@@ -68,6 +68,7 @@ int MOUSE_WHEELED    = 0x0004;  // dwEventFlags: wheel rotated
 
 // ── KeyEvent ─────────────────────────────────────────────────────────────────
 
+// One decoded keyboard event: virtual-key/scan codes, character, and modifier state.
 struct KeyEvent {
     bool keyDown      = false;
     i16  vkCode       = 0;
@@ -75,8 +76,11 @@ struct KeyEvent {
     char ch           = '\0';   // low byte of uChar; 0 for non-printable keys
     i32  controlState = 0;      // raw dwControlKeyState bitmask
 
+    // True if either Ctrl key was held.
     bool isCtrl()  { return (controlState & 0x0C) != 0; }  // LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED
+    // True if either Alt key was held.
     bool isAlt()   { return (controlState & 0x03) != 0; }  // LEFT_ALT_PRESSED  | RIGHT_ALT_PRESSED
+    // True if Shift was held.
     bool isShift() { return (controlState & 0x10) != 0; }  // SHIFT_PRESSED
 };
 
@@ -92,11 +96,17 @@ struct MouseEvent {
     i32 buttonState = 0;  // bitmask of held buttons
     i32 eventFlags  = 0;  // 0=press/release, 1=move, 4=wheel
 
+    // True if this event is a mouse-move.
     bool isMove()        { return eventFlags == MOUSE_MOVED; }
+    // True if this event is a button press (a button is now held).
     bool isPress()       { return eventFlags == 0 && buttonState != 0; }
+    // True if this event is a button release (no buttons held).
     bool isRelease()     { return eventFlags == 0 && buttonState == 0; }
+    // True if the left button is held.
     bool leftButton()    { return (buttonState & MOUSE_BTN_LEFT)   != 0; }
+    // True if the right button is held.
     bool rightButton()   { return (buttonState & MOUSE_BTN_RIGHT)  != 0; }
+    // True if the middle button is held.
     bool middleButton()  { return (buttonState & MOUSE_BTN_MIDDLE) != 0; }
 };
 
@@ -118,6 +128,7 @@ int readKey() {
 
 // ── Terminal ─────────────────────────────────────────────────────────────────
 
+// Console terminal: raw keyboard/mouse input plus ANSI cursor/clear/color output.
 struct Terminal {
     void* _hOut     = nullptr;
     void* _hIn      = nullptr;
@@ -287,7 +298,9 @@ struct Terminal {
         }
     }
 
+    // Hide the text cursor.
     void hideCursor() { printf("\033[?25l"); }
+    // Show the text cursor.
     void showCursor() { printf("\033[?25h"); }
 
     // Clear the entire screen and move cursor to top-left (1,1).
@@ -387,6 +400,7 @@ struct Terminal {
         return false;
     }
 
+    // Restore console modes on destruction.
     ~Terminal() { restore(); }
 
     // Internal helper shared by pollKey and readKey.
@@ -415,6 +429,7 @@ struct Terminal {
         return false;
     }
 
+    // Copy a Win32 mouse record into a MouseEvent.
     void _fillMouse(MouseEvent* out, os.windows._MouseEventRecord* rec) {
         out->x           = rec->mouseX;
         out->y           = rec->mouseY;
@@ -444,20 +459,32 @@ struct Terminal {
 // 256-color codes (xterm-256color):
 //   0-7: standard, 8-15: bright, 16-231: 6x6x6 color cube, 232-255: greyscale
 
+// Set both foreground and background color codes.
 void termColor(int fg, int bg)    { printf("\033[%d;%dm", fg, bg); }
+// Set the foreground color code.
 void termFg(int fg)               { printf("\033[%dm", fg); }
+// Set the background color code.
 void termBg(int bg)               { printf("\033[%dm", bg); }
+// Reset all text attributes to default.
 void termReset()                  { printf("\033[0m"); }
+// Enable bold text.
 void termBold()                   { printf("\033[1m"); }
+// Enable dim text.
 void termDim()                    { printf("\033[2m"); }
+// Enable reverse-video text.
 void termReverse()                { printf("\033[7m"); }
+// Set foreground and background using 256-color palette indices.
 void termColor256(int fg, int bg) { printf("\033[38;5;%d;48;5;%dm", fg, bg); }
+// Set the foreground using a 256-color palette index.
 void termFg256(int fg)            { printf("\033[38;5;%dm", fg); }
+// Set the background using a 256-color palette index.
 void termBg256(int bg)            { printf("\033[48;5;%dm", bg); }
 
 // Truecolor (24-bit) helpers - require Terminal.init() for UTF-8 and VT support.
 void termFgRgb(int r, int g, int b)                         { printf("\033[38;2;%d;%d;%dm", r, g, b); }
+// Set the background to a 24-bit RGB color.
 void termBgRgb(int r, int g, int b)                         { printf("\033[48;2;%d;%d;%dm", r, g, b); }
+// Set both foreground and background to 24-bit RGB colors.
 void termColorRgb(int fr, int fg, int fb, int br, int bg, int bb) { printf("\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm", fr, fg, fb, br, bg, bb); }
 
 // Render two vertically-stacked pixels in one character cell using the UTF-8
@@ -528,6 +555,7 @@ struct TerminalSnapshot {
         return s;
     }
 
+    // Free the captured screen buffer on destruction.
     ~TerminalSnapshot() {
         if (_buf != nullptr) {
             free((void*)_buf);

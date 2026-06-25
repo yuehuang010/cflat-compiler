@@ -10,6 +10,7 @@
 //
 // lock statement works: lock (s) { } acquires and releases one slot.
 
+// Counting semaphore backed by a Win32 semaphore kernel object.
 struct semaphore {
     void* _handle = nullptr;
 

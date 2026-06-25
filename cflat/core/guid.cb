@@ -34,6 +34,7 @@ i32 _guidNibble(char c)
     return -1;
 }
 
+// A 128-bit globally unique identifier with binary layout matching the Windows GUID/COM IID.
 struct Guid
 {
     u32   Data1 = 0;
@@ -89,6 +90,7 @@ struct Guid
         return g;
     }
 
+    // Return true if every field of the two GUIDs is identical.
     bool operator==(Guid other)
     {
         if (Data1 != other.Data1) return false;

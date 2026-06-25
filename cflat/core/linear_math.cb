@@ -30,45 +30,66 @@ import "math.cb";
 // vec2 (double)
 // ===================================================================
 
+// 2-component vector of doubles.
 struct vec2
 {
     double x = 0.0;
     double y = 0.0;
 
+    // Construct a vec2 from x and y components.
     static vec2 make(double x, double y) { vec2 r; r.x = x; r.y = y; return r; }
 
+    // Component-wise addition.
     vec2 operator+(vec2 o) { vec2 r; r.x = x + o.x; r.y = y + o.y; return r; }
+    // Component-wise subtraction.
     vec2 operator-(vec2 o) { vec2 r; r.x = x - o.x; r.y = y - o.y; return r; }
+    // Unary negation.
     vec2 operator-()       { vec2 r; r.x = -x;      r.y = -y;      return r; }
 
     // scalar multiply / divide
+    // Scalar multiply.
     vec2 operator*(double s) { vec2 r; r.x = x * s; r.y = y * s; return r; }
+    // Scalar divide.
     vec2 operator/(double s) { vec2 r; r.x = x / s; r.y = y / s; return r; }
     // component-wise multiply
     vec2 operator*(vec2 o)   { vec2 r; r.x = x * o.x; r.y = y * o.y; return r; }
 
+    // Equality comparison.
     bool operator==(vec2 o) { return x == o.x && y == o.y; }
 
+    // Dot product.
     double dot(vec2 o)  { return x * o.x + y * o.y; }
+    // Squared length (avoids the sqrt).
     double lengthSq()   { return x * x + y * y; }
+    // Euclidean length.
     double length()     { return Math.sqrt(x * x + y * y); }
 
+    // Unit-length copy of this vector.
     vec2 normalize()
     {
         double l = length();
         vec2 r; r.x = x / l; r.y = y / l; return r;
     }
 
+    // Linear interpolation between a and b by t.
     static vec2 lerp(vec2 a, vec2 b, double t) { return a + (b - a) * t; }
 
     // --- utility ---
+    // Euclidean distance to o.
     double distanceTo(vec2 o)    { double dx = x - o.x; double dy = y - o.y; return Math.sqrt(dx * dx + dy * dy); }
+    // 2D perpendicular dot product.
     double perpDot(vec2 o)       { return x * o.y - y * o.x; }                 // 2D wedge (signed parallelogram area)
+    // Angle to o in radians.
     double angleTo(vec2 o)       { return Math.acos(Math.clamp(dot(o) / (length() * o.length()), -1.0, 1.0)); }
+    // Component-wise minimum.
     vec2   min(vec2 o)           { return vec2.make(Math.min(x, o.x), Math.min(y, o.y)); }
+    // Component-wise maximum.
     vec2   max(vec2 o)           { return vec2.make(Math.max(x, o.x), Math.max(y, o.y)); }
+    // Component-wise clamp to [lo, hi].
     vec2   clamp(vec2 lo, vec2 hi){ return vec2.make(Math.clamp(x, lo.x, hi.x), Math.clamp(y, lo.y, hi.y)); }
+    // Component-wise absolute value.
     vec2   abs()                 { return vec2.make(Math.abs(x), Math.abs(y)); }
+    // Component-wise clamp to [0, 1].
     vec2   saturate()            { return vec2.make(Math.clamp(x, 0.0, 1.0), Math.clamp(y, 0.0, 1.0)); }
 };
 
@@ -76,53 +97,75 @@ struct vec2
 // vec3 (double)
 // ===================================================================
 
+// 3-component vector of doubles.
 struct vec3
 {
     double x = 0.0;
     double y = 0.0;
     double z = 0.0;
 
+    // Construct a vec3 from x, y, and z components.
     static vec3 make(double x, double y, double z) { vec3 r; r.x = x; r.y = y; r.z = z; return r; }
 
+    // Component-wise addition.
     vec3 operator+(vec3 o) { vec3 r; r.x = x + o.x; r.y = y + o.y; r.z = z + o.z; return r; }
+    // Component-wise subtraction.
     vec3 operator-(vec3 o) { vec3 r; r.x = x - o.x; r.y = y - o.y; r.z = z - o.z; return r; }
+    // Unary negation.
     vec3 operator-()       { vec3 r; r.x = -x;      r.y = -y;      r.z = -z;      return r; }
 
     // scalar multiply / divide
+    // Scalar multiply.
     vec3 operator*(double s) { vec3 r; r.x = x * s; r.y = y * s; r.z = z * s; return r; }
+    // Scalar divide.
     vec3 operator/(double s) { vec3 r; r.x = x / s; r.y = y / s; r.z = z / s; return r; }
     // component-wise multiply (color modulation, scaling)
     vec3 operator*(vec3 o)   { vec3 r; r.x = x * o.x; r.y = y * o.y; r.z = z * o.z; return r; }
 
+    // Equality comparison.
     bool operator==(vec3 o) { return x == o.x && y == o.y && z == o.z; }
 
+    // Dot product.
     double dot(vec3 o)  { return x * o.x + y * o.y + z * o.z; }
+    // Cross product (right-handed).
     vec3   cross(vec3 o) { vec3 r; r.x = y * o.z - z * o.y; r.y = z * o.x - x * o.z; r.z = x * o.y - y * o.x; return r; }
+    // Squared length (avoids the sqrt).
     double lengthSq()   { return x * x + y * y + z * z; }
+    // Euclidean length.
     double length()     { return Math.sqrt(x * x + y * y + z * z); }
 
+    // Unit-length copy of this vector.
     vec3 normalize()
     {
         double l = length();
         vec3 r; r.x = x / l; r.y = y / l; r.z = z / l; return r;
     }
 
+    // Linear interpolation between a and b by t.
     static vec3 lerp(vec3 a, vec3 b, double t) { return a + (b - a) * t; }
 
     // Reflect direction d about surface normal n (both assumed normalized).
     static vec3 reflect(vec3 d, vec3 n) { return d - n * (2.0 * d.dot(n)); }
 
     // --- utility ---
+    // Euclidean distance to o.
     double distanceTo(vec3 o)     { double dx = x - o.x; double dy = y - o.y; double dz = z - o.z; return Math.sqrt(dx * dx + dy * dy + dz * dz); }
+    // Angle to o in radians.
     double angleTo(vec3 o)        { return Math.acos(Math.clamp(dot(o) / (length() * o.length()), -1.0, 1.0)); }
+    // Component-wise minimum.
     vec3   min(vec3 o)            { return vec3.make(Math.min(x, o.x), Math.min(y, o.y), Math.min(z, o.z)); }
+    // Component-wise maximum.
     vec3   max(vec3 o)            { return vec3.make(Math.max(x, o.x), Math.max(y, o.y), Math.max(z, o.z)); }
+    // Component-wise clamp to [lo, hi].
     vec3   clamp(vec3 lo, vec3 hi){ return vec3.make(Math.clamp(x, lo.x, hi.x), Math.clamp(y, lo.y, hi.y), Math.clamp(z, lo.z, hi.z)); }
+    // Component-wise absolute value.
     vec3   abs()                  { return vec3.make(Math.abs(x), Math.abs(y), Math.abs(z)); }
+    // Component-wise clamp to [0, 1].
     vec3   saturate()             { return vec3.make(Math.clamp(x, 0.0, 1.0), Math.clamp(y, 0.0, 1.0), Math.clamp(z, 0.0, 1.0)); }
 
-    // Projection of this onto o, and the perpendicular remainder (this - project).
+    // Projection of this onto o.
     vec3 project(vec3 o)          { return o * (dot(o) / o.dot(o)); }
+    // Perpendicular remainder of this relative to o (this - project).
     vec3 reject(vec3 o)           { vec3 p = project(o); return vec3.make(x - p.x, y - p.y, z - p.z); }
 
     // Snell refraction of incident dir i through normal n (both normalized), eta
@@ -141,6 +184,7 @@ struct vec3
 // vec4 (double)
 // ===================================================================
 
+// 4-component vector of doubles.
 struct vec4
 {
     double x = 0.0;
@@ -148,36 +192,55 @@ struct vec4
     double z = 0.0;
     double w = 0.0;
 
+    // Construct a vec4 from x, y, z, and w components.
     static vec4 make(double x, double y, double z, double w) { vec4 r; r.x = x; r.y = y; r.z = z; r.w = w; return r; }
 
+    // Component-wise addition.
     vec4 operator+(vec4 o) { vec4 r; r.x = x + o.x; r.y = y + o.y; r.z = z + o.z; r.w = w + o.w; return r; }
+    // Component-wise subtraction.
     vec4 operator-(vec4 o) { vec4 r; r.x = x - o.x; r.y = y - o.y; r.z = z - o.z; r.w = w - o.w; return r; }
+    // Unary negation.
     vec4 operator-()       { vec4 r; r.x = -x;      r.y = -y;      r.z = -z;      r.w = -w;      return r; }
 
+    // Scalar multiply.
     vec4 operator*(double s) { vec4 r; r.x = x * s; r.y = y * s; r.z = z * s; r.w = w * s; return r; }
+    // Scalar divide.
     vec4 operator/(double s) { vec4 r; r.x = x / s; r.y = y / s; r.z = z / s; r.w = w / s; return r; }
+    // Component-wise multiply.
     vec4 operator*(vec4 o)   { vec4 r; r.x = x * o.x; r.y = y * o.y; r.z = z * o.z; r.w = w * o.w; return r; }
 
+    // Equality comparison.
     bool operator==(vec4 o) { return x == o.x && y == o.y && z == o.z && w == o.w; }
 
+    // Dot product.
     double dot(vec4 o)  { return x * o.x + y * o.y + z * o.z + w * o.w; }
+    // Squared length (avoids the sqrt).
     double lengthSq()   { return x * x + y * y + z * z + w * w; }
+    // Euclidean length.
     double length()     { return Math.sqrt(x * x + y * y + z * z + w * w); }
 
+    // Unit-length copy of this vector.
     vec4 normalize()
     {
         double l = length();
         vec4 r; r.x = x / l; r.y = y / l; r.z = z / l; r.w = w / l; return r;
     }
 
+    // Linear interpolation between a and b by t.
     static vec4 lerp(vec4 a, vec4 b, double t) { return a + (b - a) * t; }
 
     // --- utility ---
+    // Euclidean distance to o.
     double distanceTo(vec4 o)     { double dx = x - o.x; double dy = y - o.y; double dz = z - o.z; double dw = w - o.w; return Math.sqrt(dx * dx + dy * dy + dz * dz + dw * dw); }
+    // Component-wise minimum.
     vec4   min(vec4 o)            { return vec4.make(Math.min(x, o.x), Math.min(y, o.y), Math.min(z, o.z), Math.min(w, o.w)); }
+    // Component-wise maximum.
     vec4   max(vec4 o)            { return vec4.make(Math.max(x, o.x), Math.max(y, o.y), Math.max(z, o.z), Math.max(w, o.w)); }
+    // Component-wise clamp to [lo, hi].
     vec4   clamp(vec4 lo, vec4 hi){ return vec4.make(Math.clamp(x, lo.x, hi.x), Math.clamp(y, lo.y, hi.y), Math.clamp(z, lo.z, hi.z), Math.clamp(w, lo.w, hi.w)); }
+    // Component-wise absolute value.
     vec4   abs()                  { return vec4.make(Math.abs(x), Math.abs(y), Math.abs(z), Math.abs(w)); }
+    // Component-wise clamp to [0, 1].
     vec4   saturate()             { return vec4.make(Math.clamp(x, 0.0, 1.0), Math.clamp(y, 0.0, 1.0), Math.clamp(z, 0.0, 1.0), Math.clamp(w, 0.0, 1.0)); }
 };
 
@@ -185,91 +248,140 @@ struct vec4
 // vec2f / vec3f / vec4f (float)
 // ===================================================================
 
+// 2-component vector of floats.
 struct vec2f
 {
     float x = 0.0f;
     float y = 0.0f;
 
+    // Construct a vec2f from x and y components.
     static vec2f make(float x, float y) { vec2f r; r.x = x; r.y = y; return r; }
 
+    // Component-wise addition.
     vec2f operator+(vec2f o) { vec2f r; r.x = x + o.x; r.y = y + o.y; return r; }
+    // Component-wise subtraction.
     vec2f operator-(vec2f o) { vec2f r; r.x = x - o.x; r.y = y - o.y; return r; }
+    // Unary negation.
     vec2f operator-()        { vec2f r; r.x = -x;      r.y = -y;      return r; }
 
+    // Scalar multiply.
     vec2f operator*(float s) { vec2f r; r.x = x * s; r.y = y * s; return r; }
+    // Scalar divide.
     vec2f operator/(float s) { vec2f r; r.x = x / s; r.y = y / s; return r; }
+    // Component-wise multiply.
     vec2f operator*(vec2f o) { vec2f r; r.x = x * o.x; r.y = y * o.y; return r; }
 
+    // Equality comparison.
     bool operator==(vec2f o) { return x == o.x && y == o.y; }
 
+    // Dot product.
     float dot(vec2f o)  { return x * o.x + y * o.y; }
+    // Squared length (avoids the sqrt).
     float lengthSq()    { return x * x + y * y; }
+    // Euclidean length.
     float length()      { return Math.sqrt(x * x + y * y); }
 
+    // Unit-length copy of this vector.
     vec2f normalize()
     {
         float l = length();
         vec2f r; r.x = x / l; r.y = y / l; return r;
     }
 
+    // Linear interpolation between a and b by t.
     static vec2f lerp(vec2f a, vec2f b, float t) { return a + (b - a) * t; }
 
     // --- utility ---
+    // Euclidean distance to o.
     float distanceTo(vec2f o)       { float dx = x - o.x; float dy = y - o.y; return Math.sqrt(dx * dx + dy * dy); }
+    // 2D perpendicular dot product.
     float perpDot(vec2f o)          { return x * o.y - y * o.x; }
+    // Angle to o in radians.
     float angleTo(vec2f o)          { return Math.acos(Math.clamp(dot(o) / (length() * o.length()), -1.0f, 1.0f)); }
+    // Component-wise minimum.
     vec2f min(vec2f o)              { return vec2f.make(Math.min(x, o.x), Math.min(y, o.y)); }
+    // Component-wise maximum.
     vec2f max(vec2f o)              { return vec2f.make(Math.max(x, o.x), Math.max(y, o.y)); }
+    // Component-wise clamp to [lo, hi].
     vec2f clamp(vec2f lo, vec2f hi) { return vec2f.make(Math.clamp(x, lo.x, hi.x), Math.clamp(y, lo.y, hi.y)); }
+    // Component-wise absolute value.
     vec2f abs()                     { return vec2f.make(Math.abs(x), Math.abs(y)); }
+    // Component-wise clamp to [0, 1].
     vec2f saturate()                { return vec2f.make(Math.clamp(x, 0.0f, 1.0f), Math.clamp(y, 0.0f, 1.0f)); }
 };
 
+// 3-component vector of floats.
 struct vec3f
 {
     float x = 0.0f;
     float y = 0.0f;
     float z = 0.0f;
 
+    // Construct a vec3f from x, y, and z components.
     static vec3f make(float x, float y, float z) { vec3f r; r.x = x; r.y = y; r.z = z; return r; }
 
+    // Component-wise addition.
     vec3f operator+(vec3f o) { vec3f r; r.x = x + o.x; r.y = y + o.y; r.z = z + o.z; return r; }
+    // Component-wise subtraction.
     vec3f operator-(vec3f o) { vec3f r; r.x = x - o.x; r.y = y - o.y; r.z = z - o.z; return r; }
+    // Unary negation.
     vec3f operator-()        { vec3f r; r.x = -x;      r.y = -y;      r.z = -z;      return r; }
 
+    // Scalar multiply.
     vec3f operator*(float s) { vec3f r; r.x = x * s; r.y = y * s; r.z = z * s; return r; }
+    // Scalar divide.
     vec3f operator/(float s) { vec3f r; r.x = x / s; r.y = y / s; r.z = z / s; return r; }
+    // Component-wise multiply.
     vec3f operator*(vec3f o) { vec3f r; r.x = x * o.x; r.y = y * o.y; r.z = z * o.z; return r; }
 
+    // Equality comparison.
     bool operator==(vec3f o) { return x == o.x && y == o.y && z == o.z; }
 
+    // Dot product.
     float dot(vec3f o)   { return x * o.x + y * o.y + z * o.z; }
+    // Cross product (right-handed).
     vec3f cross(vec3f o) { vec3f r; r.x = y * o.z - z * o.y; r.y = z * o.x - x * o.z; r.z = x * o.y - y * o.x; return r; }
+    // Squared length (avoids the sqrt).
     float lengthSq()     { return x * x + y * y + z * z; }
+    // Euclidean length.
     float length()       { return Math.sqrt(x * x + y * y + z * z); }
 
+    // Unit-length copy of this vector.
     vec3f normalize()
     {
         float l = length();
         vec3f r; r.x = x / l; r.y = y / l; r.z = z / l; return r;
     }
 
+    // Linear interpolation between a and b by t.
     static vec3f lerp(vec3f a, vec3f b, float t) { return a + (b - a) * t; }
 
+    // Reflect direction d about surface normal n (both assumed normalized).
     static vec3f reflect(vec3f d, vec3f n) { return d - n * (2.0f * d.dot(n)); }
 
     // --- utility ---
+    // Euclidean distance to o.
     float distanceTo(vec3f o)       { float dx = x - o.x; float dy = y - o.y; float dz = z - o.z; return Math.sqrt(dx * dx + dy * dy + dz * dz); }
+    // Angle to o in radians.
     float angleTo(vec3f o)          { return Math.acos(Math.clamp(dot(o) / (length() * o.length()), -1.0f, 1.0f)); }
+    // Component-wise minimum.
     vec3f min(vec3f o)              { return vec3f.make(Math.min(x, o.x), Math.min(y, o.y), Math.min(z, o.z)); }
+    // Component-wise maximum.
     vec3f max(vec3f o)              { return vec3f.make(Math.max(x, o.x), Math.max(y, o.y), Math.max(z, o.z)); }
+    // Component-wise clamp to [lo, hi].
     vec3f clamp(vec3f lo, vec3f hi) { return vec3f.make(Math.clamp(x, lo.x, hi.x), Math.clamp(y, lo.y, hi.y), Math.clamp(z, lo.z, hi.z)); }
+    // Component-wise absolute value.
     vec3f abs()                     { return vec3f.make(Math.abs(x), Math.abs(y), Math.abs(z)); }
+    // Component-wise clamp to [0, 1].
     vec3f saturate()                { return vec3f.make(Math.clamp(x, 0.0f, 1.0f), Math.clamp(y, 0.0f, 1.0f), Math.clamp(z, 0.0f, 1.0f)); }
 
+    // Projection of this onto o.
     vec3f project(vec3f o)          { return o * (dot(o) / o.dot(o)); }
+    // Perpendicular remainder of this relative to o (this - project).
     vec3f reject(vec3f o)           { vec3f p = project(o); return vec3f.make(x - p.x, y - p.y, z - p.z); }
 
+    // Snell refraction of incident dir i through normal n; returns zero on total
+    // internal reflection.
     static vec3f refract(vec3f i, vec3f n, float eta)
     {
         float ni = n.dot(i);
@@ -279,6 +391,7 @@ struct vec3f
     }
 };
 
+// 4-component vector of floats.
 struct vec4f
 {
     float x = 0.0f;
@@ -286,36 +399,55 @@ struct vec4f
     float z = 0.0f;
     float w = 0.0f;
 
+    // Construct a vec4f from x, y, z, and w components.
     static vec4f make(float x, float y, float z, float w) { vec4f r; r.x = x; r.y = y; r.z = z; r.w = w; return r; }
 
+    // Component-wise addition.
     vec4f operator+(vec4f o) { vec4f r; r.x = x + o.x; r.y = y + o.y; r.z = z + o.z; r.w = w + o.w; return r; }
+    // Component-wise subtraction.
     vec4f operator-(vec4f o) { vec4f r; r.x = x - o.x; r.y = y - o.y; r.z = z - o.z; r.w = w - o.w; return r; }
+    // Unary negation.
     vec4f operator-()        { vec4f r; r.x = -x;      r.y = -y;      r.z = -z;      r.w = -w;      return r; }
 
+    // Scalar multiply.
     vec4f operator*(float s) { vec4f r; r.x = x * s; r.y = y * s; r.z = z * s; r.w = w * s; return r; }
+    // Scalar divide.
     vec4f operator/(float s) { vec4f r; r.x = x / s; r.y = y / s; r.z = z / s; r.w = w / s; return r; }
+    // Component-wise multiply.
     vec4f operator*(vec4f o) { vec4f r; r.x = x * o.x; r.y = y * o.y; r.z = z * o.z; r.w = w * o.w; return r; }
 
+    // Equality comparison.
     bool operator==(vec4f o) { return x == o.x && y == o.y && z == o.z && w == o.w; }
 
+    // Dot product.
     float dot(vec4f o)  { return x * o.x + y * o.y + z * o.z + w * o.w; }
+    // Squared length (avoids the sqrt).
     float lengthSq()    { return x * x + y * y + z * z + w * w; }
+    // Euclidean length.
     float length()      { return Math.sqrt(x * x + y * y + z * z + w * w); }
 
+    // Unit-length copy of this vector.
     vec4f normalize()
     {
         float l = length();
         vec4f r; r.x = x / l; r.y = y / l; r.z = z / l; r.w = w / l; return r;
     }
 
+    // Linear interpolation between a and b by t.
     static vec4f lerp(vec4f a, vec4f b, float t) { return a + (b - a) * t; }
 
     // --- utility ---
+    // Euclidean distance to o.
     float distanceTo(vec4f o)       { float dx = x - o.x; float dy = y - o.y; float dz = z - o.z; float dw = w - o.w; return Math.sqrt(dx * dx + dy * dy + dz * dz + dw * dw); }
+    // Component-wise minimum.
     vec4f min(vec4f o)              { return vec4f.make(Math.min(x, o.x), Math.min(y, o.y), Math.min(z, o.z), Math.min(w, o.w)); }
+    // Component-wise maximum.
     vec4f max(vec4f o)              { return vec4f.make(Math.max(x, o.x), Math.max(y, o.y), Math.max(z, o.z), Math.max(w, o.w)); }
+    // Component-wise clamp to [lo, hi].
     vec4f clamp(vec4f lo, vec4f hi) { return vec4f.make(Math.clamp(x, lo.x, hi.x), Math.clamp(y, lo.y, hi.y), Math.clamp(z, lo.z, hi.z), Math.clamp(w, lo.w, hi.w)); }
+    // Component-wise absolute value.
     vec4f abs()                     { return vec4f.make(Math.abs(x), Math.abs(y), Math.abs(z), Math.abs(w)); }
+    // Component-wise clamp to [0, 1].
     vec4f saturate()                { return vec4f.make(Math.clamp(x, 0.0f, 1.0f), Math.clamp(y, 0.0f, 1.0f), Math.clamp(z, 0.0f, 1.0f), Math.clamp(w, 0.0f, 1.0f)); }
 };
 
@@ -323,6 +455,7 @@ struct vec4f
 // 3x3 determinant helpers (used by mat4/mat4f cofactor expansion)
 // ===================================================================
 
+// Determinant of a 3x3 matrix given row-major (double).
 double det3(double a, double b, double c,
             double d, double e, double f,
             double g, double h, double i)
@@ -330,6 +463,7 @@ double det3(double a, double b, double c,
     return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
 }
 
+// Determinant of a 3x3 matrix given row-major (float).
 float det3f(float a, float b, float c,
             float d, float e, float f,
             float g, float h, float i)
@@ -344,13 +478,17 @@ float det3f(float a, float b, float c,
 // Storage is m[row * 4 + col]. The static factories below match the Direct3D
 // (left-handed) conventions used by example/COM so float/double agree.
 
+// 4x4 matrix of doubles, row-major.
 struct mat4
 {
     double[16] m = default;
 
+    // Read element at (row, col).
     double get(int row, int col)            { return m[row * 4 + col]; }
+    // Write element at (row, col).
     void   set(int row, int col, double v)  { m[row * 4 + col] = v; }
 
+    // Identity matrix.
     static mat4 identity()
     {
         mat4 r;
@@ -358,22 +496,27 @@ struct mat4
         return r;
     }
 
+    // Translation matrix from components.
     static mat4 translate(double tx, double ty, double tz)
     {
         mat4 r = mat4.identity();
         r.m[12] = tx; r.m[13] = ty; r.m[14] = tz;
         return r;
     }
+    // Translation matrix from a vec3.
     static mat4 translate(vec3 t) { return mat4.translate(t.x, t.y, t.z); }
 
+    // Scale matrix from components.
     static mat4 scale(double sx, double sy, double sz)
     {
         mat4 r;
         r.m[0] = sx; r.m[5] = sy; r.m[10] = sz; r.m[15] = 1.0;
         return r;
     }
+    // Scale matrix from a vec3.
     static mat4 scale(vec3 s) { return mat4.scale(s.x, s.y, s.z); }
 
+    // Rotation about the x-axis by a radians.
     static mat4 rotX(double a)
     {
         mat4 r = mat4.identity();
@@ -383,6 +526,7 @@ struct mat4
         return r;
     }
 
+    // Rotation about the y-axis by a radians.
     static mat4 rotY(double a)
     {
         mat4 r = mat4.identity();
@@ -392,6 +536,7 @@ struct mat4
         return r;
     }
 
+    // Rotation about the z-axis by a radians.
     static mat4 rotZ(double a)
     {
         mat4 r = mat4.identity();
@@ -473,6 +618,7 @@ struct mat4
         return r;
     }
 
+    // Transpose of this matrix.
     mat4 transpose()
     {
         mat4 r;
@@ -501,6 +647,7 @@ struct mat4
         return ((row + col) & 1) == 0 ? d : -d;
     }
 
+    // Determinant via cofactor expansion along the first row.
     double determinant()
     {
         double d = 0.0;
@@ -553,13 +700,17 @@ struct mat4
 // mat4f (float) - same conventions as mat4, for GPU upload
 // ===================================================================
 
+// 4x4 matrix of floats, row-major.
 struct mat4f
 {
     float[16] m = default;
 
+    // Read element at (row, col).
     float get(int row, int col)           { return m[row * 4 + col]; }
+    // Write element at (row, col).
     void  set(int row, int col, float v)  { m[row * 4 + col] = v; }
 
+    // Identity matrix.
     static mat4f identity()
     {
         mat4f r;
@@ -567,22 +718,27 @@ struct mat4f
         return r;
     }
 
+    // Translation matrix from components.
     static mat4f translate(float tx, float ty, float tz)
     {
         mat4f r = mat4f.identity();
         r.m[12] = tx; r.m[13] = ty; r.m[14] = tz;
         return r;
     }
+    // Translation matrix from a vec3f.
     static mat4f translate(vec3f t) { return mat4f.translate(t.x, t.y, t.z); }
 
+    // Scale matrix from components.
     static mat4f scale(float sx, float sy, float sz)
     {
         mat4f r;
         r.m[0] = sx; r.m[5] = sy; r.m[10] = sz; r.m[15] = 1.0f;
         return r;
     }
+    // Scale matrix from a vec3f.
     static mat4f scale(vec3f s) { return mat4f.scale(s.x, s.y, s.z); }
 
+    // Rotation about the x-axis by a radians.
     static mat4f rotX(float a)
     {
         mat4f r = mat4f.identity();
@@ -592,6 +748,7 @@ struct mat4f
         return r;
     }
 
+    // Rotation about the y-axis by a radians.
     static mat4f rotY(float a)
     {
         mat4f r = mat4f.identity();
@@ -601,6 +758,7 @@ struct mat4f
         return r;
     }
 
+    // Rotation about the z-axis by a radians.
     static mat4f rotZ(float a)
     {
         mat4f r = mat4f.identity();
@@ -610,6 +768,7 @@ struct mat4f
         return r;
     }
 
+    // Rotation of angle a (radians) about an arbitrary axis (normalized here).
     static mat4f rotationAxis(vec3f axis, float a)
     {
         vec3f u = axis.normalize();
@@ -623,6 +782,7 @@ struct mat4f
         return r;
     }
 
+    // Left-handed perspective projection (Direct3D convention).
     static mat4f perspectiveLH(float fovY, float aspect, float zn, float zf)
     {
         mat4f r;
@@ -636,6 +796,7 @@ struct mat4f
         return r;
     }
 
+    // Left-handed orthographic projection, view volume centered on the axis.
     static mat4f orthographicLH(float w, float h, float zn, float zf)
     {
         mat4f r;
@@ -647,6 +808,7 @@ struct mat4f
         return r;
     }
 
+    // Left-handed look-at view matrix.
     static mat4f lookAtLH(vec3f eye, vec3f target, vec3f up)
     {
         vec3f fwd = target - eye;
@@ -661,6 +823,7 @@ struct mat4f
         return r;
     }
 
+    // this * o (row-major matrix product).
     mat4f operator*(mat4f o)
     {
         mat4f r;
@@ -677,6 +840,7 @@ struct mat4f
         return r;
     }
 
+    // Transpose of this matrix.
     mat4f transpose()
     {
         mat4f r;
@@ -686,6 +850,7 @@ struct mat4f
         return r;
     }
 
+    // Signed cofactor of element (row, col): (-1)^(row+col) * 3x3 minor.
     float cofactor(int row, int col)
     {
         float[9] s = default;
@@ -704,6 +869,7 @@ struct mat4f
         return ((row + col) & 1) == 0 ? d : -d;
     }
 
+    // Determinant via cofactor expansion along the first row.
     float determinant()
     {
         float d = 0.0f;
@@ -711,6 +877,7 @@ struct mat4f
         return d;
     }
 
+    // Inverse via the adjugate; returns identity if the matrix is singular.
     mat4f inverse()
     {
         float det = determinant();
@@ -723,6 +890,7 @@ struct mat4f
         return r;
     }
 
+    // Row-vector transform: v * this.
     vec4f transform(vec4f v)
     {
         vec4f r;
@@ -733,6 +901,7 @@ struct mat4f
         return r;
     }
 
+    // Transform a position (implicit w = 1) with perspective divide.
     vec3f transformPoint(vec3f p)
     {
         vec4f r = transform(vec4f.make(p.x, p.y, p.z, 1.0f));
@@ -740,6 +909,7 @@ struct mat4f
         return vec3f.make(r.x * iw, r.y * iw, r.z * iw);
     }
 
+    // Transform a direction (implicit w = 0): ignores translation, no divide.
     vec3f transformDir(vec3f d)
     {
         vec4f r = transform(vec4f.make(d.x, d.y, d.z, 0.0f));
@@ -751,6 +921,7 @@ struct mat4f
 // quat (double) - unit quaternion for 3D rotation (x,y,z imaginary, w real)
 // ===================================================================
 
+// Unit quaternion for 3D rotation (double).
 struct quat
 {
     double x = 0.0;
@@ -758,7 +929,9 @@ struct quat
     double z = 0.0;
     double w = 1.0;     // identity rotation by default
 
+    // Construct a quat from x, y, z, and w components.
     static quat make(double x, double y, double z, double w) { quat r; r.x = x; r.y = y; r.z = z; r.w = w; return r; }
+    // Identity rotation quaternion.
     static quat identity() { return quat.make(0.0, 0.0, 0.0, 1.0); }
 
     // Rotation of angle (radians) about an axis (normalized here).
@@ -782,10 +955,14 @@ struct quat
             o.w * w - o.x * x - o.y * y - o.z * z);
     }
 
+    // Dot product.
     double dot(quat o) { return x * o.x + y * o.y + z * o.z + w * o.w; }
+    // Magnitude.
     double length()    { return Math.sqrt(x * x + y * y + z * z + w * w); }
+    // Conjugate (inverse rotation for unit quaternions).
     quat   conjugate() { return quat.make(-x, -y, -z, w); }
 
+    // Unit-length copy of this quaternion.
     quat normalize()
     {
         double l = length();
@@ -840,6 +1017,7 @@ struct quat
 // quatf (float) - same as quat, single precision
 // ===================================================================
 
+// Unit quaternion for 3D rotation (float).
 struct quatf
 {
     float x = 0.0f;
@@ -847,9 +1025,12 @@ struct quatf
     float z = 0.0f;
     float w = 1.0f;
 
+    // Construct a quatf from x, y, z, and w components.
     static quatf make(float x, float y, float z, float w) { quatf r; r.x = x; r.y = y; r.z = z; r.w = w; return r; }
+    // Identity rotation quaternion.
     static quatf identity() { return quatf.make(0.0f, 0.0f, 0.0f, 1.0f); }
 
+    // Rotation of angle (radians) about an axis (normalized here).
     static quatf fromAxisAngle(vec3f axis, float angle)
     {
         vec3f u = axis.normalize();
@@ -868,16 +1049,21 @@ struct quatf
             o.w * w - o.x * x - o.y * y - o.z * z);
     }
 
+    // Dot product.
     float dot(quatf o) { return x * o.x + y * o.y + z * o.z + w * o.w; }
+    // Magnitude.
     float length()     { return Math.sqrt(x * x + y * y + z * z + w * w); }
+    // Conjugate (inverse rotation for unit quaternions).
     quatf conjugate()  { return quatf.make(-x, -y, -z, w); }
 
+    // Unit-length copy of this quaternion.
     quatf normalize()
     {
         float l = length();
         return quatf.make(x / l, y / l, z / l, w / l);
     }
 
+    // Rotate a vector by this (assumed unit) quaternion.
     vec3f rotate(vec3f v)
     {
         vec3f u = vec3f.make(x, y, z);
@@ -885,6 +1071,7 @@ struct quatf
         return v + t * w + u.cross(t);
     }
 
+    // Equivalent rotation matrix (row-vector convention).
     mat4f toMat4()
     {
         float xx = x * x; float yy = y * y; float zz = z * z;
@@ -897,6 +1084,7 @@ struct quatf
         return r;
     }
 
+    // Spherical linear interpolation along the shortest arc.
     static quatf slerp(quatf a, quatf b, float t)
     {
         float  d  = a.dot(b);

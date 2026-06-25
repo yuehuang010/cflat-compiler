@@ -102,12 +102,15 @@ struct _BA_LargeHdr
 // by _ba_reg_lock. x64 TSO guarantees a thread that observes a published _table
 // pointer also observes the zero-fill that preceded the publish.
 
+// Second-level radix entry: owning BucketAllocator for one 64K page.
 struct _BA_RegSlot { i8* _owner = nullptr; };                  // second-level entry
+// Top-level radix entry pointing at a second-level _BA_RegSlot table.
 struct _BA_RegDir  { _BA_RegSlot* _table = nullptr; };         // top-level entry
 
 _BA_RegDir* _ba_reg_top = nullptr;
 mutex       _ba_reg_lock = default;
 
+// Lazily allocate the top-level registry directory (once per process).
 void _ba_reg_init_top()
 {
     if (_ba_reg_top != nullptr) return;
@@ -117,6 +120,7 @@ void _ba_reg_init_top()
     _ba_reg_lock.release();
 }
 
+// Record that the 64K page at base is owned by the given BucketAllocator.
 void _ba_reg_insert(i64 base, i8* owner)
 {
     _ba_reg_init_top();
@@ -138,6 +142,7 @@ void _ba_reg_insert(i64 base, i8* owner)
     tbl[lo]._owner = owner;
 }
 
+// Clear the owner entry for the 64K page at base.
 void _ba_reg_remove(i64 base)
 {
     if (_ba_reg_top == nullptr) return;
@@ -149,6 +154,7 @@ void _ba_reg_remove(i64 base)
     tbl[lo]._owner = nullptr;
 }
 
+// Return the owning BucketAllocator for the 64K page at base, or nullptr.
 i8* _ba_reg_lookup(i64 base)
 {
     if (_ba_reg_top == nullptr) return nullptr;
@@ -185,6 +191,8 @@ bool __BA_try_owner_dealloc(void* ptr)
     return _ba_route_free(ptr);
 }
 
+// Segregated free-list allocator: eight power-of-two size classes backed by
+// g_page_pool, with registry-routed frees and a direct large-alloc path.
 class BucketAllocator : IAllocator
 {
     _BA_Bucket _buckets[8] = default;
@@ -216,6 +224,7 @@ class BucketAllocator : IAllocator
     // Initialization
     // -----------------------------------------------------------------------
 
+    // One-time init: set per-class block sizes and install the owner-dealloc hook.
     void _init()
     {
         int i = 0;
@@ -229,6 +238,7 @@ class BucketAllocator : IAllocator
             __try_owner_dealloc = __BA_try_owner_dealloc;
     }
 
+    // Block size in bytes for size-class index cls (0..7).
     i64 _blockSizeFor(int cls)
     {
         if (cls == 0) return (i64)8;
@@ -241,6 +251,7 @@ class BucketAllocator : IAllocator
         return (i64)1024;
     }
 
+    // Smallest size class that fits size, or -1 if size exceeds 1024 bytes.
     int _classFor(i64 size)
     {
         if (size <= (i64)8)    return 0;
@@ -303,6 +314,7 @@ class BucketAllocator : IAllocator
     // Large-allocation path (> 1024 bytes)
     // -----------------------------------------------------------------------
 
+    // Allocate a > 1024-byte request via vmem_alloc and track it in _largeHead.
     void* _allocLarge(i64 size)
     {
         i64 hdrSize = (i64)sizeof(_BA_LargeHdr);
@@ -370,6 +382,7 @@ class BucketAllocator : IAllocator
     // IAllocator
     // -----------------------------------------------------------------------
 
+    // Allocate size bytes under the allocator lock.
     void* alloc(i64 size)
     {
         _lock.acquire();
@@ -378,6 +391,7 @@ class BucketAllocator : IAllocator
         return r;
     }
 
+    // Lock-free allocation core: pop a block from the size class or go large.
     void* _allocUnsynced(i64 size)
     {
         if (size <= (i64)0) return nullptr;
@@ -396,6 +410,7 @@ class BucketAllocator : IAllocator
         return (void*)block;
     }
 
+    // Free a pointer: route owned pointers to the owning BA, else CRT-free.
     void dealloc(void* ptr)
     {
         if (ptr == nullptr) return;
@@ -453,6 +468,7 @@ class BucketAllocator : IAllocator
     // Stats / diagnostics
     // -----------------------------------------------------------------------
 
+    // Live bytes across all size classes plus large allocations.
     i64 usedBytes()
     {
         if (!_initialized) return (i64)0;
@@ -466,7 +482,9 @@ class BucketAllocator : IAllocator
         return total;
     }
 
+    // No meaningful total; always reports 0.
     i64 totalBytes()   { return (i64)0; }
+    // Peak reserved bytes seen over the allocator's lifetime.
     i64 peakReserve()  { return _peakReserved; }
 
     // Spawn a fresh BucketAllocator for a child thread and chain it onto this
@@ -496,6 +514,7 @@ class BucketAllocator : IAllocator
         return child_iface;
     }
 
+    // Allocate size bytes aligned to align, stashing the raw pointer for free.
     void* alloc_aligned(i64 size, i64 align) {
         if (align <= (i64)16) return alloc(size);
         i64 total = size + align - (i64)1 + (i64)16;
@@ -507,12 +526,14 @@ class BucketAllocator : IAllocator
         stash[0] = (void*)raw;
         return (void*)aligned;
     }
+    // Recover the raw pointer stashed by alloc_aligned and free it.
     void dealloc_aligned(void* ptr) {
         if (ptr == nullptr) return;
         void** stash = (void**)((i8*)ptr - (i64)16);
         dealloc(stash[0]);
     }
 
+    // Approximate committed bytes: 64 KB per owned page across all classes.
     i64 committedBytes()
     {
         // Approximate: each owned page is 64 KB.
@@ -533,6 +554,7 @@ class BucketAllocator : IAllocator
         return total;
     }
 
+    // Print a per-bucket usage summary to stdout.
     void printUsage()
     {
         if (!_initialized) { printf("BucketAllocator: not initialized\n"); return; }
@@ -555,6 +577,7 @@ class BucketAllocator : IAllocator
     // Cleanup
     // -----------------------------------------------------------------------
 
+    // Return all pages and large allocations and reset the allocator to empty.
     void cleanup()
     {
         // Return every bucket page to the global pool.
@@ -593,6 +616,7 @@ class BucketAllocator : IAllocator
         _reservedNow = (i64)0;
     }
 
+    // Clean up and free all child allocators, then clean up this allocator.
     ~BucketAllocator()
     {
         // Walk and clean up spawned children before tearing down our own state.

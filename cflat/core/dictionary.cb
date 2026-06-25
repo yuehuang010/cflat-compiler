@@ -17,6 +17,7 @@ struct dictionary<K, V>
     int   _capacity = 0;
     V     _missing  = default;   // value returned by get() on a miss
 
+    // Hash key to a starting bucket index in [0, _capacity).
     int _slot(K key)
     {
         int h = 0;
@@ -30,6 +31,7 @@ struct dictionary<K, V>
         return h;
     }
 
+    // Allocate empty key/value/status arrays of `cap` slots.
     void _init(int cap)
     {
         _keys   = new K[cap];
@@ -44,6 +46,7 @@ struct dictionary<K, V>
         _capacity = cap;
     }
 
+    // Grow to double capacity and reinsert all live entries.
     void _rehash()
     {
         K*    oldKeys   = _keys;
@@ -237,6 +240,7 @@ struct dictionary<K, V>
         return get(key);
     }
 
+    // Free owned values and string keys, then the backing arrays.
     ~dictionary()
     {
         int i = 0;

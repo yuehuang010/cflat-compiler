@@ -14,14 +14,17 @@
 // NOTE: SRW locks are NOT recursive. A thread that calls acquire() twice without
 // an intervening release() will deadlock. Use a CRITICAL_SECTION if you need recursion.
 
+// Mutual-exclusion lock backed by a Win32 SRW lock (non-recursive).
 struct mutex {
     void* _srw = nullptr;  // Win32 SRWLOCK - lock state stored in the pointer value; 0 == unlocked
 
+    // Acquire the lock exclusively, blocking until it is available.
     void acquire() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(1); }  // thread-fuzz sched-point
         os.windows.AcquireSRWLockExclusive(&_srw);
     }
 
+    // Release the exclusive lock.
     void release() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(2); }  // thread-fuzz sched-point
         os.windows.ReleaseSRWLockExclusive(&_srw);

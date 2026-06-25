@@ -23,6 +23,7 @@ import "guid.cb";
 // with the WinRT HRESULT ABI; `[uuid("...")]` tags the interface it implements so its IID can
 // be emitted. Authoring a [winrt] class therefore requires `import "com.cb";`.
 annotation winrt { };
+// Tags the COM/WinRT interface a [winrt] class implements with its IID string.
 annotation uuid { string value; };
 
 // ===== HRESULT result codes =====
@@ -47,6 +48,7 @@ i32 E_INVALIDARG    = (i32)0x80070057;
 
 // SUCCEEDED/FAILED test the failure (high) bit, exactly like the Win32 macros.
 bool SUCCEEDED(i32 hr) { return hr >= 0; }
+// True if the HRESULT indicates failure (high/sign bit set).
 bool FAILED(i32 hr)    { return hr < 0; }
 
 // ===== HResult<T>: an HRESULT and its logical return value, carried together =====
@@ -60,7 +62,9 @@ struct HResult<T>
     i32 hr    = default;   // S_OK (0) on success; a failure HRESULT otherwise
     T   value = default;   // valid only when ok()
 
+    // True when the carried HRESULT indicates success.
     bool ok()     { return this.hr >= 0; }
+    // True when the carried HRESULT indicates failure.
     bool failed() { return this.hr < 0; }
 
     // Fill this result in place. `succeed(v)` sets S_OK + value; `fail(hr)` sets a failure.
@@ -111,6 +115,7 @@ struct IUnknownVtbl
     function<u32(void*)>                Release        = nullptr;
 };
 
+// Minimal COM root object: a single vtable pointer, ABI-identical to a real IUnknown.
 struct IUnknown
 {
     IUnknownVtbl* lpVtbl = nullptr;
@@ -132,6 +137,7 @@ class ComPtr<T>
     // ComPtr's own methods (get/reset/put/...) still win via the own-member-first rule.
     T* operator->() { return ptr; }
 
+    // True if a non-null pointer is currently held.
     bool valid() { return ptr != nullptr; }
 
     // Release any held pointer and null the slot, without leaving the holder. Lets a caller drop the
@@ -176,6 +182,7 @@ class ComPtr<T>
         return raw;
     }
 
+    // Destructor: Release any held pointer exactly once.
     ~ComPtr()
     {
         reset();

@@ -27,6 +27,7 @@ import "page_pool.cb";
 // Header at the front of each malloc'd block. Data begins after the header
 // (sizeof(_pa_chunk) = 24 bytes on 64-bit). Blocks are chained as a linked list.
 
+// One bump-allocation block: header followed by data, chained into a list.
 struct _pa_chunk
 {
     _pa_chunk* _next = nullptr;
@@ -36,6 +37,8 @@ struct _pa_chunk
 
 // ── page_arena ────────────────────────────────────────────────────────────────
 
+// Transferable bump-allocation region holding a typed message root T, used for
+// zero-copy hand-off between producer and consumer over an arena_channel.
 struct page_arena<T> where T : IMessage
 {
     void*      _pool      = nullptr;   // reserved for future pool back-pointer
@@ -47,6 +50,7 @@ struct page_arena<T> where T : IMessage
 
     // ── Bump allocation ───────────────────────────────────────────────────────
 
+    // Acquire a new chunk (pooled page or oversize vmem) and make it the head.
     void _newChunk(i64 minSize)
     {
         i64 headerSz = (i64)sizeof(_pa_chunk);
@@ -72,6 +76,7 @@ struct page_arena<T> where T : IMessage
         _head    = c;
     }
 
+    // Bump-allocate size bytes from the head chunk, opening a new one as needed.
     void* alloc(i64 size)
     {
         if (size <= (i64)0) return nullptr;
@@ -84,6 +89,7 @@ struct page_arena<T> where T : IMessage
         return p;
     }
 
+    // Zero-initialize and return size bytes.
     void* zalloc(i64 size)
     {
         void* p = alloc(size);
@@ -91,6 +97,7 @@ struct page_arena<T> where T : IMessage
         return p;
     }
 
+    // Total bytes dispensed across all chunks.
     i64 usedBytes()
     {
         i64 total = 0;
@@ -99,6 +106,7 @@ struct page_arena<T> where T : IMessage
         return total;
     }
 
+    // Total bytes reserved across all chunks.
     i64 totalBytes()
     {
         i64 total = 0;
@@ -136,6 +144,7 @@ struct page_arena<T> where T : IMessage
         _head = nullptr;
     }
 
+    // Return all chunks on destruction.
     ~page_arena()
     {
         free_chunks();

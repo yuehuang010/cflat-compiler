@@ -29,6 +29,8 @@ struct _BlockPage
     i64  _usedCount  = 0;
 };
 
+// Fixed-block-size page allocator: each 64K page is carved into uniform blocks
+// tracked by a per-page byte bitmap.
 class BlockAllocator : IAllocator
 {
     _BlockPage* _pages        = nullptr;
@@ -39,6 +41,7 @@ class BlockAllocator : IAllocator
     i64         _reservedNow  = 0;
     i64         _peakReserved = 0;
 
+    // Query page size and L3 cache-line block size from the OS.
     void _init()
     {
         // --- page size from GetSystemInfo ---
@@ -68,6 +71,7 @@ class BlockAllocator : IAllocator
         free((void*)buf);
     }
 
+    // Double the page-tracking array capacity, copying existing entries.
     void _growPages()
     {
         int newCap = _pageCapacity == 0 ? 4 : _pageCapacity * 2;
@@ -177,8 +181,11 @@ class BlockAllocator : IAllocator
         return total;
     }
 
+    // Live bytes = used blocks times the fixed block size.
     i64 usedBytes()    { return usedBlocks() * _blockSize; }
+    // No meaningful total; always reports 0.
     i64 totalBytes()   { return (i64)0; }
+    // Peak reserved bytes seen over the allocator's lifetime.
     i64 peakReserve()  { return _peakReserved; }
 
     // BlockAllocator is not thread-safe; sharing across threads is the caller's
@@ -201,6 +208,7 @@ class BlockAllocator : IAllocator
         stash[0] = (void*)raw;
         return (void*)aligned;
     }
+    // Recover the raw pointer stashed by alloc_aligned and free it.
     void dealloc_aligned(void* ptr) {
         if (ptr == nullptr) return;
         void** stash = (void**)((i8*)ptr - (i64)16);
@@ -220,6 +228,7 @@ class BlockAllocator : IAllocator
         return total;
     }
 
+    // Print a human-readable page/block usage summary to stdout.
     void PrintUsage()
     {
         i64 used  = usedBlocks();
@@ -247,6 +256,7 @@ class BlockAllocator : IAllocator
         _reservedNow  = 0;
     }
 
+    // Free every page back to the OS on destruction.
     ~BlockAllocator()
     {
         int i = 0;

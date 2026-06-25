@@ -14,11 +14,16 @@ struct view<T>
     // Point this view at an existing buffer of `len` elements.
     void wrap(T* ptr, i64 len) { _ptr = ptr; _len = len; }
 
+    // Number of elements in the view.
     i64 length() { return _len; }
+    // Raw pointer to the underlying buffer.
     T*  data()   { return _ptr; }
 
+    // Read the element at index.
     T    get(i64 index) { return _ptr[index]; }
+    // Overwrite the element at index.
     void set(i64 index, T value) { _ptr[index] = value; }
+    // v[index] - same semantics as get(index).
     T    operator[](i64 index) { return _ptr[index]; }
 
     // Sub-range view over [start, end). Offset sub-views are sound here precisely because view<T>

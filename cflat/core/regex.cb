@@ -58,11 +58,13 @@ struct ByteSet
     u64 w2 = 0;
     u64 w3 = 0;
 
+    // Clear all 256 bits (empty set).
     void _zero()
     {
         w0 = 0; w1 = 0; w2 = 0; w3 = 0;
     }
 
+    // Add byte value c to the set.
     void setBit(int c)
     {
         int w  = c >> 6;
@@ -73,6 +75,7 @@ struct ByteSet
         else             w3 = w3 | m;
     }
 
+    // Remove byte value c from the set.
     void clearBit(int c)
     {
         int w   = c >> 6;
@@ -84,6 +87,7 @@ struct ByteSet
         else             w3 = w3 & inv;
     }
 
+    // Return true if byte value c is in the set.
     bool test(int c)
     {
         int w  = c >> 6;
@@ -94,18 +98,21 @@ struct ByteSet
         return (w3 & m) != (u64)0;
     }
 
+    // Add every byte value in [lo, hi] to the set.
     void setRange(int lo, int hi)
     {
         int i = lo;
         while (i <= hi) { setBit(i); i++; }
     }
 
+    // Add all 256 byte values to the set.
     void setAll()
     {
         u64 all = (u64)0 - (u64)1;
         w0 = all; w1 = all; w2 = all; w3 = all;
     }
 
+    // Invert membership: every byte in the set leaves and vice versa.
     void negate()
     {
         u64 all = (u64)0 - (u64)1;
@@ -161,18 +168,21 @@ struct Match
     int  end     = 0;     // == caps[1]
     int  caps[20];        // filled only when success; group g -> caps[2g], caps[2g+1]
 
+    // Start byte offset of group g, or -1 if g is out of range.
     int groupStart(int g)
     {
         if (g < 0 || g > 9) return -1;
         return caps[2 * g];
     }
 
+    // End byte offset (exclusive) of group g, or -1 if g is out of range.
     int groupEnd(int g)
     {
         if (g < 0 || g > 9) return -1;
         return caps[2 * g + 1];
     }
 
+    // True if the match succeeded and group g participated in it.
     bool groupMatched(int g)
     {
         if (!success) return false;
@@ -225,12 +235,14 @@ class Regex
 
     // -- pool helpers --------------------------------------------------------
 
+    // Intern a ByteSet into the set pool; return its index.
     int _addSet(ByteSet bs)
     {
         _sets.add(bs);
         return _sets.count() - 1;
     }
 
+    // Allocate a set-leaf AST node referencing set index setIdx; return its index.
     int _newNodeSet(int setIdx)
     {
         ReNode r; r.kind = 0; r.setIdx = setIdx;
@@ -238,6 +250,7 @@ class Regex
         return _nodes.count() - 1;
     }
 
+    // Allocate a binary AST node (concat or alt) with two children; return its index.
     int _newNodeBinary(int kind, int a, int b)
     {
         ReNode r; r.kind = kind; r.a = a; r.b = b;
@@ -245,6 +258,7 @@ class Regex
         return _nodes.count() - 1;
     }
 
+    // Allocate a unary AST node (star/plus/quest) with one child; return its index.
     int _newNodeUnary(int kind, int a)
     {
         ReNode r; r.kind = kind; r.a = a;
@@ -252,6 +266,7 @@ class Regex
         return _nodes.count() - 1;
     }
 
+    // Allocate a bounded-repeat AST node {n,m}; return its index.
     int _newNodeRepeat(int a, int n, int m)
     {
         ReNode r; r.kind = 6; r.a = a; r.n = n; r.m = m;
@@ -259,6 +274,7 @@ class Regex
         return _nodes.count() - 1;
     }
 
+    // Allocate an assertion AST node (anchor / word boundary); return its index.
     int _newNodeAssert(int ak)
     {
         ReNode r; r.kind = 7; r.assertKind = ak;
@@ -266,6 +282,7 @@ class Regex
         return _nodes.count() - 1;
     }
 
+    // Allocate an empty (epsilon) AST node; return its index.
     int _newNodeEmpty()
     {
         ReNode r; r.kind = 8;
@@ -273,6 +290,7 @@ class Regex
         return _nodes.count() - 1;
     }
 
+    // Allocate a capturing-group AST node wrapping child a as group g; return its index.
     int _newNodeGroup(int a, int g)
     {
         ReNode r; r.kind = 9; r.a = a; r.n = g;
@@ -282,12 +300,14 @@ class Regex
 
     // -- cursor --------------------------------------------------------------
 
+    // Current pattern byte without advancing, or 0 at end.
     i8 _peek()
     {
         if (_pos >= _len) return 0;
         return _src[_pos];
     }
 
+    // Pattern byte `off` positions ahead without advancing, or 0 past the end.
     i8 _peekAt(int off)
     {
         int p = _pos + off;
@@ -295,6 +315,7 @@ class Regex
         return _src[p];
     }
 
+    // Return the current pattern byte and advance the cursor, or 0 at end.
     i8 _consume()
     {
         if (_pos >= _len) return 0;
@@ -305,11 +326,13 @@ class Regex
 
     // -- character-class fillers + case folding ------------------------------
 
+    // Add the digit class [0-9] to b.
     void _fillDigit(ByteSet* b)
     {
         b->setRange((int)'0', (int)'9');
     }
 
+    // Add the word class [0-9A-Za-z_] to b.
     void _fillWord(ByteSet* b)
     {
         b->setRange((int)'0', (int)'9');
@@ -318,6 +341,7 @@ class Regex
         b->setBit((int)'_');
     }
 
+    // Add the whitespace class (space, tab, newline, CR, vtab, formfeed) to b.
     void _fillSpace(ByteSet* b)
     {
         b->setBit((int)' ');
@@ -341,6 +365,7 @@ class Regex
 
     // -- parser (recursive descent) ------------------------------------------
 
+    // Parse an alternation (a|b|...); returns the root AST node index.
     int _parseAlt()
     {
         int left = _parseConcat();
@@ -353,6 +378,7 @@ class Regex
         return left;
     }
 
+    // Parse a sequence of concatenated repeated atoms; returns the AST node index.
     int _parseConcat()
     {
         int result = -1;
@@ -369,6 +395,7 @@ class Regex
         return result;
     }
 
+    // Parse an atom plus any trailing quantifier (* + ? {n,m}); returns the node index.
     int _parseRepeated()
     {
         int atom = _parseAtom();
@@ -381,6 +408,7 @@ class Regex
         return atom;
     }
 
+    // Read a run of decimal digits as an int; sets _ok = false if none are present.
     int _readInt()
     {
         i8 c = _peek();
@@ -396,6 +424,7 @@ class Regex
         return v;
     }
 
+    // Parse a {n}, {n,}, or {n,m} bounded repeat applied to atom; returns the node index.
     int _parseBrace(int atom)
     {
         _consume(); // '{'
@@ -414,6 +443,7 @@ class Regex
         return _newNodeRepeat(atom, nVal, mVal);
     }
 
+    // Parse a single atom: group, class, '.', anchor, escape, or literal byte.
     int _parseAtom()
     {
         i8 c = _peek();
@@ -444,6 +474,7 @@ class Regex
         return _newNodeSet(_addSet(bs));
     }
 
+    // Parse a backslash escape outside a class (\d \w \s \b etc.); returns the node index.
     int _parseEscape()
     {
         i8 c = _consume();
@@ -468,6 +499,7 @@ class Regex
         return _newNodeSet(_addSet(bs));
     }
 
+    // Add the bytes of a backslash escape inside a [...] class to bs.
     void _addClassEscape(ByteSet* bs, i8 e)
     {
         if      (e == 'd') _fillDigit(bs);
@@ -479,6 +511,7 @@ class Regex
         else               bs->setBit((int)e & 0xFF);
     }
 
+    // Parse a [...] / [^...] character class into a set node; returns the node index.
     int _parseClass()
     {
         _consume(); // '['
@@ -522,6 +555,7 @@ class Regex
 
     // -- NFA construction (Thompson, continuation-passing) -------------------
 
+    // Add a consume state matching set setIdx then going to out; return its index.
     int _newConsume(int setIdx, int out)
     {
         NfaState s; s.kind = 0; s.setIdx = setIdx; s.out = out;
@@ -529,6 +563,7 @@ class Regex
         return _states.count() - 1;
     }
 
+    // Add a split state with two epsilon targets (out higher priority); return its index.
     int _newSplit(int out, int out2)
     {
         NfaState s; s.kind = 1; s.out = out; s.out2 = out2;
@@ -536,6 +571,7 @@ class Regex
         return _states.count() - 1;
     }
 
+    // Add a zero-width assertion state then going to out; return its index.
     int _newAssertState(int ak, int out)
     {
         NfaState s; s.kind = 3; s.assertKind = ak; s.out = out;
@@ -543,6 +579,7 @@ class Regex
         return _states.count() - 1;
     }
 
+    // Add a save state recording capture slot then going to out; return its index.
     int _newSave(int slot, int out)
     {
         NfaState s; s.kind = 4; s.slot = slot; s.out = out;
@@ -550,6 +587,7 @@ class Regex
         return _states.count() - 1;
     }
 
+    // Add an accept state; return its index.
     int _newAccept()
     {
         NfaState s; s.kind = 2;
@@ -557,6 +595,7 @@ class Regex
         return _states.count() - 1;
     }
 
+    // Patch the primary out-edge of state idx to point at v.
     void _setOut(int idx, int v)
     {
         NfaState s = _states.get(idx);
@@ -564,6 +603,7 @@ class Regex
         _states.set(idx, s);
     }
 
+    // Compile AST node into NFA states ending at cont; return the entry state index.
     int _emit(int node, int cont)
     {
         ReNode r = _nodes.get(node);
@@ -643,6 +683,7 @@ class Regex
 
     // -- public: compile -----------------------------------------------------
 
+    // Parse and build the NFA for pattern; returns false on a syntax error.
     bool _compile(string pattern, bool ignoreCase)
     {
         _nodes.clear();
@@ -668,13 +709,18 @@ class Regex
         return true;
     }
 
+    // Compile pattern case-sensitively; returns false on a syntax error.
     bool compile(string pattern)           { return _compile(pattern, false); }
+    // Compile pattern case-insensitively; returns false on a syntax error.
     bool compileIgnoreCase(string pattern) { return _compile(pattern, true); }
+    // True if the last compile() succeeded.
     bool ok()        { return _ok; }
+    // Number of capture groups in the compiled pattern.
     int  groupCount() { return _ngroups; }
 
     // -- matching (Pike VM, leftmost-first) ----------------------------------
 
+    // True if byte c is a word character [0-9A-Za-z_].
     bool _isWordByte(i8 c)
     {
         int u = (int)c & 0xFF;
@@ -684,12 +730,14 @@ class Regex
             || u == (int)'_';
     }
 
+    // True if position i is in bounds and holds a word byte.
     bool _wordAt(i8* s, int n, int i)
     {
         if (i < 0 || i >= n) return false;
         return _isWordByte(s[i]);
     }
 
+    // Evaluate a zero-width assertion (^, $, or \b) at position pos.
     bool _assertHolds(int ak, int pos, i8* s, int n)
     {
         if (ak == 0) return pos == 0;
@@ -807,6 +855,7 @@ class Regex
         return matched;
     }
 
+    // Allocate and -1-initialize a per-state dedup stamp array; caller frees it.
     int* _newStamp()
     {
         int* stamp = new int[_nstates];
@@ -852,6 +901,7 @@ class Regex
         return r;
     }
 
+    // True if the pattern matches anywhere in input.
     bool isMatch(string input)
     {
         Match m = find(input);
@@ -900,6 +950,7 @@ class Regex
 
     // -- replace / split -----------------------------------------------------
 
+    // Append bytes [a, b) of s to the builder.
     void _appendRange(stringbuilder* sb, i8* s, int a, int b)
     {
         int i = a;
@@ -956,6 +1007,7 @@ class Regex
         return sb.toString();
     }
 
+    // Return an owning string copy of bytes [a, b) of s.
     move string _substr(i8* s, int a, int b)
     {
         int len = b - a;
@@ -989,6 +1041,7 @@ class Regex
 
     // -- static one-off helpers ---------------------------------------------
 
+    // One-off: compile pattern and test whether it matches input.
     static bool isMatch(string pattern, string input)
     {
         Regex re;
@@ -996,6 +1049,7 @@ class Regex
         return re.isMatch(input);
     }
 
+    // One-off: compile pattern and return the leftmost match in input.
     static Match find(string pattern, string input)
     {
         Regex re;

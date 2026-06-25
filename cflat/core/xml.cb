@@ -10,6 +10,7 @@ class XmlBuilder : IReflector
     string        _rootTag = default;
     list<string>  _tags   = default;
 
+    // Emit an opening tag <tag>.
     void _openTag(string tag)
     {
         sb.appendChar('<');
@@ -17,6 +18,7 @@ class XmlBuilder : IReflector
         sb.appendChar('>');
     }
 
+    // Emit a closing tag </tag>.
     void _closeTag(string tag)
     {
         sb.append("</");
@@ -24,6 +26,7 @@ class XmlBuilder : IReflector
         sb.appendChar('>');
     }
 
+    // Open an object element; uses the root tag at depth 0, else "item" when unnamed.
     void beginObject(string name)
     {
         string tag = name;
@@ -36,6 +39,7 @@ class XmlBuilder : IReflector
         _tags.add(tag);
     }
 
+    // Close the current object element.
     void endObject()
     {
         int last = _tags.count() - 1;
@@ -44,12 +48,14 @@ class XmlBuilder : IReflector
         _closeTag(tag);
     }
 
+    // Open an array element named `name`.
     void beginArray(string name)
     {
         _openTag(name);
         _tags.add(name);
     }
 
+    // Close the current array element.
     void endArray()
     {
         int last = _tags.count() - 1;
@@ -58,6 +64,7 @@ class XmlBuilder : IReflector
         _closeTag(tag);
     }
 
+    // Emit an integer field as <tag>value</tag>.
     void visitInt(string name, int value)
     {
         string tag = name;
@@ -67,6 +74,7 @@ class XmlBuilder : IReflector
         _closeTag(tag);
     }
 
+    // Emit a bool field as <tag>true</tag> or <tag>false</tag>.
     void visitBool(string name, bool value)
     {
         string tag = name;
@@ -76,6 +84,7 @@ class XmlBuilder : IReflector
         _closeTag(tag);
     }
 
+    // Emit a float field, using integer form when the value is integral.
     void visitFloat(string name, float value)
     {
         string tag = name;
@@ -96,6 +105,7 @@ class XmlBuilder : IReflector
         _closeTag(tag);
     }
 
+    // Emit a string field, escaping &, <, and > as XML entities.
     void visitString(string name, string value)
     {
         string tag = name;
@@ -116,6 +126,7 @@ class XmlBuilder : IReflector
         _closeTag(tag);
     }
 
+    // Emit a null field as a self-closing <tag />.
     void visitNull(string name)
     {
         string tag = name;
@@ -125,8 +136,10 @@ class XmlBuilder : IReflector
         sb.append(" />");
     }
 
+    // Return the accumulated XML as a string.
     string toString() { return sb.toString(); }
 
+    // Serialize obj to an XML string with the given root tag.
     static string toXml<T>(T obj, const char* rootTag)
     {
         XmlBuilder b;
@@ -139,6 +152,7 @@ class XmlBuilder : IReflector
         return b.toString();
     }
 
+    // Parse an XML string and deserialize it into a value of type T.
     static T fromXml<T>(string xml)
     {
         Arena arena;
@@ -197,6 +211,7 @@ class XmlNode : IJSON, IJSONArray
     XmlNode* _nextSibling = nullptr;
     int      _childCount  = 0;
 
+    // Recursively delete all child nodes.
     ~XmlNode()
     {
         XmlNode* child = _firstChild;
@@ -208,6 +223,7 @@ class XmlNode : IJSON, IJSONArray
         }
     }
 
+    // Append child to the end of this node's child list, taking ownership.
     void _appendChild(move XmlNode* child)
     {
         child._nextSibling = nullptr;
@@ -224,6 +240,7 @@ class XmlNode : IJSON, IJSONArray
         _childCount++;
     }
 
+    // Return the first child element whose tag equals `tag`, or nullptr.
     XmlNode* _findTag(string tag)
     {
         XmlNode* child = _firstChild;
@@ -235,6 +252,7 @@ class XmlNode : IJSON, IJSONArray
         return nullptr;
     }
 
+    // Return the child element at position `index`, or nullptr if out of range.
     XmlNode* _getIndex(int index)
     {
         XmlNode* child = _firstChild;
@@ -243,6 +261,7 @@ class XmlNode : IJSON, IJSONArray
         return child;
     }
 
+    // Parse decimal text (with optional leading '-') into an int.
     int _textToInt(string text)
     {
         i8* p = text.data();
@@ -255,6 +274,7 @@ class XmlNode : IJSON, IJSONArray
         return neg ? -acc : acc;
     }
 
+    // Parse decimal text with an optional fractional part into a float.
     float _textToFloat(string text)
     {
         i8* p = text.data();
@@ -275,8 +295,10 @@ class XmlNode : IJSON, IJSONArray
 
     // ── IJSON ─────────────────────────────────────────────────────────────────
 
+    // True if a child element named `key` exists.
     bool hasField(string key) { return _findTag(key) != nullptr; }
 
+    // Integer value of child element `key`, or 0 if absent.
     int getInt(string key)
     {
         XmlNode* n = _findTag(key);
@@ -284,6 +306,7 @@ class XmlNode : IJSON, IJSONArray
         return _textToInt(n._text);
     }
 
+    // Bool value of child element `key` ("true"), or false if absent.
     bool getBool(string key)
     {
         XmlNode* n = _findTag(key);
@@ -291,6 +314,7 @@ class XmlNode : IJSON, IJSONArray
         return n._text == "true";
     }
 
+    // Float value of child element `key`, or 0 if absent.
     float getFloat(string key)
     {
         XmlNode* n = _findTag(key);
@@ -298,6 +322,7 @@ class XmlNode : IJSON, IJSONArray
         return _textToFloat(n._text);
     }
 
+    // Text value of child element `key`, or "" if absent.
     string getString(string key)
     {
         XmlNode* n = _findTag(key);
@@ -305,6 +330,7 @@ class XmlNode : IJSON, IJSONArray
         return n._text;
     }
 
+    // Child element `key` as a nested object, or default if absent/leaf.
     IJSON getObject(string key)
     {
         XmlNode* n = _findTag(key);
@@ -314,6 +340,7 @@ class XmlNode : IJSON, IJSONArray
         return result;
     }
 
+    // Child element `key` as an array of its children, or default if absent.
     IJSONArray getArray(string key)
     {
         XmlNode* n = _findTag(key);
@@ -325,8 +352,10 @@ class XmlNode : IJSON, IJSONArray
 
     // ── IJSONArray ────────────────────────────────────────────────────────────
 
+    // Number of child elements.
     int count() { return _childCount; }
 
+    // Integer value of the child at `index`, or 0 if out of range.
     int getInt(int index)
     {
         XmlNode* n = _getIndex(index);
@@ -334,6 +363,7 @@ class XmlNode : IJSON, IJSONArray
         return _textToInt(n._text);
     }
 
+    // Bool value of the child at `index` ("true"), or false if out of range.
     bool getBool(int index)
     {
         XmlNode* n = _getIndex(index);
@@ -341,6 +371,7 @@ class XmlNode : IJSON, IJSONArray
         return n._text == "true";
     }
 
+    // Float value of the child at `index`, or 0 if out of range.
     float getFloat(int index)
     {
         XmlNode* n = _getIndex(index);
@@ -348,6 +379,7 @@ class XmlNode : IJSON, IJSONArray
         return _textToFloat(n._text);
     }
 
+    // Text value of the child at `index`, or "" if out of range.
     string getString(int index)
     {
         XmlNode* n = _getIndex(index);
@@ -355,6 +387,7 @@ class XmlNode : IJSON, IJSONArray
         return n._text;
     }
 
+    // Child at `index` as a nested object, or default if out of range/leaf.
     IJSON getObject(int index)
     {
         XmlNode* n = _getIndex(index);
@@ -377,6 +410,7 @@ struct XmlParser
     int    _len   = 0;
     Arena* _arena = nullptr;
 
+    // Allocate a node from the arena when set, else from the heap.
     XmlNode* _allocNode()
     {
         if (_arena != nullptr)
@@ -384,8 +418,10 @@ struct XmlParser
         return new XmlNode;
     }
 
+    // Current byte without advancing, or 0 at end.
     i8 _peek() { if (_pos >= _len) return 0; return _src[_pos]; }
 
+    // Return the current byte and advance, or 0 at end.
     i8 _consume()
     {
         if (_pos >= _len) return 0;
@@ -394,6 +430,7 @@ struct XmlParser
         return c;
     }
 
+    // Advance past any run of whitespace.
     void _skipWs()
     {
         while (_pos < _len)

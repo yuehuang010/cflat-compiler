@@ -26,38 +26,67 @@ namespace os.windows
 {
 
     // Win32 Threading - all Win32 API functions use __stdcall calling convention.
+    // Create a new OS thread running 'fn' with argument 'param'.
     extern stdcall void*     CreateThread(void* attr, win_size stackSize, function<win_int(void*)> fn, void* param, i32 flags, i32* id);
+    // Pin a thread to the given CPU affinity mask; returns the previous mask.
     extern stdcall win_usize SetThreadAffinityMask(void* handle, win_usize mask);
+    // Wait up to 'ms' milliseconds for the handle to become signaled.
     extern stdcall i32       WaitForSingleObject(void* handle, i32 ms);
+    // Retrieve a finished thread's exit code into 'code'.
     extern stdcall i32       GetExitCodeThread(void* handle, i32* code);
+    // Close a kernel object handle.
     extern stdcall win_int   CloseHandle(void* handle);
+    // Forcibly terminate a thread (unsafe; skips cleanup).
     extern stdcall win_int   TerminateThread(void* handle, i32 exitCode);
+    // Yield the remainder of this thread's time slice to another ready thread.
     extern stdcall win_int   SwitchToThread();
+    // Return the calling thread's OS thread id.
     extern stdcall u32       GetCurrentThreadId();
 
     // Win32 Timing
+    // Read the current high-resolution performance counter value.
     extern stdcall win_int  QueryPerformanceCounter(i64* count);
+    // Read the performance counter frequency (ticks per second).
     extern stdcall win_int  QueryPerformanceFrequency(i64* freq);
+    // Get the current wall-clock time as a FILETIME (100-ns ticks since 1601).
     extern stdcall void     GetSystemTimeAsFileTime(i64* fileTime);
+    // Suspend the calling thread for 'ms' milliseconds.
     extern stdcall void     Sleep(i32 ms);
 
     // Win32 Synchronization
+    // Initialize a critical section lock.
     extern stdcall void     InitializeCriticalSection(void* cs);
+    // Release the resources owned by a critical section.
     extern stdcall void     DeleteCriticalSection(void* cs);
+    // Acquire (lock) a critical section, blocking if held.
     extern stdcall void     EnterCriticalSection(void* cs);
+    // Release (unlock) a critical section.
     extern stdcall void     LeaveCriticalSection(void* cs);
+    // Create a semaphore with an initial and maximum count.
     extern stdcall void*    CreateSemaphoreA(void* attr, i32 initial, i32 max_count, void* name);
+    // Increase a semaphore's count, optionally returning the previous count.
     extern stdcall win_int  ReleaseSemaphore(void* handle, i32 count, i32* prev);
+    // Create an event object (manual- or auto-reset).
     extern stdcall void*    CreateEventA(void* attr, i32 manual_reset, i32 initial_state, void* name);
+    // Signal an event object.
     extern stdcall i32      SetEvent(void* handle);
+    // Acquire a slim reader/writer lock for exclusive (write) access.
     extern stdcall void     AcquireSRWLockExclusive(void** srw);
+    // Release an exclusively-held slim reader/writer lock.
     extern stdcall void     ReleaseSRWLockExclusive(void** srw);
+    // Acquire a slim reader/writer lock for shared (read) access.
     extern stdcall void     AcquireSRWLockShared(void** srw);
+    // Release a shared-held slim reader/writer lock.
     extern stdcall void     ReleaseSRWLockShared(void** srw);
+    // Initialize a condition variable.
     extern stdcall void     InitializeConditionVariable(void* cv);
+    // Wait on a condition variable, releasing the critical section while blocked.
     extern stdcall i32      SleepConditionVariableCS(void* cv, void* cs, i32 ms);
+    // Wait on a condition variable, releasing the SRW lock while blocked.
     extern stdcall i32      SleepConditionVariableSRW(void* cv, void** srw, i32 ms, u32 flags);
+    // Wake a single thread waiting on a condition variable.
     extern stdcall void     WakeConditionVariable(void* cv);
+    // Wake all threads waiting on a condition variable.
     extern stdcall void     WakeAllConditionVariable(void* cv);
 
     // Win32 SYSTEM_INFO - pointer-sized fields use i8* so layout matches Win32/Win64 ABI.
@@ -93,18 +122,26 @@ namespace os.windows
     };
 
     // Win32 Virtual Memory - dwSize is SIZE_T (win_size).
+    // Fill a SYSTEM_INFO struct (page size, processor count, allocation granularity).
     extern stdcall void     GetSystemInfo(_SystemInfo* lpSystemInfo);
+    // Query logical processor and cache topology into a caller-sized buffer.
     extern stdcall win_int  GetLogicalProcessorInformation(_SysLogicalProcInfo* Buffer, u32* ReturnLength);
+    // Reserve and/or commit pages of virtual memory.
     extern stdcall void*    VirtualAlloc(void* lpAddress, win_size dwSize, u32 flAllocationType, u32 flProtect);
+    // Release or decommit a region of virtual memory.
     extern stdcall win_int  VirtualFree(void* lpAddress, win_size dwSize, u32 dwFreeType);
+    // Return a handle to the calling process's default heap.
     extern stdcall void*    GetProcessHeap();
+    // Validate the integrity of a heap (or a single allocation).
     extern stdcall win_int  HeapValidate(void* hHeap, u32 dwFlags, const void* lpMem);
 
     // Win32: callers always pass i64 for sizes; these wrappers truncate to i32 before calling the API.
     if const (__PLATFORM__ == 32) {
+        // Win32 overload: truncate the i64 size to i32 before calling VirtualAlloc.
         void* VirtualAlloc(void* lpAddress, i64 dwSize, u32 flAllocationType, u32 flProtect) {
             return VirtualAlloc(lpAddress, (i32)dwSize, flAllocationType, flProtect);
         }
+        // Win32 overload: truncate the i64 size to i32 before calling VirtualFree.
         win_int VirtualFree(void* lpAddress, i64 dwSize, u32 dwFreeType) {
             return VirtualFree(lpAddress, (i32)dwSize, dwFreeType);
         }
@@ -133,6 +170,7 @@ namespace os.windows
     // GetProcessMemoryInfo, so it resolves from kernel32.lib (already linked) with no
     // psapi.lib dependency. Available since Windows 7.
     extern stdcall void*    GetCurrentProcess();
+    // Fill PROCESS_MEMORY_COUNTERS for a process (kernel32 alias of GetProcessMemoryInfo).
     extern stdcall win_int  K32GetProcessMemoryInfo(void* process, _ProcessMemoryCounters* counters, u32 cb);
 
     // Fill 'out' with the calling process's memory counters. Sets the required 'cb'
@@ -197,29 +235,51 @@ namespace os.windows
     };
 
     // Win32 Filesystem
+    // Open a C stdio file stream for the given path and mode.
     extern void*    fopen(const char* path, const char* mode);
+    // Close a C stdio file stream.
     extern win_int  fclose(void* stream);
+    // Read 'count' items of 'size' bytes from a stream into buf.
     extern win_int  fread(i8* buf, win_int size, win_int count, void* stream);
+    // Write 'count' items of 'size' bytes from buf to a stream.
     extern win_int  fwrite(i8* buf, win_int size, win_int count, void* stream);
+    // Read a line (up to size-1 bytes) from a stream into buf.
     extern i8*      fgets(i8* buf, win_int size, void* stream);
+    // Return nonzero once a stream has reached end-of-file.
     extern win_int  feof(void* stream);
+    // Move a stream's file position relative to origin.
     extern win_int  fseek(void* stream, win_int offset, win_int origin);
+    // Return a stream's current file position.
     extern win_int  ftell(void* stream);
+    // Delete a file by path.
     extern win_int  _unlink(const char* path);
+    // Move or rename a file (flags control replace/copy behavior).
     extern stdcall win_int  MoveFileExA(const char* existing, const char* newPath, win_int flags);
+    // Test a path for existence or access permissions.
     extern win_int  _access(const char* path, win_int mode);
+    // Create a directory.
     extern win_int  _mkdir(const char* path);
+    // Remove an empty directory.
     extern win_int  _rmdir(const char* path);
+    // Copy the current working directory into buf.
     extern i8*      _getcwd(i8* buf, win_int size);
+    // Change the current working directory.
     extern win_int  _chdir(const char* path);
     // HANDLE is pointer-sized (void*); INVALID_HANDLE_VALUE = (void*)-1.
     extern stdcall void*    FindFirstFileA(const char* pattern, _WIN32_FIND_DATAA* findData);
+    // Retrieve the next matching entry in a FindFirstFileA enumeration.
     extern stdcall win_int  FindNextFileA(void* handle, _WIN32_FIND_DATAA* findData);
+    // Close a file-search handle from FindFirstFileA.
     extern stdcall win_int  FindClose(void* handle);
+    // Return a file's attribute flags, or -1 if it does not exist.
     extern stdcall win_int  GetFileAttributesA(const char* path);
+    // Copy a file, optionally failing if the destination already exists.
     extern stdcall win_int  CopyFileA(const char* existing, const char* newPath, win_int failIfExists);
+    // Get the path of the directory used for temporary files.
     extern stdcall win_int  GetTempPathA(win_int bufLen, i8* buf);
+    // Create a uniquely named temporary file and return its name.
     extern stdcall win_int  GetTempFileNameA(const char* pathName, const char* prefix, win_int unique, i8* tmpFileName);
+    // Resolve a path to its absolute, fully qualified form.
     extern stdcall win_int  GetFullPathNameA(const char* fileName, win_int bufLen, i8* buf, void* filePart);
 
     // Win32 Console
@@ -277,18 +337,31 @@ namespace os.windows
         _InputEvent _event    = default;  //  4 - KEY_EVENT_RECORD or MOUSE_EVENT_RECORD
     };
 
+    // Return a standard device handle (stdin/stdout/stderr).
     extern stdcall void*    GetStdHandle(i32 nStdHandle);
+    // Write bytes to a file or console handle.
     extern stdcall win_int  WriteFile(void* hFile, const char* lpBuffer, i32 nNumberOfBytesToWrite, i32* lpNumberOfBytesWritten, void* lpOverlapped);
+    // Get the input/output mode flags of a console handle.
     extern stdcall win_int  GetConsoleMode(void* hConsoleHandle, i32* lpMode);
+    // Set the input/output mode flags of a console handle.
     extern stdcall win_int  SetConsoleMode(void* hConsoleHandle, i32 dwMode);
+    // Return the console's active output code page.
     extern stdcall i32      GetConsoleOutputCP();
+    // Set the console's active output code page.
     extern stdcall win_int  SetConsoleOutputCP(i32 wCodePageID);
+    // Set the console cursor size and visibility.
     extern stdcall win_int  SetConsoleCursorInfo(void* hConsoleOutput, _CONSOLE_CURSOR_INFO* lpConsoleCursorInfo);
+    // Read the console screen buffer size, cursor, and window info.
     extern stdcall win_int  GetConsoleScreenBufferInfo(void* hConsoleOutput, _CONSOLE_SCREEN_BUFFER_INFO* lpConsoleScreenBufferInfo);
+    // Return the count of unread console input events.
     extern stdcall win_int  GetNumberOfConsoleInputEvents(void* hConsoleInput, i32* lpcNumberOfEvents);
+    // Read and remove console input events into a buffer.
     extern stdcall win_int  ReadConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lpBuffer, i32 nLength, i32* lpNumberOfEventsRead);
+    // Read console input events without removing them from the buffer.
     extern stdcall win_int  PeekConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lpBuffer, i32 nLength, i32* lpNumberOfEventsRead);
+    // Write events into the console input buffer.
     extern stdcall win_int  WriteConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lpBuffer, i32 nLength, i32* lpNumberOfEventsWritten);
+    // Discard all pending console input events.
     extern stdcall win_int  FlushConsoleInputBuffer(void* hConsoleInput);
 
     // _CHAR_INFO - 4 bytes per console screen buffer cell.
@@ -317,7 +390,10 @@ namespace os.windows
     // echo, bypasses stdin entirely. Special keys (arrows, F-keys) arrive as a
     // 0 or 0xE0 prefix followed by a second _getch() returning the scan code.
     extern int      _getch();
+    // UCRT primitive backing printf/fprintf-family formatting to a stream.
     extern win_int  __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
+    // UCRT primitive backing sprintf-family formatting into a buffer.
     extern win_int  __stdio_common_vsprintf(u64 options, char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);
+    // UCRT primitive backing sscanf-family parsing from a buffer.
     extern win_int  __stdio_common_vsscanf(u64 options, const char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);
 }

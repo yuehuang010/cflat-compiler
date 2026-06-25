@@ -14,6 +14,7 @@
 extern i64 __atomic_counter_decrement(i64* ptr);
 extern i64 __atomic_counter_read(i64* ptr);
 
+// One-shot countdown latch; waiters unblock once the count reaches 0.
 struct latch {
     void* _event = nullptr;  // manual-reset Win32 event (signaled when count hits 0)
     i64   _count = 0;        // remaining count (atomically decremented)

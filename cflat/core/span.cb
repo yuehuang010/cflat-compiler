@@ -36,13 +36,17 @@ struct span<T>
     // `T[]`, so binding a raw `T*` here is rejected by the array-view one-way rule.
     void wrap(T[] ptr, i64 len) { _ptr = ptr; _len = len; }
 
+    // Number of elements in the span.
     i64 length() { return _len; }
 
     // The noalias view. Bind the result into a local `T[]` and loop over it for vectorization.
     T[] data() { return _ptr; }
 
+    // Read the element at index (carries the noalias contract).
     T    get(i64 index) { return _ptr[index]; }
+    // Overwrite the element at index (carries the noalias contract).
     void set(i64 index, T value) { _ptr[index] = value; }
+    // s[index] - same semantics as get(index).
     T    operator[](i64 index) { return _ptr[index]; }
 
     // Internal: build the sub-span [start, start+count) over the same buffer.

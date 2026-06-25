@@ -21,12 +21,15 @@ import "string.cb";
 extern stdcall i32 MultiByteToWideChar(u32 codePage, u32 flags, i8* mbStr, i32 mbBytes, u16* wideStr, i32 wideChars);
 extern stdcall i32 WideCharToMultiByte(u32 codePage, u32 flags, u16* wideStr, i32 wideChars, i8* mbStr, i32 mbBytes, i8* defaultChar, i32* usedDefault);
 
+// Owned UTF-16 string: heap buffer of code units plus a count, freed on scope exit.
 struct wstring
 {
     u16* _ptr = nullptr;
     i32  _len = 0;     // UTF-16 code-unit count, not counting the NUL terminator
 
+    // Pointer to the NUL-terminated UTF-16 code units.
     u16* data()   { return _ptr; }
+    // Number of UTF-16 code units, not counting the terminator.
     i32  length() { return _len; }
 
     // Copy `len` UTF-16 code units from a borrowed buffer into an owned wstring. Used to take
@@ -72,6 +75,7 @@ struct wstring
         return wstring.fromUtf16(_ptr, _len);
     }
 
+    // Free the owned UTF-16 buffer when the wstring is destroyed.
     ~wstring()
     {
         if (_ptr != nullptr) delete[] _ptr;
@@ -109,6 +113,7 @@ bool operator==(wstring a, wstring b)
     return true;
 }
 
+// Code-unit-wise inequality (negation of operator==).
 bool operator!=(wstring a, wstring b)
 {
     return !(a == b);

@@ -1,65 +1,106 @@
 // Core interfaces - auto-imported before string.cb so all modules can depend
 // on these contracts without importing separately.
 
+// Contract for a type that can render itself as a string.
 interface IString
 {
+    // Return a string representation of this value.
     string ToString();
 };
 
+// Read-only sequence: count plus indexed element access.
 interface IEnumerable<T>
 {
+    // Number of elements in the sequence.
     int count();
+    // Element at the given zero-based index.
     T   get(int index);
 };
 
+// Mutable indexed list contract: read, write, append, and remove elements.
 interface IList<T>
 {
+    // Number of elements in the list.
     int  count();
+    // Element at the given zero-based index.
     T    get(int index);
+    // Indexing operator - element at the given index.
     T    operator[](int index);
+    // Overwrite the element at the given index.
     void set(int index, T value);
+    // Append a value to the end of the list.
     void add(T value);
+    // Remove the element at the given index.
     void removeAt(int index);
+    // Remove all elements.
     void clear();
 };
 
+// Contract for a type that can produce an integer hash of itself.
 interface IHashable
 {
+    // Return an integer hash code for this value.
     int hash();
 };
 
 // Hash() overloads for primitive types - use with is_primitive(T) and if const
 // so generic data structures can call Hash(value) without knowing the concrete type.
+// Hash of a signed 8-bit value.
 int Hash(i8  value) { return (int)value; }
+// Hash of a signed 16-bit value.
 int Hash(i16 value) { return (int)value; }
+// Hash of a signed 32-bit value.
 int Hash(i32 value) { return value; }
+// Hash of a signed 64-bit value (folds high and low halves).
 int Hash(i64 value) { return (int)(value ^ (value >> 32)); }
+// Hash of an unsigned 8-bit value.
 int Hash(u8  value) { return (int)value; }
+// Hash of an unsigned 16-bit value.
 int Hash(u16 value) { return (int)value; }
+// Hash of an unsigned 32-bit value.
 int Hash(u32 value) { return (int)value; }
+// Hash of an unsigned 64-bit value (folds high and low halves).
 int Hash(u64 value) { return (int)(value ^ (value >> 32)); }
+// Hash of a character value.
 int Hash(char value) { return (int)value; }
+// Hash of a boolean value (1 for true, 0 for false).
 int Hash(bool value) { return value ? 1 : 0; }
+// Hash of a float value (truncates to int).
 int Hash(float value) { return (int)value; }
+// Hash of a double value (truncates to int).
 int Hash(double value) { return (int)value; }
 
+// Key/value map contract: lookup, insert, update, and removal by key.
 interface IDictionary<K, V>
 {
+    // Number of key/value pairs.
     int  count();
+    // True if the key is present.
     bool contains(K key);
+    // Value associated with the key.
     V    get(K key);
+    // Set (insert or overwrite) the value for a key.
     void set(K key, V value);
+    // Add a key/value pair; returns false if the key already exists.
     bool add(K key, V value);
+    // Remove the entry for a key; returns false if it was absent.
     bool remove(K key);
 };
 
+// Memory allocator contract used by generic data structures and `new`.
 interface IAllocator
 {
+    // Allocate `size` bytes and return the raw pointer.
     void* alloc(i64 size);
+    // Free a pointer previously returned by alloc.
     void  dealloc(void* ptr);
+    // Release all outstanding allocations / reset the allocator.
     void  cleanup();
+    // Bytes currently handed out and not yet freed.
     i64   usedBytes();
+    // Total bytes reserved from the OS.
     i64   totalBytes();
+    // Peak total bytes ever reserved.
     i64   peakReserve();
 
     // Spawn an allocator for a newly created thread. Allocators that are
@@ -83,10 +124,13 @@ interface IAllocator
 // `return move ...` to transfer ownership to the caller without a double-free.
 interface ICopyable<TSelf>
 {
+    // Return an owning deep copy of this value.
     move TSelf copy();
+    // Return an owning deep copy allocated from the given allocator.
     move TSelf copy(IAllocator alloc);
 };
 
+// Bounded message queue / channel contract used by programs and threads.
 interface IQueue<T>
 {
     void push(move T item);       // blocking send; ownership transferred for pointer types
@@ -96,41 +140,70 @@ interface IQueue<T>
     void send(move T item);       // alias for push (program inbox backward compat)
     T    receive();                // alias for pop  (program inbox backward compat)
     bool try_receive(T* out);     // alias for try_pop (program inbox backward compat)
+    // Initialize the queue with the given capacity.
     void init(int capacity);
+    // Maximum number of items the queue can hold.
     int  capacity();
+    // Tear down the queue and release its storage.
     void destroy();
 };
 
+// Empty marker interface for types that can be sent as a program/thread message.
 interface IMessage { };
 
+// Visitor contract for walking a value's fields - used by reflection/serialization.
 interface IReflector {
+    // Visit a named int field.
     void visitInt(string name, int value);
+    // Visit a named bool field.
     void visitBool(string name, bool value);
+    // Visit a named float field.
     void visitFloat(string name, float value);
+    // Visit a named string field.
     void visitString(string name, string value);
+    // Visit a named null field.
     void visitNull(string name);
+    // Begin a nested object scope under the given name.
     void beginObject(string name);
+    // End the current object scope.
     void endObject();
+    // Begin a nested array scope under the given name.
     void beginArray(string name);
+    // End the current array scope.
     void endArray();
 };
 
+// Read-only view of a JSON array - element count and typed element access.
 interface IJSONArray {
+    // Number of elements in the array.
     int    count();
+    // Element at the given index as an int.
     int    getInt(int index);
+    // Element at the given index as a bool.
     bool   getBool(int index);
+    // Element at the given index as a float.
     float  getFloat(int index);
+    // Element at the given index as a string.
     string getString(int index);
+    // Element at the given index as a nested object.
     IJSON  getObject(int index);
 };
 
+// Read-only view of a JSON object - typed field access by key.
 interface IJSON {
+    // True if the object has the given key.
     bool       hasField(string key);
+    // Value of the key as an int.
     int        getInt(string key);
+    // Value of the key as a bool.
     bool       getBool(string key);
+    // Value of the key as a float.
     float      getFloat(string key);
+    // Value of the key as a string.
     string     getString(string key);
+    // Value of the key as a nested object.
     IJSON      getObject(string key);
+    // Value of the key as a nested array.
     IJSONArray getArray(string key);
 };
 
@@ -138,13 +211,17 @@ interface IJSON {
 // T... is the ordered list of element types; get() returns all elements as a tuple.
 interface ITuple<T...>
 {
+    // Return all elements as a tuple.
     (T...) get();
 };
 
 // Unified interface for both `program` constructs and `process` (external child processes).
 interface IProcess
 {
+    // Start the process with the given argument list; returns false on failure.
     bool run(list<string> args);
+    // Block until the process has exited.
     void WaitForExit();
+    // Exit code of the finished process.
     int  exitCode();
 };

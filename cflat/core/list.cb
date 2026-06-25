@@ -9,6 +9,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     int _size     = 0;
     int _capacity = 0;
 
+    // Double the backing buffer capacity, moving existing elements over.
     void _grow()
     {
         int newCap = _capacity == 0 ? 4 : _capacity * 2;
@@ -196,6 +197,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         _data[hi] = tmp;
     }
 
+    // Recursive quicksort over [lo, hi] using median-of-three pivot selection.
     void _qsort(int lo, int hi, Lambda<bool(T, T)> compare)
     {
         if (lo >= hi) return;
@@ -220,6 +222,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         return _data[index];
     }
 
+    // Free all elements (pointers freed, value types destructed) then the buffer.
     ~list()
     {
         if const (is_pointer(T))

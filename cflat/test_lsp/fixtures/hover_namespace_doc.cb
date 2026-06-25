@@ -1,0 +1,7 @@
+// $cursor line=2 col=13
+// $expect hover contains="Squares an integer inside a namespace."
+namespace Math {
+  /// Squares an integer inside a namespace.
+  extern int square(int x) { return x * x; }
+}
+extern int main() { return Math.square(3); }

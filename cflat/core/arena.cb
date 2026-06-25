@@ -10,6 +10,7 @@
 //   arena.reset();   // reuse all memory without freeing blocks
 //   // destructor frees everything on scope exit
 
+// One malloc'd backing block in the arena's intrusive block list.
 struct _ArenaBlock
 {
     i8*          _data = nullptr;
@@ -18,11 +19,14 @@ struct _ArenaBlock
     _ArenaBlock* _next = nullptr;
 };
 
+// Bump/region allocator: sub-allocations come from large malloc'd blocks and
+// are all freed at once on reset() or destruction.
 class Arena
 {
     _ArenaBlock* _head      = nullptr;
     i64          _blockSize = 65536;   // 64 KiB default block size
 
+    // Allocate and push a new block at least minSize bytes large.
     void _newBlock(i64 minSize)
     {
         i64 size = _blockSize;
@@ -35,6 +39,7 @@ class Arena
         _head = blk;
     }
 
+    // Round n up to the next multiple of 8.
     i64 _align8(i64 n)
     {
         i64 rem = n % 8;
@@ -105,6 +110,7 @@ class Arena
         return total;
     }
 
+    // Free every backing block on destruction.
     ~Arena()
     {
         _ArenaBlock* blk = _head;

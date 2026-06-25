@@ -27,6 +27,7 @@
 
 i64 _timeQpcFreq = 0;
 
+// Lazily query and cache the QPC frequency (ticks per second).
 i64 _timeGetQpcFreq()
 {
     if (_timeQpcFreq == 0)
@@ -44,6 +45,7 @@ i64 _qpcToTicks(i64 qpc)
     return secs * 10000000 + rem * 10000000 / freq;
 }
 
+// Read the current raw QPC counter value.
 i64 _qpcNow()
 {
     i64 count = 0;
@@ -53,10 +55,12 @@ i64 _qpcNow()
 
 // ── Duration ─────────────────────────────────────────────────────────────────
 
+// A span of time measured in 100-ns ticks, with unit conversions and arithmetic.
 struct Duration
 {
     i64 _ticks = 0;
 
+    // Construct a Duration from a raw 100-ns tick count.
     static Duration fromTicks(i64 t)
     {
         Duration d;
@@ -64,6 +68,7 @@ struct Duration
         return d;
     }
 
+    // Construct a Duration from a count of microseconds.
     static Duration fromMicroseconds(i64 us)
     {
         Duration d;
@@ -71,6 +76,7 @@ struct Duration
         return d;
     }
 
+    // Construct a Duration from a count of milliseconds.
     static Duration fromMilliseconds(i64 ms)
     {
         Duration d;
@@ -78,6 +84,7 @@ struct Duration
         return d;
     }
 
+    // Construct a Duration from a count of seconds.
     static Duration fromSeconds(i64 s)
     {
         Duration d;
@@ -85,14 +92,22 @@ struct Duration
         return d;
     }
 
+    // Return the raw 100-ns tick count.
     i64    ticks()        { return _ticks; }
+    // Return the duration in nanoseconds.
     double nanoseconds()  { return (double)_ticks * 100.0; }
+    // Return the duration in microseconds.
     double microseconds() { return (double)_ticks / 10.0; }
+    // Return the duration in milliseconds.
     double milliseconds() { return (double)_ticks / 10000.0; }
+    // Return the duration in seconds.
     double seconds()      { return (double)_ticks / 10000000.0; }
+    // Return the duration in minutes.
     double minutes()      { return (double)_ticks / 600000000.0; }
+    // Return the duration in hours.
     double hours()        { return (double)_ticks / 36000000000.0; }
 
+    // Add two durations.
     Duration operator+(Duration other)
     {
         Duration d;
@@ -100,6 +115,7 @@ struct Duration
         return d;
     }
 
+    // Subtract another duration from this one.
     Duration operator-(Duration other)
     {
         Duration d;
@@ -110,10 +126,12 @@ struct Duration
 
 // ── TimePoint ─────────────────────────────────────────────────────────────────
 
+// A wall-clock timestamp in FILETIME ticks (100-ns intervals since Jan 1, 1601).
 struct TimePoint
 {
     i64 _ticks = 0;   // FILETIME: 100-ns intervals since Jan 1, 1601
 
+    // Return the current wall-clock time.
     static TimePoint now()
     {
         TimePoint tp;
@@ -121,8 +139,10 @@ struct TimePoint
         return tp;
     }
 
+    // Return the raw FILETIME tick count.
     i64 ticks() { return _ticks; }
 
+    // Return the Duration elapsed from 'other' to this time point.
     Duration operator-(TimePoint other)
     {
         Duration d;
@@ -133,6 +153,7 @@ struct TimePoint
 
 // ── Stopwatch ─────────────────────────────────────────────────────────────────
 
+// High-resolution elapsed-time accumulator that can be started, stopped, and reset.
 struct Stopwatch
 {
     i64  _startQpc    = 0;
@@ -174,6 +195,7 @@ struct Stopwatch
         _running     = true;
     }
 
+    // Return the total elapsed time, including the current interval if running.
     Duration elapsed()
     {
         i64 total = _accumulated;
@@ -182,11 +204,13 @@ struct Stopwatch
         return Duration.fromTicks(total);
     }
 
+    // Return true while the stopwatch is running.
     bool isRunning() { return _running; }
 };
 
 // ── Timer ─────────────────────────────────────────────────────────────────────
 
+// Countdown timer that expires after a target duration from start().
 struct Timer
 {
     i64  _startQpc    = 0;
@@ -240,6 +264,7 @@ struct Timer
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
+// Suspend the calling thread for the given number of milliseconds.
 void sleep(i64 ms)
 {
     if (ms > 0)

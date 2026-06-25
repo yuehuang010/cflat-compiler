@@ -1,14 +1,20 @@
 // malloc_allocator.cb - passthrough IAllocator that forwards directly to malloc/free.
 // Passthrough allocator; suitable when slab/block allocation is not needed.
 
+// IAllocator that forwards every request straight to CRT malloc/free.
 class MallocAllocator : IAllocator
 {
     i64 _totalBytes = 0;
 
+    // Forward to malloc and accumulate the requested size.
     void* alloc(i64 size)   { _totalBytes = _totalBytes + size; return malloc(size); }
+    // Forward directly to free.
     void  dealloc(void* ptr){ free(ptr); }
+    // No-op; nothing to release since malloc/free own the memory.
     void  cleanup()         { }
+    // No live-byte tracking; dealloc has no size, so report 0.
     i64   usedBytes()       { return (i64)0; }
+    // Cumulative bytes ever requested through alloc.
     i64   totalBytes()      { return _totalBytes; }
     // dealloc has no size, so we track cumulative alloc as a conservative upper bound.
     i64   peakReserve()     { return _totalBytes; }
@@ -26,5 +32,6 @@ class MallocAllocator : IAllocator
         _totalBytes = _totalBytes + size;
         return _aligned_malloc((win_size)size, (win_size)align);
     }
+    // Free a pointer returned by alloc_aligned using the CRT aligned-free.
     void dealloc_aligned(void* ptr) { _aligned_free(ptr); }
 };

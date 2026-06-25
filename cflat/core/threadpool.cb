@@ -753,6 +753,7 @@ class ThreadPool {
         _qLow.destroy();
     }
 
+    // Shut the pool down on scope exit if it was never explicitly shut down.
     ~ThreadPool() {
         if (_workers != nullptr || _inlineMode) { shutdown(); }
     }

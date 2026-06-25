@@ -17,6 +17,7 @@
 // passing &_lock to the Win32 functions works because SRWLOCK == { PVOID }.
 
 
+// Reader-writer lock backed by a Win32 SRWLOCK (shared reads, exclusive writes).
 struct rwlock {
     void* _lock = nullptr;   // SRWLOCK value; zero == unlocked
 
@@ -46,6 +47,7 @@ struct rwlock {
         os.windows.AcquireSRWLockExclusive(&_lock);
     }
 
+    // Release the exclusive (write) lock; used by the lock statement.
     void release() {
         os.windows.ReleaseSRWLockExclusive(&_lock);
     }

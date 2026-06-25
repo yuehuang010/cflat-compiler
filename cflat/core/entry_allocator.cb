@@ -38,6 +38,8 @@ struct _EntryLeaf
 // Per-slot in the allocator's page array.
 struct _EAPageSlot { i8* _data = nullptr; };
 
+// Variable-size bump allocator: each vmem page has an entry table tracking up
+// to 1024 live blocks; frees compact the table, oversize requests use malloc.
 class EntryAllocator : IAllocator
 {
     i8*          _currentPage  = nullptr;
@@ -53,6 +55,7 @@ class EntryAllocator : IAllocator
     // Init / page management
     // -----------------------------------------------------------------------
 
+    // Read the OS allocation granularity into _pageSize and derive _pageMask.
     void _initPageSize()
     {
         os.windows._SystemInfo* si = (os.windows._SystemInfo*)malloc((i64)sizeof(os.windows._SystemInfo));
@@ -62,6 +65,7 @@ class EntryAllocator : IAllocator
         _pageMask = ~(_pageSize - (i64)1);
     }
 
+    // Double the page-tracking array capacity, copying existing slots.
     void _growPageArray()
     {
         int newCap = _pageCapacity == 0 ? 4 : _pageCapacity * 2;
@@ -73,6 +77,7 @@ class EntryAllocator : IAllocator
         _pageCapacity = newCap;
     }
 
+    // Allocate and register a fresh vmem page with an initialized leaf header.
     i8* _newPage()
     {
         i8* data = (i8*)vmem_alloc(_pageSize);
@@ -138,6 +143,7 @@ class EntryAllocator : IAllocator
         leaf->_lastEntryPos = leaf->_lastEntryPos - 1;
     }
 
+    // True if ptr falls within leaf's page range.
     bool _leafIsValid(_EntryLeaf* leaf, i8* ptr)
     {
         return (i64)ptr > (i64)leaf && (i64)ptr < (i64)leaf + (i64)leaf->_reservedSize;
@@ -175,6 +181,7 @@ class EntryAllocator : IAllocator
     // IAllocator
     // -----------------------------------------------------------------------
 
+    // Bump-allocate size bytes from the current page, opening a new one as needed.
     void* alloc(i64 size)
     {
         if (size <= 0) return nullptr;
@@ -197,6 +204,7 @@ class EntryAllocator : IAllocator
         return (void*)_leafTryAlloc((_EntryLeaf*)_currentPage, (u16)size);
     }
 
+    // Free ptr from its owning leaf, or system-free a large fallback allocation.
     void dealloc(void* ptr)
     {
         if (ptr == nullptr) return;
@@ -213,6 +221,7 @@ class EntryAllocator : IAllocator
     // The current page is never freed even if empty (it stays as the next page).
     // -----------------------------------------------------------------------
 
+    // vmem-free every empty non-current page and compact the page array.
     void garbageCollect()
     {
         if (_pageCount <= 1) return;
@@ -241,6 +250,7 @@ class EntryAllocator : IAllocator
     // Stats
     // -----------------------------------------------------------------------
 
+    // Sum of live bytes across all owned pages.
     i64 usedBytes()
     {
         i64 total = 0;
@@ -254,7 +264,9 @@ class EntryAllocator : IAllocator
         return total;
     }
 
+    // Committed bytes = page count times page size.
     i64 totalBytes()   { return (i64)_pageCount * _pageSize; }
+    // Peak reserved bytes seen over the allocator's lifetime.
     i64 peakReserve()  { return _peakReserved; }
 
     // Not thread-safe; sharing across threads is the caller's responsibility.
@@ -263,6 +275,7 @@ class EntryAllocator : IAllocator
         return self_iface;
     }
 
+    // Allocate size bytes aligned to align, stashing the raw pointer for free.
     void* alloc_aligned(i64 size, i64 align) {
         if (align <= (i64)16) return alloc(size);
         i64 total = size + align - (i64)1 + (i64)16;
@@ -274,12 +287,14 @@ class EntryAllocator : IAllocator
         stash[0] = (void*)raw;
         return (void*)aligned;
     }
+    // Recover the raw pointer stashed by alloc_aligned and free it.
     void dealloc_aligned(void* ptr) {
         if (ptr == nullptr) return;
         void** stash = (void**)((i8*)ptr - (i64)16);
         dealloc(stash[0]);
     }
 
+    // Print a page/usage summary to stdout.
     void printUsage()
     {
         printf("EntryAllocator: %d pages, used=%lld / committed=%lld bytes\n",
@@ -290,6 +305,7 @@ class EntryAllocator : IAllocator
     // Cleanup - must be called before the allocator goes out of scope.
     // -----------------------------------------------------------------------
 
+    // vmem-free every page and reset the allocator to empty.
     void cleanup()
     {
         int i = 0;
@@ -307,5 +323,6 @@ class EntryAllocator : IAllocator
         _reservedNow  = 0;
     }
 
+    // Release all pages on destruction.
     ~EntryAllocator() { cleanup(); }
 };

@@ -25,11 +25,13 @@ function<void(int)> __fuzz_hook = nullptr;
 function<void(void*, u64)> __alloc_audit_hook = nullptr;
 function<void(void*)>      __free_audit_hook  = nullptr;
 
+// Register a handle and its close function for tracking. Currently a stub.
 void __register_handle(void* handle, void* closeFn)
 {
     // stub - handle tracking is future work
 }
 
+// Default allocation. Routes to the active allocator's alloc, or falls back to malloc.
 void* operator new(i64 size)
 {
     void* ptr = nullptr;
@@ -41,6 +43,7 @@ void* operator new(i64 size)
     return ptr;
 }
 
+// Default free. Consults the owner-dealloc hook, then the active allocator, else free.
 void operator delete(void* ptr)
 {
     if (ptr == nullptr) return;

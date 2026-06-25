@@ -6,6 +6,7 @@ class queue<T>
     int _capacity = 0;
     int _front    = 0;
 
+    // Double capacity, repacking live elements to the front of the new buffer.
     void _grow()
     {
         int newCap = _capacity == 0 ? 4 : _capacity * 2;
@@ -48,16 +49,19 @@ class queue<T>
         return _data[_front];
     }
 
+    // True when the queue has no elements.
     bool isEmpty()
     {
         return _size == 0;
     }
 
+    // Number of elements currently in the queue.
     int count()
     {
         return _size;
     }
 
+    // Destruct any owning value elements, then free the backing buffer.
     ~queue()
     {
         // Destruct owning value elements (string, nested containers); raw pointer

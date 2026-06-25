@@ -1,5 +1,7 @@
 import "arena.cb";
 
+// JsonBuilder - serializes a struct to JSON using the reflect intrinsic.
+// Honors [JsonName] (field rename) and [Private] (field skip) annotations.
 class JsonBuilder : IReflector
 {
     stringbuilder sb = default;
@@ -24,12 +26,14 @@ class JsonBuilder : IReflector
         firstField = true;
     }
 
+    // Close the current object with '}'.
     void endObject()
     {
         sb.appendChar('}');
         firstField = false;
     }
 
+    // Emit the "name":[ prefix and start an array.
     void beginArray(string name)
     {
         if (!firstField) sb.appendChar(',');
@@ -40,24 +44,28 @@ class JsonBuilder : IReflector
         firstField = true;
     }
 
+    // Close the current array with ']'.
     void endArray()
     {
         sb.appendChar(']');
         firstField = false;
     }
 
+    // Emit an integer field.
     void visitInt(string name, int value)
     {
         emitKey(name);
         sb.append(value);
     }
 
+    // Emit a bool field as true/false.
     void visitBool(string name, bool value)
     {
         emitKey(name);
         if (value) sb.append("true"); else sb.append("false");
     }
 
+    // Emit a float field, using integer form when the value is integral.
     void visitFloat(string name, float value)
     {
         emitKey(name);
@@ -69,6 +77,7 @@ class JsonBuilder : IReflector
         sb.appendCStr(&buf[0]);
     }
 
+    // Emit a string field, escaping quotes, backslashes, and control chars.
     void visitString(string name, string value)
     {
         emitKey(name);
@@ -90,12 +99,14 @@ class JsonBuilder : IReflector
         sb.appendChar('"');
     }
 
+    // Emit a null field.
     void visitNull(string name)
     {
         emitKey(name);
         sb.append("null");
     }
 
+    // Emit the separator comma and, when present, the "name": key prefix.
     void emitKey(string name)
     {
         if (!firstField) sb.appendChar(',');
@@ -117,6 +128,7 @@ class JsonBuilder : IReflector
         return sb.toString();
     }
 
+    // Serialize obj to a JSON string.
     static move string toJson<T>(T obj)
     {
         JsonBuilder builder;
@@ -125,6 +137,7 @@ class JsonBuilder : IReflector
         return builder.toString();
     }
 
+    // Parse a JSON string and deserialize it into a value of type T.
     static T fromJson<T>(string json)
     {
         Arena arena;
@@ -196,6 +209,7 @@ class JsonNode : IJSON, IJSONArray
     int    _count     = 0;
     JsonNode* _findCursor = nullptr;
 
+    // Recursively delete all child nodes.
     ~JsonNode()
     {
         JsonNode* child = firstChild;
@@ -207,6 +221,7 @@ class JsonNode : IJSON, IJSONArray
         }
     }
 
+    // Append child to the end of this node's child list, taking ownership.
     void _appendChild(move JsonNode* child)
     {
         child.next = nullptr;
@@ -223,6 +238,7 @@ class JsonNode : IJSON, IJSONArray
         _count++;
     }
 
+    // Return the child whose key equals `key`, or nullptr (cursor-accelerated).
     JsonNode* _findKey(string key)
     {
         // Deserialization looks keys up in field-declaration order, which
@@ -249,6 +265,7 @@ class JsonNode : IJSON, IJSONArray
         return nullptr;
     }
 
+    // Return the child at position `index`, or nullptr if out of range.
     JsonNode* _getIndex(int index)
     {
         JsonNode* child = firstChild;
@@ -259,8 +276,10 @@ class JsonNode : IJSON, IJSONArray
 
     // ── IJSON ────────────────────────────────────────────────────────────────
 
+    // True if a child with the given key exists.
     bool hasField(string key) { return _findKey(key) != nullptr; }
 
+    // Integer value of field `key`, or 0 if absent/non-numeric.
     int getInt(string key)
     {
         JsonNode* n = _findKey(key);
@@ -270,6 +289,7 @@ class JsonNode : IJSON, IJSONArray
         return 0;
     }
 
+    // Bool value of field `key`, or false if absent.
     bool getBool(string key)
     {
         JsonNode* n = _findKey(key);
@@ -277,6 +297,7 @@ class JsonNode : IJSON, IJSONArray
         return n.boolVal;
     }
 
+    // Float value of field `key`, or 0 if absent/non-numeric.
     float getFloat(string key)
     {
         JsonNode* n = _findKey(key);
@@ -286,6 +307,7 @@ class JsonNode : IJSON, IJSONArray
         return 0;
     }
 
+    // String value of field `key`, or "" if absent.
     string getString(string key)
     {
         JsonNode* n = _findKey(key);
@@ -293,6 +315,7 @@ class JsonNode : IJSON, IJSONArray
         return n.strVal;
     }
 
+    // Field `key` as a nested object, or default if absent/not an object.
     IJSON getObject(string key)
     {
         JsonNode* n = _findKey(key);
@@ -302,6 +325,7 @@ class JsonNode : IJSON, IJSONArray
         return result;
     }
 
+    // Field `key` as an array, or default if absent/not an array.
     IJSONArray getArray(string key)
     {
         JsonNode* n = _findKey(key);
@@ -313,8 +337,10 @@ class JsonNode : IJSON, IJSONArray
 
     // ── IJSONArray ───────────────────────────────────────────────────────────
 
+    // Number of array elements.
     int count() { return _count; }
 
+    // Integer value of element `index`, or 0 if out of range/non-numeric.
     int getInt(int index)
     {
         JsonNode* n = _getIndex(index);
@@ -324,6 +350,7 @@ class JsonNode : IJSON, IJSONArray
         return 0;
     }
 
+    // Bool value of element `index`, or false if out of range.
     bool getBool(int index)
     {
         JsonNode* n = _getIndex(index);
@@ -331,6 +358,7 @@ class JsonNode : IJSON, IJSONArray
         return n.boolVal;
     }
 
+    // Float value of element `index`, or 0 if out of range/non-numeric.
     float getFloat(int index)
     {
         JsonNode* n = _getIndex(index);
@@ -340,6 +368,7 @@ class JsonNode : IJSON, IJSONArray
         return 0;
     }
 
+    // String value of element `index`, or "" if out of range.
     string getString(int index)
     {
         JsonNode* n = _getIndex(index);
@@ -347,6 +376,7 @@ class JsonNode : IJSON, IJSONArray
         return n.strVal;
     }
 
+    // Element `index` as a nested object, or default if out of range/not an object.
     IJSON getObject(int index)
     {
         JsonNode* n = _getIndex(index);
@@ -370,6 +400,7 @@ struct JsonParser
     int    _len   = 0;
     Arena* _arena = nullptr;
 
+    // Allocate a node from the arena when set, else from the heap.
     JsonNode* _allocNode()
     {
         if (_arena != nullptr)
@@ -377,12 +408,14 @@ struct JsonParser
         return new JsonNode;
     }
 
+    // Current byte without advancing, or 0 at end.
     i8 _peek()
     {
         if (_pos >= _len) return 0;
         return _src[_pos];
     }
 
+    // Return the current byte and advance, or 0 at end.
     i8 _consume()
     {
         if (_pos >= _len) return 0;
@@ -391,6 +424,7 @@ struct JsonParser
         return c;
     }
 
+    // Advance past any run of whitespace.
     void _skipWs()
     {
         while (_pos < _len)
@@ -401,6 +435,7 @@ struct JsonParser
         }
     }
 
+    // Skip whitespace then consume ch if present; return whether it matched.
     bool _expect(i8 ch)
     {
         _skipWs();
@@ -431,6 +466,7 @@ struct JsonParser
         return result;
     }
 
+    // Parse a double-quoted JSON string (with escapes) into an owning string.
     move string _parseString()
     {
         _consume(); // opening "
@@ -474,6 +510,7 @@ struct JsonParser
         return _copyOut(sb.data(), sb.length());
     }
 
+    // Parse a JSON number into an int or float node.
     JsonNode* _parseNumber()
     {
         JsonNode* node = _allocNode();
@@ -536,6 +573,7 @@ struct JsonParser
         return node;
     }
 
+    // Parse a true/false/null literal into a bool or null node.
     JsonNode* _parseLiteral()
     {
         JsonNode* node = _allocNode();
@@ -545,6 +583,7 @@ struct JsonParser
         return node;
     }
 
+    // Parse a {...} object into a keyed object node.
     JsonNode* _parseObject()
     {
         _consume(); // {
@@ -574,6 +613,7 @@ struct JsonParser
         return node;
     }
 
+    // Parse a [...] array into an array node.
     JsonNode* _parseArray()
     {
         _consume(); // [
@@ -596,6 +636,7 @@ struct JsonParser
         return node;
     }
 
+    // Parse any JSON value (string, object, array, literal, or number).
     JsonNode* _parseValue()
     {
         _skipWs();
@@ -614,6 +655,7 @@ struct JsonParser
         return nullptr;
     }
 
+    // Parse a top-level JSON object into a heap JsonNode tree; caller deletes it.
     static JsonNode* parse(string json)
     {
         JsonParser p;

@@ -44,6 +44,7 @@ struct stream {
                                    // user does not hand-write s.close() (the explicit `p >> s; s >> q`
                                    // form leaves this false and closes manually).
 
+    // Allocate the two pool buffers and condition variables; seed bufB as the first empty.
     void init() {
         _bufA = (char*)malloc((i64)bufferSize);
         _bufB = (char*)malloc((i64)bufferSize);
@@ -202,6 +203,7 @@ struct stream {
         _mu.release();
     }
 
+    // Free both pool buffers, the condition variables, and destroy the mutex.
     ~stream() {
         if (_bufA    != nullptr) { free((void*)_bufA);   _bufA    = nullptr; }
         if (_bufB    != nullptr) { free((void*)_bufB);   _bufB    = nullptr; }

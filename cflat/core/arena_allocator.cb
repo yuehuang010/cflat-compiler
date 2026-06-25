@@ -76,6 +76,7 @@ struct _AR_ChunkSet
     i64  _tomb  = 0;
     i64  _cap   = 0;
 
+    // Allocate a fresh zeroed backing array of cap slots and reset counters.
     void _alloc_table(i64 cap)
     {
         _keys  = (i64*)vmem_alloc(cap * (i64)8);   // zeroed -> every slot empty
@@ -84,6 +85,7 @@ struct _AR_ChunkSet
         _tomb  = 0;
     }
 
+    // Hash a 64K-aligned base to its initial probe slot.
     i64 _slot(i64 base)
     {
         // Fibonacci-style mix on the 64K-aligned base; mask to cap (power of two).
@@ -91,6 +93,7 @@ struct _AR_ChunkSet
         return h & (_cap - (i64)1);
     }
 
+    // Reallocate to newCap and reinsert every live key.
     void _rehash(i64 newCap)
     {
         i64* old    = _keys;
@@ -106,6 +109,7 @@ struct _AR_ChunkSet
         if (old != nullptr) vmem_free((void*)old);
     }
 
+    // Insert a chunk base, growing/rehashing as load crosses 3/4.
     void add(i64 base)
     {
         if (_cap == (i64)0) _alloc_table((i64)64);
@@ -134,6 +138,7 @@ struct _AR_ChunkSet
         _count     = _count + (i64)1;
     }
 
+    // Remove a chunk base, leaving a tombstone in its slot.
     void remove(i64 base)
     {
         if (_cap == (i64)0) return;
@@ -151,6 +156,7 @@ struct _AR_ChunkSet
         }
     }
 
+    // Release the backing array and reset the set to empty.
     void free_table()
     {
         if (_keys != nullptr) vmem_free((void*)_keys);
@@ -172,11 +178,13 @@ struct _AR_ChunkSet
 // into operator new. Lookups are lock-free; only second-level table allocation
 // is guarded by _ar_reg_lock.
 struct _AR_RegSlot { i8* _owner = nullptr; };
+// Top-level radix entry pointing at a second-level _AR_RegSlot table.
 struct _AR_RegDir  { _AR_RegSlot* _table = nullptr; };
 
 _AR_RegDir* _ar_reg_top  = nullptr;
 mutex       _ar_reg_lock = default;
 
+// Lazily allocate the top-level registry directory (once per process).
 void _ar_reg_init_top()
 {
     if (_ar_reg_top != nullptr) return;
@@ -186,6 +194,7 @@ void _ar_reg_init_top()
     _ar_reg_lock.release();
 }
 
+// Record that the 64K page at base is owned by the given ArenaAllocator.
 void _ar_reg_insert(i64 base, i8* owner)
 {
     _ar_reg_init_top();
@@ -207,6 +216,7 @@ void _ar_reg_insert(i64 base, i8* owner)
     tbl[lo]._owner = owner;
 }
 
+// Clear the owner entry for the 64K page at base.
 void _ar_reg_remove(i64 base)
 {
     if (_ar_reg_top == nullptr) return;
@@ -218,6 +228,7 @@ void _ar_reg_remove(i64 base)
     tbl[lo]._owner = nullptr;
 }
 
+// Return the owning ArenaAllocator for the 64K page at base, or nullptr.
 i8* _ar_reg_lookup(i64 base)
 {
     if (_ar_reg_top == nullptr) return nullptr;
@@ -255,6 +266,8 @@ bool __AR_try_owner_dealloc(void* ptr)
     return _ar_route_free(ptr);
 }
 
+// Mixed-size bump arena: 64K chunks from g_page_pool with per-chunk live-byte
+// counting, registry-routed frees, and a direct large-alloc path.
 class ArenaAllocator : IAllocator
 {
     _AR_ChunkSet _chunks = default;   // set of owned 64 KB chunk bases
@@ -279,13 +292,16 @@ class ArenaAllocator : IAllocator
     // Layout constants
     // -----------------------------------------------------------------------
 
+    // Offset of the first block within a chunk (16-aligned, past the header).
     i64 _dataOff() { return (i64)32; }                 // 16-aligned, past 24-byte header
+    // Largest single small block (including its header) that fits in a chunk.
     i64 _usable()  { return (i64)65536 - _dataOff(); } // max single small block incl. header
 
     // -----------------------------------------------------------------------
     // Initialization
     // -----------------------------------------------------------------------
 
+    // One-time init: mark initialized and install the owner-dealloc hook.
     void _init()
     {
         _initialized = true;
@@ -297,6 +313,7 @@ class ArenaAllocator : IAllocator
     // Chunk management
     // -----------------------------------------------------------------------
 
+    // Acquire a fresh 64K chunk, init its header, and make it the active chunk.
     void _newChunk()
     {
         i8* page = (i8*)g_page_pool.acquire();
@@ -319,6 +336,7 @@ class ArenaAllocator : IAllocator
     // Large-allocation path (> chunk usable space)
     // -----------------------------------------------------------------------
 
+    // Allocate a > chunk-usable request via vmem_alloc and track it in _largeHead.
     void* _allocLarge(i64 size)
     {
         i64 hdrSize = (i64)sizeof(_AR_LargeHdr);
@@ -344,6 +362,7 @@ class ArenaAllocator : IAllocator
         return (void*)(base + hdrSize);
     }
 
+    // Unlink and vmem_free a large allocation this arena owns.
     void _freeLargeOwned(void* ptr)
     {
         i64 hdrSize = (i64)sizeof(_AR_LargeHdr);
@@ -379,6 +398,7 @@ class ArenaAllocator : IAllocator
     // IAllocator
     // -----------------------------------------------------------------------
 
+    // Allocate size bytes under the arena lock.
     void* alloc(i64 size)
     {
         _lock.acquire();
@@ -387,6 +407,7 @@ class ArenaAllocator : IAllocator
         return r;
     }
 
+    // Lock-free allocation core: bump the active chunk or route to the large path.
     void* _allocUnsynced(i64 size)
     {
         if (size <= (i64)0) return nullptr;
@@ -415,6 +436,7 @@ class ArenaAllocator : IAllocator
         return (void*)(block + (i64)8);
     }
 
+    // Free a pointer: route owned pointers to this/the owning arena, else CRT-free.
     void dealloc(void* ptr)
     {
         if (ptr == nullptr) return;
@@ -429,6 +451,7 @@ class ArenaAllocator : IAllocator
             free(ptr);
     }
 
+    // Lock-taking entry used by the registry router to free an owned pointer.
     void _lockedDeallocOwned(void* ptr)
     {
         _lock.acquire();
@@ -479,6 +502,7 @@ class ArenaAllocator : IAllocator
     // Over-aligned allocation
     // -----------------------------------------------------------------------
 
+    // Allocate size bytes aligned to align, stashing the raw pointer for free.
     void* alloc_aligned(i64 size, i64 align)
     {
         if (align <= (i64)8) return alloc(size);   // alloc already returns 8-aligned
@@ -492,6 +516,7 @@ class ArenaAllocator : IAllocator
         return (void*)aligned;
     }
 
+    // Recover the raw pointer stashed by alloc_aligned and free it.
     void dealloc_aligned(void* ptr)
     {
         if (ptr == nullptr) return;
@@ -503,10 +528,14 @@ class ArenaAllocator : IAllocator
     // Stats / diagnostics
     // -----------------------------------------------------------------------
 
+    // Live bytes across small blocks plus large allocations.
     i64 usedBytes()   { if (!_initialized) return (i64)0; return _liveBytes + _largeBytes; }
+    // Currently reserved bytes (chunks + large regions).
     i64 totalBytes()  { return _reservedNow; }
+    // Peak reserved bytes seen over the allocator's lifetime.
     i64 peakReserve() { return _peakReserved; }
 
+    // Print a human-readable usage summary to stdout.
     void printUsage()
     {
         if (!_initialized) { printf("ArenaAllocator: not initialized\n"); return; }
@@ -520,6 +549,7 @@ class ArenaAllocator : IAllocator
     // spawn_child
     // -----------------------------------------------------------------------
 
+    // Allocate a child arena for a child thread and chain it under this parent.
     IAllocator spawn_child()
     {
         ArenaAllocator* child = (ArenaAllocator*)malloc((i64)sizeof(ArenaAllocator));
@@ -540,6 +570,7 @@ class ArenaAllocator : IAllocator
     // Cleanup
     // -----------------------------------------------------------------------
 
+    // Release all chunks and large allocations and reset the arena to empty.
     void cleanup()
     {
         // Release every tracked chunk back to the pool.
@@ -575,6 +606,7 @@ class ArenaAllocator : IAllocator
         _initialized = false;
     }
 
+    // Clean up and free all child arenas, then clean up this arena.
     ~ArenaAllocator()
     {
         ArenaAllocator* c = _first_child;

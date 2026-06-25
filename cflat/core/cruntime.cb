@@ -2,17 +2,26 @@
 
 // === Memory Functions ===
 // size_t is pointer-sized (win_size: i64 on Win64, i32 on Win32).
+// Allocate `size` bytes of uninitialized memory; returns nullptr on failure.
 extern void* malloc(win_size size);
+// Free a block previously returned by malloc/calloc/realloc.
 extern void  free(void* ptr);
+// Allocate `count`*`size` zero-initialized bytes.
 extern void* calloc(win_size count, win_size size);
+// Resize a previously allocated block, preserving existing contents.
 extern void* realloc(void* ptr, win_size size);
+// Allocate `size` bytes aligned to `alignment` (MSVC CRT).
 extern void* _aligned_malloc(win_size size, win_size alignment);
+// Free a block returned by _aligned_malloc.
 extern void  _aligned_free(void* ptr);
 
 // Win32: callers always pass i64; these wrappers truncate to i32 before calling the CRT.
 if const (__PLATFORM__ == 32) {
+    // i64-arg malloc wrapper: truncates to win_size before calling the CRT.
     void* malloc(i64 bytes)          { return malloc((win_size)bytes); }
+    // i64-arg calloc wrapper: truncates both args to win_size.
     void* calloc(i64 cnt, i64 sz)   { return calloc((win_size)cnt, (win_size)sz); }
+    // i64-arg realloc wrapper: truncates size to win_size.
     void* realloc(void* p, i64 sz)  { return realloc(p, (win_size)sz); }
 }
 
@@ -95,10 +104,12 @@ int __cstr_len(const char* s) {
     return len;
 }
 
+// Thin wrapper over the Windows CRT vsscanf backend; casts bufSize to win_size.
 win_int __vsscanf_safe(u64 options, const char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap) {
     return os.windows.__stdio_common_vsscanf(options, buf, (win_size)bufSize, fmt, locale, ap);
 }
 
+// printf - formatted write to stdout (hook-aware, VT-correct); fast-paths literal text.
 extern void printf(const char* fmt, ...) {
     va_list ap;
     va_start(ap);
@@ -118,6 +129,7 @@ extern void printf(const char* fmt, ...) {
     va_end(ap);
 }
 
+// sprintf - format into `buf` with no size limit; returns the byte count written.
 extern i32 sprintf(char* buf, const char* fmt, ...) {
     va_list ap;
     va_start(ap);
@@ -126,6 +138,7 @@ extern i32 sprintf(char* buf, const char* fmt, ...) {
     return result;
 }
 
+// snprintf - format into `buf` bounded by `bufSize`; returns chars that would be written.
 extern int snprintf(char* buf, i64 bufSize, const char* fmt, ...) {
     va_list ap;
     va_start(ap);
@@ -134,6 +147,7 @@ extern int snprintf(char* buf, i64 bufSize, const char* fmt, ...) {
     return result;
 }
 
+// vprintf - like printf but takes a pre-started va_list; writes to stdout.
 extern int vprintf(const char* fmt, va_list ap) {
     // Fast path: no '%' in fmt - fmt is the literal output, skip vsprintf entirely.
     bool has_format = false;
@@ -151,10 +165,12 @@ extern int vprintf(const char* fmt, va_list ap) {
     return needed;
 }
 
+// vsprintf - like sprintf but takes a pre-started va_list; no size limit.
 extern int vsprintf(char* buf, const char* fmt, va_list ap) {
     return __vsprintf_safe(0, buf, 2147483647, fmt, nullptr, ap);
 }
 
+// vsnprintf - like snprintf but takes a pre-started va_list; bounded by `bufSize`.
 extern int vsnprintf(char* buf, i64 bufSize, const char* fmt, va_list ap) {
     return __vsprintf_safe(0, buf, bufSize, fmt, nullptr, ap);
 }
@@ -203,6 +219,7 @@ extern int fputc(int c, void* stream) {
     return fprintf(stream, "%c", c);
 }
 
+// putc - write a single byte to a stream (alias of fputc).
 extern int putc(int c, void* stream) { return fputc(c, stream); }
 
 // fprintf - formatted write to a stream. stdout/stderr route through the hook-aware,
@@ -233,6 +250,7 @@ extern int __stdio_common_vfscanf(u64 options, void* stream, const char* fmt, vo
 
 // Used by the fgets fallback to read one character from any stream.
 extern int fgetc(void* stream);
+// Copy `n` bytes from src to dest (regions must not overlap).
 extern void* memcpy(void* dest, const void* src, i64 n);
 
 // Internal: return next character from the hook line-buffer, refilling via the hook
@@ -396,30 +414,53 @@ extern int fscanf(void* stream, const char* fmt, ...) {
 }
 
 // === String Functions ===
+// Length in bytes of a NUL-terminated string.
 extern i32 strlen(const char* s);
+// Compare two strings lexicographically; 0 if equal.
 extern int strcmp(const char* a, const char* b);
+// Compare at most `n` bytes of two strings; 0 if equal in that range.
 extern int strncmp(const char* a, const char* b, i64 n);
+// Copy src (including NUL) into dest; returns dest.
 extern char* strcpy(char* dest, const char* src);
+// Copy at most `n` bytes of src into dest; returns dest.
 extern char* strncpy(char* dest, const char* src, i64 n);
+// Append src onto the end of dest; returns dest.
 extern char* strcat(char* dest, const char* src);
+// Append at most `n` bytes of src onto dest; returns dest.
 extern char* strncat(char* dest, const char* src, i64 n);
+// Find the first occurrence of byte `c` in `s`; nullptr if absent.
 extern const char* strchr(const char* s, int c);
+// Find the last occurrence of byte `c` in `s`; nullptr if absent.
 extern const char* strrchr(const char* s, int c);
+// Find the first occurrence of substring `needle` in `haystack`.
 extern const char* strstr(const char* haystack, const char* needle);
+// Tokenize `str` by any byte in `delim`, returning the next token (stateful).
 extern char* strtok(char* str, const char* delim);
+// Copy `n` bytes from src to dest (regions must not overlap).
 extern void* memcpy(void* dest, const void* src, i64 n);
+// Copy `n` bytes from src to dest, handling overlapping regions.
 extern void* memmove(void* dest, const void* src, i64 n);
+// Fill `n` bytes at `s` with byte value `c`.
 extern void* memset(void* s, int c, i64 n);
+// Compare `n` bytes of two buffers; 0 if equal.
 extern int memcmp(const void* a, const void* b, i64 n);
 
 // === Character Classification ===
+// Nonzero if `c` is an alphabetic character.
 extern int isalpha(int c);
+// Nonzero if `c` is a decimal digit.
 extern int isdigit(int c);
+// Nonzero if `c` is alphanumeric.
 extern int isalnum(int c);
+// Nonzero if `c` is whitespace.
 extern int isspace(int c);
+// Nonzero if `c` is an uppercase letter.
 extern int isupper(int c);
+// Nonzero if `c` is a lowercase letter.
 extern int islower(int c);
+// Convert `c` to uppercase if it is a lowercase letter.
 extern int toupper(int c);
+// Convert `c` to lowercase if it is an uppercase letter.
 extern int tolower(int c);
 
 // === Numeric String Conversion ===
@@ -429,28 +470,45 @@ extern int tolower(int c);
 // base 0 auto-detects 0x/0 prefixes). Windows is LLP64, so C `long` is 32-bit: atol maps
 // to int and atoll/strtoll to i64.
 extern int    atoi(const char* str);
+// Parse a leading 32-bit C `long` (int on Windows) from `str`; 0 if non-numeric.
 extern int    atol(const char* str);
+// Parse a leading 64-bit integer from `str`; 0 if non-numeric.
 extern i64    atoll(const char* str);
+// Parse a leading double from `str`; 0 if non-numeric.
 extern double atof(const char* str);
+// Parse a 32-bit integer in the given base; writes first unparsed char to *endptr.
 extern int    strtol(const char* str, char** endptr, int base);
+// Parse an unsigned 32-bit integer in the given base; *endptr gets the tail.
 extern u32    strtoul(const char* str, char** endptr, int base);
+// Parse a 64-bit integer in the given base; *endptr gets the tail.
 extern i64    strtoll(const char* str, char** endptr, int base);
+// Parse an unsigned 64-bit integer in the given base; *endptr gets the tail.
 extern u64    strtoull(const char* str, char** endptr, int base);
+// Parse a double from `str`; *endptr gets the first unparsed character.
 extern double strtod(const char* str, char** endptr);
 
 // === Math Functions (basic) ===
+// Absolute value of an integer.
 extern i64 abs(i64 n);
+// Absolute value of a double.
 extern double fabs(double x);
+// Absolute value of a maximum-width integer.
 extern i64 imaxabs(i64 n);
 
 // === Process Control ===
+// Terminate the process with the given exit status, running atexit handlers.
 extern void exit(int status);
+// Abnormally terminate the process (raises SIGABRT).
 extern void abort();
+// Register a function to run at normal program exit.
 extern int atexit(void* func);
+// Flush buffered output for a stream (nullptr flushes all streams).
 extern int fflush(void* stream);
 
 // === Other Utilities ===
+// Return a pseudo-random integer in [0, RAND_MAX].
 extern int rand();
+// Seed the pseudo-random number generator used by rand.
 extern void srand(u32 seed);
 
 // === Handle Tracker ===
@@ -461,6 +519,7 @@ struct __HandleNode {
     void* next   = nullptr;
 };
 
+// Record an open FILE handle in the per-thread tracker (no-op if tracking is off).
 void __handle_tracker_add(void* handle) {
     if (!__prog_tls.handle_tracker_enabled) return;
     __HandleNode* node = (__HandleNode*)malloc((i64)16);
@@ -469,6 +528,7 @@ void __handle_tracker_add(void* handle) {
     __prog_tls.handle_tracker_head = (void*)node;
 }
 
+// Remove a handle from the per-thread tracker (no-op if tracking is off).
 void __handle_tracker_remove(void* handle) {
     if (!__prog_tls.handle_tracker_enabled) return;
     __HandleNode* prev = nullptr;

@@ -14,8 +14,10 @@ import "stream.cb";
 // Internal helpers: re-home the args list from the caller's allocator into the
 // program's own allocator so the program can safely free them on exit.
 
+// Consume and free a moved-in args list under the currently active allocator.
 void __prog_drop_args(move list<string> s) { }
 
+// Copy the args list into the program's allocator, then free the caller's CRT copy.
 move list<string> __prog_adopt_args(move list<string> src)
 {
     list<string> dst = src.copy();          // active == program allocator -> dst owned by it

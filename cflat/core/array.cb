@@ -7,12 +7,14 @@ struct array<T>
     T*  _ptr = nullptr;
     int _len = 0;
 
+    // Allocate the backing buffer of `size` elements.
     void init(int size)
     {
         _ptr = new T[size];
         _len = size;
     }
 
+    // Free the buffer, calling ~T() on each element.
     ~array()
     {
         if (_ptr != nullptr)
@@ -23,10 +25,13 @@ struct array<T>
         }
     }
 
+    // Number of elements in the array.
     int count() { return _len; }
 
+    // Read the element at index by value (borrow - caller does not own it).
     T get(int index) { return _ptr[index]; }
 
+    // Return a pointer to the element at index (for in-place access).
     T* getPtr(int index) { return _ptr + index; }
 
     // Overwrite the element at index. Takes ownership when T owns resources (a pointer
@@ -45,5 +50,6 @@ struct array<T>
         _ptr[index] = move value;
     }
 
+    // a[index] - same semantics as get(index).
     T operator[](int index) { return _ptr[index]; }
 };

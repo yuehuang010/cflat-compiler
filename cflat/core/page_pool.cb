@@ -27,6 +27,8 @@ import "atomic.cb";
 // Free pages chain through their first 8 bytes; cast to this struct to access.
 struct _PP_Link { void* _next = nullptr; };
 
+// Process-global pool of reusable, zeroed 64 KB pages backed by a lock-free
+// Treiber stack with a soft cache cap.
 class page_pool
 {
     // Tagged-pointer Treiber stack head: tag[63:47] | page_ptr[46:0].
@@ -44,16 +46,19 @@ class page_pool
 
     // ── tagged pointer helpers ────────────────────────────────────────────────
 
+    // Pack a 47-bit pointer and 17-bit ABA tag into one tagged stack-head word.
     i64 _encode(i64 ptr, i64 tag)
     {
         return ((tag & (i64)0x1FFFF) << 47) | (ptr & (i64)0x00007FFFFFFFFFFF);
     }
 
+    // Extract the page pointer from a tagged stack-head word.
     i64 _raw_ptr(i64 top)
     {
         return top & (i64)0x00007FFFFFFFFFFF;
     }
 
+    // Extract the ABA tag from a tagged stack-head word.
     i64 _raw_tag(i64 top)
     {
         return (top >> 47) & (i64)0x1FFFF;
@@ -150,7 +155,9 @@ class page_pool
 
     // ── stats / diagnostics ───────────────────────────────────────────────────
 
+    // Approximate number of pages currently cached in the free stack.
     i64 cachedPages() { return __atomic_counter_read(&_depth); }
+    // Approximate bytes currently cached (cached pages times 64 KB).
     i64 cachedBytes() { return cachedPages() * (i64)65536; }
 };
 

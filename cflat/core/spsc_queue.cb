@@ -72,7 +72,9 @@ class spsc_queue<T>
 
     // send/receive/try_receive: IQueue-compatible aliases used by program inbox dispatch.
     void send(move T item) { push(move item); }
+    // Blocking receive - alias for pop().
     T    receive()         { return pop(); }
+    // Non-blocking receive - alias for try_pop().
     bool try_receive(T* out) { return try_pop(out); }
 
     // Blocking push.  Spins until a slot is available, then writes the item.
@@ -123,6 +125,7 @@ class spsc_queue<T>
         if (_buf != nullptr) { delete[_] _buf; _buf = nullptr; }
     }
 
+    // Free the ring buffer on destruction.
     ~spsc_queue() {
         destroy();
     }

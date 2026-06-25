@@ -57,6 +57,7 @@ void fp_disable_traps() {
     _controlfp_s(&cur, (u32)_MCW_EM, (u32)_MCW_EM);
 }
 
+// Heap packet handed to the borrow-overload trampoline; carries fn, ctx, and env.
 struct __ThreadArgs {
     function<int(void*)> fn = nullptr;
     void* ctx = nullptr;
@@ -64,6 +65,7 @@ struct __ThreadArgs {
     int _fpConfig = 0;
 };
 
+// Heap packet for the move-overload trampoline; ctx ownership transfers to fn.
 struct __ThreadArgsMove {
     function<int(move void*)> fn = nullptr;
     void* ctx = nullptr;
@@ -81,6 +83,7 @@ stdcall int __thread_trampoline(void* param) {
     return args->fn(args->ctx);
 }
 
+// Move-overload trampoline: installs the child allocator/FP env, then calls fn.
 stdcall int __thread_trampoline_move(void* param) {
     __ThreadArgsMove* args = (__ThreadArgsMove*)param;
     __active_allocator = args->_allocator;
@@ -98,6 +101,7 @@ int hardware_concurrency() {
     return (int)info._numProc;
 }
 
+// Owning handle to a single OS thread; start it, then join/try_join/terminate.
 struct Thread {
     void* _handle = nullptr;
     void* _args   = nullptr;  // owns the __ThreadArgs packet; freed in join()

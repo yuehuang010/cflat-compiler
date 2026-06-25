@@ -13,8 +13,10 @@
 //   int x = rng.nextInt(1, 100);
 //   double d = rng.nextDouble();
 
+// Read the current high-resolution performance counter value (used as a seed source).
 extern int QueryPerformanceCounter(i64* count);
 
+// splitmix64 pseudo-random generator with seeding, ranged draws, and substream support.
 struct Random
 {
     i64 _state = 0;
@@ -33,6 +35,7 @@ struct Random
         _state = s;
     }
 
+    // Advance the splitmix64 state by one step and return the scrambled output.
     i64 _advance()
     {
         // +0x9e3779b97f4a7c15 (golden-ratio derived increment, written as signed i64)

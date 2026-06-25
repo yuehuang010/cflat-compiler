@@ -58,6 +58,8 @@ struct _FA_Segment
     _FA_Segment* _next = nullptr;
 };
 
+// First-fit allocator: vmem segments carved into headered blocks managed by an
+// address-sorted, coalescing free list, with a direct large-alloc path.
 class FitAllocator : IAllocator
 {
     _FA_Segment*   _segments      = nullptr;
@@ -71,14 +73,18 @@ class FitAllocator : IAllocator
     i64            _reservedNow   = 0;
     i64            _peakReserved  = 0;
 
+    // Size of the per-allocation block header.
     i64 _hdrSize()        { return (i64)sizeof(_FA_Header); }
+    // Minimum size of a free block (must hold the free-list overlay).
     i64 _freeHdrSize()    { return (i64)sizeof(_FA_FreeBlock); }
+    // Size of the prefix stored at the base of a large allocation.
     i64 _largePfxSize()   { return (i64)sizeof(_FA_LargePrefix); }
 
     // -----------------------------------------------------------------------
     // Initialization
     // -----------------------------------------------------------------------
 
+    // Read the OS page size and create the initial 1 MB segment.
     void _init()
     {
         os.windows._SystemInfo* si = (os.windows._SystemInfo*)malloc((i64)sizeof(os.windows._SystemInfo));
@@ -90,6 +96,7 @@ class FitAllocator : IAllocator
         _growSegment(_segSize);
     }
 
+    // vmem_alloc a new page-aligned segment and add it as one big free block.
     void _growSegment(i64 size)
     {
         i64 aligned = (size + _pageSize - (i64)1) / _pageSize * _pageSize;
@@ -117,6 +124,7 @@ class FitAllocator : IAllocator
     // Free list (address-sorted doubly-linked)
     // -----------------------------------------------------------------------
 
+    // Insert a free block into the address-sorted free list.
     void _freeListInsert(_FA_FreeBlock* fb)
     {
         if (_freeHead == nullptr || (i64)fb < (i64)_freeHead)
@@ -136,6 +144,7 @@ class FitAllocator : IAllocator
         cur->_next = fb;
     }
 
+    // Unlink a free block from the free list.
     void _freeListRemove(_FA_FreeBlock* fb)
     {
         if (fb->_prev != nullptr)
@@ -152,6 +161,7 @@ class FitAllocator : IAllocator
     // Split / coalesce
     // -----------------------------------------------------------------------
 
+    // Split off the tail of fb as a new free block if the remainder is usable.
     void _maybeSplit(_FA_FreeBlock* fb, i64 needed)
     {
         i64 minTail = _freeHdrSize();
@@ -167,6 +177,7 @@ class FitAllocator : IAllocator
         _freeListInsert(tail_fb);
     }
 
+    // Merge fb with adjacent free blocks on either side.
     void _coalesce(_FA_FreeBlock* fb)
     {
         // Coalesce with next neighbor.
@@ -197,6 +208,7 @@ class FitAllocator : IAllocator
     // Large-allocation path (> half segment size)
     // -----------------------------------------------------------------------
 
+    // Allocate a > half-segment request via vmem_alloc, tracked in _largeHead.
     void* _allocLarge(i64 size)
     {
         i64 pfxSize = _largePfxSize();   // 16
@@ -224,6 +236,7 @@ class FitAllocator : IAllocator
         return (void*)(base + pfxSize + hdrSize);
     }
 
+    // Unlink and vmem_free a large allocation.
     void _freeLarge(void* ptr)
     {
         i64 pfxSize = _largePfxSize();
@@ -265,6 +278,7 @@ class FitAllocator : IAllocator
     // IAllocator
     // -----------------------------------------------------------------------
 
+    // First-fit allocate size bytes, growing a segment or going large as needed.
     void* alloc(i64 size)
     {
         if (size <= 0) return nullptr;
@@ -309,6 +323,7 @@ class FitAllocator : IAllocator
         return (void*)((i8*)fb + _hdrSize());
     }
 
+    // Free ptr: the header sign selects the large path or free-list reinsertion.
     void dealloc(void* ptr)
     {
         if (ptr == nullptr) return;
@@ -335,8 +350,11 @@ class FitAllocator : IAllocator
     // Stats / diagnostics
     // -----------------------------------------------------------------------
 
+    // Live slab bytes plus live large-allocation bytes.
     i64 usedBytes()   { return _usedBytes + _largeBytes; }
+    // No meaningful total; always reports 0.
     i64 totalBytes()  { return (i64)0; }
+    // Peak reserved bytes seen over the allocator's lifetime.
     i64 peakReserve() { return _peakReserved; }
 
     // Not thread-safe; sharing across threads is the caller's responsibility.
@@ -345,6 +363,7 @@ class FitAllocator : IAllocator
         return self_iface;
     }
 
+    // Allocate size bytes aligned to align, stashing the raw pointer for free.
     void* alloc_aligned(i64 size, i64 align) {
         if (align <= (i64)16) return alloc(size);
         i64 total = size + align - (i64)1 + (i64)16;
@@ -356,12 +375,14 @@ class FitAllocator : IAllocator
         stash[0] = (void*)raw;
         return (void*)aligned;
     }
+    // Recover the raw pointer stashed by alloc_aligned and free it.
     void dealloc_aligned(void* ptr) {
         if (ptr == nullptr) return;
         void** stash = (void**)((i8*)ptr - (i64)16);
         dealloc(stash[0]);
     }
 
+    // Total bytes currently held in the free list.
     i64 freeBytes()
     {
         i64 total = 0;
@@ -370,6 +391,7 @@ class FitAllocator : IAllocator
         return total;
     }
 
+    // Print a segment/usage summary to stdout.
     void printUsage()
     {
         if (_segments == nullptr) { printf("FitAllocator: not initialized\n"); return; }
@@ -386,6 +408,7 @@ class FitAllocator : IAllocator
     // Cleanup
     // -----------------------------------------------------------------------
 
+    // vmem-free all segments and large allocations and reset to empty.
     void cleanup()
     {
         _FA_Segment* s = _segments;
@@ -414,5 +437,6 @@ class FitAllocator : IAllocator
         _reservedNow = 0;
     }
 
+    // Release all segments and large allocations on destruction.
     ~FitAllocator() { cleanup(); }
 };

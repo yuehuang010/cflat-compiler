@@ -23,12 +23,19 @@ import "Windows.Foundation.winmd" lib { "RuntimeObject.lib", "ole32.lib" };
 using HSTRING = void*;
 
 // combase.dll (via RuntimeObject.lib / ole32.lib).
+// Initialize the WinRT runtime for this thread (initType selects the apartment model).
 extern stdcall i32   RoInitialize(i32 initType);
+// Tear down the WinRT runtime for this thread.
 extern stdcall void  RoUninitialize();
+// Get the activation factory for a runtime class name and interface IID.
 extern stdcall i32   RoGetActivationFactory(void* activatableClassId, void* iid, void** factory);
+// Activate a default-constructable runtime class, returning its IInspectable.
 extern stdcall i32   RoActivateInstance(void* activatableClassId, void** instance);
+// Create an HSTRING from a UTF-16 buffer (the buffer is copied).
 extern stdcall i32   WindowsCreateString(u16* sourceString, u32 length, HSTRING* hstring);
+// Free an HSTRING.
 extern stdcall i32   WindowsDeleteString(HSTRING hstring);
+// Get the raw UTF-16 buffer and length backing an HSTRING.
 extern stdcall u16*  WindowsGetStringRawBuffer(HSTRING hstring, u32* length);
 
 // kernel32 (always linked) - back off between async status polls. Matches windows.h's Sleep(DWORD).
@@ -95,6 +102,7 @@ i32 activateInstance(string className, void* iid, void** out)
 
 // Apartment lifecycle. 1 == RO_INIT_MULTITHREADED.
 void winrtInit()   { RoInitialize(1); }
+// Tear down the WinRT apartment for this thread.
 void winrtUninit() { RoUninitialize(); }
 
 // Block until an async object (IAsyncAction* or IAsyncOperation<T>*) leaves the Started state,

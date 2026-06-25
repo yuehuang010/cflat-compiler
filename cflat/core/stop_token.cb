@@ -1,38 +1,46 @@
 import "thread.cb";
 
+// Read-only view of a stop_source's cancellation flag; copyable, borrows the state.
 struct stop_token {
     i32* _state = nullptr;
 
+    // True once the owning stop_source has had request_stop() called.
     bool stop_requested() {
         if (_state == nullptr) return false;
         return *_state != 0;
     }
 };
 
+// Owner of a heap-allocated cancellation flag; hands out stop_tokens.
 struct stop_source {
     i32* _state = nullptr;
 
+    // Allocate the cancellation flag (initially not-stopped). Call before use.
     void init() {
         _state = (i32*)malloc(sizeof(i32));
         *_state = 0;
     }
 
+    // Return a stop_token that observes this source's flag.
     stop_token get_token() {
         stop_token t;
         t._state = _state;
         return t;
     }
 
+    // Request cancellation; all derived tokens observe it.
     void request_stop() {
         if (_state != nullptr)
             *_state = 1;
     }
 
+    // True once request_stop() has been called.
     bool stop_requested() {
         if (_state == nullptr) return false;
         return *_state != 0;
     }
 
+    // Free the cancellation flag. No tokens may be used afterwards.
     void dispose() {
         if (_state != nullptr) {
             free((void*)_state);

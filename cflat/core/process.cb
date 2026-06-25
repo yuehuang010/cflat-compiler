@@ -27,6 +27,7 @@ import "string.cb";
 
 // ── Win32 externs not already in os.windows.cb ────────────────────────────────
 
+// Create a child process from a command line, wiring up the startup info and pipes.
 extern stdcall i32 CreateProcessA(
     const char* lpApplicationName,
     char*       lpCommandLine,
@@ -39,10 +40,15 @@ extern stdcall i32 CreateProcessA(
     void*       lpStartupInfo,
     void*       lpProcessInformation);
 
+// Retrieve a child process's exit code into lpExitCode.
 extern stdcall i32 GetExitCodeProcess(void* hProcess, i32* lpExitCode);
+// Forcibly terminate a process with the given exit code.
 extern stdcall i32 TerminateProcess(void* hProcess, i32 uExitCode);
+// Create an anonymous pipe, returning its read and write handles.
 extern stdcall i32 CreatePipe(void** hReadPipe, void** hWritePipe, void* lpPipeAttributes, i32 nSize);
+// Read bytes from a file or pipe handle into lpBuffer.
 extern stdcall i32 ReadFile(void* hFile, char* lpBuffer, i32 nNumberOfBytesToRead, i32* lpNumberOfBytesRead, void* lpOverlapped);
+// Set flags (e.g. inheritability) on a kernel object handle.
 extern stdcall i32 SetHandleInformation(void* hObject, i32 dwMask, i32 dwFlags);
 
 // ── Win32 structs ─────────────────────────────────────────────────────────────
@@ -94,11 +100,13 @@ struct _ProcessInfo {
 
 // ── I/O thread context ────────────────────────────────────────────────────────
 
+// Context handed to the stdout reader thread: pipe handle plus the onStdout callback.
 struct __ProcessReaderCtx {
     void*                     pipe    = nullptr;
     Lambda<void(char*, int)> callback = nullptr;
 };
 
+// Context handed to the stdin writer thread: pipe handle plus the onStdin provider.
 struct __ProcessWriterCtx {
     void*              pipe    = nullptr;
     Lambda<char*()>  provider = nullptr;
@@ -172,6 +180,7 @@ char* __process_build_cmdline(string exe, list<string>* pargs) {
 
 // ── process struct ────────────────────────────────────────────────────────────
 
+// Launch and communicate with a child process via optional stdout/stdin hooks.
 class process : IProcess {
     // Public config - set before run().
     string exe = default;
@@ -337,6 +346,7 @@ class process : IProcess {
         if (_stdin_write   != nullptr) { os.windows.CloseHandle(_stdin_write);   _stdin_write   = nullptr; }
     }
 
+    // Destructor: terminate any I/O threads and close remaining handles.
     ~process() {
         // If the user drops a process without waiting, join/terminate I/O threads
         // first (they hold references into this struct's callback fields).

@@ -12,10 +12,12 @@ import "list.cb";
 
 // ── File ─────────────────────────────────────────────────────────────────────
 
+// Buffered file handle wrapping UCRT stdio, with static helpers for whole-file I/O.
 class File
 {
     void* _handle = nullptr;
 
+    // Open path for binary reading, closing any previously open handle.
     bool openRead(string path)
     {
         if (_handle != nullptr) { __handle_tracker_remove(_handle); os.windows.fclose(_handle); }
@@ -24,6 +26,7 @@ class File
         return _handle != nullptr;
     }
 
+    // Open path for binary writing (truncating), closing any previously open handle.
     bool openWrite(string path)
     {
         if (_handle != nullptr) { __handle_tracker_remove(_handle); os.windows.fclose(_handle); }
@@ -32,6 +35,7 @@ class File
         return _handle != nullptr;
     }
 
+    // Open path for binary appending, closing any previously open handle.
     bool openAppend(string path)
     {
         if (_handle != nullptr) { __handle_tracker_remove(_handle); os.windows.fclose(_handle); }
@@ -40,6 +44,7 @@ class File
         return _handle != nullptr;
     }
 
+    // Open path with an explicit fopen mode string, closing any previously open handle.
     bool open(string path, string mode)
     {
         if (_handle != nullptr) { __handle_tracker_remove(_handle); os.windows.fclose(_handle); }
@@ -48,6 +53,7 @@ class File
         return _handle != nullptr;
     }
 
+    // Close the file handle if open; safe to call when already closed.
     void close()
     {
         if (_handle != nullptr)
@@ -58,7 +64,9 @@ class File
         }
     }
 
+    // Return true if a file handle is currently open.
     bool isOpen() { return _handle != nullptr; }
+    // Return true if the stream is open and has reached end-of-file.
     bool atEnd()  { return _handle != nullptr && os.windows.feof(_handle) != 0; }
 
     // Read one line, stripping trailing \r and \n. Returns "" at EOF.
@@ -173,6 +181,7 @@ class File
         return sz;
     }
 
+    // Return true if a file or directory exists at path.
     static bool exists(string path)
     {
         return os.windows._access(path.data(), 0) == 0;
@@ -194,11 +203,13 @@ class File
         return (attrs & 16) != 0;
     }
 
+    // Delete the file at path. Returns true on success.
     static bool remove(string path)
     {
         return os.windows._unlink(path.data()) == 0;
     }
 
+    // Move or rename a file, replacing dst if it already exists.
     static bool move(string src, string dst)
     {
         return os.windows.MoveFileExA(src.data(), dst.data(), 1) != 0;  // MOVEFILE_REPLACE_EXISTING
@@ -238,6 +249,7 @@ class File
         return ok;
     }
 
+    // Overload of writeAllText taking a raw C string for content.
     static bool writeAllText(string path, const char* content)
     {
         string s;
@@ -260,6 +272,7 @@ class File
         return ok;
     }
 
+    // Overload of appendAllText taking a raw C string for content.
     static bool appendAllText(string path, const char* content)
     {
         string s;
@@ -268,6 +281,7 @@ class File
         return File.appendAllText(path, s);
     }
 
+    // Destructor: close the file handle if still open.
     ~File()
     {
         if (_handle != nullptr)
@@ -280,6 +294,7 @@ class File
 
 // ── Path ─────────────────────────────────────────────────────────────────────
 
+// Static helpers for manipulating filesystem path strings.
 class Path
 {
     // Join two path segments with a backslash separator if a does not already end with one.
@@ -430,6 +445,7 @@ class Path
 
 // ── Directory ─────────────────────────────────────────────────────────────────
 
+// Directory operations, both instance-bound (via init) and as static helpers.
 class Directory
 {
     i8* _pathPtr = nullptr;
@@ -447,6 +463,7 @@ class Directory
         _pathLen = len;
     }
 
+    // Return this instance's bound path as a borrowed string.
     string path()
     {
         string s;
@@ -455,27 +472,39 @@ class Directory
         return s;
     }
 
+    // Return true if the bound directory exists.
     bool exists()  { return os.windows._access(_pathPtr, 0) == 0; }
+    // Create the bound directory (parent must already exist).
     bool create()  { return os.windows._mkdir(_pathPtr) == 0; }
+    // Remove the bound directory (must be empty).
     bool remove()  { return os.windows._rmdir(_pathPtr) == 0; }
 
+    // List all entries in the bound directory.
     list<string>* list()          { return Directory.list(path()); }
+    // List only regular files in the bound directory.
     list<string>* listFiles()     { return Directory.listFiles(path()); }
+    // List only subdirectories in the bound directory.
     list<string>* listDirs()      { return Directory.listDirs(path()); }
+    // List all entries under the bound directory recursively.
     list<string>* listRecursive() { return Directory.listRecursive(path()); }
+    // Create the bound directory and all missing parents.
     bool createAll()              { return Directory.createAll(path()); }
 
+    // Destructor: free the private path copy.
     ~Directory()
     {
         if (_pathPtr != nullptr) delete[] _pathPtr;
     }
 
+    // Return true if a directory exists at path.
     static bool exists(string path)
     {
         return os.windows._access(path.data(), 0) == 0;
     }
 
+    // Create the directory at path (parent must already exist).
     static bool create(string path) { return os.windows._mkdir(path.data()) == 0; }
+    // Remove the directory at path (must be empty).
     static bool remove(string path) { return os.windows._rmdir(path.data()) == 0; }
 
     // Return the process current working directory.
@@ -491,6 +520,7 @@ class Directory
         return _strOwned(buf, strlen(buf));
     }
 
+    // Set the process current working directory to path.
     static bool setCurrent(string path)
     {
         return os.windows._chdir(path.data()) == 0;
@@ -594,6 +624,7 @@ class Directory
         return result;
     }
 
+    // Recursively walk path, appending each entry's full path to result (subdirs first).
     static void _collectRecursive(string path, list<string>* result)
     {
         list<string>* entries = Directory._listFiltered(path, 0);

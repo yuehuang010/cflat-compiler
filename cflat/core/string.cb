@@ -251,6 +251,7 @@ move string operator string(double d)
 
 // ── string equality ──────────────────────────────────────────────────────────
 
+// Byte-exact equality: same length and identical bytes (NUL-safe, memcmp-based).
 bool operator==(string a, string b)
 {
     i32 alen = a.length();
@@ -262,6 +263,7 @@ bool operator==(string a, string b)
     return memcmp(a._ptr, b._ptr, (i64)alen) == 0;
 }
 
+// Byte-exact inequality (negation of operator==).
 bool operator!=(string a, string b)
 {
     return !(a == b);
@@ -593,8 +595,11 @@ struct string_view
     i8* _ptr = nullptr;
     i32 _len = 0;
 
+    // Pointer to the borrowed bytes (not NUL-terminated in general).
     i8* data()      { return _ptr; }
+    // Number of bytes in the view.
     i32 length()    { return _len; }
+    // Byte at position i (unchecked).
     i8  get(i32 i)  { return _ptr[i]; }
 };
 
@@ -628,6 +633,7 @@ struct stringbuilder
     i32 _length   = 0;
     i32 _capacity = 0;
 
+    // Grow the buffer so it can hold at least `needed` bytes (geometric growth).
     void _ensure(i32 needed)
     {
         if (_capacity >= needed) return;
@@ -646,7 +652,9 @@ struct stringbuilder
         _capacity = newCap;
     }
 
+    // Pointer to the current NUL-terminated buffer (may be null when empty).
     i8* data()   { return _data; }
+    // Number of bytes accumulated so far.
     i32 length() { return _length; }
 
     // Append the contents of another string.
@@ -821,6 +829,7 @@ struct stringbuilder
         appendChar(10);
     }
 
+    // Append a raw C string literal followed by a newline character.
     void appendLine(const char* s)
     {
         appendCStr(s);
@@ -850,6 +859,7 @@ struct stringbuilder
         return toString();
     }
 
+    // Free the backing buffer when the builder is destroyed.
     ~stringbuilder()
     {
         if (_data != nullptr) delete[] _data;

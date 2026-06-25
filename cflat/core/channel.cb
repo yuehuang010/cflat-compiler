@@ -40,6 +40,7 @@ import "atomic.cb";
 import "thread.cb";
 import "intrinsic.cb";   // pause() - spin-loop hint for the blocking send/receive retries
 
+// Bounded MPMC lock-free ring buffer; capacity must be a power of two.
 class channel<T>
 {
     // Ring buffer and sequence array (read-only after init, shared across threads).
@@ -74,6 +75,7 @@ class channel<T>
 
     // ── public API ────────────────────────────────────────────────────────────
 
+    // Allocate the ring and sequence array; rounds cap up to a power of two.
     void init(int cap) {
         // Round up to the next power of two so bitmasking is safe.
         i64 n = (i64)1;
@@ -278,6 +280,7 @@ class channel<T>
         return false;
     }
 
+    // Blocking enqueue (IQueue alias for send) - spins until a slot is free.
     void push(move T item) {
         i64 pos   = __atomic_i64_load(&_head);
         i64 spins = (i64)0;
@@ -300,6 +303,7 @@ class channel<T>
         }
     }
 
+    // Blocking dequeue (IQueue alias for receive) - spins until an item arrives.
     T pop() {
         i64 pos   = __atomic_i64_load(&_tail);
         i64 spins = (i64)0;
@@ -340,8 +344,10 @@ class channel<T>
         t.start(entry, (void*)ctx);              // detached fire-and-forget forwarder
     }
 
+    // Total slot capacity (the power-of-two the channel was sized to).
     int capacity() { return (int)_cap; }
 
+    // Approximate number of items currently buffered (head - tail, clamped to >= 0).
     int count() {
         i64 head = __atomic_i64_load(&_head);
         i64 tail = __atomic_i64_load(&_tail);
@@ -350,11 +356,13 @@ class channel<T>
         return (int)n;
     }
 
+    // Free the ring buffer and sequence array. Safe to call more than once.
     void destroy() {
         if (_buf != nullptr) { delete[_] _buf; _buf = nullptr; }
         if (_seq != nullptr) { free((void*)_seq); _seq = nullptr; }
     }
 
+    // Release buffers on scope exit.
     ~channel() {
         destroy();
     }

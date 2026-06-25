@@ -855,6 +855,14 @@ private:
                         (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(),
                         sig, {}, doc);
 
+            // Namespace free functions also register under the unqualified name so a bare
+            // hover/completion on "square" resolves to "Math.square" (mirrors the struct alias
+            // below). Without this the doc comment and signature are unreachable from hover.
+            if (structName.empty() && !namespaceName.empty())
+                s->Register(SymbolKind::Function, rawFuncName, compiler->GetSourceFilePath(),
+                            (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(),
+                            sig, {}, doc);
+
             // Record an unused-function candidate. Only free functions: struct methods
             // can be re-emitted (and called) in another TU under monomorphization, so a
             // method unused in this file is not provably dead. Operators are dispatched
