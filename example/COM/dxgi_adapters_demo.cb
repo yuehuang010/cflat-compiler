@@ -11,15 +11,21 @@
 // `this` (the explicit `adapter->lpVtbl->GetDesc(adapter, &desc)` form works too). This is the
 // same path that drives IMalloc in imalloc_demo.cb, here on a much larger Microsoft graphics API.
 //
+// Lifetime is managed with ComPtr<T> (core/com.cb): the factory and each enumerated adapter live
+// in an owning RAII holder that Releases exactly once when it leaves scope, so there are no
+// hand-written Release() calls. Reusing one `adapter` holder across the loop frees the previous
+// adapter on each `put()` (which reset()s first), and the factory IID is supplied by iidof().
+//
 // It is fully headless: it creates no window and needs no live 3D device (DXGI
 // enumeration is a thin layer over the driver list), so it runs anywhere.
 //
 // Build:  x64/Debug/cflat.exe example/COM/dxgi_adapters_demo.cb -o out/dxgi_adapters_demo.exe
 // Run:    out\dxgi_adapters_demo.exe
 
-// dxgi.h supplies IDXGIFactory + IDXGIAdapter + CreateDXGIFactory and links dxgi.lib.
+// com.cb (ComPtr + S_OK/...) is imported BEFORE dxgi.h so its HRESULT globals win the
+// redeclaration; dxgi.h supplies IDXGIFactory + IDXGIAdapter + CreateDXGIFactory and links dxgi.lib.
+import "com.cb";
 import "dxgi.h" lib "dxgi.lib" cache;
-import "guid.cb";
 
 // Map the well-known PCI vendor id to a readable name. Anything else prints as hex.
 char* vendorName(u32 id)
@@ -33,35 +39,34 @@ char* vendorName(u32 id)
 
 extern int main()
 {
-    // CreateDXGIFactory wants the IDXGIFactory IID as a REFIID. A core `Guid` is laid
-    // out exactly like GUID, so &iid passes straight in - no dxguid.lib import needed.
-    Guid iid = Guid.parse("7b7166ec-21c7-44ae-b21a-c9ae321ae369"); // IID_IDXGIFactory
-    IDXGIFactory* factory = nullptr;
-    i32 hr = CreateDXGIFactory(&iid, (void**)&factory);
-    if (hr != 0 || factory == nullptr)
+    // CreateDXGIFactory wants the IDXGIFactory IID as a REFIID; iidof(IDXGIFactory) yields a
+    // pointer to that 16-byte GUID (read from the header), so no hand-parsed Guid is needed.
+    ComPtr<IDXGIFactory> factory = default;
+    i32 hr = CreateDXGIFactory(iidof(IDXGIFactory), (void**)factory.put());
+    if (FAILED(hr) || !factory.valid())
     {
         printf("CreateDXGIFactory failed: hr=0x%08X\n", hr);
         return 1;
     }
-    printf("CreateDXGIFactory -> IDXGIFactory* %p\n", factory);
+    printf("CreateDXGIFactory -> IDXGIFactory* %p\n", factory.get());
 
-    // Walk the adapters until EnumAdapters returns a non-zero HRESULT
-    // (DXGI_ERROR_NOT_FOUND past the last one). Each call is one vtable dispatch with
-    // `factory` passed as the explicit `this`.
-    IDXGIAdapter* adapter = nullptr;
+    // Walk the adapters until EnumAdapters returns a non-zero HRESULT (DXGI_ERROR_NOT_FOUND
+    // past the last one). adapter.put() reset()s first, so each iteration Releases the previous
+    // adapter before receiving the next - the final not-found call leaves the holder empty.
+    ComPtr<IDXGIAdapter> adapter = default;
     u32 idx = 0;
-    while (factory->EnumAdapters(idx, &adapter) == 0)
+    while (factory->EnumAdapters(idx, adapter.put()) == 0)
     {
         DXGI_ADAPTER_DESC desc = default;
         adapter->GetDesc(&desc);
         u64 vramMB = (u64)desc.DedicatedVideoMemory / (1024 * 1024);
         printf("adapter %u: %-16s vendor=0x%04X device=0x%04X  dedicated VRAM=%llu MB\n",
                idx, vendorName(desc.VendorId), desc.VendorId, desc.DeviceId, vramMB);
-        adapter->Release();
         idx = idx + 1;
     }
 
-    u32 rc = factory->Release();
-    printf("enumerated %u adapter(s); factory final Release -> refcount=%u\n", idx, rc);
+    // No explicit Release(): `adapter` (already empty) and `factory` are released by their
+    // ComPtr destructors when main returns.
+    printf("enumerated %u adapter(s)\n", idx);
     return 0;
 }

@@ -8,58 +8,54 @@
 // hand-declared structs, no hand-written `extern` for CoGetMalloc (it is auto-externed).
 //
 // This demo asks COM for its process-wide task allocator (IMalloc) via CoGetMalloc, then
-// drives it entirely through the vtable: Alloc, GetSize, Free, QueryInterface, Release.
-// Calls use the thin-COM member sugar `m->Alloc(64)` - a vtable-slot name routes through
-// `lpVtbl` and the object is supplied as the implicit `this`, so that dispatches as
-// `m->lpVtbl->Alloc(m, 64)` (the fully explicit form still works too).
-// It needs no UI and creates no files. The QueryInterface IID is built with the core
-// `Guid` type (core/guid.cb): because that type is named `Guid`, not `GUID`, it coexists
-// with the `GUID` that objbase.h registers through C interop - no name collision.
+// drives it entirely through the vtable: Alloc, GetSize, Free, QueryInterface. Calls use the
+// thin-COM member sugar `m->Alloc(64)` - a vtable-slot name routes through `lpVtbl` and the
+// object is supplied as the implicit `this`, so that dispatches as `m->lpVtbl->Alloc(m, 64)`
+// (the fully explicit form still works too).
+//
+// Lifetime is managed with ComPtr<T> (core/com.cb): an owning RAII holder that Releases its
+// interface exactly once when it leaves scope, so there are no hand-written Release() calls.
+// ComPtr.tryAs is QueryInterface with the target IID derived from T via iidof(T) - here read
+// from the __declspec(uuid) the SDK header carries on IMalloc.
 //
 // Build:  x64/Debug/cflat.exe example/COM/imalloc_demo.cb -o out/imalloc_demo.exe
 // Run:    out\imalloc_demo.exe
 
-// objbase.h supplies IMalloc + CoGetMalloc (both from the header) and links ole32.lib.
+// com.cb (ComPtr + S_OK/...) is imported BEFORE objbase.h so its HRESULT globals win the
+// redeclaration; objbase.h supplies IMalloc + CoGetMalloc (both from the header) and links ole32.lib.
+import "com.cb";
 import "objbase.h" lib "ole32.lib" cache;
-import "guid.cb";
 
 extern int main()
 {
     // CoGetMalloc(MEMCTX_TASK = 1) hands back the process task allocator as an IMalloc*.
-    IMalloc* m = nullptr;
-    i32 hr = CoGetMalloc(1, (void**)&m);
-    if (hr != 0 || m == nullptr)
+    ComPtr<IMalloc> m = default;
+    i32 hr = CoGetMalloc(1, (void**)m.put());
+    if (FAILED(hr) || !m.valid())
     {
         printf("CoGetMalloc failed: hr=0x%08X\n", hr);
         return 1;
     }
-    printf("CoGetMalloc -> IMalloc* %p\n", m);
+    printf("CoGetMalloc -> IMalloc* %p\n", m.get());
 
     // Allocate through the vtable, confirm the size, then free - each is one indirect
-    // call with `m` passed as the explicit `this`.
+    // call with `m` passed as the explicit `this` (m->Alloc dispatches as m->lpVtbl->Alloc(m, ...)).
     void* p = m->Alloc(64);
     u64 sz = m->GetSize(p);
     printf("Alloc(64) -> %p, GetSize -> %llu bytes\n", p, sz);
     m->Free(p);
     printf("Free(%p) done\n", p);
 
-    // QueryInterface for IUnknown: IMalloc derives from IUnknown, so this returns the
-    // same object (with an extra ref) and proves the QI slot dispatches correctly. The
-    // IID is a core `Guid`; its 16-byte layout matches REFIID, so &iid passes straight in.
-    Guid iid = Guid.parse("00000000-0000-0000-C000-000000000046");
-    void* unk = nullptr;
-    i32 qi = m->QueryInterface(&iid, &unk);
-    printf("QueryInterface(IUnknown) -> hr=0x%08X, unk=%p (same object: %s)\n",
-           qi, unk, ((void*)m == unk) ? "yes" : "no");
+    // QueryInterface via ComPtr.tryAs: the IID comes from T (iidof(IMalloc), read from the
+    // header's __declspec(uuid)), and any prior ref is dropped first. IMalloc derives from
+    // IUnknown, so QI'ing the allocator for its own interface returns the same object with an
+    // extra ref - which `same`'s destructor Releases at scope exit.
+    ComPtr<IMalloc> same = default;
+    i32 qi = same.tryAs(m.get());
+    printf("tryAs(IMalloc) -> hr=0x%08X, same=%p (same object: %s)\n",
+           qi, same.get(), ((void*)m.get() == (void*)same.get()) ? "yes" : "no");
 
-    // Release the QI reference, then the allocator reference. The task allocator is a
-    // process singleton, so its final count is implementation-defined, not necessarily 0.
-    if (unk != nullptr)
-    {
-        IMalloc* unkM = (IMalloc*)unk;
-        unkM->Release();
-    }
-    u32 rc = m->Release();
-    printf("final Release -> refcount=%u\n", rc);
+    // No explicit Release(): `same` then `m` are released by their ComPtr destructors when
+    // main returns. The task allocator is a process singleton, so it outlives this program.
     return 0;
 }

@@ -13,13 +13,20 @@
 // windows.h supplies the window + message loop; the cube math (perspective + rotation) is plain
 // CFlat using Math.sin/cos/tan from core/math.cb.
 //
+// COM lifetime is managed via ComPtr<T> (core/com.cb): each interface lives in an owning RAII
+// holder that Releases on scope exit, so there are no hand-written Release() calls. The device-
+// dependent objects the render loop touches are global ComPtrs (single-window, single-thread);
+// the rest are locals in main that release when it returns. ComPtr resolves a header-COM type's
+// IID through iidof(), reading the __declspec(uuid) the SDK headers carry.
+//
 // Build:  x64/Debug/cflat.exe example/COM/d3d11_cube_demo.cb -o out/d3d11_cube_demo.exe
 // Run:    out\d3d11_cube_demo.exe   (opens a window; close it to exit)
 
+// com.cb is imported BEFORE the SDK headers so its S_OK/E_FAIL/... globals win the redeclaration.
+import "com.cb";
 import { "windows.h", "d3d11.h", "d3dcompiler.h" }
     lib { "user32.lib", "gdi32.lib", "d3d11.lib", "d3dcompiler.lib", "dxgi.lib" } cache;
 import "math.cb";
-import "guid.cb";
 
 const i32 W = 640;
 const i32 H = 480;
@@ -32,12 +39,13 @@ u64 cstrlen(char* s)
 }
 
 // Device-dependent pipeline objects reached every frame. Single-window, single-thread - the
-// documented constraint for these globals (mirrors direct2d_demo.cb).
-IDXGISwapChain* g_swap = nullptr;
-ID3D11DeviceContext* g_ctx = nullptr;
-ID3D11RenderTargetView* g_rtv = nullptr;
-ID3D11DepthStencilView* g_dsv = nullptr;
-ID3D11Buffer* g_cb = nullptr;
+// documented constraint for these globals (mirrors direct2d_demo.cb). Each is an owning ComPtr;
+// the holders are reset() in reverse order at the end of main.
+ComPtr<IDXGISwapChain> g_swap = default;
+ComPtr<ID3D11DeviceContext> g_ctx = default;
+ComPtr<ID3D11RenderTargetView> g_rtv = default;
+ComPtr<ID3D11DepthStencilView> g_dsv = default;
+ComPtr<ID3D11Buffer> g_cb = default;
 
 // ---- 4x4 matrix helpers (row-major; a row vector v transforms as v*M) ----------------
 
@@ -149,18 +157,18 @@ void renderFrame()
 
     // Upload the matrix into the dynamic constant buffer (DISCARD = rename, no GPU stall).
     D3D11_MAPPED_SUBRESOURCE ms = default;
-    i32 hr = g_ctx->Map((ID3D11Resource*)g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+    i32 hr = g_ctx->Map((ID3D11Resource*)g_cb.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
     if (hr == 0)
     {
         float* dst = (float*)ms.pData;
         i32 i = 0;
         while (i < 16) { dst[i] = mvp[i]; i = i + 1; }
-        g_ctx->Unmap((ID3D11Resource*)g_cb, 0);
+        g_ctx->Unmap((ID3D11Resource*)g_cb.get(), 0);
     }
 
     float[4] clear = { 0.06, 0.07, 0.10, 1.0 };
-    g_ctx->ClearRenderTargetView(g_rtv, &clear[0]);
-    g_ctx->ClearDepthStencilView(g_dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+    g_ctx->ClearRenderTargetView(g_rtv.get(), &clear[0]);
+    g_ctx->ClearDepthStencilView(g_dsv.get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
     g_ctx->DrawIndexed(36, 0, 0);
     g_swap->Present(1, 0);
 }
@@ -223,41 +231,44 @@ extern int main()
     i32[1] levels = default;
     levels[0] = D3D_FEATURE_LEVEL_11_0;
     i32 gotFL = default;
-    ID3D11Device* dev = nullptr;
+    ComPtr<ID3D11Device> dev = default;
     i32 hr = D3D11CreateDeviceAndSwapChain(
         nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
         &levels[0], 1, D3D11_SDK_VERSION,
-        &scd, &g_swap, &dev, &gotFL, &g_ctx);
-    if (hr != 0 || dev == nullptr)
+        &scd, g_swap.put(), dev.put(), &gotFL, g_ctx.put());
+    if (hr != 0 || !dev.valid())
     {
         printf("D3D11CreateDeviceAndSwapChain failed: hr=0x%08X\n", hr);
         return 2;
     }
     printf("D3D11 device + swap chain created (feature level 0x%04X)\n", (u32)gotFL);
 
-    // 2. Render-target view over the swap chain's back buffer.
-    Guid iidTex = Guid.parse("6f15aaf2-d208-4e89-9ab4-489535d34f9c"); // IID_ID3D11Texture2D
-    ID3D11Texture2D* backbuf = nullptr;
-    g_swap->GetBuffer(0, &iidTex, (void**)&backbuf);
-    dev->CreateRenderTargetView((ID3D11Resource*)backbuf, nullptr, &g_rtv);
+    // 2. Render-target view over the swap chain's back buffer. iidof reads IID_ID3D11Texture2D
+    // from the header's __declspec(uuid); GetBuffer wants it as a REFIID.
+    ComPtr<ID3D11Texture2D> backbuf = default;
+    g_swap->GetBuffer(0, iidof(ID3D11Texture2D), (void**)backbuf.put());
+    dev->CreateRenderTargetView((ID3D11Resource*)backbuf.get(), nullptr, g_rtv.put());
 
     // 3. Depth-stencil buffer + view (so cube faces occlude correctly).
     D3D11_TEXTURE2D_DESC dd = default;
     dd.Width = (u32)W; dd.Height = (u32)H; dd.MipLevels = 1; dd.ArraySize = 1;
     dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dd.SampleDesc.Count = 1;
     dd.Usage = D3D11_USAGE_DEFAULT; dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-    ID3D11Texture2D* depth = nullptr;
-    dev->CreateTexture2D(&dd, nullptr, &depth);
-    dev->CreateDepthStencilView((ID3D11Resource*)depth, nullptr, &g_dsv);
+    ComPtr<ID3D11Texture2D> depth = default;
+    dev->CreateTexture2D(&dd, nullptr, depth.put());
+    dev->CreateDepthStencilView((ID3D11Resource*)depth.get(), nullptr, g_dsv.put());
 
-    // 4. Compile + create the shaders.
-    ID3DBlob* vsb = compileShader(hlsl, "VSMain", "vs_4_0");
-    ID3DBlob* psb = compileShader(hlsl, "PSMain", "ps_4_0");
-    if (vsb == nullptr || psb == nullptr) return 3;
-    ID3D11VertexShader* vs = nullptr;
-    ID3D11PixelShader* ps = nullptr;
-    dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &vs);
-    dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &ps);
+    // 4. Compile + create the shaders. compileShader returns an already-owned ID3DBlob*; attach()
+    // adopts that ref into the ComPtr without an extra AddRef.
+    ComPtr<ID3DBlob> vsb = default;
+    ComPtr<ID3DBlob> psb = default;
+    vsb.attach(compileShader(hlsl, "VSMain", "vs_4_0"));
+    psb.attach(compileShader(hlsl, "PSMain", "ps_4_0"));
+    if (!vsb.valid() || !psb.valid()) return 3;
+    ComPtr<ID3D11VertexShader> vs = default;
+    ComPtr<ID3D11PixelShader> ps = default;
+    dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, vs.put());
+    dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, ps.put());
 
     // 5. Input layout: float3 POSITION at 0, float3 COLOR at 12.
     D3D11_INPUT_ELEMENT_DESC[2] ied = default;
@@ -265,8 +276,8 @@ extern int main()
     ied[0].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
     ied[1].SemanticName = "COLOR"; ied[1].Format = DXGI_FORMAT_R32G32B32_FLOAT;
     ied[1].AlignedByteOffset = 12; ied[1].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
-    ID3D11InputLayout* il = nullptr;
-    dev->CreateInputLayout(&ied[0], 2, vsb->GetBufferPointer(), vsb->GetBufferSize(), &il);
+    ComPtr<ID3D11InputLayout> il = default;
+    dev->CreateInputLayout(&ied[0], 2, vsb->GetBufferPointer(), vsb->GetBufferSize(), il.put());
 
     // 6. Cube geometry: 8 corners at +-1, color = position mapped to [0,1]; 36 indices.
     float[48] verts = {
@@ -290,27 +301,27 @@ extern int main()
     vbd.ByteWidth = 48 * 4; vbd.Usage = D3D11_USAGE_DEFAULT; vbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     D3D11_SUBRESOURCE_DATA vsrd = default;
     vsrd.pSysMem = &verts[0];
-    ID3D11Buffer* vb = nullptr;
-    dev->CreateBuffer(&vbd, &vsrd, &vb);
+    ComPtr<ID3D11Buffer> vb = default;
+    dev->CreateBuffer(&vbd, &vsrd, vb.put());
 
     D3D11_BUFFER_DESC ibd = default;
     ibd.ByteWidth = 36 * 2; ibd.Usage = D3D11_USAGE_DEFAULT; ibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
     D3D11_SUBRESOURCE_DATA isrd = default;
     isrd.pSysMem = &idx[0];
-    ID3D11Buffer* ib = nullptr;
-    dev->CreateBuffer(&ibd, &isrd, &ib);
+    ComPtr<ID3D11Buffer> ib = default;
+    dev->CreateBuffer(&ibd, &isrd, ib.put());
 
     // 7. Dynamic constant buffer for the 64-byte MVP matrix.
     D3D11_BUFFER_DESC cbd = default;
     cbd.ByteWidth = 64; cbd.Usage = D3D11_USAGE_DYNAMIC; cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    dev->CreateBuffer(&cbd, nullptr, &g_cb);
+    dev->CreateBuffer(&cbd, nullptr, g_cb.put());
 
     // 8. Cull nothing so winding never hides a face; depth test (default state) handles occlusion.
     D3D11_RASTERIZER_DESC rd = default;
     rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE;
-    ID3D11RasterizerState* rs = nullptr;
-    dev->CreateRasterizerState(&rd, &rs);
+    ComPtr<ID3D11RasterizerState> rs = default;
+    dev->CreateRasterizerState(&rd, rs.put());
 
     // 9. Bind the pipeline once - state persists across Present on the immediate context.
     D3D11_VIEWPORT vp = default;
@@ -318,15 +329,20 @@ extern int main()
     u32 stride = 24;
     u32 offset = 0;
     g_ctx->RSSetViewports(1, &vp);
-    g_ctx->RSSetState(rs);
-    g_ctx->OMSetRenderTargets(1, &g_rtv, g_dsv);
-    g_ctx->IASetInputLayout(il);
-    g_ctx->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
-    g_ctx->IASetIndexBuffer(ib, DXGI_FORMAT_R16_UINT, 0);
+    g_ctx->RSSetState(rs.get());
+    // Array-of-pointer in-params (OMSetRenderTargets, IASetVertexBuffers, VSSetConstantBuffers)
+    // take the address of a raw slot, so borrow the pointer via get() into a local first.
+    ID3D11RenderTargetView* rtvRaw = g_rtv.get();
+    g_ctx->OMSetRenderTargets(1, &rtvRaw, g_dsv.get());
+    g_ctx->IASetInputLayout(il.get());
+    ID3D11Buffer* vbRaw = vb.get();
+    g_ctx->IASetVertexBuffers(0, 1, &vbRaw, &stride, &offset);
+    g_ctx->IASetIndexBuffer(ib.get(), DXGI_FORMAT_R16_UINT, 0);
     g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    g_ctx->VSSetShader(vs, nullptr, 0);
-    g_ctx->VSSetConstantBuffers(0, 1, &g_cb);
-    g_ctx->PSSetShader(ps, nullptr, 0);
+    g_ctx->VSSetShader(vs.get(), nullptr, 0);
+    ID3D11Buffer* cbRaw = g_cb.get();
+    g_ctx->VSSetConstantBuffers(0, 1, &cbRaw);
+    g_ctx->PSSetShader(ps.get(), nullptr, 0);
 
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
@@ -346,23 +362,14 @@ extern int main()
             renderFrame();
     }
 
-    // 11. Release everything (reverse order). Each is one vtable dispatch.
-    rs->Release();
-    ib->Release();
-    vb->Release();
-    il->Release();
-    ps->Release();
-    vs->Release();
-    psb->Release();
-    vsb->Release();
-    g_cb->Release();
-    g_dsv->Release();
-    depth->Release();
-    g_rtv->Release();
-    backbuf->Release();
-    g_ctx->Release();
-    g_swap->Release();
-    dev->Release();
+    // 11. Drop the device-dependent globals in reverse order; the local interfaces (dev, backbuf,
+    // depth, shaders, buffers, layout, rasterizer) are released by their ComPtr destructors when
+    // main returns. Each reset()/dtor is one vtable Release dispatch.
+    g_cb.reset();
+    g_dsv.reset();
+    g_rtv.reset();
+    g_ctx.reset();
+    g_swap.reset();
 
     return (int)msg.wParam;
 }
