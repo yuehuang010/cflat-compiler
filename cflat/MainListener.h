@@ -2898,6 +2898,9 @@ public:
         {
             if (auto* imp = extDecl->importDeclaration())
             {
+                // Point diagnostics at this import statement (see ProcessImports): a not-found
+                // error has no readable file behind it and would otherwise report (0,0).
+                Compiler()->SetSourceLocation(imp->getStart()->getLine(), imp->getStart()->getCharPositionInLine());
                 // Grouped import `import { "a", "b" };` inside an if-const branch - header
                 // entries share one TU; .cb/.c route individually (see CompileImportGroup).
                 if (auto* grp = imp->importGroup())

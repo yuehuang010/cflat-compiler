@@ -539,6 +539,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             if (auto* tu = computeUnit->translationUnit()) {
                 for (auto* decl : tu->externalDeclaration()) {
                     if (auto* imp = decl->importDeclaration()) {
+                        // Point diagnostics at this import statement. A not-found error is raised
+                        // before any real file is opened (there is no readable file behind it, e.g.
+                        // a winmd), so without this it would report (0,0) instead of the import line.
+                        SetSourceLocation(imp->getStart()->getLine(), imp->getStart()->getCharPositionInLine());
                         // `import { "a", "b" };` - a group of >1 plain imports. Each entry
                         // routes like a plain `import "x";` (no per-entry alias/lib/define). A
                         // trailing `cache` on the group applies to every entry (a no-op for
@@ -1003,16 +1007,16 @@ bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const 
         if (bare != importFilename && !resolve(bare).empty())
             suggestion = " Did you mean \"" + bare + "\"?";
 
-        std::cout << std::format(
-            "Error: imported file not found: {} (searched relative to '{}'{}{}{}{}, Windows SDK, "
-            "WinMetadata).{}\n",
+        LogError(std::format(
+            "imported file not found: {} (searched relative to '{}'{}{}{}{}, Windows SDK, "
+            "WinMetadata).{}",
             importFilename,
             importingDir.string(),
             sourceFileDir_.empty() ? "" : ", source dir '" + sourceFileDir_ + "'",
             importSearchDir.empty() ? "" : ", import dir '" + importSearchDir + "'",
             cIncludeDirs_.empty() ? "" : ", " + std::to_string(cIncludeDirs_.size()) + " --c-include dir(s)",
             runtimeDir.empty() ? "" : ", runtime core '" + runtimeDir + "/core'",
-            suggestion);
+            suggestion));
     }
     return false;
 }

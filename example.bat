@@ -25,9 +25,20 @@ REM files (no int main()) that are only meant to be imported by sibling examples
 REM The example/vcpkg/ examples are run too - cflat auto-invokes vcpkg install to
 REM pull their external packages (libcurl, SDL3, sqlite, zlib).
 REM direct2d_demo imports the Win32 metadata winmd, which ships in the
-REM Microsoft.Windows.SDK.Win32Metadata nuget package (not the system) and needs an
-REM explicit -i to it; build it manually per the command in the file header.
-set EXCLUDE=test_helper ui win32host http_parser http_response http_json http_server http_client router rest_server http_io direct2d_demo
+REM Microsoft.Windows.SDK.Win32Metadata nuget package (not the system), so it needs an
+REM explicit -i to that package. We discover it below and compile the demo when present;
+REM on a host without the package it is skipped.
+set EXCLUDE=test_helper ui win32host http_parser http_response http_json http_server http_client router rest_server http_io
+
+REM Discover the newest cached Win32-metadata package dir (the one holding Windows.Win32.winmd).
+REM dir /o-n lists newest-version-first by name. Empty if the nuget package is not installed
+REM for this user, in which case direct2d_demo is skipped rather than failing on the import.
+set "WIN32MD="
+set "WIN32MD_ROOT=%USERPROFILE%\.nuget\packages\microsoft.windows.sdk.win32metadata"
+for /f "delims=" %%D in ('dir /b /ad /o-n "!WIN32MD_ROOT!" 2^>nul') do (
+    if not defined WIN32MD if exist "!WIN32MD_ROOT!\%%D\Windows.Win32.winmd" set "WIN32MD=!WIN32MD_ROOT!\%%D"
+)
+if not defined WIN32MD set EXCLUDE=%EXCLUDE% direct2d_demo
 
 REM Helper function to try compile and run
 for /r example %%F in (*.cb) do (
@@ -51,6 +62,8 @@ for /r example %%F in (*.cb) do (
             set IMPORTED_DIRS=-i example/restAPI -i example/restAPI/network
         ) else if "!FILE:~0,15!"=="example\shell\" (
             set IMPORTED_DIRS=
+        ) else if /I "!BASENAME!"=="direct2d_demo" (
+            set IMPORTED_DIRS=-i "!WIN32MD!"
         )
 
         REM Compile

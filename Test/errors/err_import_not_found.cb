@@ -1,0 +1,10 @@
+// A missing import must be reported as a real diagnostic (LogError), not silently swallowed.
+// The error is raised at import time (during ProcessImports, before the listener walk), so the
+// expectation is armed with the bare-semicolon file-scope form.
+expect_error("imported file not found: this_module_does_not_exist_xyz.cb");
+import "this_module_does_not_exist_xyz.cb";
+
+extern int main()
+{
+    return 0;
+}

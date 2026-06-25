@@ -7250,12 +7250,13 @@ public:
             if (ok) registered++;
         }
 
-        // Deferrals are diagnosed, not silently dropped (per the projection plan). Runtime-class
-        // activation, delegates, and generic interfaces are not yet projected.
-        std::cout << std::format(
-            "[winmd] {}: registered {} interface(s), {} struct(s), {} enum(s); deferred {} generic interface(s), {} runtime class(es), {} delegate(s)\n",
-            fileForLsp, registered, model.structs.size(), model.enums.size(),
-            deferredGeneric, model.runtimeClasses.size(), model.delegates.size());
+        // Deferrals are surfaced under -v, not silently dropped (per the projection plan).
+        // Runtime-class activation, delegates, and generic interfaces are not yet projected.
+        if (verbose)
+            std::cout << std::format(
+                "[winmd] {}: registered {} interface(s), {} struct(s), {} enum(s); deferred {} generic interface(s), {} runtime class(es), {} delegate(s)\n",
+                fileForLsp, registered, model.structs.size(), model.enums.size(),
+                deferredGeneric, model.runtimeClasses.size(), model.delegates.size());
     }
 
     // Read a .winmd into the projection model and register its types. Entry point for the

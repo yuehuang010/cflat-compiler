@@ -76,7 +76,32 @@ def find_misattributed_hints(text: str, diags: list) -> list[str]:
     return problems
 
 
-def collect_files() -> list[Path]:
+# example/COM/direct2d_demo.cb imports "Windows.Win32.winmd", which ships only in the
+# Microsoft.Windows.SDK.Win32Metadata NuGet package (not the system), so it resolves only
+# when -i points at that package. The package is per-user and version-specific.
+WIN32_METADATA_DEMO = "example/COM/direct2d_demo.cb"
+
+
+def find_win32_metadata_dir() -> Path | None:
+    """Return the newest cached Win32-metadata package dir containing Windows.Win32.winmd,
+    or None if the NuGet package is not installed for this user."""
+    root = Path(os.path.expanduser("~")) / ".nuget" / "packages" / "microsoft.windows.sdk.win32metadata"
+    if not root.is_dir():
+        return None
+
+    def version_key(p: Path):
+        # Leading numeric components of e.g. "70.0.11-preview" -> (70, 0, 11); newest wins.
+        head = re.match(r"(\d+(?:\.\d+)*)", p.name)
+        return tuple(int(n) for n in head.group(1).split(".")) if head else (0,)
+
+    candidates = sorted(
+        (d for d in root.iterdir() if d.is_dir() and (d / "Windows.Win32.winmd").is_file()),
+        key=version_key,
+    )
+    return candidates[-1] if candidates else None
+
+
+def collect_files(include_win32_demo: bool) -> list[Path]:
     files: list[Path] = []
     files += sorted((REPO_ROOT / "Test").glob("*.cb"))
     files += sorted((REPO_ROOT / "example").rglob("*.cb"))
@@ -84,11 +109,15 @@ def collect_files() -> list[Path]:
         p for p in (REPO_ROOT / "cflat" / "core").glob("*.cb")
         if p.name != "runtime.cb"
     )
+    if not include_win32_demo:
+        demo = (REPO_ROOT / WIN32_METADATA_DEMO).resolve()
+        files = [f for f in files if f.resolve() != demo]
     return files
 
 
-def run_bulk(exe: str, extra_args: list, show_timings: bool = False) -> bool:
-    paths = collect_files()
+def run_bulk(exe: str, extra_args: list, show_timings: bool = False,
+             include_win32_demo: bool = True) -> bool:
+    paths = collect_files(include_win32_demo)
     print(f"Server: {exe}")
     print(f"Files:  {len(paths)}")
 
@@ -244,7 +273,17 @@ def main():
             print("error: cflat.exe not found. Build first or pass the path.", file=sys.stderr)
             sys.exit(1)
 
-    ok = run_bulk(exe, extra_args, show_timings)
+    # Resolve example/COM/direct2d_demo.cb's "Windows.Win32.winmd" import by pointing -i at the
+    # Win32-metadata NuGet package. If it isn't installed, drop that one file from the sweep so a
+    # bare host stays green rather than failing on an import it cannot satisfy.
+    win32_dir = find_win32_metadata_dir()
+    if win32_dir is not None:
+        extra_args = extra_args + ["-i", str(win32_dir)]
+        print(f"Win32 metadata: {win32_dir}")
+    else:
+        print(f"Win32 metadata: not installed - skipping {WIN32_METADATA_DEMO}")
+
+    ok = run_bulk(exe, extra_args, show_timings, include_win32_demo=win32_dir is not None)
     sys.exit(0 if ok else 1)
 
 
