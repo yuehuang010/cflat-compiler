@@ -1,23 +1,37 @@
 // ui.cb - a small React-Native-style declarative UI library for CFlat.
 //
-// Design (see internal/plan/ui-framework-v1.md for the long-form rationale):
+// Design (see internal/plan/ui-framework-v1.md for the long-form rationale, and
+// doc/UI.md for the frozen v0.4 contract):
 //   - Element is an interface; every host node (View/Text/Button) implements it.
 //   - Nodes are heap-allocated and owned by their parent through the Element
 //     interface; teardown walks the tree via destroyTree().
 //   - Children are list<Element> (avoids the T[] length-inference gap).
 //   - Events are Lambda<void()> closures with automatic capture.
-//   - v1 does not render; it serializes the tree to a renderer-friendly JSON
-//     shape: { "type": ..., "props": {...}, "children": [...] }.
+//   - Input flows through a single dispatch(Event) seam (pointer + key), focus is
+//     a keyed identity tracked in UiContext, layout is one constraints-in /
+//     size-out pass with a flexDirection strategy, and prop change-detection is a
+//     structured propsEqual() (no stringly-typed signatures).
+//   - The library carries NO process-global mutable state: the dirty flag and the
+//     focused-node identity live in a host-owned UiContext, threaded through
+//     render(UiContext*). Single mounted app, single thread (see doc/UI.md).
+//   - v0.4 does not paint pixels in the library; nodes paint via the Canvas seam
+//     and serialize to a renderer-friendly JSON shape.
 
 import "list.cb";
 import "string.cb";
 
-// Shared layout/style props. Plain value struct carried by host elements.
+// Flex main-axis direction for a View's children (the F3 layout pass strategy).
+int DIR_COLUMN = 0;   // stack children top-to-bottom (default)
+int DIR_ROW    = 1;   // place children left-to-right
+
+// Shared layout/style props. Plain value struct carried by host elements. Field
+// names track React Native (flexDirection); a typed struct, not an open bag.
 struct Style
 {
     int padding = 0;
     int width = 0;
     int height = 0;
+    int flexDirection = 0;   // DIR_COLUMN | DIR_ROW
 };
 
 Style makeStyle(int padding, int width, int height)
@@ -31,14 +45,21 @@ Style makeStyle(int padding, int width, int height)
 
 bool styleIsEmpty(Style s)
 {
-    return s.padding == 0 && s.width == 0 && s.height == 0;
+    return s.padding == 0 && s.width == 0 && s.height == 0 && s.flexDirection == 0;
+}
+
+bool styleEquals(Style a, Style b)
+{
+    return a.padding == b.padding && a.width == b.width
+        && a.height == b.height && a.flexDirection == b.flexDirection;
 }
 
 string styleToJson(Style s)
 {
     return "{\"padding\":" + s.padding.toString()
          + ",\"width\":" + s.width.toString()
-         + ",\"height\":" + s.height.toString() + "}";
+         + ",\"height\":" + s.height.toString()
+         + ",\"flexDirection\":" + s.flexDirection.toString() + "}";
 }
 
 // ── Rect: an absolute cell rectangle assigned during layout ──────────────────
@@ -54,6 +75,43 @@ struct Rect
     {
         return px >= x && px < x + w && py >= y && py < y + h;
     }
+};
+
+// Intersection of two rects (empty - zero w/h - if they do not overlap). Drives
+// the Canvas clip stack so a ScrollView only paints inside its viewport.
+Rect intersectRect(Rect a, Rect b)
+{
+    int x0 = a.x; if (b.x > x0) x0 = b.x;
+    int y0 = a.y; if (b.y > y0) y0 = b.y;
+    int x1 = a.x + a.w; int bx1 = b.x + b.w; if (bx1 < x1) x1 = bx1;
+    int y1 = a.y + a.h; int by1 = b.y + b.h; if (by1 < y1) y1 = by1;
+    Rect r = default;
+    r.x = x0; r.y = y0;
+    r.w = x1 - x0; if (r.w < 0) r.w = 0;
+    r.h = y1 - y0; if (r.h < 0) r.h = 0;
+    return r;
+}
+
+// ── Layout protocol (F3): constraints in -> size out ─────────────────────────
+// A node lays out within a LayoutConstraints (its origin + the space available)
+// and returns the Size it consumed; it also stamps its own absolute `bounds` so
+// paint and hit-test agree. Container nodes drive their children with this one
+// pass; flex/row/column/scroll are STRATEGIES over it, not bespoke per-node math.
+// Layout stays in CELL units - the Canvas owns the cell->pixel mapping.
+int LAYOUT_UNBOUNDED = 1000000;   // "no height limit" sentinel for a root pass
+
+struct LayoutConstraints
+{
+    int x = 0;
+    int y = 0;
+    int availW = 0;
+    int availH = 0;
+};
+
+struct Size
+{
+    int w = 0;
+    int h = 0;
 };
 
 // ── Surface: a headless width x height character grid ─────────────────────────
@@ -165,40 +223,252 @@ struct Surface
     }
 };
 
+// Draw a single-cell border around rect b: '+' corners, '-'/'|' edges. Silently
+// no-ops on a degenerate rect (a box needs at least 2x2 to have an interior).
+void drawBorder(Surface* s, Rect b)
+{
+    if (b.w < 2 || b.h < 2) return;
+    int right  = b.x + b.w - 1;
+    int bottom = b.y + b.h - 1;
+    s.put(b.x, b.y, '+');
+    s.put(right, b.y, '+');
+    s.put(b.x, bottom, '+');
+    s.put(right, bottom, '+');
+    int x = b.x + 1;
+    while (x < right) { s.put(x, b.y, '-'); s.put(x, bottom, '-'); x++; }
+    int y = b.y + 1;
+    while (y < bottom) { s.put(b.x, y, '|'); s.put(right, y, '|'); y++; }
+}
+
+// ── Canvas: the surface-agnostic draw target nodes paint into ─────────────────
+// Nodes paint via Canvas primitives (in CELL coordinates) instead of poking a
+// Surface's cells directly, so the SAME tree can render to a char grid (TUI) or a
+// GDI window (Win32). A Canvas implementation owns the cell->pixel mapping.
+// pushClip/popClip bound subsequent drawing to a rectangle (in cells). A
+// ScrollView pushes its viewport so off-viewport children are clipped; calls
+// nest (each push intersects with the active clip) and must be balanced.
+interface Canvas
+{
+    void clear();
+    void drawText(int col, int row, const char* s);
+    void drawRect(Rect r, bool filled);   // filled=false draws a border, true fills
+    void pushClip(Rect r);
+    void popClip();
+};
+
+// TUI Canvas: a thin adapter over a Surface. (Surface is a struct and cannot
+// implement an interface directly, so the adapter carries the contract.) Holds a
+// borrowed Surface*; it never owns the grid. The clip stack is a fixed inline
+// array (no heap) so this stays a pure value type with no destructor - it is
+// passed as a Canvas (interface) temporary, which is not auto-destructed.
+int CLIP_STACK_MAX = 8;
+
+class SurfaceCanvas : Canvas
+{
+    Surface* target = nullptr;
+    Rect[8] clipStack;
+    int clipDepth = 0;
+
+    void clear() { this.target.fill(' '); }
+
+    // True if (x,y) passes the active clip (the innermost pushed rect).
+    bool _visible(int x, int y)
+    {
+        if (this.clipDepth == 0) return true;
+        return this.clipStack[this.clipDepth - 1].contains(x, y);
+    }
+
+    void _putClipped(int x, int y, char c)
+    {
+        if (this._visible(x, y)) this.target.put(x, y, c);
+    }
+
+    void drawText(int col, int row, const char* s)
+    {
+        int i = 0;
+        while (s[i] != '\0') { this._putClipped(col + i, row, s[i]); i++; }
+    }
+
+    void drawRect(Rect r, bool filled)
+    {
+        if (!filled)
+        {
+            if (r.w < 2 || r.h < 2) return;
+            int right  = r.x + r.w - 1;
+            int bottom = r.y + r.h - 1;
+            this._putClipped(r.x, r.y, '+');
+            this._putClipped(right, r.y, '+');
+            this._putClipped(r.x, bottom, '+');
+            this._putClipped(right, bottom, '+');
+            int x = r.x + 1;
+            while (x < right) { this._putClipped(x, r.y, '-'); this._putClipped(x, bottom, '-'); x++; }
+            int y = r.y + 1;
+            while (y < bottom) { this._putClipped(r.x, y, '|'); this._putClipped(right, y, '|'); y++; }
+            return;
+        }
+        int yy = r.y;
+        while (yy < r.y + r.h)
+        {
+            int xx = r.x;
+            while (xx < r.x + r.w) { this._putClipped(xx, yy, ' '); xx++; }
+            yy++;
+        }
+    }
+
+    void pushClip(Rect r)
+    {
+        Rect eff = r;
+        if (this.clipDepth > 0) eff = intersectRect(this.clipStack[this.clipDepth - 1], r);
+        if (this.clipDepth < CLIP_STACK_MAX)
+        {
+            this.clipStack[this.clipDepth] = eff;
+            this.clipDepth = this.clipDepth + 1;
+        }
+    }
+
+    void popClip()
+    {
+        if (this.clipDepth > 0) this.clipDepth = this.clipDepth - 1;
+    }
+};
+
+// A SurfaceCanvas value bound to `s`, ready to pass as a Canvas. No heap, no owner:
+// it just wraps the borrowed pointer for the duration of a paint call.
+SurfaceCanvas canvasFor(Surface* s)
+{
+    SurfaceCanvas c = default;
+    c.target = s;
+    return c;
+}
+
+// ── Input events (F1): one dispatch path for pointer and key ─────────────────
+// The host translates native input (terminal pollEvent / WM_LBUTTONDOWN /
+// WM_KEYDOWN) into an Event and calls tree.dispatch(e, ctx). Pointer events
+// hit-test down the tree; key events route to the focused node (see UiContext).
+int EV_MOUSE_DOWN = 1;
+int EV_KEY        = 2;
+
+// Key codes the framework understands; the host maps native codes onto these.
+// EV_KEY also carries printable ASCII codes (32..126) for text entry; a focused
+// TextInput inserts them, KEY_BACKSPACE deletes, the arrows scroll a ScrollView.
+int KEY_BACKSPACE = 8;
+int KEY_TAB       = 9;
+int KEY_ENTER     = 13;
+int KEY_SPACE     = 32;
+int KEY_LEFT      = 37;
+int KEY_UP        = 38;
+int KEY_RIGHT     = 39;
+int KEY_DOWN      = 40;
+
+struct Event
+{
+    int kind = 0;   // EV_*
+    int x = 0;      // EV_MOUSE_DOWN: cell coords
+    int y = 0;
+    int key = 0;    // EV_KEY: KEY_* code
+};
+
+Event mouseDown(int x, int y)
+{
+    Event e = default;
+    e.kind = EV_MOUSE_DOWN; e.x = x; e.y = y;
+    return e;
+}
+
+Event keyPress(int key)
+{
+    Event e = default;
+    e.kind = EV_KEY; e.key = key;
+    return e;
+}
+
+// ── UiContext (F5/F2): the host-owned per-app runtime state ───────────────────
+// Replaces the former library globals. A handler calls ctx.invalidate() to mark
+// the UI dirty; the host drains it once per loop (consumeDirty) and re-renders
+// only on a change. focusKey is the KEYED IDENTITY of the focused node, so focus
+// survives reconcile (a re-render keeps the same key -> same focus), unlike a
+// list index. Single mounted app, single thread: one UiContext per host loop,
+// threaded into render() so event closures can reach it.
+struct UiContext
+{
+    bool   dirty    = false;     // a handler changed state -> re-render the tree
+    bool   repaint  = false;     // layout/paint changed but the tree did not (scroll)
+    string focusKey = default;   // "" = nothing focused
+
+    void invalidate() { this.dirty = true; }
+
+    // Request a re-layout + repaint without a re-render. Used when a node's own
+    // view state changes (e.g. a ScrollView offset) but the component tree does
+    // not, so reconcile would produce no patches for the host to repaint on.
+    void requestRepaint() { this.repaint = true; }
+
+    // Return whether a render is pending, clearing the flag.
+    bool consumeDirty()
+    {
+        bool d = this.dirty;
+        this.dirty = false;
+        return d;
+    }
+
+    bool consumeRepaint()
+    {
+        bool r = this.repaint;
+        this.repaint = false;
+        return r;
+    }
+
+    void focus(string key) { this.focusKey = "" + key; }
+    void blur() { this.focusKey = ""; }
+    bool hasFocus(string key) { return this.focusKey.length() > 0 && this.focusKey == key; }
+};
+
 // Node-kind tags - returned by Element.kind() so the reconciler can compare node
-// types WITHOUT an `as` downcast (which would hit the open Bug 9 UAF path).
+// types WITHOUT an `as` downcast in the hot diff path.
 int ELEM_VIEW      = 1;
 int ELEM_TEXT      = 2;
 int ELEM_BUTTON    = 3;
 int ELEM_COMPONENT = 4;
 int ELEM_BOX       = 5;
+int ELEM_TEXTINPUT = 6;
+int ELEM_SCROLL    = 7;
 
 // The node interface. Typed host structs implement these so the tree can be
-// walked uniformly (serialize, layout, paint, hit-test, reconcile, teardown)
+// walked uniformly (serialize, layout, paint, dispatch, reconcile, teardown)
 // while keeping props compile-checked.
-//   - layout assigns this node's bounds and returns the rows it consumed.
-//   - paint draws self (and children) into the grid using bounds.
-//   - handleClick returns true if the point hit an interactive node, after
-//     firing its action. Dispatch is virtual on purpose: the host never
-//     downcasts a child, it lets each node decide if the hit is its own.
-//   - kind / propsSig / childList drive the reconciler: kind() compares node
-//     type, propsSig() is a string signature of a node's own props for change
-//     detection, childList() exposes a View's children (nullptr for leaves).
+//   - layout takes constraints and returns the size consumed, stamping bounds.
+//   - paint draws self (and children) into the Canvas using bounds.
+//   - dispatch routes one Event: pointer events hit-test, key events go to the
+//     focused node. Returns true if a node consumed it. Virtual on purpose: the
+//     host never downcasts a child, it lets each node decide.
+//   - kind / propsEqual / childList drive the reconciler: kind() compares node
+//     type, propsEqual() is a structured same-kind props compare for change
+//     detection, childList() exposes a container's children (nullptr for leaves).
 interface Element
 {
-    string toJson();
+    move string toJson();
     void destroyTree();
-    int  layout(int x, int y, int availW);
-    void paint(Surface* s);
-    bool handleClick(int x, int y);
+    Size layout(LayoutConstraints c);
+    void paint(Canvas c, UiContext* ctx);
+    bool dispatch(Event e, UiContext* ctx);
     int  kind();
-    string propsSig();
+    bool propsEqual(Element other);   // other is guaranteed same kind() by reconcile
     list<Element>* childList();
     string keyOf();          // "" if unkeyed; drives keyed child reconciliation
     void setKey(string k);
+    // Append the keys of focusable descendants (Button/TextInput) in tree order,
+    // so Tab/Shift-Tab can build a focus ring. Leaves that cannot focus no-op.
+    void collectFocusables(list<string>* keys);
 };
 
-// ── View: a container with a style and children ──────────────────────────────
+// Lay out a root element to fill (w) cells wide at (x, y), height unbounded.
+Size layoutRoot(Element root, int x, int y, int w)
+{
+    LayoutConstraints c = default;
+    c.x = x; c.y = y; c.availW = w; c.availH = LAYOUT_UNBOUNDED;
+    return root.layout(c);
+}
+
+// ── View: a flex container with a style and children ─────────────────────────
 class View : Element
 {
     Style style = default;
@@ -211,38 +481,66 @@ class View : Element
         this.children.add(child);
     }
 
-    // Stack children top-to-bottom, inset by the style padding on all sides.
-    int layout(int x, int y, int availW)
+    // One layout pass; flexDirection picks the strategy. Column stacks children
+    // top-to-bottom, row places them left-to-right; both inset by style.padding.
+    Size layout(LayoutConstraints c)
     {
         int pad = this.style.padding;
-        int cy = y + pad;
-        for (Element c in this.children)
-            cy = cy + c.layout(x + pad, cy, availW - 2 * pad);
+        Size sz = default;
+        if (this.style.flexDirection == DIR_ROW)
+        {
+            int cx = c.x + pad;
+            int maxH = 0;
+            for (Element child in this.children)
+            {
+                LayoutConstraints cc = default;
+                cc.x = cx; cc.y = c.y + pad;
+                cc.availW = c.availW - 2 * pad; cc.availH = c.availH - 2 * pad;
+                Size cs = child.layout(cc);
+                cx = cx + cs.w;
+                if (cs.h > maxH) maxH = cs.h;
+            }
+            sz.w = c.availW;
+            sz.h = maxH + 2 * pad;
+        }
+        else
+        {
+            int cy = c.y + pad;
+            for (Element child in this.children)
+            {
+                LayoutConstraints cc = default;
+                cc.x = c.x + pad; cc.y = cy;
+                cc.availW = c.availW - 2 * pad; cc.availH = c.availH - 2 * pad;
+                Size cs = child.layout(cc);
+                cy = cy + cs.h;
+            }
+            sz.w = c.availW;
+            sz.h = (cy - c.y) + pad;
+        }
 
-        int h = (cy - y) + pad;
         Rect b = default;
-        b.x = x; b.y = y; b.w = availW; b.h = h;
+        b.x = c.x; b.y = c.y; b.w = sz.w; b.h = sz.h;
         this.bounds = b;
-        return h;
+        return sz;
     }
 
-    void paint(Surface* s)
+    void paint(Canvas cv, UiContext* ctx)
     {
         for (Element c in this.children)
-            c.paint(s);
+            c.paint(cv, ctx);
     }
 
-    bool handleClick(int x, int y)
+    bool dispatch(Event e, UiContext* ctx)
     {
         for (Element c in this.children)
         {
-            if (c.handleClick(x, y))
+            if (c.dispatch(e, ctx))
                 return true;
         }
         return false;
     }
 
-    string toJson()
+    move string toJson()
     {
         string out = "{\"type\":\"View\"";
         if (!styleIsEmpty(this.style))
@@ -274,7 +572,17 @@ class View : Element
     }
 
     int kind() { return ELEM_VIEW; }
-    string propsSig() { return styleToJson(this.style); }
+    void collectFocusables(list<string>* keys)
+    {
+        for (Element c in this.children) c.collectFocusables(keys);
+    }
+    // Containers are reconciled by child diffing, not propsEqual; compare style
+    // anyway so the contract is honest if a caller ever diffs a View directly.
+    bool propsEqual(Element other)
+    {
+        View* o = other as View;
+        return o != nullptr && styleEquals(this.style, o.style);
+    }
     list<Element>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
@@ -287,76 +595,99 @@ class Text : Element
     Rect bounds = default;
     string key = default;
 
-    string toJson()
+    move string toJson()
     {
         return "{\"type\":\"Text\",\"text\":\"" + this.text + "\"}";
     }
 
-    int layout(int x, int y, int availW)
+    Size layout(LayoutConstraints c)
     {
         Rect b = default;
-        b.x = x; b.y = y; b.w = (int)this.text.length(); b.h = 1;
+        b.x = c.x; b.y = c.y; b.w = (int)this.text.length(); b.h = 1;
         this.bounds = b;
-        return 1;
+        Size s = default; s.w = b.w; s.h = 1;
+        return s;
     }
 
-    void paint(Surface* s)
+    void paint(Canvas cv, UiContext* ctx)
     {
-        s.text(this.bounds.x, this.bounds.y, this.text.data());
+        cv.drawText(this.bounds.x, this.bounds.y, this.text.data());
     }
 
-    bool handleClick(int x, int y) { return false; }
+    bool dispatch(Event e, UiContext* ctx) { return false; }
 
     void destroyTree() { }
 
     int kind() { return ELEM_TEXT; }
-    // "T:" prefix keeps Text and Button signatures distinct even for equal content.
-    string propsSig() { return "T:" + this.text; }
+    void collectFocusables(list<string>* keys) { }
+    bool propsEqual(Element other)
+    {
+        Text* o = other as Text;
+        return o != nullptr && this.text == o.text;
+    }
     list<Element>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
 };
 
-// ── Button: a leaf with a label and a click handler ──────────────────────────
+// ── Button: a leaf with a title and a press handler ──────────────────────────
+// Names track React Native: `title` + `onPress`. A keyed button also takes focus
+// on press and re-fires on Enter/Space while focused (the keyboard-activation
+// half of the focus seam).
 class Button : Element
 {
-    string label = default;
-    Lambda<void()> onClick = default;
+    string title = default;
+    Lambda<void()> onPress = default;
     Rect bounds = default;
     string key = default;
 
     void fireClick()
     {
-        this.onClick();
+        this.onPress();
     }
 
-    string toJson()
+    move string toJson()
     {
-        return "{\"type\":\"Button\",\"label\":\"" + this.label
+        return "{\"type\":\"Button\",\"title\":\"" + this.title
              + "\",\"clickable\":true}";
     }
 
-    // Rendered as "[ label ]", so the width is the label plus the 4 framing chars.
-    int layout(int x, int y, int availW)
+    // Rendered as "[ title ]", so the width is the title plus the 4 framing chars.
+    Size layout(LayoutConstraints c)
     {
         Rect b = default;
-        b.x = x; b.y = y; b.w = (int)this.label.length() + 4; b.h = 1;
+        b.x = c.x; b.y = c.y; b.w = (int)this.title.length() + 4; b.h = 1;
         this.bounds = b;
-        return 1;
+        Size s = default; s.w = b.w; s.h = 1;
+        return s;
     }
 
-    void paint(Surface* s)
+    void paint(Canvas cv, UiContext* ctx)
     {
-        string rendered = "[ " + this.label + " ]";
-        s.text(this.bounds.x, this.bounds.y, rendered.data());
+        string rendered = "[ " + this.title + " ]";
+        cv.drawText(this.bounds.x, this.bounds.y, rendered.data());
     }
 
-    bool handleClick(int x, int y)
+    bool dispatch(Event e, UiContext* ctx)
     {
-        if (this.bounds.contains(x, y))
+        if (e.kind == EV_MOUSE_DOWN)
         {
-            this.fireClick();
-            return true;
+            if (this.bounds.contains(e.x, e.y))
+            {
+                ctx.focus(this.key);   // a press also moves focus here
+                this.fireClick();
+                return true;
+            }
+            return false;
+        }
+        if (e.kind == EV_KEY)
+        {
+            // A focused button activates on Enter/Space.
+            if (ctx.hasFocus(this.key) && (e.key == KEY_ENTER || e.key == KEY_SPACE))
+            {
+                this.fireClick();
+                return true;
+            }
         }
         return false;
     }
@@ -364,35 +695,25 @@ class Button : Element
     void destroyTree() { }
 
     int kind() { return ELEM_BUTTON; }
-    string propsSig() { return "B:" + this.label; }
+    void collectFocusables(list<string>* keys)
+    {
+        if (this.key.length() > 0) keys.add("" + this.key);
+    }
+    bool propsEqual(Element other)
+    {
+        Button* o = other as Button;
+        return o != nullptr && this.title == o.title;
+    }
     list<Element>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
 };
 
-// Draw a single-cell border around rect b: '+' corners, '-'/'|' edges. Silently
-// no-ops on a degenerate rect (a box needs at least 2x2 to have an interior).
-void drawBorder(Surface* s, Rect b)
-{
-    if (b.w < 2 || b.h < 2) return;
-    int right  = b.x + b.w - 1;
-    int bottom = b.y + b.h - 1;
-    s.put(b.x, b.y, '+');
-    s.put(right, b.y, '+');
-    s.put(b.x, bottom, '+');
-    s.put(right, bottom, '+');
-    int x = b.x + 1;
-    while (x < right) { s.put(x, b.y, '-'); s.put(x, bottom, '-'); x++; }
-    int y = b.y + 1;
-    while (y < bottom) { s.put(b.x, y, '|'); s.put(right, y, '|'); y++; }
-}
-
 // ── Box: a bordered container that fills a width x height region ───────────────
-// Unlike View (a flow-stacked, borderless container), a Box is sized: it draws a
-// border around style.width x style.height and stacks its children in the
-// interior, inset by the border plus style.padding. A box whose style.width/height
-// is 0 falls back to availW x 1, so an outer box driven by the terminal size
-// scales when the host re-renders with new dimensions.
+// Unlike View (a flow container), a Box is sized: it draws a border around
+// style.width x style.height and stacks its children in the interior, inset by
+// the border plus style.padding. A box whose style.width/height is 0 falls back
+// to availW x 1, so an outer box driven by the host size scales on re-render.
 class Box : Element
 {
     Style style = default;
@@ -405,43 +726,50 @@ class Box : Element
         this.children.add(child);
     }
 
-    int layout(int x, int y, int availW)
+    Size layout(LayoutConstraints c)
     {
-        int w = availW;
+        int w = c.availW;
         if (this.style.width > 0) w = this.style.width;
         int h = 1;
         if (this.style.height > 0) h = this.style.height;
 
         Rect b = default;
-        b.x = x; b.y = y; b.w = w; b.h = h;
+        b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
 
         int inset = 1 + this.style.padding;
-        int cx = x + inset;
-        int cy = y + inset;
-        for (Element c in this.children)
-            cy = cy + c.layout(cx, cy, w - 2 * inset);
-        return h;
+        int cy = c.y + inset;
+        for (Element child in this.children)
+        {
+            LayoutConstraints cc = default;
+            cc.x = c.x + inset; cc.y = cy;
+            cc.availW = w - 2 * inset; cc.availH = h - 2 * inset;
+            Size cs = child.layout(cc);
+            cy = cy + cs.h;
+        }
+
+        Size sz = default; sz.w = w; sz.h = h;
+        return sz;
     }
 
-    void paint(Surface* s)
+    void paint(Canvas cv, UiContext* ctx)
     {
-        drawBorder(s, this.bounds);
+        cv.drawRect(this.bounds, false);
         for (Element c in this.children)
-            c.paint(s);
+            c.paint(cv, ctx);
     }
 
-    bool handleClick(int x, int y)
+    bool dispatch(Event e, UiContext* ctx)
     {
         for (Element c in this.children)
         {
-            if (c.handleClick(x, y))
+            if (c.dispatch(e, ctx))
                 return true;
         }
         return false;
     }
 
-    string toJson()
+    move string toJson()
     {
         string out = "{\"type\":\"Box\",\"style\":" + styleToJson(this.style);
         out = out + ",\"children\":[";
@@ -468,7 +796,251 @@ class Box : Element
     }
 
     int kind() { return ELEM_BOX; }
-    string propsSig() { return "Box:" + styleToJson(this.style); }
+    void collectFocusables(list<string>* keys)
+    {
+        for (Element c in this.children) c.collectFocusables(keys);
+    }
+    bool propsEqual(Element other)
+    {
+        Box* o = other as Box;
+        return o != nullptr && styleEquals(this.style, o.style);
+    }
+    list<Element>* childList() { return &this.children; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+};
+
+// ── TextInput: a single-line editable text field ─────────────────────────────
+// A CONTROLLED widget (React Native style): the host component owns the text in
+// its state and passes it down as `value` each render; on a keystroke the field
+// fires onChangeText(newValue) and the component updates its state + invalidates,
+// so the next render flows the new value back in. The field takes focus on click
+// and, while focused, inserts printable keys and deletes on Backspace. The buffer
+// it builds per keystroke is an owning `string` - exactly the field-store path
+// that string stabilization unblocked.
+class TextInput : Element
+{
+    string value       = default;
+    string placeholder = default;
+    Lambda<void(string)> onChangeText = default;
+    int    width  = 0;          // 0 -> sized to content
+    Rect   bounds = default;
+    string key    = default;
+
+    move string toJson()
+    {
+        return "{\"type\":\"TextInput\",\"value\":\"" + this.value + "\"}";
+    }
+
+    Size layout(LayoutConstraints c)
+    {
+        int w = this.width;
+        if (w <= 0) w = (int)this.value.length() + 1;   // +1 for the caret cell
+        if (w < 3) w = 3;
+        Rect b = default;
+        b.x = c.x; b.y = c.y; b.w = w; b.h = 1;
+        this.bounds = b;
+        Size s = default; s.w = w; s.h = 1;
+        return s;
+    }
+
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        // Show the value, or the placeholder when empty; a focused field shows a
+        // trailing '_' caret in the next cell.
+        bool empty = this.value.length() == 0;
+        string shown = "" + this.value;
+        if (empty) shown = "" + this.placeholder;
+        cv.drawText(this.bounds.x, this.bounds.y, shown.data());
+        if (ctx.hasFocus(this.key))
+        {
+            int caretX = this.bounds.x + (int)this.value.length();
+            cv.drawText(caretX, this.bounds.y, "_");
+        }
+    }
+
+    bool dispatch(Event e, UiContext* ctx)
+    {
+        if (e.kind == EV_MOUSE_DOWN)
+        {
+            if (this.bounds.contains(e.x, e.y)) { ctx.focus(this.key); return true; }
+            return false;
+        }
+        if (e.kind == EV_KEY)
+        {
+            if (!ctx.hasFocus(this.key)) return false;
+            if (e.key == KEY_BACKSPACE)
+            {
+                int n = (int)this.value.length();
+                if (n == 0) return true;
+                string nv = substring(this.value, 0, n - 1);
+                this.onChangeText(nv);
+                return true;
+            }
+            if (e.key >= 32 && e.key <= 126)
+            {
+                char[2] cb;
+                cb[0] = (char)e.key; cb[1] = '\0';
+                string nv = this.value + cb;
+                this.onChangeText(nv);
+                return true;
+            }
+            return false;   // other keys (arrows/tab/enter) are not ours
+        }
+        return false;
+    }
+
+    void destroyTree() { }
+
+    int kind() { return ELEM_TEXTINPUT; }
+    void collectFocusables(list<string>* keys)
+    {
+        if (this.key.length() > 0) keys.add("" + this.key);
+    }
+    bool propsEqual(Element other)
+    {
+        TextInput* o = other as TextInput;
+        return o != nullptr && this.value == o.value;
+    }
+    list<Element>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+};
+
+// ── ScrollView: a clipped, vertically scrollable viewport ─────────────────────
+// Lays its children out in a tall virtual column shifted up by scrollY, then
+// paints them clipped to its viewport (style.width x style.height cells) via the
+// Canvas clip seam. A focused ScrollView scrolls on Up/Down; scrolling changes
+// layout but not the component tree, so it asks the host to repaint via
+// ctx.requestRepaint() (reconcile would otherwise produce no patches).
+class ScrollView : Element
+{
+    Style style    = default;   // width x height = the viewport
+    list<Element> children = default;
+    int    scrollY  = 0;
+    int    contentH = 0;        // total laid-out child height (set during layout)
+    Rect   bounds   = default;
+    string key      = default;
+
+    void add(Element child) { this.children.add(child); }
+
+    int _viewH()
+    {
+        if (this.style.height > 0) return this.style.height;
+        return 1;
+    }
+
+    int _maxScroll()
+    {
+        int over = this.contentH - this._viewH();
+        if (over < 0) return 0;
+        return over;
+    }
+
+    Size layout(LayoutConstraints c)
+    {
+        int w = c.availW;
+        if (this.style.width > 0) w = this.style.width;
+        int h = this._viewH();
+
+        Rect b = default;
+        b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        this.bounds = b;
+
+        int top = c.y - this.scrollY;
+        int cy = top;
+        for (Element child in this.children)
+        {
+            LayoutConstraints cc = default;
+            cc.x = c.x; cc.y = cy;
+            cc.availW = w; cc.availH = LAYOUT_UNBOUNDED;
+            Size cs = child.layout(cc);
+            cy = cy + cs.h;
+        }
+        this.contentH = cy - top;
+
+        Size sz = default; sz.w = w; sz.h = h;
+        return sz;
+    }
+
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        cv.pushClip(this.bounds);
+        for (Element c in this.children)
+            c.paint(cv, ctx);
+        cv.popClip();
+    }
+
+    bool dispatch(Event e, UiContext* ctx)
+    {
+        if (e.kind == EV_MOUSE_DOWN)
+        {
+            if (!this.bounds.contains(e.x, e.y)) return false;   // outside viewport
+            for (Element c in this.children)
+            {
+                if (c.dispatch(e, ctx)) return true;
+            }
+            ctx.focus(this.key);   // empty viewport area -> focus for keyboard scroll
+            return true;
+        }
+        if (e.kind == EV_KEY)
+        {
+            for (Element c in this.children)
+            {
+                if (c.dispatch(e, ctx)) return true;   // a focused child consumes first
+            }
+            if (ctx.hasFocus(this.key))
+            {
+                if (e.key == KEY_DOWN && this.scrollY < this._maxScroll())
+                {
+                    this.scrollY = this.scrollY + 1; ctx.requestRepaint(); return true;
+                }
+                if (e.key == KEY_UP && this.scrollY > 0)
+                {
+                    this.scrollY = this.scrollY - 1; ctx.requestRepaint(); return true;
+                }
+            }
+            return false;
+        }
+        return false;
+    }
+
+    move string toJson()
+    {
+        string out = "{\"type\":\"ScrollView\",\"scrollY\":" + this.scrollY.toString();
+        out = out + ",\"children\":[";
+        int i = 0;
+        for (Element c in this.children)
+        {
+            if (i > 0) out = out + ",";
+            out = out + c.toJson();
+            i++;
+        }
+        out = out + "]}";
+        return out;
+    }
+
+    void destroyTree()
+    {
+        for (Element c in this.children)
+        {
+            c.destroyTree();
+            delete c;
+        }
+        this.children.clear();
+    }
+
+    int kind() { return ELEM_SCROLL; }
+    void collectFocusables(list<string>* keys)
+    {
+        if (this.key.length() > 0) keys.add("" + this.key);
+        for (Element c in this.children) c.collectFocusables(keys);
+    }
+    bool propsEqual(Element other)
+    {
+        ScrollView* o = other as ScrollView;
+        return o != nullptr && styleEquals(this.style, o.style);
+    }
     list<Element>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
@@ -483,6 +1055,24 @@ View* view(Style style)
     return v;
 }
 
+// A View whose children flow left-to-right (row) or top-to-bottom (column). Thin
+// helpers over flexDirection so callers read declaratively.
+View* row(Style style)
+{
+    View* v = new View();
+    v.style = style;
+    v.style.flexDirection = DIR_ROW;
+    return v;
+}
+
+View* column(Style style)
+{
+    View* v = new View();
+    v.style = style;
+    v.style.flexDirection = DIR_COLUMN;
+    return v;
+}
+
 // Plain string params: assigning an alias/param to an owning-string field
 // deep-copies, so the field keeps its own buffer after the arg is freed.
 Text* text(string s)
@@ -492,11 +1082,11 @@ Text* text(string s)
     return t;
 }
 
-Button* button(string label, Lambda<void()> onClick)
+Button* button(string title, Lambda<void()> onPress)
 {
     Button* b = new Button();
-    b.label = label;
-    b.onClick = onClick;
+    b.title = title;
+    b.onPress = onPress;
     return b;
 }
 
@@ -505,6 +1095,49 @@ Box* box(Style style)
     Box* b = new Box();
     b.style = style;
     return b;
+}
+
+// A controlled text field bound to `value` with an onChangeText handler.
+TextInput* textInput(string value, Lambda<void(string)> onChangeText)
+{
+    TextInput* t = new TextInput();
+    t.value = value;
+    t.onChangeText = onChangeText;
+    return t;
+}
+
+ScrollView* scrollView(Style style)
+{
+    ScrollView* s = new ScrollView();
+    s.style = style;
+    return s;
+}
+
+// Move focus to the next (or previous, when backward) focusable node in tree
+// order, wrapping around. Built fresh from the live tree each time, so it tracks
+// keyed identity across re-renders. The host calls this on Tab / Shift-Tab.
+void moveFocus(Element tree, UiContext* ctx, bool backward)
+{
+    list<string> keys = default;
+    tree.collectFocusables(&keys);
+    int n = keys.count();
+    if (n == 0) return;
+
+    int cur = -1;
+    int i = 0;
+    while (i < n)
+    {
+        string k = keys.get(i);
+        if (ctx.hasFocus(k)) { cur = i; break; }
+        i++;
+    }
+
+    int next = 0;
+    if (cur < 0) next = backward ? n - 1 : 0;
+    else if (backward) next = (cur - 1 + n) % n;
+    else next = (cur + 1) % n;
+
+    ctx.focus(keys.get(next));
 }
 
 // Tear down and free an entire owning tree: descendants first (via the node's
@@ -575,17 +1208,13 @@ move Element reconcile(move Element committed, move Element wip, list<Patch>* pa
         return wip;
     }
 
-    // Same type. Leaves: compare prop signatures. Bind the signatures to locals so
-    // the owned temporary strings are reclaimed (a bare `a() != b()` leaks them).
+    // Same type. Leaves: structured props compare (same kind guaranteed above).
     list<Element>* kids = committed.childList();
     if (kids == nullptr)
     {
-        string oldSig = committed.propsSig();
-        string newSig = wip.propsSig();
-        bool changed = oldSig != newSig;
-        if (changed)
+        if (!committed.propsEqual(wip))
         {
-            // Adopt the new leaf (new props, and a fresh onClick for Button).
+            // Adopt the new leaf (new props, and a fresh onPress for Button).
             patches.add(makePatch(PATCH_UPDATE, wip.kind(), "update"));
             deleteTree(committed);
             return wip;
@@ -595,7 +1224,7 @@ move Element reconcile(move Element committed, move Element wip, list<Patch>* pa
         return committed;
     }
 
-    // Same type, container (View): reconcile children by index.
+    // Same type, container: reconcile children by key (or position when unkeyed).
     list<Element>* newKids = wip.childList();
     int newN = newKids.count();
 
@@ -638,35 +1267,20 @@ move Element reconcile(move Element committed, move Element wip, list<Patch>* pa
     }
 
     // WIP children all drained; free just the WIP container shell.
-    // (View style itself is treated as stable in this phase - see v3 plan.)
+    // (Container style itself is treated as stable in this phase - see v3 plan.)
     deleteTree(wip);
     return committed;
 }
 
-// ── Update scheduling (model layer) ───────────────────────────────────────────
+// ── Components (model layer) ──────────────────────────────────────────────────
 //
-// A component mutates its state in an event handler, then calls invalidate() to
-// mark the UI dirty. The host drains the flag once per loop (consumeDirty) and,
-// only when set, re-renders + reconciles. This decouples input from rendering: a
-// click that changes nothing (no invalidate) triggers no re-render. Single-app,
-// single-threaded scheduler - a global flag is sufficient and keeps the model
-// layer minimal.
-bool _uiDirty = false;
-
-void invalidate() { _uiDirty = true; }
-
-// Return whether a render is pending, clearing the flag.
-bool consumeDirty()
-{
-    bool d = _uiDirty;
-    _uiDirty = false;
-    return d;
-}
-
-// A component renders itself to a host Element tree.
+// A component renders itself to a host Element tree. render() receives the
+// host-owned UiContext so its event closures can call ctx.invalidate() (mark the
+// UI dirty) and the host can drain it once per loop. Threading the context in
+// keeps the framework free of process-global mutable state.
 interface Component
 {
-    Element render();
+    Element render(UiContext* ctx);
 };
 
 // ── ComponentElement: a reconciler node wrapping a component's rendered subtree ─
@@ -676,41 +1290,51 @@ interface Component
 // key; the reconciler matches ComponentElements by key (kind ELEM_COMPONENT) and
 // descends into the single inner child, so each child's subtree - and the state
 // behind it - keeps its identity across add/remove/reorder. The wrapper has no
-// style of its own; layout/paint/hit-test delegate to the inner subtree.
+// style of its own; layout/paint/dispatch delegate to the inner subtree.
 class ComponentElement : Element
 {
     list<Element> inner = default;   // exactly one child: the component's render()
     Rect bounds = default;
     string key = default;
 
-    int layout(int x, int y, int availW)
+    Size layout(LayoutConstraints c)
     {
-        int h = 0;
-        for (Element c in this.inner)
-            h = h + c.layout(x, y + h, availW);
+        Size total = default;
+        int cy = c.y;
+        for (Element child in this.inner)
+        {
+            LayoutConstraints cc = default;
+            cc.x = c.x; cc.y = cy;
+            cc.availW = c.availW; cc.availH = c.availH;
+            Size cs = child.layout(cc);
+            cy = cy + cs.h;
+            total.h = total.h + cs.h;
+        }
+        total.w = c.availW;
+
         Rect b = default;
-        b.x = x; b.y = y; b.w = availW; b.h = h;
+        b.x = c.x; b.y = c.y; b.w = total.w; b.h = total.h;
         this.bounds = b;
-        return h;
+        return total;
     }
 
-    void paint(Surface* s)
+    void paint(Canvas cv, UiContext* ctx)
     {
         for (Element c in this.inner)
-            c.paint(s);
+            c.paint(cv, ctx);
     }
 
-    bool handleClick(int x, int y)
+    bool dispatch(Event e, UiContext* ctx)
     {
         for (Element c in this.inner)
         {
-            if (c.handleClick(x, y))
+            if (c.dispatch(e, ctx))
                 return true;
         }
         return false;
     }
 
-    string toJson()
+    move string toJson()
     {
         string out = "{\"type\":\"Component\",\"child\":";
         for (Element c in this.inner)
@@ -729,7 +1353,11 @@ class ComponentElement : Element
     }
 
     int kind() { return ELEM_COMPONENT; }
-    string propsSig() { return ""; }
+    void collectFocusables(list<string>* keys)
+    {
+        for (Element c in this.inner) c.collectFocusables(keys);
+    }
+    bool propsEqual(Element other) { return true; }
     list<Element>* childList() { return &this.inner; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
@@ -738,10 +1366,11 @@ class ComponentElement : Element
 // Render a component now and wrap its subtree as a keyed reconciler node. The
 // component itself is owned by the caller (typically a parent component holding
 // its children by pointer); mount only renders it, it does not take ownership.
-ComponentElement* mount(Component c, string key)
+// The UiContext threads through so the child's event closures can invalidate.
+ComponentElement* mount(Component c, string key, UiContext* ctx)
 {
     ComponentElement* ce = new ComponentElement();
     ce.setKey(key);
-    ce.inner.add(c.render());
+    ce.inner.add(c.render(ctx));
     return ce;
 }

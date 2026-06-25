@@ -1,0 +1,79 @@
+// win32_boxes.cb - the resizable-box demo rendered through the native Win32 GDI
+// host, now exercising the Phase 3 widgets (TextInput + ScrollView).
+//
+// This is the SAME app shape as example/ui/boxes.cb but it renders to a real
+// window with GDI. Nothing in the framework changed between the two - only the
+// host (win32host.cb's GdiCanvas + message loop) differs from the TUI host. That
+// is the whole point of the Canvas seam: swap the draw target, reuse the tree,
+// the reconciler, and the model layer unchanged.
+//
+// The outer box is sized from hostWidth()/hostHeight() (the host's window-size
+// hook, in character cells), so it rescales live when you resize the window.
+//
+// Build & run:
+//   x64/Release/cflat.exe example/ui/win32_boxes.cb -o out/win32_boxes.exe
+//   out\win32_boxes.exe
+//
+// Headless GDI self-test (no window, used by example.bat):
+//   out\win32_boxes.exe --selftest
+//
+// Type in the field (click/Tab to focus it), click "[ add box ]" to nest a box in
+// the scroll list, focus the list and scroll with Up/Down, resize to rescale, and
+// close the window to quit.
+import "win32host.cb";
+
+class BoxApp : Component
+{
+    int    clicks = 0;
+    string label  = default;
+
+    Element render(UiContext* ctx)
+    {
+        // Outer box fills the window (in cells); it rescales on resize because
+        // render() re-reads the host size every time the host rebuilds the tree.
+        Box* root = box(makeStyle(0, hostWidth(), hostHeight()));
+        root.setKey("root");
+
+        // Editable label field (Phase 3 TextInput): click or Tab to focus, type.
+        TextInput* name = textInput(this.label, (string nv) => { this.label = nv; ctx.invalidate(); });
+        name.setKey("name");
+        name.width = 24;
+        root.add(name);
+
+        Button* add = button("add box", () => { this.clicks = this.clicks + 1; ctx.invalidate(); });
+        add.setKey("btn");
+        root.add(add);
+
+        Text* status = text("Boxes: " + this.clicks.toString());
+        status.setKey("status");
+        root.add(status);
+
+        // One small bordered box per click, stacked inside a scrollable viewport.
+        int viewW = hostWidth() - 4;
+        if (viewW < 10) viewW = 10;
+        ScrollView* list = scrollView(makeStyle(0, viewW, 6));
+        list.setKey("list");
+        int i = 0;
+        while (i < this.clicks)
+        {
+            Box* small = box(makeStyle(0, 8, 3));
+            small.setKey("b" + i.toString());
+            list.add(small);
+            i++;
+        }
+        root.add(list);
+        return root;
+    }
+};
+
+extern int main(int argc, char** argv)
+{
+    // Headless GDI readback self-test path (example.bat passes --selftest); no
+    // window is created.
+    if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
+        return guiSelfTest();
+
+    BoxApp app;
+    app.clicks = 0;
+    return runAppGui(app, "CFlat UI - Boxes (GDI)");
+}

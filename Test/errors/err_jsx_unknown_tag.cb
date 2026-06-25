@@ -1,0 +1,6 @@
+// An element tag must name a type in scope.
+extern int main()
+{
+    expect_error("is not a known type in scope");
+    <Bogus />;
+}

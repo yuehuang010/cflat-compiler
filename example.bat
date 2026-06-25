@@ -67,6 +67,66 @@ for /r example %%F in (*.cb) do (
     )
 )
 
+REM ── UI framework self-test + leak gate (S3) ──────────────────────────────────
+REM The UI host examples ship deterministic headless self-tests that run under
+REM redirected stdin (Terminal.init() fails -> selfTest path). Build each with the
+REM HeapAudit leak oracle (--heap-audit), run it, and fail the suite on any
+REM assertion failure (non-zero exit) OR any leak. This makes example.bat gate UI
+REM BEHAVIOR and leak-cleanliness, not just compilation. app.cb/counter.cb are
+REM not assertion suites (they always exit 0) but are included for the leak gate.
+set OUTDIR=out\examples
+set UI_SELFTESTS=example\ui\host.cb example\ui\boxes.cb example\ui\app.cb example\ui\counter.cb example\ui\counter_jsx.cb
+for %%U in (%UI_SELFTESTS%) do (
+    set STNAME=%%~nxU
+    set STEXE=!OUTDIR!\%%~nU_st.exe
+    set STLOG=!OUTDIR!\%%~nU_st.log
+    "!CFLAT!" "%%U" --heap-audit -o "!STEXE!" >nul 2>&1
+    if not exist "!STEXE!" (
+        set /a FAILED+=1
+        echo FAIL: !STNAME! ^(self-test build failed^)
+    ) else (
+        "!STEXE!" <nul >"!STLOG!" 2>&1
+        set STRC=!errorlevel!
+        findstr /C:"heap-audit: LEAK" "!STLOG!" >nul 2>&1
+        if !errorlevel! equ 0 (
+            set /a FAILED+=1
+            echo FAIL: !STNAME! ^(heap-audit leak^)
+        ) else if !STRC! neq 0 (
+            set /a FAILED+=1
+            echo FAIL: !STNAME! ^(self-test assertion, exit !STRC!^)
+        ) else (
+            set /a PASSED+=1
+            echo PASS: !STNAME! ^(self-test + leak-clean^)
+        )
+    )
+)
+
+REM GUI offscreen GDI readback self-test: builds the Win32 demo with --heap-audit
+REM and runs it headless (--selftest) - it paints the widget tree into a memory
+REM bitmap via GdiCanvas and reads pixels back, so the GDI path is gated for
+REM behavior AND leaks without ever opening a window.
+set GUI_STEXE=!OUTDIR!\win32_boxes_st.exe
+set GUI_STLOG=!OUTDIR!\win32_boxes_st.log
+"!CFLAT!" "example\ui\win32_boxes.cb" --heap-audit -o "!GUI_STEXE!" >nul 2>&1
+if not exist "!GUI_STEXE!" (
+    set /a FAILED+=1
+    echo FAIL: win32_boxes.cb ^(gui self-test build failed^)
+) else (
+    "!GUI_STEXE!" --selftest <nul >"!GUI_STLOG!" 2>&1
+    set GSTRC=!errorlevel!
+    findstr /C:"heap-audit: LEAK" "!GUI_STLOG!" >nul 2>&1
+    if !errorlevel! equ 0 (
+        set /a FAILED+=1
+        echo FAIL: win32_boxes.cb ^(heap-audit leak^)
+    ) else if !GSTRC! neq 0 (
+        set /a FAILED+=1
+        echo FAIL: win32_boxes.cb ^(gui self-test, exit !GSTRC!^)
+    ) else (
+        set /a PASSED+=1
+        echo PASS: win32_boxes.cb ^(gui self-test + leak-clean^)
+    )
+)
+
 echo.
 echo Results: !PASSED! passed, !FAILED! failed, !SKIPPED! skipped
 if !FAILED! gtr 0 exit /b 1

@@ -1,0 +1,6 @@
+// The element sugar requires the closing tag to match the opening tag.
+extern int main()
+{
+    expect_error("mismatched closing tag");
+    <View></Box>;
+}

@@ -1,15 +1,19 @@
 // host.cb - a terminal (TUI) host for the ui.cb framework.
 //
-// Closes the UI v1 loop: it paints an Element tree to the console, dispatches
-// mouse clicks to the node that was hit (virtually, through the Element
-// interface - never a downcast), and repaints when a click mutates state.
+// Closes the UI loop: it paints an Element tree to the console, dispatches input
+// (mouse + key) through the single Element.dispatch(Event) seam, and repaints
+// when a handler mutates state. Input never downcasts a node - each node decides
+// whether an event is its own. The host owns the UiContext (dirty flag + focused
+// node identity) and threads it into render().
 //
 // Two run modes:
 //   - Real console: interactive. Click the "[ +1 ]" button to increment the
-//     counter; ESC quits and the cursor/console mode are restored.
+//     counter; with the button focused (after a click), Enter/Space also fire it;
+//     ESC quits and the cursor/console mode are restored.
 //   - Redirected I/O (CI, --run): Terminal.init() returns false, so it falls
 //     back to a deterministic headless self-test that drives layout + paint +
-//     hit-test + dispatch against an in-memory Surface and prints PASS/FAIL.
+//     dispatch (mouse + key + focus) against an in-memory Surface and prints
+//     PASS/FAIL with a non-zero exit on any failure.
 //
 // Run the self-test:   x64/Release/cflat.exe example/ui/host.cb --run
 // Run interactively:   x64/Release/cflat.exe example/ui/host.cb -o out/host.exe && out\host.exe
@@ -21,20 +25,41 @@ class Counter : Component
 {
     int count = 0;
 
-    Element render()
+    Element render(UiContext* ctx)
     {
         View* root = view(makeStyle(1, 0, 0));
         root.add(text("Count: " + this.count.toString()));
-        root.add(button("+1", () => { this.count = this.count + 1; invalidate(); }));
+        Button* inc = button("+1", () => { this.count = this.count + 1; ctx.invalidate(); });
+        inc.setKey("inc");   // keyed so it can hold focus across re-renders
+        root.add(inc);
+        return root;
+    }
+};
+
+// A controlled text-field component: owns the text in its state, binds it to a
+// TextInput, and updates on each keystroke via onChangeText. Used by the
+// TextInput self-test.
+class EditApp : Component
+{
+    string text = default;
+
+    Element render(UiContext* ctx)
+    {
+        View* root = view(makeStyle(0, 0, 0));
+        TextInput* ti = textInput(this.text, (string nv) => { this.text = nv; ctx.invalidate(); });
+        ti.setKey("field");
+        ti.width = 12;
+        root.add(ti);
         return root;
     }
 };
 
 // ── Headless self-test suite ──────────────────────────────────────────────────
 // Deterministic, no-console checks of the whole pipeline (render -> layout ->
-// paint -> hit-test -> invalidate -> reconcile -> minimal repaint). Run when
-// Terminal.init() fails (redirected I/O / --run). Each sub-test returns true on
-// success; selfTest aggregates and returns 0 iff all pass.
+// paint -> dispatch -> invalidate -> reconcile -> minimal repaint, plus focus +
+// keyboard activation). Run when Terminal.init() fails (redirected I/O / --run).
+// Each sub-test returns true on success; selfTest aggregates and returns 0 iff
+// all pass.
 
 int countOp(list<Patch>* p, int op)
 {
@@ -52,38 +77,47 @@ int diffRows(Surface* a, Surface* b, int h)
 
 Text* ktext(string k, string s) { Text* t = text(s); t.setKey(k); return t; }
 
+// Scan the grid region for the first cell that consumes a mouse-down. Returns
+// true and leaves the handler's side effects applied.
+bool clickScan(Element tree, UiContext* ctx, int w, int h)
+{
+    int y = 0;
+    while (y < h)
+    {
+        int x = 0;
+        while (x < w) { if (tree.dispatch(mouseDown(x, y), ctx)) return true; x++; }
+        y++;
+    }
+    return false;
+}
+
 // Counter click -> invalidate -> reconcile yields exactly one Update(Text), and
 // minimal repaint sees exactly one changed row (the count text).
 bool testCounterReconcile()
 {
+    UiContext ctx = default;
     Counter c; c.count = 0;
     Surface front; front.init(40, 6);
     Surface back;  back.init(40, 6);
 
-    Element tree = c.render();
-    tree.layout(0, 0, 40);
-    front.fill(' '); tree.paint(&front);
+    Element tree = c.render(&ctx);
+    layoutRoot(tree, 0, 0, 40);
+    front.fill(' '); tree.paint(canvasFor(&front), &ctx);
     if (!front.contains("Count: 0")) { deleteTree(tree); return false; }
 
-    bool clicked = false; int y = 0;
-    while (y < front.height && !clicked)
-    {
-        int x = 0;
-        while (x < front.width) { if (tree.handleClick(x, y)) { clicked = true; break; } x++; }
-        y++;
-    }
-    if (!clicked || c.count != 1 || !consumeDirty()) { deleteTree(tree); return false; }
+    bool clicked = clickScan(tree, &ctx, 40, 6);
+    if (!clicked || c.count != 1 || !ctx.consumeDirty()) { deleteTree(tree); return false; }
 
-    Element wip = c.render();
+    Element wip = c.render(&ctx);
     list<Patch> p = default;
     tree = reconcile(tree, wip, &p);
     bool patchOk = p.count() == 1 && p.get(0).op == PATCH_UPDATE && p.get(0).nodeKind == ELEM_TEXT;
 
-    tree.layout(0, 0, 40);
-    back.fill(' '); tree.paint(&back);
+    layoutRoot(tree, 0, 0, 40);
+    back.fill(' '); tree.paint(canvasFor(&back), &ctx);
     bool rendered = back.contains("Count: 1");
     int changed = diffRows(&front, &back, 6);   // minimal repaint: one row changed
-    bool noSpurious = !consumeDirty();
+    bool noSpurious = !ctx.consumeDirty();
 
     deleteTree(tree);
     return patchOk && rendered && changed == 1 && noSpurious;
@@ -92,6 +126,7 @@ bool testCounterReconcile()
 // Keyed children matched across a reorder: no structural patches, new order shown.
 bool testKeyedReorder()
 {
+    UiContext ctx = default;
     View* x = view(makeStyle(0,0,0));
     x.add(ktext("a","A")); x.add(ktext("b","B")); x.add(ktext("c","C"));
     View* y = view(makeStyle(0,0,0));
@@ -102,7 +137,7 @@ bool testKeyedReorder()
     t = reconcile(t, y, &p);
     bool structural = countOp(&p, PATCH_INSERT) == 0 && countOp(&p, PATCH_REMOVE) == 0;
 
-    Surface s; s.init(8, 4); t.layout(0,0,8); s.fill(' '); t.paint(&s);
+    Surface s; s.init(8, 4); layoutRoot(t, 0, 0, 8); s.fill(' '); t.paint(canvasFor(&s), &ctx);
     char* r0 = s.row(0); char* r1 = s.row(1); char* r2 = s.row(2);
     bool order = strcmp(r0, "C") == 0 && strcmp(r1, "A") == 0 && strcmp(r2, "B") == 0;
     free((void*)r0); free((void*)r1); free((void*)r2);
@@ -115,16 +150,17 @@ bool testKeyedReorder()
 // structural churn (matched by key) and at least one Update (the changed child).
 bool testComponentReconcile()
 {
+    UiContext ctx = default;
     Counter* a = new Counter(); a.count = 0;
     Counter* b = new Counter(); b.count = 0;
 
     View* r1 = view(makeStyle(0,0,0));
-    r1.add(mount(a, "a")); r1.add(mount(b, "b"));
+    r1.add(mount(a, "a", &ctx)); r1.add(mount(b, "b", &ctx));
     Element committed = r1;
 
     a.count = 1;   // state behind component 'a' changes
     View* r2 = view(makeStyle(0,0,0));
-    r2.add(mount(b, "b")); r2.add(mount(a, "a"));   // reorder
+    r2.add(mount(b, "b", &ctx)); r2.add(mount(a, "a", &ctx));   // reorder
     Element wip = r2;
 
     list<Patch> p = default;
@@ -138,16 +174,176 @@ bool testComponentReconcile()
     return ok;
 }
 
+// Focus + keyboard activation through the dispatch seam, and focus surviving a
+// reconcile: a key event with nothing focused is a no-op; a click focuses the
+// button and fires it; Enter then re-fires it without a click; after a re-render
+// (same key "inc") Space still routes to the focused button.
+bool testFocusKeyboard()
+{
+    UiContext ctx = default;
+    Counter c; c.count = 0;
+
+    Element tree = c.render(&ctx);
+    layoutRoot(tree, 0, 0, 40);
+
+    bool preKey = tree.dispatch(keyPress(KEY_ENTER), &ctx);   // nothing focused yet
+    if (preKey || c.count != 0) { deleteTree(tree); return false; }
+
+    if (!clickScan(tree, &ctx, 40, 6) || c.count != 1) { deleteTree(tree); return false; }
+    ctx.consumeDirty();
+
+    bool keyed = tree.dispatch(keyPress(KEY_ENTER), &ctx);    // focused -> re-fires
+    if (!keyed || c.count != 2) { deleteTree(tree); return false; }
+    ctx.consumeDirty();
+
+    Element wip = c.render(&ctx);
+    list<Patch> p = default;
+    tree = reconcile(tree, wip, &p);                          // re-render keeps key "inc"
+    layoutRoot(tree, 0, 0, 40);
+    bool afterReconcile = tree.dispatch(keyPress(KEY_SPACE), &ctx) && c.count == 3;
+
+    deleteTree(tree);
+    return afterReconcile;
+}
+
+// The layout pass is one protocol with pluggable strategies: a row-direction
+// View places its children left-to-right on a single line, where the default
+// column-direction would stack them. Same nodes, same pass, different strategy.
+bool testRowLayout()
+{
+    UiContext ctx = default;
+    View* row = view(makeStyle(0,0,0));
+    row.style.flexDirection = DIR_ROW;
+    row.add(text("AB"));    // width 2
+    row.add(text("CDE"));   // width 3, placed at x=2
+    Element t = row;
+
+    layoutRoot(t, 0, 0, 40);
+    Surface s; s.init(40, 2); s.fill(' '); t.paint(canvasFor(&s), &ctx);
+    char* r0 = s.row(0);
+    char* r1 = s.row(1);
+    bool ok = strcmp(r0, "ABCDE") == 0 && strcmp(r1, "") == 0;   // one row, no stacking
+    free((void*)r0); free((void*)r1);
+
+    deleteTree(t);
+    return ok;
+}
+
+// Re-render the controlled EditApp and reconcile into the live tree, so a value
+// changed by onChangeText flows back into the TextInput before the next key.
+move Element editReRender(EditApp* app, UiContext* ctx, move Element tree, int w)
+{
+    Element wip = app.render(ctx);
+    list<Patch> p = default;
+    tree = reconcile(tree, wip, &p);
+    layoutRoot(tree, 0, 0, w);
+    return tree;
+}
+
+// TextInput: click to focus, type two printable keys (controlled value flows back
+// each render), backspace deletes the last char, and a focused field paints a
+// caret. Exercises the owning-string-per-keystroke field-store path.
+bool testTextInput()
+{
+    UiContext ctx = default;
+    EditApp app;   // text = ""
+
+    Element tree = app.render(&ctx);
+    layoutRoot(tree, 0, 0, 20);
+
+    if (!clickScan(tree, &ctx, 20, 2)) { deleteTree(tree); return false; }
+    ctx.consumeDirty();
+
+    tree.dispatch(keyPress(104), &ctx);                 // 'h'
+    ctx.consumeDirty();
+    tree = editReRender(&app, &ctx, tree, 20);
+    tree.dispatch(keyPress(105), &ctx);                 // 'i'
+    ctx.consumeDirty();
+    tree = editReRender(&app, &ctx, tree, 20);
+    bool typed = app.text == "hi";
+
+    tree.dispatch(keyPress(KEY_BACKSPACE), &ctx);       // delete 'i'
+    ctx.consumeDirty();
+    tree = editReRender(&app, &ctx, tree, 20);
+    bool deleted = app.text == "h";
+
+    // Focused field paints its value and a trailing caret.
+    Surface s; s.init(20, 2); s.fill(' '); tree.paint(canvasFor(&s), &ctx);
+    bool painted = s.contains("h_");
+
+    deleteTree(tree);
+    return typed && deleted && painted;
+}
+
+// Tab / Shift-Tab move focus around a ring of keyed buttons in tree order, with
+// wraparound. Nothing focused -> Tab focuses the first; Shift-Tab the last.
+bool testTabNav()
+{
+    UiContext ctx = default;
+    View* root = view(makeStyle(0,0,0));
+    Button* a = button("A", () => { }); a.setKey("a");
+    Button* b = button("B", () => { }); b.setKey("b");
+    Button* c = button("C", () => { }); c.setKey("c");
+    root.add(a); root.add(b); root.add(c);
+    Element tree = root;
+
+    moveFocus(tree, &ctx, false); bool f1 = ctx.hasFocus("a");   // none -> first
+    moveFocus(tree, &ctx, false); bool f2 = ctx.hasFocus("b");
+    moveFocus(tree, &ctx, false);                                 // -> c
+    moveFocus(tree, &ctx, false); bool wrap = ctx.hasFocus("a");  // wrap c -> a
+    moveFocus(tree, &ctx, true);  bool back = ctx.hasFocus("c");  // back a -> c
+
+    deleteTree(tree);
+    return f1 && f2 && wrap && back;
+}
+
+// ScrollView clips its children to the viewport and scrolls on Up/Down while
+// focused: 5 lines in a height-3 viewport show the top 3, and rows below are
+// clipped; scrolling down by 2 shifts the visible window to the last 3.
+bool testScrollClip()
+{
+    UiContext ctx = default;
+    ScrollView* sv = scrollView(makeStyle(0, 10, 3));   // 10x3 viewport
+    sv.setKey("scroll");
+    sv.add(text("L0")); sv.add(text("L1")); sv.add(text("L2"));
+    sv.add(text("L3")); sv.add(text("L4"));             // 5 lines
+    Element tree = sv;
+
+    layoutRoot(tree, 0, 0, 10);
+    Surface s; s.init(10, 6); s.fill(' '); tree.paint(canvasFor(&s), &ctx);
+    char* r0 = s.row(0); char* r2 = s.row(2); char* r3 = s.row(3);
+    bool clippedTop = strcmp(r0, "L0") == 0 && strcmp(r2, "L2") == 0 && strcmp(r3, "") == 0;
+    free((void*)r0); free((void*)r2); free((void*)r3);
+
+    ctx.focus("scroll");
+    tree.dispatch(keyPress(KEY_DOWN), &ctx);
+    tree.dispatch(keyPress(KEY_DOWN), &ctx);
+    bool wantsRepaint = ctx.consumeRepaint();
+    layoutRoot(tree, 0, 0, 10);
+    s.fill(' '); tree.paint(canvasFor(&s), &ctx);
+    char* q0 = s.row(0); char* q2 = s.row(2);
+    bool scrolled = strcmp(q0, "L2") == 0 && strcmp(q2, "L4") == 0;
+    free((void*)q0); free((void*)q2);
+
+    deleteTree(tree);
+    return clippedTop && scrolled && wantsRepaint;
+}
+
 int selfTest()
 {
     int pass = 0; int total = 0;
     total++; if (testCounterReconcile())   pass++; else printf("  FAIL: counter reconcile + minimal repaint\n");
     total++; if (testKeyedReorder())       pass++; else printf("  FAIL: keyed reorder\n");
     total++; if (testComponentReconcile()) pass++; else printf("  FAIL: component reconcile\n");
+    total++; if (testFocusKeyboard())      pass++; else printf("  FAIL: focus + keyboard activation\n");
+    total++; if (testRowLayout())          pass++; else printf("  FAIL: row layout strategy\n");
+    total++; if (testTextInput())          pass++; else printf("  FAIL: text input editing\n");
+    total++; if (testTabNav())             pass++; else printf("  FAIL: tab focus navigation\n");
+    total++; if (testScrollClip())         pass++; else printf("  FAIL: scroll + clip\n");
 
     if (pass == total)
     {
-        printf("PASS: ui self-tests %d/%d (reconcile, minimal repaint, keyed reorder, components)\n", pass, total);
+        printf("PASS: ui self-tests %d/%d (reconcile, repaint, reorder, components, focus, layout, textinput, tabnav, scroll)\n", pass, total);
         return 0;
     }
     printf("FAIL: ui self-tests %d/%d\n", pass, total);
@@ -182,6 +378,8 @@ int runApp(Component app)
 
     term.hideCursor();
 
+    UiContext ctx = default;
+
     int w = 0;
     int h = 0;
     if (!term.getSize(&w, &h)) { w = 80; h = 25; }
@@ -190,11 +388,11 @@ int runApp(Component app)
     Surface front; front.init(w, h);
     Surface back;  back.init(w, h);
 
-    Element tree = app.render();
-    tree.layout(0, 0, w);
+    Element tree = app.render(&ctx);
+    layoutRoot(tree, 0, 0, w);
     back.fill(' ');
-    tree.paint(&back);
-    back.text(0, h - 1, "(click [ +1 ], ESC to quit)");
+    tree.paint(canvasFor(&back), &ctx);
+    back.text(0, h - 1, "(click/Enter [ +1 ], ESC to quit)");
     flushFrame(&term, &front, &back, h, true);   // first frame: full paint
 
     bool running = true;
@@ -208,13 +406,14 @@ int runApp(Component app)
             if (evt == 1)
             {
                 if (key.vkCode == VK_ESCAPE) running = false;
+                // Route other keys to the focused node (VK codes match KEY_*).
+                else tree.dispatch(keyPress((int)key.vkCode), &ctx);
             }
             else if (evt == 2)
             {
-                // Just dispatch the click; the handler mutates state and calls
-                // invalidate(). Rendering is driven by the dirty flag below.
+                // Dispatch the click; the handler mutates state and invalidates.
                 if (mouse.isPress() && mouse.leftButton())
-                    tree.handleClick((int)mouse.x, (int)mouse.y);
+                    tree.dispatch(mouseDown((int)mouse.x, (int)mouse.y), &ctx);
             }
         }
         else
@@ -224,17 +423,17 @@ int runApp(Component app)
 
         // Drain the dirty flag: re-render + reconcile only when state changed,
         // then repaint only the rows that actually differ.
-        if (consumeDirty())
+        if (ctx.consumeDirty())
         {
-            Element wip = app.render();
+            Element wip = app.render(&ctx);
             list<Patch> patches = default;
             tree = reconcile(tree, wip, &patches);
             if (patches.count() > 0)
             {
-                tree.layout(0, 0, w);
+                layoutRoot(tree, 0, 0, w);
                 back.fill(' ');
-                tree.paint(&back);
-                back.text(0, h - 1, "(click [ +1 ], ESC to quit)");
+                tree.paint(canvasFor(&back), &ctx);
+                back.text(0, h - 1, "(click/Enter [ +1 ], ESC to quit)");
                 flushFrame(&term, &front, &back, h, false);   // minimal repaint
             }
         }

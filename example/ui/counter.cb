@@ -2,8 +2,8 @@
 //
 // Builds a Counter component, renders it to a host tree, serializes to JSON,
 // then reaches into the tree, downcasts the Button via `as`, and fires its
-// click handler twice. The handler captures `this` and mutates component
-// state, so re-rendering reflects the new count. Finally the tree is torn down.
+// press handler twice. The handler captures `this` and mutates component
+// state, so re-rendering reflects the new count. Both trees are torn down.
 
 import "ui.cb";
 
@@ -11,7 +11,7 @@ class Counter : Component
 {
     int count = 0;
 
-    Element render()
+    Element render(UiContext* ctx)
     {
         View* root = view(makeStyle(16, 0, 0));
         root.add(text("Count: " + this.count.toString()));
@@ -22,12 +22,15 @@ class Counter : Component
 
 extern int main()
 {
+    UiContext ctx = default;
     Counter c;
     c.count = 0;
 
-    // First render: Count: 0
-    Element tree = c.render();
-    printf("render 1: %s\n", tree.toJson().data());
+    // First render: Count: 0. Bind the owned JSON to a local so its buffer is
+    // freed at scope exit (toJson returns a `move string`).
+    Element tree = c.render(&ctx);
+    string json1 = tree.toJson();
+    printf("render 1: %s\n", json1.data());
 
     // Reach the Button (children[1]) and fire its onClick twice.
     View* rootView = tree as View;
@@ -50,11 +53,13 @@ extern int main()
     printf("count after 2 clicks: %d\n", c.count);
 
     // Re-render reflects the mutated state: Count: 2.
-    // NOTE: tree teardown is intentionally omitted (v1 leak posture). Both
-    // `delete <interface>` AND recursive destroyTree() over list<Element> children
-    // are currently broken - see internal/issue/delete-through-interface-invalid-bitcast.md.
-    Element tree2 = c.render();
-    printf("render 2: %s\n", tree2.toJson().data());
+    Element tree2 = c.render(&ctx);
+    string json2 = tree2.toJson();
+    printf("render 2: %s\n", json2.data());
 
+    // Tear down both trees (the recursive destroyTree + delete-through-interface
+    // path is sound now; the old v1 leak posture is closed).
+    deleteTree(tree);
+    deleteTree(tree2);
     return 0;
 }

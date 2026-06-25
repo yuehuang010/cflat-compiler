@@ -21,12 +21,12 @@ class BoxApp : Component
     int termH = 8;
     int clicks = 0;
 
-    Element render()
+    Element render(UiContext* ctx)
     {
         Box* root = box(makeStyle(0, this.termW, this.termH));
         root.setKey("root");
 
-        Button* add = button("add box", () => { this.clicks = this.clicks + 1; invalidate(); });
+        Button* add = button("add box", () => { this.clicks = this.clicks + 1; ctx.invalidate(); });
         add.setKey("btn");
         root.add(add);
 
@@ -87,12 +87,13 @@ int countOp(list<Patch>* p, int op)
 // lands flush on all four corners. Done at two sizes proves the box scales.
 bool renderFramedAt(BoxApp* app, int w, int h)
 {
+    UiContext ctx = default;
     app.termW = w; app.termH = h;
-    Element tree = app.render();
-    tree.layout(0, 0, w);
+    Element tree = app.render(&ctx);
+    layoutRoot(tree, 0, 0, w);
     Surface s; s.init(w, h);
     s.fill(' ');
-    tree.paint(&s);
+    tree.paint(canvasFor(&s), &ctx);
     bool ok = cornersFramed(&s, w, h);
     deleteTree(tree);
     return ok;
@@ -110,32 +111,33 @@ bool testResizeScaling()
 // inserted, and the painted grid gains one box worth of corners (4).
 bool testClickAddsBox()
 {
+    UiContext ctx = default;
     BoxApp app; app.clicks = 0;
     app.termW = 24; app.termH = 10;
 
-    Element tree = app.render();
-    tree.layout(0, 0, 24);
+    Element tree = app.render(&ctx);
+    layoutRoot(tree, 0, 0, 24);
 
     // Dispatch a click by scanning the grid for the cell the button occupies.
-    Surface probe; probe.init(24, 10); probe.fill(' '); tree.paint(&probe);
+    Surface probe; probe.init(24, 10); probe.fill(' '); tree.paint(canvasFor(&probe), &ctx);
     int beforeCorners = countChar(&probe, '+');   // outer box only: 4
 
     bool clicked = false; int y = 0;
     while (y < 10 && !clicked)
     {
         int x = 0;
-        while (x < 24) { if (tree.handleClick(x, y)) { clicked = true; break; } x++; }
+        while (x < 24) { if (tree.dispatch(mouseDown(x, y), &ctx)) { clicked = true; break; } x++; }
         y++;
     }
-    if (!clicked || app.clicks != 1 || !consumeDirty()) { deleteTree(tree); return false; }
+    if (!clicked || app.clicks != 1 || !ctx.consumeDirty()) { deleteTree(tree); return false; }
 
-    Element wip = app.render();
+    Element wip = app.render(&ctx);
     list<Patch> p = default;
     tree = reconcile(tree, wip, &p);
     bool oneInsert = countOp(&p, PATCH_INSERT) == 1;
 
-    tree.layout(0, 0, 24);
-    Surface after; after.init(24, 10); after.fill(' '); tree.paint(&after);
+    layoutRoot(tree, 0, 0, 24);
+    Surface after; after.init(24, 10); after.fill(' '); tree.paint(canvasFor(&after), &ctx);
     int afterCorners = countChar(&after, '+');     // outer + one nested box: 8
 
     deleteTree(tree);
@@ -182,14 +184,14 @@ void flushFrame(Terminal* term, Surface* front, Surface* back, int height, bool 
 // Render the whole tree fresh into `back` and full-paint. Used for the first
 // frame and after a resize (a size change does not produce reconcile patches, so
 // it cannot ride the incremental path - we rebuild and repaint everything).
-move Element repaintAll(BoxApp* app, Terminal* term, Surface* front, Surface* back,
-                       move Element tree, int w, int h)
+move Element repaintAll(BoxApp* app, UiContext* ctx, Terminal* term, Surface* front,
+                       Surface* back, move Element tree, int w, int h)
 {
     deleteTree(tree);
-    Element fresh = app.render();
-    fresh.layout(0, 0, w);
+    Element fresh = app.render(ctx);
+    layoutRoot(fresh, 0, 0, w);
     back.fill(' ');
-    fresh.paint(back);
+    fresh.paint(canvasFor(back), ctx);
     term.clear();
     flushFrame(term, front, back, h, true);
     return fresh;
@@ -203,6 +205,8 @@ int runApp(BoxApp* app)
 
     term.hideCursor();
 
+    UiContext ctx = default;
+
     int w = 0;
     int h = 0;
     if (!term.getSize(&w, &h)) { w = 80; h = 25; }
@@ -212,10 +216,10 @@ int runApp(BoxApp* app)
     Surface front; front.init(w, h);
     Surface back;  back.init(w, h);
 
-    Element tree = app.render();
-    tree.layout(0, 0, w);
+    Element tree = app.render(&ctx);
+    layoutRoot(tree, 0, 0, w);
     back.fill(' ');
-    tree.paint(&back);
+    tree.paint(canvasFor(&back), &ctx);
     flushFrame(&term, &front, &back, h, true);   // first frame: full paint
 
     bool running = true;
@@ -233,7 +237,7 @@ int runApp(BoxApp* app)
             else if (evt == 2)
             {
                 if (mouse.isPress() && mouse.leftButton())
-                    tree.handleClick((int)mouse.x, (int)mouse.y);
+                    tree.dispatch(mouseDown((int)mouse.x, (int)mouse.y), &ctx);
             }
         }
         else
@@ -250,21 +254,21 @@ int runApp(BoxApp* app)
             app.termW = w; app.termH = h;
             front.init(w, h);
             back.init(w, h);
-            tree = repaintAll(app, &term, &front, &back, tree, w, h);
+            tree = repaintAll(app, &ctx, &term, &front, &back, tree, w, h);
         }
 
         // Drain the dirty flag: re-render + reconcile only when a click changed
         // state, then repaint only the rows that actually differ.
-        if (consumeDirty())
+        if (ctx.consumeDirty())
         {
-            Element wip = app.render();
+            Element wip = app.render(&ctx);
             list<Patch> patches = default;
             tree = reconcile(tree, wip, &patches);
             if (patches.count() > 0)
             {
-                tree.layout(0, 0, w);
+                layoutRoot(tree, 0, 0, w);
                 back.fill(' ');
-                tree.paint(&back);
+                tree.paint(canvasFor(&back), &ctx);
                 flushFrame(&term, &front, &back, h, false);   // minimal repaint
             }
         }

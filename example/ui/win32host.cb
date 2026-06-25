@@ -8,7 +8,7 @@
 //
 // A size-aware component reads hostWidth()/hostHeight() in its render() - the
 // model-layer equivalent of a "useWindowSize()" hook - so the same tree rescales
-// when the window is resized. See gui_boxes.cb for a demo.
+// when the window is resized. See win32_boxes.cb for a demo.
 //
 // This file has no main(); it is imported by an app file that calls runAppGui().
 import "windows.h" lib { "user32.lib", "gdi32.lib" } cache;
@@ -27,14 +27,38 @@ int _gTermH = 25;
 int hostWidth()  { return _gTermW; }
 int hostHeight() { return _gTermH; }
 
-// The running app and its committed tree, reached from the free-function WndProc
-// (a stdcall callback cannot capture `this`). Single window / single thread, so
-// globals are the right tool here - same justification as the model layer's
-// _uiDirty. _gReady guards the tree before the first build (WM_SIZE) and after
-// teardown (WM_DESTROY).
-Component _gApp  = default;
-Element   _gTree = default;
+// The running app, its committed tree, and the UiContext (dirty flag + focused
+// node), reached from the free-function WndProc (a stdcall callback cannot
+// capture `this`). Single window / single thread, so these host globals are the
+// right tool here, and they live in the HOST file, not the framework library.
+// _gReady guards the tree before the first build (WM_SIZE) and after teardown
+// (WM_DESTROY).
+Component _gApp   = default;
+Element   _gTree  = default;
+UiContext _gCtx   = default;
 bool      _gReady = false;
+
+// Drain the dirty/repaint flags after an input event: re-render + reconcile when
+// state changed, and repaint when the diff produced patches OR a node requested a
+// repaint without a tree change (e.g. a ScrollView offset). Shared by the mouse
+// and key paths.
+void pumpAfterInput(void* hwnd)
+{
+    bool needPaint = false;
+    if (_gCtx.consumeDirty())
+    {
+        Element wip = _gApp.render(&_gCtx);
+        list<Patch> patches = default;
+        _gTree = reconcile(_gTree, wip, &patches);
+        if (patches.count() > 0) needPaint = true;
+    }
+    if (_gCtx.consumeRepaint()) needPaint = true;
+    if (needPaint)
+    {
+        layoutRoot(_gTree, 0, 0, _gTermW);
+        InvalidateRect(hwnd, nullptr, 1);
+    }
+}
 
 // ── GdiCanvas: the GDI implementation of the Canvas draw interface ─────────────
 // Holds the device context for the current WM_PAINT plus the cell size. drawText
@@ -72,6 +96,18 @@ class GdiCanvas : Canvas
         if (filled) { FillRect(this.hdc, &rc, br); return; }
         FrameRect(this.hdc, &rc, br);
     }
+
+    // Clip in GDI: SaveDC the current clip region, intersect with the cell rect
+    // (in pixels); popClip restores the most recently saved state. Nesting is
+    // handled by the DC save stack, so push/pop must stay balanced.
+    void pushClip(Rect r)
+    {
+        SaveDC(this.hdc);
+        IntersectClipRect(this.hdc, r.x * this.cellW, r.y * this.cellH,
+                          (r.x + r.w) * this.cellW, (r.y + r.h) * this.cellH);
+    }
+
+    void popClip() { RestoreDC(this.hdc, -1); }
 };
 
 // Free the old tree (if any) and render a fresh one at the current cell size.
@@ -80,8 +116,8 @@ class GdiCanvas : Canvas
 void rebuildTree()
 {
     if (_gReady) { deleteTree(_gTree); _gReady = false; }
-    _gTree = _gApp.render();
-    _gTree.layout(0, 0, _gTermW);
+    _gTree = _gApp.render(&_gCtx);
+    layoutRoot(_gTree, 0, 0, _gTermW);
     _gReady = true;
 }
 
@@ -130,8 +166,8 @@ stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
         {
             GdiCanvas cv = default;
             cv.hdc = memDC;
-            _gTree.layout(0, 0, _gTermW);
-            _gTree.paint(cv);
+            layoutRoot(_gTree, 0, 0, _gTermW);
+            _gTree.paint(cv, &_gCtx);
         }
         BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, (u32)SRCCOPY);
 
@@ -149,19 +185,32 @@ stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
         if (_gReady)
         {
             // Dispatch the click; the handler mutates state and calls invalidate().
-            // Then drain the dirty flag and reconcile, repainting only on a change.
-            _gTree.handleClick(px / CELL_W, py / CELL_H);
-            if (consumeDirty())
+            // pumpAfterInput then drains the dirty flag and repaints on a change.
+            _gTree.dispatch(mouseDown(px / CELL_W, py / CELL_H), &_gCtx);
+            pumpAfterInput(hwnd);
+        }
+        return (i64)0;
+    }
+
+    if (msg == WM_KEYDOWN)
+    {
+        // Tab / Shift-Tab move focus through the ring; every other key routes to
+        // the focused node (Win32 VK codes match the KEY_* constants). Then drain
+        // like the mouse path.
+        if (_gReady)
+        {
+            int vk = (int)wParam;
+            if (vk == KEY_TAB)
             {
-                Element wip = _gApp.render();
-                list<Patch> patches = default;
-                _gTree = reconcile(_gTree, wip, &patches);
-                if (patches.count() > 0)
-                {
-                    _gTree.layout(0, 0, _gTermW);
-                    InvalidateRect(hwnd, nullptr, 1);
-                }
+                bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                moveFocus(_gTree, &_gCtx, shift);
+                _gCtx.requestRepaint();
             }
+            else
+            {
+                _gTree.dispatch(keyPress(vk), &_gCtx);
+            }
+            pumpAfterInput(hwnd);
         }
         return (i64)0;
     }
@@ -174,6 +223,102 @@ stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
     }
 
     return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+// ── Offscreen GDI readback self-test ─────────────────────────────────────────
+// Verifies the GDI Canvas path WITHOUT a visible window: it paints a tree (Box +
+// Text + an overflowing ScrollView) into a memory bitmap through GdiCanvas, then
+// reads pixels back to assert the geometry landed - a box border drew black, the
+// text drew ink, and the ScrollView clipped the part of its child below the
+// viewport. Deterministic and console-free, so example.bat can gate it.
+
+bool _isBlack(u32 c) { return (c & 0xFFFFFFu) == 0u; }
+
+// True if any pixel in row y across [x0, x1) is black (drawn ink/border).
+bool _spanHasBlack(void* dc, int y, int x0, int x1)
+{
+    int x = x0;
+    while (x < x1)
+    {
+        if (_isBlack((u32)GetPixel(dc, x, y))) return true;
+        x++;
+    }
+    return false;
+}
+
+// True if any pixel within the cell (col,row) is black (e.g. text ink).
+bool _cellHasBlack(void* dc, int col, int row)
+{
+    int py = row * CELL_H;
+    while (py < (row + 1) * CELL_H)
+    {
+        if (_spanHasBlack(dc, py, col * CELL_W, (col + 1) * CELL_W)) return true;
+        py++;
+    }
+    return false;
+}
+
+int guiSelfTest()
+{
+    UiContext ctx = default;
+    int cw = 20; int ch = 12;                 // canvas size in cells
+    int W = cw * CELL_W; int H = ch * CELL_H;
+
+    void* screenDC = GetDC(nullptr);
+    void* memDC = CreateCompatibleDC(screenDC);
+    void* bmp   = CreateCompatibleBitmap(screenDC, W, H);
+    void* oldBmp = SelectObject(memDC, bmp);
+
+    RECT full = default;
+    full.left = 0; full.top = 0; full.right = W; full.bottom = H;
+    FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
+
+    // Outer box (frame) containing a Text label and a ScrollView whose child box
+    // is taller (5 cells) than the viewport (3 cells), so its lower border is
+    // clipped away.
+    Box* rootBox = box(makeStyle(0, cw, ch));
+    rootBox.add(text("GUI"));
+    ScrollView* sv = scrollView(makeStyle(0, 12, 3));
+    sv.setKey("scroll");
+    Box* tall = box(makeStyle(0, 8, 5));
+    sv.add(tall);
+    rootBox.add(sv);
+    Element tree = rootBox;
+
+    GdiCanvas cv = default;
+    cv.hdc = memDC;
+    layoutRoot(tree, 0, 0, cw);
+    tree.paint(cv, &ctx);
+
+    // 1. Outer box border: the top edge (pixel row 0) has black frame ink.
+    bool borderDrawn = _spanHasBlack(memDC, 0, 0, W);
+
+    // 2. Text rendered: the "GUI" label (Box inset 1 -> cell row 1) has ink.
+    bool textDrawn = _cellHasBlack(memDC, 2, 1) || _cellHasBlack(memDC, 3, 1)
+                  || _cellHasBlack(memDC, 4, 1);
+
+    // 3. Clip works: the ScrollView sits at cell row 2 (after the label), a
+    //    height-3 viewport (pixel rows 36..89). The tall child's TOP border falls
+    //    inside the viewport (ink present); its BOTTOM border (cell row 7+, pixels
+    //    >=126) falls below the viewport and must be clipped away (no ink).
+    bool clipTopInside = _spanHasBlack(memDC, 2 * CELL_H, CELL_W, 11 * CELL_W);
+    bool clipBottomHidden = !_spanHasBlack(memDC, 130, CELL_W, 11 * CELL_W);
+
+    deleteTree(tree);
+    SelectObject(memDC, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, screenDC);
+
+    bool ok = borderDrawn && textDrawn && clipTopInside && clipBottomHidden;
+    if (ok)
+    {
+        printf("PASS: gui self-test (GDI border + text + scroll clip)\n");
+        return 0;
+    }
+    printf("FAIL: gui self-test (border=%d text=%d clipTop=%d clipBottom=%d)\n",
+           (int)borderDrawn, (int)textDrawn, (int)clipTopInside, (int)clipBottomHidden);
+    return 1;
 }
 
 // Register the window class, create the window, and run the message loop until

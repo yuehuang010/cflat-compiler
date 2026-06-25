@@ -9410,6 +9410,118 @@ public:
         return resolved;
     }
 
+    // Store a pre-parsed value into one named (non-bitfield) struct field, with the
+    // same coercions and ownership behavior as brace-init: a char* string literal is
+    // wrapped to the string struct, an implementer pointer is boxed into an interface
+    // fat pointer, unions store at offset 0. Shared by EmitFieldInitializer (brace
+    // init) and ParseElementExpression (<Tag attr=...> sugar). Returns false on error.
+    bool EmitOneFieldInit(
+        llvm::Value* structPtr,
+        const LLVMBackend::StructData& sd,
+        const std::string& typeName,
+        const std::string& fieldName,
+        LLVMBackend::NamedVariable& rightNV,
+        antlr4::ParserRuleContext* errCtx)
+    {
+        auto* compiler = Compiler(errCtx);
+
+        int fieldIdx = -1;
+        LLVMBackend::DeclTypeAndValue fieldType;
+        for (int i = 0; i < (int)sd.StructFields.size(); i++)
+        {
+            if (sd.StructFields[i].VariableName == fieldName)
+            {
+                fieldIdx = i;
+                fieldType = sd.StructFields[i];
+                break;
+            }
+        }
+        if (fieldIdx < 0)
+        {
+            LogErrorContext(errCtx, std::format("'{}' has no field named '{}'", typeName, fieldName));
+            return false;
+        }
+
+        llvm::Value* val = LoadNamedVariable(rightNV);
+        if (!val) return false;
+
+        // Coerce char* string literals to the string struct type
+        if (fieldType.TypeName == "string" && !fieldType.Pointer
+            && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
+        {
+            auto* c = llvm::dyn_cast<llvm::Constant>(val);
+            if (c && compiler->IsStringLiteralConstant(c))
+                val = compiler->WrapStringLiteralAsString(val);
+            else if (compiler->GetFunction("operator string"))
+            {
+                LLVMBackend::NamedVariable argNV;
+                argNV.Primary = val;
+                argNV.BaseType = val->getType();
+                val = compiler->CreateOverloadedFunctionCall("operator string", { argNV });
+            }
+        }
+        // A string-STRUCT source stored into an owning string field: deep-copy so the
+        // field owns an INDEPENDENT buffer. A plain store would alias the source's
+        // buffer, which BOTH the field destructor AND the source's owner would free
+        // (double-free). Mirrors the param-to-field deep-copy the factory constructors
+        // rely on (e.g. text(string s) { t.text = s; }). copy() leaves the source
+        // intact; the copy result is owned by the field, so it is dropped from the
+        // owned-string temp-flush list below.
+        else if (fieldType.TypeName == "string" && !fieldType.Pointer
+                 && val->getType()->isStructTy() && compiler->GetFunction("copy"))
+        {
+            LLVMBackend::NamedVariable srcNV;
+            srcNV.Primary = val;
+            srcNV.BaseType = val->getType();
+            srcNV.TypeAndValue.TypeName = "string";
+            if (auto* copied = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
+                val = copied;
+        }
+        // Coerce struct pointer to interface fat pointer
+        else if (fieldType.IsInterface && val->getType() != compiler->GetFatPtrType())
+        {
+            std::string srcName = rightNV.TypeAndValue.TypeName;
+            if (!srcName.empty() && compiler->StructImplementsInterface(srcName, fieldType.TypeName))
+            {
+                auto vtable = compiler->GetOrCreateVTable(srcName, fieldType.TypeName);
+                llvm::Value* dataPtr = rightNV.TypeAndValue.Pointer ? val : rightNV.Storage;
+                if (!dataPtr)
+                {
+                    dataPtr = compiler->CreateAlloca(val->getType());
+                    compiler->CreateAssignment(val, dataPtr);
+                }
+                val = compiler->BuildInterfaceFatValue(vtable, dataPtr);
+            }
+        }
+
+        // Closure (Lambda<>) field: the destination now owns the closure env, so drop
+        // it from the owned-closure temp-flush list (otherwise the env is freed twice -
+        // by the end-of-full-expression flush AND by the owner's destructor). Mirrors
+        // the field-assignment path's UnregisterOwnedClosureTemp for the temp case.
+        bool isClosureVal = (val->getType() == compiler->GetClosureFatPtrType());
+
+        if (sd.IsUnion)
+        {
+            // Union: all fields alias at offset 0. Store through the raw pointer with the explicit field type.
+            auto* fieldLLVMType = compiler->GetType(fieldType);
+            compiler->CreateAssignment(val, structPtr, false, fieldLLVMType);
+        }
+        else
+        {
+            auto* gep = compiler->builder->CreateStructGEP(sd.StructType, structPtr, (unsigned)fieldIdx, fieldName + "_init");
+            compiler->builder->CreateStore(val, gep);
+        }
+
+        if (isClosureVal)
+            compiler->UnregisterOwnedClosureTemp(val);
+        // The field now owns the stored string buffer (a fresh copy, or a transferred
+        // owned temp); drop it from the owned-string temp-flush list so it is not freed
+        // twice (flush + field destructor).
+        if (fieldType.TypeName == "string" && !fieldType.Pointer && val->getType()->isStructTy())
+            compiler->UnregisterOwnedStringTemp(val);
+        return true;
+    }
+
     void EmitFieldInitializer(
         llvm::Value* structPtr,
         const std::string& typeName,
@@ -9474,70 +9586,8 @@ public:
                 continue;
             }
 
-            int fieldIdx = -1;
-            LLVMBackend::DeclTypeAndValue fieldType;
-            for (int i = 0; i < (int)sd.StructFields.size(); i++)
-            {
-                if (sd.StructFields[i].VariableName == fieldName)
-                {
-                    fieldIdx = i;
-                    fieldType = sd.StructFields[i];
-                    break;
-                }
-            }
-            if (fieldIdx < 0)
-            {
-                LogErrorContext(fi, std::format("'{}' has no field named '{}'", typeName, fieldName));
-                continue;
-            }
-
             auto rightNV = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
-            llvm::Value* val = LoadNamedVariable(rightNV);
-            if (!val) continue;
-
-            // Coerce char* string literals to the string struct type
-            if (fieldType.TypeName == "string" && !fieldType.Pointer
-                && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
-            {
-                auto* c = llvm::dyn_cast<llvm::Constant>(val);
-                if (c && compiler->IsStringLiteralConstant(c))
-                    val = compiler->WrapStringLiteralAsString(val);
-                else if (compiler->GetFunction("operator string"))
-                {
-                    LLVMBackend::NamedVariable argNV;
-                    argNV.Primary = val;
-                    argNV.BaseType = val->getType();
-                    val = compiler->CreateOverloadedFunctionCall("operator string", { argNV });
-                }
-            }
-            // Coerce struct pointer to interface fat pointer
-            else if (fieldType.IsInterface && val->getType() != compiler->GetFatPtrType())
-            {
-                std::string srcName = rightNV.TypeAndValue.TypeName;
-                if (!srcName.empty() && compiler->StructImplementsInterface(srcName, fieldType.TypeName))
-                {
-                    auto vtable = compiler->GetOrCreateVTable(srcName, fieldType.TypeName);
-                    llvm::Value* dataPtr = rightNV.TypeAndValue.Pointer ? val : rightNV.Storage;
-                    if (!dataPtr)
-                    {
-                        dataPtr = compiler->CreateAlloca(val->getType());
-                        compiler->CreateAssignment(val, dataPtr);
-                    }
-                    val = compiler->BuildInterfaceFatValue(vtable, dataPtr);
-                }
-            }
-
-            if (sd.IsUnion)
-            {
-                // Union: all fields alias at offset 0. Store through the raw pointer with the explicit field type.
-                auto* fieldLLVMType = compiler->GetType(fieldType);
-                compiler->CreateAssignment(val, structPtr, false, fieldLLVMType);
-            }
-            else
-            {
-                auto* gep = compiler->builder->CreateStructGEP(sd.StructType, structPtr, (unsigned)fieldIdx, fieldName + "_init");
-                compiler->builder->CreateStore(val, gep);
-            }
+            EmitOneFieldInit(structPtr, sd, typeName, fieldName, rightNV, fi);
         }
     }
 
@@ -11917,7 +11967,10 @@ public:
                             namedVar.Storage = nullptr;
                             // If the primary is a parenthesized cast expression, propagate its type
                             // so that chained member access (e.g. ((Struct*)ptr)->field) works.
-                            if (prevPrimary->expression() != nullptr && !lastParenExprType.TypeName.empty())
+                            // The <Tag> element sugar uses the same channel to publish its node
+                            // pointer type (Tag*) so interface boxing and member access resolve.
+                            if ((prevPrimary->expression() != nullptr || prevPrimary->elementExpression() != nullptr)
+                                && !lastParenExprType.TypeName.empty())
                                 namedVar.TypeAndValue = lastParenExprType;
                             // A parenthesized lvalue keeps its storage so postfix ++/-- can write
                             // back to it (e.g. '(*p)++' increments the pointee, not a temp copy).
@@ -14960,6 +15013,170 @@ public:
         return result;
     }
 
+    // Heap-allocate and default-construct a node type for the <Tag> sugar: operator
+    // new(sizeof) then the default constructor, returning a typed pointer. Mirrors
+    // the non-array path of ParseNewExpression. Returns null on error.
+    llvm::Value* EmitHeapDefaultConstruct(LLVMBackend* compiler, const std::string& typeName,
+                                          antlr4::ParserRuleContext* errCtx)
+    {
+        LLVMBackend::TypeAndValue typeInfo{ .TypeName = typeName };
+        llvm::Type* elemType = compiler->GetType(typeInfo);
+        if (!elemType || !elemType->isSized())
+        {
+            LogErrorContext(errCtx, std::format("'<{}>': cannot construct unknown or unsized type", typeName));
+            return nullptr;
+        }
+
+        uint64_t effAlign = compiler->GetEffectiveAlignmentForType(typeName, elemType);
+        llvm::Value* sizeVal;
+        if (effAlign > 1)
+        {
+            uint64_t paddedSize = compiler->GetEffectiveAllocSize(elemType, effAlign);
+            sizeVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*compiler->context), paddedSize);
+        }
+        else
+        {
+            sizeVal = compiler->GetTypeSizeBytes(elemType);
+        }
+
+        constexpr uint64_t kDefaultNewAlign = 16;
+        bool useAligned = effAlign > kDefaultNewAlign;
+        LLVMBackend::NamedVariable szArg;
+        szArg.Primary = sizeVal;
+        szArg.BaseType = sizeVal->getType();
+        std::vector<LLVMBackend::NamedVariable> newArgs = { szArg };
+        if (useAligned)
+        {
+            LLVMBackend::NamedVariable alignArg;
+            alignArg.Primary = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*compiler->context), effAlign);
+            alignArg.BaseType = alignArg.Primary->getType();
+            newArgs.push_back(alignArg);
+        }
+
+        llvm::Value* rawPtr = nullptr;
+        std::string opNewName = typeName + ".operator new";
+        if (compiler->GetFunction(opNewName))
+            rawPtr = compiler->CreateOverloadedFunctionCall(opNewName, newArgs);
+        else if (compiler->GetFunction("operator new"))
+            rawPtr = compiler->CreateOverloadedFunctionCall("operator new", newArgs);
+        else
+        {
+            LogErrorContext(errCtx, "'<>' element sugar requires 'operator new' to be defined");
+            return nullptr;
+        }
+
+        llvm::Value* typedPtr = compiler->builder->CreateBitCast(rawPtr, elemType->getPointerTo(), "elemnew");
+        if (compiler->GetFunction(typeName))
+        {
+            llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(typeName, {});
+            if (structVal)
+                compiler->builder->CreateStore(structVal, typedPtr);
+        }
+        return typedPtr;
+    }
+
+    // <Tag attr="lit" attr2={expr}> children </Tag> - JSX-like element sugar. Lowers
+    // 1:1 to: construct Tag on the heap, store each attribute into the matching field
+    // (ownership-correct, via EmitOneFieldInit), and add() each child (nested element
+    // or {expr}). Library-agnostic: the compiler only knows the tag is a type in scope
+    // with the matching fields and an add() method. The result is laundered to behave
+    // like a factory pointer (NOT a `new` local), so `return <View/>` is allowed.
+    llvm::Value* ParseElementExpression(CFlatParser::ElementExpressionContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+
+        auto tags = ctx->Identifier();
+        std::string tagName = tags[0]->getText();
+        if (tags.size() > 1 && tags[1]->getText() != tagName)
+        {
+            LogErrorContext(ctx, std::format(
+                "mismatched closing tag </{}> for <{}>", tags[1]->getText(), tagName));
+            return nullptr;
+        }
+
+        auto it = compiler->dataStructures.find(tagName);
+        if (it == compiler->dataStructures.end())
+        {
+            LogErrorContext(ctx, std::format(
+                "<{}> is not a known type in scope; the element tag must name a struct/class type", tagName));
+            return nullptr;
+        }
+
+        llvm::Value* structPtr = EmitHeapDefaultConstruct(compiler, tagName, ctx);
+        if (!structPtr)
+            return nullptr;
+        const auto& sd = it->second;
+
+        // Attributes -> ownership-correct field stores.
+        for (auto* attr : ctx->elementAttribute())
+        {
+            std::string fieldName = attr->Identifier()->getText();
+            LLVMBackend::NamedVariable rightNV = {};
+            if (auto* sl = attr->StringLiteral())
+            {
+                // attr="literal" is a static string; use attr={expr} for interpolation
+                // or any dynamic value.
+                std::string processed = ProcessRawText(sl->getText(), /*foldBraces=*/true);
+                llvm::Value* litVal = compiler->CreateGlobalString("", processed);
+                rightNV.Primary = litVal;
+                rightNV.BaseType = litVal ? litVal->getType() : nullptr;
+            }
+            else
+            {
+                rightNV = ParseAssignmentExpressionNamed(attr->assignmentExpression());
+            }
+            EmitOneFieldInit(structPtr, sd, tagName, fieldName, rightNV, attr);
+        }
+
+        // Children -> add() calls. The receiver self NV is rebuilt per call because
+        // CreateOverloadedFunctionCall may consume/null move args.
+        auto makeSelf = [&]() {
+            LLVMBackend::NamedVariable selfNV;
+            selfNV.Primary = structPtr;
+            selfNV.BaseType = structPtr->getType();
+            selfNV.TypeAndValue.TypeName = tagName;
+            selfNV.TypeAndValue.Pointer = true;
+            return selfNV;
+        };
+        for (auto* content : ctx->elementContent())
+        {
+            LLVMBackend::NamedVariable childNV = {};
+            if (auto* childEl = content->elementExpression())
+            {
+                llvm::Value* childPtr = ParseElementExpression(childEl);
+                if (!childPtr)
+                    continue;
+                childNV.Primary = childPtr;
+                childNV.BaseType = childPtr->getType();
+                childNV.TypeAndValue.TypeName = childEl->Identifier()[0]->getText();
+                childNV.TypeAndValue.Pointer = true;
+            }
+            else
+            {
+                childNV = ParseAssignmentExpressionNamed(content->assignmentExpression());
+            }
+            childNV.TypeAndValue.VariableName = "";   // forwarded positionally into add()
+            compiler->CreateOverloadedFunctionCall("add", { makeSelf(), childNV });
+        }
+
+        // Publish the result type (Tag*) on the primary->postfix side-channel so the
+        // caller boxes it into an interface where needed (e.g. `return <View/>` or
+        // assigning to an `Element` slot) and member access on the result resolves.
+        lastParenExprType = {};
+        lastParenExprType.TypeName = tagName;
+        lastParenExprType.Pointer = true;
+        lastParenExprStorage = nullptr;
+
+        // Launder ownership: the result is an unowned-by-tracker heap pointer the
+        // caller manages (add to a parent or deleteTree), exactly like a factory such
+        // as view(). Clearing these keeps `return <View/>` from tripping the
+        // "owning value boxed into interface return" check.
+        compiler->lastOwningResult = false;
+        compiler->lastCallReturnsOwned = false;
+
+        return structPtr;
+    }
+
     llvm::Value* ParsePrimaryExpression(CFlatParser::PrimaryExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
@@ -14969,6 +15186,9 @@ public:
 
         if (auto* lambdaCtx = ctx->lambdaExpression())
             return ParseLambdaExpression(lambdaCtx).Primary;
+
+        if (auto* elemCtx = ctx->elementExpression())
+            return ParseElementExpression(elemCtx);
 
         auto expressionCtx = ctx->expression();
         auto constant = ctx->Constant();

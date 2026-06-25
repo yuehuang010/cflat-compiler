@@ -14,11 +14,11 @@ class Counter : Component
     int count = 0;
     string name = default;
 
-    Element render()
+    Element render(UiContext* ctx)
     {
         View* root = view(makeStyle(1, 0, 0));
         root.add(text(this.name + ": " + this.count.toString()));
-        root.add(button("+1", () => { this.count = this.count + 1; invalidate(); }));
+        root.add(button("+1", () => { this.count = this.count + 1; ctx.invalidate(); }));
         return root;
     }
 
@@ -39,24 +39,26 @@ class CounterApp : Component
     }
 
     // Compose: mount each child Counter as a keyed component node.
-    Element render()
+    Element render(UiContext* ctx)
     {
         View* root = view(makeStyle(2, 0, 0));
         root.add(text("=== Counters ==="));
         for (Counter* child in this.counters)
-            root.add(mount(child, child.name));
+            root.add(mount(child, child.name, ctx));
         return root;
     }
 };
 
 extern int main()
 {
+    UiContext ctx = default;
     CounterApp app;
     app.addCounter("alpha");
     app.addCounter("beta");
 
-    Element committed = app.render();
-    printf("initial:  %s\n", committed.toJson().data());
+    Element committed = app.render(&ctx);
+    string initialJson = committed.toJson();
+    printf("initial:  %s\n", initialJson.data());
 
     // Drive state changes through the child components (persist via pointer),
     // then reconcile a fresh render into the live tree.
@@ -64,12 +66,13 @@ extern int main()
     app.counters[0].bump();
     app.counters[1].bump();
 
-    Element wip = app.render();
+    Element wip = app.render(&ctx);
     list<Patch> patches = default;
     committed = reconcile(committed, wip, &patches);
 
     printf("patches:  %d\n", patches.count());
-    printf("updated:  %s\n", committed.toJson().data());
+    string updatedJson = committed.toJson();
+    printf("updated:  %s\n", updatedJson.data());
 
     deleteTree(committed);
     // app (stack) is destroyed here; its list<Counter*> frees the child Counters.

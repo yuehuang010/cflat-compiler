@@ -1,0 +1,69 @@
+// counter_jsx.cb - the <View/> grammar sugar (Phase 2), proven equivalent to the
+// hand-written construction form.
+//
+// The same Counter tree that counter.cb builds with view()/text()/button() is here
+// authored as JSX-like sugar. The sugar lowers 1:1 to construction + children.add,
+// so the two trees serialize to identical JSON - which this file asserts, gating
+// example.bat on desugaring correctness.
+//
+// Run:  x64/Release/cflat.exe example/ui/counter_jsx.cb --run
+
+import "ui.cb";
+
+class CounterJsx : Component
+{
+    int count = 0;
+
+    Element render(UiContext* ctx)
+    {
+        // Hoist the interpolated label into a local. An owned-string expression used
+        // directly as a child attribute alongside a sibling capturing closure trips a
+        // known temp-flush limitation (internal/issue/element-sibling-temp-flush-leak.md);
+        // binding it first is the leak-clean idiom and reads clearly besides.
+        string label = "Count: " + this.count.toString();
+        return <View style={makeStyle(16, 0, 0)}>
+                 <Text text={label} />
+                 <Button title="+1" onPress={() => { this.count = this.count + 1; }} />
+               </View>;
+    }
+};
+
+// The exact tree the sugar above desugars to, built with explicit constructors.
+Element buildManual(int count)
+{
+    View* root = view(makeStyle(16, 0, 0));
+    root.add(text("Count: " + count.toString()));
+    root.add(button("+1", () => { }));
+    return root;
+}
+
+extern int main()
+{
+    UiContext ctx = default;
+    CounterJsx c;
+    c.count = 0;
+
+    Element sugar = c.render(&ctx);
+    Element manual = buildManual(0);
+
+    string sj = sugar.toJson();
+    string mj = manual.toJson();
+    bool same = sj == mj;
+
+    printf("sugar:  %s\n", sj.data());
+
+    int rc = 0;
+    if (same)
+    {
+        printf("PASS: jsx desugars to an identical tree\n");
+    }
+    else
+    {
+        printf("FAIL: jsx tree differs\n  manual: %s\n", mj.data());
+        rc = 1;
+    }
+
+    deleteTree(sugar);
+    deleteTree(manual);
+    return rc;
+}

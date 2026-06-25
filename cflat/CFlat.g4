@@ -41,6 +41,7 @@ primaryExpression
     | StringLiteral+
     | lambdaExpression
     | tupleExpression
+    | elementExpression
     | '(' expression ')'
     | NameOf '(' expression ')'
     | TypeOf '(' expression ')'
@@ -50,6 +51,25 @@ primaryExpression
 
 tupleExpression
     : '(' tupleConstructEntry (',' tupleConstructEntry)+ ')'
+    ;
+
+// JSX-like element sugar (see doc/UI.md). Lowers 1:1 to construction + children
+// add - LIBRARY-AGNOSTIC: <Tag/> constructs a type named Tag in scope, with no
+// compiler dependency on any UI library. Attributes set fields; children are
+// nested elements or {expr} interpolations added via the tag's add() method.
+elementExpression
+    : '<' Identifier elementAttribute* '/' '>'
+    | '<' Identifier elementAttribute* '>' elementContent* '<' '/' Identifier '>'
+    ;
+
+elementAttribute
+    : Identifier '=' StringLiteral
+    | Identifier '=' '{' assignmentExpression '}'
+    ;
+
+elementContent
+    : elementExpression
+    | '{' assignmentExpression '}'
     ;
 
 tupleConstructEntry
