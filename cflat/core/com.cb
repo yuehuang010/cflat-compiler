@@ -28,6 +28,9 @@ annotation uuid { string value; };
 // ===== HRESULT result codes =====
 // An HRESULT is a 32-bit status: the high bit is the failure flag, so success codes are
 // non-negative and failure codes are negative when read as a signed i32.
+// Import "com.cb" BEFORE any SDK header that also defines S_OK/E_FAIL/... (e.g. d3d11.h pulls in
+// winerror.h): a header-derived global tolerates a pre-existing same-named cflat global, but the
+// reverse order trips the cflat global-redeclaration check.
 
 i32 S_OK            = 0;
 i32 S_FALSE         = 1;
@@ -125,6 +128,10 @@ class ComPtr<T>
     // Borrow the raw pointer for a method call; no ref transfer (caller must not Release it).
     T* get() { return ptr; }
 
+    // Forward member access to the held pointer: `comptr->Method(...)` calls through T's vtable.
+    // ComPtr's own methods (get/reset/put/...) still win via the own-member-first rule.
+    T* operator->() { return ptr; }
+
     bool valid() { return ptr != nullptr; }
 
     // Release any held pointer and null the slot, without leaving the holder. Lets a caller drop the
@@ -145,13 +152,20 @@ class ComPtr<T>
     }
 
     // QueryInterface `src` into this holder; returns the HRESULT (check with FAILED()). Releases any
-    // pointer already held, then writes the queried interface into the slot. Pass the target IID as
-    // iidof(T) at the call site - iidof needs a concrete type, so it cannot be derived from the bare
-    // generic parameter T here. The void** cast adapts put()'s typed T** to QueryInterface's void**.
-    i32 tryAs(void* src, void* iid)
+    // pointer already held, then writes the queried interface into the slot. The target IID is derived
+    // from the holder's own T via iidof(T). The void** cast adapts put()'s typed T** to QueryInterface.
+    i32 tryAs(void* src)
     {
         reset();
-        return ((IUnknown*)src)->lpVtbl->QueryInterface(src, iid, (void**)put());
+        return ((IUnknown*)src)->lpVtbl->QueryInterface(src, iidof(T), (void**)put());
+    }
+
+    // Adopt an already-owned raw pointer without an AddRef (the caller's ref transfers in). For an
+    // API that returns an interface it already ref'd, e.g. `blob.attach(compileShader(...))`.
+    void attach(T* raw)
+    {
+        reset();
+        ptr = raw;
     }
 
     // Transfer ownership OUT: capture the raw, null the slot so the dtor will not Release, return raw.

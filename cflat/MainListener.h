@@ -15038,6 +15038,17 @@ public:
             {
                 base = ts ? ts->getText() : "";
             }
+            // A bare type-parameter (e.g. iidof(T) inside ComPtr<T>) must resolve to the
+            // specialization's concrete type argument, the same way T*/T type positions do.
+            // Route base through any `using` alias and the active generic substitution map so
+            // T -> the instantiated mangled interface (e.g. "IReference__int") reaches the PIID table.
+            if (typeArgs.empty())
+            {
+                base = compiler->ResolveTypeAlias(base);
+                auto substIt = activeTypeSubstitutions.find(base);
+                if (substIt != activeTypeSubstitutions.end())
+                    base = substIt->second;
+            }
             std::string mangled = typeArgs.empty() ? base : MangledGenericName(base, typeArgs);
             if (!typeArgs.empty())
                 compiler->InstantiateWinrtGenericInterface(base, typeArgs, mangled);

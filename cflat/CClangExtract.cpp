@@ -13,6 +13,7 @@
 
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/RecursiveASTVisitor.h"
@@ -542,6 +543,47 @@ namespace cflat_cinterop
             }
         };
 
+        // C++ uuid harvest: walk record decls and emit name + __declspec(uuid) GUID only. The
+        // header is parsed as C++ so the MIDL_INTERFACE form (with the uuid attribute) is selected;
+        // the C parse never sees it. Everything but the GUID is ignored.
+        struct UuidVisitor : public RecursiveASTVisitor<UuidVisitor>
+        {
+            ExtractState& st;
+            explicit UuidVisitor(ExtractState& s) : st(s) {}
+            bool VisitRecordDecl(RecordDecl* rd)
+            {
+                if (!rd->getIdentifier()) return true;
+                const auto* u = rd->getAttr<clang::UuidAttr>();
+                if (!u) return true;
+                RawRecord rec;
+                rec.name = rd->getNameAsString();
+                rec.uuid = u->getGuid().str();   // canonical hyphenated GUID as written in the attr
+                st.out.records.push_back(std::move(rec));
+                return true;
+            }
+        };
+
+        struct UuidConsumer : public ASTConsumer
+        {
+            ExtractState& st;
+            explicit UuidConsumer(ExtractState& s) : st(s) {}
+            void HandleTranslationUnit(ASTContext& ctx) override
+            {
+                UuidVisitor v(st);
+                v.TraverseDecl(ctx.getTranslationUnitDecl());
+            }
+        };
+
+        struct UuidAction : public ASTFrontendAction
+        {
+            ExtractState& st;
+            explicit UuidAction(ExtractState& s) : st(s) {}
+            std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance&, StringRef) override
+            {
+                return std::make_unique<UuidConsumer>(st);
+            }
+        };
+
         struct ExtractAction : public ASTFrontendAction
         {
             ExtractState& st;
@@ -665,6 +707,14 @@ namespace cflat_cinterop
     bool ExtractCInterop(const ExtractRequest& req, ExtractResult& out, std::string& err)
     {
         ExtractState st(req, out);
+
+        // C++ uuid harvest: a single full parse that only collects record __declspec(uuid) GUIDs.
+        if (req.uuidHarvestCxx)
+        {
+            llvm::TimeTraceScope parseScope("UuidHarvest", req.mainFileName);
+            UuidAction harvest(st);
+            return RunAction(req, req.source, harvest, err);
+        }
 
         // Stage 1: preprocess-only prepass to discover macro names (header path only).
         std::string fullSource = req.source;

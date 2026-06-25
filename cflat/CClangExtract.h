@@ -52,6 +52,10 @@ namespace cflat_cinterop
     {
         std::string name;           // tag name; empty for anonymous (caller synthesizes)
         bool isUnion = false;
+        // Canonical hyphenated GUID of a header-COM interface's __declspec(uuid)/MIDL_INTERFACE
+        // attribute (e.g. "db6f6ddb-ac77-4e88-8253-819df9bbf140"), or empty. Populated only by the
+        // C++ uuid-harvest pass (the C parse never sees it - the SDK gates the attr on __cplusplus).
+        std::string uuid;
         std::vector<RawField> fields;
         std::string file;
         int line = 1;
@@ -128,6 +132,10 @@ namespace cflat_cinterop
         bool definitionsOnly = false;       // .c auto-extern: only functions defined in this TU
         bool wantIncludes = false;          // deep header-cache: record every transitively included file
         bool skipFunctionBodies = false;    // header bind: parse declarations only, skip function bodies
+        // C++ uuid-harvest pass: parse the header(s) as C++ and collect only record name -> uuid
+        // (from __declspec(uuid)/MIDL_INTERFACE). No macros/sigs/enums are produced. The caller
+        // stamps the harvested GUIDs onto the C-parse records so iidof() resolves header-COM IIDs.
+        bool uuidHarvestCxx = false;
     };
 
     struct ExtractResult

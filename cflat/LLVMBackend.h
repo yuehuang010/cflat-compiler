@@ -1161,6 +1161,9 @@ private:
         std::vector<CRecordFieldEntry> fields;
         int line = 1;
         int col = 0;
+        // Header-COM interface IID (hyphenated GUID) from __declspec(uuid), or empty. Registered
+        // as the type's "uuid" annotation so iidof()/ComPtr<T> resolve a header-COM IID.
+        std::string uuid;
     };
     // Function-like C macro translated to a CFlat 'auto' generic. The translation pass filters
     // the body against an allowlist of safe operators; anything else is rejected.
@@ -3429,14 +3432,16 @@ private:
 
     std::vector<std::string> BuildClangDriverArgs(const std::string& headerDir,
                                                const std::vector<std::string>& extraDefines,
-                                               bool errorRecovery) const
+                                               bool errorRecovery, bool asCxx = false) const
     {
         std::vector<std::string> args;
         args.push_back(platformValue == 32 ? "--target=i686-pc-windows-msvc"
                                            : "--target=x86_64-pc-windows-msvc");
         args.push_back("-fsyntax-only");
         args.push_back("-x");
-        args.push_back("c");
+        // C++ is used only by the focused uuid-harvest pass, so the SDK's MIDL_INTERFACE form
+        // (which carries the __declspec(uuid) the C form omits) is parsed. The normal bind is C.
+        args.push_back(asCxx ? "c++" : "c");
         if (errorRecovery)
         {
             args.push_back("-ferror-limit=0");
@@ -3631,6 +3636,7 @@ private:
             CRecordEntry rec;
             rec.name = r.name; rec.isUnion = r.isUnion;
             rec.line = r.line ? r.line : 1; rec.col = r.col < 0 ? 0 : r.col;
+            rec.uuid = r.uuid;
             for (const auto& f : r.fields)
             {
                 CRecordFieldEntry fe;
@@ -3640,6 +3646,60 @@ private:
             }
             out.push_back(std::move(rec));
         }
+    }
+
+    // A header-COM interface record is a struct whose lpVtbl field points at its <Iface>Vtbl.
+    // Used to gate the (relatively costly) C++ uuid-harvest parse to headers that define COM.
+    static bool HasComRecord(const std::vector<cflat_cinterop::RawRecord>& records)
+    {
+        for (const auto& r : records)
+            for (const auto& f : r.fields)
+                if (f.name == "lpVtbl") return true;
+        return false;
+    }
+
+    // Parse the same header(s) once more as C++ to read each COM interface's __declspec(uuid) GUID
+    // (the MIDL_INTERFACE form), then stamp it onto the matching C-parse record by name. Failure is
+    // non-fatal: records simply keep an empty uuid and iidof() falls back to its "no IID" error.
+    void HarvestComUuids(const std::vector<std::string>& headerPaths, const std::string& primaryDir,
+                         const std::vector<std::string>& extraDefines,
+                         std::vector<cflat_cinterop::RawRecord>& records)
+    {
+        std::string source;
+        for (const auto& h : headerPaths)
+        {
+            std::string fwd = h;
+            std::replace(fwd.begin(), fwd.end(), '\\', '/');
+            source += "#include \"" + fwd + "\"\n";
+        }
+
+        cflat_cinterop::ExtractRequest req;
+        req.mainFileName      = "cflat_uuid_stub.cpp";
+        req.source            = source;
+        req.args              = BuildClangDriverArgs(primaryDir, extraDefines, /*errorRecovery*/ true, /*asCxx*/ true);
+        req.uuidHarvestCxx    = true;
+        req.skipFunctionBodies = true;
+
+        cflat_cinterop::ExtractResult uuidRaw;
+        std::string err;
+        if (!cflat_cinterop::ExtractCInterop(req, uuidRaw, err))
+        {
+            if (verbose) std::cout << std::format("[verbose]   COM uuid harvest failed: {}\n", err);
+            return;
+        }
+
+        std::unordered_map<std::string, std::string> byName;
+        for (const auto& r : uuidRaw.records)
+            if (!r.name.empty() && !r.uuid.empty()) byName.emplace(r.name, r.uuid);
+        size_t stamped = 0;
+        for (auto& r : records)
+        {
+            if (!r.uuid.empty()) continue;
+            if (auto it = byName.find(r.name); it != byName.end()) { r.uuid = it->second; ++stamped; }
+        }
+        if (verbose)
+            std::cout << std::format("[verbose]   COM uuid harvest: {} interface IID(s) captured, {} stamped\n",
+                byName.size(), stamped);
     }
 
     bool ExtractCHeaderClang(const std::vector<std::string>& headerPaths,
@@ -3725,6 +3785,12 @@ private:
         }
 
         if (outIncludes) *outIncludes = std::move(raw.includedFiles);
+
+        // Header-COM interfaces (a record carrying an `lpVtbl` field) hide their IID in the C++
+        // MIDL_INTERFACE form the C parse above cannot see. When any are present, harvest the GUIDs
+        // with a focused C++ parse and stamp them onto the matching C records so iidof() resolves.
+        if (HasComRecord(raw.records))
+            HarvestComUuids(headerPaths, primaryDir, extraDefines, raw.records);
 
         {
             llvm::TimeTraceScope adoptScope("AdoptTypedefs", headerPath);
@@ -4135,6 +4201,20 @@ private:
                                 fileForLsp, r.line, 0, fieldSig);
                 }
             }
+        }
+
+        // Register each header-COM interface's IID as its "uuid" type annotation (over ALL records,
+        // not just freshly-created `ours`, so a cache hit re-annotates already-registered types).
+        // EmitIidGlobalFor then resolves iidof(<HeaderComType>) through the existing uuid path.
+        for (const auto& r : records)
+        {
+            if (r.uuid.empty()) continue;
+            std::vector<AnnotationValue> anns;
+            if (auto it = typeAnnotations_.find(r.name); it != typeAnnotations_.end()) anns = it->second;
+            bool had = false;
+            for (auto& a : anns) if (a.Name == "uuid") { a.Value = r.uuid; had = true; }
+            if (!had) anns.push_back(AnnotationValue{ "uuid", r.uuid });
+            SetTypeAnnotations(r.name, std::move(anns));
         }
 
         if (verbose)
@@ -5693,6 +5773,21 @@ public:
         return (it != typeAliases.end()) ? it->second : name;
     }
 
+    // The "uuid" type annotation for `name`, following the typedef-alias chain (ID3DBlob ->
+    // ID3D10Blob) since a header-COM IID is registered on the struct tag, not its typedef name.
+    std::string FindUuidAnnotationResolving(const std::string& name) const
+    {
+        std::string cur = name;
+        for (int guard = 0; guard < 8; ++guard)
+        {
+            if (std::string u = GetTypeAnnotationArg(cur, "uuid"); !u.empty()) return u;
+            std::string next = ResolveTypeAlias(cur);
+            if (next == cur) break;
+            cur = next;
+        }
+        return std::string{};
+    }
+
     bool IsInterfaceType(const std::string& name) const
     {
         return interfaceTable.count(ResolveTypeAlias(name)) > 0;
@@ -6212,7 +6307,9 @@ public:
         if (auto it = winrtInstanceIid_.find(name); it != winrtInstanceIid_.end())
             return EmitGuidGlobal(it->second.data());
         uint8_t bytes[16];
-        if (std::string u = GetTypeAnnotationArg(name, "uuid"); !u.empty() && ParseUuidToBytes(u, bytes))
+        // A header-COM interface is often a typedef alias of its real tag (ID3DBlob -> ID3D10Blob);
+        // the uuid annotation lives on the tag, so resolve the alias chain before giving up.
+        if (std::string u = FindUuidAnnotationResolving(name); !u.empty() && ParseUuidToBytes(u, bytes))
             return EmitGuidGlobal(bytes);
         for (const auto& i : winrtConsumedModel_.interfaces)
             if (WinrtSimpleName(i.fullName) == name && !i.iid.empty() && ParseUuidToBytes(i.iid, bytes))
@@ -13074,6 +13171,7 @@ public:
         for (const auto& f : r.fields) fs.push_back(FieldToJson(f));
         nlohmann::json j = {{"n", r.name}, {"fs", fs}, {"ln", r.line}, {"co", r.col}};
         if (r.isUnion) j["u"] = true;
+        if (!r.uuid.empty()) j["id"] = r.uuid;
         return j;
     }
     static CRecordEntry RecordFromJson(const SjVal& j)
@@ -13083,6 +13181,7 @@ public:
         r.isUnion = j.value("u", false);
         r.line    = j.value("ln", 1);
         r.col     = j.value("co", 0);
+        r.uuid    = j.value("id", std::string{});
         if (j.contains("fs")) for (const auto& f : j["fs"]) r.fields.push_back(FieldFromJson(f));
         return r;
     }

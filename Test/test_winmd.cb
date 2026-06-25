@@ -352,20 +352,20 @@ bool testComPtrRaii()
 
         // .get() borrows the raw pointer for a live vtable call; the ComPtr keeps ownership.
         void* boxed = nullptr;
-        factory.get()->CreateInt32(7777, &boxed);
+        factory->CreateInt32(7777, &boxed);
         result &= Test("comptr_box_nonnull", boxed != nullptr ? 1 : 0, 1);
 
         // tryAs() QIs `boxed` into the holder and keeps the HRESULT - one call replacing the manual
-        // QueryInterface(iid, (void**)&out) dance. The IID is named at the call site (iidof needs a
-        // concrete type). The OS accepting the derived PIID and the value reading back prove the QI
-        // landed a live IReference<int> in the holder.
+        // QueryInterface(iid, (void**)&out) dance. The IID is derived inside tryAs from the holder's
+        // own T via iidof(T), so the call site is single-arg. The OS accepting the derived PIID and
+        // the value reading back prove the QI landed a live IReference<int> in the holder.
         ComPtr<IReference<int>> refInt = default;
-        i32 qi = refInt.tryAs(boxed, iidof(IReference<int>));
+        i32 qi = refInt.tryAs(boxed);
         result &= Test("comptr_qi_accepted", (qi == 0 && refInt.valid()) ? 1 : 0, 1);
         if (qi == 0 && refInt.valid())
         {
             int value = default;
-            refInt.get()->get_Value(&value);
+            refInt->get_Value(&value);
             boxedValue = value;
         }
 

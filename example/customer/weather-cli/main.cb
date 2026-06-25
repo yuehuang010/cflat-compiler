@@ -36,7 +36,7 @@ extern int main()
 
     HSTRING hUrl = hstring(url);
     ComPtr<IUriRuntimeClass> uri = default;
-    hr = uriFactory.get()->CreateUri(hUrl, uri.put());
+    hr = uriFactory->CreateUri(hUrl, uri.put());
     if (hr != 0 || !uri.valid()) { printf("CreateUri failed: 0x%08X\n", hr); return 2; }
 
     // HttpClient has a default constructor; activate it directly and QI for IHttpClient.
@@ -46,7 +46,7 @@ extern int main()
 
     // GetStringAsync(uri) -> StringOp; .get() borrows the raw IUriRuntimeClass* for the call.
     StringOp* op = nullptr;
-    hr = client.get()->GetStringAsync(uri.get(), &op);
+    hr = client->GetStringAsync(uri.get(), &op);
     if (hr != 0 || op == nullptr) { printf("GetStringAsync failed: 0x%08X\n", hr); return 5; }
 
     i32 status = awaitAsync(op);
