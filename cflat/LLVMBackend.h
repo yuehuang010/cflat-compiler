@@ -2845,6 +2845,9 @@ private:
     }
 
     static std::string GetCflatCacheDir();
+    // Records the running cflat.exe's full path to %USERPROFILE%\.cflat\compiler_path.txt
+    // so the VS Code extension can auto-detect the compiler without manual configuration.
+    static bool WriteCompilerPathToCache();
     static LinkerPaths DiscoverLinkerPaths(const std::string& arch, const std::string& runtimeDir, bool verbose = false);
     static std::optional<LinkerPaths> LoadLinkerPathsFromCache(const std::string& arch);
     static bool SaveLinkerPathsToCache(const std::string& arch, const LinkerPaths& paths);

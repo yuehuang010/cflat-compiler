@@ -303,7 +303,7 @@ int main(int argc, char* argv[])
     args.addOption("vcpkg-manifest", 0, "Explicit vcpkg.json path (skips upward walk from the source file)");
     args.addOption("vcpkg-triplet", 0, "vcpkg triplet (default derived from --platform: x64-windows / x86-windows)");
     args.addFlag("vcpkg-no-install", 0, "Do not run 'vcpkg install'; error out if a package-vcpkg port is not already installed");
-    args.addFlag("init", 0, "Populate %USERPROFILE%\\.cflat\\ cache with linker paths for x64 and x86, then exit");
+    args.addFlag("init", 0, "Populate %USERPROFILE%\\.cflat\\ cache with linker paths, core bitcode, and the compiler path, then exit");
     args.addFlag("print-supported-cpus", 0, "List target CPUs supported on Windows x86/x64, then exit");
     args.addFlag("print-host-cpu", 0, "Print the LLVM name of the host CPU (what --cpu native resolves to), then exit");
     args.addOption("cpu", 0, "Target CPU for code generation (name from --print-supported-cpus, or 'native'); sets ISA features + tuning", "");

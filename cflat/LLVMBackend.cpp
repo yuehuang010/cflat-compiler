@@ -2336,6 +2336,25 @@ std::string LLVMBackend::GetCflatCacheDir()
     return std::string(buf) + "\\.cflat";
 }
 
+bool LLVMBackend::WriteCompilerPathToCache()
+{
+    std::string cacheDir = GetCflatCacheDir();
+    if (cacheDir.empty()) return false;
+    if (std::error_code ec = llvm::sys::fs::create_directories(cacheDir); ec)
+        return false;
+
+    char* pgmptr = nullptr;
+    if (_get_pgmptr(&pgmptr) != 0 || pgmptr == nullptr || *pgmptr == '\0')
+        return false;
+
+    std::string outPath = cacheDir + "\\compiler_path.txt";
+    std::error_code ec;
+    llvm::raw_fd_ostream os(outPath, ec, llvm::sys::fs::OF_Text);
+    if (ec) return false;
+    os << pgmptr << "\n";
+    return true;
+}
+
 // Win32 registry read. Declared bare (no windows.h) to keep this TU free of <winnt.h>, matching
 // the RtlAddFunctionTable pattern above. Resolves against advapi32.lib (inherited default lib).
 extern "C" long __stdcall RegGetValueA(
@@ -2959,6 +2978,12 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
         return false;
     }
     std::cout << std::format("Cache directory: {}\n", cacheDir);
+
+    // Record this exe's path so the VS Code extension can auto-detect the compiler.
+    if (WriteCompilerPathToCache())
+        std::cout << "  Saved compiler_path.txt\n";
+    else
+        std::cout << "  Warning: could not write compiler_path.txt\n";
 
     for (const char* arch : {"x64", "x86"})
     {

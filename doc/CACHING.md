@@ -13,6 +13,7 @@ Run once after installing or updating cflat. Output:
 
 ```
 Cache directory: C:\Users\you\.cflat
+  Saved compiler_path.txt
 Discovering linker paths for x64...
   Saved linker_paths_x64.json
 Discovering linker paths for x86...
@@ -26,6 +27,13 @@ and fall back to a full parse if the cache is missing or out of date - no manual
 required.
 
 ## What gets cached
+
+### Compiler path
+
+The full path of the `cflat.exe` that ran `--init` is recorded in `compiler_path.txt`. The
+VS Code extension reads this file to auto-detect the compiler when `cflat.executablePath` is
+not set, so a fresh install only needs one `--init` to wire up the language server. An explicit
+`cflat.executablePath` setting always overrides the recorded path.
 
 ### Linker paths
 
@@ -42,6 +50,7 @@ Loading from cache is ~44% faster than parsing the libraries from source on ever
 
 ```
 %USERPROFILE%\.cflat\
+  compiler_path.txt
   linker_paths_x64.json
   linker_paths_x86.json
   runtime\

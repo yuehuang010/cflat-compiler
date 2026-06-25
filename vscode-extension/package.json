@@ -2,7 +2,7 @@
   "name": "cflat-language",
   "displayName": "cflat Language Support",
   "description": "Syntax highlighting, diagnostics, and completions for cflat C dialect",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "cflat",
   "engines": {
     "vscode": "^1.85.0"
@@ -138,7 +138,7 @@
         "cflat.executablePath": {
           "type": "string",
           "default": "",
-          "description": "Path to cflat.exe. Required - the language server will not start until this is set. Changes take effect immediately (no reload required)."
+          "description": "Path to cflat.exe. Leave empty to auto-detect the path recorded by 'cflat.exe --init' in ~/.cflat/compiler_path.txt. Set this to override auto-detection. Changes take effect immediately (no reload required)."
         },
         "cflat.enableDiagnostics": {
           "type": "boolean",

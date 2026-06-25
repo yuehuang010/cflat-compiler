@@ -13,10 +13,29 @@ let client: LanguageClient | undefined;
 let outputChannel: vscode.OutputChannel;
 let logFilePath: string;
 
+// Resolve the compiler exe: an explicit cflat.executablePath setting always wins; otherwise
+// fall back to the path that `cflat.exe --init` records in ~/.cflat/compiler_path.txt.
 function findCompilerExecutable(): string | undefined {
     const configured = vscode.workspace.getConfiguration('cflat').get<string>('executablePath');
     if (configured && configured.trim() !== '') {
         return configured.trim();
+    }
+    return readInitRecordedCompilerPath();
+}
+
+function readInitRecordedCompilerPath(): string | undefined {
+    const home = process.env.USERPROFILE ?? process.env.HOME;
+    if (!home) {
+        return undefined;
+    }
+    const recordPath = path.join(home, '.cflat', 'compiler_path.txt');
+    try {
+        const exePath = fs.readFileSync(recordPath, 'utf8').trim();
+        if (exePath !== '' && fs.existsSync(exePath)) {
+            return exePath;
+        }
+    } catch {
+        // No record file (or unreadable) - fall through to undefined.
     }
     return undefined;
 }
@@ -24,10 +43,11 @@ function findCompilerExecutable(): string | undefined {
 async function startClient(): Promise<void> {
     const exePath = findCompilerExecutable();
     if (!exePath) {
-        outputChannel.appendLine('ERROR: cflat.executablePath is not set.');
+        outputChannel.appendLine('ERROR: could not locate cflat.exe.');
         outputChannel.show(true);
         vscode.window.showWarningMessage(
-            'cflat: cflat.executablePath is not set. Set it in Settings to enable the language server.'
+            'cflat: could not locate cflat.exe. Run "cflat.exe --init" to record the compiler path, ' +
+            'or set cflat.executablePath in Settings to enable the language server.'
         );
         return;
     }
