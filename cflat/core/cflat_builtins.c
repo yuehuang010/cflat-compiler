@@ -182,6 +182,50 @@ __asm__(
 );
 #endif // _M_X64
 
+// ---- Buffer security check (/GS) - link-compatibility stubs (x64) ----
+//
+// CFlat compiles its own C (core/*.c) with /GS-, and CFlat-native code is memory-safe at the
+// language level, so neither references these. They exist purely for the unsafe-C island at the
+// FFI boundary: user `import "foo.c"` (compiled /GS by default) and prebuilt/vcpkg static libs
+// (already built /GS upstream, which CFlat cannot recompile). /GS is a function-LOCAL transform
+// - it does not touch any calling-convention/ABI boundary - so a single image-global definition
+// satisfies every /GS object regardless of who built it; there is nothing to version-match.
+//
+// None of these are exported by any OS DLL (kernel32/ntdll/ucrtbase), so they are defined
+// directly - no /alternatename needed (unlike __chkstk). The MSVC /GS scheme: the prologue does
+// `cookie ^ rsp` and stores it; the epilogue undoes the xor and calls __security_check_cookie
+// with the cookie in RCX, AFTER the return value is already in RAX. So the check MUST preserve
+// RAX (and is therefore asm, not C, which would clobber it as the return register).
+//
+// "GS off for now": the cookie is the standard x64 constant and is NOT randomized at startup
+// (no __security_init_cookie wiring), so this is link/behavior compatibility, not full hardening
+// - a fixed cookie still fast-fails on a contiguous overwrite but is predictable. Turning on real
+// hardening = randomize __security_cookie early in cflat_start. x64 only (x86 keeps the stock CRT).
+#if defined(_M_X64)
+// Writable (not const): a future __security_init_cookie would overwrite it at startup.
+unsigned long long __security_cookie = 0x00002B992DDFA232ULL;
+
+__asm__(
+    ".intel_syntax noprefix\n"
+    // void __security_check_cookie(uintptr_t cookieInRcx): compare against the global, fast-fail
+    // on mismatch. Touches only RCX + flags, so RAX (the caller's return value) survives.
+    ".globl __security_check_cookie\n"
+    "__security_check_cookie:\n"
+    "    cmp  rcx, qword ptr [rip + __security_cookie]\n"
+    "    jne  1f\n"
+    "    ret\n"
+    "1:\n"
+    "    mov  ecx, 2\n"            // FAST_FAIL_STACK_COOKIE_CHECK_FAILURE
+    "    int  0x29\n"             // __fastfail - does not return
+    // __report_rangecheckfailure: emitted by some /GS code paths for bounds violations.
+    ".globl __report_rangecheckfailure\n"
+    "__report_rangecheckfailure:\n"
+    "    mov  ecx, 8\n"            // FAST_FAIL_RANGE_CHECK_FAILURE
+    "    int  0x29\n"
+    ".att_syntax prefix\n"
+);
+#endif // _M_X64
+
 // ---- Exception handling (x64 language-specific handler) ----
 //
 // x64 only: x86 uses the stack-based FS:[0] / _except_handler4 model, not this table-based one,
