@@ -5123,6 +5123,11 @@ private:
             // definition only when nothing else supplies it; /alternatename is a no-op when
             // _fltused already resolves (synthetic path), avoiding a duplicate symbol.
             linkArgStrs.push_back("/alternatename:_fltused=__cflat_fltused");
+            // __chkstk (the MSVC stack-probe stub, emitted for >4KB frames) lives in the static
+            // CRT, which the freestanding link drops. kernel32.dll exports it (forwarded to ntdll),
+            // so the synthetic-lib path resolves it and this redirect is a no-op; on the SDK
+            // fallback (whose kernel32.lib omits __chkstk) it supplies our private definition.
+            linkArgStrs.push_back("/alternatename:__chkstk=__cflat_chkstk");
         }
         linkArgStrs.push_back("kernel32.lib");
         linkArgStrs.push_back("ws2_32.lib");

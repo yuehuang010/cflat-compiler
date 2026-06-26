@@ -132,6 +132,56 @@ unsigned short* wcsstr(const unsigned short* hay, const unsigned short* needle)
     return 0;
 }
 
+// ---- Stack probe (x64) ----
+//
+// The MSVC code generator emits a call to __chkstk in the prologue of any function whose
+// stack frame exceeds one page (4 KB) - large local arrays, big brace-init structs, the
+// compiler's own __strconcat, etc. __chkstk touches each guard page in order from the
+// current stack limit down to the new frame base, so the OS commits the pages one at a
+// time (skipping a guard page would fault). It is normally supplied by the VC CRT
+// (msvcrt.lib / libcmt.lib), which the freestanding link drops - so we provide it here.
+//
+// Written as module-level asm because of __chkstk's non-standard contract: the frame size
+// arrives in RAX (not a normal argument), RAX/RSP must be returned unchanged, and only
+// R10/R11 may be clobbered. This mirrors the documented Microsoft x64 algorithm (chkstk.asm).
+//
+// Defined under a private name and wired in only as a fallback via
+// /alternatename:__chkstk=__cflat_chkstk (set on the freestanding link line). kernel32.dll
+// exports __chkstk (forwarded to ntdll), so the --init synthetic-lib path already resolves it
+// and the alternatename is a no-op there - avoiding a duplicate symbol. The SDK-fallback path
+// (no --init) uses Microsoft's SDK kernel32.lib, which omits __chkstk (it lives in the static
+// CRT the freestanding link drops), so there our fallback supplies it. Same pattern as _fltused.
+// x64 only: x86 keeps the stock CRT (keepVcRuntime), which already has it.
+#if defined(_M_X64)
+__asm__(
+    ".intel_syntax noprefix\n"
+    ".globl __cflat_chkstk\n"
+    "__cflat_chkstk:\n"
+    "    sub  rsp, 16\n"            // scratch to preserve r10/r11
+    "    mov  [rsp], r10\n"
+    "    mov  [rsp+8], r11\n"
+    "    xor  r11, r11\n"
+    "    lea  r10, [rsp+24]\n"      // caller's pre-call rsp (16 scratch + 8 return addr)
+    "    sub  r10, rax\n"           // r10 = lowest address the new frame will reach
+    "    cmovb r10, r11\n"          // underflow -> clamp target to 0
+    "    mov  r11, gs:[16]\n"       // r11 = TEB.StackLimit (current committed low)
+    "    cmp  r10, r11\n"
+    "    jae  1f\n"                 // target already committed: nothing to probe
+    "    and  r10w, 0xF000\n"       // round target down to a page boundary
+    "2:\n"
+    "    lea  r11, [r11-0x1000]\n"  // step down one page
+    "    mov  byte ptr [r11], 0\n"  // touch it (commits the page below the guard)
+    "    cmp  r10, r11\n"
+    "    jne  2b\n"
+    "1:\n"
+    "    mov  r10, [rsp]\n"
+    "    mov  r11, [rsp+8]\n"
+    "    add  rsp, 16\n"
+    "    ret\n"
+    ".att_syntax prefix\n"
+);
+#endif // _M_X64
+
 // ---- Exception handling (x64 language-specific handler) ----
 //
 // x64 only: x86 uses the stack-based FS:[0] / _except_handler4 model, not this table-based one,
