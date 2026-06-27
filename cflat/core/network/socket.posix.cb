@@ -1,0 +1,95 @@
+// BSD socket bindings - imported only on non-Windows by socket.cb.
+//
+// Mirrors socket.windows.cb: it exposes the SAME function names/signatures
+// (a void* "handle" carrying the fd, _wsa_* wrappers for the calls whose names
+// collide with Socket methods) so socket.cb's method bodies stay platform-uniform.
+// The raw libc entry points live in the os.posix namespace; the wrappers below
+// adapt POSIX's int fds and ssize_t returns to the void*/i32 handle model.
+
+// Pointer-sized integer for fields that are size_t in the C API.
+if const (__PLATFORM__ == 64) {
+    using _net_size = i64;
+} else {
+    using _net_size = i32;
+}
+
+// Unused on POSIX (no WSAStartup); kept so socket.cb's type references resolve.
+struct _WsaData {
+    i8 _data[408] = default;
+};
+
+// sockaddr_in - IPv4 socket address (16 bytes; identical layout to Winsock).
+struct _SockAddrIn {
+    i16 sin_family = 0;
+    u16 sin_port   = 0;
+    u32 sin_addr   = 0;
+    i8  sin_zero[8] = default;
+};
+
+// addrinfo - getaddrinfo result node. NOTE the glibc field order DIFFERS from the
+// Win32 ADDRINFOA: on Linux ai_addr comes BEFORE ai_canonname (Windows swaps them).
+// ai_addrlen is socklen_t (4B) + 4B padding on x86-64, so an i64 spans the same 8
+// bytes and keeps ai_addr correctly at offset 24.
+struct _AddrInfo {
+    i32        ai_flags     = 0;
+    i32        ai_family    = 0;
+    i32        ai_socktype  = 0;
+    i32        ai_protocol  = 0;
+    _net_size  ai_addrlen   = 0;
+    i8*        ai_addr      = nullptr;  // sockaddr* - cast to _SockAddrIn* for IPv4
+    i8*        ai_canonname = nullptr;
+    _AddrInfo* ai_next      = nullptr;
+};
+
+// ── Handle-model wrappers (fd carried in the low bits of a void*) ─────────────
+
+// Create a socket; returns INVALID_SOCKET ((void*)-1) on failure to match Winsock.
+void* socket(i32 af, i32 type, i32 proto) {
+    i32 fd = os.posix.socket(af, type, proto);
+    if (fd < 0) return (void*)(i64)-1;
+    return (void*)(i64)fd;
+}
+i32  closesocket(void* sock) { return os.posix.close((i32)(i64)sock); }
+u16  htons(u16 h)            { return os.posix.htons(h); }
+u32  inet_addr(const char* cp) { return os.posix.inet_addr(cp); }
+i32  setsockopt(void* sock, i32 level, i32 optname, const char* val, i32 len) {
+    return os.posix.setsockopt((i32)(i64)sock, level, optname, val, len);
+}
+i32  getaddrinfo(const char* host, const char* svc, _AddrInfo* hints, _AddrInfo** res) {
+    return os.posix.getaddrinfo(host, svc, (void*)hints, (void**)res);
+}
+void freeaddrinfo(_AddrInfo* ai) { os.posix.freeaddrinfo((void*)ai); }
+
+// _wsa_* wrappers: names that also exist as Socket methods, so socket.cb calls
+// them unqualified without method-resolution prepending 'this'.
+i32 _wsa_bind(void* sock, _SockAddrIn* addr, i32 len) {
+    return os.posix.bind((i32)(i64)sock, (void*)addr, len);
+}
+i32 _wsa_listen(void* sock, i32 backlog) {
+    return os.posix.listen((i32)(i64)sock, backlog);
+}
+void* _wsa_accept(void* sock, _SockAddrIn* addr, i32* len) {
+    i32 fd = os.posix.accept((i32)(i64)sock, (void*)addr, len);
+    if (fd < 0) return (void*)(i64)-1;
+    return (void*)(i64)fd;
+}
+i32 _wsa_connect(void* sock, _SockAddrIn* addr, i32 len) {
+    return os.posix.connect((i32)(i64)sock, (void*)addr, len);
+}
+i32 _wsa_send(void* sock, const char* buf, i32 len, i32 flags) {
+    return (i32)os.posix.send((i32)(i64)sock, buf, (win_size)len, flags);
+}
+i32 _wsa_recv(void* sock, i8* buf, i32 len, i32 flags) {
+    return (i32)os.posix.recv((i32)(i64)sock, buf, (win_size)len, flags);
+}
+
+// Non-blocking toggle. POSIX has no ioctlsocket(FIONBIO); use fcntl(O_NONBLOCK).
+// cmd is ignored; argp[0] != 0 enables non-blocking (matches the Winsock call).
+i32 _wsa_ioctlsocket(void* sock, i32 cmd, u32* argp) {
+    i32 fd    = (i32)(i64)sock;
+    i32 flags = os.posix.fcntl(fd, os.posix.F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (argp[0] != (u32)0) flags = flags | os.posix.O_NONBLOCK;
+    else                   flags = flags & ~os.posix.O_NONBLOCK;
+    return os.posix.fcntl(fd, os.posix.F_SETFL, flags);
+}

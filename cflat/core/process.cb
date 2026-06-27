@@ -112,17 +112,56 @@ struct __ProcessWriterCtx {
     Lambda<char*()>  provider = nullptr;
 };
 
-// Reader thread: loops ReadFile on the pipe, calls onStdout(buf, len).
+// Close a pipe end. Windows: a kernel HANDLE; POSIX: an int fd carried in the
+// low bits of the void*.
+void _proc_close(void* h) {
+    if (h == nullptr) return;
+    if const (__WINDOWS__) { os.windows.CloseHandle(h); }
+    else { os.posix.close((i32)(i64)h); }
+}
+
+// Read up to 4096 bytes from a pipe end into buf; returns the count, or <=0 at EOF.
+int _proc_read(void* pipe, i8* buf) {
+    if const (__WINDOWS__) {
+        i32 nRead = 0;
+        if (ReadFile(pipe, buf, 4096, &nRead, nullptr) == 0) return 0;
+        return (int)nRead;
+    } else {
+        win_size n = os.posix.read((i32)(i64)pipe, buf, (win_size)4096);
+        return (int)n;
+    }
+}
+
+// Write len bytes to a pipe end.
+void _proc_write(void* pipe, char* buf, i32 len) {
+    if const (__WINDOWS__) {
+        i32 written = 0;
+        os.windows.WriteFile(pipe, buf, len, &written, nullptr);
+    } else {
+        os.posix.write((i32)(i64)pipe, (const void*)buf, (win_size)len);
+    }
+}
+
+// Heap-copy n bytes of a string as a NUL-terminated C string (for POSIX argv).
+char* _proc_dupcstr(i8* src, int n) {
+    char* b = (char*)malloc((i64)(n + 1));
+    memcpy(b, src, n);
+    b[n] = 0;
+    return b;
+}
+
+// Reader thread: loops reading the pipe, calls onStdout(buf, len).
 // ctx->callback is always set - we only start this thread when onStdout != nullptr.
 int __process_reader_fn(move void* rawCtx) {
     __ProcessReaderCtx* ctx = (__ProcessReaderCtx*)rawCtx;
     i8* buf = (i8*)malloc(4096);
-    i32 nRead = 0;
-    while (ReadFile(ctx->pipe, buf, 4096, &nRead, nullptr) != 0 && nRead > 0) {
-        ctx->callback(buf, (int)nRead);
+    while (true) {
+        int nRead = _proc_read(ctx->pipe, buf);
+        if (nRead <= 0) break;
+        ctx->callback(buf, nRead);
     }
     free((void*)buf);
-    os.windows.CloseHandle(ctx->pipe);
+    _proc_close(ctx->pipe);
     delete ctx;   // typed delete runs the dtor, freeing the Lambda callback/provider env
     return 0;
 }
@@ -140,12 +179,11 @@ int __process_writer_fn(move void* rawCtx) {
     char* line = provide();
     while (line != nullptr) {
         i32 len = (i32)strlen(line);
-        i32 written = 0;
-        os.windows.WriteFile(pipe, line, len, &written, nullptr);
+        _proc_write(pipe, line, len);
         free((void*)line);
         line = provide();
     }
-    os.windows.CloseHandle(pipe);
+    _proc_close(pipe);
     return 0;
 }
 
@@ -214,42 +252,92 @@ class process : IProcess {
         bool _want_stdin  = !(onStdin  == nullptr);
         bool _want_stdout = !(onStdout == nullptr);
 
-        // Create pipes.  Mark the parent-side handles as non-inheritable so the
-        // child does not accidentally inherit them.
-        _SecAttrs sa;
+        if const (__WINDOWS__) {
+            // Create pipes.  Mark the parent-side handles as non-inheritable so the
+            // child does not accidentally inherit them.
+            _SecAttrs sa;
 
-        CreatePipe(&_stdout_read, &_stdout_write, &sa, 0);
-        SetHandleInformation(_stdout_read, 1, 0);  // HANDLE_FLAG_INHERIT = 1
+            CreatePipe(&_stdout_read, &_stdout_write, &sa, 0);
+            SetHandleInformation(_stdout_read, 1, 0);  // HANDLE_FLAG_INHERIT = 1
 
-        if (_want_stdin) {
-            CreatePipe(&_stdin_read, &_stdin_write, &sa, 0);
-            SetHandleInformation(_stdin_write, 1, 0);
-        }
+            if (_want_stdin) {
+                CreatePipe(&_stdin_read, &_stdin_write, &sa, 0);
+                SetHandleInformation(_stdin_write, 1, 0);
+            }
 
-        // Build STARTUPINFOA.
-        _StartupInfoA si;
-        si.dwFlags     = 0x100;  // STARTF_USESTDHANDLES
-        si.hStdOutput  = _stdout_write;
-        si.hStdError   = _stdout_write;
-        si.hStdInput   = _want_stdin ? _stdin_read : nullptr;
+            // Build STARTUPINFOA.
+            _StartupInfoA si;
+            si.dwFlags     = 0x100;  // STARTF_USESTDHANDLES
+            si.hStdOutput  = _stdout_write;
+            si.hStdError   = _stdout_write;
+            si.hStdInput   = _want_stdin ? _stdin_read : nullptr;
 
-        _ProcessInfo pi;
+            _ProcessInfo pi;
 
-        char* _cmdline = __process_build_cmdline(exe, pargs);
+            char* _cmdline = __process_build_cmdline(exe, pargs);
 
-        CreateProcessA(nullptr, _cmdline, nullptr, nullptr, 1, 0,
-                       nullptr, nullptr, &si, &pi);
-        free((void*)_cmdline);
+            CreateProcessA(nullptr, _cmdline, nullptr, nullptr, 1, 0,
+                           nullptr, nullptr, &si, &pi);
+            free((void*)_cmdline);
 
-        _proc_handle   = pi.hProcess;
-        _thread_handle = pi.hThread;
+            _proc_handle   = pi.hProcess;
+            _thread_handle = pi.hThread;
 
-        // Close the child-side pipe ends - the child holds them now.
-        os.windows.CloseHandle(_stdout_write);
-        _stdout_write = nullptr;
-        if (_want_stdin) {
-            os.windows.CloseHandle(_stdin_read);
-            _stdin_read = nullptr;
+            // Close the child-side pipe ends - the child holds them now.
+            os.windows.CloseHandle(_stdout_write);
+            _stdout_write = nullptr;
+            if (_want_stdin) {
+                os.windows.CloseHandle(_stdin_read);
+                _stdin_read = nullptr;
+            }
+        } else {
+            // POSIX: pipe() + fork() + execvp(). Child wires its stdout/stderr (and
+            // optionally stdin) to the pipe ends, then execs; the parent keeps the
+            // opposite ends and reaps the pid in WaitForExit.
+            i32[2] outPipe = default;
+            os.posix.pipe(&outPipe[0]);
+            i32[2] inPipe = default;
+            if (_want_stdin) os.posix.pipe(&inPipe[0]);
+
+            // Build a NULL-terminated argv of malloc'd C strings: [exe, args..., 0].
+            int argc = pargs->count();
+            const char** argv = (const char**)malloc((i64)((argc + 2) * 8));
+            argv[0] = _proc_dupcstr(exe.data(), exe.length());
+            int ai = 0;
+            while (ai < argc) {
+                string a = pargs->get(ai);
+                argv[ai + 1] = _proc_dupcstr(a.data(), a.length());
+                ai++;
+            }
+            argv[argc + 1] = nullptr;
+
+            i32 pid = os.posix.fork();
+            if (pid == 0) {
+                // Child: redirect std handles to the pipe ends, close all pipe fds,
+                // then exec. Only async-signal-safe calls between fork and exec.
+                os.posix.dup2(outPipe[1], 1);
+                os.posix.dup2(outPipe[1], 2);
+                if (_want_stdin) os.posix.dup2(inPipe[0], 0);
+                os.posix.close(outPipe[0]);
+                os.posix.close(outPipe[1]);
+                if (_want_stdin) { os.posix.close(inPipe[0]); os.posix.close(inPipe[1]); }
+                os.posix.execvp(argv[0], argv);
+                os.posix._exit(127);   // exec failed
+            }
+
+            // Parent: free the argv copies (the child has its own via fork), keep
+            // the reading/writing ends, close the child-side ends.
+            int fi = 0;
+            while (fi <= argc) { free((void*)argv[fi]); fi++; }
+            free((void*)argv);
+
+            _proc_handle = (void*)(i64)pid;
+            _stdout_read = (void*)(i64)outPipe[0];
+            os.posix.close(outPipe[1]);
+            if (_want_stdin) {
+                _stdin_write = (void*)(i64)inPipe[1];
+                os.posix.close(inPipe[0]);
+            }
         }
 
         // Start reader thread if onStdout was wired.
@@ -282,30 +370,69 @@ class process : IProcess {
     // IProcess interface - return the exit code field.
     int exitCode() { return exitCode; }
 
+    // Join the reader/writer I/O threads (shared by every wait path).
+    void _joinIoThreads() {
+        if (_has_reader) { _reader.join(); _has_reader = false; }
+        if (_has_writer) { _writer.join(); _has_writer = false; }
+    }
+
+    // POSIX: reap the child via waitpid, writing exitCode. block=true waits;
+    // otherwise WNOHANG returns immediately. Returns true once reaped.
+    bool _posixReap(bool block) {
+        if const (__WINDOWS__) { return false; }
+        else {
+            i32 status = 0;
+            i32 opts = block ? 0 : os.posix.WNOHANG;
+            i32 r = os.posix.waitpid((i32)(i64)_proc_handle, &status, opts);
+            if (r <= 0) return false;   // 0 == still running (WNOHANG), <0 == error
+            exitCode = (int)os.posix.wexitstatus(status);
+            return true;
+        }
+    }
+
     // Block until the process exits.  Joins I/O threads and captures exitCode.
     void WaitForExit() {
         if (_proc_handle == nullptr) return;
-        os.windows.WaitForSingleObject(_proc_handle, -1);
-        if (_has_reader) { _reader.join(); _has_reader = false; }
-        if (_has_writer) { _writer.join(); _has_writer = false; }
-        i32 code = 0;
-        GetExitCodeProcess(_proc_handle, &code);
-        exitCode = (int)code;
+        if const (__WINDOWS__) {
+            os.windows.WaitForSingleObject(_proc_handle, -1);
+            _joinIoThreads();
+            i32 code = 0;
+            GetExitCodeProcess(_proc_handle, &code);
+            exitCode = (int)code;
+        } else {
+            _posixReap(true);
+            _joinIoThreads();
+        }
         _closeHandles();
     }
 
     // Wait up to ms milliseconds.  Returns true if the process exited.
     bool WaitForExit(int ms) {
         if (_proc_handle == nullptr) return true;
-        i32 result = os.windows.WaitForSingleObject(_proc_handle, (i32)ms);
-        if (result != 0) return false;
-        if (_has_reader) { _reader.join(); _has_reader = false; }
-        if (_has_writer) { _writer.join(); _has_writer = false; }
-        i32 code = 0;
-        GetExitCodeProcess(_proc_handle, &code);
-        exitCode = (int)code;
-        _closeHandles();
-        return true;
+        if const (__WINDOWS__) {
+            i32 result = os.windows.WaitForSingleObject(_proc_handle, (i32)ms);
+            if (result != 0) return false;
+            _joinIoThreads();
+            i32 code = 0;
+            GetExitCodeProcess(_proc_handle, &code);
+            exitCode = (int)code;
+            _closeHandles();
+            return true;
+        } else {
+            // Poll waitpid(WNOHANG) on a 10 ms tick until the deadline.
+            int waited = 0;
+            while (true) {
+                if (_posixReap(false)) {
+                    _joinIoThreads();
+                    _closeHandles();
+                    return true;
+                }
+                if (waited >= ms) return false;
+                os.posix.sleep_ms(10);
+                waited = waited + 10;
+            }
+            return false;
+        }
     }
 
     // Poll until the process exits or the token is cancelled.
@@ -313,15 +440,23 @@ class process : IProcess {
     bool WaitForExit(stop_token tok) {
         if (_proc_handle == nullptr) return true;
         while (!tok.stop_requested()) {
-            i32 result = os.windows.WaitForSingleObject(_proc_handle, 50);
-            if (result == 0) {
-                if (_has_reader) { _reader.join(); _has_reader = false; }
-                if (_has_writer) { _writer.join(); _has_writer = false; }
-                i32 code = 0;
-                GetExitCodeProcess(_proc_handle, &code);
-                exitCode = (int)code;
-                _closeHandles();
-                return true;
+            if const (__WINDOWS__) {
+                i32 result = os.windows.WaitForSingleObject(_proc_handle, 50);
+                if (result == 0) {
+                    _joinIoThreads();
+                    i32 code = 0;
+                    GetExitCodeProcess(_proc_handle, &code);
+                    exitCode = (int)code;
+                    _closeHandles();
+                    return true;
+                }
+            } else {
+                if (_posixReap(false)) {
+                    _joinIoThreads();
+                    _closeHandles();
+                    return true;
+                }
+                os.posix.sleep_ms(50);
             }
         }
         return false;
@@ -329,21 +464,33 @@ class process : IProcess {
 
     // Forcibly terminate the child.  I/O threads are also terminated.
     void Kill() {
-        if (_proc_handle != nullptr)
-            TerminateProcess(_proc_handle, 1);
+        if (_proc_handle != nullptr) {
+            if const (__WINDOWS__) { TerminateProcess(_proc_handle, 1); }
+            else { os.posix.kill((i32)(i64)_proc_handle, os.posix.SIGKILL); }
+        }
         if (_has_reader) { _reader.terminate(); _has_reader = false; }
         if (_has_writer) { _writer.terminate(); _has_writer = false; }
         _closeHandles();
     }
 
-    // Close any remaining Win32 handles.  Safe to call multiple times.
+    // Close any remaining OS handles/descriptors.  Safe to call multiple times.
     void _closeHandles() {
-        if (_proc_handle   != nullptr) { os.windows.CloseHandle(_proc_handle);   _proc_handle   = nullptr; }
-        if (_thread_handle != nullptr) { os.windows.CloseHandle(_thread_handle); _thread_handle = nullptr; }
-        if (_stdout_read   != nullptr) { os.windows.CloseHandle(_stdout_read);   _stdout_read   = nullptr; }
-        if (_stdout_write  != nullptr) { os.windows.CloseHandle(_stdout_write);  _stdout_write  = nullptr; }
-        if (_stdin_read    != nullptr) { os.windows.CloseHandle(_stdin_read);    _stdin_read    = nullptr; }
-        if (_stdin_write   != nullptr) { os.windows.CloseHandle(_stdin_write);   _stdin_write   = nullptr; }
+        if const (__WINDOWS__) {
+            if (_proc_handle   != nullptr) { os.windows.CloseHandle(_proc_handle);   _proc_handle   = nullptr; }
+            if (_thread_handle != nullptr) { os.windows.CloseHandle(_thread_handle); _thread_handle = nullptr; }
+            if (_stdout_read   != nullptr) { os.windows.CloseHandle(_stdout_read);   _stdout_read   = nullptr; }
+            if (_stdout_write  != nullptr) { os.windows.CloseHandle(_stdout_write);  _stdout_write  = nullptr; }
+            if (_stdin_read    != nullptr) { os.windows.CloseHandle(_stdin_read);    _stdin_read    = nullptr; }
+            if (_stdin_write   != nullptr) { os.windows.CloseHandle(_stdin_write);   _stdin_write   = nullptr; }
+        } else {
+            // _proc_handle holds the pid (NOT a descriptor) - do not close it.
+            if (_stdout_read  != nullptr) { os.posix.close((i32)(i64)_stdout_read);  _stdout_read  = nullptr; }
+            if (_stdout_write != nullptr) { os.posix.close((i32)(i64)_stdout_write); _stdout_write = nullptr; }
+            if (_stdin_read   != nullptr) { os.posix.close((i32)(i64)_stdin_read);   _stdin_read   = nullptr; }
+            if (_stdin_write  != nullptr) { os.posix.close((i32)(i64)_stdin_write);  _stdin_write  = nullptr; }
+            _proc_handle   = nullptr;
+            _thread_handle = nullptr;
+        }
     }
 
     // Destructor: terminate any I/O threads and close remaining handles.

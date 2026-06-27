@@ -33,8 +33,8 @@ struct stream {
     int   _writePos = 0;
 
     mutex _mu;
-    void* _cvFull  = nullptr;  // CONDITION_VARIABLE: consumer waits here for a full buffer
-    void* _cvEmpty = nullptr;  // CONDITION_VARIABLE: producer waits here for an empty buffer
+    void* _cvFull  = nullptr;  // condvar slot: consumer waits here for a full buffer (see mutex.cb cv_*)
+    void* _cvEmpty = nullptr;  // condvar slot: producer waits here for an empty buffer
 
     char* _pendingFull = nullptr;  // full buffer handed off to consumer (nullptr = none ready)
     int   _pendingLen  = 0;        // byte count of _pendingFull (set alongside _pendingFull)
@@ -51,10 +51,8 @@ struct stream {
         _bufB = (char*)malloc((i64)bufferSize);
         _writeBuf = _bufA;
         _writePos = 0;
-        _cvFull  = malloc((i64)8);  // sizeof(CONDITION_VARIABLE) == ptr-sized
-        _cvEmpty = malloc((i64)8);
-        os.windows.InitializeConditionVariable(_cvFull);
-        os.windows.InitializeConditionVariable(_cvEmpty);
+        cv_init(&_cvFull);
+        cv_init(&_cvEmpty);
         _mu.acquire();
         _emptyPool = _bufB;    // seed: bufB ready for first swap
         _mu.release();
@@ -66,12 +64,12 @@ struct stream {
         _writeBuf[_writePos] = '\0';
 
         _mu.acquire();
-        while (_pendingFull != nullptr) { _mu.sleep_cv(_cvFull); }
+        while (_pendingFull != nullptr) { _mu.sleep_cv(&_cvFull); }
         _pendingFull = _writeBuf;
         _pendingLen  = _writePos;
-        os.windows.WakeConditionVariable(_cvFull);
+        cv_wake_one(&_cvFull);
 
-        while (_emptyPool == nullptr) { _mu.sleep_cv(_cvEmpty); }
+        while (_emptyPool == nullptr) { _mu.sleep_cv(&_cvEmpty); }
         _writeBuf  = _emptyPool;
         _emptyPool = nullptr;
         _writePos  = 0;
@@ -87,10 +85,10 @@ struct stream {
         if (len >= bufferSize) {
             _flushWrite();
             _mu.acquire();
-            while (_pendingFull != nullptr) { _mu.sleep_cv(_cvFull); }
+            while (_pendingFull != nullptr) { _mu.sleep_cv(&_cvFull); }
             _pendingFull = data;
             _pendingLen  = len;
-            os.windows.WakeConditionVariable(_cvFull);
+            cv_wake_one(&_cvFull);
             _mu.release();
             return;
         }
@@ -120,10 +118,10 @@ struct stream {
             memcpy(buf, data, (i64)len);
             buf[len] = '\0';
             _mu.acquire();
-            while (_pendingFull != nullptr) { _mu.sleep_cv(_cvFull); }
+            while (_pendingFull != nullptr) { _mu.sleep_cv(&_cvFull); }
             _pendingFull = buf;
             _pendingLen  = len;
-            os.windows.WakeConditionVariable(_cvFull);
+            cv_wake_one(&_cvFull);
             _mu.release();
             return;
         }
@@ -144,11 +142,11 @@ struct stream {
     // Returns nullptr on EOF (after close() has been called and all data consumed).
     char* read() {
         _mu.acquire();
-        while (_pendingFull == nullptr && !_eof) { _mu.sleep_cv(_cvFull); }
+        while (_pendingFull == nullptr && !_eof) { _mu.sleep_cv(&_cvFull); }
         if (_pendingFull == nullptr) { _mu.release(); return nullptr; }
         char* buf    = _pendingFull;
         _pendingFull = nullptr;
-        os.windows.WakeConditionVariable(_cvFull);   // unblock producer waiting for the slot to clear
+        cv_wake_one(&_cvFull);   // unblock producer waiting for the slot to clear
         _mu.release();
         return buf;
     }
@@ -157,12 +155,12 @@ struct stream {
     // length-bounded loop instead of scanning for '\0', enabling LLVM vectorization.
     char* read_buf(int* out_len) {
         _mu.acquire();
-        while (_pendingFull == nullptr && !_eof) { _mu.sleep_cv(_cvFull); }
+        while (_pendingFull == nullptr && !_eof) { _mu.sleep_cv(&_cvFull); }
         if (_pendingFull == nullptr) { _mu.release(); out_len[0] = 0; return nullptr; }
         char* buf    = _pendingFull;
         out_len[0]   = _pendingLen;
         _pendingFull = nullptr;
-        os.windows.WakeConditionVariable(_cvFull);
+        cv_wake_one(&_cvFull);
         _mu.release();
         return buf;
     }
@@ -173,7 +171,7 @@ struct stream {
         if (buf == _bufA || buf == _bufB) {
             _mu.acquire();
             _emptyPool = buf;
-            os.windows.WakeConditionVariable(_cvEmpty);
+            cv_wake_one(&_cvEmpty);
             _mu.release();
         } else {
             free((void*)buf);
@@ -190,17 +188,17 @@ struct stream {
         if (_writePos > 0) {
             _writeBuf[_writePos] = '\0';
             _mu.acquire();
-            while (_pendingFull != nullptr) { _mu.sleep_cv(_cvFull); }
+            while (_pendingFull != nullptr) { _mu.sleep_cv(&_cvFull); }
             _pendingFull = _writeBuf;
             _pendingLen  = _writePos;
             _writePos    = 0;
-            os.windows.WakeConditionVariable(_cvFull);
+            cv_wake_one(&_cvFull);
             _mu.release();
         }
         _mu.acquire();
-        while (_pendingFull != nullptr) { _mu.sleep_cv(_cvFull); }
+        while (_pendingFull != nullptr) { _mu.sleep_cv(&_cvFull); }
         _eof = true;
-        os.windows.WakeConditionVariable(_cvFull);
+        cv_wake_one(&_cvFull);
         _mu.release();
     }
 
@@ -208,8 +206,8 @@ struct stream {
     ~stream() {
         if (_bufA    != nullptr) { free((void*)_bufA);   _bufA    = nullptr; }
         if (_bufB    != nullptr) { free((void*)_bufB);   _bufB    = nullptr; }
-        if (_cvFull  != nullptr) { free(_cvFull);         _cvFull  = nullptr; }
-        if (_cvEmpty != nullptr) { free(_cvEmpty);        _cvEmpty = nullptr; }
+        cv_destroy(&_cvFull);
+        cv_destroy(&_cvEmpty);
         _mu.destroy();
     }
 };

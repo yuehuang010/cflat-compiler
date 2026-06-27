@@ -56,6 +56,49 @@ Full msbuild path (if not on PATH):
 ./buildAndRun.bat test_foo.cb  # same but runs test_foo.cb instead
 ```
 
+### Cross-platform builds (CMake: Windows, Linux/WSL, macOS)
+
+The project is migrating from MSBuild (`.vcxproj`/`.slnx`) to **CMake + vcpkg**. Both build paths currently work on Windows; the CMake path is the only one that works on Linux/WSL and macOS. Presets live in `CMakePresets.json`. See `internal/plan/cross-platform-macos.md` for the staged port status (Windows + Linux/WSL host build and Linux ELF target are working; macOS is prepared but unverified).
+
+> The CMake build writes the Windows `cflat.exe` to the **same** `x64/<Config>/` layout as MSBuild, so `test.bat` / `test_lsp.bat` work unchanged after a CMake build.
+
+**Windows (Ninja + MSVC).** Use the helper - it runs `vcvars64`, sets `VCPKG_ROOT`, and reuses the existing 26 GB `vcpkg_installed` (no rebuild):
+
+```bash
+./cmake_build.bat release    # builds win-x64-release -> x64/Release/cflat.exe
+./cmake_build.bat debug      # builds win-x64-debug   -> x64/Debug/cflat.exe
+```
+
+Equivalent manual invocation (from a dev shell with `VCPKG_ROOT` set and `vcvars64` sourced):
+
+```bash
+cmake --preset win-x64-release && cmake --build --preset win-x64-release
+```
+
+**Linux / WSL (Ninja + apt clang/llvm-18).** Source of truth stays on `/mnt/c`; build artifacts go to the native fs (`~/cflat-build`). The Linux preset is standalone (no vcpkg toolchain) and points at apt's `/usr/lib/llvm-18` + the antlr 4.10 jar at `/opt/antlr`. One-time toolchain (Ubuntu-24.04): `apt install clang llvm-18-dev cmake ninja-build default-jre nlohmann-json3-dev libsimdjson-dev libantlr4-runtime-dev uuid-dev` plus the antlr 4.10.1 jar in `/opt/antlr`.
+
+From inside WSL:
+
+```bash
+cd /mnt/c/source/cflat-compiler
+cmake --preset linux-x64-release && cmake --build --preset linux-x64-release
+# binary -> ~/cflat-build/linux-x64-release/cflat
+```
+
+Driving the Linux build from the Windows host:
+
+```bash
+wsl.exe -e bash -lc "cd /mnt/c/source/cflat-compiler && cmake --preset linux-x64-release && cmake --build --preset linux-x64-release"
+```
+
+> antlr versions **must** match the runtime: Linux pins generator 4.10.1 against libantlr4-runtime 4.10 (Windows uses 4.13.2). Don't cross them.
+
+**macOS arm64 (PREPARE only - unverified, no Mac yet).** Presets `macos-arm64-release` / `macos-arm64-debug` are wired (vcpkg `arm64-osx` triplet) but Stage 4 is not validated. Note: vcpkg's installed LLVM lacks the AArch64 target, so native arm64 *code emission* still needs an LLVM rebuild or Homebrew LLVM - decision pending.
+
+```bash
+cmake --preset macos-arm64-release && cmake --build --preset macos-arm64-release
+```
+
 ### Git worktrees (share the 26 GB vcpkg_installed)
 
 `vcpkg_installed` is ~26 GB / ~50 min to build. Use these repo-root scripts so worktrees share the main checkout's copy via a junction instead of rebuilding:
@@ -147,6 +190,9 @@ See [`doc/CLI.md`](doc/CLI.md) for the full reference. Most-used flags:
 - `--run`: JIT-compile and run in-process
 
 ## Testing
+- **Windows**: `test.bat` / `test_lsp.bat` / `example.bat` (batch scripts).
+- **Linux/WSL**: `test.sh` is the `test.bat` counterpart - it compiles+runs the platform-portable subset of `Test/*.cb` (plus the `Test/errors/*.cb` negative tests) against the native ELF cflat, in parallel with a per-test timeout, and prints a PASS/FAIL/SKIP summary. Run it from inside WSL: `bash test.sh Release` (or `Debug`, `-j N`). It maintains an explicit SKIP list of Windows-only tests (Win32 APIs called in the test body, the `program` construct, C-interop, WinMD, FP-env) - these are test-content/subsystem limits, not core-library gaps. `test.sh` deliberately does **not** run `cflat --init` (a bitcode-cache warmup; pure optimization). `.gitattributes` pins `*.sh` to LF so it stays runnable on a Windows checkout.
+- After any portability change, **re-verify BOTH**: `test.sh` green on WSL AND `test.bat` (Release) green on Windows.
 - Always run `test.bat` after compiler changes to verify all tests pass before declaring work complete.
 - `test.bat` runs all tests in parallel and should complete in under a minute. A test that hangs will be killed after a configurable timeout (default 120 seconds, set via `TIMEOUT_SECS` at the top of `test.bat`).
 - Do NOT create separate compiler integration tests - test.bat already validates the compiler end-to-end.

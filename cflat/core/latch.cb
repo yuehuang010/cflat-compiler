@@ -1,5 +1,8 @@
 // latch.cb - one-shot countdown latch.
 //
+// Windows: a manual-reset Win32 event, signaled when the count reaches 0.
+// POSIX:   a mutex + condition variable; waiters sleep until the count is 0.
+//
 // Usage:
 //   latch l;
 //   l.init(3);              // 3 threads must count down before waiters unblock
@@ -10,21 +13,29 @@
 // Once the count reaches 0 all past and future wait() calls return immediately.
 // The latch is NOT reusable after the count reaches 0.
 
+import "mutex.cb";   // POSIX: mutex + cv_* condvar helpers
+
 // Atomic stubs - intercepted by the compiler; emit LLVM atomic IR.
 extern i64 __atomic_counter_decrement(i64* ptr);
 extern i64 __atomic_counter_read(i64* ptr);
 
 // One-shot countdown latch; waiters unblock once the count reaches 0.
 struct latch {
-    void* _event = nullptr;  // manual-reset Win32 event (signaled when count hits 0)
+    void* _event = nullptr;  // Windows: manual-reset event (signaled when count hits 0)
     i64   _count = 0;        // remaining count (atomically decremented)
+    mutex _mtx   = default;  // POSIX: guards the count<->wake handshake
+    void* _cv    = nullptr;  // POSIX: condvar slot waiters sleep on
 
     // Initialize the latch with a countdown of n.
     // Must be called before count_down() or wait().
     void init(int n) {
-        // manual_reset=1, initial_state=0 (not yet signaled)
-        _event = os.windows.CreateEventA(nullptr, 1, 0, nullptr);
         _count = n;
+        if const (__WINDOWS__) {
+            // manual_reset=1, initial_state=0 (not yet signaled)
+            _event = os.windows.CreateEventA(nullptr, 1, 0, nullptr);
+        } else {
+            cv_init(&_cv);
+        }
     }
 
     // Decrement the countdown.  When it reaches 0 all wait() callers unblock.
@@ -32,7 +43,15 @@ struct latch {
         if (__fuzz_hook != nullptr) { __fuzz_hook(30); }  // thread-fuzz sched-point
         i64 remaining = __atomic_counter_decrement(&_count);
         if (remaining == 0) {
-            os.windows.SetEvent(_event);
+            if const (__WINDOWS__) {
+                os.windows.SetEvent(_event);
+            } else {
+                // Take the lock before waking so a waiter cannot miss the signal
+                // between its count check and its sleep (sleep_cv holds the lock).
+                _mtx.acquire();
+                cv_wake_all(&_cv);
+                _mtx.release();
+            }
         }
     }
 
@@ -40,16 +59,29 @@ struct latch {
     // Returns immediately if already at 0.
     void wait() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(31); }  // thread-fuzz sched-point
-        if (__atomic_counter_read(&_count) > 0) {
-            os.windows.WaitForSingleObject(_event, -1);
+        if const (__WINDOWS__) {
+            if (__atomic_counter_read(&_count) > 0) {
+                os.windows.WaitForSingleObject(_event, -1);
+            }
+        } else {
+            _mtx.acquire();
+            while (__atomic_counter_read(&_count) > 0) {
+                _mtx.sleep_cv(&_cv);
+            }
+            _mtx.release();
         }
     }
 
     // Release OS resources.
     void destroy() {
-        if (_event != nullptr) {
-            os.windows.CloseHandle(_event);
-            _event = nullptr;
+        if const (__WINDOWS__) {
+            if (_event != nullptr) {
+                os.windows.CloseHandle(_event);
+                _event = nullptr;
+            }
+        } else {
+            cv_destroy(&_cv);
+            _mtx.destroy();
         }
     }
 };

@@ -41,7 +41,7 @@ import "intrinsic.cb";   // pause() - spin-loop hint (x86; compiles away elsewhe
 // ---------------------------------------------------------------------------
 struct barrier {
     mutex _mtx        = default;
-    void* _cv         = nullptr;   // Win32 CONDITION_VARIABLE (pointer-sized)
+    void* _cv         = nullptr;   // condvar slot: Win32 CONDITION_VARIABLE inline / POSIX heap pthread_cond_t*
     int   _total      = 0;         // participants expected each phase (N)
     int   _count      = 0;         // arrivals still pending in the current phase
     u64   _generation = 0;         // phase id; bumped when a phase completes
@@ -51,7 +51,7 @@ struct barrier {
         _total      = n;
         _count      = n;
         _generation = 0;
-        os.windows.InitializeConditionVariable(&_cv);
+        cv_init(&_cv);
     }
 
     // Arrive and block until all n threads have arrived; the barrier then resets
@@ -65,7 +65,7 @@ struct barrier {
         if (_count == 0) {
             _generation = _generation + 1;   // advance phase -> releases the waiters
             _count      = _total;            // re-arm for the next round
-            os.windows.WakeAllConditionVariable(&_cv);
+            cv_wake_all(&_cv);
             _mtx.release();
             return true;                     // leader
         }
@@ -90,15 +90,15 @@ struct barrier {
         if (_count == 0) {
             _generation = _generation + 1;
             _count      = _total;
-            os.windows.WakeAllConditionVariable(&_cv);
+            cv_wake_all(&_cv);
         }
         _mtx.release();
     }
 
     // Release OS resources. No threads may be waiting.
     void destroy() {
-        _mtx.destroy();   // SRW lock: no-op, present for symmetry
-        _cv = nullptr;
+        cv_destroy(&_cv);   // POSIX: free the heap condvar. Windows: no-op.
+        _mtx.destroy();     // POSIX: free the heap mutex. Windows: SRW no-op.
     }
 };
 

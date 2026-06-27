@@ -37,6 +37,7 @@
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
 #include <llvm/IR/CFG.h>          // llvm::pred_empty (MarkUnreachableIfNoPredecessors)
+#include <llvm/Analysis/TargetLibraryInfo.h>  // stdio-safe TLI for ELF codegen (no chk->plain fold)
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/MDBuilder.h>    // llvm::MDBuilder (alias-scope/domain metadata for T[] noalias)
 #include <llvm/IR/Intrinsics.h>
@@ -1057,6 +1058,13 @@ private:
     std::string targetCpu_;
     std::string tuneCpu_;
     int platformValue = 64;  // 64 for win64, 32 for win32
+    // Target OS: drives __WINDOWS__/__POSIX__ macros and core OS-library selection.
+    // Defaults to the host OS (no cross-OS compilation yet).
+#if defined(_WIN32)
+    bool targetWindows_ = true;
+#else
+    bool targetWindows_ = false;
+#endif
     std::vector<std::string> cObjectFiles_;
     int cOptLevel_ = 0;        // optimization level applied to clang C compiles
     bool cDebugInfo_ = false;  // emit CodeView for clang C compiles
@@ -2667,15 +2675,46 @@ private:
         RegisterBuiltinStrConcat();
     }
 
+    // x86-64 System V va_list is `__va_list_tag[1]` (24 bytes: gp_offset i32,
+    // fp_offset i32, overflow_arg_area ptr, reg_save_area ptr) passed by tag
+    // pointer; Windows x64 va_list is just a pointer cursor. cflat carries `va_list`
+    // as a `ptr` everywhere (GetType), which already matches a SysV tag *pointer*.
+    // The only mismatch is what va_start fills: on SysV it must initialize a 24-byte
+    // tag, not an 8-byte cursor slot. So on SysV we back the va_list slot with a real
+    // tag buffer and point the slot at it; the slot's value (the tag pointer) then
+    // forwards by value to libc vsnprintf/vsscanf unchanged. cflat never does va_arg
+    // itself, so no SysV va_arg sequence is needed.
+    llvm::StructType* VaListTagType()
+    {
+        auto* i32Ty = llvm::Type::getInt32Ty(*context);
+        auto* ptrTy = llvm::PointerType::getUnqual(*context);
+        return llvm::StructType::get(*context, { i32Ty, i32Ty, ptrTy, ptrTy });
+    }
+
     void CreateVaStart(llvm::Value* apAlloca)
     {
         auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::vastart);
+        if (!targetWindows_)
+        {
+            // Allocate the 24-byte tag, point the va_list slot at it, and init the tag.
+            auto* tag = AllocaAtEntry(VaListTagType(), nullptr, "va.tag", 16);
+            builder->CreateStore(tag, apAlloca);
+            builder->CreateCall(fn, {tag});
+            return;
+        }
         builder->CreateCall(fn, {apAlloca});
     }
 
     void CreateVaEnd(llvm::Value* apAlloca)
     {
         auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::vaend);
+        if (!targetWindows_)
+        {
+            // The slot holds the tag pointer (set by CreateVaStart); va_end takes the tag.
+            auto* tag = builder->CreateLoad(llvm::PointerType::getUnqual(*context), apAlloca, "va.tag");
+            builder->CreateCall(fn, {tag});
+            return;
+        }
         builder->CreateCall(fn, {apAlloca});
     }
 
@@ -4871,9 +4910,153 @@ private:
             target->createTargetMachine(triple, cpu, "", opt, llvm::Reloc::PIC_));
     }
 
+    // Native ELF code emission + link for Linux (and other ELF/Unix hosts).
+    // Emits an x86-64 ELF object for the host triple and links it with the
+    // system C compiler driver (cc/gcc/clang), which supplies crt1.o (_start ->
+    // __libc_start_main -> main) and libc. cflat emits a C-ABI `main`, so no
+    // custom entry point is needed. Windows/COFF/SEH/lld-link stay in
+    // EmitExecutable; this path is the Stage-3 ELF target seam.
+    bool EmitExecutableElf(const std::string& exePath, bool debugInfo,
+                           const std::optional<std::string>& lliPath)
+    {
+        llvm::InitializeAllTargets();
+        llvm::InitializeAllTargetMCs();
+        llvm::InitializeAllAsmPrinters();
+
+        const std::string triple = llvm::sys::getProcessTriple(); // e.g. x86_64-unknown-linux-gnu
+        module->setTargetTriple(triple);
+
+        std::string err;
+        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
+        if (!target)
+        {
+            std::cout << std::format("Error: no target for triple '{}': {}\n", triple, err);
+            return false;
+        }
+
+        std::string cpu = targetCpu_.empty() ? std::string("x86-64") : targetCpu_;
+        llvm::TargetOptions opt;
+        opt.FunctionSections = true;
+        opt.DataSections     = true;
+        // PIC so the object links into a position-independent executable (the
+        // default on modern Linux toolchains).
+        auto TM = std::unique_ptr<llvm::TargetMachine>(
+            target->createTargetMachine(triple, cpu, "", opt, llvm::Reloc::PIC_));
+        module->setDataLayout(TM->createDataLayout());
+
+        // Keep cflat's runtime DEFINITIONS out of the dynamic symbol table so they do
+        // not interpose libc. cflat reuses libc names (printf/vsnprintf/malloc/...);
+        // an executable that defines a symbol libc also exports would preempt libc's
+        // OWN internal calls to it (e.g. glibc __vsnprintf_chk -> vsnprintf -> cflat's
+        // vsnprintf), recursing forever. Hidden visibility makes each definition local
+        // to the image while still callable from cflat code; external declarations
+        // (the libc imports) are left untouched so they still bind to libc.
+        for (llvm::Function& F : module->functions())
+            if (!F.isDeclaration())
+                F.setVisibility(llvm::GlobalValue::HiddenVisibility);
+        for (llvm::GlobalVariable& G : module->globals())
+            if (!G.isDeclaration())
+                G.setVisibility(llvm::GlobalValue::HiddenVisibility);
+
+        if (lliPath)
+        {
+            if (verbose) std::cout << std::format("[verbose] writing IR to {}\n", *lliPath);
+            if (!SaveToFile(*lliPath))
+            {
+                std::cout << std::format("Error: failed to save IR to '{}'.\n", *lliPath);
+                return false;
+            }
+        }
+
+        const std::string objPath = exePath + ".o";
+        std::error_code EC;
+        llvm::raw_fd_ostream dest(objPath, EC, llvm::sys::fs::OF_None);
+        if (EC)
+        {
+            std::cout << std::format("Error: could not write object file '{}': {}\n", objPath, EC.message());
+            return false;
+        }
+        {
+            llvm::legacy::PassManager pass;
+            // Codegen runs its own libcall simplification with a default TargetLibraryInfo
+            // (where vsnprintf/vfprintf are "available"), which would re-fold our
+            // __vsnprintf_chk/__vfprintf_chk calls back into cflat's own vsnprintf/vfprintf
+            // and recurse forever - even though the IR-level opt pipeline already kept them
+            // intact. Seed the codegen PM with the same stdio-safe TLI so the fold stays off.
+            llvm::TargetLibraryInfoImpl codegenTLII{ llvm::Triple(triple) };
+            codegenTLII.setUnavailable(llvm::LibFunc_vsnprintf);
+            codegenTLII.setUnavailable(llvm::LibFunc_vfprintf);
+            codegenTLII.setUnavailable(llvm::LibFunc_vsscanf);
+            codegenTLII.setUnavailable(llvm::LibFunc_vfscanf);
+            pass.add(new llvm::TargetLibraryInfoWrapperPass(codegenTLII));
+            if (TM->addPassesToEmitFile(pass, dest, nullptr, llvm::CodeGenFileType::ObjectFile))
+            {
+                std::cout << "Error: target does not support object file emission\n";
+                return false;
+            }
+            pass.run(*module);
+            dest.flush();
+            dest.close();
+        }
+
+        // Link with the system C compiler driver: it pulls in the C runtime
+        // startup and libc and resolves cflat's `main`.
+        std::string cc;
+        for (const char* cand : { "cc", "gcc", "clang", "clang-18" })
+        {
+            if (auto p = llvm::sys::findProgramByName(cand)) { cc = *p; break; }
+        }
+        if (cc.empty())
+        {
+            llvm::sys::fs::remove(objPath);
+            std::cout << "Error: no C compiler driver (cc/gcc/clang) found to link the executable\n";
+            return false;
+        }
+
+        std::vector<std::string> argStrs = { cc, objPath, "-o", exePath };
+        // GC unreferenced sections: the auto-imported core runtime defines many
+        // functions (stdio/stdout shims) that still reference Windows CRT symbols
+        // until the core libs are ported. Emitting one section per function (set
+        // above) lets the linker drop the ones this program does not call.
+        argStrs.push_back("-Wl,--gc-sections");
+        // -no-pie keeps global symbols out of .dynsym so --gc-sections can drop
+        // unreferenced runtime functions (otherwise PIE exports them as GC roots).
+        argStrs.push_back("-no-pie");
+        // Merge any C objects compiled from .c inputs.
+        for (auto& cObj : cObjectFiles_) argStrs.push_back(cObj);
+        // Prebuilt C libraries (--c-lib).
+        for (const auto& lib : cLinkLibs_) argStrs.push_back(lib);
+        // Common runtime deps for cflat programs (math, threads, dlopen).
+        argStrs.push_back("-lm");
+        argStrs.push_back("-lpthread");
+        argStrs.push_back("-ldl");
+        if (debugInfo) argStrs.push_back("-g");
+
+        std::vector<llvm::StringRef> args;
+        for (auto& s : argStrs) args.push_back(s);
+
+        std::cout << std::format("Linking (elf): {}\n", exePath);
+        std::string linkErr;
+        int rc = llvm::sys::ExecuteAndWait(cc, args, std::nullopt, {}, 0, 0, &linkErr);
+        llvm::sys::fs::remove(objPath);
+        for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+        if (rc != 0)
+        {
+            std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
+            return false;
+        }
+        return true;
+    }
+
     bool EmitExecutable(const std::string& exePath, const std::string& platform, bool debugInfo = false,
                         const std::optional<std::string>& lliPath = std::nullopt)
     {
+#if !defined(_WIN32)
+        // Linux/Unix host: emit a native ELF executable. The Windows/COFF path
+        // below is unreachable here (but still compiles).
+        (void)platform;
+        return EmitExecutableElf(exePath, debugInfo, lliPath);
+#endif
         std::string triple;
         std::string clangTarget;
         std::string cpu;
@@ -8235,13 +8418,25 @@ public:
         // externalDecl with no initValue: leave initValue null so the GlobalVariable below is a
         // declaration (external reference), not a definition.
 
+        // Extern globals link to the bare C symbol: a namespaced declaration like
+        // os.posix's `stdout` must resolve to libc `stdout`, not a symbol literally
+        // named "os.posix.stdout". This mirrors extern functions (whose linkage name
+        // is the un-namespaced name). The full namespaced name stays the cflat lookup
+        // key below. Non-namespaced externs (no '.') and definitions are unaffected.
+        std::string symbolName = typeValue.VariableName;
+        if (externalDecl)
+        {
+            auto dot = symbolName.find_last_of('.');
+            if (dot != std::string::npos) symbolName = symbolName.substr(dot + 1);
+        }
+
         auto gVar = new llvm::GlobalVariable(
             *module,
             destinationType,
             false, // isConstant
             llvm::GlobalValue::LinkageTypes::ExternalLinkage,
             initValue, // Initial value
-            typeValue.VariableName // Name
+            symbolName // Name (bare C symbol for externs)
         );
 
         if (threadLocal)
@@ -12018,7 +12213,12 @@ public:
         SetCompileTimeMacro("__PLATFORM__", llvm::ConstantInt::get(i32, platformValue),            "int");
         SetCompileTimeMacro("__WIN64__",    llvm::ConstantInt::get(i32, platformValue == 64 ? 1 : 0), "int");
         SetCompileTimeMacro("__WIN32__",    llvm::ConstantInt::get(i32, platformValue == 32 ? 1 : 0), "int");
-        SetCompileTimeMacro("__WINDOWS__",  llvm::ConstantInt::get(i32, 1),                        "int");
+        SetCompileTimeMacro("__WINDOWS__",  llvm::ConstantInt::get(i32, targetWindows_ ? 1 : 0),   "int");
+        // POSIX/Linux counterparts for the non-Windows targets. __LINUX__ is the
+        // only POSIX OS for now; a future macOS target would set __MACOS__ and
+        // keep __POSIX__ = 1.
+        SetCompileTimeMacro("__POSIX__",    llvm::ConstantInt::get(i32, targetWindows_ ? 0 : 1),   "int");
+        SetCompileTimeMacro("__LINUX__",    llvm::ConstantInt::get(i32, targetWindows_ ? 0 : 1),   "int");
         SetCompileTimeMacro("__X86__",      llvm::ConstantInt::get(i32, 1),                        "int");
     }
 

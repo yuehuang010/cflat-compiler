@@ -9,6 +9,7 @@
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Linker/Linker.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
@@ -323,7 +324,13 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     }
 
     importSearchDir = args.getOption("import-dir").value_or("");
-    auto platformOption = args.getOption("platform").value_or("win64");
+    // Default target platform = host OS (no cross-OS compilation yet).
+#if defined(_WIN32)
+    const char* kDefaultPlatform = "win64";
+#else
+    const char* kDefaultPlatform = "linux";
+#endif
+    auto platformOption = args.getOption("platform").value_or(kDefaultPlatform);
     // Resolve and validate --cpu / --tune once, up front, so an unknown name is a clean
     // error before any clang-cl spawn or codegen, and both the C-interop and native-object
     // paths can use the resolved values verbatim. The CPU table is identical for both
@@ -398,7 +405,9 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // Set the platform constant (__PLATFORM__) based on the target platform.
     // This is a compile-time constant available in all compiled files.
     platformValue = (platformOption == "win32") ? 32 : 64;
-    if (verbose) std::cout << std::format("[verbose] __PLATFORM__ = {}\n", platformValue);
+    targetWindows_ = (platformOption == "win32" || platformOption == "win64");
+    if (verbose) std::cout << std::format("[verbose] __PLATFORM__ = {}, __WINDOWS__ = {}\n",
+                                          platformValue, targetWindows_ ? 1 : 0);
 
     // Try to load core bitcode cache BEFORE setting up the module, because
     // LoadCoreBitcodeIfFresh replaces context/module/builder with a fresh LLVM
@@ -1090,6 +1099,16 @@ bool LLVMBackend::CompileImportGroup(const std::string& importingFilePath,
 
 bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::vector<std::string>& explicitLibs, const std::vector<std::string>& extraDefines, bool cacheHeader)
 {
+    // WinRT metadata (.winmd) is a Windows-only feature. Reject it up front when not
+    // targeting Windows - otherwise path resolution fails with a generic "file not
+    // found" that unhelpfully lists the (absent) Windows SDK / WinMetadata dirs.
+    if (!targetWindows_ && LowerExtension(importFilename) == ".winmd")
+    {
+        LogError(std::format("import '{}': WinRT metadata (.winmd) is only supported when targeting Windows. "
+                             "WinMD/WinRT is a Windows-only feature; guard the import with "
+                             "'if const (__WINDOWS__) {{ import \"...\"; }}'.", importFilename));
+        return false;
+    }
     std::string canonicalStr;
     if (!ResolveImportPath(importingFilePath, importFilename, canonicalStr))
         return false;
@@ -1395,6 +1414,20 @@ void LLVMBackend::RunModulePasses(llvm::ModulePassManager& MPM)
     llvm::CGSCCAnalysisManager CGAM;
     llvm::ModuleAnalysisManager MAM;
 
+    // Same stdio-safe TLI as OptimizeModule: the -O0 baseline pipeline also runs
+    // instcombine, whose fortify-folding would otherwise rewrite our __vsnprintf_chk /
+    // __vfprintf_chk libc calls back into cflat's own vsnprintf/vfprintf and recurse
+    // forever on ELF. Register before registerFunctionAnalyses so it wins.
+    llvm::TargetLibraryInfoImpl TLII{ llvm::Triple(module->getTargetTriple()) };
+    if (!targetWindows_)
+    {
+        TLII.setUnavailable(llvm::LibFunc_vsnprintf);
+        TLII.setUnavailable(llvm::LibFunc_vfprintf);
+        TLII.setUnavailable(llvm::LibFunc_vsscanf);
+        TLII.setUnavailable(llvm::LibFunc_vfscanf);
+    }
+    FAM.registerPass([&] { return llvm::TargetLibraryAnalysis(TLII); });
+
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
     PB.registerFunctionAnalyses(FAM);
@@ -1699,6 +1732,23 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
     llvm::FunctionAnalysisManager FAM;
     llvm::CGSCCAnalysisManager CGAM;
     llvm::ModuleAnalysisManager MAM;
+
+    // cflat reimplements the C stdio family (printf/vsnprintf/... in cruntime.cb), so
+    // LLVM must NOT treat their libc names as available. Otherwise instcombine's
+    // fortify-folding rewrites our __vsnprintf_chk / __vfprintf_chk libc calls back
+    // into plain vsnprintf / vfprintf, which on ELF bind to cflat's OWN wrappers and
+    // recurse forever. Marking the colliding names unavailable keeps the chk calls
+    // intact so they reach libc. Register this TLI before registerFunctionAnalyses so
+    // it wins over the default (registerPass is a no-op once an analysis exists).
+    llvm::TargetLibraryInfoImpl TLII{ llvm::Triple(module->getTargetTriple()) };
+    if (!targetWindows_)
+    {
+        TLII.setUnavailable(llvm::LibFunc_vsnprintf);
+        TLII.setUnavailable(llvm::LibFunc_vfprintf);
+        TLII.setUnavailable(llvm::LibFunc_vsscanf);
+        TLII.setUnavailable(llvm::LibFunc_vfscanf);
+    }
+    FAM.registerPass([&] { return llvm::TargetLibraryAnalysis(TLII); });
 
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
@@ -3375,6 +3425,7 @@ DeserializeConstraints(const llvm::json::Object* o)
 bool LLVMBackend::CompileCoreOnly(const std::string& platform)
 {
     platformValue = (platform == "win32") ? 32 : 64;
+    targetWindows_ = (platform == "win32" || platform == "win64");
 
     // Reinitialize the LLVM module with the correct platform data layout BEFORE
     // RegisterBuiltinString creates pointer types, so %string fields have the right size.

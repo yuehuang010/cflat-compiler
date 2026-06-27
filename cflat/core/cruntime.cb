@@ -10,10 +10,22 @@ extern void  free(void* ptr);
 extern void* calloc(win_size count, win_size size);
 // Resize a previously allocated block, preserving existing contents.
 extern void* realloc(void* ptr, win_size size);
-// Allocate `size` bytes aligned to `alignment` (MSVC CRT).
-extern void* _aligned_malloc(win_size size, win_size alignment);
-// Free a block returned by _aligned_malloc.
-extern void  _aligned_free(void* ptr);
+// Allocate `size` bytes aligned to `alignment`.
+if const (__WINDOWS__) {
+    // MSVC CRT pair.
+    extern void* _aligned_malloc(win_size size, win_size alignment);
+    extern void  _aligned_free(void* ptr);
+} else {
+    // POSIX: posix_memalign (alignment must be a power of two >= sizeof(void*)).
+    // Aligned blocks are released with plain free(), so _aligned_free == free.
+    void* _aligned_malloc(win_size size, win_size alignment) {
+        void* p = nullptr;
+        win_size a = alignment < (win_size)8 ? (win_size)8 : alignment;
+        if (os.posix.posix_memalign(&p, a, size) != 0) return nullptr;
+        return p;
+    }
+    void _aligned_free(void* ptr) { free(ptr); }
+}
 
 // Win32: callers always pass i64; these wrappers truncate to i32 before calling the CRT.
 if const (__PLATFORM__ == 32) {
@@ -53,7 +65,11 @@ thread_local __ProgramTLS __prog_tls = default;
 // truncation check `needed >= cap` never fires (-1 >= cap is false) and output past the
 // initial buffer is silently dropped.
 win_int __vsprintf_safe(u64 options, char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap) {
-    return os.windows.__stdio_common_vsprintf(options | (u64)2, buf, (win_size)bufSize, fmt, locale, ap);
+    if const (__WINDOWS__) {
+        return os.windows.__stdio_common_vsprintf(options | (u64)2, buf, (win_size)bufSize, fmt, locale, ap);
+    } else {
+        return os.posix.vsnprintf_libc(buf, (win_size)bufSize, fmt, ap);
+    }
 }
 
 // Emit `len` raw bytes to stdout. Honors the program stdout hook when one is installed
@@ -66,15 +82,23 @@ void __stdout_write(const char* buf, int len) {
         __prog_tls.stdout_hook((char*)buf, len);  // non-owning, hook must NOT free
         __prog_tls.stdout_in_hook = false;
     } else {
-        int written = 0;
-        os.windows.WriteFile(os.windows.GetStdHandle(-11), buf, len, &written, nullptr);
+        if const (__WINDOWS__) {
+            int written = 0;
+            os.windows.WriteFile(os.windows.GetStdHandle(-11), buf, len, &written, nullptr);
+        } else {
+            os.posix.write(1, buf, (win_size)len);
+        }
     }
 }
 
-// Emit `len` raw bytes to stderr (handle -12). The stdout hook never applies to stderr.
+// Emit `len` raw bytes to stderr (handle -12 / fd 2). The stdout hook never applies to stderr.
 void __stderr_write(const char* buf, int len) {
-    int written = 0;
-    os.windows.WriteFile(os.windows.GetStdHandle(-12), buf, len, &written, nullptr);
+    if const (__WINDOWS__) {
+        int written = 0;
+        os.windows.WriteFile(os.windows.GetStdHandle(-12), buf, len, &written, nullptr);
+    } else {
+        os.posix.write(2, buf, (win_size)len);
+    }
 }
 
 // Format `fmt`+args into the per-thread scratch buffer, growing it on overflow, and
@@ -106,7 +130,32 @@ int __cstr_len(const char* s) {
 
 // Thin wrapper over the Windows CRT vsscanf backend; casts bufSize to win_size.
 win_int __vsscanf_safe(u64 options, const char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap) {
-    return os.windows.__stdio_common_vsscanf(options, buf, (win_size)bufSize, fmt, locale, ap);
+    if const (__WINDOWS__) {
+        return os.windows.__stdio_common_vsscanf(options, buf, (win_size)bufSize, fmt, locale, ap);
+    } else {
+        return os.posix.vsscanf_libc(buf, fmt, ap);
+    }
+}
+
+// Abstracts the Windows __acrt_iob_func(idx) vs the libc stdin/stdout/stderr
+// FILE* globals (0=stdin, 1=stdout, 2=stderr).
+void* __std_iob(int which) {
+    if const (__WINDOWS__) { return os.windows.__acrt_iob_func((u32)which); }
+    else { return os.posix.iob(which); }
+}
+
+// Windows CRT internal for the scanf fallback path (no size parameter - not in
+// os.windows.cb). Declared before use; referenced only on the Windows branch.
+extern int __stdio_common_vfscanf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
+
+// Formatted write/read to a real stream (not the stdout/stderr fast paths).
+int __vfprintf_stream(void* stream, const char* fmt, va_list ap) {
+    if const (__WINDOWS__) { return os.windows.__stdio_common_vfprintf((u64)1, stream, fmt, nullptr, ap); }
+    else { return os.posix.vfprintf_libc(stream, fmt, ap); }
+}
+int __vfscanf_stream(void* stream, const char* fmt, va_list ap) {
+    if const (__WINDOWS__) { return __stdio_common_vfscanf(0, stream, fmt, nullptr, ap); }
+    else { return os.posix.vfscanf_libc(stream, fmt, ap); }
 }
 
 // printf - formatted write to stdout (hook-aware, VT-correct); fast-paths literal text.
@@ -206,16 +255,16 @@ extern void putn(const char* buf, int len) {
 // special-cased so they stay hook-aware / VT-correct; other streams go through the CRT.
 extern int fputs(const char* s, void* stream) {
     int len = __cstr_len(s);
-    if (stream == os.windows.__acrt_iob_func(1)) { __stdout_write(s, len); return len; }
-    if (stream == os.windows.__acrt_iob_func(2)) { __stderr_write(s, len); return len; }
+    if (stream == __std_iob(1)) { __stdout_write(s, len); return len; }
+    if (stream == __std_iob(2)) { __stderr_write(s, len); return len; }
     return fprintf(stream, "%s", s);
 }
 
 // fputc / putc - write a single byte to a stream.
 extern int fputc(int c, void* stream) {
     char b = (char)c;
-    if (stream == os.windows.__acrt_iob_func(1)) { __stdout_write(&b, 1); return c; }
-    if (stream == os.windows.__acrt_iob_func(2)) { __stderr_write(&b, 1); return c; }
+    if (stream == __std_iob(1)) { __stdout_write(&b, 1); return c; }
+    if (stream == __std_iob(2)) { __stderr_write(&b, 1); return c; }
     return fprintf(stream, "%c", c);
 }
 
@@ -228,25 +277,22 @@ extern int fprintf(void* stream, const char* fmt, ...) {
     va_list ap;
     va_start(ap);
     int result = 0;
-    if (stream == os.windows.__acrt_iob_func(1)) {
+    if (stream == __std_iob(1)) {
         int needed = __format_to_tls(fmt, ap);
         __stdout_write(__prog_tls.stdout_tls_buf, needed);
         result = needed;
-    } else if (stream == os.windows.__acrt_iob_func(2)) {
+    } else if (stream == __std_iob(2)) {
         int needed = __format_to_tls(fmt, ap);
         __stderr_write(__prog_tls.stdout_tls_buf, needed);
         result = needed;
     } else {
-        result = os.windows.__stdio_common_vfprintf((u64)1, stream, fmt, nullptr, ap);
+        result = __vfprintf_stream(stream, fmt, ap);
     }
     va_end(ap);
     return result;
 }
 
 // === Stdin hook support ===
-
-// Windows CRT internal for the scanf fallback path (no size parameter - not in os.windows.cb).
-extern int __stdio_common_vfscanf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
 
 // Used by the fgets fallback to read one character from any stream.
 extern int fgetc(void* stream);
@@ -373,8 +419,8 @@ extern int scanf(const char* fmt, ...) {
         va_end(ap);
         return result;
     }
-    if (__prog_tls.cached_stdin == nullptr) { __prog_tls.cached_stdin = os.windows.__acrt_iob_func(0); }
-    int result = __stdio_common_vfscanf(0, __prog_tls.cached_stdin, fmt, nullptr, ap);
+    if (__prog_tls.cached_stdin == nullptr) { __prog_tls.cached_stdin = __std_iob(0); }
+    int result = __vfscanf_stream(__prog_tls.cached_stdin, fmt, ap);
     va_end(ap);
     return result;
 }
@@ -383,7 +429,7 @@ extern int scanf(const char* fmt, ...) {
 // `program`); otherwise reads from the real console. Returns -1 (EOF) when input is done.
 extern int getchar() {
     if (__prog_tls.stdin_active) { return __stdin_next_char(); }
-    if (__prog_tls.cached_stdin == nullptr) { __prog_tls.cached_stdin = os.windows.__acrt_iob_func(0); }
+    if (__prog_tls.cached_stdin == nullptr) { __prog_tls.cached_stdin = __std_iob(0); }
     return fgetc(__prog_tls.cached_stdin);
 }
 
@@ -408,7 +454,7 @@ extern int sscanf(const char* buf, const char* fmt, ...) {
 extern int fscanf(void* stream, const char* fmt, ...) {
     va_list ap;
     va_start(ap);
-    int result = __stdio_common_vfscanf(0, stream, fmt, nullptr, ap);
+    int result = __vfscanf_stream(stream, fmt, ap);
     va_end(ap);
     return result;
 }

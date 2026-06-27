@@ -228,10 +228,22 @@ set_target_properties(cflat PROPERTIES
 # ---------------------------------------------------------------------------
 # Post-build deployment: core library tree + linker tools next to the exe.
 # ---------------------------------------------------------------------------
-add_custom_command(TARGET cflat POST_BUILD
+# Deploy core/ via a stamp that depends on every core file, NOT a POST_BUILD on
+# cflat. A POST_BUILD only fires when the exe relinks, so editing only a core
+# *.cb (no C++ change) would leave the deployed copy - which the exe actually
+# reads - stale. The stamp re-runs the copy whenever any core file is newer.
+# CONFIGURE_DEPENDS re-globs at build time so new core files are picked up
+# without a manual reconfigure.
+file(GLOB_RECURSE CORE_FILES CONFIGURE_DEPENDS "${CFLAT_DIR}/core/*")
+set(_core_stamp "${CMAKE_CURRENT_BINARY_DIR}/deploy_core.stamp")
+add_custom_command(
+  OUTPUT ${_core_stamp}
   COMMAND ${CMAKE_COMMAND} -E copy_directory
           "${CFLAT_DIR}/core" "$<TARGET_FILE_DIR:cflat>/core"
+  COMMAND ${CMAKE_COMMAND} -E touch ${_core_stamp}
+  DEPENDS ${CORE_FILES} cflat
   COMMENT "Deploying core/ library tree next to cflat")
+add_custom_target(deploy_core ALL DEPENDS ${_core_stamp})
 
 if(WIN32)
   # lld-link + clang-cl (the C-interop / native link drivers) and the LLVM

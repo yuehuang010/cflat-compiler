@@ -40,6 +40,13 @@ import "atomic.cb";
 import "thread.cb";
 import "intrinsic.cb";   // pause() - spin-loop hint for the blocking send/receive retries
 
+// Yield the rest of this thread's time slice after a long spin, so a runnable
+// thread (e.g. the producer/consumer we are waiting on) can make progress.
+void _chan_yield() {
+    if const (__WINDOWS__) { os.windows.SwitchToThread(); }
+    else { os.posix.sched_yield(); }
+}
+
 // Bounded MPMC lock-free ring buffer; capacity must be a power of two.
 class channel<T>
 {
@@ -209,7 +216,7 @@ class channel<T>
             pause();   // contended retry - hint the spin so the SMT sibling runs
             pos   = __atomic_i64_load(&_head);
             spins = spins + (i64)1;
-            if (spins == (i64)1024) { os.windows.SwitchToThread(); spins = (i64)0; }
+            if (spins == (i64)1024) { _chan_yield(); spins = (i64)0; }
         }
     }
 
@@ -233,7 +240,7 @@ class channel<T>
             pause();   // contended retry - hint the spin so the SMT sibling runs
             pos   = __atomic_i64_load(&_tail);
             spins = spins + (i64)1;
-            if (spins == (i64)1024) { os.windows.SwitchToThread(); spins = (i64)0; }
+            if (spins == (i64)1024) { _chan_yield(); spins = (i64)0; }
         }
         T sentinel = default;
         return sentinel;
@@ -275,7 +282,7 @@ class channel<T>
             }
             pos   = __atomic_i64_load(&_tail);
             spins = spins + (i64)1;
-            if (spins == (i64)1024) { os.windows.SwitchToThread(); spins = (i64)0; }
+            if (spins == (i64)1024) { _chan_yield(); spins = (i64)0; }
         }
         return false;
     }
@@ -299,7 +306,7 @@ class channel<T>
             pause();   // contended retry - hint the spin so the SMT sibling runs
             pos   = __atomic_i64_load(&_head);
             spins = spins + (i64)1;
-            if (spins == (i64)1024) { os.windows.SwitchToThread(); spins = (i64)0; }
+            if (spins == (i64)1024) { _chan_yield(); spins = (i64)0; }
         }
     }
 
@@ -322,7 +329,7 @@ class channel<T>
             pause();   // contended retry - hint the spin so the SMT sibling runs
             pos   = __atomic_i64_load(&_tail);
             spins = spins + (i64)1;
-            if (spins == (i64)1024) { os.windows.SwitchToThread(); spins = (i64)0; }
+            if (spins == (i64)1024) { _chan_yield(); spins = (i64)0; }
         }
         T sentinel = default;
         return sentinel;

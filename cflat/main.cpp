@@ -287,7 +287,12 @@ int main(int argc, char* argv[])
     args.addFlag("heap-audit", 0, "Instrument the program with the HeapAudit leak oracle: auto-import diagnostic/heap_audit.cb, enable it at main entry, and report still-live allocations at every return. Report-only - leaks print to stderr but do not change the exit code or abort. No double-free detection; use --asan for double-free/use-after-free. Requires -o (links a C diagnostic object).");
     args.addFlag("run", 0, "JIT-compile and run the program in-process without writing an exe to disk. Entry must be 'int main()' or 'int main(int argc, char** argv)'; arguments after a bare '--' are passed as argv[1..]. The process exit code is the program's exit code. Read-only: cannot be combined with -o, -l/--out-lli, or -b/--bitcode.");
     args.addOption("import-dir", 'i', "Directory to search for imported modules");
-    args.addOption("platform", 'p', "Target platform: win64 (default) or win32", "win64");
+    // Default target platform = host OS (no cross-OS compilation yet).
+#if defined(_WIN32)
+    args.addOption("platform", 'p', "Target platform: win64 (default), win32, or linux", "win64");
+#else
+    args.addOption("platform", 'p', "Target platform: linux (default), win64, or win32", "linux");
+#endif
     args.addFlag("verbose", 'v', "Print detailed diagnostic messages during compilation");
     args.addFlag("O0", '0', "No optimization (default)");
     args.addFlag("O1", '1', "Optimize for speed (level 1)");

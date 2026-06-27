@@ -11,27 +11,67 @@
 //
 // Linux (future): mmap(PROT_NONE) / mprotect / mmap(PROT_RW) / munmap
 
+// POSIX munmap needs the region size, but vmem_free() only gets a pointer. So on
+// POSIX we over-map by one page and stash the total mapping size in that header
+// page (kept writable); the returned pointer is the page after it, preserving
+// page alignment. vmem_free reads the size back from the header.
+i64 __VMEM_HDR = 4096;
+
 // Reserve address space without committing physical pages.
 // Use with vmem_commit to implement demand-paging (e.g. slab pre-reservation).
 void* vmem_reserve(i64 size)
 {
-    return os.windows.VirtualAlloc(nullptr, size, 0x2000u, 0x04u);
+    if const (__WINDOWS__) {
+        return os.windows.VirtualAlloc(nullptr, size, 0x2000u, 0x04u);
+    } else {
+        i64 total = size + __VMEM_HDR;
+        void* base = os.posix.mmap(nullptr, total, os.posix.PROT_NONE, os.posix.MAP_ANON_PRIVATE, -1, 0);
+        if ((i64)base == -1) return nullptr;
+        os.posix.mprotect(base, __VMEM_HDR, os.posix.PROT_RW);  // header must be writable
+        i64* hdr = (i64*)base;
+        hdr[0] = total;
+        i8* bytes = (i8*)base;
+        return (void*)&bytes[__VMEM_HDR];
+    }
 }
 
 // Commit physical pages inside a previously-reserved region.
 void* vmem_commit(void* ptr, i64 size)
 {
-    return os.windows.VirtualAlloc(ptr, size, 0x1000u, 0x04u);
+    if const (__WINDOWS__) {
+        return os.windows.VirtualAlloc(ptr, size, 0x1000u, 0x04u);
+    } else {
+        if (os.posix.mprotect(ptr, size, os.posix.PROT_RW) != 0) return nullptr;
+        return ptr;
+    }
 }
 
 // Reserve and commit in one call. Returns zeroed memory.
 void* vmem_alloc(i64 size)
 {
-    return os.windows.VirtualAlloc(nullptr, size, 0x3000u, 0x04u);
+    if const (__WINDOWS__) {
+        return os.windows.VirtualAlloc(nullptr, size, 0x3000u, 0x04u);
+    } else {
+        i64 total = size + __VMEM_HDR;
+        void* base = os.posix.mmap(nullptr, total, os.posix.PROT_RW, os.posix.MAP_ANON_PRIVATE, -1, 0);
+        if ((i64)base == -1) return nullptr;
+        i64* hdr = (i64*)base;
+        hdr[0] = total;  // header is RW (whole mapping is RW); user region is zeroed by mmap
+        i8* bytes = (i8*)base;
+        return (void*)&bytes[__VMEM_HDR];
+    }
 }
 
-// Release the entire region back to the OS. size must be 0 for MEM_RELEASE.
+// Release the entire region back to the OS.
 void vmem_free(void* ptr)
 {
-    os.windows.VirtualFree(ptr, 0, 0x8000u);
+    if const (__WINDOWS__) {
+        os.windows.VirtualFree(ptr, 0, 0x8000u);  // size must be 0 for MEM_RELEASE
+    } else {
+        i8* bytes = (i8*)ptr;
+        i8* base = &bytes[0 - __VMEM_HDR];  // ptr - header page
+        i64* hdr = (i64*)base;
+        i64 total = hdr[0];
+        os.posix.munmap((void*)base, total);
+    }
 }

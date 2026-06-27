@@ -6,6 +6,20 @@ import "mutex.cb";
 import "channel.cb";
 import "time.cb";
 
+// Yield the rest of this thread's time slice (Win32 SwitchToThread / POSIX
+// sched_yield). Used by the pool's spin-wait fallbacks.
+void _tp_yield() {
+    if const (__WINDOWS__) { os.windows.SwitchToThread(); }
+    else { os.posix.sched_yield(); }
+}
+
+// Caller's OS thread id, used to recognize a pool worker calling back into the
+// pool (Win32 GetCurrentThreadId / POSIX gettid).
+u32 _tp_current_tid() {
+    if const (__WINDOWS__) { return os.windows.GetCurrentThreadId(); }
+    else { return (u32)os.posix.gettid(); }
+}
+
 // Read-only configuration constants.  CFlat has no const globals, so these are
 // plain ints by necessity - treat them as immutable; do not mutate at runtime.
 
@@ -61,7 +75,7 @@ struct TaskHandle {
     // each check - cheap for short tasks, but it keeps one logical CPU hot for
     // the whole wait.  For long-running tasks prefer wait_for() with a budget.
     void wait() {
-        while (done.load() == 0) { os.windows.SwitchToThread(); }
+        while (done.load() == 0) { _tp_yield(); }
     }
 
     // Block until the task completes or the timeout elapses.
@@ -71,7 +85,7 @@ struct TaskHandle {
         deadline.start(milliseconds);
         while (done.load() == 0) {
             if (deadline.isExpired()) { return false; }
-            os.windows.SwitchToThread();
+            _tp_yield();
         }
         return true;
     }
@@ -81,7 +95,7 @@ struct TaskHandle {
     // failure paths set done=1 manually so this never blocks for a handle that
     // was never enqueued.
     ~TaskHandle() {
-        while (done.load() == 0) { os.windows.SwitchToThread(); }
+        while (done.load() == 0) { _tp_yield(); }
         _cancelSrc.dispose();
     }
 };
@@ -136,21 +150,21 @@ struct TaskResult<T> {
     // Block until the result is ready and return it.
     // Only valid after a successful set(); check hasFailed() if the task may fail.
     T get() {
-        while (_ready.load() < 2) { os.windows.SwitchToThread(); }
+        while (_ready.load() < 2) { _tp_yield(); }
         _ready.acquire((i32 v) => { });   // acquire fence; pairs with release in set()
         return _value;
     }
 
     // True if fail() was called instead of set().
     bool hasFailed() {
-        while (_ready.load() < 2) { os.windows.SwitchToThread(); }
+        while (_ready.load() < 2) { _tp_yield(); }
         _ready.acquire((i32 v) => { });
         return _failed;
     }
 
     // Block until set() or fail() has been called.  Does not consume the result.
     void wait() {
-        while (_ready.load() < 2) { os.windows.SwitchToThread(); }
+        while (_ready.load() < 2) { _tp_yield(); }
     }
 
     // Non-blocking poll - true if set() or fail() has been called and the
@@ -251,7 +265,7 @@ void __threadpool_release_inflight(WorkerCtx* wctx) {
     i64 remaining = wctx->inflight->decrement();
     if (remaining == 0) {
         wctx->mtx->acquire();
-        os.windows.WakeAllConditionVariable(wctx->drainCv);
+        cv_wake_all((void**)wctx->drainCv);
         wctx->mtx->release();
     }
 }
@@ -383,7 +397,7 @@ class ThreadPool {
         _qHigh.init(THREADPOOL_QUEUE_CAPACITY);
         _qNormal.init(THREADPOOL_QUEUE_CAPACITY);
         _qLow.init(THREADPOOL_QUEUE_CAPACITY);
-        os.windows.InitializeConditionVariable(&_drainCv);
+        cv_init(&_drainCv);
         _workerIds   = new u32[workerCount];
         _workerStops = new stop_source[workerCount];
         int j = 0;
@@ -657,7 +671,7 @@ class ThreadPool {
                     k++;
                 } else {
                     _ready.release();
-                    os.windows.SwitchToThread();
+                    _tp_yield();
                 }
             }
             _count = newCount;
@@ -666,7 +680,7 @@ class ThreadPool {
 
     // True if the calling thread is one of this pool's workers.
     bool _isWorkerThread() {
-        u32 tid = os.windows.GetCurrentThreadId();
+        u32 tid = _tp_current_tid();
         int i = 0;
         while (i < _count) {
             if (_workerIds[i] == tid) { return true; }
@@ -703,7 +717,7 @@ class ThreadPool {
                     i64 inf      = _inflight.read();
                     i64 draining = _drainingWorkers.read();
                     if (inf <= draining) { break; }
-                    os.windows.SwitchToThread();
+                    _tp_yield();
                 }
             }
             _drainingWorkers.decrement();
@@ -747,6 +761,7 @@ class ThreadPool {
         _fpConfig     = 0;
         _ready.destroy();
         _stop.dispose();
+        cv_destroy(&_drainCv);   // POSIX: free the heap condvar. Windows: no-op.
         // Release the channel buffers so a subsequent init() starts clean.
         _qHigh.destroy();
         _qNormal.destroy();
@@ -841,7 +856,7 @@ int __threadpool_worker(move void* raw) {
     stop_token myStop   = wctx->workerStops[slot].get_token();
 
     // Register this thread's ID so drain() can detect worker-calls-drain.
-    wctx->workerIds[slot] = os.windows.GetCurrentThreadId();
+    wctx->workerIds[slot] = _tp_current_tid();
 
     while (!poolStop.stop_requested()) {
         wctx->ready->acquire();
@@ -860,7 +875,7 @@ int __threadpool_worker(move void* raw) {
             // channel<T> - producer mid-publish).  Forward the token so
             // another worker can retry; see channel.cb pairing pattern.
             wctx->ready->release();
-            os.windows.SwitchToThread();
+            _tp_yield();
         }
     }
     wctx->workerIds[slot] = (u32)0;   // signal exit to resize() / _isWorkerThread()

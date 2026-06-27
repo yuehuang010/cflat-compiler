@@ -35,15 +35,18 @@ int FP_FLUSH_DENORMALS = 0x10000;
 // Apply an FP config to the CURRENT thread. No-op when cfg == 0.
 void __fp_apply(int cfg) {
     if (cfg == 0) return;
-    u32 cur = 0;
-    int trapBits = cfg & (_EM_INVALID | _EM_ZERODIVIDE | _EM_OVERFLOW);
-    if (trapBits != 0) {
-        // Clearing an _EM_* bit unmasks (enables a trap for) that exception.
-        _controlfp_s(&cur, 0, (u32)trapBits);
+    if const (__WINDOWS__) {
+        u32 cur = 0;
+        int trapBits = cfg & (_EM_INVALID | _EM_ZERODIVIDE | _EM_OVERFLOW);
+        if (trapBits != 0) {
+            // Clearing an _EM_* bit unmasks (enables a trap for) that exception.
+            _controlfp_s(&cur, 0, (u32)trapBits);
+        }
+        if ((cfg & FP_FLUSH_DENORMALS) != 0) {
+            _controlfp_s(&cur, (u32)_DN_FLUSH, (u32)_MCW_DN);
+        }
     }
-    if ((cfg & FP_FLUSH_DENORMALS) != 0) {
-        _controlfp_s(&cur, (u32)_DN_FLUSH, (u32)_MCW_DN);
-    }
+    // POSIX: per-thread FP env control (fenv/MXCSR) not yet ported - no-op.
 }
 
 // Enable the given trap mask on the current thread (e.g. FP_TRAP_DEFAULT).
@@ -53,8 +56,11 @@ void fp_enable_traps(int mask) {
 
 // Restore masked (non-trapping) FP exceptions on the current thread.
 void fp_disable_traps() {
-    u32 cur = 0;
-    _controlfp_s(&cur, (u32)_MCW_EM, (u32)_MCW_EM);
+    if const (__WINDOWS__) {
+        u32 cur = 0;
+        _controlfp_s(&cur, (u32)_MCW_EM, (u32)_MCW_EM);
+    }
+    // POSIX: no-op until the FP env is ported.
 }
 
 // Heap packet handed to the borrow-overload trampoline; carries fn, ctx, and env.
@@ -73,32 +79,51 @@ struct __ThreadArgsMove {
     int _fpConfig = 0;
 };
 
-// Win32 LPTHREAD_START_ROUTINE. Must be __stdcall on Win32 (WINAPI convention).
-// stdcall is a no-op on Win64 - safe to always annotate.
-stdcall int __thread_trampoline(void* param) {
-    __ThreadArgs* args = (__ThreadArgs*)param;
-    __active_allocator = args->_allocator;
-    __fp_apply(args->_fpConfig);
-    if (__fuzz_hook != nullptr) { __fuzz_hook(40); }  // thread-fuzz sched-point (child-thread entry)
-    return args->fn(args->ctx);
-}
-
-// Move-overload trampoline: installs the child allocator/FP env, then calls fn.
-stdcall int __thread_trampoline_move(void* param) {
-    __ThreadArgsMove* args = (__ThreadArgsMove*)param;
-    __active_allocator = args->_allocator;
-    __fp_apply(args->_fpConfig);
-    if (__fuzz_hook != nullptr) { __fuzz_hook(41); }  // thread-fuzz sched-point (child-thread entry)
-    return args->fn(args->ctx);
+// Thread entry trampolines. Win32 LPTHREAD_START_ROUTINE returns DWORD (int) and
+// is __stdcall (a no-op on Win64); the POSIX pthread start routine returns void*.
+if const (__WINDOWS__) {
+    stdcall int __thread_trampoline(void* param) {
+        __ThreadArgs* args = (__ThreadArgs*)param;
+        __active_allocator = args->_allocator;
+        __fp_apply(args->_fpConfig);
+        if (__fuzz_hook != nullptr) { __fuzz_hook(40); }  // thread-fuzz sched-point (child-thread entry)
+        return args->fn(args->ctx);
+    }
+    stdcall int __thread_trampoline_move(void* param) {
+        __ThreadArgsMove* args = (__ThreadArgsMove*)param;
+        __active_allocator = args->_allocator;
+        __fp_apply(args->_fpConfig);
+        if (__fuzz_hook != nullptr) { __fuzz_hook(41); }  // thread-fuzz sched-point (child-thread entry)
+        return args->fn(args->ctx);
+    }
+} else {
+    void* __thread_trampoline(void* param) {
+        __ThreadArgs* args = (__ThreadArgs*)param;
+        __active_allocator = args->_allocator;
+        __fp_apply(args->_fpConfig);
+        if (__fuzz_hook != nullptr) { __fuzz_hook(40); }
+        return (void*)(i64)args->fn(args->ctx);
+    }
+    void* __thread_trampoline_move(void* param) {
+        __ThreadArgsMove* args = (__ThreadArgsMove*)param;
+        __active_allocator = args->_allocator;
+        __fp_apply(args->_fpConfig);
+        if (__fuzz_hook != nullptr) { __fuzz_hook(41); }
+        return (void*)(i64)args->fn(args->ctx);
+    }
 }
 
 // Returns the number of logical processors on the current system.
 // Equivalent to std::thread::hardware_concurrency().
 // Returns 0 if the value cannot be determined.
 int hardware_concurrency() {
-    os.windows._SystemInfo info = default;
-    os.windows.GetSystemInfo(&info);
-    return (int)info._numProc;
+    if const (__WINDOWS__) {
+        os.windows._SystemInfo info = default;
+        os.windows.GetSystemInfo(&info);
+        return (int)info._numProc;
+    } else {
+        return (int)os.posix.sysconf(os.posix._SC_NPROCESSORS_ONLN);
+    }
 }
 
 // Owning handle to a single OS thread; start it, then join/try_join/terminate.
@@ -118,8 +143,14 @@ struct Thread {
         args->_allocator = child;
         args->_fpConfig = fpConfig;
         _args = args;
-        i32 id = 0;
-        _handle = os.windows.CreateThread(nullptr, 0, __thread_trampoline, _args, 0, &id);
+        if const (__WINDOWS__) {
+            i32 id = 0;
+            _handle = os.windows.CreateThread(nullptr, 0, __thread_trampoline, _args, 0, &id);
+        } else {
+            void* tid = nullptr;
+            if (os.posix.pthread_create(&tid, nullptr, __thread_trampoline, _args) == 0) _handle = tid;
+            else _handle = nullptr;
+        }
         if (_handle == nullptr) {
             free((void*)_args);
             _args = nullptr;
@@ -146,8 +177,14 @@ struct Thread {
         args->_allocator = child;
         args->_fpConfig = fpConfig;
         _args = (void*)args;
-        i32 id = 0;
-        _handle = os.windows.CreateThread(nullptr, 0, __thread_trampoline_move, _args, 0, &id);
+        if const (__WINDOWS__) {
+            i32 id = 0;
+            _handle = os.windows.CreateThread(nullptr, 0, __thread_trampoline_move, _args, 0, &id);
+        } else {
+            void* tid = nullptr;
+            if (os.posix.pthread_create(&tid, nullptr, __thread_trampoline_move, _args) == 0) _handle = tid;
+            else _handle = nullptr;
+        }
         if (_handle == nullptr) {
             free((void*)_args);
             _args = nullptr;
@@ -159,10 +196,17 @@ struct Thread {
     // Blocks until the thread exits. Returns the thread's exit code.
     i32 join() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(42); }  // thread-fuzz sched-point
-        os.windows.WaitForSingleObject(_handle, -1);  // -1 == INFINITE
         i32 code = 0;
-        os.windows.GetExitCodeThread(_handle, &code);
-        os.windows.CloseHandle(_handle);
+        if const (__WINDOWS__) {
+            os.windows.WaitForSingleObject(_handle, -1);  // -1 == INFINITE
+            os.windows.GetExitCodeThread(_handle, &code);
+            os.windows.CloseHandle(_handle);
+        } else {
+            // pthread_join writes the trampoline's void* return (the i32 exit code).
+            void* ret = nullptr;
+            os.posix.pthread_join(_handle, &ret);
+            code = (i32)(i64)ret;
+        }
         free((void*)_args);
         _handle   = nullptr;
         _args     = nullptr;
@@ -173,18 +217,24 @@ struct Thread {
     // Returns true if the thread exited within timeout_ms; does full cleanup and
     // sets _exitCode. Returns false on timeout; all handles remain intact.
     bool try_join(i32 timeout_ms) {
-        i32 result = os.windows.WaitForSingleObject(_handle, timeout_ms);
-        if (result == 0) {
-            i32 code = 0;
-            os.windows.GetExitCodeThread(_handle, &code);
-            os.windows.CloseHandle(_handle);
-            free((void*)_args);
-            _handle   = nullptr;
-            _args     = nullptr;
-            _exitCode = code;
-            return true;
+        if const (__WINDOWS__) {
+            i32 result = os.windows.WaitForSingleObject(_handle, timeout_ms);
+            if (result == 0) {
+                i32 code = 0;
+                os.windows.GetExitCodeThread(_handle, &code);
+                os.windows.CloseHandle(_handle);
+                free((void*)_args);
+                _handle   = nullptr;
+                _args     = nullptr;
+                _exitCode = code;
+                return true;
+            }
+            return false;
+        } else {
+            // POSIX timed join (pthread_timedjoin_np) not yet ported; report "not
+            // ready" so callers fall back to a blocking join().
+            return false;
         }
-        return false;
     }
 
     // Pin this thread to a CPU affinity mask (Win32 SetThreadAffinityMask).
@@ -192,11 +242,14 @@ struct Thread {
     // Call after start() and before join(). No-op if the thread has not been started.
     void setAffinity(u64 mask) {
         if (_handle != nullptr) {
-            if const (__PLATFORM__ == 64) {
-                os.windows.SetThreadAffinityMask(_handle, mask);
-            } else {
-                os.windows.SetThreadAffinityMask(_handle, (u32)mask);
+            if const (__WINDOWS__) {
+                if const (__PLATFORM__ == 64) {
+                    os.windows.SetThreadAffinityMask(_handle, mask);
+                } else {
+                    os.windows.SetThreadAffinityMask(_handle, (u32)mask);
+                }
             }
+            // POSIX: pthread_setaffinity_np (cpu_set_t) not yet ported - no-op.
         }
     }
 
@@ -204,8 +257,12 @@ struct Thread {
     // use only when cooperative cancellation is not possible.
     void terminate() {
         if (_handle != nullptr) {
-            os.windows.TerminateThread(_handle, -1);
-            os.windows.CloseHandle(_handle);
+            if const (__WINDOWS__) {
+                os.windows.TerminateThread(_handle, -1);
+                os.windows.CloseHandle(_handle);
+            } else {
+                os.posix.pthread_cancel(_handle);
+            }
             free((void*)_args);
             _handle = nullptr;
             _args   = nullptr;

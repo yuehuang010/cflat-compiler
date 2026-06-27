@@ -1,3 +1,5 @@
 if const (__WINDOWS__) {
     import "os.windows.cb";
+} else {
+    import "os.posix.cb";
 }

@@ -377,3 +377,4 @@ FodyWeavers.xsd
 *.vsix
 *.time-trace.json
 build/
+out-linux/

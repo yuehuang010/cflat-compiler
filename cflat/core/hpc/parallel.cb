@@ -68,9 +68,13 @@ void __pfor_raw_hotloop_check() {
     if (__pfor_raw_call_count < 64) { return; }
     __pfor_raw_warned = true;
     char* msg = "[cflat/hpc] note: parallel_for_n / parallel_reduce (raw threads) have been called 64+ times; each call spawns and joins worker threads. In a hot loop use parallel_for_n_pool / parallel_reduce_pool with a resident pinned ThreadPool (pool.init(cores, cpu_mask_lowest(cores))) - see doc/HPC.md.\n";
-    void* hErr = os.windows.GetStdHandle(-12);                 // STD_ERROR_HANDLE
-    int written = 0;
-    os.windows.WriteFile(hErr, msg, (i32)strlen(msg), &written, nullptr);
+    if const (__WINDOWS__) {
+        void* hErr = os.windows.GetStdHandle(-12);             // STD_ERROR_HANDLE
+        int written = 0;
+        os.windows.WriteFile(hErr, msg, (i32)strlen(msg), &written, nullptr);
+    } else {
+        os.posix.write(2, (const void*)msg, (win_size)strlen(msg));   // fd 2 = stderr
+    }
 }
 
 // ----------------------------------------------------------------------------

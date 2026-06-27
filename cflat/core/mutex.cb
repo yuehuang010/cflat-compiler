@@ -1,4 +1,9 @@
-// mutex.cb - mutual-exclusion primitive backed by Win32 SRW lock.
+// mutex.cb - mutual-exclusion primitive.
+//
+// Windows: backed by a Win32 SRW lock (lock state lives inline in the pointer-
+// sized field; 0 == unlocked, no init/cleanup needed).
+// POSIX:   backed by a heap pthread_mutex_t pointer (lazily allocated, zeroed =
+// valid unlocked); destroy() releases it.
 //
 // Usage:
 //   mutex m;
@@ -8,34 +13,79 @@
 //
 //   m.acquire();            // manual acquire
 //   m.release();            // manual release
-//   m.sleep_cv(cv);         // atomically sleep on a condition variable, releasing the lock
-//   m.destroy();            // no-op for SRW; present for symmetry with older code
+//   m.sleep_cv(cvSlot);     // atomically sleep on a condition variable, releasing the lock
+//   m.destroy();            // frees the POSIX lock; no-op on Windows
 //
-// NOTE: SRW locks are NOT recursive. A thread that calls acquire() twice without
-// an intervening release() will deadlock. Use a CRITICAL_SECTION if you need recursion.
+// NOTE: neither SRW nor a default pthread mutex is recursive. A thread that calls
+// acquire() twice without an intervening release() will deadlock.
+//
+// POSIX lazy-init note: _srw is allocated on first acquire(). All current callers
+// first touch a mutex from its creating thread before publishing the containing
+// object to other threads, so the lazy allocation is not racy in practice.
 
-// Mutual-exclusion lock backed by a Win32 SRW lock (non-recursive).
+// Mutual-exclusion lock (non-recursive).
 struct mutex {
-    void* _srw = nullptr;  // Win32 SRWLOCK - lock state stored in the pointer value; 0 == unlocked
+    void* _srw = nullptr;  // Windows: SRWLOCK inline (0 == unlocked). POSIX: heap pthread_mutex_t*.
 
     // Acquire the lock exclusively, blocking until it is available.
     void acquire() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(1); }  // thread-fuzz sched-point
-        os.windows.AcquireSRWLockExclusive(&_srw);
+        if const (__WINDOWS__) { os.windows.AcquireSRWLockExclusive(&_srw); }
+        else { os.posix.pthread_mutex_lock(os.posix.ensure_mutex(&_srw)); }
     }
 
     // Release the exclusive lock.
     void release() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(2); }  // thread-fuzz sched-point
-        os.windows.ReleaseSRWLockExclusive(&_srw);
+        if const (__WINDOWS__) { os.windows.ReleaseSRWLockExclusive(&_srw); }
+        else { os.posix.pthread_mutex_unlock(os.posix.ensure_mutex(&_srw)); }
     }
 
-    // Atomically release the lock and sleep on cv until woken, then reacquire.
-    // Pass INFINITE (-1) for ms to block indefinitely.
-    void sleep_cv(void* cv) {
-        os.windows.SleepConditionVariableSRW(cv, &_srw, -1, (u32)0);
+    // Atomically release the lock and sleep on the condition variable until woken,
+    // then reacquire. cvSlot is the address of the caller's void* condvar field
+    // (on Windows that storage IS the CONDITION_VARIABLE; on POSIX it holds a heap
+    // pthread_cond_t pointer). Pass INFINITE (-1) for ms to block indefinitely.
+    void sleep_cv(void* cvSlot) {
+        if const (__WINDOWS__) { os.windows.SleepConditionVariableSRW(cvSlot, &_srw, -1, (u32)0); }
+        else { os.posix.pthread_cond_wait(os.posix.ensure_cond((void**)cvSlot), os.posix.ensure_mutex(&_srw)); }
     }
 
-    // No-op - SRW locks require no cleanup (no kernel object, no heap allocation).
-    void destroy() { }
+    // Release the underlying lock. No-op on Windows (SRW needs no cleanup).
+    void destroy() {
+        if const (__WINDOWS__) { }
+        else {
+            if (_srw != nullptr) { os.posix.pthread_mutex_destroy(_srw); free(_srw); _srw = nullptr; }
+        }
+    }
 };
+
+// Condition-variable helpers, paired with mutex.sleep_cv. A condvar is a caller-
+// owned void* field ("slot"): on Windows the field's 8 bytes ARE the Win32
+// CONDITION_VARIABLE; on POSIX the field holds a lazily-allocated heap
+// pthread_cond_t pointer. Always pass the slot's ADDRESS (&field).
+
+// Prepare a condvar slot for use. On POSIX this lazily allocates the cond.
+void cv_init(void** slot) {
+    if const (__WINDOWS__) { os.windows.InitializeConditionVariable((void*)slot); }
+    else { os.posix.ensure_cond(slot); }
+}
+
+// Wake one thread waiting on the condvar.
+void cv_wake_one(void** slot) {
+    if const (__WINDOWS__) { os.windows.WakeConditionVariable((void*)slot); }
+    else { os.posix.pthread_cond_signal(os.posix.ensure_cond(slot)); }
+}
+
+// Wake all threads waiting on the condvar.
+void cv_wake_all(void** slot) {
+    if const (__WINDOWS__) { os.windows.WakeAllConditionVariable((void*)slot); }
+    else { os.posix.pthread_cond_broadcast(os.posix.ensure_cond(slot)); }
+}
+
+// Release the condvar. No-op on Windows (CONDITION_VARIABLE needs no cleanup).
+void cv_destroy(void** slot) {
+    if const (__WINDOWS__) { }
+    else {
+        if (slot[0] != nullptr) { os.posix.pthread_cond_destroy(slot[0]); free(slot[0]); slot[0] = nullptr; }
+    }
+}

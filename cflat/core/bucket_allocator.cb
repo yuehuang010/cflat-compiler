@@ -424,8 +424,14 @@ class BucketAllocator : IAllocator
         // lives on the CRT heap; HeapValidate guards against vmem-backed blocks
         // from other allocators that would corrupt the CRT heap. No page-header
         // read here, so a foreign pointer is never dereferenced.
-        if (os.windows.HeapValidate(os.windows.GetProcessHeap(), 0u, ptr))
+        if const (__WINDOWS__) {
+            if (os.windows.HeapValidate(os.windows.GetProcessHeap(), 0u, ptr))
+                free(ptr);
+        } else {
+            // POSIX has no HeapValidate equivalent; foreign pointers reaching here
+            // are libc-malloc blocks in practice, so free directly.
             free(ptr);
+        }
     }
 
     // Lock-taking entry point used by the registry router (_ba_route_free). The

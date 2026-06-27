@@ -3,6 +3,10 @@
 ###############################################################################
 * text=auto
 
+# Shell scripts must stay LF even on Windows checkouts - test.sh runs under WSL
+# (reading /mnt/c), and CRLF would break the shebang / `set` parsing there.
+*.sh text eol=lf
+
 ###############################################################################
 # Set default behavior for command prompt diff.
 #

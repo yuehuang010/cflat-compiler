@@ -31,7 +31,12 @@ i64 _timeQpcFreq = 0;
 i64 _timeGetQpcFreq()
 {
     if (_timeQpcFreq == 0)
-        os.windows.QueryPerformanceFrequency(&_timeQpcFreq);
+    {
+        if const (__WINDOWS__)
+            os.windows.QueryPerformanceFrequency(&_timeQpcFreq);
+        else
+            _timeQpcFreq = os.posix.monotonic_freq();
+    }
     return _timeQpcFreq;
 }
 
@@ -48,9 +53,16 @@ i64 _qpcToTicks(i64 qpc)
 // Read the current raw QPC counter value.
 i64 _qpcNow()
 {
-    i64 count = 0;
-    os.windows.QueryPerformanceCounter(&count);
-    return count;
+    if const (__WINDOWS__)
+    {
+        i64 count = 0;
+        os.windows.QueryPerformanceCounter(&count);
+        return count;
+    }
+    else
+    {
+        return os.posix.monotonic_nanos();
+    }
 }
 
 // ── Duration ─────────────────────────────────────────────────────────────────
@@ -135,7 +147,10 @@ struct TimePoint
     static TimePoint now()
     {
         TimePoint tp;
-        os.windows.GetSystemTimeAsFileTime(&tp._ticks);
+        if const (__WINDOWS__)
+            os.windows.GetSystemTimeAsFileTime(&tp._ticks);
+        else
+            tp._ticks = os.posix.filetime_now();
         return tp;
     }
 
@@ -268,7 +283,12 @@ struct Timer
 void sleep(i64 ms)
 {
     if (ms > 0)
-        os.windows.Sleep((i32)ms);
+    {
+        if const (__WINDOWS__)
+            os.windows.Sleep((i32)ms);
+        else
+            os.posix.sleep_ms((i32)ms);
+    }
 }
 
 // Emit an LFENCE: a load fence that also serializes the instruction stream.

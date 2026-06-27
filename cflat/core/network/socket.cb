@@ -14,23 +14,32 @@ import "string.cb";
 
 if const (__WINDOWS__) {
     import "network/socket.windows.cb";
+} else {
+    import "network/socket.posix.cb";
 }
 
-// AF_INET, SOCK_STREAM/DGRAM, IPPROTO_TCP/UDP - standard POSIX/Winsock constants.
-// SOL_SOCKET = 0xFFFF (Winsock) / 1 (POSIX); SO_REUSEADDR = 4 / 2.
-// These match Winsock2; a future POSIX path would need different values.
+// AF_INET, SOCK_STREAM/DGRAM, IPPROTO_TCP/UDP - identical on POSIX and Winsock.
 int _SOCK_AF_INET    = 2;
 int _SOCK_STREAM     = 1;
 int _SOCK_DGRAM      = 2;
 int _SOCK_PROTO_TCP  = 6;
 int _SOCK_PROTO_UDP  = 17;
-int _SOCK_SOL_SOCKET = 65535;   // 0xFFFF
-int _SOCK_REUSEADDR  = 4;
-int _SOCK_KEEPALIVE  = 8;
 int _TCP_NODELAY     = 1;
 int _IPPROTO_TCP     = 6;
 int _SOMAXCONN       = 2147483647;  // 0x7fffffff
-int _SOCK_FIONBIO    = -2147195266; // 0x8004667E - ioctlsocket non-blocking mode
+int _SOCK_FIONBIO    = -2147195266; // 0x8004667E - Winsock FIONBIO (ignored on POSIX)
+
+// These socket-option levels/names differ between Winsock and POSIX.
+//   SOL_SOCKET: 0xFFFF (Winsock) vs 1 (POSIX); SO_REUSEADDR: 4 vs 2; SO_KEEPALIVE: 8 vs 9.
+if const (__WINDOWS__) {
+    int _SOCK_SOL_SOCKET = 65535;   // 0xFFFF
+    int _SOCK_REUSEADDR  = 4;
+    int _SOCK_KEEPALIVE  = 8;
+} else {
+    int _SOCK_SOL_SOCKET = 1;
+    int _SOCK_REUSEADDR  = 2;
+    int _SOCK_KEEPALIVE  = 9;
+}
 
 class Socket
 {
@@ -64,21 +73,15 @@ class Socket
     bool createTcp()
     {
         close();
-        if const (__WINDOWS__) {
-            _handle = socket(_SOCK_AF_INET, _SOCK_STREAM, _SOCK_PROTO_TCP);
-            return _handle != (void*)(i64)-1;
-        }
-        return false;
+        _handle = socket(_SOCK_AF_INET, _SOCK_STREAM, _SOCK_PROTO_TCP);
+        return _handle != (void*)(i64)-1;
     }
 
     bool createUdp()
     {
         close();
-        if const (__WINDOWS__) {
-            _handle = socket(_SOCK_AF_INET, _SOCK_DGRAM, _SOCK_PROTO_UDP);
-            return _handle != (void*)(i64)-1;
-        }
-        return false;
+        _handle = socket(_SOCK_AF_INET, _SOCK_DGRAM, _SOCK_PROTO_UDP);
+        return _handle != (void*)(i64)-1;
     }
 
     // ── Server ─────────────────────────────────────────────────────────────────
@@ -87,29 +90,23 @@ class Socket
     bool bind(string host, int port)
     {
         if (_handle == nullptr) return false;
-        if const (__WINDOWS__) {
-            _SockAddrIn* addr = new _SockAddrIn;
-            addr->sin_family = (i16)_SOCK_AF_INET;
-            addr->sin_port   = htons((u16)port);
-            if (host.length() == 0) {
-                addr->sin_addr = 0;  // INADDR_ANY
-            } else {
-                addr->sin_addr = inet_addr(host.data());
-            }
-            i32 rc = _wsa_bind(_handle, addr, 16);
-            delete addr;
-            return rc == 0;
+        _SockAddrIn* addr = new _SockAddrIn;
+        addr->sin_family = (i16)_SOCK_AF_INET;
+        addr->sin_port   = htons((u16)port);
+        if (host.length() == 0) {
+            addr->sin_addr = 0;  // INADDR_ANY
+        } else {
+            addr->sin_addr = inet_addr(host.data());
         }
-        return false;
+        i32 rc = _wsa_bind(_handle, addr, 16);
+        delete addr;
+        return rc == 0;
     }
 
     bool listenOn(int backlog)
     {
         if (_handle == nullptr) return false;
-        if const (__WINDOWS__) {
-            return _wsa_listen(_handle, backlog) == 0;
-        }
-        return false;
+        return _wsa_listen(_handle, backlog) == 0;
     }
 
     // Accept an incoming connection. Returns a new Socket* on success, nullptr on failure.
@@ -117,17 +114,14 @@ class Socket
     Socket* accept()
     {
         if (_handle == nullptr) return nullptr;
-        if const (__WINDOWS__) {
-            _SockAddrIn* addr = new _SockAddrIn;
-            i32 addrlen = 16;
-            void* client = _wsa_accept(_handle, addr, &addrlen);
-            delete addr;
-            if (client == (void*)(i64)-1) return nullptr;
-            Socket* s = new Socket;
-            s->_handle = client;
-            return s;
-        }
-        return nullptr;
+        _SockAddrIn* addr = new _SockAddrIn;
+        i32 addrlen = 16;
+        void* client = _wsa_accept(_handle, addr, &addrlen);
+        delete addr;
+        if (client == (void*)(i64)-1) return nullptr;
+        Socket* s = new Socket;
+        s->_handle = client;
+        return s;
     }
 
     // ── Client ─────────────────────────────────────────────────────────────────
@@ -136,38 +130,35 @@ class Socket
     bool connect(string host, int port)
     {
         if (_handle == nullptr) return false;
-        if const (__WINDOWS__) {
-            // Convert port int to decimal string for getaddrinfo.
-            i8* portBuf = new i8[8];
-            sprintf(portBuf, "%d", port);
+        // Convert port int to decimal string for getaddrinfo.
+        i8* portBuf = new i8[8];
+        sprintf(portBuf, "%d", port);
 
-            _AddrInfo* hints = new _AddrInfo;
-            hints->ai_family   = _SOCK_AF_INET;
-            hints->ai_socktype = _SOCK_STREAM;
-            hints->ai_protocol = _SOCK_PROTO_TCP;
+        _AddrInfo* hints = new _AddrInfo;
+        hints->ai_family   = _SOCK_AF_INET;
+        hints->ai_socktype = _SOCK_STREAM;
+        hints->ai_protocol = _SOCK_PROTO_TCP;
 
-            _AddrInfo* results = nullptr;
-            i32 rc = getaddrinfo(host.data(), portBuf, hints, &results);
-            delete portBuf;
-            delete hints;
-            if (rc != 0) return false;
+        _AddrInfo* results = nullptr;
+        i32 rc = getaddrinfo(host.data(), portBuf, hints, &results);
+        delete portBuf;
+        delete hints;
+        if (rc != 0) return false;
 
-            bool ok = false;
-            _AddrInfo* cur = results;
-            while (cur != nullptr) {
-                _SockAddrIn* addr = (_SockAddrIn*)cur->ai_addr;
-                if (addr != nullptr) {
-                    ok = _wsa_connect(_handle, addr, 16) == 0;
-                    if (ok) { cur = nullptr; }  // break
-                    else { cur = cur->ai_next; }
-                } else {
-                    cur = cur->ai_next;
-                }
+        bool ok = false;
+        _AddrInfo* cur = results;
+        while (cur != nullptr) {
+            _SockAddrIn* addr = (_SockAddrIn*)cur->ai_addr;
+            if (addr != nullptr) {
+                ok = _wsa_connect(_handle, addr, 16) == 0;
+                if (ok) { cur = nullptr; }  // break
+                else { cur = cur->ai_next; }
+            } else {
+                cur = cur->ai_next;
             }
-            freeaddrinfo(results);
-            return ok;
         }
-        return false;
+        freeaddrinfo(results);
+        return ok;
     }
 
     // ── I/O ────────────────────────────────────────────────────────────────────
@@ -176,20 +167,14 @@ class Socket
     int send(const char* buf, int len)
     {
         if (_handle == nullptr) return -1;
-        if const (__WINDOWS__) {
-            return (int)_wsa_send(_handle, buf, len, 0);
-        }
-        return -1;
+        return (int)_wsa_send(_handle, buf, len, 0);
     }
 
     // Receive up to len bytes. Returns bytes received, 0 if peer closed, -1 on error.
     int recv(i8* buf, int len)
     {
         if (_handle == nullptr) return -1;
-        if const (__WINDOWS__) {
-            return (int)_wsa_recv(_handle, buf, len, 0);
-        }
-        return -1;
+        return (int)_wsa_recv(_handle, buf, len, 0);
     }
 
     // ── Options ────────────────────────────────────────────────────────────────
@@ -197,19 +182,15 @@ class Socket
     void setReuseAddr(bool enable)
     {
         if (_handle == nullptr) return;
-        if const (__WINDOWS__) {
-            i32 val = enable ? 1 : 0;
-            setsockopt(_handle, _SOCK_SOL_SOCKET, _SOCK_REUSEADDR, (const char*)&val, 4);
-        }
+        i32 val = enable ? 1 : 0;
+        setsockopt(_handle, _SOCK_SOL_SOCKET, _SOCK_REUSEADDR, (const char*)&val, 4);
     }
 
     void setNoDelay(bool enable)
     {
         if (_handle == nullptr) return;
-        if const (__WINDOWS__) {
-            i32 val = enable ? 1 : 0;
-            setsockopt(_handle, _IPPROTO_TCP, _TCP_NODELAY, (const char*)&val, 4);
-        }
+        i32 val = enable ? 1 : 0;
+        setsockopt(_handle, _IPPROTO_TCP, _TCP_NODELAY, (const char*)&val, 4);
     }
 
     // Put the socket in non-blocking mode (true) or blocking mode (false).
@@ -218,10 +199,8 @@ class Socket
     void setNonBlocking(bool enable)
     {
         if (_handle == nullptr) return;
-        if const (__WINDOWS__) {
-            u32 mode = enable ? 1 : 0;
-            _wsa_ioctlsocket(_handle, (i32)_SOCK_FIONBIO, &mode);
-        }
+        u32 mode = enable ? 1 : 0;
+        _wsa_ioctlsocket(_handle, (i32)_SOCK_FIONBIO, &mode);
     }
 
     // ── State ──────────────────────────────────────────────────────────────────
@@ -231,9 +210,7 @@ class Socket
     void close()
     {
         if (_handle == nullptr) return;
-        if const (__WINDOWS__) {
-            closesocket(_handle);
-        }
+        closesocket(_handle);
         _handle = nullptr;
     }
 

@@ -58,10 +58,16 @@ class EntryAllocator : IAllocator
     // Read the OS allocation granularity into _pageSize and derive _pageMask.
     void _initPageSize()
     {
-        os.windows._SystemInfo* si = (os.windows._SystemInfo*)malloc((i64)sizeof(os.windows._SystemInfo));
-        os.windows.GetSystemInfo(si);
-        _pageSize = (i64)si->_allocGranularity;
-        free((void*)si);
+        if const (__WINDOWS__) {
+            os.windows._SystemInfo* si = (os.windows._SystemInfo*)malloc((i64)sizeof(os.windows._SystemInfo));
+            os.windows.GetSystemInfo(si);
+            _pageSize = (i64)si->_allocGranularity;
+            free((void*)si);
+        } else {
+            // POSIX has no separate allocation granularity; mirror block_allocator's
+            // 64 KB choice (matches the Windows allocation granularity).
+            _pageSize = (i64)65536;
+        }
         _pageMask = ~(_pageSize - (i64)1);
     }
 

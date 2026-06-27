@@ -125,7 +125,18 @@ struct MouseEvent {
 
 // readKey - read one key press; extended keys return 0/0xE0, then the scan code on the next call.
 int readKey() {
-    return os.windows._getch();
+    if const (__WINDOWS__) {
+        return os.windows._getch();
+    } else {
+        // POSIX: briefly switch stdin to cbreak so a single byte reads unbuffered
+        // and unechoed, matching _getch's contract. Escape sequences come through
+        // byte-by-byte on subsequent calls.
+        i8[64] saved = default;
+        os.posix.term_make_raw(0, &saved[0]);
+        i32 c = os.posix.term_read_byte(0);
+        os.posix.term_restore_mode(0, &saved[0]);
+        return c;
+    }
 }
 
 // ── Terminal ─────────────────────────────────────────────────────────────────
@@ -138,44 +149,66 @@ struct Terminal {
     i32   _savedIn  = 0;
     i32   _savedCP  = 0;
     bool  _active   = false;
+    void* _termiosSaved = nullptr;   // POSIX: heap copy of the pre-raw termios
 
     // Enable ANSI processing on stdout and switch stdin to raw (no echo, no
     // line-buffering). Returns false if the handles are not real console handles
     // (e.g., redirected I/O in CI). Calling other methods is safe even after a
     // false return - they just become no-ops or degrade gracefully.
     bool init() {
-        // STD_OUTPUT_HANDLE = (DWORD)(-11), STD_INPUT_HANDLE = (DWORD)(-10)
-        _hOut = os.windows.GetStdHandle(-11);
-        _hIn  = os.windows.GetStdHandle(-10);
-        if (_hOut == nullptr || _hIn == nullptr) return false;
+        if const (__WINDOWS__) {
+            // STD_OUTPUT_HANDLE = (DWORD)(-11), STD_INPUT_HANDLE = (DWORD)(-10)
+            _hOut = os.windows.GetStdHandle(-11);
+            _hIn  = os.windows.GetStdHandle(-10);
+            if (_hOut == nullptr || _hIn == nullptr) return false;
 
-        if (os.windows.GetConsoleMode(_hOut, &_savedOut) == 0) return false;
-        if (os.windows.GetConsoleMode(_hIn,  &_savedIn)  == 0) return false;
+            if (os.windows.GetConsoleMode(_hOut, &_savedOut) == 0) return false;
+            if (os.windows.GetConsoleMode(_hIn,  &_savedIn)  == 0) return false;
 
-        // Add ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x04) to existing output flags.
-        os.windows.SetConsoleMode(_hOut, _savedOut | 0x04);
+            // Add ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x04) to existing output flags.
+            os.windows.SetConsoleMode(_hOut, _savedOut | 0x04);
 
-        // Switch to UTF-8 output so Unicode characters (e.g. ▀ for image rendering)
-        // are encoded correctly. Saved and restored in restore().
-        _savedCP = os.windows.GetConsoleOutputCP();
-        os.windows.SetConsoleOutputCP(65001);
+            // Switch to UTF-8 output so Unicode characters (e.g. the upper-half
+            // block for image rendering) are encoded correctly. Restored later.
+            _savedCP = os.windows.GetConsoleOutputCP();
+            os.windows.SetConsoleOutputCP(65001);
 
-        // ENABLE_EXTENDED_FLAGS (0x80) | ENABLE_MOUSE_INPUT (0x10).
-        // Clears ENABLE_QUICK_EDIT_MODE (required for mouse events to arrive),
-        // disables echo/line-buffering, and enables mouse event delivery.
-        os.windows.SetConsoleMode(_hIn, 0x90);
+            // ENABLE_EXTENDED_FLAGS (0x80) | ENABLE_MOUSE_INPUT (0x10).
+            // Clears ENABLE_QUICK_EDIT_MODE (required for mouse events to arrive),
+            // disables echo/line-buffering, and enables mouse event delivery.
+            os.windows.SetConsoleMode(_hIn, 0x90);
 
-        _active = true;
-        return true;
+            _active = true;
+            return true;
+        } else {
+            // POSIX: fd 0 = stdin, fd 1 = stdout. VT processing and UTF-8 are the
+            // terminal's native behaviour, so there is no mode/codepage to set;
+            // we only switch stdin to cbreak (raw) and remember the old settings.
+            _hIn  = (void*)(i64)0;
+            _hOut = (void*)(i64)1;
+            i8* saved = new i8[64];
+            if (os.posix.term_make_raw(0, saved) != 0) { delete[] saved; return false; }
+            _termiosSaved = (void*)saved;
+            _active = true;
+            return true;
+        }
     }
 
     // Restore the console to the modes saved at init(). Safe to call multiple
     // times. Also called automatically by ~Terminal().
     void restore() {
         if (_active) {
-            os.windows.SetConsoleMode(_hOut, _savedOut);
-            os.windows.SetConsoleMode(_hIn,  _savedIn);
-            os.windows.SetConsoleOutputCP(_savedCP);
+            if const (__WINDOWS__) {
+                os.windows.SetConsoleMode(_hOut, _savedOut);
+                os.windows.SetConsoleMode(_hIn,  _savedIn);
+                os.windows.SetConsoleOutputCP(_savedCP);
+            } else {
+                if (_termiosSaved != nullptr) {
+                    os.posix.term_restore_mode(0, _termiosSaved);
+                    delete[] (i8*)_termiosSaved;
+                    _termiosSaved = nullptr;
+                }
+            }
             _active = false;
         }
     }
@@ -187,26 +220,35 @@ struct Terminal {
     bool supportsSixel() {
         if (!_active) return false;
 
-        os.windows.FlushConsoleInputBuffer(_hIn);
-        printf("\033[c");
-        fflush(nullptr);
-
-        os.windows.Sleep(150);
-
         char[128] resp;
         int  rlen = 0;
 
-        i32 count = 0;
-        os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
-        while (count > 0 && rlen < 127) {
-            os.windows._INPUT_RECORD rec;
-            i32 read = 0;
-            if (os.windows.ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) break;
-            if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
-                char c = (char)(rec._event.key.uChar & 0xFF);
-                if (c != '\0') { resp[rlen] = c; rlen++; }
-            }
+        if const (__WINDOWS__) {
+            os.windows.FlushConsoleInputBuffer(_hIn);
+            printf("\033[c");
+            fflush(nullptr);
+            os.windows.Sleep(150);
+            i32 count = 0;
             os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
+            while (count > 0 && rlen < 127) {
+                os.windows._INPUT_RECORD rec;
+                i32 read = 0;
+                if (os.windows.ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) break;
+                if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
+                    char c = (char)(rec._event.key.uChar & 0xFF);
+                    if (c != '\0') { resp[rlen] = c; rlen++; }
+                }
+                os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
+            }
+        } else {
+            printf("\033[c");
+            fflush(nullptr);
+            // Gather the reply with a 150 ms inactivity timeout (raw stdin).
+            while (rlen < 127 && os.posix.term_poll_in(0, 150) > 0) {
+                i32 c = os.posix.term_read_byte(0);
+                if (c < 0) break;
+                resp[rlen] = (char)c; rlen++;
+            }
         }
         resp[rlen] = '\0';
 
@@ -240,26 +282,34 @@ struct Terminal {
         *cellH = 16;
         if (!_active) return;
 
-        os.windows.FlushConsoleInputBuffer(_hIn);
-        printf("\033[16t");
-        fflush(nullptr);
-
-        os.windows.Sleep(150);
-
         char[128] resp;
         int  rlen = 0;
 
-        i32 count = 0;
-        os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
-        while (count > 0 && rlen < 127) {
-            os.windows._INPUT_RECORD rec;
-            i32 read = 0;
-            if (os.windows.ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) break;
-            if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
-                char c = (char)(rec._event.key.uChar & 0xFF);
-                if (c != '\0') { resp[rlen] = c; rlen++; }
-            }
+        if const (__WINDOWS__) {
+            os.windows.FlushConsoleInputBuffer(_hIn);
+            printf("\033[16t");
+            fflush(nullptr);
+            os.windows.Sleep(150);
+            i32 count = 0;
             os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
+            while (count > 0 && rlen < 127) {
+                os.windows._INPUT_RECORD rec;
+                i32 read = 0;
+                if (os.windows.ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) break;
+                if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
+                    char c = (char)(rec._event.key.uChar & 0xFF);
+                    if (c != '\0') { resp[rlen] = c; rlen++; }
+                }
+                os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
+            }
+        } else {
+            printf("\033[16t");
+            fflush(nullptr);
+            while (rlen < 127 && os.posix.term_poll_in(0, 150) > 0) {
+                i32 c = os.posix.term_read_byte(0);
+                if (c < 0) break;
+                resp[rlen] = (char)c; rlen++;
+            }
         }
         resp[rlen] = '\0';
 
@@ -323,47 +373,64 @@ struct Terminal {
         *width  = 0;
         *height = 0;
         if (_hOut == nullptr) return false;
-        os.windows._CONSOLE_SCREEN_BUFFER_INFO info;
-        if (os.windows.GetConsoleScreenBufferInfo(_hOut, &info) == 0) return false;
-        *width  = (int)(info.winRight  - info.winLeft + 1);
-        *height = (int)(info.winBottom - info.winTop  + 1);
-        return true;
+        if const (__WINDOWS__) {
+            os.windows._CONSOLE_SCREEN_BUFFER_INFO info;
+            if (os.windows.GetConsoleScreenBufferInfo(_hOut, &info) == 0) return false;
+            *width  = (int)(info.winRight  - info.winLeft + 1);
+            *height = (int)(info.winBottom - info.winTop  + 1);
+            return true;
+        } else {
+            return os.posix.term_get_size(width, height);
+        }
     }
 
     // Non-blocking: fill *out and return true if a key-down event is waiting.
     // Returns false immediately when the input queue is empty.
     bool pollKey(KeyEvent* out) {
         if (_hIn == nullptr) return false;
-        i32 count = 0;
-        os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
-        if (count == 0) return false;
-        return _readNextKey(out, false);
+        if const (__WINDOWS__) {
+            i32 count = 0;
+            os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
+            if (count == 0) return false;
+            return _readNextKey(out, false);
+        } else {
+            if (os.posix.term_poll_in(0, 0) <= 0) return false;
+            return _posixReadKey(out);
+        }
     }
 
     // Blocking: wait for the next key-down event, fill *out, and return true.
     bool readKey(KeyEvent* out) {
         if (_hIn == nullptr) return false;
-        return _readNextKey(out, true);
+        if const (__WINDOWS__) { return _readNextKey(out, true); }
+        else { return _posixReadKey(out); }   // blocking via VMIN=1 cbreak mode
     }
 
     // Non-blocking: fill *out and return true if a mouse event is waiting.
     // Discards queued key events. Returns false when the queue has no mouse events.
     bool pollMouse(MouseEvent* out) {
         if (_hIn == nullptr) return false;
-        os.windows._INPUT_RECORD rec;
-        i32 read = 0;
-        while (true) {
-            i32 count = 0;
-            os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
-            if (count == 0) return false;
-            if (os.windows.ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) return false;
-            if (rec.eventType == 2) {
-                _fillMouse(out, &rec._event.mouse);
-                _adjustMouseCoords(out);
-                return true;
+        if const (__WINDOWS__) {
+            os.windows._INPUT_RECORD rec;
+            i32 read = 0;
+            while (true) {
+                i32 count = 0;
+                os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
+                if (count == 0) return false;
+                if (os.windows.ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) return false;
+                if (rec.eventType == 2) {
+                    _fillMouse(out, &rec._event.mouse);
+                    _adjustMouseCoords(out);
+                    return true;
+                }
             }
+            return false;
+        } else {
+            // A POSIX tty delivers mouse events as SGR escape sequences interleaved
+            // with key input, not as a separate queue; standalone mouse polling is
+            // not supported here. Returns false (no mouse event).
+            return false;
         }
-        return false;
     }
 
     // Non-blocking unified event poll. Consumes one event from the queue and sets
@@ -372,34 +439,50 @@ struct Terminal {
     // you don't need that struct filled.
     bool pollEvent(i32* eventType, KeyEvent* key, MouseEvent* mouse) {
         if (_hIn == nullptr) return false;
-        os.windows._INPUT_RECORD rec;
-        i32 read = 0;
-        while (true) {
-            i32 count = 0;
-            os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
-            if (count == 0) return false;
-            if (os.windows.ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) return false;
-            if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
-                *eventType = 1;
-                if (key != nullptr) {
-                    key->keyDown      = true;
-                    key->vkCode       = rec._event.key.vkCode;
-                    key->scanCode     = rec._event.key.vkScan;
-                    key->ch           = (char)(rec._event.key.uChar & 0xFF);
-                    key->controlState = rec._event.key.controlKeyState;
+        if const (__WINDOWS__) {
+            os.windows._INPUT_RECORD rec;
+            i32 read = 0;
+            while (true) {
+                i32 count = 0;
+                os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
+                if (count == 0) return false;
+                if (os.windows.ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) return false;
+                if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
+                    *eventType = 1;
+                    if (key != nullptr) {
+                        key->keyDown      = true;
+                        key->vkCode       = rec._event.key.vkCode;
+                        key->scanCode     = rec._event.key.vkScan;
+                        key->ch           = (char)(rec._event.key.uChar & 0xFF);
+                        key->controlState = rec._event.key.controlKeyState;
+                    }
+                    return true;
                 }
-                return true;
-            }
-            if (rec.eventType == 2) {
-                *eventType = 2;
-                if (mouse != nullptr) {
-                    _fillMouse(mouse, &rec._event.mouse);
-                    _adjustMouseCoords(mouse);
+                if (rec.eventType == 2) {
+                    *eventType = 2;
+                    if (mouse != nullptr) {
+                        _fillMouse(mouse, &rec._event.mouse);
+                        _adjustMouseCoords(mouse);
+                    }
+                    return true;
                 }
-                return true;
             }
+            return false;
+        } else {
+            // POSIX: key events only (see pollMouse re: mouse on a tty).
+            if (os.posix.term_poll_in(0, 0) <= 0) return false;
+            KeyEvent tmp;
+            if (!_posixReadKey(&tmp)) return false;
+            *eventType = 1;
+            if (key != nullptr) {
+                key->keyDown      = tmp.keyDown;
+                key->vkCode       = tmp.vkCode;
+                key->scanCode     = tmp.scanCode;
+                key->ch           = tmp.ch;
+                key->controlState = tmp.controlState;
+            }
+            return true;
         }
-        return false;
     }
 
     // Restore console modes on destruction.
@@ -409,46 +492,108 @@ struct Terminal {
     // block=true  - keeps reading (discarding non-key and key-up events) until a key-down arrives.
     // block=false - reads only already-queued events; returns false when the queue is drained.
     bool _readNextKey(KeyEvent* out, bool block) {
-        os.windows._INPUT_RECORD rec;
-        i32 read = 0;
-        while (true) {
-            if (!block) {
-                i32 count = 0;
-                os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
-                if (count == 0) return false;
+        if const (__WINDOWS__) {
+            os.windows._INPUT_RECORD rec;
+            i32 read = 0;
+            while (true) {
+                if (!block) {
+                    i32 count = 0;
+                    os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
+                    if (count == 0) return false;
+                }
+                if (os.windows.ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) return false;
+                // eventType == 1 is KEY_EVENT; keyDown != 0 filters out key-release events.
+                if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
+                    out->keyDown      = true;
+                    out->vkCode       = rec._event.key.vkCode;
+                    out->scanCode     = rec._event.key.vkScan;
+                    out->ch           = (char)(rec._event.key.uChar & 0xFF);
+                    out->controlState = rec._event.key.controlKeyState;
+                    return true;
+                }
             }
-            if (os.windows.ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) return false;
-            // eventType == 1 is KEY_EVENT; keyDown != 0 filters out key-release events.
-            if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
-                out->keyDown      = true;
-                out->vkCode       = rec._event.key.vkCode;
-                out->scanCode     = rec._event.key.vkScan;
-                out->ch           = (char)(rec._event.key.uChar & 0xFF);
-                out->controlState = rec._event.key.controlKeyState;
-                return true;
-            }
+            return false;
+        } else {
+            return false;   // POSIX uses _posixReadKey
         }
-        return false;
     }
 
-    // Copy a Win32 mouse record into a MouseEvent.
-    void _fillMouse(MouseEvent* out, os.windows._MouseEventRecord* rec) {
-        out->x           = rec->mouseX;
-        out->y           = rec->mouseY;
-        out->buttonState = rec->buttonState;
-        out->eventFlags  = rec->eventFlags;
+    // POSIX: read one key (blocking under the VMIN=1 cbreak mode set by init())
+    // and decode it into a KeyEvent. ESC '[' / 'O' sequences map to the arrow /
+    // Home / End VK codes; printable bytes set ch (and an uppercased VK for
+    // letters). Modifier state is not recoverable from a tty byte stream.
+    bool _posixReadKey(KeyEvent* out) {
+        if const (__WINDOWS__) { return false; }
+        else {
+            i32 b0 = os.posix.term_read_byte(0);
+            if (b0 < 0) return false;
+            i16  vk = 0;
+            char ch = '\0';
+            if (b0 == 27) {
+                if (os.posix.term_poll_in(0, 1) > 0) {
+                    i32 b1 = os.posix.term_read_byte(0);
+                    if (b1 == (i32)'[' || b1 == (i32)'O') {
+                        i32 b2 = os.posix.term_read_byte(0);
+                        if      (b2 == (i32)'A') vk = (i16)VK_UP;
+                        else if (b2 == (i32)'B') vk = (i16)VK_DOWN;
+                        else if (b2 == (i32)'C') vk = (i16)VK_RIGHT;
+                        else if (b2 == (i32)'D') vk = (i16)VK_LEFT;
+                        else if (b2 == (i32)'H') vk = (i16)VK_HOME;
+                        else if (b2 == (i32)'F') vk = (i16)VK_END;
+                        else                     vk = (i16)VK_ESCAPE;
+                    } else {
+                        vk = (i16)VK_ESCAPE;
+                    }
+                } else {
+                    vk = (i16)VK_ESCAPE;
+                }
+            } else if (b0 == 13 || b0 == 10) {
+                vk = (i16)VK_RETURN; ch = '\r';
+            } else if (b0 == 9) {
+                vk = (i16)VK_TAB; ch = '\t';
+            } else if (b0 == 127 || b0 == 8) {
+                vk = (i16)VK_BACK; ch = (char)8;
+            } else if (b0 >= 32 && b0 < 127) {
+                ch = (char)b0;
+                if (b0 >= (i32)'a' && b0 <= (i32)'z') vk = (i16)(b0 - 32);
+                else                                  vk = (i16)b0;
+            } else {
+                ch = (char)b0; vk = (i16)b0;
+            }
+            out->keyDown      = true;
+            out->vkCode       = vk;
+            out->scanCode     = 0;
+            out->ch           = ch;
+            out->controlState = 0;
+            return true;
+        }
+    }
+
+    // Copy a Win32 mouse record into a MouseEvent. recPtr is an
+    // os.windows._MouseEventRecord* (passed as void* so the signature compiles
+    // off-Windows; only ever called on the Windows path).
+    void _fillMouse(MouseEvent* out, void* recPtr) {
+        if const (__WINDOWS__) {
+            os.windows._MouseEventRecord* rec = (os.windows._MouseEventRecord*)recPtr;
+            out->x           = rec->mouseX;
+            out->y           = rec->mouseY;
+            out->buttonState = rec->buttonState;
+            out->eventFlags  = rec->eventFlags;
+        }
     }
 
     // Win32 reports mouse position in screen buffer coordinates (0-based from the
     // buffer top). Subtract the visible window's top-left corner to get
     // window-relative coordinates that match the ANSI cursor positions used by
-    // moveTo() and the board layout code.
+    // moveTo() and the board layout code. No-op off Windows (no console mouse).
     void _adjustMouseCoords(MouseEvent* out) {
         if (_hOut == nullptr) return;
-        os.windows._CONSOLE_SCREEN_BUFFER_INFO info;
-        if (os.windows.GetConsoleScreenBufferInfo(_hOut, &info) == 0) return;
-        out->x = (i16)(out->x - info.winLeft);
-        out->y = (i16)(out->y - info.winTop);
+        if const (__WINDOWS__) {
+            os.windows._CONSOLE_SCREEN_BUFFER_INFO info;
+            if (os.windows.GetConsoleScreenBufferInfo(_hOut, &info) == 0) return;
+            out->x = (i16)(out->x - info.winLeft);
+            out->y = (i16)(out->y - info.winTop);
+        }
     }
 };
 
@@ -503,20 +648,23 @@ void termPixel(int tr, int tg, int tb, int br, int bg, int bb) {
 
 // TerminalSnapshot - a captured frame of the console screen buffer (1-based rows/cols) from snapshot().
 struct TerminalSnapshot {
-    os.windows._CHAR_INFO* _buf = nullptr;
+    // One CHAR_INFO per cell packed into an i32: char in the low 16 bits, the
+    // Win32 attribute word in the high 16 bits. (Stored as i32* rather than a
+    // Windows struct type so this compiles on every platform.)
+    i32* _buf        = nullptr;
     int width        = 0;
     int height       = 0;
 
     // Character at (row, col). Returns ' ' when out of bounds.
     char getChar(int row, int col) {
         if (row < 1 || row > height || col < 1 || col > width) return ' ';
-        return (char)(_buf[(row - 1) * width + (col - 1)].ch & 0xFF);
+        return (char)(_buf[(row - 1) * width + (col - 1)] & 0xFF);
     }
 
     // Raw Win32 color attribute word at (row, col). 0 when out of bounds.
     int getAttr(int row, int col) {
         if (row < 1 || row > height || col < 1 || col > width) return 0;
-        return (int)_buf[(row - 1) * width + (col - 1)].attr;
+        return (int)((_buf[(row - 1) * width + (col - 1)] >> 16) & 0xFFFF);
     }
 
     // Returns true if text appears anywhere on screen (row-by-row; does not
@@ -531,7 +679,7 @@ struct TerminalSnapshot {
                 int j = 0;
                 bool match = true;
                 while (j < tlen) {
-                    char c = (char)(_buf[row * width + col + j].ch & 0xFF);
+                    char c = (char)(_buf[row * width + col + j] & 0xFF);
                     if (c != text[j]) { match = false; break; }
                     j++;
                 }
@@ -549,7 +697,7 @@ struct TerminalSnapshot {
         char* s = (char*)malloc((i64)(width + 1));
         int i = 0;
         while (i < width) {
-            s[i] = (char)(_buf[(row - 1) * width + i].ch & 0xFF);
+            s[i] = (char)(_buf[(row - 1) * width + i] & 0xFF);
             i++;
         }
         int end = width;
@@ -597,17 +745,21 @@ struct TerminalDriver {
     // Inject a single key-down event. controlState is the dwControlKeyState
     // bitmask (e.g. 0x04 = LEFT_CTRL_PRESSED). Pass 0 for a plain keystroke.
     void injectKey(i16 vkCode, char ch, i32 controlState) {
-        os.windows._INPUT_RECORD rec;
-        rec.eventType                        = 1;   // KEY_EVENT
-        rec._pad                             = 0;
-        rec._event.key.keyDown               = 1;
-        rec._event.key.repeatCount           = 1;
-        rec._event.key.vkCode                = vkCode;
-        rec._event.key.vkScan                = 0;
-        rec._event.key.uChar                 = (i16)ch;
-        rec._event.key.controlKeyState       = controlState;
-        i32 written = 0;
-        os.windows.WriteConsoleInputA(_hIn, &rec, 1, &written);
+        if const (__WINDOWS__) {
+            os.windows._INPUT_RECORD rec;
+            rec.eventType                        = 1;   // KEY_EVENT
+            rec._pad                             = 0;
+            rec._event.key.keyDown               = 1;
+            rec._event.key.repeatCount           = 1;
+            rec._event.key.vkCode                = vkCode;
+            rec._event.key.vkScan                = 0;
+            rec._event.key.uChar                 = (i16)ch;
+            rec._event.key.controlKeyState       = controlState;
+            i32 written = 0;
+            os.windows.WriteConsoleInputA(_hIn, &rec, 1, &written);
+        }
+        // POSIX: a real tty has no input-injection API (WriteConsoleInput has no
+        // analog); this is a no-op. Automated TUI tests need the Windows console.
     }
 
     // Inject a plain key-down with no modifier keys.
@@ -636,27 +788,33 @@ struct TerminalDriver {
     // output handle is not a real console (e.g. redirected in CI).
     bool snapshot(TerminalSnapshot* out) {
         if (_hOut == nullptr) return false;
-        os.windows._CONSOLE_SCREEN_BUFFER_INFO info;
-        if (os.windows.GetConsoleScreenBufferInfo(_hOut, &info) == 0) return false;
+        if const (__WINDOWS__) {
+            os.windows._CONSOLE_SCREEN_BUFFER_INFO info;
+            if (os.windows.GetConsoleScreenBufferInfo(_hOut, &info) == 0) return false;
 
-        int w = (int)(info.winRight  - info.winLeft  + 1);
-        int h = (int)(info.winBottom - info.winTop   + 1);
+            int w = (int)(info.winRight  - info.winLeft  + 1);
+            int h = (int)(info.winBottom - info.winTop   + 1);
 
-        if (out->_buf != nullptr) free((void*)out->_buf);
-        out->_buf   = (os.windows._CHAR_INFO*)malloc((i64)(w * h * 4));
-        out->width  = w;
-        out->height = h;
+            if (out->_buf != nullptr) free((void*)out->_buf);
+            out->_buf   = (i32*)malloc((i64)(w * h * 4));
+            out->width  = w;
+            out->height = h;
 
-        // Pack COORD values into i32: X in low 16 bits, Y in high 16 bits.
-        i32 bufSize  = (i32)w | ((i32)h << 16);  // buffer dimensions
-        i32 bufCoord = 0;                          // read from cell (0,0) of our buffer
+            // Pack COORD values into i32: X in low 16 bits, Y in high 16 bits.
+            i32 bufSize  = (i32)w | ((i32)h << 16);  // buffer dimensions
+            i32 bufCoord = 0;                          // read from cell (0,0) of our buffer
 
-        os.windows._SMALL_RECT region;
-        region.left   = info.winLeft;
-        region.top    = info.winTop;
-        region.right  = info.winRight;
-        region.bottom = info.winBottom;
+            os.windows._SMALL_RECT region;
+            region.left   = info.winLeft;
+            region.top    = info.winTop;
+            region.right  = info.winRight;
+            region.bottom = info.winBottom;
 
-        return os.windows.ReadConsoleOutputA(_hOut, out->_buf, bufSize, bufCoord, &region) != 0;
+            return os.windows.ReadConsoleOutputA(_hOut, out->_buf, bufSize, bufCoord, &region) != 0;
+        } else {
+            // No POSIX equivalent of ReadConsoleOutput (a tty has no readable
+            // screen buffer); screen-capture automation is Windows-only.
+            return false;
+        }
     }
 };
