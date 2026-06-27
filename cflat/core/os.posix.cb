@@ -72,8 +72,12 @@ namespace os.posix
     // routine has signature void*(*)(void*), matching the POSIX thread trampoline.
     extern win_int pthread_create(void** thread, const void* attr, function<void*(void*)> start, void* arg);
     extern win_int pthread_join(void* thread, void** retval);
+    // Timed join (glibc extension). abstime is a CLOCK_REALTIME-based timespec; returns
+    // 0 on join, ETIMEDOUT (110) on timeout. Linux-only - macOS has no pthread_timedjoin_np.
+    extern win_int pthread_timedjoin_np(void* thread, void** retval, const i64* abstime);
     extern win_int pthread_detach(void* thread);
     extern win_int pthread_cancel(void* thread);
+    int ETIMEDOUT = 110;
 
     // Yield the remainder of this thread's time slice (Win32 SwitchToThread analog).
     extern win_int sched_yield();

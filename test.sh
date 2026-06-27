@@ -18,8 +18,13 @@
 # functionality. These are TEST-CONTENT or unrelated-subsystem limitations, not
 # core-library gaps (every portable core library compiles + runs on Linux):
 #   - Win32 APIs called directly in the test body (os.windows.*, GetCurrentProcessId)
-#   - the `program` construct (its codegen still emits Windows CRT stdio)
-#   - C interop (.c / header imports compiled by clang-cl - not wired for Linux)
+#   - C interop test CONTENT that is Windows-bound: a prebuilt Windows .lib
+#     (test_c_interop/mathlib.lib), a .c that #includes <windows.h>
+#     (test_reflect/test_collection_leaks via diagnostic/heap_audit.c), or CRT
+#     header binding that redeclares a libc symbol cflat's POSIX runtime owns
+#     (test_crt/stdlib.h posix_memalign). The C-interop MECHANISM itself works on
+#     Linux now (.c compiled to ELF via clang, system headers bound from /usr/include
+#     - see test_import_group, which runs).
 #   - Windows-only features (WinMD, the Win32/console test suites)
 #   - the FP-environment control (ftz/daz), POSIX-stubbed in thread.cb
 #   - tests that assert Windows path separators or spawn Windows-only commands
@@ -56,8 +61,7 @@ rm -rf "$RES"; mkdir -p "$RES"
 # Windows-only .cb tests - see header comment for the category of each.
 SKIP="test_helper \
   test_basic test_socket test_threadpool test_stream \
-  test_module test_program test_allocators \
-  test_c_interop test_import_group test_reflect test_collection_leaks test_crt \
+  test_c_interop test_reflect test_collection_leaks test_crt \
   test_windows test_windows_cache test_winmd \
   test_fpenv \
   test_filesystem test_core test_process"

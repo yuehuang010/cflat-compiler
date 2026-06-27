@@ -101,13 +101,23 @@ def find_win32_metadata_dir() -> Path | None:
     return candidates[-1] if candidates else None
 
 
+# OS-platform alternates: os.windows.cb and os.posix.cb declare the SAME libc/syscall
+# functions (fread/fwrite/fopen/...) as bare-linkage externs, one set per platform.
+# os.cb imports exactly one of them via `if const (__WINDOWS__)`, so only the host's
+# file is ever in scope in real use. The bulk sweep opens each file standalone with the
+# host runtime auto-imported, so analyzing the NON-host file collides its externs with
+# the host's (e.g. os.posix.cb's `fread` vs os.windows.cb's `fread` on Windows). Skip
+# the non-host alternate - it is exercised on its own platform's run.
+NON_HOST_OS_FILE = "os.posix.cb" if os.name == "nt" else "os.windows.cb"
+
+
 def collect_files(include_win32_demo: bool) -> list[Path]:
     files: list[Path] = []
     files += sorted((REPO_ROOT / "Test").glob("*.cb"))
     files += sorted((REPO_ROOT / "example").rglob("*.cb"))
     files += sorted(
         p for p in (REPO_ROOT / "cflat" / "core").glob("*.cb")
-        if p.name != "runtime.cb"
+        if p.name != "runtime.cb" and p.name != NON_HOST_OS_FILE
     )
     if not include_win32_demo:
         demo = (REPO_ROOT / WIN32_METADATA_DEMO).resolve()

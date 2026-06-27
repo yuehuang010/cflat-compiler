@@ -16857,8 +16857,11 @@ public:
             // Install Windows SEH personality so hardware faults in main() are caught.
             // Win32 does NOT set a personality: LLVM's x86 backend drops the catch handler
             // body when using _except_handler3 + catchpad/catchret, leaving broken EH tables.
-            // Win32 crash recovery is skipped in the test (guarded with if const __PLATFORM__).
-            if (compiler->platformValue == 64)
+            // POSIX has no SEH equivalent (a hardware fault is a thread-directed signal whose
+            // default action kills the process); crash recovery is Win64-only and the test
+            // guards the crash cases with if const (__WINDOWS__ ...). Both non-SEH targets fall
+            // through to the plain-call path below.
+            if (compiler->targetWindows_ && compiler->platformValue == 64)
             {
                 llvm::Function* cshFn = compiler->module->getFunction("__C_specific_handler");
                 if (!cshFn)
@@ -16971,11 +16974,30 @@ public:
             // This pre-populates __prog_tls.cached_stdin so fgets avoids a lazy-init branch on every call,
             // and sets stdin_active so fgets can use a single-field guard instead of three separate checks.
             {
-                auto* ioFuncTy  = llvm::FunctionType::get(voidPtrType, {i32Type}, false);
-                auto* ioFuncFn  = compiler->module->getOrInsertFunction("__acrt_iob_func", ioFuncTy).getCallee();
-                auto* stdinPtr  = compiler->builder->CreateCall(
-                    llvm::cast<llvm::Function>(ioFuncFn)->getFunctionType(), ioFuncFn,
-                    {llvm::ConstantInt::get(i32Type, 0)}, "stdin_ptr");
+                // stdin FILE*: Windows reads it from the CRT's __acrt_iob_func(0); POSIX has no
+                // such symbol, so route through the runtime's __std_iob(0) shim (cruntime.cb),
+                // which returns the libc `stdin` global. Keeps the Windows path byte-identical.
+                llvm::Value* stdinPtr = nullptr;
+                if (compiler->targetWindows_)
+                {
+                    auto* ioFuncTy  = llvm::FunctionType::get(voidPtrType, {i32Type}, false);
+                    auto* ioFuncFn  = compiler->module->getOrInsertFunction("__acrt_iob_func", ioFuncTy).getCallee();
+                    stdinPtr = compiler->builder->CreateCall(
+                        llvm::cast<llvm::Function>(ioFuncFn)->getFunctionType(), ioFuncFn,
+                        {llvm::ConstantInt::get(i32Type, 0)}, "stdin_ptr");
+                }
+                else if (auto* iobFn = compiler->GetFunction("__std_iob"))
+                {
+                    stdinPtr = compiler->builder->CreateCall(
+                        iobFn->getFunctionType(), iobFn,
+                        {llvm::ConstantInt::get(i32Type, 0)}, "stdin_ptr");
+                }
+                else
+                {
+                    // __std_iob missing (runtime not imported) - leave cached_stdin null; the
+                    // fgetc/scanf lazy-init path repopulates it on first use.
+                    stdinPtr = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(voidPtrType));
+                }
                 auto* cachedStdinGEP = compiler->builder->CreateStructGEP(
                     progTlsType, progTlsGlobal, kPTLS_cached_stdin, "cached_stdin_gep");
                 compiler->builder->CreateStore(stdinPtr, cachedStdinGEP);
@@ -17107,7 +17129,7 @@ public:
                     mainArgs = {self, argc32Val, argvPtrVal};
             }
 
-            if (compiler->platformValue == 64)
+            if (compiler->targetWindows_ && compiler->platformValue == 64)
             {
                 // Win64: use SEH (invoke + catchswitch + catchpad) to catch hardware faults.
                 auto* normalBB   = llvm::BasicBlock::Create(*compiler->context, "main_normal",  trampolineFn);
@@ -17147,9 +17169,10 @@ public:
             }
             else
             {
-                // Win32: LLVM's x86 backend drops the catch-handler body when using
-                // _except_handler3 + catchpad/catchret, producing broken EH tables.
-                // Fall back to a plain call - crash recovery is not supported on Win32.
+                // No SEH here (Win32 or any POSIX target). On Win32 LLVM's x86 backend drops
+                // the catch-handler body (_except_handler3 + catchpad/catchret -> broken EH
+                // tables); POSIX has no SEH at all. Fall back to a plain call - a hardware fault
+                // in main() is not recoverable on these targets.
                 auto* callResult = compiler->builder->CreateCall(
                     mainFn->getFunctionType(), mainFn, mainArgs, "main_result");
                 compiler->builder->CreateStore(callResult, exitCodeGEP);

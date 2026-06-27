@@ -553,8 +553,8 @@ program ReadLinesFgets {
         char* buf = (char*)malloc(256);
         int i = 0;
         while (i < lineCount) {
-            void* stdinStream = os.windows.__acrt_iob_func(0);
-            if (os.windows.fgets(buf, 256, stdinStream) == nullptr) break;
+            void* stdinStream = __std_iob(0);
+            if (fgets(buf, 256, stdinStream) == nullptr) break;
             totalLen += strlen(buf);
             i++;
         }
@@ -590,8 +590,8 @@ bool testOnStdinFgets() {
     p.run(args);
     p.WaitForExit();
     // "hello\n"=6, "world\n"=6, "foo\n"=4 -> 16
-    result &= Test("onStdin os.windows.fgets total", p.exitCode, 16);
-    result &= Test("onStdin os.windows.fgets totalLen", p.totalLen, 16);
+    result &= Test("onStdin fgets total", p.exitCode, 16);
+    result &= Test("onStdin fgets totalLen", p.totalLen, 16);
     return result;
 }
 
@@ -1061,17 +1061,21 @@ bool testListOwnershipNoLeaks() {
 }
 
 bool testProgramCrashRecovery() {
-    if const (__PLATFORM__ == 64) {
-        bool result = true;
-        CrashNull p;
-        list<string> args;
-        p.run(args);
-        p.WaitForExit();
-        // SEH catches the access violation; trampoline stores -1 and exits the thread cleanly.
-        result &= Test("crash recovery exit code", p.exitCode, -1);
-        return result;
+    // Crash recovery is Win64-only: it relies on SEH (catchswitch/catchpad). Win32's LLVM x86
+    // backend drops the catch body, and POSIX has no SEH (a fault is a process-killing signal).
+    if const (__WINDOWS__) {
+        if const (__PLATFORM__ == 64) {
+            bool result = true;
+            CrashNull p;
+            list<string> args;
+            p.run(args);
+            p.WaitForExit();
+            // SEH catches the access violation; trampoline stores -1 and exits the thread cleanly.
+            result &= Test("crash recovery exit code", p.exitCode, -1);
+            return result;
+        }
     }
-    return true; // Win32: SEH catch-handler not supported by LLVM x86 backend - skip.
+    return true; // No SEH crash recovery (Win32 / POSIX) - skip.
 }
 
 bool testWaitForExitWithToken() {
@@ -1209,24 +1213,28 @@ program TrackHandlesCrash {
 };
 
 bool testTrackHandles() {
-    if const (__PLATFORM__ == 64) {
-        bool result = true;
-        string path = "test_track_tmp.txt";
-        File.remove(path);
+    // Depends on crash recovery (the handle is leaked by an intentional fault and the trampoline
+    // must close it on the SEH path) - Win64-only, like testProgramCrashRecovery above.
+    if const (__WINDOWS__) {
+        if const (__PLATFORM__ == 64) {
+            bool result = true;
+            string path = "test_track_tmp.txt";
+            File.remove(path);
 
-        TrackHandlesCrash p;
-        p._path = path;
-        p.trackHandles = true;
-        list<string> args;
-        p.run(args);
-        p.WaitForExit();
-        result &= Test("trackHandles crash exitCode", p.exitCode, -1);
+            TrackHandlesCrash p;
+            p._path = path;
+            p.trackHandles = true;
+            list<string> args;
+            p.run(args);
+            p.WaitForExit();
+            result &= Test("trackHandles crash exitCode", p.exitCode, -1);
 
-        // If the tracker closed the handle, we can delete the file (no sharing violation).
-        result &= Test("trackHandles handle closed on crash", File.remove(path), true);
-        return result;
+            // If the tracker closed the handle, we can delete the file (no sharing violation).
+            result &= Test("trackHandles handle closed on crash", File.remove(path), true);
+            return result;
+        }
     }
-    return true; // Win32: SEH catch-handler not supported by LLVM x86 backend - skip.
+    return true; // No SEH crash recovery (Win32 / POSIX) - skip.
 }
 
 // ---------------------------------------------------------------------------

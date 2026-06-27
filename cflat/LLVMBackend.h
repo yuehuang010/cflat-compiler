@@ -757,14 +757,19 @@ public:
         }
     };
 
-    // ABI lowering for C extern struct-by-value params/returns; Kind selects the MSVC x64
-    // lowering strategy (Direct / CoerceToInt / ByVal / SRetReturn).
+    // ABI lowering for C extern struct-by-value params/returns; Kind selects the lowering
+    // strategy. MSVC x64 uses Direct / CoerceToInt / ByVal / SRetReturn. The SysV AMD64 ABI
+    // (Linux/macOS) additionally uses CoercePair: a <=16-byte struct that classifies into two
+    // "eightbyte" registers, passed as two scalar params (coerceTy + coerceTy2) and returned
+    // as a { coerceTy, coerceTy2 } literal aggregate. For SysV, coerceTy may be a float/double/
+    // <2 x float> (SSE eightbyte), not only an integer.
     struct AbiSlot
     {
-        enum Kind { Direct, CoerceToInt, ByVal, SRetReturn };
+        enum Kind { Direct, CoerceToInt, ByVal, SRetReturn, CoercePair };
         Kind kind = Direct;
-        llvm::Type* coerceTy = nullptr;     // iN type for CoerceToInt
-        llvm::StructType* structTy = nullptr; // pointee for ByVal / SRetReturn (and source of byval/sret type attrs)
+        llvm::Type* coerceTy = nullptr;     // eightbyte 0 type for CoerceToInt / CoercePair
+        llvm::Type* coerceTy2 = nullptr;    // eightbyte 1 type for CoercePair
+        llvm::StructType* structTy = nullptr; // pointee for ByVal / SRetReturn / coerce source
         uint64_t align = 0;                  // byval/sret alignment hint
     };
     struct AbiRecipe
@@ -2885,6 +2890,74 @@ private:
         return "";
     }
 
+    // GCC-style C compiler driver for the ELF (non-Windows) target. Prefers clang to
+    // match the LLVM the rest of the pipeline links, then falls back to cc/gcc.
+    std::string FindCDriver() const
+    {
+        for (const char* cand : { "clang", "clang-18", "cc", "gcc" })
+            if (auto p = llvm::sys::findProgramByName(cand)) return *p;
+        return "";
+    }
+
+    // Compile a .c input to an ELF object with a GCC-style driver and queue it for the
+    // ELF link. Mirrors CompileCFile's MSVC path but with POSIX flags (-c/-o/-D/-fPIC).
+    bool CompileCFileElf(const std::string& cSourcePath, const std::string& programAlias)
+    {
+        const std::string cc = FindCDriver();
+        if (cc.empty())
+        {
+            LogError(std::format("no C compiler driver (clang/cc/gcc) found - cannot compile C source '{}'.", cSourcePath));
+            return false;
+        }
+
+        llvm::SmallString<256> objFile;
+        if (auto ec = llvm::sys::fs::createTemporaryFile("cflat_c", "o", objFile))
+        {
+            LogError(std::format("could not create temp object for C source '{}': {}", cSourcePath, ec.message()));
+            return false;
+        }
+        std::string objPath = objFile.str().str();
+
+        // -fPIC so the object links into the position-independent image the ELF path emits.
+        std::vector<std::string> argStrs = { cc, "-c", "-fPIC", cSourcePath, "-o", objPath };
+        if (cOptLevel_ >= 2)      argStrs.push_back("-O2");
+        else if (cOptLevel_ == 1) argStrs.push_back("-O1");
+        if (cDebugInfo_)          argStrs.push_back("-g");
+        if (!targetCpu_.empty()) argStrs.push_back("-march=" + targetCpu_);
+        if (!tuneCpu_.empty())   argStrs.push_back("-mtune=" + tuneCpu_);
+        for (const auto& def : cDefines_) argStrs.push_back("-D" + def);
+        if (!programAlias.empty())
+            argStrs.push_back("-Dmain=__imported_main_" + programAlias);
+
+        std::vector<llvm::StringRef> args;
+        for (auto& s : argStrs) args.push_back(s);
+
+        if (verbose)
+        {
+            std::cout << std::format("[verbose] compiling C source: {} -> {}\n", cSourcePath, objPath);
+            std::cout << "[verbose]   cc";
+            for (size_t i = 1; i < argStrs.size(); ++i) std::cout << " " << argStrs[i];
+            std::cout << "\n";
+        }
+
+        std::string compileErr;
+        int rc;
+        {
+            llvm::TimeTraceScope spawnScope("ClangCompileC", cSourcePath);
+            rc = llvm::sys::ExecuteAndWait(cc, args, std::nullopt, {}, 0, 0, &compileErr);
+        }
+        if (rc != 0)
+        {
+            llvm::sys::fs::remove(objPath);
+            LogError(std::format("C compiler failed to compile C source '{}' (exit {}){}{}",
+                cSourcePath, rc, compileErr.empty() ? "" : ": ", compileErr));
+            return false;
+        }
+
+        cObjectFiles_.push_back(objPath);
+        return true;
+    }
+
     static std::string GetCflatCacheDir();
     // Records the running cflat.exe's full path to %USERPROFILE%\.cflat\compiler_path.txt
     // so the VS Code extension can auto-detect the compiler without manual configuration.
@@ -2907,6 +2980,11 @@ private:
 
         if (symbolSink_ != nullptr)
             return true;
+
+        // Non-Windows targets compile to an ELF object with a GCC-style driver and link
+        // via EmitExecutableElf; clang-cl + MSVC flags only apply to the COFF path.
+        if (!targetWindows_)
+            return CompileCFileElf(cSourcePath, programAlias);
 
         const std::string clangPath = FindClangCl();
         if (clangPath.empty())
@@ -3503,8 +3581,15 @@ private:
                                                bool errorRecovery, bool asCxx = false) const
     {
         std::vector<std::string> args;
-        args.push_back(platformValue == 32 ? "--target=i686-pc-windows-msvc"
-                                           : "--target=x86_64-pc-windows-msvc");
+        // Parse the C against the target OS so predefined macros (_WIN32 vs __linux__)
+        // and the system header search behave like the real compile would. On non-Windows
+        // the MSVC triple would pull in MSVC predefines and break libc header resolution.
+        if (targetWindows_)
+            args.push_back(platformValue == 32 ? "--target=i686-pc-windows-msvc"
+                                               : "--target=x86_64-pc-windows-msvc");
+        else
+            args.push_back(platformValue == 32 ? "--target=i686-pc-linux-gnu"
+                                               : "--target=x86_64-pc-linux-gnu");
         args.push_back("-fsyntax-only");
         args.push_back("-x");
         // C++ is used only by the focused uuid-harvest pass, so the SDK's MIDL_INTERFACE form
@@ -10047,8 +10132,122 @@ public:
         return st != nullptr && !st->isOpaque();
     }
 
-    // Win64 / Win32 ABI classification for a single param slot. Returns Direct for scalars
-    // and pointers (the existing pipeline handles them). For struct-by-value:
+    // Flatten an aggregate into its scalar leaf fields with absolute byte offsets, recursing
+    // through nested structs and arrays. Used by the SysV eightbyte classifier.
+    void CollectScalarFields(llvm::Type* ty, uint64_t base, const llvm::DataLayout& dl,
+                             std::vector<std::pair<uint64_t, llvm::Type*>>& out) const
+    {
+        if (auto* st = llvm::dyn_cast<llvm::StructType>(ty))
+        {
+            const llvm::StructLayout* sl = dl.getStructLayout(st);
+            for (unsigned i = 0; i < st->getNumElements(); ++i)
+                CollectScalarFields(st->getElementType(i), base + sl->getElementOffset(i), dl, out);
+        }
+        else if (auto* at = llvm::dyn_cast<llvm::ArrayType>(ty))
+        {
+            llvm::Type* el = at->getElementType();
+            uint64_t esz = dl.getTypeAllocSize(el);
+            for (uint64_t i = 0; i < at->getNumElements(); ++i)
+                CollectScalarFields(el, base + i * esz, dl, out);
+        }
+        else
+        {
+            out.push_back({ base, ty });
+        }
+    }
+
+    // SysV AMD64 eightbyte classification for a small aggregate. Returns the LLVM coercion
+    // type per eightbyte (1 or 2 entries); empty means the struct is class MEMORY (size > 16
+    // or a field straddling an eightbyte) and must be passed via ByVal / returned via SRet.
+    // An eightbyte is SSE only if every field overlapping it is float/double; any integer/
+    // pointer field makes the whole eightbyte INTEGER. Two packed floats -> <2 x float>.
+    std::vector<llvm::Type*> ClassifySysVStruct(llvm::StructType* st) const
+    {
+        const llvm::DataLayout& dl = module->getDataLayout();
+        uint64_t size = dl.getTypeAllocSize(st);
+        if (size == 0 || size > 16) return {}; // MEMORY
+        unsigned nEB = (unsigned)((size + 7) / 8);
+
+        std::vector<std::pair<uint64_t, llvm::Type*>> fields;
+        CollectScalarFields(st, 0, dl, fields);
+
+        enum Cls { NoClass, Integer, Sse };
+        Cls cls[2]      = { NoClass, NoClass };
+        bool hasDouble[2] = { false, false };
+        int  floatLanes[2] = { 0, 0 };
+        for (const auto& f : fields)
+        {
+            uint64_t off = f.first;
+            llvm::Type* t = f.second;
+            uint64_t fsz = dl.getTypeAllocSize(t);
+            // A scalar straddling an eightbyte boundary only happens with packing/misalignment;
+            // bail to MEMORY rather than mis-coerce.
+            if (off / 8 != (off + (fsz ? fsz - 1 : 0)) / 8) return {};
+            unsigned eb = (unsigned)(off / 8);
+            if (eb >= 2) return {};
+            bool isSse = t->isFloatTy() || t->isDoubleTy();
+            if (isSse)
+            {
+                if (cls[eb] == NoClass) cls[eb] = Sse;
+                if (t->isDoubleTy()) hasDouble[eb] = true;
+                else                 floatLanes[eb]++;
+            }
+            else
+            {
+                cls[eb] = Integer; // INTEGER wins over SSE in the same eightbyte
+            }
+        }
+
+        std::vector<llvm::Type*> coerce;
+        for (unsigned eb = 0; eb < nEB; ++eb)
+        {
+            uint64_t ebBytes = std::min<uint64_t>(8, size - (uint64_t)eb * 8);
+            if (cls[eb] == Sse)
+            {
+                if (hasDouble[eb])
+                    coerce.push_back(llvm::Type::getDoubleTy(*context));
+                else if (floatLanes[eb] >= 2)
+                    coerce.push_back(llvm::FixedVectorType::get(llvm::Type::getFloatTy(*context), 2));
+                else
+                    coerce.push_back(llvm::Type::getFloatTy(*context));
+            }
+            else // Integer or NoClass (empty eightbyte) -> integer of the covered bytes
+            {
+                coerce.push_back(llvm::Type::getIntNTy(*context, (unsigned)(ebBytes * 8)));
+            }
+        }
+        return coerce;
+    }
+
+    // SysV param classification: 1 eightbyte -> CoerceToInt; 2 -> CoercePair; MEMORY -> ByVal.
+    AbiSlot ClassifySysVParam(llvm::StructType* st, uint64_t align)
+    {
+        AbiSlot slot;
+        slot.structTy = st;
+        slot.align    = align;
+        std::vector<llvm::Type*> coerce = ClassifySysVStruct(st);
+        if (coerce.empty()) { slot.kind = AbiSlot::ByVal; return slot; }
+        if (coerce.size() == 1) { slot.kind = AbiSlot::CoerceToInt; slot.coerceTy = coerce[0]; return slot; }
+        slot.kind = AbiSlot::CoercePair; slot.coerceTy = coerce[0]; slot.coerceTy2 = coerce[1];
+        return slot;
+    }
+
+    // SysV return classification: 1 eightbyte -> CoerceToInt; 2 -> CoercePair; MEMORY -> SRet.
+    AbiSlot ClassifySysVReturn(llvm::StructType* st, uint64_t align)
+    {
+        AbiSlot slot;
+        slot.structTy = st;
+        slot.align    = align;
+        std::vector<llvm::Type*> coerce = ClassifySysVStruct(st);
+        if (coerce.empty()) { slot.kind = AbiSlot::SRetReturn; return slot; }
+        if (coerce.size() == 1) { slot.kind = AbiSlot::CoerceToInt; slot.coerceTy = coerce[0]; return slot; }
+        slot.kind = AbiSlot::CoercePair; slot.coerceTy = coerce[0]; slot.coerceTy2 = coerce[1];
+        return slot;
+    }
+
+    // Win64 / Win32 / SysV ABI classification for a single param slot. Returns Direct for
+    // scalars and pointers (the existing pipeline handles them). For struct-by-value:
+    //   - SysV (non-Windows): eightbyte classification (CoerceToInt / CoercePair / ByVal).
     //   - Win64: size in {1,2,4,8} -> CoerceToInt(iN); else ByVal(pointer + byval attr).
     //   - Win32: always ByVal (cdecl pushes the whole struct on the stack).
     AbiSlot ClassifyAbiParam(const TypeAndValue& tv)
@@ -10059,6 +10258,8 @@ public:
         const llvm::DataLayout& dl = module->getDataLayout();
         uint64_t size  = dl.getTypeAllocSize(st);
         uint64_t align = dl.getABITypeAlign(st).value();
+        if (!targetWindows_)
+            return ClassifySysVParam(st, align);
         if (platformValue == 64 && (size == 1 || size == 2 || size == 4 || size == 8))
         {
             slot.kind     = AbiSlot::CoerceToInt;
@@ -10091,6 +10292,8 @@ public:
         const llvm::DataLayout& dl = module->getDataLayout();
         uint64_t size  = dl.getTypeAllocSize(st);
         uint64_t align = dl.getABITypeAlign(st).value();
+        if (!targetWindows_)
+            return ClassifySysVReturn(st, align);
         if (size == 1 || size == 2 || size == 4 || size == 8)
         {
             slot.kind     = AbiSlot::CoerceToInt;
@@ -10149,6 +10352,8 @@ public:
         }
         else if (recipe.retSlot.kind == AbiSlot::CoerceToInt)
             loweredRet = recipe.retSlot.coerceTy;
+        else if (recipe.retSlot.kind == AbiSlot::CoercePair)
+            loweredRet = llvm::StructType::get(*context, { recipe.retSlot.coerceTy, recipe.retSlot.coerceTy2 });
         else
             loweredRet = GetCCompatibleType(retType);
 
@@ -10157,6 +10362,11 @@ public:
             const AbiSlot& s = recipe.paramSlots[i];
             if (s.kind == AbiSlot::CoerceToInt)
                 ptypes.push_back(s.coerceTy);
+            else if (s.kind == AbiSlot::CoercePair)
+            {
+                ptypes.push_back(s.coerceTy);
+                ptypes.push_back(s.coerceTy2);
+            }
             else if (s.kind == AbiSlot::ByVal)
                 ptypes.push_back(s.structTy->getPointerTo());
             else
@@ -10179,7 +10389,7 @@ public:
                 fn->addParamAttr(attrIdx, llvm::Attribute::getWithAlignment(*context, llvm::Align(recipe.retSlot.align)));
             ++attrIdx;
         }
-        for (size_t i = 0; i < recipe.paramSlots.size(); ++i, ++attrIdx)
+        for (size_t i = 0; i < recipe.paramSlots.size(); ++i)
         {
             const AbiSlot& s = recipe.paramSlots[i];
             if (s.kind == AbiSlot::ByVal)
@@ -10188,7 +10398,14 @@ public:
                 if (s.align > 0)
                     fn->addParamAttr(attrIdx, llvm::Attribute::getWithAlignment(*context, llvm::Align(s.align)));
             }
+            attrIdx += SlotLLVMParamCount(s); // CoercePair expands to two LLVM params
         }
+    }
+
+    // Number of LLVM params a param slot lowers to (CoercePair -> 2, everything else -> 1).
+    static unsigned SlotLLVMParamCount(const AbiSlot& s)
+    {
+        return s.kind == AbiSlot::CoercePair ? 2u : 1u;
     }
 
     // linkageName: optional override of the emitted LLVM symbol for externs. A namespaced
@@ -12267,7 +12484,7 @@ public:
                 ci->addParamAttr(attrIdx, llvm::Attribute::getWithAlignment(*context, llvm::Align(recipe.retSlot.align)));
             ++attrIdx;
         }
-        for (size_t i = 0; i < recipe.paramSlots.size(); ++i, ++attrIdx)
+        for (size_t i = 0; i < recipe.paramSlots.size(); ++i)
         {
             const AbiSlot& s = recipe.paramSlots[i];
             if (s.kind == AbiSlot::ByVal)
@@ -12276,6 +12493,7 @@ public:
                 if (s.align > 0)
                     ci->addParamAttr(attrIdx, llvm::Attribute::getWithAlignment(*context, llvm::Align(s.align)));
             }
+            attrIdx += SlotLLVMParamCount(s); // CoercePair expands to two LLVM params
         }
     }
 
@@ -12310,12 +12528,21 @@ public:
             }
             else if (s.kind == AbiSlot::CoerceToInt)
             {
-                // v is a struct value. Place in an alloca, then load as iN through a
-                // bitcast - portable across all element layouts and lets LLVM coalesce.
+                // v is a struct value. Place in an alloca, then load the eightbyte through a
+                // bitcast - portable across all element layouts and lets LLVM coalesce. The
+                // coerce type may be integer or SSE (float/double/<2 x float>) under SysV.
                 auto* slot = AllocaAtEntry(s.structTy, nullptr, "abi.coerce", s.align);
                 builder->CreateStore(v, slot);
-                auto* intPtr = builder->CreateBitCast(slot, s.coerceTy->getPointerTo());
-                loweredArgs.push_back(builder->CreateLoad(s.coerceTy, intPtr));
+                loweredArgs.push_back(LoadCoerceAt(slot, s.coerceTy, 0));
+            }
+            else if (s.kind == AbiSlot::CoercePair)
+            {
+                // SysV: two eightbytes passed as two separate scalar params (eightbyte 0 at
+                // byte offset 0, eightbyte 1 at byte offset 8).
+                auto* slot = AllocaAtEntry(s.structTy, nullptr, "abi.coerce", s.align);
+                builder->CreateStore(v, slot);
+                loweredArgs.push_back(LoadCoerceAt(slot, s.coerceTy, 0));
+                loweredArgs.push_back(LoadCoerceAt(slot, s.coerceTy2, 8));
             }
             else // ByVal
             {
@@ -12334,11 +12561,47 @@ public:
         if (recipe.retSlot.kind == AbiSlot::CoerceToInt)
         {
             auto* slot = AllocaAtEntry(recipe.retSlot.structTy, nullptr, "abi.ret", recipe.retSlot.align);
-            auto* intPtr = builder->CreateBitCast(slot, recipe.retSlot.coerceTy->getPointerTo());
-            builder->CreateStore(ci, intPtr);
+            StoreCoerceAt(slot, ci, 0);
+            return builder->CreateLoad(recipe.retSlot.structTy, slot);
+        }
+        if (recipe.retSlot.kind == AbiSlot::CoercePair)
+        {
+            // SysV: result is a { eightbyte0, eightbyte1 } aggregate; scatter each half back
+            // into the struct slot at byte offsets 0 and 8, then reload the natural struct.
+            auto* slot = AllocaAtEntry(recipe.retSlot.structTy, nullptr, "abi.ret", recipe.retSlot.align);
+            StoreCoerceAt(slot, builder->CreateExtractValue(ci, 0), 0);
+            StoreCoerceAt(slot, builder->CreateExtractValue(ci, 1), 8);
             return builder->CreateLoad(recipe.retSlot.structTy, slot);
         }
         return ci; // Direct return
+    }
+
+    // Load a value of type coerceTy from byte offset byteOff within an alloca'd struct slot,
+    // reinterpreting the underlying bytes (used to read SysV eightbytes out of a struct).
+    llvm::Value* LoadCoerceAt(llvm::Value* structSlot, llvm::Type* coerceTy, uint64_t byteOff)
+    {
+        llvm::Value* p = structSlot;
+        if (byteOff != 0)
+        {
+            auto* i8p = builder->CreateBitCast(structSlot, builder->getInt8Ty()->getPointerTo());
+            p = builder->CreateInBoundsGEP(builder->getInt8Ty(), i8p, builder->getInt64(byteOff));
+        }
+        auto* cp = builder->CreateBitCast(p, coerceTy->getPointerTo());
+        return builder->CreateLoad(coerceTy, cp);
+    }
+
+    // Store val into byte offset byteOff within an alloca'd struct slot, reinterpreting the
+    // bytes (used to scatter SysV eightbytes returned in registers back into a struct).
+    void StoreCoerceAt(llvm::Value* structSlot, llvm::Value* val, uint64_t byteOff)
+    {
+        llvm::Value* p = structSlot;
+        if (byteOff != 0)
+        {
+            auto* i8p = builder->CreateBitCast(structSlot, builder->getInt8Ty()->getPointerTo());
+            p = builder->CreateInBoundsGEP(builder->getInt8Ty(), i8p, builder->getInt64(byteOff));
+        }
+        auto* cp = builder->CreateBitCast(p, val->getType()->getPointerTo());
+        builder->CreateStore(val, cp);
     }
 
     llvm::Value* CreateFunctionCall(llvm::Function* func, const std::vector<llvm::Value*>& arg)

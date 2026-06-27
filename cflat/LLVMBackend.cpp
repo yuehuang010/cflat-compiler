@@ -955,6 +955,25 @@ static const std::vector<std::string>& WindowsSdkIncludeDirs()
     return dirs;
 }
 
+// Standard POSIX system include roots, so a bare `import "math.h";` resolves to the libc
+// header on Linux/macOS the way `import "windows.h";` resolves against the SDK on Windows.
+// The resolved header's own directory then becomes an in-scope -I root for clang extraction.
+// Only the dirs that exist on this host are returned. Scanned once and cached.
+static const std::vector<std::string>& PosixSystemIncludeDirs()
+{
+    static const std::vector<std::string> dirs = [] {
+        std::vector<std::string> out;
+        std::error_code ec;
+        for (const char* cand : { "/usr/include", "/usr/local/include",
+                                  "/usr/include/x86_64-linux-gnu" })
+        {
+            if (std::filesystem::exists(cand, ec)) out.push_back(cand);
+        }
+        return out;
+    }();
+    return dirs;
+}
+
 // %SystemRoot%\System32\WinMetadata - the system WinRT metadata store - so a bare
 // `import "Windows.Foundation.winmd";` resolves without spelling out the full path. Empty if
 // SystemRoot is unset. Scanned once and cached.
@@ -1000,6 +1019,9 @@ bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const 
         // detected SDK include dirs so `import "windows.h"` resolves with no --c-include flag; the
         // header's own dir then becomes an in-scope root automatically (see ExtractCHeaderClang).
         for (const auto& inc : WindowsSdkIncludeDirs()) tryDir(inc);
+        // POSIX system headers (e.g. math.h) live under /usr/include et al. Fall back to them
+        // so `import "math.h";` resolves with no --c-include flag on Linux/macOS.
+        for (const auto& inc : PosixSystemIncludeDirs()) tryDir(inc);
         // System WinRT metadata: let `import "Windows.Foundation.winmd";` resolve by bare name.
         tryDir(WinMetadataDir());
         return ec ? std::string() : canonical.string();

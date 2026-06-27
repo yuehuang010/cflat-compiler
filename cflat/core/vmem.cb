@@ -11,11 +11,17 @@
 //
 // Linux (future): mmap(PROT_NONE) / mprotect / mmap(PROT_RW) / munmap
 
-// POSIX munmap needs the region size, but vmem_free() only gets a pointer. So on
-// POSIX we over-map by one page and stash the total mapping size in that header
-// page (kept writable); the returned pointer is the page after it, preserving
-// page alignment. vmem_free reads the size back from the header.
-i64 __VMEM_HDR = 4096;
+// POSIX munmap needs the region size, but vmem_free() only gets a pointer; and the
+// allocators built on vmem (block/bucket/page_pool) require 64K-granular base
+// addresses the way Win32 VirtualAlloc returns them (e.g. the BucketAllocator masks
+// `ptr & ~0xFFFF` to find a page's owning record). mmap only guarantees page (4K)
+// alignment, so on POSIX we over-map by one 64K granule, return the first 64K-aligned
+// address inside the mapping, and stash a 16-byte header in the bytes immediately
+// before it: [0] = byte offset from the mmap base to the returned pointer, [1] = the
+// total mmap length. vmem_free recovers the mmap base (ptr - offset) and length, then
+// munmaps. The header is never closer than one page before the returned pointer.
+i64 __VMEM_GRAN = 0x10000;  // 64K - matches the Win32 VirtualAlloc allocation granularity
+i64 __VMEM_PAGE = 4096;
 
 // Reserve address space without committing physical pages.
 // Use with vmem_commit to implement demand-paging (e.g. slab pre-reservation).
@@ -24,14 +30,22 @@ void* vmem_reserve(i64 size)
     if const (__WINDOWS__) {
         return os.windows.VirtualAlloc(nullptr, size, 0x2000u, 0x04u);
     } else {
-        i64 total = size + __VMEM_HDR;
-        void* base = os.posix.mmap(nullptr, total, os.posix.PROT_NONE, os.posix.MAP_ANON_PRIVATE, -1, 0);
-        if ((i64)base == -1) return nullptr;
-        os.posix.mprotect(base, __VMEM_HDR, os.posix.PROT_RW);  // header must be writable
-        i64* hdr = (i64*)base;
-        hdr[0] = total;
-        i8* bytes = (i8*)base;
-        return (void*)&bytes[__VMEM_HDR];
+        i64 gran  = __VMEM_GRAN;
+        i64 total = size + gran;  // one granule of slack guarantees a 64K-aligned slot of `size`
+        void* raw = os.posix.mmap(nullptr, total, os.posix.PROT_NONE, os.posix.MAP_ANON_PRIVATE, -1, 0);
+        if ((i64)raw == -1) return nullptr;
+        i8* rawBytes = (i8*)raw;
+        i64 pad = ((i64)raw + gran) & ~(gran - (i64)1);  // first 64K boundary at/above raw+slack
+        pad = pad - (i64)raw;                            // bytes from the mmap base to it
+        // The header sits just before the returned pointer; make its page writable
+        // (the rest of the reservation stays PROT_NONE until vmem_commit).
+        i8* hdrPage = &rawBytes[pad - __VMEM_PAGE];
+        os.posix.mprotect((void*)hdrPage, __VMEM_PAGE, os.posix.PROT_RW);
+        i8* userPtr = &rawBytes[pad];
+        i64* hdr = (i64*)(&userPtr[0 - 16]);
+        hdr[0] = pad;
+        hdr[1] = total;
+        return (void*)userPtr;
     }
 }
 
@@ -52,13 +66,20 @@ void* vmem_alloc(i64 size)
     if const (__WINDOWS__) {
         return os.windows.VirtualAlloc(nullptr, size, 0x3000u, 0x04u);
     } else {
-        i64 total = size + __VMEM_HDR;
-        void* base = os.posix.mmap(nullptr, total, os.posix.PROT_RW, os.posix.MAP_ANON_PRIVATE, -1, 0);
-        if ((i64)base == -1) return nullptr;
-        i64* hdr = (i64*)base;
-        hdr[0] = total;  // header is RW (whole mapping is RW); user region is zeroed by mmap
-        i8* bytes = (i8*)base;
-        return (void*)&bytes[__VMEM_HDR];
+        i64 gran  = __VMEM_GRAN;
+        i64 total = size + gran;  // one granule of slack guarantees a 64K-aligned slot of `size`
+        void* raw = os.posix.mmap(nullptr, total, os.posix.PROT_RW, os.posix.MAP_ANON_PRIVATE, -1, 0);
+        if ((i64)raw == -1) return nullptr;
+        i8* rawBytes = (i8*)raw;
+        i64 pad = ((i64)raw + gran) & ~(gran - (i64)1);  // first 64K boundary at/above raw+slack
+        pad = pad - (i64)raw;                            // bytes from the mmap base to it
+        // Whole mapping is RW (and zeroed by mmap), so the header and user region are
+        // already writable - no mprotect needed.
+        i8* userPtr = &rawBytes[pad];
+        i64* hdr = (i64*)(&userPtr[0 - 16]);
+        hdr[0] = pad;
+        hdr[1] = total;
+        return (void*)userPtr;
     }
 }
 
@@ -69,9 +90,10 @@ void vmem_free(void* ptr)
         os.windows.VirtualFree(ptr, 0, 0x8000u);  // size must be 0 for MEM_RELEASE
     } else {
         i8* bytes = (i8*)ptr;
-        i8* base = &bytes[0 - __VMEM_HDR];  // ptr - header page
-        i64* hdr = (i64*)base;
-        i64 total = hdr[0];
+        i64* hdr = (i64*)(&bytes[0 - 16]);  // [0] = offset to mmap base, [1] = total length
+        i64 pad   = hdr[0];
+        i64 total = hdr[1];
+        i8* base = &bytes[0 - pad];  // ptr - offset = mmap base
         os.posix.munmap((void*)base, total);
     }
 }

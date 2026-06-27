@@ -231,8 +231,22 @@ struct Thread {
             }
             return false;
         } else {
-            // POSIX timed join (pthread_timedjoin_np) not yet ported; report "not
-            // ready" so callers fall back to a blocking join().
+            // POSIX timed join via pthread_timedjoin_np (glibc). abstime is an ABSOLUTE
+            // CLOCK_REALTIME deadline = now + timeout_ms.
+            i64[2] ts;
+            os.posix.clock_gettime(os.posix.CLOCK_REALTIME, &ts[0]);
+            i64 totalNs = ts[1] + (i64)timeout_ms * 1000000;
+            ts[0] = ts[0] + totalNs / 1000000000;
+            ts[1] = totalNs % 1000000000;
+            void* ret = nullptr;
+            i32 rc = os.posix.pthread_timedjoin_np(_handle, &ret, &ts[0]);
+            if (rc == 0) {
+                free((void*)_args);
+                _handle   = nullptr;
+                _args     = nullptr;
+                _exitCode = (i32)(i64)ret;
+                return true;
+            }
             return false;
         }
     }
