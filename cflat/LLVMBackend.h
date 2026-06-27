@@ -29,46 +29,47 @@
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
+#if defined(_WIN32)
 #include <io.h>
+#endif
+#include "platform/PlatformCompat.h"
 
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
-#include <llvm\IR\CFG.h>          // llvm::pred_empty (MarkUnreachableIfNoPredecessors)
-#include <llvm\IR\IRBuilder.h>
-#include <llvm\IR\MDBuilder.h>    // llvm::MDBuilder (alias-scope/domain metadata for T[] noalias)
-#include <llvm\IR\Intrinsics.h>
-#include <llvm\IR\IntrinsicsX86.h>   // llvm::Intrinsic::x86_rdtscp (CreateRdtscp)
-#include <llvm\IR\LLVMContext.h>
-#include <llvm\IR\Module.h>
-#include <llvm\IR\Verifier.h>
-#include <llvm\IR\Dominators.h>   // llvm::DominatorTree (dominance-aware owned-temp flush)
-#include <llvm\IR\DIBuilder.h>
-#include <llvm\IR\LegacyPassManager.h>
-#include <llvm\Bitcode\BitcodeWriter.h>
-#include <llvm\Support\FileSystem.h>
-#include <llvm\Support\MemoryBuffer.h>
-#include <llvm\Support\JSON.h>
+#include <llvm/IR/CFG.h>          // llvm::pred_empty (MarkUnreachableIfNoPredecessors)
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/MDBuilder.h>    // llvm::MDBuilder (alias-scope/domain metadata for T[] noalias)
+#include <llvm/IR/Intrinsics.h>
+#include <llvm/IR/IntrinsicsX86.h>   // llvm::Intrinsic::x86_rdtscp (CreateRdtscp)
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/Verifier.h>
+#include <llvm/IR/Dominators.h>   // llvm::DominatorTree (dominance-aware owned-temp flush)
+#include <llvm/IR/DIBuilder.h>
+#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/JSON.h>
 #include <simdjson.h>   // fast read path for the C-header disk cache (parse only; writes stay nlohmann)
-#include <llvm\Support\Path.h>
-#include <llvm\Support\Program.h>
-#include <llvm\Support\TimeProfiler.h>
-#include <llvm\Support\TargetSelect.h>
-#include <llvm\Target\TargetMachine.h>
-#include <llvm\ExecutionEngine\Orc\LLJIT.h>          // --run JIT execution (JitRun)
-#include <llvm\ExecutionEngine\Orc\ExecutionUtils.h> // DynamicLibrarySearchGenerator
-#include <llvm\ExecutionEngine\Orc\ObjectLinkingLayer.h> // JITLink layer (--run threading/SEH)
-#include <llvm\ExecutionEngine\JITLink\JITLink.h>        // LinkGraph (SEH .pdata registration)
-#include <llvm\ExecutionEngine\JITLink\x86_64.h>          // jump-stub helpers for the SEH handler thunk
-#include <llvm\ExecutionEngine\Orc\Shared\MemoryFlags.h>  // orc::MemProt for synthesized stub sections
+#include <llvm/Support/Path.h>
+#include <llvm/Support/Program.h>
+#include <llvm/Support/TimeProfiler.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/ExecutionEngine/Orc/LLJIT.h>          // --run JIT execution (JitRun)
+#include <llvm/ExecutionEngine/Orc/ExecutionUtils.h> // DynamicLibrarySearchGenerator
+#include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h> // JITLink layer (--run threading/SEH)
+#include <llvm/ExecutionEngine/JITLink/JITLink.h>        // LinkGraph (SEH .pdata registration)
+#include <llvm/ExecutionEngine/JITLink/x86_64.h>          // jump-stub helpers for the SEH handler thunk
+#include <llvm/ExecutionEngine/Orc/Shared/MemoryFlags.h>  // orc::MemProt for synthesized stub sections
 #include <unordered_map>
 #include <malloc.h>  // _aligned_malloc for the emutls shim
-#include <llvm\MC\TargetRegistry.h>
-#include <llvm\MC\MCSubtargetInfo.h>
-#include <llvm\TargetParser\Host.h>
+#include <llvm/MC/TargetRegistry.h>
+#include <llvm/MC/MCSubtargetInfo.h>
+#include <llvm/TargetParser/Host.h>
 #pragma warning(pop)
-#include <antlr4-runtime.h>
-#include <CFlatParser.h>
-#include <CFlatLexer.h>
+#include "platform/GeneratedParser.h" // antlr runtime + generated parser/lexer/listener + kTokenEOF
 #include <fstream>
 #include "ArgParser.h"
 #include "CClangExtract.h"

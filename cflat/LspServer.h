@@ -1,4 +1,5 @@
 #pragma once
+#include "platform/PlatformCompat.h"
 #include <filesystem>
 #include <string>
 
@@ -9,7 +10,5 @@ int RunLspServer(int argc, char* argv[]);
 // Returns the directory containing the running executable (used to locate runtime.cb).
 inline std::string GetExeDir()
 {
-    char* pgmptr = nullptr;
-    _get_pgmptr(&pgmptr);
-    return std::filesystem::path(pgmptr ? pgmptr : "").parent_path().string();
+    return std::filesystem::path(PlatformExePath()).parent_path().string();
 }

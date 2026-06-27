@@ -2,7 +2,7 @@
 #include <string>
 #include <vector>
 #include <optional>
-#include <nlohmann/json.hpp>
+#include "platform/JsonCompat.h"
 
 namespace lsp {
 

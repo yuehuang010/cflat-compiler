@@ -1,36 +1,34 @@
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
-#include <llvm\IR\IRBuilder.h>
-#include <llvm\IR\LLVMContext.h>
-#include <llvm\IR\Module.h>
-#include <llvm\IR\Verifier.h>
-#include <llvm\IR\Dominators.h>
-#include <llvm\Bitcode\BitcodeWriter.h>
-#include <llvm\Bitcode\BitcodeReader.h>
-#include <llvm\Linker\Linker.h>
-#include <llvm\Passes\PassBuilder.h>
-#include <llvm\Transforms\Utils\Mem2Reg.h>
-#include <llvm\Transforms\Scalar\SROA.h>
-#include <llvm\Transforms\InstCombine\InstCombine.h>
-#include <llvm\Transforms\Scalar\SimplifyCFG.h>
-#include <llvm\Transforms\IPO\GlobalDCE.h>
-#include <llvm\Transforms\Instrumentation\AddressSanitizer.h>
-#include <llvm\Object\COFF.h>
-#include <llvm\Object\Binary.h>
-#include <llvm\Object\Archive.h>
-#include <llvm\Object\COFFImportFile.h>
-#include <llvm\ADT\StringSet.h>
-#include <llvm\Support\CommandLine.h>
-#include <llvm\Support\TimeProfiler.h>
-#include <llvm\Support\JSON.h>
-#include <llvm\IR\DiagnosticInfo.h>
-#include <llvm\IR\DiagnosticHandler.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/Verifier.h>
+#include <llvm/IR/Dominators.h>
+#include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Linker/Linker.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Transforms/Utils/Mem2Reg.h>
+#include <llvm/Transforms/Scalar/SROA.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar/SimplifyCFG.h>
+#include <llvm/Transforms/IPO/GlobalDCE.h>
+#include <llvm/Transforms/Instrumentation/AddressSanitizer.h>
+#include <llvm/Object/COFF.h>
+#include <llvm/Object/Binary.h>
+#include <llvm/Object/Archive.h>
+#include <llvm/Object/COFFImportFile.h>
+#include <llvm/ADT/StringSet.h>
+#include <llvm/Support/CommandLine.h>
+#include <llvm/Support/TimeProfiler.h>
+#include <llvm/Support/JSON.h>
+#include <llvm/IR/DiagnosticInfo.h>
+#include <llvm/IR/DiagnosticHandler.h>
 #pragma warning(pop)
 #include <antlr4-runtime.h>
 
-#include "CFlatParser.h"
-#include "CFlatLexer.h"
-#include "CFlatBaseListener.h"
+#include "platform/GeneratedParser.h"
 #include "LLVMBackend.h"
 #include "MainListener.h"
 #include "GrammarTreeListener.h"
@@ -45,8 +43,10 @@
 // here, not in LLVMBackend.h, so this stays in a TU that never includes <winnt.h> - otherwise
 // the extern "C" decl would clash with the real prototype in TUs that pull in windows.h. x64
 // has a single calling convention, so the bare signature links to kernel32's export directly.
+#if defined(_WIN32)
 extern "C" unsigned char RtlAddFunctionTable(
     void* FunctionTable, unsigned long EntryCount, unsigned long long BaseAddress);
+#endif
 
 llvm::Error cflat_jit::SehRegistrationPlugin::RegisterUnwindInfo(llvm::jitlink::LinkGraph& G)
 {
@@ -97,10 +97,14 @@ llvm::Error cflat_jit::SehRegistrationPlugin::RegisterUnwindInfo(llvm::jitlink::
                     B->getAddress().toPtr<void*>(), count, (unsigned long long)imageBase, (int)wasSorted);
 
         void* funcs = B->getAddress().toPtr<void*>();
+#if defined(_WIN32)
         if (!RtlAddFunctionTable(funcs, (unsigned long)count, imageBase))
             return llvm::make_error<llvm::StringError>(
                 "RtlAddFunctionTable failed registering JIT'd .pdata unwind info",
                 llvm::inconvertibleErrorCode());
+#else
+        (void)funcs; // SEH .pdata registration is Windows-only.
+#endif
     }
     return llvm::Error::success();
 }
@@ -2347,18 +2351,19 @@ bool LLVMBackend::WriteCompilerPathToCache()
     if (std::error_code ec = llvm::sys::fs::create_directories(cacheDir); ec)
         return false;
 
-    char* pgmptr = nullptr;
-    if (_get_pgmptr(&pgmptr) != 0 || pgmptr == nullptr || *pgmptr == '\0')
+    std::string exePath = PlatformExePath();
+    if (exePath.empty())
         return false;
 
-    std::string outPath = cacheDir + "\\compiler_path.txt";
+    std::string outPath = (std::filesystem::path(cacheDir) / "compiler_path.txt").string();
     std::error_code ec;
     llvm::raw_fd_ostream os(outPath, ec, llvm::sys::fs::OF_Text);
     if (ec) return false;
-    os << pgmptr << "\n";
+    os << exePath << "\n";
     return true;
 }
 
+#if defined(_WIN32)
 // Win32 registry read. Declared bare (no windows.h) to keep this TU free of <winnt.h>, matching
 // the RtlAddFunctionTable pattern above. Resolves against advapi32.lib (inherited default lib).
 extern "C" long __stdcall RegGetValueA(
@@ -2424,6 +2429,7 @@ static std::string ReadVsInstallPathFromRegistry()
     RegCloseKey(hKey);
     return bestPath;
 }
+#endif // _WIN32
 
 LinkerPaths LLVMBackend::DiscoverLinkerPaths(const std::string& arch, const std::string& runtimeDir, bool verbose)
 {
@@ -2483,11 +2489,13 @@ LinkerPaths LLVMBackend::DiscoverLinkerPaths(const std::string& arch, const std:
 
     // Fallback when vswhere is absent or returned nothing: the legacy SxS\VS7 registry key.
     bool vsFromRegistry = false;
+#if defined(_WIN32)
     if (vsPath.empty())
     {
         vsPath = ReadVsInstallPathFromRegistry();
         vsFromRegistry = !vsPath.empty();
     }
+#endif
     if (verbose)
     {
         if (vsPath.empty())
@@ -2519,7 +2527,11 @@ LinkerPaths LLVMBackend::DiscoverLinkerPaths(const std::string& arch, const std:
     {
         std::string wkLib;
         bool sdkFromRegistry = false;
+#if defined(_WIN32)
         std::string kitsRoot = ReadKitsRoot10FromRegistry();
+#else
+        std::string kitsRoot;
+#endif
         if (!kitsRoot.empty())
         {
             if (kitsRoot.back() != '\\' && kitsRoot.back() != '/') kitsRoot += '\\';

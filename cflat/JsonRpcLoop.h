@@ -2,7 +2,7 @@
 #include <string>
 #include <functional>
 #include <mutex>
-#include <nlohmann/json.hpp>
+#include "platform/JsonCompat.h"
 
 // Reads Content-Length-framed JSON-RPC messages from stdin,
 // dispatches each to the handler, and provides a thread-safe

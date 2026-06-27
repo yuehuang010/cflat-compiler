@@ -1,4 +1,4 @@
-#include <llvm\Support\CrashRecoveryContext.h>
+#include <llvm/Support/CrashRecoveryContext.h>
 
 #include "LspServer.h"
 #include "LspTypes.h"
@@ -10,8 +10,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
-#include <io.h>
-#include <fcntl.h>
+#include "platform/PlatformIo.h"
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -20,8 +19,10 @@
 #include <unordered_map>
 #include <atomic>
 #include <deque>
+#if defined(_WIN32)
 #include <windows.h>
-#include <nlohmann/json.hpp>
+#endif
+#include "platform/JsonCompat.h"
 
 namespace {
 
@@ -1267,14 +1268,14 @@ private:
         const std::string& filePath = job.filePath;
         const std::string& text     = job.text;
 
-        char tempDirBuf[MAX_PATH] = {};
-        GetTempPathA(MAX_PATH, tempDirBuf);
         std::string tempPath;
         {
             int counter;
             { std::lock_guard<std::mutex> lock(tempCounterMutex_); counter = tempFileCounter_++; }
-            tempPath = std::string(tempDirBuf) +
-                std::format("cflat_lsp_{}_{}_{}.cb", GetCurrentProcessId(), (int)slot, counter);
+            std::error_code tmpEc;
+            std::filesystem::path tempDir = std::filesystem::temp_directory_path(tmpEc);
+            std::string fileName = std::format("cflat_lsp_{}_{}_{}.cb", _getpid(), (int)slot, counter);
+            tempPath = (tempDir / fileName).string();
         }
 
         {
@@ -1638,6 +1639,7 @@ int RunLspServer(int argc, char* argv[])
     // from inheriting the JSON-RPC pipe handles. _dup and the CRT std fds are inheritable
     // by default on Windows; an inherited protocol handle silently breaks the LSP channel
     // when the child runs, taking the server down with it.
+#if defined(_WIN32)
     auto clearInherit = [](int fd)
     {
         intptr_t h = _get_osfhandle(fd);
@@ -1646,6 +1648,10 @@ int RunLspServer(int argc, char* argv[])
     clearInherit(protocolFd);
     clearInherit(_fileno(stdin));
     clearInherit(_fileno(stdout));
+#else
+    // POSIX: keep the JSON-RPC fd from leaking into spawned children.
+    fcntl(protocolFd, F_SETFD, FD_CLOEXEC);
+#endif
 
     llvm::CrashRecoveryContext::Enable();
 

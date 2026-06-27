@@ -4,7 +4,7 @@
 #include <iostream>
 #include <string>
 
-#include "CFlatParser.h"
+#include "platform/GeneratedParser.h"
 
 // Prints the full parse-tree rule stack for `--grammar --verbose`. Each grammar
 // rule is printed indented by its nesting depth, with its source position and the

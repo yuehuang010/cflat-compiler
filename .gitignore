@@ -376,3 +376,4 @@ FodyWeavers.xsd
 /out32/results
 *.vsix
 *.time-trace.json
+build/

@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "platform/PlatformCompat.h"
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -27,7 +28,7 @@
 #include <llvm/Support/Program.h>
 #pragma warning(pop)
 
-#include <nlohmann/json.hpp>
+#include "platform/JsonCompat.h"
 
 class VcpkgResolver
 {

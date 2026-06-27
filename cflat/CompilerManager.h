@@ -2,9 +2,13 @@
 
 #include <vector>
 #include <mutex>
+#include <algorithm>
+#include <format>
 #include <iostream>
 #include <csignal>
+#if defined(_WIN32)
 #include <crtdbg.h>
+#endif
 #include <llvm/Support/Error.h>
 
 class LLVMBackend;
@@ -37,9 +41,13 @@ public:
 
     void InstallAssertHook()
     {
+#if defined(_WIN32)
         // _CrtSetReportHook2 only intercepts asserts from this module's CRT instance.
         // LLVM is a DLL with its own CRT, so its asserts won't reach this hook.
+        // On POSIX there is no CRT assert hook; assert() routes through abort() ->
+        // SIGABRT, which the handler below already catches.
         _CrtSetReportHook2(_CRT_RPTHOOK_INSTALL, &CompilerManager::AssertHook);
+#endif
 
         // SIGABRT is process-wide - catches abort() from any module including LLVM DLLs.
         signal(SIGABRT, &CompilerManager::AbortHandler);
@@ -76,6 +84,7 @@ private:
         std::cout << "===============================================\n\n";
     }
 
+#if defined(_WIN32)
     static int __cdecl AssertHook(int reportType, char* message, int* returnValue)
     {
         if (reportType == _CRT_ASSERT)
@@ -86,4 +95,5 @@ private:
         }
         return 0; // let CRT proceed to abort
     }
+#endif
 };

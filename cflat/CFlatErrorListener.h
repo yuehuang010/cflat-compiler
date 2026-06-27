@@ -1,11 +1,9 @@
 #pragma once
-#include <antlr4-runtime.h>
+#include "platform/GeneratedParser.h" // antlr runtime + generated parser + kTokenEOF
 #include <string>
 #include <vector>
 #include <set>
 #include <sstream>
-
-#include "CFlatParser.h"
 
 struct ParseDiagnostic
 {
@@ -100,7 +98,7 @@ private:
         antlr4::RuleContext* ctx = parser->getContext();
 
         bool offendingIsEof = offendingSymbol &&
-                              offendingSymbol->getType() == antlr4::Token::EOF;
+                              offendingSymbol->getType() == cflat::kTokenEOF;
 
         while (ctx)
         {

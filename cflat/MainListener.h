@@ -31,9 +31,7 @@
 #include <optional>
 #include <cstdlib>
 
-#include "CFlatParser.h"
-#include "CFlatLexer.h"
-#include "CFlatBaseListener.h"
+#include "platform/GeneratedParser.h"
 #include "LLVMBackend.h"
 #include "LspSymbolIndex.h"
 
@@ -14419,7 +14417,7 @@ public:
                 // instead of letting the partial parse fail later as a confusing
                 // "undefined variable" at a synthetic location.
                 if (exprParser.getNumberOfSyntaxErrors() > 0
-                    || exprParser.getCurrentToken()->getType() != antlr4::Token::EOF)
+                    || exprParser.getCurrentToken()->getType() != cflat::kTokenEOF)
                 {
                     std::string shown = exprText.size() > 40 ? exprText.substr(0, 40) + "..." : exprText;
                     LogErrorContext(ctx, std::format(

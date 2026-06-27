@@ -268,11 +268,14 @@ int main(int argc, char* argv[])
 
     CompilerManager::Instance().InstallAssertHook();
 
+#if defined(_WIN32)
+    // Route CRT assert/error/warning reports to stderr instead of a popup dialog.
     for (int crtMode : {_CRT_ASSERT, _CRT_ERROR, _CRT_WARN})
     {
         _CrtSetReportMode(crtMode, _CRTDBG_MODE_FILE);
         _CrtSetReportFile(crtMode, _CRTDBG_FILE_STDERR);
     }
+#endif
 
     ArgParser args;
     args.addPositional("filename", "Source file to compile");

@@ -1,5 +1,5 @@
 #include "JsonRpcLoop.h"
-#include <io.h>
+#include "platform/PlatformIo.h"
 #include <format>
 #include <iostream>
 
