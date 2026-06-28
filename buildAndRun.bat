@@ -8,11 +8,11 @@ set TESTFILE=%1
 if "%TESTFILE%"=="" set TESTFILE=test_basic.cb
 
 echo Building Debug...
-msbuild cflat.slnx -p:Platform=x64 -p:Configuration=Debug -v:minimal -nologo
+call "%SCRIPT_DIR%cmake_build.bat" debug
 if errorlevel 1 goto :end
 
 echo Building Release...
-msbuild cflat.slnx -p:Platform=x64 -p:Configuration=Release -v:minimal -nologo && (
+call "%SCRIPT_DIR%cmake_build.bat" release && (
     "%SCRIPT_DIR%x64\Release\cflat.exe" --nologo Test\%TESTFILE% -o out\myapp.exe -p win64
     if not errorlevel 1 out\myapp.exe
 )

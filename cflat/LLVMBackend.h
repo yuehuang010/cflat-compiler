@@ -1070,6 +1070,12 @@ private:
 #else
     bool targetWindows_ = false;
 #endif
+    // Darwin/Mach-O target (--platform macos). Implies !targetWindows_ + POSIX.
+    // arm64 is the only supported macOS arch; the architecture is tracked
+    // separately because every prior target was x86 (the eightbyte struct ABI,
+    // va_list lowering, and triple all assume x86-64 unless this is set).
+    bool targetMacOS_ = false;
+    bool targetArm64_ = false;
     std::vector<std::string> cObjectFiles_;
     int cOptLevel_ = 0;        // optimization level applied to clang C compiles
     bool cDebugInfo_ = false;  // emit CodeView for clang C compiles
@@ -2699,9 +2705,12 @@ private:
     void CreateVaStart(llvm::Value* apAlloca)
     {
         auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::vastart);
-        if (!targetWindows_)
+        // macOS arm64 (Darwin): va_list is a plain char* (Apple passes every variadic
+        // argument on the stack), so the slot IS the va_list - init it directly, exactly
+        // like the Windows path. NOT the x86-64 SysV __va_list_tag indirection below.
+        if (!targetWindows_ && !targetMacOS_)
         {
-            // Allocate the 24-byte tag, point the va_list slot at it, and init the tag.
+            // x86-64 SysV: allocate the 24-byte tag, point the va_list slot at it, init the tag.
             auto* tag = AllocaAtEntry(VaListTagType(), nullptr, "va.tag", 16);
             builder->CreateStore(tag, apAlloca);
             builder->CreateCall(fn, {tag});
@@ -2713,9 +2722,9 @@ private:
     void CreateVaEnd(llvm::Value* apAlloca)
     {
         auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::vaend);
-        if (!targetWindows_)
+        if (!targetWindows_ && !targetMacOS_)
         {
-            // The slot holds the tag pointer (set by CreateVaStart); va_end takes the tag.
+            // x86-64 SysV: the slot holds the tag pointer (set by CreateVaStart); va_end takes the tag.
             auto* tag = builder->CreateLoad(llvm::PointerType::getUnqual(*context), apAlloca, "va.tag");
             builder->CreateCall(fn, {tag});
             return;
@@ -2843,6 +2852,25 @@ private:
             return false;
         }
         return true;
+    }
+
+    // Build a TargetLibraryInfoImpl for `triple` with cflat's reimplemented C stdio format
+    // family (vsnprintf/vfprintf/vsscanf/vfscanf) marked unavailable on non-Windows targets.
+    // Without this, instcombine (opt pipeline) and the codegen libcall simplifier fortify-fold
+    // our __vsnprintf_chk / __vfprintf_chk libc calls back into plain vsnprintf / vfprintf, which
+    // on ELF bind to cflat's OWN reimplementations and recurse forever. Windows keeps the real
+    // libc names, so the unavailable marks only fire off-Windows.
+    llvm::TargetLibraryInfoImpl MakeStdioSafeTLII(const llvm::Triple& triple) const
+    {
+        llvm::TargetLibraryInfoImpl tlii{ triple };
+        if (!targetWindows_)
+        {
+            tlii.setUnavailable(llvm::LibFunc_vsnprintf);
+            tlii.setUnavailable(llvm::LibFunc_vfprintf);
+            tlii.setUnavailable(llvm::LibFunc_vsscanf);
+            tlii.setUnavailable(llvm::LibFunc_vfscanf);
+        }
+        return tlii;
     }
 
     void RunModulePasses(llvm::ModulePassManager& MPM);
@@ -4980,10 +5008,13 @@ private:
         llvm::InitializeAllTargetMCs();
         llvm::InitializeAllAsmPrinters();
 
-        std::string triple = (platformValue == 32)
-            ? "i686-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+        std::string triple = targetMacOS_
+            ? std::string("arm64-apple-macosx")
+            : (platformValue == 32 ? "i686-pc-windows-msvc" : "x86_64-pc-windows-msvc");
         std::string cpu = !targetCpu_.empty()
-            ? targetCpu_ : (platformValue == 32 ? std::string("i686") : std::string("x86-64"));
+            ? targetCpu_
+            : (targetMacOS_ ? std::string("apple-m1")
+                            : (platformValue == 32 ? std::string("i686") : std::string("x86-64")));
 
         std::string err;
         const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
@@ -5068,12 +5099,7 @@ private:
             // __vsnprintf_chk/__vfprintf_chk calls back into cflat's own vsnprintf/vfprintf
             // and recurse forever - even though the IR-level opt pipeline already kept them
             // intact. Seed the codegen PM with the same stdio-safe TLI so the fold stays off.
-            llvm::TargetLibraryInfoImpl codegenTLII{ llvm::Triple(triple) };
-            codegenTLII.setUnavailable(llvm::LibFunc_vsnprintf);
-            codegenTLII.setUnavailable(llvm::LibFunc_vfprintf);
-            codegenTLII.setUnavailable(llvm::LibFunc_vsscanf);
-            codegenTLII.setUnavailable(llvm::LibFunc_vfscanf);
-            pass.add(new llvm::TargetLibraryInfoWrapperPass(codegenTLII));
+            pass.add(new llvm::TargetLibraryInfoWrapperPass(MakeStdioSafeTLII(llvm::Triple(triple))));
             if (TM->addPassesToEmitFile(pass, dest, nullptr, llvm::CodeGenFileType::ObjectFile))
             {
                 std::cout << "Error: target does not support object file emission\n";
@@ -5133,9 +5159,124 @@ private:
         return true;
     }
 
+    // Cross-compile to a macOS arm64 Mach-O object (--platform macos). On a Mac
+    // this would link via clang/ld64; on a non-Darwin host (the WSL cross-build)
+    // no ld64 / macOS SDK is present, so this emits the relocatable Mach-O object
+    // and stops, leaving <exePath>.o for a later link on a real Mac. The AArch64
+    // backend must be registered in this LLVM build (apt llvm-18 on WSL has it;
+    // the Windows vcpkg LLVM is X86-only, so this cleanly errors there).
+    bool EmitExecutableMachO(const std::string& exePath, bool debugInfo,
+                             const std::optional<std::string>& lliPath)
+    {
+        llvm::InitializeAllTargets();
+        llvm::InitializeAllTargetMCs();
+        llvm::InitializeAllAsmPrinters();
+
+        const std::string triple = "arm64-apple-macosx";
+        module->setTargetTriple(triple);
+
+        std::string err;
+        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
+        if (!target)
+        {
+            std::cout << std::format("Error: no target for triple '{}': {}. The macOS arm64 "
+                                     "target needs an LLVM built with the AArch64 backend "
+                                     "(apt llvm-18 on Linux/WSL has it).\n", triple, err);
+            return false;
+        }
+
+        // Apple Silicon baseline. --cpu overrides (e.g. apple-m2).
+        std::string cpu = targetCpu_.empty() ? std::string("apple-m1") : targetCpu_;
+        llvm::TargetOptions opt;
+        opt.FunctionSections = true;
+        opt.DataSections     = true;
+        // Darwin code is always PIC.
+        auto TM = std::unique_ptr<llvm::TargetMachine>(
+            target->createTargetMachine(triple, cpu, "", opt, llvm::Reloc::PIC_));
+        module->setDataLayout(TM->createDataLayout());
+
+        if (lliPath)
+        {
+            if (verbose) std::cout << std::format("[verbose] writing IR to {}\n", *lliPath);
+            if (!SaveToFile(*lliPath))
+            {
+                std::cout << std::format("Error: failed to save IR to '{}'.\n", *lliPath);
+                return false;
+            }
+        }
+
+        const std::string objPath = exePath + ".o";
+        std::error_code EC;
+        llvm::raw_fd_ostream dest(objPath, EC, llvm::sys::fs::OF_None);
+        if (EC)
+        {
+            std::cout << std::format("Error: could not write object file '{}': {}\n", objPath, EC.message());
+            return false;
+        }
+        {
+            llvm::legacy::PassManager pass;
+            // Same stdio-safe TLI as EmitExecutableElf: codegen runs its own libcall
+            // simplification, which would fortify-fold our __vsnprintf_chk call back
+            // into a bare vsnprintf - and cflat DEFINES vsnprintf, so that recurses
+            // forever. Mark the format libcalls unavailable so the fold stays off.
+            pass.add(new llvm::TargetLibraryInfoWrapperPass(MakeStdioSafeTLII(llvm::Triple(triple))));
+            if (TM->addPassesToEmitFile(pass, dest, nullptr, llvm::CodeGenFileType::ObjectFile))
+            {
+                std::cout << "Error: target does not support object file emission\n";
+                return false;
+            }
+            pass.run(*module);
+            dest.flush();
+            dest.close();
+        }
+
+        // Link only if a Darwin-capable driver exists (a real Mac, or osxcross).
+        // ld64 / the macOS SDK is absent on the WSL cross-host, so the object IS
+        // the deliverable there; report it and stop without claiming an exe.
+        std::string cc;
+        for (const char* cand : { "o64-clang", "oa64-clang", "clang" })
+        {
+            if (auto p = llvm::sys::findProgramByName(cand)) { cc = *p; break; }
+        }
+        const bool darwinHost =
+            llvm::Triple(llvm::sys::getProcessTriple()).isOSDarwin();
+        if (cc.empty() || !darwinHost)
+        {
+            (void)debugInfo;
+            std::cout << std::format("Emitted Mach-O arm64 object (no Darwin linker on this host; "
+                                     "link on macOS): {}\n", objPath);
+            return true;
+        }
+
+        std::vector<std::string> argStrs = { cc, "-target", "arm64-apple-macosx",
+                                             objPath, "-o", exePath };
+        for (auto& cObj : cObjectFiles_) argStrs.push_back(cObj);
+        for (const auto& lib : cLinkLibs_) argStrs.push_back(lib);
+        if (debugInfo) argStrs.push_back("-g");
+
+        std::vector<llvm::StringRef> args;
+        for (auto& s : argStrs) args.push_back(s);
+
+        std::cout << std::format("Linking (mach-o): {}\n", exePath);
+        std::string linkErr;
+        int rc = llvm::sys::ExecuteAndWait(cc, args, std::nullopt, {}, 0, 0, &linkErr);
+        llvm::sys::fs::remove(objPath);
+        for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+        if (rc != 0)
+        {
+            std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
+            return false;
+        }
+        return true;
+    }
+
     bool EmitExecutable(const std::string& exePath, const std::string& platform, bool debugInfo = false,
                         const std::optional<std::string>& lliPath = std::nullopt)
     {
+        // macOS arm64 cross-target: Mach-O object emission, independent of host OS
+        // (handled before the host-specific COFF/ELF split below).
+        if (targetMacOS_)
+            return EmitExecutableMachO(exePath, debugInfo, lliPath);
 #if !defined(_WIN32)
         // Linux/Unix host: emit a native ELF executable. The Windows/COFF path
         // below is unreachable here (but still compiles).
@@ -10219,35 +10360,99 @@ public:
         return coerce;
     }
 
-    // SysV param classification: 1 eightbyte -> CoerceToInt; 2 -> CoercePair; MEMORY -> ByVal.
-    AbiSlot ClassifySysVParam(llvm::StructType* st, uint64_t align)
+    // Build a param/return slot from a classifier's coerce list (SysV eightbytes or AArch64
+    // registers): empty -> MEMORY (memoryKind: ByVal for params, SRetReturn for returns);
+    // one entry -> CoerceToInt; two -> CoercePair. Shared by the SysV and AArch64 classifiers.
+    static AbiSlot MakeCoerceSlot(llvm::StructType* st, uint64_t align,
+                                  const std::vector<llvm::Type*>& coerce, AbiSlot::Kind memoryKind)
     {
         AbiSlot slot;
         slot.structTy = st;
         slot.align    = align;
-        std::vector<llvm::Type*> coerce = ClassifySysVStruct(st);
-        if (coerce.empty()) { slot.kind = AbiSlot::ByVal; return slot; }
+        if (coerce.empty()) { slot.kind = memoryKind; return slot; }
         if (coerce.size() == 1) { slot.kind = AbiSlot::CoerceToInt; slot.coerceTy = coerce[0]; return slot; }
         slot.kind = AbiSlot::CoercePair; slot.coerceTy = coerce[0]; slot.coerceTy2 = coerce[1];
         return slot;
+    }
+
+    // SysV param classification: 1 eightbyte -> CoerceToInt; 2 -> CoercePair; MEMORY -> ByVal.
+    AbiSlot ClassifySysVParam(llvm::StructType* st, uint64_t align)
+    {
+        return MakeCoerceSlot(st, align, ClassifySysVStruct(st), AbiSlot::ByVal);
     }
 
     // SysV return classification: 1 eightbyte -> CoerceToInt; 2 -> CoercePair; MEMORY -> SRet.
     AbiSlot ClassifySysVReturn(llvm::StructType* st, uint64_t align)
     {
-        AbiSlot slot;
-        slot.structTy = st;
-        slot.align    = align;
-        std::vector<llvm::Type*> coerce = ClassifySysVStruct(st);
-        if (coerce.empty()) { slot.kind = AbiSlot::SRetReturn; return slot; }
-        if (coerce.size() == 1) { slot.kind = AbiSlot::CoerceToInt; slot.coerceTy = coerce[0]; return slot; }
-        slot.kind = AbiSlot::CoercePair; slot.coerceTy = coerce[0]; slot.coerceTy2 = coerce[1];
-        return slot;
+        return MakeCoerceSlot(st, align, ClassifySysVStruct(st), AbiSlot::SRetReturn);
     }
 
-    // Win64 / Win32 / SysV ABI classification for a single param slot. Returns Direct for
-    // scalars and pointers (the existing pipeline handles them). For struct-by-value:
-    //   - SysV (non-Windows): eightbyte classification (CoerceToInt / CoercePair / ByVal).
+    // True if `st` is an AArch64 Homogeneous Floating-point Aggregate: 1-4 leaf fields, all
+    // the SAME floating type (all float OR all double), with no padding. HFAs are passed and
+    // returned in consecutive SIMD/FP registers (V0..V3). On match, sets base + count.
+    bool IsAArch64HFA(llvm::StructType* st, llvm::Type*& base, unsigned& count) const
+    {
+        const llvm::DataLayout& dl = module->getDataLayout();
+        std::vector<std::pair<uint64_t, llvm::Type*>> fields;
+        CollectScalarFields(st, 0, dl, fields);
+        if (fields.empty() || fields.size() > 4) return false;
+        llvm::Type* b = fields[0].second;
+        if (!b->isFloatTy() && !b->isDoubleTy()) return false; // HVA (vectors) not handled
+        for (const auto& f : fields)
+            if (f.second != b) return false;
+        // Reject padding/misalignment: a clean HFA is exactly count * sizeof(base).
+        if (dl.getTypeAllocSize(st) != fields.size() * dl.getTypeAllocSize(b)) return false;
+        base = b;
+        count = (unsigned)fields.size();
+        return true;
+    }
+
+    // AArch64 AAPCS64 aggregate classification. Returns the LLVM coercion type(s):
+    //   - HFA (1-4 same FP type)  -> one entry: the base type (count 1) or [count x base].
+    //   - other <= 8 bytes        -> one entry: i(size*8)              (one X register).
+    //   - other 9..16 bytes       -> two entries: i64 + i((size-8)*8)  (two X registers).
+    //   - > 16 bytes              -> empty = MEMORY (indirect: ByVal param / SRet return).
+    // Differs from SysV: AArch64 never splits a non-HFA struct into SSE eightbytes; small
+    // mixed int/float aggregates go entirely in general registers.
+    std::vector<llvm::Type*> ClassifyAArch64Struct(llvm::StructType* st) const
+    {
+        const llvm::DataLayout& dl = module->getDataLayout();
+        uint64_t size = dl.getTypeAllocSize(st);
+        if (size == 0) return {};
+
+        llvm::Type* base = nullptr;
+        unsigned hfaCount = 0;
+        if (IsAArch64HFA(st, base, hfaCount))
+        {
+            llvm::Type* coerce = (hfaCount == 1)
+                ? base
+                : (llvm::Type*)llvm::ArrayType::get(base, hfaCount);
+            return { coerce };
+        }
+
+        if (size > 16) return {}; // MEMORY
+        if (size <= 8)
+            return { llvm::Type::getIntNTy(*context, (unsigned)(size * 8)) };
+        return { llvm::Type::getInt64Ty(*context),
+                 llvm::Type::getIntNTy(*context, (unsigned)((size - 8) * 8)) };
+    }
+
+    // AArch64 param classification: 1 coerce -> CoerceToInt; 2 -> CoercePair; MEMORY -> ByVal.
+    AbiSlot ClassifyAArch64Param(llvm::StructType* st, uint64_t align)
+    {
+        return MakeCoerceSlot(st, align, ClassifyAArch64Struct(st), AbiSlot::ByVal);
+    }
+
+    // AArch64 return classification: 1 coerce -> CoerceToInt; 2 -> CoercePair; MEMORY -> SRet.
+    AbiSlot ClassifyAArch64Return(llvm::StructType* st, uint64_t align)
+    {
+        return MakeCoerceSlot(st, align, ClassifyAArch64Struct(st), AbiSlot::SRetReturn);
+    }
+
+    // Win64 / Win32 / SysV / AArch64 ABI classification for a single param slot. Returns Direct
+    // for scalars and pointers (the existing pipeline handles them). For struct-by-value:
+    //   - AArch64 (macOS arm64): AAPCS64 (HFA in SIMD regs / 1-2 X regs / >16B indirect).
+    //   - SysV (non-Windows x86): eightbyte classification (CoerceToInt / CoercePair / ByVal).
     //   - Win64: size in {1,2,4,8} -> CoerceToInt(iN); else ByVal(pointer + byval attr).
     //   - Win32: always ByVal (cdecl pushes the whole struct on the stack).
     AbiSlot ClassifyAbiParam(const TypeAndValue& tv)
@@ -10258,6 +10463,8 @@ public:
         const llvm::DataLayout& dl = module->getDataLayout();
         uint64_t size  = dl.getTypeAllocSize(st);
         uint64_t align = dl.getABITypeAlign(st).value();
+        if (targetArm64_)
+            return ClassifyAArch64Param(st, align);
         if (!targetWindows_)
             return ClassifySysVParam(st, align);
         if (platformValue == 64 && (size == 1 || size == 2 || size == 4 || size == 8))
@@ -10292,6 +10499,8 @@ public:
         const llvm::DataLayout& dl = module->getDataLayout();
         uint64_t size  = dl.getTypeAllocSize(st);
         uint64_t align = dl.getABITypeAlign(st).value();
+        if (targetArm64_)
+            return ClassifyAArch64Return(st, align);
         if (!targetWindows_)
             return ClassifySysVReturn(st, align);
         if (size == 1 || size == 2 || size == 4 || size == 8)
@@ -12431,12 +12640,18 @@ public:
         SetCompileTimeMacro("__WIN64__",    llvm::ConstantInt::get(i32, platformValue == 64 ? 1 : 0), "int");
         SetCompileTimeMacro("__WIN32__",    llvm::ConstantInt::get(i32, platformValue == 32 ? 1 : 0), "int");
         SetCompileTimeMacro("__WINDOWS__",  llvm::ConstantInt::get(i32, targetWindows_ ? 1 : 0),   "int");
-        // POSIX/Linux counterparts for the non-Windows targets. __LINUX__ is the
-        // only POSIX OS for now; a future macOS target would set __MACOS__ and
-        // keep __POSIX__ = 1.
+        // POSIX/Linux/macOS counterparts for the non-Windows targets. Both Linux
+        // and macOS are POSIX; __LINUX__ and __MACOS__ are mutually exclusive and
+        // select the os.posix.cb vs os.macos.cb core library in os.cb.
+        const bool macos = targetMacOS_;
+        const bool linux = !targetWindows_ && !macos;
         SetCompileTimeMacro("__POSIX__",    llvm::ConstantInt::get(i32, targetWindows_ ? 0 : 1),   "int");
-        SetCompileTimeMacro("__LINUX__",    llvm::ConstantInt::get(i32, targetWindows_ ? 0 : 1),   "int");
-        SetCompileTimeMacro("__X86__",      llvm::ConstantInt::get(i32, 1),                        "int");
+        SetCompileTimeMacro("__LINUX__",    llvm::ConstantInt::get(i32, linux ? 1 : 0),            "int");
+        SetCompileTimeMacro("__MACOS__",    llvm::ConstantInt::get(i32, macos ? 1 : 0),            "int");
+        SetCompileTimeMacro("__DARWIN__",   llvm::ConstantInt::get(i32, macos ? 1 : 0),            "int");
+        // Target architecture: every prior target was x86; arm64 is macOS-only for now.
+        SetCompileTimeMacro("__X86__",      llvm::ConstantInt::get(i32, targetArm64_ ? 0 : 1),     "int");
+        SetCompileTimeMacro("__ARM64__",    llvm::ConstantInt::get(i32, targetArm64_ ? 1 : 0),     "int");
     }
 
     CompileTimeMacro GetCompileTimeMacro(const std::string& name)

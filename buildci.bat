@@ -1,8 +1,6 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-set MSBUILD="C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe"
-set SOLUTION=cflat.slnx
 set START_TIME=%TIME%
 set /a OVERALL_ERRORS=0
 
@@ -18,7 +16,7 @@ echo.
 echo =========================================================================
 echo BUILD: %CFG%
 echo =========================================================================
-%MSBUILD% %SOLUTION% -p:Configuration=%CFG% -p:Platform=x64 -v:minimal
+call "%~dp0cmake_build.bat" %CFG%
 if errorlevel 1 (
     echo BUILD FAILED: %CFG%
     set /a OVERALL_ERRORS+=1

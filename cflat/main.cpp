@@ -289,9 +289,9 @@ int main(int argc, char* argv[])
     args.addOption("import-dir", 'i', "Directory to search for imported modules");
     // Default target platform = host OS (no cross-OS compilation yet).
 #if defined(_WIN32)
-    args.addOption("platform", 'p', "Target platform: win64 (default), win32, or linux", "win64");
+    args.addOption("platform", 'p', "Target platform: win64 (default), win32, linux, or macos (arm64 Mach-O cross-compile)", "win64");
 #else
-    args.addOption("platform", 'p', "Target platform: linux (default), win64, or win32", "linux");
+    args.addOption("platform", 'p', "Target platform: linux (default), win64, win32, or macos (arm64 Mach-O cross-compile)", "linux");
 #endif
     args.addFlag("verbose", 'v', "Print detailed diagnostic messages during compilation");
     args.addFlag("O0", '0', "No optimization (default)");

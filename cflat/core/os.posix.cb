@@ -37,6 +37,16 @@ namespace os.posix
     extern win_int __vfprintf_chk(void* stream, win_int flag, const char* fmt, va_list ap);
     extern win_int __isoc99_vfscanf(void* stream, const char* fmt, va_list ap);
 
+    // macOS libc has no __isoc99_* (glibc-only) and no __vfprintf_chk (Darwin's
+    // _FORTIFY only covers buffer-bounded calls, not f/printf). cflat does NOT
+    // define vsscanf/vfprintf/vfscanf, so the public names bind without colliding.
+    // __vsnprintf_chk DOES exist on Darwin (secure/_stdio.h, same 6-arg signature),
+    // so vsnprintf - which cflat DOES define - still routes through the chk variant
+    // on both platforms. These externs are unreferenced on Linux (no symbol emitted).
+    extern win_int vsscanf(const char* buf, const char* fmt, va_list ap);
+    extern win_int vfprintf(void* stream, const char* fmt, va_list ap);
+    extern win_int vfscanf(void* stream, const char* fmt, va_list ap);
+
     // Note: i64 (not the win_size alias) for the size param - ForwardRefScanner does
     // not resolve an if-const `using` alias when scanning a function-def signature,
     // and these hosts are 64-bit (win_size == i64). externs above resolve it fine.
@@ -44,27 +54,40 @@ namespace os.posix
         return os.posix.__vsnprintf_chk(buf, size, 0, size, fmt, ap);
     }
     win_int vsscanf_libc(const char* buf, const char* fmt, va_list ap) {
-        return os.posix.__isoc99_vsscanf(buf, fmt, ap);
+        if const (__MACOS__) { return os.posix.vsscanf(buf, fmt, ap); }
+        else { return os.posix.__isoc99_vsscanf(buf, fmt, ap); }
     }
     win_int vfprintf_libc(void* stream, const char* fmt, va_list ap) {
-        return os.posix.__vfprintf_chk(stream, 0, fmt, ap);
+        if const (__MACOS__) { return os.posix.vfprintf(stream, fmt, ap); }
+        else { return os.posix.__vfprintf_chk(stream, 0, fmt, ap); }
     }
     win_int vfscanf_libc(void* stream, const char* fmt, va_list ap) {
-        return os.posix.__isoc99_vfscanf(stream, fmt, ap);
+        if const (__MACOS__) { return os.posix.vfscanf(stream, fmt, ap); }
+        else { return os.posix.__isoc99_vfscanf(stream, fmt, ap); }
     }
 
-    // libc standard stream FILE* globals (glibc: `extern FILE *stdin/stdout/stderr`).
+    // libc standard stream FILE* globals. glibc exports stdin/stdout/stderr directly;
+    // Darwin exports __stdinp/__stdoutp/__stderrp (stdin/out/err are macros over them).
     // Used to recognize the stdout/stderr streams in the f* wrappers.
     extern void* stdin;
     extern void* stdout;
     extern void* stderr;
+    extern void* __stdinp;
+    extern void* __stdoutp;
+    extern void* __stderrp;
 
     // Map the 0/1/2 stream index (the Windows __acrt_iob_func convention) to the
     // corresponding libc FILE*.
     void* iob(i32 which) {
-        if (which == 0) return os.posix.stdin;
-        if (which == 1) return os.posix.stdout;
-        return os.posix.stderr;
+        if const (__MACOS__) {
+            if (which == 0) return os.posix.__stdinp;
+            if (which == 1) return os.posix.__stdoutp;
+            return os.posix.__stderrp;
+        } else {
+            if (which == 0) return os.posix.stdin;
+            if (which == 1) return os.posix.stdout;
+            return os.posix.stderr;
+        }
     }
 
     // === pthreads (link with -lpthread) ===

@@ -76,7 +76,14 @@ else()
     target codegen analysis passes
     instrumentation scalaropts ipo instcombine transformutils
     orcjit jitlink executionengine
-    native nativecodegen)
+    native nativecodegen
+    # Cross-target macOS arm64 emission: the code calls InitializeAllTargets(),
+    # which references every target in the installed LLVM (now X86 + AArch64), so
+    # the AArch64 target libs must be linked too - 'native' only covers the host.
+    # Use the exact (case-sensitive) lib suffixes: llvm_map_components_to_libnames
+    # prepends 'LLVM' verbatim, so 'aarch64' would wrongly yield 'LLVMaarch64'.
+    AArch64CodeGen AArch64AsmParser AArch64Disassembler
+    AArch64Desc AArch64Info AArch64Utils)
 endif()
 
 # ---------------------------------------------------------------------------

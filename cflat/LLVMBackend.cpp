@@ -336,8 +336,9 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // paths can use the resolved values verbatim. The CPU table is identical for both
     // triples (shared X86 backend); we validate against the active platform's triple.
     {
-        std::string triple = (platformOption == "win32")
-            ? "i686-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+        std::string triple = (platformOption == "macos" || platformOption == "macos-arm64")
+            ? "arm64-apple-macosx"
+            : ((platformOption == "win32") ? "i686-pc-windows-msvc" : "x86_64-pc-windows-msvc");
         if (auto cpuOpt = args.getOption("cpu"))
             if (!ResolveCpuName(*cpuOpt, triple, "--cpu", verbose, targetCpu_))
                 return false;
@@ -406,8 +407,14 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // This is a compile-time constant available in all compiled files.
     platformValue = (platformOption == "win32") ? 32 : 64;
     targetWindows_ = (platformOption == "win32" || platformOption == "win64");
-    if (verbose) std::cout << std::format("[verbose] __PLATFORM__ = {}, __WINDOWS__ = {}\n",
-                                          platformValue, targetWindows_ ? 1 : 0);
+    // macos / macos-arm64: Darwin Mach-O on Apple arm64. POSIX (not Windows),
+    // 64-bit, arm64 architecture. The only non-x86 target, so it drives the
+    // triple, struct ABI, and va_list lowering off targetArm64_.
+    targetMacOS_ = (platformOption == "macos" || platformOption == "macos-arm64");
+    targetArm64_ = targetMacOS_;
+    if (verbose) std::cout << std::format("[verbose] __PLATFORM__ = {}, __WINDOWS__ = {}, __MACOS__ = {}, arm64 = {}\n",
+                                          platformValue, targetWindows_ ? 1 : 0,
+                                          targetMacOS_ ? 1 : 0, targetArm64_ ? 1 : 0);
 
     // Try to load core bitcode cache BEFORE setting up the module, because
     // LoadCoreBitcodeIfFresh replaces context/module/builder with a fresh LLVM
@@ -433,7 +440,15 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // Must precede InitDebugInfo so pointer-width queries during DI construction
     // see the real layout instead of the LLVM default.
     if (!bitcodeLoaded)
-        module->setDataLayout(llvm::DataLayout(PlatformDataLayout(platformValue)));
+    {
+        // arm64-apple-macosx layout for the Darwin cross-target; x86 layout otherwise.
+        // Set here (not just at emit time) so IR generation, optimization, and codegen
+        // all use one consistent layout.
+        const char* dl = targetMacOS_
+            ? "e-m:o-i64:64-i128:128-n32:64-S128"
+            : PlatformDataLayout(platformValue);
+        module->setDataLayout(llvm::DataLayout(dl));
+    }
 
     if (debugInfo)
     {
@@ -1440,14 +1455,7 @@ void LLVMBackend::RunModulePasses(llvm::ModulePassManager& MPM)
     // instcombine, whose fortify-folding would otherwise rewrite our __vsnprintf_chk /
     // __vfprintf_chk libc calls back into cflat's own vsnprintf/vfprintf and recurse
     // forever on ELF. Register before registerFunctionAnalyses so it wins.
-    llvm::TargetLibraryInfoImpl TLII{ llvm::Triple(module->getTargetTriple()) };
-    if (!targetWindows_)
-    {
-        TLII.setUnavailable(llvm::LibFunc_vsnprintf);
-        TLII.setUnavailable(llvm::LibFunc_vfprintf);
-        TLII.setUnavailable(llvm::LibFunc_vsscanf);
-        TLII.setUnavailable(llvm::LibFunc_vfscanf);
-    }
+    llvm::TargetLibraryInfoImpl TLII = MakeStdioSafeTLII(llvm::Triple(module->getTargetTriple()));
     FAM.registerPass([&] { return llvm::TargetLibraryAnalysis(TLII); });
 
     PB.registerModuleAnalyses(MAM);
@@ -1762,14 +1770,7 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
     // recurse forever. Marking the colliding names unavailable keeps the chk calls
     // intact so they reach libc. Register this TLI before registerFunctionAnalyses so
     // it wins over the default (registerPass is a no-op once an analysis exists).
-    llvm::TargetLibraryInfoImpl TLII{ llvm::Triple(module->getTargetTriple()) };
-    if (!targetWindows_)
-    {
-        TLII.setUnavailable(llvm::LibFunc_vsnprintf);
-        TLII.setUnavailable(llvm::LibFunc_vfprintf);
-        TLII.setUnavailable(llvm::LibFunc_vsscanf);
-        TLII.setUnavailable(llvm::LibFunc_vfscanf);
-    }
+    llvm::TargetLibraryInfoImpl TLII = MakeStdioSafeTLII(llvm::Triple(module->getTargetTriple()));
     FAM.registerPass([&] { return llvm::TargetLibraryAnalysis(TLII); });
 
     PB.registerModuleAnalyses(MAM);

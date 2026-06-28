@@ -35,7 +35,16 @@ Do not modify the root `./vcpkg.json` without explicit permission.
 
 ## Building
 
-Visual Studio 2022 project with vcpkg dependencies (ANTLR4, LLVM) and deploy core/*.cb libraries.  Always build via the **solution file** - building the `.vcxproj` alone puts the exe in the wrong location for `test.bat`:
+The Windows build uses **CMake + vcpkg (Ninja + MSVC)** - this is the default path, and what the dev scripts (`buildAndRun.bat`, `buildci.bat`) invoke. vcpkg supplies the dependencies (ANTLR4, LLVM); the build also deploys `core/*.cb` next to the exe. See [Cross-platform builds](#cross-platform-builds-cmake-windows-linuxwsl-macos) below for the `cmake_build.bat` helper and the presets. The CMake build writes `cflat.exe` to the same `x64/<Config>/` layout the old MSBuild used, so `test.bat` / `test_lsp.bat` work unchanged.
+
+**Quick dev loop** - `buildAndRun.bat` builds Debug + Release (via `cmake_build.bat`), then runs `Test/test_basic.cb`:
+
+```bash
+./buildAndRun.bat            # builds Debug + Release, runs test_basic.cb
+./buildAndRun.bat test_foo.cb  # same but runs test_foo.cb instead
+```
+
+**Legacy MSBuild** (`.slnx`/`.vcxproj`) still builds on Windows but is no longer the primary path. Build via the **solution file** - building the `.vcxproj` alone puts the exe in the wrong location for `test.bat`:
 
 ```bash
 msbuild cflat.slnx -p:Configuration=Debug -p:Platform=x64
@@ -43,22 +52,9 @@ msbuild cflat.slnx -p:Configuration=Debug -p:Platform=x64
 
 > **Bash / Git Bash note**: Use **`-p:`** (dash), not `/p:` (slash). Git Bash path-converts arguments that start with `/letter:`, stripping the leading slash, which causes MSBuild to misparse the flags. Dashes are safe.
 
-Full msbuild path (if not on PATH):
-
-```bash
-"/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/amd64/MSBuild.exe" cflat.slnx -p:Configuration=Debug -p:Platform=x64 -v:minimal
-```
-
-**Quick dev loop** - `buildAndRun.bat` builds both Release and Debug, then runs the Debug binary on `Test/test_basic.cb`. Run directly (without `cmd /c`) so MSBuild output is captured:
-
-```bash
-./buildAndRun.bat            # builds Release + Debug, runs Debug binary on test_basic.cb
-./buildAndRun.bat test_foo.cb  # same but runs test_foo.cb instead
-```
-
 ### Cross-platform builds (CMake: Windows, Linux/WSL, macOS)
 
-The project is migrating from MSBuild (`.vcxproj`/`.slnx`) to **CMake + vcpkg**. Both build paths currently work on Windows; the CMake path is the only one that works on Linux/WSL and macOS. Presets live in `CMakePresets.json`. See `internal/plan/cross-platform-macos.md` for the staged port status (Windows + Linux/WSL host build and Linux ELF target are working; macOS is prepared but unverified).
+**CMake + vcpkg** is the primary build system (the legacy MSBuild `.vcxproj`/`.slnx` still build on Windows but are not the default; the dev scripts use CMake). It is the only path that works on Linux/WSL and macOS. Presets live in `CMakePresets.json`. See `internal/plan/cross-platform-macos.md` for the staged port status (Windows + Linux/WSL host build, Linux ELF target, and macOS arm64 cross-object emission are working; on-device macOS link/run is unverified - no Mac yet).
 
 > The CMake build writes the Windows `cflat.exe` to the **same** `x64/<Config>/` layout as MSBuild, so `test.bat` / `test_lsp.bat` work unchanged after a CMake build.
 
@@ -93,11 +89,7 @@ wsl.exe -e bash -lc "cd /mnt/c/source/cflat-compiler && cmake --preset linux-x64
 
 > antlr versions **must** match the runtime: Linux pins generator 4.10.1 against libantlr4-runtime 4.10 (Windows uses 4.13.2). Don't cross them.
 
-**macOS arm64 (PREPARE only - unverified, no Mac yet).** Presets `macos-arm64-release` / `macos-arm64-debug` are wired (vcpkg `arm64-osx` triplet) but Stage 4 is not validated. Note: vcpkg's installed LLVM lacks the AArch64 target, so native arm64 *code emission* still needs an LLVM rebuild or Homebrew LLVM - decision pending.
-
-```bash
-cmake --preset macos-arm64-release && cmake --build --preset macos-arm64-release
-```
+**macOS arm64 cross-object emission (works from Windows + WSL; on-device link/run unverified, no Mac yet).** The vcpkg LLVM was rebuilt with the AArch64 target (`vcpkg.json` lists `llvm` with feature `target-aarch64`), so `cflat foo.cb --platform macos -o foo.out` emits a valid Mach-O arm64 object on either host. Since neither host has `ld64`/a macOS SDK, it stops at `foo.out.o` (link + run happen on a real Mac). The codegen seam (triple, Mach-O, AAPCS64 struct ABI, Darwin `char*` va_list, macOS libc symbol names) is verified at the object/IR level; the deferred Mac-only items (link, runtime behavior, `os.posix.cb` Darwin runtime constants) are tracked in `internal/issue/macos-arm64-mac-validation-deferred.md`. The `macos-arm64-release` / `macos-arm64-debug` presets (vcpkg `arm64-osx` triplet) are for a future native build *on* a Mac and remain unvalidated.
 
 ### Git worktrees (share the 26 GB vcpkg_installed)
 
