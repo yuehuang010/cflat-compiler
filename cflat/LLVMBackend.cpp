@@ -40,6 +40,14 @@
 #include <map>
 #include <set>
 
+#if defined(__APPLE__)
+// Step 3 (macOS self-contained link): harvest libSystem's exported symbols from
+// the live dyld shared cache to synthesize a linker stub, so -o needs no SDK.
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <cstring>
+#endif
+
 // Win32 unwind registration for the --run JIT (see cflat_jit::SehRegistrationPlugin). Declared
 // here, not in LLVMBackend.h, so this stays in a TU that never includes <winnt.h> - otherwise
 // the extern "C" decl would clash with the real prototype in TUs that pull in windows.h. x64
@@ -2434,11 +2442,17 @@ void LLVMBackend::ScanCrossThreadEscapes(CFlatParser::CompilationUnitContext* cu
 
 std::string LLVMBackend::GetCflatCacheDir()
 {
+#if defined(_WIN32)
     char buf[260] = {};
     size_t len = 0;
     if (getenv_s(&len, buf, sizeof(buf), "USERPROFILE") != 0 || len == 0)
         return {};
     return std::string(buf) + "\\.cflat";
+#else
+    if (const char* home = std::getenv("HOME"); home && *home)
+        return std::string(home) + "/.cflat";
+    return {};
+#endif
 }
 
 bool LLVMBackend::WriteCompilerPathToCache()
@@ -3076,12 +3090,150 @@ bool LLVMBackend::SynthesizeX86SystemImportLibs(const LinkerPaths& paths)
     return allOk;
 }
 
+#if defined(__APPLE__)
+namespace {
+// Mach-O export-trie decoding for the libSystem stub harvest. The trie is a
+// prefix tree: each node has an optional terminal payload (a ULEB size) followed
+// by edges (substring + child offset). A terminal node's accumulated prefix is
+// an exported symbol name.
+uint64_t MachoReadUleb(const uint8_t*& p, const uint8_t* end)
+{
+    uint64_t r = 0; int bit = 0;
+    while (p < end) { uint8_t b = *p++; r |= uint64_t(b & 0x7f) << bit; bit += 7; if (!(b & 0x80)) break; }
+    return r;
+}
+void MachoWalkExportTrie(const uint8_t* start, const uint8_t* p, const uint8_t* end,
+                         const std::string& prefix, std::set<std::string>& out)
+{
+    if (p >= end) return;
+    uint64_t termSize = MachoReadUleb(p, end);
+    const uint8_t* children = p + termSize;
+    // Skip $ld$ linker directives (previous-version aliases); keep real symbols.
+    if (termSize != 0 && prefix.find("$ld$") == std::string::npos)
+        out.insert(prefix);
+    if (children >= end) return;
+    uint8_t childCount = *children++;
+    const uint8_t* s = children;
+    for (uint8_t i = 0; i < childCount && s < end; i++)
+    {
+        std::string edge(reinterpret_cast<const char*>(s));
+        s += edge.size() + 1;
+        uint64_t off = MachoReadUleb(s, end);
+        MachoWalkExportTrie(start, start + off, end, prefix + edge, out);
+    }
+}
+// Walk one loaded image's export trie. For shared-cache dylibs the __LINKEDIT
+// segment is shared; the in-memory trie base is linkedit_vmaddr + slide - linkedit_fileoff.
+void MachoHarvestImage(const struct mach_header* mhc, intptr_t slide, std::set<std::string>& out)
+{
+    auto mh = reinterpret_cast<const mach_header_64*>(mhc);
+    if (!mh || mh->magic != MH_MAGIC_64) return;
+    uint64_t linkVm = 0, linkFoff = 0, expOff = 0, expSize = 0;
+    auto cmd = reinterpret_cast<const load_command*>(reinterpret_cast<const uint8_t*>(mh) + sizeof(*mh));
+    for (uint32_t i = 0; i < mh->ncmds; i++)
+    {
+        if (cmd->cmd == LC_SEGMENT_64)
+        {
+            auto sc = reinterpret_cast<const segment_command_64*>(cmd);
+            if (std::strcmp(sc->segname, "__LINKEDIT") == 0) { linkVm = sc->vmaddr; linkFoff = sc->fileoff; }
+        }
+        else if (cmd->cmd == LC_DYLD_INFO || cmd->cmd == LC_DYLD_INFO_ONLY)
+        {
+            auto dc = reinterpret_cast<const dyld_info_command*>(cmd);
+            expOff = dc->export_off; expSize = dc->export_size;
+        }
+        else if (cmd->cmd == LC_DYLD_EXPORTS_TRIE)
+        {
+            auto lc = reinterpret_cast<const linkedit_data_command*>(cmd);
+            expOff = lc->dataoff; expSize = lc->datasize;
+        }
+        cmd = reinterpret_cast<const load_command*>(reinterpret_cast<const uint8_t*>(cmd) + cmd->cmdsize);
+    }
+    if (expOff == 0 || expSize == 0) return;
+    const uint8_t* linkBase = reinterpret_cast<const uint8_t*>(linkVm + slide - linkFoff);
+    const uint8_t* trie = linkBase + expOff;
+    MachoWalkExportTrie(trie, trie, trie + expSize, "", out);
+}
+} // namespace
+
+std::string LLVMBackend::MacStubSyslibroot()
+{
+    std::string cacheDir = GetCflatCacheDir();
+    if (cacheDir.empty()) return {};
+    std::string root = cacheDir + "/macsdk";
+    if (llvm::sys::fs::exists(root + "/usr/lib/libSystem.tbd")) return root;
+    return {};
+}
+
+bool LLVMBackend::HarvestMacSystemStub(const std::string& cacheDir, bool verbose)
+{
+    // libSystem's reexport closure lives under /usr/lib/system/ (plus libSystem
+    // itself). Its own trie is nearly empty, so we flatten the children's exports.
+    std::set<std::string> symbols;
+    int images = 0;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++)
+    {
+        const char* name = _dyld_get_image_name(i);
+        if (!name) continue;
+        if (!std::strstr(name, "/usr/lib/system/lib") &&
+            !std::strstr(name, "/usr/lib/libSystem.B.dylib"))
+            continue;
+        images++;
+        MachoHarvestImage(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i), symbols);
+    }
+    if (symbols.empty())
+    {
+        std::cout << "  Warning: harvested no libSystem symbols; stub not written.\n";
+        return false;
+    }
+
+    std::string libDir = cacheDir + "/macsdk/usr/lib";
+    if (std::error_code ec = llvm::sys::fs::create_directories(libDir); ec)
+    {
+        std::cout << std::format("  Warning: could not create {}: {}\n", libDir, ec.message());
+        return false;
+    }
+    std::string tbdPath = libDir + "/libSystem.tbd";
+    std::error_code ec;
+    llvm::raw_fd_ostream os(tbdPath, ec, llvm::sys::fs::OF_Text);
+    if (ec)
+    {
+        std::cout << std::format("  Warning: could not write {}: {}\n", tbdPath, ec.message());
+        return false;
+    }
+    // Flattened tbd v4: every reexported symbol listed directly under libSystem's
+    // install-name. At runtime dyld's reexport chain still resolves each one.
+    os << "--- !tapi-tbd\n";
+    os << "tbd-version:     4\n";
+    os << "targets:         [ arm64-macos ]\n";
+    os << "install-name:    '/usr/lib/libSystem.B.dylib'\n";
+    os << "current-version: 1\n";
+    os << "compatibility-version: 1\n";
+    os << "exports:\n";
+    os << "  - targets:         [ arm64-macos ]\n";
+    os << "    symbols:         [ ";
+    bool first = true;
+    for (const auto& s : symbols)
+    {
+        if (!first) os << ", ";
+        first = false;
+        os << "'" << s << "'";
+    }
+    os << " ]\n...\n";
+    os.close();
+    if (verbose)
+        std::cout << std::format("  scanned {} images from the dyld shared cache\n", images);
+    std::cout << std::format("  Saved macsdk/usr/lib/libSystem.tbd ({} symbols)\n", symbols.size());
+    return true;
+}
+#endif
+
 bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
 {
     std::string cacheDir = GetCflatCacheDir();
     if (cacheDir.empty())
     {
-        std::cout << "Error: USERPROFILE environment variable is not set.\n";
+        std::cout << "Error: could not determine cache directory (HOME/USERPROFILE not set).\n";
         return false;
     }
 
@@ -3097,6 +3249,14 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
         std::cout << "  Saved compiler_path.txt\n";
     else
         std::cout << "  Warning: could not write compiler_path.txt\n";
+
+#if defined(__APPLE__)
+    // macOS: synthesize the SDK-free libSystem link stub, then done. The Windows
+    // linker-path / import-lib / bitcode-cache steps below do not apply here.
+    std::cout << "Harvesting libSystem link stub from the dyld shared cache...\n";
+    HarvestMacSystemStub(cacheDir, verbose);
+    return true;
+#else
 
     for (const char* arch : {"x64", "x86"})
     {
@@ -3157,6 +3317,7 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
     }
 
     return true;
+#endif
 }
 
 // ---- Core bitcode cache helpers ----

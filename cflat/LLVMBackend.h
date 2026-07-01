@@ -2920,6 +2920,37 @@ private:
         return "";
     }
 
+#if defined(__APPLE__)
+    // Bundled Mach-O linker (deployed next to cflat by the build), else PATH.
+    // "" if absent, in which case the link falls back to the host clang driver.
+    std::string FindBundledLd64Lld() const
+    {
+        if (!runtimeDir.empty())
+        {
+            llvm::SmallString<256> cand(runtimeDir);
+            llvm::sys::path::append(cand, "ld64.lld");
+            if (llvm::sys::fs::exists(cand)) return cand.str().str();
+        }
+        if (auto p = llvm::sys::findProgramByName("ld64.lld")) return *p;
+        return "";
+    }
+
+    // Run a shell command and return its trimmed first stdout line ("" on failure).
+    // Used for xcrun SDK discovery and the clang compiler-rt resource dir.
+    static std::string CaptureToolLine(const char* cmd)
+    {
+        std::string out;
+        if (FILE* p = popen(cmd, "r"))
+        {
+            char buf[1024];
+            if (fgets(buf, sizeof(buf), p)) out = buf;
+            pclose(p);
+            while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+        }
+        return out;
+    }
+#endif
+
     // GCC-style C compiler driver for the ELF (non-Windows) target. Prefers clang to
     // match the LLVM the rest of the pipeline links, then falls back to cc/gcc.
     std::string FindCDriver() const
@@ -5235,16 +5266,73 @@ private:
             dest.close();
         }
 
-        // Link only if a Darwin-capable driver exists (a real Mac, or osxcross).
+        // Link only if a Darwin-capable linker exists (a real Mac, or osxcross).
         // ld64 / the macOS SDK is absent on the WSL cross-host, so the object IS
         // the deliverable there; report it and stop without claiming an exe.
+        const bool darwinHost =
+            llvm::Triple(llvm::sys::getProcessTriple()).isOSDarwin();
+
+#if defined(__APPLE__)
+        // Prefer the bundled ld64.lld (deployed next to cflat), invoked directly -
+        // mirroring the Windows lld-link path. The SDK still supplies libSystem via
+        // -syslibroot; harvesting our own libSystem.tbd (step 3) is what drops that.
+        if (darwinHost)
+        {
+            const std::string ld64 = FindBundledLd64Lld();
+            // Prefer the SDK-free stub harvested by `cflat --init` (no CLT needed);
+            // fall back to $SDKROOT / xcrun when it hasn't been generated.
+            const std::string stubRoot = MacStubSyslibroot();
+            std::string sdk = stubRoot;
+            std::string sdkVer = "11.0";
+            if (sdk.empty())
+            {
+                if (const char* env = std::getenv("SDKROOT")) sdk = env;
+                if (sdk.empty()) sdk = CaptureToolLine("xcrun --show-sdk-path 2>/dev/null");
+                std::string v = CaptureToolLine("xcrun --show-sdk-version 2>/dev/null");
+                if (!v.empty()) sdkVer = v;
+            }
+            if (!ld64.empty() && !sdk.empty())
+            {
+                std::vector<std::string> argStrs = {
+                    ld64, "-arch", "arm64",
+                    "-platform_version", "macos", "11.0.0", sdkVer,
+                    "-syslibroot", sdk, "-o", exePath, objPath };
+                for (auto& cObj : cObjectFiles_) argStrs.push_back(cObj);
+                for (const auto& lib : cLinkLibs_) argStrs.push_back(lib);
+                argStrs.push_back("-lSystem");
+                // The AArch64 backend can emit compiler-rt libcalls (e.g. __multi3);
+                // clang always links libclang_rt.osx.a, so mirror it when locatable.
+                const std::string rtDir = CaptureToolLine("clang -print-resource-dir 2>/dev/null");
+                if (!rtDir.empty())
+                {
+                    const std::string rt = rtDir + "/lib/darwin/libclang_rt.osx.a";
+                    if (llvm::sys::fs::exists(rt)) argStrs.push_back(rt);
+                }
+                std::vector<llvm::StringRef> args;
+                for (auto& s : argStrs) args.push_back(s);
+                std::cout << std::format("Linking (ld64.lld{}): {}\n",
+                                         stubRoot.empty() ? "" : ", SDK-free", exePath);
+                std::string linkErr;
+                int rc = llvm::sys::ExecuteAndWait(ld64, args, std::nullopt, {}, 0, 0, &linkErr);
+                llvm::sys::fs::remove(objPath);
+                for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+                if (rc != 0)
+                {
+                    std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
+                    return false;
+                }
+                return true;
+            }
+        }
+#endif
+
+        // Fallback: host clang driver (bundled ld64.lld/SDK missing, or an osxcross
+        // cross-link from a non-Darwin host). Same behavior as before this change.
         std::string cc;
         for (const char* cand : { "o64-clang", "oa64-clang", "clang" })
         {
             if (auto p = llvm::sys::findProgramByName(cand)) { cc = *p; break; }
         }
-        const bool darwinHost =
-            llvm::Triple(llvm::sys::getProcessTriple()).isOSDarwin();
         if (cc.empty() || !darwinHost)
         {
             (void)debugInfo;
@@ -14373,6 +14461,15 @@ public:
     // Populate %USERPROFILE%\.cflat\ with cached linker paths for x64 and x86.
     // Prints discovered paths to stdout. Returns false if the cache dir cannot be created.
     static bool RunInit(const std::string& runtimeDir, bool verbose);
+
+#if defined(__APPLE__)
+    // Harvest libSystem's reexported symbols from the live dyld shared cache and
+    // write a flattened tbd stub to <cacheDir>/macsdk/usr/lib/libSystem.tbd, so the
+    // -o link needs no macOS SDK / Command Line Tools. Called by RunInit on Darwin.
+    static bool HarvestMacSystemStub(const std::string& cacheDir, bool verbose);
+    // The harvested stub's syslibroot (<cacheDir>/macsdk) if present, else "".
+    static std::string MacStubSyslibroot();
+#endif
 
     // List the target CPUs supported on the currently supported platforms
     // (Windows x86/x64, which both use LLVM's X86 backend and share one CPU table).

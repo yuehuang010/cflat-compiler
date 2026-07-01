@@ -286,4 +286,14 @@ if(WIN32)
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${_deploy_tools} "$<TARGET_FILE_DIR:cflat>"
     COMMENT "Deploying lld-link/clang-cl + LLVM plugin DLLs")
+elseif(APPLE)
+  # ld64.lld (LLVM's Mach-O linker) deployed next to cflat so the native link
+  # step can use a bundled linker instead of the host ld64. In the vcpkg tree
+  # ld64.lld is a symlink into the multi-call lld binary; copy dereferences it
+  # into a standalone file, and lld still selects the Mach-O driver from
+  # argv[0] == "ld64.lld".
+  add_custom_command(TARGET cflat POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${LLVM_TOOLS_BINARY_DIR}/ld64.lld" "$<TARGET_FILE_DIR:cflat>"
+    COMMENT "Deploying ld64.lld (Mach-O linker) next to cflat")
 endif()
