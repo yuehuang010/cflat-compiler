@@ -1,5 +1,6 @@
 import "network/socket.cb";
 import "thread.cb";
+import "time.cb";
 
 int g_port = 19876;
 
@@ -44,7 +45,7 @@ extern int main()
     Thread* srv = new Thread;
     srv->start(serverThread, nullptr);
 
-    os.windows.Sleep(50);
+    sleep(50);
 
     Socket* c = new Socket;
     if (!c->createTcp())

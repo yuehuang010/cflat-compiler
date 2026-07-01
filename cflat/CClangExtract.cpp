@@ -523,7 +523,17 @@ namespace cflat_cinterop
                     m.naturalType = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
                     const APValue& v = ev.Val;
                     if (v.isInt())        { m.kind = RawMacro::Int; m.intValue = ApsIntToLongLong(v.getInt()); }
-                    else if (v.isFloat()) { m.kind = RawMacro::Float; m.floatValue = v.getFloat().convertToDouble(); }
+                    else if (v.isFloat())
+                    {
+                        // convertToDouble() asserts unless the APFloat already has IEEEdouble
+                        // semantics; a long double macro (e.g. math.h constants) carries wider
+                        // (80-bit/quad) semantics. Narrow to double first, then read it out.
+                        m.kind = RawMacro::Float;
+                        llvm::APFloat f = v.getFloat();
+                        bool losesInfo = false;
+                        f.convert(llvm::APFloat::IEEEdouble(), llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+                        m.floatValue = f.convertToDouble();
+                    }
                     else if (v.isLValue() && v.getLValueBase().isNull())
                                           { m.kind = RawMacro::Int;   m.intValue = v.getLValueOffset().getQuantity(); }
                 }

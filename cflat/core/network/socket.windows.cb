@@ -77,3 +77,14 @@ void* _wsa_accept(void* sock, _SockAddrIn* addr, i32* len)  { return accept(sock
 i32   _wsa_connect(void* sock, _SockAddrIn* addr, i32 len)  { return connect(sock, addr, len); }
 i32   _wsa_send(void* sock, const char* buf, i32 len, i32 flags) { return send(sock, buf, len, flags); }
 i32   _wsa_recv(void* sock, i8* buf, i32 len, i32 flags)    { return recv(sock, buf, len, flags); }
+
+// Layout helpers mirroring socket.posix.cb so socket.cb stays platform-uniform.
+// Winsock sockaddr_in is the same as the struct fields (sin_family u16@0); the
+// ADDRINFOA already declares ai_addr@32 (after ai_canonname), matching the field.
+void _sockaddr_init(_SockAddrIn* a, i32 family, u16 port, u32 inaddr) {
+    a->sin_family = (i16)family;
+    a->sin_port   = port;
+    a->sin_addr   = inaddr;
+    for (i32 i = 0; i < 8; i++) a->sin_zero[i] = 0;
+}
+_SockAddrIn* _ai_addr(_AddrInfo* ai) { return (_SockAddrIn*)ai->ai_addr; }

@@ -324,9 +324,12 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     }
 
     importSearchDir = args.getOption("import-dir").value_or("");
-    // Default target platform = host OS (no cross-OS compilation yet).
+    // Default target platform = native host OS. Overridable with --platform for
+    // cross-compilation (e.g. macos Mach-O emission from a Windows/WSL host).
 #if defined(_WIN32)
     const char* kDefaultPlatform = "win64";
+#elif defined(__APPLE__)
+    const char* kDefaultPlatform = "macos";
 #else
     const char* kDefaultPlatform = "linux";
 #endif
@@ -979,6 +982,27 @@ static const std::vector<std::string>& PosixSystemIncludeDirs()
     static const std::vector<std::string> dirs = [] {
         std::vector<std::string> out;
         std::error_code ec;
+#if defined(__APPLE__)
+        // macOS has no top-level /usr/include; C system headers live in the active
+        // SDK. Prefer $SDKROOT, else `xcrun --show-sdk-path`, then <sdk>/usr/include.
+        std::string sdk;
+        if (const char* env = std::getenv("SDKROOT")) sdk = env;
+        if (sdk.empty())
+        {
+            if (FILE* p = popen("xcrun --show-sdk-path 2>/dev/null", "r"))
+            {
+                char buf[1024];
+                if (fgets(buf, sizeof(buf), p)) sdk = buf;
+                pclose(p);
+                while (!sdk.empty() && (sdk.back() == '\n' || sdk.back() == '\r')) sdk.pop_back();
+            }
+        }
+        if (!sdk.empty())
+        {
+            std::string inc = sdk + "/usr/include";
+            if (std::filesystem::exists(inc, ec)) out.push_back(inc);
+        }
+#endif
         for (const char* cand : { "/usr/include", "/usr/local/include",
                                   "/usr/include/x86_64-linux-gnu" })
         {

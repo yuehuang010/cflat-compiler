@@ -65,7 +65,10 @@
       "hidden": true,
       "inherits": "vcpkg-base",
       "cacheVariables": {
-        "VCPKG_TARGET_TRIPLET": "arm64-osx"
+        "VCPKG_TARGET_TRIPLET": "arm64-osx",
+        "VCPKG_HOST_TRIPLET": "arm64-osx",
+        "VCPKG_INSTALLED_DIR": "${sourceDir}/vcpkg_installed",
+        "ANTLR4_JAR": "/opt/homebrew/opt/antlr/antlr-4.13.2-complete.jar"
       },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
     },

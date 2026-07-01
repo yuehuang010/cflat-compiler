@@ -29,16 +29,23 @@ int _IPPROTO_TCP     = 6;
 int _SOMAXCONN       = 2147483647;  // 0x7fffffff
 int _SOCK_FIONBIO    = -2147195266; // 0x8004667E - Winsock FIONBIO (ignored on POSIX)
 
-// These socket-option levels/names differ between Winsock and POSIX.
-//   SOL_SOCKET: 0xFFFF (Winsock) vs 1 (POSIX); SO_REUSEADDR: 4 vs 2; SO_KEEPALIVE: 8 vs 9.
+// These socket-option levels/names differ between the BSD lineage and glibc/Linux.
+// Winsock and Darwin (both BSD-derived) share the SAME values; only Linux differs:
+//   SOL_SOCKET: 0xFFFF (BSD/Win) vs 1 (Linux); SO_REUSEADDR: 4 vs 2; SO_KEEPALIVE: 8 vs 9.
 if const (__WINDOWS__) {
     int _SOCK_SOL_SOCKET = 65535;   // 0xFFFF
     int _SOCK_REUSEADDR  = 4;
     int _SOCK_KEEPALIVE  = 8;
 } else {
-    int _SOCK_SOL_SOCKET = 1;
-    int _SOCK_REUSEADDR  = 2;
-    int _SOCK_KEEPALIVE  = 9;
+    if const (__MACOS__) {
+        int _SOCK_SOL_SOCKET = 65535;   // 0xFFFF (BSD, same as Winsock)
+        int _SOCK_REUSEADDR  = 4;
+        int _SOCK_KEEPALIVE  = 8;
+    } else {
+        int _SOCK_SOL_SOCKET = 1;
+        int _SOCK_REUSEADDR  = 2;
+        int _SOCK_KEEPALIVE  = 9;
+    }
 }
 
 class Socket
@@ -91,13 +98,11 @@ class Socket
     {
         if (_handle == nullptr) return false;
         _SockAddrIn* addr = new _SockAddrIn;
-        addr->sin_family = (i16)_SOCK_AF_INET;
-        addr->sin_port   = htons((u16)port);
-        if (host.length() == 0) {
-            addr->sin_addr = 0;  // INADDR_ANY
-        } else {
-            addr->sin_addr = inet_addr(host.data());
+        u32 inaddr = 0;                            // INADDR_ANY
+        if (host.length() != 0) {
+            inaddr = inet_addr(host.data());
         }
+        _sockaddr_init(addr, _SOCK_AF_INET, htons((u16)port), inaddr);
         i32 rc = _wsa_bind(_handle, addr, 16);
         delete addr;
         return rc == 0;
@@ -148,7 +153,7 @@ class Socket
         bool ok = false;
         _AddrInfo* cur = results;
         while (cur != nullptr) {
-            _SockAddrIn* addr = (_SockAddrIn*)cur->ai_addr;
+            _SockAddrIn* addr = _ai_addr(cur);
             if (addr != nullptr) {
                 ok = _wsa_connect(_handle, addr, 16) == 0;
                 if (ok) { cur = nullptr; }  // break

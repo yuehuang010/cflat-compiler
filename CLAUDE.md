@@ -54,7 +54,7 @@ msbuild cflat.slnx -p:Configuration=Debug -p:Platform=x64
 
 ### Cross-platform builds (CMake: Windows, Linux/WSL, macOS)
 
-**CMake + vcpkg** is the primary build system (the legacy MSBuild `.vcxproj`/`.slnx` still build on Windows but are not the default; the dev scripts use CMake). It is the only path that works on Linux/WSL and macOS. Presets live in `CMakePresets.json`. See `internal/plan/cross-platform-macos.md` for the staged port status (Windows + Linux/WSL host build, Linux ELF target, and macOS arm64 cross-object emission are working; on-device macOS link/run is unverified - no Mac yet).
+**CMake + vcpkg** is the primary build system (the legacy MSBuild `.vcxproj`/`.slnx` still build on Windows but are not the default; the dev scripts use CMake). It is the only path that works on Linux/WSL and macOS. Presets live in `CMakePresets.json`. See `internal/plan/cross-platform-macos.md` for the staged port status. Working end-to-end: Windows + Linux/WSL host build, Linux ELF target, and macOS arm64 native build + link + run on Apple Silicon (`./test.sh` passes 147/0 in both Debug and Release; run it with Homebrew tools on PATH).
 
 > The CMake build writes the Windows `cflat.exe` to the **same** `x64/<Config>/` layout as MSBuild, so `test.bat` / `test_lsp.bat` work unchanged after a CMake build.
 
@@ -89,7 +89,14 @@ wsl.exe -e bash -lc "cd /mnt/c/source/cflat-compiler && cmake --preset linux-x64
 
 > antlr versions **must** match the runtime: Linux pins generator 4.10.1 against libantlr4-runtime 4.10 (Windows uses 4.13.2). Don't cross them.
 
-**macOS arm64 cross-object emission (works from Windows + WSL; on-device link/run unverified, no Mac yet).** The vcpkg LLVM was rebuilt with the AArch64 target (`vcpkg.json` lists `llvm` with feature `target-aarch64`), so `cflat foo.cb --platform macos -o foo.out` emits a valid Mach-O arm64 object on either host. Since neither host has `ld64`/a macOS SDK, it stops at `foo.out.o` (link + run happen on a real Mac). The codegen seam (triple, Mach-O, AAPCS64 struct ABI, Darwin `char*` va_list, macOS libc symbol names) is verified at the object/IR level; the deferred Mac-only items (link, runtime behavior, `os.posix.cb` Darwin runtime constants) are tracked in `internal/issue/macos-arm64-mac-validation-deferred.md`. The `macos-arm64-release` / `macos-arm64-debug` presets (vcpkg `arm64-osx` triplet) are for a future native build *on* a Mac and remain unvalidated.
+**macOS arm64 native build (validated on Apple Silicon).** The `macos-arm64-{debug,release}` presets (vcpkg `arm64-osx` triplet) build cflat natively; `cflat foo.cb -o foo` defaults to `--platform macos` on a Darwin host, emits a Mach-O arm64 object (versioned triple `arm64-apple-macosx11.0.0` so it carries `LC_BUILD_VERSION`), and links via the host `clang`/`ld64`. `vcpkg.json` lists `llvm` with features `target-aarch64` + `enable-rtti` (RTTI is required: ANTLR's C++ runtime uses `dynamic_cast`, and a no-RTTI LLVM leaves clang/llvm base-class typeinfo undefined at link). One-time Mac toolchain: `brew install cmake ninja openjdk antlr pkg-config coreutils` (openjdk keg-only at `/opt/homebrew/opt/openjdk/bin`; `gtimeout` from coreutils is what `test.sh` uses), then bootstrap vcpkg and `vcpkg install --triplet=arm64-osx`. Build with Homebrew tools + `openjdk` on PATH:
+
+```bash
+cmake --preset macos-arm64-release && cmake --build --preset macos-arm64-release
+./test.sh Release   # 147 passed, 0 failed
+```
+
+Darwin runtime specifics live in `core/os.posix.cb` behind `if const (__MACOS__)` (mmap `MAP_ANON`, `CLOCK_MONOTONIC`, pthread struct sizes + explicit init since zeroed mutex/cond are invalid on Darwin, `gettid` via `pthread_threadid_np`) and `core/thread.cb` (timed join emulated with a completion flag - macOS has no `pthread_timedjoin_np`). termios raw mode (72-byte Darwin struct) and the BSD socket layouts (sockaddr_in sin_len/sin_family, addrinfo ai_addr@32, SOL_SOCKET/SO_REUSEADDR = Winsock/BSD values) are also ported via `if const (__MACOS__)`. The one remaining Mac gap is `--run` (in-process ORC/LLJIT needs an arm64/Mach-O port); it is tracked in `internal/issue/macos-arm64-mac-validation-deferred.md`.
 
 ### Git worktrees (share the 26 GB vcpkg_installed)
 

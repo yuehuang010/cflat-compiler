@@ -65,7 +65,9 @@
 #include <llvm/ExecutionEngine/JITLink/x86_64.h>          // jump-stub helpers for the SEH handler thunk
 #include <llvm/ExecutionEngine/Orc/Shared/MemoryFlags.h>  // orc::MemProt for synthesized stub sections
 #include <unordered_map>
-#include <malloc.h>  // _aligned_malloc for the emutls shim
+// _aligned_malloc/_aligned_free (emutls shim) come from platform/PlatformCompat.h
+// (included above): <malloc.h> on Windows, a posix_memalign shim on POSIX. macOS
+// has no <malloc.h>, so do not include it directly here.
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/MC/MCSubtargetInfo.h>
 #include <llvm/TargetParser/Host.h>
@@ -5172,7 +5174,10 @@ private:
         llvm::InitializeAllTargetMCs();
         llvm::InitializeAllAsmPrinters();
 
-        const std::string triple = "arm64-apple-macosx";
+        // Versioned triple (min macOS 11.0, the Apple Silicon baseline) so the
+        // emitted Mach-O carries an LC_BUILD_VERSION load command; without a
+        // version ld64 warns "no platform load command found" on every link.
+        const std::string triple = "arm64-apple-macosx11.0.0";
         module->setTargetTriple(triple);
 
         std::string err;
@@ -5248,7 +5253,7 @@ private:
             return true;
         }
 
-        std::vector<std::string> argStrs = { cc, "-target", "arm64-apple-macosx",
+        std::vector<std::string> argStrs = { cc, "-target", "arm64-apple-macosx11.0.0",
                                              objPath, "-o", exePath };
         for (auto& cObj : cObjectFiles_) argStrs.push_back(cObj);
         for (const auto& lib : cLinkLibs_) argStrs.push_back(lib);
@@ -10401,7 +10406,9 @@ public:
         for (const auto& f : fields)
             if (f.second != b) return false;
         // Reject padding/misalignment: a clean HFA is exactly count * sizeof(base).
-        if (dl.getTypeAllocSize(st) != fields.size() * dl.getTypeAllocSize(b)) return false;
+        // Cast the (fixed) TypeSize values to uint64_t so the multiply is unambiguous
+        // (AppleClang/libc++ rejects size_type * TypeSize otherwise).
+        if ((uint64_t)dl.getTypeAllocSize(st) != fields.size() * (uint64_t)dl.getTypeAllocSize(b)) return false;
         base = b;
         count = (unsigned)fields.size();
         return true;

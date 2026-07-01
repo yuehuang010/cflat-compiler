@@ -69,6 +69,10 @@ struct __ThreadArgs {
     void* ctx = nullptr;
     IAllocator _allocator;
     int _fpConfig = 0;
+    // Set to 1 by the trampoline just before it returns. macOS has no
+    // pthread_timedjoin_np, so try_join() polls this flag then does a blocking
+    // join. Layout matches __ThreadArgsMove so it can be read via either type.
+    int _done = 0;
 };
 
 // Heap packet for the move-overload trampoline; ctx ownership transfers to fn.
@@ -77,6 +81,7 @@ struct __ThreadArgsMove {
     void* ctx = nullptr;
     IAllocator _allocator;
     int _fpConfig = 0;
+    int _done = 0;  // see __ThreadArgs._done (same offset)
 };
 
 // Thread entry trampolines. Win32 LPTHREAD_START_ROUTINE returns DWORD (int) and
@@ -102,14 +107,18 @@ if const (__WINDOWS__) {
         __active_allocator = args->_allocator;
         __fp_apply(args->_fpConfig);
         if (__fuzz_hook != nullptr) { __fuzz_hook(40); }
-        return (void*)(i64)args->fn(args->ctx);
+        int r = args->fn(args->ctx);
+        args->_done = 1;  // publish completion for the macOS try_join poll
+        return (void*)(i64)r;
     }
     void* __thread_trampoline_move(void* param) {
         __ThreadArgsMove* args = (__ThreadArgsMove*)param;
         __active_allocator = args->_allocator;
         __fp_apply(args->_fpConfig);
         if (__fuzz_hook != nullptr) { __fuzz_hook(41); }
-        return (void*)(i64)args->fn(args->ctx);
+        int r = args->fn(args->ctx);
+        args->_done = 1;
+        return (void*)(i64)r;
     }
 }
 
@@ -230,6 +239,26 @@ struct Thread {
                 return true;
             }
             return false;
+        } else if const (__MACOS__) {
+            // Darwin has no pthread_timedjoin_np. Poll the trampoline's _done flag
+            // (same offset in both arg structs) up to timeout_ms, sleeping 1ms per
+            // spin; once set, a blocking pthread_join reaps the (already-exiting)
+            // thread. nanosleep in sleep_ms is an opaque call, so the _done load is
+            // not hoisted out of the loop.
+            __ThreadArgs* a = (__ThreadArgs*)_args;
+            i32 waited = 0;
+            while (a->_done == 0) {
+                if (waited >= timeout_ms) return false;
+                os.posix.sleep_ms(1);
+                waited = waited + 1;
+            }
+            void* ret = nullptr;
+            os.posix.pthread_join(_handle, &ret);
+            free((void*)_args);
+            _handle   = nullptr;
+            _args     = nullptr;
+            _exitCode = (i32)(i64)ret;
+            return true;
         } else {
             // POSIX timed join via pthread_timedjoin_np (glibc). abstime is an ABSOLUTE
             // CLOCK_REALTIME deadline = now + timeout_ms.

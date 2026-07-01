@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test.sh - Linux/WSL counterpart of test.bat.
+# test.sh - POSIX (Linux/WSL + macOS arm64) counterpart of test.bat.
 #
 # Compiles and runs the platform-portable subset of Test/*.cb against the
 # native ELF cflat built by `cmake --preset linux-x64-release` (deployed to
@@ -50,6 +50,17 @@ OUT="$ROOT/out-linux"
 RES="$OUT/results"
 TIMEOUT_SECS=120
 
+# GNU coreutils timeout: `timeout` on Linux, `gtimeout` on macOS (brew coreutils).
+# Fall back to no wrapper if neither exists so tests still run (just unbounded).
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT="timeout $TIMEOUT_SECS"
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT="gtimeout $TIMEOUT_SECS"
+else
+  echo "warning: no timeout/gtimeout found (brew install coreutils on macOS); running without per-test timeout"
+  TIMEOUT=""
+fi
+
 if [ ! -x "$CFLAT" ]; then
   echo "cflat not found at $CFLAT - build it first:"
   echo "  cmake --preset linux-x64-${CONFIG,,} && cmake --build --preset linux-x64-${CONFIG,,}"
@@ -60,11 +71,17 @@ rm -rf "$RES"; mkdir -p "$RES"
 
 # Windows-only .cb tests - see header comment for the category of each.
 SKIP="test_helper \
-  test_basic test_socket test_threadpool test_stream \
+  test_basic test_threadpool test_stream \
   test_c_interop test_reflect test_collection_leaks test_crt \
   test_windows test_windows_cache test_winmd \
   test_fpenv \
   test_filesystem test_core test_process"
+
+# Architecture-specific skips: test_intrinsic asserts __X86__==1 and exercises the
+# x86 RDTSCP/LFENCE/PAUSE intrinsics, so it cannot pass on arm64 (Apple Silicon).
+case "$(uname -m)" in
+  arm64|aarch64) SKIP="$SKIP test_intrinsic" ;;
+esac
 
 # Windows-only negative tests: they assert messages tied to Windows headers
 # (windows.h / tlhelp32.h C-interop) or the Windows core externs (os.windows.fwrite),
@@ -84,10 +101,10 @@ is_err_skipped() {
 run_cb() {
   local f="$1" n; n="$(basename "$f" .cb)"
   local log="$RES/$n.log"
-  if ! timeout "$TIMEOUT_SECS" "$CFLAT" "$f" -i "$LIB" -o "$RES/$n.bin" >"$log" 2>&1; then
+  if ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" -o "$RES/$n.bin" >"$log" 2>&1; then
     echo "FAIL compile" >"$RES/$n.result"; return
   fi
-  if timeout "$TIMEOUT_SECS" "$RES/$n.bin" </dev/null >>"$log" 2>&1; then
+  if $TIMEOUT "$RES/$n.bin" </dev/null >>"$log" 2>&1; then
     echo "PASS" >"$RES/$n.result"
   else
     echo "FAIL run(rc=$?)" >"$RES/$n.result"
@@ -97,7 +114,7 @@ run_cb() {
 # Worker: an err_*.cb passes when the compiler exits 0 (expect_error matched).
 run_err() {
   local f="$1" n; n="$(basename "$f" .cb)"
-  if timeout "$TIMEOUT_SECS" "$CFLAT" "$f" -i "$LIB" --check >"$RES/$n.log" 2>&1; then
+  if $TIMEOUT "$CFLAT" "$f" -i "$LIB" --check >"$RES/$n.log" 2>&1; then
     echo "PASS" >"$RES/$n.result"
   else
     echo "FAIL" >"$RES/$n.result"
@@ -105,7 +122,7 @@ run_err() {
 }
 
 export -f run_cb run_err is_skipped
-export CFLAT LIB RES TIMEOUT_SECS
+export CFLAT LIB RES TIMEOUT
 
 # Build the work list, then fan out across $JOBS workers via xargs -P.
 cb_list=""
@@ -145,7 +162,7 @@ for s in $SKIP;     do [ "$s" = "test_helper" ] || skip=$((skip+1)); done
 for s in $ERR_SKIP; do skip=$((skip+1)); done
 
 echo
-echo "Linux ($CONFIG): $pass passed, $fail failed, $skip skipped (Windows-only)."
+echo "$(uname -s) ($CONFIG): $pass passed, $fail failed, $skip skipped (platform-specific)."
 if [ "$fail" -ne 0 ]; then
   echo "FAILED:$failed_names"
   exit 1

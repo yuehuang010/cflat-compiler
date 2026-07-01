@@ -131,7 +131,7 @@ int readKey() {
         // POSIX: briefly switch stdin to cbreak so a single byte reads unbuffered
         // and unechoed, matching _getch's contract. Escape sequences come through
         // byte-by-byte on subsequent calls.
-        i8[64] saved = default;
+        i8[72] saved = default;
         os.posix.term_make_raw(0, &saved[0]);
         i32 c = os.posix.term_read_byte(0);
         os.posix.term_restore_mode(0, &saved[0]);
@@ -186,7 +186,7 @@ struct Terminal {
             // we only switch stdin to cbreak (raw) and remember the old settings.
             _hIn  = (void*)(i64)0;
             _hOut = (void*)(i64)1;
-            i8* saved = new i8[64];
+            i8* saved = new i8[72];
             if (os.posix.term_make_raw(0, saved) != 0) { delete[] saved; return false; }
             _termiosSaved = (void*)saved;
             _active = true;

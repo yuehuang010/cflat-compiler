@@ -18,7 +18,11 @@ struct _WsaData {
     i8 _data[408] = default;
 };
 
-// sockaddr_in - IPv4 socket address (16 bytes; identical layout to Winsock).
+// sockaddr_in - IPv4 socket address (16 bytes; struct declared with the
+// glibc/Winsock layout for field-name compatibility). BSD/Darwin actually puts a
+// 1-byte sin_len@0 and a 1-byte sin_family@1 (vs a 2-byte sin_family@0 here), so
+// on macOS the fields are NOT written directly - use _sockaddr_init(), which lays
+// the bytes out per-platform. The struct is only ever a 16-byte storage blob.
 struct _SockAddrIn {
     i16 sin_family = 0;
     u16 sin_port   = 0;
@@ -26,20 +30,54 @@ struct _SockAddrIn {
     i8  sin_zero[8] = default;
 };
 
-// addrinfo - getaddrinfo result node. NOTE the glibc field order DIFFERS from the
-// Win32 ADDRINFOA: on Linux ai_addr comes BEFORE ai_canonname (Windows swaps them).
-// ai_addrlen is socklen_t (4B) + 4B padding on x86-64, so an i64 spans the same 8
-// bytes and keeps ai_addr correctly at offset 24.
+// addrinfo - getaddrinfo result node (glibc field order: ai_addr@24 before
+// ai_canonname@32). BSD/Darwin SWAPS those two pointers (ai_canonname@24, ai_addr
+// @32) but keeps ai_next@40 and the leading int fields at the same offsets, so the
+// struct below is written by socket.cb for hints (leading ints) and iterated via
+// ai_next uniformly; the ai_addr pointer is read through _ai_addr() which applies
+// the platform offset. ai_addrlen is socklen_t (4B) + 4B pad on LP64 (an i64 here).
 struct _AddrInfo {
     i32        ai_flags     = 0;
     i32        ai_family    = 0;
     i32        ai_socktype  = 0;
     i32        ai_protocol  = 0;
     _net_size  ai_addrlen   = 0;
-    i8*        ai_addr      = nullptr;  // sockaddr* - cast to _SockAddrIn* for IPv4
+    i8*        ai_addr      = nullptr;  // Linux offset only; macOS reads via _ai_addr
     i8*        ai_canonname = nullptr;
     _AddrInfo* ai_next      = nullptr;
 };
+
+// Lay out a hand-filled IPv4 sockaddr_in per platform. port and inaddr are already
+// in network byte order. On Darwin: sin_len=16@0, sin_family(u8)@1; elsewhere:
+// sin_family(u16)@0. sin_port@2 and sin_addr@4 are identical across platforms.
+void _sockaddr_init(_SockAddrIn* a, i32 family, u16 port, u32 inaddr) {
+    i8* b = (i8*)a;
+    for (i32 i = 0; i < 16; i++) b[i] = 0;
+    if const (__MACOS__) {
+        b[0] = (i8)16;             // sin_len
+        b[1] = (i8)family;         // sin_family (u8)
+    } else {
+        i16* fam = (i16*)&b[0];
+        fam[0] = (i16)family;      // sin_family (u16)
+    }
+    u16* portp = (u16*)&b[2];
+    portp[0] = port;
+    u32* addrp = (u32*)&b[4];
+    addrp[0] = inaddr;
+}
+
+// Read the ai_addr sockaddr pointer from a getaddrinfo result node, accounting for
+// the glibc/BSD field swap (ai_addr@24 on Linux, @32 on Darwin).
+_SockAddrIn* _ai_addr(_AddrInfo* ai) {
+    i8* base = (i8*)ai;
+    if const (__MACOS__) {
+        i8** p = (i8**)&base[32];
+        return (_SockAddrIn*)p[0];
+    } else {
+        i8** p = (i8**)&base[24];
+        return (_SockAddrIn*)p[0];
+    }
+}
 
 // ── Handle-model wrappers (fd carried in the low bits of a void*) ─────────────
 

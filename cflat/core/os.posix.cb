@@ -106,8 +106,18 @@ namespace os.posix
     extern win_int sched_yield();
 
     // Kernel thread id of the caller (Win32 GetCurrentThreadId analog). Unique per
-    // live thread; fits a u32. glibc exposes gettid() as a libc function since 2.30.
-    extern win_int gettid();
+    // live thread; fits a u32. glibc exposes gettid() as a libc function since 2.30;
+    // macOS has no gettid(), so derive a unique 64-bit id via pthread_threadid_np.
+    if const (__MACOS__) {
+        extern win_int pthread_threadid_np(void* thread, u64* tid_out);
+        win_int gettid() {
+            u64 tid = 0;
+            os.posix.pthread_threadid_np(nullptr, &tid);
+            return (win_int)tid;
+        }
+    } else {
+        extern win_int gettid();
+    }
 
     // === pthread mutex / condition variable ===
     // glibc PTHREAD_MUTEX_INITIALIZER / PTHREAD_COND_INITIALIZER are all-zero, so a
@@ -126,8 +136,14 @@ namespace os.posix
     extern win_int pthread_cond_signal(void* cond);
     extern win_int pthread_cond_broadcast(void* cond);
     extern win_int pthread_cond_destroy(void* cond);
-    int PTHREAD_MUTEX_T_SIZE = 40;
+    // Sizes: glibc x86-64 mutex 40 / cond 48; Darwin arm64 mutex 64 / cond 48.
+    if const (__MACOS__) { int PTHREAD_MUTEX_T_SIZE = 64; }
+    else                 { int PTHREAD_MUTEX_T_SIZE = 40; }
     int PTHREAD_COND_T_SIZE  = 48;
+    // Darwin requires explicit init: a zeroed pthread_mutex_t / pthread_cond_t is
+    // invalid there (lock/signal return EINVAL), unlike glibc where all-zero is valid.
+    extern win_int pthread_mutex_init(void* m, const void* attr);
+    extern win_int pthread_cond_init(void* cond, const void* attr);
 
     // pthread_rwlock_t (56B on glibc x86-64); a zeroed block is a valid unlocked
     // rwlock (PTHREAD_RWLOCK_INITIALIZER is all-zero), so no pthread_rwlock_init.
@@ -135,47 +151,94 @@ namespace os.posix
     extern win_int pthread_rwlock_wrlock(void* rw);
     extern win_int pthread_rwlock_unlock(void* rw);
     extern win_int pthread_rwlock_destroy(void* rw);
-    int PTHREAD_RWLOCK_T_SIZE = 56;
+    extern win_int pthread_rwlock_init(void* rw, const void* attr);
+    // glibc x86-64 rwlock 56; Darwin arm64 rwlock 200.
+    if const (__MACOS__) { int PTHREAD_RWLOCK_T_SIZE = 200; }
+    else                 { int PTHREAD_RWLOCK_T_SIZE = 56; }
 
-    // POSIX unnamed semaphore (sem_t, 32B on glibc x86-64). Unlike the mutex/rwlock,
-    // a sem_t is NOT valid zeroed - it must be sem_init'd with its start value.
-    extern win_int sem_init(void* sem, win_int pshared, u32 value);
-    extern win_int sem_wait(void* sem);
-    extern win_int sem_post(void* sem);
-    extern win_int sem_destroy(void* sem);
-    int SEM_T_SIZE = 32;
-
-    // Allocate and initialize a process-private semaphore with the given start
-    // count; returns the heap sem_t pointer the caller carries in its handle field.
-    void* sem_new(win_int initial) {
-        void* s = os.posix.calloc((win_size)1, (win_size)os.posix.SEM_T_SIZE);
-        os.posix.sem_init(s, 0, (u32)initial);
-        return s;
+    // Counting semaphore. Linux: a heap POSIX unnamed semaphore (sem_t, 32B), which
+    // is NOT valid zeroed so it must be sem_init'd. Darwin has NO working unnamed
+    // semaphores (sem_init returns ENOSYS), so back it with a GCD dispatch_semaphore
+    // (in libSystem, no extra link lib). Either way sem_new returns an 8/32-byte heap
+    // block the caller frees; on Darwin that block just holds the dispatch handle.
+    if const (__MACOS__) {
+        extern void* dispatch_semaphore_create(i64 value);
+        extern i64   dispatch_semaphore_wait(void* sem, u64 timeout);
+        extern i64   dispatch_semaphore_signal(void* sem);
+        extern void  dispatch_release(void* obj);
+        void* sem_new(win_int initial) {
+            void** block = (void**)os.posix.calloc((win_size)1, (win_size)8);
+            block[0] = os.posix.dispatch_semaphore_create((i64)initial);
+            return (void*)block;
+        }
+        win_int sem_wait(void* sem) {
+            void** block = (void**)sem;
+            os.posix.dispatch_semaphore_wait(block[0], 0xFFFFFFFFFFFFFFFF);  // DISPATCH_TIME_FOREVER
+            return 0;
+        }
+        win_int sem_post(void* sem) {
+            void** block = (void**)sem;
+            os.posix.dispatch_semaphore_signal(block[0]);
+            return 0;
+        }
+        win_int sem_destroy(void* sem) {
+            void** block = (void**)sem;
+            os.posix.dispatch_release(block[0]);
+            return 0;
+        }
+    } else {
+        extern win_int sem_init(void* sem, win_int pshared, u32 value);
+        extern win_int sem_wait(void* sem);
+        extern win_int sem_post(void* sem);
+        extern win_int sem_destroy(void* sem);
+        int SEM_T_SIZE = 32;
+        void* sem_new(win_int initial) {
+            void* s = os.posix.calloc((win_size)1, (win_size)os.posix.SEM_T_SIZE);
+            os.posix.sem_init(s, 0, (u32)initial);
+            return s;
+        }
     }
 
     // Lazily allocate a zeroed pthread_mutex_t into *slot and return it. Zero bytes
     // are a valid unlocked mutex, so no pthread_mutex_init is needed.
     void* ensure_mutex(void** slot) {
-        if (slot[0] == nullptr) slot[0] = os.posix.calloc((win_size)1, (win_size)os.posix.PTHREAD_MUTEX_T_SIZE);
+        if (slot[0] == nullptr) {
+            slot[0] = os.posix.calloc((win_size)1, (win_size)os.posix.PTHREAD_MUTEX_T_SIZE);
+            if const (__MACOS__) { os.posix.pthread_mutex_init(slot[0], nullptr); }
+        }
         return slot[0];
     }
-    // Lazily allocate a zeroed pthread_cond_t into *slot and return it.
+    // Lazily allocate a pthread_cond_t into *slot and return it.
     void* ensure_cond(void** slot) {
-        if (slot[0] == nullptr) slot[0] = os.posix.calloc((win_size)1, (win_size)os.posix.PTHREAD_COND_T_SIZE);
+        if (slot[0] == nullptr) {
+            slot[0] = os.posix.calloc((win_size)1, (win_size)os.posix.PTHREAD_COND_T_SIZE);
+            if const (__MACOS__) { os.posix.pthread_cond_init(slot[0], nullptr); }
+        }
         return slot[0];
     }
-    // Lazily allocate a zeroed pthread_rwlock_t into *slot and return it.
+    // Lazily allocate a pthread_rwlock_t into *slot and return it.
     void* ensure_rwlock(void** slot) {
-        if (slot[0] == nullptr) slot[0] = os.posix.calloc((win_size)1, (win_size)os.posix.PTHREAD_RWLOCK_T_SIZE);
+        if (slot[0] == nullptr) {
+            slot[0] = os.posix.calloc((win_size)1, (win_size)os.posix.PTHREAD_RWLOCK_T_SIZE);
+            if const (__MACOS__) { os.posix.pthread_rwlock_init(slot[0], nullptr); }
+        }
         return slot[0];
     }
 
     // === sysconf - runtime system configuration ===
     // glibc _SC_* name constants (see bits/confname.h).
     extern win_size sysconf(i32 name);
-    int _SC_PAGESIZE              = 30;   // OS page size in bytes
-    int _SC_NPROCESSORS_ONLN      = 84;   // online CPU count
-    int _SC_LEVEL3_CACHE_LINESIZE = 196;  // L3 cache line size (0 if unknown)
+    // _SC_* name constants differ between glibc and Darwin. Darwin has no
+    // _SC_LEVEL*_CACHE_LINESIZE, so sysconf(_SC_LEVEL3_CACHE_LINESIZE) returns -1
+    // there and callers fall back to their default block size (harmless).
+    if const (__MACOS__) {
+        int _SC_PAGESIZE         = 29;
+        int _SC_NPROCESSORS_ONLN = 58;
+    } else {
+        int _SC_PAGESIZE         = 30;
+        int _SC_NPROCESSORS_ONLN = 84;
+    }
+    int _SC_LEVEL3_CACHE_LINESIZE = 196;  // glibc: L3 cache line size (0 if unknown)
 
     // === mmap - anonymous virtual memory ===
     extern void*   mmap(void* addr, win_size length, i32 prot, i32 flags, i32 fd, i64 offset);
@@ -183,7 +246,10 @@ namespace os.posix
     extern win_int mprotect(void* addr, win_size length, i32 prot);
     int PROT_NONE        = 0;
     int PROT_RW          = 3;     // PROT_READ | PROT_WRITE
-    int MAP_ANON_PRIVATE = 0x22;  // MAP_PRIVATE (0x02) | MAP_ANONYMOUS (0x20)
+    // MAP_PRIVATE (0x02) | anonymous. The anonymous bit differs: Linux MAP_ANONYMOUS
+    // is 0x20 (-> 0x22), Darwin MAP_ANON is 0x1000 (-> 0x1002).
+    if const (__MACOS__) { int MAP_ANON_PRIVATE = 0x1002; }
+    else                 { int MAP_ANON_PRIVATE = 0x22; }
 
     // === time / clock (clock_gettime, nanosleep) ===
     // struct timespec is { i64 tv_sec; i64 tv_nsec; } on 64-bit; we pass a pointer
@@ -191,7 +257,9 @@ namespace os.posix
     extern win_int clock_gettime(i32 clk_id, i64* ts);
     extern win_int nanosleep(const i64* req, i64* rem);
     int CLOCK_REALTIME  = 0;
-    int CLOCK_MONOTONIC = 1;
+    // CLOCK_MONOTONIC differs: Linux glibc uses 1, Darwin uses 6.
+    if const (__MACOS__) { int CLOCK_MONOTONIC = 6; }
+    else                 { int CLOCK_MONOTONIC = 1; }
 
     // 100-ns intervals between 1601-01-01 (FILETIME epoch) and 1970-01-01 (Unix
     // epoch); adding it turns a Unix time into the FILETIME ticks TimePoint wants.
@@ -252,14 +320,21 @@ namespace os.posix
     // directly (no __xstat versioning).
     extern win_int  stat(const char* path, void* statbuf);
     int STAT_BUF_SIZE = 144;
-    int STAT_MODE_OFF = 24;
+    // st_mode offset: glibc x86-64 puts it at 24; Darwin arm64 `struct stat` has
+    // st_dev(4) then st_mode(u16) at offset 4. Reading an i32 there and masking
+    // 0xF000 still isolates the type bits (they lie within the low 16 = st_mode).
+    if const (__MACOS__) { int STAT_MODE_OFF = 4; }
+    else                 { int STAT_MODE_OFF = 24; }
 
     // opendir/readdir/closedir. glibc x86-64 `struct dirent`: d_type (1B) at offset
     // 18, d_name (char[256]) at offset 19.
     extern void*    opendir(const char* path);
     extern void*    readdir(void* dirp);
     extern win_int  closedir(void* dirp);
-    int DIRENT_NAME_OFF = 19;
+    // d_name offset: glibc x86-64 dirent has it at 19; Darwin dirent (d_ino u64,
+    // d_seekoff u64, d_reclen u16, d_namlen u16, d_type u8, then d_name) puts it at 21.
+    if const (__MACOS__) { int DIRENT_NAME_OFF = 21; }
+    else                 { int DIRENT_NAME_OFF = 19; }
 
     // Create a directory with the usual 0777-umask mode.
     win_int mkdir_default(const char* path) { return os.posix.mkdir(path, (win_int)0x1FF); }
@@ -285,33 +360,57 @@ namespace os.posix
     }
 
     // === terminal (termios + ioctl) ===========================================
-    // glibc x86-64 `struct termios` (60B, we use a 64B blob): c_iflag@0, c_oflag@4,
-    // c_cflag@8, c_lflag@12, c_line@16, c_cc[32]@17. VMIN=index 6, VTIME=index 5.
+    // `struct termios` layout differs by platform (fields are tcflag_t):
+    //   glibc x86-64 (60B, tcflag_t=4B): c_iflag@0, c_oflag@4, c_cflag@8,
+    //     c_lflag@12, c_line@16, c_cc[32]@17. VMIN=index 6, VTIME=index 5.
+    //   Darwin arm64 (72B, tcflag_t=8B): c_iflag@0, c_oflag@8, c_cflag@16,
+    //     c_lflag@24, c_cc[20]@32. VMIN=index 16, VTIME=index 17.
+    // TERMIOS_BUF_SIZE is a common buffer size >= both structs; callers that
+    // save/restore termios must allocate at least this many bytes.
+    if const (__MACOS__) { int TERMIOS_BUF_SIZE = 72; }
+    else                 { int TERMIOS_BUF_SIZE = 64; }
     extern win_int tcgetattr(i32 fd, void* termios_p);
     extern win_int tcsetattr(i32 fd, i32 actions, void* termios_p);
     extern win_int ioctl(i32 fd, win_size request, void* arg);
     extern win_int poll(void* fds, win_size nfds, i32 timeout_ms);
     int TCSANOW    = 0;
-    int TIOCGWINSZ = 0x5413;
+    // TIOCGWINSZ ioctl number: Linux 0x5413; Darwin _IOR('t',104,winsize) = 0x40087468.
+    if const (__MACOS__) { int TIOCGWINSZ = 0x40087468; }
+    else                 { int TIOCGWINSZ = 0x5413; }
 
     // Switch fd to cbreak/raw: ICANON+ECHO+IEXTEN off, ICRNL+IXON off, 1-byte
-    // blocking reads. Saves the prior settings into `saved` (a 64-byte buffer).
+    // blocking reads. Saves the prior settings into `saved` (>= TERMIOS_BUF_SIZE).
     win_int term_make_raw(i32 fd, void* saved) {
         if (os.posix.tcgetattr(fd, saved) != 0) return -1;
-        i8[64] work = default;
+        i8[72] work = default;
         i8* s = (i8*)saved;
-        for (i32 i = 0; i < 64; i++) work[i] = s[i];
-        // c_lflag @12: clear ICANON(0x2)|ECHO(0x8)|IEXTEN(0x8000).
-        i8*  lp = &work[12];
-        i32* lflag = (i32*)lp;
-        lflag[0] = lflag[0] & ~0x800A;
-        // c_iflag @0: clear ICRNL(0x100)|IXON(0x400).
-        i8*  ip = &work[0];
-        i32* iflag = (i32*)ip;
-        iflag[0] = iflag[0] & ~0x500;
-        // c_cc[VMIN]=1, c_cc[VTIME]=0 (blocking single-byte read).
-        work[17 + 6] = 1;
-        work[17 + 5] = 0;
+        if const (__MACOS__) {
+            for (i32 i = 0; i < 72; i++) work[i] = s[i];
+            // Darwin: c_lflag @24 clear ICANON(0x100)|ECHO(0x8)|IEXTEN(0x400).
+            i8*  lp = &work[24];
+            i32* lflag = (i32*)lp;
+            lflag[0] = lflag[0] & ~0x508;
+            // c_iflag @0 clear ICRNL(0x100)|IXON(0x200).
+            i8*  ip = &work[0];
+            i32* iflag = (i32*)ip;
+            iflag[0] = iflag[0] & ~0x300;
+            // c_cc @32: VMIN=index 16, VTIME=index 17 (blocking single-byte read).
+            work[32 + 16] = 1;
+            work[32 + 17] = 0;
+        } else {
+            for (i32 i = 0; i < 64; i++) work[i] = s[i];
+            // glibc: c_lflag @12 clear ICANON(0x2)|ECHO(0x8)|IEXTEN(0x8000).
+            i8*  lp = &work[12];
+            i32* lflag = (i32*)lp;
+            lflag[0] = lflag[0] & ~0x800A;
+            // c_iflag @0 clear ICRNL(0x100)|IXON(0x400).
+            i8*  ip = &work[0];
+            i32* iflag = (i32*)ip;
+            iflag[0] = iflag[0] & ~0x500;
+            // c_cc[VMIN]=1, c_cc[VTIME]=0 (blocking single-byte read).
+            work[17 + 6] = 1;
+            work[17 + 5] = 0;
+        }
         return os.posix.tcsetattr(fd, os.posix.TCSANOW, &work[0]);
     }
     // Restore the settings saved by term_make_raw.
@@ -381,5 +480,7 @@ namespace os.posix
     extern i32      fcntl(i32 fd, i32 cmd, i32 arg);
     int F_GETFL    = 3;
     int F_SETFL    = 4;
-    int O_NONBLOCK = 0x800;
+    // O_NONBLOCK: Linux 0x800, Darwin 0x4.
+    if const (__MACOS__) { int O_NONBLOCK = 0x4; }
+    else                 { int O_NONBLOCK = 0x800; }
 }

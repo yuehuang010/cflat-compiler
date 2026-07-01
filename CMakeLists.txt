@@ -210,6 +210,17 @@ if(MSVC)
     PROPERTIES COMPILE_OPTIONS "/wd4251")
 endif()
 
+# cflat needs RTTI: the ANTLR C++ runtime and generated parser use dynamic_cast/
+# typeid, and MainListener.h (compiled into LLVMBackend.cpp alongside LLVM-derived
+# classes) leans on them too. LLVM/Clang must therefore also be built with
+# LLVM_ENABLE_RTTI=ON (Linux apt LLVM is; the vcpkg arm64-osx triplet enables it
+# via triplets/arm64-osx.cmake). A no-RTTI LLVM leaves clang/llvm base-class
+# typeinfo undefined at link once cflat is compiled with RTTI.
+if(NOT MSVC AND DEFINED LLVM_ENABLE_RTTI AND NOT LLVM_ENABLE_RTTI)
+  message(WARNING "LLVM was built without RTTI (LLVM_ENABLE_RTTI=OFF); linking cflat "
+                  "will fail on clang/llvm typeinfo. Rebuild LLVM with RTTI enabled.")
+endif()
+
 # ---------------------------------------------------------------------------
 # Platform link libraries.
 # ---------------------------------------------------------------------------
