@@ -5781,29 +5781,48 @@ private:
             return false;
         }
 
-        // Force the JITLink object-linking layer (instead of the default RuntimeDyld) and
-        // attach SehRegistrationPlugin. RuntimeDyld does not register .pdata in a way the OS
+#if defined(__APPLE__)
+        // Force emulated TLS for the in-process JIT on Darwin. The host arm64-apple target
+        // otherwise lowers `thread_local` to a native Mach-O TLV descriptor whose resolver thunk
+        // is only bootstrapped by dyld (or an ORC MachOPlatform + orc_rt, which we do not link).
+        // In the bare LLJIT that thunk is unresolved, so the first thread-local access (e.g.
+        // __prog_tls inside printf's format path) recurses through the stub and overflows the
+        // stack. Emulated TLS routes every access through __emutls_get_address instead, which we
+        // define below - matching how the Windows --run path resolves thread-locals.
+        jtmb->getOptions().EmulatedTLS = true;
+#endif
+
+        // On Windows, force the JITLink object-linking layer (instead of the default RuntimeDyld)
+        // and attach SehRegistrationPlugin. RuntimeDyld does not register .pdata in a way the OS
         // exception dispatcher finds, so a hardware fault on a JIT'd WORKER thread (e.g. the
         // 'program' construct's SEH crash-isolation catchpad) is never dispatched and the host
         // process hard-crashes. JITLink gives the plugin the LinkGraph's .pdata so we can call
         // RtlAddFunctionTable ourselves - this is what makes multi-threaded --run unwind-safe.
-        auto jitOrErr = llvm::orc::LLJITBuilder()
-                            .setJITTargetMachineBuilder(std::move(*jtmb))
-                            .setObjectLinkingLayerCreator(
-                                [](llvm::orc::ExecutionSession& ES, const llvm::Triple&)
-                                    -> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> {
-                                    auto ol = std::make_unique<llvm::orc::ObjectLinkingLayer>(ES);
-                                    // Under LLJIT, the IR layer pre-computes symbol flags from the
-                                    // IR; JITLink recomputes them from the linked COFF object and
-                                    // they can disagree (weak/COMDAT constants), tripping ORC's
-                                    // "Resolving symbol with incorrect flags" assert. Defer to the
-                                    // promised flags and claim any object-only symbols.
-                                    ol->setOverrideObjectFlagsWithResponsibilityFlags(true);
-                                    ol->setAutoClaimResponsibilityForObjectSymbols(true);
-                                    ol->addPlugin(std::make_unique<cflat_jit::SehRegistrationPlugin>());
-                                    return ol;
-                                })
-                            .create();
+        //
+        // These object-flag overrides and the SEH plugin are COFF-specific. On macOS (Mach-O)
+        // setAutoClaimResponsibilityForObjectSymbols makes JITLink claim the object's *undefined*
+        // reference to __emutls_get_address as if the object defined it, binding its GOT slot to a
+        // self-referential stub cycle instead of our absolute host hook - the emutls call then
+        // recurses until the stack overflows. Mach-O/ELF need none of this, so use the default
+        // LLJIT object layer there (which is already JITLink on macOS).
+        llvm::orc::LLJITBuilder jitBuilder;
+        jitBuilder.setJITTargetMachineBuilder(std::move(*jtmb));
+#if defined(_WIN32)
+        jitBuilder.setObjectLinkingLayerCreator(
+            [](llvm::orc::ExecutionSession& ES, const llvm::Triple&)
+                -> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> {
+                auto ol = std::make_unique<llvm::orc::ObjectLinkingLayer>(ES);
+                // Under LLJIT, the IR layer pre-computes symbol flags from the IR; JITLink
+                // recomputes them from the linked COFF object and they can disagree
+                // (weak/COMDAT constants), tripping ORC's "Resolving symbol with incorrect
+                // flags" assert. Defer to the promised flags and claim any object-only symbols.
+                ol->setOverrideObjectFlagsWithResponsibilityFlags(true);
+                ol->setAutoClaimResponsibilityForObjectSymbols(true);
+                ol->addPlugin(std::make_unique<cflat_jit::SehRegistrationPlugin>());
+                return ol;
+            });
+#endif
+        auto jitOrErr = jitBuilder.create();
         if (!jitOrErr)
         {
             LogError(std::format("--run: failed to create JIT: {}",
@@ -5816,6 +5835,17 @@ private:
         // JIT's host values before handing the module over.
         module->setDataLayout(jit->getDataLayout());
         module->setTargetTriple(jit->getTargetTriple().str());
+
+        // Disable builtin libcall recognition for the in-process JIT (equivalent to -fno-builtin).
+        // cflat DEFINES its own hook-aware libc functions (printf/vsnprintf/memcpy/...). LLVM's
+        // libcall optimizer otherwise treats those names as the standard builtins and applies
+        // folds that assume standard semantics - most damagingly the _FORTIFY fold that rewrites
+        // __vsnprintf_chk(buf,size,0,size,fmt,ap) into vsnprintf(buf,size,fmt,ap). Since cflat's
+        // vsnprintf routes back through __vsnprintf_chk, that fold makes vsnprintf_libc recurse
+        // infinitely and overflow the stack under --run. The linked -o path does not fold these,
+        // so match that behavior by marking every function "no-builtins".
+        for (llvm::Function& fn : *module)
+            fn.addFnAttr("no-builtins");
 
         // Resolve external symbols (CRT, kernel32, ws2_32) from already-loaded process symbols.
         // GlobalPrefix from the data layout keeps name mangling consistent (no prefix on win64).

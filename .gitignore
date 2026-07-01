@@ -379,3 +379,4 @@ FodyWeavers.xsd
 *.time-trace.json
 build/
 out-linux/
+/.scratch/
