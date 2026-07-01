@@ -834,6 +834,13 @@ bool testNullCoalescingAssignment()
 // Default keyword tests
 // =============================================================
 
+// Regression (nested-struct-field-default): a struct field declared `= default`
+// must run the nested struct type's own field initializers, not zero-fill. Uses
+// non-zero defaults so a zero-fill bug is distinguishable from correct behaviour.
+struct DefInner { int a = -1; int b = -2; };
+struct DefOuter { int x = -3; DefInner inner = default; };
+struct DefDeep  { int m = -7; DefOuter outer = default; };
+
 bool testDefault()
 {
     bool result = true;
@@ -854,6 +861,22 @@ bool testDefault()
     result &= Test("default_struct_num1", ds.num1, 1);
     result &= Test("default_struct_num2", ds.num2, 2);
     result &= Test("default_struct_num3", ds.num3, 3);
+
+    // Nested struct field `= default` must recurse into the field's own default
+    // ctor (running its initializers), not zero-fill the aggregate.
+    DefOuter dno = default;
+    result &= Test("default_nested_field_x", dno.x,       -3);
+    result &= Test("default_nested_field_a", dno.inner.a, -1);
+    result &= Test("default_nested_field_b", dno.inner.b, -2);
+
+    // Deeper nesting and the heap `new T` path share the same default-ctor path.
+    DefDeep ddeep = default;
+    result &= Test("default_deep_field_m", ddeep.m,             -7);
+    result &= Test("default_deep_field_x", ddeep.outer.x,       -3);
+    result &= Test("default_deep_field_a", ddeep.outer.inner.a, -1);
+    DefOuter* dheap = new DefOuter;
+    result &= Test("default_heap_field_b", dheap->inner.b, -2);
+    delete dheap;
 
     return result;
 }

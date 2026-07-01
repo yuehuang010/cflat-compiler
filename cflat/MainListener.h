@@ -16289,6 +16289,12 @@ public:
                         }
                         else if (initializer->Default() != nullptr)
                         {
+                            // We are emitting the synthetic default-constructor body (a real
+                            // function); global_scope is still true only because the file-scope
+                            // struct walk has not finished. Clear it so a struct-typed field's
+                            // `= default` recurses into that field type's own default constructor
+                            // (running its field initializers) instead of zero-filling.
+                            GlobalScopeGuard defaultCtorScope(global_scope);
                             rvalue = GenerateDefaultValue(typeValue);
                         }
                     }
@@ -17748,7 +17754,13 @@ public:
                     if (auto* ae = initializer->assignmentExpression())
                         rvalue = ParseAssignmentExpression(ae);
                     else if (initializer->Default())
+                    {
+                        // Synthetic default-ctor body: clear the stale file-scope global_scope so a
+                        // struct-typed field's `= default` runs that field's own default constructor
+                        // (its field initializers) rather than zero-filling. See GenerateDefaultValue.
+                        GlobalScopeGuard defaultCtorScope(global_scope);
                         rvalue = GenerateDefaultValue(typeValue);
+                    }
                 }
                 initializers.push_back(rvalue);
             }
@@ -18070,7 +18082,13 @@ public:
                     if (auto* ae = initializer->assignmentExpression())
                         rvalue = ParseAssignmentExpression(ae);
                     else if (initializer->Default())
+                    {
+                        // Synthetic default-ctor body: clear the stale file-scope global_scope so a
+                        // struct-typed field's `= default` runs that field's own default constructor
+                        // (its field initializers) rather than zero-filling. See GenerateDefaultValue.
+                        GlobalScopeGuard defaultCtorScope(global_scope);
                         rvalue = GenerateDefaultValue(typeValue);
+                    }
                 }
                 initializers.push_back(rvalue);
             }
@@ -18540,6 +18558,10 @@ public:
                     }
                     else if (initializer->Default() != nullptr)
                     {
+                        // Synthetic default-ctor body: clear the stale file-scope global_scope so a
+                        // struct-typed field's `= default` runs that field's own default constructor
+                        // (its field initializers) rather than zero-filling. See GenerateDefaultValue.
+                        GlobalScopeGuard defaultCtorScope(global_scope);
                         rvalue = GenerateDefaultValue(typeValue);
                     }
                 }
