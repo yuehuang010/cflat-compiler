@@ -1,0 +1,172 @@
+// win32_settings.cb - a small settings panel showcasing the v6 widget set:
+// labels, a text field, checkboxes, gap spacing, a disabled-until-enabled button,
+// and live light/dark theming - all through the Win32 GDI host.
+//
+// Build & run (live window):
+//   x64/Release/cflat.exe example/ui/win32_settings.cb -o out/win32_settings.exe
+//   out\win32_settings.exe
+//
+// Offscreen snapshot (no window; used to view the UI headlessly):
+//   out\win32_settings.exe --shot out/settings.bmp        (light)
+//   out\win32_settings.exe --shot out/settings_dark.bmp dark
+//
+// Toggling "Dark mode" reskins the whole panel; "Auto-save" enables the Save
+// button (otherwise it renders disabled). Click or Tab+Space to toggle a checkbox.
+import "win32host.cb";
+import "graphic/bitmap.cb";
+
+class SettingsApp : Component
+{
+    bool   darkMode = false;
+    bool   notify   = true;
+    bool   autoSave = false;
+    int    volume   = 60;
+    string name     = default;
+
+    Element render(UiContext* ctx)
+    {
+        // The whole panel reskins by swapping the theme on the context.
+        ctx.theme = this.darkMode ? darkTheme() : lightTheme();
+
+        Box* root = box(makeStyle(1, hostWidth(), hostHeight()));
+        root.style.gap = 1;
+        root.setKey("root");
+
+        Text* title = text("Settings");
+        title.setKey("title");
+        root.add(title);
+
+        TextInput* nm = textInput(this.name, (string v) => { this.name = v; ctx.invalidate(); });
+        nm.width = 24;
+        nm.placeholder = "your name";
+        nm.setKey("name");
+        root.add(nm);
+
+        Checkbox* dark = checkbox("Dark mode", this.darkMode,
+                                  (bool v) => { this.darkMode = v; ctx.invalidate(); });
+        dark.setKey("dark");
+        root.add(dark);
+
+        Checkbox* nt = checkbox("Notifications", this.notify,
+                                (bool v) => { this.notify = v; ctx.invalidate(); });
+        nt.setKey("notify");
+        root.add(nt);
+
+        Checkbox* au = checkbox("Auto-save", this.autoSave,
+                                (bool v) => { this.autoSave = v; ctx.invalidate(); });
+        au.setKey("auto");
+        root.add(au);
+
+        // Volume slider + a progress bar mirroring its value.
+        Text* vlabel = text("Volume: " + this.volume.toString());
+        vlabel.setKey("vlabel");
+        root.add(vlabel);
+
+        Slider* vol = slider(this.volume, 26, (int v) => { this.volume = v; ctx.invalidate(); });
+        vol.setKey("vol");
+        root.add(vol);
+
+        ProgressBar* pb = progressBar(this.volume, 26);
+        pb.setKey("pb");
+        root.add(pb);
+
+        // Disabled until Auto-save is enabled - demonstrates the disabled state.
+        Button* save = button("Save", () => { ctx.invalidate(); });
+        save.setKey("save");
+        save.disabled = !this.autoSave;
+        root.add(save);
+
+        bool named = this.name.length() > 0;
+        string who = named ? this.name : "guest";
+        string note = this.notify ? "  (notify on)" : "  (notify off)";
+        Text* status = text("Hello, " + who + note);
+        status.setKey("status");
+        root.add(status);
+
+        return root;
+    }
+};
+
+// Offscreen render of a built tree to a 24bpp BMP, mirroring win32_shot.cb.
+int saveTreeBmp(Element tree, int cw, int ch, UiContext* ctx, const char* path)
+{
+    int W = cw * CELL_W;
+    int H = ch * CELL_H;
+
+    void* screenDC = GetDC(nullptr);
+    void* memDC    = CreateCompatibleDC(screenDC);
+    void* bmp      = CreateCompatibleBitmap(screenDC, W, H);
+    void* oldBmp   = SelectObject(memDC, bmp);
+
+    RECT full = default;
+    full.left = 0; full.top = 0; full.right = W; full.bottom = H;
+    FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
+
+    void* font = createUiFont();
+    void* oldFont = SelectObject(memDC, font);
+    GdiCanvas cv = default;
+    cv.hdc = memDC;
+    layoutRoot(tree, 0, 0, cw);
+    tree.paint(cv, ctx);
+    SelectObject(memDC, oldFont);
+    DeleteObject(font);
+
+    Bitmap* out = new Bitmap;
+    out.create(W, H);
+    int y = 0;
+    while (y < H)
+    {
+        int x = 0;
+        while (x < W)
+        {
+            u32 c = (u32)GetPixel(memDC, x, y);
+            BitmapPixel px = default;
+            px.r = (u8)(c & 0xFFu);
+            px.g = (u8)((c >> 8) & 0xFFu);
+            px.b = (u8)((c >> 16) & 0xFFu);
+            px.a = (u8)255;
+            out.set(x, y, px);
+            x++;
+        }
+        y++;
+    }
+    bool ok = out.save((string)path);
+    delete out;
+
+    SelectObject(memDC, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, screenDC);
+    return ok ? 0 : 1;
+}
+
+extern int main(int argc, char** argv)
+{
+    if (argc > 2 && strcmp(argv[1], "--shot") == 0)
+    {
+        // Headless snapshot: size the host, build the panel, focus the field for a
+        // focus ring, and dump a BMP. A second arg "dark" forces the dark theme.
+        int cw = 40;
+        int ch = 22;
+        _gTermW = cw;
+        _gTermH = ch;
+
+        SettingsApp app;
+        app.name = "Ada";
+        app.autoSave = (argc > 3 && strcmp(argv[3], "dark") == 0) ? true : false;
+        app.darkMode = (argc > 3 && strcmp(argv[3], "dark") == 0) ? true : false;
+
+        UiContext ctx = default;
+        Element tree = app.render(&ctx);
+        ctx.focus("name");
+
+        int rc = saveTreeBmp(tree, cw, ch, &ctx, argv[2]);
+        deleteTree(tree);
+        if (rc == 0) printf("wrote %s\n", argv[2]);
+        return rc;
+    }
+
+    SettingsApp app;
+    app.name = "Ada";
+    return runAppGui(app, "CFlat UI - Settings");
+}

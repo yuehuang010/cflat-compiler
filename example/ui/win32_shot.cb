@@ -1,0 +1,150 @@
+// win32_shot.cb - render the UI tree to an image file (no visible window).
+//
+// The Win32 GDI host paints into a real window, but a headless build harness has
+// no display, so the rendered UI has never actually been seen. This tool closes
+// that gap: it paints the SAME Element tree the live host would, but into an
+// offscreen memory DC, then reads the pixels back and writes them to a 24bpp BMP.
+// The result is a viewable snapshot of exactly what GdiCanvas produces - a real
+// visual oracle, not a single-pixel GetPixel assertion.
+//
+// Build & run:
+//   x64/Release/cflat.exe example/ui/win32_shot.cb -o out/win32_shot.exe
+//   out\win32_shot.exe out/ui_shot.bmp
+//
+// It reuses GdiCanvas + the cell/pixel mapping from win32host.cb and the BMP
+// writer from core/graphic/bitmap.cb.
+import "win32host.cb";
+import "graphic/bitmap.cb";
+
+// Build a representative widget tree (Box + Text + Button + TextInput +
+// ScrollView with nested boxes) so the snapshot exercises every paint path.
+// Handlers are empty: a screenshot never dispatches input.
+// The widgets set no colors of their own (except the amber cards below): they
+// inherit the context's Theme. The title is an accent override, and the cards
+// override to amber - both demonstrate that an explicit node color still beats
+// the theme.
+Element buildDemoTree(int cw, int ch)
+{
+    Box* root = box(makeStyle(0, cw, ch));   // panel colors come from the theme
+
+    Text* title = text("CFlat UI - Win32 GDI");
+    title.color = rgb(33, 80, 160);          // accent override
+    root.add(title);
+
+    Button* add = button("add box", () => { });   // themed (blue/white)
+    add.setKey("btn");                             // keyed so it can hover/press/focus
+    root.add(add);
+
+    TextInput* name = textInput("hello world", (string nv) => { });  // themed field
+    name.width = 20;
+    name.setKey("name");
+    root.add(name);
+
+    ScrollView* list = scrollView(makeStyle(0, cw - 2, 6));
+    int i = 0;
+    while (i < 4)
+    {
+        Style cardStyle = makeStyle(0, 12, 3);
+        cardStyle.backgroundColor = rgb(255, 248, 220);   // pale amber card (override)
+        cardStyle.color = rgb(200, 150, 40);
+        Box* small = box(cardStyle);
+        Text* lbl = text("item " + i.toString());
+        lbl.color = rgb(150, 90, 20);
+        small.add(lbl);
+        list.add(small);
+        i++;
+    }
+    root.add(list);
+
+    Element tree = root;
+    return tree;
+}
+
+// Paint the tree into an offscreen DIB at cw x ch cells and write it to `path`,
+// styled by `theme` (the per-app styling preference). focusKey/hoverKey/pressKey
+// force interactive paint states for the snapshot (empty string = none), since a
+// still image can't move the mouse.
+int shoot(const char* path, int cw, int ch, Theme theme,
+          const char* focusKey, const char* hoverKey, const char* pressKey)
+{
+    UiContext ctx = default;
+    ctx.theme = theme;
+    if (focusKey[0] != '\0') ctx.focus((string)focusKey);
+    if (hoverKey[0] != '\0') ctx.setHover((string)hoverKey);
+    if (pressKey[0] != '\0') ctx.setPress((string)pressKey);
+    int W = cw * CELL_W;
+    int H = ch * CELL_H;
+
+    void* screenDC = GetDC(nullptr);
+    void* memDC    = CreateCompatibleDC(screenDC);
+    void* bmp      = CreateCompatibleBitmap(screenDC, W, H);
+    void* oldBmp   = SelectObject(memDC, bmp);
+
+    RECT full = default;
+    full.left = 0; full.top = 0; full.right = W; full.bottom = H;
+    FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
+
+    Element tree = buildDemoTree(cw, ch);
+    void* font = createUiFont();
+    void* oldFont = SelectObject(memDC, font);
+    GdiCanvas cv = default;
+    cv.hdc = memDC;
+    layoutRoot(tree, 0, 0, cw);
+    tree.paint(cv, &ctx);
+    SelectObject(memDC, oldFont);
+    DeleteObject(font);
+
+    // Read the rendered pixels back into a Bitmap. GetPixel returns COLORREF
+    // (0x00BBGGRR), so the red byte is the low byte.
+    Bitmap* out = new Bitmap;
+    out.create(W, H);
+    int y = 0;
+    while (y < H)
+    {
+        int x = 0;
+        while (x < W)
+        {
+            u32 c = (u32)GetPixel(memDC, x, y);
+            BitmapPixel px = default;
+            px.r = (u8)(c & 0xFFu);
+            px.g = (u8)((c >> 8) & 0xFFu);
+            px.b = (u8)((c >> 16) & 0xFFu);
+            px.a = (u8)255;
+            out.set(x, y, px);
+            x++;
+        }
+        y++;
+    }
+
+    bool ok = out.save((string)path);
+    delete out;
+
+    deleteTree(tree);
+    SelectObject(memDC, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, screenDC);
+
+    if (!ok) { printf("FAIL: could not write %s\n", path); return 1; }
+    printf("wrote %s (%dx%d px)\n", path, W, H);
+    return 0;
+}
+
+extern int main(int argc, char** argv)
+{
+    // Usage: win32_shot [path.bmp] [dark|light] [states|pressed]
+    //   states  - focus the field + hover the button
+    //   pressed - focus the field + press the button
+    const char* path = "out/ui_shot.bmp";
+    if (argc > 1) path = argv[1];
+    Theme theme = lightTheme();
+    if (argc > 2 && strcmp(argv[2], "dark") == 0) theme = darkTheme();
+
+    const char* focusKey = "";
+    const char* hoverKey = "";
+    const char* pressKey = "";
+    if (argc > 3 && strcmp(argv[3], "states") == 0)  { focusKey = "name"; hoverKey = "btn"; }
+    if (argc > 3 && strcmp(argv[3], "pressed") == 0) { focusKey = "name"; pressKey = "btn"; }
+
+    return shoot(path, 44, 22, theme, focusKey, hoverKey, pressKey);
+}

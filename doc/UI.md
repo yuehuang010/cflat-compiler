@@ -11,7 +11,10 @@ the "sugar-compatible element contract" is what a future `<View/>` grammar sugar
 (and an eventual `core/` promotion) desugars against. Changes to the frozen
 surface are deliberate and bump the API version.
 
-- **Framework API version:** 4
+- **Framework API version:** 8 (v5 added color to `Style` + `Canvas`; v6 added the
+  `Theme` styling preference and hover/pressed/focus interaction states; v7 added the
+  `Checkbox` widget, the `disabled` state, and `Style.gap`; v8 added the `ProgressBar`
+  and `Slider` widgets with the `track`/`accent` theme slots)
 - **Location:** `example/ui/` (framework + TUI and Win32 hosts). NOT in `core/`
   yet - promotion is deferred to a later release.
 - **Status:** the framework is a single source of truth (`example/ui/ui.cb`);
@@ -71,9 +74,12 @@ Notes:
 |------|------|------|-----------|
 | `View` | `ELEM_VIEW` | flex container | `Style style`, `list<Element> children` |
 | `Text` | `ELEM_TEXT` | text leaf | `string text` |
-| `Button` | `ELEM_BUTTON` | pressable leaf | `string title`, `Lambda<void()> onPress` |
+| `Button` | `ELEM_BUTTON` | pressable leaf | `string title`, `Lambda<void()> onPress`, `bool disabled` |
 | `Box` | `ELEM_BOX` | bordered sized container | `Style style`, `children` |
-| `TextInput` | `ELEM_TEXTINPUT` | controlled text field | `string value`, `Lambda<void(string)> onChangeText`, `int width` |
+| `TextInput` | `ELEM_TEXTINPUT` | controlled text field | `string value`, `Lambda<void(string)> onChangeText`, `int width`, `bool disabled` |
+| `Checkbox` | `ELEM_CHECKBOX` | controlled on/off toggle | `string label`, `bool checked`, `Lambda<void(bool)> onChange`, `bool disabled` |
+| `ProgressBar` | `ELEM_PROGRESS` | presentational fill bar | `int value` (0..100), `int width` |
+| `Slider` | `ELEM_SLIDER` | controlled value via click/drag/arrows | `int value` (0..100), `int width`, `Lambda<void(int)> onChange`, `bool disabled` |
 | `ScrollView` | `ELEM_SCROLL` | clipped scrollable viewport | `Style style` (viewport), `children`, `int scrollY` |
 | `ComponentElement` | `ELEM_COMPONENT` | wraps a mounted component subtree | single inner child |
 
@@ -88,8 +94,17 @@ Text*       text(string s);
 Button*     button(string title, Lambda<void()> onPress);
 Box*        box(Style style);
 TextInput*  textInput(string value, Lambda<void(string)> onChangeText);
-ScrollView* scrollView(Style style);
+Checkbox*    checkbox(string label, bool checked, Lambda<void(bool)> onChange);
+ProgressBar* progressBar(int value, int width);
+Slider*      slider(int value, int width, Lambda<void(int)> onChange);
+ScrollView*  scrollView(Style style);
 ```
+
+**Controlled widgets** (`TextInput`, `Checkbox`) hold no state of their own: the
+component owns the value and passes it down each render; the widget fires its
+`on*` handler with the new value and the component updates state + `invalidate()`s,
+so the next render flows it back. **`disabled`** dims the widget (`dimColor`) and
+makes it ignore input and drop out of the Tab focus ring.
 
 ### TextInput, ScrollView, focus navigation
 
@@ -127,10 +142,63 @@ struct Style
     int padding = 0;
     int width = 0;
     int height = 0;
-    int flexDirection = 0;   // DIR_COLUMN (0) | DIR_ROW (1)
+    int flexDirection = 0;       // DIR_COLUMN (0) | DIR_ROW (1)
+    int color = 0;               // foreground (text / border); COLOR_DEFAULT (0) = default ink
+    int backgroundColor = 0;     // fill; COLOR_DEFAULT (0) = no fill
+    int gap = 0;                 // cells of space inserted between stacked children
 };
-Style makeStyle(int padding, int width, int height);   // flexDirection defaults to column
+Style makeStyle(int padding, int width, int height);   // flexDirection column, colors default
+int   rgb(int r, int g, int b);                        // build an explicit color
+int   COLOR_DEFAULT;                                   // 0: backend monochrome default
 ```
+
+ALWAYS build colors with `rgb(r, g, b)` - never a raw `0xRRGGBB` literal. `rgb()`
+sets a marker bit so an explicit color is non-zero (even `rgb(0,0,0)`), and
+`COLOR_DEFAULT` is `0` ("no explicit color"): a tree that sets no color renders
+exactly as before colors existed. 0-as-sentinel is deliberate so a default/zeroed
+field is automatically "unset" - the framework does not rely on a `-1` initializer
+surviving (a nested `Struct f = default;` field is zero-filled in CFlat). The GDI
+host masks the marker off when converting to a `COLORREF`.
+
+`color`/`backgroundColor` live on `Style` (read by `View`/`Box`/`ScrollView`) and
+as direct fields on the color-bearing leaves: `Text.color`, `Button.color` +
+`Button.backgroundColor`, `TextInput.color` + `TextInput.backgroundColor`. A
+backend without color (the TUI char grid) ignores them.
+
+### Theme (styling preference)
+
+Rather than color every node by hand, set a `Theme` once on the context and widgets
+that specify no color of their own inherit it. An explicit per-node color still wins.
+
+```
+struct Theme {
+    int textColor; int panelBg; int panelBorder;
+    int buttonBg;  int buttonText;
+    int inputBg;   int inputText;
+    int focusRing;
+    int track;     int accent;             // all COLOR_DEFAULT (0) in a default Theme
+};
+Theme lightTheme();   // slate-on-near-white, blue primary button
+Theme darkTheme();    // light-on-charcoal, brighter blue button
+int   pickColor(int nodeColor, int themeColor);   // node color wins, else theme slot
+int   shade(int color, int delta);                // lighten/darken (hover/pressed)
+```
+
+The theme lives on `UiContext` (`ctx.theme`), the host-owned per-app state. An app
+declares its preference in `render()`:
+
+```
+Element render(UiContext* ctx) {
+    ctx.theme = lightTheme();   // or darkTheme(), or your own Theme
+    ...
+}
+```
+
+A default-constructed `Theme` is monochrome (every slot `0`), so a host that sets no
+theme renders exactly as the pre-color framework did - this is what keeps the GDI
+self-test and the TUI hosts byte-identical. `Box`/`Text`/`Button`/`TextInput`
+resolve each color as `pickColor(nodeColor, themeSlot)`; `View`/`ScrollView` fill
+only when given an explicit `style.backgroundColor`.
 
 ## Layout protocol (one pass, pluggable strategy)
 
@@ -157,10 +225,14 @@ All input flows through one path. The host translates native input into an
 ```
 int EV_MOUSE_DOWN = 1;   // hit-tested down the tree
 int EV_KEY        = 2;   // routed to the focused node
+int EV_MOUSE_MOVE = 3;   // hit-tested; updates hover (paint-only state)
+int EV_MOUSE_UP   = 4;   // hit-tested; host also clears pressed on release
 int KEY_ENTER = 13; int KEY_SPACE = 32; int KEY_TAB = 9;   // VK codes match these
 
 struct Event { int kind; int x; int y; int key; };
 Event mouseDown(int x, int y);
+Event mouseMove(int x, int y);
+Event mouseUp(int x, int y);
 Event keyPress(int key);
 ```
 
@@ -171,6 +243,22 @@ Event keyPress(int key);
   -> same focus), unlike a list index. A `Button` takes focus on press and, while
   focused, re-fires on Enter/Space.
 
+### Interaction visual states (hover / pressed / focus)
+
+`hover` and `pressed` are KEYED identities in `UiContext` (like focus), set as the
+pointer moves/presses and rendered as a shade of the widget's color. They are PURE
+PAINT STATE: changing them calls `requestRepaint()` (no re-render), and only when the
+identity actually changes, so dragging within one widget does not churn.
+
+- A `Button` lightens its fill on hover (`shade(bg, +28)`), darkens it while pressed
+  (`shade(bg, -40)`; pressed wins over hover), and draws a `theme.focusRing` border
+  when focused. A monochrome (unset) button shows no hover/press fill - `shade(0,..)`
+  stays `0` - so the default look is unchanged.
+- The host maps native input: `WM_MOUSEMOVE -> mouseMove` (a move hitting nothing
+  calls `ctx.setHover("")`), `WM_LBUTTONUP -> mouseUp` + `ctx.clearPress()` (so a
+  release off-target still clears). `int shade(int color, int delta)` lightens/darkens
+  every channel (clamped); an unset color stays unset.
+
 ## `UiContext` (host-owned runtime state)
 
 ```
@@ -178,12 +266,20 @@ struct UiContext
 {
     bool   dirty;       // a handler changed state; host re-renders
     string focusKey;    // keyed identity of the focused node ("" = none)
+    string hoverKey;    // node under the pointer ("" = none)
+    string pressKey;    // node pressed/held ("" = none)
+    Theme  theme;       // styling preference (default = monochrome)
 
     void invalidate();          // mark the UI dirty
     bool consumeDirty();        // read + clear the flag
     void focus(string key);     // set focus to a keyed node
     void blur();
     bool hasFocus(string key);
+    void setHover(string key);  // repaints only when hover identity changes
+    bool hasHover(string key);
+    void setPress(string key);
+    void clearPress();
+    bool hasPress(string key);
 };
 ```
 
@@ -231,15 +327,28 @@ directly, so the same tree renders to any backend.
 interface Canvas
 {
     void clear();
-    void drawText(int col, int row, const char* s);
-    void drawRect(Rect r, bool filled);   // filled=false: border; true: fill
+    void drawText(int col, int row, const char* s, int color);  // color via rgb(), 0 = default
+    void drawRect(Rect r, bool filled, int color);              // filled=false: border; true: fill
 };
 ```
 
 - **TUI:** `SurfaceCanvas` adapts a headless `Surface` char grid; `canvasFor(&surface)`
-  binds one for a paint call.
+  binds one for a paint call. The grid has no color, so it ignores the `color` arg.
 - **Win32:** `GdiCanvas` (in `win32host.cb`) maps a cell to `CELL_W`x`CELL_H`
-  pixels and draws with `DrawTextA`/`FrameRect`/`FillRect`.
+  pixels and draws with `DrawTextA`/`FrameRect`/`FillRect`. It honors `color`
+  (`0`/COLOR_DEFAULT keeps the original black ink / black border path) and the host selects a
+  crisp monospace font (`createUiFont()`, Consolas) into the DC before painting.
+  Layout stays cell-based, so the font is monospace to keep text aligned to box
+  borders and the caret; proportional/pixel layout remains deferred.
+
+### Viewing the rendered UI (`win32_shot.cb`)
+
+A headless build harness has no display, so the GDI output is captured to an image
+instead of shown in a window: `example/ui/win32_shot.cb` paints the tree into an
+offscreen memory DC through `GdiCanvas`, reads the pixels back, and writes a 24bpp
+BMP via `core/graphic/bitmap.cb`. Run `out\win32_shot.exe <path.bmp>` to produce a
+viewable snapshot of exactly what `GdiCanvas` draws - a real visual oracle beyond
+the single-pixel `guiSelfTest` readback.
 
 ## `<View/>` grammar sugar
 

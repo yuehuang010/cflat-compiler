@@ -27,6 +27,29 @@ int _gTermH = 25;
 int hostWidth()  { return _gTermW; }
 int hostHeight() { return _gTermH; }
 
+// Convert a framework color to a Win32 COLORREF (0x00BBGGRR). The masks drop the
+// rgb() marker bit; COLOR_DEFAULT (0) maps to black, matching the monochrome host.
+u32 colorRef(int color)
+{
+    int r = (color >> 16) & 0xFF;
+    int g = (color >> 8) & 0xFF;
+    int b = color & 0xFF;
+    return (u32)(r | (g << 8) | (b << 16));
+}
+
+// A crisp monospace UI font sized to the cell. Monospace is deliberate: the layout
+// places text by CELL, so a fixed-pitch face keeps glyphs aligned to box borders
+// and the TextInput caret (a proportional font would drift). The caller selects it
+// into the DC for the duration of a paint and DeleteObject()s it after.
+void* createUiFont()
+{
+    return CreateFontA(CELL_H - 3, 0, 0, 0, FW_NORMAL,
+                       0u, 0u, 0u,
+                       (u32)ANSI_CHARSET, (u32)OUT_DEFAULT_PRECIS,
+                       (u32)CLIP_DEFAULT_PRECIS, (u32)CLEARTYPE_QUALITY,
+                       (u32)(FIXED_PITCH | FF_MODERN), "Consolas");
+}
+
 // The running app, its committed tree, and the UiContext (dirty flag + focused
 // node), reached from the free-function WndProc (a stdcall callback cannot
 // capture `this`). Single window / single thread, so these host globals are the
@@ -72,7 +95,7 @@ class GdiCanvas : Canvas
 
     void clear() { }   // the window background is erased by the default WM_ERASEBKGND
 
-    void drawText(int col, int row, const char* s)
+    void drawText(int col, int row, const char* s, int color)
     {
         RECT rc = default;
         rc.left   = col * this.cellW;
@@ -80,21 +103,33 @@ class GdiCanvas : Canvas
         rc.right  = rc.left + 4096;        // wide; single line is left-clipped to it
         rc.bottom = rc.top + this.cellH;
         SetBkMode(this.hdc, TRANSPARENT);
-        SetTextColor(this.hdc, 0u);        // black
+        SetTextColor(this.hdc, colorRef(color));   // -1 -> black
         DrawTextA(this.hdc, (char*)s, -1, &rc,
                   (u32)(DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX));
     }
 
-    void drawRect(Rect r, bool filled)
+    void drawRect(Rect r, bool filled, int color)
     {
         RECT rc = default;
         rc.left   = r.x * this.cellW;
         rc.top    = r.y * this.cellH;
         rc.right  = (r.x + r.w) * this.cellW;
         rc.bottom = (r.y + r.h) * this.cellH;
-        void* br = GetStockObject(BLACK_BRUSH);
-        if (filled) { FillRect(this.hdc, &rc, br); return; }
-        FrameRect(this.hdc, &rc, br);
+
+        // Default color (0) keeps the original stock-black-brush path byte for
+        // byte, so the offscreen self-test pixels are unchanged. An explicit color
+        // allocates a solid brush for the fill/frame and frees it.
+        if (color == 0)
+        {
+            void* br = GetStockObject(BLACK_BRUSH);
+            if (filled) { FillRect(this.hdc, &rc, br); return; }
+            FrameRect(this.hdc, &rc, br);
+            return;
+        }
+        void* br = CreateSolidBrush(colorRef(color));
+        if (filled) FillRect(this.hdc, &rc, br);
+        else        FrameRect(this.hdc, &rc, br);
+        DeleteObject(br);
     }
 
     // Clip in GDI: SaveDC the current clip region, intersect with the cell rect
@@ -164,10 +199,14 @@ stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
         FillRect(memDC, &rc, GetStockObject(WHITE_BRUSH));
         if (_gReady)
         {
+            void* font = createUiFont();
+            void* oldFont = SelectObject(memDC, font);
             GdiCanvas cv = default;
             cv.hdc = memDC;
             layoutRoot(_gTree, 0, 0, _gTermW);
             _gTree.paint(cv, &_gCtx);
+            SelectObject(memDC, oldFont);
+            DeleteObject(font);
         }
         BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, (u32)SRCCOPY);
 
@@ -187,6 +226,34 @@ stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
             // Dispatch the click; the handler mutates state and calls invalidate().
             // pumpAfterInput then drains the dirty flag and repaints on a change.
             _gTree.dispatch(mouseDown(px / CELL_W, py / CELL_H), &_gCtx);
+            pumpAfterInput(hwnd);
+        }
+        return (i64)0;
+    }
+
+    if (msg == WM_MOUSEMOVE)
+    {
+        int px = (int)(lParam & (i64)0xFFFF);
+        int py = (int)((lParam >> 16) & (i64)0xFFFF);
+        if (_gReady)
+        {
+            // Hover is pure paint state: a move that hits no interactive node
+            // clears hover. setHover repaints only when the identity changes.
+            if (!_gTree.dispatch(mouseMove(px / CELL_W, py / CELL_H), &_gCtx))
+                _gCtx.setHover("");
+            pumpAfterInput(hwnd);
+        }
+        return (i64)0;
+    }
+
+    if (msg == WM_LBUTTONUP)
+    {
+        int px = (int)(lParam & (i64)0xFFFF);
+        int py = (int)((lParam >> 16) & (i64)0xFFFF);
+        if (_gReady)
+        {
+            _gTree.dispatch(mouseUp(px / CELL_W, py / CELL_H), &_gCtx);
+            _gCtx.clearPress();   // release clears any held press, even off-target
             pumpAfterInput(hwnd);
         }
         return (i64)0;
@@ -318,6 +385,207 @@ int guiSelfTest()
     }
     printf("FAIL: gui self-test (border=%d text=%d clipTop=%d clipBottom=%d)\n",
            (int)borderDrawn, (int)textDrawn, (int)clipTopInside, (int)clipBottomHidden);
+    return 1;
+}
+
+// ── Interaction-state self-test (hover / pressed / focus shading) ─────────────
+// Paints one themed button repeatedly into the same spot with different ctx states
+// and reads the fill back. The whole-span channel sum must order pressed < normal
+// < hover (pressed darkens, hover lightens), and a focused button must draw the
+// theme's focus-ring color along its top edge. Deterministic, console-free.
+
+int _rowChannelSum(void* dc, int y, int x0, int x1)
+{
+    int sum = 0;
+    int x = x0;
+    while (x < x1)
+    {
+        u32 c = (u32)GetPixel(dc, x, y);
+        sum = sum + (int)(c & 0xFFu) + (int)((c >> 8) & 0xFFu) + (int)((c >> 16) & 0xFFu);
+        x++;
+    }
+    return sum;
+}
+
+int guiStateSelfTest()
+{
+    int W = 16 * CELL_W;
+    int H = 2 * CELL_H;
+    void* screenDC = GetDC(nullptr);
+    void* memDC = CreateCompatibleDC(screenDC);
+    void* bmp   = CreateCompatibleBitmap(screenDC, W, H);
+    void* oldBmp = SelectObject(memDC, bmp);
+
+    Button* b = button("ok", () => { });
+    b.setKey("b");
+    Element tree = b;
+
+    UiContext ctx = default;
+    ctx.theme = lightTheme();
+
+    GdiCanvas cv = default;
+    cv.hdc = memDC;
+    layoutRoot(tree, 0, 0, 16);
+
+    // Sample the fill near the top of the button row (y=2), away from glyph ink,
+    // across the span; re-fill white before each paint so reads do not accumulate.
+    RECT full = default; full.left = 0; full.top = 0; full.right = W; full.bottom = H;
+    int x0 = CELL_W;
+    int x1 = 5 * CELL_W;
+
+    FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
+    tree.paint(cv, &ctx);
+    int normalSum = _rowChannelSum(memDC, 2, x0, x1);
+
+    FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
+    ctx.setPress("b");
+    tree.paint(cv, &ctx);
+    int pressedSum = _rowChannelSum(memDC, 2, x0, x1);
+
+    FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
+    ctx.clearPress();
+    ctx.setHover("b");
+    tree.paint(cv, &ctx);
+    int hoverSum = _rowChannelSum(memDC, 2, x0, x1);
+
+    // Focus ring: a focused (un-hovered, un-pressed) button draws the ring color at
+    // its top edge (pixel row 0). Assert that row is bluish (ring blue: B > R).
+    FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
+    ctx.setHover("");
+    ctx.focus("b");
+    tree.paint(cv, &ctx);
+    u32 ringPx = (u32)GetPixel(memDC, 2 * CELL_W, 0);
+    bool ringBluish = ((ringPx >> 16) & 0xFFu) > (ringPx & 0xFFu);   // COLORREF: high byte = blue
+
+    deleteTree(tree);
+    SelectObject(memDC, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, screenDC);
+
+    bool ordered = pressedSum < normalSum && normalSum < hoverSum;
+    if (ordered && ringBluish)
+    {
+        printf("PASS: gui state self-test (pressed<normal<hover shade + focus ring)\n");
+        return 0;
+    }
+    printf("FAIL: gui state self-test (pressed=%d normal=%d hover=%d ringBluish=%d)\n",
+           pressedSum, normalSum, hoverSum, (int)ringBluish);
+    return 1;
+}
+
+// True if any pixel in row y across [x0,x1) is clearly non-white (drawn ink).
+bool _spanHasInk(void* dc, int y, int x0, int x1)
+{
+    int x = x0;
+    while (x < x1)
+    {
+        u32 c = (u32)GetPixel(dc, x, y);
+        int s = (int)(c & 0xFFu) + (int)((c >> 8) & 0xFFu) + (int)((c >> 16) & 0xFFu);
+        if (s < 600) return true;
+        x++;
+    }
+    return false;
+}
+
+// Blue minus red channel of a COLORREF (0x00BBGGRR): large for an accent blue,
+// near zero for a gray trough.
+int _blueMinusRed(u32 c)
+{
+    return (int)((c >> 16) & 0xFFu) - (int)(c & 0xFFu);
+}
+
+// Spread between the brightest and darkest channel of a COLORREF (0 = pure gray).
+int _chanRange(u32 c)
+{
+    int r = (int)(c & 0xFFu);
+    int g = (int)((c >> 8) & 0xFFu);
+    int b = (int)((c >> 16) & 0xFFu);
+    int mx = r; if (g > mx) mx = g; if (b > mx) mx = b;
+    int mn = r; if (g < mn) mn = g; if (b < mn) mn = b;
+    return mx - mn;
+}
+
+// ── Widget self-test (checkbox ink + disabled dimming) ───────────────────────
+// A checked Checkbox must draw ink, and a disabled Button's fill must be grayer
+// (smaller channel spread) than the saturated themed enabled fill.
+int guiWidgetSelfTest()
+{
+    int W = 20 * CELL_W;
+    int H = 2 * CELL_H;
+    void* screenDC = GetDC(nullptr);
+    void* memDC = CreateCompatibleDC(screenDC);
+    void* bmp   = CreateCompatibleBitmap(screenDC, W, H);
+    void* oldBmp = SelectObject(memDC, bmp);
+    RECT full = default; full.left = 0; full.top = 0; full.right = W; full.bottom = H;
+
+    UiContext ctx = default;
+    ctx.theme = lightTheme();
+    GdiCanvas cv = default;
+    cv.hdc = memDC;
+
+    // 1. A checked checkbox draws ink somewhere in its first row of cells.
+    FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
+    Checkbox* cbx = checkbox("ok", true, (bool v) => { });
+    cbx.setKey("c");
+    Element ctree = cbx;
+    layoutRoot(ctree, 0, 0, 20);
+    ctree.paint(cv, &ctx);
+    bool checkboxInk = false;
+    int py = 0;
+    while (py < CELL_H)
+    {
+        if (_spanHasInk(memDC, py, 0, 10 * CELL_W)) { checkboxInk = true; break; }
+        py++;
+    }
+    deleteTree(ctree);
+
+    // 2. Enabled vs disabled button fill: disabled is grayer (smaller channel range).
+    Button* be = button("ok", () => { });
+    be.setKey("e");
+    Element etree = be;
+    FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
+    layoutRoot(etree, 0, 0, 20);
+    etree.paint(cv, &ctx);
+    int enabledRange = _chanRange((u32)GetPixel(memDC, CELL_W + CELL_W / 2, 2));
+    deleteTree(etree);
+
+    Button* bd = button("ok", () => { });
+    bd.setKey("d");
+    bd.disabled = true;
+    Element dtree = bd;
+    FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
+    layoutRoot(dtree, 0, 0, 20);
+    dtree.paint(cv, &ctx);
+    int disabledRange = _chanRange((u32)GetPixel(memDC, CELL_W + CELL_W / 2, 2));
+    deleteTree(dtree);
+
+    // 3. A 70% progress bar (width 12): the filled left is strongly blue (accent),
+    //    the right trough is not.
+    ProgressBar* pb = progressBar(70, 12);
+    pb.setKey("p");
+    Element ptree = pb;
+    FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
+    layoutRoot(ptree, 0, 0, 12);
+    ptree.paint(cv, &ctx);
+    int filledBR = _blueMinusRed((u32)GetPixel(memDC, 2 * CELL_W, 2));
+    int trackBR  = _blueMinusRed((u32)GetPixel(memDC, 10 * CELL_W, 2));
+    deleteTree(ptree);
+
+    SelectObject(memDC, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, screenDC);
+
+    bool dimmer = disabledRange < enabledRange;
+    bool barOk = filledBR > 50 && trackBR < 50;
+    if (checkboxInk && dimmer && barOk)
+    {
+        printf("PASS: gui widget self-test (checkbox ink + disabled dim + progress fill)\n");
+        return 0;
+    }
+    printf("FAIL: gui widget self-test (checkboxInk=%d dim(%d<%d) barOk=%d filledBR=%d trackBR=%d)\n",
+           (int)checkboxInk, disabledRange, enabledRange, (int)barOk, filledBR, trackBR);
     return 1;
 }
 

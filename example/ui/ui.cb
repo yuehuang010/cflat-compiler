@@ -26,12 +26,63 @@ int DIR_ROW    = 1;   // place children left-to-right
 
 // Shared layout/style props. Plain value struct carried by host elements. Field
 // names track React Native (flexDirection); a typed struct, not an open bag.
+// COLOR_DEFAULT (0) means "no explicit color": the Canvas falls back to its
+// monochrome default (black ink / black border / no fill), so a tree that sets no
+// colors renders exactly as it did before colors existed. 0 is deliberately the
+// sentinel because a default/zero-initialized struct field is then automatically
+// "unset" - the framework never depends on a -1 field initializer surviving (a
+// nested `Struct f = default;` field is zero-filled in CFlat, not initializer-run).
+//
+// Build explicit colors with rgb(): it packs 0xRRGGBB AND sets a high marker bit so
+// even pure black (rgb(0,0,0)) is non-zero and distinct from "unset". colorRef() in
+// the GDI host masks the marker off.
+int COLOR_DEFAULT = 0;
+int COLOR_SET_BIT = 0x1000000;   // marks an explicit color; masked off at draw time
+
+int rgb(int r, int g, int b)
+{
+    return COLOR_SET_BIT | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+}
+
+int clampByte(int v)
+{
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return v;
+}
+
+// Lighten (delta > 0) or darken (delta < 0) a color by shifting every channel.
+// Used for hover/pressed shades of a base color. An unset color (0) stays unset,
+// so a monochrome widget shows no hover/press fill (it had none to shade).
+int shade(int color, int delta)
+{
+    if (color == 0) return 0;
+    int r = clampByte(((color >> 16) & 0xFF) + delta);
+    int g = clampByte(((color >> 8) & 0xFF) + delta);
+    int b = clampByte((color & 0xFF) + delta);
+    return rgb(r, g, b);
+}
+
+// Collapse a color halfway toward mid-gray for a disabled/dimmed look. An unset
+// color (0, i.e. default black ink) dims to a plain gray rather than staying black.
+int dimColor(int color)
+{
+    if (color == 0) return rgb(150, 150, 150);
+    int r = (((color >> 16) & 0xFF) + 150) / 2;
+    int g = (((color >> 8) & 0xFF) + 150) / 2;
+    int b = ((color & 0xFF) + 150) / 2;
+    return rgb(r, g, b);
+}
+
 struct Style
 {
     int padding = 0;
     int width = 0;
     int height = 0;
-    int flexDirection = 0;   // DIR_COLUMN | DIR_ROW
+    int flexDirection = 0;          // DIR_COLUMN | DIR_ROW
+    int color = 0;                  // foreground (text / border); 0 = default
+    int backgroundColor = 0;        // fill; 0 = no fill
+    int gap = 0;                    // cells of space between stacked children
 };
 
 Style makeStyle(int padding, int width, int height)
@@ -45,13 +96,16 @@ Style makeStyle(int padding, int width, int height)
 
 bool styleIsEmpty(Style s)
 {
-    return s.padding == 0 && s.width == 0 && s.height == 0 && s.flexDirection == 0;
+    return s.padding == 0 && s.width == 0 && s.height == 0 && s.flexDirection == 0
+        && s.color == 0 && s.backgroundColor == 0 && s.gap == 0;
 }
 
 bool styleEquals(Style a, Style b)
 {
     return a.padding == b.padding && a.width == b.width
-        && a.height == b.height && a.flexDirection == b.flexDirection;
+        && a.height == b.height && a.flexDirection == b.flexDirection
+        && a.color == b.color && a.backgroundColor == b.backgroundColor
+        && a.gap == b.gap;
 }
 
 string styleToJson(Style s)
@@ -59,7 +113,10 @@ string styleToJson(Style s)
     return "{\"padding\":" + s.padding.toString()
          + ",\"width\":" + s.width.toString()
          + ",\"height\":" + s.height.toString()
-         + ",\"flexDirection\":" + s.flexDirection.toString() + "}";
+         + ",\"flexDirection\":" + s.flexDirection.toString()
+         + ",\"color\":" + s.color.toString()
+         + ",\"backgroundColor\":" + s.backgroundColor.toString()
+         + ",\"gap\":" + s.gap.toString() + "}";
 }
 
 // ── Rect: an absolute cell rectangle assigned during layout ──────────────────
@@ -247,11 +304,13 @@ void drawBorder(Surface* s, Rect b)
 // pushClip/popClip bound subsequent drawing to a rectangle (in cells). A
 // ScrollView pushes its viewport so off-viewport children are clipped; calls
 // nest (each push intersects with the active clip) and must be balanced.
+// color is 0xRRGGBB, or COLOR_DEFAULT (-1) for the backend's monochrome default.
+// A backend with no color (the TUI char grid) ignores it.
 interface Canvas
 {
     void clear();
-    void drawText(int col, int row, const char* s);
-    void drawRect(Rect r, bool filled);   // filled=false draws a border, true fills
+    void drawText(int col, int row, const char* s, int color);
+    void drawRect(Rect r, bool filled, int color);   // filled=false border, true fill
     void pushClip(Rect r);
     void popClip();
 };
@@ -283,13 +342,15 @@ class SurfaceCanvas : Canvas
         if (this._visible(x, y)) this.target.put(x, y, c);
     }
 
-    void drawText(int col, int row, const char* s)
+    // The terminal grid has no color; `color` is accepted for the Canvas contract
+    // and ignored.
+    void drawText(int col, int row, const char* s, int color)
     {
         int i = 0;
         while (s[i] != '\0') { this._putClipped(col + i, row, s[i]); i++; }
     }
 
-    void drawRect(Rect r, bool filled)
+    void drawRect(Rect r, bool filled, int color)
     {
         if (!filled)
         {
@@ -347,6 +408,8 @@ SurfaceCanvas canvasFor(Surface* s)
 // hit-test down the tree; key events route to the focused node (see UiContext).
 int EV_MOUSE_DOWN = 1;
 int EV_KEY        = 2;
+int EV_MOUSE_MOVE = 3;   // pointer moved: updates hover state (no state change)
+int EV_MOUSE_UP   = 4;   // pointer released: clears pressed state
 
 // Key codes the framework understands; the host maps native codes onto these.
 // EV_KEY also carries printable ASCII codes (32..126) for text entry; a focused
@@ -382,6 +445,84 @@ Event keyPress(int key)
     return e;
 }
 
+Event mouseMove(int x, int y)
+{
+    Event e = default;
+    e.kind = EV_MOUSE_MOVE; e.x = x; e.y = y;
+    return e;
+}
+
+Event mouseUp(int x, int y)
+{
+    Event e = default;
+    e.kind = EV_MOUSE_UP; e.x = x; e.y = y;
+    return e;
+}
+
+// ── Theme: the app's styling preference (per-widget default colors) ──────────
+// A widget that sets no explicit color falls back to the theme slot for its role,
+// so styling is declared once on the context instead of on every node. A
+// default-constructed Theme is MONOCHROME (every slot COLOR_DEFAULT): a host that
+// sets no theme renders exactly as the pre-color framework did, which keeps the
+// GDI self-test and the TUI hosts byte-identical. An app opts into styling by
+// assigning ctx.theme = lightTheme() (or its own Theme) in render().
+struct Theme
+{
+    int textColor   = 0;   // Text ink
+    int panelBg     = 0;   // Box fill
+    int panelBorder = 0;   // Box border
+    int buttonBg    = 0;   // Button fill
+    int buttonText  = 0;   // Button label ink
+    int inputBg     = 0;   // TextInput fill
+    int inputText   = 0;   // TextInput ink
+    int focusRing   = 0;   // border drawn around the focused widget
+    int track       = 0;   // ProgressBar / Slider trough
+    int accent      = 0;   // ProgressBar / Slider filled portion + thumb
+};
+
+// Resolve a color: an explicit per-node color (anything but COLOR_DEFAULT/0) wins;
+// otherwise fall back to the theme slot (itself 0 in the monochrome theme, which
+// the Canvas renders as its default ink).
+int pickColor(int nodeColor, int themeColor)
+{
+    if (nodeColor != 0) return nodeColor;
+    return themeColor;
+}
+
+// A light theme: slate-on-near-white with a blue primary button.
+Theme lightTheme()
+{
+    Theme t = default;
+    t.textColor   = rgb(28, 32, 38);
+    t.panelBg     = rgb(245, 247, 250);
+    t.panelBorder = rgb(170, 178, 190);
+    t.buttonBg    = rgb(52, 120, 247);
+    t.buttonText  = rgb(255, 255, 255);
+    t.inputBg     = rgb(255, 255, 255);
+    t.inputText   = rgb(20, 20, 20);
+    t.focusRing   = rgb(52, 120, 247);
+    t.track       = rgb(210, 214, 220);
+    t.accent      = rgb(52, 120, 247);
+    return t;
+}
+
+// A dark theme: light ink on charcoal panels with a brighter blue button.
+Theme darkTheme()
+{
+    Theme t = default;
+    t.textColor   = rgb(225, 228, 233);
+    t.panelBg     = rgb(34, 38, 46);
+    t.panelBorder = rgb(80, 88, 100);
+    t.buttonBg    = rgb(88, 150, 255);
+    t.buttonText  = rgb(12, 16, 22);
+    t.inputBg     = rgb(52, 58, 68);
+    t.inputText   = rgb(235, 238, 242);
+    t.focusRing   = rgb(120, 170, 255);
+    t.track       = rgb(60, 66, 76);
+    t.accent      = rgb(88, 150, 255);
+    return t;
+}
+
 // ── UiContext (F5/F2): the host-owned per-app runtime state ───────────────────
 // Replaces the former library globals. A handler calls ctx.invalidate() to mark
 // the UI dirty; the host drains it once per loop (consumeDirty) and re-renders
@@ -394,6 +535,9 @@ struct UiContext
     bool   dirty    = false;     // a handler changed state -> re-render the tree
     bool   repaint  = false;     // layout/paint changed but the tree did not (scroll)
     string focusKey = default;   // "" = nothing focused
+    string hoverKey = default;   // "" = pointer over nothing interactive
+    string pressKey = default;   // "" = nothing pressed/held
+    Theme  theme    = default;   // styling preference; default = monochrome
 
     void invalidate() { this.dirty = true; }
 
@@ -420,6 +564,32 @@ struct UiContext
     void focus(string key) { this.focusKey = "" + key; }
     void blur() { this.focusKey = ""; }
     bool hasFocus(string key) { return this.focusKey.length() > 0 && this.focusKey == key; }
+
+    // Hover and press are pure PAINT state (no re-render): they request a repaint
+    // only when the identity actually changes, so dragging the pointer within one
+    // widget does not churn. The host clears hover (setHover("")) when a move hits
+    // nothing, and clears press on mouse-up.
+    void setHover(string key)
+    {
+        if (this.hoverKey == key) return;
+        this.hoverKey = "" + key;
+        this.repaint = true;
+    }
+    bool hasHover(string key) { return this.hoverKey.length() > 0 && this.hoverKey == key; }
+
+    void setPress(string key)
+    {
+        if (this.pressKey == key) return;
+        this.pressKey = "" + key;
+        this.repaint = true;
+    }
+    void clearPress()
+    {
+        if (this.pressKey.length() == 0) return;
+        this.pressKey = "";
+        this.repaint = true;
+    }
+    bool hasPress(string key) { return this.pressKey.length() > 0 && this.pressKey == key; }
 };
 
 // Node-kind tags - returned by Element.kind() so the reconciler can compare node
@@ -431,6 +601,9 @@ int ELEM_COMPONENT = 4;
 int ELEM_BOX       = 5;
 int ELEM_TEXTINPUT = 6;
 int ELEM_SCROLL    = 7;
+int ELEM_CHECKBOX  = 8;
+int ELEM_PROGRESS  = 9;
+int ELEM_SLIDER    = 10;
 
 // The node interface. Typed host structs implement these so the tree can be
 // walked uniformly (serialize, layout, paint, dispatch, reconcile, teardown)
@@ -487,18 +660,22 @@ class View : Element
     {
         int pad = this.style.padding;
         Size sz = default;
+        int gap = this.style.gap;
         if (this.style.flexDirection == DIR_ROW)
         {
             int cx = c.x + pad;
             int maxH = 0;
+            int i = 0;
             for (Element child in this.children)
             {
+                if (i > 0) cx = cx + gap;
                 LayoutConstraints cc = default;
                 cc.x = cx; cc.y = c.y + pad;
                 cc.availW = c.availW - 2 * pad; cc.availH = c.availH - 2 * pad;
                 Size cs = child.layout(cc);
                 cx = cx + cs.w;
                 if (cs.h > maxH) maxH = cs.h;
+                i++;
             }
             sz.w = c.availW;
             sz.h = maxH + 2 * pad;
@@ -506,13 +683,16 @@ class View : Element
         else
         {
             int cy = c.y + pad;
+            int i = 0;
             for (Element child in this.children)
             {
+                if (i > 0) cy = cy + gap;
                 LayoutConstraints cc = default;
                 cc.x = c.x + pad; cc.y = cy;
                 cc.availW = c.availW - 2 * pad; cc.availH = c.availH - 2 * pad;
                 Size cs = child.layout(cc);
                 cy = cy + cs.h;
+                i++;
             }
             sz.w = c.availW;
             sz.h = (cy - c.y) + pad;
@@ -526,6 +706,8 @@ class View : Element
 
     void paint(Canvas cv, UiContext* ctx)
     {
+        if (this.style.backgroundColor != 0)
+            cv.drawRect(this.bounds, true, this.style.backgroundColor);
         for (Element c in this.children)
             c.paint(cv, ctx);
     }
@@ -592,6 +774,7 @@ class View : Element
 class Text : Element
 {
     string text = default;
+    int    color = 0;           // rgb(); 0 = default ink
     Rect bounds = default;
     string key = default;
 
@@ -611,7 +794,8 @@ class Text : Element
 
     void paint(Canvas cv, UiContext* ctx)
     {
-        cv.drawText(this.bounds.x, this.bounds.y, this.text.data());
+        cv.drawText(this.bounds.x, this.bounds.y, this.text.data(),
+                    pickColor(this.color, ctx.theme.textColor));
     }
 
     bool dispatch(Event e, UiContext* ctx) { return false; }
@@ -638,6 +822,9 @@ class Button : Element
 {
     string title = default;
     Lambda<void()> onPress = default;
+    int    color = 0;               // label ink; 0 = default
+    int    backgroundColor = 0;     // button fill; 0 = no fill
+    bool   disabled = false;        // dimmed + ignores input
     Rect bounds = default;
     string key = default;
 
@@ -664,20 +851,48 @@ class Button : Element
 
     void paint(Canvas cv, UiContext* ctx)
     {
+        // Disabled: a flat dimmed fill + gray label, no hover/press/focus affordance.
+        if (this.disabled)
+        {
+            int dbg = dimColor(pickColor(this.backgroundColor, ctx.theme.buttonBg));
+            if (dbg != 0)
+                cv.drawRect(this.bounds, true, dbg);
+            string dl = "[ " + this.title + " ]";
+            cv.drawText(this.bounds.x, this.bounds.y, dl.data(),
+                        dimColor(pickColor(this.color, ctx.theme.buttonText)));
+            return;
+        }
+        // Pressed darkens the fill, hover lightens it (shade() leaves an unset
+        // monochrome button untouched). Pressed wins over hover.
+        int bg = pickColor(this.backgroundColor, ctx.theme.buttonBg);
+        if (ctx.hasPress(this.key))      bg = shade(bg, -40);
+        else if (ctx.hasHover(this.key)) bg = shade(bg, 28);
+        if (bg != 0)
+            cv.drawRect(this.bounds, true, bg);
+        if (ctx.hasFocus(this.key) && ctx.theme.focusRing != 0)
+            cv.drawRect(this.bounds, false, ctx.theme.focusRing);
         string rendered = "[ " + this.title + " ]";
-        cv.drawText(this.bounds.x, this.bounds.y, rendered.data());
+        cv.drawText(this.bounds.x, this.bounds.y, rendered.data(),
+                    pickColor(this.color, ctx.theme.buttonText));
     }
 
     bool dispatch(Event e, UiContext* ctx)
     {
+        if (this.disabled) return false;
         if (e.kind == EV_MOUSE_DOWN)
         {
             if (this.bounds.contains(e.x, e.y))
             {
-                ctx.focus(this.key);   // a press also moves focus here
+                ctx.focus(this.key);       // a press also moves focus here
+                ctx.setPress(this.key);    // held until the host sees mouse-up
                 this.fireClick();
                 return true;
             }
+            return false;
+        }
+        if (e.kind == EV_MOUSE_MOVE)
+        {
+            if (this.bounds.contains(e.x, e.y)) { ctx.setHover(this.key); return true; }
             return false;
         }
         if (e.kind == EV_KEY)
@@ -697,12 +912,12 @@ class Button : Element
     int kind() { return ELEM_BUTTON; }
     void collectFocusables(list<string>* keys)
     {
-        if (this.key.length() > 0) keys.add("" + this.key);
+        if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
     }
     bool propsEqual(Element other)
     {
         Button* o = other as Button;
-        return o != nullptr && this.title == o.title;
+        return o != nullptr && this.title == o.title && this.disabled == o.disabled;
     }
     list<Element>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -739,13 +954,16 @@ class Box : Element
 
         int inset = 1 + this.style.padding;
         int cy = c.y + inset;
+        int gi = 0;
         for (Element child in this.children)
         {
+            if (gi > 0) cy = cy + this.style.gap;
             LayoutConstraints cc = default;
             cc.x = c.x + inset; cc.y = cy;
             cc.availW = w - 2 * inset; cc.availH = h - 2 * inset;
             Size cs = child.layout(cc);
             cy = cy + cs.h;
+            gi++;
         }
 
         Size sz = default; sz.w = w; sz.h = h;
@@ -754,7 +972,10 @@ class Box : Element
 
     void paint(Canvas cv, UiContext* ctx)
     {
-        cv.drawRect(this.bounds, false);
+        int bg = pickColor(this.style.backgroundColor, ctx.theme.panelBg);
+        if (bg != 0)
+            cv.drawRect(this.bounds, true, bg);
+        cv.drawRect(this.bounds, false, pickColor(this.style.color, ctx.theme.panelBorder));
         for (Element c in this.children)
             c.paint(cv, ctx);
     }
@@ -824,6 +1045,9 @@ class TextInput : Element
     string placeholder = default;
     Lambda<void(string)> onChangeText = default;
     int    width  = 0;          // 0 -> sized to content
+    int    color = 0;               // text ink; 0 = default
+    int    backgroundColor = 0;     // field fill; 0 = no fill
+    bool   disabled = false;        // dimmed + ignores input
     Rect   bounds = default;
     string key    = default;
 
@@ -848,22 +1072,36 @@ class TextInput : Element
     {
         // Show the value, or the placeholder when empty; a focused field shows a
         // trailing '_' caret in the next cell.
+        int bg = pickColor(this.backgroundColor, ctx.theme.inputBg);
+        if (this.disabled) bg = dimColor(bg);
+        if (bg != 0)
+            cv.drawRect(this.bounds, true, bg);
+        if (!this.disabled && ctx.hasFocus(this.key) && ctx.theme.focusRing != 0)
+            cv.drawRect(this.bounds, false, ctx.theme.focusRing);
+        int ink = pickColor(this.color, ctx.theme.inputText);
+        if (this.disabled) ink = dimColor(ink);
         bool empty = this.value.length() == 0;
         string shown = "" + this.value;
         if (empty) shown = "" + this.placeholder;
-        cv.drawText(this.bounds.x, this.bounds.y, shown.data());
-        if (ctx.hasFocus(this.key))
+        cv.drawText(this.bounds.x, this.bounds.y, shown.data(), ink);
+        if (!this.disabled && ctx.hasFocus(this.key))
         {
             int caretX = this.bounds.x + (int)this.value.length();
-            cv.drawText(caretX, this.bounds.y, "_");
+            cv.drawText(caretX, this.bounds.y, "_", ink);
         }
     }
 
     bool dispatch(Event e, UiContext* ctx)
     {
+        if (this.disabled) return false;
         if (e.kind == EV_MOUSE_DOWN)
         {
             if (this.bounds.contains(e.x, e.y)) { ctx.focus(this.key); return true; }
+            return false;
+        }
+        if (e.kind == EV_MOUSE_MOVE)
+        {
+            if (this.bounds.contains(e.x, e.y)) { ctx.setHover(this.key); return true; }
             return false;
         }
         if (e.kind == EV_KEY)
@@ -895,12 +1133,264 @@ class TextInput : Element
     int kind() { return ELEM_TEXTINPUT; }
     void collectFocusables(list<string>* keys)
     {
-        if (this.key.length() > 0) keys.add("" + this.key);
+        if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
     }
     bool propsEqual(Element other)
     {
         TextInput* o = other as TextInput;
-        return o != nullptr && this.value == o.value;
+        return o != nullptr && this.value == o.value && this.disabled == o.disabled;
+    }
+    list<Element>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+};
+
+// ── Checkbox: a controlled on/off toggle with a label ────────────────────────
+// Controlled like TextInput: the parent owns `checked` and passes it down; a click
+// or Enter/Space while focused fires onChange(!checked) and the parent flips its
+// state + invalidates, so the next render flows the new value back. Rendered as
+// "[x] label" / "[ ] label"; themed ink, hover-highlights the label, focus ring,
+// disabled dims and ignores input - all via the same UiContext state as Button.
+class Checkbox : Element
+{
+    string label    = default;
+    bool   checked  = false;
+    bool   disabled = false;
+    Lambda<void(bool)> onChange = default;
+    int    color = 0;            // label ink; 0 = default
+    Rect   bounds = default;
+    string key   = default;
+
+    void fireToggle() { this.onChange(!this.checked); }
+
+    move string toJson()
+    {
+        string c = this.checked ? "true" : "false";
+        return "{\"type\":\"Checkbox\",\"checked\":" + c
+             + ",\"label\":\"" + this.label + "\"}";
+    }
+
+    Size layout(LayoutConstraints c)
+    {
+        Rect b = default;
+        b.x = c.x; b.y = c.y; b.w = (int)this.label.length() + 4; b.h = 1;  // "[x] " + label
+        this.bounds = b;
+        Size s = default; s.w = b.w; s.h = 1;
+        return s;
+    }
+
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        int ink = pickColor(this.color, ctx.theme.textColor);
+        if (this.disabled) ink = dimColor(ink);
+        else if (ctx.hasHover(this.key) && ctx.theme.focusRing != 0) ink = ctx.theme.focusRing;
+        if (!this.disabled && ctx.hasFocus(this.key) && ctx.theme.focusRing != 0)
+            cv.drawRect(this.bounds, false, ctx.theme.focusRing);
+        string mark = this.checked ? "[x] " : "[ ] ";
+        string shown = mark + this.label;
+        cv.drawText(this.bounds.x, this.bounds.y, shown.data(), ink);
+    }
+
+    bool dispatch(Event e, UiContext* ctx)
+    {
+        if (this.disabled) return false;
+        if (e.kind == EV_MOUSE_DOWN)
+        {
+            if (this.bounds.contains(e.x, e.y)) { ctx.focus(this.key); this.fireToggle(); return true; }
+            return false;
+        }
+        if (e.kind == EV_MOUSE_MOVE)
+        {
+            if (this.bounds.contains(e.x, e.y)) { ctx.setHover(this.key); return true; }
+            return false;
+        }
+        if (e.kind == EV_KEY)
+        {
+            if (ctx.hasFocus(this.key) && (e.key == KEY_ENTER || e.key == KEY_SPACE))
+            {
+                this.fireToggle();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void destroyTree() { }
+
+    int kind() { return ELEM_CHECKBOX; }
+    void collectFocusables(list<string>* keys)
+    {
+        if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
+    }
+    bool propsEqual(Element other)
+    {
+        Checkbox* o = other as Checkbox;
+        return o != nullptr && this.checked == o.checked && this.label == o.label
+            && this.disabled == o.disabled;
+    }
+    list<Element>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+};
+
+// ── ProgressBar: a non-interactive themed fill bar (value 0..100) ─────────────
+// Draws a trough (theme.track) with the filled fraction in theme.accent. Width is
+// in cells. Purely presentational - it takes no input and no focus.
+class ProgressBar : Element
+{
+    int    value = 0;          // 0..100
+    int    width = 20;         // cells
+    int    color = 0;          // fill override; 0 = theme accent
+    Rect   bounds = default;
+    string key = default;
+
+    int _clampPct(int v) { if (v < 0) return 0; if (v > 100) return 100; return v; }
+
+    move string toJson()
+    {
+        return "{\"type\":\"ProgressBar\",\"value\":" + this.value.toString() + "}";
+    }
+
+    Size layout(LayoutConstraints c)
+    {
+        int w = this.width; if (w < 2) w = 2;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = 1;
+        this.bounds = b;
+        Size s = default; s.w = w; s.h = 1;
+        return s;
+    }
+
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        int track = ctx.theme.track;
+        int fill  = pickColor(this.color, ctx.theme.accent);
+        if (track != 0) cv.drawRect(this.bounds, true, track);
+        cv.drawRect(this.bounds, false, track);   // outline (0 -> default black border)
+        int fw = this._clampPct(this.value) * this.bounds.w / 100;
+        if (fw > 0)
+        {
+            Rect fr = this.bounds; fr.w = fw;
+            cv.drawRect(fr, true, fill);
+        }
+    }
+
+    bool dispatch(Event e, UiContext* ctx) { return false; }
+    void destroyTree() { }
+    int kind() { return ELEM_PROGRESS; }
+    void collectFocusables(list<string>* keys) { }
+    bool propsEqual(Element other)
+    {
+        ProgressBar* o = other as ProgressBar;
+        return o != nullptr && this.value == o.value && this.width == o.width;
+    }
+    list<Element>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+};
+
+// ── Slider: an interactive value (0..100) set by click/drag or arrow keys ─────
+// Click or drag along the track to set the value; while focused, Left/Right step
+// it by 5. Renders a filled portion + a thumb in theme.accent and a focus ring.
+// Controlled: fires onChange(newValue); the parent owns the value.
+class Slider : Element
+{
+    int    value = 0;          // 0..100
+    int    width = 20;         // cells
+    bool   disabled = false;
+    Lambda<void(int)> onChange = default;
+    Rect   bounds = default;
+    string key = default;
+
+    void fireSet(int v)
+    {
+        if (v < 0) v = 0; if (v > 100) v = 100;
+        this.onChange(v);
+    }
+
+    // Map a cell x along the track to a 0..100 value.
+    int _valueAt(int px)
+    {
+        int span = this.bounds.w - 1; if (span < 1) span = 1;
+        int v = (px - this.bounds.x) * 100 / span;
+        if (v < 0) v = 0; if (v > 100) v = 100;
+        return v;
+    }
+
+    move string toJson()
+    {
+        return "{\"type\":\"Slider\",\"value\":" + this.value.toString() + "}";
+    }
+
+    Size layout(LayoutConstraints c)
+    {
+        int w = this.width; if (w < 3) w = 3;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = 1;
+        this.bounds = b;
+        Size s = default; s.w = w; s.h = 1;
+        return s;
+    }
+
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        int track = ctx.theme.track;
+        int fill  = ctx.theme.accent;
+        if (this.disabled) { track = dimColor(track); fill = dimColor(fill); }
+        if (track != 0) cv.drawRect(this.bounds, true, track);
+        cv.drawRect(this.bounds, false, track);
+        int v = this.value; if (v < 0) v = 0; if (v > 100) v = 100;
+        int fw = v * this.bounds.w / 100;
+        if (fw > 0) { Rect fr = this.bounds; fr.w = fw; cv.drawRect(fr, true, fill); }
+        // Thumb: a one-cell marker at the filled end.
+        int tx = this.bounds.x + fw;
+        if (tx >= this.bounds.x + this.bounds.w) tx = this.bounds.x + this.bounds.w - 1;
+        Rect th = default; th.x = tx; th.y = this.bounds.y; th.w = 1; th.h = 1;
+        cv.drawRect(th, true, fill);
+        if (!this.disabled && ctx.hasFocus(this.key) && ctx.theme.focusRing != 0)
+            cv.drawRect(this.bounds, false, ctx.theme.focusRing);
+    }
+
+    bool dispatch(Event e, UiContext* ctx)
+    {
+        if (this.disabled) return false;
+        if (e.kind == EV_MOUSE_DOWN)
+        {
+            if (this.bounds.contains(e.x, e.y))
+            {
+                ctx.focus(this.key);
+                ctx.setPress(this.key);
+                this.fireSet(this._valueAt(e.x));
+                return true;
+            }
+            return false;
+        }
+        if (e.kind == EV_MOUSE_MOVE)
+        {
+            // While pressed, dragging anywhere updates the value (basic capture).
+            if (ctx.hasPress(this.key)) { this.fireSet(this._valueAt(e.x)); return true; }
+            if (this.bounds.contains(e.x, e.y)) { ctx.setHover(this.key); return true; }
+            return false;
+        }
+        if (e.kind == EV_KEY)
+        {
+            if (ctx.hasFocus(this.key))
+            {
+                if (e.key == KEY_LEFT)  { this.fireSet(this.value - 5); return true; }
+                if (e.key == KEY_RIGHT) { this.fireSet(this.value + 5); return true; }
+            }
+        }
+        return false;
+    }
+
+    void destroyTree() { }
+    int kind() { return ELEM_SLIDER; }
+    void collectFocusables(list<string>* keys)
+    {
+        if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
+    }
+    bool propsEqual(Element other)
+    {
+        Slider* o = other as Slider;
+        return o != nullptr && this.value == o.value && this.disabled == o.disabled;
     }
     list<Element>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -965,6 +1455,8 @@ class ScrollView : Element
 
     void paint(Canvas cv, UiContext* ctx)
     {
+        if (this.style.backgroundColor != 0)
+            cv.drawRect(this.bounds, true, this.style.backgroundColor);
         cv.pushClip(this.bounds);
         for (Element c in this.children)
             c.paint(cv, ctx);
@@ -982,6 +1474,17 @@ class ScrollView : Element
             }
             ctx.focus(this.key);   // empty viewport area -> focus for keyboard scroll
             return true;
+        }
+        if (e.kind == EV_MOUSE_MOVE || e.kind == EV_MOUSE_UP)
+        {
+            // Forward hover/release to children only while the pointer is inside
+            // the viewport, so a child inside the scroll area can hover.
+            if (!this.bounds.contains(e.x, e.y)) return false;
+            for (Element c in this.children)
+            {
+                if (c.dispatch(e, ctx)) return true;
+            }
+            return false;
         }
         if (e.kind == EV_KEY)
         {
@@ -1104,6 +1607,35 @@ TextInput* textInput(string value, Lambda<void(string)> onChangeText)
     t.value = value;
     t.onChangeText = onChangeText;
     return t;
+}
+
+// A controlled checkbox bound to `checked` with an onChange(bool) handler.
+Checkbox* checkbox(string label, bool checked, Lambda<void(bool)> onChange)
+{
+    Checkbox* c = new Checkbox();
+    c.label = label;
+    c.checked = checked;
+    c.onChange = onChange;
+    return c;
+}
+
+// A presentational progress bar (value 0..100) `width` cells wide.
+ProgressBar* progressBar(int value, int width)
+{
+    ProgressBar* p = new ProgressBar();
+    p.value = value;
+    p.width = width;
+    return p;
+}
+
+// A controlled slider bound to `value` (0..100) with an onChange(int) handler.
+Slider* slider(int value, int width, Lambda<void(int)> onChange)
+{
+    Slider* s = new Slider();
+    s.value = value;
+    s.width = width;
+    s.onChange = onChange;
+    return s;
 }
 
 ScrollView* scrollView(Style style)

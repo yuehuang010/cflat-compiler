@@ -29,6 +29,10 @@ class BoxApp : Component
 
     Element render(UiContext* ctx)
     {
+        // Declare the app's styling preference once; widgets that set no color of
+        // their own inherit it. Try darkTheme() for the charcoal variant.
+        ctx.theme = lightTheme();
+
         // Outer box fills the window (in cells); it rescales on resize because
         // render() re-reads the host size every time the host rebuilds the tree.
         Box* root = box(makeStyle(0, hostWidth(), hostHeight()));
@@ -69,9 +73,16 @@ class BoxApp : Component
 extern int main(int argc, char** argv)
 {
     // Headless GDI readback self-test path (example.bat passes --selftest); no
-    // window is created.
+    // window is created. Runs the geometry test and the interaction-state test.
     if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
-        return guiSelfTest();
+    {
+        int rc = guiSelfTest();
+        int rc2 = guiStateSelfTest();
+        int rc3 = guiWidgetSelfTest();
+        if (rc != 0) return rc;
+        if (rc2 != 0) return rc2;
+        return rc3;
+    }
 
     BoxApp app;
     app.clicks = 0;
