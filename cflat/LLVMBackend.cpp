@@ -995,16 +995,7 @@ static const std::vector<std::string>& PosixSystemIncludeDirs()
         // SDK. Prefer $SDKROOT, else `xcrun --show-sdk-path`, then <sdk>/usr/include.
         std::string sdk;
         if (const char* env = std::getenv("SDKROOT")) sdk = env;
-        if (sdk.empty())
-        {
-            if (FILE* p = popen("xcrun --show-sdk-path 2>/dev/null", "r"))
-            {
-                char buf[1024];
-                if (fgets(buf, sizeof(buf), p)) sdk = buf;
-                pclose(p);
-                while (!sdk.empty() && (sdk.back() == '\n' || sdk.back() == '\r')) sdk.pop_back();
-            }
-        }
+        if (sdk.empty()) sdk = CaptureToolLine("xcrun --show-sdk-path 2>/dev/null");
         if (!sdk.empty())
         {
             std::string inc = sdk + "/usr/include";

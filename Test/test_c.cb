@@ -589,6 +589,32 @@ bool testBitfields()
     return result;
 }
 
+// Regression: int -> pointer casts must widen with the source's sign before
+// inttoptr (which zero-extends), so negative sentinels like RTLD_DEFAULT
+// ((void*)-2) keep their high bits. Unsigned sources stay zero-extended.
+bool testIntToPtrCast()
+{
+    bool result = true;
+
+    int m = -2;
+    result &= Test("intneg_to_ptr_var",     (long long)(void*)m, -2LL);
+    result &= Test("intneg_to_ptr_literal", (long long)(void*)(-2), -2LL);
+
+    i8 s8 = -2;
+    result &= Test("i8neg_to_ptr",          (long long)(void*)s8, -2LL);
+
+    u32 ux = 0xFFFFFFFFu;
+    result &= Test("u32_to_ptr_zext",       (long long)(void*)ux, 4294967295LL);
+
+    // Assignment path (Upconvert) rather than an explicit cast expression.
+    void* p = (void*)m;
+    result &= Test("intneg_to_ptr_assign",  (long long)p, -2LL);
+    void* z = (void*)0;
+    result &= Test("zero_to_ptr_null",      (long long)z, 0LL);
+
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // Test the tests
@@ -642,6 +668,7 @@ extern int main(int argc, char** argv)
     result &= Test("testUpconvert",          testUpconvert(), true);
     result &= Test("testShortCircuitIf",     testShortCircuitIf(), true);
     result &= Test("testBitfields",          testBitfields(), true);
+    result &= Test("testIntToPtrCast",       testIntToPtrCast(), true);
 
     if (result)
     {

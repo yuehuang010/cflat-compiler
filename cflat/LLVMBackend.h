@@ -296,6 +296,23 @@ inline std::string DequoteStringLiteral(const std::string& raw)
     return raw.size() >= 2 ? raw.substr(1, raw.size() - 2) : raw;
 }
 
+#if defined(__APPLE__)
+// Run a shell command and return its trimmed first stdout line ("" on failure).
+// Used for xcrun SDK discovery and the clang compiler-rt resource dir.
+inline std::string CaptureToolLine(const char* cmd)
+{
+    std::string out;
+    if (FILE* p = popen(cmd, "r"))
+    {
+        char buf[1024];
+        if (fgets(buf, sizeof(buf), p)) out = buf;
+        pclose(p);
+        while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    }
+    return out;
+}
+#endif
+
 class LLVMBackend
 {
 public:
@@ -2933,21 +2950,6 @@ private:
         }
         if (auto p = llvm::sys::findProgramByName("ld64.lld")) return *p;
         return "";
-    }
-
-    // Run a shell command and return its trimmed first stdout line ("" on failure).
-    // Used for xcrun SDK discovery and the clang compiler-rt resource dir.
-    static std::string CaptureToolLine(const char* cmd)
-    {
-        std::string out;
-        if (FILE* p = popen(cmd, "r"))
-        {
-            char buf[1024];
-            if (fgets(buf, sizeof(buf), p)) out = buf;
-            pclose(p);
-            while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
-        }
-        return out;
     }
 #endif
 
@@ -9071,7 +9073,16 @@ public:
             {
                 if (constInt->isZero())
                     return llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(destType));
-                return builder->CreateIntToPtr(constInt, destType);
+            }
+            // Widen to pointer width with sign semantics before inttoptr (which
+            // zero-extends), so a negative sentinel keeps its high bits.
+            unsigned ptrBits = module->getDataLayout().getPointerSizeInBits();
+            if (srcType->getIntegerBitWidth() < ptrBits)
+            {
+                auto* ptrInt = llvm::Type::getIntNTy(*context, ptrBits);
+                value = (srcIsUnsigned || srcType->getIntegerBitWidth() == 1)
+                    ? builder->CreateZExt(value, ptrInt)
+                    : builder->CreateSExt(value, ptrInt);
             }
             return builder->CreateIntToPtr(value, destType);
         }
@@ -9225,7 +9236,14 @@ public:
 
         // Integer -> Pointer
         if (srcType->isIntegerTy() && destType->isPointerTy())
+        {
+            // inttoptr zero-extends a narrow source; widen with the source's sign
+            // first so (void*)(-2) yields 0xff...fe (RTLD_DEFAULT-style sentinels).
+            unsigned ptrBits = module->getDataLayout().getPointerSizeInBits();
+            if (srcType->getIntegerBitWidth() < ptrBits)
+                value = CreateCast(value, llvm::Type::getIntNTy(*context, ptrBits), isSigned);
             return builder->CreateIntToPtr(value, destType);
+        }
 
         // Pointer -> Pointer (reinterpret)
         if (srcType->isPointerTy() && destType->isPointerTy())
