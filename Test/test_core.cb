@@ -1336,6 +1336,16 @@ move string pickName(u32 i)
     else         { string b = "other"; return b.copy(); }
 }
 
+// Helper for the owned-string ternary regression below. `name` is an owned heap
+// buffer; `pick` returns a ternary whose non-default branch reads that field. The
+// select used to shallow-alias the field's buffer (owned bit rode along), so the
+// caller's owned-bit-gated dtor freed a buffer the field still owned (use-after-free).
+class TernBox {
+    string name = default;
+    void set(string s) { this.name = s; }
+    string pick(bool cond) { string who = cond ? this.name : "-"; return who.copy(); }
+};
+
 // Return-by-value of a struct whose destructor frees owned string fields. The local
 // `o`'s destructor must be SKIPPED on the return (ownership moves to the caller) or the
 // returned value dangles and the caller's destruction double-frees. g_owned_ret_dtor
@@ -1721,6 +1731,27 @@ int testStringAPI()
         passed += Test("helper-return owned-string 0", n0, "known");
         passed += Test("helper-return owned-string 1", n1, "other");
     }
+    // Owned-string TERNARY regression: a conditional whose branch reads an owning
+    // string field/local used to shallow-alias that buffer, then free it at scope
+    // exit (use-after-free / heap corruption). The ternary now deep-copies its
+    // string result into an independent owned buffer. ASan-clean.
+    {
+        TernBox* tb = new TernBox();
+        tb->set("hel" + (2).toString());          // owned heap buffer, not a literal
+        string a = tb->pick(true);                // field branch selected
+        string b = tb->pick(false);               // literal branch selected
+        passed += Test("ternary field-branch owned", a, "hel2");
+        passed += Test("ternary literal-branch owned", b, "-");
+        passed += Test("ternary source field intact", tb->name, "hel2");
+        delete tb;                                 // frees name exactly once
+
+        // Substring branch: an owned temp on one side, a literal on the other.
+        string src = "hello world";
+        bool cond = true;
+        string sub = cond ? src.substring(0, 5) : "-";
+        passed += Test("ternary substring-branch", sub, "hello");
+        passed += Test("ternary substring source intact", src, "hello world");
+    }
     // Regression (plan-03): a method call on a parenthesized (cast) expression. The
     // receiver is a by-value struct with no addressable storage; it used to fail with
     // "unknown function '((string)buf)'". Materializing it to a temp now lets the method
@@ -1815,7 +1846,7 @@ extern int main()
     r = testStringSwitch();     passed += r; total += 6;
     r = testStringBuilder();    passed += r; total += 20;
     r = testStringView();       passed += r; total += 12;
-    r = testStringAPI();        passed += r; total += 109;
+    r = testStringAPI();        passed += r; total += 114;
     r = testDiscard();          passed += r; total += 3;
 
     printf("\n%d / %d tests passed.\n", passed, total);

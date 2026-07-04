@@ -7014,7 +7014,15 @@ public:
 
             // Owning-value MOVE at reassignment: a shallow store aliases owned buffers (double-free).
             // Destruct the old destination first, then move source bits into it and zero the source.
+            // Interface targets are excluded: the upcast above replaced `right` with a fat-ptr that
+            // ALIASES the source's storage (dataPtr = &source), so zeroing the source would corrupt
+            // the object the interface now points at (it reads back default/zero fields). An owning-
+            // value bound to an interface is a borrow of the source storage - the source keeps
+            // ownership and frees at scope exit (heap-`new` is the way to hand an interface an
+            // independently-owned object). This mirrors the pointer source case, which is likewise
+            // excluded by `!rightNV.TypeAndValue.Pointer`.
             if (operatorText == "=" && right && right->getType()->isStructTy()
+                && !namedVar.TypeAndValue.IsInterface
                 && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination))
                 && rightNV.Storage != nullptr
                 && (llvm::isa<llvm::AllocaInst>(rightNV.Storage) || llvm::isa<llvm::GlobalVariable>(rightNV.Storage))
@@ -7324,6 +7332,27 @@ public:
                 }
 
                 auto* selectValue = compiler->CreateSelect(condTv.value, falseValue, trueValue);
+
+                // Owning-string ternary: a branch that reads an owning string FIELD or a named
+                // owning local (`cond ? this.name : "-"`) yields a struct whose OWNED bit rides
+                // along with the aliased buffer pointer. The select copies that struct verbatim,
+                // so the ternary result shallow-aliases the branch's buffer; binding it to a local
+                // (whose owned-bit-gated dtor then fires) frees a buffer the field/local still owns
+                // (use-after-free). Deep-copy the selected string into an independent owned buffer
+                // (always safe, mirrors the manual `"" + this.name` workaround and the direct
+                // `string x = obj.name` deep-copy path), then hand it back as an owned temporary so
+                // the standard owned-temp machinery frees it if it is not moved into a named local.
+                auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string");
+                if (strTy != nullptr && selectValue != nullptr && selectValue->getType() == strTy)
+                {
+                    auto* owned = compiler->EmitOwnedStringDeepCopy(selectValue);
+                    if (owned != selectValue)
+                    {
+                        compiler->RegisterOwnedStringTemp(owned);
+                        compiler->lastCallReturnsOwned = true;
+                        return { owned, true };
+                    }
+                }
                 return { selectValue, false };
             }
 

@@ -906,6 +906,54 @@ bool testInterfaceFieldString()
     return result;
 }
 
+// A class that is an OWNING value type (has a string field) bound to an interface
+// slot BY VALUE (stack instance, not `new`). Regression for the interface-bind
+// owning-value zeroing bug: binding used to MOVE-zero the aliased source, so reads
+// through the interface (and the source) returned default field values. The bind is
+// a borrow of the source storage - the source keeps ownership and stays intact.
+interface IStackBox
+{
+    int getV();
+    string getName();
+};
+
+class StackBox : IStackBox
+{
+    int v = 40;
+    string name = default;
+    int getV()       { return this.v; }
+    string getName() { return "" + this.name; }
+};
+
+IStackBox gStackBox = default;
+
+// ── Test 24: owning-value class bound to an interface slot by value ───────────
+bool testStackOwningValueBoxedToInterface()
+{
+    bool result = true;
+
+    // Assignment form (`_g = c`): global interface slot bound to a stack value.
+    StackBox c;
+    c.v = 41;
+    c.name = "hel" + c.v.toString();           // owned heap buffer, not a literal
+    gStackBox = c;                             // bind by value (borrow of c)
+    result &= Test("stackbox_assign_v",     gStackBox.getV(),        41);
+    result &= Test("stackbox_assign_name",  gStackBox.getName(),     "hel41");
+    result &= Test("stackbox_src_v",        c.v,                     41);
+    result &= Test("stackbox_src_name",     c.name,                  "hel41");
+
+    // Declaration-init form (`I x = c`): local interface slot bound to a stack value.
+    StackBox d;
+    d.v = 42;
+    d.name = "nm" + d.v.toString();
+    IStackBox ix = d;
+    result &= Test("stackbox_decl_v",       ix.getV(),               42);
+    result &= Test("stackbox_decl_name",    ix.getName(),            "nm42");
+    result &= Test("stackbox_decl_src",     d.name,                  "nm42");
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -933,6 +981,7 @@ extern int main()
     total++; passed += testStringInterfaceChannel()      ? 1 : 0;
     total++; passed += testStringFieldThroughInterface() ? 1 : 0;
     total++; passed += testStringFieldMoveInterface()    ? 1 : 0;
+    total++; passed += testStackOwningValueBoxedToInterface() ? 1 : 0;
     total++; passed += testInterfaceFieldString()        ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
