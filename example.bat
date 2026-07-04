@@ -161,6 +161,42 @@ if "%~1"=="--worker-fedit" (
 )
 
 REM ===========================================================================
+REM Worker mode: WinUI 3 (Windows App SDK) self-test - bring up a real XAML window
+REM from an unpackaged exe and drive it headlessly via UI Automation. Gated on the
+REM assertion exit code only: --heap-audit is INCOMPATIBLE with the WinAppSDK runtime
+REM (Application/Window/DispatcherQueue are process-lived singletons never torn down
+REM before ExitProcess, and the runtime allocates through its own heaps), so it is not
+REM used here. WINUISDK is the discovered Windows App SDK foundation package root.
+REM ===========================================================================
+if "%~1"=="--worker-winui" (
+    set "FILE=%~2"
+    set "RESID=%~3"
+    set "CFLAT=x64\%CONFIG%\cflat.exe"
+    set "OUTDIR=out\examples"
+    set "RESDIR=out\examples\results"
+    for %%A in ("!FILE!") do (set "WNAME=%%~nxA" & set "WBASE=%%~nA")
+    set "WEXE=!OUTDIR!\!WBASE!_wui.exe"
+    set "WLOG=!RESDIR!\!RESID!.log"
+    set "BOOTLIB=!WINUISDK!\lib\native\x64\Microsoft.WindowsAppRuntime.Bootstrap.lib"
+    set "BOOTDLL=!WINUISDK!\runtimes\win-x64\native\Microsoft.WindowsAppRuntime.Bootstrap.dll"
+
+    "!CFLAT!" "!FILE!" -i example/ui/winui -i example/ui -i example/ui/winui/winmd --c-lib "!BOOTLIB!" -o "!WEXE!" > "!WLOG!" 2>&1
+    if not exist "!WEXE!" (
+        echo FAIL !WNAME! ^(winui self-test build failed^)>"!RESDIR!\!RESID!.result"
+        exit /b
+    )
+    copy /y "!BOOTDLL!" "!OUTDIR!\Microsoft.WindowsAppRuntime.Bootstrap.dll" >nul 2>&1
+    "!WEXE!" --selftest >> "!WLOG!" 2>&1
+    set WRC=!errorlevel!
+    if !WRC! neq 0 (
+        echo FAIL !WNAME! ^(winui self-test, exit !WRC!^)>"!RESDIR!\!RESID!.result"
+    ) else (
+        echo PASS !WNAME! ^(winui self-test^)>"!RESDIR!\!RESID!.result"
+    )
+    exit /b
+)
+
+REM ===========================================================================
 REM Main: launch all example builds + self-tests in parallel, wait, collect
 REM ===========================================================================
 set CONFIG=%1
@@ -201,7 +237,9 @@ REM explicit -i to that package. We discover it below and compile the demo when 
 REM on a host without the package it is skipped.
 REM example/macos/* target Darwin (dlopen of AppKit, sysctl, libproc) and are
 REM excluded from this Windows run; compile them on a Mac instead.
-set EXCLUDE=test_helper ui ui_native win32host win32_native_host fedit http_parser http_response http_json http_server http_client router rest_server http_io cocoa hello_objc cocoa_window sysinfo_mac
+REM winui_host has no main (imported); the two winui demos need the Windows App SDK
+REM bootstrapper + runtime winmds and are launched via the dedicated --worker-winui below.
+set EXCLUDE=test_helper ui ui_native win32host win32_native_host fedit http_parser http_response http_json http_server http_client router rest_server http_io cocoa hello_objc cocoa_window sysinfo_mac winui_host winui_app_demo winui_demo
 
 REM Discover the newest cached Win32-metadata package dir (the one holding Windows.Win32.winmd).
 REM dir /o-n lists newest-version-first by name. Empty if the nuget package is not installed
@@ -212,6 +250,15 @@ for /f "delims=" %%D in ('dir /b /ad /o-n "!WIN32MD_ROOT!" 2^>nul') do (
     if not defined WIN32MD if exist "!WIN32MD_ROOT!\%%D\Windows.Win32.winmd" set "WIN32MD=!WIN32MD_ROOT!\%%D"
 )
 if not defined WIN32MD set EXCLUDE=%EXCLUDE% direct2d_demo
+
+REM Discover the newest Windows App SDK foundation package (holds the unpackaged bootstrapper
+REM .lib/.dll). Empty if not installed for this user, in which case the WinUI 3 self-tests are
+REM skipped rather than failing on a missing --c-lib.
+set "WINUISDK="
+set "WINUISDK_ROOT=%USERPROFILE%\.nuget\packages\microsoft.windowsappsdk.foundation"
+for /f "delims=" %%D in ('dir /b /ad /o-n "!WINUISDK_ROOT!" 2^>nul') do (
+    if not defined WINUISDK if exist "!WINUISDK_ROOT!\%%D\lib\native\x64\Microsoft.WindowsAppRuntime.Bootstrap.lib" set "WINUISDK=!WINUISDK_ROOT!\%%D"
+)
 
 REM Warm the compiler cache (linker paths + core-library bitcode) once up front so the
 REM parallel worker compiles load bitcode instead of re-parsing the stdlib closure each time.
@@ -261,6 +308,20 @@ REM Launch the fedit editor state-assert self-test (P4 flagship).
 set /a RESID+=1
 set /a LAUNCHED+=1
 start "" /b cmd /c "%SCRIPT% --worker-fedit ex_!RESID!"
+
+REM Launch the WinUI 3 (Windows App SDK) self-tests (P6 M2 window bring-up + M3 host),
+REM only when the App SDK foundation package is present. Skipped otherwise.
+if defined WINUISDK (
+    for %%W in (example\ui\winui\winui_app_demo.cb example\ui\winui\winui_demo.cb) do (
+        set /a RESID+=1
+        set /a LAUNCHED+=1
+        start "" /b cmd /c "%SCRIPT% --worker-winui %%W ex_!RESID!"
+    )
+) else (
+    set /a SKIPPED+=2
+    echo SKIP: example\ui\winui\winui_app_demo.cb ^(Windows App SDK not installed^)
+    echo SKIP: example\ui\winui\winui_demo.cb ^(Windows App SDK not installed^)
+)
 
 REM Wait for all workers to finish (up to TIMEOUT_SECS).
 set /a WAITED=0

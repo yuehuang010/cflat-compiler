@@ -241,6 +241,33 @@ struct dictionary<K, V>
         return get(key);
     }
 
+    // Return an independent deep copy of this dictionary. The copy owns its own backing
+    // arrays; string keys and string values are deep-copied so each dictionary frees its
+    // own buffers. Primitive and pointer keys/values are copied by value (a dictionary of
+    // pointer values shares pointees - same contract as list.copy()).
+    move dictionary<K, V> copy()
+    {
+        dictionary<K, V> result;
+        if (_capacity == 0) return move result;
+        result._init(_capacity);
+        int i = 0;
+        while (i < _capacity)
+        {
+            // Preserve the exact table layout (empty/occupied/deleted) so probe sequences match.
+            result._status[i] = _status[i];
+            if (_status[i] == 1)
+            {
+                if const (is_string(K))  result._keys[i]   = _keys[i].copy();
+                if const (!is_string(K)) result._keys[i]   = _keys[i];
+                if const (is_string(V))  result._values[i] = _values[i].copy();
+                if const (!is_string(V)) result._values[i] = _values[i];
+            }
+            i++;
+        }
+        result._count = _count;
+        return move result;
+    }
+
     // Free owned values and string keys, then the backing arrays.
     ~dictionary()
     {

@@ -127,6 +127,12 @@ def collect_files(include_win32_demo: bool) -> list[Path]:
     if not include_win32_demo:
         demo = (REPO_ROOT / WIN32_METADATA_DEMO).resolve()
         files = [f for f in files if f.resolve() != demo]
+    # example/ui/winui/* import the WinUI 3 runtime winmds (Microsoft.UI.Xaml.winmd) from a
+    # sibling `winmd/` dir plus the Windows App SDK bootstrapper; the bare sweep has neither
+    # the -i dir nor the App SDK, so it cannot resolve them. They are exercised by example.bat's
+    # --worker-winui gate with the right flags. Skip them here (like the Win32-metadata demo).
+    winui_dir = (REPO_ROOT / "example" / "ui" / "winui").resolve()
+    files = [f for f in files if winui_dir not in f.resolve().parents]
     return files
 
 

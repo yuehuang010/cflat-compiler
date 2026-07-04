@@ -2279,17 +2279,58 @@ private:
         auto* closureTy = GetClosureFatPtrType();
         auto* i8PtrTy   = builder->getInt8Ty()->getPointerTo();
         auto* voidTy    = llvm::Type::getVoidTy(*context);
+        auto* i64Ty     = builder->getInt64Ty();
+        auto* i32Ty     = builder->getInt32Ty();
 
-        // Destructor: free the heap env (no-op if borrowed/null) and null the field.
+        // A per-closure capture-cleanup fn (`void(i8* dst, i8* src, i32 mode)`) is stashed in the
+        // env header at (captures - 8) by __closure_env_new, or null for a scalar-only closure.
+        // Load it from a TAGGED, non-null owned env; returns null if env is null/borrowed/no-cleanup.
+        auto* cleanupFnTy = llvm::FunctionType::get(voidTy, { i8PtrTy, i8PtrTy, i32Ty }, false);
+        auto loadCleanup = [&](llvm::IRBuilder<>& b, llvm::Value* env) -> llvm::Value* {
+            auto* envInt  = b.CreatePtrToInt(env, i64Ty);
+            auto* capAddr = b.CreateAnd(envInt, b.getInt64(~(uint64_t)1));
+            auto* slotAddr = b.CreateSub(capAddr, b.getInt64(8));
+            auto* slotPtr = b.CreateIntToPtr(slotAddr, cleanupFnTy->getPointerTo()->getPointerTo());
+            return b.CreateLoad(cleanupFnTy->getPointerTo(), slotPtr, "cleanupfn");
+        };
+        auto envIsOwned = [&](llvm::IRBuilder<>& b, llvm::Value* env) -> llvm::Value* {
+            auto* envInt = b.CreatePtrToInt(env, i64Ty);
+            return b.CreateICmpNE(b.CreateAnd(envInt, b.getInt64(1)), b.getInt64(0));
+        };
+        auto capPtrOf = [&](llvm::IRBuilder<>& b, llvm::Value* env) -> llvm::Value* {
+            auto* envInt  = b.CreatePtrToInt(env, i64Ty);
+            auto* capAddr = b.CreateAnd(envInt, b.getInt64(~(uint64_t)1));
+            return b.CreateIntToPtr(capAddr, i8PtrTy);
+        };
+
+        // Destructor: destruct owning captures (via the header cleanup fn), free the heap env
+        // (no-op if borrowed/null), and null the field.
         {
             auto* dtorTy = llvm::FunctionType::get(voidTy, { closureTy->getPointerTo() }, false);
             auto* dtorFn = llvm::Function::Create(dtorTy, llvm::Function::InternalLinkage,
                                                   "__closure_fat_ptr.dtor", *module);
             dtorFn->arg_begin()->setName("self");
-            llvm::IRBuilder<> b(llvm::BasicBlock::Create(*context, "entry", dtorFn));
+            auto* entry = llvm::BasicBlock::Create(*context, "entry", dtorFn);
+            auto* ownBB = llvm::BasicBlock::Create(*context, "owned", dtorFn);
+            auto* callBB = llvm::BasicBlock::Create(*context, "callcleanup", dtorFn);
+            auto* freeBB = llvm::BasicBlock::Create(*context, "freeenv", dtorFn);
+            llvm::IRBuilder<> b(entry);
             auto* self   = &*dtorFn->arg_begin();
             auto* envPtr = b.CreateStructGEP(closureTy, self, 1, "envfield");
             auto* env    = b.CreateLoad(i8PtrTy, envPtr, "env");
+            b.CreateCondBr(envIsOwned(b, env), ownBB, freeBB);
+
+            b.SetInsertPoint(ownBB);
+            auto* cleanup = loadCleanup(b, env);
+            b.CreateCondBr(b.CreateICmpNE(cleanup,
+                llvm::ConstantPointerNull::get(cleanupFnTy->getPointerTo())), callBB, freeBB);
+
+            b.SetInsertPoint(callBB);
+            b.CreateCall(cleanupFnTy, cleanup,
+                { capPtrOf(b, env), llvm::ConstantPointerNull::get(i8PtrTy), b.getInt32(0) });
+            b.CreateBr(freeBB);
+
+            b.SetInsertPoint(freeBB);
             b.CreateCall(freeFn->getFunctionType(), freeFn, { env });
             b.CreateStore(llvm::ConstantPointerNull::get(i8PtrTy), envPtr);
             b.CreateRetVoid();
@@ -2303,11 +2344,28 @@ private:
             auto* copyFn = llvm::Function::Create(copyTy, llvm::Function::InternalLinkage,
                                                   "__closure_fat_ptr.copy", *module);
             copyFn->arg_begin()->setName("self");
-            llvm::IRBuilder<> b(llvm::BasicBlock::Create(*context, "entry", copyFn));
+            auto* entry  = llvm::BasicBlock::Create(*context, "entry", copyFn);
+            auto* ownBB  = llvm::BasicBlock::Create(*context, "owned", copyFn);
+            auto* callBB = llvm::BasicBlock::Create(*context, "callcleanup", copyFn);
+            auto* doneBB = llvm::BasicBlock::Create(*context, "done", copyFn);
+            llvm::IRBuilder<> b(entry);
             auto* self   = &*copyFn->arg_begin();
             auto* code   = b.CreateExtractValue(self, { 0u }, "code");
             auto* env    = b.CreateExtractValue(self, { 1u }, "env");
             auto* newEnv = b.CreateCall(cloneFn->getFunctionType(), cloneFn, { env }, "clonedenv");
+            // Deep-copy owning captures into the fresh env (the byte-clone left them aliasing src).
+            b.CreateCondBr(envIsOwned(b, newEnv), ownBB, doneBB);
+
+            b.SetInsertPoint(ownBB);
+            auto* cleanup = loadCleanup(b, newEnv);
+            b.CreateCondBr(b.CreateICmpNE(cleanup,
+                llvm::ConstantPointerNull::get(cleanupFnTy->getPointerTo())), callBB, doneBB);
+
+            b.SetInsertPoint(callBB);
+            b.CreateCall(cleanupFnTy, cleanup, { capPtrOf(b, newEnv), capPtrOf(b, env), b.getInt32(1) });
+            b.CreateBr(doneBB);
+
+            b.SetInsertPoint(doneBB);
             llvm::Value* fat = llvm::UndefValue::get(closureTy);
             fat = b.CreateInsertValue(fat, code,   { 0u });
             fat = b.CreateInsertValue(fat, newEnv, { 1u });
@@ -2610,6 +2668,40 @@ private:
         return false;
     }
 
+    // True when `typeName` has an AUTHOR-written (library/user) copy() - not the memberwise
+    // synth generated on demand. The synth is registered under "<type>.copy.synth"; a real
+    // copy is anything else. This is the deep-copy guarantee a container (list/dictionary)
+    // gives via its own copy() vs. the shallow pointer-field byte copy the synth would do.
+    bool HasRealCopyOverloadFor(const std::string& typeName) const
+    {
+        auto it = functionTable.find("copy");
+        if (it == functionTable.end()) return false;
+        const std::string synthName = typeName + ".copy.synth";
+        for (const auto& sym : it->second)
+            if (!sym.Parameters.empty() && sym.Parameters[0].TypeName == typeName
+                && sym.UniqueName != synthName)
+                return true;
+        return false;
+    }
+
+    // True when an owning value type T can be safely DEEP-copied into a closure env by routing
+    // through CreateOverloadedFunctionCall("copy", {T}) - i.e. capturing it by value behaves
+    // exactly like `T x = src;`. Admitted when: T has a real copy() (list/dictionary/string/
+    // hand-written user copy - authoritatively deep), OR T relies only on the memberwise synth
+    // AND has no raw pointer/view field (the synth shallow-shares those while T's dtor frees
+    // them -> double-free; such a type needs a hand-written copy() to be capturable).
+    bool ClosureCaptureDeepCopyable(const std::string& typeName)
+    {
+        if (!IsOwningValueType(typeName)) return false;
+        if (HasRealCopyOverloadFor(typeName)) return true;
+        auto ds = dataStructures.find(typeName);
+        if (ds == dataStructures.end()) return false;
+        for (const auto& f : ds->second.StructFields)
+            if (f.Pointer || f.ElemPointer || f.IsArrayView)
+                return false;
+        return true;
+    }
+
     // True when `typeName` defines `operator->` (its implicit `this` is the sole parameter).
     // Drives the operator-> forward-on-miss path for both `.` and `->`.
     bool HasArrowOverloadFor(const std::string& typeName) const
@@ -2698,6 +2790,61 @@ private:
 
         auto* resultVal = builder->CreateLoad(structTy, resultSlot, "copyresult");
         builder->CreateRet(resultVal);
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // Generate a per-closure capture-cleanup function `void(i8* dst, i8* src, i32 mode)` for a
+    // capture block `capTy` whose owning-value fields are listed in `owningFields` (fieldIndex,
+    // typeName). mode 1 (CLONE): deep-copy each owning field FROM src INTO dst, overwriting the
+    // shallow byte-copy the env clone left. mode 0 (FREE): destruct each owning field in dst.
+    // This is what makes a closure OWN its captured strings/containers (independent lifetime),
+    // so a captured owning value survives after its source is destructed and is freed exactly
+    // once. Returns null when there are no owning fields (the scalar-only fast path).
+    llvm::Function* GenerateClosureCaptureCleanup(const std::string& name, llvm::StructType* capTy,
+        const std::vector<std::pair<unsigned, std::string>>& owningFields)
+    {
+        if (owningFields.empty()) return nullptr;
+        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* i32Ty   = builder->getInt32Ty();
+        auto* voidTy  = llvm::Type::getVoidTy(*context);
+        auto* fnTy = llvm::FunctionType::get(voidTy, { i8PtrTy, i8PtrTy, i32Ty }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, name, module.get());
+
+        auto savedIP  = builder->saveIP();
+        auto* entry   = llvm::BasicBlock::Create(*context, "entry", fn);
+        auto* cloneBB = llvm::BasicBlock::Create(*context, "clone", fn);
+        auto* freeBB  = llvm::BasicBlock::Create(*context, "free", fn);
+        builder->SetInsertPoint(entry);
+        auto* dstCaps = builder->CreateBitCast(fn->getArg(0), capTy->getPointerTo(), "dstcaps");
+        auto* isClone = builder->CreateICmpEQ(fn->getArg(2), builder->getInt32(1));
+        builder->CreateCondBr(isClone, cloneBB, freeBB);
+
+        // CLONE: dst currently aliases src's owning handles (byte copy); replace each with a
+        // deep copy so dst owns independent buffers.
+        builder->SetInsertPoint(cloneBB);
+        auto* srcCaps = builder->CreateBitCast(fn->getArg(1), capTy->getPointerTo(), "srccaps");
+        for (const auto& [idx, tn] : owningFields)
+        {
+            NamedVariable argNV;
+            argNV.Storage  = builder->CreateStructGEP(capTy, srcCaps, idx);
+            argNV.BaseType = capTy->getElementType(idx);
+            argNV.TypeAndValue.TypeName = tn;
+            if (auto* copied = CreateOverloadedFunctionCall("copy", { argNV }))
+                builder->CreateStore(copied, builder->CreateStructGEP(capTy, dstCaps, idx));
+        }
+        builder->CreateRetVoid();
+
+        // FREE: destruct dst's owning fields.
+        builder->SetInsertPoint(freeBB);
+        for (const auto& [idx, tn] : owningFields)
+        {
+            auto* fldPtr = builder->CreateStructGEP(capTy, dstCaps, idx);
+            if (auto* dtor = GetOrCreateFullDestructor(tn))
+                builder->CreateCall(dtor->getFunctionType(), dtor,
+                    { builder->CreateBitCast(fldPtr, dtor->getArg(0)->getType()) });
+        }
+        builder->CreateRetVoid();
         builder->restoreIP(savedIP);
         return fn;
     }
@@ -8009,15 +8156,26 @@ public:
         }
 
         // Pass B: value structs. Shells first so a field can reference a peer struct by value.
+        // First-writer-wins: a struct simple name already defined (user code, a core library,
+        // or an earlier import) is NOT clobbered by a winmd value struct of the same name (e.g.
+        // a program's own `struct Rect` vs Windows.Foundation.Rect). The winmd type stays
+        // unprojected - by design, since the program clearly wants its own type of that name.
+        std::set<std::string> skipStructSimple;
         for (const Struct& st : model.structs)
         {
-            winrtValueStructs_.insert(st.fullName);
             std::string simple = WinrtSimpleName(st.fullName);
+            if (dataStructures.count(simple) && !winrtValueStructs_.count(st.fullName))
+            {
+                skipStructSimple.insert(simple);
+                continue;
+            }
+            winrtValueStructs_.insert(st.fullName);
             if (!dataStructures.count(simple)) CreateStructType(simple, {});
         }
         for (const Struct& st : model.structs)
         {
             std::string simple = WinrtSimpleName(st.fullName);
+            if (skipStructSimple.count(simple)) continue;
             std::vector<DeclTypeAndValue> fields;
             for (const Field& f : st.fields)
             {

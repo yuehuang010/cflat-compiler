@@ -12,28 +12,34 @@ i8* __closure_env_alloc(i64 n)
     return base;
 }
 
-// Allocate an owned env block big enough for `size` capture bytes. Returns the
-// TAGGED pointer to the captures region (base + 8, low bit set). The capture byte
-// count is stored in the 8-byte header so clone/free can recover it.
-i8* __closure_env_new(i64 size)
+// Allocate an owned env block big enough for `size` capture bytes. Returns the TAGGED pointer
+// to the captures region (base + 16, low bit set). A 16-byte header precedes the captures:
+// [0..8) = capture byte count; [8..16) = a per-closure capture-cleanup fn pointer (or null for a
+// scalar-only closure), which the compiler-emitted closure copy/dtor invoke to deep-copy /
+// destruct owning-value captures (strings, containers) so they have independent lifetime.
+i8* __closure_env_new(i64 size, i8* cleanup)
 {
-    i8* base = __closure_env_alloc(size + (i64)8);       // untracked function result
+    i8* base = __closure_env_alloc(size + (i64)16);      // untracked function result
     i64* hdr = (i64*)base;
     hdr[0] = size;                                       // size header at base[0..8)
-    return (i8*)(((i64)base + (i64)8) | (i64)1);         // captures = base+8, OWNED-tagged
+    hdr[1] = (i64)cleanup;                               // cleanup fn ptr at base[8..16)
+    return (i8*)(((i64)base + (i64)16) | (i64)1);        // captures = base+16, OWNED-tagged
 }
 
-// Deep-copy an env block. A null or untagged (borrowed) env is returned unchanged -
-// there is nothing to clone and it is not ours to duplicate. An owned env is copied
-// byte-for-byte into a fresh block and re-tagged.
+// Deep-copy an env block. A null or untagged (borrowed) env is returned unchanged - there is
+// nothing to clone and it is not ours to duplicate. An owned env is copied byte-for-byte into a
+// fresh block (carrying the same cleanup fn) and re-tagged. Owning-value capture fields are still
+// shallow after this byte copy; the compiler-emitted __closure_fat_ptr.copy runs the cleanup fn
+// (CLONE mode) afterward to deep-copy them.
 i8* __closure_env_clone(i8* env)
 {
     if (env == nullptr) return env;
     if (((i64)env & (i64)1) == (i64)0) return env;       // borrowed: share, do not clone
     i64 capAddr = (i64)env & ~(i64)1;                    // strip the tag -> captures address
-    i64* hdr = (i64*)(capAddr - (i64)8);
+    i64* hdr = (i64*)(capAddr - (i64)16);
     i64 size = hdr[0];                                   // recover capture byte count
-    i8* fresh = __closure_env_new(size);                 // tagged captures ptr (untracked result)
+    i8* cleanup = (i8*)hdr[1];                           // carry the cleanup fn to the clone
+    i8* fresh = __closure_env_new(size, cleanup);        // tagged captures ptr (untracked result)
     i8* dst = (i8*)((i64)fresh & ~(i64)1);
     i8* src = (i8*)capAddr;
     i64 i = (i64)0;
@@ -41,12 +47,13 @@ i8* __closure_env_clone(i8* env)
     return fresh;
 }
 
-// Free an owned env block. A null or untagged env is left alone (borrowed - the low
-// bit is clear, so it is not a heap block we allocated).
+// Free an owned env block. A null or untagged env is left alone (borrowed - the low bit is
+// clear, so it is not a heap block we allocated). Owning-value capture fields are destructed by
+// the compiler-emitted __closure_fat_ptr.dtor (via the cleanup fn) BEFORE this runs.
 void __closure_env_free(i8* env)
 {
     if (env == nullptr) return;
     if (((i64)env & (i64)1) == (i64)0) return;           // borrowed: not ours to free
-    i8* base = (i8*)(((i64)env & ~(i64)1) - (i64)8);      // captures -> allocation base
+    i8* base = (i8*)(((i64)env & ~(i64)1) - (i64)16);     // captures -> allocation base
     delete[] base;
 }

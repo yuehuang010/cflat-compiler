@@ -1,0 +1,160 @@
+// winui_app_demo.cb - P6 M2: a real WinUI 3 (Windows App SDK) window brought up from an
+// UNPACKAGED, self-contained cflat exe. No packaging, no Xaml markup, no C++/WinRT - the whole
+// XAML object graph is driven through cflat's winmd consume path + winrtDelegate projection.
+//
+// Chain proven here, all headless and unattended:
+//   1. MddBootstrapInitialize2      - load the WindowsAppRuntime framework package unpackaged.
+//   2. Application.Start(callback)  - callback projected via winrtDelegate(ApplicationInitializationCallback).
+//   3. Application (base, null-outer composition) + Window + Button + boxed text content.
+//   4. Button.Click wired through winrtDelegate(RoutedEventHandler).
+//   5. A DispatcherQueue-posted handler programmatically Invokes the button through its UI
+//      Automation peer, which raises Click -> our projected handler fires, then Application.Exit().
+//
+// The self-test asserts the pump ran AND the projected Click handler fired, then exits 0/1.
+//
+// Build (needs the Windows App SDK 1.8 bootstrapper .lib + the runtime winmds via -i):
+//   cflat winui_app_demo.cb -i winmd --c-lib <...>\Microsoft.WindowsAppRuntime.Bootstrap.lib -o winui_app_demo.exe
+//   (copy Microsoft.WindowsAppRuntime.Bootstrap.dll next to the exe)
+// Run headless self-test:  winui_app_demo.exe --selftest
+
+import "winrt.cb";
+import "function.cb";
+import "Microsoft.UI.Xaml.winmd";
+import "Microsoft.UI.winmd";
+
+// Windows App SDK bootstrapper (Microsoft.WindowsAppRuntime.Bootstrap.lib). minVersion is a
+// PACKAGE_VERSION (a ULONGLONG passed by value); options 0x10 == OnNoMatch_NoOp.
+extern stdcall i32  MddBootstrapInitialize2(u32 majorMinor, u16* versionTag, u64 minVersion, i32 options);
+extern stdcall void MddBootstrapShutdown();
+
+i32 gPumped  = 0;
+i32 gClicked = 0;
+i32 gTicks   = 0;
+void* gApp = nullptr;
+void* gDq  = nullptr;
+void* gButtonElem = nullptr;   // the button as IUIElement*, driven by the automation peer
+
+// The button Click handler, projected as a RoutedEventHandler.
+void onClick(void* sender, void* args) { gClicked = 1; }
+
+// Post onPumpTick onto the thread's DispatcherQueue so it runs on a later pump cycle.
+void postTick()
+{
+    void* tick = winrtDelegate(DispatcherQueueHandler, () => { onPumpTick(); });
+    void* enqOut = nullptr;
+    ((IDispatcherQueue*)gDq)->lpVtbl->TryEnqueue(gDq, tick, &enqOut);
+}
+
+// Runs on the UI thread: invoke the button via its automation peer (retrying until the button
+// is realized), then exit the app loop. Proves the Click handler fires without user input.
+void onPumpTick()
+{
+    gPumped = 1;
+    gTicks = gTicks + 1;
+
+    IFrameworkElementAutomationPeerStatics* peerStatics = nullptr;
+    i32 hr = activationFactory("Microsoft.UI.Xaml.Automation.Peers.FrameworkElementAutomationPeer",
+        iidof(IFrameworkElementAutomationPeerStatics), (void**)&peerStatics);
+    if (hr == 0 && peerStatics != nullptr && gButtonElem != nullptr)
+    {
+        void* peer = nullptr;
+        peerStatics->lpVtbl->CreatePeerForElement(peerStatics, gButtonElem, &peer);
+        if (peer != nullptr)
+        {
+            void* patternObj = nullptr;
+            ((IAutomationPeer*)peer)->lpVtbl->GetPattern(peer, 0, &patternObj);   // PatternInterface.Invoke = 0
+            void* invoker = nullptr;
+            if (patternObj != nullptr)
+                ((IAutomationPeer*)patternObj)->lpVtbl->QueryInterface(patternObj, iidof(IInvokeProvider), (void**)&invoker);
+            if (invoker != nullptr)
+                ((IInvokeProvider*)invoker)->lpVtbl->Invoke(invoker);
+        }
+    }
+
+    if (gClicked == 0 && gTicks < 60) { postTick(); return; }
+    if (gApp != nullptr) ((IApplication*)gApp)->Exit();
+}
+
+// The ApplicationInitializationCallback body: build the whole XAML object graph on the UI thread.
+void onInit(void* params)
+{
+    // Base Application (null outer composition) -> sets Application.Current for this thread.
+    IApplicationFactory* appFactory = nullptr;
+    activationFactory("Microsoft.UI.Xaml.Application", iidof(IApplicationFactory), (void**)&appFactory);
+    void* appInner = nullptr;
+    appFactory->lpVtbl->CreateInstance(appFactory, nullptr, &appInner, &gApp);
+
+    // Window (null outer composition).
+    IWindowFactory* winFactory = nullptr;
+    activationFactory("Microsoft.UI.Xaml.Window", iidof(IWindowFactory), (void**)&winFactory);
+    void* winInner = nullptr;
+    void* winRaw = nullptr;
+    winFactory->lpVtbl->CreateInstance(winFactory, nullptr, &winInner, &winRaw);
+
+    // Button (activatable) with a boxed-string label as its content.
+    void* btnInsp = nullptr;
+    RoActivateInstance(hstring("Microsoft.UI.Xaml.Controls.Button"), &btnInsp);
+
+    IPropertyValueStatics* pv = nullptr;
+    activationFactory("Windows.Foundation.PropertyValue", iidof(IPropertyValueStatics), (void**)&pv);
+    void* boxed = nullptr;
+    pv->CreateString(hstring("Click me"), &boxed);
+    void* content = nullptr;
+    ((IButton*)btnInsp)->lpVtbl->QueryInterface(btnInsp, iidof(IContentControl), (void**)&content);
+    if (content != nullptr) ((IContentControl*)content)->lpVtbl->put_Content(content, boxed);
+
+    // Wire Click through a projected RoutedEventHandler.
+    void* bbase = nullptr;
+    ((IButton*)btnInsp)->lpVtbl->QueryInterface(btnInsp, iidof(IButtonBase), (void**)&bbase);
+    if (bbase != nullptr)
+    {
+        void* clickHandler = winrtDelegate(RoutedEventHandler, (void* s, void* a) => { onClick(s, a); });
+        u64 token = 0;
+        ((IButtonBase*)bbase)->lpVtbl->add_Click(bbase, clickHandler, &token);
+    }
+
+    // Button as UIElement -> window content; keep the UIElement for the automation peer.
+    ((IButton*)btnInsp)->lpVtbl->QueryInterface(btnInsp, iidof(IUIElement), (void**)&gButtonElem);
+    void* win = nullptr;
+    ((IWindowFactory*)winRaw)->lpVtbl->QueryInterface(winRaw, iidof(IWindow), (void**)&win);
+    if (win != nullptr && gButtonElem != nullptr)
+    {
+        ((IWindow*)win)->lpVtbl->put_Content(win, gButtonElem);
+        ((IWindow*)win)->lpVtbl->Activate(win);
+    }
+
+    // Post the verify-and-exit tick onto this thread's DispatcherQueue.
+    IDispatcherQueueStatics* dqStatics = nullptr;
+    activationFactory("Microsoft.UI.Dispatching.DispatcherQueue", iidof(IDispatcherQueueStatics), (void**)&dqStatics);
+    dqStatics->lpVtbl->GetForCurrentThread(dqStatics, &gDq);
+    postTick();
+}
+
+// Bring up the whole XAML app and return 0 iff the pump ran and the Click handler fired.
+int runWinuiDemo()
+{
+    i32 bhr = MddBootstrapInitialize2(0x00010008, nullptr, 0, 0x10);
+    if (bhr != 0) { printf("winui: bootstrap failed 0x%08X\n", bhr); return 1; }
+    RoInitialize(0);   // single-threaded apartment for XAML
+
+    IApplicationStatics* appStatics = nullptr;
+    i32 shr = activationFactory("Microsoft.UI.Xaml.Application", iidof(IApplicationStatics), (void**)&appStatics);
+    if (shr != 0 || appStatics == nullptr) { printf("winui: IApplicationStatics failed 0x%08X\n", shr); MddBootstrapShutdown(); return 1; }
+
+    void* cb = winrtDelegate(ApplicationInitializationCallback, (void* params) => { onInit(params); });
+    appStatics->Start(cb);   // runs the XAML message pump until Application.Exit()
+
+    MddBootstrapShutdown();
+    if (gPumped == 1 && gClicked == 1)
+    {
+        printf("PASS: winui app self-test (bootstrap, Start, window+button, projected Click via UIA invoke)\n");
+        return 0;
+    }
+    printf("FAIL: winui app self-test (pumped=%d clicked=%d)\n", gPumped, gClicked);
+    return 1;
+}
+
+extern int main(int argc, char** argv)
+{
+    return runWinuiDemo();
+}

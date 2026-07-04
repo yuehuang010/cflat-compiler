@@ -1,0 +1,510 @@
+// winui_host.cb - P6 M3: a WinUI 3 backend for the NativeHost seam (ui_native.cb).
+//
+// Same contract as win32_native_host.cb, but the output stage drives REAL WinUI 3 (Windows
+// App SDK) controls instead of Win32 common controls: the reconciled Element tree's keyed
+// nodes map to XAML controls rooted in a Microsoft.UI.Xaml.Controls.Canvas, positioned with
+// Canvas.SetLeft/Top, and events flow back through winrtDelegate handlers into the existing
+// Event/dispatch seam. Nothing above the NativeHost seam changes - this file only replaces
+// the host implementation.
+//
+// The whole graph lives on the XAML UI thread: bring-up runs inside Application.Start's
+// ApplicationInitializationCallback (Start owns the message pump). See runAppWinui below.
+//
+// This file has no main(); an app imports it, defines a Component, and calls runAppWinui().
+// See winui_demo.cb for the flagship + headless self-test.
+
+import "ui.cb";
+import "ui_native.cb";
+import "winrt.cb";
+import "function.cb";
+import "Microsoft.UI.Xaml.winmd";
+import "Microsoft.UI.winmd";
+
+extern stdcall i32  MddBootstrapInitialize2(u32 majorMinor, u16* versionTag, u64 minVersion, i32 options);
+extern stdcall void MddBootstrapShutdown();
+
+// ── Host-wide singletons (one UI thread, one window) ─────────────────────────
+WinUI3Host _wHost  = default;
+Component    _wApp  = default;
+Element     _wTree  = default;
+UiContext   _wCtx   = default;
+bool        _wReady = false;
+int         _wW     = 80;   // client size in DIP units (layout width/height)
+int         _wH     = 40;
+
+// XAML plumbing captured during bring-up (all borrowed process-lived singletons).
+void* _gApp        = nullptr;   // IApplication* (base app; Exit ends the pump)
+void* _gDq         = nullptr;   // IDispatcherQueue* for this thread
+void* _gCanvasVec  = nullptr;   // Canvas.Children as IVector<UIElement>*
+void* _gCanvasStat = nullptr;   // ICanvasStatics* (SetLeft/SetTop)
+void* _gPv         = nullptr;   // IPropertyValueStatics* (box a string as content)
+
+int hostWidth()  { return _wW; }
+int hostHeight() { return _wH; }
+
+// The app registers a post-mount hook (run on the UI thread after the first tree is mounted):
+// a live app idles; a self-test drives the controls. Kept as a Lambda so the host never calls
+// an app-defined function by name (imported-module -> importer inversion).
+Lambda<void()> _wPostMount    = default;
+bool           _wHasPostMount = false;
+void setPostMount(Lambda<void()> f) { _wPostMount = f; _wHasPostMount = true; }
+
+// QI helper: COM QueryInterface is symmetric, so any thin interface pointer reaches slot-0 QI.
+void* wqi(void* obj, void* iid)
+{
+    void* out = nullptr;
+    if (obj != nullptr) ((IButton*)obj)->lpVtbl->QueryInterface(obj, iid, (void**)&out);
+    return out;
+}
+
+// Box a UTF-8 string as an IInspectable (WinRT content object) via PropertyValue.CreateString.
+void* boxString(string s)
+{
+    void* boxed = nullptr;
+    if (_gPv != nullptr) ((IPropertyValueStatics*)_gPv)->lpVtbl->CreateString(_gPv, hstring(s), &boxed);
+    return boxed;
+}
+
+// Box a bool as IReference<Boolean> (the Nullable<Boolean> that IToggleButton.IsChecked wants).
+void* boxBool(bool b)
+{
+    void* boxed = nullptr;
+    if (_gPv != nullptr) ((IPropertyValueStatics*)_gPv)->lpVtbl->CreateBoolean(_gPv, b, &boxed);
+    return boxed;
+}
+
+// Which Element kinds this host realizes as XAML controls (M3 subset).
+bool winuiMappable(int kind)
+{
+    return kind == ELEM_BUTTON || kind == ELEM_TEXT || kind == ELEM_CHECKBOX || kind == ELEM_BOX;
+}
+
+class WinUI3Host : NativeHost
+{
+    bool applying = false;   // guard: swallow self-inflicted Checked/Unchecked
+    list<string> liveKeys = default;   // keys live this frame (drives the destroy diff)
+
+    // NativeHost: activate a XAML control for `elemKind`, append it to the root Canvas, wire
+    // its events (capturing `key` for routing), and return the control's IInspectable as u64.
+    u64 createControl(int elemKind, u64 parentHandle, string key)
+    {
+        string cls = "Microsoft.UI.Xaml.Controls.TextBlock";
+        if (elemKind == ELEM_BUTTON)   cls = "Microsoft.UI.Xaml.Controls.Button";
+        else if (elemKind == ELEM_CHECKBOX) cls = "Microsoft.UI.Xaml.Controls.CheckBox";
+        else if (elemKind == ELEM_BOX) cls = "Microsoft.UI.Xaml.Controls.Border";
+
+        void* insp = nullptr;
+        RoActivateInstance(hstring(cls), &insp);
+        if (insp == nullptr) return 0u;
+
+        // Append to the root Canvas as a UIElement.
+        void* elem = wqi(insp, iidof(IUIElement));
+        if (_gCanvasVec != nullptr && elem != nullptr)
+            ((IVector<UIElement>*)_gCanvasVec)->lpVtbl->Append(_gCanvasVec, elem);
+
+        // Wire events once. The routing closures capture the node's key path directly (an owning
+        // string capture, made safe by the closure-capture fix). A control's key path is invariant
+        // for the lifetime of its handle - reconcile realizes any re-key/reparent as a
+        // destroy+create - so a key captured here never goes stale (no handle->key reverse map).
+        if (elemKind == ELEM_BUTTON)
+        {
+            void* bb = wqi(insp, iidof(IButtonBase));
+            if (bb != nullptr)
+            {
+                void* h = winrtDelegate(RoutedEventHandler, (void* s, void* a) => { routeWinuiClick(key); });
+                u64 tok = 0;
+                ((IButtonBase*)bb)->lpVtbl->add_Click(bb, h, &tok);
+            }
+        }
+        else if (elemKind == ELEM_CHECKBOX)
+        {
+            void* tb = wqi(insp, iidof(IToggleButton));
+            if (tb != nullptr)
+            {
+                void* hc = winrtDelegate(RoutedEventHandler, (void* s, void* a) => { routeWinuiToggle(key); });
+                void* hu = winrtDelegate(RoutedEventHandler, (void* s, void* a) => { routeWinuiToggle(key); });
+                u64 t1 = 0; u64 t2 = 0;
+                ((IToggleButton*)tb)->lpVtbl->add_Checked(tb, hc, &t1);
+                ((IToggleButton*)tb)->lpVtbl->add_Unchecked(tb, hu, &t2);
+            }
+        }
+        return (u64)insp;
+    }
+
+    void destroyControl(u64 h)
+    {
+        // Remove from the Canvas so it leaves the visual tree (the object is refcounted).
+        if (h == 0u || _gCanvasVec == nullptr) return;
+        void* elem = wqi((void*)h, iidof(IUIElement));
+        if (elem == nullptr) return;
+        u32 idx = 0u;
+        u8 found = 0;
+        ((IVector<UIElement>*)_gCanvasVec)->lpVtbl->IndexOf(_gCanvasVec, elem, &idx, &found);
+        if (found != 0) ((IVector<UIElement>*)_gCanvasVec)->lpVtbl->RemoveAt(_gCanvasVec, idx);
+    }
+
+    // Position + size in DIPs (XAML units are DIPs, so this is a near-1:1 passthrough).
+    void setFrame(u64 h, Rect frameDip)
+    {
+        int ix = frameDip.x; int iy = frameDip.y; int iw = frameDip.w; int ih = frameDip.h;
+        double x = (double)ix; double y = (double)iy;
+        double w = (double)iw; double hh = (double)ih;
+        void* elem = wqi((void*)h, iidof(IUIElement));
+        if (elem != nullptr && _gCanvasStat != nullptr)
+        {
+            ((ICanvasStatics*)_gCanvasStat)->lpVtbl->SetLeft(_gCanvasStat, elem, x);
+            ((ICanvasStatics*)_gCanvasStat)->lpVtbl->SetTop(_gCanvasStat, elem, y);
+        }
+        void* fe = wqi((void*)h, iidof(IFrameworkElement));
+        if (fe != nullptr)
+        {
+            ((IFrameworkElement*)fe)->lpVtbl->put_Width(fe, w);
+            ((IFrameworkElement*)fe)->lpVtbl->put_Height(fe, hh);
+        }
+    }
+
+    // Text/content: a TextBlock takes put_Text; a ContentControl (Button/CheckBox) takes a
+    // boxed string content. QI decides which applies to this control.
+    void setText(u64 h, const char* s)
+    {
+        void* tb = wqi((void*)h, iidof(ITextBlock));
+        if (tb != nullptr)
+        {
+            ((ITextBlock*)tb)->lpVtbl->put_Text(tb, hstring((string)s));
+            return;
+        }
+        void* cc = wqi((void*)h, iidof(IContentControl));
+        if (cc != nullptr)
+            ((IContentControl*)cc)->lpVtbl->put_Content(cc, boxString((string)s));
+    }
+
+    void setBoolProp(u64 h, int prop, bool v)
+    {
+        if (prop == PROP_CHECKED)
+        {
+            void* tb = wqi((void*)h, iidof(IToggleButton));
+            if (tb != nullptr) ((IToggleButton*)tb)->lpVtbl->put_IsChecked(tb, boxBool(v));
+        }
+        else if (prop == PROP_ENABLED)
+        {
+            void* ctl = wqi((void*)h, iidof(IControl));
+            if (ctl != nullptr) ((IControl*)ctl)->lpVtbl->put_IsEnabled(ctl, v);
+        }
+        else if (prop == PROP_VISIBLE)
+        {
+            void* elem = wqi((void*)h, iidof(IUIElement));
+            if (elem != nullptr) ((IUIElement*)elem)->lpVtbl->put_Visibility(elem, v ? 0 : 1);
+        }
+    }
+
+    // Progress/Slider are the same IRangeBase pattern; deferred in this M3 subset.
+    void setIntProp(u64 h, int prop, int v) { }
+    void setAccent(u64 h, int fgColor, int bgColor) { }
+
+    // XAML measures intrinsically; return a DIP estimate so the DIP layout pass spaces rows.
+    Size measureText(const char* s, int fontId, int wrapWidthDip)
+    {
+        Size sz = default;
+        sz.w = (int)strlen((char*)s) * 8 + 24;
+        sz.h = 32;
+        return sz;
+    }
+
+    void requestLayout()
+    {
+        if (!_wReady) return;
+        layoutRoot(_wTree, 0, 0, _wW);
+        this.applyTree(_wTree, &_wCtx);
+    }
+
+    // Reconcile the Element tree to XAML controls: create-on-first-sight (reuse by key path),
+    // sync props, position, then destroy controls whose key left the tree.
+    void applyTree(Element tree, UiContext* ctx)
+    {
+        this.applying = true;
+        list<string> newKeys = default;
+        this._applyNode(tree, keySegment(tree, 0), ctx, &newKeys);
+
+        int i = 0;
+        while (i < this.liveKeys.count())
+        {
+            string k = this.liveKeys.get(i);
+            if (!winuiListHas(&newKeys, k))
+            {
+                u64 h = ctx.nativeHandle(k);
+                this.destroyControl(h);
+                ctx.removeNativeHandle(k);
+            }
+            i++;
+        }
+
+        this.liveKeys.clear();
+        int m = 0;
+        while (m < newKeys.count())
+        {
+            this.liveKeys.add("" + newKeys.get(m));
+            m++;
+        }
+        this.applying = false;
+    }
+
+    void _applyNode(Element node, string path, UiContext* ctx, list<string>* keys)
+    {
+        if (winuiMappable(node.kind()))
+        {
+            u64 h = ctx.nativeHandle(path);
+            if (h == 0u)
+            {
+                h = this.createControl(node.kind(), 0u, path);
+                ctx.setNativeHandle(path, h);
+            }
+            this._syncProps(node, h);
+            Rect b = node.nodeBounds();
+            this.setFrame(h, b);
+            keys.add("" + path);
+        }
+        list<Element>* kids = node.childList();
+        if (kids != nullptr)
+        {
+            int i = 0;
+            while (i < kids.count())
+            {
+                Element c = kids.get(i);
+                string cp = joinKeyPath(path, keySegment(c, i));
+                this._applyNode(c, cp, ctx, keys);
+                i++;
+            }
+        }
+    }
+
+    void _syncProps(Element node, u64 h)
+    {
+        int k = node.kind();
+        if (k == ELEM_BUTTON)
+        {
+            Button* b = node as Button;
+            this.setText(h, b.title.data());
+            this.setBoolProp(h, PROP_ENABLED, !b.disabled);
+        }
+        else if (k == ELEM_TEXT)
+        {
+            Text* t = node as Text;
+            this.setText(h, t.text.data());
+        }
+        else if (k == ELEM_CHECKBOX)
+        {
+            Checkbox* c = node as Checkbox;
+            this.setText(h, c.label.data());
+            this.setBoolProp(h, PROP_CHECKED, c.checked);
+            this.setBoolProp(h, PROP_ENABLED, !c.disabled);
+        }
+    }
+
+};
+
+// ── Free helpers (shared by the host + routing) ──────────────────────────────
+bool winuiListHas(list<string>* xs, string want)
+{
+    int i = 0;
+    while (i < xs.count()) { if (xs.get(i) == want) return true; i++; }
+    return false;
+}
+
+// Depth-first find of the element whose key path equals `want` (mirrors win32 findByKey).
+Element winuiFindByKey(Element node, string path, string want)
+{
+    if (path == want) return node;
+    list<Element>* kids = node.childList();
+    if (kids != nullptr)
+    {
+        int i = 0;
+        while (i < kids.count())
+        {
+            Element c = kids.get(i);
+            string cp = joinKeyPath(path, keySegment(c, i));
+            Element found = winuiFindByKey(c, cp, want);
+            if (found != nullptr) return found;
+            i++;
+        }
+    }
+    return nullptr;
+}
+
+// Re-render when the model is dirty: render -> reconcile -> layout -> apply (mirrors pumpNative).
+void pumpWinui()
+{
+    if (_wCtx.consumeDirty())
+    {
+        Element wip = _wApp.render(&_wCtx);
+        list<Patch> patches = default;
+        _wTree = reconcile(_wTree, wip, &patches);
+        layoutRoot(_wTree, 0, 0, _wW);
+        _wHost.applyTree(_wTree, &_wCtx);
+    }
+}
+
+// A XAML Click landed on the control bound to `key` (captured at subscribe time): fire the
+// button handler, re-render.
+void routeWinuiClick(string key)
+{
+    if (key.length() == 0) return;
+    Element e = winuiFindByKey(_wTree, keySegment(_wTree, 0), key);
+    if (e == nullptr) return;
+    Button* b = e as Button;
+    if (b != nullptr) { b.fireClick(); pumpWinui(); }
+}
+
+// A XAML Checked/Unchecked landed on `key`. Ignore self-inflicted toggles (we set IsChecked
+// during syncProps under the `applying` guard); a genuine user toggle flips the model.
+void routeWinuiToggle(string key)
+{
+    if (_wHost.applying) return;
+    if (key.length() == 0) return;
+    Element e = winuiFindByKey(_wTree, keySegment(_wTree, 0), key);
+    if (e == nullptr) return;
+    Checkbox* c = e as Checkbox;
+    if (c != nullptr) { c.fireToggle(); pumpWinui(); }
+}
+
+// Build the initial control tree from the app's first render (direct, like win32's first
+// build - reconcile is only for later re-renders against a live committed tree).
+void buildWinuiTree()
+{
+    if (_wReady) { deleteTree(_wTree); _wReady = false; }
+    _wTree = _wApp.render(&_wCtx);
+    layoutRoot(_wTree, 0, 0, _wW);
+    _wHost.applyTree(_wTree, &_wCtx);
+    _wReady = true;
+}
+
+// The ApplicationInitializationCallback body: stand up Application/Window/Canvas, then the tree.
+void winuiOnInit(void* params)
+{
+    IApplicationFactory* af = nullptr;
+    activationFactory("Microsoft.UI.Xaml.Application", iidof(IApplicationFactory), (void**)&af);
+    void* ai = nullptr;
+    af->lpVtbl->CreateInstance(af, nullptr, &ai, &_gApp);
+
+    IWindowFactory* wf = nullptr;
+    activationFactory("Microsoft.UI.Xaml.Window", iidof(IWindowFactory), (void**)&wf);
+    void* wi = nullptr; void* winRaw = nullptr;
+    wf->lpVtbl->CreateInstance(wf, nullptr, &wi, &winRaw);
+
+    // Root Canvas: keep its Children vector + the Canvas statics for absolute positioning.
+    void* canvas = nullptr;
+    RoActivateInstance(hstring("Microsoft.UI.Xaml.Controls.Canvas"), &canvas);
+    void* panel = wqi(canvas, iidof(IPanel));
+    void* children = nullptr;
+    if (panel != nullptr) ((IPanel*)panel)->lpVtbl->get_Children(panel, &children);
+    _gCanvasVec = wqi(children, iidof(IVector<UIElement>));
+    activationFactory("Microsoft.UI.Xaml.Controls.Canvas", iidof(ICanvasStatics), (void**)&_gCanvasStat);
+    activationFactory("Windows.Foundation.PropertyValue", iidof(IPropertyValueStatics), (void**)&_gPv);
+
+    // Window content = the canvas.
+    void* win = wqi(winRaw, iidof(IWindow));
+    void* canvasElem = wqi(canvas, iidof(IUIElement));
+    if (win != nullptr && canvasElem != nullptr)
+    {
+        ((IWindow*)win)->lpVtbl->put_Content(win, canvasElem);
+        ((IWindow*)win)->lpVtbl->Activate(win);
+    }
+
+    // Thread DispatcherQueue (drives re-render posts + the self-test harness).
+    IDispatcherQueueStatics* dqs = nullptr;
+    activationFactory("Microsoft.UI.Dispatching.DispatcherQueue", iidof(IDispatcherQueueStatics), (void**)&dqs);
+    dqs->lpVtbl->GetForCurrentThread(dqs, &_gDq);
+
+    buildWinuiTree();
+
+    // Hand control to the app's post-mount hook (a live window idles; the self-test drives).
+    if (_wHasPostMount) _wPostMount();
+}
+
+// Exit the XAML pump (ends Application.Start); called by the self-test when done.
+void winuiExit()
+{
+    if (_gApp != nullptr) ((IApplication*)_gApp)->Exit();
+}
+
+// Post a handler onto the UI thread's DispatcherQueue.
+void winuiPost(Lambda<void()> fn)
+{
+    void* h = winrtDelegate(DispatcherQueueHandler, () => { fn(); });
+    void* enqOut = nullptr;
+    ((IDispatcherQueue*)_gDq)->lpVtbl->TryEnqueue(_gDq, h, &enqOut);
+}
+
+// Drive a control's UIA Invoke pattern (a button click) from the key path; returns true if driven.
+bool winuiUiaInvoke(string key)
+{
+    u64 h = _wCtx.nativeHandle(key);
+    if (h == 0u) return false;
+    void* elem = wqi((void*)h, iidof(IUIElement));
+    if (elem == nullptr) return false;
+    IFrameworkElementAutomationPeerStatics* ps = nullptr;
+    activationFactory("Microsoft.UI.Xaml.Automation.Peers.FrameworkElementAutomationPeer",
+        iidof(IFrameworkElementAutomationPeerStatics), (void**)&ps);
+    if (ps == nullptr) return false;
+    void* peer = nullptr;
+    ps->lpVtbl->CreatePeerForElement(ps, elem, &peer);
+    if (peer == nullptr) return false;
+    void* pat = nullptr;
+    ((IAutomationPeer*)peer)->lpVtbl->GetPattern(peer, 0, &pat);   // Invoke = 0
+    void* inv = wqi(pat, iidof(IInvokeProvider));
+    if (inv == nullptr) return false;
+    ((IInvokeProvider*)inv)->lpVtbl->Invoke(inv);
+    return true;
+}
+
+// Drive a checkbox's UIA Toggle pattern from the key path; returns true if driven.
+bool winuiUiaToggle(string key)
+{
+    u64 h = _wCtx.nativeHandle(key);
+    if (h == 0u) return false;
+    void* elem = wqi((void*)h, iidof(IUIElement));
+    if (elem == nullptr) return false;
+    IFrameworkElementAutomationPeerStatics* ps = nullptr;
+    activationFactory("Microsoft.UI.Xaml.Automation.Peers.FrameworkElementAutomationPeer",
+        iidof(IFrameworkElementAutomationPeerStatics), (void**)&ps);
+    if (ps == nullptr) return false;
+    void* peer = nullptr;
+    ps->lpVtbl->CreatePeerForElement(ps, elem, &peer);
+    if (peer == nullptr) return false;
+    void* pat = nullptr;
+    ((IAutomationPeer*)peer)->lpVtbl->GetPattern(peer, 15, &pat);   // Toggle = 15
+    void* tog = wqi(pat, iidof(IToggleProvider));
+    if (tog == nullptr) return false;
+    ((IToggleProvider*)tog)->lpVtbl->Toggle(tog);
+    return true;
+}
+
+// Read a live TextBlock's text back through the control (proves end-to-end, not just the model).
+string winuiControlText(string key)
+{
+    u64 h = _wCtx.nativeHandle(key);
+    if (h == 0u) return "";
+    void* tb = wqi((void*)h, iidof(ITextBlock));
+    if (tb == nullptr) return "";
+    void* hs = nullptr;
+    ((ITextBlock*)tb)->lpVtbl->get_Text(tb, &hs);
+    if (hs == nullptr) return "";
+    return fromHString(hs);
+}
+
+// Bring up the whole WinUI 3 app for `app`. Blocks in the XAML pump until winuiExit().
+int runAppWinui(Component app)
+{
+    _wApp = app;
+    i32 bhr = MddBootstrapInitialize2(0x00010008, nullptr, 0, 0x10);
+    if (bhr != 0) { printf("winui: bootstrap failed 0x%08X\n", bhr); return 1; }
+    RoInitialize(0);
+
+    IApplicationStatics* appStat = nullptr;
+    i32 shr = activationFactory("Microsoft.UI.Xaml.Application", iidof(IApplicationStatics), (void**)&appStat);
+    if (shr != 0 || appStat == nullptr) { printf("winui: IApplicationStatics 0x%08X\n", shr); MddBootstrapShutdown(); return 1; }
+
+    void* cb = winrtDelegate(ApplicationInitializationCallback, (void* p) => { winuiOnInit(p); });
+    appStat->Start(cb);
+    MddBootstrapShutdown();
+    return 0;
+}

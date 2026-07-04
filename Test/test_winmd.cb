@@ -40,6 +40,7 @@ struct DelegateThin { DelegateVtbl* lpVtbl = default; };
 i32 gDelegateFired = 0;
 i32 gDelegateStatus = -1;
 i32 gDelegateCap = -1;
+string gDelegateCapStr = default;
 
 // === iidof byte-exactness: a stored IID and a DERIVED parameterized IID (no OS needed) ===
 //
@@ -433,6 +434,46 @@ bool testDelegateSyncInvoke()
     return result;
 }
 
+// === Delegate projection: an OWNING STRING captured into the closure survives the source ===
+//
+// Regression for the shallow-capture bug: a `string` captured by value into a closure was stored
+// as a raw {ptr,len} alias of the source, so once the source was destructed the captured string
+// dangled and read back EMPTY at Invoke time (and the winrtDelegate clone shared the buffer). The
+// fix deep-copies owning captures into the env and destructs/clones them via a per-closure cleanup
+// fn. Here `label` is destructed when makeStringCapturingDelegate returns - long before Invoke - so
+// the delegate must own an independent copy. Two Invokes prove it survives across calls; the final
+// Release destructs the owned closure (incl. the captured string) with no crash/double-free.
+void* makeStringCapturingDelegate(string label)
+{
+    return winrtDelegate(AsyncOperationCompletedHandler<string>,
+        (void* asyncInfo, i32 status) => { gDelegateCapStr = "" + label; });
+}
+
+bool testDelegateStringCapture()
+{
+    bool result = true;
+    gDelegateCapStr = "";
+
+    // A heap-owned (non-literal) string, so a shallow capture would alias a freed buffer.
+    void* h = makeStringCapturingDelegate("captured-" + "payload-42");
+    result &= Test("winmd_delegate_strcap_nonnull", h != nullptr ? 1 : 0, 1);
+    if (h == nullptr) return false;
+
+    DelegateThin* d = (DelegateThin*)h;
+
+    // First Invoke: the captured string content must be intact (not empty / dangling).
+    d->lpVtbl->Invoke(h, nullptr, 1);
+    result &= Test("winmd_delegate_strcap_content", (gDelegateCapStr == "captured-payload-42") ? 1 : 0, 1);
+
+    // Second Invoke: still intact - the delegate owns its copy across calls.
+    gDelegateCapStr = "";
+    d->lpVtbl->Invoke(h, nullptr, 2);
+    result &= Test("winmd_delegate_strcap_content2", (gDelegateCapStr == "captured-payload-42") ? 1 : 0, 1);
+
+    d->lpVtbl->Release(h);   // destructs the owned closure incl. the captured string - no double-free
+    return result;
+}
+
 // === Delegate projection (async): a REAL WinRT AsyncOperationCompletedHandler<String> ===
 //
 // Upgrades the async round-trip from polling (awaitAsync) to a projected completion handler:
@@ -514,6 +555,7 @@ extern int main()
     total++; passed += testAsyncRoundtrip()             ? 1 : 0;
     total++; passed += testComPtrRaii()                 ? 1 : 0;
     total++; passed += testDelegateSyncInvoke()          ? 1 : 0;
+    total++; passed += testDelegateStringCapture()       ? 1 : 0;
     total++; passed += testDelegateAsyncCompleted()      ? 1 : 0;
 
     winrtUninit();

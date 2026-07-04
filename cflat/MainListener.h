@@ -14638,10 +14638,15 @@ public:
                                 ci.OuterStorage = nv.Storage;
                                 // string is a value type ({i8*,i32}): its methods take string by value,
                                 // so it must be value-captured like primitives to avoid pointer mismatch.
+                                // Owning value types with a genuine deep copy (list/dictionary/owning
+                                // struct) are ALSO value-captured: they are deep-copied into the env so
+                                // the closure owns an independent buffer and can outlive its source
+                                // (an escaping closure that captured them by-reference would dangle).
                                 ci.ByReference = !ci.TV.Pointer
                                     && !ci.TV.IsFunctionPointer
                                     && !ci.TV.IsPrimitive()
                                     && ci.TV.TypeName != "string"
+                                    && !compiler->ClosureCaptureDeepCopyable(ci.TV.TypeName)
                                     && compiler->dataStructures.count(ci.TV.TypeName);
                                 captures.push_back(ci);
                             };
@@ -14708,6 +14713,22 @@ public:
         // Scan body for captures from the enclosing function scope BEFORE saving builder state.
         auto captures = CollectLambdaCaptures(ctx->lambdaBody(), lambdaParamNames, compiler);
 
+        // A by-value capture of an owning value type is DEEP-COPIED into the env, which then OWNS
+        // it (its cleanup fn frees it exactly once); the invoker's unpacked local only BORROWS it.
+        // Both the deep-copy-at-store and the borrow-in-body decisions key off this one predicate.
+        // Deep copy goes through the type's own copy() (list.copy()/dictionary.copy()/string/user
+        // copy), so capturing an owning value behaves exactly like `T x = src;`. Admitted only when
+        // that copy is genuinely deep (ClosureCaptureDeepCopyable). Nested closures are excluded:
+        // marking their unpacked capture IsAliasBorrow spuriously propagates the alias flag to the
+        // closure's call results (broke a lambda-capturing-lambda case in test_function_ptr).
+        auto isOwningCap = [&](const CaptureInfo& cap) -> bool {
+            if (cap.ByReference || cap.IsThis) return false;
+            if (cap.TV.Pointer || cap.TV.ConstArraySize > 0) return false;
+            if (cap.TV.TypeName == "string") return true;
+            if (cap.TV.TypeName == "__closure_fat_ptr") return false;
+            return compiler->ClosureCaptureDeepCopyable(cap.TV.TypeName);
+        };
+
         // Build closure struct alloca in the OUTER function before switching IR context.
         llvm::AllocaInst* closureAlloca = nullptr;
         llvm::StructType* closureStructTy = nullptr;
@@ -14727,19 +14748,36 @@ public:
             }
             closureStructTy = llvm::StructType::create(*compiler->context, closureFields, closureName);
 
+            // A by-value capture of an owning value type must be DEEP-COPIED into the env so the
+            // closure owns an independent buffer with its own lifetime - otherwise the capture
+            // aliases the source and dangles once the source is destructed (the empty-captured-
+            // string bug). Collect the owning field slots so we can (a) deep-copy them at store
+            // time and (b) generate a cleanup fn the env copy/dtor use to deep-copy / destruct them.
+            std::vector<std::pair<unsigned, std::string>> owningFields;
+            for (size_t i = 0; i < captures.size(); i++)
+                if (isOwningCap(captures[i]))
+                    owningFields.emplace_back((unsigned)i, captures[i].TV.TypeName);
+            llvm::Function* cleanupFn = compiler->GenerateClosureCaptureCleanup(
+                "__closure_cleanup_" + std::to_string(lambdaIdx), closureStructTy, owningFields);
+
             // Owning heap env (lambda Option A): allocate the captures block on the heap via the
             // library primitive so the closure VALUE can outlive its defining frame (Bug 8) and
-            // is freed/cloned by the value-type machinery. __closure_env_new returns a TAGGED
-            // captures pointer (low bit set); we populate captures through the untagged base and
-            // store the tagged pointer in the fat struct. If function.cb is not yet available
-            // (a capturing lambda in an early core file imported before it), fall back to the
-            // legacy stack env - untagged, so it reads as borrowed and is never freed/cloned.
+            // is freed/cloned by the value-type machinery. __closure_env_new(size, cleanup) returns
+            // a TAGGED captures pointer (low bit set); we populate captures through the untagged
+            // base and store the tagged pointer in the fat struct. If function.cb is not yet
+            // available (a capturing lambda in an early core file imported before it), fall back to
+            // the legacy stack env - untagged, so it reads as borrowed and is never freed/cloned.
             llvm::Value* envCaptureBase = nullptr;
+            bool heapEnv = false;
             if (llvm::Function* envNewFn = compiler->GetFunction("__closure_env_new"))
             {
+                heapEnv = true;
                 uint64_t sz = compiler->module->getDataLayout().getTypeAllocSize(closureStructTy);
                 auto* sizeC     = llvm::ConstantInt::get(compiler->builder->getInt64Ty(), sz);
-                auto* taggedEnv = compiler->builder->CreateCall(envNewFn, { sizeC }, "closure_env");
+                llvm::Value* cleanupArg = cleanupFn
+                    ? compiler->builder->CreateBitCast(cleanupFn, i8PtrTy)
+                    : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(i8PtrTy));
+                auto* taggedEnv = compiler->builder->CreateCall(envNewFn, { sizeC, cleanupArg }, "closure_env");
                 envForFatTagged = taggedEnv;
                 auto* envInt  = compiler->builder->CreatePtrToInt(taggedEnv, compiler->builder->getInt64Ty());
                 auto* baseInt = compiler->builder->CreateAnd(envInt, compiler->builder->getInt64(~(uint64_t)1));
@@ -14761,9 +14799,20 @@ public:
                     // Store pointer to outer struct (alloca address) in closure field.
                     compiler->builder->CreateStore(captures[i].OuterStorage, fieldGEP);
                 }
+                else if (heapEnv && isOwningCap(captures[i]))
+                {
+                    // Deep-copy the owning value into the env so it has independent lifetime
+                    // (the cleanup fn frees this copy; the source keeps its own).
+                    LLVMBackend::NamedVariable srcNV;
+                    srcNV.Storage  = captures[i].OuterStorage;
+                    srcNV.BaseType = compiler->GetType(captures[i].TV);
+                    srcNV.TypeAndValue.TypeName = captures[i].TV.TypeName;
+                    if (auto* copied = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
+                        compiler->builder->CreateStore(copied, fieldGEP);
+                }
                 else
                 {
-                    // Store a copy of the value in the closure field.
+                    // Store a copy of the value in the closure field (scalars/pointers: shallow).
                     auto* val = compiler->CreateLoad(compiler->GetType(captures[i].TV), captures[i].OuterStorage);
                     compiler->builder->CreateStore(val, fieldGEP);
                 }
@@ -14863,6 +14912,11 @@ public:
                     captureNV.Storage = capAlloca;
                     captureNV.TypeAndValue = cap.TV;
                     captureNV.BaseType     = capTy;
+                    // The ENV owns an owning-value capture (its cleanup fn frees it exactly once);
+                    // the body's unpacked local only BORROWS it, so suppress its scope-exit
+                    // destructor - otherwise it would free the env's buffer (a double-free).
+                    if (isOwningCap(cap))
+                        captureNV.IsAliasBorrow = true;
                 }
             }
         }
@@ -16480,10 +16534,26 @@ public:
 
         // Member function signatures were pre-declared above (before the flush).
 
-        // Pre-register destructor so 'delete' inside static methods can call it.
+        // Pre-register destructor so 'delete' inside static methods can call it, AND so a member
+        // that constructs an instance of its own type (e.g. dictionary.copy() building a local
+        // dictionary) forces .dtorfull with the user destructor already resolved. The scanner only
+        // forward-declares the TEMPLATE's `~name`; a concrete instantiation's `~name__T` is not, so
+        // declare it here when missing - otherwise .dtorfull bakes a null user-dtor and caches it,
+        // leaking everything the hand-written destructor would have freed.
         if (!MemberDestructorDefinitions(ctx).empty())
         {
-            if (auto* dtorFn = compiler->GetFunction("~" + structName))
+            llvm::Function* dtorFn = compiler->GetFunction("~" + structName);
+            if (dtorFn == nullptr)
+            {
+                LLVMBackend::DeclTypeAndValue thisParam;
+                thisParam.TypeName = structName;
+                thisParam.VariableName = structName + "__";
+                thisParam.Pointer = true;
+                LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
+                compiler->CreateFunctionDeclaration("~" + structName, voidReturn, { thisParam });
+                dtorFn = compiler->GetFunction("~" + structName);
+            }
+            if (dtorFn != nullptr)
                 compiler->RegisterDestructor(structName, dtorFn);
         }
 
@@ -18718,10 +18788,26 @@ public:
 
         // Member function signatures were pre-declared above (before the flush).
 
-        // Pre-register destructor so 'delete' inside static methods can call it.
+        // Pre-register destructor so 'delete' inside static methods can call it, AND so a member
+        // that constructs an instance of its own type (e.g. dictionary.copy() building a local
+        // dictionary) forces .dtorfull with the user destructor already resolved. The scanner only
+        // forward-declares the TEMPLATE's `~name`; a concrete instantiation's `~name__T` is not, so
+        // declare it here when missing - otherwise .dtorfull bakes a null user-dtor and caches it,
+        // leaking everything the hand-written destructor would have freed.
         if (!MemberDestructorDefinitions(ctx).empty())
         {
-            if (auto* dtorFn = compiler->GetFunction("~" + structName))
+            llvm::Function* dtorFn = compiler->GetFunction("~" + structName);
+            if (dtorFn == nullptr)
+            {
+                LLVMBackend::DeclTypeAndValue thisParam;
+                thisParam.TypeName = structName;
+                thisParam.VariableName = structName + "__";
+                thisParam.Pointer = true;
+                LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
+                compiler->CreateFunctionDeclaration("~" + structName, voidReturn, { thisParam });
+                dtorFn = compiler->GetFunction("~" + structName);
+            }
+            if (dtorFn != nullptr)
                 compiler->RegisterDestructor(structName, dtorFn);
         }
 

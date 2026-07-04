@@ -380,3 +380,7 @@ FodyWeavers.xsd
 build/
 out-linux/
 /.scratch/
+
+# Ignore these winmd until package-nuget is implemented.
+example/ui/winui/winmd/Microsoft.UI.winmd
+example/ui/winui/winmd/Microsoft.UI.Xaml.winmd

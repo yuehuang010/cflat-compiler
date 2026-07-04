@@ -1,0 +1,119 @@
+// winui_demo.cb - P6 M3 flagship: an app-facing Component rendered on REAL WinUI 3 controls
+// through winui_host.cb (the NativeHost output stage). The component code is identical in shape
+// to the Win32/TUI hosts - nothing above the NativeHost seam knows it is XAML.
+//
+// A checkbox enables an Increment button; each click bumps a counter shown in a TextBlock. This
+// exercises the whole seam: control creation on a Canvas, property sync (enabled/checked/text),
+// and events (Checked/Unchecked, Click) flowing back through winrtDelegate into dispatch.
+//
+// Build (needs the Windows App SDK 1.8 bootstrapper .lib + the runtime winmds via -i):
+//   cflat winui_demo.cb -i . -i winmd --c-lib <...>\Microsoft.WindowsAppRuntime.Bootstrap.lib -o winui_demo.exe
+//   (copy Microsoft.WindowsAppRuntime.Bootstrap.dll next to the exe)
+// Headless self-test:  winui_demo.exe --selftest
+
+import "winui_host.cb";
+
+class WinuiDemo : Component
+{
+    int  count   = 0;
+    bool enabled = false;
+
+    Element render(UiContext* ctx)
+    {
+        Box* root = box(makeStyle(1, hostWidth(), hostHeight()));
+        root.style.gap = 1;
+        root.setKey("root");
+
+        Text* title = text("WinUI 3 (native) demo");
+        title.setKey("title");
+        root.add(title);
+
+        Checkbox* en = checkbox("Enable", this.enabled,
+                                (bool v) => { this.enabled = v; ctx.invalidate(); });
+        en.setKey("en");
+        root.add(en);
+
+        Button* inc = button("Increment", () => { this.count = this.count + 1; ctx.invalidate(); });
+        inc.setKey("inc");
+        inc.disabled = !this.enabled;
+        root.add(inc);
+
+        Text* status = text("Count: " + this.count.toString());
+        status.setKey("status");
+        root.add(status);
+        return root;
+    }
+};
+
+// ── Headless state-assert self-test ──────────────────────────────────────────
+// Runs on the XAML UI thread once the tree is mounted. Drives the checkbox + button through
+// their UI Automation peers (no user input), then reads state back through the model AND the
+// live TextBlock. A retry-reposted state machine waits for each control to realize.
+
+WinuiDemo* _demo   = nullptr;
+bool       _stMode = false;
+int        _stStep = 0;
+int        _stTick = 0;
+int        _stPass = 0;
+int        _stTotal = 0;
+bool       _stCreatedOk = false;
+
+void selfTestFinish()
+{
+    _stTotal = _stTotal + 3;
+    if (_stCreatedOk) _stPass = _stPass + 1; else printf("  FAIL: not all controls created\n");
+    if (_demo.count >= 1) _stPass = _stPass + 1; else printf("  FAIL: button click did not bump count\n");
+    if (winuiControlText("root/status") == "Count: 1") _stPass = _stPass + 1;
+    else printf("  FAIL: status TextBlock not updated (got '%s')\n", winuiControlText("root/status").data());
+    winuiExit();
+}
+
+void selfTestTick()
+{
+    _stTick = _stTick + 1;
+
+    if (_stStep == 0)
+    {
+        _stCreatedOk = _wCtx.nativeHandle("root/title") != 0u
+            && _wCtx.nativeHandle("root/en") != 0u
+            && _wCtx.nativeHandle("root/inc") != 0u
+            && _wCtx.nativeHandle("root/status") != 0u;
+        // Toggle the checkbox: enables the button on the next render.
+        if (winuiUiaToggle("root/en")) _stStep = 1;
+    }
+    else if (_stStep == 1)
+    {
+        // Wait for the model to pick up the toggle, then invoke the (now enabled) button.
+        if (_demo.enabled)
+        {
+            if (winuiUiaInvoke("root/inc")) _stStep = 2;
+        }
+    }
+    else if (_stStep == 2)
+    {
+        if (_demo.count >= 1) { selfTestFinish(); return; }
+    }
+
+    if (_stTick >= 200) { selfTestFinish(); return; }
+    winuiPost(() => { selfTestTick(); });
+}
+
+extern int main(int argc, char** argv)
+{
+    _stMode = argc > 1 && strcmp(argv[1], "--selftest") == 0;
+
+    // Register the post-mount hook: in self-test mode, drive the controls on the UI thread.
+    if (_stMode) setPostMount(() => { winuiPost(() => { selfTestTick(); }); });
+
+    _demo = new WinuiDemo();
+    runAppWinui(_demo);
+
+    if (!_stMode) return 0;
+    if (_stPass == _stTotal && _stTotal > 0)
+    {
+        printf("PASS: winui host self-test %d/%d (create, checkbox->enable, click->count, textblock readback)\n", _stPass, _stTotal);
+        return 0;
+    }
+    printf("FAIL: winui host self-test %d/%d\n", _stPass, _stTotal);
+    return 1;
+}
