@@ -81,6 +81,13 @@ def find_misattributed_hints(text: str, diags: list) -> list[str]:
 # when -i points at that package. The package is per-user and version-specific.
 WIN32_METADATA_DEMO = "example/COM/direct2d_demo.cb"
 
+# fedit imports its framework from a sibling directory (`import "win32_native_host.cb"`
+# resolved against example/ui). example.bat compiles it with `-i example/ui`, but the
+# bulk sweep's single import-dir slot is already spent on the Win32-metadata package,
+# so fedit cannot be analyzed standalone here. Skip it - the file is exercised (and
+# leak-checked) by example.bat's dedicated fedit self-test worker.
+CROSS_DIR_IMPORT_SKIP = "example/ui/fedit/fedit.cb"
+
 
 def find_win32_metadata_dir() -> Path | None:
     """Return the newest cached Win32-metadata package dir containing Windows.Win32.winmd,
@@ -122,6 +129,8 @@ def collect_files(include_win32_demo: bool) -> list[Path]:
     if not include_win32_demo:
         demo = (REPO_ROOT / WIN32_METADATA_DEMO).resolve()
         files = [f for f in files if f.resolve() != demo]
+    skip = (REPO_ROOT / CROSS_DIR_IMPORT_SKIP).resolve()
+    files = [f for f in files if f.resolve() != skip]
     return files
 
 

@@ -1,0 +1,319 @@
+// fedit.cb - a small real native text editor, the flagship demo for the CFlat
+// native UI framework (the "not Electron" pitch: a self-contained native exe with
+// real OS controls, a real menu bar + accelerators, real shell file dialogs, and a
+// real multiline editor - no browser engine).
+//
+// Features: open / edit / save / save-as text files; a find bar; a dirty-close
+// prompt; a light/dark theme switch (immersive dark titlebar); and a second window
+// (Help > About). The editor buffer is a native multiline EDIT (source of truth),
+// so typing a large file never round-trips through the framework - only a dirty
+// notification does.
+//
+// Build & run:
+//   x64/Release/cflat.exe example/ui/fedit/fedit.cb -i example/ui -o out/fedit.exe
+//   out\fedit.exe
+//
+// Headless state-assert self-test (example.bat gate; drives via SendMessage +
+// direct load/save, since OS file dialogs cannot run unattended):
+//   out\fedit.exe --selftest
+import "win32_native_host.cb";
+import "filesystem.cb";
+
+// Menu command ids (any positive ints distinct from each other; menu WM_COMMAND
+// carries lParam == 0 so these never clash with control notifications).
+int CMD_NEW      = 101;
+int CMD_OPEN     = 102;
+int CMD_SAVE     = 103;
+int CMD_SAVEAS   = 104;
+int CMD_EXIT     = 105;
+int CMD_FIND     = 106;
+int CMD_FINDNEXT = 107;
+int CMD_THEME    = 108;
+int CMD_ABOUT    = 109;
+
+string EDITOR_KEY = "root/editor";
+
+// Filename portion of a path (after the last '/' or '\'). Returns an owned substring,
+// so it is `move` per the core-lib convention (allocating string returns transfer
+// ownership); without `move` the buffer is not a registered owned temp and would be
+// orphaned when the result flows through a ternary.
+move string baseName(string p)
+{
+    int last = -1; int i = 0; int n = (int)p.length();
+    while (i < n) { char c = p.data()[i]; if (c == '/' || c == '\\') last = i; i++; }
+    return substring(p, last + 1, n - last - 1);
+}
+
+class Editor : Component
+{
+    string path     = default;   // current file ("" = untitled)
+    bool   dirty    = false;
+    bool   isDark   = false;
+    bool   findOpen = false;
+    string findText = default;
+
+    Element render(UiContext* ctx)
+    {
+        ctx.theme = this.isDark ? darkTheme() : lightTheme();
+
+        Box* root = box(makeStyle(0, hostWidth(), hostHeight()));
+        root.setKey("root");
+
+        // Status line: filename + dirty marker.
+        string name = this.path.length() > 0 ? baseName(this.path) : "untitled";
+        string star = this.dirty ? " *" : "";
+        Text* status = text("fedit   |   " + name + star);
+        status.setKey("status");
+        root.add(status);
+
+        // Optional find bar (toggled by Edit > Find). Controlled TextInput.
+        if (this.findOpen)
+        {
+            TextInput* f = textInput(this.findText,
+                                     (string v) => { this.findText = "" + v; ctx.invalidate(); });
+            f.width = 40;
+            f.placeholder = "find text (F3 = next)";
+            f.setKey("find");
+            root.add(f);
+        }
+
+        // The editor fills the rest. Its key is stable so toggling the find bar
+        // reuses the SAME native EDIT (its text survives). value "" is never pushed
+        // by render (uncontrolled); content flows through nativeSetControlText.
+        int used = this.findOpen ? 3 : 2;
+        int eh = hostHeight() - used; if (eh < 3) eh = 3;
+        TextArea* ed = textArea("", () => { this.markDirty(ctx); });
+        ed.width = hostWidth();
+        ed.height = eh;
+        ed.setKey("editor");
+        root.add(ed);
+        return root;
+    }
+
+    void markDirty(UiContext* ctx)
+    {
+        if (!this.dirty) { this.dirty = true; ctx.invalidate(); }
+    }
+
+    // Load a file into the editor (push into the native buffer; not dirty after).
+    void loadPath(string p, UiContext* ctx)
+    {
+        string content = File.readAllText(p);
+        nativeSetControlText(EDITOR_KEY, content);
+        this.path = "" + p;
+        this.dirty = false;
+        ctx.invalidate();
+    }
+
+    // Pull the editor buffer and write it to `p`.
+    bool saveTo(string p)
+    {
+        string content = nativeControlText(EDITOR_KEY);
+        return File.writeAllText(p, content);
+    }
+
+    void doSave(UiContext* ctx)
+    {
+        if (this.path.length() == 0) { this.doSaveAs(ctx); return; }
+        if (this.saveTo(this.path)) { this.dirty = false; ctx.invalidate(); }
+        else nativeInfo("fedit", "Could not write the file.");
+    }
+
+    void doSaveAs(UiContext* ctx)
+    {
+        string p = nativeSaveFile();
+        if (p.length() == 0) return;
+        if (this.saveTo(p)) { this.path = "" + p; this.dirty = false; ctx.invalidate(); }
+        else nativeInfo("fedit", "Could not write the file.");
+    }
+
+    // If there are unsaved changes, ask; returns true if it is OK to proceed
+    // (discard), false to cancel the operation.
+    bool confirmDiscard(UiContext* ctx)
+    {
+        if (!this.dirty) return true;
+        int r = nativeConfirm("fedit", "You have unsaved changes. Save them?");
+        if (r == 1) { this.doSave(ctx); return !this.dirty; }   // Yes: saved iff clean now
+        if (r == 0) return true;                                // No: discard
+        return false;                                           // Cancel
+    }
+
+    // Select the next occurrence of findText in the editor, after the caret.
+    void doFind()
+    {
+        if (this.findText.length() == 0) return;
+        u64 hu = _nCtx.nativeHandle(EDITOR_KEY);
+        if (hu == 0u) return;
+        void* h = u2h(hu);
+        string content = nativeControlText(EDITOR_KEY);
+        u32 selA = 0u; u32 selB = 0u;
+        SendMessageA(h, (u32)EM_GETSEL, (u64)&selA, (i64)&selB);
+        int startPos = (int)selB;
+        char* hit = strstr(content.data() + startPos, this.findText.data());
+        if (hit == nullptr) hit = strstr(content.data(), this.findText.data());   // wrap
+        if (hit == nullptr) return;
+        int pos = (int)(hit - content.data());
+        int end = pos + (int)this.findText.length();
+        SendMessageA(h, (u32)EM_SETSEL, (u64)pos, (i64)end);
+        SendMessageA(h, (u32)EM_SCROLLCARET, 0u, (i64)0);
+        SetFocus(h);
+    }
+
+    // Dispatch a menu / accelerator command.
+    void onCommand(int id, UiContext* ctx)
+    {
+        if (id == CMD_NEW)
+        {
+            if (!this.confirmDiscard(ctx)) return;
+            nativeSetControlText(EDITOR_KEY, "");
+            this.path = ""; this.dirty = false; ctx.invalidate();
+        }
+        else if (id == CMD_OPEN)
+        {
+            if (!this.confirmDiscard(ctx)) return;
+            string p = nativeOpenFile();
+            if (p.length() > 0) this.loadPath(p, ctx);
+        }
+        else if (id == CMD_SAVE)    this.doSave(ctx);
+        else if (id == CMD_SAVEAS)  this.doSaveAs(ctx);
+        else if (id == CMD_FIND)    { this.findOpen = true; ctx.invalidate(); }
+        else if (id == CMD_FINDNEXT) this.doFind();
+        else if (id == CMD_THEME)   { this.isDark = !this.isDark; ctx.invalidate(); }
+        else if (id == CMD_ABOUT)
+            showSecondaryWindow("About fedit",
+                "fedit\r\n\r\nA tiny native text editor built with the CFlat UI\r\n"
+                + "framework - real Win32 controls, no browser engine.\r\n\r\n"
+                + "A self-contained native exe: the anti-Electron demo.");
+        else if (id == CMD_EXIT)    { if (this.confirmDiscard(ctx)) nativeCloseWindow(); }
+    }
+};
+
+// Declare the menu bar + accelerators (read by the host at window creation).
+void setupMenu()
+{
+    menuReset();
+    int mFile = menuAddTop("File");
+    menuAddItem(mFile, "New",        "Ctrl+N",       CMD_NEW);
+    menuAddItem(mFile, "Open...",    "Ctrl+O",       CMD_OPEN);
+    menuAddItem(mFile, "Save",       "Ctrl+S",       CMD_SAVE);
+    menuAddItem(mFile, "Save As...", "Ctrl+Shift+S", CMD_SAVEAS);
+    menuAddSeparator(mFile);
+    menuAddItem(mFile, "Exit",       "",             CMD_EXIT);
+
+    int mEdit = menuAddTop("Edit");
+    menuAddItem(mEdit, "Find...",    "Ctrl+F",       CMD_FIND);
+    menuAddItem(mEdit, "Find Next",  "F3",           CMD_FINDNEXT);
+
+    int mView = menuAddTop("View");
+    menuAddItem(mView, "Toggle Theme", "Ctrl+T",     CMD_THEME);
+
+    int mHelp = menuAddTop("Help");
+    menuAddItem(mHelp, "About fedit", "",            CMD_ABOUT);
+}
+
+// Wire the command + close handlers. They reach the editor via _nApp (no capture),
+// so they are unaffected by the component being moved into the host.
+void wireHandlers()
+{
+    setMenuHandler((int id) =>
+    {
+        Editor* e = _nApp as Editor;
+        if (e != nullptr) e.onCommand(id, &_nCtx);
+    });
+    setCloseQuery(() =>
+    {
+        Editor* e = _nApp as Editor;
+        if (e == nullptr) return true;
+        return e.confirmDiscard(&_nCtx);
+    });
+}
+
+// ── Headless state-assert self-test ──────────────────────────────────────────
+bool _has(string s, const char* sub) { return strstr(s.data(), (char*)sub) != nullptr; }
+
+int feditSelfTest()
+{
+    createNativeWindow("fedit-selftest", false);   // hidden
+    _nW = 70; _nH = 30;
+    setupMenu();
+    wireHandlers();
+    _nApp = new Editor();
+    buildNativeTree();
+
+    Editor* e = _nApp as Editor;
+    void* hed = u2h(_nCtx.nativeHandle(EDITOR_KEY));
+    int pass = 0; int total = 0;
+
+    // 1. The editor became a real multiline EDIT.
+    total++;
+    if (hed != nullptr) pass++; else printf("  FAIL: no editor control\n");
+
+    // 2. Open a file: content flows into the buffer and the doc is not dirty.
+    total++;
+    char[300] tdir; GetTempPathA(300u, tdir);
+    string tmp = (string)tdir + "fedit_selftest.txt";
+    File.writeAllText(tmp, "hello world\r\nsecond line\r\nhello again");
+    e.loadPath(tmp, &_nCtx);
+    string got = nativeControlText(EDITOR_KEY);
+    bool opened = _has(got, "hello world") && _has(got, "second line") && !e.dirty;
+    if (opened) pass++; else printf("  FAIL: open/load (dirty=%d)\n", (int)e.dirty);
+
+    // 3. Editing the native EDIT fires the dirty notification (EN_CHANGE routed).
+    //    EM_REPLACESEL inserts text like a keystroke would, firing EN_CHANGE.
+    total++;
+    char[8] ins; ins[0] = ' '; ins[1] = 'X'; ins[2] = '\0';
+    SendMessageA(hed, (u32)EM_SETSEL, 0u, (i64)0);
+    SendMessageA(hed, (u32)EM_REPLACESEL, 1u, (i64)&ins[0]);
+    bool becameDirty = e.dirty;
+    if (becameDirty) pass++; else printf("  FAIL: edit did not mark dirty\n");
+
+    // 4. Save to a new path (bypassing the OS dialog): the file round-trips.
+    total++;
+    string tmp2 = (string)tdir + "fedit_selftest_out.txt";
+    e.path = "" + tmp2;
+    e.doSave(&_nCtx);
+    string back = File.readAllText(tmp2);
+    // Test 3 inserted " X" at the start, so the pulled+saved buffer is " Xhello...".
+    bool saved = _has(back, "Xhello world") && !e.dirty;
+    if (saved) pass++; else printf("  FAIL: save round-trip (dirty=%d back=[%s])\n", (int)e.dirty, back.data());
+
+    // 5. Menu routing: drive View > Toggle Theme via WM_COMMAND; the host applies
+    //    the dark theme.
+    total++;
+    SendMessageA(_nHost.window, (u32)WM_COMMAND, (u64)CMD_THEME, (i64)0);
+    bool themed = _nHost.dark;
+    if (themed) pass++; else printf("  FAIL: theme toggle via menu\n");
+
+    // 6. Find: locate the second "hello" after the caret and select it.
+    total++;
+    nativeSetControlText(EDITOR_KEY, "alpha hello beta hello gamma");
+    SendMessageA(hed, (u32)EM_SETSEL, 0u, (i64)0);   // caret at start
+    e.findText = "hello";
+    e.doFind();                                      // selects first "hello" (pos 6)
+    e.doFind();                                      // selects second "hello" (pos 17)
+    u32 a = 0u; u32 b = 0u;
+    SendMessageA(hed, (u32)EM_GETSEL, (u64)&a, (i64)&b);
+    bool found = (int)a == 17;
+    if (found) pass++; else printf("  FAIL: find next (selStart=%d, want 17)\n", (int)a);
+
+    // Teardown: release all global host + context state (leak-clean for heap-audit).
+    nativeTeardownForTest();
+
+    if (pass == total)
+    {
+        printf("PASS: fedit self-test %d/%d (open, edit-dirty, save, menu, theme, find)\n", pass, total);
+        return 0;
+    }
+    printf("FAIL: fedit self-test %d/%d\n", pass, total);
+    return 1;
+}
+
+extern int main(int argc, char** argv)
+{
+    if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
+        return feditSelfTest();
+
+    setupMenu();
+    wireHandlers();
+    return runAppGuiNative(new Editor(), "fedit");
+}

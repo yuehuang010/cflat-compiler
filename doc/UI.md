@@ -11,10 +11,15 @@ the "sugar-compatible element contract" is what a future `<View/>` grammar sugar
 (and an eventual `core/` promotion) desugars against. Changes to the frozen
 surface are deliberate and bump the API version.
 
-- **Framework API version:** 8 (v5 added color to `Style` + `Canvas`; v6 added the
+- **Framework API version:** 9 (v5 added color to `Style` + `Canvas`; v6 added the
   `Theme` styling preference and hover/pressed/focus interaction states; v7 added the
   `Checkbox` widget, the `disabled` state, and `Style.gap`; v8 added the `ProgressBar`
-  and `Slider` widgets with the `track`/`accent` theme slots)
+  and `Slider` widgets with the `track`/`accent` theme slots; v9 added the `NativeHost`
+  seam - real OS controls as an alternative output stage to `Canvas` - plus `Patch.key`
+  identity, the `UiContext.nativeByKey` shadow map, and the DIP layout unit; v10 added
+  the `TextArea` multiline element and the Win32 native host's editor features -
+  per-monitor DPI, dark titlebar + themed controls, a declarative menu bar with
+  accelerators, shell file dialogs, message boxes, and a secondary window)
 - **Location:** `example/ui/` (framework + TUI and Win32 hosts). NOT in `core/`
   yet - promotion is deferred to a later release.
 - **Status:** the framework is a single source of truth (`example/ui/ui.cb`);
@@ -80,6 +85,7 @@ Notes:
 | `Checkbox` | `ELEM_CHECKBOX` | controlled on/off toggle | `string label`, `bool checked`, `Lambda<void(bool)> onChange`, `bool disabled` |
 | `ProgressBar` | `ELEM_PROGRESS` | presentational fill bar | `int value` (0..100), `int width` |
 | `Slider` | `ELEM_SLIDER` | controlled value via click/drag/arrows | `int value` (0..100), `int width`, `Lambda<void(int)> onChange`, `bool disabled` |
+| `TextArea` | `ELEM_TEXTAREA` | multiline text region (editor) | `string value` (push), `Lambda<void()> onChange` (dirty notify), `int width/height` |
 | `ScrollView` | `ELEM_SCROLL` | clipped scrollable viewport | `Style style` (viewport), `children`, `int scrollY` |
 | `ComponentElement` | `ELEM_COMPONENT` | wraps a mounted component subtree | single inner child |
 
@@ -269,6 +275,7 @@ struct UiContext
     string hoverKey;    // node under the pointer ("" = none)
     string pressKey;    // node pressed/held ("" = none)
     Theme  theme;       // styling preference (default = monochrome)
+    dictionary<string, u64> nativeByKey;   // v9: key path -> native control handle
 
     void invalidate();          // mark the UI dirty
     bool consumeDirty();        // read + clear the flag
@@ -280,6 +287,11 @@ struct UiContext
     void setPress(string key);
     void clearPress();
     bool hasPress(string key);
+
+    void setNativeHandle(string key, u64 h);   // v9: shadow-map accessors
+    u64  nativeHandle(string key);             // 0 if none
+    bool hasNativeHandle(string key);
+    void removeNativeHandle(string key);
 };
 ```
 
@@ -310,8 +322,14 @@ leaves are swapped in from WIP.
 
 ```
 int PATCH_UPDATE; int PATCH_REPLACE; int PATCH_INSERT; int PATCH_REMOVE;
-struct Patch { int op; int nodeKind; string detail; };
+struct Patch { int op; int nodeKind; string detail; string key; };
 ```
+
+`Patch.key` (v9) is the affected node's stable key path - the parent chain of node
+keys joined with `/`, with unkeyed nodes carrying a synthesized positional segment
+(`#i`). It lets a `NativeHost` (below) route a create/update/destroy to the right
+control by identity. Adding it did not change patch op/kind/count/order, so the
+Canvas self-tests are byte-identical.
 
 Leaf change-detection is the structured `propsEqual()` - no stringly-typed
 signatures. Children are matched by key when keyed (so middle insert/remove and
@@ -419,6 +437,78 @@ runtime, or Yoga.
 
 `Row`/`Column`, `TextInput`, `ScrollView`, and Tab focus navigation are
 implemented as thin layers over these seams (see above), not special cases.
+
+## The `NativeHost` seam (v9) - real OS controls
+
+`Canvas` paints the tree pixel by pixel. `NativeHost` is the alternative output
+stage: instead of painting, it drives real OS controls (HWND on Windows; NSView
+later) so the OS handles rendering, text input, IME, and accessibility. The
+app-facing model (Element tree, Component, controlled widgets, Theme, keyed
+identity) is unchanged - only the output stage differs. The contract lives in
+`example/ui/ui_native.cb`; the Win32 implementation is `win32_native_host.cb`.
+
+```
+interface NativeHost
+{
+    u64  createControl(int elemKind, u64 parentHandle, string key);
+    void destroyControl(u64 h);
+    void setFrame(u64 h, Rect frameDip);
+    void setText(u64 h, const char* s);
+    void setBoolProp(u64 h, int prop, bool v);      // PROP_CHECKED/ENABLED/VISIBLE
+    void setIntProp(u64 h, int prop, int v);        // PROP_VALUE/MAX/CARET/SCROLLY
+    void setAccent(u64 h, int fgColor, int bgColor);// 0 = native default
+    Size measureText(const char* s, int fontId, int wrapWidthDip);  // FONT_UI/FONT_MONO
+    void requestLayout();
+};
+```
+
+Design rules that keep the seam WinUI-3-ready: handles are opaque `u64` and are
+never dereferenced by `ui.cb`; every mutation is a property set keyed by
+`(handle, prop)` (a 1:1 map to a XAML `DependencyProperty` set later); events flow
+back only through the existing `Event` + `dispatch()` seam, with the host owning
+the native->`Event` translation.
+
+- **Shadow map.** `UiContext` gains `dictionary<string, u64> nativeByKey` mapping a
+  node's key path to its control handle, with accessors `setNativeHandle` /
+  `nativeHandle` / `hasNativeHandle` / `removeNativeHandle`. Only a `NativeHost`
+  touches it; Canvas hosts leave it empty and inert. The handles are non-owning
+  integers, so tearing the map down destroys no windows - the host destroys
+  controls explicitly.
+- **DIP units.** Layout math in `ui.cb` is unit-blind integer arithmetic. A
+  Canvas/TUI host reads those integers as cells (1 DIP == 1 cell, so the TUI stays
+  byte-identical); a `NativeHost` reads them as DIPs and scales DIP->physical px at
+  the host boundary using the monitor DPI. `measureText` replaces the
+  1-cell-per-char assumption for native text.
+
+### Win32 native host: editor features (v10)
+
+`example/ui/win32_native_host.cb` (the `Win32Host` implementation of `NativeHost`)
+adds the pieces a real desktop app needs. All are documented-API only (no uxtheme
+ordinals). An app imports this host and calls `runAppGuiNative(new App(), title)`.
+
+- **Modern look:** per-monitor-v2 DPI awareness with DIP->px scaling and
+  `WM_DPICHANGED` relayout; Segoe UI Variable font; immersive dark-mode titlebar +
+  themed control/window colors driven by the app `Theme` (`WM_CTLCOLOR*` +
+  `WM_ERASEBKGND`). The menu bar and stock scrollbars stay light in dark mode
+  (documented-API limit).
+- **`TextArea`** is a multiline native `EDIT` and is **uncontrolled-with-sync** (a
+  deliberate exception to the controlled-widget rule for large buffers): the native
+  buffer is the source of truth, so typing never round-trips through the framework.
+  `value` is pushed only at creation; `onChange` is a dirty NOTIFICATION. Pull/push
+  the text with the host helpers `nativeControlText(keyPath)` /
+  `nativeSetControlText(keyPath, s)`.
+- **Menu bar + accelerators:** `menuReset()`, `menuAddTop(title)`,
+  `menuAddItem(top, label, accel, cmdId)`, `menuAddSeparator(top)` build the menu;
+  `setMenuHandler(Lambda<void(int)>)` receives command ids (menu clicks AND
+  accelerators like `"Ctrl+S"` / `"F3"`).
+- **Dialogs:** `nativeOpenFile()` / `nativeSaveFile()` (shell file dialogs),
+  `nativeConfirm(title, text)` (Yes/No/Cancel -> 1/0/-1), `nativeInfo(title, text)`.
+- **Windowing:** `setCloseQuery(Lambda<bool()>)` vetoes window close (dirty-save
+  prompt); `showSecondaryWindow(title, message)` opens a real second top-level
+  window; `nativeCloseWindow()` quits.
+- **Flagship demo:** `example/ui/fedit/fedit.cb` - a small native text editor built
+  entirely on the above (open/edit/save, find, dirty-close prompt, light/dark, two
+  windows). Build: `cflat example/ui/fedit/fedit.cb -i example/ui -o out/fedit.exe`.
 
 ## Hosts
 

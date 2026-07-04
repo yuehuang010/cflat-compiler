@@ -19,6 +19,7 @@
 
 import "list.cb";
 import "string.cb";
+import "dictionary.cb";
 
 // Flex main-axis direction for a View's children (the F3 layout pass strategy).
 int DIR_COLUMN = 0;   // stack children top-to-bottom (default)
@@ -539,6 +540,14 @@ struct UiContext
     string pressKey = default;   // "" = nothing pressed/held
     Theme  theme    = default;   // styling preference; default = monochrome
 
+    // Shadow map from a node's stable key path to its native control handle (an
+    // opaque u64: HWND on Windows, NSView* on macOS). Populated ONLY by a
+    // NativeHost (see ui_native.cb); the Canvas hosts (TUI/GDI) never touch it, so
+    // it stays empty and inert for them - this is the P0 key->handle plumbing. The
+    // handles are non-owning integers, so destroying the map destroys no windows;
+    // the host explicitly destroys controls.
+    dictionary<string, u64> nativeByKey = default;
+
     void invalidate() { this.dirty = true; }
 
     // Request a re-layout + repaint without a re-render. Used when a node's own
@@ -590,6 +599,16 @@ struct UiContext
         this.repaint = true;
     }
     bool hasPress(string key) { return this.pressKey.length() > 0 && this.pressKey == key; }
+
+    // Native-handle shadow map accessors (used by a NativeHost). 0 = no handle.
+    void setNativeHandle(string key, u64 h) { this.nativeByKey.set(key, h); }
+    bool hasNativeHandle(string key) { return this.nativeByKey.contains(key); }
+    u64  nativeHandle(string key)
+    {
+        if (!this.nativeByKey.contains(key)) return 0u;
+        return this.nativeByKey.get(key);
+    }
+    void removeNativeHandle(string key) { this.nativeByKey.remove(key); }
 };
 
 // Node-kind tags - returned by Element.kind() so the reconciler can compare node
@@ -604,6 +623,7 @@ int ELEM_SCROLL    = 7;
 int ELEM_CHECKBOX  = 8;
 int ELEM_PROGRESS  = 9;
 int ELEM_SLIDER    = 10;
+int ELEM_TEXTAREA  = 11;
 
 // The node interface. Typed host structs implement these so the tree can be
 // walked uniformly (serialize, layout, paint, dispatch, reconcile, teardown)
@@ -631,6 +651,9 @@ interface Element
     // Append the keys of focusable descendants (Button/TextInput) in tree order,
     // so Tab/Shift-Tab can build a focus ring. Leaves that cannot focus no-op.
     void collectFocusables(list<string>* keys);
+    // The absolute frame stamped by the last layout pass (in DIP/cell units). A
+    // NativeHost reads this to position the node's OS control (v9).
+    Rect nodeBounds();
 };
 
 // Lay out a root element to fill (w) cells wide at (x, y), height unbounded.
@@ -768,6 +791,7 @@ class View : Element
     list<Element>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
 };
 
 // ── Text: a leaf displaying a string ─────────────────────────────────────────
@@ -812,6 +836,7 @@ class Text : Element
     list<Element>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
 };
 
 // ── Button: a leaf with a title and a press handler ──────────────────────────
@@ -922,6 +947,7 @@ class Button : Element
     list<Element>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
 };
 
 // ── Box: a bordered container that fills a width x height region ───────────────
@@ -1029,6 +1055,7 @@ class Box : Element
     list<Element>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
 };
 
 // ── TextInput: a single-line editable text field ─────────────────────────────
@@ -1081,8 +1108,7 @@ class TextInput : Element
         int ink = pickColor(this.color, ctx.theme.inputText);
         if (this.disabled) ink = dimColor(ink);
         bool empty = this.value.length() == 0;
-        string shown = "" + this.value;
-        if (empty) shown = "" + this.placeholder;
+        string shown = empty ? this.placeholder : this.value;
         cv.drawText(this.bounds.x, this.bounds.y, shown.data(), ink);
         if (!this.disabled && ctx.hasFocus(this.key))
         {
@@ -1143,6 +1169,7 @@ class TextInput : Element
     list<Element>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
 };
 
 // ── Checkbox: a controlled on/off toggle with a label ────────────────────────
@@ -1231,6 +1258,7 @@ class Checkbox : Element
     list<Element>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
 };
 
 // ── ProgressBar: a non-interactive themed fill bar (value 0..100) ─────────────
@@ -1286,6 +1314,7 @@ class ProgressBar : Element
     list<Element>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
 };
 
 // ── Slider: an interactive value (0..100) set by click/drag or arrow keys ─────
@@ -1395,7 +1424,103 @@ class Slider : Element
     list<Element>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
 };
+
+// ── TextArea: a multiline, scrollable text region (the editor's core widget) ──
+// Deliberately NOT controlled per keystroke (round-tripping a large buffer per key
+// is the Electron-class mistake): the NATIVE control's buffer is the source of
+// truth. `value` is the text to PUSH (initial content / file open); `onChange` is a
+// dirty NOTIFICATION (no payload) fired on edits. The app pulls the current text
+// with a host helper (nativeControlText) keyed by this node's key path. A Canvas
+// host falls back to painting `value` line by line (read-only preview).
+class TextArea : Element
+{
+    string value    = default;   // pushed content (setText); not per-keystroke state
+    Lambda<void()> onChange = default;   // dirty notify (no payload)
+    int    width  = 40;
+    int    height = 10;
+    int    color = 0;
+    int    backgroundColor = 0;
+    bool   disabled = false;
+    Rect   bounds = default;
+    string key    = default;
+
+    move string toJson() { return "{\"type\":\"TextArea\"}"; }
+
+    Size layout(LayoutConstraints c)
+    {
+        int w = this.width;  if (w > c.availW && c.availW > 0) w = c.availW;
+        if (w < 4) w = 4;
+        int h = this.height; if (h < 2) h = 2;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        this.bounds = b;
+        Size s = default; s.w = w; s.h = h;
+        return s;
+    }
+
+    // Canvas fallback: draw the pushed text, one grid row per '\n'-delimited line,
+    // clipped to the region. Native hosts ignore this (the EDIT paints itself).
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        int bg = pickColor(this.backgroundColor, ctx.theme.inputBg);
+        if (bg != 0) cv.drawRect(this.bounds, true, bg);
+        cv.drawRect(this.bounds, false, pickColor(this.color, ctx.theme.panelBorder));
+        int ink = pickColor(this.color, ctx.theme.inputText);
+        int row = 0; int start = 0; int n = (int)this.value.length();
+        int i = 0;
+        while (i <= n && row < this.bounds.h - 1)
+        {
+            bool eol = i == n || this.value.data()[i] == '\n';
+            if (eol)
+            {
+                string line = substring(this.value, start, i - start);
+                cv.drawText(this.bounds.x + 1, this.bounds.y + 1 + row, line.data(), ink);
+                row++; start = i + 1;
+            }
+            i++;
+        }
+    }
+
+    bool dispatch(Event e, UiContext* ctx)
+    {
+        if (this.disabled) return false;
+        if (e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y))
+        {
+            ctx.focus(this.key);
+            return true;
+        }
+        return false;
+    }
+
+    void destroyTree() { }
+    int kind() { return ELEM_TEXTAREA; }
+    void collectFocusables(list<string>* keys)
+    {
+        if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
+    }
+    // Uncontrolled: the value flowing down is a PUSH, not per-keystroke state, so
+    // do not treat a value difference as a prop change (that would clobber the
+    // native buffer mid-edit). Same kind + same key = the same editor.
+    bool propsEqual(Element other)
+    {
+        TextArea* o = other as TextArea;
+        return o != nullptr && this.disabled == o.disabled;
+    }
+    list<Element>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// A multiline text region seeded with `value` and notifying `onChange` on edits.
+TextArea* textArea(string value, Lambda<void()> onChange)
+{
+    TextArea* t = new TextArea();
+    t.value = value;
+    t.onChange = onChange;
+    return t;
+}
 
 // ── ScrollView: a clipped, vertically scrollable viewport ─────────────────────
 // Lays its children out in a tall virtual column shifted up by scrollY, then
@@ -1547,6 +1672,7 @@ class ScrollView : Element
     list<Element>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
 };
 
 // Convenience constructors returning the concrete heap pointer (so callers can
@@ -1700,6 +1826,7 @@ struct Patch
     int    op       = 0;          // PATCH_*
     int    nodeKind = 0;          // ELEM_* of the affected node
     string detail   = default;    // human-readable, for tests/debug
+    string key      = default;    // stable key path of the affected node ("" if unkeyed)
 };
 
 Patch makePatch(int op, int nodeKind, string detail)
@@ -1709,6 +1836,27 @@ Patch makePatch(int op, int nodeKind, string detail)
     p.nodeKind = nodeKind;
     p.detail = detail;
     return p;
+}
+
+// Patch identity (P0): the affected node's stable key path lets a NativeHost route
+// a create/update/destroy to the right control without re-walking the tree. `key`
+// is the parent key-path joined with the node's own key; unkeyed nodes carry the
+// positional path the reconciler synthesizes at the call site.
+Patch makePatchKeyed(int op, int nodeKind, string detail, string key)
+{
+    Patch p = default;
+    p.op = op;
+    p.nodeKind = nodeKind;
+    p.detail = detail;
+    p.key = key;
+    return p;
+}
+
+// Join a parent key path with a child segment, e.g. "root" + "save" -> "root/save".
+string joinKeyPath(string parent, string seg)
+{
+    if (parent.length() == 0) return "" + seg;
+    return parent + "/" + seg;
 }
 
 // Index of the first element in `pool` whose key equals `key`, or -1. Used to
@@ -1732,10 +1880,32 @@ int indexByKey(list<Element>* pool, string key)
 // Frees whichever subtree it discards. Ownership of both args transfers in.
 move Element reconcile(move Element committed, move Element wip, list<Patch>* patches)
 {
+    // Public entry: the root has no parent path. reconcilePath threads a stable
+    // key path down the tree so each patch carries its node's identity (P0).
+    return reconcilePath(committed, wip, patches, "");
+}
+
+// The child segment for a node at position `pos`: its own key if keyed, else the
+// synthesized positional segment "#pos" so unkeyed nodes still get a stable path.
+string keySegment(Element node, int pos)
+{
+    string k = node.keyOf();
+    if (k.length() > 0) return k;
+    return "#" + pos.toString();
+}
+
+// Reconcile threading the parent key path. Behavior (patch op/kind/count/order and
+// which subtree is freed) is IDENTICAL to the pre-P0 reconcile; the only addition
+// is populating each patch's `key` with the affected node's joined key path.
+move Element reconcilePath(move Element committed, move Element wip, list<Patch>* patches, string parentPath)
+{
+    // The committed node's own segment (keyed identity; "" at the unkeyed root).
+    string selfPath = joinKeyPath(parentPath, keySegment(committed, 0));
+
     // Different node type at this slot: replace the whole subtree.
     if (committed.kind() != wip.kind())
     {
-        patches.add(makePatch(PATCH_REPLACE, wip.kind(), "replace"));
+        patches.add(makePatchKeyed(PATCH_REPLACE, wip.kind(), "replace", selfPath));
         deleteTree(committed);
         return wip;
     }
@@ -1747,7 +1917,7 @@ move Element reconcile(move Element committed, move Element wip, list<Patch>* pa
         if (!committed.propsEqual(wip))
         {
             // Adopt the new leaf (new props, and a fresh onPress for Button).
-            patches.add(makePatch(PATCH_UPDATE, wip.kind(), "update"));
+            patches.add(makePatchKeyed(PATCH_UPDATE, wip.kind(), "update", selfPath));
             deleteTree(committed);
             return wip;
         }
@@ -1780,11 +1950,12 @@ move Element reconcile(move Element committed, move Element wip, list<Patch>* pa
         if (idx >= 0)
         {
             Element oldC = staged.take(idx);
-            kids.add(reconcile(oldC, newC, patches));
+            kids.add(reconcilePath(oldC, newC, patches, selfPath));
         }
         else
         {
-            patches.add(makePatch(PATCH_INSERT, newC.kind(), "insert"));
+            string childPath = joinKeyPath(selfPath, keySegment(newC, i));
+            patches.add(makePatchKeyed(PATCH_INSERT, newC.kind(), "insert", childPath));
             kids.add(newC);
         }
         i++;
@@ -1794,7 +1965,8 @@ move Element reconcile(move Element committed, move Element wip, list<Patch>* pa
     while (staged.count() > 0)
     {
         Element rem = staged.take(0);
-        patches.add(makePatch(PATCH_REMOVE, rem.kind(), "remove"));
+        string remPath = joinKeyPath(selfPath, keySegment(rem, 0));
+        patches.add(makePatchKeyed(PATCH_REMOVE, rem.kind(), "remove", remPath));
         deleteTree(rem);
     }
 
@@ -1893,6 +2065,7 @@ class ComponentElement : Element
     list<Element>* childList() { return &this.inner; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
 };
 
 // Render a component now and wrap its subtree as a keyed reconciler node. The

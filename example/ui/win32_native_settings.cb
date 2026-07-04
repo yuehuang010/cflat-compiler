@@ -1,0 +1,198 @@
+// win32_native_settings.cb - a settings panel rendered with REAL Win32 controls
+// through win32_native_host.cb (the NativeHost output stage), not GDI painting.
+//
+// Same app-facing shape as win32_settings.cb (labels, a text field, checkboxes, a
+// slider mirrored by a progress bar, a disabled-until-enabled button), but every
+// widget here is a genuine OS control: a BUTTON, an EDIT, a msctls_progress32, a
+// trackbar. The OS paints them, handles IME, and owns Tab focus.
+//
+// Build & run (live window):
+//   x64/Release/cflat.exe example/ui/win32_native_settings.cb -o out/nsettings.exe
+//   out\nsettings.exe
+//
+// Headless state-assert self-test (no visible window; example.bat gate):
+//   x64/Release/cflat.exe example/ui/win32_native_settings.cb --heap-audit -o out/nsettings.exe
+//   out\nsettings.exe --selftest
+import "win32_native_host.cb";
+
+class NativeSettings : Component
+{
+    bool   darkMode = false;
+    bool   autoSave = false;
+    int    volume   = 40;
+    int    clicks   = 0;
+    string name     = default;
+
+    Element render(UiContext* ctx)
+    {
+        // Declare the styling preference; the native host reads it to theme the
+        // titlebar (immersive dark mode) and control colors (WM_CTLCOLOR*).
+        ctx.theme = this.darkMode ? darkTheme() : lightTheme();
+
+        Box* root = box(makeStyle(1, hostWidth(), hostHeight()));
+        root.style.gap = 1;
+        root.setKey("root");
+
+        Text* title = text("Settings (native controls)");
+        title.setKey("title");
+        root.add(title);
+
+        TextInput* nm = textInput(this.name, (string v) => { this.name = v; ctx.invalidate(); });
+        nm.width = 24;
+        nm.placeholder = "your name";
+        nm.setKey("name");
+        root.add(nm);
+
+        Checkbox* dark = checkbox("Dark mode", this.darkMode,
+                                  (bool v) => { this.darkMode = v; ctx.invalidate(); });
+        dark.setKey("dark");
+        root.add(dark);
+
+        Checkbox* au = checkbox("Auto-save", this.autoSave,
+                                (bool v) => { this.autoSave = v; ctx.invalidate(); });
+        au.setKey("auto");
+        root.add(au);
+
+        Slider* vol = slider(this.volume, 26, (int v) => { this.volume = v; ctx.invalidate(); });
+        vol.setKey("vol");
+        root.add(vol);
+
+        ProgressBar* pb = progressBar(this.volume, 26);
+        pb.setKey("pb");
+        root.add(pb);
+
+        Button* save = button("Save", () => { this.clicks = this.clicks + 1; ctx.invalidate(); });
+        save.setKey("save");
+        save.disabled = !this.autoSave;
+        root.add(save);
+
+        // Status echoes both the click count and the name, so the self-test can
+        // verify button + edit routing end-to-end through a separate control.
+        string who = this.name.length() > 0 ? this.name : "-";
+        Text* status = text("Clicks: " + this.clicks.toString() + " / " + who);
+        status.setKey("status");
+        root.add(status);
+        return root;
+    }
+};
+
+// ── Headless state-assert self-test ──────────────────────────────────────────
+// Creates an INVISIBLE window, builds the panel on real controls, then drives them
+// with SendMessage (BM_CLICK / SetWindowText / WM_HSCROLL) exactly as the OS would
+// on user input, and reads control state back (BM_GETCHECK / GetWindowText /
+// IsWindowEnabled / PBM_GETPOS). No pixels: the OS paints, so state is the oracle.
+
+bool _txtEq(void* h, const char* want)
+{
+    char[256] buf;
+    GetWindowTextA(h, buf, 256);
+    return strcmp(buf, (char*)want) == 0;
+}
+
+int nativeSelfTest()
+{
+    createNativeWindow("selftest", false);   // hidden top-level; sets host globals
+    _nW = 44; _nH = 26;
+
+    NativeSettings* app = new NativeSettings();
+    _nApp = app;                 // heap component: the pointer moves in cleanly
+    buildNativeTree();
+
+    void* win  = _nHost.window;
+    void* hTtl  = u2h(_nCtx.nativeHandle("root/title"));
+    void* hName = u2h(_nCtx.nativeHandle("root/name"));
+    void* hDark = u2h(_nCtx.nativeHandle("root/dark"));
+    void* hAuto = u2h(_nCtx.nativeHandle("root/auto"));
+    void* hVol  = u2h(_nCtx.nativeHandle("root/vol"));
+    void* hPb   = u2h(_nCtx.nativeHandle("root/pb"));
+    void* hSave = u2h(_nCtx.nativeHandle("root/save"));
+    void* hStat = u2h(_nCtx.nativeHandle("root/status"));
+
+    int pass = 0; int total = 0;
+
+    // 1. Every widget became a real control.
+    total++;
+    bool created = hTtl != nullptr && hName != nullptr && hDark != nullptr
+        && hAuto != nullptr && hVol != nullptr && hPb != nullptr
+        && hSave != nullptr && hStat != nullptr;
+    if (created) pass++; else printf("  FAIL: controls not all created\n");
+
+    // 2. Initial state: checkboxes clear, Save disabled, labels correct. The
+    //    status STATIC echoes the model (clicks + name), so it is the oracle for
+    //    later button/edit routing.
+    total++;
+    bool init = (int)SendMessageA(hDark, (u32)BM_GETCHECK, 0u, (i64)0) == 0
+        && (int)SendMessageA(hAuto, (u32)BM_GETCHECK, 0u, (i64)0) == 0
+        && IsWindowEnabled(hSave) == 0
+        && _txtEq(hTtl, "Settings (native controls)")
+        && _txtEq(hStat, "Clicks: 0 / -");
+    if (init) pass++; else printf("  FAIL: initial control state\n");
+
+    // 3. Click "Dark mode": the OS toggles the checkbox and notifies the parent;
+    //    the handler flips the model and the control reads back checked.
+    total++;
+    SendMessageA(hDark, (u32)BM_CLICK, 0u, (i64)0);
+    bool darkOn = (int)SendMessageA(hDark, (u32)BM_GETCHECK, 0u, (i64)0) == 1
+        && _nHost.dark;   // P2: the host applied the dark theme (titlebar + colors)
+    if (darkOn) pass++; else printf("  FAIL: dark toggle (host.dark=%d)\n", (int)_nHost.dark);
+
+    // 4. Click "Auto-save": enabling it must ENABLE the Save button on the next
+    //    render (disabled = !autoSave), proving a re-render re-synced a prop.
+    total++;
+    SendMessageA(hAuto, (u32)BM_CLICK, 0u, (i64)0);
+    bool saveEnabled = IsWindowEnabled(hSave) != 0;
+    if (saveEnabled) pass++; else printf("  FAIL: auto-save did not enable Save\n");
+
+    // 5. Click "Save": the handler bumps the counter, and the status STATIC updates
+    //    to "Clicks: 1 / -" - button routing end to end.
+    total++;
+    SendMessageA(hSave, (u32)BM_CLICK, 0u, (i64)0);
+    bool saved = _txtEq(hStat, "Clicks: 1 / -");
+    if (saved) pass++; else printf("  FAIL: save click did not update status\n");
+
+    // 6. Type into the EDIT (programmatic SetWindowText fires EN_CHANGE): the
+    //    controlled model picks up the text, shown in the status STATIC.
+    total++;
+    SetWindowTextA(hName, "Ada");
+    bool named = _txtEq(hStat, "Clicks: 1 / Ada");
+    if (named) pass++; else printf("  FAIL: edit change not routed to model\n");
+
+    // 7. Drag the trackbar (set pos + WM_HSCROLL): routeSlider reads TBM_GETPOS and
+    //    the mirrored progress bar follows the model.
+    total++;
+    SendMessageA(hVol, (u32)TBM_SETPOS, 1u, (i64)70);
+    SendMessageA(win, (u32)WM_HSCROLL, 0u, (i64)hVol);
+    int pbPos = (int)SendMessageA(hPb, (u32)PBM_GETPOS, 0u, (i64)0);
+    bool slid = pbPos == 70;
+    if (slid) pass++; else printf("  FAIL: slider drag (pbPos=%d)\n", pbPos);
+
+    // Teardown: destroy the window (cascades to child controls), free the tree and
+    // the heap component, and clear the host globals so --heap-audit sees no residue.
+    if (_nReady) { deleteTree(_nTree); _nReady = false; }
+    DestroyWindow(win);
+    delete _nApp;
+    _nApp = nullptr;
+    _nHost.window = nullptr;
+    // Free the global container backings (clear() keeps capacity; move each into a
+    // scoped local whose destructor releases the storage, so --heap-audit is clean).
+    { dictionary<string, u64> d = move _nCtx.nativeByKey; }
+    { list<string> lk = move _nHost.liveKeys; }
+    { list<u64> lh = move _nHost.liveHandles; }
+    _nCtx.blur();
+
+    if (pass == total)
+    {
+        printf("PASS: native host self-test %d/%d (create, checkbox, enable, click, edit, slider)\n", pass, total);
+        return 0;
+    }
+    printf("FAIL: native host self-test %d/%d\n", pass, total);
+    return 1;
+}
+
+extern int main(int argc, char** argv)
+{
+    if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
+        return nativeSelfTest();
+
+    return runAppGuiNative(new NativeSettings(), "CFlat UI - Settings (native)");
+}

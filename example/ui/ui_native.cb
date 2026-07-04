@@ -1,0 +1,68 @@
+// ui_native.cb - the NativeHost seam (P0 of the native UI framework plan).
+//
+// The Canvas hosts (SurfaceCanvas/GdiCanvas in ui.cb + win32host.cb) PAINT the
+// Element tree pixel by pixel. A NativeHost instead drives real OS controls (HWND
+// on Windows, NSView* on macOS later): the reconciled tree's stable keys map to
+// native control handles (UiContext.nativeByKey), and the host creates / updates /
+// destroys those controls to match the tree, letting the OS paint, do IME, and
+// expose accessibility for free.
+//
+// This file is JUST the contract + constants (no behavior). The Win32
+// implementation lives in win32_native_host.cb (P1); an AppKit one comes in P5.
+// Design rules that keep the seam WinUI-3-ready (see the plan):
+//   - Handles are opaque u64; ui.cb never dereferences them.
+//   - Every mutation is a property set keyed by (handle, prop) - a 1:1 map to a
+//     XAML DependencyProperty set later.
+//   - Events flow back only through the existing Event struct + dispatch() seam;
+//     the host owns the native->Event translation.
+//
+// Units: frames are in DIPs (device-independent pixels, 96-dpi logical). The
+// layout pass in ui.cb is unit-blind integer math; a Canvas/TUI host reads those
+// integers as cells (1 DIP == 1 cell, so the TUI stays byte-identical), and a
+// NativeHost scales DIP->physical px at the host boundary using the monitor DPI.
+
+import "ui.cb";
+
+// Boolean control properties (setBoolProp). Values are stable so a future backend
+// can switch on them directly.
+int PROP_CHECKED = 1;   // Checkbox/radio checked state
+int PROP_ENABLED = 2;   // control is interactive (vs disabled/dimmed)
+int PROP_VISIBLE = 3;   // control is shown
+
+// Integer control properties (setIntProp).
+int PROP_VALUE   = 1;   // ProgressBar/Slider position (0..100)
+int PROP_MAX     = 2;   // range maximum (default 100)
+int PROP_CARET   = 3;   // text caret index
+int PROP_SCROLLY = 4;   // vertical scroll offset (DIPs)
+
+// Font ids for measureText; a host maps these to a concrete typeface + size.
+int FONT_UI      = 0;   // the default UI font (Segoe UI Variable / system)
+int FONT_MONO    = 1;   // a monospace face (editor / code)
+
+// The native backend contract. One instance per app drives all its windows'
+// controls. A method that takes a handle `h` operates on a control previously
+// returned by createControl.
+interface NativeHost
+{
+    // Create a control of the given ELEM_* kind under `parentHandle` (0 = the
+    // window's client area). `key` is the node's stable key path, for the host's
+    // own reverse map (handle -> key) used to route events. Returns the handle.
+    u64  createControl(int elemKind, u64 parentHandle, string key);
+    void destroyControl(u64 h);
+
+    // Geometry + content, all property-style so they map to XAML setters later.
+    void setFrame(u64 h, Rect frameDip);
+    void setText(u64 h, const char* s);
+    void setBoolProp(u64 h, int prop, bool v);
+    void setIntProp(u64 h, int prop, int v);
+    void setAccent(u64 h, int fgColor, int bgColor);   // 0 = native default
+
+    // Text metrics for layout (replaces the 1-cell-per-char assumption). Returns
+    // the size in DIPs the string needs in font `fontId`, wrapped to
+    // `wrapWidthDip` (0 = single line, unbounded).
+    Size measureText(const char* s, int fontId, int wrapWidthDip);
+
+    // Ask the host to relayout the tree and reposition controls (e.g. after a
+    // content change that alters intrinsic sizes).
+    void requestLayout();
+};

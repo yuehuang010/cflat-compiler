@@ -1,0 +1,1112 @@
+// win32_native_host.cb - a native Win32 host that drives REAL OS controls.
+//
+// Where win32host.cb PAINTS the Element tree through GDI (GdiCanvas), this host is
+// the NativeHost output stage (see ui_native.cb): the reconciled tree's stable key
+// paths map to real child controls (BUTTON/STATIC/EDIT/checkbox/msctls_progress32/
+// trackbar/etched panel), and the host creates/updates/destroys those controls to
+// match the tree. The OS paints, handles IME + accessibility, and owns focus/Tab.
+//
+// The app-facing model (Component/Element/Theme/controlled widgets) is UNCHANGED;
+// an app that renders to the GDI host renders here too - it just imports this host
+// instead. Single window / single thread (P1); multi-window is P3.
+//
+// This file has no main(); an app imports it and calls runAppGuiNative().
+import "windows.h" lib { "user32.lib", "gdi32.lib", "comctl32.lib", "dwmapi.lib", "comdlg32.lib" } cache;
+import "ui_native.cb";
+
+// ── APIs not surfaced by the windows.h binding (declared by hand) ────────────
+// InitCommonControls() (commctrl.h) registers the classic control classes;
+// DwmSetWindowAttribute (dwmapi.h) drives the immersive dark-mode titlebar.
+extern stdcall void InitCommonControls();
+extern stdcall i32 DwmSetWindowAttribute(void* hwnd, u32 attr, void* pv, u32 cb);
+
+const int PBM_SETRANGE32 = 1030;   // WM_USER+6
+const int PBM_SETPOS     = 1026;   // WM_USER+2
+const int PBM_GETPOS     = 1032;   // WM_USER+8
+const int TBM_GETPOS     = 1024;   // WM_USER+0
+const int TBM_SETPOS     = 1029;   // WM_USER+5
+const int TBM_SETRANGE   = 1030;   // WM_USER+6
+const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+
+// Per-DIP base pixels at 96 dpi (100%). Layout math in ui.cb is unit-blind
+// integers; a native host reads them as DIPs and scales by the monitor dpi:
+// physical px = dip * BASE * dpi / 96. One layout column ~8px, one row ~26px so
+// native controls get sensible heights. P2 makes this DPI-driven (per-monitor-v2
+// awareness + WM_DPICHANGED); P1 used a fixed 96-dpi scale.
+const int BASE_X = 8;
+const int BASE_Y = 26;
+
+// ── The running app + its tree + context, reached from the free-function WndProc
+// (a stdcall callback cannot capture `this`). Single window / single thread, so
+// these host globals are the right tool; they live in the HOST file, not ui.cb.
+Win32Host _nHost  = default;
+Component _nApp   = default;
+Element   _nTree  = default;
+UiContext _nCtx   = default;
+bool      _nReady = false;
+int       _nW     = 80;   // client size in DIP units (layout width/height)
+int       _nH     = 30;
+
+// ── Declarative menu bar (P3) ─────────────────────────────────────────────────
+// The app builds a menu with menuReset/menuAddTop/menuAddItem before
+// runAppGuiNative; the host realizes it into an HMENU + an accelerator table.
+// Parallel lists (not a struct-with-closure) keep ownership simple. An item's
+// command id is MENU_ID_BASE + its index; WM_COMMAND with lParam == 0 routes here.
+// The app assigns each item an int command id and provides ONE dispatch closure
+// (setMenuHandler) that switches on the id - avoids a list-of-closures.
+list<string>          _menuTop        = default;   // top-level menu titles
+list<int>             _menuItemTopIdx = default;   // per item: owning top index
+list<string>          _menuItemLabel  = default;   // per item: label (with \t accel text)
+list<int>             _menuItemCmd    = default;   // per item: app command id (0 = separator)
+list<int>             _menuAccelKey   = default;   // per item: virtual key (0 = none)
+list<int>             _menuAccelMods  = default;   // per item: FCONTROL|FSHIFT|FALT
+Lambda<void(int)>     _menuHandler    = default;   // app's command dispatcher
+void*                 _accelTable     = nullptr;
+
+// Optional close guard: the app returns true to allow the window to close (e.g.
+// after a dirty-save prompt), false to veto. Default (unset) always allows.
+Lambda<bool()>        _closeQuery     = default;
+bool                  _hasCloseQuery  = false;
+
+void setMenuHandler(Lambda<void(int)> h) { _menuHandler = h; }
+void setCloseQuery(Lambda<bool()> q) { _closeQuery = q; _hasCloseQuery = true; }
+
+int hostWidth()  { return _nW; }
+int hostHeight() { return _nH; }
+
+void* u2h(u64 u) { return (void*)u; }
+
+// A node kind that maps to an OS control (vs a pure layout container that only
+// contributes geometry to its children). VIEW/SCROLL/COMPONENT are containers.
+bool nativeMappable(int kind)
+{
+    return kind == ELEM_BUTTON || kind == ELEM_TEXT || kind == ELEM_TEXTINPUT
+        || kind == ELEM_CHECKBOX || kind == ELEM_PROGRESS || kind == ELEM_SLIDER
+        || kind == ELEM_BOX || kind == ELEM_TEXTAREA;
+}
+
+// ── Win32Host: the NativeHost implementation ─────────────────────────────────
+// Owns the top-level window, the shared UI font, the reentrancy guard, and the
+// per-frame live-control bookkeeping (parallel key/handle lists) used to route
+// events and to destroy controls that fell out of the tree.
+class Win32Host : NativeHost
+{
+    void* window = nullptr;
+    void* font   = nullptr;
+    void* hInst  = nullptr;
+    bool  applying = false;          // guard: swallow self-inflicted EN_CHANGE
+    u32   dpi     = 96u;             // window dpi (96 = 100%); drives DIP->px
+    bool  dark    = false;           // last applied theme was dark (titlebar/bg)
+    u32   themeText = 0u;            // COLORREF for control text (WM_CTLCOLOR*)
+    u32   themeBg   = 0xFFFFFFu;     // COLORREF for control/window background
+    void* bgBrush   = nullptr;       // cached solid brush of themeBg
+    list<string> liveKeys    = default;   // keys with a live control this frame
+    list<u64>    liveHandles = default;   // parallel handles (HWND as u64)
+
+    // Physical pixels per layout DIP on each axis at the current dpi.
+    int dipX() { return BASE_X * (int)this.dpi / 96; }
+    int dipY() { return BASE_Y * (int)this.dpi / 96; }
+
+    // NativeHost: create a control of `elemKind` under `parentHandle`. `key` is the
+    // node's key path (kept by the caller in the shadow map). Returns the HWND.
+    u64 createControl(int elemKind, u64 parentHandle, string key)
+    {
+        void* parent = u2h(parentHandle);
+        string cls = "STATIC";
+        u32 style = (u32)(WS_CHILD | WS_VISIBLE);
+        if (elemKind == ELEM_BUTTON)
+        {
+            cls = "BUTTON";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON);
+        }
+        else if (elemKind == ELEM_CHECKBOX)
+        {
+            cls = "BUTTON";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX);
+        }
+        else if (elemKind == ELEM_TEXTINPUT)
+        {
+            cls = "EDIT";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL);
+        }
+        else if (elemKind == ELEM_TEXTAREA)
+        {
+            cls = "EDIT";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL
+                          | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN);
+        }
+        else if (elemKind == ELEM_TEXT)
+        {
+            cls = "STATIC";
+            style = (u32)(WS_CHILD | WS_VISIBLE | SS_LEFT);
+        }
+        else if (elemKind == ELEM_BOX)
+        {
+            cls = "STATIC";
+            style = (u32)(WS_CHILD | WS_VISIBLE | SS_ETCHEDFRAME);
+        }
+        else if (elemKind == ELEM_PROGRESS)
+        {
+            cls = "msctls_progress32";
+            style = (u32)(WS_CHILD | WS_VISIBLE);
+        }
+        else if (elemKind == ELEM_SLIDER)
+        {
+            cls = "msctls_trackbar32";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP);
+        }
+
+        void* h = CreateWindowExA(0u, cls.data(), "", style,
+                                  0, 0, 10, 10, parent, nullptr, this.hInst, nullptr);
+        if (this.font != nullptr)
+            SendMessageA(h, (u32)WM_SETFONT, (u64)this.font, (i64)1);
+        return (u64)h;
+    }
+
+    void destroyControl(u64 h)
+    {
+        if (h != 0u) DestroyWindow(u2h(h));
+    }
+
+    // Batched elsewhere (applyTree uses DeferWindowPos); this immediate form is the
+    // NativeHost contract for a one-off reposition.
+    void setFrame(u64 h, Rect frameDip)
+    {
+        MoveWindow(u2h(h), frameDip.x * this.dipX(), frameDip.y * this.dipY(),
+                   frameDip.w * this.dipX(), frameDip.h * this.dipY(), 1);
+    }
+
+    // Only push text when it actually differs, so an EDIT does not reset its caret
+    // (and STATIC/BUTTON do not needlessly invalidate) on every re-render.
+    void setText(u64 h, const char* s)
+    {
+        char[512] cur;
+        GetWindowTextA(u2h(h), cur, 512);
+        if (strcmp(cur, (char*)s) == 0) return;
+        SetWindowTextA(u2h(h), (char*)s);
+    }
+
+    void setBoolProp(u64 h, int prop, bool v)
+    {
+        if (prop == PROP_CHECKED)
+            SendMessageA(u2h(h), (u32)BM_SETCHECK, v ? 1u : 0u, (i64)0);
+        else if (prop == PROP_ENABLED)
+            EnableWindow(u2h(h), v ? 1 : 0);
+        else if (prop == PROP_VISIBLE)
+            ShowWindow(u2h(h), v ? (int)SW_SHOW : SW_HIDE);
+    }
+
+    // Route a value/max set to the right control message by its class (keeps the
+    // seam property-based: the host, not ui.cb, knows progress vs trackbar).
+    void setIntProp(u64 h, int prop, int v)
+    {
+        char[32] cn;
+        GetClassNameA(u2h(h), cn, 32);
+        bool isProg = strcmp(cn, "msctls_progress32") == 0;
+        bool isTrack = strcmp(cn, "msctls_trackbar32") == 0;
+        if (prop == PROP_VALUE)
+        {
+            if (isProg)  SendMessageA(u2h(h), (u32)PBM_SETPOS, (u64)v, (i64)0);
+            if (isTrack) SendMessageA(u2h(h), (u32)TBM_SETPOS, 1u, (i64)v);
+        }
+        else if (prop == PROP_MAX)
+        {
+            if (isProg)  SendMessageA(u2h(h), (u32)PBM_SETRANGE32, 0u, (i64)v);
+            if (isTrack) SendMessageA(u2h(h), (u32)TBM_SETRANGE, 1u, (i64)(v << 16));
+        }
+    }
+
+    // P1: native default look. P2 wires theme accents through WM_CTLCOLOR* +
+    // NM_CUSTOMDRAW; the seam is here so callers need not change.
+    void setAccent(u64 h, int fgColor, int bgColor) { }
+
+    // Text metrics in DIPs. Selects the UI font into a screen DC and measures.
+    Size measureText(const char* s, int fontId, int wrapWidthDip)
+    {
+        Size sz = default;
+        void* dc = GetDC(this.window);
+        void* oldF = nullptr;
+        if (this.font != nullptr) oldF = SelectObject(dc, this.font);
+        SIZE px = default;
+        GetTextExtentPoint32A(dc, (char*)s, strlen((char*)s), &px);
+        if (oldF != nullptr) SelectObject(dc, oldF);
+        ReleaseDC(this.window, dc);
+        sz.w = ((int)px.cx + this.dipX() - 1) / this.dipX();
+        sz.h = ((int)px.cy + this.dipY() - 1) / this.dipY();
+        return sz;
+    }
+
+    void requestLayout()
+    {
+        if (!_nReady) return;
+        layoutRoot(_nTree, 0, 0, _nW);
+        this.applyTree(_nTree, &_nCtx);
+    }
+
+    // Reconcile the Element tree to native controls: ensure a control per mappable
+    // node (create on first sight, reuse by key path), sync its props, collect its
+    // frame, then batch-position everything and destroy controls that left the tree.
+    void applyTree(Element tree, UiContext* ctx)
+    {
+        this.applying = true;
+
+        list<string> newKeys    = default;
+        list<u64>    newHandles = default;
+        list<int> fx = default; list<int> fy = default;
+        list<int> fw = default; list<int> fh = default;
+
+        this._applyNode(tree, keySegment(tree, 0), ctx,
+                        &newKeys, &newHandles, &fx, &fy, &fw, &fh);
+
+        // Destroy controls whose key path is no longer in the tree.
+        int i = 0;
+        while (i < this.liveKeys.count())
+        {
+            string k = this.liveKeys.get(i);
+            if (!listHasStr(&newKeys, k))
+            {
+                u64 h = ctx.nativeHandle(k);
+                this.destroyControl(h);
+                ctx.removeNativeHandle(k);
+            }
+            i++;
+        }
+
+        // Batch-position all live controls in one DeferWindowPos pass (flicker
+        // defense: the OS moves them together rather than one repaint each).
+        int n = newHandles.count();
+        if (n > 0)
+        {
+            void* hdwp = BeginDeferWindowPos(n);
+            int j = 0;
+            while (j < n)
+            {
+                hdwp = DeferWindowPos(hdwp, u2h(newHandles.get(j)), nullptr,
+                                      fx.get(j), fy.get(j), fw.get(j), fh.get(j),
+                                      (u32)(SWP_NOZORDER | SWP_NOACTIVATE));
+                j++;
+            }
+            EndDeferWindowPos(hdwp);
+        }
+
+        // Replace the live sets with copies (clear + add, not a move-assign, which
+        // repeated per frame corrupted the heap - avoid container move-into-field).
+        this.liveKeys.clear();
+        this.liveHandles.clear();
+        int m = 0;
+        while (m < newKeys.count())
+        {
+            this.liveKeys.add("" + newKeys.get(m));
+            this.liveHandles.add(newHandles.get(m));
+            m++;
+        }
+        this.applyTheme(ctx);
+        this.applying = false;
+    }
+
+    // Recursive worker: `path` is this node's key path. Mappable nodes get a
+    // control + synced props + a collected frame; every node recurses into its
+    // children (containers contribute only geometry).
+    void _applyNode(Element node, string path, UiContext* ctx,
+                    list<string>* keys, list<u64>* handles,
+                    list<int>* fx, list<int>* fy, list<int>* fw, list<int>* fh)
+    {
+        if (nativeMappable(node.kind()))
+        {
+            u64 h = ctx.nativeHandle(path);
+            if (h == 0u)
+            {
+                h = this.createControl(node.kind(), (u64)this.window, path);
+                ctx.setNativeHandle(path, h);
+                // One-time seed of a TextArea's buffer (it is uncontrolled after;
+                // the native EDIT owns the text, further pushes are explicit).
+                if (node.kind() == ELEM_TEXTAREA)
+                {
+                    TextArea* ta = node as TextArea;
+                    this.setText(h, ta.value.data());
+                }
+            }
+            this._syncProps(node, h);
+            Rect b = node.nodeBounds();
+            keys.add("" + path);
+            handles.add(h);
+            fx.add(b.x * this.dipX()); fy.add(b.y * this.dipY());
+            fw.add(b.w * this.dipX()); fh.add(b.h * this.dipY());
+        }
+
+        list<Element>* kids = node.childList();
+        if (kids != nullptr)
+        {
+            int i = 0;
+            while (i < kids.count())
+            {
+                Element c = kids.get(i);
+                string cp = joinKeyPath(path, keySegment(c, i));
+                this._applyNode(c, cp, ctx, keys, handles, fx, fy, fw, fh);
+                i++;
+            }
+        }
+    }
+
+    // Push a node's current props onto its control (downcast per kind - the same
+    // structured access the reconciler uses in propsEqual).
+    void _syncProps(Element node, u64 h)
+    {
+        int k = node.kind();
+        if (k == ELEM_BUTTON)
+        {
+            Button* b = node as Button;
+            this.setText(h, b.title.data());
+            this.setBoolProp(h, PROP_ENABLED, !b.disabled);
+        }
+        else if (k == ELEM_TEXT)
+        {
+            Text* t = node as Text;
+            this.setText(h, t.text.data());
+        }
+        else if (k == ELEM_TEXTINPUT)
+        {
+            TextInput* ti = node as TextInput;
+            this.setText(h, ti.value.data());
+            this.setBoolProp(h, PROP_ENABLED, !ti.disabled);
+        }
+        else if (k == ELEM_CHECKBOX)
+        {
+            Checkbox* c = node as Checkbox;
+            this.setText(h, c.label.data());
+            this.setBoolProp(h, PROP_CHECKED, c.checked);
+            this.setBoolProp(h, PROP_ENABLED, !c.disabled);
+        }
+        else if (k == ELEM_PROGRESS)
+        {
+            ProgressBar* p = node as ProgressBar;
+            this.setIntProp(h, PROP_MAX, 100);
+            this.setIntProp(h, PROP_VALUE, p.value);
+        }
+        else if (k == ELEM_SLIDER)
+        {
+            Slider* s = node as Slider;
+            this.setIntProp(h, PROP_MAX, 100);
+            this.setIntProp(h, PROP_VALUE, s.value);
+            this.setBoolProp(h, PROP_ENABLED, !s.disabled);
+        }
+        else if (k == ELEM_TEXTAREA)
+        {
+            // Uncontrolled: never push text here (would clobber the buffer mid-edit);
+            // only sync the enabled state. Text is seeded once at creation and
+            // pushed explicitly via nativeSetControlText (file open).
+            TextArea* ta = node as TextArea;
+            this.setBoolProp(h, PROP_ENABLED, !ta.disabled);
+        }
+    }
+
+    // The key path bound to a control HWND this frame, or "" if none (linear scan
+    // of the small live set - controls per window are few).
+    string keyForHandle(u64 h)
+    {
+        int i = 0;
+        while (i < this.liveHandles.count())
+        {
+            if (this.liveHandles.get(i) == h) return "" + this.liveKeys.get(i);
+            i++;
+        }
+        return "";
+    }
+
+    // Convert a framework color (0x1RRGGBB with the marker bit) to a COLORREF
+    // (0x00BBGGRR). A default/unset color (0) maps to black.
+    u32 colorRef(int color)
+    {
+        int r = (color >> 16) & 0xFF;
+        int g = (color >> 8) & 0xFF;
+        int b = color & 0xFF;
+        return (u32)(r | (g << 8) | (b << 16));
+    }
+
+    // Apply the app's Theme to the window chrome: immersive dark-mode titlebar,
+    // themed control/window background + text colors (used by WM_CTLCOLOR* and
+    // WM_ERASEBKGND). Called every frame from applyTree; cheap and idempotent.
+    void applyTheme(UiContext* ctx)
+    {
+        int panel = pickColor(ctx.theme.panelBg, 0);
+        int text  = pickColor(ctx.theme.textColor, 0);
+        bool isDark = themeIsDark(&ctx.theme);
+
+        if (isDark != this.dark || this.bgBrush == nullptr)
+        {
+            this.dark = isDark;
+            int one = isDark ? 1 : 0;
+            DwmSetWindowAttribute(this.window, (u32)DWMWA_USE_IMMERSIVE_DARK_MODE,
+                                  (void*)&one, 4u);
+        }
+
+        // A default (monochrome) theme leaves controls at the OS default look.
+        u32 bg = panel != 0 ? this.colorRef(panel) : (u32)GetSysColor((int)COLOR_BTNFACE);
+        u32 fg = text  != 0 ? this.colorRef(text)  : (u32)GetSysColor((int)COLOR_BTNTEXT);
+        if (bg != this.themeBg || this.bgBrush == nullptr)
+        {
+            if (this.bgBrush != nullptr) DeleteObject(this.bgBrush);
+            this.bgBrush = CreateSolidBrush(bg);
+        }
+        this.themeBg = bg;
+        this.themeText = fg;
+        InvalidateRect(this.window, nullptr, 1);
+    }
+};
+
+// A Theme is "dark" when its panel background is darker than mid-gray. A default
+// (monochrome, all-zero) theme is treated as light.
+bool themeIsDark(Theme* t)
+{
+    int c = t.panelBg;
+    if (c == 0) return false;
+    int r = (c >> 16) & 0xFF; int g = (c >> 8) & 0xFF; int b = c & 0xFF;
+    return (r + g + b) < 384;
+}
+
+// True if `want` is present in the key list.
+bool listHasStr(list<string>* xs, string want)
+{
+    int i = 0;
+    while (i < xs.count()) { if (xs.get(i) == want) return true; i++; }
+    return false;
+}
+
+// Find the live node whose key path equals `want`. `path` is `node`'s own path.
+// The key came from the live map, so the node exists; returns default only if the
+// tree changed underfoot.
+Element findByKey(Element node, string path, string want)
+{
+    if (path == want) return node;
+    list<Element>* kids = node.childList();
+    if (kids != nullptr)
+    {
+        int i = 0;
+        while (i < kids.count())
+        {
+            Element c = kids.get(i);
+            string cp = joinKeyPath(path, keySegment(c, i));
+            Element r = findByKey(c, cp, want);
+            if (r != nullptr) return r;
+            i++;
+        }
+    }
+    return nullptr;
+}
+
+// Drain the dirty flag after a native event: re-render + reconcile, relayout, and
+// reconcile the tree to native controls. The OS repaints the controls itself.
+void pumpNative()
+{
+    if (_nCtx.consumeDirty())
+    {
+        Element wip = _nApp.render(&_nCtx);
+        list<Patch> patches = default;
+        _nTree = reconcile(_nTree, wip, &patches);
+        layoutRoot(_nTree, 0, 0, _nW);
+        _nHost.applyTree(_nTree, &_nCtx);
+    }
+}
+
+// ── Native event routing (parent WM_COMMAND / WM_HSCROLL -> element handler) ──
+void routeClick(void* ctrl)
+{
+    string key = _nHost.keyForHandle((u64)ctrl);
+    if (key.length() == 0) return;
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    if (e == nullptr) return;
+    Button* b = e as Button;
+    if (b != nullptr) { b.fireClick(); pumpNative(); return; }
+    Checkbox* c = e as Checkbox;
+    if (c != nullptr) { c.fireToggle(); pumpNative(); return; }
+}
+
+void routeEdit(void* ctrl)
+{
+    string key = _nHost.keyForHandle((u64)ctrl);
+    if (key.length() == 0) return;
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    if (e == nullptr) return;
+    TextInput* ti = e as TextInput;
+    if (ti != nullptr)
+    {
+        char[512] buf;
+        GetWindowTextA(ctrl, buf, 512);
+        string nv = (string)buf;
+        ti.onChangeText(nv);
+        pumpNative();
+        return;
+    }
+    // A TextArea is uncontrolled: EN_CHANGE is just a dirty NOTIFICATION; do not
+    // read/push the (potentially large) buffer here.
+    TextArea* ta = e as TextArea;
+    if (ta != nullptr)
+    {
+        ta.onChange();
+        pumpNative();
+    }
+}
+
+// Read the current text of the control at `keyPath` (owned string). Used to PULL a
+// TextArea's buffer on save. Returns "" if there is no such control.
+string nativeControlText(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return "";
+    void* ctrl = u2h(h);
+    int n = (int)GetWindowTextLengthA(ctrl);
+    if (n <= 0) return "";
+    char* buf = (char*)malloc((i64)(n + 1));
+    GetWindowTextA(ctrl, buf, n + 1);
+    string s = (string)buf;
+    free((void*)buf);
+    return s;
+}
+
+// Push text into the control at `keyPath` (file open / clear). Guards the reentrant
+// EN_CHANGE so the push does not register as a user edit.
+void nativeSetControlText(string keyPath, string s)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    bool prev = _nHost.applying;
+    _nHost.applying = true;
+    SetWindowTextA(u2h(h), s.data());
+    _nHost.applying = prev;
+}
+
+void routeSlider(void* ctrl)
+{
+    string key = _nHost.keyForHandle((u64)ctrl);
+    if (key.length() == 0) return;
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    if (e == nullptr) return;
+    Slider* s = e as Slider;
+    if (s == nullptr) return;
+    int pos = (int)SendMessageA(ctrl, (u32)TBM_GETPOS, 0u, (i64)0);
+    s.fireSet(pos);
+    pumpNative();
+}
+
+// Mirror OS focus into ctx.focusKey (the framework's keyed focus becomes a mirror
+// of real focus, so app code that reads ctx.focusKey stays correct).
+void mirrorFocus(void* ctrl)
+{
+    string key = _nHost.keyForHandle((u64)ctrl);
+    if (key.length() > 0) _nCtx.focus(key);
+}
+
+// ── Menu bar + accelerators (P3) ─────────────────────────────────────────────
+bool strContains(string s, const char* sub)
+{
+    return strstr(s.data(), (char*)sub) != nullptr;
+}
+
+// Parse an accelerator like "Ctrl+Shift+S" or "F3" into a virtual key + modifier
+// flags. Returns 0 (no accel) if the key token is unrecognized.
+int parseAccelKey(string a)
+{
+    int plus = -1; int i = 0; int n = (int)a.length();
+    while (i < n) { if (a.data()[i] == '+') plus = i; i++; }
+    string keyTok = plus >= 0 ? substring(a, plus + 1, n - plus - 1) : a;
+    int kn = (int)keyTok.length();
+    if (kn == 1)
+    {
+        char c = keyTok.data()[0];
+        if (c >= 'a' && c <= 'z') return (int)(c - 32);   // -> uppercase VK
+        return (int)c;                                    // A-Z, 0-9 map to VK
+    }
+    if (kn >= 2 && (keyTok.data()[0] == 'F' || keyTok.data()[0] == 'f'))
+    {
+        int num = atoi(keyTok.data() + 1);
+        if (num >= 1 && num <= 12) return (int)VK_F1 + (num - 1);
+    }
+    return 0;
+}
+
+int parseAccelMods(string a)
+{
+    int m = 0;
+    if (strContains(a, "Ctrl"))  m = m | (int)FCONTROL;
+    if (strContains(a, "Shift")) m = m | (int)FSHIFT;
+    if (strContains(a, "Alt"))   m = m | (int)FALT;
+    return m;
+}
+
+void menuReset()
+{
+    _menuTop.clear();
+    _menuItemTopIdx.clear();
+    _menuItemLabel.clear();
+    _menuItemCmd.clear();
+    _menuAccelKey.clear();
+    _menuAccelMods.clear();
+}
+
+int menuAddTop(string title)
+{
+    _menuTop.add("" + title);
+    return _menuTop.count() - 1;
+}
+
+// Add a command item to top-level menu `top` with app command id `cmd`. `accel`
+// (e.g. "Ctrl+S", "" for none) both labels the item and registers an accelerator.
+void menuAddItem(int top, string label, string accel, int cmd)
+{
+    string shown = "" + label;
+    int vk = 0; int mods = 0;
+    if (accel.length() > 0)
+    {
+        vk = parseAccelKey(accel);
+        mods = parseAccelMods(accel);
+        shown = label + "\t" + accel;
+    }
+    _menuItemTopIdx.add(top);
+    _menuItemLabel.add(shown);
+    _menuItemCmd.add(cmd);
+    _menuAccelKey.add(vk);
+    _menuAccelMods.add(mods);
+}
+
+void menuAddSeparator(int top)
+{
+    _menuItemTopIdx.add(top);
+    _menuItemLabel.add("");
+    _menuItemCmd.add(0);
+    _menuAccelKey.add(0);
+    _menuAccelMods.add(0);
+}
+
+// Realize the declared menu into an HMENU on `hwnd` plus an accelerator table.
+void buildMenuBar(void* hwnd)
+{
+    if (_menuTop.count() == 0) return;
+    void* bar = CreateMenu();
+    int t = 0;
+    while (t < _menuTop.count())
+    {
+        void* pop = CreatePopupMenu();
+        int i = 0;
+        while (i < _menuItemTopIdx.count())
+        {
+            if (_menuItemTopIdx.get(i) == t)
+            {
+                if (_menuItemLabel.get(i).length() == 0)
+                    AppendMenuA(pop, (u32)MF_SEPARATOR, 0u, nullptr);
+                else
+                    AppendMenuA(pop, (u32)MF_STRING, (u64)_menuItemCmd.get(i),
+                                _menuItemLabel.get(i).data());
+            }
+            i++;
+        }
+        AppendMenuA(bar, (u32)MF_POPUP, (u64)pop, _menuTop.get(t).data());
+        t++;
+    }
+    SetMenu(hwnd, bar);
+
+    // Accelerator table from items that declared a key.
+    int cnt = 0; int k = 0;
+    while (k < _menuAccelKey.count()) { if (_menuAccelKey.get(k) != 0) cnt++; k++; }
+    if (cnt > 0)
+    {
+        ACCEL* acc = (ACCEL*)malloc((i64)cnt * (i64)sizeof(ACCEL));
+        int w = 0; int j = 0;
+        while (j < _menuAccelKey.count())
+        {
+            if (_menuAccelKey.get(j) != 0)
+            {
+                acc[w].fVirt = (u8)((int)FVIRTKEY | _menuAccelMods.get(j));
+                acc[w].key = (u16)_menuAccelKey.get(j);
+                acc[w].cmd = (u16)_menuItemCmd.get(j);
+                w++;
+            }
+            j++;
+        }
+        _accelTable = CreateAcceleratorTableA(acc, cnt);
+        free((void*)acc);
+    }
+}
+
+// A menu command / accelerator (WM_COMMAND, lParam == 0) fired: dispatch it to the
+// app's handler, then pump.
+void routeMenu(int id)
+{
+    if (id <= 0) return;
+    _menuHandler(id);
+    pumpNative();
+}
+
+// ── File dialogs + message boxes (P3) ─────────────────────────────────────────
+// GetOpenFileName/GetSaveFileName present the standard shell file dialog (the same
+// window users see everywhere); simpler and more robust than IFileDialog COM vtable
+// interop, and visually identical. (COM IFileDialog is deferred - see the report.)
+
+// Fill `buf` with a comdlg32 double-null-terminated filter: "desc\0pat\0...\0\0".
+int _filterZ(char* buf, int p, const char* s)
+{
+    int i = 0;
+    while (s[i] != '\0') { buf[p] = s[i]; p++; i++; }
+    buf[p] = '\0'; p++;
+    return p;
+}
+
+string nativeOpenFile()
+{
+    char[128] filt;
+    int p = 0;
+    p = _filterZ(filt, p, "Text files (*.txt;*.md;*.cb)");
+    p = _filterZ(filt, p, "*.txt;*.md;*.cb");
+    p = _filterZ(filt, p, "All files (*.*)");
+    p = _filterZ(filt, p, "*.*");
+    filt[p] = '\0';
+
+    char[520] path; path[0] = '\0';
+    OPENFILENAMEA ofn = default;
+    ofn.lStructSize = (u32)sizeof(OPENFILENAMEA);
+    ofn.hwndOwner = _nHost.window;
+    ofn.lpstrFilter = filt;
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = 520u;
+    ofn.Flags = (u32)((int)OFN_FILEMUSTEXIST | (int)OFN_PATHMUSTEXIST);
+    if (GetOpenFileNameA(&ofn) == 0) return "";
+    return (string)path;
+}
+
+string nativeSaveFile()
+{
+    char[128] filt;
+    int p = 0;
+    p = _filterZ(filt, p, "Text files (*.txt;*.md;*.cb)");
+    p = _filterZ(filt, p, "*.txt;*.md;*.cb");
+    p = _filterZ(filt, p, "All files (*.*)");
+    p = _filterZ(filt, p, "*.*");
+    filt[p] = '\0';
+
+    char[520] path; path[0] = '\0';
+    OPENFILENAMEA ofn = default;
+    ofn.lStructSize = (u32)sizeof(OPENFILENAMEA);
+    ofn.hwndOwner = _nHost.window;
+    ofn.lpstrFilter = filt;
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = 520u;
+    ofn.lpstrDefExt = "txt";
+    ofn.Flags = (u32)((int)OFN_PATHMUSTEXIST | (int)OFN_OVERWRITEPROMPT);
+    if (GetSaveFileNameA(&ofn) == 0) return "";
+    return (string)path;
+}
+
+// Modal confirm with Yes/No/Cancel. Returns 1 = Yes, 0 = No, -1 = Cancel.
+int nativeConfirm(string title, string text)
+{
+    int r = (int)MessageBoxA(_nHost.window, text.data(), title.data(),
+                             (u32)((int)MB_YESNOCANCEL | (int)MB_ICONWARNING));
+    if (r == (int)IDYES) return 1;
+    if (r == (int)IDNO) return 0;
+    return -1;
+}
+
+void nativeInfo(string title, string text)
+{
+    MessageBoxA(_nHost.window, text.data(), title.data(), (u32)MB_OK);
+}
+
+// Close the main window (bypasses the WM_CLOSE guard - the caller already decided).
+void nativeCloseWindow()
+{
+    if (_nHost.window != nullptr) DestroyWindow(_nHost.window);
+}
+
+// Fully release all global host + context state - for the headless self-tests, so
+// --heap-audit sees no residue (globals are not destructed at process exit, and
+// list/dictionary clear() keeps its capacity, so each backing is moved into a
+// scoped local whose destructor frees it).
+void nativeTeardownForTest()
+{
+    if (_nReady) { deleteTree(_nTree); _nReady = false; }
+    if (_nApp != nullptr) { delete _nApp; _nApp = nullptr; }
+    if (_nHost.window != nullptr) { DestroyWindow(_nHost.window); _nHost.window = nullptr; }
+    if (_nHost.bgBrush != nullptr) { DeleteObject(_nHost.bgBrush); _nHost.bgBrush = nullptr; }
+    if (_nHost.font != nullptr) { DeleteObject(_nHost.font); _nHost.font = nullptr; }
+    { dictionary<string, u64> d = move _nCtx.nativeByKey; }
+    { list<string> a1 = move _nHost.liveKeys; }
+    { list<u64>    a2 = move _nHost.liveHandles; }
+    { list<string> a3 = move _menuTop; }
+    { list<int>    a4 = move _menuItemTopIdx; }
+    { list<string> a5 = move _menuItemLabel; }
+    { list<int>    a6 = move _menuItemCmd; }
+    { list<int>    a7 = move _menuAccelKey; }
+    { list<int>    a8 = move _menuAccelMods; }
+    { Lambda<void(int)> a9 = move _menuHandler; }
+    { Lambda<bool()>    a10 = move _closeQuery; }
+    _hasCloseQuery = false;
+    _nCtx.blur();
+}
+
+// ── Secondary window (P3 multi-window) ───────────────────────────────────────
+// A genuinely separate top-level window with its own read-only content, sharing
+// the app's single message loop. Closing it does NOT quit the app (its WndProc
+// does not PostQuitMessage). Used by fedit's Help > About.
+bool _secClassReg = false;
+
+stdcall i64 SecondaryWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
+{
+    if (msg == WM_CTLCOLORSTATIC && _nHost.bgBrush != nullptr)
+    {
+        void* hdc = u2h(wParam);
+        SetTextColor(hdc, _nHost.themeText);
+        SetBkColor(hdc, _nHost.themeBg);
+        return (i64)(u64)_nHost.bgBrush;
+    }
+    if (msg == WM_ERASEBKGND && _nHost.bgBrush != nullptr)
+    {
+        RECT rc = default; GetClientRect(hwnd, &rc);
+        FillRect(u2h(wParam), &rc, _nHost.bgBrush);
+        return (i64)1;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+void showSecondaryWindow(string title, string message)
+{
+    if (!_secClassReg)
+    {
+        WNDCLASSEXA wc = default;
+        wc.cbSize = (u32)sizeof(WNDCLASSEXA);
+        wc.lpfnWndProc = (void*)SecondaryWndProc;
+        wc.hInstance = _nHost.hInst;
+        wc.hCursor = LoadCursorA(nullptr, (char*)IDC_ARROW);
+        wc.hbrBackground = (void*)((i64)COLOR_BTNFACE + 1);
+        wc.lpszClassName = "CFlatSecondary";
+        RegisterClassExA(&wc);
+        _secClassReg = true;
+    }
+    int w = 360 * (int)_nHost.dpi / 96;
+    int h = 200 * (int)_nHost.dpi / 96;
+    void* wnd = CreateWindowExA(0u, "CFlatSecondary", title.data(),
+        (u32)(WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX)),
+        CW_USEDEFAULT, CW_USEDEFAULT, w, h,
+        _nHost.window, nullptr, _nHost.hInst, nullptr);
+    void* st = CreateWindowExA(0u, "STATIC", message.data(),
+        (u32)(WS_CHILD | WS_VISIBLE | SS_LEFT),
+        16 * (int)_nHost.dpi / 96, 16 * (int)_nHost.dpi / 96,
+        320 * (int)_nHost.dpi / 96, 140 * (int)_nHost.dpi / 96,
+        wnd, nullptr, _nHost.hInst, nullptr);
+    if (_nHost.font != nullptr) SendMessageA(st, (u32)WM_SETFONT, (u64)_nHost.font, (i64)1);
+    if (_nHost.dark)
+    {
+        int one = 1;
+        DwmSetWindowAttribute(wnd, (u32)DWMWA_USE_IMMERSIVE_DARK_MODE, (void*)&one, 4u);
+    }
+    ShowWindow(wnd, (int)SW_SHOW);
+    UpdateWindow(wnd);
+}
+
+// Free the old tree (if any) and render + reconcile-to-native a fresh one at the
+// current client size. Controls are reused by key path, so this does not recreate
+// them - only new/removed nodes create/destroy controls.
+void buildNativeTree()
+{
+    if (_nReady) { deleteTree(_nTree); _nReady = false; }
+    _nTree = _nApp.render(&_nCtx);
+    layoutRoot(_nTree, 0, 0, _nW);
+    _nHost.applyTree(_nTree, &_nCtx);
+    _nReady = true;
+}
+
+// LRESULT CALLBACK. Controls notify the PARENT: WM_COMMAND (button/checkbox click,
+// edit change, focus) with the control HWND in lParam; WM_HSCROLL (trackbar) with
+// it in lParam. Menu items (P3) arrive as WM_COMMAND with lParam == 0.
+stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
+{
+    if (msg == WM_SIZE)
+    {
+        int pw = (int)(lParam & (i64)0xFFFF);
+        int ph = (int)((lParam >> 16) & (i64)0xFFFF);
+        int nw = pw / _nHost.dipX();
+        int nh = ph / _nHost.dipY();
+        if (nw < 1) nw = 1;
+        if (nh < 1) nh = 1;
+        _nW = nw; _nH = nh;
+        buildNativeTree();
+        return (i64)0;
+    }
+
+    if (msg == WM_COMMAND)
+    {
+        int code = (int)((wParam >> 16) & (u64)0xFFFF);
+        void* ctrl = u2h((u64)lParam);
+        if (ctrl == nullptr)
+        {
+            // Menu item or accelerator: LOWORD(wParam) is the command id.
+            if (_nReady) routeMenu((int)(wParam & (u64)0xFFFF));
+        }
+        else if (_nReady)
+        {
+            if (code == BN_CLICKED)                          routeClick(ctrl);
+            else if (code == EN_CHANGE && !_nHost.applying)  routeEdit(ctrl);
+            else if (code == BN_SETFOCUS || code == EN_SETFOCUS) mirrorFocus(ctrl);
+        }
+        return (i64)0;
+    }
+
+    if (msg == WM_HSCROLL)
+    {
+        void* ctrl = u2h((u64)lParam);
+        if (ctrl != nullptr && _nReady) routeSlider(ctrl);
+        return (i64)0;
+    }
+
+    // DPI change (moved to a different-scale monitor): rescale font + controls and
+    // move to the OS-suggested rectangle, then relayout at the new scale.
+    if (msg == WM_DPICHANGED)
+    {
+        u32 nd = (u32)((wParam >> 16) & (u64)0xFFFF);   // HIWORD = Y dpi
+        if (nd < 96u) nd = 96u;
+        _nHost.dpi = nd;
+        if (_nHost.font != nullptr) DeleteObject(_nHost.font);
+        _nHost.font = createUiFontDpi(nd);
+        int i = 0;
+        while (i < _nHost.liveHandles.count())
+        {
+            SendMessageA(u2h(_nHost.liveHandles.get(i)), (u32)WM_SETFONT,
+                         (u64)_nHost.font, (i64)1);
+            i++;
+        }
+        RECT* pr = (RECT*)u2h((u64)lParam);
+        if (pr != nullptr)
+            SetWindowPos(hwnd, nullptr, pr.left, pr.top,
+                         pr.right - pr.left, pr.bottom - pr.top,
+                         (u32)(SWP_NOZORDER | SWP_NOACTIVATE));
+        if (_nReady) { layoutRoot(_nTree, 0, 0, _nW); _nHost.applyTree(_nTree, &_nCtx); }
+        return (i64)0;
+    }
+
+    // Theme the window background and control text/backgrounds (documented APIs,
+    // no uxtheme ordinal hacks). Only active once a non-default theme has set the
+    // brush; a monochrome theme falls through to the OS default look.
+    if (msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLORBTN || msg == WM_CTLCOLOREDIT)
+    {
+        if (_nHost.bgBrush != nullptr)
+        {
+            void* hdc = u2h(wParam);
+            SetTextColor(hdc, _nHost.themeText);
+            SetBkColor(hdc, _nHost.themeBg);
+            return (i64)(u64)_nHost.bgBrush;
+        }
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
+    }
+
+    if (msg == WM_ERASEBKGND)
+    {
+        if (_nHost.bgBrush != nullptr)
+        {
+            void* hdc = u2h(wParam);
+            RECT rc = default;
+            GetClientRect(hwnd, &rc);
+            FillRect(hdc, &rc, _nHost.bgBrush);
+            return (i64)1;
+        }
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
+    }
+
+    // Close guard: let the app veto (dirty-save prompt) before the window closes.
+    if (msg == WM_CLOSE)
+    {
+        if (_hasCloseQuery && !_closeQuery()) return (i64)0;
+        DestroyWindow(hwnd);
+        return (i64)0;
+    }
+
+    if (msg == WM_DESTROY)
+    {
+        if (_nReady) { deleteTree(_nTree); _nReady = false; }
+        if (_nHost.bgBrush != nullptr) { DeleteObject(_nHost.bgBrush); _nHost.bgBrush = nullptr; }
+        if (_nHost.font != nullptr) { DeleteObject(_nHost.font); _nHost.font = nullptr; }
+        PostQuitMessage(0);
+        return (i64)0;
+    }
+
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+// A Segoe UI Variable Text face (fallback Segoe UI) sized to the dpi. Height is
+// negative (character height, not cell height). The modern Windows 11 UI font.
+void* createUiFontDpi(u32 dpi)
+{
+    int h = -(15 * (int)dpi / 96);
+    void* f = CreateFontA(h, 0, 0, 0, FW_NORMAL, 0u, 0u, 0u,
+                          (u32)DEFAULT_CHARSET, (u32)OUT_DEFAULT_PRECIS,
+                          (u32)CLIP_DEFAULT_PRECIS, (u32)CLEARTYPE_QUALITY,
+                          (u32)(VARIABLE_PITCH | FF_SWISS), "Segoe UI Variable Text");
+    return f;
+}
+
+// Register the window class + create the top-level window. `show` controls whether
+// it is made visible (the self-test creates it hidden). Sets up the host globals.
+void* createNativeWindow(const char* title, bool show)
+{
+    // Per-monitor-v2 DPI awareness: we scale DIP->px ourselves (crisp text/controls
+    // at >100%), rather than letting the OS bitmap-stretch a 96-dpi window.
+    SetProcessDpiAwarenessContext((void*)(i64)(-4));
+    InitCommonControls();
+    _nHost.hInst = GetModuleHandleA(nullptr);
+
+    WNDCLASSEXA wc = default;
+    wc.cbSize        = (u32)sizeof(WNDCLASSEXA);
+    wc.style         = (u32)(CS_HREDRAW | CS_VREDRAW);
+    wc.lpfnWndProc   = (void*)NativeWndProc;
+    wc.hInstance     = _nHost.hInst;
+    wc.hCursor       = LoadCursorA(nullptr, (char*)IDC_ARROW);
+    wc.hbrBackground = (void*)((i64)COLOR_BTNFACE + 1);
+    wc.lpszClassName = "CFlatNativeWindow";
+    RegisterClassExA(&wc);
+
+    void* hwnd = CreateWindowExA(
+        0u, "CFlatNativeWindow", title, (u32)WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 760, 560,
+        nullptr, nullptr, _nHost.hInst, nullptr);
+    _nHost.window = hwnd;
+    _nHost.dpi = GetDpiForWindow(hwnd);
+    if (_nHost.dpi < 96u) _nHost.dpi = 96u;
+    _nHost.font = createUiFontDpi(_nHost.dpi);
+    buildMenuBar(hwnd);   // realize the app's declared menu (if any) + accelerators
+    if (show)
+    {
+        ShowWindow(hwnd, (int)SW_SHOW);
+        UpdateWindow(hwnd);
+    }
+    return hwnd;
+}
+
+// Register the class, create + show the window, and run the message loop until
+// WM_QUIT. IsDialogMessageA gives OS-owned Tab/arrow navigation and default-button
+// handling among the WS_TABSTOP controls.
+//
+// The component MUST be heap-allocated (`new`): the host stashes it in `_nApp` and
+// `delete`s it after the message loop, so it has to outlive this call and be a heap
+// object. A stack component would dangle once the caller's frame unwinds (and could
+// not be deleted). This is the idiomatic React-style ownership model (mount() uses
+// `new`), independent of any language feature.
+int runAppGuiNative(Component app, const char* title)
+{
+    _nApp = app;
+    void* hwnd = createNativeWindow(title, true);
+    if (hwnd == nullptr) { printf("CreateWindowExA failed\n"); return 1; }
+    if (!_nReady) buildNativeTree();   // in case WM_SIZE did not fire on show
+
+    MSG msg = default;
+    while (GetMessageA(&msg, nullptr, 0u, 0u) > 0)
+    {
+        // Accelerators first, then dialog-style Tab/arrow nav, then normal dispatch.
+        if (_accelTable != nullptr && TranslateAcceleratorA(hwnd, _accelTable, &msg) != 0)
+            continue;
+        if (IsDialogMessageA(hwnd, &msg) == 0)
+        {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+    }
+    delete _nApp;                      // host owns the heap component
+    _nApp = nullptr;
+    return (int)msg.wParam;
+}

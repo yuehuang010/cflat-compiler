@@ -102,6 +102,65 @@ if "%~1"=="--worker-gui" (
 )
 
 REM ===========================================================================
+REM Worker mode: native-controls host state-assert self-test
+REM (win32_native_settings --selftest: invisible window, driven via SendMessage).
+REM ===========================================================================
+if "%~1"=="--worker-native" (
+    set "RESID=%~2"
+    set "CFLAT=x64\%CONFIG%\cflat.exe"
+    set "OUTDIR=out\examples"
+    set "RESDIR=out\examples\results"
+    set "NAT_STEXE=!OUTDIR!\win32_native_settings_st.exe"
+    set "NAT_STLOG=!RESDIR!\!RESID!.log"
+
+    "!CFLAT!" "example\ui\win32_native_settings.cb" --heap-audit -o "!NAT_STEXE!" > "!NAT_STLOG!" 2>&1
+    if not exist "!NAT_STEXE!" (
+        echo FAIL win32_native_settings.cb ^(native self-test build failed^)>"!RESDIR!\!RESID!.result"
+        exit /b
+    )
+    "!NAT_STEXE!" --selftest <nul >> "!NAT_STLOG!" 2>&1
+    set NSTRC=!errorlevel!
+    findstr /C:"heap-audit: LEAK" "!NAT_STLOG!" >nul 2>&1
+    if !errorlevel! equ 0 (
+        echo FAIL win32_native_settings.cb ^(heap-audit leak^)>"!RESDIR!\!RESID!.result"
+    ) else if !NSTRC! neq 0 (
+        echo FAIL win32_native_settings.cb ^(native self-test, exit !NSTRC!^)>"!RESDIR!\!RESID!.result"
+    ) else (
+        echo PASS win32_native_settings.cb ^(native self-test + leak-clean^)>"!RESDIR!\!RESID!.result"
+    )
+    exit /b
+)
+
+REM ===========================================================================
+REM Worker mode: fedit editor state-assert self-test (the P4 flagship).
+REM ===========================================================================
+if "%~1"=="--worker-fedit" (
+    set "RESID=%~2"
+    set "CFLAT=x64\%CONFIG%\cflat.exe"
+    set "OUTDIR=out\examples"
+    set "RESDIR=out\examples\results"
+    set "FED_STEXE=!OUTDIR!\fedit_st.exe"
+    set "FED_STLOG=!RESDIR!\!RESID!.log"
+
+    "!CFLAT!" "example\ui\fedit\fedit.cb" -i example/ui --heap-audit -o "!FED_STEXE!" > "!FED_STLOG!" 2>&1
+    if not exist "!FED_STEXE!" (
+        echo FAIL fedit.cb ^(fedit self-test build failed^)>"!RESDIR!\!RESID!.result"
+        exit /b
+    )
+    "!FED_STEXE!" --selftest <nul >> "!FED_STLOG!" 2>&1
+    set FEDRC=!errorlevel!
+    findstr /C:"heap-audit: LEAK" "!FED_STLOG!" >nul 2>&1
+    if !errorlevel! equ 0 (
+        echo FAIL fedit.cb ^(heap-audit leak^)>"!RESDIR!\!RESID!.result"
+    ) else if !FEDRC! neq 0 (
+        echo FAIL fedit.cb ^(fedit self-test, exit !FEDRC!^)>"!RESDIR!\!RESID!.result"
+    ) else (
+        echo PASS fedit.cb ^(editor self-test + leak-clean^)>"!RESDIR!\!RESID!.result"
+    )
+    exit /b
+)
+
+REM ===========================================================================
 REM Main: launch all example builds + self-tests in parallel, wait, collect
 REM ===========================================================================
 set CONFIG=%1
@@ -142,7 +201,7 @@ REM explicit -i to that package. We discover it below and compile the demo when 
 REM on a host without the package it is skipped.
 REM example/macos/* target Darwin (dlopen of AppKit, sysctl, libproc) and are
 REM excluded from this Windows run; compile them on a Mac instead.
-set EXCLUDE=test_helper ui win32host http_parser http_response http_json http_server http_client router rest_server http_io cocoa hello_objc cocoa_window sysinfo_mac
+set EXCLUDE=test_helper ui ui_native win32host win32_native_host fedit http_parser http_response http_json http_server http_client router rest_server http_io cocoa hello_objc cocoa_window sysinfo_mac
 
 REM Discover the newest cached Win32-metadata package dir (the one holding Windows.Win32.winmd).
 REM dir /o-n lists newest-version-first by name. Empty if the nuget package is not installed
@@ -192,6 +251,16 @@ REM Launch the GUI offscreen GDI readback self-test.
 set /a RESID+=1
 set /a LAUNCHED+=1
 start "" /b cmd /c "%SCRIPT% --worker-gui ex_!RESID!"
+
+REM Launch the native-controls host state-assert self-test.
+set /a RESID+=1
+set /a LAUNCHED+=1
+start "" /b cmd /c "%SCRIPT% --worker-native ex_!RESID!"
+
+REM Launch the fedit editor state-assert self-test (P4 flagship).
+set /a RESID+=1
+set /a LAUNCHED+=1
+start "" /b cmd /c "%SCRIPT% --worker-fedit ex_!RESID!"
 
 REM Wait for all workers to finish (up to TIMEOUT_SECS).
 set /a WAITED=0
