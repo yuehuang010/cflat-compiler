@@ -11,7 +11,7 @@ cflat lsp                       # run the Language Server (see the VS Code exten
 cflat lsp --lsp-pool-size N      # cap concurrent analyses to N backends/workers
 ```
 
-The `lsp` subcommand accepts `--verbose`/`-v`, `--import-dir`/`-i <dir>`, and
+The `lsp` subcommand accepts `--verbose`/`-v`, `--import-dir`/`-i <dir>` (repeatable), and
 `--lsp-pool-size <N>`. The pool size bounds how many analyses run in parallel (one
 backend and worker thread per slot); it defaults to the logical CPU count. The switch
 takes precedence over the `CFLAT_LSP_POOL_SIZE` environment variable.
@@ -92,7 +92,7 @@ See [`doc/HPC.md`](HPC.md) for `--cpu`/`-O2` and vectorization guidance.
 
 | Switch | Short | Value | Description |
 |--------|-------|-------|-------------|
-| `--import-dir` | `-i` | dir | Directory to search for imported modules. |
+| `--import-dir` | `-i` | dir | Directory to search for imported modules. Repeatable: pass `-i` multiple times to add several search dirs; they are searched in the order given and the first match wins. |
 | `--no-runtime` | | | Do not auto-import `core/runtime.cb`. |
 
 The `core/` directory is always on the import search path; only `runtime.cb` is auto-imported.

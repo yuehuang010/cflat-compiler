@@ -102,6 +102,13 @@ struct OuterTok { InnerTok inner = default; };
 move OuterTok makeOuterTok(int n) { OuterTok o = default; o.inner.s = "in" + n.toString(); return o; }
 InnerTok returnMovedInner(int n) { return makeOuterTok(n).inner; }
 
+// Interface with a PLAIN (non-`move`) string method: the implementer returns a freshly owned
+// concat, so a virtual call physically carries the owned bit. Exercises the interface-dispatch
+// (CallInterfaceMethod) leg of the ternary-branch cleanup - a distinct codegen path from a
+// direct free-function/member call, but the same runtime-owned-bit contract.
+interface ILabel { string label(); };
+class Labeler : ILabel { string tag = default; string label() { return tag + "!"; } };
+
 extern int main()
 {
     HeapAudit.enable();
@@ -525,6 +532,38 @@ extern int main()
             string addB = returnOwnedConcat("q");
             string addLocals = addA + addB;
             total++; passed += Test("named owned-string locals added (no double-free)", addLocals.length() > 0, true);
+        }
+
+        // Ternary over a PLAIN (non-`move`) owned-string return. The ternary deep-copies the
+        // selected branch into an independent owned buffer for the local; the branch's own fresh
+        // temp (a plain string-returning CALL) was not registered by the call path, so before the
+        // fix it leaked after the copy. Both branches of a select are evaluated, so a temp on the
+        // NON-selected branch must be freed too. Covered for a free function, a member function,
+        // and interface dispatch. `cond` is derived from a runtime value so the select is real.
+        {
+            bool cond = total > 0;   // always true, but not a compile-time constant
+
+            string tsel = cond ? returnOwnedConcat("t1") : "lit";       // free-fn owned branch
+            total++; passed += Test("ternary plain-fn owned branch", tsel.length(), 8); // "hello t1"
+
+            string tboth = cond ? returnOwnedConcat("a") : returnOwnedConcat("b"); // both branches call
+            total++; passed += Test("ternary both-branch owned calls", tboth.length(), 7); // "hello a"
+
+            string tmem = cond ? gr.greet("z") : "lit";                 // member-fn owned branch
+            total++; passed += Test("ternary plain member-fn owned branch", tmem.length(), 4); // "hi-z"
+
+            Labeler lb = default;
+            lb.tag = "ta" + "g";                                        // owned field
+            ILabel il = lb;
+            string tvirt = cond ? il.label() : "lit";                   // interface-dispatch owned branch
+            total++; passed += Test("ternary interface-dispatch owned branch", tvirt.length(), 4); // "tag!"
+
+            // A named owning local as a branch must NOT be double-freed (the deep-copy keeps the
+            // local's buffer intact); a borrow branch (list element) likewise stays owned by the list.
+            string loc = returnOwnedConcat("k");
+            string tloc = cond ? loc : "lit";
+            total++; passed += Test("ternary named-local branch (no double-free)", tloc.length(), 7); // "hello k"
+            total++; passed += Test("ternary named-local branch source live", loc.length(), 7);
         }
     }
 

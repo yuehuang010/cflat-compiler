@@ -331,7 +331,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         if (!bitcodePath.empty()) std::filesystem::remove(bitcodePath, rmEc);
     }
 
-    importSearchDir = args.getOption("import-dir").value_or("");
+    importSearchDirs = args.getMultiOption("import-dir");
     // Default target platform = native host OS. Overridable with --platform for
     // cross-compilation (e.g. macos Mach-O emission from a Windows/WSL host).
 #if defined(_WIN32)
@@ -385,7 +385,12 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         std::cout << std::format("[verbose] output exe:   {}\n", exePath ? *exePath : "(none)");
         std::cout << std::format("[verbose] output lli:   {}\n", lliPath ? *lliPath : "(none)");
         std::cout << std::format("[verbose] runtime dir:  {}\n", runtimeDir);
-        std::cout << std::format("[verbose] import dir:   {}\n", importSearchDir.empty() ? "(none)" : importSearchDir);
+        {
+            std::string importDirsJoined;
+            for (const auto& d : importSearchDirs)
+                importDirsJoined += (importDirsJoined.empty() ? "" : ", ") + d;
+            std::cout << std::format("[verbose] import dir:   {}\n", importDirsJoined.empty() ? "(none)" : importDirsJoined);
+        }
         std::cout << std::format("[verbose] debug info:   {}\n", debugInfo ? "yes" : "no");
         // Effective codegen CPU: the platform default unless --cpu overrode it. Tune
         // defaults to the target CPU unless --tune set it (mirrors -mtune semantics).
@@ -1048,7 +1053,7 @@ bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const 
 
         // For LSP analysis: the "importing" file is a temp file; try the real source directory first.
         tryDir(sourceFileDir_);
-        tryDir(importSearchDir);
+        for (const auto& d : importSearchDirs) tryDir(d);
         // C library headers (e.g. "curl/curl.h") live under the --c-include roots.
         for (const auto& inc : cIncludeDirs_) tryDir(inc);
         // Implicit fallback: look in the "core" directory beside the runtime.
@@ -1080,13 +1085,17 @@ bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const 
         if (bare != importFilename && !resolve(bare).empty())
             suggestion = " Did you mean \"" + bare + "\"?";
 
+        std::string importDirsNote;
+        for (const auto& d : importSearchDirs)
+            importDirsNote += ", import dir '" + d + "'";
+
         LogError(std::format(
             "imported file not found: {} (searched relative to '{}'{}{}{}{}, Windows SDK, "
             "WinMetadata).{}",
             importFilename,
             importingDir.string(),
             sourceFileDir_.empty() ? "" : ", source dir '" + sourceFileDir_ + "'",
-            importSearchDir.empty() ? "" : ", import dir '" + importSearchDir + "'",
+            importDirsNote,
             cIncludeDirs_.empty() ? "" : ", " + std::to_string(cIncludeDirs_.size()) + " --c-include dir(s)",
             runtimeDir.empty() ? "" : ", runtime core '" + runtimeDir + "/core'",
             suggestion));
@@ -1198,10 +1207,11 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
             auto alt = std::filesystem::canonical((dir / importFilename).lexically_normal(), altEc);
             return altEc ? "" : alt.string();
         };
-        std::string altPaths[] = {
-            importSearchDir.empty() ? "" : tryAlt(importSearchDir),
-            runtimeDir.empty()      ? "" : tryAlt(std::filesystem::path(runtimeDir) / "core"),
-        };
+        std::vector<std::string> altPaths;
+        for (const auto& d : importSearchDirs)
+            altPaths.push_back(tryAlt(d));
+        if (!runtimeDir.empty())
+            altPaths.push_back(tryAlt(std::filesystem::path(runtimeDir) / "core"));
         for (auto& alt : altPaths)
         {
             if (!alt.empty() && alt != canonicalStr && importedFiles.count(alt))
@@ -1901,7 +1911,7 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
 }
 
 bool LLVMBackend::Analyze(const std::string& filePath,
-                              const std::string& importDir,
+                              const std::vector<std::string>& importDirs,
                               const std::string& runtimeDirPath)
 {
     gts.Clear();
@@ -1920,7 +1930,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         std::vector<std::string>& stack;
         ~RootGuard() { stack.pop_back(); }
     } rootGuard{importStack};
-    importSearchDir = importDir;
+    importSearchDirs = importDirs;
     runtimeDir = runtimeDirPath;
     // verbose retains the value set by the LSP via SetVerbose() - left unmodified.
     bool debugInfo = false;

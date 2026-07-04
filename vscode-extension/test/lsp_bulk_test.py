@@ -82,11 +82,9 @@ def find_misattributed_hints(text: str, diags: list) -> list[str]:
 WIN32_METADATA_DEMO = "example/COM/direct2d_demo.cb"
 
 # fedit imports its framework from a sibling directory (`import "win32_native_host.cb"`
-# resolved against example/ui). example.bat compiles it with `-i example/ui`, but the
-# bulk sweep's single import-dir slot is already spent on the Win32-metadata package,
-# so fedit cannot be analyzed standalone here. Skip it - the file is exercised (and
-# leak-checked) by example.bat's dedicated fedit self-test worker.
-CROSS_DIR_IMPORT_SKIP = "example/ui/fedit/fedit.cb"
+# resolved against example/ui). The sweep passes `-i example/ui` alongside the
+# Win32-metadata `-i` (multiple -i dirs are searched in order), so fedit analyzes clean here.
+UI_FRAMEWORK_DIR = "example/ui"
 
 
 def find_win32_metadata_dir() -> Path | None:
@@ -129,8 +127,6 @@ def collect_files(include_win32_demo: bool) -> list[Path]:
     if not include_win32_demo:
         demo = (REPO_ROOT / WIN32_METADATA_DEMO).resolve()
         files = [f for f in files if f.resolve() != demo]
-    skip = (REPO_ROOT / CROSS_DIR_IMPORT_SKIP).resolve()
-    files = [f for f in files if f.resolve() != skip]
     return files
 
 
@@ -301,6 +297,11 @@ def main():
         print(f"Win32 metadata: {win32_dir}")
     else:
         print(f"Win32 metadata: not installed - skipping {WIN32_METADATA_DEMO}")
+
+    # fedit imports its framework from example/ui; a second -i lets it resolve alongside
+    # the Win32-metadata dir (import dirs are searched in order, first match wins).
+    ui_dir = (REPO_ROOT / UI_FRAMEWORK_DIR).resolve()
+    extra_args = extra_args + ["-i", str(ui_dir)]
 
     ok = run_bulk(exe, extra_args, show_timings, include_win32_demo=win32_dir is not None)
     sys.exit(0 if ok else 1)

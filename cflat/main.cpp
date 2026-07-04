@@ -164,7 +164,7 @@ static void PrintSymbolSuggestions(const LspSymbolIndex& index, const std::strin
 static int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool showLogo)
 {
     const std::vector<std::string> terms = args.getMultiOption("symbol");
-    const std::string importDir = args.getOption("import-dir").value_or("");
+    const std::vector<std::string> importDirs = args.getMultiOption("import-dir");
 
     // What to index: an explicit positional source file (true IDE semantics - the
     // index reflects exactly what that file imports), or, when none is given, a
@@ -214,7 +214,7 @@ static int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool s
 
     LspSymbolIndex index;
     compiler.SetSymbolSink(&index);
-    bool ok = compiler.Analyze(sourcePath, importDir, runtimeDir);
+    bool ok = compiler.Analyze(sourcePath, importDirs, runtimeDir);
     compiler.SetSymbolSink(nullptr);
 
     if (!tempPath.empty())
@@ -286,7 +286,7 @@ int main(int argc, char* argv[])
     args.addFlag("asan", 0, "Instrument with AddressSanitizer and link the asan runtime (pair with -g for source-line reports). Alias: -fsanitize=address");
     args.addFlag("heap-audit", 0, "Instrument the program with the HeapAudit leak oracle: auto-import diagnostic/heap_audit.cb, enable it at main entry, and report still-live allocations at every return. Report-only - leaks print to stderr but do not change the exit code or abort. No double-free detection; use --asan for double-free/use-after-free. Requires -o (links a C diagnostic object).");
     args.addFlag("run", 0, "JIT-compile and run the program in-process without writing an exe to disk. Entry must be 'int main()' or 'int main(int argc, char** argv)'; arguments after a bare '--' are passed as argv[1..]. The process exit code is the program's exit code. Read-only: cannot be combined with -o, -l/--out-lli, or -b/--bitcode.");
-    args.addOption("import-dir", 'i', "Directory to search for imported modules");
+    args.addMultiOption("import-dir", 'i', "Directory to search for imported modules (repeatable; searched in order, first match wins)");
     // Default target platform = native host OS. --platform overrides it for
     // cross-compilation (e.g. macos Mach-O emission from a Windows/WSL host).
 #if defined(_WIN32)

@@ -1049,6 +1049,11 @@ private:
     // imports and concrete generic instantiations). Used to route foreach over a winmd interface
     // through the IIterable<T>/IIterator<T> protocol instead of the count()/get() index path.
     std::unordered_set<std::string> winrtThinInterfaces_;
+    // Projected delegate objects built by EmitWinrtDelegateObject, keyed by mangled instance name
+    // (e.g. "AsyncOperationCompletedHandler__string"). Caches the COM object struct type and the
+    // static vtable so repeated winrtDelegate(...) sites reuse one type/vtable per instantiation.
+    std::unordered_map<std::string, llvm::StructType*> winrtDelegateObjTy_;
+    std::unordered_map<std::string, llvm::GlobalVariable*> winrtDelegateVtbl_;
     // All imported winmd types accumulated across every imported file, so the signature encoder
     // can resolve nested named type args (enums/structs/interfaces) when deriving a PIID.
     cflat_winmd::Model winrtConsumedModel_;
@@ -1061,7 +1066,7 @@ private:
     std::unordered_map<std::string, std::unordered_set<std::string>> importAliasMembers;
     std::unordered_set<std::string> importedFiles;
     std::vector<std::string> importStack;  // DFS stack for circular import detection
-    std::string importSearchDir;
+    std::vector<std::string> importSearchDirs;  // -i dirs, searched in order (first match wins)
     std::string runtimeDir;
     std::string sourceFileDir_;  // original source dir for LSP temp-file analysis
     // Override name for diagnostics: LSP analyzes a temp copy, so this carries the real
@@ -7688,6 +7693,280 @@ public:
             LogError("PIID derivation for '" + mangledName + "': " + err);
         }
         return true;
+    }
+
+    // Find an imported WinRT delegate template by its simple (last-segment) name.
+    const cflat_winmd::Delegate* FindWinrtDelegate(const std::string& simple) const
+    {
+        for (const auto& d : winrtConsumedModel_.delegates)
+            if (WinrtSimpleName(d.fullName) == simple) return &d;
+        return nullptr;
+    }
+
+    // The LLVM types for each Invoke parameter, mapped through the thin-slot ABI (interfaces /
+    // objects / strings -> i8*, scalars/enums -> their scalar). This is exactly the surface a
+    // consume-side handler sees, so the cflat closure's parameter list mirrors it 1:1.
+    std::vector<llvm::Type*> WinrtDelegateInvokeParamTypes(const cflat_winmd::Method& invoke)
+    {
+        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        std::vector<llvm::Type*> out;
+        for (const cflat_winmd::Param& p : invoke.params)
+        {
+            std::string nm; bool ptr = false;
+            MapWinrtTypeForSlot(p.type, nm, ptr);
+            if (ptr) { out.push_back(i8PtrTy); continue; }
+            TypeAndValue tv; tv.TypeName = nm; tv.Pointer = false;
+            out.push_back(GetType(tv));
+        }
+        return out;
+    }
+
+    // Build (once) the COM object type + static vtable {QI,AddRef,Release,Invoke} for a projected
+    // delegate instantiation `mangled`. The object is { vtbl*, i32 refcount, __closure_fat_ptr };
+    // Invoke forwards the WinRT ABI args to the stored closure (env-last), returning S_OK. QI
+    // answers IUnknown, IAgileObject, and the delegate's own IID/PIID (`iidBytes`).
+    void BuildWinrtDelegateType(const std::string& mangled, const cflat_winmd::Method& invoke,
+        const uint8_t iidBytes[16])
+    {
+        EnsureClosureLifetimeRegistered();
+        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* i32Ty = builder->getInt32Ty();
+        auto* closureTy = GetClosureFatPtrType();
+
+        // vtbl = 4 opaque code pointers (WinRT reinterprets it as the delegate C vtable).
+        auto* vtblTy = llvm::StructType::create(*context,
+            { i8PtrTy, i8PtrTy, i8PtrTy, i8PtrTy }, "winrtdel_" + mangled + "_vtbl");
+        auto* objTy = llvm::StructType::create(*context,
+            { vtblTy->getPointerTo(), i32Ty, closureTy }, "winrtdel_" + mangled);
+
+        // GUID globals: IUnknown, IAgileObject, and this delegate's IID.
+        uint8_t unkB[16], agileB[16];
+        ParseUuidToBytes("00000000-0000-0000-C000-000000000046", unkB);
+        ParseUuidToBytes("94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90", agileB);
+        auto* gUnk = EmitGuidGlobal(unkB);
+        auto* gAgile = EmitGuidGlobal(agileB);
+        auto* gIid = EmitGuidGlobal(iidBytes);
+
+        auto makeFn = [&](const std::string& nm, llvm::FunctionType* ty) {
+            return llvm::Function::Create(ty, llvm::Function::InternalLinkage,
+                "__winrtdel_" + mangled + "_" + nm, module.get());
+        };
+
+        // QueryInterface(i8* self, i8* riid, i8* ppv) -> i32
+        auto* qiFn = makeFn("QueryInterface",
+            llvm::FunctionType::get(i32Ty, { i8PtrTy, i8PtrTy, i8PtrTy }, false));
+        {
+            auto* entry = llvm::BasicBlock::Create(*context, "entry", qiFn);
+            auto* matchBB = llvm::BasicBlock::Create(*context, "match", qiFn);
+            auto* noBB = llvm::BasicBlock::Create(*context, "nomatch", qiFn);
+            llvm::IRBuilder<> b(entry);
+            auto* self = qiFn->getArg(0);
+            auto* riid = qiFn->getArg(1);
+            auto* ppv = qiFn->getArg(2);
+            auto guidEq = [&](llvm::Value* a, llvm::GlobalVariable* g) -> llvm::Value* {
+                auto* i64Ty = b.getInt64Ty();
+                auto* i64PtrTy = i64Ty->getPointerTo();
+                auto* aLo = b.CreateAlignedLoad(i64Ty, b.CreateBitCast(a, i64PtrTy), llvm::MaybeAlign(1));
+                auto* aHiPtr = b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), a, 8);
+                auto* aHi = b.CreateAlignedLoad(i64Ty, b.CreateBitCast(aHiPtr, i64PtrTy), llvm::MaybeAlign(1));
+                auto* gI8 = b.CreateBitCast(g, i8PtrTy);
+                auto* bLo = b.CreateAlignedLoad(i64Ty, b.CreateBitCast(gI8, i64PtrTy), llvm::MaybeAlign(1));
+                auto* bHiPtr = b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), gI8, 8);
+                auto* bHi = b.CreateAlignedLoad(i64Ty, b.CreateBitCast(bHiPtr, i64PtrTy), llvm::MaybeAlign(1));
+                return b.CreateAnd(b.CreateICmpEQ(aLo, bLo), b.CreateICmpEQ(aHi, bHi));
+            };
+            llvm::Value* match = b.CreateOr(guidEq(riid, gUnk), guidEq(riid, gAgile));
+            match = b.CreateOr(match, guidEq(riid, gIid));
+            b.CreateCondBr(match, matchBB, noBB);
+
+            b.SetInsertPoint(matchBB);
+            auto* objP = b.CreateBitCast(self, objTy->getPointerTo());
+            auto* rcP = b.CreateStructGEP(objTy, objP, 1);
+            b.CreateAtomicRMW(llvm::AtomicRMWInst::Add, rcP, b.getInt32(1),
+                llvm::MaybeAlign(), llvm::AtomicOrdering::Monotonic);
+            b.CreateStore(self, b.CreateBitCast(ppv, i8PtrTy->getPointerTo()));
+            b.CreateRet(b.getInt32(0));
+
+            b.SetInsertPoint(noBB);
+            b.CreateStore(llvm::ConstantPointerNull::get(i8PtrTy),
+                b.CreateBitCast(ppv, i8PtrTy->getPointerTo()));
+            b.CreateRet(b.getInt32((uint32_t)0x80004002));   // E_NOINTERFACE
+        }
+
+        // AddRef(i8* self) -> i32
+        auto* addRefFn = makeFn("AddRef", llvm::FunctionType::get(i32Ty, { i8PtrTy }, false));
+        {
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(*context, "entry", addRefFn));
+            auto* objP = b.CreateBitCast(addRefFn->getArg(0), objTy->getPointerTo());
+            auto* rcP = b.CreateStructGEP(objTy, objP, 1);
+            auto* old = b.CreateAtomicRMW(llvm::AtomicRMWInst::Add, rcP, b.getInt32(1),
+                llvm::MaybeAlign(), llvm::AtomicOrdering::Monotonic);
+            b.CreateRet(b.CreateAdd(old, b.getInt32(1)));
+        }
+
+        // Release(i8* self) -> i32: destruct the owned closure and free at zero.
+        auto* releaseFn = makeFn("Release", llvm::FunctionType::get(i32Ty, { i8PtrTy }, false));
+        {
+            auto* entry = llvm::BasicBlock::Create(*context, "entry", releaseFn);
+            auto* freeBB = llvm::BasicBlock::Create(*context, "free", releaseFn);
+            auto* doneBB = llvm::BasicBlock::Create(*context, "done", releaseFn);
+            llvm::IRBuilder<> b(entry);
+            auto* self = releaseFn->getArg(0);
+            auto* objP = b.CreateBitCast(self, objTy->getPointerTo());
+            auto* rcP = b.CreateStructGEP(objTy, objP, 1);
+            auto* old = b.CreateAtomicRMW(llvm::AtomicRMWInst::Sub, rcP, b.getInt32(1),
+                llvm::MaybeAlign(), llvm::AtomicOrdering::Monotonic);
+            auto* nw = b.CreateSub(old, b.getInt32(1));
+            b.CreateCondBr(b.CreateICmpEQ(nw, b.getInt32(0)), freeBB, doneBB);
+
+            b.SetInsertPoint(freeBB);
+            if (auto* cdtor = module->getFunction("__closure_fat_ptr.dtor"))
+                b.CreateCall(cdtor->getFunctionType(), cdtor, { b.CreateStructGEP(objTy, objP, 2) });
+            if (auto* del = GetFunction("operator delete"))
+                b.CreateCall(del->getFunctionType(), del, { b.CreateBitCast(self, del->getArg(0)->getType()) });
+            b.CreateBr(doneBB);
+
+            b.SetInsertPoint(doneBB);
+            b.CreateRet(nw);
+        }
+
+        // Invoke(i8* self, <mapped invoke params...>) -> i32. Forward to the closure (env-last).
+        std::vector<llvm::Type*> paramTys = WinrtDelegateInvokeParamTypes(invoke);
+        std::vector<llvm::Type*> invokeSig = { i8PtrTy };
+        for (auto* t : paramTys) invokeSig.push_back(t);
+        auto* invokeFn = makeFn("Invoke", llvm::FunctionType::get(i32Ty, invokeSig, false));
+        {
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(*context, "entry", invokeFn));
+            auto* objP = b.CreateBitCast(invokeFn->getArg(0), objTy->getPointerTo());
+            auto* cloP = b.CreateStructGEP(objTy, objP, 2);
+            auto* code = b.CreateLoad(i8PtrTy, b.CreateStructGEP(closureTy, cloP, 0), "clo_code");
+            llvm::Value* env = b.CreateLoad(i8PtrTy, b.CreateStructGEP(closureTy, cloP, 1), "clo_env");
+
+            // Strip the OWNED tag (low bit) off the env before invoking - an owning heap env
+            // carries the tag (lambda Option A) but the closure code expects a clean pointer.
+            auto* envInt = b.CreatePtrToInt(env, b.getInt64Ty());
+            auto* masked = b.CreateAnd(envInt, b.getInt64(~(uint64_t)1));
+            env = b.CreateIntToPtr(masked, i8PtrTy, "env_untagged");
+
+            std::vector<llvm::Type*> cloSig = paramTys;
+            cloSig.push_back(i8PtrTy);   // trailing env
+            auto* cloFnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(*context), cloSig, false);
+            auto* cloFn = b.CreateBitCast(code, cloFnTy->getPointerTo(), "clo_fn");
+            std::vector<llvm::Value*> cloArgs;
+            for (size_t i = 0; i < paramTys.size(); i++) cloArgs.push_back(invokeFn->getArg(1 + (unsigned)i));
+            cloArgs.push_back(env);
+            b.CreateCall(cloFnTy, cloFn, cloArgs);
+            b.CreateRet(b.getInt32(0));   // S_OK
+        }
+
+        std::vector<llvm::Constant*> entries = {
+            llvm::ConstantExpr::getBitCast(qiFn, i8PtrTy),
+            llvm::ConstantExpr::getBitCast(addRefFn, i8PtrTy),
+            llvm::ConstantExpr::getBitCast(releaseFn, i8PtrTy),
+            llvm::ConstantExpr::getBitCast(invokeFn, i8PtrTy) };
+        auto* init = llvm::ConstantStruct::get(vtblTy, entries);
+        auto* vtblGlobal = new llvm::GlobalVariable(*module, vtblTy, true,
+            llvm::GlobalValue::InternalLinkage, init, "__winrtdel_" + mangled + "_vtbl_inst");
+
+        winrtDelegateObjTy_[mangled] = objTy;
+        winrtDelegateVtbl_[mangled] = vtblGlobal;
+    }
+
+    // Lower winrtDelegate(DelegateType, closure): synthesize (or reuse) the COM-callable object
+    // type for the delegate instantiation, then at the call site allocate it, wire lpVtbl and a
+    // refcount of 1, clone the closure into it (clone-by-default; the object owns the clone and
+    // destructs it on final Release), and return the object as an i8* the WinRT ABI accepts.
+    llvm::Value* EmitWinrtDelegateObject(const std::string& base,
+        const std::vector<std::string>& cflatArgs, llvm::Value* closureFat)
+    {
+        const cflat_winmd::Delegate* tpl = FindWinrtDelegate(base);
+        if (!tpl)
+        {
+            LogError("winrtDelegate: '" + base + "' is not an imported WinRT delegate type "
+                     "(import the .winmd that declares it)");
+            return nullptr;
+        }
+        if (cflatArgs.size() != tpl->genericParams.size())
+        {
+            LogError(std::format("winrtDelegate: '{}' expects {} type argument(s), got {}",
+                base, tpl->genericParams.size(), cflatArgs.size()));
+            return nullptr;
+        }
+        if (!(tpl->invoke.returnType.fullName == "Void" && tpl->invoke.returnType.pointerDepth == 0))
+        {
+            LogError("winrtDelegate: '" + base + "' has a non-void Invoke return, which the "
+                     "projection does not support yet (only void-returning handlers)");
+            return nullptr;
+        }
+
+        std::string mangled = base;
+        for (const auto& a : cflatArgs) mangled += "__" + a;
+
+        // Substitute the generic Invoke signature with the concrete type arguments.
+        std::vector<cflat_winmd::TypeRef> argRefs;
+        for (const auto& a : cflatArgs)
+        {
+            cflat_winmd::TypeRef r; std::string err;
+            if (!CFlatArgToWinrtTypeRef(a, r, err)) { LogError("winrtDelegate " + base + "<...>: " + err); return nullptr; }
+            argRefs.push_back(r);
+        }
+        cflat_winmd::Method invoke = tpl->invoke;
+        for (auto& p : invoke.params) p.type = SubstWinrtVar(p.type, argRefs);
+
+        // Derive the delegate IID: stored (non-generic) or PIID (parameterized).
+        uint8_t iidBytes[16];
+        if (cflatArgs.empty())
+        {
+            if (!ParseUuidToBytes(tpl->iid, iidBytes))
+            {
+                LogError("winrtDelegate: delegate '" + base + "' has no IID in metadata");
+                return nullptr;
+            }
+        }
+        else
+        {
+            cflat_winmd::TypeRef inst; inst.fullName = tpl->fullName; inst.genericArgs = argRefs;
+            std::string err;
+            if (!cflat_winmd::DerivePiid(inst, winrtConsumedModel_, iidBytes, err))
+            {
+                LogError("winrtDelegate PIID for '" + mangled + "': " + err);
+                return nullptr;
+            }
+        }
+
+        if (!winrtDelegateObjTy_.count(mangled))
+            BuildWinrtDelegateType(mangled, invoke, iidBytes);
+        auto* objTy = winrtDelegateObjTy_[mangled];
+        auto* vtblGlobal = winrtDelegateVtbl_[mangled];
+
+        if (!GetFunction("operator new"))
+        {
+            LogError("winrtDelegate: 'operator new' unavailable (import a core library first)");
+            return nullptr;
+        }
+        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* closureTy = GetClosureFatPtrType();
+
+        // Allocate the object.
+        uint64_t sz = module->getDataLayout().getTypeAllocSize(objTy);
+        NamedVariable szArg;
+        szArg.Primary = builder->getInt64(sz);
+        szArg.BaseType = builder->getInt64Ty();
+        auto* raw = CreateOverloadedFunctionCall("operator new", { szArg });
+        auto* objP = builder->CreateBitCast(raw, objTy->getPointerTo(), "winrtdel.obj");
+
+        // lpVtbl = &vtbl, refcount = 1.
+        builder->CreateStore(builder->CreateBitCast(vtblGlobal, objTy->getStructElementType(0)),
+            builder->CreateStructGEP(objTy, objP, 0));
+        builder->CreateStore(builder->getInt32(1), builder->CreateStructGEP(objTy, objP, 1));
+
+        // Clone the closure into the object so it owns an independent env (destructed on Release).
+        llvm::Value* owned = closureFat;
+        if (auto* copyFn = module->getFunction("__closure_fat_ptr.copy"))
+            owned = builder->CreateCall(copyFn->getFunctionType(), copyFn, { closureFat }, "clo_clone");
+        builder->CreateStore(owned, builder->CreateStructGEP(objTy, objP, 2));
+
+        return builder->CreateBitCast(objP, i8PtrTy, "winrtdel.i8");
     }
 
     // Register every projectable type in `model` as CFlat types: value structs, enums (named
@@ -14473,7 +14752,7 @@ public:
         return ok;
     }
 
-    bool Analyze(const std::string& filePath, const std::string& importDir, const std::string& runtimeDirPath);
+    bool Analyze(const std::string& filePath, const std::vector<std::string>& importDirs, const std::string& runtimeDirPath);
     void ResetForReanalysis();
 
     // Populate %USERPROFILE%\.cflat\ with cached linker paths for x64 and x86.

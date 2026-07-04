@@ -103,7 +103,7 @@ static std::string extractImportFilename(const std::string& text, int line)
 // Resolve an import filename using the same search order as CompileImportedFile.
 static std::string resolveImportPath(const std::string& sourceFilePath,
                                      const std::string& importFilename,
-                                     const std::string& importSearchDir,
+                                     const std::vector<std::string>& importSearchDirs,
                                      const std::string& runtimeDir)
 {
     auto tryCanonical = [](std::filesystem::path p) -> std::string {
@@ -116,9 +116,11 @@ static std::string resolveImportPath(const std::string& sourceFilePath,
         auto r = tryCanonical(std::filesystem::path(sourceFilePath).parent_path() / importFilename);
         if (!r.empty()) return r;
     }
-    if (!importSearchDir.empty())
+    // Search the -i dirs in order; first match wins.
+    for (const auto& dir : importSearchDirs)
     {
-        auto r = tryCanonical(std::filesystem::path(importSearchDir) / importFilename);
+        if (dir.empty()) continue;
+        auto r = tryCanonical(std::filesystem::path(dir) / importFilename);
         if (!r.empty()) return r;
     }
     if (!runtimeDir.empty())
@@ -344,11 +346,11 @@ struct OpenDocument
 class LspServer
 {
 public:
-    LspServer(int protocolFd, const std::string& runtimeDir, const std::string& importDir, bool verbose,
+    LspServer(int protocolFd, const std::string& runtimeDir, const std::vector<std::string>& importDirs, bool verbose,
               unsigned int poolSizeOverride = 0)
         : loop_(protocolFd, verbose)
         , runtimeDir_(runtimeDir)
-        , importSearchDir_(importDir)
+        , importSearchDirs_(importDirs)
         , verbose_(verbose)
         , currentIndex_(std::make_shared<LspSymbolIndex>())
     {
@@ -968,7 +970,7 @@ private:
         std::string importFile = extractImportFilename(text, line);
         if (!importFile.empty())
         {
-            std::string resolved = resolveImportPath(filePath, importFile, importSearchDir_, runtimeDir_);
+            std::string resolved = resolveImportPath(filePath, importFile, importSearchDirs_, runtimeDir_);
             if (!resolved.empty())
             {
                 lsp::Range range{ {0, 0}, {0, 0} };
@@ -1330,7 +1332,7 @@ private:
         llvm::CrashRecoveryContext crc;
         bool recovered = crc.RunSafely([&]
         {
-            ok = backend->Analyze(tempPath, importSearchDir_, runtimeDir_);
+            ok = backend->Analyze(tempPath, importSearchDirs_, runtimeDir_);
         });
 
         if (!recovered)
@@ -1513,7 +1515,7 @@ private:
             std::string fname(ln.substr(fnStart, i - fnStart));
             if (!fname.ends_with(".cb")) continue;
 
-            std::string resolved = resolveImportPath(filePath, fname, importSearchDir_, runtimeDir_);
+            std::string resolved = resolveImportPath(filePath, fname, importSearchDirs_, runtimeDir_);
             if (resolved.empty()) continue;
             auto it = namesByFile.find(canon(resolved));
             if (it == namesByFile.end() || it->second.empty()) continue;  // nothing to conclude
@@ -1578,7 +1580,7 @@ private:
 
     JsonRpcLoop loop_;
     std::string runtimeDir_;
-    std::string importSearchDir_;
+    std::vector<std::string> importSearchDirs_;
 
     std::mutex docsMutex_;
     std::unordered_map<std::string, OpenDocument> docs_;
@@ -1658,7 +1660,7 @@ int RunLspServer(int argc, char* argv[])
     std::string runtimeDir = GetExeDir();
 
     bool verbose = false;
-    std::string importDir;
+    std::vector<std::string> importDirs;
     unsigned int poolSizeOverride = 0;
     for (int i = 0; i < argc; ++i)
     {
@@ -1666,7 +1668,7 @@ int RunLspServer(int argc, char* argv[])
         if (arg == "--verbose" || arg == "-v")
             verbose = true;
         else if ((arg == "--import-dir" || arg == "-i") && i + 1 < argc)
-            importDir = argv[++i];
+            importDirs.push_back(argv[++i]);
         else if (arg == "--lsp-pool-size" && i + 1 < argc)
         {
             int v = std::atoi(argv[++i]);
@@ -1675,7 +1677,7 @@ int RunLspServer(int argc, char* argv[])
     }
 
     if (verbose) std::cerr << "[lsp] server starting\n";
-    LspServer server(protocolFd, runtimeDir, importDir, verbose, poolSizeOverride);
+    LspServer server(protocolFd, runtimeDir, importDirs, verbose, poolSizeOverride);
     if (verbose) std::cerr << "[lsp] entering Run()\n";
     server.Run();
     if (verbose) std::cerr << "[lsp] Run() returned\n";

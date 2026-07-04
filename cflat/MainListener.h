@@ -7269,6 +7269,18 @@ public:
                 auto trueValue  = ParseExpression(expressionTrueCtx);
                 llvm::Value* falseValue = ParseConditionalExpression(expressionFalseCtx);
 
+                // A branch that is a plain (non-`move`) string-returning CALL yields a fresh owned
+                // temp the call path did not register (only `move` returns are). CreateSelect below
+                // evaluates BOTH branches and the string case deep-copies the winner into a new owned
+                // buffer, leaving each branch's temp unreferenced - so an unregistered plain-return
+                // temp leaks. Register any call-result string branch for end-of-statement cleanup;
+                // this reuses the operator-operand path's logic: a named local / field read lowers to
+                // a load (not a CallInst) and is skipped, so it is never double-freed, and the free is
+                // owned-bit-gated so a borrow return is a runtime no-op. `move` returns are already
+                // registered and re-registration is idempotent (deduped).
+                RegisterBorrowedStringOperandTemp(compiler, trueValue);
+                RegisterBorrowedStringOperandTemp(compiler, falseValue);
+
                 // Align branch types so LLVM select has matching operand types. A select
                 // with mismatched operands asserts inside LLVM ("Invalid operands for
                 // select"), so every unifiable case is coerced here and any remaining
@@ -15343,6 +15355,47 @@ public:
                 return g;
             compiler->LogError("iidof: no IID known for type '" + (typeArgs.empty() ? base : mangled) +
                                "' (only [winrt]/imported interfaces and parameterized WinRT interfaces have one)");
+            return llvm::Constant::getNullValue(compiler->builder->getPtrTy());
+        }
+        else if (ctx->WinrtDelegate())
+        {
+            // winrtDelegate(DelegateType, closure) -> a COM-callable delegate object (i8*) whose
+            // Invoke forwards the WinRT ABI args to the closure. The delegate type resolves the
+            // IID/PIID + Invoke signature from imported metadata; the closure is cloned in and
+            // owned by the object (released on final COM Release). See EmitWinrtDelegateObject.
+            auto* ts = ctx->typeSpecifier();
+            std::string base;
+            std::vector<std::string> typeArgs;
+            if (ts && ts->genericIdentifier())
+            {
+                base = ts->genericIdentifier()->Identifier()->getText();
+                if (auto* gp = ts->genericIdentifier()->genericTypeParameters())
+                    for (auto* entry : gp->typeParameterList()->typeParameterEntry())
+                        typeArgs.push_back(ResolveTypeArgEntry(entry));
+            }
+            else
+            {
+                base = ts ? ts->getText() : "";
+            }
+
+            // Evaluate the closure argument and normalize it to a fat closure {code, env} value.
+            auto nv = ParseAssignmentExpressionNamed(ctx->assignmentExpression());
+            llvm::Value* cloVal = LoadNamedVariable(nv);
+            if (auto* fn = llvm::dyn_cast<llvm::Function>(cloVal))
+                cloVal = compiler->WrapBareValueAsFatStruct(fn);
+            else if (cloVal && cloVal->getType() == compiler->GetClosureFatPtrType())
+            { /* already a fat closure value */ }
+            else if (cloVal && cloVal->getType()->isPointerTy())
+                cloVal = compiler->WidenThinToFat(cloVal);   // thin function<T>
+            else
+            {
+                compiler->LogError("winrtDelegate: second argument must be a closure "
+                                   "(lambda, function<...>, or Lambda<...>)");
+                return llvm::Constant::getNullValue(compiler->builder->getPtrTy());
+            }
+
+            if (auto* v = compiler->EmitWinrtDelegateObject(base, typeArgs, cloVal))
+                return v;
             return llvm::Constant::getNullValue(compiler->builder->getPtrTy());
         }
         else if (expressionCtx != nullptr)

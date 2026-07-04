@@ -515,6 +515,8 @@ namespace cflat_winmd
                     Delegate d;
                     d.fullName = StripArity(fullName);
                     d.iid = r.ReadIid(td);
+                    for (int gp = 0, arity = ArityOf(fullName); gp < arity; gp++)
+                        d.genericParams.push_back("T" + std::to_string(gp));
                     std::vector<Method> ms;
                     r.ReadMethods(td, ms);
                     for (auto& m : ms) if (m.name == "Invoke") { d.invoke = std::move(m); break; }

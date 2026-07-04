@@ -20,6 +20,26 @@ import "winrt.cb";
 import "windows.h" cache;
 import "test_helper.cb";
 import "guid.cb";
+import "function.cb";   // capturing-closure delegate handler (clone/free env primitives)
+
+// A thin COM vtable shape mirroring a WinRT delegate ({QI, AddRef, Release, Invoke}) so a
+// projected delegate object can be driven SYNCHRONOUSLY in-process - no OS callback thread - to
+// assert refcount + capture + Invoke marshaling deterministically. (The OS-driven path is proven
+// separately by testDelegateAsyncCompleted, where Windows itself calls our Invoke.)
+struct DelegateVtbl
+{
+    function<i32(void*, void*, void*)> QueryInterface = default;
+    function<u32(void*)> AddRef = default;
+    function<u32(void*)> Release = default;
+    function<i32(void*, void*, i32)> Invoke = default;
+};
+struct DelegateThin { DelegateVtbl* lpVtbl = default; };
+
+// Globals a non-capturing async handler writes (module scope so it needs no capture); and the
+// slot a capturing sync handler writes through its captured base.
+i32 gDelegateFired = 0;
+i32 gDelegateStatus = -1;
+i32 gDelegateCap = -1;
 
 // === iidof byte-exactness: a stored IID and a DERIVED parameterized IID (no OS needed) ===
 //
@@ -381,6 +401,103 @@ bool testComPtrRaii()
     return result;
 }
 
+// === Delegate projection (sync): winrtDelegate wraps a closure as a COM-callable object ===
+//
+// winrtDelegate(DelegateType, closure) synthesizes a refcounted COM object whose vtable is
+// {QueryInterface, AddRef, Release, Invoke} and whose Invoke forwards the WinRT ABI args to the
+// (cloned, owned) closure. Here we drive it fully in-process: AddRef/Release move the refcount,
+// and a direct Invoke runs the CAPTURING closure (proving the captured `base` was cloned into the
+// object and the `status` arg marshaled), all with zero threading so the assertions are exact.
+bool testDelegateSyncInvoke()
+{
+    bool result = true;
+    gDelegateCap = -1;
+
+    int base = 1000;
+    void* h = winrtDelegate(AsyncOperationCompletedHandler<string>,
+        (void* asyncInfo, i32 status) => { gDelegateCap = base + status; });
+    result &= Test("winmd_delegate_nonnull", h != nullptr ? 1 : 0, 1);
+    if (h == nullptr) return false;
+
+    DelegateThin* d = (DelegateThin*)h;
+    // Refcount starts at 1: AddRef -> 2, Release -> 1.
+    result &= Test("winmd_delegate_addref", (int)d->lpVtbl->AddRef(h), 2);
+    result &= Test("winmd_delegate_release", (int)d->lpVtbl->Release(h), 1);
+
+    // Invoke as the OS would: HRESULT S_OK back, and the closure runs with the captured base.
+    i32 hr = d->lpVtbl->Invoke(h, nullptr, 5);
+    result &= Test("winmd_delegate_invoke_hr", hr, 0);
+    result &= Test("winmd_delegate_capture", gDelegateCap, 1005);
+
+    d->lpVtbl->Release(h);   // final release -> destructs the owned closure + frees the object
+    return result;
+}
+
+// === Delegate projection (async): a REAL WinRT AsyncOperationCompletedHandler<String> ===
+//
+// Upgrades the async round-trip from polling (awaitAsync) to a projected completion handler:
+// put_Completed hands Windows our synthesized delegate, and the OS QueryInterfaces it for the
+// derived AsyncOperationCompletedHandler<String> PIID (accepting it proves byte-exact PIID
+// derivation) then calls our Invoke on a threadpool thread. The handler (non-capturing) records
+// the terminal status; a bounded spin waits for it. GetResults then yields the round-tripped text.
+bool testDelegateAsyncCompleted()
+{
+    bool result = true;
+    gDelegateFired = 0;
+    gDelegateStatus = -1;
+
+    u16[260] pathBuf = default;
+    u32 baseLen = GetTempPathW(260, &pathBuf[0]);
+    string fname = "cflat_winmd_delegate_test.txt";
+    int j = 0;
+    while (j < fname.length()) { pathBuf[baseLen + (u32)j] = (u16)fname.data()[j]; j = j + 1; }
+    u32 pathLen = baseLen + (u32)fname.length();
+    void* hPath = nullptr;
+    WindowsCreateString(&pathBuf[0], pathLen, &hPath);
+
+    IPathIOStatics* pathIO = nullptr;
+    i32 hr = activationFactory("Windows.Storage.PathIO", iidof(IPathIOStatics), (void**)&pathIO);
+    result &= Test("winmd_delegate_activation_hr", (hr == 0 && pathIO != nullptr) ? 1 : 0, 1);
+    if (hr != 0 || pathIO == nullptr) { freeHString(hPath); return false; }
+
+    void* hFile = CreateFileW(&pathBuf[0], 0x40000000, 0, nullptr, 2, 0x80, nullptr);
+    CloseHandle(hFile);
+
+    string content = "delegate handler roundtrip";
+    void* hContent = hstring(content);
+    void* writeOp = nullptr;
+    pathIO->WriteTextAsync(hPath, hContent, &writeOp);
+    awaitAsync(writeOp);
+    if (writeOp != nullptr) ((IAsyncAction*)writeOp)->lpVtbl->Release(writeOp);
+
+    void* readOp = nullptr;
+    pathIO->ReadTextAsync(hPath, &readOp);
+
+    void* handler = winrtDelegate(AsyncOperationCompletedHandler<string>,
+        (void* asyncInfo, i32 status) => { gDelegateStatus = status; gDelegateFired = 1; });
+    IAsyncOperation<string>* op = (IAsyncOperation<string>*)readOp;
+    op->lpVtbl->put_Completed(readOp, handler);
+
+    // The handler fires on an MTA threadpool thread; wait on the single gate global.
+    int guard = 0;
+    while (gDelegateFired == 0 && guard < 20000) { Sleep((u32)1); guard = guard + 1; }
+    result &= Test("winmd_delegate_completed_fired", gDelegateFired, 1);
+    result &= Test("winmd_delegate_completed_status", gDelegateStatus, 1);
+
+    void* hOut = nullptr;
+    op->lpVtbl->GetResults(readOp, &hOut);
+    string readBack = fromHString(hOut);
+    result &= Test("winmd_delegate_roundtrip_text", (readBack == content) ? 1 : 0, 1);
+
+    op->lpVtbl->Release(readOp);
+    ((IAsyncInfo*)handler)->Release();
+    pathIO->lpVtbl->Release(pathIO);
+    freeHString(hOut);
+    freeHString(hContent);
+    freeHString(hPath);
+    return result;
+}
+
 extern int main()
 {
     winrtInit();   // RO_INIT_MULTITHREADED
@@ -396,6 +513,8 @@ extern int main()
     total++; passed += testForeachCollection()          ? 1 : 0;
     total++; passed += testAsyncRoundtrip()             ? 1 : 0;
     total++; passed += testComPtrRaii()                 ? 1 : 0;
+    total++; passed += testDelegateSyncInvoke()          ? 1 : 0;
+    total++; passed += testDelegateAsyncCompleted()      ? 1 : 0;
 
     winrtUninit();
 

@@ -47,6 +47,7 @@ primaryExpression
     | TypeOf '(' expression ')'
     | TypeOf '(' typeSpecifier ')'
     | IidOf '(' typeSpecifier ')'
+    | WinrtDelegate '(' typeSpecifier ',' assignmentExpression ')'
     ;
 
 tupleExpression
@@ -954,6 +955,10 @@ TypeOf
 
 IidOf
     : 'iidof'
+    ;
+
+WinrtDelegate
+    : 'winrtDelegate'
     ;
 
 Is
