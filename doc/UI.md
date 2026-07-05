@@ -11,7 +11,7 @@ the "sugar-compatible element contract" is what a future `<View/>` grammar sugar
 (and an eventual `core/` promotion) desugars against. Changes to the frozen
 surface are deliberate and bump the API version.
 
-- **Framework API version:** 9 (v5 added color to `Style` + `Canvas`; v6 added the
+- **Framework API version:** 11 (v5 added color to `Style` + `Canvas`; v6 added the
   `Theme` styling preference and hover/pressed/focus interaction states; v7 added the
   `Checkbox` widget, the `disabled` state, and `Style.gap`; v8 added the `ProgressBar`
   and `Slider` widgets with the `track`/`accent` theme slots; v9 added the `NativeHost`
@@ -19,7 +19,9 @@ surface are deliberate and bump the API version.
   identity, the `UiContext.nativeByKey` shadow map, and the DIP layout unit; v10 added
   the `TextArea` multiline element and the Win32 native host's editor features -
   per-monitor DPI, dark titlebar + themed controls, a declarative menu bar with
-  accelerators, shell file dialogs, message boxes, and a secondary window)
+  accelerators, shell file dialogs, message boxes, and a secondary window; v11 added
+  the macOS **AppKit (Cocoa)** `NativeHost` backend and the `native_host.cb` platform
+  shim, so one app source compiles to real OS controls on both Windows and macOS)
 - **Location:** `example/ui/` (framework + TUI and Win32 hosts). NOT in `core/`
   yet - promotion is deferred to a later release.
 - **Status:** the framework is a single source of truth (`example/ui/ui.cb`);
@@ -441,11 +443,18 @@ implemented as thin layers over these seams (see above), not special cases.
 ## The `NativeHost` seam (v9) - real OS controls
 
 `Canvas` paints the tree pixel by pixel. `NativeHost` is the alternative output
-stage: instead of painting, it drives real OS controls (HWND on Windows; NSView
-later) so the OS handles rendering, text input, IME, and accessibility. The
-app-facing model (Element tree, Component, controlled widgets, Theme, keyed
-identity) is unchanged - only the output stage differs. The contract lives in
-`example/ui/ui_native.cb`; the Win32 implementation is `win32_native_host.cb`.
+stage: instead of painting, it drives real OS controls (HWND on Windows; AppKit
+`NSView`/`NSControl` on macOS) so the OS handles rendering, text input, IME, and
+accessibility. The app-facing model (Element tree, Component, controlled widgets,
+Theme, keyed identity) is unchanged - only the output stage differs. The contract
+lives in `example/ui/ui_native.cb`; the implementations are `win32_native_host.cb`
+(Win32/GDI) and `cocoa_native_host.cb` (AppKit).
+
+**Platform shim.** An app imports `example/ui/native_host.cb` - a file-scope
+`if const (__MACOS__)` shim that pulls in the Cocoa host on macOS and the Win32
+host elsewhere. Both backends expose the identical public surface
+(`runAppGuiNative`, `buildNativeTree`, the `menu*`/`native*` helpers, the driver
+API), so a single app source compiles to real OS controls on both platforms.
 
 ```
 interface NativeHost
@@ -508,7 +517,9 @@ ordinals). An app imports this host and calls `runAppGuiNative(new App(), title)
   window; `nativeCloseWindow()` quits.
 - **Flagship demo:** `example/ui/fedit/fedit.cb` - a small native text editor built
   entirely on the above (open/edit/save, find, dirty-close prompt, light/dark, two
-  windows). Build: `cflat example/ui/fedit/fedit.cb -i example/ui -o out/fedit.exe`.
+  windows). It imports the `native_host.cb` shim, so the same source builds and runs
+  on Windows (Win32) and macOS (Cocoa). Build:
+  `cflat example/ui/fedit/fedit.cb -i example/ui -o out/fedit` (`.exe` on Windows).
 
 ## Hosts
 
@@ -518,6 +529,9 @@ ordinals). An app imports this host and calls `runAppGuiNative(new App(), title)
   AND leaks (built with `--heap-audit`).
 - **Win32** (`example/ui/win32host.cb` + `example/ui/win32_boxes.cb`): a native
   GDI host reusing the framework unchanged behind the `Canvas` seam.
+- **Native OS controls** (`example/ui/native_host.cb` shim -> `win32_native_host.cb`
+  / `cocoa_native_host.cb`): the `NativeHost` seam instead of `Canvas` - real HWND
+  (Win32) or AppKit controls (macOS). See the `NativeHost` section above.
 
 To run the TUI self-tests directly:
 

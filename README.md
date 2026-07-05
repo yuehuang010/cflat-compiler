@@ -6,11 +6,13 @@ CFlat (`.cb`) extends C with generics, interfaces, namespaces, operator overload
 
 ## Quick Start
 
-cflat is self-contained on Windows 10 and later - it links native executables without the Windows SDK or Visual Studio. The hello app below builds and runs on a clean machine. (The Windows SDK is only needed for advanced C interop against prebuilt system libraries; cflat falls back to it automatically when present.)
+cflat runs natively on **Windows 10+**, **macOS (Apple Silicon)**, and **Linux/WSL**, and is self-contained on each - it links native executables without an external toolchain. On Windows it links without the Windows SDK or Visual Studio; on macOS it links via a bundled `ld64.lld` with no Xcode or Command Line Tools (after a one-time `cflat --init`); on Linux it emits x64 ELF. The hello app below builds and runs on a clean machine. (On Windows, the Windows SDK is only needed for advanced C interop against prebuilt system libraries; cflat falls back to it automatically when present.)
+
+The compiler defaults to the native host target and picks the object format automatically (PE/COFF, Mach-O, or ELF); use `--platform` to cross-compile. See [`doc/CLI.md`](doc/CLI.md).
 
 ```bash
 # Compile a source file to native executable
-cflat.exe hello.cb -o hello.exe
+cflat hello.cb -o hello        # cflat.exe hello.cb -o hello.exe on Windows
 ```
 
 ```c

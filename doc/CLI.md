@@ -82,7 +82,7 @@ program argument, so program args are never mistaken for compiler flags or sourc
 | `-O1` | `-1` | | Optimize for speed (level 1). |
 | `-O2` | `-2` | | Optimize for speed (level 2). The loop vectorizer (and the `vectorize` keyword enforcement) runs only at `-O2`. |
 | `--no-opt` | | | Disable the baseline passes (sroa, mem2reg, instcombine, simplifycfg) that run even at `-O0`. |
-| `--platform` | `-p` | `win64`\|`win32` | Target platform (default `win64`). |
+| `--platform` | `-p` | `win64`\|`win32`\|`linux`\|`macos` | Target platform. Defaults to the native host OS (`win64` on Windows, `macos` -> arm64 Mach-O on Apple Silicon, `linux` -> x64 ELF on Linux). `macos` cross-compiles an arm64 Mach-O object. |
 | `--cpu` | | name\|`native` | Target CPU: sets ISA features and tuning. Names come from `--print-supported-cpus`. |
 | `--tune` | | name\|`native` | Tune scheduling for this CPU without changing the instruction set. |
 
