@@ -18,13 +18,45 @@ if const (__WINDOWS__) {
 } else {
     // POSIX: posix_memalign (alignment must be a power of two >= sizeof(void*)).
     // Aligned blocks are released with plain free(), so _aligned_free == free.
+    extern win_int posix_memalign(void** memptr, win_size alignment, win_size size);
     void* _aligned_malloc(win_size size, win_size alignment) {
         void* p = nullptr;
         win_size a = alignment < (win_size)8 ? (win_size)8 : alignment;
-        if (os.posix.posix_memalign(&p, a, size) != 0) return nullptr;
+        if (posix_memalign(&p, a, size) != 0) return nullptr;
         return p;
     }
     void _aligned_free(void* ptr) { free(ptr); }
+}
+
+// === File stream I/O (portable C stdio: one linkage name on Win CRT and libc) ===
+// Declared here (cruntime is the canonical home for portable stdio); filesystem.cb
+// calls these un-namespaced. Types mirror os.posix.cb (win_size == i64 on 64-bit).
+extern void*    fopen(const char* path, const char* mode);
+extern win_int  fclose(void* stream);
+extern win_size fread(i8* buf, win_size size, win_size count, void* stream);
+extern win_size fwrite(const i8* buf, win_size size, win_size count, void* stream);
+extern win_int  feof(void* stream);
+extern win_int  fseek(void* stream, win_size offset, win_int origin);
+extern win_size ftell(void* stream);
+
+// === Formatting primitives (canonical home; keep an if const only where the CRT
+// vs libc entry-point NAME differs). These share the one linkage symbol with the
+// identical decls left in os.windows.cb / os.posix.cb for the later prune pass.
+if const (__WINDOWS__) {
+    extern win_int __stdio_common_vsprintf(u64 options, char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);
+    extern win_int __stdio_common_vsscanf(u64 options, const char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);
+    extern win_int __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
+} else {
+    // POSIX: __vsnprintf_chk (both), the glibc ISO-C99/chk variants, and the Darwin
+    // public names. Wrapper BODIES pick per-platform via if const; unreferenced
+    // decls (e.g. __isoc99_* on Darwin) emit no symbol. Mirrors os.posix.cb.
+    extern win_int __vsnprintf_chk(char* buf, win_size maxlen, win_int flag, win_size slen, const char* fmt, va_list ap);
+    extern win_int __isoc99_vsscanf(const char* buf, const char* fmt, va_list ap);
+    extern win_int __vfprintf_chk(void* stream, win_int flag, const char* fmt, va_list ap);
+    extern win_int __isoc99_vfscanf(void* stream, const char* fmt, va_list ap);
+    extern win_int vsscanf(const char* buf, const char* fmt, va_list ap);
+    extern win_int vfprintf(void* stream, const char* fmt, va_list ap);
+    extern win_int vfscanf(void* stream, const char* fmt, va_list ap);
 }
 
 // Win32: callers always pass i64; these wrappers truncate to i32 before calling the CRT.
@@ -66,9 +98,10 @@ thread_local __ProgramTLS __prog_tls = default;
 // initial buffer is silently dropped.
 win_int __vsprintf_safe(u64 options, char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap) {
     if const (__WINDOWS__) {
-        return os.windows.__stdio_common_vsprintf(options | (u64)2, buf, (win_size)bufSize, fmt, locale, ap);
+        return __stdio_common_vsprintf(options | (u64)2, buf, (win_size)bufSize, fmt, locale, ap);
     } else {
-        return os.posix.vsnprintf_libc(buf, (win_size)bufSize, fmt, ap);
+        // __vsnprintf_chk(s, maxlen, flag=0, slen=maxlen, fmt, ap): plain, bounds never trip.
+        return __vsnprintf_chk(buf, (win_size)bufSize, 0, (win_size)bufSize, fmt, ap);
     }
 }
 
@@ -82,23 +115,13 @@ void __stdout_write(const char* buf, int len) {
         __prog_tls.stdout_hook((char*)buf, len);  // non-owning, hook must NOT free
         __prog_tls.stdout_in_hook = false;
     } else {
-        if const (__WINDOWS__) {
-            int written = 0;
-            os.windows.WriteFile(os.windows.GetStdHandle(-11), buf, len, &written, nullptr);
-        } else {
-            os.posix.write(1, buf, (win_size)len);
-        }
+        os.std_write(1, buf, len);
     }
 }
 
 // Emit `len` raw bytes to stderr (handle -12 / fd 2). The stdout hook never applies to stderr.
 void __stderr_write(const char* buf, int len) {
-    if const (__WINDOWS__) {
-        int written = 0;
-        os.windows.WriteFile(os.windows.GetStdHandle(-12), buf, len, &written, nullptr);
-    } else {
-        os.posix.write(2, buf, (win_size)len);
-    }
+    os.std_write(2, buf, len);
 }
 
 // Format `fmt`+args into the per-thread scratch buffer, growing it on overflow, and
@@ -131,31 +154,35 @@ int __cstr_len(const char* s) {
 // Thin wrapper over the Windows CRT vsscanf backend; casts bufSize to win_size.
 win_int __vsscanf_safe(u64 options, const char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap) {
     if const (__WINDOWS__) {
-        return os.windows.__stdio_common_vsscanf(options, buf, (win_size)bufSize, fmt, locale, ap);
+        return __stdio_common_vsscanf(options, buf, (win_size)bufSize, fmt, locale, ap);
+    } else if const (__MACOS__) {
+        return vsscanf(buf, fmt, ap);
     } else {
-        return os.posix.vsscanf_libc(buf, fmt, ap);
+        return __isoc99_vsscanf(buf, fmt, ap);
     }
 }
 
-// Abstracts the Windows __acrt_iob_func(idx) vs the libc stdin/stdout/stderr
-// FILE* globals (0=stdin, 1=stdout, 2=stderr).
+// Standard C stdio stream FILE* for index 0/1/2 (stdin/stdout/stderr).
 void* __std_iob(int which) {
-    if const (__WINDOWS__) { return os.windows.__acrt_iob_func((u32)which); }
-    else { return os.posix.iob(which); }
+    return os.std_stream(which);
 }
 
-// Windows CRT internal for the scanf fallback path (no size parameter - not in
-// os.windows.cb). Declared before use; referenced only on the Windows branch.
-extern int __stdio_common_vfscanf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
+// Windows CRT internal for the scanf fallback path (no size parameter). Declared
+// before use; referenced only on the Windows branch.
+if const (__WINDOWS__) {
+    extern int __stdio_common_vfscanf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
+}
 
 // Formatted write/read to a real stream (not the stdout/stderr fast paths).
 int __vfprintf_stream(void* stream, const char* fmt, va_list ap) {
-    if const (__WINDOWS__) { return os.windows.__stdio_common_vfprintf((u64)1, stream, fmt, nullptr, ap); }
-    else { return os.posix.vfprintf_libc(stream, fmt, ap); }
+    if const (__WINDOWS__) { return __stdio_common_vfprintf((u64)1, stream, fmt, nullptr, ap); }
+    else if const (__MACOS__) { return vfprintf(stream, fmt, ap); }
+    else { return __vfprintf_chk(stream, 0, fmt, ap); }
 }
 int __vfscanf_stream(void* stream, const char* fmt, va_list ap) {
     if const (__WINDOWS__) { return __stdio_common_vfscanf(0, stream, fmt, nullptr, ap); }
-    else { return os.posix.vfscanf_libc(stream, fmt, ap); }
+    else if const (__MACOS__) { return vfscanf(stream, fmt, ap); }
+    else { return __isoc99_vfscanf(stream, fmt, ap); }
 }
 
 // printf - formatted write to stdout (hook-aware, VT-correct); fast-paths literal text.

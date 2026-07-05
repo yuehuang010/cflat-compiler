@@ -63,81 +63,57 @@ void fp_disable_traps() {
     // POSIX: no-op until the FP env is ported.
 }
 
-// Heap packet handed to the borrow-overload trampoline; carries fn, ctx, and env.
+// Heap packet handed to the borrow-overload entry; carries fn, ctx, and env.
+// The entry stores the user fn's int return in _exitCode; join()/try_join()
+// read it after the thread has exited (os.thread_* returns only the OS code).
 struct __ThreadArgs {
     function<int(void*)> fn = nullptr;
     void* ctx = nullptr;
     IAllocator _allocator;
     int _fpConfig = 0;
-    // Set to 1 by the trampoline just before it returns. macOS has no
-    // pthread_timedjoin_np, so try_join() polls this flag then does a blocking
-    // join. Layout matches __ThreadArgsMove so it can be read via either type.
-    int _done = 0;
+    // Written by the entry with the user fn's result. Layout matches
+    // __ThreadArgsMove so join() can read it via either type.
+    int _exitCode = 0;
 };
 
-// Heap packet for the move-overload trampoline; ctx ownership transfers to fn.
+// Heap packet for the move-overload entry; ctx ownership transfers to fn.
 struct __ThreadArgsMove {
     function<int(move void*)> fn = nullptr;
     void* ctx = nullptr;
     IAllocator _allocator;
     int _fpConfig = 0;
-    int _done = 0;  // see __ThreadArgs._done (same offset)
+    int _exitCode = 0;  // see __ThreadArgs._exitCode (same offset)
 };
 
-// Thread entry trampolines. Win32 LPTHREAD_START_ROUTINE returns DWORD (int) and
-// is __stdcall (a no-op on Win64); the POSIX pthread start routine returns void*.
-if const (__WINDOWS__) {
-    stdcall int __thread_trampoline(void* param) {
-        __ThreadArgs* args = (__ThreadArgs*)param;
-        __active_allocator = args->_allocator;
-        __fp_apply(args->_fpConfig);
-        if (__fuzz_hook != nullptr) { __fuzz_hook(40); }  // thread-fuzz sched-point (child-thread entry)
-        return args->fn(args->ctx);
-    }
-    stdcall int __thread_trampoline_move(void* param) {
-        __ThreadArgsMove* args = (__ThreadArgsMove*)param;
-        __active_allocator = args->_allocator;
-        __fp_apply(args->_fpConfig);
-        if (__fuzz_hook != nullptr) { __fuzz_hook(41); }  // thread-fuzz sched-point (child-thread entry)
-        return args->fn(args->ctx);
-    }
-} else {
-    void* __thread_trampoline(void* param) {
-        __ThreadArgs* args = (__ThreadArgs*)param;
-        __active_allocator = args->_allocator;
-        __fp_apply(args->_fpConfig);
-        if (__fuzz_hook != nullptr) { __fuzz_hook(40); }
-        int r = args->fn(args->ctx);
-        args->_done = 1;  // publish completion for the macOS try_join poll
-        return (void*)(i64)r;
-    }
-    void* __thread_trampoline_move(void* param) {
-        __ThreadArgsMove* args = (__ThreadArgsMove*)param;
-        __active_allocator = args->_allocator;
-        __fp_apply(args->_fpConfig);
-        if (__fuzz_hook != nullptr) { __fuzz_hook(41); }
-        int r = args->fn(args->ctx);
-        args->_done = 1;
-        return (void*)(i64)r;
-    }
+// Neutral thread entries of type `function<void(void*)>` handed to
+// os.thread_create. Each unpacks its packet, installs the child allocator + FP
+// env, runs the user fn, and stashes the exit code back in the packet.
+void __thread_entry(void* param) {
+    __ThreadArgs* args = (__ThreadArgs*)param;
+    __active_allocator = args->_allocator;
+    __fp_apply(args->_fpConfig);
+    if (__fuzz_hook != nullptr) { __fuzz_hook(40); }  // thread-fuzz sched-point (child-thread entry)
+    args->_exitCode = args->fn(args->ctx);
+}
+
+void __thread_entry_move(void* param) {
+    __ThreadArgsMove* args = (__ThreadArgsMove*)param;
+    __active_allocator = args->_allocator;
+    __fp_apply(args->_fpConfig);
+    if (__fuzz_hook != nullptr) { __fuzz_hook(41); }  // thread-fuzz sched-point (child-thread entry)
+    args->_exitCode = args->fn(args->ctx);
 }
 
 // Returns the number of logical processors on the current system.
 // Equivalent to std::thread::hardware_concurrency().
 // Returns 0 if the value cannot be determined.
 int hardware_concurrency() {
-    if const (__WINDOWS__) {
-        os.windows._SystemInfo info = default;
-        os.windows.GetSystemInfo(&info);
-        return (int)info._numProc;
-    } else {
-        return (int)os.posix.sysconf(os.posix._SC_NPROCESSORS_ONLN);
-    }
+    return os.thread_hardware_concurrency();
 }
 
 // Owning handle to a single OS thread; start it, then join/try_join/terminate.
 struct Thread {
-    void* _handle = nullptr;
+    void* _handle = nullptr;  // opaque os thread handle; nulled once consumed
     void* _args   = nullptr;  // owns the __ThreadArgs packet; freed in join()
     i32   _exitCode = 0;
 
@@ -152,14 +128,7 @@ struct Thread {
         args->_allocator = child;
         args->_fpConfig = fpConfig;
         _args = args;
-        if const (__WINDOWS__) {
-            i32 id = 0;
-            _handle = os.windows.CreateThread(nullptr, 0, __thread_trampoline, _args, 0, &id);
-        } else {
-            void* tid = nullptr;
-            if (os.posix.pthread_create(&tid, nullptr, __thread_trampoline, _args) == 0) _handle = tid;
-            else _handle = nullptr;
-        }
+        _handle = os.thread_create(__thread_entry, _args);
         if (_handle == nullptr) {
             free((void*)_args);
             _args = nullptr;
@@ -186,14 +155,7 @@ struct Thread {
         args->_allocator = child;
         args->_fpConfig = fpConfig;
         _args = (void*)args;
-        if const (__WINDOWS__) {
-            i32 id = 0;
-            _handle = os.windows.CreateThread(nullptr, 0, __thread_trampoline_move, _args, 0, &id);
-        } else {
-            void* tid = nullptr;
-            if (os.posix.pthread_create(&tid, nullptr, __thread_trampoline_move, _args) == 0) _handle = tid;
-            else _handle = nullptr;
-        }
+        _handle = os.thread_create(__thread_entry_move, _args);
         if (_handle == nullptr) {
             free((void*)_args);
             _args = nullptr;
@@ -205,19 +167,13 @@ struct Thread {
     // Blocks until the thread exits. Returns the thread's exit code.
     i32 join() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(42); }  // thread-fuzz sched-point
-        i32 code = 0;
-        if const (__WINDOWS__) {
-            os.windows.WaitForSingleObject(_handle, -1);  // -1 == INFINITE
-            os.windows.GetExitCodeThread(_handle, &code);
-            os.windows.CloseHandle(_handle);
-        } else {
-            // pthread_join writes the trampoline's void* return (the i32 exit code).
-            void* ret = nullptr;
-            os.posix.pthread_join(_handle, &ret);
-            code = (i32)(i64)ret;
-        }
+        // os.thread_join frees the os handle, so null _handle to avoid a later
+        // double-free. The user exit code lives in our packet, not the OS code.
+        os.thread_join(_handle);
+        _handle = nullptr;
+        __ThreadArgs* a = (__ThreadArgs*)_args;
+        i32 code = (i32)a->_exitCode;
         free((void*)_args);
-        _handle   = nullptr;
         _args     = nullptr;
         _exitCode = code;
         return code;
@@ -226,58 +182,20 @@ struct Thread {
     // Returns true if the thread exited within timeout_ms; does full cleanup and
     // sets _exitCode. Returns false on timeout; all handles remain intact.
     bool try_join(i32 timeout_ms) {
-        if const (__WINDOWS__) {
-            i32 result = os.windows.WaitForSingleObject(_handle, timeout_ms);
-            if (result == 0) {
-                i32 code = 0;
-                os.windows.GetExitCodeThread(_handle, &code);
-                os.windows.CloseHandle(_handle);
-                free((void*)_args);
-                _handle   = nullptr;
-                _args     = nullptr;
-                _exitCode = code;
-                return true;
-            }
-            return false;
-        } else if const (__MACOS__) {
-            // Darwin has no pthread_timedjoin_np. Poll the trampoline's _done flag
-            // (same offset in both arg structs) up to timeout_ms, sleeping 1ms per
-            // spin; once set, a blocking pthread_join reaps the (already-exiting)
-            // thread. nanosleep in sleep_ms is an opaque call, so the _done load is
-            // not hoisted out of the loop.
+        // On finish os.thread_timed_join frees the os handle; on timeout it
+        // leaves it intact for a later join. Only null _handle / read the packet
+        // on finish so a timeout keeps the thread joinable.
+        bool fin = false;
+        os.thread_timed_join(_handle, timeout_ms, &fin);
+        if (fin) {
+            _handle = nullptr;
             __ThreadArgs* a = (__ThreadArgs*)_args;
-            i32 waited = 0;
-            while (a->_done == 0) {
-                if (waited >= timeout_ms) return false;
-                os.posix.sleep_ms(1);
-                waited = waited + 1;
-            }
-            void* ret = nullptr;
-            os.posix.pthread_join(_handle, &ret);
+            _exitCode = (i32)a->_exitCode;
             free((void*)_args);
-            _handle   = nullptr;
-            _args     = nullptr;
-            _exitCode = (i32)(i64)ret;
+            _args = nullptr;
             return true;
-        } else {
-            // POSIX timed join via pthread_timedjoin_np (glibc). abstime is an ABSOLUTE
-            // CLOCK_REALTIME deadline = now + timeout_ms.
-            i64[2] ts;
-            os.posix.clock_gettime(os.posix.CLOCK_REALTIME, &ts[0]);
-            i64 totalNs = ts[1] + (i64)timeout_ms * 1000000;
-            ts[0] = ts[0] + totalNs / 1000000000;
-            ts[1] = totalNs % 1000000000;
-            void* ret = nullptr;
-            i32 rc = os.posix.pthread_timedjoin_np(_handle, &ret, &ts[0]);
-            if (rc == 0) {
-                free((void*)_args);
-                _handle   = nullptr;
-                _args     = nullptr;
-                _exitCode = (i32)(i64)ret;
-                return true;
-            }
-            return false;
         }
+        return false;
     }
 
     // Pin this thread to a CPU affinity mask (Win32 SetThreadAffinityMask).
@@ -285,14 +203,7 @@ struct Thread {
     // Call after start() and before join(). No-op if the thread has not been started.
     void setAffinity(u64 mask) {
         if (_handle != nullptr) {
-            if const (__WINDOWS__) {
-                if const (__PLATFORM__ == 64) {
-                    os.windows.SetThreadAffinityMask(_handle, mask);
-                } else {
-                    os.windows.SetThreadAffinityMask(_handle, (u32)mask);
-                }
-            }
-            // POSIX: pthread_setaffinity_np (cpu_set_t) not yet ported - no-op.
+            os.thread_set_affinity(_handle, mask);
         }
     }
 
@@ -300,14 +211,11 @@ struct Thread {
     // use only when cooperative cancellation is not possible.
     void terminate() {
         if (_handle != nullptr) {
-            if const (__WINDOWS__) {
-                os.windows.TerminateThread(_handle, -1);
-                os.windows.CloseHandle(_handle);
-            } else {
-                os.posix.pthread_cancel(_handle);
-            }
-            free((void*)_args);
+            // os.thread_kill frees the os handle; null _handle to avoid a later
+            // double-free. The dead thread no longer touches _args, so free it.
+            os.thread_kill(_handle);
             _handle = nullptr;
+            free((void*)_args);
             _args   = nullptr;
         }
     }

@@ -126,15 +126,16 @@ struct MouseEvent {
 // readKey - read one key press; extended keys return 0/0xE0, then the scan code on the next call.
 int readKey() {
     if const (__WINDOWS__) {
-        return os.windows._getch();
+        // os.term_read_byte(0) is an unbuffered console keystroke on Windows.
+        return os.term_read_byte(0);
     } else {
         // POSIX: briefly switch stdin to cbreak so a single byte reads unbuffered
         // and unechoed, matching _getch's contract. Escape sequences come through
         // byte-by-byte on subsequent calls.
         i8[72] saved = default;
-        os.posix.term_make_raw(0, &saved[0]);
-        i32 c = os.posix.term_read_byte(0);
-        os.posix.term_restore_mode(0, &saved[0]);
+        os.term_make_raw(0, &saved[0]);
+        i32 c = os.term_read_byte(0);
+        os.term_restore(0, &saved[0]);
         return c;
     }
 }
@@ -186,8 +187,8 @@ struct Terminal {
             // we only switch stdin to cbreak (raw) and remember the old settings.
             _hIn  = (void*)(i64)0;
             _hOut = (void*)(i64)1;
-            i8* saved = new i8[72];
-            if (os.posix.term_make_raw(0, saved) != 0) { delete[] saved; return false; }
+            i8* saved = new i8[os.termios_buf_size()];
+            if (os.term_make_raw(0, saved) != 0) { delete[] saved; return false; }
             _termiosSaved = (void*)saved;
             _active = true;
             return true;
@@ -204,7 +205,7 @@ struct Terminal {
                 os.windows.SetConsoleOutputCP(_savedCP);
             } else {
                 if (_termiosSaved != nullptr) {
-                    os.posix.term_restore_mode(0, _termiosSaved);
+                    os.term_restore(0, _termiosSaved);
                     delete[] (i8*)_termiosSaved;
                     _termiosSaved = nullptr;
                 }
@@ -227,7 +228,7 @@ struct Terminal {
             os.windows.FlushConsoleInputBuffer(_hIn);
             printf("\033[c");
             fflush(nullptr);
-            os.windows.Sleep(150);
+            os.sleep_ms(150);
             i32 count = 0;
             os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
             while (count > 0 && rlen < 127) {
@@ -244,8 +245,8 @@ struct Terminal {
             printf("\033[c");
             fflush(nullptr);
             // Gather the reply with a 150 ms inactivity timeout (raw stdin).
-            while (rlen < 127 && os.posix.term_poll_in(0, 150) > 0) {
-                i32 c = os.posix.term_read_byte(0);
+            while (rlen < 127 && os.term_poll_in(0, 150) > 0) {
+                i32 c = os.term_read_byte(0);
                 if (c < 0) break;
                 resp[rlen] = (char)c; rlen++;
             }
@@ -289,7 +290,7 @@ struct Terminal {
             os.windows.FlushConsoleInputBuffer(_hIn);
             printf("\033[16t");
             fflush(nullptr);
-            os.windows.Sleep(150);
+            os.sleep_ms(150);
             i32 count = 0;
             os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
             while (count > 0 && rlen < 127) {
@@ -305,8 +306,8 @@ struct Terminal {
         } else {
             printf("\033[16t");
             fflush(nullptr);
-            while (rlen < 127 && os.posix.term_poll_in(0, 150) > 0) {
-                i32 c = os.posix.term_read_byte(0);
+            while (rlen < 127 && os.term_poll_in(0, 150) > 0) {
+                i32 c = os.term_read_byte(0);
                 if (c < 0) break;
                 resp[rlen] = (char)c; rlen++;
             }
@@ -373,15 +374,7 @@ struct Terminal {
         *width  = 0;
         *height = 0;
         if (_hOut == nullptr) return false;
-        if const (__WINDOWS__) {
-            os.windows._CONSOLE_SCREEN_BUFFER_INFO info;
-            if (os.windows.GetConsoleScreenBufferInfo(_hOut, &info) == 0) return false;
-            *width  = (int)(info.winRight  - info.winLeft + 1);
-            *height = (int)(info.winBottom - info.winTop  + 1);
-            return true;
-        } else {
-            return os.posix.term_get_size(width, height);
-        }
+        return os.term_get_size(width, height);
     }
 
     // Non-blocking: fill *out and return true if a key-down event is waiting.
@@ -394,7 +387,7 @@ struct Terminal {
             if (count == 0) return false;
             return _readNextKey(out, false);
         } else {
-            if (os.posix.term_poll_in(0, 0) <= 0) return false;
+            if (os.term_poll_in(0, 0) <= 0) return false;
             return _posixReadKey(out);
         }
     }
@@ -470,7 +463,7 @@ struct Terminal {
             return false;
         } else {
             // POSIX: key events only (see pollMouse re: mouse on a tty).
-            if (os.posix.term_poll_in(0, 0) <= 0) return false;
+            if (os.term_poll_in(0, 0) <= 0) return false;
             KeyEvent tmp;
             if (!_posixReadKey(&tmp)) return false;
             *eventType = 1;
@@ -525,15 +518,15 @@ struct Terminal {
     bool _posixReadKey(KeyEvent* out) {
         if const (__WINDOWS__) { return false; }
         else {
-            i32 b0 = os.posix.term_read_byte(0);
+            i32 b0 = os.term_read_byte(0);
             if (b0 < 0) return false;
             i16  vk = 0;
             char ch = '\0';
             if (b0 == 27) {
-                if (os.posix.term_poll_in(0, 1) > 0) {
-                    i32 b1 = os.posix.term_read_byte(0);
+                if (os.term_poll_in(0, 1) > 0) {
+                    i32 b1 = os.term_read_byte(0);
                     if (b1 == (i32)'[' || b1 == (i32)'O') {
-                        i32 b2 = os.posix.term_read_byte(0);
+                        i32 b2 = os.term_read_byte(0);
                         if      (b2 == (i32)'A') vk = (i16)VK_UP;
                         else if (b2 == (i32)'B') vk = (i16)VK_DOWN;
                         else if (b2 == (i32)'C') vk = (i16)VK_RIGHT;

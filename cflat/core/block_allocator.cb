@@ -44,41 +44,12 @@ class BlockAllocator : IAllocator
     // Query page size and L3 cache-line block size from the OS.
     void _init()
     {
-        if const (__WINDOWS__) {
-            // --- page size from GetSystemInfo ---
-            os.windows._SystemInfo* sysInfo = (os.windows._SystemInfo*)malloc(sizeof(os.windows._SystemInfo));
-            os.windows.GetSystemInfo(sysInfo);
-            _pageSize = sysInfo->_allocGranularity;
-            free((void*)sysInfo);
-
-            // --- L3 cache line size from GetLogicalProcessorInformation ---
-            u32 len = 0;
-            os.windows.GetLogicalProcessorInformation(nullptr, &len);   // first call: query required buffer size
-            os.windows._SysLogicalProcInfo* buf = (os.windows._SysLogicalProcInfo*)malloc((i64)len);
-            os.windows.GetLogicalProcessorInformation(buf, &len);
-
-            i64 count = (i64)len / (i64)sizeof(os.windows._SysLogicalProcInfo);
-            int i = 0;
-            while (i < (int)count)
-            {
-                os.windows._SysLogicalProcInfo* e = buf + i;
-                if (e->_relationship == 2 && e->_cacheLevel == 3)  // RelationCache, Level 3
-                {
-                    _blockSize = (i64)e->_cacheLineSize;
-                    break;
-                }
-                i = i + 1;
-            }
-            free((void*)buf);
-        } else {
-            // POSIX has no allocation-granularity concept; use a fixed 64K carving
-            // chunk (mmap rounds to the OS page boundary, so 64K is always valid).
-            _pageSize = 65536;
-
-            // L3 cache line size via sysconf; 0 means unknown - keep the 64 fallback.
-            i64 line = (i64)os.posix.sysconf(os.posix._SC_LEVEL3_CACHE_LINESIZE);
-            if (line > 0) _blockSize = line;
-        }
+        // 64K carving chunk: matches the Win32 allocation granularity and is a
+        // valid mmap size on POSIX (rounds to the OS page boundary).
+        _pageSize = 65536;
+        // L3 cache line size; os.cache_line_size() returns 64 when unknown, so
+        // _blockSize keeps its 64 fallback either way.
+        _blockSize = (i64)os.cache_line_size();
     }
 
     // Double the page-tracking array capacity, copying existing entries.

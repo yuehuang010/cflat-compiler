@@ -55,19 +55,12 @@ class EntryAllocator : IAllocator
     // Init / page management
     // -----------------------------------------------------------------------
 
-    // Read the OS allocation granularity into _pageSize and derive _pageMask.
+    // Set _pageSize to the 64K allocation granularity and derive _pageMask.
     void _initPageSize()
     {
-        if const (__WINDOWS__) {
-            os.windows._SystemInfo* si = (os.windows._SystemInfo*)malloc((i64)sizeof(os.windows._SystemInfo));
-            os.windows.GetSystemInfo(si);
-            _pageSize = (i64)si->_allocGranularity;
-            free((void*)si);
-        } else {
-            // POSIX has no separate allocation granularity; mirror block_allocator's
-            // 64 KB choice (matches the Windows allocation granularity).
-            _pageSize = (i64)65536;
-        }
+        // 64K matches the Win32 allocation granularity and is a valid mmap size
+        // on POSIX; the allocators rely on 64K-granular page bases.
+        _pageSize = (i64)65536;
         _pageMask = ~(_pageSize - (i64)1);
     }
 

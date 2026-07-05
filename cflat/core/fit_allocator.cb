@@ -87,14 +87,7 @@ class FitAllocator : IAllocator
     // Read the OS page size and create the initial 1 MB segment.
     void _init()
     {
-        if const (__WINDOWS__) {
-            os.windows._SystemInfo* si = (os.windows._SystemInfo*)malloc((i64)sizeof(os.windows._SystemInfo));
-            os.windows.GetSystemInfo(si);
-            _pageSize = (i64)si->_pageSize;
-            free((void*)si);
-        } else {
-            _pageSize = (i64)os.posix.sysconf(os.posix._SC_PAGESIZE);
-        }
+        _pageSize = os.page_size();
 
         _segSize = (i64)1048576;  // 1 MB default segment
         _growSegment(_segSize);

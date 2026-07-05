@@ -6,18 +6,16 @@ import "mutex.cb";
 import "channel.cb";
 import "time.cb";
 
-// Yield the rest of this thread's time slice (Win32 SwitchToThread / POSIX
-// sched_yield). Used by the pool's spin-wait fallbacks.
+// Yield the rest of this thread's time slice. Used by the pool's spin-wait
+// fallbacks.
 void _tp_yield() {
-    if const (__WINDOWS__) { os.windows.SwitchToThread(); }
-    else { os.posix.sched_yield(); }
+    os.thread_yield();
 }
 
 // Caller's OS thread id, used to recognize a pool worker calling back into the
-// pool (Win32 GetCurrentThreadId / POSIX gettid).
+// pool.
 u32 _tp_current_tid() {
-    if const (__WINDOWS__) { return os.windows.GetCurrentThreadId(); }
-    else { return (u32)os.posix.gettid(); }
+    return os.thread_current_id();
 }
 
 // Read-only configuration constants.  CFlat has no const globals, so these are

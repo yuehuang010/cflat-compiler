@@ -478,6 +478,15 @@ struct I32Guarded {
     }
 };
 
+// Regression: an unrelated struct with a release() method must NOT disable the
+// lock(this) guard-seeding on atomic release(val, body). The guard checker used
+// to resolve the callee by bare method name and pick the first overload named
+// 'release' (this one), dropping the seeding and rejecting the guarded write.
+struct ReleaseDecoy {
+    int state = 0;
+    void release() { state = 0; }
+};
+
 int flagReleaseWorker(void* ctx) {
     FlagGuarded* s = (FlagGuarded*)ctx;
     s->ready.release(1, () => {

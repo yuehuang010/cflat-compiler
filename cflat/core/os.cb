@@ -1,5 +1,871 @@
+// os.cb - neutral OS abstraction surface.
+//
+// Backend dispatch: import the raw platform externs (os.windows / os.posix).
 if const (__WINDOWS__) {
     import "os.windows.cb";
 } else {
     import "os.posix.cb";
+}
+
+// os.cb is imported before cruntime.cb in the chain, so cruntime's malloc/free
+// externs are not yet visible when the os.* bodies below compile. Declare them
+// here; they share the one linkage symbol with cruntime's identical decls.
+extern void* malloc(i64 size);
+extern void  free(void* ptr);
+
+// ===========================================================================
+// The `namespace os` surface below is the ONLY place a capability performs its
+// `if const (__WINDOWS__)` dispatch. Every function is stateless free-function
+// dispatch onto the backend externs/helpers. State (mutex/cond slots, thread
+// handles, saved-termios buffers) is owned by CALLER structs in their own .cb
+// files; os.cb never holds long-lived state.
+//
+// Type note: function-def SIGNATURES use CONCRETE types (i64/u64/i32) because
+// ForwardRefScanner does not resolve the `if const` win_size alias in a def
+// signature. externs (in the backend files) may use the alias.
+// ===========================================================================
+
+// --- Thread trampoline plumbing (os.cb owns the shims) ---------------------
+// Neutral heap packet adapting a `function<void(void*)>` start to the platform
+// thread-entry signature. _done is published by the shim for the macOS
+// timed-join poll (macOS has no pthread_timedjoin_np).
+struct __OsThreadPacket {
+    function<void(void*)> start = nullptr;
+    void* arg  = nullptr;
+    int   _done = 0;
+};
+
+// Neutral thread handle: the OS handle plus the owned packet. os.thread_create
+// returns this; join/detach/kill free it.
+struct __OsThreadHandle {
+    void* _os = nullptr;                // Win HANDLE / pthread_t
+    __OsThreadPacket* _packet = nullptr;
+};
+
+// Win32 LPTHREAD_START_ROUTINE returns DWORD (int) and is __stdcall; the POSIX
+// pthread start routine returns void*. Each adapts the neutral packet's start.
+if const (__WINDOWS__) {
+    stdcall int __os_thread_shim(void* param) {
+        __OsThreadPacket* p = (__OsThreadPacket*)param;
+        p->start(p->arg);
+        p->_done = 1;
+        return 0;
+    }
+} else {
+    void* __os_thread_shim(void* param) {
+        __OsThreadPacket* p = (__OsThreadPacket*)param;
+        p->start(p->arg);
+        p->_done = 1;
+        return nullptr;
+    }
+}
+
+// --- POSIX event backing struct (os.cb owns the mutex+cond+flag) -----------
+// On Windows an event is a real kernel Event; on POSIX it is this heap struct.
+struct __OsEvent {
+    void* _mtx = nullptr;               // heap pthread_mutex_t
+    void* _cv  = nullptr;               // heap pthread_cond_t
+    int   _signaled = 0;
+};
+
+// --- Windows directory-enumeration wrapper ---------------------------------
+// FindFirst/FindNext do not map cleanly to opendir/readdir_name, so os.cb owns
+// a tiny stateful handle to bridge them. POSIX uses opendir directly.
+if const (__WINDOWS__) {
+    struct __OsDir {
+        void* _find = nullptr;                     // FindFirstFileA HANDLE
+        os.windows._WIN32_FIND_DATAA _data = default;
+        int   _pending = 0;                        // 1 when _data holds an unconsumed entry
+        int   _valid   = 0;                        // 1 if FindFirst succeeded
+    };
+}
+
+namespace os
+{
+    // === Time ==============================================================
+
+    // Suspend the calling thread for 'ms' milliseconds.
+    void sleep_ms(i32 ms) {
+        if const (__WINDOWS__) { os.windows.Sleep(ms); }
+        else { os.posix.sleep_ms(ms); }
+    }
+
+    // Monotonic counter reading. On Windows this is the raw QPC counter (scale by
+    // monotonic_freq()); on POSIX it is a nanosecond count (freq == 1e9).
+    i64 monotonic_nanos() {
+        if const (__WINDOWS__) {
+            i64 count = 0;
+            os.windows.QueryPerformanceCounter(&count);
+            return count;
+        } else {
+            return os.posix.monotonic_nanos();
+        }
+    }
+
+    // Tick frequency of monotonic_nanos() in ticks per second.
+    i64 monotonic_freq() {
+        if const (__WINDOWS__) {
+            i64 freq = 0;
+            os.windows.QueryPerformanceFrequency(&freq);
+            return freq;
+        } else {
+            return os.posix.monotonic_freq();
+        }
+    }
+
+    // Current wall-clock time as FILETIME ticks (100-ns intervals since 1601).
+    i64 wallclock_filetime() {
+        if const (__WINDOWS__) {
+            i64 t = 0;
+            os.windows.GetSystemTimeAsFileTime(&t);
+            return t;
+        } else {
+            return os.posix.filetime_now();
+        }
+    }
+
+    // === Sysinfo ===========================================================
+
+    // OS memory page size in bytes.
+    i64 page_size() {
+        if const (__WINDOWS__) {
+            os.windows._SystemInfo info = default;
+            os.windows.GetSystemInfo(&info);
+            return (i64)info._pageSize;
+        } else {
+            return (i64)os.posix.sysconf(os.posix._SC_PAGESIZE);
+        }
+    }
+
+    // Number of logical processors; 0 if it cannot be determined.
+    int num_processors() {
+        if const (__WINDOWS__) {
+            os.windows._SystemInfo info = default;
+            os.windows.GetSystemInfo(&info);
+            return (int)info._numProc;
+        } else {
+            return (int)os.posix.sysconf(os.posix._SC_NPROCESSORS_ONLN);
+        }
+    }
+
+    // L3 cache line size in bytes; falls back to 64 when unknown.
+    int cache_line_size() {
+        if const (__WINDOWS__) {
+            u32 len = 0;
+            os.windows.GetLogicalProcessorInformation(nullptr, &len);   // query buffer size
+            if (len == 0) return 64;
+            os.windows._SysLogicalProcInfo* buf = (os.windows._SysLogicalProcInfo*)malloc((i64)len);
+            os.windows.GetLogicalProcessorInformation(buf, &len);
+            i64 count = (i64)len / (i64)sizeof(os.windows._SysLogicalProcInfo);
+            int result = 64;
+            int i = 0;
+            while (i < (int)count) {
+                os.windows._SysLogicalProcInfo* e = buf + i;
+                if (e->_relationship == 2 && e->_cacheLevel == 3) {   // RelationCache, Level 3
+                    result = (int)e->_cacheLineSize;
+                    break;
+                }
+                i = i + 1;
+            }
+            free((void*)buf);
+            return result;
+        } else {
+            i64 line = (i64)os.posix.sysconf(os.posix._SC_LEVEL3_CACHE_LINESIZE);
+            if (line > 0) return (int)line;
+            return 64;
+        }
+    }
+
+    // Current working-set (resident) bytes; 0 on failure or unsupported platform.
+    u64 process_working_set_bytes() {
+        if const (__WINDOWS__) { return os.windows.GetProcessWorkingSetBytes(); }
+        else { return (u64)0; }   // POSIX: not ported (would need /proc parsing)
+    }
+
+    // Peak working-set bytes since start; 0 on failure or unsupported platform.
+    u64 process_peak_working_set_bytes() {
+        if const (__WINDOWS__) { return os.windows.GetProcessPeakWorkingSetBytes(); }
+        else { return (u64)0; }
+    }
+
+    // Private commit charge in bytes; 0 on failure or unsupported platform.
+    u64 process_private_bytes() {
+        if const (__WINDOWS__) { return os.windows.GetProcessPrivateBytes(); }
+        else { return (u64)0; }
+    }
+
+    // === Virtual memory ====================================================
+    // os.cb OWNS the POSIX header-page length-stash so vm_release(ptr) is
+    // symmetric. On POSIX we over-map by one 64K granule, return the first
+    // 64K-aligned address inside, and stash [offset,total] in the 16 bytes
+    // immediately before the returned pointer.
+
+    // Reserve address space without committing physical pages.
+    void* vm_reserve(i64 size) {
+        if const (__WINDOWS__) {
+            return os.windows.VirtualAlloc(nullptr, size, 0x2000u, 0x04u);   // MEM_RESERVE
+        } else {
+            i64 gran  = 0x10000;
+            i64 page  = 4096;
+            i64 total = size + gran;
+            void* raw = os.posix.mmap(nullptr, total, os.posix.PROT_NONE, os.posix.MAP_ANON_PRIVATE, -1, 0);
+            if ((i64)raw == -1) return nullptr;
+            i8* rawBytes = (i8*)raw;
+            i64 pad = ((i64)raw + gran) & ~(gran - (i64)1);   // first 64K boundary >= raw+slack
+            pad = pad - (i64)raw;
+            i8* hdrPage = &rawBytes[pad - page];
+            os.posix.mprotect((void*)hdrPage, page, os.posix.PROT_RW);
+            i8* userPtr = &rawBytes[pad];
+            i64* hdr = (i64*)(&userPtr[0 - 16]);
+            hdr[0] = pad;
+            hdr[1] = total;
+            return (void*)userPtr;
+        }
+    }
+
+    // Commit physical pages inside a previously-reserved region.
+    void* vm_commit(void* ptr, i64 size) {
+        if const (__WINDOWS__) {
+            return os.windows.VirtualAlloc(ptr, size, 0x1000u, 0x04u);   // MEM_COMMIT
+        } else {
+            if (os.posix.mprotect(ptr, size, os.posix.PROT_RW) != 0) return nullptr;
+            return ptr;
+        }
+    }
+
+    // Reserve and commit in one call. Returns zeroed memory.
+    void* vm_reserve_commit(i64 size) {
+        if const (__WINDOWS__) {
+            return os.windows.VirtualAlloc(nullptr, size, 0x3000u, 0x04u);   // MEM_RESERVE|MEM_COMMIT
+        } else {
+            i64 gran  = 0x10000;
+            i64 total = size + gran;
+            void* raw = os.posix.mmap(nullptr, total, os.posix.PROT_RW, os.posix.MAP_ANON_PRIVATE, -1, 0);
+            if ((i64)raw == -1) return nullptr;
+            i8* rawBytes = (i8*)raw;
+            i64 pad = ((i64)raw + gran) & ~(gran - (i64)1);
+            pad = pad - (i64)raw;
+            i8* userPtr = &rawBytes[pad];
+            i64* hdr = (i64*)(&userPtr[0 - 16]);
+            hdr[0] = pad;
+            hdr[1] = total;
+            return (void*)userPtr;
+        }
+    }
+
+    // Release the entire region back to the OS.
+    void vm_release(void* ptr) {
+        if const (__WINDOWS__) {
+            os.windows.VirtualFree(ptr, 0, 0x8000u);   // MEM_RELEASE (size must be 0)
+        } else {
+            i8* bytes = (i8*)ptr;
+            i64* hdr = (i64*)(&bytes[0 - 16]);   // [0]=offset to mmap base, [1]=total length
+            i64 pad   = hdr[0];
+            i64 total = hdr[1];
+            i8* base = &bytes[0 - pad];
+            os.posix.munmap((void*)base, total);
+        }
+    }
+
+    // === Mutex (caller owns the void* slot) ================================
+    // Windows: the slot is an inline SRWLOCK (0 == unlocked). POSIX: the slot
+    // holds a lazily-allocated heap pthread_mutex_t pointer.
+
+    void mutex_lock(void** slot) {
+        if const (__WINDOWS__) { os.windows.AcquireSRWLockExclusive(slot); }
+        else { os.posix.pthread_mutex_lock(os.posix.ensure_mutex(slot)); }
+    }
+
+    void mutex_unlock(void** slot) {
+        if const (__WINDOWS__) { os.windows.ReleaseSRWLockExclusive(slot); }
+        else { os.posix.pthread_mutex_unlock(os.posix.ensure_mutex(slot)); }
+    }
+
+    void mutex_destroy(void** slot) {
+        if const (__WINDOWS__) { }   // SRWLOCK needs no cleanup
+        else {
+            if (slot[0] != nullptr) { os.posix.pthread_mutex_destroy(slot[0]); free(slot[0]); slot[0] = nullptr; }
+        }
+    }
+
+    // === Condition variable (caller owns the void* slots) ==================
+
+    void cond_init(void** slot) {
+        if const (__WINDOWS__) { os.windows.InitializeConditionVariable((void*)slot); }
+        else { os.posix.ensure_cond(slot); }
+    }
+
+    // Atomically release mtx and sleep on cv until woken, then reacquire mtx.
+    void cond_wait(void** cv, void** mtx) {
+        if const (__WINDOWS__) { os.windows.SleepConditionVariableSRW((void*)cv, mtx, -1, (u32)0); }
+        else { os.posix.pthread_cond_wait(os.posix.ensure_cond(cv), os.posix.ensure_mutex(mtx)); }
+    }
+
+    void cond_signal(void** cv) {
+        if const (__WINDOWS__) { os.windows.WakeConditionVariable((void*)cv); }
+        else { os.posix.pthread_cond_signal(os.posix.ensure_cond(cv)); }
+    }
+
+    void cond_broadcast(void** cv) {
+        if const (__WINDOWS__) { os.windows.WakeAllConditionVariable((void*)cv); }
+        else { os.posix.pthread_cond_broadcast(os.posix.ensure_cond(cv)); }
+    }
+
+    void cond_destroy(void** cv) {
+        if const (__WINDOWS__) { }   // CONDITION_VARIABLE needs no cleanup
+        else {
+            if (cv[0] != nullptr) { os.posix.pthread_cond_destroy(cv[0]); free(cv[0]); cv[0] = nullptr; }
+        }
+    }
+
+    // === Reader-writer lock (caller owns the void* slot) ===================
+
+    void rwlock_read_lock(void** slot) {
+        if const (__WINDOWS__) { os.windows.AcquireSRWLockShared(slot); }
+        else { os.posix.pthread_rwlock_rdlock(os.posix.ensure_rwlock(slot)); }
+    }
+
+    void rwlock_read_unlock(void** slot) {
+        if const (__WINDOWS__) { os.windows.ReleaseSRWLockShared(slot); }
+        else { os.posix.pthread_rwlock_unlock(os.posix.ensure_rwlock(slot)); }
+    }
+
+    void rwlock_write_lock(void** slot) {
+        if const (__WINDOWS__) { os.windows.AcquireSRWLockExclusive(slot); }
+        else { os.posix.pthread_rwlock_wrlock(os.posix.ensure_rwlock(slot)); }
+    }
+
+    void rwlock_write_unlock(void** slot) {
+        if const (__WINDOWS__) { os.windows.ReleaseSRWLockExclusive(slot); }
+        else { os.posix.pthread_rwlock_unlock(os.posix.ensure_rwlock(slot)); }
+    }
+
+    void rwlock_destroy(void** slot) {
+        if const (__WINDOWS__) { }   // SRWLOCK needs no cleanup
+        else {
+            if (slot[0] != nullptr) { os.posix.pthread_rwlock_destroy(slot[0]); free(slot[0]); slot[0] = nullptr; }
+        }
+    }
+
+    // === Semaphore =========================================================
+    // Returns an opaque handle the caller destroys. 'max' is a Win32 concept;
+    // it is ignored on POSIX (sem_t has no upper bound).
+
+    void* sem_new(i32 initial, i32 max) {
+        if const (__WINDOWS__) { return os.windows.CreateSemaphoreA(nullptr, initial, max, nullptr); }
+        else { return os.posix.sem_new(initial); }
+    }
+
+    void sem_wait(void* s) {
+        if const (__WINDOWS__) { os.windows.WaitForSingleObject(s, -1); }   // -1 == INFINITE
+        else { os.posix.sem_wait(s); }
+    }
+
+    void sem_post(void* s, i32 n) {
+        if const (__WINDOWS__) { os.windows.ReleaseSemaphore(s, n, nullptr); }
+        else {
+            // POSIX sem_post increments by 1, so post n times.
+            for (i32 i = 0; i < n; i++) os.posix.sem_post(s);
+        }
+    }
+
+    void sem_destroy(void* s) {
+        if (s == nullptr) return;
+        if const (__WINDOWS__) { os.windows.CloseHandle(s); }
+        else { os.posix.sem_destroy(s); free(s); }
+    }
+
+    // === Event (manual-reset) ==============================================
+    // Win: real CreateEventA(manual_reset=1, initial=0). POSIX: a heap
+    // mutex+cond+flag struct owned entirely here.
+
+    void* event_new() {
+        if const (__WINDOWS__) {
+            return os.windows.CreateEventA(nullptr, 1, 0, nullptr);
+        } else {
+            __OsEvent* e = (__OsEvent*)malloc(sizeof(__OsEvent));
+            e->_mtx = nullptr;
+            e->_cv  = nullptr;
+            e->_signaled = 0;
+            os.posix.ensure_mutex(&e->_mtx);
+            os.posix.ensure_cond(&e->_cv);
+            return (void*)e;
+        }
+    }
+
+    void event_set(void* handle) {
+        if const (__WINDOWS__) { os.windows.SetEvent(handle); }
+        else {
+            __OsEvent* e = (__OsEvent*)handle;
+            os.posix.pthread_mutex_lock(e->_mtx);
+            e->_signaled = 1;
+            os.posix.pthread_cond_broadcast(e->_cv);
+            os.posix.pthread_mutex_unlock(e->_mtx);
+        }
+    }
+
+    void event_wait(void* handle) {
+        if const (__WINDOWS__) { os.windows.WaitForSingleObject(handle, -1); }
+        else {
+            __OsEvent* e = (__OsEvent*)handle;
+            os.posix.pthread_mutex_lock(e->_mtx);
+            while (e->_signaled == 0) { os.posix.pthread_cond_wait(e->_cv, e->_mtx); }
+            os.posix.pthread_mutex_unlock(e->_mtx);
+        }
+    }
+
+    void event_destroy(void* handle) {
+        if (handle == nullptr) return;
+        if const (__WINDOWS__) { os.windows.CloseHandle(handle); }
+        else {
+            __OsEvent* e = (__OsEvent*)handle;
+            if (e->_cv != nullptr)  { os.posix.pthread_cond_destroy(e->_cv);  free(e->_cv); }
+            if (e->_mtx != nullptr) { os.posix.pthread_mutex_destroy(e->_mtx); free(e->_mtx); }
+            free(handle);
+        }
+    }
+
+    // === Threads ===========================================================
+    // os.thread_create returns an opaque handle owning the thread + packet.
+    // The neutral start is `function<void(void*)>`; there is no exit code, so
+    // join returns the OS-level code (0 in the normal path).
+
+    void* thread_create(function<void(void*)> start, void* arg) {
+        __OsThreadPacket* p = (__OsThreadPacket*)malloc(sizeof(__OsThreadPacket));
+        p->start = start;
+        p->arg   = arg;
+        p->_done = 0;
+        __OsThreadHandle* h = (__OsThreadHandle*)malloc(sizeof(__OsThreadHandle));
+        h->_packet = p;
+        h->_os     = nullptr;
+        if const (__WINDOWS__) {
+            i32 id = 0;
+            h->_os = os.windows.CreateThread(nullptr, 0, __os_thread_shim, (void*)p, 0, &id);
+        } else {
+            void* tid = nullptr;
+            if (os.posix.pthread_create(&tid, nullptr, __os_thread_shim, (void*)p) == 0) h->_os = tid;
+            else h->_os = nullptr;
+        }
+        if (h->_os == nullptr) {
+            free((void*)p);
+            free((void*)h);
+            return nullptr;
+        }
+        return (void*)h;
+    }
+
+    // Block until the thread exits, reap it, and free the handle. Returns the
+    // OS exit code.
+    int thread_join(void* handle) {
+        if (handle == nullptr) return -1;
+        __OsThreadHandle* h = (__OsThreadHandle*)handle;
+        int code = 0;
+        if const (__WINDOWS__) {
+            os.windows.WaitForSingleObject(h->_os, -1);
+            i32 c = 0;
+            os.windows.GetExitCodeThread(h->_os, &c);
+            os.windows.CloseHandle(h->_os);
+            code = (int)c;
+        } else {
+            void* ret = nullptr;
+            os.posix.pthread_join(h->_os, &ret);
+            code = (int)(i64)ret;
+        }
+        free((void*)h->_packet);
+        free((void*)handle);
+        return code;
+    }
+
+    // Join with a timeout. On success sets *out_finished true, reaps the thread,
+    // frees the handle, and returns its OS exit code. On timeout sets
+    // *out_finished false, leaves the handle intact, and returns 0.
+    int thread_timed_join(void* handle, i32 ms, bool* out_finished) {
+        out_finished[0] = false;
+        if (handle == nullptr) return -1;
+        __OsThreadHandle* h = (__OsThreadHandle*)handle;
+        if const (__WINDOWS__) {
+            i32 r = os.windows.WaitForSingleObject(h->_os, ms);
+            if (r == 0) {
+                i32 c = 0;
+                os.windows.GetExitCodeThread(h->_os, &c);
+                os.windows.CloseHandle(h->_os);
+                free((void*)h->_packet);
+                free((void*)handle);
+                out_finished[0] = true;
+                return (int)c;
+            }
+            return 0;
+        } else if const (__MACOS__) {
+            // Darwin has no pthread_timedjoin_np: poll the shim's _done flag then
+            // do a blocking join on the (already-exiting) thread.
+            __OsThreadPacket* p = h->_packet;
+            i32 waited = 0;
+            while (p->_done == 0) {
+                if (waited >= ms) return 0;
+                os.posix.sleep_ms(1);
+                waited = waited + 1;
+            }
+            void* ret = nullptr;
+            os.posix.pthread_join(h->_os, &ret);
+            free((void*)h->_packet);
+            free((void*)handle);
+            out_finished[0] = true;
+            return (int)(i64)ret;
+        } else {
+            // glibc pthread_timedjoin_np: abstime is an ABSOLUTE CLOCK_REALTIME deadline.
+            i64[2] ts = default;
+            os.posix.clock_gettime(os.posix.CLOCK_REALTIME, &ts[0]);
+            i64 totalNs = ts[1] + (i64)ms * 1000000;
+            ts[0] = ts[0] + totalNs / 1000000000;
+            ts[1] = totalNs % 1000000000;
+            void* ret = nullptr;
+            i32 rc = os.posix.pthread_timedjoin_np(h->_os, &ret, &ts[0]);
+            if (rc == 0) {
+                free((void*)h->_packet);
+                free((void*)handle);
+                out_finished[0] = true;
+                return (int)(i64)ret;
+            }
+            return 0;
+        }
+    }
+
+    // Detach the thread; the handle wrapper is freed. The packet is intentionally
+    // leaked because the still-running thread references it and cannot be reaped.
+    void thread_detach(void* handle) {
+        if (handle == nullptr) return;
+        __OsThreadHandle* h = (__OsThreadHandle*)handle;
+        if const (__WINDOWS__) { os.windows.CloseHandle(h->_os); }
+        else { os.posix.pthread_detach(h->_os); }
+        free((void*)handle);
+    }
+
+    // Forcibly terminate the thread (unsafe; skips cleanup). Frees the handle.
+    void thread_kill(void* handle) {
+        if (handle == nullptr) return;
+        __OsThreadHandle* h = (__OsThreadHandle*)handle;
+        if const (__WINDOWS__) {
+            os.windows.TerminateThread(h->_os, -1);
+            os.windows.CloseHandle(h->_os);
+        } else {
+            os.posix.pthread_cancel(h->_os);
+        }
+        free((void*)h->_packet);
+        free((void*)handle);
+    }
+
+    // Pin the thread to a CPU affinity mask. POSIX: not ported (no-op).
+    void thread_set_affinity(void* handle, u64 mask) {
+        if (handle == nullptr) return;
+        __OsThreadHandle* h = (__OsThreadHandle*)handle;
+        if const (__WINDOWS__) {
+            if const (__PLATFORM__ == 64) { os.windows.SetThreadAffinityMask(h->_os, mask); }
+            else { os.windows.SetThreadAffinityMask(h->_os, (u32)mask); }
+        }
+    }
+
+    // Yield the remainder of the current time slice.
+    void thread_yield() {
+        if const (__WINDOWS__) { os.windows.SwitchToThread(); }
+        else { os.posix.sched_yield(); }
+    }
+
+    // OS thread id of the caller.
+    u32 thread_current_id() {
+        if const (__WINDOWS__) { return os.windows.GetCurrentThreadId(); }
+        else { return (u32)os.posix.gettid(); }
+    }
+
+    // Number of logical processors; 0 if it cannot be determined.
+    int thread_hardware_concurrency() {
+        if const (__WINDOWS__) {
+            os.windows._SystemInfo info = default;
+            os.windows.GetSystemInfo(&info);
+            return (int)info._numProc;
+        } else {
+            return (int)os.posix.sysconf(os.posix._SC_NPROCESSORS_ONLN);
+        }
+    }
+
+    // === Terminal ==========================================================
+    // POSIX branches call the existing os.posix.term_* helpers; Windows branches
+    // port terminal.cb's console raw-mode logic. On Windows 'saved' points at an
+    // i32 buffer holding the prior console mode; fd selects stdin (0) vs stdout.
+
+    i32 term_make_raw(i32 fd, void* saved) {
+        if const (__WINDOWS__) {
+            i32 which = -10;                 // STD_INPUT_HANDLE
+            if (fd != 0) which = -11;        // STD_OUTPUT_HANDLE
+            void* hnd = os.windows.GetStdHandle(which);
+            if (hnd == nullptr) return -1;
+            i32* savedMode = (i32*)saved;
+            if (os.windows.GetConsoleMode(hnd, savedMode) == 0) return -1;
+            if (fd == 0) {
+                // ENABLE_EXTENDED_FLAGS (0x80) | ENABLE_MOUSE_INPUT (0x10): raw,
+                // no echo/line-buffering, mouse events delivered.
+                os.windows.SetConsoleMode(hnd, 0x90);
+            } else {
+                // Add ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x04) for ANSI output.
+                os.windows.SetConsoleMode(hnd, savedMode[0] | 0x04);
+            }
+            return 0;
+        } else {
+            return os.posix.term_make_raw(fd, saved);
+        }
+    }
+
+    i32 term_restore(i32 fd, void* saved) {
+        if const (__WINDOWS__) {
+            i32 which = -10;
+            if (fd != 0) which = -11;
+            void* hnd = os.windows.GetStdHandle(which);
+            i32* savedMode = (i32*)saved;
+            os.windows.SetConsoleMode(hnd, savedMode[0]);
+            return 0;
+        } else {
+            return os.posix.term_restore_mode(fd, saved);
+        }
+    }
+
+    // Are there bytes to read on fd within ms? (>0 ready, 0 none, <0 error)
+    i32 term_poll_in(i32 fd, i32 ms) {
+        if const (__WINDOWS__) {
+            void* hnd = os.windows.GetStdHandle(-10);
+            i32 count = 0;
+            if (os.windows.GetNumberOfConsoleInputEvents(hnd, &count) == 0) return -1;
+            if (count > 0) return 1;
+            i32 r = os.windows.WaitForSingleObject(hnd, ms);
+            if (r == 0) return 1;
+            return 0;
+        } else {
+            return os.posix.term_poll_in(fd, ms);
+        }
+    }
+
+    // Read one byte, or -1 if none / EOF.
+    i32 term_read_byte(i32 fd) {
+        if const (__WINDOWS__) {
+            // _getch reads one unbuffered keystroke directly from the console.
+            return os.windows._getch();
+        } else {
+            return os.posix.term_read_byte(fd);
+        }
+    }
+
+    // Query the visible terminal size into *w, *h. Returns false if unavailable.
+    bool term_get_size(i32* w, i32* h) {
+        if const (__WINDOWS__) {
+            void* hOut = os.windows.GetStdHandle(-11);
+            os.windows._CONSOLE_SCREEN_BUFFER_INFO info = default;
+            if (os.windows.GetConsoleScreenBufferInfo(hOut, &info) == 0) return false;
+            w[0] = (i32)(info.winRight - info.winLeft + 1);
+            h[0] = (i32)(info.winBottom - info.winTop + 1);
+            return true;
+        } else {
+            return os.posix.term_get_size(w, h);
+        }
+    }
+
+    // Write raw bytes to a standard fd (1 = stdout, 2 = stderr).
+    void std_write(i32 fd, const char* buf, i32 len) {
+        if const (__WINDOWS__) {
+            i32 which = -11;                 // STD_OUTPUT_HANDLE
+            if (fd == 2) which = -12;        // STD_ERROR_HANDLE
+            void* hnd = os.windows.GetStdHandle(which);
+            i32 written = 0;
+            os.windows.WriteFile(hnd, buf, len, &written, nullptr);
+        } else {
+            os.posix.write(fd, (const void*)buf, (i64)len);
+        }
+    }
+
+    // Standard C stdio stream FILE* for index 0/1/2 (stdin/stdout/stderr).
+    void* std_stream(int which) {
+        if const (__WINDOWS__) { return os.windows.__acrt_iob_func(which); }
+        else { return os.posix.iob(which); }
+    }
+
+    // Bytes a caller must allocate to save/restore terminal state. Windows only
+    // needs an i32 console-mode word; POSIX needs a full termios buffer.
+    int termios_buf_size() {
+        if const (__WINDOWS__) { return 8; }
+        else { return os.posix.TERMIOS_BUF_SIZE; }
+    }
+
+    // === Filesystem ========================================================
+
+    // Create a directory. Returns 0 on success.
+    i32 mkdir(const char* path) {
+        if const (__WINDOWS__) { return os.windows._mkdir(path); }
+        else { return os.posix.mkdir_default(path); }
+    }
+
+    // Remove an empty directory. Returns 0 on success.
+    i32 rmdir(const char* path) {
+        if const (__WINDOWS__) { return os.windows._rmdir(path); }
+        else { return os.posix.rmdir(path); }
+    }
+
+    // True if path names an existing directory.
+    bool is_dir(const char* path) {
+        if const (__WINDOWS__) {
+            i32 attr = os.windows.GetFileAttributesA(path);
+            if (attr == -1) return false;
+            return (attr & 0x10) != 0;   // FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            return os.posix.is_dir(path);
+        }
+    }
+
+    // Test a path for existence/access (mode 0 == exists). Returns 0 on success.
+    i32 access(const char* path, i32 mode) {
+        if const (__WINDOWS__) { return os.windows._access(path, mode); }
+        else { return os.posix.access(path, mode); }
+    }
+
+    // Delete a file. Returns 0 on success.
+    i32 unlink(const char* path) {
+        if const (__WINDOWS__) { return os.windows._unlink(path); }
+        else { return os.posix.unlink(path); }
+    }
+
+    // Rename/move a file, replacing the destination. Returns 0 on success.
+    i32 rename(const char* oldp, const char* newp) {
+        if const (__WINDOWS__) {
+            // MOVEFILE_REPLACE_EXISTING (0x1) | MOVEFILE_COPY_ALLOWED (0x2).
+            if (os.windows.MoveFileExA(oldp, newp, 0x3) != 0) return 0;
+            return -1;
+        } else {
+            return os.posix.rename(oldp, newp);
+        }
+    }
+
+    // Copy the current working directory into buf; returns buf or nullptr.
+    i8* getcwd(i8* buf, i64 size) {
+        if const (__WINDOWS__) { return os.windows._getcwd(buf, (i32)size); }
+        else { return os.posix.getcwd(buf, (i64)size); }
+    }
+
+    // Change the current working directory. Returns 0 on success.
+    i32 chdir(const char* path) {
+        if const (__WINDOWS__) { return os.windows._chdir(path); }
+        else { return os.posix.chdir(path); }
+    }
+
+    // Open a directory stream; returns an opaque handle or nullptr.
+    void* opendir(const char* path) {
+        if const (__WINDOWS__) {
+            __OsDir* d = (__OsDir*)malloc(sizeof(__OsDir));
+            d->_find    = nullptr;
+            d->_pending = 0;
+            d->_valid   = 0;
+            // Build the "<path>\*" search pattern.
+            i8[600] pat = default;
+            i32 n = 0;
+            const i8* pp = (const i8*)path;
+            while (pp[n] != 0 && n < 596) { pat[n] = pp[n]; n = n + 1; }
+            pat[n] = 92; n = n + 1;   // '\'
+            pat[n] = 42; n = n + 1;   // '*'
+            pat[n] = 0;
+            d->_find = os.windows.FindFirstFileA((const char*)&pat[0], &d->_data);
+            if ((i64)d->_find == -1) { free((void*)d); return nullptr; }
+            d->_valid   = 1;
+            d->_pending = 1;
+            return (void*)d;
+        } else {
+            return os.posix.opendir(path);
+        }
+    }
+
+    // Read the next directory entry name, or nullptr at end-of-stream.
+    i8* readdir_name(void* dir) {
+        if const (__WINDOWS__) {
+            __OsDir* d = (__OsDir*)dir;
+            if (d->_valid == 0) return nullptr;
+            if (d->_pending == 0) {
+                if (os.windows.FindNextFileA(d->_find, &d->_data) == 0) return nullptr;
+            }
+            d->_pending = 0;
+            return &d->_data.cFileName[0];
+        } else {
+            return os.posix.readdir_name(dir);
+        }
+    }
+
+    // Close a directory stream. Returns 0 on success.
+    i32 closedir(void* dir) {
+        if const (__WINDOWS__) {
+            __OsDir* d = (__OsDir*)dir;
+            if (d->_find != nullptr && (i64)d->_find != -1) { os.windows.FindClose(d->_find); }
+            free((void*)d);
+            return 0;
+        } else {
+            return os.posix.closedir(dir);
+        }
+    }
+
+    // Resolve path to its absolute form, writing into resolved; returns resolved
+    // or nullptr. resolved must be large enough (PATH_MAX / MAX_PATH).
+    i8* realpath(const char* path, i8* resolved) {
+        if const (__WINDOWS__) {
+            if (os.windows.GetFullPathNameA(path, 260, resolved, nullptr) == 0) return nullptr;
+            return resolved;
+        } else {
+            return os.posix.realpath(path, resolved);
+        }
+    }
+
+    // === Process heap validation (debug guard) =============================
+
+    // True if ptr is a valid allocation in the process heap. POSIX has no heap
+    // walker, so it always returns true (the guard is a no-op there).
+    bool heap_validate(void* ptr) {
+        if const (__WINDOWS__) { return os.windows.HeapValidate(os.windows.GetProcessHeap(), 0u, ptr) != 0; }
+        else { return true; }
+    }
+
+    // === Temp files ========================================================
+
+    // Fill buf with the system temp directory path (no trailing separator).
+    // Returns the length written, or 0 on failure.
+    i32 temp_dir(i8* buf, i64 len) {
+        if const (__WINDOWS__) {
+            i32 n = os.windows.GetTempPathA((i32)len, buf);
+            if (n > 0 && buf[n - 1] == '\\') { buf[n - 1] = 0; n = n - 1; }
+            return n;
+        } else {
+            i8* env = os.posix.getenv("TMPDIR");
+            const i8* src = "/tmp";
+            if (env != nullptr && env[0] != 0) src = (const i8*)env;
+            i32 n = 0;
+            while (src[n] != 0 && (i64)n < len - 1) { buf[n] = src[n]; n = n + 1; }
+            buf[n] = 0;
+            return n;
+        }
+    }
+
+    // Create a uniquely named temp file whose name starts with prefix, writing
+    // its full path into buf (size len). Returns true on success. The file is
+    // left on disk (any opened fd is closed); the caller deletes it when done.
+    bool make_temp_file(const char* prefix, i8* buf, i64 len) {
+        if const (__WINDOWS__) {
+            i8[260] dir = default;
+            if (os.windows.GetTempPathA(260, &dir[0]) == 0) return false;
+            if (os.windows.GetTempFileNameA(&dir[0], prefix, 0, buf) == 0) return false;
+            return true;
+        } else {
+            // Build "<tmpdir>/<prefix>XXXXXX", mkstemp it, then close the fd.
+            i32 n = temp_dir(buf, len);
+            buf[n] = '/'; n = n + 1;
+            const i8* p = (const i8*)prefix;
+            i32 i = 0;
+            while (p[i] != 0 && (i64)n < len - 7) { buf[n] = p[i]; n = n + 1; i = i + 1; }
+            for (i32 j = 0; j < 6; j++) { buf[n] = 'X'; n = n + 1; }
+            buf[n] = 0;
+            i32 fd = os.posix.mkstemp(buf);
+            if (fd < 0) return false;
+            os.posix.close(fd);
+            return true;
+        }
+    }
 }

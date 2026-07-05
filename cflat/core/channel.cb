@@ -43,8 +43,7 @@ import "intrinsic.cb";   // pause() - spin-loop hint for the blocking send/recei
 // Yield the rest of this thread's time slice after a long spin, so a runnable
 // thread (e.g. the producer/consumer we are waiting on) can make progress.
 void _chan_yield() {
-    if const (__WINDOWS__) { os.windows.SwitchToThread(); }
-    else { os.posix.sched_yield(); }
+    os.thread_yield();
 }
 
 // Bounded MPMC lock-free ring buffer; capacity must be a power of two.

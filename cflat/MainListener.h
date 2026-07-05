@@ -13848,7 +13848,32 @@ public:
                                 {
                                     auto it = Compiler(ctx)->functionTable.find(functionName);
                                     if (it != Compiler(ctx)->functionTable.end() && !it->second.empty())
-                                        funcSym = &it->second.front();
+                                    {
+                                        // Select the overload matching the receiver type (and arity), not
+                                        // front(): several types can share a method name (e.g. an atomic's
+                                        // lock(this) release(val, body) vs an unrelated struct's release()).
+                                        // front() could read the wrong param list and drop the lock(this)
+                                        // guard-seeding, wrongly rejecting access to guarded fields.
+                                        const std::string& recvType = structVar.TypeAndValue.TypeName;
+                                        if (recvType.empty())
+                                        {
+                                            funcSym = &it->second.front();
+                                        }
+                                        else
+                                        {
+                                            size_t wantParams = arguments.size() + namedArgCtx.size();
+                                            const LLVMBackend::FunctionSymbol* typeMatch = nullptr;
+                                            for (const auto& cand : it->second)
+                                            {
+                                                if (cand.Parameters.empty()
+                                                    || cand.Parameters.front().TypeName != recvType)
+                                                    continue;
+                                                if (!typeMatch) typeMatch = &cand;
+                                                if (cand.Parameters.size() == wantParams) { funcSym = &cand; break; }
+                                            }
+                                            if (!funcSym) funcSym = typeMatch ? typeMatch : &it->second.front();
+                                        }
+                                    }
                                 }
                                 size_t paramOffset = arguments.empty() ? 0 : 1; // offset for implicit 'this'
 

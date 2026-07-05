@@ -446,15 +446,10 @@ class ArenaAllocator : IAllocator
         if (_ar_route_free(ptr)) return;
 
         // Foreign pointer - only CRT-free if it lives on the CRT heap. No header
-        // read here, so a foreign pointer is never dereferenced.
-        if const (__WINDOWS__) {
-            if (os.windows.HeapValidate(os.windows.GetProcessHeap(), 0u, ptr))
-                free(ptr);
-        } else {
-            // POSIX has no HeapValidate equivalent; foreign pointers reaching here
-            // are libc-malloc blocks in practice, so free directly.
+        // read here, so a foreign pointer is never dereferenced. os.heap_validate
+        // returns true on POSIX (no heap walker; foreign blocks are libc-malloc).
+        if (os.heap_validate(ptr))
             free(ptr);
-        }
     }
 
     // Lock-taking entry used by the registry router to free an owned pointer.

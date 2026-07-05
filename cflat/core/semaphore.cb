@@ -1,7 +1,8 @@
 // semaphore.cb - counting semaphore.
 //
-// Windows: backed by a Win32 semaphore kernel object (CreateSemaphoreA).
-// POSIX:   backed by a heap POSIX unnamed semaphore (sem_t*, sem_init'd).
+// Backed by the neutral os.* semaphore surface. The struct owns an opaque handle
+// (_handle); os.cb decides the platform representation (Windows kernel semaphore /
+// POSIX heap sem_t).
 //
 // Usage:
 //   semaphore s;
@@ -16,7 +17,9 @@
 // NOTE: max_count is a Win32 concept; POSIX sem_t has no upper bound, so the
 // max_count argument is ignored off Windows.
 
-// Counting semaphore (Win32 semaphore handle / POSIX sem_t).
+import "os.cb";
+
+// Counting semaphore (opaque OS handle owned by os.*).
 struct semaphore {
     void* _handle = nullptr;
 
@@ -24,39 +27,31 @@ struct semaphore {
     //   initial   - starting signal count (0 = fully blocked)
     //   max_count - maximum count (Windows only; ignored on POSIX)
     void init(int initial, int max_count) {
-        if const (__WINDOWS__) { _handle = os.windows.CreateSemaphoreA(nullptr, initial, max_count, nullptr); }
-        else { _handle = os.posix.sem_new(initial); }
+        _handle = os.sem_new(initial, max_count);
     }
 
     // Decrement count; block until count > 0.  (alias: acquire)
     void acquire() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(20); }  // thread-fuzz sched-point
-        if const (__WINDOWS__) { os.windows.WaitForSingleObject(_handle, -1); }  // -1 == INFINITE
-        else { os.posix.sem_wait(_handle); }
+        os.sem_wait(_handle);
     }
 
     // Increment count by 1; wake one blocked acquire() caller.  (alias: release)
     void release() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(21); }  // thread-fuzz sched-point
-        if const (__WINDOWS__) { os.windows.ReleaseSemaphore(_handle, 1, nullptr); }
-        else { os.posix.sem_post(_handle); }
+        os.sem_post(_handle, 1);
     }
 
     // Increment count by n; wake up to n blocked acquire() callers.
     void release_n(int n) {
         if (__fuzz_hook != nullptr) { __fuzz_hook(22); }  // thread-fuzz sched-point
-        if const (__WINDOWS__) { os.windows.ReleaseSemaphore(_handle, n, nullptr); }
-        else {
-            // POSIX sem_post increments by 1, so post n times.
-            for (int i = 0; i < n; i++) os.posix.sem_post(_handle);
-        }
+        os.sem_post(_handle, n);
     }
 
     // Release the OS object.
     void destroy() {
         if (_handle != nullptr) {
-            if const (__WINDOWS__) { os.windows.CloseHandle(_handle); }
-            else { os.posix.sem_destroy(_handle); free(_handle); }
+            os.sem_destroy(_handle);   // os.sem_destroy frees the block; do not free here.
             _handle = nullptr;
         }
     }

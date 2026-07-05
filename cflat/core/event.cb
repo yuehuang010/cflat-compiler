@@ -1,0 +1,31 @@
+// event.cb - cross-platform manual-reset event (waitable flag).
+// Backed by os.* (Windows kernel Event / POSIX mutex+cond+flag, both in os.cb).
+
+import "os.cb";
+
+// Manual-reset event: once set(), it stays signaled until destroyed, so every
+// past and future wait() returns immediately (no missed-wakeup race).
+struct event {
+    void* _h = nullptr;   // opaque event handle owned by os.* (see os.cb event_* ).
+
+    // Create the event (starts unsignaled).
+    void init() {
+        _h = os.event_new();
+    }
+
+    // Signal the event, unblocking all current and future waiters.
+    void set() {
+        os.event_set(_h);
+    }
+
+    // Block until the event is signaled.
+    void wait() {
+        os.event_wait(_h);
+    }
+
+    // Release the OS event.
+    void destroy() {
+        os.event_destroy(_h);
+        _h = nullptr;
+    }
+};

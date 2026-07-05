@@ -1,9 +1,8 @@
 // rwlock.cb - slim reader-writer lock.
 //
-// Windows: backed by a Win32 SRWLOCK (lock state lives inline in the pointer-
-// sized field; 0 == unlocked, no init needed and no kernel object to release).
-// POSIX:   backed by a heap pthread_rwlock_t pointer (lazily allocated, zeroed =
-// valid unlocked); destroy() releases it.
+// Backed by the neutral os.* rwlock surface. The struct owns a single pointer-
+// sized slot (_lock); os.cb decides the platform representation (Windows SRWLOCK
+// inline / POSIX heap pthread_rwlock_t*).
 //
 // Usage:
 //   rwlock rw;
@@ -11,63 +10,50 @@
 //   rw.release_read();
 //   rw.acquire_write();     // exclusive - one writer, no readers
 //   rw.release_write();
-//   rw.destroy();           // frees the POSIX lock; no-op on Windows
+//   rw.destroy();           // frees any OS lock state
 //
 // lock statement uses exclusive (write) semantics:
 //   lock (rw) { }           // equivalent to acquire_write() / release_write()
-//
-// SRWLOCK is a single pointer-sized opaque value, stored inline as void* with
-// &_lock passed to the Win32 functions (SRWLOCK == { PVOID }). POSIX lazy-init
-// note (same as mutex): _lock is allocated on first use, which all current
-// callers do from the creating thread before publishing the object.
 
+import "os.cb";
 
 // Reader-writer lock (shared reads, exclusive writes).
 struct rwlock {
-    void* _lock = nullptr;   // Windows: SRWLOCK inline (0 == unlocked). POSIX: heap pthread_rwlock_t*.
+    void* _lock = nullptr;   // opaque lock slot owned by os.* (see os.cb rwlock_* ).
 
     // Acquire a shared (read) lock - many readers can hold this simultaneously.
     void acquire_read() {
-        if const (__WINDOWS__) { os.windows.AcquireSRWLockShared(&_lock); }
-        else { os.posix.pthread_rwlock_rdlock(os.posix.ensure_rwlock(&_lock)); }
+        os.rwlock_read_lock(&_lock);
     }
 
     // Release a shared (read) lock.
     void release_read() {
-        if const (__WINDOWS__) { os.windows.ReleaseSRWLockShared(&_lock); }
-        else { os.posix.pthread_rwlock_unlock(os.posix.ensure_rwlock(&_lock)); }
+        os.rwlock_read_unlock(&_lock);
     }
 
     // Acquire an exclusive (write) lock - no other readers or writers allowed.
     void acquire_write() {
-        if const (__WINDOWS__) { os.windows.AcquireSRWLockExclusive(&_lock); }
-        else { os.posix.pthread_rwlock_wrlock(os.posix.ensure_rwlock(&_lock)); }
+        os.rwlock_write_lock(&_lock);
     }
 
     // Release an exclusive (write) lock.
     void release_write() {
-        if const (__WINDOWS__) { os.windows.ReleaseSRWLockExclusive(&_lock); }
-        else { os.posix.pthread_rwlock_unlock(os.posix.ensure_rwlock(&_lock)); }
+        os.rwlock_write_unlock(&_lock);
     }
 
     // acquire() / release() are exclusive-lock aliases so that
     // lock (rw) { } works as a write lock.
     void acquire() {
-        if const (__WINDOWS__) { os.windows.AcquireSRWLockExclusive(&_lock); }
-        else { os.posix.pthread_rwlock_wrlock(os.posix.ensure_rwlock(&_lock)); }
+        os.rwlock_write_lock(&_lock);
     }
 
     // Release the exclusive (write) lock; used by the lock statement.
     void release() {
-        if const (__WINDOWS__) { os.windows.ReleaseSRWLockExclusive(&_lock); }
-        else { os.posix.pthread_rwlock_unlock(os.posix.ensure_rwlock(&_lock)); }
+        os.rwlock_write_unlock(&_lock);
     }
 
-    // Release the underlying lock. No-op on Windows (SRW needs no cleanup).
+    // Release any underlying OS lock state.
     void destroy() {
-        if const (__WINDOWS__) { }
-        else {
-            if (_lock != nullptr) { os.posix.pthread_rwlock_destroy(_lock); free(_lock); _lock = nullptr; }
-        }
+        os.rwlock_destroy(&_lock);
     }
 };

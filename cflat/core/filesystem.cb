@@ -19,101 +19,50 @@ import "list.cb";
 // Path separator inserted when joining segments ('\' on Windows, '/' on POSIX).
 i8 _fs_sep() { if const (__WINDOWS__) { return '\\'; } else { return '/'; } }
 
-void* _fs_fopen(const char* path, const char* mode) {
-    if const (__WINDOWS__) { return os.windows.fopen(path, mode); }
-    else { return os.posix.fopen(path, mode); }
-}
-win_int _fs_fclose(void* s) {
-    if const (__WINDOWS__) { return os.windows.fclose(s); }
-    else { return os.posix.fclose(s); }
-}
+// Portable C stdio (fopen family) lives in cruntime.cb; call it un-namespaced.
+void* _fs_fopen(const char* path, const char* mode) { return fopen(path, mode); }
+win_int _fs_fclose(void* s) { return fclose(s); }
 int _fs_fread(i8* buf, int size, int count, void* s) {
-    if const (__WINDOWS__) { return os.windows.fread(buf, size, count, s); }
-    else { return (int)os.posix.fread(buf, (win_size)size, (win_size)count, s); }
+    return (int)fread(buf, (win_size)size, (win_size)count, s);
 }
 int _fs_fwrite(i8* buf, int size, int count, void* s) {
-    if const (__WINDOWS__) { return os.windows.fwrite(buf, size, count, s); }
-    else { return (int)os.posix.fwrite(buf, (win_size)size, (win_size)count, s); }
+    return (int)fwrite(buf, (win_size)size, (win_size)count, s);
 }
-win_int _fs_feof(void* s) {
-    if const (__WINDOWS__) { return os.windows.feof(s); }
-    else { return os.posix.feof(s); }
-}
+win_int _fs_feof(void* s) { return feof(s); }
 win_int _fs_fseek(void* s, int offset, int origin) {
-    if const (__WINDOWS__) { return os.windows.fseek(s, offset, origin); }
-    else { return os.posix.fseek(s, (win_size)offset, origin); }
+    return fseek(s, (win_size)offset, origin);
 }
-int _fs_ftell(void* s) {
-    if const (__WINDOWS__) { return os.windows.ftell(s); }
-    else { return (int)os.posix.ftell(s); }
-}
+int _fs_ftell(void* s) { return (int)ftell(s); }
 
-bool _fs_exists(const char* path) {
-    if const (__WINDOWS__) { return os.windows._access(path, 0) == 0; }
-    else { return os.posix.access(path, 0) == 0; }
-}
-bool _fs_isDir(const char* path) {
-    if const (__WINDOWS__) {
-        win_int attrs = os.windows.GetFileAttributesA(path);
-        return attrs != (i32)-1 && (attrs & 16) != 0;
-    } else {
-        return os.posix.is_dir(path);
-    }
-}
-bool _fs_isFile(const char* path) {
-    if const (__WINDOWS__) {
-        win_int attrs = os.windows.GetFileAttributesA(path);
-        return attrs != (i32)-1 && (attrs & 16) == 0;
-    } else {
-        return os.posix.access(path, 0) == 0 && !os.posix.is_dir(path);
-    }
-}
-win_int _fs_unlink(const char* path) {
-    if const (__WINDOWS__) { return os.windows._unlink(path); }
-    else { return os.posix.unlink(path); }
-}
-bool _fs_move(const char* src, const char* dst) {
-    if const (__WINDOWS__) { return os.windows.MoveFileExA(src, dst, 1) != 0; }
-    else { return os.posix.rename(src, dst) == 0; }
-}
-win_int _fs_mkdir(const char* path) {
-    if const (__WINDOWS__) { return os.windows._mkdir(path); }
-    else { return os.posix.mkdir_default(path); }
-}
-win_int _fs_rmdir(const char* path) {
-    if const (__WINDOWS__) { return os.windows._rmdir(path); }
-    else { return os.posix.rmdir(path); }
-}
-i8* _fs_getcwd(i8* buf, int size) {
-    if const (__WINDOWS__) { return os.windows._getcwd(buf, size); }
-    else { return os.posix.getcwd(buf, (win_size)size); }
-}
-win_int _fs_chdir(const char* path) {
-    if const (__WINDOWS__) { return os.windows._chdir(path); }
-    else { return os.posix.chdir(path); }
-}
+// Directory/metadata ops route through the neutral os.* surface.
+bool _fs_exists(const char* path) { return os.access(path, 0) == 0; }
+bool _fs_isDir(const char* path) { return os.is_dir(path); }
+bool _fs_isFile(const char* path) { return os.access(path, 0) == 0 && !os.is_dir(path); }
+win_int _fs_unlink(const char* path) { return os.unlink(path); }
+bool _fs_move(const char* src, const char* dst) { return os.rename(src, dst) == 0; }
+win_int _fs_mkdir(const char* path) { return os.mkdir(path); }
+win_int _fs_rmdir(const char* path) { return os.rmdir(path); }
+i8* _fs_getcwd(i8* buf, int size) { return os.getcwd(buf, (i64)size); }
+win_int _fs_chdir(const char* path) { return os.chdir(path); }
 
-// Copy src -> dst (overwrite). Windows has CopyFileA; POSIX streams via stdio.
+// Copy src -> dst (overwrite) via a portable stdio read/write loop (works on both
+// platforms; drops the Windows CopyFileA fast path but names no backend).
 bool _fs_copy(const char* src, const char* dst) {
-    if const (__WINDOWS__) {
-        return os.windows.CopyFileA(src, dst, 0) != 0;
-    } else {
-        void* fin = os.posix.fopen(src, "rb");
-        if (fin == nullptr) return false;
-        void* fout = os.posix.fopen(dst, "wb");
-        if (fout == nullptr) { os.posix.fclose(fin); return false; }
-        i8* buf = new i8[65536];
-        bool ok = true;
-        while (true) {
-            win_size n = os.posix.fread(buf, (win_size)1, (win_size)65536, fin);
-            if (n == (win_size)0) break;
-            if (os.posix.fwrite(buf, (win_size)1, n, fout) != n) { ok = false; break; }
-        }
-        delete[] buf;
-        os.posix.fclose(fin);
-        os.posix.fclose(fout);
-        return ok;
+    void* fin = fopen(src, "rb");
+    if (fin == nullptr) return false;
+    void* fout = fopen(dst, "wb");
+    if (fout == nullptr) { fclose(fin); return false; }
+    i8* buf = new i8[65536];
+    bool ok = true;
+    while (true) {
+        win_size n = fread(buf, (win_size)1, (win_size)65536, fin);
+        if (n == (win_size)0) break;
+        if (fwrite(buf, (win_size)1, n, fout) != n) { ok = false; break; }
     }
+    delete[] buf;
+    fclose(fin);
+    fclose(fout);
+    return ok;
 }
 
 // ── File ─────────────────────────────────────────────────────────────────────
@@ -513,66 +462,33 @@ class Path
     // Resolve path to an absolute path. Returns path unchanged on failure.
     static move string getAbsolute(string path)
     {
+        // os.realpath resolves to absolute form; on failure (path must exist on
+        // POSIX) the contract is to return the path unchanged.
         i8* buf = new i8[4096];
-        if const (__WINDOWS__) {
-            win_int len = os.windows.GetFullPathNameA(path.data(), 4096, buf, nullptr);
-            if (len == 0 || len >= 4096) { delete[] buf; return path.copy(); }
-            return _strOwned(buf, len);
-        } else {
-            // realpath requires the path (or its prefix) to exist; on failure the
-            // contract is to return the path unchanged.
-            i8* result = os.posix.realpath(path.data(), buf);
-            if (result == nullptr) { delete[] buf; return path.copy(); }
-            return _strOwned(buf, strlen(buf));
-        }
+        i8* result = os.realpath(path.data(), buf);
+        if (result == nullptr) { delete[] buf; return path.copy(); }
+        return _strOwned(buf, strlen(buf));
     }
 
     // Return the system temporary directory path (no trailing separator).
+    // Delegates to os.temp_dir (Win GetTempPathA / POSIX $TMPDIR or /tmp).
     static move string getTempPath()
     {
-        if const (__WINDOWS__) {
-            i8* buf = new i8[260];
-            win_int len = os.windows.GetTempPathA(260, buf);
-            if (len == 0) { delete[] buf; return ""; }
-            if (len > 0 && buf[len - 1] == '\\') { buf[len - 1] = 0; len--; }
-            return _strOwned(buf, len);
-        } else {
-            // Honor $TMPDIR (POSIX), else /tmp.
-            i8* env = os.posix.getenv("TMPDIR");
-            string dir;
-            if (env != nullptr && env[0] != 0) { dir._ptr = env; dir._len = strlen(env); }
-            else { dir._ptr = "/tmp"; dir._len = 4; }
-            return dir.copy();
-        }
+        i8* buf = new i8[260];
+        i32 len = os.temp_dir(buf, 260);
+        if (len == 0) { delete[] buf; return ""; }
+        return _strOwned(buf, len);
     }
 
     // Create a uniquely named temporary file in the system temp directory.
     // prefix is up to 3 characters used at the start of the filename.
     // Returns the full path, or "" on failure. Caller must delete the file when done.
+    // Delegates to os.make_temp_file (Win GetTempFileNameA / POSIX mkstemp).
     static move string getTempFile(string prefix)
     {
-        if const (__WINDOWS__) {
-            i8* tmpDir = new i8[260];
-            win_int tlen = os.windows.GetTempPathA(260, tmpDir);
-            if (tlen == 0) { delete[] tmpDir; return ""; }
-            i8* buf = new i8[260];
-            win_int ok = os.windows.GetTempFileNameA(tmpDir, prefix.data(), 0, buf);
-            delete[] tmpDir;
-            if (ok == 0) { delete[] buf; return ""; }
-            return _strOwned(buf, strlen(buf));
-        } else {
-            // mkstemp needs a writable template ending in XXXXXX; it creates+opens
-            // the file (we just close the fd, leaving the unique path on disk).
-            string tmp = Path.getTempPath();
-            string templ = tmp + "/" + prefix + "XXXXXX";
-            i32 tlen = templ.length();
-            i8* buf = new i8[tlen + 1];
-            memcpy(buf, templ.data(), tlen + 1);
-            i32 fd = os.posix.mkstemp(buf);
-            if (fd < 0) { delete[] buf; return ""; }
-            os.posix.close(fd);
-            return _strOwned(buf, strlen(buf));
-        }
+        i8* buf = new i8[300];
+        if (!os.make_temp_file(prefix.data(), buf, 300)) { delete[] buf; return ""; }
+        return _strOwned(buf, strlen(buf));
     }
 };
 
@@ -733,57 +649,30 @@ class Directory
     static list<string>* _listFiltered(string path, int filter)
     {
         list<string>* result = new list<string>;
-        if const (__WINDOWS__) {
-            string pattern = path + "\\*";
-            os.windows._WIN32_FIND_DATAA* findData = new os.windows._WIN32_FIND_DATAA;
-            void* handle = os.windows.FindFirstFileA(pattern.data(), findData);
-            if (handle == (void*)(i64)-1)
-            {
-                delete findData;
-                return result;
+        void* dir = os.opendir(path.data());
+        if (dir == nullptr) return result;
+        while (true) {
+            i8* name = os.readdir_name(dir);
+            if (name == nullptr) break;
+            bool isDot = strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
+            if (isDot) continue;
+            // Only the files/dirs-only filters need the (more expensive) stat.
+            bool isDir = false;
+            if (filter != 0) {
+                string nm; nm._ptr = name; nm._len = strlen(name);
+                string full = Path.combine(path, nm);
+                isDir = _fs_isDir(full.data());
             }
-            do {
-                i8* name = findData->cFileName;
-                bool isDot = strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
-                bool isDir = (findData->dwFileAttributes & 16) != 0;
-                bool include = !isDot && (filter == 0 || (filter == 1 && !isDir) || (filter == 2 && isDir));
-                if (include)
-                {
-                    int len = strlen(name);
-                    i8* nameBuf = new i8[len + 1];
-                    memcpy(nameBuf, name, len + 1);
-                    result->add(_strOwned(nameBuf, len));
-                }
-            } while (os.windows.FindNextFileA(handle, findData) != 0);
-            os.windows.FindClose(handle);
-            delete findData;
-            return result;
-        } else {
-            void* dir = os.posix.opendir(path.data());
-            if (dir == nullptr) return result;
-            while (true) {
-                i8* name = os.posix.readdir_name(dir);
-                if (name == nullptr) break;
-                bool isDot = strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
-                if (isDot) continue;
-                // Only the files/dirs-only filters need the (more expensive) stat.
-                bool isDir = false;
-                if (filter != 0) {
-                    string nm; nm._ptr = name; nm._len = strlen(name);
-                    string full = Path.combine(path, nm);
-                    isDir = _fs_isDir(full.data());
-                }
-                bool include = filter == 0 || (filter == 1 && !isDir) || (filter == 2 && isDir);
-                if (include) {
-                    int len = strlen(name);
-                    i8* nameBuf = new i8[len + 1];
-                    memcpy(nameBuf, name, len + 1);
-                    result->add(_strOwned(nameBuf, len));
-                }
+            bool include = filter == 0 || (filter == 1 && !isDir) || (filter == 2 && isDir);
+            if (include) {
+                int len = strlen(name);
+                i8* nameBuf = new i8[len + 1];
+                memcpy(nameBuf, name, len + 1);
+                result->add(_strOwned(nameBuf, len));
             }
-            os.posix.closedir(dir);
-            return result;
         }
+        os.closedir(dir);
+        return result;
     }
 
     // Recursively walk path, appending each entry's full path to result (subdirs first).
