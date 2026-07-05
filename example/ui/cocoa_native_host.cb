@@ -1,0 +1,1207 @@
+// cocoa_native_host.cb - a native macOS (AppKit) host that drives REAL OS controls.
+//
+// This is the macOS counterpart of win32_native_host.cb: the NativeHost output
+// stage of the CFlat UI framework (see ui_native.cb). The reconciled Element tree's
+// stable key paths map to real AppKit controls (NSButton / NSTextField / NSSlider /
+// NSProgressIndicator / NSBox / NSTextView), and the host creates / updates /
+// destroys those controls to match the tree. AppKit paints them, handles IME +
+// accessibility, and owns focus / Tab. The app-facing model is UNCHANGED; an app
+// that renders to the Win32 host renders here too - it just imports this host
+// (via native_host.cb) instead.
+//
+// It drives AppKit through the dlopen/objc_msgSend bridge in cocoa.cb (no SDK, no
+// Xcode, no -framework linking). Coordinates use a FLIPPED content view so every
+// frame is top-left like Win32; DIP->points is x*BASE_X, y*BASE_Y with NO DPI
+// scaling (Cocoa points are already density-independent, so the Win32 WM_DPICHANGED
+// machinery is dropped here).
+//
+// This file has no main(); an app imports it and calls runAppGuiNative().
+import "ui_native.cb";
+import "cocoa.cb";
+
+// Per-DIP base points. Layout math in ui.cb is unit-blind integers; a native host
+// reads them as DIPs. One layout column ~8pt, one row ~26pt so native controls get
+// sensible heights. Unlike Win32, there is no DPI multiplier (Cocoa points scale).
+const int BASE_X = 8;
+const int BASE_Y = 26;
+
+// NSEventModifierFlag masks (accelerators). Ctrl maps to Cmd per mac convention.
+const int MOD_CMD   = 0x100000;   // 1<<20  NSEventModifierFlagCommand
+const int MOD_SHIFT = 0x20000;    // 1<<17  NSEventModifierFlagShift
+const int MOD_ALT   = 0x80000;    // 1<<19  NSEventModifierFlagOption
+
+// A 4-double aggregate matching NSRect. On arm64 an HFA of 4 doubles is returned in
+// d0-d3; the M1 probe (cocoa_probe --selftest) confirmed the cflat function<> ABI
+// matches, so -[NSView frame] is read this way for the resize path (D10 Plan A).
+struct RectD
+{
+    double x = 0.0;
+    double y = 0.0;
+    double w = 0.0;
+    double h = 0.0;
+};
+
+// -- The running app + its tree + context, reached from the free-function IMPs
+// (a plain objc callback cannot capture `this`). Single window / single thread, so
+// these host globals are the right tool; they live in the HOST file, not ui.cb.
+CocoaHost _nHost  = default;
+Component _nApp   = default;
+Element   _nTree  = default;
+UiContext _nCtx   = default;
+bool      _nReady = false;
+int       _nW     = 95;   // client size in DIP units (760pt / 8)
+int       _nH     = 21;   // 560pt / 26
+
+// -- Declarative menu bar -----------------------------------------------------
+// Same surface + globals as the Win32 host. Parallel lists (not a struct with a
+// closure) keep ownership simple; an item's app command id is carried on the
+// NSMenuItem via setTag:. The app provides ONE dispatch closure (setMenuHandler).
+list<string>          _menuTop        = default;   // top-level menu titles
+list<int>             _menuItemTopIdx = default;   // per item: owning top index
+list<string>          _menuItemLabel  = default;   // per item: label
+list<int>             _menuItemCmd    = default;   // per item: app command id (0 = separator)
+list<string>          _menuAccel      = default;   // per item: accel text (e.g. "Ctrl+S")
+Lambda<void(int)>     _menuHandler    = default;   // app's command dispatcher
+
+// Optional close guard: the app returns true to allow the window to close, false to
+// veto. Default (unset) always allows.
+Lambda<bool()>        _closeQuery     = default;
+bool                  _hasCloseQuery  = false;
+
+void setMenuHandler(Lambda<void(int)> h) { _menuHandler = h; }
+void setCloseQuery(Lambda<bool()> q) { _closeQuery = q; _hasCloseQuery = true; }
+
+int hostWidth()  { return _nW; }
+int hostHeight() { return _nH; }
+
+void* u2h(u64 u) { return (void*)u; }
+
+// A node kind that maps to an OS control (vs a pure layout container). Same set as
+// the Win32 host.
+bool nativeMappable(int kind)
+{
+    return kind == ELEM_BUTTON || kind == ELEM_TEXT || kind == ELEM_TEXTINPUT
+        || kind == ELEM_CHECKBOX || kind == ELEM_PROGRESS || kind == ELEM_SLIDER
+        || kind == ELEM_BOX || kind == ELEM_TEXTAREA;
+}
+
+// An NSString for `s`, safe for an empty cflat string (whose data() can be null):
+// an empty value maps to [NSString string] (@"") rather than a nil arg.
+void* _nsStrSafe(string s)
+{
+    if (s.length() == 0) return msg0(cls("NSString"), "string");
+    return nsStr(s.data());
+}
+
+// True if `ctrl` is an NSScrollView (a TextArea's handle is its scroll view; text
+// ops resolve the documentView first).
+bool _isScroll(void* ctrl)
+{
+    return msgBool1(ctrl, "isKindOfClass:", cls("NSScrollView")) != (i8)0;
+}
+
+// -- CocoaHost: the NativeHost implementation ---------------------------------
+// Owns the top-level window, the flipped content view, the one shared callback
+// target (CfHostTarget), the reentrancy guard, and the per-frame live-control
+// bookkeeping (parallel key/handle lists) used to route events and destroy controls
+// that fell out of the tree.
+class CocoaHost : NativeHost
+{
+    void* window      = nullptr;
+    void* contentView = nullptr;   // the flipped CfFlippedView
+    void* target      = nullptr;   // shared CfHostTarget (control + menu + window delegate)
+    void* appDelegate = nullptr;
+    bool  applying    = false;     // guard: swallow self-inflicted change notifications
+    bool  dark        = false;     // last applied theme was dark
+    list<string> liveKeys    = default;   // keys with a live control this frame
+    list<u64>    liveHandles = default;   // parallel handles (NSView* as u64)
+
+    // NativeHost: create a control of `elemKind` under the flipped content view.
+    // `key` is the node's key path (kept by the caller in the shadow map). Returns
+    // the control (NSView*) as a u64; a TextArea returns its enclosing scroll view.
+    u64 createControl(int elemKind, u64 parentHandle, string key)
+    {
+        void* ctrl = nullptr;
+        if (elemKind == ELEM_BUTTON)
+        {
+            ctrl = msgRect(msg0(cls("NSButton"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgInt(ctrl, "setBezelStyle:", 1);            // NSBezelStyleRounded
+            msg1(ctrl, "setTarget:", this.target);
+            msg1(ctrl, "setAction:", sel("onAction:"));
+        }
+        else if (elemKind == ELEM_CHECKBOX)
+        {
+            ctrl = msgRect(msg0(cls("NSButton"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgInt(ctrl, "setButtonType:", 3);            // NSButtonTypeSwitch
+            msg1(ctrl, "setTarget:", this.target);
+            msg1(ctrl, "setAction:", sel("onAction:"));
+        }
+        else if (elemKind == ELEM_TEXTINPUT)
+        {
+            ctrl = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msg1(ctrl, "setDelegate:", this.target);
+        }
+        else if (elemKind == ELEM_TEXT)
+        {
+            ctrl = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgBool(ctrl, "setBezeled:", false);
+            msgBool(ctrl, "setDrawsBackground:", false);
+            msgBool(ctrl, "setEditable:", false);
+            msgBool(ctrl, "setSelectable:", false);
+        }
+        else if (elemKind == ELEM_BOX)
+        {
+            ctrl = msgRect(msg0(cls("NSBox"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgInt(ctrl, "setTitlePosition:", 0);         // NSNoTitle
+        }
+        else if (elemKind == ELEM_PROGRESS)
+        {
+            ctrl = msgRect(msg0(cls("NSProgressIndicator"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgInt(ctrl, "setStyle:", 0);                 // NSProgressIndicatorStyleBar
+            msgBool(ctrl, "setIndeterminate:", false);
+            msgSetDouble(ctrl, "setMinValue:", 0.0);
+        }
+        else if (elemKind == ELEM_SLIDER)
+        {
+            ctrl = msgRect(msg0(cls("NSSlider"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgBool(ctrl, "setContinuous:", true);
+            msg1(ctrl, "setTarget:", this.target);
+            msg1(ctrl, "setAction:", sel("onAction:"));
+        }
+        else if (elemKind == ELEM_TEXTAREA)
+        {
+            // NSTextView inside an NSScrollView; the u64 handle IS the scroll view
+            // (framing / destroy). Text/selection ops resolve documentView first.
+            void* scroll = msgRect(msg0(cls("NSScrollView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgBool(scroll, "setHasVerticalScroller:", true);
+            msgInt(scroll, "setBorderType:", 2);          // NSBezelBorder
+            void* tv = msgRect(msg0(cls("NSTextView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgBool(tv, "setEditable:", true);
+            msgBool(tv, "setSelectable:", true);
+            msgBool(tv, "setRichText:", false);
+            msg1(tv, "setDelegate:", this.target);
+            msg1(scroll, "setDocumentView:", tv);
+            ctrl = scroll;
+        }
+        else
+        {
+            ctrl = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+        }
+
+        if (this.contentView != nullptr && ctrl != nullptr)
+            msg1(this.contentView, "addSubview:", ctrl);
+        return (u64)ctrl;
+    }
+
+    void destroyControl(u64 h)
+    {
+        if (h == 0u) return;
+        void* ctrl = u2h(h);
+        msg0(ctrl, "removeFromSuperview");   // drops the superview's retain
+        msg0(ctrl, "release");               // drops our alloc/init retain -> dealloc
+    }
+
+    // Position + size in points (flipped view, so no y-flip). DIP -> points by
+    // BASE_X / BASE_Y; the M3 resize path feeds the client size back in DIPs.
+    void setFrame(u64 h, Rect frameDip)
+    {
+        void* ctrl = u2h(h);
+        msgRect(ctrl, "setFrame:",
+                (double)(frameDip.x * BASE_X), (double)(frameDip.y * BASE_Y),
+                (double)(frameDip.w * BASE_X), (double)(frameDip.h * BASE_Y));
+    }
+
+    // Only push text when it actually differs, so an NSTextField does not reset its
+    // caret / selection on every re-render (mirror win32:181). Class-sniffed: a
+    // scroll view (TextArea) writes its text view; an NSButton writes its title; an
+    // NSTextField writes its string value.
+    void setText(u64 h, const char* s)
+    {
+        void* ctrl = u2h(h);
+        if (_isScroll(ctrl))
+        {
+            void* tv = msg0(ctrl, "documentView");
+            char* cur = cStr(msg0(tv, "string"));
+            if (cur != nullptr && strcmp(cur, (char*)s) == 0) return;
+            msg1(tv, "setString:", nsStr((char*)s));
+            return;
+        }
+        if (msgBool1(ctrl, "isKindOfClass:", cls("NSButton")) != (i8)0)
+        {
+            char* cur = cStr(msg0(ctrl, "title"));
+            if (cur != nullptr && strcmp(cur, (char*)s) == 0) return;
+            msg1(ctrl, "setTitle:", nsStr((char*)s));
+            return;
+        }
+        char* cur = cStr(msg0(ctrl, "stringValue"));
+        if (cur != nullptr && strcmp(cur, (char*)s) == 0) return;
+        msg1(ctrl, "setStringValue:", nsStr((char*)s));
+    }
+
+    void setBoolProp(u64 h, int prop, bool v)
+    {
+        void* ctrl = u2h(h);
+        if (prop == PROP_CHECKED)
+        {
+            msgInt(ctrl, "setState:", v ? (i64)1 : (i64)0);   // NSControlStateValueOn = 1
+        }
+        else if (prop == PROP_ENABLED)
+        {
+            if (_isScroll(ctrl))
+            {
+                void* tv = msg0(ctrl, "documentView");
+                msgBool(tv, "setEditable:", v);
+                msgBool(tv, "setSelectable:", v);
+            }
+            else
+            {
+                msgBool(ctrl, "setEnabled:", v);
+            }
+        }
+        else if (prop == PROP_VISIBLE)
+        {
+            msgBool(ctrl, "setHidden:", !v);
+        }
+    }
+
+    // Route a value/max set to the right control by class (keeps the seam
+    // property-based: the host, not ui.cb, knows progress vs slider). Both take
+    // doubles; the DIP int value is promoted.
+    void setIntProp(u64 h, int prop, int v)
+    {
+        void* ctrl = u2h(h);
+        bool isProg = msgBool1(ctrl, "isKindOfClass:", cls("NSProgressIndicator")) != (i8)0;
+        bool isSlider = msgBool1(ctrl, "isKindOfClass:", cls("NSSlider")) != (i8)0;
+        if (prop == PROP_VALUE)
+        {
+            if (isProg || isSlider) msgSetDouble(ctrl, "setDoubleValue:", (double)v);
+        }
+        else if (prop == PROP_MAX)
+        {
+            if (isProg || isSlider) msgSetDouble(ctrl, "setMaxValue:", (double)v);
+        }
+    }
+
+    // Native default look (theme is applied to the window chrome in applyTheme).
+    void setAccent(u64 h, int fgColor, int bgColor) { }
+
+    // Text metrics in DIPs. A length-based estimate is enough: the layout pass in
+    // ui.cb never calls measureText today (the winui host uses the same stub).
+    Size measureText(const char* s, int fontId, int wrapWidthDip)
+    {
+        Size sz = default;
+        sz.w = (int)strlen((char*)s) + 1;
+        sz.h = 1;
+        return sz;
+    }
+
+    void requestLayout()
+    {
+        if (!_nReady) return;
+        layoutRoot(_nTree, 0, 0, _nW);
+        this.applyTree(_nTree, &_nCtx);
+    }
+
+    // Reconcile the Element tree to native controls: ensure a control per mappable
+    // node (create on first sight, reuse by key path), sync its props, collect its
+    // DIP frame, position everything, then destroy controls that left the tree.
+    void applyTree(Element tree, UiContext* ctx)
+    {
+        this.applying = true;
+
+        list<string> newKeys    = default;
+        list<u64>    newHandles = default;
+        list<int> fx = default; list<int> fy = default;
+        list<int> fw = default; list<int> fh = default;
+
+        this._applyNode(tree, keySegment(tree, 0), ctx,
+                        &newKeys, &newHandles, &fx, &fy, &fw, &fh);
+
+        // Destroy controls whose key path is no longer in the tree.
+        int i = 0;
+        while (i < this.liveKeys.count())
+        {
+            string k = this.liveKeys.get(i);
+            if (!listHasStr(&newKeys, k))
+            {
+                u64 h = ctx.nativeHandle(k);
+                this.destroyControl(h);
+                ctx.removeNativeHandle(k);
+            }
+            i++;
+        }
+
+        // Position all live controls (no batch API needed; AppKit coalesces the
+        // relayout on the next display cycle).
+        int n = newHandles.count();
+        int j = 0;
+        while (j < n)
+        {
+            int rx = fx.get(j); int ry = fy.get(j);
+            int rw = fw.get(j); int rh = fh.get(j);
+            Rect r = default;
+            r.x = rx; r.y = ry; r.w = rw; r.h = rh;
+            this.setFrame(newHandles.get(j), r);
+            j++;
+        }
+
+        // Replace the live sets with COPIES (clear + add, not a move-assign, which
+        // repeated per frame corrupted the heap on Win32 - avoid container move-into-field).
+        this.liveKeys.clear();
+        this.liveHandles.clear();
+        int m = 0;
+        while (m < newKeys.count())
+        {
+            this.liveKeys.add("" + newKeys.get(m));
+            this.liveHandles.add(newHandles.get(m));
+            m++;
+        }
+        this.applyTheme(ctx);
+        this.applying = false;
+    }
+
+    // Recursive worker: `path` is this node's key path. Mappable nodes get a control
+    // + synced props + a collected DIP frame; every node recurses into its children
+    // (containers contribute only geometry).
+    void _applyNode(Element node, string path, UiContext* ctx,
+                    list<string>* keys, list<u64>* handles,
+                    list<int>* fx, list<int>* fy, list<int>* fw, list<int>* fh)
+    {
+        if (nativeMappable(node.kind()))
+        {
+            u64 h = ctx.nativeHandle(path);
+            if (h == 0u)
+            {
+                h = this.createControl(node.kind(), (u64)this.contentView, path);
+                ctx.setNativeHandle(path, h);
+                // One-time seed of a TextArea's buffer (uncontrolled after; the
+                // native view owns the text, further pushes are explicit).
+                if (node.kind() == ELEM_TEXTAREA)
+                {
+                    TextArea* ta = node as TextArea;
+                    this.setText(h, ta.value.data());
+                }
+            }
+            this._syncProps(node, h);
+            Rect b = node.nodeBounds();
+            keys.add("" + path);
+            handles.add(h);
+            fx.add(b.x); fy.add(b.y); fw.add(b.w); fh.add(b.h);
+        }
+
+        list<Element>* kids = node.childList();
+        if (kids != nullptr)
+        {
+            int i = 0;
+            while (i < kids.count())
+            {
+                Element c = kids.get(i);
+                string cp = joinKeyPath(path, keySegment(c, i));
+                this._applyNode(c, cp, ctx, keys, handles, fx, fy, fw, fh);
+                i++;
+            }
+        }
+    }
+
+    // Push a node's current props onto its control (downcast per kind - the same
+    // structured access the reconciler uses in propsEqual).
+    void _syncProps(Element node, u64 h)
+    {
+        int k = node.kind();
+        if (k == ELEM_BUTTON)
+        {
+            Button* b = node as Button;
+            this.setText(h, b.title.data());
+            this.setBoolProp(h, PROP_ENABLED, !b.disabled);
+        }
+        else if (k == ELEM_TEXT)
+        {
+            Text* t = node as Text;
+            this.setText(h, t.text.data());
+        }
+        else if (k == ELEM_TEXTINPUT)
+        {
+            TextInput* ti = node as TextInput;
+            this.setText(h, ti.value.data());
+            this.setBoolProp(h, PROP_ENABLED, !ti.disabled);
+        }
+        else if (k == ELEM_CHECKBOX)
+        {
+            Checkbox* c = node as Checkbox;
+            this.setText(h, c.label.data());
+            this.setBoolProp(h, PROP_CHECKED, c.checked);
+            this.setBoolProp(h, PROP_ENABLED, !c.disabled);
+        }
+        else if (k == ELEM_PROGRESS)
+        {
+            ProgressBar* p = node as ProgressBar;
+            this.setIntProp(h, PROP_MAX, 100);
+            this.setIntProp(h, PROP_VALUE, p.value);
+        }
+        else if (k == ELEM_SLIDER)
+        {
+            Slider* s = node as Slider;
+            this.setIntProp(h, PROP_MAX, 100);
+            this.setIntProp(h, PROP_VALUE, s.value);
+            this.setBoolProp(h, PROP_ENABLED, !s.disabled);
+        }
+        else if (k == ELEM_TEXTAREA)
+        {
+            // Uncontrolled: never push text here (would clobber the buffer mid-edit);
+            // only sync enabled. Text is seeded once at creation and pushed
+            // explicitly via nativeSetControlText (file open).
+            TextArea* ta = node as TextArea;
+            this.setBoolProp(h, PROP_ENABLED, !ta.disabled);
+        }
+    }
+
+    // The key path bound to a control this frame, or "" if none (linear scan of the
+    // small live set - controls per window are few).
+    string keyForHandle(u64 h)
+    {
+        int i = 0;
+        while (i < this.liveHandles.count())
+        {
+            if (this.liveHandles.get(i) == h) return "" + this.liveKeys.get(i);
+            i++;
+        }
+        return "";
+    }
+
+    // Apply the app's Theme to the window chrome: dark vs aqua appearance. Called
+    // every frame from applyTree; cheap and idempotent. Control accent colors are
+    // left at the OS default (setAccent is a no-op), matching the Win32 host's
+    // monochrome-default behavior.
+    void applyTheme(UiContext* ctx)
+    {
+        bool isDark = themeIsDark(&ctx.theme);
+        this.dark = isDark;
+        if (this.window != nullptr)
+        {
+            void* apName = isDark ? nsStr("NSAppearanceNameDarkAqua") : nsStr("NSAppearanceNameAqua");
+            void* ap = msg1(cls("NSAppearance"), "appearanceNamed:", apName);
+            msg1(this.window, "setAppearance:", ap);
+        }
+    }
+};
+
+// A Theme is "dark" when its panel background is darker than mid-gray. A default
+// (monochrome, all-zero) theme is treated as light.
+bool themeIsDark(Theme* t)
+{
+    int c = t.panelBg;
+    if (c == 0) return false;
+    int r = (c >> 16) & 0xFF; int g = (c >> 8) & 0xFF; int b = c & 0xFF;
+    return (r + g + b) < 384;
+}
+
+// True if `want` is present in the key list.
+bool listHasStr(list<string>* xs, string want)
+{
+    int i = 0;
+    while (i < xs.count()) { if (xs.get(i) == want) return true; i++; }
+    return false;
+}
+
+// Find the live node whose key path equals `want`. `path` is `node`'s own path.
+Element findByKey(Element node, string path, string want)
+{
+    if (path == want) return node;
+    list<Element>* kids = node.childList();
+    if (kids != nullptr)
+    {
+        int i = 0;
+        while (i < kids.count())
+        {
+            Element c = kids.get(i);
+            string cp = joinKeyPath(path, keySegment(c, i));
+            Element r = findByKey(c, cp, want);
+            if (r != nullptr) return r;
+            i++;
+        }
+    }
+    return nullptr;
+}
+
+// Drain the dirty flag after a native event: re-render + reconcile, relayout, and
+// reconcile the tree to native controls. AppKit repaints the controls itself.
+void pumpNative()
+{
+    if (_nCtx.consumeDirty())
+    {
+        Element wip = _nApp.render(&_nCtx);
+        list<Patch> patches = default;
+        _nTree = reconcile(_nTree, wip, &patches);
+        layoutRoot(_nTree, 0, 0, _nW);
+        _nHost.applyTree(_nTree, &_nCtx);
+    }
+}
+
+// -- Native event routing (target/action + delegate -> element handler) --------
+void routeClick(void* ctrl)
+{
+    string key = _nHost.keyForHandle((u64)ctrl);
+    if (key.length() == 0) return;
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    if (e == nullptr) return;
+    Button* b = e as Button;
+    if (b != nullptr) { b.fireClick(); pumpNative(); return; }
+    Checkbox* c = e as Checkbox;
+    if (c != nullptr) { c.fireToggle(); pumpNative(); return; }
+}
+
+void routeEdit(void* ctrl)
+{
+    string key = _nHost.keyForHandle((u64)ctrl);
+    if (key.length() == 0) return;
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    if (e == nullptr) return;
+    TextInput* ti = e as TextInput;
+    if (ti != nullptr)
+    {
+        char* c = cStr(msg0(ctrl, "stringValue"));
+        string nv = c != nullptr ? (string)c : "";
+        ti.onChangeText(nv);
+        pumpNative();
+        return;
+    }
+    // A TextArea is uncontrolled: textDidChange is just a dirty NOTIFICATION; do
+    // not read / push the (potentially large) buffer here.
+    TextArea* ta = e as TextArea;
+    if (ta != nullptr)
+    {
+        ta.onChange();
+        pumpNative();
+    }
+}
+
+void routeSlider(void* ctrl)
+{
+    string key = _nHost.keyForHandle((u64)ctrl);
+    if (key.length() == 0) return;
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    if (e == nullptr) return;
+    Slider* s = e as Slider;
+    if (s == nullptr) return;
+    int pos = (int)msgGetDouble(ctrl, "doubleValue");
+    s.fireSet(pos);
+    pumpNative();
+}
+
+// Read the current text of the control at `keyPath` (owned string). Used to PULL a
+// TextArea's buffer on save. Returns "" if there is no such control.
+string nativeControlText(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return "";
+    void* ctrl = u2h(h);
+    void* pool = poolPush();
+    void* text = nullptr;
+    if (_isScroll(ctrl))
+    {
+        void* tv = msg0(ctrl, "documentView");
+        text = msg0(tv, "string");
+    }
+    else
+    {
+        text = msg0(ctrl, "stringValue");
+    }
+    char* c = text != nullptr ? cStr(text) : nullptr;
+    string s = c != nullptr ? (string)c : "";   // owned copy before the pool pops
+    poolPop(pool);
+    return s;
+}
+
+// Push text into the control at `keyPath` (file open / clear). Guards the reentrant
+// change notification so the push does not register as a user edit.
+void nativeSetControlText(string keyPath, string s)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    void* ctrl = u2h(h);
+    void* ns = _nsStrSafe(s);   // avoid a null NSString arg for an empty push
+    bool prev = _nHost.applying;
+    _nHost.applying = true;
+    if (_isScroll(ctrl))
+    {
+        void* tv = msg0(ctrl, "documentView");
+        msg1(tv, "setString:", ns);
+    }
+    else
+    {
+        msg1(ctrl, "setStringValue:", ns);
+    }
+    _nHost.applying = prev;
+}
+
+// -- Host-neutral driver API (selection / insertion / menu) -------------------
+// Same surface as the Win32 host; fedit uses these to stay platform-portable.
+
+// The NSTextView backing the control at `keyPath` (documentView of a scroll view),
+// or the control itself for a plain field.
+void* _textViewFor(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return nullptr;
+    void* ctrl = u2h(h);
+    if (_isScroll(ctrl)) return msg0(ctrl, "documentView");
+    return ctrl;
+}
+
+// Select [start, end) in the control and scroll it into view + focus it (mirror of
+// Win32 EM_SETSEL + EM_SCROLLCARET + SetFocus).
+void nativeSelect(string keyPath, int start, int end)
+{
+    void* tv = _textViewFor(keyPath);
+    if (tv == nullptr) return;
+    u64 len = end >= start ? (u64)(end - start) : 0u;
+    msgRange(tv, "setSelectedRange:", (u64)start, len);
+    msgRange(tv, "scrollRangeToVisible:", (u64)start, len);
+    void* win = msg0(tv, "window");
+    if (win == nullptr) win = _nHost.window;
+    if (win != nullptr) msg1(win, "makeFirstResponder:", tv);
+}
+
+// The selection start (NSRange location) of the control (mirror of EM_GETSEL selA).
+int nativeSelectionStart(string keyPath)
+{
+    void* tv = _textViewFor(keyPath);
+    if (tv == nullptr) return 0;
+    return (int)msgRangeLoc(tv, "selectedRange");
+}
+
+// Insert `s` at character `pos`, firing the change notification like a keystroke
+// (insertText:replacementRange: FIRES textDidChange:, mirror of EM_SETSEL +
+// EM_REPLACESEL).
+void nativeInsertTextAt(string keyPath, int pos, string s)
+{
+    void* tv = _textViewFor(keyPath);
+    if (tv == nullptr) return;
+    msgIdRange(tv, "insertText:replacementRange:", nsStr(s.data()), (u64)pos, 0u);
+}
+
+// Fire a menu command as if the user selected it (used by fedit's self-test).
+void nativeTestFireMenu(int cmd)
+{
+    routeMenu(cmd);
+}
+
+// Close the main window (bypasses the close guard - the caller already decided).
+// -close does not fire windowShouldClose:, matching Win32 DestroyWindow.
+void nativeCloseWindow()
+{
+    if (_nHost.window != nullptr) msg0(_nHost.window, "close");
+}
+
+// -- Objective-C callback IMPs (D5: one shared CfHostTarget carries them all) --
+// Plain non-capturing cflat functions; state flows through the host globals - no
+// Lambda crosses the C ABI.
+
+// isFlipped -> YES: the content view's origin is top-left, like Win32.
+i8 _isFlippedImp(void* self, void* cmd) { return (i8)1; }
+
+// applicationShouldTerminateAfterLastWindowClosed: -> NO. The host controls exit
+// itself (the main window's windowWillClose: stops the run loop) so runAppGuiNative
+// can delete the heap component after [NSApp run] returns (D9).
+i8 _shouldTerminateImp(void* self, void* cmd, void* app) { return (i8)0; }
+
+// A control fired its action: a slider routes by value, everything else (button /
+// checkbox) routes as a click.
+void _onActionImp(void* self, void* cmd, void* sender)
+{
+    if (!_nReady) return;
+    if (msgBool1(sender, "isKindOfClass:", cls("NSSlider")) != (i8)0) { routeSlider(sender); return; }
+    routeClick(sender);
+}
+
+// A menu item fired: its command id rides on the tag.
+void _onMenuImp(void* self, void* cmd, void* sender)
+{
+    i64 tag = msgGetI64(sender, "tag");
+    if (_nReady) routeMenu((int)tag);
+}
+
+// controlTextDidChange: (NSTextField edit). The notification object is the field.
+void _controlTextChangedImp(void* self, void* cmd, void* note)
+{
+    if (_nHost.applying || !_nReady) return;
+    void* field = msg0(note, "object");
+    routeEdit(field);
+}
+
+// textDidChange: (NSTextView edit). The object is the text view; route through its
+// enclosing scroll view (the live handle).
+void _textDidChangeImp(void* self, void* cmd, void* note)
+{
+    if (_nHost.applying || !_nReady) return;
+    void* tv = msg0(note, "object");
+    void* scroll = msg0(tv, "enclosingScrollView");
+    if (scroll == nullptr) scroll = tv;
+    routeEdit(scroll);
+}
+
+// windowDidResize: read the content view's size (D10 Plan A struct return) and
+// relayout at the new DIP client size.
+void _windowResizeImp(void* self, void* cmd, void* note)
+{
+    if (!_nReady) return;
+    void* win = msg0(note, "object");
+    void* cv = msg0(win, "contentView");
+    function<RectD(void*, void*)> ff = (function<RectD(void*, void*)>)__objcMsgSendPtr;
+    RectD r = ff(cv, sel("frame"));
+    int nw = (int)(r.w / (double)BASE_X);
+    int nh = (int)(r.h / (double)BASE_Y);
+    if (nw < 1) nw = 1;
+    if (nh < 1) nh = 1;
+    _nW = nw; _nH = nh;
+    buildNativeTree();
+}
+
+// windowShouldClose: the app's close guard vetoes (dirty-save prompt) before close.
+i8 _windowShouldCloseImp(void* self, void* cmd, void* sender)
+{
+    if (_hasCloseQuery) return _closeQuery() ? (i8)1 : (i8)0;
+    return (i8)1;
+}
+
+// windowWillClose: (main window only) stop the run loop so [NSApp run] returns and
+// runAppGuiNative can delete the heap component. stop: is deferred until the next
+// event, so post a dummy application-defined event to wake the loop.
+void _windowWillCloseImp(void* self, void* cmd, void* note)
+{
+    void* app = msg0(cls("NSApplication"), "sharedApplication");
+    msg1(app, "stop:", nullptr);
+    _postWakeEvent(app);
+}
+
+// Post a no-op NSApplicationDefined event so a pending stop: takes effect promptly
+// (nextEventMatchingMask would otherwise block until real input arrives).
+void _postWakeEvent(void* app)
+{
+    // otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:
+    //   subtype:data1:data2: - type/flags/windowNumber/context/subtype/data1/data2
+    // are integer/pointer args (x2..), location (NSPoint) is d0/d1, timestamp is d2.
+    function<void*(void*, void*, u64, double, double, u64, double, i64, void*, i16, i64, i64)> f =
+        (function<void*(void*, void*, u64, double, double, u64, double, i64, void*, i16, i64, i64)>)__objcMsgSendPtr;
+    void* ev = f(cls("NSEvent"), sel("otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:"),
+                 15u, 0.0, 0.0, 0u, 0.0, (i64)0, nullptr, (i16)0, (i64)0, (i64)0);
+    // postEvent:atStart: takes (id event, BOOL atStart).
+    if (ev != nullptr)
+    {
+        function<void*(void*, void*, void*, i8)> p = (function<void*(void*, void*, void*, i8)>)__objcMsgSendPtr;
+        p(app, sel("postEvent:atStart:"), ev, (i8)1);
+    }
+}
+
+// -- Menu bar + accelerators --------------------------------------------------
+bool strContains(string s, const char* sub)
+{
+    return strstr(s.data(), (char*)sub) != nullptr;
+}
+
+void menuReset()
+{
+    _menuTop.clear();
+    _menuItemTopIdx.clear();
+    _menuItemLabel.clear();
+    _menuItemCmd.clear();
+    _menuAccel.clear();
+}
+
+int menuAddTop(string title)
+{
+    _menuTop.add("" + title);
+    return _menuTop.count() - 1;
+}
+
+void menuAddItem(int top, string label, string accel, int cmd)
+{
+    _menuItemTopIdx.add(top);
+    _menuItemLabel.add("" + label);
+    _menuItemCmd.add(cmd);
+    _menuAccel.add("" + accel);
+}
+
+void menuAddSeparator(int top)
+{
+    _menuItemTopIdx.add(top);
+    _menuItemLabel.add("");
+    _menuItemCmd.add(0);
+    _menuAccel.add("");
+}
+
+// The accel key token (after the last '+'), or the whole string if there is no '+'.
+string _accelKeyToken(string a)
+{
+    int plus = -1; int i = 0; int n = (int)a.length();
+    while (i < n) { if (a.data()[i] == '+') plus = i; i++; }
+    if (plus >= 0) return substring(a, plus + 1, n - plus - 1);
+    return "" + a;
+}
+
+// The NSMenuItem key equivalent NSString for an accel: a lowercase letter, or the
+// Unicode function-key char for F1..F12 (NSF1FunctionKey = 0xF704) built directly
+// from the unichar via stringWithCharacters:length: (a hand-encoded UTF-8 PUA byte
+// sequence does not round-trip through stringWithUTF8String:), else [NSString string].
+void* _accelKeyEquivObj(string a)
+{
+    string k = _accelKeyToken(a);
+    int kn = (int)k.length();
+    if (kn == 1)
+    {
+        char c = k.data()[0];
+        char[2] b;
+        b[0] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+        b[1] = '\0';
+        return nsStr(b);
+    }
+    if (kn >= 2 && (k.data()[0] == 'F' || k.data()[0] == 'f'))
+    {
+        int num = atoi(k.data() + 1);
+        if (num >= 1 && num <= 12)
+        {
+            u16 uc = (u16)(0xF704 + (num - 1));
+            return msg2(cls("NSString"), "stringWithCharacters:length:", (void*)&uc, (void*)1);
+        }
+    }
+    return msg0(cls("NSString"), "string");
+}
+
+// The key-equivalent modifier mask for an accel. F-keys carry no modifier of their
+// own (D7); Ctrl maps to Cmd.
+int _accelMask(string a)
+{
+    string k = _accelKeyToken(a);
+    if (k.length() >= 2 && (k.data()[0] == 'F' || k.data()[0] == 'f')) return 0;
+    int m = 0;
+    if (strContains(a, "Ctrl"))  m = m | MOD_CMD;
+    if (strContains(a, "Shift")) m = m | MOD_SHIFT;
+    if (strContains(a, "Alt"))   m = m | MOD_ALT;
+    return m;
+}
+
+// Realize the declared menu into the application main menu. Slot 0 is a leading app
+// menu with Quit (Cmd+Q) routed through the close guard via performClose: on the
+// main window; the rest mirror the declared top-level menus + items.
+void buildMenuBar()
+{
+    void* app = msg0(cls("NSApplication"), "sharedApplication");
+    void* mainMenu = msg0(msg0(cls("NSMenu"), "alloc"), "init");
+
+    // App menu (slot 0): the system shows the process name; Quit -> performClose:.
+    void* appItem = msg0(msg0(cls("NSMenuItem"), "alloc"), "init");
+    msg1(mainMenu, "addItem:", appItem);
+    void* appMenu = msg0(msg0(cls("NSMenu"), "alloc"), "init");
+    msg1(appItem, "setSubmenu:", appMenu);
+    void* quit = msg3(msg0(cls("NSMenuItem"), "alloc"), "initWithTitle:action:keyEquivalent:",
+                      nsStr("Quit"), sel("performClose:"), nsStr("q"));
+    msg1(quit, "setTarget:", _nHost.window);
+    msgInt(quit, "setKeyEquivalentModifierMask:", (i64)MOD_CMD);
+    msg1(appMenu, "addItem:", quit);
+
+    int t = 0;
+    while (t < _menuTop.count())
+    {
+        void* topItem = msg0(msg0(cls("NSMenuItem"), "alloc"), "init");
+        msg1(topItem, "setTitle:", nsStr(_menuTop.get(t).data()));
+        msg1(mainMenu, "addItem:", topItem);
+        void* sub = msg1(msg0(cls("NSMenu"), "alloc"), "initWithTitle:", nsStr(_menuTop.get(t).data()));
+        msg1(topItem, "setSubmenu:", sub);
+
+        int i = 0;
+        while (i < _menuItemTopIdx.count())
+        {
+            if (_menuItemTopIdx.get(i) == t)
+            {
+                if (_menuItemLabel.get(i).length() == 0)
+                {
+                    msg1(sub, "addItem:", msg0(cls("NSMenuItem"), "separatorItem"));
+                }
+                else
+                {
+                    string accel = _menuAccel.get(i);
+                    void* keqObj = _accelKeyEquivObj(accel);
+                    void* item = msg3(msg0(cls("NSMenuItem"), "alloc"), "initWithTitle:action:keyEquivalent:",
+                                      _nsStrSafe(_menuItemLabel.get(i)), sel("onMenu:"), keqObj);
+                    msg1(item, "setTarget:", _nHost.target);
+                    msgInt(item, "setTag:", (i64)_menuItemCmd.get(i));
+                    if (accel.length() > 0)
+                        msgInt(item, "setKeyEquivalentModifierMask:", (i64)_accelMask(accel));
+                    msg1(sub, "addItem:", item);
+                }
+            }
+            i++;
+        }
+        t++;
+    }
+
+    msg1(app, "setMainMenu:", mainMenu);
+}
+
+// A menu command / accelerator fired: dispatch it to the app's handler, then pump.
+void routeMenu(int id)
+{
+    if (id <= 0) return;
+    _menuHandler(id);
+    pumpNative();
+}
+
+// -- File dialogs + alerts ----------------------------------------------------
+string nativeOpenFile()
+{
+    void* panel = msg0(cls("NSOpenPanel"), "openPanel");
+    msgBool(panel, "setCanChooseFiles:", true);
+    msgBool(panel, "setCanChooseDirectories:", false);
+    msgBool(panel, "setAllowsMultipleSelection:", false);
+    i64 r = msgGetI64(panel, "runModal");
+    if (r != (i64)1) return "";                 // NSModalResponseOK = 1
+    void* url = msg0(panel, "URL");
+    if (url == nullptr) return "";
+    char* c = cStr(msg0(url, "path"));
+    return c != nullptr ? (string)c : "";
+}
+
+string nativeSaveFile()
+{
+    void* panel = msg0(cls("NSSavePanel"), "savePanel");
+    i64 r = msgGetI64(panel, "runModal");
+    if (r != (i64)1) return "";
+    void* url = msg0(panel, "URL");
+    if (url == nullptr) return "";
+    char* c = cStr(msg0(url, "path"));
+    return c != nullptr ? (string)c : "";
+}
+
+// Modal confirm with Yes/No/Cancel. Returns 1 = Yes, 0 = No, -1 = Cancel. NSAlert
+// button responses are 1000/1001/1002 in add order.
+int nativeConfirm(string title, string text)
+{
+    void* alert = msg0(msg0(cls("NSAlert"), "alloc"), "init");
+    msg1(alert, "setMessageText:", nsStr(title.data()));
+    msg1(alert, "setInformativeText:", nsStr(text.data()));
+    msg1(alert, "addButtonWithTitle:", nsStr("Yes"));
+    msg1(alert, "addButtonWithTitle:", nsStr("No"));
+    msg1(alert, "addButtonWithTitle:", nsStr("Cancel"));
+    i64 r = msgGetI64(alert, "runModal");
+    msg0(alert, "release");
+    if (r == (i64)1000) return 1;
+    if (r == (i64)1001) return 0;
+    return -1;
+}
+
+void nativeInfo(string title, string text)
+{
+    void* alert = msg0(msg0(cls("NSAlert"), "alloc"), "init");
+    msg1(alert, "setMessageText:", nsStr(title.data()));
+    msg1(alert, "setInformativeText:", nsStr(text.data()));
+    msg1(alert, "addButtonWithTitle:", nsStr("OK"));
+    msgGetI64(alert, "runModal");
+    msg0(alert, "release");
+}
+
+// -- Secondary window (Help > About) ------------------------------------------
+// A genuinely separate top-level window with read-only content, sharing the app's
+// run loop. It has NO window delegate, so closing it does NOT stop the app (only the
+// main window's windowWillClose: does).
+string _normalizeNewlines(string s)
+{
+    string out = "";
+    int i = 0; int n = (int)s.length();
+    while (i < n)
+    {
+        char c = s.data()[i];
+        if (c == '\r')
+        {
+            if (i + 1 < n && s.data()[i + 1] == '\n') { i++; }   // collapse CRLF -> LF
+            out = out + "\n";
+        }
+        else
+        {
+            char[2] cb; cb[0] = c; cb[1] = '\0';
+            out = out + cb;
+        }
+        i++;
+    }
+    return out;
+}
+
+void showSecondaryWindow(string title, string message)
+{
+    string norm = _normalizeNewlines(message);
+    // styleMask 7 = Titled|Closable|Miniaturizable (no resize), backing 2 = Buffered.
+    void* win = msgRect3i(msg0(cls("NSWindow"), "alloc"),
+                          "initWithContentRect:styleMask:backing:defer:",
+                          0.0, 0.0, 360.0, 200.0, 7u, 2u, false);
+    msg1(win, "setTitle:", nsStr(title.data()));
+    msgBool(win, "setReleasedWhenClosed:", true);
+
+    void* cv = msgRect(msg0(cls("CfFlippedView"), "alloc"), "initWithFrame:", 0.0, 0.0, 360.0, 200.0);
+    msg1(win, "setContentView:", cv);
+
+    void* label = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 16.0, 16.0, 328.0, 168.0);
+    msgBool(label, "setBezeled:", false);
+    msgBool(label, "setDrawsBackground:", false);
+    msgBool(label, "setEditable:", false);
+    msgBool(label, "setSelectable:", false);
+    void* cell = msg0(label, "cell");
+    msgBool(cell, "setWraps:", true);
+    msg1(label, "setStringValue:", nsStr(norm.data()));
+    msg1(cv, "addSubview:", label);
+
+    if (_nHost.dark)
+    {
+        void* ap = msg1(cls("NSAppearance"), "appearanceNamed:", nsStr("NSAppearanceNameDarkAqua"));
+        msg1(win, "setAppearance:", ap);
+    }
+    msg1(win, "center", nullptr);
+    msg1(win, "makeKeyAndOrderFront:", nullptr);
+}
+
+// -- Bring-up -----------------------------------------------------------------
+// Register the objc classes the host needs (idempotent - newClass returns null for
+// an already-registered name). One CfHostTarget instance carries every callback.
+bool _hostClassesReg = false;
+void registerHostClasses()
+{
+    if (_hostClassesReg) return;
+    _hostClassesReg = true;
+
+    void* fv = newClass("CfFlippedView", "NSView");
+    if (fv != nullptr)
+    {
+        function<i8(void*, void*)> impF = _isFlippedImp;
+        addMethodBool0(fv, "isFlipped", impF);
+        finishClass(fv);
+    }
+
+    void* tg = newClass("CfHostTarget", "NSObject");
+    if (tg != nullptr)
+    {
+        function<void(void*, void*, void*)> a  = _onActionImp;
+        function<void(void*, void*, void*)> m  = _onMenuImp;
+        function<void(void*, void*, void*)> ct = _controlTextChangedImp;
+        function<void(void*, void*, void*)> td = _textDidChangeImp;
+        function<void(void*, void*, void*)> wr = _windowResizeImp;
+        function<void(void*, void*, void*)> ww = _windowWillCloseImp;
+        function<i8(void*, void*, void*)>   wc = _windowShouldCloseImp;
+        addMethod0(tg, "onAction:", a);
+        addMethod0(tg, "onMenu:", m);
+        addMethod0(tg, "controlTextDidChange:", ct);
+        addMethod0(tg, "textDidChange:", td);
+        addMethod0(tg, "windowDidResize:", wr);
+        addMethod0(tg, "windowWillClose:", ww);
+        addMethodBool(tg, "windowShouldClose:", wc);
+        finishClass(tg);
+    }
+
+    void* ad = newClass("CfHostAppDelegate", "NSObject");
+    if (ad != nullptr)
+    {
+        function<i8(void*, void*, void*)> t = _shouldTerminateImp;
+        addMethodBool(ad, "applicationShouldTerminateAfterLastWindowClosed:", t);
+        finishClass(ad);
+    }
+}
+
+// Register the classes + create the top-level window. `show` controls whether it is
+// made visible (the self-test creates it hidden). Sets up the host globals.
+void* createNativeWindow(const char* title, bool show)
+{
+    if (!cocoaInit()) { printf("failed to load AppKit\n"); return nullptr; }
+    void* app = msg0(cls("NSApplication"), "sharedApplication");
+    msgInt(app, "setActivationPolicy:", 0);   // NSApplicationActivationPolicyRegular
+
+    registerHostClasses();
+    void* del = msg0(msg0(cls("CfHostAppDelegate"), "alloc"), "init");
+    msg1(app, "setDelegate:", del);
+    _nHost.appDelegate = del;
+
+    // One shared target: control action, menu action, and window delegate.
+    _nHost.target = msg0(msg0(cls("CfHostTarget"), "alloc"), "init");
+
+    // Content 760x560 pt -> _nW=95, _nH=21 DIP. styleMask 15 = Titled|Closable|
+    // Miniaturizable|Resizable, backing 2 = Buffered.
+    void* win = msgRect3i(msg0(cls("NSWindow"), "alloc"),
+                          "initWithContentRect:styleMask:backing:defer:",
+                          0.0, 0.0, 760.0, 560.0, 15u, 2u, false);
+    msg1(win, "setTitle:", nsStr((char*)title));
+    msgBool(win, "setReleasedWhenClosed:", false);
+    _nHost.window = win;
+    _nW = 95; _nH = 21;
+
+    void* cv = msgRect(msg0(cls("CfFlippedView"), "alloc"), "initWithFrame:", 0.0, 0.0, 760.0, 560.0);
+    msg1(win, "setContentView:", cv);
+    _nHost.contentView = cv;
+
+    msg1(win, "setDelegate:", _nHost.target);
+    buildMenuBar();
+
+    if (show)
+    {
+        msg1(win, "center", nullptr);
+        msg1(win, "makeKeyAndOrderFront:", nullptr);
+        msgBool(app, "activateIgnoringOtherApps:", true);
+    }
+    return win;
+}
+
+// Free the old tree (if any) and render + reconcile-to-native a fresh one at the
+// current client size. Controls are reused by key path.
+void buildNativeTree()
+{
+    if (_nReady) { deleteTree(_nTree); _nReady = false; }
+    _nTree = _nApp.render(&_nCtx);
+    layoutRoot(_nTree, 0, 0, _nW);
+    _nHost.applyTree(_nTree, &_nCtx);
+    _nReady = true;
+}
+
+// Register the classes, create + show the window, and run the AppKit event loop
+// until the main window closes (windowWillClose: -> [NSApp stop:]).
+//
+// The component MUST be heap-allocated (`new`): the host stashes it in `_nApp` and
+// `delete`s it after the loop, so it has to outlive this call and be a heap object.
+int runAppGuiNative(Component app, const char* title)
+{
+    _nApp = app;
+    if (!cocoaInit()) { printf("failed to load AppKit\n"); return 1; }
+    void* pool = poolPush();
+    void* win = createNativeWindow(title, true);
+    if (win == nullptr) { poolPop(pool); return 1; }
+    if (!_nReady) buildNativeTree();
+
+    void* nsapp = msg0(cls("NSApplication"), "sharedApplication");
+    msg0(nsapp, "run");
+
+    poolPop(pool);
+    delete _nApp;
+    _nApp = nullptr;
+    return 0;
+}
+
+// Fully release all global host + context state - for the headless self-tests, so
+// --heap-audit sees no cflat residue (globals are not destructed at process exit,
+// and list/dictionary clear() keeps its capacity, so each backing is moved into a
+// scoped local whose destructor frees it). ObjC objects live on the objc heap (not
+// cflat malloc), so closing the window is enough for the audit.
+void nativeTeardownForTest()
+{
+    if (_nReady) { deleteTree(_nTree); _nReady = false; }
+    if (_nApp != nullptr) { delete _nApp; _nApp = nullptr; }
+    if (_nHost.window != nullptr) { msg0(_nHost.window, "close"); _nHost.window = nullptr; }
+    _nHost.contentView = nullptr;
+    _nHost.target = nullptr;
+    _nHost.appDelegate = nullptr;
+    { dictionary<string, u64> d = move _nCtx.nativeByKey; }
+    { list<string> a1 = move _nHost.liveKeys; }
+    { list<u64>    a2 = move _nHost.liveHandles; }
+    { list<string> a3 = move _menuTop; }
+    { list<int>    a4 = move _menuItemTopIdx; }
+    { list<string> a5 = move _menuItemLabel; }
+    { list<int>    a6 = move _menuItemCmd; }
+    { list<string> a7 = move _menuAccel; }
+    { Lambda<void(int)> a8 = move _menuHandler; }
+    { Lambda<bool()>    a9 = move _closeQuery; }
+    _hasCloseQuery = false;
+    _nCtx.blur();
+}

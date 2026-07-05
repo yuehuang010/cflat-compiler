@@ -1,0 +1,14 @@
+// native_host.cb - the platform import shim for the CFlat UI NativeHost backend.
+//
+// An app that wants "real OS controls" imports THIS file instead of a specific
+// backend; the compile-time platform switch selects the Win32 host on Windows and
+// the AppKit (Cocoa) host on macOS. Both expose the identical public surface
+// (runAppGuiNative, buildNativeTree, menu*, native* dialogs, the driver API, the
+// _nHost/_nApp/_nCtx globals), so a single app source compiles against either.
+//
+// Precedent for a file-scope `if const` import shim: cflat/core/os.cb.
+if const (__MACOS__) {
+    import "cocoa_native_host.cb";
+} else {
+    import "win32_native_host.cb";
+}

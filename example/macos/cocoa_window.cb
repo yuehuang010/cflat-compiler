@@ -1,0 +1,82 @@
+// cocoa_window.cb - a native Cocoa GUI app written in CFlat: a window with a
+// label, a text field, a "Click me" counter button, and a "Quit" button.
+//
+// This is the macOS counterpart of example/windows/win_red_button.cb. Instead
+// of importing <windows.h> and linking user32.lib, it drives AppKit through the
+// Objective-C runtime via the cocoa.cb bridge (dlopen/dlsym + typed
+// objc_msgSend casts) - no SDK, no Xcode, no framework link flags needed.
+//
+// Build & run (from the repo root, on an Apple Silicon Mac):
+//   x64/Release/cflat example/macos/cocoa_window.cb -o out/cocoa_window
+//   ./out/cocoa_window
+//
+// Headless self-test (no window shown; used to validate the bridge in CI):
+//   ./out/cocoa_window --selftest
+//
+// Click "Click me" to bump the counter shown in the label (the greeting uses
+// whatever is typed in the text field), and "Quit" or the close box to exit.
+import "cocoa.cb";
+
+int   gClicks  = 0;
+void* gLabel   = default;
+void* gNameBox = default;
+
+// Target/action callback: Cocoa calls this CFlat function when the counter
+// button is clicked - the analog of handling WM_COMMAND in a WndProc.
+void onClick(void* self, void* cmd, void* sender)
+{
+    gClicks = gClicks + 1;
+    string who = getText(gNameBox);
+    string msg = "Hello " + who + " - clicks: " + gClicks.toString();
+    setText(gLabel, msg.data());
+}
+
+// Quit button action: [NSApp terminate:nil].
+void onQuit(void* self, void* cmd, void* sender)
+{
+    msg1(msg0(cls("NSApplication"), "sharedApplication"), "terminate:", nullptr);
+}
+
+extern int main(int argc, char** argv)
+{
+    if (!cocoaInit())
+    {
+        printf("failed to load AppKit\n");
+        return 1;
+    }
+
+    bool selfTest = argc > 1 && strcmp(argv[1], "--selftest") == 0;
+
+    void* pool = poolPush();
+    void* app = cocoaApp();
+    void* win = createWindow("CFlat on macOS", 200.0, 200.0, 380.0, 160.0);
+
+    // Cocoa origin is the bottom-left of the content view.
+    gLabel   = createLabel(win, "Type a name, then click the button.", 20.0, 110.0, 340.0, 24.0);
+    gNameBox = createTextField(win, "world", 20.0, 72.0, 340.0, 26.0);
+
+    void* target = makeTarget("CfClickTarget", "onClick:", onClick);
+    createButton(win, "Click me", 20.0, 20.0, 120.0, 32.0, target, "onClick:");
+
+    void* quitTarget = makeTarget("CfQuitTarget", "onQuit:", onQuit);
+    createButton(win, "Quit", 240.0, 20.0, 120.0, 32.0, quitTarget, "onQuit:");
+
+    if (selfTest)
+    {
+        // Fire the button action directly (no event loop, no window shown) and
+        // verify the callback updated the label through the objc round trip.
+        msg1(target, "onClick:", nullptr);
+        msg1(target, "onClick:", nullptr);
+        char* shown = getText(gLabel);
+        printf("selftest label: %s\n", shown);
+        bool ok = gClicks == 2 && strstr(shown, "clicks: 2") != nullptr;
+        msg1(win, "close", nullptr);
+        poolPop(pool);
+        printf(ok ? "PASS\n" : "FAIL\n");
+        return ok ? 0 : 1;
+    }
+
+    runApp(app, win);
+    poolPop(pool);
+    return 0;
+}

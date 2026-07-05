@@ -816,6 +816,48 @@ void nativeCloseWindow()
     if (_nHost.window != nullptr) DestroyWindow(_nHost.window);
 }
 
+// -- Host-neutral driver API (selection / insertion / menu) -------------------
+// Same surface as the Cocoa host; fedit uses these to stay platform-portable.
+
+// Select [start, end) in the EDIT control, scroll the caret into view, and focus it.
+void nativeSelect(string keyPath, int start, int end)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    void* ctrl = u2h(h);
+    SendMessageA(ctrl, (u32)EM_SETSEL, (u64)start, (i64)end);
+    SendMessageA(ctrl, (u32)EM_SCROLLCARET, 0u, (i64)0);
+    SetFocus(ctrl);
+}
+
+// The selection start (EM_GETSEL selA) of the EDIT control at `keyPath`.
+int nativeSelectionStart(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0;
+    void* ctrl = u2h(h);
+    u32 selA = 0u; u32 selB = 0u;
+    SendMessageA(ctrl, (u32)EM_GETSEL, (u64)&selA, (i64)&selB);
+    return (int)selA;
+}
+
+// Insert `s` at character `pos`, firing EN_CHANGE like a keystroke (EM_SETSEL +
+// EM_REPLACESEL).
+void nativeInsertTextAt(string keyPath, int pos, string s)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    void* ctrl = u2h(h);
+    SendMessageA(ctrl, (u32)EM_SETSEL, (u64)pos, (i64)pos);
+    SendMessageA(ctrl, (u32)EM_REPLACESEL, 1u, (i64)s.data());
+}
+
+// Fire a menu command as if the user selected it (used by fedit's self-test).
+void nativeTestFireMenu(int cmd)
+{
+    routeMenu(cmd);
+}
+
 // Fully release all global host + context state - for the headless self-tests, so
 // --heap-audit sees no residue (globals are not destructed at process exit, and
 // list/dictionary clear() keeps its capacity, so each backing is moved into a

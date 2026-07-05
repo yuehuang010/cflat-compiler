@@ -1,0 +1,331 @@
+// cocoa.cb - a minimal Objective-C / AppKit bridge for CFlat on macOS.
+//
+// This is a library file (no main); sibling examples import it:
+//   import "cocoa.cb";
+//
+// Why dlopen/dlsym instead of `import "AppKit.h"` + framework linking:
+//  1. cflat's Mach-O link is SDK-free (harvested libSystem.tbd) and has no
+//     -framework support yet, so AppKit cannot be linked statically. dlopen
+//     of the framework binary needs no link-time reference at all.
+//  2. On arm64 objc_msgSend MUST be called through a function pointer cast to
+//     the exact per-call signature (Apple removed objc_msgSend_stret etc.),
+//     so typed `function<...>` casts are the ABI-correct way to call it anyway.
+//
+// The result is fully self-contained: no Xcode, no SDK, no extra link flags.
+//
+// Layers:
+//   low level  - cocoaInit, cls, sel, msg0..msg3, msgInt, msgBool, msgRect,
+//                nsStr, cStr, newClass/addMethod0/finishClass, pool push/pop
+//   controls   - cocoaApp, createWindow, createLabel, createButton,
+//                createTextField, setText/getText, runApp
+//
+// Coordinates are Cocoa-style: origin at the BOTTOM-left of the window.
+
+extern void* dlopen(const char* path, int mode);
+extern void* dlsym(void* handle, const char* name);
+
+// Cached Objective-C runtime entry points, resolved once by cocoaInit().
+void* __appKitHandle = default;
+void* __objcMsgSendPtr = default;
+function<void*(char*)> __objcGetClass = default;
+function<void*(char*)> __selRegisterName = default;
+function<void*(void*, char*, u64)> __allocClassPair = default;
+function<void(void*)> __registerClassPair = default;
+function<i8(void*, void*, void*, char*)> __classAddMethod = default;
+function<void*()> __poolPush = default;
+function<void(void*)> __poolPop = default;
+
+// Loads AppKit (which pulls in libobjc, Foundation, CoreGraphics as
+// dependencies) and resolves the runtime entry points through its handle.
+bool cocoaInit()
+{
+    if (__appKitHandle != nullptr) return true;
+    __appKitHandle = dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", 2);
+    if (__appKitHandle == nullptr) return false;
+
+    __objcMsgSendPtr   = dlsym(__appKitHandle, "objc_msgSend");
+    __objcGetClass     = (function<void*(char*)>)dlsym(__appKitHandle, "objc_getClass");
+    __selRegisterName  = (function<void*(char*)>)dlsym(__appKitHandle, "sel_registerName");
+    __allocClassPair   = (function<void*(void*, char*, u64)>)dlsym(__appKitHandle, "objc_allocateClassPair");
+    __registerClassPair = (function<void(void*)>)dlsym(__appKitHandle, "objc_registerClassPair");
+    __classAddMethod   = (function<i8(void*, void*, void*, char*)>)dlsym(__appKitHandle, "class_addMethod");
+    __poolPush         = (function<void*()>)dlsym(__appKitHandle, "objc_autoreleasePoolPush");
+    __poolPop          = (function<void(void*)>)dlsym(__appKitHandle, "objc_autoreleasePoolPop");
+    return __objcMsgSendPtr != nullptr && __objcGetClass != nullptr;
+}
+
+void* cls(char* name) { return __objcGetClass(name); }
+void* sel(char* name) { return __selRegisterName(name); }
+
+void* poolPush() { return __poolPush(); }
+void  poolPop(void* pool) { __poolPop(pool); }
+
+// objc_msgSend, cast per signature. [obj selector] with 0..3 object args.
+void* msg0(void* obj, char* selName)
+{
+    function<void*(void*, void*)> f = (function<void*(void*, void*)>)__objcMsgSendPtr;
+    return f(obj, sel(selName));
+}
+
+void* msg1(void* obj, char* selName, void* a)
+{
+    function<void*(void*, void*, void*)> f = (function<void*(void*, void*, void*)>)__objcMsgSendPtr;
+    return f(obj, sel(selName), a);
+}
+
+void* msg2(void* obj, char* selName, void* a, void* b)
+{
+    function<void*(void*, void*, void*, void*)> f = (function<void*(void*, void*, void*, void*)>)__objcMsgSendPtr;
+    return f(obj, sel(selName), a, b);
+}
+
+void* msg3(void* obj, char* selName, void* a, void* b, void* c)
+{
+    function<void*(void*, void*, void*, void*, void*)> f =
+        (function<void*(void*, void*, void*, void*, void*)>)__objcMsgSendPtr;
+    return f(obj, sel(selName), a, b, c);
+}
+
+// [obj selector:(NSInteger)v] - e.g. setActivationPolicy:, setBezelStyle:.
+void* msgInt(void* obj, char* selName, i64 v)
+{
+    function<void*(void*, void*, i64)> f = (function<void*(void*, void*, i64)>)__objcMsgSendPtr;
+    return f(obj, sel(selName), v);
+}
+
+// [obj selector:(BOOL)v] - e.g. setEditable:, activateIgnoringOtherApps:.
+void* msgBool(void* obj, char* selName, bool v)
+{
+    function<void*(void*, void*, i8)> f = (function<void*(void*, void*, i8)>)__objcMsgSendPtr;
+    return f(obj, sel(selName), v ? (i8)1 : (i8)0);
+}
+
+// [obj selector:(NSRect)r]. On arm64 an NSRect (4 doubles) is a homogeneous
+// float aggregate passed in d0-d3 - the same registers as 4 separate double
+// args - so a plain-doubles signature through msgSend is ABI-identical.
+void* msgRect(void* obj, char* selName, double x, double y, double w, double h)
+{
+    function<void*(void*, void*, double, double, double, double)> f =
+        (function<void*(void*, void*, double, double, double, double)>)__objcMsgSendPtr;
+    return f(obj, sel(selName), x, y, w, h);
+}
+
+// initWithContentRect:styleMask:backing:defer: - NSRect in d0-d3, then the
+// integer args land in x2/x3/x4 exactly as the real signature expects.
+void* msgRect3i(void* obj, char* selName, double x, double y, double w, double h,
+                u64 styleMask, u64 backing, bool deferFlag)
+{
+    function<void*(void*, void*, double, double, double, double, u64, u64, i8)> f =
+        (function<void*(void*, void*, double, double, double, double, u64, u64, i8)>)__objcMsgSendPtr;
+    return f(obj, sel(selName), x, y, w, h, styleMask, backing, deferFlag ? (i8)1 : (i8)0);
+}
+
+// [obj selector] returning char* - e.g. UTF8String.
+char* msgCStr(void* obj, char* selName)
+{
+    function<char*(void*, void*)> f = (function<char*(void*, void*)>)__objcMsgSendPtr;
+    return f(obj, sel(selName));
+}
+
+// --- Additional typed msgSend casts (used by the AppKit NativeHost) ----------
+// [obj selector:(double)v] - e.g. setDoubleValue:, setMinValue:. One double lands
+// in d0 exactly as the real signature expects.
+void* msgSetDouble(void* obj, char* selName, double v)
+{
+    function<void*(void*, void*, double)> f =
+        (function<void*(void*, void*, double)>)__objcMsgSendPtr;
+    return f(obj, sel(selName), v);
+}
+
+// [obj selector] returning double - e.g. doubleValue (NSSlider/NSNumber). The
+// result comes back in d0, so a double-returning cast reads it directly.
+double msgGetDouble(void* obj, char* selName)
+{
+    function<double(void*, void*)> f = (function<double(void*, void*)>)__objcMsgSendPtr;
+    return f(obj, sel(selName));
+}
+
+// [obj selector] returning NSInteger - e.g. tag, state, runModal. Returned in x0.
+i64 msgGetI64(void* obj, char* selName)
+{
+    function<i64(void*, void*)> f = (function<i64(void*, void*)>)__objcMsgSendPtr;
+    return f(obj, sel(selName));
+}
+
+// [obj selector:(id)arg] returning BOOL - e.g. isKindOfClass:. Result in w0.
+i8 msgBool1(void* obj, char* selName, void* a)
+{
+    function<i8(void*, void*, void*)> f = (function<i8(void*, void*, void*)>)__objcMsgSendPtr;
+    return f(obj, sel(selName), a);
+}
+
+// [obj selector:(NSRange){loc,len}] - an NSRange arg is two NSUInteger, passed in
+// two integer registers (x2/x3), ABI-identical to two u64 args.
+void* msgRange(void* obj, char* selName, u64 loc, u64 len)
+{
+    function<void*(void*, void*, u64, u64)> f =
+        (function<void*(void*, void*, u64, u64)>)__objcMsgSendPtr;
+    return f(obj, sel(selName), loc, len);
+}
+
+// [obj selector:(id)arg range:(NSRange){loc,len}] - insertText:replacementRange:.
+// id in x2, then the NSRange in x3/x4.
+void* msgIdRange(void* obj, char* selName, void* a, u64 loc, u64 len)
+{
+    function<void*(void*, void*, void*, u64, u64)> f =
+        (function<void*(void*, void*, void*, u64, u64)>)__objcMsgSendPtr;
+    return f(obj, sel(selName), a, loc, len);
+}
+
+// [obj selector] returning NSRange - e.g. selectedRange. An NSRange (two
+// NSUInteger) is returned in x0/x1; reading only x0 (the location) via a u64 cast
+// is ABI-legal and ignores the length in x1.
+u64 msgRangeLoc(void* obj, char* selName)
+{
+    function<u64(void*, void*)> f = (function<u64(void*, void*)>)__objcMsgSendPtr;
+    return f(obj, sel(selName));
+}
+
+// Adds -(BOOL)sel implemented by a CFlat function (no id arg) - e.g. isFlipped.
+// Encoding "c@:" = BOOL(self,_cmd).
+bool addMethodBool0(void* klass, char* selName, function<i8(void*, void*)> imp)
+{
+    return __classAddMethod(klass, sel(selName), (void*)imp, "c@:") != (i8)0;
+}
+
+// C string -> autoreleased NSString, and back.
+void* nsStr(char* s) { return msg1(cls("NSString"), "stringWithUTF8String:", (void*)s); }
+char* cStr(void* nsString) { return msgCStr(nsString, "UTF8String"); }
+
+// Runtime class registration - this is how CFlat code receives target/action
+// callbacks and delegate messages. Type encodings: "v@:@" = void(self,_cmd,id),
+// "c@:@" = BOOL(self,_cmd,id).
+void* newClass(char* name, char* superName)
+{
+    // objc_allocateClassPair returns null for an already-registered name; check
+    // first so a second bring-up in the same process returns cleanly (callers
+    // guard on null and skip re-adding methods).
+    if (cls(name) != nullptr) return nullptr;
+    return __allocClassPair(cls(superName), name, 0u);
+}
+
+// Adds -(void)sel:(id)arg implemented by a CFlat function.
+bool addMethod0(void* klass, char* selName, function<void(void*, void*, void*)> imp)
+{
+    return __classAddMethod(klass, sel(selName), (void*)imp, "v@:@") != (i8)0;
+}
+
+// Adds -(BOOL)sel:(id)arg implemented by a CFlat function.
+bool addMethodBool(void* klass, char* selName, function<i8(void*, void*, void*)> imp)
+{
+    return __classAddMethod(klass, sel(selName), (void*)imp, "c@:@") != (i8)0;
+}
+
+void finishClass(void* klass) { __registerClassPair(klass); }
+
+// Registers a one-method target class and returns an instance of it - the
+// Cocoa equivalent of a Win32 WndProc for a single control action.
+void* makeTarget(char* className, char* actionSel, function<void(void*, void*, void*)> imp)
+{
+    void* klass = newClass(className, "NSObject");
+    if (klass == nullptr) return nullptr;
+    addMethod0(klass, actionSel, imp);
+    finishClass(klass);
+    return msg0(msg0(klass, "alloc"), "init");
+}
+
+// ---------------------------------------------------------------------------
+// Controls layer - small wrappers shaped like Win32 CreateWindow calls.
+// ---------------------------------------------------------------------------
+
+// Delegate IMP: quit the app when the last window closes.
+i8 __lastWindowClosed(void* self, void* cmd, void* app)
+{
+    return (i8)1;
+}
+
+// sharedApplication with a Regular activation policy (Dock icon + key focus)
+// and a delegate that terminates after the last window closes.
+void* cocoaApp()
+{
+    void* app = msg0(cls("NSApplication"), "sharedApplication");
+    msgInt(app, "setActivationPolicy:", 0);  // NSApplicationActivationPolicyRegular
+
+    void* delegateClass = newClass("CfAppDelegate", "NSObject");
+    if (delegateClass != nullptr)
+    {
+        function<i8(void*, void*, void*)> imp = __lastWindowClosed;
+        addMethodBool(delegateClass, "applicationShouldTerminateAfterLastWindowClosed:", imp);
+        finishClass(delegateClass);
+        msg1(app, "setDelegate:", msg0(msg0(delegateClass, "alloc"), "init"));
+    }
+    return app;
+}
+
+// Titled + closable + miniaturizable window; (x, y) is the bottom-left corner
+// of the content rect in screen coordinates.
+void* createWindow(char* title, double x, double y, double w, double h)
+{
+    // styleMask 15 = Titled|Closable|Miniaturizable|Resizable, backing 2 = Buffered
+    void* win = msgRect3i(msg0(cls("NSWindow"), "alloc"),
+                          "initWithContentRect:styleMask:backing:defer:",
+                          x, y, w, h, 15u, 2u, false);
+    msg1(win, "setTitle:", nsStr(title));
+    // The window is created by us, not a nib; without this, closing it would
+    // autorelease an object the bridge still references.
+    msgBool(win, "setReleasedWhenClosed:", false);
+    return win;
+}
+
+void addToWindow(void* win, void* view)
+{
+    msg1(msg0(win, "contentView"), "addSubview:", view);
+}
+
+// Static text - the Cocoa analog of a Win32 STATIC control.
+void* createLabel(void* win, char* text, double x, double y, double w, double h)
+{
+    void* label = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", x, y, w, h);
+    msg1(label, "setStringValue:", nsStr(text));
+    msgBool(label, "setBezeled:", false);
+    msgBool(label, "setDrawsBackground:", false);
+    msgBool(label, "setEditable:", false);
+    msgBool(label, "setSelectable:", false);
+    addToWindow(win, label);
+    return label;
+}
+
+// Push button wired to target/action - the analog of a Win32 BUTTON with
+// WM_COMMAND routed to `actionSel` on `target`.
+void* createButton(void* win, char* title, double x, double y, double w, double h,
+                   void* target, char* actionSel)
+{
+    void* button = msgRect(msg0(cls("NSButton"), "alloc"), "initWithFrame:", x, y, w, h);
+    msg1(button, "setTitle:", nsStr(title));
+    msgInt(button, "setBezelStyle:", 1);  // NSBezelStyleRounded
+    msg1(button, "setTarget:", target);
+    msg1(button, "setAction:", sel(actionSel));
+    addToWindow(win, button);
+    return button;
+}
+
+// Editable single-line text input - the analog of a Win32 EDIT control.
+void* createTextField(void* win, char* text, double x, double y, double w, double h)
+{
+    void* field = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", x, y, w, h);
+    msg1(field, "setStringValue:", nsStr(text));
+    addToWindow(win, field);
+    return field;
+}
+
+void  setText(void* control, char* s) { msg1(control, "setStringValue:", nsStr(s)); }
+char* getText(void* control) { return cStr(msg0(control, "stringValue")); }
+
+// Shows the window and enters the Cocoa event loop; returns when the app
+// terminates (last window closed, Cmd-Q, or [NSApp terminate:]).
+void runApp(void* app, void* win)
+{
+    msg1(win, "makeKeyAndOrderFront:", nullptr);
+    msgBool(app, "activateIgnoringOtherApps:", true);
+    msg0(app, "run");
+}

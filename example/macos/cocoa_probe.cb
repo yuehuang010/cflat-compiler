@@ -1,0 +1,137 @@
+// cocoa_probe.cb - a permanent bridge-ABI probe for the AppKit NativeHost's new
+// typed objc_msgSend casts (msgSetDouble/msgGetDouble/msgRange/msgRangeLoc/...)
+// and the CfFlippedView isFlipped override. It also runs an EXPERIMENTAL 4-double
+// struct-return of -[NSView frame]: its PASS/SKIP verdict picks the M3 resize path
+// (Plan A struct-return vs Plan B CALayer-KVC).
+//
+// Build & run (headless self-test, no window shown):
+//   x64/Release/cflat example/macos/cocoa_probe.cb -o out/cocoa_probe
+//   ./out/cocoa_probe --selftest
+import "cocoa.cb";
+
+// A 4-double aggregate matching NSRect (x, y, w, h). On arm64 this is a
+// homogeneous float aggregate returned in d0-d3 IF the callee ABI matches.
+struct RectD
+{
+    double x = 0.0;
+    double y = 0.0;
+    double w = 0.0;
+    double h = 0.0;
+};
+
+// -- Multi-method dispatch probe: one class carrying several CFlat IMPs --------
+int gAction = 0;
+int gMenu   = 0;
+int gChange = 0;
+
+void probeOnAction(void* self, void* cmd, void* sender) { gAction = gAction + 1; }
+void probeOnMenu(void* self, void* cmd, void* sender)   { gMenu = gMenu + 1; }
+void probeOnChange(void* self, void* cmd, void* note)   { gChange = gChange + 1; }
+
+// isFlipped override: a flipped NSView puts the origin at the TOP-left (like Win32).
+i8 probeIsFlipped(void* self, void* cmd) { return (i8)1; }
+
+int probeSelfTest()
+{
+    if (!cocoaInit()) { printf("FAIL: cocoaInit\n"); return 1; }
+    void* pool = poolPush();
+    int pass = 0; int total = 0;
+
+    // 1. double set/get round-trip on an NSSlider.
+    total++;
+    void* slider = msgRect(msg0(cls("NSSlider"), "alloc"), "initWithFrame:", 0.0, 0.0, 120.0, 24.0);
+    msgSetDouble(slider, "setMaxValue:", 100.0);
+    msgSetDouble(slider, "setDoubleValue:", 42.0);
+    double dv = msgGetDouble(slider, "doubleValue");
+    bool dblOk = dv > 41.5 && dv < 42.5;
+    if (dblOk) pass++; else printf("  FAIL: slider double round-trip (got %f)\n", dv);
+
+    // 2. NSRange set + location read on an NSTextView.
+    total++;
+    void* tv = msgRect(msg0(cls("NSTextView"), "alloc"), "initWithFrame:", 0.0, 0.0, 200.0, 100.0);
+    msg1(tv, "setString:", nsStr("hello world"));
+    msgRange(tv, "setSelectedRange:", 2u, 3u);
+    u64 loc = msgRangeLoc(tv, "selectedRange");
+    bool rangeOk = loc == 2u;
+    if (rangeOk) pass++; else printf("  FAIL: NSRange location read (got %llu)\n", loc);
+
+    // 3. CfFlippedView overrides isFlipped -> YES.
+    total++;
+    void* fclass = newClass("CfFlippedView", "NSView");
+    bool flipOk = false;
+    if (fclass != nullptr)
+    {
+        function<i8(void*, void*)> impF = probeIsFlipped;
+        addMethodBool0(fclass, "isFlipped", impF);
+        finishClass(fclass);
+        void* fv = msgRect(msg0(fclass, "alloc"), "initWithFrame:", 0.0, 0.0, 50.0, 50.0);
+        i64 fr = msgGetI64(fv, "isFlipped");
+        flipOk = (fr & 1) == 1;
+    }
+    if (flipOk) pass++; else printf("  FAIL: CfFlippedView isFlipped\n");
+
+    // 4. Multi-method class dispatch: one class, several CFlat IMPs.
+    total++;
+    void* tclass = newClass("CfProbeTarget", "NSObject");
+    bool multiOk = false;
+    if (tclass != nullptr)
+    {
+        function<void(void*, void*, void*)> a = probeOnAction;
+        function<void(void*, void*, void*)> m = probeOnMenu;
+        function<void(void*, void*, void*)> c = probeOnChange;
+        addMethod0(tclass, "onAction:", a);
+        addMethod0(tclass, "onMenu:", m);
+        addMethod0(tclass, "textDidChange:", c);
+        finishClass(tclass);
+        void* inst = msg0(msg0(tclass, "alloc"), "init");
+        msg1(inst, "onAction:", nullptr);
+        msg1(inst, "onAction:", nullptr);
+        msg1(inst, "onMenu:", nullptr);
+        msg1(inst, "textDidChange:", nullptr);
+        multiOk = gAction == 2 && gMenu == 1 && gChange == 1;
+    }
+    if (multiOk) pass++; else printf("  FAIL: multi-method dispatch (a=%d m=%d c=%d)\n", gAction, gMenu, gChange);
+
+    void* view = msgRect(msg0(cls("NSView"), "alloc"), "initWithFrame:", 0.0, 0.0, 120.0, 40.0);
+
+    // EXPERIMENTAL: 4-double struct return of -[NSView frame]. If the cflat
+    // function<> ABI returns an HFA of 4 doubles in d0-d3 (matching objc_msgSend),
+    // the width/height come back correct -> Plan A. Otherwise SKIP -> Plan B.
+    // Runs before the KVC probe (which is only needed if struct return fails).
+    function<RectD(void*, void*)> ff = (function<RectD(void*, void*)>)__objcMsgSendPtr;
+    RectD rc = ff(view, sel("frame"));
+    bool structOk = rc.w > 119.5 && rc.w < 120.5 && rc.h > 39.5 && rc.h < 40.5;
+    printf("STRUCTRET: %s (frame w=%f h=%f)\n", structOk ? "PASS" : "SKIP", rc.w, rc.h);
+
+    // 5. CALayer/KVC content-size read (Plan B path for M3 resize): a CALayer is
+    //    KVC-compliant for "bounds.size.width" (it boxes the CGFloat as an
+    //    NSNumber), unlike a bare NSView. Used only if struct return is unusable.
+    total++;
+    msgBool(view, "setWantsLayer:", true);
+    void* layer = msg0(view, "layer");
+    double kvcW = -1.0;
+    if (layer != nullptr)
+    {
+        void* num = msg1(layer, "valueForKeyPath:", nsStr("bounds.size.width"));
+        if (num != nullptr) kvcW = msgGetDouble(num, "doubleValue");
+    }
+    bool kvcOk = kvcW > 119.5 && kvcW < 120.5;
+    if (kvcOk) pass++; else printf("  FAIL: CALayer/KVC width read (got %f)\n", kvcW);
+
+    poolPop(pool);
+    if (pass == total)
+    {
+        printf("PASS: cocoa probe %d/%d (double, range, flipped, multi-method, kvc)\n", pass, total);
+        return 0;
+    }
+    printf("FAIL: cocoa probe %d/%d\n", pass, total);
+    return 1;
+}
+
+extern int main(int argc, char** argv)
+{
+    if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
+        return probeSelfTest();
+    printf("cocoa_probe: run with --selftest\n");
+    return 0;
+}

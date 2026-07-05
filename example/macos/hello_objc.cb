@@ -1,0 +1,53 @@
+// hello_objc.cb - console demo of calling Foundation / the Objective-C runtime
+// from CFlat on macOS. No window; runs fine headless or over ssh.
+//
+// Shows the two core techniques the GUI examples build on:
+//   1. Sending messages to framework classes through typed objc_msgSend casts
+//      (NSProcessInfo, NSString) via the cocoa.cb bridge.
+//   2. Defining a NEW Objective-C class whose method is implemented by a CFlat
+//      function, then messaging it - the callback mechanism behind buttons.
+//
+// Build & run:
+//   x64/Release/cflat example/macos/hello_objc.cb -o out/hello_objc
+//   ./out/hello_objc
+import "cocoa.cb";
+
+int gPings = 0;
+
+// IMP for -(void)ping:(id)sender on the runtime-registered class below.
+void onPing(void* self, void* cmd, void* sender)
+{
+    gPings = gPings + 1;
+}
+
+extern int main()
+{
+    if (!cocoaInit())
+    {
+        printf("failed to load AppKit\n");
+        return 1;
+    }
+    void* pool = poolPush();
+
+    // [NSProcessInfo processInfo] - macOS system facts via Foundation.
+    void* info = msg0(cls("NSProcessInfo"), "processInfo");
+    printf("process:   %s\n", cStr(msg0(info, "processName")));
+    printf("os:        %s\n", cStr(msg0(info, "operatingSystemVersionString")));
+    printf("host:      %s\n", cStr(msg0(info, "hostName")));
+    printf("cpus:      %d\n", (int)(i64)msg0(info, "processorCount"));
+    printf("memory:    %d MB\n", (int)((i64)msg0(info, "physicalMemory") / (1024 * 1024)));
+
+    // NSString round trip with a real method chain: uppercase a CFlat string.
+    void* s = nsStr("hello from cflat");
+    printf("uppercase: %s\n", cStr(msg0(s, "uppercaseString")));
+
+    // Register CfPinger with -(void)ping: implemented by the CFlat onPing()
+    // above, instantiate it, and message it twice.
+    void* pinger = makeTarget("CfPinger", "ping:", onPing);
+    msg1(pinger, "ping:", nullptr);
+    msg1(pinger, "ping:", nullptr);
+    printf("pings:     %d (callbacks into CFlat)\n", gPings);
+
+    poolPop(pool);
+    return gPings == 2 ? 0 : 1;
+}

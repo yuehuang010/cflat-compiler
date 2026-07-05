@@ -1,0 +1,76 @@
+// sysinfo_mac.cb - query macOS-specific C APIs (sysctl, libproc, Mach time)
+// with plain `extern` declarations. The macOS counterpart of
+// example/windows/sysinfo.cb.
+//
+// Everything here lives in libSystem, so it compiles and links with cflat's
+// SDK-free Mach-O linker - no header import, no SDK, no extra libs:
+//
+//   x64/Release/cflat example/macos/sysinfo_mac.cb -o out/sysinfo_mac
+//   ./out/sysinfo_mac
+
+// BSD sysctl - the canonical macOS "read a kernel/hardware fact" API.
+extern int sysctlbyname(const char* name, void* oldp, u64* oldlenp, void* newp, u64 newlen);
+
+// libproc - process introspection (macOS-specific, not POSIX).
+extern int proc_pidpath(int pid, void* buffer, u32 buffersize);
+extern int getpid();
+
+// Mach kernel time - the raw monotonic clock behind mach_absolute_time.
+struct TimebaseInfo
+{
+    u32 numer = default;
+    u32 denom = default;
+};
+extern u64 mach_absolute_time();
+extern int mach_timebase_info(TimebaseInfo* info);
+
+// Prints a string-valued sysctl like hw.model or machdep.cpu.brand_string.
+void printSysctlString(char* key)
+{
+    char[256] buf;
+    u64 len = (u64)sizeof(buf);
+    if (sysctlbyname(key, buf, &len, nullptr, 0u) == 0)
+        printf("%-28s %s\n", key, buf);
+    else
+        printf("%-28s <unavailable>\n", key);
+}
+
+void printSysctlInt(char* key)
+{
+    i64 value = 0;
+    u64 len = 8u;
+    if (sysctlbyname(key, &value, &len, nullptr, 0u) == 0)
+        printf("%-28s %d\n", key, (int)value);
+}
+
+extern int main()
+{
+    printf("== sysctlbyname ==\n");
+    printSysctlString("hw.model");                  // e.g. Mac15,6
+    printSysctlString("machdep.cpu.brand_string");  // e.g. Apple M3 Pro
+    printSysctlString("kern.osproductversion");     // e.g. 15.5
+    printSysctlString("kern.osrelease");            // Darwin kernel version
+    printSysctlInt("hw.ncpu");
+    printSysctlInt("hw.perflevel0.physicalcpu");    // performance cores
+    printSysctlInt("hw.perflevel1.physicalcpu");    // efficiency cores
+
+    i64 memsize = 0;
+    u64 len = 8u;
+    if (sysctlbyname("hw.memsize", &memsize, &len, nullptr, 0u) == 0)
+        printf("%-28s %d MB\n", "hw.memsize", (int)(memsize / (1024 * 1024)));
+
+    printf("\n== libproc ==\n");
+    char[1024] path;
+    int n = proc_pidpath(getpid(), path, (u32)sizeof(path));
+    if (n > 0)
+        printf("pid %d executable: %s\n", getpid(), path);
+
+    printf("\n== mach time ==\n");
+    TimebaseInfo tb;
+    mach_timebase_info(&tb);
+    u64 t0 = mach_absolute_time();
+    u64 t1 = mach_absolute_time();
+    printf("timebase %d/%d, back-to-back reads: %d ticks\n",
+           (int)tb.numer, (int)tb.denom, (int)(t1 - t0));
+    return 0;
+}

@@ -16,7 +16,7 @@
 // Headless state-assert self-test (example.bat gate; drives via SendMessage +
 // direct load/save, since OS file dialogs cannot run unattended):
 //   out\fedit.exe --selftest
-import "win32_native_host.cb";
+import "native_host.cb";
 import "filesystem.cb";
 
 // Menu command ids (any positive ints distinct from each other; menu WM_COMMAND
@@ -138,25 +138,23 @@ class Editor : Component
         return false;                                           // Cancel
     }
 
-    // Select the next occurrence of findText in the editor, after the caret.
+    // Select the next occurrence of findText in the editor, after the caret. Built
+    // entirely on the host-neutral driver API, so it runs on either backend.
     void doFind()
     {
         if (this.findText.length() == 0) return;
-        u64 hu = _nCtx.nativeHandle(EDITOR_KEY);
-        if (hu == 0u) return;
-        void* h = u2h(hu);
+        if (_nCtx.nativeHandle(EDITOR_KEY) == 0u) return;
         string content = nativeControlText(EDITOR_KEY);
-        u32 selA = 0u; u32 selB = 0u;
-        SendMessageA(h, (u32)EM_GETSEL, (u64)&selA, (i64)&selB);
-        int startPos = (int)selB;
+        int n = (int)content.length();
+        int startPos = nativeSelectionStart(EDITOR_KEY) + 1;   // search past the caret
+        if (startPos < 0) startPos = 0;
+        if (startPos > n) startPos = n;
         char* hit = strstr(content.data() + startPos, this.findText.data());
         if (hit == nullptr) hit = strstr(content.data(), this.findText.data());   // wrap
         if (hit == nullptr) return;
         int pos = (int)(hit - content.data());
         int end = pos + (int)this.findText.length();
-        SendMessageA(h, (u32)EM_SETSEL, (u64)pos, (i64)end);
-        SendMessageA(h, (u32)EM_SCROLLCARET, 0u, (i64)0);
-        SetFocus(h);
+        nativeSelect(EDITOR_KEY, pos, end);
     }
 
     // Dispatch a menu / accelerator command.
@@ -250,26 +248,24 @@ int feditSelfTest()
 
     // 2. Open a file: content flows into the buffer and the doc is not dirty.
     total++;
-    char[300] tdir; GetTempPathA(300u, tdir);
-    string tmp = (string)tdir + "fedit_selftest.txt";
+    string tdir = Path.getTempPath();   // portable temp dir (no trailing separator)
+    string tmp = tdir + "/fedit_selftest.txt";
     File.writeAllText(tmp, "hello world\r\nsecond line\r\nhello again");
     e.loadPath(tmp, &_nCtx);
     string got = nativeControlText(EDITOR_KEY);
     bool opened = _has(got, "hello world") && _has(got, "second line") && !e.dirty;
     if (opened) pass++; else printf("  FAIL: open/load (dirty=%d)\n", (int)e.dirty);
 
-    // 3. Editing the native EDIT fires the dirty notification (EN_CHANGE routed).
-    //    EM_REPLACESEL inserts text like a keystroke would, firing EN_CHANGE.
+    // 3. Editing the native control fires the dirty notification. Inserting text
+    //    like a keystroke would (nativeInsertTextAt) fires the change event.
     total++;
-    char[8] ins; ins[0] = ' '; ins[1] = 'X'; ins[2] = '\0';
-    SendMessageA(hed, (u32)EM_SETSEL, 0u, (i64)0);
-    SendMessageA(hed, (u32)EM_REPLACESEL, 1u, (i64)&ins[0]);
+    string tmp2 = tdir + "/fedit_selftest_out.txt";
+    nativeInsertTextAt(EDITOR_KEY, 0, " X");
     bool becameDirty = e.dirty;
     if (becameDirty) pass++; else printf("  FAIL: edit did not mark dirty\n");
 
     // 4. Save to a new path (bypassing the OS dialog): the file round-trips.
     total++;
-    string tmp2 = (string)tdir + "fedit_selftest_out.txt";
     e.path = "" + tmp2;
     e.doSave(&_nCtx);
     string back = File.readAllText(tmp2);
@@ -277,24 +273,23 @@ int feditSelfTest()
     bool saved = _has(back, "Xhello world") && !e.dirty;
     if (saved) pass++; else printf("  FAIL: save round-trip (dirty=%d back=[%s])\n", (int)e.dirty, back.data());
 
-    // 5. Menu routing: drive View > Toggle Theme via WM_COMMAND; the host applies
-    //    the dark theme.
+    // 5. Menu routing: drive View > Toggle Theme through the menu command path; the
+    //    host applies the dark theme.
     total++;
-    SendMessageA(_nHost.window, (u32)WM_COMMAND, (u64)CMD_THEME, (i64)0);
+    nativeTestFireMenu(CMD_THEME);
     bool themed = _nHost.dark;
     if (themed) pass++; else printf("  FAIL: theme toggle via menu\n");
 
     // 6. Find: locate the second "hello" after the caret and select it.
     total++;
     nativeSetControlText(EDITOR_KEY, "alpha hello beta hello gamma");
-    SendMessageA(hed, (u32)EM_SETSEL, 0u, (i64)0);   // caret at start
+    nativeSelect(EDITOR_KEY, 0, 0);                  // caret at start
     e.findText = "hello";
     e.doFind();                                      // selects first "hello" (pos 6)
     e.doFind();                                      // selects second "hello" (pos 17)
-    u32 a = 0u; u32 b = 0u;
-    SendMessageA(hed, (u32)EM_GETSEL, (u64)&a, (i64)&b);
-    bool found = (int)a == 17;
-    if (found) pass++; else printf("  FAIL: find next (selStart=%d, want 17)\n", (int)a);
+    int a = nativeSelectionStart(EDITOR_KEY);
+    bool found = a == 17;
+    if (found) pass++; else printf("  FAIL: find next (selStart=%d, want 17)\n", a);
 
     // Teardown: release all global host + context state (leak-clean for heap-audit).
     nativeTeardownForTest();

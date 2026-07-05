@@ -1,0 +1,222 @@
+// cocoa_native_settings.cb - a settings panel rendered with REAL AppKit controls
+// through cocoa_native_host.cb (the macOS NativeHost output stage), not pixels.
+//
+// Same app-facing shape as win32_native_settings.cb (labels, a text field,
+// checkboxes, a slider mirrored by a progress bar, a disabled-until-enabled button),
+// but every widget here is a genuine OS control: an NSButton, an NSTextField, an
+// NSProgressIndicator, an NSSlider. AppKit paints them, handles IME, and owns Tab.
+//
+// Build & run (live window):
+//   x64/Release/cflat example/ui/cocoa_native_settings.cb -i example/ui -i example/macos -o out/nsettings_mac
+//   ./out/nsettings_mac
+//
+// Headless state-assert self-test (no visible window; example_mac.sh gate):
+//   x64/Release/cflat example/ui/cocoa_native_settings.cb -i example/ui -i example/macos --heap-audit -o out/nsettings_mac
+//   ./out/nsettings_mac --selftest
+import "cocoa_native_host.cb";
+
+class NativeSettings : Component
+{
+    bool   darkMode = false;
+    bool   autoSave = false;
+    int    volume   = 40;
+    int    clicks   = 0;
+    string name     = default;
+
+    Element render(UiContext* ctx)
+    {
+        // Declare the styling preference; the native host reads it to theme the
+        // window (dark vs aqua appearance).
+        ctx.theme = this.darkMode ? darkTheme() : lightTheme();
+
+        Box* root = box(makeStyle(1, hostWidth(), hostHeight()));
+        root.style.gap = 1;
+        root.setKey("root");
+
+        Text* title = text("Settings (native controls)");
+        title.setKey("title");
+        root.add(title);
+
+        TextInput* nm = textInput(this.name, (string v) => { this.name = v; ctx.invalidate(); });
+        nm.width = 24;
+        nm.placeholder = "your name";
+        nm.setKey("name");
+        root.add(nm);
+
+        Checkbox* dark = checkbox("Dark mode", this.darkMode,
+                                  (bool v) => { this.darkMode = v; ctx.invalidate(); });
+        dark.setKey("dark");
+        root.add(dark);
+
+        Checkbox* au = checkbox("Auto-save", this.autoSave,
+                                (bool v) => { this.autoSave = v; ctx.invalidate(); });
+        au.setKey("auto");
+        root.add(au);
+
+        Slider* vol = slider(this.volume, 26, (int v) => { this.volume = v; ctx.invalidate(); });
+        vol.setKey("vol");
+        root.add(vol);
+
+        ProgressBar* pb = progressBar(this.volume, 26);
+        pb.setKey("pb");
+        root.add(pb);
+
+        Button* save = button("Save", () => { this.clicks = this.clicks + 1; ctx.invalidate(); });
+        save.setKey("save");
+        save.disabled = !this.autoSave;
+        root.add(save);
+
+        // Status echoes both the click count and the name, so the self-test can
+        // verify button + edit routing end-to-end through a separate control.
+        string who = this.name.length() > 0 ? this.name : "-";
+        Text* status = text("Clicks: " + this.clicks.toString() + " / " + who);
+        status.setKey("status");
+        root.add(status);
+        return root;
+    }
+};
+
+// Menu-routing probe target for the self-test (set by the test's menu handler).
+int _testMenuHit = 0;
+
+// -- Headless state-assert self-test ------------------------------------------
+// Creates an INVISIBLE window, builds the panel on real controls, then drives them
+// (setState:/onAction:/setStringValue:+NSNotification/setDoubleValue:) exactly as
+// AppKit would on user input, and reads control state back. No pixels: the controls
+// are the oracle.
+
+// Compare a control's displayed text (stringValue) to `want`.
+bool _txtEq(void* h, const char* want)
+{
+    char* c = cStr(msg0(h, "stringValue"));
+    return c != nullptr && strcmp(c, (char*)want) == 0;
+}
+
+int nativeSelfTest()
+{
+    if (!cocoaInit()) { printf("FAIL: cocoaInit\n"); return 1; }
+    void* pool = poolPush();
+    createNativeWindow("selftest", false);   // hidden top-level; sets host globals
+    _nW = 44; _nH = 26;
+
+    NativeSettings* app = new NativeSettings();
+    _nApp = app;
+    buildNativeTree();
+
+    void* target = _nHost.target;
+    void* hTtl  = u2h(_nCtx.nativeHandle("root/title"));
+    void* hName = u2h(_nCtx.nativeHandle("root/name"));
+    void* hDark = u2h(_nCtx.nativeHandle("root/dark"));
+    void* hAuto = u2h(_nCtx.nativeHandle("root/auto"));
+    void* hVol  = u2h(_nCtx.nativeHandle("root/vol"));
+    void* hPb   = u2h(_nCtx.nativeHandle("root/pb"));
+    void* hSave = u2h(_nCtx.nativeHandle("root/save"));
+    void* hStat = u2h(_nCtx.nativeHandle("root/status"));
+
+    int pass = 0; int total = 0;
+
+    // 1. Every widget became a real control.
+    total++;
+    bool created = hTtl != nullptr && hName != nullptr && hDark != nullptr
+        && hAuto != nullptr && hVol != nullptr && hPb != nullptr
+        && hSave != nullptr && hStat != nullptr;
+    if (created) pass++; else printf("  FAIL: controls not all created\n");
+
+    // 2. Initial state: checkboxes clear, Save disabled, labels correct. The status
+    //    NSTextField echoes the model (clicks + name), the oracle for routing.
+    total++;
+    bool init = msgGetI64(hDark, "state") == (i64)0
+        && msgGetI64(hAuto, "state") == (i64)0
+        && msgGetI64(hSave, "isEnabled") == (i64)0
+        && _txtEq(hTtl, "Settings (native controls)")
+        && _txtEq(hStat, "Clicks: 0 / -");
+    if (init) pass++; else printf("  FAIL: initial control state\n");
+
+    // 3. Click "Dark mode": AppKit toggles the switch (setState:) and sends its
+    //    action; the handler flips the model and the host applies the dark theme.
+    total++;
+    msgInt(hDark, "setState:", (i64)1);
+    msg1(target, "onAction:", hDark);
+    bool darkOn = msgGetI64(hDark, "state") == (i64)1 && _nHost.dark;
+    if (darkOn) pass++; else printf("  FAIL: dark toggle (host.dark=%d)\n", (int)_nHost.dark);
+
+    // 4. Click "Auto-save": enabling it must ENABLE the Save button on the next
+    //    render (disabled = !autoSave), proving a re-render re-synced a prop.
+    total++;
+    msgInt(hAuto, "setState:", (i64)1);
+    msg1(target, "onAction:", hAuto);
+    bool saveEnabled = msgGetI64(hSave, "isEnabled") != (i64)0;
+    if (saveEnabled) pass++; else printf("  FAIL: auto-save did not enable Save\n");
+
+    // 5. Click "Save": the handler bumps the counter, and the status label updates
+    //    to "Clicks: 1 / -" - button routing end to end.
+    total++;
+    msg1(target, "onAction:", hSave);
+    bool saved = _txtEq(hStat, "Clicks: 1 / -");
+    if (saved) pass++; else printf("  FAIL: save click did not update status\n");
+
+    // 6. Type into the NSTextField: set its value, then deliver a real
+    //    NSControlTextDidChangeNotification to the delegate (programmatic
+    //    setStringValue: does not fire it) - the controlled model picks up the text.
+    total++;
+    msg1(hName, "setStringValue:", nsStr("Ada"));
+    void* note = msg2(cls("NSNotification"), "notificationWithName:object:",
+                      nsStr("NSControlTextDidChangeNotification"), hName);
+    msg1(target, "controlTextDidChange:", note);
+    bool named = _txtEq(hStat, "Clicks: 1 / Ada");
+    if (named) pass++; else printf("  FAIL: edit change not routed to model\n");
+
+    // 7. Move the slider (set value + fire its action): routeSlider reads
+    //    doubleValue and the mirrored progress bar follows the model.
+    total++;
+    msgSetDouble(hVol, "setDoubleValue:", 70.0);
+    msg1(target, "onAction:", hVol);
+    int pbPos = (int)msgGetDouble(hPb, "doubleValue");
+    bool slid = pbPos == 70;
+    if (slid) pass++; else printf("  FAIL: slider drag (pbPos=%d)\n", pbPos);
+
+    // 8. Menu routing: a declared command id reaches the app's dispatch closure.
+    total++;
+    _testMenuHit = 0;
+    setMenuHandler((int id) => { _testMenuHit = id; });
+    routeMenu(42);
+    bool menuOk = _testMenuHit == 42;
+    if (menuOk) pass++; else printf("  FAIL: routeMenu (hit=%d)\n", _testMenuHit);
+
+    // 9. Close guard: windowShouldClose: returns the app's decision (veto then allow).
+    total++;
+    setCloseQuery(() => { return false; });
+    bool vetoed = _windowShouldCloseImp(nullptr, nullptr, nullptr) == (i8)0;
+    setCloseQuery(() => { return true; });
+    bool allowed = _windowShouldCloseImp(nullptr, nullptr, nullptr) == (i8)1;
+    if (vetoed && allowed) pass++; else printf("  FAIL: close guard (veto=%d allow=%d)\n", (int)vetoed, (int)allowed);
+
+    // 10. Resize path (D10 Plan A): synthesize a windowDidResize: and confirm the
+    //     content view's 760x560pt frame maps back to 95x21 DIP via struct return.
+    total++;
+    void* rnote = msg2(cls("NSNotification"), "notificationWithName:object:",
+                       nsStr("NSWindowDidResizeNotification"), _nHost.window);
+    _windowResizeImp(nullptr, nullptr, rnote);
+    bool resized = _nW == 95 && _nH == 21;
+    if (resized) pass++; else printf("  FAIL: resize (nW=%d nH=%d)\n", _nW, _nH);
+
+    // Teardown: release all global host + context state (leak-clean for heap-audit).
+    nativeTeardownForTest();
+    poolPop(pool);
+
+    if (pass == total)
+    {
+        printf("PASS: cocoa native host self-test %d/%d (create, checkbox, enable, click, edit, slider, menu, close, resize)\n", pass, total);
+        return 0;
+    }
+    printf("FAIL: cocoa native host self-test %d/%d\n", pass, total);
+    return 1;
+}
+
+extern int main(int argc, char** argv)
+{
+    if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
+        return nativeSelfTest();
+
+    return runAppGuiNative(new NativeSettings(), "CFlat UI - Settings (native)");
+}
