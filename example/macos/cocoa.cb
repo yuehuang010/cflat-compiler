@@ -137,6 +137,16 @@ void* msgSetDouble(void* obj, char* selName, double v)
     return f(obj, sel(selName), v);
 }
 
+// [obj selector:(NSSize){w,h}] - e.g. setMinSize:, setMaxSize:, setContainerSize:.
+// On arm64 an NSSize (2 doubles) is a homogeneous FP aggregate in d0/d1, ABI-identical
+// to two separate double args.
+void* msgSize(void* obj, char* selName, double w, double h)
+{
+    function<void*(void*, void*, double, double)> f =
+        (function<void*(void*, void*, double, double)>)__objcMsgSendPtr;
+    return f(obj, sel(selName), w, h);
+}
+
 // [obj selector] returning double - e.g. doubleValue (NSSlider/NSNumber). The
 // result comes back in d0, so a double-returning cast reads it directly.
 double msgGetDouble(void* obj, char* selName)

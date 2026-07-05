@@ -179,6 +179,23 @@ class CocoaHost : NativeHost
             msgBool(tv, "setEditable:", true);
             msgBool(tv, "setSelectable:", true);
             msgBool(tv, "setRichText:", false);
+            // Make the text view fill (and track) the scroll view's content width, and
+            // grow vertically with the text. Without this, initWithFrame leaves a ~10pt
+            // text container that never resizes, so only one character column is visible
+            // even though the buffer holds the full text. This is Apple's canonical
+            // NSScrollView + NSTextView setup. NSViewWidthSizable = 1<<1 = 2.
+            double big = 10000000.0;
+            msgSize(tv, "setMinSize:", 0.0, 0.0);
+            msgSize(tv, "setMaxSize:", big, big);
+            msgBool(tv, "setVerticallyResizable:", true);
+            msgBool(tv, "setHorizontallyResizable:", false);
+            msgInt(tv, "setAutoresizingMask:", 2);
+            void* tc = msg0(tv, "textContainer");
+            if (tc != nullptr)
+            {
+                msgBool(tc, "setWidthTracksTextView:", true);
+                msgSize(tc, "setContainerSize:", big, big);
+            }
             msg1(tv, "setDelegate:", this.target);
             msg1(scroll, "setDocumentView:", tv);
             ctrl = scroll;
@@ -247,13 +264,21 @@ class CocoaHost : NativeHost
         }
         else if (prop == PROP_ENABLED)
         {
+            // Only touch editability when it actually changes. applyTree runs on every
+            // keystroke (edit -> invalidate -> reconcile), and re-sending setEditable:
+            // / setEnabled: to a control that is MID-EDIT ends its input session and
+            // resigns first responder - the "type one char then nothing" bug. Mirror
+            // the differ-guard in setText.
             if (_isScroll(ctrl))
             {
                 void* tv = msg0(ctrl, "documentView");
-                msgBool(tv, "setEditable:", v);
-                msgBool(tv, "setSelectable:", v);
+                if ((msgBool1(tv, "isEditable", nullptr) != (i8)0) != v)
+                {
+                    msgBool(tv, "setEditable:", v);
+                    msgBool(tv, "setSelectable:", v);
+                }
             }
-            else
+            else if ((msgBool1(ctrl, "isEnabled", nullptr) != (i8)0) != v)
             {
                 msgBool(ctrl, "setEnabled:", v);
             }
@@ -705,6 +730,54 @@ i8 _isFlippedImp(void* self, void* cmd) { return (i8)1; }
 // can delete the heap component after [NSApp run] returns (D9).
 i8 _shouldTerminateImp(void* self, void* cmd, void* app) { return (i8)0; }
 
+// The control to focus on show: prefer a TextArea (a scroll view's NSTextView),
+// otherwise the first editable NSTextField. Returns nullptr if the tree has neither.
+void* _firstEditableControl()
+{
+    void* field = nullptr;
+    int n = _nHost.liveHandles.count();
+    int i = 0;
+    while (i < n)
+    {
+        void* ctrl = u2h(_nHost.liveHandles.get(i));
+        if (ctrl != nullptr)
+        {
+            if (_isScroll(ctrl)) return msg0(ctrl, "documentView");
+            if (field == nullptr
+                && msgBool1(ctrl, "isKindOfClass:", cls("NSTextField")) != (i8)0
+                && msgBool1(ctrl, "isEditable", nullptr) != (i8)0)
+                field = ctrl;
+        }
+        i++;
+    }
+    return field;
+}
+
+// applicationDidFinishLaunching: bring the app to the foreground and make the main
+// window key. A CLI-launched (non-.app-bundle) binary does NOT reliably become the
+// active app when activateIgnoringOtherApps: is called synchronously around window
+// creation on modern macOS; the window comes up behind the launching terminal and
+// keystrokes go there, so text controls look "not editable". Doing it here - after
+// the run loop has started - is the point at which activation reliably sticks, and
+// makeFirstResponder puts the caret in the first editable control right away.
+void _didFinishLaunchingImp(void* self, void* cmd, void* note)
+{
+    void* app = msg0(cls("NSApplication"), "sharedApplication");
+    // activateIgnoringOtherApps: is deprecated and unreliable for a CLI-launched
+    // binary on modern macOS (the launching terminal keeps focus). Go through
+    // NSRunningApplication, which foregrounds a non-.app process reliably. Options
+    // 3 = ActivateAllWindows | ActivateIgnoringOtherApps.
+    void* self2 = msg0(cls("NSRunningApplication"), "currentApplication");
+    if (self2 != nullptr) msgInt(self2, "activateWithOptions:", 3);
+    msgBool(app, "activateIgnoringOtherApps:", true);
+    if (_nHost.window != nullptr)
+    {
+        msg1(_nHost.window, "makeKeyAndOrderFront:", nullptr);
+        void* fr = _firstEditableControl();
+        if (fr != nullptr) msg1(_nHost.window, "makeFirstResponder:", fr);
+    }
+}
+
 // A control fired its action: a slider routes by value, everything else (button /
 // checkbox) routes as a click.
 void _onActionImp(void* self, void* cmd, void* sender)
@@ -1099,6 +1172,8 @@ void registerHostClasses()
     {
         function<i8(void*, void*, void*)> t = _shouldTerminateImp;
         addMethodBool(ad, "applicationShouldTerminateAfterLastWindowClosed:", t);
+        function<void(void*, void*, void*)> dfl = _didFinishLaunchingImp;
+        addMethod0(ad, "applicationDidFinishLaunching:", dfl);
         finishClass(ad);
     }
 }
