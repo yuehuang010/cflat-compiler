@@ -311,7 +311,23 @@ class process : IProcess {
             }
             argv[argc + 1] = nullptr;
 
+            // Ignore SIGPIPE so the stdin writer thread gets EPIPE (not a fatal
+            // signal) if the child closes its stdin before consuming all input.
+            os.posix.ignore_sigpipe();
+
             i32 pid = os.posix.fork();
+            if (pid < 0) {
+                // fork failed: close both pipe ends, free the argv copies, and leave
+                // the process unstarted so no wait path reaps an unrelated child.
+                int fi = 0;
+                while (fi <= argc) { free((void*)argv[fi]); fi++; }
+                free((void*)argv);
+                os.posix.close(outPipe[0]); os.posix.close(outPipe[1]);
+                if (_want_stdin) { os.posix.close(inPipe[0]); os.posix.close(inPipe[1]); }
+                _proc_handle = nullptr;
+                exitCode = -1;
+                return;
+            }
             if (pid == 0) {
                 // Child: redirect std handles to the pipe ends, close all pipe fds,
                 // then exec. Only async-signal-safe calls between fork and exec.
@@ -385,7 +401,10 @@ class process : IProcess {
             i32 opts = block ? 0 : os.posix.WNOHANG;
             i32 r = os.posix.waitpid((i32)(i64)_proc_handle, &status, opts);
             if (r <= 0) return false;   // 0 == still running (WNOHANG), <0 == error
-            exitCode = (int)os.posix.wexitstatus(status);
+            // A child killed by a signal has no exit code; report 128+signal (shell
+            // convention) so a crashed/killed child is not mistaken for a clean exit 0.
+            if (os.posix.wifexited(status)) { exitCode = (int)os.posix.wexitstatus(status); }
+            else { exitCode = 128 + (int)os.posix.wtermsig(status); }
             return true;
         }
     }
@@ -466,7 +485,10 @@ class process : IProcess {
     void Kill() {
         if (_proc_handle != nullptr) {
             if const (__WINDOWS__) { TerminateProcess(_proc_handle, 1); }
-            else { os.posix.kill((i32)(i64)_proc_handle, os.posix.SIGKILL); }
+            else {
+                os.posix.kill((i32)(i64)_proc_handle, os.posix.SIGKILL);
+                _posixReap(true);   // reap the killed child so it does not linger as a zombie
+            }
         }
         if (_has_reader) { _reader.terminate(); _has_reader = false; }
         if (_has_writer) { _writer.terminate(); _has_writer = false; }

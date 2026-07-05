@@ -185,7 +185,11 @@ struct Terminal {
             // POSIX: fd 0 = stdin, fd 1 = stdout. VT processing and UTF-8 are the
             // terminal's native behaviour, so there is no mode/codepage to set;
             // we only switch stdin to cbreak (raw) and remember the old settings.
-            _hIn  = (void*)(i64)0;
+            // Non-null "active" sentinels: POSIX input/output use the fixed fds 0/1
+            // directly (via os.term_*), so _hIn/_hOut are only tested against nullptr.
+            // stdin fd 0 must NOT be stored raw here - it aliases nullptr and would
+            // make every input method's `if (_hIn == nullptr)` guard short-circuit.
+            _hIn  = (void*)(i64)1;
             _hOut = (void*)(i64)1;
             i8* saved = new i8[os.termios_buf_size()];
             if (os.term_make_raw(0, saved) != 0) { delete[] saved; return false; }

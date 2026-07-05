@@ -83,6 +83,9 @@ _SockAddrIn* _ai_addr(_AddrInfo* ai) {
 
 // Create a socket; returns INVALID_SOCKET ((void*)-1) on failure to match Winsock.
 void* socket(i32 af, i32 type, i32 proto) {
+    // Ignore SIGPIPE so a send() to a peer that closed returns EPIPE instead of
+    // killing the process (Winsock has no SIGPIPE; nothing else installs this).
+    os.posix.ignore_sigpipe();
     i32 fd = os.posix.socket(af, type, proto);
     if (fd < 0) return (void*)(i64)-1;
     return (void*)(i64)fd;
@@ -107,6 +110,7 @@ i32 _wsa_listen(void* sock, i32 backlog) {
     return os.posix.listen((i32)(i64)sock, backlog);
 }
 void* _wsa_accept(void* sock, _SockAddrIn* addr, i32* len) {
+    os.posix.ignore_sigpipe();   // accepted sockets send too; keep EPIPE non-fatal
     i32 fd = os.posix.accept((i32)(i64)sock, (void*)addr, len);
     if (fd < 0) return (void*)(i64)-1;
     return (void*)(i64)fd;

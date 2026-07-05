@@ -126,6 +126,12 @@ namespace os.posix
     // pthread_cond_t (48B) do not fit in the pointer-sized inline storage the Win32
     // SRWLOCK / CONDITION_VARIABLE used.
     extern void*   calloc(win_size count, win_size size);
+    extern void    free(void* ptr);
+    // Pointer-sized atomic CAS/load, used to publish a lazily allocated lock
+    // exactly once under concurrent first-touch. Compiler-intercepted (name
+    // starts with __atomic_); never actually linked.
+    extern bool    __atomic_i64_cas(i64* ptr, i64 expected, i64 desired);
+    extern i64     __atomic_i64_load(i64* ptr);
     // Over-aligned allocation: alignment must be a power of two and a multiple of
     // sizeof(void*). Returns 0 on success and writes the block to *memptr.
     extern win_int posix_memalign(void** memptr, win_size alignment, win_size size);
@@ -167,8 +173,11 @@ namespace os.posix
         extern i64   dispatch_semaphore_signal(void* sem);
         extern void  dispatch_release(void* obj);
         void* sem_new(win_int initial) {
-            void** block = (void**)os.posix.calloc((win_size)1, (win_size)8);
+            // block[0] = dispatch handle, block[1] = creation value (needed by
+            // sem_destroy to avoid dispatch_release's "deallocated while in use" abort).
+            void** block = (void**)os.posix.calloc((win_size)2, (win_size)8);
             block[0] = os.posix.dispatch_semaphore_create((i64)initial);
+            block[1] = (void*)(i64)initial;
             return (void*)block;
         }
         win_int sem_wait(void* sem) {
@@ -183,6 +192,12 @@ namespace os.posix
         }
         win_int sem_destroy(void* sem) {
             void** block = (void**)sem;
+            // dispatch_release aborts if the semaphore's value is below its creation
+            // value (permits still checked out). Signal it back up to at least the
+            // creation count first so teardown with outstanding permits is safe;
+            // outstanding <= initial, so signaling initial times guarantees value >= creation.
+            i64 initial = (i64)block[1];
+            for (i64 i = 0; i < initial; i++) { os.posix.dispatch_semaphore_signal(block[0]); }
             os.posix.dispatch_release(block[0]);
             return 0;
         }
@@ -199,30 +214,43 @@ namespace os.posix
         }
     }
 
-    // Lazily allocate a zeroed pthread_mutex_t into *slot and return it. Zero bytes
-    // are a valid unlocked mutex, so no pthread_mutex_init is needed.
+    // Lazily allocate a zeroed pthread_mutex_t into *slot and return it, safely
+    // under concurrent first use. Zero bytes are a valid unlocked mutex on glibc
+    // (Darwin needs an explicit init). We allocate a fresh object and publish it
+    // with a single CAS; a thread that loses the race frees its block and uses the
+    // winner's, so two threads first-locking the same slot can never end up with
+    // different mutex objects.
     void* ensure_mutex(void** slot) {
-        if (slot[0] == nullptr) {
-            slot[0] = os.posix.calloc((win_size)1, (win_size)os.posix.PTHREAD_MUTEX_T_SIZE);
-            if const (__MACOS__) { os.posix.pthread_mutex_init(slot[0], nullptr); }
-        }
-        return slot[0];
+        void* cur = (void*)os.posix.__atomic_i64_load((i64*)slot);
+        if (cur != nullptr) return cur;
+        void* fresh = os.posix.calloc((win_size)1, (win_size)os.posix.PTHREAD_MUTEX_T_SIZE);
+        if const (__MACOS__) { os.posix.pthread_mutex_init(fresh, nullptr); }
+        if (os.posix.__atomic_i64_cas((i64*)slot, (i64)0, (i64)fresh)) { return fresh; }
+        if const (__MACOS__) { os.posix.pthread_mutex_destroy(fresh); }
+        os.posix.free(fresh);
+        return (void*)os.posix.__atomic_i64_load((i64*)slot);
     }
-    // Lazily allocate a pthread_cond_t into *slot and return it.
+    // Lazily allocate a pthread_cond_t into *slot and return it (CAS-published; see ensure_mutex).
     void* ensure_cond(void** slot) {
-        if (slot[0] == nullptr) {
-            slot[0] = os.posix.calloc((win_size)1, (win_size)os.posix.PTHREAD_COND_T_SIZE);
-            if const (__MACOS__) { os.posix.pthread_cond_init(slot[0], nullptr); }
-        }
-        return slot[0];
+        void* cur = (void*)os.posix.__atomic_i64_load((i64*)slot);
+        if (cur != nullptr) return cur;
+        void* fresh = os.posix.calloc((win_size)1, (win_size)os.posix.PTHREAD_COND_T_SIZE);
+        if const (__MACOS__) { os.posix.pthread_cond_init(fresh, nullptr); }
+        if (os.posix.__atomic_i64_cas((i64*)slot, (i64)0, (i64)fresh)) { return fresh; }
+        if const (__MACOS__) { os.posix.pthread_cond_destroy(fresh); }
+        os.posix.free(fresh);
+        return (void*)os.posix.__atomic_i64_load((i64*)slot);
     }
-    // Lazily allocate a pthread_rwlock_t into *slot and return it.
+    // Lazily allocate a pthread_rwlock_t into *slot and return it (CAS-published; see ensure_mutex).
     void* ensure_rwlock(void** slot) {
-        if (slot[0] == nullptr) {
-            slot[0] = os.posix.calloc((win_size)1, (win_size)os.posix.PTHREAD_RWLOCK_T_SIZE);
-            if const (__MACOS__) { os.posix.pthread_rwlock_init(slot[0], nullptr); }
-        }
-        return slot[0];
+        void* cur = (void*)os.posix.__atomic_i64_load((i64*)slot);
+        if (cur != nullptr) return cur;
+        void* fresh = os.posix.calloc((win_size)1, (win_size)os.posix.PTHREAD_RWLOCK_T_SIZE);
+        if const (__MACOS__) { os.posix.pthread_rwlock_init(fresh, nullptr); }
+        if (os.posix.__atomic_i64_cas((i64*)slot, (i64)0, (i64)fresh)) { return fresh; }
+        os.posix.pthread_rwlock_destroy(fresh);
+        os.posix.free(fresh);
+        return (void*)os.posix.__atomic_i64_load((i64*)slot);
     }
 
     // === sysconf - runtime system configuration ===
@@ -455,11 +483,20 @@ namespace os.posix
     extern void    _exit(i32 code);
     int WNOHANG = 1;
     int SIGKILL = 9;
+    int SIGPIPE = 13;
 
     // Exit status decode: glibc encodes a normal exit's code in bits 8-15.
     i32 wexitstatus(i32 status) { return (status >> 8) & 0xFF; }
     // True once waitpid reports the child terminated (exited or signalled).
     bool wifexited(i32 status) { return (status & 0x7F) == 0; }
+    // The terminating signal for a child killed by a signal (0 for a normal exit).
+    i32 wtermsig(i32 status) { return status & 0x7F; }
+
+    // Ignore SIGPIPE process-wide so a write/send to a peer or child that closed
+    // its end returns EPIPE instead of killing the process (Winsock has no SIGPIPE).
+    // signal() takes/returns a handler pointer; SIG_IGN is (void*)1. Idempotent.
+    extern void* signal(i32 sig, void* handler);
+    void ignore_sigpipe() { os.posix.signal(os.posix.SIGPIPE, (void*)(i64)1); }
 
     // === BSD sockets ==========================================================
     // POSIX socket fds are plain ints; socket.posix.cb wraps them in a void* to

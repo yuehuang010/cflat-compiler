@@ -545,12 +545,18 @@ namespace os
         if (handle == nullptr) return;
         __OsThreadHandle* h = (__OsThreadHandle*)handle;
         if const (__WINDOWS__) {
+            // TerminateThread stops the thread synchronously, so the packet is safe to free.
             os.windows.TerminateThread(h->_os, -1);
             os.windows.CloseHandle(h->_os);
+            free((void*)h->_packet);
         } else {
+            // pthread_cancel is DEFERRED by default: a compute thread with no
+            // cancellation point keeps running and still references _packet, so
+            // freeing it here would be a use-after-free. Detach and intentionally
+            // leak the packet (as thread_detach does) - the live thread owns it.
             os.posix.pthread_cancel(h->_os);
+            os.posix.pthread_detach(h->_os);
         }
-        free((void*)h->_packet);
         free((void*)handle);
     }
 

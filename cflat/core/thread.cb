@@ -211,12 +211,15 @@ struct Thread {
     // use only when cooperative cancellation is not possible.
     void terminate() {
         if (_handle != nullptr) {
-            // os.thread_kill frees the os handle; null _handle to avoid a later
-            // double-free. The dead thread no longer touches _args, so free it.
             os.thread_kill(_handle);
             _handle = nullptr;
-            free((void*)_args);
-            _args   = nullptr;
+            if const (__WINDOWS__) {
+                // TerminateThread stopped the thread synchronously, so _args is safe to free.
+                free((void*)_args);
+                _args = nullptr;
+            }
+            // POSIX: pthread_cancel is deferred, so the thread may still read _args;
+            // it is intentionally leaked (see os.thread_kill) rather than risk a UAF.
         }
     }
 };
