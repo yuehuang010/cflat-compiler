@@ -148,6 +148,9 @@ def find_exe() -> str | None:
         repo_root / "x64" / "Debug"   / "cflat.exe",
         repo_root / "x86" / "Release" / "cflat.exe",
         repo_root / "x86" / "Debug"   / "cflat.exe",
+        # POSIX (Linux/WSL + macOS) builds emit an extensionless binary.
+        repo_root / "x64" / "Release" / "cflat",
+        repo_root / "x64" / "Debug"   / "cflat",
     ]
     for p in candidates:
         if p.exists():

@@ -115,6 +115,40 @@ def find_win32_metadata_dir() -> Path | None:
 # the non-host alternate - it is exercised on its own platform's run.
 NON_HOST_OS_FILE = "os.posix.cb" if os.name == "nt" else "os.windows.cb"
 
+HOST_IS_WINDOWS = os.name == "nt"
+
+# Windows/environment-only sources that cannot analyze clean on a non-Windows host:
+# they import windows.h/winsock2.h/COM headers, use os.windows.* or WinRT (.winmd),
+# or need a vcpkg package installed. The sweep runs the locally-built native cflat,
+# so the host OS is the analysis target. Mirrors test.sh's SKIP-list rationale; the
+# Windows CI run (test_lsp.bat) still sweeps every one of these. Skipped only off
+# Windows - keep in sync with the same-named content in test.sh when files move.
+_WIN_ONLY_DIRS = ("example/windows", "example/COM", "example/vcpkg")
+_WIN_ONLY_FILES = {
+    # Test/: os.windows.* usage, WinMD, or CRT header binding that collides with POSIX libc.
+    "test_crt.cb", "test_stream.cb", "test_threadpool.cb",
+    "test_windows.cb", "test_windows_cache.cb", "test_winmd.cb",
+    # example/hpc: os.windows.* high-resolution timing.
+    "heat_stencil.cb", "nbody2.cb", "spectrum.cb",
+    # example/restAPI: the server half uses os.windows.* (winsock); the client half is portable.
+    "benchmark.cb", "http_server.cb", "rest_server.cb",
+    "test_http_server.cb", "test_rest_features.cb", "test_rest_server.cb", "todo_api.cb",
+    # example/shell: os.windows.* console / _WIN32_FIND_DATAA.
+    "dir.cb", "fsh.cb", "stars.cb",
+    # example/ui: the win32_* backends and the os.windows.* framework demos.
+    "boxes.cb", "host.cb", "win32_boxes.cb", "win32_native_host.cb",
+    "win32_native_settings.cb", "win32_settings.cb", "win32_shot.cb", "win32host.cb",
+    # core: WinRT projection library (Windows-only).
+    "winrt.cb",
+}
+
+
+def is_windows_only(path: Path) -> bool:
+    rel = path.relative_to(REPO_ROOT).as_posix()
+    if any(rel == d or rel.startswith(d + "/") for d in _WIN_ONLY_DIRS):
+        return True
+    return path.name in _WIN_ONLY_FILES
+
 
 def collect_files(include_win32_demo: bool) -> list[Path]:
     files: list[Path] = []
@@ -139,8 +173,14 @@ def collect_files(include_win32_demo: bool) -> list[Path]:
 def run_bulk(exe: str, extra_args: list, show_timings: bool = False,
              include_win32_demo: bool = True) -> bool:
     paths = collect_files(include_win32_demo)
+    skipped_win: list[Path] = []
+    if not HOST_IS_WINDOWS:
+        skipped_win = [p for p in paths if is_windows_only(p)]
+        paths = [p for p in paths if not is_windows_only(p)]
     print(f"Server: {exe}")
     print(f"Files:  {len(paths)}")
+    if skipped_win:
+        print(f"Skipped: {len(skipped_win)} Windows/env-only sources (non-Windows host)")
 
     # Pipeline depth - open this many files concurrently, then wait for diagnostics.
     # The server pool runs analyses in parallel up to its hardware_concurrency limit,
@@ -283,7 +323,8 @@ def main():
     exe: str | None = None
     if argv:
         first = argv[0]
-        if Path(first).exists() and first.lower().endswith(".exe"):
+        # Accept either a Windows cflat.exe or an extensionless POSIX cflat binary.
+        if not first.startswith("-") and Path(first).exists():
             exe = first
             extra_args = argv[1:]
         else:
@@ -308,6 +349,12 @@ def main():
     # the Win32-metadata dir (import dirs are searched in order, first match wins).
     ui_dir = (REPO_ROOT / UI_FRAMEWORK_DIR).resolve()
     extra_args = extra_args + ["-i", str(ui_dir)]
+
+    # The macOS NativeHost demos (cocoa_native_host/settings) import "cocoa.cb" from
+    # example/macos; add it so those resolve on a Mac (harmless extra dir on Windows).
+    macos_dir = (REPO_ROOT / "example" / "macos").resolve()
+    if macos_dir.is_dir():
+        extra_args = extra_args + ["-i", str(macos_dir)]
 
     ok = run_bulk(exe, extra_args, show_timings, include_win32_demo=win32_dir is not None)
     sys.exit(0 if ok else 1)

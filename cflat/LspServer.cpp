@@ -33,7 +33,10 @@ std::string uriToFilePath(const std::string& uri)
 {
     if (!uri.starts_with(kFileUriPrefix))
         return uri;
-    std::string path = uri.substr(kFileUriPrefix.size());
+    // Keep the leading '/' after "file://": on POSIX it is the root of the
+    // absolute path; on Windows it precedes the drive letter and is stripped below.
+    // (Consuming all three slashes would turn "/Users/x" into a relative "Users/x".)
+    std::string path = uri.substr(kFileUriPrefix.size() - 1);
     std::string result;
     for (size_t i = 0; i < path.size(); ++i)
     {
@@ -43,24 +46,36 @@ std::string uriToFilePath(const std::string& uri)
             result += static_cast<char>(std::strtol(hex, nullptr, 16));
             i += 2;
         }
-        else if (path[i] == '/')
-            result += '\\';
         else
             result += path[i];
     }
+#ifdef _WIN32
+    // "/C:/foo/bar" -> "C:\foo\bar": drop the leading slash before the drive letter,
+    // then use backslash separators. POSIX paths keep '/' and their leading slash.
+    if (result.size() >= 3 && result[0] == '/' &&
+        std::isalpha((unsigned char)result[1]) && result[2] == ':')
+        result.erase(0, 1);
+    for (char& c : result)
+        if (c == '/') c = '\\';
+#endif
     return result;
 }
 
 std::string filePathToUri(const std::string& path)
 {
-    std::string uri(kFileUriPrefix);
+    std::string body;
     for (char c : path)
     {
-        if (c == '\\') uri += '/';
-        else if (c == ':') uri += "%3A";
-        else uri += c;
+        if (c == '\\') body += '/';
+        else if (c == ':') body += "%3A";
+        else body += c;
     }
-    return uri;
+    // Exactly three slashes must follow "file:". A POSIX path already starts with
+    // '/', so "file://" + "/Users/x" == "file:///Users/x". A Windows drive path
+    // ("C:\...") does not, so it needs the explicit third slash.
+    if (!body.empty() && body[0] == '/')
+        return "file://" + body;
+    return std::string(kFileUriPrefix) + body;
 }
 
 static bool isWordChar(char c) { return std::isalnum((unsigned char)c) || c == '_'; }
@@ -1370,6 +1385,15 @@ private:
         {
             newIndex->RemapFile(tempPath, filePath);
             newIndex->RemapFile(std::filesystem::path(tempPath).filename().string(), filePath);
+            // The backend canonicalizes source paths (weakly_canonical) when recording
+            // candidate/symbol files. On macOS $TMPDIR (/var/folders/...) is a symlink to
+            // /private/var/..., so the recorded form differs from the raw tempPath and the
+            // exact-match remaps above miss it - remap the resolved form too, else
+            // file-scoped filters (e.g. unused-symbol hints) drop every entry.
+            std::error_code canonEc;
+            auto canonTemp = std::filesystem::weakly_canonical(tempPath, canonEc);
+            if (!canonEc && canonTemp.string() != tempPath)
+                newIndex->RemapFile(canonTemp.string(), filePath);
         }
 
         // Last-known-good cache - kept global for now. Edits land sequentially in

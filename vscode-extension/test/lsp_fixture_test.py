@@ -44,8 +44,16 @@ def _uri_for(name: str) -> str:
 # Directive parser
 # ---------------------------------------------------------------------------
 
-_CURSOR_RE  = re.compile(r"//\s+\$cursor\s+line=(\d+)\s+col=(\d+)")
-_EXPECT_RE  = re.compile(r"//\s+\$expect\s+(.*)")
+_CURSOR_RE   = re.compile(r"//\s+\$cursor\s+line=(\d+)\s+col=(\d+)")
+_EXPECT_RE   = re.compile(r"//\s+\$expect\s+(.*)")
+# `// $platform windows` marks a fixture that only runs on the named host (e.g. it
+# imports windows.h). The suite runs the locally-built native cflat, so the host
+# platform is also the target platform.
+_PLATFORM_RE = re.compile(r"//\s+\$platform\s+(\w+)")
+
+HOST_PLATFORM = ("windows" if sys.platform.startswith("win")
+                 else "macos" if sys.platform == "darwin"
+                 else "linux")
 
 
 def _parse_kv(text: str) -> dict:
@@ -82,6 +90,10 @@ def parse_fixture(content: str) -> tuple[dict, str]:
             kind = parts[0]
             kv = _parse_kv(parts[1]) if len(parts) > 1 else {}
             directives["expect"] = (kind, kv)
+            continue
+        m = _PLATFORM_RE.match(stripped)
+        if m:
+            directives["platform"] = m.group(1).lower()
             continue
         source_lines.append(line)
 
@@ -507,6 +519,7 @@ def run_all(exe: str, extra_args: list) -> bool:
 
     passed = 0
     failed = 0
+    skipped = 0
 
     def record(name: str, error: str | None):
         nonlocal passed, failed
@@ -518,9 +531,19 @@ def run_all(exe: str, extra_args: list) -> bool:
             print(f"        {error}")
             failed += 1
 
+    def skip(name: str, reason: str):
+        nonlocal skipped
+        print(f"  SKIP  {name} ({reason})")
+        skipped += 1
+
     # --- fixture-driven tests ---
     for fixture_path in fixtures:
         name = fixture_path.name
+        directives, _ = parse_fixture(fixture_path.read_text(encoding="utf-8"))
+        req = directives.get("platform")
+        if req and req != HOST_PLATFORM:
+            skip(name, f"requires {req}, host is {HOST_PLATFORM}")
+            continue
         try:
             err = run_fixture(client, fixture_path)
         except TimeoutError as e:
@@ -570,12 +593,20 @@ def run_all(exe: str, extra_args: list) -> bool:
     except Exception as e:
         record("negative: hover before initialize", f"EXCEPTION: {e}")
 
-    try:
-        err = test_reanalysis_state_isolation(exe)
-        record("reanalysis: B-after-A state isolation (L1)", err)
-    except Exception as e:
-        record("reanalysis: B-after-A state isolation (L1)", f"EXCEPTION: {e}")
+    # The L1 repro pins Test/test_threadpool.cb as "file A", which uses os.windows.*
+    # and so is not clean standalone off Windows (it is in test.sh's skip list). The
+    # regression stays covered by the Windows test_lsp.bat run.
+    if HOST_PLATFORM != "windows":
+        skip("reanalysis: B-after-A state isolation (L1)", "repro files are Windows-only")
+    else:
+        try:
+            err = test_reanalysis_state_isolation(exe)
+            record("reanalysis: B-after-A state isolation (L1)", err)
+        except Exception as e:
+            record("reanalysis: B-after-A state isolation (L1)", f"EXCEPTION: {e}")
 
+    if skipped:
+        print(f"({skipped} skipped: platform-specific)")
     return failed == 0
 
 

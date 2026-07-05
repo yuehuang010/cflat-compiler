@@ -1098,8 +1098,20 @@ private:
     // arm64 is the only supported macOS arch; the architecture is tracked
     // separately because every prior target was x86 (the eightbyte struct ABI,
     // va_list lowering, and triple all assume x86-64 unless this is set).
+    // Defaults to the host OS (the CLI overrides via --platform; the LSP Analyze
+    // path does not, so the raw default must match the host or if-const(__MACOS__)
+    // branches and os.macos.cb selection go the wrong way during LSP analysis).
+#if defined(__APPLE__)
+    bool targetMacOS_ = true;
+  #if defined(__aarch64__) || defined(__arm64__)
+    bool targetArm64_ = true;
+  #else
+    bool targetArm64_ = false;
+  #endif
+#else
     bool targetMacOS_ = false;
     bool targetArm64_ = false;
+#endif
     std::vector<std::string> cObjectFiles_;
     int cOptLevel_ = 0;        // optimization level applied to clang C compiles
     bool cDebugInfo_ = false;  // emit CodeView for clang C compiles
