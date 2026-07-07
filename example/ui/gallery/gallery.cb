@@ -1,0 +1,657 @@
+// gallery.cb - the widget-gallery flagship (P10 finishes it).
+//
+// A single app that exercises EVERY framework element on real Win32 controls through
+// win32_native_host.cb, and their permanent home for the headless state-assert self-
+// tests. P8 added the tier-1 data controls (RadioGroup/RadioButton, ComboBox, a
+// virtualized ListView); P9 added the tier-2 navigation chrome (TabControl, TreeView,
+// SplitView, ContextMenu). P10 completes the set: the classic form widgets (Button,
+// TextInput, Checkbox, ProgressBar, Slider, TextArea, StatusBar, GroupBox), a bitmap
+// Image (BGRA32 pushed through the setImageData seam), and a CanvasView escape hatch
+// the app paints with the Canvas API. A light/dark toggle drives NM_CUSTOMDRAW accent
+// buttons; PrintWindow -> BMP (see --shots) makes the gallery the doc-screenshot source.
+//
+// Build & run (live window):
+//   x64/Release/cflat.exe example/ui/gallery/gallery.cb -i example/ui -o out/gallery.exe
+//   out\gallery.exe
+//
+// Headless state-assert self-test (no visible window; example.bat --worker-gallery):
+//   out\gallery.exe --selftest
+// Doc screenshots (light + dark BMP into out/):
+//   out\gallery.exe --shots out
+import "win32_native_host.cb";
+import "graphic/bitmap.cb";
+
+// The gallery's virtual list size. 100k rows must work with only the visible rows
+// ever queried - the whole point of LVS_OWNERDATA + a rowText callback.
+const int GALLERY_ROWS = 100000;
+
+// Context-menu command ids (routed through the app menu handler, like the menu bar).
+int CMD_CTX_A = 201;
+int CMD_CTX_B = 202;
+
+// PrintWindow + GetDIBits are used by the screenshot path; not surfaced by the binding.
+extern stdcall i32 PrintWindow(void* hwnd, void* hdc, u32 flags);
+extern stdcall i32 GetDIBits(void* hdc, void* hbm, u32 start, u32 lines, void* bits, void* bmi, u32 usage);
+
+// A generated top-down BGRA32 gradient (caller frees). Demonstrates the setImageData
+// seam end to end without any asset file: the host uploads these bytes to an HBITMAP.
+u64 makeGradientPixels(int w, int h)
+{
+    u64 p = (u64)malloc((i64)(w * h * 4));
+    char* b = (char*)p;
+    int y = 0;
+    while (y < h)
+    {
+        int x = 0;
+        while (x < w)
+        {
+            int i = (y * w + x) * 4;
+            b[i + 0] = (char)(x * 255 / w);   // Blue
+            b[i + 1] = (char)(y * 255 / h);   // Green
+            b[i + 2] = (char)200;             // Red
+            b[i + 3] = (char)255;             // Alpha
+            x++;
+        }
+        y++;
+    }
+    return p;
+}
+
+class GalleryApp : Component
+{
+    int pick          = 1;    // RadioGroup selection (0 Small / 1 Medium / 2 Large)
+    int fontIdx       = 0;    // ComboBox selection
+    int listSel       = -1;   // ListView selected row (controlled)
+    int listActivated = -1;   // last double-clicked / Entered row
+    int rowTextCalls  = 0;    // rowText callback invocations (virtualization oracle)
+    int tab           = 0;    // TabControl selection (P9)
+    int treeSel       = 0 - 1; // selected tree node id (P9)
+    int treeExpands   = 0;    // onExpand invocations (P9)
+    int splitRatio    = 30;   // SplitView first-pane percentage (P9)
+    int ctxFired      = 0;    // last context-menu command routed (P9)
+    bool _ctxReg      = false; // one-time context-menu registration guard
+
+    // P10 form-widget state (all controlled).
+    bool   dark       = false;   // theme toggle (light/dark)
+    int    btnClicks  = 0;       // push-button press count
+    string inputText  = default; // TextInput value
+    bool   checked    = false;   // Checkbox value
+    int    progress   = 60;      // ProgressBar value (0..100)
+    int    sliderVal  = 40;      // Slider value (0..100)
+    int    areaEdits  = 0;       // TextArea dirty-notify count
+
+    // Image pixel buffer (owned by the component; freed in the destructor). Borrowed by
+    // the Image element each render - the element never owns pixel memory.
+    u64 imgPixels = 0u;
+    int imgW = 0;
+    int imgH = 0;
+
+    ~GalleryApp()
+    {
+        if (this.imgPixels != 0u) { free((void*)this.imgPixels); this.imgPixels = 0u; }
+    }
+
+    string _sizeName()
+    {
+        if (this.pick == 0) return "Small";
+        if (this.pick == 1) return "Medium";
+        return "Large";
+    }
+
+    // Route a context-menu command (invoked via setMenuHandler / nativeFireContextMenu).
+    void onCommand(int id, UiContext* ctx) { this.ctxFired = id; ctx.invalidate(); }
+
+    Element render(UiContext* ctx)
+    {
+        ctx.theme = this.dark ? darkTheme() : lightTheme();
+
+        // Lazily build the image pixels once (freed in the destructor).
+        if (this.imgPixels == 0u) { this.imgW = 12; this.imgH = 6; this.imgPixels = makeGradientPixels(12, 6); }
+
+        // Register the tree's context menu once (keyed by control path; idempotent).
+        if (!this._ctxReg)
+        {
+            nativeSetContextMenu("root/ctxbox", (u64)buildCtxMenu());
+            this._ctxReg = true;
+        }
+
+        Box* root = box(makeStyle(1, hostWidth(), hostHeight()));
+        root.style.gap = 1;
+        root.setKey("root");
+
+        Text* title = text("Widget Gallery (P10 - full element set)");
+        title.setKey("title");
+        root.add(title);
+
+        // A themed push button + a theme toggle (NM_CUSTOMDRAW accent in dark mode).
+        Button* btn = <Button key="btn" title="Click me"
+                onPress={() => { this.btnClicks = this.btnClicks + 1; ctx.invalidate(); }}/>;
+        root.add(btn);
+        Button* themeBtn = <Button key="themebtn" title="Toggle theme"
+                onPress={() => { this.dark = !this.dark; ctx.invalidate(); }}/>;
+        root.add(themeBtn);
+
+        // The P10 visuals sit high in the column so they land in the doc screenshot (the
+        // full single-column gallery is taller than one window; the self-test covers the rest).
+        // An Image fed a procedural BGRA32 buffer through the setImageData seam.
+        Image* img = <Image key="img" width={12} height={4} altText="gradient"/>;
+        img.pixels = this.imgPixels; img.pxW = this.imgW; img.pxH = this.imgH;
+        root.add(img);
+
+        // A CanvasView escape hatch: the app draws with the same Canvas API the framework
+        // paints through (here, a tiny bar chart + a label) into a GDI-backed child window.
+        CanvasView* canvas = <CanvasView key="canvas" width={24} height={6}/>;
+        canvas.onPaint = (Canvas c) => {
+            int barCount = 5;
+            int i = 0;
+            while (i < barCount)
+            {
+                Rect bar = default;
+                bar.x = 1 + i * 4; bar.w = 3;
+                bar.h = 1 + i; bar.y = 5 - bar.h;
+                c.drawRect(bar, true, rgb(60 + i * 30, 120, 220));
+                i++;
+            }
+            c.drawText(1, 5, "canvas", rgb(40, 40, 40));
+        };
+        root.add(canvas);
+
+        // Controlled TextInput + Checkbox.
+        TextInput* input = <TextInput key="input" value={this.inputText} width={24}
+                placeholder="type here"
+                onChangeText={(string s) => { this.inputText = s; ctx.invalidate(); }}/>;
+        root.add(input);
+        Checkbox* chk = <Checkbox key="check" label="Enable feature" checked={this.checked}
+                onChange={(bool v) => { this.checked = v; ctx.invalidate(); }}/>;
+        root.add(chk);
+
+        // Presentational ProgressBar + controlled Slider.
+        ProgressBar* prog = <ProgressBar key="prog" value={this.progress} width={24}/>;
+        root.add(prog);
+        Slider* sld = <Slider key="slider" value={this.sliderVal} width={24}
+                onChange={(int v) => { this.sliderVal = v; ctx.invalidate(); }}/>;
+        root.add(sld);
+
+        // A GroupBox framing a couple of labels (classic-forms grouping).
+        GroupBox* grp = <GroupBox key="grp" title="Options"/>;
+        grp.style.width = 30; grp.style.height = 4;
+        grp.add(<Text key="gt0" text="grouped item A"/>);
+        grp.add(<Text key="gt1" text="grouped item B"/>);
+        root.add(grp);
+
+        // RadioGroup authored in sugar (controlled: each radio's checked flows down).
+        RadioGroup* rg = <RadioGroup key="rg" value={this.pick}
+                onChange={(int i) => { this.pick = i; ctx.invalidate(); }}>
+            <RadioButton key="r0" label="Small"  index={0} checked={this.pick == 0}/>
+            <RadioButton key="r1" label="Medium" index={1} checked={this.pick == 1}/>
+            <RadioButton key="r2" label="Large"  index={2} checked={this.pick == 2}/>
+        </RadioGroup>;
+        root.add(rg);
+
+        // ComboBox authored in sugar; items added imperatively (a list-valued field is
+        // not set through a sugar attribute - the container-copy-into-field rule).
+        ComboBox* cb = <ComboBox key="combo" selectedIndex={this.fontIdx} width={20}
+                onChange={(int i) => { this.fontIdx = i; ctx.invalidate(); }}/>;
+        cb.addItem("Consolas");
+        cb.addItem("Cascadia Code");
+        cb.addItem("Segoe UI");
+        cb.addItem("Courier New");
+        root.add(cb);
+
+        // Virtualized ListView authored in sugar; columns + rowText set imperatively.
+        ListView* lv = <ListView key="list" rowCount={GALLERY_ROWS}
+                selectedIndex={this.listSel} width={40} height={6}
+                onSelect={(int r) => { this.listSel = r; ctx.invalidate(); }}
+                onActivate={(int r) => { this.listActivated = r; ctx.invalidate(); }}/>;
+        lv.addColumn("Index", 12);
+        lv.addColumn("Square", 18);
+        lv.rowText = (int r, int c) => {
+            this.rowTextCalls = this.rowTextCalls + 1;
+            if (c == 0) return "row " + r.toString();
+            i64 sq = (i64)r * (i64)r;
+            return sq.toString();
+        };
+        root.add(lv);
+
+        // TabControl authored in sugar (P9): keyed panes, only the active one maps to
+        // native. Switching tabs is controlled through onSelectTab.
+        TabControl* tabs = <TabControl key="tabs" selectedTab={this.tab} width={40} height={5}
+                onSelectTab={(int i) => { this.tab = i; ctx.invalidate(); }}>
+            <TabPane key="p0" title="Alpha"><Text key="t0" text="Alpha pane content"/></TabPane>
+            <TabPane key="p1" title="Beta"><Text key="t1" text="Beta pane content"/></TabPane>
+        </TabControl>;
+        root.add(tabs);
+
+        // TreeView authored in sugar (P9): expand-on-demand node source. onSelect/onExpand
+        // are attributes; the child/label callbacks are assigned imperatively (like rowText).
+        TreeView* tree = <TreeView key="tree" width={24} height={6} selectedNode={this.treeSel}
+                onSelect={(int nid) => { this.treeSel = nid; ctx.invalidate(); }}
+                onExpand={(int nid) => { this.treeExpands = this.treeExpands + 1; }}/>;
+        tree.childCount = (int nid) => {
+            if (nid == TREE_ROOT) return 2;   // src (folder) + notes.txt
+            if (nid == 1) return 2;           // main.cb + ui.cb
+            return 0;
+        };
+        tree.childId = (int nid, int i) => {
+            if (nid == TREE_ROOT) return i == 0 ? 1 : 2;
+            if (nid == 1) return i == 0 ? 10 : 11;
+            return 0;
+        };
+        tree.label = (int nid) => {
+            if (nid == 1) return "src";
+            if (nid == 2) return "notes.txt";
+            if (nid == 10) return "main.cb";
+            if (nid == 11) return "ui.cb";
+            return "?";
+        };
+        root.add(tree);
+
+        // SplitView authored in sugar (P9): two weighted panes + a draggable divider.
+        SplitView* split = <SplitView key="split" ratio={this.splitRatio} vertical={true}
+                onRatioChange={(int r) => { this.splitRatio = r; ctx.invalidate(); }}>
+            <Box key="lp" style={makeStyle(0, 0, 3)}><Text key="lpt" text="left"/></Box>
+            <Box key="rp" style={makeStyle(0, 0, 3)}><Text key="rpt" text="right"/></Box>
+        </SplitView>;
+        split.style.width = 40; split.style.height = 3;
+        root.add(split);
+
+        // A multiline TextArea (uncontrolled-with-sync) + a right-clickable context panel.
+        TextArea* area = <TextArea key="area" value="" width={40} height={4}
+                onChange={() => { this.areaEdits = this.areaEdits + 1; }}/>;
+        root.add(area);
+
+        Box* ctxbox = box(makeStyle(0, 40, 2));
+        ctxbox.setKey("ctxbox");
+        ctxbox.add(text("right-click me (context menu)"));
+        root.add(ctxbox);
+
+        // Status lines (existing P8/P9 asserts) + a bottom StatusBar strip.
+        Text* status = text("pick=" + this._sizeName() + " font=" + this.fontIdx.toString()
+            + " sel=" + this.listSel.toString() + " act=" + this.listActivated.toString());
+        status.setKey("status");
+        root.add(status);
+
+        Text* status2 = text("tab=" + this.tab.toString() + " tsel=" + this.treeSel.toString()
+            + " ratio=" + this.splitRatio.toString() + " ctx=" + this.ctxFired.toString());
+        status2.setKey("status2");
+        root.add(status2);
+
+        StatusBar* sbar = <StatusBar key="sbar"/>;
+        sbar.parts.add("Ready");
+        sbar.parts.add("clicks=" + this.btnClicks.toString());
+        root.add(sbar);
+        return root;
+    }
+};
+
+// A context menu built with the <ContextMenu/> sugar (P9); returned as an owned pointer
+// the caller inline-casts to u64 for nativeSetContextMenu (the host then owns + frees it).
+ContextMenu* buildCtxMenu()
+{
+    ContextMenu* m = <ContextMenu/>;
+    m.addItem("Action A", CMD_CTX_A);
+    m.addItem("Action B", CMD_CTX_B);
+    return m;
+}
+
+// Wire the app menu handler so a context-menu command reaches the model. A NAMED borrow
+// is downcast (not activeApp() directly) - `as` on a call result yields an owning ptr.
+void wireGallery()
+{
+    setMenuHandler((int id) =>
+    {
+        Component app = activeApp();
+        GalleryApp* g = app as GalleryApp;
+        if (g != nullptr) g.onCommand(id, activeCtx());
+    });
+}
+
+// ── Headless state-assert self-test ──────────────────────────────────────────
+// Invisible window, real controls, driven with SendMessage exactly as the OS would on
+// user input; control + model state is the oracle (no pixels).
+
+bool _txtEq(void* h, const char* want)
+{
+    char[256] buf;
+    GetWindowTextA(h, buf, 256);
+    return strcmp(buf, (char*)want) == 0;
+}
+
+bool _statusEq(void* hStat, const char* want) { return _txtEq(hStat, want); }
+
+// status2 substring check (owned read + strstr).
+bool _has2(void* h, const char* sub)
+{
+    char[256] buf;
+    GetWindowTextA(h, buf, 256);
+    return strstr(buf, (char*)sub) != nullptr;
+}
+
+int gallerySelfTest()
+{
+    wireGallery();
+    int wi = createAppWindow(new GalleryApp(), "gallery-selftest", false);   // hidden
+    curWin().w = 60; curWin().h = 60;
+    buildWindowTree(wi);
+
+    void* hR0 = u2h(activeCtx().nativeHandle("root/rg/r0"));
+    void* hR1 = u2h(activeCtx().nativeHandle("root/rg/r1"));
+    void* hR2 = u2h(activeCtx().nativeHandle("root/rg/r2"));
+    void* hCombo = u2h(activeCtx().nativeHandle("root/combo"));
+    void* hList  = u2h(activeCtx().nativeHandle("root/list"));
+    void* hStat  = u2h(activeCtx().nativeHandle("root/status"));
+    void* hStat2 = u2h(activeCtx().nativeHandle("root/status2"));
+
+    int pass = 0; int total = 0;
+
+    // 1. Every P8 control became a real control.
+    total++;
+    bool created = hR0 != nullptr && hR1 != nullptr && hR2 != nullptr
+        && hCombo != nullptr && hList != nullptr && hStat != nullptr && hStat2 != nullptr;
+    if (created) pass++; else printf("  FAIL: controls not all created\n");
+
+    // 2. Initial state: radio r1 checked (pick=1), combo at index 0, list has 100k rows,
+    //    status echoes the model.
+    total++;
+    bool init = (int)SendMessageA(hR1, (u32)BM_GETCHECK, 0u, (i64)0) == 1
+        && (int)SendMessageA(hR0, (u32)BM_GETCHECK, 0u, (i64)0) == 0
+        && (int)SendMessageA(hR2, (u32)BM_GETCHECK, 0u, (i64)0) == 0
+        && (int)SendMessageA(hCombo, (u32)CB_GETCURSEL, 0u, (i64)0) == 0
+        && nativeListRowCount("root/list") == GALLERY_ROWS
+        && _statusEq(hStat, "pick=Medium font=0 sel=-1 act=-1");
+    if (init) pass++; else printf("  FAIL: initial state\n");
+
+    // 3. Click radio "Large".
+    total++;
+    SendMessageA(hR2, (u32)BM_CLICK, 0u, (i64)0);
+    bool radio = (int)SendMessageA(hR2, (u32)BM_GETCHECK, 0u, (i64)0) == 1
+        && (int)SendMessageA(hR1, (u32)BM_GETCHECK, 0u, (i64)0) == 0
+        && _statusEq(hStat, "pick=Large font=0 sel=-1 act=-1");
+    if (radio) pass++; else printf("  FAIL: radio selection\n");
+
+    // 4. Change the combo to index 2 and post CBN_SELCHANGE.
+    total++;
+    SendMessageA(hCombo, (u32)CB_SETCURSEL, 2u, (i64)0);
+    SendMessageA(curWin().hwnd, (u32)WM_COMMAND, ((u64)CBN_SELCHANGE << 16), (i64)hCombo);
+    bool combo = _statusEq(hStat, "pick=Large font=2 sel=-1 act=-1");
+    if (combo) pass++; else printf("  FAIL: combo change not routed\n");
+
+    // 5. Virtualization + rowText wiring: query two cells of row 50000.
+    total++;
+    string cell0 = nativeListCellText("root/list", 50000, 0);
+    string cell1 = nativeListCellText("root/list", 50000, 1);
+    bool cells = cell0 == "row 50000" && cell1 == "2500000000";
+    if (cells) pass++; else printf("  FAIL: cell text (col0='%s' col1='%s')\n", cell0.data(), cell1.data());
+
+    // 6. Virtualization oracle: rowText fired only a handful of times for 100k rows.
+    total++;
+    Component app = activeApp();
+    GalleryApp* g = app as GalleryApp;
+    int calls = g != nullptr ? g.rowTextCalls : 999999;
+    bool virt = calls > 0 && calls < 100;
+    if (virt) pass++; else printf("  FAIL: rowText invoked %d times (expected small)\n", calls);
+
+    // 7. Selection round-trip: select row 5 as the OS would.
+    total++;
+    nativeListSelect("root/list", 5);
+    bool sel = nativeListSelectedRow("root/list") == 5
+        && g != nullptr && g.listSel == 5
+        && _statusEq(hStat, "pick=Large font=2 sel=5 act=-1");
+    if (sel) pass++; else printf("  FAIL: list selection round-trip (row=%d)\n", nativeListSelectedRow("root/list"));
+
+    // 8. Activation: Enter on the list.
+    total++;
+    SendMessageA(hList, (u32)WM_KEYDOWN, (u64)VK_RETURN, (i64)0);
+    bool act = g != nullptr && g.listActivated == 5
+        && _statusEq(hStat, "pick=Large font=2 sel=5 act=5");
+    if (act) pass++; else printf("  FAIL: list activation (act=%d)\n", g != nullptr ? g.listActivated : -2);
+
+    // 9. TabControl (P9): two tabs, initial selection 0, the active pane's Text is live.
+    total++;
+    void* hTabs = u2h(activeCtx().nativeHandle("root/tabs"));
+    void* hP0   = u2h(activeCtx().nativeHandle("root/tabs/p0/t0"));
+    void* hP1a  = u2h(activeCtx().nativeHandle("root/tabs/p1/t1"));
+    bool tabsInit = hTabs != nullptr && nativeTabCount("root/tabs") == 2
+        && nativeTabSelected("root/tabs") == 0 && hP0 != nullptr && hP1a == nullptr;
+    if (tabsInit) pass++; else printf("  FAIL: tabs init (count=%d sel=%d)\n", nativeTabCount("root/tabs"), nativeTabSelected("root/tabs"));
+
+    // 10. Tab switch: select tab 1; the model follows, pane p1 becomes live, p0 destroyed.
+    total++;
+    nativeTabSelect("root/tabs", 1);
+    void* hP0b = u2h(activeCtx().nativeHandle("root/tabs/p0/t0"));
+    void* hP1b = u2h(activeCtx().nativeHandle("root/tabs/p1/t1"));
+    bool tabSwitch = g != nullptr && g.tab == 1 && nativeTabSelected("root/tabs") == 1
+        && hP1b != nullptr && hP0b == nullptr && _has2(hStat2, "tab=1");
+    if (tabSwitch) pass++; else printf("  FAIL: tab switch (tab=%d)\n", g != nullptr ? g.tab : -1);
+
+    // 11. TreeView (P9): the two top-level nodes are inserted; expanding "src" lazily
+    //     materializes its two children (count 2 -> 4) and fires onExpand.
+    total++;
+    void* hTree = u2h(activeCtx().nativeHandle("root/tree"));
+    int cntBefore = nativeTreeItemCount("root/tree");
+    u64 srcItem = nativeTreeRootItem("root/tree");
+    int beforeExpands = g != nullptr ? g.treeExpands : 0;
+    nativeTreeExpandItem("root/tree", srcItem);
+    int cntAfter = nativeTreeItemCount("root/tree");
+    bool treeExpand = hTree != nullptr && cntBefore == 2 && cntAfter == 4
+        && g != nullptr && g.treeExpands > beforeExpands;
+    if (treeExpand) pass++; else printf("  FAIL: tree expand (before=%d after=%d)\n", cntBefore, cntAfter);
+
+    // 12. Tree select: select the first child of "src" (main.cb, node 10) -> onSelect.
+    total++;
+    u64 child0 = nativeTreeChildItem("root/tree", srcItem);
+    int childNid = nativeTreeItemNodeId("root/tree", child0);
+    nativeTreeSelectItem("root/tree", child0);
+    bool treeSel = g != nullptr && g.treeSel == 10 && childNid == 10 && _has2(hStat2, "tsel=10");
+    if (treeSel) pass++; else printf("  FAIL: tree select (treeSel=%d nid=%d)\n", g != nullptr ? g.treeSel : -9, childNid);
+
+    // 13. SplitView (P9): dragging the divider changes the ratio + the left pane's width.
+    total++;
+    Rect sbBefore = nativeNodeBounds("root/split/lp");
+    Rect splitB = nativeNodeBounds("root/split");
+    nativeSplitterDrag("root/split", splitB.x + 30, splitB.y);   // ratio ~= 75
+    Rect sbAfter = nativeNodeBounds("root/split/lp");
+    bool splitDrag = g != nullptr && g.splitRatio != 30 && sbAfter.w != sbBefore.w
+        && _has2(hStat2, "ratio=");
+    if (splitDrag) pass++; else printf("  FAIL: split drag (ratio=%d w %d->%d)\n", g != nullptr ? g.splitRatio : -1, sbBefore.w, sbAfter.w);
+
+    // 14. ContextMenu (P9): firing item 0 routes CMD_CTX_A through the app menu handler.
+    total++;
+    nativeFireContextMenu("root/ctxbox", 0);
+    bool ctxOk = g != nullptr && g.ctxFired == CMD_CTX_A && _has2(hStat2, "ctx=201");
+    if (ctxOk) pass++; else printf("  FAIL: context menu route (ctxFired=%d)\n", g != nullptr ? g.ctxFired : -1);
+
+    // ── P10: form widgets + visuals ──────────────────────────────────────────
+    void* hBtn   = u2h(activeCtx().nativeHandle("root/btn"));
+    void* hInput = u2h(activeCtx().nativeHandle("root/input"));
+    void* hCheck = u2h(activeCtx().nativeHandle("root/check"));
+    void* hProg  = u2h(activeCtx().nativeHandle("root/prog"));
+    void* hSlide = u2h(activeCtx().nativeHandle("root/slider"));
+    void* hGrp   = u2h(activeCtx().nativeHandle("root/grp"));
+    void* hImg   = u2h(activeCtx().nativeHandle("root/img"));
+    void* hCanvas = u2h(activeCtx().nativeHandle("root/canvas"));
+    void* hArea  = u2h(activeCtx().nativeHandle("root/area"));
+    void* hSbar  = u2h(activeCtx().nativeHandle("root/sbar"));
+
+    // 15. All the P10 controls were created.
+    total++;
+    bool p10Created = hBtn != nullptr && hInput != nullptr && hCheck != nullptr
+        && hProg != nullptr && hSlide != nullptr && hGrp != nullptr && hImg != nullptr
+        && hCanvas != nullptr && hArea != nullptr && hSbar != nullptr;
+    if (p10Created) pass++; else printf("  FAIL: P10 controls not all created\n");
+
+    // 16. Button click routes onPress (BN_CLICKED via the parent WM_COMMAND).
+    total++;
+    SendMessageA(curWin().hwnd, (u32)WM_COMMAND, ((u64)BN_CLICKED << 16), (i64)hBtn);
+    bool btnOk = g != nullptr && g.btnClicks == 1;
+    if (btnOk) pass++; else printf("  FAIL: button click (clicks=%d)\n", g != nullptr ? g.btnClicks : -1);
+
+    // 17. TextInput: set text + route EN_CHANGE -> controlled onChangeText updates the model.
+    total++;
+    SetWindowTextA(hInput, "hello");
+    SendMessageA(curWin().hwnd, (u32)WM_COMMAND, ((u64)EN_CHANGE << 16), (i64)hInput);
+    bool inputOk = g != nullptr && g.inputText == "hello" && _txtEq(hInput, "hello");
+    if (inputOk) pass++; else printf("  FAIL: text input route\n");
+
+    // 18. Checkbox: click + route BN_CLICKED -> controlled onChange flips the model.
+    total++;
+    SendMessageA(hCheck, (u32)BM_SETCHECK, 1u, (i64)0);
+    SendMessageA(curWin().hwnd, (u32)WM_COMMAND, ((u64)BN_CLICKED << 16), (i64)hCheck);
+    bool checkOk = g != nullptr && g.checked;
+    if (checkOk) pass++; else printf("  FAIL: checkbox toggle\n");
+
+    // 19. ProgressBar reflects the model value (PBM_GETPOS).
+    total++;
+    bool progOk = (int)SendMessageA(hProg, (u32)PBM_GETPOS, 0u, (i64)0) == 60;
+    if (progOk) pass++; else printf("  FAIL: progress value (%d)\n", (int)SendMessageA(hProg, (u32)PBM_GETPOS, 0u, (i64)0));
+
+    // 20. Slider: drag to a new position + route WM_HSCROLL -> controlled onChange.
+    total++;
+    SendMessageA(hSlide, (u32)TBM_SETPOS, 1u, (i64)80);
+    SendMessageA(curWin().hwnd, (u32)WM_HSCROLL, 0u, (i64)hSlide);
+    bool sliderOk = g != nullptr && g.sliderVal == 80;
+    if (sliderOk) pass++; else printf("  FAIL: slider (val=%d)\n", g != nullptr ? g.sliderVal : -1);
+
+    // 21. GroupBox carries its title.
+    total++;
+    bool grpOk = _txtEq(hGrp, "Options");
+    if (grpOk) pass++; else printf("  FAIL: groupbox title\n");
+
+    // 22. Image: the setImageData seam uploaded an HBITMAP (STM_GETIMAGE non-null).
+    total++;
+    void* imgBmp = (void*)SendMessageA(hImg, (u32)STM_GETIMAGE, (u64)IMAGE_BITMAP, (i64)0);
+    bool imgOk = imgBmp != nullptr;
+    if (imgOk) pass++; else printf("  FAIL: image has no bitmap\n");
+
+    // 23. StatusBar strip carries the main pane text.
+    total++;
+    bool sbarOk = _has2(hSbar, "Ready");
+    if (sbarOk) pass++; else printf("  FAIL: statusbar text\n");
+
+    // 24. Theme toggle: clicking flips dark mode and re-themes the window.
+    total++;
+    void* hTheme = u2h(activeCtx().nativeHandle("root/themebtn"));
+    SendMessageA(curWin().hwnd, (u32)WM_COMMAND, ((u64)BN_CLICKED << 16), (i64)hTheme);
+    bool themeOk = g != nullptr && g.dark && curWin().dark;
+    if (themeOk) pass++; else printf("  FAIL: theme toggle (dark=%d win=%d)\n", g != nullptr ? (g.dark ? 1 : 0) : -1, curWin().dark ? 1 : 0);
+
+    // 25. Accent buttons (P10): in dark mode the push button carries a stored accent AND the
+    //     NM_CUSTOMDRAW path renders it - driving the custom draw into a memory DC fills the
+    //     button rect with exactly the stored accent color (PrintWindow cannot capture this).
+    total++;
+    u32 abg = 0u; u32 afg = 0u;
+    bool stored = curWin().accentFor((u64)hBtn, &abg, &afg) && abg != 0u;
+    u32 drawn = nativeTestCustomDrawFill("root/btn");
+    bool accentOk = stored && drawn == abg;
+    if (accentOk) pass++; else printf("  FAIL: accent (stored=%d bg=%u drawn=%u)\n", stored ? 1 : 0, abg, drawn);
+
+    nativeTeardownForTest();
+
+    if (pass == total)
+    {
+        printf("PASS: gallery self-test %d/%d (full element set: forms, data, nav, visuals)\n", pass, total);
+        return 0;
+    }
+    printf("FAIL: gallery self-test %d/%d\n", pass, total);
+    return 1;
+}
+
+// ── Screenshot (PrintWindow -> BMP), one per theme, for the docs ──────────────
+// Renders the live window into an offscreen bitmap via PrintWindow and writes a 24bpp
+// BMP through core/graphic/bitmap.cb - the same technique win32_shot.cb uses for the
+// Canvas host, here for the real native controls.
+bool saveWindowBmp(void* hwnd, const char* path)
+{
+    RECT rc = default;
+    GetClientRect(hwnd, &rc);
+    int W = rc.right - rc.left;
+    int H = rc.bottom - rc.top;
+    if (W <= 0 || H <= 0) return false;
+
+    void* screenDC = GetDC(nullptr);
+    void* memDC = CreateCompatibleDC(screenDC);
+    void* bmp = CreateCompatibleBitmap(screenDC, W, H);
+    void* oldBmp = SelectObject(memDC, bmp);
+    // Pre-fill with the theme background so any region PrintWindow leaves unrendered (the
+    // gallery is taller than the screen work area PrintWindow clamps to) reads as the app
+    // background rather than uninitialized black.
+    if (hasCurWin() && curWin().bgBrush != nullptr) FillRect(memDC, &rc, curWin().bgBrush);
+    else FillRect(memDC, &rc, GetStockObject(WHITE_BRUSH));
+    PrintWindow(hwnd, memDC, (u32)PW_RENDERFULLCONTENT);
+    SelectObject(memDC, oldBmp);
+
+    // Pull the pixels as top-down BGRA32 in one GetDIBits call (fast; no per-pixel GetPixel).
+    BmiHeader bi = default;
+    bi.biSize = 40u; bi.biWidth = W; bi.biHeight = 0 - H; bi.biPlanes = 1; bi.biBitCount = 32;
+    u64 bufN = (u64)(W * H * 4);
+    char* buf = (char*)malloc((i64)bufN);
+    GetDIBits(memDC, bmp, 0u, (u32)H, (void*)buf, &bi, (u32)DIB_RGB_COLORS);
+
+    Bitmap* out = new Bitmap;
+    out.create(W, H);
+    int y = 0;
+    while (y < H)
+    {
+        int x = 0;
+        while (x < W)
+        {
+            int i = (y * W + x) * 4;
+            BitmapPixel px = default;
+            px.b = (u8)buf[i + 0]; px.g = (u8)buf[i + 1]; px.r = (u8)buf[i + 2]; px.a = (u8)255;
+            out.set(x, y, px);
+            x++;
+        }
+        y++;
+    }
+    bool ok = out.save((string)path);
+    delete out;
+    free((void*)buf);
+    SelectObject(memDC, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, screenDC);
+    return ok;
+}
+
+// Build the gallery in a shown window, sized tall enough that every control fits, and
+// write a BMP for the light theme and one for the dark theme into `dir`.
+int galleryShots(const char* dir)
+{
+    wireGallery();
+    createAppWindow(new GalleryApp(), "CFlat UI - Widget Gallery", true);
+    void* hwnd = curWin().hwnd;
+    // Size the window to what PrintWindow renders reliably (it clamps to the screen work
+    // area). The single-column gallery is taller than one screen, so the capture shows the
+    // top band - the classic forms + the P10 visuals (Image, CanvasView), which were placed
+    // near the top for exactly this reason; the FULL element set is covered by the self-test.
+    SetWindowPos(hwnd, nullptr, 10, 0, 900, 860, (u32)(SWP_NOZORDER | SWP_NOACTIVATE));
+    buildNativeTree();
+    UpdateWindow(hwnd);
+
+    string lightPath = "" + dir + "/gallery_light.bmp";
+    bool okL = saveWindowBmp(hwnd, lightPath.data());
+    printf("%s: %s\n", okL ? "wrote" : "FAIL", lightPath.data());
+
+    // Flip to dark and recapture (reach the model via a named borrow - not a call-result cast).
+    Component app = activeApp();
+    GalleryApp* g = app as GalleryApp;
+    if (g != nullptr) { g.dark = true; activeCtx().invalidate(); pumpNative(); }
+    UpdateWindow(hwnd);
+    string darkPath = "" + dir + "/gallery_dark.bmp";
+    bool okD = saveWindowBmp(hwnd, darkPath.data());
+    printf("%s: %s\n", okD ? "wrote" : "FAIL", darkPath.data());
+
+    nativeTeardownForTest();
+    return (okL && okD) ? 0 : 1;
+}
+
+extern int main(int argc, char** argv)
+{
+    if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
+        return gallerySelfTest();
+    if (argc > 2 && strcmp(argv[1], "--shots") == 0)
+        return galleryShots(argv[2]);
+
+    wireGallery();
+    return runAppGuiNative(new GalleryApp(), "CFlat UI - Widget Gallery");
+}

@@ -1,7 +1,13 @@
 # Plan: Native UI Framework (Electron-competitor, native OS controls)
 
-Status: P0-P6.5 DONE (Win32 + macOS AppKit + WinUI 3 proof; fedit authored in
-JSX sugar). P7-P12 rich-control milestones planned 2026-07-06, not started. Created 2026-07-03; consolidated
+Status: P0-P10 DONE (Win32 + macOS AppKit + WinUI 3 proof; fedit authored in
+JSX sugar; app-shell foundation - multi-window, ctx.post, StatusBar, tooltip; P8
+data controls tier 1 - RadioGroup/ComboBox/virtualized ListView + the setListOp seam;
+P9 tier-2 navigation chrome - TabControl/TreeView/SplitView/ContextMenu/toolbar + fedit v2;
+P10 visuals + the widget-gallery flagship - Image/GroupBox/CanvasView, NM_CUSTOMDRAW accent
+buttons, and the full-element-set gallery with light/dark PrintWindow screenshots).
+P11-P12 rich-control milestones (host parity sweep + core/ promotion) remain, planned
+2026-07-06, not started. Created 2026-07-03; consolidated
 2026-07-06 (finished phases summarized; this is the single UI framework plan -
 the predecessor ui-framework-v5-sugar-widgets.md was lost with the old
 internal/plan/ and its shipped result is example/ui/ at API v8, see doc/UI.md).
@@ -199,6 +205,38 @@ no ui.cb change is expected; this is an authoring-style conversion.
 
 ### P7 - app-shell foundation (unblocks everything after)
 
+DONE 2026-07-06. Win32 host is now genuinely multi-window: the single-editor host
+globals (_nHost/_nApp/_nTree/_nCtx/_nW/_nH) are gone, replaced by a `Window` class
+(implements NativeHost, owns hwnd/font/tree/component/UiContext/live-control lists) held
+in an owning `list<Window*>`; the free-function WndProc resolves the servicing window by
+scanning for its HWND and app code reaches it via activeCtx()/activeApp() (mirrored on
+Cocoa). fedit's "New Window" opens a full second editor; the About/secondary window rides
+the shared loop. ctx.post(work) clones a closure into a heap PostBox and marshals it to
+the UI thread via PostMessage(WM_APP_CALL) (worker-thread round-trip proven, leak-clean);
+ctx.assertUiThread() guards. New StatusBar element (msctls_statusbar32 / NSTextField strip
+/ Canvas text row) carries fedit's status line; `tooltip` is a plain field on the mappable
+elements (tooltips_class32 / setToolTip:). Gate: fedit self-test 10/10 (adds statusbar
+readback, StatusBar sugar, two live windows, worker post round-trip) leak-clean +
+asan-clean; win32_native_settings 8/8 (adds a tooltip assertion) leak-clean; example.bat
+Release 84/0/25; test.bat Release green.
+
+Deviations / notes:
+- ctx.post is wired as a UiContext hook (opaque boxed-closure pointer + a `function<>`
+  marshal callback the host installs), NOT a NativeHost interface method - a Lambda-typed
+  interface/hook parameter breaks the monomorphizer, so the closure crosses the seam as a
+  u64. No WinUI3Host churn.
+- macOS multi-window + real post marshaling stay single-window / inline stubs (already
+  P11 in this plan); the Cocoa host gained the host-neutral accessors + StatusBar/tooltip
+  mapping + nativeStatusText so shared fedit compiles and its self-test passes there
+  (cflat --check --platform macos green; runtime unverified on this Windows box).
+- NO compiler changes. Found+filed a real compiler bug: `expr as T` on a *function-call
+  result* yields an OWNING pointer that double-frees at scope exit (a named-local downcast
+  is a correct borrow). Worked around with the two-step `T x = call(); U* p = x as U;` in
+  fedit + hosts. See internal/issue/downcast-of-call-result-owns-and-double-frees.md. Also
+  fixed a latent host bug: `(string)buf`/`(string)path` aliased a freed/stack buffer on
+  return (now `"" + buf` for an owned copy) - was UAF, surfaced by asan.
+
+Original spec (for reference):
 The two deferred P3 items plus real multi-window. Do this first because data
 controls and a bigger flagship both sit on it.
 
@@ -221,6 +259,39 @@ controls and a bigger flagship both sit on it.
 
 ### P8 - data controls, tier 1 (the "rich" core)
 
+DONE 2026-07-07. Three tier-1 data controls landed behind the unchanged NativeHost
+property surface plus ONE new interface method. RadioGroup/RadioButton
+(BS_AUTORADIOBUTTON, WS_GROUP on the first radio; controlled - each radio's `checked`
+flows down, a click routes one key-path segment up to the group's onChange), ComboBox
+(CBS_DROPDOWNLIST, controlled selectedIndex + imperative items, CBN_SELCHANGE), and a
+VIRTUALIZED ListView (LVS_OWNERDATA + LVM_SETITEMCOUNT; the rowText(row,col) callback
+is the item source, so 100k rows only ever query the visible cells via LVN_GETDISPINFO;
+single-select controlled, onSelect on LVN_ITEMCHANGED, onActivate on NM_DBLCLK /
+LVN_KEYDOWN Enter). New seam call `setListOp(h, op, arg0, arg1, text, payload)` carries
+columns/rowCount/selection/invalidate + the boxed rowText callback (a ui.cb ListRowBox*
+as an opaque u64 - no Lambda crosses the seam, mirroring ctx.post); designed against
+Win32 ListView + NSTableView + WinUI ItemsView up front (design block above the interface
+method in ui_native.cb). Canvas fallbacks render for all three (radio rows, "[sel v]"
+combo, header+visible-rows list). Flagship carrier example/ui/gallery/gallery.cb starts
+here (each control authored via <Tag/> sugar), self-test 8/8 leak-clean AND asan-clean
+including a 100k-row virtualization assert (rowText fired <100x) + selection/activation
+round-trips. Cocoa + WinUI hosts got setListOp stubs (free the box, real backends -> P11).
+
+Deviations / notes:
+- The gallery imports win32_native_host.cb directly (Windows-only, like
+  win32_native_settings) - its SendMessage-driven self-test is inherently Win32; P11
+  ports it (and the CocoaHost/WinUI3Host setListOp bodies) to the other hosts.
+- NO compiler changes. Found + filed a real compiler bug:
+  internal/issue/negative-int-literal-global-init.md - a negative integer literal in a
+  GLOBAL/const initializer is truncated to minimal unsigned width (`const int x = -150`
+  reads back 65386); local inits / returns are fine. Worked around with `0 - N` for the
+  LVN_*/NM_* notify codes (folds correctly). Reported prominently.
+- Gates: gallery 8/8 leak+asan-clean, win32_native_settings 8/8, fedit 10/10 leak-clean,
+  example.bat Release 85/0/26, test.bat Release all pass, cocoa + winui hosts
+  `--check` green (cocoa via `--platform macos`).
+
+Original spec (for reference):
+
 - **RadioGroup/RadioButton** (BS_AUTORADIOBUTTON + WS_GROUP / NSButton
   radio): controlled, single `value` on the group.
 - **ComboBox/Dropdown** (COMBOBOX CBS_DROPDOWNLIST / NSPopUpButton):
@@ -240,6 +311,65 @@ controls and a bigger flagship both sit on it.
 
 ### P9 - data controls, tier 2 + navigation chrome
 
+DONE 2026-07-07. Four tier-2 navigation controls landed behind the unchanged NativeHost
+property surface, reusing the P8 setListOp seam (no new interface method - plan risk #3):
+TabControl/TabPane (WC_TABCONTROL header strip; keyed panes with LAZY inactive tabs - only
+the active pane maps to native, so per-tab buffers must live in the app model; controlled
+selectedTab + LISTOP_TAB_RESET/ADD/SET_SEL), TreeView (WC_TREEVIEW; expand-on-demand node
+source = three callbacks keyed by an int nodeId, boxed as a u64 TreeBox* like ListRowBox,
+TVN_ITEMEXPANDING materializes children lazily; LISTOP_TREE_SET_SRC_CB/REBUILD, selection
+round-trips via TVN_SELCHANGED), SplitView (a layout container - the layout engine learned
+the weighted two-pane constraint + a 1-DIP divider gutter; Win32 hit-tests the gutter in
+the parent WndProc with SetCapture, nativeSplitterDrag drives it headlessly), and a
+per-element ContextMenu (reuses the P3 declarative menu model; host-owned, registered by
+key via nativeSetContextMenu, shown with TrackPopupMenu, routes the chosen cmd through the
+app menu handler). Toolbar is a documented pattern, not a new element (toolbar() = a
+DIR_ROW View of Buttons; icons arrive with Image in P10). Canvas fallbacks render for all
+(tabs -> header row + active pane, tree -> indented rows, split -> two panes + divider).
+Reconcile learned adoptContainerProps to copy the controlled container scalars
+(selectedTab / ratio) onto the retained committed node (the RadioGroup leaf-prop pattern
+does not apply to geometry-driving container scalars).
+
+FLAGSHIP: fedit v2 (example/ui/fedit/fedit.cb) - file-tree sidebar (TreeView over a fake
+in-memory project), multi-tab documents (TabControl; a shared native EDIT + per-tab
+buffers parked in the app model, so tab switch preserves each buffer), a splitter between
+tree and editor, a context menu on the tree, and a toolbar. Self-test 14/14 leak+asan-clean
+(adds: tab-switch buffer preservation, tree expand-on-demand + select opens a file into a
+tab, splitter drag changes layout, context-menu command routes) on top of the P7 six.
+gallery.cb extended to 14/14 (adds TabControl/TreeView/SplitView/ContextMenu pages).
+
+Deviations / notes:
+- SplitView is a layout CONTAINER (not a native control), like RadioGroup - the divider is
+  a gap the parent WndProc hit-tests (no subclassed child), which is simpler and robust.
+  Cocoa's NSSplitView is P11.
+- Per-tab editor buffers live in the app MODEL (parallel list<string>), not inactive
+  native controls: "only the active pane reconciles to native" (plan spec) and "tab switch
+  preserves buffers" (gate) are in tension for a real editor, and the model-owned buffer +
+  shared EDIT is how real single-editor multi-tab editors work anyway.
+- ContextMenu is a model object (chrome), authored via <ContextMenu/> sugar in a builder
+  that returns an owned ptr the caller inline-casts to u64; the host owns + frees it. The
+  three new ELEMENTS (TabControl/TreeView/SplitView) are each authored via <Tag/> sugar in
+  the gallery self-test.
+- NO compiler changes. Found + filed a real compiler bug:
+  internal/issue/list-add-set-owned-string-move-leaks.md - a BARE owned string (call
+  result or named local) moved into list<string>.add/set leaks its buffer (owned by
+  nobody: source marked moved-from, slot never adopts it). Wrapping the arg in `"" + ...`
+  is the fix (a concat temp is adopted); string literals were always safe, which is why
+  the gallery's `add("" + s)` never leaked. Worked around in fedit's tab bookkeeping;
+  reported prominently. Also re-hit the known "owned string TEMP passed straight as a
+  read-only string call-arg leaks" pattern (bind to a named local first - editorHas helper).
+- Cocoa + WinUI hosts got placeholder controls (NSTextField / TextBlock) + the tab/tree
+  setListOp box-free + host-neutral driver STUBS so shared app code compiles (fedit
+  `--check --platform macos` PASS; winui_demo `--check` PASS); real NSTabView/NSOutlineView/
+  NSSplitView + WinUI TabView/TreeView backends are the P11 parity sweep. The gallery imports
+  win32_native_host.cb directly (Windows-only, like win32_native_settings), so its
+  SendMessage-driven self-test is inherently Win32; the fedit P9 self-test asserts are
+  `if const (!__MACOS__)`-gated (name-resolved on mac, never run there).
+- Gates: gallery 14/14 leak+asan-clean, fedit 14/14 leak+asan-clean, win32_native_settings
+  8/8, example.bat Release 85/0/26, test.bat Release all pass, cocoa + winui `--check` green.
+
+Original spec (for reference):
+
 - **TabControl** (WC_TABCONTROL / NSTabView... use tabless NSTabView or
   segmented control + swap, decide in-milestone): keyed child panes, lazy
   render of inactive tabs (only active pane reconciles to native).
@@ -257,6 +387,54 @@ controls and a bigger flagship both sit on it.
   flagship forcing-function for the whole tier, same role P4 played.
 
 ### P10 - visuals + the widget gallery flagship
+
+DONE 2026-07-07. Three elements complete the set, plus the deferred accent buttons and the
+flagship gallery. **Image** (ELEM_IMAGE): a leaf carrying a BORROWED top-down BGRA32 buffer
+(pixels + pxW/pxH) that the host uploads via a NEW `setImageData(h, pixels, w, h, stride)` seam
+method (top-down DIB section + STM_SETIMAGE, HBITMAP bookkeeping freed on destroy/dispose); a
+`.bmp source` path decodes host-internally via LoadImage. **GroupBox** (ELEM_GROUPBOX): a titled
+BS_GROUPBOX frame whose children position as siblings. **CanvasView** (ELEM_CANVAS): the escape
+hatch - a GDI-backed child window (CFlatCanvasChild + NativeGdiCanvas implementing the ui.cb
+Canvas) whose WM_PAINT/WM_PRINTCLIENT invokes the app's boxed `onPaint(Canvas)` closure (a
+CanvasBox opaque-u64, like ListRowBox). **NM_CUSTOMDRAW accent buttons**: a themed push button
+fills with theme.buttonBg + focus ring via NM_CUSTOMDRAW (setAccent stores per-control colors;
+monochrome themes store none -> native look, CDRF_DODEFAULT). **Flagship gallery.cb** now
+authors EVERY element (forms + data + nav + visuals) via `<Tag/>` sugar, a light/dark toggle,
+a 25-assert headless self-test, and `--shots <dir>` -> PrintWindow light/dark BMPs. Each new
+element has a Canvas fallback (image -> placeholder+altText, groupbox -> bordered box+title,
+canvasview -> delegate to onPaint). Cocoa + WinUI hosts got setImageData stubs + placeholder
+controls (real NSImageView/NSBox/CGView + WriteableBitmap -> P11).
+
+Deviations / notes:
+- `setImageData` is a NEW NativeHost interface method (not an overloaded setListOp op) - a raw
+  pixel-pointer + w/h/stride operand is unlike the LISTOP_* integer/string/box operands, and
+  image data never rides the item-data virtualization path. Documented at the interface.
+- Decoder: the toolkit-neutral BGRA32 pixel seam is fully implemented (the gallery pushes a
+  procedural gradient through it, proving it end to end); file decode uses `LoadImage` for `.bmp`.
+  WIC-based PNG/JPG decode (the plan's "WIC" wording) is the SAME seam with a richer host-internal
+  decoder, deferred as an enrichment - it needs no seam or element change.
+- NM_CUSTOMDRAW cannot be captured by PrintWindow (it re-renders controls in their default style),
+  so the accent fill is a LIVE-render feature. It is verified headlessly by a pixel-level draw
+  assert (`nativeTestCustomDrawFill` drives the custom-draw path into a memory DC and checks the
+  filled pixel equals the stored accent), NOT by the screenshot. The dark-mode BMP therefore shows
+  default-styled buttons; the accent is real on-screen (NM_CUSTOMDRAW fires on paint, confirmed).
+- The gallery stays SINGLE-COLUMN (preserves the P8/P9 self-test key paths; keys are order-
+  independent, so the P10 visuals were placed high to land in the screenshot). It is taller than
+  one screen, so `--shots` captures the top band + the Image/CanvasView visuals; the FULL element
+  set is covered by `--selftest`, not the screenshot (the capture pre-fills the theme bg so any
+  unrendered tail is not black). fedit toolbar icons via Image were left out (optional, small).
+- NO compiler changes. The interface-typed lambda param `Lambda<void(Canvas)>` (CanvasBox) was
+  probed first and compiles + runs asan-clean. The known compiler pitfalls were worked around as
+  before (negative-int-literal `0 - N` for NM_CUSTOMDRAW, named-borrow downcasts, `"" +` string
+  concats); no new issue filed. Nine of the P10 Win32 constants (STM_SETIMAGE, SS_BITMAP,
+  BS_GROUPBOX, GWLP_USERDATA, ...) are already surfaced by the windows.h binding - only the
+  NM_/CDDS_/CDRF_/CDIS_ custom-draw codes are declared by hand.
+- Gates: gallery 25/25 leak-clean AND asan-clean (incl. the pixel-level accent-draw assert),
+  screenshots written (gallery_{light,dark}.bmp, ~2.9 MB each, visually verified), fedit 14/14
+  leak-clean, win32_native_settings 8/8 leak-clean, example.bat Release 85/0/26, test.bat Release
+  all pass, cocoa (fedit + cocoa_native_settings) + winui_demo `--check` green.
+
+Original spec (for reference):
 
 - **Image element**: setImageData(h, ptr, w, h, stride) BGRA32 at the seam
   (STM_SETIMAGE HBITMAP / NSImageView). Decoder = WIC on Windows,
@@ -345,7 +523,9 @@ Still open going into P7+:
    under --heap-audit at every milestone (closures are owning values;
    teardown must destruct).
 3. setListOp seam design (P8) must survive three hosts - design against
-   ListView + NSTableView + WinUI ItemsView before coding.
+   ListView + NSTableView + WinUI ItemsView before coding. RESOLVED for P8: the
+   op-coded protocol is proven on Win32 ListView (LVS_OWNERDATA) and stubbed on
+   Cocoa/WinUI; P11 validates the NSTableView/ItemsView bodies against the same ops.
 4. Multi-window refactor (P7) touches the host globals every existing
    self-test relies on - migrate tests in the same change, gate on all of
    them.

@@ -203,6 +203,20 @@ class WinUI3Host : NativeHost
     void setIntProp(u64 h, int prop, int v) { }
     void setAccent(u64 h, int fgColor, int bgColor) { }
 
+    // P11: the ListView item-data protocol (ItemsView/ListView virtualized source)
+    // is deferred to the WinUI catch-up. The stub keeps the NativeHost contract
+    // satisfied; it frees the boxed rowText callback it is handed so nothing leaks.
+    void setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload)
+    {
+        if (op == LISTOP_SET_ROWTEXT_CB && payload != 0u) __uiFreeListRowBox(payload);
+        else if (op == LISTOP_TREE_SET_SRC_CB && payload != 0u) __uiFreeTreeBox(payload);
+    }
+
+    // P11: the Image pixel upload (BGRA buffer -> a WriteableBitmap on an Image control) is
+    // deferred to the WinUI catch-up; the stub keeps the NativeHost contract satisfied. No
+    // box crosses here, so there is nothing to free.
+    void setImageData(u64 h, u64 pixels, int w, int h2, int stride) { }
+
     // XAML measures intrinsically; return a DIP estimate so the DIP layout pass spaces rows.
     Size measureText(const char* s, int fontId, int wrapWidthDip)
     {

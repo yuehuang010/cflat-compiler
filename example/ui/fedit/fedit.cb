@@ -1,27 +1,31 @@
-// fedit.cb - a small real native text editor, the flagship demo for the CFlat
-// native UI framework (the "not Electron" pitch: a self-contained native exe with
-// real OS controls, a real menu bar + accelerators, real shell file dialogs, and a
-// real multiline editor - no browser engine).
+// fedit.cb - a small real native text editor, the flagship demo for the CFlat native
+// UI framework (the "not Electron" pitch: a self-contained native exe with real OS
+// controls, a real menu bar + accelerators, real shell file dialogs, and a real
+// multiline editor - no browser engine).
 //
-// Features: open / edit / save / save-as text files; a find bar; a dirty-close
-// prompt; a light/dark theme switch (immersive dark titlebar); and a second window
-// (Help > About). The editor buffer is a native multiline EDIT (source of truth),
-// so typing a large file never round-trips through the framework - only a dirty
-// notification does.
+// fedit v2 (P9) grows the single-editor app into a small IDE shell: a file-tree
+// SIDEBAR (TreeView, expand-on-demand), MULTI-TAB documents (TabControl, each tab's
+// buffer preserved in the model), a draggable SPLITTER between the tree and the editor,
+// a right-click CONTEXT MENU on the tree, and a TOOLBAR row of buttons. The editor
+// buffer is still a single native multiline EDIT (source of truth for the ACTIVE tab);
+// switching tabs saves the outgoing buffer into the model and loads the incoming one.
 //
 // Build & run:
 //   x64/Release/cflat.exe example/ui/fedit/fedit.cb -i example/ui -o out/fedit.exe
 //   out\fedit.exe
 //
-// Headless state-assert self-test (example.bat gate; drives via SendMessage +
-// direct load/save, since OS file dialogs cannot run unattended):
+// Headless state-assert self-test (example.bat gate; drives via SendMessage + direct
+// load/save, since OS file dialogs cannot run unattended):
 //   out\fedit.exe --selftest
 import "native_host.cb";
 import "filesystem.cb";
+import "thread.cb";
 
-// Menu command ids (any positive ints distinct from each other; menu WM_COMMAND
+extern stdcall u32 GetCurrentThreadId();
+
+// Menu / command ids (any positive ints distinct from each other; menu WM_COMMAND
 // carries lParam == 0 so these never clash with control notifications).
-int CMD_NEW      = 101;
+int CMD_NEW      = 101;   // new (untitled) tab
 int CMD_OPEN     = 102;
 int CMD_SAVE     = 103;
 int CMD_SAVEAS   = 104;
@@ -30,13 +34,17 @@ int CMD_FIND     = 106;
 int CMD_FINDNEXT = 107;
 int CMD_THEME    = 108;
 int CMD_ABOUT    = 109;
+int CMD_NEWWIN   = 110;
+int CMD_NEWTAB   = 120;   // context-menu: open a new untitled tab
+int CMD_REFRESH  = 121;   // context-menu: refresh the tree (re-render)
 
-string EDITOR_KEY = "root/editor";
+// Key paths of the mappable controls (stable across renders, so the native EDIT / tree
+// are reused and per-tab buffers survive a re-render).
+string EDITOR_KEY = "root/split/main/editor";
+string TREE_KEY   = "root/split/side/tree";
+string TABS_KEY   = "root/split/main/tabs";
 
-// Filename portion of a path (after the last '/' or '\'). Returns an owned substring,
-// so it is `move` per the core-lib convention (allocating string returns transfer
-// ownership); without `move` the buffer is not a registered owned temp and would be
-// orphaned when the result flows through a ternary.
+// Filename portion of a path (after the last '/' or '\'). Owned substring, so `move`.
 move string baseName(string p)
 {
     int last = -1; int i = 0; int n = (int)p.length();
@@ -44,43 +52,238 @@ move string baseName(string p)
     return substring(p, last + 1, n - last - 1);
 }
 
+// ── Fake project tree (the file-tree sidebar source) ─────────────────────────
+// A tiny in-memory file tree so the sidebar + its self-test run with no real disk
+// dependency. Node ids: 1 = "docs" folder (children 10 a.txt, 11 b.txt), 2 hello.txt,
+// 3 readme.md. childCount(nid) == 0 (nid != root) marks a file leaf.
+int fsChildCount(int nid)
+{
+    if (nid == TREE_ROOT) return 3;
+    if (nid == 1) return 2;
+    return 0;
+}
+
+int fsChildId(int nid, int i)
+{
+    if (nid == TREE_ROOT) { if (i == 0) return 1; if (i == 1) return 2; return 3; }
+    if (nid == 1) return i == 0 ? 10 : 11;
+    return 0;
+}
+
+string fsLabel(int nid)
+{
+    if (nid == 1) return "docs";
+    if (nid == 2) return "hello.txt";
+    if (nid == 3) return "readme.md";
+    if (nid == 10) return "a.txt";
+    if (nid == 11) return "b.txt";
+    return "?";
+}
+
+bool fsIsFile(int nid) { return nid != TREE_ROOT && fsChildCount(nid) == 0; }
+
+string fsContent(int nid)
+{
+    if (nid == 2) return "hello from the tree\r\nsecond line";
+    if (nid == 3) return "# Readme\r\nfedit v2";
+    if (nid == 10) return "aaa contents";
+    if (nid == 11) return "bbb contents";
+    return "";
+}
+
 class Editor : Component
 {
-    string path     = default;   // current file ("" = untitled)
-    bool   dirty    = false;
+    string path     = default;   // active tab's file ("" = untitled)
+    bool   dirty    = false;     // active tab's dirty flag
     bool   isDark   = false;
     bool   findOpen = false;
     string findText = default;
+    // Open documents, as parallel lists (a list of owning-string-field objects cannot be
+    // mutated through list.get - an aliased element rejects an owned-string field store).
+    list<string> tabPaths   = default;   // per tab: file path ("" = untitled)
+    list<string> tabBuffers = default;   // per tab: parked text (live text of the active tab
+                                          //          is in the native EDIT, parked on switch)
+    list<int>    tabDirty   = default;   // per tab: 0/1
+    int    activeTab = 0;
+    int    treeSel   = 0 - 1;     // selected tree node id
+    int    splitRatio = 22;       // sidebar width percentage
+    bool   _ctxReg   = false;     // one-time tree context-menu registration
 
-    // Authored in the <Tag/> element sugar (P6.5): attribute = field init,
-    // child = add(). The find bar stays a conditional root.add() below.
+    int tabCount() { return this.tabPaths.count(); }
+
+    // Ensure at least one (untitled) document exists.
+    void _ensureTabs()
+    {
+        if (this.tabPaths.count() == 0)
+        { this.tabPaths.add(""); this.tabBuffers.add(""); this.tabDirty.add(0); }
+    }
+
+    // Park the active tab's live editor text + state into its model slot.
+    void _saveActiveToModel()
+    {
+        if (this.activeTab < 0 || this.activeTab >= this.tabPaths.count()) return;
+        // Wrap every string move-arg to list.set in `"" + ...`: a bare owned string (a
+        // call result or named local) moved into a list.add/set slot leaks (compiler bug,
+        // see internal/issue/list-add-set-owned-string-move-leaks.md); `"" + x` is safe.
+        this.tabBuffers.set(this.activeTab, "" + nativeControlText(EDITOR_KEY));
+        this.tabPaths.set(this.activeTab, "" + this.path);
+        this.tabDirty.set(this.activeTab, this.dirty ? 1 : 0);
+    }
+
+    // Load the active tab's model slot into the editor + the active-doc fields.
+    void _loadActiveFromModel()
+    {
+        if (this.activeTab < 0 || this.activeTab >= this.tabPaths.count()) return;
+        // Bind to a named local: an owned-string TEMP passed straight to a read-only
+        // string param leaks (the callee reads but does not consume it).
+        string b = "" + this.tabBuffers.get(this.activeTab);
+        nativeSetControlText(EDITOR_KEY, b);
+        this.path = "" + this.tabPaths.get(this.activeTab);
+        this.dirty = this.tabDirty.get(this.activeTab) != 0;
+    }
+
+    // Switch the active tab (TabControl onSelectTab): park the outgoing buffer, load the
+    // incoming one. This is what preserves each tab's text across switches.
+    void switchTab(int idx, UiContext* ctx)
+    {
+        if (idx == this.activeTab || idx < 0 || idx >= this.tabPaths.count()) return;
+        this._saveActiveToModel();
+        this.activeTab = idx;
+        this._loadActiveFromModel();
+        ctx.invalidate();
+    }
+
+    void _addTab(string path, string content, UiContext* ctx)
+    {
+        this._saveActiveToModel();
+        this.tabPaths.add("" + path);
+        this.tabBuffers.add("");
+        this.tabDirty.add(0);
+        this.activeTab = this.tabPaths.count() - 1;
+        nativeSetControlText(EDITOR_KEY, content);
+        this.path = "" + path; this.dirty = false;
+        ctx.invalidate();
+    }
+
+    // Open a new (untitled) tab and make it active.
+    void newTab(UiContext* ctx) { this._addTab("", "", ctx); }
+
+    // Open a file tree node into a NEW tab (its content flows into the editor). Bind the
+    // fs* results to named locals so no owned-string temp is passed straight as an arg.
+    void openFileNode(int nid, UiContext* ctx)
+    {
+        string p = fsLabel(nid);
+        string c = fsContent(nid);
+        this._addTab(p, c, ctx);
+    }
+
+    // Tree selection: a file node opens into a tab; a folder just updates selection.
+    void onTreeSelect(int nid, UiContext* ctx)
+    {
+        this.treeSel = nid;
+        if (fsIsFile(nid)) this.openFileNode(nid, ctx);
+        else ctx.invalidate();
+    }
+
+    // Authored partly in the <Tag/> sugar (P6.5); tabs/tree are dynamic so they are
+    // built imperatively (sugar children are static by design).
     Element render(UiContext* ctx)
     {
         ctx.theme = this.isDark ? darkTheme() : lightTheme();
+        this._ensureTabs();
 
-        // Status line: filename + dirty marker.
-        string name = this.path.length() > 0 ? baseName(this.path) : "untitled";
-        string star = this.dirty ? " *" : "";
+        // Register the tree's right-click context menu once (keyed by control path).
+        if (!this._ctxReg)
+        {
+            nativeSetContextMenu(TREE_KEY, (u64)buildTreeMenu());
+            this._ctxReg = true;
+        }
 
-        Box* root = <Box key="root" style={makeStyle(0, hostWidth(), hostHeight())}>
-                      <Text key="status" text={"fedit   |   " + name + star} />
-                    </Box>;
+        int splitH = hostHeight() - (this.findOpen ? 4 : 3); if (splitH < 4) splitH = 4;
 
-        // Optional find bar (toggled by Edit > Find). Controlled TextInput.
+        Box* root = <Box key="root" style={makeStyle(0, hostWidth(), hostHeight())} />;
+
+        // Toolbar: a styled row of Buttons (P9 pattern - no new native control).
+        View* tb = toolbar();
+        tb.setKey("tb");
+        tb.add(button("New",  () => { this.onCommand(CMD_NEW, ctx); }));
+        tb.add(button("Open", () => { this.onCommand(CMD_OPEN, ctx); }));
+        tb.add(button("Save", () => { this.onCommand(CMD_SAVE, ctx); }));
+        // Give the toolbar buttons stable keys (children keyed positionally otherwise).
+        tb.children.get(0).setKey("new");
+        tb.children.get(1).setKey("open");
+        tb.children.get(2).setKey("save");
+        root.add(tb);
+
+        // Optional find bar (Edit > Find). Controlled TextInput.
         if (this.findOpen)
         {
             root.add(<TextInput key="find" value={this.findText} width={40}
                                  placeholder="find text (F3 = next)"
+                                 tooltip="Find text - press F3 for the next match"
                                  onChangeText={(string v) => { this.findText = "" + v; ctx.invalidate(); }} />);
         }
 
-        // The editor fills the rest. Its key is stable so toggling the find bar
-        // reuses the SAME native EDIT (its text survives). value "" is never pushed
-        // by render (uncontrolled); content flows through nativeSetControlText.
-        int used = this.findOpen ? 3 : 2;
-        int eh = hostHeight() - used; if (eh < 3) eh = 3;
-        root.add(<TextArea key="editor" value="" onChange={() => { this.markDirty(ctx); }}
-                            width={hostWidth()} height={eh} />);
+        // Split: file-tree sidebar | (tab strip + editor). The panes are plain column
+        // Views (not native-mapped); their leaf controls carry the native handles.
+        SplitView* split = splitView(this.splitRatio, true);
+        split.setKey("split");
+        split.style.width = hostWidth(); split.style.height = splitH;
+        split.onRatioChange = (int r) => { this.splitRatio = r; ctx.invalidate(); };
+
+        View* side = column(makeStyle(0, 0, 0));
+        side.setKey("side");
+        TreeView* tree = <TreeView key="tree" width={100} height={splitH - 1}
+                selectedNode={this.treeSel}
+                onSelect={(int nid) => { this.onTreeSelect(nid, ctx); }}
+                onExpand={(int nid) => { }} />;
+        tree.childCount = (int nid) => { return fsChildCount(nid); };
+        tree.childId    = (int nid, int i) => { return fsChildId(nid, i); };
+        tree.label      = (int nid) => { return fsLabel(nid); };
+        tree.tooltip = "Project files - click a file to open it in a tab";
+        side.add(tree);
+        split.add(side);
+
+        View* main = column(makeStyle(0, 0, 0));
+        main.setKey("main");
+
+        // Document tabs: one TabPane per open doc (empty panes - the shared editor below
+        // shows the active doc). selectedTab is controlled; switching saves/loads buffers.
+        TabControl* tabs = tabControl(this.activeTab, (int i) => { this.switchTab(i, ctx); });
+        tabs.setKey("tabs");
+        tabs.width = 100; tabs.height = 3;
+        int ti = 0;
+        while (ti < this.tabPaths.count())
+        {
+            string tp = this.tabPaths.get(ti);
+            string title = tp.length() > 0 ? baseName(tp) : "untitled";
+            TabPane* p = tabPane(title);
+            p.setKey("d" + ti.toString());
+            tabs.addPane(p);
+            ti++;
+        }
+        main.add(tabs);
+
+        // The shared editor (uncontrolled native EDIT). Its key is stable across renders
+        // and tab switches, so the native buffer is reused; content flows via
+        // nativeSetControlText (tab switch / file open), never pushed by render.
+        TextArea* ed = <TextArea key="editor" value="" onChange={() => { this.markDirty(ctx); }}
+                                 width={100} height={splitH - 4} />;
+        ed.tooltip = "Editor - type your text here";
+        main.add(ed);
+        split.add(main);
+        root.add(split);
+
+        // Bottom status bar: file pane (name + dirty marker) + a theme pane.
+        string name = this.path.length() > 0 ? baseName(this.path) : "untitled";
+        string star = this.dirty ? " *" : "";
+        int tabNo = this.activeTab + 1;
+        int tabN  = this.tabPaths.count();
+        StatusBar* sb = statusBar("fedit   |   " + name + star
+            + "   |   tab " + tabNo.toString() + "/" + tabN.toString());
+        sb.addPart(this.isDark ? "dark" : "light");
+        sb.setKey("status");
+        root.add(sb);
         return root;
     }
 
@@ -89,7 +292,7 @@ class Editor : Component
         if (!this.dirty) { this.dirty = true; ctx.invalidate(); }
     }
 
-    // Load a file into the editor (push into the native buffer; not dirty after).
+    // Load a file into the active tab's editor (push into the native buffer; not dirty).
     void loadPath(string p, UiContext* ctx)
     {
         string content = File.readAllText(p);
@@ -121,71 +324,73 @@ class Editor : Component
         else nativeInfo("fedit", "Could not write the file.");
     }
 
-    // If there are unsaved changes, ask; returns true if it is OK to proceed
-    // (discard), false to cancel the operation.
     bool confirmDiscard(UiContext* ctx)
     {
         if (!this.dirty) return true;
         int r = nativeConfirm("fedit", "You have unsaved changes. Save them?");
-        if (r == 1) { this.doSave(ctx); return !this.dirty; }   // Yes: saved iff clean now
-        if (r == 0) return true;                                // No: discard
-        return false;                                           // Cancel
+        if (r == 1) { this.doSave(ctx); return !this.dirty; }
+        if (r == 0) return true;
+        return false;
     }
 
-    // Select the next occurrence of findText in the editor, after the caret. Built
-    // entirely on the host-neutral driver API, so it runs on either backend.
     void doFind()
     {
         if (this.findText.length() == 0) return;
-        if (_nCtx.nativeHandle(EDITOR_KEY) == 0u) return;
+        if (activeCtx().nativeHandle(EDITOR_KEY) == 0u) return;
         string content = nativeControlText(EDITOR_KEY);
         int n = (int)content.length();
-        int startPos = nativeSelectionStart(EDITOR_KEY) + 1;   // search past the caret
+        int startPos = nativeSelectionStart(EDITOR_KEY) + 1;
         if (startPos < 0) startPos = 0;
         if (startPos > n) startPos = n;
         char* hit = strstr(content.data() + startPos, this.findText.data());
-        if (hit == nullptr) hit = strstr(content.data(), this.findText.data());   // wrap
+        if (hit == nullptr) hit = strstr(content.data(), this.findText.data());
         if (hit == nullptr) return;
         int pos = (int)(hit - content.data());
         int end = pos + (int)this.findText.length();
         nativeSelect(EDITOR_KEY, pos, end);
     }
 
-    // Dispatch a menu / accelerator command.
     void onCommand(int id, UiContext* ctx)
     {
-        if (id == CMD_NEW)
-        {
-            if (!this.confirmDiscard(ctx)) return;
-            nativeSetControlText(EDITOR_KEY, "");
-            this.path = ""; this.dirty = false; ctx.invalidate();
-        }
+        if (id == CMD_NEW || id == CMD_NEWTAB) this.newTab(ctx);
         else if (id == CMD_OPEN)
         {
-            if (!this.confirmDiscard(ctx)) return;
             string p = nativeOpenFile();
             if (p.length() > 0) this.loadPath(p, ctx);
         }
-        else if (id == CMD_SAVE)    this.doSave(ctx);
-        else if (id == CMD_SAVEAS)  this.doSaveAs(ctx);
-        else if (id == CMD_FIND)    { this.findOpen = true; ctx.invalidate(); }
+        else if (id == CMD_SAVE)     this.doSave(ctx);
+        else if (id == CMD_SAVEAS)   this.doSaveAs(ctx);
+        else if (id == CMD_FIND)     { this.findOpen = true; ctx.invalidate(); }
         else if (id == CMD_FINDNEXT) this.doFind();
-        else if (id == CMD_THEME)   { this.isDark = !this.isDark; ctx.invalidate(); }
+        else if (id == CMD_REFRESH)  ctx.invalidate();
+        else if (id == CMD_THEME)    { this.isDark = !this.isDark; ctx.invalidate(); }
+        else if (id == CMD_NEWWIN)   openAppWindow(new Editor(), "fedit");
         else if (id == CMD_ABOUT)
             showSecondaryWindow("About fedit",
                 "fedit\r\n\r\nA tiny native text editor built with the CFlat UI\r\n"
                 + "framework - real Win32 controls, no browser engine.\r\n\r\n"
                 + "A self-contained native exe: the anti-Electron demo.");
-        else if (id == CMD_EXIT)    { if (this.confirmDiscard(ctx)) nativeCloseWindow(); }
+        else if (id == CMD_EXIT)     { if (this.confirmDiscard(ctx)) nativeCloseWindow(); }
     }
 };
+
+// The tree's right-click menu, authored with the <ContextMenu/> sugar (P9). Returned
+// as an owned pointer the caller inline-casts to u64 (the host then owns + frees it).
+ContextMenu* buildTreeMenu()
+{
+    ContextMenu* m = <ContextMenu/>;
+    m.addItem("New Tab", CMD_NEWTAB);
+    m.addItem("Refresh", CMD_REFRESH);
+    return m;
+}
 
 // Declare the menu bar + accelerators (read by the host at window creation).
 void setupMenu()
 {
     menuReset();
     int mFile = menuAddTop("File");
-    menuAddItem(mFile, "New",        "Ctrl+N",       CMD_NEW);
+    menuAddItem(mFile, "New Tab",    "Ctrl+N",       CMD_NEW);
+    menuAddItem(mFile, "New Window", "Ctrl+Shift+N", CMD_NEWWIN);
     menuAddItem(mFile, "Open...",    "Ctrl+O",       CMD_OPEN);
     menuAddItem(mFile, "Save",       "Ctrl+S",       CMD_SAVE);
     menuAddItem(mFile, "Save As...", "Ctrl+Shift+S", CMD_SAVEAS);
@@ -203,94 +408,193 @@ void setupMenu()
     menuAddItem(mHelp, "About fedit", "",            CMD_ABOUT);
 }
 
-// Wire the command + close handlers. They reach the editor via _nApp (no capture),
-// so they are unaffected by the component being moved into the host.
+// Wire the command + close handlers. They reach the ACTIVE window's editor via
+// activeApp()/activeCtx() (no capture), so one pair of closures serves every window.
 void wireHandlers()
 {
     setMenuHandler((int id) =>
     {
-        Editor* e = _nApp as Editor;
-        if (e != nullptr) e.onCommand(id, &_nCtx);
+        Component app = activeApp();
+        Editor* e = app as Editor;
+        if (e != nullptr) e.onCommand(id, activeCtx());
     });
     setCloseQuery(() =>
     {
-        Editor* e = _nApp as Editor;
+        Component app = activeApp();
+        Editor* e = app as Editor;
         if (e == nullptr) return true;
-        return e.confirmDiscard(&_nCtx);
+        return e.confirmDiscard(activeCtx());
     });
 }
 
 // ── Headless state-assert self-test ──────────────────────────────────────────
 bool _has(string s, const char* sub) { return strstr(s.data(), (char*)sub) != nullptr; }
 
+// Read the editor buffer and test a substring, keeping the owned string in THIS
+// function's scope (so it is freed). Passing the nativeControlText() result straight
+// into a call arg leaks the temp - hence a named-local helper.
+bool editorHas(const char* sub)
+{
+    string s = nativeControlText(EDITOR_KEY);
+    return strstr(s.data(), (char*)sub) != nullptr;
+}
+
+// P7 post round-trip: a worker thread posts a closure that must run on the UI thread.
+
+int _postRan = 0;
+u64 _postRanTid = 0u;
+int _postWorker(void* arg)
+{
+    UiContext* c = (UiContext*)arg;
+    c.post(() => { _postRan = _postRan + 1; _postRanTid = (u64)GetCurrentThreadId(); });
+    return 0;
+}
+
 int feditSelfTest()
 {
-    createNativeWindow("fedit-selftest", false);   // hidden
-    _nW = 70; _nH = 30;
     setupMenu();
     wireHandlers();
-    _nApp = new Editor();
-    buildNativeTree();
+    startHeadlessWindow(new Editor(), "fedit-selftest", 80, 34);   // hidden window 1
 
-    Editor* e = _nApp as Editor;
-    void* hed = u2h(_nCtx.nativeHandle(EDITOR_KEY));
+    Component app0 = activeApp();
+    Editor* e = app0 as Editor;
+    void* hed = u2h(activeCtx().nativeHandle(EDITOR_KEY));
     int pass = 0; int total = 0;
 
-    // 1. The editor became a real multiline EDIT.
+    // 1. The editor became a real multiline EDIT (now nested under the splitter/main).
     total++;
     if (hed != nullptr) pass++; else printf("  FAIL: no editor control\n");
 
     // 2. Open a file: content flows into the buffer and the doc is not dirty.
     total++;
-    string tdir = Path.getTempPath();   // portable temp dir (no trailing separator)
+    string tdir = Path.getTempPath();
     string tmp = tdir + "/fedit_selftest.txt";
     File.writeAllText(tmp, "hello world\r\nsecond line\r\nhello again");
-    e.loadPath(tmp, &_nCtx);
+    e.loadPath(tmp, activeCtx());
     string got = nativeControlText(EDITOR_KEY);
     bool opened = _has(got, "hello world") && _has(got, "second line") && !e.dirty;
     if (opened) pass++; else printf("  FAIL: open/load (dirty=%d)\n", (int)e.dirty);
 
-    // 3. Editing the native control fires the dirty notification. Inserting text
-    //    like a keystroke would (nativeInsertTextAt) fires the change event.
+    // 3. Editing fires the dirty notification.
     total++;
     string tmp2 = tdir + "/fedit_selftest_out.txt";
     nativeInsertTextAt(EDITOR_KEY, 0, " X");
     bool becameDirty = e.dirty;
     if (becameDirty) pass++; else printf("  FAIL: edit did not mark dirty\n");
 
-    // 4. Save to a new path (bypassing the OS dialog): the file round-trips.
+    // 4. Save to a new path (bypassing the OS dialog).
     total++;
     e.path = "" + tmp2;
-    e.doSave(&_nCtx);
+    e.doSave(activeCtx());
     string back = File.readAllText(tmp2);
-    // Test 3 inserted " X" at the start, so the pulled+saved buffer is " Xhello...".
     bool saved = _has(back, "Xhello world") && !e.dirty;
     if (saved) pass++; else printf("  FAIL: save round-trip (dirty=%d back=[%s])\n", (int)e.dirty, back.data());
 
-    // 5. Menu routing: drive View > Toggle Theme through the menu command path; the
-    //    host applies the dark theme.
+    // 5. Menu routing: View > Toggle Theme.
     total++;
     nativeTestFireMenu(CMD_THEME);
-    bool themed = _nHost.dark;
+    bool themed = hostDark();
     if (themed) pass++; else printf("  FAIL: theme toggle via menu\n");
 
     // 6. Find: locate the second "hello" after the caret and select it.
     total++;
     nativeSetControlText(EDITOR_KEY, "alpha hello beta hello gamma");
-    nativeSelect(EDITOR_KEY, 0, 0);                  // caret at start
+    nativeSelect(EDITOR_KEY, 0, 0);
     e.findText = "hello";
-    e.doFind();                                      // selects first "hello" (pos 6)
-    e.doFind();                                      // selects second "hello" (pos 17)
+    e.doFind();
+    e.doFind();
     int a = nativeSelectionStart(EDITOR_KEY);
     bool found = a == 17;
     if (found) pass++; else printf("  FAIL: find next (selStart=%d, want 17)\n", a);
 
-    // Teardown: release all global host + context state (leak-clean for heap-audit).
+    // 7. StatusBar readback.
+    total++;
+    string stat = nativeStatusText("root/status");
+    bool statusOk = _has(stat, "fedit");
+    if (statusOk) pass++; else printf("  FAIL: statusbar readback [%s]\n", stat.data());
+
+    // 8. StatusBar authored via the <Tag/> sugar (host-agnostic element check).
+    total++;
+    StatusBar* sbx = <StatusBar key="sbx" />;
+    sbx.addPart("ready");
+    bool sugarOk = sbx.kind() == ELEM_STATUSBAR && sbx.parts.count() == 1;
+    sbx.destroyTree(); delete sbx;
+    if (sugarOk) pass++; else printf("  FAIL: StatusBar sugar authoring\n");
+
+    // ── P9 tests (Win32-only native driver; macOS parity is P11) ──────────────
+    if const (!__MACOS__)
+    {
+        // 9. Multi-tab buffers survive a tab switch. Type into tab 0, open tab 1, type,
+        //    switch back to 0, and the tab-0 text must be intact (parked in the model).
+        total++;
+        nativeSetControlText(EDITOR_KEY, "TAB0TEXT");
+        nativeTestFireMenu(CMD_NEW);                           // new tab (routed + pumped)
+        nativeSetControlText(EDITOR_KEY, "TAB1TEXT");
+        nativeTabSelect(TABS_KEY, 0);                          // -> switchTab(0)
+        bool back0 = editorHas("TAB0TEXT");
+        nativeTabSelect(TABS_KEY, 1);                          // -> switchTab(1)
+        bool back1 = editorHas("TAB1TEXT");
+        bool tabsOk = back0 && back1 && nativeTabCount(TABS_KEY) == 2;
+        if (tabsOk) pass++; else printf("  FAIL: tab buffers (back0=%d back1=%d)\n", (int)back0, (int)back1);
+
+        // 10. Tree expand-on-demand + select opens a file into a tab. Expand "docs",
+        //     select its first child (a.txt), and a new tab shows the file content.
+        total++;
+        int tabsBefore = e.tabCount();
+        u64 docsItem = nativeTreeRootItem(TREE_KEY);           // first root = "docs"
+        nativeTreeExpandItem(TREE_KEY, docsItem);              // lazily inserts a.txt/b.txt
+        u64 aItem = nativeTreeChildItem(TREE_KEY, docsItem);
+        nativeTreeSelectItem(TREE_KEY, aItem);                 // -> onTreeSelect(10)
+        bool treeOpened = e.tabCount() == tabsBefore + 1
+            && editorHas("aaa contents")
+            && e.treeSel == 10;
+        if (treeOpened) pass++; else printf("  FAIL: tree open (tabs %d->%d treeSel=%d)\n", tabsBefore, e.tabCount(), e.treeSel);
+
+        // 11. Splitter drag changes the layout (the sidebar / editor widths shift).
+        total++;
+        Rect edBefore = nativeNodeBounds(EDITOR_KEY);
+        Rect splitB = nativeNodeBounds("root/split");
+        nativeSplitterDrag("root/split", splitB.x + splitB.w * 60 / 100, splitB.y);
+        Rect edAfter = nativeNodeBounds(EDITOR_KEY);
+        bool splitOk = e.splitRatio != 22 && edAfter.x != edBefore.x;
+        if (splitOk) pass++; else printf("  FAIL: split drag (ratio=%d edX %d->%d)\n", e.splitRatio, edBefore.x, edAfter.x);
+
+        // 12. Context-menu command routes: firing "New Tab" adds a tab via the handler.
+        total++;
+        int tabsBefore2 = e.tabCount();
+        nativeFireContextMenu(TREE_KEY, 0);                    // -> CMD_NEWTAB
+        bool ctxOk = e.tabCount() == tabsBefore2 + 1;
+        if (ctxOk) pass++; else printf("  FAIL: context menu route (tabs %d->%d)\n", tabsBefore2, e.tabCount());
+
+        // 13. New Window: a genuine second editor window with its own tree/ctx/controls.
+        total++;
+        int before = hostWindowCount();
+        nativeTestFireMenu(CMD_NEWWIN);                        // _cur -> the new window
+        u64 ed2 = activeCtx().nativeHandle(EDITOR_KEY);
+        bool twoWin = hostWindowCount() == before + 1 && ed2 != 0u && ed2 != (u64)hed;
+        if (twoWin) pass++;
+        else printf("  FAIL: New Window (count=%d ed2=%llu)\n", hostWindowCount(), ed2);
+
+        // 14. ctx.post() round-trip from a worker thread (marshaled, runs on UI thread).
+        total++;
+        u64 mainTid = (u64)GetCurrentThreadId();
+        UiContext* c2 = activeCtx();
+        Thread t;
+        t.start(_postWorker, c2);
+        t.join();
+        bool queuedNotRun = _postRan == 0;
+        hostDrainPosted();
+        bool ranOnUi = _postRan == 1 && _postRanTid == mainTid;
+        if (queuedNotRun && ranOnUi) pass++;
+        else printf("  FAIL: post round-trip (ran=%d onUi=%d)\n", _postRan, (int)(_postRanTid == mainTid));
+    }
+
+    // Teardown: destroy every window + release host state (leak-clean for heap-audit).
     nativeTeardownForTest();
 
     if (pass == total)
     {
-        printf("PASS: fedit self-test %d/%d (open, edit-dirty, save, menu, theme, find)\n", pass, total);
+        printf("PASS: fedit self-test %d/%d (open, edit, save, menu, theme, find, statusbar, sugar, tabs, tree, split, context, multi-window, post)\n", pass, total);
         return 0;
     }
     printf("FAIL: fedit self-test %d/%d\n", pass, total);

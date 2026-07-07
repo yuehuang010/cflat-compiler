@@ -3,12 +3,21 @@
 // Where win32host.cb PAINTS the Element tree through GDI (GdiCanvas), this host is
 // the NativeHost output stage (see ui_native.cb): the reconciled tree's stable key
 // paths map to real child controls (BUTTON/STATIC/EDIT/checkbox/msctls_progress32/
-// trackbar/etched panel), and the host creates/updates/destroys those controls to
-// match the tree. The OS paints, handles IME + accessibility, and owns focus/Tab.
+// trackbar/etched-panel/status bar), and the host creates/updates/destroys those
+// controls to match the tree. The OS paints, handles IME + accessibility, and owns
+// focus/Tab.
 //
 // The app-facing model (Component/Element/Theme/controlled widgets) is UNCHANGED;
 // an app that renders to the GDI host renders here too - it just imports this host
-// instead. Single window / single thread (P1); multi-window is P3.
+// instead.
+//
+// P7 - app-shell foundation: this host is now MULTI-WINDOW. A `Window` owns its
+// {top-level HWND, root Element/Component, UiContext, live-control bookkeeping,
+// theme}; the app holds a list<Window*> driven by ONE message loop. The former
+// single-editor host globals are gone: the free-function WndProc resolves the
+// servicing window by finding its HWND in the registry, and app code reaches the
+// window it is servicing through activeCtx()/activeApp() (set per message).
+// ctx.post() marshals a closure back to the UI thread via PostMessage(WM_APP_CALL).
 //
 // This file has no main(); an app imports it and calls runAppGuiNative().
 import "windows.h" lib { "user32.lib", "gdi32.lib", "comctl32.lib", "dwmapi.lib", "comdlg32.lib" } cache;
@@ -28,51 +37,263 @@ const int TBM_SETPOS     = 1029;   // WM_USER+5
 const int TBM_SETRANGE   = 1030;   // WM_USER+6
 const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
 
+// Status bar (msctls_statusbar32) messages.
+const int SB_SETTEXTA = 1025;   // WM_USER+1
+const int SB_GETTEXTA = 1026;   // WM_USER+2
+const int SB_SETPARTS = 1028;   // WM_USER+4
+
+// Tooltip (tooltips_class32) messages / flags.
+const int TTM_ADDTOOLA       = 1028;   // WM_USER+4
+const int TTM_UPDATETIPTEXTA = 1036;   // WM_USER+12
+const int TTM_GETTOOLCOUNT   = 1037;   // WM_USER+13
+const int TTF_IDISHWND       = 0x0001;
+const int TTF_SUBCLASS       = 0x0010;
+const int TTS_ALWAYSTIP      = 0x0001;
+
+// Marshaled UI-thread call (ctx.post): WM_APP+1, lParam = the boxed closure pointer.
+const int WM_APP_CALL = 0x8001;
+
+// ── ListView (WC_LISTVIEW) messages / styles / notify codes (P8) ──────────────
+// The commctrl LV* constants are not surfaced by the windows.h binding (CB_* and
+// NMHDR are), so they are declared by hand. LVM_FIRST = 0x1000, LVN_FIRST = -100.
+const int LVM_DELETECOLUMN            = 0x101C;   // LVM_FIRST+28
+const int LVM_INSERTCOLUMNA           = 0x101B;   // LVM_FIRST+27
+const int LVM_SETITEMCOUNT            = 0x102F;   // LVM_FIRST+47
+const int LVM_SETITEMSTATE            = 0x102B;   // LVM_FIRST+43
+const int LVM_GETITEMTEXTA            = 0x102D;   // LVM_FIRST+45
+const int LVM_GETNEXTITEM             = 0x100C;   // LVM_FIRST+12
+const int LVM_SETEXTENDEDLISTVIEWSTYLE = 0x1036;  // LVM_FIRST+54
+const int LVM_GETITEMCOUNT            = 0x1004;   // LVM_FIRST+4
+const int LVS_REPORT       = 0x0001;
+const int LVS_SINGLESEL    = 0x0004;
+const int LVS_SHOWSELALWAYS = 0x0008;
+const int LVS_OWNERDATA    = 0x1000;
+const int LVS_EX_FULLROWSELECT = 0x0020;
+const int LVCF_FMT     = 0x0001;
+const int LVCF_WIDTH   = 0x0002;
+const int LVCF_TEXT    = 0x0004;
+const int LVCF_SUBITEM = 0x0008;
+const int LVIF_TEXT    = 0x0001;
+const int LVIS_FOCUSED  = 0x0001;
+const int LVIS_SELECTED = 0x0002;
+const int LVNI_SELECTED = 0x0002;
+// Negative literals in a global const initializer are miscompiled (truncated to the
+// smallest unsigned width - see internal/issue/negative-int-literal-global-init.md),
+// so these are written as `0 - N`, which folds correctly.
+const int LVN_ITEMCHANGED = 0 - 101;   // LVN_FIRST-1
+const int LVN_GETDISPINFOA = 0 - 150;  // LVN_FIRST-50
+const int LVN_KEYDOWN     = 0 - 155;   // LVN_FIRST-55
+const int NM_DBLCLK       = 0 - 3;     // NM_FIRST-3
+
+// LVCOLUMNA (ANSI, natural 8-byte pointer alignment). pszText/iSubItem drive an
+// LVM_INSERTCOLUMNA; _pad aligns pszText to offset 16.
+struct LVColumnA
+{
+    u32   mask       = 0u;
+    i32   fmt        = 0;
+    i32   cx         = 0;
+    i32   _pad       = 0;
+    char* pszText    = nullptr;
+    i32   cchTextMax = 0;
+    i32   iSubItem   = 0;
+    i32   iImage     = 0;
+    i32   iOrder     = 0;
+};
+
+// LVITEMA (ANSI). Used for LVM_SETITEMSTATE (state+stateMask), LVM_GETITEMTEXTA
+// (iSubItem+pszText+cchTextMax), and to read a GETDISPINFO item (offset 24 inside
+// NMLVDISPINFO). pszText lands at struct offset 24, matching the Win32 layout.
+struct LVItemA
+{
+    u32   mask       = 0u;
+    i32   iItem      = 0;
+    i32   iSubItem   = 0;
+    u32   state      = 0u;
+    u32   stateMask  = 0u;
+    i32   _pad       = 0;
+    char* pszText    = nullptr;
+    i32   cchTextMax = 0;
+    i32   iImage     = 0;
+    i64   lParam     = 0;
+};
+
+// TOOLINFOA is not surfaced by the windows.h binding; declared by hand to match the
+// comctl32 v6 ANSI layout (embedded RECT as 4 i32; natural 8-byte pointer alignment).
+struct TTInfoA
+{
+    u32   cbSize     = 0u;
+    u32   uFlags     = 0u;
+    void* hwnd       = nullptr;
+    u64   uId        = 0u;
+    i32   rectLeft   = 0;
+    i32   rectTop    = 0;
+    i32   rectRight  = 0;
+    i32   rectBottom = 0;
+    void* hinst      = nullptr;
+    char* lpszText   = nullptr;
+    i64   lParam     = 0;
+    void* lpReserved = nullptr;
+};
+
+// ── TabControl (WC_TABCONTROL) messages / notify codes (P9) ───────────────────
+// TCM_FIRST = 0x1300; TCN_FIRST = -550. Not surfaced by the windows.h binding.
+const int TCM_INSERTITEMA   = 0x1307;   // TCM_FIRST+7
+const int TCM_DELETEALLITEMS = 0x1309;  // TCM_FIRST+9
+const int TCM_GETCURSEL     = 0x130B;   // TCM_FIRST+11
+const int TCM_SETCURSEL     = 0x130C;   // TCM_FIRST+12
+const int TCM_GETITEMCOUNT  = 0x1304;   // TCM_FIRST+4
+const int TCIF_TEXT         = 0x0001;
+const int TCN_SELCHANGE     = 0 - 551;  // TCN_FIRST-1 (negative; see the note above)
+
+// TCITEMA (ANSI, tightly packed like LVColumnA - cflat inserts no field padding, so
+// pointers/i64 are hand-aligned). pszText lands at offset 16, lParam at 32.
+struct TCItemA
+{
+    u32   mask        = 0u;
+    u32   dwState     = 0u;
+    u32   dwStateMask = 0u;
+    u32   _pad        = 0u;
+    char* pszText     = nullptr;
+    i32   cchTextMax  = 0;
+    i32   iImage      = 0;
+    i64   lParam      = 0;
+};
+
+// ── TreeView (WC_TREEVIEW) messages / styles / notify codes (P9) ──────────────
+// TV_FIRST = 0x1100; TVN_FIRST = -400.
+const int TVM_INSERTITEMA  = 0x1100;   // TV_FIRST+0
+const int TVM_DELETEITEM   = 0x1101;   // TV_FIRST+1
+const int TVM_EXPAND       = 0x1102;   // TV_FIRST+2
+const int TVM_GETCOUNT     = 0x1105;   // TV_FIRST+5
+const int TVM_GETNEXTITEM  = 0x110A;   // TV_FIRST+10
+const int TVM_SELECTITEM   = 0x110B;   // TV_FIRST+11
+const int TVM_GETITEMA     = 0x110C;   // TV_FIRST+12
+const int TVS_HASBUTTONS   = 0x0001;
+const int TVS_HASLINES     = 0x0002;
+const int TVS_LINESATROOT  = 0x0004;
+const int TVS_SHOWSELALWAYS = 0x0020;
+const int TVIF_TEXT        = 0x0001;
+const int TVIF_PARAM       = 0x0004;
+const int TVIF_CHILDREN    = 0x0040;
+const int TVGN_ROOT        = 0x0000;
+const int TVGN_CHILD       = 0x0004;
+const int TVGN_CARET       = 0x0009;
+const int TVE_EXPAND       = 0x0002;
+const int TVN_SELCHANGEDA   = 0 - 402;  // TVN_FIRST-2
+const int TVN_ITEMEXPANDINGA = 0 - 405; // TVN_FIRST-5
+
+// TVITEMA (ANSI, tightly packed). hItem@8, pszText@24, lParam@48; size 56.
+struct TVItemA
+{
+    u32   mask           = 0u;
+    u32   _pad0          = 0u;
+    void* hItem          = nullptr;
+    u32   state          = 0u;
+    u32   stateMask      = 0u;
+    char* pszText        = nullptr;
+    i32   cchTextMax     = 0;
+    i32   iImage         = 0;
+    i32   iSelectedImage = 0;
+    i32   cChildren      = 0;
+    i64   lParam         = 0;
+};
+
+// TVINSERTSTRUCTA (ANSI): hParent@0, hInsertAfter@8, then the embedded TVITEMA @16
+// (mask@16 ... lParam@64). Flattened so the layout is explicit.
+struct TVInsertA
+{
+    void* hParent        = nullptr;
+    void* hInsertAfter   = nullptr;
+    u32   mask           = 0u;
+    u32   _pad0          = 0u;
+    void* hItem          = nullptr;
+    u32   state          = 0u;
+    u32   stateMask      = 0u;
+    char* pszText        = nullptr;
+    i32   cchTextMax     = 0;
+    i32   iImage         = 0;
+    i32   iSelectedImage = 0;
+    i32   cChildren      = 0;
+    i64   lParam         = 0;
+};
+
+// The two HTREEITEM sentinels used at insert time (ULONG_PTR -0x10000 / -0xFFFE on
+// 64-bit). Computed via subtraction so no negative literal is folded (see the note above).
+void* tviRoot() { return (void*)((i64)0 - (i64)0x10000); }
+void* tviLast() { return (void*)((i64)0 - (i64)0xFFFE); }
+
+// ── Image / GroupBox / CanvasView (P10) ──────────────────────────────────────
+// STM_SETIMAGE / IMAGE_BITMAP / SS_BITMAP / SS_REALSIZECONTROL / BS_GROUPBOX /
+// LR_LOADFROMFILE / DIB_RGB_COLORS / PW_RENDERFULLCONTENT / GWLP_USERDATA are all
+// surfaced by the windows.h binding. The custom-draw NM_/CDDS_/CDRF_/CDIS_ codes are not.
+
+// NM_CUSTOMDRAW for themed accent buttons (P10). NM_FIRST = 0; NM_CUSTOMDRAW = NM_FIRST-12
+// (negative literal in a global const is miscompiled - see the note above - so `0 - N`).
+const int NM_CUSTOMDRAW      = 0 - 12;
+const int CDDS_PREPAINT      = 0x00000001;
+const int CDRF_DODEFAULT     = 0x00000000;
+const int CDRF_SKIPDEFAULT   = 0x00000004;
+const int CDIS_SELECTED      = 0x00000001;
+const int CDIS_FOCUS         = 0x00000010;
+const int CDIS_HOT           = 0x00000040;
+
+// GDI + shell APIs used by the image DIB upload, the canvas child, and screenshots that
+// the windows.h binding may not surface; declared by hand to match the Win32 signatures.
+extern stdcall void* CreateDIBSection(void* hdc, void* pbmi, u32 usage, void** bits, void* sect, u32 off);
+extern stdcall void* LoadImageA(void* inst, char* name, u32 type, i32 cx, i32 cy, u32 fuLoad);
+
+// A 40-byte BITMAPINFOHEADER (no color table for 32bpp BI_RGB). A negative biHeight
+// makes the DIB top-down, matching the BGRA32 buffers Image carries.
+struct BmiHeader
+{
+    u32 biSize        = 40u;
+    i32 biWidth       = 0;
+    i32 biHeight      = 0;
+    u16 biPlanes      = 1;
+    u16 biBitCount    = 32;
+    u32 biCompression = 0u;
+    u32 biSizeImage   = 0u;
+    i32 biXPelsPerM   = 0;
+    i32 biYPelsPerM   = 0;
+    u32 biClrUsed     = 0u;
+    u32 biClrImportant = 0u;
+};
+
 // Per-DIP base pixels at 96 dpi (100%). Layout math in ui.cb is unit-blind
 // integers; a native host reads them as DIPs and scales by the monitor dpi:
 // physical px = dip * BASE * dpi / 96. One layout column ~8px, one row ~26px so
-// native controls get sensible heights. P2 makes this DPI-driven (per-monitor-v2
-// awareness + WM_DPICHANGED); P1 used a fixed 96-dpi scale.
+// native controls get sensible heights.
 const int BASE_X = 8;
 const int BASE_Y = 26;
 
-// ── The running app + its tree + context, reached from the free-function WndProc
-// (a stdcall callback cannot capture `this`). Single window / single thread, so
-// these host globals are the right tool; they live in the HOST file, not ui.cb.
-Win32Host _nHost  = default;
-Component _nApp   = default;
-Element   _nTree  = default;
-UiContext _nCtx   = default;
-bool      _nReady = false;
-int       _nW     = 80;   // client size in DIP units (layout width/height)
-int       _nH     = 30;
+// ── App-wide host state (NOT per-window) ─────────────────────────────────────
+// The window class + hInstance + declarative menu are shared by every window; the
+// per-window state lives in Window (below). _cur is the window currently being
+// serviced (set by WndProc from the incoming HWND, and explicitly during a build).
+void*          _hInst      = nullptr;
+bool           _classReg   = false;
+bool           _secClassReg = false;
+void*          _accelTable = nullptr;
 
-// ── Declarative menu bar (P3) ─────────────────────────────────────────────────
-// The app builds a menu with menuReset/menuAddTop/menuAddItem before
-// runAppGuiNative; the host realizes it into an HMENU + an accelerator table.
-// Parallel lists (not a struct-with-closure) keep ownership simple. An item's
-// command id is MENU_ID_BASE + its index; WM_COMMAND with lParam == 0 routes here.
-// The app assigns each item an int command id and provides ONE dispatch closure
-// (setMenuHandler) that switches on the id - avoids a list-of-closures.
+// The declarative menu bar (P3). The app builds it once with menuReset/menuAddTop/
+// menuAddItem before creating windows; each window realizes the SAME declaration into
+// its own HMENU + the shared accelerator table. Parallel lists keep ownership simple.
 list<string>          _menuTop        = default;   // top-level menu titles
 list<int>             _menuItemTopIdx = default;   // per item: owning top index
 list<string>          _menuItemLabel  = default;   // per item: label (with \t accel text)
 list<int>             _menuItemCmd    = default;   // per item: app command id (0 = separator)
 list<int>             _menuAccelKey   = default;   // per item: virtual key (0 = none)
 list<int>             _menuAccelMods  = default;   // per item: FCONTROL|FSHIFT|FALT
-Lambda<void(int)>     _menuHandler    = default;   // app's command dispatcher
-void*                 _accelTable     = nullptr;
 
-// Optional close guard: the app returns true to allow the window to close (e.g.
-// after a dirty-save prompt), false to veto. Default (unset) always allows.
+// One app-wide command dispatcher + close guard. They reach the servicing window via
+// activeApp()/activeCtx(), so a single closure serves every window.
+Lambda<void(int)>     _menuHandler    = default;
+bool                  _hasMenuHandler = false;
 Lambda<bool()>        _closeQuery     = default;
 bool                  _hasCloseQuery  = false;
 
-void setMenuHandler(Lambda<void(int)> h) { _menuHandler = h; }
+void setMenuHandler(Lambda<void(int)> h) { _menuHandler = h; _hasMenuHandler = true; }
 void setCloseQuery(Lambda<bool()> q) { _closeQuery = q; _hasCloseQuery = true; }
-
-int hostWidth()  { return _nW; }
-int hostHeight() { return _nH; }
 
 void* u2h(u64 u) { return (void*)u; }
 
@@ -82,18 +303,44 @@ bool nativeMappable(int kind)
 {
     return kind == ELEM_BUTTON || kind == ELEM_TEXT || kind == ELEM_TEXTINPUT
         || kind == ELEM_CHECKBOX || kind == ELEM_PROGRESS || kind == ELEM_SLIDER
-        || kind == ELEM_BOX || kind == ELEM_TEXTAREA;
+        || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_STATUSBAR
+        || kind == ELEM_RADIO || kind == ELEM_COMBO || kind == ELEM_LIST
+        || kind == ELEM_TABS || kind == ELEM_TREE
+        || kind == ELEM_IMAGE || kind == ELEM_GROUPBOX || kind == ELEM_CANVAS;
 }
 
-// ── Win32Host: the NativeHost implementation ─────────────────────────────────
-// Owns the top-level window, the shared UI font, the reentrancy guard, and the
-// per-frame live-control bookkeeping (parallel key/handle lists) used to route
-// events and to destroy controls that fell out of the tree.
-class Win32Host : NativeHost
+// The concrete tooltip text a mappable node carries ("" = none). Read via downcast so
+// the Element interface stays unchanged; every mappable class exposes a `tooltip` field.
+string tooltipOf(Element node)
 {
-    void* window = nullptr;
-    void* font   = nullptr;
-    void* hInst  = nullptr;
+    int k = node.kind();
+    if (k == ELEM_BUTTON)    { Button* b = node as Button; return "" + b.tooltip; }
+    if (k == ELEM_TEXT)      { Text* t = node as Text; return "" + t.tooltip; }
+    if (k == ELEM_TEXTINPUT) { TextInput* t = node as TextInput; return "" + t.tooltip; }
+    if (k == ELEM_CHECKBOX)  { Checkbox* c = node as Checkbox; return "" + c.tooltip; }
+    if (k == ELEM_PROGRESS)  { ProgressBar* p = node as ProgressBar; return "" + p.tooltip; }
+    if (k == ELEM_SLIDER)    { Slider* s = node as Slider; return "" + s.tooltip; }
+    if (k == ELEM_TEXTAREA)  { TextArea* a = node as TextArea; return "" + a.tooltip; }
+    if (k == ELEM_RADIO)     { RadioButton* r = node as RadioButton; return "" + r.tooltip; }
+    if (k == ELEM_COMBO)     { ComboBox* c = node as ComboBox; return "" + c.tooltip; }
+    if (k == ELEM_LIST)      { ListView* l = node as ListView; return "" + l.tooltip; }
+    if (k == ELEM_TABS)      { TabControl* t = node as TabControl; return "" + t.tooltip; }
+    if (k == ELEM_TREE)      { TreeView* t = node as TreeView; return "" + t.tooltip; }
+    if (k == ELEM_IMAGE)     { Image* im = node as Image; return "" + im.tooltip; }
+    if (k == ELEM_GROUPBOX)  { GroupBox* g = node as GroupBox; return "" + g.tooltip; }
+    if (k == ELEM_CANVAS)    { CanvasView* c = node as CanvasView; return "" + c.tooltip; }
+    return "";
+}
+
+// ── Window: one top-level window + its Element tree, context, and controls ────
+// Implements NativeHost (each window drives its own controls). P7 replaces the old
+// single-editor Win32Host globals; the app holds a list<Window*>. Menu declaration,
+// hInstance, and the accelerator table stay app-wide (above).
+class Window : NativeHost
+{
+    void* hwnd    = nullptr;
+    void* font    = nullptr;
+    void* tooltip = nullptr;         // lazily-created tooltips_class32 for this window
     bool  applying = false;          // guard: swallow self-inflicted EN_CHANGE
     u32   dpi     = 96u;             // window dpi (96 = 100%); drives DIP->px
     bool  dark    = false;           // last applied theme was dark (titlebar/bg)
@@ -102,13 +349,50 @@ class Win32Host : NativeHost
     void* bgBrush   = nullptr;       // cached solid brush of themeBg
     list<string> liveKeys    = default;   // keys with a live control this frame
     list<u64>    liveHandles = default;   // parallel handles (HWND as u64)
+    // ListView rowText callback boxes (P8): parallel HWND -> ListRowBox* (as u64). The
+    // host owns these; freed on destroyControl and dispose. A Lambda cannot cross the
+    // seam, so the callback rides as an opaque u64 (see setListOp / __uiListRowText).
+    list<u64>    listBoxHandles = default;
+    list<u64>    listBoxPtrs    = default;
+    // TreeView node-source boxes (P9): parallel HWND -> TreeBox* (as u64), like the list
+    // boxes. Freed on destroyControl + dispose (a Lambda cannot cross the seam).
+    list<u64>    treeBoxHandles = default;
+    list<u64>    treeBoxPtrs    = default;
+    // Per-key context menus (P9): parallel key-path -> ContextMenu* (as u64). Host-owned;
+    // registered via nativeSetContextMenu, freed on dispose.
+    list<string> ctxKeys        = default;
+    list<u64>    ctxMenus        = default;
+    string       splitDragKey    = default;   // key path of a splitter being dragged ("" = none)
+    // Image HBITMAPs (P10): parallel control HWND -> HBITMAP (as u64) + the last pixel
+    // buffer uploaded (to skip redundant DIB rebuilds). The host owns the bitmaps; they
+    // are deleted on destroyControl + dispose (DestroyWindow does not free an STM image).
+    list<u64>    imgHandles      = default;
+    list<u64>    imgBitmaps      = default;
+    list<u64>    imgLastPixels   = default;
+    // CanvasView paint boxes (P10): parallel child HWND -> CanvasBox* (as u64), like the
+    // list/tree boxes; freed on destroyControl + dispose (a Lambda cannot cross the seam).
+    list<u64>    canvasHandles   = default;
+    list<u64>    canvasBoxes     = default;
+    // Accent-button colors (P10): parallel push-BUTTON HWND -> (bg, fg) COLORREF for
+    // NM_CUSTOMDRAW. Only set when the theme gives a non-default button color, so a
+    // monochrome theme leaves buttons at the native look (byte-identical).
+
+    list<u64>    accentHandles   = default;
+    list<u32>    accentBg        = default;
+    list<u32>    accentFg        = default;
+
+    Component app   = default;       // the mounted component (this window owns it)
+    Element   tree  = default;       // the committed Element tree
+    UiContext ctx   = default;       // per-window runtime state
+    bool      ready = false;
+    int       w     = 80;            // client size in DIP units (layout width)
+    int       h     = 30;            // client size in DIP units (layout height)
 
     // Physical pixels per layout DIP on each axis at the current dpi.
     int dipX() { return BASE_X * (int)this.dpi / 96; }
     int dipY() { return BASE_Y * (int)this.dpi / 96; }
 
-    // NativeHost: create a control of `elemKind` under `parentHandle`. `key` is the
-    // node's key path (kept by the caller in the shadow map). Returns the HWND.
+    // NativeHost: create a control of `elemKind` under `parentHandle`. Returns the HWND.
     u64 createControl(int elemKind, u64 parentHandle, string key)
     {
         void* parent = u2h(parentHandle);
@@ -155,9 +439,65 @@ class Win32Host : NativeHost
             cls = "msctls_trackbar32";
             style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP);
         }
+        else if (elemKind == ELEM_STATUSBAR)
+        {
+            cls = "msctls_statusbar32";
+            style = (u32)(WS_CHILD | WS_VISIBLE);
+        }
+        else if (elemKind == ELEM_RADIO)
+        {
+            cls = "BUTTON";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON);
+        }
+        else if (elemKind == ELEM_COMBO)
+        {
+            cls = "COMBOBOX";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL);
+        }
+        else if (elemKind == ELEM_LIST)
+        {
+            cls = "SysListView32";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER
+                          | LVS_REPORT | LVS_OWNERDATA | LVS_SINGLESEL | LVS_SHOWSELALWAYS);
+        }
+        else if (elemKind == ELEM_TABS)
+        {
+            cls = "SysTabControl32";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS);
+        }
+        else if (elemKind == ELEM_TREE)
+        {
+            cls = "SysTreeView32";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER
+                          | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT | TVS_SHOWSELALWAYS);
+        }
+        else if (elemKind == ELEM_IMAGE)
+        {
+            // A STATIC that hosts an HBITMAP; SS_REALSIZECONTROL stretches the bitmap to
+            // the control frame (the setImageData seam uploads the pixels).
+            cls = "STATIC";
+            style = (u32)(WS_CHILD | WS_VISIBLE | SS_BITMAP | SS_REALSIZECONTROL);
+        }
+        else if (elemKind == ELEM_GROUPBOX)
+        {
+            // A BUTTON with BS_GROUPBOX draws the titled frame; its children position as
+            // siblings inside the frame (Win32 group boxes do not parent their contents).
+            cls = "BUTTON";
+            style = (u32)(WS_CHILD | WS_VISIBLE | BS_GROUPBOX);
+        }
+        else if (elemKind == ELEM_CANVAS)
+        {
+            // A GDI-backed child window the app paints via the Canvas API; its own WndProc
+            // (CanvasChildProc) invokes the boxed onPaint closure on WM_PAINT.
+            ensureCanvasClass();
+            void* ch = CreateWindowExA(0u, "CFlatCanvasChild", "",
+                (u32)(WS_CHILD | WS_VISIBLE),
+                0, 0, 10, 10, parent, nullptr, _hInst, nullptr);
+            return (u64)ch;
+        }
 
         void* h = CreateWindowExA(0u, cls.data(), "", style,
-                                  0, 0, 10, 10, parent, nullptr, this.hInst, nullptr);
+                                  0, 0, 10, 10, parent, nullptr, _hInst, nullptr);
         if (this.font != nullptr)
             SendMessageA(h, (u32)WM_SETFONT, (u64)this.font, (i64)1);
         return (u64)h;
@@ -165,11 +505,18 @@ class Win32Host : NativeHost
 
     void destroyControl(u64 h)
     {
-        if (h != 0u) DestroyWindow(u2h(h));
+        if (h == 0u) return;
+        this._freeListBox(h);   // no-op unless h is a ListView with a boxed callback
+        this._freeTreeBox(h);   // no-op unless h is a TreeView with a boxed node source
+        this._freeImage(h);     // no-op unless h is an Image with an HBITMAP
+        this._freeCanvasBox(h); // no-op unless h is a CanvasView with a boxed painter
+        this._forgetAccent(h);
+        DestroyWindow(u2h(h));
     }
 
     // Batched elsewhere (applyTree uses DeferWindowPos); this immediate form is the
-    // NativeHost contract for a one-off reposition.
+    // NativeHost contract for a one-off reposition. A status bar self-docks, so it is
+    // repositioned by a WM_SIZE tickle rather than an absolute frame.
     void setFrame(u64 h, Rect frameDip)
     {
         MoveWindow(u2h(h), frameDip.x * this.dipX(), frameDip.y * this.dipY(),
@@ -216,21 +563,453 @@ class Win32Host : NativeHost
         }
     }
 
-    // P1: native default look. P2 wires theme accents through WM_CTLCOLOR* +
-    // NM_CUSTOMDRAW; the seam is here so callers need not change.
-    void setAccent(u64 h, int fgColor, int bgColor) { }
+    // Store a push button's accent colors for NM_CUSTOMDRAW (P10). A 0 (default) bg
+    // forgets any prior accent so the button reverts to the native look; a set bg is
+    // recorded as a COLORREF pair the custom-draw handler fills with. fgColor/bgColor are
+    // framework colors (0 = default). Only ELEM_BUTTON calls this (see _syncProps).
+    void setAccent(u64 h, int fgColor, int bgColor)
+    {
+        if (bgColor == 0) { this._forgetAccent(h); return; }
+        u32 bg = this.colorRef(bgColor);
+        u32 fg = fgColor != 0 ? this.colorRef(fgColor) : (u32)0xFFFFFFu;
+        int i = 0;
+        while (i < this.accentHandles.count())
+        {
+            if (this.accentHandles.get(i) == h)
+            {
+                this.accentBg.set(i, bg); this.accentFg.set(i, fg); return;
+            }
+            i++;
+        }
+        this.accentHandles.add(h); this.accentBg.add(bg); this.accentFg.add(fg);
+    }
+
+    void _forgetAccent(u64 h)
+    {
+        int i = 0;
+        while (i < this.accentHandles.count())
+        {
+            if (this.accentHandles.get(i) == h)
+            {
+                this.accentHandles.removeAt(i); this.accentBg.removeAt(i); this.accentFg.removeAt(i);
+                return;
+            }
+            i++;
+        }
+    }
+
+    // True (with the accent colors) if control `h` has a stored accent. Drives NM_CUSTOMDRAW.
+    bool accentFor(u64 h, u32* bg, u32* fg)
+    {
+        int i = 0;
+        while (i < this.accentHandles.count())
+        {
+            if (this.accentHandles.get(i) == h)
+            {
+                bg[0] = this.accentBg.get(i); fg[0] = this.accentFg.get(i); return true;
+            }
+            i++;
+        }
+        return false;
+    }
+
+    // ── Image DIB upload (P10; setImageData seam + HBITMAP bookkeeping) ───────────
+    // Upload a top-down BGRA32 buffer to control `h` as an HBITMAP (STM_SETIMAGE). Builds
+    // a top-down 32bpp DIB section, copies the pixels into it, and swaps the control's
+    // bitmap, deleting the previous one. The new HBITMAP is remembered so destroyControl /
+    // dispose can free it (an STM image is not destroyed with the window).
+    void setImageData(u64 h, u64 pixels, int w, int h2, int stride)
+    {
+        if (h == 0u || pixels == 0u || w <= 0 || h2 <= 0) return;
+        void* dc = GetDC(this.hwnd);
+        BmiHeader bi = default;
+        bi.biSize = 40u; bi.biWidth = w; bi.biHeight = 0 - h2;   // negative = top-down
+        bi.biPlanes = 1; bi.biBitCount = 32; bi.biCompression = 0u;
+        void* bits = nullptr;
+        void* bmp = CreateDIBSection(dc, &bi, (u32)DIB_RGB_COLORS, &bits, nullptr, 0u);
+        ReleaseDC(this.hwnd, dc);
+        if (bmp == nullptr || bits == nullptr) return;
+        // Copy row by row (source stride may exceed w*4).
+        char* src = (char*)u2h(pixels);
+        char* dst = (char*)bits;
+        int rowBytes = w * 4;
+        int y = 0;
+        while (y < h2)
+        {
+            memcpy((void*)(dst + (i64)(y * rowBytes)), (void*)(src + (i64)(y * stride)), (i64)rowBytes);
+            y++;
+        }
+        void* old = (void*)SendMessageA(u2h(h), (u32)STM_SETIMAGE, (u64)IMAGE_BITMAP, (i64)bmp);
+        this._rememberImage(h, (u64)bmp);
+        if (old != nullptr && old != bmp) DeleteObject(old);
+    }
+
+    // Load a .bmp file into control `h` (host-internal decoder; no image library). WIC/
+    // richer formats (PNG/JPG) would decode to the same BGRA buffer and ride setImageData.
+    void setImageFile(u64 h, string path)
+    {
+        if (h == 0u || path.length() == 0) return;
+        void* bmp = LoadImageA(nullptr, (char*)path.data(), (u32)IMAGE_BITMAP, 0, 0, (u32)LR_LOADFROMFILE);
+        if (bmp == nullptr) return;
+        void* old = (void*)SendMessageA(u2h(h), (u32)STM_SETIMAGE, (u64)IMAGE_BITMAP, (i64)bmp);
+        this._rememberImage(h, (u64)bmp);
+        if (old != nullptr && old != bmp) DeleteObject(old);
+    }
+
+    void _rememberImage(u64 h, u64 bmp)
+    {
+        int i = 0;
+        while (i < this.imgHandles.count())
+        {
+            if (this.imgHandles.get(i) == h)
+            {
+                u64 prev = this.imgBitmaps.get(i);
+                if (prev != 0u && prev != bmp) DeleteObject(u2h(prev));
+                this.imgBitmaps.set(i, bmp); return;
+            }
+            i++;
+        }
+        this.imgHandles.add(h); this.imgBitmaps.add(bmp); this.imgLastPixels.add(0u);
+    }
+
+    // The last pixel buffer uploaded to `h` (0 if none) - lets _syncProps skip a rebuild
+    // when the app hands down the same buffer pointer again.
+    u64 _imgLastPixels(u64 h)
+    {
+        int i = 0;
+        while (i < this.imgHandles.count())
+        {
+            if (this.imgHandles.get(i) == h) { u64 v = this.imgLastPixels.get(i); return v; }
+            i++;
+        }
+        return 0u;
+    }
+
+    void _setImgLastPixels(u64 h, u64 px)
+    {
+        int i = 0;
+        while (i < this.imgHandles.count())
+        {
+            if (this.imgHandles.get(i) == h) { this.imgLastPixels.set(i, px); return; }
+            i++;
+        }
+        this.imgHandles.add(h); this.imgBitmaps.add(0u); this.imgLastPixels.add(px);
+    }
+
+    void _freeImage(u64 h)
+    {
+        int i = 0;
+        while (i < this.imgHandles.count())
+        {
+            if (this.imgHandles.get(i) == h)
+            {
+                u64 bmp = this.imgBitmaps.get(i);
+                if (bmp != 0u) DeleteObject(u2h(bmp));
+                this.imgHandles.removeAt(i); this.imgBitmaps.removeAt(i); this.imgLastPixels.removeAt(i);
+                return;
+            }
+            i++;
+        }
+    }
+
+    // ── CanvasView paint-box bookkeeping (P10; mirrors the list/tree boxes) ───────
+    void _setCanvasBox(u64 h, u64 box)
+    {
+        int i = 0;
+        while (i < this.canvasHandles.count())
+        {
+            if (this.canvasHandles.get(i) == h)
+            {
+                u64 old = this.canvasBoxes.get(i);
+                if (old != 0u && old != box) __uiFreeCanvasBox(old);
+                this.canvasBoxes.set(i, box); return;
+            }
+            i++;
+        }
+        this.canvasHandles.add(h); this.canvasBoxes.add(box);
+    }
+
+    void _freeCanvasBox(u64 h)
+    {
+        int i = 0;
+        while (i < this.canvasHandles.count())
+        {
+            if (this.canvasHandles.get(i) == h)
+            {
+                u64 old = this.canvasBoxes.get(i);
+                if (old != 0u) __uiFreeCanvasBox(old);
+                this.canvasHandles.removeAt(i); this.canvasBoxes.removeAt(i);
+                return;
+            }
+            i++;
+        }
+    }
+
+    // ── ListView rowText box bookkeeping (P8) ────────────────────────────────
+    u64 _listBoxFor(u64 h)
+    {
+        int i = 0;
+        while (i < this.listBoxHandles.count())
+        {
+            if (this.listBoxHandles.get(i) == h)
+            {
+                u64 v = this.listBoxPtrs.get(i);
+                return v;
+            }
+            i++;
+        }
+        return 0u;
+    }
+
+    // Store the box for control `h`, freeing any previous one (idempotent per frame).
+    void _setListBox(u64 h, u64 box)
+    {
+        int i = 0;
+        while (i < this.listBoxHandles.count())
+        {
+            if (this.listBoxHandles.get(i) == h)
+            {
+                u64 old = this.listBoxPtrs.get(i);
+                if (old != 0u && old != box) __uiFreeListRowBox(old);
+                this.listBoxPtrs.set(i, box);
+                return;
+            }
+            i++;
+        }
+        this.listBoxHandles.add(h);
+        this.listBoxPtrs.add(box);
+    }
+
+    void _freeListBox(u64 h)
+    {
+        int i = 0;
+        while (i < this.listBoxHandles.count())
+        {
+            if (this.listBoxHandles.get(i) == h)
+            {
+                u64 old = this.listBoxPtrs.get(i);
+                if (old != 0u) __uiFreeListRowBox(old);
+                this.listBoxHandles.removeAt(i);
+                this.listBoxPtrs.removeAt(i);
+                return;
+            }
+            i++;
+        }
+    }
+
+    // ── TreeView node-source box bookkeeping (P9; mirrors the ListView boxes) ──
+    u64 _treeBoxFor(u64 h)
+    {
+        int i = 0;
+        while (i < this.treeBoxHandles.count())
+        {
+            if (this.treeBoxHandles.get(i) == h) { u64 v = this.treeBoxPtrs.get(i); return v; }
+            i++;
+        }
+        return 0u;
+    }
+
+    void _setTreeBox(u64 h, u64 box)
+    {
+        int i = 0;
+        while (i < this.treeBoxHandles.count())
+        {
+            if (this.treeBoxHandles.get(i) == h)
+            {
+                u64 old = this.treeBoxPtrs.get(i);
+                if (old != 0u && old != box) __uiFreeTreeBox(old);
+                this.treeBoxPtrs.set(i, box);
+                return;
+            }
+            i++;
+        }
+        this.treeBoxHandles.add(h);
+        this.treeBoxPtrs.add(box);
+    }
+
+    void _freeTreeBox(u64 h)
+    {
+        int i = 0;
+        while (i < this.treeBoxHandles.count())
+        {
+            if (this.treeBoxHandles.get(i) == h)
+            {
+                u64 old = this.treeBoxPtrs.get(i);
+                if (old != 0u) __uiFreeTreeBox(old);
+                this.treeBoxHandles.removeAt(i);
+                this.treeBoxPtrs.removeAt(i);
+                return;
+            }
+            i++;
+        }
+    }
+
+    // Read a tree item's lParam (the app's nodeId) via TVM_GETITEM.
+    int _treeItemParam(void* ctrl, void* hItem)
+    {
+        TVItemA it = default;
+        it.mask = (u32)TVIF_PARAM;
+        it.hItem = hItem;
+        SendMessageA(ctrl, (u32)TVM_GETITEMA, 0u, (i64)&it);
+        return (int)it.lParam;
+    }
+
+    // Insert one node (nodeId) under `parent` (nullptr = root). The lParam carries the
+    // nodeId; a node with children sets cChildren=1 so the OS shows an expander and
+    // fires TVN_ITEMEXPANDING, at which point _treeExpandItem materializes the children.
+    void* _treeInsert(u64 h, u64 box, void* parent, int nodeId)
+    {
+        void* ctrl = u2h(h);
+        string lbl = __uiTreeLabel(box, nodeId);
+        TVInsertA ins = default;
+        ins.hParent = parent == nullptr ? tviRoot() : parent;
+        ins.hInsertAfter = tviLast();
+        ins.mask = (u32)(TVIF_TEXT | TVIF_PARAM);
+        ins.pszText = (char*)lbl.data();
+        ins.lParam = (i64)nodeId;
+        if (__uiTreeChildCount(box, nodeId) > 0)
+        {
+            ins.mask = ins.mask | (u32)TVIF_CHILDREN;
+            ins.cChildren = 1;
+        }
+        return (void*)SendMessageA(ctrl, (u32)TVM_INSERTITEMA, 0u, (i64)&ins);
+    }
+
+    // Clear the tree and insert the root's children (the top-level nodes), lazily.
+    void _treeBuildRoot(u64 h)
+    {
+        u64 box = this._treeBoxFor(h);
+        if (box == 0u) return;
+        void* ctrl = u2h(h);
+        SendMessageA(ctrl, (u32)TVM_DELETEITEM, 0u, (i64)tviRoot());   // TVI_ROOT clears all
+        int n = __uiTreeChildCount(box, TREE_ROOT);
+        int i = 0;
+        while (i < n) { this._treeInsert(h, box, nullptr, __uiTreeChildId(box, TREE_ROOT, i)); i++; }
+    }
+
+    // Materialize a node's children on first expand (idempotent: skip if already done).
+    void _treeExpandItem(u64 h, void* hItem)
+    {
+        u64 box = this._treeBoxFor(h);
+        if (box == 0u) return;
+        void* ctrl = u2h(h);
+        void* firstChild = (void*)SendMessageA(ctrl, (u32)TVM_GETNEXTITEM, (u64)TVGN_CHILD, (i64)hItem);
+        if (firstChild != nullptr) return;   // already materialized
+        int nodeId = this._treeItemParam(ctrl, hItem);
+        int n = __uiTreeChildCount(box, nodeId);
+        int i = 0;
+        while (i < n) { this._treeInsert(h, box, hItem, __uiTreeChildId(box, nodeId, i)); i++; }
+    }
+
+    // Rebuild a tab strip when its pane count changes, then set the controlled selection.
+    void _syncTabs(u64 h, TabControl* tc)
+    {
+        void* ctrl = u2h(h);
+        int have = (int)SendMessageA(ctrl, (u32)TCM_GETITEMCOUNT, 0u, (i64)0);
+        if (have != tc.children.count())
+        {
+            this.setListOp(h, LISTOP_TAB_RESET, 0, 0, "", 0u);
+            int i = 0;
+            while (i < tc.children.count())
+            {
+                string t = tc._title(i);
+                this.setListOp(h, LISTOP_TAB_ADD, i, 0, t.data(), 0u);
+                i++;
+            }
+        }
+        this.setListOp(h, LISTOP_TAB_SET_SEL, tc.selectedTab, 0, "", 0u);
+    }
+
+    // The setListOp seam (see ui_native.cb for the cross-toolkit protocol design).
+    void setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload)
+    {
+        void* ctrl = u2h(h);
+        if (op == LISTOP_RESET_COLUMNS)
+        {
+            while (SendMessageA(ctrl, (u32)LVM_DELETECOLUMN, 0u, (i64)0) != (i64)0) { }
+        }
+        else if (op == LISTOP_ADD_COLUMN)
+        {
+            LVColumnA col = default;
+            col.mask = (u32)(LVCF_FMT | LVCF_WIDTH | LVCF_TEXT | LVCF_SUBITEM);
+            col.cx = arg0 * this.dipX();
+            col.pszText = (char*)text;
+            col.iSubItem = arg1;
+            SendMessageA(ctrl, (u32)LVM_INSERTCOLUMNA, (u64)arg1, (i64)&col);
+        }
+        else if (op == LISTOP_SET_ROWCOUNT)
+        {
+            SendMessageA(ctrl, (u32)LVM_SETITEMCOUNT, (u64)arg0, (i64)0);
+        }
+        else if (op == LISTOP_SET_ROWTEXT_CB)
+        {
+            this._setListBox(h, payload);
+            SendMessageA(ctrl, (u32)LVM_SETEXTENDEDLISTVIEWSTYLE,
+                         (u64)LVS_EX_FULLROWSELECT, (i64)LVS_EX_FULLROWSELECT);
+        }
+        else if (op == LISTOP_SET_SELECT_MODE)
+        {
+            i64 st = GetWindowLongPtrA(ctrl, (int)GWL_STYLE);
+            if (arg0 == 0) st = st | (i64)LVS_SINGLESEL;
+            else st = st & ~((i64)LVS_SINGLESEL);
+            SetWindowLongPtrA(ctrl, (int)GWL_STYLE, st);
+        }
+        else if (op == LISTOP_SET_SELECTION)
+        {
+            int cur = (int)SendMessageA(ctrl, (u32)LVM_GETNEXTITEM, (u64)(i64)(-1), (i64)LVNI_SELECTED);
+            if (cur == arg0) return;   // already in the requested state (incl. both -1)
+            LVItemA clr = default;
+            clr.stateMask = (u32)LVIS_SELECTED;
+            SendMessageA(ctrl, (u32)LVM_SETITEMSTATE, (u64)(i64)(-1), (i64)&clr);
+            if (arg0 >= 0)
+            {
+                LVItemA it = default;
+                it.stateMask = (u32)(LVIS_SELECTED | LVIS_FOCUSED);
+                it.state = (u32)(LVIS_SELECTED | LVIS_FOCUSED);
+                SendMessageA(ctrl, (u32)LVM_SETITEMSTATE, (u64)arg0, (i64)&it);
+            }
+        }
+        else if (op == LISTOP_INVALIDATE)
+        {
+            InvalidateRect(ctrl, nullptr, 1);
+        }
+        else if (op == LISTOP_TAB_RESET)
+        {
+            SendMessageA(ctrl, (u32)TCM_DELETEALLITEMS, 0u, (i64)0);
+        }
+        else if (op == LISTOP_TAB_ADD)
+        {
+            TCItemA ti = default;
+            ti.mask = (u32)TCIF_TEXT;
+            ti.pszText = (char*)text;
+            SendMessageA(ctrl, (u32)TCM_INSERTITEMA, (u64)arg0, (i64)&ti);
+        }
+        else if (op == LISTOP_TAB_SET_SEL)
+        {
+            int cur = (int)SendMessageA(ctrl, (u32)TCM_GETCURSEL, 0u, (i64)0);
+            if (cur != arg0) SendMessageA(ctrl, (u32)TCM_SETCURSEL, (u64)arg0, (i64)0);
+        }
+        else if (op == LISTOP_TREE_SET_SRC_CB)
+        {
+            this._setTreeBox(h, payload);
+        }
+        else if (op == LISTOP_TREE_REBUILD)
+        {
+            this._treeBuildRoot(h);
+        }
+    }
 
     // Text metrics in DIPs. Selects the UI font into a screen DC and measures.
     Size measureText(const char* s, int fontId, int wrapWidthDip)
     {
         Size sz = default;
-        void* dc = GetDC(this.window);
+        void* dc = GetDC(this.hwnd);
         void* oldF = nullptr;
         if (this.font != nullptr) oldF = SelectObject(dc, this.font);
         SIZE px = default;
         GetTextExtentPoint32A(dc, (char*)s, strlen((char*)s), &px);
         if (oldF != nullptr) SelectObject(dc, oldF);
-        ReleaseDC(this.window, dc);
+        ReleaseDC(this.hwnd, dc);
         sz.w = ((int)px.cx + this.dipX() - 1) / this.dipX();
         sz.h = ((int)px.cy + this.dipY() - 1) / this.dipY();
         return sz;
@@ -238,9 +1017,32 @@ class Win32Host : NativeHost
 
     void requestLayout()
     {
-        if (!_nReady) return;
-        layoutRoot(_nTree, 0, 0, _nW);
-        this.applyTree(_nTree, &_nCtx);
+        if (!this.ready) return;
+        layoutRoot(this.tree, 0, 0, this.w);
+        this.applyTree(this.tree, &this.ctx);
+    }
+
+    // Ensure this window has a tooltip control, then set/update the tip text for the
+    // control `hCtl`. A tooltip control tracks tools by (owner hwnd, uId=control hwnd).
+    void setTooltip(u64 hCtl, string text)
+    {
+        if (text.length() == 0) return;
+        if (this.tooltip == nullptr)
+        {
+            this.tooltip = CreateWindowExA(0u, "tooltips_class32", "",
+                (u32)(WS_POPUP | TTS_ALWAYSTIP), 0, 0, 0, 0,
+                this.hwnd, nullptr, _hInst, nullptr);
+        }
+        if (this.tooltip == nullptr) return;
+        TTInfoA ti = default;
+        ti.cbSize = (u32)sizeof(TTInfoA);
+        ti.uFlags = (u32)(TTF_IDISHWND | TTF_SUBCLASS);
+        ti.hwnd = this.hwnd;
+        ti.uId = (u64)u2h(hCtl);
+        ti.lpszText = (char*)text.data();
+        // ADD is idempotent-ish here; UPDATE keeps an existing tool's text fresh.
+        SendMessageA(this.tooltip, (u32)TTM_ADDTOOLA, 0u, (i64)&ti);
+        SendMessageA(this.tooltip, (u32)TTM_UPDATETIPTEXTA, 0u, (i64)&ti);
     }
 
     // Reconcile the Element tree to native controls: ensure a control per mappable
@@ -273,7 +1075,8 @@ class Win32Host : NativeHost
         }
 
         // Batch-position all live controls in one DeferWindowPos pass (flicker
-        // defense: the OS moves them together rather than one repaint each).
+        // defense: the OS moves them together rather than one repaint each). A frame
+        // width of -1 marks a self-docking status bar, tickled with WM_SIZE instead.
         int n = newHandles.count();
         if (n > 0)
         {
@@ -281,9 +1084,16 @@ class Win32Host : NativeHost
             int j = 0;
             while (j < n)
             {
-                hdwp = DeferWindowPos(hdwp, u2h(newHandles.get(j)), nullptr,
-                                      fx.get(j), fy.get(j), fw.get(j), fh.get(j),
-                                      (u32)(SWP_NOZORDER | SWP_NOACTIVATE));
+                if (fw.get(j) < 0)
+                {
+                    SendMessageA(u2h(newHandles.get(j)), (u32)WM_SIZE, 0u, (i64)0);
+                }
+                else
+                {
+                    hdwp = DeferWindowPos(hdwp, u2h(newHandles.get(j)), nullptr,
+                                          fx.get(j), fy.get(j), fw.get(j), fh.get(j),
+                                          (u32)(SWP_NOZORDER | SWP_NOACTIVATE));
+                }
                 j++;
             }
             EndDeferWindowPos(hdwp);
@@ -316,7 +1126,7 @@ class Win32Host : NativeHost
             u64 h = ctx.nativeHandle(path);
             if (h == 0u)
             {
-                h = this.createControl(node.kind(), (u64)this.window, path);
+                h = this.createControl(node.kind(), (u64)this.hwnd, path);
                 ctx.setNativeHandle(path, h);
                 // One-time seed of a TextArea's buffer (it is uncontrolled after;
                 // the native EDIT owns the text, further pushes are explicit).
@@ -325,13 +1135,95 @@ class Win32Host : NativeHost
                     TextArea* ta = node as TextArea;
                     this.setText(h, ta.value.data());
                 }
+                else if (node.kind() == ELEM_LIST)
+                {
+                    // One-time ListView setup: columns, select mode, and the rowText
+                    // callback box (captures the component pointer, so it reads live
+                    // state across renders - no per-frame re-box). Rows/selection are
+                    // pushed every frame in _syncProps.
+                    ListView* lv = node as ListView;
+                    this.setListOp(h, LISTOP_RESET_COLUMNS, 0, 0, "", 0u);
+                    int ci = 0;
+                    while (ci < lv.columns.count())
+                    {
+                        int wdip = 12;
+                        if (ci < lv.colWidths.count()) wdip = lv.colWidths.get(ci);
+                        this.setListOp(h, LISTOP_ADD_COLUMN, wdip, ci, lv.columns.get(ci).data(), 0u);
+                        ci++;
+                    }
+                    this.setListOp(h, LISTOP_SET_SELECT_MODE, lv.multiSelect ? 1 : 0, 0, "", 0u);
+                    // Inline _boxListRow call-result cast to u64: no named owning local,
+                    // so nothing auto-frees the box the host now owns (mirrors ctx.post).
+                    this.setListOp(h, LISTOP_SET_ROWTEXT_CB, 0, 0, "", (u64)_boxListRow(lv.rowText));
+                }
+                else if (node.kind() == ELEM_RADIO)
+                {
+                    // Mark the first radio of a group as its WS_GROUP boundary so Win32
+                    // auto-exclusivity is scoped correctly with multiple groups.
+                    RadioButton* rb = node as RadioButton;
+                    if (rb.groupFirst)
+                    {
+                        i64 st = GetWindowLongPtrA(u2h(h), (int)GWL_STYLE);
+                        SetWindowLongPtrA(u2h(h), (int)GWL_STYLE, st | (i64)WS_GROUP);
+                    }
+                }
+                else if (node.kind() == ELEM_TREE)
+                {
+                    // One-time TreeView setup: box the node-source callbacks (they capture
+                    // the component pointer, so they read live state across renders) and
+                    // build the root's children lazily. Rows expand on demand thereafter.
+                    TreeView* tv = node as TreeView;
+                    this.setListOp(h, LISTOP_TREE_SET_SRC_CB, 0, 0, "",
+                                   (u64)_boxTree(tv.childCount, tv.childId, tv.label));
+                    this.setListOp(h, LISTOP_TREE_REBUILD, 0, 0, "", 0u);
+                }
+                else if (node.kind() == ELEM_CANVAS)
+                {
+                    // One-time CanvasView setup: box the onPaint closure (captures the
+                    // component, so it reads live state across renders) and stash it in the
+                    // child's USERDATA so CanvasChildProc reaches it on WM_PAINT.
+                    CanvasView* cvw = node as CanvasView;
+                    u64 box = (u64)_boxCanvas(cvw.onPaint);
+                    this._setCanvasBox(h, box);
+                    SetWindowLongPtrA(u2h(h), (int)GWLP_USERDATA, (i64)box);
+                }
             }
             this._syncProps(node, h);
+            string tip = tooltipOf(node);
+            if (tip.length() > 0) this.setTooltip(h, tip);
             Rect b = node.nodeBounds();
             keys.add("" + path);
             handles.add(h);
-            fx.add(b.x * this.dipX()); fy.add(b.y * this.dipY());
-            fw.add(b.w * this.dipX()); fh.add(b.h * this.dipY());
+            // A status bar self-docks (width -1 sentinel); others get an absolute frame.
+            if (node.kind() == ELEM_STATUSBAR)
+            {
+                fx.add(0); fy.add(0); fw.add(-1); fh.add(0);
+            }
+            else
+            {
+                int fhpx = b.h * this.dipY();
+                // A dropdown-list combo's height param sizes the dropped list; add rows
+                // so the list is usable (the collapsed field height is fixed by the OS).
+                if (node.kind() == ELEM_COMBO) fhpx = fhpx + 8 * this.dipY();
+                fx.add(b.x * this.dipX()); fy.add(b.y * this.dipY());
+                fw.add(b.w * this.dipX()); fh.add(fhpx);
+            }
+        }
+
+        // A TabControl walks ONLY its active pane into native controls (lazy inactive
+        // tabs). Every other container recurses into all children; leaves have none.
+        if (node.kind() == ELEM_TABS)
+        {
+            TabControl* tc = node as TabControl;
+            list<Element>* panes = node.childList();
+            int sel = tc.selectedTab;
+            if (panes != nullptr && sel >= 0 && sel < panes.count())
+            {
+                Element pane = panes.get(sel);
+                string cp = joinKeyPath(path, keySegment(pane, sel));
+                this._applyNode(pane, cp, ctx, keys, handles, fx, fy, fw, fh);
+            }
+            return;
         }
 
         list<Element>* kids = node.childList();
@@ -348,6 +1240,22 @@ class Win32Host : NativeHost
         }
     }
 
+    // Set a status bar's part text (single pane spanning the strip).
+    void _syncStatusBar(u64 h, StatusBar* sb)
+    {
+        int rightEdge = -1;   // one part filling the whole width
+        SendMessageA(u2h(h), (u32)SB_SETPARTS, 1u, (i64)&rightEdge);
+        string joined = "";
+        int i = 0;
+        while (i < sb.parts.count())
+        {
+            if (i > 0) joined = joined + "   ";
+            joined = joined + sb.parts.get(i);
+            i++;
+        }
+        SendMessageA(u2h(h), (u32)SB_SETTEXTA, 0u, (i64)joined.data());
+    }
+
     // Push a node's current props onto its control (downcast per kind - the same
     // structured access the reconciler uses in propsEqual).
     void _syncProps(Element node, u64 h)
@@ -358,6 +1266,11 @@ class Win32Host : NativeHost
             Button* b = node as Button;
             this.setText(h, b.title.data());
             this.setBoolProp(h, PROP_ENABLED, !b.disabled);
+            // Accent-fill via NM_CUSTOMDRAW (P10): a themed button gets its accent colors;
+            // a monochrome theme (buttonBg 0) forgets the accent -> native look.
+            int abg = pickColor(b.backgroundColor, this.ctx.theme.buttonBg);
+            int afg = pickColor(b.color, this.ctx.theme.buttonText);
+            this.setAccent(h, afg, abg);
         }
         else if (k == ELEM_TEXT)
         {
@@ -398,6 +1311,100 @@ class Win32Host : NativeHost
             TextArea* ta = node as TextArea;
             this.setBoolProp(h, PROP_ENABLED, !ta.disabled);
         }
+        else if (k == ELEM_STATUSBAR)
+        {
+            StatusBar* sb = node as StatusBar;
+            this._syncStatusBar(h, sb);
+        }
+        else if (k == ELEM_RADIO)
+        {
+            RadioButton* rb = node as RadioButton;
+            this.setText(h, rb.label.data());
+            this.setBoolProp(h, PROP_CHECKED, rb.checked);
+            this.setBoolProp(h, PROP_ENABLED, !rb.disabled);
+        }
+        else if (k == ELEM_COMBO)
+        {
+            ComboBox* cb = node as ComboBox;
+            this._syncCombo(h, cb);
+            this.setBoolProp(h, PROP_ENABLED, !cb.disabled);
+        }
+        else if (k == ELEM_LIST)
+        {
+            // Virtualized: push row count + controlled selection, then repaint. Cell
+            // text is pulled on demand via the boxed rowText callback (LVN_GETDISPINFO).
+            ListView* lv = node as ListView;
+            this.setListOp(h, LISTOP_SET_ROWCOUNT, lv.rowCount, 0, "", 0u);
+            this.setListOp(h, LISTOP_SET_SELECTION, lv.selectedIndex, 0, "", 0u);
+            this.setListOp(h, LISTOP_INVALIDATE, 0, 0, "", 0u);
+            this.setBoolProp(h, PROP_ENABLED, !lv.disabled);
+        }
+        else if (k == ELEM_TABS)
+        {
+            // Rebuild the tab strip on a pane-count change, then push the controlled tab.
+            TabControl* tc = node as TabControl;
+            this._syncTabs(h, tc);
+            this.setBoolProp(h, PROP_ENABLED, !tc.disabled);
+        }
+        else if (k == ELEM_TREE)
+        {
+            // Expand-on-demand: the root children were inserted once at creation; the
+            // native control owns the tree state, so only the enabled flag is synced here
+            // (selection round-trips through TVN_SELCHANGED, not a per-frame push).
+            TreeView* tv = node as TreeView;
+            this.setBoolProp(h, PROP_ENABLED, !tv.disabled);
+        }
+        else if (k == ELEM_IMAGE)
+        {
+            // Upload the image once per distinct pixel buffer (or once from a .bmp source),
+            // via the toolkit-neutral setImageData seam. A re-render with the same buffer
+            // pointer is a no-op (the last-uploaded pointer is remembered per control).
+            Image* im = node as Image;
+            if (im.pixels != 0u)
+            {
+                if (im.pixels != this._imgLastPixels(h))
+                {
+                    this.setImageData(h, im.pixels, im.pxW, im.pxH, im.pxW * 4);
+                    this._setImgLastPixels(h, im.pixels);
+                }
+            }
+            else if (im.source.length() > 0 && this._imgLastPixels(h) == 0u)
+            {
+                this.setImageFile(h, im.source);
+                this._setImgLastPixels(h, 1u);   // sentinel: file loaded once
+            }
+        }
+        else if (k == ELEM_GROUPBOX)
+        {
+            GroupBox* g = node as GroupBox;
+            this.setText(h, g.title.data());
+        }
+        else if (k == ELEM_CANVAS)
+        {
+            // The paint closure was boxed at creation; just repaint so state changes redraw.
+            InvalidateRect(u2h(h), nullptr, 1);
+        }
+    }
+
+    // Repopulate a combo only when its item set changed (count differs), then set the
+    // controlled selection. Refilling every frame would reset the list mid-interaction.
+    void _syncCombo(u64 h, ComboBox* cb)
+    {
+        void* ctrl = u2h(h);
+        int have = (int)SendMessageA(ctrl, (u32)CB_GETCOUNT, 0u, (i64)0);
+        if (have != cb.items.count())
+        {
+            SendMessageA(ctrl, (u32)CB_RESETCONTENT, 0u, (i64)0);
+            int i = 0;
+            while (i < cb.items.count())
+            {
+                SendMessageA(ctrl, (u32)CB_ADDSTRING, 0u, (i64)cb.items.get(i).data());
+                i++;
+            }
+        }
+        int cur = (int)SendMessageA(ctrl, (u32)CB_GETCURSEL, 0u, (i64)0);
+        if (cur != cb.selectedIndex)
+            SendMessageA(ctrl, (u32)CB_SETCURSEL, (u64)cb.selectedIndex, (i64)0);
     }
 
     // The key path bound to a control HWND this frame, or "" if none (linear scan
@@ -436,7 +1443,7 @@ class Win32Host : NativeHost
         {
             this.dark = isDark;
             int one = isDark ? 1 : 0;
-            DwmSetWindowAttribute(this.window, (u32)DWMWA_USE_IMMERSIVE_DARK_MODE,
+            DwmSetWindowAttribute(this.hwnd, (u32)DWMWA_USE_IMMERSIVE_DARK_MODE,
                                   (void*)&one, 4u);
         }
 
@@ -450,9 +1457,349 @@ class Win32Host : NativeHost
         }
         this.themeBg = bg;
         this.themeText = fg;
-        InvalidateRect(this.window, nullptr, 1);
+        InvalidateRect(this.hwnd, nullptr, 1);
+    }
+
+    // Free this window's owned cflat + GDI state (tree, component, brush, font). The
+    // HWND + child controls are destroyed by Windows; deleting the Window later frees
+    // the value members (ctx dictionary + strings, live lists) automatically. Moving
+    // the app/tree fields is only legal from inside the owning class, hence a method.
+    void dispose()
+    {
+        if (this.ready) { Element t = this.tree; deleteTree(t); this.ready = false; }
+        if (this.app != nullptr) { Component a = this.app; this.app = nullptr; delete a; }
+        if (this.bgBrush != nullptr) { DeleteObject(this.bgBrush); this.bgBrush = nullptr; }
+        if (this.font != nullptr) { DeleteObject(this.font); this.font = nullptr; }
+        // Free any ListView rowText boxes still live (DestroyWindow destroys the child
+        // controls without routing through destroyControl, so free them here).
+        int bi = 0;
+        while (bi < this.listBoxPtrs.count())
+        {
+            u64 b = this.listBoxPtrs.get(bi);
+            if (b != 0u) __uiFreeListRowBox(b);
+            bi++;
+        }
+        this.listBoxHandles.clear();
+        this.listBoxPtrs.clear();
+        // Free any TreeView node-source boxes still live.
+        int ti = 0;
+        while (ti < this.treeBoxPtrs.count())
+        {
+            u64 b = this.treeBoxPtrs.get(ti);
+            if (b != 0u) __uiFreeTreeBox(b);
+            ti++;
+        }
+        this.treeBoxHandles.clear();
+        this.treeBoxPtrs.clear();
+        // Free the host-owned per-key context menus (P9).
+        int ci = 0;
+        while (ci < this.ctxMenus.count())
+        {
+            u64 m = this.ctxMenus.get(ci);
+            if (m != 0u) __uiFreeContextMenu(m);
+            ci++;
+        }
+        this.ctxKeys.clear();
+        this.ctxMenus.clear();
+        // Free any Image HBITMAPs still live (STM images are not freed with the window).
+        int ii = 0;
+        while (ii < this.imgBitmaps.count())
+        {
+            u64 bmp = this.imgBitmaps.get(ii);
+            if (bmp != 0u) DeleteObject(u2h(bmp));
+            ii++;
+        }
+        this.imgHandles.clear();
+        this.imgBitmaps.clear();
+        this.imgLastPixels.clear();
+        // Free any CanvasView paint boxes still live (DestroyWindow does not route through
+        // destroyControl for cascaded children).
+        int cvi = 0;
+        while (cvi < this.canvasBoxes.count())
+        {
+            u64 box = this.canvasBoxes.get(cvi);
+            if (box != 0u) __uiFreeCanvasBox(box);
+            cvi++;
+        }
+        this.canvasHandles.clear();
+        this.canvasBoxes.clear();
+        this.accentHandles.clear();
+        this.accentBg.clear();
+        this.accentFg.clear();
+    }
+
+    // Register (or replace) the context menu for a key path; the window takes ownership.
+    void setContextMenu(string key, u64 menuPtr)
+    {
+        int i = 0;
+        while (i < this.ctxKeys.count())
+        {
+            if (this.ctxKeys.get(i) == key)
+            {
+                u64 old = this.ctxMenus.get(i);
+                if (old != 0u && old != menuPtr) __uiFreeContextMenu(old);
+                this.ctxMenus.set(i, menuPtr);
+                return;
+            }
+            i++;
+        }
+        this.ctxKeys.add("" + key);
+        this.ctxMenus.add(menuPtr);
+    }
+
+    // The ContextMenu* (as u64) registered for a key path, or 0.
+    u64 contextMenuFor(string key)
+    {
+        int i = 0;
+        while (i < this.ctxKeys.count())
+        {
+            if (this.ctxKeys.get(i) == key) { u64 v = this.ctxMenus.get(i); return v; }
+            i++;
+        }
+        return 0u;
+    }
+
+    // Show a control's context menu (WM_CONTEXTMENU); returns true if one was shown. The
+    // chosen command routes through the app menu handler (routeMenu), like a menu-bar item.
+    bool showContextMenu(void* fromCtl, i64 screenXY)
+    {
+        string key = this.keyForHandle((u64)fromCtl);
+        if (key.length() == 0) return false;
+        u64 mp = this.contextMenuFor(key);
+        if (mp == 0u) return false;
+        ContextMenu* cm = (ContextMenu*)mp;
+        if (cm.count() == 0) return false;
+        void* pop = CreatePopupMenu();
+        int i = 0;
+        while (i < cm.count())
+        {
+            if (cm.labels.get(i).length() == 0)
+                AppendMenuA(pop, (u32)MF_SEPARATOR, 0u, nullptr);
+            else
+                AppendMenuA(pop, (u32)MF_STRING, (u64)cm.cmds.get(i), cm.labels.get(i).data());
+            i++;
+        }
+        int x = (int)(screenXY & (i64)0xFFFF);
+        int y = (int)((screenXY >> 16) & (i64)0xFFFF);
+        int cmd = (int)TrackPopupMenu(pop, (u32)(TPM_RETURNCMD | TPM_RIGHTBUTTON),
+                                      x, y, 0, this.hwnd, nullptr);
+        DestroyMenu(pop);
+        if (cmd > 0) routeMenu(cmd);
+        return true;
+    }
+
+    // Hit-test a pixel against every SplitView divider in the tree; returns the split's
+    // key path (widened to a grabbable band) or "". Drives WM_LBUTTONDOWN drag capture.
+    string splitAtPixel(int px, int py)
+    {
+        return this._splitScan(this.tree, keySegment(this.tree, 0), px, py);
+    }
+
+    string _splitScan(Element node, string path, int px, int py)
+    {
+        if (node.kind() == ELEM_SPLIT)
+        {
+            SplitView* sv = node as SplitView;
+            Rect d = sv.dividerBounds;
+            int x0 = d.x * this.dipX(); int y0 = d.y * this.dipY();
+            int x1 = x0 + d.w * this.dipX(); int y1 = y0 + d.h * this.dipY();
+            if (x1 - x0 < 6) { x0 = x0 - 3; x1 = x1 + 3; }   // widen a 1-DIP gutter
+            if (y1 - y0 < 6) { y0 = y0 - 3; y1 = y1 + 3; }
+            if (px >= x0 && px < x1 && py >= y0 && py < y1) return "" + path;
+        }
+        list<Element>* kids = node.childList();
+        if (kids != nullptr)
+        {
+            int i = 0;
+            while (i < kids.count())
+            {
+                Element c = kids.get(i);
+                string cp = joinKeyPath(path, keySegment(c, i));
+                string r = this._splitScan(c, cp, px, py);
+                if (r.length() > 0) return r;
+                i++;
+            }
+        }
+        return "";
     }
 };
+
+// ── CanvasView: a GDI-backed child the app paints via the Canvas API (P10) ────
+// The escape hatch. A CanvasView maps to a "CFlatCanvasChild" window whose WndProc
+// invokes the app's boxed onPaint(Canvas) closure on WM_PAINT, handing it a
+// NativeGdiCanvas over the paint DC. The app draws in the SAME cell coordinates the
+// framework paints through, so any custom widget is expressible.
+
+// Free-function colorRef (the GdiCanvas needs one outside a Window). Masks the marker
+// bit and swaps R/B to a COLORREF; a default/unset color (0) maps to black.
+u32 gdiColorRef(int color)
+{
+    int r = (color >> 16) & 0xFF;
+    int g = (color >> 8) & 0xFF;
+    int b = color & 0xFF;
+    return (u32)(r | (g << 8) | (b << 16));
+}
+
+// A GDI implementation of the ui.cb Canvas interface, mirroring win32host.cb's GdiCanvas
+// but living in the native host (which does not import win32host.cb). Borrows the HDC.
+class NativeGdiCanvas : Canvas
+{
+    void* hdc = nullptr;
+    int cellW = BASE_X;
+    int cellH = BASE_Y;
+
+    void clear() { }
+
+    void drawText(int col, int row, const char* s, int color)
+    {
+        RECT rc = default;
+        rc.left = col * this.cellW; rc.top = row * this.cellH;
+        rc.right = rc.left + 4096; rc.bottom = rc.top + this.cellH;
+        SetBkMode(this.hdc, TRANSPARENT);
+        SetTextColor(this.hdc, gdiColorRef(color));
+        DrawTextA(this.hdc, (char*)s, -1, &rc,
+                  (u32)(DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX));
+    }
+
+    void drawRect(Rect r, bool filled, int color)
+    {
+        RECT rc = default;
+        rc.left = r.x * this.cellW; rc.top = r.y * this.cellH;
+        rc.right = (r.x + r.w) * this.cellW; rc.bottom = (r.y + r.h) * this.cellH;
+        if (color == 0)
+        {
+            void* br = GetStockObject(BLACK_BRUSH);
+            if (filled) { FillRect(this.hdc, &rc, br); return; }
+            FrameRect(this.hdc, &rc, br);
+            return;
+        }
+        void* br = CreateSolidBrush(gdiColorRef(color));
+        if (filled) FillRect(this.hdc, &rc, br);
+        else        FrameRect(this.hdc, &rc, br);
+        DeleteObject(br);
+    }
+
+    void pushClip(Rect r)
+    {
+        SaveDC(this.hdc);
+        IntersectClipRect(this.hdc, r.x * this.cellW, r.y * this.cellH,
+                          (r.x + r.w) * this.cellW, (r.y + r.h) * this.cellH);
+    }
+    void popClip() { RestoreDC(this.hdc, -1); }
+};
+
+bool _canvasClassReg = false;
+
+// WndProc for a CanvasView child: on WM_PAINT, build a NativeGdiCanvas over the paint DC
+// and invoke the boxed onPaint closure (stored in GWLP_USERDATA). The background is filled
+// with the servicing window's theme brush so the custom drawing sits on the app palette.
+// Paint a canvas child into `hdc`: fill the theme background, then invoke the boxed
+// onPaint closure through a NativeGdiCanvas. Shared by WM_PAINT (live) and WM_PRINTCLIENT
+// (so PrintWindow captures the canvas too - it sends WM_PRINTCLIENT, not WM_PAINT).
+void _paintCanvasChild(void* hwnd, void* hdc)
+{
+    RECT rc = default; GetClientRect(hwnd, &rc);
+    void* brush = nullptr;
+    if (hasCurWin()) brush = curWin().bgBrush;
+    if (brush != nullptr) FillRect(hdc, &rc, brush);
+    else FillRect(hdc, &rc, GetStockObject(WHITE_BRUSH));
+    u64 box = (u64)GetWindowLongPtrA(hwnd, (int)GWLP_USERDATA);
+    if (box == 0u) return;
+    u32 dpi = GetDpiForWindow(hwnd);
+    if (dpi < 96u) dpi = 96u;
+    NativeGdiCanvas cv = default;
+    cv.hdc = hdc;
+    cv.cellW = BASE_X * (int)dpi / 96;
+    cv.cellH = BASE_Y * (int)dpi / 96;
+    __uiCanvasPaint(box, cv);
+}
+
+stdcall i64 CanvasChildProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
+{
+    if (msg == WM_PAINT)
+    {
+        PAINTSTRUCT ps = default;
+        void* hdc = BeginPaint(hwnd, &ps);
+        _paintCanvasChild(hwnd, hdc);
+        EndPaint(hwnd, &ps);
+        return (i64)0;
+    }
+    if (msg == WM_PRINTCLIENT)
+    {
+        _paintCanvasChild(hwnd, u2h(wParam));
+        return (i64)0;
+    }
+    if (msg == WM_ERASEBKGND) return (i64)1;   // WM_PAINT fills the background itself
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+// Register the canvas child window class once (CS_HREDRAW|CS_VREDRAW so a resize repaints).
+void ensureCanvasClass()
+{
+    if (_canvasClassReg) return;
+    WNDCLASSEXA wc = default;
+    wc.cbSize = (u32)sizeof(WNDCLASSEXA);
+    wc.style = (u32)(CS_HREDRAW | CS_VREDRAW);
+    wc.lpfnWndProc = (void*)CanvasChildProc;
+    wc.hInstance = _hInst;
+    wc.hCursor = LoadCursorA(nullptr, (char*)IDC_ARROW);
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = "CFlatCanvasChild";
+    RegisterClassExA(&wc);
+    _canvasClassReg = true;
+}
+
+// ── App-wide window registry + the "current" window ──────────────────────────
+// One message loop drives every window. _cur is the window being serviced: the
+// WndProc sets it from GWLP_USERDATA before dispatching, and a build sets it to its
+// target. App code reaches the servicing window through activeCtx()/activeApp().
+// The list OWNS the windows; app code reaches the servicing one by index (_cur). We
+// never bind a Window* to a long-lived variable (an owning class pointer auto-frees at
+// scope exit and cannot be re-aliased), so curWin() returns a borrow via `alias`.
+list<Window*> _windows = default;
+int           _cur     = -1;   // index into _windows of the servicing window
+
+alias Window* curWin() { return _windows.get(_cur); }
+bool hasCurWin() { return _cur >= 0 && _cur < _windows.count(); }
+
+// Index of the window owning `hwnd`, or -1 (small list; scanned per message).
+int findWindowIdx(void* hwnd)
+{
+    int i = 0;
+    while (i < _windows.count()) { if (_windows.get(i).hwnd == hwnd) return i; i++; }
+    return -1;
+}
+
+// Host-neutral accessors used by app code (mirrored by the Cocoa host). activeApp()
+// borrows the component (alias) so the window keeps ownership of it.
+UiContext*     activeCtx() { return &curWin().ctx; }
+alias Component activeApp() { return curWin().app; }
+bool           hostDark()  { if (!hasCurWin()) return false; return curWin().dark; }
+int hostWidth()  { return curWin().w; }
+int hostHeight() { return curWin().h; }
+int hostWindowCount() { return _windows.count(); }
+
+// Create a hidden window bound to `app` at DIP size w x h and build its tree. The
+// host-neutral entry the headless self-tests use (mirrored by the Cocoa host).
+void startHeadlessWindow(Component app, const char* title, int w, int h)
+{
+    int wi = createAppWindow(app, title, false);
+    curWin().w = w; curWin().h = h;
+    buildWindowTree(wi);
+}
+
+// Drain any pending posted UI-thread calls (WM_APP_CALL) + other queued messages.
+// The headless self-tests call this after a worker thread posts, since there is no
+// running message loop to dispatch the marshaled closure.
+void hostDrainPosted()
+{
+    MSG msg = default;
+    while (PeekMessageA(&msg, nullptr, 0u, 0u, (u32)PM_REMOVE) != 0)
+    {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+}
 
 // A Theme is "dark" when its panel background is darker than mid-gray. A default
 // (monochrome, all-zero) theme is treated as light.
@@ -473,8 +1820,6 @@ bool listHasStr(list<string>* xs, string want)
 }
 
 // Find the live node whose key path equals `want`. `path` is `node`'s own path.
-// The key came from the live map, so the node exists; returns default only if the
-// tree changed underfoot.
 Element findByKey(Element node, string path, string want)
 {
     if (path == want) return node;
@@ -494,38 +1839,292 @@ Element findByKey(Element node, string path, string want)
     return nullptr;
 }
 
-// Drain the dirty flag after a native event: re-render + reconcile, relayout, and
-// reconcile the tree to native controls. The OS repaints the controls itself.
+
+// ── ctx.post() marshaling hooks (installed into each window's ctx) ────────────
+extern stdcall u32 GetCurrentThreadId();
+
+// Enqueue a boxed closure onto a window's UI thread. `target` is the window HWND.
+void _win32PostEnqueue(u64 target, u64 boxPtr)
+{
+    PostMessageA(u2h(target), (u32)WM_APP_CALL, 0u, (i64)boxPtr);
+}
+
+u64 _win32CurTid() { return (u64)GetCurrentThreadId(); }
+
+// Drain the dirty flag after a native event on `_cur`: re-render + reconcile,
+// relayout, and reconcile the tree to native controls. The OS repaints itself.
 void pumpNative()
 {
-    if (_nCtx.consumeDirty())
+    if (!hasCurWin()) return;
+    Window* wnd = curWin();
+    if (wnd.ctx.consumeDirty())
     {
-        Element wip = _nApp.render(&_nCtx);
+        Element wip = wnd.app.render(&wnd.ctx);
         list<Patch> patches = default;
-        _nTree = reconcile(_nTree, wip, &patches);
-        layoutRoot(_nTree, 0, 0, _nW);
-        _nHost.applyTree(_nTree, &_nCtx);
+        Element committed = wnd.tree;
+        wnd.tree = reconcile(committed, wip, &patches);
+        layoutRoot(wnd.tree, 0, 0, wnd.w);
+        wnd.applyTree(wnd.tree, &wnd.ctx);
     }
 }
 
 // ── Native event routing (parent WM_COMMAND / WM_HSCROLL -> element handler) ──
 void routeClick(void* ctrl)
 {
-    string key = _nHost.keyForHandle((u64)ctrl);
+    Window* wnd = curWin();
+    string key = wnd.keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
     Button* b = e as Button;
     if (b != nullptr) { b.fireClick(); pumpNative(); return; }
     Checkbox* c = e as Checkbox;
     if (c != nullptr) { c.fireToggle(); pumpNative(); return; }
+    // A radio button routes to its enclosing RadioGroup (one key-path segment up),
+    // which owns the controlled `value` + onChange.
+    RadioButton* rb = e as RadioButton;
+    if (rb != nullptr)
+    {
+        string pp = _parentPath(key);
+        Element pe = findByKey(wnd.tree, keySegment(wnd.tree, 0), pp);
+        if (pe != nullptr)
+        {
+            RadioGroup* g = pe as RadioGroup;
+            if (g != nullptr) { g.onChange(rb.index); pumpNative(); }
+        }
+    }
+}
+
+// Strip the last "/segment" from a key path ("root/rg/r1" -> "root/rg"); "" if none.
+string _parentPath(string key)
+{
+    int last = -1; int i = 0; int n = (int)key.length();
+    while (i < n) { if (key.data()[i] == '/') last = i; i++; }
+    if (last < 0) return "";
+    return substring(key, 0, last);
+}
+
+// A combo selection change (CBN_SELCHANGE): read the new index, fire onChange.
+void routeCombo(void* ctrl)
+{
+    Window* wnd = curWin();
+    string key = wnd.keyForHandle((u64)ctrl);
+    if (key.length() == 0) return;
+    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    if (e == nullptr) return;
+    ComboBox* cb = e as ComboBox;
+    if (cb == nullptr) return;
+    int sel = (int)SendMessageA(ctrl, (u32)CB_GETCURSEL, 0u, (i64)0);
+    if (sel >= 0) { cb.onChange(sel); pumpNative(); }
+}
+
+// ── ListView notifications (WM_NOTIFY) ───────────────────────────────────────
+// Fill a GETDISPINFO request (owner-data): call the boxed rowText callback for the
+// requested (row, subitem) and copy the text into the OS-provided buffer.
+void fillListDispInfo(i64 lParam)
+{
+    Window* wnd = curWin();
+    NMHDR* nh = (NMHDR*)u2h((u64)lParam);
+    void* hFrom = nh.hwndFrom;
+    LVItemA* item = (LVItemA*)((char*)u2h((u64)lParam) + 24);   // LVITEM at NMHDR+24
+    if ((item.mask & (u32)LVIF_TEXT) == 0u) return;
+    if (item.pszText == nullptr || item.cchTextMax <= 0) return;
+    u64 box = wnd._listBoxFor((u64)hFrom);
+    if (box == 0u) { item.pszText[0] = '\0'; return; }
+    string cell = __uiListRowText(box, item.iItem, item.iSubItem);
+    int max = item.cchTextMax - 1;
+    int i = 0; int len = (int)cell.length();
+    while (i < len && i < max) { item.pszText[i] = cell.data()[i]; i++; }
+    item.pszText[i] = '\0';
+}
+
+// The currently selected row of the ListView at `from`, or -1.
+int _listSelectedRow(void* hFrom)
+{
+    return (int)SendMessageA(hFrom, (u32)LVM_GETNEXTITEM, (u64)(i64)(-1), (i64)LVNI_SELECTED);
+}
+
+// Route a selection change to the ListView's onSelect (guarded against the host's
+// own selection pushes during applyTree, which would otherwise recurse).
+void routeListSelect(void* hFrom)
+{
+    Window* wnd = curWin();
+    if (wnd.applying) return;
+    string key = wnd.keyForHandle((u64)hFrom);
+    if (key.length() == 0) return;
+    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    if (e == nullptr) return;
+    ListView* lv = e as ListView;
+    if (lv == nullptr) return;
+    int sel = _listSelectedRow(hFrom);
+    if (sel >= 0 && sel != lv.selectedIndex) { lv.onSelect(sel); pumpNative(); }
+}
+
+void routeListActivate(void* hFrom)
+{
+    Window* wnd = curWin();
+    string key = wnd.keyForHandle((u64)hFrom);
+    if (key.length() == 0) return;
+    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    if (e == nullptr) return;
+    ListView* lv = e as ListView;
+    if (lv == nullptr) return;
+    int sel = _listSelectedRow(hFrom);
+    if (sel >= 0) { lv.onActivate(sel); pumpNative(); }
+}
+
+// Dispatch a WM_NOTIFY from a child control. Returns true if we consumed it.
+bool routeNotify(i64 lParam)
+{
+    NMHDR* nh = (NMHDR*)u2h((u64)lParam);
+    if (nh == nullptr) return false;
+    int code = (int)nh.code;
+    void* hFrom = nh.hwndFrom;
+    if (code == LVN_GETDISPINFOA) { fillListDispInfo(lParam); return true; }
+    if (code == LVN_ITEMCHANGED)  { routeListSelect(hFrom); return true; }
+    if (code == NM_DBLCLK)        { routeListActivate(hFrom); return true; }
+    if (code == LVN_KEYDOWN)
+    {
+        u16* pv = (u16*)((char*)u2h((u64)lParam) + 24);   // wVKey at NMHDR+24
+        if ((int)pv[0] == (int)VK_RETURN) routeListActivate(hFrom);
+        return true;
+    }
+    if (code == TCN_SELCHANGE)      { routeTabChange(hFrom); return true; }
+    if (code == TVN_SELCHANGEDA)    { routeTreeSelect(lParam); return true; }
+    if (code == TVN_ITEMEXPANDINGA) { routeTreeExpand(lParam); return true; }
+    return false;
+}
+
+// ── NMTREEVIEW field readers (P9) ─────────────────────────────────────────────
+// NMTREEVIEWA = { NMHDR hdr; UINT action; TVITEMA itemOld; TVITEMA itemNew; POINT pt }.
+// itemNew starts at offset 88 on Win64; its hItem is +8 (96) and its lParam is +48 (136).
+void* _nmTreeItemNewHandle(i64 lParam)
+{
+    char* p = (char*)u2h((u64)lParam);
+    void** slot = (void**)(p + 96);
+    return slot[0];
+}
+
+i64 _nmTreeItemNewParam(i64 lParam)
+{
+    char* p = (char*)u2h((u64)lParam);
+    i64* slot = (i64*)(p + 136);
+    return slot[0];
+}
+
+// A tab selection change (TCN_SELCHANGE): read the new tab, fire onSelectTab.
+void routeTabChange(void* hFrom)
+{
+    Window* wnd = curWin();
+    if (wnd.applying) return;
+    string key = wnd.keyForHandle((u64)hFrom);
+    if (key.length() == 0) return;
+    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    if (e == nullptr) return;
+    TabControl* tc = e as TabControl;
+    if (tc == nullptr) return;
+    int sel = (int)SendMessageA(hFrom, (u32)TCM_GETCURSEL, 0u, (i64)0);
+    if (sel >= 0 && sel != tc.selectedTab) { tc.onSelectTab(sel); pumpNative(); }
+}
+
+// A tree selection change (TVN_SELCHANGED): read the newly-selected node's id, fire onSelect.
+void routeTreeSelect(i64 lParam)
+{
+    Window* wnd = curWin();
+    if (wnd.applying) return;
+    NMHDR* nh = (NMHDR*)u2h((u64)lParam);
+    void* hFrom = nh.hwndFrom;
+    string key = wnd.keyForHandle((u64)hFrom);
+    if (key.length() == 0) return;
+    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    if (e == nullptr) return;
+    TreeView* tv = e as TreeView;
+    if (tv == nullptr) return;
+    int nid = (int)_nmTreeItemNewParam(lParam);
+    if (nid != tv.selectedNode) { tv.onSelect(nid); pumpNative(); }
+}
+
+// A tree node is expanding (TVN_ITEMEXPANDING): materialize its children on demand, then
+// fire onExpand. Returning 0 from WM_NOTIFY allows the expansion to proceed.
+void routeTreeExpand(i64 lParam)
+{
+    Window* wnd = curWin();
+    NMHDR* nh = (NMHDR*)u2h((u64)lParam);
+    void* hFrom = nh.hwndFrom;
+    void* hItem = _nmTreeItemNewHandle(lParam);
+    wnd._treeExpandItem((u64)hFrom, hItem);
+    string key = wnd.keyForHandle((u64)hFrom);
+    if (key.length() == 0) return;
+    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    if (e == nullptr) return;
+    TreeView* tv = e as TreeView;
+    if (tv == nullptr) return;
+    tv.onExpand((int)_nmTreeItemNewParam(lParam));
+    pumpNative();
+}
+
+// Drag a splitter's divider to a pixel position (WM_MOUSEMOVE while captured). Converts
+// to DIPs, recomputes the ratio, and fires onRatioChange so the app re-lays-out.
+void splitDragTo(Window* wnd, string key, int px, int py)
+{
+    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    if (e == nullptr) return;
+    SplitView* sv = e as SplitView;
+    if (sv == nullptr) return;
+    sv.onRatioChange(sv._ratioAt(px / wnd.dipX(), py / wnd.dipY()));
+    pumpNative();
+}
+
+// ── ListView driver API (host-neutral; used by the gallery self-test) ─────────
+void nativeListSelect(string keyPath, int row)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    void* ctrl = u2h(h);
+    LVItemA clr = default;
+    clr.stateMask = (u32)(LVIS_SELECTED | LVIS_FOCUSED);
+    SendMessageA(ctrl, (u32)LVM_SETITEMSTATE, (u64)(i64)(-1), (i64)&clr);
+    if (row < 0) return;
+    LVItemA it = default;
+    it.stateMask = (u32)(LVIS_SELECTED | LVIS_FOCUSED);
+    it.state = (u32)(LVIS_SELECTED | LVIS_FOCUSED);
+    SendMessageA(ctrl, (u32)LVM_SETITEMSTATE, (u64)row, (i64)&it);
+}
+
+int nativeListSelectedRow(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return -1;
+    return (int)SendMessageA(u2h(h), (u32)LVM_GETNEXTITEM, (u64)(i64)(-1), (i64)LVNI_SELECTED);
+}
+
+// Read a cell's text (drives the rowText callback for owner-data). Owned string.
+string nativeListCellText(string keyPath, int row, int col)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return "";
+    char[512] buf; buf[0] = '\0';
+    LVItemA it = default;
+    it.iSubItem = col;
+    it.pszText = buf;
+    it.cchTextMax = 512;
+    SendMessageA(u2h(h), (u32)LVM_GETITEMTEXTA, (u64)row, (i64)&it);
+    return "" + buf;   // owned copy (buf is a stack buffer)
+}
+
+int nativeListRowCount(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0;
+    return (int)SendMessageA(u2h(h), (u32)LVM_GETITEMCOUNT, 0u, (i64)0);
 }
 
 void routeEdit(void* ctrl)
 {
-    string key = _nHost.keyForHandle((u64)ctrl);
+    Window* wnd = curWin();
+    string key = wnd.keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
     TextInput* ti = e as TextInput;
     if (ti != nullptr)
@@ -547,18 +2146,19 @@ void routeEdit(void* ctrl)
     }
 }
 
-// Read the current text of the control at `keyPath` (owned string). Used to PULL a
-// TextArea's buffer on save. Returns "" if there is no such control.
+// Read the current text of the control at `keyPath` on the active window (owned
+// string). Used to PULL a TextArea's buffer on save. Returns "" if no such control.
 string nativeControlText(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return "";
     void* ctrl = u2h(h);
     int n = (int)GetWindowTextLengthA(ctrl);
     if (n <= 0) return "";
     char* buf = (char*)malloc((i64)(n + 1));
     GetWindowTextA(ctrl, buf, n + 1);
-    string s = (string)buf;
+    // Deep-copy into an owned string BEFORE freeing buf ('(string)buf' aliases it).
+    string s = "" + buf;
     free((void*)buf);
     return s;
 }
@@ -567,19 +2167,125 @@ string nativeControlText(string keyPath)
 // EN_CHANGE so the push does not register as a user edit.
 void nativeSetControlText(string keyPath, string s)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return;
-    bool prev = _nHost.applying;
-    _nHost.applying = true;
+    bool prev = curWin().applying;
+    curWin().applying = true;
     SetWindowTextA(u2h(h), s.data());
-    _nHost.applying = prev;
+    curWin().applying = prev;
+}
+
+// ── P9 host-neutral driver API (tabs / tree / splitter / context menu) ─────────
+// Register (or replace) the context menu for a key path; the window takes ownership of
+// the boxed ContextMenu* (freed on teardown). The app builds it once (sugar + addItem).
+void nativeSetContextMenu(string keyPath, u64 menuPtr) { curWin().setContextMenu(keyPath, menuPtr); }
+
+// Simulate the user picking item `itemIndex` of the context menu registered on keyPath
+// (headless: TrackPopupMenu cannot run unattended). Routes the item's command.
+void nativeFireContextMenu(string keyPath, int itemIndex)
+{
+    u64 mp = curWin().contextMenuFor(keyPath);
+    if (mp == 0u) return;
+    ContextMenu* cm = (ContextMenu*)mp;
+    if (itemIndex < 0 || itemIndex >= cm.count()) return;
+    int cmd = cm.cmds.get(itemIndex);
+    if (cmd > 0) routeMenu(cmd);
+}
+
+// Drive a splitter to a DIP position along its axis (headless drag). Fires onRatioChange.
+void nativeSplitterDrag(string keyPath, int dipX, int dipY)
+{
+    Window* wnd = curWin();
+    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), keyPath);
+    if (e == nullptr) return;
+    SplitView* sv = e as SplitView;
+    if (sv == nullptr) return;
+    sv.onRatioChange(sv._ratioAt(dipX, dipY));
+    pumpNative();
+}
+
+// The absolute frame (DIP) of the node at keyPath, or a zero rect (layout assertions).
+Rect nativeNodeBounds(string keyPath)
+{
+    Window* wnd = curWin();
+    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), keyPath);
+    if (e == nullptr) { Rect z = default; return z; }
+    return e.nodeBounds();
+}
+
+// Tab driver: read/count the native tab strip; SETCURSEL does not notify, so it routes
+// the selection change like the user clicking a tab header.
+int nativeTabSelected(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0 - 1;
+    return (int)SendMessageA(u2h(h), (u32)TCM_GETCURSEL, 0u, (i64)0);
+}
+
+int nativeTabCount(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0;
+    return (int)SendMessageA(u2h(h), (u32)TCM_GETITEMCOUNT, 0u, (i64)0);
+}
+
+void nativeTabSelect(string keyPath, int idx)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    SendMessageA(u2h(h), (u32)TCM_SETCURSEL, (u64)idx, (i64)0);
+    routeTabChange(u2h(h));
+}
+
+// Tree driver: root/child item handles, count, expand (fires lazy insert), select, node id.
+u64 nativeTreeRootItem(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0u;
+    return (u64)SendMessageA(u2h(h), (u32)TVM_GETNEXTITEM, (u64)TVGN_ROOT, (i64)0);
+}
+
+u64 nativeTreeChildItem(string keyPath, u64 hItem)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0u;
+    return (u64)SendMessageA(u2h(h), (u32)TVM_GETNEXTITEM, (u64)TVGN_CHILD, (i64)u2h(hItem));
+}
+
+int nativeTreeItemCount(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0;
+    return (int)SendMessageA(u2h(h), (u32)TVM_GETCOUNT, 0u, (i64)0);
+}
+
+void nativeTreeExpandItem(string keyPath, u64 hItem)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    SendMessageA(u2h(h), (u32)TVM_EXPAND, (u64)TVE_EXPAND, (i64)u2h(hItem));
+}
+
+void nativeTreeSelectItem(string keyPath, u64 hItem)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    SendMessageA(u2h(h), (u32)TVM_SELECTITEM, (u64)TVGN_CARET, (i64)u2h(hItem));
+}
+
+int nativeTreeItemNodeId(string keyPath, u64 hItem)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0 - 1;
+    return curWin()._treeItemParam(u2h(h), u2h(hItem));
 }
 
 void routeSlider(void* ctrl)
 {
-    string key = _nHost.keyForHandle((u64)ctrl);
+    Window* wnd = curWin();
+    string key = wnd.keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
     Slider* s = e as Slider;
     if (s == nullptr) return;
@@ -592,8 +2298,9 @@ void routeSlider(void* ctrl)
 // of real focus, so app code that reads ctx.focusKey stays correct).
 void mirrorFocus(void* ctrl)
 {
-    string key = _nHost.keyForHandle((u64)ctrl);
-    if (key.length() > 0) _nCtx.focus(key);
+    Window* wnd = curWin();
+    string key = wnd.keyForHandle((u64)ctrl);
+    if (key.length() > 0) wnd.ctx.focus(key);
 }
 
 // ── Menu bar + accelerators (P3) ─────────────────────────────────────────────
@@ -602,8 +2309,7 @@ bool strContains(string s, const char* sub)
     return strstr(s.data(), (char*)sub) != nullptr;
 }
 
-// Parse an accelerator like "Ctrl+Shift+S" or "F3" into a virtual key + modifier
-// flags. Returns 0 (no accel) if the key token is unrecognized.
+// Parse an accelerator like "Ctrl+Shift+S" or "F3" into a virtual key. 0 = none.
 int parseAccelKey(string a)
 {
     int plus = -1; int i = 0; int n = (int)a.length();
@@ -677,7 +2383,8 @@ void menuAddSeparator(int top)
     _menuAccelMods.add(0);
 }
 
-// Realize the declared menu into an HMENU on `hwnd` plus an accelerator table.
+// Realize the declared menu into an HMENU on `hwnd`; build the shared accelerator
+// table on first use (every window uses the same accelerators).
 void buildMenuBar(void* hwnd)
 {
     if (_menuTop.count() == 0) return;
@@ -704,7 +2411,7 @@ void buildMenuBar(void* hwnd)
     }
     SetMenu(hwnd, bar);
 
-    // Accelerator table from items that declared a key.
+    if (_accelTable != nullptr) return;   // accelerators are app-wide; build once
     int cnt = 0; int k = 0;
     while (k < _menuAccelKey.count()) { if (_menuAccelKey.get(k) != 0) cnt++; k++; }
     if (cnt > 0)
@@ -727,21 +2434,16 @@ void buildMenuBar(void* hwnd)
     }
 }
 
-// A menu command / accelerator (WM_COMMAND, lParam == 0) fired: dispatch it to the
-// app's handler, then pump.
+// A menu command / accelerator (WM_COMMAND, lParam == 0) fired on `_cur`: dispatch
+// it to the app's handler, then pump.
 void routeMenu(int id)
 {
     if (id <= 0) return;
-    _menuHandler(id);
+    if (_hasMenuHandler) _menuHandler(id);
     pumpNative();
 }
 
 // ── File dialogs + message boxes (P3) ─────────────────────────────────────────
-// GetOpenFileName/GetSaveFileName present the standard shell file dialog (the same
-// window users see everywhere); simpler and more robust than IFileDialog COM vtable
-// interop, and visually identical. (COM IFileDialog is deferred - see the report.)
-
-// Fill `buf` with a comdlg32 double-null-terminated filter: "desc\0pat\0...\0\0".
 int _filterZ(char* buf, int p, const char* s)
 {
     int i = 0;
@@ -763,13 +2465,13 @@ string nativeOpenFile()
     char[520] path; path[0] = '\0';
     OPENFILENAMEA ofn = default;
     ofn.lStructSize = (u32)sizeof(OPENFILENAMEA);
-    ofn.hwndOwner = _nHost.window;
+    ofn.hwndOwner = curWin().hwnd;
     ofn.lpstrFilter = filt;
     ofn.lpstrFile = path;
     ofn.nMaxFile = 520u;
     ofn.Flags = (u32)((int)OFN_FILEMUSTEXIST | (int)OFN_PATHMUSTEXIST);
     if (GetOpenFileNameA(&ofn) == 0) return "";
-    return (string)path;
+    return "" + path;   // owned copy (path is a stack buffer)
 }
 
 string nativeSaveFile()
@@ -785,20 +2487,20 @@ string nativeSaveFile()
     char[520] path; path[0] = '\0';
     OPENFILENAMEA ofn = default;
     ofn.lStructSize = (u32)sizeof(OPENFILENAMEA);
-    ofn.hwndOwner = _nHost.window;
+    ofn.hwndOwner = curWin().hwnd;
     ofn.lpstrFilter = filt;
     ofn.lpstrFile = path;
     ofn.nMaxFile = 520u;
     ofn.lpstrDefExt = "txt";
     ofn.Flags = (u32)((int)OFN_PATHMUSTEXIST | (int)OFN_OVERWRITEPROMPT);
     if (GetSaveFileNameA(&ofn) == 0) return "";
-    return (string)path;
+    return "" + path;   // owned copy (path is a stack buffer)
 }
 
 // Modal confirm with Yes/No/Cancel. Returns 1 = Yes, 0 = No, -1 = Cancel.
 int nativeConfirm(string title, string text)
 {
-    int r = (int)MessageBoxA(_nHost.window, text.data(), title.data(),
+    int r = (int)MessageBoxA(curWin().hwnd, text.data(), title.data(),
                              (u32)((int)MB_YESNOCANCEL | (int)MB_ICONWARNING));
     if (r == (int)IDYES) return 1;
     if (r == (int)IDNO) return 0;
@@ -807,22 +2509,21 @@ int nativeConfirm(string title, string text)
 
 void nativeInfo(string title, string text)
 {
-    MessageBoxA(_nHost.window, text.data(), title.data(), (u32)MB_OK);
+    MessageBoxA(curWin().hwnd, text.data(), title.data(), (u32)MB_OK);
 }
 
-// Close the main window (bypasses the WM_CLOSE guard - the caller already decided).
+// Close the active window (bypasses the WM_CLOSE guard - the caller already decided).
 void nativeCloseWindow()
 {
-    if (_nHost.window != nullptr) DestroyWindow(_nHost.window);
+    if (hasCurWin() && curWin().hwnd != nullptr) DestroyWindow(curWin().hwnd);
 }
 
 // -- Host-neutral driver API (selection / insertion / menu) -------------------
 // Same surface as the Cocoa host; fedit uses these to stay platform-portable.
 
-// Select [start, end) in the EDIT control, scroll the caret into view, and focus it.
 void nativeSelect(string keyPath, int start, int end)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return;
     void* ctrl = u2h(h);
     SendMessageA(ctrl, (u32)EM_SETSEL, (u64)start, (i64)end);
@@ -830,10 +2531,9 @@ void nativeSelect(string keyPath, int start, int end)
     SetFocus(ctrl);
 }
 
-// The selection start (EM_GETSEL selA) of the EDIT control at `keyPath`.
 int nativeSelectionStart(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return 0;
     void* ctrl = u2h(h);
     u32 selA = 0u; u32 selB = 0u;
@@ -841,11 +2541,9 @@ int nativeSelectionStart(string keyPath)
     return (int)selA;
 }
 
-// Insert `s` at character `pos`, firing EN_CHANGE like a keystroke (EM_SETSEL +
-// EM_REPLACESEL).
 void nativeInsertTextAt(string keyPath, int pos, string s)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return;
     void* ctrl = u2h(h);
     SendMessageA(ctrl, (u32)EM_SETSEL, (u64)pos, (i64)pos);
@@ -858,51 +2556,36 @@ void nativeTestFireMenu(int cmd)
     routeMenu(cmd);
 }
 
-// Fully release all global host + context state - for the headless self-tests, so
-// --heap-audit sees no residue (globals are not destructed at process exit, and
-// list/dictionary clear() keeps its capacity, so each backing is moved into a
-// scoped local whose destructor frees it).
-void nativeTeardownForTest()
+// Read a status bar pane's text (used by fedit's self-test to read the status line).
+string nativeStatusText(string keyPath)
 {
-    if (_nReady) { deleteTree(_nTree); _nReady = false; }
-    if (_nApp != nullptr) { delete _nApp; _nApp = nullptr; }
-    if (_nHost.window != nullptr) { DestroyWindow(_nHost.window); _nHost.window = nullptr; }
-    if (_nHost.bgBrush != nullptr) { DeleteObject(_nHost.bgBrush); _nHost.bgBrush = nullptr; }
-    if (_nHost.font != nullptr) { DeleteObject(_nHost.font); _nHost.font = nullptr; }
-    { dictionary<string, u64> d = move _nCtx.nativeByKey; }
-    { list<string> a1 = move _nHost.liveKeys; }
-    { list<u64>    a2 = move _nHost.liveHandles; }
-    { list<string> a3 = move _menuTop; }
-    { list<int>    a4 = move _menuItemTopIdx; }
-    { list<string> a5 = move _menuItemLabel; }
-    { list<int>    a6 = move _menuItemCmd; }
-    { list<int>    a7 = move _menuAccelKey; }
-    { list<int>    a8 = move _menuAccelMods; }
-    { Lambda<void(int)> a9 = move _menuHandler; }
-    { Lambda<bool()>    a10 = move _closeQuery; }
-    _hasCloseQuery = false;
-    _nCtx.blur();
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return "";
+    char[512] buf; buf[0] = '\0';
+    SendMessageA(u2h(h), (u32)SB_GETTEXTA, 0u, (i64)buf);
+    return "" + buf;   // owned copy (buf is a stack buffer)
 }
 
-// ── Secondary window (P3 multi-window) ───────────────────────────────────────
-// A genuinely separate top-level window with its own read-only content, sharing
-// the app's single message loop. Closing it does NOT quit the app (its WndProc
-// does not PostQuitMessage). Used by fedit's Help > About.
-bool _secClassReg = false;
-
+// ── Secondary window (P3 read-only About) ────────────────────────────────────
+// A separate top-level window with static read-only content, sharing the app's
+// message loop. Closing it does NOT quit the app. Used by fedit's Help > About.
 stdcall i64 SecondaryWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
 {
-    if (msg == WM_CTLCOLORSTATIC && _nHost.bgBrush != nullptr)
+    // Snapshot the servicing window's theme into plain scalars (a Window* alias local
+    // may not have field-derived values returned from it - borrow-checker restriction).
+    void* brush = nullptr; u32 txt = 0u; u32 bg = 0u;
+    if (hasCurWin()) { brush = curWin().bgBrush; txt = curWin().themeText; bg = curWin().themeBg; }
+    if (msg == WM_CTLCOLORSTATIC && brush != nullptr)
     {
         void* hdc = u2h(wParam);
-        SetTextColor(hdc, _nHost.themeText);
-        SetBkColor(hdc, _nHost.themeBg);
-        return (i64)(u64)_nHost.bgBrush;
+        SetTextColor(hdc, txt);
+        SetBkColor(hdc, bg);
+        return (i64)(u64)brush;
     }
-    if (msg == WM_ERASEBKGND && _nHost.bgBrush != nullptr)
+    if (msg == WM_ERASEBKGND && brush != nullptr)
     {
         RECT rc = default; GetClientRect(hwnd, &rc);
-        FillRect(u2h(wParam), &rc, _nHost.bgBrush);
+        FillRect(u2h(wParam), &rc, brush);
         return (i64)1;
     }
     return DefWindowProcA(hwnd, msg, wParam, lParam);
@@ -910,66 +2593,187 @@ stdcall i64 SecondaryWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
 
 void showSecondaryWindow(string title, string message)
 {
+    Window* wnd = curWin();
     if (!_secClassReg)
     {
         WNDCLASSEXA wc = default;
         wc.cbSize = (u32)sizeof(WNDCLASSEXA);
         wc.lpfnWndProc = (void*)SecondaryWndProc;
-        wc.hInstance = _nHost.hInst;
+        wc.hInstance = _hInst;
         wc.hCursor = LoadCursorA(nullptr, (char*)IDC_ARROW);
         wc.hbrBackground = (void*)((i64)COLOR_BTNFACE + 1);
         wc.lpszClassName = "CFlatSecondary";
         RegisterClassExA(&wc);
         _secClassReg = true;
     }
-    int w = 360 * (int)_nHost.dpi / 96;
-    int h = 200 * (int)_nHost.dpi / 96;
-    void* wnd = CreateWindowExA(0u, "CFlatSecondary", title.data(),
+    u32 dpi = wnd != nullptr ? wnd.dpi : 96u;
+    int w = 360 * (int)dpi / 96;
+    int h = 200 * (int)dpi / 96;
+    void* owner = wnd != nullptr ? wnd.hwnd : nullptr;
+    void* wndH = CreateWindowExA(0u, "CFlatSecondary", title.data(),
         (u32)(WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX)),
         CW_USEDEFAULT, CW_USEDEFAULT, w, h,
-        _nHost.window, nullptr, _nHost.hInst, nullptr);
+        owner, nullptr, _hInst, nullptr);
     void* st = CreateWindowExA(0u, "STATIC", message.data(),
         (u32)(WS_CHILD | WS_VISIBLE | SS_LEFT),
-        16 * (int)_nHost.dpi / 96, 16 * (int)_nHost.dpi / 96,
-        320 * (int)_nHost.dpi / 96, 140 * (int)_nHost.dpi / 96,
-        wnd, nullptr, _nHost.hInst, nullptr);
-    if (_nHost.font != nullptr) SendMessageA(st, (u32)WM_SETFONT, (u64)_nHost.font, (i64)1);
-    if (_nHost.dark)
+        16 * (int)dpi / 96, 16 * (int)dpi / 96,
+        320 * (int)dpi / 96, 140 * (int)dpi / 96,
+        wndH, nullptr, _hInst, nullptr);
+    void* font = wnd != nullptr ? wnd.font : nullptr;
+    if (font != nullptr) SendMessageA(st, (u32)WM_SETFONT, (u64)font, (i64)1);
+    if (wnd != nullptr && wnd.dark)
     {
         int one = 1;
-        DwmSetWindowAttribute(wnd, (u32)DWMWA_USE_IMMERSIVE_DARK_MODE, (void*)&one, 4u);
+        DwmSetWindowAttribute(wndH, (u32)DWMWA_USE_IMMERSIVE_DARK_MODE, (void*)&one, 4u);
     }
-    ShowWindow(wnd, (int)SW_SHOW);
-    UpdateWindow(wnd);
+    ShowWindow(wndH, (int)SW_SHOW);
+    UpdateWindow(wndH);
 }
 
-// Free the old tree (if any) and render + reconcile-to-native a fresh one at the
-// current client size. Controls are reused by key path, so this does not recreate
-// them - only new/removed nodes create/destroy controls.
-void buildNativeTree()
+// Render + reconcile-to-native the ACTIVE window's tree at its current client size.
+// Controls are reused by key path, so only new/removed nodes create/destroy controls.
+void buildCurrentTree()
 {
-    if (_nReady) { deleteTree(_nTree); _nReady = false; }
-    _nTree = _nApp.render(&_nCtx);
-    layoutRoot(_nTree, 0, 0, _nW);
-    _nHost.applyTree(_nTree, &_nCtx);
-    _nReady = true;
+    Window* wnd = curWin();
+    if (wnd.ready) { Element old = wnd.tree; deleteTree(old); wnd.ready = false; }
+    wnd.tree = wnd.app.render(&wnd.ctx);
+    layoutRoot(wnd.tree, 0, 0, wnd.w);
+    wnd.applyTree(wnd.tree, &wnd.ctx);
+    wnd.ready = true;
 }
 
-// LRESULT CALLBACK. Controls notify the PARENT: WM_COMMAND (button/checkbox click,
-// edit change, focus) with the control HWND in lParam; WM_HSCROLL (trackbar) with
-// it in lParam. Menu items (P3) arrive as WM_COMMAND with lParam == 0.
+// Build the window at registry index `wi` (makes it active first).
+void buildWindowTree(int wi) { _cur = wi; buildCurrentTree(); }
+
+// Backward-compatible name: build the ACTIVE window's tree.
+void buildNativeTree() { buildCurrentTree(); }
+
+// A Segoe UI Variable Text face (fallback Segoe UI) sized to the dpi.
+void* createUiFontDpi(u32 dpi)
+{
+    int h = -(15 * (int)dpi / 96);
+    void* f = CreateFontA(h, 0, 0, 0, FW_NORMAL, 0u, 0u, 0u,
+                          (u32)DEFAULT_CHARSET, (u32)OUT_DEFAULT_PRECIS,
+                          (u32)CLIP_DEFAULT_PRECIS, (u32)CLEARTYPE_QUALITY,
+                          (u32)(VARIABLE_PITCH | FF_SWISS), "Segoe UI Variable Text");
+    return f;
+}
+
+// Lighten/darken a COLORREF by shifting every channel (clamped), for the hover/pressed
+// button states in custom draw.
+u32 shadeRef(u32 c, int delta)
+{
+    int r = (int)(c & 0xFFu) + delta;
+    int g = (int)((c >> 8) & 0xFFu) + delta;
+    int b = (int)((c >> 16) & 0xFFu) + delta;
+    if (r < 0) r = 0; if (r > 255) r = 255;
+    if (g < 0) g = 0; if (g > 255) g = 255;
+    if (b < 0) b = 0; if (b > 255) b = 255;
+    return (u32)(r | (g << 8) | (b << 16));
+}
+
+// NM_CUSTOMDRAW accent draw for a themed push button (P10). Reads the NMCUSTOMDRAW at
+// `lParam`; if the notifying control has a stored accent, fills the accent background,
+// draws a focus ring when focused, paints the centered label in the accent text color,
+// and returns CDRF_SKIPDEFAULT (fully owning the draw). Returns true (with the LRESULT in
+// *result) only when it custom-drew; false lets the caller fall through to the default.
+bool tryCustomDrawButton(Window* wnd, i64 lParam, i64* result)
+{
+    char* p = (char*)u2h((u64)lParam);
+    u32* stagePtr = (u32*)(p + 24);
+    if (stagePtr[0] != (u32)CDDS_PREPAINT) { result[0] = (i64)CDRF_DODEFAULT; return false; }
+    NMHDR* nh = (NMHDR*)u2h((u64)lParam);
+    u64 hFrom = (u64)nh.hwndFrom;
+    u32 bg = 0u; u32 fg = 0u;
+    if (!wnd.accentFor(hFrom, &bg, &fg)) return false;   // not an accent button
+
+    void** hdcPtr = (void**)(p + 32);
+    void* hdc = hdcPtr[0];
+    i32* rcPtr = (i32*)(p + 40);
+    u32* statePtr = (u32*)(p + 64);
+    u32 state = statePtr[0];
+
+    RECT rc = default;
+    rc.left = rcPtr[0]; rc.top = rcPtr[1]; rc.right = rcPtr[2]; rc.bottom = rcPtr[3];
+
+    u32 fill = bg;
+    if ((state & (u32)CDIS_SELECTED) != 0u) fill = shadeRef(bg, 0 - 40);
+    else if ((state & (u32)CDIS_HOT) != 0u) fill = shadeRef(bg, 28);
+    void* br = CreateSolidBrush(fill);
+    FillRect(hdc, &rc, br);
+    DeleteObject(br);
+    if ((state & (u32)CDIS_FOCUS) != 0u)
+    {
+        void* ring = CreateSolidBrush(shadeRef(bg, 60));
+        FrameRect(hdc, &rc, ring);
+        DeleteObject(ring);
+    }
+    char[256] label; GetWindowTextA(u2h(hFrom), label, 256);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, fg);
+    DrawTextA(hdc, label, -1, &rc,
+              (u32)(DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX));
+    result[0] = (i64)CDRF_SKIPDEFAULT;
+    return true;
+}
+
+// Headless verification of the accent-button DRAW (P10). NM_CUSTOMDRAW cannot be captured
+// by PrintWindow (it re-renders controls default), so this drives the custom-draw path into
+// a memory DC with a synthetic NMCUSTOMDRAW and returns the filled pixel as a COLORREF. The
+// self-test asserts it equals the button's stored accent, proving the accent renders.
+u32 nativeTestCustomDrawFill(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0u;
+    void* screenDC = GetDC(nullptr);
+    void* memDC = CreateCompatibleDC(screenDC);
+    void* bmp = CreateCompatibleBitmap(screenDC, 32, 16);
+    void* oldBmp = SelectObject(memDC, bmp);
+    char* buf = (char*)malloc((i64)96);
+    int z = 0; while (z < 96) { buf[z] = (char)0; z++; }
+    void** pHwnd = (void**)buf;              pHwnd[0]  = u2h(h);                 // hwndFrom@0
+    u32*   pCode = (u32*)(buf + 16);         pCode[0]  = (u32)NM_CUSTOMDRAW;     // code@16
+    u32*   pStage = (u32*)(buf + 24);        pStage[0] = (u32)CDDS_PREPAINT;     // dwDrawStage@24
+    void** pHdc  = (void**)(buf + 32);       pHdc[0]   = memDC;                  // hdc@32
+    i32*   pRc   = (i32*)(buf + 40);         pRc[0] = 0; pRc[1] = 0; pRc[2] = 32; pRc[3] = 16;
+    u32*   pState = (u32*)(buf + 64);        pState[0] = (u32)CDIS_FOCUS;        // uItemState@64
+    i64 res = 0;
+    tryCustomDrawButton(curWin(), (i64)buf, &res);
+    u32 px = (u32)GetPixel(memDC, 2, 2);
+    free((void*)buf);
+    SelectObject(memDC, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, screenDC);
+    return px;
+}
+
+// LRESULT CALLBACK shared by all windows. Resolves the servicing window by scanning
+// the (small) registry for its HWND and sets `_cur` so app handlers reach it.
 stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
 {
+    int wi = findWindowIdx(hwnd);
+    if (wi < 0) return DefWindowProcA(hwnd, msg, wParam, lParam);
+    _cur = wi;
+    Window* wnd = curWin();
+
+    if (msg == WM_APP_CALL)
+    {
+        // A worker thread marshaled a closure here via ctx.post(); run + free it.
+        __uiRunPostBox((u64)lParam);
+        return (i64)0;
+    }
+
     if (msg == WM_SIZE)
     {
         int pw = (int)(lParam & (i64)0xFFFF);
         int ph = (int)((lParam >> 16) & (i64)0xFFFF);
-        int nw = pw / _nHost.dipX();
-        int nh = ph / _nHost.dipY();
+        int nw = pw / wnd.dipX();
+        int nh = ph / wnd.dipY();
         if (nw < 1) nw = 1;
         if (nh < 1) nh = 1;
-        _nW = nw; _nH = nh;
-        buildNativeTree();
+        wnd.w = nw; wnd.h = nh;
+        buildCurrentTree();
         return (i64)0;
     }
 
@@ -979,39 +2783,90 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
         void* ctrl = u2h((u64)lParam);
         if (ctrl == nullptr)
         {
-            // Menu item or accelerator: LOWORD(wParam) is the command id.
-            if (_nReady) routeMenu((int)(wParam & (u64)0xFFFF));
+            if (wnd.ready) routeMenu((int)(wParam & (u64)0xFFFF));
         }
-        else if (_nReady)
+        else if (wnd.ready)
         {
             if (code == BN_CLICKED)                          routeClick(ctrl);
-            else if (code == EN_CHANGE && !_nHost.applying)  routeEdit(ctrl);
+            else if (code == EN_CHANGE && !wnd.applying)     routeEdit(ctrl);
+            else if (code == CBN_SELCHANGE && !wnd.applying) routeCombo(ctrl);
             else if (code == BN_SETFOCUS || code == EN_SETFOCUS) mirrorFocus(ctrl);
         }
         return (i64)0;
     }
 
+    if (msg == WM_NOTIFY)
+    {
+        // NM_CUSTOMDRAW accent buttons (P10): intercept before the data-control routing so
+        // a themed push button paints its accent fill + focus ring (fixing dark mode).
+        NMHDR* nh = (NMHDR*)u2h((u64)lParam);
+        if (wnd.ready && nh != nullptr && (int)nh.code == NM_CUSTOMDRAW)
+        {
+            i64 cdr = (i64)CDRF_DODEFAULT;
+            if (tryCustomDrawButton(wnd, lParam, &cdr)) return cdr;
+        }
+        if (wnd.ready && routeNotify(lParam)) return (i64)0;
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
+    }
+
+    // Right-click over a control with a registered context menu -> TrackPopupMenu (P9).
+    if (msg == WM_CONTEXTMENU)
+    {
+        if (wnd.ready && wnd.showContextMenu((void*)wParam, lParam)) return (i64)0;
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
+    }
+
+    // Splitter drag: a press in a divider gutter (client area, no child control there)
+    // captures the mouse; moves re-ratio the split; release ends the drag (P9).
+    if (msg == WM_LBUTTONDOWN)
+    {
+        if (wnd.ready)
+        {
+            int mx = (int)(lParam & (i64)0xFFFF);
+            int my = (int)((lParam >> 16) & (i64)0xFFFF);
+            string sk = wnd.splitAtPixel(mx, my);
+            if (sk.length() > 0) { wnd.splitDragKey = "" + sk; SetCapture(hwnd); return (i64)0; }
+        }
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
+    }
+
+    if (msg == WM_MOUSEMOVE)
+    {
+        if (wnd.splitDragKey.length() > 0)
+        {
+            int mx = (int)(lParam & (i64)0xFFFF);
+            int my = (int)((lParam >> 16) & (i64)0xFFFF);
+            splitDragTo(wnd, wnd.splitDragKey, mx, my);
+            return (i64)0;
+        }
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
+    }
+
+    if (msg == WM_LBUTTONUP)
+    {
+        if (wnd.splitDragKey.length() > 0) { wnd.splitDragKey = ""; ReleaseCapture(); return (i64)0; }
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
+    }
+
     if (msg == WM_HSCROLL)
     {
         void* ctrl = u2h((u64)lParam);
-        if (ctrl != nullptr && _nReady) routeSlider(ctrl);
+        if (ctrl != nullptr && wnd.ready) routeSlider(ctrl);
         return (i64)0;
     }
 
-    // DPI change (moved to a different-scale monitor): rescale font + controls and
-    // move to the OS-suggested rectangle, then relayout at the new scale.
     if (msg == WM_DPICHANGED)
     {
-        u32 nd = (u32)((wParam >> 16) & (u64)0xFFFF);   // HIWORD = Y dpi
+        u32 nd = (u32)((wParam >> 16) & (u64)0xFFFF);
         if (nd < 96u) nd = 96u;
-        _nHost.dpi = nd;
-        if (_nHost.font != nullptr) DeleteObject(_nHost.font);
-        _nHost.font = createUiFontDpi(nd);
+        wnd.dpi = nd;
+        if (wnd.font != nullptr) DeleteObject(wnd.font);
+        wnd.font = createUiFontDpi(nd);
         int i = 0;
-        while (i < _nHost.liveHandles.count())
+        while (i < wnd.liveHandles.count())
         {
-            SendMessageA(u2h(_nHost.liveHandles.get(i)), (u32)WM_SETFONT,
-                         (u64)_nHost.font, (i64)1);
+            SendMessageA(u2h(wnd.liveHandles.get(i)), (u32)WM_SETFONT,
+                         (u64)wnd.font, (i64)1);
             i++;
         }
         RECT* pr = (RECT*)u2h((u64)lParam);
@@ -1019,33 +2874,32 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
             SetWindowPos(hwnd, nullptr, pr.left, pr.top,
                          pr.right - pr.left, pr.bottom - pr.top,
                          (u32)(SWP_NOZORDER | SWP_NOACTIVATE));
-        if (_nReady) { layoutRoot(_nTree, 0, 0, _nW); _nHost.applyTree(_nTree, &_nCtx); }
+        if (wnd.ready) { layoutRoot(wnd.tree, 0, 0, wnd.w); wnd.applyTree(wnd.tree, &wnd.ctx); }
         return (i64)0;
     }
 
-    // Theme the window background and control text/backgrounds (documented APIs,
-    // no uxtheme ordinal hacks). Only active once a non-default theme has set the
-    // brush; a monochrome theme falls through to the OS default look.
     if (msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLORBTN || msg == WM_CTLCOLOREDIT)
     {
-        if (_nHost.bgBrush != nullptr)
+        void* brush = wnd.bgBrush;
+        if (brush != nullptr)
         {
             void* hdc = u2h(wParam);
-            SetTextColor(hdc, _nHost.themeText);
-            SetBkColor(hdc, _nHost.themeBg);
-            return (i64)(u64)_nHost.bgBrush;
+            SetTextColor(hdc, wnd.themeText);
+            SetBkColor(hdc, wnd.themeBg);
+            return (i64)(u64)brush;
         }
         return DefWindowProcA(hwnd, msg, wParam, lParam);
     }
 
     if (msg == WM_ERASEBKGND)
     {
-        if (_nHost.bgBrush != nullptr)
+        void* brush = wnd.bgBrush;
+        if (brush != nullptr)
         {
             void* hdc = u2h(wParam);
             RECT rc = default;
             GetClientRect(hwnd, &rc);
-            FillRect(hdc, &rc, _nHost.bgBrush);
+            FillRect(hdc, &rc, brush);
             return (i64)1;
         }
         return DefWindowProcA(hwnd, msg, wParam, lParam);
@@ -1061,94 +2915,144 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
 
     if (msg == WM_DESTROY)
     {
-        if (_nReady) { deleteTree(_nTree); _nReady = false; }
-        if (_nHost.bgBrush != nullptr) { DeleteObject(_nHost.bgBrush); _nHost.bgBrush = nullptr; }
-        if (_nHost.font != nullptr) { DeleteObject(_nHost.font); _nHost.font = nullptr; }
-        PostQuitMessage(0);
+        destroyWindowStateAt(wi);
+        // Quit the message loop only when the last window is gone.
+        if (_windows.count() == 0) PostQuitMessage(0);
         return (i64)0;
     }
 
     return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
-// A Segoe UI Variable Text face (fallback Segoe UI) sized to the dpi. Height is
-// negative (character height, not cell height). The modern Windows 11 UI font.
-void* createUiFontDpi(u32 dpi)
+// Tear down the window at index `idx`: free its cflat + GDI state, remove it from the
+// registry, and delete it. The HWND + child controls are destroyed by Windows; child
+// controls cascade. `list.take` transfers ownership so the Window is deletable.
+void destroyWindowStateAt(int idx)
 {
-    int h = -(15 * (int)dpi / 96);
-    void* f = CreateFontA(h, 0, 0, 0, FW_NORMAL, 0u, 0u, 0u,
-                          (u32)DEFAULT_CHARSET, (u32)OUT_DEFAULT_PRECIS,
-                          (u32)CLIP_DEFAULT_PRECIS, (u32)CLEARTYPE_QUALITY,
-                          (u32)(VARIABLE_PITCH | FF_SWISS), "Segoe UI Variable Text");
-    return f;
+    if (idx < 0 || idx >= _windows.count()) return;
+    _cur = idx;
+    curWin().dispose();
+    Window* owned = _windows.take(idx);
+    delete owned;
+    _cur = _windows.count() > 0 ? 0 : -1;
 }
 
-// Register the window class + create the top-level window. `show` controls whether
-// it is made visible (the self-test creates it hidden). Sets up the host globals.
-void* createNativeWindow(const char* title, bool show)
+// Register the window class once.
+void ensureWindowClass()
 {
-    // Per-monitor-v2 DPI awareness: we scale DIP->px ourselves (crisp text/controls
-    // at >100%), rather than letting the OS bitmap-stretch a 96-dpi window.
+    if (_classReg) return;
     SetProcessDpiAwarenessContext((void*)(i64)(-4));
     InitCommonControls();
-    _nHost.hInst = GetModuleHandleA(nullptr);
+    _hInst = GetModuleHandleA(nullptr);
 
     WNDCLASSEXA wc = default;
     wc.cbSize        = (u32)sizeof(WNDCLASSEXA);
     wc.style         = (u32)(CS_HREDRAW | CS_VREDRAW);
     wc.lpfnWndProc   = (void*)NativeWndProc;
-    wc.hInstance     = _nHost.hInst;
+    wc.hInstance     = _hInst;
     wc.hCursor       = LoadCursorA(nullptr, (char*)IDC_ARROW);
     wc.hbrBackground = (void*)((i64)COLOR_BTNFACE + 1);
     wc.lpszClassName = "CFlatNativeWindow";
     RegisterClassExA(&wc);
+    _classReg = true;
+}
+
+// Create a new top-level window bound to `app`, register it in the owning list,
+// install the ctx.post marshaling hooks, and (if shown) let WM_SIZE build its tree.
+// Returns the window's registry INDEX and leaves it active (_cur). We return an int,
+// not a Window*: an owning class pointer bound to a caller local would auto-free the
+// window at scope exit and double-free with teardown - callers use curWin() instead.
+// `show` controls visibility (the self-test creates it hidden and builds explicitly).
+int createAppWindow(Component app, const char* title, bool show)
+{
+    ensureWindowClass();
+
+    Window* fresh = new Window();
+    fresh.app = app;
+    _windows.add(fresh);            // moves the window into the owning registry
+    _cur = _windows.count() - 1;
+    Window* wnd = curWin();         // borrow the just-added window
 
     void* hwnd = CreateWindowExA(
         0u, "CFlatNativeWindow", title, (u32)WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 760, 560,
-        nullptr, nullptr, _nHost.hInst, nullptr);
-    _nHost.window = hwnd;
-    _nHost.dpi = GetDpiForWindow(hwnd);
-    if (_nHost.dpi < 96u) _nHost.dpi = 96u;
-    _nHost.font = createUiFontDpi(_nHost.dpi);
-    buildMenuBar(hwnd);   // realize the app's declared menu (if any) + accelerators
+        nullptr, nullptr, _hInst, nullptr);
+    wnd.hwnd = hwnd;               // findWindowIdx now resolves this window's messages
+    wnd.dpi = GetDpiForWindow(hwnd);
+    if (wnd.dpi < 96u) wnd.dpi = 96u;
+    wnd.font = createUiFontDpi(wnd.dpi);
+
+    // Install the thread-marshaling hooks so this window's ctx.post() delivers here.
+    wnd.ctx.bindPost((u64)hwnd, _win32PostEnqueue);
+    wnd.ctx.bindThreadId(_win32CurTid(), _win32CurTid);
+
+    buildMenuBar(hwnd);
     if (show)
     {
         ShowWindow(hwnd, (int)SW_SHOW);
         UpdateWindow(hwnd);
     }
-    return hwnd;
+    return _cur;
 }
 
-// Register the class, create + show the window, and run the message loop until
-// WM_QUIT. IsDialogMessageA gives OS-owned Tab/arrow navigation and default-button
-// handling among the WS_TABSTOP controls.
+// Open a second (or Nth) top-level application window running `app`, built + shown,
+// sharing the one message loop. This is P7's genuine multi-window ("New Window").
+void openAppWindow(Component app, const char* title)
+{
+    createAppWindow(app, title, true);
+    buildNativeTree();   // build the just-created (now active) window
+}
+
+// Register the class, create + show the primary window, and run the message loop
+// until every window is closed. IsDialogMessageA on the active window gives OS-owned
+// Tab/arrow navigation and default-button handling among the WS_TABSTOP controls.
 //
-// The component MUST be heap-allocated (`new`): the host stashes it in `_nApp` and
-// `delete`s it after the message loop, so it has to outlive this call and be a heap
-// object. A stack component would dangle once the caller's frame unwinds (and could
-// not be deleted). This is the idiomatic React-style ownership model (mount() uses
-// `new`), independent of any language feature.
+// The component MUST be heap-allocated (`new`): a Window stashes it and `delete`s it
+// on teardown, so it has to outlive this call.
 int runAppGuiNative(Component app, const char* title)
 {
-    _nApp = app;
-    void* hwnd = createNativeWindow(title, true);
-    if (hwnd == nullptr) { printf("CreateWindowExA failed\n"); return 1; }
-    if (!_nReady) buildNativeTree();   // in case WM_SIZE did not fire on show
+    createAppWindow(app, title, true);
+    if (curWin().hwnd == nullptr) { printf("CreateWindowExA failed\n"); return 1; }
+    if (!curWin().ready) buildNativeTree();   // in case WM_SIZE did not fire on show
 
     MSG msg = default;
     while (GetMessageA(&msg, nullptr, 0u, 0u) > 0)
     {
-        // Accelerators first, then dialog-style Tab/arrow nav, then normal dispatch.
-        if (_accelTable != nullptr && TranslateAcceleratorA(hwnd, _accelTable, &msg) != 0)
+        void* activeHwnd = GetActiveWindow();
+        if (activeHwnd == nullptr && _windows.count() > 0) activeHwnd = _windows.get(0).hwnd;
+        if (activeHwnd != nullptr && _accelTable != nullptr && TranslateAcceleratorA(activeHwnd, _accelTable, &msg) != 0)
             continue;
-        if (IsDialogMessageA(hwnd, &msg) == 0)
+        if (IsDialogMessageA(activeHwnd, &msg) == 0)
         {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
     }
-    delete _nApp;                      // host owns the heap component
-    _nApp = nullptr;
     return (int)msg.wParam;
+}
+
+// Fully release all host + context state - for the headless self-tests, so
+// --heap-audit sees no residue. Destroys every window (each `delete Window` frees its
+// ctx + live lists), then releases the app-wide menu declaration + closures.
+void nativeTeardownForTest()
+{
+    // DestroyWindow synchronously sends WM_DESTROY -> destroyWindowStateAt, which frees
+    // the Window and drops it from _windows (via list.take, transferring ownership).
+    while (_windows.count() > 0)
+    {
+        Window* wnd = _windows.get(0);
+        void* hwnd = wnd.hwnd;
+        if (hwnd != nullptr) DestroyWindow(hwnd);
+        else destroyWindowStateAt(0);
+    }
+    _cur = -1;
+    { list<Window*> lw = move _windows; }
+    { list<string> a3 = move _menuTop; }
+    { list<int>    a4 = move _menuItemTopIdx; }
+    { list<string> a5 = move _menuItemLabel; }
+    { list<int>    a6 = move _menuItemCmd; }
+    { list<int>    a7 = move _menuAccelKey; }
+    { list<int>    a8 = move _menuAccelMods; }
+    if (_hasMenuHandler) { Lambda<void(int)> a9 = move _menuHandler; _hasMenuHandler = false; }
+    if (_hasCloseQuery)  { Lambda<bool()> a10 = move _closeQuery; _hasCloseQuery = false; }
 }

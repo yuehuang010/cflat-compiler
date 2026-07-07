@@ -524,6 +524,34 @@ Theme darkTheme()
     return t;
 }
 
+// ── ctx.post() thread marshaling (P7) ────────────────────────────────────────
+// A closure queued to run on the UI thread. ctx.post() clones the closure into a
+// heap PostBox and hands the host an opaque pointer; the host marshals that pointer
+// to the UI thread (PostMessage on Win32) and calls __uiRunPostBox to run + free it.
+// Keeping the box + run/free in ui.cb means the seam carries only an opaque u64 - no
+// closure type crosses the host boundary (a Lambda-typed hook breaks monomorphization).
+class PostBox { Lambda<void()> work = default; };
+
+// Heap-box a closure. Returns a TYPED pointer so escape analysis keeps the cloned
+// closure alive past this call; a u64 cast inside the creating function would let the
+// field be destructed at scope exit. The caller casts to u64 at its own site.
+PostBox* _boxClosure(Lambda<void()> work)
+{
+    PostBox* box = new PostBox();
+    box.work = work;   // clone-in (lambdas are clone-by-default; the arg keeps its copy)
+    return box;
+}
+
+// Run a boxed closure on the current thread, then free the box. The host calls this
+// from its UI-thread message handler (Win32 WM_APP_CALL). Leak-clean.
+void __uiRunPostBox(u64 boxPtr)
+{
+    if (boxPtr == 0u) return;
+    PostBox* b = (PostBox*)boxPtr;
+    b.work();
+    delete b;
+}
+
 // ── UiContext (F5/F2): the host-owned per-app runtime state ───────────────────
 // Replaces the former library globals. A handler calls ctx.invalidate() to mark
 // the UI dirty; the host drains it once per loop (consumeDirty) and re-renders
@@ -548,7 +576,46 @@ struct UiContext
     // the host explicitly destroys controls.
     dictionary<string, u64> nativeByKey = default;
 
+    // Thread marshaling (P7). The host installs a marshal hook + the UI thread id so
+    // ctx.post() can run a closure back on the UI thread from a worker. These are thin
+    // function pointers (no owning closure type crosses the seam), set by the host at
+    // window creation; with none bound, post() runs inline (TUI / headless).
+    u64  postTarget  = 0u;                        // opaque UI-thread target (HWND on Win32)
+    function<void(u64, u64)> postHook = default;  // (target, boxPtr) -> marshal to UI thread
+    bool hasPostHook = false;
+    u64  uiThreadId  = 0u;                        // the UI thread's OS id (host-set)
+    function<u64()> tidHook = default;            // returns the CURRENT thread id (host-set)
+    bool hasTidHook  = false;
+
     void invalidate() { this.dirty = true; }
+
+    // Install the host's thread-marshaling hook. `target` is the UI-thread post target
+    // (a window handle on Win32); `hook(target, boxPtr)` enqueues a boxed closure.
+    void bindPost(u64 target, function<void(u64, u64)> hook)
+    {
+        this.postTarget = target; this.postHook = hook; this.hasPostHook = true;
+    }
+    void bindThreadId(u64 uiTid, function<u64()> tidFn)
+    {
+        this.uiThreadId = uiTid; this.tidHook = tidFn; this.hasTidHook = true;
+    }
+
+    // Run `work` on the UI thread. Safe to call from any thread: the closure is cloned
+    // into a heap box here and the host marshals it (PostMessage) to the UI thread,
+    // where it runs once and is freed. With no host bound, it runs inline.
+    void post(Lambda<void()> work)
+    {
+        PostBox* box = _boxClosure(work);
+        if (this.hasPostHook) this.postHook(this.postTarget, (u64)box);
+        else __uiRunPostBox((u64)box);
+    }
+
+    // Debug guard: warn if called off the UI thread. A no-op until a host binds ids.
+    void assertUiThread()
+    {
+        if (this.hasTidHook && this.tidHook() != this.uiThreadId)
+            printf("ui: assertUiThread() called off the UI thread\n");
+    }
 
     // Request a re-layout + repaint without a re-render. Used when a node's own
     // view state changes (e.g. a ScrollView offset) but the component tree does
@@ -611,6 +678,24 @@ struct UiContext
     void removeNativeHandle(string key) { this.nativeByKey.remove(key); }
 };
 
+// ── ContextMenu: a per-element right-click menu (P9) ──────────────────────────
+// Reuses the P3 declarative menu model as a popup attached to ONE element. The app
+// builds it (addItem(label, cmd)) and hangs it on an element's `contextMenu` field; on
+// a right-click over that control the native host shows a TrackPopupMenu and routes the
+// chosen cmd through the SAME app menu handler (setMenuHandler). An empty label is a
+// separator. Owned by the element it is attached to (freed in that element's
+// destroyTree). A plain default-constructible class, so `<ContextMenu/>` sugar works.
+class ContextMenu
+{
+    string       title  = default;   // optional label (unused by the popup; sugar-friendly)
+    list<string> labels = default;   // per item: menu text ("" = separator)
+    list<int>    cmds   = default;   // per item: app command id (routed via setMenuHandler)
+
+    void addItem(string label, int cmd) { this.labels.add("" + label); this.cmds.add(cmd); }
+    void addSeparator() { this.labels.add(""); this.cmds.add(0); }
+    int count() { return this.labels.count(); }
+};
+
 // Node-kind tags - returned by Element.kind() so the reconciler can compare node
 // types WITHOUT an `as` downcast in the hot diff path.
 int ELEM_VIEW      = 1;
@@ -624,6 +709,18 @@ int ELEM_CHECKBOX  = 8;
 int ELEM_PROGRESS  = 9;
 int ELEM_SLIDER    = 10;
 int ELEM_TEXTAREA  = 11;
+int ELEM_STATUSBAR = 12;
+int ELEM_RADIOGROUP = 13;   // container of RadioButtons (P8); not native-mapped
+int ELEM_RADIO      = 14;   // one radio button inside a RadioGroup (P8)
+int ELEM_COMBO      = 15;   // dropdown list (P8)
+int ELEM_LIST       = 16;   // report-mode list view, virtualized (P8)
+int ELEM_TABS       = 17;   // tab control; keyed panes, active-only native (P9)
+int ELEM_TABPANE    = 18;   // one pane inside a TabControl (P9); container, not native-mapped
+int ELEM_TREE       = 19;   // tree view, expand-on-demand callback children (P9)
+int ELEM_SPLIT      = 20;   // split view: two weighted panes + divider (P9); container
+int ELEM_IMAGE      = 21;   // bitmap image (P10); BGRA32 pixels pushed via setImageData
+int ELEM_GROUPBOX   = 22;   // titled group frame (P10); container, native-mapped
+int ELEM_CANVAS     = 23;   // app-painted canvas child (P10); paint callback via Canvas
 
 // The node interface. Typed host structs implement these so the tree can be
 // walked uniformly (serialize, layout, paint, dispatch, reconcile, teardown)
@@ -799,6 +896,7 @@ class Text : Element
 {
     string text = default;
     int    color = 0;           // rgb(); 0 = default ink
+    string tooltip = default;   // native hover tooltip (P7); "" = none. Use a literal.
     Rect bounds = default;
     string key = default;
 
@@ -850,6 +948,7 @@ class Button : Element
     int    color = 0;               // label ink; 0 = default
     int    backgroundColor = 0;     // button fill; 0 = no fill
     bool   disabled = false;        // dimmed + ignores input
+    string tooltip = default;       // native hover tooltip (P7); "" = none
     Rect bounds = default;
     string key = default;
 
@@ -1075,6 +1174,7 @@ class TextInput : Element
     int    color = 0;               // text ink; 0 = default
     int    backgroundColor = 0;     // field fill; 0 = no fill
     bool   disabled = false;        // dimmed + ignores input
+    string tooltip = default;       // native hover tooltip (P7); "" = none
     Rect   bounds = default;
     string key    = default;
 
@@ -1185,6 +1285,7 @@ class Checkbox : Element
     bool   disabled = false;
     Lambda<void(bool)> onChange = default;
     int    color = 0;            // label ink; 0 = default
+    string tooltip = default;    // native hover tooltip (P7); "" = none
     Rect   bounds = default;
     string key   = default;
 
@@ -1269,6 +1370,7 @@ class ProgressBar : Element
     int    value = 0;          // 0..100
     int    width = 20;         // cells
     int    color = 0;          // fill override; 0 = theme accent
+    string tooltip = default;  // native hover tooltip (P7); "" = none
     Rect   bounds = default;
     string key = default;
 
@@ -1327,6 +1429,7 @@ class Slider : Element
     int    width = 20;         // cells
     bool   disabled = false;
     Lambda<void(int)> onChange = default;
+    string tooltip = default;  // native hover tooltip (P7); "" = none
     Rect   bounds = default;
     string key = default;
 
@@ -1443,6 +1546,7 @@ class TextArea : Element
     int    color = 0;
     int    backgroundColor = 0;
     bool   disabled = false;
+    string tooltip = default;  // native hover tooltip (P7); "" = none
     Rect   bounds = default;
     string key    = default;
 
@@ -1520,6 +1624,88 @@ TextArea* textArea(string value, Lambda<void()> onChange)
     t.value = value;
     t.onChange = onChange;
     return t;
+}
+
+// ── StatusBar: a bottom strip of text parts (msctls_statusbar32 on Win32) ─────
+// App-shell chrome (P7): one or more text panes. `parts` is a plain public list so
+// the <StatusBar/> sugar and imperative addPart() both work; the native host maps it
+// to a real status bar (which self-docks at the window bottom), and a Canvas host
+// falls back to one row of " | "-joined parts.
+class StatusBar : Element
+{
+    list<string> parts = default;   // text per pane; parts[0] is the main pane
+    Rect   bounds = default;
+    string key    = default;
+
+    void addPart(string s) { this.parts.add("" + s); }
+
+    move string toJson()
+    {
+        string out = "{\"type\":\"StatusBar\",\"parts\":[";
+        int i = 0;
+        while (i < this.parts.count())
+        {
+            if (i > 0) out = out + ",";
+            out = out + "\"" + this.parts.get(i) + "\"";
+            i++;
+        }
+        out = out + "]}";
+        return out;
+    }
+
+    Size layout(LayoutConstraints c)
+    {
+        Rect b = default;
+        b.x = c.x; b.y = c.y; b.w = c.availW; b.h = 1;
+        this.bounds = b;
+        Size s = default; s.w = b.w; s.h = 1;
+        return s;
+    }
+
+    // Canvas fallback: the panes joined by " | " on the strip's row.
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        string line = "";
+        int i = 0;
+        while (i < this.parts.count())
+        {
+            if (i > 0) line = line + " | ";
+            line = line + this.parts.get(i);
+            i++;
+        }
+        cv.drawText(this.bounds.x, this.bounds.y, line.data(),
+                    pickColor(0, ctx.theme.textColor));
+    }
+
+    bool dispatch(Event e, UiContext* ctx) { return false; }
+    void destroyTree() { }
+    int kind() { return ELEM_STATUSBAR; }
+    void collectFocusables(list<string>* keys) { }
+    bool propsEqual(Element other)
+    {
+        StatusBar* o = other as StatusBar;
+        if (o == nullptr) return false;
+        if (this.parts.count() != o.parts.count()) return false;
+        int i = 0;
+        while (i < this.parts.count())
+        {
+            if (this.parts.get(i) != o.parts.get(i)) return false;
+            i++;
+        }
+        return true;
+    }
+    list<Element>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// A status bar seeded with a main-pane string (add more panes with addPart()).
+StatusBar* statusBar(string text)
+{
+    StatusBar* s = new StatusBar();
+    s.parts.add("" + text);
+    return s;
 }
 
 // ── ScrollView: a clipped, vertically scrollable viewport ─────────────────────
@@ -1771,6 +1957,1295 @@ ScrollView* scrollView(Style style)
     return s;
 }
 
+// ── RadioButton: one option inside a RadioGroup (P8) ──────────────────────────
+// A dumb controlled leaf: `checked` is pushed down each render (index == group
+// value), `index` is its position. The enclosing RadioGroup owns selection and
+// hit-testing; a bare radio is inert on its own (the native host routes a click to
+// the group by key path). Rendered "(o) label" / "( ) label" on a Canvas host, a
+// BS_AUTORADIOBUTTON on Win32 (WS_GROUP on the first radio of the group).
+class RadioButton : Element
+{
+    string label      = default;
+    int    index      = 0;          // position within the group (drives selection)
+    bool   checked    = false;      // controlled: index == group.value
+    bool   disabled   = false;
+    bool   groupFirst = false;      // host puts WS_GROUP on the first radio of a group
+    string tooltip    = default;    // native hover tooltip; "" = none
+    Rect   bounds = default;
+    string key    = default;
+
+    move string toJson()
+    {
+        string c = this.checked ? "true" : "false";
+        return "{\"type\":\"RadioButton\",\"checked\":" + c
+             + ",\"label\":\"" + this.label + "\"}";
+    }
+
+    Size layout(LayoutConstraints c)
+    {
+        Rect b = default;
+        b.x = c.x; b.y = c.y; b.w = (int)this.label.length() + 4; b.h = 1;  // "(o) " + label
+        this.bounds = b;
+        Size s = default; s.w = b.w; s.h = 1;
+        return s;
+    }
+
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        int ink = pickColor(0, ctx.theme.textColor);
+        if (this.disabled) ink = dimColor(ink);
+        string mark = this.checked ? "(o) " : "( ) ";
+        string shown = mark + this.label;
+        cv.drawText(this.bounds.x, this.bounds.y, shown.data(), ink);
+    }
+
+    bool dispatch(Event e, UiContext* ctx) { return false; }
+    void destroyTree() { }
+    int kind() { return ELEM_RADIO; }
+    void collectFocusables(list<string>* keys)
+    {
+        if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
+    }
+    bool propsEqual(Element other)
+    {
+        RadioButton* o = other as RadioButton;
+        return o != nullptr && this.checked == o.checked && this.label == o.label
+            && this.disabled == o.disabled;
+    }
+    list<Element>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// ── RadioGroup: a controlled single-choice group of RadioButtons (P8) ─────────
+// Owns the selected `value` (an index) and `onChange`. It is a layout container
+// (not itself a native control, like View); its RadioButton children ARE controls.
+// Selection is controlled: each render sets each child's `checked` (via addOption or
+// sugar `checked={value==i}`), and a click fires onChange(index). The group is where
+// hit-testing lives on a Canvas host; the native host routes a radio click here by
+// walking the key path up one segment.
+class RadioGroup : Element
+{
+    list<Element> children = default;   // RadioButton*
+    int   value    = 0;                 // selected index (controlled)
+    Lambda<void(int)> onChange = default;
+    Style style    = default;
+    Rect  bounds   = default;
+    string key     = default;
+
+    void add(Element child) { this.children.add(child); }
+
+    // Append a wired option. `checked` is seeded from the current value at render time
+    // (the controlled contract); reconcile propagates a later selection change through
+    // each child's propsEqual (checked), so the committed tree the host syncs is right.
+    void addOption(string label)
+    {
+        RadioButton* r = new RadioButton();
+        r.label = label;
+        r.index = this.children.count();
+        r.checked = r.index == this.value;
+        r.key = "r" + r.index.toString();
+        this.children.add(r);
+    }
+
+    // Mark the first child as the WS_GROUP boundary (position-based, so it is stable
+    // across reconcile even though container props are otherwise treated as stable),
+    // then stack the radios in a column.
+    Size layout(LayoutConstraints c)
+    {
+        int pad = this.style.padding;
+        int gap = this.style.gap;
+        int cy = c.y + pad;
+        int i = 0;
+        for (Element child in this.children)
+        {
+            if (child.kind() == ELEM_RADIO)
+            {
+                RadioButton* rb = child as RadioButton;
+                rb.groupFirst = i == 0;
+            }
+            if (i > 0) cy = cy + gap;
+            LayoutConstraints cc = default;
+            cc.x = c.x + pad; cc.y = cy;
+            cc.availW = c.availW - 2 * pad; cc.availH = c.availH - 2 * pad;
+            Size cs = child.layout(cc);
+            cy = cy + cs.h;
+            i++;
+        }
+        Rect b = default;
+        b.x = c.x; b.y = c.y; b.w = c.availW; b.h = (cy - c.y) + pad;
+        this.bounds = b;
+        Size sz = default; sz.w = b.w; sz.h = b.h;
+        return sz;
+    }
+
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        for (Element c in this.children) c.paint(cv, ctx);
+    }
+
+    bool dispatch(Event e, UiContext* ctx)
+    {
+        if (e.kind == EV_MOUSE_DOWN)
+        {
+            for (Element c in this.children)
+            {
+                if (c.kind() != ELEM_RADIO) continue;
+                RadioButton* rb = c as RadioButton;
+                if (!rb.disabled && rb.bounds.contains(e.x, e.y))
+                {
+                    ctx.focus(this.key);
+                    this.onChange(rb.index);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    move string toJson()
+    {
+        string out = "{\"type\":\"RadioGroup\",\"value\":" + this.value.toString();
+        out = out + ",\"children\":[";
+        int i = 0;
+        for (Element c in this.children)
+        {
+            if (i > 0) out = out + ",";
+            out = out + c.toJson();
+            i++;
+        }
+        out = out + "]}";
+        return out;
+    }
+
+    void destroyTree()
+    {
+        for (Element c in this.children) { c.destroyTree(); delete c; }
+        this.children.clear();
+    }
+
+    int kind() { return ELEM_RADIOGROUP; }
+    void collectFocusables(list<string>* keys)
+    {
+        for (Element c in this.children) c.collectFocusables(keys);
+    }
+    bool propsEqual(Element other)
+    {
+        RadioGroup* o = other as RadioGroup;
+        return o != nullptr && this.value == o.value && styleEquals(this.style, o.style);
+    }
+    list<Element>* childList() { return &this.children; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// ── ComboBox: a controlled dropdown (P8) ──────────────────────────────────────
+// A CBS_DROPDOWNLIST on Win32 (NSPopUpButton on Cocoa later). Controlled like the
+// other widgets: `selectedIndex` + `items` flow down, a selection fires
+// onChange(index). Canvas fallback shows "[selected v]" and cycles on click.
+class ComboBox : Element
+{
+    list<string> items = default;
+    int   selectedIndex = 0;
+    Lambda<void(int)> onChange = default;
+    int   width    = 0;             // 0 -> sized to the widest item
+    bool  disabled = false;
+    string tooltip = default;
+    Rect  bounds = default;
+    string key   = default;
+
+    void addItem(string s) { this.items.add("" + s); }
+
+    string _selectedText()
+    {
+        if (this.selectedIndex < 0 || this.selectedIndex >= this.items.count()) return "";
+        return "" + this.items.get(this.selectedIndex);
+    }
+
+    move string toJson()
+    {
+        int n = this.items.count();
+        return "{\"type\":\"ComboBox\",\"selectedIndex\":" + this.selectedIndex.toString()
+             + ",\"count\":" + n.toString() + "}";
+    }
+
+    Size layout(LayoutConstraints c)
+    {
+        int w = this.width;
+        if (w <= 0)
+        {
+            int mx = 4;
+            int i = 0;
+            while (i < this.items.count())
+            {
+                int l = (int)this.items.get(i).length();
+                if (l > mx) mx = l;
+                i++;
+            }
+            w = mx + 4;   // room for the dropdown arrow
+        }
+        if (w < 6) w = 6;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = 1;
+        this.bounds = b;
+        Size s = default; s.w = w; s.h = 1;
+        return s;
+    }
+
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        int ink = pickColor(0, ctx.theme.inputText);
+        if (this.disabled) ink = dimColor(ink);
+        int bg = pickColor(0, ctx.theme.inputBg);
+        if (bg != 0) cv.drawRect(this.bounds, true, bg);
+        string shown = "[" + this._selectedText() + " v]";
+        cv.drawText(this.bounds.x, this.bounds.y, shown.data(), ink);
+    }
+
+    bool dispatch(Event e, UiContext* ctx)
+    {
+        if (this.disabled) return false;
+        if (e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y))
+        {
+            ctx.focus(this.key);
+            int n = this.items.count();
+            if (n > 0) this.onChange((this.selectedIndex + 1) % n);
+            return true;
+        }
+        if (e.kind == EV_KEY && ctx.hasFocus(this.key))
+        {
+            int n = this.items.count();
+            if (n == 0) return false;
+            if (e.key == KEY_DOWN) { this.onChange((this.selectedIndex + 1) % n); return true; }
+            if (e.key == KEY_UP)   { this.onChange((this.selectedIndex - 1 + n) % n); return true; }
+        }
+        return false;
+    }
+
+    void destroyTree() { }
+    int kind() { return ELEM_COMBO; }
+    void collectFocusables(list<string>* keys)
+    {
+        if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
+    }
+    bool propsEqual(Element other)
+    {
+        ComboBox* o = other as ComboBox;
+        if (o == nullptr) return false;
+        if (this.selectedIndex != o.selectedIndex || this.disabled != o.disabled) return false;
+        if (this.items.count() != o.items.count()) return false;
+        int i = 0;
+        while (i < this.items.count())
+        {
+            if (this.items.get(i) != o.items.get(i)) return false;
+            i++;
+        }
+        return true;
+    }
+    list<Element>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// ── ListView: a virtualized report-mode list (P8) ─────────────────────────────
+// The item SOURCE is a callback, not a copied list: `rowText(row, col)` supplies a
+// cell on demand, so `rowCount` can be 100k+ and only the visible rows are ever
+// queried (LVS_OWNERDATA on Win32; NSTableView's dataSource is naturally the same
+// shape). Selection is controlled (`selectedIndex`); onSelect fires on a selection
+// change, onActivate on double-click / Enter. Column headers/widths are set through
+// the setListOp seam by the host. rowText/onSelect/onActivate are owning closures
+// that capture the component pointer, so they read current state even when the
+// committed node is reused across renders (no per-frame re-box needed).
+class ListView : Element
+{
+    list<string> columns   = default;   // header titles
+    list<int>    colWidths = default;    // per-column width in DIPs (parallel to columns)
+    int   rowCount = 0;
+    Lambda<string(int,int)> rowText = default;   // (row, col) -> cell text
+    int   selectedIndex = -1;            // controlled single selection (-1 = none)
+    bool  multiSelect = false;
+    Lambda<void(int)> onSelect   = default;      // selection changed to row
+    Lambda<void(int)> onActivate = default;      // double-click / Enter on row
+    int   width  = 40;
+    int   height = 10;
+    bool  disabled = false;
+    string tooltip = default;
+    Rect  bounds = default;
+    string key = default;
+
+    void addColumn(string title, int widthDip)
+    {
+        this.columns.add("" + title);
+        this.colWidths.add(widthDip);
+    }
+
+    move string toJson()
+    {
+        int nc = this.columns.count();
+        return "{\"type\":\"ListView\",\"rowCount\":" + this.rowCount.toString()
+             + ",\"columns\":" + nc.toString()
+             + ",\"selectedIndex\":" + this.selectedIndex.toString() + "}";
+    }
+
+    Size layout(LayoutConstraints c)
+    {
+        int w = this.width;  if (w > c.availW && c.availW > 0) w = c.availW;
+        if (w < 6) w = 6;
+        int h = this.height; if (h < 3) h = 3;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        this.bounds = b;
+        Size s = default; s.w = w; s.h = h;
+        return s;
+    }
+
+    // Canvas fallback: header row + only the rows that fit (virtualization is visible
+    // here too - the callback is asked for at most bounds.h-1 rows regardless of count).
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        int bg = pickColor(0, ctx.theme.inputBg);
+        if (bg != 0) cv.drawRect(this.bounds, true, bg);
+        cv.drawRect(this.bounds, false, pickColor(0, ctx.theme.panelBorder));
+        int ink = pickColor(0, ctx.theme.textColor);
+        string hdr = "";
+        int c = 0;
+        while (c < this.columns.count())
+        {
+            if (c > 0) hdr = hdr + " | ";
+            hdr = hdr + this.columns.get(c);
+            c++;
+        }
+        cv.drawText(this.bounds.x + 1, this.bounds.y, hdr.data(), ink);
+        int ncol = this.columns.count(); if (ncol < 1) ncol = 1;
+        int visible = this.bounds.h - 1;
+        int r = 0;
+        while (r < visible && r < this.rowCount)
+        {
+            string line = "";
+            int cc = 0;
+            while (cc < ncol)
+            {
+                if (cc > 0) line = line + " | ";
+                line = line + this.rowText(r, cc);
+                cc++;
+            }
+            if (r == this.selectedIndex) line = ">" + line;
+            cv.drawText(this.bounds.x + 1, this.bounds.y + 1 + r, line.data(), ink);
+            r++;
+        }
+    }
+
+    bool dispatch(Event e, UiContext* ctx)
+    {
+        if (this.disabled) return false;
+        if (e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y))
+        {
+            ctx.focus(this.key);
+            int r = e.y - (this.bounds.y + 1);
+            if (r >= 0 && r < this.rowCount) this.onSelect(r);
+            return true;
+        }
+        if (e.kind == EV_KEY && ctx.hasFocus(this.key))
+        {
+            if (e.key == KEY_ENTER && this.selectedIndex >= 0) { this.onActivate(this.selectedIndex); return true; }
+            if (e.key == KEY_DOWN && this.selectedIndex + 1 < this.rowCount) { this.onSelect(this.selectedIndex + 1); return true; }
+            if (e.key == KEY_UP && this.selectedIndex > 0) { this.onSelect(this.selectedIndex - 1); return true; }
+        }
+        return false;
+    }
+
+    void destroyTree() { }
+    int kind() { return ELEM_LIST; }
+    void collectFocusables(list<string>* keys)
+    {
+        if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
+    }
+    bool propsEqual(Element other)
+    {
+        ListView* o = other as ListView;
+        if (o == nullptr) return false;
+        return this.rowCount == o.rowCount && this.selectedIndex == o.selectedIndex
+            && this.multiSelect == o.multiSelect && this.disabled == o.disabled
+            && this.columns.count() == o.columns.count();
+    }
+    list<Element>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// ── P8 element factories (thin field-setters; sugar-ready fields elsewhere) ────
+// A controlled radio group; append options with addOption(), which wires index/key
+// and seeds checked from `value`.
+RadioGroup* radioGroup(int value, Lambda<void(int)> onChange)
+{
+    RadioGroup* g = new RadioGroup();
+    g.value = value;
+    g.onChange = onChange;
+    return g;
+}
+
+// A controlled dropdown; add items with addItem().
+ComboBox* comboBox(int selectedIndex, Lambda<void(int)> onChange)
+{
+    ComboBox* c = new ComboBox();
+    c.selectedIndex = selectedIndex;
+    c.onChange = onChange;
+    return c;
+}
+
+// A virtualized list; add columns with addColumn() and set `rowText`/`rowCount`.
+ListView* listView(int rowCount, Lambda<string(int,int)> rowText)
+{
+    ListView* lv = new ListView();
+    lv.rowCount = rowCount;
+    lv.rowText = rowText;
+    return lv;
+}
+
+// ── ListView rowText callback boxing (the setListOp seam carries an opaque u64) ─
+// The native host must call back into a `Lambda<string(int,int)>` when the OS asks
+// for a cell (LVN_GETDISPINFO). A Lambda type cannot cross the NativeHost interface
+// (it breaks the monomorphizer - same constraint as ctx.post), so ui.cb heap-boxes
+// the closure and the seam carries the box as a u64. The host stores the box per
+// control, invokes it through __uiListRowText, and frees it via __uiFreeListRowBox
+// when the control is destroyed. Mirrors the PostBox pattern above.
+class ListRowBox { Lambda<string(int,int)> cb = default; };
+
+// Heap-box a rowText closure. Returns a TYPED pointer so escape analysis keeps the
+// cloned closure alive past this call; the caller casts to u64 at its own site.
+ListRowBox* _boxListRow(Lambda<string(int,int)> cb)
+{
+    ListRowBox* b = new ListRowBox();
+    b.cb = cb;   // clone-in (lambdas are clone-by-default)
+    return b;
+}
+
+// Invoke a boxed rowText callback (called by the host from its cell-data handler).
+// Returns an owned string; the host copies the bytes into the OS buffer then lets it
+// drop. An empty/zero box yields "".
+move string __uiListRowText(u64 boxPtr, int row, int col)
+{
+    if (boxPtr == 0u) return "";
+    ListRowBox* b = (ListRowBox*)boxPtr;
+    return b.cb(row, col);
+}
+
+void __uiFreeListRowBox(u64 boxPtr)
+{
+    if (boxPtr == 0u) return;
+    ListRowBox* b = (ListRowBox*)boxPtr;
+    delete b;
+}
+
+// ── TabPane: one titled pane inside a TabControl (P9) ─────────────────────────
+// A pure layout container (like View), NOT itself a native control. Its `title`
+// labels the tab; its children are the pane content. Only the ACTIVE pane is walked
+// into native controls by the host (lazy inactive tabs), so a re-render never
+// materializes an inactive pane's controls.
+class TabPane : Element
+{
+    string title = default;
+    list<Element> children = default;
+    Rect bounds = default;
+    string key = default;
+
+    void add(Element child) { this.children.add(child); }
+
+    Size layout(LayoutConstraints c)
+    {
+        int cy = c.y;
+        for (Element child in this.children)
+        {
+            LayoutConstraints cc = default;
+            cc.x = c.x; cc.y = cy; cc.availW = c.availW; cc.availH = c.availH;
+            Size cs = child.layout(cc);
+            cy = cy + cs.h;
+        }
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = c.availW; b.h = cy - c.y;
+        this.bounds = b;
+        Size s = default; s.w = b.w; s.h = b.h;
+        return s;
+    }
+
+    void paint(Canvas cv, UiContext* ctx) { for (Element c in this.children) c.paint(cv, ctx); }
+
+    bool dispatch(Event e, UiContext* ctx)
+    {
+        for (Element c in this.children) { if (c.dispatch(e, ctx)) return true; }
+        return false;
+    }
+
+    move string toJson()
+    {
+        string out = "{\"type\":\"TabPane\",\"title\":\"" + this.title + "\",\"children\":[";
+        int i = 0;
+        for (Element c in this.children) { if (i > 0) out = out + ","; out = out + c.toJson(); i++; }
+        out = out + "]}";
+        return out;
+    }
+
+    void destroyTree()
+    {
+        for (Element c in this.children) { c.destroyTree(); delete c; }
+        this.children.clear();
+    }
+
+    int kind() { return ELEM_TABPANE; }
+    void collectFocusables(list<string>* keys)
+    {
+        for (Element c in this.children) c.collectFocusables(keys);
+    }
+    bool propsEqual(Element other)
+    {
+        TabPane* o = other as TabPane;
+        return o != nullptr && this.title == o.title;
+    }
+    list<Element>* childList() { return &this.children; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// ── TabControl: keyed child panes with lazy inactive tabs (P9) ────────────────
+// A native SysTabControl32 header strip (WC_TABCONTROL) plus one active pane whose
+// content maps to native controls; inactive panes are NOT walked into native (so a
+// per-tab editor buffer must live in the app model, not an inactive native control).
+// Controlled: `selectedTab` flows down, a header click fires onSelectTab(index).
+class TabControl : Element
+{
+    list<Element> children = default;   // TabPane*
+    int selectedTab = 0;                 // controlled active pane index
+    Lambda<void(int)> onSelectTab = default;
+    int width = 40;
+    int height = 10;
+    bool disabled = false;
+    string tooltip = default;
+    Rect bounds = default;
+    string key = default;
+
+    void add(Element child) { this.children.add(child); }
+    void addPane(TabPane* p) { this.children.add(p); }
+
+    string _title(int i)
+    {
+        if (i < 0 || i >= this.children.count()) return "";
+        Element c = this.children.get(i);
+        TabPane* p = c as TabPane;
+        if (p == nullptr) return "";
+        return "" + p.title;
+    }
+
+    Size layout(LayoutConstraints c)
+    {
+        int w = this.width;  if (w > c.availW && c.availW > 0) w = c.availW;
+        if (w < 6) w = 6;
+        int h = this.height; if (h < 3) h = 3;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        this.bounds = b;
+        int hdr = 2;   // the tab header strip reserves two rows
+        int i = 0;
+        for (Element child in this.children)
+        {
+            LayoutConstraints cc = default;
+            if (i == this.selectedTab)
+            {
+                cc.x = c.x + 1; cc.y = c.y + hdr;
+                cc.availW = w - 2; cc.availH = h - hdr - 1;
+            }
+            else
+            {
+                cc.x = c.x; cc.y = c.y; cc.availW = 0; cc.availH = 0;   // inactive: zero-area
+            }
+            child.layout(cc);
+            i++;
+        }
+        Size s = default; s.w = w; s.h = h;
+        return s;
+    }
+
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        int bg = pickColor(0, ctx.theme.panelBg);
+        if (bg != 0) cv.drawRect(this.bounds, true, bg);
+        cv.drawRect(this.bounds, false, pickColor(0, ctx.theme.panelBorder));
+        int ink = pickColor(0, ctx.theme.textColor);
+        string hdr = "";
+        int i = 0;
+        while (i < this.children.count())
+        {
+            if (i > 0) hdr = hdr + " ";
+            string t = this._title(i);
+            if (i == this.selectedTab) hdr = hdr + "[" + t + "]";
+            else hdr = hdr + " " + t + " ";
+            i++;
+        }
+        cv.drawText(this.bounds.x + 1, this.bounds.y, hdr.data(), ink);
+        if (this.selectedTab >= 0 && this.selectedTab < this.children.count())
+            this.children.get(this.selectedTab).paint(cv, ctx);
+    }
+
+    bool dispatch(Event e, UiContext* ctx)
+    {
+        if (this.disabled) return false;
+        if (e.kind == EV_MOUSE_DOWN && e.y == this.bounds.y && this.bounds.contains(e.x, e.y))
+        {
+            int rel = e.x - (this.bounds.x + 1);
+            int cx = 0; int i = 0;
+            while (i < this.children.count())
+            {
+                string t = this._title(i);
+                int seg = (int)t.length() + 2 + 1;   // "[t]" plus a gap
+                if (rel >= cx && rel < cx + seg) { this.onSelectTab(i); return true; }
+                cx = cx + seg; i++;
+            }
+            return true;
+        }
+        if (this.selectedTab >= 0 && this.selectedTab < this.children.count())
+            return this.children.get(this.selectedTab).dispatch(e, ctx);
+        return false;
+    }
+
+    move string toJson()
+    {
+        string out = "{\"type\":\"TabControl\",\"selectedTab\":" + this.selectedTab.toString()
+                   + ",\"children\":[";
+        int i = 0;
+        for (Element c in this.children) { if (i > 0) out = out + ","; out = out + c.toJson(); i++; }
+        out = out + "]}";
+        return out;
+    }
+
+    void destroyTree()
+    {
+        for (Element c in this.children) { c.destroyTree(); delete c; }
+        this.children.clear();
+    }
+
+    int kind() { return ELEM_TABS; }
+    void collectFocusables(list<string>* keys)
+    {
+        if (this.selectedTab >= 0 && this.selectedTab < this.children.count())
+            this.children.get(this.selectedTab).collectFocusables(keys);
+    }
+    bool propsEqual(Element other)
+    {
+        TabControl* o = other as TabControl;
+        return o != nullptr && this.selectedTab == o.selectedTab
+            && this.children.count() == o.children.count();
+    }
+    list<Element>* childList() { return &this.children; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// ── TreeView: an expand-on-demand tree (P9) ───────────────────────────────────
+// The node source is a set of callbacks keyed by an integer nodeId (the app's own
+// ids), so the tree is virtualized: children(nodeId) is queried only when a node is
+// expanded. childCount(TREE_ROOT) gives the top-level nodes; childId(nodeId, i) the
+// i-th child's id; label(nodeId) its text. Controlled selection is `selectedNode`;
+// onSelect(nodeId) fires on a selection change, onExpand(nodeId) on expand. Native =
+// WC_TREEVIEW (SysTreeView32); the Canvas fallback renders the top-level nodes.
+const int TREE_ROOT = 0 - 1;   // virtual root nodeId; its children are the top-level nodes
+
+class TreeView : Element
+{
+    Lambda<int(int)>     childCount = default;   // nodeId -> number of children
+    Lambda<int(int,int)> childId    = default;   // (nodeId, i) -> child nodeId
+    Lambda<string(int)>  label      = default;   // nodeId -> display text
+    int selectedNode = 0 - 1;                      // controlled selection (nodeId; -1 = none)
+    Lambda<void(int)> onSelect = default;
+    Lambda<void(int)> onExpand = default;
+    int width = 24;
+    int height = 10;
+    bool disabled = false;
+    string tooltip = default;
+    Rect bounds = default;
+    string key = default;
+
+    move string toJson()
+    {
+        return "{\"type\":\"TreeView\",\"selectedNode\":" + this.selectedNode.toString() + "}";
+    }
+
+    Size layout(LayoutConstraints c)
+    {
+        int w = this.width;  if (w > c.availW && c.availW > 0) w = c.availW;
+        if (w < 4) w = 4;
+        int h = this.height; if (h < 3) h = 3;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        this.bounds = b;
+        Size s = default; s.w = w; s.h = h;
+        return s;
+    }
+
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        int bg = pickColor(0, ctx.theme.inputBg);
+        if (bg != 0) cv.drawRect(this.bounds, true, bg);
+        cv.drawRect(this.bounds, false, pickColor(0, ctx.theme.panelBorder));
+        int ink = pickColor(0, ctx.theme.textColor);
+        int n = this.childCount(TREE_ROOT);
+        int visible = this.bounds.h - 1;
+        int r = 0;
+        while (r < n && r < visible)
+        {
+            int nid = this.childId(TREE_ROOT, r);
+            string mark = this.childCount(nid) > 0 ? "+ " : "  ";
+            string line = mark + this.label(nid);
+            if (nid == this.selectedNode) line = ">" + line;
+            cv.drawText(this.bounds.x + 1, this.bounds.y + 1 + r, line.data(), ink);
+            r++;
+        }
+    }
+
+    bool dispatch(Event e, UiContext* ctx)
+    {
+        if (this.disabled) return false;
+        if (e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y))
+        {
+            ctx.focus(this.key);
+            int r = e.y - (this.bounds.y + 1);
+            int n = this.childCount(TREE_ROOT);
+            if (r >= 0 && r < n) { int nid = this.childId(TREE_ROOT, r); this.onSelect(nid); }
+            return true;
+        }
+        return false;
+    }
+
+    void destroyTree() { }
+    int kind() { return ELEM_TREE; }
+    void collectFocusables(list<string>* keys)
+    {
+        if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
+    }
+    bool propsEqual(Element other)
+    {
+        TreeView* o = other as TreeView;
+        return o != nullptr && this.selectedNode == o.selectedNode && this.disabled == o.disabled;
+    }
+    list<Element>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// ── SplitView: two weighted panes + a draggable divider (P9) ──────────────────
+// A pure layout container (not itself a native control): it splits the available
+// space between exactly two child panes by `ratio` (the first pane's percentage
+// along the split axis), reserving a 1-DIP divider gutter between them. `vertical`
+// true = side-by-side (a vertical divider), false = stacked. Dragging the divider
+// fires onRatioChange(newRatio) - the app owns the ratio (controlled), the host hit-
+// tests the gutter. The Canvas fallback draws the two panes and the divider line.
+const int SPLIT_DIVIDER = 1;   // DIP thickness of the divider gutter
+
+class SplitView : Element
+{
+    list<Element> children = default;   // exactly two panes
+    int   ratio    = 50;                 // first pane's percentage of the split axis (5..95)
+    bool  vertical = true;               // true = side-by-side, false = stacked
+    Lambda<void(int)> onRatioChange = default;
+    Style style    = default;
+    Rect  bounds   = default;
+    Rect  dividerBounds = default;       // the draggable gutter (host hit-test target)
+    string key     = default;
+
+    void add(Element child) { this.children.add(child); }
+
+    int _clampRatio(int v) { if (v < 5) return 5; if (v > 95) return 95; return v; }
+
+    Size layout(LayoutConstraints c)
+    {
+        int w = c.availW; if (this.style.width > 0) w = this.style.width;
+        int h = this.style.height > 0 ? this.style.height : c.availH;
+        if (h >= LAYOUT_UNBOUNDED) h = 1;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        this.bounds = b;
+        int rt = this._clampRatio(this.ratio);
+        if (this.vertical)
+        {
+            int firstW = (w - SPLIT_DIVIDER) * rt / 100;
+            if (this.children.count() > 0)
+            {
+                LayoutConstraints cc = default;
+                cc.x = c.x; cc.y = c.y; cc.availW = firstW; cc.availH = h;
+                this.children.get(0).layout(cc);
+            }
+            Rect d = default; d.x = c.x + firstW; d.y = c.y; d.w = SPLIT_DIVIDER; d.h = h;
+            this.dividerBounds = d;
+            if (this.children.count() > 1)
+            {
+                LayoutConstraints cc = default;
+                cc.x = c.x + firstW + SPLIT_DIVIDER; cc.y = c.y;
+                cc.availW = w - firstW - SPLIT_DIVIDER; cc.availH = h;
+                this.children.get(1).layout(cc);
+            }
+        }
+        else
+        {
+            int firstH = (h - SPLIT_DIVIDER) * rt / 100;
+            if (this.children.count() > 0)
+            {
+                LayoutConstraints cc = default;
+                cc.x = c.x; cc.y = c.y; cc.availW = w; cc.availH = firstH;
+                this.children.get(0).layout(cc);
+            }
+            Rect d = default; d.x = c.x; d.y = c.y + firstH; d.w = w; d.h = SPLIT_DIVIDER;
+            this.dividerBounds = d;
+            if (this.children.count() > 1)
+            {
+                LayoutConstraints cc = default;
+                cc.x = c.x; cc.y = c.y + firstH + SPLIT_DIVIDER;
+                cc.availW = w; cc.availH = h - firstH - SPLIT_DIVIDER;
+                this.children.get(1).layout(cc);
+            }
+        }
+        Size s = default; s.w = w; s.h = h;
+        return s;
+    }
+
+    // Map a pointer position along the split axis to a ratio (clamped 5..95).
+    int _ratioAt(int px, int py)
+    {
+        if (this.vertical)
+        {
+            if (this.bounds.w <= 1) return this.ratio;
+            return this._clampRatio((px - this.bounds.x) * 100 / this.bounds.w);
+        }
+        if (this.bounds.h <= 1) return this.ratio;
+        return this._clampRatio((py - this.bounds.y) * 100 / this.bounds.h);
+    }
+
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        for (Element c in this.children) c.paint(cv, ctx);
+        cv.drawRect(this.dividerBounds, true, pickColor(this.style.color, ctx.theme.panelBorder));
+    }
+
+    bool dispatch(Event e, UiContext* ctx)
+    {
+        if (e.kind == EV_MOUSE_DOWN && this.dividerBounds.contains(e.x, e.y))
+        {
+            ctx.setPress(this.key); return true;
+        }
+        if (e.kind == EV_MOUSE_MOVE && ctx.hasPress(this.key))
+        {
+            this.onRatioChange(this._ratioAt(e.x, e.y)); return true;
+        }
+        for (Element c in this.children) { if (c.dispatch(e, ctx)) return true; }
+        return false;
+    }
+
+    move string toJson()
+    {
+        string out = "{\"type\":\"SplitView\",\"ratio\":" + this.ratio.toString()
+                   + ",\"children\":[";
+        int i = 0;
+        for (Element c in this.children) { if (i > 0) out = out + ","; out = out + c.toJson(); i++; }
+        out = out + "]}";
+        return out;
+    }
+
+    void destroyTree()
+    {
+        for (Element c in this.children) { c.destroyTree(); delete c; }
+        this.children.clear();
+    }
+
+    int kind() { return ELEM_SPLIT; }
+    void collectFocusables(list<string>* keys)
+    {
+        for (Element c in this.children) c.collectFocusables(keys);
+    }
+    bool propsEqual(Element other)
+    {
+        SplitView* o = other as SplitView;
+        return o != nullptr && this.ratio == o.ratio && this.vertical == o.vertical
+            && styleEquals(this.style, o.style);
+    }
+    list<Element>* childList() { return &this.children; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// Copy controlled CONTAINER scalars from a wip node onto the retained committed node
+// during reconcile (P9). Only the containers whose native host layout reads a scalar
+// need this - see the call in reconcilePath. Both args are named borrows (safe `as`).
+void adoptContainerProps(Element committed, Element wip)
+{
+    int k = committed.kind();
+    if (k == ELEM_TABS)
+    {
+        TabControl* a = committed as TabControl;
+        TabControl* b = wip as TabControl;
+        if (a != nullptr && b != nullptr) a.selectedTab = b.selectedTab;
+    }
+    else if (k == ELEM_SPLIT)
+    {
+        SplitView* a = committed as SplitView;
+        SplitView* b = wip as SplitView;
+        if (a != nullptr && b != nullptr) { a.ratio = b.ratio; a.vertical = b.vertical; }
+    }
+}
+
+// ── TreeView node-source boxing (the setListOp seam carries an opaque u64) ──────
+// The native host must call back into the tree's childCount/childId/label closures
+// when the OS asks to expand a node (TVN_ITEMEXPANDING) or reports selection. Lambdas
+// cannot cross the NativeHost interface (monomorphizer limit - same as ctx.post /
+// ListRowBox), so ui.cb heap-boxes the three closures and the seam carries the box as
+// a u64. The host invokes them through __uiTree* and frees via __uiFreeTreeBox.
+class TreeBox
+{
+    Lambda<int(int)>     childCount = default;
+    Lambda<int(int,int)> childId    = default;
+    Lambda<string(int)>  label      = default;
+};
+
+TreeBox* _boxTree(Lambda<int(int)> cc, Lambda<int(int,int)> ci, Lambda<string(int)> lb)
+{
+    TreeBox* b = new TreeBox();
+    b.childCount = cc; b.childId = ci; b.label = lb;   // clone-in (lambdas clone-by-default)
+    return b;
+}
+
+int __uiTreeChildCount(u64 boxPtr, int nodeId)
+{
+    if (boxPtr == 0u) return 0;
+    TreeBox* b = (TreeBox*)boxPtr;
+    return b.childCount(nodeId);
+}
+
+int __uiTreeChildId(u64 boxPtr, int nodeId, int i)
+{
+    if (boxPtr == 0u) return 0;
+    TreeBox* b = (TreeBox*)boxPtr;
+    return b.childId(nodeId, i);
+}
+
+move string __uiTreeLabel(u64 boxPtr, int nodeId)
+{
+    if (boxPtr == 0u) return "";
+    TreeBox* b = (TreeBox*)boxPtr;
+    return b.label(nodeId);
+}
+
+void __uiFreeTreeBox(u64 boxPtr)
+{
+    if (boxPtr == 0u) return;
+    TreeBox* b = (TreeBox*)boxPtr;
+    delete b;
+}
+
+// Free a boxed ContextMenu (host-owned; registered by key via nativeSetContextMenu,
+// freed on window teardown). Mirrors __uiFreeListRowBox / __uiFreeTreeBox.
+void __uiFreeContextMenu(u64 menuPtr)
+{
+    if (menuPtr == 0u) return;
+    ContextMenu* m = (ContextMenu*)menuPtr;
+    delete m;
+}
+
+// ── P9 element factories (thin field-setters; sugar-ready fields elsewhere) ────
+TabPane* tabPane(string title)
+{
+    TabPane* p = new TabPane();
+    p.title = title;
+    return p;
+}
+
+TabControl* tabControl(int selectedTab, Lambda<void(int)> onSelectTab)
+{
+    TabControl* t = new TabControl();
+    t.selectedTab = selectedTab;
+    t.onSelectTab = onSelectTab;
+    return t;
+}
+
+// A tree with its node source. onSelect/onExpand default to no-ops so the native host
+// never invokes an unset closure; the app overrides them.
+TreeView* treeView(Lambda<int(int)> childCount, Lambda<int(int,int)> childId, Lambda<string(int)> label)
+{
+    TreeView* t = new TreeView();
+    t.childCount = childCount;
+    t.childId = childId;
+    t.label = label;
+    t.onSelect = (int nid) => { };
+    t.onExpand = (int nid) => { };
+    return t;
+}
+
+SplitView* splitView(int ratio, bool vertical)
+{
+    SplitView* s = new SplitView();
+    s.ratio = ratio;
+    s.vertical = vertical;
+    return s;
+}
+
+// A toolbar is a styled row of Buttons - no new native control (P9). This factory is
+// the documented pattern: a DIR_ROW View with a small gap. Icons arrive with Image (P10).
+View* toolbar()
+{
+    View* v = new View();
+    v.style.flexDirection = DIR_ROW;
+    v.style.gap = 1;
+    return v;
+}
+
+// ── Image: a bitmap leaf (P10) ────────────────────────────────────────────────
+// Displays a 32-bit BGRA image. The pixel source is toolkit-neutral: the app hands
+// down a BORROWED top-down BGRA32 buffer (`pixels` + `pxW`/`pxH`) that the native host
+// uploads through the setImageData seam (an HBITMAP + STM_SETIMAGE on Win32). The app
+// owns the buffer (a component field / global freed on teardown), so the element never
+// owns pixel memory - it just points at it, like the borrowed `tooltip`/`source`
+// string literals. Alternatively `source` names a .bmp file the host decodes directly.
+// A Canvas host has no bitmap surface, so it falls back to a bordered placeholder box
+// with the `altText` centered.
+class Image : Element
+{
+    u64    pixels  = 0u;         // borrowed top-down BGRA32 buffer (app-owned); 0 = none
+    int    pxW     = 0;          // source pixel width
+    int    pxH     = 0;          // source pixel height
+    int    width   = 8;          // layout width (DIP)
+    int    height  = 4;          // layout height (DIP)
+    string source  = default;    // optional .bmp file path (host-decoded); use a literal
+    string altText = default;    // placeholder / accessibility text; use a literal
+    string tooltip = default;    // native hover tooltip; "" = none
+    Rect   bounds = default;
+    string key    = default;
+
+    move string toJson()
+    {
+        return "{\"type\":\"Image\",\"pxW\":" + this.pxW.toString()
+             + ",\"pxH\":" + this.pxH.toString() + "}";
+    }
+
+    Size layout(LayoutConstraints c)
+    {
+        int w = this.width;  if (w < 1) w = 1;
+        int h = this.height; if (h < 1) h = 1;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        this.bounds = b;
+        Size s = default; s.w = w; s.h = h;
+        return s;
+    }
+
+    // Canvas fallback: a bordered box with the alt text (a char grid has no bitmap).
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        cv.drawRect(this.bounds, false, pickColor(0, ctx.theme.panelBorder));
+        string t = this.altText.length() > 0 ? this.altText : "[img]";
+        cv.drawText(this.bounds.x + 1, this.bounds.y + this.bounds.h / 2, t.data(),
+                    pickColor(0, ctx.theme.textColor));
+    }
+
+    bool dispatch(Event e, UiContext* ctx) { return false; }
+    void destroyTree() { }
+    int kind() { return ELEM_IMAGE; }
+    void collectFocusables(list<string>* keys) { }
+    bool propsEqual(Element other)
+    {
+        Image* o = other as Image;
+        return o != nullptr && this.pixels == o.pixels && this.pxW == o.pxW
+            && this.pxH == o.pxH && this.width == o.width && this.height == o.height;
+    }
+    list<Element>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// An image bound to a borrowed BGRA32 buffer (top-down, stride = pxW*4).
+Image* image(u64 pixels, int pxW, int pxH)
+{
+    Image* im = new Image();
+    im.pixels = pixels;
+    im.pxW = pxW;
+    im.pxH = pxH;
+    return im;
+}
+
+// ── GroupBox: a titled group frame (P10) ──────────────────────────────────────
+// The classic-forms grouping frame: a border with a caption, wrapping related
+// controls. A pure sized container (like Box) whose native mapping is a BS_GROUPBOX
+// (a BUTTON that draws the frame + caption); its children position as siblings inside
+// the frame. A Canvas host draws a bordered box with the title on the top edge.
+class GroupBox : Element
+{
+    string title = default;
+    Style  style = default;
+    list<Element> children = default;
+    string tooltip = default;
+    Rect   bounds = default;
+    string key    = default;
+
+    void add(Element child) { this.children.add(child); }
+
+    Size layout(LayoutConstraints c)
+    {
+        int w = c.availW;
+        if (this.style.width > 0) w = this.style.width;
+        int h = 2;
+        if (this.style.height > 0) h = this.style.height;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        this.bounds = b;
+
+        int inset = 1 + this.style.padding;
+        int cy = c.y + inset;   // one row down for the caption + frame
+        int gi = 0;
+        for (Element child in this.children)
+        {
+            if (gi > 0) cy = cy + this.style.gap;
+            LayoutConstraints cc = default;
+            cc.x = c.x + inset; cc.y = cy;
+            cc.availW = w - 2 * inset; cc.availH = h - 2 * inset;
+            Size cs = child.layout(cc);
+            cy = cy + cs.h;
+            gi++;
+        }
+        Size sz = default; sz.w = w; sz.h = h;
+        return sz;
+    }
+
+    void paint(Canvas cv, UiContext* ctx)
+    {
+        cv.drawRect(this.bounds, false, pickColor(this.style.color, ctx.theme.panelBorder));
+        cv.drawText(this.bounds.x + 2, this.bounds.y, this.title.data(),
+                    pickColor(0, ctx.theme.textColor));
+        for (Element c in this.children) c.paint(cv, ctx);
+    }
+
+    bool dispatch(Event e, UiContext* ctx)
+    {
+        for (Element c in this.children) { if (c.dispatch(e, ctx)) return true; }
+        return false;
+    }
+
+    move string toJson()
+    {
+        string out = "{\"type\":\"GroupBox\",\"title\":\"" + this.title + "\",\"children\":[";
+        int i = 0;
+        for (Element c in this.children) { if (i > 0) out = out + ","; out = out + c.toJson(); i++; }
+        out = out + "]}";
+        return out;
+    }
+
+    void destroyTree()
+    {
+        for (Element c in this.children) { c.destroyTree(); delete c; }
+        this.children.clear();
+    }
+
+    int kind() { return ELEM_GROUPBOX; }
+    void collectFocusables(list<string>* keys)
+    {
+        for (Element c in this.children) c.collectFocusables(keys);
+    }
+    bool propsEqual(Element other)
+    {
+        GroupBox* o = other as GroupBox;
+        return o != nullptr && this.title == o.title && styleEquals(this.style, o.style);
+    }
+    list<Element>* childList() { return &this.children; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// A titled group frame sized to style.width x style.height (add children with .add()).
+GroupBox* groupBox(string title, Style style)
+{
+    GroupBox* g = new GroupBox();
+    g.title = title;
+    g.style = style;
+    return g;
+}
+
+// ── CanvasView: the app-painted escape hatch (P10) ────────────────────────────
+// Hosts a child surface the app draws with the SAME Canvas API the framework paints
+// through. `onPaint(Canvas)` receives a Canvas whose cell origin is the view's top-left;
+// the app draws text/rects freely. This closes the "the framework cannot do X" gap: any
+// custom widget (a chart, a game board) is a CanvasView with a paint closure. On a native
+// host the view maps to a GDI-backed child window that invokes the boxed closure on
+// WM_PAINT (see the CanvasBox seam below); on a Canvas host, paint() delegates straight
+// to onPaint with the host's own Canvas.
+class CanvasView : Element
+{
+    Lambda<void(Canvas)> onPaint = default;
+    int    width   = 20;         // layout width (DIP)
+    int    height  = 8;          // layout height (DIP)
+    string tooltip = default;
+    Rect   bounds = default;
+    string key    = default;
+
+    move string toJson() { return "{\"type\":\"CanvasView\"}"; }
+
+    Size layout(LayoutConstraints c)
+    {
+        int w = this.width;  if (w > c.availW && c.availW > 0) w = c.availW;
+        if (w < 1) w = 1;
+        int h = this.height; if (h < 1) h = 1;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        this.bounds = b;
+        Size s = default; s.w = w; s.h = h;
+        return s;
+    }
+
+    // Canvas fallback: the host IS a Canvas, so delegate straight to the app's painter.
+    void paint(Canvas cv, UiContext* ctx) { this.onPaint(cv); }
+
+    bool dispatch(Event e, UiContext* ctx) { return false; }
+    void destroyTree() { }
+    int kind() { return ELEM_CANVAS; }
+    void collectFocusables(list<string>* keys) { }
+    bool propsEqual(Element other) { CanvasView* o = other as CanvasView; return o != nullptr; }
+    list<Element>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// A canvas view driven by an onPaint(Canvas) closure.
+CanvasView* canvasView(Lambda<void(Canvas)> onPaint)
+{
+    CanvasView* c = new CanvasView();
+    c.onPaint = onPaint;
+    return c;
+}
+
+// ── CanvasView paint-callback boxing (the seam carries an opaque u64) ──────────
+// The native host must invoke the app's onPaint(Canvas) closure when the OS asks the
+// child window to repaint (WM_PAINT). A Lambda cannot cross the NativeHost interface
+// (monomorphizer limit - same as ctx.post / ListRowBox / TreeBox), so ui.cb heap-boxes
+// the closure and the seam carries the box as a u64. The host constructs its own Canvas
+// (a GDI-backed one) and invokes the box through __uiCanvasPaint; it frees the box via
+// __uiFreeCanvasBox when the control is destroyed.
+class CanvasBox { Lambda<void(Canvas)> paint = default; };
+
+CanvasBox* _boxCanvas(Lambda<void(Canvas)> p)
+{
+    CanvasBox* b = new CanvasBox();
+    b.paint = p;   // clone-in (lambdas clone-by-default)
+    return b;
+}
+
+void __uiCanvasPaint(u64 boxPtr, Canvas c)
+{
+    if (boxPtr == 0u) return;
+    CanvasBox* b = (CanvasBox*)boxPtr;
+    b.paint(c);
+}
+
+void __uiFreeCanvasBox(u64 boxPtr)
+{
+    if (boxPtr == 0u) return;
+    CanvasBox* b = (CanvasBox*)boxPtr;
+    delete b;
+}
+
 // Move focus to the next (or previous, when backward) focusable node in tree
 // order, wrapping around. Built fresh from the live tree each time, so it tracks
 // keyed identity across re-renders. The host calls this on Tab / Shift-Tab.
@@ -1929,6 +3404,12 @@ move Element reconcilePath(move Element committed, move Element wip, list<Patch>
     // Same type, container: reconcile children by key (or position when unkeyed).
     list<Element>* newKids = wip.childList();
     int newN = newKids.count();
+
+    // Controlled CONTAINER props (P9): reconcile keeps the committed container node and
+    // frees the wip, so a controlled scalar authored on the wip (tab selection / split
+    // ratio) would be lost. Copy those forward for the containers whose host layout reads
+    // them - the leaf-prop RadioGroup pattern does not apply since these drive geometry.
+    adoptContainerProps(committed, wip);
 
     // Drain committed's children into a staging list so we can rebuild in order.
     list<Element> staged = default;

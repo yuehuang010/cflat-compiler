@@ -64,6 +64,7 @@ class NativeSettings : Component
         Button* save = button("Save", () => { this.clicks = this.clicks + 1; ctx.invalidate(); });
         save.setKey("save");
         save.disabled = !this.autoSave;
+        save.tooltip = "Save these settings";   // P7: native hover tooltip
         root.add(save);
 
         // Status echoes both the click count and the name, so the self-test can
@@ -91,22 +92,22 @@ bool _txtEq(void* h, const char* want)
 
 int nativeSelfTest()
 {
-    createNativeWindow("selftest", false);   // hidden top-level; sets host globals
-    _nW = 44; _nH = 26;
+    // P7: a Window owns the app + tree + context (no host globals). createAppWindow
+    // registers it, installs the ctx.post hooks, and leaves it active; we reach it via
+    // curWin()/activeCtx() (never a Window* local, which would auto-free at scope exit).
+    int wi = createAppWindow(new NativeSettings(), "selftest", false);   // hidden
+    curWin().w = 44; curWin().h = 26;
+    buildWindowTree(wi);
 
-    NativeSettings* app = new NativeSettings();
-    _nApp = app;                 // heap component: the pointer moves in cleanly
-    buildNativeTree();
-
-    void* win  = _nHost.window;
-    void* hTtl  = u2h(_nCtx.nativeHandle("root/title"));
-    void* hName = u2h(_nCtx.nativeHandle("root/name"));
-    void* hDark = u2h(_nCtx.nativeHandle("root/dark"));
-    void* hAuto = u2h(_nCtx.nativeHandle("root/auto"));
-    void* hVol  = u2h(_nCtx.nativeHandle("root/vol"));
-    void* hPb   = u2h(_nCtx.nativeHandle("root/pb"));
-    void* hSave = u2h(_nCtx.nativeHandle("root/save"));
-    void* hStat = u2h(_nCtx.nativeHandle("root/status"));
+    void* win  = curWin().hwnd;
+    void* hTtl  = u2h(activeCtx().nativeHandle("root/title"));
+    void* hName = u2h(activeCtx().nativeHandle("root/name"));
+    void* hDark = u2h(activeCtx().nativeHandle("root/dark"));
+    void* hAuto = u2h(activeCtx().nativeHandle("root/auto"));
+    void* hVol  = u2h(activeCtx().nativeHandle("root/vol"));
+    void* hPb   = u2h(activeCtx().nativeHandle("root/pb"));
+    void* hSave = u2h(activeCtx().nativeHandle("root/save"));
+    void* hStat = u2h(activeCtx().nativeHandle("root/status"));
 
     int pass = 0; int total = 0;
 
@@ -133,8 +134,8 @@ int nativeSelfTest()
     total++;
     SendMessageA(hDark, (u32)BM_CLICK, 0u, (i64)0);
     bool darkOn = (int)SendMessageA(hDark, (u32)BM_GETCHECK, 0u, (i64)0) == 1
-        && _nHost.dark;   // P2: the host applied the dark theme (titlebar + colors)
-    if (darkOn) pass++; else printf("  FAIL: dark toggle (host.dark=%d)\n", (int)_nHost.dark);
+        && curWin().dark;   // P2: the host applied the dark theme (titlebar + colors)
+    if (darkOn) pass++; else printf("  FAIL: dark toggle (host.dark=%d)\n", (int)curWin().dark);
 
     // 4. Click "Auto-save": enabling it must ENABLE the Save button on the next
     //    render (disabled = !autoSave), proving a re-render re-synced a prop.
@@ -166,23 +167,21 @@ int nativeSelfTest()
     bool slid = pbPos == 70;
     if (slid) pass++; else printf("  FAIL: slider drag (pbPos=%d)\n", pbPos);
 
-    // Teardown: destroy the window (cascades to child controls), free the tree and
-    // the heap component, and clear the host globals so --heap-audit sees no residue.
-    if (_nReady) { deleteTree(_nTree); _nReady = false; }
-    DestroyWindow(win);
-    delete _nApp;
-    _nApp = nullptr;
-    _nHost.window = nullptr;
-    // Free the global container backings (clear() keeps capacity; move each into a
-    // scoped local whose destructor releases the storage, so --heap-audit is clean).
-    { dictionary<string, u64> d = move _nCtx.nativeByKey; }
-    { list<string> lk = move _nHost.liveKeys; }
-    { list<u64> lh = move _nHost.liveHandles; }
-    _nCtx.blur();
+    // 8. Tooltip (P7): the Save button declared a `tooltip`, so the window's tooltip
+    //    control exists and holds at least one registered tool.
+    total++;
+    int tools = 0;
+    if (curWin().tooltip != nullptr)
+        tools = (int)SendMessageA(curWin().tooltip, (u32)TTM_GETTOOLCOUNT, 0u, (i64)0);
+    if (tools > 0) pass++; else printf("  FAIL: tooltip not registered (tools=%d)\n", tools);
+
+    // Teardown: destroy the window (cascades to child controls) and free all Window +
+    // context state so --heap-audit sees no residue.
+    nativeTeardownForTest();
 
     if (pass == total)
     {
-        printf("PASS: native host self-test %d/%d (create, checkbox, enable, click, edit, slider)\n", pass, total);
+        printf("PASS: native host self-test %d/%d (create, checkbox, enable, click, edit, slider, tooltip)\n", pass, total);
         return 0;
     }
     printf("FAIL: native host self-test %d/%d\n", pass, total);

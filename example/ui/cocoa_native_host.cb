@@ -82,7 +82,33 @@ bool nativeMappable(int kind)
 {
     return kind == ELEM_BUTTON || kind == ELEM_TEXT || kind == ELEM_TEXTINPUT
         || kind == ELEM_CHECKBOX || kind == ELEM_PROGRESS || kind == ELEM_SLIDER
-        || kind == ELEM_BOX || kind == ELEM_TEXTAREA;
+        || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_STATUSBAR
+        || kind == ELEM_RADIO || kind == ELEM_COMBO || kind == ELEM_LIST
+        || kind == ELEM_TABS || kind == ELEM_TREE
+        || kind == ELEM_IMAGE || kind == ELEM_GROUPBOX || kind == ELEM_CANVAS;
+}
+
+// The concrete tooltip text a mappable node carries ("" = none), read via downcast
+// (mirror of the Win32 host); every mappable class exposes a `tooltip` field.
+string tooltipOf(Element node)
+{
+    int k = node.kind();
+    if (k == ELEM_BUTTON)    { Button* b = node as Button; return "" + b.tooltip; }
+    if (k == ELEM_TEXT)      { Text* t = node as Text; return "" + t.tooltip; }
+    if (k == ELEM_TEXTINPUT) { TextInput* t = node as TextInput; return "" + t.tooltip; }
+    if (k == ELEM_CHECKBOX)  { Checkbox* c = node as Checkbox; return "" + c.tooltip; }
+    if (k == ELEM_PROGRESS)  { ProgressBar* p = node as ProgressBar; return "" + p.tooltip; }
+    if (k == ELEM_SLIDER)    { Slider* s = node as Slider; return "" + s.tooltip; }
+    if (k == ELEM_TEXTAREA)  { TextArea* a = node as TextArea; return "" + a.tooltip; }
+    if (k == ELEM_RADIO)     { RadioButton* r = node as RadioButton; return "" + r.tooltip; }
+    if (k == ELEM_COMBO)     { ComboBox* c = node as ComboBox; return "" + c.tooltip; }
+    if (k == ELEM_LIST)      { ListView* l = node as ListView; return "" + l.tooltip; }
+    if (k == ELEM_TABS)      { TabControl* t = node as TabControl; return "" + t.tooltip; }
+    if (k == ELEM_TREE)      { TreeView* t = node as TreeView; return "" + t.tooltip; }
+    if (k == ELEM_IMAGE)     { Image* im = node as Image; return "" + im.tooltip; }
+    if (k == ELEM_GROUPBOX)  { GroupBox* g = node as GroupBox; return "" + g.tooltip; }
+    if (k == ELEM_CANVAS)    { CanvasView* c = node as CanvasView; return "" + c.tooltip; }
+    return "";
 }
 
 // An NSString for `s`, safe for an empty cflat string (whose data() can be null):
@@ -200,6 +226,67 @@ class CocoaHost : NativeHost
             msg1(scroll, "setDocumentView:", tv);
             ctrl = scroll;
         }
+        else if (elemKind == ELEM_STATUSBAR)
+        {
+            // A read-only text strip stands in for the status bar (P7); macOS has no
+            // NSStatusBar equivalent for an in-window strip, so we use an NSTextField.
+            ctrl = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgBool(ctrl, "setBezeled:", false);
+            msgBool(ctrl, "setDrawsBackground:", false);
+            msgBool(ctrl, "setEditable:", false);
+            msgBool(ctrl, "setSelectable:", false);
+        }
+        else if (elemKind == ELEM_RADIO)
+        {
+            // P11: real NSButton radio + WS_GROUP-equivalent grouping is deferred; a
+            // switch-style button keeps the control set compiling + roughly usable.
+            ctrl = msgRect(msg0(cls("NSButton"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgInt(ctrl, "setButtonType:", 4);            // NSButtonTypeRadio
+            msg1(ctrl, "setTarget:", this.target);
+            msg1(ctrl, "setAction:", sel("onAction:"));
+        }
+        else if (elemKind == ELEM_COMBO)
+        {
+            // P11: NSPopUpButton item population + selection wiring is deferred.
+            ctrl = msgRect(msg0(cls("NSPopUpButton"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msg1(ctrl, "setTarget:", this.target);
+            msg1(ctrl, "setAction:", sel("onAction:"));
+        }
+        else if (elemKind == ELEM_LIST)
+        {
+            // P11: real NSTableView (dataSource-virtualized, mapping the setListOp
+            // protocol) is deferred; a placeholder text field keeps the seam compiling.
+            ctrl = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgBool(ctrl, "setEditable:", false);
+        }
+        else if (elemKind == ELEM_TABS)
+        {
+            // P11: real (tabless) NSTabView / segmented control is deferred; a placeholder
+            // text field keeps the seam compiling. The active pane's controls still map.
+            ctrl = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgBool(ctrl, "setEditable:", false);
+        }
+        else if (elemKind == ELEM_TREE)
+        {
+            // P11: real NSOutlineView (dataSource-virtualized) is deferred; placeholder.
+            ctrl = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgBool(ctrl, "setEditable:", false);
+        }
+        else if (elemKind == ELEM_IMAGE)
+        {
+            // P11: real NSImageView (setImageData -> NSImage from the BGRA bytes) deferred.
+            ctrl = msgRect(msg0(cls("NSImageView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+        }
+        else if (elemKind == ELEM_GROUPBOX)
+        {
+            // P11: real titled NSBox deferred; a plain NSBox keeps the seam compiling.
+            ctrl = msgRect(msg0(cls("NSBox"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+        }
+        else if (elemKind == ELEM_CANVAS)
+        {
+            // P11: a CGContext-backed custom NSView is deferred; a plain view placeholder.
+            ctrl = msgRect(msg0(cls("NSView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+        }
         else
         {
             ctrl = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
@@ -310,6 +397,21 @@ class CocoaHost : NativeHost
     // Native default look (theme is applied to the window chrome in applyTheme).
     void setAccent(u64 h, int fgColor, int bgColor) { }
 
+    // P11: the ListView item-data protocol (columns/rowCount/rowText callback via
+    // NSTableView's dataSource) is deferred to the macOS parity sweep. The stub keeps
+    // the NativeHost contract satisfied so shared app code compiles on Darwin; it must
+    // still free the boxed rowText callback it is handed to avoid leaking it.
+    void setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload)
+    {
+        if (op == LISTOP_SET_ROWTEXT_CB && payload != 0u) __uiFreeListRowBox(payload);
+        else if (op == LISTOP_TREE_SET_SRC_CB && payload != 0u) __uiFreeTreeBox(payload);
+    }
+
+    // P11: the Image pixel upload (BGRA buffer -> NSImage on an NSImageView) is deferred to
+    // the macOS parity sweep; the stub keeps the NativeHost contract satisfied so shared app
+    // code compiles on Darwin. No box crosses here, so there is nothing to free.
+    void setImageData(u64 h, u64 pixels, int w, int h2, int stride) { }
+
     // Text metrics in DIPs. A length-based estimate is enough: the layout pass in
     // ui.cb never calls measureText today (the winui host uses the same stub).
     Size measureText(const char* s, int fontId, int wrapWidthDip)
@@ -408,10 +510,28 @@ class CocoaHost : NativeHost
                 }
             }
             this._syncProps(node, h);
+            string tip = tooltipOf(node);
+            if (tip.length() > 0) msg1(u2h(h), "setToolTip:", nsStr(tip.data()));
             Rect b = node.nodeBounds();
             keys.add("" + path);
             handles.add(h);
             fx.add(b.x); fy.add(b.y); fw.add(b.w); fh.add(b.h);
+        }
+
+        // A TabControl walks ONLY its active pane into native controls (lazy inactive
+        // tabs), mirroring the Win32 host.
+        if (node.kind() == ELEM_TABS)
+        {
+            TabControl* tc = node as TabControl;
+            list<Element>* panes = node.childList();
+            int sel = tc.selectedTab;
+            if (panes != nullptr && sel >= 0 && sel < panes.count())
+            {
+                Element pane = panes.get(sel);
+                string cp = joinKeyPath(path, keySegment(pane, sel));
+                this._applyNode(pane, cp, ctx, keys, handles, fx, fy, fw, fh);
+            }
+            return;
         }
 
         list<Element>* kids = node.childList();
@@ -478,6 +598,19 @@ class CocoaHost : NativeHost
             TextArea* ta = node as TextArea;
             this.setBoolProp(h, PROP_ENABLED, !ta.disabled);
         }
+        else if (k == ELEM_STATUSBAR)
+        {
+            StatusBar* sb = node as StatusBar;
+            string joined = "";
+            int i = 0;
+            while (i < sb.parts.count())
+            {
+                if (i > 0) joined = joined + "   ";
+                joined = joined + sb.parts.get(i);
+                i++;
+            }
+            this.setText(h, joined.data());
+        }
     }
 
     // The key path bound to a control this frame, or "" if none (linear scan of the
@@ -519,6 +652,32 @@ bool themeIsDark(Theme* t)
     int r = (c >> 16) & 0xFF; int g = (c >> 8) & 0xFF; int b = c & 0xFF;
     return (r + g + b) < 384;
 }
+
+// ── Host-neutral accessors (P7; mirror the Win32 host) ───────────────────────
+// macOS stays single-window in P7 - multi-window + ctx.post marshaling parity is P11
+// (see the plan). These keep the shared apps (fedit) compiling and correct on Darwin.
+// (Defined after CocoaHost so _nHost's field types are known.)
+UiContext*      activeCtx() { return &_nCtx; }
+alias Component activeApp() { return _nApp; }
+bool            hostDark()  { return _nHost.dark; }
+int hostWindowCount() { return _nApp != nullptr ? 1 : 0; }
+
+// Create a hidden window bound to `app` and build its tree (mirror of the Win32
+// startHeadlessWindow; the headless self-tests use it).
+void startHeadlessWindow(Component app, const char* title, int w, int h)
+{
+    createNativeWindow(title, false);
+    _nApp = app;
+    _nW = w; _nH = h;
+    buildNativeTree();
+}
+
+// No queued UI-thread calls on macOS yet (ctx.post runs inline; marshaling is P11).
+void hostDrainPosted() { }
+
+// macOS multi-window is P11: opening a second top-level window is not wired here yet.
+// `app` is consumed (freed at scope exit) so it does not leak.
+void openAppWindow(Component app, const char* title) { }
 
 // True if `want` is present in the key list.
 bool listHasStr(list<string>* xs, string want)
@@ -632,7 +791,22 @@ string nativeControlText(string keyPath)
         text = msg0(ctrl, "stringValue");
     }
     char* c = text != nullptr ? cStr(text) : nullptr;
-    string s = c != nullptr ? (string)c : "";   // owned copy before the pool pops
+    // Deep-copy into an owned string BEFORE the pool pops ('(string)c' would alias the
+    // autoreleased buffer, which poolPop then frees). "" + c allocates a fresh buffer.
+    string s = c != nullptr ? "" + c : "";
+    poolPop(pool);
+    return s;
+}
+
+// Read a status bar pane's text (mirror of the Win32 nativeStatusText). The macOS
+// status strip is an NSTextField, so its stringValue is the joined pane text.
+string nativeStatusText(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return "";
+    void* pool = poolPush();
+    char* c = cStr(msg0(u2h(h), "stringValue"));
+    string s = c != nullptr ? "" + c : "";
     poolPop(pool);
     return s;
 }
@@ -710,6 +884,39 @@ void nativeTestFireMenu(int cmd)
 {
     routeMenu(cmd);
 }
+
+// P11: a real per-element NSMenu popUpContextMenu is deferred to the macOS parity sweep;
+// this stub keeps shared app code compiling and frees the boxed ContextMenu it is handed
+// so nothing leaks (mirrors the setListOp box-free stub).
+void nativeSetContextMenu(string keyPath, u64 menuPtr)
+{
+    if (menuPtr != 0u) __uiFreeContextMenu(menuPtr);
+}
+
+// ── P9 host-neutral driver API (macOS stubs; NSTabView/NSOutlineView/NSSplitView
+// backends are the P11 parity sweep). These keep shared app code (the fedit P9 self-
+// test block) compiling on Darwin; the block itself is `if const (!__MACOS__)`-gated,
+// so they are never invoked on mac - but name resolution still requires them.
+void nativeFireContextMenu(string keyPath, int itemIndex) { }
+void nativeSplitterDrag(string keyPath, int dipX, int dipY) { }
+
+Rect nativeNodeBounds(string keyPath)
+{
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), keyPath);
+    if (e == nullptr) { Rect z = default; return z; }
+    return e.nodeBounds();
+}
+
+int nativeTabSelected(string keyPath) { return 0 - 1; }
+int nativeTabCount(string keyPath) { return 0; }
+void nativeTabSelect(string keyPath, int idx) { }
+
+u64 nativeTreeRootItem(string keyPath) { return 0u; }
+u64 nativeTreeChildItem(string keyPath, u64 hItem) { return 0u; }
+int nativeTreeItemCount(string keyPath) { return 0; }
+void nativeTreeExpandItem(string keyPath, u64 hItem) { }
+void nativeTreeSelectItem(string keyPath, u64 hItem) { }
+int nativeTreeItemNodeId(string keyPath, u64 hItem) { return 0 - 1; }
 
 // Close the main window (bypasses the close guard - the caller already decided).
 // -close does not fire windowShouldClose:, matching Win32 DestroyWindow.
@@ -1031,7 +1238,7 @@ string nativeOpenFile()
     void* url = msg0(panel, "URL");
     if (url == nullptr) return "";
     char* c = cStr(msg0(url, "path"));
-    return c != nullptr ? (string)c : "";
+    return c != nullptr ? "" + c : "";
 }
 
 string nativeSaveFile()
@@ -1042,7 +1249,7 @@ string nativeSaveFile()
     void* url = msg0(panel, "URL");
     if (url == nullptr) return "";
     char* c = cStr(msg0(url, "path"));
-    return c != nullptr ? (string)c : "";
+    return c != nullptr ? "" + c : "";
 }
 
 // Modal confirm with Yes/No/Cancel. Returns 1 = Yes, 0 = No, -1 = Cancel. NSAlert

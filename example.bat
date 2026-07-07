@@ -196,6 +196,35 @@ if "%~1"=="--worker-winui" (
 )
 
 REM ===========================================================================
+REM Worker mode: widget-gallery state-assert self-test (the P8 data-controls carrier).
+REM ===========================================================================
+if "%~1"=="--worker-gallery" (
+    set "RESID=%~2"
+    set "CFLAT=x64\%CONFIG%\cflat.exe"
+    set "OUTDIR=out\examples"
+    set "RESDIR=out\examples\results"
+    set "GAL_STEXE=!OUTDIR!\gallery_st.exe"
+    set "GAL_STLOG=!RESDIR!\!RESID!.log"
+
+    "!CFLAT!" "example\ui\gallery\gallery.cb" -i example/ui --heap-audit -o "!GAL_STEXE!" > "!GAL_STLOG!" 2>&1
+    if not exist "!GAL_STEXE!" (
+        echo FAIL gallery.cb ^(gallery self-test build failed^)>"!RESDIR!\!RESID!.result"
+        exit /b
+    )
+    "!GAL_STEXE!" --selftest <nul >> "!GAL_STLOG!" 2>&1
+    set GALRC=!errorlevel!
+    findstr /C:"heap-audit: LEAK" "!GAL_STLOG!" >nul 2>&1
+    if !errorlevel! equ 0 (
+        echo FAIL gallery.cb ^(heap-audit leak^)>"!RESDIR!\!RESID!.result"
+    ) else if !GALRC! neq 0 (
+        echo FAIL gallery.cb ^(gallery self-test, exit !GALRC!^)>"!RESDIR!\!RESID!.result"
+    ) else (
+        echo PASS gallery.cb ^(gallery self-test + leak-clean^)>"!RESDIR!\!RESID!.result"
+    )
+    exit /b
+)
+
+REM ===========================================================================
 REM Main: launch all example builds + self-tests in parallel, wait, collect
 REM ===========================================================================
 set CONFIG=%1
@@ -240,7 +269,7 @@ REM winui_host has no main (imported); the two winui demos need the Windows App 
 REM bootstrapper + runtime winmds and are launched via the dedicated --worker-winui below.
 REM native_host is the NativeHost import shim (no main); cocoa_native_host/cocoa_native_settings/
 REM cocoa_probe are its AppKit (Darwin) backend + probes, excluded from this Windows run.
-set EXCLUDE=test_helper ui ui_native win32host win32_native_host native_host fedit http_parser http_response http_json http_server http_client router rest_server http_io cocoa cocoa_probe cocoa_native_host cocoa_native_settings hello_objc cocoa_window sysinfo_mac winui_host winui_app_demo winui_demo
+set EXCLUDE=test_helper ui ui_native win32host win32_native_host native_host fedit gallery http_parser http_response http_json http_server http_client router rest_server http_io cocoa cocoa_probe cocoa_native_host cocoa_native_settings hello_objc cocoa_window sysinfo_mac winui_host winui_app_demo winui_demo
 
 REM Discover the newest cached Win32-metadata package dir (the one holding Windows.Win32.winmd).
 REM dir /o-n lists newest-version-first by name. Empty if the nuget package is not installed
@@ -316,6 +345,11 @@ REM Launch the fedit editor state-assert self-test (P4 flagship).
 set /a RESID+=1
 set /a LAUNCHED+=1
 start "" /b cmd /c "%SCRIPT% --worker-fedit ex_!RESID!"
+
+REM Launch the widget-gallery state-assert self-test (P8 data controls).
+set /a RESID+=1
+set /a LAUNCHED+=1
+start "" /b cmd /c "%SCRIPT% --worker-gallery ex_!RESID!"
 
 REM Launch the WinUI 3 (Windows App SDK) self-tests (P6 M2 window bring-up + M3 host),
 REM only when the pinned WindowsAppSDK NuGet packages are cached. Skipped otherwise.

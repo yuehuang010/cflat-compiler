@@ -11,7 +11,7 @@ the "sugar-compatible element contract" is what a future `<View/>` grammar sugar
 (and an eventual `core/` promotion) desugars against. Changes to the frozen
 surface are deliberate and bump the API version.
 
-- **Framework API version:** 11 (v5 added color to `Style` + `Canvas`; v6 added the
+- **Framework API version:** 15 (v5 added color to `Style` + `Canvas`; v6 added the
   `Theme` styling preference and hover/pressed/focus interaction states; v7 added the
   `Checkbox` widget, the `disabled` state, and `Style.gap`; v8 added the `ProgressBar`
   and `Slider` widgets with the `track`/`accent` theme slots; v9 added the `NativeHost`
@@ -21,7 +21,19 @@ surface are deliberate and bump the API version.
   per-monitor DPI, dark titlebar + themed controls, a declarative menu bar with
   accelerators, shell file dialogs, message boxes, and a secondary window; v11 added
   the macOS **AppKit (Cocoa)** `NativeHost` backend and the `native_host.cb` platform
-  shim, so one app source compiles to real OS controls on both Windows and macOS)
+  shim, so one app source compiles to real OS controls on both Windows and macOS;
+  v12 added the app-shell foundation - real multi-window (a `Window` class + one
+  message loop, `activeCtx()`/`activeApp()`/`openAppWindow`), `ctx.post()` thread
+  marshaling, the `StatusBar` element, and a `tooltip` prop on every mappable element;
+  v13 added the tier-1 data controls - `RadioGroup`/`RadioButton`, `ComboBox`, and a
+  virtualized `ListView` - plus the `setListOp` item-data seam call; v14 added the tier-2
+  navigation chrome - a `TabControl`/`TabPane` (keyed panes, lazy inactive tabs), a
+  `TreeView` (expand-on-demand node source), a `SplitView` (two weighted panes + a
+  draggable divider), a per-element `ContextMenu`, and a `toolbar()` pattern - reusing the
+  `setListOp` seam for the tab/tree ops; v15 completed the element set - an `Image` (BGRA32
+  pixels pushed through the new `setImageData` seam), a titled `GroupBox`, and a `CanvasView`
+  escape hatch the app paints with the `Canvas` API - plus NM_CUSTOMDRAW accent buttons and the
+  widget-gallery screenshot workflow)
 - **Location:** `example/ui/` (framework + TUI and Win32 hosts). NOT in `core/`
   yet - promotion is deferred to a later release.
 - **Status:** the framework is a single source of truth (`example/ui/ui.cb`);
@@ -88,8 +100,149 @@ Notes:
 | `ProgressBar` | `ELEM_PROGRESS` | presentational fill bar | `int value` (0..100), `int width` |
 | `Slider` | `ELEM_SLIDER` | controlled value via click/drag/arrows | `int value` (0..100), `int width`, `Lambda<void(int)> onChange`, `bool disabled` |
 | `TextArea` | `ELEM_TEXTAREA` | multiline text region (editor) | `string value` (push), `Lambda<void()> onChange` (dirty notify), `int width/height` |
+| `StatusBar` | `ELEM_STATUSBAR` | bottom strip of text panes (app shell) | `list<string> parts` (pane text) |
+| `RadioGroup` | `ELEM_RADIOGROUP` | controlled single-choice group (container) | `int value` (selected index), `onChange`, `RadioButton` children |
+| `RadioButton` | `ELEM_RADIO` | one option inside a `RadioGroup` | `string label`, `int index`, `bool checked` |
+| `ComboBox` | `ELEM_COMBO` | controlled dropdown | `list<string> items`, `int selectedIndex`, `onChange` |
+| `ListView` | `ELEM_LIST` | virtualized report-mode list | `columns`, `int rowCount`, `rowText(row,col)`, `int selectedIndex`, `onSelect`, `onActivate` |
+| `TabControl` | `ELEM_TABS` | keyed tab panes, lazy inactive tabs | `int selectedTab`, `onSelectTab`, `TabPane` children |
+| `TabPane` | `ELEM_TABPANE` | one titled pane inside a `TabControl` (container) | `string title`, `children` |
+| `TreeView` | `ELEM_TREE` | expand-on-demand tree | `childCount(nid)`, `childId(nid,i)`, `label(nid)`, `int selectedNode`, `onSelect`, `onExpand` |
+| `SplitView` | `ELEM_SPLIT` | two weighted panes + draggable divider (container) | `int ratio`, `bool vertical`, `onRatioChange`, two pane children |
+| `Image` | `ELEM_IMAGE` | bitmap leaf (BGRA32 via `setImageData`) | `u64 pixels` (borrowed top-down BGRA32), `int pxW/pxH`, `int width/height`, `string source` (.bmp), `string altText` |
+| `GroupBox` | `ELEM_GROUPBOX` | titled group frame (container) | `string title`, `Style style`, `children` |
+| `CanvasView` | `ELEM_CANVAS` | app-painted escape hatch | `Lambda<void(Canvas)> onPaint`, `int width/height` |
 | `ScrollView` | `ELEM_SCROLL` | clipped scrollable viewport | `Style style` (viewport), `children`, `int scrollY` |
 | `ComponentElement` | `ELEM_COMPONENT` | wraps a mounted component subtree | single inner child |
+
+**`tooltip` prop (v12):** every mappable element (`Text`/`Button`/`Box`/`TextInput`/
+`Checkbox`/`ProgressBar`/`Slider`/`TextArea`/`RadioButton`/`ComboBox`/`ListView`/`TabControl`/`TreeView`) carries a `string tooltip` field ("" = none).
+A native host attaches it to the OS control (Win32 `tooltips_class32`, Cocoa `setToolTip:`);
+Canvas hosts ignore it. Use a string literal (a bare `string` field does not auto-free).
+
+**`StatusBar` (v12):** an app-shell strip whose `parts` list holds one string per pane
+(`statusBar(mainText)` + `addPart(...)`). The Win32 host maps it to a real
+`msctls_statusbar32` (which self-docks at the window bottom); Cocoa uses a read-only
+`NSTextField` strip; a Canvas host draws one `" | "`-joined text row. Read a pane back
+with `nativeStatusText(keyPath)`.
+
+**Data controls (v13).** Three controlled tier-1 data controls, each with a Canvas
+fallback and a headless self-test in `example/ui/gallery/gallery.cb`:
+
+- **`RadioGroup` / `RadioButton`** - a single-choice group. `RadioGroup` is a layout
+  container (like `View`) owning `int value` (the selected index) + `onChange(index)`;
+  its `RadioButton` children each carry `label`/`index`/`checked` (controlled: seed
+  `checked` from `value`, e.g. `checked={value == i}`, or use `group.addOption(label)`
+  which wires it). Win32 maps each radio to a `BS_AUTORADIOBUTTON` (WS_GROUP on the
+  first); a click routes to the group's `onChange`. Canvas draws `(o)`/`( )` rows.
+- **`ComboBox`** - a controlled dropdown (`CBS_DROPDOWNLIST`). `int selectedIndex` +
+  `list<string> items` (add with `addItem`) + `onChange(index)`. Canvas draws
+  `[selected v]`.
+- **`ListView`** - a **virtualized** report-mode list. The item source is a callback,
+  `Lambda<string(int,int)> rowText` (row, col -> cell text), NOT a copied list, so
+  `rowCount` can be 100k+ and only the visible cells are ever queried (Win32
+  `LVS_OWNERDATA` + `LVN_GETDISPINFO`). Columns via `addColumn(title, widthDip)`;
+  controlled `selectedIndex`; `onSelect(row)` on a selection change, `onActivate(row)`
+  on double-click / Enter. Driver helpers: `nativeListSelect(keyPath, row)`,
+  `nativeListSelectedRow(keyPath)`, `nativeListCellText(keyPath, row, col)`,
+  `nativeListRowCount(keyPath)`.
+
+**`setListOp` seam (v13).** Property setters cannot express a data control's columns +
+item source, so the `NativeHost` interface gained ONE op-coded call:
+`setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload)`, with the
+`LISTOP_*` codes (RESET_COLUMNS / ADD_COLUMN / SET_ROWCOUNT / SET_ROWTEXT_CB /
+SET_SELECT_MODE / SET_SELECTION / INVALIDATE). The op set is the deliberate common
+denominator of Win32 `ListView`, macOS `NSTableView`, and WinUI `ItemsView` (see the
+design block above the method in `ui_native.cb`). The `rowText` callback rides as an
+opaque `u64` (a ui.cb `ListRowBox*`, invoked via `__uiListRowText`) so no `Lambda` type
+crosses the seam - the same constraint `ctx.post` obeys. The CocoaHost + WinUI3Host
+implement `setListOp` as stubs today (freeing the box); the real table backends land in
+the P11 host-parity sweep.
+
+**Navigation chrome (v14).** Tier-2 controls, each with a Canvas fallback and a headless
+self-test in `example/ui/gallery/gallery.cb`; `example/ui/fedit/fedit.cb` (fedit v2) is
+the flagship that composes all of them:
+
+- **`TabControl` / `TabPane`** - keyed child panes with **lazy inactive tabs**: only the
+  active pane's controls map to native (switching a tab destroys the old pane's controls
+  and creates the new pane's), so per-tab editor buffers must live in the app model, not
+  an inactive native control. Controlled `selectedTab` + `onSelectTab(index)`. Win32 maps
+  the header strip to a `WC_TABCONTROL` (`SysTabControl32`); Canvas draws a bracketed
+  header row plus the active pane. Tabs are inserted through the `setListOp` seam
+  (`LISTOP_TAB_RESET`/`ADD`/`SET_SEL`).
+- **`TreeView`** - an **expand-on-demand** tree whose node source is three callbacks keyed
+  by an integer nodeId: `childCount(nid)` / `childId(nid, i)` / `label(nid)`, with
+  `TREE_ROOT` (the virtual root) giving the top-level nodes. Children are queried only
+  when a node is expanded (Win32 `WC_TREEVIEW` + `TVN_ITEMEXPANDING`), so the tree is
+  virtualized. Controlled `selectedNode`; `onSelect(nid)` on a selection change,
+  `onExpand(nid)` on expand. The node source rides the `setListOp` seam as an opaque
+  `u64` (`TreeBox*`, `LISTOP_TREE_SET_SRC_CB`/`REBUILD`), like `ListView`'s `rowText`.
+  Driver helpers: `nativeTreeRootItem`/`nativeTreeChildItem`/`nativeTreeItemCount`/
+  `nativeTreeExpandItem`/`nativeTreeSelectItem`/`nativeTreeItemNodeId`.
+- **`SplitView`** - two panes split by `int ratio` (the first pane's percentage of the
+  split axis) with a 1-DIP divider gutter; `bool vertical` picks side-by-side vs stacked.
+  A layout container (not a native control): the layout engine learns the weighted
+  two-pane constraint. Dragging the divider fires `onRatioChange(newRatio)` (Win32 hit-
+  tests the gutter in the parent `WndProc` with `SetCapture`; `nativeSplitterDrag(keyPath,
+  dipX, dipY)` drives it headlessly). Canvas draws the two panes and the divider line.
+- **`ContextMenu`** - a per-element right-click menu reusing the P3 declarative menu model
+  (`addItem(label, cmd)` / `addSeparator()`). The app builds one (the `<ContextMenu/>`
+  sugar works) and registers it by key path with `nativeSetContextMenu(keyPath, (u64)m)`;
+  the window takes ownership. On a right-click over that control the Win32 host shows a
+  `TrackPopupMenu` and routes the chosen command through the SAME app menu handler
+  (`setMenuHandler`), like a menu-bar item. `nativeFireContextMenu(keyPath, itemIndex)`
+  routes an item headlessly.
+- **Toolbar (pattern, not a new element)** - a toolbar is a styled row of Buttons:
+  `View* toolbar()` returns a `DIR_ROW` View with a small gap; add `button(...)`s to it.
+  There is no new native control (icon support arrives with `Image` below).
+
+**Visuals + escape hatch (v15).** The last three elements complete the set, each with a Canvas
+fallback and a headless self-test in `example/ui/gallery/gallery.cb`:
+
+- **`Image`** - a bitmap leaf. Its content is a toolkit-neutral **32-bit BGRA** buffer, not a
+  Win32 `HBITMAP`: the app hands down a BORROWED top-down BGRA32 buffer (`pixels` + `pxW`/`pxH`,
+  stride `pxW*4`) that the native host uploads through the new `setImageData` seam (a top-down
+  DIB section + `STM_SETIMAGE` on Win32; a `WriteableBitmap`/`NSImage` on the other hosts, P11).
+  The app owns the buffer (a component field / global freed on teardown) - the element never
+  owns pixel memory. Alternatively `source` names a `.bmp` file the host decodes directly
+  (`LoadImage`; WIC/PNG/JPG decode is the same seam with a richer host-internal decoder,
+  deferred). Canvas hosts draw a bordered placeholder with the `altText`. Build one with
+  `image(pixels, pxW, pxH)` or `<Image .../>` + field assignment.
+- **`GroupBox`** - a titled group frame (a `BS_GROUPBOX` BUTTON on Win32; its children position
+  as siblings inside the frame). Canvas hosts draw a bordered box with the title on the top edge.
+  Build with `groupBox(title, style)` or `<GroupBox title=... />` + `.add(child)`.
+- **`CanvasView`** - the **escape hatch**. It hosts a child surface the app paints with the SAME
+  `Canvas` API the framework paints through: `onPaint(Canvas)` receives a Canvas whose cell
+  origin is the view's top-left, and the app draws text/rects freely (a chart, a game board, any
+  custom widget). On a native host the view maps to a GDI-backed child window that invokes the
+  boxed closure on `WM_PAINT`/`WM_PRINTCLIENT` (through the `CanvasBox` seam, an opaque `u64`
+  like `ListRowBox`); on a Canvas host, `paint()` delegates straight to `onPaint`. Build with
+  `canvasView(onPaint)` or `<CanvasView .../>` + `.onPaint = (Canvas c) => {...}`.
+
+**Accent buttons (v15).** A themed push button no longer stays light in dark mode. The Win32 host
+draws it via `NM_CUSTOMDRAW` (a documented API, per the look policy): a themed `Button`
+(`theme.buttonBg` set) fills with the accent color, shades on hover/press (`CDIS_HOT`/`SELECTED`),
+draws a focus ring when focused, and paints its label in `theme.buttonText`. A monochrome
+(default) theme stores no accent, so the button keeps the native look (`CDRF_DODEFAULT`) - the
+per-control accent is set through the `setAccent(h, fg, bg)` seam from `_syncProps`. Note:
+`PrintWindow` re-renders controls in their default style and does NOT route `NM_CUSTOMDRAW`, so
+the accent fill is a live-render feature (verified headlessly by the gallery's pixel-level draw
+assert), not something the screenshot workflow below captures.
+
+**Widget-gallery screenshots.** `example/ui/gallery/gallery.cb` is the full-element-set flagship
+(every element, light + dark, a 25-assert headless self-test). It doubles as the doc-screenshot
+source: `gallery.exe --shots <dir>` renders the live window into an offscreen bitmap via
+`PrintWindow(PW_RENDERFULLCONTENT)` and writes `gallery_light.bmp` + `gallery_dark.bmp` through
+`core/graphic/bitmap.cb` (the same technique `win32_shot.cb` uses for the Canvas host). The
+single-column gallery is taller than one screen, so the capture shows the top band (the classic
+forms + the `Image`/`CanvasView` visuals, placed high for this reason); the FULL element set is
+covered by `--selftest`, not the screenshot.
+
+The tab/tree ops share the ONE `setListOp` seam call rather than adding interface methods
+(`LISTOP_TAB_*` = 10-12, `LISTOP_TREE_*` = 20-21). `nativeNodeBounds(keyPath)` returns a
+node's laid-out frame (layout assertions). The Cocoa + WinUI hosts get placeholder
+controls + driver stubs for these; real `NSTabView`/`NSOutlineView`/`NSSplitView` /
+`TabView`/`TreeView` backends land in the P11 host-parity sweep.
 
 Convenience constructors return the concrete heap pointer so callers can set
 typed props, then assign into an `Element` slot:
@@ -105,6 +258,18 @@ TextInput*  textInput(string value, Lambda<void(string)> onChangeText);
 Checkbox*    checkbox(string label, bool checked, Lambda<void(bool)> onChange);
 ProgressBar* progressBar(int value, int width);
 Slider*      slider(int value, int width, Lambda<void(int)> onChange);
+StatusBar*   statusBar(string mainText);   // add more panes with .addPart(s)
+RadioGroup*  radioGroup(int value, Lambda<void(int)> onChange);  // add options with .addOption(label)
+ComboBox*    comboBox(int selectedIndex, Lambda<void(int)> onChange);  // add items with .addItem(s)
+ListView*    listView(int rowCount, Lambda<string(int,int)> rowText); // add columns with .addColumn(title, widthDip)
+TabControl*  tabControl(int selectedTab, Lambda<void(int)> onSelectTab); // add panes with .addPane(tabPane(title))
+TabPane*     tabPane(string title);
+TreeView*    treeView(Lambda<int(int)> childCount, Lambda<int(int,int)> childId, Lambda<string(int)> label);
+SplitView*   splitView(int ratio, bool vertical);   // add exactly two pane children
+View*        toolbar();                              // DIR_ROW View + gap; add button()s
+Image*       image(u64 pixels, int pxW, int pxH);    // borrowed top-down BGRA32 buffer
+GroupBox*    groupBox(string title, Style style);    // titled frame; add children with .add()
+CanvasView*  canvasView(Lambda<void(Canvas)> onPaint);   // app-painted escape hatch
 ScrollView*  scrollView(Style style);
 ```
 
@@ -294,12 +459,22 @@ struct UiContext
     u64  nativeHandle(string key);             // 0 if none
     bool hasNativeHandle(string key);
     void removeNativeHandle(string key);
+
+    void post(Lambda<void()> work);   // v12: run `work` on the UI thread (thread-safe)
+    void assertUiThread();            // v12: debug guard (warns off the UI thread)
 };
 ```
 
 The host owns one `UiContext`, threads `&ctx` into `render()`, and drains
 `consumeDirty()` once per loop, re-rendering + reconciling only on a change.
 Event closures call `ctx.invalidate()`.
+
+**`ctx.post(work)` (v12) - thread marshaling.** Call from any thread to run `work`
+back on the UI thread. The closure is cloned into a heap box and the host marshals it
+(Win32 `PostMessage(WM_APP_CALL)`; macOS runs it inline for now - real marshaling is
+deferred). With no host bound (TUI/headless), it runs inline. `ctx.assertUiThread()` is
+a debug guard that warns if called off the UI thread. Lifetime: the closure is
+clone-in / destruct-after-call, so it is leak-clean under `--heap-audit`.
 
 ## Components and the model layer
 
@@ -468,6 +643,9 @@ interface NativeHost
     void setAccent(u64 h, int fgColor, int bgColor);// 0 = native default
     Size measureText(const char* s, int fontId, int wrapWidthDip);  // FONT_UI/FONT_MONO
     void requestLayout();
+    void setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload); // v13: LISTOP_* item-data batch
+    // (v14 reuses setListOp for the tab + tree ops: LISTOP_TAB_* / LISTOP_TREE_*)
+    void setImageData(u64 h, u64 pixels, int w, int h2, int stride);   // v15: push BGRA32 pixels to an Image control
 };
 ```
 
@@ -491,9 +669,19 @@ the native->`Event` translation.
 
 ### Win32 native host: editor features (v10)
 
-`example/ui/win32_native_host.cb` (the `Win32Host` implementation of `NativeHost`)
-adds the pieces a real desktop app needs. All are documented-API only (no uxtheme
-ordinals). An app imports this host and calls `runAppGuiNative(new App(), title)`.
+`example/ui/win32_native_host.cb` implements `NativeHost` as a `Window` class (one
+per top-level window) and adds the pieces a real desktop app needs. All are
+documented-API only (no uxtheme ordinals). An app imports this host and calls
+`runAppGuiNative(new App(), title)`.
+
+- **Multi-window (v12):** the host is genuinely multi-window - the app holds an
+  owning `list<Window*>` driven by ONE message loop. A `Window` owns its top-level
+  HWND, root Element/Component, `UiContext`, live-control bookkeeping, and theme.
+  App code reaches the window currently being serviced through **`activeCtx()`** /
+  **`activeApp()`** (the free-function WndProc sets it per message), so one pair of
+  menu/close closures serves every window. Open another window with
+  `openAppWindow(new App(), title)`. These accessors are mirrored on the Cocoa host
+  (single-window there in this release; multi-window parity is planned).
 
 - **Modern look:** per-monitor-v2 DPI awareness with DIP->px scaling and
   `WM_DPICHANGED` relayout; Segoe UI Variable font; immersive dark-mode titlebar +
@@ -513,8 +701,10 @@ ordinals). An app imports this host and calls `runAppGuiNative(new App(), title)
 - **Dialogs:** `nativeOpenFile()` / `nativeSaveFile()` (shell file dialogs),
   `nativeConfirm(title, text)` (Yes/No/Cancel -> 1/0/-1), `nativeInfo(title, text)`.
 - **Windowing:** `setCloseQuery(Lambda<bool()>)` vetoes window close (dirty-save
-  prompt); `showSecondaryWindow(title, message)` opens a real second top-level
-  window; `nativeCloseWindow()` quits.
+  prompt); `showSecondaryWindow(title, message)` opens a read-only second top-level
+  window; `openAppWindow(new App(), title)` opens a full second app window (v12);
+  `nativeCloseWindow()` closes the active window (the loop ends when the last one
+  closes). Read a status pane with `nativeStatusText(keyPath)`.
 - **Flagship demo:** `example/ui/fedit/fedit.cb` - a small native text editor built
   entirely on the above (open/edit/save, find, dirty-close prompt, light/dark, two
   windows). It imports the `native_host.cb` shim, so the same source builds and runs
