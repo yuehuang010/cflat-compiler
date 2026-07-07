@@ -240,17 +240,17 @@ namespace os.windows
     // Close a C stdio file stream.
     extern win_int  fclose(void* stream);
     // Read 'count' items of 'size' bytes from a stream into buf.
-    extern win_int  fread(i8* buf, win_int size, win_int count, void* stream);
+    extern win_size fread(i8* buf, win_size size, win_size count, void* stream);
     // Write 'count' items of 'size' bytes from buf to a stream.
-    extern win_int  fwrite(i8* buf, win_int size, win_int count, void* stream);
+    extern win_size fwrite(const i8* buf, win_size size, win_size count, void* stream);
     // Read a line (up to size-1 bytes) from a stream into buf.
     extern i8*      fgets(i8* buf, win_int size, void* stream);
     // Return nonzero once a stream has reached end-of-file.
     extern win_int  feof(void* stream);
     // Move a stream's file position relative to origin.
-    extern win_int  fseek(void* stream, win_int offset, win_int origin);
+    extern win_int  fseek(void* stream, win_size offset, win_int origin);
     // Return a stream's current file position.
-    extern win_int  ftell(void* stream);
+    extern win_size ftell(void* stream);
     // Delete a file by path.
     extern win_int  _unlink(const char* path);
     // Move or rename a file (flags control replace/copy behavior).

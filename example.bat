@@ -239,7 +239,9 @@ REM example/macos/* target Darwin (dlopen of AppKit, sysctl, libproc) and are
 REM excluded from this Windows run; compile them on a Mac instead.
 REM winui_host has no main (imported); the two winui demos need the Windows App SDK
 REM bootstrapper + runtime winmds and are launched via the dedicated --worker-winui below.
-set EXCLUDE=test_helper ui ui_native win32host win32_native_host fedit http_parser http_response http_json http_server http_client router rest_server http_io cocoa hello_objc cocoa_window sysinfo_mac winui_host winui_app_demo winui_demo
+REM native_host is the NativeHost import shim (no main); cocoa_native_host/cocoa_native_settings/
+REM cocoa_probe are its AppKit (Darwin) backend + probes, excluded from this Windows run.
+set EXCLUDE=test_helper ui ui_native win32host win32_native_host native_host fedit http_parser http_response http_json http_server http_client router rest_server http_io cocoa cocoa_probe cocoa_native_host cocoa_native_settings hello_objc cocoa_window sysinfo_mac winui_host winui_app_demo winui_demo
 
 REM Discover the newest cached Win32-metadata package dir (the one holding Windows.Win32.winmd).
 REM dir /o-n lists newest-version-first by name. Empty if the nuget package is not installed

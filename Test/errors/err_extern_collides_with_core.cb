@@ -1,9 +1,11 @@
-// A user `extern` whose name collides with a core-library extern (os.windows.fwrite,
-// declared with 32-bit win_int params) must be rejected with a clear diagnostic. Before
-// the fix, getOrInsertFunction reused the existing 32-bit-signature function while the
-// call coerced args to the user's 64-bit types, tripping an LLVM "bad signature" assert.
-expect_error("conflicting declaration of extern 'fwrite'") {
-    extern u64 fwrite(void* buf, u64 size, u64 count, void* file);
+// A user `extern` whose bare name collides with a namespaced core-library extern
+// (os.windows.WriteFile, materialized in every program) must be rejected with a clear
+// diagnostic. The core symbol lives under its namespace in the function table, so a
+// bare user extern does not match it there; without this check getOrInsertFunction would
+// hand back the existing function while the call coerces args to the user's differing
+// types, tripping an LLVM "bad signature" assert at codegen.
+expect_error("conflicting declaration of extern 'WriteFile'") {
+    extern u32 WriteFile(void* h, void* buf, u64 n, void* written, void* ov);
 }
 
 extern int main()
