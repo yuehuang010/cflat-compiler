@@ -52,29 +52,26 @@ class Editor : Component
     bool   findOpen = false;
     string findText = default;
 
+    // Authored in the <Tag/> element sugar (P6.5): attribute = field init,
+    // child = add(). The find bar stays a conditional root.add() below.
     Element render(UiContext* ctx)
     {
         ctx.theme = this.isDark ? darkTheme() : lightTheme();
 
-        Box* root = box(makeStyle(0, hostWidth(), hostHeight()));
-        root.setKey("root");
-
         // Status line: filename + dirty marker.
         string name = this.path.length() > 0 ? baseName(this.path) : "untitled";
         string star = this.dirty ? " *" : "";
-        Text* status = text("fedit   |   " + name + star);
-        status.setKey("status");
-        root.add(status);
+
+        Box* root = <Box key="root" style={makeStyle(0, hostWidth(), hostHeight())}>
+                      <Text key="status" text={"fedit   |   " + name + star} />
+                    </Box>;
 
         // Optional find bar (toggled by Edit > Find). Controlled TextInput.
         if (this.findOpen)
         {
-            TextInput* f = textInput(this.findText,
-                                     (string v) => { this.findText = "" + v; ctx.invalidate(); });
-            f.width = 40;
-            f.placeholder = "find text (F3 = next)";
-            f.setKey("find");
-            root.add(f);
+            root.add(<TextInput key="find" value={this.findText} width={40}
+                                 placeholder="find text (F3 = next)"
+                                 onChangeText={(string v) => { this.findText = "" + v; ctx.invalidate(); }} />);
         }
 
         // The editor fills the rest. Its key is stable so toggling the find bar
@@ -82,11 +79,8 @@ class Editor : Component
         // by render (uncontrolled); content flows through nativeSetControlText.
         int used = this.findOpen ? 3 : 2;
         int eh = hostHeight() - used; if (eh < 3) eh = 3;
-        TextArea* ed = textArea("", () => { this.markDirty(ctx); });
-        ed.width = hostWidth();
-        ed.height = eh;
-        ed.setKey("editor");
-        root.add(ed);
+        root.add(<TextArea key="editor" value="" onChange={() => { this.markDirty(ctx); }}
+                            width={hostWidth()} height={eh} />);
         return root;
     }
 
