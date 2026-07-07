@@ -6322,6 +6322,14 @@ public:
         // owned-string-returning call.
         bool savedOwned = compilerLLVM->lastCallReturnsOwned;
         compilerLLVM->lastCallReturnsOwned = false;
+        // Clear any stale new/move owning flag left by a PRIOR statement (e.g. a bare
+        // `items.add(new T())` whose `new` result was moved into the callee, not consumed
+        // by a declaration). Only a new/move parsed WITHIN this RHS may mark the target
+        // owning; without this, the next pointer/interface declaration in the same scope
+        // (notably `T* d = expr as U;`, whose cast produces no owning signal of its own)
+        // falsely inherits ownership and double-frees at scope exit. Mirrors the existing
+        // assignment-path reset (see operatorText == "=" below).
+        compilerLLVM->lastOwningResult = false;
 
         auto* condCtx = ctx->conditionalExpression();
         if (condCtx && !ctx->assignmentOperator()

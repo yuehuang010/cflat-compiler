@@ -954,6 +954,61 @@ bool testStackOwningValueBoxedToInterface()
     return result;
 }
 
+// ── Test 25: downcast of a call result is a BORROW, not an owner ──────────────
+// Regression: `T* d = someCall() as U;` where the operand is a function-call
+// result (r-value) must yield a BORROW. A stale new/move owning flag left by a
+// prior statement (e.g. `list.add(new U())`) used to leak into this declaration,
+// so `d` was tracked as owning and auto-deleted at scope exit - double-freeing
+// the object the list still owns (and freeing a live object each closure return).
+int gDcDtorCount = 0;
+
+interface IPokable { int poke(); };
+
+class Pokable : IPokable
+{
+    int v = 0;
+    int poke() { return v; }
+    ~Pokable() { gDcDtorCount = gDcDtorCount + 1; }
+};
+
+list<IPokable> _dcZoo = default;
+
+alias IPokable dcActive() { return _dcZoo.get(0); }
+
+bool testDowncastCallResultBorrow()
+{
+    bool result = true;
+    gDcDtorCount = 0;
+
+    _dcZoo.add(new Pokable());   // the list is the sole owner of this heap object
+
+    {
+        // Downcast of a CALL RESULT (r-value) - must be a BORROW, not owning.
+        Pokable* d = dcActive() as Pokable;
+        d.v = 7;
+        result &= Test("dc_mutate_via_ptr", d.v, 7);
+
+        // Closure variant: each call downcasts the same call result. Before the fix
+        // the inner `p` was owning and freed the live object at the closure's return.
+        Lambda<void()> bump = () => { Pokable* p = dcActive() as Pokable; p.v = p.v + 1; };
+        bump();
+        bump();
+        result &= Test("dc_closure_bumped_twice", d.v, 9);
+    }
+    // `d` (and the closure's inner downcasts) are out of scope. A borrow must NOT
+    // have freed the object - the list still owns it. Before the fix, `d`'s scope-exit
+    // delete freed it here, so the dtor count would already be 1 and the object dead.
+    result &= Test("dc_borrow_did_not_free", gDcDtorCount, 0);
+    result &= Test("dc_object_still_live",   dcActive().poke(), 9);
+
+    // The real owner frees the heap object exactly once.
+    IPokable owned = _dcZoo.take(0);
+    delete owned;
+    result &= Test("dc_owner_frees_once", gDcDtorCount, 1);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -983,6 +1038,7 @@ extern int main()
     total++; passed += testStringFieldMoveInterface()    ? 1 : 0;
     total++; passed += testStackOwningValueBoxedToInterface() ? 1 : 0;
     total++; passed += testInterfaceFieldString()        ? 1 : 0;
+    total++; passed += testDowncastCallResultBorrow()    ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;
