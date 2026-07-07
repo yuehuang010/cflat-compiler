@@ -1,0 +1,10 @@
+// An empty package id in `import package-nuget ... from "";` must be a clean diagnostic.
+// Raised at import time (ProcessImports), so the expectation uses the bare-semicolon
+// file-scope form. Hermetic: fails in spec parsing before any filesystem or network access.
+expect_error("empty package id");
+import package-nuget "foo.h" from "";
+
+extern int main()
+{
+    return 0;
+}

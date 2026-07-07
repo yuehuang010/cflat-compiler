@@ -685,15 +685,18 @@ importDeclaration
     | Import 'program' StringLiteral As Identifier ';'
     | Import 'package' StringLiteral libClause? defineClause* cacheClause? ';'
     | Import 'package-vcpkg' StringLiteral fromClause defineClause* ';'
+    | Import 'package-nuget' importGroup fromClause defineClause* ';'
     ;
 
 // A plain file import target: either a single bare filename or a brace-wrapped comma
 // list of them. The list form is a shorthand for writing several `import "file";` lines
 // (so `import { "sqlite3.h", "sqlite3.c" };` binds the header and compiles the .c). Each
 // entry routes exactly like a plain `import "x";`; the optional `as` / `cache` on the
-// importDeclaration apply only when the group holds a single filename. The other
-// importDeclaration alternatives (program/package/package-vcpkg) keep a single direct
-// StringLiteral, so that accessor stays singular for them.
+// importDeclaration apply only when the group holds a single filename. package-nuget also
+// uses importGroup (a multi-entry group binds as one package translation unit; a single
+// entry behaves like the bare form). The remaining alternatives (program/package/
+// package-vcpkg) keep a single direct StringLiteral, so that accessor stays singular for
+// them - dispatch on the keyword (children[1] text) before any importGroup-based routing.
 importGroup
     : StringLiteral
     | '{' StringLiteral (',' StringLiteral)* ','? '}'
@@ -731,9 +734,10 @@ cacheClause
     : 'cache'
     ;
 
-// Required port name (with optional [features]) on an `import package-vcpkg` line:
-//   import package-vcpkg "curl/curl.h" from "curl";
+// Required source spec on an `import package-vcpkg` / `import package-nuget` line:
+//   import package-vcpkg "curl/curl.h" from "curl";        // vcpkg port (optional [features])
 //   import package-vcpkg "curl/curl.h" from "curl[ssl]";
+//   import package-nuget "WebView2.h" from "Microsoft.Web.WebView2/1.0.3179.45";  // nuget id[/version]
 // Sub-rule so importDeclaration keeps a single direct StringLiteral.
 fromClause
     : 'from' StringLiteral

@@ -13,6 +13,24 @@ Keep `master` linear: every commit on `master` must have a single parent.  Do no
 ## Dependencies
 Do not modify the root `./vcpkg.json` without explicit permission.
 
+## Agent Delegation: Cost vs Intelligence
+
+The main session runs on the most expensive model tier. Implementation work should be delegated to a subagent (Agent tool) at the cheapest tier that can do the job reliably; the main session plans, coordinates, and reviews the results.
+
+| Tier | Relative cost | Right for |
+|------|---------------|-----------|
+| `sonnet` (`general-purpose-sonnet`) | Low | Mechanical and routine implementation: renames, running builds/tests and reporting output, well-specified single-area changes, straightforward features from a clear plan, doc updates, writing regression tests |
+| `opus` (`opus-general-purpose`) | High | Hard implementation: multi-file compiler changes (grammar + ForwardRefScanner + codegen), debugging with unclear root cause, ownership/lifetime work |
+
+Guidelines:
+
+- Never use the `haiku` tier; `sonnet` is the floor.
+- Default flow: main session writes the plan and acceptance criteria, spawns an implementation agent at the right tier, then verifies the result (build + `test.bat`).
+- Give implementation agents a self-contained prompt: exact files, the plan, constraints from this file (both-pass ParseDeclarationSpecifiers, LogError-only, ASCII, no new test files), and how to verify.
+- Use the read-only `Explore` agent for broad codebase searches instead of burning main-session context.
+- If an agent at one tier fails or flails, escalate one tier with the failure context - do not retry the same tier with the same prompt, and do not silently absorb the work into the main session for convenience.
+- Independent sub-tasks should be spawned in parallel when they touch disjoint files.
+
 ## Text Output
 
 - Use plain ASCII characters for readable text in source files, comments, log messages, and documentation. Avoid Unicode punctuation such as en/em dashes, smart quotes, and ellipsis characters. Use ASCII `-`, `"`, `'`, and three dots `...` instead.

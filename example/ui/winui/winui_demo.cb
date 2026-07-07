@@ -6,9 +6,9 @@
 // exercises the whole seam: control creation on a Canvas, property sync (enabled/checked/text),
 // and events (Checked/Unchecked, Click) flowing back through winrtDelegate into dispatch.
 //
-// Build (needs the Windows App SDK 1.8 bootstrapper .lib + the runtime winmds via -i):
-//   cflat winui_demo.cb -i . -i winmd --c-lib <...>\Microsoft.WindowsAppRuntime.Bootstrap.lib -o winui_demo.exe
-//   (copy Microsoft.WindowsAppRuntime.Bootstrap.dll next to the exe)
+// Build (imports winui_host.cb, so it needs -i to find it when built from elsewhere;
+// the winmds/bootstrapper lib/dll come from pinned NuGet packages automatically):
+//   cflat winui_demo.cb -i . -o winui_demo.exe
 // Headless self-test:  winui_demo.exe --selftest
 
 import "winui_host.cb";

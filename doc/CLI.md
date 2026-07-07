@@ -117,6 +117,13 @@ Full details, including the `import package` / inline `lib`/`define`/`cache` cla
 | `--vcpkg-triplet` | triplet | vcpkg triplet (default derived from `--platform`: `x64-windows` / `x86-windows`). |
 | `--vcpkg-no-install` | | Do not run `vcpkg install`; error out if a `package-vcpkg` port is not already installed. |
 
+### NuGet integration
+
+| Switch | Value | Description |
+|--------|-------|-------------|
+| `--nuget-packages-dir` | path | Explicit NuGet global packages folder (overrides `NUGET_PACKAGES` / `%USERPROFILE%\.nuget\packages` discovery). |
+| `--nuget-no-install` | | Do not download NuGet packages; error out if a `package-nuget` package is not already in the packages folder. |
+
 ## Caching
 
 | Switch | Description |

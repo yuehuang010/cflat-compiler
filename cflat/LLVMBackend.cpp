@@ -190,6 +190,13 @@ static bool IsPackageVcpkgImport(CFlatParser::ImportDeclarationContext* imp)
     return imp->children.size() >= 2 && imp->children[1]->getText() == "package-vcpkg";
 }
 
+// True when this import line is `import package-nuget "..." from "...";`. Mirrors
+// IsPackageVcpkgImport - detected by the second child token text.
+static bool IsPackageNugetImport(CFlatParser::ImportDeclarationContext* imp)
+{
+    return imp->children.size() >= 2 && imp->children[1]->getText() == "package-nuget";
+}
+
 // Dequoted port spec from `from "..."` on an import package-vcpkg line (empty if absent).
 static std::string DequoteFromClause(CFlatParser::ImportDeclarationContext* imp)
 {
@@ -378,6 +385,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     if (auto p = args.getOption("vcpkg-manifest")) vcpkg_.SetManifestOverride(*p);
     if (auto p = args.getOption("vcpkg-triplet"))  vcpkg_.SetTripletOverride(*p);
     vcpkg_.SetNoInstall(args.hasFlag("vcpkg-no-install"));
+    // Nuget integration options: mirror the vcpkg wiring. Both optional - the resolver
+    // defaults to the NuGet global packages folder when no override is given.
+    if (auto p = args.getOption("nuget-packages-dir")) nuget_.SetPackagesDirOverride(*p);
+    nuget_.SetNoInstall(args.hasFlag("nuget-no-install"));
 
     if (verbose)
     {
@@ -592,6 +603,18 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         // trailing `cache` on the group applies to every entry (a no-op for
                         // .cb/.c entries; only the .h header-bind branch consults it).
                         auto groupedImports = DequoteImportGroup(imp);
+                        // `import package-nuget importGroup from "id[/version]";` - dispatch on the
+                        // keyword BEFORE any importGroup-based routing (package-nuget now also
+                        // carries an importGroup, but a multi-entry nuget group is ONE package TU,
+                        // not several plain imports). Skips the regular import dedup/parse machinery.
+                        if (IsPackageNugetImport(imp))
+                        {
+                            std::string packageSpec = DequoteFromClause(imp);
+                            if (verbose) std::cout << std::format("[verbose] nuget import (group of {}) from {}\n", groupedImports.size(), packageSpec);
+                            if (!CompileNugetImport(groupedImports, packageSpec, DequoteDefineClauses(imp)))
+                                return false;
+                            continue;
+                        }
                         if (groupedImports.size() > 1)
                         {
                             if (verbose) std::cout << std::format("[verbose] import requested (group of {})\n", groupedImports.size());
@@ -1309,6 +1332,16 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 // Grouped import `import { "a", "b" };` - one TU for header entries, individual
                 // routing for .cb/.c entries (see CompileImportGroup).
                 auto groupedImports = DequoteImportGroup(imp);
+                // package-nuget dispatch first (it now carries an importGroup too); a multi-entry
+                // nuget group is one package TU, not several plain imports.
+                if (IsPackageNugetImport(imp))
+                {
+                    std::string packageSpec = DequoteFromClause(imp);
+                    if (verbose) std::cout << std::format("[verbose]   nested nuget import (group of {}) from {}\n", groupedImports.size(), packageSpec);
+                    if (!CompileNugetImport(groupedImports, packageSpec, DequoteDefineClauses(imp)))
+                        return false;
+                    continue;
+                }
                 if (groupedImports.size() > 1)
                 {
                     if (verbose) std::cout << std::format("[verbose]   nested import (group of {})\n", groupedImports.size());
@@ -2000,6 +2033,15 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     // Grouped import `import { "a", "b" };` - one TU for header entries (see
                     // CompileImportGroup); .cb/.c entries route individually.
                     auto groupedImports = DequoteImportGroup(imp);
+                    // package-nuget dispatch first (it now carries an importGroup too); a
+                    // multi-entry nuget group is one package TU, not several plain imports.
+                    if (IsPackageNugetImport(imp))
+                    {
+                        std::string packageSpec = DequoteFromClause(imp);
+                        if (!CompileNugetImport(groupedImports, packageSpec, DequoteDefineClauses(imp)))
+                            return false;
+                        continue;
+                    }
                     if (groupedImports.size() > 1)
                     {
                         if (!CompileImportGroup(filePath, groupedImports, DequoteLibClauses(imp),

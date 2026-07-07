@@ -1,0 +1,12 @@
+// A multi-entry `import package-nuget { ... }` group is one C translation unit, so a
+// .winmd may not ride in it - it must be imported on its own line. This shape check fires
+// BEFORE package resolution, so the test is hermetic (no filesystem/network access): the
+// bogus package id is never touched. Raised at import time (ProcessImports), so the
+// expectation uses the bare-semicolon file-scope form.
+expect_error("group a .winmd import on its own line");
+import package-nuget { "Foo.h", "Bar.winmd" } from "cflat.test.err.no.such.package/1.0.0";
+
+extern int main()
+{
+    return 0;
+}

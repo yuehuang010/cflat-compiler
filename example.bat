@@ -166,7 +166,9 @@ REM from an unpackaged exe and drive it headlessly via UI Automation. Gated on t
 REM assertion exit code only: --heap-audit is INCOMPATIBLE with the WinAppSDK runtime
 REM (Application/Window/DispatcherQueue are process-lived singletons never torn down
 REM before ExitProcess, and the runtime allocates through its own heaps), so it is not
-REM used here. WINUISDK is the discovered Windows App SDK foundation package root.
+REM used here. The winmds, bootstrapper .lib, and Bootstrap.dll all come from pinned
+REM NuGet packages via `import package-nuget` in the .cb sources - no WINUISDK path or
+REM --c-lib needed here, and the compiler auto-deploys Bootstrap.dll next to the exe.
 REM ===========================================================================
 if "%~1"=="--worker-winui" (
     set "FILE=%~2"
@@ -177,15 +179,12 @@ if "%~1"=="--worker-winui" (
     for %%A in ("!FILE!") do (set "WNAME=%%~nxA" & set "WBASE=%%~nA")
     set "WEXE=!OUTDIR!\!WBASE!_wui.exe"
     set "WLOG=!RESDIR!\!RESID!.log"
-    set "BOOTLIB=!WINUISDK!\lib\native\x64\Microsoft.WindowsAppRuntime.Bootstrap.lib"
-    set "BOOTDLL=!WINUISDK!\runtimes\win-x64\native\Microsoft.WindowsAppRuntime.Bootstrap.dll"
 
-    "!CFLAT!" "!FILE!" -i example/ui/winui -i example/ui -i example/ui/winui/winmd --c-lib "!BOOTLIB!" -o "!WEXE!" > "!WLOG!" 2>&1
+    "!CFLAT!" "!FILE!" -i example/ui/winui -i example/ui -o "!WEXE!" > "!WLOG!" 2>&1
     if not exist "!WEXE!" (
         echo FAIL !WNAME! ^(winui self-test build failed^)>"!RESDIR!\!RESID!.result"
         exit /b
     )
-    copy /y "!BOOTDLL!" "!OUTDIR!\Microsoft.WindowsAppRuntime.Bootstrap.dll" >nul 2>&1
     "!WEXE!" --selftest >> "!WLOG!" 2>&1
     set WRC=!errorlevel!
     if !WRC! neq 0 (
@@ -253,13 +252,20 @@ for /f "delims=" %%D in ('dir /b /ad /o-n "!WIN32MD_ROOT!" 2^>nul') do (
 )
 if not defined WIN32MD set EXCLUDE=%EXCLUDE% direct2d_demo
 
-REM Discover the newest Windows App SDK foundation package (holds the unpackaged bootstrapper
-REM .lib/.dll). Empty if not installed for this user, in which case the WinUI 3 self-tests are
-REM skipped rather than failing on a missing --c-lib.
-set "WINUISDK="
-set "WINUISDK_ROOT=%USERPROFILE%\.nuget\packages\microsoft.windowsappsdk.foundation"
-for /f "delims=" %%D in ('dir /b /ad /o-n "!WINUISDK_ROOT!" 2^>nul') do (
-    if not defined WINUISDK if exist "!WINUISDK_ROOT!\%%D\lib\native\x64\Microsoft.WindowsAppRuntime.Bootstrap.lib" set "WINUISDK=!WINUISDK_ROOT!\%%D"
+REM Gate the WinUI 3 self-tests on the three pinned WindowsAppSDK NuGet packages (WinUI,
+REM InteractiveExperiences, Foundation) actually being present in the NuGet global packages
+REM folder (respects NUGET_PACKAGES override). The .cb sources resolve these themselves via
+REM `import package-nuget`; this is just an offline-friendly SKIP gate for this script, not a
+REM separate lookup of the artifacts.
+set "NUGETROOT=%NUGET_PACKAGES%"
+if not defined NUGETROOT set "NUGETROOT=%USERPROFILE%\.nuget\packages"
+set "WINUINUGET="
+if exist "!NUGETROOT!\microsoft.windowsappsdk.winui\1.8.260224000" (
+    if exist "!NUGETROOT!\microsoft.windowsappsdk.interactiveexperiences\1.8.260125001" (
+        if exist "!NUGETROOT!\microsoft.windowsappsdk.foundation\1.8.260222000" (
+            set "WINUINUGET=1"
+        )
+    )
 )
 
 REM Warm the compiler cache (linker paths + core-library bitcode) once up front so the
@@ -312,8 +318,8 @@ set /a LAUNCHED+=1
 start "" /b cmd /c "%SCRIPT% --worker-fedit ex_!RESID!"
 
 REM Launch the WinUI 3 (Windows App SDK) self-tests (P6 M2 window bring-up + M3 host),
-REM only when the App SDK foundation package is present. Skipped otherwise.
-if defined WINUISDK (
+REM only when the pinned WindowsAppSDK NuGet packages are cached. Skipped otherwise.
+if defined WINUINUGET (
     for %%W in (example\ui\winui\winui_app_demo.cb example\ui\winui\winui_demo.cb) do (
         set /a RESID+=1
         set /a LAUNCHED+=1
@@ -321,8 +327,8 @@ if defined WINUISDK (
     )
 ) else (
     set /a SKIPPED+=2
-    echo SKIP: example\ui\winui\winui_app_demo.cb ^(Windows App SDK not installed^)
-    echo SKIP: example\ui\winui\winui_demo.cb ^(Windows App SDK not installed^)
+    echo SKIP: example\ui\winui\winui_app_demo.cb ^(pinned WindowsAppSDK NuGet packages not in cache^)
+    echo SKIP: example\ui\winui\winui_demo.cb ^(pinned WindowsAppSDK NuGet packages not in cache^)
 )
 
 REM Wait for all workers to finish (up to TIMEOUT_SECS).

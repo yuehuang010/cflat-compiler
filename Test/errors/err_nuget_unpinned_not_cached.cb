@@ -1,0 +1,10 @@
+// An unpinned package-nuget import must never download "latest"; when no version is in
+// the local packages folder it errors with a pin suggestion. Hermetic: the bogus id is
+// never cached and the unpinned path does no network access, only the local folder probe.
+expect_error("has no version in the NuGet packages folder");
+import package-nuget "foo.h" from "cflat.test.err.no.such.package";
+
+extern int main()
+{
+    return 0;
+}

@@ -17,8 +17,10 @@ import "ui.cb";
 import "ui_native.cb";
 import "winrt.cb";
 import "function.cb";
-import "Microsoft.UI.Xaml.winmd";
-import "Microsoft.UI.winmd";
+import package-nuget "Microsoft.UI.Xaml.winmd" from "Microsoft.WindowsAppSDK.WinUI/1.8.260224000";
+import package-nuget "Microsoft.UI.winmd" from "Microsoft.WindowsAppSDK.InteractiveExperiences/1.8.260125001";
+// Foundation supplies Microsoft.WindowsAppRuntime.Bootstrap.{lib,dll} for the Mdd* externs below.
+import package-nuget "Microsoft.Windows.ApplicationModel.DynamicDependency.winmd" from "Microsoft.WindowsAppSDK.Foundation/1.8.260222000";
 
 extern stdcall i32  MddBootstrapInitialize2(u32 majorMinor, u16* versionTag, u64 minVersion, i32 options);
 extern stdcall void MddBootstrapShutdown();

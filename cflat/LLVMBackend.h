@@ -85,6 +85,7 @@
 #include "LspSymbolIndex.h"
 #include "CFlatErrorListener.h"
 #include "VcpkgResolver.h"
+#include "NugetResolver.h"
 
 struct ExpectedErrorReceived {};
 
@@ -1147,6 +1148,7 @@ private:
     // Kept separate from cLinkLibs_-based DLL probing.
     std::vector<std::string> vcpkgRuntimeDlls_;
     VcpkgResolver vcpkg_;
+    NugetResolver nuget_;
 
     // Process-global mutex-guarded cache of C signatures from clang AST dumps. Global because
     // LSP backends run concurrently and a document is not pinned to a slot.
@@ -14860,11 +14862,19 @@ public:
                 header, res.includeDir));
             return false;
         }
-        // Disk cache for vcpkg headers, stored in vcpkg_installed/.cflat-cache/.
-        // On hit we preload the in-memory cache so CompileCHeader skips clang entirely.
-        // On miss we write after CompileCHeader so the next build is a hit.
-        std::filesystem::path vcpkgCacheDir =
-            std::filesystem::path(res.includeDir).parent_path().parent_path() / ".cflat-cache";
+        return BindCanonicalCHeader(headerCanon, res.includeDir, extraDefines);
+    }
+
+    // Bind a resolved package header (vcpkg or nuget) through the C-header pipeline with a
+    // disk cache. 'headerCanon' is the canonical header path; 'includeDir' locates the sibling
+    // .cflat-cache dir. On a disk hit we preload the in-memory cache so CompileCHeader skips
+    // clang entirely; on a miss we write after CompileCHeader so the next build is a hit.
+    bool BindCanonicalCHeader(const std::filesystem::path& headerCanon,
+                              const std::string& includeDir,
+                              const std::vector<std::string>& extraDefines)
+    {
+        std::filesystem::path pkgCacheDir =
+            std::filesystem::path(includeDir).parent_path().parent_path() / ".cflat-cache";
 
         // Derive the same in-memory key CompileCHeader builds internally.
         llvm::SmallString<256> realPathBuf;
@@ -14891,19 +14901,19 @@ public:
         if (haveHash && !mtEc)
         {
             CFileSigCacheEntry diskEntry;
-            if (TryLoadCHeaderDiskCache(vcpkgCacheDir, diskKey, headerMtime, contentHash, diskEntry))
+            if (TryLoadCHeaderDiskCache(pkgCacheDir, diskKey, headerMtime, contentHash, diskEntry))
             {
                 std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
                 cFileSigCache_[inMemKey] = std::move(diskEntry);
                 diskHit = true;
                 if (verbose)
-                    std::cout << std::format("[verbose] vcpkg header disk cache hit: {}\n", fileForLsp);
+                    std::cout << std::format("[verbose] package header disk cache hit: {}\n", fileForLsp);
             }
         }
 
         bool ok = CompileCHeader(headerCanon.string(), extraDefines);
 
-        // --run is read-only: skip persisting the vcpkg header cache to disk under run mode
+        // --run is read-only: skip persisting the header cache to disk under run mode
         // (the in-memory cache entry from CompileCHeader still serves this compile).
         if (ok && !diskHit && !runMode_ && haveHash && !mtEc)
         {
@@ -14915,11 +14925,219 @@ public:
                 if (it != cFileSigCache_.end()) { entryToWrite = it->second; haveEntry = true; }
             }
             if (haveEntry)
-                WriteCHeaderDiskCache(vcpkgCacheDir, diskKey, headerMtime, contentHash, entryToWrite);
+                WriteCHeaderDiskCache(pkgCacheDir, diskKey, headerMtime, contentHash, entryToWrite);
         }
 
         if (ok) ProcessPendingMacroSources();
         return ok;
+    }
+
+    // Handle `import package-nuget importGroup from "id[/version]";`. Resolves the package
+    // through the NuGet global packages folder (acquiring on a miss unless suppressed), pushes
+    // the resulting include dirs / libs / DLLs into the per-backend accumulators, then binds
+    // the imported files. A single entry routes by extension: .h/.hpp/.hh through the C-header
+    // binding path (shared with package-vcpkg via BindCanonicalCHeader), .winmd through the
+    // WinRT metadata pipeline. A multi-entry group is STRICT package-only and header-only: every
+    // entry must resolve under the package include dirs (system headers may not ride in a group)
+    // and is bound as ONE translation unit / one disk-cache entry via CompileCHeaderGroup.
+    // Returns false on hard error. In LSP mode an unresolved package (or a not-found header)
+    // degrades to a silent skip.
+    bool CompileNugetImport(const std::vector<std::string>& files,
+                            const std::string& packageSpec,
+                            const std::vector<std::string>& extraDefines = {})
+    {
+        if (files.empty()) return true;
+        const bool multi = files.size() > 1;
+        const bool lspMode = symbolSink_ != nullptr;
+
+        // Lowercased extension of a path (leading '.' included, e.g. ".winmd").
+        auto lowerExt = [](const std::string& f) {
+            std::string e = std::filesystem::path(f).extension().string();
+            std::transform(e.begin(), e.end(), e.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return e;
+        };
+
+        // Shape check BEFORE package resolution (needs no network/cache): a multi-entry group is
+        // one C translation unit, so it may hold only .h/.hpp/.hh headers. A .winmd must be
+        // imported on its own line; anything else is unsupported inside a group.
+        if (multi)
+        {
+            for (const auto& f : files)
+            {
+                std::string ext = lowerExt(f);
+                if (ext == ".winmd")
+                {
+                    LogError(std::format(
+                        "import package-nuget: '{}' - a .winmd cannot appear in a multi-entry group; "
+                        "group a .winmd import on its own line.", f));
+                    return false;
+                }
+                if (ext != ".h" && ext != ".hpp" && ext != ".hh")
+                {
+                    LogError(std::format(
+                        "import package-nuget: '{}' - a multi-entry group may contain only "
+                        ".h/.hpp/.hh headers.", f));
+                    return false;
+                }
+            }
+        }
+
+        // Mirror LSP/non-LSP mode and verbosity into the resolver.
+        nuget_.SetVerbose(verbose);
+        nuget_.SetLspMode(symbolSink_ != nullptr);
+        nuget_.SetPlatform(platformValue == 32 ? "win32" : "win64");
+
+        NugetResolver::Resolution res;
+        std::string err;
+        if (!nuget_.Resolve(packageSpec, res, err))
+        {
+            // LSP mode never downloads; an unresolved package should not paint an error on a
+            // file that compiles cleanly once the package is restored. Degrade to a silent skip.
+            if (lspMode)
+            {
+                if (verbose)
+                    std::cout << std::format("[verbose] nuget: package '{}' not resolved; skipping for LSP analysis\n",
+                        packageSpec);
+                return true;
+            }
+            LogError(err);
+            return false;
+        }
+
+        // Push the resolved paths into the existing accumulators (deduped, same as vcpkg).
+        // vcpkgRuntimeDlls_ is the generic "runtime DLLs to copy next to the exe" list; reuse it.
+        for (const auto& inc : res.includeDirs)
+        {
+            if (inc.empty()) continue;
+            bool dup = false;
+            for (const auto& d : cIncludeDirs_) if (d == inc) { dup = true; break; }
+            if (!dup) cIncludeDirs_.push_back(inc);
+        }
+        for (const auto& lib : res.libs)
+        {
+            bool dup = false;
+            for (const auto& l : cLinkLibs_) if (l == lib) { dup = true; break; }
+            if (!dup) cLinkLibs_.push_back(lib);
+        }
+        for (const auto& dll : res.dlls)
+        {
+            bool dup = false;
+            for (const auto& d : vcpkgRuntimeDlls_) if (d == dll) { dup = true; break; }
+            if (!dup) vcpkgRuntimeDlls_.push_back(dll);
+        }
+
+        // Multi-entry group: STRICT package-only. Resolve every header under the package
+        // include dirs (a header not found there is an error - system headers may not ride in a
+        // package-nuget group), then bind them all as one TU / one disk-cache entry.
+        if (multi)
+        {
+            std::vector<std::string> headerCanonicals;
+            for (const auto& f : files)
+            {
+                bool found = false;
+                for (const auto& inc : res.includeDirs)
+                {
+                    std::error_code ec;
+                    auto headerCanon = std::filesystem::canonical(std::filesystem::path(inc) / f, ec);
+                    if (!ec) { headerCanonicals.push_back(headerCanon.string()); found = true; break; }
+                }
+                if (found) continue;
+                // Not found under any resolved include dir. In LSP mode degrade to a silent skip.
+                if (lspMode)
+                {
+                    if (verbose)
+                        std::cout << std::format("[verbose] nuget: header '{}' not found in package '{}'; skipping for LSP analysis\n",
+                            f, packageSpec);
+                    return true;
+                }
+                LogError(std::format(
+                    "import package-nuget: header '{}' was not found in the include dirs of package '{}'.\n"
+                    "  Only package-owned headers may appear in a package-nuget group; a system header "
+                    "(e.g. windows.h) may not ride in a package-nuget group.",
+                    f, packageSpec));
+                return false;
+            }
+            bool ok = CompileCHeaderGroup(headerCanonicals, extraDefines, /*diskCache=*/true);
+            if (ok) ProcessPendingMacroSources();
+            return ok;
+        }
+
+        // Single entry: route by extension of the imported file.
+        const std::string& file = files[0];
+        std::string ext = std::filesystem::path(file).extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        if (ext == ".h" || ext == ".hpp" || ext == ".hh")
+        {
+            // The source header path is relative to a package include dir (e.g. "WebView2.h").
+            // Find the first include dir under which it exists, canonicalize, then reuse the
+            // shared disk-cache + CompileCHeader flow.
+            for (const auto& inc : res.includeDirs)
+            {
+                std::error_code ec;
+                std::filesystem::path headerAbs = std::filesystem::path(inc) / file;
+                auto headerCanon = std::filesystem::canonical(headerAbs, ec);
+                if (!ec)
+                    return BindCanonicalCHeader(headerCanon, inc, extraDefines);
+            }
+            // Not found under any resolved include dir. In LSP mode the package may not be
+            // restored yet - degrade to a silent skip rather than flagging the import line.
+            if (lspMode)
+            {
+                if (verbose)
+                    std::cout << std::format("[verbose] nuget: header '{}' not found in package '{}'; skipping for LSP analysis\n",
+                        file, packageSpec);
+                return true;
+            }
+            LogError(std::format(
+                "import package-nuget: header '{}' not found in the include dirs of package '{}'.\n"
+                "  The package may not own this header, or the layout is unexpected.",
+                file, packageSpec));
+            return false;
+        }
+
+        if (ext == ".winmd")
+        {
+            // WinRT metadata is a Windows-only feature - reject early off-Windows with a
+            // guarded-import hint, mirroring CompileImportedFile's .winmd guard.
+            if (!targetWindows_)
+            {
+                LogError(std::format("import package-nuget '{}': WinRT metadata (.winmd) is only supported when "
+                                     "targeting Windows; guard the import with "
+                                     "'if const (__WINDOWS__) {{ import ...; }}'.", file));
+                return false;
+            }
+            // Search the resolved metadata dirs for the exact filename and route the absolute
+            // path through the existing .winmd import pipeline.
+            for (const auto& dir : res.winmdDirs)
+            {
+                std::error_code ec;
+                std::filesystem::path cand = std::filesystem::path(dir) / file;
+                if (std::filesystem::exists(cand, ec) && !ec)
+                {
+                    auto canon = std::filesystem::canonical(cand, ec);
+                    return CompileWinmdFile(ec ? cand.string() : canon.string());
+                }
+            }
+            if (lspMode)
+            {
+                if (verbose)
+                    std::cout << std::format("[verbose] nuget: winmd '{}' not found in package '{}'; skipping for LSP analysis\n",
+                        file, packageSpec);
+                return true;
+            }
+            LogError(std::format(
+                "import package-nuget: metadata '{}' not found in the winmd dirs of package '{}'.",
+                file, packageSpec));
+            return false;
+        }
+
+        LogError(std::format(
+            "import package-nuget: '{}': only .h/.hpp/.hh headers and .winmd metadata are supported.",
+            file));
+        return false;
     }
 
     bool Analyze(const std::string& filePath, const std::vector<std::string>& importDirs, const std::string& runtimeDirPath);

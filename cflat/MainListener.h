@@ -2903,6 +2903,33 @@ public:
                 // Point diagnostics at this import statement (see ProcessImports): a not-found
                 // error has no readable file behind it and would otherwise report (0,0).
                 Compiler()->SetSourceLocation(imp->getStart()->getLine(), imp->getStart()->getCharPositionInLine());
+                // `import package-nuget importGroup from "id[/version]";` inside an if-const
+                // branch. Dispatch on the keyword BEFORE the plain importGroup routing, since
+                // package-nuget now also carries an importGroup; a multi-entry nuget group is
+                // ONE package TU, not several plain imports.
+                if (imp->children.size() >= 2 && imp->children[1]->getText() == "package-nuget")
+                {
+                    std::vector<std::string> nugetFiles;
+                    if (auto* grp = imp->importGroup())
+                        for (auto* lit : grp->StringLiteral())
+                            nugetFiles.push_back(DequoteStringLiteral(lit->getText()));
+                    std::string packageSpec;
+                    if (auto* fc = imp->fromClause())
+                        if (fc->StringLiteral())
+                        {
+                            std::string fr = fc->StringLiteral()->getText();
+                            if (fr.size() >= 2) packageSpec = DequoteStringLiteral(fr);
+                        }
+                    std::vector<std::string> nugetDefines;
+                    for (auto* dc : imp->defineClause())
+                        if (dc->StringLiteral())
+                        {
+                            std::string dr = dc->StringLiteral()->getText();
+                            if (dr.size() >= 2) nugetDefines.push_back(DequoteStringLiteral(dr));
+                        }
+                    Compiler()->CompileNugetImport(nugetFiles, packageSpec, nugetDefines);
+                    continue;
+                }
                 // Grouped import `import { "a", "b" };` inside an if-const branch - header
                 // entries share one TU; .cb/.c route individually (see CompileImportGroup).
                 if (auto* grp = imp->importGroup())

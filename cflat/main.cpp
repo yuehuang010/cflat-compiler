@@ -314,6 +314,8 @@ int main(int argc, char* argv[])
     args.addOption("vcpkg-manifest", 0, "Explicit vcpkg.json path (skips upward walk from the source file)");
     args.addOption("vcpkg-triplet", 0, "vcpkg triplet (default derived from --platform: x64-windows / x86-windows)");
     args.addFlag("vcpkg-no-install", 0, "Do not run 'vcpkg install'; error out if a package-vcpkg port is not already installed");
+    args.addOption("nuget-packages-dir", 0, "Explicit NuGet global packages folder (overrides NUGET_PACKAGES / %USERPROFILE%\\.nuget\\packages discovery)");
+    args.addFlag("nuget-no-install", 0, "Do not download NuGet packages; error out if a package-nuget package is not already in the packages folder");
     args.addFlag("init", 0, "Populate %USERPROFILE%\\.cflat\\ cache with linker paths, core bitcode, and the compiler path, then exit");
     args.addFlag("print-supported-cpus", 0, "List target CPUs supported on Windows x86/x64, then exit");
     args.addFlag("print-host-cpu", 0, "Print the LLVM name of the host CPU (what --cpu native resolves to), then exit");
