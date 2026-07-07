@@ -499,6 +499,33 @@ static bool isFunctionStatic(CFlatParser::FunctionDefinitionContext* func)
     return false;
 }
 
+// Detect functions that heap-allocate and return a new owned value, so call sites
+// register the result as an owned temp and free it. operator+ always allocates;
+// operator string(i32) uses malloc; user functions opt in via 'move string' /
+// 'move T*' / 'move <interface>'. Shared by the forward-decl, definition, and
+// interface-method-decl paths so the three copies cannot drift apart.
+static bool ComputeReturnsOwned(const LLVMBackend::DeclTypeAndValue& returnType,
+                                const std::string& name,
+                                const std::vector<LLVMBackend::TypeAndValue>& allParams)
+{
+    if (returnType.TypeName == "string")
+    {
+        if (name == "operator+")
+            return true;
+        if (name == "operator string" && allParams.size() == 1 && allParams[0].TypeName == "i32")
+            return true;
+        if (returnType.IsMove)
+            return true;
+        return false;
+    }
+    // 'move <interface>' transfers ownership of the boxed heap object to the caller (the
+    // caller is then responsible for 'delete'). An interface return type is not Pointer
+    // (its LLVM type is a { vtable, data } fat pointer), so it needs its own case.
+    if (returnType.IsMove && (returnType.Pointer || returnType.IsInterface))
+        return true;
+    return false;
+}
+
 // ForwardRefScanner performs a lightweight pre-pass over the AST to register
 // all function signatures and struct type shells before the main code-gen walk.
 // This allows functions and types to be used before their definition in source.
@@ -805,30 +832,7 @@ private:
 
         std::vector<LLVMBackend::TypeAndValue> allParams(params.begin(), params.end());
 
-        // Detect functions that heap-allocate and return a new owned value.
-        // operator+ always allocates; operator string(i32) uses malloc; user functions can
-        // opt in by declaring 'move string' or 'move T*' as their return type.
-        bool returnsOwned = false;
-        if (returnType.TypeName == "string")
-        {
-            if (name == "operator+")
-                returnsOwned = true;
-            else if (name == "operator string" && allParams.size() == 1 && allParams[0].TypeName == "i32")
-                returnsOwned = true;
-            else if (returnType.IsMove)
-                returnsOwned = true;
-        }
-        else if (returnType.IsMove && returnType.Pointer)
-        {
-            returnsOwned = true;
-        }
-        // 'move <interface>' transfers ownership of the boxed heap object to the caller (the
-        // caller is then responsible for 'delete'). An interface return type is not Pointer
-        // (its LLVM type is a { vtable, data } fat pointer), so it needs its own case.
-        else if (returnType.IsMove && returnType.IsInterface)
-        {
-            returnsOwned = true;
-        }
+        bool returnsOwned = ComputeReturnsOwned(returnType, name, allParams);
 
         compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwned, false, returnType.CallConv);
 
@@ -4875,16 +4879,7 @@ public:
             returnType.IsNullable = false;
         }
 
-        bool returnsOwned = false;
-        if (returnType.TypeName == "string" && returnType.IsMove)
-            returnsOwned = true;
-        else if (returnType.IsMove && returnType.Pointer)
-            returnsOwned = true;
-        // 'move <interface>' transfers ownership of the boxed heap object to the caller. An
-        // interface return type is not Pointer (its LLVM type is a fat pointer), so handle it
-        // here too - mirrors the forward-declaration copy above.
-        else if (returnType.IsMove && returnType.IsInterface)
-            returnsOwned = true;
+        bool returnsOwned = ComputeReturnsOwned(returnType, name, allParams);
 
         // Pre-scan parameter types, return type, and function body to queue and emit any
         // generic struct instantiations before the function's IR block is opened.
@@ -16146,20 +16141,7 @@ public:
             }
 
             std::vector<LLVMBackend::TypeAndValue> declAllParams(declParams.begin(), declParams.end());
-            bool declReturnsOwned = false;
-            if (declReturnType.TypeName == "string")
-            {
-                if (declName == "operator+")
-                    declReturnsOwned = true;
-                else if (declName == "operator string" && declAllParams.size() == 1 && declAllParams[0].TypeName == "i32")
-                    declReturnsOwned = true;
-                else if (declReturnType.IsMove)
-                    declReturnsOwned = true;
-            }
-            else if (declReturnType.IsMove && declReturnType.Pointer)
-            {
-                declReturnsOwned = true;
-            }
+            bool declReturnsOwned = ComputeReturnsOwned(declReturnType, declName, declAllParams);
             compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs, declReturnsOwned, !isStaticLike);
         }
     }
