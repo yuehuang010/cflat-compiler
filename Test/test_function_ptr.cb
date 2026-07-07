@@ -656,6 +656,34 @@ bool testCaptureOwningContainerEscapes()
         result &= Test("clone escaping closure b", second(), 6);
     }
 
+    // A nested closure (an inner closure with its own heap env) captured by an ESCAPING outer
+    // closure must be DEEP-COPIED via __closure_fat_ptr.copy so the outer owns an independent
+    // clone of the inner env. Before the fix the inner fat pointer was shallow-copied and its env
+    // dangled (UAF under --asan) once the inner closure's block closed.
+    {
+        Lambda<int()> callAdder = default;
+        {
+            int base = 100;
+            Lambda<int(int)> adder = (int x) => x + base;
+            callAdder = () => { return adder(5); };
+        }
+        result &= Test("escaping nested-closure capture", callAdder(), 105);
+    }
+
+    // Clone-of-clone of an escaping outer closure over a heap-env inner: each clone must own an
+    // independent inner env (no shared alias, no double-free of the inner env buffer).
+    {
+        Lambda<int()> outer = default;
+        {
+            int base = 200;
+            Lambda<int(int)> adder = (int x) => x + base;
+            outer = () => { return adder(3); };
+        }
+        Lambda<int()> clone = outer;
+        result &= Test("clone nested-closure a", outer(), 203);
+        result &= Test("clone nested-closure b", clone(), 203);
+    }
+
     return result;
 }
 

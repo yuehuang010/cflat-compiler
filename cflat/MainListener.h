@@ -13494,6 +13494,12 @@ public:
                                 // Invoking a temp's function<> field (`get(i).fn(req)`) yields a fresh result,
                                 // not the borrowed field - clear the taint so storing/returning it isn't rejected.
                                 namedVar.FromOwningTempField = false;
+                                // The call result is a fresh owned value, never a borrow of the callee
+                                // variable. `namedVar` is reused from the callee (e.g. an unpacked
+                                // `alias`/nested-closure capture marked IsAliasBorrow), so clear the
+                                // borrow flag - otherwise it leaks onto the result and suppresses the
+                                // receiving local's destructor (a leak).
+                                namedVar.IsAliasBorrow = false;
                                 namedVar.BondByAddress = false;
                                 namedVar.BondedSources.clear();
                                 functionArgCounter++;
@@ -14738,14 +14744,15 @@ public:
         // Both the deep-copy-at-store and the borrow-in-body decisions key off this one predicate.
         // Deep copy goes through the type's own copy() (list.copy()/dictionary.copy()/string/user
         // copy), so capturing an owning value behaves exactly like `T x = src;`. Admitted only when
-        // that copy is genuinely deep (ClosureCaptureDeepCopyable). Nested closures are excluded:
-        // marking their unpacked capture IsAliasBorrow spuriously propagates the alias flag to the
-        // closure's call results (broke a lambda-capturing-lambda case in test_function_ptr).
+        // that copy is genuinely deep (ClosureCaptureDeepCopyable). A nested closure IS deep-copyable
+        // via `__closure_fat_ptr.copy` (env clone), so its captured inner env has an independent
+        // lifetime and does not dangle once the inner closure's scope closes; the invoker's unpacked
+        // capture is marked IsAliasBorrow, which the indirect-call result path clears so the borrow
+        // does not leak onto the closure's call results.
         auto isOwningCap = [&](const CaptureInfo& cap) -> bool {
             if (cap.ByReference || cap.IsThis) return false;
             if (cap.TV.Pointer || cap.TV.ConstArraySize > 0) return false;
             if (cap.TV.TypeName == "string") return true;
-            if (cap.TV.TypeName == "__closure_fat_ptr") return false;
             return compiler->ClosureCaptureDeepCopyable(cap.TV.TypeName);
         };
 
