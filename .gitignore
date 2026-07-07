@@ -364,8 +364,6 @@ MigrationBackup/
 
 # Claude
 .claude/
-internal/plan/
-internal/issue/
 fuzz/
 
 # macOS Finder metadata
