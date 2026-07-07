@@ -641,6 +641,38 @@ bool testAssertReturnBlock()
 int sumI32(i32 a, i32 b) { return a + b; }
 int sumU32(u32 a, u32 b) { return a + b; }
 
+// Regression: a negative integer literal in a file-scope initializer used to be
+// sign-dropped (narrowed to the smallest unsigned width, e.g. -150 read back as
+// 65386). CreateGlobalVariable now sign-extends when widening the narrowed
+// constant back to the global's declared width.
+const int GlobalNegConstSmall = -3;
+const int GlobalNegConstI8    = -101;
+const int GlobalNegConstI16   = -150;
+const int GlobalNegConstI32   = -70000;
+int GlobalNegPlainSmall = -3;
+int GlobalNegPlainI8    = -101;
+int GlobalNegPlainI16   = -150;
+int GlobalNegPlainI32   = -70000;
+
+bool testNegativeGlobalInit()
+{
+    bool result = true;
+    result &= Test("const_global_neg_small", GlobalNegConstSmall, -3);
+    result &= Test("const_global_neg_i8",     GlobalNegConstI8,    -101);
+    result &= Test("const_global_neg_i16",    GlobalNegConstI16,   -150);
+    result &= Test("const_global_neg_i32",    GlobalNegConstI32,   -70000);
+    result &= Test("plain_global_neg_small",  GlobalNegPlainSmall, -3);
+    result &= Test("plain_global_neg_i8",     GlobalNegPlainI8,    -101);
+    result &= Test("plain_global_neg_i16",    GlobalNegPlainI16,   -150);
+    result &= Test("plain_global_neg_i32",    GlobalNegPlainI32,   -70000);
+
+    // Local initializer with the same magnitudes must keep working (was never broken).
+    int localNeg = -150;
+    result &= Test("local_neg_i16", localNeg, -150);
+
+    return result;
+}
+
 bool testExplicitIntTypes()
 {
     bool result = true;
@@ -2350,6 +2382,7 @@ extern int main()
     total++; passed += testReturnBlock()                 ? 1 : 0;
     total++; passed += testAssertReturnBlock()           ? 1 : 0;
     total++; passed += testExplicitIntTypes()            ? 1 : 0;
+    total++; passed += testNegativeGlobalInit()          ? 1 : 0;
     total++; passed += testNullConditional()             ? 1 : 0;
     total++; passed += testNullCoalescing()              ? 1 : 0;
     total++; passed += testNullCoalescingAssignment()    ? 1 : 0;

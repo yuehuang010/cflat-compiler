@@ -9188,7 +9188,11 @@ public:
             {
                 if (intValue->getIntegerType()->getBitWidth() != destinationType->getIntegerBitWidth())
                 {
-                    initValue = builder->getIntN(destinationType->getIntegerBitWidth(), intValue->getZExtValue());
+                    // Sign-extend, not zero-extend: a negative literal (e.g. the unary-minus
+                    // fold that narrows -150 to i16) must widen via its signed value or the
+                    // sign bit is lost and the constant reads back as a large positive number.
+                    initValue = builder->getIntN(destinationType->getIntegerBitWidth(),
+                        (uint64_t)intValue->getSExtValue());
                 }
             }
             else if (auto fpValue = llvm::dyn_cast<llvm::ConstantFP>(initValue))
