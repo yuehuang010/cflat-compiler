@@ -2030,6 +2030,9 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         if (auto* tu = computeUnit->translationUnit()) {
             for (auto* decl : tu->externalDeclaration()) {
                 if (auto* imp = decl->importDeclaration()) {
+                    // Point diagnostics at this import statement (mirrors Compile's ProcessImports):
+                    // a not-found error would otherwise report a stale location from a prior import.
+                    SetSourceLocation(imp->getStart()->getLine(), imp->getStart()->getCharPositionInLine());
                     // Grouped import `import { "a", "b" };` - one TU for header entries (see
                     // CompileImportGroup); .cb/.c entries route individually.
                     auto groupedImports = DequoteImportGroup(imp);
