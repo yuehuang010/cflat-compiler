@@ -180,7 +180,7 @@ if "%~1"=="--worker-winui" (
     set "WEXE=!OUTDIR!\!WBASE!_wui.exe"
     set "WLOG=!RESDIR!\!RESID!.log"
 
-    "!CFLAT!" "!FILE!" -i example/ui/winui -i example/ui -o "!WEXE!" > "!WLOG!" 2>&1
+    "!CFLAT!" "!FILE!" -i example/ui/winui -i example/ui -i example/ui/gallery -o "!WEXE!" > "!WLOG!" 2>&1
     if not exist "!WEXE!" (
         echo FAIL !WNAME! ^(winui self-test build failed^)>"!RESDIR!\!RESID!.result"
         exit /b
@@ -265,11 +265,13 @@ REM explicit -i to that package. We discover it below and compile the demo when 
 REM on a host without the package it is skipped.
 REM example/macos/* target Darwin (dlopen of AppKit, sysctl, libproc) and are
 REM excluded from this Windows run; compile them on a Mac instead.
-REM winui_host has no main (imported); the two winui demos need the Windows App SDK
-REM bootstrapper + runtime winmds and are launched via the dedicated --worker-winui below.
+REM winui_host has no main (imported); the three winui demos (winui_app_demo, winui_demo,
+REM winui_gallery) need the Windows App SDK bootstrapper + runtime winmds and are launched via
+REM the dedicated --worker-winui below. gallery_app is the host-neutral gallery Component + self-
+REM test (no main; imported by gallery.cb and winui_gallery.cb), so it is excluded like gallery.
 REM native_host is the NativeHost import shim (no main); cocoa_native_host/cocoa_native_settings/
 REM cocoa_probe are its AppKit (Darwin) backend + probes, excluded from this Windows run.
-set EXCLUDE=test_helper ui ui_native win32host win32_native_host native_host fedit gallery http_parser http_response http_json http_server http_client router rest_server http_io cocoa cocoa_probe cocoa_native_host cocoa_native_settings hello_objc cocoa_window sysinfo_mac winui_host winui_app_demo winui_demo
+set EXCLUDE=test_helper ui ui_native win32host win32_native_host native_host fedit gallery gallery_app http_parser http_response http_json http_server http_client router rest_server http_io cocoa cocoa_probe cocoa_native_host cocoa_native_settings hello_objc cocoa_window sysinfo_mac winui_host winui_app_demo winui_demo winui_gallery
 
 REM Discover the newest cached Win32-metadata package dir (the one holding Windows.Win32.winmd).
 REM dir /o-n lists newest-version-first by name. Empty if the nuget package is not installed
@@ -354,15 +356,16 @@ start "" /b cmd /c "%SCRIPT% --worker-gallery ex_!RESID!"
 REM Launch the WinUI 3 (Windows App SDK) self-tests (P6 M2 window bring-up + M3 host),
 REM only when the pinned WindowsAppSDK NuGet packages are cached. Skipped otherwise.
 if defined WINUINUGET (
-    for %%W in (example\ui\winui\winui_app_demo.cb example\ui\winui\winui_demo.cb) do (
+    for %%W in (example\ui\winui\winui_app_demo.cb example\ui\winui\winui_demo.cb example\ui\winui\winui_gallery.cb) do (
         set /a RESID+=1
         set /a LAUNCHED+=1
         start "" /b cmd /c "%SCRIPT% --worker-winui %%W ex_!RESID!"
     )
 ) else (
-    set /a SKIPPED+=2
+    set /a SKIPPED+=3
     echo SKIP: example\ui\winui\winui_app_demo.cb ^(pinned WindowsAppSDK NuGet packages not in cache^)
     echo SKIP: example\ui\winui\winui_demo.cb ^(pinned WindowsAppSDK NuGet packages not in cache^)
+    echo SKIP: example\ui\winui\winui_gallery.cb ^(pinned WindowsAppSDK NuGet packages not in cache^)
 )
 
 REM Wait for all workers to finish (up to TIMEOUT_SECS).

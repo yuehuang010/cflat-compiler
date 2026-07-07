@@ -1,0 +1,627 @@
+// gallery_app.cb - the host-neutral widget-gallery Component + headless self-test.
+//
+// P12 split this out of gallery.cb so BOTH the Win32/Cocoa launcher (gallery.cb, via the
+// native_host.cb shim) and the WinUI 3 launcher (winui/winui_gallery.cb, via winui_host.cb)
+// can compile the SAME GalleryApp + gallerySelfTest against their own NativeHost backend.
+// This file imports ONLY ui.cb (the element model + sugar); every host free function it
+// calls (startHeadlessWindow, the native* drivers, activeApp/activeCtx, hostWidth/hostHeight/
+// hostDark, setMenuHandler, nativeSetContextMenu/nativeFireContextMenu, nativeTeardownForTest)
+// is resolved from whichever host its LAUNCHER also imports - a cflat compilation shares one
+// global scope across the whole import closure of the root, so a sibling import supplies them.
+// It has no main(): a launcher provides that. Excluded from example.bat's plain build sweep.
+import "ui.cb";
+
+const int GALLERY_ROWS = 100000;
+
+// Context-menu command ids (routed through the app menu handler, like the menu bar).
+int CMD_CTX_A = 201;
+int CMD_CTX_B = 202;
+
+// A generated top-down BGRA32 gradient (caller frees). Demonstrates the setImageData
+// seam end to end without any asset file: the host uploads these bytes to an HBITMAP.
+u64 makeGradientPixels(int w, int h)
+{
+    u64 p = (u64)malloc((i64)(w * h * 4));
+    char* b = (char*)p;
+    int y = 0;
+    while (y < h)
+    {
+        int x = 0;
+        while (x < w)
+        {
+            int i = (y * w + x) * 4;
+            b[i + 0] = (char)(x * 255 / w);   // Blue
+            b[i + 1] = (char)(y * 255 / h);   // Green
+            b[i + 2] = (char)200;             // Red
+            b[i + 3] = (char)255;             // Alpha
+            x++;
+        }
+        y++;
+    }
+    return p;
+}
+
+class GalleryApp : Component
+{
+    int pick          = 1;    // RadioGroup selection (0 Small / 1 Medium / 2 Large)
+    int fontIdx       = 0;    // ComboBox selection
+    int listSel       = -1;   // ListView selected row (controlled)
+    int listActivated = -1;   // last double-clicked / Entered row
+    int rowTextCalls  = 0;    // rowText callback invocations (virtualization oracle)
+    int tab           = 0;    // TabControl selection (P9)
+    int treeSel       = 0 - 1; // selected tree node id (P9)
+    int treeExpands   = 0;    // onExpand invocations (P9)
+    int splitRatio    = 30;   // SplitView first-pane percentage (P9)
+    int ctxFired      = 0;    // last context-menu command routed (P9)
+    bool _ctxReg      = false; // one-time context-menu registration guard
+
+    // P10 form-widget state (all controlled).
+    bool   dark       = false;   // theme toggle (light/dark)
+    int    btnClicks  = 0;       // push-button press count
+    string inputText  = default; // TextInput value
+    bool   checked    = false;   // Checkbox value
+    int    progress   = 60;      // ProgressBar value (0..100)
+    int    sliderVal  = 40;      // Slider value (0..100)
+    int    areaEdits  = 0;       // TextArea dirty-notify count
+
+    // Image pixel buffer (owned by the component; freed in the destructor). Borrowed by
+    // the Image element each render - the element never owns pixel memory.
+    u64 imgPixels = 0u;
+    int imgW = 0;
+    int imgH = 0;
+
+    // P13 reconcile stress-soak state. When `stress` is on, render() emits a churn box
+    // whose active pool slots (a fixed kind per slot) and order are driven by a seeded LCG,
+    // so the keyed reconciler must create/destroy/reorder controls by key identity.
+    bool stress      = false;
+    int  stressSeed  = 0;   // LCG state (seeded by the self-test before the first step)
+    int  stressMask  = 0;   // bit i set => pool slot i is present this render
+    int  stressOrder = 0;   // rotation applied to the child order (deterministic reorder)
+
+    ~GalleryApp()
+    {
+        if (this.imgPixels != 0u) { free((void*)this.imgPixels); this.imgPixels = 0u; }
+    }
+
+    string _sizeName()
+    {
+        if (this.pick == 0) return "Small";
+        if (this.pick == 1) return "Medium";
+        return "Large";
+    }
+
+    // Route a context-menu command (invoked via setMenuHandler / nativeFireContextMenu).
+    void onCommand(int id, UiContext* ctx) { this.ctxFired = id; ctx.invalidate(); }
+
+    // Build one churn-pool element for `slot` (a fixed kind per slot). Its LOCAL key is
+    // "s<slot>", so under the stress box its path is "root/stressbox/s<slot>". Kinds span
+    // leaf, container, and data-control families to exercise reconcile across the set.
+    Element _stressChild(int slot)
+    {
+        string k = "s" + slot.toString();
+        if (slot == 0) { Button* b = button("b", () => {}); b.setKey(k); return b; }
+        if (slot == 1) { Text* t = text("t"); t.setKey(k); return t; }
+        if (slot == 2) { Checkbox* c = checkbox("c", false, (bool v) => {}); c.setKey(k); return c; }
+        if (slot == 3) { TextInput* ti = textInput("", (string s) => {}); ti.width = 10; ti.setKey(k); return ti; }
+        if (slot == 4) { ProgressBar* p = progressBar(50, 10); p.setKey(k); return p; }
+        if (slot == 5) { Slider* s = slider(50, 10, (int v) => {}); s.setKey(k); return s; }
+        if (slot == 6)
+        {
+            GroupBox* g = groupBox("g", makeStyle(0, 10, 2)); g.setKey(k);
+            Text* gc = text("gc"); gc.setKey("gc"); g.add(gc);
+            return g;
+        }
+        ComboBox* cb = comboBox(0, (int i) => {}); cb.addItem("x"); cb.addItem("y");
+        cb.width = 10; cb.setKey(k);
+        return cb;
+    }
+
+    Element render(UiContext* ctx)
+    {
+        ctx.theme = this.dark ? darkTheme() : lightTheme();
+
+        // Lazily build the image pixels once (freed in the destructor).
+        if (this.imgPixels == 0u) { this.imgW = 12; this.imgH = 6; this.imgPixels = makeGradientPixels(12, 6); }
+
+        // Register the tree's context menu once (keyed by control path; idempotent).
+        if (!this._ctxReg)
+        {
+            nativeSetContextMenu("root/ctxbox", (u64)buildCtxMenu());
+            this._ctxReg = true;
+        }
+
+        Box* root = box(makeStyle(1, hostWidth(), hostHeight()));
+        root.style.gap = 1;
+        root.setKey("root");
+
+        Text* title = text("Widget Gallery (P10 - full element set)");
+        title.setKey("title");
+        root.add(title);
+
+        // A themed push button + a theme toggle (NM_CUSTOMDRAW accent in dark mode).
+        Button* btn = <Button key="btn" title="Click me"
+                onPress={() => { this.btnClicks = this.btnClicks + 1; ctx.invalidate(); }}/>;
+        root.add(btn);
+        Button* themeBtn = <Button key="themebtn" title="Toggle theme"
+                onPress={() => { this.dark = !this.dark; ctx.invalidate(); }}/>;
+        root.add(themeBtn);
+
+        // The P10 visuals sit high in the column so they land in the doc screenshot (the
+        // full single-column gallery is taller than one window; the self-test covers the rest).
+        // An Image fed a procedural BGRA32 buffer through the setImageData seam.
+        Image* img = <Image key="img" width={12} height={4} altText="gradient"/>;
+        img.pixels = this.imgPixels; img.pxW = this.imgW; img.pxH = this.imgH;
+        root.add(img);
+
+        // A CanvasView escape hatch: the app draws with the same Canvas API the framework
+        // paints through (here, a tiny bar chart + a label) into a GDI-backed child window.
+        CanvasView* canvas = <CanvasView key="canvas" width={24} height={6}/>;
+        canvas.onPaint = (Canvas c) => {
+            int barCount = 5;
+            int i = 0;
+            while (i < barCount)
+            {
+                Rect bar = default;
+                bar.x = 1 + i * 4; bar.w = 3;
+                bar.h = 1 + i; bar.y = 5 - bar.h;
+                c.drawRect(bar, true, rgb(60 + i * 30, 120, 220));
+                i++;
+            }
+            c.drawText(1, 5, "canvas", rgb(40, 40, 40));
+        };
+        root.add(canvas);
+
+        // Controlled TextInput + Checkbox.
+        TextInput* input = <TextInput key="input" value={this.inputText} width={24}
+                placeholder="type here"
+                onChangeText={(string s) => { this.inputText = s; ctx.invalidate(); }}/>;
+        root.add(input);
+        Checkbox* chk = <Checkbox key="check" label="Enable feature" checked={this.checked}
+                onChange={(bool v) => { this.checked = v; ctx.invalidate(); }}/>;
+        root.add(chk);
+
+        // Presentational ProgressBar + controlled Slider.
+        ProgressBar* prog = <ProgressBar key="prog" value={this.progress} width={24}/>;
+        prog.tooltip = "download progress";   // also the control's accessible Name (P13 a11y)
+        root.add(prog);
+        Slider* sld = <Slider key="slider" value={this.sliderVal} width={24}
+                onChange={(int v) => { this.sliderVal = v; ctx.invalidate(); }}/>;
+        root.add(sld);
+
+        // A GroupBox framing a couple of labels (classic-forms grouping).
+        GroupBox* grp = <GroupBox key="grp" title="Options"/>;
+        grp.style.width = 30; grp.style.height = 4;
+        grp.add(<Text key="gt0" text="grouped item A"/>);
+        grp.add(<Text key="gt1" text="grouped item B"/>);
+        root.add(grp);
+
+        // RadioGroup authored in sugar (controlled: each radio's checked flows down).
+        RadioGroup* rg = <RadioGroup key="rg" value={this.pick}
+                onChange={(int i) => { this.pick = i; ctx.invalidate(); }}>
+            <RadioButton key="r0" label="Small"  index={0} checked={this.pick == 0}/>
+            <RadioButton key="r1" label="Medium" index={1} checked={this.pick == 1}/>
+            <RadioButton key="r2" label="Large"  index={2} checked={this.pick == 2}/>
+        </RadioGroup>;
+        root.add(rg);
+
+        // ComboBox authored in sugar; items added imperatively (a list-valued field is
+        // not set through a sugar attribute - the container-copy-into-field rule).
+        ComboBox* cb = <ComboBox key="combo" selectedIndex={this.fontIdx} width={20}
+                onChange={(int i) => { this.fontIdx = i; ctx.invalidate(); }}/>;
+        cb.addItem("Consolas");
+        cb.addItem("Cascadia Code");
+        cb.addItem("Segoe UI");
+        cb.addItem("Courier New");
+        root.add(cb);
+
+        // Virtualized ListView authored in sugar; columns + rowText set imperatively.
+        ListView* lv = <ListView key="list" rowCount={GALLERY_ROWS}
+                selectedIndex={this.listSel} width={40} height={6}
+                onSelect={(int r) => { this.listSel = r; ctx.invalidate(); }}
+                onActivate={(int r) => { this.listActivated = r; ctx.invalidate(); }}/>;
+        lv.addColumn("Index", 12);
+        lv.addColumn("Square", 18);
+        lv.rowText = (int r, int c) => {
+            this.rowTextCalls = this.rowTextCalls + 1;
+            if (c == 0) return "row " + r.toString();
+            i64 sq = (i64)r * (i64)r;
+            return sq.toString();
+        };
+        root.add(lv);
+
+        // TabControl authored in sugar (P9): keyed panes, only the active one maps to
+        // native. Switching tabs is controlled through onSelectTab.
+        TabControl* tabs = <TabControl key="tabs" selectedTab={this.tab} width={40} height={5}
+                onSelectTab={(int i) => { this.tab = i; ctx.invalidate(); }}>
+            <TabPane key="p0" title="Alpha"><Text key="t0" text="Alpha pane content"/></TabPane>
+            <TabPane key="p1" title="Beta"><Text key="t1" text="Beta pane content"/></TabPane>
+        </TabControl>;
+        root.add(tabs);
+
+        // TreeView authored in sugar (P9): expand-on-demand node source. onSelect/onExpand
+        // are attributes; the child/label callbacks are assigned imperatively (like rowText).
+        TreeView* tree = <TreeView key="tree" width={24} height={6} selectedNode={this.treeSel}
+                onSelect={(int nid) => { this.treeSel = nid; ctx.invalidate(); }}
+                onExpand={(int nid) => { this.treeExpands = this.treeExpands + 1; }}/>;
+        tree.childCount = (int nid) => {
+            if (nid == TREE_ROOT) return 2;   // src (folder) + notes.txt
+            if (nid == 1) return 2;           // main.cb + ui.cb
+            return 0;
+        };
+        tree.childId = (int nid, int i) => {
+            if (nid == TREE_ROOT) return i == 0 ? 1 : 2;
+            if (nid == 1) return i == 0 ? 10 : 11;
+            return 0;
+        };
+        tree.label = (int nid) => {
+            if (nid == 1) return "src";
+            if (nid == 2) return "notes.txt";
+            if (nid == 10) return "main.cb";
+            if (nid == 11) return "ui.cb";
+            return "?";
+        };
+        root.add(tree);
+
+        // SplitView authored in sugar (P9): two weighted panes + a draggable divider.
+        SplitView* split = <SplitView key="split" ratio={this.splitRatio} vertical={true}
+                onRatioChange={(int r) => { this.splitRatio = r; ctx.invalidate(); }}>
+            <Box key="lp" style={makeStyle(0, 0, 3)}><Text key="lpt" text="left"/></Box>
+            <Box key="rp" style={makeStyle(0, 0, 3)}><Text key="rpt" text="right"/></Box>
+        </SplitView>;
+        split.style.width = 40; split.style.height = 3;
+        root.add(split);
+
+        // A multiline TextArea (uncontrolled-with-sync) + a right-clickable context panel.
+        TextArea* area = <TextArea key="area" value="" width={40} height={4}
+                onChange={() => { this.areaEdits = this.areaEdits + 1; }}/>;
+        root.add(area);
+
+        Box* ctxbox = box(makeStyle(0, 40, 2));
+        ctxbox.setKey("ctxbox");
+        ctxbox.add(text("right-click me (context menu)"));
+        root.add(ctxbox);
+
+        // Status lines (existing P8/P9 asserts) + a bottom StatusBar strip.
+        Text* status = text("pick=" + this._sizeName() + " font=" + this.fontIdx.toString()
+            + " sel=" + this.listSel.toString() + " act=" + this.listActivated.toString());
+        status.setKey("status");
+        root.add(status);
+
+        Text* status2 = text("tab=" + this.tab.toString() + " tsel=" + this.treeSel.toString()
+            + " ratio=" + this.splitRatio.toString() + " ctx=" + this.ctxFired.toString());
+        status2.setKey("status2");
+        root.add(status2);
+
+        StatusBar* sbar = <StatusBar key="sbar"/>;
+        sbar.parts.add("Ready");
+        sbar.parts.add("clicks=" + this.btnClicks.toString());
+        root.add(sbar);
+
+        // P13 reconcile stress-soak: only rendered once the self-test turns `stress` on. The
+        // active pool slots and their order come from the seeded LCG state, so each step is a
+        // deterministic create/destroy/reorder the keyed reconciler must track by identity.
+        if (this.stress)
+        {
+            Box* sbox = box(makeStyle(0, 40, 10));
+            sbox.setKey("stressbox");
+            int n = 8;
+            int step = 0;
+            while (step < n)
+            {
+                int slot = (step + this.stressOrder) % n;
+                if (((this.stressMask >> slot) & 1) != 0) sbox.add(this._stressChild(slot));
+                step++;
+            }
+            root.add(sbox);
+        }
+
+        // The stress-step button (always present) advances the LCG one step per click. The
+        // self-test drives it host-neutrally via nativeClickButton, then asserts the native
+        // control census matches this.stressMask after each reconcile.
+        Button* stressBtn = button("stress-step", () => {
+            this.stress = true;
+            u32 s = (u32)this.stressSeed * 1103515245u + 12345u;
+            this.stressSeed = (int)s;
+            this.stressMask = (int)((s >> 8) & 0xFFu);
+            this.stressOrder = (int)((s >> 20) & 0x7u);
+            ctx.invalidate();
+        });
+        stressBtn.setKey("stressbtn");
+        root.add(stressBtn);
+        return root;
+    }
+};
+
+// A context menu built with the <ContextMenu/> sugar (P9); returned as an owned pointer
+// the caller inline-casts to u64 for nativeSetContextMenu (the host then owns + frees it).
+ContextMenu* buildCtxMenu()
+{
+    ContextMenu* m = <ContextMenu/>;
+    m.addItem("Action A", CMD_CTX_A);
+    m.addItem("Action B", CMD_CTX_B);
+    return m;
+}
+
+// Wire the app menu handler so a context-menu command reaches the model. A NAMED borrow
+// is downcast (not activeApp() directly) - `as` on a call result yields an owning ptr.
+void wireGallery()
+{
+    setMenuHandler((int id) =>
+    {
+        GalleryApp* g = activeApp() as GalleryApp;
+        if (g != nullptr) g.onCommand(id, activeCtx());
+    });
+}
+
+// ── Headless state-assert self-test ──────────────────────────────────────────
+// Invisible window, real controls, driven through host-neutral native* test drivers
+// exactly as the OS would on user input; control + model state is the oracle (no
+// pixels). P11 removed every toolkit-typed SendMessage so this runs against any host.
+
+// True if the control at keyPath has a live native handle.
+bool _exists(string keyPath) { return activeCtx().nativeHandle(keyPath) != 0u; }
+
+// A control's text equals `want` (owned read via the host-neutral driver).
+bool _statusIs(string keyPath, const char* want)
+{
+    string s = nativeControlText(keyPath);
+    return strcmp(s.data(), (char*)want) == 0;
+}
+
+// A control's text contains `sub`.
+bool _statusHas(string keyPath, const char* sub)
+{
+    string s = nativeControlText(keyPath);
+    return strstr(s.data(), (char*)sub) != nullptr;
+}
+
+int gallerySelfTest()
+{
+    wireGallery();
+    startHeadlessWindow(new GalleryApp(), "gallery-selftest", 60, 60);   // hidden 60x60
+
+    int pass = 0; int total = 0;
+
+    // 1. Every P8 control became a real control.
+    total++;
+    bool created = _exists("root/rg/r0") && _exists("root/rg/r1") && _exists("root/rg/r2")
+        && _exists("root/combo") && _exists("root/list")
+        && _exists("root/status") && _exists("root/status2");
+    if (created) pass++; else printf("  FAIL: controls not all created\n");
+
+    // 2. Initial state: radio r1 checked (pick=1), combo at index 0, list has 100k rows,
+    //    status echoes the model.
+    total++;
+    bool init = nativeIsChecked("root/rg/r1")
+        && !nativeIsChecked("root/rg/r0")
+        && !nativeIsChecked("root/rg/r2")
+        && nativeComboSelected("root/combo") == 0
+        && nativeListRowCount("root/list") == GALLERY_ROWS
+        && _statusIs("root/status", "pick=Medium font=0 sel=-1 act=-1");
+    if (init) pass++; else printf("  FAIL: initial state\n");
+
+    // 3. Click radio "Large".
+    total++;
+    nativeClickButton("root/rg/r2");
+    bool radio = nativeIsChecked("root/rg/r2") && !nativeIsChecked("root/rg/r1")
+        && _statusIs("root/status", "pick=Large font=0 sel=-1 act=-1");
+    if (radio) pass++; else printf("  FAIL: radio selection\n");
+
+    // 4. Change the combo to index 2 (routes CBN_SELCHANGE).
+    total++;
+    nativeComboSelect("root/combo", 2);
+    bool combo = _statusIs("root/status", "pick=Large font=2 sel=-1 act=-1");
+    if (combo) pass++; else printf("  FAIL: combo change not routed\n");
+
+    // 5. Virtualization + rowText wiring: query two cells of row 50000.
+    total++;
+    string cell0 = nativeListCellText("root/list", 50000, 0);
+    string cell1 = nativeListCellText("root/list", 50000, 1);
+    bool cells = cell0 == "row 50000" && cell1 == "2500000000";
+    if (cells) pass++; else printf("  FAIL: cell text (col0='%s' col1='%s')\n", cell0.data(), cell1.data());
+
+    // 6. Virtualization oracle: rowText fired only a handful of times for 100k rows.
+    total++;
+    GalleryApp* g = activeApp() as GalleryApp;
+    int calls = g != nullptr ? g.rowTextCalls : 999999;
+    bool virt = calls > 0 && calls < 100;
+    if (virt) pass++; else printf("  FAIL: rowText invoked %d times (expected small)\n", calls);
+
+    // 7. Selection round-trip: select row 5 as the OS would.
+    total++;
+    nativeListSelect("root/list", 5);
+    bool sel = nativeListSelectedRow("root/list") == 5
+        && g != nullptr && g.listSel == 5
+        && _statusIs("root/status", "pick=Large font=2 sel=5 act=-1");
+    if (sel) pass++; else printf("  FAIL: list selection round-trip (row=%d)\n", nativeListSelectedRow("root/list"));
+
+    // 8. Activation: Enter on the list (row 5 still selected).
+    total++;
+    nativeListActivate("root/list", 5);
+    bool act = g != nullptr && g.listActivated == 5
+        && _statusIs("root/status", "pick=Large font=2 sel=5 act=5");
+    if (act) pass++; else printf("  FAIL: list activation (act=%d)\n", g != nullptr ? g.listActivated : -2);
+
+    // 9. TabControl (P9): two tabs, initial selection 0, the active pane's Text is live.
+    total++;
+    bool tabsInit = _exists("root/tabs") && nativeTabCount("root/tabs") == 2
+        && nativeTabSelected("root/tabs") == 0
+        && _exists("root/tabs/p0/t0") && !_exists("root/tabs/p1/t1");
+    if (tabsInit) pass++; else printf("  FAIL: tabs init (count=%d sel=%d)\n", nativeTabCount("root/tabs"), nativeTabSelected("root/tabs"));
+
+    // 10. Tab switch: select tab 1; the model follows, pane p1 becomes live, p0 destroyed.
+    total++;
+    nativeTabSelect("root/tabs", 1);
+    bool tabSwitch = g != nullptr && g.tab == 1 && nativeTabSelected("root/tabs") == 1
+        && _exists("root/tabs/p1/t1") && !_exists("root/tabs/p0/t0") && _statusHas("root/status2", "tab=1");
+    if (tabSwitch) pass++; else printf("  FAIL: tab switch (tab=%d)\n", g != nullptr ? g.tab : -1);
+
+    // 11. TreeView (P9): the two top-level nodes are inserted; expanding "src" lazily
+    //     materializes its two children (count 2 -> 4) and fires onExpand.
+    total++;
+    int cntBefore = nativeTreeItemCount("root/tree");
+    u64 srcItem = nativeTreeRootItem("root/tree");
+    int beforeExpands = g != nullptr ? g.treeExpands : 0;
+    nativeTreeExpandItem("root/tree", srcItem);
+    int cntAfter = nativeTreeItemCount("root/tree");
+    bool treeExpand = _exists("root/tree") && cntBefore == 2 && cntAfter == 4
+        && g != nullptr && g.treeExpands > beforeExpands;
+    if (treeExpand) pass++; else printf("  FAIL: tree expand (before=%d after=%d)\n", cntBefore, cntAfter);
+
+    // 12. Tree select: select the first child of "src" (main.cb, node 10) -> onSelect.
+    total++;
+    u64 child0 = nativeTreeChildItem("root/tree", srcItem);
+    int childNid = nativeTreeItemNodeId("root/tree", child0);
+    nativeTreeSelectItem("root/tree", child0);
+    bool treeSel = g != nullptr && g.treeSel == 10 && childNid == 10 && _statusHas("root/status2", "tsel=10");
+    if (treeSel) pass++; else printf("  FAIL: tree select (treeSel=%d nid=%d)\n", g != nullptr ? g.treeSel : -9, childNid);
+
+    // 13. SplitView (P9): dragging the divider changes the ratio + the left pane's width.
+    total++;
+    Rect sbBefore = nativeNodeBounds("root/split/lp");
+    Rect splitB = nativeNodeBounds("root/split");
+    nativeSplitterDrag("root/split", splitB.x + 30, splitB.y);   // ratio ~= 75
+    Rect sbAfter = nativeNodeBounds("root/split/lp");
+    bool splitDrag = g != nullptr && g.splitRatio != 30 && sbAfter.w != sbBefore.w
+        && _statusHas("root/status2", "ratio=");
+    if (splitDrag) pass++; else printf("  FAIL: split drag (ratio=%d w %d->%d)\n", g != nullptr ? g.splitRatio : -1, sbBefore.w, sbAfter.w);
+
+    // 14. ContextMenu (P9): firing item 0 routes CMD_CTX_A through the app menu handler.
+    total++;
+    nativeFireContextMenu("root/ctxbox", 0);
+    bool ctxOk = g != nullptr && g.ctxFired == CMD_CTX_A && _statusHas("root/status2", "ctx=201");
+    if (ctxOk) pass++; else printf("  FAIL: context menu route (ctxFired=%d)\n", g != nullptr ? g.ctxFired : -1);
+
+    // ── P10: form widgets + visuals (all host-neutral drivers) ────────────────
+    // 15. All the P10 controls were created.
+    total++;
+    bool p10Created = _exists("root/btn") && _exists("root/input") && _exists("root/check")
+        && _exists("root/prog") && _exists("root/slider") && _exists("root/grp") && _exists("root/img")
+        && _exists("root/canvas") && _exists("root/area") && _exists("root/sbar");
+    if (p10Created) pass++; else printf("  FAIL: P10 controls not all created\n");
+
+    // 16. Button click routes onPress.
+    total++;
+    nativeClickButton("root/btn");
+    bool btnOk = g != nullptr && g.btnClicks == 1;
+    if (btnOk) pass++; else printf("  FAIL: button click (clicks=%d)\n", g != nullptr ? g.btnClicks : -1);
+
+    // 17. TextInput: type text (routes EN_CHANGE) -> controlled onChangeText updates the model.
+    total++;
+    nativeTypeText("root/input", "hello");
+    bool inputOk = g != nullptr && g.inputText == "hello" && _statusIs("root/input", "hello");
+    if (inputOk) pass++; else printf("  FAIL: text input route\n");
+
+    // 18. Checkbox: click -> controlled onChange flips the model.
+    total++;
+    nativeClickButton("root/check");
+    bool checkOk = g != nullptr && g.checked;
+    if (checkOk) pass++; else printf("  FAIL: checkbox toggle\n");
+
+    // 19. ProgressBar reflects the model value.
+    total++;
+    bool progOk = nativeProgressValue("root/prog") == 60;
+    if (progOk) pass++; else printf("  FAIL: progress value (%d)\n", nativeProgressValue("root/prog"));
+
+    // 20. Slider: drag to a new position -> controlled onChange.
+    total++;
+    nativeSliderSet("root/slider", 80);
+    bool sliderOk = g != nullptr && g.sliderVal == 80;
+    if (sliderOk) pass++; else printf("  FAIL: slider (val=%d)\n", g != nullptr ? g.sliderVal : -1);
+
+    // 21. GroupBox carries its title.
+    total++;
+    bool grpOk = _statusIs("root/grp", "Options");
+    if (grpOk) pass++; else printf("  FAIL: groupbox title\n");
+
+    // 22. Image: the setImageData seam uploaded a bitmap.
+    total++;
+    bool imgOk = nativeImageHasBitmap("root/img");
+    if (imgOk) pass++; else printf("  FAIL: image has no bitmap\n");
+
+    // 23. StatusBar strip carries the main pane text.
+    total++;
+    string sbarTxt = nativeStatusText("root/sbar");
+    bool sbarOk = strstr(sbarTxt.data(), "Ready") != nullptr;
+    if (sbarOk) pass++; else printf("  FAIL: statusbar text [%s]\n", sbarTxt.data());
+
+    // 24. Theme toggle: clicking flips dark mode and re-themes the window.
+    total++;
+    nativeClickButton("root/themebtn");
+    bool themeOk = g != nullptr && g.dark && hostDark();
+    if (themeOk) pass++; else printf("  FAIL: theme toggle (dark=%d win=%d)\n", g != nullptr ? (g.dark ? 1 : 0) : -1, hostDark() ? 1 : 0);
+
+    // 25. Accent buttons (P10): in dark mode the push button carries a stored accent AND the
+    //     NM_CUSTOMDRAW path renders it - driving the custom draw fills the button rect with
+    //     exactly the stored accent color (PrintWindow cannot capture this; live-only render).
+    total++;
+    u32 abg = nativeAccentBg("root/btn");
+    bool stored = abg != 0u;
+    u32 drawn = nativeTestCustomDrawFill("root/btn");
+    bool accentOk = stored && drawn == abg;
+    if (accentOk) pass++; else printf("  FAIL: accent (stored=%d bg=%u drawn=%u)\n", stored ? 1 : 0, abg, drawn);
+
+    // ── P13: hardening asserts (theme-flip storm + reconcile stress-soak) ─────
+    // 26. Theme-flip storm: toggling light/dark many times must keep the host titlebar theme
+    //     in lockstep with the model after every reconcile (and stay leak/asan-clean, which
+    //     the external --heap-audit/--asan gate verifies).
+    total++;
+    bool stormOk = true;
+    int flip = 0;
+    while (flip < 26)
+    {
+        nativeClickButton("root/themebtn");
+        bool modelDark = g != nullptr && g.dark;
+        if (hostDark() != modelDark) stormOk = false;
+        flip++;
+    }
+    if (stormOk) pass++; else printf("  FAIL: theme-flip storm desynced host vs model\n");
+
+    // 27. Reconcile stress-soak: a seeded LCG drives create/destroy/reorder across the churn
+    //     pool for N steps. After each step the native control census (one live handle per
+    //     key) must exactly match this.stressMask, and any slot present both before AND after
+    //     must keep its handle (reconcile preserved identity across the reorder).
+    total++;
+    bool soakOk = true;
+    if (g != nullptr)
+    {
+        g.stressSeed = 305419896;   // fixed seed (0x12345678); fully deterministic
+        list<u64> prevH = default;
+        int p = 0;
+        while (p < 8) { prevH.add(0u); p++; }
+        int prevMask = 0;
+        int iter = 0;
+        while (iter < 48)
+        {
+            nativeClickButton("root/stressbtn");
+            int mask = g.stressMask;
+            int slot = 0;
+            while (slot < 8)
+            {
+                string kp = "root/stressbox/s" + slot.toString();
+                bool want = ((mask >> slot) & 1) != 0;
+                u64 h = activeCtx().nativeHandle(kp);
+                bool have = h != 0u;
+                if (have != want) soakOk = false;
+                if (want && ((prevMask >> slot) & 1) != 0 && prevH.get(slot) != 0u && h != prevH.get(slot))
+                    soakOk = false;
+                prevH.set(slot, h);
+                slot++;
+            }
+            prevMask = mask;
+            iter++;
+        }
+    }
+    else soakOk = false;
+    if (soakOk) pass++; else printf("  FAIL: reconcile stress-soak census/identity mismatch\n");
+
+    nativeTeardownForTest();
+
+    if (pass == total)
+    {
+        printf("PASS: gallery self-test %d/%d (full element set: forms, data, nav, visuals)\n", pass, total);
+        return 0;
+    }
+    printf("FAIL: gallery self-test %d/%d\n", pass, total);
+    return 1;
+}

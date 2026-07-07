@@ -3583,11 +3583,24 @@ public:
                             && returnNV.Storage != nullptr
                             && llvm::isa<llvm::AllocaInst>(returnNV.Storage)
                             && !returnNV.BorrowsOwnedString;
+                        // A direct call result carries an authoritative runtime OWNED bit: the callee
+                        // already cleared it for a borrow return (list.get's `return _data[i]`) or left
+                        // it set for an owned return (`return "k" + s;`). Re-clearing here would orphan
+                        // a buffer the caller must free - the leak in `return makeOwned();`. Genuine
+                        // borrows are loads from storage (field/element GEP), never a CallInst.
+                        bool returnIsCallResult = right != nullptr && llvm::isa<llvm::CallInst>(right);
+                        // A borrow string PARAMETER (`string echo(string s){return s;}`) has an
+                        // alloca Storage so it looks like a movable whole-local, but the frame does
+                        // not own its buffer - returning it must clear the OWNED bit so the caller
+                        // gets a BORROW, not a second owner of the caller's buffer (double-free).
+                        bool returnIsBorrowStringParam =
+                            compiler->IsBorrowStringParamStorage(returnNV.Storage);
                         bool clearReturnedStringBorrowBit =
                             NamedVarIsString(returnNV)
                             && !compiler->currentFunctionReturnsOwned
                             && !returnExprOwned
-                            && !returnIsWholeLocal;
+                            && (!returnIsWholeLocal || returnIsBorrowStringParam)
+                            && !returnIsCallResult;
                         // Same borrow classification for a STRUCT taken from a collection the
                         // function does not own (e.g. `alias T get` returning `_data[i]`). The
                         // shallow copy handed back carries the OWNED bit of every owning string
@@ -3602,7 +3615,8 @@ public:
                             && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)
                             && !compiler->currentFunctionReturnsOwned
                             && !returnExprOwned
-                            && !returnIsWholeLocal;
+                            && !returnIsWholeLocal
+                            && !returnIsCallResult;
 
                         if (compiler->currentFunctionReturnsOwned && right != nullptr
                             && !llvm::isa<llvm::Constant>(right)

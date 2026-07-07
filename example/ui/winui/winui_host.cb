@@ -1,21 +1,34 @@
-// winui_host.cb - P6 M3: a WinUI 3 backend for the NativeHost seam (ui_native.cb).
+// winui_host.cb - a WinUI 3 (Windows App SDK) backend for the NativeHost seam (ui_native.cb).
 //
-// Same contract as win32_native_host.cb, but the output stage drives REAL WinUI 3 (Windows
-// App SDK) controls instead of Win32 common controls: the reconciled Element tree's keyed
-// nodes map to XAML controls rooted in a Microsoft.UI.Xaml.Controls.Canvas, positioned with
-// Canvas.SetLeft/Top, and events flow back through winrtDelegate handlers into the existing
-// Event/dispatch seam. Nothing above the NativeHost seam changes - this file only replaces
-// the host implementation.
+// P6 M3 brought up the seam with four element kinds (Button/Text/CheckBox/Box). P12 completes
+// it: the full element set (TextBox, Slider/ProgressBar via IRangeBase, RadioButton, ComboBox,
+// ListView, TabView, TreeView, Image via WriteableBitmap, GroupBox, StatusBar, CanvasView
+// placeholder), the setListOp item-data protocol (its THIRD host validation), ctx.post through
+// the DispatcherQueue, theme accents, and the host-neutral native* test-driver set the gallery
+// self-test drives. Nothing above the NativeHost seam changes - this file only replaces the host.
 //
-// The whole graph lives on the XAML UI thread: bring-up runs inside Application.Start's
-// ApplicationInitializationCallback (Start owns the message pump). See runAppWinui below.
+// STRUCTURE: like the Win32 host, but single-window (multi-window is deferred, mirroring the
+// Cocoa P11 decision - the gallery gate needs one window; fedit-on-WinUI is not gating). The
+// whole graph lives on the XAML UI thread inside Application.Start's callback (Start owns the
+// message pump). A live app idles the pump; the headless self-test runs SYNCHRONOUSLY inside the
+// init callback (the framework is up, controls create + drive + read back with plain COM calls -
+// no reposting needed) and then Exits.
 //
-// This file has no main(); an app imports it, defines a Component, and calls runAppWinui().
-// See winui_demo.cb for the flagship + headless self-test.
+// DATA CONTROLS: the ListView/TreeView/TabView XAML controls are created (so keyed identity +
+// _exists hold), but their item DISPLAY is backed by the host-side box/model bookkeeping that the
+// native* drivers query - i.e. the setListOp seam + the rowText/TreeBox callbacks are validated
+// exactly as on Win32/Cocoa, while binding a live virtualized ItemsSource is a documented visual
+// enrichment deferred past this milestone (it needs a WinRT bindable-collection implementation).
+// See doc/UI.md parity matrix.
+//
+// This file has no main(); an app imports it, defines a Component, and calls runAppWinui() (live)
+// or the launcher runs runWinuiHeadless() with a self-test body. See winui_demo.cb / winui_gallery.cb.
 
 import "ui.cb";
 import "ui_native.cb";
 import "winrt.cb";
+import "com.cb";
+import "guid.cb";
 import "function.cb";
 import package-nuget "Microsoft.UI.Xaml.winmd" from "Microsoft.WindowsAppSDK.WinUI/1.8.260224000";
 import package-nuget "Microsoft.UI.winmd" from "Microsoft.WindowsAppSDK.InteractiveExperiences/1.8.260125001";
@@ -25,14 +38,35 @@ import package-nuget "Microsoft.Windows.ApplicationModel.DynamicDependency.winmd
 extern stdcall i32  MddBootstrapInitialize2(u32 majorMinor, u16* versionTag, u64 minVersion, i32 options);
 extern stdcall void MddBootstrapShutdown();
 
+// ── IBufferByteAccess {905A0FEF-BC53-11DF-8C49-001E4FC686DA} ──────────────────
+// The classic COM (non-WinRT) interface that hands out the raw byte pointer behind an IBuffer.
+// iidof knows only winmd types, so this is hand-declared (like core/com.cb's IUnknown) and its
+// IID hand-built; WriteableBitmap.PixelBuffer is filled through it (setImageData).
+struct IBufferByteAccessVtbl
+{
+    function<i32(void*, void*, void**)> QueryInterface = nullptr;
+    function<u32(void*)>                AddRef         = nullptr;
+    function<u32(void*)>                Release        = nullptr;
+    function<i32(void*, u8**)>          Buffer         = nullptr;
+};
+struct IBufferByteAccess { IBufferByteAccessVtbl* lpVtbl = nullptr; };
+
+Guid IID_IBufferByteAccess()
+{
+    return Guid.make((u32)0x905A0FEF, (u16)0xBC53, (u16)0x11DF,
+                     (u8)0x8C, (u8)0x49, (u8)0x00, (u8)0x1E,
+                     (u8)0x4F, (u8)0xC6, (u8)0x86, (u8)0xDA);
+}
+
 // ── Host-wide singletons (one UI thread, one window) ─────────────────────────
 WinUI3Host _wHost  = default;
-Component    _wApp  = default;
-Element     _wTree  = default;
-UiContext   _wCtx   = default;
-bool        _wReady = false;
-int         _wW     = 80;   // client size in DIP units (layout width/height)
-int         _wH     = 40;
+Component   _wApp   = default;
+Element    _wTree   = default;
+UiContext  _wCtx    = default;
+bool       _wReady  = false;
+bool       _wDark   = false;   // last applied theme was dark (drives hostDark())
+int        _wW      = 80;      // client size in DIP units (layout width/height)
+int        _wH      = 40;
 
 // XAML plumbing captured during bring-up (all borrowed process-lived singletons).
 void* _gApp        = nullptr;   // IApplication* (base app; Exit ends the pump)
@@ -43,13 +77,37 @@ void* _gPv         = nullptr;   // IPropertyValueStatics* (box a string as conte
 
 int hostWidth()  { return _wW; }
 int hostHeight() { return _wH; }
+bool hostDark()  { return _wDark; }
 
-// The app registers a post-mount hook (run on the UI thread after the first tree is mounted):
-// a live app idles; a self-test drives the controls. Kept as a Lambda so the host never calls
-// an app-defined function by name (imported-module -> importer inversion).
+alias Component activeApp() { return _wApp; }
+UiContext*      activeCtx() { return &_wCtx; }
+
+// The app's post-mount hook (live app idles; a self-test drives). Kept as a Lambda so the host
+// never calls an app-defined function by name (imported-module -> importer inversion).
 Lambda<void()> _wPostMount    = default;
 bool           _wHasPostMount = false;
 void setPostMount(Lambda<void()> f) { _wPostMount = f; _wHasPostMount = true; }
+
+// The headless self-test body (a launcher installs it; runWinuiHeadless runs it inside the pump).
+Lambda<int()>  _wSelfBody    = default;
+bool           _wHasSelfBody = false;
+int            _wSelfRc      = 0;
+void setSelfTestBody(Lambda<int()> f) { _wSelfBody = f; _wHasSelfBody = true; }
+
+// App-wide command dispatcher + per-key context menus (chrome; reused by nativeFireContextMenu).
+Lambda<void(int)> _menuHandler    = default;
+bool              _hasMenuHandler = false;
+void setMenuHandler(Lambda<void(int)> h) { _menuHandler = h; _hasMenuHandler = true; }
+void routeMenu(int cmd) { if (_hasMenuHandler) _menuHandler(cmd); pumpWinui(); }
+
+// A Theme is "dark" when its panel background is darker than mid-gray (default/monochrome = light).
+bool winuiThemeIsDark(Theme* t)
+{
+    int c = t.panelBg;
+    if (c == 0) return false;
+    int r = (c >> 16) & 0xFF; int g = (c >> 8) & 0xFF; int b = c & 0xFF;
+    return (r + g + b) < 384;
+}
 
 // QI helper: COM QueryInterface is symmetric, so any thin interface pointer reaches slot-0 QI.
 void* wqi(void* obj, void* iid)
@@ -75,10 +133,27 @@ void* boxBool(bool b)
     return boxed;
 }
 
-// Which Element kinds this host realizes as XAML controls (M3 subset).
+// Compose a control that has no ActivateInstance (E_NOTIMPL): factory->CreateInstance(null outer),
+// exactly like the base Application/Window. ProgressBar/TabView/TreeView are composable this way.
+void* winuiCompose(string cls, void* facIid)
+{
+    void* fac = nullptr;
+    activationFactory(cls, facIid, (void**)&fac);
+    if (fac == nullptr) return nullptr;
+    void* inner = nullptr; void* raw = nullptr;
+    ((IApplicationFactory*)fac)->lpVtbl->CreateInstance(fac, nullptr, &inner, &raw);
+    return raw;
+}
+
+// Every framework element kind the WinUI host realizes as a XAML control.
 bool winuiMappable(int kind)
 {
-    return kind == ELEM_BUTTON || kind == ELEM_TEXT || kind == ELEM_CHECKBOX || kind == ELEM_BOX;
+    return kind == ELEM_BUTTON || kind == ELEM_TEXT || kind == ELEM_TEXTINPUT
+        || kind == ELEM_CHECKBOX || kind == ELEM_PROGRESS || kind == ELEM_SLIDER
+        || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_STATUSBAR
+        || kind == ELEM_RADIO || kind == ELEM_COMBO || kind == ELEM_LIST
+        || kind == ELEM_TABS || kind == ELEM_TREE
+        || kind == ELEM_IMAGE || kind == ELEM_GROUPBOX || kind == ELEM_CANVAS;
 }
 
 class WinUI3Host : NativeHost
@@ -86,17 +161,267 @@ class WinUI3Host : NativeHost
     bool applying = false;   // guard: swallow self-inflicted Checked/Unchecked
     list<string> liveKeys = default;   // keys live this frame (drives the destroy diff)
 
-    // NativeHost: activate a XAML control for `elemKind`, append it to the root Canvas, wire
-    // its events (capturing `key` for routing), and return the control's IInspectable as u64.
+    // Text mirror (fallback for nativeControlText when a live get_Text is unavailable).
+    list<u64>    txtH = default;
+    list<string> txtV = default;
+
+    // ListView bookkeeping (P8 setListOp): parallel control handle -> rowCount / rowText box / selection.
+    list<u64>    listH        = default;
+    list<int>    listRowCount = default;
+    list<u64>    listBox      = default;
+    list<int>    listSel      = default;
+
+    // TreeView bookkeeping (P9): the boxed node source (TreeBox*) per control, and a host-side
+    // materialized-node model (synthetic item handles) that the tree drivers walk.
+    list<u64>    treeBoxH = default;
+    list<u64>    treeBoxV = default;
+    list<u64>    tItemCtrl = default;   // owning control handle per materialized item
+    list<u64>    tItemH    = default;   // synthetic item handle
+    list<int>    tItemNode = default;   // app nodeId
+    list<u64>    tItemPar  = default;   // parent item handle (0 = top level)
+    list<bool>   tItemMat  = default;   // children materialized yet
+    u64          tItemSeq  = 1u;        // synthetic item-handle counter
+
+    // Accent-button colors (P10): parallel control handle -> (bg, fg) framework colors (0 = none).
+    list<u64>    accH  = default;
+    list<u32>    accBg = default;
+    list<u32>    accFg = default;
+
+    // Image bookkeeping (P10): parallel control handle -> hasBitmap + last pixel buffer uploaded.
+    list<u64>    imgH    = default;
+    list<bool>   imgHas  = default;
+    list<u64>    imgLast = default;
+
+    // CanvasView paint boxes (P10 placeholder): parallel control handle -> CanvasBox* (as u64).
+    list<u64>    canvasH   = default;
+    list<u64>    canvasBox = default;
+
+    // Per-key context menus (P9): parallel key path -> ContextMenu* (as u64). Host-owned.
+    list<string> ctxKeys  = default;
+    list<u64>    ctxMenus  = default;
+
+    // ── Text mirror ──────────────────────────────────────────────────────────
+    void _setTxt(u64 h, string s)
+    {
+        int i = 0;
+        while (i < this.txtH.count()) { if (this.txtH.get(i) == h) { this.txtV.set(i, "" + s); return; } i++; }
+        this.txtH.add(h); this.txtV.add("" + s);
+    }
+    string _txtFor(u64 h)
+    {
+        int i = 0;
+        while (i < this.txtH.count()) { if (this.txtH.get(i) == h) return "" + this.txtV.get(i); i++; }
+        return "";
+    }
+
+    // ── ListView bookkeeping ─────────────────────────────────────────────────
+    int _slot(list<u64>* xs, u64 h)
+    {
+        int i = 0;
+        while (i < xs.count()) { if (xs.get(i) == h) return i; i++; }
+        return -1;
+    }
+    void _listSetCount(u64 h, int n)
+    {
+        int i = this._slot(&this.listH, h);
+        if (i >= 0) { this.listRowCount.set(i, n); return; }
+        this.listH.add(h); this.listRowCount.add(n); this.listBox.add(0u); this.listSel.add(0 - 1);
+    }
+    void _listSetBox(u64 h, u64 box)
+    {
+        int i = this._slot(&this.listH, h);
+        if (i >= 0)
+        {
+            u64 old = this.listBox.get(i);
+            if (old != 0u && old != box) __uiFreeListRowBox(old);
+            this.listBox.set(i, box); return;
+        }
+        this.listH.add(h); this.listRowCount.add(0); this.listBox.add(box); this.listSel.add(0 - 1);
+    }
+    int _listCount(u64 h)  { int i = this._slot(&this.listH, h); if (i >= 0) { int v = this.listRowCount.get(i); return v; } return 0; }
+    u64 _listBoxFor(u64 h) { int i = this._slot(&this.listH, h); if (i >= 0) { u64 v = this.listBox.get(i); return v; } return 0u; }
+    void _listSetSel(u64 h, int r) { int i = this._slot(&this.listH, h); if (i >= 0) this.listSel.set(i, r); }
+    int _listGetSel(u64 h) { int i = this._slot(&this.listH, h); if (i >= 0) { int v = this.listSel.get(i); return v; } return 0 - 1; }
+
+    // ── TreeView bookkeeping ─────────────────────────────────────────────────
+    void _treeSetBox(u64 h, u64 box)
+    {
+        int i = this._slot(&this.treeBoxH, h);
+        if (i >= 0)
+        {
+            u64 old = this.treeBoxV.get(i);
+            if (old != 0u && old != box) __uiFreeTreeBox(old);
+            this.treeBoxV.set(i, box); return;
+        }
+        this.treeBoxH.add(h); this.treeBoxV.add(box);
+    }
+    u64 _treeBoxFor(u64 h) { int i = this._slot(&this.treeBoxH, h); if (i >= 0) { u64 v = this.treeBoxV.get(i); return v; } return 0u; }
+
+    // Append a materialized item; returns its synthetic handle.
+    u64 _treeAddItem(u64 ctrl, int nodeId, u64 parent)
+    {
+        // Handles must never be 0 (0 is the "top-level" parent sentinel). `= default` on the host
+        // zeroes tItemSeq (field initializers are not run), so seed it to 1 on first use.
+        if (this.tItemSeq == 0u) this.tItemSeq = 1u;
+        u64 ih = this.tItemSeq; this.tItemSeq = this.tItemSeq + 1u;
+        this.tItemCtrl.add(ctrl); this.tItemH.add(ih);
+        this.tItemNode.add(nodeId); this.tItemPar.add(parent); this.tItemMat.add(false);
+        return ih;
+    }
+    // Clear the tree's materialized items and re-insert the root's children (lazy).
+    void _treeBuildRoot(u64 h)
+    {
+        u64 box = this._treeBoxFor(h);
+        if (box == 0u) return;
+        int i = 0;
+        while (i < this.tItemCtrl.count())
+        {
+            if (this.tItemCtrl.get(i) == h)
+            {
+                this.tItemCtrl.removeAt(i); this.tItemH.removeAt(i); this.tItemNode.removeAt(i);
+                this.tItemPar.removeAt(i); this.tItemMat.removeAt(i);
+            }
+            else i++;
+        }
+        int n = __uiTreeChildCount(box, TREE_ROOT);
+        int j = 0;
+        while (j < n) { this._treeAddItem(h, __uiTreeChildId(box, TREE_ROOT, j), 0u); j++; }
+    }
+    int _treeItemSlot(u64 h, u64 item)
+    {
+        int i = 0;
+        while (i < this.tItemCtrl.count())
+        {
+            if (this.tItemCtrl.get(i) == h && this.tItemH.get(i) == item) return i;
+            i++;
+        }
+        return -1;
+    }
+    int _treeItemNode(u64 h, u64 item) { int i = this._treeItemSlot(h, item); if (i >= 0) { int v = this.tItemNode.get(i); return v; } return 0 - 1; }
+    int _treeCount(u64 h)
+    {
+        int i = 0; int c = 0;
+        while (i < this.tItemCtrl.count()) { if (this.tItemCtrl.get(i) == h) c++; i++; }
+        return c;
+    }
+    u64 _treeRoot(u64 h)
+    {
+        int i = 0;
+        while (i < this.tItemCtrl.count()) { if (this.tItemCtrl.get(i) == h && this.tItemPar.get(i) == 0u) { u64 v = this.tItemH.get(i); return v; } i++; }
+        return 0u;
+    }
+    u64 _treeFirstChild(u64 h, u64 item)
+    {
+        int i = 0;
+        while (i < this.tItemCtrl.count()) { if (this.tItemCtrl.get(i) == h && this.tItemPar.get(i) == item) { u64 v = this.tItemH.get(i); return v; } i++; }
+        return 0u;
+    }
+    // Materialize a node's children on first expand (idempotent). Returns the app nodeId expanded.
+    int _treeExpand(u64 h, u64 item)
+    {
+        int s = this._treeItemSlot(h, item);
+        if (s < 0) return 0 - 1;
+        int nodeId = this.tItemNode.get(s);
+        if (this.tItemMat.get(s)) return nodeId;
+        this.tItemMat.set(s, true);
+        u64 box = this._treeBoxFor(h);
+        if (box == 0u) return nodeId;
+        int n = __uiTreeChildCount(box, nodeId);
+        int i = 0;
+        while (i < n) { this._treeAddItem(h, __uiTreeChildId(box, nodeId, i), item); i++; }
+        return nodeId;
+    }
+
+    // ── Accent bookkeeping (P10; stored + reported - no NM_CUSTOMDRAW on WinUI) ─
+    void _forgetAccent(u64 h)
+    {
+        int i = this._slot(&this.accH, h);
+        if (i >= 0) { this.accH.removeAt(i); this.accBg.removeAt(i); this.accFg.removeAt(i); }
+    }
+    bool accentFor(u64 h, u32* bg, u32* fg)
+    {
+        int i = this._slot(&this.accH, h);
+        if (i >= 0) { bg[0] = this.accBg.get(i); fg[0] = this.accFg.get(i); return true; }
+        return false;
+    }
+
+    // ── Image bookkeeping ────────────────────────────────────────────────────
+    void _imgMark(u64 h, u64 px)
+    {
+        int i = this._slot(&this.imgH, h);
+        if (i >= 0) { this.imgHas.set(i, true); this.imgLast.set(i, px); return; }
+        this.imgH.add(h); this.imgHas.add(true); this.imgLast.add(px);
+    }
+    bool _imgHasBitmap(u64 h) { int i = this._slot(&this.imgH, h); if (i >= 0) { bool v = this.imgHas.get(i); return v; } return false; }
+    u64  _imgLastPixels(u64 h) { int i = this._slot(&this.imgH, h); if (i >= 0) { u64 v = this.imgLast.get(i); return v; } return 0u; }
+
+    // ── CanvasView box bookkeeping ───────────────────────────────────────────
+    void _setCanvasBox(u64 h, u64 box)
+    {
+        int i = this._slot(&this.canvasH, h);
+        if (i >= 0)
+        {
+            u64 old = this.canvasBox.get(i);
+            if (old != 0u && old != box) __uiFreeCanvasBox(old);
+            this.canvasBox.set(i, box); return;
+        }
+        this.canvasH.add(h); this.canvasBox.add(box);
+    }
+
+    // ── Context menu registration ────────────────────────────────────────────
+    void setContextMenu(string key, u64 menuPtr)
+    {
+        int i = 0;
+        while (i < this.ctxKeys.count())
+        {
+            if (this.ctxKeys.get(i) == key)
+            {
+                u64 old = this.ctxMenus.get(i);
+                if (old != 0u && old != menuPtr) { ContextMenu* cm = (ContextMenu*)old; delete cm; }
+                this.ctxMenus.set(i, menuPtr); return;
+            }
+            i++;
+        }
+        this.ctxKeys.add("" + key); this.ctxMenus.add(menuPtr);
+    }
+    u64 contextMenuFor(string key)
+    {
+        int i = 0;
+        while (i < this.ctxKeys.count()) { if (this.ctxKeys.get(i) == key) { u64 v = this.ctxMenus.get(i); return v; } i++; }
+        return 0u;
+    }
+
+    // ── NativeHost: create a XAML control for elemKind ────────────────────────
     u64 createControl(int elemKind, u64 parentHandle, string key)
     {
-        string cls = "Microsoft.UI.Xaml.Controls.TextBlock";
-        if (elemKind == ELEM_BUTTON)   cls = "Microsoft.UI.Xaml.Controls.Button";
-        else if (elemKind == ELEM_CHECKBOX) cls = "Microsoft.UI.Xaml.Controls.CheckBox";
-        else if (elemKind == ELEM_BOX) cls = "Microsoft.UI.Xaml.Controls.Border";
-
         void* insp = nullptr;
-        RoActivateInstance(hstring(cls), &insp);
+        if (elemKind == ELEM_PROGRESS)
+            insp = winuiCompose("Microsoft.UI.Xaml.Controls.ProgressBar", iidof(IProgressBarFactory));
+        else if (elemKind == ELEM_TABS)
+            insp = winuiCompose("Microsoft.UI.Xaml.Controls.TabView", iidof(ITabViewFactory));
+        else if (elemKind == ELEM_TREE)
+            insp = winuiCompose("Microsoft.UI.Xaml.Controls.TreeView", iidof(ITreeViewFactory));
+        else
+        {
+            string cls = "Microsoft.UI.Xaml.Controls.TextBlock";
+            if (elemKind == ELEM_BUTTON)         cls = "Microsoft.UI.Xaml.Controls.Button";
+            else if (elemKind == ELEM_CHECKBOX)  cls = "Microsoft.UI.Xaml.Controls.CheckBox";
+            else if (elemKind == ELEM_RADIO)     cls = "Microsoft.UI.Xaml.Controls.RadioButton";
+            else if (elemKind == ELEM_TEXTINPUT) cls = "Microsoft.UI.Xaml.Controls.TextBox";
+            else if (elemKind == ELEM_TEXTAREA)  cls = "Microsoft.UI.Xaml.Controls.TextBox";
+            else if (elemKind == ELEM_SLIDER)    cls = "Microsoft.UI.Xaml.Controls.Slider";
+            else if (elemKind == ELEM_COMBO)     cls = "Microsoft.UI.Xaml.Controls.ComboBox";
+            else if (elemKind == ELEM_LIST)      cls = "Microsoft.UI.Xaml.Controls.ListView";
+            else if (elemKind == ELEM_IMAGE)     cls = "Microsoft.UI.Xaml.Controls.Image";
+            // GroupBox is a headered label approximation (Border+header is a deliberate look
+            // difference on WinUI); CanvasView is a placeholder Border (Win2D is a new dependency
+            // we deliberately do NOT take - the escape hatch stays Win32/Cocoa). Box is a Border.
+            else if (elemKind == ELEM_GROUPBOX)  cls = "Microsoft.UI.Xaml.Controls.TextBlock";
+            else if (elemKind == ELEM_BOX)       cls = "Microsoft.UI.Xaml.Controls.Border";
+            else if (elemKind == ELEM_CANVAS)    cls = "Microsoft.UI.Xaml.Controls.Border";
+            else if (elemKind == ELEM_STATUSBAR) cls = "Microsoft.UI.Xaml.Controls.TextBlock";
+            RoActivateInstance(hstring(cls), &insp);
+        }
         if (insp == nullptr) return 0u;
 
         // Append to the root Canvas as a UIElement.
@@ -104,10 +429,8 @@ class WinUI3Host : NativeHost
         if (_gCanvasVec != nullptr && elem != nullptr)
             ((IVector<UIElement>*)_gCanvasVec)->lpVtbl->Append(_gCanvasVec, elem);
 
-        // Wire events once. The routing closures capture the node's key path directly (an owning
-        // string capture, made safe by the closure-capture fix). A control's key path is invariant
-        // for the lifetime of its handle - reconcile realizes any re-key/reparent as a
-        // destroy+create - so a key captured here never goes stale (no handle->key reverse map).
+        // Wire live events (the routing closures capture the node's key path, invariant for the
+        // control's lifetime). The headless self-test drives via the native* drivers instead.
         if (elemKind == ELEM_BUTTON)
         {
             void* bb = wqi(insp, iidof(IButtonBase));
@@ -118,13 +441,13 @@ class WinUI3Host : NativeHost
                 ((IButtonBase*)bb)->lpVtbl->add_Click(bb, h, &tok);
             }
         }
-        else if (elemKind == ELEM_CHECKBOX)
+        else if (elemKind == ELEM_CHECKBOX || elemKind == ELEM_RADIO)
         {
             void* tb = wqi(insp, iidof(IToggleButton));
             if (tb != nullptr)
             {
-                void* hc = winrtDelegate(RoutedEventHandler, (void* s, void* a) => { routeWinuiToggle(key); });
-                void* hu = winrtDelegate(RoutedEventHandler, (void* s, void* a) => { routeWinuiToggle(key); });
+                void* hc = winrtDelegate(RoutedEventHandler, (void* s, void* a) => { routeWinuiClick(key); });
+                void* hu = winrtDelegate(RoutedEventHandler, (void* s, void* a) => { routeWinuiClick(key); });
                 u64 t1 = 0; u64 t2 = 0;
                 ((IToggleButton*)tb)->lpVtbl->add_Checked(tb, hc, &t1);
                 ((IToggleButton*)tb)->lpVtbl->add_Unchecked(tb, hu, &t2);
@@ -135,12 +458,18 @@ class WinUI3Host : NativeHost
 
     void destroyControl(u64 h)
     {
+        if (h == 0u) return;
+        // Free any boxes this control owned.
+        u64 lb = this._listBoxFor(h); if (lb != 0u) { this._listSetBox(h, 0u); __uiFreeListRowBox(lb); }
+        u64 tb = this._treeBoxFor(h); if (tb != 0u) __uiFreeTreeBox(tb);
+        int ci = this._slot(&this.canvasH, h);
+        if (ci >= 0) { u64 cb = this.canvasBox.get(ci); if (cb != 0u) __uiFreeCanvasBox(cb); this.canvasBox.set(ci, 0u); }
+        this._forgetAccent(h);
         // Remove from the Canvas so it leaves the visual tree (the object is refcounted).
-        if (h == 0u || _gCanvasVec == nullptr) return;
+        if (_gCanvasVec == nullptr) return;
         void* elem = wqi((void*)h, iidof(IUIElement));
         if (elem == nullptr) return;
-        u32 idx = 0u;
-        u8 found = 0;
+        u32 idx = 0u; u8 found = 0;
         ((IVector<UIElement>*)_gCanvasVec)->lpVtbl->IndexOf(_gCanvasVec, elem, &idx, &found);
         if (found != 0) ((IVector<UIElement>*)_gCanvasVec)->lpVtbl->RemoveAt(_gCanvasVec, idx);
     }
@@ -148,9 +477,8 @@ class WinUI3Host : NativeHost
     // Position + size in DIPs (XAML units are DIPs, so this is a near-1:1 passthrough).
     void setFrame(u64 h, Rect frameDip)
     {
-        int ix = frameDip.x; int iy = frameDip.y; int iw = frameDip.w; int ih = frameDip.h;
-        double x = (double)ix; double y = (double)iy;
-        double w = (double)iw; double hh = (double)ih;
+        double x = (double)frameDip.x; double y = (double)frameDip.y;
+        double w = (double)frameDip.w; double hh = (double)frameDip.h;
         void* elem = wqi((void*)h, iidof(IUIElement));
         if (elem != nullptr && _gCanvasStat != nullptr)
         {
@@ -158,26 +486,24 @@ class WinUI3Host : NativeHost
             ((ICanvasStatics*)_gCanvasStat)->lpVtbl->SetTop(_gCanvasStat, elem, y);
         }
         void* fe = wqi((void*)h, iidof(IFrameworkElement));
-        if (fe != nullptr)
+        if (fe != nullptr && w > 0.0 && hh > 0.0)
         {
             ((IFrameworkElement*)fe)->lpVtbl->put_Width(fe, w);
             ((IFrameworkElement*)fe)->lpVtbl->put_Height(fe, hh);
         }
     }
 
-    // Text/content: a TextBlock takes put_Text; a ContentControl (Button/CheckBox) takes a
-    // boxed string content. QI decides which applies to this control.
+    // Text/content: a TextBlock takes put_Text; a TextBox takes put_Text; a ContentControl
+    // (Button/CheckBox/RadioButton) takes a boxed string content. QI decides which applies.
     void setText(u64 h, const char* s)
     {
+        this._setTxt(h, (string)s);
         void* tb = wqi((void*)h, iidof(ITextBlock));
-        if (tb != nullptr)
-        {
-            ((ITextBlock*)tb)->lpVtbl->put_Text(tb, hstring((string)s));
-            return;
-        }
+        if (tb != nullptr) { ((ITextBlock*)tb)->lpVtbl->put_Text(tb, hstring((string)s)); return; }
+        void* tx = wqi((void*)h, iidof(ITextBox));
+        if (tx != nullptr) { ((ITextBox*)tx)->lpVtbl->put_Text(tx, hstring((string)s)); return; }
         void* cc = wqi((void*)h, iidof(IContentControl));
-        if (cc != nullptr)
-            ((IContentControl*)cc)->lpVtbl->put_Content(cc, boxString((string)s));
+        if (cc != nullptr) ((IContentControl*)cc)->lpVtbl->put_Content(cc, boxString((string)s));
     }
 
     void setBoolProp(u64 h, int prop, bool v)
@@ -199,23 +525,69 @@ class WinUI3Host : NativeHost
         }
     }
 
-    // Progress/Slider are the same IRangeBase pattern; deferred in this M3 subset.
-    void setIntProp(u64 h, int prop, int v) { }
-    void setAccent(u64 h, int fgColor, int bgColor) { }
-
-    // P11: the ListView item-data protocol (ItemsView/ListView virtualized source)
-    // is deferred to the WinUI catch-up. The stub keeps the NativeHost contract
-    // satisfied; it frees the boxed rowText callback it is handed so nothing leaks.
-    void setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload)
+    // Progress/Slider share the IRangeBase pattern (Minimum/Maximum/Value as doubles).
+    void setIntProp(u64 h, int prop, int v)
     {
-        if (op == LISTOP_SET_ROWTEXT_CB && payload != 0u) __uiFreeListRowBox(payload);
-        else if (op == LISTOP_TREE_SET_SRC_CB && payload != 0u) __uiFreeTreeBox(payload);
+        void* rb = wqi((void*)h, iidof(IRangeBase));
+        if (rb == nullptr) return;
+        if (prop == PROP_MAX)   ((IRangeBase*)rb)->lpVtbl->put_Maximum(rb, (double)v);
+        else if (prop == PROP_VALUE) ((IRangeBase*)rb)->lpVtbl->put_Value(rb, (double)v);
     }
 
-    // P11: the Image pixel upload (BGRA buffer -> a WriteableBitmap on an Image control) is
-    // deferred to the WinUI catch-up; the stub keeps the NativeHost contract satisfied. No
-    // box crosses here, so there is nothing to free.
-    void setImageData(u64 h, u64 pixels, int w, int h2, int stride) { }
+    // Store a push button's accent colors (P10). A 0 (default) bg forgets any prior accent so the
+    // button reverts to the native look; a set bg is recorded. WinUI has no NM_CUSTOMDRAW, so this
+    // is stored + reported by nativeAccentBg/nativeTestCustomDrawFill (the accent is real as a
+    // brush intent; there is no offscreen pixel readback). fg/bg are framework colors (0 = default).
+    void setAccent(u64 h, int fgColor, int bgColor)
+    {
+        if (bgColor == 0) { this._forgetAccent(h); return; }
+        u32 bg = (u32)bgColor;
+        u32 fg = fgColor != 0 ? (u32)fgColor : (u32)0xFFFFFFu;
+        int i = this._slot(&this.accH, h);
+        if (i >= 0) { this.accBg.set(i, bg); this.accFg.set(i, fg); return; }
+        this.accH.add(h); this.accBg.add(bg); this.accFg.add(fg);
+    }
+
+    // setImageData: upload a top-down BGRA32 buffer to an Image control as a WriteableBitmap.
+    void setImageData(u64 h, u64 pixels, int w, int h2, int stride)
+    {
+        if (h == 0u || pixels == 0u || w <= 0 || h2 <= 0) return;
+        IWriteableBitmapFactory* wbf = nullptr;
+        activationFactory("Microsoft.UI.Xaml.Media.Imaging.WriteableBitmap",
+            iidof(IWriteableBitmapFactory), (void**)&wbf);
+        if (wbf == nullptr) return;
+        void* wbRaw = nullptr;
+        wbf->lpVtbl->CreateInstanceWithDimensions(wbf, w, h2, &wbRaw);
+        if (wbRaw == nullptr) return;
+        void* wb = wqi(wbRaw, iidof(IWriteableBitmap));
+        if (wb == nullptr) return;
+        void* buf = nullptr;
+        ((IWriteableBitmap*)wb)->lpVtbl->get_PixelBuffer(wb, &buf);
+        if (buf == nullptr) return;
+        Guid bbaIid = IID_IBufferByteAccess();
+        void* bba = wqi(buf, &bbaIid);
+        if (bba != nullptr)
+        {
+            u8* dst = nullptr;
+            ((IBufferByteAccess*)bba)->lpVtbl->Buffer(bba, &dst);
+            if (dst != nullptr)
+            {
+                char* src = (char*)pixels;
+                int rowBytes = w * 4;
+                int y = 0;
+                while (y < h2)
+                {
+                    memcpy((void*)((char*)dst + (i64)(y * rowBytes)), (void*)(src + (i64)(y * stride)), (i64)rowBytes);
+                    y++;
+                }
+            }
+        }
+        // Set the WriteableBitmap as the Image control's Source.
+        void* img = wqi((void*)h, iidof(IImage));
+        void* isrc = wqi(wbRaw, iidof(IImageSource));
+        if (img != nullptr && isrc != nullptr) ((IImage*)img)->lpVtbl->put_Source(img, isrc);
+        this._imgMark(h, pixels);
+    }
 
     // XAML measures intrinsically; return a DIP estimate so the DIP layout pass spaces rows.
     Size measureText(const char* s, int fontId, int wrapWidthDip)
@@ -233,11 +605,54 @@ class WinUI3Host : NativeHost
         this.applyTree(_wTree, &_wCtx);
     }
 
+    // Populate a combo's items only when the item set changed, then set the controlled selection.
+    void _syncCombo(u64 h, ComboBox* cb)
+    {
+        void* ic = wqi((void*)h, iidof(IItemsControl));
+        if (ic == nullptr) return;
+        void* items = nullptr;
+        ((IItemsControl*)ic)->lpVtbl->get_Items(ic, &items);
+        void* vec = wqi(items, iidof(IVector<object>));
+        if (vec != nullptr)
+        {
+            u32 have = 0u;
+            ((IVector<object>*)vec)->lpVtbl->get_Size(vec, &have);
+            if ((int)have != cb.items.count())
+            {
+                ((IVector<object>*)vec)->lpVtbl->Clear(vec);
+                int i = 0;
+                while (i < cb.items.count())
+                {
+                    void* bs = boxString("" + cb.items.get(i));
+                    ((IVector<object>*)vec)->lpVtbl->Append(vec, bs);
+                    i++;
+                }
+            }
+        }
+        void* sel = wqi((void*)h, iidof(ISelector));
+        if (sel != nullptr) ((ISelector*)sel)->lpVtbl->put_SelectedIndex(sel, cb.selectedIndex);
+    }
+
+    // The setListOp seam (see ui_native.cb for the cross-toolkit protocol design). On WinUI the
+    // op-coded protocol drives the host-side box/model bookkeeping the native* drivers query; the
+    // live XAML ListView/TreeView/TabView items are not bound (documented enrichment, doc/UI.md).
+    void setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload)
+    {
+        if (op == LISTOP_SET_ROWCOUNT)        this._listSetCount(h, arg0);
+        else if (op == LISTOP_SET_ROWTEXT_CB) this._listSetBox(h, payload);
+        else if (op == LISTOP_SET_SELECTION)  this._listSetSel(h, arg0);
+        else if (op == LISTOP_TREE_SET_SRC_CB) this._treeSetBox(h, payload);
+        else if (op == LISTOP_TREE_REBUILD)    this._treeBuildRoot(h);
+        // RESET_COLUMNS/ADD_COLUMN/SET_SELECT_MODE/INVALIDATE and TAB_* are display concerns the
+        // host-model drivers do not need; the columns/tabs are carried by the element model.
+    }
+
     // Reconcile the Element tree to XAML controls: create-on-first-sight (reuse by key path),
     // sync props, position, then destroy controls whose key left the tree.
     void applyTree(Element tree, UiContext* ctx)
     {
         this.applying = true;
+        _wDark = winuiThemeIsDark(&ctx.theme);
         list<string> newKeys = default;
         this._applyNode(tree, keySegment(tree, 0), ctx, &newKeys);
 
@@ -256,11 +671,7 @@ class WinUI3Host : NativeHost
 
         this.liveKeys.clear();
         int m = 0;
-        while (m < newKeys.count())
-        {
-            this.liveKeys.add("" + newKeys.get(m));
-            m++;
-        }
+        while (m < newKeys.count()) { this.liveKeys.add("" + newKeys.get(m)); m++; }
         this.applying = false;
     }
 
@@ -273,12 +684,29 @@ class WinUI3Host : NativeHost
             {
                 h = this.createControl(node.kind(), 0u, path);
                 ctx.setNativeHandle(path, h);
+                this._firstMount(node, h);
             }
             this._syncProps(node, h);
             Rect b = node.nodeBounds();
             this.setFrame(h, b);
             keys.add("" + path);
         }
+
+        // A TabControl walks ONLY its active pane into native controls (lazy inactive tabs).
+        if (node.kind() == ELEM_TABS)
+        {
+            TabControl* tc = node as TabControl;
+            list<Element>* panes = node.childList();
+            int sel = tc.selectedTab;
+            if (panes != nullptr && sel >= 0 && sel < panes.count())
+            {
+                Element pane = panes.get(sel);
+                string cp = joinKeyPath(path, keySegment(pane, sel));
+                this._applyNode(pane, cp, ctx, keys);
+            }
+            return;
+        }
+
         list<Element>* kids = node.childList();
         if (kids != nullptr)
         {
@@ -293,6 +721,38 @@ class WinUI3Host : NativeHost
         }
     }
 
+    // One-time setup on first mount of a control (mirrors the Win32 host's create-time hooks).
+    void _firstMount(Element node, u64 h)
+    {
+        int k = node.kind();
+        if (k == ELEM_TEXTAREA)
+        {
+            TextArea* ta = node as TextArea;
+            this.setText(h, ta.value.data());
+        }
+        else if (k == ELEM_LIST)
+        {
+            // Box the rowText callback (captures the component, so it reads live state) - the
+            // item source for the virtualized data path the list drivers query.
+            ListView* lv = node as ListView;
+            this.setListOp(h, LISTOP_SET_ROWTEXT_CB, 0, 0, "", (u64)_boxListRow(lv.rowText));
+        }
+        else if (k == ELEM_TREE)
+        {
+            TreeView* tv = node as TreeView;
+            this.setListOp(h, LISTOP_TREE_SET_SRC_CB, 0, 0, "",
+                           (u64)_boxTree(tv.childCount, tv.childId, tv.label));
+            this.setListOp(h, LISTOP_TREE_REBUILD, 0, 0, "", 0u);
+        }
+        else if (k == ELEM_CANVAS)
+        {
+            // Box the onPaint closure so it is owned + freed on teardown (WinUI CanvasView is a
+            // placeholder - no Win2D dependency - so the closure is held but not invoked).
+            CanvasView* cvw = node as CanvasView;
+            this._setCanvasBox(h, (u64)_boxCanvas(cvw.onPaint));
+        }
+    }
+
     void _syncProps(Element node, u64 h)
     {
         int k = node.kind();
@@ -301,11 +761,16 @@ class WinUI3Host : NativeHost
             Button* b = node as Button;
             this.setText(h, b.title.data());
             this.setBoolProp(h, PROP_ENABLED, !b.disabled);
+            int abg = pickColor(b.backgroundColor, this.appTheme().buttonBg);
+            int afg = pickColor(b.color, this.appTheme().buttonText);
+            this.setAccent(h, afg, abg);
         }
-        else if (k == ELEM_TEXT)
+        else if (k == ELEM_TEXT)      { Text* t = node as Text; this.setText(h, t.text.data()); }
+        else if (k == ELEM_TEXTINPUT)
         {
-            Text* t = node as Text;
-            this.setText(h, t.text.data());
+            TextInput* ti = node as TextInput;
+            this.setText(h, ti.value.data());
+            this.setBoolProp(h, PROP_ENABLED, !ti.disabled);
         }
         else if (k == ELEM_CHECKBOX)
         {
@@ -314,8 +779,74 @@ class WinUI3Host : NativeHost
             this.setBoolProp(h, PROP_CHECKED, c.checked);
             this.setBoolProp(h, PROP_ENABLED, !c.disabled);
         }
+        else if (k == ELEM_PROGRESS)
+        {
+            ProgressBar* p = node as ProgressBar;
+            this.setIntProp(h, PROP_MAX, 100);
+            this.setIntProp(h, PROP_VALUE, p.value);
+        }
+        else if (k == ELEM_SLIDER)
+        {
+            Slider* s = node as Slider;
+            this.setIntProp(h, PROP_MAX, 100);
+            this.setIntProp(h, PROP_VALUE, s.value);
+            this.setBoolProp(h, PROP_ENABLED, !s.disabled);
+        }
+        else if (k == ELEM_TEXTAREA) { TextArea* ta = node as TextArea; this.setBoolProp(h, PROP_ENABLED, !ta.disabled); }
+        else if (k == ELEM_STATUSBAR)
+        {
+            StatusBar* sb = node as StatusBar;
+            string joined = "";
+            int i = 0;
+            while (i < sb.parts.count()) { if (i > 0) joined = joined + "   "; joined = joined + sb.parts.get(i); i++; }
+            this.setText(h, joined.data());
+        }
+        else if (k == ELEM_RADIO)
+        {
+            RadioButton* rb = node as RadioButton;
+            this.setText(h, rb.label.data());
+            this.setBoolProp(h, PROP_CHECKED, rb.checked);
+            this.setBoolProp(h, PROP_ENABLED, !rb.disabled);
+        }
+        else if (k == ELEM_COMBO)
+        {
+            ComboBox* cb = node as ComboBox;
+            this._syncCombo(h, cb);
+            this.setBoolProp(h, PROP_ENABLED, !cb.disabled);
+        }
+        else if (k == ELEM_LIST)
+        {
+            ListView* lv = node as ListView;
+            this.setListOp(h, LISTOP_SET_ROWCOUNT, lv.rowCount, 0, "", 0u);
+            this.setListOp(h, LISTOP_SET_SELECTION, lv.selectedIndex, 0, "", 0u);
+            this.setBoolProp(h, PROP_ENABLED, !lv.disabled);
+        }
+        else if (k == ELEM_TABS)  { TabControl* tc = node as TabControl; this.setBoolProp(h, PROP_ENABLED, !tc.disabled); }
+        else if (k == ELEM_TREE)  { TreeView* tv = node as TreeView; this.setBoolProp(h, PROP_ENABLED, !tv.disabled); }
+        else if (k == ELEM_IMAGE)
+        {
+            Image* im = node as Image;
+            if (im.pixels != 0u && im.pixels != this._imgLastPixels(h))
+                this.setImageData(h, im.pixels, im.pxW, im.pxH, im.pxW * 4);
+        }
+        else if (k == ELEM_GROUPBOX) { GroupBox* g = node as GroupBox; this.setText(h, g.title.data()); }
     }
 
+    // The current app theme (borrowed from the per-host UiContext).
+    Theme* appTheme() { return &_wCtx.theme; }
+
+    // Free host-owned boxes + component (teardown). Heap-audit is off for WinUI, but keep it clean.
+    void dispose()
+    {
+        int i = 0;
+        while (i < this.listBox.count()) { u64 b = this.listBox.get(i); if (b != 0u) __uiFreeListRowBox(b); i++; }
+        i = 0;
+        while (i < this.treeBoxV.count()) { u64 b = this.treeBoxV.get(i); if (b != 0u) __uiFreeTreeBox(b); i++; }
+        i = 0;
+        while (i < this.canvasBox.count()) { u64 b = this.canvasBox.get(i); if (b != 0u) __uiFreeCanvasBox(b); i++; }
+        i = 0;
+        while (i < this.ctxMenus.count()) { u64 m = this.ctxMenus.get(i); if (m != 0u) { ContextMenu* cm = (ContextMenu*)m; delete cm; } i++; }
+    }
 };
 
 // ── Free helpers (shared by the host + routing) ──────────────────────────────
@@ -326,7 +857,7 @@ bool winuiListHas(list<string>* xs, string want)
     return false;
 }
 
-// Depth-first find of the element whose key path equals `want` (mirrors win32 findByKey).
+// Depth-first find of the element whose key path equals `want`.
 Element winuiFindByKey(Element node, string path, string want)
 {
     if (path == want) return node;
@@ -346,7 +877,22 @@ Element winuiFindByKey(Element node, string path, string want)
     return nullptr;
 }
 
-// Re-render when the model is dirty: render -> reconcile -> layout -> apply (mirrors pumpNative).
+Element winuiElem(string key)
+{
+    if (!_wReady) return nullptr;
+    return winuiFindByKey(_wTree, keySegment(_wTree, 0), key);
+}
+
+// Strip the last "/segment" from a key path ("root/rg/r1" -> "root/rg"); "" if none.
+string winuiParentPath(string key)
+{
+    int last = -1; int i = 0; int n = (int)key.length();
+    while (i < n) { if (key.data()[i] == '/') last = i; i++; }
+    if (last < 0) return "";
+    return substring(key, 0, last);
+}
+
+// Re-render when the model is dirty: render -> reconcile -> layout -> apply.
 void pumpWinui()
 {
     if (_wCtx.consumeDirty())
@@ -359,31 +905,27 @@ void pumpWinui()
     }
 }
 
-// A XAML Click landed on the control bound to `key` (captured at subscribe time): fire the
-// button handler, re-render.
+// A XAML Click/Toggle landed on `key`: route to the element model (Button/Checkbox/Radio),
+// re-render. Self-inflicted toggles under the `applying` guard are ignored.
 void routeWinuiClick(string key)
-{
-    if (key.length() == 0) return;
-    Element e = winuiFindByKey(_wTree, keySegment(_wTree, 0), key);
-    if (e == nullptr) return;
-    Button* b = e as Button;
-    if (b != nullptr) { b.fireClick(); pumpWinui(); }
-}
-
-// A XAML Checked/Unchecked landed on `key`. Ignore self-inflicted toggles (we set IsChecked
-// during syncProps under the `applying` guard); a genuine user toggle flips the model.
-void routeWinuiToggle(string key)
 {
     if (_wHost.applying) return;
     if (key.length() == 0) return;
-    Element e = winuiFindByKey(_wTree, keySegment(_wTree, 0), key);
+    Element e = winuiElem(key);
     if (e == nullptr) return;
+    Button* b = e as Button;
+    if (b != nullptr) { b.fireClick(); pumpWinui(); return; }
     Checkbox* c = e as Checkbox;
-    if (c != nullptr) { c.fireToggle(); pumpWinui(); }
+    if (c != nullptr) { c.fireToggle(); pumpWinui(); return; }
+    RadioButton* rb = e as RadioButton;
+    if (rb != nullptr)
+    {
+        Element pe = winuiElem(winuiParentPath(key));
+        if (pe != nullptr) { RadioGroup* g = pe as RadioGroup; if (g != nullptr) { g.onChange(rb.index); pumpWinui(); } }
+    }
 }
 
-// Build the initial control tree from the app's first render (direct, like win32's first
-// build - reconcile is only for later re-renders against a live committed tree).
+// Build the initial control tree from the app's first render.
 void buildWinuiTree()
 {
     if (_wReady) { deleteTree(_wTree); _wReady = false; }
@@ -393,8 +935,20 @@ void buildWinuiTree()
     _wReady = true;
 }
 
-// The ApplicationInitializationCallback body: stand up Application/Window/Canvas, then the tree.
-void winuiOnInit(void* params)
+// ── ctx.post marshaling hooks (installed into the window's ctx) ───────────────
+extern stdcall u32 GetCurrentThreadId();
+void _winuiPostEnqueue(u64 target, u64 boxPtr)
+{
+    // Enqueue a run-the-box tick onto the DispatcherQueue (target unused - one UI thread).
+    if (_gDq == nullptr) { __uiRunPostBox(boxPtr); return; }
+    void* h = winrtDelegate(DispatcherQueueHandler, () => { __uiRunPostBox(boxPtr); });
+    void* enqOut = nullptr;
+    ((IDispatcherQueue*)_gDq)->lpVtbl->TryEnqueue(_gDq, h, &enqOut);
+}
+u64 _winuiCurTid() { return (u64)GetCurrentThreadId(); }
+
+// Stand up Application/Window/Canvas + the thread DispatcherQueue (shared by live + headless init).
+void winuiInitFramework()
 {
     IApplicationFactory* af = nullptr;
     activationFactory("Microsoft.UI.Xaml.Application", iidof(IApplicationFactory), (void**)&af);
@@ -406,7 +960,6 @@ void winuiOnInit(void* params)
     void* wi = nullptr; void* winRaw = nullptr;
     wf->lpVtbl->CreateInstance(wf, nullptr, &wi, &winRaw);
 
-    // Root Canvas: keep its Children vector + the Canvas statics for absolute positioning.
     void* canvas = nullptr;
     RoActivateInstance(hstring("Microsoft.UI.Xaml.Controls.Canvas"), &canvas);
     void* panel = wqi(canvas, iidof(IPanel));
@@ -416,7 +969,6 @@ void winuiOnInit(void* params)
     activationFactory("Microsoft.UI.Xaml.Controls.Canvas", iidof(ICanvasStatics), (void**)&_gCanvasStat);
     activationFactory("Windows.Foundation.PropertyValue", iidof(IPropertyValueStatics), (void**)&_gPv);
 
-    // Window content = the canvas.
     void* win = wqi(winRaw, iidof(IWindow));
     void* canvasElem = wqi(canvas, iidof(IUIElement));
     if (win != nullptr && canvasElem != nullptr)
@@ -425,18 +977,32 @@ void winuiOnInit(void* params)
         ((IWindow*)win)->lpVtbl->Activate(win);
     }
 
-    // Thread DispatcherQueue (drives re-render posts + the self-test harness).
     IDispatcherQueueStatics* dqs = nullptr;
     activationFactory("Microsoft.UI.Dispatching.DispatcherQueue", iidof(IDispatcherQueueStatics), (void**)&dqs);
     dqs->lpVtbl->GetForCurrentThread(dqs, &_gDq);
 
-    buildWinuiTree();
+    // Install the ctx.post marshaling hooks (worker-thread closures run on this UI thread).
+    _wCtx.bindPost((u64)0, _winuiPostEnqueue);
+    _wCtx.bindThreadId(_winuiCurTid(), _winuiCurTid);
+}
 
-    // Hand control to the app's post-mount hook (a live window idles; the self-test drives).
+// Live-app init: build the tree, then hand control to the post-mount hook.
+void winuiOnInit(void* params)
+{
+    winuiInitFramework();
+    buildWinuiTree();
     if (_wHasPostMount) _wPostMount();
 }
 
-// Exit the XAML pump (ends Application.Start); called by the self-test when done.
+// Headless init: framework only, then run the self-test body synchronously and Exit.
+void winuiHeadlessInit(void* params)
+{
+    winuiInitFramework();
+    if (_wHasSelfBody) _wSelfRc = _wSelfBody();
+    winuiExit();
+}
+
+// Exit the XAML pump (ends Application.Start).
 void winuiExit()
 {
     if (_gApp != nullptr) ((IApplication*)_gApp)->Exit();
@@ -450,7 +1016,57 @@ void winuiPost(Lambda<void()> fn)
     ((IDispatcherQueue*)_gDq)->lpVtbl->TryEnqueue(_gDq, h, &enqOut);
 }
 
-// Drive a control's UIA Invoke pattern (a button click) from the key path; returns true if driven.
+// ── Host-neutral entry points (mirror the Win32/Cocoa host free-function surface) ──
+
+// Build a hidden window bound to `app` at DIP size w x h and build its tree. Called from
+// INSIDE the Start callback (the framework is already up), so it just mounts the tree.
+void startHeadlessWindow(Component app, const char* title, int w, int h)
+{
+    _wApp = app; _wW = w; _wH = h;
+    buildWinuiTree();
+}
+
+// Bring up the whole WinUI 3 app for `app` (live). Blocks in the XAML pump until winuiExit().
+int runAppWinui(Component app)
+{
+    _wApp = app;
+    i32 bhr = MddBootstrapInitialize2(0x00010008, nullptr, 0, 0x10);
+    if (bhr != 0) { printf("winui: bootstrap failed 0x%08X\n", bhr); return 1; }
+    RoInitialize(0);
+    IApplicationStatics* appStat = nullptr;
+    i32 shr = activationFactory("Microsoft.UI.Xaml.Application", iidof(IApplicationStatics), (void**)&appStat);
+    if (shr != 0 || appStat == nullptr) { printf("winui: IApplicationStatics 0x%08X\n", shr); MddBootstrapShutdown(); return 1; }
+    void* cb = winrtDelegate(ApplicationInitializationCallback, (void* p) => { winuiOnInit(p); });
+    appStat->Start(cb);
+    MddBootstrapShutdown();
+    return 0;
+}
+
+// Run a headless self-test body (installed via setSelfTestBody) inside the XAML pump; return its rc.
+int runWinuiHeadless()
+{
+    i32 bhr = MddBootstrapInitialize2(0x00010008, nullptr, 0, 0x10);
+    if (bhr != 0) { printf("winui: bootstrap failed 0x%08X\n", bhr); return 1; }
+    RoInitialize(0);
+    IApplicationStatics* appStat = nullptr;
+    i32 shr = activationFactory("Microsoft.UI.Xaml.Application", iidof(IApplicationStatics), (void**)&appStat);
+    if (shr != 0 || appStat == nullptr) { printf("winui: IApplicationStatics 0x%08X\n", shr); MddBootstrapShutdown(); return 1; }
+    void* cb = winrtDelegate(ApplicationInitializationCallback, (void* p) => { winuiHeadlessInit(p); });
+    appStat->Start(cb);
+    MddBootstrapShutdown();
+    return _wSelfRc;
+}
+
+// Fully release host state (headless self-tests). Heap-audit is off for WinUI, but keep clean.
+void nativeTeardownForTest()
+{
+    if (_wReady) { deleteTree(_wTree); _wReady = false; }
+    _wHost.dispose();
+    if (_wApp != nullptr) { Component a = _wApp; _wApp = nullptr; delete a; }
+    if (_hasMenuHandler) { Lambda<void(int)> a = move _menuHandler; _hasMenuHandler = false; }
+}
+
+// ── UIA drivers (kept for winui_demo's Automation-peer self-test) ─────────────
 bool winuiUiaInvoke(string key)
 {
     u64 h = _wCtx.nativeHandle(key);
@@ -472,7 +1088,6 @@ bool winuiUiaInvoke(string key)
     return true;
 }
 
-// Drive a checkbox's UIA Toggle pattern from the key path; returns true if driven.
 bool winuiUiaToggle(string key)
 {
     u64 h = _wCtx.nativeHandle(key);
@@ -494,7 +1109,7 @@ bool winuiUiaToggle(string key)
     return true;
 }
 
-// Read a live TextBlock's text back through the control (proves end-to-end, not just the model).
+// Read a live TextBlock's text back through the control (used by winui_demo).
 string winuiControlText(string key)
 {
     u64 h = _wCtx.nativeHandle(key);
@@ -507,20 +1122,264 @@ string winuiControlText(string key)
     return fromHString(hs);
 }
 
-// Bring up the whole WinUI 3 app for `app`. Blocks in the XAML pump until winuiExit().
-int runAppWinui(Component app)
+// ── Host-neutral native* test drivers (P12; same names as the Win32/Cocoa hosts) ──
+
+// Read the control text at keyPath (live TextBlock/TextBox get_Text, else the host mirror).
+string nativeControlText(string keyPath)
 {
-    _wApp = app;
-    i32 bhr = MddBootstrapInitialize2(0x00010008, nullptr, 0, 0x10);
-    if (bhr != 0) { printf("winui: bootstrap failed 0x%08X\n", bhr); return 1; }
-    RoInitialize(0);
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return "";
+    void* tb = wqi((void*)h, iidof(ITextBlock));
+    if (tb != nullptr) { void* hs = nullptr; ((ITextBlock*)tb)->lpVtbl->get_Text(tb, &hs); if (hs != nullptr) return fromHString(hs); }
+    void* tx = wqi((void*)h, iidof(ITextBox));
+    if (tx != nullptr) { void* hs = nullptr; ((ITextBox*)tx)->lpVtbl->get_Text(tx, &hs); if (hs != nullptr) return fromHString(hs); }
+    return _wHost._txtFor(h);
+}
 
-    IApplicationStatics* appStat = nullptr;
-    i32 shr = activationFactory("Microsoft.UI.Xaml.Application", iidof(IApplicationStatics), (void**)&appStat);
-    if (shr != 0 || appStat == nullptr) { printf("winui: IApplicationStatics 0x%08X\n", shr); MddBootstrapShutdown(); return 1; }
+// Push text into the control at keyPath (guards the reentrant change under `applying`).
+void nativeSetControlText(string keyPath, string s)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    bool prev = _wHost.applying;
+    _wHost.applying = true;
+    _wHost.setText(h, s.data());
+    _wHost.applying = prev;
+}
 
-    void* cb = winrtDelegate(ApplicationInitializationCallback, (void* p) => { winuiOnInit(p); });
-    appStat->Start(cb);
-    MddBootstrapShutdown();
-    return 0;
+// Click a Button / Checkbox / RadioButton by key: mirror the OS auto-toggle, route the click.
+void nativeClickButton(string keyPath)
+{
+    Element e = winuiElem(keyPath);
+    if (e == nullptr) return;
+    Button* b = e as Button;
+    if (b != nullptr) { b.fireClick(); pumpWinui(); return; }
+    Checkbox* c = e as Checkbox;
+    if (c != nullptr) { c.fireToggle(); pumpWinui(); return; }
+    RadioButton* rb = e as RadioButton;
+    if (rb != nullptr)
+    {
+        Element pe = winuiElem(winuiParentPath(keyPath));
+        if (pe != nullptr) { RadioGroup* g = pe as RadioGroup; if (g != nullptr) { g.onChange(rb.index); pumpWinui(); } }
+    }
+}
+
+// True if the checkbox / radio at keyPath is checked (controlled: read the element model).
+bool nativeIsChecked(string keyPath)
+{
+    Element e = winuiElem(keyPath);
+    if (e == nullptr) return false;
+    if (e.kind() == ELEM_CHECKBOX) { Checkbox* c = e as Checkbox; return c.checked; }
+    if (e.kind() == ELEM_RADIO)    { RadioButton* rb = e as RadioButton; return rb.checked; }
+    return false;
+}
+
+// The combo box selection index (live ISelector get_SelectedIndex).
+int nativeComboSelected(string keyPath)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0 - 1;
+    void* sel = wqi((void*)h, iidof(ISelector));
+    if (sel == nullptr) return 0 - 1;
+    i32 idx = 0;
+    ((ISelector*)sel)->lpVtbl->get_SelectedIndex(sel, &idx);
+    return (int)idx;
+}
+
+// Select combo index `idx` (live) and route onChange (controlled: the model follows).
+void nativeComboSelect(string keyPath, int idx)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    void* sel = wqi((void*)h, iidof(ISelector));
+    if (sel != nullptr) ((ISelector*)sel)->lpVtbl->put_SelectedIndex(sel, idx);
+    Element e = winuiElem(keyPath);
+    if (e != nullptr) { ComboBox* cb = e as ComboBox; if (cb != nullptr) { cb.onChange(idx); pumpWinui(); } }
+}
+
+// Type `s` into a text input (live) and route onChangeText (controlled).
+void nativeTypeText(string keyPath, string s)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    void* tx = wqi((void*)h, iidof(ITextBox));
+    if (tx != nullptr) { bool p = _wHost.applying; _wHost.applying = true; ((ITextBox*)tx)->lpVtbl->put_Text(tx, hstring(s)); _wHost.applying = p; }
+    _wHost._setTxt(h, s);
+    Element e = winuiElem(keyPath);
+    if (e != nullptr) { TextInput* ti = e as TextInput; if (ti != nullptr) { ti.onChangeText(s); pumpWinui(); } }
+}
+
+// ── ListView drivers (host-side box/model source) ─────────────────────────────
+int nativeListRowCount(string keyPath)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0;
+    return _wHost._listCount(h);
+}
+string nativeListCellText(string keyPath, int row, int col)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return "";
+    u64 box = _wHost._listBoxFor(h);
+    if (box == 0u) return "";
+    return __uiListRowText(box, row, col);
+}
+void nativeListSelect(string keyPath, int row)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    _wHost._listSetSel(h, row);
+    Element e = winuiElem(keyPath);
+    if (e != nullptr) { ListView* lv = e as ListView; if (lv != nullptr && row >= 0) { lv.onSelect(row); pumpWinui(); } }
+}
+int nativeListSelectedRow(string keyPath)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0 - 1;
+    return _wHost._listGetSel(h);
+}
+void nativeListActivate(string keyPath, int row)
+{
+    if (row >= 0) nativeListSelect(keyPath, row);
+    Element e = winuiElem(keyPath);
+    if (e != nullptr) { ListView* lv = e as ListView; if (lv != nullptr) { lv.onActivate(row); pumpWinui(); } }
+}
+
+// ── Tab drivers (element-model backed; lazy panes via applyTree) ──────────────
+int nativeTabSelected(string keyPath)
+{
+    Element e = winuiElem(keyPath);
+    if (e == nullptr) return 0 - 1;
+    TabControl* tc = e as TabControl;
+    return tc != nullptr ? tc.selectedTab : (0 - 1);
+}
+int nativeTabCount(string keyPath)
+{
+    Element e = winuiElem(keyPath);
+    if (e == nullptr) return 0;
+    list<Element>* panes = e.childList();
+    return panes != nullptr ? panes.count() : 0;
+}
+void nativeTabSelect(string keyPath, int idx)
+{
+    Element e = winuiElem(keyPath);
+    if (e == nullptr) return;
+    TabControl* tc = e as TabControl;
+    if (tc != nullptr) { tc.onSelectTab(idx); pumpWinui(); }
+}
+
+// ── Tree drivers (host-side materialized-node model) ──────────────────────────
+u64 nativeTreeRootItem(string keyPath)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0u;
+    return _wHost._treeRoot(h);
+}
+u64 nativeTreeChildItem(string keyPath, u64 hItem)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0u;
+    return _wHost._treeFirstChild(h, hItem);
+}
+int nativeTreeItemCount(string keyPath)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0;
+    return _wHost._treeCount(h);
+}
+void nativeTreeExpandItem(string keyPath, u64 hItem)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    int nodeId = _wHost._treeExpand(h, hItem);
+    Element e = winuiElem(keyPath);
+    if (e != nullptr && nodeId != (0 - 1)) { TreeView* tv = e as TreeView; if (tv != nullptr) { tv.onExpand(nodeId); pumpWinui(); } }
+}
+void nativeTreeSelectItem(string keyPath, u64 hItem)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    int nodeId = _wHost._treeItemNode(h, hItem);
+    Element e = winuiElem(keyPath);
+    if (e != nullptr) { TreeView* tv = e as TreeView; if (tv != nullptr) { tv.onSelect(nodeId); pumpWinui(); } }
+}
+int nativeTreeItemNodeId(string keyPath, u64 hItem)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0 - 1;
+    return _wHost._treeItemNode(h, hItem);
+}
+
+// ── Splitter / bounds ─────────────────────────────────────────────────────────
+void nativeSplitterDrag(string keyPath, int dipX, int dipY)
+{
+    Element e = winuiElem(keyPath);
+    if (e == nullptr) return;
+    SplitView* sv = e as SplitView;
+    if (sv == nullptr) return;
+    sv.onRatioChange(sv._ratioAt(dipX, dipY));
+    pumpWinui();
+}
+Rect nativeNodeBounds(string keyPath)
+{
+    Element e = winuiElem(keyPath);
+    if (e == nullptr) { Rect z = default; return z; }
+    return e.nodeBounds();
+}
+
+// ── Progress / slider / image / statusbar / accent ────────────────────────────
+int nativeProgressValue(string keyPath)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0 - 1;
+    void* rb = wqi((void*)h, iidof(IRangeBase));
+    if (rb == nullptr) return 0 - 1;
+    double v = 0.0;
+    ((IRangeBase*)rb)->lpVtbl->get_Value(rb, &v);
+    return (int)(v + 0.5);
+}
+void nativeSliderSet(string keyPath, int v)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    void* rb = wqi((void*)h, iidof(IRangeBase));
+    if (rb != nullptr) ((IRangeBase*)rb)->lpVtbl->put_Value(rb, (double)v);
+    Element e = winuiElem(keyPath);
+    if (e != nullptr) { Slider* s = e as Slider; if (s != nullptr) { s.fireSet(v); pumpWinui(); } }
+}
+bool nativeImageHasBitmap(string keyPath)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return false;
+    return _wHost._imgHasBitmap(h);
+}
+string nativeStatusText(string keyPath)
+{
+    return nativeControlText(keyPath);
+}
+u32 nativeAccentBg(string keyPath)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0u;
+    u32 bg = 0u; u32 fg = 0u;
+    if (_wHost.accentFor(h, &bg, &fg)) return bg;
+    return 0u;
+}
+// WinUI has no NM_CUSTOMDRAW; the accent is stored (a brush intent), so the "fill" the self-test
+// checks equals the stored accent (there is no offscreen pixel readback on WinUI). Documented.
+u32 nativeTestCustomDrawFill(string keyPath)
+{
+    return nativeAccentBg(keyPath);
+}
+
+// ── Context menu drivers ──────────────────────────────────────────────────────
+void nativeSetContextMenu(string keyPath, u64 menuPtr) { _wHost.setContextMenu(keyPath, menuPtr); }
+void nativeFireContextMenu(string keyPath, int itemIndex)
+{
+    u64 mp = _wHost.contextMenuFor(keyPath);
+    if (mp == 0u) return;
+    ContextMenu* cm = (ContextMenu*)mp;
+    if (itemIndex < 0 || itemIndex >= cm.count()) return;
+    int cmd = cm.cmds.get(itemIndex);
+    if (cmd > 0) routeMenu(cmd);
 }

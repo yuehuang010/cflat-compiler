@@ -1809,6 +1809,48 @@ int testDiscard()
     return passed;
 }
 
+// Owned-string producers for the direct-return ownership regression below.
+string retInner(const char* suffix) { string k = "key"; return k + suffix; }
+string retDirect(const char* suffix) { return retInner(suffix); }        // direct call-result return
+string retChainB(const char* suffix) { return retInner(suffix); }
+string retChainA(const char* suffix) { return retChainB(suffix); }       // chained direct returns
+string retEcho(string s) { return s; }                                   // borrowed-param passthrough
+string retTernary(int n) { return n > 0 ? retInner("pos") : retInner("neg"); }
+
+int testDirectReturnOwnership()
+{
+    int passed = 0;
+
+    // Directly returning an owned call-result must transfer ownership to the caller.
+    // Regression: the returned buffer used to leak - its runtime OWNED bit was cleared
+    // as if it were a borrow, so the caller never freed it.
+    string a = retDirect("1");
+    passed += Test("direct call-result return", a.data(), "key1");
+
+    // Chained direct returns (A returns B returns inner) still transfer ownership once.
+    string c = retChainA("3");
+    passed += Test("chained direct return", c.data(), "key3");
+
+    // Returning a borrowed string param (a literal here) passes the value through unchanged.
+    string e = retEcho("literal");
+    passed += Test("borrowed-param return", e.data(), "literal");
+
+    // Passing an OWNED string to a borrow param and retaining the passthrough return must
+    // NOT double-free: the return is a BORROW (the caller's original still owns the buffer).
+    // Regression: the owned bit rode through the borrow param, so both the original and the
+    // retained return destructed the same buffer at scope exit.
+    string owned = retInner("1");
+    string borrowed = retEcho(owned);
+    passed += Test("owned-input passthrough return", borrowed.data(), "key1");
+    passed += Test("owned-input original still valid", owned.data(), "key1");
+
+    // Ternary of owned call-results returns an owned value (no leak).
+    string t = retTernary(4);
+    passed += Test("ternary owned return", t.data(), "keypos");
+
+    return passed;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 extern int main()
@@ -1848,6 +1890,7 @@ extern int main()
     r = testStringView();       passed += r; total += 12;
     r = testStringAPI();        passed += r; total += 114;
     r = testDiscard();          passed += r; total += 3;
+    r = testDirectReturnOwnership(); passed += r; total += 6;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

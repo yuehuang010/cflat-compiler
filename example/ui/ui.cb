@@ -2648,7 +2648,7 @@ class TabControl : Element
 // i-th child's id; label(nodeId) its text. Controlled selection is `selectedNode`;
 // onSelect(nodeId) fires on a selection change, onExpand(nodeId) on expand. Native =
 // WC_TREEVIEW (SysTreeView32); the Canvas fallback renders the top-level nodes.
-const int TREE_ROOT = 0 - 1;   // virtual root nodeId; its children are the top-level nodes
+const int TREE_ROOT = -1;   // virtual root nodeId; its children are the top-level nodes
 
 class TreeView : Element
 {

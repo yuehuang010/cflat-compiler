@@ -122,10 +122,9 @@ class Editor : Component
     void _saveActiveToModel()
     {
         if (this.activeTab < 0 || this.activeTab >= this.tabPaths.count()) return;
-        // Wrap every string move-arg to list.set in `"" + ...`: a bare owned string (a
-        // call result or named local) moved into a list.add/set slot leaks (compiler bug,
-        // see internal/issue/list-add-set-owned-string-move-leaks.md); `"" + x` is safe.
-        this.tabBuffers.set(this.activeTab, "" + nativeControlText(EDITOR_KEY));
+        // The editor text is an owned call result moved straight into the slot. this.path
+        // is a live field, so copy it (`"" + ...`) rather than move it out of the field.
+        this.tabBuffers.set(this.activeTab, nativeControlText(EDITOR_KEY));
         this.tabPaths.set(this.activeTab, "" + this.path);
         this.tabDirty.set(this.activeTab, this.dirty ? 1 : 0);
     }
@@ -414,14 +413,12 @@ void wireHandlers()
 {
     setMenuHandler((int id) =>
     {
-        Component app = activeApp();
-        Editor* e = app as Editor;
+        Editor* e = activeApp() as Editor;
         if (e != nullptr) e.onCommand(id, activeCtx());
     });
     setCloseQuery(() =>
     {
-        Component app = activeApp();
-        Editor* e = app as Editor;
+        Editor* e = activeApp() as Editor;
         if (e == nullptr) return true;
         return e.confirmDiscard(activeCtx());
     });
@@ -456,8 +453,7 @@ int feditSelfTest()
     wireHandlers();
     startHeadlessWindow(new Editor(), "fedit-selftest", 80, 34);   // hidden window 1
 
-    Component app0 = activeApp();
-    Editor* e = app0 as Editor;
+    Editor* e = activeApp() as Editor;
     void* hed = u2h(activeCtx().nativeHandle(EDITOR_KEY));
     int pass = 0; int total = 0;
 

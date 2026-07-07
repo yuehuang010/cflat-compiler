@@ -162,6 +162,13 @@ i64 msgGetI64(void* obj, char* selName)
     return f(obj, sel(selName));
 }
 
+// [obj selector:(id)arg] returning NSInteger - e.g. rowForItem:, indexOfObject:.
+i64 msgGetI64Arg(void* obj, char* selName, void* a)
+{
+    function<i64(void*, void*, void*)> f = (function<i64(void*, void*, void*)>)__objcMsgSendPtr;
+    return f(obj, sel(selName), a);
+}
+
 // [obj selector:(id)arg] returning BOOL - e.g. isKindOfClass:. Result in w0.
 i8 msgBool1(void* obj, char* selName, void* a)
 {
@@ -232,6 +239,93 @@ bool addMethodBool(void* klass, char* selName, function<i8(void*, void*, void*)>
 }
 
 void finishClass(void* klass) { __registerClassPair(klass); }
+
+// ── Extra runtime-method + msgSend shapes used by the AppKit data controls ─────
+// (P11: NSTableView / NSOutlineView / NSPopUpButton backends). Type encodings:
+//   q = NSInteger, c = BOOL, @ = id, : = SEL, v = void.
+
+// -(NSInteger)sel:(id)a  -> "q@:@" (e.g. numberOfRowsInTableView:).
+bool addMethodI64_1(void* klass, char* selName, function<i64(void*, void*, void*)> imp)
+{
+    return __classAddMethod(klass, sel(selName), (void*)imp, "q@:@") != (i8)0;
+}
+
+// -(NSInteger)sel:(id)a b:(id)b  -> "q@:@@" (outlineView:numberOfChildrenOfItem:).
+bool addMethodI64_2(void* klass, char* selName, function<i64(void*, void*, void*, void*)> imp)
+{
+    return __classAddMethod(klass, sel(selName), (void*)imp, "q@:@@") != (i8)0;
+}
+
+// -(BOOL)sel:(id)a b:(id)b  -> "c@:@@" (outlineView:isItemExpandable:).
+bool addMethodBool2(void* klass, char* selName, function<i8(void*, void*, void*, void*)> imp)
+{
+    return __classAddMethod(klass, sel(selName), (void*)imp, "c@:@@") != (i8)0;
+}
+
+// -(id)sel:(id)a b:(id)b c:(NSInteger)c  -> "@@:@@q"
+// (tableView:objectValueForTableColumn:row:).
+bool addMethodIdIdIdI64(void* klass, char* selName, function<void*(void*, void*, void*, void*, i64)> imp)
+{
+    return __classAddMethod(klass, sel(selName), (void*)imp, "@@:@@q") != (i8)0;
+}
+
+// -(id)sel:(id)a b:(NSInteger)b c:(id)c  -> "@@:@q@" (outlineView:child:ofItem:).
+bool addMethodIdIdI64Id(void* klass, char* selName, function<void*(void*, void*, void*, i64, void*)> imp)
+{
+    return __classAddMethod(klass, sel(selName), (void*)imp, "@@:@q@") != (i8)0;
+}
+
+// -(id)sel:(id)a b:(id)b c:(id)c  -> "@@:@@@"
+// (outlineView:objectValueForTableColumn:byItem:).
+bool addMethodIdIdIdId(void* klass, char* selName, function<void*(void*, void*, void*, void*, void*)> imp)
+{
+    return __classAddMethod(klass, sel(selName), (void*)imp, "@@:@@@") != (i8)0;
+}
+
+// -(void)sel:(id)a b:(id)b  -> "v@:@@" (a two-arg notification/void selector).
+bool addMethod2(void* klass, char* selName, function<void(void*, void*, void*, void*)> imp)
+{
+    return __classAddMethod(klass, sel(selName), (void*)imp, "v@:@@") != (i8)0;
+}
+
+// [obj selector:(NSInteger)v] returning NSInteger - e.g. numberOfItems reads with
+// msgGetI64; this is for selectItemAtIndex: style calls that also return an integer.
+void* msgIntArg(void* obj, char* selName, i64 v)
+{
+    function<void*(void*, void*, i64)> f = (function<void*(void*, void*, i64)>)__objcMsgSendPtr;
+    return f(obj, sel(selName), v);
+}
+
+// An autoreleased NSColor from 0..1 RGBA components (colorWithSRGBRed:green:blue:alpha:).
+void* nsColor(double r, double g, double b, double a)
+{
+    function<void*(void*, void*, double, double, double, double)> f =
+        (function<void*(void*, void*, double, double, double, double)>)__objcMsgSendPtr;
+    return f(cls("NSColor"), sel("colorWithSRGBRed:green:blue:alpha:"), r, g, b, a);
+}
+
+// An NSBitmapImageRep wrapping (a copy of) an interleaved RGBA/BGRA buffer. The 11-arg
+// initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:
+// isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel: - planes ptr in x2, then integers.
+void* nsBitmapRep(void* planes, i64 w, i64 h, i64 bitsPerSample, i64 samplesPerPixel,
+                  i8 hasAlpha, i8 isPlanar, void* colorSpaceName, i64 bytesPerRow, i64 bitsPerPixel)
+{
+    void* rep = msg0(cls("NSBitmapImageRep"), "alloc");
+    function<void*(void*, void*, void*, i64, i64, i64, i64, i8, i8, void*, i64, i64)> f =
+        (function<void*(void*, void*, void*, i64, i64, i64, i64, i8, i8, void*, i64, i64)>)__objcMsgSendPtr;
+    return f(rep, sel("initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:"),
+             planes, w, h, bitsPerSample, samplesPerPixel, hasAlpha, isPlanar, colorSpaceName, bytesPerRow, bitsPerPixel);
+}
+
+// performSelectorOnMainThread:withObject:waitUntilDone: - marshal a call to the main
+// thread. `arg` is an id passed to the selector; waitUntilDone NO for async post.
+void* msgPerformOnMain(void* obj, char* selName, void* arg, bool waitDone)
+{
+    function<void*(void*, void*, void*, void*, i8)> f =
+        (function<void*(void*, void*, void*, void*, i8)>)__objcMsgSendPtr;
+    return f(obj, sel("performSelectorOnMainThread:withObject:waitUntilDone:"),
+             sel(selName), arg, waitDone ? (i8)1 : (i8)0);
+}
 
 // Registers a one-method target class and returns an instance of it - the
 // Cocoa equivalent of a Win32 WndProc for a single control action.

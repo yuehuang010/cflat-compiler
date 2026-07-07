@@ -167,6 +167,12 @@ def collect_files(include_win32_demo: bool) -> list[Path]:
     # --worker-winui gate with the right flags. Skip them here (like the Win32-metadata demo).
     winui_dir = (REPO_ROOT / "example" / "ui" / "winui").resolve()
     files = [f for f in files if winui_dir not in f.resolve().parents]
+    # gallery_app.cb is the host-neutral gallery component: it imports only ui.cb by
+    # design and resolves the native* host drivers from whichever LAUNCHER imports it
+    # (gallery.cb or winui_gallery.cb share one global scope with it). Standalone
+    # analysis therefore cannot resolve those drivers; both launchers are swept and
+    # example.bat exercises the component on both hosts. Skip it here.
+    files = [f for f in files if f.name != "gallery_app.cb"]
     return files
 
 

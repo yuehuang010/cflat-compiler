@@ -1,17 +1,19 @@
-# UI Framework (v0.4)
+# UI Framework (v1.0-rc)
 
 A small React-Native-style declarative UI library for CFlat, living in
 `example/ui/ui.cb`. It builds an `Element` tree, diffs renders with a keyed
 reconciler, routes input through one `dispatch(Event)` seam, lays out in a single
-constraints-in/size-out pass, and paints through a surface-agnostic `Canvas` so
-the same tree renders to a terminal (TUI) or a native Win32 GDI window.
+constraints-in/size-out pass, and paints through a surface-agnostic `Canvas` (TUI /
+Win32 GDI) or drives real OS controls through the `NativeHost` seam (Win32, macOS
+AppKit, WinUI 3).
 
-This document is the FROZEN CONTRACT for v0.4: the surface below is stable, and
-the "sugar-compatible element contract" is what a future `<View/>` grammar sugar
-(and an eventual `core/` promotion) desugars against. Changes to the frozen
-surface are deliberate and bump the API version.
+This document is the v1.0-rc FROZEN CONTRACT: the surface below is the release-
+candidate API. The "sugar-compatible element contract" is what the `<View/>` grammar
+sugar (and the pending `core/` promotion) desugars against. Changes to the frozen
+surface are deliberate and bump the API version. v1.0-rc is the P13 API-freeze pass;
+P14 promotes the files into `core/` and stamps v1.0 (a version bump, not an edit).
 
-- **Framework API version:** 15 (v5 added color to `Style` + `Canvas`; v6 added the
+- **Framework API version:** 17 (v5 added color to `Style` + `Canvas`; v6 added the
   `Theme` styling preference and hover/pressed/focus interaction states; v7 added the
   `Checkbox` widget, the `disabled` state, and `Style.gap`; v8 added the `ProgressBar`
   and `Slider` widgets with the `track`/`accent` theme slots; v9 added the `NativeHost`
@@ -33,8 +35,26 @@ surface are deliberate and bump the API version.
   `setListOp` seam for the tab/tree ops; v15 completed the element set - an `Image` (BGRA32
   pixels pushed through the new `setImageData` seam), a titled `GroupBox`, and a `CanvasView`
   escape hatch the app paints with the `Canvas` API - plus NM_CUSTOMDRAW accent buttons and the
-  widget-gallery screenshot workflow)
-- **Location:** `example/ui/` (framework + TUI and Win32 hosts). NOT in `core/`
+  widget-gallery screenshot workflow); v16 added the host-neutral test-driver surface
+  (see "Host-neutral test drivers" below) so an app self-test drives real controls
+  through key-path helpers with no toolkit-typed calls - the gallery self-test now runs
+  against any host - and filled in the macOS (Cocoa) backends for the P7-P10 controls
+  (real `NSPopUpButton`/`NSTableView`/`NSOutlineView`/`NSSegmentedControl`/`NSImageView`/
+  titled `NSBox`/`CfCanvasView`, `bezelColor` accents, `ctx.post` via
+  `performSelectorOnMainThread`, and per-element `NSMenu` context menus); v17 added the
+  **WinUI 3 (Windows App SDK)** `NativeHost` backend (`example/ui/winui/winui_host.cb`) for the
+  full element set - `TextBox`, `Slider`/`ProgressBar` via `IRangeBase`, `RadioButton`, `ComboBox`,
+  `ListView`, `TabView`, `TreeView`, `Image` via `WriteableBitmap`, headered `GroupBox`, `StatusBar`,
+  a `CanvasView` placeholder - implementing the same `setListOp` seam (its third host validation) +
+  every `native*` test driver + `ctx.post` through the `DispatcherQueue`, so the widget-gallery
+  self-test now runs green on Win32, Cocoa (compile-checked), AND WinUI 3. See the parity matrix below.
+  **v18 (v1.0-rc, P13 hardening)** froze the surface for release: a minimal native-accessibility
+  pass (control window text is the MSAA/UIA Name; a textless control's `tooltip` is mirrored into
+  its Name), the keyboard/focus contract (WS_TABSTOP flat parenting + `IsDialogMessageA`; the full
+  element set is in the Tab ring), and two new gallery self-test asserts - a light/dark theme-flip
+  storm and a seeded reconcile stress-soak - plus a Win32 hardening self-test (focus traversal,
+  live-resize relayout, a11y Name readback). No element or seam surface changed in v18
+- **Location:** `example/ui/` (framework + TUI, Win32, and Cocoa hosts). NOT in `core/`
   yet - promotion is deferred to a later release.
 - **Status:** the framework is a single source of truth (`example/ui/ui.cb`);
   every host (TUI and the Win32 `win32host.cb`) imports it directly.
@@ -155,9 +175,9 @@ SET_SELECT_MODE / SET_SELECTION / INVALIDATE). The op set is the deliberate comm
 denominator of Win32 `ListView`, macOS `NSTableView`, and WinUI `ItemsView` (see the
 design block above the method in `ui_native.cb`). The `rowText` callback rides as an
 opaque `u64` (a ui.cb `ListRowBox*`, invoked via `__uiListRowText`) so no `Lambda` type
-crosses the seam - the same constraint `ctx.post` obeys. The CocoaHost + WinUI3Host
-implement `setListOp` as stubs today (freeing the box); the real table backends land in
-the P11 host-parity sweep.
+crosses the seam - the same constraint `ctx.post` obeys. The CocoaHost (real `NSTableView`
+dataSource) and WinUI3Host (host-side box/model source the `native*` drivers query, its third
+seam validation) both implement `setListOp` fully; see the parity matrix.
 
 **Navigation chrome (v14).** Tier-2 controls, each with a Canvas fallback and a headless
 self-test in `example/ui/gallery/gallery.cb`; `example/ui/fedit/fedit.cb` (fedit v2) is
@@ -240,9 +260,9 @@ covered by `--selftest`, not the screenshot.
 
 The tab/tree ops share the ONE `setListOp` seam call rather than adding interface methods
 (`LISTOP_TAB_*` = 10-12, `LISTOP_TREE_*` = 20-21). `nativeNodeBounds(keyPath)` returns a
-node's laid-out frame (layout assertions). The Cocoa + WinUI hosts get placeholder
-controls + driver stubs for these; real `NSTabView`/`NSOutlineView`/`NSSplitView` /
-`TabView`/`TreeView` backends land in the P11 host-parity sweep.
+node's laid-out frame (layout assertions). The Cocoa host provides real
+`NSSegmentedControl`/`NSOutlineView` backends (P11); the WinUI host provides real
+`TabView`/`TreeView` controls with driver-backed strips/nodes (P12). See the parity matrix.
 
 Convenience constructors return the concrete heap pointer so callers can set
 typed props, then assign into an `Element` slot:
@@ -711,6 +731,44 @@ documented-API only (no uxtheme ordinals). An app imports this host and calls
   on Windows (Win32) and macOS (Cocoa). Build:
   `cflat example/ui/fedit/fedit.cb -i example/ui -o out/fedit` (`.exe` on Windows).
 
+## Host-neutral test drivers (v16, WinUI added v17)
+
+Headless self-tests drive real controls through key-path helpers that every native host
+implements under the SAME name, so a self-test contains no toolkit-typed calls (no
+`SendMessage`, no `objc_msgSend`, no WinRT vtable calls) and runs against any host. The gallery
+self-test lives in the host-neutral `example/ui/gallery/gallery_app.cb` (the `GalleryApp`
+Component + the 25-assert self-test); its Win32/Cocoa launcher is `example/ui/gallery/gallery.cb`
+(imports the `native_host.cb` shim) and its WinUI 3 launcher is `example/ui/winui/winui_gallery.cb`
+(imports `winui_host.cb`). All three build the SAME `gallery_app.cb` - a cflat compilation shares
+one global scope across its whole import closure, so a sibling host import supplies the drivers.
+Each helper routes through the same element-model handler the OS would fire on real input, then
+re-renders; readbacks query native control state (or, for the data controls, the host-side box/
+model source the `setListOp` seam feeds).
+
+- **Window / app:** `startHeadlessWindow(new App(), title, w, h)` (hidden window at DIP
+  size, tree built), `activeApp()` / `activeCtx()`, `hostDark()`, `hostWindowCount()`,
+  `nativeTeardownForTest()` (leak-gate cleanup).
+- **Buttons / state:** `nativeClickButton(keyPath)` (Button/Checkbox/RadioButton - mirrors
+  the OS auto-toggle then routes), `nativeIsChecked(keyPath)`.
+- **Combo:** `nativeComboSelected(keyPath)`, `nativeComboSelect(keyPath, idx)`.
+- **Text:** `nativeTypeText(keyPath, s)` (types + routes the change),
+  `nativeControlText(keyPath)`, `nativeSetControlText(keyPath, s)`, `nativeStatusText(keyPath)`.
+- **Range:** `nativeProgressValue(keyPath)`, `nativeSliderSet(keyPath, v)`.
+- **ListView:** `nativeListRowCount`, `nativeListCellText(keyPath, row, col)`,
+  `nativeListSelect(keyPath, row)`, `nativeListSelectedRow`, `nativeListActivate(keyPath, row)`.
+- **Tabs / tree / split:** `nativeTabSelected`/`nativeTabCount`/`nativeTabSelect`,
+  `nativeTreeRootItem`/`nativeTreeChildItem`/`nativeTreeItemCount`/`nativeTreeExpandItem`/
+  `nativeTreeSelectItem`/`nativeTreeItemNodeId`, `nativeSplitterDrag(keyPath, dipX, dipY)`,
+  `nativeNodeBounds(keyPath)`.
+- **Chrome / visuals:** `nativeSetContextMenu(keyPath, menuPtr)`,
+  `nativeFireContextMenu(keyPath, itemIndex)`, `nativeImageHasBitmap(keyPath)`.
+- **Accent assert:** `nativeAccentBg(keyPath)` + `nativeTestCustomDrawFill(keyPath)`. On Win32
+  these verify the NM_CUSTOMDRAW accent fill (a live-render feature PrintWindow cannot capture) by
+  driving the custom-draw path into a memory DC and reading back the filled pixel. On Cocoa they
+  return 0 (accents ride `bezelColor`, so there is no stored COLORREF to read). On WinUI 3 there is
+  no NM_CUSTOMDRAW; the accent is stored (a brush intent) and BOTH helpers return that stored accent
+  color - the fidelity check is "reported fill == stored accent", with no offscreen pixel readback.
+
 ## Hosts
 
 - **TUI** (`example/ui/host.cb`, `example/ui/boxes.cb`): a double-buffered
@@ -722,6 +780,148 @@ documented-API only (no uxtheme ordinals). An app imports this host and calls
 - **Native OS controls** (`example/ui/native_host.cb` shim -> `win32_native_host.cb`
   / `cocoa_native_host.cb`): the `NativeHost` seam instead of `Canvas` - real HWND
   (Win32) or AppKit controls (macOS). See the `NativeHost` section above.
+- **WinUI 3 (Windows App SDK)** (`example/ui/winui/winui_host.cb`): the same `NativeHost` seam
+  driving real XAML controls rooted in a `Canvas`, brought up unpackaged via
+  `MddBootstrapInitialize2` + `Application.Start`. An app runs on it with `runAppWinui(new App())`;
+  the gallery launcher is `example/ui/winui/winui_gallery.cb`. Its self-tests run WITHOUT
+  `--heap-audit` (the WinAppSDK runtime keeps process-lived singletons and its own heaps).
+
+### Element x host parity matrix (v17)
+
+Y = real native control; the notes call out deliberate differences and gaps. Cocoa is
+compile-checked (`--check --platform macos`); its runtime verification on an arm64 box is
+deferred (see the plan). "driver-backed" means the control is created but its item DISPLAY is
+answered from the host-side `setListOp` box/model the `native*` drivers query - the seam and data
+path are validated, while binding a live virtualized item source is a documented enrichment.
+
+| Element      | Win32                     | Cocoa (compile-checked)   | WinUI 3                              |
+|--------------|---------------------------|---------------------------|-------------------------------------|
+| Button       | Y BUTTON                  | Y NSButton                | Y Button                            |
+| Text         | Y STATIC                  | Y NSTextField             | Y TextBlock                         |
+| TextInput    | Y EDIT                    | Y NSTextField             | Y TextBox                           |
+| TextArea     | Y EDIT multiline          | Y NSTextView              | Y TextBox (uncontrolled-with-sync)  |
+| Checkbox     | Y BUTTON checkbox         | Y NSButton                | Y CheckBox                          |
+| RadioGroup   | Y BS_AUTORADIOBUTTON      | Y NSButton radio          | Y RadioButton (controlled via model)|
+| ProgressBar  | Y msctls_progress32       | Y NSProgressIndicator     | Y ProgressBar (IRangeBase)          |
+| Slider       | Y msctls_trackbar32       | Y NSSlider                | Y Slider (IRangeBase)               |
+| ComboBox     | Y COMBOBOX                | Y NSPopUpButton           | Y ComboBox (live items + selection) |
+| ListView     | Y virtualized OWNERDATA   | Y NSTableView dataSource  | Y ListView, driver-backed items     |
+| TabControl   | Y WC_TABCONTROL           | Y NSSegmentedControl      | Y TabView, driver-backed strip      |
+| TreeView     | Y WC_TREEVIEW             | Y NSOutlineView           | Y TreeView, driver-backed nodes     |
+| SplitView    | layout container          | layout container          | layout container                    |
+| StatusBar    | Y msctls_statusbar32      | Y NSTextField strip       | Y TextBlock strip                   |
+| GroupBox     | Y BS_GROUPBOX frame       | Y titled NSBox            | header label (look difference)      |
+| Image        | Y HBITMAP DIB             | Y NSImageView             | Y WriteableBitmap (BGRA upload)     |
+| CanvasView   | Y GDI child + onPaint     | Y CfCanvasView + onPaint  | placeholder (GAP - no Win2D dep)    |
+| ContextMenu  | Y TrackPopupMenu          | Y NSMenu popup            | routed via nativeFireContextMenu    |
+| tooltip prop | Y tooltips_class32        | Y setToolTip:             | (not wired; deferred)               |
+| ctx.post     | Y PostMessage(WM_APP)     | Y performSelectorOnMain   | Y DispatcherQueue.TryEnqueue        |
+| multi-window | Y (Window list)           | single-window (deferred)  | single-window (deferred)            |
+| accents      | Y NM_CUSTOMDRAW fill      | bezelColor (no readback)  | stored + reported (no readback)     |
+| a11y Name     | Y window text / tooltip   | Y NSAccessibility strings | Y XAML automation Name (text)       |
+
+Deliberate WinUI 3 gaps in this release, all documented and non-silent:
+- **CanvasView** is a placeholder Border. Win2D would be a NEW dependency, against the
+  self-contained-exe pitch; the escape hatch stays Win32/Cocoa. The `onPaint` closure is still
+  owned + freed, but never invoked on WinUI.
+- **GroupBox** renders as a header label rather than a titled frame (a look difference; the title
+  text is what the self-test reads).
+- **ListView / TabView / TreeView** create their real XAML control but their item DISPLAY is
+  driver-backed (host-side `setListOp` box/model). Binding a live virtualized `ItemsSource` needs a
+  WinRT bindable-collection implementation and is deferred; the seam + rowText/TreeBox callbacks are
+  fully exercised (the 100k-row virtualization oracle passes: rowText fires only for queried cells).
+- **Multi-window** is single-window (mirrors the Cocoa decision); the gallery gate needs one window.
+- **tooltip** prop is not wired to `ToolTipService` yet (no self-test covers it on WinUI).
+
+## Accessibility (v1.0-rc)
+
+Native controls give native accessibility for free - a headline anti-Electron property. The
+framework does no custom drawing for the standard controls, so each control's OS accessibility
+(MSAA/UIA on Windows, `NSAccessibility` on macOS, the XAML automation peer on WinUI) is the real
+one, and its **Name** comes from the control's text:
+
+- **Text-bearing controls** (`Button`, `Checkbox`, `RadioButton`, `GroupBox`, `Text`/STATIC,
+  `TabControl` tab labels) expose their window text as the accessible Name automatically - no extra
+  work.
+- **Textless controls** (`ProgressBar`, `Slider`, `ListView`, `TreeView`, `ComboBox`, `Image`,
+  `CanvasView`) have no intrinsic Name. When such a control carries a `tooltip`, the Win32 host
+  mirrors it into the control's window text (which these classes do not paint), so a screen reader
+  announces a Name. Set a `tooltip` on these to name them (e.g. `prog.tooltip = "download progress"`).
+- **Edit controls** (`TextInput`, `TextArea`) keep their text as CONTENT, so their Name must come
+  from a preceding `Text` label or an assistive `tooltip` (announced as a tip), never from window
+  text.
+
+This is a minimal, name-level pass (v1.0-rc), not a full custom UIA tree; the standing gallery
+self-test reads a textless control's Name back via `nativeAccessibleName(keyPath)`. macOS controls
+carry native `NSAccessibility` from their string values + `setToolTip:`; WinUI controls carry the
+XAML automation Name from their text (`AutomationProperties.Name` from tooltip is deferred with the
+tooltip wiring).
+
+## Keyboard and focus (v1.0-rc)
+
+- **Tab order.** Every mapped Win32 control is created `WS_TABSTOP` and parented directly to the
+  top-level window (containers `GroupBox`/`SplitView`/`RadioGroup` are LAYOUT containers, not nested
+  HWNDs), so the control set is FLAT and the message loop's `IsDialogMessageA` walks Tab / Shift-Tab
+  across the whole set - including `ListView`, `TreeView`, `TabControl`, and `ComboBox` (no
+  `WS_EX_CONTROLPARENT` is needed precisely because nothing is nested). The framework's own
+  `collectFocusables`/`moveFocus` ring (Canvas hosts) mirrors the same order; OS focus is the source
+  of truth on a native host and `ctx.focusKey` is a keyed mirror.
+- **Default keys.** Enter activates the default push button, Space toggles a focused
+  Checkbox/RadioButton, and the arrow keys move within a `RadioGroup` and a `TreeView` - all standard
+  common-control behavior, not reimplemented. Dialog Esc/Enter for the message-box helpers
+  (`nativeConfirm`/`nativeInfo`) is the OS `MessageBox` convention.
+- **Headless guard.** The Win32 hardening self-test walks the Tab ring by handle
+  (`nativeFocusFirstH`/`nativeFocusNextH`), asserts it closes over >= 8 distinct controls, and reads
+  the focused key back - a real programmatic focus-traversal check, not "verified by hand".
+
+## Event- and prop-naming convention (v1.0-rc)
+
+Handlers follow one principled convention (React-Native-derived), frozen for v1.0-rc:
+
+| Handler | On which nodes | Fires when |
+|---------|----------------|------------|
+| `onPress` | `Button` | pressed/activated |
+| `onChange` | `Checkbox`, `Slider`, `RadioGroup`, `ComboBox`, `TextArea` | the controlled scalar VALUE changed |
+| `onChangeText` | `TextInput` | the text value changed (RN's `TextInput.onChangeText` name) |
+| `onSelect` / `onActivate` | `ListView`, `TreeView` | selection changed / row double-click-or-Enter |
+| `onSelectTab` | `TabControl` | the active tab changed |
+| `onExpand` | `TreeView` | a node expanded (children materialized) |
+| `onRatioChange` | `SplitView` | the divider was dragged |
+| `onPaint` | `CanvasView` | the view needs painting |
+
+Rationale (why `ComboBox` uses `onChange` but `ListView` uses `onSelect`): a control with a SINGLE
+controlled scalar uses `onChange` (like `Slider`); a control with TWO distinct interactions
+(select vs activate) names them explicitly (`onSelect`/`onActivate`) rather than overloading
+`onChange`. `onChangeText` is kept (not renamed to `onChange`) deliberately for RN familiarity.
+These are documented as-is for the freeze; no rename was applied (all would be breaking changes for a
+purely cosmetic gain).
+
+## Controlled vs uncontrolled
+
+| Widget | Model | Notes |
+|--------|-------|-------|
+| `TextInput` | CONTROLLED | component owns `value`; `onChangeText` -> update + `invalidate()` -> value flows back |
+| `Checkbox` / `Slider` / `RadioGroup` / `ComboBox` | CONTROLLED | component owns the scalar; `on*` pushes the new value up |
+| `ListView` / `TreeView` / `TabControl` | CONTROLLED selection | `selectedIndex`/`selectedNode`/`selectedTab` is owned by the component |
+| `SplitView` | CONTROLLED ratio | `ratio` owned by the component; `onRatioChange` pushes drags up |
+| `TextArea` | UNCONTROLLED-with-sync | native buffer is the source of truth; `value` is a push, `onChange` a dirty notify (documented large-buffer exception) |
+| `ProgressBar` | presentational | no input; `value` is display-only |
+
+## Hardening self-tests (v1.0-rc)
+
+The gallery self-test (`gallerySelfTest`, host-neutral in `gallery_app.cb`) adds two P13 asserts on
+top of the 25 element asserts, so it is 27/27 on Win32 and WinUI 3 (leak-clean under `--heap-audit`
+and asan-clean under `--asan` on Win32):
+
+- **Theme-flip storm** - toggles light/dark many times and asserts the host titlebar theme stays in
+  lockstep with the model after every reconcile.
+- **Reconcile stress-soak** - a fixed-seed LCG drives create/destroy/reorder across a churn pool
+  (`Button`/`Text`/`Checkbox`/`TextInput`/`ProgressBar`/`Slider`/`GroupBox`/`ComboBox`) for 48 steps;
+  after each step the native control census (one live handle per key) must exactly match the element
+  tree, and a slot present before AND after must keep its handle (identity preserved across reorder).
+
+The Win32-only `win32HardeningSelfTest` (in `gallery.cb`, gated out of the Cocoa build) adds the
+focus-traversal, live-resize relayout, and accessible-Name readback checks described above.
 
 To run the TUI self-tests directly:
 

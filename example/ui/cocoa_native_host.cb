@@ -142,6 +142,29 @@ class CocoaHost : NativeHost
     list<string> liveKeys    = default;   // keys with a live control this frame
     list<u64>    liveHandles = default;   // parallel handles (NSView* as u64)
 
+    // ── P11 data/visual-control bookkeeping (mirror of the Win32 host lists) ──────
+    // ListView rowText boxes: parallel table-view handle -> ListRowBox* (as u64), plus
+    // the controlled selection (NSTableView owns no owner-data virtualization the way
+    // Win32 LVS_OWNERDATA does, but the boxed rowText is still the single item source).
+    list<u64>    listBoxHandles = default;
+    list<u64>    listBoxPtrs    = default;
+    list<u64>    listSelHandles = default;   // parallel handle -> selected row
+    list<int>    listSelRows    = default;
+    list<u64>    listRowCounts  = default;   // parallel handle -> virtual row count
+    list<int>    listRowCountV  = default;
+    // TreeView node-source boxes: parallel outline-view handle -> TreeBox* (as u64).
+    list<u64>    treeBoxHandles = default;
+    list<u64>    treeBoxPtrs    = default;
+    // Per-key context menus: parallel key path -> ContextMenu* (as u64), host-owned.
+    list<string> ctxKeys        = default;
+    list<u64>    ctxMenus        = default;
+    // CanvasView paint boxes: parallel view handle -> CanvasBox* (as u64).
+    list<u64>    canvasHandles   = default;
+    list<u64>    canvasBoxes     = default;
+    // Image last-uploaded pixel pointer per handle (skip redundant NSImage rebuilds).
+    list<u64>    imgHandles      = default;
+    list<u64>    imgLastPixels   = default;
+
     // NativeHost: create a control of `elemKind` under the flipped content view.
     // `key` is the node's key path (kept by the caller in the shadow map). Returns
     // the control (NSView*) as a u64; a TextArea returns its enclosing scroll view.
@@ -238,8 +261,8 @@ class CocoaHost : NativeHost
         }
         else if (elemKind == ELEM_RADIO)
         {
-            // P11: real NSButton radio + WS_GROUP-equivalent grouping is deferred; a
-            // switch-style button keeps the control set compiling + roughly usable.
+            // NSButtonTypeRadio: AppKit auto-groups radios that share the same
+            // target+action within a superview, matching the RadioGroup semantics.
             ctrl = msgRect(msg0(cls("NSButton"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
             msgInt(ctrl, "setButtonType:", 4);            // NSButtonTypeRadio
             msg1(ctrl, "setTarget:", this.target);
@@ -247,45 +270,77 @@ class CocoaHost : NativeHost
         }
         else if (elemKind == ELEM_COMBO)
         {
-            // P11: NSPopUpButton item population + selection wiring is deferred.
+            // NSPopUpButton (pull-down NO = a select-one popup). Items are populated in
+            // _syncCombo; selection routes onChange through onAction:.
             ctrl = msgRect(msg0(cls("NSPopUpButton"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgBool(ctrl, "setPullsDown:", false);
             msg1(ctrl, "setTarget:", this.target);
             msg1(ctrl, "setAction:", sel("onAction:"));
         }
         else if (elemKind == ELEM_LIST)
         {
-            // P11: real NSTableView (dataSource-virtualized, mapping the setListOp
-            // protocol) is deferred; a placeholder text field keeps the seam compiling.
-            ctrl = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
-            msgBool(ctrl, "setEditable:", false);
+            // NSScrollView + NSTableView. The scroll view is the live handle (framing /
+            // destroy); the table's dataSource is the shared target, which queries the
+            // boxed rowText through the setListOp protocol (naturally virtualized).
+            void* scroll = msgRect(msg0(cls("NSScrollView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgBool(scroll, "setHasVerticalScroller:", true);
+            msgInt(scroll, "setBorderType:", 2);          // NSBezelBorder
+            void* table = msgRect(msg0(cls("NSTableView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgInt(table, "setUsesAlternatingRowBackgroundColors:", 1);
+            msg1(table, "setDataSource:", this.target);
+            msg1(table, "setDelegate:", this.target);
+            msg1(table, "setTarget:", this.target);
+            msg1(table, "setAction:", sel("onListClick:"));
+            msg1(table, "setDoubleAction:", sel("onListDoubleClick:"));
+            msg1(scroll, "setDocumentView:", table);
+            ctrl = scroll;
         }
         else if (elemKind == ELEM_TABS)
         {
-            // P11: real (tabless) NSTabView / segmented control is deferred; a placeholder
-            // text field keeps the seam compiling. The active pane's controls still map.
-            ctrl = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
-            msgBool(ctrl, "setEditable:", false);
+            // A tab strip = an NSSegmentedControl; the active pane's controls map as
+            // siblings (lazy inactive panes) exactly like the Win32 header + panes.
+            ctrl = msgRect(msg0(cls("NSSegmentedControl"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgInt(ctrl, "setSegmentStyle:", 8);          // NSSegmentStyleTexturedSquare
+            msg1(ctrl, "setTarget:", this.target);
+            msg1(ctrl, "setAction:", sel("onTabSegment:"));
         }
         else if (elemKind == ELEM_TREE)
         {
-            // P11: real NSOutlineView (dataSource-virtualized) is deferred; placeholder.
-            ctrl = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
-            msgBool(ctrl, "setEditable:", false);
+            // NSScrollView + NSOutlineView. Expand-on-demand rides the outline's
+            // dataSource (numberOfChildren / child:ofItem: / isItemExpandable), which
+            // resolves the boxed TreeBox callbacks keyed by nodeId.
+            void* scroll = msgRect(msg0(cls("NSScrollView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgBool(scroll, "setHasVerticalScroller:", true);
+            msgInt(scroll, "setBorderType:", 2);          // NSBezelBorder
+            void* outline = msgRect(msg0(cls("NSOutlineView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            void* col = msg0(msg0(cls("NSTableColumn"), "alloc"), "initWithIdentifier:");
+            msg1(outline, "addTableColumn:", col);
+            msg1(outline, "setOutlineTableColumn:", col);
+            msg1(outline, "setDataSource:", this.target);
+            msg1(outline, "setDelegate:", this.target);
+            msg1(outline, "setTarget:", this.target);
+            msg1(outline, "setAction:", sel("onTreeClick:"));
+            msg1(scroll, "setDocumentView:", outline);
+            ctrl = scroll;
         }
         else if (elemKind == ELEM_IMAGE)
         {
-            // P11: real NSImageView (setImageData -> NSImage from the BGRA bytes) deferred.
+            // NSImageView; setImageData uploads an NSImage from the borrowed BGRA bytes.
             ctrl = msgRect(msg0(cls("NSImageView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgInt(ctrl, "setImageScaling:", 0);          // NSImageScaleProportionallyDown
         }
         else if (elemKind == ELEM_GROUPBOX)
         {
-            // P11: real titled NSBox deferred; a plain NSBox keeps the seam compiling.
+            // A titled NSBox; children position as siblings inside the frame (like Win32).
             ctrl = msgRect(msg0(cls("NSBox"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgInt(ctrl, "setTitlePosition:", 2);         // NSAtTop
         }
         else if (elemKind == ELEM_CANVAS)
         {
-            // P11: a CGContext-backed custom NSView is deferred; a plain view placeholder.
-            ctrl = msgRect(msg0(cls("NSView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            // A custom CfCanvasView whose drawRect: bridges to the boxed onPaint(Canvas)
+            // via a CoreGraphics-backed Canvas (CocoaCanvas). The box is stashed in
+            // setListOp-style bookkeeping and reached through the view's key path.
+            ctrl = msgRect(msg0(cls("CfCanvasView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
         }
         else
         {
@@ -300,6 +355,9 @@ class CocoaHost : NativeHost
     void destroyControl(u64 h)
     {
         if (h == 0u) return;
+        this._freeListBox(h);    // no-op unless h is a list with a boxed rowText
+        this._freeTreeBox(h);    // no-op unless h is a tree with a boxed node source
+        this._freeCanvasBox(h);  // no-op unless h is a canvas with a boxed painter
         void* ctrl = u2h(h);
         msg0(ctrl, "removeFromSuperview");   // drops the superview's retain
         msg0(ctrl, "release");               // drops our alloc/init retain -> dealloc
@@ -394,23 +452,374 @@ class CocoaHost : NativeHost
         }
     }
 
-    // Native default look (theme is applied to the window chrome in applyTheme).
-    void setAccent(u64 h, int fgColor, int bgColor) { }
-
-    // P11: the ListView item-data protocol (columns/rowCount/rowText callback via
-    // NSTableView's dataSource) is deferred to the macOS parity sweep. The stub keeps
-    // the NativeHost contract satisfied so shared app code compiles on Darwin; it must
-    // still free the boxed rowText callback it is handed to avoid leaking it.
-    void setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload)
+    // ── box + per-control state bookkeeping (mirror of the Win32 host lists) ──────
+    // The NSTableView / NSOutlineView backing the list/tree handle `h` (its scroll
+    // view's documentView), or the handle itself as a fallback.
+    void* _tableOf(u64 h)
     {
-        if (op == LISTOP_SET_ROWTEXT_CB && payload != 0u) __uiFreeListRowBox(payload);
-        else if (op == LISTOP_TREE_SET_SRC_CB && payload != 0u) __uiFreeTreeBox(payload);
+        void* ctrl = u2h(h);
+        if (_isScroll(ctrl)) return msg0(ctrl, "documentView");
+        return ctrl;
     }
 
-    // P11: the Image pixel upload (BGRA buffer -> NSImage on an NSImageView) is deferred to
-    // the macOS parity sweep; the stub keeps the NativeHost contract satisfied so shared app
-    // code compiles on Darwin. No box crosses here, so there is nothing to free.
-    void setImageData(u64 h, u64 pixels, int w, int h2, int stride) { }
+    void _setListBox(u64 h, u64 box)
+    {
+        void* table = this._tableOf(h);
+        int i = 0;
+        while (i < this.listBoxHandles.count())
+        {
+            if (this.listBoxHandles.get(i) == (u64)table)
+            {
+                u64 old = this.listBoxPtrs.get(i);
+                if (old != 0u && old != box) __uiFreeListRowBox(old);
+                this.listBoxPtrs.set(i, box);
+                return;
+            }
+            i++;
+        }
+        this.listBoxHandles.add((u64)table);
+        this.listBoxPtrs.add(box);
+    }
+
+    u64 _listBoxForTable(u64 tablePtr)
+    {
+        int i = 0;
+        while (i < this.listBoxHandles.count())
+        {
+            if (this.listBoxHandles.get(i) == tablePtr) { u64 v = this.listBoxPtrs.get(i); return v; }
+            i++;
+        }
+        return 0u;
+    }
+
+    void _setListRows(u64 h, int rows)
+    {
+        void* table = this._tableOf(h);
+        int i = 0;
+        while (i < this.listRowCounts.count())
+        {
+            if (this.listRowCounts.get(i) == (u64)table) { this.listRowCountV.set(i, rows); return; }
+            i++;
+        }
+        this.listRowCounts.add((u64)table); this.listRowCountV.add(rows);
+    }
+
+    int _listRowsForTable(u64 tablePtr)
+    {
+        int i = 0;
+        while (i < this.listRowCounts.count())
+        {
+            if (this.listRowCounts.get(i) == tablePtr) { int v = this.listRowCountV.get(i); return v; }
+            i++;
+        }
+        return 0;
+    }
+
+    int _listRows(u64 h) { void* t = this._tableOf(h); return this._listRowsForTable((u64)t); }
+
+    void _setListSel(u64 h, int row)
+    {
+        void* table = this._tableOf(h);
+        int i = 0;
+        while (i < this.listSelHandles.count())
+        {
+            if (this.listSelHandles.get(i) == (u64)table) { this.listSelRows.set(i, row); return; }
+            i++;
+        }
+        this.listSelHandles.add((u64)table); this.listSelRows.add(row);
+    }
+
+    int _listSel(u64 h)
+    {
+        void* table = this._tableOf(h);
+        int i = 0;
+        while (i < this.listSelHandles.count())
+        {
+            if (this.listSelHandles.get(i) == (u64)table) { int v = this.listSelRows.get(i); return v; }
+            i++;
+        }
+        return 0 - 1;
+    }
+
+    void _freeListBox(u64 h)
+    {
+        void* table = this._tableOf(h);
+        int i = 0;
+        while (i < this.listBoxHandles.count())
+        {
+            if (this.listBoxHandles.get(i) == (u64)table)
+            {
+                u64 old = this.listBoxPtrs.get(i);
+                if (old != 0u) __uiFreeListRowBox(old);
+                this.listBoxHandles.removeAt(i); this.listBoxPtrs.removeAt(i);
+                return;
+            }
+            i++;
+        }
+    }
+
+    void _setTreeBox(u64 h, u64 box)
+    {
+        void* outline = this._tableOf(h);
+        int i = 0;
+        while (i < this.treeBoxHandles.count())
+        {
+            if (this.treeBoxHandles.get(i) == (u64)outline)
+            {
+                u64 old = this.treeBoxPtrs.get(i);
+                if (old != 0u && old != box) __uiFreeTreeBox(old);
+                this.treeBoxPtrs.set(i, box);
+                return;
+            }
+            i++;
+        }
+        this.treeBoxHandles.add((u64)outline);
+        this.treeBoxPtrs.add(box);
+    }
+
+    u64 _treeBoxForOutline(u64 outlinePtr)
+    {
+        int i = 0;
+        while (i < this.treeBoxHandles.count())
+        {
+            if (this.treeBoxHandles.get(i) == outlinePtr) { u64 v = this.treeBoxPtrs.get(i); return v; }
+            i++;
+        }
+        return 0u;
+    }
+
+    u64 _treeBox(u64 h) { void* o = this._tableOf(h); return this._treeBoxForOutline((u64)o); }
+
+    void _freeTreeBox(u64 h)
+    {
+        void* outline = this._tableOf(h);
+        int i = 0;
+        while (i < this.treeBoxHandles.count())
+        {
+            if (this.treeBoxHandles.get(i) == (u64)outline)
+            {
+                u64 old = this.treeBoxPtrs.get(i);
+                if (old != 0u) __uiFreeTreeBox(old);
+                this.treeBoxHandles.removeAt(i); this.treeBoxPtrs.removeAt(i);
+                return;
+            }
+            i++;
+        }
+    }
+
+    void _setCanvasBox(u64 h, u64 box)
+    {
+        int i = 0;
+        while (i < this.canvasHandles.count())
+        {
+            if (this.canvasHandles.get(i) == h)
+            {
+                u64 old = this.canvasBoxes.get(i);
+                if (old != 0u && old != box) __uiFreeCanvasBox(old);
+                this.canvasBoxes.set(i, box); return;
+            }
+            i++;
+        }
+        this.canvasHandles.add(h); this.canvasBoxes.add(box);
+    }
+
+    u64 _canvasBoxFor(u64 h)
+    {
+        int i = 0;
+        while (i < this.canvasHandles.count())
+        {
+            if (this.canvasHandles.get(i) == h) { u64 v = this.canvasBoxes.get(i); return v; }
+            i++;
+        }
+        return 0u;
+    }
+
+    void _freeCanvasBox(u64 h)
+    {
+        int i = 0;
+        while (i < this.canvasHandles.count())
+        {
+            if (this.canvasHandles.get(i) == h)
+            {
+                u64 old = this.canvasBoxes.get(i);
+                if (old != 0u) __uiFreeCanvasBox(old);
+                this.canvasHandles.removeAt(i); this.canvasBoxes.removeAt(i);
+                return;
+            }
+            i++;
+        }
+    }
+
+    void setContextMenu(string keyPath, u64 menuPtr)
+    {
+        int i = 0;
+        while (i < this.ctxKeys.count())
+        {
+            if (this.ctxKeys.get(i) == keyPath)
+            {
+                u64 old = this.ctxMenus.get(i);
+                if (old != 0u && old != menuPtr) __uiFreeContextMenu(old);
+                this.ctxMenus.set(i, menuPtr); return;
+            }
+            i++;
+        }
+        this.ctxKeys.add("" + keyPath); this.ctxMenus.add(menuPtr);
+    }
+
+    u64 contextMenuFor(string keyPath)
+    {
+        int i = 0;
+        while (i < this.ctxKeys.count())
+        {
+            if (this.ctxKeys.get(i) == keyPath) { u64 v = this.ctxMenus.get(i); return v; }
+            i++;
+        }
+        return 0u;
+    }
+
+    u64 _imgLastPixels(u64 h)
+    {
+        int i = 0;
+        while (i < this.imgHandles.count())
+        {
+            if (this.imgHandles.get(i) == h) { u64 v = this.imgLastPixels.get(i); return v; }
+            i++;
+        }
+        return 0u;
+    }
+
+    void _setImgLastPixels(u64 h, u64 px)
+    {
+        int i = 0;
+        while (i < this.imgHandles.count())
+        {
+            if (this.imgHandles.get(i) == h) { this.imgLastPixels.set(i, px); return; }
+            i++;
+        }
+        this.imgHandles.add(h); this.imgLastPixels.add(px);
+    }
+
+    // A framework color (0x1RRGGBB with the marker bit, 0 = default) as an NSColor,
+    // or nullptr for a default/unset color (native look).
+    void* colorFor(int color)
+    {
+        if (color == 0) return nullptr;
+        double r = (double)((color >> 16) & 0xFF) / 255.0;
+        double g = (double)((color >> 8) & 0xFF) / 255.0;
+        double b = (double)(color & 0xFF) / 255.0;
+        return nsColor(r, g, b, 1.0);
+    }
+
+    // Accent a push button via bezelColor (documented-API accent, look policy). A 0 bg
+    // clears the accent (native look); a set bg tints the bezel + the title (fg).
+    void setAccent(u64 h, int fgColor, int bgColor)
+    {
+        void* ctrl = u2h(h);
+        if (msgBool1(ctrl, "isKindOfClass:", cls("NSButton")) == (i8)0) return;
+        void* bg = this.colorFor(bgColor);
+        msg1(ctrl, "setBezelColor:", bg);   // nil clears the accent
+        void* fg = fgColor != 0 ? this.colorFor(fgColor) : nullptr;
+        if (fg != nullptr) msg1(ctrl, "setContentTintColor:", fg);
+    }
+
+    // The setListOp seam (see ui_native.cb for the cross-toolkit protocol design).
+    // Columns/rowCount/selection drive an NSTableView; the tab ops an NSSegmentedControl;
+    // the tree ops an NSOutlineView. The rowText / node-source boxes are stored (not
+    // freed immediately) so the dataSource can query them; freed on destroy + teardown.
+    void setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload)
+    {
+        void* ctrl = u2h(h);
+        if (op == LISTOP_RESET_COLUMNS)
+        {
+            void* table = this._tableOf(h);
+            void* cols = msg0(table, "tableColumns");
+            i64 n = msgGetI64(cols, "count");
+            while (n > (i64)0)
+            {
+                void* c = msgIntArg(cols, "objectAtIndex:", (i64)0);
+                msg1(table, "removeTableColumn:", c);
+                cols = msg0(table, "tableColumns");
+                n = msgGetI64(cols, "count");
+            }
+        }
+        else if (op == LISTOP_ADD_COLUMN)
+        {
+            void* table = this._tableOf(h);
+            void* col = msg1(msg0(cls("NSTableColumn"), "alloc"), "initWithIdentifier:", nsStr((char*)text));
+            msg1(msg0(col, "headerCell"), "setStringValue:", nsStr((char*)text));
+            msgSetDouble(col, "setWidth:", (double)(arg0 * BASE_X));
+            msg1(table, "addTableColumn:", col);
+        }
+        else if (op == LISTOP_SET_ROWCOUNT)
+        {
+            this._setListRows(h, arg0);
+            msg0(this._tableOf(h), "reloadData");
+        }
+        else if (op == LISTOP_SET_ROWTEXT_CB)
+        {
+            this._setListBox(h, payload);
+        }
+        else if (op == LISTOP_SET_SELECT_MODE)
+        {
+            void* table = this._tableOf(h);
+            msgBool(table, "setAllowsMultipleSelection:", arg0 != 0);
+        }
+        else if (op == LISTOP_SET_SELECTION)
+        {
+            void* table = this._tableOf(h);
+            this._setListSel(h, arg0);
+            if (arg0 < 0) { msg0(table, "deselectAll:"); }
+            else
+            {
+                void* idx = msgIntArg(cls("NSIndexSet"), "indexSetWithIndex:", (i64)arg0);
+                function<void*(void*, void*, void*, i8)> f = (function<void*(void*, void*, void*, i8)>)__objcMsgSendPtr;
+                f(table, sel("selectRowIndexes:byExtendingSelection:"), idx, (i8)0);
+            }
+        }
+        else if (op == LISTOP_INVALIDATE)
+        {
+            msg0(this._tableOf(h), "reloadData");
+        }
+        else if (op == LISTOP_TAB_RESET)
+        {
+            msgInt(ctrl, "setSegmentCount:", (i64)0);
+        }
+        else if (op == LISTOP_TAB_ADD)
+        {
+            int have = (int)msgGetI64(ctrl, "segmentCount");
+            if (arg0 >= have) msgInt(ctrl, "setSegmentCount:", (i64)(arg0 + 1));
+            function<void*(void*, void*, void*, i64)> f = (function<void*(void*, void*, void*, i64)>)__objcMsgSendPtr;
+            f(ctrl, sel("setLabel:forSegment:"), nsStr((char*)text), (i64)arg0);
+        }
+        else if (op == LISTOP_TAB_SET_SEL)
+        {
+            msgInt(ctrl, "setSelectedSegment:", (i64)arg0);
+        }
+        else if (op == LISTOP_TREE_SET_SRC_CB)
+        {
+            this._setTreeBox(h, payload);
+        }
+        else if (op == LISTOP_TREE_REBUILD)
+        {
+            msg0(this._tableOf(h), "reloadData");
+        }
+    }
+
+    // Upload a top-down BGRA32 buffer to an NSImageView as an NSImage. Builds an
+    // NSBitmapImageRep (it copies the bytes), wraps it in an NSImage, and sets it.
+    void setImageData(u64 h, u64 pixels, int w, int h2, int stride)
+    {
+        if (h == 0u || pixels == 0u || w <= 0 || h2 <= 0) return;
+        void* ctrl = u2h(h);
+        // NSBitmapImageRep with an explicit bytesPerRow copies row-by-row from the source.
+        // colorSpaceName NSDeviceRGBColorSpace; 8 bits/sample, 4 samples, hasAlpha, 32bpp.
+        void* rep = nsBitmapRep((void*)pixels, (i64)w, (i64)h2, (i64)8, (i64)4,
+                                (i8)1, (i8)0, nsStr("NSDeviceRGBColorSpace"), (i64)stride, (i64)32);
+        if (rep == nullptr) return;
+        void* img = msg0(msg0(cls("NSImage"), "alloc"), "init");
+        msg1(img, "addRepresentation:", rep);
+        msg1(ctrl, "setImage:", img);
+    }
 
     // Text metrics in DIPs. A length-based estimate is enough: the layout pass in
     // ui.cb never calls measureText today (the winui host uses the same stub).
@@ -508,6 +917,38 @@ class CocoaHost : NativeHost
                     TextArea* ta = node as TextArea;
                     this.setText(h, ta.value.data());
                 }
+                else if (node.kind() == ELEM_LIST)
+                {
+                    // One-time ListView setup: columns, select mode, and the boxed rowText
+                    // source (captures the component, so it reads live state across renders).
+                    ListView* lv = node as ListView;
+                    this.setListOp(h, LISTOP_RESET_COLUMNS, 0, 0, "", 0u);
+                    int ci = 0;
+                    while (ci < lv.columns.count())
+                    {
+                        int wdip = 12;
+                        if (ci < lv.colWidths.count()) wdip = lv.colWidths.get(ci);
+                        this.setListOp(h, LISTOP_ADD_COLUMN, wdip, ci, lv.columns.get(ci).data(), 0u);
+                        ci++;
+                    }
+                    this.setListOp(h, LISTOP_SET_SELECT_MODE, lv.multiSelect ? 1 : 0, 0, "", 0u);
+                    this.setListOp(h, LISTOP_SET_ROWTEXT_CB, 0, 0, "", (u64)_boxListRow(lv.rowText));
+                }
+                else if (node.kind() == ELEM_TREE)
+                {
+                    // One-time TreeView setup: box the node-source callbacks + build the root.
+                    TreeView* tv = node as TreeView;
+                    this.setListOp(h, LISTOP_TREE_SET_SRC_CB, 0, 0, "",
+                                   (u64)_boxTree(tv.childCount, tv.childId, tv.label));
+                    this.setListOp(h, LISTOP_TREE_REBUILD, 0, 0, "", 0u);
+                }
+                else if (node.kind() == ELEM_CANVAS)
+                {
+                    // One-time CanvasView setup: box the onPaint closure so CfCanvasView's
+                    // drawRect: (which resolves the view handle -> box) can invoke it.
+                    CanvasView* cvw = node as CanvasView;
+                    this._setCanvasBox(h, (u64)_boxCanvas(cvw.onPaint));
+                }
             }
             this._syncProps(node, h);
             string tip = tooltipOf(node);
@@ -558,6 +999,7 @@ class CocoaHost : NativeHost
             Button* b = node as Button;
             this.setText(h, b.title.data());
             this.setBoolProp(h, PROP_ENABLED, !b.disabled);
+            this._syncButtonAccent(h, b);
         }
         else if (k == ELEM_TEXT)
         {
@@ -611,6 +1053,110 @@ class CocoaHost : NativeHost
             }
             this.setText(h, joined.data());
         }
+        else if (k == ELEM_RADIO)
+        {
+            RadioButton* rb = node as RadioButton;
+            this.setText(h, rb.label.data());
+            this.setBoolProp(h, PROP_CHECKED, rb.checked);
+            this.setBoolProp(h, PROP_ENABLED, !rb.disabled);
+        }
+        else if (k == ELEM_COMBO)
+        {
+            ComboBox* cb = node as ComboBox;
+            this._syncCombo(h, cb);
+            this.setBoolProp(h, PROP_ENABLED, !cb.disabled);
+        }
+        else if (k == ELEM_LIST)
+        {
+            // Virtualized: push row count + controlled selection, then reload. Cell text
+            // is pulled on demand via the boxed rowText (the table's dataSource).
+            ListView* lv = node as ListView;
+            this.setListOp(h, LISTOP_SET_ROWCOUNT, lv.rowCount, 0, "", 0u);
+            this.setListOp(h, LISTOP_SET_SELECTION, lv.selectedIndex, 0, "", 0u);
+            this.setBoolProp(h, PROP_ENABLED, !lv.disabled);
+        }
+        else if (k == ELEM_TABS)
+        {
+            TabControl* tc = node as TabControl;
+            this._syncTabs(h, tc);
+        }
+        else if (k == ELEM_TREE)
+        {
+            // Expand-on-demand: the outline owns its tree state (built once at creation);
+            // only the enabled flag is synced (selection round-trips through the delegate).
+            TreeView* tv = node as TreeView;
+            this.setBoolProp(h, PROP_ENABLED, !tv.disabled);
+        }
+        else if (k == ELEM_IMAGE)
+        {
+            // Upload once per distinct pixel buffer (a re-render with the same pointer is
+            // a no-op); the toolkit-neutral setImageData seam builds the NSImage.
+            Image* im = node as Image;
+            if (im.pixels != 0u && im.pixels != this._imgLastPixels(h))
+            {
+                this.setImageData(h, im.pixels, im.pxW, im.pxH, im.pxW * 4);
+                this._setImgLastPixels(h, im.pixels);
+            }
+        }
+        else if (k == ELEM_GROUPBOX)
+        {
+            GroupBox* g = node as GroupBox;
+            msg1(u2h(h), "setTitle:", nsStr(g.title.data()));
+        }
+        else if (k == ELEM_CANVAS)
+        {
+            // The paint closure was boxed at creation; mark the view dirty so state
+            // changes redraw (drawRect: re-invokes onPaint through the CG-backed Canvas).
+            msgBool(u2h(h), "setNeedsDisplay:", true);
+        }
+    }
+
+    // Accent-fill for a themed button (P10 parity): the same buttonBg/buttonText the
+    // Win32 host feeds NM_CUSTOMDRAW is applied here through bezelColor (look policy).
+    void _syncButtonAccent(u64 h, Button* b)
+    {
+        int abg = pickColor(b.backgroundColor, _nCtx.theme.buttonBg);
+        int afg = pickColor(b.color, _nCtx.theme.buttonText);
+        this.setAccent(h, afg, abg);
+    }
+
+    // Repopulate an NSPopUpButton only when its item set changed, then set the
+    // controlled selection (refilling every frame would reset the popup mid-interaction).
+    void _syncCombo(u64 h, ComboBox* cb)
+    {
+        void* ctrl = u2h(h);
+        int have = (int)msgGetI64(ctrl, "numberOfItems");
+        if (have != cb.items.count())
+        {
+            msg0(ctrl, "removeAllItems");
+            int i = 0;
+            while (i < cb.items.count())
+            {
+                msg1(ctrl, "addItemWithTitle:", nsStr(cb.items.get(i).data()));
+                i++;
+            }
+        }
+        int cur = (int)msgGetI64(ctrl, "indexOfSelectedItem");
+        if (cur != cb.selectedIndex) msgInt(ctrl, "selectItemAtIndex:", (i64)cb.selectedIndex);
+    }
+
+    // Rebuild the segmented tab strip on a pane-count change, then set the selection.
+    void _syncTabs(u64 h, TabControl* tc)
+    {
+        void* ctrl = u2h(h);
+        int have = (int)msgGetI64(ctrl, "segmentCount");
+        if (have != tc.children.count())
+        {
+            this.setListOp(h, LISTOP_TAB_RESET, 0, 0, "", 0u);
+            int i = 0;
+            while (i < tc.children.count())
+            {
+                string t = tc._title(i);
+                this.setListOp(h, LISTOP_TAB_ADD, i, 0, t.data(), 0u);
+                i++;
+            }
+        }
+        this.setListOp(h, LISTOP_TAB_SET_SEL, tc.selectedTab, 0, "", 0u);
     }
 
     // The key path bound to a control this frame, or "" if none (linear scan of the
@@ -651,6 +1197,180 @@ bool themeIsDark(Theme* t)
     if (c == 0) return false;
     int r = (c >> 16) & 0xFF; int g = (c >> 8) & 0xFF; int b = c & 0xFF;
     return (r + g + b) < 384;
+}
+
+// ── CanvasView bridge (P11): a CoreGraphics-backed Canvas ────────────────────
+// CocoaCanvas implements the ui.cb Canvas interface using AppKit drawing primitives
+// (NSBezierPath fill/stroke, NSString drawAtPoint - both CoreGraphics-backed), so the
+// app's onPaint(Canvas) closure paints into a CfCanvasView's drawRect:. Cell coords map
+// to points via BASE_X/BASE_Y (like the Win32 NativeGdiCanvas). The view is flipped, so
+// row 0 is at the top, matching the framework's top-left convention.
+class CocoaCanvas : Canvas
+{
+    void clear() { }   // drawRect: already erased to the view background
+
+    void drawText(int col, int row, const char* s, int color)
+    {
+        void* str = nsStr((char*)s);
+        void* attrs = msg0(msg0(cls("NSMutableDictionary"), "alloc"), "init");
+        void* col2 = _nsColorFromFramework(color);
+        if (col2 != nullptr) msg2(attrs, "setObject:forKey:", col2, _nsForegroundColorKey());
+        function<void(void*, void*, double, double, void*)> f =
+            (function<void(void*, void*, double, double, void*)>)__objcMsgSendPtr;
+        f(str, sel("drawAtPoint:withAttributes:"), (double)(col * BASE_X), (double)(row * BASE_Y), attrs);
+    }
+
+    void drawRect(Rect r, bool filled, int color)
+    {
+        function<void*(void*, void*, double, double, double, double)> mk =
+            (function<void*(void*, void*, double, double, double, double)>)__objcMsgSendPtr;
+        void* path = mk(cls("NSBezierPath"), sel("bezierPathWithRect:"),
+                        (double)(r.x * BASE_X), (double)(r.y * BASE_Y),
+                        (double)(r.w * BASE_X), (double)(r.h * BASE_Y));
+        void* col2 = _nsColorFromFramework(color);
+        if (col2 != nullptr) msg0(col2, "set");
+        if (filled) msg0(path, "fill"); else msg0(path, "stroke");
+    }
+
+    void pushClip(Rect r) { }   // per-region clipping not bridged (best-effort)
+    void popClip() { }
+};
+
+// The NSAttributedString foreground-color attribute key (a global NSString symbol);
+// resolved via a small class method wrapper is overkill, so a literal name is used.
+void* _nsForegroundColorKey() { return nsStr("NSColor"); }
+
+// A framework color (0x1RRGGBB with the marker bit; 0 = default) as an NSColor, or a
+// mid-gray fallback for a default color.
+void* _nsColorFromFramework(int color)
+{
+    if (color == 0) return nsColor(0.2, 0.2, 0.2, 1.0);
+    double r = (double)((color >> 16) & 0xFF) / 255.0;
+    double g = (double)((color >> 8) & 0xFF) / 255.0;
+    double b = (double)(color & 0xFF) / 255.0;
+    return nsColor(r, g, b, 1.0);
+}
+
+// CfCanvasView.drawRect: - resolve the view's boxed onPaint and invoke it with a
+// CocoaCanvas. NSRect arrives as 4 doubles (d0-d3) which we ignore (we paint the full
+// content each time). isFlipped -> YES so row 0 is at the top.
+void _canvasDrawRectImp(void* self, void* cmd, double x, double y, double w, double h)
+{
+    u64 box = _nHost._canvasBoxFor((u64)self);
+    if (box == 0u) return;
+    CocoaCanvas cv = default;
+    __uiCanvasPaint(box, cv);
+}
+
+i8 _canvasIsFlippedImp(void* self, void* cmd) { return (i8)1; }
+
+// ── NSTableView dataSource IMPs (ListView; the boxed rowText is the item source) ──
+i64 _numberOfRowsImp(void* self, void* cmd, void* table)
+{
+    return (i64)_nHost._listRowsForTable((u64)table);
+}
+
+void* _tableObjectValueImp(void* self, void* cmd, void* table, void* column, i64 row)
+{
+    u64 box = _nHost._listBoxForTable((u64)table);
+    if (box == 0u) return nsStr("");
+    void* cols = msg0(table, "tableColumns");
+    i64 ci = msgGetI64Arg(cols, "indexOfObject:", column);
+    if (ci < (i64)0) ci = (i64)0;
+    string cell = __uiListRowText(box, (int)row, (int)ci);
+    return nsStr(cell.data());
+}
+
+// A table row clicked (single) / double-clicked -> onSelect / onActivate.
+void _onListClickImp(void* self, void* cmd, void* table)
+{
+    if (!_nReady || _nHost.applying) return;
+    string key = _nHost.keyForHandle((u64)msg0(table, "enclosingScrollView"));
+    if (key.length() == 0) return;
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    if (e == nullptr) return;
+    ListView* lv = e as ListView;
+    if (lv == nullptr) return;
+    int sel = (int)msgGetI64(table, "selectedRow");
+    if (sel >= 0 && sel != lv.selectedIndex) { lv.onSelect(sel); pumpNative(); }
+}
+
+void _onListDoubleClickImp(void* self, void* cmd, void* table)
+{
+    if (!_nReady) return;
+    string key = _nHost.keyForHandle((u64)msg0(table, "enclosingScrollView"));
+    if (key.length() == 0) return;
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    if (e == nullptr) return;
+    ListView* lv = e as ListView;
+    if (lv == nullptr) return;
+    int sel = (int)msgGetI64(table, "selectedRow");
+    if (sel >= 0) { lv.onActivate(sel); pumpNative(); }
+}
+
+// The segmented tab strip changed -> onSelectTab.
+void _onTabSegmentImp(void* self, void* cmd, void* seg) { if (_nReady) routeTabChange(seg); }
+
+// ── NSOutlineView dataSource IMPs (TreeView; items are NSNumber(nodeId)) ──────
+i64 _outlineNumChildrenImp(void* self, void* cmd, void* outline, void* item)
+{
+    u64 box = _nHost._treeBoxForOutline((u64)outline);
+    if (box == 0u) return (i64)0;
+    int nodeId = item != nullptr ? (int)msgGetI64(item, "integerValue") : TREE_ROOT;
+    return (i64)__uiTreeChildCount(box, nodeId);
+}
+
+void* _outlineChildImp(void* self, void* cmd, void* outline, i64 index, void* item)
+{
+    u64 box = _nHost._treeBoxForOutline((u64)outline);
+    if (box == 0u) return nullptr;
+    int nodeId = item != nullptr ? (int)msgGetI64(item, "integerValue") : TREE_ROOT;
+    int childNid = __uiTreeChildId(box, nodeId, (int)index);
+    return msgIntArg(cls("NSNumber"), "numberWithInteger:", (i64)childNid);
+}
+
+i8 _outlineExpandableImp(void* self, void* cmd, void* outline, void* item)
+{
+    u64 box = _nHost._treeBoxForOutline((u64)outline);
+    if (box == 0u) return (i8)0;
+    int nodeId = item != nullptr ? (int)msgGetI64(item, "integerValue") : TREE_ROOT;
+    return __uiTreeChildCount(box, nodeId) > 0 ? (i8)1 : (i8)0;
+}
+
+void* _outlineObjectValueImp(void* self, void* cmd, void* outline, void* column, void* item)
+{
+    u64 box = _nHost._treeBoxForOutline((u64)outline);
+    if (box == 0u || item == nullptr) return nsStr("");
+    int nodeId = (int)msgGetI64(item, "integerValue");
+    string lbl = __uiTreeLabel(box, nodeId);
+    return nsStr(lbl.data());
+}
+
+// The outline selection changed (via its target/action) -> onSelect.
+void _onTreeClickImp(void* self, void* cmd, void* outline)
+{
+    if (!_nReady) return;
+    i64 row = msgGetI64(outline, "selectedRow");
+    if (row < (i64)0) return;
+    void* item = msgIntArg(outline, "itemAtRow:", row);
+    routeTreeSelectItem(outline, item);
+}
+
+// ── ctx.post() marshaling (performSelectorOnMainThread with an NSNumber box) ───
+void _cocoaPostEnqueue(u64 target, u64 boxPtr)
+{
+    void* num = msgIntArg(cls("NSNumber"), "numberWithUnsignedLongLong:", (i64)boxPtr);
+    msgPerformOnMain(_nHost.target, "runPostBox:", num, false);
+}
+
+u64 _cocoaCurTid() { return (u64)msg0(cls("NSThread"), "currentThread"); }
+
+// runPostBox: (main thread) - unwrap the NSNumber and run + free the boxed closure.
+void _runPostBoxImp(void* self, void* cmd, void* num)
+{
+    if (num == nullptr) return;
+    u64 boxPtr = (u64)msgGetI64(num, "unsignedLongLongValue");
+    __uiRunPostBox(boxPtr);
 }
 
 // ── Host-neutral accessors (P7; mirror the Win32 host) ───────────────────────
@@ -732,6 +1452,69 @@ void routeClick(void* ctrl)
     if (b != nullptr) { b.fireClick(); pumpNative(); return; }
     Checkbox* c = e as Checkbox;
     if (c != nullptr) { c.fireToggle(); pumpNative(); return; }
+    // A radio routes to its enclosing RadioGroup (one key-path segment up), which owns
+    // the controlled value + onChange (mirror of the Win32 host).
+    RadioButton* rb = e as RadioButton;
+    if (rb != nullptr)
+    {
+        string pp = _parentPath(key);
+        Element pe = findByKey(_nTree, keySegment(_nTree, 0), pp);
+        if (pe != nullptr)
+        {
+            RadioGroup* g = pe as RadioGroup;
+            if (g != nullptr) { g.onChange(rb.index); pumpNative(); }
+        }
+    }
+}
+
+// Strip the last "/segment" from a key path ("root/rg/r1" -> "root/rg"); "" if none.
+string _parentPath(string key)
+{
+    int last = -1; int i = 0; int n = (int)key.length();
+    while (i < n) { if (key.data()[i] == '/') last = i; i++; }
+    if (last < 0) return "";
+    return substring(key, 0, last);
+}
+
+// A combo selection change: read the new index, fire onChange.
+void routeCombo(void* ctrl)
+{
+    string key = _nHost.keyForHandle((u64)ctrl);
+    if (key.length() == 0) return;
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    if (e == nullptr) return;
+    ComboBox* cb = e as ComboBox;
+    if (cb == nullptr) return;
+    int sel = (int)msgGetI64(ctrl, "indexOfSelectedItem");
+    if (sel >= 0 && sel != cb.selectedIndex) { cb.onChange(sel); pumpNative(); }
+}
+
+// A tab strip selection change: read the segment, fire onSelectTab.
+void routeTabChange(void* ctrl)
+{
+    if (_nHost.applying) return;
+    string key = _nHost.keyForHandle((u64)ctrl);
+    if (key.length() == 0) return;
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    if (e == nullptr) return;
+    TabControl* tc = e as TabControl;
+    if (tc == nullptr) return;
+    int sel = (int)msgGetI64(ctrl, "selectedSegment");
+    if (sel >= 0 && sel != tc.selectedTab) { tc.onSelectTab(sel); pumpNative(); }
+}
+
+// A tree selection change: read the selected item's nodeId, fire onSelect + onExpand.
+void routeTreeSelectItem(void* outline, void* item)
+{
+    if (_nHost.applying) return;
+    string key = _nHost.keyForHandle((u64)msg0(outline, "enclosingScrollView"));
+    if (key.length() == 0) return;
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    if (e == nullptr) return;
+    TreeView* tv = e as TreeView;
+    if (tv == nullptr) return;
+    int nid = item != nullptr ? (int)msgGetI64(item, "integerValue") : (0 - 1);
+    if (nid != tv.selectedNode) { tv.onSelect(nid); pumpNative(); }
 }
 
 void routeEdit(void* ctrl)
@@ -885,20 +1668,37 @@ void nativeTestFireMenu(int cmd)
     routeMenu(cmd);
 }
 
-// P11: a real per-element NSMenu popUpContextMenu is deferred to the macOS parity sweep;
-// this stub keeps shared app code compiling and frees the boxed ContextMenu it is handed
-// so nothing leaks (mirrors the setListOp box-free stub).
+// Register (or replace) the context menu for a key path; the host takes ownership of
+// the boxed ContextMenu* (freed on teardown). Right-click shows it via NSMenu.
 void nativeSetContextMenu(string keyPath, u64 menuPtr)
 {
-    if (menuPtr != 0u) __uiFreeContextMenu(menuPtr);
+    _nHost.setContextMenu(keyPath, menuPtr);
 }
 
-// ── P9 host-neutral driver API (macOS stubs; NSTabView/NSOutlineView/NSSplitView
-// backends are the P11 parity sweep). These keep shared app code (the fedit P9 self-
-// test block) compiling on Darwin; the block itself is `if const (!__MACOS__)`-gated,
-// so they are never invoked on mac - but name resolution still requires them.
-void nativeFireContextMenu(string keyPath, int itemIndex) { }
-void nativeSplitterDrag(string keyPath, int dipX, int dipY) { }
+// Simulate the user picking item `itemIndex` of the context menu on keyPath (headless:
+// popUpMenuPositioningItem cannot run unattended). Routes the item's command.
+void nativeFireContextMenu(string keyPath, int itemIndex)
+{
+    u64 mp = _nHost.contextMenuFor(keyPath);
+    if (mp == 0u) return;
+    ContextMenu* cm = (ContextMenu*)mp;
+    if (itemIndex < 0 || itemIndex >= cm.count()) return;
+    int cmd = cm.cmds.get(itemIndex);
+    if (cmd > 0) routeMenu(cmd);
+}
+
+// Drive a splitter to a DIP position along its axis (headless drag). Fires onRatioChange
+// (the SplitView is a layout container, like Win32 - the divider is a parent-tracked gap,
+// not an NSSplitView, so the layout model stays single-source per the plan).
+void nativeSplitterDrag(string keyPath, int dipX, int dipY)
+{
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), keyPath);
+    if (e == nullptr) return;
+    SplitView* sv = e as SplitView;
+    if (sv == nullptr) return;
+    sv.onRatioChange(sv._ratioAt(dipX, dipY));
+    pumpNative();
+}
 
 Rect nativeNodeBounds(string keyPath)
 {
@@ -907,16 +1707,208 @@ Rect nativeNodeBounds(string keyPath)
     return e.nodeBounds();
 }
 
-int nativeTabSelected(string keyPath) { return 0 - 1; }
-int nativeTabCount(string keyPath) { return 0; }
-void nativeTabSelect(string keyPath, int idx) { }
+// ── Tab drivers (NSSegmentedControl strip + the controlled model) ─────────────
+int nativeTabSelected(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0 - 1;
+    return (int)msgGetI64(u2h(h), "selectedSegment");
+}
 
-u64 nativeTreeRootItem(string keyPath) { return 0u; }
-u64 nativeTreeChildItem(string keyPath, u64 hItem) { return 0u; }
-int nativeTreeItemCount(string keyPath) { return 0; }
-void nativeTreeExpandItem(string keyPath, u64 hItem) { }
-void nativeTreeSelectItem(string keyPath, u64 hItem) { }
-int nativeTreeItemNodeId(string keyPath, u64 hItem) { return 0 - 1; }
+int nativeTabCount(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0;
+    return (int)msgGetI64(u2h(h), "segmentCount");
+}
+
+void nativeTabSelect(string keyPath, int idx)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    msgInt(u2h(h), "setSelectedSegment:", (i64)idx);
+    routeTabChange(u2h(h));
+}
+
+// ── Tree drivers (real NSOutlineView item API; items are NSNumber(nodeId)) ─────
+void* _outlineOf(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return nullptr;
+    return _nHost._tableOf(h);
+}
+
+u64 nativeTreeRootItem(string keyPath)
+{
+    void* ov = _outlineOf(keyPath);
+    if (ov == nullptr) return 0u;
+    return (u64)msgIntArg(ov, "itemAtRow:", (i64)0);
+}
+
+u64 nativeTreeChildItem(string keyPath, u64 hItem)
+{
+    void* ov = _outlineOf(keyPath);
+    if (ov == nullptr) return 0u;
+    function<void*(void*, void*, i64, void*)> f = (function<void*(void*, void*, i64, void*)>)__objcMsgSendPtr;
+    return (u64)f(ov, sel("child:ofItem:"), (i64)0, u2h(hItem));
+}
+
+int nativeTreeItemCount(string keyPath)
+{
+    void* ov = _outlineOf(keyPath);
+    if (ov == nullptr) return 0;
+    return (int)msgGetI64(ov, "numberOfRows");
+}
+
+void nativeTreeExpandItem(string keyPath, u64 hItem)
+{
+    void* ov = _outlineOf(keyPath);
+    if (ov == nullptr) return;
+    msg1(ov, "expandItem:", u2h(hItem));
+}
+
+void nativeTreeSelectItem(string keyPath, u64 hItem)
+{
+    void* ov = _outlineOf(keyPath);
+    if (ov == nullptr) return;
+    i64 row = msgGetI64Arg(ov, "rowForItem:", u2h(hItem));
+    if (row >= (i64)0)
+    {
+        void* idx = msgIntArg(cls("NSIndexSet"), "indexSetWithIndex:", row);
+        function<void*(void*, void*, void*, i8)> f = (function<void*(void*, void*, void*, i8)>)__objcMsgSendPtr;
+        f(ov, sel("selectRowIndexes:byExtendingSelection:"), idx, (i8)0);
+    }
+    routeTreeSelectItem(ov, u2h(hItem));
+}
+
+int nativeTreeItemNodeId(string keyPath, u64 hItem)
+{
+    if (hItem == 0u) return 0 - 1;
+    return (int)msgGetI64(u2h(hItem), "integerValue");   // items are NSNumber(nodeId)
+}
+
+// ── ListView drivers (NSTableView + the boxed rowText item source) ────────────
+int nativeListRowCount(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0;
+    return _nHost._listRows(h);
+}
+
+string nativeListCellText(string keyPath, int row, int col)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return "";
+    void* table = _nHost._tableOf(h);
+    u64 box = _nHost._listBoxForTable((u64)table);
+    if (box == 0u) return "";
+    return __uiListRowText(box, row, col);
+}
+
+void nativeListSelect(string keyPath, int row)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    _nHost.setListOp(h, LISTOP_SET_SELECTION, row, 0, "", 0u);
+}
+
+int nativeListSelectedRow(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0 - 1;
+    void* table = _nHost._tableOf(h);
+    return (int)msgGetI64(table, "selectedRow");
+}
+
+void nativeListActivate(string keyPath, int row)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    if (row >= 0) nativeListSelect(keyPath, row);
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), keyPath);
+    if (e == nullptr) return;
+    ListView* lv = e as ListView;
+    if (lv == nullptr) return;
+    if (row >= 0) { lv.onActivate(row); pumpNative(); }
+}
+
+// ── P11 host-neutral form/data test drivers (mirror the Win32 names) ──────────
+void nativeClickButton(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    void* ctrl = u2h(h);
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), keyPath);
+    // Mirror the OS auto-toggle for the two state controls before routing the click.
+    if (e != nullptr && e.kind() == ELEM_CHECKBOX)
+    {
+        i64 cur = msgGetI64(ctrl, "state");
+        msgInt(ctrl, "setState:", cur == (i64)0 ? (i64)1 : (i64)0);
+    }
+    else if (e != nullptr && e.kind() == ELEM_RADIO)
+    {
+        msgInt(ctrl, "setState:", (i64)1);
+    }
+    routeClick(ctrl);
+}
+
+bool nativeIsChecked(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return false;
+    return msgGetI64(u2h(h), "state") == (i64)1;
+}
+
+int nativeComboSelected(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0 - 1;
+    return (int)msgGetI64(u2h(h), "indexOfSelectedItem");
+}
+
+void nativeComboSelect(string keyPath, int idx)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    msgInt(u2h(h), "selectItemAtIndex:", (i64)idx);
+    routeCombo(u2h(h));
+}
+
+void nativeTypeText(string keyPath, string s)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    msg1(u2h(h), "setStringValue:", nsStr(s.data()));
+    routeEdit(u2h(h));
+}
+
+int nativeProgressValue(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0 - 1;
+    return (int)msgGetDouble(u2h(h), "doubleValue");
+}
+
+void nativeSliderSet(string keyPath, int v)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    msgSetDouble(u2h(h), "setDoubleValue:", (double)v);
+    routeSlider(u2h(h));
+}
+
+bool nativeImageHasBitmap(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return false;
+    return msg0(u2h(h), "image") != nullptr;
+}
+
+// Accents on mac ride bezelColor/contentTintColor (no NM_CUSTOMDRAW). The gallery's
+// accent asserts are Win32-only in spirit; these keep the shared self-test compiling and
+// return 0 (no stored COLORREF model on mac - the color lives on the NSButton).
+u32 nativeAccentBg(string keyPath) { return 0u; }
+u32 nativeTestCustomDrawFill(string keyPath) { return 0u; }
 
 // Close the main window (bypasses the close guard - the caller already decided).
 // -close does not fire windowShouldClose:, matching Win32 DestroyWindow.
@@ -1371,7 +2363,42 @@ void registerHostClasses()
         addMethod0(tg, "windowDidResize:", wr);
         addMethod0(tg, "windowWillClose:", ww);
         addMethodBool(tg, "windowShouldClose:", wc);
+
+        // Data-control target/action + dataSource methods (P11).
+        function<void(void*, void*, void*)> lc = _onListClickImp;
+        function<void(void*, void*, void*)> ld = _onListDoubleClickImp;
+        function<void(void*, void*, void*)> tsg = _onTabSegmentImp;
+        function<void(void*, void*, void*)> trc = _onTreeClickImp;
+        function<void(void*, void*, void*)> rpb = _runPostBoxImp;
+        addMethod0(tg, "onListClick:", lc);
+        addMethod0(tg, "onListDoubleClick:", ld);
+        addMethod0(tg, "onTabSegment:", tsg);
+        addMethod0(tg, "onTreeClick:", trc);
+        addMethod0(tg, "runPostBox:", rpb);
+        function<i64(void*, void*, void*)> nr = _numberOfRowsImp;
+        function<void*(void*, void*, void*, void*, i64)> tov = _tableObjectValueImp;
+        addMethodI64_1(tg, "numberOfRowsInTableView:", nr);
+        addMethodIdIdIdI64(tg, "tableView:objectValueForTableColumn:row:", tov);
+        function<i64(void*, void*, void*, void*)> onc = _outlineNumChildrenImp;
+        function<void*(void*, void*, void*, i64, void*)> och = _outlineChildImp;
+        function<i8(void*, void*, void*, void*)> oex = _outlineExpandableImp;
+        function<void*(void*, void*, void*, void*, void*)> oov = _outlineObjectValueImp;
+        addMethodI64_2(tg, "outlineView:numberOfChildrenOfItem:", onc);
+        addMethodIdIdI64Id(tg, "outlineView:child:ofItem:", och);
+        addMethodBool2(tg, "outlineView:isItemExpandable:", oex);
+        addMethodIdIdIdId(tg, "outlineView:objectValueForTableColumn:byItem:", oov);
         finishClass(tg);
+    }
+
+    // CfCanvasView: a flipped custom NSView whose drawRect: bridges to onPaint(Canvas).
+    void* cvv = newClass("CfCanvasView", "NSView");
+    if (cvv != nullptr)
+    {
+        function<i8(void*, void*)> flip = _canvasIsFlippedImp;
+        addMethodBool0(cvv, "isFlipped", flip);
+        function<void(void*, void*, double, double, double, double)> dr = _canvasDrawRectImp;
+        __classAddMethod(cvv, sel("drawRect:"), (void*)dr, "v@:{{CGRect={{CGPoint=dd}}{{CGSize=dd}}}}");
+        finishClass(cvv);
     }
 
     void* ad = newClass("CfHostAppDelegate", "NSObject");
@@ -1398,8 +2425,13 @@ void* createNativeWindow(const char* title, bool show)
     msg1(app, "setDelegate:", del);
     _nHost.appDelegate = del;
 
-    // One shared target: control action, menu action, and window delegate.
+    // One shared target: control action, menu action, window delegate, data sources.
     _nHost.target = msg0(msg0(cls("CfHostTarget"), "alloc"), "init");
+
+    // ctx.post() marshaling: run a boxed closure on the main thread via the target's
+    // runPostBox: (performSelectorOnMainThread). Same opaque-u64 contract as Win32.
+    _nCtx.bindPost((u64)_nHost.target, _cocoaPostEnqueue);
+    _nCtx.bindThreadId(_cocoaCurTid(), _cocoaCurTid);
 
     // Content 760x560 pt -> _nW=95, _nH=21 DIP. styleMask 15 = Titled|Closable|
     // Miniaturizable|Resizable, backing 2 = Buffered.
@@ -1474,9 +2506,28 @@ void nativeTeardownForTest()
     _nHost.contentView = nullptr;
     _nHost.target = nullptr;
     _nHost.appDelegate = nullptr;
+    // Free any remaining boxed callbacks + registered context menus (host-owned).
+    { int i = 0; while (i < _nHost.listBoxPtrs.count()) { u64 b = _nHost.listBoxPtrs.get(i); if (b != 0u) __uiFreeListRowBox(b); i++; } }
+    { int i = 0; while (i < _nHost.treeBoxPtrs.count()) { u64 b = _nHost.treeBoxPtrs.get(i); if (b != 0u) __uiFreeTreeBox(b); i++; } }
+    { int i = 0; while (i < _nHost.canvasBoxes.count()) { u64 b = _nHost.canvasBoxes.get(i); if (b != 0u) __uiFreeCanvasBox(b); i++; } }
+    { int i = 0; while (i < _nHost.ctxMenus.count()) { u64 b = _nHost.ctxMenus.get(i); if (b != 0u) __uiFreeContextMenu(b); i++; } }
     { dictionary<string, u64> d = move _nCtx.nativeByKey; }
     { list<string> a1 = move _nHost.liveKeys; }
     { list<u64>    a2 = move _nHost.liveHandles; }
+    { list<u64>    b1 = move _nHost.listBoxHandles; }
+    { list<u64>    b2 = move _nHost.listBoxPtrs; }
+    { list<u64>    b3 = move _nHost.listSelHandles; }
+    { list<int>    b4 = move _nHost.listSelRows; }
+    { list<u64>    b5 = move _nHost.listRowCounts; }
+    { list<int>    b6 = move _nHost.listRowCountV; }
+    { list<u64>    b7 = move _nHost.treeBoxHandles; }
+    { list<u64>    b8 = move _nHost.treeBoxPtrs; }
+    { list<string> b9 = move _nHost.ctxKeys; }
+    { list<u64>    b10 = move _nHost.ctxMenus; }
+    { list<u64>    b11 = move _nHost.canvasHandles; }
+    { list<u64>    b12 = move _nHost.canvasBoxes; }
+    { list<u64>    b13 = move _nHost.imgHandles; }
+    { list<u64>    b14 = move _nHost.imgLastPixels; }
     { list<string> a3 = move _menuTop; }
     { list<int>    a4 = move _menuItemTopIdx; }
     { list<string> a5 = move _menuItemLabel; }

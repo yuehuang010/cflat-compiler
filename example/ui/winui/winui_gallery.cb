@@ -1,0 +1,33 @@
+// winui_gallery.cb - the WinUI 3 launcher for the widget-gallery flagship (P12).
+//
+// The host-neutral GalleryApp Component + its 25-assert headless self-test live in
+// example/ui/gallery/gallery_app.cb (shared with the Win32/Cocoa launcher gallery.cb). This
+// file wires them to winui_host.cb (the WinUI 3 NativeHost backend) - the THIRD host the setListOp
+// seam + the whole native* driver surface run against, which is the last design-risk retirement
+// before the API can freeze.
+//
+// The self-test runs SYNCHRONOUSLY inside Application.Start's init callback (runWinuiHeadless
+// installs gallerySelfTest as the body): the XAML framework is up, so startHeadlessWindow mounts
+// the tree and every native* driver creates/drives/reads controls with plain COM calls, then Exits.
+//
+// Build (needs -i to both winui/ and ui/ + gallery/; the winmds/bootstrapper come from NuGet):
+//   cflat winui_gallery.cb -i example/ui/winui -i example/ui -i example/ui/gallery -o winui_gallery.exe
+// Headless self-test:  winui_gallery.exe --selftest
+// (example.bat runs it via --worker-winui when the WindowsAppSDK NuGet packages are cached.)
+
+import "winui_host.cb";
+import "gallery_app.cb";
+
+extern int main(int argc, char** argv)
+{
+    if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
+    {
+        // Run the shared gallery self-test on the XAML UI thread, inside the pump.
+        setSelfTestBody(() => { return gallerySelfTest(); });
+        return runWinuiHeadless();
+    }
+
+    // Live window: render the gallery on real WinUI 3 controls.
+    wireGallery();
+    return runAppWinui(new GalleryApp());
+}

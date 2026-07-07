@@ -77,13 +77,10 @@ const int LVIF_TEXT    = 0x0001;
 const int LVIS_FOCUSED  = 0x0001;
 const int LVIS_SELECTED = 0x0002;
 const int LVNI_SELECTED = 0x0002;
-// Negative literals in a global const initializer are miscompiled (truncated to the
-// smallest unsigned width - see internal/issue/negative-int-literal-global-init.md),
-// so these are written as `0 - N`, which folds correctly.
-const int LVN_ITEMCHANGED = 0 - 101;   // LVN_FIRST-1
-const int LVN_GETDISPINFOA = 0 - 150;  // LVN_FIRST-50
-const int LVN_KEYDOWN     = 0 - 155;   // LVN_FIRST-55
-const int NM_DBLCLK       = 0 - 3;     // NM_FIRST-3
+const int LVN_ITEMCHANGED = -101;   // LVN_FIRST-1
+const int LVN_GETDISPINFOA = -150;  // LVN_FIRST-50
+const int LVN_KEYDOWN     = -155;   // LVN_FIRST-55
+const int NM_DBLCLK       = -3;     // NM_FIRST-3
 
 // LVCOLUMNA (ANSI, natural 8-byte pointer alignment). pszText/iSubItem drive an
 // LVM_INSERTCOLUMNA; _pad aligns pszText to offset 16.
@@ -143,7 +140,7 @@ const int TCM_GETCURSEL     = 0x130B;   // TCM_FIRST+11
 const int TCM_SETCURSEL     = 0x130C;   // TCM_FIRST+12
 const int TCM_GETITEMCOUNT  = 0x1304;   // TCM_FIRST+4
 const int TCIF_TEXT         = 0x0001;
-const int TCN_SELCHANGE     = 0 - 551;  // TCN_FIRST-1 (negative; see the note above)
+const int TCN_SELCHANGE     = -551;  // TCN_FIRST-1
 
 // TCITEMA (ANSI, tightly packed like LVColumnA - cflat inserts no field padding, so
 // pointers/i64 are hand-aligned). pszText lands at offset 16, lParam at 32.
@@ -179,8 +176,8 @@ const int TVGN_ROOT        = 0x0000;
 const int TVGN_CHILD       = 0x0004;
 const int TVGN_CARET       = 0x0009;
 const int TVE_EXPAND       = 0x0002;
-const int TVN_SELCHANGEDA   = 0 - 402;  // TVN_FIRST-2
-const int TVN_ITEMEXPANDINGA = 0 - 405; // TVN_FIRST-5
+const int TVN_SELCHANGEDA   = -402;  // TVN_FIRST-2
+const int TVN_ITEMEXPANDINGA = -405; // TVN_FIRST-5
 
 // TVITEMA (ANSI, tightly packed). hItem@8, pszText@24, lParam@48; size 56.
 struct TVItemA
@@ -227,9 +224,8 @@ void* tviLast() { return (void*)((i64)0 - (i64)0xFFFE); }
 // LR_LOADFROMFILE / DIB_RGB_COLORS / PW_RENDERFULLCONTENT / GWLP_USERDATA are all
 // surfaced by the windows.h binding. The custom-draw NM_/CDDS_/CDRF_/CDIS_ codes are not.
 
-// NM_CUSTOMDRAW for themed accent buttons (P10). NM_FIRST = 0; NM_CUSTOMDRAW = NM_FIRST-12
-// (negative literal in a global const is miscompiled - see the note above - so `0 - N`).
-const int NM_CUSTOMDRAW      = 0 - 12;
+// NM_CUSTOMDRAW for themed accent buttons (P10). NM_FIRST = 0; NM_CUSTOMDRAW = NM_FIRST-12.
+const int NM_CUSTOMDRAW      = -12;
 const int CDDS_PREPAINT      = 0x00000001;
 const int CDRF_DODEFAULT     = 0x00000000;
 const int CDRF_SKIPDEFAULT   = 0x00000004;
@@ -330,6 +326,16 @@ string tooltipOf(Element node)
     if (k == ELEM_GROUPBOX)  { GroupBox* g = node as GroupBox; return "" + g.tooltip; }
     if (k == ELEM_CANVAS)    { CanvasView* c = node as CanvasView; return "" + c.tooltip; }
     return "";
+}
+
+// P13 a11y: kinds whose window text is NOT their visible content, so they expose no
+// MSAA/UIA Name on their own. For these, a tooltip is mirrored into the window text (which
+// these classes do not paint) so a screen reader announces a Name - text-bearing controls
+// (Button/Text/Checkbox/Radio/GroupBox/Edit) already get a Name from their window text.
+bool accessibleNameKind(int k)
+{
+    return k == ELEM_PROGRESS || k == ELEM_SLIDER || k == ELEM_LIST || k == ELEM_TREE
+        || k == ELEM_COMBO || k == ELEM_IMAGE || k == ELEM_CANVAS;
 }
 
 // ── Window: one top-level window + its Element tree, context, and controls ────
@@ -1191,6 +1197,9 @@ class Window : NativeHost
             this._syncProps(node, h);
             string tip = tooltipOf(node);
             if (tip.length() > 0) this.setTooltip(h, tip);
+            // Name-only: mirror the tooltip into the window text of a textless control so it
+            // exposes an accessible Name (no visual change - these classes do not paint it).
+            if (tip.length() > 0 && accessibleNameKind(node.kind())) SetWindowTextA(u2h(h), tip.data());
             Rect b = node.nodeBounds();
             keys.add("" + path);
             handles.add(h);
@@ -2746,6 +2755,160 @@ u32 nativeTestCustomDrawFill(string keyPath)
     DeleteDC(memDC);
     ReleaseDC(nullptr, screenDC);
     return px;
+}
+
+// ── P11 host-neutral test drivers (form + data controls) ──────────────────────
+// These drive controls by KEY PATH through the same routing the OS uses on real input,
+// so the gallery self-test contains no toolkit-typed calls and runs against any host.
+// The Cocoa/WinUI hosts implement the SAME names (best-effort on Cocoa; P12 on WinUI).
+
+// Click a Button / Checkbox / RadioButton by key: mirror the OS auto-toggle for the two
+// state controls, then route the click so the model fires + the tree re-renders.
+void nativeClickButton(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    void* ctrl = u2h(h);
+    Window* wnd = curWin();
+    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), keyPath);
+    if (e != nullptr && e.kind() == ELEM_CHECKBOX)
+    {
+        int cur = (int)SendMessageA(ctrl, (u32)BM_GETCHECK, 0u, (i64)0);
+        SendMessageA(ctrl, (u32)BM_SETCHECK, cur == 0 ? 1u : 0u, (i64)0);
+    }
+    else if (e != nullptr && e.kind() == ELEM_RADIO)
+    {
+        SendMessageA(ctrl, (u32)BM_SETCHECK, 1u, (i64)0);
+    }
+    routeClick(ctrl);
+}
+
+// True if the checkbox / radio at keyPath is checked (native BM_GETCHECK).
+bool nativeIsChecked(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return false;
+    return (int)SendMessageA(u2h(h), (u32)BM_GETCHECK, 0u, (i64)0) == 1;
+}
+
+// The combo box selection index (-1 if none / not a combo).
+int nativeComboSelected(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0 - 1;
+    return (int)SendMessageA(u2h(h), (u32)CB_GETCURSEL, 0u, (i64)0);
+}
+
+// Select combo index `idx` and route CBN_SELCHANGE (controlled: the model follows).
+void nativeComboSelect(string keyPath, int idx)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    SendMessageA(u2h(h), (u32)CB_SETCURSEL, (u64)idx, (i64)0);
+    routeCombo(u2h(h));
+}
+
+// Type `s` into a text input and route EN_CHANGE (controlled: onChangeText fires).
+void nativeTypeText(string keyPath, string s)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    SetWindowTextA(u2h(h), s.data());
+    routeEdit(u2h(h));
+}
+
+// Select row `row` (if >= 0) then activate it (double-click / Enter) -> onActivate.
+void nativeListActivate(string keyPath, int row)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    if (row >= 0) nativeListSelect(keyPath, row);
+    routeListActivate(u2h(h));
+}
+
+// The progress bar position (PBM_GETPOS); -1 if no control.
+int nativeProgressValue(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0 - 1;
+    return (int)SendMessageA(u2h(h), (u32)PBM_GETPOS, 0u, (i64)0);
+}
+
+// Drag a slider to position `v` and route WM_HSCROLL (controlled: onChange fires).
+void nativeSliderSet(string keyPath, int v)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    SendMessageA(u2h(h), (u32)TBM_SETPOS, 1u, (i64)v);
+    routeSlider(u2h(h));
+}
+
+// True if the Image control at keyPath has an uploaded bitmap (setImageData ran).
+bool nativeImageHasBitmap(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return false;
+    return (void*)SendMessageA(u2h(h), (u32)STM_GETIMAGE, (u64)IMAGE_BITMAP, (i64)0) != nullptr;
+}
+
+// The stored accent background (COLORREF) of the button at keyPath, or 0 if none.
+u32 nativeAccentBg(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0u;
+    u32 bg = 0u; u32 fg = 0u;
+    if (curWin().accentFor(h, &bg, &fg)) return bg;
+    return 0u;
+}
+
+// ── P13 host-neutral hardening drivers (Win32 bodies) ─────────────────────────
+// The MSAA/UIA accessible Name of the control at keyPath (its window text - the OS Name
+// source; for a textless control this is the tooltip mirrored in by applyTree).
+string nativeAccessibleName(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return "";
+    char[512] buf;
+    GetWindowTextA(u2h(h), buf, 512);
+    return "" + buf;
+}
+
+// Host-side logical Tab focus. A headless window is never foreground, so GetFocus() reads
+// NULL there; the tests chain focus through this tracked handle (GetNextDlgTabItem is the
+// real Tab ring, independent of OS foreground) and SetFocus is called for fidelity.
+u64 _testFocusH = 0u;
+
+// Advance logical Tab focus to the tabstop after `from` (nullptr = the first tabstop),
+// tracking + real-SetFocus-ing it; returns the new focus handle (0 if none).
+u64 _focusStep(void* fromCtl)
+{
+    void* n = GetNextDlgTabItem(curWin().hwnd, fromCtl, 0);
+    if (n != nullptr) { _testFocusH = (u64)n; SetFocus(n); } else _testFocusH = 0u;
+    return _testFocusH;
+}
+
+// Handle-valued ring walk (leak-free: no owned key string allocated per step).
+u64 nativeFocusFirstH() { return _focusStep(nullptr); }
+u64 nativeFocusNextH()  { return _focusStep(u2h(_testFocusH)); }
+
+// Focus the first WS_TABSTOP control in the dialog Tab ring; return its key path.
+string nativeFocusFirst() { return curWin().keyForHandle(nativeFocusFirstH()); }
+
+// Advance focus to the next control in the Tab ring (Tab key equivalent); return its key.
+string nativeFocusNext() { return curWin().keyForHandle(nativeFocusNextH()); }
+
+// The key path / handle of the control that currently holds logical Tab focus.
+string nativeFocusedKey() { return curWin().keyForHandle(_testFocusH); }
+u64    nativeFocusedHandle() { return _testFocusH; }
+
+// Drive a live client-area resize (WM_SIZE) to w x h DIPs, so the host relayouts + reconciles.
+void nativeResizeClient(int wDip, int hDip)
+{
+    Window* wnd = curWin();
+    int px = wDip * wnd.dipX();
+    int py = hDip * wnd.dipY();
+    i64 lp = (i64)(((py & 0xFFFF) << 16) | (px & 0xFFFF));
+    SendMessageA(wnd.hwnd, (u32)WM_SIZE, 0u, lp);
 }
 
 // LRESULT CALLBACK shared by all windows. Resolves the servicing window by scanning

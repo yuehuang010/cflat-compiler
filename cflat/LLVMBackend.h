@@ -13491,6 +13491,26 @@ public:
         return false;
     }
 
+    // True when `storage` is the slot of a plain (borrow) string PARAMETER - a `string s`
+    // argument this frame does NOT own. The slot holds a {ptr,len} copied by value from the
+    // caller with the runtime OWNED bit intact (correct: the callee must not free a borrow),
+    // so a passthrough `return s;` must hand back a BORROW, not a move: its Storage is an
+    // alloca (looks like a movable whole-local), but the caller still owns the buffer.
+    // A `move string s` param (IsOwningString) or any owning local is excluded.
+    bool IsBorrowStringParamStorage(llvm::Value* storage)
+    {
+        if (storage == nullptr) return false;
+        for (auto& frame : stackNamedVariable)
+        {
+            for (auto& [varName, nv] : frame.functionArgument)
+                if (nv.Storage == storage)
+                    return nv.TypeAndValue.TypeName == "string"
+                        && !nv.TypeAndValue.IsMove
+                        && !nv.IsOwningString && !nv.IsOwning;
+        }
+        return false;
+    }
+
     // `returnedLocalStorage`, when provided, is the alloca of the named local being
     // returned (the return expression's NamedVariable.Storage). It lets the struct-return
     // move detection below work even when the by-value return is materialized field-wise
