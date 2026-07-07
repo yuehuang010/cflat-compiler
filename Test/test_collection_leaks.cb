@@ -109,6 +109,13 @@ InnerTok returnMovedInner(int n) { return makeOuterTok(n).inner; }
 interface ILabel { string label(); };
 class Labeler : ILabel { string tag = default; string label() { return tag + "!"; } };
 
+// PLAIN (non-`move`) string return that hands back a freshly owned concat. Passing its result -
+// or an owned local bound from it - bare into list<string>.add(move)/set(move) used to LEAK: the
+// move-arg lowering heap-copied a fresh buffer for the slot (the static owned flag is unset for a
+// plain return / bare local read) and orphaned the runtime-owned original. The lowering now
+// branches on the runtime owned bit: transfer when already owned, copy only literals/views.
+string plainOwnedStr(int n) { return "owned" + n.toString(); }
+
 extern int main()
 {
     HeapAudit.enable();
@@ -139,6 +146,26 @@ extern int main()
         ls.set(1, "OVERWRITTEN");          // old "bbb" must be destructed, new value moved in
         total++; passed += Test("list set value", ls.get(1), "OVERWRITTEN");
         total++; passed += Test("list set keeps count", ls.count(), 3);
+    }
+
+    // === Bug 2d: bare owned string moved into list<string>.add / .set adopts (no leak) ===
+    // A call result and a named local (both runtime-owned but NOT statically flagged) moved into
+    // a `move string` param must transfer their buffer into the slot, not orphan it via a copy.
+    {
+        list<string> ls = default;
+        string s = plainOwnedStr(0);
+        ls.add(s);                         // bare named local -> add(move)
+        ls.add(plainOwnedStr(1));          // bare call result  -> add(move)
+        ls.add("lit2");                    // literal still heap-copied (owns an independent buffer)
+        total++; passed += Test("bare-move add count", ls.count(), 3);
+        total++; passed += Test("bare-move add[0]", ls.get(0), "owned0");
+        total++; passed += Test("bare-move add[1]", ls.get(1), "owned1");
+
+        ls.set(0, plainOwnedStr(2));       // bare call result  -> set(move), old freed
+        string s2 = plainOwnedStr(3);
+        ls.set(1, s2);                     // bare named local  -> set(move), old freed
+        total++; passed += Test("bare-move set[0]", ls.get(0), "owned2");
+        total++; passed += Test("bare-move set[1]", ls.get(1), "owned3");
     }
 
     // === Bug 2b: list<string>.removeAt frees the removed owning element ===

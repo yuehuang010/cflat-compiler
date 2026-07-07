@@ -8561,20 +8561,32 @@ public:
             value = Upconvert(value, GetType(param), argIsUnsigned);
         }
 
-        // Non-owning string (literal or view) passed to a move parameter - heap-copy it
-        // so the callee receives an owned buffer it can safely free.
+        // A string not statically known to own its buffer, passed to a move parameter.
+        // It may still carry the runtime OWNED bit (a plain-'string' call result, or an
+        // owned local read bare) - transferring that as-is lets the callee/list adopt it.
+        // A literal or view (owned bit clear) must instead be heap-copied so the callee
+        // receives an independent, freeable buffer that cannot dangle or leak. The static
+        // flag cannot tell these apart, so branch on the owned bit at runtime.
         if (param.IsMove && param.TypeName == "string" && !arg.IsOwningString)
         {
             auto* strTy = llvm::StructType::getTypeByName(*context, "string");
             if (strTy && GetFunction("operator new"))
             {
                 auto* srcPtr = builder->CreateExtractValue(value, { 0u }, "litptr");
-                // Mask off _len's high OWNED bit before using it as a byte count
-                // (string-redesign FINAL MODEL) - the bit would inflate allocSize to
-                // ~2GB and AV the memcpy when the source is an owned string.
-                auto* srcLen = builder->CreateAnd(
-                    builder->CreateExtractValue(value, { 1u }, "litlenraw"),
-                    builder->getInt32(0x7FFFFFFF), "litlen");
+                auto* rawLen = builder->CreateExtractValue(value, { 1u }, "litlenraw");
+                // Owned bit is _len's high bit - already-owned strings transfer without a copy.
+                auto* alreadyOwned = builder->CreateICmpSLT(rawLen, builder->getInt32(0), "movearg.owned");
+                auto* transferBB = builder->GetInsertBlock();
+                auto* fn = transferBB->getParent();
+                auto* copyBB  = llvm::BasicBlock::Create(*context, "movearg.copy",  fn);
+                auto* mergeBB = llvm::BasicBlock::Create(*context, "movearg.merge", fn);
+                builder->CreateCondBr(alreadyOwned, mergeBB, copyBB);
+
+                // Non-owning source: heap-copy the bytes (plus the null terminator) and set
+                // the OWNED bit. Mask off _len's high bit before using it as a byte count -
+                // it would otherwise inflate allocSize to ~2GB and AV the memcpy.
+                builder->SetInsertPoint(copyBB);
+                auto* srcLen = builder->CreateAnd(rawLen, builder->getInt32(0x7FFFFFFF), "litlen");
                 auto* allocSize = builder->CreateAdd(
                     builder->CreateZExt(srcLen, builder->getInt64Ty()),
                     builder->getInt64(1), "litbufsz");
@@ -8584,11 +8596,19 @@ public:
                 auto* rawPtr  = CreateOverloadedFunctionCall("operator new", { szArg });
                 auto* heapPtr = builder->CreateBitCast(rawPtr, builder->getInt8Ty()->getPointerTo(), "litbuf");
                 builder->CreateMemCpy(heapPtr, llvm::MaybeAlign(1), srcPtr, llvm::MaybeAlign(1), allocSize);
-                // The callee receives a freshly allocated buffer it owns: set the OWNED bit.
                 auto* ownedLen = builder->CreateOr(srcLen, builder->getInt32(0x80000000), "ownedlen");
-                value = llvm::UndefValue::get(strTy);
-                value = builder->CreateInsertValue(value, heapPtr, { 0u });
-                value = builder->CreateInsertValue(value, ownedLen, { 1u });
+                llvm::Value* copyVal = llvm::UndefValue::get(strTy);
+                copyVal = builder->CreateInsertValue(copyVal, heapPtr, { 0u });
+                copyVal = builder->CreateInsertValue(copyVal, ownedLen, { 1u });
+                auto* copyEndBB = builder->GetInsertBlock();
+                builder->CreateBr(mergeBB);
+
+                // Merge: the original owned value, or the fresh owned copy.
+                builder->SetInsertPoint(mergeBB);
+                auto* phi = builder->CreatePHI(strTy, 2, "movearg.val");
+                phi->addIncoming(value, transferBB);
+                phi->addIncoming(copyVal, copyEndBB);
+                value = phi;
             }
         }
 
