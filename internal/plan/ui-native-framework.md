@@ -25,6 +25,67 @@ Created 2026-07-03; consolidated
 the predecessor ui-framework-v5-sugar-widgets.md was lost with the old
 internal/plan/ and its shipped result is example/ui/ at API v8, see doc/UI.md).
 
+## Post-merge macOS re-port status (2026-07-07) - DONE ON MAC; Windows re-verify owed
+
+Context: merged origin/master `a8ef6c4` (fast-forward, 3 commits: closure-generics +
+delete-of-alias compiler work; the UI core migration `9952c74`; the `ui_test.cb` test
+framework `a8ef6c4`). The migration MOVED `example/ui/cocoa_native_host.cb` ->
+`cflat/core/ui_native_cocoa.cb` but was branched from BEFORE the verified macOS runtime
+fixes, so the merge DROPPED them. fedit is already migrated onto `ui_test.cb` upstream
+(2 UiTestSuite cases; the Win32-only nav suite is gated off mac via
+`if const (__MACOS__){}else{}`, and `GetCurrentThreadId`/`_postWorker` DCE out) - so
+"integrate ui_test into fedit" is already done in the merge; the remaining work is
+re-landing the dropped Cocoa host fixes so the mac gate goes green again.
+
+Post-merge baseline (Release compiler rebuilt on the arm64 box): `./example_mac.sh` =
+30 passed / 1 failed. Only `fedit` fails (rc=139 SIGSEGV) - it is the sole self-test
+that builds a TreeView, hitting the reverted `NSTableColumn initWithIdentifier:`
+missing-arg bug. Crash report confirms it: EXC_BAD_ACCESS in `objc_retain` <-
+`-[NSTableColumn initWithIdentifier:]` <- `_msg0_...` (the selector was sent via msg0
+with no identifier arg). cocoa_probe/cocoa_window/cocoa_settings still PASS (no tree).
+
+Re-port progress (the verified patch is saved at scratchpad/local_review_fixes.patch;
+target is `cflat/core/ui_native_cocoa.cb`, re-anchored by hand since the file diverged):
+
+LANDED, part 1 (the first port agent, before it hit a session limit):
+- NSTableColumn `initWithIdentifier:` msg0 -> msg1 + nsStr("col") (the fedit crash fix).
+- `accHandles`/`accBgs` fields on CocoaHost.
+- setText: NSButton + NSBox title path; NSControl-only guard on stringValue/setStringValue:.
+- setEnabled: NSTextView vs NSOutlineView split inside scroll; NSControl-only guard.
+- `this._storeAccent(h, 0)` call in the control-destroy path.
+
+LANDED, part 2 (main session, same day - completes the port):
+- `_storeAccent`/`_accentFor` method bodies + the `setAccent` store call.
+- `nativeControlText`/`nativeSetControlText`: NSBox (title) + NSControl (stringValue) guards.
+- `nativeTypeText`: NSControl-only guard.
+- `nativeAccentBg` -> `_nHost._accentFor(h)`; `nativeTestCustomDrawFill` delegates to it
+  (stored-accent readback, WinUI P12 precedent); stale comment fixed.
+- `_onTreeWillExpandImp` + `outlineViewItemWillExpand:` registration (the outline's
+  setDelegate: was already wired in createControl).
+- `nativeListSelect`: routes onSelect after a programmatic selection.
+- `hostDrainPosted`: two-pass non-blocking `runMode:beforeDate:` drain.
+- `nativeTeardownForTest`: move-out accHandles/accBgs; accessor-comment honesty fix.
+- doc/UI.md ctx.post paragraph (performSelectorOnMainThread + hostDrainPosted).
+- example_mac.sh: `gallery` selftest_case added (gate is now 32 cases).
+
+NOT re-applied on purpose: the stash's fedit.cb edits (os.thread_current_id, case-13
+gating) - the merged fedit already gates the whole nav suite off mac and DCEs
+GetCurrentThreadId, so touching fedit.cb was unnecessary (confirmed: fedit PASS unmodified).
+
+VERIFIED (arm64 box, Release):
+- `./example_mac.sh` = 32 passed / 0 failed (`fedit PASS`, `gallery PASS`).
+- `out/fedit_mac --selftest` 9/9 (SUITE fedit 1/1, rc=0);
+  `out/gallery_mac --selftest` 27/27 (SUITE gallery 1/1, rc=0).
+- `--check --platform macos` clean: cflat/core/ui_native_cocoa.cb, fedit.cb, gallery.cb.
+- `test.sh Release`: 151 passed / 0 failed / 18 skipped.
+- NOTE: the compiler reads core libs deployed next to the exe (`x64/Release/core/`); the
+  edited `cflat/core/ui_native_cocoa.cb` was hand-copied there. A CMake rebuild redeploys it.
+
+STILL OWED: Windows re-verification (test.bat + example.bat Release). The edits are
+mac-only code paths (ui_native_cocoa.cb) plus doc/UI.md and example_mac.sh (inert on
+Windows), so risk is low, but the core/ file rides every Windows deploy and must be
+gate-checked there before commit.
+
 ## Locked decisions (user, 2026-07-03)
 
 1. Windows tier: **Win32 common controls now, WinUI-3-ready host interface**.

@@ -150,6 +150,8 @@ class CocoaHost : NativeHost
     list<u64>    listBoxPtrs    = default;
     list<u64>    listSelHandles = default;   // parallel handle -> selected row
     list<int>    listSelRows    = default;
+    list<u64>    accHandles = default;       // parallel handle -> stored accent bg
+    list<u32>    accBgs     = default;       // (reported by nativeAccentBg, P10 parity)
     list<u64>    listRowCounts  = default;   // parallel handle -> virtual row count
     list<int>    listRowCountV  = default;
     // TreeView node-source boxes: parallel outline-view handle -> TreeBox* (as u64).
@@ -313,7 +315,7 @@ class CocoaHost : NativeHost
             msgBool(scroll, "setHasVerticalScroller:", true);
             msgInt(scroll, "setBorderType:", 2);          // NSBezelBorder
             void* outline = msgRect(msg0(cls("NSOutlineView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
-            void* col = msg0(msg0(cls("NSTableColumn"), "alloc"), "initWithIdentifier:");
+            void* col = msg1(msg0(cls("NSTableColumn"), "alloc"), "initWithIdentifier:", nsStr((char*)"col"));
             msg1(outline, "addTableColumn:", col);
             msg1(outline, "setOutlineTableColumn:", col);
             msg1(outline, "setDataSource:", this.target);
@@ -358,6 +360,7 @@ class CocoaHost : NativeHost
         this._freeListBox(h);    // no-op unless h is a list with a boxed rowText
         this._freeTreeBox(h);    // no-op unless h is a tree with a boxed node source
         this._freeCanvasBox(h);  // no-op unless h is a canvas with a boxed painter
+        this._storeAccent(h, 0); // drop any stored accent for this handle
         void* ctrl = u2h(h);
         msg0(ctrl, "removeFromSuperview");   // drops the superview's retain
         msg0(ctrl, "release");               // drops our alloc/init retain -> dealloc
@@ -388,13 +391,18 @@ class CocoaHost : NativeHost
             msg1(tv, "setString:", nsStr((char*)s));
             return;
         }
-        if (msgBool1(ctrl, "isKindOfClass:", cls("NSButton")) != (i8)0)
+        if (msgBool1(ctrl, "isKindOfClass:", cls("NSButton")) != (i8)0
+            || msgBool1(ctrl, "isKindOfClass:", cls("NSBox")) != (i8)0)
         {
+            // NSButton and NSBox (GroupBox) both carry their text as `title`.
             char* cur = cStr(msg0(ctrl, "title"));
             if (cur != nullptr && strcmp(cur, (char*)s) == 0) return;
             msg1(ctrl, "setTitle:", nsStr((char*)s));
             return;
         }
+        // Only NSControl subclasses respond to stringValue (NSProgressIndicator,
+        // CfCanvasView and plain NSViews do not - sending it would throw).
+        if (msgBool1(ctrl, "isKindOfClass:", cls("NSControl")) == (i8)0) return;
         char* cur = cStr(msg0(ctrl, "stringValue"));
         if (cur != nullptr && strcmp(cur, (char*)s) == 0) return;
         msg1(ctrl, "setStringValue:", nsStr((char*)s));
@@ -416,15 +424,26 @@ class CocoaHost : NativeHost
             // the differ-guard in setText.
             if (_isScroll(ctrl))
             {
+                // The scroll's documentView is an NSTextView (multiline edit) or an
+                // NSOutlineView (tree). Only NSTextView has isEditable/setEditable:.
                 void* tv = msg0(ctrl, "documentView");
-                if ((msgBool1(tv, "isEditable", nullptr) != (i8)0) != v)
+                if (msgBool1(tv, "isKindOfClass:", cls("NSTextView")) != (i8)0)
                 {
-                    msgBool(tv, "setEditable:", v);
-                    msgBool(tv, "setSelectable:", v);
+                    if ((msgBool1(tv, "isEditable", nullptr) != (i8)0) != v)
+                    {
+                        msgBool(tv, "setEditable:", v);
+                        msgBool(tv, "setSelectable:", v);
+                    }
+                }
+                else if ((msgBool1(tv, "isEnabled", nullptr) != (i8)0) != v)
+                {
+                    msgBool(tv, "setEnabled:", v);
                 }
             }
-            else if ((msgBool1(ctrl, "isEnabled", nullptr) != (i8)0) != v)
+            else if (msgBool1(ctrl, "isKindOfClass:", cls("NSControl")) != (i8)0
+                && (msgBool1(ctrl, "isEnabled", nullptr) != (i8)0) != v)
             {
+                // isEnabled/setEnabled: exist on NSControl only (not NSBox/NSProgressIndicator).
                 msgBool(ctrl, "setEnabled:", v);
             }
         }
@@ -720,6 +739,36 @@ class CocoaHost : NativeHost
         msg1(ctrl, "setBezelColor:", bg);   // nil clears the accent
         void* fg = fgColor != 0 ? this.colorFor(fgColor) : nullptr;
         if (fg != nullptr) msg1(ctrl, "setContentTintColor:", fg);
+        this._storeAccent(h, bgColor);
+    }
+
+    // Stored accent, reported by nativeAccentBg/nativeTestCustomDrawFill (the accent is
+    // real via bezelColor; no offscreen pixel readback on Cocoa - WinUI P12 precedent).
+    void _storeAccent(u64 h, int bgColor)
+    {
+        int i = 0;
+        while (i < this.accHandles.count())
+        {
+            if (this.accHandles.get(i) == h)
+            {
+                if (bgColor == 0) { this.accHandles.removeAt(i); this.accBgs.removeAt(i); }
+                else this.accBgs.set(i, (u32)bgColor);
+                return;
+            }
+            i++;
+        }
+        if (bgColor != 0) { this.accHandles.add(h); this.accBgs.add((u32)bgColor); }
+    }
+
+    u32 _accentFor(u64 h)
+    {
+        int i = 0;
+        while (i < this.accHandles.count())
+        {
+            if (this.accHandles.get(i) == h) { u32 v = this.accBgs.get(i); return v; }
+            i++;
+        }
+        return 0u;
     }
 
     // The setListOp seam (see ui_native.cb for the cross-toolkit protocol design).
@@ -1356,6 +1405,23 @@ void _onTreeClickImp(void* self, void* cmd, void* outline)
     routeTreeSelectItem(outline, item);
 }
 
+// NSOutlineView expansion delegate (fires for user AND programmatic expandItem:).
+// Mirror of the Win32 TVN_ITEMEXPANDING route: fire the TreeView's onExpand.
+void _onTreeWillExpandImp(void* self, void* cmd, void* note)
+{
+    if (!_nReady || _nHost.applying) return;
+    void* outline = msg0(note, "object");
+    void* item = msg1(msg0(note, "userInfo"), "objectForKey:", nsStr((char*)"NSObject"));
+    string key = _nHost.keyForHandle((u64)msg0(outline, "enclosingScrollView"));
+    if (key.length() == 0) return;
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    if (e == nullptr) return;
+    TreeView* tv = e as TreeView;
+    if (tv == nullptr) return;
+    int nid = item != nullptr ? (int)msgGetI64(item, "integerValue") : (0 - 1);
+    if (nid >= 0) { tv.onExpand(nid); pumpNative(); }
+}
+
 // ── ctx.post() marshaling (performSelectorOnMainThread with an NSNumber box) ───
 void _cocoaPostEnqueue(u64 target, u64 boxPtr)
 {
@@ -1374,8 +1440,8 @@ void _runPostBoxImp(void* self, void* cmd, void* num)
 }
 
 // ── Host-neutral accessors (P7; mirror the Win32 host) ───────────────────────
-// macOS stays single-window in P7 - multi-window + ctx.post marshaling parity is P11
-// (see the plan). These keep the shared apps (fedit) compiling and correct on Darwin.
+// macOS stays single-window (documented deviation; real multi-window is P14).
+// ctx.post marshaling IS real here: performSelectorOnMainThread + hostDrainPosted.
 // (Defined after CocoaHost so _nHost's field types are known.)
 UiContext*      activeCtx() { return &_nCtx; }
 alias Component activeApp() { return _nApp; }
@@ -1392,8 +1458,20 @@ void startHeadlessWindow(Component app, const char* title, int w, int h)
     buildNativeTree();
 }
 
-// No queued UI-thread calls on macOS yet (ctx.post runs inline; marshaling is P11).
-void hostDrainPosted() { }
+// Deliver pending performSelectorOnMainThread: posts (ctx.post marshaling). Mirror
+// of the Win32 PeekMessage drain: non-blocking run-loop passes, no fixed wait.
+void hostDrainPosted()
+{
+    void* loop = msg0(cls("NSRunLoop"), "currentRunLoop");
+    void* mode = nsStr((char*)"kCFRunLoopDefaultMode");
+    void* past = msgSetDouble(cls("NSDate"), "dateWithTimeIntervalSinceNow:", -1.0);
+    function<i8(void*, void*, void*, void*)> run =
+        (function<i8(void*, void*, void*, void*)>)__objcMsgSendPtr;
+    // A past beforeDate never waits; a second pass picks up posts chained by the
+    // first (runMode: returns YES on timeout too, so do NOT loop on its result).
+    run(loop, sel("runMode:beforeDate:"), mode, past);
+    run(loop, sel("runMode:beforeDate:"), mode, past);
+}
 
 // macOS multi-window is P11: opening a second top-level window is not wired here yet.
 // `app` is consumed (freed at scope exit) so it does not leak.
@@ -1569,7 +1647,11 @@ string nativeControlText(string keyPath)
         void* tv = msg0(ctrl, "documentView");
         text = msg0(tv, "string");
     }
-    else
+    else if (msgBool1(ctrl, "isKindOfClass:", cls("NSBox")) != (i8)0)
+    {
+        text = msg0(ctrl, "title");   // GroupBox text lives in the NSBox title
+    }
+    else if (msgBool1(ctrl, "isKindOfClass:", cls("NSControl")) != (i8)0)
     {
         text = msg0(ctrl, "stringValue");
     }
@@ -1609,7 +1691,11 @@ void nativeSetControlText(string keyPath, string s)
         void* tv = msg0(ctrl, "documentView");
         msg1(tv, "setString:", ns);
     }
-    else
+    else if (msgBool1(ctrl, "isKindOfClass:", cls("NSBox")) != (i8)0)
+    {
+        msg1(ctrl, "setTitle:", ns);
+    }
+    else if (msgBool1(ctrl, "isKindOfClass:", cls("NSControl")) != (i8)0)
     {
         msg1(ctrl, "setStringValue:", ns);
     }
@@ -1810,6 +1896,13 @@ void nativeListSelect(string keyPath, int row)
     u64 h = _nCtx.nativeHandle(keyPath);
     if (h == 0u) return;
     _nHost.setListOp(h, LISTOP_SET_SELECTION, row, 0, "", 0u);
+    // Programmatic selectRowIndexes: fires no action; route onSelect like a click
+    // would (Win32's LVM_SETITEMSTATE raises a real LVN_ITEMCHANGED notify).
+    Element e = findByKey(_nTree, keySegment(_nTree, 0), keyPath);
+    if (e == nullptr) return;
+    ListView* lv = e as ListView;
+    if (lv == nullptr) return;
+    if (row >= 0 && row != lv.selectedIndex) { lv.onSelect(row); pumpNative(); }
 }
 
 int nativeListSelectedRow(string keyPath)
@@ -1896,6 +1989,7 @@ void nativeTypeText(string keyPath, string s)
 {
     u64 h = _nCtx.nativeHandle(keyPath);
     if (h == 0u) return;
+    if (msgBool1(u2h(h), "isKindOfClass:", cls("NSControl")) == (i8)0) return;
     msg1(u2h(h), "setStringValue:", nsStr(s.data()));
     routeEdit(u2h(h));
 }
@@ -1922,11 +2016,16 @@ bool nativeImageHasBitmap(string keyPath)
     return msg0(u2h(h), "image") != nullptr;
 }
 
-// Accents on mac ride bezelColor/contentTintColor (no NM_CUSTOMDRAW). The gallery's
-// accent asserts are Win32-only in spirit; these keep the shared self-test compiling and
-// return 0 (no stored COLORREF model on mac - the color lives on the NSButton).
-u32 nativeAccentBg(string keyPath) { return 0u; }
-u32 nativeTestCustomDrawFill(string keyPath) { return 0u; }
+// Accents on mac ride bezelColor/contentTintColor (no NM_CUSTOMDRAW). Report the
+// stored accent: "reported == stored" is the same honest driver semantic the WinUI
+// host uses - the accent is real via bezelColor, there is no offscreen pixel readback.
+u32 nativeAccentBg(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return 0u;
+    return _nHost._accentFor(h);
+}
+u32 nativeTestCustomDrawFill(string keyPath) { return nativeAccentBg(keyPath); }
 
 // Close the main window (bypasses the close guard - the caller already decided).
 // -close does not fire windowShouldClose:, matching Win32 DestroyWindow.
@@ -2387,11 +2486,13 @@ void registerHostClasses()
         function<void(void*, void*, void*)> ld = _onListDoubleClickImp;
         function<void(void*, void*, void*)> tsg = _onTabSegmentImp;
         function<void(void*, void*, void*)> trc = _onTreeClickImp;
+        function<void(void*, void*, void*)> twe = _onTreeWillExpandImp;
         function<void(void*, void*, void*)> rpb = _runPostBoxImp;
         addMethod0(tg, "onListClick:", lc);
         addMethod0(tg, "onListDoubleClick:", ld);
         addMethod0(tg, "onTabSegment:", tsg);
         addMethod0(tg, "onTreeClick:", trc);
+        addMethod0(tg, "outlineViewItemWillExpand:", twe);
         addMethod0(tg, "runPostBox:", rpb);
         function<i64(void*, void*, void*)> nr = _numberOfRowsImp;
         function<void*(void*, void*, void*, void*, i64)> tov = _tableObjectValueImp;
@@ -2546,6 +2647,8 @@ void nativeTeardownForTest()
     { list<u64>    b12 = move _nHost.canvasBoxes; }
     { list<u64>    b13 = move _nHost.imgHandles; }
     { list<u64>    b14 = move _nHost.imgLastPixels; }
+    { list<u64>    b15 = move _nHost.accHandles; }
+    { list<u32>    b16 = move _nHost.accBgs; }
     { list<string> a3 = move _menuTop; }
     { list<int>    a4 = move _menuItemTopIdx; }
     { list<string> a5 = move _menuItemLabel; }

@@ -461,8 +461,9 @@ Event closures call `ctx.invalidate()`.
 
 **`ctx.post(work)` (v12) - thread marshaling.** Call from any thread to run `work`
 back on the UI thread. The closure is cloned into a heap box and the host marshals it
-(Win32 `PostMessage(WM_APP_CALL)`; macOS runs it inline for now - real marshaling is
-deferred). With no host bound (TUI/headless), it runs inline. `ctx.assertUiThread()` is
+(Win32 `PostMessage(WM_APP_CALL)`; macOS `performSelectorOnMainThread:` - delivered by
+the running run loop, or `hostDrainPosted()` in headless tests). With no host bound
+(TUI/headless), it runs inline. `ctx.assertUiThread()` is
 a debug guard that warns if called off the UI thread. Lifetime: the closure is
 clone-in / destruct-after-call, so it is leak-clean under `--heap-audit`.
 
