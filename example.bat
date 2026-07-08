@@ -225,6 +225,38 @@ if "%~1"=="--worker-gallery" (
 )
 
 REM ===========================================================================
+REM Worker mode: ui_test.cb template self-test (example/ui/testing/todo_test.cb).
+REM The customer-facing "copy-me" test target - the todo app driven through the
+REM UiTest framework. Same gate as the other UI self-tests: build with --heap-audit,
+REM run headless under redirected stdin, gate on the assertion exit code AND leaks.
+REM ===========================================================================
+if "%~1"=="--worker-uitest" (
+    set "RESID=%~2"
+    set "CFLAT=x64\%CONFIG%\cflat.exe"
+    set "OUTDIR=out\examples"
+    set "RESDIR=out\examples\results"
+    set "UIT_STEXE=!OUTDIR!\todo_test_st.exe"
+    set "UIT_STLOG=!RESDIR!\!RESID!.log"
+
+    "!CFLAT!" "example\ui\testing\todo_test.cb" -i example/ui/testing --heap-audit -o "!UIT_STEXE!" > "!UIT_STLOG!" 2>&1
+    if not exist "!UIT_STEXE!" (
+        echo FAIL todo_test.cb ^(uitest self-test build failed^)>"!RESDIR!\!RESID!.result"
+        exit /b
+    )
+    "!UIT_STEXE!" --selftest <nul >> "!UIT_STLOG!" 2>&1
+    set UITRC=!errorlevel!
+    findstr /C:"heap-audit: LEAK" "!UIT_STLOG!" >nul 2>&1
+    if !errorlevel! equ 0 (
+        echo FAIL todo_test.cb ^(heap-audit leak^)>"!RESDIR!\!RESID!.result"
+    ) else if !UITRC! neq 0 (
+        echo FAIL todo_test.cb ^(uitest self-test, exit !UITRC!^)>"!RESDIR!\!RESID!.result"
+    ) else (
+        echo PASS todo_test.cb ^(uitest template self-test + leak-clean^)>"!RESDIR!\!RESID!.result"
+    )
+    exit /b
+)
+
+REM ===========================================================================
 REM Main: launch all example builds + self-tests in parallel, wait, collect
 REM ===========================================================================
 set CONFIG=%1
@@ -272,7 +304,10 @@ REM winui_demo, winui_gallery) need the Windows App SDK bootstrapper + runtime w
 REM launched via the dedicated --worker-winui below. gallery_app is the host-neutral gallery
 REM Component + self-test (no main; imported by gallery.cb and winui_gallery.cb), so it is
 REM excluded like gallery. cocoa_native_settings is the Darwin backend probe, excluded here.
-set EXCLUDE=test_helper win32host fedit gallery gallery_app http_parser http_response http_json http_server http_client router rest_server http_io cocoa_probe cocoa_native_settings hello_objc cocoa_window sysinfo_mac winui_app_demo winui_demo winui_gallery
+REM todo_app is the host-neutral shared app module (no main; imported by todo_test.cb) and
+REM todo_test is the ui_test.cb template target - both driven by the dedicated --worker-uitest
+REM below (build with --heap-audit + run headless), so they are excluded from the plain sweep.
+set EXCLUDE=test_helper win32host fedit gallery gallery_app todo_app todo_test http_parser http_response http_json http_server http_client router rest_server http_io cocoa_probe cocoa_native_settings hello_objc cocoa_window sysinfo_mac winui_app_demo winui_demo winui_gallery
 
 REM Discover the newest cached Win32-metadata package dir (the one holding Windows.Win32.winmd).
 REM dir /o-n lists newest-version-first by name. Empty if the nuget package is not installed
@@ -353,6 +388,11 @@ REM Launch the widget-gallery state-assert self-test (P8 data controls).
 set /a RESID+=1
 set /a LAUNCHED+=1
 start "" /b cmd /c "%SCRIPT% --worker-gallery ex_!RESID!"
+
+REM Launch the ui_test.cb template self-test (example/ui/testing/todo_test.cb).
+set /a RESID+=1
+set /a LAUNCHED+=1
+start "" /b cmd /c "%SCRIPT% --worker-uitest ex_!RESID!"
 
 REM Launch the WinUI 3 (Windows App SDK) self-tests (P6 M2 window bring-up + M3 host),
 REM only when the pinned WindowsAppSDK NuGet packages are cached. Skipped otherwise.

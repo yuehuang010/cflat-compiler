@@ -719,7 +719,8 @@ model source the `setListOp` seam feeds).
   size, tree built), `activeApp()` / `activeCtx()`, `hostDark()`, `hostWindowCount()`,
   `nativeTeardownForTest()` (leak-gate cleanup).
 - **Buttons / state:** `nativeClickButton(keyPath)` (Button/Checkbox/RadioButton - mirrors
-  the OS auto-toggle then routes), `nativeIsChecked(keyPath)`.
+  the OS auto-toggle then routes), `nativeIsChecked(keyPath)`, `nativeIsEnabled(keyPath)`
+  (Win32 `IsWindowEnabled`; Cocoa `NSControl.isEnabled`; WinUI element-model read).
 - **Combo:** `nativeComboSelected(keyPath)`, `nativeComboSelect(keyPath, idx)`.
 - **Text:** `nativeTypeText(keyPath, s)` (types + routes the change),
   `nativeControlText(keyPath)`, `nativeSetControlText(keyPath, s)`, `nativeStatusText(keyPath)`.
@@ -732,6 +733,11 @@ model source the `setListOp` seam feeds).
   `nativeNodeBounds(keyPath)`.
 - **Chrome / visuals:** `nativeSetContextMenu(keyPath, menuPtr)`,
   `nativeFireContextMenu(keyPath, itemIndex)`, `nativeImageHasBitmap(keyPath)`.
+- **Tooltip / capture:** `nativeTooltipCount()` (Win32: tools registered on the window's shared
+  tooltip control; Cocoa/WinUI return 0 - their tooltips ride a per-view / attached property, not a
+  per-window registry, and no gate on those hosts exercises the count), `nativeSaveWindowBmp(path)`
+  (Win32 offscreen capture via `PrintWindow` + `GetDIBits` -> 24bpp BMP; Cocoa/WinUI no-op returning
+  false). The screenshot driver is surfaced host-neutrally as `ui_test.cb`'s `shot()` / `uiShot()`.
 - **Accent assert:** `nativeAccentBg(keyPath)` + `nativeTestCustomDrawFill(keyPath)`. On Win32
   these verify the NM_CUSTOMDRAW accent fill (a live-render feature PrintWindow cannot capture) by
   driving the custom-draw path into a memory DC and reading back the filled pixel. On Cocoa they
@@ -877,21 +883,144 @@ purely cosmetic gain).
 | `TextArea` | UNCONTROLLED-with-sync | native buffer is the source of truth; `value` is a push, `onChange` a dirty notify (documented large-buffer exception) |
 | `ProgressBar` | presentational | no input; `value` is display-only |
 
+## Testing your app
+
+`import "ui_test.cb"` gives you a headless, CI-ready test framework for any ui_native app. It
+drives real controls through the [host-neutral `native*` drivers](#host-neutral-test-drivers-v16-winui-added-v17)
+on an invisible window and asserts on control + model state - deterministic, no display, no OS
+input synthesis. The copy-me template is **`example/ui/testing/`**: `todo_app.cb` (the app) +
+`todo_test.cb` (its suite). Copy those two files, swap in your Component, and you have a suite.
+
+**Shared-app-module pattern.** Split the app into a host-neutral **app module** (your Component,
+imports only `ui_native.cb` + whatever it needs) and a **test target** that imports a host backend,
+`ui_test.cb`, and the app module:
+
+```cflat
+// myapp.cb  - the app module (no main; host-neutral, like todo_app.cb / gallery_app.cb)
+import "ui_native.cb";
+class MyApp : Component { /* render() with setKey on everything you automate */ };
+
+// myapp_test.cb  - the test target
+import "ui_native_host.cb";   // the default host: Win32 on Windows, Cocoa on macOS
+import "ui_test.cb";
+import "myapp.cb";
+int main(int argc, char** argv)
+{
+    UiTestSuite s = uiTestSuite("myapp");
+    s.test("save enables after edit", (UiTest* t) => {
+        t.launch(new MyApp(), 80, 30);              // fresh invisible window per case
+        t.type("root/name", "hello");
+        t.expectTrue("save enabled", t.isEnabled("root/save"));
+        t.click("root/save");
+        t.expectText("saved", "root/status", "Saved");
+    });
+    return s.run(argc, argv);                        // exit code = the CI gate
+}
+```
+
+The app module is not compilable on its own (it calls host functions like `hostWidth()` that a
+sibling backend supplies through the shared import closure), so exclude it from your build sweeps -
+the test target is what you compile. This is exactly how `gallery_app.cb` / `gallery.cb` are split.
+
+**Key discipline (the one rule that matters).** Every element you automate needs an explicit
+`setKey` (or a sugar `key=`). The test addresses controls by a stable path - `"root/save"`,
+`"root/list"`. An unkeyed node falls back to a positional `"#index"` path that breaks the moment
+you reorder or conditionally omit a sibling. Key everything you touch; nest keys by parent
+(`"root/split/main/editor"`).
+
+**The `UiTest` / `UiTestSuite` API** (a compact map - use LSP for the exact signatures):
+
+| Group | Methods |
+|-------|---------|
+| Launch | `launch(new App(), wDip, hDip)`, `pump()` (re-render + drain posted work) |
+| Actions | `click`, `type`, `setText`, `comboSelect`, `listSelect`, `listActivate`, `tabSelect`, `sliderSet`, `splitterDrag`, `fireContextMenu`, `fireMenu`, `resize`, `focusFirst`/`focusNext` (all key-path addressed) |
+| Readers | `controlText`, `isChecked`, `isEnabled`/`isDisabled`, `comboSelected`, `listRowCount`, `listSelectedRow`, `listCellText`, `progressValue`, `statusText`, `bounds`, `accessibleName`, `focusedKey`, `tabCount`/`tabSelected`, `tooltipCount`, `exists(key)`, `hostIsDark()` |
+| Asserts | `expectTrue`/`expectFalse`, `expectBool`, `expectInt`, `expectStr`, `expectText(name, key, want)`, `requireTrue(name, cond)` |
+| Wait | `waitUntil(pred, timeoutMs)` - see the rule below |
+| Suite | `uiTestSuite(name)`, `s.test(name, body)`, `s.run(argc, argv)` |
+
+Asserts record a pass/fail with the key path + expected/actual in the message; they never abort the
+process. A failed `requireTrue` marks the case aborted so the rest of its asserts are skipped
+(neither passed nor counted) - use it for a precondition the rest of the case depends on. `run`
+prints per-case `PASS`/`FAIL` + a suite summary and returns 0 iff every run case passed. It parses
+three flags (unknown flags - e.g. your app's own - are ignored, so they coexist):
+
+- `--list` - print case names and exit 0.
+- `--filter <substr>` - run only cases whose name contains `<substr>`.
+- `--shot-dir <dir>` - on a failing case, auto-capture a screenshot named after the case.
+
+**The `waitUntil` rule.** Everything a driver does is **synchronous** - `click`/`type`/`select`
+route the handler and re-render before they return, so you assert immediately. The ONE exception is
+work marshaled back to the UI thread with `ctx.post` (typically from a worker thread): that closure
+runs only when posted work is drained. `waitUntil(pred, timeoutMs)` polls `pred()` and pumps posted
+work between polls, returning true once it holds. Use it ONLY for post/thread work; reaching for it
+elsewhere hides a real synchronization bug behind a timeout. The template's "Load sample" case is the
+canonical example (a worker thread posts items back; the test waits for the row count). `waitUntil`
+is the only method that sleeps, so a suite that uses it must have `sleep()` in scope
+(`import "time.cb"`).
+
+**Screenshots.** `t.shot(path)` / `uiShot(path)` writes a 24bpp BMP of the current window (Win32
+only; a documented no-op returning false on Cocoa/WinUI). Pass `--shot-dir <dir>` to `run` to grab
+one automatically on each failing case. There is no golden-image compare - font/DPI variance makes
+byte-compares flaky; probe specific pixels with `customDrawFill`/`accentBg` instead.
+
+**Hardening kits.** For soak coverage - theme storms, reconcile churn, resize storms - call the
+library kits (`themeStorm`, `reconcileStress`, `resizeStorm`) documented in the next section. The
+template's last case calls `themeStorm` to show the shape.
+
+**CI recipe.** Build the test target with `--heap-audit`, run it headless with stdin redirected from
+nul, and gate on BOTH the exit code and a leak grep:
+
+```bash
+cflat myapp_test.cb -i . --heap-audit -o out/myapp_test.exe
+out\myapp_test.exe <nul            # exit 0 = all cases passed
+# fail the build if the run leaked:
+findstr /C:"heap-audit: LEAK" run.log
+```
+
+This is precisely what `example.bat`'s `--worker-uitest` does for the template.
+
+**Per-host guarantee levels.** The framework is host-neutral, but what a run proves differs by host:
+
+- **Win32** - full: real controls, `--heap-audit` leak gate, offscreen screenshots, and cases may
+  relaunch (each `test()` gets a fresh window). Use it as your primary gate.
+- **WinUI 3** - runs, but: NO `--heap-audit` (the WinAppSDK runtime keeps process-lived singletons
+  and its own heaps), single launch per process (a second `launch()` after teardown within one
+  `Application.Start` session is unsupported - keep a WinUI suite to ONE case), and some readers
+  answer from the element model rather than a live control (`isEnabled`, tooltip count).
+- **Cocoa** - compile-checked only (`--check --platform macos`) until an arm64 box exists; the
+  drivers are implemented but not yet runtime-verified.
+
 ## Hardening self-tests
 
-The gallery self-test (`gallerySelfTest`, host-neutral in `gallery_app.cb`) adds two P13 asserts on
-top of the 25 element asserts, so it is 27/27 on Win32 and WinUI 3 (leak-clean under `--heap-audit`
-and asan-clean under `--asan` on Win32):
+The hardening soaks are library kits in `core/ui_test.cb` (the `import "ui_test.cb"` test framework -
+`UiTestSuite` runner + `UiTest` facade over the `native*` drivers). They are host-neutral - any
+ui_native app can call them - and the gallery self-test dogfoods them. The gallery self-test
+(`gallerySelfTest`, host-neutral in `gallery_app.cb`) runs the 25 element asserts plus the two kits
+below in one case, so it is 27/27 on Win32 and WinUI 3 (leak-clean under `--heap-audit` and asan-clean
+under `--asan` on Win32):
 
-- **Theme-flip storm** - toggles light/dark many times and asserts the host titlebar theme stays in
-  lockstep with the model after every reconcile.
-- **Reconcile stress-soak** - a fixed-seed LCG drives create/destroy/reorder across a churn pool
-  (`Button`/`Text`/`Checkbox`/`TextInput`/`ProgressBar`/`Slider`/`GroupBox`/`ComboBox`) for 48 steps;
-  after each step the native control census (one live handle per key) must exactly match the element
-  tree, and a slot present before AND after must keep its handle (identity preserved across reorder).
+- **`themeStorm(flips, themeBtnKey, modelDark)`** (theme-flip storm) - clicks the theme toggle `flips`
+  times and asserts the host titlebar theme (`hostDark()`) stays in lockstep with the app's model
+  (`modelDark()`) after every reconcile.
+- **`reconcileStress(steps, mutate, expectedKeys)`** (reconcile stress-soak) - calls `mutate()`
+  `steps` times; after each step the native control census (one live handle per key) must exactly
+  equal the keys `expectedKeys()` reports (a `list<string>` of key paths), and any key present in two
+  consecutive steps must keep the SAME handle (identity preserved across reorder). The gallery drives
+  it with a fixed-seed LCG over a churn pool
+  (`Button`/`Text`/`Checkbox`/`TextInput`/`ProgressBar`/`Slider`/`GroupBox`/`ComboBox`) for 48 steps.
+- **`resizeStorm(rootKey, sizes, sanity)`** - drives `nativeResizeClient` through a list of `uiSize(w, h)`
+  values and after each asserts layout sanity: `rootKey` keeps positive bounds, the caller's `sanity()`
+  holds, and the layout is responsive (root wider at the widest requested size than at the narrowest).
+- **`shot(path)` / `uiShot(path)`** - offscreen screenshot verb (Win32 `nativeSaveWindowBmp`; Cocoa/WinUI
+  return false). `UiTestSuite.run` auto-captures a per-case shot on failure when `--shot-dir <dir>` is
+  passed; the gallery `--shots <dir>` doc-screenshot path calls the same library verb.
 
-The Win32-only `win32HardeningSelfTest` (in `gallery.cb`, gated out of the Cocoa build) adds the
-focus-traversal, live-resize relayout, and accessible-Name readback checks described above.
+The Win32-only `win32HardeningSelfTest` (in `gallery.cb`, gated out of the Cocoa build) is its own
+`UiTestSuite` covering focus-traversal, the `resizeStorm`-backed live relayout, and accessible-Name
+readback. Because a `UiTest` case body is a non-capturing `function<void(UiTest*)>` while the kits take
+capturing `Lambda<>` closures, a case reads app state through a local downcast (e.g.
+`GalleryApp* g = activeApp() as GalleryApp;`) and passes `Lambda` predicates that capture it to the kits.
 
 To run the TUI self-tests directly:
 

@@ -1,0 +1,162 @@
+// todo_app.cb - a small host-neutral to-do app Component, the shared module the
+// ui_test.cb template drives. This is the "copy-me" app half of the testing template:
+// the test target (todo_test.cb) imports it AND a host backend, then automates it.
+//
+// The split mirrors gallery_app.cb / gallery.cb: this file has NO main() and imports
+// only the element model (ui_native.cb) plus thread.cb/time.cb for the one background
+// interaction. Every host free function it calls (hostWidth/hostHeight, and - inside the
+// worker - the UiContext it was handed) resolves from whichever host the LAUNCHER also
+// imports; a cflat compilation shares one global scope across the root's whole import
+// closure. Because those host drivers are unresolved when this file is analyzed ALONE, it
+// is excluded from the plain example build sweep and the LSP bulk sweep, exactly like
+// gallery_app.cb. The launcher (todo_test.cb) is what the sweeps analyze.
+//
+// Key discipline: every element the test automates gets an explicit setKey (or a sugar
+// `key=`), so the test addresses it by a stable path (e.g. "root/newitem"). Unkeyed nodes
+// fall to positional "#index" paths that break the moment the tree is reordered.
+import "ui_native.cb";
+import "thread.cb";
+import "time.cb";
+
+// A tiny to-do list: a text field + Add button, a virtualized ListView of tasks, a
+// Delete button for the selected task, a "Load sample" button that fills the list from a
+// background thread, and a theme toggle. All state is controlled (the model is the source
+// of truth; render() reflects it), so the test can assert on model + control state alike.
+class TodoApp : Component
+{
+    list<string> todos    = default;   // the task list (ListView row source)
+    string       newItem  = default;   // the text field's controlled value
+    int          selected = 0 - 1;     // selected ListView row (-1 = none)
+    bool         dark      = false;    // theme toggle
+    bool         loading   = false;    // a background load is in flight
+
+    // Background-load plumbing: the worker handle + a guard so we join exactly once, and
+    // the UiContext the worker posts back through (captured when the load is kicked off).
+    bool         loaderStarted = false;
+    Thread       loader   = default;
+    UiContext*   uiCtx    = nullptr;
+
+    // Join a still-running loader so its thread packet is freed (leak-clean under --heap-audit).
+    // In normal flow finishLoad() has already joined and cleared the flag before teardown.
+    ~TodoApp()
+    {
+        if (this.loaderStarted) this.loader.join();
+    }
+
+    // Add the text field's contents as a new task, then clear the field (controlled).
+    void addTodo(UiContext* ctx)
+    {
+        if (this.newItem.length() == 0) return;
+        this.todos.add("" + this.newItem);   // copy the live field into the owning list
+        this.newItem = "";
+        ctx.invalidate();
+    }
+
+    // Remove task `r` (a "complete" gesture); keep the selection in range.
+    void completeAt(int r, UiContext* ctx)
+    {
+        if (r < 0 || r >= this.todos.count()) return;
+        this.todos.removeAt(r);
+        if (this.selected >= this.todos.count()) this.selected = this.todos.count() - 1;
+        ctx.invalidate();
+    }
+
+    // Remove the selected task (the Delete button).
+    void deleteSelected(UiContext* ctx) { this.completeAt(this.selected, ctx); }
+
+    // Kick off a background load: remember the context to post through, then start the worker
+    // and return immediately. The list stays empty until the worker's posted closure runs.
+    void loadSample(UiContext* ctx)
+    {
+        if (this.loading) return;
+        this.loading = true;
+        this.uiCtx = ctx;
+        this.loaderStarted = true;
+        this.loader.start(_todoLoader, this);   // borrow overload: the worker never frees `this`
+        ctx.invalidate();
+    }
+
+    // Runs on the UI thread (via the worker's ctx.post). Join the finished worker, append the
+    // sample tasks, and re-render. Because it runs on the UI thread, touching model state is safe.
+    void finishLoad()
+    {
+        if (this.loaderStarted) { this.loader.join(); this.loaderStarted = false; }
+        this.todos.add("Buy groceries");
+        this.todos.add("Walk the dog");
+        this.todos.add("Ship the release");
+        this.loading = false;
+        this.uiCtx.invalidate();
+    }
+
+    Element render(UiContext* ctx)
+    {
+        ctx.theme = this.dark ? darkTheme() : lightTheme();
+
+        Box* root = box(makeStyle(1, hostWidth(), hostHeight()));
+        root.style.gap = 1;
+        root.setKey("root");
+
+        Text* title = text("CFlat To-Do");
+        title.setKey("title");
+        root.add(title);
+
+        // The new-task text field (controlled: its value flows from the model, edits flow back).
+        TextInput* input = <TextInput key="newitem" value={this.newItem} width={30}
+                placeholder="new task"
+                onChangeText={(string s) => { this.newItem = s; ctx.invalidate(); }}/>;
+        root.add(input);
+
+        // Add is disabled while the field is empty, so the test can assert the enable/disable flip.
+        Button* add = <Button key="add" title="Add" onPress={() => { this.addTodo(ctx); }}/>;
+        add.disabled = this.newItem.length() == 0;
+        root.add(add);
+
+        // The task list: virtualized (row source is a callback, not a copied list), single column.
+        ListView* list = <ListView key="list" rowCount={this.todos.count()} selectedIndex={this.selected}
+                width={40} height={8}
+                onSelect={(int r) => { this.selected = r; ctx.invalidate(); }}
+                onActivate={(int r) => { this.completeAt(r, ctx); }}/>;
+        list.addColumn("Task", 38);
+        list.rowText = (int r, int c) => { return "" + this.todos.get(r); };
+        root.add(list);
+
+        // Delete is disabled unless a row is selected.
+        Button* del = <Button key="delete" title="Delete selected"
+                onPress={() => { this.deleteSelected(ctx); }}/>;
+        del.disabled = this.selected < 0 || this.selected >= this.todos.count();
+        root.add(del);
+
+        // Load sample: fills the list from a background thread (disabled while one is running).
+        Button* load = <Button key="load" title="Load sample"
+                onPress={() => { this.loadSample(ctx); }}/>;
+        load.disabled = this.loading;
+        root.add(load);
+
+        Button* theme = <Button key="theme" title="Toggle theme"
+                onPress={() => { this.dark = !this.dark; ctx.invalidate(); }}/>;
+        root.add(theme);
+
+        // Status line - the single-control oracle the test reads to confirm model state.
+        int n = this.todos.count();
+        string label = default;
+        if (this.loading) label = "Loading...";
+        else if (n == 0) label = "No tasks yet";
+        else label = n.toString() + " task(s)";
+        Text* status = text(label);
+        status.setKey("status");
+        root.add(status);
+        return root;
+    }
+};
+
+// The worker thread run by "Load sample". It does its work OFF the UI thread, then marshals
+// the result back with ctx.post(): the posted closure runs on the UI thread the next time the
+// host drains posted work (which UiTest.waitUntil pumps for you). `arg` is the TodoApp* handed
+// to Thread.start as a borrow - the component outlives the worker, so no ownership transfers.
+int _todoLoader(void* arg)
+{
+    TodoApp* app = (TodoApp*)arg;
+    sleep(20);   // stand in for real background work (a network fetch, a file scan, ...)
+    app.uiCtx.post(() => { app.finishLoad(); });
+    return 0;
+}

@@ -10,6 +10,7 @@
 // global scope across the whole import closure of the root, so a sibling import supplies them.
 // It has no main(): a launcher provides that. Excluded from example.bat's plain build sweep.
 import "ui_native.cb";
+import "ui_test.cb";
 
 const int GALLERY_ROWS = 100000;
 
@@ -375,253 +376,189 @@ bool _statusHas(string keyPath, const char* sub)
     return strstr(s.data(), (char*)sub) != nullptr;
 }
 
+// The gallery self-test, migrated onto the ui_test.cb runner (UiTestSuite/UiTest). Same
+// coverage as the pre-T2 27-assert monolith: the full element set, then the theme-flip storm
+// and the reconcile stress-soak via the library kits (themeStorm/reconcileStress). Called
+// with no argv so both launchers keep invoking it as `gallerySelfTest()`: the Win32/Cocoa
+// launcher (gallery.cb) and the WinUI launcher (winui_gallery.cb, inside setSelfTestBody).
+//
+// One case / one launch (not case-per-concern): the WinUI host does not support a second
+// startHeadlessWindow after nativeTeardownForTest within a single Application.Start session,
+// so a multi-case suite (each case a fresh launch) crashes on WinUI. gallery_app.cb is shared
+// by both hosts, so the storm + soak stay in this launch. run(0, nullptr) runs the case.
 int gallerySelfTest()
 {
     wireGallery();
-    startHeadlessWindow(new GalleryApp(), "gallery-selftest", 60, 60);   // hidden 60x60
+    UiTestSuite s = uiTestSuite("gallery");
 
-    int pass = 0; int total = 0;
-
-    // 1. Every P8 control became a real control.
-    total++;
-    bool created = _exists("root/rg/r0") && _exists("root/rg/r1") && _exists("root/rg/r2")
-        && _exists("root/combo") && _exists("root/list")
-        && _exists("root/status") && _exists("root/status2");
-    if (created) pass++; else printf("  FAIL: controls not all created\n");
-
-    // 2. Initial state: radio r1 checked (pick=1), combo at index 0, list has 100k rows,
-    //    status echoes the model.
-    total++;
-    bool init = nativeIsChecked("root/rg/r1")
-        && !nativeIsChecked("root/rg/r0")
-        && !nativeIsChecked("root/rg/r2")
-        && nativeComboSelected("root/combo") == 0
-        && nativeListRowCount("root/list") == GALLERY_ROWS
-        && _statusIs("root/status", "pick=Medium font=0 sel=-1 act=-1");
-    if (init) pass++; else printf("  FAIL: initial state\n");
-
-    // 3. Click radio "Large".
-    total++;
-    nativeClickButton("root/rg/r2");
-    bool radio = nativeIsChecked("root/rg/r2") && !nativeIsChecked("root/rg/r1")
-        && _statusIs("root/status", "pick=Large font=0 sel=-1 act=-1");
-    if (radio) pass++; else printf("  FAIL: radio selection\n");
-
-    // 4. Change the combo to index 2 (routes CBN_SELCHANGE).
-    total++;
-    nativeComboSelect("root/combo", 2);
-    bool combo = _statusIs("root/status", "pick=Large font=2 sel=-1 act=-1");
-    if (combo) pass++; else printf("  FAIL: combo change not routed\n");
-
-    // 5. Virtualization + rowText wiring: query two cells of row 50000.
-    total++;
-    string cell0 = nativeListCellText("root/list", 50000, 0);
-    string cell1 = nativeListCellText("root/list", 50000, 1);
-    bool cells = cell0 == "row 50000" && cell1 == "2500000000";
-    if (cells) pass++; else printf("  FAIL: cell text (col0='%s' col1='%s')\n", cell0.data(), cell1.data());
-
-    // 6. Virtualization oracle: rowText fired only a handful of times for 100k rows.
-    total++;
-    GalleryApp* g = activeApp() as GalleryApp;
-    int calls = g != nullptr ? g.rowTextCalls : 999999;
-    bool virt = calls > 0 && calls < 100;
-    if (virt) pass++; else printf("  FAIL: rowText invoked %d times (expected small)\n", calls);
-
-    // 7. Selection round-trip: select row 5 as the OS would.
-    total++;
-    nativeListSelect("root/list", 5);
-    bool sel = nativeListSelectedRow("root/list") == 5
-        && g != nullptr && g.listSel == 5
-        && _statusIs("root/status", "pick=Large font=2 sel=5 act=-1");
-    if (sel) pass++; else printf("  FAIL: list selection round-trip (row=%d)\n", nativeListSelectedRow("root/list"));
-
-    // 8. Activation: Enter on the list (row 5 still selected).
-    total++;
-    nativeListActivate("root/list", 5);
-    bool act = g != nullptr && g.listActivated == 5
-        && _statusIs("root/status", "pick=Large font=2 sel=5 act=5");
-    if (act) pass++; else printf("  FAIL: list activation (act=%d)\n", g != nullptr ? g.listActivated : -2);
-
-    // 9. TabControl (P9): two tabs, initial selection 0, the active pane's Text is live.
-    total++;
-    bool tabsInit = _exists("root/tabs") && nativeTabCount("root/tabs") == 2
-        && nativeTabSelected("root/tabs") == 0
-        && _exists("root/tabs/p0/t0") && !_exists("root/tabs/p1/t1");
-    if (tabsInit) pass++; else printf("  FAIL: tabs init (count=%d sel=%d)\n", nativeTabCount("root/tabs"), nativeTabSelected("root/tabs"));
-
-    // 10. Tab switch: select tab 1; the model follows, pane p1 becomes live, p0 destroyed.
-    total++;
-    nativeTabSelect("root/tabs", 1);
-    bool tabSwitch = g != nullptr && g.tab == 1 && nativeTabSelected("root/tabs") == 1
-        && _exists("root/tabs/p1/t1") && !_exists("root/tabs/p0/t0") && _statusHas("root/status2", "tab=1");
-    if (tabSwitch) pass++; else printf("  FAIL: tab switch (tab=%d)\n", g != nullptr ? g.tab : -1);
-
-    // 11. TreeView (P9): the two top-level nodes are inserted; expanding "src" lazily
-    //     materializes its two children (count 2 -> 4) and fires onExpand.
-    total++;
-    int cntBefore = nativeTreeItemCount("root/tree");
-    u64 srcItem = nativeTreeRootItem("root/tree");
-    int beforeExpands = g != nullptr ? g.treeExpands : 0;
-    nativeTreeExpandItem("root/tree", srcItem);
-    int cntAfter = nativeTreeItemCount("root/tree");
-    bool treeExpand = _exists("root/tree") && cntBefore == 2 && cntAfter == 4
-        && g != nullptr && g.treeExpands > beforeExpands;
-    if (treeExpand) pass++; else printf("  FAIL: tree expand (before=%d after=%d)\n", cntBefore, cntAfter);
-
-    // 12. Tree select: select the first child of "src" (main.cb, node 10) -> onSelect.
-    total++;
-    u64 child0 = nativeTreeChildItem("root/tree", srcItem);
-    int childNid = nativeTreeItemNodeId("root/tree", child0);
-    nativeTreeSelectItem("root/tree", child0);
-    bool treeSel = g != nullptr && g.treeSel == 10 && childNid == 10 && _statusHas("root/status2", "tsel=10");
-    if (treeSel) pass++; else printf("  FAIL: tree select (treeSel=%d nid=%d)\n", g != nullptr ? g.treeSel : -9, childNid);
-
-    // 13. SplitView (P9): dragging the divider changes the ratio + the left pane's width.
-    total++;
-    Rect sbBefore = nativeNodeBounds("root/split/lp");
-    Rect splitB = nativeNodeBounds("root/split");
-    nativeSplitterDrag("root/split", splitB.x + 30, splitB.y);   // ratio ~= 75
-    Rect sbAfter = nativeNodeBounds("root/split/lp");
-    bool splitDrag = g != nullptr && g.splitRatio != 30 && sbAfter.w != sbBefore.w
-        && _statusHas("root/status2", "ratio=");
-    if (splitDrag) pass++; else printf("  FAIL: split drag (ratio=%d w %d->%d)\n", g != nullptr ? g.splitRatio : -1, sbBefore.w, sbAfter.w);
-
-    // 14. ContextMenu (P9): firing item 0 routes CMD_CTX_A through the app menu handler.
-    total++;
-    nativeFireContextMenu("root/ctxbox", 0);
-    bool ctxOk = g != nullptr && g.ctxFired == CMD_CTX_A && _statusHas("root/status2", "ctx=201");
-    if (ctxOk) pass++; else printf("  FAIL: context menu route (ctxFired=%d)\n", g != nullptr ? g.ctxFired : -1);
-
-    // ── P10: form widgets + visuals (all host-neutral drivers) ────────────────
-    // 15. All the P10 controls were created.
-    total++;
-    bool p10Created = _exists("root/btn") && _exists("root/input") && _exists("root/check")
-        && _exists("root/prog") && _exists("root/slider") && _exists("root/grp") && _exists("root/img")
-        && _exists("root/canvas") && _exists("root/area") && _exists("root/sbar");
-    if (p10Created) pass++; else printf("  FAIL: P10 controls not all created\n");
-
-    // 16. Button click routes onPress.
-    total++;
-    nativeClickButton("root/btn");
-    bool btnOk = g != nullptr && g.btnClicks == 1;
-    if (btnOk) pass++; else printf("  FAIL: button click (clicks=%d)\n", g != nullptr ? g.btnClicks : -1);
-
-    // 17. TextInput: type text (routes EN_CHANGE) -> controlled onChangeText updates the model.
-    total++;
-    nativeTypeText("root/input", "hello");
-    bool inputOk = g != nullptr && g.inputText == "hello" && _statusIs("root/input", "hello");
-    if (inputOk) pass++; else printf("  FAIL: text input route\n");
-
-    // 18. Checkbox: click -> controlled onChange flips the model.
-    total++;
-    nativeClickButton("root/check");
-    bool checkOk = g != nullptr && g.checked;
-    if (checkOk) pass++; else printf("  FAIL: checkbox toggle\n");
-
-    // 19. ProgressBar reflects the model value.
-    total++;
-    bool progOk = nativeProgressValue("root/prog") == 60;
-    if (progOk) pass++; else printf("  FAIL: progress value (%d)\n", nativeProgressValue("root/prog"));
-
-    // 20. Slider: drag to a new position -> controlled onChange.
-    total++;
-    nativeSliderSet("root/slider", 80);
-    bool sliderOk = g != nullptr && g.sliderVal == 80;
-    if (sliderOk) pass++; else printf("  FAIL: slider (val=%d)\n", g != nullptr ? g.sliderVal : -1);
-
-    // 21. GroupBox carries its title.
-    total++;
-    bool grpOk = _statusIs("root/grp", "Options");
-    if (grpOk) pass++; else printf("  FAIL: groupbox title\n");
-
-    // 22. Image: the setImageData seam uploaded a bitmap.
-    total++;
-    bool imgOk = nativeImageHasBitmap("root/img");
-    if (imgOk) pass++; else printf("  FAIL: image has no bitmap\n");
-
-    // 23. StatusBar strip carries the main pane text.
-    total++;
-    string sbarTxt = nativeStatusText("root/sbar");
-    bool sbarOk = strstr(sbarTxt.data(), "Ready") != nullptr;
-    if (sbarOk) pass++; else printf("  FAIL: statusbar text [%s]\n", sbarTxt.data());
-
-    // 24. Theme toggle: clicking flips dark mode and re-themes the window.
-    total++;
-    nativeClickButton("root/themebtn");
-    bool themeOk = g != nullptr && g.dark && hostDark();
-    if (themeOk) pass++; else printf("  FAIL: theme toggle (dark=%d win=%d)\n", g != nullptr ? (g.dark ? 1 : 0) : -1, hostDark() ? 1 : 0);
-
-    // 25. Accent buttons (P10): in dark mode the push button carries a stored accent AND the
-    //     NM_CUSTOMDRAW path renders it - driving the custom draw fills the button rect with
-    //     exactly the stored accent color (PrintWindow cannot capture this; live-only render).
-    total++;
-    u32 abg = nativeAccentBg("root/btn");
-    bool stored = abg != 0u;
-    u32 drawn = nativeTestCustomDrawFill("root/btn");
-    bool accentOk = stored && drawn == abg;
-    if (accentOk) pass++; else printf("  FAIL: accent (stored=%d bg=%u drawn=%u)\n", stored ? 1 : 0, abg, drawn);
-
-    // ── P13: hardening asserts (theme-flip storm + reconcile stress-soak) ─────
-    // 26. Theme-flip storm: toggling light/dark many times must keep the host titlebar theme
-    //     in lockstep with the model after every reconcile (and stay leak/asan-clean, which
-    //     the external --heap-audit/--asan gate verifies).
-    total++;
-    bool stormOk = true;
-    int flip = 0;
-    while (flip < 26)
+    // The full element set: P8 forms, P9 nav (tabs/tree/split/context), P10 visuals, then the
+    // P13 hardening kits. One launch drives it all through the host-neutral drivers; control +
+    // model state is the oracle (no pixels).
+    s.test("full element set + hardening", (UiTest* t) =>
     {
+        t.launch(new GalleryApp(), 60, 60);
+        GalleryApp* g = activeApp() as GalleryApp;
+
+        // 1. Every P8 control became a real control.
+        t.expectTrue("controls created",
+            _exists("root/rg/r0") && _exists("root/rg/r1") && _exists("root/rg/r2")
+            && _exists("root/combo") && _exists("root/list")
+            && _exists("root/status") && _exists("root/status2"));
+
+        // 2. Initial state: r1 checked (pick=1), combo at 0, 100k rows, status echoes model.
+        t.expectTrue("initial state",
+            nativeIsChecked("root/rg/r1") && !nativeIsChecked("root/rg/r0") && !nativeIsChecked("root/rg/r2")
+            && nativeComboSelected("root/combo") == 0
+            && nativeListRowCount("root/list") == GALLERY_ROWS
+            && _statusIs("root/status", "pick=Medium font=0 sel=-1 act=-1"));
+
+        // 3. Click radio "Large".
+        nativeClickButton("root/rg/r2");
+        t.expectTrue("radio selection",
+            nativeIsChecked("root/rg/r2") && !nativeIsChecked("root/rg/r1")
+            && _statusIs("root/status", "pick=Large font=0 sel=-1 act=-1"));
+
+        // 4. Change the combo to index 2 (routes CBN_SELCHANGE).
+        nativeComboSelect("root/combo", 2);
+        t.expectTrue("combo change routed", _statusIs("root/status", "pick=Large font=2 sel=-1 act=-1"));
+
+        // 5. Virtualization + rowText wiring: query two cells of row 50000.
+        string cell0 = nativeListCellText("root/list", 50000, 0);
+        string cell1 = nativeListCellText("root/list", 50000, 1);
+        t.expectTrue("cell text", cell0 == "row 50000" && cell1 == "2500000000");
+
+        // 6. Virtualization oracle: rowText fired only a handful of times for 100k rows.
+        int calls = g != nullptr ? g.rowTextCalls : 999999;
+        t.expectTrue("rowText small", calls > 0 && calls < 100);
+
+        // 7. Selection round-trip: select row 5 as the OS would.
+        nativeListSelect("root/list", 5);
+        t.expectTrue("list selection round-trip",
+            nativeListSelectedRow("root/list") == 5 && g != nullptr && g.listSel == 5
+            && _statusIs("root/status", "pick=Large font=2 sel=5 act=-1"));
+
+        // 8. Activation: Enter on the list (row 5 still selected).
+        nativeListActivate("root/list", 5);
+        t.expectTrue("list activation",
+            g != nullptr && g.listActivated == 5
+            && _statusIs("root/status", "pick=Large font=2 sel=5 act=5"));
+
+        // 9. TabControl (P9): two tabs, initial selection 0, the active pane's Text is live.
+        t.expectTrue("tabs init",
+            _exists("root/tabs") && nativeTabCount("root/tabs") == 2
+            && nativeTabSelected("root/tabs") == 0
+            && _exists("root/tabs/p0/t0") && !_exists("root/tabs/p1/t1"));
+
+        // 10. Tab switch: select tab 1; model follows, pane p1 becomes live, p0 destroyed.
+        nativeTabSelect("root/tabs", 1);
+        t.expectTrue("tab switch",
+            g != nullptr && g.tab == 1 && nativeTabSelected("root/tabs") == 1
+            && _exists("root/tabs/p1/t1") && !_exists("root/tabs/p0/t0") && _statusHas("root/status2", "tab=1"));
+
+        // 11. TreeView (P9): two top-level nodes; expanding "src" lazily makes 2 children (2->4).
+        int cntBefore = nativeTreeItemCount("root/tree");
+        u64 srcItem = nativeTreeRootItem("root/tree");
+        int beforeExpands = g != nullptr ? g.treeExpands : 0;
+        nativeTreeExpandItem("root/tree", srcItem);
+        int cntAfter = nativeTreeItemCount("root/tree");
+        t.expectTrue("tree expand",
+            _exists("root/tree") && cntBefore == 2 && cntAfter == 4
+            && g != nullptr && g.treeExpands > beforeExpands);
+
+        // 12. Tree select: select the first child of "src" (main.cb, node 10) -> onSelect.
+        u64 child0 = nativeTreeChildItem("root/tree", srcItem);
+        int childNid = nativeTreeItemNodeId("root/tree", child0);
+        nativeTreeSelectItem("root/tree", child0);
+        t.expectTrue("tree select",
+            g != nullptr && g.treeSel == 10 && childNid == 10 && _statusHas("root/status2", "tsel=10"));
+
+        // 13. SplitView (P9): dragging the divider changes the ratio + the left pane's width.
+        Rect sbBefore = nativeNodeBounds("root/split/lp");
+        Rect splitB = nativeNodeBounds("root/split");
+        nativeSplitterDrag("root/split", splitB.x + 30, splitB.y);   // ratio ~= 75
+        Rect sbAfter = nativeNodeBounds("root/split/lp");
+        t.expectTrue("split drag",
+            g != nullptr && g.splitRatio != 30 && sbAfter.w != sbBefore.w && _statusHas("root/status2", "ratio="));
+
+        // 14. ContextMenu (P9): firing item 0 routes CMD_CTX_A through the app menu handler.
+        nativeFireContextMenu("root/ctxbox", 0);
+        t.expectTrue("context menu route",
+            g != nullptr && g.ctxFired == CMD_CTX_A && _statusHas("root/status2", "ctx=201"));
+
+        // 15. All the P10 controls were created.
+        t.expectTrue("P10 controls created",
+            _exists("root/btn") && _exists("root/input") && _exists("root/check")
+            && _exists("root/prog") && _exists("root/slider") && _exists("root/grp") && _exists("root/img")
+            && _exists("root/canvas") && _exists("root/area") && _exists("root/sbar"));
+
+        // 16. Button click routes onPress.
+        nativeClickButton("root/btn");
+        t.expectTrue("button click", g != nullptr && g.btnClicks == 1);
+
+        // 17. TextInput: type text (routes EN_CHANGE) -> controlled onChangeText updates model.
+        nativeTypeText("root/input", "hello");
+        t.expectTrue("text input route", g != nullptr && g.inputText == "hello" && _statusIs("root/input", "hello"));
+
+        // 18. Checkbox: click -> controlled onChange flips the model.
+        nativeClickButton("root/check");
+        t.expectTrue("checkbox toggle", g != nullptr && g.checked);
+
+        // 19. ProgressBar reflects the model value.
+        t.expectTrue("progress value", nativeProgressValue("root/prog") == 60);
+
+        // 20. Slider: drag to a new position -> controlled onChange.
+        nativeSliderSet("root/slider", 80);
+        t.expectTrue("slider", g != nullptr && g.sliderVal == 80);
+
+        // 21. GroupBox carries its title.
+        t.expectTrue("groupbox title", _statusIs("root/grp", "Options"));
+
+        // 22. Image: the setImageData seam uploaded a bitmap.
+        t.expectTrue("image has bitmap", nativeImageHasBitmap("root/img"));
+
+        // 23. StatusBar strip carries the main pane text.
+        string sbarTxt = nativeStatusText("root/sbar");
+        t.expectTrue("statusbar text", strstr(sbarTxt.data(), "Ready") != nullptr);
+
+        // 24. Theme toggle: clicking flips dark mode and re-themes the window.
         nativeClickButton("root/themebtn");
-        bool modelDark = g != nullptr && g.dark;
-        if (hostDark() != modelDark) stormOk = false;
-        flip++;
-    }
-    if (stormOk) pass++; else printf("  FAIL: theme-flip storm desynced host vs model\n");
+        t.expectTrue("theme toggle", g != nullptr && g.dark && hostDark());
 
-    // 27. Reconcile stress-soak: a seeded LCG drives create/destroy/reorder across the churn
-    //     pool for N steps. After each step the native control census (one live handle per
-    //     key) must exactly match this.stressMask, and any slot present both before AND after
-    //     must keep its handle (reconcile preserved identity across the reorder).
-    total++;
-    bool soakOk = true;
-    if (g != nullptr)
-    {
+        // 25. Accent buttons (P10): dark-mode push button carries a stored accent AND the
+        //     NM_CUSTOMDRAW path renders it - driving the custom draw fills the button rect
+        //     with exactly the stored accent (PrintWindow cannot capture this; live-only).
+        u32 abg = nativeAccentBg("root/btn");
+        bool stored = abg != 0u;
+        u32 drawn = nativeTestCustomDrawFill("root/btn");
+        t.expectTrue("accent", stored && drawn == abg);
+
+        // 26. Theme-flip storm (via themeStorm kit): flip light/dark K times; the host titlebar
+        //     theme must stay in lockstep with the model after every reconcile.
+        t.expectTrue("theme-flip storm keeps host in lockstep",
+            themeStorm(26, "root/themebtn", () => g != nullptr && g.dark));
+
+        // 27. Reconcile stress-soak (via reconcileStress kit): a seeded LCG drives create/
+        //     destroy/reorder across the churn pool for 48 steps; after each step the native
+        //     census must match the mask-decoded key set and any persisting key keeps its
+        //     handle. mutate = click the stress-step button; expectedKeys = decode stressMask.
         g.stressSeed = 305419896;   // fixed seed (0x12345678); fully deterministic
-        list<u64> prevH = default;
-        int p = 0;
-        while (p < 8) { prevH.add(0u); p++; }
-        int prevMask = 0;
-        int iter = 0;
-        while (iter < 48)
-        {
-            nativeClickButton("root/stressbtn");
-            int mask = g.stressMask;
-            int slot = 0;
-            while (slot < 8)
-            {
-                string kp = "root/stressbox/s" + slot.toString();
-                bool want = ((mask >> slot) & 1) != 0;
-                u64 h = activeCtx().nativeHandle(kp);
-                bool have = h != 0u;
-                if (have != want) soakOk = false;
-                if (want && ((prevMask >> slot) & 1) != 0 && prevH.get(slot) != 0u && h != prevH.get(slot))
-                    soakOk = false;
-                prevH.set(slot, h);
-                slot++;
-            }
-            prevMask = mask;
-            iter++;
-        }
-    }
-    else soakOk = false;
-    if (soakOk) pass++; else printf("  FAIL: reconcile stress-soak census/identity mismatch\n");
+        t.expectTrue("reconcile census + identity held across 48 steps",
+            reconcileStress(48,
+                () => { nativeClickButton("root/stressbtn"); },
+                () =>
+                {
+                    // Collect the keys the churn mask says should be live this step.
+                    list<string> keys = default;
+                    int slot = 0;
+                    while (slot < 8)
+                    {
+                        if (((g.stressMask >> slot) & 1) != 0)
+                            keys.add("root/stressbox/s" + slot.toString());
+                        slot++;
+                    }
+                    return keys;
+                }));
+    });
 
-    nativeTeardownForTest();
-
-    if (pass == total)
-    {
-        printf("PASS: gallery self-test %d/%d (full element set: forms, data, nav, visuals)\n", pass, total);
-        return 0;
-    }
-    printf("FAIL: gallery self-test %d/%d\n", pass, total);
-    return 1;
+    return s.run(0, nullptr);
 }

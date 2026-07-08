@@ -14,6 +14,7 @@
 //   x64/Release/cflat.exe example/ui/win32_native_settings.cb --heap-audit -o out/nsettings.exe
 //   out\nsettings.exe --selftest
 import "ui_native_win32.cb";
+import "ui_test.cb";
 
 class NativeSettings : Component
 {
@@ -77,121 +78,72 @@ class NativeSettings : Component
     }
 };
 
-// ── Headless state-assert self-test ──────────────────────────────────────────
-// Creates an INVISIBLE window, builds the panel on real controls, then drives them
-// with SendMessage (BM_CLICK / SetWindowText / WM_HSCROLL) exactly as the OS would
-// on user input, and reads control state back (BM_GETCHECK / GetWindowText /
-// IsWindowEnabled / PBM_GETPOS). No pixels: the OS paints, so state is the oracle.
+// ── Headless state-assert self-test (on the ui_test.cb runner) ────────────────
+// Each case launches its OWN invisible window (fresh per case), drives the real
+// controls through the HOST-NEUTRAL native* drivers exactly as the OS would on user
+// input, and reads control + model state back through the UiTest facade. No pixels
+// and no raw SendMessage: the OS paints, so control state is the oracle. This retires
+// the legacy toolkit-typed SendMessage/BM_CLICK/TBM_SETPOS pattern.
 
-bool _txtEq(void* h, const char* want)
+int nativeSelfTest(int argc, char** argv)
 {
-    char[256] buf;
-    GetWindowTextA(h, buf, 256);
-    return strcmp(buf, (char*)want) == 0;
-}
+    UiTestSuite s = uiTestSuite("native-settings");
 
-int nativeSelfTest()
-{
-    // P7: a Window owns the app + tree + context (no host globals). createAppWindow
-    // registers it, installs the ctx.post hooks, and leaves it active; we reach it via
-    // curWin()/activeCtx() (never a Window* local, which would auto-free at scope exit).
-    int wi = createAppWindow(new NativeSettings(), "selftest", false);   // hidden
-    curWin().w = 44; curWin().h = 26;
-    buildWindowTree(wi);
-
-    void* win  = curWin().hwnd;
-    void* hTtl  = u2h(activeCtx().nativeHandle("root/title"));
-    void* hName = u2h(activeCtx().nativeHandle("root/name"));
-    void* hDark = u2h(activeCtx().nativeHandle("root/dark"));
-    void* hAuto = u2h(activeCtx().nativeHandle("root/auto"));
-    void* hVol  = u2h(activeCtx().nativeHandle("root/vol"));
-    void* hPb   = u2h(activeCtx().nativeHandle("root/pb"));
-    void* hSave = u2h(activeCtx().nativeHandle("root/save"));
-    void* hStat = u2h(activeCtx().nativeHandle("root/status"));
-
-    int pass = 0; int total = 0;
-
-    // 1. Every widget became a real control.
-    total++;
-    bool created = hTtl != nullptr && hName != nullptr && hDark != nullptr
-        && hAuto != nullptr && hVol != nullptr && hPb != nullptr
-        && hSave != nullptr && hStat != nullptr;
-    if (created) pass++; else printf("  FAIL: controls not all created\n");
-
-    // 2. Initial state: checkboxes clear, Save disabled, labels correct. The
-    //    status STATIC echoes the model (clicks + name), so it is the oracle for
-    //    later button/edit routing.
-    total++;
-    bool init = (int)SendMessageA(hDark, (u32)BM_GETCHECK, 0u, (i64)0) == 0
-        && (int)SendMessageA(hAuto, (u32)BM_GETCHECK, 0u, (i64)0) == 0
-        && IsWindowEnabled(hSave) == 0
-        && _txtEq(hTtl, "Settings (native controls)")
-        && _txtEq(hStat, "Clicks: 0 / -");
-    if (init) pass++; else printf("  FAIL: initial control state\n");
-
-    // 3. Click "Dark mode": the OS toggles the checkbox and notifies the parent;
-    //    the handler flips the model and the control reads back checked.
-    total++;
-    SendMessageA(hDark, (u32)BM_CLICK, 0u, (i64)0);
-    bool darkOn = (int)SendMessageA(hDark, (u32)BM_GETCHECK, 0u, (i64)0) == 1
-        && curWin().dark;   // P2: the host applied the dark theme (titlebar + colors)
-    if (darkOn) pass++; else printf("  FAIL: dark toggle (host.dark=%d)\n", (int)curWin().dark);
-
-    // 4. Click "Auto-save": enabling it must ENABLE the Save button on the next
-    //    render (disabled = !autoSave), proving a re-render re-synced a prop.
-    total++;
-    SendMessageA(hAuto, (u32)BM_CLICK, 0u, (i64)0);
-    bool saveEnabled = IsWindowEnabled(hSave) != 0;
-    if (saveEnabled) pass++; else printf("  FAIL: auto-save did not enable Save\n");
-
-    // 5. Click "Save": the handler bumps the counter, and the status STATIC updates
-    //    to "Clicks: 1 / -" - button routing end to end.
-    total++;
-    SendMessageA(hSave, (u32)BM_CLICK, 0u, (i64)0);
-    bool saved = _txtEq(hStat, "Clicks: 1 / -");
-    if (saved) pass++; else printf("  FAIL: save click did not update status\n");
-
-    // 6. Type into the EDIT (programmatic SetWindowText fires EN_CHANGE): the
-    //    controlled model picks up the text, shown in the status STATIC.
-    total++;
-    SetWindowTextA(hName, "Ada");
-    bool named = _txtEq(hStat, "Clicks: 1 / Ada");
-    if (named) pass++; else printf("  FAIL: edit change not routed to model\n");
-
-    // 7. Drag the trackbar (set pos + WM_HSCROLL): routeSlider reads TBM_GETPOS and
-    //    the mirrored progress bar follows the model.
-    total++;
-    SendMessageA(hVol, (u32)TBM_SETPOS, 1u, (i64)70);
-    SendMessageA(win, (u32)WM_HSCROLL, 0u, (i64)hVol);
-    int pbPos = (int)SendMessageA(hPb, (u32)PBM_GETPOS, 0u, (i64)0);
-    bool slid = pbPos == 70;
-    if (slid) pass++; else printf("  FAIL: slider drag (pbPos=%d)\n", pbPos);
-
-    // 8. Tooltip (P7): the Save button declared a `tooltip`, so the window's tooltip
-    //    control exists and holds at least one registered tool.
-    total++;
-    int tools = 0;
-    if (curWin().tooltip != nullptr)
-        tools = (int)SendMessageA(curWin().tooltip, (u32)TTM_GETTOOLCOUNT, 0u, (i64)0);
-    if (tools > 0) pass++; else printf("  FAIL: tooltip not registered (tools=%d)\n", tools);
-
-    // Teardown: destroy the window (cascades to child controls) and free all Window +
-    // context state so --heap-audit sees no residue.
-    nativeTeardownForTest();
-
-    if (pass == total)
+    // Every widget becomes a real control, and the initial state is correct: the
+    // status STATIC echoes the model (clicks + name), the oracle for later routing.
+    s.test("controls created + initial state", (UiTest* t) =>
     {
-        printf("PASS: native host self-test %d/%d (create, checkbox, enable, click, edit, slider, tooltip)\n", pass, total);
-        return 0;
-    }
-    printf("FAIL: native host self-test %d/%d\n", pass, total);
-    return 1;
+        t.launch(new NativeSettings(), 44, 26);
+        bool created = t.exists("root/title") && t.exists("root/name") && t.exists("root/dark")
+            && t.exists("root/auto") && t.exists("root/vol") && t.exists("root/pb")
+            && t.exists("root/save") && t.exists("root/status");
+        t.requireTrue("all controls created", created);
+        t.expectFalse("dark unchecked", t.isChecked("root/dark"));
+        t.expectFalse("auto unchecked", t.isChecked("root/auto"));
+        t.expectTrue("save disabled", t.isDisabled("root/save"));
+        t.expectText("title text", "root/title", "Settings (native controls)");
+        t.expectText("status initial", "root/status", "Clicks: 0 / -");
+    });
+
+    // The interaction flow: toggle dark (host re-themes), enable auto-save (re-render
+    // re-syncs the Save enabled prop), click Save, type a name, and move the slider -
+    // each routed end to end and read back through a control.
+    s.test("interaction flow routes to model", (UiTest* t) =>
+    {
+        t.launch(new NativeSettings(), 44, 26);
+
+        t.click("root/dark");
+        t.expectTrue("dark toggled", t.isChecked("root/dark"));
+        t.expectTrue("host applied dark theme", t.hostIsDark());
+
+        t.click("root/auto");
+        t.expectTrue("auto-save enables Save", t.isEnabled("root/save"));
+
+        t.click("root/save");
+        t.expectText("save updates status", "root/status", "Clicks: 1 / -");
+
+        t.type("root/name", "Ada");
+        t.expectText("edit routes to model", "root/status", "Clicks: 1 / Ada");
+
+        t.sliderSet("root/vol", 70);
+        t.expectInt("progress mirrors slider", 70, t.progressValue("root/pb"));
+    });
+
+    // The Save button declared a `tooltip`, so the window's tooltip control exists
+    // and holds at least one registered tool (P7).
+    s.test("tooltip registered", (UiTest* t) =>
+    {
+        t.launch(new NativeSettings(), 44, 26);
+        t.expectTrue("tooltip registered", t.tooltipCount() > 0);
+    });
+
+    return s.run(argc, argv);
 }
 
 extern int main(int argc, char** argv)
 {
     if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
-        return nativeSelfTest();
+        return nativeSelfTest(argc, argv);
 
     return runAppGuiNative(new NativeSettings(), "CFlat UI - Settings (native)");
 }

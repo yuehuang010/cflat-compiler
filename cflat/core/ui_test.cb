@@ -1,0 +1,458 @@
+// ui_test.cb - a host-neutral test framework for ui_native apps.
+//
+// Layer 1 (UiTest): a fluent facade over the host-neutral native* drivers -
+//   click/type/select/read + rich key-path failure messages + waitUntil.
+// Layer 2 (UiTestSuite): case registration, per-case launch/teardown, --filter
+//   and --list flags, a PASS/FAIL summary, and a process exit code for CI gates.
+//
+// This module is HOST-NEUTRAL by construction: it imports only ui_native.cb (the
+// element model + UiContext) and calls the native* driver names by forward
+// declaration. Those drivers are DEFINED in whichever backend the consumer's
+// LAUNCHER imports (ui_native_win32.cb / ui_native_cocoa.cb / ui_native_winui.cb) -
+// a cflat compilation shares one global scope across the root's whole import
+// closure, so the sibling backend supplies the bodies. The forward declarations
+// let ui_test.cb --check on its own (a prototype with no body is legal); with a
+// backend in the closure the prototypes resolve to the real definitions.
+//
+// Usage (the consumer imports a backend AND this module):
+//   import "ui_native_win32.cb";
+//   import "ui_test.cb";
+//   int main(int argc, char** argv)
+//   {
+//       UiTestSuite s = uiTestSuite("myapp");
+//       s.test("save enables after edit", (UiTest* t) => {
+//           t.launch(new MyApp(), 80, 30);
+//           t.type("root/name", "hello");
+//           t.expectTrue("save enabled", !t.isDisabled("root/save"));
+//       });
+//       return s.run(argc, argv);
+//   }
+import "ui_native.cb";
+
+// sleep() is forward-declared (not `import "time.cb"`) so this module does not drag time.cb
+// into every consumer's closure - time.cb's Duration type collides with the WinUI winmd
+// projection, and the WinUI gallery links ui_test.cb. Only waitUntil() calls sleep; a
+// consumer that uses waitUntil must have sleep in scope (import "time.cb").
+void sleep(i64 ms);
+
+// ── Host + driver seam (forward declarations, defined by the backend) ─────────
+// Window lifecycle + message pumping.
+void startHeadlessWindow(Component app, const char* title, int w, int h);
+void hostDrainPosted();
+void pumpNative();
+void nativeTeardownForTest();
+UiContext* activeCtx();
+bool hostDark();
+
+// Action drivers (drive a control the way the OS would on user input).
+void nativeClickButton(string keyPath);
+void nativeTypeText(string keyPath, string s);
+void nativeSetControlText(string keyPath, string s);
+void nativeComboSelect(string keyPath, int idx);
+void nativeListSelect(string keyPath, int row);
+void nativeListActivate(string keyPath, int row);
+void nativeTabSelect(string keyPath, int idx);
+void nativeSliderSet(string keyPath, int v);
+void nativeSplitterDrag(string keyPath, int dipX, int dipY);
+void nativeFireContextMenu(string keyPath, int itemIndex);
+void nativeTestFireMenu(int cmd);
+void nativeResizeClient(int wDip, int hDip);
+
+// Reader drivers (read live control + model state; the oracle, no pixels).
+string nativeControlText(string keyPath);
+bool nativeIsChecked(string keyPath);
+bool nativeIsEnabled(string keyPath);
+int nativeComboSelected(string keyPath);
+int nativeListRowCount(string keyPath);
+int nativeListSelectedRow(string keyPath);
+string nativeListCellText(string keyPath, int row, int col);
+int nativeProgressValue(string keyPath);
+string nativeStatusText(string keyPath);
+Rect nativeNodeBounds(string keyPath);
+string nativeAccessibleName(string keyPath);
+string nativeFocusFirst();
+string nativeFocusNext();
+string nativeFocusedKey();
+u32 nativeAccentBg(string keyPath);
+u32 nativeTestCustomDrawFill(string keyPath);
+bool nativeImageHasBitmap(string keyPath);
+int nativeTabCount(string keyPath);
+int nativeTabSelected(string keyPath);
+int nativeTooltipCount();
+
+// Offscreen window capture (Win32: PrintWindow + GetDIBits -> 24bpp BMP). The heavy GDI
+// path lives in the Win32 backend so this module stays windows.h-free + LSP-sweep clean;
+// cocoa/winui define it as a no-op returning false. shot()/uiShot() are the portable verb.
+bool nativeSaveWindowBmp(string path);
+
+// ── Small helpers used by the hardening kits below ────────────────────────────
+// True if `xs` contains `want` (string value compare).
+bool _uiListHasStr(list<string>* xs, string want)
+{
+    int i = 0;
+    while (i < xs.count()) { if (xs.get(i) == want) return true; i++; }
+    return false;
+}
+
+// A filesystem-safe version of `name` (non-alphanumeric -> '_'), for shot filenames.
+string _uiSafeName(string name)
+{
+    char[128] buf;
+    const char* src = name.data();
+    int i = 0;
+    while (i < 127 && src[i] != (char)0)
+    {
+        char ch = src[i];
+        bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
+        buf[i] = ok ? ch : (char)'_';
+        i++;
+    }
+    buf[i] = (char)0;
+    return "" + buf;
+}
+
+// A requested client size (DIP), for resizeStorm's size list.
+struct UiSize { int w = 0; int h = 0; };
+UiSize uiSize(int w, int h) { UiSize s = default; s.w = w; s.h = h; return s; }
+
+// ── UiTest: the per-case context (wraps one launched headless window) ─────────
+// A case body receives a UiTest* and drives the window through the methods below.
+// Asserts record pass/fail with the key path + expected/actual in the message and
+// never abort the process; a failed require() sets `aborted` so the remaining
+// asserts in that case are skipped (counted neither pass nor total).
+class UiTest
+{
+    string caseName = default;
+    int    pass     = 0;
+    int    total    = 0;
+    bool   aborted  = false;   // a require() failed -> skip the rest of this case
+    bool   launched = false;   // launch() created a window -> runner tears it down
+
+    // ── Launch / teardown ────────────────────────────────────────────────────
+    // Create a fresh invisible window bound to `app` (DIP size w x h) and build its
+    // tree. `app` is a `new`-allocated Component the window takes ownership of; the
+    // runner frees it via nativeTeardownForTest after the case.
+    void launch(Component app, int w, int h)
+    {
+        startHeadlessWindow(app, "uitest", w, h);
+        this.launched = true;
+    }
+
+    // Re-render + drain any posted UI-thread work. Call after driving a control that
+    // kicks a worker + ctx.post; waitUntil pumps for you between polls.
+    void pump()
+    {
+        pumpNative();
+        hostDrainPosted();
+    }
+
+    // ── Actions (thin facades, one per driver, same key-path addressing) ──────
+    void click(string key)                 { if (this.aborted) return; nativeClickButton(key); }
+    void type(string key, string s)         { if (this.aborted) return; nativeTypeText(key, s); }
+    void setText(string key, string s)      { if (this.aborted) return; nativeSetControlText(key, s); }
+    void comboSelect(string key, int i)     { if (this.aborted) return; nativeComboSelect(key, i); }
+    void listSelect(string key, int row)    { if (this.aborted) return; nativeListSelect(key, row); }
+    void listActivate(string key, int row)  { if (this.aborted) return; nativeListActivate(key, row); }
+    void tabSelect(string key, int i)       { if (this.aborted) return; nativeTabSelect(key, i); }
+    void sliderSet(string key, int v)       { if (this.aborted) return; nativeSliderSet(key, v); }
+    void splitterDrag(string key, int dx, int dy) { if (this.aborted) return; nativeSplitterDrag(key, dx, dy); }
+    void fireContextMenu(string key, int i) { if (this.aborted) return; nativeFireContextMenu(key, i); }
+    void fireMenu(int cmd)                  { if (this.aborted) return; nativeTestFireMenu(cmd); }
+    void resize(int w, int h)               { if (this.aborted) return; nativeResizeClient(w, h); }
+    string focusFirst()                     { return nativeFocusFirst(); }
+    string focusNext()                      { return nativeFocusNext(); }
+
+    // ── Readers (return live state for the caller to assert on) ───────────────
+    string controlText(string key)          { return nativeControlText(key); }
+    bool isChecked(string key)              { return nativeIsChecked(key); }
+    bool isEnabled(string key)              { return nativeIsEnabled(key); }
+    bool isDisabled(string key)             { return !nativeIsEnabled(key); }
+    int comboSelected(string key)           { return nativeComboSelected(key); }
+    int listRowCount(string key)            { return nativeListRowCount(key); }
+    int listSelectedRow(string key)         { return nativeListSelectedRow(key); }
+    string listCellText(string key, int r, int c) { return nativeListCellText(key, r, c); }
+    int progressValue(string key)           { return nativeProgressValue(key); }
+    string statusText(string key)           { return nativeStatusText(key); }
+    Rect bounds(string key)                 { return nativeNodeBounds(key); }
+    string accessibleName(string key)       { return nativeAccessibleName(key); }
+    string focusedKey()                     { return nativeFocusedKey(); }
+    u32 accentBg(string key)                { return nativeAccentBg(key); }
+    u32 customDrawFill(string key)          { return nativeTestCustomDrawFill(key); }
+    bool imageHasBitmap(string key)         { return nativeImageHasBitmap(key); }
+    int tabCount(string key)                { return nativeTabCount(key); }
+    int tabSelected(string key)             { return nativeTabSelected(key); }
+    int tooltipCount()                      { return nativeTooltipCount(); }
+    bool hostIsDark()                       { return hostDark(); }
+
+    // True if the control at keyPath has a live native handle (was created).
+    bool exists(string key) { return activeCtx().nativeHandle(key) != 0u; }
+
+    // Save an offscreen capture of the current window to `path` (24bpp BMP). Win32-only;
+    // returns false on cocoa/winui (documented no-op). The runner auto-calls this on a
+    // failing case when --shot-dir is set.
+    bool shot(string path) { return nativeSaveWindowBmp(path); }
+
+    // ── waitUntil: the ONLY place time appears; everything else is synchronous ─
+    // Poll pred() every ~10ms up to timeoutMs, pumping posted UI-thread work between
+    // polls. Returns true once pred() holds, false on timeout (or if the case aborted).
+    bool waitUntil(Lambda<bool()> pred, int timeoutMs)
+    {
+        if (this.aborted) return false;
+        int polls = timeoutMs / 10;
+        if (polls < 1) polls = 1;
+        int i = 0;
+        while (i <= polls)
+        {
+            if (pred()) return true;
+            this.pump();
+            sleep(10);
+            i++;
+        }
+        return pred();
+    }
+
+    // ── Asserts (record with the assertion name + expected/actual detail) ─────
+    void _record(string name, bool ok, string detail)
+    {
+        if (this.aborted) return;   // a require() already failed: skip the rest
+        this.total = this.total + 1;
+        if (ok) { this.pass = this.pass + 1; return; }
+        printf("  FAIL [%s]: %s\n", name.data(), detail.data());
+    }
+
+    void expectTrue(string name, bool cond)  { this._record(name, cond, "expected true, got false"); }
+    void expectFalse(string name, bool cond) { this._record(name, !cond, "expected false, got true"); }
+
+    void expectBool(string name, bool want, bool got)
+    {
+        this._record(name, want == got,
+            "expected " + (want ? "true" : "false") + ", got " + (got ? "true" : "false"));
+    }
+
+    void expectInt(string name, int want, int got)
+    {
+        this._record(name, want == got,
+            "expected " + want.toString() + ", got " + got.toString());
+    }
+
+    // Compare a raw string value (not tied to a control).
+    void expectStr(string name, string want, string got)
+    {
+        this._record(name, want == got, "expected \"" + want + "\", got \"" + got + "\"");
+    }
+
+    // Compare the live text of the control at `key` to `want` (key path in the msg).
+    void expectText(string name, string key, string want)
+    {
+        string got = nativeControlText(key);
+        this._record(name, want == got,
+            key + ": expected \"" + want + "\", got \"" + got + "\"");
+    }
+
+    // A hard precondition: on failure, record it AND abort the rest of the case.
+    void requireTrue(string name, bool cond)
+    {
+        if (this.aborted) return;
+        this.total = this.total + 1;
+        if (cond) { this.pass = this.pass + 1; return; }
+        printf("  REQUIRE FAILED [%s]: expected true, got false\n", name.data());
+        this.aborted = true;
+    }
+};
+
+// ── UiCase: one registered case (name + body) ─────────────────────────────────
+// The body is stored as a function<> FIELD (which cflat supports) rather than a
+// list<function<...>> element (which does not monomorphize), so cases live in a
+// list<UiCase*>. The case wrapper owns its body closure and frees it on delete.
+class UiCase
+{
+    string name = default;
+    function<void(UiTest*)> body = default;
+};
+
+// ── UiTestSuite: the runner ───────────────────────────────────────────────────
+class UiTestSuite
+{
+    string name = default;
+    list<UiCase*> cases = default;
+
+    // Register a case. `body` is cloned into the wrapper (closures clone by default).
+    void test(string caseName, function<void(UiTest*)> body)
+    {
+        UiCase* c = new UiCase();
+        c.name = caseName;
+        c.body = body;
+        this.cases.add(c);
+    }
+
+    // Run all (or the filtered) cases sequentially - one window at a time, since the
+    // backends are single-UI-thread. Prints per-case PASS/FAIL + a suite summary and
+    // returns 0 iff every run case passed (the CI exit-code gate). Flags: --filter
+    // <substr> runs matching cases; --list prints case names and exits 0. Unknown
+    // flags (e.g. the app's own --selftest) are ignored so they can coexist.
+    int run(int argc, char** argv)
+    {
+        string filter = default;
+        string shotDir = default;
+        int a = 1;
+        while (a < argc)
+        {
+            string arg = "" + argv[a];
+            if (arg == "--list")
+            {
+                int i = 0;
+                while (i < this.cases.count()) { printf("%s\n", this.cases.get(i).name.data()); i++; }
+                return 0;
+            }
+            if (arg == "--filter" && a + 1 < argc) { filter = "" + argv[a + 1]; a = a + 2; continue; }
+            if (arg == "--shot-dir" && a + 1 < argc) { shotDir = "" + argv[a + 1]; a = a + 2; continue; }
+            a = a + 1;
+        }
+
+        int casePass = 0;
+        int caseRun = 0;
+        int i = 0;
+        while (i < this.cases.count())
+        {
+            UiCase* uc = this.cases.get(i);
+            i++;
+            if (filter.length() > 0 && strstr(uc.name.data(), filter.data()) == nullptr) continue;
+
+            caseRun = caseRun + 1;
+            UiTest t = default;
+            t.caseName = "" + uc.name;   // independent owned copy (uc keeps its name)
+            uc.body(&t);
+
+            bool ok = t.total > 0 && t.pass == t.total && !t.aborted;
+            // On a failing case, capture a screenshot named after the case (Win32-only;
+            // a no-op elsewhere). Taken while the window is still up, before teardown.
+            if (!ok && shotDir.length() > 0 && t.launched)
+                uiShot(shotDir + "/" + _uiSafeName(uc.name) + ".bmp");
+            // Always tear the window down (a case that failed early still launched one).
+            if (t.launched) nativeTeardownForTest();
+
+            if (ok)
+            {
+                casePass = casePass + 1;
+                printf("  PASS: %s (%d/%d)\n", uc.name.data(), t.pass, t.total);
+            }
+            else
+            {
+                printf("  FAIL: %s (%d/%d)\n", uc.name.data(), t.pass, t.total);
+            }
+        }
+
+        if (casePass == caseRun && caseRun > 0)
+        {
+            printf("PASS: SUITE %s %d/%d cases\n", this.name.data(), casePass, caseRun);
+            return 0;
+        }
+        printf("FAIL: SUITE %s %d/%d cases\n", this.name.data(), casePass, caseRun);
+        return 1;
+    }
+    // No destructor: list<UiCase*> owns its elements and deletes each UiCase (which
+    // destructs its name string + body closure) when the suite is torn down.
+};
+
+// Construct an empty suite named `name`.
+UiTestSuite uiTestSuite(string name)
+{
+    UiTestSuite s = default;
+    s.name = "" + name;
+    return s;
+}
+
+// ── Hardening kits (host-neutral; generalized from the gallery self-test) ─────
+
+// Save an offscreen capture of the current window to `bmpPath` (Win32-only; false
+// otherwise). The portable verb apps + the runner call (delegates to the backend).
+bool uiShot(string bmpPath) { return nativeSaveWindowBmp(bmpPath); }
+
+// Reconcile stress-soak: call mutate() `steps` times; after each step the set of controls
+// with a live native handle must EXACTLY equal the keys reported by expectedKeys() (the
+// census), and any key present in two consecutive steps must keep the SAME handle (reconcile
+// preserved identity across the churn). expectedKeys() returns the expected-present key paths
+// as a list<string> (empty => none). The universe of keys to police grows as keys are first
+// seen, so a control that should be ABSENT this step (present in an earlier one) is still
+// checked to have no handle. Returns true iff every step's census + identity held. Seeding the
+// app's churn RNG (for determinism) is the caller's job - do it before the first mutate().
+bool reconcileStress(int steps, Lambda<void()> mutate, Lambda<list<string>()> expectedKeys)
+{
+    dictionary<string, u64> lastHandle = default;   // handle seen last step per key (0 = absent)
+    list<string> universe = default;                 // every key ever expected (to detect strays)
+    bool ok = true;
+    int iter = 0;
+    while (iter < steps)
+    {
+        mutate();
+        list<string> cur = expectedKeys();
+        int c = 0;
+        while (c < cur.count())
+        {
+            string k = cur.get(c);
+            if (k.length() > 0 && !_uiListHasStr(&universe, k)) universe.add("" + k);
+            c++;
+        }
+        int u = 0;
+        while (u < universe.count())
+        {
+            string key = universe.get(u);
+            bool want = _uiListHasStr(&cur, key);
+            u64 h = activeCtx().nativeHandle(key);
+            bool have = h != 0u;
+            if (have != want) ok = false;
+            u64 prev = lastHandle.get(key);
+            if (want && prev != 0u && h != prev) ok = false;
+            lastHandle.set(key, h);
+            u++;
+        }
+        iter++;
+    }
+    return ok;
+}
+
+// Theme-flip storm: click `themeBtnKey` `flips` times; after each flip the host titlebar
+// dark state (hostDark) must equal the model's dark state (modelDark()). Returns true iff
+// they stayed in lockstep every flip.
+bool themeStorm(int flips, string themeBtnKey, Lambda<bool()> modelDark)
+{
+    bool ok = true;
+    int i = 0;
+    while (i < flips)
+    {
+        nativeClickButton(themeBtnKey);
+        if (hostDark() != modelDark()) ok = false;
+        i++;
+    }
+    return ok;
+}
+
+// Resize storm: drive the client area through each size in `sizes` (nativeResizeClient) and
+// after each assert layout sanity - rootKey keeps positive bounds and the caller's sanity()
+// holds (e.g. key controls survived the min-size clamp). Also checks the layout is
+// responsive: the root is wider at the widest requested width than at the narrowest.
+// Returns true iff every check held.
+bool resizeStorm(string rootKey, list<UiSize> sizes, Lambda<bool()> sanity)
+{
+    if (sizes.count() == 0) return true;
+    bool ok = true;
+    int minReqW = 0; int maxReqW = 0;
+    int rootAtMin = 0; int rootAtMax = 0;
+    bool first = true;
+    int i = 0;
+    while (i < sizes.count())
+    {
+        UiSize s = sizes.get(i);
+        nativeResizeClient(s.w, s.h);
+        Rect r = nativeNodeBounds(rootKey);
+        if (r.w <= 0 || r.h <= 0) ok = false;
+        if (!sanity()) ok = false;
+        if (first || s.w < minReqW) { minReqW = s.w; rootAtMin = r.w; }
+        if (first || s.w > maxReqW) { maxReqW = s.w; rootAtMax = r.w; }
+        first = false;
+        i++;
+    }
+    // Responsive: a wider request yields a strictly wider root than the narrowest request.
+    if (maxReqW > minReqW && rootAtMax <= rootAtMin) ok = false;
+    return ok;
+}

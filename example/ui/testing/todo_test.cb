@@ -1,0 +1,117 @@
+// todo_test.cb - the test target for todo_app.cb, and the "copy-me" example of the
+// ui_test.cb framework. Copy this file + todo_app.cb, rename them, and swap in your own
+// Component to get an automated, CI-ready test suite for a ui_native app.
+//
+// It imports THREE things: a host backend (ui_native_host.cb - the default Win32/Cocoa
+// host), the test framework (ui_test.cb), and the shared app module (todo_app.cb). The
+// backend supplies the native* drivers that ui_test.cb forward-declares, so the framework
+// resolves against a real host. time.cb is imported because the one waitUntil case needs
+// sleep() in scope (waitUntil is the only place time appears; everything else is synchronous).
+//
+// Build + run headless (the CI recipe: --heap-audit gates for leaks, <nul feeds no stdin):
+//   x64/Release/cflat.exe example/ui/testing/todo_test.cb -i example/ui/testing --heap-audit -o out/todo_test.exe
+//   out\todo_test.exe            # runs every case; exit code 0 = all passed
+//   out\todo_test.exe --list     # print case names and exit
+//   out\todo_test.exe --filter add   # run only cases whose name contains "add"
+import "ui_native_host.cb";
+import "ui_test.cb";
+import "todo_app.cb";
+import "time.cb";
+
+extern int main(int argc, char** argv)
+{
+    UiTestSuite s = uiTestSuite("todo");
+
+    // Every case launches its OWN fresh invisible window (the runner tears it down after),
+    // so cases are independent. A case body gets a UiTest* and drives the window through the
+    // facade (click/type/select + expect*); the runner records the result and sets the exit code.
+
+    // 1. A freshly launched app: all keyed controls exist, the list is empty, and the two
+    //    action buttons are disabled until there is something to act on.
+    s.test("initial state", (UiTest* t) =>
+    {
+        t.launch(new TodoApp(), 44, 34);
+        t.requireTrue("controls created",
+            t.exists("root/newitem") && t.exists("root/add") && t.exists("root/list")
+            && t.exists("root/delete") && t.exists("root/status"));
+        t.expectInt("empty list", 0, t.listRowCount("root/list"));
+        t.expectText("empty status", "root/status", "No tasks yet");
+        t.expectTrue("add disabled when field empty", t.isDisabled("root/add"));
+        t.expectTrue("delete disabled with no selection", t.isDisabled("root/delete"));
+    });
+
+    // 2. Type a task, watch Add enable, click it, and the task lands in the list while the
+    //    field clears and the status updates - the full add flow, read back through controls.
+    s.test("add a task", (UiTest* t) =>
+    {
+        t.launch(new TodoApp(), 44, 34);
+        t.expectTrue("add disabled when empty", t.isDisabled("root/add"));
+        t.type("root/newitem", "Write docs");
+        t.expectTrue("add enabled after typing", t.isEnabled("root/add"));
+        t.click("root/add");
+        t.expectInt("one row", 1, t.listRowCount("root/list"));
+        t.expectStr("row text", "Write docs", t.listCellText("root/list", 0, 0));
+        t.expectText("status updated", "root/status", "1 task(s)");
+        t.expectText("field cleared", "root/newitem", "");
+    });
+
+    // 3. Add three tasks and confirm the virtualized list reports each row's cell text.
+    s.test("add several tasks", (UiTest* t) =>
+    {
+        t.launch(new TodoApp(), 44, 34);
+        t.type("root/newitem", "alpha"); t.click("root/add");
+        t.type("root/newitem", "beta");  t.click("root/add");
+        t.type("root/newitem", "gamma"); t.click("root/add");
+        t.expectInt("three rows", 3, t.listRowCount("root/list"));
+        t.expectStr("row 0", "alpha", t.listCellText("root/list", 0, 0));
+        t.expectStr("row 2", "gamma", t.listCellText("root/list", 2, 0));
+        t.expectText("status", "root/status", "3 task(s)");
+    });
+
+    // 4. List interaction: select a row (Delete enables), delete it, then double-click
+    //    (activate) another row to complete it - selection + delete + activate drivers.
+    s.test("select, delete, and complete", (UiTest* t) =>
+    {
+        t.launch(new TodoApp(), 44, 34);
+        t.type("root/newitem", "one");   t.click("root/add");
+        t.type("root/newitem", "two");   t.click("root/add");
+        t.type("root/newitem", "three"); t.click("root/add");
+        t.expectTrue("delete disabled before selection", t.isDisabled("root/delete"));
+
+        t.listSelect("root/list", 1);
+        t.expectTrue("delete enabled after selection", t.isEnabled("root/delete"));
+        t.click("root/delete");
+        t.expectInt("two rows after delete", 2, t.listRowCount("root/list"));
+        t.expectStr("row 1 shifted up", "three", t.listCellText("root/list", 1, 0));
+
+        t.listActivate("root/list", 0);   // double-click completes the task
+        t.expectInt("one row after complete", 1, t.listRowCount("root/list"));
+    });
+
+    // 5. Background work: "Load sample" spawns a worker thread that fills the list via
+    //    ctx.post. The list is empty until the posted closure runs on the UI thread, so the
+    //    test WAITS - waitUntil pumps posted work between polls. This is the ONLY place a
+    //    wait is correct; every other assertion above is synchronous (drivers route inline).
+    s.test("background load lands via ctx.post", (UiTest* t) =>
+    {
+        t.launch(new TodoApp(), 44, 34);
+        TodoApp* g = activeApp() as TodoApp;
+        t.click("root/load");
+        t.expectTrue("sample tasks loaded",
+            t.waitUntil(() => t.listRowCount("root/list") == 3, 2000));
+        t.expectFalse("load finished", g.loading);
+        t.expectText("status reflects loaded tasks", "root/status", "3 task(s)");
+    });
+
+    // 6. A hardening kit: flip the theme many times and assert the host titlebar theme stays
+    //    in lockstep with the model after every reconcile (a soak the kits generalize for you).
+    s.test("theme storm hardening kit", (UiTest* t) =>
+    {
+        t.launch(new TodoApp(), 44, 34);
+        TodoApp* g = activeApp() as TodoApp;
+        t.expectTrue("theme stays in lockstep across flips",
+            themeStorm(12, "root/theme", () => g != nullptr && g.dark));
+    });
+
+    return s.run(argc, argv);
+}

@@ -1173,6 +1173,51 @@ bool nativeIsChecked(string keyPath)
     return false;
 }
 
+// True if the control at keyPath is enabled (element-model read, mirroring nativeIsChecked
+// and the PROP_ENABLED dispatch in applyTree). Best-effort parity for the shared facade -
+// no winui gate exercises this reader (the settings enabled/tooltip asserts are Win32-only);
+// it just needs to link so ui_test.cb's forward declaration resolves in the WinUI closure.
+bool nativeIsEnabled(string keyPath)
+{
+    Element e = winuiElem(keyPath);
+    if (e == nullptr) return false;
+    int k = e.kind();
+    if (k == ELEM_BUTTON)    { Button* b = e as Button; return !b.disabled; }
+    if (k == ELEM_TEXTINPUT) { TextInput* t = e as TextInput; return !t.disabled; }
+    if (k == ELEM_CHECKBOX)  { Checkbox* c = e as Checkbox; return !c.disabled; }
+    if (k == ELEM_RADIO)     { RadioButton* rb = e as RadioButton; return !rb.disabled; }
+    if (k == ELEM_SLIDER)    { Slider* s = e as Slider; return !s.disabled; }
+    if (k == ELEM_TEXTAREA)  { TextArea* ta = e as TextArea; return !ta.disabled; }
+    if (k == ELEM_COMBO)     { ComboBox* cb = e as ComboBox; return !cb.disabled; }
+    if (k == ELEM_LIST)      { ListView* lv = e as ListView; return !lv.disabled; }
+    if (k == ELEM_TABS)      { TabControl* tc = e as TabControl; return !tc.disabled; }
+    if (k == ELEM_TREE)      { TreeView* tv = e as TreeView; return !tv.disabled; }
+    return true;   // controls without a disabled prop are always enabled
+}
+
+// WinUI tooltips ride ToolTipService (per-element attached property), not a per-window tool
+// registry, so there is no host-neutral count to read; return 0 (documented, like cocoa).
+// No winui gate exercises this reader - the settings tooltip assert is Win32-only.
+int nativeTooltipCount() { return 0; }
+
+// Offscreen window capture is Win32-only (PrintWindow + GetDIBits); on WinUI shot() is a
+// documented no-op returning false.
+bool nativeSaveWindowBmp(string path) { return false; }
+
+// ── Link-only parity for the ui_test.cb facade ────────────────────────────────
+// gallery_app.cb imports ui_test.cb, whose UiTest facade references the full native*
+// surface. These WinUI bodies exist so that closure links; the ones below are NOT exercised
+// by any WinUI gate (they back Win32-only hardening drivers - focus ring, live resize, menu
+// firing - or map WinUI's own pump/dispatcher onto the host-neutral names).
+void pumpNative() { pumpWinui(); }
+void hostDrainPosted() { pumpWinui(); }   // posted work runs on the DispatcherQueue pumpWinui drains
+void nativeTestFireMenu(int cmd) { routeMenu(cmd); }
+void nativeResizeClient(int wDip, int hDip) { _wW = wDip; _wH = hDip; }   // record only; not exercised on WinUI
+string nativeAccessibleName(string keyPath) { return nativeControlText(keyPath); }
+string nativeFocusFirst() { return ""; }   // Win32-only Tab ring; no WinUI gate exercises focus drivers
+string nativeFocusNext() { return ""; }
+string nativeFocusedKey() { return ""; }
+
 // The combo box selection index (live ISelector get_SelectedIndex).
 int nativeComboSelected(string keyPath)
 {

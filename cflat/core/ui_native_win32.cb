@@ -22,12 +22,16 @@
 // This file has no main(); an app imports it and calls runAppGuiNative().
 import "windows.h" lib { "user32.lib", "gdi32.lib", "comctl32.lib", "dwmapi.lib", "comdlg32.lib" } cache;
 import "ui_native.cb";
+import "graphic/bitmap.cb";   // 24bpp BMP writer for nativeSaveWindowBmp (the shot() backend)
 
 // ── APIs not surfaced by the windows.h binding (declared by hand) ────────────
 // InitCommonControls() (commctrl.h) registers the classic control classes;
 // DwmSetWindowAttribute (dwmapi.h) drives the immersive dark-mode titlebar.
 extern stdcall void InitCommonControls();
 extern stdcall i32 DwmSetWindowAttribute(void* hwnd, u32 attr, void* pv, u32 cb);
+// PrintWindow + GetDIBits back the offscreen screenshot path; not surfaced by the binding.
+extern stdcall i32 PrintWindow(void* hwnd, void* hdc, u32 flags);
+extern stdcall i32 GetDIBits(void* hdc, void* hbm, u32 start, u32 lines, void* bits, void* bmi, u32 usage);
 
 const int PBM_SETRANGE32 = 1030;   // WM_USER+6
 const int PBM_SETPOS     = 1026;   // WM_USER+2
@@ -2791,6 +2795,15 @@ bool nativeIsChecked(string keyPath)
     return (int)SendMessageA(u2h(h), (u32)BM_GETCHECK, 0u, (i64)0) == 1;
 }
 
+// True if the control at keyPath is enabled (native IsWindowEnabled). Host-neutral
+// reader for the disabled-until-enabled pattern (Save button, etc.).
+bool nativeIsEnabled(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return false;
+    return IsWindowEnabled(u2h(h)) != 0;
+}
+
 // The combo box selection index (-1 if none / not a combo).
 int nativeComboSelected(string keyPath)
 {
@@ -2859,6 +2872,72 @@ u32 nativeAccentBg(string keyPath)
     u32 bg = 0u; u32 fg = 0u;
     if (curWin().accentFor(h, &bg, &fg)) return bg;
     return 0u;
+}
+
+// Number of tooltips registered on the window's shared tooltip control (0 if none
+// exists yet). Host-neutral reader proving a declared `tooltip` reached the OS.
+int nativeTooltipCount()
+{
+    if (!hasCurWin() || curWin().tooltip == nullptr) return 0;
+    return (int)SendMessageA(curWin().tooltip, (u32)TTM_GETTOOLCOUNT, 0u, (i64)0);
+}
+
+// Render the current window into an offscreen bitmap via PrintWindow and write a 24bpp BMP
+// (through core/graphic/bitmap.cb) to `path`. This is the Win32 backend for ui_test.cb's
+// shot()/uiShot() verb; cocoa/winui return false. Promoted from the gallery launcher's
+// saveWindowBmp so any ui_native app (and the runner's --shot-dir auto-capture) can use it.
+bool nativeSaveWindowBmp(string path)
+{
+    if (!hasCurWin() || curWin().hwnd == nullptr) return false;
+    void* hwnd = curWin().hwnd;
+    RECT rc = default;
+    GetClientRect(hwnd, &rc);
+    int W = rc.right - rc.left;
+    int H = rc.bottom - rc.top;
+    if (W <= 0 || H <= 0) return false;
+
+    void* screenDC = GetDC(nullptr);
+    void* memDC = CreateCompatibleDC(screenDC);
+    void* bmp = CreateCompatibleBitmap(screenDC, W, H);
+    void* oldBmp = SelectObject(memDC, bmp);
+    // Pre-fill with the theme background so any region PrintWindow leaves unrendered (a
+    // window taller than the screen work area PrintWindow clamps to) reads as the app
+    // background rather than uninitialized black.
+    if (curWin().bgBrush != nullptr) FillRect(memDC, &rc, curWin().bgBrush);
+    else FillRect(memDC, &rc, GetStockObject(WHITE_BRUSH));
+    PrintWindow(hwnd, memDC, (u32)PW_RENDERFULLCONTENT);
+    SelectObject(memDC, oldBmp);
+
+    // Pull the pixels as top-down BGRA32 in one GetDIBits call (fast; no per-pixel GetPixel).
+    BmiHeader bi = default;
+    bi.biSize = 40u; bi.biWidth = W; bi.biHeight = 0 - H; bi.biPlanes = 1; bi.biBitCount = 32;
+    u64 bufN = (u64)(W * H * 4);
+    char* buf = (char*)malloc((i64)bufN);
+    GetDIBits(memDC, bmp, 0u, (u32)H, (void*)buf, &bi, (u32)DIB_RGB_COLORS);
+
+    Bitmap* out = new Bitmap;
+    out.create(W, H);
+    int y = 0;
+    while (y < H)
+    {
+        int x = 0;
+        while (x < W)
+        {
+            int idx = (y * W + x) * 4;
+            BitmapPixel px = default;
+            px.b = (u8)buf[idx + 0]; px.g = (u8)buf[idx + 1]; px.r = (u8)buf[idx + 2]; px.a = (u8)255;
+            out.set(x, y, px);
+            x++;
+        }
+        y++;
+    }
+    bool ok = out.save(path);
+    delete out;
+    free((void*)buf);
+    DeleteObject(bmp);
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, screenDC);
+    return ok;
 }
 
 // ── P13 host-neutral hardening drivers (Win32 bodies) ─────────────────────────

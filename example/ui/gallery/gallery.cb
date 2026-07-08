@@ -15,74 +15,15 @@
 import "ui_native_host.cb";
 import "gallery_app.cb";
 
-// ── Screenshot (PrintWindow -> BMP), one per theme, for the docs ──────────────
-// PrintWindow/GetDIBits are Win32-only, so the whole screenshot path (and its bitmap
-// import + externs) is gated to Windows at file scope; the Cocoa build skips it. The
-// host-neutral self-test above is the cross-platform gate. The `if const (__MACOS__){}
+// ── Screenshot + Win32-only hardening self-test ───────────────────────────────
+// The offscreen capture (PrintWindow + GetDIBits) now lives in the Win32 backend
+// (nativeSaveWindowBmp), surfaced host-neutrally as ui_test.cb's uiShot(); the docs
+// screenshot path and the keyboard/focus/relayout/a11y hardening drivers are Win32-only,
+// so this whole block is gated to Windows at file scope (the Cocoa build skips it). The
+// host-neutral gallerySelfTest above is the cross-platform gate. The `if const (__MACOS__){}
 // else{...}` shape (not `!__MACOS__`) is required: the forward-ref scanner only folds a
 // SIMPLE-identifier condition, so a negated condition would type-scan both branches.
 if const (__MACOS__) { } else {
-import "graphic/bitmap.cb";
-
-// PrintWindow + GetDIBits are used by the screenshot path; not surfaced by the binding.
-extern stdcall i32 PrintWindow(void* hwnd, void* hdc, u32 flags);
-extern stdcall i32 GetDIBits(void* hdc, void* hbm, u32 start, u32 lines, void* bits, void* bmi, u32 usage);
-
-// Renders the live window into an offscreen bitmap via PrintWindow and writes a 24bpp
-// BMP through core/graphic/bitmap.cb - the same technique win32_shot.cb uses for the
-// Canvas host, here for the real native controls.
-bool saveWindowBmp(void* hwnd, const char* path)
-{
-    RECT rc = default;
-    GetClientRect(hwnd, &rc);
-    int W = rc.right - rc.left;
-    int H = rc.bottom - rc.top;
-    if (W <= 0 || H <= 0) return false;
-
-    void* screenDC = GetDC(nullptr);
-    void* memDC = CreateCompatibleDC(screenDC);
-    void* bmp = CreateCompatibleBitmap(screenDC, W, H);
-    void* oldBmp = SelectObject(memDC, bmp);
-    // Pre-fill with the theme background so any region PrintWindow leaves unrendered (the
-    // gallery is taller than the screen work area PrintWindow clamps to) reads as the app
-    // background rather than uninitialized black.
-    if (hasCurWin() && curWin().bgBrush != nullptr) FillRect(memDC, &rc, curWin().bgBrush);
-    else FillRect(memDC, &rc, GetStockObject(WHITE_BRUSH));
-    PrintWindow(hwnd, memDC, (u32)PW_RENDERFULLCONTENT);
-    SelectObject(memDC, oldBmp);
-
-    // Pull the pixels as top-down BGRA32 in one GetDIBits call (fast; no per-pixel GetPixel).
-    BmiHeader bi = default;
-    bi.biSize = 40u; bi.biWidth = W; bi.biHeight = 0 - H; bi.biPlanes = 1; bi.biBitCount = 32;
-    u64 bufN = (u64)(W * H * 4);
-    char* buf = (char*)malloc((i64)bufN);
-    GetDIBits(memDC, bmp, 0u, (u32)H, (void*)buf, &bi, (u32)DIB_RGB_COLORS);
-
-    Bitmap* out = new Bitmap;
-    out.create(W, H);
-    int y = 0;
-    while (y < H)
-    {
-        int x = 0;
-        while (x < W)
-        {
-            int i = (y * W + x) * 4;
-            BitmapPixel px = default;
-            px.b = (u8)buf[i + 0]; px.g = (u8)buf[i + 1]; px.r = (u8)buf[i + 2]; px.a = (u8)255;
-            out.set(x, y, px);
-            x++;
-        }
-        y++;
-    }
-    bool ok = out.save((string)path);
-    delete out;
-    free((void*)buf);
-    SelectObject(memDC, oldBmp);
-    DeleteObject(bmp);
-    DeleteDC(memDC);
-    ReleaseDC(nullptr, screenDC);
-    return ok;
-}
 
 // Build the gallery in a shown window, sized tall enough that every control fits, and
 // write a BMP for the light theme and one for the dark theme into `dir`.
@@ -100,7 +41,7 @@ int galleryShots(const char* dir)
     UpdateWindow(hwnd);
 
     string lightPath = "" + dir + "/gallery_light.bmp";
-    bool okL = saveWindowBmp(hwnd, lightPath.data());
+    bool okL = uiShot(lightPath);
     printf("%s: %s\n", okL ? "wrote" : "FAIL", lightPath.data());
 
     // Flip to dark and recapture (a call-result downcast is a borrow).
@@ -108,7 +49,7 @@ int galleryShots(const char* dir)
     if (g != nullptr) { g.dark = true; activeCtx().invalidate(); pumpNative(); }
     UpdateWindow(hwnd);
     string darkPath = "" + dir + "/gallery_dark.bmp";
-    bool okD = saveWindowBmp(hwnd, darkPath.data());
+    bool okD = uiShot(darkPath);
     printf("%s: %s\n", okD ? "wrote" : "FAIL", darkPath.data());
 
     nativeTeardownForTest();
@@ -118,69 +59,65 @@ int galleryShots(const char* dir)
 // ── P13 Win32-only hardening self-test: keyboard/focus, relayout, a11y names ───
 // These drive documented Win32 APIs (GetNextDlgTabItem, WM_SIZE, GetWindowTextA) that have
 // no host-neutral driver, so they live in the Win32/Cocoa launcher and are gated out of the
-// Cocoa build. Run after the host-neutral gallerySelfTest (which tore down its own window).
+// Cocoa build. Migrated onto the ui_test.cb runner (each case a fresh headless launch); the
+// live-relayout check now rides the resizeStorm() kit. Run after gallerySelfTest.
 int win32HardeningSelfTest()
 {
     wireGallery();
-    startHeadlessWindow(new GalleryApp(), "gallery-harden", 60, 60);
-    int pass = 0; int total = 0;
+    UiTestSuite s = uiTestSuite("gallery-harden");
 
-    // 1. Tab ring: the first WS_TABSTOP control is reachable, and walking the ring with
-    //    GetNextDlgTabItem visits many distinct controls (the full element set participates
-    //    - ListView/TreeView/TabControl/ComboBox are all WS_TABSTOP) and cycles back.
-    total++;
-    u64 firstH = nativeFocusFirstH();
-    // GetNextDlgTabItem visits each tabstop once before cycling back, so the step count at
-    // ring-closure equals the number of participating controls - a count >= 8 proves the full
-    // element set (ListView/TreeView/TabControl/ComboBox included) is in the Tab ring. Walk by
-    // handle (u64) so no owned key string is allocated per step.
-    int stepCount = 0; bool closed = false;
-    while (stepCount < 200)
+    // Tab ring + focus readback: the first WS_TABSTOP control is reachable, walking the ring
+    // (GetNextDlgTabItem, by handle so no owned key string is allocated per step) visits >= 8
+    // distinct controls and cycles back, and after advancing once more the OS-focused control
+    // matches the driver's report.
+    s.test("tab ring + focus readback", (UiTest* t) =>
     {
-        u64 h = nativeFocusNextH();
-        stepCount++;
-        if (h == firstH) { closed = true; break; }
-        if (h == 0u) break;
-    }
-    bool tabOk = firstH != 0u && closed && stepCount >= 8;
-    if (tabOk) pass++; else printf("  FAIL: tab ring (firstH=%llu closed=%d steps=%d)\n", firstH, closed ? 1 : 0, stepCount);
+        t.launch(new GalleryApp(), 60, 60);
+        u64 firstH = nativeFocusFirstH();
+        int stepCount = 0; bool closed = false;
+        while (stepCount < 200)
+        {
+            u64 h = nativeFocusNextH();
+            stepCount++;
+            if (h == firstH) { closed = true; break; }
+            if (h == 0u) break;
+        }
+        t.expectTrue("tab ring cycles through >= 8 controls", firstH != 0u && closed && stepCount >= 8);
 
-    // 2. Focus readback: after advancing, the OS-focused control matches the driver's report.
-    total++;
-    string advKey = nativeFocusNext();
-    string curKey = nativeFocusedKey();
-    bool focusReadback = advKey.length() > 0 && curKey == advKey;
-    if (focusReadback) pass++; else printf("  FAIL: focus readback (adv='%s' cur='%s')\n", advKey.data(), curKey.data());
+        string advKey = t.focusNext();
+        string curKey = t.focusedKey();
+        t.expectTrue("focus readback matches", advKey.length() > 0 && curKey == advKey);
+    });
 
-    // 3. Live relayout: widening the client area re-lays-out the root to the new width; a tiny
-    //    resize is clamped (min-size floor) without crashing and controls survive.
-    total++;
-    Rect rBefore = nativeNodeBounds("root");
-    nativeResizeClient(120, 90);
-    Rect rWide = nativeNodeBounds("root");
-    nativeResizeClient(1, 1);                 // clamp floor - must not crash
-    bool survived = _exists("root/list") && _exists("root/tree");
-    nativeResizeClient(60, 60);               // restore
-    bool relayoutOk = rWide.w > rBefore.w && survived && _exists("root/status");
-    if (relayoutOk) pass++; else printf("  FAIL: relayout (w %d->%d survived=%d)\n", rBefore.w, rWide.w, survived ? 1 : 0);
+    // Live relayout: widening the client area re-lays-out the root wider; a tiny resize is
+    // clamped (min-size floor) without crashing; key controls survive across the sequence.
+    s.test("live relayout", (UiTest* t) =>
+    {
+        t.launch(new GalleryApp(), 60, 60);
+        list<UiSize> sizes = default;
+        sizes.add(uiSize(120, 90));
+        sizes.add(uiSize(1, 1));       // clamp floor - must not crash
+        sizes.add(uiSize(60, 60));     // restore
+        t.expectTrue("resize storm keeps layout sane",
+            resizeStorm("root", sizes,
+                () => _exists("root/list") && _exists("root/tree") && _exists("root/status")));
+    });
 
-    // 4. Accessibility Name: a text-bearing control's Name is its window text; a textless
-    //    control (ProgressBar) gets its Name from the tooltip mirrored in by applyTree.
-    total++;
-    string btnName = nativeAccessibleName("root/btn");
-    string progName = nativeAccessibleName("root/prog");
-    bool a11yOk = strcmp(btnName.data(), "Click me") == 0
-        && strcmp(progName.data(), "download progress") == 0;
-    if (a11yOk) pass++; else printf("  FAIL: a11y names (btn='%s' prog='%s')\n", btnName.data(), progName.data());
+    // Accessibility Name: a text-bearing control's Name is its window text; a textless control
+    // (ProgressBar) gets its Name from the tooltip mirrored in by applyTree.
+    s.test("accessibility names", (UiTest* t) =>
+    {
+        t.launch(new GalleryApp(), 60, 60);
+        string btnName = t.accessibleName("root/btn");
+        string progName = t.accessibleName("root/prog");
+        t.expectTrue("a11y names",
+            strcmp(btnName.data(), "Click me") == 0 && strcmp(progName.data(), "download progress") == 0);
+    });
 
-    nativeTeardownForTest();
-
-    if (pass == total) { printf("PASS: win32 hardening self-test %d/%d (focus, relayout, a11y)\n", pass, total); return 0; }
-    printf("FAIL: win32 hardening self-test %d/%d\n", pass, total);
-    return 1;
+    return s.run(0, nullptr);
 }
 
-}   // end if const (!__MACOS__) - screenshot path
+}   // end if const (__MACOS__) - screenshot + hardening path
 
 extern int main(int argc, char** argv)
 {

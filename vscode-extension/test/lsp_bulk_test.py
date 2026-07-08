@@ -178,6 +178,12 @@ def collect_files(include_win32_demo: bool) -> list[Path]:
     # analysis therefore cannot resolve those drivers; both launchers are swept and
     # example.bat exercises the component on both hosts. Skip it here.
     files = [f for f in files if f.name != "gallery_app.cb"]
+    # todo_app.cb (example/ui/testing/) is the ui_test.cb template's host-neutral app module:
+    # like gallery_app.cb it imports only the element model and resolves the native* host
+    # drivers (hostWidth/hostHeight/...) from its LAUNCHER, todo_test.cb, which shares one
+    # global scope with it. Standalone analysis cannot resolve those drivers; todo_test.cb is
+    # swept and example.bat's --worker-uitest exercises the module. Skip it here.
+    files = [f for f in files if f.name != "todo_app.cb"]
     return files
 
 

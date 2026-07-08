@@ -18,6 +18,7 @@
 // load/save, since OS file dialogs cannot run unattended):
 //   out\fedit.exe --selftest
 import "ui_native_host.cb";
+import "ui_test.cb";
 import "filesystem.cb";
 import "thread.cb";
 
@@ -447,82 +448,88 @@ int _postWorker(void* arg)
     return 0;
 }
 
+// The fedit self-test, migrated onto the ui_test.cb runner. The open->edit->save->find
+// sequence shares one launch (its steps depend on each other); the Win32-only P9 nav suite
+// (tabs/tree/split/context/multi-window/post) is a second case, registered only off macOS
+// via `if const (__MACOS__){}else{}` (the correct simple-ident gating form). run(0, nullptr)
+// runs every registered case. Same --selftest flag + exit-code contract as before.
 int feditSelfTest()
 {
-    setupMenu();
-    wireHandlers();
-    startHeadlessWindow(new Editor(), "fedit-selftest", 80, 34);   // hidden window 1
+    UiTestSuite s = uiTestSuite("fedit");
 
-    Editor* e = activeApp() as Editor;
-    void* hed = u2h(activeCtx().nativeHandle(EDITOR_KEY));
-    int pass = 0; int total = 0;
-
-    // 1. The editor became a real multiline EDIT (now nested under the splitter/main).
-    total++;
-    if (hed != nullptr) pass++; else printf("  FAIL: no editor control\n");
-
-    // 2. Open a file: content flows into the buffer and the doc is not dirty.
-    total++;
-    string tdir = Path.getTempPath();
-    string tmp = tdir + "/fedit_selftest.txt";
-    File.writeAllText(tmp, "hello world\r\nsecond line\r\nhello again");
-    e.loadPath(tmp, activeCtx());
-    string got = nativeControlText(EDITOR_KEY);
-    bool opened = _has(got, "hello world") && _has(got, "second line") && !e.dirty;
-    if (opened) pass++; else printf("  FAIL: open/load (dirty=%d)\n", (int)e.dirty);
-
-    // 3. Editing fires the dirty notification.
-    total++;
-    string tmp2 = tdir + "/fedit_selftest_out.txt";
-    nativeInsertTextAt(EDITOR_KEY, 0, " X");
-    bool becameDirty = e.dirty;
-    if (becameDirty) pass++; else printf("  FAIL: edit did not mark dirty\n");
-
-    // 4. Save to a new path (bypassing the OS dialog).
-    total++;
-    e.path = "" + tmp2;
-    e.doSave(activeCtx());
-    string back = File.readAllText(tmp2);
-    bool saved = _has(back, "Xhello world") && !e.dirty;
-    if (saved) pass++; else printf("  FAIL: save round-trip (dirty=%d back=[%s])\n", (int)e.dirty, back.data());
-
-    // 5. Menu routing: View > Toggle Theme.
-    total++;
-    nativeTestFireMenu(CMD_THEME);
-    bool themed = hostDark();
-    if (themed) pass++; else printf("  FAIL: theme toggle via menu\n");
-
-    // 6. Find: locate the second "hello" after the caret and select it.
-    total++;
-    nativeSetControlText(EDITOR_KEY, "alpha hello beta hello gamma");
-    nativeSelect(EDITOR_KEY, 0, 0);
-    e.findText = "hello";
-    e.doFind();
-    e.doFind();
-    int a = nativeSelectionStart(EDITOR_KEY);
-    bool found = a == 17;
-    if (found) pass++; else printf("  FAIL: find next (selStart=%d, want 17)\n", a);
-
-    // 7. StatusBar readback.
-    total++;
-    string stat = nativeStatusText("root/status");
-    bool statusOk = _has(stat, "fedit");
-    if (statusOk) pass++; else printf("  FAIL: statusbar readback [%s]\n", stat.data());
-
-    // 8. StatusBar authored via the <Tag/> sugar (host-agnostic element check).
-    total++;
-    StatusBar* sbx = <StatusBar key="sbx" />;
-    sbx.addPart("ready");
-    bool sugarOk = sbx.kind() == ELEM_STATUSBAR && sbx.parts.count() == 1;
-    sbx.destroyTree(); delete sbx;
-    if (sugarOk) pass++; else printf("  FAIL: StatusBar sugar authoring\n");
-
-    // ── P9 tests (Win32-only native driver; macOS parity is P11) ──────────────
-    if const (!__MACOS__)
+    // Editor lifecycle in one launch: create -> open -> edit -> save -> menu/theme -> find ->
+    // statusbar readback -> sugar authoring (the steps build on each other). setupMenu +
+    // wireHandlers run per case BEFORE the launch: nativeTeardownForTest clears the menu model
+    // and the command/close handlers, so a later case must re-establish them for menu routing.
+    s.test("open / edit / save / find / statusbar / sugar", (UiTest* t) =>
     {
-        // 9. Multi-tab buffers survive a tab switch. Type into tab 0, open tab 1, type,
-        //    switch back to 0, and the tab-0 text must be intact (parked in the model).
-        total++;
+        setupMenu();
+        wireHandlers();
+        t.launch(new Editor(), 80, 34);
+        Editor* e = activeApp() as Editor;
+        t.requireTrue("app is Editor", e != nullptr);
+
+        // 1. The editor became a real multiline EDIT (nested under the splitter/main).
+        void* hed = u2h(activeCtx().nativeHandle(EDITOR_KEY));
+        t.expectTrue("editor control created", hed != nullptr);
+
+        // 2. Open a file: content flows into the buffer and the doc is not dirty.
+        string tdir = Path.getTempPath();
+        string tmp = tdir + "/fedit_selftest.txt";
+        File.writeAllText(tmp, "hello world\r\nsecond line\r\nhello again");
+        e.loadPath(tmp, activeCtx());
+        string got = nativeControlText(EDITOR_KEY);
+        t.expectTrue("open / load", _has(got, "hello world") && _has(got, "second line") && !e.dirty);
+
+        // 3. Editing fires the dirty notification.
+        string tmp2 = tdir + "/fedit_selftest_out.txt";
+        nativeInsertTextAt(EDITOR_KEY, 0, " X");
+        t.expectTrue("edit marks dirty", e.dirty);
+
+        // 4. Save to a new path (bypassing the OS dialog).
+        e.path = "" + tmp2;
+        e.doSave(activeCtx());
+        string back = File.readAllText(tmp2);
+        t.expectTrue("save round-trip", _has(back, "Xhello world") && !e.dirty);
+
+        // 5. Menu routing: View > Toggle Theme.
+        t.fireMenu(CMD_THEME);
+        t.expectTrue("theme toggle via menu", hostDark());
+
+        // 6. Find: locate the second "hello" after the caret and select it.
+        nativeSetControlText(EDITOR_KEY, "alpha hello beta hello gamma");
+        nativeSelect(EDITOR_KEY, 0, 0);
+        e.findText = "hello";
+        e.doFind();
+        e.doFind();
+        t.expectInt("find next selStart", 17, nativeSelectionStart(EDITOR_KEY));
+
+        // 7. StatusBar readback.
+        string stat = nativeStatusText("root/status");
+        t.expectTrue("statusbar readback", _has(stat, "fedit"));
+
+        // 8. StatusBar authored via the <Tag/> sugar (host-agnostic element check).
+        StatusBar* sbx = <StatusBar key="sbx" />;
+        sbx.addPart("ready");
+        bool sugarOk = sbx.kind() == ELEM_STATUSBAR && sbx.parts.count() == 1;
+        sbx.destroyTree(); delete sbx;
+        t.expectTrue("StatusBar sugar authoring", sugarOk);
+    });
+
+    // ── P9 nav suite (Win32-only native driver; macOS parity is P11) ──────────
+    // Registered only off macOS. The `if const (__MACOS__){}else{...}` shape (not `!__MACOS__`)
+    // is required: the forward-ref scanner only folds a SIMPLE-identifier condition.
+    if const (__MACOS__) { } else {
+    s.test("tabs / tree / split / context / multi-window / post", (UiTest* t) =>
+    {
+        setupMenu();
+        wireHandlers();
+        t.launch(new Editor(), 80, 34);
+        Editor* e = activeApp() as Editor;
+        void* hed = u2h(activeCtx().nativeHandle(EDITOR_KEY));
+
+        // 9. Multi-tab buffers survive a tab switch. Type into tab 0, open tab 1, type, switch
+        //    back to 0, and the tab-0 text must be intact (parked in the model).
         nativeSetControlText(EDITOR_KEY, "TAB0TEXT");
         nativeTestFireMenu(CMD_NEW);                           // new tab (routed + pumped)
         nativeSetControlText(EDITOR_KEY, "TAB1TEXT");
@@ -530,71 +537,49 @@ int feditSelfTest()
         bool back0 = editorHas("TAB0TEXT");
         nativeTabSelect(TABS_KEY, 1);                          // -> switchTab(1)
         bool back1 = editorHas("TAB1TEXT");
-        bool tabsOk = back0 && back1 && nativeTabCount(TABS_KEY) == 2;
-        if (tabsOk) pass++; else printf("  FAIL: tab buffers (back0=%d back1=%d)\n", (int)back0, (int)back1);
+        t.expectTrue("tab buffers", back0 && back1 && nativeTabCount(TABS_KEY) == 2);
 
-        // 10. Tree expand-on-demand + select opens a file into a tab. Expand "docs",
-        //     select its first child (a.txt), and a new tab shows the file content.
-        total++;
+        // 10. Tree expand-on-demand + select opens a file into a tab. Expand "docs", select
+        //     its first child (a.txt), and a new tab shows the file content.
         int tabsBefore = e.tabCount();
         u64 docsItem = nativeTreeRootItem(TREE_KEY);           // first root = "docs"
         nativeTreeExpandItem(TREE_KEY, docsItem);              // lazily inserts a.txt/b.txt
         u64 aItem = nativeTreeChildItem(TREE_KEY, docsItem);
         nativeTreeSelectItem(TREE_KEY, aItem);                 // -> onTreeSelect(10)
-        bool treeOpened = e.tabCount() == tabsBefore + 1
-            && editorHas("aaa contents")
-            && e.treeSel == 10;
-        if (treeOpened) pass++; else printf("  FAIL: tree open (tabs %d->%d treeSel=%d)\n", tabsBefore, e.tabCount(), e.treeSel);
+        t.expectTrue("tree open",
+            e.tabCount() == tabsBefore + 1 && editorHas("aaa contents") && e.treeSel == 10);
 
         // 11. Splitter drag changes the layout (the sidebar / editor widths shift).
-        total++;
         Rect edBefore = nativeNodeBounds(EDITOR_KEY);
         Rect splitB = nativeNodeBounds("root/split");
         nativeSplitterDrag("root/split", splitB.x + splitB.w * 60 / 100, splitB.y);
         Rect edAfter = nativeNodeBounds(EDITOR_KEY);
-        bool splitOk = e.splitRatio != 22 && edAfter.x != edBefore.x;
-        if (splitOk) pass++; else printf("  FAIL: split drag (ratio=%d edX %d->%d)\n", e.splitRatio, edBefore.x, edAfter.x);
+        t.expectTrue("split drag", e.splitRatio != 22 && edAfter.x != edBefore.x);
 
         // 12. Context-menu command routes: firing "New Tab" adds a tab via the handler.
-        total++;
         int tabsBefore2 = e.tabCount();
         nativeFireContextMenu(TREE_KEY, 0);                    // -> CMD_NEWTAB
-        bool ctxOk = e.tabCount() == tabsBefore2 + 1;
-        if (ctxOk) pass++; else printf("  FAIL: context menu route (tabs %d->%d)\n", tabsBefore2, e.tabCount());
+        t.expectTrue("context menu route", e.tabCount() == tabsBefore2 + 1);
 
         // 13. New Window: a genuine second editor window with its own tree/ctx/controls.
-        total++;
         int before = hostWindowCount();
         nativeTestFireMenu(CMD_NEWWIN);                        // _cur -> the new window
         u64 ed2 = activeCtx().nativeHandle(EDITOR_KEY);
-        bool twoWin = hostWindowCount() == before + 1 && ed2 != 0u && ed2 != (u64)hed;
-        if (twoWin) pass++;
-        else printf("  FAIL: New Window (count=%d ed2=%llu)\n", hostWindowCount(), ed2);
+        t.expectTrue("New Window", hostWindowCount() == before + 1 && ed2 != 0u && ed2 != (u64)hed);
 
-        // 14. ctx.post() round-trip from a worker thread (marshaled, runs on UI thread).
-        total++;
+        // 14. ctx.post() round-trip from a worker thread (marshaled, runs on the UI thread).
         u64 mainTid = (u64)GetCurrentThreadId();
         UiContext* c2 = activeCtx();
-        Thread t;
-        t.start(_postWorker, c2);
-        t.join();
+        Thread th;
+        th.start(_postWorker, c2);
+        th.join();
         bool queuedNotRun = _postRan == 0;
         hostDrainPosted();
-        bool ranOnUi = _postRan == 1 && _postRanTid == mainTid;
-        if (queuedNotRun && ranOnUi) pass++;
-        else printf("  FAIL: post round-trip (ran=%d onUi=%d)\n", _postRan, (int)(_postRanTid == mainTid));
+        t.expectTrue("post round-trip", queuedNotRun && _postRan == 1 && _postRanTid == mainTid);
+    });
     }
 
-    // Teardown: destroy every window + release host state (leak-clean for heap-audit).
-    nativeTeardownForTest();
-
-    if (pass == total)
-    {
-        printf("PASS: fedit self-test %d/%d (open, edit, save, menu, theme, find, statusbar, sugar, tabs, tree, split, context, multi-window, post)\n", pass, total);
-        return 0;
-    }
-    printf("FAIL: fedit self-test %d/%d\n", pass, total);
-    return 1;
+    return s.run(0, nullptr);
 }
 
 extern int main(int argc, char** argv)

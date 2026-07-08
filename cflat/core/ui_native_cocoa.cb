@@ -1859,6 +1859,24 @@ bool nativeIsChecked(string keyPath)
     return msgGetI64(u2h(h), "state") == (i64)1;
 }
 
+// Live NSControl enabled getter (mirror of Win32 IsWindowEnabled). Best-effort like its
+// cocoa peers - the macOS box is --check-only, so this is compile-verified, not run-verified.
+bool nativeIsEnabled(string keyPath)
+{
+    u64 h = _nCtx.nativeHandle(keyPath);
+    if (h == 0u) return false;
+    return msgBool1(u2h(h), "isEnabled", nullptr) != (i8)0;
+}
+
+// macOS tooltips ride NSView.toolTip per-view, not a per-window tool registry, so there is
+// no host-neutral count to read; return 0 (documented, like nativeAccentBg). No cocoa gate
+// exercises this reader - the settings tooltip assert is Win32-only.
+int nativeTooltipCount() { return 0; }
+
+// Offscreen window capture is Win32-only (PrintWindow + GetDIBits); on macOS shot() is a
+// documented no-op returning false.
+bool nativeSaveWindowBmp(string path) { return false; }
+
 int nativeComboSelected(string keyPath)
 {
     u64 h = _nCtx.nativeHandle(keyPath);
