@@ -635,6 +635,35 @@ int testStackQueueOwning()
     return passed;
 }
 
+// ── list<T*> ownership: take() transfers out, removeAt() frees in place ────────
+// Positive counterpart to Test/errors/err_delete_alias_result.cb: the owning
+// accessors stay deletable/removable exactly once (no leak, no double-free).
+// get() returns an alias borrow and must NOT be deleted - that is a compile error.
+int testListPtrOwnership()
+{
+    int passed = 0;
+    g_dtor_count = 0;
+
+    list<Tracked*> l;
+    l.add(new Tracked());
+    l.add(new Tracked());
+    l.add(new Tracked());
+
+    // take() transfers ownership to the caller; delete then frees it exactly once.
+    Tracked* taken = l.take(0);
+    delete taken;
+    passed += Test("list<T*> take+delete dtor once", g_dtor_count, 1);
+    passed += Test("list<T*> count after take",      l.count(),   2);
+
+    // removeAt() frees the pointer element in place (dtor fires once more).
+    l.removeAt(0);
+    passed += Test("list<T*> removeAt frees element", g_dtor_count, 2);
+    passed += Test("list<T*> count after removeAt",   l.count(),   1);
+
+    // The remaining element is freed by the list destructor at scope exit.
+    return passed;
+}
+
 // ── for ──────────────────────────────────────────────────────────────────
 
 int testFor()
@@ -1880,6 +1909,7 @@ extern int main()
     r = testStack();            passed += r; total += 8;
     r = testQueue();            passed += r; total += 8;
     r = testStackQueueOwning(); passed += r; total += 7;
+    r = testListPtrOwnership(); passed += r; total += 4;
     r = testFor();              passed += r; total += 10;
     r = testString();           passed += r; total += 22;
     r = testStringConcat();     passed += r; total += 10;

@@ -987,6 +987,12 @@ private:
     // Closure type aliases (`using Cb = function<R(Args)>;`). Cannot live in string-shaped
     // typeAliases because a closure type carries a full call signature, not a plain type name.
     std::unordered_map<std::string, TypeAndValue> functionTypeAliases;
+    // Closure types used as generic arguments (e.g. list<Lambda<int(int)>>) are encoded into a
+    // symbol-safe name (see BuildEncodedClosureName in MainListener.h) and registered here so the
+    // call descriptor (signature + fat/thin) is recoverable at the invoke site. The encoded name
+    // is also a real dataStructures entry (fat -> owning closure struct; thin -> {i8*} POD) so it
+    // behaves as an ordinary value-type element for storage / pointer-wrap / element destruction.
+    std::unordered_map<std::string, TypeAndValue> encodedClosureTypes_;
     // Fallback typedef map (HANDLE->void*, etc.) for the type mapper when canonical spellings
     // don't resolve. Process-wide, first-writer-wins.
     std::unordered_map<std::string, std::string> cTypedefMap_;
@@ -2393,6 +2399,66 @@ private:
             sym.Parameters = { TypeAndValue{ "__closure_fat_ptr", "self", false } };
             functionTable["copy"].push_back(sym);
         }
+    }
+
+    // Register a closure type used as a generic argument (e.g. list<Lambda<int(int)>>). `sig` is the
+    // call descriptor: IsFunctionPointer + TypeName (__closure_fat_ptr | __c_fn_ptr) + FuncPtr*.
+    // The encoded name is also made a real dataStructures value type so it stores, pointer-wraps,
+    // and (fat) destructs like any owning element. Idempotent.
+    void RegisterEncodedClosureType(const std::string& encodedName, const TypeAndValue& sig)
+    {
+        if (encodedClosureTypes_.count(encodedName)) return;
+        encodedClosureTypes_[encodedName] = sig;
+        EnsureClosureLifetimeRegistered();
+
+        if (!sig.IsThinFnPtr())
+        {
+            // Fat owning closure: alias the closure fat struct + its dtor so the encoded name is an
+            // owning value type (container frees envs; GetType resolves; pointer-wrap works).
+            auto& base = dataStructures["__closure_fat_ptr"];
+            auto& ds = dataStructures[encodedName];
+            ds.StructType   = base.StructType;
+            ds.StructFields = base.StructFields;
+            ds.Destructor   = base.Destructor;
+            // Bind clone-by-default to the closure copy so a copy request deep-clones the env rather
+            // than falling back to the memberwise synth (which shallow-shares env -> double-free).
+            if (auto* copyFn = module->getFunction("__closure_fat_ptr.copy"))
+            {
+                FunctionSymbol sym;
+                sym.UniqueName = encodedName + ".copy";
+                sym.Function   = copyFn;
+                sym.ReturnType = TypeAndValue{ encodedName, "", false };
+                sym.ReturnType.IsMove = true;
+                sym.Parameters = { TypeAndValue{ encodedName, "self", false } };
+                functionTable["copy"].push_back(sym);
+            }
+        }
+        else
+        {
+            // Thin C fn ptr: an 8-byte POD. Represent as a { i8* } struct so it stores/copies like a
+            // normal value-type element; no destructor.
+            auto& ds = dataStructures[encodedName];
+            if (!ds.StructType)
+            {
+                auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+                ds.StructType = llvm::StructType::create(*context, { i8PtrTy }, encodedName);
+                DeclTypeAndValue fnField;
+                fnField.TypeName    = "i8";
+                fnField.VariableName = "fn";
+                fnField.Pointer     = true;
+                ds.StructFields = { fnField };
+            }
+        }
+    }
+
+    bool IsEncodedClosureType(const std::string& name) const
+    {
+        return encodedClosureTypes_.count(name) != 0;
+    }
+    const TypeAndValue* GetEncodedClosureType(const std::string& name) const
+    {
+        auto it = encodedClosureTypes_.find(name);
+        return it == encodedClosureTypes_.end() ? nullptr : &it->second;
     }
 
     // Called lazily the first time a string local's destructor needs to fire.
@@ -8535,6 +8601,18 @@ public:
     // two argument-lowering paths cannot drift. Returns the lowered call-arg value.
     llvm::Value* LowerByValueArg(llvm::Value* value, const TypeAndValue& param, const NamedVariable& arg)
     {
+        // Encoded thin closure param (list<function<...>>::add's `T value`, gap a): the element is a
+        // { i8* } POD wrapper. A bare C fn ptr / thin function<> value arrives as a pointer - wrap it
+        // into the struct so it stores as the element type. The invoke site unwraps field 0.
+        if (const TypeAndValue* enc = GetEncodedClosureType(param.TypeName);
+            enc && enc->IsThinFnPtr() && value && value->getType()->isPointerTy() && !param.Pointer)
+        {
+            auto* wrapTy  = dataStructures[param.TypeName].StructType;
+            auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+            auto* asI8    = builder->CreateBitCast(value, i8PtrTy, "thinfn_i8");
+            llvm::Value* wrapped = llvm::UndefValue::get(wrapTy);
+            return builder->CreateInsertValue(wrapped, asI8, { 0u });
+        }
         if (param.TypeName == "string" && !param.Pointer
             && value && value->getType() == builder->getInt8Ty()->getPointerTo())
         {
@@ -11768,9 +11846,12 @@ public:
 
                 // function<T> parameter: accept any function-compatible argument (named function,
                 // lambda fat struct, or stored function<T> variable). Type fidelity is checked at codegen.
-                if (candidateParamItr->IsFunctionPointer
+                // An encoded closure param (list<Lambda<...>>::add's `T value`, gap a) accepts the same
+                // arguments; an encoded closure arg satisfies a function<T> param likewise.
+                if ((candidateParamItr->IsFunctionPointer || IsEncodedClosureType(candidateParamItr->TypeName))
                     && (arg.TypeAndValue.IsFunctionPointer
                         || arg.TypeAndValue.TypeName == "__closure_fat_ptr"
+                        || IsEncodedClosureType(arg.TypeAndValue.TypeName)
                         || (arg.BaseType && arg.BaseType->isStructTy()
                             && llvm::isa<llvm::StructType>(arg.BaseType)
                             && llvm::cast<llvm::StructType>(arg.BaseType)->getName() == "__closure_fat_ptr")
@@ -12622,6 +12703,12 @@ public:
                 // expression cleanup list so it is not also freed by the caller.
                 if (candidate.Parameters[i].TypeName == "string")
                     UnregisterOwnedStringTemp(matched[i].Primary);
+                // A `move` closure argument (fat Lambda<T> or an encoded closure element type, gap a)
+                // transfers env ownership to the callee. Drop the unnamed lambda temp from the end-
+                // of-expression closure cleanup so it is not also freed by the caller (double-free).
+                else if (candidate.Parameters[i].TypeName == "__closure_fat_ptr"
+                         || IsEncodedClosureType(candidate.Parameters[i].TypeName))
+                    UnregisterOwnedClosureTemp(matched[i].Primary);
 
                 // Interface fat-ptr parameters (non-pointer) borrow the caller's data - don't zero it.
                 // The fat-ptr holds a reference to the caller's struct; zeroing would corrupt that data.

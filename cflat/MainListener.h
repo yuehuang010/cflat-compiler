@@ -180,6 +180,27 @@ static std::string MangleTypeArg(const std::string& typeName)
     return result;
 }
 
+// Build the symbol-safe encoded name for a closure type used as a generic argument (gap a).
+// Length-prefixed components keep it collision-free; the result contains only [A-Za-z0-9_].
+// Each component folds its pointer flag in via MangleTypeArg ("int*" -> "intptr"); isThin selects
+// the thin/fat prefix. Examples: Lambda<int(int)> -> "__fatfn_1_3_int_3_int";
+// function<void(UiTest*)> -> "__thinfn_1_4_void_9_UiTestptr"; Lambda<list<string>()> ->
+// "__fatfn_0_12_list__string". Both compiler passes MUST call this identically.
+static std::string BuildEncodedClosureName(bool isThin, const std::string& ret, bool retPtr,
+    const std::vector<std::pair<std::string, bool>>& params)
+{
+    auto comp = [](const std::string& name, bool ptr) {
+        std::string c = MangleTypeArg(name + (ptr ? "*" : ""));
+        return std::to_string(c.size()) + "_" + c;
+    };
+    std::string s = isThin ? "__thinfn" : "__fatfn";
+    s += "_" + std::to_string(params.size());
+    s += "_" + comp(ret, retPtr);
+    for (const auto& p : params) s += "_" + comp(p.first, p.second);
+    return s;
+}
+
+
 // Peel the reference-kind suffixes off a (possibly substituted) type-arg string, recording them
 // as flags: a trailing "[]" is a noalias array-view (which is also a pointer repr), a trailing "*"
 // is a plain pointer. They never combine ("T[]*" is rejected at the grammar/listener). Suffixes
@@ -597,15 +618,18 @@ private:
                         declType.TypeName = (fpSpec->Function() != nullptr) ? "__c_fn_ptr" : "__closure_fat_ptr";
                         if (fpSpec->typeSpecifier() != nullptr)
                         {
-                            declType.FuncPtrReturnTypeName = fpSpec->typeSpecifier()->getText();
-                            declType.FuncPtrReturnPointer = fpSpec->pointer() != nullptr;
+                            // Resolve generic signature types (gap b) to match the main pass.
+                            bool retPtr = fpSpec->pointer() != nullptr;
+                            declType.FuncPtrReturnTypeName = ResolveSigComponentScanner(fpSpec->typeSpecifier(), retPtr);
+                            declType.FuncPtrReturnPointer = retPtr;
                             if (fpSpec->functionPointerParamList() != nullptr)
                             {
                                 for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
                                 {
                                     LLVMBackend::TypeAndValue::FuncPtrParam p;
-                                    p.TypeName = param->typeSpecifier()->getText();
-                                    p.Pointer = param->pointer() != nullptr;
+                                    bool pPtr = param->pointer() != nullptr;
+                                    p.TypeName = ResolveSigComponentScanner(param->typeSpecifier(), pPtr);
+                                    p.Pointer = pPtr;
                                     p.IsMove = param->Move() != nullptr;
                                     declType.FuncPtrParams.push_back(p);
                                 }
@@ -638,7 +662,14 @@ private:
                         std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
                         std::vector<std::string> typeArgs;
                     for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-                        typeArgs.push_back(entry->getText());
+                    {
+                        // Closure type args (gap a) encode to a symbol-safe name; others keep the
+                        // pre-existing raw getText() spelling.
+                        if (entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
+                            typeArgs.push_back(ResolveForwardTypeArg(entry));
+                        else
+                            typeArgs.push_back(entry->getText());
+                    }
                     std::string mangledName = baseName;
                     for (const auto& arg : typeArgs) mangledName += "__" + MangleTypeArg(arg);
                     // Pre-declare opaque struct type and default constructor so that
@@ -1131,6 +1162,12 @@ public:
             for (auto* innerEntry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                 resolved += "__" + MangleTypeArg(ResolveForwardTypeArg(innerEntry));
         }
+        else if (typeSpec && typeSpec->functionPointerSpecifier())
+        {
+            // Closure type as a generic argument (gap a): encode to a symbol-safe name so the
+            // shell name (e.g. list____fatfn_1_3_int_3_int) matches the main pass.
+            resolved = EncodeClosureScanner(typeSpec->functionPointerSpecifier());
+        }
         else
         {
             resolved = typeSpec ? typeSpec->getText() : entry->getText();
@@ -1142,6 +1179,45 @@ public:
         else if (IsArrayViewArg(entry))
             resolved += "[]";
         return resolved;
+    }
+
+    // Scanner counterpart of ResolveSigComponentCodegen: resolve a closure signature type. The scan
+    // pass has no active substitutions, so a plain type stays getText(); a nested generic mangles to
+    // match MangledGenericName; a nested closure encodes recursively. Names only (no queue/register).
+    std::string ResolveSigComponentScanner(CFlatParser::TypeSpecifierContext* ts, bool& outPointer)
+    {
+        (void)outPointer;
+        if (ts == nullptr) return "void";
+        if (ts->functionPointerSpecifier() != nullptr)
+            return EncodeClosureScanner(ts->functionPointerSpecifier());
+        if (ts->genericIdentifier() != nullptr && ts->genericIdentifier()->genericTypeParameters() != nullptr)
+        {
+            std::string mangled = ts->genericIdentifier()->Identifier()->getText();
+            for (auto* entry : ts->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                mangled += "__" + MangleTypeArg(ResolveForwardTypeArg(entry));
+            return mangled;
+        }
+        return ts->getText();
+    }
+
+    // Scanner counterpart of EncodeClosureCodegen: builds the encoded name only (the main pass owns
+    // registration, so the copy-overload is not lost to RegisterEncodedClosureType's idempotency).
+    std::string EncodeClosureScanner(CFlatParser::FunctionPointerSpecifierContext* fpSpec)
+    {
+        bool isThin = fpSpec->Function() != nullptr;
+        if (fpSpec->typeSpecifier() == nullptr)
+            return isThin ? "__c_fn_ptr" : "__closure_fat_ptr";  // main pass reports the error
+        bool retPtr = fpSpec->pointer() != nullptr;
+        std::string retName = ResolveSigComponentScanner(fpSpec->typeSpecifier(), retPtr);
+        std::vector<std::pair<std::string, bool>> encParams;
+        if (fpSpec->functionPointerParamList() != nullptr)
+            for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
+            {
+                bool pPtr = param->pointer() != nullptr;
+                std::string pName = ResolveSigComponentScanner(param->typeSpecifier(), pPtr);
+                encParams.push_back({ pName, pPtr });
+            }
+        return BuildEncodedClosureName(isThin, retName, retPtr, encParams);
     }
 
     // Walk every typeSpecifier in the entire parse tree and pre-declare an opaque
@@ -1236,14 +1312,17 @@ public:
         tv.TypeName = (fpSpec->Function() != nullptr) ? "__c_fn_ptr" : "__closure_fat_ptr";
         if (fpSpec->typeSpecifier() != nullptr)
         {
-            tv.FuncPtrReturnTypeName = fpSpec->typeSpecifier()->getText();
-            tv.FuncPtrReturnPointer  = fpSpec->pointer() != nullptr;
+            // Resolve generic signature types (gap b) to match the main pass.
+            bool retPtr = fpSpec->pointer() != nullptr;
+            tv.FuncPtrReturnTypeName = ResolveSigComponentScanner(fpSpec->typeSpecifier(), retPtr);
+            tv.FuncPtrReturnPointer  = retPtr;
             if (fpSpec->functionPointerParamList() != nullptr)
                 for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
                 {
                     LLVMBackend::TypeAndValue::FuncPtrParam p;
-                    p.TypeName = param->typeSpecifier()->getText();
-                    p.Pointer  = param->pointer() != nullptr;
+                    bool pPtr = param->pointer() != nullptr;
+                    p.TypeName = ResolveSigComponentScanner(param->typeSpecifier(), pPtr);
+                    p.Pointer  = pPtr;
                     p.IsMove   = param->Move() != nullptr;
                     tv.FuncPtrParams.push_back(p);
                 }
@@ -1288,7 +1367,13 @@ public:
         {
             std::string mangledName = typeSpec->genericIdentifier()->Identifier()->getText();
             for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-                mangledName += "__" + MangleTypeArg(entry->getText());
+            {
+                // Closure type args (gap a) encode to a symbol-safe name; others keep raw getText().
+                if (entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
+                    mangledName += "__" + MangleTypeArg(ResolveForwardTypeArg(entry));
+                else
+                    mangledName += "__" + MangleTypeArg(entry->getText());
+            }
             compiler->CreateStructType(mangledName, {});
             LLVMBackend::TypeAndValue returnType{ .TypeName = mangledName };
             compiler->CreateFunctionDeclaration(mangledName, returnType, {});
@@ -1781,6 +1866,13 @@ private:
             // levels first, so inner types are registered before the outer.
             QueueGenericInstantiation(innerBase, innerArgs, resolved);
         }
+        else if (typeSpec && typeSpec->functionPointerSpecifier())
+        {
+            // Closure type as a generic argument (gap a): encode to a symbol-safe name and register
+            // the call descriptor + backing value type. The encoded name never carries a pointer/
+            // array-view suffix (a closure arg is a value), so return it directly.
+            return EncodeClosureCodegen(typeSpec->functionPointerSpecifier());
+        }
         else
         {
             // Simple type or type parameter: look up in activeTypeSubstitutions
@@ -1793,6 +1885,12 @@ private:
                 resolved = substIt->second;
                 PeelTypeArgSuffix(resolved, hasPointer, hasArrayView);
             }
+            // A function-type alias (using IntFn = Lambda<int(int)>) used as a generic arg resolves
+            // to the SAME encoded closure type as the direct spelling (canonicalization / gap a).
+            if (!hasPointer && !hasArrayView)
+                if (auto fit = Compiler(entry)->functionTypeAliases.find(resolved);
+                    fit != Compiler(entry)->functionTypeAliases.end())
+                    return EncodeClosureFromSig(Compiler(entry), fit->second);
         }
 
         // Array-view wins the suffix encoding ("[]"); pointer and array-view never combine here.
@@ -1834,6 +1932,84 @@ private:
                 c->CreateFunctionDeclaration(mangledName, rt, {});
             }
         }
+    }
+
+    // Resolve a type in a function-pointer signature position (return or param) the way an ordinary
+    // type position resolves: apply active substitutions, and if it names a generic instantiation
+    // (e.g. list<string>) mangle it + queue the instantiation. A nested closure encodes recursively.
+    // A trailing '*' from a substitution folds into outPointer. Non-generic scalar types stay
+    // byte-identical to the pre-existing raw-getText() behavior (no alias resolution added).
+    std::string ResolveSigComponentCodegen(CFlatParser::TypeSpecifierContext* ts, bool& outPointer)
+    {
+        if (ts == nullptr) return "void";
+        if (ts->functionPointerSpecifier() != nullptr)
+            return EncodeClosureCodegen(ts->functionPointerSpecifier());
+        if (ts->genericIdentifier() != nullptr && ts->genericIdentifier()->genericTypeParameters() != nullptr)
+        {
+            std::string baseName = ts->genericIdentifier()->Identifier()->getText();
+            std::vector<std::string> innerArgs;
+            for (auto* entry : ts->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                innerArgs.push_back(ResolveTypeArgEntry(entry));
+            std::string mangled = MangledGenericName(baseName, innerArgs);
+            QueueGenericInstantiation(baseName, innerArgs, mangled);
+            return mangled;
+        }
+        std::string name = ts->getText();
+        auto substIt = activeTypeSubstitutions.find(name);
+        if (substIt != activeTypeSubstitutions.end())
+        {
+            name = substIt->second;
+            while (!name.empty() && name.back() == '*') { name.pop_back(); outPointer = true; }
+        }
+        return name;
+    }
+
+    // Encode a closure type (Lambda<...>/function<...>) that appears as a generic argument or in a
+    // nested signature position into a symbol-safe name (BuildEncodedClosureName), resolving its
+    // signature component types, and register the call descriptor. Returns the encoded name.
+    std::string EncodeClosureCodegen(CFlatParser::FunctionPointerSpecifierContext* fpSpec)
+    {
+        bool isThin = fpSpec->Function() != nullptr;
+        if (fpSpec->typeSpecifier() == nullptr)
+        {
+            LogErrorContext(fpSpec, "bare 'function'/'Lambda' has no signature; write "
+                "'function<R(Args)>' or 'Lambda<R(Args)>' when used as a generic argument");
+            return isThin ? "__c_fn_ptr" : "__closure_fat_ptr";
+        }
+        LLVMBackend::TypeAndValue sig;
+        sig.IsFunctionPointer = true;
+        sig.TypeName = isThin ? "__c_fn_ptr" : "__closure_fat_ptr";
+        bool retPtr = fpSpec->pointer() != nullptr;
+        std::string retName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr);
+        sig.FuncPtrReturnTypeName = retName;
+        sig.FuncPtrReturnPointer  = retPtr;
+        std::vector<std::pair<std::string, bool>> encParams;
+        if (fpSpec->functionPointerParamList() != nullptr)
+            for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
+            {
+                bool pPtr = param->pointer() != nullptr;
+                std::string pName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr);
+                encParams.push_back({ pName, pPtr });
+                LLVMBackend::TypeAndValue::FuncPtrParam fp;
+                fp.TypeName = pName; fp.Pointer = pPtr; fp.IsMove = param->Move() != nullptr;
+                sig.FuncPtrParams.push_back(fp);
+            }
+        std::string encoded = BuildEncodedClosureName(isThin, retName, retPtr, encParams);
+        Compiler(fpSpec)->RegisterEncodedClosureType(encoded, sig);
+        return encoded;
+    }
+
+    // Encode + register a closure type from an already-resolved signature (used when a function-type
+    // alias `using IntFn = Lambda<int(int)>` appears as a generic arg, so it unifies with the direct
+    // spelling). Produces the same name BuildEncodedClosureName gives for the direct form.
+    std::string EncodeClosureFromSig(LLVMBackend* compiler, const LLVMBackend::TypeAndValue& sig)
+    {
+        std::vector<std::pair<std::string, bool>> params;
+        for (const auto& p : sig.FuncPtrParams) params.push_back({ p.TypeName, p.Pointer });
+        std::string encoded = BuildEncodedClosureName(sig.IsThinFnPtr(),
+            sig.FuncPtrReturnTypeName, sig.FuncPtrReturnPointer, params);
+        compiler->RegisterEncodedClosureType(encoded, sig);
+        return encoded;
     }
 
     LLVMBackend::DeclTypeAndValue ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs)
@@ -1936,44 +2112,21 @@ private:
                     declType.TypeName = (fpSpec->Function() != nullptr) ? "__c_fn_ptr" : "__closure_fat_ptr";
                     if (fpSpec->typeSpecifier() != nullptr)
                     {
-                        declType.FuncPtrReturnTypeName = fpSpec->typeSpecifier()->getText();
-                        // Apply active generic type substitutions (e.g. T -> int inside list<int>)
-                        {
-                            auto substIt = activeTypeSubstitutions.find(declType.FuncPtrReturnTypeName);
-                            if (substIt != activeTypeSubstitutions.end())
-                            {
-                                declType.FuncPtrReturnTypeName = substIt->second;
-                                while (!declType.FuncPtrReturnTypeName.empty() && declType.FuncPtrReturnTypeName.back() == '*')
-                                {
-                                    declType.FuncPtrReturnTypeName.pop_back();
-                                    declType.FuncPtrReturnPointer = true;
-                                }
-                            }
-                        }
-                        if (!declType.FuncPtrReturnPointer)
-                            declType.FuncPtrReturnPointer = fpSpec->pointer() != nullptr;
+                        // Resolve return/param types the same way ordinary type positions resolve:
+                        // substitution + generic mangling/queueing (gap b), so a generic inside the
+                        // signature (e.g. Lambda<list<string>()>) stores the mangled "list__string".
+                        bool retPtr = fpSpec->pointer() != nullptr;
+                        declType.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr);
+                        declType.FuncPtrReturnPointer  = retPtr;
                         if (fpSpec->functionPointerParamList() != nullptr)
                         {
                             for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
                             {
                                 LLVMBackend::TypeAndValue::FuncPtrParam p;
-                                p.TypeName = param->typeSpecifier()->getText();
-                                // Apply active generic type substitutions; strip trailing * into Pointer flag
-                                {
-                                    auto substIt = activeTypeSubstitutions.find(p.TypeName);
-                                    if (substIt != activeTypeSubstitutions.end())
-                                    {
-                                        p.TypeName = substIt->second;
-                                        while (!p.TypeName.empty() && p.TypeName.back() == '*')
-                                        {
-                                            p.TypeName.pop_back();
-                                            p.Pointer = true;
-                                        }
-                                    }
-                                }
-                                if (!p.Pointer)
-                                    p.Pointer = param->pointer() != nullptr;
-                                p.IsMove = param->Move() != nullptr;
+                                bool pPtr = param->pointer() != nullptr;
+                                p.TypeName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr);
+                                p.Pointer  = pPtr;
+                                p.IsMove   = param->Move() != nullptr;
                                 declType.FuncPtrParams.push_back(p);
                             }
                         }
@@ -2589,14 +2742,18 @@ public:
         tv.TypeName = (fpSpec->Function() != nullptr) ? "__c_fn_ptr" : "__closure_fat_ptr";
         if (fpSpec->typeSpecifier() != nullptr)
         {
-            tv.FuncPtrReturnTypeName = fpSpec->typeSpecifier()->getText();
-            tv.FuncPtrReturnPointer  = fpSpec->pointer() != nullptr;
+            // Resolve generic signature types (gap b) so `using Cb = Lambda<list<string>()>` stores
+            // the mangled "list__string" and queues the instantiation.
+            bool retPtr = fpSpec->pointer() != nullptr;
+            tv.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr);
+            tv.FuncPtrReturnPointer  = retPtr;
             if (fpSpec->functionPointerParamList() != nullptr)
                 for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
                 {
                     LLVMBackend::TypeAndValue::FuncPtrParam p;
-                    p.TypeName = param->typeSpecifier()->getText();
-                    p.Pointer  = param->pointer() != nullptr;
+                    bool pPtr = param->pointer() != nullptr;
+                    p.TypeName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr);
+                    p.Pointer  = pPtr;
                     p.IsMove   = param->Move() != nullptr;
                     tv.FuncPtrParams.push_back(p);
                 }
@@ -10472,6 +10629,22 @@ public:
                 elemIsPtr = castElemPtr;
             }
 
+            // Error: deleting the DIRECT result of a call whose callee returns 'alias' (a borrow the
+            // owner retains, e.g. list.get's `alias T get`). The owner still holds the pointer and
+            // frees it at its own dtor - deleting it here double-frees. A call result has null Storage
+            // (Primary holds the value); a named local has alloca Storage and is not flagged, so
+            // 'T* p = ...; delete p;' stays allowed. Covers the parenthesized/cast-laundered forms too.
+            if (namedVar.TypeAndValue.IsAlias && namedVar.Storage == nullptr)
+            {
+                std::string calleeName = DeleteOperandCalleeName(ue);
+                LogErrorContext(ctx, std::format(
+                    "cannot delete the alias (borrowed) result of '{}': the owner still holds it, so "
+                    "this delete would double-free when the owner frees it. Use an owning accessor "
+                    "such as take()/removeAt(), or let the owner free it.",
+                    calleeName.empty() ? "<call>" : calleeName));
+                return {};
+            }
+
             // Error: deleting a pointer whose ownership was boxed into an interface ('IFace x = ptr').
             // The boxing transferred ownership to the interface and nulled the source, so this
             // 'delete ptr' frees nothing; and because interface locals are not auto-destructed, the
@@ -13464,13 +13637,26 @@ public:
                         // [PFX-5] indirect call through a function<...> value (a loaded vtable slot,
                         // a callback field, or a thin/fat closure). No implicit receiver is prepended.
                         // Check if this is a function pointer variable - emit an indirect call.
-                        if (namedVar.TypeAndValue.IsFunctionPointer)
+                        // An encoded closure element (from list<Lambda<...>>.get / a field of a
+                        // substituted encoded type) is a struct value, not IsFunctionPointer; recover
+                        // its call descriptor from the registry (gap a).
+                        const LLVMBackend::TypeAndValue* encClosure =
+                            namedVar.TypeAndValue.IsFunctionPointer ? nullptr
+                            : Compiler(ctx)->GetEncodedClosureType(namedVar.TypeAndValue.TypeName);
+                        if (namedVar.TypeAndValue.IsFunctionPointer || encClosure != nullptr)
                         {
+                            LLVMBackend::TypeAndValue funcPtrTV =
+                                encClosure ? *encClosure : namedVar.TypeAndValue;
                             llvm::Value* funcPtr = nullptr;
                             if (namedVar.Storage != nullptr)
                                 funcPtr = Compiler(ctx)->CreateLoad(namedVar.Storage);
                             else if (namedVar.Primary != nullptr)
                                 funcPtr = namedVar.Primary;
+                            // A thin encoded closure is stored as a { i8* } POD wrapper; unwrap to the
+                            // bare fn ptr the thin CreateIndirectCall path expects.
+                            if (funcPtr != nullptr && encClosure != nullptr && funcPtrTV.IsThinFnPtr()
+                                && funcPtr->getType()->isStructTy())
+                                funcPtr = Compiler(ctx)->builder->CreateExtractValue(funcPtr, { 0u }, "thinfn");
 
                             if (funcPtr != nullptr)
                             {
@@ -13506,17 +13692,17 @@ public:
                                     }
                                 }
                                 // Bond/move ownership-mismatch checks against the funcptr's per-param flags.
-                                size_t pcount = std::min(argNVs.size(), namedVar.TypeAndValue.FuncPtrParams.size());
+                                size_t pcount = std::min(argNVs.size(), funcPtrTV.FuncPtrParams.size());
                                 for (size_t i = 0; i < pcount; i++)
                                 {
-                                    if (namedVar.TypeAndValue.FuncPtrParams[i].IsMove && argNVs[i].IsBonded)
+                                    if (funcPtrTV.FuncPtrParams[i].IsMove && argNVs[i].IsBonded)
                                         Compiler(ctx)->LogError("cannot pass bonded value to 'move' parameter of function pointer - bonded values cannot be transferred out of their source's scope");
                                 }
-                                auto result = Compiler(ctx)->CreateIndirectCall(namedVar.TypeAndValue, funcPtr, callArgs);
+                                auto result = Compiler(ctx)->CreateIndirectCall(funcPtrTV, funcPtr, callArgs);
                                 // Null caller storage and mark as moved for params declared 'move' on the funcptr type.
                                 for (size_t i = 0; i < pcount; i++)
                                 {
-                                    if (!namedVar.TypeAndValue.FuncPtrParams[i].IsMove) continue;
+                                    if (!funcPtrTV.FuncPtrParams[i].IsMove) continue;
                                     auto& argNV = argNVs[i];
                                     if (argNV.Storage != nullptr && argNV.TypeAndValue.Pointer)
                                     {
@@ -14008,6 +14194,13 @@ public:
                                                     lambdaLockThisReceiver = field;
                                             }
                                         }
+                                        // Encoded closure param (list<Lambda<...>>::add's `T value`, gap a):
+                                        // seed the lambda's expected signature from the registry so its body
+                                        // types its return/params correctly.
+                                        else if (const auto* enc = Compiler(ctx)->GetEncodedClosureType(paramTv.TypeName))
+                                        {
+                                            lambdaExpectedType = *enc;
+                                        }
                                     }
                                     auto argName = namedArgument->Identifier();
                                     auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
@@ -14373,6 +14566,27 @@ public:
             }
         }
         return singleRuleChild ? tryGetUnaryExpression(singleRuleChild) : nullptr;
+    }
+
+    // Extract the callee identifier from a delete operand that is a call, for diagnostics only.
+    // Takes the operand text up to its first '(' (the call's argument list) and returns the
+    // trailing identifier after the last '.'/'->' (e.g. "l.get" -> "get", "foo" -> "foo").
+    // Returns "" when no plausible identifier is found; detection does not depend on this.
+    std::string DeleteOperandCalleeName(CFlatParser::UnaryExpressionContext* ue)
+    {
+        if (ue == nullptr) return "";
+        std::string text = ue->getText();
+        size_t paren = text.find('(');
+        std::string head = paren == std::string::npos ? text : text.substr(0, paren);
+        size_t arrow = head.rfind("->");
+        size_t dot   = head.rfind('.');
+        size_t cut   = std::string::npos;
+        if (arrow != std::string::npos) cut = arrow + 2;
+        if (dot != std::string::npos && (cut == std::string::npos || dot + 1 > cut)) cut = dot + 1;
+        std::string name = cut == std::string::npos ? head : head.substr(cut);
+        for (char c : name)
+            if (!(std::isalnum((unsigned char)c) || c == '_')) return "";
+        return name;
     }
 
     // Drill down single-rule-child chains to find the first actual cast expression

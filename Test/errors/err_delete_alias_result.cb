@@ -1,0 +1,46 @@
+// Reject `delete <call>` when the callee returns an `alias` borrow: the owner
+// (here a list<T*>) still holds the pointer and frees it at its own destructor,
+// so deleting the borrowed result double-frees. list.get is `alias T get(int)`.
+// The correct APIs are take()/removeAt() (positive coverage lives in
+// Test/test_core.cb testListPtrOwnership). The check is narrow: only the DIRECT
+// call-result form is flagged - a named local is never rejected.
+
+import "list.cb";
+
+struct Box { int v = 0; };
+
+// delete of a plain alias-returning get() result on a pointer list.
+expect_error("cannot delete the alias (borrowed) result of 'get'") {
+    int useGetPlain() {
+        list<Box*> l;
+        l.add(new Box());
+        delete l.get(0);
+        return 0;
+    }
+}
+
+// Cast-laundered form: peeling the cast still reaches the alias call result.
+expect_error("cannot delete the alias (borrowed) result of 'get'") {
+    int useGetCast() {
+        list<Box*> l;
+        l.add(new Box());
+        delete (Box*)l.get(0);
+        return 0;
+    }
+}
+
+// The ui_test T1 crash shape: a class with a closure field, deleted via get()
+// in a loop. Same alias-borrow rejection regardless of the element field type.
+struct Widget { function<void()> onClick = nullptr; };
+
+expect_error("cannot delete the alias (borrowed) result of 'get'") {
+    int useGetClosureField() {
+        list<Widget*> l;
+        l.add(new Widget());
+        int i = 0;
+        while (i < l.count()) { delete l.get(i); i++; }
+        return 0;
+    }
+}
+
+extern int main() { return 0; }
