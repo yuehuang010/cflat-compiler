@@ -24,7 +24,6 @@
 // This file has no main(); an app imports it, defines a Component, and calls runAppWinui() (live)
 // or the launcher runs runWinuiHeadless() with a self-test body. See winui_demo.cb / winui_gallery.cb.
 
-import "ui.cb";
 import "ui_native.cb";
 import "winrt.cb";
 import "com.cb";

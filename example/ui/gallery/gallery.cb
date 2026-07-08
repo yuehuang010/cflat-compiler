@@ -12,7 +12,7 @@
 //   out\gallery.exe --selftest
 // Doc screenshots (light + dark BMP into out/):
 //   out\gallery.exe --shots out
-import "native_host.cb";
+import "ui_native_host.cb";
 import "gallery_app.cb";
 
 // ── Screenshot (PrintWindow -> BMP), one per theme, for the docs ──────────────

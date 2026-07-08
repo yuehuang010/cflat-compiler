@@ -8,7 +8,7 @@
 //
 // Precedent for a file-scope `if const` import shim: cflat/core/os.cb.
 if const (__MACOS__) {
-    import "cocoa_native_host.cb";
+    import "ui_native_cocoa.cb";
 } else {
-    import "win32_native_host.cb";
+    import "ui_native_win32.cb";
 }

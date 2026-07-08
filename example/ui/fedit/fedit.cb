@@ -17,7 +17,7 @@
 // Headless state-assert self-test (example.bat gate; drives via SendMessage + direct
 // load/save, since OS file dialogs cannot run unattended):
 //   out\fedit.exe --selftest
-import "native_host.cb";
+import "ui_native_host.cb";
 import "filesystem.cb";
 import "thread.cb";
 

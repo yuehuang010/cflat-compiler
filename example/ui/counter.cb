@@ -5,7 +5,7 @@
 // press handler twice. The handler captures `this` and mutates component
 // state, so re-rendering reflects the new count. Both trees are torn down.
 
-import "ui.cb";
+import "ui_native.cb";
 
 class Counter : Component
 {

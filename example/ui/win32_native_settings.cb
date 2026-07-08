@@ -13,7 +13,7 @@
 // Headless state-assert self-test (no visible window; example.bat gate):
 //   x64/Release/cflat.exe example/ui/win32_native_settings.cb --heap-audit -o out/nsettings.exe
 //   out\nsettings.exe --selftest
-import "win32_native_host.cb";
+import "ui_native_win32.cb";
 
 class NativeSettings : Component
 {

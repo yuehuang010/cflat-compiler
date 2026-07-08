@@ -9,7 +9,7 @@
 // is resolved from whichever host its LAUNCHER also imports - a cflat compilation shares one
 // global scope across the whole import closure of the root, so a sibling import supplies them.
 // It has no main(): a launcher provides that. Excluded from example.bat's plain build sweep.
-import "ui.cb";
+import "ui_native.cb";
 
 const int GALLERY_ROWS = 100000;
 

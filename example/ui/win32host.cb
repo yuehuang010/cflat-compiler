@@ -12,7 +12,7 @@
 //
 // This file has no main(); it is imported by an app file that calls runAppGui().
 import "windows.h" lib { "user32.lib", "gdi32.lib" } cache;
-import "ui.cb";
+import "ui_native.cb";
 
 // Layout is in CHARACTER CELLS; GdiCanvas maps a cell to this many pixels. Hit
 // testing divides mouse pixels by the same constants, so clicks land on the cell

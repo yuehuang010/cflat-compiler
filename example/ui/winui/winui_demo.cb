@@ -11,7 +11,7 @@
 //   cflat winui_demo.cb -i . -o winui_demo.exe
 // Headless self-test:  winui_demo.exe --selftest
 
-import "winui_host.cb";
+import "ui_native_winui.cb";
 
 class WinuiDemo : Component
 {

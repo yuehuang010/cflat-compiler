@@ -1,63 +1,33 @@
-# UI Framework (v1.0-rc)
+# ui_native - native UI framework
 
-A small React-Native-style declarative UI library for CFlat, living in
-`example/ui/ui.cb`. It builds an `Element` tree, diffs renders with a keyed
-reconciler, routes input through one `dispatch(Event)` seam, lays out in a single
-constraints-in/size-out pass, and paints through a surface-agnostic `Canvas` (TUI /
-Win32 GDI) or drives real OS controls through the `NativeHost` seam (Win32, macOS
-AppKit, WinUI 3).
+`ui_native` is a small React-Native-style declarative UI library for CFlat,
+shipped as a core module (`core/ui_native.cb`). It builds an `Element` tree, diffs
+renders with a keyed reconciler, routes input through one `dispatch(Event)` seam,
+lays out in a single constraints-in/size-out pass, and paints through a
+surface-agnostic `Canvas` (TUI / Win32 GDI) or drives real OS controls through the
+`NativeHost` seam (Win32, macOS AppKit, WinUI 3).
 
-This document is the v1.0-rc FROZEN CONTRACT: the surface below is the release-
-candidate API. The "sugar-compatible element contract" is what the `<View/>` grammar
-sugar (and the pending `core/` promotion) desugars against. Changes to the frozen
-surface are deliberate and bump the API version. v1.0-rc is the P13 API-freeze pass;
-P14 promotes the files into `core/` and stamps v1.0 (a version bump, not an edit).
+The framework ships with the compiler and is versioned with it - there is no
+independent framework version number. The "sugar-compatible element contract" below
+is what the `<View/>` grammar sugar desugars against; changes to that surface are
+deliberate. The element/seam surface was frozen in the pre-promotion hardening pass
+(native accessibility Names, the keyboard/focus contract, and the gallery theme-flip
++ reconcile stress-soak self-tests) and then promoted into `core/` unchanged.
 
-- **Framework API version:** 17 (v5 added color to `Style` + `Canvas`; v6 added the
-  `Theme` styling preference and hover/pressed/focus interaction states; v7 added the
-  `Checkbox` widget, the `disabled` state, and `Style.gap`; v8 added the `ProgressBar`
-  and `Slider` widgets with the `track`/`accent` theme slots; v9 added the `NativeHost`
-  seam - real OS controls as an alternative output stage to `Canvas` - plus `Patch.key`
-  identity, the `UiContext.nativeByKey` shadow map, and the DIP layout unit; v10 added
-  the `TextArea` multiline element and the Win32 native host's editor features -
-  per-monitor DPI, dark titlebar + themed controls, a declarative menu bar with
-  accelerators, shell file dialogs, message boxes, and a secondary window; v11 added
-  the macOS **AppKit (Cocoa)** `NativeHost` backend and the `native_host.cb` platform
-  shim, so one app source compiles to real OS controls on both Windows and macOS;
-  v12 added the app-shell foundation - real multi-window (a `Window` class + one
-  message loop, `activeCtx()`/`activeApp()`/`openAppWindow`), `ctx.post()` thread
-  marshaling, the `StatusBar` element, and a `tooltip` prop on every mappable element;
-  v13 added the tier-1 data controls - `RadioGroup`/`RadioButton`, `ComboBox`, and a
-  virtualized `ListView` - plus the `setListOp` item-data seam call; v14 added the tier-2
-  navigation chrome - a `TabControl`/`TabPane` (keyed panes, lazy inactive tabs), a
-  `TreeView` (expand-on-demand node source), a `SplitView` (two weighted panes + a
-  draggable divider), a per-element `ContextMenu`, and a `toolbar()` pattern - reusing the
-  `setListOp` seam for the tab/tree ops; v15 completed the element set - an `Image` (BGRA32
-  pixels pushed through the new `setImageData` seam), a titled `GroupBox`, and a `CanvasView`
-  escape hatch the app paints with the `Canvas` API - plus NM_CUSTOMDRAW accent buttons and the
-  widget-gallery screenshot workflow); v16 added the host-neutral test-driver surface
-  (see "Host-neutral test drivers" below) so an app self-test drives real controls
-  through key-path helpers with no toolkit-typed calls - the gallery self-test now runs
-  against any host - and filled in the macOS (Cocoa) backends for the P7-P10 controls
-  (real `NSPopUpButton`/`NSTableView`/`NSOutlineView`/`NSSegmentedControl`/`NSImageView`/
-  titled `NSBox`/`CfCanvasView`, `bezelColor` accents, `ctx.post` via
-  `performSelectorOnMainThread`, and per-element `NSMenu` context menus); v17 added the
-  **WinUI 3 (Windows App SDK)** `NativeHost` backend (`example/ui/winui/winui_host.cb`) for the
-  full element set - `TextBox`, `Slider`/`ProgressBar` via `IRangeBase`, `RadioButton`, `ComboBox`,
-  `ListView`, `TabView`, `TreeView`, `Image` via `WriteableBitmap`, headered `GroupBox`, `StatusBar`,
-  a `CanvasView` placeholder - implementing the same `setListOp` seam (its third host validation) +
-  every `native*` test driver + `ctx.post` through the `DispatcherQueue`, so the widget-gallery
-  self-test now runs green on Win32, Cocoa (compile-checked), AND WinUI 3. See the parity matrix below.
-  **v18 (v1.0-rc, P13 hardening)** froze the surface for release: a minimal native-accessibility
-  pass (control window text is the MSAA/UIA Name; a textless control's `tooltip` is mirrored into
-  its Name), the keyboard/focus contract (WS_TABSTOP flat parenting + `IsDialogMessageA`; the full
-  element set is in the Tab ring), and two new gallery self-test asserts - a light/dark theme-flip
-  storm and a seeded reconcile stress-soak - plus a Win32 hardening self-test (focus traversal,
-  live-resize relayout, a11y Name readback). No element or seam surface changed in v18
-- **Location:** `example/ui/` (framework + TUI, Win32, and Cocoa hosts). NOT in `core/`
-  yet - promotion is deferred to a later release.
-- **Status:** the framework is a single source of truth (`example/ui/ui.cb`);
-  every host (TUI and the Win32 `win32host.cb`) imports it directly.
+- **Location:** `core/` - the framework and every host deploy next to the compiler,
+  so apps import them with no `-i`:
+  - `core/ui_native.cb` - the framework + the `NativeHost` seam (the one module apps import
+    for the Canvas hosts; the Element tree, reconciler, `Theme`, `Canvas`, and the seam
+    interface + `PROP_*`/`FONT_*`/`LISTOP_*` consts all live here).
+  - `core/ui_native_host.cb` - the `if const` platform shim: selects the Win32 host on
+    Windows, the Cocoa host on macOS. Apps that want real OS controls import this.
+  - `core/ui_native_win32.cb` - the Win32/GDI `NativeHost` backend.
+  - `core/ui_native_cocoa.cb` - the macOS AppKit (Cocoa) `NativeHost` backend (imports
+    `core/cocoa.cb`, the objc bridge); compile-verified only (see the parity matrix).
+  - `core/ui_native_winui.cb` - the WinUI 3 (Windows App SDK) `NativeHost` backend.
+- **Status:** the framework is a single source of truth (`core/ui_native.cb`); every
+  host imports it directly. See the parity matrix below for per-host coverage and the
+  documented WinUI 3 / Cocoa gaps.
 
 ## Constraints (read first)
 
@@ -642,10 +612,10 @@ stage: instead of painting, it drives real OS controls (HWND on Windows; AppKit
 `NSView`/`NSControl` on macOS) so the OS handles rendering, text input, IME, and
 accessibility. The app-facing model (Element tree, Component, controlled widgets,
 Theme, keyed identity) is unchanged - only the output stage differs. The contract
-lives in `example/ui/ui_native.cb`; the implementations are `win32_native_host.cb`
-(Win32/GDI) and `cocoa_native_host.cb` (AppKit).
+lives in `core/ui_native.cb`; the implementations are `core/ui_native_win32.cb`
+(Win32/GDI) and `core/ui_native_cocoa.cb` (AppKit).
 
-**Platform shim.** An app imports `example/ui/native_host.cb` - a file-scope
+**Platform shim.** An app imports `core/ui_native_host.cb` - a file-scope
 `if const (__MACOS__)` shim that pulls in the Cocoa host on macOS and the Win32
 host elsewhere. Both backends expose the identical public surface
 (`runAppGuiNative`, `buildNativeTree`, the `menu*`/`native*` helpers, the driver
@@ -689,7 +659,7 @@ the native->`Event` translation.
 
 ### Win32 native host: editor features (v10)
 
-`example/ui/win32_native_host.cb` implements `NativeHost` as a `Window` class (one
+`core/ui_native_win32.cb` implements `NativeHost` as a `Window` class (one
 per top-level window) and adds the pieces a real desktop app needs. All are
 documented-API only (no uxtheme ordinals). An app imports this host and calls
 `runAppGuiNative(new App(), title)`.
@@ -727,9 +697,9 @@ documented-API only (no uxtheme ordinals). An app imports this host and calls
   closes). Read a status pane with `nativeStatusText(keyPath)`.
 - **Flagship demo:** `example/ui/fedit/fedit.cb` - a small native text editor built
   entirely on the above (open/edit/save, find, dirty-close prompt, light/dark, two
-  windows). It imports the `native_host.cb` shim, so the same source builds and runs
-  on Windows (Win32) and macOS (Cocoa). Build:
-  `cflat example/ui/fedit/fedit.cb -i example/ui -o out/fedit` (`.exe` on Windows).
+  windows). It imports the `ui_native_host.cb` shim, so the same source builds and runs
+  on Windows (Win32) and macOS (Cocoa). The hosts are core, so no `-i` is needed. Build:
+  `cflat example/ui/fedit/fedit.cb -o out/fedit` (`.exe` on Windows).
 
 ## Host-neutral test drivers (v16, WinUI added v17)
 
@@ -738,8 +708,8 @@ implements under the SAME name, so a self-test contains no toolkit-typed calls (
 `SendMessage`, no `objc_msgSend`, no WinRT vtable calls) and runs against any host. The gallery
 self-test lives in the host-neutral `example/ui/gallery/gallery_app.cb` (the `GalleryApp`
 Component + the 25-assert self-test); its Win32/Cocoa launcher is `example/ui/gallery/gallery.cb`
-(imports the `native_host.cb` shim) and its WinUI 3 launcher is `example/ui/winui/winui_gallery.cb`
-(imports `winui_host.cb`). All three build the SAME `gallery_app.cb` - a cflat compilation shares
+(imports the `ui_native_host.cb` shim) and its WinUI 3 launcher is `example/ui/winui/winui_gallery.cb`
+(imports `ui_native_winui.cb`). All three build the SAME `gallery_app.cb` - a cflat compilation shares
 one global scope across its whole import closure, so a sibling host import supplies the drivers.
 Each helper routes through the same element-model handler the OS would fire on real input, then
 re-renders; readbacks query native control state (or, for the data controls, the host-side box/
@@ -777,10 +747,10 @@ model source the `setListOp` seam feeds).
   AND leaks (built with `--heap-audit`).
 - **Win32** (`example/ui/win32host.cb` + `example/ui/win32_boxes.cb`): a native
   GDI host reusing the framework unchanged behind the `Canvas` seam.
-- **Native OS controls** (`example/ui/native_host.cb` shim -> `win32_native_host.cb`
-  / `cocoa_native_host.cb`): the `NativeHost` seam instead of `Canvas` - real HWND
+- **Native OS controls** (`core/ui_native_host.cb` shim -> `core/ui_native_win32.cb`
+  / `core/ui_native_cocoa.cb`): the `NativeHost` seam instead of `Canvas` - real HWND
   (Win32) or AppKit controls (macOS). See the `NativeHost` section above.
-- **WinUI 3 (Windows App SDK)** (`example/ui/winui/winui_host.cb`): the same `NativeHost` seam
+- **WinUI 3 (Windows App SDK)** (`core/ui_native_winui.cb`): the same `NativeHost` seam
   driving real XAML controls rooted in a `Canvas`, brought up unpackaged via
   `MddBootstrapInitialize2` + `Application.Start`. An app runs on it with `runAppWinui(new App())`;
   the gallery launcher is `example/ui/winui/winui_gallery.cb`. Its self-tests run WITHOUT
@@ -833,7 +803,7 @@ Deliberate WinUI 3 gaps in this release, all documented and non-silent:
 - **Multi-window** is single-window (mirrors the Cocoa decision); the gallery gate needs one window.
 - **tooltip** prop is not wired to `ToolTipService` yet (no self-test covers it on WinUI).
 
-## Accessibility (v1.0-rc)
+## Accessibility
 
 Native controls give native accessibility for free - a headline anti-Electron property. The
 framework does no custom drawing for the standard controls, so each control's OS accessibility
@@ -851,13 +821,13 @@ one, and its **Name** comes from the control's text:
   from a preceding `Text` label or an assistive `tooltip` (announced as a tip), never from window
   text.
 
-This is a minimal, name-level pass (v1.0-rc), not a full custom UIA tree; the standing gallery
+This is a minimal, name-level pass, not a full custom UIA tree; the standing gallery
 self-test reads a textless control's Name back via `nativeAccessibleName(keyPath)`. macOS controls
 carry native `NSAccessibility` from their string values + `setToolTip:`; WinUI controls carry the
 XAML automation Name from their text (`AutomationProperties.Name` from tooltip is deferred with the
 tooltip wiring).
 
-## Keyboard and focus (v1.0-rc)
+## Keyboard and focus
 
 - **Tab order.** Every mapped Win32 control is created `WS_TABSTOP` and parented directly to the
   top-level window (containers `GroupBox`/`SplitView`/`RadioGroup` are LAYOUT containers, not nested
@@ -874,9 +844,9 @@ tooltip wiring).
   (`nativeFocusFirstH`/`nativeFocusNextH`), asserts it closes over >= 8 distinct controls, and reads
   the focused key back - a real programmatic focus-traversal check, not "verified by hand".
 
-## Event- and prop-naming convention (v1.0-rc)
+## Event- and prop-naming convention
 
-Handlers follow one principled convention (React-Native-derived), frozen for v1.0-rc:
+Handlers follow one principled convention (React-Native-derived), frozen for release:
 
 | Handler | On which nodes | Fires when |
 |---------|----------------|------------|
@@ -907,7 +877,7 @@ purely cosmetic gain).
 | `TextArea` | UNCONTROLLED-with-sync | native buffer is the source of truth; `value` is a push, `onChange` a dirty notify (documented large-buffer exception) |
 | `ProgressBar` | presentational | no input; `value` is display-only |
 
-## Hardening self-tests (v1.0-rc)
+## Hardening self-tests
 
 The gallery self-test (`gallerySelfTest`, host-neutral in `gallery_app.cb`) adds two P13 asserts on
 top of the 25 element asserts, so it is 27/27 on Win32 and WinUI 3 (leak-clean under `--heap-audit`

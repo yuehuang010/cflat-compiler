@@ -1,6 +1,7 @@
 # Plan: Native UI Framework (Electron-competitor, native OS controls)
 
-Status: P0-P13 DONE (Win32 + macOS AppKit + WinUI 3; fedit authored in
+Status: P0-P14 DONE - framework PROMOTED TO core/ as `ui_native` (2026-07-07).
+(Win32 + macOS AppKit + WinUI 3; fedit authored in
 JSX sugar; app-shell foundation - multi-window, ctx.post, StatusBar, tooltip; P8
 data controls tier 1 - RadioGroup/ComboBox/virtualized ListView + the setListOp seam;
 P9 tier-2 navigation chrome - TabControl/TreeView/SplitView/ContextMenu/toolbar + fedit v2;
@@ -14,7 +15,7 @@ host-neutral gallery_app.cb, so the 25-assert gallery self-test runs GREEN on Wi
 - the setListOp seam's third host validation, retiring the last pre-freeze design risk);
 P13 (hardening + API-freeze prep) - the compiler-workaround removal sweep, keyboard/focus
 + minimal a11y audit, relayout/theming hardening, a seeded reconcile stress-soak, and the
-doc/UI.md v1.0-rc freeze. P14 core/ promotion is all that remains. Replanned 2026-07-07
+doc/UI.md v1.0-rc freeze. P14 core/ promotion (as `ui_native`) is DONE. Replanned 2026-07-07
 (the old single P11 parity sweep split in two, promotion pushed from P12 to P14).
 CAVEAT (carried from P11, still open going into P14): macOS is COMPILE-CHECKED ONLY
 (`--check --platform macos`); no arm64 box was available, so mac RUNTIME verification of
@@ -843,6 +844,63 @@ move - so P14 promotion is mechanical, not a stabilization effort.
   example/ui/, doc/UI.md reviewed and versioned v1.0-rc.
 
 ### P14 - promotion to core/ (the "complete framework" stamp)
+
+DONE 2026-07-07. The framework + all hosts were promoted into `core/` under the
+USER-CHOSEN name **`ui_native`** (not the plan's recommended `weave`), and every
+consumer + doc + test harness rewired to the new names. NO compiler changes; NO
+element/seam changes. What landed:
+
+- **Seam-merge decision.** The chosen name `ui_native` collided with the old seam
+  filename `example/ui/ui_native.cb`, so the framework file (`ui.cb`) and the seam
+  file (the old `ui_native.cb`, which did `import "ui.cb";`) were MERGED into a single
+  `core/ui_native.cb` (framework body + the seam's consts/`NativeHost` interface
+  appended, its `import "ui.cb";` dropped). This is the one module apps import for the
+  Canvas hosts.
+- **File layout in `core/`:** `ui_native.cb` (merged framework + seam),
+  `ui_native_host.cb` (<- `native_host.cb`, the `if const` platform shim, imports
+  rewritten to `ui_native_cocoa.cb`/`ui_native_win32.cb`), `ui_native_win32.cb` (<-
+  `win32_native_host.cb`), `ui_native_cocoa.cb` (<- `cocoa_native_host.cb`),
+  `ui_native_winui.cb` (<- `winui/winui_host.cb`, its `ui.cb`+`ui_native.cb` imports
+  collapsed to the single merged `ui_native.cb`), and `cocoa.cb` (<- `example/macos/
+  cocoa.cb`, the objc bridge the Cocoa host depends on).
+- **Consumers stayed in `example/`** with imports rewired: the Canvas demos + gallery
+  component (`import "ui.cb"` -> `"ui_native.cb"`), the settings probes (`win32_native_host`
+  -> `ui_native_win32`, `cocoa_native_host` -> `ui_native_cocoa`), fedit + gallery
+  (`native_host` -> `ui_native_host`), and the winui launchers (`winui_host` ->
+  `ui_native_winui`). Core imports now resolve with NO `-i` (verified:
+  `cflat example/ui/fedit/fedit.cb -o out/fedit.exe`).
+- **Build system.** CMake globs `cflat/core/*` (CONFIGURE_DEPENDS) and deploys the tree
+  next to the exe, so the new files are picked up automatically - no build-file edit.
+  (The legacy `cflat.vcxproj` no longer exists; the build is CMake-only. Updated the
+  stale "add to cflat.vcxproj" note in internal/stdlib-reference.md.)
+- **Test harness rewires.** example.bat EXCLUDE trimmed (7 moved-out basenames removed);
+  lsp_bulk_test.py skips `ui_native_winui.cb` (unresolvable App SDK winmds in the bare
+  sweep, like the winui/ launchers) and lists `ui_native_win32.cb` as Windows-only
+  (imports windows.h). The other new core hosts (`ui_native.cb`/`_host`/`_cocoa`)
+  analyze clean on Windows and are swept.
+- **Docs.** doc/UI.md retitled to `ui_native`, all import/path examples updated to the
+  core names, and the standalone `v1.0-rc`/`API v18` version scheme REMOVED (replaced
+  with a note that the framework ships with + is versioned by the compiler - user
+  decision, cflat is unpublished). Parity matrix + WinUI/Cocoa gaps kept.
+  internal/stdlib-reference.md gained a UI section.
+- **NO Test/test_ui.cb** (user decision) - example.bat stays the gate.
+
+CAVEAT carried forward unchanged: **macOS is COMPILE-VERIFIED ONLY**
+(`--check --platform macos` green for fedit/gallery/cocoa_native_settings); no arm64
+box was available, so mac RUNTIME verification of the gallery/fedit self-tests is
+still DEFERRED. This is the one P11 debt promotion did not close.
+
+Gates (all green on Windows):
+- `cmake_build.bat release` clean; `cflat.exe --init` exit 0 (core bitcode cache rebuilt).
+- test.bat Release: all tests passed.
+- test_lsp.bat: 197 passed, 0 failed (the new `ui_native*.cb` core files analyze clean).
+- example.bat Release: 86 passed, 0 failed, 21 skipped (skip fell from 28: 7 files left
+  example/ for core/). gallery 27/27, fedit 14/14, win32_native_settings 8/8 - all
+  leak-clean under --heap-audit; winui demos pass.
+- Cocoa + WinUI `--check` green for fedit/gallery/cocoa_native_settings (`--platform
+  macos`) and winui_demo/winui_gallery.
+
+Original spec (for reference):
 
 Now mechanical: the name, the API surface, and three-host stability were
 all settled in P11-P13.

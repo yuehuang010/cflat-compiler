@@ -8,7 +8,7 @@
 //
 // Run:  x64/Release/cflat.exe example/ui/counter_jsx.cb --run
 
-import "ui.cb";
+import "ui_native.cb";
 
 class CounterJsx : Component
 {

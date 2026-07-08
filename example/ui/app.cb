@@ -7,7 +7,7 @@
 // This file shows: building children from data, per-child closures capturing
 // their own `this`, state persisting via pointer, and a minimal reconcile.
 
-import "ui.cb";
+import "ui_native.cb";
 
 class Counter : Component
 {

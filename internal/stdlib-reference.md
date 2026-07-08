@@ -111,6 +111,17 @@ Method-level API discovery is via the LSP (hover / completion / `--symbol`); thi
 |------|---------|
 | `graphic/bitmap.cb` | `Bitmap` - load/create/save Windows BMP files; `BitmapPixel` struct |
 
+### UI (native controls; see `doc/UI.md`)
+
+| File | Exports |
+|------|---------|
+| `ui_native.cb` | The `ui_native` framework: `Element` tree, keyed reconciler, `Component`, `Theme`, `<View/>` sugar, `Canvas`, and the `NativeHost` seam (interface + `PROP_*`/`FONT_*`/`LISTOP_*` consts). The one module apps import |
+| `ui_native_host.cb` | `if const` platform shim: selects the Win32 host on Windows, the Cocoa host on macOS. Apps import this for real OS controls |
+| `ui_native_win32.cb` | Win32/GDI `NativeHost` backend (common controls, DPI, dark titlebar, menus, dialogs). Imports `windows.h` - Windows-only |
+| `ui_native_cocoa.cb` | macOS AppKit (Cocoa) `NativeHost` backend. Imports `cocoa.cb`; compile-verified via `--check --platform macos` |
+| `ui_native_winui.cb` | WinUI 3 (Windows App SDK) `NativeHost` backend. Imports the App SDK runtime winmds via `package-nuget` |
+| `cocoa.cb` | Minimal Objective-C / AppKit bridge (dlopen/objc_msgSend, typed `msg*` casts). Dependency of the Cocoa host; macOS-only |
+
 ### HPC (see `doc/HPC.md`)
 
 | File | Exports |
@@ -132,4 +143,4 @@ Method-level API discovery is via the LSP (hover / completion / `--symbol`); thi
 | `diagnostic/heap_audit.cb` | Opt-in heap leak detector (front end). See `doc/CLI.md` `--heap-audit` |
 | `diagnostic/thread_fuzz.cb` | Seeded randomized thread-scheduling fuzzer |
 
-To add a new core library: add the `.cb` file to `core/` and add an entry in `cflat.vcxproj` with `DeploymentContent`.
+To add a new core library: add the `.cb` file to `cflat/core/`. The CMake build globs `cflat/core/*` (CONFIGURE_DEPENDS) and deploys the tree next to the exe, so no build-file edit is needed.

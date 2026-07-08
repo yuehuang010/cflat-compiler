@@ -136,10 +136,10 @@ _WIN_ONLY_FILES = {
     # example/shell: os.windows.* console / _WIN32_FIND_DATAA.
     "dir.cb", "fsh.cb", "stars.cb",
     # example/ui: the win32_* backends and the os.windows.* framework demos.
-    "boxes.cb", "host.cb", "win32_boxes.cb", "win32_native_host.cb",
+    "boxes.cb", "host.cb", "win32_boxes.cb",
     "win32_native_settings.cb", "win32_settings.cb", "win32_shot.cb", "win32host.cb",
-    # core: WinRT projection library (Windows-only).
-    "winrt.cb",
+    # core: WinRT projection library + the Win32 UI host (both import windows.h).
+    "winrt.cb", "ui_native_win32.cb",
 }
 
 
@@ -167,6 +167,11 @@ def collect_files(include_win32_demo: bool) -> list[Path]:
     # --worker-winui gate with the right flags. Skip them here (like the Win32-metadata demo).
     winui_dir = (REPO_ROOT / "example" / "ui" / "winui").resolve()
     files = [f for f in files if winui_dir not in f.resolve().parents]
+    # core/ui_native_winui.cb is the WinUI 3 host: it imports the Windows App SDK runtime
+    # winmds (Microsoft.UI.Xaml.winmd) via package-nuget, which the bare sweep cannot resolve
+    # (no -i dir, no App SDK). It is exercised by example.bat's --worker-winui gate with the
+    # right flags; skip it here like the example/ui/winui/* launchers above.
+    files = [f for f in files if f.name != "ui_native_winui.cb"]
     # gallery_app.cb is the host-neutral gallery component: it imports only ui.cb by
     # design and resolves the native* host drivers from whichever LAUNCHER imports it
     # (gallery.cb or winui_gallery.cb share one global scope with it). Standalone

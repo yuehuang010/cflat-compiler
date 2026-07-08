@@ -265,13 +265,14 @@ REM explicit -i to that package. We discover it below and compile the demo when 
 REM on a host without the package it is skipped.
 REM example/macos/* target Darwin (dlopen of AppKit, sysctl, libproc) and are
 REM excluded from this Windows run; compile them on a Mac instead.
-REM winui_host has no main (imported); the three winui demos (winui_app_demo, winui_demo,
-REM winui_gallery) need the Windows App SDK bootstrapper + runtime winmds and are launched via
-REM the dedicated --worker-winui below. gallery_app is the host-neutral gallery Component + self-
-REM test (no main; imported by gallery.cb and winui_gallery.cb), so it is excluded like gallery.
-REM native_host is the NativeHost import shim (no main); cocoa_native_host/cocoa_native_settings/
-REM cocoa_probe are its AppKit (Darwin) backend + probes, excluded from this Windows run.
-set EXCLUDE=test_helper ui ui_native win32host win32_native_host native_host fedit gallery gallery_app http_parser http_response http_json http_server http_client router rest_server http_io cocoa cocoa_probe cocoa_native_host cocoa_native_settings hello_objc cocoa_window sysinfo_mac winui_host winui_app_demo winui_demo winui_gallery
+REM The UI framework + hosts now live in core/ (ui_native.cb, ui_native_host.cb,
+REM ui_native_win32.cb, ui_native_cocoa.cb, ui_native_winui.cb, cocoa.cb) and deploy next to
+REM the exe, so example UI demos import them with no -i. The three winui demos (winui_app_demo,
+REM winui_demo, winui_gallery) need the Windows App SDK bootstrapper + runtime winmds and are
+REM launched via the dedicated --worker-winui below. gallery_app is the host-neutral gallery
+REM Component + self-test (no main; imported by gallery.cb and winui_gallery.cb), so it is
+REM excluded like gallery. cocoa_native_settings is the Darwin backend probe, excluded here.
+set EXCLUDE=test_helper win32host fedit gallery gallery_app http_parser http_response http_json http_server http_client router rest_server http_io cocoa_probe cocoa_native_settings hello_objc cocoa_window sysinfo_mac winui_app_demo winui_demo winui_gallery
 
 REM Discover the newest cached Win32-metadata package dir (the one holding Windows.Win32.winmd).
 REM dir /o-n lists newest-version-first by name. Empty if the nuget package is not installed

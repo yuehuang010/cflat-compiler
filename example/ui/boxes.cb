@@ -12,7 +12,7 @@
 //
 // BoxApp keeps termW/termH (the host pokes these in on resize) and a click count.
 
-import "ui.cb";
+import "ui_native.cb";
 import "terminal.cb";
 
 class BoxApp : Component
