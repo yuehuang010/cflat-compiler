@@ -2,7 +2,7 @@
   "name": "cflat-language",
   "displayName": "cflat Language Support",
   "description": "Syntax highlighting, diagnostics, and completions for cflat C dialect",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "cflat",
   "engines": {
     "vscode": "^1.85.0"
