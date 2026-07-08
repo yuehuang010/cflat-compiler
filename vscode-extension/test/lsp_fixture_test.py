@@ -19,6 +19,8 @@ Usage:
 
 Exit code: 0 = all passed, 1 = one or more failures.
 """
+# Defer annotation evaluation so PEP 604 unions (str | None) run on Python 3.9.
+from __future__ import annotations
 
 import os
 import re

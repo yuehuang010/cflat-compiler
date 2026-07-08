@@ -1,4 +1,4 @@
-// DEPRECATED: replaced by cflat.exe lsp (stdio transport in extension.ts).
+// DEPRECATED: replaced by cflat lsp (stdio transport in extension.ts).
 // Remove once the native LSP server is stable.
 import {
     createConnection,
@@ -217,7 +217,7 @@ function runCompiler(exePath: string, inputFile: string, lineCount: number) {
         proc.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
 
         proc.on('error', err => {
-            connection.console.error(`Failed to start cflat.exe: ${err.message}`);
+            connection.console.error(`Failed to start cflat: ${err.message}`);
             resolve([]);
         });
 

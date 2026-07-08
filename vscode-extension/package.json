@@ -138,12 +138,12 @@
         "cflat.executablePath": {
           "type": "string",
           "default": "",
-          "description": "Path to cflat.exe. Leave empty to auto-detect the path recorded by 'cflat.exe --init' in ~/.cflat/compiler_path.txt. Set this to override auto-detection. Changes take effect immediately (no reload required)."
+          "description": "Path to the cflat compiler executable (cflat.exe on Windows, cflat on macOS/Linux). Leave empty to auto-detect the path recorded by 'cflat --init' in ~/.cflat/compiler_path.txt. Set this to override auto-detection. Changes take effect immediately (no reload required)."
         },
         "cflat.enableDiagnostics": {
           "type": "boolean",
           "default": true,
-          "description": "Run cflat.exe on save and show errors/warnings inline."
+          "description": "Run the cflat compiler on save and show errors/warnings inline."
         },
         "cflat.diagnosticDelay": {
           "type": "number",

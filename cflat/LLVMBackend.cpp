@@ -3297,10 +3297,39 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
         std::cout << "  Warning: could not write compiler_path.txt\n";
 
 #if defined(__APPLE__)
-    // macOS: synthesize the SDK-free libSystem link stub, then done. The Windows
-    // linker-path / import-lib / bitcode-cache steps below do not apply here.
+    // macOS: synthesize the SDK-free libSystem link stub. The Windows linker-path /
+    // import-lib steps do not apply, but we still build the core bitcode cache below
+    // for the "macos" platform so native Darwin compiles get the same warm-start.
     std::cout << "Harvesting libSystem link stub from the dyld shared cache...\n";
     HarvestMacSystemStub(cacheDir, verbose);
+
+    for (const char* platform : {"macos"})
+    {
+        std::cout << std::format("Building core bitcode cache for {}...\n", platform);
+        LLVMBackend coreCompiler;
+        coreCompiler.SetRuntimeDir(runtimeDir);
+        coreCompiler.SetVerbose(verbose);
+        if (!coreCompiler.CompileCoreOnly(platform))
+        {
+            std::cout << std::format("  Warning: core compilation failed for {}.\n", platform);
+            continue;
+        }
+        std::string bcCacheDir = LLVMBackend::GetRuntimeBitcodeDir(runtimeDir);
+        if (bcCacheDir.empty())
+        {
+            std::cout << "  Warning: could not determine bitcode cache dir.\n";
+            continue;
+        }
+        if (std::error_code ec = llvm::sys::fs::create_directories(bcCacheDir); ec)
+        {
+            std::cout << std::format("  Warning: could not create {}: {}\n", bcCacheDir, ec.message());
+            continue;
+        }
+        if (coreCompiler.SaveCoreBitcode(bcCacheDir, platform))
+            std::cout << std::format("  Saved core_{}.bc + .meta.json\n", platform);
+        else
+            std::cout << std::format("  Warning: could not write core bitcode cache for {}.\n", platform);
+    }
     return true;
 #else
 
@@ -3402,14 +3431,15 @@ static std::string ComputeCoreHash(const std::string& runtimeDir)
     return buf;
 }
 
-// Returns %USERPROFILE%\.cflat\runtime\<hash>  or "" on failure.
+// Returns <cache>/runtime/<hash>  or "" on failure. Built with std::filesystem
+// so the separator is correct on every platform (backslash on Windows, slash otherwise).
 std::string LLVMBackend::GetRuntimeBitcodeDir(const std::string& runtimeDir)
 {
     std::string base = GetCflatCacheDir();
     if (base.empty()) return {};
     std::string hash = ComputeCoreHash(runtimeDir);
     if (hash.empty()) return {};
-    return base + "\\runtime\\" + hash;
+    return (std::filesystem::path(base) / "runtime" / hash).string();
 }
 
 // ---- Serialization helpers (file-scope) ----
@@ -3680,6 +3710,9 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
 {
     platformValue = (platform == "win32") ? 32 : 64;
     targetWindows_ = (platform == "win32" || platform == "win64");
+    // macos / macos-arm64 mirror the normal-compile setup in Init(): POSIX, arm64.
+    targetMacOS_ = (platform == "macos" || platform == "macos-arm64");
+    targetArm64_ = targetMacOS_;
 
     // Reinitialize the LLVM module with the correct platform data layout BEFORE
     // RegisterBuiltinString creates pointer types, so %string fields have the right size.
@@ -3693,8 +3726,14 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
         module  = std::make_unique<llvm::Module>("cflat", *context);
         builder = std::make_unique<llvm::IRBuilder<>>(*context);
     }
-    module->setDataLayout(llvm::DataLayout(PlatformDataLayout(platformValue)));
-    module->setTargetTriple((platformValue == 32) ? "i686-pc-windows-msvc" : "x86_64-pc-windows-msvc");
+    // Match the layout/triple the normal compile path selects for each target.
+    const char* dl = targetMacOS_
+        ? "e-m:o-i64:64-i128:128-n32:64-S128"
+        : PlatformDataLayout(platformValue);
+    module->setDataLayout(llvm::DataLayout(dl));
+    module->setTargetTriple(targetMacOS_ ? "arm64-apple-macosx"
+                            : (platformValue == 32) ? "i686-pc-windows-msvc"
+                                                    : "x86_64-pc-windows-msvc");
     RegisterBuiltinString();
     RegisterBuiltinClosure();   // closure fat type as an owning value type (Option A)
 
@@ -3719,7 +3758,7 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
 
 bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string& platform) const
 {
-    std::string prefix = cacheDir + "\\core_" + platform;
+    std::string prefix = (std::filesystem::path(cacheDir) / ("core_" + platform)).string();
 
     // Write LLVM bitcode.
     {
@@ -3741,26 +3780,25 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
 
     // importedFiles - store paths relative to runtimeDir so the cache is
     // portable between Debug and Release builds that share core/*.cb files.
+    // std::filesystem::relative handles the platform separator/case rules; the
+    // load side rejoins the stored relative path against the current runtimeDir.
     {
         llvm::json::Array arr;
-        std::string rdPrefix = runtimeDir;
-        // Normalize to lowercase backslash for consistent prefix matching.
-        std::replace(rdPrefix.begin(), rdPrefix.end(), '/', '\\');
+        std::filesystem::path rdPath(runtimeDir);
+        std::error_code ec;
+        std::filesystem::path rdCanon = std::filesystem::weakly_canonical(rdPath, ec);
+        if (ec) rdCanon = rdPath;
         for (auto& f : importedFiles)
         {
-            std::string norm = f;
-            std::replace(norm.begin(), norm.end(), '/', '\\');
-            if (norm.size() > rdPrefix.size() &&
-                _strnicmp(norm.c_str(), rdPrefix.c_str(), rdPrefix.size()) == 0 &&
-                (norm[rdPrefix.size()] == '\\' || norm[rdPrefix.size()] == '/'))
-            {
-                // Store relative path (skip separator after prefix).
-                arr.push_back(norm.substr(rdPrefix.size() + 1));
-            }
+            std::error_code rec;
+            std::filesystem::path fCanon = std::filesystem::weakly_canonical(std::filesystem::path(f), rec);
+            if (rec) fCanon = std::filesystem::path(f);
+            std::filesystem::path rel = std::filesystem::relative(fCanon, rdCanon, rec);
+            // Store relative only when f is genuinely under runtimeDir (no leading ..).
+            if (!rec && !rel.empty() && rel.native().rfind(std::filesystem::path("..").native(), 0) != 0)
+                arr.push_back(rel.string());
             else
-            {
                 arr.push_back(f);
-            }
         }
         root["imported_files"] = std::move(arr);
     }
@@ -3965,7 +4003,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
 
 bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std::string& platform)
 {
-    std::string prefix   = cacheDir + "\\core_" + platform;
+    std::string prefix   = (std::filesystem::path(cacheDir) / ("core_" + platform)).string();
     std::string bcPath   = prefix + ".bc";
     std::string jsonPath = prefix + ".meta.json";
 

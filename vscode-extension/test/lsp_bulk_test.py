@@ -23,6 +23,8 @@ Usage:
 Exit code: 0 = every file clean, 1 = at least one file produced an error
 diagnostic, a misattributed hint, or the server died / timed out.
 """
+# Defer annotation evaluation so PEP 604 unions (str | None) run on Python 3.9.
+from __future__ import annotations
 
 import os
 import re

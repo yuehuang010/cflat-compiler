@@ -2,6 +2,8 @@
 Shared LSP client for MyCompiler LSP tests.
 Spawns cflat.exe lsp and speaks JSON-RPC over its stdio.
 """
+# Defer annotation evaluation so PEP 604 unions (str | None) run on Python 3.9.
+from __future__ import annotations
 
 import collections
 import json

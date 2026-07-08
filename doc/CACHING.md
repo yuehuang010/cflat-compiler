@@ -110,6 +110,22 @@ This is **distinct** from the `import package-vcpkg` cache, which is co-located 
 `vcpkg_installed/.cflat-cache/` (a vcpkg package is already version-pinned, so it caches
 unconditionally). Headers without a `cache` clause are never disk-cached.
 
+## macOS
+
+On macOS the cache directory is `~/.cflat` (no `%USERPROFILE%` env var). `cflat --init`
+populates it with:
+
+- `compiler_path.txt` - same role as on Windows: the VS Code extension reads this to
+  auto-detect the compiler when `cflat.executablePath` is not set.
+- `macsdk/usr/lib/libSystem.tbd` - a flattened link stub harvested from the live dyld
+  shared cache (export-trie walk over `/usr/lib/system/*`), used as the link `-syslibroot`
+  so linking is self-contained without Xcode / Command Line Tools.
+- `runtime/<hash>/core_macos.bc` - the core bitcode cache, same purpose and invalidation
+  rule as `core_win64.bc` on Windows (hash derived from core `.cb` file mtimes).
+
+There is no per-arch linker-path cache on macOS (the bundled `ld64.lld` is invoked directly,
+not discovered via a VS/SDK scan), so that section of the Windows cache does not apply.
+
 ## Troubleshooting
 
 - **Cache not taking effect**: run `cflat.exe --init` to rebuild it after an update.

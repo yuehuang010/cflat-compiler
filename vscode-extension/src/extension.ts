@@ -14,7 +14,7 @@ let outputChannel: vscode.OutputChannel;
 let logFilePath: string;
 
 // Resolve the compiler exe: an explicit cflat.executablePath setting always wins; otherwise
-// fall back to the path that `cflat.exe --init` records in ~/.cflat/compiler_path.txt.
+// fall back to the path that `cflat --init` records in ~/.cflat/compiler_path.txt.
 function findCompilerExecutable(): string | undefined {
     const configured = vscode.workspace.getConfiguration('cflat').get<string>('executablePath');
     if (configured && configured.trim() !== '') {
@@ -43,10 +43,11 @@ function readInitRecordedCompilerPath(): string | undefined {
 async function startClient(): Promise<void> {
     const exePath = findCompilerExecutable();
     if (!exePath) {
-        outputChannel.appendLine('ERROR: could not locate cflat.exe.');
+        outputChannel.appendLine('ERROR: could not locate the cflat compiler.');
         outputChannel.show(true);
         vscode.window.showWarningMessage(
-            'cflat: could not locate cflat.exe. Run "cflat.exe --init" to record the compiler path, ' +
+            'cflat: could not locate the cflat compiler (cflat.exe on Windows, cflat on macOS/Linux). ' +
+            'Run "cflat --init" to record the compiler path, ' +
             'or set cflat.executablePath in Settings to enable the language server.'
         );
         return;
@@ -144,14 +145,19 @@ class CflatDebugConfigurationProvider implements vscode.DebugConfigurationProvid
             return undefined;
         }
 
-        const outExe = source.replace(/\.(cb|c)$/i, '.exe');
+        // On Windows the output keeps the .exe extension; elsewhere it has none. Either way
+        // the output name differs from the source (.cb/.c), so it never collides on disk.
+        const outExe = process.platform === 'win32'
+            ? source.replace(/\.(cb|c)$/i, '.exe')
+            : source.replace(/\.(cb|c)$/i, '');
         const ok = await compileForDebug(cflatExe, source, outExe);
         if (!ok) {
             return undefined;
         }
 
-        // Prefer cppvsdbg if cpptools is installed. Otherwise fall back to running the .exe
-        // in an integrated terminal - no breakpoints, but at least F5 still launches the program.
+        // Prefer cpptools if installed: cppvsdbg on Windows, cppdbg+lldb/gdb elsewhere.
+        // Otherwise fall back to running the program in an integrated terminal - no
+        // breakpoints, but at least F5 still launches the program.
         const cpptools = vscode.extensions.getExtension('ms-vscode.cpptools');
         if (cpptools) {
             // Force-activate to avoid racing the C/C++ extension's lazy activation, which
@@ -159,15 +165,28 @@ class CflatDebugConfigurationProvider implements vscode.DebugConfigurationProvid
             if (!cpptools.isActive) {
                 await cpptools.activate();
             }
+            if (process.platform === 'win32') {
+                return {
+                    name: config.name ?? `cflat: ${path.basename(outExe)}`,
+                    type: 'cppvsdbg',
+                    request: 'launch',
+                    program: outExe,
+                    args: config.args ?? [],
+                    cwd: config.cwd ?? path.dirname(outExe),
+                    stopAtEntry: config.stopAtEntry ?? false,
+                    console: config.console ?? 'integratedTerminal'
+                };
+            }
             return {
                 name: config.name ?? `cflat: ${path.basename(outExe)}`,
-                type: 'cppvsdbg',
+                type: 'cppdbg',
                 request: 'launch',
                 program: outExe,
                 args: config.args ?? [],
                 cwd: config.cwd ?? path.dirname(outExe),
                 stopAtEntry: config.stopAtEntry ?? false,
-                console: config.console ?? 'integratedTerminal'
+                MIMode: process.platform === 'darwin' ? 'lldb' : 'gdb',
+                externalConsole: false
             };
         }
 

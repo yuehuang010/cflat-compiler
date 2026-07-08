@@ -128,7 +128,7 @@ Full details, including the `import package` / inline `lib`/`define`/`cache` cla
 
 | Switch | Description |
 |--------|-------------|
-| `--init` | Populate `%USERPROFILE%\.cflat\` (linker paths for x64/x86 + core bitcode + the compiler path for VS Code auto-detection), then exit. Run once after installing or updating cflat. |
+| `--init` | Populate the compiler cache, then exit. Run once after installing or updating cflat. On Windows this is `%USERPROFILE%\.cflat\` (linker paths for x64/x86 + core bitcode + the compiler path for VS Code auto-detection); on macOS this is `~/.cflat/` (the compiler path record, the libSystem link stub at `macsdk/usr/lib/libSystem.tbd`, and core bitcode). |
 | `--no-cache` | Bypass the core bitcode cache and reparse the core libraries from source. |
 | `--c-header-cache-deep` | For C headers opted in with the `cache` import clause, validate every transitively included file (mtime/hash), not just the top header. |
 
