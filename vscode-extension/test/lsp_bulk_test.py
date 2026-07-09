@@ -118,6 +118,7 @@ def find_win32_metadata_dir() -> Path | None:
 NON_HOST_OS_FILE = "os.posix.cb" if os.name == "nt" else "os.windows.cb"
 
 HOST_IS_WINDOWS = os.name == "nt"
+HOST_IS_MACOS = sys.platform == "darwin"
 
 # Windows/environment-only sources that cannot analyze clean on a non-Windows host:
 # they import windows.h/winsock2.h/COM headers, use os.windows.* or WinRT (.winmd),
@@ -150,6 +151,17 @@ def is_windows_only(path: Path) -> bool:
     if any(rel == d or rel.startswith(d + "/") for d in _WIN_ONLY_DIRS):
         return True
     return path.name in _WIN_ONLY_FILES
+
+
+# macOS-only sources: `import framework` is rejected unless the target is macOS, and the
+# Darwin SDK headers it binds (CoreGraphics/...) do not exist on other hosts. The rest of
+# example/macos/ analyzes clean anywhere (it dlopens AppKit at runtime, binds no SDK
+# header), so skip by name rather than by directory. Skipped only off macOS.
+_MAC_ONLY_FILES = {"framework_link.cb"}
+
+
+def is_macos_only(path: Path) -> bool:
+    return path.name in _MAC_ONLY_FILES
 
 
 def collect_files(include_win32_demo: bool) -> list[Path]:
@@ -196,10 +208,16 @@ def run_bulk(exe: str, extra_args: list, show_timings: bool = False,
     if not HOST_IS_WINDOWS:
         skipped_win = [p for p in paths if is_windows_only(p)]
         paths = [p for p in paths if not is_windows_only(p)]
+    skipped_mac: list[Path] = []
+    if not HOST_IS_MACOS:
+        skipped_mac = [p for p in paths if is_macos_only(p)]
+        paths = [p for p in paths if not is_macos_only(p)]
     print(f"Server: {exe}")
     print(f"Files:  {len(paths)}")
     if skipped_win:
         print(f"Skipped: {len(skipped_win)} Windows/env-only sources (non-Windows host)")
+    if skipped_mac:
+        print(f"Skipped: {len(skipped_mac)} macOS-only sources (non-macOS host)")
 
     # Pipeline depth - open this many files concurrently, then wait for diagnostics.
     # The server pool runs analyses in parallel up to its hardware_concurrency limit,
