@@ -9,8 +9,8 @@
 // that renders to the Win32 host renders here too - it just imports this host
 // (via native_host.cb) instead.
 //
-// It drives AppKit through the dlopen/objc_msgSend bridge in cocoa.cb (no SDK, no
-// Xcode, no -framework linking). Coordinates use a FLIPPED content view so every
+// It drives AppKit through the objc_msgSend bridge in cocoa.cb, which links AppKit +
+// Foundation via `import framework` (no SDK, no Xcode). Coordinates use a FLIPPED content view so every
 // frame is top-left like Win32; DIP->points is x*BASE_X, y*BASE_Y with NO DPI
 // scaling (Cocoa points are already density-independent, so the Win32 WM_DPICHANGED
 // machinery is dropped here).

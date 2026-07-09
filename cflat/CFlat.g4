@@ -681,11 +681,12 @@ usingDeclaration
     ;
 
 importDeclaration
-    : Import importGroup (As Identifier)? libClause? defineClause* cacheClause? ';'
+    : Import importGroup (As Identifier)? libClause? frameworkClause? defineClause* cacheClause? ';'
     | Import 'program' StringLiteral As Identifier ';'
-    | Import 'package' StringLiteral libClause? defineClause* cacheClause? ';'
+    | Import 'package' StringLiteral libClause? frameworkClause? defineClause* cacheClause? ';'
     | Import 'package-vcpkg' StringLiteral fromClause defineClause* ';'
     | Import 'package-nuget' importGroup fromClause defineClause* ';'
+    | Import 'framework' importGroup ';'
     ;
 
 // A plain file import target: either a single bare filename or a brace-wrapped comma
@@ -713,6 +714,16 @@ importGroup
 libClause
     : 'lib' StringLiteral
     | 'lib' '{' StringLiteral (',' StringLiteral)* ','? '}'
+    ;
+
+// Optional inline macOS framework(s) to link for a header binding (S3):
+//   import package "CoreGraphics/CoreGraphics.h" framework "CoreGraphics";
+//   import "x.h" framework { "CoreFoundation", "CoreGraphics" };
+// Mirrors libClause: the names route through the same AddFrameworkImport accumulator
+// (-> -framework at link). Standalone `import framework "X";` stays a separate form.
+frameworkClause
+    : 'framework' StringLiteral
+    | 'framework' '{' StringLiteral (',' StringLiteral)* ','? '}'
     ;
 
 // Optional inline preprocessor define(s) for a header binding, scoped to THIS

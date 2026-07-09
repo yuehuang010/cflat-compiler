@@ -3,8 +3,8 @@
 //
 // This is the macOS counterpart of example/windows/win_red_button.cb. Instead
 // of importing <windows.h> and linking user32.lib, it drives AppKit through the
-// Objective-C runtime via the cocoa.cb bridge (dlopen/dlsym + typed
-// objc_msgSend casts) - no SDK, no Xcode, no framework link flags needed.
+// Objective-C runtime via the cocoa.cb bridge (AppKit + Foundation linked with
+// `import framework`, then typed objc_msgSend casts) - no SDK, no Xcode needed.
 //
 // Build & run (from the repo root, on an Apple Silicon Mac):
 //   x64/Release/cflat example/macos/cocoa_window.cb -o out/cocoa_window

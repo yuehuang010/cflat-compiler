@@ -3,15 +3,20 @@
 // This is a library file (no main); sibling examples import it:
 //   import "cocoa.cb";
 //
-// Why dlopen/dlsym instead of `import "AppKit.h"` + framework linking:
-//  1. cflat's Mach-O link is SDK-free (harvested libSystem.tbd) and has no
-//     -framework support yet, so AppKit cannot be linked statically. dlopen
-//     of the framework binary needs no link-time reference at all.
-//  2. On arm64 objc_msgSend MUST be called through a function pointer cast to
+// AppKit + Foundation are linked as Mach-O load commands via `import framework`
+// (S4). Linking pulls in libobjc/CoreFoundation/CoreGraphics transitively, so the
+// framework classes are registered at process load - no dlopen of the framework
+// binary is needed. The objc runtime entry points (objc_msgSend, objc_getClass,
+// ...) are then obtained once via dlsym(RTLD_DEFAULT, ...) as typed function<>
+// pointers. Two reasons this is still the right shape:
+//  1. On arm64 objc_msgSend MUST be called through a function pointer cast to
 //     the exact per-call signature (Apple removed objc_msgSend_stret etc.),
-//     so typed `function<...>` casts are the ABI-correct way to call it anyway.
+//     so typed `function<...>` casts are the ABI-correct way to call it anyway;
+//     cflat cannot take the address of a declared extern C function to cast it.
+//  2. Linking stays self-contained: after `cflat --init` the framework tbd stubs
+//     live under ~/.cflat/macsdk, so no Xcode, no SDK, no dlopen is needed.
 //
-// The result is fully self-contained: no Xcode, no SDK, no extra link flags.
+import framework { "AppKit", "Foundation" };
 //
 // Layers:
 //   low level  - cocoaInit, cls, sel, msg0..msg3, msgInt, msgBool, msgRect,
@@ -21,11 +26,10 @@
 //
 // Coordinates are Cocoa-style: origin at the BOTTOM-left of the window.
 
-extern void* dlopen(const char* path, int mode);
 extern void* dlsym(void* handle, const char* name);
 
 // Cached Objective-C runtime entry points, resolved once by cocoaInit().
-void* __appKitHandle = default;
+bool __cocoaInited = default;
 void* __objcMsgSendPtr = default;
 function<void*(char*)> __objcGetClass = default;
 function<void*(char*)> __selRegisterName = default;
@@ -35,23 +39,25 @@ function<i8(void*, void*, void*, char*)> __classAddMethod = default;
 function<void*()> __poolPush = default;
 function<void(void*)> __poolPop = default;
 
-// Loads AppKit (which pulls in libobjc, Foundation, CoreGraphics as
-// dependencies) and resolves the runtime entry points through its handle.
+// Resolves the objc runtime entry points via dlsym(RTLD_DEFAULT). AppKit and
+// Foundation are already loaded (they are Mach-O load commands from the
+// `import framework` above), which drags in libobjc, so RTLD_DEFAULT finds every
+// runtime symbol. RTLD_DEFAULT is (void*)-2 on Darwin.
 bool cocoaInit()
 {
-    if (__appKitHandle != nullptr) return true;
-    __appKitHandle = dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", 2);
-    if (__appKitHandle == nullptr) return false;
+    if (__cocoaInited) return true;
+    void* rtld = (void*)(i64)(-2);
 
-    __objcMsgSendPtr   = dlsym(__appKitHandle, "objc_msgSend");
-    __objcGetClass     = (function<void*(char*)>)dlsym(__appKitHandle, "objc_getClass");
-    __selRegisterName  = (function<void*(char*)>)dlsym(__appKitHandle, "sel_registerName");
-    __allocClassPair   = (function<void*(void*, char*, u64)>)dlsym(__appKitHandle, "objc_allocateClassPair");
-    __registerClassPair = (function<void(void*)>)dlsym(__appKitHandle, "objc_registerClassPair");
-    __classAddMethod   = (function<i8(void*, void*, void*, char*)>)dlsym(__appKitHandle, "class_addMethod");
-    __poolPush         = (function<void*()>)dlsym(__appKitHandle, "objc_autoreleasePoolPush");
-    __poolPop          = (function<void(void*)>)dlsym(__appKitHandle, "objc_autoreleasePoolPop");
-    return __objcMsgSendPtr != nullptr && __objcGetClass != nullptr;
+    __objcMsgSendPtr   = dlsym(rtld, "objc_msgSend");
+    __objcGetClass     = (function<void*(char*)>)dlsym(rtld, "objc_getClass");
+    __selRegisterName  = (function<void*(char*)>)dlsym(rtld, "sel_registerName");
+    __allocClassPair   = (function<void*(void*, char*, u64)>)dlsym(rtld, "objc_allocateClassPair");
+    __registerClassPair = (function<void(void*)>)dlsym(rtld, "objc_registerClassPair");
+    __classAddMethod   = (function<i8(void*, void*, void*, char*)>)dlsym(rtld, "class_addMethod");
+    __poolPush         = (function<void*()>)dlsym(rtld, "objc_autoreleasePoolPush");
+    __poolPop          = (function<void(void*)>)dlsym(rtld, "objc_autoreleasePoolPop");
+    __cocoaInited = __objcMsgSendPtr != nullptr && __objcGetClass != nullptr;
+    return __cocoaInited;
 }
 
 void* cls(char* name) { return __objcGetClass(name); }

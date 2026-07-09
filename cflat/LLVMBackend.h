@@ -312,6 +312,20 @@ inline std::string CaptureToolLine(const char* cmd)
     }
     return out;
 }
+
+// Cached real SDK path for macOS C-header binding ($SDKROOT, else `xcrun --show-sdk-path`).
+// The harvested ~/.cflat/macsdk carries link stubs but no headers, so it is never used here.
+// Empty when no SDK is available (no Xcode / Command Line Tools and no $SDKROOT).
+inline const std::string& MacSdkPathCached()
+{
+    static const std::string sdk = [] {
+        std::string s;
+        if (const char* env = std::getenv("SDKROOT")) if (env[0]) s = env;
+        if (s.empty()) s = CaptureToolLine("xcrun --show-sdk-path 2>/dev/null");
+        return s;
+    }();
+    return sdk;
+}
 #endif
 
 class LLVMBackend
@@ -1150,6 +1164,9 @@ private:
     std::vector<std::string> cIncludeDirs_;
     std::vector<std::string> cLinkLibs_;
     std::vector<std::string> cDefines_;
+    // macOS frameworks requested via `import framework "X"` / --framework. Each becomes
+    // a `-framework X` pair on the Mach-O link. Deduped, first-seen order preserved.
+    std::vector<std::string> cFrameworks_;
     // Authoritative DLL list from vcpkg_installed/<triplet>/bin, copied next to the exe.
     // Kept separate from cLinkLibs_-based DLL probing.
     std::vector<std::string> vcpkgRuntimeDlls_;
@@ -3882,6 +3899,31 @@ private:
         if (targetWindows_)
             args.push_back(platformValue == 32 ? "--target=i686-pc-windows-msvc"
                                                : "--target=x86_64-pc-windows-msvc");
+        else if (targetMacOS_)
+        {
+            // Match the codegen triple from EmitExecutableMachO so __APPLE__ and the Apple
+            // system-header search are active. Headers need a REAL SDK (the harvested
+            // ~/.cflat/macsdk carries link stubs only), so isysroot points at $SDKROOT/xcrun.
+            args.push_back("--target=arm64-apple-macosx11.0.0");
+            std::string sdk;
+#if defined(__APPLE__)
+            sdk = MacSdkPathCached();
+#else
+            if (const char* env = std::getenv("SDKROOT")) if (env[0]) sdk = env;
+#endif
+            if (!sdk.empty())
+            {
+                args.push_back("-isysroot");
+                args.push_back(sdk);
+            }
+            else if (symbolSink_ == nullptr)
+            {
+                // Do not fall through to a Linux triple - Apple headers would misparse.
+                // In LSP/analyze mode (symbolSink_ set) degrade silently like other binds.
+                LogError("C header import targeting macOS requires an SDK: set $SDKROOT or install "
+                         "Xcode / Command Line Tools so 'xcrun --show-sdk-path' resolves");
+            }
+        }
         else
             args.push_back(platformValue == 32 ? "--target=i686-pc-linux-gnu"
                                                : "--target=x86_64-pc-linux-gnu");
@@ -4216,6 +4258,14 @@ private:
         {
             std::filesystem::path hdrDirPath = std::filesystem::path(h).parent_path();
             addScopeDir(hdrDirPath.string());
+            // macOS framework: sibling headers are spelled `.../X.framework/Headers/...` but the
+            // umbrella's real_path is `.../X.framework/Versions/A/Headers/...`. Scope the whole
+            // X.framework bundle so both spellings pass the in-scope filter.
+            {
+                auto pos = h.find(".framework/");
+                if (pos != std::string::npos)
+                    addScopeDir(h.substr(0, pos + std::string(".framework").size()));
+            }
             std::string dirLeaf = hdrDirPath.filename().string();
             std::transform(dirLeaf.begin(), dirLeaf.end(), dirLeaf.begin(),
                            [](unsigned char c) { return (char)std::tolower(c); });
@@ -5432,6 +5482,21 @@ private:
     // and stops, leaving <exePath>.o for a later link on a real Mac. The AArch64
     // backend must be registered in this LLVM build (apt llvm-18 on WSL has it;
     // the Windows vcpkg LLVM is X86-only, so this cleanly errors there).
+    // Records a framework for the Mach-O link (`import framework "X"`). Dedups on
+    // insert, preserving first-seen order. On a non-macOS target this is an error,
+    // except in LSP analyze mode (symbolSink_ set) where it is recorded silently.
+    bool AddFrameworkImport(const std::string& name)
+    {
+        if (!targetMacOS_ && symbolSink_ == nullptr)
+        {
+            LogError(std::format("import framework '{}' is only supported when targeting macOS", name));
+            return false;
+        }
+        for (const auto& f : cFrameworks_) if (f == name) return true;
+        cFrameworks_.push_back(name);
+        return true;
+    }
+
     bool EmitExecutableMachO(const std::string& exePath, bool debugInfo,
                              const std::optional<std::string>& lliPath)
     {
@@ -5533,6 +5598,22 @@ private:
                     "-syslibroot", sdk, "-o", exePath, objPath };
                 for (auto& cObj : cObjectFiles_) argStrs.push_back(cObj);
                 for (const auto& lib : cLinkLibs_) argStrs.push_back(lib);
+                // macOS frameworks (`import framework`). When the SDK-free harvested
+                // root is in use, point -F at its Frameworks dir so ld64 finds the
+                // harvested stubs; the SDK/xcrun syslibroot already carries the default path.
+                if (!cFrameworks_.empty() && !stubRoot.empty())
+                    argStrs.push_back("-F"), argStrs.push_back(stubRoot + "/System/Library/Frameworks");
+                // Frameworks not in the harvested root (e.g. CoreGraphics from a header
+                // bind) resolve from the real SDK: add its Frameworks dir as an extra -F.
+                // ld64 tries syslibroot+path then path, so this coexists with the stub root.
+                if (!cFrameworks_.empty())
+                {
+                    const std::string& fwSdk = MacSdkPathCached();
+                    if (!fwSdk.empty() && fwSdk != stubRoot)
+                        argStrs.push_back("-F"), argStrs.push_back(fwSdk + "/System/Library/Frameworks");
+                }
+                for (const auto& fw : cFrameworks_)
+                    argStrs.push_back("-framework"), argStrs.push_back(fw);
                 argStrs.push_back("-lSystem");
                 // The AArch64 backend can emit compiler-rt libcalls (e.g. __multi3);
                 // clang always links libclang_rt.osx.a, so mirror it when locatable.
@@ -5544,6 +5625,12 @@ private:
                 }
                 std::vector<llvm::StringRef> args;
                 for (auto& s : argStrs) args.push_back(s);
+                if (verbose)
+                {
+                    std::string joined;
+                    for (auto& s : argStrs) joined += (joined.empty() ? "" : " ") + s;
+                    std::cout << std::format("[verbose] ld64.lld link line: {}\n", joined);
+                }
                 std::cout << std::format("Linking (ld64.lld{}): {}\n",
                                          stubRoot.empty() ? "" : ", SDK-free", exePath);
                 std::string linkErr;
@@ -5579,6 +5666,9 @@ private:
                                              objPath, "-o", exePath };
         for (auto& cObj : cObjectFiles_) argStrs.push_back(cObj);
         for (const auto& lib : cLinkLibs_) argStrs.push_back(lib);
+        // macOS frameworks (`import framework`); the clang driver accepts -framework.
+        for (const auto& fw : cFrameworks_)
+            argStrs.push_back("-framework"), argStrs.push_back(fw);
         if (debugInfo) argStrs.push_back("-g");
 
         std::vector<llvm::StringRef> args;
@@ -15283,6 +15373,11 @@ public:
     // write a flattened tbd stub to <cacheDir>/macsdk/usr/lib/libSystem.tbd, so the
     // -o link needs no macOS SDK / Command Line Tools. Called by RunInit on Darwin.
     static bool HarvestMacSystemStub(const std::string& cacheDir, bool verbose);
+    // Harvest one dyld-shared-cache image (framework or dylib) into a tbd v4 stub at
+    // <cacheDir>/macsdk/<relTbdPath>, using the image's real install-name. Best-effort;
+    // enables SDK-free `import framework` linking. Called by RunInit on Darwin.
+    static bool HarvestMacImageStub(const std::string& cacheDir, const std::string& dlopenPath,
+                                    const std::string& relTbdPath, bool verbose);
     // The harvested stub's syslibroot (<cacheDir>/macsdk) if present, else "".
     static std::string MacStubSyslibroot();
 #endif

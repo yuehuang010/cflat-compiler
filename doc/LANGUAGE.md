@@ -1390,6 +1390,33 @@ Math.Point p;             // uses Point struct from ns_math.cb
 
 If two imported files both declare a symbol with the same name and signature, that is a collision - the author should put the conflicting declarations inside a `namespace` block to make them distinct.
 
+#### macOS frameworks (`import framework`)
+
+On a macOS (Darwin) target, `import framework` links an Apple framework as a Mach-O load
+command, so its symbols become plain externs instead of runtime `dlopen`/`dlsym` lookups:
+
+```c
+import framework "AppKit";                     // single framework
+import framework { "AppKit", "Foundation" };   // several on one line
+```
+
+To bind a framework's C headers (auto-extern the declarations) AND link it, add a `framework`
+clause to a header/package import:
+
+```c
+import package "CoreGraphics/CoreGraphics.h" framework "CoreGraphics";
+```
+
+Linking is **SDK-free after a one-time `cflat --init`**: the harvest writes tbd stubs for
+AppKit / Foundation / CoreFoundation (plus `libobjc`) under `~/.cflat/macsdk`, and the bundled
+`ld64.lld` resolves the frameworks from there - no Xcode or Command Line Tools needed. Header
+**binding** (the `framework` clause on a header import) still needs a real SDK (`$SDKROOT` or
+`xcrun`) because the harvested stubs carry no headers. Objective-C frameworks such as AppKit are
+driven through the objc runtime (see `core/cocoa.cb`), which links AppKit + Foundation this way
+and obtains `objc_msgSend` via `dlsym(RTLD_DEFAULT, ...)`. Targeting a non-macOS platform with
+`import framework` is a compile error. See [C Interop](C_INTEROP.md) and the `--framework` flag
+in [CLI](CLI.md).
+
 ---
 
 ## Type Casting

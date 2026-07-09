@@ -108,6 +108,20 @@ The `core/` directory is always on the import search path; only `runtime.cb` is 
 Full details, including the `import package` / inline `lib`/`define`/`cache` clauses, are in
 [`doc/C_INTEROP.md`](C_INTEROP.md).
 
+### macOS frameworks
+
+| Switch | Value | Description |
+|--------|-------|-------------|
+| `--framework` | name | Apple framework to link as a Mach-O load command (macOS target only, repeatable). Mirrors the `import framework "name";` source form. |
+
+Equivalent source-level forms: `import framework "AppKit";`, the brace group
+`import framework { "AppKit", "Foundation" };`, and the `framework` clause on a C-header/package
+import (`import package "CoreGraphics/CoreGraphics.h" framework "CoreGraphics";`) which binds the
+header AND links the framework. Linking is SDK-free after a one-time `cflat --init` (harvests
+AppKit / Foundation / CoreFoundation / `libobjc` tbd stubs under `~/.cflat/macsdk`); header
+**binding** still needs a real SDK (`$SDKROOT` / `xcrun`). Non-macOS targets reject
+`--framework` / `import framework` with a diagnostic. See [`doc/LANGUAGE.md`](LANGUAGE.md).
+
 ### vcpkg integration
 
 | Switch | Value | Description |

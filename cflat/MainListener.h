@@ -3060,6 +3060,20 @@ public:
                 // Point diagnostics at this import statement (see ProcessImports): a not-found
                 // error has no readable file behind it and would otherwise report (0,0).
                 Compiler()->SetSourceLocation(imp->getStart()->getLine(), imp->getStart()->getCharPositionInLine());
+                // `import framework "X";` / `import framework { ... };` inside an if-const
+                // branch. Dispatch before the importGroup routing since it reuses importGroup.
+                if (imp->children.size() >= 2 && imp->children[1]->getText() == "framework")
+                {
+                    if (auto* grp = imp->importGroup())
+                        for (auto* lit : grp->StringLiteral())
+                            Compiler()->AddFrameworkImport(DequoteStringLiteral(lit->getText()));
+                    continue;
+                }
+                // A `framework "X"` clause on a header/package/group import (S3): link the
+                // framework in addition to binding the header. Standalone form handled above.
+                if (auto* fc = imp->frameworkClause())
+                    for (auto* lit : fc->StringLiteral())
+                        Compiler()->AddFrameworkImport(DequoteStringLiteral(lit->getText()));
                 // `import package-nuget importGroup from "id[/version]";` inside an if-const
                 // branch. Dispatch on the keyword BEFORE the plain importGroup routing, since
                 // package-nuget now also carries an importGroup; a multi-entry nuget group is

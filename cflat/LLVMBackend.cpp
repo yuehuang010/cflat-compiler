@@ -45,6 +45,7 @@
 // the live dyld shared cache to synthesize a linker stub, so -o needs no SDK.
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
+#include <dlfcn.h>
 #include <cstring>
 #endif
 
@@ -148,6 +149,19 @@ static std::vector<std::string> DequoteLibClauses(CFlatParser::ImportDeclaration
     return libs;
 }
 
+// Inline `framework "..."` clause(s) on a header/package import (S3). Returns every
+// named macOS framework in source order (one for `framework "X"`, several for the brace
+// form). Empty when absent. Each routes through AddFrameworkImport (-> -framework at link).
+static std::vector<std::string> DequoteFrameworkClauses(CFlatParser::ImportDeclarationContext* imp)
+{
+    std::vector<std::string> fws;
+    auto* fc = imp->frameworkClause();
+    if (!fc) return fws;
+    for (auto* lit : fc->StringLiteral())
+        fws.push_back(DequoteStringLiteral(lit->getText()));
+    return fws;
+}
+
 // Inline `define "..."` clauses on an `import package` line. Each is scoped to
 // that header's clang AST dump and appended on top of the process-wide --c-define.
 static std::vector<std::string> DequoteDefineClauses(CFlatParser::ImportDeclarationContext* imp)
@@ -195,6 +209,13 @@ static bool IsPackageVcpkgImport(CFlatParser::ImportDeclarationContext* imp)
 static bool IsPackageNugetImport(CFlatParser::ImportDeclarationContext* imp)
 {
     return imp->children.size() >= 2 && imp->children[1]->getText() == "package-nuget";
+}
+
+// True when this import line is `import framework "X";` / `import framework { ... };`.
+// Detected by the second child token text - mirrors the package/program tests.
+static bool IsFrameworkImport(CFlatParser::ImportDeclarationContext* imp)
+{
+    return imp->children.size() >= 2 && imp->children[1]->getText() == "framework";
 }
 
 // Dequoted port spec from `from "..."` on an import package-vcpkg line (empty if absent).
@@ -379,6 +400,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     cIncludeDirs_ = args.getMultiOption("c-include");
     cLinkLibs_    = args.getMultiOption("c-lib");
     cDefines_     = args.getMultiOption("c-define");
+    // macOS frameworks seeded from --framework (mirrors --c-lib). `import framework`
+    // lines append more during ProcessImports; AddFrameworkImport dedups.
+    for (const auto& fw : args.getMultiOption("framework"))
+        AddFrameworkImport(fw);
     // Vcpkg integration options: forward to the resolver. Each is optional - the
     // resolver auto-discovers vcpkg.exe and the manifest when not overridden.
     if (auto p = args.getOption("vcpkg-exe"))      vcpkg_.SetExeOverride(*p);
@@ -603,6 +628,19 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         // trailing `cache` on the group applies to every entry (a no-op for
                         // .cb/.c entries; only the .h header-bind branch consults it).
                         auto groupedImports = DequoteImportGroup(imp);
+                        // `import framework "X";` / `import framework { ... };` - record each
+                        // framework for the Mach-O link. Dispatched before the importGroup
+                        // routing since it reuses importGroup for its name list.
+                        if (IsFrameworkImport(imp))
+                        {
+                            for (const auto& fw : groupedImports)
+                                if (!AddFrameworkImport(fw)) return false;
+                            continue;
+                        }
+                        // A `framework "X"` clause on a header/package/group import (S3): link the
+                        // framework in addition to binding the header. Standalone form handled above.
+                        for (const auto& fw : DequoteFrameworkClauses(imp))
+                            if (!AddFrameworkImport(fw)) return false;
                         // `import package-nuget importGroup from "id[/version]";` - dispatch on the
                         // keyword BEFORE any importGroup-based routing (package-nuget now also
                         // carries an importGroup, but a multi-entry nuget group is ONE package TU,
@@ -1090,6 +1128,30 @@ bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const 
         for (const auto& inc : PosixSystemIncludeDirs()) tryDir(inc);
         // System WinRT metadata: let `import "Windows.Foundation.winmd";` resolve by bare name.
         tryDir(WinMetadataDir());
+#if defined(__APPLE__)
+        // macOS framework headers use a non-flat layout: `<Foo/Bar.h>` lives at
+        // <sdk>/System/Library/Frameworks/Foo.framework/Headers/Bar.h. Map that shape so
+        // `import package "CoreGraphics/CoreGraphics.h"` resolves to a real path for clang.
+        if (ec && targetMacOS_)
+        {
+            auto slash = filename.find('/');
+            const std::string& sdk = MacSdkPathCached();
+            if (slash != std::string::npos && !sdk.empty())
+            {
+                std::filesystem::path fh = std::filesystem::path(sdk) / "System/Library/Frameworks"
+                    / (filename.substr(0, slash) + ".framework") / "Headers" / filename.substr(slash + 1);
+                // Keep the framework `Headers` symlink path (do NOT canonicalize the
+                // Versions/ symlink): clang spells sibling framework headers via `Headers/`,
+                // and the extractor's in-scope filter matches that spelling, not Versions/A.
+                std::error_code fex;
+                if (std::filesystem::exists(fh, fex))
+                {
+                    canonical = fh.lexically_normal();
+                    ec.clear();
+                }
+            }
+        }
+#endif
         return ec ? std::string() : canonical.string();
     };
 
@@ -1332,6 +1394,17 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 // Grouped import `import { "a", "b" };` - one TU for header entries, individual
                 // routing for .cb/.c entries (see CompileImportGroup).
                 auto groupedImports = DequoteImportGroup(imp);
+                // `import framework` dispatch first - it reuses importGroup for its names.
+                if (IsFrameworkImport(imp))
+                {
+                    for (const auto& fw : groupedImports)
+                        if (!AddFrameworkImport(fw)) return false;
+                    continue;
+                }
+                // A `framework "X"` clause on a header/package/group import (S3): link the
+                // framework in addition to binding the header. Standalone form handled above.
+                for (const auto& fw : DequoteFrameworkClauses(imp))
+                    if (!AddFrameworkImport(fw)) return false;
                 // package-nuget dispatch first (it now carries an importGroup too); a multi-entry
                 // nuget group is one package TU, not several plain imports.
                 if (IsPackageNugetImport(imp))
@@ -2036,6 +2109,18 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     // Grouped import `import { "a", "b" };` - one TU for header entries (see
                     // CompileImportGroup); .cb/.c entries route individually.
                     auto groupedImports = DequoteImportGroup(imp);
+                    // `import framework` dispatch first - reuses importGroup for its names.
+                    // In LSP analyze mode AddFrameworkImport records silently (never errors).
+                    if (IsFrameworkImport(imp))
+                    {
+                        for (const auto& fw : groupedImports)
+                            if (!AddFrameworkImport(fw)) return false;
+                        continue;
+                    }
+                    // A `framework "X"` clause on a header/package/group import (S3): link the
+                    // framework in addition to binding the header. Standalone form handled above.
+                    for (const auto& fw : DequoteFrameworkClauses(imp))
+                        if (!AddFrameworkImport(fw)) return false;
                     // package-nuget dispatch first (it now carries an importGroup too); a
                     // multi-entry nuget group is one package TU, not several plain imports.
                     if (IsPackageNugetImport(imp))
@@ -3272,6 +3357,76 @@ bool LLVMBackend::HarvestMacSystemStub(const std::string& cacheDir, bool verbose
     std::cout << std::format("  Saved macsdk/usr/lib/libSystem.tbd ({} symbols)\n", symbols.size());
     return true;
 }
+
+bool LLVMBackend::HarvestMacImageStub(const std::string& cacheDir, const std::string& dlopenPath,
+                                      const std::string& relTbdPath, bool verbose)
+{
+    // dlopen loads the image straight from the dyld shared cache (no on-disk file
+    // required). RTLD_NOLOAD first in case it is already mapped into this process.
+    void* h = dlopen(dlopenPath.c_str(), RTLD_LAZY | RTLD_NOLOAD);
+    if (!h) h = dlopen(dlopenPath.c_str(), RTLD_LAZY);
+    if (!h)
+    {
+        std::cout << std::format("  Warning: could not dlopen {}; stub not written.\n", dlopenPath);
+        return false;
+    }
+    // Locate the loaded image by its install-name and harvest its export trie.
+    std::set<std::string> symbols;
+    std::string installName;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++)
+    {
+        const char* name = _dyld_get_image_name(i);
+        if (!name || std::strcmp(name, dlopenPath.c_str()) != 0) continue;
+        installName = name;
+        MachoHarvestImage(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i), symbols);
+        break;
+    }
+    if (installName.empty()) installName = dlopenPath;
+    if (symbols.empty())
+    {
+        std::cout << std::format("  Warning: harvested no symbols from {}; stub not written.\n", dlopenPath);
+        return false;
+    }
+
+    std::string tbdPath = cacheDir + "/macsdk/" + relTbdPath;
+    std::string tbdDir = std::filesystem::path(tbdPath).parent_path().string();
+    if (std::error_code ec = llvm::sys::fs::create_directories(tbdDir); ec)
+    {
+        std::cout << std::format("  Warning: could not create {}: {}\n", tbdDir, ec.message());
+        return false;
+    }
+    std::error_code ec;
+    llvm::raw_fd_ostream os(tbdPath, ec, llvm::sys::fs::OF_Text);
+    if (ec)
+    {
+        std::cout << std::format("  Warning: could not write {}: {}\n", tbdPath, ec.message());
+        return false;
+    }
+    // tbd v4 stub carrying the image's real install-name; whatever the trie yielded
+    // (including weak-def and objc class symbols) is listed under exports.
+    os << "--- !tapi-tbd\n";
+    os << "tbd-version:     4\n";
+    os << "targets:         [ arm64-macos ]\n";
+    os << std::format("install-name:    '{}'\n", installName);
+    os << "current-version: 1\n";
+    os << "compatibility-version: 1\n";
+    os << "exports:\n";
+    os << "  - targets:         [ arm64-macos ]\n";
+    os << "    symbols:         [ ";
+    bool first = true;
+    for (const auto& s : symbols)
+    {
+        if (!first) os << ", ";
+        first = false;
+        os << "'" << s << "'";
+    }
+    os << " ]\n...\n";
+    os.close();
+    if (verbose)
+        std::cout << std::format("  harvested {}\n", installName);
+    std::cout << std::format("  Saved macsdk/{} ({} symbols)\n", relTbdPath, symbols.size());
+    return true;
+}
 #endif
 
 bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
@@ -3302,6 +3457,22 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
     // for the "macos" platform so native Darwin compiles get the same warm-start.
     std::cout << "Harvesting libSystem link stub from the dyld shared cache...\n";
     HarvestMacSystemStub(cacheDir, verbose);
+
+    // Framework/dylib stubs so `import framework` links with no Xcode/CLT. Each is
+    // dlopen'd from the shared cache and its export trie flattened into a tbd v4.
+    std::cout << "Harvesting macOS framework link stubs from the dyld shared cache...\n";
+    struct MacFwSpec { const char* dlopenPath; const char* relTbd; };
+    const MacFwSpec macFwSpecs[] = {
+        { "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit",
+          "System/Library/Frameworks/AppKit.framework/AppKit.tbd" },
+        { "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation",
+          "System/Library/Frameworks/Foundation.framework/Foundation.tbd" },
+        { "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation",
+          "System/Library/Frameworks/CoreFoundation.framework/CoreFoundation.tbd" },
+        { "/usr/lib/libobjc.A.dylib", "usr/lib/libobjc.tbd" },
+    };
+    for (const auto& fs : macFwSpecs)
+        HarvestMacImageStub(cacheDir, fs.dlopenPath, fs.relTbd, verbose);
 
     for (const char* platform : {"macos"})
     {

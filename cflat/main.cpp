@@ -309,6 +309,7 @@ int main(int argc, char* argv[])
     args.addFlag("ftime-trace", 0, "Write compilation time trace to <input>.time-trace.json");
     args.addMultiOption("c-include", 0, "Header search directory for C library bindings (repeatable)");
     args.addMultiOption("c-lib", 0, "Prebuilt C import library (.lib) to link (repeatable)");
+    args.addMultiOption("framework", 0, "macOS framework to link, e.g. AppKit (repeatable; mirrors `import framework`)");
     args.addMultiOption("c-define", 0, "Preprocessor define passed to all clang-cl C compiles/dumps, e.g. NAME or NAME=val (repeatable)");
     args.addOption("vcpkg-exe", 0, "Explicit path to vcpkg.exe (overrides VS-bundled / VCPKG_ROOT / PATH discovery)");
     args.addOption("vcpkg-manifest", 0, "Explicit vcpkg.json path (skips upward walk from the source file)");
