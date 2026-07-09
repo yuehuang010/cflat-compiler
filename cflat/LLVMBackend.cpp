@@ -346,6 +346,24 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     auto bitcodePath = checkOnly ? std::string{} : args.getOption("bitcode").value_or("");
     bool debugInfo = args.hasFlag("debug-info");
 
+    importSearchDirs = args.getMultiOption("import-dir");
+    // Default target platform = native host OS. Overridable with --platform for
+    // cross-compilation (e.g. macos Mach-O emission from a Windows/WSL host).
+#if defined(_WIN32)
+    const char* kDefaultPlatform = "win64";
+#elif defined(__APPLE__)
+    const char* kDefaultPlatform = "macos";
+#else
+    const char* kDefaultPlatform = "linux";
+#endif
+    auto platformOption = args.getOption("platform").value_or(kDefaultPlatform);
+
+    // Windows images must be named *.exe to be runnable, so `-o foo` would produce a
+    // file the shell refuses to launch. Supply the extension when none was given.
+    if (exePath && (platformOption == "win32" || platformOption == "win64")
+        && !std::filesystem::path(*exePath).has_extension())
+        *exePath += ".exe";
+
     // Delete any pre-existing outputs up front so a failed compile can never
     // leave a stale binary behind for the user to unknowingly run. Without this,
     // an edit-compile-run loop that hits a compile error silently re-runs the
@@ -359,17 +377,6 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         if (!bitcodePath.empty()) std::filesystem::remove(bitcodePath, rmEc);
     }
 
-    importSearchDirs = args.getMultiOption("import-dir");
-    // Default target platform = native host OS. Overridable with --platform for
-    // cross-compilation (e.g. macos Mach-O emission from a Windows/WSL host).
-#if defined(_WIN32)
-    const char* kDefaultPlatform = "win64";
-#elif defined(__APPLE__)
-    const char* kDefaultPlatform = "macos";
-#else
-    const char* kDefaultPlatform = "linux";
-#endif
-    auto platformOption = args.getOption("platform").value_or(kDefaultPlatform);
     // Resolve and validate --cpu / --tune once, up front, so an unknown name is a clean
     // error before any clang-cl spawn or codegen, and both the C-interop and native-object
     // paths can use the resolved values verbatim. The CPU table is identical for both
