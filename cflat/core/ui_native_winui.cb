@@ -29,7 +29,7 @@ import "winrt.cb";
 import "com.cb";
 import "guid.cb";
 import "function.cb";
-import package-nuget "Microsoft.UI.Xaml.winmd" from "Microsoft.WindowsAppSDK.WinUI/1.8.260224000";
+import package-nuget "Microsoft.UI.Xaml.winmd" from "Microsoft.WindowsAppSDK.WinUI/1.8.260224000" pri "Microsoft.UI.Xaml.Controls.pri";
 import package-nuget "Microsoft.UI.winmd" from "Microsoft.WindowsAppSDK.InteractiveExperiences/1.8.260125001";
 // Foundation supplies Microsoft.WindowsAppRuntime.Bootstrap.{lib,dll} for the Mdd* externs below.
 import package-nuget "Microsoft.Windows.ApplicationModel.DynamicDependency.winmd" from "Microsoft.WindowsAppSDK.Foundation/1.8.260222000";
@@ -73,6 +73,8 @@ void* _gDq         = nullptr;   // IDispatcherQueue* for this thread
 void* _gCanvasVec  = nullptr;   // Canvas.Children as IVector<UIElement>*
 void* _gCanvasStat = nullptr;   // ICanvasStatics* (SetLeft/SetTop)
 void* _gPv         = nullptr;   // IPropertyValueStatics* (box a string as content)
+void* _gRootElem   = nullptr;   // Canvas as IUIElement* (window content root; UpdateLayout target)
+void* _gRootFe     = nullptr;   // Canvas as IFrameworkElement* (Loaded subscription target)
 
 int hostWidth()  { return _wW; }
 int hostHeight() { return _wH; }
@@ -946,13 +948,115 @@ void _winuiPostEnqueue(u64 target, u64 boxPtr)
 }
 u64 _winuiCurTid() { return (u64)GetCurrentThreadId(); }
 
+// ── Derived App outer: IInspectable + IXamlMetadataProvider (COM aggregation) ─
+// A bare (null-outer) Application exposes no IXamlMetadataProvider, so XamlControlsResources' XBF
+// parse cannot resolve muxc types and its ctor fails (surfacing later as a missing theme brush and
+// a failfast when a TextBox/ProgressBar/TabView/TreeView applies its template). We aggregate: the
+// outer answers IXamlMetadataProvider itself (QI returns self) and forwards its three methods to an
+// activated XamlControlsXamlMetaDataProvider; every other IID delegates to the inner Application.
+void* _gOuterInner = nullptr;   // inner non-delegating IUnknown of the aggregated Application
+void* _gMeta       = nullptr;   // IXamlMetadataProvider* (XamlControlsXamlMetaDataProvider)
+
+// IID_IXamlMetadataProvider {A96251F0-2214-5D53-8746-CE99A2593CD7} (Microsoft.UI.Xaml.Markup).
+Guid IID_IXamlMetadataProvider()
+{
+    return Guid.make((u32)0xA96251F0, (u16)0x2214, (u16)0x5D53,
+                     (u8)0x87, (u8)0x46, (u8)0xCE, (u8)0x99,
+                     (u8)0xA2, (u8)0x59, (u8)0x3C, (u8)0xD7);
+}
+
+// Vtable = IInspectable (6 slots) + IXamlMetadataProvider (3 slots). GetXamlType takes a TypeName
+// {HSTRING Name; TypeKind Kind} by value, which splats into two args (void* + i32) on x64.
+struct IXamlMetaVtbl
+{
+    function<i32(void*, void*, void**)>      QueryInterface      = nullptr;
+    function<u32(void*)>                     AddRef              = nullptr;
+    function<u32(void*)>                     Release             = nullptr;
+    function<i32(void*, u32*, void**)>       GetIids             = nullptr;
+    function<i32(void*, void**)>             GetRuntimeClassName = nullptr;
+    function<i32(void*, i32*)>               GetTrustLevel       = nullptr;
+    function<i32(void*, void*, i32, void**)> GetXamlType         = nullptr;
+    function<i32(void*, void*, void**)>      GetXamlTypeByName   = nullptr;
+    function<i32(void*, u32*, void**)>       GetXmlnsDefinitions = nullptr;
+};
+struct MetaObj { IXamlMetaVtbl* lpVtbl = nullptr; };
+
+IXamlMetaVtbl _gOuterVtbl = default;
+MetaObj       _gOuter     = default;
+
+// Compare a REFIID (Guid*) against a Guid value field-by-field (cflat cannot deref *(Guid*)p).
+bool _guidEq(void* iidp, Guid want)
+{
+    Guid* p = (Guid*)iidp;
+    if (p->Data1 != want.Data1) return false;
+    if (p->Data2 != want.Data2) return false;
+    if (p->Data3 != want.Data3) return false;
+    for (i32 i = 0; i < 8; i++) if (p->Data4[i] != want.Data4[i]) return false;
+    return true;
+}
+
+// slot 0: the outer answers IUnknown/IInspectable/IAgileObject/IXamlMetadataProvider itself; every
+// other IID delegates to the inner Application's non-delegating IUnknown.
+i32 _outerQI(void* self, void* iid, void** out)
+{
+    if (_guidEq(iid, IID_IUnknown()) || _guidEq(iid, IID_IInspectable())
+        || _guidEq(iid, IID_IAgileObject()) || _guidEq(iid, IID_IXamlMetadataProvider()))
+    { out[0] = self; return 0; }
+    if (_gOuterInner != nullptr)
+        return ((IUnknown*)_gOuterInner)->lpVtbl->QueryInterface(_gOuterInner, iid, out);
+    out[0] = nullptr;
+    return (i32)0x80004002;   // E_NOINTERFACE
+}
+// Singleton controlling unknown: process-lived, never freed, so refcounts are nominal.
+u32 _outerAddRef(void* self)  { return 2u; }
+u32 _outerRelease(void* self) { return 1u; }
+i32 _outerGetIids(void* self, u32* count, void** iids) { count[0] = 0u; iids[0] = nullptr; return 0; }
+i32 _outerGetRcn(void* self, void** name) { name[0] = hstring("CFlatWinUI.App"); return 0; }
+i32 _outerGetTrust(void* self, i32* level) { level[0] = 0; return 0; }
+// The three IXamlMetadataProvider methods forward verbatim to the activated provider (_gMeta).
+i32 _outerGetXamlType(void* self, void* nameH, i32 kind, void** out)
+{
+    if (_gMeta == nullptr) { out[0] = nullptr; return (i32)0x80004005; }
+    return ((MetaObj*)_gMeta)->lpVtbl->GetXamlType(_gMeta, nameH, kind, out);
+}
+i32 _outerGetXamlTypeByName(void* self, void* fullName, void** out)
+{
+    if (_gMeta == nullptr) { out[0] = nullptr; return (i32)0x80004005; }
+    return ((MetaObj*)_gMeta)->lpVtbl->GetXamlTypeByName(_gMeta, fullName, out);
+}
+i32 _outerGetXmlns(void* self, u32* count, void** defs)
+{
+    if (_gMeta == nullptr) { count[0] = 0u; defs[0] = nullptr; return 0; }
+    return ((MetaObj*)_gMeta)->lpVtbl->GetXmlnsDefinitions(_gMeta, count, defs);
+}
+
+// Wire the outer's vtable once and return its IInspectable*.
+void* _makeOuter()
+{
+    _gOuterVtbl.QueryInterface      = _outerQI;
+    _gOuterVtbl.AddRef              = _outerAddRef;
+    _gOuterVtbl.Release             = _outerRelease;
+    _gOuterVtbl.GetIids             = _outerGetIids;
+    _gOuterVtbl.GetRuntimeClassName = _outerGetRcn;
+    _gOuterVtbl.GetTrustLevel       = _outerGetTrust;
+    _gOuterVtbl.GetXamlType         = _outerGetXamlType;
+    _gOuterVtbl.GetXamlTypeByName   = _outerGetXamlTypeByName;
+    _gOuterVtbl.GetXmlnsDefinitions = _outerGetXmlns;
+    _gOuter.lpVtbl = &_gOuterVtbl;
+    return (void*)&_gOuter;
+}
+
 // Stand up Application/Window/Canvas + the thread DispatcherQueue (shared by live + headless init).
 void winuiInitFramework()
 {
+    // Activate the framework metadata provider first so the aggregated App can forward to it.
+    Guid mpi = IID_IXamlMetadataProvider();
+    activateInstance("Microsoft.UI.Xaml.XamlTypeInfo.XamlControlsXamlMetaDataProvider", &mpi, &_gMeta);
+
     IApplicationFactory* af = nullptr;
     activationFactory("Microsoft.UI.Xaml.Application", iidof(IApplicationFactory), (void**)&af);
-    void* ai = nullptr;
-    af->lpVtbl->CreateInstance(af, nullptr, &ai, &_gApp);
+    void* outer = _makeOuter();
+    af->lpVtbl->CreateInstance(af, outer, &_gOuterInner, &_gApp);
 
     IWindowFactory* wf = nullptr;
     activationFactory("Microsoft.UI.Xaml.Window", iidof(IWindowFactory), (void**)&wf);
@@ -970,10 +1074,28 @@ void winuiInitFramework()
 
     void* win = wqi(winRaw, iidof(IWindow));
     void* canvasElem = wqi(canvas, iidof(IUIElement));
+    _gRootElem = canvasElem;   // window content root: the headless path drives layout through this
+    _gRootFe   = wqi(canvas, iidof(IFrameworkElement));   // Loaded fires after the tree is live
     if (win != nullptr && canvasElem != nullptr)
     {
         ((IWindow*)win)->lpVtbl->put_Content(win, canvasElem);
         ((IWindow*)win)->lpVtbl->Activate(win);
+    }
+
+    // Merge XamlControlsResources into Application.Resources so muxc controls + TextBox resolve
+    // their theme dictionaries. The metadata provider (above) makes its XBF parse succeed; post-
+    // Activate the Resources dictionary is live, and the control tree mounts only afterwards.
+    void* xcr = nullptr;
+    RoActivateInstance(hstring("Microsoft.UI.Xaml.Controls.XamlControlsResources"), &xcr);
+    void* appRes = nullptr;
+    ((IApplication*)_gApp)->get_Resources(&appRes);
+    void* xcrDict = wqi(xcr, iidof(IResourceDictionary));
+    if (appRes != nullptr && xcrDict != nullptr)
+    {
+        void* merged = nullptr;
+        ((IResourceDictionary*)appRes)->lpVtbl->get_MergedDictionaries(appRes, &merged);
+        void* mvec = wqi(merged, iidof(IVector<ResourceDictionary>));
+        if (mvec != nullptr) ((IVector<ResourceDictionary>*)mvec)->lpVtbl->Append(mvec, xcrDict);
     }
 
     IDispatcherQueueStatics* dqs = nullptr;
@@ -993,12 +1115,32 @@ void winuiOnInit(void* params)
     if (_wHasPostMount) _wPostMount();
 }
 
-// Headless init: framework only, then run the self-test body synchronously and Exit.
+// Force a synchronous measure/arrange over the mounted tree. XAML applies each control's
+// ControlTemplate at first measure (not at Append), so this is where a bad theme resource
+// failfasts (0xC000027B) - exactly the class of fault the headless suite must not skip.
+void winuiForceLayout()
+{
+    if (_gRootElem != nullptr) ((IUIElement*)_gRootElem)->lpVtbl->UpdateLayout(_gRootElem);
+}
+
+// Headless init: framework only, then run the self-test body synchronously. Exit is DEFERRED
+// until the root canvas raises Loaded - which fires only after the mounted tree has entered the
+// live window and each control has applied its ControlTemplate (a bad theme resource failfasts
+// 0xC000027B during that template application, before Loaded). A synchronous UpdateLayout or a
+// burst of same-frame dispatcher hops both return before the window's first real layout pass, so
+// they miss the fault; waiting on Loaded lets the pump run real frames until layout has happened.
 void winuiHeadlessInit(void* params)
 {
     winuiInitFramework();
     if (_wHasSelfBody) _wSelfRc = _wSelfBody();
-    winuiExit();
+    if (_gRootFe != nullptr)
+    {
+        void* h = winrtDelegate(RoutedEventHandler,
+            (void* s, void* a) => { winuiForceLayout(); winuiExit(); });
+        u64 tok = 0;
+        ((IFrameworkElement*)_gRootFe)->lpVtbl->add_Loaded(_gRootFe, h, &tok);
+    }
+    else winuiExit();
 }
 
 // Exit the XAML pump (ends Application.Start).

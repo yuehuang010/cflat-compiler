@@ -1170,6 +1170,9 @@ private:
     // Authoritative DLL list from vcpkg_installed/<triplet>/bin, copied next to the exe.
     // Kept separate from cLinkLibs_-based DLL probing.
     std::vector<std::string> vcpkgRuntimeDlls_;
+    // Absolute path of a .pri harvested from a package-nuget `pri "..."` clause, deployed
+    // next to the exe as <exe>.pri (WinUI MRT probes resources.pri and <exe>.pri).
+    std::string deployPriPath_;
     VcpkgResolver vcpkg_;
     NugetResolver nuget_;
 
@@ -6468,6 +6471,26 @@ private:
             fs::copy_file(src, dest, fs::copy_options::overwrite_existing, ec);
             if (!ec && verbose)
                 std::cout << std::format("[verbose]   copied vcpkg DLL: {} -> {}\n", src.string(), dest.string());
+        }
+
+        // Deploy a package-nuget `pri "..."` file as <exe>.pri (WinUI MRT probes resources.pri
+        // and <exe>.pri beside an unpackaged exe; <exe>.pri lets several exes share a folder).
+        if (!deployPriPath_.empty())
+        {
+            std::error_code ec;
+            fs::path src(deployPriPath_);
+            fs::path dest = exeDir / (fs::path(exePath).stem().string() + ".pri");
+            if (!fs::exists(src, ec))
+                LogError(std::format("failed to deploy pri: source '{}' no longer exists", deployPriPath_));
+            else
+            {
+                fs::copy_file(src, dest, fs::copy_options::overwrite_existing, ec);
+                if (ec)
+                    LogError(std::format("failed to deploy pri '{}' to '{}': {}",
+                                         deployPriPath_, dest.string(), ec.message()));
+                else if (verbose)
+                    std::cout << std::format("[verbose]   copied pri: {} -> {}\n", src.string(), dest.string());
+            }
         }
     }
 
@@ -15153,6 +15176,64 @@ public:
         return ok;
     }
 
+    // Locate the .pri named by a package-nuget `pri "..."` clause inside the resolved package
+    // folder and record its absolute path in deployPriPath_ for deployment as <exe>.pri.
+    // Probe runtimes-framework/win-<arch>/native/<name> first, then recursively search the
+    // package folder for an exact filename match. Not-found is a hard error (LSP: silent skip).
+    // A second pri that resolves to a DIFFERENT path is a conflict error; the same path is ok.
+    bool ResolveNugetPri(const std::string& priName,
+                         const std::string& packageFolder,
+                         const std::string& packageSpec,
+                         bool lspMode)
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        std::string arch = (platformValue == 32) ? "x86" : "x64";
+
+        fs::path primary = fs::path(packageFolder) / "runtimes-framework" /
+                           ("win-" + arch) / "native" / priName;
+        fs::path found;
+        if (fs::exists(primary, ec))
+            found = primary;
+        else
+        {
+            for (auto it = fs::recursive_directory_iterator(packageFolder, ec);
+                 !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
+            {
+                if (it->is_regular_file(ec) && it->path().filename().string() == priName)
+                {
+                    found = it->path();
+                    break;
+                }
+            }
+        }
+
+        if (found.empty())
+        {
+            // LSP never deploys; a missing pri must not paint an error on a clean file.
+            if (lspMode) return true;
+            LogError(std::format(
+                "import package-nuget: pri file '{}' was not found in package '{}' (probed '{}' "
+                "and a recursive search of '{}').",
+                priName, packageSpec, primary.string(), packageFolder));
+            return false;
+        }
+
+        std::string abs = fs::absolute(found, ec).string();
+        if (!deployPriPath_.empty() && deployPriPath_ != abs)
+        {
+            LogError(std::format(
+                "import package-nuget: conflicting pri deployment - both '{}' and '{}' were "
+                "requested as <exe>.pri. Only one pri may be deployed per output.",
+                deployPriPath_, abs));
+            return false;
+        }
+        deployPriPath_ = abs;
+        if (verbose)
+            std::cout << std::format("[verbose] nuget: pri '{}' -> deploy as <exe>.pri from {}\n", priName, abs);
+        return true;
+    }
+
     // Handle `import package-nuget importGroup from "id[/version]";`. Resolves the package
     // through the NuGet global packages folder (acquiring on a miss unless suppressed), pushes
     // the resulting include dirs / libs / DLLs into the per-backend accumulators, then binds
@@ -15165,7 +15246,8 @@ public:
     // degrades to a silent skip.
     bool CompileNugetImport(const std::vector<std::string>& files,
                             const std::string& packageSpec,
-                            const std::vector<std::string>& extraDefines = {})
+                            const std::vector<std::string>& extraDefines = {},
+                            const std::string& priName = "")
     {
         if (files.empty()) return true;
         const bool multi = files.size() > 1;
@@ -15247,6 +15329,12 @@ public:
             for (const auto& d : vcpkgRuntimeDlls_) if (d == dll) { dup = true; break; }
             if (!dup) vcpkgRuntimeDlls_.push_back(dll);
         }
+
+        // Optional `pri "..."` clause: locate the named .pri inside the resolved package and
+        // record it for deployment as <exe>.pri. Probe the arch-specific framework runtimes
+        // dir first, then fall back to a recursive filename match over the package folder.
+        if (!priName.empty() && !ResolveNugetPri(priName, res.packageFolder, packageSpec, lspMode))
+            return false;
 
         // Multi-entry group: STRICT package-only. Resolve every header under the package
         // include dirs (a header not found there is an error - system headers may not ride in a

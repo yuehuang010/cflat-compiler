@@ -685,7 +685,7 @@ importDeclaration
     | Import 'program' StringLiteral As Identifier ';'
     | Import 'package' StringLiteral libClause? frameworkClause? defineClause* cacheClause? ';'
     | Import 'package-vcpkg' StringLiteral fromClause defineClause* ';'
-    | Import 'package-nuget' importGroup fromClause defineClause* ';'
+    | Import 'package-nuget' importGroup fromClause priClause? defineClause* ';'
     | Import 'framework' importGroup ';'
     ;
 
@@ -733,6 +733,14 @@ frameworkClause
 // Sub-rule (like libClause) so importDeclaration keeps a single direct StringLiteral.
 defineClause
     : 'define' StringLiteral
+    ;
+
+// Optional inline pri deployment for a package-nuget import (WinUI/MRT):
+//   import package-nuget "Microsoft.UI.Xaml.winmd" from "Id/1.2.3" pri "Foo.pri";
+// The named .pri is located inside the resolved package and copied next to the
+// output exe as <exe>.pri. Only valid on the package-nuget import alternative.
+priClause
+    : 'pri' StringLiteral
     ;
 
 // Optional inline opt-in to the persistent C-header disk cache:

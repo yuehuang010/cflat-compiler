@@ -1417,6 +1417,17 @@ and obtains `objc_msgSend` via `dlsym(RTLD_DEFAULT, ...)`. Targeting a non-macOS
 `import framework` is a compile error. See [C Interop](C_INTEROP.md) and the `--framework` flag
 in [CLI](CLI.md).
 
+#### Deploying a package resource (`pri` clause on `package-nuget`)
+
+A `pri "<file>"` clause on an `import package-nuget` line locates the named `.pri` inside the
+resolved NuGet package and copies it next to the output exe as `<exe>.pri` (WinUI's MRT probes
+`resources.pri` and `<exe>.pri` beside an unpackaged exe). It is only valid on `package-nuget`
+imports and deploys only when emitting a native exe:
+
+```c
+import package-nuget "Microsoft.UI.Xaml.winmd" from "Microsoft.WindowsAppSDK.WinUI/1.8.260224000" pri "Microsoft.UI.Xaml.Controls.pri";
+```
+
 ---
 
 ## Type Casting

@@ -3098,7 +3098,15 @@ public:
                             std::string dr = dc->StringLiteral()->getText();
                             if (dr.size() >= 2) nugetDefines.push_back(DequoteStringLiteral(dr));
                         }
-                    Compiler()->CompileNugetImport(nugetFiles, packageSpec, nugetDefines);
+                    // Optional `pri "..."` clause: deploy the named .pri as <exe>.pri.
+                    std::string nugetPri;
+                    if (auto* pc = imp->priClause())
+                        if (pc->StringLiteral())
+                        {
+                            std::string pr = pc->StringLiteral()->getText();
+                            if (pr.size() >= 2) nugetPri = DequoteStringLiteral(pr);
+                        }
+                    Compiler()->CompileNugetImport(nugetFiles, packageSpec, nugetDefines, nugetPri);
                     continue;
                 }
                 // Grouped import `import { "a", "b" };` inside an if-const branch - header

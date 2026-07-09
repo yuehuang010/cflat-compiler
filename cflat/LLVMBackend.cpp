@@ -226,6 +226,15 @@ static std::string DequoteFromClause(CFlatParser::ImportDeclarationContext* imp)
     return DequoteStringLiteral(fc->StringLiteral()->getText());
 }
 
+// Dequoted .pri filename from `pri "..."` on an import package-nuget line (empty if
+// absent). The named .pri is deployed next to the exe as <exe>.pri.
+static std::string DequotePriClause(CFlatParser::ImportDeclarationContext* imp)
+{
+    auto* pc = imp->priClause();
+    if (!pc || !pc->StringLiteral()) return "";
+    return DequoteStringLiteral(pc->StringLiteral()->getText());
+}
+
 static std::vector<std::string> ReadFileToLines(std::ifstream& stream)
 {
     std::vector<std::string> lines;
@@ -656,7 +665,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         {
                             std::string packageSpec = DequoteFromClause(imp);
                             if (verbose) std::cout << std::format("[verbose] nuget import (group of {}) from {}\n", groupedImports.size(), packageSpec);
-                            if (!CompileNugetImport(groupedImports, packageSpec, DequoteDefineClauses(imp)))
+                            if (!CompileNugetImport(groupedImports, packageSpec, DequoteDefineClauses(imp), DequotePriClause(imp)))
                                 return false;
                             continue;
                         }
@@ -1418,7 +1427,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 {
                     std::string packageSpec = DequoteFromClause(imp);
                     if (verbose) std::cout << std::format("[verbose]   nested nuget import (group of {}) from {}\n", groupedImports.size(), packageSpec);
-                    if (!CompileNugetImport(groupedImports, packageSpec, DequoteDefineClauses(imp)))
+                    if (!CompileNugetImport(groupedImports, packageSpec, DequoteDefineClauses(imp), DequotePriClause(imp)))
                         return false;
                     continue;
                 }
@@ -2133,7 +2142,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     if (IsPackageNugetImport(imp))
                     {
                         std::string packageSpec = DequoteFromClause(imp);
-                        if (!CompileNugetImport(groupedImports, packageSpec, DequoteDefineClauses(imp)))
+                        if (!CompileNugetImport(groupedImports, packageSpec, DequoteDefineClauses(imp), DequotePriClause(imp)))
                             return false;
                         continue;
                     }

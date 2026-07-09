@@ -46,6 +46,7 @@ public:
         std::vector<std::string> winmdDirs;    // dirs to search for the imported .winmd
         std::vector<std::string> libs;         // absolute .lib paths to link
         std::vector<std::string> dlls;         // runtime DLLs to deploy next to the exe
+        std::string packageFolder;             // resolved package root (for `pri` clause lookup)
     };
 
     void SetPackagesDirOverride(const std::string& d) { packagesDirOverride_ = d; }  // --nuget-packages-dir
@@ -567,6 +568,9 @@ private:
                          Resolution& out)
     {
         std::set<std::string> seenInc, seenWinmd, seenLib, seenDll;
+
+        // Resolved package root, so the caller can locate a `pri "..."` file by convention.
+        out.packageFolder = pkgFolder.string();
 
         // --- 1. MsbuildLite eval of build\native\<Id>.{props,targets} + build\<Id>.{props,targets} ---
         std::map<std::string, std::string> seed = BuildSeedProps(root);
