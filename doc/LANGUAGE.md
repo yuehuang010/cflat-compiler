@@ -2265,9 +2265,12 @@ table is a file index of what each library is for.
 | `random.cb` | `Random` - splitmix64 PRNG with independent substreams (`jump`/`split`) |
 | `intrinsic.cb` | Compiler intrinsics: `popcount`, `ctz`, `clz`, `prefetch`, `likely`/`unlikely`, `pause()`, `cycle_count`/`cycle_count_serialized` |
 
-`cycle_count()` returns the raw CPU cycle counter as a `u64` (lowers to `llvm.readcyclecounter`:
-RDTSC on x86, the cycle-count register on other targets). It is a *cycle* count, not a
-wall-clock value - use it only for deltas. It is NON-serializing: out-of-order execution may
+`cycle_count()` returns the raw hardware tick counter as a `u64` (lowers to `llvm.readcyclecounter`:
+RDTSC on x86, `CNTVCT_EL0` on arm64). It is a *tick* count, not a wall-clock value - use it only
+for deltas. The tick rate is target-specific and is not a CPU clock in general: x86 RDTSC ticks at
+a GHz-scale invariant rate, while arm64's `CNTVCT_EL0` is a fixed ~24MHz timebase that does not
+track the core clock. Compare deltas only against other deltas on the same target; never hard-code
+a ticks-per-second constant. It is NON-serializing: out-of-order execution may
 reorder instructions across the read, so `cycle_count_serialized()` (an LFENCE-bracketed read on
 x86) is the choice for tight per-region measurement. Portable and unguarded, unlike time.cb's
 x86-only `rdtscp()`/`lfence()`. Prefer it over the QPC-based `Stopwatch`/`Duration` in `time.cb`

@@ -67,15 +67,21 @@ void pause()
         __pause();
 }
 
-// Read the CPU cycle counter and return the raw 64-bit count.  Portable: lowers
-// to RDTSC on x86 and the platform cycle-count register on other targets (0 where
+// Read the hardware tick counter and return the raw 64-bit count.  Portable: lowers
+// to RDTSC on x86 and the platform tick register on other targets (0 where
 // unsupported), so unlike time.cb's x86-only rdtscp() it needs no __X86__ guard.
+//
+// The TICK RATE is target-specific and is NOT a CPU clock in general: on x86 RDTSC
+// counts at the (GHz-scale) invariant-TSC rate, while on arm64 this is CNTVCT_EL0, a
+// fixed-frequency timebase (~24MHz on Apple silicon) that does not track core clock.
+// So a tick delta is comparable only against other deltas ON THE SAME TARGET - never
+// hard-code a cycles-per-second constant, and never convert ticks to time.
 //
 // NON-SERIALIZING: out-of-order execution may reorder instructions across this
 // read, so back-to-back deltas can smear.  Use cycle_count_serialized() (or, on
 // x86, time.cb's rdtscp() + lfence()) to fence a measured region.
 //
-// Returns CYCLES, not nanoseconds; use only for deltas, never as a wall clock.
+// Returns TICKS, not nanoseconds; use only for deltas, never as a wall clock.
 // For wall-clock timing prefer the QPC-based Stopwatch/Duration in time.cb.
 u64 cycle_count()
 {

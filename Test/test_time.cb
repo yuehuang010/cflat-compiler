@@ -149,12 +149,17 @@ int testCycleCount()
     // Reference acc so the spin loop is not optimized away.
     passed += Test("spin loop ran", acc > 0, true);
 
-    // Bracket a ~10ms sleep; the delta must clear a very loose lower bound.
+    // Bracket a ~10ms sleep; the delta must clear a very loose lower bound. The tick
+    // rate is target-specific: x86 RDTSC runs at GHz, arm64's CNTVCT_EL0 is a fixed
+    // ~24MHz timebase, so a GHz-scale bound would wrongly fail there.
     u64 before = cycle_count();
     sleep(10);
     u64 after = cycle_count();
     u64 delta = after - before;
-    passed += Test("cycle_count advances over 10ms sleep", delta > 1000000, true);
+    u64 minDelta = 10000;         // 10ms of a >=1MHz timebase (arm64 CNTVCT_EL0)
+    if const (__X86__)
+        minDelta = 1000000;       // 10ms of a >=100MHz TSC (x86 RDTSC, really GHz)
+    passed += Test("cycle_count advances over 10ms sleep", delta > minDelta, true);
     printf("cycle delta over 10ms sleep: %llu\n", delta);
 
     // Serializing wrapper returns a plausible (nonzero) value.
