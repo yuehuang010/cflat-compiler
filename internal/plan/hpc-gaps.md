@@ -2,8 +2,9 @@
 
 Status: G1-G3 AND G5 DONE, G2 incl Phase 2 reduce_dynamic (2026-07-09,
 integrated on master, all Windows gates green); G7's rdtsc-timing and
-BLAS-example sub-items also DONE (2026-07-09). G4 (planned) / G6 and the
-rest of G7 remain PROPOSED.
+BLAS-example sub-items also DONE (2026-07-09). G4 DONE 2026-07-09
+(vectorize(contract)/vectorize(reassoc) tiers - see detailed plan). G6
+and the rest of G7 remain PROPOSED.
 WSL test.sh re-verification for the core library changes deliberately
 skipped (user decision at integration).
 Created: 2026-07-09
@@ -243,16 +244,32 @@ Write its own plan before starting; do not fold into a gap-fix pass.
   behind an opt-in `threads` feature (USE_THREAD, off by default) - without
   it, openblas_get_num_procs/num_threads report 1/1 regardless of host
   core count and cblas_dgemm runs single-threaded (~7 GFLOP/s @1024 on the
-  dev box, slower than Mat.gemm). With `threads` on (current manifest),
-  num_procs/num_threads correctly report 20/20, but throughput (~28-38
-  GFLOP/s across 256/512/1024) still lands well under the old prebuilt
-  release's ~126-307 GFLOP/s and under Mat.gemm (pool, 8w)'s ~51-74
-  GFLOP/s - most likely because vcpkg's default port build lacks
-  DYNAMIC_ARCH (the prebuilt release's runtime-dispatched, per-microarch
-  assembly kernels). Both the single-thread-default and threads-feature
-  numbers are recorded honestly in performance/hpc/README.md "External
-  BLAS" section alongside the original prebuilt-release table. Zero
-  compiler changes.
+  dev box, slower than Mat.gemm). With `threads` on (current manifest,
+  `{ "name": "openblas", "features": ["threads"] }`), num_procs/num_threads
+  correctly report 20/20, but throughput (~33-39 GFLOP/s across
+  256/512/1024) still lands well under the old prebuilt release's
+  ~126-307 GFLOP/s and under Mat.gemm (pool, 8w)'s ~43-74 GFLOP/s.
+  Root-caused (2026-07-09) and CONFIRMED CLOSED (vcpkg-side, not
+  fixable from the manifest): tried adding vcpkg's `dynamic-arch` feature
+  (DYNAMIC_ARCH - the prebuilt release's runtime-CPUID-dispatched,
+  per-microarch assembly kernels) alongside `threads`; `vcpkg install`
+  rejects it outright - the port's supports-expression restricts
+  `dynamic-arch` to `!windows | mingw`, which excludes the `x64-windows`
+  MSVC triplet this repo builds against. `--allow-unsupported` would force
+  it past that check but the port's own message warns of known build/
+  runtime problems doing so on an unsupported platform; not attempted
+  without a separate, explicit approval (it would also need
+  `--allow-unsupported` threaded through VcpkgResolver's `vcpkg install`
+  call - a compiler change, not a manifest edit). Manifest reverted to
+  `threads`-only (the verified-good config) after the attempt. The
+  remaining gap to the prebuilt release's tuned kernels is therefore a
+  real, currently-unclosed limitation of sourcing OpenBLAS via vcpkg's
+  MSVC/x64-windows port. All of: single-thread-default, threads-feature,
+  and the blocked dynamic-arch attempt are recorded honestly in
+  performance/hpc/README.md "External BLAS" section alongside the
+  original prebuilt-release table. Zero compiler changes made (a
+  compiler change would be needed to go further, via --allow-unsupported
+  plumbing).
 - rdtsc-class timing: DONE (2026-07-09). time.cb already had the x86-only
   serializing rdtscp()/lfence(); the gap was a PORTABLE counter (rdtscp()
   returns 0 on non-x86, e.g. macOS arm64). Added the target-independent

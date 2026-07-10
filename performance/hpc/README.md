@@ -155,13 +155,21 @@ this host); `Mat.gemm (pool)` is the core kernel fanned out over 8 pinned worker
 | 1024 | 6.992 ms / **307.2** GFLOP/s | 67.49 ms / 31.8 GFLOP/s | 21.65 ms / 99.2 GFLOP/s |
 
 The demo now sources OpenBLAS from vcpkg (`example/vcpkg/vcpkg.json`) instead of that prebuilt
-package. The port's threading is opt-in (`threads` feature -> `USE_THREAD`), so it was re-measured
-twice, honestly, against the vcpkg build:
+package. Two vcpkg port features affect performance; both were measured honestly, and a third
+(`dynamic-arch`, to try to close the remaining gap to the prebuilt release) was attempted and
+turned out to be blocked on this triplet - see below.
 
-**vcpkg build, `openblas` with no features (single-threaded default):**
+| Config | `openblas` manifest entry | What it changes |
+|---|---|---|
+| prebuilt release (orig.) | n/a - external `OpenBLAS-0.3.33-x64.zip` | Vendor build: multithreaded + `DYNAMIC_ARCH` (runtime CPUID-dispatched micro-kernels) |
+| vcpkg default | `"openblas"` | Single-threaded, one generic kernel |
+| vcpkg + `threads` (current manifest) | `{ "name": "openblas", "features": ["threads"] }` | Multithreaded (`USE_THREAD`), still one generic kernel |
+| vcpkg + `threads` + `dynamic-arch` | *(attempted, not usable - see below)* | Would add the CPUID-dispatched micro-kernels |
 
-| N (N x N x N) | OpenBLAS `cblas_dgemm` (vcpkg, no `threads`) | `Mat.gemm` (serial) | `Mat.gemm` (pool, 8w) |
-|---------------|-----------------------------------------------:|--------------------:|----------------------:|
+**vcpkg default (no features) - single-threaded:**
+
+| N (N x N x N) | OpenBLAS `cblas_dgemm` (vcpkg default) | `Mat.gemm` (serial) | `Mat.gemm` (pool, 8w) |
+|---------------|-----------------------------------------:|--------------------:|----------------------:|
 | 1024 | 305.9 ms / **7.0** GFLOP/s | 83.0 ms / 25.9 GFLOP/s | 29.0 ms / 74.1 GFLOP/s |
 
 `openblas_get_num_procs()` / `openblas_get_num_threads()` report **1 proc, 1 thread** here,
@@ -170,33 +178,53 @@ was off. At N=1024 that is ~44x slower than the prebuilt multithreaded release, 
 than single-threaded `Mat.gemm` - the opposite of the "vendor BLAS wins on peak throughput"
 takeaway the demo makes with the prebuilt package.
 
-**vcpkg build, `{ "name": "openblas", "features": ["threads"] }` (current manifest):**
+**vcpkg + `threads` (current manifest) - multithreaded, generic kernel:**
 
 | N (N x N x N) | OpenBLAS `cblas_dgemm` (vcpkg, `threads`) | `Mat.gemm` (serial) | `Mat.gemm` (pool, 8w) |
 |---------------|---------------------------------------------:|--------------------:|----------------------:|
-| 256  | 0.893 ms / **37.6** GFLOP/s | 1.341 ms / 25.0 GFLOP/s | 0.655 ms / 51.2 GFLOP/s |
-| 512  | 9.770 ms / **27.5** GFLOP/s | 12.765 ms / 21.0 GFLOP/s | 3.617 ms / 74.2 GFLOP/s |
-| 1024 | 63.945 ms / **33.6** GFLOP/s | 83.412 ms / 25.8 GFLOP/s | 30.547 ms / 70.3 GFLOP/s |
+| 256  | 1.029 ms / **32.6** GFLOP/s | 1.407 ms / 23.9 GFLOP/s | 0.779 ms / 43.1 GFLOP/s |
+| 512  | 6.852 ms / **39.2** GFLOP/s | 12.439 ms / 21.6 GFLOP/s | 3.702 ms / 72.5 GFLOP/s |
+| 1024 | 65.633 ms / **32.7** GFLOP/s | 99.807 ms / 21.5 GFLOP/s | 30.314 ms / 70.8 GFLOP/s |
 
 With `threads` enabled, `openblas_get_num_procs()` / `openblas_get_num_threads()` correctly report
 **20 procs, 20 threads** - the port now sees and uses the real core count. Throughput is much
-better than the single-threaded default (up to ~5x at 1024) but still well short of the prebuilt
-release's ~307 GFLOP/s, and `Mat.gemm` (pool, 8w) now *beats* `cblas_dgemm` at every size measured.
-The most likely reason: the prebuilt Windows release ships `DYNAMIC_ARCH` (multiple hand-tuned
-assembly micro-kernels, picked at runtime by CPUID - Zen-family kernels included), while vcpkg's
-default `openblas` port build does not enable that feature, so it falls back to a much more
-generic kernel even though it now has 20 threads to spread it across. This is reported as observed,
-not worked around - swapping to `DYNAMIC_ARCH` (if vcpkg's port exposes it as a feature) would be a
-further follow-up.
+better than the single-threaded default (roughly 4-6x) but still well short of the prebuilt
+release's 126-307 GFLOP/s, and `Mat.gemm` (pool, 8w) *beats* `cblas_dgemm` at every size measured
+(run-to-run variance on this heterogeneous host is real - see the cache-topology note earlier in
+this doc - but the gap to `Mat.gemm` pool is consistent across repeated runs, not noise).
+
+**`dynamic-arch` attempted, not usable on this triplet:** the vcpkg port declares
+`openblas[dynamic-arch]` (`"Support for multiple targets in a single library"`, i.e. `DYNAMIC_ARCH`)
+as `"only supported on '!windows | mingw'"` - MSVC's `x64-windows` triplet is explicitly excluded.
+Adding `{ "name": "openblas", "features": ["dynamic-arch", "threads"] }` fails the install outright:
+
+```
+openblas[dynamic-arch] is only supported on '!windows | mingw', which does not match x64-windows.
+```
+
+vcpkg does offer `--allow-unsupported` to force it anyway, but the port's own message warns of
+"known build failures, or runtime problems" doing so - not attempted here without a deliberate,
+separately-approved follow-up (and it would need `--allow-unsupported` threaded through
+`VcpkgResolver`'s `vcpkg install` invocation, a compiler-side change, not just a manifest edit).
+vcpkg rejects the feature at the supports-expression check before any compilation starts, so no
+`dynamic-arch` build ever ran here and there is no DLL-size comparison to report; the current
+`openblas.dll` (`threads` only, no `dynamic-arch`) is **2,712,064 bytes** (~2.6 MB).
+The manifest was reverted to `{ "name": "openblas", "features": ["threads"] }` (the last known-good,
+verified config) after this was discovered. **The remaining gap to the prebuilt release's
+per-microarchitecture tuned kernels is therefore a real, currently-unclosed limitation of sourcing
+OpenBLAS through vcpkg's MSVC/x64-windows port**, not something this example's configuration can
+fix.
 
 **Takeaway.** With the prebuilt, multithreaded, `DYNAMIC_ARCH`-tuned release, OpenBLAS reaches
 ~307 GFLOP/s at 1024; `Mat.gemm` reaches ~99 GFLOP/s pooled (~32% of OpenBLAS) and ~32 GFLOP/s
 single-threaded (~10%), with zero external dependencies. With the vcpkg-managed build this example
-now uses, the `threads` feature is required just to get OpenBLAS off single-core (7 -> 34
-GFLOP/s at 1024), and even then `Mat.gemm` (pool) wins by ~2x - a reminder that "vendor BLAS beats
-a self-written kernel" is a claim about a *specific, tuned build* of that vendor library, not the
-library in the abstract. Either way, the header-import path makes swapping one BLAS binding (or
-build configuration) for another a two-line change.
+now uses, the `threads` feature is required just to get OpenBLAS off single-core (roughly 7 -> 33
+GFLOP/s at 1024), and even then `Mat.gemm` (pool) wins by ~2x, because vcpkg's `x64-windows` port
+cannot build the `DYNAMIC_ARCH` tuned kernels the prebuilt release ships - a reminder that "vendor
+BLAS beats a self-written kernel" is a claim about a *specific, tuned build* of that vendor library,
+not the library in the abstract, and that a package manager's default port build is not always that
+build. Either way, the header-import path makes swapping one BLAS binding (or build configuration)
+for another a two-line change.
 
 ## Latency-bound: the B+ tree (`bptree.cb`)
 

@@ -1832,6 +1832,24 @@ private:
     // `vectorize` loop re-arms it for itself.
     bool vectorizeActive_ = false;
     int  vectorizeLine_ = 0;
+    // FP-math relaxation tier requested by `vectorize(contract)` / `vectorize(reassoc)`.
+    // Latched with vectorizeActive_ and consumed at the iteration-statement emit so a
+    // nested loop does not inherit it. Drives the builder fast-math flags on the loop body.
+    enum class VectorizeFpTier { None, Contract, Reassoc };
+    VectorizeFpTier vectorizeFpTier_ = VectorizeFpTier::None;
+
+    // Set the builder's fast-math flags for the loop body according to the tier.
+    // contract lets mul+add fuse to fma; reassoc additionally lets the optimizer
+    // regroup FP expressions and split reduction accumulators (implies contract).
+    static void ApplyVectorizeFpTier(LLVMBackend* compiler, VectorizeFpTier tier)
+    {
+        if (tier == VectorizeFpTier::None) return;
+        llvm::FastMathFlags f = compiler->builder->getFastMathFlags();
+        f.setAllowContract(true);
+        if (tier == VectorizeFpTier::Reassoc)
+            f.setAllowReassoc(true);
+        compiler->builder->setFastMathFlags(f);
+    }
     // Line of the `vectorize` keyword whose loop body is currently being emitted (0 = none).
     // Set across the body codegen so span-accessor lowering can attribute a noalias-defeating
     // accessor to the enclosing vectorize loop (Detection A). Saved/restored to survive nesting.
@@ -3588,6 +3606,23 @@ public:
                     "vectorize supports counted 'for' and 'while' loops only");
                 return;
             }
+            // Optional FP-math tier flag: 'contract' or 'reassoc' (tiers, not composable;
+            // reassoc implies contract). Anything else is rejected.
+            vectorizeFpTier_ = VectorizeFpTier::None;
+            if (auto* flagId = vectorizeStatement->Identifier())
+            {
+                const std::string flag = flagId->getText();
+                if (flag == "contract")
+                    vectorizeFpTier_ = VectorizeFpTier::Contract;
+                else if (flag == "reassoc")
+                    vectorizeFpTier_ = VectorizeFpTier::Reassoc;
+                else
+                {
+                    LogErrorContext(vectorizeStatement,
+                        "vectorize flag must be 'contract' or 'reassoc'");
+                    return;
+                }
+            }
             vectorizeActive_ = true;
             vectorizeLine_ = static_cast<int>(vectorizeStatement->getStart()->getLine());
 
@@ -4032,7 +4067,9 @@ public:
             // loop level (a nested loop in the body re-reads a cleared flag).
             bool doVectorize = vectorizeActive_;
             int  vectorizeLine = vectorizeLine_;
+            VectorizeFpTier fpTier = vectorizeFpTier_;
             vectorizeActive_ = false;
+            vectorizeFpTier_ = VectorizeFpTier::None;
 
             /*
             iterationStatement
@@ -4112,7 +4149,12 @@ public:
                 {
                     int prevBody = currentVectorizeBodyLine_;
                     if (doVectorize) currentVectorizeBodyLine_ = vectorizeLine;
+                    // Apply the FP-math tier to the body's FP ops; save/restore so nothing
+                    // outside the lexical body inherits the flags (and outer scopes compose).
+                    llvm::FastMathFlags prevFMF = compiler->builder->getFastMathFlags();
+                    ApplyVectorizeFpTier(compiler, fpTier);
                     ParseControlledBody(innerStatement);
+                    compiler->builder->setFastMathFlags(prevFMF);
                     currentVectorizeBodyLine_ = prevBody;
                 }
                 compiler->CreateContinueCall();
@@ -4173,7 +4215,11 @@ public:
                     {
                         int prevBody = currentVectorizeBodyLine_;
                         if (doVectorize) currentVectorizeBodyLine_ = vectorizeLine;
+                        // Apply the FP-math tier to every FP op the body emits (see while-form).
+                        llvm::FastMathFlags prevFMF = compiler->builder->getFastMathFlags();
+                        ApplyVectorizeFpTier(compiler, fpTier);
                         ParseControlledBody(innerStatement);
+                        compiler->builder->setFastMathFlags(prevFMF);
                         currentVectorizeBodyLine_ = prevBody;
                     }
                     compiler->CreateContinueCall();

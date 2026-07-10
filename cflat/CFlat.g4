@@ -542,7 +542,7 @@ statement
 // the loop forms that cannot be vectorized (do-while, foreach). 'vectorize' is a
 // soft keyword (inline literal, same mechanism as 'lock'/'program').
 vectorizeStatement
-    : 'vectorize' iterationStatement
+    : 'vectorize' ('(' Identifier ')')? iterationStatement
     ;
 
 lockStatement

@@ -75,12 +75,145 @@ int vectorizeWhile()
     return count; // 512
 }
 
+// vectorize(contract): mul-add kernel. contract permits fusing a*b+c into one fma,
+// which changes at most the final rounding. Compared against an unfused serial
+// reference over the SAME inputs with a small tolerance (fused != unfused by <=1 ulp).
+int contractMulAddApprox()
+{
+    int n = 1024;
+    double[1024] a = default;
+    double[1024] b = default;
+    double[1024] c = default;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        double x = i;
+        a[i] = x / 3.0;
+        b[i] = (x + 1.0) / 7.0;
+        c[i] = (x + 2.0) / 11.0;
+    }
+
+    // Serial reference: plain (flagless) ops, separately rounded mul then add.
+    double[1024] ref = default;
+    for (int i = 0; i < n; i = i + 1)
+        ref[i] = a[i] * b[i] + c[i];
+
+    double[1024] out = default;
+    vectorize(contract) for (int k = 0; k < n; k = k + 1)
+    {
+        out[k] = a[k] * b[k] + c[k];
+    }
+
+    int fails = 0;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        double d = out[i] - ref[i];
+        if (d < 0.0) d = -d;
+        if (d > 1.0e-9) fails = fails + 1;
+    }
+    return fails;
+}
+
+// vectorize(contract) exact case: small-integer-valued doubles, where a*b+c is
+// computed with no rounding at all, so fused == unfused EXACTLY.
+int contractMulAddExact()
+{
+    int n = 256;
+    double[256] a = default;
+    double[256] b = default;
+    double[256] c = default;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        a[i] = i % 7;   // 0..6
+        b[i] = i % 5;   // 0..4
+        c[i] = i % 3;   // 0..2
+    }
+
+    double[256] out = default;
+    vectorize(contract) for (int k = 0; k < n; k = k + 1)
+    {
+        out[k] = a[k] * b[k] + c[k];
+    }
+
+    int fails = 0;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        double expect = a[i] * b[i] + c[i];   // exact for small integers
+        if (out[i] != expect) fails = fails + 1;
+    }
+    return fails;
+}
+
+// vectorize(reassoc): sum-of-products reduction. reassoc lets the optimizer regroup
+// and split accumulators, so the result drifts from a strict left-to-right serial sum
+// by more than the reduction ulp - compared with a looser RELATIVE tolerance.
+int reassocSumApprox()
+{
+    int n = 1024;
+    double[1024] a = default;
+    double[1024] b = default;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        double x = i;
+        a[i] = x / 3.0;
+        b[i] = (x + 1.0) / 7.0;
+    }
+
+    // Serial reference: strict left-to-right, unfused, un-reassociated.
+    double refSum = 0.0;
+    for (int i = 0; i < n; i = i + 1)
+        refSum = refSum + a[i] * b[i];
+
+    double sum = 0.0;
+    vectorize(reassoc) for (int k = 0; k < n; k = k + 1)
+    {
+        sum = sum + a[k] * b[k];
+    }
+
+    double d = sum - refSum;
+    if (d < 0.0) d = -d;
+    double denom = refSum;
+    if (denom < 0.0) denom = -denom;
+    if (d > 1.0e-6 * denom) return 1;
+    return 0;
+}
+
+// vectorize(reassoc) exact case: small integers where every partial sum stays exact
+// in double, so any regrouping yields the identical result.
+int reassocSumExact()
+{
+    int n = 512;
+    double[512] a = default;
+    double[512] b = default;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        a[i] = i % 4;   // 0..3
+        b[i] = i % 3;   // 0..2
+    }
+
+    double sum = 0.0;
+    vectorize(reassoc) for (int k = 0; k < n; k = k + 1)
+    {
+        sum = sum + a[k] * b[k];
+    }
+
+    double refSum = 0.0;
+    for (int i = 0; i < n; i = i + 1)
+        refSum = refSum + a[i] * b[i];   // <= 512*6 = 3072, exact in any grouping
+
+    if (sum != refSum) return 1;
+    return 0;
+}
+
 extern int main()
 {
     int fails = 0;
     if (sumArrays() != 1571328) fails = fails + 1;
     if (reduceArray() != 500500) fails = fails + 1;
     if (vectorizeWhile() != 512) fails = fails + 1;
+    fails = fails + contractMulAddApprox();
+    fails = fails + contractMulAddExact();
+    fails = fails + reassocSumApprox();
+    fails = fails + reassocSumExact();
 
     if (fails == 0)
         printf("test_vectorize: all passed\n");

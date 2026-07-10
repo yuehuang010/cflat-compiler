@@ -1,0 +1,13 @@
+// vectorize accepts only the 'contract' and 'reassoc' FP-math tiers; any other
+// parenthesized flag (here 'fast') is rejected at parse time.
+extern int main()
+{
+    int[64] a = default;
+    expect_error("vectorize flag must be 'contract' or 'reassoc'") {
+        vectorize(fast) for (int i = 0; i < 64; i = i + 1)
+        {
+            a[i] = i;
+        }
+    }
+    return 0;
+}

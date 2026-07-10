@@ -81,9 +81,57 @@ Semantics:
   end), which reorders the sums and so can change the result in the last few ULPs.
   Mark a loop `vectorize` only when that reassociation is acceptable. For a parallel
   FP reduction where you want to control the accumulation explicitly, use
-  `parallel_reduce<T>` instead (see below).
+  `parallel_reduce<T>` instead (see below). To additionally fuse the `a[k] * b[k]`
+  products in a dot-product reduction into single fused-multiply-adds, use
+  `vectorize(contract)` - see the FP-math tiers below.
 - Only counted `for` and `while` are allowed; `do`/`while` and `foreach` are rejected
   up front (`foreach` lowers to `count()`/`get()` calls that cannot vectorize).
+
+### FP-math tiers: `vectorize(contract)` and `vectorize(reassoc)`
+
+Plain `vectorize` emits every floating-point operation in the loop body with default
+(strict) rounding: a `mul` then an `add` are two separately-rounded steps, and the
+optimizer may not regroup them. An optional parenthesized flag relaxes FP math for the
+loop's lexical body only. The flags are **tiers**, not composable options - `reassoc`
+implies `contract`:
+
+```c
+vectorize(contract) for (int k = 0; k < n; k = k + 1)
+{
+    out[k] = a[k] * b[k] + c[k];   // mul+add may fuse to one fma on FMA targets
+}
+
+vectorize(reassoc) for (int k = 0; k < n; k = k + 1)
+{
+    dot = dot + a[k] * b[k];       // products fuse AND the sum may be regrouped
+}
+```
+
+- **`vectorize(contract)`** sets the `contract` fast-math flag on the body's FP ops.
+  This lets the backend fuse a multiply feeding an add (`a*b + c`) into a single
+  fused-multiply-add (`vfmadd...` on AVX2/FMA targets), removing one intermediate
+  rounding step. It never reorders across statements - the "safe" tier. On a dot-
+  product reduction it stacks with the existing reduction reassociation, so the vector
+  body both fuses each product and accumulates in vector lanes (the dot-product payoff).
+- **`vectorize(reassoc)`** sets `reassoc` in addition to `contract`. It extends the
+  reordering permission that plain `vectorize` already grants to the reduction chain to
+  ALL FP math in the body: the optimizer may regroup expressions and split the
+  reduction into several independent accumulators. Results can differ from a strict
+  serial computation by more than the reduction ULP drift, so this is the tier for
+  "throughput over reproducibility" kernels.
+- The flags apply to the **lexical body** only - the loop condition/increment (integer
+  ops in a counted loop) and any code outside the loop stay strict, as do sibling and
+  outer plain loops. A lambda written inside a `vectorize(contract)`/`vectorize(reassoc)`
+  body is emitted inline through the same builder, so its FP ops inherit the tier too -
+  defensible lexical-scope semantics, and it does not leak past the loop.
+- Any flag other than `contract` or `reassoc` (e.g. `vectorize(fast)`) is a compile
+  error: `vectorize flag must be 'contract' or 'reassoc'`.
+- The flags are emitted at all optimization levels (harmless at `-O0`, where ISel may
+  still fuse a contracted mul-add); the vectorization contract itself is still enforced
+  only at `-O2`, unchanged. `contract` neither helps nor hurts vectorizability.
+- **`contract` is permission to fuse, not a guarantee.** For an exact, single-rounding
+  fused-multiply-add regardless of target or opt level, call `fma()` (see
+  `core/math.cb`) or use `simd`'s `fma` - those always lower to `llvm.fma`.
 
 ## `simd<T,N>` explicit vector type
 
@@ -202,7 +250,10 @@ simd<double,4> acc = simd<double,4>.fma(inv, dx, acc);       // acc = inv*dx + a
   back to a **per-lane libm `fma()` call**. That is correct but slow: in the N-body kernel it
   *halved* throughput (46 -> 19 GFLOP/s) versus plain `acc + dx*s`. Reach for `simd.fma` only
   when you specifically need the extra precision of single rounding *and* know the target has
-  FMA; for a plain accumulate, write `acc + a*b` and let it vectorize to `fmul`+`fadd`.
+  FMA; for a plain accumulate, write `acc + a*b` and let it vectorize to `fmul`+`fadd`. To let
+  the backend *fuse* that `fmul`+`fadd` into a hardware `vfmadd` when the target has FMA (and
+  fall back to the unfused pair otherwise), wrap the loop in `vectorize(contract)` - see
+  "FP-math tiers" under the `vectorize` section above.
 - **Every operand is a `simd<T,N>` of the same shape** - there is no implicit scalar splat
   here (unlike `+ - * /`). Splat first if you need a constant: `simd<double,4> k = 0.5;`.
 - **Transcendentals are deliberately excluded.** `exp`, `log`, `sin`, `cos`, `pow`, ... have

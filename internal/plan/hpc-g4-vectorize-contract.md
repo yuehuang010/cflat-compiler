@@ -1,6 +1,6 @@
 # G4: FP-Math Tiers via vectorize(contract) / vectorize(reassoc) - Detailed Plan
 
-Status: PROPOSED
+Status: LANDED 2026-07-09 (Windows; branch feature/hpc-g4-vectorize-fp)
 Created: 2026-07-09
 Parent: internal/plan/hpc-gaps.md (G4)
 
@@ -196,3 +196,88 @@ Single phase - the change is small but sits in grammar + ParseStatement
 + builder state: opus tier per the delegation table (grammar + codegen).
 Worktree + agent per the established flow. Disjoint from all G7 items -
 the BLAS example can run in parallel at sonnet tier if started.
+
+---
+
+## Implementation notes (as landed) - 2026-07-09
+
+Landed exactly as designed; both tiers work. Files changed:
+- `cflat/CFlat.g4`: vectorizeStatement gains `('(' Identifier ')')?`.
+- `cflat/MainListener.h`: `enum class VectorizeFpTier {None,Contract,Reassoc}`
+  + `vectorizeFpTier_` flag + static `ApplyVectorizeFpTier(compiler, tier)`
+  helper; parse-time validation in the vectorizeStatement branch (accepts
+  `contract`/`reassoc`, else LogErrorContext + return); tier captured/cleared
+  at the iteration-statement consume site next to `vectorizeActive_`; FMF
+  save/set/restore wrapped around `ParseControlledBody` at both the while-form
+  and for-form body brackets.
+- `Test/test_vectorize.cb`: four new functions (contract approx+exact,
+  reassoc approx+exact), wired into main's fails counter.
+- `Test/errors/err_vectorize_bad_flag.cb`: new error test on `vectorize(fast)`.
+- `doc/HPC.md`: FP-math-tiers subsection, reduction bullet amended, simd `fma`
+  caveat cross-linked to `vectorize(contract)`.
+
+Deviations from the plan:
+- ResetForReanalysis: the plan said to clear `vectorizeFpTier_` there, but
+  `ResetForReanalysis` is an `LLVMBackend` method and the vectorize flags are
+  `MainListener` members. `MainListener` is constructed fresh per analysis
+  (`std::make_unique<MainListener>` in LLVMBackend.cpp / LspServer.cpp), so its
+  members default-init each run - exactly how `vectorizeActive_` is already
+  handled (it is NOT in ResetForReanalysis either). Leak prevention is fully
+  covered by the default member initializer (`None`) plus the consume-site
+  clear next to `vectorizeActive_ = false`. No ResetForReanalysis edit needed;
+  `vectorizeFpTier_` mirrors `vectorizeActive_` one-for-one.
+
+VERIFY-AT-IMPLEMENTATION outcomes:
+- (a) Lambda/closure bodies inside a vectorize body: ACCEPTED (inherit the
+  tier). Read the emission path: `ParseLambdaExpression` emits the lambda body
+  inline through the same `compiler->builder` (`ParseBlockItemList` /
+  `ParseAssignmentExpression`), guarded by `SaveBuilderState`/`RestoreBuilderState`.
+  `BuilderState` snapshots only the insert point + function/return + pending
+  temps; it does NOT snapshot fast-math flags (and `saveIP`/`restoreIP` save
+  only the insertion point). So a lambda written lexically inside the loop body
+  has its FP ops emitted while the FMF is set and inherits contract/reassoc.
+  This does NOT leak past the region: the FMF is restored right after
+  `ParseControlledBody`, so nothing after the loop (or in sibling/outer loops)
+  is affected - verified in the .ll (see below). Defensible lexical-scope
+  semantics; documented in HPC.md. No extra save/restore added.
+- (b) reassoc + nsz: NOT needed. Empirically, `vectorize(reassoc)` on a
+  sum-of-products at `-O2 --cpu x86-64-v3` already splits the reduction into
+  four independent `<4 x double>` accumulators (accumulator splitting) and
+  finishes with `llvm.vector.reduce.fadd`, all carrying `reassoc contract` and
+  NO nsz. LLVM 18 initializes the split-lane identities with `-0.0` itself, so
+  it does not require the source FMF to carry nsz. The reassoc tier therefore
+  sets `reassoc + contract` only (no nsz), as designed.
+
+.ll evidence (unoptimized, --out-lli):
+- `vectorize(contract)` body: `fmul contract` / `fadd contract`.
+- `vectorize(reassoc)` body: `fmul reassoc contract` / `fadd reassoc contract`.
+- Plain `vectorize` body, ops outside any loop, and sibling plain loops: bare
+  `fmul` / `fadd` (no flags).
+- Nested plain loop inside a tiered loop: inner body inherits `contract`.
+- Tiered loop inside a plain loop: only the inner tiered body carries `contract`;
+  the outer plain loop's ops before AND after the nested loop are flagless
+  (balanced save/restore).
+
+Optimized-IR / codegen evidence (-O2 --cpu x86-64-v3):
+- contract mul-add kernel vectorizes to `<4 x double>` with `fmul/fadd contract`,
+  and `llc -mcpu=x86-64-v3` lowers it to `vfmadd132pd` / `vfmadd132sd`.
+- The same kernel under PLAIN `vectorize` produces 0 `vfmadd` and 0 `contract`
+  flags - confirming the tier is what enables the fusion.
+- Note: `--cpu native` resolves to baseline SSE2 on this box (no FMA); use
+  `x86-64-v3` for FMA evidence, per the plan.
+
+Gates (Release, all green):
+- `cmake_build.bat release`: build + ANTLR regen succeeded.
+- `test.bat Release`: all tests passed (incl. test_vectorize + err test).
+- `test_hpc.bat Release`: all HPC checks passed (test_vectorize `--run -O2`
+  positive + three vectorize negatives + span-noalias).
+- `test_lsp.bat Release`: 202 passed, 0 failed. (A first run showed 4 transient
+  failures in `example/vcpkg/*` from a cold vcpkg header-bind cache under the
+  parallel sweep; a warm-cache re-run is 202/0 and the baseline exe passes them
+  too - not a regression, and orthogonal to this change.)
+- `example.bat Release`: 88 passed, 0 failed, 24 skipped.
+
+Skipped per instructions: the perf-evidence step (main session benchmarks
+after landing). Both-pass ParseDeclarationSpecifiers untouched (verified: the
+diff does not reference it). Vectorize enforcement (LLVMBackend.cpp:1974-2061)
+and loop metadata (AttachVectorizeHintToCurrentLatch) untouched.
