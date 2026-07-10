@@ -170,12 +170,13 @@ if exist "%SRC%\cinterop\build_mathlib.bat" (
 
 set /a LAUNCHED=0
 
-REM Launch error tests as 4 parallel groups - files distributed round-robin by test_err.bat
-set /a LAUNCHED+=4
-start "" /b cmd /c "%SCRIPT% --worker-err 1"
-start "" /b cmd /c "%SCRIPT% --worker-err 2"
-start "" /b cmd /c "%SCRIPT% --worker-err 3"
-start "" /b cmd /c "%SCRIPT% --worker-err 4"
+REM Launch the error tests as CFLAT_ERR_GROUPS parallel groups - files are distributed
+REM round-robin across the groups by test_err.bat, which reads the same variable.
+if not defined CFLAT_ERR_GROUPS set CFLAT_ERR_GROUPS=4
+for /l %%G in (1,1,%CFLAT_ERR_GROUPS%) do (
+    set /a LAUNCHED+=1
+    start "" /b cmd /c "%SCRIPT% --worker-err %%G"
+)
 
 REM Launch the HPC -O2 IR checks (vectorize keyword + span noalias) as one worker.
 set /a LAUNCHED+=1

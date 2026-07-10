@@ -490,8 +490,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // the %string type pre-created by RegisterBuiltinString in Init().
     // --run is read-only (see the run-mode note below): it touches no on-disk caches, so the
     // import/core-bitcode cache is disabled here just like an explicit --no-cache.
+    // Batch (--check) loads the cache too: ResetForReanalysis leaves each file in the same
+    // state a fresh backend is in at this point, and the load replaces context/module wholesale.
     bool bitcodeLoaded = false;
-    if (!batchMode_ && !noCache_ && !runMode_ && !runtimeDir.empty() && !skipRuntimeImport)
+    if (!noCache_ && !runMode_ && !runtimeDir.empty() && !skipRuntimeImport)
     {
         std::string bcCacheDir = GetRuntimeBitcodeDir(runtimeDir);
         if (!bcCacheDir.empty())

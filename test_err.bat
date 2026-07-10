@@ -11,56 +11,39 @@ if "%~1"=="--group" set GROUP=%~2
 
 set ERRORS=0
 
+REM Files are distributed round-robin across GROUP_COUNT groups by index modulo
+REM GROUP_COUNT. Adding a new err_*.cb is self-maintaining - no list updates needed.
+REM test.bat exports CFLAT_ERR_GROUPS and launches exactly that many --worker-err workers.
+if not defined CFLAT_ERR_GROUPS set CFLAT_ERR_GROUPS=4
+set GROUP_COUNT=%CFLAT_ERR_GROUPS%
+
 if "%GROUP%"=="0" goto :RunAll
-if "%GROUP%"=="1" goto :Group1
-if "%GROUP%"=="2" goto :Group2
-if "%GROUP%"=="3" goto :Group3
-if "%GROUP%"=="4" goto :Group4
+if %GROUP% geq 1 if %GROUP% leq %GROUP_COUNT% goto :RunOneGroup
 goto :RunAll
 
 :RunAll
-call :Group1Tests
-call :Group2Tests
-call :Group3Tests
-call :Group4Tests
+set /a G=1
+:RunAllLoop
+call :GroupTests !G!
+set /a G+=1
+if !G! leq %GROUP_COUNT% goto :RunAllLoop
 goto :Done
 
-:Group1
-call :Group1Tests
+:RunOneGroup
+call :GroupTests %GROUP%
 goto :Done
 
-:Group2
-call :Group2Tests
-goto :Done
-
-:Group3
-call :Group3Tests
-goto :Done
-
-:Group4
-call :Group4Tests
-goto :Done
-
-REM Files are distributed round-robin across 4 groups by index modulo 4.
-REM Adding a new err_*.cb is self-maintaining - no list updates needed.
-
-:Group1Tests
-call :RunModuloGroup 0 4
-exit /b
-
-:Group2Tests
-call :RunModuloGroup 1 4
-exit /b
-
-:Group3Tests
-call :RunModuloGroup 2 4
-for %%F in (%SRC%\errors\circular\entry_*.cb) do (
-    call :RunCircularTest %%~nxF
+REM Group N checks the files whose index mod GROUP_COUNT == N-1. Group 1 also runs the
+REM circular-import tests (separate single-file compiler invocations); it carries them
+REM because group 1 is the only group guaranteed to exist for any CFLAT_ERR_GROUPS.
+:GroupTests
+set /a GRP_REM=%~1-1
+call :RunModuloGroup !GRP_REM! %GROUP_COUNT%
+if "%~1"=="1" (
+    for %%F in (%SRC%\errors\circular\entry_*.cb) do (
+        call :RunCircularTest %%~nxF
+    )
 )
-exit /b
-
-:Group4Tests
-call :RunModuloGroup 3 4
 exit /b
 
 :RunModuloGroup
