@@ -1,7 +1,7 @@
 // winui_gallery.cb - the WinUI 3 launcher for the widget-gallery flagship (P12).
 //
 // The host-neutral GalleryApp Component + its 25-assert headless self-test live in
-// example/ui/gallery/gallery_app.cb (shared with the Win32/Cocoa launcher gallery.cb). This
+// example/ui/05-gallery/gallery_app.cb (shared with the Win32/Cocoa launcher gallery.cb). This
 // file wires them to winui_host.cb (the WinUI 3 NativeHost backend) - the THIRD host the setListOp
 // seam + the whole native* driver surface run against, which is the last design-risk retirement
 // before the API can freeze.
@@ -11,7 +11,7 @@
 // the tree and every native* driver creates/drives/reads controls with plain COM calls, then Exits.
 //
 // Build (needs -i to both winui/ and ui/ + gallery/; the winmds/bootstrapper come from NuGet):
-//   cflat winui_gallery.cb -i example/ui/winui -i example/ui -i example/ui/gallery -o winui_gallery.exe
+//   cflat winui_gallery.cb -i example/ui/06-winui -i example/ui -i example/ui/05-gallery -o winui_gallery.exe
 // Headless self-test:  winui_gallery.exe --selftest
 // (example.bat runs it via --worker-winui when the WindowsAppSDK NuGet packages are cached.)
 

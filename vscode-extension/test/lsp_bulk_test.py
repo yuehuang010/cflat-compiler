@@ -194,16 +194,16 @@ def collect_files(include_win32_demo: bool) -> list[Path]:
     if not include_win32_demo:
         demo = (REPO_ROOT / WIN32_METADATA_DEMO).resolve()
         files = [f for f in files if f.resolve() != demo]
-    # example/ui/winui/* import the WinUI 3 runtime winmds (Microsoft.UI.Xaml.winmd) from a
+    # example/ui/06-winui/* import the WinUI 3 runtime winmds (Microsoft.UI.Xaml.winmd) from a
     # sibling `winmd/` dir plus the Windows App SDK bootstrapper; the bare sweep has neither
     # the -i dir nor the App SDK, so it cannot resolve them. They are exercised by example.bat's
     # --worker-winui gate with the right flags. Skip them here (like the Win32-metadata demo).
-    winui_dir = (REPO_ROOT / "example" / "ui" / "winui").resolve()
+    winui_dir = (REPO_ROOT / "example" / "ui" / "06-winui").resolve()
     files = [f for f in files if winui_dir not in f.resolve().parents]
     # core/ui_native/winui.cb is the WinUI 3 host: it imports the Windows App SDK runtime
     # winmds (Microsoft.UI.Xaml.winmd) via package-nuget, which the bare sweep cannot resolve
     # (no -i dir, no App SDK). It is exercised by example.bat's --worker-winui gate with the
-    # right flags; skip it here like the example/ui/winui/* launchers above.
+    # right flags; skip it here like the example/ui/06-winui/* launchers above.
     # Path-qualified (not bare "winui.cb") since core/ui_native/ is not the only place
     # a file could plausibly be named winui.cb.
     files = [
@@ -216,7 +216,7 @@ def collect_files(include_win32_demo: bool) -> list[Path]:
     # analysis therefore cannot resolve those drivers; both launchers are swept and
     # example.bat exercises the component on both hosts. Skip it here.
     files = [f for f in files if f.name != "gallery_app.cb"]
-    # todo_app.cb (example/ui/testing/) is the ui_test.cb template's host-neutral app module:
+    # todo_app.cb (example/ui/07-testing/) is the ui_test.cb template's host-neutral app module:
     # like gallery_app.cb it imports only the element model and resolves the native* host
     # drivers (hostWidth/hostHeight/...) from its LAUNCHER, todo_test.cb, which shares one
     # global scope with it. Standalone analysis cannot resolve those drivers; todo_test.cb is

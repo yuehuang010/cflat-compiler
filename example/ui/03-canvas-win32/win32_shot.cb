@@ -8,7 +8,7 @@
 // visual oracle, not a single-pixel GetPixel assertion.
 //
 // Build & run:
-//   x64/Release/cflat.exe example/ui/win32_shot.cb -o out/win32_shot.exe
+//   x64/Release/cflat.exe example/ui/03-canvas-win32/win32_shot.cb -o out/win32_shot.exe
 //   out\win32_shot.exe out/ui_shot.bmp
 //
 // It reuses GdiCanvas + the cell/pixel mapping from core/ui_canvas/win32.cb and the

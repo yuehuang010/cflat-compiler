@@ -15,8 +15,8 @@
 //     main() falls back to a deterministic headless self-test that prints
 //     PASS/FAIL with a non-zero exit on any failure.
 //
-// Run the self-test:   x64/Release/cflat.exe example/ui/tui_demo.cb --run
-// Run interactively:   x64/Release/cflat.exe example/ui/tui_demo.cb -o out/tui_demo.exe && out\tui_demo.exe
+// Run the self-test:   x64/Release/cflat.exe example/ui/02-terminal/tui_demo.cb --run
+// Run interactively:   x64/Release/cflat.exe example/ui/02-terminal/tui_demo.cb -o out/tui_demo.exe && out\tui_demo.exe
 
 import "ui_canvas/term.cb";
 

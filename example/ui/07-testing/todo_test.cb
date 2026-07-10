@@ -9,7 +9,7 @@
 // sleep() in scope (waitUntil is the only place time appears; everything else is synchronous).
 //
 // Build + run headless (the CI recipe: --heap-audit gates for leaks, <nul feeds no stdin):
-//   x64/Release/cflat.exe example/ui/testing/todo_test.cb -i example/ui/testing --heap-audit -o out/todo_test.exe
+//   x64/Release/cflat.exe example/ui/07-testing/todo_test.cb -i example/ui/07-testing --heap-audit -o out/todo_test.exe
 //   out\todo_test.exe            # runs every case; exit code 0 = all passed
 //   out\todo_test.exe --list     # print case names and exit
 //   out\todo_test.exe --filter add   # run only cases whose name contains "add"

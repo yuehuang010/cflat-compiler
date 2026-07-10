@@ -6,7 +6,7 @@
 // so the two trees serialize to identical JSON - which this file asserts, gating
 // example.bat on desugaring correctness.
 //
-// Run:  x64/Release/cflat.exe example/ui/counter_jsx.cb --run
+// Run:  x64/Release/cflat.exe example/ui/01-elements/counter_jsx.cb --run
 
 import "ui_native.cb";
 

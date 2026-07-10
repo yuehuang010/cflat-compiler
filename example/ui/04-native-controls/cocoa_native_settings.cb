@@ -7,11 +7,11 @@
 // NSProgressIndicator, an NSSlider. AppKit paints them, handles IME, and owns Tab.
 //
 // Build & run (live window):
-//   x64/Release/cflat example/ui/cocoa_native_settings.cb -i example/ui -i example/macos -o out/nsettings_mac
+//   x64/Release/cflat example/ui/04-native-controls/cocoa_native_settings.cb -i example/ui -i example/macos -o out/nsettings_mac
 //   ./out/nsettings_mac
 //
 // Headless state-assert self-test (no visible window; example_mac.sh gate):
-//   x64/Release/cflat example/ui/cocoa_native_settings.cb -i example/ui -i example/macos --heap-audit -o out/nsettings_mac
+//   x64/Release/cflat example/ui/04-native-controls/cocoa_native_settings.cb -i example/ui -i example/macos --heap-audit -o out/nsettings_mac
 //   ./out/nsettings_mac --selftest
 import "ui_native_cocoa.cb";
 

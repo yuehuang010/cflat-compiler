@@ -11,7 +11,7 @@
 // switching tabs saves the outgoing buffer into the model and loads the incoming one.
 //
 // Build & run:
-//   x64/Release/cflat.exe example/ui/fedit/fedit.cb -i example/ui -o out/fedit.exe
+//   x64/Release/cflat.exe example/ui/08-fedit/fedit.cb -i example/ui -o out/fedit.exe
 //   out\fedit.exe
 //
 // Headless state-assert self-test (example.bat gate; drives via SendMessage + direct

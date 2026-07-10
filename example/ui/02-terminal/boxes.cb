@@ -7,8 +7,8 @@
 //   - Redirected I/O (CI, --run): Terminal.init() returns false, so it falls back
 //     to a deterministic headless self-test (resize scaling + click -> nested box).
 //
-// Run the self-test:   x64/Release/cflat.exe example/ui/boxes.cb --run
-// Run interactively:   x64/Release/cflat.exe example/ui/boxes.cb -o out/boxes.exe && out\boxes.exe
+// Run the self-test:   x64/Release/cflat.exe example/ui/02-terminal/boxes.cb --run
+// Run interactively:   x64/Release/cflat.exe example/ui/02-terminal/boxes.cb -o out/boxes.exe && out\boxes.exe
 //
 // BoxApp keeps termW/termH (the host pokes these in on resize) and a click count.
 

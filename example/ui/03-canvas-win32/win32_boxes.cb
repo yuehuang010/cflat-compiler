@@ -1,7 +1,7 @@
 // win32_boxes.cb - the resizable-box demo rendered through the native Win32 GDI
 // host, now exercising the Phase 3 widgets (TextInput + ScrollView).
 //
-// This is the SAME app shape as example/ui/boxes.cb but it renders to a real
+// This is the SAME app shape as example/ui/02-terminal/boxes.cb but it renders to a real
 // window with GDI. Nothing in the framework changed between the two - only the
 // host (core/ui_canvas/win32.cb's GdiCanvas + message loop) differs from the TUI
 // host. That is the whole point of the Canvas seam: swap the draw target, reuse
@@ -11,7 +11,7 @@
 // hook, in character cells), so it rescales live when you resize the window.
 //
 // Build & run:
-//   x64/Release/cflat.exe example/ui/win32_boxes.cb -o out/win32_boxes.exe
+//   x64/Release/cflat.exe example/ui/03-canvas-win32/win32_boxes.cb -o out/win32_boxes.exe
 //   out\win32_boxes.exe
 //
 // Headless GDI self-test (no window, used by example.bat):

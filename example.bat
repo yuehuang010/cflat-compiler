@@ -83,7 +83,7 @@ if "%~1"=="--worker-gui" (
     set "GUI_STEXE=!OUTDIR!\win32_boxes_st.exe"
     set "GUI_STLOG=!RESDIR!\!RESID!.log"
 
-    "!CFLAT!" "example\ui\win32_boxes.cb" --heap-audit -o "!GUI_STEXE!" > "!GUI_STLOG!" 2>&1
+    "!CFLAT!" "example\ui\03-canvas-win32\win32_boxes.cb" --heap-audit -o "!GUI_STEXE!" > "!GUI_STLOG!" 2>&1
     if not exist "!GUI_STEXE!" (
         echo FAIL win32_boxes.cb ^(gui self-test build failed^)>"!RESDIR!\!RESID!.result"
         exit /b
@@ -113,7 +113,7 @@ if "%~1"=="--worker-native" (
     set "NAT_STEXE=!OUTDIR!\win32_native_settings_st.exe"
     set "NAT_STLOG=!RESDIR!\!RESID!.log"
 
-    "!CFLAT!" "example\ui\win32_native_settings.cb" --heap-audit -o "!NAT_STEXE!" > "!NAT_STLOG!" 2>&1
+    "!CFLAT!" "example\ui\04-native-controls\win32_native_settings.cb" --heap-audit -o "!NAT_STEXE!" > "!NAT_STLOG!" 2>&1
     if not exist "!NAT_STEXE!" (
         echo FAIL win32_native_settings.cb ^(native self-test build failed^)>"!RESDIR!\!RESID!.result"
         exit /b
@@ -142,7 +142,7 @@ if "%~1"=="--worker-fedit" (
     set "FED_STEXE=!OUTDIR!\fedit_st.exe"
     set "FED_STLOG=!RESDIR!\!RESID!.log"
 
-    "!CFLAT!" "example\ui\fedit\fedit.cb" -i example/ui --heap-audit -o "!FED_STEXE!" > "!FED_STLOG!" 2>&1
+    "!CFLAT!" "example\ui\08-fedit\fedit.cb" -i example/ui --heap-audit -o "!FED_STEXE!" > "!FED_STLOG!" 2>&1
     if not exist "!FED_STEXE!" (
         echo FAIL fedit.cb ^(fedit self-test build failed^)>"!RESDIR!\!RESID!.result"
         exit /b
@@ -180,7 +180,7 @@ if "%~1"=="--worker-winui" (
     set "WEXE=!OUTDIR!\!WBASE!_wui.exe"
     set "WLOG=!RESDIR!\!RESID!.log"
 
-    "!CFLAT!" "!FILE!" -i example/ui/winui -i example/ui -i example/ui/gallery -o "!WEXE!" > "!WLOG!" 2>&1
+    "!CFLAT!" "!FILE!" -i example/ui/06-winui -i example/ui -i example/ui/05-gallery -o "!WEXE!" > "!WLOG!" 2>&1
     if not exist "!WEXE!" (
         echo FAIL !WNAME! ^(winui self-test build failed^)>"!RESDIR!\!RESID!.result"
         exit /b
@@ -206,7 +206,7 @@ if "%~1"=="--worker-gallery" (
     set "GAL_STEXE=!OUTDIR!\gallery_st.exe"
     set "GAL_STLOG=!RESDIR!\!RESID!.log"
 
-    "!CFLAT!" "example\ui\gallery\gallery.cb" -i example/ui --heap-audit -o "!GAL_STEXE!" > "!GAL_STLOG!" 2>&1
+    "!CFLAT!" "example\ui\05-gallery\gallery.cb" -i example/ui --heap-audit -o "!GAL_STEXE!" > "!GAL_STLOG!" 2>&1
     if not exist "!GAL_STEXE!" (
         echo FAIL gallery.cb ^(gallery self-test build failed^)>"!RESDIR!\!RESID!.result"
         exit /b
@@ -225,7 +225,7 @@ if "%~1"=="--worker-gallery" (
 )
 
 REM ===========================================================================
-REM Worker mode: ui_test.cb template self-test (example/ui/testing/todo_test.cb).
+REM Worker mode: ui_test.cb template self-test (example/ui/07-testing/todo_test.cb).
 REM The customer-facing "copy-me" test target - the todo app driven through the
 REM UiTest framework. Same gate as the other UI self-tests: build with --heap-audit,
 REM run headless under redirected stdin, gate on the assertion exit code AND leaks.
@@ -238,7 +238,7 @@ if "%~1"=="--worker-uitest" (
     set "UIT_STEXE=!OUTDIR!\todo_test_st.exe"
     set "UIT_STLOG=!RESDIR!\!RESID!.log"
 
-    "!CFLAT!" "example\ui\testing\todo_test.cb" -i example/ui/testing --heap-audit -o "!UIT_STEXE!" > "!UIT_STLOG!" 2>&1
+    "!CFLAT!" "example\ui\07-testing\todo_test.cb" -i example/ui/07-testing --heap-audit -o "!UIT_STEXE!" > "!UIT_STLOG!" 2>&1
     if not exist "!UIT_STEXE!" (
         echo FAIL todo_test.cb ^(uitest self-test build failed^)>"!RESDIR!\!RESID!.result"
         exit /b
@@ -364,7 +364,7 @@ for /r example %%F in (*.cb) do (
 
 REM Launch the UI framework self-tests (behavior + leak gate). app.cb/counter.cb
 REM are not assertion suites (they always exit 0) but are included for the leak gate.
-set UI_SELFTESTS=example\ui\tui_demo.cb example\ui\boxes.cb example\ui\app.cb example\ui\counter.cb example\ui\counter_jsx.cb
+set UI_SELFTESTS=example\ui\02-terminal\tui_demo.cb example\ui\02-terminal\boxes.cb example\ui\01-elements\app.cb example\ui\01-elements\counter.cb example\ui\01-elements\counter_jsx.cb
 for %%U in (%UI_SELFTESTS%) do (
     set /a RESID+=1
     set /a LAUNCHED+=1
@@ -391,7 +391,7 @@ set /a RESID+=1
 set /a LAUNCHED+=1
 start "" /b cmd /c "%SCRIPT% --worker-gallery ex_!RESID!"
 
-REM Launch the ui_test.cb template self-test (example/ui/testing/todo_test.cb).
+REM Launch the ui_test.cb template self-test (example/ui/07-testing/todo_test.cb).
 set /a RESID+=1
 set /a LAUNCHED+=1
 start "" /b cmd /c "%SCRIPT% --worker-uitest ex_!RESID!"
@@ -399,16 +399,16 @@ start "" /b cmd /c "%SCRIPT% --worker-uitest ex_!RESID!"
 REM Launch the WinUI 3 (Windows App SDK) self-tests (P6 M2 window bring-up + M3 host),
 REM only when the pinned WindowsAppSDK NuGet packages are cached. Skipped otherwise.
 if defined WINUINUGET (
-    for %%W in (example\ui\winui\winui_app_demo.cb example\ui\winui\winui_demo.cb example\ui\winui\winui_gallery.cb) do (
+    for %%W in (example\ui\06-winui\winui_app_demo.cb example\ui\06-winui\winui_demo.cb example\ui\06-winui\winui_gallery.cb) do (
         set /a RESID+=1
         set /a LAUNCHED+=1
         start "" /b cmd /c "%SCRIPT% --worker-winui %%W ex_!RESID!"
     )
 ) else (
     set /a SKIPPED+=3
-    echo SKIP: example\ui\winui\winui_app_demo.cb ^(pinned WindowsAppSDK NuGet packages not in cache^)
-    echo SKIP: example\ui\winui\winui_demo.cb ^(pinned WindowsAppSDK NuGet packages not in cache^)
-    echo SKIP: example\ui\winui\winui_gallery.cb ^(pinned WindowsAppSDK NuGet packages not in cache^)
+    echo SKIP: example\ui\06-winui\winui_app_demo.cb ^(pinned WindowsAppSDK NuGet packages not in cache^)
+    echo SKIP: example\ui\06-winui\winui_demo.cb ^(pinned WindowsAppSDK NuGet packages not in cache^)
+    echo SKIP: example\ui\06-winui\winui_gallery.cb ^(pinned WindowsAppSDK NuGet packages not in cache^)
 )
 
 REM Wait for all workers to finish (up to TIMEOUT_SECS).

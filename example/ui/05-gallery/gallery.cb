@@ -3,10 +3,10 @@
 // The GalleryApp Component + its 25-assert headless self-test live in the host-neutral
 // gallery_app.cb (P12 split); this file wires them to the native_host.cb shim (Win32 on
 // Windows, Cocoa on macOS), keeps the Win32-only screenshot path (PrintWindow -> BMP), and
-// owns main(). The WinUI 3 launcher is winui/winui_gallery.cb (same gallery_app.cb, WinUI host).
+// owns main(). The WinUI 3 launcher is 06-winui/winui_gallery.cb (same gallery_app.cb, WinUI host).
 //
 // Build & run (live window):
-//   x64/Release/cflat.exe example/ui/gallery/gallery.cb -i example/ui -o out/gallery.exe
+//   x64/Release/cflat.exe example/ui/05-gallery/gallery.cb -i example/ui -o out/gallery.exe
 //   out\gallery.exe
 // Headless self-test (no visible window; example.bat --worker-gallery):
 //   out\gallery.exe --selftest

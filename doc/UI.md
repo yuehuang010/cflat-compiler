@@ -117,7 +117,7 @@ Canvas hosts ignore it. Use a string literal (a bare `string` field does not aut
 with `nativeStatusText(keyPath)`.
 
 **Data controls (v13).** Three controlled tier-1 data controls, each with a Canvas
-fallback and a headless self-test in `example/ui/gallery/gallery.cb`:
+fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
 
 - **`RadioGroup` / `RadioButton`** - a single-choice group. `RadioGroup` is a layout
   container (like `View`) owning `int value` (the selected index) + `onChange(index)`;
@@ -150,7 +150,7 @@ dataSource) and WinUI3Host (host-side box/model source the `native*` drivers que
 seam validation) both implement `setListOp` fully; see the parity matrix.
 
 **Navigation chrome (v14).** Tier-2 controls, each with a Canvas fallback and a headless
-self-test in `example/ui/gallery/gallery.cb`; `example/ui/fedit/fedit.cb` (fedit v2) is
+self-test in `example/ui/05-gallery/gallery.cb`; `example/ui/08-fedit/fedit.cb` (fedit v2) is
 the flagship that composes all of them:
 
 - **`TabControl` / `TabPane`** - keyed child panes with **lazy inactive tabs**: only the
@@ -187,7 +187,7 @@ the flagship that composes all of them:
   There is no new native control (icon support arrives with `Image` below).
 
 **Visuals + escape hatch (v15).** The last three elements complete the set, each with a Canvas
-fallback and a headless self-test in `example/ui/gallery/gallery.cb`:
+fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
 
 - **`Image`** - a bitmap leaf. Its content is a toolkit-neutral **32-bit BGRA** buffer, not a
   Win32 `HBITMAP`: the app hands down a BORROWED top-down BGRA32 buffer (`pixels` + `pxW`/`pxH`,
@@ -219,7 +219,7 @@ per-control accent is set through the `setAccent(h, fg, bg)` seam from `_syncPro
 the accent fill is a live-render feature (verified headlessly by the gallery's pixel-level draw
 assert), not something the screenshot workflow below captures.
 
-**Widget-gallery screenshots.** `example/ui/gallery/gallery.cb` is the full-element-set flagship
+**Widget-gallery screenshots.** `example/ui/05-gallery/gallery.cb` is the full-element-set flagship
 (every element, light + dark, a 25-assert headless self-test). It doubles as the doc-screenshot
 source: `gallery.exe --shots <dir>` renders the live window into an offscreen bitmap via
 `PrintWindow(PW_RENDERFULLCONTENT)` and writes `gallery_light.bmp` + `gallery_dark.bmp` through
@@ -530,7 +530,7 @@ interface Canvas
 ### Viewing the rendered UI (`win32_shot.cb`)
 
 A headless build harness has no display, so the GDI output is captured to an image
-instead of shown in a window: `example/ui/win32_shot.cb` paints the tree into an
+instead of shown in a window: `example/ui/03-canvas-win32/win32_shot.cb` paints the tree into an
 offscreen memory DC through `GdiCanvas`, reads the pixels back, and writes a 24bpp
 BMP via `core/graphic/bitmap.cb`. Run `out\win32_shot.exe <path.bmp>` to produce a
 viewable snapshot of exactly what `GdiCanvas` draws - a real visual oracle beyond
@@ -696,20 +696,20 @@ documented-API only (no uxtheme ordinals). An app imports this host and calls
   window; `openAppWindow(new App(), title)` opens a full second app window (v12);
   `nativeCloseWindow()` closes the active window (the loop ends when the last one
   closes). Read a status pane with `nativeStatusText(keyPath)`.
-- **Flagship demo:** `example/ui/fedit/fedit.cb` - a small native text editor built
+- **Flagship demo:** `example/ui/08-fedit/fedit.cb` - a small native text editor built
   entirely on the above (open/edit/save, find, dirty-close prompt, light/dark, two
   windows). It imports the `ui_native/host.cb` shim, so the same source builds and runs
   on Windows (Win32) and macOS (Cocoa). The hosts are core, so no `-i` is needed. Build:
-  `cflat example/ui/fedit/fedit.cb -o out/fedit` (`.exe` on Windows).
+  `cflat example/ui/08-fedit/fedit.cb -o out/fedit` (`.exe` on Windows).
 
 ## Host-neutral test drivers (v16, WinUI added v17)
 
 Headless self-tests drive real controls through key-path helpers that every native host
 implements under the SAME name, so a self-test contains no toolkit-typed calls (no
 `SendMessage`, no `objc_msgSend`, no WinRT vtable calls) and runs against any host. The gallery
-self-test lives in the host-neutral `example/ui/gallery/gallery_app.cb` (the `GalleryApp`
-Component + the 25-assert self-test); its Win32/Cocoa launcher is `example/ui/gallery/gallery.cb`
-(imports the `ui_native/host.cb` shim) and its WinUI 3 launcher is `example/ui/winui/winui_gallery.cb`
+self-test lives in the host-neutral `example/ui/05-gallery/gallery_app.cb` (the `GalleryApp`
+Component + the 25-assert self-test); its Win32/Cocoa launcher is `example/ui/05-gallery/gallery.cb`
+(imports the `ui_native/host.cb` shim) and its WinUI 3 launcher is `example/ui/06-winui/winui_gallery.cb`
 (imports `ui_native/winui.cb`). All three build the SAME `gallery_app.cb` - a cflat compilation shares
 one global scope across its whole import closure, so a sibling host import supplies the drivers.
 Each helper routes through the same element-model handler the OS would fire on real input, then
@@ -748,12 +748,12 @@ model source the `setListOp` seam feeds).
 
 ## Hosts
 
-- **TUI** (`core/ui_canvas/term.cb` host loop; `example/ui/tui_demo.cb`,
-  `example/ui/boxes.cb` demos): a double-buffered terminal host. Real console =
+- **TUI** (`core/ui_canvas/term.cb` host loop; `example/ui/02-terminal/tui_demo.cb`,
+  `example/ui/02-terminal/boxes.cb` demos): a double-buffered terminal host. Real console =
   interactive; redirected I/O (`--run`, CI) falls back to a deterministic
   headless self-test that gates `example.bat` on behavior AND leaks (built with
   `--heap-audit`).
-- **Win32** (`core/ui_canvas/win32.cb` host + `example/ui/win32_boxes.cb`): a native
+- **Win32** (`core/ui_canvas/win32.cb` host + `example/ui/03-canvas-win32/win32_boxes.cb`): a native
   GDI host reusing the framework unchanged behind the `Canvas` seam.
 - **Native OS controls** (`core/ui_native/host.cb` shim -> `core/ui_native/win32.cb`
   / `core/ui_native_cocoa.cb`): the `NativeHost` seam instead of `Canvas` - real HWND
@@ -761,7 +761,7 @@ model source the `setListOp` seam feeds).
 - **WinUI 3 (Windows App SDK)** (`core/ui_native/winui.cb`): the same `NativeHost` seam
   driving real XAML controls rooted in a `Canvas`, brought up unpackaged via
   `MddBootstrapInitialize2` + `Application.Start`. An app runs on it with `runAppWinui(new App())`;
-  the gallery launcher is `example/ui/winui/winui_gallery.cb`. Its self-tests run WITHOUT
+  the gallery launcher is `example/ui/06-winui/winui_gallery.cb`. Its self-tests run WITHOUT
   `--heap-audit` (the WinAppSDK runtime keeps process-lived singletons and its own heaps).
 
 ### Element x host parity matrix (v17)
@@ -890,7 +890,7 @@ purely cosmetic gain).
 `import "ui_test.cb"` gives you a headless, CI-ready test framework for any ui_native app. It
 drives real controls through the [host-neutral `native*` drivers](#host-neutral-test-drivers-v16-winui-added-v17)
 on an invisible window and asserts on control + model state - deterministic, no display, no OS
-input synthesis. The copy-me template is **`example/ui/testing/`**: `todo_app.cb` (the app) +
+input synthesis. The copy-me template is **`example/ui/07-testing/`**: `todo_app.cb` (the app) +
 `todo_test.cb` (its suite). Copy those two files, swap in your Component, and you have a suite.
 
 **Shared-app-module pattern.** Split the app into a host-neutral **app module** (your Component,
@@ -1027,6 +1027,6 @@ capturing `Lambda<>` closures, a case reads app state through a local downcast (
 To run the TUI self-tests directly:
 
 ```
-x64/Release/cflat.exe example/ui/tui_demo.cb --run
-x64/Release/cflat.exe example/ui/boxes.cb --run
+x64/Release/cflat.exe example/ui/02-terminal/tui_demo.cb --run
+x64/Release/cflat.exe example/ui/02-terminal/boxes.cb --run
 ```

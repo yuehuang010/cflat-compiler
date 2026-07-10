@@ -10,7 +10,7 @@
 //
 // A size-aware component reads hostWidth()/hostHeight() in its render() - the
 // model-layer equivalent of a "useWindowSize()" hook - so the same tree rescales
-// when the window is resized. See example/ui/win32_boxes.cb for a demo.
+// when the window is resized. See example/ui/03-canvas-win32/win32_boxes.cb for a demo.
 //
 // This file has no main(); it is imported by an app file that calls runAppGui().
 import "windows.h" lib { "user32.lib", "gdi32.lib" } cache;

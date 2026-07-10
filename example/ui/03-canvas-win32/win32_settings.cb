@@ -3,7 +3,7 @@
 // and live light/dark theming - all through the Win32 GDI host.
 //
 // Build & run (live window):
-//   x64/Release/cflat.exe example/ui/win32_settings.cb -o out/win32_settings.exe
+//   x64/Release/cflat.exe example/ui/03-canvas-win32/win32_settings.cb -o out/win32_settings.exe
 //   out\win32_settings.exe
 //
 // Offscreen snapshot (no window; used to view the UI headlessly):
