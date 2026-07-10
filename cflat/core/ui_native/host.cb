@@ -1,4 +1,4 @@
-// native_host.cb - the platform import shim for the CFlat UI NativeHost backend.
+// core/ui_native/host.cb - the platform import shim for the CFlat UI NativeHost backend.
 //
 // An app that wants "real OS controls" imports THIS file instead of a specific
 // backend; the compile-time platform switch selects the Win32 host on Windows and
@@ -7,8 +7,13 @@
 // _nHost/_nApp/_nCtx globals), so a single app source compiles against either.
 //
 // Precedent for a file-scope `if const` import shim: cflat/core/os.cb.
+//
+// The Cocoa backend deliberately stays FLAT at core/ui_native_cocoa.cb rather than
+// moving in here as ui_native/cocoa.cb: it bare-imports the objc bridge core/cocoa.cb,
+// and the import resolver probes the importing file's own directory first, so a
+// same-named ui_native/cocoa.cb would resolve to itself (circular import).
 if const (__MACOS__) {
     import "ui_native_cocoa.cb";
 } else {
-    import "ui_native_win32.cb";
+    import "ui_native/win32.cb";
 }

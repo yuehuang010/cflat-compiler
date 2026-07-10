@@ -12,7 +12,7 @@
 //   out\gallery.exe --selftest
 // Doc screenshots (light + dark BMP into out/):
 //   out\gallery.exe --shots out
-import "ui_native_host.cb";
+import "ui_native/host.cb";
 import "gallery_app.cb";
 
 // ── Screenshot + Win32-only hardening self-test ───────────────────────────────

@@ -139,16 +139,29 @@ _WIN_ONLY_FILES = {
     # example/shell: os.windows.* console / _WIN32_FIND_DATAA.
     "dir.cb", "fsh.cb", "stars.cb",
     # example/ui: the win32_* backends and the os.windows.* framework demos.
-    "boxes.cb", "host.cb", "win32_boxes.cb",
-    "win32_native_settings.cb", "win32_settings.cb", "win32_shot.cb", "win32host.cb",
-    # core: WinRT projection library + the Win32 UI host (both import windows.h).
-    "winrt.cb", "ui_native_win32.cb",
+    # (tui_demo.cb, formerly host.cb, no longer uses os.windows.* directly - the
+    # host loop moved to core/ui_canvas/term.cb - so it is portable and not skipped.)
+    "boxes.cb", "win32_boxes.cb",
+    "win32_native_settings.cb", "win32_settings.cb", "win32_shot.cb",
+    # core: WinRT projection library (the two Win32 UI hosts are path-qualified below,
+    # since core/ui_native/win32.cb and core/ui_canvas/win32.cb share the basename win32.cb).
+    "winrt.cb",
+}
+
+# Windows-only sources whose basename alone is ambiguous (core/ui_native/win32.cb and
+# core/ui_canvas/win32.cb both import windows.h and are both win32.cb by basename), so
+# these are matched by full repo-relative path instead of going in _WIN_ONLY_FILES.
+_WIN_ONLY_PATHS = {
+    "cflat/core/ui_native/win32.cb",
+    "cflat/core/ui_canvas/win32.cb",
 }
 
 
 def is_windows_only(path: Path) -> bool:
     rel = path.relative_to(REPO_ROOT).as_posix()
     if any(rel == d or rel.startswith(d + "/") for d in _WIN_ONLY_DIRS):
+        return True
+    if rel in _WIN_ONLY_PATHS:
         return True
     return path.name in _WIN_ONLY_FILES
 
@@ -172,6 +185,12 @@ def collect_files(include_win32_demo: bool) -> list[Path]:
         p for p in (REPO_ROOT / "cflat" / "core").glob("*.cb")
         if p.name != "runtime.cb" and p.name != NON_HOST_OS_FILE
     )
+    # The NativeHost/Canvas host backends live in two subdirectories (core/ui_native/,
+    # core/ui_canvas/) rather than flat in core/, so the non-recursive glob above misses
+    # them; sweep those two directories explicitly to keep the same coverage as before
+    # they were split out of core/*.cb.
+    files += sorted((REPO_ROOT / "cflat" / "core" / "ui_native").glob("*.cb"))
+    files += sorted((REPO_ROOT / "cflat" / "core" / "ui_canvas").glob("*.cb"))
     if not include_win32_demo:
         demo = (REPO_ROOT / WIN32_METADATA_DEMO).resolve()
         files = [f for f in files if f.resolve() != demo]
@@ -181,11 +200,16 @@ def collect_files(include_win32_demo: bool) -> list[Path]:
     # --worker-winui gate with the right flags. Skip them here (like the Win32-metadata demo).
     winui_dir = (REPO_ROOT / "example" / "ui" / "winui").resolve()
     files = [f for f in files if winui_dir not in f.resolve().parents]
-    # core/ui_native_winui.cb is the WinUI 3 host: it imports the Windows App SDK runtime
+    # core/ui_native/winui.cb is the WinUI 3 host: it imports the Windows App SDK runtime
     # winmds (Microsoft.UI.Xaml.winmd) via package-nuget, which the bare sweep cannot resolve
     # (no -i dir, no App SDK). It is exercised by example.bat's --worker-winui gate with the
     # right flags; skip it here like the example/ui/winui/* launchers above.
-    files = [f for f in files if f.name != "ui_native_winui.cb"]
+    # Path-qualified (not bare "winui.cb") since core/ui_native/ is not the only place
+    # a file could plausibly be named winui.cb.
+    files = [
+        f for f in files
+        if f.relative_to(REPO_ROOT).as_posix() != "cflat/core/ui_native/winui.cb"
+    ]
     # gallery_app.cb is the host-neutral gallery component: it imports only ui.cb by
     # design and resolves the native* host drivers from whichever LAUNCHER imports it
     # (gallery.cb or winui_gallery.cb share one global scope with it). Standalone

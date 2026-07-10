@@ -1,6 +1,6 @@
 // boxes.cb - an interactive, resizable bordered-box demo for the ui.cb framework.
 //
-// Run modes (same split as host.cb):
+// Run modes (same split as tui_demo.cb):
 //   - Real console: interactive. The outer Box fills the terminal and rescales
 //     LIVE when you resize the window; clicking "[ add box ]" nests one more small
 //     box inside. ESC quits and the cursor/console mode are restored.

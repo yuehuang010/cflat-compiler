@@ -15,7 +15,7 @@
 // Headless self-test:  winui_gallery.exe --selftest
 // (example.bat runs it via --worker-winui when the WindowsAppSDK NuGet packages are cached.)
 
-import "ui_native_winui.cb";
+import "ui_native/winui.cb";
 import "gallery_app.cb";
 
 extern int main(int argc, char** argv)

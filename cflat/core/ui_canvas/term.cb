@@ -1,0 +1,114 @@
+// core/ui_canvas/term.cb - a terminal (TUI) canvas host for the ui_native.cb framework.
+//
+// This host paints the reconciled Element tree to the console through the
+// Canvas seam (SurfaceCanvas over a double-buffered Surface), diffing rows so
+// only changed lines are re-blitted. Contrast with ui_native/host.cb, which
+// drives REAL OS controls through the separate NativeHost seam - this file
+// never leaves the Canvas/paint model.
+//
+// The app supplies the status line shown on the last row (see runApp below);
+// the caller also decides what to do when no TTY is available (see
+// UI_TUI_UNAVAILABLE below) - this file contains no test/demo code of its own.
+import "ui_native.cb";
+import "terminal.cb";
+import "os.cb";
+
+// Returned by runApp when stdin/stdout are redirected (CI, --run) and no TTY
+// exists, so the interactive loop cannot start. Callers should fall back to
+// their own deterministic self-test in this case.
+const int UI_TUI_UNAVAILABLE = -1;
+
+// Minimal repaint: blit only the rows of `back` that differ from `front`, then
+// sync front <- back. Pass full=true to force a complete repaint (first frame).
+void flushFrame(Terminal* term, Surface* front, Surface* back, int height, bool full)
+{
+    int r = 0;
+    while (r < height)
+    {
+        if (full || back.rowDiffers(front, r))
+        {
+            char* line = back.row(r);
+            term.moveTo(r + 1, 1);
+            printf("%s", line);
+            free((void*)line);
+        }
+        r++;
+    }
+    front.copyFrom(back);
+    term.flush();
+}
+
+int runApp(Component app, const char* statusLine)
+{
+    Terminal term;
+    if (!term.init())
+        return UI_TUI_UNAVAILABLE;   // redirected I/O: caller decides the fallback
+
+    term.hideCursor();
+
+    UiContext ctx = default;
+
+    int w = 0;
+    int h = 0;
+    if (!term.getSize(&w, &h)) { w = 80; h = 25; }
+
+    // Double buffer: paint into `back`, diff against `front`, blit only changed rows.
+    Surface front; front.init(w, h);
+    Surface back;  back.init(w, h);
+
+    Element tree = app.render(&ctx);
+    layoutRoot(tree, 0, 0, w);
+    back.fill(' ');
+    tree.paint(canvasFor(&back), &ctx);
+    back.text(0, h - 1, statusLine);
+    flushFrame(&term, &front, &back, h, true);   // first frame: full paint
+
+    bool running = true;
+    while (running)
+    {
+        i32 evt = 0;
+        KeyEvent key;
+        MouseEvent mouse;
+        if (term.pollEvent(&evt, &key, &mouse))
+        {
+            if (evt == 1)
+            {
+                if (key.vkCode == VK_ESCAPE) running = false;
+                // Route other keys to the focused node (VK codes match KEY_*).
+                else tree.dispatch(keyPress((int)key.vkCode), &ctx);
+            }
+            else if (evt == 2)
+            {
+                // Dispatch the click; the handler mutates state and invalidates.
+                if (mouse.isPress() && mouse.leftButton())
+                    tree.dispatch(mouseDown((int)mouse.x, (int)mouse.y), &ctx);
+            }
+        }
+        else
+        {
+            os.sleep_ms(16);
+        }
+
+        // Drain the dirty flag: re-render + reconcile only when state changed,
+        // then repaint only the rows that actually differ.
+        if (ctx.consumeDirty())
+        {
+            Element wip = app.render(&ctx);
+            list<Patch> patches = default;
+            tree = reconcile(tree, wip, &patches);
+            if (patches.count() > 0)
+            {
+                layoutRoot(tree, 0, 0, w);
+                back.fill(' ');
+                tree.paint(canvasFor(&back), &ctx);
+                back.text(0, h - 1, statusLine);
+                flushFrame(&term, &front, &back, h, false);   // minimal repaint
+            }
+        }
+    }
+
+    deleteTree(tree);
+    term.showCursor();
+    term.restore();
+    return 0;
+}

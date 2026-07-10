@@ -44,7 +44,7 @@ Hardening kits (reconcileStress/themeStorm/resizeStorm) and shot() are NOT built
    `delete <call>` when the callee returns an `alias` borrow (e.g. `delete l.get(i)`)
    at compile time - see Test/errors/err_delete_alias_result.cb and the positive
    coverage in Test/test_core.cb testListPtrOwnership.)
-4. Two NEW host-neutral reader drivers added to ui_native_win32.cb ONLY:
+4. Two NEW host-neutral reader drivers added to ui_native/win32.cb ONLY:
    `bool nativeIsEnabled(string keyPath)` (IsWindowEnabled) and
    `int nativeTooltipCount()` (TTM_GETTOOLCOUNT on the window tooltip control). The
    facade's isDisabled()/tooltipCount() need them; the plan's reader list already
@@ -74,7 +74,7 @@ All gates green:
 - example.bat Release: 86 passed / 0 failed / 21 skipped. gallery (27/27 + 3-case Win32
   hardening 4/4), fedit (9/9 + 6/6), win32_native_settings (T1, still green), and
   winui_gallery (27/27) workers all PASS + leak-clean under `--heap-audit`.
-- test.bat Release: all pass. test_lsp.bat: 198/0 (ui_test.cb + ui_native_win32/cocoa all
+- test.bat Release: all pass. test_lsp.bat: 198/0 (ui_test.cb + ui_native/win32.cb/cocoa.cb all
   sweep clean; NO new skip-list entry). cocoa `--check --platform macos` clean for ui_test.cb,
   ui_native_cocoa.cb, cocoa_native_settings.cb, gallery.cb, fedit.cb.
 - gallery `--shots out` still writes gallery_light.bmp + gallery_dark.bmp (now via the library).
@@ -91,7 +91,7 @@ Kit signatures (all in ui_test.cb):
 ### T2 deviations (and why)
 
 1. shot() is NOT physically in ui_test.cb. The Win32 PrintWindow+GetDIBits+BMP grab lives in
-   the Win32 backend as `nativeSaveWindowBmp(string)` (ui_native_win32.cb, which already imports
+   the Win32 backend as `nativeSaveWindowBmp(string)` (ui_native/win32.cb, which already imports
    windows.h + gained `import "graphic/bitmap.cb"`); cocoa/winui define it returning false;
    ui_test.cb forward-declares it and exposes the portable `shot()`/`uiShot()` verb. Reason:
    putting windows.h/GDI in ui_test.cb would (a) collide GDI externs with the win32 backend's

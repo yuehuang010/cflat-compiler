@@ -12,7 +12,7 @@
 //
 // Toggling "Dark mode" reskins the whole panel; "Auto-save" enables the Save
 // button (otherwise it renders disabled). Click or Tab+Space to toggle a checkbox.
-import "win32host.cb";
+import "ui_canvas/win32.cb";
 import "graphic/bitmap.cb";
 
 class SettingsApp : Component

@@ -1,13 +1,13 @@
-// cocoa_native_host.cb - a native macOS (AppKit) host that drives REAL OS controls.
+// core/ui_native_cocoa.cb - a native macOS (AppKit) host that drives REAL OS controls.
 //
-// This is the macOS counterpart of win32_native_host.cb: the NativeHost output
+// This is the macOS counterpart of ui_native/win32.cb: the NativeHost output
 // stage of the CFlat UI framework (see ui_native.cb). The reconciled Element tree's
 // stable key paths map to real AppKit controls (NSButton / NSTextField / NSSlider /
 // NSProgressIndicator / NSBox / NSTextView), and the host creates / updates /
 // destroys those controls to match the tree. AppKit paints them, handles IME +
 // accessibility, and owns focus / Tab. The app-facing model is UNCHANGED; an app
 // that renders to the Win32 host renders here too - it just imports this host
-// (via native_host.cb) instead.
+// (via ui_native/host.cb) instead.
 //
 // It drives AppKit through the objc_msgSend bridge in cocoa.cb, which links AppKit +
 // Foundation via `import framework` (no SDK, no Xcode). Coordinates use a FLIPPED content view so every

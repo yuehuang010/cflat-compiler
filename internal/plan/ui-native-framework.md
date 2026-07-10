@@ -117,6 +117,11 @@ App render() -> Element tree -> reconcile (existing)
         headless/testing path)                 Win32Host | CocoaHost | WinUI3Host
 ```
 
+2026-07-09: both canvas hosts were subsequently promoted to core as
+ui_canvas/term.cb / ui_canvas/win32.cb (they were the last pieces of the UI
+framework still stranded in example/ui/; example/ui/tui_demo.cb and
+example/ui/win32_boxes.cb are now pure demos + self-tests over those core hosts).
+
 Key contracts (all proven through three hosts):
 
 - **NativeHost seam** (`example/ui/ui_native.cb`): opaque u64 handles (HWND /
@@ -918,25 +923,25 @@ element/seam changes. What landed:
   appended, its `import "ui.cb";` dropped). This is the one module apps import for the
   Canvas hosts.
 - **File layout in `core/`:** `ui_native.cb` (merged framework + seam),
-  `ui_native_host.cb` (<- `native_host.cb`, the `if const` platform shim, imports
-  rewritten to `ui_native_cocoa.cb`/`ui_native_win32.cb`), `ui_native_win32.cb` (<-
+  `ui_native/host.cb` (<- `native_host.cb`, the `if const` platform shim, imports
+  rewritten to `ui_native_cocoa.cb`/`ui_native/win32.cb`), `ui_native/win32.cb` (<-
   `win32_native_host.cb`), `ui_native_cocoa.cb` (<- `cocoa_native_host.cb`),
-  `ui_native_winui.cb` (<- `winui/winui_host.cb`, its `ui.cb`+`ui_native.cb` imports
+  `ui_native/winui.cb` (<- `winui/winui_host.cb`, its `ui.cb`+`ui_native.cb` imports
   collapsed to the single merged `ui_native.cb`), and `cocoa.cb` (<- `example/macos/
   cocoa.cb`, the objc bridge the Cocoa host depends on).
 - **Consumers stayed in `example/`** with imports rewired: the Canvas demos + gallery
   component (`import "ui.cb"` -> `"ui_native.cb"`), the settings probes (`win32_native_host`
-  -> `ui_native_win32`, `cocoa_native_host` -> `ui_native_cocoa`), fedit + gallery
-  (`native_host` -> `ui_native_host`), and the winui launchers (`winui_host` ->
-  `ui_native_winui`). Core imports now resolve with NO `-i` (verified:
+  -> `ui_native/win32`, `cocoa_native_host` -> `ui_native_cocoa`), fedit + gallery
+  (`native_host` -> `ui_native/host`), and the winui launchers (`winui_host` ->
+  `ui_native/winui`). Core imports now resolve with NO `-i` (verified:
   `cflat example/ui/fedit/fedit.cb -o out/fedit.exe`).
 - **Build system.** CMake globs `cflat/core/*` (CONFIGURE_DEPENDS) and deploys the tree
   next to the exe, so the new files are picked up automatically - no build-file edit.
   (The legacy `cflat.vcxproj` no longer exists; the build is CMake-only. Updated the
   stale "add to cflat.vcxproj" note in internal/stdlib-reference.md.)
 - **Test harness rewires.** example.bat EXCLUDE trimmed (7 moved-out basenames removed);
-  lsp_bulk_test.py skips `ui_native_winui.cb` (unresolvable App SDK winmds in the bare
-  sweep, like the winui/ launchers) and lists `ui_native_win32.cb` as Windows-only
+  lsp_bulk_test.py skips `ui_native/winui.cb` (unresolvable App SDK winmds in the bare
+  sweep, like the winui/ launchers) and lists `ui_native/win32.cb` as Windows-only
   (imports windows.h). The other new core hosts (`ui_native.cb`/`_host`/`_cocoa`)
   analyze clean on Windows and are swept.
 - **Docs.** doc/UI.md retitled to `ui_native`, all import/path examples updated to the

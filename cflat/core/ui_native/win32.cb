@@ -1,7 +1,7 @@
-// win32_native_host.cb - a native Win32 host that drives REAL OS controls.
+// core/ui_native/win32.cb - a native Win32 host that drives REAL OS controls.
 //
-// Where win32host.cb PAINTS the Element tree through GDI (GdiCanvas), this host is
-// the NativeHost output stage (see ui_native.cb): the reconciled tree's stable key
+// Where ui_canvas/win32.cb PAINTS the Element tree through GDI (GdiCanvas), this
+// host is the NativeHost output stage (see ui_native.cb): the reconciled tree's stable key
 // paths map to real child controls (BUTTON/STATIC/EDIT/checkbox/msctls_progress32/
 // trackbar/etched-panel/status bar), and the host creates/updates/destroys those
 // controls to match the tree. The OS paints, handles IME + accessibility, and owns
@@ -1653,8 +1653,8 @@ u32 gdiColorRef(int color)
     return (u32)(r | (g << 8) | (b << 16));
 }
 
-// A GDI implementation of the ui.cb Canvas interface, mirroring win32host.cb's GdiCanvas
-// but living in the native host (which does not import win32host.cb). Borrows the HDC.
+// A GDI implementation of the ui.cb Canvas interface, mirroring ui_canvas/win32.cb's
+// GdiCanvas but living in the native host (which does not import ui_canvas/win32.cb). Borrows the HDC.
 class NativeGdiCanvas : Canvas
 {
     void* hdc = nullptr;

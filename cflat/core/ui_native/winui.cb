@@ -1,4 +1,4 @@
-// winui_host.cb - a WinUI 3 (Windows App SDK) backend for the NativeHost seam (ui_native.cb).
+// core/ui_native/winui.cb - a WinUI 3 (Windows App SDK) backend for the NativeHost seam (ui_native.cb).
 //
 // P6 M3 brought up the seam with four element kinds (Button/Text/CheckBox/Box). P12 completes
 // it: the full element set (TextBox, Slider/ProgressBar via IRangeBase, RadioButton, ComboBox,

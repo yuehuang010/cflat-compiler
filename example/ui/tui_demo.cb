@@ -1,25 +1,24 @@
-// host.cb - a terminal (TUI) host for the ui.cb framework.
+// tui_demo.cb - a TUI demo + reconciler self-test suite for the ui_native.cb
+// framework.
 //
-// Closes the UI loop: it paints an Element tree to the console, dispatches input
-// (mouse + key) through the single Element.dispatch(Event) seam, and repaints
-// when a handler mutates state. Input never downcasts a node - each node decides
-// whether an event is its own. The host owns the UiContext (dirty flag + focused
-// node identity) and threads it into render().
+// The host loop itself (double-buffered paint + input dispatch) now lives in
+// core/ui_canvas/term.cb (runApp). This file owns the demo Component (Counter),
+// the EditApp used by the TextInput test, and a headless self-test suite that
+// exercises layout + paint + dispatch (mouse + key + focus) against an
+// in-memory Surface, independent of any real console.
 //
 // Two run modes:
 //   - Real console: interactive. Click the "[ +1 ]" button to increment the
 //     counter; with the button focused (after a click), Enter/Space also fire it;
 //     ESC quits and the cursor/console mode are restored.
-//   - Redirected I/O (CI, --run): Terminal.init() returns false, so it falls
-//     back to a deterministic headless self-test that drives layout + paint +
-//     dispatch (mouse + key + focus) against an in-memory Surface and prints
+//   - Redirected I/O (CI, --run): runApp() reports that no TTY is available, so
+//     main() falls back to a deterministic headless self-test that prints
 //     PASS/FAIL with a non-zero exit on any failure.
 //
-// Run the self-test:   x64/Release/cflat.exe example/ui/host.cb --run
-// Run interactively:   x64/Release/cflat.exe example/ui/host.cb -o out/host.exe && out\host.exe
+// Run the self-test:   x64/Release/cflat.exe example/ui/tui_demo.cb --run
+// Run interactively:   x64/Release/cflat.exe example/ui/tui_demo.cb -o out/tui_demo.exe && out\tui_demo.exe
 
-import "ui_native.cb";
-import "terminal.cb";
+import "ui_canvas/term.cb";
 
 class Counter : Component
 {
@@ -350,104 +349,13 @@ int selfTest()
     return 1;
 }
 
-// Minimal repaint: blit only the rows of `back` that differ from `front`, then
-// sync front <- back. Pass full=true to force a complete repaint (first frame).
-void flushFrame(Terminal* term, Surface* front, Surface* back, int height, bool full)
-{
-    int r = 0;
-    while (r < height)
-    {
-        if (full || back.rowDiffers(front, r))
-        {
-            char* line = back.row(r);
-            term.moveTo(r + 1, 1);
-            printf("%s", line);
-            free((void*)line);
-        }
-        r++;
-    }
-    front.copyFrom(back);
-    term.flush();
-}
-
-int runApp(Component app)
-{
-    Terminal term;
-    if (!term.init())
-        return selfTest();   // redirected I/O: run the deterministic self-test
-
-    term.hideCursor();
-
-    UiContext ctx = default;
-
-    int w = 0;
-    int h = 0;
-    if (!term.getSize(&w, &h)) { w = 80; h = 25; }
-
-    // Double buffer: paint into `back`, diff against `front`, blit only changed rows.
-    Surface front; front.init(w, h);
-    Surface back;  back.init(w, h);
-
-    Element tree = app.render(&ctx);
-    layoutRoot(tree, 0, 0, w);
-    back.fill(' ');
-    tree.paint(canvasFor(&back), &ctx);
-    back.text(0, h - 1, "(click/Enter [ +1 ], ESC to quit)");
-    flushFrame(&term, &front, &back, h, true);   // first frame: full paint
-
-    bool running = true;
-    while (running)
-    {
-        i32 evt = 0;
-        KeyEvent key;
-        MouseEvent mouse;
-        if (term.pollEvent(&evt, &key, &mouse))
-        {
-            if (evt == 1)
-            {
-                if (key.vkCode == VK_ESCAPE) running = false;
-                // Route other keys to the focused node (VK codes match KEY_*).
-                else tree.dispatch(keyPress((int)key.vkCode), &ctx);
-            }
-            else if (evt == 2)
-            {
-                // Dispatch the click; the handler mutates state and invalidates.
-                if (mouse.isPress() && mouse.leftButton())
-                    tree.dispatch(mouseDown((int)mouse.x, (int)mouse.y), &ctx);
-            }
-        }
-        else
-        {
-            os.windows.Sleep(16);
-        }
-
-        // Drain the dirty flag: re-render + reconcile only when state changed,
-        // then repaint only the rows that actually differ.
-        if (ctx.consumeDirty())
-        {
-            Element wip = app.render(&ctx);
-            list<Patch> patches = default;
-            tree = reconcile(tree, wip, &patches);
-            if (patches.count() > 0)
-            {
-                layoutRoot(tree, 0, 0, w);
-                back.fill(' ');
-                tree.paint(canvasFor(&back), &ctx);
-                back.text(0, h - 1, "(click/Enter [ +1 ], ESC to quit)");
-                flushFrame(&term, &front, &back, h, false);   // minimal repaint
-            }
-        }
-    }
-
-    deleteTree(tree);
-    term.showCursor();
-    term.restore();
-    return 0;
-}
-
 extern int main()
 {
     Counter app;
     app.count = 0;
-    return runApp(app);
+    int rc = runApp(app, "(click/Enter [ +1 ], ESC to quit)");
+    // Redirected I/O (CI, --run): no TTY, so run the deterministic self-test.
+    if (rc == UI_TUI_UNAVAILABLE)
+        return selfTest();
+    return rc;
 }

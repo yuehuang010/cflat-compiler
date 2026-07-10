@@ -298,9 +298,10 @@ REM on a host without the package it is skipped.
 REM example/macos/* target Darwin (dlopen of AppKit, sysctl, libproc; framework_link also
 REM uses `import framework` + Darwin SDK headers) and are excluded from this Windows run;
 REM compile them on a Mac instead.
-REM The UI framework + hosts now live in core/ (ui_native.cb, ui_native_host.cb,
-REM ui_native_win32.cb, ui_native_cocoa.cb, ui_native_winui.cb, cocoa.cb) and deploy next to
-REM the exe, so example UI demos import them with no -i. The three winui demos (winui_app_demo,
+REM The UI framework + hosts now live in core/ (ui_native.cb, ui_native/host.cb,
+REM ui_native/win32.cb, ui_native_cocoa.cb, ui_native/winui.cb, cocoa.cb, ui_canvas/term.cb,
+REM ui_canvas/win32.cb) and deploy next to the exe, so example UI demos import them with no
+REM -i. The three winui demos (winui_app_demo,
 REM winui_demo, winui_gallery) need the Windows App SDK bootstrapper + runtime winmds and are
 REM launched via the dedicated --worker-winui below. gallery_app is the host-neutral gallery
 REM Component + self-test (no main; imported by gallery.cb and winui_gallery.cb), so it is
@@ -308,7 +309,7 @@ REM excluded like gallery. cocoa_native_settings is the Darwin backend probe, ex
 REM todo_app is the host-neutral shared app module (no main; imported by todo_test.cb) and
 REM todo_test is the ui_test.cb template target - both driven by the dedicated --worker-uitest
 REM below (build with --heap-audit + run headless), so they are excluded from the plain sweep.
-set EXCLUDE=test_helper win32host fedit gallery gallery_app todo_app todo_test http_parser http_response http_json http_server http_client router rest_server http_io cocoa_probe cocoa_native_settings hello_objc cocoa_window sysinfo_mac framework_link winui_app_demo winui_demo winui_gallery
+set EXCLUDE=test_helper fedit gallery gallery_app todo_app todo_test http_parser http_response http_json http_server http_client router rest_server http_io cocoa_probe cocoa_native_settings hello_objc cocoa_window sysinfo_mac framework_link winui_app_demo winui_demo winui_gallery
 
 REM Discover the newest cached Win32-metadata package dir (the one holding Windows.Win32.winmd).
 REM dir /o-n lists newest-version-first by name. Empty if the nuget package is not installed
@@ -363,7 +364,7 @@ for /r example %%F in (*.cb) do (
 
 REM Launch the UI framework self-tests (behavior + leak gate). app.cb/counter.cb
 REM are not assertion suites (they always exit 0) but are included for the leak gate.
-set UI_SELFTESTS=example\ui\host.cb example\ui\boxes.cb example\ui\app.cb example\ui\counter.cb example\ui\counter_jsx.cb
+set UI_SELFTESTS=example\ui\tui_demo.cb example\ui\boxes.cb example\ui\app.cb example\ui\counter.cb example\ui\counter_jsx.cb
 for %%U in (%UI_SELFTESTS%) do (
     set /a RESID+=1
     set /a LAUNCHED+=1

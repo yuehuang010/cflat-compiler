@@ -19,12 +19,12 @@ deliberate. The element/seam surface was frozen in the pre-promotion hardening p
   - `core/ui_native.cb` - the framework + the `NativeHost` seam (the one module apps import
     for the Canvas hosts; the Element tree, reconciler, `Theme`, `Canvas`, and the seam
     interface + `PROP_*`/`FONT_*`/`LISTOP_*` consts all live here).
-  - `core/ui_native_host.cb` - the `if const` platform shim: selects the Win32 host on
+  - `core/ui_native/host.cb` - the `if const` platform shim: selects the Win32 host on
     Windows, the Cocoa host on macOS. Apps that want real OS controls import this.
-  - `core/ui_native_win32.cb` - the Win32/GDI `NativeHost` backend.
+  - `core/ui_native/win32.cb` - the Win32/GDI `NativeHost` backend.
   - `core/ui_native_cocoa.cb` - the macOS AppKit (Cocoa) `NativeHost` backend (imports
     `core/cocoa.cb`, the objc bridge); compile-verified only (see the parity matrix).
-  - `core/ui_native_winui.cb` - the WinUI 3 (Windows App SDK) `NativeHost` backend.
+  - `core/ui_native/winui.cb` - the WinUI 3 (Windows App SDK) `NativeHost` backend.
 - **Status:** the framework is a single source of truth (`core/ui_native.cb`); every
   host imports it directly. See the parity matrix below for per-host coverage and the
   documented WinUI 3 / Cocoa gaps.
@@ -520,7 +520,7 @@ interface Canvas
 
 - **TUI:** `SurfaceCanvas` adapts a headless `Surface` char grid; `canvasFor(&surface)`
   binds one for a paint call. The grid has no color, so it ignores the `color` arg.
-- **Win32:** `GdiCanvas` (in `win32host.cb`) maps a cell to `CELL_W`x`CELL_H`
+- **Win32:** `GdiCanvas` (in `core/ui_canvas/win32.cb`) maps a cell to `CELL_W`x`CELL_H`
   pixels and draws with `DrawTextA`/`FrameRect`/`FillRect`. It honors `color`
   (`0`/COLOR_DEFAULT keeps the original black ink / black border path) and the host selects a
   crisp monospace font (`createUiFont()`, Consolas) into the DC before painting.
@@ -613,10 +613,10 @@ stage: instead of painting, it drives real OS controls (HWND on Windows; AppKit
 `NSView`/`NSControl` on macOS) so the OS handles rendering, text input, IME, and
 accessibility. The app-facing model (Element tree, Component, controlled widgets,
 Theme, keyed identity) is unchanged - only the output stage differs. The contract
-lives in `core/ui_native.cb`; the implementations are `core/ui_native_win32.cb`
+lives in `core/ui_native.cb`; the implementations are `core/ui_native/win32.cb`
 (Win32/GDI) and `core/ui_native_cocoa.cb` (AppKit).
 
-**Platform shim.** An app imports `core/ui_native_host.cb` - a file-scope
+**Platform shim.** An app imports `core/ui_native/host.cb` - a file-scope
 `if const (__MACOS__)` shim that pulls in the Cocoa host on macOS and the Win32
 host elsewhere. Both backends expose the identical public surface
 (`runAppGuiNative`, `buildNativeTree`, the `menu*`/`native*` helpers, the driver
@@ -660,7 +660,7 @@ the native->`Event` translation.
 
 ### Win32 native host: editor features (v10)
 
-`core/ui_native_win32.cb` implements `NativeHost` as a `Window` class (one
+`core/ui_native/win32.cb` implements `NativeHost` as a `Window` class (one
 per top-level window) and adds the pieces a real desktop app needs. All are
 documented-API only (no uxtheme ordinals). An app imports this host and calls
 `runAppGuiNative(new App(), title)`.
@@ -698,7 +698,7 @@ documented-API only (no uxtheme ordinals). An app imports this host and calls
   closes). Read a status pane with `nativeStatusText(keyPath)`.
 - **Flagship demo:** `example/ui/fedit/fedit.cb` - a small native text editor built
   entirely on the above (open/edit/save, find, dirty-close prompt, light/dark, two
-  windows). It imports the `ui_native_host.cb` shim, so the same source builds and runs
+  windows). It imports the `ui_native/host.cb` shim, so the same source builds and runs
   on Windows (Win32) and macOS (Cocoa). The hosts are core, so no `-i` is needed. Build:
   `cflat example/ui/fedit/fedit.cb -o out/fedit` (`.exe` on Windows).
 
@@ -709,8 +709,8 @@ implements under the SAME name, so a self-test contains no toolkit-typed calls (
 `SendMessage`, no `objc_msgSend`, no WinRT vtable calls) and runs against any host. The gallery
 self-test lives in the host-neutral `example/ui/gallery/gallery_app.cb` (the `GalleryApp`
 Component + the 25-assert self-test); its Win32/Cocoa launcher is `example/ui/gallery/gallery.cb`
-(imports the `ui_native_host.cb` shim) and its WinUI 3 launcher is `example/ui/winui/winui_gallery.cb`
-(imports `ui_native_winui.cb`). All three build the SAME `gallery_app.cb` - a cflat compilation shares
+(imports the `ui_native/host.cb` shim) and its WinUI 3 launcher is `example/ui/winui/winui_gallery.cb`
+(imports `ui_native/winui.cb`). All three build the SAME `gallery_app.cb` - a cflat compilation shares
 one global scope across its whole import closure, so a sibling host import supplies the drivers.
 Each helper routes through the same element-model handler the OS would fire on real input, then
 re-renders; readbacks query native control state (or, for the data controls, the host-side box/
@@ -748,16 +748,17 @@ model source the `setListOp` seam feeds).
 
 ## Hosts
 
-- **TUI** (`example/ui/host.cb`, `example/ui/boxes.cb`): a double-buffered
-  terminal host. Real console = interactive; redirected I/O (`--run`, CI) falls
-  back to a deterministic headless self-test that gates `example.bat` on behavior
-  AND leaks (built with `--heap-audit`).
-- **Win32** (`example/ui/win32host.cb` + `example/ui/win32_boxes.cb`): a native
+- **TUI** (`core/ui_canvas/term.cb` host loop; `example/ui/tui_demo.cb`,
+  `example/ui/boxes.cb` demos): a double-buffered terminal host. Real console =
+  interactive; redirected I/O (`--run`, CI) falls back to a deterministic
+  headless self-test that gates `example.bat` on behavior AND leaks (built with
+  `--heap-audit`).
+- **Win32** (`core/ui_canvas/win32.cb` host + `example/ui/win32_boxes.cb`): a native
   GDI host reusing the framework unchanged behind the `Canvas` seam.
-- **Native OS controls** (`core/ui_native_host.cb` shim -> `core/ui_native_win32.cb`
+- **Native OS controls** (`core/ui_native/host.cb` shim -> `core/ui_native/win32.cb`
   / `core/ui_native_cocoa.cb`): the `NativeHost` seam instead of `Canvas` - real HWND
   (Win32) or AppKit controls (macOS). See the `NativeHost` section above.
-- **WinUI 3 (Windows App SDK)** (`core/ui_native_winui.cb`): the same `NativeHost` seam
+- **WinUI 3 (Windows App SDK)** (`core/ui_native/winui.cb`): the same `NativeHost` seam
   driving real XAML controls rooted in a `Canvas`, brought up unpackaged via
   `MddBootstrapInitialize2` + `Application.Start`. An app runs on it with `runAppWinui(new App())`;
   the gallery launcher is `example/ui/winui/winui_gallery.cb`. Its self-tests run WITHOUT
@@ -902,7 +903,7 @@ import "ui_native.cb";
 class MyApp : Component { /* render() with setKey on everything you automate */ };
 
 // myapp_test.cb  - the test target
-import "ui_native_host.cb";   // the default host: Win32 on Windows, Cocoa on macOS
+import "ui_native/host.cb";   // the default host: Win32 on Windows, Cocoa on macOS
 import "ui_test.cb";
 import "myapp.cb";
 int main(int argc, char** argv)
@@ -1026,6 +1027,6 @@ capturing `Lambda<>` closures, a case reads app state through a local downcast (
 To run the TUI self-tests directly:
 
 ```
-x64/Release/cflat.exe example/ui/host.cb --run
+x64/Release/cflat.exe example/ui/tui_demo.cb --run
 x64/Release/cflat.exe example/ui/boxes.cb --run
 ```

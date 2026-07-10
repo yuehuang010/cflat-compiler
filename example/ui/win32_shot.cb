@@ -11,9 +11,9 @@
 //   x64/Release/cflat.exe example/ui/win32_shot.cb -o out/win32_shot.exe
 //   out\win32_shot.exe out/ui_shot.bmp
 //
-// It reuses GdiCanvas + the cell/pixel mapping from win32host.cb and the BMP
-// writer from core/graphic/bitmap.cb.
-import "win32host.cb";
+// It reuses GdiCanvas + the cell/pixel mapping from core/ui_canvas/win32.cb and the
+// BMP writer from core/graphic/bitmap.cb.
+import "ui_canvas/win32.cb";
 import "graphic/bitmap.cb";
 
 // Build a representative widget tree (Box + Text + Button + TextInput +
