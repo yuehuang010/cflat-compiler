@@ -1,0 +1,115 @@
+// pfor_dynamic_bench.cb - static vs dynamic scheduling for parallel_for_n, on both a
+// triangular-cost (skewed) body and a uniform-cost body, at a few values of n.
+//
+// Build for best results with an explicit ISA level (AVX2 / AVX-512), e.g.:
+//   x64/Release/cflat.exe performance/hpc/pfor_dynamic_bench.cb -i performance/hpc -i cflat/core \
+//       -o out/hpc/pfor_dynamic_bench.exe -O2 --cpu x86-64-v3
+//   out/hpc/pfor_dynamic_bench.exe
+
+import "cruntime.cb";
+import "time.cb";
+import "hpc/parallel.cb";
+
+void report(char* name, double secs) {
+    printf("  %-32s %10.3f ms\n", name, secs * 1000.0);
+}
+
+// Triangular-cost body: index i costs ~(n-i) inner iterations, so the first
+// worker's static range (the low indices) is by far the most expensive -
+// this is the classic skewed-cost shape static scheduling handles badly.
+void triangularWork(double[] out, i64 lo, i64 hi, i64 n) {
+    i64 i = lo;
+    while (i < hi) {
+        double s = 0.0;
+        i64 cost = n - i;
+        i64 t = 0;
+        while (t < cost) { s = s + 1.0; t = t + 1; }
+        out[i] = s;
+        i = i + 1;
+    }
+}
+
+// Uniform-cost body: every index costs the same, so static scheduling's free
+// split is already optimal - this is the "dynamic should not regress" check.
+void uniformWork(double[] out, double[] src, i64 lo, i64 hi) {
+    i64 i = lo;
+    while (i < hi) { out[i] = src[i] * 1.0000001 + 0.5; i = i + 1; }
+}
+
+void benchTriangular(i64 n, int workers) {
+    double[] ser = new double[n];
+    double[] statOut = new double[n];
+    double[] dynOut = new double[n];
+    Stopwatch sw;
+
+    sw.restart();
+    triangularWork(ser, 0, n, n);
+    double tSerial = sw.elapsed().seconds();
+
+    sw.restart();
+    parallel_for_n(n, workers, (i64 lo, i64 hi) => { triangularWork(statOut, lo, hi, n); });
+    double tStatic = sw.elapsed().seconds();
+
+    sw.restart();
+    parallel_for_n_dynamic(n, workers, 0, (i64 lo, i64 hi) => { triangularWork(dynOut, lo, hi, n); });
+    double tDynamic = sw.elapsed().seconds();
+
+    printf("\ntriangular n=%lld workers=%d:\n", n, workers);
+    report("serial", tSerial);
+    report("static (parallel_for_n)", tStatic);
+    report("dynamic (parallel_for_n_dynamic)", tDynamic);
+    printf("  speedup static=%.2fx  dynamic=%.2fx  (dynamic/static=%.2fx)\n",
+        tSerial / tStatic, tSerial / tDynamic, tStatic / tDynamic);
+
+    delete[_] ser;
+    delete[_] statOut;
+    delete[_] dynOut;
+}
+
+void benchUniform(i64 n, int workers) {
+    double[] src = new double[n];
+    double[] statOut = new double[n];
+    double[] dynOut = new double[n];
+    i64 i = 0;
+    while (i < n) { src[i] = (double)i; i = i + 1; }
+    Stopwatch sw;
+
+    int reps = 200;
+
+    sw.restart();
+    for (int r = 0; r < reps; r = r + 1) {
+        parallel_for_n(n, workers, (i64 lo, i64 hi) => { uniformWork(statOut, src, lo, hi); });
+    }
+    double tStatic = sw.elapsed().seconds() / (double)reps;
+
+    sw.restart();
+    for (int r = 0; r < reps; r = r + 1) {
+        parallel_for_n_dynamic(n, workers, 0, (i64 lo, i64 hi) => { uniformWork(dynOut, src, lo, hi); });
+    }
+    double tDynamic = sw.elapsed().seconds() / (double)reps;
+
+    printf("\nuniform n=%lld workers=%d (avg over %d reps):\n", n, workers, reps);
+    report("static (parallel_for_n)", tStatic);
+    report("dynamic (parallel_for_n_dynamic)", tDynamic);
+    printf("  dynamic/static = %.2fx (~1.0x expected: no regression on uniform cost)\n", tDynamic / tStatic);
+
+    delete[_] src;
+    delete[_] statOut;
+    delete[_] dynOut;
+}
+
+extern int main() {
+    int workers = 4;
+
+    printf("=== Triangular-cost body: static vs dynamic scheduling ===\n");
+    benchTriangular(4096, workers);
+    benchTriangular(16384, workers);
+    benchTriangular(65536, workers);
+
+    printf("\n=== Uniform-cost body: dynamic should be roughly on par with static ===\n");
+    benchUniform(1 << 20, workers);
+    benchUniform(1 << 22, workers);
+
+    printf("\nDone.\n");
+    return 0;
+}

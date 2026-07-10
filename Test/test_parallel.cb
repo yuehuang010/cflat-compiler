@@ -226,6 +226,217 @@ void testReduce_moreWorkersThanN() {
     delete[_] v;
 }
 
+// ---- parallel_for_n_dynamic / parallel_for_n_dynamic_pool ------------------
+// Same axpy-style body shape as parallel_for_n, but every case below also
+// checks the dynamic chunk-dispenser's edge behavior (uneven division, chunk
+// bigger than n, n==0, more workers than n, auto chunk sizing) plus a
+// triangular-cost body to prove the result is race-free / element-exact
+// against serial even though chunk boundaries land on different workers than
+// the static split would produce.
+
+double fillFunc(i64 i) {
+    return (double)(i * i) - 3.0 * (double)i + 1.0;
+}
+
+void fillSerialDyn(double[] y, i64 n) {
+    i64 i = 0;
+    while (i < n) { y[i] = fillFunc(i); i = i + 1; }
+}
+
+bool checkFillDyn(double[] y, i64 n) {
+    i64 i = 0;
+    while (i < n) {
+        if (!approx(y[i], fillFunc(i))) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+void testForNDynamic_thread_notDivisible() {
+    i64 n = 1003;   // not divisible by chunk=16
+    double[] y = new double[n];
+    parallel_for_n_dynamic(n, 4, 16, (i64 lo, i64 hi) => {
+        i64 i = lo;
+        while (i < hi) { y[i] = fillFunc(i); i = i + 1; }
+    });
+    check("parallel_for_n_dynamic thread: n not divisible by chunk", checkFillDyn(y, n));
+    delete[_] y;
+}
+
+void testForNDynamic_thread_chunkBiggerThanN() {
+    i64 n = 50;
+    double[] y = new double[n];
+    parallel_for_n_dynamic(n, 4, 10000, (i64 lo, i64 hi) => {
+        i64 i = lo;
+        while (i < hi) { y[i] = fillFunc(i); i = i + 1; }
+    });
+    check("parallel_for_n_dynamic thread: chunk > n", checkFillDyn(y, n));
+    delete[_] y;
+}
+
+void testForNDynamic_thread_zeroN() {
+    i64 n = 5;
+    double[] y = new double[n];
+    y[0] = 42.0;   // sentinel: must survive an n==0 call untouched
+    parallel_for_n_dynamic(0, 4, 8, (i64 lo, i64 hi) => {
+        y[0] = -1.0;   // must never run
+    });
+    check("parallel_for_n_dynamic thread: n==0 is a no-op", approx(y[0], 42.0));
+    delete[_] y;
+}
+
+void testForNDynamic_thread_moreWorkersThanN() {
+    i64 n = 3;
+    double[] y = new double[n];
+    parallel_for_n_dynamic(n, 16, 1, (i64 lo, i64 hi) => {
+        i64 i = lo;
+        while (i < hi) { y[i] = fillFunc(i); i = i + 1; }
+    });
+    check("parallel_for_n_dynamic thread: workers > n", checkFillDyn(y, n));
+    delete[_] y;
+}
+
+void testForNDynamic_thread_autoChunk() {
+    i64 n = 20000;
+    double[] y = new double[n];
+    parallel_for_n_dynamic(n, 4, 0, (i64 lo, i64 hi) => {   // chunk<=0 -> auto
+        i64 i = lo;
+        while (i < hi) { y[i] = fillFunc(i); i = i + 1; }
+    });
+    check("parallel_for_n_dynamic thread: auto chunk", checkFillDyn(y, n));
+    delete[_] y;
+}
+
+// Triangular-cost body: index k costs ~(n-k) inner iterations. Kept small
+// (n in the low thousands) so this correctness test stays fast - timing
+// comparisons live in performance/hpc/pfor_dynamic_bench.cb, not here.
+void triangularFill(double[] out, i64 lo, i64 hi, i64 n) {
+    i64 k = lo;
+    while (k < hi) {
+        double s = 0.0;
+        i64 cost = n - k;
+        i64 t = 0;
+        while (t < cost) { s = s + 1.0; t = t + 1; }
+        out[k] = s;
+        k = k + 1;
+    }
+}
+
+void testForNDynamic_thread_triangularSkew() {
+    i64 n = 2000;
+    double[] ser = new double[n];
+    double[] par = new double[n];
+    triangularFill(ser, 0, n, n);
+
+    parallel_for_n_dynamic(n, 4, 0, (i64 lo, i64 hi) => {
+        triangularFill(par, lo, hi, n);
+    });
+
+    bool same = true;
+    i64 i = 0;
+    while (i < n) {
+        if (!approx(par[i], ser[i])) { same = false; }
+        i = i + 1;
+    }
+    check("parallel_for_n_dynamic thread: triangular skew == serial", same);
+    delete[_] ser;
+    delete[_] par;
+}
+
+void testForNDynamic_pool_notDivisible() {
+    i64 n = 1003;
+    double[] y = new double[n];
+    ThreadPool pool;
+    pool.init(4);
+    parallel_for_n_dynamic_pool(&pool, n, 0, 16, (i64 lo, i64 hi) => {
+        i64 i = lo;
+        while (i < hi) { y[i] = fillFunc(i); i = i + 1; }
+    });
+    pool.shutdown();
+    check("parallel_for_n_dynamic pool: n not divisible by chunk", checkFillDyn(y, n));
+    delete[_] y;
+}
+
+void testForNDynamic_pool_chunkBiggerThanN() {
+    i64 n = 50;
+    double[] y = new double[n];
+    ThreadPool pool;
+    pool.init(4);
+    parallel_for_n_dynamic_pool(&pool, n, 0, 10000, (i64 lo, i64 hi) => {
+        i64 i = lo;
+        while (i < hi) { y[i] = fillFunc(i); i = i + 1; }
+    });
+    pool.shutdown();
+    check("parallel_for_n_dynamic pool: chunk > n", checkFillDyn(y, n));
+    delete[_] y;
+}
+
+void testForNDynamic_pool_zeroN() {
+    i64 n = 5;
+    double[] y = new double[n];
+    y[0] = 42.0;
+    ThreadPool pool;
+    pool.init(4);
+    parallel_for_n_dynamic_pool(&pool, 0, 0, 8, (i64 lo, i64 hi) => {
+        y[0] = -1.0;   // must never run
+    });
+    pool.shutdown();
+    check("parallel_for_n_dynamic pool: n==0 is a no-op", approx(y[0], 42.0));
+    delete[_] y;
+}
+
+void testForNDynamic_pool_moreWorkersThanN() {
+    i64 n = 3;
+    double[] y = new double[n];
+    ThreadPool pool;
+    pool.init(4);
+    parallel_for_n_dynamic_pool(&pool, n, 16, 1, (i64 lo, i64 hi) => {
+        i64 i = lo;
+        while (i < hi) { y[i] = fillFunc(i); i = i + 1; }
+    });
+    pool.shutdown();
+    check("parallel_for_n_dynamic pool: workers > n", checkFillDyn(y, n));
+    delete[_] y;
+}
+
+void testForNDynamic_pool_autoChunk() {
+    i64 n = 20000;
+    double[] y = new double[n];
+    ThreadPool pool;
+    pool.init(4);
+    parallel_for_n_dynamic_pool(&pool, n, 0, 0, (i64 lo, i64 hi) => {   // chunk<=0 -> auto
+        i64 i = lo;
+        while (i < hi) { y[i] = fillFunc(i); i = i + 1; }
+    });
+    pool.shutdown();
+    check("parallel_for_n_dynamic pool: auto chunk", checkFillDyn(y, n));
+    delete[_] y;
+}
+
+void testForNDynamic_pool_triangularSkew() {
+    i64 n = 2000;
+    double[] ser = new double[n];
+    double[] par = new double[n];
+    triangularFill(ser, 0, n, n);
+
+    ThreadPool pool;
+    pool.init(4);
+    parallel_for_n_dynamic_pool(&pool, n, 0, 0, (i64 lo, i64 hi) => {
+        triangularFill(par, lo, hi, n);
+    });
+    pool.shutdown();
+
+    bool same = true;
+    i64 i = 0;
+    while (i < n) {
+        if (!approx(par[i], ser[i])) { same = false; }
+        i = i + 1;
+    }
+    check("parallel_for_n_dynamic pool: triangular skew == serial", same);
+    delete[_] ser;
+    delete[_] par;
+}
+
 extern int main() {
     testForN_thread();
     testForN_pool();
@@ -234,6 +445,19 @@ extern int main() {
     testReduce_thread_sum();
     testReduce_moreWorkersThanN();
     testForN_capturedStructOperator();
+
+    testForNDynamic_thread_notDivisible();
+    testForNDynamic_thread_chunkBiggerThanN();
+    testForNDynamic_thread_zeroN();
+    testForNDynamic_thread_moreWorkersThanN();
+    testForNDynamic_thread_autoChunk();
+    testForNDynamic_thread_triangularSkew();
+    testForNDynamic_pool_notDivisible();
+    testForNDynamic_pool_chunkBiggerThanN();
+    testForNDynamic_pool_zeroN();
+    testForNDynamic_pool_moreWorkersThanN();
+    testForNDynamic_pool_autoChunk();
+    testForNDynamic_pool_triangularSkew();
 
     printf("%d/%d passed\n", g_pass, g_total);
     return g_pass == g_total ? 0 : 1;

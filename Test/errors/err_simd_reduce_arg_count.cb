@@ -1,0 +1,9 @@
+// simd<T,N>.reduce_add/min/max take exactly one vector argument.
+extern int main()
+{
+    double[] a = new double[4];
+    simd<double,4> v = simd<double,4>.load(a, 0);
+    expect_error("simd<T,N>.reduce_add expects 1 argument") {
+        double r = simd<double,4>.reduce_add(v, v);
+    }
+}

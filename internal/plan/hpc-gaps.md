@@ -1,6 +1,8 @@
 # HPC Gaps Plan
 
-Status: PROPOSED (not started)
+Status: G1-G3 DONE (2026-07-09, integrated on master, all Windows gates
+green); G4-G7 remain PROPOSED. WSL test.sh re-verification for G2's core
+library change deliberately skipped (user decision at integration).
 Created: 2026-07-09
 Source: gap analysis of doc/HPC.md (+ CLI.md, THREADING.md) against what HPC
 developers need from a compiler/library. What CFlat already has is strong:
@@ -63,6 +65,16 @@ files.
 
 Detailed plan: internal/plan/hpc-g2-dynamic-scheduling.md (2026-07-09).
 
+G2 DONE 2026-07-09 (agent, steps 1-5; Phase 2 reduce_dynamic still open -
+see detailed plan for status/readiness notes). parallel_for_n_dynamic +
+_pool in core/hpc/parallel.cb; tests in Test/test_parallel.cb (not
+test_hpc_kernels.cb - that file does not exercise parallel.cb); benchmark
+performance/hpc/pfor_dynamic_bench.cb. Triangular skew, 4 workers,
+n=65536: serial 1463ms, static 639ms (2.29x), dynamic 363ms (4.03x -
+near-ideal). Uniform body: par at moderate n, ~23% slower at n=2^22
+(counter contention - documented tradeoff). Guided variant not warranted
+on this evidence.
+
 Today: static balanced chunks only. Irregular work (sparse rows with
 varying nnz, adaptive mesh, shrinking LU trailing update - the doc already
 fights this with a work cutoff) wants dynamic/guided.
@@ -84,6 +96,13 @@ body. Pure library change - no compiler work.
 ## G3. SIMD completeness
 
 Detailed plan: internal/plan/hpc-g3-simd-completeness.md (2026-07-09).
+
+G3 DONE 2026-07-09 (agent, all 3 phases): reduce_add/min/max (reassoc
+fadd), lanes() iota helper (needed - no other way to build a tail mask),
+load_masked/store_masked, load_gather/store_scatter (unmasked MVP), all
+as ParseSimdStaticMethod branches - no grammar/ParseDeclarationSpecifiers
+changes. Tests: test_hpc.cb 141->170 asserts + 4 err_simd_*.cb. -O2 spot
+check matches -O0. Shuffles/lane writes stay deferred per plan.
 
 Today: no lane writes, no shuffles (doc says so), no horizontal reduce,
 no masked load/store, no gather/scatter.

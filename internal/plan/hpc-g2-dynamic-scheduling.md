@@ -1,6 +1,7 @@
 # G2: Dynamic Scheduling for parallel_for_n
 
-Status: PROPOSED (not started)
+Status: DONE for steps 1-5 (2026-07-09, integrated on master, gates green).
+Step 6 / Phase 2 (parallel_reduce_dynamic) NOT started - see notes at end.
 Created: 2026-07-09
 Parent: internal/plan/hpc-gaps.md (G2)
 Files: cflat/core/hpc/parallel.cb (only), doc/HPC.md, Test/test_hpc_kernels.cb
@@ -188,3 +189,34 @@ large - amortize the counter line ping-pong; see tradeoff below).
   for core/*.cb changes.
 - Skewed-work benchmark shows dynamic > static on the triangular body and
   static >= dynamic (within noise) on a uniform body at auto chunk.
+
+## Implementation notes (as landed, 2026-07-09)
+
+Deviations from the text above, all deliberate:
+
+1. POOL-REFUSAL FIX: the wording "drain the puller loop before deleting
+   the box" above is a use-after-free - ThreadPool.submit frees ctx via
+   the deleter BEFORE returning nullptr on refusal. As landed, the inline
+   drain runs off still-live locals (body/counter/n/chunk in the helper's
+   frame), never the freed box. Any future variant (Phase 2 included)
+   must repeat this shape.
+2. Tests went into Test/test_parallel.cb, not test_hpc_kernels.cb - that
+   is the file that actually imports and exercises hpc/parallel.cb.
+3. New benchmark file performance/hpc/pfor_dynamic_bench.cb (none existed
+   for the parallel helpers).
+
+Measured (4 workers, triangular skew): n=65536 serial 1463ms, static
+639ms (2.29x), dynamic 363ms (4.03x). Uniform body: par at n=2^20,
+dynamic ~23% slower at n=2^22 (counter-line contention). Guided variant
+NOT warranted on this evidence; revisit only with a new workload.
+
+WSL test.sh re-verification skipped at integration (user decision).
+
+## Phase 2 readiness (parallel_reduce_dynamic<T>, when picked up)
+
+__PRedBox<T> adapts cleanly: add next/n/chunk/combine fields; replace the
+single partial() call with a chunk-pulling fold into one local
+accumulator, written to the worker's slot after exhaustion. Watch for:
+(a) the same pool-refusal use-after-free trap as note 1; (b) the raw
+variant's one-shot inline trampoline lambda becomes a small loop - a
+second copy of the drain logic to keep in sync.

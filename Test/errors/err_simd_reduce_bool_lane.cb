@@ -1,0 +1,11 @@
+// simd<T,N>.reduce_add/min/max do not support bool (i1) lanes - use select/mask ops
+// instead. Keeps the reduction matrix small.
+extern int main()
+{
+    simd<double,4> a = 1.0;
+    simd<double,4> thresh = 0.5;
+    simd<bool,4> mask = a > thresh;
+    expect_error("does not support bool lanes") {
+        bool r = simd<bool,4>.reduce_add(mask);
+    }
+}

@@ -1,6 +1,7 @@
 # G3: SIMD Completeness - Detailed Plan
 
-Status: PROPOSED (not started)
+Status: DONE - all 3 phases (2026-07-09, integrated on master, gates
+green: test.bat all pass, test_lsp 201/0, example.bat 88/0/24).
 Created: 2026-07-09
 Parent: internal/plan/hpc-gaps.md (G3)
 
@@ -183,6 +184,25 @@ since MainListener.h is touched.
    (simd section ~85+: new ops in the intrinsic table, reassoc
    semantics note, tail-free loop example, scatter ordering note) in
    the same change.
+
+## Implementation notes (as landed, 2026-07-09)
+
+- `lanes()` WAS needed (no other way to build a tail mask existed) and is
+  implemented as a ConstantVector iota, int or FP per element type.
+- Index validation for gather/scatter checks the LLVM element type
+  (isIntegerTy(32)/isIntegerTy(64)), not type-name strings, so all int
+  aliases (int/i32/u32/long/i64/u64) are accepted uniformly.
+- Intrinsic signatures (vcpkg LLVM 18): vector.reduce.fadd overloads on
+  {vecTy} only (start operand derived); masked.load/store overload
+  {vecTy, ptrTy}; masked.gather/scatter overload {vecTy, ptrVecTy} and
+  take <N x ptr> + i32 align + mask (+passthru on loads/gathers).
+- Error-path hardening: the new branches RETURN immediately after
+  LogErrorContext on arity/shape mismatch. The pre-existing
+  load/store/select/clamp branches log-and-continue and then index
+  argNVs[k] unconditionally - a latent OOB read on malformed calls.
+  KNOWN CLEANUP: give those older branches the same early return.
+- LSP: no hardcoded simd method list exists (completion is generic) -
+  nothing to extend.
 
 ## Sequencing / delegation
 

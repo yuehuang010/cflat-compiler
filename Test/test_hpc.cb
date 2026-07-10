@@ -551,6 +551,134 @@ int testSimdCompareSelect()
 }
 
 // ---------------------------------------------------------------------------
+// simd<T,N> horizontal reductions: reduce_add/min/max collapse all N lanes to a
+// scalar T. Checked against the equivalent scalar loop over v[i]. reduce_add on
+// float/double is reassociating (see doc/HPC.md); values below are powers of two
+// so the sum is exactly representable regardless of summation order.
+// ---------------------------------------------------------------------------
+int testSimdReduce()
+{
+    int passed = 0;
+
+    float[] af = new float[4];
+    af[0] = 1.0f; af[1] = 2.0f; af[2] = 4.0f; af[3] = 8.0f;   // sum=15, min=1, max=8
+    simd<float,4> vf = simd<float,4>.load(af, 0);
+    passed += Test("simd reduce_add float",  simd<float,4>.reduce_add(vf), 15.0f);
+    passed += Test("simd reduce_min float",  simd<float,4>.reduce_min(vf), 1.0f);
+    passed += Test("simd reduce_max float",  simd<float,4>.reduce_max(vf), 8.0f);
+
+    double[] ad = new double[4];
+    ad[0] = 1.0; ad[1] = 2.0; ad[2] = 4.0; ad[3] = 8.0;       // sum=15, min=1, max=8
+    simd<double,4> vd = simd<double,4>.load(ad, 0);
+    passed += Test("simd reduce_add double", (float)simd<double,4>.reduce_add(vd), 15.0f);
+    passed += Test("simd reduce_min double", (float)simd<double,4>.reduce_min(vd), 1.0f);
+    passed += Test("simd reduce_max double", (float)simd<double,4>.reduce_max(vd), 8.0f);
+
+    i32[] ai = new i32[4];
+    ai[0] = -5; ai[1] = 3; ai[2] = -20; ai[3] = 7;            // sum=-15, min=-20, max=7
+    simd<i32,4> vi = simd<i32,4>.load(ai, 0);
+    passed += Test("simd reduce_add i32", simd<i32,4>.reduce_add(vi), -15);
+    passed += Test("simd reduce_min i32", simd<i32,4>.reduce_min(vi), -20);
+    passed += Test("simd reduce_max i32", simd<i32,4>.reduce_max(vi), 7);
+
+    // Unsigned: a large top-bit-set lane must reduce as the biggest value, not negative.
+    u32[] au = new u32[4];
+    au[0] = (u32)5; au[1] = (u32)4000000000; au[2] = (u32)7; au[3] = (u32)9;
+    simd<u32,4> vu = simd<u32,4>.load(au, 0);
+    passed += Test("simd reduce_add u32", (i64)simd<u32,4>.reduce_add(vu), (i64)4000000021);
+    passed += Test("simd reduce_min u32", (int)simd<u32,4>.reduce_min(vu), 5);
+    passed += Test("simd reduce_max u32", (i64)simd<u32,4>.reduce_max(vu), (i64)4000000000);
+
+    delete[] af; delete[] ad; delete[] ai; delete[] au;
+    return passed;
+}
+
+// ---------------------------------------------------------------------------
+// simd<T,N> masked load/store: the tail-free replacement for a scalar epilogue.
+// simd<T,N>.lanes() builds the {0,1,...,N-1} iota used to compare against the
+// remaining count and produce the tail mask.
+// ---------------------------------------------------------------------------
+int testSimdMasked()
+{
+    int passed = 0;
+
+    // Partial-tail load: only 2 of 4 lanes are "in range" (remaining = 2).
+    double[] src = new double[4];
+    src[0] = 10.0; src[1] = 20.0; src[2] = 30.0; src[3] = 40.0;
+    simd<double,4> remaining = 2.0;
+    simd<bool,4> mask = simd<double,4>.lanes() < remaining;      // {T,T,F,F}
+    simd<double,4> passthru = (double)-1.0;
+    simd<double,4> loaded = simd<double,4>.load_masked(src, 0, mask, passthru);
+    passed += Test("simd load_masked in-range lane0",  (float)loaded[0], 10.0f);
+    passed += Test("simd load_masked in-range lane1",  (float)loaded[1], 20.0f);
+    passed += Test("simd load_masked passthru lane2",  (float)loaded[2], -1.0f);
+    passed += Test("simd load_masked passthru lane3",  (float)loaded[3], -1.0f);
+
+    // Partial-tail store: masked-off lanes must leave destination memory untouched.
+    double[] dst = new double[4];
+    dst[0] = 0.0; dst[1] = 0.0; dst[2] = 111.0; dst[3] = 222.0;   // 2,3 are sentinel
+    simd<double,4> v = simd<double,4>.load(src, 0);               // {10,20,30,40}
+    simd<double,4>.store_masked(v, dst, 0, mask);                 // writes lanes 0,1 only
+    passed += Test("simd store_masked writes lane0",    (float)dst[0], 10.0f);
+    passed += Test("simd store_masked writes lane1",    (float)dst[1], 20.0f);
+    passed += Test("simd store_masked untouched lane2", (float)dst[2], 111.0f);
+    passed += Test("simd store_masked untouched lane3", (float)dst[3], 222.0f);
+
+    delete[] src; delete[] dst;
+    return passed;
+}
+
+// ---------------------------------------------------------------------------
+// simd<T,N> gather/scatter: unmasked MVP over a simd<i32,N> index vector.
+// ---------------------------------------------------------------------------
+int testSimdGatherScatter()
+{
+    int passed = 0;
+
+    // Permutation gather: idx picks lanes out of order, with a repeat (index 0 read twice).
+    double[] table = new double[8];
+    table[0]=100.0; table[1]=101.0; table[2]=102.0; table[3]=103.0;
+    table[4]=104.0; table[5]=105.0; table[6]=106.0; table[7]=107.0;
+    i32[] idxa = new i32[4];
+    idxa[0] = 7; idxa[1] = 0; idxa[2] = 3; idxa[3] = 0;
+    simd<i32,4> idx = simd<i32,4>.load(idxa, 0);
+    simd<double,4> gathered = simd<double,4>.load_gather(table, idx);
+    passed += Test("simd load_gather lane0", (float)gathered[0], 107.0f);
+    passed += Test("simd load_gather lane1", (float)gathered[1], 100.0f);
+    passed += Test("simd load_gather lane2", (float)gathered[2], 103.0f);
+    passed += Test("simd load_gather lane3", (float)gathered[3], 100.0f);
+
+    // Scatter with a duplicate index: LLVM's masked.scatter stores in lane order, so the
+    // last lane targeting a given address wins.
+    double[] out = new double[8];
+    i32[] outIdxA = new i32[4];
+    outIdxA[0] = 2; outIdxA[1] = 5; outIdxA[2] = 2; outIdxA[3] = 1;   // lane0 and lane2 both hit index 2
+    simd<i32,4> outIdx = simd<i32,4>.load(outIdxA, 0);
+    double[] vals = new double[4];
+    vals[0] = 1.0; vals[1] = 2.0; vals[2] = 3.0; vals[3] = 4.0;      // lane2's 3.0 must win at index 2
+    simd<double,4> valsv = simd<double,4>.load(vals, 0);
+    simd<double,4>.store_scatter(valsv, out, outIdx);
+    passed += Test("simd store_scatter dup-index last-lane-wins", (float)out[2], 3.0f);
+    passed += Test("simd store_scatter lane1 target",  (float)out[5], 2.0f);
+    passed += Test("simd store_scatter lane3 target",  (float)out[1], 4.0f);
+
+    // Gather/scatter round-trip through the same index vector.
+    double[] rtSrc = new double[4];
+    rtSrc[0] = 11.0; rtSrc[1] = 22.0; rtSrc[2] = 33.0; rtSrc[3] = 44.0;
+    i32[] identA = new i32[4];
+    identA[0] = 3; identA[1] = 2; identA[2] = 1; identA[3] = 0;
+    simd<i32,4> ident = simd<i32,4>.load(identA, 0);
+    double[] rtDst = new double[4];
+    simd<double,4>.store_scatter(simd<double,4>.load_gather(rtSrc, ident), rtDst, ident);
+    passed += Test("simd gather/scatter round-trip lane0", (float)rtDst[0], 11.0f);
+    passed += Test("simd gather/scatter round-trip lane3", (float)rtDst[3], 44.0f);
+
+    delete[] table; delete[] idxa; delete[] out; delete[] outIdxA; delete[] vals;
+    delete[] rtSrc; delete[] identA; delete[] rtDst;
+    return passed;
+}
+
+// ---------------------------------------------------------------------------
 // span<T> (noalias) and view<T> (may-alias) library types - see doc/HPC.md.
 // span rides the T[] array-view noalias metadata; view is the may-alias sibling.
 // (Correctness is checked here at -O0; the noalias/no-memcheck IR guarantee for
@@ -685,6 +813,9 @@ extern int main(int argc, char** argv)
     passed += testSimdLoadStoreStrided();  total += 6;
     passed += testSimdMath();              total += 25;
     passed += testSimdCompareSelect();     total += 24;
+    passed += testSimdReduce();            total += 12;
+    passed += testSimdMasked();            total += 8;
+    passed += testSimdGatherScatter();     total += 9;
 
     // ---- span<T> / view<T> ----
     passed += testSpanView(); total += 24;

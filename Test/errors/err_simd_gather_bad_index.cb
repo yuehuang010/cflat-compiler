@@ -1,0 +1,10 @@
+// simd<T,N>.load_gather requires the index vector to be simd<int,N> or simd<long,N>
+// (i32/i64 lanes) - a float index vector is a clean error, not a bit-cast miscompile.
+extern int main()
+{
+    double[] table = new double[4];
+    simd<float,4> floatIdx = 0.0;
+    expect_error("index vector must be a simd<int,N> or simd<long,N>") {
+        simd<double,4> r = simd<double,4>.load_gather(table, floatIdx);
+    }
+}

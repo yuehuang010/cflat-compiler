@@ -1,0 +1,11 @@
+// simd<T,N>.load_masked requires `mask` to be a simd<bool,N> of the same lane count
+// (the result of a vector comparison), not an arbitrary value vector.
+extern int main()
+{
+    double[] a = new double[4];
+    simd<double,4> notAMask = 1.0;
+    simd<double,4> passthru = 0.0;
+    expect_error("the mask must be a simd<bool,N>") {
+        simd<double,4> r = simd<double,4>.load_masked(a, 0, notAMask, passthru);
+    }
+}

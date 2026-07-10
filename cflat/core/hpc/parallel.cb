@@ -1,5 +1,6 @@
 import "thread.cb";
 import "threadpool.cb";
+import "atomic.cb";
 
 // parallel.cb - data-parallel helpers that close the "across-core" gap left by the
 // single-threaded HPC primitives (`vectorize`, `simd<T,N>`, span<T> noalias). They
@@ -360,4 +361,177 @@ T parallel_reduce_pool<T>(ThreadPool* pool, i64 n, int workers, T identity,
     delete[_] handles;
     delete[_] partials;
     return total;
+}
+
+// ----------------------------------------------------------------------------
+// parallel_for_n_dynamic - like parallel_for_n, but workers pull small chunks
+// from a shared atomic counter instead of each taking one fixed range. Static
+// splitting is optimal when cost-per-index is uniform; it falls over when cost
+// varies with the index (triangular loops, skewed sparse rows, shrinking
+// trailing updates), because the unluckiest worker's chunk sets the wall time.
+// Dynamic scheduling cuts [0,n) into many small chunks and lets any worker
+// that finishes early pull the next one, so imbalance is bounded by roughly
+// one chunk instead of one worker's whole share.
+//
+// Every index is still processed exactly once by exactly one worker, so a
+// race-free body produces results IDENTICAL to serial - only WHICH thread
+// computes which index changes, never the per-index computation itself. This
+// is what makes it a drop-in replacement for parallel_for_n: same contract,
+// same signature plus a leading `chunk`. Contrast a possible future
+// parallel_reduce_dynamic<T>, whose running combine would additionally
+// reassociate non-deterministically run to run - deliberately out of scope
+// here (see internal/plan/hpc-g2-dynamic-scheduling.md).
+// ----------------------------------------------------------------------------
+
+// Chunks-per-worker used to derive an automatic chunk size when the caller
+// passes chunk <= 0 (see __pfor_dyn_auto_chunk). Larger values bound imbalance
+// tighter but push more traffic through the shared counter line; smaller
+// values amortize the counter better but leave a longer tail. Named so it is
+// easy to retune from one place after measurement.
+int PFOR_DYN_CHUNKS_PER_WORKER = 16;
+
+// Shared chunk dispenser + per-worker context. `next` is a single atomic_counter
+// living in the calling helper's stack frame; every worker/task box for one
+// call shares the SAME `next`, so whichever one gets there first claims the
+// next chunk. `body` follows the same clone-per-box discipline as __PForBox.
+struct __PForDynBox {
+    Lambda<void(i64, i64)> body = default;
+    atomic_counter* next = nullptr;   // shared dispenser (caller frame)
+    i64 n     = 0;
+    i64 chunk = 0;
+};
+
+// Pull-and-run loop shared by the raw thread trampoline and the pool
+// trampoline: fetch-add the shared counter by `chunk` (relaxed - the returned
+// value is used only to compute this chunk's [lo,hi), and workers' writes are
+// published to the caller by the existing join/wait barrier), and stop once
+// the claimed range starts at or past n. The final chunk is clamped to n.
+void __pfor_dyn_drain(__PForDynBox* b) {
+    while (true) {
+        i64 newv = b->next->add(b->chunk);
+        i64 lo    = newv - b->chunk;
+        if (lo >= b->n) { break; }
+        i64 hi = lo + b->chunk;
+        if (hi > b->n) { hi = b->n; }
+        b->body(lo, hi);
+    }
+}
+
+// Thread.start trampoline (borrow box; helper owns the array).
+int __pfor_dyn_thread_tramp(void* raw) {
+    __PForDynBox* b = (__PForDynBox*)raw;
+    __pfor_dyn_drain(b);
+    return 0;
+}
+
+// ThreadPool.submit trampoline (owns the box; frees it after draining).
+int __pfor_dyn_pool_tramp(move void* raw, stop_token tok) {
+    __PForDynBox* b = (__PForDynBox*)raw;
+    __pfor_dyn_drain(b);
+    delete b;
+    return 0;
+}
+
+// ctx deleter handed to submit(): on ACCEPTANCE __pfor_dyn_pool_tramp frees the
+// box. On REFUSAL, ThreadPool.submit unconditionally routes ctx through this
+// deleter before returning nullptr (submit's contract: "the pool deletes ctx,
+// so the caller never frees ctx after this call") - so by the time
+// parallel_for_n_dynamic_pool observes a nullptr handle, the box is already
+// gone. That is why the refusal branch below drains the shared counter using
+// the still-live local variables instead of trying to reach into the box.
+void __pfor_dyn_box_free(move void* raw) { delete (__PForDynBox*)raw; }
+
+// Auto chunk size for chunk <= 0: max(1, n / (workers * PFOR_DYN_CHUNKS_PER_WORKER)),
+// clamped to n so a single call never needs more than one chunk when n is small.
+i64 __pfor_dyn_auto_chunk(i64 n, int workers) {
+    i64 c = n / ((i64)workers * (i64)PFOR_DYN_CHUNKS_PER_WORKER);
+    if (c < 1) { c = 1; }
+    if (c > n) { c = n; }
+    return c;
+}
+
+// RAW THREAD overload. Same signature as parallel_for_n plus a leading
+// `chunk`: pass 0 (or negative) to let it size itself (see
+// __pfor_dyn_auto_chunk). `pin` and `fpConfig` behave exactly as in
+// parallel_for_n.
+void parallel_for_n_dynamic(i64 n, int workers, i64 chunk, Lambda<void(i64, i64)> body, bool pin = false, int fpConfig = 0) {
+    if (n <= 0) { return; }
+    __pfor_raw_hotloop_check();
+    if (workers <= 0) { workers = hardware_concurrency(); }
+    if ((i64)workers > n) { workers = (int)n; }
+    if (chunk <= 0) { chunk = __pfor_dyn_auto_chunk(n, workers); }
+
+    Thread*       threads = new Thread[workers];
+    __PForDynBox* boxes   = new __PForDynBox[workers];
+    atomic_counter next   = default;
+
+    int hwc = hardware_concurrency();
+    if (hwc <= 0) { hwc = workers; }
+
+    int w = 0;
+    while (w < workers) {
+        boxes[w].body  = body;
+        boxes[w].next  = &next;
+        boxes[w].n     = n;
+        boxes[w].chunk = chunk;
+        threads[w].start(__pfor_dyn_thread_tramp, &boxes[w], fpConfig);
+        if (pin) { threads[w].setAffinity((u64)1 << (w % hwc)); }
+        w = w + 1;
+    }
+    w = 0;
+    while (w < workers) { threads[w].join(); w = w + 1; }
+
+    delete[_] threads;
+    delete[workers] boxes;   // boxes own a clone of `body`; destruct each to free it
+}
+
+// THREAD POOL variant. The shared atomic_counter lives in THIS frame (not one
+// per worker) - every submitted box's `next` points at it, so all workers/tasks
+// drain the same dispenser. If submit() refuses a task (queue saturated /
+// shutting down), ThreadPool.submit has already freed the box via
+// __pfor_dyn_box_free before returning nullptr (see that deleter's comment),
+// so the refusal branch below drains the shared counter directly using the
+// still-live locals (`body`, `next`, `n`, `chunk`) rather than the box - this
+// still composes correctly with whatever chunks other submitted workers pull
+// concurrently, since they all share the one counter.
+void parallel_for_n_dynamic_pool(ThreadPool* pool, i64 n, int workers, i64 chunk, Lambda<void(i64, i64)> body) {
+    if (n <= 0) { return; }
+    if (workers <= 0) { workers = pool->workerCount(); }
+    if (workers <= 0) { workers = hardware_concurrency(); }
+    if ((i64)workers > n) { workers = (int)n; }
+    if (chunk <= 0) { chunk = __pfor_dyn_auto_chunk(n, workers); }
+
+    atomic_counter next    = default;
+    __HandleSlot*  handles = new __HandleSlot[workers];
+
+    int w = 0;
+    while (w < workers) {
+        __PForDynBox* box = new __PForDynBox;
+        box->body  = body;
+        box->next  = &next;
+        box->n     = n;
+        box->chunk = chunk;
+        handles[w].h = pool->submit(__pfor_dyn_pool_tramp, box, THREADPOOL_PRIORITY_NORMAL, __pfor_dyn_box_free);
+        if (handles[w].h == nullptr) {
+            // Pool refused: `box` is already freed (see __pfor_dyn_box_free's
+            // comment above) - drain the shared counter inline via the locals.
+            while (true) {
+                i64 newv = next.add(chunk);
+                i64 lo    = newv - chunk;
+                if (lo >= n) { break; }
+                i64 hi = lo + chunk;
+                if (hi > n) { hi = n; }
+                body(lo, hi);
+            }
+        }
+        w = w + 1;
+    }
+
+    w = 0;
+    while (w < workers) {
+        TaskHandle* h = move handles[w].h;
+        if (h != nullptr) { h->wait(); delete h; }
+        w = w + 1;
+    }
+    delete[_] handles;
 }

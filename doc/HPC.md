@@ -24,6 +24,7 @@ failure points you toward.
 - [Alignment control (`alignas`)](#alignment-control-alignas)
 - [`span<T>` (noalias) and `view<T>` (may-alias)](#spant-noalias-and-viewt-may-alias)
 - [Across-core data parallelism (`parallel_for_n` / `parallel_reduce`)](#across-core-data-parallelism-parallel_for_n--parallel_reduce)
+  - [Dynamic scheduling (`parallel_for_n_dynamic` / `parallel_for_n_dynamic_pool`)](#dynamic-scheduling-parallel_for_n_dynamic--parallel_for_n_dynamic_pool)
 - [Numeric kernel libraries (`core/hpc`)](#numeric-kernel-libraries-corehpc)
 
 **Related:** [Threading & Memory Management](THREADING.md) (threads, affinity, thread pool, allocators, lock-set analysis) | [Language & Core Library Features](LANGUAGE.md)
@@ -262,6 +263,111 @@ piecewise functions) to SIMD: hoist the condition into a mask, blend with `selec
 inner loop has no data-dependent branch left to block vectorization. A worked end-to-end
 example (a bounce-back/relax step, with a scalar reference for bit-equality) is in
 [`eval/cfd/simd_bounceback_proof.cb`](../eval/cfd/simd_bounceback_proof.cb).
+
+### Horizontal reductions - `simd<T,N>.reduce_add` / `.reduce_min` / `.reduce_max`
+
+Collapse all `N` lanes of a `simd<T,N>` to a single scalar `T`:
+
+```c
+simd<double,4> v     = simd<double,4>.load(a, i);
+double         total = simd<double,4>.reduce_add(v);   // sum of the 4 lanes
+double         lo    = simd<double,4>.reduce_min(v);
+double         hi    = simd<double,4>.reduce_max(v);
+```
+
+| Method | Lowering (float) | Lowering (int) |
+|--------|-------------------|-----------------|
+| `reduce_add` | `llvm.vector.reduce.fadd` (start = +0.0, `reassoc` flag) | `llvm.vector.reduce.add` |
+| `reduce_min` | `llvm.vector.reduce.fmin` | `llvm.vector.reduce.smin` / `.umin` by signedness |
+| `reduce_max` | `llvm.vector.reduce.fmax` | `llvm.vector.reduce.smax` / `.umax` by signedness |
+
+- **`reduce_add` on float/double is reassociating** - the call carries the `reassoc` fast-math
+  flag, so the compiler is free to sum the lanes in any order (a tree, pairwise, whatever the
+  target's reduction instruction does). This matches the `vectorize` reduction contract, which
+  already reorders a scalar accumulation loop. There is no ordered variant in this pass.
+- `reduce_min`/`reduce_max` on floating point follow the same `minnum`/`maxnum` NaN family as
+  `simd<T,N>.min`/`.max` (a NaN operand does not "poison" the result if the other operand is a
+  number) - semantics stay consistent across the vector-math and reduction APIs.
+- Integer min/max pick the signed or unsigned family from `T`'s signedness (`u8..u64` -> unsigned,
+  everything else -> signed), the same convention `simd<T,N>`'s comparison operators use.
+- `bool` (`simd<bool,N>`) lanes are rejected with a clear error - reduce a mask with `select`
+  or ordinary boolean logic instead; this keeps the reduction matrix small.
+
+### Building a lane-index vector - `simd<T,N>.lanes()`
+
+`simd<T,N>.lanes()` returns the constant `{0, 1, 2, ..., N-1}` as a `simd<T,N>` (an iota). It
+exists to build a **tail mask**: compare `lanes()` against a splat of the remaining element
+count to get exactly the mask a partial last iteration needs.
+
+### Masked load/store - the tail-free loop
+
+`simd<T,N>.load_masked` / `simd<T,N>.store_masked` are `load`/`store` with a per-lane mask
+appended, so a masked chunk can stand in for the scalar epilogue that a fixed-width SIMD loop
+usually needs when the element count is not a multiple of `N`:
+
+```c
+simd<T,N> simd<T,N>.load_masked(T[] arr, long i, simd<bool,N> mask, simd<T,N> passthru);
+void      simd<T,N>.store_masked(simd<T,N> v, T[] arr, long i, simd<bool,N> mask);
+```
+
+```c
+// Tail-free loop: one masked final iteration replaces the scalar epilogue that would
+// otherwise handle `n % N != 0`. remaining <= 0 in the mask compare means "past the end".
+i64 i = 0;
+while (i + N <= n)
+{
+    simd<double,N> v = simd<double,N>.load(a, i);
+    simd<double,N>.store(v * v, a, i);
+    i = i + N;
+}
+if (i < n)
+{
+    simd<double,N> remaining = (double)(n - i);
+    simd<bool,N>   mask      = simd<double,N>.lanes() < remaining;
+    simd<double,N> passthru  = 0.0;
+    simd<double,N> v = simd<double,N>.load_masked(a, i, mask, passthru);
+    simd<double,N>.store_masked(v * v, a, i, mask);
+}
+```
+
+- `passthru` is a **required** argument, not defaulted: lanes where `mask[k]` is false take
+  `passthru[k]` instead of reading memory. An explicit zero (or sentinel) splat is one argument
+  and keeps dispatch simple - there is no optional-argument machinery.
+- `store_masked` leaves the destination memory for masked-off lanes **completely untouched**
+  (it is not a read-modify-write; those bytes are simply not written).
+- Both lower 1:1 to `llvm.masked.load` / `llvm.masked.store` at the same element alignment
+  `load`/`store` already use.
+
+### Gather/scatter - `simd<T,N>.load_gather` / `simd<T,N>.store_scatter`
+
+```c
+simd<T,N> simd<T,N>.load_gather(T[] arr, simd<int,N> idx);
+void      simd<T,N>.store_scatter(simd<T,N> v, T[] arr, simd<int,N> idx);
+```
+
+Reads (or writes) `N` elements of `arr` at `N` independent, dynamically-computed indices in one
+vector instruction - the primitive that CSR sparse matrix-vector products and particle codes
+need (`row[j]`, `col[j]` are not contiguous):
+
+```c
+simd<i32,4>    idx  = simd<i32,4>.load(colIndices, k);      // 4 sparse column indices
+simd<double,4> vals = simd<double,4>.load_gather(x, idx);   // x[idx[0..3]]
+simd<double,4>.store_scatter(vals * scale, y, idx);         // y[idx[0..3]] = vals*scale
+```
+
+- `idx` must be `simd<int,N>` or `simd<long,N>` (i32 or i64 lanes); a float or bool index vector
+  is a compile error.
+- **MVP is unmasked**: every lane is always read/written (the mask operand passed to the
+  underlying `llvm.masked.gather`/`llvm.masked.scatter` is an all-true constant). A masked
+  overload can be added later, by arity, if a kernel needs partial gather/scatter.
+- `load_gather`'s passthru is `poison` - there is no masked-off lane to preserve, since every
+  lane is always read.
+- **Scatter with duplicate indices stores in lane order - the last lane targeting a given
+  address wins.** This is `llvm.masked.scatter`'s defined behaviour; if two lanes of `idx` are
+  equal, whichever has the higher lane number determines the final value at that address.
+- Lowering: a single `CreateGEP` with a *vector* index and a scalar base pointer yields the
+  `<N x ptr>` that `llvm.masked.gather`/`llvm.masked.scatter` take directly - no manual
+  per-lane pointer arithmetic.
 
 ## `T[]` array-view (noalias)
 
@@ -537,7 +643,10 @@ Each helper comes in two backends:
 > handful of rows, where the dispatch dominates and the parallel version runs *slower* than
 > serial. Use a work-based cutoff and fall back to the serial loop below it, e.g.
 > `if (rows * cols >= 262144) parallel_for_n_pool(...) else for (...)`, rather than
-> parallelizing every iteration unconditionally.
+> parallelizing every iteration unconditionally. [`parallel_for_n_dynamic`](#dynamic-scheduling-parallel_for_n_dynamic--parallel_for_n_dynamic_pool)
+> is also worth trying here instead of a fixed cutoff: since a shrinking trailing update is
+> exactly the skewed-cost shape dynamic scheduling targets, it can let the last few columns
+> keep parallelizing productively instead of falling back to serial.
 
 `workers <= 0` selects a default (`hardware_concurrency()`, or the pool's worker count for the pool
 variants); `workers` is clamped to `n`. The worker body is a **capturing** lambda over its `[lo, hi)`
@@ -701,6 +810,78 @@ pool.shutdown();
 > The pool variants are named `*_pool` rather than overloading the raw names: two generic functions of
 > the same name monomorphize to the same mangled symbol and would collide, so both pool entry points
 > carry the suffix for a uniform API.
+
+### Dynamic scheduling (`parallel_for_n_dynamic` / `parallel_for_n_dynamic_pool`)
+
+`parallel_for_n` and `parallel_for_n_pool` use **static** scheduling: `[0, n)` is split once, up
+front, into exactly `workers` contiguous near-equal ranges. That is optimal when cost-per-index is
+uniform (axpy, stencil) - zero coordination, perfect balance by construction. It falls over when
+cost varies with the index - a triangular loop (iteration `i` costs `~n-i`), CSR rows with a skewed
+nonzero distribution, or a shrinking trailing update (see the dispatch-budget callout above) - because
+the *unluckiest* worker's range sets the wall time. With 4 workers and a triangular cost, the first
+quarter of the range holds ~44% of the total work: ~2.3x speedup instead of ~4x.
+
+`parallel_for_n_dynamic` / `parallel_for_n_dynamic_pool` fix this by cutting `[0, n)` into many small
+chunks - far more chunks than workers - and letting each worker pull the next chunk from a shared
+counter as soon as it finishes its current one:
+
+```c
+void parallel_for_n_dynamic(i64 n, int workers, i64 chunk,
+                            Lambda<void(i64, i64)> body,
+                            bool pin = false, int fpConfig = 0);
+
+void parallel_for_n_dynamic_pool(ThreadPool* pool, i64 n, int workers,
+                                 i64 chunk, Lambda<void(i64, i64)> body);
+```
+
+Same body shape as `parallel_for_n` - the lambda still receives `[lo, hi)`, so a kernel migrates by
+changing one call name and adding the `chunk` argument:
+
+```c
+parallel_for_n_dynamic(n, 0, 0, (i64 lo, i64 hi) => {   // workers=0 -> hardware_concurrency(); chunk=0 -> auto
+    for (i64 i = lo; i < hi; i = i + 1) { out[i] = triangularWork(i); }
+});
+```
+
+A worker that draws cheap chunks just draws more of them; balance is automatic for any cost skew,
+and no worker idles until the last chunk is claimed. Every index is still processed **exactly once**
+by exactly one worker, so a race-free body produces results **identical to serial** - chunking only
+changes *which thread* computes an index, never the per-index computation or its floating-point
+order. That is what makes `parallel_for_n_dynamic` a safe drop-in replacement for `parallel_for_n`.
+
+> **Static vs. dynamic - pick by cost shape, not by default.**
+>
+> | | Static (`parallel_for_n[_pool]`) | Dynamic (`parallel_for_n_dynamic[_pool]`) |
+> |---|---|---|
+> | Coordination | None after the initial split | One relaxed atomic fetch-add per chunk, on a shared, contended counter line |
+> | Partition | Deterministic, contiguous per-worker ranges (cache/first-touch friendly) | Non-deterministic - which worker computes which chunk varies run to run |
+> | Imbalance | Eats the full skew (unluckiest worker sets wall time) | Bounded by roughly one chunk's worth of work |
+> | Best for | Uniform cost-per-index (axpy, stencil, dense BLAS) | Skewed cost-per-index (triangular loops, ragged CSR rows, shrinking trailing updates) |
+>
+> Rule of thumb: uniform body -> static; skewed body -> dynamic. Reach for dynamic only when the
+> skew is real - on a uniform body the extra atomic traffic buys nothing over static's free split.
+
+`chunk <= 0` selects an automatic size: `max(1, n / (workers * PFOR_DYN_CHUNKS_PER_WORKER))`, clamped
+to `n`. `PFOR_DYN_CHUNKS_PER_WORKER` (currently 16) targets ~16 chunks per worker, which bounds
+imbalance at roughly 1/16 of one worker's share while still amortizing the atomic + dispatch cost over
+a meaningful range; it is a named global so it can be retuned in one place after measurement. Pass an
+explicit `chunk` to tune further: smaller for bodies with extreme per-index cost (tighter balance, more
+counter traffic), larger for very cheap bodies (amortize the counter line ping-pong). `workers <= 0` and
+`workers` clamped to `n` behave exactly as in the static helpers; `n <= 0` is a no-op, exactly as in the
+static helpers.
+
+The pool variant's refused-submit fallback differs from the static pool's: since every worker (and any
+refused submission) shares the *same* counter, a refused task drains the counter directly on the calling
+thread instead of running one fixed range - it just claims whatever chunks are still unclaimed, so it
+composes correctly with chunks concurrently pulled by workers that *did* get submitted.
+
+> **`parallel_reduce_dynamic<T>` does not exist (yet).** A dynamic sibling for reductions is a natural
+> follow-up (each worker would fold every chunk it pulls into one local accumulator, then contribute one
+> partial per worker, same as `parallel_reduce`'s merge step) but is deliberately out of scope for now.
+> Unlike `parallel_for_n_dynamic`, it would **not** be reproducible run-to-run even at a fixed `workers`
+> count: which chunks land in which worker's accumulator varies by scheduling, so the combine
+> reassociates differently from run to run. If your reduction needs a stable result, stay on the static
+> `parallel_reduce<T>` regardless of cost skew.
 
 ---
 

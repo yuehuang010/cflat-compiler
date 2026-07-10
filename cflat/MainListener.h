@@ -11191,9 +11191,202 @@ public:
             result.TypeAndValue = simdTv;
             result.Storage = nullptr;
         }
+        else if (method == "reduce_add" || method == "reduce_min" || method == "reduce_max")
+        {
+            // Horizontal reduction across all N lanes -> scalar T. reduce_add on float is
+            // reassociating (matches the vectorize contract's reduction semantics); reduce_min/max
+            // follow the minnum/maxnum NaN family used by the existing min/max vector ops. See doc/HPC.md.
+            if (elemTy->isIntegerTy(1))
+            {
+                LogErrorContext(ctx, std::format("simd<T,N>.{} does not support bool lanes; use select/mask ops instead.", method));
+                return result;
+            }
+            if (argNVs.size() != 1)
+            {
+                LogErrorContext(ctx, std::format("simd<T,N>.{} expects 1 argument.", method));
+                return result;
+            }
+            llvm::Value* v = requireSimdArg(ctx, argValue(0), 0, vecTy, method);
+            bool isFloat = elemTy->isFloatingPointTy();
+            bool isUnsigned = simdTv.IsUnsignedInteger() != -1;
+            llvm::Value* reduced;
+            if (method == "reduce_add")
+            {
+                if (isFloat)
+                {
+                    auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::vector_reduce_fadd, {vecTy});
+                    auto* start = llvm::ConstantFP::get(elemTy, 0.0);
+                    auto* call = compiler->builder->CreateCall(fn, {start, v}, "simdreduceadd");
+                    call->setHasAllowReassoc(true);
+                    reduced = call;
+                }
+                else
+                {
+                    auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::vector_reduce_add, {vecTy});
+                    reduced = compiler->builder->CreateCall(fn, {v}, "simdreduceadd");
+                }
+            }
+            else
+            {
+                bool isMin = (method == "reduce_min");
+                llvm::Intrinsic::ID rid = isFloat
+                    ? (isMin ? llvm::Intrinsic::vector_reduce_fmin : llvm::Intrinsic::vector_reduce_fmax)
+                    : isUnsigned
+                        ? (isMin ? llvm::Intrinsic::vector_reduce_umin : llvm::Intrinsic::vector_reduce_umax)
+                        : (isMin ? llvm::Intrinsic::vector_reduce_smin : llvm::Intrinsic::vector_reduce_smax);
+                auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), rid, {vecTy});
+                reduced = compiler->builder->CreateCall(fn, {v}, "simdreduce");
+            }
+            result.Primary = reduced;
+            result.BaseType = elemTy;
+            result.TypeAndValue = simdTv;
+            // Result is a scalar T, not a vector - drop the simd-ness (mirrors the lane-read path).
+            result.TypeAndValue.IsSimd = false;
+            result.TypeAndValue.SimdLanes = 0;
+            result.Storage = nullptr;
+        }
+        else if (method == "lanes")
+        {
+            // Constant iota {0,1,...,N-1} as a simd<T,N>. Needed to build a tail mask
+            // (compare lanes() against a splat of the remaining count) - there is no other
+            // ergonomic way to construct a lane-index vector today.
+            if (argNVs.size() != 0)
+            {
+                LogErrorContext(ctx, "simd<T,N>.lanes expects no arguments.");
+                return result;
+            }
+            unsigned n = (unsigned)vecTy->getNumElements();
+            std::vector<llvm::Constant*> elems;
+            elems.reserve(n);
+            for (unsigned i = 0; i < n; i++)
+                elems.push_back(elemTy->isFloatingPointTy()
+                    ? (llvm::Constant*)llvm::ConstantFP::get(elemTy, (double)i)
+                    : (llvm::Constant*)llvm::ConstantInt::get(elemTy, i));
+            result.Primary = llvm::ConstantVector::get(elems);
+            result.BaseType = vecTy;
+            result.TypeAndValue = simdTv;
+            result.Storage = nullptr;
+        }
+        else if (method == "load_masked")
+        {
+            // Masked load: lanes where mask[i]=0 take the passthru value instead of reading
+            // memory (the tail-free replacement for a scalar epilogue loop). passthru is a
+            // required argument, not defaulted, to keep dispatch dumb.
+            if (argNVs.size() != 4)
+            {
+                LogErrorContext(ctx, "simd<T,N>.load_masked expects (array, index, mask, passthru).");
+                return result;
+            }
+            llvm::Value* basePtr = argValue(0);
+            llvm::Value* index   = compiler->CreateCast(argValue(1), int64Ty, true);
+            llvm::Value* mask    = argValue(2);
+            auto* maskTy = llvm::dyn_cast<llvm::FixedVectorType>(mask->getType());
+            if (!maskTy || !maskTy->getElementType()->isIntegerTy(1)
+                || maskTy->getNumElements() != vecTy->getNumElements())
+            {
+                LogErrorContext(ctx, "simd<T,N>.load_masked: the mask must be a simd<bool,N> of the same lane count (produce one with a vector comparison, e.g. `simd<T,N>.lanes() < remaining`).");
+                return result;
+            }
+            llvm::Value* passthru = requireSimdArg(ctx, argValue(3), 3, vecTy, method);
+            llvm::Value* elemPtr = compiler->CreateGEP(elemTy, basePtr, index);
+            auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::masked_load,
+                {vecTy, compiler->builder->getPtrTy()});
+            result.Primary = compiler->builder->CreateCall(
+                fn, {elemPtr, compiler->builder->getInt32((uint32_t)al.value()), mask, passthru}, "simdloadmasked");
+            result.BaseType = vecTy;
+            result.TypeAndValue = simdTv;
+            result.Storage = nullptr;
+        }
+        else if (method == "store_masked")
+        {
+            // Masked store: lanes where mask[i]=0 leave the destination memory untouched.
+            if (argNVs.size() != 4)
+            {
+                LogErrorContext(ctx, "simd<T,N>.store_masked expects (vector, array, index, mask).");
+                return result;
+            }
+            llvm::Value* vecVal  = requireSimdArg(ctx, argValue(0), 0, vecTy, method);
+            llvm::Value* basePtr = argValue(1);
+            llvm::Value* index   = compiler->CreateCast(argValue(2), int64Ty, true);
+            llvm::Value* mask    = argValue(3);
+            auto* maskTy = llvm::dyn_cast<llvm::FixedVectorType>(mask->getType());
+            if (!maskTy || !maskTy->getElementType()->isIntegerTy(1)
+                || maskTy->getNumElements() != vecTy->getNumElements())
+            {
+                LogErrorContext(ctx, "simd<T,N>.store_masked: the mask must be a simd<bool,N> of the same lane count (produce one with a vector comparison, e.g. `simd<T,N>.lanes() < remaining`).");
+                return result;
+            }
+            llvm::Value* elemPtr = compiler->CreateGEP(elemTy, basePtr, index);
+            auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::masked_store,
+                {vecTy, compiler->builder->getPtrTy()});
+            compiler->builder->CreateCall(fn, {vecVal, elemPtr, compiler->builder->getInt32((uint32_t)al.value()), mask});
+            // store returns nothing
+        }
+        else if (method == "load_gather")
+        {
+            // Unmasked MVP gather: one CreateGEP with a vector index yields <N x ptr>, then
+            // llvm.masked.gather with an all-true mask constant. Passthru is poison since every
+            // lane is always read (no masked-off lane to preserve).
+            if (argNVs.size() != 2)
+            {
+                LogErrorContext(ctx, "simd<T,N>.load_gather expects (array, index_vector).");
+                return result;
+            }
+            llvm::Value* basePtr = argValue(0);
+            llvm::Value* idxVec  = argValue(1);
+            auto* idxVecTy = llvm::dyn_cast<llvm::FixedVectorType>(idxVec->getType());
+            if (!idxVecTy
+                || !(idxVecTy->getElementType()->isIntegerTy(32) || idxVecTy->getElementType()->isIntegerTy(64))
+                || idxVecTy->getNumElements() != vecTy->getNumElements())
+            {
+                LogErrorContext(ctx, "simd<T,N>.load_gather: the index vector must be a simd<int,N> or simd<long,N> of the same lane count.");
+                return result;
+            }
+            llvm::Value* ptrVec = compiler->CreateGEP(elemTy, basePtr, idxVec);
+            auto* ptrVecTy = llvm::FixedVectorType::get(compiler->builder->getPtrTy(), vecTy->getNumElements());
+            auto* maskTy = llvm::FixedVectorType::get(compiler->builder->getInt1Ty(), vecTy->getNumElements());
+            llvm::Value* allTrue = llvm::ConstantInt::get(maskTy, 1);
+            llvm::Value* passthru = llvm::PoisonValue::get(vecTy);
+            auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::masked_gather, {vecTy, ptrVecTy});
+            result.Primary = compiler->builder->CreateCall(
+                fn, {ptrVec, compiler->builder->getInt32((uint32_t)al.value()), allTrue, passthru}, "simdgather");
+            result.BaseType = vecTy;
+            result.TypeAndValue = simdTv;
+            result.Storage = nullptr;
+        }
+        else if (method == "store_scatter")
+        {
+            // Unmasked MVP scatter. Duplicate indices store in lane order (last lane wins) -
+            // LLVM's defined behaviour for llvm.masked.scatter; see doc/HPC.md.
+            if (argNVs.size() != 3)
+            {
+                LogErrorContext(ctx, "simd<T,N>.store_scatter expects (vector, array, index_vector).");
+                return result;
+            }
+            llvm::Value* vecVal  = requireSimdArg(ctx, argValue(0), 0, vecTy, method);
+            llvm::Value* basePtr = argValue(1);
+            llvm::Value* idxVec  = argValue(2);
+            auto* idxVecTy = llvm::dyn_cast<llvm::FixedVectorType>(idxVec->getType());
+            if (!idxVecTy
+                || !(idxVecTy->getElementType()->isIntegerTy(32) || idxVecTy->getElementType()->isIntegerTy(64))
+                || idxVecTy->getNumElements() != vecTy->getNumElements())
+            {
+                LogErrorContext(ctx, "simd<T,N>.store_scatter: the index vector must be a simd<int,N> or simd<long,N> of the same lane count.");
+                return result;
+            }
+            llvm::Value* ptrVec = compiler->CreateGEP(elemTy, basePtr, idxVec);
+            auto* ptrVecTy = llvm::FixedVectorType::get(compiler->builder->getPtrTy(), vecTy->getNumElements());
+            auto* maskTy = llvm::FixedVectorType::get(compiler->builder->getInt1Ty(), vecTy->getNumElements());
+            llvm::Value* allTrue = llvm::ConstantInt::get(maskTy, 1);
+            auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::masked_scatter, {vecTy, ptrVecTy});
+            compiler->builder->CreateCall(fn, {vecVal, ptrVec, compiler->builder->getInt32((uint32_t)al.value()), allTrue});
+            // store returns nothing
+        }
         else
         {
-            LogErrorContext(ctx, std::format("'{}' is not a static method on simd<T,N>; expected 'load', 'store', 'select', or a vector math op (sqrt, abs, floor, ceil, trunc, round, rint, min, max, clamp, copysign, sign, fma).", method));
+            LogErrorContext(ctx, std::format("'{}' is not a static method on simd<T,N>; expected 'load', 'store', 'select', 'lanes', "
+                "'reduce_add', 'reduce_min', 'reduce_max', 'load_masked', 'store_masked', 'load_gather', 'store_scatter', "
+                "or a vector math op (sqrt, abs, floor, ceil, trunc, round, rint, min, max, clamp, copysign, sign, fma).", method));
         }
         return result;
     }
