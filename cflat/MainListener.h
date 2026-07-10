@@ -15568,7 +15568,19 @@ public:
             }
             else
             {
+                // Thread the target field's function-pointer type into a lambda RHS, so
+                // `label={(int n) => { return s; }}` infers its return type the way the
+                // equivalent `t.label = (int n) => {...}` field assignment already does.
+                for (const auto& field : sd.StructFields)
+                {
+                    if (field.VariableName == fieldName && field.IsFunctionPointer)
+                    {
+                        lambdaExpectedType = field;
+                        break;
+                    }
+                }
                 rightNV = ParseAssignmentExpressionNamed(attr->assignmentExpression());
+                lambdaExpectedType = {};
             }
             EmitOneFieldInit(structPtr, sd, tagName, fieldName, rightNV, attr);
         }

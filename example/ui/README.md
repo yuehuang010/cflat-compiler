@@ -112,6 +112,9 @@ multiline editor - no browser engine.
 
 - `fedit.cb` - a small IDE shell: file-tree sidebar, multi-tab documents, a draggable
   splitter, a context menu, and a toolbar.
+- `fedit_jsx.cb` - the same app with `render()` authored in the `<Tag/>` sugar. Chapter
+  01 proves the sugar desugars to an identical tree; this proves it at app scale, by
+  passing the same self-test against the same key paths.
 
 ```bash
 x64/Release/cflat.exe example/ui/08-fedit/fedit.cb -i example/ui -o out/fedit.exe

@@ -552,7 +552,10 @@ return <View style={makeStyle(16, 0, 0)}>
 ```
 
 - `attr="literal"` sets a string field from a static literal; `attr={expr}` sets
-  any field from an expression (including `onPress={() => {...}}` lambdas).
+  any field from an expression (including `onPress={() => {...}}` lambdas). A lambda
+  attribute infers its return type from the target field, so a value-returning
+  callback (`label={(int n) => { return name(n); }}` against a `Lambda<string(int)>`
+  field) needs no annotation - the same inference a plain field assignment gets.
 - Children are nested elements or `{expr}` interpolations; each is `add()`-ed to
   the parent, so the tag needs an `add(Element)` method (View/Box/ScrollView have
   one; leaves like Text do not take children).
@@ -560,6 +563,10 @@ return <View style={makeStyle(16, 0, 0)}>
   `return <View/>` or assigning to an `Element` slot.
 - `counter_jsx.cb` asserts the sugar desugars to a tree identical to the
   hand-written `counter.cb` form.
+- Sugar children are STATIC. Dynamic children compose as sugar FRAGMENTS: build the
+  node and `add()` it (a conditional child), or interpolate a builder's result as a
+  `{expr}` child (a loop-built list). `example/ui/08-fedit/fedit_jsx.cb` is the whole
+  fedit editor authored this way, and passes fedit's own self-test unchanged.
 - An owned-string expression used directly as a child attribute next to a sibling
   capturing closure (e.g. `<Text text={"Count: " + n.toString()} />` beside
   `<Button onPress={() => {...}} />`) is leak-clean - the intermediate temp is

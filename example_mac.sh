@@ -111,6 +111,7 @@ selftest_case "cocoa_probe"     "$OUT/cocoa_probe"    "$IMAC/cocoa_probe.cb"    
 selftest_case "cocoa_window"    "$OUT/cocoa_window"   "$IMAC/cocoa_window.cb"          -i "$IMAC"
 selftest_case "cocoa_settings"  "$OUT/nsettings_mac"  "$IUI/04-native-controls/cocoa_native_settings.cb"  -i "$IUI" -i "$IMAC"
 selftest_case "fedit"           "$OUT/fedit_mac"      "$IUI/08-fedit/fedit.cb"            -i "$IUI" -i "$IMAC"
+selftest_case "fedit_jsx"       "$OUT/fedit_jsx_mac"  "$IUI/08-fedit/fedit_jsx.cb"        -i "$IUI" -i "$IMAC"
 selftest_case "gallery"         "$OUT/gallery_mac"    "$IUI/05-gallery/gallery.cb"        -i "$IUI" -i "$IMAC"
 
 echo "-- compile-and-run (headless, exit 0) --"

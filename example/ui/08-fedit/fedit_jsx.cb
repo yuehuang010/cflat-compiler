@@ -1,22 +1,27 @@
-// fedit.cb - a small real native text editor, the flagship demo for the CFlat native
-// UI framework (the "not Electron" pitch: a self-contained native exe with real OS
-// controls, a real menu bar + accelerators, real shell file dialogs, and a real
-// multiline editor - no browser engine).
+// fedit_jsx.cb - fedit.cb authored in the <Tag/> grammar sugar.
 //
-// fedit v2 (P9) grows the single-editor app into a small IDE shell: a file-tree
-// SIDEBAR (TreeView, expand-on-demand), MULTI-TAB documents (TabControl, each tab's
-// buffer preserved in the model), a draggable SPLITTER between the tree and the editor,
-// a right-click CONTEXT MENU on the tree, and a TOOLBAR row of buttons. The editor
-// buffer is still a single native multiline EDIT (source of truth for the ACTIVE tab);
-// switching tabs saves the outgoing buffer into the model and loads the incoming one.
+// Same app, same behaviour, same key paths: a small IDE shell with a file-tree
+// SIDEBAR, MULTI-TAB documents, a draggable SPLITTER, a tree CONTEXT MENU, and a
+// TOOLBAR. Only render() differs from fedit.cb - the nested static structure is
+// authored as sugar instead of view()/button()/column() construction calls.
+//
+// Sugar children are STATIC by design, so the two dynamic parts compose as sugar
+// FRAGMENTS added to their parent: the conditional find bar (add()-ed only when
+// findOpen) and the per-document tab strip (one <TabPane/> per open document,
+// built in a loop by buildTabs and interpolated as a {expr} child).
+//
+// counter_jsx.cb proves the sugar desugars to an identical tree by comparing JSON;
+// this file proves it at app scale behaviourally - it runs the same self-test as
+// fedit.cb, so the sugar tree must reconcile, map to the same native controls, and
+// answer the same key paths.
 //
 // Build & run:
-//   x64/Release/cflat.exe example/ui/08-fedit/fedit.cb -i example/ui -o out/fedit.exe
-//   out\fedit.exe
+//   x64/Release/cflat.exe example/ui/08-fedit/fedit_jsx.cb -i example/ui -o out/fedit_jsx.exe
+//   out\fedit_jsx.exe
 //
 // Headless state-assert self-test (example.bat gate; drives via SendMessage + direct
 // load/save, since OS file dialogs cannot run unattended):
-//   out\fedit.exe --selftest
+//   out\fedit_jsx.exe --selftest
 import "ui_native/host.cb";
 import "ui_test.cb";
 import "filesystem.cb";
@@ -81,6 +86,16 @@ string fsLabel(int nid)
 }
 
 bool fsIsFile(int nid) { return nid != TREE_ROOT && fsChildCount(nid) == 0; }
+
+// The row-of-buttons Style that the toolbar() factory bakes in. A sugar tag default-
+// constructs its type, so a factory's constructor arguments arrive as attributes.
+Style toolbarStyle()
+{
+    Style s = default;
+    s.flexDirection = DIR_ROW;
+    s.gap = 1;
+    return s;
+}
 
 string fsContent(int nid)
 {
@@ -184,8 +199,29 @@ class Editor : Component
         else ctx.invalidate();
     }
 
-    // Authored partly in the <Tag/> sugar (P6.5); tabs/tree are dynamic so they are
-    // built imperatively (sugar children are static by design).
+    // Document tabs: one TabPane per open doc (empty panes - the shared editor shows the
+    // active doc). The pane count is dynamic, so the panes are sugar fragments added in a
+    // loop; the strip itself is one <TabControl/>. selectedTab is controlled; switching
+    // saves the outgoing buffer and loads the incoming one.
+    TabControl* buildTabs(UiContext* ctx)
+    {
+        TabControl* tabs = <TabControl key="tabs" width={100} height={3}
+                                       selectedTab={this.activeTab}
+                                       onSelectTab={(int i) => { this.switchTab(i, ctx); }} />;
+        int ti = 0;
+        while (ti < this.tabPaths.count())
+        {
+            string tp = this.tabPaths.get(ti);
+            string title = tp.length() > 0 ? baseName(tp) : "untitled";
+            tabs.addPane(<TabPane key={"d" + ti.toString()} title={title} />);
+            ti++;
+        }
+        return tabs;
+    }
+
+    // The whole shell in one sugar tree. The static structure (toolbar, split, panes,
+    // tree, editor) nests directly; the two dynamic parts compose as fragments - the
+    // find bar is add()-ed only when open, and buildTabs() rides in as a {expr} child.
     Element render(UiContext* ctx)
     {
         ctx.theme = this.isDark ? darkTheme() : lightTheme();
@@ -200,19 +236,15 @@ class Editor : Component
 
         int splitH = hostHeight() - (this.findOpen ? 4 : 3); if (splitH < 4) splitH = 4;
 
-        Box* root = <Box key="root" style={makeStyle(0, hostWidth(), hostHeight())} />;
-
-        // Toolbar: a styled row of Buttons (P9 pattern - no new native control).
-        View* tb = toolbar();
-        tb.setKey("tb");
-        tb.add(button("New",  () => { this.onCommand(CMD_NEW, ctx); }));
-        tb.add(button("Open", () => { this.onCommand(CMD_OPEN, ctx); }));
-        tb.add(button("Save", () => { this.onCommand(CMD_SAVE, ctx); }));
-        // Give the toolbar buttons stable keys (children keyed positionally otherwise).
-        tb.children.get(0).setKey("new");
-        tb.children.get(1).setKey("open");
-        tb.children.get(2).setKey("save");
-        root.add(tb);
+        // Toolbar buttons carry explicit keys: sugar children are keyed positionally
+        // otherwise, exactly as with the construction form.
+        Box* root = <Box key="root" style={makeStyle(0, hostWidth(), hostHeight())}>
+                      <View key="tb" style={toolbarStyle()}>
+                        <Button key="new"  title="New"  onPress={() => { this.onCommand(CMD_NEW,  ctx); }} />
+                        <Button key="open" title="Open" onPress={() => { this.onCommand(CMD_OPEN, ctx); }} />
+                        <Button key="save" title="Save" onPress={() => { this.onCommand(CMD_SAVE, ctx); }} />
+                      </View>
+                    </Box>;
 
         // Optional find bar (Edit > Find). Controlled TextInput.
         if (this.findOpen)
@@ -224,64 +256,41 @@ class Editor : Component
         }
 
         // Split: file-tree sidebar | (tab strip + editor). The panes are plain column
-        // Views (not native-mapped); their leaf controls carry the native handles.
-        SplitView* split = splitView(this.splitRatio, true);
-        split.setKey("split");
-        split.style.width = hostWidth(); split.style.height = splitH;
-        split.onRatioChange = (int r) => { this.splitRatio = r; ctx.invalidate(); };
+        // Views (not native-mapped); their leaf controls carry the native handles. The
+        // shared editor is an uncontrolled native EDIT whose key is stable across renders
+        // and tab switches, so its buffer is reused; content flows via nativeSetControlText
+        // (tab switch / file open), never pushed by render.
+        root.add(<SplitView key="split" ratio={this.splitRatio} vertical={true}
+                            style={makeStyle(0, hostWidth(), splitH)}
+                            onRatioChange={(int r) => { this.splitRatio = r; ctx.invalidate(); }}>
+                   <View key="side" style={makeStyle(0, 0, 0)}>
+                     <TreeView key="tree" width={100} height={splitH - 1}
+                               selectedNode={this.treeSel}
+                               childCount={(int nid) => { return fsChildCount(nid); }}
+                               childId={(int nid, int i) => { return fsChildId(nid, i); }}
+                               label={(int nid) => { return fsLabel(nid); }}
+                               onSelect={(int nid) => { this.onTreeSelect(nid, ctx); }}
+                               onExpand={(int nid) => { }}
+                               tooltip="Project files - click a file to open it in a tab" />
+                   </View>
+                   <View key="main" style={makeStyle(0, 0, 0)}>
+                     {this.buildTabs(ctx)}
+                     <TextArea key="editor" value="" width={100} height={splitH - 4}
+                               onChange={() => { this.markDirty(ctx); }}
+                               tooltip="Editor - type your text here" />
+                   </View>
+                 </SplitView>);
 
-        View* side = column(makeStyle(0, 0, 0));
-        side.setKey("side");
-        TreeView* tree = <TreeView key="tree" width={100} height={splitH - 1}
-                selectedNode={this.treeSel}
-                onSelect={(int nid) => { this.onTreeSelect(nid, ctx); }}
-                onExpand={(int nid) => { }} />;
-        tree.childCount = (int nid) => { return fsChildCount(nid); };
-        tree.childId    = (int nid, int i) => { return fsChildId(nid, i); };
-        tree.label      = (int nid) => { return fsLabel(nid); };
-        tree.tooltip = "Project files - click a file to open it in a tab";
-        side.add(tree);
-        split.add(side);
-
-        View* main = column(makeStyle(0, 0, 0));
-        main.setKey("main");
-
-        // Document tabs: one TabPane per open doc (empty panes - the shared editor below
-        // shows the active doc). selectedTab is controlled; switching saves/loads buffers.
-        TabControl* tabs = tabControl(this.activeTab, (int i) => { this.switchTab(i, ctx); });
-        tabs.setKey("tabs");
-        tabs.width = 100; tabs.height = 3;
-        int ti = 0;
-        while (ti < this.tabPaths.count())
-        {
-            string tp = this.tabPaths.get(ti);
-            string title = tp.length() > 0 ? baseName(tp) : "untitled";
-            TabPane* p = tabPane(title);
-            p.setKey("d" + ti.toString());
-            tabs.addPane(p);
-            ti++;
-        }
-        main.add(tabs);
-
-        // The shared editor (uncontrolled native EDIT). Its key is stable across renders
-        // and tab switches, so the native buffer is reused; content flows via
-        // nativeSetControlText (tab switch / file open), never pushed by render.
-        TextArea* ed = <TextArea key="editor" value="" onChange={() => { this.markDirty(ctx); }}
-                                 width={100} height={splitH - 4} />;
-        ed.tooltip = "Editor - type your text here";
-        main.add(ed);
-        split.add(main);
-        root.add(split);
-
-        // Bottom status bar: file pane (name + dirty marker) + a theme pane.
+        // Bottom status bar: file pane (name + dirty marker) + a theme pane. StatusBar is a
+        // leaf whose panes are text, not children, so the parts are addPart()-ed.
         string name = this.path.length() > 0 ? baseName(this.path) : "untitled";
         string star = this.dirty ? " *" : "";
         int tabNo = this.activeTab + 1;
         int tabN  = this.tabPaths.count();
-        StatusBar* sb = statusBar("fedit   |   " + name + star
+        StatusBar* sb = <StatusBar key="status" />;
+        sb.addPart("fedit   |   " + name + star
             + "   |   tab " + tabNo.toString() + "/" + tabN.toString());
         sb.addPart(this.isDark ? "dark" : "light");
-        sb.setKey("status");
         root.add(sb);
         return root;
     }
@@ -449,6 +458,9 @@ int _postWorker(void* arg)
     return 0;
 }
 
+// The same self-test fedit.cb runs - the behavioural proof that the sugar tree above
+// reconciles, maps to the same native controls, and answers the same key paths.
+//
 // The fedit self-test, migrated onto the ui_test.cb runner. The open->edit->save->find
 // sequence shares one launch (its steps depend on each other); the Win32-only P9 nav suite
 // (tabs/tree/split/context/multi-window/post) is a second case, registered only off macOS
@@ -456,7 +468,7 @@ int _postWorker(void* arg)
 // runs every registered case. Same --selftest flag + exit-code contract as before.
 int feditSelfTest()
 {
-    UiTestSuite s = uiTestSuite("fedit");
+    UiTestSuite s = uiTestSuite("fedit_jsx");
 
     // Editor lifecycle in one launch: create -> open -> edit -> save -> menu/theme -> find ->
     // statusbar readback -> sugar authoring (the steps build on each other). setupMenu +

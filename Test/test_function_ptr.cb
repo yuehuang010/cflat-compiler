@@ -1454,6 +1454,35 @@ bool testClosureListAliasUnify()
     return result;
 }
 
+// A sugar target: any struct in scope, with Lambda fields of non-void return type.
+struct FnHolder
+{
+    Lambda<int(int)>      unary  = default;
+    Lambda<int(int, int)> binary = default;
+    Lambda<string(int)>   label  = default;
+};
+
+// A lambda passed as a <Tag/> ATTRIBUTE must infer its return type from the target
+// field, exactly as the equivalent field assignment does. Void-returning attributes
+// always worked; a value-returning one inferred void and emitted a bad `ret`.
+bool testSugarLambdaAttrReturnType()
+{
+    bool result = true;
+
+    FnHolder* h = <FnHolder unary={(int x) => { return x * 3; }}
+                            binary={(int a, int b) => { return a + b; }}
+                            label={(int n) => { return "n=" + n.toString(); }} />;
+
+    result &= Test("sugar attr int(int)",      h.unary(5),     15);
+    result &= Test("sugar attr int(int,int)",  h.binary(2, 3), 5);
+
+    string s = h.label(7);
+    result &= Test("sugar attr string(int)", s, "n=7");
+
+    delete h;
+    return result;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1539,6 +1568,9 @@ extern int main()
     total++; passed += testClosureListFat()             ? 1 : 0;
     total++; passed += testClosureListThin()            ? 1 : 0;
     total++; passed += testClosureListAliasUnify()      ? 1 : 0;
+
+    // <Tag/> sugar: lambda attribute return-type inference
+    total++; passed += testSugarLambdaAttrReturnType()  ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

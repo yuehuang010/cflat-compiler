@@ -135,27 +135,29 @@ REM ===========================================================================
 REM Worker mode: fedit editor state-assert self-test (the P4 flagship).
 REM ===========================================================================
 if "%~1"=="--worker-fedit" (
-    set "RESID=%~2"
+    set "FED_SRC=%~2"
+    set "RESID=%~3"
     set "CFLAT=x64\%CONFIG%\cflat.exe"
     set "OUTDIR=out\examples"
     set "RESDIR=out\examples\results"
-    set "FED_STEXE=!OUTDIR!\fedit_st.exe"
+    set "FED_NAME=%~n2"
+    set "FED_STEXE=!OUTDIR!\!FED_NAME!_st.exe"
     set "FED_STLOG=!RESDIR!\!RESID!.log"
 
-    "!CFLAT!" "example\ui\08-fedit\fedit.cb" -i example/ui --heap-audit -o "!FED_STEXE!" > "!FED_STLOG!" 2>&1
+    "!CFLAT!" "!FED_SRC!" -i example/ui --heap-audit -o "!FED_STEXE!" > "!FED_STLOG!" 2>&1
     if not exist "!FED_STEXE!" (
-        echo FAIL fedit.cb ^(fedit self-test build failed^)>"!RESDIR!\!RESID!.result"
+        echo FAIL !FED_NAME!.cb ^(fedit self-test build failed^)>"!RESDIR!\!RESID!.result"
         exit /b
     )
     "!FED_STEXE!" --selftest <nul >> "!FED_STLOG!" 2>&1
     set FEDRC=!errorlevel!
     findstr /C:"heap-audit: LEAK" "!FED_STLOG!" >nul 2>&1
     if !errorlevel! equ 0 (
-        echo FAIL fedit.cb ^(heap-audit leak^)>"!RESDIR!\!RESID!.result"
+        echo FAIL !FED_NAME!.cb ^(heap-audit leak^)>"!RESDIR!\!RESID!.result"
     ) else if !FEDRC! neq 0 (
-        echo FAIL fedit.cb ^(fedit self-test, exit !FEDRC!^)>"!RESDIR!\!RESID!.result"
+        echo FAIL !FED_NAME!.cb ^(fedit self-test, exit !FEDRC!^)>"!RESDIR!\!RESID!.result"
     ) else (
-        echo PASS fedit.cb ^(editor self-test + leak-clean^)>"!RESDIR!\!RESID!.result"
+        echo PASS !FED_NAME!.cb ^(editor self-test + leak-clean^)>"!RESDIR!\!RESID!.result"
     )
     exit /b
 )
@@ -309,7 +311,9 @@ REM excluded like gallery. cocoa_native_settings is the Darwin backend probe, ex
 REM todo_app is the host-neutral shared app module (no main; imported by todo_test.cb) and
 REM todo_test is the ui_test.cb template target - both driven by the dedicated --worker-uitest
 REM below (build with --heap-audit + run headless), so they are excluded from the plain sweep.
-set EXCLUDE=test_helper fedit gallery gallery_app todo_app todo_test http_parser http_response http_json http_server http_client router rest_server http_io cocoa_probe cocoa_native_settings hello_objc cocoa_window sysinfo_mac framework_link winui_app_demo winui_demo winui_gallery
+REM fedit_jsx is fedit.cb authored in the <Tag/> sugar; both run the same state-assert
+REM self-test via --worker-fedit, so both are excluded from the plain sweep.
+set EXCLUDE=test_helper fedit fedit_jsx gallery gallery_app todo_app todo_test http_parser http_response http_json http_server http_client router rest_server http_io cocoa_probe cocoa_native_settings hello_objc cocoa_window sysinfo_mac framework_link winui_app_demo winui_demo winui_gallery
 
 REM Discover the newest cached Win32-metadata package dir (the one holding Windows.Win32.winmd).
 REM dir /o-n lists newest-version-first by name. Empty if the nuget package is not installed
@@ -381,10 +385,13 @@ set /a RESID+=1
 set /a LAUNCHED+=1
 start "" /b cmd /c "%SCRIPT% --worker-native ex_!RESID!"
 
-REM Launch the fedit editor state-assert self-test (P4 flagship).
-set /a RESID+=1
-set /a LAUNCHED+=1
-start "" /b cmd /c "%SCRIPT% --worker-fedit ex_!RESID!"
+REM Launch the fedit editor state-assert self-test (P4 flagship), for both the
+REM construction-form source and its <Tag/>-sugar twin (same self-test, same contract).
+for %%F in (example\ui\08-fedit\fedit.cb example\ui\08-fedit\fedit_jsx.cb) do (
+    set /a RESID+=1
+    set /a LAUNCHED+=1
+    start "" /b cmd /c "%SCRIPT% --worker-fedit %%F ex_!RESID!"
+)
 
 REM Launch the widget-gallery state-assert self-test (P8 data controls).
 set /a RESID+=1
