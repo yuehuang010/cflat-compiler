@@ -1,5 +1,6 @@
 import "test_helper.cb";
 import "time.cb";
+import "intrinsic.cb";
 
 // ── Duration: factory tick values ─────────────────────────────────────────────
 
@@ -129,6 +130,40 @@ int testSleep()
     return passed;
 }
 
+// ── cycle_count (portable cycle counter) ──────────────────────────────────────
+
+int testCycleCount()
+{
+    int passed = 0;
+
+    u64 c0 = cycle_count();
+    passed += Test("cycle_count nonzero", c0 != 0, true);
+
+    // Busy-work between two reads: the counter must advance.
+    u64 first = cycle_count();
+    u64 acc = 0;
+    for (int i = 0; i < 2000000; i++)
+        acc += (u64)(i & 7);
+    u64 second = cycle_count();
+    passed += Test("cycle_count monotonic across spin", second > first, true);
+    // Reference acc so the spin loop is not optimized away.
+    passed += Test("spin loop ran", acc > 0, true);
+
+    // Bracket a ~10ms sleep; the delta must clear a very loose lower bound.
+    u64 before = cycle_count();
+    sleep(10);
+    u64 after = cycle_count();
+    u64 delta = after - before;
+    passed += Test("cycle_count advances over 10ms sleep", delta > 1000000, true);
+    printf("cycle delta over 10ms sleep: %llu\n", delta);
+
+    // Serializing wrapper returns a plausible (nonzero) value.
+    u64 s = cycle_count_serialized();
+    passed += Test("cycle_count_serialized nonzero", s != 0, true);
+
+    return passed;
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 extern int main()
@@ -143,6 +178,7 @@ extern int main()
     passed += testStopwatch();            total += 7;
     passed += testTimer();                total += 7;
     passed += testSleep();                total += 1;
+    passed += testCycleCount();           total += 5;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

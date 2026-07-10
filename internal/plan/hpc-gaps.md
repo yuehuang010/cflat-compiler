@@ -1,7 +1,9 @@
 # HPC Gaps Plan
 
 Status: G1-G3 AND G5 DONE, G2 incl Phase 2 reduce_dynamic (2026-07-09,
-integrated on master, all Windows gates green); G4/G6/G7 remain PROPOSED.
+integrated on master, all Windows gates green); G7's rdtsc-timing and
+BLAS-example sub-items also DONE (2026-07-09). G4 (planned) / G6 and the
+rest of G7 remain PROPOSED.
 WSL test.sh re-verification for the core library changes deliberately
 skipped (user decision at integration).
 Created: 2026-07-09
@@ -129,6 +131,15 @@ kernels that currently carry scalar tails.
 
 ## G4. Scoped FP-math control (FMA contraction + reassociation)
 
+Detailed plan: internal/plan/hpc-g4-vectorize-contract.md (2026-07-09).
+RE-SCOPED by user decision: no new `fastmath` keyword - extend the
+existing vectorize soft keyword to `vectorize(contract)` and
+`vectorize(reassoc)` (two tiers, reassoc implies contract; lock-clause
+grammar precedent; builder-default FMF save/set/restore around the loop
+body brackets). Serial-FMA escape hatch already exists (scalar fma() in
+core/math.cb + simd fma). fast/nsz/arcp/afn/nnan/ninf levels and a
+--fp-contract CLI flag stay deferred.
+
 Today: `vectorize` on a reduction is opt-in reassociation for that loop
 (tasteful partial answer). But there is no spelling anywhere for FMA
 *contraction* (a*b+c -> one vfmadd when the target has FMA; distinct
@@ -215,13 +226,40 @@ Write its own plan before starting; do not fold into a gap-fix pass.
 - Huge pages: MEM_LARGE_PAGES / madvise(MADV_HUGEPAGE) option in the
   vmem layer for multi-GB kernel buffers (TLB relief). Windows large
   pages need SeLockMemoryPrivilege - degrade gracefully.
-- Worked external BLAS binding example: import package "cblas.h" (or
-  MKL) via the existing header-import machinery, benchmarked against
-  Mat.gemm in performance/hpc/README.md. Pure example/doc work; big
-  credibility win ("call MKL when you want peak").
-- rdtsc-class timing: check what time.cb already exposes; add a
-  serializing cycle counter intrinsic if missing (intrinsic.cb already
-  has prefetch/pause, so there is a home for it).
+- BLAS binding example DONE 2026-07-09 (agent), RE-SOURCED 2026-07-09
+  (agent) to the example-local vcpkg manifest: example/vcpkg/blas_gemm.cb
+  binds OpenBLAS via
+  `import package-vcpkg "openblas/cblas.h" from "openblas";` (openblas
+  added to example/vcpkg/vcpkg.json dependencies as
+  `{ "name": "openblas", "features": ["threads"] }`; root vcpkg.json
+  untouched - same pattern as the sqlite3/sdl3/zlib demos, no external SDK
+  or CLI paths needed); calls cblas_dgemm (CblasRowMajor/CblasNoTrans
+  straight from the header, no hand-proto) and benchmarks it against
+  Mat.gemm at 256/512/1024 with a naive-triple-loop correctness check.
+  example.bat picks it up automatically via the example/vcpkg/ sweep (the
+  earlier %BLAS_SDK% discovery/gate block AND a second per-file
+  `--c-lib libopenblas.lib` special-case in the --worker-example block
+  were both removed). The vcpkg `openblas` port gates multithreading
+  behind an opt-in `threads` feature (USE_THREAD, off by default) - without
+  it, openblas_get_num_procs/num_threads report 1/1 regardless of host
+  core count and cblas_dgemm runs single-threaded (~7 GFLOP/s @1024 on the
+  dev box, slower than Mat.gemm). With `threads` on (current manifest),
+  num_procs/num_threads correctly report 20/20, but throughput (~28-38
+  GFLOP/s across 256/512/1024) still lands well under the old prebuilt
+  release's ~126-307 GFLOP/s and under Mat.gemm (pool, 8w)'s ~51-74
+  GFLOP/s - most likely because vcpkg's default port build lacks
+  DYNAMIC_ARCH (the prebuilt release's runtime-dispatched, per-microarch
+  assembly kernels). Both the single-thread-default and threads-feature
+  numbers are recorded honestly in performance/hpc/README.md "External
+  BLAS" section alongside the original prebuilt-release table. Zero
+  compiler changes.
+- rdtsc-class timing: DONE (2026-07-09). time.cb already had the x86-only
+  serializing rdtscp()/lfence(); the gap was a PORTABLE counter (rdtscp()
+  returns 0 on non-x86, e.g. macOS arm64). Added the target-independent
+  __readcyclecounter builtin (llvm.readcyclecounter; CreateReadCycleCounter
+  in LLVMBackend.h, dispatch in MainListener.h) wrapped by cycle_count() and
+  cycle_count_serialized() (LFENCE-bracketed on x86) in intrinsic.cb. Tests
+  in Test/test_time.cb; doc in doc/LANGUAGE.md stdlib table.
 - list<int[]> restriction (T[] as generic type argument does not parse):
   documented limitation; mildly hurts multi-buffer containers. Revisit
   cost/benefit - may stay a documented restriction.

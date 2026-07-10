@@ -3,6 +3,7 @@
   "version-string": "0.0.1",
   "dependencies": [
     "curl",
+    { "name": "openblas", "features": ["threads"] },
     "sdl3",
     "sqlite3",
     "zlib"

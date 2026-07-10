@@ -1,0 +1,191 @@
+// blas_gemm.cb - worked example of binding a vendor BLAS (OpenBLAS) through
+// CFlat's vcpkg-package import machinery, and benchmarking its cblas_dgemm
+// against the dependency-free core kernel Mat.gemm (cflat/core/hpc/densemat.cb).
+//
+// The whole point: `import package-vcpkg "openblas/cblas.h" from "openblas";`
+// binds OpenBLAS's real C header - cblas_dgemm, the CBLAS_ORDER / CBLAS_TRANSPOSE
+// enums and their constants (CblasRowMajor, CblasNoTrans, ...) all come straight
+// from the header, no hand-written prototypes. OpenBLAS is resolved through vcpkg
+// via the sibling example/vcpkg/vcpkg.json - cflat runs `vcpkg install` itself and
+// auto-resolves the include dir, link lib, and runtime DLL. No manual paths, no
+// external SDK:
+//
+//   x64\Release\cflat.exe example\vcpkg\blas_gemm.cb -o out\blas_gemm.exe -O2 ^
+//       --cpu x86-64-v3 -i cflat\core
+//
+// See performance/hpc/README.md for the benchmark table.
+//
+// Run:  out\blas_gemm.exe [N]        (square N x N x N GEMM; default 512)
+// It fills two deterministic N x N double matrices, computes C = A*B with BOTH
+// cblas_dgemm (row-major, no-transpose) and Mat.gemm, checks a handful of output
+// elements against a naive triple-loop reference (and cross-checks the two GEMMs
+// against each other), then reports ms and GFLOP/s for each. Exit 0 on PASS.
+
+import package-vcpkg "openblas/cblas.h" from "openblas";   // OpenBLAS: cblas_dgemm + CBLAS_* enums
+
+import "hpc/densemat.cb";   // Mat.gemm - the dependency-free core kernel we compare against
+import "threadpool.cb";     // ThreadPool + cpu_mask_lowest + hardware_concurrency (pool-parallel Mat.gemm)
+import "time.cb";           // Stopwatch
+import "cruntime.cb";       // atoi
+
+// Deterministic fill in [-1, 1) via a small linear congruential generator, so
+// both GEMMs and the naive reference read byte-identical inputs across runs.
+void fillDeterministic(double[] m, int count, u64 seedVal)
+{
+    u64 s = seedVal;
+    for (int i = 0; i < count; i = i + 1)
+    {
+        s = s * 6364136223846793005 + 1442695040888963407;
+        // top 32 bits -> [0,1) -> [-1,1); avoids the low-bit LCG correlation.
+        u32 hi = (u32)(s >> 32);
+        double u = (double)hi / 4294967296.0;
+        m[i] = u * 2.0 - 1.0;
+    }
+}
+
+// Reference value of C[i,j] for C = A*B, A is (m x k), B is (k x n), row-major.
+double naiveElem(double[] a, double[] b, int k, int n, int i, int j)
+{
+    double s = 0.0;
+    int arow = i * k;
+    for (int p = 0; p < k; p = p + 1)
+        s = s + a[arow + p] * b[p * n + j];
+    return s;
+}
+
+// True if got is within a small relative tolerance of ref.
+bool close(double got, double ref)
+{
+    double d = got - ref;
+    if (d < 0.0) d = -d;
+    double scale = ref < 0.0 ? -ref : ref;
+    if (scale < 1.0) scale = 1.0;
+    return d <= 1.0e-9 * scale;
+}
+
+// Check a fixed spread of C elements against the naive reference. Returns element
+// count checked; sets *okOut false on any mismatch (and prints the first miss).
+int checkAgainstNaive(string label, double[] a, double[] b, double[] c,
+                      int m, int k, int n, bool* okOut)
+{
+    // A spread of (row,col) probes clamped into range for any N.
+    int[10] ri = {0, 1, 7, 0, m / 2, m / 3, m - 1, m - 1, 2, m / 2};
+    int[10] cj = {0, 3, 11, n - 1, n / 2, n / 4, n - 1, 0, n - 2, 1};
+    int checked = 0;
+    for (int t = 0; t < 10; t = t + 1)
+    {
+        int i = ri[t];
+        int j = cj[t];
+        if (i < 0 || i >= m || j < 0 || j >= n) continue;
+        double got = c[i * n + j];
+        double ref = naiveElem(a, b, k, n, i, j);
+        checked = checked + 1;
+        if (!close(got, ref))
+        {
+            printf("  FAIL %s: C[%d,%d] = %.12g, naive = %.12g\n", label, i, j, got, ref);
+            *okOut = false;
+        }
+    }
+    return checked;
+}
+
+extern int main(int argc, char** argv)
+{
+    int n = 512;
+    if (argc > 1) { int v = atoi(argv[1]); if (v >= 2) n = v; }
+    int m = n;
+    int k = n;
+
+    printf("External BLAS binding demo: OpenBLAS cblas_dgemm vs core Mat.gemm\n");
+    printf("-----------------------------------------------------------------\n");
+    printf("Square GEMM  C = A*B   (%d x %d x %d, row-major double)\n", m, k, n);
+    printf("OpenBLAS: %d procs, %d threads\n\n",
+           openblas_get_num_procs(), openblas_get_num_threads());
+
+    double flops = 2.0 * (double)m * (double)k * (double)n;
+    int NRUNS = 3;
+
+    double[] a  = new double[m * k];
+    double[] b  = new double[k * n];
+    double[] c0 = new double[m * n];   // cblas_dgemm output
+    double[] c1 = new double[m * n];   // Mat.gemm serial output
+    double[] c2 = new double[m * n];   // Mat.gemm pool output
+
+    fillDeterministic(a, m * k, 0x1234567);
+    fillDeterministic(b, k * n, 0x89ABCDEF);
+
+    bool ok = true;
+    Stopwatch sw;
+
+    // --- OpenBLAS cblas_dgemm -------------------------------------------------
+    // Row-major, no transpose, alpha=1, beta=0: C = A*B. lda=k, ldb=n, ldc=n.
+    // One warmup call (also the correctness sample), then best-of-NRUNS timing.
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k,
+                1.0, &a[0], k, &b[0], n, 0.0, &c0[0], n);
+    int nchk = checkAgainstNaive("cblas", a, b, c0, m, k, n, &ok);
+
+    double blasBest = 1.0e30;
+    for (int r = 0; r < NRUNS; r = r + 1)
+    {
+        sw.reset(); sw.start();
+        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k,
+                    1.0, &a[0], k, &b[0], n, 0.0, &c0[0], n);
+        sw.stop();
+        double s = sw.elapsed().seconds();
+        if (s < blasBest) blasBest = s;
+    }
+
+    // --- Core Mat.gemm, serial ------------------------------------------------
+    Mat.gemm(1.0, a, b, 0.0, c1, m, k, n);
+    checkAgainstNaive("Mat.gemm serial", a, b, c1, m, k, n, &ok);
+
+    double matBest = 1.0e30;
+    for (int r = 0; r < NRUNS; r = r + 1)
+    {
+        sw.reset(); sw.start();
+        Mat.gemm(1.0, a, b, 0.0, c1, m, k, n);
+        sw.stop();
+        double s = sw.elapsed().seconds();
+        if (s < matBest) matBest = s;
+    }
+
+    // --- Core Mat.gemm, pool-parallel -----------------------------------------
+    ThreadPool pool;
+    int workers = hardware_concurrency();
+    if (workers > 8) workers = 8;   // gemm tile fan-out scales to ~8 here
+    if (workers < 1) workers = 1;
+    pool.init(workers, cpu_mask_lowest(workers));
+
+    Mat.gemm(1.0, a, b, 0.0, c2, m, k, n, &pool, workers);
+    checkAgainstNaive("Mat.gemm pool", a, b, c2, m, k, n, &ok);
+
+    double poolBest = 1.0e30;
+    for (int r = 0; r < NRUNS; r = r + 1)
+    {
+        sw.reset(); sw.start();
+        Mat.gemm(1.0, a, b, 0.0, c2, m, k, n, &pool, workers);
+        sw.stop();
+        double s = sw.elapsed().seconds();
+        if (s < poolBest) poolBest = s;
+    }
+    pool.shutdown();
+
+    printf("Correctness: checked %d probe elements per GEMM against a naive triple loop\n", nchk);
+    printf("\n%-26s %10s %12s\n", "kernel", "ms", "GFLOP/s");
+    printf("%-26s %10.3f %12.2f\n", "OpenBLAS cblas_dgemm",
+           blasBest * 1000.0, flops / blasBest / 1.0e9);
+    printf("%-26s %10.3f %12.2f\n", "Mat.gemm (serial)",
+           matBest * 1000.0, flops / matBest / 1.0e9);
+    printf("%-26s %10.3f %12.2f\n", "Mat.gemm (pool)",
+           poolBest * 1000.0, flops / poolBest / 1.0e9);
+
+    delete[_] a;  delete[_] b;  delete[_] c0;  delete[_] c1;  delete[_] c2;
+
+    if (ok)
+    {
+        printf("\nRESULT: PASS\n");
+        return 0;
+    }
+    printf("\nRESULT: FAIL\n");
+    return 1;
+}

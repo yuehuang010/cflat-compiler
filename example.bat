@@ -292,7 +292,7 @@ del /q "%RESDIR%\*.log" 2>nul
 REM Space-separated list of base filenames (without .cb) to skip. Library/helper
 REM files (no int main()) that are only meant to be imported by sibling examples.
 REM The example/vcpkg/ examples are run too - cflat auto-invokes vcpkg install to
-REM pull their external packages (libcurl, SDL3, sqlite, zlib).
+REM pull their external packages (libcurl, OpenBLAS, SDL3, sqlite, zlib).
 REM direct2d_demo imports the Win32 metadata winmd, which ships in the
 REM Microsoft.Windows.SDK.Win32Metadata nuget package (not the system), so it needs an
 REM explicit -i to that package. We discover it below and compile the demo when present;

@@ -3039,6 +3039,15 @@ private:
         return builder->CreateExtractValue(call, { 0u }, "rdtscp");
     }
 
+    llvm::Value* CreateReadCycleCounter()
+    {
+        // llvm.readcyclecounter is target-independent: it returns an i64 cycle
+        // count and takes no arguments. Lowers to RDTSC on x86, the cycle-count
+        // register elsewhere (e.g. mftb/CNTVCT), or 0 where unsupported.
+        auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::readcyclecounter);
+        return builder->CreateCall(fn, {}, "cyclecount");
+    }
+
     void CreateLfence()
     {
         // llvm.x86.sse2.lfence returns void and takes no arguments.

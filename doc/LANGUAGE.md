@@ -2263,7 +2263,16 @@ table is a file index of what each library is for.
 | `math.cb` | `Math` namespace: `abs`/`min`/`max`/`pow`/`sqrt`/`clamp`/`fma`, trig, rounding; constants `Math.PI`/`TAU`/`E`/`SQRT2`/`LN2`/`LN10` |
 | `linear_math.cb` | Small fixed-size geometry value types with operator overloading: `vec2`/`vec3`/`vec4` (+ `f` float variants), `mat4`/`mat4f` (row-major, D3D left-handed), `quat`/`quatf`. dot/cross/normalize/lerp/reflect, project/lookAt/inverse, quaternion slerp. GLM-style; for *small* vectors - contrast `hpc/vecmath.cb` |
 | `random.cb` | `Random` - splitmix64 PRNG with independent substreams (`jump`/`split`) |
-| `intrinsic.cb` | Compiler intrinsics: `popcount`, `ctz`, `clz`, `prefetch`, `likely`/`unlikely`, `pause()` |
+| `intrinsic.cb` | Compiler intrinsics: `popcount`, `ctz`, `clz`, `prefetch`, `likely`/`unlikely`, `pause()`, `cycle_count`/`cycle_count_serialized` |
+
+`cycle_count()` returns the raw CPU cycle counter as a `u64` (lowers to `llvm.readcyclecounter`:
+RDTSC on x86, the cycle-count register on other targets). It is a *cycle* count, not a
+wall-clock value - use it only for deltas. It is NON-serializing: out-of-order execution may
+reorder instructions across the read, so `cycle_count_serialized()` (an LFENCE-bracketed read on
+x86) is the choice for tight per-region measurement. Portable and unguarded, unlike time.cb's
+x86-only `rdtscp()`/`lfence()`. Prefer it over the QPC-based `Stopwatch`/`Duration` in `time.cb`
+when you need sub-100ns resolution and are comparing two counter reads; prefer `time.cb` when you
+need a real wall-clock or millisecond duration.
 
 **Memory & allocators**
 

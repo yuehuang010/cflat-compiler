@@ -89,6 +89,115 @@ real:
 streaming kernel out of cache). `gemm` is compute-bound and roughly doubles per ISA level,
 confirming the inner loop is genuinely SIMD.
 
+## External BLAS: OpenBLAS `cblas_dgemm` vs `Mat.gemm`
+
+`Mat.gemm` (above) is a self-contained, dependency-free kernel. The other end of the spectrum
+is a hand-tuned vendor BLAS. [`example/vcpkg/blas_gemm.cb`](../../example/vcpkg/blas_gemm.cb) binds
+**OpenBLAS** straight from its C header with CFlat's `import package-vcpkg` machinery and
+benchmarks `cblas_dgemm` against `Mat.gemm` at three sizes - a worked example of "call the vendor
+library when you want peak, keep the core kernel when you want a self-contained build."
+
+### Getting OpenBLAS (via the example-local vcpkg manifest)
+
+The demo sources OpenBLAS through vcpkg, the same way `example/vcpkg/sqlite_demo.cb`,
+`sdl3_demo.cb`, and `zlib_demo.cb` source their packages: `openblas` is a dependency in
+[`example/vcpkg/vcpkg.json`](../../example/vcpkg/vcpkg.json) (the repo's root `vcpkg.json` stays
+untouched). No download, no `%BLAS_SDK%` env var, no CLI paths - `cflat.exe` invokes
+`vcpkg install` itself against that manifest on first compile and resolves the include dir, link
+lib, and runtime DLL automatically. `example.bat` builds `blas_gemm.cb` unconditionally as part of
+the `example/vcpkg/` sweep (there is no SDK-discovery gate to skip).
+
+The first compile triggers a **source build** of OpenBLAS (vcpkg has no prebuilt binary cache for
+it here) - expect it to take 10-30 minutes once; subsequent compiles reuse the installed package.
+A manifest change to the `openblas` dependency (e.g. adding/removing a feature) triggers a full
+rebuild of the port on the next compile - also 10-30 minutes.
+
+- Version installed via vcpkg: **OpenBLAS 0.3.33** (same upstream version as the previous external
+  SDK).
+- The manifest pins `{ "name": "openblas", "features": ["threads"] }` - vcpkg's `openblas` port
+  gates multithreading behind an opt-in `threads` feature (`USE_THREAD`, off by default); without
+  it the built library is single-threaded regardless of host core count. **The `threads` feature is
+  required to get anywhere near peak** - see Results below for the measured gap.
+
+### The working bind
+
+The source names *what* to bind; vcpkg resolves everything else from the manifest:
+
+```c
+import package-vcpkg "openblas/cblas.h" from "openblas";   // cblas_dgemm + CBLAS_ORDER/CBLAS_TRANSPOSE enums
+...
+cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k,
+            1.0, &a[0], k, &b[0], n, 0.0, &c[0], n);
+```
+
+```bat
+x64\Release\cflat.exe example\vcpkg\blas_gemm.cb -o out\hpc\blas_gemm.exe -O2 --cpu x86-64-v3
+out\hpc\blas_gemm.exe            REM square 512 (default); pass an N for another size
+```
+
+`cblas_dgemm`, `CblasRowMajor`, and `CblasNoTrans` all come straight from `cblas.h` (installed at
+`example/vcpkg/vcpkg_installed/x64-windows/include/openblas/cblas.h`) - no hand-written prototype,
+no manual enum values. The `core/hpc` import (`hpc/densemat.cb`) resolves against the deployed
+`core/` tree next to `cflat.exe`, so no `-i` is needed. **Runtime DLL:** after the link the
+compiler auto-copies `openblas.dll` next to the exe, so it launches with nothing extra on `PATH`.
+
+### Results (Ryzen AI 9 365, Release, `--cpu x86-64-v3`, best of 3 per process)
+
+The table below was originally measured against the **prebuilt OpenBLAS 0.3.33 Windows release**
+(`OpenBLAS-0.3.33-x64.zip`), which ships built with multithreading enabled (20 logical cores on
+this host); `Mat.gemm (pool)` is the core kernel fanned out over 8 pinned workers; `Mat.gemm
+(serial)` is single-threaded. Each size was run in a fresh process.
+
+| N (N x N x N) | OpenBLAS `cblas_dgemm` | `Mat.gemm` (serial) | `Mat.gemm` (pool, 8w) |
+|---------------|-----------------------:|--------------------:|----------------------:|
+| 256  | 0.266 ms / **126.3** GFLOP/s | 1.098 ms / 30.6 GFLOP/s | 0.565 ms / 59.4 GFLOP/s |
+| 512  | 1.094 ms / **245.3** GFLOP/s | 9.642 ms / 27.8 GFLOP/s | 2.631 ms / 102.0 GFLOP/s |
+| 1024 | 6.992 ms / **307.2** GFLOP/s | 67.49 ms / 31.8 GFLOP/s | 21.65 ms / 99.2 GFLOP/s |
+
+The demo now sources OpenBLAS from vcpkg (`example/vcpkg/vcpkg.json`) instead of that prebuilt
+package. The port's threading is opt-in (`threads` feature -> `USE_THREAD`), so it was re-measured
+twice, honestly, against the vcpkg build:
+
+**vcpkg build, `openblas` with no features (single-threaded default):**
+
+| N (N x N x N) | OpenBLAS `cblas_dgemm` (vcpkg, no `threads`) | `Mat.gemm` (serial) | `Mat.gemm` (pool, 8w) |
+|---------------|-----------------------------------------------:|--------------------:|----------------------:|
+| 1024 | 305.9 ms / **7.0** GFLOP/s | 83.0 ms / 25.9 GFLOP/s | 29.0 ms / 74.1 GFLOP/s |
+
+`openblas_get_num_procs()` / `openblas_get_num_threads()` report **1 proc, 1 thread** here,
+regardless of the host's 20 logical cores - the library is single-threaded because `USE_THREAD`
+was off. At N=1024 that is ~44x slower than the prebuilt multithreaded release, and even slower
+than single-threaded `Mat.gemm` - the opposite of the "vendor BLAS wins on peak throughput"
+takeaway the demo makes with the prebuilt package.
+
+**vcpkg build, `{ "name": "openblas", "features": ["threads"] }` (current manifest):**
+
+| N (N x N x N) | OpenBLAS `cblas_dgemm` (vcpkg, `threads`) | `Mat.gemm` (serial) | `Mat.gemm` (pool, 8w) |
+|---------------|---------------------------------------------:|--------------------:|----------------------:|
+| 256  | 0.893 ms / **37.6** GFLOP/s | 1.341 ms / 25.0 GFLOP/s | 0.655 ms / 51.2 GFLOP/s |
+| 512  | 9.770 ms / **27.5** GFLOP/s | 12.765 ms / 21.0 GFLOP/s | 3.617 ms / 74.2 GFLOP/s |
+| 1024 | 63.945 ms / **33.6** GFLOP/s | 83.412 ms / 25.8 GFLOP/s | 30.547 ms / 70.3 GFLOP/s |
+
+With `threads` enabled, `openblas_get_num_procs()` / `openblas_get_num_threads()` correctly report
+**20 procs, 20 threads** - the port now sees and uses the real core count. Throughput is much
+better than the single-threaded default (up to ~5x at 1024) but still well short of the prebuilt
+release's ~307 GFLOP/s, and `Mat.gemm` (pool, 8w) now *beats* `cblas_dgemm` at every size measured.
+The most likely reason: the prebuilt Windows release ships `DYNAMIC_ARCH` (multiple hand-tuned
+assembly micro-kernels, picked at runtime by CPUID - Zen-family kernels included), while vcpkg's
+default `openblas` port build does not enable that feature, so it falls back to a much more
+generic kernel even though it now has 20 threads to spread it across. This is reported as observed,
+not worked around - swapping to `DYNAMIC_ARCH` (if vcpkg's port exposes it as a feature) would be a
+further follow-up.
+
+**Takeaway.** With the prebuilt, multithreaded, `DYNAMIC_ARCH`-tuned release, OpenBLAS reaches
+~307 GFLOP/s at 1024; `Mat.gemm` reaches ~99 GFLOP/s pooled (~32% of OpenBLAS) and ~32 GFLOP/s
+single-threaded (~10%), with zero external dependencies. With the vcpkg-managed build this example
+now uses, the `threads` feature is required just to get OpenBLAS off single-core (7 -> 34
+GFLOP/s at 1024), and even then `Mat.gemm` (pool) wins by ~2x - a reminder that "vendor BLAS beats
+a self-written kernel" is a claim about a *specific, tuned build* of that vendor library, not the
+library in the abstract. Either way, the header-import path makes swapping one BLAS binding (or
+build configuration) for another a two-line change.
+
 ## Latency-bound: the B+ tree (`bptree.cb`)
 
 The numeric kernels above are throughput-bound - the question is "does the inner loop

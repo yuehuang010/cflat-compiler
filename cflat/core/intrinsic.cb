@@ -66,3 +66,32 @@ void pause()
     if const (__X86__)
         __pause();
 }
+
+// Read the CPU cycle counter and return the raw 64-bit count.  Portable: lowers
+// to RDTSC on x86 and the platform cycle-count register on other targets (0 where
+// unsupported), so unlike time.cb's x86-only rdtscp() it needs no __X86__ guard.
+//
+// NON-SERIALIZING: out-of-order execution may reorder instructions across this
+// read, so back-to-back deltas can smear.  Use cycle_count_serialized() (or, on
+// x86, time.cb's rdtscp() + lfence()) to fence a measured region.
+//
+// Returns CYCLES, not nanoseconds; use only for deltas, never as a wall clock.
+// For wall-clock timing prefer the QPC-based Stopwatch/Duration in time.cb.
+u64 cycle_count()
+{
+    return __readcyclecounter();
+}
+
+// Serializing cycle-counter read: fence, read, fence.  On x86 the LFENCE pair
+// keeps out-of-order execution from pulling work across the read in either
+// direction, so back-to-back deltas measure a region cleanly.  On non-x86 the
+// fences compile away and this degrades to a plain cycle_count().
+u64 cycle_count_serialized()
+{
+    if const (__X86__)
+        __lfence();
+    u64 c = __readcyclecounter();
+    if const (__X86__)
+        __lfence();
+    return c;
+}

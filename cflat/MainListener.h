@@ -13781,6 +13781,19 @@ public:
                             break;
                         }
 
+                        // Hardware intrinsic: __readcyclecounter() - target-independent read of
+                        // the CPU cycle counter (llvm.readcyclecounter). Returns a u64 raw cycle
+                        // count; lowers to RDTSC on x86 and the platform cycle register elsewhere.
+                        // Non-serializing; wrapped by cycle_count() in intrinsic.cb.
+                        if (functionName == "__readcyclecounter")
+                        {
+                            namedVar.Primary = Compiler(ctx)->CreateReadCycleCounter();
+                            namedVar.Storage = nullptr;
+                            namedVar.BaseType = namedVar.Primary->getType();
+                            namedVar.TypeAndValue.TypeName = "u64";
+                            break;
+                        }
+
                         // Hardware intrinsic: __lfence() - emit the x86 LFENCE load/serializing
                         // fence. Returns nothing. x86/Intel target only; guard callers with
                         // `if const (__X86__)`. Wrapped by lfence() in time.cb; pair with rdtscp()
@@ -16181,7 +16194,7 @@ public:
         // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
             "va_start", "va_end", "is_pointer", "is_primitive", "is_string", "annotationof",
-            "reflect", "reflect_set", "__rdtscp", "__lfence", "__pause",
+            "reflect", "reflect_set", "__rdtscp", "__readcyclecounter", "__lfence", "__pause",
             "__popcount", "__ctz", "__clz", "__prefetch", "__fma", "__likely", "__unlikely",
         };
         if (kIntrinsics.count(name))
