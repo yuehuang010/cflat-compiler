@@ -126,6 +126,15 @@ namespace os.windows
     extern stdcall void     GetSystemInfo(_SystemInfo* lpSystemInfo);
     // Query logical processor and cache topology into a caller-sized buffer.
     extern stdcall win_int  GetLogicalProcessorInformation(_SysLogicalProcInfo* Buffer, u32* ReturnLength);
+    // Query logical processor topology (relationship = RelationAll(0xFFFF) reads
+    // every record type in one call) into a caller-sized buffer of variable-length
+    // SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX records. Returns 0 and sets
+    // *ReturnedLength to the required size if the buffer is too small.
+    // The variable-length GROUP_AFFINITY arrays make this an honest raw-byte walk
+    // rather than a modeled struct - see core/topology.cb for the offset table.
+    extern stdcall win_int  GetLogicalProcessorInformationEx(u32 RelationshipType, i8* Buffer, u32* ReturnedLength);
+    // Count active logical processors in a processor group (0xFFFF = ALL_PROCESSOR_GROUPS).
+    extern stdcall u32      GetActiveProcessorCount(u16 GroupNumber);
     // Reserve and/or commit pages of virtual memory.
     extern stdcall void*    VirtualAlloc(void* lpAddress, win_size dwSize, u32 flAllocationType, u32 flProtect);
     // Release or decommit a region of virtual memory.

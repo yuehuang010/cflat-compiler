@@ -1,0 +1,168 @@
+// topology_pingpong_bench.cb - cache-line ping-pong latency across the G5
+// topology-aware masks (cpu_mask_llc), in three pinned configurations:
+//
+//   intra-CCX0  - both threads on distinct physical cores inside cpu_mask_llc(0)
+//   intra-CCX1  - both threads on distinct physical cores inside cpu_mask_llc(1)
+//   cross-CCX   - one thread in llc(0), the other in llc(1)
+//
+// Two threads alternate ownership of one shared cache line (an atomic_counter
+// "turn" flag) as fast as possible - the classic line-transfer latency probe:
+// each round trip forces the line to bounce M->E->S->... between the two
+// cores' L1/L2, so the measured ns/roundtrip is dominated by however far the
+// coherence traffic has to travel (same LLC domain vs across the LLC/CCX
+// boundary). No yielding/pausing in the spin - we want raw transfer latency,
+// not scheduler-friendliness.
+//
+// Build (see performance/hpc/pfor_dynamic_bench.cb for the pattern):
+//   x64/Release/cflat.exe performance/hpc/topology_pingpong_bench.cb -O2 -o out/hpc/topo_pingpong.exe
+//   out\hpc\topo_pingpong.exe
+//
+// Not in performance.bat's BENCH_FILES list (ad hoc bench evidence for G5).
+
+import "thread.cb";
+import "time.cb";
+import "atomic.cb";
+import "topology.cb";
+
+i64 ROUNDS = 2000000;   // round trips measured per run
+int REPS   = 5;         // repetitions per configuration; report the minimum
+
+atomic_counter g_turn = default;   // 0 = A's turn, 1 = B's turn
+atomic_counter g_go   = default;   // 0 = wait, 1 = start the timed loop
+
+// Thread A: waits for turn==0, flips it to 1. ROUNDS iterations.
+int pingA(void* ctx) {
+    while (g_go.read() == (i64)0) { }
+    i64 i = 0;
+    while (i < ROUNDS) {
+        while (g_turn.read() != (i64)0) { }
+        g_turn.store((i64)1);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Thread B: waits for turn==1, flips it to 0. ROUNDS iterations.
+int pingB(void* ctx) {
+    while (g_go.read() == (i64)0) { }
+    i64 i = 0;
+    while (i < ROUNDS) {
+        while (g_turn.read() != (i64)1) { }
+        g_turn.store((i64)0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Return the single-bit affinity mask of the `skip`-th (0-indexed) distinct
+// physical core whose SMT sibling set lies entirely inside `llcMask`, in
+// topology enumeration order. Returns 0 if there is no such core (caller must
+// check before using it as an affinity mask).
+u64 pickCoreInLlc(u64 llcMask, int skip) {
+    CpuTopology* topo = cpu_topology();
+    int found = 0;
+    int i = 0;
+    while (i < topo->physicalCount) {
+        u64 cm = topo->coreMask[i];
+        if (cm != (u64)0 && (cm & llcMask) == cm) {
+            if (found == skip) {
+                return cm & ((~cm) + (u64)1);   // isolate lowest set bit
+            }
+            found = found + 1;
+        }
+        i = i + 1;
+    }
+    return (u64)0;
+}
+
+// Run one pinned ping-pong measurement; returns elapsed ns for ROUNDS round trips.
+double runOnce(u64 maskA, u64 maskB) {
+    g_turn.store((i64)0);
+    g_go.store((i64)0);
+
+    Thread tA;
+    Thread tB;
+    tA.start(pingA, nullptr);
+    tB.start(pingB, nullptr);
+    tA.setAffinity(maskA);
+    tB.setAffinity(maskB);
+    sleep(1);   // let the scheduler settle both threads onto their pinned cores
+
+    Stopwatch sw;
+    sw.start();
+    g_go.store((i64)1);
+    tA.join();
+    tB.join();
+    sw.stop();
+
+    return sw.elapsed().nanoseconds();
+}
+
+// Run REPS repetitions of one named configuration, print each rep and the
+// minimum, and return the minimum ns/roundtrip.
+double benchConfig(char* name, u64 maskA, u64 maskB) {
+    printf("\n%s  (maskA=0x%llx maskB=0x%llx)\n", name, maskA, maskB);
+    double best = 1.0e30;
+    int r = 0;
+    while (r < REPS) {
+        double ns = runOnce(maskA, maskB);
+        double nsPerRoundtrip = ns / (double)ROUNDS;
+        printf("  rep %d: %10.2f ns/roundtrip\n", r, nsPerRoundtrip);
+        if (nsPerRoundtrip < best) { best = nsPerRoundtrip; }
+        r = r + 1;
+    }
+    printf("  best: %10.2f ns/roundtrip\n", best);
+    return best;
+}
+
+extern int main() {
+    CpuTopology* topo = cpu_topology();
+    printf("cpu_topology(): logicalCount=%d physicalCount=%d llcCount=%d\n",
+           topo->logicalCount, topo->physicalCount, topo->llcCount);
+
+    if (topo->llcCount < 2) {
+        printf("Only %d LLC domain(s) found - this benchmark needs at least 2 to show a cross-CCX gap.\n",
+               topo->llcCount);
+        printf("Falling back to intra-CCX0 only (two distinct physical cores in llc(0)).\n");
+        u64 llc0 = cpu_mask_llc(0);
+        u64 a = pickCoreInLlc(llc0, 0);
+        u64 b = pickCoreInLlc(llc0, 1);
+        if (a == (u64)0 || b == (u64)0) {
+            printf("Not enough distinct physical cores in llc(0) to run even the intra-CCX case.\n");
+            return 1;
+        }
+        benchConfig("intra-CCX0", a, b);
+        return 0;
+    }
+
+    u64 llc0 = cpu_mask_llc(0);
+    u64 llc1 = cpu_mask_llc(1);
+    printf("llcMask[0]=0x%llx llcMask[1]=0x%llx\n", llc0, llc1);
+
+    u64 c0a = pickCoreInLlc(llc0, 0);
+    u64 c0b = pickCoreInLlc(llc0, 1);
+    u64 c1a = pickCoreInLlc(llc1, 0);
+    u64 c1b = pickCoreInLlc(llc1, 1);
+
+    if (c0a == (u64)0 || c0b == (u64)0) {
+        printf("Not enough distinct physical cores in llc(0) - cannot run intra-CCX0.\n");
+        return 1;
+    }
+    if (c1a == (u64)0 || c1b == (u64)0) {
+        printf("Not enough distinct physical cores in llc(1) - cannot run intra-CCX1.\n");
+        return 1;
+    }
+
+    double intra0 = benchConfig("intra-CCX0", c0a, c0b);
+    double intra1 = benchConfig("intra-CCX1", c1a, c1b);
+    double cross  = benchConfig("cross-CCX ", c0a, c1a);
+
+    printf("\n=== Summary (best of %d reps, %lld round trips each) ===\n", REPS, ROUNDS);
+    printf("  intra-CCX0: %10.2f ns/roundtrip\n", intra0);
+    printf("  intra-CCX1: %10.2f ns/roundtrip\n", intra1);
+    printf("  cross-CCX:  %10.2f ns/roundtrip\n", cross);
+    printf("  cross/intra0 = %.2fx   cross/intra1 = %.2fx\n",
+           cross / intra0, cross / intra1);
+
+    return 0;
+}

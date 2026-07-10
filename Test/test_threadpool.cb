@@ -30,6 +30,7 @@ import "time.cb";
 import "list.cb";
 import "program.cb";
 import "latch.cb";
+import "topology.cb";
 
 // Inline test helpers (mirroring Test/test_helper.cb's bool/int Test() API).
 int Test(const char* name, bool actual, bool expected) {
@@ -817,6 +818,91 @@ bool testPinnedPool() {
     return result;
 }
 
+// Popcount via Kernighan bit-clearing, for the mask assertions below.
+int _testPopcount(u64 mask) {
+    int count = 0;
+    u64 m = mask;
+    while (m != (u64)0) { m = m & (m - (u64)1); count = count + 1; }
+    return count;
+}
+
+// core/topology.cb: CpuTopology snapshot + mask helpers (cpu_mask_physical,
+// cpu_mask_perf_cores/efficiency_cores, cpu_mask_llc/numa). Assertions are
+// machine-independent - they hold on a uniform machine (degraded/POSIX
+// fallback: 1 LLC domain, 1 NUMA node, all cores "performance" class) and on
+// a heterogeneous one (e.g. the dev box: 2 LLC domains split along CCX
+// lines, perf vs efficiency cores distinguished by EfficiencyClass).
+bool testCpuTopology() {
+    bool result = true;
+    CpuTopology* topo = cpu_topology();
+
+    result &= Test("topology physicalCount >= 1", topo->physicalCount >= 1, true);
+    result &= Test("topology physicalCount <= logicalCount", topo->physicalCount <= topo->logicalCount, true);
+    result &= Test("topology llcCount >= 1", topo->llcCount >= 1, true);
+
+    // Every LLC mask is non-zero, and all LLC masks are pairwise disjoint.
+    bool llcNonZero = true;
+    bool llcDisjoint = true;
+    int i = 0;
+    while (i < topo->llcCount) {
+        if (topo->llcMask[i] == (u64)0) { llcNonZero = false; }
+        int j = i + 1;
+        while (j < topo->llcCount) {
+            if ((topo->llcMask[i] & topo->llcMask[j]) != (u64)0) { llcDisjoint = false; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    result &= Test("topology llcMask all non-zero", llcNonZero, true);
+    result &= Test("topology llcMask pairwise disjoint", llcDisjoint, true);
+
+    // Union of llcMask[0..llcCount-1] == union of coreMask[0..physicalCount-1].
+    u64 llcUnion = (u64)0;
+    i = 0;
+    while (i < topo->llcCount) { llcUnion = llcUnion | topo->llcMask[i]; i = i + 1; }
+    u64 coreUnion = (u64)0;
+    i = 0;
+    while (i < topo->physicalCount) { coreUnion = coreUnion | topo->coreMask[i]; i = i + 1; }
+    result &= Test("topology llc union == core union", (int)(llcUnion == coreUnion), 1);
+
+    // cpu_mask_physical(n): popcount == min(n, physicalCount).
+    result &= Test("mask_physical(1) popcount", _testPopcount(cpu_mask_physical(1)), 1);
+    int expectAll = topo->physicalCount;
+    if (expectAll > 64) { expectAll = 64; }
+    result &= Test("mask_physical(physicalCount) popcount", _testPopcount(cpu_mask_physical(topo->physicalCount)), expectAll);
+    result &= Test("mask_physical(physicalCount+5) popcount", _testPopcount(cpu_mask_physical(topo->physicalCount + 5)), expectAll);
+
+    // perf/efficiency cores partition the full core union.
+    u64 perf = cpu_mask_perf_cores();
+    u64 eff  = cpu_mask_efficiency_cores();
+    result &= Test("perf | efficiency == core union", (int)((perf | eff) == coreUnion), 1);
+    result &= Test("perf & efficiency == 0", (int)(perf & eff), 0);
+
+    // cpu_mask_llc(i) non-zero for every valid domain; out-of-range returns 0.
+    bool llcHelperNonZero = true;
+    i = 0;
+    while (i < cpu_llc_count()) {
+        if (cpu_mask_llc(i) == (u64)0) { llcHelperNonZero = false; }
+        i = i + 1;
+    }
+    result &= Test("cpu_mask_llc nonzero in range", llcHelperNonZero, true);
+    result &= Test("cpu_mask_llc(-1) == 0", (int)cpu_mask_llc(-1), 0);
+    result &= Test("cpu_mask_llc(llcCount) == 0", (int)cpu_mask_llc(cpu_llc_count()), 0);
+
+    // Same shape for NUMA.
+    bool numaHelperNonZero = true;
+    i = 0;
+    while (i < cpu_numa_count()) {
+        if (cpu_mask_numa(i) == (u64)0) { numaHelperNonZero = false; }
+        i = i + 1;
+    }
+    result &= Test("cpu_mask_numa nonzero in range", numaHelperNonZero, true);
+    result &= Test("cpu_mask_numa(-1) == 0", (int)cpu_mask_numa(-1), 0);
+    result &= Test("cpu_mask_numa(numaCount) == 0", (int)cpu_mask_numa(cpu_numa_count()), 0);
+
+    return result;
+}
+
 extern int main() {
     int total  = 0;
     int passed = 0;
@@ -842,6 +928,7 @@ extern int main() {
     total++; passed += testPriorityOrdering()            ? 1 : 0;
     total++; passed += testThreadPoolInProgram()         ? 1 : 0;
     total++; passed += testPinnedPool()                  ? 1 : 0;
+    total++; passed += testCpuTopology()                 ? 1 : 0;
 
     printf("ThreadPool tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

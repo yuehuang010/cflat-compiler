@@ -437,6 +437,277 @@ void testForNDynamic_pool_triangularSkew() {
     delete[_] par;
 }
 
+// ---- parallel_reduce_dynamic / parallel_reduce_dynamic_pool ----------------
+// Same chunk-pulling scheduler as parallel_for_n_dynamic, but each worker
+// folds every chunk it pulls into ONE local accumulator via combine, then
+// writes that accumulator to its slot once at exhaustion (see doc/HPC.md).
+// Integer sum is the exact-match workload here: integer addition is
+// associative AND commutative exactly (no rounding), so the total is
+// order-independent no matter which chunks land on which worker's
+// accumulator - unlike floating point, whose run-to-run reproducibility
+// caveat gets its own tolerance-based test further below.
+
+void fillSumV(i64[] v, i64 n) {
+    i64 i = 0;
+    while (i < n) { v[i] = i; i = i + 1; }
+}
+
+i64 sumExpect(i64 n) { return n * (n - 1) / 2; }
+
+void testReduceDynamic_thread_notDivisible() {
+    i64 n = 1003;   // not divisible by chunk=16
+    i64[] v = new i64[n];
+    fillSumV(v, n);
+    Lambda<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+        i64 s = 0;
+        i64 j = lo;
+        while (j < hi) { s = s + v[j]; j = j + 1; }   // v captured
+        return s;
+    };
+    i64 sum = parallel_reduce_dynamic<i64>(n, 4, 16, (i64)0, partial, addI64);
+    check("parallel_reduce_dynamic thread: n not divisible by chunk", sum == sumExpect(n));
+    delete[_] v;
+}
+
+void testReduceDynamic_thread_chunkBiggerThanN() {
+    i64 n = 50;
+    i64[] v = new i64[n];
+    fillSumV(v, n);
+    Lambda<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+        i64 s = 0;
+        i64 j = lo;
+        while (j < hi) { s = s + v[j]; j = j + 1; }
+        return s;
+    };
+    i64 sum = parallel_reduce_dynamic<i64>(n, 4, 10000, (i64)0, partial, addI64);
+    check("parallel_reduce_dynamic thread: chunk > n", sum == sumExpect(n));
+    delete[_] v;
+}
+
+void testReduceDynamic_thread_zeroN() {
+    Lambda<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+        return (i64)999;   // must never run
+    };
+    i64 result = parallel_reduce_dynamic<i64>(0, 4, 8, (i64)42, partial, addI64);
+    check("parallel_reduce_dynamic thread: n==0 returns identity", result == 42);
+}
+
+void testReduceDynamic_thread_moreWorkersThanN() {
+    i64 n = 3;
+    i64[] v = new i64[n];
+    fillSumV(v, n);
+    Lambda<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+        i64 s = 0;
+        i64 j = lo;
+        while (j < hi) { s = s + v[j]; j = j + 1; }
+        return s;
+    };
+    i64 sum = parallel_reduce_dynamic<i64>(n, 16, 1, (i64)0, partial, addI64);
+    check("parallel_reduce_dynamic thread: workers > n", sum == sumExpect(n));
+    delete[_] v;
+}
+
+void testReduceDynamic_thread_autoChunk() {
+    i64 n = 20000;
+    i64[] v = new i64[n];
+    fillSumV(v, n);
+    Lambda<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+        i64 s = 0;
+        i64 j = lo;
+        while (j < hi) { s = s + v[j]; j = j + 1; }
+        return s;
+    };
+    i64 sum = parallel_reduce_dynamic<i64>(n, 4, 0, (i64)0, partial, addI64);   // chunk<=0 -> auto
+    check("parallel_reduce_dynamic thread: auto chunk", sum == sumExpect(n));
+    delete[_] v;
+}
+
+void testReduceDynamic_pool_notDivisible() {
+    i64 n = 1003;
+    i64[] v = new i64[n];
+    fillSumV(v, n);
+    ThreadPool pool;
+    pool.init(4);
+    Lambda<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+        i64 s = 0;
+        i64 j = lo;
+        while (j < hi) { s = s + v[j]; j = j + 1; }
+        return s;
+    };
+    i64 sum = parallel_reduce_dynamic_pool<i64>(&pool, n, 0, 16, (i64)0, partial, addI64);
+    pool.shutdown();
+    check("parallel_reduce_dynamic pool: n not divisible by chunk", sum == sumExpect(n));
+    delete[_] v;
+}
+
+void testReduceDynamic_pool_chunkBiggerThanN() {
+    i64 n = 50;
+    i64[] v = new i64[n];
+    fillSumV(v, n);
+    ThreadPool pool;
+    pool.init(4);
+    Lambda<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+        i64 s = 0;
+        i64 j = lo;
+        while (j < hi) { s = s + v[j]; j = j + 1; }
+        return s;
+    };
+    i64 sum = parallel_reduce_dynamic_pool<i64>(&pool, n, 0, 10000, (i64)0, partial, addI64);
+    pool.shutdown();
+    check("parallel_reduce_dynamic pool: chunk > n", sum == sumExpect(n));
+    delete[_] v;
+}
+
+void testReduceDynamic_pool_zeroN() {
+    ThreadPool pool;
+    pool.init(4);
+    Lambda<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+        return (i64)999;   // must never run
+    };
+    i64 result = parallel_reduce_dynamic_pool<i64>(&pool, 0, 0, 8, (i64)42, partial, addI64);
+    pool.shutdown();
+    check("parallel_reduce_dynamic pool: n==0 returns identity", result == 42);
+}
+
+void testReduceDynamic_pool_moreWorkersThanN() {
+    i64 n = 3;
+    i64[] v = new i64[n];
+    fillSumV(v, n);
+    ThreadPool pool;
+    pool.init(4);
+    Lambda<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+        i64 s = 0;
+        i64 j = lo;
+        while (j < hi) { s = s + v[j]; j = j + 1; }
+        return s;
+    };
+    i64 sum = parallel_reduce_dynamic_pool<i64>(&pool, n, 16, 1, (i64)0, partial, addI64);
+    pool.shutdown();
+    check("parallel_reduce_dynamic pool: workers > n", sum == sumExpect(n));
+    delete[_] v;
+}
+
+void testReduceDynamic_pool_autoChunk() {
+    i64 n = 20000;
+    i64[] v = new i64[n];
+    fillSumV(v, n);
+    ThreadPool pool;
+    pool.init(4);
+    Lambda<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+        i64 s = 0;
+        i64 j = lo;
+        while (j < hi) { s = s + v[j]; j = j + 1; }
+        return s;
+    };
+    i64 sum = parallel_reduce_dynamic_pool<i64>(&pool, n, 0, 0, (i64)0, partial, addI64);   // chunk<=0 -> auto
+    pool.shutdown();
+    check("parallel_reduce_dynamic pool: auto chunk", sum == sumExpect(n));
+    delete[_] v;
+}
+
+// Triangular-cost partial: chunk [lo,hi) does ~sum(n-k) work computing its
+// contribution, so a static split would badly imbalance workers (see
+// testForNDynamic_thread_triangularSkew); dynamic chunking should still land
+// on the exact serial total since integer addition is associative and
+// commutative regardless of which worker folds which chunk.
+i64 triangularPartial(i64 lo, i64 hi, i64 n) {
+    i64 s = 0;
+    i64 k = lo;
+    while (k < hi) {
+        i64 cost = n - k;
+        i64 t = 0;
+        while (t < cost) { s = s + 1; t = t + 1; }   // s += (n-k), the slow way
+        k = k + 1;
+    }
+    return s;
+}
+
+i64 triangularExpectFrom(i64 lo, i64 hi, i64 n) { return triangularPartial(lo, hi, n); }
+
+void testReduceDynamic_thread_triangularSkew() {
+    i64 n = 2000;
+    i64 serial = triangularExpectFrom(0, n, n);
+
+    Lambda<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+        return triangularPartial(lo, hi, n);   // n captured
+    };
+    i64 sum = parallel_reduce_dynamic<i64>(n, 4, 0, (i64)0, partial, addI64);
+    check("parallel_reduce_dynamic thread: triangular skew == serial", sum == serial);
+}
+
+void testReduceDynamic_pool_triangularSkew() {
+    i64 n = 2000;
+    i64 serial = triangularExpectFrom(0, n, n);
+
+    ThreadPool pool;
+    pool.init(4);
+    Lambda<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+        return triangularPartial(lo, hi, n);
+    };
+    i64 sum = parallel_reduce_dynamic_pool<i64>(&pool, n, 0, 0, (i64)0, partial, addI64);
+    pool.shutdown();
+    check("parallel_reduce_dynamic pool: triangular skew == serial", sum == serial);
+}
+
+// ---- reproducibility caveat: FP sum, tolerance not exact -------------------
+// parallel_reduce_dynamic's per-worker accumulator is seeded and folded in an
+// order that varies run to run (which chunks a given worker happens to pull
+// is scheduling-dependent), so unlike the integer tests above, a floating
+// combine is NOT expected to reproduce the serial fold bit-for-bit - only
+// within a tolerance. Values alternate large magnitude terms that nearly
+// cancel (+/-1e6) with a small residual, so naive reordering is meaningful
+// (a wrong reduction - e.g. dropped or duplicated chunks - would miss the
+// tolerance by many orders of magnitude, while legitimate FP reassociation
+// noise stays tiny).
+bool approxTol(double a, double b, double tol) {
+    double d = a - b;
+    if (d < 0.0) { d = -d; }
+    return d < tol;
+}
+
+double fpTerm(i64 i) {
+    if (i % 2 == 0) { return 1000000.0; }
+    return -1000000.0 + 0.5;   // pairs sum to 0.5
+}
+
+double fpSerialSum(i64 n) {
+    double s = 0.0;
+    i64 i = 0;
+    while (i < n) { s = s + fpTerm(i); i = i + 1; }
+    return s;
+}
+
+void testReduceDynamic_thread_fpTolerance() {
+    i64 n = 100000;   // n/2 pairs, each contributing 0.5 -> ~25000.0
+    double serial = fpSerialSum(n);
+
+    Lambda<double(i64, i64)> partial = (i64 lo, i64 hi) => {
+        double s = 0.0;
+        i64 j = lo;
+        while (j < hi) { s = s + fpTerm(j); j = j + 1; }
+        return s;
+    };
+    double dyn = parallel_reduce_dynamic<double>(n, 4, 0, 0.0, partial, addDouble);
+    check("parallel_reduce_dynamic thread: FP sum within tolerance of serial", approxTol(dyn, serial, 1.0e-3));
+}
+
+void testReduceDynamic_pool_fpTolerance() {
+    i64 n = 100000;
+    double serial = fpSerialSum(n);
+
+    ThreadPool pool;
+    pool.init(4);
+    Lambda<double(i64, i64)> partial = (i64 lo, i64 hi) => {
+        double s = 0.0;
+        i64 j = lo;
+        while (j < hi) { s = s + fpTerm(j); j = j + 1; }
+        return s;
+    };
+    double dyn = parallel_reduce_dynamic_pool<double>(&pool, n, 0, 0, 0.0, partial, addDouble);
+    pool.shutdown();
+    check("parallel_reduce_dynamic pool: FP sum within tolerance of serial", approxTol(dyn, serial, 1.0e-3));
+}
+
 extern int main() {
     testForN_thread();
     testForN_pool();
@@ -458,6 +729,21 @@ extern int main() {
     testForNDynamic_pool_moreWorkersThanN();
     testForNDynamic_pool_autoChunk();
     testForNDynamic_pool_triangularSkew();
+
+    testReduceDynamic_thread_notDivisible();
+    testReduceDynamic_thread_chunkBiggerThanN();
+    testReduceDynamic_thread_zeroN();
+    testReduceDynamic_thread_moreWorkersThanN();
+    testReduceDynamic_thread_autoChunk();
+    testReduceDynamic_pool_notDivisible();
+    testReduceDynamic_pool_chunkBiggerThanN();
+    testReduceDynamic_pool_zeroN();
+    testReduceDynamic_pool_moreWorkersThanN();
+    testReduceDynamic_pool_autoChunk();
+    testReduceDynamic_thread_triangularSkew();
+    testReduceDynamic_pool_triangularSkew();
+    testReduceDynamic_thread_fpTolerance();
+    testReduceDynamic_pool_fpTolerance();
 
     printf("%d/%d passed\n", g_pass, g_total);
     return g_pass == g_total ? 0 : 1;

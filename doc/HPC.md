@@ -25,6 +25,7 @@ failure points you toward.
 - [`span<T>` (noalias) and `view<T>` (may-alias)](#spant-noalias-and-viewt-may-alias)
 - [Across-core data parallelism (`parallel_for_n` / `parallel_reduce`)](#across-core-data-parallelism-parallel_for_n--parallel_reduce)
   - [Dynamic scheduling (`parallel_for_n_dynamic` / `parallel_for_n_dynamic_pool`)](#dynamic-scheduling-parallel_for_n_dynamic--parallel_for_n_dynamic_pool)
+    - [`parallel_reduce_dynamic<T>` / `parallel_reduce_dynamic_pool<T>` - dynamic reduction](#parallel_reduce_dynamict--parallel_reduce_dynamic_poolt---dynamic-reduction)
 - [Numeric kernel libraries (`core/hpc`)](#numeric-kernel-libraries-corehpc)
 
 **Related:** [Threading & Memory Management](THREADING.md) (threads, affinity, thread pool, allocators, lock-set analysis) | [Language & Core Library Features](LANGUAGE.md)
@@ -730,9 +731,57 @@ pool.init(8, cpu_mask_lowest(8));   // 8 workers, worker i pinned to core i
 `init(int workers, u64 pinMask)` pins worker `i` to a single core - the `i`-th set bit of `pinMask`
 (see `__threadpool_nth_core`) - so a pool can be pinned to an arbitrary core subset, not just the low
 cores. `cpu_mask_lowest(n)` builds the mask for cores `0..n-1` (the usual one-worker-per-core layout);
-pass any bitmask for a custom set (e.g. `cpu_mask_lowest` on a P-core range to keep a solver off the
-E-cores). The plain `init(workers)` overload leaves the workers unpinned. This closes the old
-pin-vs-pool gap: a bulk-synchronous solver now gets thread reuse **and** affinity at the same time.
+pass any bitmask for a custom set. The plain `init(workers)` overload leaves the workers unpinned. This
+closes the old pin-vs-pool gap: a bulk-synchronous solver now gets thread reuse **and** affinity at the
+same time.
+
+`cpu_mask_lowest(n)` assumes cores `0..n-1` are the right ones to use, which is not true on a
+heterogeneous or multi-CCX machine - core 0 and core 1 might be on different cache domains, or one
+might be a slower efficiency core. `import "topology.cb";` gives mask constructors that understand the
+actual machine, built on a memoized `CpuTopology` snapshot (`cpu_topology()`):
+
+- `cpu_mask_physical(n)` - one logical CPU per physical core (skips SMT siblings), for the first `n`
+  cores in enumeration order.
+- `cpu_mask_perf_cores()` / `cpu_mask_efficiency_cores()` - all logical CPUs of the performance-class
+  cores, and of everything below that class, split by the OS-reported `EfficiencyClass`. On a uniform
+  machine `cpu_mask_efficiency_cores()` is `0` and `cpu_mask_perf_cores()` covers everything - that is
+  correct-by-definition, not a bug.
+- `cpu_mask_llc(domain)` / `cpu_llc_count()` - the logical CPUs sharing LLC (L3 cache / CCX) domain
+  `domain`, and how many domains exist. This is the discriminating tool when a machine does not expose
+  distinct efficiency classes but still has separate cache domains (e.g. two same-class CCXs).
+- `cpu_mask_numa(node)` / `cpu_numa_count()` - the NUMA-node equivalent.
+
+Worked example: pin a pool to stay inside a single LLC/CCX domain, so every worker shares one L3 cache
+and cross-core communication never crosses the slow inter-CCX link:
+
+```c
+import "topology.cb";
+import "threadpool.cb";
+
+u64 llc0 = cpu_mask_llc(0);
+int workers = 0;
+u64 m = llc0;
+while (m != (u64)0) { m = m & (m - (u64)1); workers = workers + 1; }   // popcount(llc0)
+
+ThreadPool pool;
+pool.init(workers, llc0);
+// ... parallel_for_n_pool(&pool, ...) - every worker stays inside LLC domain 0.
+```
+
+`workers` here is the popcount of the mask (one worker per logical CPU in that domain); pass a smaller
+count if you want fewer workers than the domain has room for - `init` still only pins to bits within
+`llc0`. On a heterogeneous box (AMD
+Strix Point: 4 Zen5 performance cores + 6 Zen5c compact cores on two separate CCXs) `cpu_mask_llc(0)` and
+`cpu_mask_llc(1)` isolate each CCX; `cpu_mask_perf_cores()` isolates the 4 Zen5 cores directly since
+Windows reports them at a higher `EfficiencyClass` than the Zen5c cores.
+
+Limits: masks are a bare `u64`, so only the first 64 logical processors in Windows processor group 0 are
+covered (multi-group machines and >64 logical processors are out of scope, same implicit limit
+`cpu_mask_lowest` already had). `topology.cb` compiles on POSIX but the walk is Windows-only: POSIX
+`os.thread_set_affinity` is an explicit no-op today (see `core/os.cb`), so a topology query there
+degrades to a uniform synthetic snapshot (`physicalCount == logicalCount`, one LLC domain, one NUMA
+node) rather than doing a real sysfs walk - pinning on POSIX stays a no-op until affinity itself is
+ported.
 
 ### Per-worker floating-point environment (trap NaN/Inf, flush denormals)
 
@@ -875,13 +924,55 @@ refused submission) shares the *same* counter, a refused task drains the counter
 thread instead of running one fixed range - it just claims whatever chunks are still unclaimed, so it
 composes correctly with chunks concurrently pulled by workers that *did* get submitted.
 
-> **`parallel_reduce_dynamic<T>` does not exist (yet).** A dynamic sibling for reductions is a natural
-> follow-up (each worker would fold every chunk it pulls into one local accumulator, then contribute one
-> partial per worker, same as `parallel_reduce`'s merge step) but is deliberately out of scope for now.
-> Unlike `parallel_for_n_dynamic`, it would **not** be reproducible run-to-run even at a fixed `workers`
-> count: which chunks land in which worker's accumulator varies by scheduling, so the combine
-> reassociates differently from run to run. If your reduction needs a stable result, stay on the static
-> `parallel_reduce<T>` regardless of cost skew.
+#### `parallel_reduce_dynamic<T>` / `parallel_reduce_dynamic_pool<T>` - dynamic reduction
+
+The same chunk-pulling scheduler applies to reductions, for the same reason: `parallel_reduce<T>` /
+`parallel_reduce_pool<T>` split `[0, n)` once, up front, so a skewed `partial` (e.g. the triangular-cost
+kernel above, adapted to return a value instead of writing an array) imbalances the same way a skewed
+`parallel_for_n` body does.
+
+```c
+T parallel_reduce_dynamic<T>(i64 n, int workers, i64 chunk, T identity,
+                             Lambda<T(i64, i64)> partial,
+                             Lambda<T(T, T)> combine, bool pin = false, int fpConfig = 0);
+
+T parallel_reduce_dynamic_pool<T>(ThreadPool* pool, i64 n, int workers, i64 chunk, T identity,
+                                  Lambda<T(i64, i64)> partial,
+                                  Lambda<T(T, T)> combine);
+```
+
+Each worker seeds **one** local accumulator with `identity`, folds every chunk it pulls via
+`combine(acc, partial(lo, hi))`, and writes that accumulator to its own partials slot once it exhausts
+the counter (a slot per worker, never shared - no synchronization needed on the write). After all
+workers finish, the helper merges the `workers` slots exactly like the static `parallel_reduce<T>` does.
+`chunk <= 0` uses the same automatic sizing as `parallel_for_n_dynamic` (`__pfor_dyn_auto_chunk`,
+`PFOR_DYN_CHUNKS_PER_WORKER`); `workers <= 0` and clamping to `n` behave exactly as in the static
+reduction; `n <= 0` returns `identity` untouched, without calling `partial` or `combine`. `combine` must
+still be associative, exactly as for `parallel_reduce<T>`.
+
+```c
+Lambda<double(i64, i64)> partial = (i64 lo, i64 hi) => {
+    double s = 0.0;
+    for (i64 i = lo; i < hi; i = i + 1) { s = s + triangularCost(i); }
+    return s;
+};
+double total = parallel_reduce_dynamic<double>(n, 0, 0, 0.0, partial, addDouble);
+```
+
+> **Reproducibility caveat - read this before reaching for the dynamic reduction.**
+>
+> `parallel_for_n_dynamic` is a safe drop-in for `parallel_for_n` because every index still runs exactly
+> once, on exactly one worker - chunking only changes *which thread* computes an index, never any
+> per-index computation. A reduction is different: `parallel_reduce_dynamic<T>` folds *multiple* chunks
+> together per worker, and which chunks a given worker happens to pull - and therefore the order
+> `combine` sees them in - varies **run to run**, even at a fixed `workers` count. For an exactly
+> associative `combine` (integer add, min/max, bitwise ops) the result is bit-identical regardless of
+> order, so this is a non-issue. For a floating-point `combine`, reassociation changes rounding, so the
+> result is **not** reproducible run-to-run - strictly weaker than the static `parallel_reduce<T>`, whose
+> partition (and therefore its reassociation) is deterministic for a fixed `workers` count. If your
+> reduction must be bit-stable across runs (regression baselines, checkpoint/replay determinism), stay on
+> `parallel_reduce<T>` regardless of cost skew; reach for the dynamic variant only when the skew is real
+> and run-to-run FP drift (typically far below any meaningful tolerance) is acceptable.
 
 ---
 

@@ -1,7 +1,13 @@
 # G2: Dynamic Scheduling for parallel_for_n
 
-Status: DONE for steps 1-5 (2026-07-09, integrated on master, gates green).
-Step 6 / Phase 2 (parallel_reduce_dynamic) NOT started - see notes at end.
+Status: DONE including Phase 2 (2026-07-09, integrated on master, gates
+green). parallel_reduce_dynamic<T> + _pool landed via __PRedDynBox<T> /
+__pred_dyn_run<T> mirroring the static reduce dispatch; both readiness
+traps below were handled (pool-refusal drain off live locals; raw
+trampoline is a second copy of the drain loop, kept in sync). 14 new
+tests in Test/test_parallel.cb (33 total); doc/HPC.md documents the
+run-to-run FP non-reproducibility and steers stable-result users to
+static parallel_reduce<T>.
 Created: 2026-07-09
 Parent: internal/plan/hpc-gaps.md (G2)
 Files: cflat/core/hpc/parallel.cb (only), doc/HPC.md, Test/test_hpc_kernels.cb

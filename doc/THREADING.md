@@ -196,7 +196,13 @@ fp_disable_traps();                 // back to masked (quiet-NaN) behavior
 
 - `ThreadPool.init(workerCount, pinMask, fpConfig)` - every worker the pool spawns
   (including workers added by a later `resize`) is armed with `fpConfig`. The third
-  argument is optional and defaults to `0`.
+  argument is optional and defaults to `0`. `pinMask` can come from the simple
+  `cpu_mask_lowest(n)` (cores `0..n-1`) or, for a topology-aware choice (physical
+  cores, performance vs efficiency class, LLC/CCX domains, NUMA nodes), from
+  `core/topology.cb`'s `cpu_mask_physical`/`cpu_mask_perf_cores`/`cpu_mask_efficiency_cores`/
+  `cpu_mask_llc`/`cpu_mask_numa` - see [HPC.md's Pinning workers to
+  cores](HPC.md#pinning-workers-to-cores-pin) for the full helper list and a worked
+  per-CCX pinning example.
 - Raw `parallel_for_n(n, workers, body, pin, fpConfig)` and
   `parallel_reduce<T>(n, workers, identity, partial, combine, pin, fpConfig)` arm
   each worker thread they spawn. The `_pool` variants take no `fpConfig` - they run

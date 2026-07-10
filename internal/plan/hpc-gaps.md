@@ -1,8 +1,9 @@
 # HPC Gaps Plan
 
-Status: G1-G3 DONE (2026-07-09, integrated on master, all Windows gates
-green); G4-G7 remain PROPOSED. WSL test.sh re-verification for G2's core
-library change deliberately skipped (user decision at integration).
+Status: G1-G3 AND G5 DONE, G2 incl Phase 2 reduce_dynamic (2026-07-09,
+integrated on master, all Windows gates green); G4/G6/G7 remain PROPOSED.
+WSL test.sh re-verification for the core library changes deliberately
+skipped (user decision at integration).
 Created: 2026-07-09
 Source: gap analysis of doc/HPC.md (+ CLI.md, THREADING.md) against what HPC
 developers need from a compiler/library. What CFlat already has is strong:
@@ -65,8 +66,8 @@ files.
 
 Detailed plan: internal/plan/hpc-g2-dynamic-scheduling.md (2026-07-09).
 
-G2 DONE 2026-07-09 (agent, steps 1-5; Phase 2 reduce_dynamic still open -
-see detailed plan for status/readiness notes). parallel_for_n_dynamic +
+G2 DONE 2026-07-09 (agent, ALL steps incl Phase 2:
+parallel_reduce_dynamic<T> + _pool landed same day - see detailed plan). parallel_for_n_dynamic +
 _pool in core/hpc/parallel.cb; tests in Test/test_parallel.cb (not
 test_hpc_kernels.cb - that file does not exercise parallel.cb); benchmark
 performance/hpc/pfor_dynamic_bench.cb. Triangular skew, 4 workers,
@@ -154,6 +155,19 @@ N-body kernel with --cpu native shows the fmul+fadd -> vfmadd win;
 bit-identical results outside the region.
 
 ## G5. Topology-aware CPU masks
+
+Detailed plan: internal/plan/hpc-g5-topology-masks.md (2026-07-09).
+Pure library change (new core/topology.cb + os.windows.cb externs);
+Windows-only by design - POSIX setAffinity is a no-op today, so the
+POSIX branch just compiles with a degraded uniform topology.
+
+G5 DONE 2026-07-09 (agent): CpuTopology snapshot (RelationAll Ex-walk,
+SDK-verified offsets, L3 dedupe, lazy-mutex memoized) + cpu_mask_physical/
+perf_cores/efficiency_cores/llc/numa helpers; testCpuTopology() in
+test_threadpool.cb; docs updated. Dev box reports 10 phys/2 LLC/1 NUMA,
+EfficiencyClass DOES split Zen5(1) vs Zen5c(0) on this AMD part. Bench
+performance/hpc/topology_pingpong_bench.cb: cross-CCX line bounce ~2x
+intra-CCX (~190ns vs ~90/105ns roundtrip) - cpu_mask_llc validated.
 
 Today: cpu_mask_lowest(n) assumes cores 0..n-1 are the right set. On
 hybrid parts that is wrong by default: on the dev box (Strix Point,

@@ -1,0 +1,296 @@
+// topology.cb - CPU topology snapshot (physical cores, perf/efficiency class,
+// LLC/CCX domains, NUMA nodes) and mask constructors built on top of it.
+//
+// Replaces "cpu_mask_lowest(n) and hope cores 0..n-1 are the right ones" with
+// mask helpers that understand the machine. On a heterogeneous box (e.g. AMD
+// Strix Point: full Zen5 performance cores + compact Zen5c cores on separate
+// CCXs) cpu_mask_lowest(8) can span both core classes and both LLC domains -
+// exactly the jitter pinning exists to remove.
+//
+// Scope: Windows-only walk. os.cb's POSIX thread_set_affinity is an explicit
+// no-op ("POSIX: not ported"), so a topology-aware mask is not actionable
+// there yet; the POSIX branch below still compiles and returns a uniform
+// synthetic topology (same shape os.cb uses for its own Windows/POSIX split)
+// so callers never see a zero mask. Porting affinity + a real POSIX topology
+// walk (sysfs) is a separate future item.
+//
+// Limit: masks are a bare u64, so only the first 64 logical processors in
+// Windows processor group 0 are represented. Machines with >64 logical
+// processors (multiple processor groups) are not supported here - same
+// implicit limit cpu_mask_lowest already had.
+
+import "os.cb";
+import "mutex.cb";
+
+// Fixed lane/domain caps: 64 logical CPUs (one u64 mask), up to 64 physical
+// cores, up to 8 LLC domains and 8 NUMA nodes (generous for current hardware).
+struct CpuTopology {
+    int  logicalCount   = 0;         // popcount of the group-0 active processor mask
+    int  physicalCount  = 0;         // number of physical cores (RelationProcessorCore records)
+    int  llcCount        = 0;        // number of distinct L3 (LLC) domains
+    int  numaCount       = 0;        // number of NUMA nodes
+    u64[64] coreMask     = default;  // per physical core: mask of its SMT sibling logical CPUs
+    u8[64]  coreEff      = default;  // per physical core: EfficiencyClass (higher = more performant)
+    u64[8]  llcMask       = default; // per LLC domain: mask of member logical CPUs
+    u64[8]  numaMask      = default; // per NUMA node: mask of member logical CPUs
+};
+
+CpuTopology* g_topology     = nullptr;
+mutex        g_topologyLock = default;
+
+// Fill `topo` with a uniform synthetic topology built from the logical CPU
+// count alone: every logical CPU is its own physical core, one shared LLC
+// domain, one NUMA node. Used both as the POSIX story and as the Windows
+// fallback when the Ex query fails or returns nothing (never leave a zero
+// mask, which would silently un-pin a pool).
+void _topo_build_uniform(CpuTopology* topo) {
+    int n = os.num_processors();
+    if (n <= 0) { n = 1; }
+    if (n > 64) { n = 64; }   // group-0 / u64-mask limit
+
+    topo->logicalCount  = n;
+    topo->physicalCount = n;
+    topo->llcCount      = 1;
+    topo->numaCount     = 1;
+
+    u64 all = (n >= 64) ? ~(u64)0 : (((u64)1 << n) - (u64)1);
+    int i = 0;
+    while (i < n) {
+        topo->coreMask[i] = (u64)1 << i;
+        topo->coreEff[i]  = (u8)0;
+        i = i + 1;
+    }
+    topo->llcMask[0]  = all;
+    topo->numaMask[0] = all;
+}
+
+if const (__WINDOWS__) {
+
+    // True if `m` already appears in topo->llcMask[0..llcCount-1]; RelationCache
+    // records repeat per L3 subunit (one per CCX slice sharing the same cache),
+    // so identical masks must be deduped rather than double-counted.
+    bool _topo_llc_mask_seen(CpuTopology* topo, u64 m) {
+        int i = 0;
+        while (i < topo->llcCount) {
+            if (topo->llcMask[i] == m) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // Walk one GetLogicalProcessorInformationEx(RelationAll) buffer and populate
+    // `topo`. Returns true if at least one physical-core record was found.
+    //
+    // Every SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX record starts with:
+    //   Relationship : u32 @ +0   (0=Core, 1=NumaNode, 2=Cache, 0xFFFF=All)
+    //   Size         : u32 @ +4   (self-describing; advance by this each record)
+    // Record-specific fields verified against the Windows SDK 10.0.26100.0
+    // um/winnt.h (_PROCESSOR_RELATIONSHIP / _NUMA_NODE_RELATIONSHIP /
+    // _CACHE_RELATIONSHIP; GROUP_AFFINITY is 16 bytes: u64 Mask + u16 Group +
+    // u16 Reserved[3], 8-byte aligned since KAFFINITY is pointer-sized):
+    //
+    // RelationProcessorCore (0), struct PROCESSOR_RELATIONSHIP:
+    //   Flags @+8 (u8), EfficiencyClass @+9 (u8), Reserved[20] @+10..+29,
+    //   GroupCount @+30 (u16), GroupMask[0].Mask @+32 (u64, 8-byte aligned).
+    //
+    // RelationNumaNode (1), struct NUMA_NODE_RELATIONSHIP:
+    //   NodeNumber @+8 (u32), Reserved[18] @+12..+29, GroupCount @+30 (u16),
+    //   GroupMask.Mask @+32 (u64, 8-byte aligned - 32 is already a multiple of 8).
+    //
+    // RelationCache (2), struct CACHE_RELATIONSHIP:
+    //   Level @+8 (u8), Associativity @+9 (u8), LineSize @+10 (u16),
+    //   CacheSize @+12 (u32), Type @+16 (u32 enum), Reserved[18] @+20..+37,
+    //   GroupCount @+38 (u16, ends at +40), GroupMask.Mask @+40 (u64, 8-byte
+    //   aligned - 40 is already a multiple of 8). Only Level==3 (L3/LLC)
+    //   records are kept; L1/L2 records are skipped.
+    bool _topo_walk(CpuTopology* topo, i8* buf, i64 bufLen) {
+        int foundCore = 0;
+        i64 off = 0;
+        while (off + 8 <= bufLen) {
+            u32* relPtr  = (u32*)(buf + off);
+            u32  rel     = *relPtr;
+            i32* sizePtr = (i32*)(buf + off + 4);
+            i32  size    = *sizePtr;
+            if (size <= 0) { break; }   // malformed record; stop rather than spin
+
+            if (rel == (u32)0 && topo->physicalCount < 64) {
+                // RelationProcessorCore.
+                u8*  effPtr  = (u8*)(buf + off + 9);
+                u64* maskPtr = (u64*)(buf + off + 32);
+                int  idx = topo->physicalCount;
+                topo->coreMask[idx] = *maskPtr;
+                topo->coreEff[idx]  = *effPtr;
+                topo->physicalCount = idx + 1;
+                foundCore = 1;
+            } else if (rel == (u32)2 && topo->llcCount < 8) {
+                // RelationCache; keep L3 (LLC) only.
+                u8* levelPtr = (u8*)(buf + off + 8);
+                if (*levelPtr == (u8)3) {
+                    u64* maskPtr = (u64*)(buf + off + 40);
+                    u64  m = *maskPtr;
+                    if (!_topo_llc_mask_seen(topo, m)) {
+                        topo->llcMask[topo->llcCount] = m;
+                        topo->llcCount = topo->llcCount + 1;
+                    }
+                }
+            } else if (rel == (u32)1 && topo->numaCount < 8) {
+                // RelationNumaNode.
+                u64* maskPtr = (u64*)(buf + off + 32);
+                topo->numaMask[topo->numaCount] = *maskPtr;
+                topo->numaCount = topo->numaCount + 1;
+            }
+
+            off = off + (i64)size;
+        }
+        return foundCore != 0;
+    }
+
+    // Windows snapshot: one GetLogicalProcessorInformationEx(RelationAll) call,
+    // one buffer walk. Falls back to the uniform synthetic topology if the
+    // query fails or finds no physical-core records.
+    void _topo_build_windows(CpuTopology* topo) {
+        u32 len = 0;
+        os.windows.GetLogicalProcessorInformationEx((u32)0xFFFF, nullptr, &len);   // query size
+        if (len == 0) { _topo_build_uniform(topo); return; }
+
+        i8* buf = new i8[(i64)len];
+        win_int ok = os.windows.GetLogicalProcessorInformationEx((u32)0xFFFF, buf, &len);
+        if (ok == 0) {
+            delete[] buf;
+            _topo_build_uniform(topo);
+            return;
+        }
+
+        bool found = _topo_walk(topo, buf, (i64)len);
+        delete[] buf;
+
+        if (!found || topo->llcCount == 0 || topo->numaCount == 0) {
+            // Degrade rather than expose a partial/zero snapshot; a Core-only
+            // or Cache-only walk still leaves a caller with a usable mask.
+            _topo_build_uniform(topo);
+            return;
+        }
+
+        // logicalCount = union popcount of all physical-core sibling masks.
+        u64 all = (u64)0;
+        int i = 0;
+        while (i < topo->physicalCount) {
+            all = all | topo->coreMask[i];
+            i = i + 1;
+        }
+        int count = 0;
+        u64 t = all;
+        while (t != (u64)0) { t = t & (t - (u64)1); count = count + 1; }
+        topo->logicalCount = count;
+    }
+
+} else {
+
+    // POSIX: affinity itself is unported (os.cb thread_set_affinity is a
+    // no-op there), so a real topology walk is not actionable yet. Degrade to
+    // the uniform synthetic topology; see the file header comment.
+    void _topo_build_windows(CpuTopology* topo) {
+        _topo_build_uniform(topo);
+    }
+
+}
+
+// Return the process-wide CpuTopology snapshot, computing it once. Never
+// returns nullptr and never returns a snapshot with a zero llcMask/coreMask
+// entry (the uniform-fallback path guarantees at least one nonempty domain).
+CpuTopology* cpu_topology() {
+    if (g_topology != nullptr) { return g_topology; }
+    g_topologyLock.acquire();
+    if (g_topology == nullptr) {
+        CpuTopology* topo = new CpuTopology;
+        _topo_build_windows(topo);
+        g_topology = topo;
+    }
+    g_topologyLock.release();
+    return g_topology;
+}
+
+// One logical CPU per physical core (the lowest-set-bit SMT sibling), for the
+// first min(n, physicalCount) cores in record/enumeration order. Does NOT
+// sort by efficiency class - compose with cpu_mask_perf_cores() for that.
+u64 cpu_mask_physical(int n) {
+    CpuTopology* topo = cpu_topology();
+    if (n <= 0) { return (u64)0; }
+    int cap = (n < topo->physicalCount) ? n : topo->physicalCount;
+    u64 result = (u64)0;
+    int i = 0;
+    while (i < cap) {
+        u64 m = topo->coreMask[i];
+        u64 low = m & ((~m) + (u64)1);   // isolate lowest set bit
+        result = result | low;
+        i = i + 1;
+    }
+    return result;
+}
+
+// Union of logical CPUs (full SMT sibling sets) of every physical core whose
+// EfficiencyClass equals the maximum EfficiencyClass observed on the machine.
+// On a uniform machine this is every logical CPU (see cpu_mask_efficiency_cores).
+u64 cpu_mask_perf_cores() {
+    CpuTopology* topo = cpu_topology();
+    if (topo->physicalCount == 0) { return (u64)0; }
+    u8 maxEff = topo->coreEff[0];
+    int i = 1;
+    while (i < topo->physicalCount) {
+        if (topo->coreEff[i] > maxEff) { maxEff = topo->coreEff[i]; }
+        i = i + 1;
+    }
+    u64 result = (u64)0;
+    i = 0;
+    while (i < topo->physicalCount) {
+        if (topo->coreEff[i] == maxEff) { result = result | topo->coreMask[i]; }
+        i = i + 1;
+    }
+    return result;
+}
+
+// Union of logical CPUs of every physical core BELOW the max EfficiencyClass.
+// 0 on a uniform machine (all cores report the same class) - that is
+// correct-by-definition, not a bug; cpu_mask_llc() is the discriminating tool
+// for CCX/cache splits when the machine does not expose distinct classes.
+u64 cpu_mask_efficiency_cores() {
+    CpuTopology* topo = cpu_topology();
+    if (topo->physicalCount == 0) { return (u64)0; }
+    u8 maxEff = topo->coreEff[0];
+    int i = 1;
+    while (i < topo->physicalCount) {
+        if (topo->coreEff[i] > maxEff) { maxEff = topo->coreEff[i]; }
+        i = i + 1;
+    }
+    u64 result = (u64)0;
+    i = 0;
+    while (i < topo->physicalCount) {
+        if (topo->coreEff[i] < maxEff) { result = result | topo->coreMask[i]; }
+        i = i + 1;
+    }
+    return result;
+}
+
+// Number of distinct LLC (L3) domains - the loop bound for cpu_mask_llc().
+int cpu_llc_count() {
+    return cpu_topology()->llcCount;
+}
+
+// Mask of logical CPUs sharing LLC (L3) domain `domain`. 0 if out of range.
+u64 cpu_mask_llc(int domain) {
+    CpuTopology* topo = cpu_topology();
+    if (domain < 0 || domain >= topo->llcCount) { return (u64)0; }
+    return topo->llcMask[domain];
+}
+
+// Number of NUMA nodes - the loop bound for cpu_mask_numa().
+int cpu_numa_count() {
+    return cpu_topology()->numaCount;
+}
+
+// Mask of logical CPUs belonging to NUMA node `node`. 0 if out of range.
+u64 cpu_mask_numa(int node) {
+    CpuTopology* topo = cpu_topology();
+    if (node < 0 || node >= topo->numaCount) { return (u64)0; }
+    return topo->numaMask[node];
+}

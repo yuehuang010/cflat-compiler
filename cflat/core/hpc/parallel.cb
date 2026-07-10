@@ -535,3 +535,222 @@ void parallel_for_n_dynamic_pool(ThreadPool* pool, i64 n, int workers, i64 chunk
     }
     delete[_] handles;
 }
+
+// ----------------------------------------------------------------------------
+// parallel_reduce_dynamic<T> - like parallel_reduce<T>, but workers pull small
+// chunks from a shared atomic counter instead of each taking one fixed range
+// (same rationale as parallel_for_n_dynamic: bounds imbalance from skewed
+// per-index cost to roughly one chunk instead of one worker's whole share).
+//
+// Each worker seeds ONE local accumulator with `identity`, folds every chunk
+// it pulls via `combine(acc, partial(lo, hi))`, and writes the accumulator to
+// its distinct partials slot once at exhaustion; the helper merges the
+// `workers` slots at the end exactly like the static parallel_reduce<T>.
+//
+// combine must be associative AND commutative here (not just associative, as
+// in the static reduce): which chunks land in which worker's accumulator
+// varies RUN TO RUN, so the result is not reproducible even at fixed
+// `workers` - strictly weaker than the static variant, which is deterministic
+// for fixed workers. Callers whose reduction must be bit-stable across runs
+// should use parallel_reduce<T> instead; see doc/HPC.md.
+// ----------------------------------------------------------------------------
+
+struct __PRedDynBox<T> {
+    // `run` MUST stay first: __PRedDynHeader aliases it so the non-generic
+    // pool trampoline can invoke the T-specialized drain loop without being
+    // generic itself. Takes `move void*`: the trampoline hands it the box,
+    // and the runner deletes it.
+    function<int(move void*)> run      = default;
+    Lambda<T(i64, i64)>    partial  = default;
+    Lambda<T(T, T)>        combine  = default;
+    atomic_counter*         next     = nullptr;   // shared dispenser (caller frame)
+    i64                     n        = 0;
+    i64                     chunk    = 0;
+    T                       identity = default;
+    T*                      slot     = nullptr;   // this worker's folded accumulator lands here
+};
+
+// Non-generic view of __PRedDynBox<T>'s leading `run` field - same trick as
+// __PRedHeader, needed because a generic function cannot be referenced as a
+// function-pointer value to hand to submit().
+struct __PRedDynHeader {
+    function<int(move void*)> run = default;
+};
+
+// T-specialized chunk-pulling fold, stored in __PRedDynBox<T>.run. Drains the
+// shared counter (same claim/clamp shape as __pfor_dyn_drain), folding every
+// chunk into one local accumulator seeded with identity, then writes the
+// accumulator to the box's slot once at exhaustion and deletes the box
+// through its real type so the owning `partial`/`combine` closure envs are
+// freed by the destructor. Takes `move void*`: the pool trampoline hands it
+// ownership of the box.
+int __pred_dyn_run<T>(move void* raw) {
+    __PRedDynBox<T>* b = (__PRedDynBox<T>*)raw;
+    T acc = b->identity;
+    while (true) {
+        i64 newv = b->next->add(b->chunk);
+        i64 lo    = newv - b->chunk;
+        if (lo >= b->n) { break; }
+        i64 hi = lo + b->chunk;
+        if (hi > b->n) { hi = b->n; }
+        acc = b->combine(acc, b->partial(lo, hi));
+    }
+    *b->slot = acc;
+    delete b;
+    return 0;
+}
+
+// ctx deleter handed to submit(): frees a REFUSED box through its real
+// __PRedDynBox<T>* type so the owning `partial`/`combine` Lambda<> envs are
+// destructed (a raw void* delete would leak them). On acceptance
+// __pred_dyn_run<T> frees the box instead.
+void __pred_dyn_box_free<T>(move void* raw) { delete (__PRedDynBox<T>*)raw; }
+
+// ThreadPool.submit trampoline for the dynamic reduction. Owns the box (`move
+// void*`) and hands that ownership to run (= __pred_dyn_run<T>), which
+// deletes it through the real __PRedDynBox<T>* type.
+int __pred_dyn_pool_tramp(move void* raw, stop_token tok) {
+    function<int(move void*)> fn = ((__PRedDynHeader*)raw)->run;   // borrow to read thunk
+    return fn(move raw);                                           // then hand it the box
+}
+
+// RAW THREAD overload. Same signature as parallel_reduce<T> plus a leading
+// `chunk`: pass 0 (or negative) to let it size itself (see
+// __pfor_dyn_auto_chunk). `pin` and `fpConfig` behave exactly as in
+// parallel_reduce<T>.
+T parallel_reduce_dynamic<T>(i64 n, int workers, i64 chunk, T identity,
+                             Lambda<T(i64, i64)> partial,
+                             Lambda<T(T, T)> combine, bool pin = false, int fpConfig = 0) {
+    if (n <= 0) { return identity; }
+    __pfor_raw_hotloop_check();
+    if (workers <= 0) { workers = hardware_concurrency(); }
+    if ((i64)workers > n) { workers = (int)n; }
+    if (chunk <= 0) { chunk = __pfor_dyn_auto_chunk(n, workers); }
+
+    Thread*          threads  = new Thread[workers];
+    __PRedDynBox<T>* boxes    = new __PRedDynBox<T>[workers];
+    T*               partials = new T[workers];
+    atomic_counter   next     = default;
+
+    int hwc = hardware_concurrency();
+    if (hwc <= 0) { hwc = workers; }
+
+    // Non-capturing trampoline (references only the type parameter T): drains
+    // the shared counter into one local accumulator per worker, exactly like
+    // __pred_dyn_run<T>'s loop, then writes it through the box's distinct
+    // slot (no synchronization needed - each slot is written by one worker).
+    function<int(void*)> tramp = (void* raw) => {
+        __PRedDynBox<T>* b = (__PRedDynBox<T>*)raw;
+        T acc = b->identity;
+        while (true) {
+            i64 newv = b->next->add(b->chunk);
+            i64 lo    = newv - b->chunk;
+            if (lo >= b->n) { break; }
+            i64 hi = lo + b->chunk;
+            if (hi > b->n) { hi = b->n; }
+            acc = b->combine(acc, b->partial(lo, hi));
+        }
+        *b->slot = acc;
+        return 0;
+    };
+
+    int w = 0;
+    while (w < workers) {
+        partials[w]       = identity;
+        boxes[w].partial  = partial;
+        boxes[w].combine  = combine;
+        boxes[w].next     = &next;
+        boxes[w].n        = n;
+        boxes[w].chunk    = chunk;
+        boxes[w].identity = identity;
+        boxes[w].slot     = &partials[w];
+        threads[w].start(tramp, &boxes[w], fpConfig);
+        if (pin) { threads[w].setAffinity((u64)1 << (w % hwc)); }
+        w = w + 1;
+    }
+    w = 0;
+    while (w < workers) { threads[w].join(); w = w + 1; }
+
+    T total = identity;
+    w = 0;
+    while (w < workers) { total = combine(total, partials[w]); w = w + 1; }
+
+    delete[_] threads;
+    delete[workers] boxes;   // boxes own clones of partial/combine; destruct each to free them
+    delete[_] partials;
+    return total;
+}
+
+// THREAD POOL variant. The shared atomic_counter lives in THIS frame (not one
+// per worker) - every submitted box's `next` points at it, so all
+// workers/tasks drain the same dispenser. If submit() refuses a task, it has
+// already freed the box via __pred_dyn_box_free<T> before returning nullptr
+// (submit's contract), so the refusal branch below drains the shared counter
+// using the still-live locals (partial/combine/identity/next/n/chunk) into a
+// local accumulator - never the freed box - matching the same trap fix used
+// by parallel_for_n_dynamic_pool.
+T parallel_reduce_dynamic_pool<T>(ThreadPool* pool, i64 n, int workers, i64 chunk, T identity,
+                                  Lambda<T(i64, i64)> partial,
+                                  Lambda<T(T, T)> combine) {
+    if (n <= 0) { return identity; }
+    if (workers <= 0) { workers = pool->workerCount(); }
+    if (workers <= 0) { workers = hardware_concurrency(); }
+    if ((i64)workers > n) { workers = (int)n; }
+    if (chunk <= 0) { chunk = __pfor_dyn_auto_chunk(n, workers); }
+
+    atomic_counter next     = default;
+    __HandleSlot*  handles  = new __HandleSlot[workers];
+    T*             partials = new T[workers];
+
+    // Each box dispatches through __pred_dyn_run<T> (drains its chunks, folds
+    // them, then deletes the box - freeing its owning partial/combine envs -
+    // via the real __PRedDynBox<T>* type).
+    function<int(move void*)> run = __pred_dyn_run<T>;
+
+    int w = 0;
+    while (w < workers) {
+        partials[w] = identity;
+        __PRedDynBox<T>* box = new __PRedDynBox<T>;
+        box->run      = run;
+        box->partial  = partial;
+        box->combine  = combine;
+        box->next     = &next;
+        box->n        = n;
+        box->chunk    = chunk;
+        box->identity = identity;
+        box->slot     = &partials[w];
+        handles[w].h = pool->submit(__pred_dyn_pool_tramp, box, THREADPOOL_PRIORITY_NORMAL, __pred_dyn_box_free<T>);
+        if (handles[w].h == nullptr) {
+            // Pool refused: box already freed (see __pred_dyn_box_free<T>);
+            // drain the shared counter inline off the still-live locals,
+            // folding into a local accumulator exactly like __pred_dyn_run<T>
+            // would have - never touch the freed box.
+            T acc = identity;
+            while (true) {
+                i64 newv = next.add(chunk);
+                i64 lo    = newv - chunk;
+                if (lo >= n) { break; }
+                i64 hi = lo + chunk;
+                if (hi > n) { hi = n; }
+                acc = combine(acc, partial(lo, hi));
+            }
+            partials[w] = acc;
+        }
+        w = w + 1;
+    }
+
+    w = 0;
+    while (w < workers) {
+        TaskHandle* h = move handles[w].h;
+        if (h != nullptr) { h->wait(); delete h; }
+        w = w + 1;
+    }
+
+    T total = identity;
+    w = 0;
+    while (w < workers) { total = combine(total, partials[w]); w = w + 1; }
+
+    delete[_] handles;
+    delete[_] partials;
+    return total;
+}
