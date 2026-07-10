@@ -828,11 +828,32 @@ Windows reports them at a higher `EfficiencyClass` than the Zen5c cores.
 
 Limits: masks are a bare `u64`, so only the first 64 logical processors in Windows processor group 0 are
 covered (multi-group machines and >64 logical processors are out of scope, same implicit limit
-`cpu_mask_lowest` already had). `topology.cb` compiles on POSIX but the walk is Windows-only: POSIX
-`os.thread_set_affinity` is an explicit no-op today (see `core/os.cb`), so a topology query there
-degrades to a uniform synthetic snapshot (`physicalCount == logicalCount`, one LLC domain, one NUMA
-node) rather than doing a real sysfs walk - pinning on POSIX stays a no-op until affinity itself is
-ported.
+`cpu_mask_lowest` already had). Any query failure on any platform degrades to a uniform synthetic
+snapshot (`physicalCount == logicalCount`, one LLC domain, one NUMA node) rather than to a zero mask,
+so a pinned pool never silently un-pins.
+
+`topology.cb` does a real walk on all three platforms:
+
+| Platform | Topology source | Pinning |
+|----------|-----------------|---------|
+| Windows | `GetLogicalProcessorInformationEx(RelationAll)` | `SetThreadAffinityMask` |
+| Linux | sysfs: `cpu/online`, `topology/thread_siblings_list` (collapses SMT), `cache/indexN` (highest level >= 2 -> LLC), `node/nodeN/cpulist`; `EfficiencyClass` is approximated from ARM `cpu_capacity` rank, else Intel `cpu_core`/`cpu_atom` | `pthread_setaffinity_np` |
+| macOS | `sysctlbyname` over `hw.physicalcpu` / `hw.logicalcpu` / `hw.nperflevels` / `hw.perflevelN.*`; perflevel 0 is the most performant, so `coreEff = nperflevels - 1 - level`; LLC domains are each perflevel's `cpusperl2` cluster | **none** |
+
+**macOS has no CPU affinity API.** Darwin exposes no `sched_setaffinity`, and `thread_affinity_policy` is
+an advisory L2-sharing hint that returns `KERN_NOT_SUPPORTED` on Apple Silicon. `os.thread_set_affinity`
+is therefore an honest no-op there, and `os.thread_affinity_supported()` returns `false` so callers can
+branch. The macOS mask bits are **synthetic and informational**: they are assigned in perflevel order and
+do not correspond to any OS-visible CPU number.
+
+The actionable macOS lever is **QoS class**, which is what actually steers a thread onto the P or E
+cluster. `cpu_qos_for_mask(mask)` maps a mask to the QoS class that best expresses it - a mask contained
+in `cpu_mask_efficiency_cores()` maps to `QOS_CLASS_BACKGROUND`, one contained in `cpu_mask_perf_cores()`
+maps to `QOS_CLASS_USER_INTERACTIVE`, and anything else (including *every* mask on a uniform,
+single-core-class machine, where there is no P/E split to express) maps to `0` / unspecified. `ThreadPool`
+applies this automatically: when `pinMask` is set, each worker calls `os.thread_set_qos_self()` on entry.
+QoS must be set from the target thread itself, which is why it is a self-only call rather than a
+handle-taking one.
 
 ### Per-worker floating-point environment (trap NaN/Inf, flush denormals)
 

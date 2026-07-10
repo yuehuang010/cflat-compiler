@@ -119,6 +119,25 @@ namespace os.posix
         extern win_int gettid();
     }
 
+    // === CPU affinity / QoS ===
+    // Linux pins a thread to a CPU set via pthread_setaffinity_np (cpuset is a
+    // cpu_set_t bitmap). Darwin has NO per-thread CPU affinity API - the closest
+    // actionable lever is a QoS class self-hint (pthread_set_qos_class_self_np),
+    // and topology is read via sysctlbyname.
+    if const (__MACOS__) {
+        extern win_int pthread_set_qos_class_self_np(i32 qos_class, i32 relative_priority);
+        extern win_int sysctlbyname(const char* name, void* oldp, win_size* oldlenp, void* newp, win_size newlen);
+        // QOS_CLASS_* from <sys/qos.h>.
+        int QOS_CLASS_USER_INTERACTIVE = 0x21;
+        int QOS_CLASS_USER_INITIATED   = 0x19;
+        int QOS_CLASS_DEFAULT          = 0x15;
+        int QOS_CLASS_UTILITY          = 0x11;
+        int QOS_CLASS_BACKGROUND       = 0x09;
+        int QOS_CLASS_UNSPECIFIED      = 0;
+    } else {
+        extern win_int pthread_setaffinity_np(void* thread, win_size cpusetsize, const void* cpuset);
+    }
+
     // === pthread mutex / condition variable ===
     // glibc PTHREAD_MUTEX_INITIALIZER / PTHREAD_COND_INITIALIZER are all-zero, so a
     // calloc'd block is a valid (unlocked) mutex / fresh condvar with no _init call.

@@ -560,13 +560,45 @@ namespace os
         free((void*)handle);
     }
 
-    // Pin the thread to a CPU affinity mask. POSIX: not ported (no-op).
+    // Pin the thread to a CPU affinity mask. Windows: SetThreadAffinityMask.
+    // Linux: pthread_setaffinity_np over a zeroed cpu_set_t (mask -> word 0).
+    // macOS: no-op - Darwin has no CPU affinity API (thread_affinity_policy
+    // returns KERN_NOT_SUPPORTED on Apple Silicon); use thread_set_qos_self.
     void thread_set_affinity(void* handle, u64 mask) {
         if (handle == nullptr) return;
         __OsThreadHandle* h = (__OsThreadHandle*)handle;
         if const (__WINDOWS__) {
             if const (__PLATFORM__ == 64) { os.windows.SetThreadAffinityMask(h->_os, mask); }
             else { os.windows.SetThreadAffinityMask(h->_os, (u32)mask); }
+        } else {
+            if const (__MACOS__) {
+                // No affinity on Darwin; intentional no-op.
+            } else {
+                // cpu_set_t is a fixed 128-byte bitmap (1024 bits); we set the
+                // low 64 CPUs from `mask` in word 0 and leave the rest zeroed.
+                u64[16] cpuset = default;
+                cpuset[0] = mask;
+                os.posix.pthread_setaffinity_np(h->_os, (win_size)128, &cpuset[0]);
+            }
+        }
+    }
+
+    // True where thread_set_affinity actually pins (Windows, Linux); false on
+    // macOS where it is a no-op. Lets callers pick QoS steering instead.
+    bool thread_affinity_supported() {
+        if const (__WINDOWS__) { return true; }
+        else {
+            if const (__MACOS__) { return false; }
+            else { return true; }
+        }
+    }
+
+    // Set the QoS class of the CURRENT thread (macOS only). Self-only because
+    // Darwin cannot change another thread's QoS after creation - so this must be
+    // called from the target thread. No-op / harmless on other platforms.
+    void thread_set_qos_self(int qos) {
+        if const (__MACOS__) {
+            os.posix.pthread_set_qos_class_self_np((i32)qos, (i32)0);
         }
     }
 

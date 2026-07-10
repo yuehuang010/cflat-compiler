@@ -89,7 +89,7 @@ int taskCancellable(move void* raw, stop_token tok) {
     CancelCtx* c = (CancelCtx*)raw;
     while (!tok.stop_requested()) {
         c->iterations->increment();
-        os.windows.SwitchToThread();
+        os.thread_yield();
     }
     *c->sawCancel = true;
     return 0;
@@ -347,7 +347,7 @@ bool testCancellation() {
     // would set stop before the loop ran even one iteration, leaving
     // iterations==0 and failing spuriously.  Spinning on the first increment
     // makes "ran some iterations" deterministic.
-    while (iterations.read() == 0) { os.windows.SwitchToThread(); }
+    while (iterations.read() == 0) { os.thread_yield(); }
     h->cancel();
     h->wait();
 
@@ -899,6 +899,28 @@ bool testCpuTopology() {
     result &= Test("cpu_mask_numa nonzero in range", numaHelperNonZero, true);
     result &= Test("cpu_mask_numa(-1) == 0", (int)cpu_mask_numa(-1), 0);
     result &= Test("cpu_mask_numa(numaCount) == 0", (int)cpu_mask_numa(cpu_numa_count()), 0);
+
+    // QoS mapping: an empty mask is always QOS_CLASS_UNSPECIFIED (0).
+    result &= Test("cpu_qos_for_mask(0) == 0", cpu_qos_for_mask(0), 0);
+
+    if const (__MACOS__) {
+        // Apple Silicon is not SMT, so physical == logical here.
+        result &= Test("macos physicalCount == logicalCount", (int)(topo->physicalCount == topo->logicalCount), 1);
+        result &= Test("macos perf cores non-zero", (int)(cpu_mask_perf_cores() != (u64)0), 1);
+        result &= Test("macos llc count >= 1", topo->llcCount >= 1, true);
+        // On a >1-core-class box (P + E, i.e. 2 perflevels) the efficiency set is
+        // non-empty and disjoint from the perf set.
+        bool twoClasses = false;
+        int e = 1;
+        while (e < topo->physicalCount) {
+            if (topo->coreEff[e] != topo->coreEff[0]) { twoClasses = true; }
+            e = e + 1;
+        }
+        if (twoClasses) {
+            result &= Test("macos eff cores non-zero", (int)(cpu_mask_efficiency_cores() != (u64)0), 1);
+            result &= Test("macos perf/eff disjoint", (int)((cpu_mask_perf_cores() & cpu_mask_efficiency_cores()) == (u64)0), 1);
+        }
+    }
 
     return result;
 }

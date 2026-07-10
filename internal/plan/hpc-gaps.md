@@ -169,9 +169,47 @@ bit-identical results outside the region.
 ## G5. Topology-aware CPU masks
 
 Detailed plan: internal/plan/hpc-g5-topology-masks.md (2026-07-09).
-Pure library change (new core/topology.cb + os.windows.cb externs);
-Windows-only by design - POSIX setAffinity is a no-op today, so the
-POSIX branch just compiles with a degraded uniform topology.
+Pure library change (new core/topology.cb + os.windows.cb externs).
+
+POSIX PARITY DONE 2026-07-10 (agents): the original G5 was Windows-only
+by design. Now all three platforms do a real walk.
+- Linux: sysfs (cpu/online -> the online set, NOT 0..nproc-1, which is
+  wrong under isolcpus/offlined cores; thread_siblings_list collapses SMT;
+  cache/indexN highest level >=2 -> LLC; node/online + node/nodeN/cpulist
+  for sparse NUMA ids). coreEff approximated from ARM cpu_capacity rank,
+  else Intel cpu_core/cpu_atom, else uniform 0.
+  Affinity: real, via pthread_setaffinity_np (128-byte cpu_set_t).
+- macOS: sysctlbyname hw.physicalcpu / hw.logicalcpu / hw.nperflevels /
+  hw.perflevelN.{physicalcpu,logicalcpu,cpusperl2}. perflevel 0 is the
+  MOST performant, so coreEff = nperflevels-1-level. LLC domain = each
+  perflevel's cpusperl2 cluster. Mask bits are SYNTHETIC (perflevel order,
+  no OS-visible CPU numbering) because...
+  Affinity: NONE. Darwin has no CPU affinity API (thread_affinity_policy
+  returns KERN_NOT_SUPPORTED on Apple Silicon). thread_set_affinity is an
+  honest no-op; os.thread_affinity_supported() lets callers branch. The
+  actionable lever is QoS: cpu_qos_for_mask(mask) -> QOS_CLASS_BACKGROUND
+  (mask subset of eff cores) / USER_INTERACTIVE (subset of perf cores) /
+  0 otherwise, INCLUDING on any uniform single-core-class machine, where
+  there is no P/E split to express and promoting QoS would be an
+  unrequested side effect. ThreadPool workers call os.thread_set_qos_self()
+  on entry when _pinMask != 0 (QoS is self-only on Darwin).
+
+Verified on this Apple Silicon box (18 logical = 6 P + 12 E, 2 perflevels):
+snapshot exactly matches sysctl - physicalCount=18, llcCount=3 (P cluster +
+two 6-core E L2 clusters), perf=0x3f, eff=0x3ffc0, qos(perf)=0x21,
+qos(eff)=0x09. test_threadpool REMOVED from test.sh's SKIP list and now
+runs green (test.sh Release: 158 passed / 0 failed / 17 skipped, up from
+157/0/18). All four targets (win64/win32/linux/macos) type-check and
+code-gen via --platform cross-targeting from macOS.
+
+NOT VERIFIED: the Linux path has never been RUN (no Linux host or container
+runtime on the Mac); it is compile- and codegen-checked only, plus its
+cpulist parser was extracted and unit-exercised natively against real sysfs
+strings (ranges, sparse lists, empty, reversed, >=64 clamp). Windows was
+not rebuilt; its code path is semantically unchanged (mechanical
+_topo_build_windows -> _topo_build rename + _topo_llc_mask_seen hoisted to
+file scope) and still type-checks/codegens for win64+win32.
+Re-run test.bat on Windows and test.sh on WSL before trusting either.
 
 G5 DONE 2026-07-09 (agent): CpuTopology snapshot (RelationAll Ex-walk,
 SDK-verified offsets, L3 dedupe, lazy-mutex memoized) + cpu_mask_physical/

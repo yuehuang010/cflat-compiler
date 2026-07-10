@@ -5,6 +5,7 @@ import "atomic.cb";
 import "mutex.cb";
 import "channel.cb";
 import "time.cb";
+import "topology.cb";
 
 // Yield the rest of this thread's time slice. Used by the pool's spin-wait
 // fallbacks.
@@ -195,6 +196,9 @@ struct Task {
 struct WorkerStartCtx {
     WorkerCtx* wctx = nullptr;
     int        slot = 0;
+    // macOS QoS class for this worker (0 = leave default). Set from the pin mask
+    // at start time; applied by the worker itself (QoS is self-only on Darwin).
+    int        qos  = 0;
 };
 
 // --- WorkerCtx ----------------------------------------------------------------
@@ -419,6 +423,9 @@ class ThreadPool {
             WorkerStartCtx* sc = new WorkerStartCtx();
             sc->wctx = &_ctx;
             sc->slot = i;
+            // Derive a macOS QoS class from this worker's pinned core set (the
+            // actionable pinning lever on Darwin, where setAffinity is a no-op).
+            if (_pinMask != (u64)0) { sc->qos = cpu_qos_for_mask(__threadpool_nth_core(_pinMask, i)); }
             _workers[i].start(__threadpool_worker, sc, _fpConfig);   // ownership transfers to worker
             if (_pinMask != (u64)0) {
                 _workers[i].setAffinity(__threadpool_nth_core(_pinMask, i));
@@ -646,6 +653,7 @@ class ThreadPool {
                 WorkerStartCtx* sc = new WorkerStartCtx();
                 sc->wctx = &_ctx;
                 sc->slot = j;
+                if (_pinMask != (u64)0) { sc->qos = cpu_qos_for_mask(__threadpool_nth_core(_pinMask, j)); }
                 _workers[j].start(__threadpool_worker, sc, _fpConfig);   // ownership transfers to worker
                 if (_pinMask != (u64)0) {
                     _workers[j].setAffinity(__threadpool_nth_core(_pinMask, j));
@@ -848,7 +856,12 @@ int __threadpool_worker(move void* raw) {
     WorkerStartCtx* ws   = (WorkerStartCtx*)raw;
     WorkerCtx*      wctx = ws->wctx;
     int             slot = ws->slot;
+    int             qos  = ws->qos;
     delete ws;
+
+    // Apply the macOS QoS steer from this thread (QoS is self-only on Darwin);
+    // no-op on other platforms and when unpinned (qos == 0).
+    if (qos != 0) { os.thread_set_qos_self(qos); }
 
     stop_token poolStop = wctx->stop->get_token();
     stop_token myStop   = wctx->workerStops[slot].get_token();

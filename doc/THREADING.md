@@ -116,10 +116,12 @@ i32 code = t.join();   // 42
 | `start(fn, move ctx, fpConfig = 0)` | `bool` | move overload - ownership of `ctx` transfers to the thread (the caller's pointer is auto-nulled), and `fn` (typed `int(move void*)`) frees it. Same optional `fpConfig` as the borrow overload. |
 | `join()` | `i32` | block until the thread exits; returns its exit code and releases the handle. |
 | `try_join(i32 ms)` | `bool` | block up to `ms`; returns `true` and cleans up if the thread exited, `false` on timeout (handle left intact). |
-| `setAffinity(u64 mask)` | - | pin the thread to a CPU set; `mask` is a bitmask of allowed cores (`1` = core 0, `2` = core 1, `3` = cores 0+1, ...). Call after `start()`, before `join()`. |
+| `setAffinity(u64 mask)` | - | pin the thread to a CPU set; `mask` is a bitmask of allowed cores (`1` = core 0, `2` = core 1, `3` = cores 0+1, ...). Call after `start()`, before `join()`. No-op on macOS - see below. |
 | `terminate()` | - | forcibly kill the thread; leaks anything it held. Use only when cooperative cancellation (`stop_token`) is impossible. |
 
 **Affinity** matters for performance work: pinning a producer and consumer (or per-core HPC workers) to separate physical cores avoids OS scheduling jitter and cross-core cache bouncing.
+
+Affinity is real on Windows (`SetThreadAffinityMask`) and Linux (`pthread_setaffinity_np`), and a **no-op on macOS**, which has no CPU affinity API. Test `os.thread_affinity_supported()` to branch. On macOS the equivalent lever is the QoS class - `os.thread_set_qos_self(qos)`, set from the target thread itself - which steers it onto the performance or efficiency cluster; `cpu_qos_for_mask()` in `topology.cb` converts a core mask into the right QoS class, and `ThreadPool` applies it automatically when `pinMask` is set. See [HPC.md](HPC.md).
 
 ```c
 Thread t;

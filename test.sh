@@ -71,7 +71,7 @@ rm -rf "$RES"; mkdir -p "$RES"
 
 # Windows-only .cb tests - see header comment for the category of each.
 SKIP="test_helper \
-  test_basic test_threadpool test_stream \
+  test_basic test_stream \
   test_c_interop test_reflect test_collection_leaks test_crt \
   test_windows test_windows_cache test_winmd \
   test_fpenv \

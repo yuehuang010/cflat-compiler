@@ -198,7 +198,9 @@ struct Thread {
         return false;
     }
 
-    // Pin this thread to a CPU affinity mask (Win32 SetThreadAffinityMask).
+    // Pin this thread to a CPU affinity mask. Windows: SetThreadAffinityMask;
+    // Linux: pthread_setaffinity_np; macOS: no-op (Darwin has no affinity API -
+    // use os.thread_set_qos_self, see topology.cb cpu_qos_for_mask).
     // mask is a bitmask of allowed cores: 1 = core 0, 2 = core 1, 3 = cores 0+1, etc.
     // Call after start() and before join(). No-op if the thread has not been started.
     void setAffinity(u64 mask) {

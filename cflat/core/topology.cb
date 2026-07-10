@@ -7,17 +7,24 @@
 // CCXs) cpu_mask_lowest(8) can span both core classes and both LLC domains -
 // exactly the jitter pinning exists to remove.
 //
-// Scope: Windows-only walk. os.cb's POSIX thread_set_affinity is an explicit
-// no-op ("POSIX: not ported"), so a topology-aware mask is not actionable
-// there yet; the POSIX branch below still compiles and returns a uniform
-// synthetic topology (same shape os.cb uses for its own Windows/POSIX split)
-// so callers never see a zero mask. Porting affinity + a real POSIX topology
-// walk (sysfs) is a separate future item.
+// Scope: three platforms.
+//   Windows - GetLogicalProcessorInformationEx(RelationAll) walk; masks map to
+//     real CPUs and thread_set_affinity pins to them.
+//   Linux   - sysfs walk (/sys/devices/system/cpu, /sys/devices/system/node);
+//     masks map to real CPUs and thread_set_affinity pins to them.
+//   macOS   - sysctlbyname (hw.physicalcpu / hw.perflevelN.*). Darwin has NO
+//     CPU affinity API, so the logical-CPU bit indices here are SYNTHETIC and
+//     INFORMATIONAL - they do NOT map to real CPUs and setAffinity is a no-op.
+//     The actionable lever on macOS is QoS class steering (cpu_qos_for_mask +
+//     os.thread_set_qos_self); topology is used only to classify a mask as
+//     perf vs efficiency for that purpose.
+// Any parse/query failure on any platform degrades to _topo_build_uniform (a
+// synthetic 1-CPU-per-core topology), never to a zero mask that would un-pin.
 //
-// Limit: masks are a bare u64, so only the first 64 logical processors in
-// Windows processor group 0 are represented. Machines with >64 logical
-// processors (multiple processor groups) are not supported here - same
-// implicit limit cpu_mask_lowest already had.
+// Limit: masks are a bare u64, so only the first 64 logical processors (on
+// Windows, processor group 0) are represented. Machines with >64 logical
+// processors are not fully covered here - same implicit limit cpu_mask_lowest
+// already had.
 
 import "os.cb";
 import "mutex.cb";
@@ -64,19 +71,20 @@ void _topo_build_uniform(CpuTopology* topo) {
     topo->numaMask[0] = all;
 }
 
-if const (__WINDOWS__) {
-
-    // True if `m` already appears in topo->llcMask[0..llcCount-1]; RelationCache
-    // records repeat per L3 subunit (one per CCX slice sharing the same cache),
-    // so identical masks must be deduped rather than double-counted.
-    bool _topo_llc_mask_seen(CpuTopology* topo, u64 m) {
-        int i = 0;
-        while (i < topo->llcCount) {
-            if (topo->llcMask[i] == m) { return true; }
-            i = i + 1;
-        }
-        return false;
+// True if `m` already appears in topo->llcMask[0..llcCount-1]. LLC records can
+// repeat (Windows RelationCache per L3 subunit; Linux per-CPU shared_cpu_list),
+// so identical masks must be deduped rather than double-counted. Shared by the
+// Windows and Linux walks.
+bool _topo_llc_mask_seen(CpuTopology* topo, u64 m) {
+    int i = 0;
+    while (i < topo->llcCount) {
+        if (topo->llcMask[i] == m) { return true; }
+        i = i + 1;
     }
+    return false;
+}
+
+if const (__WINDOWS__) {
 
     // Walk one GetLogicalProcessorInformationEx(RelationAll) buffer and populate
     // `topo`. Returns true if at least one physical-core record was found.
@@ -148,7 +156,7 @@ if const (__WINDOWS__) {
     // Windows snapshot: one GetLogicalProcessorInformationEx(RelationAll) call,
     // one buffer walk. Falls back to the uniform synthetic topology if the
     // query fails or finds no physical-core records.
-    void _topo_build_windows(CpuTopology* topo) {
+    void _topo_build(CpuTopology* topo) {
         u32 len = 0;
         os.windows.GetLogicalProcessorInformationEx((u32)0xFFFF, nullptr, &len);   // query size
         if (len == 0) { _topo_build_uniform(topo); return; }
@@ -186,11 +194,399 @@ if const (__WINDOWS__) {
 
 } else {
 
-    // POSIX: affinity itself is unported (os.cb thread_set_affinity is a
-    // no-op there), so a real topology walk is not actionable yet. Degrade to
-    // the uniform synthetic topology; see the file header comment.
-    void _topo_build_windows(CpuTopology* topo) {
-        _topo_build_uniform(topo);
+    // Append the NUL-terminated string `s` to `out` starting at `pos`; returns
+    // the new position. Does not write a terminator (caller does).
+    int _str_append(i8* out, int pos, const char* s) {
+        int i = 0;
+        while (s[i] != 0) { out[pos] = s[i]; pos = pos + 1; i = i + 1; }
+        return pos;
+    }
+    // Append the decimal digits of the non-negative int `v` to `out` at `pos`.
+    int _int_append(i8* out, int pos, int v) {
+        if (v >= 10) { pos = _int_append(out, pos, v / 10); }
+        out[pos] = (i8)('0' + (v % 10));
+        return pos + 1;
+    }
+    // Index of the lowest set bit of `m` (0..63); 0 if m == 0.
+    int _lowest_bit_index(u64 m) {
+        int i = 0;
+        while (i < 64) {
+            if ((m & ((u64)1 << i)) != (u64)0) { return i; }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    if const (__MACOS__) {
+
+        // Read an integer sysctl by name into *out (oldlen = 4 bytes). Darwin
+        // exposes hw.* topology counts as C ints; false if the name is absent.
+        bool _sysctl_i32(const char* name, i32* out) {
+            i32 val = 0;
+            win_size len = 4;
+            win_int rc = os.posix.sysctlbyname(name, &val, &len, nullptr, (win_size)0);
+            if (rc != 0) { return false; }
+            out[0] = val;
+            return true;
+        }
+
+        // Build "hw.perflevelN.<suffix>" into `out` (NUL-terminated).
+        void _perflevel_name(i8* out, int level, const char* suffix) {
+            int p = 0;
+            p = _str_append(out, p, "hw.perflevel");
+            p = _int_append(out, p, level);
+            p = _str_append(out, p, ".");
+            p = _str_append(out, p, suffix);
+            out[p] = (i8)0;
+        }
+
+        // macOS snapshot via sysctl. Apple perflevel 0 is the MOST performant;
+        // Windows coreEff semantics are "higher = more performant", so we invert
+        // the level index. Bit indices are synthetic (see file header). Any query
+        // shape we cannot represent degrades to the uniform topology.
+        void _topo_build(CpuTopology* topo) {
+            i32 logical = 0;
+            i32 physical = 0;
+            if (!_sysctl_i32("hw.logicalcpu", &logical)) { _topo_build_uniform(topo); return; }
+            if (!_sysctl_i32("hw.physicalcpu", &physical)) { _topo_build_uniform(topo); return; }
+            if (logical <= 0 || physical <= 0) { _topo_build_uniform(topo); return; }
+            if (logical > 64) { logical = 64; }
+
+            i32 nlevels = 0;
+            if (!_sysctl_i32("hw.nperflevels", &nlevels) || nlevels <= 0) {
+                _topo_build_uniform(topo); return;
+            }
+
+            int coreIdx = 0;   // running physical-core index / synthetic bit index
+            int llcIdx  = 0;
+            int level   = 0;
+            while (level < nlevels) {
+                i8[64] nameLog  = default;
+                i8[64] namePhys = default;
+                i8[64] nameL2   = default;
+                _perflevel_name(&nameLog[0], level, "logicalcpu");
+                _perflevel_name(&namePhys[0], level, "physicalcpu");
+                _perflevel_name(&nameL2[0], level, "cpusperl2");
+                i32 lLog = 0;
+                i32 lPhys = 0;
+                i32 lL2 = 0;
+                if (!_sysctl_i32(&nameLog[0], &lLog))  { _topo_build_uniform(topo); return; }
+                if (!_sysctl_i32(&namePhys[0], &lPhys)) { _topo_build_uniform(topo); return; }
+                if (!_sysctl_i32(&nameL2[0], &lL2) || lL2 <= 0) { lL2 = lPhys; }
+                if (lLog <= 0 || lPhys <= 0) { _topo_build_uniform(topo); return; }
+                // Apple Silicon is not SMT: a level with logical > physical would
+                // need a sibling layout we cannot infer - degrade rather than guess.
+                if (lLog > lPhys) { _topo_build_uniform(topo); return; }
+
+                u8 eff = (u8)(nlevels - 1 - level);
+                int inCluster = 0;
+                u64 clusterMask = (u64)0;
+                int c = 0;
+                while (c < lPhys) {
+                    if (coreIdx >= 64) { _topo_build_uniform(topo); return; }
+                    u64 bit = (u64)1 << coreIdx;
+                    topo->coreMask[coreIdx] = bit;   // single bit: no SMT siblings
+                    topo->coreEff[coreIdx]  = eff;
+                    clusterMask = clusterMask | bit;
+                    coreIdx = coreIdx + 1;
+                    inCluster = inCluster + 1;
+                    // Close an LLC (Apple L2 cluster / CCX analog) every lL2 cores.
+                    if (inCluster >= lL2) {
+                        if (llcIdx >= 8) { _topo_build_uniform(topo); return; }
+                        topo->llcMask[llcIdx] = clusterMask;
+                        llcIdx = llcIdx + 1;
+                        clusterMask = (u64)0;
+                        inCluster = 0;
+                    }
+                    c = c + 1;
+                }
+                if (inCluster > 0) {
+                    if (llcIdx >= 8) { _topo_build_uniform(topo); return; }
+                    topo->llcMask[llcIdx] = clusterMask;
+                    llcIdx = llcIdx + 1;
+                }
+                level = level + 1;
+            }
+
+            topo->physicalCount = coreIdx;
+            topo->logicalCount  = logical;
+            topo->llcCount      = llcIdx;
+            topo->numaCount     = 1;
+            u64 all = (coreIdx >= 64) ? ~(u64)0 : (((u64)1 << coreIdx) - (u64)1);
+            topo->numaMask[0] = all;
+        }
+
+    } else {
+
+        // Read a small sysfs file into `buf` (NUL-terminated, trailing newline
+        // stripped). False if the file is missing or empty.
+        bool _sysfs_read(const char* path, i8* buf, int cap) {
+            void* f = os.posix.fopen(path, "rb");
+            if (f == nullptr) { return false; }
+            win_size n = os.posix.fread(buf, (win_size)1, (win_size)(cap - 1), f);
+            os.posix.fclose(f);
+            if (n <= (win_size)0) { return false; }
+            int len = (int)n;
+            buf[len] = (i8)0;
+            if (len > 0 && buf[len - 1] == 10) { buf[len - 1] = (i8)0; }   // strip '\n'
+            return true;
+        }
+
+        // Parse the first non-negative integer in `s` (e.g. a cpu_capacity file).
+        int _parse_int(const char* s) {
+            int i = 0;
+            int v = 0;
+            while (s[i] >= '0' && s[i] <= '9') { v = v * 10 + (int)(s[i] - '0'); i = i + 1; }
+            return v;
+        }
+
+        // Parse a Linux cpulist like "0-3,8,10-11" into a u64 mask. CPUs >= 64
+        // are ignored (u64-mask limit).
+        u64 _parse_cpu_list(const char* s) {
+            u64 mask = (u64)0;
+            int i = 0;
+            while (s[i] != 0) {
+                if (s[i] < '0' || s[i] > '9') { i = i + 1; continue; }
+                int a = 0;
+                while (s[i] >= '0' && s[i] <= '9') { a = a * 10 + (int)(s[i] - '0'); i = i + 1; }
+                int b = a;
+                if (s[i] == '-') {
+                    i = i + 1;
+                    b = 0;
+                    while (s[i] >= '0' && s[i] <= '9') { b = b * 10 + (int)(s[i] - '0'); i = i + 1; }
+                }
+                int c = a;
+                while (c <= b) {
+                    if (c < 64) { mask = mask | ((u64)1 << c); }
+                    c = c + 1;
+                }
+            }
+            return mask;
+        }
+
+        // Build "/sys/devices/system/cpu/cpuN/<suffix>".
+        void _cpu_path(i8* out, int cpu, const char* suffix) {
+            int p = 0;
+            p = _str_append(out, p, "/sys/devices/system/cpu/cpu");
+            p = _int_append(out, p, cpu);
+            p = _str_append(out, p, "/");
+            p = _str_append(out, p, suffix);
+            out[p] = (i8)0;
+        }
+        // Build "/sys/devices/system/cpu/cpuN/cache/indexK/<suffix>".
+        void _cpu_cache_path(i8* out, int cpu, int idx, const char* suffix) {
+            int p = 0;
+            p = _str_append(out, p, "/sys/devices/system/cpu/cpu");
+            p = _int_append(out, p, cpu);
+            p = _str_append(out, p, "/cache/index");
+            p = _int_append(out, p, idx);
+            p = _str_append(out, p, "/");
+            p = _str_append(out, p, suffix);
+            out[p] = (i8)0;
+        }
+        // Build "/sys/devices/system/node/nodeN/cpulist".
+        void _node_path(i8* out, int node) {
+            int p = 0;
+            p = _str_append(out, p, "/sys/devices/system/node/node");
+            p = _int_append(out, p, node);
+            p = _str_append(out, p, "/cpulist");
+            out[p] = (i8)0;
+        }
+
+        // Assign coreEff for each physical core (in coreMask order): (a) ARM
+        // cpu_capacity rank ascending; (b) Intel hybrid cpu_core=1/cpu_atom=0;
+        // (c) uniform 0. Called after physicalCount/coreMask are populated.
+        void _topo_linux_eff(CpuTopology* topo) {
+            int phys = topo->physicalCount;
+            // (a) cpu_capacity (ARM big.LITTLE): coreEff = rank of the capacity.
+            i32[64] caps = default;
+            bool haveCaps = true;
+            int i = 0;
+            while (i < phys) {
+                int firstCpu = _lowest_bit_index(topo->coreMask[i]);
+                i8[256] p = default;
+                _cpu_path(&p[0], firstCpu, "cpu_capacity");
+                i8[64] b = default;
+                if (!_sysfs_read(&p[0], &b[0], 64)) { haveCaps = false; break; }
+                caps[i] = (i32)_parse_int(&b[0]);
+                i = i + 1;
+            }
+            if (haveCaps) {
+                i = 0;
+                while (i < phys) {
+                    // rank = # of DISTINCT capacities strictly less than caps[i].
+                    int rank = 0;
+                    int v = 0;
+                    while (v < phys) {
+                        if (caps[v] < caps[i]) {
+                            bool firstOcc = true;
+                            int w = 0;
+                            while (w < v) { if (caps[w] == caps[v]) { firstOcc = false; } w = w + 1; }
+                            if (firstOcc) { rank = rank + 1; }
+                        }
+                        v = v + 1;
+                    }
+                    topo->coreEff[i] = (u8)rank;
+                    i = i + 1;
+                }
+                return;
+            }
+            // (b) Intel hybrid: cpu_core members are perf (1), cpu_atom are eff (0).
+            i8[256] cbuf = default;
+            i8[256] abuf = default;
+            bool haveCore = _sysfs_read("/sys/devices/cpu_core/cpus", &cbuf[0], 256);
+            bool haveAtom = _sysfs_read("/sys/devices/cpu_atom/cpus", &abuf[0], 256);
+            if (haveCore && haveAtom) {
+                u64 coreCpus = _parse_cpu_list(&cbuf[0]);
+                i = 0;
+                while (i < phys) {
+                    int firstCpu = _lowest_bit_index(topo->coreMask[i]);
+                    u64 bit = (u64)1 << firstCpu;
+                    if ((bit & coreCpus) != (u64)0) { topo->coreEff[i] = (u8)1; }
+                    else { topo->coreEff[i] = (u8)0; }
+                    i = i + 1;
+                }
+                return;
+            }
+            // (c) uniform: leave coreEff at its default 0 (cpu_mask_efficiency_cores
+            // then correctly returns 0).
+        }
+
+        // Linux snapshot via sysfs. Collapses SMT via thread_siblings_list,
+        // finds the highest cache level (>= 2) per core for LLC domains, and
+        // reads NUMA node cpulists. Any failure at the core stage -> uniform.
+        void _topo_build(CpuTopology* topo) {
+            // Enumerate the real online CPU set rather than assuming a dense
+            // 0..count-1 range: offline CPUs / isolcpus make sysfs indices sparse.
+            i8[256] onlineBuf = default;
+            u64 onlineMask = (u64)0;
+            if (_sysfs_read("/sys/devices/system/cpu/online", &onlineBuf[0], 256)) {
+                onlineMask = _parse_cpu_list(&onlineBuf[0]);
+            }
+            if (onlineMask == (u64)0) {
+                int logical = os.num_processors();
+                if (logical <= 0) { _topo_build_uniform(topo); return; }
+                if (logical > 64) { logical = 64; }
+                onlineMask = (logical >= 64) ? ~(u64)0 : (((u64)1 << logical) - (u64)1);
+            }
+            int logicalCount = 0;
+            u64 tOnline = onlineMask;
+            while (tOnline != (u64)0) { tOnline = tOnline & (tOnline - (u64)1); logicalCount = logicalCount + 1; }
+            topo->logicalCount = logicalCount;
+
+            // Physical cores: one entry per distinct thread_siblings_list mask.
+            int phys = 0;
+            int cpu = 0;
+            while (cpu < 64) {
+                if ((onlineMask & ((u64)1 << cpu)) == (u64)0) { cpu = cpu + 1; continue; }
+                i8[256] path = default;
+                _cpu_path(&path[0], cpu, "topology/thread_siblings_list");
+                i8[256] buf = default;
+                u64 sib = (u64)0;
+                if (_sysfs_read(&path[0], &buf[0], 256)) { sib = _parse_cpu_list(&buf[0]) & onlineMask; }
+                if (sib == (u64)0) { sib = (u64)1 << cpu; }
+                // A mask already recorded means cpu is an SMT sibling; skip it.
+                bool seen = false;
+                int k = 0;
+                while (k < phys) { if (topo->coreMask[k] == sib) { seen = true; } k = k + 1; }
+                if (!seen && phys < 64) {
+                    topo->coreMask[phys] = sib;
+                    topo->coreEff[phys]  = (u8)0;
+                    phys = phys + 1;
+                }
+                cpu = cpu + 1;
+            }
+            if (phys == 0) { _topo_build_uniform(topo); return; }
+            topo->physicalCount = phys;
+
+            // LLC domains: for the first CPU of each core, keep the highest
+            // cache level >= 2 (prefer L3, fall back to L2), dedupe masks.
+            int i = 0;
+            while (i < phys) {
+                int firstCpu = _lowest_bit_index(topo->coreMask[i]);
+                int bestLevel = 0;
+                u64 bestMask = (u64)0;
+                int idx = 0;
+                while (idx < 5) {
+                    i8[256] lpath = default;
+                    _cpu_cache_path(&lpath[0], firstCpu, idx, "level");
+                    i8[64] lbuf = default;
+                    if (_sysfs_read(&lpath[0], &lbuf[0], 64)) {
+                        int lvl = _parse_int(&lbuf[0]);
+                        if (lvl >= 2 && lvl > bestLevel) {
+                            i8[256] spath = default;
+                            _cpu_cache_path(&spath[0], firstCpu, idx, "shared_cpu_list");
+                            i8[256] sbuf = default;
+                            if (_sysfs_read(&spath[0], &sbuf[0], 256)) {
+                                u64 sm = _parse_cpu_list(&sbuf[0]);
+                                if (sm != (u64)0) { bestLevel = lvl; bestMask = sm; }
+                            }
+                        }
+                    }
+                    idx = idx + 1;
+                }
+                if (bestMask == (u64)0) { bestMask = topo->coreMask[i]; }
+                if (!_topo_llc_mask_seen(topo, bestMask) && topo->llcCount < 8) {
+                    topo->llcMask[topo->llcCount] = bestMask;
+                    topo->llcCount = topo->llcCount + 1;
+                }
+                i = i + 1;
+            }
+            if (topo->llcCount == 0) {
+                u64 all = (u64)0;
+                int a = 0;
+                while (a < phys) { all = all | topo->coreMask[a]; a = a + 1; }
+                topo->llcMask[0] = all;
+                topo->llcCount = 1;
+            }
+
+            // NUMA nodes: prefer the online-node list (tolerates sparse ids from
+            // hotplug, e.g. node0 + node2); fall back to sequential scan-until-missing.
+            i8[256] nodeOnlineBuf = default;
+            u64 nodeMask = (u64)0;
+            if (_sysfs_read("/sys/devices/system/node/online", &nodeOnlineBuf[0], 256)) {
+                nodeMask = _parse_cpu_list(&nodeOnlineBuf[0]);
+            }
+            if (nodeMask != (u64)0) {
+                int node = 0;
+                while (node < 64 && topo->numaCount < 8) {
+                    if ((nodeMask & ((u64)1 << node)) != (u64)0) {
+                        i8[256] npath = default;
+                        _node_path(&npath[0], node);
+                        i8[256] nbuf = default;
+                        if (_sysfs_read(&npath[0], &nbuf[0], 256)) {
+                            u64 nm = _parse_cpu_list(&nbuf[0]);
+                            if (nm != (u64)0) {
+                                topo->numaMask[topo->numaCount] = nm;
+                                topo->numaCount = topo->numaCount + 1;
+                            }
+                        }
+                    }
+                    node = node + 1;
+                }
+            } else {
+                int node = 0;
+                while (node < 8) {
+                    i8[256] npath = default;
+                    _node_path(&npath[0], node);
+                    i8[256] nbuf = default;
+                    if (!_sysfs_read(&npath[0], &nbuf[0], 256)) { break; }
+                    topo->numaMask[topo->numaCount] = _parse_cpu_list(&nbuf[0]);
+                    topo->numaCount = topo->numaCount + 1;
+                    node = node + 1;
+                }
+            }
+            if (topo->numaCount == 0) {
+                u64 all = (u64)0;
+                int a = 0;
+                while (a < phys) { all = all | topo->coreMask[a]; a = a + 1; }
+                topo->numaMask[0] = all;
+                topo->numaCount = 1;
+            }
+
+            _topo_linux_eff(topo);
+        }
+
     }
 
 }
@@ -203,7 +599,7 @@ CpuTopology* cpu_topology() {
     g_topologyLock.acquire();
     if (g_topology == nullptr) {
         CpuTopology* topo = new CpuTopology;
-        _topo_build_windows(topo);
+        _topo_build(topo);
         g_topology = topo;
     }
     g_topologyLock.release();
@@ -293,4 +689,22 @@ u64 cpu_mask_numa(int node) {
     CpuTopology* topo = cpu_topology();
     if (node < 0 || node >= topo->numaCount) { return (u64)0; }
     return topo->numaMask[node];
+}
+
+// The macOS QoS class that best expresses `mask` (0 == QOS_CLASS_UNSPECIFIED,
+// 0x09 == BACKGROUND, 0x21 == USER_INTERACTIVE). A mask confined to the
+// efficiency cores maps to BACKGROUND; one confined to the perf cores maps to
+// USER_INTERACTIVE; anything else leaves the thread at its default (0). On a
+// uniform machine (no P/E core-class split) there is nothing for QoS to
+// express, so this always returns 0. On non-macOS this still computes but
+// only threadpool's macOS path consumes it, since affinity is the actionable
+// lever elsewhere.
+int cpu_qos_for_mask(u64 mask) {
+    if (mask == (u64)0) { return 0; }
+    u64 eff = cpu_mask_efficiency_cores();
+    if (eff == (u64)0) { return 0; }   // uniform machine: no P/E split to express
+    if ((mask & ~eff) == (u64)0) { return 0x09; }
+    u64 perf = cpu_mask_perf_cores();
+    if ((mask & ~perf) == (u64)0) { return 0x21; }
+    return 0;
 }
