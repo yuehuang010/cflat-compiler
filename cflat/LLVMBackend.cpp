@@ -2348,6 +2348,7 @@ void LLVMBackend::ResetForReanalysis()
     lastCallReturnType = TypeAndValue{};
     lastCallReturnsOwned = false;
     lastOwningResult = false;
+    lastAllocAlignment = 0;
     currentFunctionReturnsOwned = false;
     // Siblings of currentFunctionReturnsOwned, set together in createFunctionBlock; an aborted
     // compile mid-function would leave them describing the prior file's last function.

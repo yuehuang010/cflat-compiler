@@ -812,7 +812,7 @@ destructorDefinition
 
 newExpression
     : New typeSpecifier ('(' argumentExpressionList ')')?
-    | New typeSpecifier '[' assignmentExpression ']'
+    | New typeSpecifier '[' assignmentExpression ']' alignmentSpecifier?
     | New typeSpecifier '{' initializerList ','? '}'
     ;
 

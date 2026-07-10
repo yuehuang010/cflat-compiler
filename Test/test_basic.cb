@@ -3214,6 +3214,23 @@ bool testAlignas()
     result &= Test("new AlignCL%64", (int)(((i64)p) & 63), 0);
     delete p;
 
+    // Per-allocation alignment: `new T[n] alignas(N)`. Allocation property only -
+    // does not change sizeof. Base address must honor the requested alignment.
+    int an = 100;
+    double[] abuf = new double[an] alignas(64);
+    result &= Test("new double[n] alignas(64) base%64", (int)(((i64)&abuf[0]) & 63), 0);
+    abuf[0]  = 1.5;
+    abuf[99] = 2.5;
+    result &= Test("aligned buf read lo", abuf[0]  == 1.5, true);
+    result &= Test("aligned buf read hi", abuf[99] == 2.5, true);
+    delete[_] abuf;   // explicit aligned free (delete path)
+
+    // Page-aligned buffer, freed by scope-exit auto-free (aligned cleanup path).
+    double[] pbuf = new double[an] alignas(4096);
+    result &= Test("new double[n] alignas(4096) base%4096", (int)(((i64)&pbuf[0]) & 4095), 0);
+    pbuf[0] = 3.5;
+    result &= Test("page-aligned buf read", pbuf[0] == 3.5, true);
+
     return result;
 }
 

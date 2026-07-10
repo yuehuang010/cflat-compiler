@@ -1,0 +1,9 @@
+// Per-allocation alignment reuses the alignas validation: N must be a power of two.
+
+extern int main()
+{
+    int n = 4;
+    expect_error("alignas: value 24 is not a power of two");
+    double[] p = new double[n] alignas(24);
+    return 0;
+}

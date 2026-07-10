@@ -639,6 +639,7 @@ public:
         llvm::Type* UnionFieldType = nullptr;  // When non-null: load/store this storage as this type (union field access).
         bool IsOwning = false;           // true for move parameters, new-allocated locals, and any owned pointer - freed on scope exit
         bool IsNewAllocated = false;     // true only for 'new'-allocated locals - enables refcount on field escape (cleared on null-source transfer)
+        uint64_t AllocAlignment = 0;     // per-allocation alignment from `new T[n] alignas(N)` (>16 = over-aligned); frees via __delete_aligned
         bool IsOwningString = false;     // true when a string local owns its heap buffer - destructor called on scope exit
         bool BorrowsOwnedString = false; // true when a string local was initialized/assigned from an owning string FIELD (a non-owning alias of a heap buffer some struct still owns) - storing it into another field would double-free, so the field-store path rejects it
         bool IsOwningStruct = false;     // true for move parameters of struct types with destructors - destructor called on scope exit
@@ -867,6 +868,7 @@ public:
     TypeAndValue lastCallReturnType;        // set by CreateOverloadedFunctionCall for post-call TypeAndValue queries
     bool lastCallReturnsOwned = false;       // set when the last call returned an owned heap string or pointer
     bool lastOwningResult = false;           // set by ParseNewExpression/ParseMoveExpression; consumed by ParseDeclaration
+    uint64_t lastAllocAlignment = 0;         // set by ParseNewExpression for `new T[n] alignas(N)` (>16); consumed by ParseDeclaration into NamedVariable.AllocAlignment
     bool currentFunctionReturnsOwned = false; // true when current function is declared with move T* or move string return type
     bool currentFunctionReturnIsArrayView = false; // true when the current function's return type is a `T[]` array-view
     std::string currentFunctionReturnTypeName; // declared return TypeName of the current function (e.g. an interface name); used to box a returned concrete pointer into the interface fat pointer
@@ -1518,14 +1520,16 @@ private:
         if (auto* dtor = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
             builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
 
-        // Call operator delete (allocator-aware) to free the pointer.
-        auto* opDel = GetFunction("operator delete");
-        if (opDel)
-        {
-            auto* voidPtrTy = builder->getInt8Ty()->getPointerTo();
-            auto* voidPtr = builder->CreateBitCast(ptrVal, voidPtrTy);
+        // Free the pointer. An over-aligned buffer (`new T[n] alignas(N)`, N>16) came
+        // from the aligned allocator, so it must be freed via __delete_aligned to match;
+        // otherwise use the allocator-aware operator delete.
+        auto* voidPtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* voidPtr = builder->CreateBitCast(ptrVal, voidPtrTy);
+        llvm::Function* alignedDel = namedVar.AllocAlignment > 16 ? GetFunction("__delete_aligned") : nullptr;
+        if (alignedDel)
+            builder->CreateCall(alignedDel->getFunctionType(), alignedDel, { voidPtr });
+        else if (auto* opDel = GetFunction("operator delete"))
             builder->CreateCall(opDel->getFunctionType(), opDel, { voidPtr });
-        }
 
         builder->CreateBr(afterBB);
         builder->SetInsertPoint(afterBB);

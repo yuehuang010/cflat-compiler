@@ -21,6 +21,7 @@ failure points you toward.
 - [`vectorize` loops](#vectorize-loops)
 - [`simd<T,N>` explicit vector type](#simdtn-explicit-vector-type)
 - [`T[]` array-view (noalias)](#t-array-view-noalias)
+- [Alignment control (`alignas`)](#alignment-control-alignas)
 - [`span<T>` (noalias) and `view<T>` (may-alias)](#spant-noalias-and-viewt-may-alias)
 - [Across-core data parallelism (`parallel_for_n` / `parallel_reduce`)](#across-core-data-parallelism-parallel_for_n--parallel_reduce)
 - [Numeric kernel libraries (`core/hpc`)](#numeric-kernel-libraries-corehpc)
@@ -354,6 +355,69 @@ To return several results from a kernel - a computed array plus auxiliary scalar
 contract, so the vectorizer proves the buffers pairwise disjoint without a runtime overlap
 check. See [Returning Multiple Results](LANGUAGE.md#returning-multiple-results) for the full
 pattern - it is a general language feature, not HPC-specific.
+
+## Alignment control (`alignas`)
+
+`alignas(N)` over-aligns a type, field, local, global, or heap allocation to `N`
+bytes (`N` a power of two, up to 4096). It has two HPC uses: killing false
+sharing between cores, and giving the vectorizer aligned buffers.
+
+### Cache-line padding (kill false sharing)
+
+Two cores writing different fields that share a cache line thrash that line back
+and forth between their L1s - the "false sharing" cliff. `alignas(64)` on a
+struct (or a field) pads it to a full cache line so per-worker slots land on
+separate lines:
+
+```c
+// Per-worker accumulator: one cache line each, so worker writes never collide.
+struct alignas(64) Accum { i64 count = 0; double sum = 0.0; };
+
+Accum[8] slots;                 // stride is 64 - slots[i] and slots[k] never share a line
+alignas(64) i64 g_counter = 0;  // a lone hot global on its own line
+```
+
+`sizeof` and `alignof` both report the padded size, and array stride follows -
+`alignas(64)` on a 12-byte struct makes `sizeof == 64` and `&a[1] - &a[0] == 64`.
+This is a layout property of the type: it applies everywhere the type is used
+(fields, locals, globals, arrays, `new`).
+
+### Aligned allocation - `new T[n] alignas(N)`
+
+An `alignas(N)` clause on an array `new` over-aligns just that allocation,
+without changing the element type's `sizeof` or stride:
+
+```c
+double[] a = new double[n] alignas(64);   // base address is a multiple of 64
+```
+
+This is an allocation property, not a type property: `sizeof(double)` is still
+8 and the buffer strides by 8. The buffer comes from the aligned allocator, so
+it must be freed by a path that knows it is over-aligned. Freeing a local it is
+bound to - either an explicit `delete[_] a;` / `delete[n] a;`, or the automatic
+scope-exit free of the owning `T[]` local - does the right thing. If you instead
+store the buffer into a struct field or hand it off elsewhere, delete it
+explicitly at that site; the aligned-free tag is tracked on the owning local,
+not on arbitrary aliases.
+
+### Assume-aligned for the vectorizer
+
+An aligned `new` also emits an alignment assumption on the returned pointer, so
+the optimizer knows the buffer is aligned and `vectorize` loops over it use
+aligned vector moves instead of unaligned ones:
+
+```c
+double[] a = new double[n] alignas(64);
+vectorize for (i64 i = 0; i < n; i = i + 1) { a[i] = a[i] * 2.0 + 1.0; }
+delete[_] a;
+```
+
+In the emitted IR the allocation carries
+`call void @llvm.assume(i1 true) [ "align"(ptr %a, i64 64) ]`, and at `-O2` the
+loop's loads and stores become `load <2 x double>, ptr %..., align 64` where the
+same loop over an unaligned buffer would show `align 8`. The vectorized code is
+correct either way; the aligned form avoids the split-load penalty on the aligned
+buffer.
 
 ## `span<T>` (noalias) and `view<T>` (may-alias)
 

@@ -6398,7 +6398,10 @@ public:
                             auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
                             nv.IsOwning = true;
                             nv.IsNewAllocated = true;
+                            // Carry per-site over-alignment so scope-exit / delete free via __delete_aligned.
+                            nv.AllocAlignment = compiler->lastAllocAlignment;
                             compiler->lastOwningResult = false;
+                            compiler->lastAllocAlignment = 0;
                         }
 
                         // Propagate bond: if the RHS was a bonded call result, tag this local.
@@ -10452,12 +10455,24 @@ public:
             sizeVal = compiler->builder->CreateMul(sizeVal, count, "arraysz");
         }
 
+        // Per-allocation alignment: `new T[n] alignas(N)`. This is an allocation
+        // property only - it must NOT change the type's sizeof/stride, so the size
+        // above stays derived from the type's effAlign. allocAlign drives the
+        // aligned operator-new route and the assume below; it is max(site, type).
+        uint64_t allocAlign = effAlign;
+        if (auto* alignSpec = ctx->alignmentSpecifier())
+        {
+            uint64_t siteAlign = ParseAlignmentSpecifier(alignSpec);
+            if (siteAlign == 0) return {};  // ParseAlignmentSpecifier already logged the reason
+            if (siteAlign > allocAlign) allocAlign = siteAlign;
+        }
+
         // Call operator new: class-specific -> global. When effective alignment
         // exceeds the default-new threshold (16 on x64), route to the 2-arg
         // overload `operator new(size, align)` so the allocator picks aligned
         // memory and the matching delete uses operator delete_aligned.
         constexpr uint64_t kDefaultNewAlign = 16;
-        bool useAligned = effAlign > kDefaultNewAlign;
+        bool useAligned = allocAlign > kDefaultNewAlign;
         llvm::Value* rawPtr = nullptr;
         std::string opNewName = typeName + ".operator new";
         LLVMBackend::NamedVariable szArg;
@@ -10467,7 +10482,7 @@ public:
         if (useAligned)
         {
             LLVMBackend::NamedVariable alignArg;
-            alignArg.Primary = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*compiler->context), effAlign);
+            alignArg.Primary = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*compiler->context), allocAlign);
             alignArg.BaseType = alignArg.Primary->getType();
             newArgs.push_back(alignArg);
         }
@@ -10487,6 +10502,12 @@ public:
 
         llvm::Type* ptrTy = elemType->getPointerTo();
         llvm::Value* typedPtr = compiler->builder->CreateBitCast(rawPtr, ptrTy, "newptr");
+
+        // Assume-aligned: tell the optimizer the buffer is aligned so LoopVectorize
+        // can emit aligned vector moves over it. Sound because operator new(size, align)
+        // returns memory aligned to allocAlign. Emit only for the array-view result.
+        if (isArray && useAligned)
+            compiler->builder->CreateAlignmentAssumption(compiler->module->getDataLayout(), typedPtr, (unsigned)allocAlign);
 
         // For array new of a class type: call default constructor for each element (like C++).
         // Skip when typeIsPtr - the element is a pointer (e.g. Point*), not a struct; calling
@@ -10560,9 +10581,12 @@ public:
         result.TypeAndValue.IsArrayView = isArray;
         result.Primary = typedPtr;
         result.BaseType = ptrTy;
+        result.AllocAlignment = useAligned ? allocAlign : 0;
         // A COM object's lifetime is refcounted via Release, not owning-pointer auto-free, so the
         // caller must NOT auto-delete it at scope exit.
         compiler->lastOwningResult = !isWinrtNew;
+        // Carry the over-alignment so the owning local's free routes to __delete_aligned.
+        compiler->lastAllocAlignment = useAligned ? allocAlign : 0;
         return result;
     }
 
@@ -10607,6 +10631,7 @@ public:
         llvm::Value* srcAlloca = nullptr;
         llvm::Type* srcAllocaElemType = nullptr;
         std::string targetName;         // name of the deleted local (empty for field/expr targets)
+        uint64_t operandAllocAlign = 0; // per-site over-alignment carried on the operand (`new T[n] alignas(N)`)
 
         // Peel leading casts so 'delete[_] (T*)p' recovers the underlying owning local and its alloca;
         // without this, a cast target drops storage/ownership info and double-frees at scope exit.
@@ -10640,6 +10665,7 @@ public:
             auto namedVar = ParseUnaryExpression(ue);
             typeName  = namedVar.TypeAndValue.TypeName;
             elemIsPtr = namedVar.TypeAndValue.ElemPointer;
+            operandAllocAlign = namedVar.AllocAlignment;
             // An interface value is a {vtable, data} fat struct, not a raw pointer; flag it so
             // the free path below extracts the data pointer and dispatches the dtor virtually.
             isInterfaceOperand = namedVar.TypeAndValue.IsInterface
@@ -10883,6 +10909,9 @@ public:
             if (t != nullptr && t->isSized())
                 deleteEffAlign = compiler->GetEffectiveAlignmentForType(typeName, t);
         }
+        // Per-site over-alignment (`new T[n] alignas(N)`) is not in the static type, so
+        // fold in the alignment carried on the operand; either source routes to __delete_aligned.
+        if (operandAllocAlign > deleteEffAlign) deleteEffAlign = operandAllocAlign;
         bool useAlignedDelete = deleteEffAlign > 16;
         if (!typeName.empty() && compiler->GetFunction(opDelName))
         {
