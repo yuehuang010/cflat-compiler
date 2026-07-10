@@ -17,9 +17,9 @@ P13 (hardening + API-freeze prep) - the compiler-workaround removal sweep, keybo
 + minimal a11y audit, relayout/theming hardening, a seeded reconcile stress-soak, and the
 doc/UI.md v1.0-rc freeze. P14 core/ promotion (as `ui_native`) is DONE. Replanned 2026-07-07
 (the old single P11 parity sweep split in two, promotion pushed from P12 to P14).
-CAVEAT (carried from P11, still open going into P14): macOS is COMPILE-CHECKED ONLY
-(`--check --platform macos`); no arm64 box was available, so mac RUNTIME verification of
-the gallery/fedit self-tests is DEFERRED and MUST be done before P14 signs off on mac.
+CAVEAT (carried from P11): mac RUNTIME verification is now DONE on an arm64 box - the
+gallery, fedit/fedit_jsx (incl. the P9 nav suite + New Window), and cocoa_native_settings
+self-tests all pass natively, and the Cocoa host is genuinely multi-window (2026-07-09).
 Created 2026-07-03; consolidated
 2026-07-06 (finished phases summarized; this is the single UI framework plan -
 the predecessor ui-framework-v5-sugar-widgets.md was lost with the old
@@ -304,10 +304,10 @@ Deviations / notes:
   marshal callback the host installs), NOT a NativeHost interface method - a Lambda-typed
   interface/hook parameter breaks the monomorphizer, so the closure crosses the seam as a
   u64. No WinUI3Host churn.
-- macOS multi-window + real post marshaling stay single-window / inline stubs (already
-  P11 in this plan); the Cocoa host gained the host-neutral accessors + StatusBar/tooltip
-  mapping + nativeStatusText so shared fedit compiles and its self-test passes there
-  (cflat --check --platform macos green; runtime unverified on this Windows box).
+- macOS real post marshaling landed at P11; genuine multi-window landed 2026-07-09 (Cocoa
+  host is now a window registry mirroring the Win32 `Window` class). The Cocoa host has the
+  host-neutral accessors + StatusBar/tooltip mapping + nativeStatusText so shared fedit
+  compiles and its full self-test (incl. the P9 nav suite + New Window) passes on arm64.
 - NO compiler changes. Found+filed a real compiler bug: `expr as T` on a *function-call
   result* yields an OWNING pointer that double-frees at scope exit (a named-local downcast
   is a correct borrow). Worked around with the two-step `T x = call(); U* p = x as U;` in
@@ -582,10 +582,11 @@ Part (b) - Cocoa backends (compile-checked, runtime deferred):
   `destroyControl` + `nativeTeardownForTest` (mirror of the Win32 host).
 
 Deviations / notes:
-- **Multi-window on Cocoa stays single-window** (the Win32 `Window`-class multi-window
-  model was NOT mirrored). fedit's "New Window" self-test is `if const (!__MACOS__)`-gated,
-  so this does not block the mac compile gate; real multi-window on Cocoa is carried into
-  P13/P14 hardening. Documented honestly rather than faked.
+- **Multi-window on Cocoa is DONE** (2026-07-09): the Win32 `Window`-class model is now
+  mirrored - a `list<CocoaHost*>` registry + `_cur`, a per-window `CfHostTarget`, a
+  per-window ctx.post target, and last-window-closed quits the run loop. Each callback IMP
+  re-establishes `_cur` from the event's window/target. fedit's "New Window" self-test is
+  UN-gated and its P9 nav suite now runs on macOS too (fedit + fedit_jsx --selftest 2/2).
 - **SplitView** stays a layout container (parent-tracked divider gap, same
   `nativeSplitterDrag` driver), NOT `NSSplitView` - keeps the layout model single-source
   per the plan.
@@ -620,8 +621,8 @@ stub becomes a real backend. This is the older and larger of the two parity
 debts, and doing it first hardens the host-neutral self-test drivers that
 the WinUI sweep (P12) then reuses.
 
-- **App shell (P7 debt)**: real multi-window on Cocoa (mirror the Win32
-  `Window` class over the P7 host-neutral accessors; one NSApplication run
+- **App shell (P7 debt)**: real multi-window on Cocoa is DONE (2026-07-09) -
+  mirrors the Win32 `Window` class over the P7 host-neutral accessors; one NSApplication run
   loop, list of windows) and real ctx.post() marshaling
   (performSelectorOnMainThread: or dispatch_async onto the main queue,
   same boxed-closure u64 contract; clone-in, destruct-after-call under the
@@ -952,9 +953,9 @@ element/seam changes. What landed:
 - **NO Test/test_ui.cb** (user decision) - example.bat stays the gate.
 
 CAVEAT carried forward unchanged: **macOS is COMPILE-VERIFIED ONLY**
-(`--check --platform macos` green for fedit/gallery/cocoa_native_settings); no arm64
-box was available, so mac RUNTIME verification of the gallery/fedit self-tests is
-still DEFERRED. This is the one P11 debt promotion did not close.
+(`--check --platform macos` green for fedit/gallery/cocoa_native_settings); mac RUNTIME
+verification is now DONE on an arm64 box - those self-tests pass natively and the Cocoa
+host is genuinely multi-window (2026-07-09), closing the last P11 debt.
 
 Gates (all green on Windows):
 - `cmake_build.bat release` clean; `cflat.exe --init` exit 0 (core bitcode cache rebuilt).

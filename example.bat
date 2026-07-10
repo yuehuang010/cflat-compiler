@@ -301,7 +301,7 @@ REM example/macos/* target Darwin (dlopen of AppKit, sysctl, libproc; framework_
 REM uses `import framework` + Darwin SDK headers) and are excluded from this Windows run;
 REM compile them on a Mac instead.
 REM The UI framework + hosts now live in core/ (ui_native.cb, ui_native/host.cb,
-REM ui_native/win32.cb, ui_native_cocoa.cb, ui_native/winui.cb, cocoa.cb, ui_canvas/term.cb,
+REM ui_native/win32.cb, ui_native/cocoa.cb, ui_native/winui.cb, cocoa.cb, ui_canvas/term.cb,
 REM ui_canvas/win32.cb) and deploy next to the exe, so example UI demos import them with no
 REM -i. The three winui demos (winui_app_demo,
 REM winui_demo, winui_gallery) need the Windows App SDK bootstrapper + runtime winmds and are

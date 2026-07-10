@@ -118,7 +118,7 @@ Method-level API discovery is via the LSP (hover / completion / `--symbol`); thi
 | `ui_native.cb` | The `ui_native` framework: `Element` tree, keyed reconciler, `Component`, `Theme`, `<View/>` sugar, `Canvas`, and the `NativeHost` seam (interface + `PROP_*`/`FONT_*`/`LISTOP_*` consts). The one module apps import |
 | `ui_native/host.cb` | `if const` platform shim: selects the Win32 host on Windows, the Cocoa host on macOS. Apps import this for real OS controls |
 | `ui_native/win32.cb` | Win32/GDI `NativeHost` backend (common controls, DPI, dark titlebar, menus, dialogs). Imports `windows.h` - Windows-only |
-| `ui_native_cocoa.cb` | macOS AppKit (Cocoa) `NativeHost` backend. Imports `cocoa.cb`; compile-verified via `--check --platform macos` |
+| `ui_native/cocoa.cb` | macOS AppKit (Cocoa) `NativeHost` backend. Imports `cocoa.cb` (the objc bridge, not itself); runtime-verified on arm64 |
 | `ui_native/winui.cb` | WinUI 3 (Windows App SDK) `NativeHost` backend. Imports the App SDK runtime winmds via `package-nuget` |
 | `cocoa.cb` | Minimal Objective-C / AppKit bridge (dlopen/objc_msgSend, typed `msg*` casts). Dependency of the Cocoa host; macOS-only |
 | `ui_canvas/term.cb` | Terminal (TUI) `Canvas` host: `runApp`/`flushFrame`, double-buffered `Surface` diff-repaint. Portable |

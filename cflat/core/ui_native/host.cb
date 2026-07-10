@@ -4,16 +4,11 @@
 // backend; the compile-time platform switch selects the Win32 host on Windows and
 // the AppKit (Cocoa) host on macOS. Both expose the identical public surface
 // (runAppGuiNative, buildNativeTree, menu*, native* dialogs, the driver API, the
-// _nHost/_nApp/_nCtx globals), so a single app source compiles against either.
+// window registry + activeCtx/activeApp), so a single app source compiles against either.
 //
 // Precedent for a file-scope `if const` import shim: cflat/core/os.cb.
-//
-// The Cocoa backend still lives flat at core/ui_native_cocoa.cb while the other two
-// backends moved into this directory. Historical only: it bare-imports the objc bridge
-// core/cocoa.cb, which used to self-resolve if the backend were named ui_native/cocoa.cb.
-// The import resolver no longer does that, so moving it in is safe whenever it is worth it.
 if const (__MACOS__) {
-    import "ui_native_cocoa.cb";
+    import "ui_native/cocoa.cb";
 } else {
     import "ui_native/win32.cb";
 }

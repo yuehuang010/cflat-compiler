@@ -1,4 +1,4 @@
-// core/ui_native_cocoa.cb - a native macOS (AppKit) host that drives REAL OS controls.
+// core/ui_native/cocoa.cb - a native macOS (AppKit) host that drives REAL OS controls.
 //
 // This is the macOS counterpart of ui_native/win32.cb: the NativeHost output
 // stage of the CFlat UI framework (see ui_native.cb). The reconciled Element tree's
@@ -16,6 +16,9 @@
 // machinery is dropped here).
 //
 // This file has no main(); an app imports it and calls runAppGuiNative().
+//
+// "cocoa.cb" below is the objc bridge at core/cocoa.cb, NOT this file: the importing
+// file's own directory is probed first, but the resolver rejects self-resolution.
 import "ui_native.cb";
 import "cocoa.cb";
 
@@ -41,16 +44,13 @@ struct RectD
     double h = 0.0;
 };
 
-// -- The running app + its tree + context, reached from the free-function IMPs
-// (a plain objc callback cannot capture `this`). Single window / single thread, so
-// these host globals are the right tool; they live in the HOST file, not ui.cb.
-CocoaHost _nHost  = default;
-Component _nApp   = default;
-Element   _nTree  = default;
-UiContext _nCtx   = default;
-bool      _nReady = false;
-int       _nW     = 95;   // client size in DIP units (760pt / 8)
-int       _nH     = 21;   // 560pt / 26
+// -- App-wide host state (NOT per-window) -------------------------------------
+// This host is genuinely multi-window: each top-level window is a CocoaHost in the
+// owning registry `_windows`, and `_cur` is the window currently being serviced. The
+// free-function IMPs (a plain objc callback cannot capture `this`) re-establish `_cur`
+// at entry by resolving the event's window/target to its registry index, then reach
+// the servicing window through curWin(). The NSApplication delegate is process-global.
+void* _appDelegate = nullptr;
 
 // -- Declarative menu bar -----------------------------------------------------
 // Same surface + globals as the Win32 host. Parallel lists (not a struct with a
@@ -68,11 +68,13 @@ Lambda<void(int)>     _menuHandler    = default;   // app's command dispatcher
 Lambda<bool()>        _closeQuery     = default;
 bool                  _hasCloseQuery  = false;
 
+// macOS has ONE app-wide main menu bar (unlike Win32's per-HWND HMENU), so buildMenuBar
+// is idempotent: it realizes the declared menu once, then every window shares it.
+bool                  _menuBuilt      = false;
+void*                 _menuTarget     = nullptr;   // app-wide onMenu: target (see buildMenuBar)
+
 void setMenuHandler(Lambda<void(int)> h) { _menuHandler = h; }
 void setCloseQuery(Lambda<bool()> q) { _closeQuery = q; _hasCloseQuery = true; }
-
-int hostWidth()  { return _nW; }
-int hostHeight() { return _nH; }
 
 void* u2h(u64 u) { return (void*)u; }
 
@@ -135,10 +137,17 @@ class CocoaHost : NativeHost
 {
     void* window      = nullptr;
     void* contentView = nullptr;   // the flipped CfFlippedView
-    void* target      = nullptr;   // shared CfHostTarget (control + menu + window delegate)
-    void* appDelegate = nullptr;
+    void* target      = nullptr;   // this window's CfHostTarget (control + delegate + dataSource)
     bool  applying    = false;     // guard: swallow self-inflicted change notifications
     bool  dark        = false;     // last applied theme was dark
+    // Per-window app + tree + context (mirror of the Win32 Window). The registry owns
+    // the window and it owns its app Component; freed in dispose().
+    Component app   = default;
+    Element   tree  = default;
+    UiContext ctx   = default;
+    bool      ready = false;
+    int       w     = 95;   // client size in DIP units (760pt / 8)
+    int       h     = 21;   // 560pt / 26
     list<string> liveKeys    = default;   // keys with a live control this frame
     list<u64>    liveHandles = default;   // parallel handles (NSView* as u64)
 
@@ -882,9 +891,9 @@ class CocoaHost : NativeHost
 
     void requestLayout()
     {
-        if (!_nReady) return;
-        layoutRoot(_nTree, 0, 0, _nW);
-        this.applyTree(_nTree, &_nCtx);
+        if (!this.ready) return;
+        layoutRoot(this.tree, 0, 0, this.w);
+        this.applyTree(this.tree, &this.ctx);
     }
 
     // Reconcile the Element tree to native controls: ensure a control per mappable
@@ -1164,8 +1173,8 @@ class CocoaHost : NativeHost
     // Win32 host feeds NM_CUSTOMDRAW is applied here through bezelColor (look policy).
     void _syncButtonAccent(u64 h, Button* b)
     {
-        int abg = pickColor(b.backgroundColor, _nCtx.theme.buttonBg);
-        int afg = pickColor(b.color, _nCtx.theme.buttonText);
+        int abg = pickColor(b.backgroundColor, this.ctx.theme.buttonBg);
+        int afg = pickColor(b.color, this.ctx.theme.buttonText);
         this.setAccent(h, afg, abg);
     }
 
@@ -1236,7 +1245,103 @@ class CocoaHost : NativeHost
             msg1(this.window, "setAppearance:", ap);
         }
     }
+
+    // Free this window's owned cflat + objc state (tree, component, boxes, lists) and
+    // release the NSWindow. `sendClose` is false when called from windowWillClose:
+    // (AppKit is already closing the window). Nil the delegate BEFORE close so -close
+    // does not re-enter windowWillClose: and recurse into destroyWindowStateAt.
+    void dispose(bool sendClose)
+    {
+        if (this.ready) { Element t = this.tree; deleteTree(t); this.ready = false; }
+        if (this.app != nullptr) { Component a = this.app; this.app = nullptr; delete a; }
+        // Free the host-owned boxes (the destroyControl path does not run for a window
+        // closing wholesale). The parallel lists + ctx.nativeByKey are value fields freed
+        // automatically when `delete owned` runs this window's destructor.
+        { int i = 0; while (i < this.listBoxPtrs.count()) { u64 b = this.listBoxPtrs.get(i); if (b != 0u) __uiFreeListRowBox(b); i++; } }
+        { int i = 0; while (i < this.treeBoxPtrs.count()) { u64 b = this.treeBoxPtrs.get(i); if (b != 0u) __uiFreeTreeBox(b); i++; } }
+        { int i = 0; while (i < this.canvasBoxes.count()) { u64 b = this.canvasBoxes.get(i); if (b != 0u) __uiFreeCanvasBox(b); i++; } }
+        { int i = 0; while (i < this.ctxMenus.count()) { u64 b = this.ctxMenus.get(i); if (b != 0u) __uiFreeContextMenu(b); i++; } }
+        this.listBoxHandles.clear(); this.listBoxPtrs.clear();
+        this.treeBoxHandles.clear(); this.treeBoxPtrs.clear();
+        this.canvasHandles.clear();  this.canvasBoxes.clear();
+        this.ctxKeys.clear();        this.ctxMenus.clear();
+        if (this.window != nullptr)
+        {
+            msg1(this.window, "setDelegate:", nullptr);   // do not re-enter windowWillClose:
+            if (sendClose) msg0(this.window, "close");
+            msg0(this.window, "release");                 // setReleasedWhenClosed: was false
+            this.window = nullptr;
+        }
+        if (this.target != nullptr) { msg0(this.target, "release"); this.target = nullptr; }
+        this.contentView = nullptr;
+    }
 };
+
+// -- App-wide window registry + the "current" window --------------------------
+// The list OWNS the windows; app code reaches the servicing one by index (_cur). We
+// never bind a CocoaHost* to a long-lived variable (an owning class pointer auto-frees
+// at scope exit and cannot be re-aliased), so curWin() returns a borrow via `alias`.
+// _windows.add(fresh) MOVES ownership in; only _windows.take(idx) transfers it back out.
+list<CocoaHost*> _windows = default;
+int              _cur     = 0 - 1;   // index into _windows of the servicing window
+
+alias CocoaHost* curWin() { return _windows.get(_cur); }
+bool hasCurWin() { return _cur >= 0 && _cur < _windows.count(); }
+
+// Index of the window owning `nsWindow` / `target`, or -1 (small list; scanned per event).
+// A nil probe never matches: createAppWindow registers the entry before the NSWindow
+// exists, so a nil keyWindow / detached view must not resolve to that half-built window.
+int findWindowIdx(void* nsWindow)
+{
+    if (nsWindow == nullptr) return 0 - 1;
+    int i = 0;
+    while (i < _windows.count()) { if (_windows.get(i).window == nsWindow) return i; i++; }
+    return 0 - 1;
+}
+
+int findWindowIdxByTarget(void* target)
+{
+    if (target == nullptr) return 0 - 1;
+    int i = 0;
+    while (i < _windows.count()) { if (_windows.get(i).target == target) return i; i++; }
+    return 0 - 1;
+}
+
+// Point _cur at the window resolved from an NSView / NSWindow / CfHostTarget. Return
+// false (leaving _cur untouched) if the object does not belong to a registered window.
+bool _setCurFromView(void* v)
+{
+    void* w = msg0(v, "window");
+    int i = findWindowIdx(w);
+    if (i >= 0) { _cur = i; return true; }
+    return false;
+}
+
+bool _setCurFromWindow(void* w)
+{
+    int i = findWindowIdx(w);
+    if (i >= 0) { _cur = i; return true; }
+    return false;
+}
+
+bool _setCurFromTarget(void* s)
+{
+    int i = findWindowIdxByTarget(s);
+    if (i >= 0) { _cur = i; return true; }
+    return false;
+}
+
+// Tear down the window at `idx`: free its state, drop it from the registry, delete it.
+// `sendClose` is false when AppKit is already closing the window (windowWillClose:).
+void destroyWindowStateAt(int idx, bool sendClose)
+{
+    if (idx < 0 || idx >= _windows.count()) return;
+    _cur = idx;
+    curWin().dispose(sendClose);
+    CocoaHost* owned = _windows.take(idx);
+    delete owned;
+    _cur = _windows.count() > 0 ? 0 : (0 - 1);
+}
 
 // A Theme is "dark" when its panel background is darker than mid-gray. A default
 // (monochrome, all-zero) theme is treated as light.
@@ -1305,7 +1410,8 @@ void* _nsColorFromFramework(int color)
 // content each time). isFlipped -> YES so row 0 is at the top.
 void _canvasDrawRectImp(void* self, void* cmd, double x, double y, double w, double h)
 {
-    u64 box = _nHost._canvasBoxFor((u64)self);
+    if (!_setCurFromView(self)) return;
+    u64 box = curWin()._canvasBoxFor((u64)self);
     if (box == 0u) return;
     CocoaCanvas cv = default;
     __uiCanvasPaint(box, cv);
@@ -1316,12 +1422,14 @@ i8 _canvasIsFlippedImp(void* self, void* cmd) { return (i8)1; }
 // ── NSTableView dataSource IMPs (ListView; the boxed rowText is the item source) ──
 i64 _numberOfRowsImp(void* self, void* cmd, void* table)
 {
-    return (i64)_nHost._listRowsForTable((u64)table);
+    if (!_setCurFromTarget(self)) return (i64)0;
+    return (i64)curWin()._listRowsForTable((u64)table);
 }
 
 void* _tableObjectValueImp(void* self, void* cmd, void* table, void* column, i64 row)
 {
-    u64 box = _nHost._listBoxForTable((u64)table);
+    if (!_setCurFromTarget(self)) return nsStr("");
+    u64 box = curWin()._listBoxForTable((u64)table);
     if (box == 0u) return nsStr("");
     void* cols = msg0(table, "tableColumns");
     i64 ci = msgGetI64Arg(cols, "indexOfObject:", column);
@@ -1333,10 +1441,11 @@ void* _tableObjectValueImp(void* self, void* cmd, void* table, void* column, i64
 // A table row clicked (single) / double-clicked -> onSelect / onActivate.
 void _onListClickImp(void* self, void* cmd, void* table)
 {
-    if (!_nReady || _nHost.applying) return;
-    string key = _nHost.keyForHandle((u64)msg0(table, "enclosingScrollView"));
+    if (!_setCurFromTarget(self)) return;
+    if (!curWin().ready || curWin().applying) return;
+    string key = curWin().keyForHandle((u64)msg0(table, "enclosingScrollView"));
     if (key.length() == 0) return;
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     ListView* lv = e as ListView;
     if (lv == nullptr) return;
@@ -1346,10 +1455,11 @@ void _onListClickImp(void* self, void* cmd, void* table)
 
 void _onListDoubleClickImp(void* self, void* cmd, void* table)
 {
-    if (!_nReady) return;
-    string key = _nHost.keyForHandle((u64)msg0(table, "enclosingScrollView"));
+    if (!_setCurFromTarget(self)) return;
+    if (!curWin().ready) return;
+    string key = curWin().keyForHandle((u64)msg0(table, "enclosingScrollView"));
     if (key.length() == 0) return;
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     ListView* lv = e as ListView;
     if (lv == nullptr) return;
@@ -1358,12 +1468,17 @@ void _onListDoubleClickImp(void* self, void* cmd, void* table)
 }
 
 // The segmented tab strip changed -> onSelectTab.
-void _onTabSegmentImp(void* self, void* cmd, void* seg) { if (_nReady) routeTabChange(seg); }
+void _onTabSegmentImp(void* self, void* cmd, void* seg)
+{
+    if (!_setCurFromTarget(self)) return;
+    if (curWin().ready) routeTabChange(seg);
+}
 
 // ── NSOutlineView dataSource IMPs (TreeView; items are NSNumber(nodeId)) ──────
 i64 _outlineNumChildrenImp(void* self, void* cmd, void* outline, void* item)
 {
-    u64 box = _nHost._treeBoxForOutline((u64)outline);
+    if (!_setCurFromTarget(self)) return (i64)0;
+    u64 box = curWin()._treeBoxForOutline((u64)outline);
     if (box == 0u) return (i64)0;
     int nodeId = item != nullptr ? (int)msgGetI64(item, "integerValue") : TREE_ROOT;
     return (i64)__uiTreeChildCount(box, nodeId);
@@ -1371,7 +1486,8 @@ i64 _outlineNumChildrenImp(void* self, void* cmd, void* outline, void* item)
 
 void* _outlineChildImp(void* self, void* cmd, void* outline, i64 index, void* item)
 {
-    u64 box = _nHost._treeBoxForOutline((u64)outline);
+    if (!_setCurFromTarget(self)) return nullptr;
+    u64 box = curWin()._treeBoxForOutline((u64)outline);
     if (box == 0u) return nullptr;
     int nodeId = item != nullptr ? (int)msgGetI64(item, "integerValue") : TREE_ROOT;
     int childNid = __uiTreeChildId(box, nodeId, (int)index);
@@ -1380,7 +1496,8 @@ void* _outlineChildImp(void* self, void* cmd, void* outline, i64 index, void* it
 
 i8 _outlineExpandableImp(void* self, void* cmd, void* outline, void* item)
 {
-    u64 box = _nHost._treeBoxForOutline((u64)outline);
+    if (!_setCurFromTarget(self)) return (i8)0;
+    u64 box = curWin()._treeBoxForOutline((u64)outline);
     if (box == 0u) return (i8)0;
     int nodeId = item != nullptr ? (int)msgGetI64(item, "integerValue") : TREE_ROOT;
     return __uiTreeChildCount(box, nodeId) > 0 ? (i8)1 : (i8)0;
@@ -1388,7 +1505,8 @@ i8 _outlineExpandableImp(void* self, void* cmd, void* outline, void* item)
 
 void* _outlineObjectValueImp(void* self, void* cmd, void* outline, void* column, void* item)
 {
-    u64 box = _nHost._treeBoxForOutline((u64)outline);
+    if (!_setCurFromTarget(self)) return nsStr("");
+    u64 box = curWin()._treeBoxForOutline((u64)outline);
     if (box == 0u || item == nullptr) return nsStr("");
     int nodeId = (int)msgGetI64(item, "integerValue");
     string lbl = __uiTreeLabel(box, nodeId);
@@ -1398,7 +1516,8 @@ void* _outlineObjectValueImp(void* self, void* cmd, void* outline, void* column,
 // The outline selection changed (via its target/action) -> onSelect.
 void _onTreeClickImp(void* self, void* cmd, void* outline)
 {
-    if (!_nReady) return;
+    if (!_setCurFromTarget(self)) return;
+    if (!curWin().ready) return;
     i64 row = msgGetI64(outline, "selectedRow");
     if (row < (i64)0) return;
     void* item = msgIntArg(outline, "itemAtRow:", row);
@@ -1409,12 +1528,13 @@ void _onTreeClickImp(void* self, void* cmd, void* outline)
 // Mirror of the Win32 TVN_ITEMEXPANDING route: fire the TreeView's onExpand.
 void _onTreeWillExpandImp(void* self, void* cmd, void* note)
 {
-    if (!_nReady || _nHost.applying) return;
+    if (!_setCurFromTarget(self)) return;
+    if (!curWin().ready || curWin().applying) return;
     void* outline = msg0(note, "object");
     void* item = msg1(msg0(note, "userInfo"), "objectForKey:", nsStr((char*)"NSObject"));
-    string key = _nHost.keyForHandle((u64)msg0(outline, "enclosingScrollView"));
+    string key = curWin().keyForHandle((u64)msg0(outline, "enclosingScrollView"));
     if (key.length() == 0) return;
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     TreeView* tv = e as TreeView;
     if (tv == nullptr) return;
@@ -1426,7 +1546,7 @@ void _onTreeWillExpandImp(void* self, void* cmd, void* note)
 void _cocoaPostEnqueue(u64 target, u64 boxPtr)
 {
     void* num = msgIntArg(cls("NSNumber"), "numberWithUnsignedLongLong:", (i64)boxPtr);
-    msgPerformOnMain(_nHost.target, "runPostBox:", num, false);
+    msgPerformOnMain(u2h(target), "runPostBox:", num, false);
 }
 
 u64 _cocoaCurTid() { return (u64)msg0(cls("NSThread"), "currentThread"); }
@@ -1434,28 +1554,31 @@ u64 _cocoaCurTid() { return (u64)msg0(cls("NSThread"), "currentThread"); }
 // runPostBox: (main thread) - unwrap the NSNumber and run + free the boxed closure.
 void _runPostBoxImp(void* self, void* cmd, void* num)
 {
+    _setCurFromTarget(self);   // point _cur at this window's ctx before the closure runs
     if (num == nullptr) return;
     u64 boxPtr = (u64)msgGetI64(num, "unsignedLongLongValue");
     __uiRunPostBox(boxPtr);
 }
 
 // ── Host-neutral accessors (P7; mirror the Win32 host) ───────────────────────
-// macOS stays single-window (documented deviation; real multi-window is P14).
-// ctx.post marshaling IS real here: performSelectorOnMainThread + hostDrainPosted.
-// (Defined after CocoaHost so _nHost's field types are known.)
-UiContext*      activeCtx() { return &_nCtx; }
-alias Component activeApp() { return _nApp; }
-bool            hostDark()  { return _nHost.dark; }
-int hostWindowCount() { return _nApp != nullptr ? 1 : 0; }
+// This host is genuinely multi-window: each accessor resolves the servicing window
+// through curWin() (_cur is re-established at every callback entry). ctx.post
+// marshaling is real: performSelectorOnMainThread + hostDrainPosted.
+UiContext*      activeCtx() { return &curWin().ctx; }
+alias Component activeApp() { return curWin().app; }
+bool            hostDark()  { if (!hasCurWin()) return false; return curWin().dark; }
+int hostWidth()  { return curWin().w; }
+int hostHeight() { return curWin().h; }
+int hostWindowCount() { return _windows.count(); }
 
-// Create a hidden window bound to `app` and build its tree (mirror of the Win32
-// startHeadlessWindow; the headless self-tests use it).
+// Create a hidden window bound to `app` at DIP size w x h and build its tree (mirror
+// of the Win32 startHeadlessWindow; the headless self-tests use it).
 void startHeadlessWindow(Component app, const char* title, int w, int h)
 {
-    createNativeWindow(title, false);
-    _nApp = app;
-    _nW = w; _nH = h;
-    buildNativeTree();
+    int wi = createAppWindow(app, title, false);
+    if (wi < 0) return;
+    curWin().w = w; curWin().h = h;
+    buildWindowTree(wi);
 }
 
 // Deliver pending performSelectorOnMainThread: posts (ctx.post marshaling). Mirror
@@ -1473,9 +1596,21 @@ void hostDrainPosted()
     run(loop, sel("runMode:beforeDate:"), mode, past);
 }
 
-// macOS multi-window is P11: opening a second top-level window is not wired here yet.
-// `app` is consumed (freed at scope exit) so it does not leak.
-void openAppWindow(Component app, const char* title) { }
+// Open a second (or Nth) top-level application window running `app`, built + shown,
+// sharing the one NSApplication run loop. Genuine multi-window ("New Window").
+void openAppWindow(Component app, const char* title)
+{
+    createAppWindow(app, title, true);
+    buildNativeTree();   // build the just-created (now active) window
+}
+
+// Build the tree of the window at registry index `wi` (points _cur at it first).
+void buildWindowTree(int wi)
+{
+    if (wi < 0 || wi >= _windows.count()) return;
+    _cur = wi;
+    buildNativeTree();
+}
 
 // True if `want` is present in the key list.
 bool listHasStr(list<string>* xs, string want)
@@ -1509,22 +1644,24 @@ Element findByKey(Element node, string path, string want)
 // reconcile the tree to native controls. AppKit repaints the controls itself.
 void pumpNative()
 {
-    if (_nCtx.consumeDirty())
+    if (!hasCurWin()) return;
+    CocoaHost* wnd = curWin();
+    if (wnd.ctx.consumeDirty())
     {
-        Element wip = _nApp.render(&_nCtx);
+        Element wip = wnd.app.render(&wnd.ctx);
         list<Patch> patches = default;
-        _nTree = reconcile(_nTree, wip, &patches);
-        layoutRoot(_nTree, 0, 0, _nW);
-        _nHost.applyTree(_nTree, &_nCtx);
+        wnd.tree = reconcile(wnd.tree, wip, &patches);
+        layoutRoot(wnd.tree, 0, 0, wnd.w);
+        wnd.applyTree(wnd.tree, &wnd.ctx);
     }
 }
 
 // -- Native event routing (target/action + delegate -> element handler) --------
 void routeClick(void* ctrl)
 {
-    string key = _nHost.keyForHandle((u64)ctrl);
+    string key = curWin().keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     Button* b = e as Button;
     if (b != nullptr) { b.fireClick(); pumpNative(); return; }
@@ -1536,7 +1673,7 @@ void routeClick(void* ctrl)
     if (rb != nullptr)
     {
         string pp = _parentPath(key);
-        Element pe = findByKey(_nTree, keySegment(_nTree, 0), pp);
+        Element pe = findByKey(curWin().tree, keySegment(curWin().tree, 0), pp);
         if (pe != nullptr)
         {
             RadioGroup* g = pe as RadioGroup;
@@ -1557,9 +1694,9 @@ string _parentPath(string key)
 // A combo selection change: read the new index, fire onChange.
 void routeCombo(void* ctrl)
 {
-    string key = _nHost.keyForHandle((u64)ctrl);
+    string key = curWin().keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     ComboBox* cb = e as ComboBox;
     if (cb == nullptr) return;
@@ -1570,10 +1707,10 @@ void routeCombo(void* ctrl)
 // A tab strip selection change: read the segment, fire onSelectTab.
 void routeTabChange(void* ctrl)
 {
-    if (_nHost.applying) return;
-    string key = _nHost.keyForHandle((u64)ctrl);
+    if (curWin().applying) return;
+    string key = curWin().keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     TabControl* tc = e as TabControl;
     if (tc == nullptr) return;
@@ -1584,10 +1721,10 @@ void routeTabChange(void* ctrl)
 // A tree selection change: read the selected item's nodeId, fire onSelect + onExpand.
 void routeTreeSelectItem(void* outline, void* item)
 {
-    if (_nHost.applying) return;
-    string key = _nHost.keyForHandle((u64)msg0(outline, "enclosingScrollView"));
+    if (curWin().applying) return;
+    string key = curWin().keyForHandle((u64)msg0(outline, "enclosingScrollView"));
     if (key.length() == 0) return;
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     TreeView* tv = e as TreeView;
     if (tv == nullptr) return;
@@ -1597,9 +1734,9 @@ void routeTreeSelectItem(void* outline, void* item)
 
 void routeEdit(void* ctrl)
 {
-    string key = _nHost.keyForHandle((u64)ctrl);
+    string key = curWin().keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     TextInput* ti = e as TextInput;
     if (ti != nullptr)
@@ -1622,9 +1759,9 @@ void routeEdit(void* ctrl)
 
 void routeSlider(void* ctrl)
 {
-    string key = _nHost.keyForHandle((u64)ctrl);
+    string key = curWin().keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), key);
+    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     Slider* s = e as Slider;
     if (s == nullptr) return;
@@ -1637,7 +1774,7 @@ void routeSlider(void* ctrl)
 // TextArea's buffer on save. Returns "" if there is no such control.
 string nativeControlText(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return "";
     void* ctrl = u2h(h);
     void* pool = poolPush();
@@ -1667,7 +1804,7 @@ string nativeControlText(string keyPath)
 // status strip is an NSTextField, so its stringValue is the joined pane text.
 string nativeStatusText(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return "";
     void* pool = poolPush();
     char* c = cStr(msg0(u2h(h), "stringValue"));
@@ -1680,12 +1817,12 @@ string nativeStatusText(string keyPath)
 // change notification so the push does not register as a user edit.
 void nativeSetControlText(string keyPath, string s)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return;
     void* ctrl = u2h(h);
     void* ns = _nsStrSafe(s);   // avoid a null NSString arg for an empty push
-    bool prev = _nHost.applying;
-    _nHost.applying = true;
+    bool prev = curWin().applying;
+    curWin().applying = true;
     if (_isScroll(ctrl))
     {
         void* tv = msg0(ctrl, "documentView");
@@ -1699,7 +1836,7 @@ void nativeSetControlText(string keyPath, string s)
     {
         msg1(ctrl, "setStringValue:", ns);
     }
-    _nHost.applying = prev;
+    curWin().applying = prev;
 }
 
 // -- Host-neutral driver API (selection / insertion / menu) -------------------
@@ -1709,7 +1846,7 @@ void nativeSetControlText(string keyPath, string s)
 // or the control itself for a plain field.
 void* _textViewFor(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return nullptr;
     void* ctrl = u2h(h);
     if (_isScroll(ctrl)) return msg0(ctrl, "documentView");
@@ -1726,7 +1863,7 @@ void nativeSelect(string keyPath, int start, int end)
     msgRange(tv, "setSelectedRange:", (u64)start, len);
     msgRange(tv, "scrollRangeToVisible:", (u64)start, len);
     void* win = msg0(tv, "window");
-    if (win == nullptr) win = _nHost.window;
+    if (win == nullptr) win = curWin().window;
     if (win != nullptr) msg1(win, "makeFirstResponder:", tv);
 }
 
@@ -1758,14 +1895,14 @@ void nativeTestFireMenu(int cmd)
 // the boxed ContextMenu* (freed on teardown). Right-click shows it via NSMenu.
 void nativeSetContextMenu(string keyPath, u64 menuPtr)
 {
-    _nHost.setContextMenu(keyPath, menuPtr);
+    curWin().setContextMenu(keyPath, menuPtr);
 }
 
 // Simulate the user picking item `itemIndex` of the context menu on keyPath (headless:
 // popUpMenuPositioningItem cannot run unattended). Routes the item's command.
 void nativeFireContextMenu(string keyPath, int itemIndex)
 {
-    u64 mp = _nHost.contextMenuFor(keyPath);
+    u64 mp = curWin().contextMenuFor(keyPath);
     if (mp == 0u) return;
     ContextMenu* cm = (ContextMenu*)mp;
     if (itemIndex < 0 || itemIndex >= cm.count()) return;
@@ -1778,7 +1915,7 @@ void nativeFireContextMenu(string keyPath, int itemIndex)
 // not an NSSplitView, so the layout model stays single-source per the plan).
 void nativeSplitterDrag(string keyPath, int dipX, int dipY)
 {
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), keyPath);
+    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     if (e == nullptr) return;
     SplitView* sv = e as SplitView;
     if (sv == nullptr) return;
@@ -1788,7 +1925,7 @@ void nativeSplitterDrag(string keyPath, int dipX, int dipY)
 
 Rect nativeNodeBounds(string keyPath)
 {
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), keyPath);
+    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     if (e == nullptr) { Rect z = default; return z; }
     return e.nodeBounds();
 }
@@ -1796,21 +1933,21 @@ Rect nativeNodeBounds(string keyPath)
 // ── Tab drivers (NSSegmentedControl strip + the controlled model) ─────────────
 int nativeTabSelected(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return 0 - 1;
     return (int)msgGetI64(u2h(h), "selectedSegment");
 }
 
 int nativeTabCount(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return 0;
     return (int)msgGetI64(u2h(h), "segmentCount");
 }
 
 void nativeTabSelect(string keyPath, int idx)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return;
     msgInt(u2h(h), "setSelectedSegment:", (i64)idx);
     routeTabChange(u2h(h));
@@ -1819,9 +1956,9 @@ void nativeTabSelect(string keyPath, int idx)
 // ── Tree drivers (real NSOutlineView item API; items are NSNumber(nodeId)) ─────
 void* _outlineOf(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return nullptr;
-    return _nHost._tableOf(h);
+    return curWin()._tableOf(h);
 }
 
 u64 nativeTreeRootItem(string keyPath)
@@ -1876,29 +2013,29 @@ int nativeTreeItemNodeId(string keyPath, u64 hItem)
 // ── ListView drivers (NSTableView + the boxed rowText item source) ────────────
 int nativeListRowCount(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return 0;
-    return _nHost._listRows(h);
+    return curWin()._listRows(h);
 }
 
 string nativeListCellText(string keyPath, int row, int col)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return "";
-    void* table = _nHost._tableOf(h);
-    u64 box = _nHost._listBoxForTable((u64)table);
+    void* table = curWin()._tableOf(h);
+    u64 box = curWin()._listBoxForTable((u64)table);
     if (box == 0u) return "";
     return __uiListRowText(box, row, col);
 }
 
 void nativeListSelect(string keyPath, int row)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return;
-    _nHost.setListOp(h, LISTOP_SET_SELECTION, row, 0, "", 0u);
+    curWin().setListOp(h, LISTOP_SET_SELECTION, row, 0, "", 0u);
     // Programmatic selectRowIndexes: fires no action; route onSelect like a click
     // would (Win32's LVM_SETITEMSTATE raises a real LVN_ITEMCHANGED notify).
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), keyPath);
+    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     if (e == nullptr) return;
     ListView* lv = e as ListView;
     if (lv == nullptr) return;
@@ -1907,18 +2044,18 @@ void nativeListSelect(string keyPath, int row)
 
 int nativeListSelectedRow(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return 0 - 1;
-    void* table = _nHost._tableOf(h);
+    void* table = curWin()._tableOf(h);
     return (int)msgGetI64(table, "selectedRow");
 }
 
 void nativeListActivate(string keyPath, int row)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return;
     if (row >= 0) nativeListSelect(keyPath, row);
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), keyPath);
+    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     if (e == nullptr) return;
     ListView* lv = e as ListView;
     if (lv == nullptr) return;
@@ -1928,10 +2065,10 @@ void nativeListActivate(string keyPath, int row)
 // ── P11 host-neutral form/data test drivers (mirror the Win32 names) ──────────
 void nativeClickButton(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return;
     void* ctrl = u2h(h);
-    Element e = findByKey(_nTree, keySegment(_nTree, 0), keyPath);
+    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     // Mirror the OS auto-toggle for the two state controls before routing the click.
     if (e != nullptr && e.kind() == ELEM_CHECKBOX)
     {
@@ -1947,7 +2084,7 @@ void nativeClickButton(string keyPath)
 
 bool nativeIsChecked(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return false;
     return msgGetI64(u2h(h), "state") == (i64)1;
 }
@@ -1956,7 +2093,7 @@ bool nativeIsChecked(string keyPath)
 // cocoa peers - the macOS box is --check-only, so this is compile-verified, not run-verified.
 bool nativeIsEnabled(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return false;
     return msgBool1(u2h(h), "isEnabled", nullptr) != (i8)0;
 }
@@ -1972,14 +2109,14 @@ bool nativeSaveWindowBmp(string path) { return false; }
 
 int nativeComboSelected(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return 0 - 1;
     return (int)msgGetI64(u2h(h), "indexOfSelectedItem");
 }
 
 void nativeComboSelect(string keyPath, int idx)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return;
     msgInt(u2h(h), "selectItemAtIndex:", (i64)idx);
     routeCombo(u2h(h));
@@ -1987,7 +2124,7 @@ void nativeComboSelect(string keyPath, int idx)
 
 void nativeTypeText(string keyPath, string s)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return;
     if (msgBool1(u2h(h), "isKindOfClass:", cls("NSControl")) == (i8)0) return;
     msg1(u2h(h), "setStringValue:", nsStr(s.data()));
@@ -1996,14 +2133,14 @@ void nativeTypeText(string keyPath, string s)
 
 int nativeProgressValue(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return 0 - 1;
     return (int)msgGetDouble(u2h(h), "doubleValue");
 }
 
 void nativeSliderSet(string keyPath, int v)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return;
     msgSetDouble(u2h(h), "setDoubleValue:", (double)v);
     routeSlider(u2h(h));
@@ -2011,7 +2148,7 @@ void nativeSliderSet(string keyPath, int v)
 
 bool nativeImageHasBitmap(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return false;
     return msg0(u2h(h), "image") != nullptr;
 }
@@ -2021,17 +2158,26 @@ bool nativeImageHasBitmap(string keyPath)
 // host uses - the accent is real via bezelColor, there is no offscreen pixel readback.
 u32 nativeAccentBg(string keyPath)
 {
-    u64 h = _nCtx.nativeHandle(keyPath);
+    u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return 0u;
-    return _nHost._accentFor(h);
+    return curWin()._accentFor(h);
 }
 u32 nativeTestCustomDrawFill(string keyPath) { return nativeAccentBg(keyPath); }
 
-// Close the main window (bypasses the close guard - the caller already decided).
-// -close does not fire windowShouldClose:, matching Win32 DestroyWindow.
+// Close the current window (bypasses the close guard - the caller already decided).
+// -close fires windowWillClose: which tears the window down. A headless window (never
+// ordered front) may not deliver windowWillClose:, so if the registry still holds this
+// window after -close, tear it down directly. The findWindowIdx / this.window = nullptr
+// guards make a double teardown impossible either way.
 void nativeCloseWindow()
 {
-    if (_nHost.window != nullptr) msg0(_nHost.window, "close");
+    if (!hasCurWin()) return;
+    int idx = _cur;
+    void* w = curWin().window;
+    if (w != nullptr) msg0(w, "close");
+    // If windowWillClose: already ran, the window at idx is gone or its .window is nil.
+    if (idx >= 0 && idx < _windows.count() && _windows.get(idx).window == w && w != nullptr)
+        destroyWindowStateAt(idx, true);
 }
 
 // -- Objective-C callback IMPs (D5: one shared CfHostTarget carries them all) --
@@ -2050,12 +2196,13 @@ i8 _shouldTerminateImp(void* self, void* cmd, void* app) { return (i8)0; }
 // otherwise the first editable NSTextField. Returns nullptr if the tree has neither.
 void* _firstEditableControl()
 {
+    if (!hasCurWin()) return nullptr;
     void* field = nullptr;
-    int n = _nHost.liveHandles.count();
+    int n = curWin().liveHandles.count();
     int i = 0;
     while (i < n)
     {
-        void* ctrl = u2h(_nHost.liveHandles.get(i));
+        void* ctrl = u2h(curWin().liveHandles.get(i));
         if (ctrl != nullptr)
         {
             if (_isScroll(ctrl)) return msg0(ctrl, "documentView");
@@ -2078,6 +2225,7 @@ void* _firstEditableControl()
 // makeFirstResponder puts the caret in the first editable control right away.
 void _didFinishLaunchingImp(void* self, void* cmd, void* note)
 {
+    if (!hasCurWin()) return;
     void* app = msg0(cls("NSApplication"), "sharedApplication");
     // activateIgnoringOtherApps: is deprecated and unreliable for a CLI-launched
     // binary on modern macOS (the launching terminal keeps focus). Go through
@@ -2086,11 +2234,11 @@ void _didFinishLaunchingImp(void* self, void* cmd, void* note)
     void* self2 = msg0(cls("NSRunningApplication"), "currentApplication");
     if (self2 != nullptr) msgInt(self2, "activateWithOptions:", 3);
     msgBool(app, "activateIgnoringOtherApps:", true);
-    if (_nHost.window != nullptr)
+    if (curWin().window != nullptr)
     {
-        msg1(_nHost.window, "makeKeyAndOrderFront:", nullptr);
+        msg1(curWin().window, "makeKeyAndOrderFront:", nullptr);
         void* fr = _firstEditableControl();
-        if (fr != nullptr) msg1(_nHost.window, "makeFirstResponder:", fr);
+        if (fr != nullptr) msg1(curWin().window, "makeFirstResponder:", fr);
     }
 }
 
@@ -2098,22 +2246,29 @@ void _didFinishLaunchingImp(void* self, void* cmd, void* note)
 // checkbox) routes as a click.
 void _onActionImp(void* self, void* cmd, void* sender)
 {
-    if (!_nReady) return;
+    if (!_setCurFromTarget(self)) return;
+    if (!curWin().ready) return;
     if (msgBool1(sender, "isKindOfClass:", cls("NSSlider")) != (i8)0) { routeSlider(sender); return; }
     routeClick(sender);
 }
 
-// A menu item fired: its command id rides on the tag.
+// A menu item fired: its command id rides on the tag. There is no view, so resolve the
+// servicing window from the app's key window; if none is key (headless test), leave _cur
+// as-is so nativeTestFireMenu still routes to the current window.
 void _onMenuImp(void* self, void* cmd, void* sender)
 {
+    void* kw = msg0(msg0(cls("NSApplication"), "sharedApplication"), "keyWindow");
+    _setCurFromWindow(kw);
+    if (!hasCurWin()) return;
     i64 tag = msgGetI64(sender, "tag");
-    if (_nReady) routeMenu((int)tag);
+    if (curWin().ready) routeMenu((int)tag);
 }
 
 // controlTextDidChange: (NSTextField edit). The notification object is the field.
 void _controlTextChangedImp(void* self, void* cmd, void* note)
 {
-    if (_nHost.applying || !_nReady) return;
+    if (!_setCurFromTarget(self)) return;
+    if (curWin().applying || !curWin().ready) return;
     void* field = msg0(note, "object");
     routeEdit(field);
 }
@@ -2122,7 +2277,8 @@ void _controlTextChangedImp(void* self, void* cmd, void* note)
 // enclosing scroll view (the live handle).
 void _textDidChangeImp(void* self, void* cmd, void* note)
 {
-    if (_nHost.applying || !_nReady) return;
+    if (!_setCurFromTarget(self)) return;
+    if (curWin().applying || !curWin().ready) return;
     void* tv = msg0(note, "object");
     void* scroll = msg0(tv, "enclosingScrollView");
     if (scroll == nullptr) scroll = tv;
@@ -2133,8 +2289,9 @@ void _textDidChangeImp(void* self, void* cmd, void* note)
 // relayout at the new DIP client size.
 void _windowResizeImp(void* self, void* cmd, void* note)
 {
-    if (!_nReady) return;
     void* win = msg0(note, "object");
+    if (!_setCurFromWindow(win)) return;
+    if (!curWin().ready) return;
     void* cv = msg0(win, "contentView");
     function<RectD(void*, void*)> ff = (function<RectD(void*, void*)>)__objcMsgSendPtr;
     RectD r = ff(cv, sel("frame"));
@@ -2142,25 +2299,33 @@ void _windowResizeImp(void* self, void* cmd, void* note)
     int nh = (int)(r.h / (double)BASE_Y);
     if (nw < 1) nw = 1;
     if (nh < 1) nh = 1;
-    _nW = nw; _nH = nh;
+    curWin().w = nw; curWin().h = nh;
     buildNativeTree();
 }
 
 // windowShouldClose: the app's close guard vetoes (dirty-save prompt) before close.
 i8 _windowShouldCloseImp(void* self, void* cmd, void* sender)
 {
+    _setCurFromWindow(sender);
     if (_hasCloseQuery) return _closeQuery() ? (i8)1 : (i8)0;
     return (i8)1;
 }
 
-// windowWillClose: (main window only) stop the run loop so [NSApp run] returns and
-// runAppGuiNative can delete the heap component. stop: is deferred until the next
-// event, so post a dummy application-defined event to wake the loop.
+// windowWillClose: tear down the closing window. When the LAST window closes, stop the
+// run loop so [NSApp run] returns (stop: is deferred to the next event, so post a dummy
+// application-defined event to wake the loop). AppKit is already closing the window, so
+// dispose does not re-send -close.
 void _windowWillCloseImp(void* self, void* cmd, void* note)
 {
-    void* app = msg0(cls("NSApplication"), "sharedApplication");
-    msg1(app, "stop:", nullptr);
-    _postWakeEvent(app);
+    void* w = msg0(note, "object");
+    int i = findWindowIdx(w);
+    if (i >= 0) destroyWindowStateAt(i, false);
+    if (_windows.count() == 0)
+    {
+        void* app = msg0(cls("NSApplication"), "sharedApplication");
+        msg1(app, "stop:", nullptr);
+        _postWakeEvent(app);
+    }
 }
 
 // Post a no-op NSApplicationDefined event so a pending stop: takes effect promptly
@@ -2190,6 +2355,7 @@ bool strContains(string s, const char* sub)
 
 void menuReset()
 {
+    _menuBuilt = false;
     _menuTop.clear();
     _menuItemTopIdx.clear();
     _menuItemLabel.clear();
@@ -2274,6 +2440,9 @@ int _accelMask(string a)
 // main window; the rest mirror the declared top-level menus + items.
 void buildMenuBar()
 {
+    if (_menuBuilt) return;   // app-wide main menu; realize the declaration once
+    _menuBuilt = true;
+    if (_menuTarget == nullptr) _menuTarget = msg0(msg0(cls("CfHostTarget"), "alloc"), "init");
     void* app = msg0(cls("NSApplication"), "sharedApplication");
     void* mainMenu = msg0(msg0(cls("NSMenu"), "alloc"), "init");
 
@@ -2284,7 +2453,7 @@ void buildMenuBar()
     msg1(appItem, "setSubmenu:", appMenu);
     void* quit = msg3(msg0(cls("NSMenuItem"), "alloc"), "initWithTitle:action:keyEquivalent:",
                       nsStr("Quit"), sel("performClose:"), nsStr("q"));
-    msg1(quit, "setTarget:", _nHost.window);
+    msg1(quit, "setTarget:", nullptr);   // travel the responder chain -> the KEY window
     msgInt(quit, "setKeyEquivalentModifierMask:", (i64)MOD_CMD);
     msg1(appMenu, "addItem:", quit);
 
@@ -2312,7 +2481,9 @@ void buildMenuBar()
                     void* keqObj = _accelKeyEquivObj(accel);
                     void* item = msg3(msg0(cls("NSMenuItem"), "alloc"), "initWithTitle:action:keyEquivalent:",
                                       _nsStrSafe(_menuItemLabel.get(i)), sel("onMenu:"), keqObj);
-                    msg1(item, "setTarget:", _nHost.target);
+                    // App-wide menu target: _onMenuImp ignores `self` and resolves the
+                    // servicing window from the key window, so one target serves every window.
+                    msg1(item, "setTarget:", _menuTarget);
                     msgInt(item, "setTag:", (i64)_menuItemCmd.get(i));
                     if (accel.length() > 0)
                         msgInt(item, "setKeyEquivalentModifierMask:", (i64)_accelMask(accel));
@@ -2437,7 +2608,7 @@ void showSecondaryWindow(string title, string message)
     msg1(label, "setStringValue:", nsStr(norm.data()));
     msg1(cv, "addSubview:", label);
 
-    if (_nHost.dark)
+    if (hostDark())
     {
         void* ap = msg1(cls("NSAppearance"), "appearanceNamed:", nsStr("NSAppearanceNameDarkAqua"));
         msg1(win, "setAppearance:", ap);
@@ -2531,84 +2702,97 @@ void registerHostClasses()
     }
 }
 
-// Register the classes + create the top-level window. `show` controls whether it is
-// made visible (the self-test creates it hidden). Sets up the host globals.
-void* createNativeWindow(const char* title, bool show)
+// Create a new top-level window bound to `app`, register it in the owning list, give it
+// its own content view + CfHostTarget, install the ctx.post marshaling hooks, and (if
+// shown) make it key. Returns the window's registry INDEX and leaves it active (_cur).
+// We return an int, not a CocoaHost*: an owning class pointer bound to a caller local
+// would auto-free the window at scope exit and double-free with teardown.
+// `show` controls visibility (the self-test creates it hidden and builds explicitly).
+int createAppWindow(Component app, const char* title, bool show)
 {
-    if (!cocoaInit()) { printf("failed to load AppKit\n"); return nullptr; }
-    void* app = msg0(cls("NSApplication"), "sharedApplication");
-    msgInt(app, "setActivationPolicy:", 0);   // NSApplicationActivationPolicyRegular
-
+    if (!cocoaInit()) { printf("failed to load AppKit\n"); return 0 - 1; }
+    void* nsapp = msg0(cls("NSApplication"), "sharedApplication");
+    msgInt(nsapp, "setActivationPolicy:", 0);   // NSApplicationActivationPolicyRegular
     registerHostClasses();
-    void* del = msg0(msg0(cls("CfHostAppDelegate"), "alloc"), "init");
-    msg1(app, "setDelegate:", del);
-    _nHost.appDelegate = del;
 
-    // One shared target: control action, menu action, window delegate, data sources.
-    _nHost.target = msg0(msg0(cls("CfHostTarget"), "alloc"), "init");
+    // Process-global app delegate, installed once (applicationDidFinishLaunching drives
+    // activation; applicationShouldTerminateAfterLastWindowClosed: -> NO).
+    if (_appDelegate == nullptr)
+    {
+        _appDelegate = msg0(msg0(cls("CfHostAppDelegate"), "alloc"), "init");
+        msg1(nsapp, "setDelegate:", _appDelegate);
+    }
 
-    // ctx.post() marshaling: run a boxed closure on the main thread via the target's
-    // runPostBox: (performSelectorOnMainThread). Same opaque-u64 contract as Win32.
-    _nCtx.bindPost((u64)_nHost.target, _cocoaPostEnqueue);
-    _nCtx.bindThreadId(_cocoaCurTid(), _cocoaCurTid);
+    CocoaHost* fresh = new CocoaHost();
+    fresh.app = app;
+    _windows.add(fresh);            // moves the window into the owning registry
+    _cur = _windows.count() - 1;
 
-    // Content 760x560 pt -> _nW=95, _nH=21 DIP. styleMask 15 = Titled|Closable|
+    // Content 760x560 pt -> w=95, h=21 DIP. styleMask 15 = Titled|Closable|
     // Miniaturizable|Resizable, backing 2 = Buffered.
     void* win = msgRect3i(msg0(cls("NSWindow"), "alloc"),
                           "initWithContentRect:styleMask:backing:defer:",
                           0.0, 0.0, 760.0, 560.0, 15u, 2u, false);
     msg1(win, "setTitle:", nsStr((char*)title));
     msgBool(win, "setReleasedWhenClosed:", false);
-    _nHost.window = win;
-    _nW = 95; _nH = 21;
+    curWin().window = win;
+    curWin().w = 95; curWin().h = 21;
 
     void* cv = msgRect(msg0(cls("CfFlippedView"), "alloc"), "initWithFrame:", 0.0, 0.0, 760.0, 560.0);
     msg1(win, "setContentView:", cv);
-    _nHost.contentView = cv;
+    curWin().contentView = cv;
 
-    msg1(win, "setDelegate:", _nHost.target);
-    buildMenuBar();
+    // This window's own target: control action, window delegate, data sources.
+    curWin().target = msg0(msg0(cls("CfHostTarget"), "alloc"), "init");
+    msg1(win, "setDelegate:", curWin().target);
+
+    // ctx.post() marshaling: run a boxed closure on the main thread via THIS window's
+    // target's runPostBox: (performSelectorOnMainThread). Same opaque-u64 contract as Win32.
+    curWin().ctx.bindPost((u64)curWin().target, _cocoaPostEnqueue);
+    curWin().ctx.bindThreadId(_cocoaCurTid(), _cocoaCurTid);
+
+    buildMenuBar();   // app-wide, built once
 
     if (show)
     {
         msg1(win, "center", nullptr);
         msg1(win, "makeKeyAndOrderFront:", nullptr);
-        msgBool(app, "activateIgnoringOtherApps:", true);
+        msgBool(nsapp, "activateIgnoringOtherApps:", true);
     }
-    return win;
+    return _cur;
 }
 
 // Free the old tree (if any) and render + reconcile-to-native a fresh one at the
-// current client size. Controls are reused by key path.
+// current window's client size. Controls are reused by key path.
 void buildNativeTree()
 {
-    if (_nReady) { deleteTree(_nTree); _nReady = false; }
-    _nTree = _nApp.render(&_nCtx);
-    layoutRoot(_nTree, 0, 0, _nW);
-    _nHost.applyTree(_nTree, &_nCtx);
-    _nReady = true;
+    if (!hasCurWin()) return;
+    if (curWin().ready) { Element t = curWin().tree; deleteTree(t); curWin().ready = false; }
+    curWin().tree = curWin().app.render(&curWin().ctx);
+    layoutRoot(curWin().tree, 0, 0, curWin().w);
+    curWin().applyTree(curWin().tree, &curWin().ctx);
+    curWin().ready = true;
 }
 
-// Register the classes, create + show the window, and run the AppKit event loop
-// until the main window closes (windowWillClose: -> [NSApp stop:]).
+// Register the classes, create + show the primary window, and run the AppKit event loop
+// until every window closes (the last windowWillClose: -> [NSApp stop:]).
 //
-// The component MUST be heap-allocated (`new`): the host stashes it in `_nApp` and
-// `delete`s it after the loop, so it has to outlive this call and be a heap object.
+// The component MUST be heap-allocated (`new`): the window OWNS it and `delete`s it in
+// dispose(), so it has to outlive this call and be a heap object.
 int runAppGuiNative(Component app, const char* title)
 {
-    _nApp = app;
     if (!cocoaInit()) { printf("failed to load AppKit\n"); return 1; }
     void* pool = poolPush();
-    void* win = createNativeWindow(title, true);
-    if (win == nullptr) { poolPop(pool); return 1; }
-    if (!_nReady) buildNativeTree();
+    int wi = createAppWindow(app, title, true);
+    if (wi < 0 || curWin().window == nullptr) { poolPop(pool); return 1; }
+    if (!curWin().ready) buildNativeTree();
 
     void* nsapp = msg0(cls("NSApplication"), "sharedApplication");
     msg0(nsapp, "run");
 
+    // Each window OWNS its app Component and frees it in dispose(); do not double-free.
+    while (_windows.count() > 0) destroyWindowStateAt(0, true);
     poolPop(pool);
-    delete _nApp;
-    _nApp = nullptr;
     return 0;
 }
 
@@ -2619,36 +2803,13 @@ int runAppGuiNative(Component app, const char* title)
 // cflat malloc), so closing the window is enough for the audit.
 void nativeTeardownForTest()
 {
-    if (_nReady) { deleteTree(_nTree); _nReady = false; }
-    if (_nApp != nullptr) { delete _nApp; _nApp = nullptr; }
-    if (_nHost.window != nullptr) { msg0(_nHost.window, "close"); _nHost.window = nullptr; }
-    _nHost.contentView = nullptr;
-    _nHost.target = nullptr;
-    _nHost.appDelegate = nullptr;
-    // Free any remaining boxed callbacks + registered context menus (host-owned).
-    { int i = 0; while (i < _nHost.listBoxPtrs.count()) { u64 b = _nHost.listBoxPtrs.get(i); if (b != 0u) __uiFreeListRowBox(b); i++; } }
-    { int i = 0; while (i < _nHost.treeBoxPtrs.count()) { u64 b = _nHost.treeBoxPtrs.get(i); if (b != 0u) __uiFreeTreeBox(b); i++; } }
-    { int i = 0; while (i < _nHost.canvasBoxes.count()) { u64 b = _nHost.canvasBoxes.get(i); if (b != 0u) __uiFreeCanvasBox(b); i++; } }
-    { int i = 0; while (i < _nHost.ctxMenus.count()) { u64 b = _nHost.ctxMenus.get(i); if (b != 0u) __uiFreeContextMenu(b); i++; } }
-    { dictionary<string, u64> d = move _nCtx.nativeByKey; }
-    { list<string> a1 = move _nHost.liveKeys; }
-    { list<u64>    a2 = move _nHost.liveHandles; }
-    { list<u64>    b1 = move _nHost.listBoxHandles; }
-    { list<u64>    b2 = move _nHost.listBoxPtrs; }
-    { list<u64>    b3 = move _nHost.listSelHandles; }
-    { list<int>    b4 = move _nHost.listSelRows; }
-    { list<u64>    b5 = move _nHost.listRowCounts; }
-    { list<int>    b6 = move _nHost.listRowCountV; }
-    { list<u64>    b7 = move _nHost.treeBoxHandles; }
-    { list<u64>    b8 = move _nHost.treeBoxPtrs; }
-    { list<string> b9 = move _nHost.ctxKeys; }
-    { list<u64>    b10 = move _nHost.ctxMenus; }
-    { list<u64>    b11 = move _nHost.canvasHandles; }
-    { list<u64>    b12 = move _nHost.canvasBoxes; }
-    { list<u64>    b13 = move _nHost.imgHandles; }
-    { list<u64>    b14 = move _nHost.imgLastPixels; }
-    { list<u64>    b15 = move _nHost.accHandles; }
-    { list<u32>    b16 = move _nHost.accBgs; }
+    // Destroy every window (each dispose() frees its tree/app/boxes/lists + ctx), then
+    // release the app-wide menu declaration + closures. The per-window boxes/lists that
+    // this function used to free inline now belong to dispose(); do not free them twice.
+    while (_windows.count() > 0) destroyWindowStateAt(0, true);
+    _cur = 0 - 1;
+    { list<CocoaHost*> lw = move _windows; }
+    _menuBuilt = false;
     { list<string> a3 = move _menuTop; }
     { list<int>    a4 = move _menuItemTopIdx; }
     { list<string> a5 = move _menuItemLabel; }
@@ -2657,5 +2818,4 @@ void nativeTeardownForTest()
     { Lambda<void(int)> a8 = move _menuHandler; }
     { Lambda<bool()>    a9 = move _closeQuery; }
     _hasCloseQuery = false;
-    _nCtx.blur();
 }

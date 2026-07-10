@@ -462,9 +462,9 @@ int _postWorker(void* arg)
 // reconciles, maps to the same native controls, and answers the same key paths.
 //
 // The fedit self-test, migrated onto the ui_test.cb runner. The open->edit->save->find
-// sequence shares one launch (its steps depend on each other); the Win32-only P9 nav suite
-// (tabs/tree/split/context/multi-window/post) is a second case, registered only off macOS
-// via `if const (__MACOS__){}else{}` (the correct simple-ident gating form). run(0, nullptr)
+// sequence shares one launch (its steps depend on each other); the P9 nav suite
+// (tabs/tree/split/context/multi-window/post) is a second case. It runs on BOTH hosts now
+// that the Cocoa host is genuinely multi-window. run(0, nullptr)
 // runs every registered case. Same --selftest flag + exit-code contract as before.
 int feditSelfTest()
 {
@@ -529,10 +529,9 @@ int feditSelfTest()
         t.expectTrue("StatusBar sugar authoring", sugarOk);
     });
 
-    // ── P9 nav suite (Win32-only native driver; macOS parity is P11) ──────────
-    // Registered only off macOS. The `if const (__MACOS__){}else{...}` shape (not `!__MACOS__`)
-    // is required: the forward-ref scanner only folds a SIMPLE-identifier condition.
-    if const (__MACOS__) { } else {
+    // -- P9 nav suite (runs on BOTH hosts) -------------------------------------
+    // The Win32 and Cocoa hosts are both genuinely multi-window, so the "New Window"
+    // assertion and the whole nav/data driver surface exercise on macOS too.
     s.test("tabs / tree / split / context / multi-window / post", (UiTest* t) =>
     {
         setupMenu();
@@ -590,7 +589,6 @@ int feditSelfTest()
         hostDrainPosted();
         t.expectTrue("post round-trip", queuedNotRun && _postRan == 1 && _postRanTid == mainTid);
     });
-    }
 
     return s.run(0, nullptr);
 }

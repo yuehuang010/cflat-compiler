@@ -13,7 +13,7 @@
 // Headless state-assert self-test (no visible window; example_mac.sh gate):
 //   x64/Release/cflat example/ui/04-native-controls/cocoa_native_settings.cb -i example/ui -i example/macos --heap-audit -o out/nsettings_mac
 //   ./out/nsettings_mac --selftest
-import "ui_native_cocoa.cb";
+import "ui_native/cocoa.cb";
 
 class NativeSettings : Component
 {
@@ -96,22 +96,19 @@ int nativeSelfTest()
 {
     if (!cocoaInit()) { printf("FAIL: cocoaInit\n"); return 1; }
     void* pool = poolPush();
-    createNativeWindow("selftest", false);   // hidden top-level; sets host globals
-    _nW = 44; _nH = 26;
+    // Hidden top-level window bound to the panel, built at 44x26 DIP (the multi-window
+    // host registers it and points _cur at it; curWin() is the servicing window).
+    startHeadlessWindow(new NativeSettings(), "selftest", 44, 26);
 
-    NativeSettings* app = new NativeSettings();
-    _nApp = app;
-    buildNativeTree();
-
-    void* target = _nHost.target;
-    void* hTtl  = u2h(_nCtx.nativeHandle("root/title"));
-    void* hName = u2h(_nCtx.nativeHandle("root/name"));
-    void* hDark = u2h(_nCtx.nativeHandle("root/dark"));
-    void* hAuto = u2h(_nCtx.nativeHandle("root/auto"));
-    void* hVol  = u2h(_nCtx.nativeHandle("root/vol"));
-    void* hPb   = u2h(_nCtx.nativeHandle("root/pb"));
-    void* hSave = u2h(_nCtx.nativeHandle("root/save"));
-    void* hStat = u2h(_nCtx.nativeHandle("root/status"));
+    void* target = curWin().target;
+    void* hTtl  = u2h(activeCtx().nativeHandle("root/title"));
+    void* hName = u2h(activeCtx().nativeHandle("root/name"));
+    void* hDark = u2h(activeCtx().nativeHandle("root/dark"));
+    void* hAuto = u2h(activeCtx().nativeHandle("root/auto"));
+    void* hVol  = u2h(activeCtx().nativeHandle("root/vol"));
+    void* hPb   = u2h(activeCtx().nativeHandle("root/pb"));
+    void* hSave = u2h(activeCtx().nativeHandle("root/save"));
+    void* hStat = u2h(activeCtx().nativeHandle("root/status"));
 
     int pass = 0; int total = 0;
 
@@ -137,8 +134,8 @@ int nativeSelfTest()
     total++;
     msgInt(hDark, "setState:", (i64)1);
     msg1(target, "onAction:", hDark);
-    bool darkOn = msgGetI64(hDark, "state") == (i64)1 && _nHost.dark;
-    if (darkOn) pass++; else printf("  FAIL: dark toggle (host.dark=%d)\n", (int)_nHost.dark);
+    bool darkOn = msgGetI64(hDark, "state") == (i64)1 && curWin().dark;
+    if (darkOn) pass++; else printf("  FAIL: dark toggle (host.dark=%d)\n", (int)curWin().dark);
 
     // 4. Click "Auto-save": enabling it must ENABLE the Save button on the next
     //    render (disabled = !autoSave), proving a re-render re-synced a prop.
@@ -195,10 +192,10 @@ int nativeSelfTest()
     //     content view's 760x560pt frame maps back to 95x21 DIP via struct return.
     total++;
     void* rnote = msg2(cls("NSNotification"), "notificationWithName:object:",
-                       nsStr("NSWindowDidResizeNotification"), _nHost.window);
+                       nsStr("NSWindowDidResizeNotification"), curWin().window);
     _windowResizeImp(nullptr, nullptr, rnote);
-    bool resized = _nW == 95 && _nH == 21;
-    if (resized) pass++; else printf("  FAIL: resize (nW=%d nH=%d)\n", _nW, _nH);
+    bool resized = curWin().w == 95 && curWin().h == 21;
+    if (resized) pass++; else printf("  FAIL: resize (nW=%d nH=%d)\n", curWin().w, curWin().h);
 
     // Teardown: release all global host + context state (leak-clean for heap-audit).
     nativeTeardownForTest();

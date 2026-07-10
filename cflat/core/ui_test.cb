@@ -8,7 +8,7 @@
 // This module is HOST-NEUTRAL by construction: it imports only ui_native.cb (the
 // element model + UiContext) and calls the native* driver names by forward
 // declaration. Those drivers are DEFINED in whichever backend the consumer's
-// LAUNCHER imports (ui_native/win32.cb / ui_native_cocoa.cb / ui_native/winui.cb) -
+// LAUNCHER imports (ui_native/win32.cb / ui_native/cocoa.cb / ui_native/winui.cb) -
 // a cflat compilation shares one global scope across the root's whole import
 // closure, so the sibling backend supplies the bodies. The forward declarations
 // let ui_test.cb --check on its own (a prototype with no body is legal); with a

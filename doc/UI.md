@@ -22,8 +22,8 @@ deliberate. The element/seam surface was frozen in the pre-promotion hardening p
   - `core/ui_native/host.cb` - the `if const` platform shim: selects the Win32 host on
     Windows, the Cocoa host on macOS. Apps that want real OS controls import this.
   - `core/ui_native/win32.cb` - the Win32/GDI `NativeHost` backend.
-  - `core/ui_native_cocoa.cb` - the macOS AppKit (Cocoa) `NativeHost` backend (imports
-    `core/cocoa.cb`, the objc bridge); compile-verified only (see the parity matrix).
+  - `core/ui_native/cocoa.cb` - the macOS AppKit (Cocoa) `NativeHost` backend (imports
+    `core/cocoa.cb`, the objc bridge).
   - `core/ui_native/winui.cb` - the WinUI 3 (Windows App SDK) `NativeHost` backend.
 - **Status:** the framework is a single source of truth (`core/ui_native.cb`); every
   host imports it directly. See the parity matrix below for per-host coverage and the
@@ -621,7 +621,7 @@ stage: instead of painting, it drives real OS controls (HWND on Windows; AppKit
 accessibility. The app-facing model (Element tree, Component, controlled widgets,
 Theme, keyed identity) is unchanged - only the output stage differs. The contract
 lives in `core/ui_native.cb`; the implementations are `core/ui_native/win32.cb`
-(Win32/GDI) and `core/ui_native_cocoa.cb` (AppKit).
+(Win32/GDI) and `core/ui_native/cocoa.cb` (AppKit).
 
 **Platform shim.** An app imports `core/ui_native/host.cb` - a file-scope
 `if const (__MACOS__)` shim that pulls in the Cocoa host on macOS and the Win32
@@ -763,7 +763,7 @@ model source the `setListOp` seam feeds).
 - **Win32** (`core/ui_canvas/win32.cb` host + `example/ui/03-canvas-win32/win32_boxes.cb`): a native
   GDI host reusing the framework unchanged behind the `Canvas` seam.
 - **Native OS controls** (`core/ui_native/host.cb` shim -> `core/ui_native/win32.cb`
-  / `core/ui_native_cocoa.cb`): the `NativeHost` seam instead of `Canvas` - real HWND
+  / `core/ui_native/cocoa.cb`): the `NativeHost` seam instead of `Canvas` - real HWND
   (Win32) or AppKit controls (macOS). See the `NativeHost` section above.
 - **WinUI 3 (Windows App SDK)** (`core/ui_native/winui.cb`): the same `NativeHost` seam
   driving real XAML controls rooted in a `Canvas`, brought up unpackaged via
