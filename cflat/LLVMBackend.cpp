@@ -1116,16 +1116,38 @@ bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const 
 {
     auto importingDir = std::filesystem::path(importingFilePath).parent_path();
 
+    // Canonical path of the file doing the importing, used to reject self-resolution below.
+    // Empty (checks disabled) when it does not exist on disk, e.g. an LSP temp buffer.
+    std::error_code selfEc;
+    auto importingCanonical =
+        std::filesystem::canonical(std::filesystem::path(importingFilePath).lexically_normal(), selfEc);
+    if (selfEc) importingCanonical.clear();
+
     // Resolve a candidate filename against the full import search order. Returns the canonical
     // path on success, or an empty string if it was not found in any search location.
     auto resolve = [&](const std::string& filename) -> std::string {
         std::error_code ec;
+        // A file cannot import itself. The importing file's own directory is probed first, so
+        // without this a same-basename import (core/ui_native/cocoa.cb importing "cocoa.cb")
+        // would self-resolve instead of reaching the intended file on a later search dir.
+        // Remember the self-hit: if nothing else resolves, return it so a genuine self-import
+        // still reports as a circular import rather than a bare "not found".
+        std::string selfHit;
+        auto rejectSelf = [&](const std::filesystem::path& candidate) {
+            if (ec || importingCanonical.empty() || candidate != importingCanonical) return false;
+            selfHit = candidate.string();
+            ec = std::make_error_code(std::errc::no_such_file_or_directory);
+            return true;
+        };
+
         auto canonical = std::filesystem::canonical((importingDir / filename).lexically_normal(), ec);
+        rejectSelf(canonical);
 
         // Try an additional base directory (no-op if already resolved or dir is empty).
         auto tryDir = [&](const std::filesystem::path& dir) {
             if (!ec || dir.empty()) return;
-            canonical = std::filesystem::canonical((dir / filename).lexically_normal(), ec);
+            auto candidate = std::filesystem::canonical((dir / filename).lexically_normal(), ec);
+            if (!ec && !rejectSelf(candidate)) canonical = candidate;
         };
 
         // For LSP analysis: the "importing" file is a temp file; try the real source directory first.
@@ -1168,6 +1190,8 @@ bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const 
             }
         }
 #endif
+        // Nothing else matched: hand back the self-hit so the caller's cycle check reports it.
+        if (ec && !selfHit.empty()) return selfHit;
         return ec ? std::string() : canonical.string();
     };
 
@@ -1183,8 +1207,13 @@ bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const 
         // Catches the common `import "core/list.cb"` mistake where `list.cb` is the valid path.
         std::string suggestion;
         auto bare = std::filesystem::path(importFilename).filename().string();
-        if (bare != importFilename && !resolve(bare).empty())
-            suggestion = " Did you mean \"" + bare + "\"?";
+        if (bare != importFilename)
+        {
+            // Never suggest a name that only resolves to the importing file itself.
+            auto bareHit = resolve(bare);
+            if (!bareHit.empty() && std::filesystem::path(bareHit) != importingCanonical)
+                suggestion = " Did you mean \"" + bare + "\"?";
+        }
 
         std::string importDirsNote;
         for (const auto& d : importSearchDirs)
