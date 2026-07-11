@@ -3203,6 +3203,7 @@ bool LLVMBackend::SynthesizeSystemImportLibs(const std::string& arch, const std:
         { "ws2_32.dll",   "ws2_32.dll",   "ws2_32.lib"   },
         { "ntdll.dll",    "ntdll.dll",    "ntdll.lib"    },
         { "dbghelp.dll",  "dbghelp.dll",  "dbghelp.lib"  },
+        { "advapi32.dll", "advapi32.dll", "advapi32.lib" },
         { "ucrtbase.dll", "ucrtbase.dll", "ucrt.lib"     },
     };
 
@@ -3250,6 +3251,7 @@ bool LLVMBackend::SynthesizeX86SystemImportLibs(const LinkerPaths& paths)
         { paths.umLib   + "\\ws2_32.lib",   "ws2_32.dll",   "ws2_32.lib"   },
         { paths.umLib   + "\\ntdll.lib",    "ntdll.dll",    "ntdll.lib"    },
         { paths.umLib   + "\\dbghelp.lib",  "dbghelp.dll",  "dbghelp.lib"  },
+        { paths.umLib   + "\\advapi32.lib", "advapi32.dll", "advapi32.lib" },
         { paths.ucrtLib + "\\ucrt.lib",     "ucrtbase.dll", "ucrt.lib"     },
     };
 

@@ -145,12 +145,9 @@ if const (__WINDOWS__) {
         i64 _numa_meminfo_read(int id, const char* key) {
             i8[80] path = default;
             _numa_meminfo_path(&path[0], id);
-            void* f = os.posix.fopen((const char*)&path[0], "rb");
-            if (f == nullptr) { return -1; }
             i8[2048] buf = default;
-            win_size n = os.posix.fread(&buf[0], (win_size)1, (win_size)2047, f);
-            os.posix.fclose(f);
-            if ((i64)n <= 0) { return -1; }
+            i64 n = _read_sysfs_line((const char*)&path[0], &buf[0], 2047);
+            if (n <= 0) { return -1; }
             buf[(int)n] = 0;
             return _numa_meminfo_value(&buf[0], key);
         }
@@ -163,18 +160,48 @@ if const (__WINDOWS__) {
             i64 rc = os.posix.syscall(237, (i64)addr, len, (i64)os.posix.MPOL_BIND, (i64)(&nodemask), 64, 0);
             return rc == 0;
         }
+
+        // Read up to `maxLen` bytes of `path` into `buf` (NOT NUL-terminated -
+        // the caller does that). -1 on any failure (missing file, zero-byte
+        // read). Shared small-sysfs-read shape used by both the NUMA meminfo
+        // probe and the THP mode probe below.
+        i64 _read_sysfs_line(const char* path, i8* buf, i64 maxLen) {
+            void* f = os.posix.fopen(path, "rb");
+            if (f == nullptr) { return -1; }
+            win_size n = os.posix.fread(buf, (win_size)1, (win_size)maxLen, f);
+            os.posix.fclose(f);
+            if ((i64)n <= 0) { return -1; }
+            return (i64)n;
+        }
+
+        // True if NUL-terminated `hay` contains `needle` as a substring.
+        bool _buf_contains(const i8* hay, const char* needle) {
+            int nlen = 0;
+            while (needle[nlen] != 0) { nlen = nlen + 1; }
+            int i = 0;
+            while (hay[i] != 0) {
+                int j = 0;
+                while (j < nlen && hay[i + j] == needle[j]) { j = j + 1; }
+                if (j == nlen) { return true; }
+                i = i + 1;
+            }
+            return false;
+        }
     }
 
-    // Reserve+commit `size` bytes with the standard 64K-aligned header-stash
-    // trick shared with vm_reserve_commit (see the vm_release comment). Shared
-    // by macOS and Linux (both mmap-based); if `node` >= 0 on Linux, binds the
-    // mapping to that NUMA node via mbind right after mmap - alignment/header
-    // handling stays in this ONE place so vm_release/vm_release_numa remain
-    // symmetric with both callers. macOS has no mbind lever, so `node` is
+    // Reserve+commit `size` bytes with the standard aligned header-stash trick
+    // shared with vm_reserve_commit (see the vm_release comment). Shared by
+    // macOS and Linux (both mmap-based); if `node` >= 0 on Linux, binds the
+    // mapping to that NUMA node via mbind right after mmap. `huge` selects a
+    // 2 MB-aligned mapping (with a best-effort THP madvise hint on Linux)
+    // instead of the standard 64 KB granule - alignment/header handling stays
+    // in this ONE place so vm_release/vm_release_numa remain symmetric with
+    // every caller, huge or not. macOS has no mbind lever, so `node` is
     // ignored there (vm_reserve_commit_numa never passes a real node on macOS
-    // anyway - it routes straight to the plain reserve+commit).
-    void* _vm_reserve_commit_core(i64 size, int node) {
-        i64 gran  = 0x10000;
+    // anyway - it routes straight to the plain reserve+commit); macOS also has
+    // no THP lever, so `huge` there only affects alignment.
+    void* _vm_reserve_commit_core(i64 size, int node, bool huge) {
+        i64 gran  = huge ? 0x200000 : 0x10000;
         i64 total = size + gran;
         void* raw = os.posix.mmap(nullptr, total, os.posix.PROT_RW, os.posix.MAP_ANON_PRIVATE, -1, 0);
         if ((i64)raw == -1) return nullptr;
@@ -194,9 +221,20 @@ if const (__WINDOWS__) {
         i64* hdr = (i64*)(&userPtr[0 - 16]);
         hdr[0] = pad;
         hdr[1] = total;
+        if (huge) {
+            if const (!__MACOS__) {
+                // Best-effort THP hint; a madvise failure is not fatal - the
+                // mapping is still valid, just backed by normal pages.
+                os.posix.madvise((void*)userPtr, size, os.posix.MADV_HUGEPAGE);
+            }
+        }
         return (void*)userPtr;
     }
 }
+
+// Memoized result of os.huge_pages_enable(): 0=not yet probed, 1=available,
+// 2=unavailable. A plain non-atomic memo is fine - see the comment there.
+int _hugePagesState = 0;
 
 namespace os
 {
@@ -351,12 +389,105 @@ namespace os
         }
     }
 
-    // Reserve and commit in one call. Returns zeroed memory.
+    // Reserve and commit in one call (thin wrapper over the single
+    // vm_reserve_commit_ex implementation). Returns zeroed memory.
     void* vm_reserve_commit(i64 size) {
+        return vm_reserve_commit_ex(size, -1, false);
+    }
+
+    // === Huge pages (2 MB) ==================================================
+
+    // 2097152 (2 MB) where huge pages are usable in this process, else 0.
+    // Attempts to enable them on first call (memoized - see huge_pages_enable).
+    i64 huge_page_bytes() {
+        if (huge_pages_enable()) { return 2097152; }
+        return 0;
+    }
+
+    // Attempt to enable huge pages for this process; memoized and idempotent
+    // (safe to call repeatedly - only the first call does real work).
+    // Windows: opens the process token, enables SeLockMemoryPrivilege, and -
+    // critically - re-checks GetLastError() == ERROR_SUCCESS, because
+    // AdjustTokenPrivileges returns TRUE even when it did NOT grant the
+    // privilege (the classic Win32 trap here). Linux: probes
+    // /sys/kernel/mm/transparent_hugepage/enabled for "madvise" or "always"
+    // mode (no privilege needed). macOS: no lever - always false.
+    bool huge_pages_enable() {
+        if (_hugePagesState != 0) { return _hugePagesState == 1; }
         if const (__WINDOWS__) {
-            return os.windows.VirtualAlloc(nullptr, size, 0x3000u, 0x04u);   // MEM_RESERVE|MEM_COMMIT
+            void* tok = nullptr;
+            win_int opened = os.windows.OpenProcessToken(os.windows.GetCurrentProcess(),
+                os.windows.TOKEN_ADJUST_PRIVILEGES | os.windows.TOKEN_QUERY, &tok);
+            if (opened == 0) { _hugePagesState = 2; return false; }
+            os.windows.LUID luid = default;
+            win_int looked = os.windows.LookupPrivilegeValueA(nullptr, "SeLockMemoryPrivilege", &luid);
+            if (looked == 0) {
+                os.windows.CloseHandle(tok);
+                _hugePagesState = 2;
+                return false;
+            }
+            os.windows.TOKEN_PRIVILEGES priv = default;
+            priv.PrivilegeCount = 1u;
+            priv.Privileges.luid.LowPart = luid.LowPart;
+            priv.Privileges.luid.HighPart = luid.HighPart;
+            priv.Privileges.attributes = os.windows.SE_PRIVILEGE_ENABLED;
+            os.windows.AdjustTokenPrivileges(tok, 0, &priv, (u32)sizeof(os.windows.TOKEN_PRIVILEGES), nullptr, nullptr);
+            u32 err = os.windows.GetLastError();
+            os.windows.CloseHandle(tok);
+            _hugePagesState = (err == os.windows.ERROR_SUCCESS) ? 1 : 2;
+            return _hugePagesState == 1;
+        } else if const (__MACOS__) {
+            _hugePagesState = 2;
+            return false;
         } else {
-            return _vm_reserve_commit_core(size, -1);
+            i8[64] buf = default;
+            i64 n = _read_sysfs_line("/sys/kernel/mm/transparent_hugepage/enabled", &buf[0], 63);
+            bool ok = false;
+            if (n > 0) {
+                buf[(int)n] = 0;
+                ok = _buf_contains(&buf[0], "[madvise]") || _buf_contains(&buf[0], "[always]");
+            }
+            _hugePagesState = ok ? 1 : 2;
+            return ok;
+        }
+    }
+
+    // The ONE implementation behind vm_reserve_commit / vm_reserve_commit_numa.
+    // huge=false is byte-identical to the pre-huge-pages behaviour on every
+    // platform. huge=true is best effort: Windows rounds up to
+    // GetLargePageMinimum() and retries once without MEM_LARGE_PAGES on
+    // failure (large-page allocation can fail on a fragmented system even with
+    // the privilege held); POSIX rounds the mapping's alignment up to 2 MB and
+    // hints THP via madvise on Linux (see _vm_reserve_commit_core).
+    void* vm_reserve_commit_ex(i64 size, int node, bool huge) {
+        if const (__WINDOWS__) {
+            u32 flags = 0x3000u;   // MEM_RESERVE|MEM_COMMIT
+            i64 allocSize = size;
+            if (huge) {
+                huge_pages_enable();   // best-effort privilege attempt
+                i64 minSize = (i64)os.windows.GetLargePageMinimum();
+                if (minSize > 0) {
+                    allocSize = ((size + minSize - 1) / minSize) * minSize;
+                    flags = flags | os.windows.MEM_LARGE_PAGES;
+                }
+            }
+            void* p = nullptr;
+            if (node >= 0) {
+                p = os.windows.VirtualAllocExNuma(os.windows.GetCurrentProcess(), nullptr, allocSize, flags, 4u, (u32)node);
+            } else {
+                p = os.windows.VirtualAlloc(nullptr, allocSize, flags, 4u);
+            }
+            if (p == nullptr && (flags & os.windows.MEM_LARGE_PAGES) != 0u) {
+                // Retry once without MEM_LARGE_PAGES.
+                if (node >= 0) {
+                    p = os.windows.VirtualAllocExNuma(os.windows.GetCurrentProcess(), nullptr, size, 0x3000u, 4u, (u32)node);
+                } else {
+                    p = os.windows.VirtualAlloc(nullptr, size, 0x3000u, 4u);
+                }
+            }
+            return p;
+        } else {
+            return _vm_reserve_commit_core(size, node, huge);
         }
     }
 
@@ -406,17 +537,13 @@ namespace os
         }
     }
 
-    // Reserve+commit `size` bytes bound to NUMA node `id`. Windows:
-    // VirtualAllocExNuma. Linux: mmap+mbind (see _vm_reserve_commit_core).
-    // macOS: no per-node lever - falls back to the plain reserve+commit.
+    // Reserve+commit `size` bytes bound to NUMA node `id` (thin wrapper over
+    // vm_reserve_commit_ex). Windows: VirtualAllocExNuma. Linux: mmap+mbind
+    // (see _vm_reserve_commit_core). macOS: no per-node lever -
+    // _vm_reserve_commit_core ignores `node` there, which is exactly today's
+    // plain-allocation fallback.
     void* vm_reserve_commit_numa(i64 size, int id) {
-        if const (__WINDOWS__) {
-            return os.windows.VirtualAllocExNuma(os.windows.GetCurrentProcess(), nullptr, size, 0x3000u, 4u, (u32)id);
-        } else if const (__MACOS__) {
-            return vm_reserve_commit(size);
-        } else {
-            return _vm_reserve_commit_core(size, id);
-        }
+        return vm_reserve_commit_ex(size, id, false);
     }
 
     // Symmetric free for vm_reserve_commit_numa. VirtualFree/the POSIX

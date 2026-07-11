@@ -153,6 +153,45 @@ namespace os.windows
     // Validate the integrity of a heap (or a single allocation).
     extern stdcall win_int  HeapValidate(void* hHeap, u32 dwFlags, const void* lpMem);
 
+    // === Large/huge pages (SeLockMemoryPrivilege) ===========================
+    // Minimum (and required multiple) size for a MEM_LARGE_PAGES allocation;
+    // 2 MB on x64.
+    extern stdcall win_size GetLargePageMinimum();
+    // Open the calling process's access token for privilege adjustment/query.
+    extern stdcall win_int  OpenProcessToken(void* proc, u32 desiredAccess, void** tokenHandle);
+    // Look up the locally-unique identifier for a privilege name (e.g. "SeLockMemoryPrivilege").
+    extern stdcall win_int  LookupPrivilegeValueA(const char* systemName, const char* name, LUID* luid);
+    // Enable/disable privileges in a token. Returns nonzero even when NOT all
+    // requested privileges were granted - callers MUST re-check GetLastError().
+    extern stdcall win_int  AdjustTokenPrivileges(void* tokenHandle, win_int disableAllPrivileges, TOKEN_PRIVILEGES* newState, u32 bufferLen, void* prevState, u32* retLen);
+    // Return the calling thread's last-error code.
+    extern stdcall u32      GetLastError();
+
+    // LUID - a 64-bit locally-unique identifier, split as two 32-bit halves.
+    struct LUID {
+        u32 LowPart  = default;
+        i32 HighPart = default;
+    };
+
+    // One privilege + its attribute flags (SE_PRIVILEGE_ENABLED, etc).
+    struct LUID_AND_ATTRIBUTES {
+        LUID luid       = default;
+        u32  attributes = default;
+    };
+
+    // TOKEN_PRIVILEGES with a single trailing LUID_AND_ATTRIBUTES (the common
+    // one-privilege-at-a-time shape AdjustTokenPrivileges is called with here).
+    struct TOKEN_PRIVILEGES {
+        u32 PrivilegeCount            = default;
+        LUID_AND_ATTRIBUTES Privileges = default;
+    };
+
+    u32 TOKEN_ADJUST_PRIVILEGES = 0x20u;
+    u32 TOKEN_QUERY             = 0x08u;
+    u32 SE_PRIVILEGE_ENABLED    = 0x02u;
+    u32 MEM_LARGE_PAGES         = 0x20000000u;
+    u32 ERROR_SUCCESS           = 0u;
+
     // === NUMA topology / memory (Part A query + Part B node-local alloc) ===
     // Bytes of free memory local to NUMA node `Node`; false on failure.
     extern stdcall win_int  GetNumaAvailableMemoryNodeEx(u16 Node, u64* AvailableBytes);

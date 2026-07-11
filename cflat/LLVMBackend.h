@@ -5977,6 +5977,9 @@ private:
         // ntdll.lib provides RtlUnwindEx, used by cflat_builtins.c's __C_specific_handler.
         // Harmless when unreferenced (no DLL import is added unless a symbol is pulled).
         linkArgStrs.push_back("ntdll.lib");
+        // advapi32.lib provides OpenProcessToken/LookupPrivilegeValueA/AdjustTokenPrivileges
+        // (core/os.windows.cb's huge-page privilege dance). Harmless when unreferenced.
+        linkArgStrs.push_back("advapi32.lib");
         linkArgStrs.push_back(objPath);
         // Merge any C objects compiled by clang-cl from .c inputs.
         for (auto& cObj : cObjectFiles_) linkArgStrs.push_back(cObj);

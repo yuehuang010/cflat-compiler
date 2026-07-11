@@ -27,6 +27,7 @@ failure points you toward.
   - [NUMA domains (`core/numa.cb`)](#numa-domains-corenumacb)
   - [Dynamic scheduling (`parallel_for_n_dynamic` / `parallel_for_n_dynamic_pool`)](#dynamic-scheduling-parallel_for_n_dynamic--parallel_for_n_dynamic_pool)
     - [`parallel_reduce_dynamic<T>` / `parallel_reduce_dynamic_pool<T>` - dynamic reduction](#parallel_reduce_dynamict--parallel_reduce_dynamic_poolt---dynamic-reduction)
+- [Huge pages](#huge-pages)
 - [Numeric kernel libraries (`core/hpc`)](#numeric-kernel-libraries-corehpc)
 
 **Related:** [Threading & Memory Management](THREADING.md) (threads, affinity, thread pool, allocators, lock-set analysis) | [Language & Core Library Features](LANGUAGE.md)
@@ -1365,6 +1366,55 @@ double total = parallel_reduce_dynamic<double>(n, 0, 0, 0.0, partial, addDouble)
 > and run-to-run FP drift (typically far below any meaningful tolerance) is acceptable.
 
 ---
+
+## Huge pages
+
+`import "vmem.cb";` gives an opt-in way to back a big buffer with 2 MB pages
+instead of the usual 4 KB, at the `vmem_alloc_*` tier only - `block_allocator`
+/ `bucket_allocator` / `page_pool` and friends keep handing out 64 KB pages,
+since backing those with 2 MB pages would waste memory for no TLB win. Reach
+for huge pages when a kernel streams or randomly accesses a multi-GB buffer
+and dTLB misses (page-walk cost on every access once the buffer's page count
+blows past the CPU's dTLB entry count) are the bottleneck - see
+`performance/hpc/hugepage_bench.cb` for a worked dependent-pointer-chase
+benchmark that isolates the effect.
+
+```c
+import "vmem.cb";
+
+bool avail = vmem_huge_pages_available();   // pre-flight query
+void* buf  = vmem_alloc_huge(bytes);        // best effort; degrades to normal pages
+// ... use buf ...
+vmem_free(buf);                             // same free path as vmem_alloc
+
+void* nodeBuf = vmem_alloc_numa_huge(bytes, numa_domain_id(0));   // + node-bound
+vmem_free_numa(nodeBuf);
+```
+
+- **`vmem_huge_pages_available()`** - true if this process can actually get 2 MB
+  pages right now (attempts to enable them on first call; memoized after that).
+- **`vmem_huge_page_bytes()`** - `2097152` where available, else `0`.
+- **`vmem_alloc_huge(size)`** / **`vmem_alloc_numa_huge(size, node)`** - reserve+commit,
+  preferring huge pages. **Degrade-silently, query-explicitly**: these never fail an
+  allocation just because huge pages are unavailable - they hand back normal-page
+  memory instead, and a caller that cares (a benchmark labelling its run, a kernel
+  choosing a strategy) calls `vmem_huge_pages_available()` first rather than getting
+  an out-param or a global "was that huge" flag. Freed by the existing `vmem_free` /
+  `vmem_free_numa` - there is no separate huge-page free entry point.
+
+### Per-platform admin steps
+
+| Platform | Mechanism | To enable |
+|---|---|---|
+| Windows | `VirtualAlloc(..., MEM_LARGE_PAGES, ...)` | Needs the `SeLockMemoryPrivilege` account right: `secpol.msc` -> Local Policies -> User Rights Assignment -> "Lock pages in memory" -> add the account -> **log out and back in** (a fresh process is required for the privilege to take effect). Without it, `vmem_alloc_huge` silently returns normal pages. |
+| Linux | transparent huge pages (`madvise(MADV_HUGEPAGE)`) | Check `/sys/kernel/mm/transparent_hugepage/enabled`; `madvise` or `always` mode both work (system-wide `always` needs **no code change at all** - every mapping is a THP candidate). `never` mode disables the lever entirely; `vmem_huge_pages_available()` reports it honestly either way. No privilege needed - THP is best-effort by design, unlike `MAP_HUGETLB` which needs preallocated `vm.nr_hugepages` and hard-fails without them. |
+| macOS | none | Apple Silicon has no usable huge-page lever (`VM_FLAGS_SUPERPAGE_SIZE_2MB` is x86-64-only and effectively dead there). `vmem_huge_pages_available()` always returns `false` - the honest no-op, same posture as the NUMA/CPU-affinity no-op tier on this platform. |
+
+Windows large-page allocation can still fail even with the privilege held, on
+a fragmented system that lacks a physically contiguous 2 MB block - the
+library retries once without `MEM_LARGE_PAGES` and hands back normal pages
+rather than failing the call; this is expected occasionally on a long-uptime
+box, not a bug report.
 
 ## Numeric kernel libraries (`core/hpc`)
 

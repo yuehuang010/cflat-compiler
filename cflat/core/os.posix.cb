@@ -310,6 +310,16 @@ namespace os.posix
     if const (__MACOS__) { int MAP_ANON_PRIVATE = 0x1002; }
     else                 { int MAP_ANON_PRIVATE = 0x22; }
 
+    // Transparent-huge-page hint. MADV_HUGEPAGE == 14 is Linux-specific (the
+    // number means something else entirely on Darwin), so this is guarded out
+    // on macOS entirely - there is no THP lever there.
+    if const (__MACOS__) {
+        // Nothing: Darwin has no THP/madvise-hugepage lever.
+    } else {
+        extern win_int madvise(void* addr, win_size length, i32 advice);
+        int MADV_HUGEPAGE = 14;
+    }
+
     // === time / clock (clock_gettime, nanosleep) ===
     // struct timespec is { i64 tv_sec; i64 tv_nsec; } on 64-bit; we pass a pointer
     // to a 2-element i64 buffer ([0] = tv_sec, [1] = tv_nsec).

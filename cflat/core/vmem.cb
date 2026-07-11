@@ -52,6 +52,35 @@ void vmem_free_numa(void* ptr)
     os.vm_release_numa(ptr);
 }
 
+// True if this process can actually get 2 MB huge pages (attempts to enable
+// them on first call - see os.huge_pages_enable). False means
+// vmem_alloc_huge/vmem_alloc_numa_huge still work, just on normal pages.
+bool vmem_huge_pages_available()
+{
+    return os.huge_page_bytes() != 0;
+}
+
+// Huge page size in bytes (2097152), or 0 where huge pages are unavailable.
+i64 vmem_huge_page_bytes()
+{
+    return os.huge_page_bytes();
+}
+
+// Reserve+commit `size` bytes, preferring 2 MB huge pages. Best effort: silently
+// degrades to normal pages when huge pages are unavailable (no privilege on
+// Windows, THP disabled on Linux, or macOS, which has no huge-page lever at
+// all) - never fails an allocation over it. Freed by the plain vmem_free.
+void* vmem_alloc_huge(i64 size)
+{
+    return os.vm_reserve_commit_ex(size, -1, true);
+}
+
+// vmem_alloc_huge, bound to NUMA node `node`. Freed by vmem_free_numa.
+void* vmem_alloc_numa_huge(i64 size, int node)
+{
+    return os.vm_reserve_commit_ex(size, node, true);
+}
+
 // RAII wrapper around a single reserve+commit region. On scope exit the region
 // is released automatically; move it or clear base to suppress the release.
 struct VMemRegion

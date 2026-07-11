@@ -968,6 +968,48 @@ bool testCpuTopology() {
         result &= Test("vmem_alloc_numa(bogus node) == nullptr", bad == nullptr, true);
     }
 
+    // vmem_huge_page_bytes: 0 (unavailable) or exactly 2 MB, never anything else.
+    i64 hugeBytes = vmem_huge_page_bytes();
+    result &= Test("vmem_huge_page_bytes 0 or 2MB", (int)(hugeBytes == 0 || hugeBytes == 2097152), 1);
+
+    bool hugeAvailable = vmem_huge_pages_available();
+
+    // vmem_alloc_huge: 4MB region, non-null, 64K-aligned unconditionally,
+    // writable at both ends, symmetric free - regardless of whether this
+    // process actually got huge pages (the graceful-degrade path, expected on
+    // a dev box without SeLockMemoryPrivilege / THP disabled).
+    i64 hugeSize = (i64)4 << 20;
+    void* hp = vmem_alloc_huge(hugeSize);
+    result &= Test("vmem_alloc_huge non-null", hp != nullptr, true);
+    if (hp != nullptr) {
+        result &= Test("vmem_alloc_huge 64K-aligned", (int)(((i64)hp & (i64)0xFFFF) == 0), 1);
+        if (hugeAvailable) {
+            result &= Test("vmem_alloc_huge 2MB-aligned when available", (int)(((i64)hp & (i64)0x1FFFFF) == 0), 1);
+        }
+        i8* hbytes = (i8*)hp;
+        hbytes[0] = (i8)11;
+        hbytes[hugeSize - 1] = (i8)22;
+        result &= Test("vmem_alloc_huge write/read start", (int)hbytes[0], 11);
+        result &= Test("vmem_alloc_huge write/read end", (int)hbytes[hugeSize - 1], 22);
+        vmem_free(hp);
+    }
+
+    // vmem_alloc_numa_huge: same graceful-degrade contract, node-bound.
+    void* hpn = vmem_alloc_numa_huge(hugeSize, numa_domain_id(0));
+    result &= Test("vmem_alloc_numa_huge non-null", hpn != nullptr, true);
+    if (hpn != nullptr) {
+        result &= Test("vmem_alloc_numa_huge 64K-aligned", (int)(((i64)hpn & (i64)0xFFFF) == 0), 1);
+        if (hugeAvailable) {
+            result &= Test("vmem_alloc_numa_huge 2MB-aligned when available", (int)(((i64)hpn & (i64)0x1FFFFF) == 0), 1);
+        }
+        i8* hnbytes = (i8*)hpn;
+        hnbytes[0] = (i8)33;
+        hnbytes[hugeSize - 1] = (i8)44;
+        result &= Test("vmem_alloc_numa_huge write/read start", (int)hnbytes[0], 33);
+        result &= Test("vmem_alloc_numa_huge write/read end", (int)hnbytes[hugeSize - 1], 44);
+        vmem_free_numa(hpn);
+    }
+
     // Process affinity round-trip: identity set (must not disturb the test run).
     if const (!__MACOS__) {
         u64 aff = os.process_get_affinity();

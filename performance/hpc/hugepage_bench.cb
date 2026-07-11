@@ -1,0 +1,161 @@
+// hugepage_bench.cb - TLB-bound dependent pointer-chase, normal pages vs huge
+// pages (G7: internal/plan/hpc-g7-huge-pages.md).
+//
+// The buffer is divided into N_SLOTS chunks, each exactly HUGE_PAGE (2 MB)
+// apart. Each chunk's first 8 bytes hold the index of the NEXT chunk to visit,
+// forming a single random cycle over all N_SLOTS chunks (built once, reused
+// for every round). Walking the cycle is a genuinely DATA-DEPENDENT chase -
+// each load's value determines the next address - so the CPU cannot prefetch
+// or reorder past it; the measured ns/access is dominated by however long a
+// dTLB miss + page-walk costs on this hardware.
+//
+// N_SLOTS is chosen so the buffer's PAGE COUNT (not byte size) is what matters:
+// at the standard 4 KB page size, N_SLOTS * 2 MB / 4 KB pages are touched
+// across the whole run (far past any dTLB's ~1.5-2K entries); at a 2 MB huge
+// page size, only N_SLOTS pages exist in the entire mapping - the whole
+// working set can fit inside a modest 2 MB dTLB, if this hardware has one.
+//
+// vmem_alloc_huge degrades silently to normal pages when huge pages are
+// unavailable (no SeLockMemoryPrivilege on Windows, THP disabled on Linux, or
+// macOS, which has no lever at all) - vmem_huge_pages_available() is printed
+// up front so a privilege-less run is self-labelling rather than a silent A/A
+// comparison.
+//
+// Build (see performance/hpc/pfor_dynamic_bench.cb for the pattern):
+//   x64/Release/cflat.exe performance/hpc/hugepage_bench.cb -i cflat/core \
+//       -o out/hpc/hugepage_bench.exe -O2
+//   out\hpc\hugepage_bench.exe
+//
+// Not in performance.bat's BENCH_FILES list (ad hoc bench evidence for G7).
+
+import "cruntime.cb";
+import "time.cb";
+import "vmem.cb";
+import "random.cb";
+
+i64 HUGE_PAGE = 2097152;   // 2 MB
+i64 N_SLOTS   = 2000;      // buffer = N_SLOTS * 2MB ~= 3.9 GB; well past the ~1.5-2K
+                            // dTLB entry count called out in the plan
+i64 ROUNDS    = 30;        // full passes through the N_SLOTS-cycle per timed run
+int REPS      = 5;         // repetitions per variant; report the minimum
+
+// Build a random single-cycle permutation of [0, n) into `order`, then write
+// each slot's NEXT index directly into the buffer (offset 0 of its 2MB chunk)
+// so the timed chase is a true dependent load, not a precomputed lookup.
+void buildCycle(i8* base, i64 n) {
+    i64[] order = new i64[n];
+    i64 i = 0;
+    while (i < n) { order[i] = i; i = i + 1; }
+
+    Random rng;
+    rng.seedFromTime();
+    i = n - 1;
+    while (i > 0) {
+        i64 j = rng.next() % (i64)(i + 1);
+        i64 tmp = order[i];
+        order[i] = order[j];
+        order[j] = tmp;
+        i = i - 1;
+    }
+
+    i = 0;
+    while (i < n) {
+        i64 curSlot  = order[i];
+        i64 nextSlot = order[(i + 1) % n];
+        i64* cell = (i64*)(base + curSlot * HUGE_PAGE);
+        cell[0] = nextSlot;
+        i = i + 1;
+    }
+    delete[_] order;
+}
+
+// Untimed warm-up pass: faults in every slot once so first-touch page faults
+// (normal pages are demand-paged; huge pages are already physically backed at
+// alloc time) never leak into the timed measurement below.
+i64 warmup(i8* base, i64 n) {
+    i64 idx = 0;
+    i64 i = 0;
+    while (i < n) {
+        i64* cell = (i64*)(base + idx * HUGE_PAGE);
+        idx = cell[0];
+        i = i + 1;
+    }
+    return idx;
+}
+
+// Chase `hops` dependent jumps starting at slot 0; returns elapsed ns.
+// `sink` accumulates the visited indices so the loop cannot be optimized away.
+double runChase(i8* base, i64 hops, i64* sinkOut) {
+    Stopwatch sw;
+    sw.start();
+    i64 idx  = 0;
+    i64 sink = 0;
+    i64 h = 0;
+    while (h < hops) {
+        i64* cell = (i64*)(base + idx * HUGE_PAGE);
+        idx = cell[0];
+        sink = sink + idx;
+        h = h + 1;
+    }
+    sw.stop();
+    sinkOut[0] = sink;
+    return sw.elapsed().nanoseconds();
+}
+
+// Allocate the buffer (huge or normal), build the cycle, warm up, then time
+// REPS repetitions and report the minimum ns/access.
+double benchVariant(char* name, bool huge) {
+    i64 bufBytes = N_SLOTS * HUGE_PAGE;
+    void* raw = huge ? vmem_alloc_huge(bufBytes) : vmem_alloc(bufBytes);
+    if (raw == nullptr) {
+        printf("  %s: allocation FAILED (%lld bytes)\n", name, bufBytes);
+        return -1.0;
+    }
+    i8* base = (i8*)raw;
+
+    buildCycle(base, N_SLOTS);
+    warmup(base, N_SLOTS);
+
+    i64 hops = ROUNDS * N_SLOTS;
+    i64 sink = 0;
+    double best = 1.0e30;
+    int r = 0;
+    while (r < REPS) {
+        double ns = runChase(base, hops, &sink);
+        double nsPerAccess = ns / (double)hops;
+        if (nsPerAccess < best) { best = nsPerAccess; }
+        r = r + 1;
+    }
+    printf("  %-16s %10.2f ns/access  (sink=%lld, checked to prevent dead-code elimination)\n", name, best, sink);
+
+    vmem_free(base);   // vmem_alloc_huge/vmem_alloc are both freed by plain vmem_free
+    return best;
+}
+
+extern int main() {
+    bool hugeAvailable = vmem_huge_pages_available();
+    i64 hugeBytes = vmem_huge_page_bytes();
+    printf("vmem_huge_pages_available() = %s\n", hugeAvailable ? "true" : "false");
+    printf("vmem_huge_page_bytes()      = %lld\n", hugeBytes);
+    printf("buffer size = %lld bytes (%lld slots x 2MB), %d rounds x %d reps\n\n",
+           (i64)(N_SLOTS * HUGE_PAGE), N_SLOTS, (int)ROUNDS, REPS);
+
+    double normalNs = benchVariant("normal pages", false);
+    double hugeNs   = benchVariant("huge pages",   true);
+
+    printf("\n=== Summary ===\n");
+    if (normalNs > 0.0 && hugeNs > 0.0) {
+        printf("  normal: %10.2f ns/access\n", normalNs);
+        printf("  huge:   %10.2f ns/access\n", hugeNs);
+        printf("  speedup (normal/huge) = %.2fx\n", normalNs / hugeNs);
+        if (!hugeAvailable) {
+            printf("  NOTE: huge pages were NOT actually obtained on this run (no privilege/THP) -\n");
+            printf("  the 'huge' variant above ran on normal pages too, so this is an A/A comparison.\n");
+        }
+    } else {
+        printf("  one or both variants failed to allocate; see above.\n");
+        return 1;
+    }
+
+    return 0;
+}
