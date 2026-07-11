@@ -669,7 +669,7 @@ annotationDefinition
     ;
 
 ifConstDeclaration
-    : 'if' 'const' '(' expression ')' '{' ifConstBlock '}' ('else' '{' ifConstBlock '}')?
+    : 'if' 'const' '(' expression ')' '{' ifConstBlock '}' ('else' ('{' ifConstBlock '}' | ifConstDeclaration))?
     ;
 
 ifConstBlock

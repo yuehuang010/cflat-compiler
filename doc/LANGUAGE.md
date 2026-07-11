@@ -2067,6 +2067,32 @@ else
 }
 ```
 
+The untaken branch is discarded before type checking - it is never name-resolved
+or code-generated. That is what lets each arm call APIs that only exist on its own
+platform, and lets two arms define the same function without colliding.
+
+**Chaining.** `else if const` selects the first arm whose condition is true, at both
+scopes. The trailing `else` is optional:
+
+```c
+if const (__WINDOWS__)
+{
+    int platformId() { return 1; }
+}
+else if const (__MACOS__)
+{
+    int platformId() { return 2; }
+}
+else
+{
+    int platformId() { return 3; }
+}
+```
+
+**What an arm may contain** depends on the scope. At file scope each arm holds
+declarations - functions, structs, globals, `import`, `using`, and nested `if const`.
+At function scope each arm holds ordinary statements.
+
 ---
 
 ## `program` Keyword

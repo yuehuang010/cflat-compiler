@@ -3060,6 +3060,12 @@ public:
         {
             branchBlock = ifBlocks[0];
         }
+        else if (auto* elseIf = ctx->ifConstDeclaration())
+        {
+            // Chained `else if const` - the else arm is another if const, not a brace block.
+            ParseIfConstDeclaration(elseIf, namespaceName);
+            return;
+        }
         else if (ifBlocks.size() > 1)
         {
             branchBlock = ifBlocks[1];

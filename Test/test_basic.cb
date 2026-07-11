@@ -1399,6 +1399,35 @@ if const (true)
     };
 }
 
+// Test 4: Chained else-if-const at global scope - only the first true arm is compiled.
+// Untaken arms are not type-checked, hence the undefined calls below.
+if const (false)
+{
+    int chainedIfConstValue() { return neverDefinedA(); }
+}
+else if const (1 == 2)
+{
+    int chainedIfConstValue() { return neverDefinedB(); }
+}
+else if const (2 + 2 == 4)
+{
+    int chainedIfConstValue() { return 314; }
+}
+else
+{
+    int chainedIfConstValue() { return neverDefinedC(); }
+}
+
+// Test 5: Chained else-if-const with no trailing else - the platform arm wins.
+if const (__PLATFORM__ == 64)
+{
+    int chainedNoElseValue() { return 64; }
+}
+else if const (__PLATFORM__ == 32)
+{
+    int chainedNoElseValue() { return 32; }
+}
+
 bool testGlobalIfConst()
 {
     bool result = true;
@@ -1406,6 +1435,10 @@ bool testGlobalIfConst()
     // Test that GlobalTrueClass from true branch is available
     GlobalTrueClass gtc = GlobalTrueClass();
     result &= Test("global_if_const_true_branch", gtc.value, 42);
+
+    // Chained else-if-const: the third arm (2 + 2 == 4) is the first true one
+    result &= Test("global_else_if_const_chain", chainedIfConstValue(), 314);
+    result &= Test("global_else_if_const_no_else", chainedNoElseValue(), __PLATFORM__);
 
     // Test that PlatformSpecificClass is declared correctly
     PlatformSpecificClass psc = PlatformSpecificClass();
