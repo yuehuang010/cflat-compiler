@@ -50,7 +50,7 @@ class Socket
 {
     void* _handle = nullptr;
 
-    // ── Lifecycle ──────────────────────────────────────────────────────────────
+    // -- Lifecycle --------------------------------------------------------------
 
     // Call once per process before any socket operations.
     static bool initNetwork()
@@ -73,7 +73,7 @@ class Socket
         }
     }
 
-    // ── Creation ───────────────────────────────────────────────────────────────
+    // -- Creation ---------------------------------------------------------------
 
     bool createTcp()
     {
@@ -89,7 +89,7 @@ class Socket
         return _handle != (void*)(i64)-1;
     }
 
-    // ── Server ─────────────────────────────────────────────────────────────────
+    // -- Server -----------------------------------------------------------------
 
     // Bind to a local address/port. Pass "" or "0.0.0.0" for all interfaces.
     bool bind(string host, int port)
@@ -127,7 +127,7 @@ class Socket
         return s;
     }
 
-    // ── Client ─────────────────────────────────────────────────────────────────
+    // -- Client -----------------------------------------------------------------
 
     // Connect to host:port. Resolves hostnames via getaddrinfo.
     bool connect(string host, int port)
@@ -164,7 +164,7 @@ class Socket
         return ok;
     }
 
-    // ── I/O ────────────────────────────────────────────────────────────────────
+    // -- I/O --------------------------------------------------------------------
 
     // Send up to len bytes. Returns bytes actually sent, or -1 on error.
     int send(const char* buf, int len)
@@ -180,7 +180,7 @@ class Socket
         return (int)_wsa_recv(_handle, buf, len, 0);
     }
 
-    // ── Options ────────────────────────────────────────────────────────────────
+    // -- Options ----------------------------------------------------------------
 
     void setReuseAddr(bool enable)
     {
@@ -206,7 +206,7 @@ class Socket
         _wsa_ioctlsocket(_handle, (i32)_SOCK_FIONBIO, &mode);
     }
 
-    // ── State ──────────────────────────────────────────────────────────────────
+    // -- State ------------------------------------------------------------------
 
     bool isValid() { return _handle != nullptr; }
 

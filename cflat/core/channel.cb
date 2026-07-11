@@ -79,7 +79,7 @@ class channel<T>
     i64 _p0 = 0; i64 _p1 = 0; i64 _p2 = 0;
     i64 _p3 = 0; i64 _p4 = 0; i64 _p5 = 0;
 
-    // ── public API ────────────────────────────────────────────────────────────
+    // -- public API ------------------------------------------------------------
 
     // Allocate the ring and sequence array; rounds cap up to a power of two.
     void init(int cap) {
@@ -98,7 +98,7 @@ class channel<T>
         __atomic_i64_store(&_closed, (i64)0);
     }
 
-    // ── producer-lifetime tracking (drives blocking receive(T*) termination) ──
+    // -- producer-lifetime tracking (drives blocking receive(T*) termination) --
 
     // Register a live producer.  Call before the first push from a new sender;
     // pair with exactly one close_producer().

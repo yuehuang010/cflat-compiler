@@ -195,7 +195,7 @@ class XmlBuilder : IReflector
     }
 };
 
-// ── XmlNode ───────────────────────────────────────────────────────────────────
+// -- XmlNode -------------------------------------------------------------------
 // Tree node for a parsed XML element. Implements IJSON so reflect_set can walk
 // struct fields by looking up child elements by tag name, and IJSONArray so
 // array fields work by iterating children.
@@ -293,7 +293,7 @@ class XmlNode : IJSON, IJSONArray
         return neg ? -acc : acc;
     }
 
-    // ── IJSON ─────────────────────────────────────────────────────────────────
+    // -- IJSON -----------------------------------------------------------------
 
     // True if a child element named `key` exists.
     bool hasField(string key) { return _findTag(key) != nullptr; }
@@ -350,7 +350,7 @@ class XmlNode : IJSON, IJSONArray
         return result;
     }
 
-    // ── IJSONArray ────────────────────────────────────────────────────────────
+    // -- IJSONArray ------------------------------------------------------------
 
     // Number of child elements.
     int count() { return _childCount; }
@@ -398,7 +398,7 @@ class XmlNode : IJSON, IJSONArray
     }
 };
 
-// ── XmlParser ─────────────────────────────────────────────────────────────────
+// -- XmlParser -----------------------------------------------------------------
 // Recursive-descent XML parser. Builds an XmlNode tree.
 // Nodes are bump-allocated from _arena when set; strings are heap-allocated.
 // Supports: elements, text content, XML declarations (<?...?>), comments.

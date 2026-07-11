@@ -246,8 +246,8 @@ bool addMethodBool(void* klass, char* selName, function<i8(void*, void*, void*)>
 
 void finishClass(void* klass) { __registerClassPair(klass); }
 
-// ── Extra runtime-method + msgSend shapes used by the AppKit data controls ─────
-// (P11: NSTableView / NSOutlineView / NSPopUpButton backends). Type encodings:
+// -- Extra runtime-method + msgSend shapes used by the AppKit data controls -----
+// (NSTableView / NSOutlineView / NSPopUpButton backends). Type encodings:
 //   q = NSInteger, c = BOOL, @ = id, : = SEL, v = void.
 
 // -(NSInteger)sel:(id)a  -> "q@:@" (e.g. numberOfRowsInTableView:).

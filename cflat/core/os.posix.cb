@@ -137,9 +137,8 @@ namespace os.posix
     } else {
         extern win_int pthread_setaffinity_np(void* thread, win_size cpusetsize, const void* cpuset);
         // Process-wide affinity (pid 0 == calling thread; NOTE it affects only the
-        // CALLING thread on Linux, not the whole process - see the PROCESS-tier
-        // caveat in internal/plan/numa-domains.md). cpu_set_t is a fixed 128-byte
-        // bitmap, same shape thread_set_affinity already builds.
+        // CALLING thread on Linux, not the whole process). cpu_set_t is a fixed
+        // 128-byte bitmap, same shape thread_set_affinity already builds.
         extern win_int sched_setaffinity(i32 pid, win_size cpusetsize, const void* mask);
         extern win_int sched_getaffinity(i32 pid, win_size cpusetsize, void* mask);
         // Raw syscall escape hatch (glibc wrapper; no libnuma dependency). Used for

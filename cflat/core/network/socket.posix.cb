@@ -79,7 +79,7 @@ _SockAddrIn* _ai_addr(_AddrInfo* ai) {
     }
 }
 
-// ── Handle-model wrappers (fd carried in the low bits of a void*) ─────────────
+// -- Handle-model wrappers (fd carried in the low bits of a void*) -------------
 
 // Create a socket; returns INVALID_SOCKET ((void*)-1) on failure to match Winsock.
 void* socket(i32 af, i32 type, i32 proto) {

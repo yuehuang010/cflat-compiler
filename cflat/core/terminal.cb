@@ -28,7 +28,7 @@
 // work correctly inside a `program` with an onStdout hook, because the ANSI
 // codes are intercepted by the hook rather than sent to the real console.
 
-// ── VK constants ─────────────────────────────────────────────────────────────
+// -- VK constants -------------------------------------------------------------
 
 int VK_BACK   = 0x08;
 int VK_TAB    = 0x09;
@@ -58,7 +58,7 @@ int VK_F10    = 0x79;
 int VK_F11    = 0x7A;
 int VK_F12    = 0x7B;
 
-// ── Mouse event-flag and button-state constants ───────────────────────────────
+// -- Mouse event-flag and button-state constants -------------------------------
 
 int MOUSE_BTN_LEFT   = 0x0001;  // FROM_LEFT_1ST_BUTTON_PRESSED
 int MOUSE_BTN_RIGHT  = 0x0002;  // RIGHTMOST_BUTTON_PRESSED
@@ -66,7 +66,7 @@ int MOUSE_BTN_MIDDLE = 0x0004;  // FROM_LEFT_2ND_BUTTON_PRESSED
 int MOUSE_MOVED      = 0x0001;  // dwEventFlags: mouse position changed
 int MOUSE_WHEELED    = 0x0004;  // dwEventFlags: wheel rotated
 
-// ── KeyEvent ─────────────────────────────────────────────────────────────────
+// -- KeyEvent -----------------------------------------------------------------
 
 // One decoded keyboard event: virtual-key/scan codes, character, and modifier state.
 struct KeyEvent {
@@ -84,7 +84,7 @@ struct KeyEvent {
     bool isShift() { return (controlState & 0x10) != 0; }  // SHIFT_PRESSED
 };
 
-// ── MouseEvent ────────────────────────────────────────────────────────────────
+// -- MouseEvent ----------------------------------------------------------------
 //
 // Filled by Terminal.pollMouse() and Terminal.pollEvent().
 // eventFlags values: 0=button press/release, MOUSE_MOVED=1, MOUSE_WHEELED=4.
@@ -111,7 +111,7 @@ struct MouseEvent {
     bool middleButton()  { return (buttonState & MOUSE_BTN_MIDDLE) != 0; }
 };
 
-// ── Standalone key read ──────────────────────────────────────────────────────
+// -- Standalone key read ------------------------------------------------------
 //
 // Read one keystroke from the console without going through stdin (unbuffered,
 // no echo). Useful for simple line editors that need to intercept Tab/Backspace
@@ -140,7 +140,7 @@ int readKey() {
     }
 }
 
-// ── Terminal ─────────────────────────────────────────────────────────────────
+// -- Terminal -----------------------------------------------------------------
 
 // Console terminal: raw keyboard/mouse input plus ANSI cursor/clear/color output.
 struct Terminal {
@@ -594,7 +594,7 @@ struct Terminal {
     }
 };
 
-// ── ANSI color helpers ────────────────────────────────────────────────────────
+// -- ANSI color helpers --------------------------------------------------------
 //
 // Standard 16-color codes:
 //   fg: 30-37 (normal), 90-97 (bright)   - e.g. 32=green, 91=bright red
@@ -632,13 +632,13 @@ void termBgRgb(int r, int g, int b)                         { printf("\033[48;2;
 void termColorRgb(int fr, int fg, int fb, int br, int bg, int bb) { printf("\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm", fr, fg, fb, br, bg, bb); }
 
 // Render two vertically-stacked pixels in one character cell using the UTF-8
-// upper-half-block character (▀). Top pixel maps to foreground, bottom to background.
+// upper-half-block character (U+2580). Top pixel maps to foreground, bottom to background.
 // Requires Terminal.init() (UTF-8 + VT processing). Call termReset() after the row.
 void termPixel(int tr, int tg, int tb, int br, int bg, int bb) {
     printf("\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm\xe2\x96\x80", tr, tg, tb, br, bg, bb);
 }
 
-// ── TerminalSnapshot ─────────────────────────────────────────────────────────
+// -- TerminalSnapshot ---------------------------------------------------------
 //
 // Holds a captured frame of the console screen buffer. Obtained via
 // TerminalDriver.snapshot(). Rows and columns are 1-based.
@@ -712,7 +712,7 @@ struct TerminalSnapshot {
     }
 };
 
-// ── TerminalDriver ────────────────────────────────────────────────────────────
+// -- TerminalDriver ------------------------------------------------------------
 //
 // Automation counterpart to Terminal: injects synthetic key events and captures
 // screen snapshots. Borrows console handles from an existing Terminal - does not

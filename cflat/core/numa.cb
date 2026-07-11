@@ -21,7 +21,7 @@
 // thread affinity must be a SUBSET of the process affinity - shrinking the
 // process mask would make a NumaThread pinned inside the acquired domain fail
 // to pin. CPU Sets steer un-pinned threads while leaving explicit per-thread
-// pins unconstrained. Verified empirically; see internal/plan/numa-domains.md.
+// pins unconstrained. Verified empirically.
 
 import "topology.cb";
 import "vmem.cb";

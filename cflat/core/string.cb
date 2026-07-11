@@ -30,7 +30,7 @@ move string _strOwned(move i8* buf, i32 len)
     return result;
 }
 
-// ── string core accessors ────────────────────────────────────────────────────
+// -- string core accessors ----------------------------------------------------
 
 // Number of bytes in the string.
 i32 length(string self)
@@ -61,7 +61,7 @@ i32 hash(string self)
     return h;
 }
 
-// ── toString: primitive -> string (the public conversion API) ────────────────
+// -- toString: primitive -> string (the public conversion API) ----------------
 //
 // Stringify a primitive value explicitly with `value.toString()`. A bare cast
 // `(string)value` on a primitive is rejected by the compiler - this mirrors
@@ -194,7 +194,7 @@ move string toString(const char* self)
     return borrowed.copy();
 }
 
-// ── operator string conversions ──────────────────────────────────────────────
+// -- operator string conversions ----------------------------------------------
 //
 // These are used by the compiler for string interpolation "{x}" and for
 // char* / IString coercion into a string value. They are NOT reachable as a
@@ -249,7 +249,7 @@ move string operator string(double d)
     return toString(d);
 }
 
-// ── string equality ──────────────────────────────────────────────────────────
+// -- string equality ----------------------------------------------------------
 
 // Byte-exact equality: same length and identical bytes (NUL-safe, memcmp-based).
 bool operator==(string a, string b)
@@ -269,7 +269,7 @@ bool operator!=(string a, string b)
     return !(a == b);
 }
 
-// ── string concatenation (operator+) ─────────────────────────────────────────
+// -- string concatenation (operator+) -----------------------------------------
 
 // Concatenate two strings: s1 + s2
 // The result owns a freshly allocated buffer; the caller is responsible for
@@ -368,7 +368,7 @@ string operator+(string a, IString b)
     return a + b->ToString();
 }
 
-// ── string.copy ───────────────────────────────────────────────────────────────
+// -- string.copy ---------------------------------------------------------------
 // Return an independent owning deep copy of self.
 move string copy(string self)
 {
@@ -406,7 +406,7 @@ move string copy(string self, IAllocator alloc)
     return _strOwned(move buf, len);
 }
 
-// ── string -> number parsing ──────────────────────────────────────────────────
+// -- string -> number parsing --------------------------------------------------
 // Thin wrappers over the C runtime (atoi/atoll/atof) on the string's null-terminated
 // buffer. Like their C backends these return 0 on a non-numeric string (leading
 // whitespace is skipped, a trailing non-numeric suffix is ignored) and give no error
@@ -444,7 +444,7 @@ i64 toIntBase(string self, int base)
     return strtoll(self._ptr, nullptr, base);
 }
 
-// ── Phase 1: Non-allocating queries ──────────────────────────────────────────
+// -- Phase 1: Non-allocating queries ------------------------------------------
 
 // Return true if the string has no characters.
 bool isEmpty(string self)
@@ -588,7 +588,7 @@ bool operator>(string a, string b)
     return compare(a, b) > 0;
 }
 
-// ── string_view ───────────────────────────────────────────────────────────────
+// -- string_view ---------------------------------------------------------------
 // Non-owning view into a string's buffer.  _ptr is borrowed; never freed.
 struct string_view
 {
@@ -625,7 +625,7 @@ string_view* span(bond string* this, i32 start, i32 end)
     return sv;
 }
 
-// ── stringbuilder ────────────────────────────────────────────────────────────
+// -- stringbuilder ------------------------------------------------------------
 // Mutable, growable string buffer.
 struct stringbuilder
 {
@@ -866,7 +866,7 @@ struct stringbuilder
     }
 };
 
-// ── Phase 2: Allocating transforms ──────────────────────────────────────────
+// -- Phase 2: Allocating transforms ------------------------------------------
 
 // Return a copy of bytes [start, _len).  start is clamped to [0, _len].
 move string substring(string self, i32 start)
@@ -1071,7 +1071,7 @@ move string padRight(string self, i32 width)
     return _strOwned(move buf, width);
 }
 
-// ── Phase 3: split / join ────────────────────────────────────────────────────
+// -- Phase 3: split / join ----------------------------------------------------
 
 // Build an owning string from the byte range [src, src+len).
 move string _str_owned_range(i8* src, i32 len)

@@ -1,7 +1,6 @@
 // ui.cb - a small React-Native-style declarative UI library for CFlat.
 //
-// Design (see internal/plan/ui-framework-v1.md for the long-form rationale, and
-// doc/UI.md for the frozen v0.4 contract):
+// Design (see doc/UI.md for the frozen v0.4 contract):
 //   - Element is an interface; every host node (View/Text/Button) implements it.
 //   - Nodes are heap-allocated and owned by their parent through the Element
 //     interface; teardown walks the tree via destroyTree().
@@ -21,7 +20,7 @@ import "list.cb";
 import "string.cb";
 import "dictionary.cb";
 
-// Flex main-axis direction for a View's children (the F3 layout pass strategy).
+// Flex main-axis direction for a View's children (the layout pass strategy).
 int DIR_COLUMN = 0;   // stack children top-to-bottom (default)
 int DIR_ROW    = 1;   // place children left-to-right
 
@@ -120,7 +119,7 @@ string styleToJson(Style s)
          + ",\"gap\":" + s.gap.toString() + "}";
 }
 
-// ── Rect: an absolute cell rectangle assigned during layout ──────────────────
+// -- Rect: an absolute cell rectangle assigned during layout ------------------
 // Each node stores its own bounds so paint and hit-testing agree on geometry.
 struct Rect
 {
@@ -150,7 +149,7 @@ Rect intersectRect(Rect a, Rect b)
     return r;
 }
 
-// ── Layout protocol (F3): constraints in -> size out ─────────────────────────
+// -- Layout protocol: constraints in -> size out -------------------------------
 // A node lays out within a LayoutConstraints (its origin + the space available)
 // and returns the Size it consumed; it also stamps its own absolute `bounds` so
 // paint and hit-test agree. Container nodes drive their children with this one
@@ -172,7 +171,7 @@ struct Size
     int h = 0;
 };
 
-// ── Surface: a headless width x height character grid ─────────────────────────
+// -- Surface: a headless width x height character grid -------------------------
 // Nodes paint into a Surface; the host then blits it to the terminal. Keeping
 // paint off the real console makes layout/paint/hit-test deterministically
 // testable with no console attached. Mirrors TerminalSnapshot in core/terminal.cb.
@@ -298,7 +297,7 @@ void drawBorder(Surface* s, Rect b)
     while (y < bottom) { s.put(b.x, y, '|'); s.put(right, y, '|'); y++; }
 }
 
-// ── Canvas: the surface-agnostic draw target nodes paint into ─────────────────
+// -- Canvas: the surface-agnostic draw target nodes paint into -----------------
 // Nodes paint via Canvas primitives (in CELL coordinates) instead of poking a
 // Surface's cells directly, so the SAME tree can render to a char grid (TUI) or a
 // GDI window (Win32). A Canvas implementation owns the cell->pixel mapping.
@@ -403,7 +402,7 @@ SurfaceCanvas canvasFor(Surface* s)
     return c;
 }
 
-// ── Input events (F1): one dispatch path for pointer and key ─────────────────
+// -- Input events: one dispatch path for pointer and key ----------------------
 // The host translates native input (terminal pollEvent / WM_LBUTTONDOWN /
 // WM_KEYDOWN) into an Event and calls tree.dispatch(e, ctx). Pointer events
 // hit-test down the tree; key events route to the focused node (see UiContext).
@@ -460,7 +459,7 @@ Event mouseUp(int x, int y)
     return e;
 }
 
-// ── Theme: the app's styling preference (per-widget default colors) ──────────
+// -- Theme: the app's styling preference (per-widget default colors) ----------
 // A widget that sets no explicit color falls back to the theme slot for its role,
 // so styling is declared once on the context instead of on every node. A
 // default-constructed Theme is MONOCHROME (every slot COLOR_DEFAULT): a host that
@@ -524,7 +523,7 @@ Theme darkTheme()
     return t;
 }
 
-// ── ctx.post() thread marshaling (P7) ────────────────────────────────────────
+// -- ctx.post() thread marshaling ---------------------------------------------
 // A closure queued to run on the UI thread. ctx.post() clones the closure into a
 // heap PostBox and hands the host an opaque pointer; the host marshals that pointer
 // to the UI thread (PostMessage on Win32) and calls __uiRunPostBox to run + free it.
@@ -552,7 +551,7 @@ void __uiRunPostBox(u64 boxPtr)
     delete b;
 }
 
-// ── UiContext (F5/F2): the host-owned per-app runtime state ───────────────────
+// -- UiContext: the host-owned per-app runtime state ---------------------------
 // Replaces the former library globals. A handler calls ctx.invalidate() to mark
 // the UI dirty; the host drains it once per loop (consumeDirty) and re-renders
 // only on a change. focusKey is the KEYED IDENTITY of the focused node, so focus
@@ -571,12 +570,12 @@ struct UiContext
     // Shadow map from a node's stable key path to its native control handle (an
     // opaque u64: HWND on Windows, NSView* on macOS). Populated ONLY by a
     // NativeHost (see ui_native.cb); the Canvas hosts (TUI/GDI) never touch it, so
-    // it stays empty and inert for them - this is the P0 key->handle plumbing. The
+    // it stays empty and inert for them - this is the key->handle plumbing. The
     // handles are non-owning integers, so destroying the map destroys no windows;
     // the host explicitly destroys controls.
     dictionary<string, u64> nativeByKey = default;
 
-    // Thread marshaling (P7). The host installs a marshal hook + the UI thread id so
+    // Thread marshaling. The host installs a marshal hook + the UI thread id so
     // ctx.post() can run a closure back on the UI thread from a worker. These are thin
     // function pointers (no owning closure type crosses the seam), set by the host at
     // window creation; with none bound, post() runs inline (TUI / headless).
@@ -678,8 +677,8 @@ struct UiContext
     void removeNativeHandle(string key) { this.nativeByKey.remove(key); }
 };
 
-// ── ContextMenu: a per-element right-click menu (P9) ──────────────────────────
-// Reuses the P3 declarative menu model as a popup attached to ONE element. The app
+// -- ContextMenu: a per-element right-click menu --------------------------------
+// Reuses the declarative menu model as a popup attached to ONE element. The app
 // builds it (addItem(label, cmd)) and hangs it on an element's `contextMenu` field; on
 // a right-click over that control the native host shows a TrackPopupMenu and routes the
 // chosen cmd through the SAME app menu handler (setMenuHandler). An empty label is a
@@ -710,17 +709,17 @@ int ELEM_PROGRESS  = 9;
 int ELEM_SLIDER    = 10;
 int ELEM_TEXTAREA  = 11;
 int ELEM_STATUSBAR = 12;
-int ELEM_RADIOGROUP = 13;   // container of RadioButtons (P8); not native-mapped
-int ELEM_RADIO      = 14;   // one radio button inside a RadioGroup (P8)
-int ELEM_COMBO      = 15;   // dropdown list (P8)
-int ELEM_LIST       = 16;   // report-mode list view, virtualized (P8)
-int ELEM_TABS       = 17;   // tab control; keyed panes, active-only native (P9)
-int ELEM_TABPANE    = 18;   // one pane inside a TabControl (P9); container, not native-mapped
-int ELEM_TREE       = 19;   // tree view, expand-on-demand callback children (P9)
-int ELEM_SPLIT      = 20;   // split view: two weighted panes + divider (P9); container
-int ELEM_IMAGE      = 21;   // bitmap image (P10); BGRA32 pixels pushed via setImageData
-int ELEM_GROUPBOX   = 22;   // titled group frame (P10); container, native-mapped
-int ELEM_CANVAS     = 23;   // app-painted canvas child (P10); paint callback via Canvas
+int ELEM_RADIOGROUP = 13;   // container of RadioButtons; not native-mapped
+int ELEM_RADIO      = 14;   // one radio button inside a RadioGroup
+int ELEM_COMBO      = 15;   // dropdown list
+int ELEM_LIST       = 16;   // report-mode list view, virtualized
+int ELEM_TABS       = 17;   // tab control; keyed panes, active-only native
+int ELEM_TABPANE    = 18;   // one pane inside a TabControl; container, not native-mapped
+int ELEM_TREE       = 19;   // tree view, expand-on-demand callback children
+int ELEM_SPLIT      = 20;   // split view: two weighted panes + divider; container
+int ELEM_IMAGE      = 21;   // bitmap image; BGRA32 pixels pushed via setImageData
+int ELEM_GROUPBOX   = 22;   // titled group frame; container, native-mapped
+int ELEM_CANVAS     = 23;   // app-painted canvas child; paint callback via Canvas
 
 // The node interface. Typed host structs implement these so the tree can be
 // walked uniformly (serialize, layout, paint, dispatch, reconcile, teardown)
@@ -761,7 +760,7 @@ Size layoutRoot(Element root, int x, int y, int w)
     return root.layout(c);
 }
 
-// ── View: a flex container with a style and children ─────────────────────────
+// -- View: a flex container with a style and children -------------------------
 class View : Element
 {
     Style style = default;
@@ -891,12 +890,12 @@ class View : Element
     Rect nodeBounds() { return this.bounds; }
 };
 
-// ── Text: a leaf displaying a string ─────────────────────────────────────────
+// -- Text: a leaf displaying a string -----------------------------------------
 class Text : Element
 {
     string text = default;
     int    color = 0;           // rgb(); 0 = default ink
-    string tooltip = default;   // native hover tooltip (P7); "" = none. Use a literal.
+    string tooltip = default;   // native hover tooltip; "" = none. Use a literal.
     Rect bounds = default;
     string key = default;
 
@@ -937,7 +936,7 @@ class Text : Element
     Rect nodeBounds() { return this.bounds; }
 };
 
-// ── Button: a leaf with a title and a press handler ──────────────────────────
+// -- Button: a leaf with a title and a press handler --------------------------
 // Names track React Native: `title` + `onPress`. A keyed button also takes focus
 // on press and re-fires on Enter/Space while focused (the keyboard-activation
 // half of the focus seam).
@@ -948,7 +947,7 @@ class Button : Element
     int    color = 0;               // label ink; 0 = default
     int    backgroundColor = 0;     // button fill; 0 = no fill
     bool   disabled = false;        // dimmed + ignores input
-    string tooltip = default;       // native hover tooltip (P7); "" = none
+    string tooltip = default;       // native hover tooltip; "" = none
     Rect bounds = default;
     string key = default;
 
@@ -1049,7 +1048,7 @@ class Button : Element
     Rect nodeBounds() { return this.bounds; }
 };
 
-// ── Box: a bordered container that fills a width x height region ───────────────
+// -- Box: a bordered container that fills a width x height region ---------------
 // Unlike View (a flow container), a Box is sized: it draws a border around
 // style.width x style.height and stacks its children in the interior, inset by
 // the border plus style.padding. A box whose style.width/height is 0 falls back
@@ -1157,7 +1156,7 @@ class Box : Element
     Rect nodeBounds() { return this.bounds; }
 };
 
-// ── TextInput: a single-line editable text field ─────────────────────────────
+// -- TextInput: a single-line editable text field -----------------------------
 // A CONTROLLED widget (React Native style): the host component owns the text in
 // its state and passes it down as `value` each render; on a keystroke the field
 // fires onChangeText(newValue) and the component updates its state + invalidates,
@@ -1174,7 +1173,7 @@ class TextInput : Element
     int    color = 0;               // text ink; 0 = default
     int    backgroundColor = 0;     // field fill; 0 = no fill
     bool   disabled = false;        // dimmed + ignores input
-    string tooltip = default;       // native hover tooltip (P7); "" = none
+    string tooltip = default;       // native hover tooltip; "" = none
     Rect   bounds = default;
     string key    = default;
 
@@ -1272,7 +1271,7 @@ class TextInput : Element
     Rect nodeBounds() { return this.bounds; }
 };
 
-// ── Checkbox: a controlled on/off toggle with a label ────────────────────────
+// -- Checkbox: a controlled on/off toggle with a label ------------------------
 // Controlled like TextInput: the parent owns `checked` and passes it down; a click
 // or Enter/Space while focused fires onChange(!checked) and the parent flips its
 // state + invalidates, so the next render flows the new value back. Rendered as
@@ -1285,7 +1284,7 @@ class Checkbox : Element
     bool   disabled = false;
     Lambda<void(bool)> onChange = default;
     int    color = 0;            // label ink; 0 = default
-    string tooltip = default;    // native hover tooltip (P7); "" = none
+    string tooltip = default;    // native hover tooltip; "" = none
     Rect   bounds = default;
     string key   = default;
 
@@ -1362,7 +1361,7 @@ class Checkbox : Element
     Rect nodeBounds() { return this.bounds; }
 };
 
-// ── ProgressBar: a non-interactive themed fill bar (value 0..100) ─────────────
+// -- ProgressBar: a non-interactive themed fill bar (value 0..100) -------------
 // Draws a trough (theme.track) with the filled fraction in theme.accent. Width is
 // in cells. Purely presentational - it takes no input and no focus.
 class ProgressBar : Element
@@ -1370,7 +1369,7 @@ class ProgressBar : Element
     int    value = 0;          // 0..100
     int    width = 20;         // cells
     int    color = 0;          // fill override; 0 = theme accent
-    string tooltip = default;  // native hover tooltip (P7); "" = none
+    string tooltip = default;  // native hover tooltip; "" = none
     Rect   bounds = default;
     string key = default;
 
@@ -1419,7 +1418,7 @@ class ProgressBar : Element
     Rect nodeBounds() { return this.bounds; }
 };
 
-// ── Slider: an interactive value (0..100) set by click/drag or arrow keys ─────
+// -- Slider: an interactive value (0..100) set by click/drag or arrow keys -----
 // Click or drag along the track to set the value; while focused, Left/Right step
 // it by 5. Renders a filled portion + a thumb in theme.accent and a focus ring.
 // Controlled: fires onChange(newValue); the parent owns the value.
@@ -1429,7 +1428,7 @@ class Slider : Element
     int    width = 20;         // cells
     bool   disabled = false;
     Lambda<void(int)> onChange = default;
-    string tooltip = default;  // native hover tooltip (P7); "" = none
+    string tooltip = default;  // native hover tooltip; "" = none
     Rect   bounds = default;
     string key = default;
 
@@ -1530,7 +1529,7 @@ class Slider : Element
     Rect nodeBounds() { return this.bounds; }
 };
 
-// ── TextArea: a multiline, scrollable text region (the editor's core widget) ──
+// -- TextArea: a multiline, scrollable text region (the editor's core widget) --
 // Deliberately NOT controlled per keystroke (round-tripping a large buffer per key
 // is the Electron-class mistake): the NATIVE control's buffer is the source of
 // truth. `value` is the text to PUSH (initial content / file open); `onChange` is a
@@ -1546,7 +1545,7 @@ class TextArea : Element
     int    color = 0;
     int    backgroundColor = 0;
     bool   disabled = false;
-    string tooltip = default;  // native hover tooltip (P7); "" = none
+    string tooltip = default;  // native hover tooltip; "" = none
     Rect   bounds = default;
     string key    = default;
 
@@ -1626,8 +1625,8 @@ TextArea* textArea(string value, Lambda<void()> onChange)
     return t;
 }
 
-// ── StatusBar: a bottom strip of text parts (msctls_statusbar32 on Win32) ─────
-// App-shell chrome (P7): one or more text panes. `parts` is a plain public list so
+// -- StatusBar: a bottom strip of text parts (msctls_statusbar32 on Win32) -----
+// App-shell chrome: one or more text panes. `parts` is a plain public list so
 // the <StatusBar/> sugar and imperative addPart() both work; the native host maps it
 // to a real status bar (which self-docks at the window bottom), and a Canvas host
 // falls back to one row of " | "-joined parts.
@@ -1708,7 +1707,7 @@ StatusBar* statusBar(string text)
     return s;
 }
 
-// ── ScrollView: a clipped, vertically scrollable viewport ─────────────────────
+// -- ScrollView: a clipped, vertically scrollable viewport ---------------------
 // Lays its children out in a tall virtual column shifted up by scrollY, then
 // paints them clipped to its viewport (style.width x style.height cells) via the
 // Canvas clip seam. A focused ScrollView scrolls on Up/Down; scrolling changes
@@ -1957,7 +1956,7 @@ ScrollView* scrollView(Style style)
     return s;
 }
 
-// ── RadioButton: one option inside a RadioGroup (P8) ──────────────────────────
+// -- RadioButton: one option inside a RadioGroup --------------------------------
 // A dumb controlled leaf: `checked` is pushed down each render (index == group
 // value), `index` is its position. The enclosing RadioGroup owns selection and
 // hit-testing; a bare radio is inert on its own (the native host routes a click to
@@ -2018,7 +2017,7 @@ class RadioButton : Element
     Rect nodeBounds() { return this.bounds; }
 };
 
-// ── RadioGroup: a controlled single-choice group of RadioButtons (P8) ─────────
+// -- RadioGroup: a controlled single-choice group of RadioButtons --------------
 // Owns the selected `value` (an index) and `onChange`. It is a layout container
 // (not itself a native control, like View); its RadioButton children ARE controls.
 // Selection is controlled: each render sets each child's `checked` (via addOption or
@@ -2141,7 +2140,7 @@ class RadioGroup : Element
     Rect nodeBounds() { return this.bounds; }
 };
 
-// ── ComboBox: a controlled dropdown (P8) ──────────────────────────────────────
+// -- ComboBox: a controlled dropdown --------------------------------------------
 // A CBS_DROPDOWNLIST on Win32 (NSPopUpButton on Cocoa later). Controlled like the
 // other widgets: `selectedIndex` + `items` flow down, a selection fires
 // onChange(index). Canvas fallback shows "[selected v]" and cycles on click.
@@ -2249,7 +2248,7 @@ class ComboBox : Element
     Rect nodeBounds() { return this.bounds; }
 };
 
-// ── ListView: a virtualized report-mode list (P8) ─────────────────────────────
+// -- ListView: a virtualized report-mode list -----------------------------------
 // The item SOURCE is a callback, not a copied list: `rowText(row, col)` supplies a
 // cell on demand, so `rowCount` can be 100k+ and only the visible rows are ever
 // queried (LVS_OWNERDATA on Win32; NSTableView's dataSource is naturally the same
@@ -2375,7 +2374,7 @@ class ListView : Element
     Rect nodeBounds() { return this.bounds; }
 };
 
-// ── P8 element factories (thin field-setters; sugar-ready fields elsewhere) ────
+// -- Element factories (thin field-setters; sugar-ready fields elsewhere) -------
 // A controlled radio group; append options with addOption(), which wires index/key
 // and seeds checked from `value`.
 RadioGroup* radioGroup(int value, Lambda<void(int)> onChange)
@@ -2404,7 +2403,7 @@ ListView* listView(int rowCount, Lambda<string(int,int)> rowText)
     return lv;
 }
 
-// ── ListView rowText callback boxing (the setListOp seam carries an opaque u64) ─
+// -- ListView rowText callback boxing (the setListOp seam carries an opaque u64) -
 // The native host must call back into a `Lambda<string(int,int)>` when the OS asks
 // for a cell (LVN_GETDISPINFO). A Lambda type cannot cross the NativeHost interface
 // (it breaks the monomorphizer - same constraint as ctx.post), so ui.cb heap-boxes
@@ -2439,7 +2438,7 @@ void __uiFreeListRowBox(u64 boxPtr)
     delete b;
 }
 
-// ── TabPane: one titled pane inside a TabControl (P9) ─────────────────────────
+// -- TabPane: one titled pane inside a TabControl --------------------------------
 // A pure layout container (like View), NOT itself a native control. Its `title`
 // labels the tab; its children are the pane content. Only the ACTIVE pane is walked
 // into native controls by the host (lazy inactive tabs), so a re-render never
@@ -2508,7 +2507,7 @@ class TabPane : Element
     Rect nodeBounds() { return this.bounds; }
 };
 
-// ── TabControl: keyed child panes with lazy inactive tabs (P9) ────────────────
+// -- TabControl: keyed child panes with lazy inactive tabs ----------------------
 // A native SysTabControl32 header strip (WC_TABCONTROL) plus one active pane whose
 // content maps to native controls; inactive panes are NOT walked into native (so a
 // per-tab editor buffer must live in the app model, not an inactive native control).
@@ -2641,7 +2640,7 @@ class TabControl : Element
     Rect nodeBounds() { return this.bounds; }
 };
 
-// ── TreeView: an expand-on-demand tree (P9) ───────────────────────────────────
+// -- TreeView: an expand-on-demand tree ------------------------------------------
 // The node source is a set of callbacks keyed by an integer nodeId (the app's own
 // ids), so the tree is virtualized: children(nodeId) is queried only when a node is
 // expanded. childCount(TREE_ROOT) gives the top-level nodes; childId(nodeId, i) the
@@ -2732,7 +2731,7 @@ class TreeView : Element
     Rect nodeBounds() { return this.bounds; }
 };
 
-// ── SplitView: two weighted panes + a draggable divider (P9) ──────────────────
+// -- SplitView: two weighted panes + a draggable divider ------------------------
 // A pure layout container (not itself a native control): it splits the available
 // space between exactly two child panes by `ratio` (the first pane's percentage
 // along the split axis), reserving a 1-DIP divider gutter between them. `vertical`
@@ -2872,7 +2871,7 @@ class SplitView : Element
 };
 
 // Copy controlled CONTAINER scalars from a wip node onto the retained committed node
-// during reconcile (P9). Only the containers whose native host layout reads a scalar
+// during reconcile. Only the containers whose native host layout reads a scalar
 // need this - see the call in reconcilePath. Both args are named borrows (safe `as`).
 void adoptContainerProps(Element committed, Element wip)
 {
@@ -2891,7 +2890,7 @@ void adoptContainerProps(Element committed, Element wip)
     }
 }
 
-// ── TreeView node-source boxing (the setListOp seam carries an opaque u64) ──────
+// -- TreeView node-source boxing (the setListOp seam carries an opaque u64) ------
 // The native host must call back into the tree's childCount/childId/label closures
 // when the OS asks to expand a node (TVN_ITEMEXPANDING) or reports selection. Lambdas
 // cannot cross the NativeHost interface (monomorphizer limit - same as ctx.post /
@@ -2948,7 +2947,7 @@ void __uiFreeContextMenu(u64 menuPtr)
     delete m;
 }
 
-// ── P9 element factories (thin field-setters; sugar-ready fields elsewhere) ────
+// -- Element factories (thin field-setters; sugar-ready fields elsewhere) -------
 TabPane* tabPane(string title)
 {
     TabPane* p = new TabPane();
@@ -2985,8 +2984,8 @@ SplitView* splitView(int ratio, bool vertical)
     return s;
 }
 
-// A toolbar is a styled row of Buttons - no new native control (P9). This factory is
-// the documented pattern: a DIR_ROW View with a small gap. Icons arrive with Image (P10).
+// A toolbar is a styled row of Buttons - no new native control. This factory is
+// the documented pattern: a DIR_ROW View with a small gap. Icons arrive with Image.
 View* toolbar()
 {
     View* v = new View();
@@ -2995,7 +2994,7 @@ View* toolbar()
     return v;
 }
 
-// ── Image: a bitmap leaf (P10) ────────────────────────────────────────────────
+// -- Image: a bitmap leaf -----------------------------------------------------
 // Displays a 32-bit BGRA image. The pixel source is toolkit-neutral: the app hands
 // down a BORROWED top-down BGRA32 buffer (`pixels` + `pxW`/`pxH`) that the native host
 // uploads through the setImageData seam (an HBITMAP + STM_SETIMAGE on Win32). The app
@@ -3068,7 +3067,7 @@ Image* image(u64 pixels, int pxW, int pxH)
     return im;
 }
 
-// ── GroupBox: a titled group frame (P10) ──────────────────────────────────────
+// -- GroupBox: a titled group frame -------------------------------------------
 // The classic-forms grouping frame: a border with a caption, wrapping related
 // controls. A pure sized container (like Box) whose native mapping is a BS_GROUPBOX
 // (a BUTTON that draws the frame + caption); its children position as siblings inside
@@ -3164,7 +3163,7 @@ GroupBox* groupBox(string title, Style style)
     return g;
 }
 
-// ── CanvasView: the app-painted escape hatch (P10) ────────────────────────────
+// -- CanvasView: the app-painted escape hatch ---------------------------------
 // Hosts a child surface the app draws with the SAME Canvas API the framework paints
 // through. `onPaint(Canvas)` receives a Canvas whose cell origin is the view's top-left;
 // the app draws text/rects freely. This closes the "the framework cannot do X" gap: any
@@ -3216,7 +3215,7 @@ CanvasView* canvasView(Lambda<void(Canvas)> onPaint)
     return c;
 }
 
-// ── CanvasView paint-callback boxing (the seam carries an opaque u64) ──────────
+// -- CanvasView paint-callback boxing (the seam carries an opaque u64) ----------
 // The native host must invoke the app's onPaint(Canvas) closure when the OS asks the
 // child window to repaint (WM_PAINT). A Lambda cannot cross the NativeHost interface
 // (monomorphizer limit - same as ctx.post / ListRowBox / TreeBox), so ui.cb heap-boxes
@@ -3282,7 +3281,7 @@ void deleteTree(move Element root)
     delete root;
 }
 
-// ── Reconciler / patch stream ─────────────────────────────────────────────────
+// -- Reconciler / patch stream -------------------------------------------------
 //
 // reconcile() diffs a freshly-rendered WIP tree against the committed (live)
 // tree, mutating the committed tree in place and recording what changed as a
@@ -3313,7 +3312,7 @@ Patch makePatch(int op, int nodeKind, string detail)
     return p;
 }
 
-// Patch identity (P0): the affected node's stable key path lets a NativeHost route
+// Patch identity: the affected node's stable key path lets a NativeHost route
 // a create/update/destroy to the right control without re-walking the tree. `key`
 // is the parent key-path joined with the node's own key; unkeyed nodes carry the
 // positional path the reconciler synthesizes at the call site.
@@ -3356,7 +3355,7 @@ int indexByKey(list<Element>* pool, string key)
 move Element reconcile(move Element committed, move Element wip, list<Patch>* patches)
 {
     // Public entry: the root has no parent path. reconcilePath threads a stable
-    // key path down the tree so each patch carries its node's identity (P0).
+    // key path down the tree so each patch carries its node's identity.
     return reconcilePath(committed, wip, patches, "");
 }
 
@@ -3370,7 +3369,7 @@ string keySegment(Element node, int pos)
 }
 
 // Reconcile threading the parent key path. Behavior (patch op/kind/count/order and
-// which subtree is freed) is IDENTICAL to the pre-P0 reconcile; the only addition
+// which subtree is freed) is IDENTICAL to the earlier reconcile; the only addition
 // is populating each patch's `key` with the affected node's joined key path.
 move Element reconcilePath(move Element committed, move Element wip, list<Patch>* patches, string parentPath)
 {
@@ -3405,7 +3404,7 @@ move Element reconcilePath(move Element committed, move Element wip, list<Patch>
     list<Element>* newKids = wip.childList();
     int newN = newKids.count();
 
-    // Controlled CONTAINER props (P9): reconcile keeps the committed container node and
+    // Controlled CONTAINER props: reconcile keeps the committed container node and
     // frees the wip, so a controlled scalar authored on the wip (tab selection / split
     // ratio) would be lost. Copy those forward for the containers whose host layout reads
     // them - the leaf-prop RadioGroup pattern does not apply since these drive geometry.
@@ -3457,7 +3456,7 @@ move Element reconcilePath(move Element committed, move Element wip, list<Patch>
     return committed;
 }
 
-// ── Components (model layer) ──────────────────────────────────────────────────
+// -- Components (model layer) --------------------------------------------------
 //
 // A component renders itself to a host Element tree. render() receives the
 // host-owned UiContext so its event closures can call ctx.invalidate() (mark the
@@ -3468,7 +3467,7 @@ interface Component
     Element render(UiContext* ctx);
 };
 
-// ── ComponentElement: a reconciler node wrapping a component's rendered subtree ─
+// -- ComponentElement: a reconciler node wrapping a component's rendered subtree -
 //
 // Lets a parent render child components as nodes in its own tree. A parent owns
 // its child components (e.g. list<Counter*>) and, each render, re-mounts them by
@@ -3582,11 +3581,11 @@ int PROP_SCROLLY = 4;   // vertical scroll offset (DIPs)
 int FONT_UI      = 0;   // the default UI font (Segoe UI Variable / system)
 int FONT_MONO    = 1;   // a monospace face (editor / code)
 
-// ── setListOp: the item-data batch protocol (P8) ─────────────────────────────
+// -- setListOp: the item-data batch protocol -----------------------------------
 // Property sets (setText/setBoolProp/setIntProp) cannot express a data-control's
 // columns + item source, so a ListView drives its native control through one op-coded
 // call. The ops below are the DELIBERATE common denominator of three toolkits, chosen
-// so the P11 Cocoa/WinUI backends implement the SAME protocol without a redesign:
+// so the Cocoa/WinUI backends implement the SAME protocol without a redesign:
 //   * Win32 WC_LISTVIEW (report + LVS_OWNERDATA): RESET/ADD_COLUMN -> LVM_INSERTCOLUMN;
 //     SET_ROWCOUNT -> LVM_SETITEMCOUNT; SET_ROWTEXT_CB stores the callback that
 //     LVN_GETDISPINFO invokes; SELECT_MODE -> LVS_SINGLESEL; SET_SELECTION ->
@@ -3610,16 +3609,16 @@ int LISTOP_SET_SELECT_MODE = 5;  // arg0 = 0 single-select, 1 multi-select
 int LISTOP_SET_SELECTION  = 6;   // arg0 = row to select (-1 clears selection)
 int LISTOP_INVALIDATE     = 7;   // redraw / reload the visible (virtual) rows
 
-// ── Tab + tree ops on the SAME setListOp seam (P9) ───────────────────────────
+// -- Tab + tree ops on the SAME setListOp seam ---------------------------------
 // TabControl and TreeView reuse setListOp rather than adding new interface methods
 // (keeps the seam surface flat - one batch call for every data/navigation control).
 //   * TabControl (WC_TABCONTROL): TAB_RESET -> TCM_DELETEALLITEMS; TAB_ADD -> TCM_INSERTITEM
 //     (arg0 = index, text = title); TAB_SET_SEL -> TCM_SETCURSEL (arg0 = index). Cocoa maps
-//     these to a tabless NSTabView / segmented control; WinUI to a TabView (all P11).
+//     these to a tabless NSTabView / segmented control; WinUI to a TabView.
 //   * TreeView (WC_TREEVIEW): TREE_SET_SRC_CB stores the boxed node-source (TreeBox* as u64,
 //     like ROWTEXT_CB); TREE_REBUILD clears + inserts the root's children (lazy, cChildren
 //     drives the expander, TVN_ITEMEXPANDING materializes on demand). Cocoa -> NSOutlineView
-//     dataSource, WinUI -> TreeView ItemsSource (P11). Selection round-trips through the
+//     dataSource, WinUI -> TreeView ItemsSource. Selection round-trips through the
 //     native control (TVN_SELCHANGED), so there is no SET_SELECTION op for the tree.
 int LISTOP_TAB_RESET       = 10;  // remove every tab
 int LISTOP_TAB_ADD         = 11;  // arg0 = index, text = tab title
@@ -3654,13 +3653,13 @@ interface NativeHost
     // content change that alters intrinsic sizes).
     void requestLayout();
 
-    // Item-data batch op for data controls (ListView, P8). `op` is a LISTOP_* code;
+    // Item-data batch op for data controls (ListView). `op` is a LISTOP_* code;
     // `arg0`/`arg1` are integer operands, `text` a UTF-8 string operand (column
     // titles), `payload` an opaque u64 (the boxed rowText callback). See the LISTOP_*
     // design block above - this is the one seam call that is NOT a plain property set.
     void setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload);
 
-    // ── setImageData: push decoded pixels to an Image control (P10) ──────────────
+    // -- setImageData: push decoded pixels to an Image control --------------------
     // An Image's content is a toolkit-neutral 32-bit BGRA buffer, NOT a Win32 HBITMAP:
     // `pixels` is an opaque u64 pointing at `h`-row x `stride`-byte top-down BGRA32 data;
     // the host uploads it to the control however its toolkit prefers (Win32: a top-down

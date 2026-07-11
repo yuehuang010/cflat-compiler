@@ -44,7 +44,7 @@ class page_pool
     // Used only to gate the soft cap; not relied on for correctness.
     i64 _depth = 0;
 
-    // ── tagged pointer helpers ────────────────────────────────────────────────
+    // -- tagged pointer helpers ------------------------------------------------
 
     // Pack a 47-bit pointer and 17-bit ABA tag into one tagged stack-head word.
     i64 _encode(i64 ptr, i64 tag)
@@ -64,7 +64,7 @@ class page_pool
         return (top >> 47) & (i64)0x1FFFF;
     }
 
-    // ── public API ────────────────────────────────────────────────────────────
+    // -- public API ------------------------------------------------------------
 
     // Acquire a 64 KB page. Thread-safe.
     // Returned page is fully zeroed.
@@ -153,7 +153,7 @@ class page_pool
         }
     }
 
-    // ── stats / diagnostics ───────────────────────────────────────────────────
+    // -- stats / diagnostics ---------------------------------------------------
 
     // Approximate number of pages currently cached in the free stack.
     i64 cachedPages() { return __atomic_counter_read(&_depth); }

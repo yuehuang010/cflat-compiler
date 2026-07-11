@@ -404,7 +404,7 @@ extern char* fgets(char* buf, int count, void* stream) {
 // scanf - when the stdin hook is active, copy the current line into a local buffer
 // and parse it with the Windows CRT vsscanf backend.  After parsing the line cursor
 // advances to EOL (correct for one-value-per-line; multi-value same-line reads are
-// a known v1 limitation).
+// a known limitation).
 extern int scanf(const char* fmt, ...) {
     va_list ap;
     va_start(ap);

@@ -11,7 +11,7 @@
 // an app that renders to the GDI host renders here too - it just imports this host
 // instead.
 //
-// P7 - app-shell foundation: this host is now MULTI-WINDOW. A `Window` owns its
+// App-shell foundation: this host is now MULTI-WINDOW. A `Window` owns its
 // {top-level HWND, root Element/Component, UiContext, live-control bookkeeping,
 // theme}; the app holds a list<Window*> driven by ONE message loop. The former
 // single-editor host globals are gone: the free-function WndProc resolves the
@@ -24,7 +24,7 @@ import "windows.h" lib { "user32.lib", "gdi32.lib", "comctl32.lib", "dwmapi.lib"
 import "ui_native.cb";
 import "graphic/bitmap.cb";   // 24bpp BMP writer for nativeSaveWindowBmp (the shot() backend)
 
-// ── APIs not surfaced by the windows.h binding (declared by hand) ────────────
+// -- APIs not surfaced by the windows.h binding (declared by hand) ------------
 // InitCommonControls() (commctrl.h) registers the classic control classes;
 // DwmSetWindowAttribute (dwmapi.h) drives the immersive dark-mode titlebar.
 extern stdcall void InitCommonControls();
@@ -57,7 +57,7 @@ const int TTS_ALWAYSTIP      = 0x0001;
 // Marshaled UI-thread call (ctx.post): WM_APP+1, lParam = the boxed closure pointer.
 const int WM_APP_CALL = 0x8001;
 
-// ── ListView (WC_LISTVIEW) messages / styles / notify codes (P8) ──────────────
+// -- ListView (WC_LISTVIEW) messages / styles / notify codes -------------------
 // The commctrl LV* constants are not surfaced by the windows.h binding (CB_* and
 // NMHDR are), so they are declared by hand. LVM_FIRST = 0x1000, LVN_FIRST = -100.
 const int LVM_DELETECOLUMN            = 0x101C;   // LVM_FIRST+28
@@ -136,7 +136,7 @@ struct TTInfoA
     void* lpReserved = nullptr;
 };
 
-// ── TabControl (WC_TABCONTROL) messages / notify codes (P9) ───────────────────
+// -- TabControl (WC_TABCONTROL) messages / notify codes -------------------------
 // TCM_FIRST = 0x1300; TCN_FIRST = -550. Not surfaced by the windows.h binding.
 const int TCM_INSERTITEMA   = 0x1307;   // TCM_FIRST+7
 const int TCM_DELETEALLITEMS = 0x1309;  // TCM_FIRST+9
@@ -160,7 +160,7 @@ struct TCItemA
     i64   lParam      = 0;
 };
 
-// ── TreeView (WC_TREEVIEW) messages / styles / notify codes (P9) ──────────────
+// -- TreeView (WC_TREEVIEW) messages / styles / notify codes --------------------
 // TV_FIRST = 0x1100; TVN_FIRST = -400.
 const int TVM_INSERTITEMA  = 0x1100;   // TV_FIRST+0
 const int TVM_DELETEITEM   = 0x1101;   // TV_FIRST+1
@@ -223,12 +223,12 @@ struct TVInsertA
 void* tviRoot() { return (void*)((i64)0 - (i64)0x10000); }
 void* tviLast() { return (void*)((i64)0 - (i64)0xFFFE); }
 
-// ── Image / GroupBox / CanvasView (P10) ──────────────────────────────────────
+// -- Image / GroupBox / CanvasView --------------------------------------------
 // STM_SETIMAGE / IMAGE_BITMAP / SS_BITMAP / SS_REALSIZECONTROL / BS_GROUPBOX /
 // LR_LOADFROMFILE / DIB_RGB_COLORS / PW_RENDERFULLCONTENT / GWLP_USERDATA are all
 // surfaced by the windows.h binding. The custom-draw NM_/CDDS_/CDRF_/CDIS_ codes are not.
 
-// NM_CUSTOMDRAW for themed accent buttons (P10). NM_FIRST = 0; NM_CUSTOMDRAW = NM_FIRST-12.
+// NM_CUSTOMDRAW for themed accent buttons. NM_FIRST = 0; NM_CUSTOMDRAW = NM_FIRST-12.
 const int NM_CUSTOMDRAW      = -12;
 const int CDDS_PREPAINT      = 0x00000001;
 const int CDRF_DODEFAULT     = 0x00000000;
@@ -266,7 +266,7 @@ struct BmiHeader
 const int BASE_X = 8;
 const int BASE_Y = 26;
 
-// ── App-wide host state (NOT per-window) ─────────────────────────────────────
+// -- App-wide host state (NOT per-window) -------------------------------------
 // The window class + hInstance + declarative menu are shared by every window; the
 // per-window state lives in Window (below). _cur is the window currently being
 // serviced (set by WndProc from the incoming HWND, and explicitly during a build).
@@ -275,7 +275,7 @@ bool           _classReg   = false;
 bool           _secClassReg = false;
 void*          _accelTable = nullptr;
 
-// The declarative menu bar (P3). The app builds it once with menuReset/menuAddTop/
+// The declarative menu bar. The app builds it once with menuReset/menuAddTop/
 // menuAddItem before creating windows; each window realizes the SAME declaration into
 // its own HMENU + the shared accelerator table. Parallel lists keep ownership simple.
 list<string>          _menuTop        = default;   // top-level menu titles
@@ -332,7 +332,7 @@ string tooltipOf(Element node)
     return "";
 }
 
-// P13 a11y: kinds whose window text is NOT their visible content, so they expose no
+// Accessibility: kinds whose window text is NOT their visible content, so they expose no
 // MSAA/UIA Name on their own. For these, a tooltip is mirrored into the window text (which
 // these classes do not paint) so a screen reader announces a Name - text-bearing controls
 // (Button/Text/Checkbox/Radio/GroupBox/Edit) already get a Name from their window text.
@@ -342,8 +342,8 @@ bool accessibleNameKind(int k)
         || k == ELEM_COMBO || k == ELEM_IMAGE || k == ELEM_CANVAS;
 }
 
-// ── Window: one top-level window + its Element tree, context, and controls ────
-// Implements NativeHost (each window drives its own controls). P7 replaces the old
+// -- Window: one top-level window + its Element tree, context, and controls ----
+// Implements NativeHost (each window drives its own controls). This replaces the old
 // single-editor Win32Host globals; the app holds a list<Window*>. Menu declaration,
 // hInstance, and the accelerator table stay app-wide (above).
 class Window : NativeHost
@@ -359,31 +359,31 @@ class Window : NativeHost
     void* bgBrush   = nullptr;       // cached solid brush of themeBg
     list<string> liveKeys    = default;   // keys with a live control this frame
     list<u64>    liveHandles = default;   // parallel handles (HWND as u64)
-    // ListView rowText callback boxes (P8): parallel HWND -> ListRowBox* (as u64). The
+    // ListView rowText callback boxes: parallel HWND -> ListRowBox* (as u64). The
     // host owns these; freed on destroyControl and dispose. A Lambda cannot cross the
     // seam, so the callback rides as an opaque u64 (see setListOp / __uiListRowText).
     list<u64>    listBoxHandles = default;
     list<u64>    listBoxPtrs    = default;
-    // TreeView node-source boxes (P9): parallel HWND -> TreeBox* (as u64), like the list
+    // TreeView node-source boxes: parallel HWND -> TreeBox* (as u64), like the list
     // boxes. Freed on destroyControl + dispose (a Lambda cannot cross the seam).
     list<u64>    treeBoxHandles = default;
     list<u64>    treeBoxPtrs    = default;
-    // Per-key context menus (P9): parallel key-path -> ContextMenu* (as u64). Host-owned;
+    // Per-key context menus: parallel key-path -> ContextMenu* (as u64). Host-owned;
     // registered via nativeSetContextMenu, freed on dispose.
     list<string> ctxKeys        = default;
     list<u64>    ctxMenus        = default;
     string       splitDragKey    = default;   // key path of a splitter being dragged ("" = none)
-    // Image HBITMAPs (P10): parallel control HWND -> HBITMAP (as u64) + the last pixel
+    // Image HBITMAPs: parallel control HWND -> HBITMAP (as u64) + the last pixel
     // buffer uploaded (to skip redundant DIB rebuilds). The host owns the bitmaps; they
     // are deleted on destroyControl + dispose (DestroyWindow does not free an STM image).
     list<u64>    imgHandles      = default;
     list<u64>    imgBitmaps      = default;
     list<u64>    imgLastPixels   = default;
-    // CanvasView paint boxes (P10): parallel child HWND -> CanvasBox* (as u64), like the
+    // CanvasView paint boxes: parallel child HWND -> CanvasBox* (as u64), like the
     // list/tree boxes; freed on destroyControl + dispose (a Lambda cannot cross the seam).
     list<u64>    canvasHandles   = default;
     list<u64>    canvasBoxes     = default;
-    // Accent-button colors (P10): parallel push-BUTTON HWND -> (bg, fg) COLORREF for
+    // Accent-button colors: parallel push-BUTTON HWND -> (bg, fg) COLORREF for
     // NM_CUSTOMDRAW. Only set when the theme gives a non-default button color, so a
     // monochrome theme leaves buttons at the native look (byte-identical).
 
@@ -573,7 +573,7 @@ class Window : NativeHost
         }
     }
 
-    // Store a push button's accent colors for NM_CUSTOMDRAW (P10). A 0 (default) bg
+    // Store a push button's accent colors for NM_CUSTOMDRAW. A 0 (default) bg
     // forgets any prior accent so the button reverts to the native look; a set bg is
     // recorded as a COLORREF pair the custom-draw handler fills with. fgColor/bgColor are
     // framework colors (0 = default). Only ELEM_BUTTON calls this (see _syncProps).
@@ -623,7 +623,7 @@ class Window : NativeHost
         return false;
     }
 
-    // ── Image DIB upload (P10; setImageData seam + HBITMAP bookkeeping) ───────────
+    // -- Image DIB upload (setImageData seam + HBITMAP bookkeeping) -----------------
     // Upload a top-down BGRA32 buffer to control `h` as an HBITMAP (STM_SETIMAGE). Builds
     // a top-down 32bpp DIB section, copies the pixels into it, and swaps the control's
     // bitmap, deleting the previous one. The new HBITMAP is remembered so destroyControl /
@@ -722,7 +722,7 @@ class Window : NativeHost
         }
     }
 
-    // ── CanvasView paint-box bookkeeping (P10; mirrors the list/tree boxes) ───────
+    // -- CanvasView paint-box bookkeeping (mirrors the list/tree boxes) -------------
     void _setCanvasBox(u64 h, u64 box)
     {
         int i = 0;
@@ -755,7 +755,7 @@ class Window : NativeHost
         }
     }
 
-    // ── ListView rowText box bookkeeping (P8) ────────────────────────────────
+    // -- ListView rowText box bookkeeping --------------------------------------
     u64 _listBoxFor(u64 h)
     {
         int i = 0;
@@ -807,7 +807,7 @@ class Window : NativeHost
         }
     }
 
-    // ── TreeView node-source box bookkeeping (P9; mirrors the ListView boxes) ──
+    // -- TreeView node-source box bookkeeping (mirrors the ListView boxes) ------
     u64 _treeBoxFor(u64 h)
     {
         int i = 0;
@@ -1279,7 +1279,7 @@ class Window : NativeHost
             Button* b = node as Button;
             this.setText(h, b.title.data());
             this.setBoolProp(h, PROP_ENABLED, !b.disabled);
-            // Accent-fill via NM_CUSTOMDRAW (P10): a themed button gets its accent colors;
+            // Accent-fill via NM_CUSTOMDRAW: a themed button gets its accent colors;
             // a monochrome theme (buttonBg 0) forgets the accent -> native look.
             int abg = pickColor(b.backgroundColor, this.ctx.theme.buttonBg);
             int afg = pickColor(b.color, this.ctx.theme.buttonText);
@@ -1504,7 +1504,7 @@ class Window : NativeHost
         }
         this.treeBoxHandles.clear();
         this.treeBoxPtrs.clear();
-        // Free the host-owned per-key context menus (P9).
+        // Free the host-owned per-key context menus.
         int ci = 0;
         while (ci < this.ctxMenus.count())
         {
@@ -1637,7 +1637,7 @@ class Window : NativeHost
     }
 };
 
-// ── CanvasView: a GDI-backed child the app paints via the Canvas API (P10) ────
+// -- CanvasView: a GDI-backed child the app paints via the Canvas API -----------
 // The escape hatch. A CanvasView maps to a "CFlatCanvasChild" window whose WndProc
 // invokes the app's boxed onPaint(Canvas) closure on WM_PAINT, handing it a
 // NativeGdiCanvas over the paint DC. The app draws in the SAME cell coordinates the
@@ -1762,7 +1762,7 @@ void ensureCanvasClass()
     _canvasClassReg = true;
 }
 
-// ── App-wide window registry + the "current" window ──────────────────────────
+// -- App-wide window registry + the "current" window --------------------------
 // One message loop drives every window. _cur is the window being serviced: the
 // WndProc sets it from GWLP_USERDATA before dispatching, and a build sets it to its
 // target. App code reaches the servicing window through activeCtx()/activeApp().
@@ -1853,7 +1853,7 @@ Element findByKey(Element node, string path, string want)
 }
 
 
-// ── ctx.post() marshaling hooks (installed into each window's ctx) ────────────
+// -- ctx.post() marshaling hooks (installed into each window's ctx) ------------
 extern stdcall u32 GetCurrentThreadId();
 
 // Enqueue a boxed closure onto a window's UI thread. `target` is the window HWND.
@@ -1881,7 +1881,7 @@ void pumpNative()
     }
 }
 
-// ── Native event routing (parent WM_COMMAND / WM_HSCROLL -> element handler) ──
+// -- Native event routing (parent WM_COMMAND / WM_HSCROLL -> element handler) --
 void routeClick(void* ctrl)
 {
     Window* wnd = curWin();
@@ -1931,7 +1931,7 @@ void routeCombo(void* ctrl)
     if (sel >= 0) { cb.onChange(sel); pumpNative(); }
 }
 
-// ── ListView notifications (WM_NOTIFY) ───────────────────────────────────────
+// -- ListView notifications (WM_NOTIFY) ---------------------------------------
 // Fill a GETDISPINFO request (owner-data): call the boxed rowText callback for the
 // requested (row, subitem) and copy the text into the OS-provided buffer.
 void fillListDispInfo(i64 lParam)
@@ -2008,7 +2008,7 @@ bool routeNotify(i64 lParam)
     return false;
 }
 
-// ── NMTREEVIEW field readers (P9) ─────────────────────────────────────────────
+// -- NMTREEVIEW field readers ----------------------------------------------------
 // NMTREEVIEWA = { NMHDR hdr; UINT action; TVITEMA itemOld; TVITEMA itemNew; POINT pt }.
 // itemNew starts at offset 88 on Win64; its hItem is +8 (96) and its lParam is +48 (136).
 void* _nmTreeItemNewHandle(i64 lParam)
@@ -2088,7 +2088,7 @@ void splitDragTo(Window* wnd, string key, int px, int py)
     pumpNative();
 }
 
-// ── ListView driver API (host-neutral; used by the gallery self-test) ─────────
+// -- ListView driver API (host-neutral; used by the gallery self-test) ---------
 void nativeListSelect(string keyPath, int row)
 {
     u64 h = curWin().ctx.nativeHandle(keyPath);
@@ -2188,7 +2188,7 @@ void nativeSetControlText(string keyPath, string s)
     curWin().applying = prev;
 }
 
-// ── P9 host-neutral driver API (tabs / tree / splitter / context menu) ─────────
+// -- Host-neutral driver API (tabs / tree / splitter / context menu) ------------
 // Register (or replace) the context menu for a key path; the window takes ownership of
 // the boxed ContextMenu* (freed on teardown). The app builds it once (sugar + addItem).
 void nativeSetContextMenu(string keyPath, u64 menuPtr) { curWin().setContextMenu(keyPath, menuPtr); }
@@ -2316,7 +2316,7 @@ void mirrorFocus(void* ctrl)
     if (key.length() > 0) wnd.ctx.focus(key);
 }
 
-// ── Menu bar + accelerators (P3) ─────────────────────────────────────────────
+// -- Menu bar + accelerators ----------------------------------------------------
 bool strContains(string s, const char* sub)
 {
     return strstr(s.data(), (char*)sub) != nullptr;
@@ -2456,7 +2456,7 @@ void routeMenu(int id)
     pumpNative();
 }
 
-// ── File dialogs + message boxes (P3) ─────────────────────────────────────────
+// -- File dialogs + message boxes ---------------------------------------------
 int _filterZ(char* buf, int p, const char* s)
 {
     int i = 0;
@@ -2579,7 +2579,7 @@ string nativeStatusText(string keyPath)
     return "" + buf;   // owned copy (buf is a stack buffer)
 }
 
-// ── Secondary window (P3 read-only About) ────────────────────────────────────
+// -- Secondary window (read-only About) ---------------------------------------
 // A separate top-level window with static read-only content, sharing the app's
 // message loop. Closing it does NOT quit the app. Used by fedit's Help > About.
 stdcall i64 SecondaryWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
@@ -2685,7 +2685,7 @@ u32 shadeRef(u32 c, int delta)
     return (u32)(r | (g << 8) | (b << 16));
 }
 
-// NM_CUSTOMDRAW accent draw for a themed push button (P10). Reads the NMCUSTOMDRAW at
+// NM_CUSTOMDRAW accent draw for a themed push button. Reads the NMCUSTOMDRAW at
 // `lParam`; if the notifying control has a stored accent, fills the accent background,
 // draws a focus ring when focused, paints the centered label in the accent text color,
 // and returns CDRF_SKIPDEFAULT (fully owning the draw). Returns true (with the LRESULT in
@@ -2730,7 +2730,7 @@ bool tryCustomDrawButton(Window* wnd, i64 lParam, i64* result)
     return true;
 }
 
-// Headless verification of the accent-button DRAW (P10). NM_CUSTOMDRAW cannot be captured
+// Headless verification of the accent-button DRAW. NM_CUSTOMDRAW cannot be captured
 // by PrintWindow (it re-renders controls default), so this drives the custom-draw path into
 // a memory DC with a synthetic NMCUSTOMDRAW and returns the filled pixel as a COLORREF. The
 // self-test asserts it equals the button's stored accent, proving the accent renders.
@@ -2761,10 +2761,10 @@ u32 nativeTestCustomDrawFill(string keyPath)
     return px;
 }
 
-// ── P11 host-neutral test drivers (form + data controls) ──────────────────────
+// -- Host-neutral test drivers (form + data controls) ---------------------------
 // These drive controls by KEY PATH through the same routing the OS uses on real input,
 // so the gallery self-test contains no toolkit-typed calls and runs against any host.
-// The Cocoa/WinUI hosts implement the SAME names (best-effort on Cocoa; P12 on WinUI).
+// The Cocoa/WinUI hosts implement the SAME names (best-effort on Cocoa; WinUI too).
 
 // Click a Button / Checkbox / RadioButton by key: mirror the OS auto-toggle for the two
 // state controls, then route the click so the model fires + the tree re-renders.
@@ -2940,7 +2940,7 @@ bool nativeSaveWindowBmp(string path)
     return ok;
 }
 
-// ── P13 host-neutral hardening drivers (Win32 bodies) ─────────────────────────
+// -- Host-neutral hardening drivers (Win32 bodies) ------------------------------
 // The MSAA/UIA accessible Name of the control at keyPath (its window text - the OS Name
 // source; for a textless control this is the tooltip mirrored in by applyTree).
 string nativeAccessibleName(string keyPath)
@@ -3039,7 +3039,7 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
 
     if (msg == WM_NOTIFY)
     {
-        // NM_CUSTOMDRAW accent buttons (P10): intercept before the data-control routing so
+        // NM_CUSTOMDRAW accent buttons: intercept before the data-control routing so
         // a themed push button paints its accent fill + focus ring (fixing dark mode).
         NMHDR* nh = (NMHDR*)u2h((u64)lParam);
         if (wnd.ready && nh != nullptr && (int)nh.code == NM_CUSTOMDRAW)
@@ -3051,7 +3051,7 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
         return DefWindowProcA(hwnd, msg, wParam, lParam);
     }
 
-    // Right-click over a control with a registered context menu -> TrackPopupMenu (P9).
+    // Right-click over a control with a registered context menu -> TrackPopupMenu.
     if (msg == WM_CONTEXTMENU)
     {
         if (wnd.ready && wnd.showContextMenu((void*)wParam, lParam)) return (i64)0;
@@ -3059,7 +3059,7 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
     }
 
     // Splitter drag: a press in a divider gutter (client area, no child control there)
-    // captures the mouse; moves re-ratio the split; release ends the drag (P9).
+    // captures the mouse; moves re-ratio the split; release ends the drag.
     if (msg == WM_LBUTTONDOWN)
     {
         if (wnd.ready)
@@ -3238,7 +3238,7 @@ int createAppWindow(Component app, const char* title, bool show)
 }
 
 // Open a second (or Nth) top-level application window running `app`, built + shown,
-// sharing the one message loop. This is P7's genuine multi-window ("New Window").
+// sharing the one message loop. This is the genuine multi-window feature ("New Window").
 void openAppWindow(Component app, const char* title)
 {
     createAppWindow(app, title, true);

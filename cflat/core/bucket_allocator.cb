@@ -212,12 +212,12 @@ class BucketAllocator : IAllocator
     BucketAllocator* _next_sibling  = nullptr;
 
     // Per-BA mutex guarding all bucket/page/large-list mutation. Required
-    // because Phase B routes cross-thread/cross-program frees back through
+    // because cross-thread and cross-program frees are routed back through
     // the owning BA's dealloc, where they race with the owner's own
     // alloc/dealloc on its native thread.
     //
-    // Future optimization (Phase D'): replace the mutex with a lock-free
-    // remote-free LIFO so the owning thread's hot path takes zero atomics.
+    // Future optimization: replace the mutex with a lock-free remote-free
+    // LIFO so the owning thread's hot path takes zero atomics.
     mutex _lock = default;
 
     // -----------------------------------------------------------------------
@@ -494,8 +494,8 @@ class BucketAllocator : IAllocator
     //
     // Thread-safety: spawn_child mutates _first_child without synchronization;
     // it must be called from the parent's own thread (the usual case: a
-    // program's main thread spawning child Threads sequentially). Phase D
-    // will add atomic linking if concurrent spawn becomes a need.
+    // program's main thread spawning child Threads sequentially). A future
+    // revision will add atomic linking if concurrent spawn becomes a need.
     IAllocator spawn_child()
     {
         BucketAllocator* child = (BucketAllocator*)malloc((i64)sizeof(BucketAllocator));

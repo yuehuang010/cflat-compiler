@@ -85,7 +85,7 @@ void pumpAfterInput(void* hwnd)
     }
 }
 
-// ── GdiCanvas: the GDI implementation of the Canvas draw interface ─────────────
+// -- GdiCanvas: the GDI implementation of the Canvas draw interface -------------
 // Holds the device context for the current WM_PAINT plus the cell size. drawText
 // uses DrawTextA (left-aligned, single line); drawRect frames or fills a cell
 // rectangle with a stock black brush. Borrows the HDC - owns no GDI objects.

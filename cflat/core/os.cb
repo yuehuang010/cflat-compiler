@@ -86,10 +86,9 @@ if const (__WINDOWS__) {
 // --- POSIX NUMA helpers (meminfo parse, mbind syscall, shared reserve+commit
 // core) -----------------------------------------------------------------
 // os.cb owns the Linux meminfo/mbind helpers rather than reusing topology.cb's
-// file-parse helpers (topology.cb imports os.cb, not the other way around -
-// see the layering note in internal/plan/numa-domains.md). Gated out
-// entirely on Windows via an if/else pair (a bare `if` with no matching
-// `else` is not reliably dropped by ForwardRefScanner at file scope).
+// file-parse helpers (topology.cb imports os.cb, not the other way around).
+// Gated out entirely on Windows via an if/else pair (a bare `if` with no
+// matching `else` is not reliably dropped by ForwardRefScanner at file scope).
 if const (__WINDOWS__) {
     // Nothing: Windows uses GetNumaAvailableMemoryNodeEx/VirtualAllocExNuma directly.
 } else {
@@ -555,8 +554,7 @@ namespace os
     // Set the calling process's CPU affinity mask (self). Windows:
     // SetProcessAffinityMask (affects every thread of the process). Linux:
     // sched_setaffinity(0, ...) - NOTE this affects only the CALLING thread,
-    // not the whole process (see the PROCESS-tier caveat in
-    // internal/plan/numa-domains.md). macOS: no affinity API - always false.
+    // not the whole process. macOS: no affinity API - always false.
     bool process_set_affinity(u64 mask) {
         if const (__WINDOWS__) {
             return os.windows.SetProcessAffinityMask(os.windows.GetCurrentProcess(), mask) != 0;
@@ -592,9 +590,8 @@ namespace os
     // off those domains while explicitly pinned NumaThreads still win their
     // cores. Windows: SetProcessDefaultCpuSets, which (unlike
     // SetProcessAffinityMask) leaves the process affinity FULL so per-thread
-    // SetThreadAffinityMask pins are unconstrained (verified empirically -
-    // see the PROCESS-tier section of internal/plan/numa-domains.md). Linux:
-    // sched_setaffinity(0,...) on the calling thread (inherited by threads
+    // SetThreadAffinityMask pins are unconstrained (verified empirically).
+    // Linux: sched_setaffinity(0,...) on the calling thread (inherited by threads
     // spawned after; per-thread pins override). macOS: no lever -> false.
     // Returns true if confinement was applied.
     bool process_confine_cpus(u64 keepMask) {

@@ -187,7 +187,7 @@ class JsonBuilder : IReflector
     }
 };
 
-// ── JsonNode ─────────────────────────────────────────────────────────────────
+// -- JsonNode -----------------------------------------------------------------
 // Tagged-union tree node that implements both IJSON and IJSONArray directly.
 //
 // Tree structure: children are a singly-linked list via `next`.
@@ -274,7 +274,7 @@ class JsonNode : IJSON, IJSONArray
         return child;
     }
 
-    // ── IJSON ────────────────────────────────────────────────────────────────
+    // -- IJSON ----------------------------------------------------------------
 
     // True if a child with the given key exists.
     bool hasField(string key) { return _findKey(key) != nullptr; }
@@ -335,7 +335,7 @@ class JsonNode : IJSON, IJSONArray
         return result;
     }
 
-    // ── IJSONArray ───────────────────────────────────────────────────────────
+    // -- IJSONArray -----------------------------------------------------------
 
     // Number of array elements.
     int count() { return _count; }
@@ -387,7 +387,7 @@ class JsonNode : IJSON, IJSONArray
     }
 };
 
-// ── JsonParser ────────────────────────────────────────────────────────────────
+// -- JsonParser ----------------------------------------------------------------
 // Recursive-descent JSON parser. Builds a JsonNode tree.
 // When _arena is set, nodes are bump-allocated from it and the caller must NOT
 // delete individual nodes - the arena is freed as a unit by the caller.

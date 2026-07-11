@@ -23,7 +23,7 @@ import "interfaces.cb";
 import "cruntime.cb";
 import "page_pool.cb";
 
-// ── _pa_chunk ─────────────────────────────────────────────────────────────────
+// -- _pa_chunk -----------------------------------------------------------------
 // Header at the front of each malloc'd block. Data begins after the header
 // (sizeof(_pa_chunk) = 24 bytes on 64-bit). Blocks are chained as a linked list.
 
@@ -35,7 +35,7 @@ struct _pa_chunk
     i64        _used = 0;    // bytes consumed past the header
 };
 
-// ── page_arena ────────────────────────────────────────────────────────────────
+// -- page_arena ----------------------------------------------------------------
 
 // Transferable bump-allocation region holding a typed message root T, used for
 // zero-copy hand-off between producer and consumer over an arena_channel.
@@ -48,7 +48,7 @@ struct page_arena<T> where T : IMessage
     void*      _next      = nullptr;   // intrusive free-list link (used by block_pool)
     T          _root      = default;   // producer sets this to the typed message root
 
-    // ── Bump allocation ───────────────────────────────────────────────────────
+    // -- Bump allocation -------------------------------------------------------
 
     // Acquire a new chunk (pooled page or oversize vmem) and make it the head.
     void _newChunk(i64 minSize)
@@ -115,7 +115,7 @@ struct page_arena<T> where T : IMessage
         return total;
     }
 
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
+    // -- Lifecycle -------------------------------------------------------------
 
     // Reset all chunks for reuse (zero _used, clear _root and _id).
     // Chunks are NOT freed - they are retained for the next use.

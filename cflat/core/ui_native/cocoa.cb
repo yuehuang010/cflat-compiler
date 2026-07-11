@@ -34,8 +34,8 @@ const int MOD_SHIFT = 0x20000;    // 1<<17  NSEventModifierFlagShift
 const int MOD_ALT   = 0x80000;    // 1<<19  NSEventModifierFlagOption
 
 // A 4-double aggregate matching NSRect. On arm64 an HFA of 4 doubles is returned in
-// d0-d3; the M1 probe (cocoa_probe --selftest) confirmed the cflat function<> ABI
-// matches, so -[NSView frame] is read this way for the resize path (D10 Plan A).
+// d0-d3; cocoa_probe --selftest confirmed the cflat function<> ABI matches, so
+// -[NSView frame] is read this way for the resize path.
 struct RectD
 {
     double x = 0.0;
@@ -151,7 +151,7 @@ class CocoaHost : NativeHost
     list<string> liveKeys    = default;   // keys with a live control this frame
     list<u64>    liveHandles = default;   // parallel handles (NSView* as u64)
 
-    // ── P11 data/visual-control bookkeeping (mirror of the Win32 host lists) ──────
+    // -- Data/visual-control bookkeeping (mirror of the Win32 host lists) -----------
     // ListView rowText boxes: parallel table-view handle -> ListRowBox* (as u64), plus
     // the controlled selection (NSTableView owns no owner-data virtualization the way
     // Win32 LVS_OWNERDATA does, but the boxed rowText is still the single item source).
@@ -160,7 +160,7 @@ class CocoaHost : NativeHost
     list<u64>    listSelHandles = default;   // parallel handle -> selected row
     list<int>    listSelRows    = default;
     list<u64>    accHandles = default;       // parallel handle -> stored accent bg
-    list<u32>    accBgs     = default;       // (reported by nativeAccentBg, P10 parity)
+    list<u32>    accBgs     = default;       // (reported by nativeAccentBg)
     list<u64>    listRowCounts  = default;   // parallel handle -> virtual row count
     list<int>    listRowCountV  = default;
     // TreeView node-source boxes: parallel outline-view handle -> TreeBox* (as u64).
@@ -262,7 +262,7 @@ class CocoaHost : NativeHost
         }
         else if (elemKind == ELEM_STATUSBAR)
         {
-            // A read-only text strip stands in for the status bar (P7); macOS has no
+            // A read-only text strip stands in for the status bar; macOS has no
             // NSStatusBar equivalent for an in-window strip, so we use an NSTextField.
             ctrl = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
             msgBool(ctrl, "setBezeled:", false);
@@ -376,7 +376,7 @@ class CocoaHost : NativeHost
     }
 
     // Position + size in points (flipped view, so no y-flip). DIP -> points by
-    // BASE_X / BASE_Y; the M3 resize path feeds the client size back in DIPs.
+    // BASE_X / BASE_Y; the resize path feeds the client size back in DIPs.
     void setFrame(u64 h, Rect frameDip)
     {
         void* ctrl = u2h(h);
@@ -480,7 +480,7 @@ class CocoaHost : NativeHost
         }
     }
 
-    // ── box + per-control state bookkeeping (mirror of the Win32 host lists) ──────
+    // -- box + per-control state bookkeeping (mirror of the Win32 host lists) ------
     // The NSTableView / NSOutlineView backing the list/tree handle `h` (its scroll
     // view's documentView), or the handle itself as a fallback.
     void* _tableOf(u64 h)
@@ -752,7 +752,7 @@ class CocoaHost : NativeHost
     }
 
     // Stored accent, reported by nativeAccentBg/nativeTestCustomDrawFill (the accent is
-    // real via bezelColor; no offscreen pixel readback on Cocoa - WinUI P12 precedent).
+    // real via bezelColor; no offscreen pixel readback on Cocoa - same as the WinUI host).
     void _storeAccent(u64 h, int bgColor)
     {
         int i = 0;
@@ -1169,7 +1169,7 @@ class CocoaHost : NativeHost
         }
     }
 
-    // Accent-fill for a themed button (P10 parity): the same buttonBg/buttonText the
+    // Accent-fill for a themed button: the same buttonBg/buttonText the
     // Win32 host feeds NM_CUSTOMDRAW is applied here through bezelColor (look policy).
     void _syncButtonAccent(u64 h, Button* b)
     {
@@ -1353,7 +1353,7 @@ bool themeIsDark(Theme* t)
     return (r + g + b) < 384;
 }
 
-// ── CanvasView bridge (P11): a CoreGraphics-backed Canvas ────────────────────
+// -- CanvasView bridge: a CoreGraphics-backed Canvas -----------------------------
 // CocoaCanvas implements the ui.cb Canvas interface using AppKit drawing primitives
 // (NSBezierPath fill/stroke, NSString drawAtPoint - both CoreGraphics-backed), so the
 // app's onPaint(Canvas) closure paints into a CfCanvasView's drawRect:. Cell coords map
@@ -1419,7 +1419,7 @@ void _canvasDrawRectImp(void* self, void* cmd, double x, double y, double w, dou
 
 i8 _canvasIsFlippedImp(void* self, void* cmd) { return (i8)1; }
 
-// ── NSTableView dataSource IMPs (ListView; the boxed rowText is the item source) ──
+// -- NSTableView dataSource IMPs (ListView; the boxed rowText is the item source) --
 i64 _numberOfRowsImp(void* self, void* cmd, void* table)
 {
     if (!_setCurFromTarget(self)) return (i64)0;
@@ -1474,7 +1474,7 @@ void _onTabSegmentImp(void* self, void* cmd, void* seg)
     if (curWin().ready) routeTabChange(seg);
 }
 
-// ── NSOutlineView dataSource IMPs (TreeView; items are NSNumber(nodeId)) ──────
+// -- NSOutlineView dataSource IMPs (TreeView; items are NSNumber(nodeId)) ------
 i64 _outlineNumChildrenImp(void* self, void* cmd, void* outline, void* item)
 {
     if (!_setCurFromTarget(self)) return (i64)0;
@@ -1542,7 +1542,7 @@ void _onTreeWillExpandImp(void* self, void* cmd, void* note)
     if (nid >= 0) { tv.onExpand(nid); pumpNative(); }
 }
 
-// ── ctx.post() marshaling (performSelectorOnMainThread with an NSNumber box) ───
+// -- ctx.post() marshaling (performSelectorOnMainThread with an NSNumber box) ---
 void _cocoaPostEnqueue(u64 target, u64 boxPtr)
 {
     void* num = msgIntArg(cls("NSNumber"), "numberWithUnsignedLongLong:", (i64)boxPtr);
@@ -1560,7 +1560,7 @@ void _runPostBoxImp(void* self, void* cmd, void* num)
     __uiRunPostBox(boxPtr);
 }
 
-// ── Host-neutral accessors (P7; mirror the Win32 host) ───────────────────────
+// -- Host-neutral accessors (mirror the Win32 host) ------------------------------
 // This host is genuinely multi-window: each accessor resolves the servicing window
 // through curWin() (_cur is re-established at every callback entry). ctx.post
 // marshaling is real: performSelectorOnMainThread + hostDrainPosted.
@@ -1912,7 +1912,7 @@ void nativeFireContextMenu(string keyPath, int itemIndex)
 
 // Drive a splitter to a DIP position along its axis (headless drag). Fires onRatioChange
 // (the SplitView is a layout container, like Win32 - the divider is a parent-tracked gap,
-// not an NSSplitView, so the layout model stays single-source per the plan).
+// not an NSSplitView, so the layout model stays single-source).
 void nativeSplitterDrag(string keyPath, int dipX, int dipY)
 {
     Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
@@ -1930,7 +1930,7 @@ Rect nativeNodeBounds(string keyPath)
     return e.nodeBounds();
 }
 
-// ── Tab drivers (NSSegmentedControl strip + the controlled model) ─────────────
+// -- Tab drivers (NSSegmentedControl strip + the controlled model) -------------
 int nativeTabSelected(string keyPath)
 {
     u64 h = curWin().ctx.nativeHandle(keyPath);
@@ -1953,7 +1953,7 @@ void nativeTabSelect(string keyPath, int idx)
     routeTabChange(u2h(h));
 }
 
-// ── Tree drivers (real NSOutlineView item API; items are NSNumber(nodeId)) ─────
+// -- Tree drivers (real NSOutlineView item API; items are NSNumber(nodeId)) -----
 void* _outlineOf(string keyPath)
 {
     u64 h = curWin().ctx.nativeHandle(keyPath);
@@ -2010,7 +2010,7 @@ int nativeTreeItemNodeId(string keyPath, u64 hItem)
     return (int)msgGetI64(u2h(hItem), "integerValue");   // items are NSNumber(nodeId)
 }
 
-// ── ListView drivers (NSTableView + the boxed rowText item source) ────────────
+// -- ListView drivers (NSTableView + the boxed rowText item source) ------------
 int nativeListRowCount(string keyPath)
 {
     u64 h = curWin().ctx.nativeHandle(keyPath);
@@ -2062,7 +2062,7 @@ void nativeListActivate(string keyPath, int row)
     if (row >= 0) { lv.onActivate(row); pumpNative(); }
 }
 
-// ── P11 host-neutral form/data test drivers (mirror the Win32 names) ──────────
+// -- Host-neutral form/data test drivers (mirror the Win32 names) ---------------
 void nativeClickButton(string keyPath)
 {
     u64 h = curWin().ctx.nativeHandle(keyPath);
@@ -2180,7 +2180,7 @@ void nativeCloseWindow()
         destroyWindowStateAt(idx, true);
 }
 
-// -- Objective-C callback IMPs (D5: one shared CfHostTarget carries them all) --
+// -- Objective-C callback IMPs (one shared CfHostTarget carries them all) --
 // Plain non-capturing cflat functions; state flows through the host globals - no
 // Lambda crosses the C ABI.
 
@@ -2189,7 +2189,7 @@ i8 _isFlippedImp(void* self, void* cmd) { return (i8)1; }
 
 // applicationShouldTerminateAfterLastWindowClosed: -> NO. The host controls exit
 // itself (the main window's windowWillClose: stops the run loop) so runAppGuiNative
-// can delete the heap component after [NSApp run] returns (D9).
+// can delete the heap component after [NSApp run] returns.
 i8 _shouldTerminateImp(void* self, void* cmd, void* app) { return (i8)0; }
 
 // The control to focus on show: prefer a TextArea (a scroll view's NSTextView),
@@ -2285,7 +2285,7 @@ void _textDidChangeImp(void* self, void* cmd, void* note)
     routeEdit(scroll);
 }
 
-// windowDidResize: read the content view's size (D10 Plan A struct return) and
+// windowDidResize: read the content view's size (struct return) and
 // relayout at the new DIP client size.
 void _windowResizeImp(void* self, void* cmd, void* note)
 {
@@ -2423,7 +2423,7 @@ void* _accelKeyEquivObj(string a)
 }
 
 // The key-equivalent modifier mask for an accel. F-keys carry no modifier of their
-// own (D7); Ctrl maps to Cmd.
+// own; Ctrl maps to Cmd.
 int _accelMask(string a)
 {
     string k = _accelKeyToken(a);
@@ -2652,7 +2652,7 @@ void registerHostClasses()
         addMethod0(tg, "windowWillClose:", ww);
         addMethodBool(tg, "windowShouldClose:", wc);
 
-        // Data-control target/action + dataSource methods (P11).
+        // Data-control target/action + dataSource methods.
         function<void(void*, void*, void*)> lc = _onListClickImp;
         function<void(void*, void*, void*)> ld = _onListDoubleClickImp;
         function<void(void*, void*, void*)> tsg = _onTabSegmentImp;

@@ -35,7 +35,7 @@ import "ui_native.cb";
 // consumer that uses waitUntil must have sleep in scope (import "time.cb").
 void sleep(i64 ms);
 
-// ── Host + driver seam (forward declarations, defined by the backend) ─────────
+// -- Host + driver seam (forward declarations, defined by the backend) ---------
 // Window lifecycle + message pumping.
 void startHeadlessWindow(Component app, const char* title, int w, int h);
 void hostDrainPosted();
@@ -85,7 +85,7 @@ int nativeTooltipCount();
 // cocoa/winui define it as a no-op returning false. shot()/uiShot() are the portable verb.
 bool nativeSaveWindowBmp(string path);
 
-// ── Small helpers used by the hardening kits below ────────────────────────────
+// -- Small helpers used by the hardening kits below ----------------------------
 // True if `xs` contains `want` (string value compare).
 bool _uiListHasStr(list<string>* xs, string want)
 {
@@ -115,7 +115,7 @@ string _uiSafeName(string name)
 struct UiSize { int w = 0; int h = 0; };
 UiSize uiSize(int w, int h) { UiSize s = default; s.w = w; s.h = h; return s; }
 
-// ── UiTest: the per-case context (wraps one launched headless window) ─────────
+// -- UiTest: the per-case context (wraps one launched headless window) ---------
 // A case body receives a UiTest* and drives the window through the methods below.
 // Asserts record pass/fail with the key path + expected/actual in the message and
 // never abort the process; a failed require() sets `aborted` so the remaining
@@ -128,7 +128,7 @@ class UiTest
     bool   aborted  = false;   // a require() failed -> skip the rest of this case
     bool   launched = false;   // launch() created a window -> runner tears it down
 
-    // ── Launch / teardown ────────────────────────────────────────────────────
+    // -- Launch / teardown ----------------------------------------------------
     // Create a fresh invisible window bound to `app` (DIP size w x h) and build its
     // tree. `app` is a `new`-allocated Component the window takes ownership of; the
     // runner frees it via nativeTeardownForTest after the case.
@@ -146,7 +146,7 @@ class UiTest
         hostDrainPosted();
     }
 
-    // ── Actions (thin facades, one per driver, same key-path addressing) ──────
+    // -- Actions (thin facades, one per driver, same key-path addressing) ------
     void click(string key)                 { if (this.aborted) return; nativeClickButton(key); }
     void type(string key, string s)         { if (this.aborted) return; nativeTypeText(key, s); }
     void setText(string key, string s)      { if (this.aborted) return; nativeSetControlText(key, s); }
@@ -162,7 +162,7 @@ class UiTest
     string focusFirst()                     { return nativeFocusFirst(); }
     string focusNext()                      { return nativeFocusNext(); }
 
-    // ── Readers (return live state for the caller to assert on) ───────────────
+    // -- Readers (return live state for the caller to assert on) ---------------
     string controlText(string key)          { return nativeControlText(key); }
     bool isChecked(string key)              { return nativeIsChecked(key); }
     bool isEnabled(string key)              { return nativeIsEnabled(key); }
@@ -192,7 +192,7 @@ class UiTest
     // failing case when --shot-dir is set.
     bool shot(string path) { return nativeSaveWindowBmp(path); }
 
-    // ── waitUntil: the ONLY place time appears; everything else is synchronous ─
+    // -- waitUntil: the ONLY place time appears; everything else is synchronous -
     // Poll pred() every ~10ms up to timeoutMs, pumping posted UI-thread work between
     // polls. Returns true once pred() holds, false on timeout (or if the case aborted).
     bool waitUntil(Lambda<bool()> pred, int timeoutMs)
@@ -211,7 +211,7 @@ class UiTest
         return pred();
     }
 
-    // ── Asserts (record with the assertion name + expected/actual detail) ─────
+    // -- Asserts (record with the assertion name + expected/actual detail) -----
     void _record(string name, bool ok, string detail)
     {
         if (this.aborted) return;   // a require() already failed: skip the rest
@@ -260,7 +260,7 @@ class UiTest
     }
 };
 
-// ── UiCase: one registered case (name + body) ─────────────────────────────────
+// -- UiCase: one registered case (name + body) ---------------------------------
 // The body is stored as a function<> FIELD (which cflat supports) rather than a
 // list<function<...>> element (which does not monomorphize), so cases live in a
 // list<UiCase*>. The case wrapper owns its body closure and frees it on delete.
@@ -270,7 +270,7 @@ class UiCase
     function<void(UiTest*)> body = default;
 };
 
-// ── UiTestSuite: the runner ───────────────────────────────────────────────────
+// -- UiTestSuite: the runner ---------------------------------------------------
 class UiTestSuite
 {
     string name = default;
@@ -362,7 +362,7 @@ UiTestSuite uiTestSuite(string name)
     return s;
 }
 
-// ── Hardening kits (host-neutral; generalized from the gallery self-test) ─────
+// -- Hardening kits (host-neutral; generalized from the gallery self-test) -----
 
 // Save an offscreen capture of the current window to `bmpPath` (Win32-only; false
 // otherwise). The portable verb apps + the runner call (delegates to the backend).

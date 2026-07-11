@@ -25,7 +25,7 @@ import "stop_token.cb";
 import "list.cb";
 import "string.cb";
 
-// ── Win32 externs not already in os.windows.cb ────────────────────────────────
+// -- Win32 externs not already in os.windows.cb --------------------------------
 
 // Create a child process from a command line, wiring up the startup info and pipes.
 extern stdcall i32 CreateProcessA(
@@ -51,7 +51,7 @@ extern stdcall i32 ReadFile(void* hFile, char* lpBuffer, i32 nNumberOfBytesToRea
 // Set flags (e.g. inheritability) on a kernel object handle.
 extern stdcall i32 SetHandleInformation(void* hObject, i32 dwMask, i32 dwFlags);
 
-// ── Win32 structs ─────────────────────────────────────────────────────────────
+// -- Win32 structs -------------------------------------------------------------
 
 // SECURITY_ATTRIBUTES - 24 bytes on x64 (pointer at offset 8 needs 4-byte pad after nLength).
 struct _SecAttrs {
@@ -98,7 +98,7 @@ struct _ProcessInfo {
     i32   dwThreadId  = 0;
 };
 
-// ── I/O thread context ────────────────────────────────────────────────────────
+// -- I/O thread context --------------------------------------------------------
 
 // Context handed to the stdout reader thread: pipe handle plus the onStdout callback.
 struct __ProcessReaderCtx {
@@ -216,7 +216,7 @@ char* __process_build_cmdline(string exe, list<string>* pargs) {
     return buf;
 }
 
-// ── process struct ────────────────────────────────────────────────────────────
+// -- process struct ------------------------------------------------------------
 
 // Launch and communicate with a child process via optional stdout/stdin hooks.
 class process : IProcess {

@@ -10,7 +10,7 @@
 //
 // MUST be compiled with -fno-builtin: otherwise LLVM's loop-idiom recognizer turns the
 // byte loops below back into calls to memcpy/memset, which would recurse into these very
-// definitions. See internal/plan/remove-vcruntime-dependency.md.
+// definitions.
 
 // No #include: this file is compiled at the user's link time, so staying header-free keeps the
 // freestanding link from needing any SDK/CRT headers. size_t is the only library type used;
@@ -376,7 +376,7 @@ double    difftime(long long e, long long s) { return _difftime64(e, s); }
 // loader-filled slot index (_tls_index); the compiler emits references to both. The CRT
 // (msvcrt.lib / libcmt.lib) normally supplies them - we provide them here so the freestanding
 // link does not need it. Layout mirrors the standard CRT tlssup.c. x64 only for now (x86 name
-// decoration differs - Phase D).
+// decoration differs).
 
 unsigned long _tls_index = 0;
 
@@ -425,7 +425,7 @@ const cflat_image_tls_directory64 _tls_used = {
 // static initializers, sets up argv/env, calls main, then exit(). We provide our own so
 // the output exe does not need msvcrt.lib - using ONLY Universal CRT entry points
 // (api-ms-win-crt-*, OS-resident on Win10+). Linked via /entry:cflat_start with
-// /nodefaultlib:msvcrt.lib. See internal/plan/remove-vcruntime-dependency.md Phase A.
+// /nodefaultlib:msvcrt.lib.
 
 typedef void (__cdecl* cflat_pvfv)(void);   // C++ ctor / void initializer thunk
 typedef int  (__cdecl* cflat_pifv)(void);   // C initializer (returns an errno-style code)

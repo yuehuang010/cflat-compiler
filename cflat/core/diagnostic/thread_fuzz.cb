@@ -1,4 +1,4 @@
-// thread_fuzz.cb - seeded randomized thread-scheduling fuzzer (v1).
+// thread_fuzz.cb - seeded randomized thread-scheduling fuzzer.
 //
 // Opt-in debugging tool. Importing this module and calling ThreadFuzz.enable()
 // installs the global __fuzz_hook (declared in memory.cb, alongside the analogous
@@ -54,10 +54,10 @@ i64 __fuzz_splitmix64(__FuzzTLS* s) {
 }
 
 // The hook. Called from arbitrary threads at every sched-point. 'site' is a small
-// per-call-site id (unused by v1's randomized yielding; kept for v2/PCT and for
-// diagnostics). Each thread's decisions are a pure function of (seed, tid, local
-// counter), which keeps the hot path lock-free and makes replay far more stable
-// than a shared, racy RNG.
+// per-call-site id (unused by the current randomized yielding; kept for a future
+// PCT scheduler and for diagnostics). Each thread's decisions are a pure function
+// of (seed, tid, local counter), which keeps the hot path lock-free and makes
+// replay far more stable than a shared, racy RNG.
 void __fuzz_on_syncpoint(int site) {
     if (!__fuzz_tls.inited) {
         i64 tid = 0;

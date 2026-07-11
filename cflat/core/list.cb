@@ -126,7 +126,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         _size = 0;
     }
 
-    // ── ICopyable ──────────────────────────────────────────────────────────
+    // -- ICopyable ----------------------------------------------------------
     // Return an independent deep copy of this list. String elements are deep-copied;
     // primitive and pointer elements are copied by value (a list of pointers shares pointees).
     move list<T> copy()

@@ -41,7 +41,7 @@ import "atomic.cb";
 import "bucket_allocator.cb";
 import "page_arena.cb";
 
-// ── block_pool ────────────────────────────────────────────────────────────────
+// -- block_pool ----------------------------------------------------------------
 // Program thread allocator. Normal alloc/dealloc delegates to the embedded bucket.
 // acquire_arena() spawns a page_arena drawing chunks from the same bucket.
 // Maintains a lock-free Treiber stack of recycled page_arena* for fast reuse.
@@ -51,7 +51,7 @@ class block_pool<T> where T : IMessage
 {
     BucketAllocator _bucket    = default;
 
-    // ── cache line: free-list head ────────────────────────────────────────────
+    // -- cache line: free-list head --------------------------------------------
     // _top packs: tag[63:47] | page_arena_ptr[46:0]  (one i64, CAS target)
     // Tag increments on every push/pop; 17 bits prevents ABA within any
     // realistic scheduling window. Windows x64 user pointers fit in 47 bits.
@@ -61,7 +61,7 @@ class block_pool<T> where T : IMessage
 
     i64 _chunkSize = 65536;
 
-    // ── tagged pointer helpers ────────────────────────────────────────────────
+    // -- tagged pointer helpers ------------------------------------------------
 
     // Pack a 47-bit pointer and 17-bit ABA tag into one i64 CAS word.
     i64 _encode(i64 ptr, i64 tag)
@@ -81,7 +81,7 @@ class block_pool<T> where T : IMessage
         return (top >> 47) & (i64)0x1FFFF;
     }
 
-    // ── Treiber stack pop (lock-free) ─────────────────────────────────────────
+    // -- Treiber stack pop (lock-free) -----------------------------------------
 
     // _pop - lock-free Treiber stack pop; returns a recycled page_arena<T> or nullptr.
     page_arena<T>* _pop()
@@ -104,7 +104,7 @@ class block_pool<T> where T : IMessage
         return nullptr;
     }
 
-    // ── Treiber stack push (lock-free) ────────────────────────────────────────
+    // -- Treiber stack push (lock-free) ----------------------------------------
 
     // _push - lock-free Treiber stack push of a recycled page_arena<T> node.
     void _push(page_arena<T>* node)
@@ -119,7 +119,7 @@ class block_pool<T> where T : IMessage
         }
     }
 
-    // ── IAllocator - day-to-day allocation, delegates to bucket ───────────────
+    // -- IAllocator - day-to-day allocation, delegates to bucket ---------------
 
     // alloc - day-to-day allocation; delegates to the embedded bucket.
     void* alloc(i64 size)    { return _bucket.alloc(size); }
@@ -132,7 +132,7 @@ class block_pool<T> where T : IMessage
     // Total bytes committed by the bucket allocator.
     i64   totalBytes()       { return _bucket.committedBytes(); }
 
-    // ── Arena lifecycle ───────────────────────────────────────────────────────
+    // -- Arena lifecycle -------------------------------------------------------
 
     // Return a fresh or recycled page_arena ready for bump allocation.
     page_arena<T>* acquire_arena()
@@ -169,7 +169,7 @@ class block_pool<T> where T : IMessage
     }
 };
 
-// ── arena_channel ─────────────────────────────────────────────────────────────
+// -- arena_channel -------------------------------------------------------------
 // Composes a block_pool (thread allocator + arena spawner) with a bounded MPMC
 // ring for zero-copy page_arena transfer between threads.
 

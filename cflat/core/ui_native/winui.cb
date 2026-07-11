@@ -1,14 +1,14 @@
 // core/ui_native/winui.cb - a WinUI 3 (Windows App SDK) backend for the NativeHost seam (ui_native.cb).
 //
-// P6 M3 brought up the seam with four element kinds (Button/Text/CheckBox/Box). P12 completes
-// it: the full element set (TextBox, Slider/ProgressBar via IRangeBase, RadioButton, ComboBox,
+// An earlier pass brought up the seam with four element kinds (Button/Text/CheckBox/Box). This
+// file completes it: the full element set (TextBox, Slider/ProgressBar via IRangeBase, RadioButton, ComboBox,
 // ListView, TabView, TreeView, Image via WriteableBitmap, GroupBox, StatusBar, CanvasView
 // placeholder), the setListOp item-data protocol (its THIRD host validation), ctx.post through
 // the DispatcherQueue, theme accents, and the host-neutral native* test-driver set the gallery
 // self-test drives. Nothing above the NativeHost seam changes - this file only replaces the host.
 //
 // STRUCTURE: like the Win32 host, but single-window (multi-window is deferred, mirroring the
-// Cocoa P11 decision - the gallery gate needs one window; fedit-on-WinUI is not gating). The
+// Cocoa decision - the gallery gate needs one window; fedit-on-WinUI is not gating). The
 // whole graph lives on the XAML UI thread inside Application.Start's callback (Start owns the
 // message pump). A live app idles the pump; the headless self-test runs SYNCHRONOUSLY inside the
 // init callback (the framework is up, controls create + drive + read back with plain COM calls -
@@ -18,7 +18,7 @@
 // _exists hold), but their item DISPLAY is backed by the host-side box/model bookkeeping that the
 // native* drivers query - i.e. the setListOp seam + the rowText/TreeBox callbacks are validated
 // exactly as on Win32/Cocoa, while binding a live virtualized ItemsSource is a documented visual
-// enrichment deferred past this milestone (it needs a WinRT bindable-collection implementation).
+// enrichment deferred for now (it needs a WinRT bindable-collection implementation).
 // See doc/UI.md parity matrix.
 //
 // This file has no main(); an app imports it, defines a Component, and calls runAppWinui() (live)
@@ -37,7 +37,7 @@ import package-nuget "Microsoft.Windows.ApplicationModel.DynamicDependency.winmd
 extern stdcall i32  MddBootstrapInitialize2(u32 majorMinor, u16* versionTag, u64 minVersion, i32 options);
 extern stdcall void MddBootstrapShutdown();
 
-// ── IBufferByteAccess {905A0FEF-BC53-11DF-8C49-001E4FC686DA} ──────────────────
+// -- IBufferByteAccess {905A0FEF-BC53-11DF-8C49-001E4FC686DA} ------------------
 // The classic COM (non-WinRT) interface that hands out the raw byte pointer behind an IBuffer.
 // iidof knows only winmd types, so this is hand-declared (like core/com.cb's IUnknown) and its
 // IID hand-built; WriteableBitmap.PixelBuffer is filled through it (setImageData).
@@ -57,7 +57,7 @@ Guid IID_IBufferByteAccess()
                      (u8)0x4F, (u8)0xC6, (u8)0x86, (u8)0xDA);
 }
 
-// ── Host-wide singletons (one UI thread, one window) ─────────────────────────
+// -- Host-wide singletons (one UI thread, one window) -------------------------
 WinUI3Host _wHost  = default;
 Component   _wApp   = default;
 Element    _wTree   = default;
@@ -166,13 +166,13 @@ class WinUI3Host : NativeHost
     list<u64>    txtH = default;
     list<string> txtV = default;
 
-    // ListView bookkeeping (P8 setListOp): parallel control handle -> rowCount / rowText box / selection.
+    // ListView bookkeeping (setListOp): parallel control handle -> rowCount / rowText box / selection.
     list<u64>    listH        = default;
     list<int>    listRowCount = default;
     list<u64>    listBox      = default;
     list<int>    listSel      = default;
 
-    // TreeView bookkeeping (P9): the boxed node source (TreeBox*) per control, and a host-side
+    // TreeView bookkeeping: the boxed node source (TreeBox*) per control, and a host-side
     // materialized-node model (synthetic item handles) that the tree drivers walk.
     list<u64>    treeBoxH = default;
     list<u64>    treeBoxV = default;
@@ -183,25 +183,25 @@ class WinUI3Host : NativeHost
     list<bool>   tItemMat  = default;   // children materialized yet
     u64          tItemSeq  = 1u;        // synthetic item-handle counter
 
-    // Accent-button colors (P10): parallel control handle -> (bg, fg) framework colors (0 = none).
+    // Accent-button colors: parallel control handle -> (bg, fg) framework colors (0 = none).
     list<u64>    accH  = default;
     list<u32>    accBg = default;
     list<u32>    accFg = default;
 
-    // Image bookkeeping (P10): parallel control handle -> hasBitmap + last pixel buffer uploaded.
+    // Image bookkeeping: parallel control handle -> hasBitmap + last pixel buffer uploaded.
     list<u64>    imgH    = default;
     list<bool>   imgHas  = default;
     list<u64>    imgLast = default;
 
-    // CanvasView paint boxes (P10 placeholder): parallel control handle -> CanvasBox* (as u64).
+    // CanvasView paint boxes (placeholder): parallel control handle -> CanvasBox* (as u64).
     list<u64>    canvasH   = default;
     list<u64>    canvasBox = default;
 
-    // Per-key context menus (P9): parallel key path -> ContextMenu* (as u64). Host-owned.
+    // Per-key context menus: parallel key path -> ContextMenu* (as u64). Host-owned.
     list<string> ctxKeys  = default;
     list<u64>    ctxMenus  = default;
 
-    // ── Text mirror ──────────────────────────────────────────────────────────
+    // -- Text mirror ----------------------------------------------------------
     void _setTxt(u64 h, string s)
     {
         int i = 0;
@@ -215,7 +215,7 @@ class WinUI3Host : NativeHost
         return "";
     }
 
-    // ── ListView bookkeeping ─────────────────────────────────────────────────
+    // -- ListView bookkeeping -------------------------------------------------
     int _slot(list<u64>* xs, u64 h)
     {
         int i = 0;
@@ -244,7 +244,7 @@ class WinUI3Host : NativeHost
     void _listSetSel(u64 h, int r) { int i = this._slot(&this.listH, h); if (i >= 0) this.listSel.set(i, r); }
     int _listGetSel(u64 h) { int i = this._slot(&this.listH, h); if (i >= 0) { int v = this.listSel.get(i); return v; } return 0 - 1; }
 
-    // ── TreeView bookkeeping ─────────────────────────────────────────────────
+    // -- TreeView bookkeeping -------------------------------------------------
     void _treeSetBox(u64 h, u64 box)
     {
         int i = this._slot(&this.treeBoxH, h);
@@ -333,7 +333,7 @@ class WinUI3Host : NativeHost
         return nodeId;
     }
 
-    // ── Accent bookkeeping (P10; stored + reported - no NM_CUSTOMDRAW on WinUI) ─
+    // -- Accent bookkeeping (stored + reported - no NM_CUSTOMDRAW on WinUI) ------
     void _forgetAccent(u64 h)
     {
         int i = this._slot(&this.accH, h);
@@ -346,7 +346,7 @@ class WinUI3Host : NativeHost
         return false;
     }
 
-    // ── Image bookkeeping ────────────────────────────────────────────────────
+    // -- Image bookkeeping ----------------------------------------------------
     void _imgMark(u64 h, u64 px)
     {
         int i = this._slot(&this.imgH, h);
@@ -356,7 +356,7 @@ class WinUI3Host : NativeHost
     bool _imgHasBitmap(u64 h) { int i = this._slot(&this.imgH, h); if (i >= 0) { bool v = this.imgHas.get(i); return v; } return false; }
     u64  _imgLastPixels(u64 h) { int i = this._slot(&this.imgH, h); if (i >= 0) { u64 v = this.imgLast.get(i); return v; } return 0u; }
 
-    // ── CanvasView box bookkeeping ───────────────────────────────────────────
+    // -- CanvasView box bookkeeping -------------------------------------------
     void _setCanvasBox(u64 h, u64 box)
     {
         int i = this._slot(&this.canvasH, h);
@@ -369,7 +369,7 @@ class WinUI3Host : NativeHost
         this.canvasH.add(h); this.canvasBox.add(box);
     }
 
-    // ── Context menu registration ────────────────────────────────────────────
+    // -- Context menu registration --------------------------------------------
     void setContextMenu(string key, u64 menuPtr)
     {
         int i = 0;
@@ -392,7 +392,7 @@ class WinUI3Host : NativeHost
         return 0u;
     }
 
-    // ── NativeHost: create a XAML control for elemKind ────────────────────────
+    // -- NativeHost: create a XAML control for elemKind ------------------------
     u64 createControl(int elemKind, u64 parentHandle, string key)
     {
         void* insp = nullptr;
@@ -535,7 +535,7 @@ class WinUI3Host : NativeHost
         else if (prop == PROP_VALUE) ((IRangeBase*)rb)->lpVtbl->put_Value(rb, (double)v);
     }
 
-    // Store a push button's accent colors (P10). A 0 (default) bg forgets any prior accent so the
+    // Store a push button's accent colors. A 0 (default) bg forgets any prior accent so the
     // button reverts to the native look; a set bg is recorded. WinUI has no NM_CUSTOMDRAW, so this
     // is stored + reported by nativeAccentBg/nativeTestCustomDrawFill (the accent is real as a
     // brush intent; there is no offscreen pixel readback). fg/bg are framework colors (0 = default).
@@ -850,7 +850,7 @@ class WinUI3Host : NativeHost
     }
 };
 
-// ── Free helpers (shared by the host + routing) ──────────────────────────────
+// -- Free helpers (shared by the host + routing) ------------------------------
 bool winuiListHas(list<string>* xs, string want)
 {
     int i = 0;
@@ -936,7 +936,7 @@ void buildWinuiTree()
     _wReady = true;
 }
 
-// ── ctx.post marshaling hooks (installed into the window's ctx) ───────────────
+// -- ctx.post marshaling hooks (installed into the window's ctx) ---------------
 extern stdcall u32 GetCurrentThreadId();
 void _winuiPostEnqueue(u64 target, u64 boxPtr)
 {
@@ -948,7 +948,7 @@ void _winuiPostEnqueue(u64 target, u64 boxPtr)
 }
 u64 _winuiCurTid() { return (u64)GetCurrentThreadId(); }
 
-// ── Derived App outer: IInspectable + IXamlMetadataProvider (COM aggregation) ─
+// -- Derived App outer: IInspectable + IXamlMetadataProvider (COM aggregation) -
 // A bare (null-outer) Application exposes no IXamlMetadataProvider, so XamlControlsResources' XBF
 // parse cannot resolve muxc types and its ctor fails (surfacing later as a missing theme brush and
 // a failfast when a TextBox/ProgressBar/TabView/TreeView applies its template). We aggregate: the
@@ -1157,7 +1157,7 @@ void winuiPost(Lambda<void()> fn)
     ((IDispatcherQueue*)_gDq)->lpVtbl->TryEnqueue(_gDq, h, &enqOut);
 }
 
-// ── Host-neutral entry points (mirror the Win32/Cocoa host free-function surface) ──
+// -- Host-neutral entry points (mirror the Win32/Cocoa host free-function surface) --
 
 // Build a hidden window bound to `app` at DIP size w x h and build its tree. Called from
 // INSIDE the Start callback (the framework is already up), so it just mounts the tree.
@@ -1207,7 +1207,7 @@ void nativeTeardownForTest()
     if (_hasMenuHandler) { Lambda<void(int)> a = move _menuHandler; _hasMenuHandler = false; }
 }
 
-// ── UIA drivers (kept for winui_demo's Automation-peer self-test) ─────────────
+// -- UIA drivers (kept for winui_demo's Automation-peer self-test) -------------
 bool winuiUiaInvoke(string key)
 {
     u64 h = _wCtx.nativeHandle(key);
@@ -1263,7 +1263,7 @@ string winuiControlText(string key)
     return fromHString(hs);
 }
 
-// ── Host-neutral native* test drivers (P12; same names as the Win32/Cocoa hosts) ──
+// -- Host-neutral native* test drivers (same names as the Win32/Cocoa hosts) ----
 
 // Read the control text at keyPath (live TextBlock/TextBox get_Text, else the host mirror).
 string nativeControlText(string keyPath)
@@ -1346,7 +1346,7 @@ int nativeTooltipCount() { return 0; }
 // documented no-op returning false.
 bool nativeSaveWindowBmp(string path) { return false; }
 
-// ── Link-only parity for the ui_test.cb facade ────────────────────────────────
+// -- Link-only parity for the ui_test.cb facade --------------------------------
 // gallery_app.cb imports ui_test.cb, whose UiTest facade references the full native*
 // surface. These WinUI bodies exist so that closure links; the ones below are NOT exercised
 // by any WinUI gate (they back Win32-only hardening drivers - focus ring, live resize, menu
@@ -1395,7 +1395,7 @@ void nativeTypeText(string keyPath, string s)
     if (e != nullptr) { TextInput* ti = e as TextInput; if (ti != nullptr) { ti.onChangeText(s); pumpWinui(); } }
 }
 
-// ── ListView drivers (host-side box/model source) ─────────────────────────────
+// -- ListView drivers (host-side box/model source) -----------------------------
 int nativeListRowCount(string keyPath)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
@@ -1431,7 +1431,7 @@ void nativeListActivate(string keyPath, int row)
     if (e != nullptr) { ListView* lv = e as ListView; if (lv != nullptr) { lv.onActivate(row); pumpWinui(); } }
 }
 
-// ── Tab drivers (element-model backed; lazy panes via applyTree) ──────────────
+// -- Tab drivers (element-model backed; lazy panes via applyTree) --------------
 int nativeTabSelected(string keyPath)
 {
     Element e = winuiElem(keyPath);
@@ -1454,7 +1454,7 @@ void nativeTabSelect(string keyPath, int idx)
     if (tc != nullptr) { tc.onSelectTab(idx); pumpWinui(); }
 }
 
-// ── Tree drivers (host-side materialized-node model) ──────────────────────────
+// -- Tree drivers (host-side materialized-node model) --------------------------
 u64 nativeTreeRootItem(string keyPath)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
@@ -1496,7 +1496,7 @@ int nativeTreeItemNodeId(string keyPath, u64 hItem)
     return _wHost._treeItemNode(h, hItem);
 }
 
-// ── Splitter / bounds ─────────────────────────────────────────────────────────
+// -- Splitter / bounds ---------------------------------------------------------
 void nativeSplitterDrag(string keyPath, int dipX, int dipY)
 {
     Element e = winuiElem(keyPath);
@@ -1513,7 +1513,7 @@ Rect nativeNodeBounds(string keyPath)
     return e.nodeBounds();
 }
 
-// ── Progress / slider / image / statusbar / accent ────────────────────────────
+// -- Progress / slider / image / statusbar / accent ----------------------------
 int nativeProgressValue(string keyPath)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
@@ -1558,7 +1558,7 @@ u32 nativeTestCustomDrawFill(string keyPath)
     return nativeAccentBg(keyPath);
 }
 
-// ── Context menu drivers ──────────────────────────────────────────────────────
+// -- Context menu drivers ------------------------------------------------------
 void nativeSetContextMenu(string keyPath, u64 menuPtr) { _wHost.setContextMenu(keyPath, menuPtr); }
 void nativeFireContextMenu(string keyPath, int itemIndex)
 {

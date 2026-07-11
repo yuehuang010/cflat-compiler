@@ -11,7 +11,7 @@ import "string.cb";
 import "list.cb";
 import "span.cb";
 
-// ── Platform wrappers ─────────────────────────────────────────────────────────
+// -- Platform wrappers ---------------------------------------------------------
 // Centralize the Windows/POSIX split so the File/Path/Directory bodies stay
 // readable. UCRT stdio + the _access/_mkdir-family map 1:1 to libc/POSIX; the
 // Win32-only calls (GetFileAttributes, FindFirstFile, CopyFile, ...) get a POSIX
@@ -66,7 +66,7 @@ bool _fs_copy(const char* src, const char* dst) {
     return ok;
 }
 
-// ── File ─────────────────────────────────────────────────────────────────────
+// -- File ---------------------------------------------------------------------
 
 // Buffered file handle wrapping UCRT stdio, with static helpers for whole-file I/O.
 class File
@@ -344,7 +344,7 @@ class File
     }
 };
 
-// ── MappedFile ───────────────────────────────────────────────────────────────
+// -- MappedFile ---------------------------------------------------------------
 // Owning, whole-file memory mapping. Modelled on VMemRegion in core/vmem.cb:
 // unmaps in the destructor, close() is idempotent, re-opening releases any
 // previous mapping first. Do NOT bolt this onto File - File is FILE*/stdio-based;
@@ -438,7 +438,7 @@ class MappedFile
     }
 };
 
-// ── Path ─────────────────────────────────────────────────────────────────────
+// -- Path ---------------------------------------------------------------------
 
 // Static helpers for manipulating filesystem path strings.
 class Path
@@ -587,7 +587,7 @@ class Path
     }
 };
 
-// ── Directory ─────────────────────────────────────────────────────────────────
+// -- Directory -----------------------------------------------------------------
 
 // Directory operations, both instance-bound (via init) and as static helpers.
 class Directory
@@ -737,7 +737,7 @@ class Directory
         return Path.getTempPath();
     }
 
-    // ── private helpers ────────────────────────────────────────────────────────
+    // -- private helpers --------------------------------------------------------
 
     // filter: 0=all entries, 1=files only, 2=dirs only.
     // FILE_ATTRIBUTE_DIRECTORY = 0x10 = 16.

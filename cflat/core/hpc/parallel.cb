@@ -380,7 +380,7 @@ T parallel_reduce_pool<T>(ThreadPool* pool, i64 n, int workers, T identity,
 // same signature plus a leading `chunk`. Contrast a possible future
 // parallel_reduce_dynamic<T>, whose running combine would additionally
 // reassociate non-deterministically run to run - deliberately out of scope
-// here (see internal/plan/hpc-g2-dynamic-scheduling.md).
+// here.
 // ----------------------------------------------------------------------------
 
 // Chunks-per-worker used to derive an automatic chunk size when the caller
