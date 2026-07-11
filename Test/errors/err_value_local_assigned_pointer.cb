@@ -1,0 +1,27 @@
+// Value-typed local initialized from a pointer-yielding 'new' expression
+// must be diagnosed, not lowered into an invalid pointer->struct bitcast.
+
+class Foo { int a = 0; };
+
+expect_error("cannot initialize value of type") {
+    int test_plain_class()
+    {
+        Foo f = new Foo();
+        return 0;
+    }
+}
+
+class Holder<T> { T _v = default; };
+
+expect_error("cannot initialize value of type") {
+    int test_generic_class()
+    {
+        Holder<int> h = new Holder<int>();
+        return 0;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

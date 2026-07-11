@@ -1410,6 +1410,93 @@ bool testTemplateFunctions()
     return result;
 }
 
+// --- Generic INSTANCE methods (own type parameter, receiver bound) ---
+// A method with its own type parameter must still see `this` and the owner's fields,
+// on a plain class as well as inside a generic one.
+class BoxedCounter
+{
+    i64 _n = 0;
+    int _bump = 1;
+
+    T get<T>() { return (T)_n; }
+    T getVia<T>() { return (T)this->_n; }
+    T scaled<T>(int factor) { return (T)(_n * factor + _bump); }
+};
+
+class TypedHolder<T>
+{
+    T _value = default;
+
+    U convert<U>() { return (U)_value; }
+    static int sconvert<U>(U x) { return (int)x + 1; }
+};
+
+// A static generic method has no receiver, so it keeps its free-function shape and is
+// reached through the type name - including through an instantiated generic type name.
+class StaticBox
+{
+    int _unused = 0;
+
+    static int twice<U>(U x) { return (int)x * 2; }
+};
+
+struct TypedPair<T>
+{
+    T _first = default;
+    T _second = default;
+
+    static int triple<U>(U x) { return (int)x * 3; }
+};
+
+bool testGenericStaticMethods()
+{
+    bool result = true;
+
+    // Static generic method on a NON-generic class (already worked - guard against regression).
+    result &= Test("generic_static_plain_class", StaticBox.twice<int>(5), 10);
+    result &= Test("generic_static_plain_class_i64", StaticBox.twice<i64>(6), 12);
+
+    // Static generic method on a GENERIC class, reached through the instantiated type name.
+    result &= Test("generic_static_generic_class", TypedHolder<i64>.sconvert<int>(5), 6);
+    result &= Test("generic_static_generic_class_alt", TypedHolder<int>.sconvert<i64>(9), 10);
+
+    // Same, on a generic struct.
+    result &= Test("generic_static_generic_struct", TypedPair<int>.triple<int>(4), 12);
+
+    // The instance path through the same generic class must still bind its receiver.
+    TypedHolder<i64> h = default;
+    h._value = 21;
+    result &= Test("generic_static_sibling_instance", (int)h.convert<int>(), 21);
+
+    return result;
+}
+
+bool testGenericInstanceMethods()
+{
+    bool result = true;
+
+    BoxedCounter c = default;
+    c._n = 7;
+    c._bump = 2;
+
+    result &= Test("generic_method_field_int", (int)c.get<int>(), 7);
+    result &= Test("generic_method_field_i64", (int)c.get<i64>(), 7);
+    result &= Test("generic_method_this_field", (int)c.getVia<int>(), 7);
+    result &= Test("generic_method_with_args", (int)c.scaled<int>(3), 23);
+
+    // Same call through a pointer receiver.
+    BoxedCounter* p = &c;
+    result &= Test("generic_method_ptr_receiver", (int)p->get<int>(), 7);
+
+    // Generic method inside a generic class: the method's own parameter and the
+    // class's monomorphized fields must both resolve.
+    TypedHolder<i64> h = default;
+    h._value = 12;
+    result &= Test("generic_method_in_generic_class", (int)h.convert<int>(), 12);
+
+    return result;
+}
+
 // =============================================================
 // Generic type constraint tests (where T : IInterface)
 // =============================================================
@@ -2427,6 +2514,8 @@ extern int main()
     total++; passed += testMixedGenericFields()          ? 1 : 0;
     total++; passed += testIsPointerIntrinsic()          ? 1 : 0;
     total++; passed += testTemplateFunctions()           ? 1 : 0;
+    total++; passed += testGenericInstanceMethods()      ? 1 : 0;
+    total++; passed += testGenericStaticMethods()        ? 1 : 0;
     total++; passed += testBasicStructConstraint()       ? 1 : 0;
     total++; passed += testAlternativeConcreteType()     ? 1 : 0;
     total++; passed += testTwoConstrainedParams()        ? 1 : 0;

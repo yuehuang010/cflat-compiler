@@ -1430,7 +1430,7 @@ import "filesystem.cb";
 
 MappedFile* m = new MappedFile;
 if (m->openRead("dataset.bin")) {
-    span<double> data = MappedFile.asSpan<double>(m);   // zero-copy noalias view
+    span<double> data = m->asSpan<double>();            // zero-copy noalias view
     double[] v = data.data();
     double sum = 0.0;
     vectorize(reassoc) for (i64 i = 0; i < data.length(); i = i + 1) { sum = sum + v[i]; }
@@ -1444,12 +1444,9 @@ delete m;   // destructor unmaps
   release any mapping already held first (re-opening a `MappedFile` is safe), and both are
   whole-file only in v1: there is no windowed `map(offset, len)` and no copy-on-write mode.
 - **`length()`** / **`data()`** - the mapping's byte length and raw `i8*` base.
-- **`MappedFile.asSpan<T>(ptr)`** is the payoff: a noalias `span<T>` over the whole
-  mapping. It is written as a **static** method taking the `MappedFile*` explicitly (the
-  same shape as `simd<T,N>.load`/`.store`) rather than an instance method
-  `m.asSpan<T>()` - a generic method with its own type parameter does not resolve
-  `this`/fields on a non-generic class in this compiler, so the static form is the
-  supported spelling, not a style choice.
+- **`asSpan<T>()`** is the payoff: a noalias `span<T>` over the whole mapping, handed
+  straight to `vectorize` / `parallel_for_n` with zero copy (`m->asSpan<double>()` on a
+  `MappedFile*`, `f.asSpan<double>()` on a value).
 - **`flush()`** writes a writable mapping's dirty pages back to the file
   (`FlushViewOfFile` / `msync`). **`close()`** unmaps and is idempotent; the destructor
   calls it, so an RAII-scoped `MappedFile` needs no explicit cleanup (same shape as
@@ -1460,7 +1457,7 @@ delete m;   // destructor unmaps
 - **An empty file maps cleanly, not as an error.** Windows cannot create a file mapping
   over a zero-length file at all (`CreateFileMapping` fails outright), so a 0-byte file is
   special-cased to `length() == 0`, `data() == nullptr`, `openRead` returning `true` - on
-  every platform, for consistency. `MappedFile.asSpan<T>` on an empty mapping returns an
+  every platform, for consistency. `asSpan<T>()` on an empty mapping returns an
   empty span rather than dereferencing a null base.
 - **A write mapping cannot grow the file.** `openWrite`'s `len` sets the FINAL size before
   anything is mapped (`SetEndOfFile` / `ftruncate`, run first). Appending through a mapping
@@ -1480,7 +1477,7 @@ delete m;   // destructor unmaps
 ### Copy vs. zero-copy: what `performance/hpc/mmap_scan_bench.cb` actually shows
 
 The benchmark sums a 256 MB file of doubles two ways - `File.readBytes` into a heap buffer
-vs. `MappedFile.asSpan<double>` fed straight to a `vectorize(reassoc)` reduction - and
+vs. `MappedFile.asSpan<double>()` fed straight to a `vectorize(reassoc)` reduction - and
 reports the honest result rather than an assumed win: on a **warm page-cache, single-process
 run** (the file was just written by the same process, so the pages are already resident),
 the **copy variant was faster**, not the mapped one - the first-touch soft page faults on a

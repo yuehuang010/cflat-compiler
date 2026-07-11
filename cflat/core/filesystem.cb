@@ -400,24 +400,19 @@ class MappedFile
     i8* data() { return (i8*)_addr; }
 
     // A first-class noalias span<T> over the whole mapping, ready to hand
-    // straight to vectorize/parallel_for_n with zero copy. STATIC, taking the
-    // receiver explicitly (the simd<T,N>.load/store idiom), rather than an
-    // instance method `f.asSpan<T>()`: a generic method with its own type
-    // parameter on a non-generic class does not currently resolve `this` or
-    // its fields, so the static form is the supported shape, not a stylistic
-    // choice. An empty mapping (len 0) yields an empty span rather than
-    // dereferencing a null base.
-    static span<T> asSpan<T>(MappedFile* f)
+    // straight to vectorize/parallel_for_n with zero copy. An empty mapping
+    // (len 0) yields an empty span rather than dereferencing a null base.
+    span<T> asSpan<T>()
     {
         span<T> s;
-        if (f->_len == 0) { return s; }
+        if (_len == 0) { return s; }
         // Sound, not merely trusted: a file mapping IS a whole, distinct VM
         // region by construction (map_file/mmap/MapViewOfFile always hand
         // back a fresh region, never a slice of an existing allocation) -
         // exactly the guarantee the (T[]) escape asserts. This is the one
         // unsafe cast in the whole feature.
-        T[] view = (T[])(f->_addr);
-        s.wrap(view, f->_len / (i64)sizeof(T));
+        T[] view = (T[])(_addr);
+        s.wrap(view, _len / (i64)sizeof(T));
         return s;
     }
 

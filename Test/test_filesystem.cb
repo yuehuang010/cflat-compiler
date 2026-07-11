@@ -360,7 +360,7 @@ int testMappedFile()
     MappedFile* w = new MappedFile;
     passed += Test("MappedFile.openWrite", w->openWrite(path, 40), true);   // 5 doubles
     passed += Test("MappedFile write length", w->length(), (i64)40);
-    span<double> wsp = MappedFile.asSpan<double>(w);
+    span<double> wsp = w->asSpan<double>();
     passed += Test("write span length", wsp.length(), (i64)5);
     int i = 0;
     while (i < 5) { wsp.set(i, (double)i * 1.5); i = i + 1; }
@@ -370,7 +370,7 @@ int testMappedFile()
     MappedFile* r = new MappedFile;
     passed += Test("MappedFile.openRead", r->openRead(path), true);
     passed += Test("MappedFile read length", r->length(), (i64)40);
-    span<double> rsp = MappedFile.asSpan<double>(r);
+    span<double> rsp = r->asSpan<double>();
     passed += Test("read span length", rsp.length(), (i64)5);
     bool valuesOk = true;
     i = 0;
@@ -387,7 +387,7 @@ int testMappedFile()
     passed += Test("empty file openRead", e->openRead(emptyPath), true);
     passed += Test("empty file length", e->length(), (i64)0);
     passed += Test("empty file data null", e->data() == nullptr, true);
-    span<double> esp = MappedFile.asSpan<double>(e);
+    span<double> esp = e->asSpan<double>();
     passed += Test("empty file span length", esp.length(), (i64)0);
     delete e;
     File.remove(emptyPath);

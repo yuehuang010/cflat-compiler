@@ -527,15 +527,23 @@ core-library change - no compiler, grammar, or codegen work (unlike G7,
 which broke that same claim on advapi32.lib): every API used is kernel32
 or libc, both already in the default link set.
 
-As-built, and the one deviation that changed the public API:
-`asSpan<T>` shipped as a STATIC method taking the receiver explicitly -
-`MappedFile.asSpan<T>(f)`, the simd<T,N>.load/store idiom - NOT the
-instance method `f.asSpan<T>()` the plan sketched. Reason: a generic
-method with its own type parameter on a NON-generic class cannot resolve
-`this`/fields in this compiler; it fails at compile time with "Undefined
-variable <field>". Independently reproduced, and now tracked as
-internal/issue/generic-method-on-nongeneric-class.md. If that gap is ever
-fixed, the instance-method spelling is the one to move back to.
+The API shipped as the plan sketched it: `asSpan<T>` is an INSTANCE method,
+called `m->asSpan<double>()`. It briefly shipped as a static taking the
+receiver explicitly, because a generic method with its own type parameter
+on a non-generic class could not resolve `this` or its fields - it failed
+with "Undefined variable <field>". That turned out to be a real compiler
+bug rather than a design constraint: it was diagnosed and FIXED the same
+day (cflat/MainListener.h - generic member methods are now registered as
+owner-keyed templates and the monomorphized body is emitted as a true
+member with its implicit `this`; regression coverage in
+Test/test_generics.cb), and asSpan was moved back to the natural spelling.
+So this DID end up touching the compiler after all - but for a bug the
+feature merely exposed, not for anything mapped files needed.
+
+Still open, found while fixing that: a STATIC generic method on a GENERIC
+class is unreachable through the mangled type - see
+internal/issue/static-generic-method-on-generic-class.md. Pre-existing,
+unrelated to mapped files.
 
 Landed: os.map_file/unmap_file/flush_view in core/os.cb (zero-length and
 failure both collapsed into this one place: empty file -> nullptr with

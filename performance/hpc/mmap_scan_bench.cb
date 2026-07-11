@@ -45,7 +45,7 @@ void writeBenchFile() {
         delete w;
         return;
     }
-    span<double> sp = MappedFile.asSpan<double>(w);
+    span<double> sp = w->asSpan<double>();
     double[] v = sp.data();
     // Plain (non-vectorize) fill - only the SUM kernel below is the thing
     // this benchmark is measuring; writing the fixture data does not need
@@ -94,7 +94,7 @@ double runMappedVariant(double* outSum) {
 
     MappedFile* m = new MappedFile;
     m->openRead(BENCH_PATH);
-    span<double> sp = MappedFile.asSpan<double>(m);
+    span<double> sp = m->asSpan<double>();
     double[] view = sp.data();
     outSum[0] = sumSpan(view, N_DOUBLES);
     delete m;

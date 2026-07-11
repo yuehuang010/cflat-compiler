@@ -2586,6 +2586,42 @@ public:
         Compiler()->CreateInterfaceDefinition(mangledName, parentNames, methods);
     }
 
+    // Owner struct of a generic template keyed "Owner.method", or "" when the template is a
+    // free function or a static member (a static has no receiver, so it stays free-shaped).
+    std::string GenericMethodOwner(const std::string& baseName, CFlatParser::FunctionDefinitionContext* tmplCtx)
+    {
+        size_t dot = baseName.rfind('.');
+        if (dot == std::string::npos || tmplCtx == nullptr || isFunctionStatic(tmplCtx))
+            return {};
+        std::string owner = baseName.substr(0, dot);
+        return Compiler()->IsDataStructure(owner) ? owner : std::string{};
+    }
+
+    // Template key for a generic method called on a receiver ("Holder" + "get" -> "Holder.get"),
+    // or "" when the receiver's type declares no such template.
+    std::string GenericMethodTemplateKey(const std::string& receiverType, const std::string& methodName)
+    {
+        if (receiverType.empty() || methodName.empty())
+            return {};
+        std::string key = receiverType + "." + methodName;
+        return genericFunctionTemplates.count(key) ? key : std::string{};
+    }
+
+    // True when the child right after `child` is a '.' - i.e. the primary is used as a member
+    // qualifier (`Holder<i64>.sget(...)`) rather than being called or indexed.
+    bool IsFollowedByDot(CFlatParser::PostfixExpressionContext* ctx, antlr4::tree::ParseTree* child)
+    {
+        const auto& children = ctx->children;
+        for (size_t i = 0; i + 1 < children.size(); i++)
+        {
+            if (children[i] != child)
+                continue;
+            auto* next = dynamic_cast<antlr4::tree::TerminalNode*>(children[i + 1]);
+            return next != nullptr && next->getSymbol()->getType() == CFlatParser::Dot;
+        }
+        return false;
+    }
+
     // Instantiate a generic function template with concrete type arguments.
     // Returns the mangled name of the instantiated function, or empty string on failure.
     std::string InstantiateGenericFunction(const std::string& baseName, const std::vector<std::string>& typeArgs)
@@ -2609,6 +2645,11 @@ public:
         for (size_t i = 0; i < typeParams.size(); i++)
             activeTypeSubstitutions[typeParams[i]] = typeArgs[i];
 
+        // A generic member method is keyed "Owner.method". An instance method must be
+        // emitted as a member (implicit `this` param) so its body can reach the owner's
+        // fields; a static one keeps the free-function shape.
+        std::string ownerStruct = GenericMethodOwner(baseName, tmplCtx);
+
         // Save the current IRBuilder insertion point so that emitting a new
         // function definition mid-block does not corrupt the caller's block.
         auto* instCompiler = Compiler(tmplCtx);
@@ -2621,7 +2662,7 @@ public:
         // and "Instruction does not dominate all uses" verifier error).
         auto savedStack = std::move(instCompiler->stackNamedVariable);
         instCompiler->stackNamedVariable.clear();
-        ParseFunctionDefinition(tmplCtx, {}, {}, mangledName);
+        ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName);
         instCompiler->stackNamedVariable = std::move(savedStack);
         instCompiler->RestoreBuilderState(savedState);
 
@@ -6134,6 +6175,19 @@ public:
                                 LogErrorContext(assignmentExpression, std::format(
                                     "cannot initialize pointer '{}' with a value of type '{}' - the right-hand side must be a pointer (call getPtr() or use '&')",
                                     name, typeAndValue.TypeName));
+                                right = nullptr;
+                            }
+
+                            // Value-typed local assigned a pointer (`Foo f = new Foo();`): catch the
+                            // mismatch here rather than emitting an invalid pointer->struct bitcast.
+                            if (right && !typeAndValue.Pointer && !typeAndValue.IsFunctionPointer
+                                && right->getType()->isPointerTy()
+                                && compiler->GetDataStructure(typeAndValue.TypeName).StructType != nullptr)
+                            {
+                                LogErrorContext(assignmentExpression, std::format(
+                                    "cannot initialize value of type '{}' with a pointer of type '{}*'; "
+                                    "declare it as '{}* {} = ...;' or drop the 'new'",
+                                    typeAndValue.TypeName, typeAndValue.TypeName, typeAndValue.TypeName, name));
                                 right = nullptr;
                             }
 
@@ -12346,6 +12400,7 @@ public:
                                 }
                             }
                             else if (Compiler(ctx)->GetFunction(primaryIdentifier) || genericFunctionTemplates.count(primaryIdentifier)
+                                     || !GenericMethodTemplateKey(structVar.TypeAndValue.TypeName, primaryIdentifier).empty()
                                      || (primaryIdentifier == "toFunction" && structVar.TypeAndValue.TypeName == "__closure_fat_ptr")
                                      || Compiler(ctx)->GetWinrtSlot(structVar.TypeAndValue.TypeName, primaryIdentifier))
                             {
@@ -12527,6 +12582,21 @@ public:
                                 primaryIdentifier = mangledName;
                                 namedVar = {};
                                 namedVar.CallerName = mangledName;
+                                break;
+                            }
+                            // An instantiated generic type used as a static-member qualifier
+                            // (`Holder<i64>.sget<int>(x)`): seed the namespace context with the MANGLED
+                            // name, since that is what the instantiation's members are registered under.
+                            // Gated on a following '.' so a constructor temp (`Holder<i64>().m()`) keeps
+                            // its receiver and dispatches as an instance call.
+                            if ((genericClassTemplates.count(baseName) || genericStructTemplates.count(baseName))
+                                && IsFollowedByDot(ctx, parseTree))
+                            {
+                                namespaceContext = mangledName;
+                                primaryIdentifier = mangledName;
+                                namedVar = {};
+                                structVar = {};
+                                interfaceVar = {};
                                 break;
                             }
                             primaryIdentifier = mangledName;
@@ -12880,7 +12950,12 @@ public:
                     case CFlatParser::RuleGenericTypeParameters:
                     {
                         auto* genParams = dynamic_cast<CFlatParser::GenericTypeParametersContext*>(ruleContext);
-                        if (!primaryIdentifier.empty() && genericFunctionTemplates.count(primaryIdentifier))
+                        // A generic method called on a receiver (`h.get<int>()`) is keyed by its owner;
+                        // that key wins over a same-named free generic function.
+                        std::string templateName = GenericMethodTemplateKey(structVar.TypeAndValue.TypeName, primaryIdentifier);
+                        if (templateName.empty() && genericFunctionTemplates.count(primaryIdentifier))
+                            templateName = primaryIdentifier;
+                        if (!templateName.empty())
                         {
                             std::vector<std::string> typeArgs;
                             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
@@ -12891,7 +12966,7 @@ public:
                                     arg = it->second;
                                 typeArgs.push_back(arg);
                             }
-                            std::string mangled = InstantiateGenericFunction(primaryIdentifier, typeArgs);
+                            std::string mangled = InstantiateGenericFunction(templateName, typeArgs);
                             if (!mangled.empty())
                             {
                                 primaryIdentifier = mangled;
@@ -17179,20 +17254,20 @@ public:
                     ParseConstructorDefinition(func, structName);
                     continue;
                 }
-                if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
+                // A generic member method - static or instance - is stored as a template keyed by
+                // its owner ("Owner.method"). InstantiateGenericFunction re-derives the owner from
+                // that key and emits an instance method with its implicit `this` parameter, so the
+                // monomorphized body resolves the owner's fields like any other member.
+                if (func->genericTypeParameters() != nullptr)
                 {
-                    if (func->genericTypeParameters() != nullptr)
-                    {
-                        std::string qualifiedName = structName + "." + funcName;
-                        auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters());
-                        genericFunctionTemplates[qualifiedName] = func;
-                        genericFunctionTypeParams[qualifiedName] = typeParams;
-                        genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
-                    }
-                    else
-                    {
-                        ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
-                    }
+                    std::string qualifiedName = structName + "." + funcName;
+                    genericFunctionTemplates[qualifiedName] = func;
+                    genericFunctionTypeParams[qualifiedName] = ParseGenericTypeParameters(func->genericTypeParameters());
+                    genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
+                }
+                else if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
+                {
+                    ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
                 }
                 else
                     ParseFunctionDefinition(func, structName);
@@ -19482,20 +19557,20 @@ public:
                     ParseConstructorDefinition(func, structName);
                     continue;
                 }
-                if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
+                // A generic member method - static or instance - is stored as a template keyed by
+                // its owner ("Owner.method"). InstantiateGenericFunction re-derives the owner from
+                // that key and emits an instance method with its implicit `this` parameter, so the
+                // monomorphized body resolves the owner's fields like any other member.
+                if (func->genericTypeParameters() != nullptr)
                 {
-                    if (func->genericTypeParameters() != nullptr)
-                    {
-                        std::string qualifiedName = structName + "." + funcName;
-                        auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters());
-                        genericFunctionTemplates[qualifiedName] = func;
-                        genericFunctionTypeParams[qualifiedName] = typeParams;
-                        genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
-                    }
-                    else
-                    {
-                        ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
-                    }
+                    std::string qualifiedName = structName + "." + funcName;
+                    genericFunctionTemplates[qualifiedName] = func;
+                    genericFunctionTypeParams[qualifiedName] = ParseGenericTypeParameters(func->genericTypeParameters());
+                    genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
+                }
+                else if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
+                {
+                    ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
                 }
                 else
                     ParseFunctionDefinition(func, structName);
