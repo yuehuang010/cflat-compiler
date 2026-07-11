@@ -13,6 +13,7 @@
   - [Other Synchronization Primitives](#other-synchronization-primitives)
   - [Barrier](#barrier-corebarriercb)
   - [Thread Pool](#thread-pool-corethreadpoolcb)
+  - [NUMA-aware domains](#numa-aware-domains-corenumacb)
 - [Compile-Time Lock-Set Analysis](#compile-time-lock-set-analysis)
   - [Guarded Field Groups](#guarded-field-groups)
   - [Lock Statement](#lock-statement)
@@ -444,6 +445,17 @@ int v = r.get();              // blocks; returns 81  (use r.hasFailed() if the t
 - `workerCount()` / `approxPendingCount()` - introspection (the pending count is approximate, for diagnostics only).
 
 > **Inside a `program`:** the pool runs fully multi-threaded inside `program` scope; worker threads cross-allocate safely against the program allocator. Size the internal queue via `THREADPOOL_QUEUE_CAPACITY` if bursts of `submit` outpace the workers (a saturated queue makes `submit` return `nullptr`/`false`).
+
+### NUMA-aware domains (`core/numa.cb`)
+
+`Thread`/`ThreadPool` pin to a *core*; `core/numa.cb` goes one level up and pins to a whole
+**NUMA domain** - reserving a node in-process, handing out one core-pinned thread per physical
+core of that node, and giving those threads node-local memory (`allocLocal`) instead of whatever
+node first-touch happens to land on. Reach for it when a pinned pool alone isn't enough because
+the *data* also needs to live on the same node as the cores touching it (a large in-memory
+dataset on a multi-socket box). See [HPC.md's NUMA domains section](HPC.md#numa-domains-corenumacb)
+for the full API (`NumaDomain.acquire`/`release`, `acquireThread`/`releaseThread`, confinement
+tiers, the per-OS capability table, and a worked example).
 
 ---
 

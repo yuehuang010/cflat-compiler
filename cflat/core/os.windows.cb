@@ -30,6 +30,9 @@ namespace os.windows
     extern stdcall void*     CreateThread(void* attr, win_size stackSize, function<win_int(void*)> fn, void* param, i32 flags, i32* id);
     // Pin a thread to the given CPU affinity mask; returns the previous mask.
     extern stdcall win_usize SetThreadAffinityMask(void* handle, win_usize mask);
+    // Set/get the calling process's CPU affinity mask (all its threads).
+    extern stdcall win_int   SetProcessAffinityMask(void* proc, win_usize mask);
+    extern stdcall win_int   GetProcessAffinityMask(void* proc, win_usize* procMask, win_usize* sysMask);
     // Wait up to 'ms' milliseconds for the handle to become signaled.
     extern stdcall i32       WaitForSingleObject(void* handle, i32 ms);
     // Retrieve a finished thread's exit code into 'code'.
@@ -38,6 +41,9 @@ namespace os.windows
     extern stdcall win_int   CloseHandle(void* handle);
     // Forcibly terminate a thread (unsafe; skips cleanup).
     extern stdcall win_int   TerminateThread(void* handle, i32 exitCode);
+    // Suspend/resume a thread; return the previous suspend count (-1 on failure).
+    extern stdcall i32       SuspendThread(void* handle);
+    extern stdcall i32       ResumeThread(void* handle);
     // Yield the remainder of this thread's time slice to another ready thread.
     extern stdcall win_int   SwitchToThread();
     // Return the calling thread's OS thread id.
@@ -139,10 +145,29 @@ namespace os.windows
     extern stdcall void*    VirtualAlloc(void* lpAddress, win_size dwSize, u32 flAllocationType, u32 flProtect);
     // Release or decommit a region of virtual memory.
     extern stdcall win_int  VirtualFree(void* lpAddress, win_size dwSize, u32 dwFreeType);
+    // Reserve/commit memory local to NUMA node `nndPreferred`. VirtualFree
+    // (the plain vm_release path) frees a region allocated this way too.
+    extern stdcall void*    VirtualAllocExNuma(void* hProcess, void* lpAddress, win_size dwSize, u32 flAllocationType, u32 flProtect, u32 nndPreferred);
     // Return a handle to the calling process's default heap.
     extern stdcall void*    GetProcessHeap();
     // Validate the integrity of a heap (or a single allocation).
     extern stdcall win_int  HeapValidate(void* hHeap, u32 dwFlags, const void* lpMem);
+
+    // === NUMA topology / memory (Part A query + Part B node-local alloc) ===
+    // Bytes of free memory local to NUMA node `Node`; false on failure.
+    extern stdcall win_int  GetNumaAvailableMemoryNodeEx(u16 Node, u64* AvailableBytes);
+    // Highest NUMA node number configured on the system.
+    extern stdcall win_int  GetNumaHighestNodeNumber(u32* HighestNodeNumber);
+
+    // CPU Sets (Win10+): steer the process's DEFAULT (un-pinned) threads onto a
+    // chosen set of logical CPUs. Unlike SetProcessAffinityMask this does NOT
+    // hard-constrain explicit per-thread affinity, so a pinned NumaThread still
+    // wins its core while the rest of the process is kept off the acquired
+    // domains (NUMA PROCESS-tier confinement). SYSTEM_CPU_SET_INFORMATION is a
+    // self-sized record (Size @+0): Id @+8 (u32), Group @+12 (u16),
+    // LogicalProcessorIndex @+14 (u8), 32 bytes on this SDK.
+    extern stdcall win_int  GetSystemCpuSetInformation(void* Information, u32 BufferLength, u32* ReturnedLength, void* Process, u32 Flags);
+    extern stdcall win_int  SetProcessDefaultCpuSets(void* Process, u32* CpuSetIds, u32 CpuSetIdCount);
 
     // Win32: callers always pass i64 for sizes; these wrappers truncate to i32 before calling the API.
     if const (__PLATFORM__ == 32) {

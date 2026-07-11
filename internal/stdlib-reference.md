@@ -137,6 +137,7 @@ Method-level API discovery is via the LSP (hover / completion / `--symbol`); thi
 | `hpc/stencil.cb` | Structured-grid stencil kernels (finite-difference PDEs) |
 | `hpc/scan.cb` | Reductions, prefix sums, and streaming statistics over `double[]` |
 | `hpc/fft.cb` | Iterative in-place radix-2 Cooley-Tukey FFT |
+| `numa.cb` | `NumaDomain`/`NumaThread` - acquire a NUMA node in-process, hand out core-pinned + node-memory-bound threads, allocate node-local memory (`allocLocal`); PROCESS-tier confinement via CPU Sets (Win) / affinity (Linux). Built on `topology.cb` |
 
 ### Diagnostics
 

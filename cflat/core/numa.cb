@@ -1,0 +1,353 @@
+// numa.cb - NUMA domain acquisition: reserve a node in-process, hand out
+// core-pinned + memory-bound threads, and allocate node-local memory.
+//
+// Built on topology.cb (which OS node exists, its cores and free memory) and
+// the neutral os.* NUMA surface (node-local alloc, process/thread affinity,
+// per-thread memory binding). This is the "guide the user" layer: one domain
+// object hands out pinned threads and local buffers from THE SAME node, so the
+// good HPC pattern (data and the cores that touch it live together) is the path
+// of least resistance.
+//
+// Single-process scope: the library manages only the calling process's own
+// threads and memory placement. Isolating OTHER processes is out of scope.
+//
+// Platforms: Windows + Linux are the real implementations (core pinning +
+// node-local memory + PROCESS-tier confinement). macOS degrades to the weakest
+// tier - one synthetic domain, no affinity, QoS steering instead of pinning,
+// plain (unbound) allocation - so portable code still runs.
+//
+// Confinement mechanism (PROCESS tier): Windows uses CPU Sets
+// (SetProcessDefaultCpuSets) rather than SetProcessAffinityMask, because a
+// thread affinity must be a SUBSET of the process affinity - shrinking the
+// process mask would make a NumaThread pinned inside the acquired domain fail
+// to pin. CPU Sets steer un-pinned threads while leaving explicit per-thread
+// pins unconstrained. Verified empirically; see internal/plan/numa-domains.md.
+
+import "topology.cb";
+import "vmem.cb";
+import "mutex.cb";
+import "list.cb";
+import "cruntime.cb";
+
+// Confinement levels, weakest to strongest.
+const int NUMA_ISOLATE_NONE    = 0;   // bookkeeping only (macOS; or caller opt-out)
+const int NUMA_ISOLATE_PROCESS = 1;   // this process's un-pinned threads kept OFF
+                                      // acquired domains; handed-out threads pinned IN
+
+// --- Module-level acquisition registry -------------------------------------
+// Guards double-acquire and owns the process-confinement state. A domain is
+// identified by its snapshot slot index (numa_domain_index(id)); one u64 bit
+// per slot is plenty (topology caps NUMA nodes at 8).
+mutex _g_numaRegLock    = default;
+u64   _g_numaAcquiredIdx = 0;   // bit i set: snapshot slot i is acquired in-process
+u64   _g_numaConfineIdx  = 0;   // bit i set: slot i requested PROCESS-tier confinement
+u64   _g_numaSavedCpus   = 0;   // process cpu mask captured before first confinement
+bool  _g_numaHaveSaved   = false;
+
+// --- NumaThread trampoline -------------------------------------------------
+// Heap packet adapting the user's start to the neutral thread entry. Carries
+// the domain id so the thread can bind its OWN future allocations (Linux
+// set_mempolicy is self-only) and the macOS QoS class (self-only too). Mirrors
+// os.cb's __OsThreadPacket: malloc'd, freed (never `delete`d), function<> is a
+// plain non-capturing pointer so no ownership tracking is involved.
+struct _NumaThreadPacket {
+    function<void(void*)> userEntry = nullptr;
+    void* userArg  = nullptr;
+    int   domainId = -1;
+    int   qos      = 0;
+};
+
+// Runs on the handed-out thread: bind memory to the domain (Linux), steer QoS
+// (macOS), then invoke the user entry. Both binds are no-ops on the platforms
+// that lack the lever, so this shape is identical everywhere.
+void _numa_thread_trampoline(void* raw) {
+    _NumaThreadPacket* p = (_NumaThreadPacket*)raw;
+    os.thread_bind_memory_self(p->domainId);
+    if (p->qos != 0) { os.thread_set_qos_self(p->qos); }
+    function<void(void*)> fn = p->userEntry;
+    void* a = p->userArg;
+    fn(a);
+}
+
+// Index (0..63) of the single set bit of `bit`; -1 if none.
+int _numa_bit_index(u64 bit) {
+    int i = 0;
+    while (i < 64) {
+        if ((bit & ((u64)1 << i)) != (u64)0) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// One bit per physical core of the domain: the lowest SMT sibling that actually
+// belongs to `domainMask`. This is both the hand-out unit and the pin mask
+// (popcount 1, subset of the domain), so a domain hands out exactly one thread
+// per physical core.
+u64 _numa_domain_free_cores(CpuTopology* topo, u64 domainMask) {
+    u64 cores = 0;
+    int i = 0;
+    while (i < topo->physicalCount) {
+        u64 inDomain = topo->coreMask[i] & domainMask;
+        if (inDomain != (u64)0) {
+            u64 low = inDomain & ((~inDomain) + (u64)1);   // lowest sibling in the domain
+            cores = cores | low;
+        }
+        i = i + 1;
+    }
+    return cores;
+}
+
+// Recompute and apply process confinement from the registry. Confines the
+// process's default threads to the complement of all PROCESS-tier domains; if
+// that complement is empty (single-domain box - the addendum case) or no
+// PROCESS-tier domain remains, restores the saved state. Caller holds
+// _g_numaRegLock.
+void _numa_recompute_confinement() {
+    if (_g_numaConfineIdx == (u64)0 && !_g_numaHaveSaved) { return; }
+    CpuTopology* topo = cpu_topology();
+    u64 allCpus  = 0;
+    u64 confined = 0;
+    int i = 0;
+    while (i < topo->numaCount) {
+        allCpus = allCpus | topo->numaMask[i];
+        if ((_g_numaConfineIdx & ((u64)1 << i)) != (u64)0) { confined = confined | topo->numaMask[i]; }
+        i = i + 1;
+    }
+    u64 keep = allCpus & ~confined;
+    if (keep != allCpus && keep != (u64)0) {
+        // Some domains are confined and the complement is non-empty: apply it.
+        if (!_g_numaHaveSaved) { _g_numaSavedCpus = os.process_get_affinity(); _g_numaHaveSaved = true; }
+        os.process_confine_cpus(keep);
+    } else {
+        // Nothing effective to confine (complement empty, or no domains left).
+        if (_g_numaHaveSaved) { os.process_restore_cpus(_g_numaSavedCpus); _g_numaHaveSaved = false; }
+    }
+}
+
+// A core-pinned thread handed out by a domain. Its memory is bound to the
+// domain node where the OS supports it (Linux mempolicy; Windows first-touch on
+// the pinned core; macOS QoS only). join() for graceful completion; the owning
+// domain's releaseThread(kill) is the hard path.
+struct NumaThread {
+    int  core    = -1;   // physical-core index (0..63) of the pinned CPU
+    u64  pinMask = 0;    // single logical-CPU bit this thread is pinned to
+    // internal
+    void*              _os      = nullptr;   // os.thread_create handle (nulled once reaped)
+    _NumaThreadPacket* _pkt     = nullptr;   // trampoline packet (freed by owner)
+    u64                _coreBit = 0;         // core bit to return to the domain's _freeCores
+
+    // Block up to timeoutMs for the thread to finish; reap it on success.
+    // Returns true if it exited (or was already reaped), false on timeout.
+    bool join(int timeoutMs) {
+        if (_os == nullptr) { return true; }
+        bool fin = false;
+        os.thread_timed_join(_os, timeoutMs, &fin);
+        if (fin) {
+            // The thread has fully exited, so the trampoline can no longer read
+            // the packet - free it. os.thread_timed_join already freed the os
+            // handle wrapper on success.
+            _os = nullptr;
+            if (_pkt != nullptr) { free((void*)_pkt); _pkt = nullptr; }
+            return true;
+        }
+        return false;
+    }
+};
+
+// One acquired NUMA domain. Not copyable (owning). Acquire via
+// NumaDomain.acquire(); release() or scope-exit returns it to the OS. The
+// returned pointer is owned by the caller's local and auto-releases at scope
+// exit (~NumaDomain -> release(false)).
+struct NumaDomain {
+    int id      = -1;
+    int level   = NUMA_ISOLATE_NONE;   // confinement tier actually achieved
+    u64 cpuMask = 0;                   // logical CPUs of the domain
+    // internal hand-out state
+    u64                  _freeCores = 0;         // one bit per AVAILABLE physical core
+    list<NumaThread*>    _threads   = default;   // live hand-outs (domain owns them)
+    mutex                _lock      = default;
+    bool                 _released  = false;
+
+    // Feature 3. Reserve domain `id` in-process. Returns nullptr if `id` is
+    // unknown, already acquired in-process, or `required` == NUMA_ISOLATE_PROCESS
+    // on macOS (no affinity API). `required` == NUMA_ISOLATE_NONE always
+    // succeeds for a valid, un-acquired id.
+    static NumaDomain* acquire(int id, int required) {
+        int slot = numa_domain_index(id);
+        if (slot < 0) { return nullptr; }   // unknown OS node id
+        if const (__MACOS__) {
+            // No affinity API: the PROCESS tier cannot be achieved.
+            if (required == NUMA_ISOLATE_PROCESS) { return nullptr; }
+        }
+
+        _g_numaRegLock.acquire();
+        u64 bit = (u64)1 << slot;
+        if ((_g_numaAcquiredIdx & bit) != (u64)0) {
+            _g_numaRegLock.release();
+            return nullptr;   // already acquired in this process
+        }
+        _g_numaAcquiredIdx = _g_numaAcquiredIdx | bit;
+        int level = NUMA_ISOLATE_NONE;
+        if (required == NUMA_ISOLATE_PROCESS) {
+            // Windows/Linux both reach PROCESS tier; the confinement itself is
+            // best-effort (skipped when the complement is empty), but the level
+            // is recorded as PROCESS regardless (addendum: single-domain box).
+            _g_numaConfineIdx = _g_numaConfineIdx | bit;
+            level = NUMA_ISOLATE_PROCESS;
+            _numa_recompute_confinement();
+        }
+        _g_numaRegLock.release();
+
+        CpuTopology* topo = cpu_topology();
+        u64 domainMask = topo->numaMask[slot];
+        NumaDomain* d = new NumaDomain;
+        d->id         = id;
+        d->level      = level;
+        d->cpuMask    = domainMask;
+        d->_freeCores = _numa_domain_free_cores(topo, domainMask);
+        d->_released  = false;
+        return d;
+    }
+
+    // Feature 4. Release the domain. killRemaining: kill still-live NumaThreads
+    // (the hard path); otherwise detach them (they finish on their own) and warn
+    // via the OS thread's own lifetime. Idempotent. Recomputes process
+    // confinement so releasing one domain keeps the others' confinement intact.
+    void release(bool killRemaining) {
+        _lock.acquire();
+        if (_released) { _lock.release(); return; }
+        _released = true;
+        while (_threads.count() > 0) {
+            NumaThread* t = _threads.take(0);   // ownership out of the list
+            if (t->_os != nullptr) {
+                if (killRemaining) {
+                    os.thread_kill(t->_os);
+                    t->_os = nullptr;
+                    // Windows kill is synchronous, so the packet is safe to free;
+                    // on POSIX pthread_cancel is deferred (the live thread may
+                    // still read _pkt) so it is intentionally leaked.
+                    if const (__WINDOWS__) {
+                        if (t->_pkt != nullptr) { free((void*)t->_pkt); t->_pkt = nullptr; }
+                    }
+                } else {
+                    // Let the straggler run to completion detached; the os handle
+                    // wrapper is freed, the packet is owned by the live thread.
+                    os.thread_detach(t->_os);
+                    t->_os = nullptr;
+                }
+            }
+            delete t;   // NumaThread has no destructor; frees the struct memory
+        }
+        _lock.release();
+
+        int slot = numa_domain_index(id);
+        _g_numaRegLock.acquire();
+        if (slot >= 0) {
+            u64 bit = (u64)1 << slot;
+            _g_numaAcquiredIdx = _g_numaAcquiredIdx & ~bit;
+            _g_numaConfineIdx  = _g_numaConfineIdx & ~bit;
+            _numa_recompute_confinement();
+        }
+        _g_numaRegLock.release();
+    }
+
+    // Release on scope exit (graceful: stragglers detached, not killed).
+    ~NumaDomain() {
+        release(false);
+        _lock.destroy();
+    }
+
+    // Feature 5. Hand out a thread pinned to one free physical core of this
+    // domain (lowest SMT sibling), memory-bound to the node where supported.
+    // Returns nullptr (a borrow either way - the domain owns the thread) when no
+    // free physical core remains; size work to info().physicalCores.
+    alias NumaThread* acquireThread(function<void(void*)> entry, void* arg) {
+        _lock.acquire();
+        if (_released || _freeCores == (u64)0) { _lock.release(); return nullptr; }
+        u64 coreBit = _freeCores & ((~_freeCores) + (u64)1);   // lowest free core bit
+        _freeCores = _freeCores & (_freeCores - (u64)1);       // consume it
+        int coreIdx = _numa_bit_index(coreBit);
+        _lock.release();
+
+        _NumaThreadPacket* pkt = (_NumaThreadPacket*)malloc(sizeof(_NumaThreadPacket));
+        pkt->userEntry = entry;
+        pkt->userArg   = arg;
+        pkt->domainId  = id;
+        pkt->qos       = cpu_qos_for_mask(coreBit);   // macOS steer; 0 elsewhere
+
+        void* h = os.thread_create(_numa_thread_trampoline, (void*)pkt);
+        if (h == nullptr) {
+            free((void*)pkt);
+            _lock.acquire();
+            _freeCores = _freeCores | coreBit;   // hand the core back
+            _lock.release();
+            return nullptr;
+        }
+        // Pin to the single core (Windows/Linux); no-op on macOS (QoS in the
+        // trampoline is the lever there).
+        os.thread_set_affinity(h, coreBit);
+
+        NumaThread* t = new NumaThread;
+        t->core     = coreIdx;
+        t->pinMask  = coreBit;
+        t->_os      = h;
+        t->_pkt     = pkt;
+        t->_coreBit = coreBit;
+
+        _lock.acquire();
+        _threads.add(t);   // MOVES t into the list; the domain owns it now
+        NumaThread* borrowed = _threads.get(_threads.count() - 1);
+        _lock.release();
+        return borrowed;
+    }
+
+    // Feature 6. Return a thread to the domain, killing it if still running.
+    // The core is returned to the free set and the NumaThread is freed. Prefer
+    // t->join() first for graceful shutdown - kill is the hard path (skips
+    // cleanup; on POSIX the trampoline packet is leaked, as os.thread_kill docs).
+    void releaseThread(NumaThread* t) {
+        if (t == nullptr) { return; }
+        _lock.acquire();
+        int idx = -1;
+        int i = 0;
+        while (i < _threads.count()) {
+            if (_threads.get(i) == t) { idx = i; break; }
+            i = i + 1;
+        }
+        NumaThread* owned = nullptr;
+        if (idx >= 0) {
+            owned = _threads.take(idx);          // ownership out of the list
+            _freeCores = _freeCores | t->_coreBit;
+        }
+        _lock.release();
+        if (owned == nullptr) { return; }        // foreign / already released
+
+        if (owned->_os != nullptr) {
+            os.thread_kill(owned->_os);
+            owned->_os = nullptr;
+            if const (__WINDOWS__) {
+                if (owned->_pkt != nullptr) { free((void*)owned->_pkt); owned->_pkt = nullptr; }
+            }
+        }
+        delete owned;   // NumaThread has no destructor; frees the struct memory
+    }
+
+    // Domain-local memory: node-bound pages (VirtualAllocExNuma / mmap+mbind);
+    // plain placement on macOS. 64K-aligned, writable, zeroed. nullptr on
+    // failure. Free with freeLocal.
+    void* allocLocal(i64 size) {
+        return vmem_alloc_numa(size, id);
+    }
+
+    void freeLocal(void* p) {
+        vmem_free_numa(p);
+    }
+
+    // Feature 2 re-query: live domain detail (free memory changes, so this is
+    // not memoized).
+    NumaDomainInfo info() {
+        NumaDomainInfo out = default;
+        numa_domain_info(id, &out);
+        return out;
+    }
+};

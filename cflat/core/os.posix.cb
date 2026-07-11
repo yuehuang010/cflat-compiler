@@ -136,6 +136,18 @@ namespace os.posix
         int QOS_CLASS_UNSPECIFIED      = 0;
     } else {
         extern win_int pthread_setaffinity_np(void* thread, win_size cpusetsize, const void* cpuset);
+        // Process-wide affinity (pid 0 == calling thread; NOTE it affects only the
+        // CALLING thread on Linux, not the whole process - see the PROCESS-tier
+        // caveat in internal/plan/numa-domains.md). cpu_set_t is a fixed 128-byte
+        // bitmap, same shape thread_set_affinity already builds.
+        extern win_int sched_setaffinity(i32 pid, win_size cpusetsize, const void* mask);
+        extern win_int sched_getaffinity(i32 pid, win_size cpusetsize, void* mask);
+        // Raw syscall escape hatch (glibc wrapper; no libnuma dependency). Used for
+        // set_mempolicy(238)/mbind(237) - neither has a glibc-name binding without
+        // libnuma. Fixed 6-arg arity covers both (mbind's max); unused trailing
+        // args are passed as 0 and safely ignored by the callee (SysV ABI).
+        extern i64 syscall(i64 number, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6);
+        int MPOL_BIND = 2;
     }
 
     // === pthread mutex / condition variable ===

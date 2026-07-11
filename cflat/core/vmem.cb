@@ -36,6 +36,22 @@ void vmem_free(void* ptr)
     os.vm_release(ptr);
 }
 
+// Reserve+commit `size` bytes bound to NUMA node `node` (VirtualAllocExNuma /
+// mmap+mbind); falls back to a plain vmem_alloc where the OS has no per-node
+// allocation lever (macOS). nullptr on failure (e.g. an invalid node id).
+void* vmem_alloc_numa(i64 size, int node)
+{
+    return os.vm_reserve_commit_numa(size, node);
+}
+
+// Release a region returned by vmem_alloc_numa. Same symmetric free path as
+// vmem_free (POSIX header-stash reused; VirtualFree also frees a
+// VirtualAllocExNuma region on Windows).
+void vmem_free_numa(void* ptr)
+{
+    os.vm_release_numa(ptr);
+}
+
 // RAII wrapper around a single reserve+commit region. On scope exit the region
 // is released automatically; move it or clear base to suppress the release.
 struct VMemRegion

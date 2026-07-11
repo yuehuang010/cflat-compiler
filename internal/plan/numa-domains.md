@@ -1,7 +1,12 @@
 # NUMA Domains: query, acquire/isolate, pinned threads, local memory
 
-Status: PROPOSED
+Status: DONE (all 4 steps landed 2026-07-11)
 Created: 2026-07-11
+
+Validation constraint (user, 2026-07-11): the dev box is single-NUMA-node,
+so PERFORMANCE cannot be validated - the bar is that every API call WORKS
+(returns correct data / succeeds / fails cleanly) on Windows AND on WSL
+(test.sh gate applies).
 Parent: internal/plan/hpc-gaps.md (G5 follow-on; "per-node arenas if NUMA
 hardware ever matters" is this plan)
 
@@ -255,19 +260,48 @@ acquired domain:
     protection that remains, exactly as the addendum asks.
   - NumaThreads themselves are exempt by construction: per-thread
     affinity (SetThreadAffinityMask / pthread_setaffinity_np on the
-    handed-out thread) overrides the process-level complement. On
-    Windows a thread affinity must be a subset of the process affinity -
-    so acquire() computes the process mask as complement-of-acquired
-    UNION all handed-out pin masks; verify this ordering works during
-    implementation (set thread affinity BEFORE shrinking process mask,
-    or keep the domain's full mask inside the process mask - decide and
-    record; the simple correct answer is: process mask = all CPUs minus
-    (acquired domains' masks minus their handed-out pin bits) is over-
-    complex; instead keep process mask = complement of acquired masks
-    and set NumaThread affinity via CPU Sets on Windows
-    (SetThreadSelectedCpuSets is NOT constrained by process affinity) -
-    implementer picks whichever of the two mechanisms verifies, records
-    the choice here).
+    handed-out thread) overrides the process-level complement.
+
+    RESOLVED (2026-07-11, step 3 - empirical probe on the dev box, a
+    single-domain 20-LP Ryzen; probe was a throwaway C program, not
+    checked in). Findings:
+      1. The Windows subset constraint is REAL. After
+         SetProcessAffinityMask(complement-of-cpu0), a subsequent
+         SetThreadAffinityMask(thread, cpu0) FAILS (returns 0,
+         GetLastError == 87 ERROR_INVALID_PARAMETER) and the thread runs
+         on some other CPU. So shrinking the PROCESS affinity mask would
+         break pinning a NumaThread INSIDE an acquired domain. Confirmed.
+      2. CPU Sets are the fix. GetSystemCpuSetInformation returns 32-byte
+         self-sized records (Size@+0, Id@+8 u32, Group@+12 u16,
+         LogicalProcessorIndex@+14 u8). SetProcessDefaultCpuSets(process,
+         complement-ids) succeeds AND leaves the process affinity FULL,
+         so SetThreadAffinityMask(thread, cpu0) then succeeds and the
+         pinned thread runs on cpu0 - i.e. an explicit per-thread pin
+         BEATS the process default CPU set. Exactly the PROCESS-tier
+         intent: default (un-pinned) threads are steered onto the
+         complement, pinned NumaThreads keep their acquired-domain cores.
+
+    MECHANISM CHOSEN: CPU Sets for process-level confinement, per-thread
+    SetThreadAffinityMask for pinning (process affinity is NEVER touched
+    on Windows). Neutral surface added to os.cb:
+      - os.process_confine_cpus(u64 keepMask): Windows walks
+        GetSystemCpuSetInformation, collects group-0 CpuSetIds whose
+        LogicalProcessorIndex is in keepMask, calls
+        SetProcessDefaultCpuSets. Linux: sched_setaffinity(0, keepMask)
+        (main thread + inherited by threads spawned after; per-thread
+        pins override - no subset problem, affinity is per-thread on
+        Linux). macOS: false.
+      - os.process_restore_cpus(u64 savedMask): Windows clears the
+        default set (SetProcessDefaultCpuSets(NULL,0), savedMask ignored
+        since affinity was untouched); Linux restores savedMask via
+        sched_setaffinity(0,...); macOS no-op.
+    SetProcessAffinityMask is NOT called for confinement anywhere.
+    SetThreadSelectedCpuSets was judged unnecessary (SetThreadAffinityMask
+    alone pins correctly with full process affinity, probe-proven) and is
+    NOT bound - only the two used externs (GetSystemCpuSetInformation,
+    SetProcessDefaultCpuSets) were added, per the repo "no loose ends"
+    rule. numa.cb owns the saved-affinity registry state
+    (_g_numaSavedCpus) so os.cb stays stateless.
 - Windows extra (cheap, worth it): CPU Sets to declare intent -
   `GetSystemCpuSetInformation` to map CPUs->CpuSetIds,
   `SetProcessDefaultCpuSets` to the complement; pinned NumaThreads get
@@ -432,8 +466,14 @@ the doc version is the deliverable.
   scheduler may still run OTHER processes' threads on an acquired
   domain's cores; per-thread pinning plus the process-affinity
   complement is the whole confinement story.
-- No migrate_pages / page migration of any kind (pages are PLACED right
-  via allocLocal/first-touch, never moved after the fact).
+- No page migration in v1 (pages are PLACED right via allocLocal/
+  first-touch, never moved after the fact). POST-V1 TODO (user,
+  2026-07-11): a move helper. Linux can migrate in place without libnuma:
+  mbind(MPOL_MF_MOVE) over an owned range (unprivileged for private
+  pages); move_pages(2) with a NULL nodes array is the placement-query
+  probe for tests. Windows has NO migration API - the portable shape is
+  `void* moveToDomain(p, size, d)` (Linux returns p, Windows allocs on
+  the target node + copies + frees, pointer changes). Do after v1 lands.
 - No libnuma dependency (raw syscalls + sysfs only).
 - No >64-LP / multi-group support (existing topology.cb limit).
 - cpu_mask_numa / existing topology API: unchanged, byte-compatible.
@@ -459,15 +499,134 @@ the doc version is the deliverable.
    acquire(0, PROCESS) succeeds without the affinity-complement step,
    threads run pinned, allocLocal works, double-acquire fails, release
    restores process affinity).
+   DONE 2026-07-11. core/numa.cb landed (NumaDomain/NumaThread, module
+   registry, list<NumaThread*> ownership, trampoline that self-binds
+   memory + steers QoS, CPU-Sets confinement resolved empirically - see
+   PROCESS-tier section above). os.cb gained process_confine_cpus /
+   process_restore_cpus; os.windows.cb gained GetSystemCpuSetInformation
+   + SetProcessDefaultCpuSets. Tests: testNumaDomain() in
+   Test/test_threadpool.cb (23/23). Deviations from the sketch: (a)
+   acquireThread returns `alias NumaThread*` (borrow) and the domain owns
+   the threads in a `list<NumaThread*>` instead of a raw `NumaThread*[64]`
+   - the raw-pointer-array store has ambiguous move semantics in cflat;
+   list<T*> has defined move-on-add + take() ownership, so it is the safe
+   choice. (b) NUMA_ISOLATE_* are `const int` (compiles fine; used
+   elsewhere in core). Gates: test.bat Release all pass; test.sh Release
+   159/0/16 (test_threadpool 23/23 on Linux - set_mempolicy trampoline +
+   pin/join/kill/mbind-allocLocal exercised); --platform macos
+   cross-compile exit 0; --asan clean.
 4. **Docs + example** (sonnet): doc/HPC.md "NUMA domains" section with
    the large-file worked example above + the per-OS capability table;
    note in doc/THREADING.md. No new Test/ files anywhere (extend
    existing).
+   DONE 2026-07-11. doc/HPC.md gained a "### NUMA domains (`core/numa.cb`)"
+   subsection (nested under "Across-core data parallelism", right after
+   the existing "Pinning workers to cores" topology-masks material and
+   before "Per-worker floating-point environment") with: the remote-memory/
+   first-touch motivation, the query API (numa_domain_id/index,
+   NumaDomainInfo/numa_domain_info with the verified -1 semantics per OS),
+   the NumaDomain/NumaThread class (acquire/release, the two confinement
+   tiers and exact failure modes, acquireThread/releaseThread/join,
+   allocLocal/freeLocal, info()), a trimmed per-OS capability table, the
+   large-file worked example (adapted from the sketch above and verified
+   against the shipped core/numa.cb + core/topology.cb + core/filesystem.cb
+   APIs), and an honest limitations paragraph (single-process scope,
+   best-effort confinement, 64-CPU limit, no page migration in v1 with the
+   move-helper TODO still visible, and that multi-node performance itself
+   is unverified on the single-node dev hardware). doc/THREADING.md gained
+   a short "NUMA-aware domains" subsection at the end of Thread Pool,
+   pointing at HPC.md. Both files' Tables of Contents updated.
+
+   Deviations found while verifying the worked example against the
+   shipped library (fixed in the doc, not the library):
+   - `join(timeoutMs)` has no portable "wait forever" sentinel: on
+     Windows a negative timeout maps to `WaitForSingleObject`'s
+     `INFINITE`, but the macOS/Linux polling `thread_timed_join` treats
+     any negative value as an immediate timeout (`waited(0) >= ms` is
+     true for `ms < 0`). The doc example joins via a bounded retry loop
+     (`while (!t->join(1000)) { }`) instead of `join(-1)`; the "join
+     semantics" bullet calls this out explicitly.
+   - `core/filesystem.cb`'s `File.seek`/`.size()`/`.readBytes` are
+     `int`-sized (no `i64` overload), so the "tens of GB" load in the
+     original sketch cannot be one `readBytes` call. The doc's
+     `loadShard` reads each domain's shard in bounded 64 MB chunks
+     inside an `i64`-indexed loop instead.
+   - `function<void(void*)>` entries are non-capturing (matching
+     `Thread`/`ThreadPool`'s task shape), so the file path every loader
+     thread needs is carried on a plain global (`g_loadPath`) rather
+     than captured - the sketch didn't need this because it left the
+     load/compute bodies unwritten.
+   - `NumaDomain.acquire`/`NumaThread` match the sketch otherwise:
+     `acquireThread` returns `alias NumaThread*` (a borrow - the domain
+     owns it), confirmed against `Test/test_threadpool.cb`'s
+     `testNumaDomain()`.
+
+   Verification: the worked example was extracted verbatim to a
+   scratch .cb file and checked with
+   `x64/Release/cflat.exe <file> --check` - PASS on the first attempt
+   after the two fixes above (join retry loop, chunked file read) were
+   applied during drafting. Docs-only change: no build/test.bat run
+   needed (nothing under cflat/, core/, or Test/ touched).
 
 Gates per step: build Release, test.bat green; test.sh on WSL for steps
 1-3 (POSIX code paths are load-bearing here - the standing skip does
 NOT apply); example.bat if examples touched; no test_lsp needed (no
 compiler change anywhere in this plan - it is pure library).
+
+## Post-landing fix: TerminateThread-vs-loader-lock hang (2026-07-11)
+
+After all 4 steps landed, one full-parallel `test.bat` run hung on
+test_threadpool for the 600s suite timeout (passed standalone and on
+rerun). Reproduced 1/60 running test_threadpool.exe under 16 CPU
+burners; cdb stacks of the hung process were definitive: the test had
+printed "23/23 passed" and the MAIN thread was stuck at process exit in
+`ucrtbase!common_exit -> LoadLibraryExW -> ntdll!LdrpDrainWorkQueue`.
+Root cause: `release(true)`'s TerminateThread (os.thread_kill) landed
+while the just-created worker was still inside NT loader thread-init
+(startup delayed by machine load); the killed thread orphaned loader
+state, deadlocking ucrt's lazy exit-time LoadLibrary.
+
+There are TWO unsafe kill windows, both loader-lock regions of a thread
+that user code never sees:
+1. Thread INIT: kill lands before the thread entry runs (thread start
+   delayed by load) - inside LdrInitializeThunk/DLL_THREAD_ATTACH.
+2. Thread EXIT: kill lands after user code returned (main delayed past
+   the worker's short sleep) - inside ExitThread/DLL_THREAD_DETACH.
+A first fix that only gated window 1 (`_started` flag set at shim entry,
+spin before TerminateThread) still hung 1/100 under load - the cdb
+stacks were identical, which is what exposed window 2.
+
+Fix at the root in os.cb (protects thread.cb kill and the program
+construct too, not just numa.cb), Windows branch of `os.thread_kill`:
+- Gate 1: `__OsThreadPacket._started` is set at shim entry (past loader
+  init); thread_kill spins on `_started || _done` first.
+- Gate 2: SuspendThread, then re-check `_done`. If `_done` is set the
+  thread finished user code and may be inside thread-exit - resume and
+  WaitForSingleObject for natural exit instead of terminating (there is
+  nothing left to kill). If `_done` is clear the thread is suspended
+  strictly inside shim/user code - TerminateThread is safe from loader
+  orphaning there. New externs: SuspendThread/ResumeThread.
+POSIX behavior unchanged (pthread_cancel is deferred; the extra
+field/store is inert). A kill landing inside USER code that itself
+holds a lock (heap, loader via LoadLibrary, ...) remains
+documented-unsafe, as before - same contract as thread.cb.
+
+Implementation gotcha that itself caused a hang (fixed): os.cb's
+thread packets are MALLOC'd, not `new`'d, so struct field defaults do
+NOT apply - thread_create must explicitly zero every flag. The new
+`_started` field was initially left uninitialized; a recycled heap
+allocation carried a stale `_started = 1`, gate 1 passed instantly, and
+the kill landed mid-loader-init again (a tight create/kill loop hung
+50% of runs; cdb showed the NEXT thread stuck in LdrpInitializeThread
+-> LdrpDrainWorkQueue with main spinning in gate 1). One line:
+`p->_started = 0;` in thread_create.
+
+testNumaDomain's immediate release(true)-after-acquireThread is exactly
+the race trigger and stays as the regression test. Stress evidence (all
+under 16 CPU-burner load): pre-fix 1 hang/60 runs of
+test_threadpool.exe; gate-1-only 1 hang/100; final fix 0 hangs/0 fails
+across 40 runs x 500 swept-timing kills (20,000 kills sweeping the
+startup/in-sleep/exit windows) AND 100 full test_threadpool runs.
 
 ## Verification highlights
 

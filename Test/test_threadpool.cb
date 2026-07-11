@@ -31,6 +31,8 @@ import "list.cb";
 import "program.cb";
 import "latch.cb";
 import "topology.cb";
+import "vmem.cb";
+import "numa.cb";
 
 // Inline test helpers (mirroring Test/test_helper.cb's bool/int Test() API).
 int Test(const char* name, bool actual, bool expected) {
@@ -900,6 +902,90 @@ bool testCpuTopology() {
     result &= Test("cpu_mask_numa(-1) == 0", (int)cpu_mask_numa(-1), 0);
     result &= Test("cpu_mask_numa(numaCount) == 0", (int)cpu_mask_numa(cpu_numa_count()), 0);
 
+    // numa_domain_id/index: valid, pairwise-distinct OS node ids; inverse holds.
+    bool numaIdsValid     = true;
+    bool numaIdsDistinct  = true;
+    bool numaIndexRoundtrip = true;
+    i = 0;
+    while (i < cpu_numa_count()) {
+        int id = numa_domain_id(i);
+        if (id < 0) { numaIdsValid = false; }
+        int j = i + 1;
+        while (j < cpu_numa_count()) {
+            if (numa_domain_id(j) == id) { numaIdsDistinct = false; }
+            j = j + 1;
+        }
+        if (numa_domain_index(id) != i) { numaIndexRoundtrip = false; }
+        i = i + 1;
+    }
+    result &= Test("numa_domain_id valid in range", numaIdsValid, true);
+    result &= Test("numa_domain_id pairwise distinct", numaIdsDistinct, true);
+    result &= Test("numa_domain_index(id(i)) == i", numaIndexRoundtrip, true);
+    result &= Test("numa_domain_id(numaCount) == -1", numa_domain_id(cpu_numa_count()), -1);
+    result &= Test("numa_domain_index(-12345) == -1", numa_domain_index(-12345), -1);
+
+    // numa_domain_info: domain 0's detail matches the snapshot; unknown id fails.
+    NumaDomainInfo inf = default;
+    bool infoOk = numa_domain_info(numa_domain_id(0), &inf);
+    result &= Test("numa_domain_info(id(0)) succeeds", infoOk, true);
+    result &= Test("numa_domain_info cpuMask == cpu_mask_numa(0)", (int)(inf.cpuMask == cpu_mask_numa(0)), 1);
+    result &= Test("numa_domain_info logicalCpus == popcount(cpuMask)", inf.logicalCpus, _testPopcount(inf.cpuMask));
+    result &= Test("numa_domain_info physicalCores >= 1", inf.physicalCores >= 1, true);
+    result &= Test("numa_domain_info physicalCores <= logicalCpus", inf.physicalCores <= inf.logicalCpus, true);
+
+    NumaDomainInfo badInf = default;
+    result &= Test("numa_domain_info(unknown id) fails", numa_domain_info(-12345, &badInf), false);
+
+    // Memory: Windows/Linux report real free bytes; Windows total is documented
+    // -1 by design (no per-node total API), so only cross-check when both sides
+    // are actually known.
+    if const (!__MACOS__) {
+        result &= Test("numa_domain_info memFreeBytes > 0", inf.memFreeBytes > 0, true);
+        if (inf.memTotalBytes >= 0 && inf.memFreeBytes >= 0) {
+            result &= Test("numa_domain_info memFree <= memTotal", inf.memFreeBytes <= inf.memTotalBytes, true);
+        }
+    }
+
+    // vmem_alloc_numa: 64K-aligned, writable, symmetric free - on every platform.
+    void* p = vmem_alloc_numa((i64)1 << 20, numa_domain_id(0));
+    result &= Test("vmem_alloc_numa non-null", p != nullptr, true);
+    if (p != nullptr) {
+        result &= Test("vmem_alloc_numa 64K-aligned", (int)(((i64)p & (i64)0xFFFF) == 0), 1);
+        i8* bytes = (i8*)p;
+        bytes[0] = (i8)42;
+        bytes[(1 << 20) - 1] = (i8)7;
+        result &= Test("vmem_alloc_numa write/read start", (int)bytes[0], 42);
+        result &= Test("vmem_alloc_numa write/read end", (int)bytes[(1 << 20) - 1], 7);
+        vmem_free_numa(p);
+    }
+
+    // Bogus node id: deterministic failure where the OS actually validates it.
+    // Windows: VirtualAllocExNuma rejects an out-of-range node outright. Linux:
+    // mbind on a bad node fails and _vm_reserve_commit_core unmaps + returns
+    // nullptr. macOS ignores the node id entirely (no per-node lever) - skip.
+    if const (!__MACOS__) {
+        void* bad = vmem_alloc_numa(4096, 99999);
+        result &= Test("vmem_alloc_numa(bogus node) == nullptr", bad == nullptr, true);
+    }
+
+    // Process affinity round-trip: identity set (must not disturb the test run).
+    if const (!__MACOS__) {
+        u64 aff = os.process_get_affinity();
+        result &= Test("process_get_affinity != 0", aff != (u64)0, true);
+        result &= Test("process_set_affinity(current) succeeds", os.process_set_affinity(aff), true);
+    } else {
+        result &= Test("macos process_get_affinity == 0", (int)(os.process_get_affinity() == (u64)0), 1);
+        result &= Test("macos process_set_affinity fails", os.process_set_affinity((u64)1), false);
+    }
+
+    // thread_bind_memory_self: Linux-only smoke call (self-only mempolicy bind;
+    // no cheap observable, just must not crash on a 1-node box or a real NUMA one).
+    if const (!__WINDOWS__) {
+        if const (!__MACOS__) {
+            os.thread_bind_memory_self(numa_domain_id(0));
+        }
+    }
+
     // QoS mapping: an empty mask is always QOS_CLASS_UNSPECIFIED (0).
     result &= Test("cpu_qos_for_mask(0) == 0", cpu_qos_for_mask(0), 0);
 
@@ -920,6 +1006,139 @@ bool testCpuTopology() {
             result &= Test("macos eff cores non-zero", (int)(cpu_mask_efficiency_cores() != (u64)0), 1);
             result &= Test("macos perf/eff disjoint", (int)((cpu_mask_perf_cores() & cpu_mask_efficiency_cores()) == (u64)0), 1);
         }
+    }
+
+    return result;
+}
+
+// --- NumaDomain worker functions (function<void(void*)>, non-capturing) -----
+
+// Increment a shared atomic counter passed by borrow through arg.
+void _numaWorkerInc(void* arg) {
+    atomic_counter* c = (atomic_counter*)arg;
+    c->increment();
+}
+
+// Sleep briefly so releaseThread() can exercise the kill path while running.
+void _numaWorkerSleep(void* arg) {
+    os.sleep_ms(300);
+}
+
+// Exercises core/numa.cb on the single-NUMA-node dev box (the addendum path:
+// acquire(0, PROCESS) succeeds without the affinity-complement step, threads
+// run pinned, allocLocal works, double-acquire fails, release restores affinity).
+// Machine-independent - the same assertions hold on a 1-domain WSL box.
+bool testNumaDomain() {
+    bool result = true;
+    int id0 = numa_domain_id(0);
+
+    // Acquisition tier depends on the affinity API: Windows/Linux reach PROCESS,
+    // macOS has no affinity API so PROCESS is refused (NONE still works).
+    if const (__MACOS__) {
+        NumaDomain* dn = NumaDomain.acquire(id0, NUMA_ISOLATE_NONE);
+        result &= Test("macos acquire(NONE) non-null", dn != nullptr, true);
+        result &= Test("macos acquire(PROCESS) null", NumaDomain.acquire(id0, NUMA_ISOLATE_PROCESS) == nullptr, true);
+        if (dn != nullptr) { dn->release(false); }
+    } else {
+        NumaDomain* dp = NumaDomain.acquire(id0, NUMA_ISOLATE_PROCESS);
+        result &= Test("acquire(PROCESS) non-null", dp != nullptr, true);
+        result &= Test("acquire(PROCESS) level == PROCESS", dp->level, NUMA_ISOLATE_PROCESS);
+        if (dp != nullptr) { dp->release(false); }
+    }
+
+    // Unknown id fails cleanly.
+    result &= Test("acquire(unknown id -5) null", NumaDomain.acquire(-5, NUMA_ISOLATE_PROCESS) == nullptr, true);
+
+    // Double-acquire of the same id fails; re-acquire succeeds after release.
+    NumaDomain* d = NumaDomain.acquire(id0, NUMA_ISOLATE_NONE);
+    result &= Test("acquire(id0) non-null", d != nullptr, true);
+    result &= Test("double-acquire(id0) null", NumaDomain.acquire(id0, NUMA_ISOLATE_NONE) == nullptr, true);
+
+    // info() through the domain matches numa_domain_info directly.
+    NumaDomainInfo direct = default;
+    numa_domain_info(id0, &direct);
+    NumaDomainInfo via = d->info();
+    result &= Test("info().physicalCores matches", via.physicalCores, direct.physicalCores);
+    result &= Test("info().logicalCpus matches", via.logicalCpus, direct.logicalCpus);
+    result &= Test("info().cpuMask matches", (int)(via.cpuMask == direct.cpuMask), 1);
+
+    // acquireThread hands out up to physicalCores threads pinned to disjoint,
+    // single-bit cores within the domain, then returns nullptr for one more.
+    atomic_counter counter = default;
+    int cores = via.physicalCores;
+    NumaThread*[64] handed = default;
+    int nHanded = 0;
+    u64 seenPins = 0;
+    bool pinsSingleBit  = true;
+    bool pinsInDomain   = true;
+    bool pinsDisjoint   = true;
+    int i = 0;
+    while (i < cores) {
+        NumaThread* t = d->acquireThread(_numaWorkerInc, (void*)&counter);
+        if (t == nullptr) { break; }
+        if (_testPopcount(t->pinMask) != 1) { pinsSingleBit = false; }
+        if ((t->pinMask & d->cpuMask) != t->pinMask) { pinsInDomain = false; }
+        if ((seenPins & t->pinMask) != (u64)0) { pinsDisjoint = false; }
+        seenPins = seenPins | t->pinMask;
+        handed[nHanded] = t;
+        nHanded = nHanded + 1;
+        i = i + 1;
+    }
+    result &= Test("acquireThread handed == physicalCores", nHanded, cores);
+    result &= Test("pinMask popcount == 1", pinsSingleBit, true);
+    result &= Test("pinMask subset of domain cpuMask", pinsInDomain, true);
+    result &= Test("pinMasks pairwise disjoint", pinsDisjoint, true);
+    result &= Test("acquireThread past capacity == nullptr", d->acquireThread(_numaWorkerInc, (void*)&counter) == nullptr, true);
+
+    // Thread bodies actually run: join each, then all increments are visible.
+    bool allJoined = true;
+    i = 0;
+    while (i < nHanded) {
+        if (!handed[i]->join(5000)) { allJoined = false; }
+        i = i + 1;
+    }
+    result &= Test("all NumaThreads joined", allJoined, true);
+    result &= Test("all workers ran (counter == handed)", (int)counter.read(), nHanded);
+
+    // After join + releaseThread the cores are reusable: hand one back out.
+    i = 0;
+    while (i < nHanded) { d->releaseThread(handed[i]); i = i + 1; }
+    NumaThread* reuse = d->acquireThread(_numaWorkerInc, (void*)&counter);
+    result &= Test("core reusable after release", reuse != nullptr, true);
+    if (reuse != nullptr) { reuse->join(5000); d->releaseThread(reuse); }
+
+    // allocLocal: node-bound, 64K-aligned, writable; symmetric free.
+    void* p = d->allocLocal((i64)1 << 20);
+    result &= Test("allocLocal non-null", p != nullptr, true);
+    if (p != nullptr) {
+        result &= Test("allocLocal 64K-aligned", (int)(((i64)p & (i64)0xFFFF) == 0), 1);
+        i8* bytes = (i8*)p;
+        bytes[0] = (i8)42;
+        bytes[(1 << 20) - 1] = (i8)7;
+        result &= Test("allocLocal write/read start", (int)bytes[0], 42);
+        result &= Test("allocLocal write/read end", (int)bytes[(1 << 20) - 1], 7);
+        d->freeLocal(p);
+    }
+
+    // Process affinity is restored after release (on the single-domain box the
+    // complement is empty so confinement is skipped - the mask is untouched).
+    u64 affBefore = os.process_get_affinity();
+    d->release(false);
+    u64 affAfter = os.process_get_affinity();
+    result &= Test("process affinity restored after release", (int)(affBefore == affAfter), 1);
+
+    // Re-acquire after release succeeds.
+    NumaDomain* d2 = NumaDomain.acquire(id0, NUMA_ISOLATE_NONE);
+    result &= Test("re-acquire after release non-null", d2 != nullptr, true);
+    if (d2 != nullptr) { d2->release(false); }
+
+    // release(true) with a live sleeping thread: kill path must not crash.
+    NumaDomain* d3 = NumaDomain.acquire(id0, NUMA_ISOLATE_NONE);
+    if (d3 != nullptr) {
+        NumaThread* st = d3->acquireThread(_numaWorkerSleep, nullptr);
+        result &= Test("sleeper thread non-null", st != nullptr, true);
+        d3->release(true);   // kills the still-sleeping thread; must not crash
+        result &= Test("release(true) with live thread survived", true, true);
     }
 
     return result;
@@ -951,6 +1170,7 @@ extern int main() {
     total++; passed += testThreadPoolInProgram()         ? 1 : 0;
     total++; passed += testPinnedPool()                  ? 1 : 0;
     total++; passed += testCpuTopology()                 ? 1 : 0;
+    total++; passed += testNumaDomain()                  ? 1 : 0;
 
     printf("ThreadPool tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

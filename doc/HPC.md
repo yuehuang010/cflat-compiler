@@ -24,6 +24,7 @@ failure points you toward.
 - [Alignment control (`alignas`)](#alignment-control-alignas)
 - [`span<T>` (noalias) and `view<T>` (may-alias)](#spant-noalias-and-viewt-may-alias)
 - [Across-core data parallelism (`parallel_for_n` / `parallel_reduce`)](#across-core-data-parallelism-parallel_for_n--parallel_reduce)
+  - [NUMA domains (`core/numa.cb`)](#numa-domains-corenumacb)
   - [Dynamic scheduling (`parallel_for_n_dynamic` / `parallel_for_n_dynamic_pool`)](#dynamic-scheduling-parallel_for_n_dynamic--parallel_for_n_dynamic_pool)
     - [`parallel_reduce_dynamic<T>` / `parallel_reduce_dynamic_pool<T>` - dynamic reduction](#parallel_reduce_dynamict--parallel_reduce_dynamic_poolt---dynamic-reduction)
 - [Numeric kernel libraries (`core/hpc`)](#numeric-kernel-libraries-corehpc)
@@ -854,6 +855,323 @@ single-core-class machine, where there is no P/E split to express) maps to `0` /
 applies this automatically: when `pinMask` is set, each worker calls `os.thread_set_qos_self()` on entry.
 QoS must be set from the target thread itself, which is why it is a self-only call rather than a
 handle-taking one.
+
+### NUMA domains (`core/numa.cb`)
+
+`cpu_mask_numa`/`cpu_mask_llc` pin a pool *inside* a memory domain; `core/numa.cb` closes the
+other half of the story - getting the *data* into that domain too. On a multi-socket (or
+multi-die) box, a core reading memory that lives on a **remote** node pays extra interconnect
+latency on every access - often 1.5-2x a local access - and the usual way this bites a program is
+silent: a single thread loads a big buffer at startup, the OS's first-touch page-fault policy
+places every page on *that* thread's node, and every other node's cores then pay the remote
+penalty for the buffer's entire lifetime, with no error and no obvious symptom besides "this
+scales worse than it should." `import "numa.cb";` gives you the domain-aware primitives to place
+both the memory and the threads deliberately, so first-touch never gets the chance to place a
+page wrong.
+
+**Query API** (`core/topology.cb`, alongside `cpu_mask_numa`): `cpu_numa_count()` is the existing
+domain count; `numa_domain_id(index)` / `numa_domain_index(id)` convert between a snapshot slot
+and the OS's own node ID (the acquisition API below is ID-keyed, since that's what a caller holds
+onto). `numa_domain_info(id, &out)` fills a `NumaDomainInfo` with that node's core counts (from
+the memoized topology snapshot) and its **live** free/total memory (queried fresh on every call,
+since free memory changes; never memoized):
+
+```c
+struct NumaDomainInfo {
+    int id             = -1;
+    int physicalCores  = 0;   // physical cores whose coreMask intersects the node
+    int logicalCpus    = 0;   // popcount(cpuMask)
+    u64 cpuMask        = 0;
+    i64 memTotalBytes  = -1;  // -1 = the OS does not expose a per-node total
+    i64 memFreeBytes   = -1;  // -1 = unknown
+};
+bool numa_domain_info(int id, NumaDomainInfo* out);   // false if `id` is unknown
+```
+
+`-1` means "the OS will not tell us this", not "zero": Windows has no documented per-node
+**total**-memory API (`memTotalBytes` is always `-1` there; `memFreeBytes` is real, from
+`GetNumaAvailableMemoryNodeEx`); Linux reports both real, from `/sys/devices/system/node/nodeN/
+meminfo`; macOS reports a real **total** for its single synthetic domain (`hw.memsize`) but
+`memFreeBytes` is always `-1` (not worth binding `host_statistics64` for a tier that has no
+placement lever anyway - see the table below).
+
+**The `NumaDomain` class** is the acquisition layer - one domain object hands out pinned threads
+and node-local memory from the *same* node, so the correct HPC pattern (data and the cores that
+touch it live together) is the path of least resistance:
+
+```c
+NumaDomain* d = NumaDomain.acquire(numa_domain_id(0), NUMA_ISOLATE_PROCESS);
+// ... d->acquireThread / d->allocLocal ...
+d->release(false);   // or just let d go out of scope - ~NumaDomain calls release(false)
+```
+
+- **`NumaDomain.acquire(id, required)`** reserves domain `id` in-process (a module-level registry
+  rejects double-acquire) and returns `nullptr` on exactly three failures: `id` is not a known OS
+  node ID, `id` is already acquired by this process, or `required == NUMA_ISOLATE_PROCESS` on
+  macOS (no affinity API exists there to achieve it). There are two confinement tiers, weakest to
+  strongest:
+
+  ```c
+  const int NUMA_ISOLATE_NONE    = 0;  // bookkeeping only - domain object, thread hand-out,
+                                        // allocLocal; no scheduler interference
+  const int NUMA_ISOLATE_PROCESS = 1;  // + this process's UN-PINNED threads are steered OFF the
+                                        // acquired domain; threads handed out BY the domain are
+                                        // pinned inside it regardless
+  ```
+
+  `NUMA_ISOLATE_NONE` always succeeds for a valid, unacquired ID (it's the macOS tier: threads get
+  QoS steering instead of pinning, `allocLocal` is a plain unbound allocation). `NUMA_ISOLATE_PROCESS`
+  is best-effort even where it "succeeds": on a single-domain machine the complement of every
+  acquired domain's mask is empty, so the confinement step is silently skipped (the addendum case)
+  and pinning is the only protection that remains - `level` still reports `NUMA_ISOLATE_PROCESS`
+  because the pinning half of the contract holds.
+- **`release(killRemaining)`** returns the domain to the registry and restores this process's
+  saved CPU affinity/CPU-set state (recomputed so releasing one domain doesn't disturb another
+  domain's confinement). `killRemaining` kills any `NumaThread`s still running (see below);
+  passing `false` lets stragglers finish on their own, detached. `~NumaDomain` calls
+  `release(false)` on scope exit, so a `NumaDomain*` local auto-releases.
+- **`acquireThread(entry, arg)`** hands out one thread pinned to a free **physical** core of the
+  domain (the lowest SMT sibling - a domain with N physical cores supports exactly N concurrent
+  `NumaThread`s; SMT pairs are never handed out as separate cores) and returns `nullptr` once every
+  physical core is taken. `entry` is a plain non-capturing `function<void(void*)>`, same shape as
+  `Thread.start`/`ThreadPool`'s task functions. The thread's *own* future allocations are steered to
+  the node too, where the OS has the lever: Linux calls `set_mempolicy(MPOL_BIND)` on itself inside
+  the trampoline (self-only, hence thread-side rather than `acquire`-side); Windows has no per-thread
+  mempolicy, so pinning plus first-touch is the mechanism, and `allocLocal` is the explicit lever for
+  a pre-sized buffer; macOS does neither (QoS steering only).
+- **`releaseThread(t)`** returns a handed-out thread's core to the free pool, killing it if it's
+  still running (`os.thread_kill` - the same forced-teardown caveats as everywhere else in this repo:
+  synchronous and safe to clean up after on Windows, deferred and packet-leaking on POSIX). Prefer
+  `t->join(timeoutMs)` first for a graceful return; `releaseThread` is the hard path for a straggler.
+  There is no infinite-timeout sentinel that's portable across platforms - Windows' `join` maps a
+  negative timeout to `WaitForSingleObject`'s `INFINITE`, but the macOS/Linux polling join treats any
+  negative value as "already timed out" - so a thread that may run indefinitely is joined via a retry
+  loop (`while (!t->join(1000)) { }`), not a single call with a sentinel timeout.
+- **`allocLocal(size)` / `freeLocal(p)`** give node-bound pages (`VirtualAllocExNuma` on Windows,
+  `mmap`+`mbind(MPOL_BIND)` on Linux, a plain allocation on macOS), 64K-aligned and zeroed, freed
+  symmetrically.
+- **`info()`** is a live re-query of `numa_domain_info` for this domain's ID - the same struct as
+  above, fetched through the object you already have.
+
+**Per-OS capability table** (single-process scope only - this library places and pins *this*
+process's own memory and threads; it does not evict or isolate other processes):
+
+| Capability | Windows | Linux | macOS |
+|---|---|---|---|
+| Pin a `NumaThread` to a physical core | real (`SetThreadAffinityMask`) | real (`pthread_setaffinity_np`) | none - QoS steering only |
+| Keep un-pinned process threads off an acquired domain (`NUMA_ISOLATE_PROCESS`) | real, via CPU Sets (`SetProcessDefaultCpuSets`) - process *affinity* is deliberately never touched, since a thread's affinity must be a subset of the process's, and shrinking it would break pinning a `NumaThread` inside the very domain being confined | real, via `sched_setaffinity(0, ...)` on the calling thread (the confining thread; inherited by threads spawned after) | not achievable - `acquire(id, NUMA_ISOLATE_PROCESS)` returns `nullptr` |
+| Bind a thread's own future allocations to the node | pin + first-touch (no per-thread mempolicy API) | `set_mempolicy(MPOL_BIND)`, self-only, applied in the trampoline | none |
+| `allocLocal` - explicit node-bound buffer | real (`VirtualAllocExNuma`) | real (`mmap` + `mbind`) | plain unbound allocation (no per-node lever) |
+| Query free / total memory per node | free real, total always `-1` (no documented user-mode API) | both real (`/sys/.../nodeN/meminfo`) | total real for the one synthetic domain (`hw.memsize`), free always `-1` |
+
+**Worked example - loading a very large file striped across domains.** This is the pattern the
+class exists to make easy: query each domain's free memory to size a proportional shard, place
+each shard's buffer with `allocLocal` (so the pages are born on the right node - no first-touch
+discipline needed for the buffer itself), give each domain one pinned I/O thread to load its own
+shard, then hand every physical core in every domain a compute worker that touches only its own
+domain's data:
+
+```c
+import "numa.cb";
+import "topology.cb";
+import "filesystem.cb";
+
+// Shared read-only input path for every domain's loader thread. A
+// function<void(void*)> entry is non-capturing, so a plain global is how
+// workers reach data every domain needs (the per-shard data itself still
+// travels through the arg pointer).
+string g_loadPath = default;
+
+struct FileShard {
+    NumaDomain* domain = nullptr;   // owns the pages + the cores
+    i8*  base   = nullptr;          // domain-local buffer (allocLocal)
+    i64  offset = 0;                // byte range of the file in this shard
+    i64  len    = 0;
+};
+
+// Reads this shard's [offset, offset+len) range of g_loadPath straight into
+// its domain-local buffer, in 64 MB chunks (File.seek/readBytes are int-sized,
+// so a multi-GB shard is read incrementally rather than in one call).
+void loadShard(void* arg) {
+    FileShard* s = (FileShard*)arg;
+    File f;
+    f.openRead(g_loadPath);
+    i64 chunkSize = (i64)1 << 26;
+    i64 done = 0;
+    while (done < s->len) {
+        i64 remaining = s->len - done;
+        int n = (remaining < chunkSize) ? (int)remaining : (int)chunkSize;
+        f.seek((int)(s->offset + done), 0);
+        f.readBytes((i8*)(s->base + done), n);
+        done = done + (i64)n;
+    }
+    f.close();
+}
+
+// One compute worker's context: which shard, which sub-range of its cores.
+struct ComputeCtx {
+    FileShard* shard       = nullptr;
+    int        workerIdx   = 0;
+    int        workerCount = 0;
+};
+
+// Touches ONLY this worker's slice of ITS domain's shard - every read is
+// node-local. (Stub body: replace with the real per-byte kernel.)
+void computeWorker(void* arg) {
+    ComputeCtx* c = (ComputeCtx*)arg;
+    FileShard* s = c->shard;
+    i64 lo = s->len * (i64)c->workerIdx / (i64)c->workerCount;
+    i64 hi = s->len * (i64)(c->workerIdx + 1) / (i64)c->workerCount;
+    i64 i = lo;
+    i64 checksum = 0;
+    while (i < hi) { checksum = checksum + (i64)s->base[i]; i = i + 1; }
+    // ... consume checksum (e.g. fold into a shared atomic total) ...
+}
+
+// join() has no portable "wait forever" sentinel (see the acquireThread note
+// above), so a long-running thread is joined via a retry loop.
+void joinFully(NumaThread* t) {
+    if (t == nullptr) { return; }
+    while (!t->join(1000)) { }
+}
+
+int main() {
+    g_loadPath = "bigfile.bin";   // set before any domain thread is spawned
+
+    int shardCount = cpu_numa_count();
+    FileShard[8] shards = default;
+
+    File probe;
+    probe.openRead(g_loadPath);
+    i64 fileSize = (i64)probe.size();
+    probe.close();
+
+    // 1) Query each domain (feature 2) and acquire it (feature 3). Sizing is
+    //    proportional to each domain's free local memory, so an asymmetric
+    //    machine (or a half-full node) does not overcommit one node while
+    //    another sits empty. Single-domain machine: loop runs once, everything
+    //    below still works (addendum path).
+    i64 freeTotal = 0;
+    int i = 0;
+    while (i < shardCount) {
+        NumaDomainInfo inf = default;
+        numa_domain_info(numa_domain_id(i), &inf);
+        if (inf.memFreeBytes > 0) { freeTotal = freeTotal + inf.memFreeBytes; }
+        i = i + 1;
+    }
+
+    i64 covered = 0;
+    i = 0;
+    while (i < shardCount) {
+        shards[i].domain = NumaDomain.acquire(numa_domain_id(i), NUMA_ISOLATE_PROCESS);
+        NumaDomainInfo inf = shards[i].domain->info();
+        i64 slice = 0;
+        if (i == shardCount - 1 || freeTotal <= 0) {
+            slice = fileSize - covered;
+        } else {
+            slice = fileSize * inf.memFreeBytes / freeTotal;
+        }
+        shards[i].offset = covered;
+        shards[i].len    = slice;
+        // 2) The pages are BORN on the right node: allocLocal binds them
+        //    (VirtualAllocExNuma / mbind) - no first-touch discipline needed
+        //    for the buffer itself.
+        shards[i].base = (i8*)shards[i].domain->allocLocal(slice);
+        covered = covered + slice;
+        i = i + 1;
+    }
+
+    // 3) Parallel load (feature 5): each domain contributes ONE pinned I/O
+    //    thread that reads its own [offset, offset+len) range straight into
+    //    its domain-local buffer.
+    NumaThread*[8] loaders = default;
+    i = 0;
+    while (i < shardCount) {
+        loaders[i] = shards[i].domain->acquireThread(loadShard, (void*)&shards[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < shardCount) { joinFully(loaders[i]); i = i + 1; }
+
+    // 4) Compute (features 5/6): every physical core of every domain gets a
+    //    worker; each worker's slice comes from ITS domain's shard, so all
+    //    hot reads are node-local.
+    NumaThread*[64] workers = default;
+    ComputeCtx*[64] ctxs    = default;
+    int nWorkers = 0;
+    i = 0;
+    while (i < shardCount) {
+        NumaDomainInfo inf = shards[i].domain->info();
+        int w = 0;
+        while (w < inf.physicalCores) {
+            ComputeCtx* ctx = new ComputeCtx;
+            ctx->shard       = &shards[i];
+            ctx->workerIdx   = w;
+            ctx->workerCount = inf.physicalCores;
+            ctxs[nWorkers]    = ctx;
+            workers[nWorkers] = shards[i].domain->acquireThread(computeWorker, (void*)ctx);
+            nWorkers = nWorkers + 1;
+            w = w + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < nWorkers) {
+        joinFully(workers[i]);
+        delete ctxs[i];
+        i = i + 1;
+    }
+
+    // 5) Release (features 4/6): free the domain-local buffers, then release
+    //    every domain - restores process affinity/CPU sets.
+    i = 0;
+    while (i < shardCount) {
+        shards[i].domain->freeLocal(shards[i].base);
+        shards[i].domain->release(false);   // graceful; release(true) would kill stragglers
+        i = i + 1;
+    }
+    return 0;
+}
+```
+
+What the library did for the user, step by step: domain discovery (count + IDs), free-memory-
+proportional shard sizing (`info()`), buffers placed on the right node at allocation time
+(`allocLocal`), loader and compute threads pinned to cores of the *same* node as their data
+(`acquireThread`), un-pinned threads of the rest of the process kept off the acquired domains
+(`NUMA_ISOLATE_PROCESS`), and a single release path that restores process affinity and can reap
+stragglers. On a 1-domain box the identical code degrades to "pinned threads + one big buffer" -
+`shardCount == 1`, the free-memory proportion is trivially `1.0`, and every step still runs.
+
+**Honest limitations:**
+
+- **Single-process scope, always.** The library places and pins only the calling process's own
+  threads and memory; it never evicts, isolates, or even looks at other processes. The OS
+  scheduler remains free to run other processes' threads on an acquired domain's cores - per-thread
+  pinning plus the process-affinity/CPU-Set complement is the *entire* confinement story, not a
+  system-wide guarantee.
+- **Confinement is best-effort, not enforced.** `NUMA_ISOLATE_PROCESS` silently skips the
+  confinement step when the complement is empty (the single-domain case), and on Linux
+  `sched_setaffinity(0, ...)` only affects the calling thread - pre-existing threads created
+  *before* `acquire()` are never chased down and re-pinned (enumerating and rewriting foreign
+  threads' affinity was judged too intrusive). In practice this covers the normal HPC shape:
+  acquire domains at startup, before spawning anything else.
+- **The existing 64-CPU / processor-group-0 limit applies here too.** Masks are a bare `u64`; a
+  NUMA node whose CPUs live outside Windows processor group 0 (>64 logical processors on the
+  machine) reports `cpuMask == 0` even though `numa_domain_info` still returns valid ID and memory
+  fields. Lifting this is its own plan, same as the rest of `topology.cb`.
+- **No page migration in v1.** Pages are placed correctly at allocation time (`allocLocal`) or via
+  first-touch after pinning; nothing in this library *moves* an already-placed page afterward. A
+  `moveToDomain(p, size, domain)` helper is a recorded post-v1 TODO (Linux can do this
+  unprivileged via `mbind(MPOL_MF_MOVE)`; Windows has no migration API, so the portable shape
+  would alloc-on-target + copy + free, changing the pointer) - see
+  `internal/plan/numa-domains.md` for the exact mechanism.
+- **Multi-node performance itself is unverified on this repo's hardware.** Every API call
+  (query, acquire, confinement, pinning, `allocLocal`, kill/release) was validated for
+  correctness on Windows and on Linux/WSL, but the only development machine available is a
+  single-NUMA-node box, so the actual latency win of keeping data and compute on the same node
+  has not been - and could not be - measured here. The design keeps every multi-node decision
+  data-driven off the topology snapshot (nothing is hardcoded to "2 domains"), so a real
+  multi-socket machine exercises the same code path without any change.
 
 ### Per-worker floating-point environment (trap NaN/Inf, flush denormals)
 

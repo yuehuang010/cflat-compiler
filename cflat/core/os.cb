@@ -33,6 +33,7 @@ struct __OsThreadPacket {
     function<void(void*)> start = nullptr;
     void* arg  = nullptr;
     int   _done = 0;
+    int   _started = 0;   // set at shim entry; thread_kill waits for it (see there)
 };
 
 // Neutral thread handle: the OS handle plus the owned packet. os.thread_create
@@ -47,6 +48,7 @@ struct __OsThreadHandle {
 if const (__WINDOWS__) {
     stdcall int __os_thread_shim(void* param) {
         __OsThreadPacket* p = (__OsThreadPacket*)param;
+        p->_started = 1;
         p->start(p->arg);
         p->_done = 1;
         return 0;
@@ -54,6 +56,7 @@ if const (__WINDOWS__) {
 } else {
     void* __os_thread_shim(void* param) {
         __OsThreadPacket* p = (__OsThreadPacket*)param;
+        p->_started = 1;
         p->start(p->arg);
         p->_done = 1;
         return nullptr;
@@ -78,6 +81,121 @@ if const (__WINDOWS__) {
         int   _pending = 0;                        // 1 when _data holds an unconsumed entry
         int   _valid   = 0;                        // 1 if FindFirst succeeded
     };
+}
+
+// --- POSIX NUMA helpers (meminfo parse, mbind syscall, shared reserve+commit
+// core) -----------------------------------------------------------------
+// os.cb owns the Linux meminfo/mbind helpers rather than reusing topology.cb's
+// file-parse helpers (topology.cb imports os.cb, not the other way around -
+// see the layering note in internal/plan/numa-domains.md). Gated out
+// entirely on Windows via an if/else pair (a bare `if` with no matching
+// `else` is not reliably dropped by ForwardRefScanner at file scope).
+if const (__WINDOWS__) {
+    // Nothing: Windows uses GetNumaAvailableMemoryNodeEx/VirtualAllocExNuma directly.
+} else {
+    if const (__MACOS__) {
+        // Nothing: macOS has no per-node memory query or mbind/set_mempolicy lever.
+    } else {
+        // Append the decimal digits of the non-negative int `v` to `out` at `pos`.
+        int _numa_int_append(i8* out, int pos, int v) {
+            if (v >= 10) { pos = _numa_int_append(out, pos, v / 10); }
+            out[pos] = (i8)('0' + (v % 10));
+            return pos + 1;
+        }
+
+        // Build "/sys/devices/system/node/node<id>/meminfo" into out (NUL-terminated).
+        void _numa_meminfo_path(i8* out, int id) {
+            const char* prefix = "/sys/devices/system/node/node";
+            int p = 0;
+            while (prefix[p] != 0) { out[p] = prefix[p]; p = p + 1; }
+            p = _numa_int_append(out, p, id);
+            const char* suffix = "/meminfo";
+            int s = 0;
+            while (suffix[s] != 0) { out[p] = suffix[s]; p = p + 1; s = s + 1; }
+            out[p] = 0;
+        }
+
+        // Value (in bytes) following the first occurrence of `key` in `buf`
+        // (e.g. key="MemFree:" against a line "Node 0 MemFree:   12345 kB").
+        // -1 if `key` does not appear or is not followed by a digit run.
+        i64 _numa_meminfo_value(i8* buf, const char* key) {
+            int klen = 0;
+            while (key[klen] != 0) { klen = klen + 1; }
+            int i = 0;
+            while (buf[i] != 0) {
+                int j = 0;
+                while (j < klen && buf[i + j] == key[j]) { j = j + 1; }
+                if (j == klen) {
+                    int p = i + klen;
+                    while (buf[p] == ' ') { p = p + 1; }
+                    i64 v = 0;
+                    bool any = false;
+                    while (buf[p] >= '0' && buf[p] <= '9') { v = v * 10 + (i64)(buf[p] - '0'); p = p + 1; any = true; }
+                    if (!any) { return -1; }
+                    return v * 1024;   // kB -> bytes
+                }
+                i = i + 1;
+            }
+            return -1;
+        }
+
+        // Read node `id`'s meminfo file (<2KB) into a stack buffer and look up
+        // `key` ("MemTotal:" / "MemFree:"). -1 on any failure (missing node,
+        // unreadable file, key not present).
+        i64 _numa_meminfo_read(int id, const char* key) {
+            i8[80] path = default;
+            _numa_meminfo_path(&path[0], id);
+            void* f = os.posix.fopen((const char*)&path[0], "rb");
+            if (f == nullptr) { return -1; }
+            i8[2048] buf = default;
+            win_size n = os.posix.fread(&buf[0], (win_size)1, (win_size)2047, f);
+            os.posix.fclose(f);
+            if ((i64)n <= 0) { return -1; }
+            buf[(int)n] = 0;
+            return _numa_meminfo_value(&buf[0], key);
+        }
+
+        // mbind(addr, len, MPOL_BIND, &nodemask, maxnode, 0) via the raw syscall
+        // (no libnuma dependency). Returns true on success; on failure the
+        // caller unmaps rather than handing out an unbound region.
+        bool _numa_mbind(void* addr, i64 len, int node) {
+            u64 nodemask = (u64)1 << node;
+            i64 rc = os.posix.syscall(237, (i64)addr, len, (i64)os.posix.MPOL_BIND, (i64)(&nodemask), 64, 0);
+            return rc == 0;
+        }
+    }
+
+    // Reserve+commit `size` bytes with the standard 64K-aligned header-stash
+    // trick shared with vm_reserve_commit (see the vm_release comment). Shared
+    // by macOS and Linux (both mmap-based); if `node` >= 0 on Linux, binds the
+    // mapping to that NUMA node via mbind right after mmap - alignment/header
+    // handling stays in this ONE place so vm_release/vm_release_numa remain
+    // symmetric with both callers. macOS has no mbind lever, so `node` is
+    // ignored there (vm_reserve_commit_numa never passes a real node on macOS
+    // anyway - it routes straight to the plain reserve+commit).
+    void* _vm_reserve_commit_core(i64 size, int node) {
+        i64 gran  = 0x10000;
+        i64 total = size + gran;
+        void* raw = os.posix.mmap(nullptr, total, os.posix.PROT_RW, os.posix.MAP_ANON_PRIVATE, -1, 0);
+        if ((i64)raw == -1) return nullptr;
+        if const (__MACOS__) {
+            // No mbind lever; node is ignored (vm_reserve_commit_numa never
+            // passes a real node on macOS anyway - see os.vm_reserve_commit_numa).
+        } else {
+            if (node >= 0 && !_numa_mbind(raw, total, node)) {
+                os.posix.munmap(raw, total);
+                return nullptr;
+            }
+        }
+        i8* rawBytes = (i8*)raw;
+        i64 pad = ((i64)raw + gran) & ~(gran - (i64)1);
+        pad = pad - (i64)raw;
+        i8* userPtr = &rawBytes[pad];
+        i64* hdr = (i64*)(&userPtr[0 - 16]);
+        hdr[0] = pad;
+        hdr[1] = total;
+        return (void*)userPtr;
+    }
 }
 
 namespace os
@@ -238,18 +356,7 @@ namespace os
         if const (__WINDOWS__) {
             return os.windows.VirtualAlloc(nullptr, size, 0x3000u, 0x04u);   // MEM_RESERVE|MEM_COMMIT
         } else {
-            i64 gran  = 0x10000;
-            i64 total = size + gran;
-            void* raw = os.posix.mmap(nullptr, total, os.posix.PROT_RW, os.posix.MAP_ANON_PRIVATE, -1, 0);
-            if ((i64)raw == -1) return nullptr;
-            i8* rawBytes = (i8*)raw;
-            i64 pad = ((i64)raw + gran) & ~(gran - (i64)1);
-            pad = pad - (i64)raw;
-            i8* userPtr = &rawBytes[pad];
-            i64* hdr = (i64*)(&userPtr[0 - 16]);
-            hdr[0] = pad;
-            hdr[1] = total;
-            return (void*)userPtr;
+            return _vm_reserve_commit_core(size, -1);
         }
     }
 
@@ -264,6 +371,170 @@ namespace os
             i64 total = hdr[1];
             i8* base = &bytes[0 - pad];
             os.posix.munmap((void*)base, total);
+        }
+    }
+
+    // === NUMA (Part A query + Part B node-local placement) =================
+
+    // Bytes of free memory local to NUMA node `id`; -1 if unknown.
+    i64 numa_free_bytes(int id) {
+        if const (__WINDOWS__) {
+            u64 bytes = 0;
+            win_int ok = os.windows.GetNumaAvailableMemoryNodeEx((u16)id, &bytes);
+            if (ok == 0) { return -1; }
+            return (i64)bytes;
+        } else {
+            if const (__MACOS__) { return -1; }   // not worth binding host_statistics64 for the no-op tier
+            else { return _numa_meminfo_read(id, "MemFree:"); }
+        }
+    }
+
+    // Bytes of total memory local to node `id`; -1 if the OS hides it.
+    i64 numa_total_bytes(int id) {
+        if const (__WINDOWS__) {
+            return -1;   // no documented per-node total API on Windows user mode
+        } else {
+            if const (__MACOS__) {
+                if (id != 0) { return -1; }   // single synthetic domain
+                i64 val = 0;
+                win_size len = (win_size)8;
+                win_int rc = os.posix.sysctlbyname("hw.memsize", &val, &len, nullptr, (win_size)0);
+                if (rc != 0) { return -1; }
+                return val;
+            } else {
+                return _numa_meminfo_read(id, "MemTotal:");
+            }
+        }
+    }
+
+    // Reserve+commit `size` bytes bound to NUMA node `id`. Windows:
+    // VirtualAllocExNuma. Linux: mmap+mbind (see _vm_reserve_commit_core).
+    // macOS: no per-node lever - falls back to the plain reserve+commit.
+    void* vm_reserve_commit_numa(i64 size, int id) {
+        if const (__WINDOWS__) {
+            return os.windows.VirtualAllocExNuma(os.windows.GetCurrentProcess(), nullptr, size, 0x3000u, 4u, (u32)id);
+        } else {
+            if const (__MACOS__) { return vm_reserve_commit(size); }
+            else { return _vm_reserve_commit_core(size, id); }
+        }
+    }
+
+    // Symmetric free for vm_reserve_commit_numa. VirtualFree/the POSIX
+    // header-stash release both work unchanged on a node-bound region.
+    void vm_release_numa(void* p) {
+        vm_release(p);
+    }
+
+    // Set the calling process's CPU affinity mask (self). Windows:
+    // SetProcessAffinityMask (affects every thread of the process). Linux:
+    // sched_setaffinity(0, ...) - NOTE this affects only the CALLING thread,
+    // not the whole process (see the PROCESS-tier caveat in
+    // internal/plan/numa-domains.md). macOS: no affinity API - always false.
+    bool process_set_affinity(u64 mask) {
+        if const (__WINDOWS__) {
+            return os.windows.SetProcessAffinityMask(os.windows.GetCurrentProcess(), mask) != 0;
+        } else {
+            if const (__MACOS__) { return false; }
+            else {
+                u64[16] cpuset = default;   // cpu_set_t: 128-byte bitmap, low word = mask
+                cpuset[0] = mask;
+                return os.posix.sched_setaffinity(0, (win_size)128, &cpuset[0]) == 0;
+            }
+        }
+    }
+
+    // Read back the calling process's current CPU affinity mask (0 on
+    // failure / macOS, which has no affinity API to query).
+    u64 process_get_affinity() {
+        if const (__WINDOWS__) {
+            win_usize procMask = 0;
+            win_usize sysMask  = 0;
+            win_int ok = os.windows.GetProcessAffinityMask(os.windows.GetCurrentProcess(), &procMask, &sysMask);
+            if (ok == 0) { return (u64)0; }
+            return (u64)procMask;
+        } else {
+            if const (__MACOS__) { return (u64)0; }
+            else {
+                u64[16] cpuset = default;
+                if (os.posix.sched_getaffinity(0, (win_size)128, &cpuset[0]) != 0) { return (u64)0; }
+                return cpuset[0];
+            }
+        }
+    }
+
+    // Confine the process's DEFAULT (un-pinned) threads to `keepMask` - the
+    // complement of any acquired NUMA domains - so the rest of the process stays
+    // off those domains while explicitly pinned NumaThreads still win their
+    // cores. Windows: SetProcessDefaultCpuSets, which (unlike
+    // SetProcessAffinityMask) leaves the process affinity FULL so per-thread
+    // SetThreadAffinityMask pins are unconstrained (verified empirically -
+    // see the PROCESS-tier section of internal/plan/numa-domains.md). Linux:
+    // sched_setaffinity(0,...) on the calling thread (inherited by threads
+    // spawned after; per-thread pins override). macOS: no lever -> false.
+    // Returns true if confinement was applied.
+    bool process_confine_cpus(u64 keepMask) {
+        if const (__WINDOWS__) {
+            u32 len = 0;
+            os.windows.GetSystemCpuSetInformation(nullptr, (u32)0, &len, os.windows.GetCurrentProcess(), (u32)0);
+            if (len == 0) { return false; }
+            i8* buf = (i8*)malloc((i64)len);
+            win_int ok = os.windows.GetSystemCpuSetInformation((void*)buf, len, &len, os.windows.GetCurrentProcess(), (u32)0);
+            if (ok == 0) { free((void*)buf); return false; }
+            // Walk the self-sized records and collect the CpuSetId of every
+            // group-0 logical CPU present in keepMask.
+            u32[64] ids = default;
+            int nids = 0;
+            i64 off = 0;
+            while (off + 8 <= (i64)len && nids < 64) {
+                u32* szPtr  = (u32*)(buf + off);
+                u32  sz     = *szPtr;
+                if (sz == 0) { break; }
+                u32* idPtr  = (u32*)(buf + off + 8);
+                u16* grpPtr = (u16*)(buf + off + 12);
+                u8*  lpiPtr = (u8*)(buf + off + 14);
+                u32  idv    = *idPtr;
+                u16  grp    = *grpPtr;
+                u8   lpi    = *lpiPtr;
+                if (grp == (u16)0 && (int)lpi < 64 && (keepMask & ((u64)1 << (int)lpi)) != (u64)0) {
+                    ids[nids] = idv;
+                    nids = nids + 1;
+                }
+                off = off + (i64)sz;
+            }
+            win_int sp = os.windows.SetProcessDefaultCpuSets(os.windows.GetCurrentProcess(), &ids[0], (u32)nids);
+            free((void*)buf);
+            return sp != 0;
+        } else {
+            if const (__MACOS__) { return false; }
+            else { return process_set_affinity(keepMask); }
+        }
+    }
+
+    // Undo process_confine_cpus. Windows: clear the default CPU set
+    // (SetProcessDefaultCpuSets(NULL,0)); `savedMask` is ignored because the
+    // process affinity was never touched. Linux: restore the saved affinity
+    // (sched_setaffinity(0, savedMask)). macOS: no-op.
+    void process_restore_cpus(u64 savedMask) {
+        if const (__WINDOWS__) {
+            os.windows.SetProcessDefaultCpuSets(os.windows.GetCurrentProcess(), nullptr, (u32)0);
+        } else {
+            if const (__MACOS__) { }
+            else { process_set_affinity(savedMask); }
+        }
+    }
+
+    // Bind the CALLING thread's future page allocations (first-touch) to NUMA
+    // node `id`. Linux only: set_mempolicy(MPOL_BIND) is self-only, which is
+    // why this is thread-side rather than process-side. No-op on Windows
+    // (pinning + first-touch is the mechanism there) and macOS (no lever).
+    void thread_bind_memory_self(int id) {
+        if const (__WINDOWS__) { }
+        else {
+            if const (__MACOS__) { }
+            else {
+                u64 nodemask = (u64)1 << id;
+                os.posix.syscall(238, (i64)os.posix.MPOL_BIND, (i64)(&nodemask), 64, 0, 0, 0);   // set_mempolicy(MPOL_BIND, &nodemask, maxnode=64)
+            }
         }
     }
 
@@ -435,6 +706,7 @@ namespace os
         p->start = start;
         p->arg   = arg;
         p->_done = 0;
+        p->_started = 0;   // malloc'd packet: recycled memory is NOT zeroed
         __OsThreadHandle* h = (__OsThreadHandle*)malloc(sizeof(__OsThreadHandle));
         h->_packet = p;
         h->_os     = nullptr;
@@ -545,8 +817,24 @@ namespace os
         if (handle == nullptr) return;
         __OsThreadHandle* h = (__OsThreadHandle*)handle;
         if const (__WINDOWS__) {
-            // TerminateThread stops the thread synchronously, so the packet is safe to free.
-            os.windows.TerminateThread(h->_os, -1);
+            // TerminateThread inside NT loader regions (thread INIT before the shim, or
+            // thread EXIT after user code - both hold the loader lock) orphans the loader
+            // and deadlocks ucrt's exit-time lazy LoadLibrary (cdb-proven under load).
+            // Gate 1: wait until the shim has entered user code (past DLL_THREAD_ATTACH).
+            while (h->_packet->_started == 0 && h->_packet->_done == 0) {
+                os.thread_yield();
+            }
+            // Gate 2: suspend then re-check. _done means user code finished and the
+            // thread may be inside DLL_THREAD_DETACH - let it exit instead of killing.
+            os.windows.SuspendThread(h->_os);
+            if (h->_packet->_done != 0) {
+                os.windows.ResumeThread(h->_os);
+                os.windows.WaitForSingleObject(h->_os, -1);
+            } else {
+                // Suspended strictly inside shim/user code: safe to terminate. The kill
+                // is synchronous, so the packet is safe to free afterward.
+                os.windows.TerminateThread(h->_os, -1);
+            }
             os.windows.CloseHandle(h->_os);
             free((void*)h->_packet);
         } else {

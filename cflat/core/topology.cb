@@ -40,6 +40,7 @@ struct CpuTopology {
     u8[64]  coreEff      = default;  // per physical core: EfficiencyClass (higher = more performant)
     u64[8]  llcMask       = default; // per LLC domain: mask of member logical CPUs
     u64[8]  numaMask      = default; // per NUMA node: mask of member logical CPUs
+    i32[8]  numaId        = default; // per NUMA node slot: OS node ID (sparse-safe)
 };
 
 CpuTopology* g_topology     = nullptr;
@@ -69,6 +70,7 @@ void _topo_build_uniform(CpuTopology* topo) {
     }
     topo->llcMask[0]  = all;
     topo->numaMask[0] = all;
+    topo->numaId[0]   = 0;
 }
 
 // True if `m` already appears in topo->llcMask[0..llcCount-1]. LLC records can
@@ -143,8 +145,10 @@ if const (__WINDOWS__) {
                 }
             } else if (rel == (u32)1 && topo->numaCount < 8) {
                 // RelationNumaNode.
+                u32* nodePtr = (u32*)(buf + off + 8);
                 u64* maskPtr = (u64*)(buf + off + 32);
                 topo->numaMask[topo->numaCount] = *maskPtr;
+                topo->numaId[topo->numaCount]   = (i32)(*nodePtr);
                 topo->numaCount = topo->numaCount + 1;
             }
 
@@ -314,6 +318,7 @@ if const (__WINDOWS__) {
             topo->numaCount     = 1;
             u64 all = (coreIdx >= 64) ? ~(u64)0 : (((u64)1 << coreIdx) - (u64)1);
             topo->numaMask[0] = all;
+            topo->numaId[0]   = 0;
         }
 
     } else {
@@ -558,6 +563,7 @@ if const (__WINDOWS__) {
                             u64 nm = _parse_cpu_list(&nbuf[0]);
                             if (nm != (u64)0) {
                                 topo->numaMask[topo->numaCount] = nm;
+                                topo->numaId[topo->numaCount]   = (i32)node;
                                 topo->numaCount = topo->numaCount + 1;
                             }
                         }
@@ -572,6 +578,7 @@ if const (__WINDOWS__) {
                     i8[256] nbuf = default;
                     if (!_sysfs_read(&npath[0], &nbuf[0], 256)) { break; }
                     topo->numaMask[topo->numaCount] = _parse_cpu_list(&nbuf[0]);
+                    topo->numaId[topo->numaCount]   = (i32)node;
                     topo->numaCount = topo->numaCount + 1;
                     node = node + 1;
                 }
@@ -581,6 +588,7 @@ if const (__WINDOWS__) {
                 int a = 0;
                 while (a < phys) { all = all | topo->coreMask[a]; a = a + 1; }
                 topo->numaMask[0] = all;
+                topo->numaId[0]   = 0;
                 topo->numaCount = 1;
             }
 
@@ -689,6 +697,66 @@ u64 cpu_mask_numa(int node) {
     CpuTopology* topo = cpu_topology();
     if (node < 0 || node >= topo->numaCount) { return (u64)0; }
     return topo->numaMask[node];
+}
+
+// OS node ID of snapshot slot `index` (0..cpu_numa_count()-1); -1 if out of range.
+int numa_domain_id(int index) {
+    CpuTopology* topo = cpu_topology();
+    if (index < 0 || index >= topo->numaCount) { return -1; }
+    return (int)topo->numaId[index];
+}
+
+// Inverse of numa_domain_id: snapshot slot index whose OS node ID is `id`;
+// -1 if `id` is not a node ID present in the current snapshot.
+int numa_domain_index(int id) {
+    CpuTopology* topo = cpu_topology();
+    int i = 0;
+    while (i < topo->numaCount) {
+        if ((int)topo->numaId[i] == id) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Per-NUMA-domain detail, keyed by OS node ID (callers hold IDs, not slot
+// indices). Core/CPU counts come from the memoized snapshot; memory fields
+// are queried LIVE via os.cb (free memory changes, so never memoized).
+struct NumaDomainInfo {
+    int id             = -1;
+    int physicalCores  = 0;   // physical cores whose coreMask intersects the node mask
+    int logicalCpus    = 0;   // popcount(cpuMask)
+    u64 cpuMask        = 0;   // logical CPUs belonging to this node
+    i64 memTotalBytes  = -1;  // -1 = OS does not expose a per-node total (e.g. Windows)
+    i64 memFreeBytes   = -1;  // -1 = unknown
+};
+
+// Fill *out with domain `id`'s detail. Returns false (out left untouched) if
+// `id` is not a known OS node ID in the current snapshot.
+bool numa_domain_info(int id, NumaDomainInfo* out) {
+    int slot = numa_domain_index(id);
+    if (slot < 0) { return false; }
+    CpuTopology* topo = cpu_topology();
+    u64 mask = topo->numaMask[slot];
+
+    out->id      = id;
+    out->cpuMask = mask;
+
+    int logical = 0;
+    u64 t = mask;
+    while (t != (u64)0) { t = t & (t - (u64)1); logical = logical + 1; }
+    out->logicalCpus = logical;
+
+    int phys = 0;
+    int i = 0;
+    while (i < topo->physicalCount) {
+        if ((topo->coreMask[i] & mask) != (u64)0) { phys = phys + 1; }
+        i = i + 1;
+    }
+    out->physicalCores = phys;
+
+    out->memFreeBytes  = os.numa_free_bytes(id);
+    out->memTotalBytes = os.numa_total_bytes(id);
+    return true;
 }
 
 // The macOS QoS class that best expresses `mask` (0 == QOS_CLASS_UNSPECIFIED,
