@@ -18,7 +18,7 @@ set LLDLIB=%TOOLS%\lld-link.exe
 
 if not exist "%CLANG%" (
     echo ERROR: clang-cl not found at "%CLANG%"
-    echo Build cflat first with msbuild; that deploys clang-cl/lld-link.
+    echo Build cflat first with cmake_build.bat; that deploys clang-cl/lld-link.
     exit /b 1
 )
 

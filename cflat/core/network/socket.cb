@@ -36,16 +36,14 @@ if const (__WINDOWS__) {
     int _SOCK_SOL_SOCKET = 65535;   // 0xFFFF
     int _SOCK_REUSEADDR  = 4;
     int _SOCK_KEEPALIVE  = 8;
+} else if const (__MACOS__) {
+    int _SOCK_SOL_SOCKET = 65535;   // 0xFFFF (BSD, same as Winsock)
+    int _SOCK_REUSEADDR  = 4;
+    int _SOCK_KEEPALIVE  = 8;
 } else {
-    if const (__MACOS__) {
-        int _SOCK_SOL_SOCKET = 65535;   // 0xFFFF (BSD, same as Winsock)
-        int _SOCK_REUSEADDR  = 4;
-        int _SOCK_KEEPALIVE  = 8;
-    } else {
-        int _SOCK_SOL_SOCKET = 1;
-        int _SOCK_REUSEADDR  = 2;
-        int _SOCK_KEEPALIVE  = 9;
-    }
+    int _SOCK_SOL_SOCKET = 1;
+    int _SOCK_REUSEADDR  = 2;
+    int _SOCK_KEEPALIVE  = 9;
 }
 
 class Socket

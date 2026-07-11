@@ -1,13 +1,13 @@
 # cflat compiler - cross-platform CMake build.
 #
-# This replaces the MSBuild .vcxproj/.slnx. Configure via CMakePresets.json:
+# Configure via CMakePresets.json:
 #   cmake --preset win-x64-release   (or win-x64-debug)
 #   cmake --build --preset win-x64-release
 #
 # The Windows preset reuses the existing repo-root vcpkg_installed tree
 # (VCPKG_MANIFEST_INSTALL=OFF) so it does NOT trigger a 26 GB / 50 min rebuild.
 #
-# Output mirrors the old MSBuild layout exactly so test.bat works unchanged:
+# Output layout so test.bat works unchanged:
 #   x64/<Config>/cflat.exe + x64/<Config>/core/** + lld-link/clang-cl/*.dll.
 #
 # Cross-platform structure: Windows is implemented; APPLE/UNIX branches are
@@ -39,8 +39,8 @@ set(CFLAT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cflat)
 # ---------------------------------------------------------------------------
 find_package(LLVM CONFIG REQUIRED)
 # CClangExtract.cpp drives the clang frontend (CompilerInstance, FrontendAction,
-# PPCallbacks, Lexer) for C-interop auto-extern. The old MSBuild build relied on
-# vcpkg auto-linking every installed lib; CMake names the clang libs explicitly.
+# PPCallbacks, Lexer) for C-interop auto-extern. CMake names the clang libs
+# explicitly rather than relying on vcpkg auto-linking every installed lib.
 find_package(Clang CONFIG REQUIRED)
 find_package(antlr4-runtime CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
@@ -225,7 +225,7 @@ endif()
 # Platform link libraries.
 # ---------------------------------------------------------------------------
 if(WIN32)
-  # ws2_32/version per the old .vcxproj; advapi32 (registry SDK detection),
+  # ws2_32/version for sockets/version info; advapi32 (registry SDK detection),
   # ole32 (WinMD/COM) are default MSVC libs, named here for clarity.
   target_link_libraries(cflat PRIVATE ws2_32 version advapi32 ole32)
   # 64 MB stack: the recursive-descent codegen walk has very large frames.

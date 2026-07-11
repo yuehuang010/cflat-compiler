@@ -4,12 +4,23 @@
 
 The compiler resolves `runtime.cb` (and the whole standard library) **next to the
 executable** - `x64/Release/core/` or `x64/Debug/core/` - not from `cflat/core/`.
-Those deployed copies are produced by the DeploymentContent items in `cflat.vcxproj`
-**at build time**.
+Those deployed copies are produced by the `deploy_core` custom target in
+`CMakeLists.txt` (see the `deploy_core.stamp` custom command around line 249),
+which runs as part of the normal build.
 
-So this sequence silently tests the *old* standard library:
+The `deploy_core` stamp depends on every file under `cflat/core/` (via a
+`CONFIGURE_DEPENDS` glob), not on the `cflat` exe relinking - so editing only a
+core `*.cb` (no C++ change) still triggers a re-copy on the next build. This
+closes the historical trap where a POST_BUILD-only deploy step would leave the
+deployed copy stale after a core-only edit; you still need to **rebuild** for
+the copy to happen, but a plain `cmake_build.bat` run is enough - no C++ touch
+required.
 
-1. `msbuild cflat.slnx ...` (deploys core as a side effect)
+So this sequence used to silently test the *old* standard library (under the
+legacy MSBuild build, which deployed core via `DeploymentContent` items in a
+`.vcxproj` that has since been removed):
+
+1. build (deploys core as a side effect)
 2. edit `cflat/core/*.cb`
 3. `test.bat` - **all green**, but it ran against the pre-edit core
 
@@ -20,11 +31,11 @@ which compiles each core library standalone).
 
 ## The rule
 
-After **any** edit to `cflat/core/*.cb`, rebuild via the solution (the incremental
-build just re-copies content) **before** running `test.bat` / `example.bat`:
+After **any** edit to `cflat/core/*.cb`, rebuild **before** running `test.bat` /
+`example.bat`, so the `deploy_core` target re-copies the tree:
 
 ```bash
-msbuild cflat.slnx -p:Configuration=Release -p:Platform=x64
+./cmake_build.bat release
 test.bat Release
 ```
 

@@ -19,7 +19,7 @@ existence so they can be recreated if lost.
 new-worktree.bat C:\source\cflat-feature -b feature/foo
 
 # build it (no vcpkg rebuild)
-msbuild C:\source\cflat-feature\cflat.slnx -p:Configuration=Release -p:Platform=x64
+cd C:\source\cflat-feature && cmake_build.bat release
 
 # remove it safely
 rm-worktree.bat C:\source\cflat-feature
@@ -37,21 +37,20 @@ robocopy C:\source\vcpkg_installed.bak <main>\vcpkg_installed /MIR /MT:16   # re
 
 ## Why the junction works
 
-Everything keys off the MSBuild property `VcpkgManifestRoot`:
+The CMake build resolves vcpkg deps relative to the source dir: `cmake_build.bat`
+sets `VCPKG_ROOT` and the Windows preset points `VCPKG_INSTALLED_DIR` at
+`${sourceDir}/vcpkg_installed` (see `CMakePresets.json`) with
+`VCPKG_MANIFEST_INSTALL=OFF`, so it reuses whatever is physically at
+`<worktree>\vcpkg_installed` instead of triggering vcpkg's manifest-install step.
 
-- `vcpkg.props` sets it to the dir above `vcpkg.json` (the worktree root), **only
-  if unset** (`Condition="'$(VcpkgManifestRoot)' == ''"`).
-- The vcpkg install dir defaults to `$(VcpkgManifestRoot)\vcpkg_installed\$(VcpkgTriplet)\`.
-- `cflat.vcxproj` *also hardcodes* `$(VcpkgManifestRoot)\vcpkg_installed\...` for the
-  antlr4 include path (lines ~139/163) and the lld-link/clang-cl copy step (lines ~623-627).
-
-The junction keeps `VcpkgManifestRoot` = worktree, so all of those resolve through
-`<worktree>\vcpkg_installed` -> (junction) -> `<main>\vcpkg_installed`. No source change needed.
+The junction keeps `<worktree>\vcpkg_installed` -> (junction) -> `<main>\vcpkg_installed`,
+so the CMake configure finds the shared tree with no source change needed.
 
 ## The rebuild trap (cost real time once)
 
 A fresh `git worktree add` writes `vcpkg.json` with **mtime = now**, newer than the
-shared MSBuild stamp (`vcpkg_installed\<triplet>\.msbuildstamp-...`). That defeats the
+shared build's stamp (`vcpkg_installed\<triplet>\.msbuildstamp-...` under the legacy
+MSBuild flow this mechanism was originally built for). That defeats the
 stamp-skip, so the worktree's first build invokes `vcpkg install`.
 
 The **main repo normally never runs `vcpkg install`** - it coasts on the stamp-skip.

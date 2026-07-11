@@ -3281,7 +3281,7 @@ public:
 
         // Unreachable-code hint (LSP only): a direct return/break/continue ends the
         // block, so any items after it are dead. Report the span once and let normal
-        // codegen proceed unchanged (it already emits into a dead block harmlessly).
+        // codegen proceed unchanged (the loop below reopens a dead block for them).
         if (auto* compiler = Compiler(ctx); compiler->HasHintRegionSink())
         {
             for (size_t i = 0; i + 1 < blockItems.size(); ++i)
@@ -3310,6 +3310,16 @@ public:
             auto destructuring = blockItem->destructuringDeclaration();
 
             auto* compiler = Compiler(blockItem);
+
+            // Dead code after a return/break/continue (typically one nested in a compound
+            // block or an `if const` arm, which inline into this block): the insert block is
+            // already terminated, so reopen emission in a fresh unreachable block. A
+            // `case:`/`default:` label switches blocks itself - a block injected here would be
+            // left empty and unterminated - so leave those to the labeled-statement path.
+            if (compiler->IsBlockTerminated()
+                && !(statement != nullptr && statement->labeledStatement() != nullptr))
+                compiler->ReopenAfterTerminator();
+
             if (decl != nullptr)
             {
                 compiler->SetCurrentDebugLocation(decl->getStart()->getLine());

@@ -66,7 +66,7 @@ if exist "!LINK!" (
 
 REM ---------------------------------------------------------------------------
 REM CRITICAL: a fresh `git worktree add` stamps vcpkg.json with mtime=now, which
-REM is newer than the shared MSBuild stamp. That defeats vcpkg's stamp-skip and
+REM is newer than the shared build's stamp. That defeats vcpkg's stamp-skip and
 REM forces a full `vcpkg install` re-resolve on the worktree's first build - and
 REM if the shared tree is even slightly ABI-stale, vcpkg REBUILDS (llvm etc.)
 REM straight into the shared dir. We age the worktree's manifest files back to
@@ -82,5 +82,5 @@ if errorlevel 1 echo NOTE: could not align mtimes - first build may run a (fast)
 
 echo.
 echo Done. Worktree "!WT_ABS!" shares vcpkg_installed with "!MAIN_ROOT!".
-echo Build it with:  msbuild cflat.slnx -p:Configuration=Release -p:Platform=x64
+echo Build it with:  cmake_build.bat release
 endlocal

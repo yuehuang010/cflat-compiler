@@ -1337,6 +1337,85 @@ bool testPlatformConstant()
 }
 
 // =============================================================
+// Statements following a return/break/continue that lives in a nested scope
+// (a plain compound block or an `if const` arm - both inline into the enclosing
+// block). The dead remainder must still compile into valid IR.
+// =============================================================
+
+int unreachableAfterIfConstReturn()
+{
+    if const (__PLATFORM__ == 64)
+    {
+        return 64;
+    }
+
+    int dead = 1;
+    return dead;
+}
+
+int unreachableAfterNestedReturn()
+{
+    {
+        return 65;
+    }
+    int dead = 2;
+    return dead;
+}
+
+int unreachableAfterTopLevelReturn()
+{
+    return 66;
+    int dead = 3;
+}
+
+// The nested return must still run the owning string's scope-exit destructor.
+int unreachableAfterOwningReturn(int n)
+{
+    string s = "abc" + "def";
+    if (n > 0)
+    {
+        {
+            return s.length();
+        }
+        s = "leaked";
+    }
+    return 0;
+}
+
+int unreachableAfterNestedBreakContinue()
+{
+    int total = 0;
+    for (int i = 0; i < 5; i++)
+    {
+        if (i == 3)
+        {
+            { break; }
+            total += 100;
+        }
+        {
+            if (i == 1) { continue; }
+            total += 1;
+        }
+        total += 10;
+    }
+    return total;
+}
+
+bool testUnreachableAfterReturn()
+{
+    bool result = true;
+
+    result &= Test("unreachable_if_const_return", unreachableAfterIfConstReturn(), 64);
+    result &= Test("unreachable_nested_return", unreachableAfterNestedReturn(), 65);
+    result &= Test("unreachable_top_level_return", unreachableAfterTopLevelReturn(), 66);
+    result &= Test("unreachable_owning_return", unreachableAfterOwningReturn(1), 6);
+    result &= Test("unreachable_owning_return_0", unreachableAfterOwningReturn(0), 0);
+    result &= Test("unreachable_nested_break", unreachableAfterNestedBreakContinue(), 22);
+
+    return result;
+}
+
+// =============================================================
 // Global-scope if const tests (compile-time conditional declarations)
 // =============================================================
 
@@ -2438,6 +2517,7 @@ extern int main()
     total++; passed += testIfConst()                     ? 1 : 0;
     total++; passed += testPlatformConstant()            ? 1 : 0;
     total++; passed += testGlobalIfConst()               ? 1 : 0;
+    total++; passed += testUnreachableAfterReturn()      ? 1 : 0;
     total++; passed += testGlobalStructPtrMethod()       ? 1 : 0;
     total++; passed += testStructWithString()            ? 1 : 0;
     total++; passed += testBraceEscapes()                ? 1 : 0;

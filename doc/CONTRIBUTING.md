@@ -1,15 +1,13 @@
 # Contributing to cflat
 
 The compiler builds on **Windows**, **macOS (Apple Silicon)**, and **Linux/WSL**.
-The primary build system is **CMake + vcpkg** (presets in `CMakePresets.json`); the
-legacy MSBuild `.slnx`/`.vcxproj` still builds on Windows but is no longer the
-default path.
+The build system is **CMake + vcpkg** (presets in `CMakePresets.json`).
 
 ## Prerequisites
 
 **Windows:**
 
-- **[Visual Studio 2022](https://visualstudio.microsoft.com/vs/)** with the **Desktop development with C++** workload (provides MSVC, the Windows SDK, and MSBuild).
+- **[Visual Studio 2022](https://visualstudio.microsoft.com/vs/)** with the **Desktop development with C++** workload (provides MSVC and the Windows SDK).
 - **[Python](https://www.python.org/downloads/)** with pip, then `pip install antlr4-tools`.
 - **LLVM and ANTLR4** are built automatically via vcpkg on first build (~50 minutes the first time as vcpkg compiles LLVM from source).
 

@@ -14155,6 +14155,19 @@ public:
         return !IsInsertBlockLive();
     }
 
+    // A `return` / `break` / `continue` inside a NESTED scope (a plain compound block or an
+    // `if const` arm - both inline their statements into the ENCLOSING block) terminates the
+    // block the caller is still writing to. Reopen emission in a fresh, predecessor-less block
+    // so any statements that follow form valid - if unreachable - IR instead of instructions
+    // after a terminator. Destructors already ran on the real return path (CreateReturnCall).
+    void ReopenAfterTerminator()
+    {
+        auto* bb = builder->GetInsertBlock();
+        if (bb == nullptr || bb->getParent() == nullptr || bb->getTerminator() == nullptr)
+            return;
+        builder->SetInsertPoint(CreateBasicBlock("unreachable", bb->getParent()));
+    }
+
     // True when v is a compile-time-constant non-zero integer - the guard of an
     // infinite loop such as `while (true)` / `while (1)`. Control can only leave
     // such a loop via `break`; it never falls through the condition.

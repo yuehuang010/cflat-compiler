@@ -65,8 +65,8 @@ tool obviously opt-in.
 5. `core/thread.cb`: guarded hook call at child-thread entry (in the trampoline,
    so the new thread registers itself) and around `join()`.
 6. New file `core/diagnostic/thread_fuzz.cb`: the scheduler (sections 4-5).
-7. `cflat.vcxproj`: deploy `core/diagnostic/thread_fuzz.cb` (DeploymentContent),
-   mirroring an existing `core/*.cb` entry.
+   No build plumbing needed - CMake's core-deploy glob picks up new
+   `core/*.cb` files automatically.
 
 That is the whole surface. Everything else is contained in the diagnostic module.
 

@@ -7,8 +7,8 @@ REM   cmake_build.bat              builds win-x64-release
 REM   cmake_build.bat debug        builds win-x64-debug
 REM   cmake_build.bat release      builds win-x64-release
 REM
-REM Output: x64\<Config>\cflat.exe (+ core\, lld-link, clang-cl) - same layout
-REM as the old MSBuild build, so test.bat works unchanged.
+REM Output: x64\<Config>\cflat.exe (+ core\, lld-link, clang-cl) - the layout
+REM test.bat expects.
 setlocal
 
 set VS_ROOT=C:\Program Files\Microsoft Visual Studio\18\Community

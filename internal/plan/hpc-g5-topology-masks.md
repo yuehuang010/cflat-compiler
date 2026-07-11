@@ -17,9 +17,9 @@ YES - pure library. The mask contract is a flat `u64` end to end
 (ThreadPool.init pinMask -> __threadpool_nth_core -> Thread.setAffinity ->
 os.thread_set_affinity -> SetThreadAffinityMask), so G5 only adds smarter
 mask CONSTRUCTORS; every consumer stays byte-identical. No compiler,
-grammar, or ParseDeclarationSpecifiers work. The only non-.cb touches are
-build plumbing for the new core file (vcxproj DeploymentContent entry +
-whatever the CMake core-deploy list needs - verify both).
+grammar, or ParseDeclarationSpecifiers work. No build plumbing is needed for
+the new core file - CMake's `CONFIGURE_DEPENDS` glob deploys everything under
+`cflat/core/` automatically.
 
 ## Scope decision: Windows-only (deliberate)
 
@@ -182,9 +182,9 @@ future affinity-port item.
 ## Implementation steps
 
 1. os.windows.cb externs + core/topology.cb walk + CpuTopology snapshot +
-   degradation path. Build plumbing: vcxproj DeploymentContent + CMake
-   core deploy (verify how core/*.cb get deployed in CMakeLists and add
-   the file the same way). REBUILD BEFORE TESTING - deployed-copy trap.
+   degradation path. No build plumbing needed - CMake's core-deploy glob
+   picks up new core/*.cb files automatically. REBUILD BEFORE TESTING -
+   deployed-copy trap.
 2. Mask helpers on the snapshot.
 3. Tests: extend Test/test_threadpool.cb testPinnedPool area (no new test
    files): snapshot sanity (physicalCount>=1, <=logicalCount; llcCount>=1;
@@ -296,11 +296,7 @@ custom command copies the whole `core/` directory to
 file's mtime is newer than a stamp file. `CONFIGURE_DEPENDS` re-globs at build
 time, so `core/topology.cb` was picked up automatically with **no CMakeLists.txt
 change** - confirmed by `x64/Release/core/topology.cb` existing after a plain
-`cmake_build.bat release` with no other edits. The legacy MSBuild
-`cflat.vcxproj` has no such glob (each core file is an explicit `<None
-Include="core\X.cb">` with per-config `DeploymentContent`), so
-`core\topology.cb` was added there by hand, mirroring the existing
-`core\threadpool.cb` entry.
+`cmake_build.bat release` with no other edits.
 
 **Deviations from the plan**: none of substance. The worked example in
 doc/HPC.md computes the pool worker count as `popcount(cpu_mask_llc(0))`

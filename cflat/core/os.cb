@@ -383,9 +383,10 @@ namespace os
             win_int ok = os.windows.GetNumaAvailableMemoryNodeEx((u16)id, &bytes);
             if (ok == 0) { return -1; }
             return (i64)bytes;
+        } else if const (__MACOS__) {
+            return -1;   // not worth binding host_statistics64 for the no-op tier
         } else {
-            if const (__MACOS__) { return -1; }   // not worth binding host_statistics64 for the no-op tier
-            else { return _numa_meminfo_read(id, "MemFree:"); }
+            return _numa_meminfo_read(id, "MemFree:");
         }
     }
 
@@ -393,17 +394,15 @@ namespace os
     i64 numa_total_bytes(int id) {
         if const (__WINDOWS__) {
             return -1;   // no documented per-node total API on Windows user mode
+        } else if const (__MACOS__) {
+            if (id != 0) { return -1; }   // single synthetic domain
+            i64 val = 0;
+            win_size len = (win_size)8;
+            win_int rc = os.posix.sysctlbyname("hw.memsize", &val, &len, nullptr, (win_size)0);
+            if (rc != 0) { return -1; }
+            return val;
         } else {
-            if const (__MACOS__) {
-                if (id != 0) { return -1; }   // single synthetic domain
-                i64 val = 0;
-                win_size len = (win_size)8;
-                win_int rc = os.posix.sysctlbyname("hw.memsize", &val, &len, nullptr, (win_size)0);
-                if (rc != 0) { return -1; }
-                return val;
-            } else {
-                return _numa_meminfo_read(id, "MemTotal:");
-            }
+            return _numa_meminfo_read(id, "MemTotal:");
         }
     }
 
@@ -413,9 +412,10 @@ namespace os
     void* vm_reserve_commit_numa(i64 size, int id) {
         if const (__WINDOWS__) {
             return os.windows.VirtualAllocExNuma(os.windows.GetCurrentProcess(), nullptr, size, 0x3000u, 4u, (u32)id);
+        } else if const (__MACOS__) {
+            return vm_reserve_commit(size);
         } else {
-            if const (__MACOS__) { return vm_reserve_commit(size); }
-            else { return _vm_reserve_commit_core(size, id); }
+            return _vm_reserve_commit_core(size, id);
         }
     }
 
@@ -433,13 +433,12 @@ namespace os
     bool process_set_affinity(u64 mask) {
         if const (__WINDOWS__) {
             return os.windows.SetProcessAffinityMask(os.windows.GetCurrentProcess(), mask) != 0;
+        } else if const (__MACOS__) {
+            return false;
         } else {
-            if const (__MACOS__) { return false; }
-            else {
-                u64[16] cpuset = default;   // cpu_set_t: 128-byte bitmap, low word = mask
-                cpuset[0] = mask;
-                return os.posix.sched_setaffinity(0, (win_size)128, &cpuset[0]) == 0;
-            }
+            u64[16] cpuset = default;   // cpu_set_t: 128-byte bitmap, low word = mask
+            cpuset[0] = mask;
+            return os.posix.sched_setaffinity(0, (win_size)128, &cpuset[0]) == 0;
         }
     }
 
@@ -452,13 +451,12 @@ namespace os
             win_int ok = os.windows.GetProcessAffinityMask(os.windows.GetCurrentProcess(), &procMask, &sysMask);
             if (ok == 0) { return (u64)0; }
             return (u64)procMask;
+        } else if const (__MACOS__) {
+            return (u64)0;
         } else {
-            if const (__MACOS__) { return (u64)0; }
-            else {
-                u64[16] cpuset = default;
-                if (os.posix.sched_getaffinity(0, (win_size)128, &cpuset[0]) != 0) { return (u64)0; }
-                return cpuset[0];
-            }
+            u64[16] cpuset = default;
+            if (os.posix.sched_getaffinity(0, (win_size)128, &cpuset[0]) != 0) { return (u64)0; }
+            return cpuset[0];
         }
     }
 
@@ -504,9 +502,10 @@ namespace os
             win_int sp = os.windows.SetProcessDefaultCpuSets(os.windows.GetCurrentProcess(), &ids[0], (u32)nids);
             free((void*)buf);
             return sp != 0;
+        } else if const (__MACOS__) {
+            return false;
         } else {
-            if const (__MACOS__) { return false; }
-            else { return process_set_affinity(keepMask); }
+            return process_set_affinity(keepMask);
         }
     }
 
@@ -517,9 +516,9 @@ namespace os
     void process_restore_cpus(u64 savedMask) {
         if const (__WINDOWS__) {
             os.windows.SetProcessDefaultCpuSets(os.windows.GetCurrentProcess(), nullptr, (u32)0);
+        } else if const (__MACOS__) {
         } else {
-            if const (__MACOS__) { }
-            else { process_set_affinity(savedMask); }
+            process_set_affinity(savedMask);
         }
     }
 
@@ -529,12 +528,10 @@ namespace os
     // (pinning + first-touch is the mechanism there) and macOS (no lever).
     void thread_bind_memory_self(int id) {
         if const (__WINDOWS__) { }
+        else if const (__MACOS__) { }
         else {
-            if const (__MACOS__) { }
-            else {
-                u64 nodemask = (u64)1 << id;
-                os.posix.syscall(238, (i64)os.posix.MPOL_BIND, (i64)(&nodemask), 64, 0, 0, 0);   // set_mempolicy(MPOL_BIND, &nodemask, maxnode=64)
-            }
+            u64 nodemask = (u64)1 << id;
+            os.posix.syscall(238, (i64)os.posix.MPOL_BIND, (i64)(&nodemask), 64, 0, 0, 0);   // set_mempolicy(MPOL_BIND, &nodemask, maxnode=64)
         }
     }
 
@@ -858,16 +855,14 @@ namespace os
         if const (__WINDOWS__) {
             if const (__PLATFORM__ == 64) { os.windows.SetThreadAffinityMask(h->_os, mask); }
             else { os.windows.SetThreadAffinityMask(h->_os, (u32)mask); }
+        } else if const (__MACOS__) {
+            // No affinity on Darwin; intentional no-op.
         } else {
-            if const (__MACOS__) {
-                // No affinity on Darwin; intentional no-op.
-            } else {
-                // cpu_set_t is a fixed 128-byte bitmap (1024 bits); we set the
-                // low 64 CPUs from `mask` in word 0 and leave the rest zeroed.
-                u64[16] cpuset = default;
-                cpuset[0] = mask;
-                os.posix.pthread_setaffinity_np(h->_os, (win_size)128, &cpuset[0]);
-            }
+            // cpu_set_t is a fixed 128-byte bitmap (1024 bits); we set the
+            // low 64 CPUs from `mask` in word 0 and leave the rest zeroed.
+            u64[16] cpuset = default;
+            cpuset[0] = mask;
+            os.posix.pthread_setaffinity_np(h->_os, (win_size)128, &cpuset[0]);
         }
     }
 
@@ -875,10 +870,8 @@ namespace os
     // macOS where it is a no-op. Lets callers pick QoS steering instead.
     bool thread_affinity_supported() {
         if const (__WINDOWS__) { return true; }
-        else {
-            if const (__MACOS__) { return false; }
-            else { return true; }
-        }
+        else if const (__MACOS__) { return false; }
+        else { return true; }
     }
 
     // Set the QoS class of the CURRENT thread (macOS only). Self-only because

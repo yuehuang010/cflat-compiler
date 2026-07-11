@@ -53,7 +53,7 @@ Guidelines:
 
 ## Building
 
-The Windows build uses **CMake + vcpkg (Ninja + MSVC)** - this is the default path, and what the dev scripts (`buildAndRun.bat`, `buildci.bat`) invoke. vcpkg supplies the dependencies (ANTLR4, LLVM); the build also deploys `core/*.cb` next to the exe. See [Cross-platform builds](#cross-platform-builds-cmake-windows-linuxwsl-macos) below for the `cmake_build.bat` helper and the presets. The CMake build writes `cflat.exe` to the same `x64/<Config>/` layout the old MSBuild used, so `test.bat` / `test_lsp.bat` work unchanged.
+The Windows build uses **CMake + vcpkg (Ninja + MSVC)** - this is the default path, and what the dev scripts (`buildAndRun.bat`, `buildci.bat`) invoke. vcpkg supplies the dependencies (ANTLR4, LLVM); the build also deploys `core/*.cb` next to the exe. See [Cross-platform builds](#cross-platform-builds-cmake-windows-linuxwsl-macos) below for the `cmake_build.bat` helper and the presets. The CMake build writes `cflat.exe` to the `x64/<Config>/` layout that `test.bat` / `test_lsp.bat` expect.
 
 **Quick dev loop** - `buildAndRun.bat` builds Debug + Release (via `cmake_build.bat`), then runs `Test/test_basic.cb`:
 
@@ -62,19 +62,11 @@ The Windows build uses **CMake + vcpkg (Ninja + MSVC)** - this is the default pa
 ./buildAndRun.bat test_foo.cb  # same but runs test_foo.cb instead
 ```
 
-**Legacy MSBuild** (`.slnx`/`.vcxproj`) still builds on Windows but is no longer the primary path. Build via the **solution file** - building the `.vcxproj` alone puts the exe in the wrong location for `test.bat`:
-
-```bash
-msbuild cflat.slnx -p:Configuration=Debug -p:Platform=x64
-```
-
-> **Bash / Git Bash note**: Use **`-p:`** (dash), not `/p:` (slash). Git Bash path-converts arguments that start with `/letter:`, stripping the leading slash, which causes MSBuild to misparse the flags. Dashes are safe.
-
 ### Cross-platform builds (CMake: Windows, Linux/WSL, macOS)
 
-**CMake + vcpkg** is the primary build system (the legacy MSBuild `.vcxproj`/`.slnx` still build on Windows but are not the default; the dev scripts use CMake). It is the only path that works on Linux/WSL and macOS. Presets live in `CMakePresets.json`. See `internal/plan/cross-platform-macos.md` for the staged port status. Working end-to-end: Windows + Linux/WSL host build, Linux ELF target, and macOS arm64 native build + link + run on Apple Silicon (`./test.sh` passes 147/0 in both Debug and Release; run it with Homebrew tools on PATH).
+**CMake + vcpkg is the build system.** It is the only path, and the only one that works on Linux/WSL and macOS. Presets live in `CMakePresets.json`. See `internal/plan/cross-platform-macos.md` for the staged port status. Working end-to-end: Windows + Linux/WSL host build, Linux ELF target, and macOS arm64 native build + link + run on Apple Silicon (`./test.sh` passes 147/0 in both Debug and Release; run it with Homebrew tools on PATH).
 
-> The CMake build writes the Windows `cflat.exe` to the **same** `x64/<Config>/` layout as MSBuild, so `test.bat` / `test_lsp.bat` work unchanged after a CMake build.
+> The CMake build writes the Windows `cflat.exe` to the `x64/<Config>/` layout, so `test.bat` / `test_lsp.bat` work unchanged after a CMake build.
 
 **Windows (Ninja + MSVC).** Use the helper - it runs `vcvars64`, sets `VCPKG_ROOT`, and reuses the existing 26 GB `vcpkg_installed` (no rebuild):
 
@@ -390,7 +382,7 @@ Only `runtime.cb` is auto-imported. All other core libraries require an explicit
 
 See `internal/stdlib-reference.md` for the full table of all core/*.cb files and their exports.
 
-To add a new core library: add the `.cb` file to `core/` and add an entry in `cflat.vcxproj` with `DeploymentContent`.
+To add a new core library: add the `.cb` file to `cflat/core/`. CMake's `CONFIGURE_DEPENDS` glob copies the whole `core/` directory to the exe dir automatically, so a rebuild picks it up - no project file entry needed.
 
 Use `nullptr` instead of `null`. Always assign `default` to fields.
 
