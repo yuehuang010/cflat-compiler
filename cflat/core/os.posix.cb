@@ -304,11 +304,23 @@ namespace os.posix
     extern win_int munmap(void* addr, win_size length);
     extern win_int mprotect(void* addr, win_size length, i32 prot);
     int PROT_NONE        = 0;
+    int PROT_READ        = 1;
     int PROT_RW          = 3;     // PROT_READ | PROT_WRITE
     // MAP_PRIVATE (0x02) | anonymous. The anonymous bit differs: Linux MAP_ANONYMOUS
     // is 0x20 (-> 0x22), Darwin MAP_ANON is 0x1000 (-> 0x1002).
     if const (__MACOS__) { int MAP_ANON_PRIVATE = 0x1002; }
     else                 { int MAP_ANON_PRIVATE = 0x22; }
+    // MAP_SHARED (0x01) - same value on Linux and Darwin, unlike the anonymous
+    // bit above. Real-fd file mappings use this, not MAP_PRIVATE, so writes
+    // through a writable mapping propagate back to the file.
+    int MAP_SHARED = 1;
+
+    // Flush a mapped range's dirty pages to the backing file (msync). MS_SYNC
+    // differs by platform: Linux 4, Darwin 0x10 (MS_ASYNC/MS_INVALIDATE agree
+    // at 1/2 but MS_SYNC does not - same shape as the MAP_ANON split above).
+    extern win_int msync(void* addr, win_size length, i32 flags);
+    if const (__MACOS__) { int MS_SYNC = 0x10; }
+    else                 { int MS_SYNC = 4; }
 
     // Transparent-huge-page hint. MADV_HUGEPAGE == 14 is Linux-specific (the
     // number means something else entirely on Darwin), so this is guarded out
@@ -383,6 +395,22 @@ namespace os.posix
     extern i8*      getenv(const char* name);
     extern i8*      realpath(const char* path, i8* resolved);    // resolved needs PATH_MAX bytes
     extern win_int  mkstemp(i8* templ);                          // templ ends in XXXXXX; opens+creates
+
+    // === Memory-mapped files - fd-based open/resize/seek ==================
+    // open() is variadic (mode is only consulted with O_CREAT); a fixed 3-arg
+    // extern is safe on the SysV ABI even when mode is unused (the extra
+    // argument register is simply not read by the callee).
+    extern win_int  open(const char* path, win_int flags, win_int mode);
+    extern win_int  ftruncate(i32 fd, i64 length);
+    // Used instead of fstat/stat to read a file's size: avoids hand-deriving
+    // struct stat's st_size offset (which differs between glibc and Darwin).
+    extern i64      lseek(i32 fd, i64 offset, win_int whence);
+    int O_RDONLY = 0;
+    int O_RDWR   = 2;
+    // O_CREAT differs: Linux 0100 (octal, =64), Darwin 0x200 (=512).
+    if const (__MACOS__) { int O_CREAT = 0x200; }
+    else                 { int O_CREAT = 64; }
+    int SEEK_END = 2;
 
     // stat: glibc x86-64 `struct stat` is 144 bytes; st_mode (mode_t, 4B) is at
     // offset 24. S_IFMT mask 0xF000, S_IFDIR 0x4000. glibc 2.33+ exports `stat`

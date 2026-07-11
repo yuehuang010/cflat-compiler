@@ -355,6 +355,40 @@ namespace os.windows
     // Resolve a path to its absolute, fully qualified form.
     extern stdcall win_int  GetFullPathNameA(const char* fileName, win_int bufLen, i8* buf, void* filePart);
 
+    // === Memory-mapped files ===============================================
+    // CreateFileA -> GetFileSizeEx/SetEndOfFile -> CreateFileMappingA ->
+    // MapViewOfFile -> CloseHandle (both handles) is the whole pipeline; see
+    // os.map_file in os.cb, which owns the dispatch. HANDLE is pointer-sized.
+    extern stdcall void*    CreateFileA(const char* path, u32 desiredAccess, u32 shareMode, void* securityAttrs, u32 creationDisposition, u32 flagsAndAttributes, void* templateFile);
+    // Read a file's current size into *size (64-bit, high/low combined by the API).
+    extern stdcall win_int  GetFileSizeEx(void* handle, i64* size);
+    // Move the file pointer; used to position at the target length before SetEndOfFile
+    // (SetEndOfFile truncates/extends the file to the CURRENT file pointer position).
+    extern stdcall win_int  SetFilePointerEx(void* handle, i64 distance, i64* newPointer, u32 moveMethod);
+    // Truncate or extend the file to the current file pointer position.
+    extern stdcall win_int  SetEndOfFile(void* handle);
+    // Create a file-mapping (section) object backed by hFile. sizeHigh/sizeLow == 0
+    // means "map the whole current file size" - the case used here (v1 is whole-file only).
+    extern stdcall void*    CreateFileMappingA(void* hFile, void* securityAttrs, u32 protect, u32 sizeHigh, u32 sizeLow, const char* name);
+    // Map a view of a file-mapping object into this process's address space.
+    extern stdcall void*    MapViewOfFile(void* hMapping, u32 desiredAccess, u32 offsetHigh, u32 offsetLow, win_size size);
+    // Unmap a previously mapped view.
+    extern stdcall win_int  UnmapViewOfFile(void* addr);
+    // Flush a range of a mapped view's dirty pages to disk.
+    extern stdcall win_int  FlushViewOfFile(void* addr, win_size size);
+
+    u32 GENERIC_READ         = 0x80000000u;
+    u32 GENERIC_WRITE        = 0x40000000u;
+    u32 FILE_SHARE_READ      = 0x00000001u;
+    u32 FILE_SHARE_WRITE     = 0x00000002u;
+    u32 OPEN_EXISTING        = 3u;
+    u32 OPEN_ALWAYS          = 4u;
+    u32 FILE_ATTRIBUTE_NORMAL = 0x80u;
+    u32 PAGE_READONLY        = 0x02u;
+    u32 PAGE_READWRITE       = 0x04u;
+    u32 FILE_MAP_READ        = 0x0004u;
+    u32 FILE_MAP_WRITE       = 0x0002u;
+
     // Win32 Console
     // _CONSOLE_CURSOR_INFO - 8 bytes (dwSize + bVisible).
     struct _CONSOLE_CURSOR_INFO {

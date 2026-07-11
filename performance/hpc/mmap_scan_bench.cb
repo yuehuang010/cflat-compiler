@@ -1,0 +1,149 @@
+// mmap_scan_bench.cb - copy-then-scan (File.readBytes) vs zero-copy scan
+// (MappedFile.asSpan<double> + vectorize) over a large file of doubles.
+//
+// Both variants read the SAME file, written once up front, and sum every
+// element with a vectorize reduction loop. The only difference is whether
+// the bytes are copied into a heap buffer first (File.readBytes) or the
+// page-cache-backed mapping is fed straight to the loop (MappedFile).
+//
+// Build (see performance/hpc/pfor_dynamic_bench.cb for the pattern):
+//   x64/Release/cflat.exe performance/hpc/mmap_scan_bench.cb -i cflat/core \
+//       -o out/hpc/mmap_scan_bench.exe -O2
+//   out\hpc\mmap_scan_bench.exe
+//
+// Not in performance.bat's BENCH_FILES list (ad hoc bench evidence, same as
+// hugepage_bench.cb / pfor_dynamic_bench.cb).
+
+import "cruntime.cb";
+import "time.cb";
+import "filesystem.cb";
+
+i64 N_DOUBLES = 32000000;             // 32M doubles = 256 MB file
+i64 FILE_BYTES = 256000000;           // N_DOUBLES * 8, spelled out - global
+                                       // initializers must be compile-time constants
+int REPS = 5;                          // repetitions per variant; report the minimum
+string BENCH_PATH = "mmap_scan_bench_data.bin";
+
+// Sum a noalias double[] with a vectorize reduction (the point of the whole
+// exercise: both variants funnel into the exact same kernel, so the only
+// thing being measured is how the data got here).
+double sumSpan(double[] a, i64 n) {
+    double s = 0.0;
+    // FP reduction needs the reassoc tier (see doc/HPC.md "FP-math tiers") -
+    // plain `vectorize` rejects a floating-point sum as "not a recognized
+    // reduction" since it may not reorder the adds on its own.
+    vectorize(reassoc) for (i64 i = 0; i < n; i = i + 1) { s = s + a[i]; }
+    return s;
+}
+
+// Write N_DOUBLES deterministic values to BENCH_PATH via a MappedFile write
+// mapping (exercises openWrite in the same run that exercises openRead).
+void writeBenchFile() {
+    MappedFile* w = new MappedFile;
+    if (!w->openWrite(BENCH_PATH, FILE_BYTES)) {
+        printf("FAILED to create benchmark file\n");
+        delete w;
+        return;
+    }
+    span<double> sp = MappedFile.asSpan<double>(w);
+    double[] v = sp.data();
+    // Plain (non-vectorize) fill - only the SUM kernel below is the thing
+    // this benchmark is measuring; writing the fixture data does not need
+    // the vectorize contract.
+    i64 i = 0;
+    while (i < N_DOUBLES) { v[i] = (double)i * 0.001; i = i + 1; }
+    w->flush();
+    delete w;
+}
+
+// Variant 1: File.readBytes copies the whole file into a fresh heap buffer,
+// then sums it. readBytes takes an `int` count, so this variant is capped at
+// ~2 GB files - fine at the 256 MB size used here. `outSum` is checked by the
+// caller against the mapped variant's sum (both a dead-code-elimination sink
+// and a correctness cross-check that both paths see the same bytes).
+double runCopyVariant(double* outSum) {
+    Stopwatch sw;
+    sw.start();
+
+    File* f = new File;
+    f->openRead(BENCH_PATH);
+    i8* buf = new i8[FILE_BYTES];
+    f->readBytes(buf, (int)FILE_BYTES);
+    delete f;
+
+    // The buffer just came from `new i8[FILE_BYTES]` - a fresh, whole,
+    // distinct allocation - so re-blessing it as a noalias double[] is sound
+    // by the same construction argument MappedFile.asSpan uses, just spelled
+    // out here instead of hidden behind a library method.
+    double[] view = (double[])((double*)buf);
+    outSum[0] = sumSpan(view, N_DOUBLES);
+
+    delete[] buf;
+    sw.stop();
+    return sw.elapsed().nanoseconds() / 1.0e6;   // ms
+}
+
+// Variant 2: MappedFile.asSpan<double> feeds the mapping straight to the same
+// vectorize kernel - zero bytes copied into user space by cflat (the OS page
+// cache still backs the pages, same as it does for the read() syscall inside
+// File.readBytes; the difference measured here is the extra user-space copy,
+// not disk I/O).
+double runMappedVariant(double* outSum) {
+    Stopwatch sw;
+    sw.start();
+
+    MappedFile* m = new MappedFile;
+    m->openRead(BENCH_PATH);
+    span<double> sp = MappedFile.asSpan<double>(m);
+    double[] view = sp.data();
+    outSum[0] = sumSpan(view, N_DOUBLES);
+    delete m;
+
+    sw.stop();
+    return sw.elapsed().nanoseconds() / 1.0e6;   // ms
+}
+
+extern int main() {
+    printf("Writing %lld doubles (%lld bytes) to %s ...\n", N_DOUBLES, FILE_BYTES, BENCH_PATH.data());
+    writeBenchFile();
+
+    printf("\n%d reps per variant; reporting the minimum.\n\n", REPS);
+
+    double bestCopy = 1.0e30;
+    double copySum = 0.0;
+    int r = 0;
+    while (r < REPS) {
+        double sum = 0.0;
+        double ms = runCopyVariant(&sum);
+        copySum = sum;
+        if (ms < bestCopy) { bestCopy = ms; }
+        r = r + 1;
+    }
+    printf("  %-28s %10.2f ms  (sum=%.3f)\n", "File.readBytes + sum", bestCopy, copySum);
+
+    double bestMapped = 1.0e30;
+    double mappedSum = 0.0;
+    r = 0;
+    while (r < REPS) {
+        double sum = 0.0;
+        double ms = runMappedVariant(&sum);
+        mappedSum = sum;
+        if (ms < bestMapped) { bestMapped = ms; }
+        r = r + 1;
+    }
+    printf("  %-28s %10.2f ms  (sum=%.3f)\n", "MappedFile.asSpan + sum", bestMapped, mappedSum);
+
+    printf("\n=== Summary ===\n");
+    printf("  copy variant:   %10.2f ms\n", bestCopy);
+    printf("  mapped variant: %10.2f ms\n", bestMapped);
+    printf("  sums agree: %s\n", copySum == mappedSum ? "yes" : "NO (correctness bug!)");
+    printf("  speedup (copy/mapped) = %.2fx\n", bestCopy / bestMapped);
+    printf("  NOTE: this is a WARM page-cache run (the file was just written by this\n");
+    printf("  same process) - it isolates the user-space-copy cost, not disk I/O. A\n");
+    printf("  cold-cache first read of a multi-GB file is disk-bound either way, and\n");
+    printf("  the copy is not the bottleneck there - report whatever this run actually\n");
+    printf("  shows rather than assuming the zero-copy path always wins.\n");
+
+    File.remove(BENCH_PATH);
+    return 0;
+}

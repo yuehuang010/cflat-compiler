@@ -348,6 +348,73 @@ int testDirectoryExtended()
     return passed;
 }
 
+// ── MappedFile ─────────────────────────────────────────────────────────────
+
+int testMappedFile()
+{
+    int passed = 0;
+    string path = "test_fs_mapped.bin";
+    File.remove(path);
+
+    // Round-trip a known buffer through openWrite + flush + openRead.
+    MappedFile* w = new MappedFile;
+    passed += Test("MappedFile.openWrite", w->openWrite(path, 40), true);   // 5 doubles
+    passed += Test("MappedFile write length", w->length(), (i64)40);
+    span<double> wsp = MappedFile.asSpan<double>(w);
+    passed += Test("write span length", wsp.length(), (i64)5);
+    int i = 0;
+    while (i < 5) { wsp.set(i, (double)i * 1.5); i = i + 1; }
+    passed += Test("flush", w->flush(), true);
+    delete w;   // destructor unmaps
+
+    MappedFile* r = new MappedFile;
+    passed += Test("MappedFile.openRead", r->openRead(path), true);
+    passed += Test("MappedFile read length", r->length(), (i64)40);
+    span<double> rsp = MappedFile.asSpan<double>(r);
+    passed += Test("read span length", rsp.length(), (i64)5);
+    bool valuesOk = true;
+    i = 0;
+    while (i < 5) { if (rsp.get(i) != (double)i * 1.5) valuesOk = false; i = i + 1; }
+    passed += Test("asSpan values round-trip", valuesOk, true);
+    delete r;
+    File.remove(path);
+
+    // A zero-length file must map cleanly (len 0, null addr, openRead true) -
+    // NOT an error - on every platform (Windows cannot map a 0-size section).
+    string emptyPath = "test_fs_mapped_empty.bin";
+    File.writeAllText(emptyPath, "");
+    MappedFile* e = new MappedFile;
+    passed += Test("empty file openRead", e->openRead(emptyPath), true);
+    passed += Test("empty file length", e->length(), (i64)0);
+    passed += Test("empty file data null", e->data() == nullptr, true);
+    span<double> esp = MappedFile.asSpan<double>(e);
+    passed += Test("empty file span length", esp.length(), (i64)0);
+    delete e;
+    File.remove(emptyPath);
+
+    // Opening a missing file for read fails cleanly (not an empty mapping).
+    MappedFile* missing = new MappedFile;
+    passed += Test("missing file openRead fails", missing->openRead("test_fs_mapped_missing.bin"), false);
+    delete missing;
+
+    // Map/drop loop: if the destructor failed to unmap, repeatedly mapping a
+    // fresh region would eventually exhaust address space / fail to allocate.
+    string loopPath = "test_fs_mapped_loop.bin";
+    File.remove(loopPath);
+    bool loopOk = true;
+    i = 0;
+    while (i < 2000) {
+        MappedFile mf;
+        if (!mf.openWrite(loopPath, 65536)) { loopOk = false; break; }
+        mf.close();
+        i = i + 1;
+    }
+    passed += Test("map/drop loop does not leak", loopOk, true);
+    File.remove(loopPath);
+
+    return passed;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 extern int main()
@@ -366,6 +433,7 @@ extern int main()
     r = testFileInstanceMethods();  passed += r; total += 9;
     r = testPathClass();            passed += r; total += 17;
     r = testDirectoryExtended();    passed += r; total += 8;
+    r = testMappedFile();           passed += r; total += 14;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

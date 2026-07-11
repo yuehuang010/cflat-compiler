@@ -28,6 +28,7 @@ failure points you toward.
   - [Dynamic scheduling (`parallel_for_n_dynamic` / `parallel_for_n_dynamic_pool`)](#dynamic-scheduling-parallel_for_n_dynamic--parallel_for_n_dynamic_pool)
     - [`parallel_reduce_dynamic<T>` / `parallel_reduce_dynamic_pool<T>` - dynamic reduction](#parallel_reduce_dynamict--parallel_reduce_dynamic_poolt---dynamic-reduction)
 - [Huge pages](#huge-pages)
+- [Memory-mapped files (`MappedFile`)](#memory-mapped-files-mappedfile)
 - [Numeric kernel libraries (`core/hpc`)](#numeric-kernel-libraries-corehpc)
 
 **Related:** [Threading & Memory Management](THREADING.md) (threads, affinity, thread pool, allocators, lock-set analysis) | [Language & Core Library Features](LANGUAGE.md)
@@ -1415,6 +1416,82 @@ a fragmented system that lacks a physically contiguous 2 MB block - the
 library retries once without `MEM_LARGE_PAGES` and hands back normal pages
 rather than failing the call; this is expected occasionally on a long-uptime
 box, not a bug report.
+
+## Memory-mapped files (`MappedFile`)
+
+`import "filesystem.cb";` gives `MappedFile`, an owning, whole-file memory mapping - the
+missing INPUT side of the HPC story: G1-G4 built the noalias/vectorize machinery, and a
+mapping is its natural producer. Reading a large input with `File.readBytes` copies every
+byte into a heap buffer first; `MappedFile` hands the page-cache-backed pages straight to
+`vectorize` / `parallel_for_n` as a first-class noalias `span<T>`, with **zero copy**.
+
+```c
+import "filesystem.cb";
+
+MappedFile* m = new MappedFile;
+if (m->openRead("dataset.bin")) {
+    span<double> data = MappedFile.asSpan<double>(m);   // zero-copy noalias view
+    double[] v = data.data();
+    double sum = 0.0;
+    vectorize(reassoc) for (i64 i = 0; i < data.length(); i = i + 1) { sum = sum + v[i]; }
+}
+delete m;   // destructor unmaps
+```
+
+- **`openRead(path)`** maps the whole file read-only. **`openWrite(path, len)`** maps
+  `len` bytes read-write, fixing the file at exactly that size **before** the mapping is
+  created - the mapping cannot grow the file afterward, so `len` is not optional. Both
+  release any mapping already held first (re-opening a `MappedFile` is safe), and both are
+  whole-file only in v1: there is no windowed `map(offset, len)` and no copy-on-write mode.
+- **`length()`** / **`data()`** - the mapping's byte length and raw `i8*` base.
+- **`MappedFile.asSpan<T>(ptr)`** is the payoff: a noalias `span<T>` over the whole
+  mapping. It is written as a **static** method taking the `MappedFile*` explicitly (the
+  same shape as `simd<T,N>.load`/`.store`) rather than an instance method
+  `m.asSpan<T>()` - a generic method with its own type parameter does not resolve
+  `this`/fields on a non-generic class in this compiler, so the static form is the
+  supported spelling, not a style choice.
+- **`flush()`** writes a writable mapping's dirty pages back to the file
+  (`FlushViewOfFile` / `msync`). **`close()`** unmaps and is idempotent; the destructor
+  calls it, so an RAII-scoped `MappedFile` needs no explicit cleanup (same shape as
+  `VMemRegion` in `core/vmem.cb`).
+
+### Traps
+
+- **An empty file maps cleanly, not as an error.** Windows cannot create a file mapping
+  over a zero-length file at all (`CreateFileMapping` fails outright), so a 0-byte file is
+  special-cased to `length() == 0`, `data() == nullptr`, `openRead` returning `true` - on
+  every platform, for consistency. `MappedFile.asSpan<T>` on an empty mapping returns an
+  empty span rather than dereferencing a null base.
+- **A write mapping cannot grow the file.** `openWrite`'s `len` sets the FINAL size before
+  anything is mapped (`SetEndOfFile` / `ftruncate`, run first). Appending through a mapping
+  is not a thing - write the desired final size up front.
+- **Truncating a file under a live mapping is a hard fault, not an error code.** `SIGBUS`
+  on POSIX, `EXCEPTION_IN_PAGE_ERROR` on Windows, on the next access to the truncated
+  pages. This is the irreducible price of mapping a file that something else can still
+  resize; there is no guard against it because there is no way to win that race. Don't
+  truncate (or let another process/thread truncate) a file you have mapped.
+- **Huge pages do not back mapped files.** Windows large pages only back private committed
+  memory, not real file mappings (`SEC_LARGE_PAGES` is pagefile-backed sections only); Linux
+  THP for read-only file-backed page cache is narrow and kernel-config-dependent, not
+  something a library can rely on. So do not expect the huge-page support to speed up a
+  mapping. The actionable lever for a mapping's performance is prefetch/advice
+  (`madvise(MADV_WILLNEED)` / `PrefetchVirtualMemory`), not page size - not yet implemented.
+
+### Copy vs. zero-copy: what `performance/hpc/mmap_scan_bench.cb` actually shows
+
+The benchmark sums a 256 MB file of doubles two ways - `File.readBytes` into a heap buffer
+vs. `MappedFile.asSpan<double>` fed straight to a `vectorize(reassoc)` reduction - and
+reports the honest result rather than an assumed win: on a **warm page-cache, single-process
+run** (the file was just written by the same process, so the pages are already resident),
+the **copy variant was faster**, not the mapped one - the first-touch soft page faults on a
+fresh mapping's pages cost more, in this shape of run, than one bulk `read()` syscall plus a
+memcpy-speed scan. Zero-copy is not automatically a win; it removes ONE cost (the user-space
+copy) while potentially adding another (page-fault-driven, one-page-at-a-time population of
+the mapping) that a single sequential `read()` does not pay. Where `MappedFile` is expected
+to win is a **cold, multi-GB, page-cache-resident-across-many-reads** dataset (avoiding the
+copy on every subsequent pass) or a **randomly-accessed** dataset (no need to read the parts
+never touched) - re-run the benchmark for your actual access pattern before assuming either
+direction.
 
 ## Numeric kernel libraries (`core/hpc`)
 

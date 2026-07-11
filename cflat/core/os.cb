@@ -1314,4 +1314,142 @@ namespace os
             return true;
         }
     }
+
+    // === Memory-mapped files ===============================================
+    // WHOLE-FILE-ONLY: no windowed map(offset,len), no copy-on-write. On both
+    // platforms the mapping outlives the handles/fd that created it, so
+    // map_file closes them itself before returning; the owning MappedFile type
+    // (core/filesystem.cb) stores only {addr, len}.
+    //
+    // Contract: on success, returns the mapping base and sets *outLen to its
+    // length (>= 0). A file that is legitimately EMPTY (len 0) is success, not
+    // failure: returns nullptr with *outLen == 0 (Windows cannot map a
+    // zero-length file at all, so this case is special-cased here, in the one
+    // place, rather than leaking into every caller). On any real failure
+    // returns nullptr with *outLen == -1, which is how callers tell "empty
+    // file" apart from "open/map failed".
+    //
+    // writable == true: *outLen must be set by the CALLER on entry to the
+    // desired FINAL file size. The mapping cannot grow the file afterward
+    // (the size is fixed before CreateFileMappingA/mmap are ever called) -
+    // appending through a mapping is not a thing. Truncating the file while a
+    // mapping over it is still live is a hard fault (SIGBUS / Windows
+    // EXCEPTION_IN_PAGE_ERROR on next access), not a recoverable error; there
+    // is no guard against it because there is no way to win that race.
+    void* map_file(const char* path, i64* outLen, bool writable) {
+        if const (__WINDOWS__) {
+            u32 access = writable ? (os.windows.GENERIC_READ | os.windows.GENERIC_WRITE) : os.windows.GENERIC_READ;
+            // FILE_SHARE_READ | FILE_SHARE_WRITE: a file mapping open here for
+            // reading only must not lock other processes out of it either.
+            u32 share  = os.windows.FILE_SHARE_READ | os.windows.FILE_SHARE_WRITE;
+            u32 disp   = writable ? os.windows.OPEN_ALWAYS : os.windows.OPEN_EXISTING;
+            void* file = os.windows.CreateFileA(path, access, share, nullptr, disp, os.windows.FILE_ATTRIBUTE_NORMAL, nullptr);
+            if ((i64)file == -1) { outLen[0] = -1; return nullptr; }   // INVALID_HANDLE_VALUE
+
+            i64 len = 0;
+            if (writable) {
+                // Set the file's final size BEFORE mapping: position the file
+                // pointer at the target length, then SetEndOfFile truncates or
+                // extends to that position.
+                len = outLen[0];
+                i64 newPos = 0;
+                os.windows.SetFilePointerEx(file, len, &newPos, 0u);   // 0 == FILE_BEGIN
+                if (os.windows.SetEndOfFile(file) == 0) {
+                    os.windows.CloseHandle(file);
+                    outLen[0] = -1;
+                    return nullptr;
+                }
+            } else {
+                if (os.windows.GetFileSizeEx(file, &len) == 0) {
+                    os.windows.CloseHandle(file);
+                    outLen[0] = -1;
+                    return nullptr;
+                }
+            }
+
+            if (len == 0) {
+                os.windows.CloseHandle(file);
+                outLen[0] = 0;
+                return nullptr;   // empty file: valid empty mapping, not an error
+            }
+
+            u32 protect = writable ? os.windows.PAGE_READWRITE : os.windows.PAGE_READONLY;
+            // sizeHigh/sizeLow == 0 means "map the current full file size".
+            void* mapping = os.windows.CreateFileMappingA(file, nullptr, protect, 0u, 0u, nullptr);
+            if (mapping == nullptr) {
+                os.windows.CloseHandle(file);
+                outLen[0] = -1;
+                return nullptr;
+            }
+            u32 mapAccess = writable ? os.windows.FILE_MAP_WRITE : os.windows.FILE_MAP_READ;
+            void* addr = os.windows.MapViewOfFile(mapping, mapAccess, 0u, 0u, (win_size)0);
+            // Handle lifetime: close BOTH handles now - the view stays valid
+            // after CloseHandle (Win32 refcounts the section via the view).
+            os.windows.CloseHandle(mapping);
+            os.windows.CloseHandle(file);
+            if (addr == nullptr) { outLen[0] = -1; return nullptr; }
+            outLen[0] = len;
+            return addr;
+        } else {
+            i32 fd = -1;
+            i64 len = 0;
+            if (writable) {
+                len = outLen[0];
+                fd = os.posix.open(path, os.posix.O_RDWR | os.posix.O_CREAT, 0x1B6);   // 0666
+                if (fd < 0) { outLen[0] = -1; return nullptr; }
+                if (os.posix.ftruncate(fd, len) != 0) {
+                    os.posix.close(fd);
+                    outLen[0] = -1;
+                    return nullptr;
+                }
+            } else {
+                fd = os.posix.open(path, os.posix.O_RDONLY, 0);
+                if (fd < 0) { outLen[0] = -1; return nullptr; }
+                len = os.posix.lseek(fd, 0, os.posix.SEEK_END);
+                if (len < 0) {
+                    os.posix.close(fd);
+                    outLen[0] = -1;
+                    return nullptr;
+                }
+            }
+
+            if (len == 0) {
+                os.posix.close(fd);
+                outLen[0] = 0;
+                return nullptr;   // empty file: valid empty mapping, not an error
+            }
+
+            i32 prot = writable ? os.posix.PROT_RW : os.posix.PROT_READ;
+            void* addr = os.posix.mmap(nullptr, len, prot, os.posix.MAP_SHARED, fd, 0);
+            // Handle lifetime: close the fd now - the mapping stays valid
+            // after close() (the kernel keeps the mapping alive independently).
+            os.posix.close(fd);
+            if ((i64)addr == -1) { outLen[0] = -1; return nullptr; }
+            outLen[0] = len;
+            return addr;
+        }
+    }
+
+    // Unmap a region returned by map_file. Safe to call with addr == nullptr
+    // (the empty-mapping case) - a no-op returning true.
+    bool unmap_file(void* addr, i64 len) {
+        if (addr == nullptr) return true;
+        if const (__WINDOWS__) {
+            return os.windows.UnmapViewOfFile(addr) != 0;
+        } else {
+            return os.posix.munmap(addr, len) == 0;
+        }
+    }
+
+    // Flush a writable mapping's dirty pages back to the file (msync /
+    // FlushViewOfFile). Safe to call with addr == nullptr - a no-op returning
+    // true (nothing was ever mapped for an empty file).
+    bool flush_view(void* addr, i64 len) {
+        if (addr == nullptr) return true;
+        if const (__WINDOWS__) {
+            return os.windows.FlushViewOfFile(addr, (win_size)len) != 0;
+        } else {
+            return os.posix.msync(addr, len, os.posix.MS_SYNC) == 0;
+        }
+    }
 }

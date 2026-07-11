@@ -9,6 +9,7 @@
 
 import "string.cb";
 import "list.cb";
+import "span.cb";
 
 // ── Platform wrappers ─────────────────────────────────────────────────────────
 // Centralize the Windows/POSIX split so the File/Path/Directory bodies stay
@@ -340,6 +341,105 @@ class File
             __handle_tracker_remove(_handle);
             _fs_fclose(_handle);
         }
+    }
+};
+
+// ── MappedFile ───────────────────────────────────────────────────────────────
+// Owning, whole-file memory mapping. Modelled on VMemRegion in core/vmem.cb:
+// unmaps in the destructor, close() is idempotent, re-opening releases any
+// previous mapping first. Do NOT bolt this onto File - File is FILE*/stdio-based;
+// a mapping needs raw OS handles, and those handles are closed immediately by
+// os.map_file (see the handle-lifetime note there), so this type stores only
+// {addr, len} - no platform-conditional fields, same representation on every
+// platform.
+//
+// Maps WHOLE FILES only: no windowed map(offset,len), no copy-on-write.
+// A write mapping's final size is fixed by openWrite's `len` argument BEFORE
+// the file is mapped - appending through a mapping is not a thing. Truncating
+// the file while a mapping over it is still live is a hard fault (SIGBUS /
+// EXCEPTION_IN_PAGE_ERROR on the next access), not a recoverable error.
+class MappedFile
+{
+    void* _addr = nullptr;
+    i64   _len  = 0;
+
+    // Map path read-only. A legitimately empty file maps cleanly (length() ==
+    // 0, data() == nullptr) and this still returns true - it is not an error.
+    // Releases any mapping already held first.
+    bool openRead(string path)
+    {
+        close();
+        i64 len = 0;
+        void* addr = os.map_file(path.data(), &len, false);
+        if (len < 0) { return false; }
+        _addr = addr;
+        _len  = len;
+        return true;
+    }
+
+    // Map path read-write, fixing the file at exactly `len` bytes BEFORE
+    // mapping (truncating or zero-extending as needed - the file cannot be
+    // grown through the mapping afterward). len == 0 maps cleanly (same empty
+    // contract as openRead) and still returns true. Releases any mapping
+    // already held first.
+    bool openWrite(string path, i64 len)
+    {
+        close();
+        i64 outLen = len;
+        void* addr = os.map_file(path.data(), &outLen, true);
+        if (outLen < 0) { return false; }
+        _addr = addr;
+        _len  = outLen;
+        return true;
+    }
+
+    // Mapping length in bytes (0 for an empty-file mapping).
+    i64 length() { return _len; }
+
+    // Raw base address, or nullptr for an empty-file mapping / before opening.
+    i8* data() { return (i8*)_addr; }
+
+    // A first-class noalias span<T> over the whole mapping, ready to hand
+    // straight to vectorize/parallel_for_n with zero copy. STATIC, taking the
+    // receiver explicitly (the simd<T,N>.load/store idiom), rather than an
+    // instance method `f.asSpan<T>()`: a generic method with its own type
+    // parameter on a non-generic class does not currently resolve `this` or
+    // its fields, so the static form is the supported shape, not a stylistic
+    // choice. An empty mapping (len 0) yields an empty span rather than
+    // dereferencing a null base.
+    static span<T> asSpan<T>(MappedFile* f)
+    {
+        span<T> s;
+        if (f->_len == 0) { return s; }
+        // Sound, not merely trusted: a file mapping IS a whole, distinct VM
+        // region by construction (map_file/mmap/MapViewOfFile always hand
+        // back a fresh region, never a slice of an existing allocation) -
+        // exactly the guarantee the (T[]) escape asserts. This is the one
+        // unsafe cast in the whole feature.
+        T[] view = (T[])(f->_addr);
+        s.wrap(view, f->_len / (i64)sizeof(T));
+        return s;
+    }
+
+    // Flush dirty pages of a writable mapping back to the file. A no-op
+    // (returns true) when nothing is mapped.
+    bool flush()
+    {
+        return os.flush_view(_addr, _len);
+    }
+
+    // Unmap and clear; safe to call more than once (VMemRegion.release() shape).
+    void close()
+    {
+        os.unmap_file(_addr, _len);
+        _addr = nullptr;
+        _len  = 0;
+    }
+
+    // Destructor: unmap if still mapped.
+    ~MappedFile()
+    {
+        close();
     }
 };
 

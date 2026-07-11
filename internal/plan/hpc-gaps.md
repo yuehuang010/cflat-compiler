@@ -5,8 +5,12 @@ vectorize(contract)/vectorize(reassoc) tiers, G5 incl 2026-07-10 POSIX
 parity), all integrated on master, gates green. ALL of G7 is now DONE too:
 rdtsc-timing and the BLAS example (2026-07-09), huge pages (2026-07-11,
 Phases 1-3 - its Phase 4 and the list<int[]> restriction are the only
-things left in that section). G6 (SoA generic) is the one remaining
-PROPOSED item.
+things left in that section). G8 (memory-mapped files - the zero-copy
+INPUT side of the kernel story, and the natural producer for the noalias
+span machinery G1-G4 built) is DONE as of 2026-07-11; note its benchmark
+came back NEGATIVE for the single-pass streaming case, which is recorded
+in full in that section and should be read before building on it. G6 (SoA
+generic, a design project) is the one remaining PROPOSED item.
 The former detailed sub-plans for G2/G3/G4/G5
 (internal/plan/hpc-g2..g5-*.md) have been consolidated in-file below and
 deleted. G7's huge-pages detail plan
@@ -513,6 +517,127 @@ Write its own plan before starting; do not fold into a gap-fix pass.
 - list<int[]> restriction (T[] as generic type argument does not parse):
   documented limitation; mildly hurts multi-buffer containers. Revisit
   cost/benefit - may stay a documented restriction.
+
+## G8. Memory-mapped files (mmap-with-fd / MapViewOfFile)
+
+Status: DONE (2026-07-11, all 3 phases). Its detail plan
+(internal/plan/hpc-g8-mapped-files.md) has been consolidated into this
+section and deleted, the same way G2-G5's were. It WAS a pure
+core-library change - no compiler, grammar, or codegen work (unlike G7,
+which broke that same claim on advapi32.lib): every API used is kernel32
+or libc, both already in the default link set.
+
+As-built, and the one deviation that changed the public API:
+`asSpan<T>` shipped as a STATIC method taking the receiver explicitly -
+`MappedFile.asSpan<T>(f)`, the simd<T,N>.load/store idiom - NOT the
+instance method `f.asSpan<T>()` the plan sketched. Reason: a generic
+method with its own type parameter on a NON-generic class cannot resolve
+`this`/fields in this compiler; it fails at compile time with "Undefined
+variable <field>". Independently reproduced, and now tracked as
+internal/issue/generic-method-on-nongeneric-class.md. If that gap is ever
+fixed, the instance-method spelling is the one to move back to.
+
+Landed: os.map_file/unmap_file/flush_view in core/os.cb (zero-length and
+failure both collapsed into this one place: empty file -> nullptr with
+*outLen == 0 and SUCCESS, real failure -> nullptr with *outLen == -1);
+new Windows externs (CreateFileA, GetFileSizeEx, SetFilePointerEx,
+SetEndOfFile, CreateFileMappingA, MapViewOfFile, UnmapViewOfFile,
+FlushViewOfFile) and POSIX externs (open, ftruncate, lseek, msync);
+owning MappedFile in core/filesystem.cb. Two implementation notes worth
+keeping: SetFilePointerEx was NOT in the plan's extern list but is
+required (SetEndOfFile truncates to the CURRENT file pointer, so the
+pointer must be positioned first), and lseek(SEEK_END) is used instead of
+fstat to read a file's size, which dodges hand-deriving st_size's offset
+(it differs between glibc and Darwin).
+
+BENCHMARK RESULT IS NEGATIVE, AND THAT IS THE POINT OF HAVING RUN IT.
+performance/hpc/mmap_scan_bench.cb, 256 MB of doubles, warm page cache,
+best-of-5, both variants feeding the SAME vectorize(reassoc) kernel:
+
+    File.readBytes + sum       59.92 ms
+    MappedFile.asSpan + sum    80.86 ms      (sums bit-identical)
+
+The copy variant WON. First-touch soft page faults on a freshly-mapped
+256 MB region (~64K faults) cost more than one bulk read plus a
+memcpy-speed scan. So: do NOT reach for MappedFile expecting a
+single-streaming-pass win - the user-space copy was not the bottleneck.
+Where it is still expected to pay: repeated reads of the same file,
+random access, and avoiding a re-copy across multiple passes. Anyone
+building on this should re-measure their own shape rather than inherit
+the assumption. This also sharpens the follow-on: the lever for mappings
+is the advice/prefetch APIs (madvise MADV_WILLNEED/MADV_SEQUENTIAL,
+PrefetchVirtualMemory), aimed squarely at that fault cost.
+
+SPUN OFF - a doc inaccuracy this work exposed, NOT fixed here: doc/HPC.md's
+"FP-math tiers" section reads as though a plain `vectorize` will vectorize a
+floating-point reduction. It will not - LLVM rejects it ("not a recognized
+reduction"), and the sum kernel needs `vectorize(reassoc)`. Confirmed with a
+minimal probe while writing the benchmark. Harmless but misleading; the
+wording should be tightened in its own pass.
+
+Gates: test.bat 45/45 (test_filesystem 88/88, +14 new MappedFile
+assertions covering round-trip, empty file, missing file, asSpan values,
+and a 2000-iteration map/drop loop); example.bat 89/0/24; WSL test.sh
+159/0/16. test_lsp.bat not run - no compiler file touched.
+
+Caveat on the Linux coverage: test_filesystem.cb is on test.sh's
+PRE-EXISTING skip list (it assumes Windows backslash paths - unrelated to
+this work), so the new MappedFile assertions do NOT run in that 159/0/16.
+MappedFile was instead verified against the Linux ELF cflat with a
+standalone probe (round-trip + empty-file case). The POSIX real-fd mmap
+path is therefore proven, but it is NOT yet guarded by the automated
+suite - if test_filesystem.cb is ever made path-portable, that skip should
+be lifted and this becomes moot.
+
+One weak assertion, recorded rather than silently inherited: the
+"map/drop loop does not leak" test maps 2000 x 64 KB (~131 MB total). On
+64-bit that would not exhaust address space even if the destructor never
+unmapped, so it would pass with a leak present. The destructor path is
+simple enough that this was judged not worth hardening; anyone touching
+MappedFile's lifetime should not treat that test as a real guard.
+
+Today: cflat has NO file-mapping binding at all. The `mmap` extern in
+core/os.posix.cb is only ever called anonymously (fd = -1,
+MAP_ANON_PRIVATE) as the allocator substrate behind vmem_alloc, and
+Windows has no CreateFileMapping/MapViewOfFile extern whatsoever.
+core/filesystem.cb's `File` is stdio (FILE*), so reading an input means a
+full copy through user space - for a multi-GB dataset, that copy is the
+first thing standing between the program and the kernel.
+
+Proposal: neutral os.map_file/unmap_file/flush_view primitives in
+core/os.cb (the vmem/NUMA layering precedent), and an owning `MappedFile`
+class in core/filesystem.cb shaped like VMemRegion (unmaps in the
+destructor). NOT an extension of `File` - that class is FILE*-based and a
+mapping needs raw handles.
+
+Why it belongs in THIS plan rather than being a filesystem chore: a
+mapping is the natural producer for the noalias machinery G1-G4 built.
+`MappedFile.asSpan<T>()` hands the region out as a first-class `span<T>`
+that feeds vectorize/parallel_for_n with zero copy. The `(T[])` unsafe
+escape it uses internally is SOUND here rather than merely trusted - a
+mapping IS a whole, distinct VM region by construction, which is exactly
+what the cast asserts - so the unsafe stays confined to one reviewed line
+inside core and callers never see a raw pointer.
+
+Key facts (detail plan has the rest): the mapping outlives the handles
+that made it on BOTH platforms (POSIX close(fd) after mmap; Windows
+CloseHandle both after MapViewOfFile), so MappedFile stores only
+{addr, len} and the platforms converge on one representation. Windows
+CANNOT map a zero-length file; a write mapping cannot grow the file (size
+is fixed before mapping); truncation under a live mapping is a hard fault
+(SIGBUS / EXCEPTION_IN_PAGE_ERROR), not an error code.
+
+G7 and G8 do NOT compose: huge pages do not back mapped file views on
+either platform (Windows SEC_LARGE_PAGES is pagefile-backed sections only;
+Linux THP does not back file mappings in the general case). The real lever
+for a mapping is madvise(MADV_WILLNEED/MADV_SEQUENTIAL) /
+PrefetchVirtualMemory - a follow-on item, and only once the benchmark
+shows where the time goes.
+
+Verification: extend Test/test_filesystem.cb (no new test file);
+benchmark performance/hpc/mmap_scan_bench.cb (readBytes-into-heap vs
+mapped span<double> through a vectorize loop). Re-verify on WSL - this is
+the first real-fd mmap call on the POSIX side.
 
 ---
 
