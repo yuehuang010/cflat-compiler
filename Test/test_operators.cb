@@ -31,6 +31,14 @@ struct Bits
     int operator~() { return ~value; }
 };
 
+// ── Cells: subscript overload, reached through a pointer deref ──────────────
+
+struct Cells
+{
+    int base = 0;
+    int operator[](int i) { return base + i; }
+};
+
 // ── Fraction: rational number with arithmetic ────────────────────────────────
 
 struct Fraction
@@ -267,6 +275,24 @@ extern int main()
     Box wn; wn.p = nullptr;
     Test("Box?. null field short-circuits", wn?.value,       0);
     Test("Box?. null with coalesce",        wn?.value ?? -1, -1);
+
+    // ── operator[] through a parenthesized deref ──────────────────────────────
+    // `(*p)` is a struct receiver like any other, so `(*p)[i]` must find operator[].
+    // Regression: the parenthesized primary published its type and storage but never
+    // its BaseType, so no struct receiver was established - the subscript fell through
+    // to the raw-index path and crashed the COMPILER on a null type (exit 139, no
+    // diagnostic). An unknown base type is now a LogError instead.
+    Cells cs; cs.base = 100;
+    Cells* cp = &cs;
+    Test("Cells value subscript",     cs[3],    103);
+    Test("Cells deref subscript",     (*cp)[3], 103);
+    Test("Cells deref subscript [0]", (*cp)[0], 100);
+
+    // The same shape stays an LVALUE: a write through it must reach the pointee,
+    // not a materialized copy of it.
+    (*cp).base = 200;
+    Test("Cells deref field write",   cs.base,  200);
+    Test("Cells deref subscript after write", (*cp)[1], 201);
 
     // Logical '!' is a zero-compare yielding bool, NOT the bitwise '~'. Regression:
     // '!' used to lower to xor -1, so on any type wider than i1 every operand negated

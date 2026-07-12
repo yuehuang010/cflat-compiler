@@ -118,9 +118,11 @@ int testDirectoryFunctions()
 int testDirectoryClass()
 {
     int passed = 0;
+    // Build child paths with Path.combine: '\\' is a literal filename character on
+    // POSIX, so a hardcoded separator creates one oddly-named top-level entry.
     string testDir = "test_fs_dir2";
-    string atxt    = "test_fs_dir2\\a.txt";
-    string btxt    = "test_fs_dir2\\b.txt";
+    string atxt    = Path.combine(testDir, "a.txt");
+    string btxt    = Path.combine(testDir, "b.txt");
 
     File.remove(atxt);
     File.remove(btxt);
@@ -239,8 +241,13 @@ int testPathClass()
     string bar     = "bar";
     string empty   = "";
     string foo     = "foo";
+    // combine INSERTS the platform separator (_fs_sep) but ACCEPTS either when
+    // parsing, so only the inserted one differs by platform. The cfoosl case
+    // already ends in a separator, so nothing is inserted and it matches everywhere.
+    string joined = "C:\\foo/bar";
+    if const (__WINDOWS__) { joined = "C:\\foo\\bar"; }
     r = Path.combine(cfoo, bar);
-    passed += Test("combine adds sep",      r.data(), "C:\\foo\\bar");
+    passed += Test("combine adds sep",      r.data(), joined.data());
     r = Path.combine(cfoosl, bar);
     passed += Test("combine no double sep", r.data(), "C:\\foo\\bar");
     r = Path.combine(empty, bar);
@@ -297,12 +304,12 @@ int testPathClass()
 int testDirectoryExtended()
 {
     int passed = 0;
-    string base    = "test_fs_dxt";
-    string sub     = "test_fs_dxt\\sub";
-    string afile   = "test_fs_dxt\\a.txt";
-    string bfile   = "test_fs_dxt\\sub\\b.txt";
-    string deepdir  = "test_fs_dxt\\deep\\nested";
-    string deepbase = "test_fs_dxt\\deep";
+    string base     = "test_fs_dxt";
+    string sub      = Path.combine(base, "sub");
+    string afile    = Path.combine(base, "a.txt");
+    string bfile    = Path.combine(sub, "b.txt");
+    string deepbase = Path.combine(base, "deep");
+    string deepdir  = Path.combine(deepbase, "nested");
 
     // Setup
     Directory.create(base);

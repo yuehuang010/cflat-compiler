@@ -396,10 +396,13 @@ namespace os.posix
     extern win_int  mkstemp(i8* templ);                          // templ ends in XXXXXX; opens+creates
 
     // === Memory-mapped files - fd-based open/resize/seek ==================
-    // open() is variadic (mode is only consulted with O_CREAT); a fixed 3-arg
-    // extern is safe on the SysV ABI even when mode is unused (the extra
-    // argument register is simply not read by the callee).
-    extern win_int  open(const char* path, win_int flags, win_int mode);
+    // open() is variadic (mode is only consulted with O_CREAT) and MUST be
+    // declared that way: Darwin/arm64 passes variadic arguments on the stack,
+    // not in the next argument register, so a fixed 3-arg extern hands `mode`
+    // to a callee that never looks there - files get created with a garbage
+    // (0000) mode and every later open fails EACCES. Only SysV lets the two
+    // forms coincide. Callers pass mode only alongside O_CREAT.
+    extern win_int  open(const char* path, win_int flags, ...);
     extern win_int  ftruncate(i32 fd, i64 length);
     // Used instead of fstat/stat to read a file's size: avoids hand-deriving
     // struct stat's st_size offset (which differs between glibc and Darwin).

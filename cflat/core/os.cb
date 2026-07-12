@@ -1400,7 +1400,7 @@ namespace os
                     return nullptr;
                 }
             } else {
-                fd = os.posix.open(path, os.posix.O_RDONLY, 0);
+                fd = os.posix.open(path, os.posix.O_RDONLY);
                 if (fd < 0) { outLen[0] = -1; return nullptr; }
                 len = os.posix.lseek(fd, 0, os.posix.SEEK_END);
                 if (len < 0) {

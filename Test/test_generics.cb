@@ -521,6 +521,21 @@ bool testListStruct()
     result &= Test("list<struct> count after remove", people.count(), 2);
     result &= Test("list<struct> after remove[1]", people.get(1).id, 103);
 
+    // Both edge indices must still be ACCEPTED by the bounds check guarding
+    // get/set/operator[]/removeAt. An out-of-range index now aborts with a
+    // diagnostic instead of reading past the buffer, so an over-strict check
+    // (off by one at either end) would break valid code here.
+    Person p5 = default;
+    p5.age = 50;
+    p5.id = 105;
+    result &= Test("list<struct> first index valid", people.get(0).id, 101);
+    result &= Test("list<struct> last index valid",  people.get(people.count() - 1).id, 103);
+    result &= Test("list<struct> op[] last index",   people[people.count() - 1].id, 103);
+    people.set(people.count() - 1, p5);
+    result &= Test("list<struct> set last index",    people.get(1).id, 105);
+    people.removeAt(people.count() - 1);
+    result &= Test("list<struct> removeAt last",     people.count(), 1);
+
     // clear
     people.clear();
     result &= Test("list<struct> after clear", people.count(), 0);

@@ -36,11 +36,25 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         _size++;
     }
 
+    // A bad index is a program bug, not a recoverable state: get()/operator[] hand back
+    // an alias (a borrow of a slot that does not exist), so there is no value to return
+    // in its place. Report and abort rather than reading past the buffer, which silently
+    // corrupts or faults far from the actual mistake.
+    void _checkBounds(int index, const char* op)
+    {
+        if (index < 0 || index >= _size)
+        {
+            fprintf(__std_iob(2), "list.%s: index %d is out of range (count %d).\n", op, index, _size);
+            abort();
+        }
+    }
+
     // Read the element at index (borrow - caller does not receive ownership).
     // `alias`: the element stays owned by the list, so the returned value must not
     // be freed by the caller. Use `.copy()` to take an independent owned copy.
     alias T get(int index)
     {
+        _checkBounds(index, "get");
         return _data[index];
     }
 
@@ -48,6 +62,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // The old element is freed/destructed before the new one is stored.
     void set(int index, move T value)
     {
+        _checkBounds(index, "set");
         if const (is_pointer(T))
         {
             if (_data[index] != nullptr) delete _data[index];
@@ -65,6 +80,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // to keep the element.  Only meaningful for pointer element types.
     move T take(int index)
     {
+        _checkBounds(index, "take");
         T removed = move _data[index];
         int i = index;
         while (i < _size - 1)
@@ -81,6 +97,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // owned buffers (e.g. string or a nested container), the element is destructed.
     void removeAt(int index)
     {
+        _checkBounds(index, "removeAt");
         if const (is_pointer(T))
             delete _data[index];
         else
@@ -220,6 +237,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // l[index] - same semantics as get(index) (alias borrow, see get).
     alias T operator[](int index)
     {
+        _checkBounds(index, "operator[]");
         return _data[index];
     }
 

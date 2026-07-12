@@ -12659,15 +12659,20 @@ public:
                             lastParenExprType = {};
                             lastParenExprStorage = nullptr;
 
-                            // A parenthesized expression yielding a by-VALUE known struct
-                            // (e.g. `((string)buf)`) has its value in Primary but no addressable
-                            // storage, so a following `.method()` could not establish a struct
-                            // receiver and fell back to treating the primary text as a function
-                            // name ("unknown function '((string)buf)'"). Materialize the value into
-                            // a temp alloca and set BaseType so the struct-receiver branch below
-                            // picks it up - matching the two-statement `string t = (string)buf;
-                            // t.copy()` workaround.
-                            if (namedVar.Primary != nullptr && namedVar.Storage == nullptr
+                            // A parenthesized expression yielding a known struct publishes its type
+                            // and (for an lvalue) its storage through the side channel above, but
+                            // never its BaseType - recover it here so the struct-receiver branch
+                            // below picks the primary up. Without it a parenthesized struct has no
+                            // structVar, which the subscript suffix reads: `(*p)[i]` found no
+                            // operator[] and fell through to the raw-index path with a null BaseType.
+                            // By-VALUE only (e.g. `((string)buf)`): the value lives in Primary with no
+                            // addressable storage, so a following `.method()` could not establish a
+                            // receiver and fell back to treating the primary text as a function name
+                            // ("unknown function '((string)buf)'"). Materialize it into a temp alloca -
+                            // matching the two-statement `string t = (string)buf; t.copy()` workaround.
+                            // An lvalue (`(*p)`) already has storage; keep it so writes land in the
+                            // pointee rather than a copy.
+                            if (namedVar.Primary != nullptr
                                 && namedVar.BaseType == nullptr
                                 && !namedVar.TypeAndValue.Pointer
                                 && !namedVar.TypeAndValue.TypeName.empty())
@@ -12677,9 +12682,12 @@ public:
                                     && namedVar.Primary->getType() == sd.StructType)
                                 {
                                     namedVar.BaseType = sd.StructType;
-                                    auto* tmp = Compiler(ctx)->CreateAlloca(sd.StructType);
-                                    Compiler(ctx)->builder->CreateStore(namedVar.Primary, tmp);
-                                    namedVar.Storage = tmp;
+                                    if (namedVar.Storage == nullptr)
+                                    {
+                                        auto* tmp = Compiler(ctx)->CreateAlloca(sd.StructType);
+                                        Compiler(ctx)->builder->CreateStore(namedVar.Primary, tmp);
+                                        namedVar.Storage = tmp;
+                                    }
                                 }
                             }
                         }
@@ -12867,6 +12875,17 @@ public:
                             // TypeName already holds the element scalar (e.g. "float"); drop the simd-ness.
                             namedVar.TypeAndValue.IsSimd = false;
                             namedVar.TypeAndValue.SimdLanes = 0;
+                        }
+                        // A base with no resolved type cannot be indexed. Guard before the dyn_cast:
+                        // it asserts on a null operand, so an unhandled primary shape used to abort
+                        // the compiler with no diagnostic instead of pointing at the source.
+                        else if (namedVar.BaseType == nullptr)
+                        {
+                            LogErrorContext(expressCtx,
+                                "cannot apply '[]' here - the type of the indexed expression is unknown.");
+                            namedVar = {};
+                            structVar = {};
+                            break;
                         }
                         else if (auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(namedVar.BaseType))
                         {
