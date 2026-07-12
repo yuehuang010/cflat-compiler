@@ -268,5 +268,43 @@ extern int main()
     Test("Box?. null field short-circuits", wn?.value,       0);
     Test("Box?. null with coalesce",        wn?.value ?? -1, -1);
 
+    // Logical '!' is a zero-compare yielding bool, NOT the bitwise '~'. Regression:
+    // '!' used to lower to xor -1, so on any type wider than i1 every operand negated
+    // to a nonzero (truthy) value - '!1' and '!0' were both true, and '!ptr' was
+    // invalid IR that faulted at runtime.
+    int notOne  = 1;
+    int notZero = 0;
+    Test("!int 1",         !notOne,   false);
+    Test("!int 0",         !notZero,  true);
+    Test("!!int 1",        !!notOne,  true);
+    Test("!int truthy 42", !42,    false);
+
+    bool notBt = true;
+    Test("!bool true",  !notBt, false);
+    Test("!bool false", !!notBt, true);
+
+    float notFz = 0.0f;
+    float notFnz = 2.5f;
+    Test("!float 0",   !notFz,  true);
+    Test("!float 2.5", !notFnz, false);
+
+    int notTarget = 7;
+    int* notPv = &notTarget;
+    int* notPn = nullptr;
+    Test("!ptr null",    !notPn, true);
+    Test("!ptr non-null", !notPv, false);
+
+    // '~' stays bitwise - the two operators must not collapse onto each other.
+    Test("~int 0", ~notZero, -1);
+    Test("~int 1", ~notOne,  -2);
+
+    // Compile-time macros are i32, so `if const (!MACRO)` exercised the same bug:
+    // the not-taken arm was compiled anyway. __WINDOWS__ and __MACOS__ are disjoint,
+    // so exactly one of these two arms may run.
+    int constArm = 0;
+    if const (!__WINDOWS__) { constArm = constArm + 1; }
+    if const (!__MACOS__)   { constArm = constArm + 10; }
+    Test("if const (!macro) picks one arm", constArm == 1 || constArm == 10, true);
+
     return 0;
 }

@@ -9598,7 +9598,15 @@ public:
                 }
                 else
                 {
-                    namedVar.Primary = compiler->CreateNot(newValue);
+                    // Logical negation yields a plain rvalue bool, whatever the operand was
+                    // (int, pointer, float). Reset the type so a negated pointer/owning/view
+                    // operand cannot carry those flags into the result.
+                    namedVar.Primary = compiler->CreateLogicalNot(newValue);
+                    namedVar.TypeAndValue = {};
+                    namedVar.TypeAndValue.TypeName = "bool";
+                    namedVar.BaseType = nullptr;
+                    namedVar.IsOwning = false;
+                    namedVar.BitfieldStorage = nullptr;
                 }
                 namedVar.Storage = nullptr;
             }

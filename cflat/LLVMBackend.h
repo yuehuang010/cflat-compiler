@@ -10826,6 +10826,23 @@ public:
         return builder->CreateNot(value);
     }
 
+    // Logical '!': zero-compare, always i1. Distinct from CreateNot ('~', bitwise xor -1),
+    // which only coincides with logical negation on i1 - on a wider int every operand
+    // negates to a nonzero value (~1 == -2, ~0 == -1), making '!x' unconditionally true.
+    llvm::Value* CreateLogicalNot(llvm::Value* value)
+    {
+        auto* type = value->getType();
+        if (type->isIntegerTy(1))
+            return builder->CreateNot(value);
+        if (type->isPointerTy())
+            return builder->CreateIsNull(value);
+        if (type->isFloatingPointTy())
+            return builder->CreateFCmpOEQ(value, llvm::ConstantFP::get(type, 0.0));
+        if (type->isIntegerTy())
+            return builder->CreateICmpEQ(value, llvm::ConstantInt::get(type, 0));
+        return builder->CreateNot(value);
+    }
+
     llvm::Value* CreateNeg(llvm::Value* value)
     {
         if (value->getType()->isFloatingPointTy())
