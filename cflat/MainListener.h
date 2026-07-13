@@ -180,6 +180,34 @@ static std::string MangleTypeArg(const std::string& typeName)
     return result;
 }
 
+// The generic instantiation written at `ts`, covering BOTH spellings: the bare `Box<int>`
+// (genericIdentifier) and the namespace-qualified `Windows.Foundation.IReference<int>`
+// (qualifiedGenericIdentifier). `base` receives the base name, dotted when it was written dotted.
+// Returns the <...> argument list, or nullptr when `ts` is not a generic instantiation (in which
+// case callers fall through to their plain-type path, which reads getText()).
+static CFlatParser::GenericTypeParametersContext* GenericSpecOf(
+    CFlatParser::TypeSpecifierContext* ts, std::string& base)
+{
+    base.clear();
+    if (ts == nullptr) return nullptr;
+    if (auto* q = ts->qualifiedGenericIdentifier())
+    {
+        for (auto* id : q->Identifier())
+        {
+            if (!base.empty()) base += ".";
+            base += id->getText();
+        }
+        return q->genericTypeParameters();
+    }
+    if (auto* g = ts->genericIdentifier())
+    {
+        if (g->Identifier() == nullptr) return nullptr;
+        base = g->Identifier()->getText();
+        return g->genericTypeParameters();
+    }
+    return nullptr;
+}
+
 // Build the symbol-safe encoded name for a closure type used as a generic argument (gap a).
 // Length-prefixed components keep it collision-free; the result contains only [A-Za-z0-9_].
 // Each component folds its pointer flag in via MangleTypeArg ("int*" -> "intptr"); isThin selects
@@ -656,12 +684,14 @@ private:
                     // from the resolved alias string below and combined with the declarator's stars.
                     int aliasPtrDepth = 0;
                     // grammar: some Identifier occurrences were refactored into a genericIdentifier rule
-                    if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
+                    std::string baseName;
+                    auto* genParams = GenericSpecOf(typeSpec, baseName);
+                    if (genParams != nullptr)
                     {
                         // Generic type instantiation: Box<MyType> -> Box__MyType
-                        std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
+                        baseName = compiler->ResolveGenericBaseAlias(baseName);
                         std::vector<std::string> typeArgs;
-                    for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                    for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                     {
                         // Closure type args (gap a) encode to a symbol-safe name; others keep the
                         // pre-existing raw getText() spelling.
@@ -1204,11 +1234,11 @@ public:
     {
         auto* typeSpec = entry->typeSpecifier();
         std::string resolved;
-        if (typeSpec && typeSpec->genericIdentifier() && typeSpec->genericIdentifier()->genericTypeParameters())
+        std::string innerBase;
+        if (auto* innerParams = GenericSpecOf(typeSpec, innerBase))
         {
-            std::string innerBase = typeSpec->genericIdentifier()->Identifier()->getText();
-            resolved = innerBase;
-            for (auto* innerEntry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+            resolved = Compiler(entry)->ResolveGenericBaseAlias(innerBase);
+            for (auto* innerEntry : innerParams->typeParameterList()->typeParameterEntry())
                 resolved += "__" + MangleTypeArg(ResolveForwardTypeArg(innerEntry));
         }
         else if (typeSpec && typeSpec->functionPointerSpecifier())
@@ -1410,12 +1440,11 @@ public:
         // ParseDeclarationSpecifiers), then alias to the mangled name - still a plain string.
         // The forward-ref pass is opportunistic: it never errors (templates may not be scanned
         // yet); ParseUsingDeclaration is authoritative and emits the diagnostics.
-        if (typeSpec->genericIdentifier() != nullptr
-            && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr
-            && typeSpec->genericIdentifier()->Identifier() != nullptr)
+        std::string baseName;
+        if (auto* genParams = GenericSpecOf(typeSpec, baseName))
         {
-            std::string mangledName = typeSpec->genericIdentifier()->Identifier()->getText();
-            for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+            std::string mangledName = compiler->ResolveGenericBaseAlias(baseName);
+            for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
             {
                 // Closure type args (gap a) encode to a symbol-safe name; others keep raw getText().
                 if (entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
@@ -1430,8 +1459,22 @@ public:
             return;
         }
 
+        // An alias of an alias names whatever the RHS already names (one hop).
+        target = compiler->ResolveGenericBaseAlias(compiler->ResolveTypeAlias(target));
+
+        // Alias of a generic BASE (using IVector = Windows.Foundation.Collections.IVector;) - the
+        // use site supplies the <...> arguments. Authoritative handling is in ParseUsingDeclaration.
+        if (suffix.empty() && (compiler->IsWinrtGenericBase(target)
+                               || compiler->gts.genericStructTemplates.count(target) != 0
+                               || compiler->gts.genericClassTemplates.count(target) != 0
+                               || compiler->gts.genericInterfaceTemplates.count(target) != 0))
+        {
+            compiler->RegisterGenericBaseAlias(alias, target);
+            return;
+        }
+
         if (compiler->IsInterfaceType(target) || compiler->dataStructures.count(target) > 0
-            || LLVMBackend::IsPrimitiveTypeName(target))
+            || LLVMBackend::IsPrimitiveTypeName(target) || compiler->IsWinrtFullName(target))
             compiler->RegisterTypeAlias(alias, target + suffix);
     }
 
@@ -1918,12 +1961,13 @@ private:
                 "type argument; a sized 'T[N]' and a pointer-to-array 'T[]*' are not");
         std::string resolved;
 
-        if (typeSpec && typeSpec->genericIdentifier() && typeSpec->genericIdentifier()->genericTypeParameters())
+        std::string innerBase;
+        if (auto* innerParams = GenericSpecOf(typeSpec, innerBase))
         {
             // Nested generic (e.g., Box<T>): recurse into each type argument
-            std::string innerBase = typeSpec->genericIdentifier()->Identifier()->getText();
+            innerBase = Compiler()->ResolveGenericBaseAlias(innerBase);
             std::vector<std::string> innerArgs;
-            for (auto* innerEntry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+            for (auto* innerEntry : innerParams->typeParameterList()->typeParameterEntry())
                 innerArgs.push_back(ResolveTypeArgEntry(innerEntry));
             resolved = MangledGenericName(innerBase, innerArgs);
             // A generic used as a type argument to another generic (e.g. list<int>
@@ -1932,6 +1976,9 @@ private:
             // reports "unknown type '<inner>'". Recursion above queues the deepest
             // levels first, so inner types are registered before the outer.
             QueueGenericInstantiation(innerBase, innerArgs, resolved);
+            // A qualified base is an imported winmd generic - build it through the winmd path.
+            if (innerBase.find('.') != std::string::npos)
+                Compiler()->InstantiateWinrtGenericInterface(innerBase, innerArgs, resolved);
         }
         else if (typeSpec && typeSpec->functionPointerSpecifier())
         {
@@ -2220,15 +2267,21 @@ private:
                     declType.Pointer = declSpec->pointer() != nullptr;
                     break;
                 }
-                if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
+                std::string baseName;
+                auto* genParams = GenericSpecOf(typeSpec, baseName);
+                if (genParams != nullptr)
                 {
                     // Generic type instantiation: Box<MyType> -> Box__MyType
-                    std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
+                    baseName = Compiler(declSpecs)->ResolveGenericBaseAlias(baseName);
                     std::vector<std::string> typeArgs;
-                    for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                    for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                         typeArgs.push_back(ResolveTypeArgEntry(entry));
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
                     declType.TypeName = mangledName;
+                    // A namespace-qualified generic names an imported winmd template: build the
+                    // concrete thin interface + PIID now so the declared type is a real struct.
+                    if (baseName.find('.') != std::string::npos)
+                        Compiler(declSpecs)->InstantiateWinrtGenericInterface(baseName, typeArgs, mangledName);
                     // Queue instantiation of nested generic types discovered during field/param parsing.
                     // Only do this when inside an active instantiation context (substitutions are set),
                     // to avoid treating unresolved type parameters (e.g. "T") as concrete types.
@@ -2946,17 +2999,27 @@ public:
         }
         suffix += arraySuffix;  // pointer stars precede array brackets ("int*[3]")
 
+        // An alias of an alias (using PVStatics = IPropertyValueStatics;) names whatever the RHS
+        // already names. One hop - enough for the qualified-WinMD-name -> short-alias -> shorter
+        // -alias chains that consuming a .winmd produces.
+        target = compiler->ResolveGenericBaseAlias(compiler->ResolveTypeAlias(target));
+
+        // A name that only becomes a type once its <...> arguments are supplied.
+        auto IsGenericTemplateName = [&](const std::string& n) {
+            return genericStructTemplates.count(n) != 0 || genericClassTemplates.count(n) != 0
+                || genericInterfaceTemplates.count(n) != 0 || compiler->IsWinrtGenericBase(n);
+        };
+
         // Generic RHS (using IL = list<int>): mangle to list__int and pre-declare the shell +
         // default ctor to enqueue the instantiation, then alias to the mangled name. The base
         // must name a generic template, else the RHS is malformed - LogError rather than
         // silently degrading to a namespace alias (the historical bug).
-        if (typeSpec->genericIdentifier() != nullptr
-            && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr
-            && typeSpec->genericIdentifier()->Identifier() != nullptr)
+        std::string baseName;
+        if (auto* genParams = GenericSpecOf(typeSpec, baseName))
         {
-            std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
+            baseName = compiler->ResolveGenericBaseAlias(baseName);
             std::vector<std::string> typeArgs;
-            for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+            for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                 typeArgs.push_back(ResolveTypeArgEntry(entry));
             std::string mangledName = MangledGenericName(baseName, typeArgs);
 
@@ -2986,11 +3049,38 @@ public:
             return;
         }
 
-        // If the target names a known type (interface, struct, or primitive), register a type alias.
-        // Otherwise treat it as a namespace alias.
-        if (compiler->IsInterfaceType(target) || compiler->GetDataStructure(target).StructType != nullptr
-            || LLVMBackend::IsPrimitiveTypeName(target))
+        // Alias of a GENERIC BASE (using IReference = Windows.Foundation.IReference;) so a body can
+        // keep writing the familiar `IReference<int>`. Only meaningful with no suffix - a base is
+        // not a type, so `T*` / `T[N]` decoration on it is meaningless.
+        if (suffix.empty() && IsGenericTemplateName(target))
         {
+            compiler->RegisterGenericBaseAlias(alias, target);
+            if (auto* s = compiler->GetSymbolSink())
+                s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
+                            (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
+                            "using " + alias + " = " + target, {},
+                            ExtractLeadingDoc(GetTokens(), ctx->getStart()));
+            return;
+        }
+
+        // If the target names a known type (interface, struct, primitive, or an imported winmd
+        // type - delegates/enums/runtime classes have no CFlat struct but are nameable), register a
+        // type alias. Otherwise treat it as a namespace alias.
+        if (compiler->IsInterfaceType(target) || compiler->GetDataStructure(target).StructType != nullptr
+            || LLVMBackend::IsPrimitiveTypeName(target) || compiler->IsWinrtFullName(target))
+        {
+            // A winmd projection must never silently displace a CFlat type of the same short name -
+            // that is the collision the qualified registration exists to prevent. An alias is the
+            // user explicitly claiming the name, so an outright clash is an error, not a shadow.
+            if (compiler->IsWinrtFullName(target) && alias != target
+                && (compiler->IsInterfaceType(alias) || compiler->GetDataStructure(alias).StructType != nullptr))
+            {
+                compiler->LogError(std::format(
+                    "using alias '{}' = '{}': '{}' already names a type in this program; "
+                    "pick a different alias or spell the WinMD type fully qualified",
+                    alias, target, alias));
+                return;
+            }
             compiler->RegisterTypeAlias(alias, target + suffix);
             if (auto* s = compiler->GetSymbolSink())
                 s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
@@ -4432,10 +4522,10 @@ public:
                         std::string elemArg = elemType.TypeName;
 
                         // Synthesize IIterable<T> and IIterator<T> (COM vtable + thin ptr + PIID).
-                        std::string iterableName = MangledGenericName("IIterable", { elemArg });
-                        std::string iteratorName = MangledGenericName("IIterator", { elemArg });
-                        bool haveIterable = compiler->InstantiateWinrtGenericInterface("IIterable", { elemArg }, iterableName);
-                        bool haveIterator = compiler->InstantiateWinrtGenericInterface("IIterator", { elemArg }, iteratorName);
+                        std::string iterableName = MangledGenericName(LLVMBackend::kWinrtIIterable, { elemArg });
+                        std::string iteratorName = MangledGenericName(LLVMBackend::kWinrtIIterator, { elemArg });
+                        bool haveIterable = compiler->InstantiateWinrtGenericInterface(LLVMBackend::kWinrtIIterable, { elemArg }, iterableName);
+                        bool haveIterator = compiler->InstantiateWinrtGenericInterface(LLVMBackend::kWinrtIIterator, { elemArg }, iteratorName);
                         auto* iidGlobal = haveIterable ? compiler->EmitIidGlobalFor(iterableName) : nullptr;
                         if (!haveIterable || !haveIterator || !iidGlobal)
                         {
@@ -9420,6 +9510,8 @@ public:
             {
                 // TODO Collect all of them.
                 auto* typeSpec = typeSpecs[0];
+                std::string baseName;
+                auto* genParams = GenericSpecOf(typeSpec, baseName);
                 if (auto* fpSpec = typeSpec->functionPointerSpecifier())
                 {
                     // Cast target `(function<R(Args)>)addr` / `(Lambda<...>)x`: build the
@@ -9427,12 +9519,12 @@ public:
                     // thin C function pointer. Mirrors the declaration path (BuildFuncPtrAliasType).
                     typeValue = BuildFuncPtrAliasType(fpSpec);
                 }
-                else if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
+                else if (genParams != nullptr)
                 {
                     // Generic cast: (channel<int>*) -> mangle to channel__int
-                    std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
+                    baseName = compilerLLVM->ResolveGenericBaseAlias(baseName);
                     std::vector<std::string> typeArgs;
-                    for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                    for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                         typeArgs.push_back(ResolveTypeArgEntry(entry));
                     typeValue.TypeName = MangledGenericName(baseName, typeArgs);
                     // A deferred winmd generic interface named directly in a cast (no `using` or
@@ -9903,15 +9995,16 @@ public:
 
     std::string ParseTypeSpecifierName(CFlatParser::TypeSpecifierContext* ctx)
     {
-        if (ctx->genericIdentifier() && ctx->genericIdentifier()->genericTypeParameters())
+        std::string base;
+        if (auto* genParams = GenericSpecOf(ctx, base))
         {
             // Generic type: Box<int> -> Box__int
             // Also apply type substitutions to arguments (e.g. Box<T> with T=int -> Box__int)
-            std::string base = ctx->genericIdentifier()->Identifier()->getText();
+            base = Compiler(ctx)->ResolveGenericBaseAlias(base);
             std::vector<std::string> args;
             // ResolveTypeArgEntry applies active substitutions AND recursively
             // resolves/queues nested generics (e.g. list<int> inside list<list<int>>).
-            for (auto* entry : ctx->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+            for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                 args.push_back(ResolveTypeArgEntry(entry));
             return MangledGenericName(base, args);
         }
@@ -16273,12 +16366,11 @@ public:
             auto* ts = ctx->typeSpecifier();
             std::string base;
             std::vector<std::string> typeArgs;
-            if (ts && ts->genericIdentifier())
+            if (auto* gp = GenericSpecOf(ts, base))
             {
-                base = ts->genericIdentifier()->Identifier()->getText();
-                if (auto* gp = ts->genericIdentifier()->genericTypeParameters())
-                    for (auto* entry : gp->typeParameterList()->typeParameterEntry())
-                        typeArgs.push_back(ResolveTypeArgEntry(entry));
+                base = compiler->ResolveGenericBaseAlias(base);
+                for (auto* entry : gp->typeParameterList()->typeParameterEntry())
+                    typeArgs.push_back(ResolveTypeArgEntry(entry));
             }
             else
             {
@@ -16293,7 +16385,12 @@ public:
                 base = compiler->ResolveTypeAlias(base);
                 auto substIt = activeTypeSubstitutions.find(base);
                 if (substIt != activeTypeSubstitutions.end())
-                    base = substIt->second;
+                {
+                    // The substituted argument is spelled as the caller wrote it - which for a
+                    // WinMD type is usually an alias (ComPtr<IPropertyValueStatics>), so expand
+                    // it too before looking up the IID.
+                    base = compiler->ResolveTypeAlias(substIt->second);
+                }
             }
             std::string mangled = typeArgs.empty() ? base : MangledGenericName(base, typeArgs);
             if (!typeArgs.empty())
@@ -16313,16 +16410,16 @@ public:
             auto* ts = ctx->typeSpecifier();
             std::string base;
             std::vector<std::string> typeArgs;
-            if (ts && ts->genericIdentifier())
+            if (auto* gp = GenericSpecOf(ts, base))
             {
-                base = ts->genericIdentifier()->Identifier()->getText();
-                if (auto* gp = ts->genericIdentifier()->genericTypeParameters())
-                    for (auto* entry : gp->typeParameterList()->typeParameterEntry())
-                        typeArgs.push_back(ResolveTypeArgEntry(entry));
+                base = compiler->ResolveGenericBaseAlias(base);
+                for (auto* entry : gp->typeParameterList()->typeParameterEntry())
+                    typeArgs.push_back(ResolveTypeArgEntry(entry));
             }
             else
             {
                 base = ts ? ts->getText() : "";
+                base = compiler->ResolveTypeAlias(base);   // `using RoutedEventHandler = Microsoft...;`
             }
 
             // Evaluate the closure argument and normalize it to a fat closure {code, env} value.

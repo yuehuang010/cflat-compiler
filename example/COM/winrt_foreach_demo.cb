@@ -17,6 +17,12 @@
 import "winrt.cb";
 import "Windows.Data.winmd";         // JsonArray, IJsonValue, IJsonArrayStatics
 
+// WinMD types are registered under their FULLY-QUALIFIED WinRT name, so a projection can never
+// displace a type of your own. Alias the ones you use to keep the call sites short.
+using IJsonArrayStatics = Windows.Data.Json.IJsonArrayStatics;
+using IJsonArray        = Windows.Data.Json.IJsonArray;
+using IJsonValue        = Windows.Data.Json.IJsonValue;
+
 extern int main()
 {
     winrtInit();   // RO_INIT_MULTITHREADED

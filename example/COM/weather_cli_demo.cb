@@ -15,6 +15,14 @@ import "winrt.cb";              // winrtInit / hstring / activationFactory / awa
 import "Windows.Web.winmd";     // IHttpClient
 import "json.cb";               // JsonParser / JsonNode
 
+// WinMD types are registered under their FULLY-QUALIFIED WinRT name, so a projection can never
+// displace a type of your own. Alias the ones you use to keep the call sites short.
+using IUriRuntimeClass        = Windows.Foundation.IUriRuntimeClass;
+using IUriRuntimeClassFactory = Windows.Foundation.IUriRuntimeClassFactory;
+using IHttpClient             = Windows.Web.Http.IHttpClient;
+using HttpProgress            = Windows.Web.Http.HttpProgress;
+using IAsyncOperationWithProgress = Windows.Foundation.IAsyncOperationWithProgress;
+
 // Abbreviate the async result type so the operation handle can be a typed local, not a void*.
 using StringOp = IAsyncOperationWithProgress<string, HttpProgress>;
 

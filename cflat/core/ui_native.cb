@@ -815,9 +815,7 @@ interface IText : ITooltipped
     int    color;
 };
 
-// NOT `IButton`: the WinUI winmd that ui_native/winui.cb imports projects a WinRT
-// `IButton`, and a cflat interface cannot share a name with a consumed WinMD type.
-interface IButtonElement : IDisableable
+interface IButton : IDisableable
 {
     string title;
     int    color;
@@ -956,9 +954,7 @@ interface ISplitView : IElement
     void  fireRatioChange(int r);
 };
 
-// NOT `IImage`: same WinRT name collision as IButtonElement (winui.cb reaches the
-// XAML Image control through the projected WinRT `IImage`).
-interface IImageElement : ITooltipped
+interface IImage : ITooltipped
 {
     u64    pixels;
     int    pxW;
@@ -1530,7 +1526,7 @@ class Text : IText
 // Names track React Native: `title` + `onPress`. A keyed button also takes focus
 // on press and re-fires on Enter/Space while focused (the keyboard-activation
 // half of the focus seam).
-class Button : IButtonElement
+class Button : IButton
 {
     string title = default;
     Lambda<void()> onPress = default;
@@ -1630,7 +1626,7 @@ class Button : IButtonElement
     }
     bool propsEqual(IElement other)
     {
-        IButtonElement o = other as IButtonElement;
+        IButton o = other as IButton;
         return o != nullptr && this.title == o.title && this.disabled == o.disabled;
     }
     list<IElement>* childList() { return nullptr; }
@@ -3637,7 +3633,7 @@ View* toolbar()
 // string literals. Alternatively `source` names a .bmp file the host decodes directly.
 // A ICanvas host has no bitmap surface, so it falls back to a bordered placeholder box
 // with the `altText` centered.
-class Image : IImageElement
+class Image : IImage
 {
     u64    pixels  = 0u;         // borrowed top-down BGRA32 buffer (app-owned); 0 = none
     int    pxW     = 0;          // source pixel width
@@ -3682,7 +3678,7 @@ class Image : IImageElement
     void collectFocusables(list<string>* keys) { }
     bool propsEqual(IElement other)
     {
-        IImageElement o = other as IImageElement;
+        IImage o = other as IImage;
         return o != nullptr && this.pixels == o.pixels && this.pxW == o.pxW
             && this.pxH == o.pxH && this.width == o.width && this.height == o.height;
     }

@@ -17,6 +17,11 @@
 // (IPropertyValueStatics, IReference`1), and links the WinRT libs - nothing else is needed.
 import "winrt.cb";
 
+// WinMD types are registered under their FULLY-QUALIFIED WinRT name, so a projection can never
+// displace a type of your own. Alias the ones you use to keep the call sites short.
+using IPropertyValueStatics = Windows.Foundation.IPropertyValueStatics;
+using IReference            = Windows.Foundation.IReference;   // generic base: IReference<int>
+
 extern int main()
 {
     winrtInit();   // RO_INIT_MULTITHREADED

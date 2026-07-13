@@ -1,0 +1,24 @@
+// A WinMD type and a CFlat interface cannot share a name.
+//
+// WinMD types are registered ONLY under their fully-qualified WinRT name, so a projection can
+// never silently take a bare identifier - that used to make a CFlat interface VALUE (a fat
+// pointer) get GEP'd as a WinRT COM struct, emitting invalid LLVM IR with no diagnostic.
+//
+// The one way back into that state is a `using` alias that claims a name a CFlat interface also
+// uses. That is now a hard error instead of a silent shadow: the alias would win at every use
+// site and the interface would become unusable.
+import "winrt.cb";
+
+using IStringable = Windows.Foundation.IStringable;
+
+expect_error("collides with the WinMD alias") {
+    interface IStringable
+    {
+        string speak();
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

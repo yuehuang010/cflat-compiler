@@ -34,6 +34,13 @@ import "windows.h" lib { "user32.lib", "gdi32.lib", "d2d1.lib" } cache;
 import "Windows.Win32.winmd";
 import "guid.cb";
 
+// WinMD types are registered under their fully-qualified WinRT name, so they can never displace a
+// type of your own. Alias the four Direct2D interfaces this demo drives to keep the call sites short.
+using ID2D1Factory          = Windows.Win32.Graphics.Direct2D.ID2D1Factory;
+using ID2D1RenderTarget     = Windows.Win32.Graphics.Direct2D.ID2D1RenderTarget;
+using ID2D1HwndRenderTarget = Windows.Win32.Graphics.Direct2D.ID2D1HwndRenderTarget;
+using ID2D1SolidColorBrush  = Windows.Win32.Graphics.Direct2D.ID2D1SolidColorBrush;
+
 // ---- Direct2D value types (FLOAT-based, matching the SDK struct layouts) -------------
 // These are passed by pointer into the imported vtable slots, whose parameter types degrade to
 // void* under LLVM opaque pointers, so the demo's own POD layouts marshal correctly. (The winmd

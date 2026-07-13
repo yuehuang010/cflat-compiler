@@ -34,6 +34,52 @@ import package-nuget "Microsoft.UI.winmd" from "Microsoft.WindowsAppSDK.Interact
 // Foundation supplies Microsoft.WindowsAppRuntime.Bootstrap.{lib,dll} for the Mdd* externs below.
 import package-nuget "Microsoft.Windows.ApplicationModel.DynamicDependency.winmd" from "Microsoft.WindowsAppSDK.Foundation/1.8.260222000";
 
+// -- WinMD type aliases --------------------------------------------------------
+// WinMD types are registered under their FULLY-QUALIFIED name, so they can never displace a CFlat
+// type (that collision used to emit invalid IR - see doc/WINMD.md). These aliases keep the call
+// sites below readable. They are deliberately prefixed - a core library must not claim bare
+// identifiers like `IButton` or `IControl`, which belong to CFlat interfaces (ui_native.cb).
+using XamlUIElement                = Microsoft.UI.Xaml.IUIElement;
+using XamlFrameworkElement         = Microsoft.UI.Xaml.IFrameworkElement;
+using XamlApplication              = Microsoft.UI.Xaml.IApplication;
+using XamlApplicationFactory       = Microsoft.UI.Xaml.IApplicationFactory;
+using XamlApplicationStatics       = Microsoft.UI.Xaml.IApplicationStatics;
+using XamlWindow                   = Microsoft.UI.Xaml.IWindow;
+using XamlWindowFactory            = Microsoft.UI.Xaml.IWindowFactory;
+using XamlResourceDictionary       = Microsoft.UI.Xaml.IResourceDictionary;
+using XamlRoutedEventHandler       = Microsoft.UI.Xaml.RoutedEventHandler;
+using XamlAppInitCallback          = Microsoft.UI.Xaml.ApplicationInitializationCallback;
+using XamlButton                   = Microsoft.UI.Xaml.Controls.IButton;
+using XamlCanvasStatics            = Microsoft.UI.Xaml.Controls.ICanvasStatics;
+using XamlContentControl           = Microsoft.UI.Xaml.Controls.IContentControl;
+using XamlControl                  = Microsoft.UI.Xaml.Controls.IControl;
+using XamlImage                    = Microsoft.UI.Xaml.Controls.IImage;
+using XamlItemsControl             = Microsoft.UI.Xaml.Controls.IItemsControl;
+using XamlPanel                    = Microsoft.UI.Xaml.Controls.IPanel;
+using XamlProgressBarFactory       = Microsoft.UI.Xaml.Controls.IProgressBarFactory;
+using XamlTabViewFactory           = Microsoft.UI.Xaml.Controls.ITabViewFactory;
+using XamlTextBlock                = Microsoft.UI.Xaml.Controls.ITextBlock;
+using XamlTextBox                  = Microsoft.UI.Xaml.Controls.ITextBox;
+using XamlTreeViewFactory          = Microsoft.UI.Xaml.Controls.ITreeViewFactory;
+using XamlButtonBase               = Microsoft.UI.Xaml.Controls.Primitives.IButtonBase;
+using XamlRangeBase                = Microsoft.UI.Xaml.Controls.Primitives.IRangeBase;
+using XamlSelector                 = Microsoft.UI.Xaml.Controls.Primitives.ISelector;
+using XamlToggleButton             = Microsoft.UI.Xaml.Controls.Primitives.IToggleButton;
+using XamlAutomationPeer           = Microsoft.UI.Xaml.Automation.Peers.IAutomationPeer;
+using XamlPeerStatics              = Microsoft.UI.Xaml.Automation.Peers.IFrameworkElementAutomationPeerStatics;
+using XamlInvokeProvider           = Microsoft.UI.Xaml.Automation.Provider.IInvokeProvider;
+using XamlToggleProvider           = Microsoft.UI.Xaml.Automation.Provider.IToggleProvider;
+using XamlImageSource              = Microsoft.UI.Xaml.Media.IImageSource;
+using XamlWriteableBitmap          = Microsoft.UI.Xaml.Media.Imaging.IWriteableBitmap;
+using XamlWriteableBitmapFactory   = Microsoft.UI.Xaml.Media.Imaging.IWriteableBitmapFactory;
+using DispatcherQueue              = Microsoft.UI.Dispatching.IDispatcherQueue;
+using DispatcherQueueStatics       = Microsoft.UI.Dispatching.IDispatcherQueueStatics;
+using DispatcherHandler            = Microsoft.UI.Dispatching.DispatcherQueueHandler;
+using WfPropertyValueStatics       = Windows.Foundation.IPropertyValueStatics;
+using XamlUIElementVector          = Windows.Foundation.Collections.IVector<Microsoft.UI.Xaml.UIElement>;
+using XamlObjectVector             = Windows.Foundation.Collections.IVector<object>;
+using XamlResourceDictionaryVector = Windows.Foundation.Collections.IVector<Microsoft.UI.Xaml.ResourceDictionary>;
+
 extern stdcall i32  MddBootstrapInitialize2(u32 majorMinor, u16* versionTag, u64 minVersion, i32 options);
 extern stdcall void MddBootstrapShutdown();
 
@@ -68,13 +114,13 @@ int        _wW      = 80;      // client size in DIP units (layout width/height)
 int        _wH      = 40;
 
 // XAML plumbing captured during bring-up (all borrowed process-lived singletons).
-void* _gApp        = nullptr;   // IApplication* (base app; Exit ends the pump)
-void* _gDq         = nullptr;   // IDispatcherQueue* for this thread
-void* _gCanvasVec  = nullptr;   // ICanvas.Children as IVector<UIElement>*
-void* _gCanvasStat = nullptr;   // ICanvasStatics* (SetLeft/SetTop)
-void* _gPv         = nullptr;   // IPropertyValueStatics* (box a string as content)
-void* _gRootElem   = nullptr;   // ICanvas as IUIElement* (window content root; UpdateLayout target)
-void* _gRootFe     = nullptr;   // ICanvas as IFrameworkElement* (Loaded subscription target)
+void* _gApp        = nullptr;   // XamlApplication* (base app; Exit ends the pump)
+void* _gDq         = nullptr;   // DispatcherQueue* for this thread
+void* _gCanvasVec  = nullptr;   // ICanvas.Children as XamlUIElementVector*
+void* _gCanvasStat = nullptr;   // XamlCanvasStatics* (SetLeft/SetTop)
+void* _gPv         = nullptr;   // WfPropertyValueStatics* (box a string as content)
+void* _gRootElem   = nullptr;   // ICanvas as XamlUIElement* (window content root; UpdateLayout target)
+void* _gRootFe     = nullptr;   // ICanvas as XamlFrameworkElement* (Loaded subscription target)
 
 int hostWidth()  { return _wW; }
 int hostHeight() { return _wH; }
@@ -114,7 +160,7 @@ bool winuiThemeIsDark(Theme* t)
 void* wqi(void* obj, void* iid)
 {
     void* out = nullptr;
-    if (obj != nullptr) ((IButton*)obj)->lpVtbl->QueryInterface(obj, iid, (void**)&out);
+    if (obj != nullptr) ((XamlButton*)obj)->lpVtbl->QueryInterface(obj, iid, (void**)&out);
     return out;
 }
 
@@ -122,15 +168,15 @@ void* wqi(void* obj, void* iid)
 void* boxString(string s)
 {
     void* boxed = nullptr;
-    if (_gPv != nullptr) ((IPropertyValueStatics*)_gPv)->lpVtbl->CreateString(_gPv, hstring(s), &boxed);
+    if (_gPv != nullptr) ((WfPropertyValueStatics*)_gPv)->lpVtbl->CreateString(_gPv, hstring(s), &boxed);
     return boxed;
 }
 
-// Box a bool as IReference<Boolean> (the Nullable<Boolean> that IToggleButton.IsChecked wants).
+// Box a bool as IReference<Boolean> (the Nullable<Boolean> that XamlToggleButton.IsChecked wants).
 void* boxBool(bool b)
 {
     void* boxed = nullptr;
-    if (_gPv != nullptr) ((IPropertyValueStatics*)_gPv)->lpVtbl->CreateBoolean(_gPv, b, &boxed);
+    if (_gPv != nullptr) ((WfPropertyValueStatics*)_gPv)->lpVtbl->CreateBoolean(_gPv, b, &boxed);
     return boxed;
 }
 
@@ -142,7 +188,7 @@ void* winuiCompose(string cls, void* facIid)
     activationFactory(cls, facIid, (void**)&fac);
     if (fac == nullptr) return nullptr;
     void* inner = nullptr; void* raw = nullptr;
-    ((IApplicationFactory*)fac)->lpVtbl->CreateInstance(fac, nullptr, &inner, &raw);
+    ((XamlApplicationFactory*)fac)->lpVtbl->CreateInstance(fac, nullptr, &inner, &raw);
     return raw;
 }
 
@@ -397,11 +443,11 @@ class WinUI3Host : INativeHost
     {
         void* insp = nullptr;
         if (elemKind == ELEM_PROGRESS)
-            insp = winuiCompose("Microsoft.UI.Xaml.Controls.ProgressBar", iidof(IProgressBarFactory));
+            insp = winuiCompose("Microsoft.UI.Xaml.Controls.ProgressBar", iidof(XamlProgressBarFactory));
         else if (elemKind == ELEM_TABS)
-            insp = winuiCompose("Microsoft.UI.Xaml.Controls.TabView", iidof(ITabViewFactory));
+            insp = winuiCompose("Microsoft.UI.Xaml.Controls.TabView", iidof(XamlTabViewFactory));
         else if (elemKind == ELEM_TREE)
-            insp = winuiCompose("Microsoft.UI.Xaml.Controls.TreeView", iidof(ITreeViewFactory));
+            insp = winuiCompose("Microsoft.UI.Xaml.Controls.TreeView", iidof(XamlTreeViewFactory));
         else
         {
             string cls = "Microsoft.UI.Xaml.Controls.TextBlock";
@@ -426,32 +472,32 @@ class WinUI3Host : INativeHost
         if (insp == nullptr) return 0u;
 
         // Append to the root ICanvas as a UIElement.
-        void* elem = wqi(insp, iidof(IUIElement));
+        void* elem = wqi(insp, iidof(XamlUIElement));
         if (_gCanvasVec != nullptr && elem != nullptr)
-            ((IVector<UIElement>*)_gCanvasVec)->lpVtbl->Append(_gCanvasVec, elem);
+            ((XamlUIElementVector*)_gCanvasVec)->lpVtbl->Append(_gCanvasVec, elem);
 
         // Wire live events (the routing closures capture the node's key path, invariant for the
         // control's lifetime). The headless self-test drives via the native* drivers instead.
         if (elemKind == ELEM_BUTTON)
         {
-            void* bb = wqi(insp, iidof(IButtonBase));
+            void* bb = wqi(insp, iidof(XamlButtonBase));
             if (bb != nullptr)
             {
-                void* h = winrtDelegate(RoutedEventHandler, (void* s, void* a) => { routeWinuiClick(key); });
+                void* h = winrtDelegate(XamlRoutedEventHandler, (void* s, void* a) => { routeWinuiClick(key); });
                 u64 tok = 0;
-                ((IButtonBase*)bb)->lpVtbl->add_Click(bb, h, &tok);
+                ((XamlButtonBase*)bb)->lpVtbl->add_Click(bb, h, &tok);
             }
         }
         else if (elemKind == ELEM_CHECKBOX || elemKind == ELEM_RADIO)
         {
-            void* tb = wqi(insp, iidof(IToggleButton));
+            void* tb = wqi(insp, iidof(XamlToggleButton));
             if (tb != nullptr)
             {
-                void* hc = winrtDelegate(RoutedEventHandler, (void* s, void* a) => { routeWinuiClick(key); });
-                void* hu = winrtDelegate(RoutedEventHandler, (void* s, void* a) => { routeWinuiClick(key); });
+                void* hc = winrtDelegate(XamlRoutedEventHandler, (void* s, void* a) => { routeWinuiClick(key); });
+                void* hu = winrtDelegate(XamlRoutedEventHandler, (void* s, void* a) => { routeWinuiClick(key); });
                 u64 t1 = 0; u64 t2 = 0;
-                ((IToggleButton*)tb)->lpVtbl->add_Checked(tb, hc, &t1);
-                ((IToggleButton*)tb)->lpVtbl->add_Unchecked(tb, hu, &t2);
+                ((XamlToggleButton*)tb)->lpVtbl->add_Checked(tb, hc, &t1);
+                ((XamlToggleButton*)tb)->lpVtbl->add_Unchecked(tb, hu, &t2);
             }
         }
         return (u64)insp;
@@ -468,11 +514,11 @@ class WinUI3Host : INativeHost
         this._forgetAccent(h);
         // Remove from the ICanvas so it leaves the visual tree (the object is refcounted).
         if (_gCanvasVec == nullptr) return;
-        void* elem = wqi((void*)h, iidof(IUIElement));
+        void* elem = wqi((void*)h, iidof(XamlUIElement));
         if (elem == nullptr) return;
         u32 idx = 0u; u8 found = 0;
-        ((IVector<UIElement>*)_gCanvasVec)->lpVtbl->IndexOf(_gCanvasVec, elem, &idx, &found);
-        if (found != 0) ((IVector<UIElement>*)_gCanvasVec)->lpVtbl->RemoveAt(_gCanvasVec, idx);
+        ((XamlUIElementVector*)_gCanvasVec)->lpVtbl->IndexOf(_gCanvasVec, elem, &idx, &found);
+        if (found != 0) ((XamlUIElementVector*)_gCanvasVec)->lpVtbl->RemoveAt(_gCanvasVec, idx);
     }
 
     // Position + size in DIPs (XAML units are DIPs, so this is a near-1:1 passthrough).
@@ -480,17 +526,17 @@ class WinUI3Host : INativeHost
     {
         double x = (double)frameDip.x; double y = (double)frameDip.y;
         double w = (double)frameDip.w; double hh = (double)frameDip.h;
-        void* elem = wqi((void*)h, iidof(IUIElement));
+        void* elem = wqi((void*)h, iidof(XamlUIElement));
         if (elem != nullptr && _gCanvasStat != nullptr)
         {
-            ((ICanvasStatics*)_gCanvasStat)->lpVtbl->SetLeft(_gCanvasStat, elem, x);
-            ((ICanvasStatics*)_gCanvasStat)->lpVtbl->SetTop(_gCanvasStat, elem, y);
+            ((XamlCanvasStatics*)_gCanvasStat)->lpVtbl->SetLeft(_gCanvasStat, elem, x);
+            ((XamlCanvasStatics*)_gCanvasStat)->lpVtbl->SetTop(_gCanvasStat, elem, y);
         }
-        void* fe = wqi((void*)h, iidof(IFrameworkElement));
+        void* fe = wqi((void*)h, iidof(XamlFrameworkElement));
         if (fe != nullptr && w > 0.0 && hh > 0.0)
         {
-            ((IFrameworkElement*)fe)->lpVtbl->put_Width(fe, w);
-            ((IFrameworkElement*)fe)->lpVtbl->put_Height(fe, hh);
+            ((XamlFrameworkElement*)fe)->lpVtbl->put_Width(fe, w);
+            ((XamlFrameworkElement*)fe)->lpVtbl->put_Height(fe, hh);
         }
     }
 
@@ -499,40 +545,40 @@ class WinUI3Host : INativeHost
     void setText(u64 h, const char* s)
     {
         this._setTxt(h, (string)s);
-        void* tb = wqi((void*)h, iidof(ITextBlock));
-        if (tb != nullptr) { ((ITextBlock*)tb)->lpVtbl->put_Text(tb, hstring((string)s)); return; }
-        void* tx = wqi((void*)h, iidof(ITextBox));
-        if (tx != nullptr) { ((ITextBox*)tx)->lpVtbl->put_Text(tx, hstring((string)s)); return; }
-        void* cc = wqi((void*)h, iidof(IContentControl));
-        if (cc != nullptr) ((IContentControl*)cc)->lpVtbl->put_Content(cc, boxString((string)s));
+        void* tb = wqi((void*)h, iidof(XamlTextBlock));
+        if (tb != nullptr) { ((XamlTextBlock*)tb)->lpVtbl->put_Text(tb, hstring((string)s)); return; }
+        void* tx = wqi((void*)h, iidof(XamlTextBox));
+        if (tx != nullptr) { ((XamlTextBox*)tx)->lpVtbl->put_Text(tx, hstring((string)s)); return; }
+        void* cc = wqi((void*)h, iidof(XamlContentControl));
+        if (cc != nullptr) ((XamlContentControl*)cc)->lpVtbl->put_Content(cc, boxString((string)s));
     }
 
     void setBoolProp(u64 h, int prop, bool v)
     {
         if (prop == PROP_CHECKED)
         {
-            void* tb = wqi((void*)h, iidof(IToggleButton));
-            if (tb != nullptr) ((IToggleButton*)tb)->lpVtbl->put_IsChecked(tb, boxBool(v));
+            void* tb = wqi((void*)h, iidof(XamlToggleButton));
+            if (tb != nullptr) ((XamlToggleButton*)tb)->lpVtbl->put_IsChecked(tb, boxBool(v));
         }
         else if (prop == PROP_ENABLED)
         {
-            void* ctl = wqi((void*)h, iidof(IControl));
-            if (ctl != nullptr) ((IControl*)ctl)->lpVtbl->put_IsEnabled(ctl, v);
+            void* ctl = wqi((void*)h, iidof(XamlControl));
+            if (ctl != nullptr) ((XamlControl*)ctl)->lpVtbl->put_IsEnabled(ctl, v);
         }
         else if (prop == PROP_VISIBLE)
         {
-            void* elem = wqi((void*)h, iidof(IUIElement));
-            if (elem != nullptr) ((IUIElement*)elem)->lpVtbl->put_Visibility(elem, v ? 0 : 1);
+            void* elem = wqi((void*)h, iidof(XamlUIElement));
+            if (elem != nullptr) ((XamlUIElement*)elem)->lpVtbl->put_Visibility(elem, v ? 0 : 1);
         }
     }
 
-    // Progress/Slider share the IRangeBase pattern (Minimum/Maximum/Value as doubles).
+    // Progress/Slider share the XamlRangeBase pattern (Minimum/Maximum/Value as doubles).
     void setIntProp(u64 h, int prop, int v)
     {
-        void* rb = wqi((void*)h, iidof(IRangeBase));
+        void* rb = wqi((void*)h, iidof(XamlRangeBase));
         if (rb == nullptr) return;
-        if (prop == PROP_MAX)   ((IRangeBase*)rb)->lpVtbl->put_Maximum(rb, (double)v);
-        else if (prop == PROP_VALUE) ((IRangeBase*)rb)->lpVtbl->put_Value(rb, (double)v);
+        if (prop == PROP_MAX)   ((XamlRangeBase*)rb)->lpVtbl->put_Maximum(rb, (double)v);
+        else if (prop == PROP_VALUE) ((XamlRangeBase*)rb)->lpVtbl->put_Value(rb, (double)v);
     }
 
     // Store a push button's accent colors. A 0 (default) bg forgets any prior accent so the
@@ -553,17 +599,17 @@ class WinUI3Host : INativeHost
     void setImageData(u64 h, u64 pixels, int w, int h2, int stride)
     {
         if (h == 0u || pixels == 0u || w <= 0 || h2 <= 0) return;
-        IWriteableBitmapFactory* wbf = nullptr;
+        XamlWriteableBitmapFactory* wbf = nullptr;
         activationFactory("Microsoft.UI.Xaml.Media.Imaging.WriteableBitmap",
-            iidof(IWriteableBitmapFactory), (void**)&wbf);
+            iidof(XamlWriteableBitmapFactory), (void**)&wbf);
         if (wbf == nullptr) return;
         void* wbRaw = nullptr;
         wbf->lpVtbl->CreateInstanceWithDimensions(wbf, w, h2, &wbRaw);
         if (wbRaw == nullptr) return;
-        void* wb = wqi(wbRaw, iidof(IWriteableBitmap));
+        void* wb = wqi(wbRaw, iidof(XamlWriteableBitmap));
         if (wb == nullptr) return;
         void* buf = nullptr;
-        ((IWriteableBitmap*)wb)->lpVtbl->get_PixelBuffer(wb, &buf);
+        ((XamlWriteableBitmap*)wb)->lpVtbl->get_PixelBuffer(wb, &buf);
         if (buf == nullptr) return;
         Guid bbaIid = IID_IBufferByteAccess();
         void* bba = wqi(buf, &bbaIid);
@@ -584,9 +630,9 @@ class WinUI3Host : INativeHost
             }
         }
         // Set the WriteableBitmap as the Image control's Source.
-        void* img = wqi((void*)h, iidof(IImage));
-        void* isrc = wqi(wbRaw, iidof(IImageSource));
-        if (img != nullptr && isrc != nullptr) ((IImage*)img)->lpVtbl->put_Source(img, isrc);
+        void* img = wqi((void*)h, iidof(XamlImage));
+        void* isrc = wqi(wbRaw, iidof(XamlImageSource));
+        if (img != nullptr && isrc != nullptr) ((XamlImage*)img)->lpVtbl->put_Source(img, isrc);
         this._imgMark(h, pixels);
     }
 
@@ -609,29 +655,29 @@ class WinUI3Host : INativeHost
     // Populate a combo's items only when the item set changed, then set the controlled selection.
     void _syncCombo(u64 h, ComboBox* cb)
     {
-        void* ic = wqi((void*)h, iidof(IItemsControl));
+        void* ic = wqi((void*)h, iidof(XamlItemsControl));
         if (ic == nullptr) return;
         void* items = nullptr;
-        ((IItemsControl*)ic)->lpVtbl->get_Items(ic, &items);
-        void* vec = wqi(items, iidof(IVector<object>));
+        ((XamlItemsControl*)ic)->lpVtbl->get_Items(ic, &items);
+        void* vec = wqi(items, iidof(XamlObjectVector));
         if (vec != nullptr)
         {
             u32 have = 0u;
-            ((IVector<object>*)vec)->lpVtbl->get_Size(vec, &have);
+            ((XamlObjectVector*)vec)->lpVtbl->get_Size(vec, &have);
             if ((int)have != cb.items.count())
             {
-                ((IVector<object>*)vec)->lpVtbl->Clear(vec);
+                ((XamlObjectVector*)vec)->lpVtbl->Clear(vec);
                 int i = 0;
                 while (i < cb.items.count())
                 {
                     void* bs = boxString("" + cb.items.get(i));
-                    ((IVector<object>*)vec)->lpVtbl->Append(vec, bs);
+                    ((XamlObjectVector*)vec)->lpVtbl->Append(vec, bs);
                     i++;
                 }
             }
         }
-        void* sel = wqi((void*)h, iidof(ISelector));
-        if (sel != nullptr) ((ISelector*)sel)->lpVtbl->put_SelectedIndex(sel, cb.selectedIndex);
+        void* sel = wqi((void*)h, iidof(XamlSelector));
+        if (sel != nullptr) ((XamlSelector*)sel)->lpVtbl->put_SelectedIndex(sel, cb.selectedIndex);
     }
 
     // The setListOp seam (see ui_native.cb for the cross-toolkit protocol design). On WinUI the
@@ -942,9 +988,9 @@ void _winuiPostEnqueue(u64 target, u64 boxPtr)
 {
     // Enqueue a run-the-box tick onto the DispatcherQueue (target unused - one UI thread).
     if (_gDq == nullptr) { __uiRunPostBox(boxPtr); return; }
-    void* h = winrtDelegate(DispatcherQueueHandler, () => { __uiRunPostBox(boxPtr); });
+    void* h = winrtDelegate(DispatcherHandler, () => { __uiRunPostBox(boxPtr); });
     void* enqOut = nullptr;
-    ((IDispatcherQueue*)_gDq)->lpVtbl->TryEnqueue(_gDq, h, &enqOut);
+    ((DispatcherQueue*)_gDq)->lpVtbl->TryEnqueue(_gDq, h, &enqOut);
 }
 u64 _winuiCurTid() { return (u64)GetCurrentThreadId(); }
 
@@ -1053,33 +1099,33 @@ void winuiInitFramework()
     Guid mpi = IID_IXamlMetadataProvider();
     activateInstance("Microsoft.UI.Xaml.XamlTypeInfo.XamlControlsXamlMetaDataProvider", &mpi, &_gMeta);
 
-    IApplicationFactory* af = nullptr;
-    activationFactory("Microsoft.UI.Xaml.Application", iidof(IApplicationFactory), (void**)&af);
+    XamlApplicationFactory* af = nullptr;
+    activationFactory("Microsoft.UI.Xaml.Application", iidof(XamlApplicationFactory), (void**)&af);
     void* outer = _makeOuter();
     af->lpVtbl->CreateInstance(af, outer, &_gOuterInner, &_gApp);
 
-    IWindowFactory* wf = nullptr;
-    activationFactory("Microsoft.UI.Xaml.Window", iidof(IWindowFactory), (void**)&wf);
+    XamlWindowFactory* wf = nullptr;
+    activationFactory("Microsoft.UI.Xaml.Window", iidof(XamlWindowFactory), (void**)&wf);
     void* wi = nullptr; void* winRaw = nullptr;
     wf->lpVtbl->CreateInstance(wf, nullptr, &wi, &winRaw);
 
     void* canvas = nullptr;
     RoActivateInstance(hstring("Microsoft.UI.Xaml.Controls.Canvas"), &canvas);
-    void* panel = wqi(canvas, iidof(IPanel));
+    void* panel = wqi(canvas, iidof(XamlPanel));
     void* children = nullptr;
-    if (panel != nullptr) ((IPanel*)panel)->lpVtbl->get_Children(panel, &children);
-    _gCanvasVec = wqi(children, iidof(IVector<UIElement>));
-    activationFactory("Microsoft.UI.Xaml.Controls.Canvas", iidof(ICanvasStatics), (void**)&_gCanvasStat);
-    activationFactory("Windows.Foundation.PropertyValue", iidof(IPropertyValueStatics), (void**)&_gPv);
+    if (panel != nullptr) ((XamlPanel*)panel)->lpVtbl->get_Children(panel, &children);
+    _gCanvasVec = wqi(children, iidof(XamlUIElementVector));
+    activationFactory("Microsoft.UI.Xaml.Controls.Canvas", iidof(XamlCanvasStatics), (void**)&_gCanvasStat);
+    activationFactory("Windows.Foundation.PropertyValue", iidof(WfPropertyValueStatics), (void**)&_gPv);
 
-    void* win = wqi(winRaw, iidof(IWindow));
-    void* canvasElem = wqi(canvas, iidof(IUIElement));
+    void* win = wqi(winRaw, iidof(XamlWindow));
+    void* canvasElem = wqi(canvas, iidof(XamlUIElement));
     _gRootElem = canvasElem;   // window content root: the headless path drives layout through this
-    _gRootFe   = wqi(canvas, iidof(IFrameworkElement));   // Loaded fires after the tree is live
+    _gRootFe   = wqi(canvas, iidof(XamlFrameworkElement));   // Loaded fires after the tree is live
     if (win != nullptr && canvasElem != nullptr)
     {
-        ((IWindow*)win)->lpVtbl->put_Content(win, canvasElem);
-        ((IWindow*)win)->lpVtbl->Activate(win);
+        ((XamlWindow*)win)->lpVtbl->put_Content(win, canvasElem);
+        ((XamlWindow*)win)->lpVtbl->Activate(win);
     }
 
     // Merge XamlControlsResources into Application.Resources so muxc controls + TextBox resolve
@@ -1088,18 +1134,18 @@ void winuiInitFramework()
     void* xcr = nullptr;
     RoActivateInstance(hstring("Microsoft.UI.Xaml.Controls.XamlControlsResources"), &xcr);
     void* appRes = nullptr;
-    ((IApplication*)_gApp)->get_Resources(&appRes);
-    void* xcrDict = wqi(xcr, iidof(IResourceDictionary));
+    ((XamlApplication*)_gApp)->get_Resources(&appRes);
+    void* xcrDict = wqi(xcr, iidof(XamlResourceDictionary));
     if (appRes != nullptr && xcrDict != nullptr)
     {
         void* merged = nullptr;
-        ((IResourceDictionary*)appRes)->lpVtbl->get_MergedDictionaries(appRes, &merged);
-        void* mvec = wqi(merged, iidof(IVector<ResourceDictionary>));
-        if (mvec != nullptr) ((IVector<ResourceDictionary>*)mvec)->lpVtbl->Append(mvec, xcrDict);
+        ((XamlResourceDictionary*)appRes)->lpVtbl->get_MergedDictionaries(appRes, &merged);
+        void* mvec = wqi(merged, iidof(XamlResourceDictionaryVector));
+        if (mvec != nullptr) ((XamlResourceDictionaryVector*)mvec)->lpVtbl->Append(mvec, xcrDict);
     }
 
-    IDispatcherQueueStatics* dqs = nullptr;
-    activationFactory("Microsoft.UI.Dispatching.DispatcherQueue", iidof(IDispatcherQueueStatics), (void**)&dqs);
+    DispatcherQueueStatics* dqs = nullptr;
+    activationFactory("Microsoft.UI.Dispatching.DispatcherQueue", iidof(DispatcherQueueStatics), (void**)&dqs);
     dqs->lpVtbl->GetForCurrentThread(dqs, &_gDq);
 
     // Install the ctx.post marshaling hooks (worker-thread closures run on this UI thread).
@@ -1120,7 +1166,7 @@ void winuiOnInit(void* params)
 // failfasts (0xC000027B) - exactly the class of fault the headless suite must not skip.
 void winuiForceLayout()
 {
-    if (_gRootElem != nullptr) ((IUIElement*)_gRootElem)->lpVtbl->UpdateLayout(_gRootElem);
+    if (_gRootElem != nullptr) ((XamlUIElement*)_gRootElem)->lpVtbl->UpdateLayout(_gRootElem);
 }
 
 // Headless init: framework only, then run the self-test body synchronously. Exit is DEFERRED
@@ -1135,10 +1181,10 @@ void winuiHeadlessInit(void* params)
     if (_wHasSelfBody) _wSelfRc = _wSelfBody();
     if (_gRootFe != nullptr)
     {
-        void* h = winrtDelegate(RoutedEventHandler,
+        void* h = winrtDelegate(XamlRoutedEventHandler,
             (void* s, void* a) => { winuiForceLayout(); winuiExit(); });
         u64 tok = 0;
-        ((IFrameworkElement*)_gRootFe)->lpVtbl->add_Loaded(_gRootFe, h, &tok);
+        ((XamlFrameworkElement*)_gRootFe)->lpVtbl->add_Loaded(_gRootFe, h, &tok);
     }
     else winuiExit();
 }
@@ -1146,15 +1192,15 @@ void winuiHeadlessInit(void* params)
 // Exit the XAML pump (ends Application.Start).
 void winuiExit()
 {
-    if (_gApp != nullptr) ((IApplication*)_gApp)->Exit();
+    if (_gApp != nullptr) ((XamlApplication*)_gApp)->Exit();
 }
 
 // Post a handler onto the UI thread's DispatcherQueue.
 void winuiPost(Lambda<void()> fn)
 {
-    void* h = winrtDelegate(DispatcherQueueHandler, () => { fn(); });
+    void* h = winrtDelegate(DispatcherHandler, () => { fn(); });
     void* enqOut = nullptr;
-    ((IDispatcherQueue*)_gDq)->lpVtbl->TryEnqueue(_gDq, h, &enqOut);
+    ((DispatcherQueue*)_gDq)->lpVtbl->TryEnqueue(_gDq, h, &enqOut);
 }
 
 // -- Host-neutral entry points (mirror the Win32/Cocoa host free-function surface) --
@@ -1174,10 +1220,10 @@ int runAppWinui(IComponent app)
     i32 bhr = MddBootstrapInitialize2(0x00010008, nullptr, 0, 0x10);
     if (bhr != 0) { printf("winui: bootstrap failed 0x%08X\n", bhr); return 1; }
     RoInitialize(0);
-    IApplicationStatics* appStat = nullptr;
-    i32 shr = activationFactory("Microsoft.UI.Xaml.Application", iidof(IApplicationStatics), (void**)&appStat);
-    if (shr != 0 || appStat == nullptr) { printf("winui: IApplicationStatics 0x%08X\n", shr); MddBootstrapShutdown(); return 1; }
-    void* cb = winrtDelegate(ApplicationInitializationCallback, (void* p) => { winuiOnInit(p); });
+    XamlApplicationStatics* appStat = nullptr;
+    i32 shr = activationFactory("Microsoft.UI.Xaml.Application", iidof(XamlApplicationStatics), (void**)&appStat);
+    if (shr != 0 || appStat == nullptr) { printf("winui: XamlApplicationStatics 0x%08X\n", shr); MddBootstrapShutdown(); return 1; }
+    void* cb = winrtDelegate(XamlAppInitCallback, (void* p) => { winuiOnInit(p); });
     appStat->Start(cb);
     MddBootstrapShutdown();
     return 0;
@@ -1189,10 +1235,10 @@ int runWinuiHeadless()
     i32 bhr = MddBootstrapInitialize2(0x00010008, nullptr, 0, 0x10);
     if (bhr != 0) { printf("winui: bootstrap failed 0x%08X\n", bhr); return 1; }
     RoInitialize(0);
-    IApplicationStatics* appStat = nullptr;
-    i32 shr = activationFactory("Microsoft.UI.Xaml.Application", iidof(IApplicationStatics), (void**)&appStat);
-    if (shr != 0 || appStat == nullptr) { printf("winui: IApplicationStatics 0x%08X\n", shr); MddBootstrapShutdown(); return 1; }
-    void* cb = winrtDelegate(ApplicationInitializationCallback, (void* p) => { winuiHeadlessInit(p); });
+    XamlApplicationStatics* appStat = nullptr;
+    i32 shr = activationFactory("Microsoft.UI.Xaml.Application", iidof(XamlApplicationStatics), (void**)&appStat);
+    if (shr != 0 || appStat == nullptr) { printf("winui: XamlApplicationStatics 0x%08X\n", shr); MddBootstrapShutdown(); return 1; }
+    void* cb = winrtDelegate(XamlAppInitCallback, (void* p) => { winuiHeadlessInit(p); });
     appStat->Start(cb);
     MddBootstrapShutdown();
     return _wSelfRc;
@@ -1212,20 +1258,20 @@ bool winuiUiaInvoke(string key)
 {
     u64 h = _wCtx.nativeHandle(key);
     if (h == 0u) return false;
-    void* elem = wqi((void*)h, iidof(IUIElement));
+    void* elem = wqi((void*)h, iidof(XamlUIElement));
     if (elem == nullptr) return false;
-    IFrameworkElementAutomationPeerStatics* ps = nullptr;
+    XamlPeerStatics* ps = nullptr;
     activationFactory("Microsoft.UI.Xaml.Automation.Peers.FrameworkElementAutomationPeer",
-        iidof(IFrameworkElementAutomationPeerStatics), (void**)&ps);
+        iidof(XamlPeerStatics), (void**)&ps);
     if (ps == nullptr) return false;
     void* peer = nullptr;
     ps->lpVtbl->CreatePeerForElement(ps, elem, &peer);
     if (peer == nullptr) return false;
     void* pat = nullptr;
-    ((IAutomationPeer*)peer)->lpVtbl->GetPattern(peer, 0, &pat);   // Invoke = 0
-    void* inv = wqi(pat, iidof(IInvokeProvider));
+    ((XamlAutomationPeer*)peer)->lpVtbl->GetPattern(peer, 0, &pat);   // Invoke = 0
+    void* inv = wqi(pat, iidof(XamlInvokeProvider));
     if (inv == nullptr) return false;
-    ((IInvokeProvider*)inv)->lpVtbl->Invoke(inv);
+    ((XamlInvokeProvider*)inv)->lpVtbl->Invoke(inv);
     return true;
 }
 
@@ -1233,20 +1279,20 @@ bool winuiUiaToggle(string key)
 {
     u64 h = _wCtx.nativeHandle(key);
     if (h == 0u) return false;
-    void* elem = wqi((void*)h, iidof(IUIElement));
+    void* elem = wqi((void*)h, iidof(XamlUIElement));
     if (elem == nullptr) return false;
-    IFrameworkElementAutomationPeerStatics* ps = nullptr;
+    XamlPeerStatics* ps = nullptr;
     activationFactory("Microsoft.UI.Xaml.Automation.Peers.FrameworkElementAutomationPeer",
-        iidof(IFrameworkElementAutomationPeerStatics), (void**)&ps);
+        iidof(XamlPeerStatics), (void**)&ps);
     if (ps == nullptr) return false;
     void* peer = nullptr;
     ps->lpVtbl->CreatePeerForElement(ps, elem, &peer);
     if (peer == nullptr) return false;
     void* pat = nullptr;
-    ((IAutomationPeer*)peer)->lpVtbl->GetPattern(peer, 15, &pat);   // Toggle = 15
-    void* tog = wqi(pat, iidof(IToggleProvider));
+    ((XamlAutomationPeer*)peer)->lpVtbl->GetPattern(peer, 15, &pat);   // Toggle = 15
+    void* tog = wqi(pat, iidof(XamlToggleProvider));
     if (tog == nullptr) return false;
-    ((IToggleProvider*)tog)->lpVtbl->Toggle(tog);
+    ((XamlToggleProvider*)tog)->lpVtbl->Toggle(tog);
     return true;
 }
 
@@ -1255,10 +1301,10 @@ string winuiControlText(string key)
 {
     u64 h = _wCtx.nativeHandle(key);
     if (h == 0u) return "";
-    void* tb = wqi((void*)h, iidof(ITextBlock));
+    void* tb = wqi((void*)h, iidof(XamlTextBlock));
     if (tb == nullptr) return "";
     void* hs = nullptr;
-    ((ITextBlock*)tb)->lpVtbl->get_Text(tb, &hs);
+    ((XamlTextBlock*)tb)->lpVtbl->get_Text(tb, &hs);
     if (hs == nullptr) return "";
     return fromHString(hs);
 }
@@ -1270,10 +1316,10 @@ string nativeControlText(string keyPath)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
     if (h == 0u) return "";
-    void* tb = wqi((void*)h, iidof(ITextBlock));
-    if (tb != nullptr) { void* hs = nullptr; ((ITextBlock*)tb)->lpVtbl->get_Text(tb, &hs); if (hs != nullptr) return fromHString(hs); }
-    void* tx = wqi((void*)h, iidof(ITextBox));
-    if (tx != nullptr) { void* hs = nullptr; ((ITextBox*)tx)->lpVtbl->get_Text(tx, &hs); if (hs != nullptr) return fromHString(hs); }
+    void* tb = wqi((void*)h, iidof(XamlTextBlock));
+    if (tb != nullptr) { void* hs = nullptr; ((XamlTextBlock*)tb)->lpVtbl->get_Text(tb, &hs); if (hs != nullptr) return fromHString(hs); }
+    void* tx = wqi((void*)h, iidof(XamlTextBox));
+    if (tx != nullptr) { void* hs = nullptr; ((XamlTextBox*)tx)->lpVtbl->get_Text(tx, &hs); if (hs != nullptr) return fromHString(hs); }
     return _wHost._txtFor(h);
 }
 
@@ -1360,15 +1406,15 @@ string nativeFocusFirst() { return ""; }   // Win32-only Tab ring; no WinUI gate
 string nativeFocusNext() { return ""; }
 string nativeFocusedKey() { return ""; }
 
-// The combo box selection index (live ISelector get_SelectedIndex).
+// The combo box selection index (live XamlSelector get_SelectedIndex).
 int nativeComboSelected(string keyPath)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
     if (h == 0u) return 0 - 1;
-    void* sel = wqi((void*)h, iidof(ISelector));
+    void* sel = wqi((void*)h, iidof(XamlSelector));
     if (sel == nullptr) return 0 - 1;
     i32 idx = 0;
-    ((ISelector*)sel)->lpVtbl->get_SelectedIndex(sel, &idx);
+    ((XamlSelector*)sel)->lpVtbl->get_SelectedIndex(sel, &idx);
     return (int)idx;
 }
 
@@ -1377,8 +1423,8 @@ void nativeComboSelect(string keyPath, int idx)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
     if (h == 0u) return;
-    void* sel = wqi((void*)h, iidof(ISelector));
-    if (sel != nullptr) ((ISelector*)sel)->lpVtbl->put_SelectedIndex(sel, idx);
+    void* sel = wqi((void*)h, iidof(XamlSelector));
+    if (sel != nullptr) ((XamlSelector*)sel)->lpVtbl->put_SelectedIndex(sel, idx);
     IElement e = winuiElem(keyPath);
     if (e != nullptr) { ComboBox* cb = e as ComboBox; if (cb != nullptr) { cb.onChange(idx); pumpWinui(); } }
 }
@@ -1388,8 +1434,8 @@ void nativeTypeText(string keyPath, string s)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
     if (h == 0u) return;
-    void* tx = wqi((void*)h, iidof(ITextBox));
-    if (tx != nullptr) { bool p = _wHost.applying; _wHost.applying = true; ((ITextBox*)tx)->lpVtbl->put_Text(tx, hstring(s)); _wHost.applying = p; }
+    void* tx = wqi((void*)h, iidof(XamlTextBox));
+    if (tx != nullptr) { bool p = _wHost.applying; _wHost.applying = true; ((XamlTextBox*)tx)->lpVtbl->put_Text(tx, hstring(s)); _wHost.applying = p; }
     _wHost._setTxt(h, s);
     IElement e = winuiElem(keyPath);
     if (e != nullptr) { TextInput* ti = e as TextInput; if (ti != nullptr) { ti.onChangeText(s); pumpWinui(); } }
@@ -1518,18 +1564,18 @@ int nativeProgressValue(string keyPath)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
     if (h == 0u) return 0 - 1;
-    void* rb = wqi((void*)h, iidof(IRangeBase));
+    void* rb = wqi((void*)h, iidof(XamlRangeBase));
     if (rb == nullptr) return 0 - 1;
     double v = 0.0;
-    ((IRangeBase*)rb)->lpVtbl->get_Value(rb, &v);
+    ((XamlRangeBase*)rb)->lpVtbl->get_Value(rb, &v);
     return (int)(v + 0.5);
 }
 void nativeSliderSet(string keyPath, int v)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
     if (h == 0u) return;
-    void* rb = wqi((void*)h, iidof(IRangeBase));
-    if (rb != nullptr) ((IRangeBase*)rb)->lpVtbl->put_Value(rb, (double)v);
+    void* rb = wqi((void*)h, iidof(XamlRangeBase));
+    if (rb != nullptr) ((XamlRangeBase*)rb)->lpVtbl->put_Value(rb, (double)v);
     IElement e = winuiElem(keyPath);
     if (e != nullptr) { Slider* s = e as Slider; if (s != nullptr) { s.fireSet(v); pumpWinui(); } }
 }

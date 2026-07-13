@@ -314,7 +314,7 @@ typeSpecifier
     | structClassUnion
     | 'auto'
     | Move                           // soft keyword - ownership modifier on parameters
-    | Identifier ('.' Identifier)+   // namespace-qualified type (e.g. MathAdv.MyNumber)
+    | qualifiedGenericIdentifier     // namespace-qualified type (e.g. MathAdv.MyNumber, Windows.Foundation.IReference<int>)
     | genericIdentifier
     | functionPointerSpecifier
     | simdTypeSpecifier
@@ -804,6 +804,13 @@ programDefinition
 
 genericIdentifier
     : Identifier genericTypeParameters?
+    ;
+
+// A namespace-qualified type name, optionally generic. Type positions only (never an expression -
+// `a.b` there is member access), which is why this is separate from genericIdentifier. WinMD types
+// are always spelled this way (e.g. Windows.Foundation.Collections.IVector<Microsoft.UI.Xaml.UIElement>).
+qualifiedGenericIdentifier
+    : Identifier ('.' Identifier)+ genericTypeParameters?
     ;
 
 destructorDefinition

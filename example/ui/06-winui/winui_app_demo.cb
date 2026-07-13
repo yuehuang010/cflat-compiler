@@ -24,6 +24,29 @@ import package-nuget "Microsoft.UI.winmd" from "Microsoft.WindowsAppSDK.Interact
 // Foundation supplies Microsoft.WindowsAppRuntime.Bootstrap.{lib,dll} for the Mdd* externs below.
 import package-nuget "Microsoft.Windows.ApplicationModel.DynamicDependency.winmd" from "Microsoft.WindowsAppSDK.Foundation/1.8.260222000";
 
+// WinMD types are named by their fully-qualified WinRT name, so a projection can never displace a
+// type of your own. Alias the ones you use to keep the call sites short - this is the normal way
+// to consume a .winmd, and the alias is YOUR name, so nothing can claim it behind your back.
+using IApplication         = Microsoft.UI.Xaml.IApplication;
+using IApplicationFactory  = Microsoft.UI.Xaml.IApplicationFactory;
+using IApplicationStatics  = Microsoft.UI.Xaml.IApplicationStatics;
+using IUIElement           = Microsoft.UI.Xaml.IUIElement;
+using IWindow              = Microsoft.UI.Xaml.IWindow;
+using IWindowFactory       = Microsoft.UI.Xaml.IWindowFactory;
+using RoutedEventHandler   = Microsoft.UI.Xaml.RoutedEventHandler;
+using ApplicationInitializationCallback = Microsoft.UI.Xaml.ApplicationInitializationCallback;
+using IButton              = Microsoft.UI.Xaml.Controls.IButton;
+using IContentControl      = Microsoft.UI.Xaml.Controls.IContentControl;
+using IButtonBase          = Microsoft.UI.Xaml.Controls.Primitives.IButtonBase;
+using IAutomationPeer      = Microsoft.UI.Xaml.Automation.Peers.IAutomationPeer;
+using IFrameworkElementAutomationPeerStatics
+                           = Microsoft.UI.Xaml.Automation.Peers.IFrameworkElementAutomationPeerStatics;
+using IInvokeProvider      = Microsoft.UI.Xaml.Automation.Provider.IInvokeProvider;
+using IDispatcherQueue     = Microsoft.UI.Dispatching.IDispatcherQueue;
+using IDispatcherQueueStatics = Microsoft.UI.Dispatching.IDispatcherQueueStatics;
+using DispatcherQueueHandler  = Microsoft.UI.Dispatching.DispatcherQueueHandler;
+using IPropertyValueStatics = Windows.Foundation.IPropertyValueStatics;
+
 // Windows App SDK bootstrapper (Microsoft.WindowsAppRuntime.Bootstrap.lib). minVersion is a
 // PACKAGE_VERSION (a ULONGLONG passed by value); options 0x10 == OnNoMatch_NoOp.
 extern stdcall i32  MddBootstrapInitialize2(u32 majorMinor, u16* versionTag, u64 minVersion, i32 options);

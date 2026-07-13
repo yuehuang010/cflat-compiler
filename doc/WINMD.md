@@ -176,8 +176,43 @@ A bare name (`import "Windows.Foundation.winmd";`) resolves against the system W
 (`%SystemRoot%\System32\WinMetadata`), so the in-box winmds need no full path; a relative or absolute
 path also works for a winmd you ship yourself.
 
+### WinMD Types Are Always Fully Qualified
+
+A type from a `.winmd` is registered under its **fully-qualified WinRT name** and nothing else -
+`Windows.Foundation.IStringable`, never a bare `IStringable`. Consequently a WinMD projection can
+never displace a type of your own: your `interface IStringable` and WinRT's are different types and
+can coexist in one program. (They could not before: the projection silently won the lookup, and a
+CFlat interface value - a fat pointer - was then emitted as a WinRT COM struct access, producing
+invalid LLVM IR with no diagnostic.)
+
+Use a `using` alias to get the short spelling back. The alias is *your* name, chosen in your own
+file, so nothing can claim it behind your back - and if it clashes with one of your interfaces, the
+compiler says so instead of silently shadowing it.
+
+```cpp
+import "Windows.Foundation.winmd";
+
+using IStringable = Windows.Foundation.IStringable;    // plain interface
+using IReference  = Windows.Foundation.IReference;     // GENERIC BASE: now write IReference<int>
+using RefInt      = Windows.Foundation.IReference<int>;// or alias a concrete instantiation
+```
+
+An alias may name: a plain interface, a value struct, an enum, a delegate, a runtime class, a
+generic *base* (the `<...>` is supplied at the use site), or a concrete generic *instantiation*.
+Aliases chain, so `using PV = IPropertyValueStatics;` over an earlier alias works.
+
+Two spots still take the bare short name, by design:
+
+- **Enum members** are named constants `<Enum>_<Member>` (`AsyncStatus_Completed`). They are
+  *values*, not types, so they cannot reach the bad-IR class above; and a dotted name in expression
+  position is member access, so a qualified spelling would not even parse. First-writer-wins.
+- **Type arguments** inside `<...>` are matched after alias expansion, so `IReference<HttpProgress>`
+  works via `using HttpProgress = Windows.Web.Http.HttpProgress;`.
+
 ```cpp
 import "Windows.Foundation.winmd";       // resolved from %SystemRoot%\System32\WinMetadata
+
+using IStringable = Windows.Foundation.IStringable;
 
 extern int main()
 {
@@ -194,11 +229,11 @@ extern int main()
 
 What is registered from a `.winmd`:
 
-- **interfaces** (non-generic) -> a COM vtable struct `<Name>Vtbl` (IInspectable layout + the
-  interface methods) plus a thin pointer struct `<Name> { <Name>Vtbl* lpVtbl }`. Each method slot is
-  the WinRT ABI: returns HRESULT, `this` first, a trailing out-pointer for a non-void return.
-- **value structs** -> CFlat structs.
-- **enums** -> named constants `<EnumName>_<Member>`.
+- **interfaces** (non-generic) -> a COM vtable struct `<FullName>Vtbl` (IInspectable layout + the
+  interface methods) plus a thin pointer struct `<FullName> { <FullName>Vtbl* lpVtbl }`. Each method
+  slot is the WinRT ABI: returns HRESULT, `this` first, a trailing out-pointer for a non-void return.
+- **value structs** -> CFlat structs, under the full name.
+- **enums** -> named constants `<EnumName>_<Member>` (the short name; see above).
 
 You get an interface pointer from a WinRT API call and drive it through `lpVtbl`. Scalar parameters
 map precisely; `String`/`Object`/interfaces/arrays/by-ref map to opaque `void*` (the COM thin
@@ -233,12 +268,20 @@ instantiates a concrete COM vtable + thin pointer from the generic template in t
 and derives the instance's IID (the **PIID**) by the standard RFC 4122 v5 / SHA-1 algorithm over the
 WinRT type signature - byte-for-byte what cppwinrt and windows-rs compute.
 
+A generic base is qualified like any other WinMD name. Alias the base once and the use sites read
+exactly like any other projection:
+
 ```cpp
 import "Windows.Foundation.winmd";
+
+using IReference = Windows.Foundation.IReference;   // alias the BASE; <...> comes at the use site
 
 IReference<int>* r = default;            // resolves to a synthesized concrete COM interface
 int v = default;
 i32 hr = r->lpVtbl->get_Value(r, &v);    // drive it through the vtable like any imported interface
+
+// The fully-qualified spelling always works too, alias or no alias:
+Windows.Foundation.IReference<int>* r2 = default;
 ```
 
 #### `iidof(T)` and Derived IIDs
@@ -258,8 +301,8 @@ i32 qi = obj->lpVtbl->QueryInterface(obj, iidof(IReference<int>), (void**)&ref);
 See `example/COM/winrt_ireference_demo.cb` for a full live round-trip (activate
 `Windows.Foundation.PropertyValue`, box an `Int32`, QI to `IReference<int>` with the derived PIID,
 read it back). Type arguments must be an explicit-width scalar (`i32`/`u32`/`f32`/`f64`/`bool`/`string`/
-`object`, or the `int`/`uint`/`float`/`double` aliases) or an imported winmd type; arrays are not
-permitted as type arguments (a WinRT rule).
+`object`, or the `int`/`uint`/`float`/`double` aliases) or an imported winmd type named by its full
+name or a `using` alias of one; arrays are not permitted as type arguments (a WinRT rule).
 
 #### `foreach` Iteration
 

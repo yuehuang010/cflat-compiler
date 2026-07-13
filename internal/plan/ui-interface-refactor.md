@@ -231,9 +231,9 @@ Shipped hierarchy (see `internal/plan/ui-widget-interface-inventory.md` for the 
 IElement
   +- ITooltipped  { string tooltip; }                 // 15 implementors
   |    +- IDisableable { bool disabled; }             // 10 implementors
-  |    |    +- IButtonElement, ITextInput, ICheckbox, ISlider, ITextArea,
+  |    |    +- IButton, ITextInput, ICheckbox, ISlider, ITextArea,
   |    |       IRadioButton, IComboBox, IListView, ITabControl, ITreeView
-  |    +- IText, IProgressBar, IImageElement, IGroupBox, ICanvasView
+  |    +- IText, IProgressBar, IImage, IGroupBox, ICanvasView
   +- IView, IBox, IStatusBar, IScrollView, IRadioGroup, ITabPane, ISplitView
 ```
 
@@ -243,15 +243,15 @@ downcasts repo-wide), so 22 interfaces for 23 classes.
 
 Deviations from the inventory, all deliberate:
 
-1. **`IButton` and `IImage` are named `IButtonElement` / `IImageElement`.** HARD NAME
-   COLLISION, not a style choice: `core/ui_native/winui.cb` consumes the WinUI winmd,
-   which projects a WinRT `IButton` (used at `winui.cb:117`) and a WinRT `IImage`
-   (`:587-589`, `iidof(IImage)` + `put_Source` through its vtable). A WinMD projection
-   and a cflat interface cannot share a name - the WinMD type wins the lookup and the
-   cflat interface value is then GEP'd as a COM struct, producing INVALID IR ("Invalid
-   bitcast ... %__iface_fat_ptr", module verification failure), not a diagnostic. Fully
-   qualified WinMD names (`Microsoft.UI.Xaml.Controls.IImage`) are NOT supported, so no
-   spelling in winui.cb can dodge it. See "Phase 4 inputs" below.
+1. **RESOLVED - `IButton` and `IImage` have their natural names.** They shipped as
+   `IButtonElement` / `IImageElement` because a WinMD projection and a cflat interface
+   could not share a name (the WinMD type won the lookup and the cflat interface value -
+   a fat pointer - was GEP'd as a COM struct: INVALID IR, no diagnostic). WinMD types are
+   now registered ONLY under their fully-qualified name
+   (`Microsoft.UI.Xaml.Controls.IButton`), so the collision class no longer exists and
+   both interfaces were renamed back. `winui.cb` names WinMD types through prefixed
+   `using` aliases (`XamlButton`, `XamlImage`, ...); a core library must not claim bare
+   identifiers. See `doc/WINMD.md` "WinMD Types Are Always Fully Qualified".
 2. **9 of the 14 closure fields are NOT interface fields.** They are reached only to be
    INVOKED, so they got fire* wrapper methods on the class (mirroring the existing
    `fireClick`/`fireToggle`/`fireSet`): `TextInput.fireChangeText`, `TextArea.fireChange`,
@@ -285,18 +285,12 @@ had a cast).
    Owning-container interface fields (`list<string>`, `list<int>`, `list<IElement>`) are
    also true lvalues - `o.items.count()` and `o.items.add(...)` hit the object, not a
    copy (E2 clear).
-2. **A cflat interface name is unusable if ANY file in the import closure names a WinMD
-   type of the same name.** Today that is exactly `IButton` and `IImage` (both from
-   `winui.cb`). It is NOT a general WinUI-namespace clash: `IListView`, `ISlider`,
-   `IComboBox`, ... all exist in the WinUI winmd too but resolve to the cflat interface,
-   because winui.cb never names them as WinRT types. Phase 4 must not introduce a WinRT
-   reference whose short name matches a widget interface. Two follow-ups worth doing,
-   neither blocking:
-   - The compiler should ERROR on this collision instead of emitting invalid IR.
-   - `winui.cb:117` uses WinRT `IButton` only as an arbitrary IUnknown stand-in for the
-     slot-0 QI (its own comment says so). Switching it to `IButtonBase` (already imported
-     and used at `:437`) would free the `IButton` name; `IImage` at `:587-589` is a real
-     use and cannot be freed without qualified-name support.
+2. **RESOLVED - a cflat interface name can no longer be taken by a WinMD type.** WinMD
+   types are registered only under their fully-qualified WinRT name, so nothing in the
+   import closure can claim a bare identifier. Phase 4 is free to name any widget
+   interface. The one remaining way to collide is a `using` alias that deliberately
+   claims a name a cflat interface also uses - that is now a hard compiler error
+   (`Test/errors/err_winmd_alias_collides_with_interface.cb`), never a silent shadow.
 3. Pre-existing bug found while validating (does not block Phase 4, but do not build on
    it): calling a `Lambda<string(...)>` CLASS FIELD and binding the owned result to a
    local leaks the string. See `internal/issue/lambda-field-call-owned-string-result-leaks.md`.

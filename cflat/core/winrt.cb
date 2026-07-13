@@ -7,7 +7,11 @@
 // only `import "winrt.cb";` plus the .winmd of whatever specific API it calls - no `lib { ... }`
 // clause of its own.
 //
+// WinMD types are named by their FULLY-QUALIFIED WinRT name (that is what keeps them from
+// colliding with your own types). Alias one if you want the short spelling back:
+//
 //   import "winrt.cb";
+//   using IFooStatics = Windows.Foo.IFooStatics;
 //   winrtInit();
 //   IFooStatics* f = nullptr;
 //   activationFactory("Windows.Foo.Bar", iidof(IFooStatics), (void**)&f);
@@ -94,7 +98,7 @@ i32 activateInstance(string className, void* iid, void** out)
     freeHString(h);
     if (FAILED(hr) || inst == nullptr) return hr;
 
-    IAsyncInfo* unk = (IAsyncInfo*)inst;
+    Windows.Foundation.IAsyncInfo* unk = (Windows.Foundation.IAsyncInfo*)inst;
     hr = unk->QueryInterface(iid, out);
     unk->Release();
     return hr;
@@ -116,9 +120,9 @@ void winrtUninit() { RoUninitialize(); }
 //   if (awaitAsync(op) == 1) { ((IAsyncOperation<string>*)op)->lpVtbl->GetResults(op, &h); }
 i32 awaitAsync(void* asyncObj)
 {
-    IAsyncInfo* probe = (IAsyncInfo*)asyncObj;
-    IAsyncInfo* info = nullptr;
-    i32 qi = probe->QueryInterface(iidof(IAsyncInfo), (void**)&info);
+    Windows.Foundation.IAsyncInfo* probe = (Windows.Foundation.IAsyncInfo*)asyncObj;
+    Windows.Foundation.IAsyncInfo* info = nullptr;
+    i32 qi = probe->QueryInterface(iidof(Windows.Foundation.IAsyncInfo), (void**)&info);
     if (FAILED(qi) || info == nullptr) return -1;
 
     i32 status = 0;
@@ -142,9 +146,9 @@ i32 awaitAsync(void* asyncObj)
 //   if (awaitAsync(op) != 1) { printf("async failed: 0x%08X\n", asyncError(op)); return 1; }
 i32 asyncError(void* asyncObj)
 {
-    IAsyncInfo* probe = (IAsyncInfo*)asyncObj;
-    IAsyncInfo* info = nullptr;
-    i32 qi = probe->QueryInterface(iidof(IAsyncInfo), (void**)&info);
+    Windows.Foundation.IAsyncInfo* probe = (Windows.Foundation.IAsyncInfo*)asyncObj;
+    Windows.Foundation.IAsyncInfo* info = nullptr;
+    i32 qi = probe->QueryInterface(iidof(Windows.Foundation.IAsyncInfo), (void**)&info);
     if (FAILED(qi) || info == nullptr) return qi;
 
     i32 errCode = 0;

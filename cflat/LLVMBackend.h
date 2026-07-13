@@ -1003,6 +1003,9 @@ private:
     std::unordered_map<std::string, ProgramData> programTable;
     std::unordered_map<std::string, std::string> enumBackingTypes;
     std::unordered_map<std::string, std::string> typeAliases;
+    // `using IReference = Windows.Foundation.IReference;` - alias -> generic BASE name. Separate
+    // from typeAliases because a base is not a type until its <...> arguments are supplied.
+    std::unordered_map<std::string, std::string> genericBaseAliases_;
     // Closure type aliases (`using Cb = function<R(Args)>;`). Cannot live in string-shaped
     // typeAliases because a closure type carries a full call signature, not a plain type name.
     std::unordered_map<std::string, TypeAndValue> functionTypeAliases;
@@ -1067,9 +1070,9 @@ private:
     // value structs (so a struct-typed field/param can pass by value when we have registered it).
     std::unordered_map<std::string, std::string> winrtEnumUnderlying_;
     std::unordered_set<std::string> winrtValueStructs_;
-    // Parameterized (generic) interface templates from imported .winmd, keyed by simple name
-    // (IVector, IMap, IReference, ...). Kept so `IVector<int>` can be instantiated on demand into a
-    // concrete COM vtable + thin pointer + derived PIID. See InstantiateWinrtGenericInterface.
+    // Parameterized (generic) interface templates from imported .winmd, keyed by WinRT FULL name
+    // (Windows.Foundation.Collections.IVector, ...). Kept so a qualified `IVector<int>` can be
+    // instantiated on demand into a concrete COM vtable + thin pointer + derived PIID.
     std::unordered_map<std::string, cflat_winmd::Interface> winrtGenericTemplates_;
     // Derived per-instantiation IID (PIID) keyed by mangled name (e.g. "IVector__int"), used for
     // QueryInterface identity and the `iidof(...)` builtin.
@@ -6705,9 +6708,29 @@ public:
         pendingOwnedStructTemps  = state.pendingStructTemps;
     }
 
+    // True if `name` is a type projected from an imported .winmd (always fully qualified) or a
+    // concrete instantiation of one.
+    bool IsWinrtProjectedType(const std::string& name) const
+    {
+        return winrtThinInterfaces_.count(name) != 0 || winrtValueStructs_.count(name) != 0
+            || IsWinrtFullName(name);
+    }
+
     void CreateInterfaceDefinition(const std::string& name, const std::vector<std::string>& parentNames,
                                    std::vector<InterfaceMethod> methods, std::vector<TypeAndValue> fields = {})
     {
+        // A CFlat interface value is a fat pointer; a WinMD interface is a COM struct with an
+        // lpVtbl. If a name meant both, the use site would GEP the fat pointer as a COM struct and
+        // emit invalid IR. WinMD types are registered fully qualified so they can never take a bare
+        // name - the only way back into that state is a `using` alias claiming this one. Reject it.
+        if (auto it = typeAliases.find(name); it != typeAliases.end() && IsWinrtProjectedType(it->second))
+        {
+            LogError(std::format(
+                "interface '{}' collides with the WinMD alias 'using {} = {};' - rename one of them "
+                "(a WinMD type and a CFlat interface cannot share a name)", name, name, it->second));
+            return;
+        }
+
         // Prepend inherited methods and fields from parent interfaces (in order)
         std::vector<InterfaceMethod> inherited;
         std::vector<TypeAndValue> inheritedFields;
@@ -6775,6 +6798,43 @@ public:
     {
         auto it = typeAliases.find(name);
         return (it != typeAliases.end()) ? it->second : name;
+    }
+
+    // A `using` alias that names a GENERIC BASE rather than a concrete type - e.g.
+    // `using IReference = Windows.Foundation.IReference;`, which then lets a body write the
+    // familiar `IReference<int>`. Kept out of typeAliases: a base is not a usable type on its
+    // own, and ResolveTypeAlias is consulted in places where expanding one would be wrong.
+    void RegisterGenericBaseAlias(const std::string& alias, const std::string& target)
+    {
+        genericBaseAliases_[alias] = target;
+    }
+
+    bool IsGenericBaseAlias(const std::string& name) const
+    {
+        return genericBaseAliases_.count(name) != 0;
+    }
+
+    std::string ResolveGenericBaseAlias(const std::string& base) const
+    {
+        auto it = genericBaseAliases_.find(base);
+        return (it != genericBaseAliases_.end()) ? it->second : base;
+    }
+
+    // True if `fullName` is a parameterized interface template from an imported .winmd.
+    bool IsWinrtGenericTemplate(const std::string& fullName) const
+    {
+        return winrtGenericTemplates_.count(fullName) != 0;
+    }
+
+    // True if `fullName` is a PARAMETERIZED imported type - an interface template or a generic
+    // delegate (AsyncOperationCompletedHandler`1). Both only become a type once <...> is supplied,
+    // so both are aliasable as a generic BASE.
+    bool IsWinrtGenericBase(const std::string& fullName) const
+    {
+        if (IsWinrtGenericTemplate(fullName)) return true;
+        for (const auto& d : winrtConsumedModel_.delegates)
+            if (d.fullName == fullName) return !d.genericParams.empty();
+        return false;
     }
 
     // The "uuid" type annotation for `name`, following the typedef-alias chain (ID3DBlob ->
@@ -7441,8 +7501,8 @@ public:
         return true;
     }
 
-    // Resolve `name` (a mangled generic instance like "IReference__int", a [uuid] interface, or an
-    // imported non-generic interface simple name) to a static 16-byte GUID/PIID global for the
+    // Resolve `name` (a mangled generic instance like "Windows.Foundation.IReference__i32", a
+    // [uuid] interface, or an imported non-generic interface FULL name) to a 16-byte GUID/PIID for
     // `iidof(...)` builtin. Returns nullptr if no IID is known. The result is a REFIID-shaped
     // pointer suitable for QueryInterface.
     llvm::GlobalVariable* EmitIidGlobalFor(const std::string& name)
@@ -7455,7 +7515,7 @@ public:
         if (std::string u = FindUuidAnnotationResolving(name); !u.empty() && ParseUuidToBytes(u, bytes))
             return EmitGuidGlobal(bytes);
         for (const auto& i : winrtConsumedModel_.interfaces)
-            if (WinrtSimpleName(i.fullName) == name && !i.iid.empty() && ParseUuidToBytes(i.iid, bytes))
+            if (i.fullName == name && !i.iid.empty() && ParseUuidToBytes(i.iid, bytes))
                 return EmitGuidGlobal(bytes);
         return nullptr;
     }
@@ -7899,6 +7959,11 @@ public:
     // exactly like the hand-written example/COM demos.
     // ========================================================================================
 
+    // The only WinRT type names the COMPILER itself spells (foreach lowers to this protocol).
+    // Everything else is named by source, fully qualified.
+    static constexpr const char* kWinrtIIterable = "Windows.Foundation.Collections.IIterable";
+    static constexpr const char* kWinrtIIterator = "Windows.Foundation.Collections.IIterator";
+
     // Last dotted segment of a WinRT full name ("Windows.Foundation.IFoo" -> "IFoo").
     static std::string WinrtSimpleName(const std::string& fullName)
     {
@@ -7934,10 +7999,9 @@ public:
         {
             outName = e->second; outPtr = false; return;
         }
-        std::string simple = WinrtSimpleName(t.fullName);
-        if (winrtValueStructs_.count(t.fullName) && dataStructures.count(simple))
+        if (winrtValueStructs_.count(t.fullName) && dataStructures.count(t.fullName))
         {
-            outName = simple; outPtr = false; return;
+            outName = t.fullName; outPtr = false; return;
         }
         outName = "void"; outPtr = true;   // interface / class / forward -> opaque thin pointer
     }
@@ -8146,30 +8210,35 @@ public:
         std::string w = cflat_winmd::CFlatToWinrtFundamental(n);
         if (!w.empty()) { out.fullName = w; return true; }
 
-        // Named imported winmd type (interface / struct / enum / delegate / runtime class).
-        std::string full = WinrtFullNameForSimple(cflatName);
-        if (!full.empty()) { out.fullName = full; return true; }
+        // Named imported winmd type (interface / struct / enum / delegate / runtime class). WinMD
+        // types are registered under their fully-qualified name, so this is an exact match - after
+        // expanding a `using` alias, which is how a type ARGUMENT names one (the mangled
+        // instantiation name keeps the alias spelling; only the WinRT signature needs the real one).
+        std::string resolved = ResolveTypeAlias(cflatName);
+        if (IsWinrtFullName(resolved)) { out.fullName = resolved; return true; }
 
         err = "cannot map type argument '" + cflatName + "' to a WinRT type (use an explicit-width "
-              "scalar like i32/u32/f32/f64/bool/string/object or an imported winmd type)";
+              "scalar like i32/u32/f32/f64/bool/string/object, or the FULLY-QUALIFIED name of an "
+              "imported winmd type such as Windows.Foundation.IStringable)";
         return false;
     }
 
-    // Find the full WinRT name of an imported type given its simple (last-segment) name.
-    std::string WinrtFullNameForSimple(const std::string& simple)
+    // True if `fullName` names an imported winmd type (any kind).
+    bool IsWinrtFullName(const std::string& fullName) const
     {
-        for (const auto& i : winrtConsumedModel_.interfaces)   if (WinrtSimpleName(i.fullName) == simple) return i.fullName;
-        for (const auto& s : winrtConsumedModel_.structs)      if (WinrtSimpleName(s.fullName) == simple) return s.fullName;
-        for (const auto& e : winrtConsumedModel_.enums)        if (WinrtSimpleName(e.fullName) == simple) return e.fullName;
-        for (const auto& d : winrtConsumedModel_.delegates)    if (WinrtSimpleName(d.fullName) == simple) return d.fullName;
-        for (const auto& rc : winrtConsumedModel_.runtimeClasses) if (WinrtSimpleName(rc.fullName) == simple) return rc.fullName;
-        return "";
+        for (const auto& i : winrtConsumedModel_.interfaces)   if (i.fullName == fullName) return true;
+        for (const auto& s : winrtConsumedModel_.structs)      if (s.fullName == fullName) return true;
+        for (const auto& e : winrtConsumedModel_.enums)        if (e.fullName == fullName) return true;
+        for (const auto& d : winrtConsumedModel_.delegates)    if (d.fullName == fullName) return true;
+        for (const auto& rc : winrtConsumedModel_.runtimeClasses) if (rc.fullName == fullName) return true;
+        return false;
     }
 
-    // Instantiate an imported generic WinRT interface (`base` = simple name like "IVector",
-    // `cflatArgs` = the concrete CFlat type arguments, `mangledName` = "IVector__int") into a
-    // concrete COM vtable + thin pointer struct and a derived PIID. Returns false if `base` is not
-    // a registered winmd generic template (so the caller can fall through to other resolution).
+    // Instantiate an imported generic WinRT interface (`base` = the FULL name, e.g.
+    // "Windows.Foundation.Collections.IVector", `cflatArgs` = the concrete CFlat type arguments,
+    // `mangledName` = base + "__" + args) into a concrete COM vtable + thin pointer struct and a
+    // derived PIID. Returns false if `base` is not a registered winmd generic template (so the
+    // caller can fall through to other resolution).
     bool InstantiateWinrtGenericInterface(const std::string& base,
         const std::vector<std::string>& cflatArgs, const std::string& mangledName)
     {
@@ -8226,11 +8295,11 @@ public:
         return true;
     }
 
-    // Find an imported WinRT delegate template by its simple (last-segment) name.
-    const cflat_winmd::Delegate* FindWinrtDelegate(const std::string& simple) const
+    // Find an imported WinRT delegate template by its fully-qualified name.
+    const cflat_winmd::Delegate* FindWinrtDelegate(const std::string& fullName) const
     {
         for (const auto& d : winrtConsumedModel_.delegates)
-            if (WinrtSimpleName(d.fullName) == simple) return &d;
+            if (d.fullName == fullName) return &d;
         return nullptr;
     }
 
@@ -8503,6 +8572,11 @@ public:
     // Register every projectable type in `model` as CFlat types: value structs, enums (named
     // constants + underlying), and interfaces (COM vtable struct + thin pointer struct). Runtime
     // classes, delegates, generics, and HSTRING/string ergonomics are deferred (counted + noted).
+    //
+    // TYPES are registered ONLY under their fully-qualified WinRT name (a `.winmd`'s IButton is
+    // "Microsoft.UI.Xaml.Controls.IButton", never a bare "IButton"), so a projection can never
+    // displace a CFlat interface/struct of the same short name. Source spells them qualified, or
+    // aliases them (`using IButton = Microsoft.UI.Xaml.Controls.IButton;`).
     void RegisterWinrtModel(const cflat_winmd::Model& model, const std::string& fileForLsp)
     {
         using namespace cflat_winmd;
@@ -8517,7 +8591,10 @@ public:
         for (const auto& rc : model.runtimeClasses) winrtConsumedModel_.runtimeClasses.push_back(rc);
 
         // Pass A: enums. Record the underlying scalar (for type mapping) and expose members as
-        // named constants "<Simple>_<Member>" (unambiguous across namespaces, first-writer-wins).
+        // named constants "<Simple>_<Member>" (first-writer-wins). Deliberately NOT qualified: a
+        // member is a VALUE (a global constant, never a type), so it cannot displace a type and
+        // cannot reach the bad-IR class that qualification exists to kill; and a dotted name in
+        // expression position is member access, so "Ns.Enum_Member" would not even be spellable.
         for (const Enum& e : model.enums)
         {
             std::string under = WinrtFundamentalToCFlat(e.underlying);
@@ -8539,27 +8616,16 @@ public:
             }
         }
 
-        // Pass B: value structs. Shells first so a field can reference a peer struct by value.
-        // First-writer-wins: a struct simple name already defined (user code, a core library,
-        // or an earlier import) is NOT clobbered by a winmd value struct of the same name (e.g.
-        // a program's own `struct Rect` vs Windows.Foundation.Rect). The winmd type stays
-        // unprojected - by design, since the program clearly wants its own type of that name.
-        std::set<std::string> skipStructSimple;
+        // Pass B: value structs, under their full name. Shells first so a field can reference a
+        // peer struct by value. Nothing to skip - a fully-qualified name cannot collide with a
+        // program's own `struct Rect`, so both types coexist.
         for (const Struct& st : model.structs)
         {
-            std::string simple = WinrtSimpleName(st.fullName);
-            if (dataStructures.count(simple) && !winrtValueStructs_.count(st.fullName))
-            {
-                skipStructSimple.insert(simple);
-                continue;
-            }
             winrtValueStructs_.insert(st.fullName);
-            if (!dataStructures.count(simple)) CreateStructType(simple, {});
+            if (!dataStructures.count(st.fullName)) CreateStructType(st.fullName, {});
         }
         for (const Struct& st : model.structs)
         {
-            std::string simple = WinrtSimpleName(st.fullName);
-            if (skipStructSimple.count(simple)) continue;
             std::vector<DeclTypeAndValue> fields;
             for (const Field& f : st.fields)
             {
@@ -8568,26 +8634,26 @@ public:
                 MapWinrtTypeForSlot(f.type, d.TypeName, d.Pointer);
                 fields.push_back(d);
             }
-            CreateStructType(simple, fields);   // fills the shell created above
+            CreateStructType(st.fullName, fields);   // fills the shell created above
             if (auto* s = GetSymbolSink())
-                s->Register(SymbolKind::Struct, simple, fileForLsp, 0, 0, "struct " + st.fullName);
+                s->Register(SymbolKind::Struct, st.fullName, fileForLsp, 0, 0, "struct " + st.fullName);
         }
 
         // Pass C: interfaces -> COM vtable struct (flat IInspectable layout) + thin pointer struct.
         // Generic interfaces (IVector<T>, IMap<K,V>, ...) cannot be lowered until their type args
-        // are known, so they are stashed as templates (keyed by simple name) and instantiated on
-        // demand by InstantiateWinrtGenericInterface when the user writes e.g. `IVector<int>`.
+        // are known, so they are stashed as templates (keyed by full name) and instantiated on
+        // demand by InstantiateWinrtGenericInterface.
         std::unordered_map<std::string, const cflat_winmd::Interface*> byName;
         for (const Interface& iface : model.interfaces) byName[iface.fullName] = &iface;
 
         size_t registered = 0, deferredGeneric = 0;
         for (const Interface& iface : model.interfaces)
         {
-            std::string simple = WinrtSimpleName(iface.fullName);
+            const std::string& regName = iface.fullName;
             if (!iface.genericParams.empty())
             {
                 deferredGeneric++;
-                if (!winrtGenericTemplates_.count(simple)) winrtGenericTemplates_[simple] = iface;
+                if (!winrtGenericTemplates_.count(regName)) winrtGenericTemplates_[regName] = iface;
                 continue;
             }
             // Classic-COM (IUnknown-rooted, not IInspectable) interfaces from Win32 metadata use the
@@ -8602,11 +8668,11 @@ public:
                 std::vector<cflat_winmd::Method> flat;
                 std::set<std::string> seen;
                 CollectComBaseMethods(iface, byName, seen, flat);
-                ok = BuildWinrtInterfaceStructs(simple, flat, "interface " + iface.fullName, fileForLsp, false);
+                ok = BuildWinrtInterfaceStructs(regName, flat, "interface " + iface.fullName, fileForLsp, false);
             }
             else
             {
-                ok = BuildWinrtInterfaceStructs(simple, iface.methods, "interface " + iface.fullName, fileForLsp);
+                ok = BuildWinrtInterfaceStructs(regName, iface.methods, "interface " + iface.fullName, fileForLsp);
             }
             if (ok) registered++;
         }
@@ -8649,10 +8715,10 @@ public:
 
         struct Case { const char* base; std::vector<std::string> args; const char* iid; };
         std::vector<Case> cases = {
-            { "IReference", { "i32" }, "548cefbd-bc8a-5fa0-8df2-957440fc8bf4" },
-            { "IVector",    { "i32" }, "b939af5b-b45d-5489-9149-61442c1905fe" },
-            { "IVectorView",{ "i32" }, "8d720cdf-3934-5d3f-9a55-40e8063b086a" },
-            { "IIterable",  { "i32" }, "81a643fb-f51c-5565-83c4-f96425777b66" },
+            { "Windows.Foundation.IReference",                  { "i32" }, "548cefbd-bc8a-5fa0-8df2-957440fc8bf4" },
+            { "Windows.Foundation.Collections.IVector",         { "i32" }, "b939af5b-b45d-5489-9149-61442c1905fe" },
+            { "Windows.Foundation.Collections.IVectorView",     { "i32" }, "8d720cdf-3934-5d3f-9a55-40e8063b086a" },
+            { "Windows.Foundation.Collections.IIterable",       { "i32" }, "81a643fb-f51c-5565-83c4-f96425777b66" },
         };
 
         bool allOk = true;

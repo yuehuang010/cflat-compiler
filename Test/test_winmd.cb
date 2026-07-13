@@ -22,6 +22,19 @@ import "test_helper.cb";
 import "guid.cb";
 import "function.cb";   // capturing-closure delegate handler (clone/free env primitives)
 
+// WinMD types are registered under their FULLY-QUALIFIED WinRT name, so a projection can never
+// displace a type of your own. Alias the ones you use to keep the call sites short.
+using IPropertyValueStatics = Windows.Foundation.IPropertyValueStatics;
+using IAsyncAction          = Windows.Foundation.IAsyncAction;
+using IAsyncInfo            = Windows.Foundation.IAsyncInfo;
+using IReference            = Windows.Foundation.IReference;      // generic base: IReference<int>
+using IAsyncOperation       = Windows.Foundation.IAsyncOperation; // generic base: IAsyncOperation<string>
+using IJsonArrayStatics     = Windows.Data.Json.IJsonArrayStatics;
+using IJsonArray            = Windows.Data.Json.IJsonArray;
+using IJsonValue            = Windows.Data.Json.IJsonValue;
+using IPathIOStatics        = Windows.Storage.IPathIOStatics;
+using AsyncOperationCompletedHandler = Windows.Foundation.AsyncOperationCompletedHandler;  // generic delegate base
+
 // A thin COM vtable shape mirroring a WinRT delegate ({QI, AddRef, Release, Invoke}) so a
 // projected delegate object can be driven SYNCHRONOUSLY in-process - no OS callback thread - to
 // assert refcount + capture + Invoke marshaling deterministically. (The OS-driven path is proven
@@ -539,6 +552,42 @@ bool testDelegateAsyncCompleted()
     return result;
 }
 
+// === Name coexistence: a CFlat interface and a WinMD type may share a short name ===
+//
+// WinMD types are registered ONLY under their fully-qualified name, so a CFlat `interface
+// IStringable` and Windows.Foundation.IStringable are different types and both are usable in the
+// same program. Before qualification the WinMD projection silently won the lookup and a boxed
+// CFlat interface value (a fat pointer) was GEP'd as a COM struct -> INVALID IR, no diagnostic.
+// This regression proves both halves still resolve to what their spelling says.
+interface IStringable          // deliberately the SAME short name as Windows.Foundation.IStringable
+{
+    string speak();
+};
+
+class Greeter : IStringable
+{
+    string speak() { return "hi"; }
+};
+
+bool testCflatInterfaceNameCoexistsWithWinmd()
+{
+    bool result = true;
+
+    // The CFlat interface: boxing a class into it must still produce a working fat pointer.
+    Greeter g = Greeter();
+    IStringable s = g;
+    result &= Test("winmd_cflat_iface_same_name_works", (s.speak() == "hi") ? 1 : 0, 1);
+
+    // The WinMD type of the same short name, reached by its qualified spelling - a real, distinct
+    // type with its own IID (proving it is registered, just not under the bare name).
+    Guid* pIid = (Guid*)iidof(Windows.Foundation.IStringable);
+    Guid iid = *pIid;
+    Guid expected = Guid.parse("96369f54-8eb6-48f0-abce-c1b211e627c3");
+    result &= Test("winmd_qualified_same_name_distinct", (iid == expected) ? 1 : 0, 1);
+
+    return result;
+}
+
 extern int main()
 {
     winrtInit();   // RO_INIT_MULTITHREADED
@@ -557,6 +606,7 @@ extern int main()
     total++; passed += testDelegateSyncInvoke()          ? 1 : 0;
     total++; passed += testDelegateStringCapture()       ? 1 : 0;
     total++; passed += testDelegateAsyncCompleted()      ? 1 : 0;
+    total++; passed += testCflatInterfaceNameCoexistsWithWinmd() ? 1 : 0;
 
     winrtUninit();
 

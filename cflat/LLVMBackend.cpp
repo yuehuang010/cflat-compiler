@@ -1369,6 +1369,16 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         // import is their home. Resolve each onto the link line, same as the .h branch below.
         if (ext == ".winmd")
         {
+            // `as Alias` is meaningless here and used to be dropped in silence: a .winmd carries
+            // many WinRT namespaces, so there is no single one to rename, and its types are already
+            // registered under their full WinRT name. Point at the mechanism that does work.
+            if (!namespaceName.empty())
+            {
+                LogError("import \"" + importFilename + "\" as " + namespaceName + ": a .winmd has no "
+                    "single namespace to alias (its types are registered under their full WinRT "
+                    "name). Use a type alias instead, e.g. `using IFoo = Windows.Foo.IFoo;`");
+                return false;
+            }
             for (const auto& explicitLib : explicitLibs)
             {
                 if (explicitLib.empty()) continue;
@@ -2316,6 +2326,7 @@ void LLVMBackend::ResetForReanalysis()
     programTable.clear();
     enumBackingTypes.clear();
     typeAliases.clear();
+    genericBaseAliases_.clear();
     functionTypeAliases.clear();
     interfaceTable.clear();
     interfaceFields.clear();
