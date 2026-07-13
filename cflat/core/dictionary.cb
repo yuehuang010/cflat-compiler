@@ -16,6 +16,7 @@ struct dictionary<K, V>
     char* _status   = nullptr;   // 0 = empty, 1 = occupied, 2 = deleted
     int   _count    = 0;
     int   _capacity = 0;
+    int   _tombstones = 0;       // number of deleted (status==2) slots
     V     _missing  = default;   // value returned by get() on a miss
 
     // Hash key to a starting bucket index in [0, _capacity).
@@ -47,8 +48,22 @@ struct dictionary<K, V>
         _capacity = cap;
     }
 
-    // Grow to double capacity and reinsert all live entries.
-    void _rehash()
+    // Rehash when occupied+tombstone slots exceed 3/4 of capacity. Grow only when the
+    // live-entry count is itself dense; otherwise rehash in place to purge tombstones.
+    // Without counting tombstones toward the load factor, insert/remove churn fills the
+    // table with tombstones, leaves zero empty slots, and the probe loops spin forever.
+    void _maybeRehash()
+    {
+        if ((_count + _tombstones) * 4 >= _capacity * 3)
+        {
+            int newCap = _capacity;
+            if (_count * 4 >= _capacity * 3) newCap = _capacity * 2;
+            _rehash(newCap);
+        }
+    }
+
+    // Rebuild the table at `newCap`, reinserting live entries and dropping tombstones.
+    void _rehash(int newCap)
     {
         K*    oldKeys   = _keys;
         V*    oldValues = _values;
@@ -56,7 +71,8 @@ struct dictionary<K, V>
         int   oldCap    = _capacity;
 
         _count = 0;
-        _init(_capacity * 2);
+        _tombstones = 0;
+        _init(newCap);
 
         int i = 0;
         while (i < oldCap)
@@ -85,7 +101,7 @@ struct dictionary<K, V>
     bool add(K key, move V value)
     {
         if (_capacity == 0) _init(8);
-        if (_count * 4 >= _capacity * 3) _rehash();
+        _maybeRehash();
 
         int slot = _slot(key);
         int firstDeleted = -1;
@@ -96,7 +112,7 @@ struct dictionary<K, V>
             slot = (slot + 1) % _capacity;
         }
         int insertSlot = slot;
-        if (firstDeleted != -1) insertSlot = firstDeleted;
+        if (firstDeleted != -1) { insertSlot = firstDeleted; _tombstones--; }
         // Store the key. A `string` key is deep-copied so the slot owns an independent buffer:
         // a plain store would alias the caller's `key` argument (a soon-freed temp/local),
         // leaving the stored key dangling once that buffer is freed. The destructor/remove()/
@@ -116,7 +132,7 @@ struct dictionary<K, V>
     void set(K key, move V value)
     {
         if (_capacity == 0) _init(8);
-        if (_count * 4 >= _capacity * 3) _rehash();
+        _maybeRehash();
 
         int slot = _slot(key);
         int firstDeleted = -1;
@@ -143,7 +159,7 @@ struct dictionary<K, V>
         else
         {
             updateSlot = slot;
-            if (firstDeleted != -1) updateSlot = firstDeleted;
+            if (firstDeleted != -1) { updateSlot = firstDeleted; _tombstones--; }
             // Deep-copy a string key into the slot; store all other key types as-is.
             // See add() for the rationale (avoid aliasing the soon-freed caller argument).
             if const (is_string(K))  _keys[updateSlot] = key.copy();
@@ -199,6 +215,7 @@ struct dictionary<K, V>
                     _keys[slot].~();
                 _status[slot] = 2;
                 _count--;
+                _tombstones++;
                 return true;
             }
             slot = (slot + 1) % _capacity;
@@ -233,6 +250,7 @@ struct dictionary<K, V>
         i = 0;
         while (i < _capacity) { _status[i] = 0; i++; }
         _count = 0;
+        _tombstones = 0;
     }
 
     // d[key] - same semantics as get(key): returns default(V) on miss.
@@ -265,6 +283,7 @@ struct dictionary<K, V>
             i++;
         }
         result._count = _count;
+        result._tombstones = _tombstones;
         return move result;
     }
 

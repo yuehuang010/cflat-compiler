@@ -84,9 +84,11 @@ case "$(uname -m)" in
 esac
 
 # Windows-only negative tests: they assert messages tied to Windows headers
-# (windows.h / tlhelp32.h C-interop) or the Windows core externs (os.windows.fwrite),
-# which don't exist on Linux.
-ERR_SKIP="err_orphan_header err_c_struct_incomplete_by_value err_extern_collides_with_core"
+# (windows.h / tlhelp32.h C-interop), the Windows core externs (os.windows.fwrite), or
+# WinMD/WinRT metadata, none of which exist on Linux/macOS. A WinMD import is rejected
+# outright off-Windows, so the expected error never gets a chance to fire.
+ERR_SKIP="err_orphan_header err_c_struct_incomplete_by_value err_extern_collides_with_core \
+  err_winmd_alias_collides_with_interface"
 
 is_skipped() {
   for s in $SKIP; do [ "$1" = "$s" ] && return 0; done

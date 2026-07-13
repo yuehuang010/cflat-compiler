@@ -1551,6 +1551,17 @@ Rect nativeNodeBounds(string keyPath)
     return e.nodeBounds();
 }
 
+// The committed View container's backgroundColor (its host backdrop fill), or 0. Reads
+// the reconciled tree, so it verifies a theme flip actually re-colored the card.
+int nativeContainerBg(string keyPath)
+{
+    IElement e = winuiElem(keyPath);
+    if (e == nullptr) return 0;
+    IView v = e as IView;
+    if (v != nullptr) return v.style.backgroundColor;
+    return 0;
+}
+
 // -- Progress / slider / image / statusbar / accent ----------------------------
 int nativeProgressValue(string keyPath)
 {

@@ -1,0 +1,36 @@
+// map.cb - the Win32/Cocoa launcher for the map-canvas example (M4).
+//
+// The host-neutral MapApp Component + MapView control + mapSelfTest() live in
+// map_app.cb (the 05-gallery split); this file wires them to the ui_native/host.cb
+// shim (Win32 on Windows, Cocoa on macOS) and owns main().
+//
+// Build & run (live window - pan with drag, zoom with wheel/pinch or the +/- HUD):
+//   x64/Release/cflat.exe example/ui/09-map/map.cb -i example/ui -o out/map.exe
+//   out\map.exe
+// Headless self-test (no visible window):
+//   out\map.exe --selftest
+//
+// Note: live canvas input (drag/wheel/pinch) is Cocoa-only for now - the Win32
+// host's canvas-input drivers are a recorded parity gap
+// (internal/issue/ui-native-canvas-input-images-win32-winui.md). The self-test is
+// host-neutral: it drives MapView's public input methods directly and paints
+// through a counting Canvas fake, so it passes on both hosts.
+import "ui_native/host.cb";
+import "map_app.cb";
+
+extern int main(int argc, char** argv)
+{
+    if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
+        return mapSelfTest();
+
+    // --probe [secs]: run the LIVE window unattended and exit 0 only if every visible
+    // tile resolved on screen (a real run-loop oracle for the grey-box class of bug).
+    if (argc > 1 && strcmp(argv[1], "--probe") == 0)
+    {
+        int secs = (argc > 2) ? atoi(argv[2]) : 3;
+        if (secs < 1) secs = 1;
+        return mapLiveProbe(secs);
+    }
+
+    return runAppGuiNative(new MapApp(), "CFlat UI - Map");
+}

@@ -53,6 +53,13 @@ void nativeListActivate(string keyPath, int row);
 void nativeTabSelect(string keyPath, int idx);
 void nativeSliderSet(string keyPath, int v);
 void nativeSplitterDrag(string keyPath, int dipX, int dipY);
+// CanvasView input drivers (M1). Coordinates/deltas are POINTS relative to the canvas
+// origin. phase: 0 down, 1 move, 2 up. Defined by the native backend (cocoa); a no-op on
+// the Win32 hosts for now (canvas-input parity gap). The TUI/Canvas host defines its own
+// copies (see ui_canvas/term.cb) since it does not link ui_test.cb.
+void nativeCanvasPointer(string keyPath, int phase, double x, double y);
+void nativeCanvasWheel(string keyPath, double x, double y, double dx, double dy);
+void nativeCanvasPinch(string keyPath, double x, double y, double scale);
 void nativeFireContextMenu(string keyPath, int itemIndex);
 void nativeTestFireMenu(int cmd);
 void nativeResizeClient(int wDip, int hDip);

@@ -227,6 +227,38 @@ if "%~1"=="--worker-gallery" (
 )
 
 REM ===========================================================================
+REM Worker mode: map-canvas self-test (example/ui/09-map/map.cb - M4 MapView +
+REM tile engine). Host-neutral suite: it drives MapView's input methods and a
+REM counting Canvas fake directly, so it passes on the Win32 host even though
+REM live canvas input is a recorded Cocoa-only feature (parity gap issue file).
+REM ===========================================================================
+if "%~1"=="--worker-map" (
+    set "RESID=%~2"
+    set "CFLAT=x64\%CONFIG%\cflat.exe"
+    set "OUTDIR=out\examples"
+    set "RESDIR=out\examples\results"
+    set "MAP_STEXE=!OUTDIR!\map_st.exe"
+    set "MAP_STLOG=!RESDIR!\!RESID!.log"
+
+    "!CFLAT!" "example\ui\09-map\map.cb" -i example/ui --heap-audit -o "!MAP_STEXE!" > "!MAP_STLOG!" 2>&1
+    if not exist "!MAP_STEXE!" (
+        echo FAIL map.cb ^(map self-test build failed^)>"!RESDIR!\!RESID!.result"
+        exit /b
+    )
+    "!MAP_STEXE!" --selftest <nul >> "!MAP_STLOG!" 2>&1
+    set MAPRC=!errorlevel!
+    findstr /C:"heap-audit: LEAK" "!MAP_STLOG!" >nul 2>&1
+    if !errorlevel! equ 0 (
+        echo FAIL map.cb ^(heap-audit leak^)>"!RESDIR!\!RESID!.result"
+    ) else if !MAPRC! neq 0 (
+        echo FAIL map.cb ^(map self-test, exit !MAPRC!^)>"!RESDIR!\!RESID!.result"
+    ) else (
+        echo PASS map.cb ^(map self-test + leak-clean^)>"!RESDIR!\!RESID!.result"
+    )
+    exit /b
+)
+
+REM ===========================================================================
 REM Worker mode: ui_test.cb template self-test (example/ui/07-testing/todo_test.cb).
 REM The customer-facing "copy-me" test target - the todo app driven through the
 REM UiTest framework. Same gate as the other UI self-tests: build with --heap-audit,
@@ -313,7 +345,8 @@ REM todo_test is the ui_test.cb template target - both driven by the dedicated -
 REM below (build with --heap-audit + run headless), so they are excluded from the plain sweep.
 REM fedit_jsx is fedit.cb authored in the <Tag/> sugar; both run the same state-assert
 REM self-test via --worker-fedit, so both are excluded from the plain sweep.
-set EXCLUDE=test_helper fedit fedit_jsx gallery gallery_app todo_app todo_test http_parser http_response http_json http_server http_client router rest_server http_io cocoa_probe cocoa_native_settings hello_objc cocoa_window sysinfo_mac framework_link winui_app_demo winui_demo winui_gallery
+REM map is driven by --worker-map; map_app/map_engine are its no-main library halves.
+set EXCLUDE=test_helper fedit fedit_jsx gallery gallery_app map map_app map_engine todo_app todo_test http_parser http_response http_json http_server http_client router rest_server http_io cocoa_probe cocoa_native_settings hello_objc cocoa_window sysinfo_mac framework_link winui_app_demo winui_demo winui_gallery
 
 REM Discover the newest cached Win32-metadata package dir (the one holding Windows.Win32.winmd).
 REM dir /o-n lists newest-version-first by name. Empty if the nuget package is not installed
@@ -397,6 +430,11 @@ REM Launch the widget-gallery state-assert self-test (P8 data controls).
 set /a RESID+=1
 set /a LAUNCHED+=1
 start "" /b cmd /c "%SCRIPT% --worker-gallery ex_!RESID!"
+
+REM Launch the map-canvas self-test (example/ui/09-map/map.cb).
+set /a RESID+=1
+set /a LAUNCHED+=1
+start "" /b cmd /c "%SCRIPT% --worker-map ex_!RESID!"
 
 REM Launch the ui_test.cb template self-test (example/ui/07-testing/todo_test.cb).
 set /a RESID+=1

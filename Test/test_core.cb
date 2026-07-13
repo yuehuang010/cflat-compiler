@@ -1002,6 +1002,109 @@ int testDictRehash()
     return passed;
 }
 
+// -- dictionary/hashset: insert-remove churn (tombstone saturation) -----------
+// Regression: tombstones were not counted toward the load factor, so a rehash never
+// fired during churn.  Deleted slots accumulated until zero empty slots were left and
+// the `while (_status[slot] != 0)` probe loops spun forever (map paint path hang).
+
+int testDictChurn()
+{
+    int passed = 0;
+
+    // Mimics the map's per-frame markVisible/cancelNotIn: pin 8 keys, drop them, shift.
+    dictionary<u64, bool> pinned;
+    u64 base = 0;
+    int round = 0;
+    while (round < 5000)
+    {
+        int i = 0;
+        while (i < 8) { pinned.set(base + (u64)i, true); i++; }
+        i = 0;
+        while (i < 8) { pinned.remove(base + (u64)i); i++; }
+        base = base + 4;
+        round++;
+    }
+    passed += Test ("d-churn completes",  round,          5000);
+    passed += Test ("d-churn empty",      pinned.count(), 0);
+
+    // The table must still be correct (and bounded) after all that churn.
+    pinned.set(42, true);
+    passed += Test("d-churn set after",   pinned.contains(42), true);
+    passed += Test("d-churn get after",   pinned.get(42),      true);
+    passed += Test("d-churn miss after",  pinned.contains(43), false);
+    passed += Test ("d-churn count after", pinned.count(),      1);
+
+    // Churn with a live working set that is repeatedly overwritten and re-keyed.
+    dictionary<int, int> d;
+    int r = 0;
+    while (r < 2000)
+    {
+        int i = 0;
+        while (i < 16) { d.set(r * 8 + i, r + i); i++; }
+        i = 0;
+        while (i < 16) { d.remove(r * 8 + i); i++; }
+        r++;
+    }
+    passed += Test ("d-churn2 empty", d.count(), 0);
+
+    // A retained set of keys must survive churn around it with values intact.
+    dictionary<int, int> keep;
+    int k = 0;
+    while (k < 10) { keep.set(k, k * 100); k++; }
+    r = 0;
+    while (r < 2000)
+    {
+        keep.set(1000 + r, r);
+        keep.remove(1000 + r);
+        r++;
+    }
+    passed += Test ("d-churn3 count",  keep.count(), 10);
+    passed += Test ("d-churn3 get 0",  keep.get(0),  0);
+    passed += Test ("d-churn3 get 7",  keep.get(7),  700);
+    passed += Test ("d-churn3 get 9",  keep.get(9),  900);
+    passed += Test("d-churn3 miss",   keep.contains(1500), false);
+
+    return passed;
+}
+
+int testHashsetChurn()
+{
+    int passed = 0;
+
+    hashset<i64> s;
+    i64 base = 0;
+    int round = 0;
+    while (round < 5000)
+    {
+        int i = 0;
+        while (i < 8) { s.add(base + (i64)i); i++; }
+        i = 0;
+        while (i < 8) { s.remove(base + (i64)i); i++; }
+        base = base + 4;
+        round++;
+    }
+    passed += Test ("hs-churn completes", round,     5000);
+    passed += Test ("hs-churn empty",     s.count(), 0);
+
+    // Retained elements survive surrounding churn.
+    hashset<int> keep;
+    int k = 0;
+    while (k < 10) { keep.add(k); k++; }
+    int r = 0;
+    while (r < 2000)
+    {
+        keep.add(1000 + r);
+        keep.remove(1000 + r);
+        r++;
+    }
+    passed += Test ("hs-churn keep count", keep.count(),        10);
+    passed += Test("hs-churn keep 0",     keep.contains(0),    true);
+    passed += Test("hs-churn keep 9",     keep.contains(9),    true);
+    passed += Test("hs-churn miss",       keep.contains(1500), false);
+
+    return passed;
+}
+
 // ── string / stringbuilder / string_view ─────────────────────────────────────
 
 struct StringRow { string name = default; };
@@ -1899,12 +2002,14 @@ extern int main()
     r = testHashsetI64();       passed += r; total += 12;
     r = testHashsetChar();      passed += r; total += 11;
     r = testHashsetRehash();    passed += r; total += 9;
+    r = testHashsetChurn();     passed += r; total += 6;
     r = testDictionary();       passed += r; total += 34;
     r = testDictNegative();     passed += r; total += 11;
     r = testDictTombstone();    passed += r; total += 7;
     r = testDictI64();          passed += r; total += 11;
     r = testDictChar();         passed += r; total += 11;
     r = testDictRehash();       passed += r; total += 9;
+    r = testDictChurn();        passed += r; total += 12;
     r = testPair();             passed += r; total += 8;
     r = testStack();            passed += r; total += 8;
     r = testQueue();            passed += r; total += 8;

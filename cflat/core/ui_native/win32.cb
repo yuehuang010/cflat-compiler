@@ -1685,7 +1685,26 @@ class NativeGdiCanvas : ICanvas
                           (r.x + r.w) * this.cellW, (r.y + r.h) * this.cellH);
     }
     void popClip() { RestoreDC(this.hdc, -1); }
+
+    // Canvas image blitting is not yet wired on the Win32 native host (parity gap - see
+    // internal/issue/ui-native-canvas-input-images-win32-winui.md). Documented no-op.
+    void drawImage(u64 img, double dx, double dy, double dw, double dh) { }
 };
+
+// Canvas image handles + input drivers: not yet wired on the Win32 native host (parity gap
+// - see internal/issue/ui-native-canvas-input-images-win32-winui.md). canvasCreateImage
+// returns a nonzero DUMMY so library code runs; the drivers are no-ops (no OS routing yet).
+u64 canvasCreateImage(u64 bgraPixels, int w, int h)
+{
+    if (bgraPixels == 0u || w <= 0 || h <= 0) return 0u;
+    return 1u;
+}
+
+void canvasReleaseImage(u64 img) { }
+
+void nativeCanvasPointer(string keyPath, int phase, double x, double y) { }
+void nativeCanvasWheel(string keyPath, double x, double y, double dx, double dy) { }
+void nativeCanvasPinch(string keyPath, double x, double y, double scale) { }
 
 bool _canvasClassReg = false;
 
@@ -2210,6 +2229,18 @@ Rect nativeNodeBounds(string keyPath)
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), keyPath);
     if (e == nullptr) { Rect z = default; return z; }
     return e.nodeBounds();
+}
+
+// The committed View container's backgroundColor (its host backdrop fill), or 0. Reads
+// the reconciled tree, so it verifies a theme flip actually re-colored the card.
+int nativeContainerBg(string keyPath)
+{
+    Window* wnd = curWin();
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), keyPath);
+    if (e == nullptr) return 0;
+    IView v = e as IView;
+    if (v != nullptr) return v.style.backgroundColor;
+    return 0;
 }
 
 // Tab driver: read/count the native tab strip; SETCURSEL does not notify, so it routes

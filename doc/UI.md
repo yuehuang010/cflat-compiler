@@ -270,7 +270,49 @@ fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
   custom widget). On a native host the view maps to a GDI-backed child window that invokes the
   boxed closure on `WM_PAINT`/`WM_PRINTCLIENT` (through the `CanvasBox` seam, an opaque `u64`
   like `ListRowBox`); on a ICanvas host, `paint()` delegates straight to `onPaint`. Build with
-  `canvasView(onPaint)` or `<CanvasView .../>` + `.onPaint = (ICanvas c) => {...}`.
+  `canvasView(onPaint)` or `<CanvasView .../>` + `.onPaint = (ICanvas c) => {...}`. (Prefer the
+  JSX form for a live native window: a raw `new CanvasView()` currently hits a pre-existing
+  onPaint box-clone crash on the Cocoa host; the framework factories/JSX are unaffected.)
+
+**Interactive CanvasView input (M1).** A `ICanvasView` may opt into pointer / wheel / pinch
+input. Handlers are installed via `setOn*` (never a bare field write - the installer also arms
+the presence flag the hosts gate on; an uninstalled handler is a safe no-op):
+
+- `setOnPointerDown/Move/Up(Lambda<void(double x, double y, int buttons)>)` - `buttons` is a
+  bitmask of pressed mouse buttons (bit 0 = left, bit 1 = right). Drag capture is automatic
+  (the pointer keeps reporting to the canvas that received the down).
+- `setOnWheel(Lambda<void(double x, double y, double dx, double dy, bool precise)>)` - `precise`
+  is true for a trackpad's continuous scroll (discrete mouse wheels report false).
+- `setOnPinch(Lambda<void(double x, double y, double scale)>)` - trackpad magnify; `scale` is a
+  per-event zoom factor around 1.0.
+
+All handler coordinates are **POINTS relative to the canvas origin** (top-left, y DOWN), NOT
+layout cells - this is the pixel-precise path for pan/zoom/drawing. Handlers are not serialized
+(`toJson`) or compared (`propsEqual`), so installing one never churns reconcile identity. **No-op
+guarantee:** a `ICanvasView` with no handlers installed behaves exactly as before - `toJson` and
+`propsEqual` are byte-identical, and the hosts invoke nothing. Host-neutral test drivers
+`nativeCanvasPointer(path, phase, x, y)` (phase 0 down / 1 move / 2 up), `nativeCanvasWheel(path,
+x, y, dx, dy)`, and `nativeCanvasPinch(path, x, y, scale)` synthesize a handler invocation for
+self-tests.
+
+**Canvas image handles (M2).** A canvas image is a paint-time bitmap (a tile / sprite), distinct
+from the `Image` element's `setImageData` control path. The host seam is `u64 canvasCreateImage(u64
+bgraPixels, int w, int h)` (COPIES the caller's top-down 32-bit BGRA buffer - the caller keeps
+ownership of its input; returns an opaque handle) and `void canvasReleaseImage(u64 img)`. Blit with
+`ICanvas.drawImage(u64 img, double dx, double dy, double dw, double dh)` in POINTS (linear
+scaling); the cell-based `drawText`/`drawRect` are unchanged. On Cocoa the bytes are wrapped once
+into a `CGImage`-backed `NSImage` and drawn upright into the flipped `CfCanvasView` context.
+
+**CanvasView input + image host support:**
+
+| Feature | Cocoa | Win32 / GDI canvas | WinUI | TUI (char grid) |
+|---------|-------|--------------------|-------|-----------------|
+| `onPointer*` / `onWheel` / `onPinch` | yes (live OS events) | no-op (parity gap) | no-op (parity gap) | drivers only (native-host-only live) |
+| `canvasCreateImage` / `Release` | real `NSImage` | nonzero DUMMY handle | nonzero DUMMY handle | nonzero DUMMY handle |
+| `ICanvas.drawImage` | real blit | no-op | no-op | no-op |
+
+The Win32/WinUI gaps are tracked in `internal/issue/ui-native-canvas-input-images-win32-winui.md`;
+the map example is native-host-first and SKIPs there until they close.
 
 **Accent buttons (v15).** A themed push button no longer stays light in dark mode. The Win32 host
 draws it via `NM_CUSTOMDRAW` (a documented API, per the look policy): a themed `Button`
@@ -416,6 +458,26 @@ as direct fields on the color-bearing leaves: `Text.color`, `Button.color` +
 `Button.backgroundColor`, `TextInput.color` + `TextInput.backgroundColor`. A
 backend without color (the TUI char grid) ignores them.
 
+### Text font variants
+
+`Text` carries an `int font` (default `FONT_UI`, `0`) that selects a font role a
+native host maps to a concrete typeface:
+
+```
+int FONT_UI      = 0;   // default UI font (byte-identical to pre-font behavior)
+int FONT_TITLE   = 2;   // bold, ~1.3x system size (headers / card titles)
+int FONT_CAPTION = 3;   // smaller, secondary label color (descriptions / captions)
+```
+
+`FONT_CAPTION` renders in the platform secondary label color UNLESS the `Text`
+sets an explicit `color` (an explicit color always wins). Only the **Cocoa** host
+honors `font` today (via `NSFont systemFontOfSize:weight:`, cached; secondary color
+via `NSColor secondaryLabelColor`); the canvas/TUI hosts draw a single fixed cell
+font, so `font` is a no-op there (cell rendering is unchanged). Win32/WinUI fall
+back to the default control font (see the parity issue file). A default-font `Text`
+(font `0`) serializes byte-identically - `toJson` elides the `font` field unless it
+is non-default - so existing trees are unaffected.
+
 ### Theme (styling preference)
 
 Rather than color every node by hand, set a `Theme` once on the context and widgets
@@ -453,6 +515,16 @@ theme renders exactly as the pre-color framework did - this is what keeps the GD
 self-test and the TUI hosts byte-identical. `Box`/`Text`/`Button`/`TextInput`
 resolve each color as `pickColor(nodeColor, themeSlot)`; `View`/`ScrollView` fill
 only when given an explicit `style.backgroundColor`.
+
+On the **Cocoa** host a plain `View` container (from `view`/`row`/`column`) with a
+non-zero `style.backgroundColor` is painted as a rounded (8pt) layer-backed backdrop
+panel behind its children, with an optional 1px border from `theme.panelBorder` -
+this is what makes themed "cards" read as filled panels. The panel is a painted
+backdrop (a native handle keyed by the container's path), not a layout parent:
+children still position at their absolute frames, and inside a `ScrollView` the
+backdrop lives in the document view so it scrolls with its card. `Box` maps to a
+native `NSBox` and is unaffected. Win32/WinUI do not paint container backgrounds yet
+(see `internal/issue/ui-native-visual-polish-win32-winui.md`).
 
 ## Layout protocol (one pass, pluggable strategy)
 
@@ -499,11 +571,20 @@ Key contract: the parent passes each flex child's share as its `availW`
 (row) / `availH` (column) and **advances its own cursor by the share**,
 regardless of the `Size` the child actually returns - this is what keeps
 sibling columns aligned even when a leaf paints narrower than its cell. A flex
-`View` child fills its own `availW` already (every `View` reports `w = availW`
-in both directions), so nested row containers stretch naturally; a `View`'s
-own height, however, is always content-driven (sum of its children), so a
-column-flex `View`'s reported height need not equal its share - only the
-cursor position (and thus sibling placement) reflects the distribution.
+`View` child fills its own effective width already (a `View` reports
+`w = availW` when it sets no `style.width`, and `w = style.width` when it does),
+so nested row containers stretch naturally; a `View`'s own height, however, is
+always content-driven (sum of its children), so a column-flex `View`'s reported
+height need not equal its share - only the cursor position (and thus sibling
+placement) reflects the distribution.
+
+A plain (non-flex) `View` honors its own `style.width`: when set, it lays its
+children within `style.width - 2*padding` and reports `sz.w = style.width`
+(capping a card to a fixed column count); when `style.width` is 0 it fills the
+`availW` its parent hands down, exactly as before. Height is unaffected either
+way (still the sum of children). This mirrors the flex/width interaction above:
+an explicit width wins over flex, and a child that sets both keeps treating
+width as fixed.
 
 If a flex child also sets an explicit `style.width` (row) / `style.height`
 (column), the explicit size wins and the child is treated as fixed (its flex
@@ -680,8 +761,14 @@ interface ICanvas
     void clear();
     void drawText(int col, int row, const char* s, int color);  // color via rgb(), 0 = default
     void drawRect(Rect r, bool filled, int color);              // filled=false: border; true: fill
+    void drawImage(u64 img, double dx, double dy, double dw, double dh);  // POINTS; canvas image handle
+    void pushClip(Rect r);
+    void popClip();
 };
 ```
+
+`drawText`/`drawRect` are in CELLS; `drawImage` is in POINTS (see the canvas image handles above).
+The native hosts blit; the TUI char grid draws a documented no-op.
 
 - **TUI:** `SurfaceCanvas` adapts a headless `Surface` char grid; `canvasFor(&surface)`
   binds one for a paint call. The grid has no color, so it ignores the `color` arg.
@@ -817,7 +904,7 @@ interface INativeHost
     void setBoolProp(u64 h, int prop, bool v);      // PROP_CHECKED/ENABLED/VISIBLE
     void setIntProp(u64 h, int prop, int v);        // PROP_VALUE/MAX/CARET/SCROLLY
     void setAccent(u64 h, int fgColor, int bgColor);// 0 = native default
-    Size measureText(const char* s, int fontId, int wrapWidthDip);  // FONT_UI/FONT_MONO
+    Size measureText(const char* s, int fontId, int wrapWidthDip);  // FONT_UI/MONO/TITLE/CAPTION
     void requestLayout();
     void setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload); // v13: LISTOP_* item-data batch
     // (v14 reuses setListOp for the tab + tree ops: LISTOP_TAB_* / LISTOP_TREE_*)
@@ -960,7 +1047,9 @@ path are validated, while binding a live virtualized item source is a documented
 | IElement      | Win32                     | Cocoa (compile-checked)   | WinUI 3                              |
 |--------------|---------------------------|---------------------------|-------------------------------------|
 | Button       | Y BUTTON                  | Y NSButton                | Y Button                            |
-| Text         | Y STATIC                  | Y NSTextField             | Y TextBlock                         |
+| Text         | Y STATIC                  | Y NSTextField (font var.) | Y TextBlock                         |
+| container bg | (plain container)         | Y rounded backdrop panel  | (plain container)                   |
+| Text.font    | default font              | Y FONT_UI/TITLE/CAPTION   | default font                        |
 | TextInput    | Y EDIT                    | Y NSTextField             | Y TextBox                           |
 | TextArea     | Y EDIT multiline          | Y NSTextView              | Y TextBox (uncontrolled-with-sync)  |
 | Checkbox     | Y BUTTON checkbox         | Y NSButton                | Y CheckBox                          |

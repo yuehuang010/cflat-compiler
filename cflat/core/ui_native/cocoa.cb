@@ -48,6 +48,17 @@ struct RectD
     double h = 0.0;
 };
 
+// A 2-double aggregate matching NSPoint. On arm64 an HFA of 2 doubles is returned in
+// d0/d1 (the same class of return as RectD's 4-double d0-d3, which cocoa_probe validated
+// through the function<> ABI), so -[NSEvent locationInWindow] / -[NSView convertPoint:...]
+// are read this way. An NSPoint ARGUMENT is passed as two scalar doubles (see the location:
+// arg in _postWakeEvent), so convertPoint: takes its point decomposed, not as a struct.
+struct PointD
+{
+    double x = 0.0;
+    double y = 0.0;
+};
+
 // -- App-wide host state (NOT per-window) -------------------------------------
 // This host is genuinely multi-window: each top-level window is a CocoaHost in the
 // owning registry `_windows`, and `_cur` is the window currently being serviced. The
@@ -93,6 +104,15 @@ bool nativeMappable(int kind)
         || kind == ELEM_TABS || kind == ELEM_TREE
         || kind == ELEM_IMAGE || kind == ELEM_GROUPBOX || kind == ELEM_CANVAS
         || kind == ELEM_SCROLL;
+}
+
+// The style.backgroundColor of a plain (non-mapped) container - a View from
+// view/row/column - or 0 for anything else. A non-zero value opts the container into
+// a painted backdrop panel (Box already maps to a native NSBox, so it is excluded).
+int _containerBg(IElement node)
+{
+    if (node.kind() == ELEM_VIEW) { IView v = node as IView; return v.style.backgroundColor; }
+    return 0;
 }
 
 // The concrete tooltip text a mappable node carries ("" = none), read through
@@ -166,6 +186,16 @@ class CocoaHost : INativeHost
     // Image last-uploaded pixel pointer per handle (skip redundant NSImage rebuilds).
     list<u64>    imgHandles      = default;
     list<u64>    imgLastPixels   = default;
+    // Cached NSFont instances for Text.font (lazily built, retained for window life).
+    void*        fontUI      = nullptr;
+    void*        fontTitle   = nullptr;
+    void*        fontCaption = nullptr;
+    // CoreText line-metrics symbols (lazily dlsym'd; CoreText is already loaded
+    // transitively by AppKit). Scalar-return API, not the NSSize-returning
+    // -sizeWithAttributes: (a struct return is not safe through this msgSend bridge).
+    function<void*(void*)> ctLineCreate = nullptr;
+    function<double(void*, double*, double*, double*)> ctLineBounds = nullptr;
+    function<void(void*)> cfRelease = nullptr;
 
     // INativeHost: create a control of `elemKind` under the flipped content view.
     // `key` is the node's key path (kept by the caller in the shadow map). Returns
@@ -289,6 +319,11 @@ class CocoaHost : INativeHost
             msgInt(scroll, "setBorderType:", 2);          // NSBezelBorder
             void* table = msgRect(msg0(cls("NSTableView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
             msgInt(table, "setUsesAlternatingRowBackgroundColors:", 1);
+            // Big Sur+ inflates the default cell-based row height (automatic style) well
+            // past the font line height, and cell-based NSTextFieldCell top-aligns rather
+            // than centers in the extra space. Pin a compact row height so single-line
+            // text reads vertically centered.
+            msgSetDouble(table, "setRowHeight:", 19.0);
             msg1(table, "setDataSource:", this.target);
             msg1(table, "setDelegate:", this.target);
             msg1(table, "setTarget:", this.target);
@@ -315,6 +350,9 @@ class CocoaHost : INativeHost
             msgBool(scroll, "setHasVerticalScroller:", true);
             msgInt(scroll, "setBorderType:", 2);          // NSBezelBorder
             void* outline = msgRect(msg0(cls("NSOutlineView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            // Same compact-row fix as ELEM_LIST's table above: pin the row height so
+            // cell-based text centers instead of top-aligning in an inflated row.
+            msgSetDouble(outline, "setRowHeight:", 19.0);
             void* col = msg1(msg0(cls("NSTableColumn"), "alloc"), "initWithIdentifier:", nsStr((char*)"col"));
             msg1(outline, "addTableColumn:", col);
             msg1(outline, "setOutlineTableColumn:", col);
@@ -714,6 +752,59 @@ class CocoaHost : INativeHost
         return 0u;
     }
 
+    // The registered context menu for `keyPath` or its nearest ancestor prefix (longest
+    // match wins). Controls are flat sibling NSViews, so a right-click over a card's inner
+    // control must resolve the container's menu - the prefix walk mirrors Win32's bubbling.
+    u64 _ctxMenuForPathOrAncestor(string keyPath)
+    {
+        u64 best = 0u; int bestLen = 0 - 1;
+        int i = 0;
+        while (i < this.ctxKeys.count())
+        {
+            string k = this.ctxKeys.get(i);
+            bool isSelf = keyPath == k;
+            bool isDesc = !isSelf && keyPath.length() > k.length() && startsWith(keyPath, k + "/");
+            if ((isSelf || isDesc) && (int)k.length() > bestLen)
+            {
+                best = this.ctxMenus.get(i); bestLen = (int)k.length();
+            }
+            i++;
+        }
+        return best;
+    }
+
+    // Build an NSMenu from a boxed ContextMenu and hang it on the control (setMenu:, which
+    // NSView inherits). A live right-click pops it; the chosen item routes its command
+    // through onMenu: -> routeMenu, the same path the menu bar + nativeFireContextMenu use.
+    void _attachContextMenu(u64 h, u64 menuPtr)
+    {
+        void* ctrl = u2h(h);
+        if (ctrl == nullptr) return;
+        ContextMenu* cm = (ContextMenu*)menuPtr;
+        if (cm == nullptr) return;
+        void* menu = msg0(msg0(cls("NSMenu"), "alloc"), "init");
+        msgBool(menu, "setAutoenablesItems:", false);
+        int i = 0;
+        while (i < cm.count())
+        {
+            string lbl = cm.labels.get(i);
+            if (lbl.length() == 0)
+            {
+                msg1(menu, "addItem:", msg0(cls("NSMenuItem"), "separatorItem"));
+            }
+            else
+            {
+                void* item = msg3(msg0(cls("NSMenuItem"), "alloc"), "initWithTitle:action:keyEquivalent:",
+                                  nsStr(lbl.data()), sel("onMenu:"), nsStr((char*)""));
+                msg1(item, "setTarget:", this.target);
+                msgInt(item, "setTag:", (i64)cm.cmds.get(i));
+                msg1(menu, "addItem:", item);
+            }
+            i++;
+        }
+        msg1(ctrl, "setMenu:", menu);
+    }
+
     u64 _imgLastPixels(u64 h)
     {
         int i = 0;
@@ -745,6 +836,128 @@ class CocoaHost : INativeHost
         double g = (double)((color >> 8) & 0xFF) / 255.0;
         double b = (double)(color & 0xFF) / 255.0;
         return nsColor(r, g, b, 1.0);
+    }
+
+    // The cached NSFont for a FONT_* id (Text.font). FONT_TITLE is bold at ~1.3x the
+    // system size; FONT_CAPTION is 2pt smaller; everything else is the default UI font.
+    void* _fontFor(int fontId)
+    {
+        if (fontId == FONT_TITLE)
+        {
+            if (this.fontTitle == nullptr)
+            {
+                double sz = msgGetDouble(cls("NSFont"), "systemFontSize");
+                // systemFontOfSize:weight: - two CGFloat args, ABI-identical to msgSize.
+                this.fontTitle = msgSize(cls("NSFont"), "systemFontOfSize:weight:", sz * 1.3, 0.4);
+                msg0(this.fontTitle, "retain");
+            }
+            return this.fontTitle;
+        }
+        if (fontId == FONT_CAPTION)
+        {
+            if (this.fontCaption == nullptr)
+            {
+                double sz = msgGetDouble(cls("NSFont"), "systemFontSize");
+                this.fontCaption = msgSetDouble(cls("NSFont"), "systemFontOfSize:", sz - 2.0);
+                msg0(this.fontCaption, "retain");
+            }
+            return this.fontCaption;
+        }
+        if (this.fontUI == nullptr)
+        {
+            double sz = msgGetDouble(cls("NSFont"), "systemFontSize");
+            this.fontUI = msgSetDouble(cls("NSFont"), "systemFontOfSize:", sz);
+            msg0(this.fontUI, "retain");
+        }
+        return this.fontUI;
+    }
+
+    // Resolve the CoreText line-metrics symbols once via dlsym(RTLD_DEFAULT), mirroring
+    // cocoaInit()'s objc runtime lookup. Left null (silently) if unavailable.
+    void _ctInit()
+    {
+        void* rtld = (void*)(i64)(0 - 2);
+        this.ctLineCreate = (function<void*(void*)>)dlsym(rtld, "CTLineCreateWithAttributedString");
+        this.ctLineBounds = (function<double(void*, double*, double*, double*)>)dlsym(rtld, "CTLineGetTypographicBounds");
+        this.cfRelease    = (function<void(void*)>)dlsym(rtld, "CFRelease");
+    }
+
+    // Real glyph width (points) of `s` set in NSFont `font`, via CoreText line metrics.
+    // "NSFont" is NSFontAttributeName's actual runtime string value (same trick as
+    // _nsForegroundColorKey below), so a literal works as the attributes dictionary key.
+    double _measuredTextWidthPt(const char* s, void* font)
+    {
+        if (font == nullptr) return 0.0;
+        if (this.ctLineCreate == nullptr) this._ctInit();
+        if (this.ctLineCreate == nullptr || this.ctLineBounds == nullptr) return 0.0;
+        void* attrs = msg0(msg0(cls("NSMutableDictionary"), "alloc"), "init");
+        msg2(attrs, "setObject:forKey:", font, nsStr("NSFont"));
+        void* astr = msg2(msg0(cls("NSAttributedString"), "alloc"),
+                           "initWithString:attributes:", nsStr((char*)s), attrs);
+        void* line = this.ctLineCreate(astr);
+        if (line == nullptr) return 0.0;
+        double ascent = 0.0; double descent = 0.0; double leading = 0.0;
+        double w = this.ctLineBounds(line, &ascent, &descent, &leading);
+        if (this.cfRelease != nullptr) this.cfRelease(line);
+        return w;
+    }
+
+    // Apply a Text node's font + default ink to its NSTextField. FONT_CAPTION defaults
+    // to the secondary label color unless the Text carries an explicit color; an explicit
+    // color always wins. Always re-applied so a font/color change on re-sync is honored.
+    void _applyTextFont(u64 h, IText t)
+    {
+        void* ctrl = u2h(h);
+        void* f = this._fontFor(t.font);
+        if (f != nullptr) msg1(ctrl, "setFont:", f);
+        if (t.color != 0)
+            msg1(ctrl, "setTextColor:", this.colorFor(t.color));
+        else if (t.font == FONT_CAPTION)
+            msg1(ctrl, "setTextColor:", msg0(cls("NSColor"), "secondaryLabelColor"));
+        else
+            msg1(ctrl, "setTextColor:", msg0(cls("NSColor"), "labelColor"));
+    }
+
+    // Create a layer-backed plain NSView backdrop for a container with a fill. Inserted
+    // BELOW its siblings so it paints behind the card's controls (also correct for a
+    // late 0->color transition). Parents like a leaf control (docv inside a ScrollView).
+    u64 _createBackdrop(u64 parentHandle)
+    {
+        void* v = msgRect(msg0(cls("NSView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+        msgBool(v, "setWantsLayer:", true);
+        void* layer = msg0(v, "layer");
+        if (layer != nullptr) msgSetDouble(layer, "setCornerRadius:", 8.0);
+        void* parent = u2h(parentHandle);
+        if (parent == nullptr) parent = this.contentView;
+        if (parent != nullptr)
+        {
+            // addSubview:positioned:relativeTo: with NSWindowBelow (-1) + nil sends the
+            // panel to the back of the sibling order.
+            function<void*(void*, void*, void*, i64, void*)> f =
+                (function<void*(void*, void*, void*, i64, void*)>)__objcMsgSendPtr;
+            f(parent, sel("addSubview:positioned:relativeTo:"), v, (i64)(0 - 1), nullptr);
+        }
+        return (u64)v;
+    }
+
+    // Re-sync a backdrop's layer fill (and the optional theme border) to the current
+    // container color. Called every reconcile so a color change re-syncs naturally.
+    void _syncBackdrop(u64 h, int bg)
+    {
+        void* v = u2h(h);
+        void* layer = msg0(v, "layer");
+        if (layer == nullptr) return;
+        void* col = this.colorFor(bg);
+        void* cg = col != nullptr ? msg0(col, "CGColor") : nullptr;
+        msg1(layer, "setBackgroundColor:", cg);
+        int pb = this.ctx.theme.panelBorder;
+        if (pb != 0)
+        {
+            void* bc = this.colorFor(pb);
+            void* bcg = bc != nullptr ? msg0(bc, "CGColor") : nullptr;
+            msg1(layer, "setBorderColor:", bcg);
+            msgSetDouble(layer, "setBorderWidth:", 1.0);
+        }
     }
 
     // Accent a push button via bezelColor (documented-API accent, look policy). A 0 bg
@@ -893,7 +1106,11 @@ class CocoaHost : INativeHost
     Size measureText(const char* s, int fontId, int wrapWidthDip)
     {
         Size sz = default;
-        sz.w = (int)strlen((char*)s) + 1;
+        int n = (int)strlen((char*)s) + 1;
+        // FONT_TITLE renders ~1.3x wider than the body font; widen the estimate so a
+        // title's measured width still tracks its glyphs (a 1.3x line fits the 26pt row).
+        if (fontId == FONT_TITLE) n = n + n / 3;
+        sz.w = n;
         sz.h = 1;
         return sz;
     }
@@ -1030,12 +1247,58 @@ class CocoaHost : INativeHost
                 }
             }
             this._syncProps(node, h);
+            // Live right-click menu: attach the NSMenu registered for this path or the
+            // nearest ancestor (flat sibling views overlap, so descendants need it too).
+            u64 cm = this._ctxMenuForPathOrAncestor(path);
+            if (cm != 0u && msg0(u2h(h), "menu") == nullptr) this._attachContextMenu(h, cm);
             string tip = tooltipOf(node);
             if (tip.length() > 0) msg1(u2h(h), "setToolTip:", nsStr(tip.data()));
             Rect b = node.nodeBounds();
+            if (node.kind() == ELEM_TABS)
+            {
+                // The NSSegmentedControl is only the tab strip; frame it at the top header
+                // rows (TabControl.layout reserves hdr=2). Full-height framing stretched the
+                // segments across the whole card so the active pane overlapped the strip.
+                b.h = 2;
+            }
+            if (node.kind() == ELEM_TEXT)
+            {
+                // Widen the frame (not the layout node) to the REAL measured glyph width
+                // when it exceeds the layout estimate, so no font/text combo ever clips.
+                IText t = node as IText;
+                double measured = this._measuredTextWidthPt(t.text.data(), this._fontFor(t.font));
+                double needPts = measured + 2.0;
+                double layoutPts = (double)(b.w * BASE_X);
+                if (needPts > layoutPts)
+                    b.w = b.w + (int)((needPts - layoutPts) / (double)BASE_X) + 1;
+            }
             keys.add("" + path);
             handles.add(h);
             // Parent-relative frame: absolute DIP minus the enclosing scroll origin.
+            fx.add(b.x - offX); fy.add(b.y - offY); fw.add(b.w); fh.add(b.h);
+        }
+        else if (_containerBg(node) != 0)
+        {
+            // A plain container with a fill gets a painted backdrop panel (keyed by the
+            // container's path) behind its children; it recurses into children below like
+            // any container, and rides the same create/reuse/destroy/reposition reconcile.
+            int bg = _containerBg(node);
+            u64 h = ctx.nativeHandle(path);
+            if (h != 0u && parentView != 0u && msg0(u2h(h), "superview") != u2h(parentView))
+            {
+                this.destroyControl(h);
+                ctx.removeNativeHandle(path);
+                h = 0u;
+            }
+            if (h == 0u)
+            {
+                h = this._createBackdrop(parentView);
+                ctx.setNativeHandle(path, h);
+            }
+            this._syncBackdrop(h, bg);
+            Rect b = node.nodeBounds();
+            keys.add("" + path);
+            handles.add(h);
             fx.add(b.x - offX); fy.add(b.y - offY); fw.add(b.w); fh.add(b.h);
         }
 
@@ -1120,6 +1383,7 @@ class CocoaHost : INativeHost
         {
             IText t = node as IText;
             this.setText(h, t.text.data());
+            this._applyTextFont(h, t);
         }
         else if (k == ELEM_TEXTINPUT)
         {
@@ -1330,6 +1594,9 @@ class CocoaHost : INativeHost
             this.window = nullptr;
         }
         if (this.target != nullptr) { msg0(this.target, "release"); this.target = nullptr; }
+        if (this.fontUI != nullptr)      { msg0(this.fontUI, "release");      this.fontUI = nullptr; }
+        if (this.fontTitle != nullptr)   { msg0(this.fontTitle, "release");   this.fontTitle = nullptr; }
+        if (this.fontCaption != nullptr) { msg0(this.fontCaption, "release"); this.fontCaption = nullptr; }
         this.contentView = nullptr;
     }
 };
@@ -1443,9 +1710,53 @@ class CocoaCanvas : ICanvas
         if (filled) msg0(path, "fill"); else msg0(path, "stroke");
     }
 
+    // Blit a canvas image (an NSImage* handle from canvasCreateImage) into a POINTS rect.
+    // drawInRect:...:respectFlipped:YES makes AppKit draw the image UPRIGHT in this flipped
+    // view (CG y-up vs the flipped y-down view is handled by AppKit), matching the
+    // NSBezierPath/NSString primitives above. Called during CfCanvasView.drawRect:, so this
+    // view is the focused graphics context. Source NSZeroRect = the whole image; op 2 =
+    // NSCompositingOperationSourceOver; fraction 1.0 = opaque.
+    void drawImage(u64 img, double dx, double dy, double dw, double dh)
+    {
+        if (img == 0u) return;
+        function<void(void*, void*, double, double, double, double,
+                      double, double, double, double, i64, double, i8, void*)> f =
+            (function<void(void*, void*, double, double, double, double,
+                           double, double, double, double, i64, double, i8, void*)>)__objcMsgSendPtr;
+        f((void*)img, sel("drawInRect:fromRect:operation:fraction:respectFlipped:hints:"),
+          dx, dy, dw, dh, 0.0, 0.0, 0.0, 0.0, (i64)2, 1.0, (i8)1, nullptr);
+    }
+
     void pushClip(Rect r) { }   // per-region clipping not bridged (best-effort)
     void popClip() { }
 };
+
+// -- Canvas image handles (M2): NSImage wrappers over a copied BGRA buffer --------
+// canvasCreateImage builds an NSBitmapImageRep (which COPIES the bytes, so the caller may
+// free its buffer immediately), wraps it in a retained NSImage, and returns the NSImage*
+// as a u64. This is fully separate from the Image ELEMENT's setImageData path (that sets a
+// control's image; these are paint-time objects drawn via CocoaCanvas.drawImage). Distinct
+// from the autoreleased nsStr/nsColor helpers, the NSImage is alloc/init (+1 retained) so
+// it survives autorelease-pool drains between create and draw; canvasReleaseImage releases
+// it. The alloc'd rep is released after addRepresentation: (the image retains it).
+u64 canvasCreateImage(u64 bgraPixels, int w, int h)
+{
+    if (bgraPixels == 0u || w <= 0 || h <= 0) return 0u;
+    if (!cocoaInit()) return 0u;
+    void* rep = nsBitmapRep((void*)bgraPixels, (i64)w, (i64)h, (i64)8, (i64)4,
+                            (i8)1, (i8)0, nsStr("NSDeviceRGBColorSpace"), (i64)(w * 4), (i64)32);
+    if (rep == nullptr) return 0u;
+    void* img = msg0(msg0(cls("NSImage"), "alloc"), "init");
+    msg1(img, "addRepresentation:", rep);
+    msg0(rep, "release");   // the NSImage now owns the rep
+    return (u64)img;
+}
+
+void canvasReleaseImage(u64 img)
+{
+    if (img == 0u) return;
+    msg0((void*)img, "release");
+}
 
 // The NSAttributedString foreground-color attribute key (a global NSString symbol);
 // resolved via a small class method wrapper is overkill, so a literal name is used.
@@ -1475,6 +1786,87 @@ void _canvasDrawRectImp(void* self, void* cmd, double x, double y, double w, dou
 }
 
 i8 _canvasIsFlippedImp(void* self, void* cmd) { return (i8)1; }
+
+// -- CfCanvasView input IMPs (M1): mouse / wheel / pinch -> element handlers -------
+// These fire during the run loop while the tree is stable, so they resolve the live
+// CanvasView element per event (like _onListClickImp routes list clicks) rather than a
+// boxed clone - the paint callback is boxed instead because drawRect: fires on OS-driven
+// repaints outside the event pump. Every handler defaults to a no-op, so a canvas without
+// handlers is safely a no-op. Drag capture is free: Cocoa keeps routing mouseDragged:/
+// mouseUp: to the mouseDown: view.
+ICanvasView _canvasViewFor(void* self)
+{
+    if (!_setCurFromView(self)) return nullptr;
+    if (!curWin().ready) return nullptr;
+    string key = curWin().keyForHandle((u64)self);
+    if (key.length() == 0) return nullptr;
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
+    if (e == nullptr) return nullptr;
+    return e as ICanvasView;
+}
+
+// The event location in the flipped view's own POINTS (top-left, y down). locationInWindow
+// (NSPoint, 2-double HFA return) then convertPoint:fromView:nil (NSPoint arg decomposed to
+// two doubles, NSPoint return). See the PointD note on the ABI.
+PointD _canvasPointFor(void* self, void* event)
+{
+    function<PointD(void*, void*)> loc = (function<PointD(void*, void*)>)__objcMsgSendPtr;
+    PointD win = loc(event, sel("locationInWindow"));
+    function<PointD(void*, void*, double, double, void*)> cvt =
+        (function<PointD(void*, void*, double, double, void*)>)__objcMsgSendPtr;
+    return cvt(self, sel("convertPoint:fromView:"), win.x, win.y, nullptr);
+}
+
+// Bitmask of currently-pressed mouse buttons (bit 0 = left, bit 1 = right), a class-method
+// scalar read - no per-event struct.
+int _canvasButtons() { return (int)msgGetI64(cls("NSEvent"), "pressedMouseButtons"); }
+
+void _canvasMouseDownImp(void* self, void* cmd, void* event)
+{
+    ICanvasView cv = _canvasViewFor(self);
+    if (cv == nullptr || !cv.hasPointerDown) return;
+    PointD p = _canvasPointFor(self, event);
+    cv.onPointerDown(p.x, p.y, _canvasButtons());
+}
+
+void _canvasMouseDraggedImp(void* self, void* cmd, void* event)
+{
+    ICanvasView cv = _canvasViewFor(self);
+    if (cv == nullptr || !cv.hasPointerMove) return;
+    PointD p = _canvasPointFor(self, event);
+    cv.onPointerMove(p.x, p.y, _canvasButtons());
+}
+
+void _canvasMouseUpImp(void* self, void* cmd, void* event)
+{
+    ICanvasView cv = _canvasViewFor(self);
+    if (cv == nullptr || !cv.hasPointerUp) return;
+    PointD p = _canvasPointFor(self, event);
+    cv.onPointerUp(p.x, p.y, _canvasButtons());
+}
+
+// scrollWheel: continuous (trackpad) vs line (mouse) deltas via scalar accessors;
+// hasPreciseScrollingDeltas distinguishes a trackpad's precise scroll.
+void _canvasScrollWheelImp(void* self, void* cmd, void* event)
+{
+    ICanvasView cv = _canvasViewFor(self);
+    if (cv == nullptr || !cv.hasWheel) return;
+    PointD p = _canvasPointFor(self, event);
+    double dx = msgGetDouble(event, "scrollingDeltaX");
+    double dy = msgGetDouble(event, "scrollingDeltaY");
+    bool precise = msgGetI64(event, "hasPreciseScrollingDeltas") != (i64)0;
+    cv.onWheel(p.x, p.y, dx, dy, precise);
+}
+
+// magnifyWithEvent: -magnification is the incremental zoom delta; report scale = 1.0 + it.
+void _canvasMagnifyImp(void* self, void* cmd, void* event)
+{
+    ICanvasView cv = _canvasViewFor(self);
+    if (cv == nullptr || !cv.hasPinch) return;
+    PointD p = _canvasPointFor(self, event);
+    double mag = msgGetDouble(event, "magnification");
+    cv.onPinch(p.x, p.y, 1.0 + mag);
+}
 
 // -- NSTableView dataSource IMPs (ListView; the boxed rowText is the item source) --
 i64 _numberOfRowsImp(void* self, void* cmd, void* table)
@@ -1600,10 +1992,22 @@ void _onTreeWillExpandImp(void* self, void* cmd, void* note)
 }
 
 // -- ctx.post() marshaling (performSelectorOnMainThread with an NSNumber box) ---
+// Scheduled in the COMMON run-loop modes (not just default): a worker completion
+// must deliver while the main thread is in event-tracking mode (mouse drag / pinch),
+// or live tile loads freeze mid-gesture. Common modes still service under the default
+// mode too, so hostDrainPosted (default-mode drain) keeps working for the self-tests.
 void _cocoaPostEnqueue(u64 target, u64 boxPtr)
 {
     void* num = msgIntArg(cls("NSNumber"), "numberWithUnsignedLongLong:", (i64)boxPtr);
-    msgPerformOnMain(u2h(target), "runPostBox:", num, false);
+    // performSelector...modes: does NOT expand kCFRunLoopCommonModes, so list the
+    // concrete modes: default (rest / hostDrainPosted) + event-tracking (drag/pinch).
+    void* modes = msg0(cls("NSMutableArray"), "array");
+    msg1(modes, "addObject:", nsStr((char*)"kCFRunLoopDefaultMode"));
+    msg1(modes, "addObject:", nsStr((char*)"NSEventTrackingRunLoopMode"));
+    function<void*(void*, void*, void*, void*, i8, void*)> f =
+        (function<void*(void*, void*, void*, void*, i8, void*)>)__objcMsgSendPtr;
+    f(u2h(target), sel("performSelectorOnMainThread:withObject:waitUntilDone:modes:"),
+      sel("runPostBox:"), num, (i8)0, modes);
 }
 
 u64 _cocoaCurTid() { return (u64)msg0(cls("NSThread"), "currentThread"); }
@@ -1615,6 +2019,9 @@ void _runPostBoxImp(void* self, void* cmd, void* num)
     if (num == nullptr) return;
     u64 boxPtr = (u64)msgGetI64(num, "unsignedLongLongValue");
     __uiRunPostBox(boxPtr);
+    // A posted closure is a UI-thread mutation like any native event handler: if it
+    // called ctx.invalidate() it expects a repaint, so pump here (handlers do the same).
+    pumpNative();
 }
 
 // -- Host-neutral accessors (mirror the Win32 host) ------------------------------
@@ -1987,6 +2394,17 @@ Rect nativeNodeBounds(string keyPath)
     return e.nodeBounds();
 }
 
+// The committed View container's backgroundColor (its host backdrop fill), or 0. Reads
+// the reconciled tree, so it verifies a theme flip actually re-colored the card.
+int nativeContainerBg(string keyPath)
+{
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
+    if (e == nullptr) return 0;
+    IView v = e as IView;
+    if (v != nullptr) return v.style.backgroundColor;
+    return 0;
+}
+
 // -- Tab drivers (NSSegmentedControl strip + the controlled model) -------------
 int nativeTabSelected(string keyPath)
 {
@@ -2139,6 +2557,44 @@ void nativeClickButton(string keyPath)
     routeClick(ctrl);
 }
 
+// -- Canvas input drivers (M1): synthesize a handler invocation on the CanvasView at
+// keyPath. These call the element handler directly (the oracle is app state, not OS event
+// plumbing), so they exercise the same closures the live mouse/wheel/pinch IMPs invoke.
+ICanvasView _nativeCanvasAt(string keyPath)
+{
+    if (!hasCurWin()) return nullptr;
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
+    if (e == nullptr) return nullptr;
+    return e as ICanvasView;
+}
+
+void nativeCanvasPointer(string keyPath, int phase, double x, double y)
+{
+    ICanvasView cv = _nativeCanvasAt(keyPath);
+    if (cv == nullptr) return;
+    int buttons = phase == 2 ? 0 : 1;   // down/move = left held, up = released
+    if (phase == 0) { if (cv.hasPointerDown) cv.onPointerDown(x, y, buttons); }
+    else if (phase == 1) { if (cv.hasPointerMove) cv.onPointerMove(x, y, buttons); }
+    else { if (cv.hasPointerUp) cv.onPointerUp(x, y, buttons); }
+    pumpNative();
+}
+
+void nativeCanvasWheel(string keyPath, double x, double y, double dx, double dy)
+{
+    ICanvasView cv = _nativeCanvasAt(keyPath);
+    if (cv == nullptr || !cv.hasWheel) return;
+    cv.onWheel(x, y, dx, dy, true);
+    pumpNative();
+}
+
+void nativeCanvasPinch(string keyPath, double x, double y, double scale)
+{
+    ICanvasView cv = _nativeCanvasAt(keyPath);
+    if (cv == nullptr || !cv.hasPinch) return;
+    cv.onPinch(x, y, scale);
+    pumpNative();
+}
+
 bool nativeIsChecked(string keyPath)
 {
     u64 h = curWin().ctx.nativeHandle(keyPath);
@@ -2220,6 +2676,146 @@ u32 nativeAccentBg(string keyPath)
     return curWin()._accentFor(h);
 }
 u32 nativeTestCustomDrawFill(string keyPath) { return nativeAccentBg(keyPath); }
+
+// -- Host-neutral hardening drivers (Cocoa bodies) ----------------------------
+// Same contract as the Win32 bodies (win32.cb): a live client resize, the accessible
+// Name of a control, and the logical Tab ring (focus first / next / read back).
+
+// Drive a live client-area resize to w x h DIPs, so the host relayouts + reconciles.
+// Cocoa peer of the Win32 WM_SIZE synthesis: set the window's content size and run the
+// same relayout path windowDidResize: takes (buildNativeTree at the new DIP size).
+void nativeResizeClient(int wDip, int hDip)
+{
+    if (!hasCurWin()) return;
+    CocoaHost* wnd = curWin();
+    int w = wDip < 1 ? 1 : wDip;
+    int h = hDip < 1 ? 1 : hDip;
+    if (wnd.window != nullptr)
+        msgSize(wnd.window, "setContentSize:", (double)(w * BASE_X), (double)(h * BASE_Y));
+    wnd.w = w; wnd.h = h;
+    buildNativeTree();
+}
+
+// The user-visible accessible Name of the control at keyPath. AppKit derives the label
+// from the control's title / stringValue; a textless control (ProgressBar) has none, so
+// fall back to the tooltip - which is exactly what the Win32 host mirrors into its text.
+string nativeAccessibleName(string keyPath)
+{
+    if (!hasCurWin()) return "";
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return "";
+    void* ctrl = u2h(h);
+    void* pool = poolPush();
+    void* lbl = msg0(ctrl, "accessibilityLabel");
+    char* c = lbl != nullptr ? cStr(lbl) : nullptr;
+    string s = c != nullptr ? "" + c : "";
+    poolPop(pool);
+    if (s.length() > 0) return s;
+
+    string t = nativeControlText(keyPath);
+    if (t.length() > 0) return t;
+
+    void* pool2 = poolPush();
+    void* tip = msg0(ctrl, "toolTip");
+    char* tc = tip != nullptr ? cStr(tip) : nullptr;
+    string ts = tc != nullptr ? "" + tc : "";
+    poolPop(pool2);
+    return ts;
+}
+
+// The responder that takes focus for a live control: a TextArea's handle is its scroll
+// view, but the NSTextView inside it is what becomes first responder.
+void* _responderFor(void* ctrl)
+{
+    if (ctrl == nullptr) return nullptr;
+    if (_isScroll(ctrl)) return msg0(ctrl, "documentView");
+    return ctrl;
+}
+
+// The live control handle backing `resp` (walk up the view chain: a text view resolves
+// to its scroll view, a field editor to the NSTextField it is editing). 0u if none.
+u64 _liveHandleForResponder(void* resp)
+{
+    // The first responder can be the NSWindow itself (no focused control); only a view
+    // has a superview chain to walk.
+    if (resp == nullptr || msgBool1(resp, "isKindOfClass:", cls("NSView")) == (i8)0) return 0u;
+    void* v = resp;
+    int guard = 0;
+    while (v != nullptr && guard < 32)
+    {
+        if (curWin().keyForHandle((u64)v).length() > 0) return (u64)v;
+        v = msg0(v, "superview");
+        guard++;
+    }
+    return 0u;
+}
+
+// Make `ctrl` the window's first responder; true if AppKit accepted it (a label or a
+// disabled control refuses, which is what keeps the ring to real tabstops).
+bool _tryFocus(void* ctrl)
+{
+    void* win = curWin().window;
+    void* resp = _responderFor(ctrl);
+    if (win == nullptr || resp == nullptr) return false;
+    if (msgBool1(resp, "canBecomeKeyView", nullptr) == (i8)0) return false;
+    return msgBool1(win, "makeFirstResponder:", resp) != (i8)0;
+}
+
+// Focus the first focusable live control at or after index `start` (wrapping once), and
+// return its key path; "" if the window has no focusable control at all.
+string _focusFrom(int start)
+{
+    if (!hasCurWin()) return "";
+    int n = curWin().liveHandles.count();
+    if (n == 0) return "";
+    int i = 0;
+    while (i < n)
+    {
+        int idx = (start + i) % n;
+        u64 h = curWin().liveHandles.get(idx);
+        if (_tryFocus(u2h(h))) return "" + curWin().liveKeys.get(idx);
+        i++;
+    }
+    return "";
+}
+
+// The live control handle that currently holds focus (the window's first responder
+// resolved back to a registered control), or 0u.
+u64 _focusedHandle()
+{
+    if (!hasCurWin() || curWin().window == nullptr) return 0u;
+    void* resp = msg0(curWin().window, "firstResponder");
+    if (resp == nullptr) return 0u;
+    return _liveHandleForResponder(resp);
+}
+
+// Focus the first control in the key ring; return its key path.
+string nativeFocusFirst() { return _focusFrom(0); }
+
+// Advance focus to the next control in the ring (Tab key equivalent); return its key.
+string nativeFocusNext()
+{
+    if (!hasCurWin()) return "";
+    u64 cur = _focusedHandle();
+    int start = 0;
+    if (cur != 0u)
+    {
+        int i = 0;
+        while (i < curWin().liveHandles.count())
+        {
+            if (curWin().liveHandles.get(i) == cur) { start = i + 1; break; }
+            i++;
+        }
+    }
+    return _focusFrom(start);
+}
+
+// The key path of the control that currently holds focus ("" if none).
+string nativeFocusedKey()
+{
+    if (!hasCurWin()) return "";
+    return curWin().keyForHandle(_focusedHandle());
+}
 
 // Close the current window (bypasses the close guard - the caller already decided).
 // -close fires windowWillClose: which tears the window down. A headless window (never
@@ -2745,6 +3341,19 @@ void registerHostClasses()
         addMethodBool0(cvv, "isFlipped", flip);
         function<void(void*, void*, double, double, double, double)> dr = _canvasDrawRectImp;
         __classAddMethod(cvv, sel("drawRect:"), (void*)dr, "v@:{{CGRect={{CGPoint=dd}}{{CGSize=dd}}}}");
+        // Input overrides (mouseDown:/Dragged:/Up:/scrollWheel:/magnifyWithEvent:): all
+        // take (self, _cmd, NSEvent*), encoding "v@:@". They invoke the element handlers
+        // (no-op by default), so an input-less canvas is unaffected.
+        function<void(void*, void*, void*)> md = _canvasMouseDownImp;
+        function<void(void*, void*, void*)> mg = _canvasMouseDraggedImp;
+        function<void(void*, void*, void*)> mu = _canvasMouseUpImp;
+        function<void(void*, void*, void*)> sw = _canvasScrollWheelImp;
+        function<void(void*, void*, void*)> mag = _canvasMagnifyImp;
+        addMethod0(cvv, "mouseDown:", md);
+        addMethod0(cvv, "mouseDragged:", mg);
+        addMethod0(cvv, "mouseUp:", mu);
+        addMethod0(cvv, "scrollWheel:", sw);
+        addMethod0(cvv, "magnifyWithEvent:", mag);
         finishClass(cvv);
     }
 

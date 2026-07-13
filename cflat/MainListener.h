@@ -6293,10 +6293,14 @@ public:
                             {
                                 // Re-resolve by name to avoid picking a struct method that shares the
                                 // same plain key in functionTable (e.g. atomic_counter::add vs add).
+                                // Only when the RHS is a bare named function (right is already an
+                                // llvm::Function); a same-named local/param of function-pointer type
+                                // loads to a Value and must shadow the global function, not be replaced.
                                 std::string funcName = assignmentExpression->getText();
                                 int expectedParams = (int)typeAndValue.FuncPtrParams.size();
-                                if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams, &typeAndValue.FuncPtrParams))
-                                    right = correctFn;
+                                if (llvm::isa<llvm::Function>(right))
+                                    if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams, &typeAndValue.FuncPtrParams))
+                                        right = correctFn;
                                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
                                 {
                                     VerifyFuncPtrAssignmentMoveFlags(funcName, typeAndValue, assignmentExpression);
@@ -7185,10 +7189,14 @@ public:
             {
                 // Re-resolve by name to avoid picking a struct method that shares the
                 // same plain key in functionTable (e.g. atomic_counter::add vs add).
+                // Only when the RHS is a bare named function (right is already an
+                // llvm::Function); a same-named local/param of function-pointer type
+                // loads to a Value and must shadow the global function, not be replaced.
                 std::string funcName = assignCtx->getText();
                 int expectedParams = (int)namedVar.TypeAndValue.FuncPtrParams.size();
-                if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams, &namedVar.TypeAndValue.FuncPtrParams))
-                    right = correctFn;
+                if (llvm::isa<llvm::Function>(right))
+                    if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams, &namedVar.TypeAndValue.FuncPtrParams))
+                        right = correctFn;
                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
                 {
                     VerifyFuncPtrAssignmentMoveFlags(funcName, namedVar.TypeAndValue, ctx);

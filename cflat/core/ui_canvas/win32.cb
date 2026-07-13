@@ -145,7 +145,21 @@ class GdiCanvas : ICanvas
     }
 
     void popClip() { RestoreDC(this.hdc, -1); }
+
+    // Canvas image blitting is not yet wired on the Win32 GDI canvas host (parity gap -
+    // see internal/issue/ui-native-canvas-input-images-win32-winui.md). Documented no-op.
+    void drawImage(u64 img, double dx, double dy, double dw, double dh) { }
 };
+
+// Canvas image handles are a native-host feature; the Win32 GDI canvas host does not yet
+// wrap pixels (parity gap). canvasCreateImage returns a nonzero DUMMY so library code runs.
+u64 canvasCreateImage(u64 bgraPixels, int w, int h)
+{
+    if (bgraPixels == 0u || w <= 0 || h <= 0) return 0u;
+    return 1u;
+}
+
+void canvasReleaseImage(u64 img) { }
 
 // Free the old tree (if any) and render a fresh one at the current cell size.
 // A resize produces no reconcile patches (the size flows in through render()), so

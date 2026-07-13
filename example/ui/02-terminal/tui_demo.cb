@@ -544,6 +544,152 @@ bool testScrollClip()
     return clippedTop && scrolled && wantsRepaint;
 }
 
+// Text font variants (Phase B typography): a FONT_TITLE Text serializes a "font"
+// field and propsEqual distinguishes it, while a default-font Text stays byte-
+// identical in JSON (font elided when 0) - so existing serialized trees are unchanged.
+bool testTextFont()
+{
+    IView root = view(makeStyle(0, 0, 0));
+    IText title = text("Hello"); title.font = FONT_TITLE;
+    IText plain = text("Hello");
+    IText plain2 = text("Hello");
+    root.add(title); root.add(plain); root.add(plain2);
+    IElement tree = root;
+
+    bool titleJson = title.toJson() == "{\"type\":\"Text\",\"text\":\"Hello\",\"font\":2}";
+    bool plainJson = plain.toJson() == "{\"type\":\"Text\",\"text\":\"Hello\"}";
+    bool diff = !title.propsEqual(plain);   // same text, different font -> not equal
+    bool same = plain.propsEqual(plain2);   // identical -> equal
+
+    // A FONT_TITLE cell reserves ~1.3x width so native hosts do not clip a bold
+    // title; a default-font Text stays exactly 1 cell/char.
+    LayoutConstraints cc = default;
+    cc.x = 0; cc.y = 0; cc.availW = 40; cc.availH = 10;
+    title.layout(cc); plain.layout(cc);
+    bool titleWider = title.nodeBounds().w > plain.nodeBounds().w;
+    bool plainExact = plain.nodeBounds().w == 5;   // "Hello" == 5 chars
+
+    deleteTree(tree);
+    return titleJson && plainJson && diff && same && titleWider && plainExact;
+}
+
+// Records handler callbacks so the canvas-input test can assert exact coordinates.
+class CanvasRec
+{
+    double px = 0.0; double py = 0.0; int pb = 0; int downCount = 0;
+    double mx = 0.0; double my = 0.0;
+    double ux = 0.0; double uy = 0.0;
+    double wx = 0.0; double wy = 0.0; double wdx = 0.0; double wdy = 0.0; bool wp = false;
+    double zx = 0.0; double zy = 0.0; double zs = 0.0;
+};
+
+// A CanvasView with all input handlers set receives synthesized pointer/wheel/pinch
+// through the host-neutral nativeCanvas* drivers with the exact points/deltas passed.
+bool testCanvasInput()
+{
+    CanvasRec* rec = new CanvasRec();
+    ICanvasView cv = new CanvasView();
+    cv.setKey("cnv");
+    cv.setOnPointerDown((double x, double y, int b) => { rec.px = x; rec.py = y; rec.pb = b; rec.downCount = rec.downCount + 1; });
+    cv.setOnPointerMove((double x, double y, int b) => { rec.mx = x; rec.my = y; });
+    cv.setOnPointerUp((double x, double y, int b) => { rec.ux = x; rec.uy = y; });
+    cv.setOnWheel((double x, double y, double dx, double dy, bool p) => { rec.wx = x; rec.wy = y; rec.wdx = dx; rec.wdy = dy; rec.wp = p; });
+    cv.setOnPinch((double x, double y, double s) => { rec.zx = x; rec.zy = y; rec.zs = s; });
+
+    IElement tree = cv;
+    nativeCanvasBindRoot(tree);
+    nativeCanvasPointer("cnv", 0, 12.5, 34.25);
+    nativeCanvasPointer("cnv", 1, 40.0, 41.0);
+    nativeCanvasPointer("cnv", 2, 50.5, 51.5);
+    nativeCanvasWheel("cnv", 5.0, 6.0, -3.0, 7.5);
+    nativeCanvasPinch("cnv", 8.0, 9.0, 1.25);
+
+    bool down  = rec.px == 12.5 && rec.py == 34.25 && rec.pb == 1 && rec.downCount == 1;
+    bool moved = rec.mx == 40.0 && rec.my == 41.0;
+    bool up    = rec.ux == 50.5 && rec.uy == 51.5;
+    bool wheel = rec.wx == 5.0 && rec.wy == 6.0 && rec.wdx == -3.0 && rec.wdy == 7.5 && rec.wp;
+    bool pinch = rec.zx == 8.0 && rec.zy == 9.0 && rec.zs == 1.25;
+
+    delete rec;
+    deleteTree(tree);
+    return down && moved && up && wheel && pinch;
+}
+
+// A CanvasView with NO handlers is unaffected: toJson/propsEqual are byte-identical to
+// today, and driving it through the same drivers invokes only the no-op defaults (no
+// crash, no state to change).
+bool testCanvasNoHandlers()
+{
+    ICanvasView cv = new CanvasView();
+    cv.setKey("plain");
+    ICanvasView other = new CanvasView();
+
+    bool jsonSame  = cv.toJson() == "{\"type\":\"CanvasView\"}";
+    bool propsSame = cv.propsEqual(other);
+
+    IElement tree = cv;
+    nativeCanvasBindRoot(tree);
+    nativeCanvasPointer("plain", 0, 1.0, 2.0);   // no-op default handlers: must not crash
+    nativeCanvasWheel("plain", 1.0, 2.0, 3.0, 4.0);
+    nativeCanvasPinch("plain", 1.0, 2.0, 1.5);
+
+    delete other;
+    deleteTree(tree);
+    return jsonSame && propsSame;
+}
+
+// canvasCreateImage returns a nonzero handle, drawImage is a headless no-op, and
+// canvasReleaseImage does not crash. (On the TUI host the handle is a dummy sentinel.)
+bool testCanvasImage()
+{
+    u32[4] px;
+    px[0] = 0xFFFFFFFFu; px[1] = 0u; px[2] = 0u; px[3] = 0xFFFFFFFFu;
+    u64 img = canvasCreateImage((u64)&px[0], 2, 2);
+    bool made = img != 0u;
+
+    Surface s; s.init(4, 4); s.fill(' ');
+    SurfaceCanvas c = canvasFor(&s);
+    c.drawImage(img, 0.0, 0.0, 4.0, 4.0);   // documented no-op on the char grid
+
+    canvasReleaseImage(img);
+    return made;
+}
+
+// A plain View honors its own style.width: in a row it advances the parent
+// cursor by exactly that width (not the parent availW) and caps its children to
+// width - 2*padding; a width-0 View still fills the parent availW as before.
+bool testViewWidthHonored()
+{
+    IView r = row(makeStyle(0, 0, 0));
+    IView sized = view(makeStyle(2, 12, 0));   // padding 2, width 12
+    IView child = view(makeStyle(0, 0, 0));    // width 0 -> fills sized inner = 12 - 2*2 = 8
+    sized.add(child);
+    r.add(sized);
+    IView rest = view(makeStyle(0, 0, 0));     // width 0 -> fills the row availW (100)
+    r.add(rest);
+    IElement t = r;
+
+    layoutRoot(t, 0, 0, 100);
+    Rect rs = sized.nodeBounds();
+    Rect rc = child.nodeBounds();
+    Rect rr = rest.nodeBounds();
+
+    // Sized View reports its own width 12 and starts at x 0.
+    bool sizedSelf = rs.w == 12 && rs.x == 0;
+    // Its child is capped to 12 - 2*padding(2) = 8 and inset to x 0 + padding = 2.
+    bool childCapped = rc.w == 8 && rc.x == 2;
+    // The row cursor advanced by the width (12), not availW: rest starts at 12.
+    bool cursorByWidth = rr.x == 12;
+    // Byte-identical width-0 path: a width-0 View still fills the row availW (100),
+    // exactly as before View honored style.width (had sized not honored width, the
+    // cursor would have advanced by availW and rest.x would be 100, not 12).
+    bool widthZeroFills = rr.w == 100;
+
+    bool ok = sizedSelf && childCapped && cursorByWidth && widthZeroFills;
+    deleteTree(t);
+    return ok;
+}
+
 int selfTest()
 {
     int pass = 0; int total = 0;
@@ -565,10 +711,15 @@ int selfTest()
     total++; if (testFlexWrapLineHeight())     pass++; else printf("  FAIL: flexWrap line height\n");
     total++; if (testFlexWrapOversizedChild()) pass++; else printf("  FAIL: flexWrap oversized child\n");
     total++; if (testFlexWrapLineFlex())       pass++; else printf("  FAIL: flexWrap per-line flex\n");
+    total++; if (testTextFont())               pass++; else printf("  FAIL: text font variants\n");
+    total++; if (testCanvasInput())            pass++; else printf("  FAIL: canvas input drivers\n");
+    total++; if (testCanvasNoHandlers())       pass++; else printf("  FAIL: canvas no-handler unchanged\n");
+    total++; if (testCanvasImage())            pass++; else printf("  FAIL: canvas image handle + drawImage no-op\n");
+    total++; if (testViewWidthHonored())       pass++; else printf("  FAIL: View honors style.width (cursor + child cap + width-0 fills)\n");
 
     if (pass == total)
     {
-        printf("PASS: ui self-tests %d/%d (reconcile, repaint, reorder, components, focus, layout, textinput, tabnav, scroll, flex, flexWrap)\n", pass, total);
+        printf("PASS: ui self-tests %d/%d (reconcile, repaint, reorder, components, focus, layout, textinput, tabnav, scroll, flex, flexWrap, canvas)\n", pass, total);
         return 0;
     }
     printf("FAIL: ui self-tests %d/%d\n", pass, total);

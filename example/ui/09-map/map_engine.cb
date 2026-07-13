@@ -1,0 +1,469 @@
+// map_engine.cb - pure, host-independent slippy-map tile engine library.
+//
+// This file is intentionally host-neutral: it imports only math.cb (for
+// floor/ceil/pow/clamp), list.cb and dictionary.cb (containers), plus the
+// implicit runtime - never ui_native.cb or any host/canvas file. It has no
+// main() - it is a library imported by the
+// M4 MapView control / launcher and by a standalone headless test harness
+// (map_engine_check.cb, which lives outside this repo during M3 and whose
+// asserts are meant to be folded into the real M4 self-test later).
+//
+// Contents: MapCamera (world<->screen math, pan, anchor-preserving zoom),
+// tile addressing (TileKey/VisibleTile/visibleTiles), TileCache (capacity-
+// bounded LRU with pinning + release callback), TileScheduler (dedupe/cap/
+// cancel request tracking - a pure state machine, does not itself fetch),
+// and bestAncestor (progressive-placeholder lookup helper).
+import "math.cb";
+import "list.cb";
+import "dictionary.cb";
+
+// A point in viewport/screen space, in points (not pixels).
+struct ScreenPt
+{
+    double x = 0.0;
+    double y = 0.0;
+};
+
+// A point in normalized world space (zoom-0 space spans [0,1) x [0,1)).
+struct WorldPt
+{
+    double x = 0.0;
+    double y = 0.0;
+};
+
+// -----------------------------------------------------------------------
+// Tile addressing
+// -----------------------------------------------------------------------
+
+// Slippy-map tile address: level z, tile column tx, tile row ty.
+struct TileKey
+{
+    int z  = 0;
+    int tx = 0;
+    int ty = 0;
+
+    // Pack (z, tx, ty) into a single u64 dictionary key.
+    // Layout: bits [63:44] = z (20 bits), bits [43:22] = tx (22 bits),
+    // bits [21:0] = ty (22 bits). Safe for z up to ~20 (tx/ty < 2^20 there,
+    // well within the 22-bit fields); do not use for larger z.
+    u64 pack()
+    {
+        return ((u64)z << 44) | ((u64)tx << 22) | (u64)ty;
+    }
+
+    // Reconstruct a TileKey from a value produced by pack().
+    static TileKey unpack(u64 packed)
+    {
+        TileKey k = default;
+        k.z  = (int)(packed >> 44);
+        k.tx = (int)((packed >> 22) & (u64)0x3FFFFF);
+        k.ty = (int)(packed & (u64)0x3FFFFF);
+        return k;
+    }
+};
+
+// A tile plus its destination rect (viewport points) as computed by MapCamera.visibleTiles().
+struct VisibleTile
+{
+    TileKey key = default;
+    double destX = 0.0;
+    double destY = 0.0;
+    double destW = 0.0;
+    double destH = 0.0;
+};
+
+// -----------------------------------------------------------------------
+// MapCamera
+// -----------------------------------------------------------------------
+// World units: at zoom Z, one world-unit-square (the full [0,1)x[0,1)
+// normalized world) maps to a (2^Z * 256) x (2^Z * 256) point square.
+// centerX/centerY are always expressed in the fixed [0,1) zoom-0 space.
+struct MapCamera
+{
+    double centerX  = 0.0;
+    double centerY  = 0.0;
+    double zoom     = 0.0;
+    double viewportW = 0.0;
+    double viewportH = 0.0;
+    double minZoom  = 0.0;
+    double maxZoom  = 22.0;
+
+    // Points-per-world-unit at the current zoom.
+    double _scale()
+    {
+        return Math.pow(2.0, zoom) * 256.0;
+    }
+
+    // Convert world coordinates to viewport point coordinates.
+    ScreenPt worldToScreen(double wx, double wy)
+    {
+        double scale = _scale();
+        ScreenPt r;
+        r.x = (wx - centerX) * scale + viewportW * 0.5;
+        r.y = (wy - centerY) * scale + viewportH * 0.5;
+        return r;
+    }
+
+    // Convert viewport point coordinates back to world coordinates (inverse of worldToScreen).
+    WorldPt screenToWorld(double sx, double sy)
+    {
+        double scale = _scale();
+        WorldPt r;
+        r.x = (sx - viewportW * 0.5) / scale + centerX;
+        r.y = (sy - viewportH * 0.5) / scale + centerY;
+        return r;
+    }
+
+    // Shift the camera so the view moves by (dxPoints, dyPoints) screen points.
+    void panBy(double dxPoints, double dyPoints)
+    {
+        double scale = _scale();
+        centerX = centerX + dxPoints / scale;
+        centerY = centerY + dyPoints / scale;
+    }
+
+    // Anchor-preserving zoom: the world point currently under (anchorXpt, anchorYpt)
+    // stays under that same screen point after the zoom change.
+    void zoomAt(double anchorXpt, double anchorYpt, double dz)
+    {
+        WorldPt anchorWorld = screenToWorld(anchorXpt, anchorYpt);
+        zoom = Math.clamp(zoom + dz, minZoom, maxZoom);
+        double scale = _scale();
+        centerX = anchorWorld.x - (anchorXpt - viewportW * 0.5) / scale;
+        centerY = anchorWorld.y - (anchorYpt - viewportH * 0.5) / scale;
+    }
+
+    // List of tiles overlapping the current viewport plus their destination
+    // rects (in viewport points). Level L = floor(zoom); tiles are addressed
+    // on a 2^L x 2^L grid and clamped to that range at world edges (no
+    // wraparound - out of scope for M3).
+    list<VisibleTile> visibleTiles()
+    {
+        list<VisibleTile> result = default;
+
+        int L = (int)Math.floor(zoom);
+        if (L < 0) L = 0;
+
+        int gridN = 1;
+        int i = 0;
+        while (i < L) { gridN = gridN * 2; i++; }
+
+        double frac = zoom - (double)L;
+        double tileSize = 256.0 * Math.pow(2.0, frac);
+
+        WorldPt w0 = screenToWorld(0.0, 0.0);
+        WorldPt w1 = screenToWorld(viewportW, viewportH);
+        double wx0 = w0.x < w1.x ? w0.x : w1.x;
+        double wx1 = w0.x < w1.x ? w1.x : w0.x;
+        double wy0 = w0.y < w1.y ? w0.y : w1.y;
+        double wy1 = w0.y < w1.y ? w1.y : w0.y;
+
+        int txMin = (int)Math.floor(wx0 * (double)gridN);
+        int txMax = (int)Math.ceil(wx1 * (double)gridN) - 1;
+        int tyMin = (int)Math.floor(wy0 * (double)gridN);
+        int tyMax = (int)Math.ceil(wy1 * (double)gridN) - 1;
+
+        if (txMin < 0) txMin = 0;
+        if (tyMin < 0) tyMin = 0;
+        if (txMax > gridN - 1) txMax = gridN - 1;
+        if (tyMax > gridN - 1) tyMax = gridN - 1;
+
+        int tx = txMin;
+        while (tx <= txMax)
+        {
+            int ty = tyMin;
+            while (ty <= tyMax)
+            {
+                double tileWx = (double)tx / (double)gridN;
+                double tileWy = (double)ty / (double)gridN;
+                ScreenPt dst = worldToScreen(tileWx, tileWy);
+
+                VisibleTile vt = default;
+                vt.key.z = L;
+                vt.key.tx = tx;
+                vt.key.ty = ty;
+                vt.destX = dst.x;
+                vt.destY = dst.y;
+                vt.destW = tileSize;
+                vt.destH = tileSize;
+                result.add(vt);
+                ty++;
+            }
+            tx++;
+        }
+        return move result;
+    }
+};
+
+// -----------------------------------------------------------------------
+// TileCache - capacity-bounded LRU keyed by packed TileKey, storing an
+// opaque u64 image handle per tile.
+// -----------------------------------------------------------------------
+struct TileCache
+{
+    int capacity = 0;
+    dictionary<u64, u64>  handles   = default;   // packed key -> image handle
+    list<u64>             lruOrder  = default;   // front = least-recently-used, back = most-recently-used
+    dictionary<u64, bool> pinned    = default;   // packed key -> pinned this frame (never evicted)
+    function<void(u64)>   releaseImage = default;
+    bool hasRelease = false;
+    int hitCount   = 0;
+    int missCount  = 0;
+    int evictCount = 0;
+
+    // Configure capacity (in tile count) and the callback used to free an
+    // evicted tile's image handle.
+    //
+    // NOTE (compiler quirk, see internal/issue/map-engine-param-field-prefix.md):
+    // do not name this parameter `release` - `releaseImage = release;` silently
+    // no-ops (the field keeps its default null callback) when the parameter
+    // name is an exact prefix of the field name it is assigned to.
+    void init(int cap, function<void(u64)> onEvict)
+    {
+        capacity = cap;
+        releaseImage = onEvict;
+        hasRelease = true;
+    }
+
+    // Move packedKey to the most-recently-used end of the LRU order.
+    void _touch(u64 packedKey)
+    {
+        int i = 0;
+        int n = lruOrder.count();
+        int foundIdx = -1;
+        while (i < n)
+        {
+            if (lruOrder.get(i) == packedKey) foundIdx = i;
+            i++;
+        }
+        if (foundIdx != -1) lruOrder.removeAt(foundIdx);
+        lruOrder.add(packedKey);
+    }
+
+    // Look up a tile's image handle. Updates LRU order and hit/miss counters
+    // on a hit; does not mutate state on a miss.
+    bool tryGet(TileKey key, u64* outHandle)
+    {
+        u64 pk = key.pack();
+        if (handles.contains(pk))
+        {
+            *outHandle = handles.get(pk);
+            _touch(pk);
+            hitCount++;
+            return true;
+        }
+        missCount++;
+        return false;
+    }
+
+    // Pin exactly this set of tiles for the current frame (replaces any
+    // previous pin set - does not accumulate). Call once per frame, before
+    // any eviction-triggering insert().
+    void markVisible(list<TileKey> keys)
+    {
+        pinned.clear();
+        int i = 0;
+        int n = keys.count();
+        while (i < n)
+        {
+            pinned.set(keys.get(i).pack(), true);
+            i++;
+        }
+    }
+
+    // Evict the single least-recently-used UNPINNED tile, if any.
+    // Returns true if a tile was evicted.
+    bool _evictOne()
+    {
+        int i = 0;
+        int n = lruOrder.count();
+        while (i < n)
+        {
+            u64 candidate = lruOrder.get(i);
+            if (!pinned.contains(candidate))
+            {
+                u64 h = handles.get(candidate);
+                handles.remove(candidate);
+                lruOrder.removeAt(i);
+                if (hasRelease) releaseImage(h);
+                evictCount++;
+                return true;
+            }
+            i++;
+        }
+        return false;
+    }
+
+    // Insert or overwrite a tile's image handle. Evicts LRU unpinned tiles
+    // (via releaseImage) until there is room, when inserting a brand-new key.
+    void insert(TileKey key, u64 handle)
+    {
+        u64 pk = key.pack();
+        if (handles.contains(pk))
+        {
+            handles.set(pk, handle);
+            _touch(pk);
+            return;
+        }
+        while (handles.count() >= capacity)
+        {
+            bool evicted = _evictOne();
+            if (!evicted) break;   // everything left is pinned - nothing more to reclaim
+        }
+        handles.set(pk, handle);
+        lruOrder.add(pk);
+    }
+};
+
+// -----------------------------------------------------------------------
+// TileScheduler - a PURE state machine tracking request dedupe, in-flight
+// caps, and cancellation. It never itself starts a fetch: the app layer is
+// expected to call drainReady() after request()/tileReady() calls and start
+// fetching exactly the TileKeys it returns (that transition is what "in-
+// flight" means here - purely a bookkeeping state, not a real network/thread
+// event). This drainReady()-pull design (vs. request() returning a bool) was
+// chosen so multiple request() calls in a frame can be batched into one
+// drain, and so completions (tileReady) that free an in-flight slot can also
+// promote a newly-eligible queued tile via the same drain call.
+//
+// No retry/backoff in M3: a dispatched (in-flight) tile that never calls
+// tileReady() is simply forgotten by the scheduler (nothing times it out -
+// that needs the M5 timer seam). cancelNotIn() only removes QUEUED (not yet
+// dispatched) requests; in-flight requests are never cancelled in M3.
+// -----------------------------------------------------------------------
+struct TileScheduler
+{
+    int maxInFlight = 4;
+    dictionary<u64, bool> queued   = default;   // packed key -> still queued (not yet dispatched)
+    list<u64>             queueOrder = default; // FIFO order of queued keys
+    dictionary<u64, bool> inFlight = default;   // packed key -> dispatched, awaiting tileReady()
+
+    // Request a tile. No-op (deduped) if it is already cached, already
+    // queued, or already in-flight. Otherwise the key is queued; whether it
+    // becomes dispatchable is decided by drainReady().
+    void request(TileKey key, TileCache* tileCache)
+    {
+        u64 pk = key.pack();
+        u64 dummy = (u64)0;
+        if (tileCache != nullptr && tileCache->tryGet(key, &dummy)) return;
+        if (queued.contains(pk) || inFlight.contains(pk)) return;
+        queued.set(pk, true);
+        queueOrder.add(pk);
+    }
+
+    // Promote as many queued keys to in-flight as the maxInFlight cap
+    // allows, in FIFO request order. Returns the keys that just became
+    // dispatchable this call - the app should start a fetch for each.
+    list<TileKey> drainReady()
+    {
+        list<TileKey> ready = default;
+        while (inFlight.count() < maxInFlight && queueOrder.count() > 0)
+        {
+            u64 pk = queueOrder.take(0);
+            if (!queued.contains(pk)) continue;   // was cancelled while queued
+            queued.remove(pk);
+            inFlight.set(pk, true);
+            ready.add(TileKey.unpack(pk));
+        }
+        return move ready;
+    }
+
+    // Cancel any QUEUED (not yet dispatched) request whose key is not in
+    // stillWantedKeys. In-flight requests are left running (no cancellation
+    // of already-dispatched work in M3).
+    void cancelNotIn(list<TileKey> stillWantedKeys)
+    {
+        dictionary<u64, bool> wanted = default;
+        int i = 0;
+        int n = stillWantedKeys.count();
+        while (i < n)
+        {
+            wanted.set(stillWantedKeys.get(i).pack(), true);
+            i++;
+        }
+
+        list<u64> newOrder = default;
+        i = 0;
+        n = queueOrder.count();
+        while (i < n)
+        {
+            u64 pk = queueOrder.get(i);
+            if (wanted.contains(pk))
+            {
+                newOrder.add(pk);
+            }
+            else
+            {
+                queued.remove(pk);
+            }
+            i++;
+        }
+        queueOrder = move newOrder;
+    }
+
+    // Report that a fetch completed. Removes key from the in-flight set; if
+    // the key was actually tracked as in-flight ("wanted" == was in-flight -
+    // a cancelled-while-queued key never reaches in-flight, so this is the
+    // only way "not wanted" can happen in M3), inserts into tileCache and
+    // returns true. Otherwise the caller should release the image itself.
+    bool tileReady(TileKey key, u64 img, TileCache* tileCache)
+    {
+        u64 pk = key.pack();
+        bool wasInFlight = inFlight.contains(pk);
+        if (wasInFlight) inFlight.remove(pk);
+        if (!wasInFlight) return false;
+        tileCache->insert(key, img);
+        return true;
+    }
+};
+
+// -----------------------------------------------------------------------
+// bestAncestor - progressive-placeholder lookup: walk up from `key` toward
+// z=0 looking for the nearest cached ancestor tile, and the sub-rect (in
+// [0,1] fractions of the ancestor tile) that `key`'s tile occupies within it.
+// -----------------------------------------------------------------------
+struct AncestorResult
+{
+    bool found = false;
+    TileKey key = default;
+    double sx = 0.0;
+    double sy = 0.0;
+    double sw = 0.0;
+    double sh = 0.0;
+};
+
+// Does not pin or mark-visible the probed ancestor keys - only tryGet()'s
+// hit/miss counters and LRU order are affected, mirroring a normal lookup.
+AncestorResult bestAncestor(TileCache* tileCache, TileKey key)
+{
+    AncestorResult result = default;
+
+    int delta = 1;
+    while (key.z - delta >= 0)
+    {
+        int pow2 = 1;
+        int i = 0;
+        while (i < delta) { pow2 = pow2 * 2; i++; }
+
+        TileKey ancestorKey = default;
+        ancestorKey.z  = key.z - delta;
+        ancestorKey.tx = key.tx / pow2;
+        ancestorKey.ty = key.ty / pow2;
+
+        u64 dummyHandle = (u64)0;
+        if (tileCache->tryGet(ancestorKey, &dummyHandle))
+        {
+            result.found = true;
+            result.key = ancestorKey;
+            int modTx = key.tx - ancestorKey.tx * pow2;
+            int modTy = key.ty - ancestorKey.ty * pow2;
+            result.sx = (double)modTx / (double)pow2;
+            result.sy = (double)modTy / (double)pow2;
+            result.sw = 1.0 / (double)pow2;
+            result.sh = 1.0 / (double)pow2;
+            return result;
+        }
+        delta++;
+    }
+    return result;
+}

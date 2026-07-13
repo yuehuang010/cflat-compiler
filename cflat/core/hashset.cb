@@ -11,6 +11,7 @@ struct hashset<T>
     char* _status = nullptr;   // 0 = empty, 1 = occupied, 2 = deleted
     int   _count  = 0;
     int   _capacity = 0;
+    int   _tombstones = 0;     // number of deleted (status==2) slots
 
     // Hash value to a starting bucket index in [0, _capacity).
     int _slot(T value)
@@ -40,15 +41,30 @@ struct hashset<T>
         _capacity = cap;
     }
 
-    // Grow to double capacity and reinsert all live elements.
-    void _rehash()
+    // Rehash when occupied+tombstone slots exceed 3/4 of capacity. Grow only when the
+    // live-element count is itself dense; otherwise rehash in place to purge tombstones.
+    // Without counting tombstones toward the load factor, add/remove churn fills the
+    // table with tombstones, leaves zero empty slots, and the probe loops spin forever.
+    void _maybeRehash()
+    {
+        if ((_count + _tombstones) * 4 >= _capacity * 3)
+        {
+            int newCap = _capacity;
+            if (_count * 4 >= _capacity * 3) newCap = _capacity * 2;
+            _rehash(newCap);
+        }
+    }
+
+    // Rebuild the table at `newCap`, reinserting live elements and dropping tombstones.
+    void _rehash(int newCap)
     {
         T*    oldKeys   = _keys;
         char* oldStatus = _status;
         int   oldCap    = _capacity;
 
         _count = 0;
-        _init(_capacity * 2);
+        _tombstones = 0;
+        _init(newCap);
 
         int i = 0;
         while (i < oldCap)
@@ -73,7 +89,7 @@ struct hashset<T>
     bool add(T value)
     {
         if (_capacity == 0) _init(8);
-        if (_count * 4 >= _capacity * 3) _rehash();
+        _maybeRehash();
 
         int slot = _slot(value);
         int firstDeleted = -1;
@@ -84,7 +100,7 @@ struct hashset<T>
             slot = (slot + 1) % _capacity;
         }
         int insertSlot = slot;
-        if (firstDeleted != -1) insertSlot = firstDeleted;
+        if (firstDeleted != -1) { insertSlot = firstDeleted; _tombstones--; }
         // Store the element. A `string` element is deep-copied so the slot owns an independent
         // buffer: a plain store would alias the caller's `value` argument (a soon-freed temp/
         // local) and dangle once it is freed. The destructor/remove()/clear() free this owned
@@ -125,6 +141,7 @@ struct hashset<T>
                     _keys[slot].~();
                 _status[slot] = 2;
                 _count--;
+                _tombstones++;
                 return true;
             }
             slot = (slot + 1) % _capacity;
@@ -152,6 +169,7 @@ struct hashset<T>
         i = 0;
         while (i < _capacity) { _status[i] = 0; i++; }
         _count = 0;
+        _tombstones = 0;
     }
 
     // Free owned string element copies, then the backing arrays.

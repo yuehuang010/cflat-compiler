@@ -329,9 +329,24 @@ interface ICanvas
     void clear();
     void drawText(int col, int row, const char* s, int color);
     void drawRect(Rect r, bool filled, int color);   // filled=false border, true fill
+    // Blit a host image handle (from canvasCreateImage) into a POINTS rect (dx,dy,dw,dh),
+    // linearly scaled. Points are relative to the canvas origin (top-left, y down), NOT
+    // cells - this is the pixel-precise draw path (tiles, sprites). The TUI/char backends
+    // have no pixels, so drawImage is a documented no-op there.
+    void drawImage(u64 img, double dx, double dy, double dw, double dh);
     void pushClip(Rect r);
     void popClip();
 };
+
+// -- Canvas image handles: the host seam for retained paint-time images ----------
+// A canvas image is a paint-time object (a tile / sprite the host wraps once into a
+// CGImage / HBITMAP), distinct from the Image ELEMENT's setImageData control path.
+// canvasCreateImage COPIES the caller's BGRA buffer (the caller keeps ownership of its
+// input), returns an opaque host handle, and canvasReleaseImage frees it. These are
+// host free functions (no window/control needed), defined per backend; the ICanvas/TUI
+// hosts return a nonzero DUMMY handle so headless library code runs without pixels.
+u64  canvasCreateImage(u64 bgraPixels, int w, int h);
+void canvasReleaseImage(u64 img);
 
 // TUI ICanvas: a thin adapter over a Surface. (Surface is a struct and cannot
 // implement an interface directly, so the adapter carries the contract.) Holds a
@@ -393,6 +408,10 @@ class SurfaceCanvas : ICanvas
             yy++;
         }
     }
+
+    // The char grid has no pixels; canvas images are a native-host feature. Documented
+    // no-op here (a dithered block fill could come later; out of scope).
+    void drawImage(u64 img, double dx, double dy, double dw, double dh) { }
 
     void pushClip(Rect r)
     {
@@ -859,6 +878,7 @@ interface IText : ITooltipped
 {
     string text;
     int    color;
+    int    font;      // FONT_* id; a native-host display hint (0 = default UI font)
 };
 
 interface IButton : IDisableable
@@ -1025,6 +1045,23 @@ interface ICanvasView : ITooltipped
     int width;
     int height;
     Lambda<void(ICanvas)> onPaint;   // read as a value: boxed across the host seam
+    // Opt-in input (M1). The hosts read the has* flag first and only then read the
+    // Lambda as a value (boxed across the host seam) - an unset Lambda cannot be called.
+    bool hasPointerDown;
+    bool hasPointerMove;
+    bool hasPointerUp;
+    bool hasWheel;
+    bool hasPinch;
+    Lambda<void(double, double, int)> onPointerDown;
+    Lambda<void(double, double, int)> onPointerMove;
+    Lambda<void(double, double, int)> onPointerUp;
+    Lambda<void(double, double, double, double, bool)> onWheel;
+    Lambda<void(double, double, double)> onPinch;
+    void setOnPointerDown(Lambda<void(double, double, int)> h);
+    void setOnPointerMove(Lambda<void(double, double, int)> h);
+    void setOnPointerUp(Lambda<void(double, double, int)> h);
+    void setOnWheel(Lambda<void(double, double, double, double, bool)> h);
+    void setOnPinch(Lambda<void(double, double, double)> h);
 };
 
 // ComponentElement needs no interface: nothing outside the class reaches a field of
@@ -1087,6 +1124,11 @@ class View : IView
         int pad = this.style.padding;
         Size sz = default;
         int gap = this.style.gap;
+        // Honor an explicit style.width: cap the width this View lays children
+        // within and reports as its own size to style.width. Height stays
+        // content-driven. When style.width is 0 this is a no-op (c.availW is a
+        // by-value copy), so a no-width tree lays out and serializes identically.
+        if (this.style.width > 0) c.availW = this.style.width;
         if (this.style.flexDirection == DIR_ROW && this.style.flexWrap == WRAP_WRAP)
         {
             int innerW = c.availW - 2 * pad;
@@ -1529,24 +1571,37 @@ class Text : IText
 {
     string text = default;
     int    color = 0;           // rgb(); 0 = default ink
+    int    font = 0;            // FONT_UI (0) default; FONT_TITLE / FONT_CAPTION on native hosts
     string tooltip = default;   // native hover tooltip; "" = none. Use a literal.
     Rect bounds = default;
     string key = default;
 
+    // A default-font Text (font 0) elides the field so existing serialized trees
+    // stay byte-identical; a non-default font adds a "font" key.
     move string toJson()
     {
+        if (this.font != 0)
+            return "{\"type\":\"Text\",\"text\":\"" + this.text
+                 + "\",\"font\":" + this.font.toString() + "}";
         return "{\"type\":\"Text\",\"text\":\"" + this.text + "\"}";
     }
 
     Size layout(LayoutConstraints c)
     {
         Rect b = default;
-        b.x = c.x; b.y = c.y; b.w = (int)this.text.length(); b.h = 1;
+        b.x = c.x; b.y = c.y;
+        int len = (int)this.text.length();
+        // FONT_TITLE == 2 (bold, ~1.3x wider on native hosts; literal since the
+        // FONT_* consts are declared later in the file) reserves a wider cell.
+        b.w = this.font == 2 ? (len * 13 + 9) / 10 : len;
+        b.h = 1;
         this.bounds = b;
         Size s = default; s.w = b.w; s.h = 1;
         return s;
     }
 
+    // The canvas/TUI backends draw a single fixed cell font, so this.font is a
+    // native-host display hint only and is ignored here (cell rendering unchanged).
     void paint(ICanvas cv, IUiContext ctx)
     {
         cv.drawText(this.bounds.x, this.bounds.y, this.text.data(),
@@ -1563,7 +1618,7 @@ class Text : IText
     bool propsEqual(IElement other)
     {
         IText o = other as IText;
-        return o != nullptr && this.text == o.text;
+        return o != nullptr && this.text == o.text && this.font == o.font;
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -3568,6 +3623,15 @@ void adoptContainerProps(IElement committed, IElement wip)
         ISplitView b = wip as ISplitView;
         if (a != nullptr && b != nullptr) { a.ratio = b.ratio; a.vertical = b.vertical; }
     }
+    else if (k == ELEM_VIEW)
+    {
+        // A View container's style drives its host backdrop fill (panelBg) + layout.
+        // Reconcile keeps the committed node, so a theme flip that re-colored the wip
+        // View would otherwise be dropped and the card would keep its stale fill.
+        IView a = committed as IView;
+        IView b = wip as IView;
+        if (a != nullptr && b != nullptr) a.style = b.style;
+    }
 }
 
 // -- TreeView node-source boxing (the setListOp seam carries an opaque u64) ------
@@ -3853,14 +3917,46 @@ move IGroupBox groupBox(string title, Style style)
 // host the view maps to a GDI-backed child window that invokes the boxed closure on
 // WM_PAINT (see the CanvasBox seam below); on a ICanvas host, paint() delegates straight
 // to onPaint with the host's own ICanvas.
+// -- Interactive input (M1) ----------------------------------------------------
+// A CanvasView may opt into pointer / wheel / pinch input. All handler coordinates
+// are POINTS relative to the canvas view origin (top-left, y DOWN), NOT layout cells -
+// this is the pixel-precise input path (pan/zoom, drawing). `buttons` is a bitmask of
+// currently-pressed mouse buttons (bit 0 = left, bit 1 = right). `dx/dy` are wheel
+// deltas (points); `precise` is true for a trackpad's continuous scroll. `scale` is a
+// per-event pinch zoom factor around 1.0 (1.0 = no change). Handlers are OPT-IN: each is
+// `= default` (unset) with a parallel `has*` flag, INSTALLED via the setOn* methods (a
+// direct field write would not arm the flag). Calling an unset Lambda faults, so the hosts
+// only invoke a handler when its flag is set - a canvas with none behaves exactly as before.
+// Handlers are NOT serialized (toJson) and NOT compared (propsEqual) - identical to onPaint -
+// so installing one never churns reconcile identity. Only the native hosts route real OS
+// input; the TUI/ICanvas host exposes the same handlers through its test drivers (wheel/pinch
+// are native-host-only there).
 class CanvasView : ICanvasView
 {
     Lambda<void(ICanvas)> onPaint = default;
+    Lambda<void(double, double, int)> onPointerDown = default;
+    Lambda<void(double, double, int)> onPointerMove = default;
+    Lambda<void(double, double, int)> onPointerUp   = default;
+    Lambda<void(double, double, double, double, bool)> onWheel = default;
+    Lambda<void(double, double, double)> onPinch = default;
+    bool hasPointerDown = false;
+    bool hasPointerMove = false;
+    bool hasPointerUp   = false;
+    bool hasWheel       = false;
+    bool hasPinch       = false;
     int    width   = 20;         // layout width (DIP)
     int    height  = 8;          // layout height (DIP)
     string tooltip = default;
     Rect   bounds = default;
     string key    = default;
+
+    // Handler installers. Assign the closure AND arm the presence flag; the hosts gate
+    // every invocation on the flag (an unset Lambda cannot be called safely).
+    void setOnPointerDown(Lambda<void(double, double, int)> h) { this.onPointerDown = h; this.hasPointerDown = true; }
+    void setOnPointerMove(Lambda<void(double, double, int)> h) { this.onPointerMove = h; this.hasPointerMove = true; }
+    void setOnPointerUp(Lambda<void(double, double, int)> h)   { this.onPointerUp = h;   this.hasPointerUp = true; }
+    void setOnWheel(Lambda<void(double, double, double, double, bool)> h) { this.onWheel = h; this.hasWheel = true; }
+    void setOnPinch(Lambda<void(double, double, double)> h)    { this.onPinch = h;       this.hasPinch = true; }
 
     move string toJson() { return "{\"type\":\"CanvasView\"}"; }
 
@@ -4263,9 +4359,13 @@ int PROP_MAX     = 2;   // range maximum (default 100)
 int PROP_CARET   = 3;   // text caret index
 int PROP_SCROLLY = 4;   // vertical scroll offset (DIPs)
 
-// Font ids for measureText; a host maps these to a concrete typeface + size.
+// Font ids for measureText and Text.font; a host maps these to a concrete
+// typeface + size. Only native hosts honor them; the canvas/TUI hosts render a
+// fixed cell font, so a font id is a no-op there (see Text.paint).
 int FONT_UI      = 0;   // the default UI font (Segoe UI Variable / system)
 int FONT_MONO    = 1;   // a monospace face (editor / code)
+int FONT_TITLE   = 2;   // bold, ~1.3x system size (headers / card titles)
+int FONT_CAPTION = 3;   // smaller, secondary label color (descriptions / captions)
 
 // -- setListOp: the item-data batch protocol -----------------------------------
 // Property sets (setText/setBoolProp/setIntProp) cannot express a data-control's

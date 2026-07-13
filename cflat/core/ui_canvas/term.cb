@@ -112,3 +112,77 @@ int runApp(IComponent app, const char* statusLine)
     term.restore();
     return 0;
 }
+
+// -- Canvas input drivers + image stubs (M1/M2, TUI/Canvas host) ---------------
+// The char grid has no pixels and no wheel/pinch input, so on this host the canvas
+// input drivers are TEST seams that invoke the CanvasView element's handlers directly
+// (the oracle is app state), and the image API is a documented no-op. Live pointer/
+// wheel/pinch on the TUI host are native-host-only; a headless self-test binds its root
+// tree with nativeCanvasBindRoot, then drives nativeCanvas* by key path.
+IElement _uiCanvasRoot = nullptr;   // borrowed active tree for the drivers below
+
+void nativeCanvasBindRoot(IElement root) { _uiCanvasRoot = root; }
+
+// Depth-first key-path lookup (mirror of the native hosts' findByKey), local to this host.
+IElement _termFindByKey(IElement node, string path, string want)
+{
+    if (node == nullptr) return nullptr;
+    if (path == want) return node;
+    list<IElement>* kids = node.childList();
+    if (kids != nullptr)
+    {
+        int i = 0;
+        while (i < kids.count())
+        {
+            IElement c = kids.get(i);
+            string cp = joinKeyPath(path, keySegment(c, i));
+            IElement r = _termFindByKey(c, cp, want);
+            if (r != nullptr) return r;
+            i++;
+        }
+    }
+    return nullptr;
+}
+
+ICanvasView _termCanvasAt(string keyPath)
+{
+    if (_uiCanvasRoot == nullptr) return nullptr;
+    IElement e = _termFindByKey(_uiCanvasRoot, keySegment(_uiCanvasRoot, 0), keyPath);
+    if (e == nullptr) return nullptr;
+    return e as ICanvasView;
+}
+
+void nativeCanvasPointer(string keyPath, int phase, double x, double y)
+{
+    ICanvasView cv = _termCanvasAt(keyPath);
+    if (cv == nullptr) return;
+    int buttons = phase == 2 ? 0 : 1;   // down/move = left held, up = released
+    if (phase == 0) { if (cv.hasPointerDown) cv.onPointerDown(x, y, buttons); }
+    else if (phase == 1) { if (cv.hasPointerMove) cv.onPointerMove(x, y, buttons); }
+    else { if (cv.hasPointerUp) cv.onPointerUp(x, y, buttons); }
+}
+
+void nativeCanvasWheel(string keyPath, double x, double y, double dx, double dy)
+{
+    ICanvasView cv = _termCanvasAt(keyPath);
+    if (cv == nullptr || !cv.hasWheel) return;
+    cv.onWheel(x, y, dx, dy, true);
+}
+
+void nativeCanvasPinch(string keyPath, double x, double y, double scale)
+{
+    ICanvasView cv = _termCanvasAt(keyPath);
+    if (cv == nullptr || !cv.hasPinch) return;
+    cv.onPinch(x, y, scale);
+}
+
+// canvasCreateImage returns a nonzero DUMMY handle (no pixel store on the char grid) so
+// headless library code runs; canvasReleaseImage is a no-op. drawImage (SurfaceCanvas) is
+// already a no-op. The handle is never dereferenced on this host.
+u64 canvasCreateImage(u64 bgraPixels, int w, int h)
+{
+    if (bgraPixels == 0u || w <= 0 || h <= 0) return 0u;
+    return 1u;   // opaque nonzero sentinel
+}
+
+void canvasReleaseImage(u64 img) { }

@@ -1,0 +1,1176 @@
+// map_app.cb - the host-neutral map example: MapView (a library control wrapping an
+// interactive CanvasView + the map_engine.cb camera/cache/scheduler) + the MapApp
+// IComponent + the headless mapSelfTest().
+//
+// This file follows the 05-gallery split: it has NO main() (map.cb is the launcher)
+// and imports only the element model (ui_native.cb), the test runner (ui_test.cb),
+// the pure tile engine (map_engine.cb), and thread.cb/time.cb for the worker tile
+// source. Every host free function it calls (canvasCreateImage/canvasReleaseImage,
+// startHeadlessWindow, pumpNative, activeApp/activeCtx, hostWidth, the native*
+// drivers) resolves from whichever host the LAUNCHER also imports - a cflat
+// compilation shares one global scope across the root's whole import closure.
+// Excluded from the plain example build sweeps for that reason, like gallery_app.cb.
+//
+// Placeholder strategy (M4): drawImage has NO src-rect overload yet, so a missing
+// tile cannot be blitted from a sub-rect of its cached ancestor. Instead paint runs
+// three passes: (1) a flat theme-gray base coat over the whole canvas, (2) each
+// UNIQUE cached ancestor of any missing tile drawn ONCE at its full scaled extent
+// (an upscaled-but-correct progressive backdrop - drawing it per-missing-child
+// would blit the same ancestor 4+ times), then (3) every resolved tile on top.
+// A true per-tile ancestor crop is recorded as the "src-rect drawImage overload"
+// M5 unlock in internal/plan/ui-map-canvas.md.
+import "ui_native.cb";
+import "ui_test.cb";
+import "map_engine.cb";
+import "thread.cb";
+import "time.cb";
+
+const int    MAP_TILE_PX     = 256;    // generated tile edge, pixels
+const double MAP_VIEW_W_PTS  = 512.0;  // camera viewport, points
+const double MAP_VIEW_H_PTS  = 520.0;
+const int    MAP_CANVAS_W    = 64;     // CanvasView layout cells (Cocoa: 64*8 = 512pt)
+const int    MAP_CANVAS_H    = 20;     // (Cocoa: 20*26 = 520pt)
+const int    MAP_CACHE_CAP   = 64;     // tile cache capacity (tiles)
+const double MAP_WHEEL_STEP  = 0.25;   // zoom levels per discrete wheel line
+
+// TileCache eviction callback: free the host image handle (plain global function -
+// see the M3 note at TileCache.init about function<> field assignment).
+void _mapReleaseTileImage(u64 imgHandle)
+{
+    canvasReleaseImage(imgHandle);
+}
+
+// Build a fresh TileKey (list<T>.add takes ownership of the argument, so hand it a
+// fresh value instead of a reused local - same helper the M3 harness used).
+TileKey mapKey(int kz, int ktx, int kty)
+{
+    TileKey k = default;
+    k.z = kz; k.tx = ktx; k.ty = kty;
+    return k;
+}
+
+// Deterministic procedural tile source: a checkerboard shaded from a hash of
+// (z,tx,ty), a light 2px border, and the tx/ty/z bit patterns drawn as small blocks
+// (coordinate encoding - each tile is visually unique and byte-identical across
+// calls, which the self-test asserts). BGRA32, caller frees. Compute is one pass
+// over 256x256 pixels - well inside the per-tile budget.
+u64 makeTilePixels(int tz, int ttx, int tty)
+{
+    int edge = MAP_TILE_PX;
+    u64 p = (u64)malloc((i64)(edge * edge * 4));
+    char* b = (char*)p;
+
+    u32 hsh = ((u32)tz * 73856093u) ^ ((u32)ttx * 19349663u) ^ ((u32)tty * 83492791u);
+    int baseB = (int)((hsh >> 0) & 0x3Fu) + 96;
+    int baseG = (int)((hsh >> 8) & 0x3Fu) + 96;
+    int baseR = (int)((hsh >> 16) & 0x3Fu) + 96;
+
+    int y = 0;
+    while (y < edge)
+    {
+        int x = 0;
+        while (x < edge)
+        {
+            int i = (y * edge + x) * 4;
+            bool darkSq = (((x / 32) + (y / 32)) & 1) == 1;
+            int shade = darkSq ? 0 : 48;
+            int cb = baseB + shade;
+            int cg = baseG + shade;
+            int cr = baseR + shade;
+            // Border ring so tile seams are visible while panning.
+            if (x < 2 || y < 2 || x >= edge - 2 || y >= edge - 2) { cb = 230; cg = 230; cr = 230; }
+            b[i + 0] = (char)cb;
+            b[i + 1] = (char)cg;
+            b[i + 2] = (char)cr;
+            b[i + 3] = (char)255;
+            x++;
+        }
+        y++;
+    }
+
+    // Coordinate encoding: tx bits (row at y=8), ty bits (y=24), z bits (y=40);
+    // bit i set -> an 8x8 white block at x = 8 + i*12.
+    int rowVals0 = ttx; int rowVals1 = tty; int rowVals2 = tz;
+    int rowIdx = 0;
+    while (rowIdx < 3)
+    {
+        int v = rowIdx == 0 ? rowVals0 : (rowIdx == 1 ? rowVals1 : rowVals2);
+        int by = 8 + rowIdx * 16;
+        int bit = 0;
+        while (bit < 10)
+        {
+            if (((v >> bit) & 1) != 0)
+            {
+                int bx = 8 + bit * 12;
+                int yy = by;
+                while (yy < by + 8)
+                {
+                    int xx = bx;
+                    while (xx < bx + 8)
+                    {
+                        int i = (yy * edge + xx) * 4;
+                        b[i + 0] = (char)255; b[i + 1] = (char)255;
+                        b[i + 2] = (char)255; b[i + 3] = (char)255;
+                        xx++;
+                    }
+                    yy++;
+                }
+            }
+            bit++;
+        }
+        rowIdx++;
+    }
+    return p;
+}
+
+// -----------------------------------------------------------------------
+// MapView - the library control: an interactive CanvasView wired to a
+// MapCamera + TileCache + TileScheduler. Host-neutral: input arrives through
+// the CanvasView handler seam (or the public pointer*/wheel/pinch methods,
+// which the self-test drives directly), painting goes through the ICanvas
+// interface, and tile fetches are delegated to the app via tileSource.
+// -----------------------------------------------------------------------
+class MapView
+{
+    MapCamera     camera    = default;
+    TileCache     tileCache = default;
+    TileScheduler scheduler = default;
+
+    // The app's on-demand fetch seam: called with (z, tx, ty) for each tile the
+    // scheduler dispatches; the app generates pixels on a worker and completes via
+    // MapView.tileArrived on the UI thread.
+    Lambda<void(int, int, int)> tileSource = default;
+    bool hasTileSource = false;
+
+    // Optional region-change notification (fired after any pan/zoom).
+    Lambda<void()> onRegionChange = default;
+    bool hasRegionChange = false;
+
+    // Drag-pan state + paint diagnostics.
+    bool   dragging = false;
+    double dragX    = 0.0;
+    double dragY    = 0.0;
+    int    paintCount = 0;
+    int    lastResolvedDraws = 0;   // resolved tiles drawn on the most recent paint
+    int    lastAncestorDraws = 0;   // unique ancestor placeholders drawn
+
+    IUiContext uiCtx = default;     // bound each build(); used by input handlers
+
+    void init(double vpWidthPts, double vpHeightPts)
+    {
+        this.camera.centerX = 0.5;
+        this.camera.centerY = 0.5;
+        this.camera.zoom = 2.0;
+        this.camera.viewportW = vpWidthPts;
+        this.camera.viewportH = vpHeightPts;
+        this.tileCache.init(MAP_CACHE_CAP, _mapReleaseTileImage);
+    }
+
+    void setTileSource(Lambda<void(int, int, int)> src)
+    {
+        this.tileSource = src;
+        this.hasTileSource = true;
+    }
+
+    void _regionChanged()
+    {
+        if (this.hasRegionChange) this.onRegionChange();
+        if (this.uiCtx != nullptr) this.uiCtx.invalidate();
+        // Re-render immediately so the live Cocoa event path repaints during the
+        // gesture (the same fireClick+pumpNative pattern the hosts' routeClick uses).
+        pumpNative();
+    }
+
+    // -- Public input surface (the CanvasView closures forward here; the
+    //    self-test calls these directly, host-neutrally) ---------------------
+    void pointerDown(double px, double py, int buttons)
+    {
+        this.dragging = true;
+        this.dragX = px; this.dragY = py;
+    }
+
+    void pointerMove(double px, double py, int buttons)
+    {
+        if (!this.dragging) return;
+        this.camera.panBy(this.dragX - px, this.dragY - py);
+        this.dragX = px; this.dragY = py;
+        this._regionChanged();
+    }
+
+    void pointerUp(double px, double py, int buttons)
+    {
+        this.dragging = false;
+    }
+
+    // Google Maps wheel semantics: precise (trackpad) deltas PAN the map;
+    // discrete wheel lines ZOOM anchored at the cursor.
+    void wheel(double px, double py, double dx, double dy, bool precise)
+    {
+        if (precise) this.camera.panBy(-dx, -dy);
+        else this.camera.zoomAt(px, py, dy * MAP_WHEEL_STEP);
+        this._regionChanged();
+    }
+
+    // Pinch: scale is a per-event factor around 1.0 -> dz = log2(scale).
+    void pinch(double px, double py, double scaleFactor)
+    {
+        if (scaleFactor <= 0.0) return;
+        this.camera.zoomAt(px, py, Math.log2(scaleFactor));
+        this._regionChanged();
+    }
+
+    // Zoom by dz anchored at the viewport center (the HUD +/- buttons).
+    void zoomCenter(double dz)
+    {
+        this.camera.zoomAt(this.camera.viewportW * 0.5, this.camera.viewportH * 0.5, dz);
+        this._regionChanged();
+    }
+
+    // -- Paint: visibility -> cache/scheduler bookkeeping -> three draw passes --
+    // Pass 1 base coat, pass 2 unique cached ancestors of missing tiles at full
+    // scaled extent, pass 3 resolved tiles (see the placeholder note at file top).
+    void paint(ICanvas cv)
+    {
+        this.paintCount++;
+        list<VisibleTile> vis = this.camera.visibleTiles();
+        int n = vis.count();
+
+        // Pin exactly this frame's tiles, then drop stale queued requests.
+        // Two key lists: markVisible/cancelNotIn each take their list by value.
+        list<TileKey> pinKeys = default;
+        list<TileKey> wantKeys = default;
+        int i = 0;
+        while (i < n)
+        {
+            VisibleTile vt = vis.get(i);
+            pinKeys.add(mapKey(vt.key.z, vt.key.tx, vt.key.ty));
+            wantKeys.add(mapKey(vt.key.z, vt.key.tx, vt.key.ty));
+            i++;
+        }
+        this.tileCache.markVisible(pinKeys);
+        this.scheduler.cancelNotIn(wantKeys);
+
+        // One cache probe per tile; remember the result for the draw pass.
+        list<u64>  gotHandle = default;
+        list<bool> gotTile   = default;
+        i = 0;
+        while (i < n)
+        {
+            VisibleTile vt = vis.get(i);
+            u64 h = (u64)0;
+            bool ok = this.tileCache.tryGet(vt.key, &h);
+            gotTile.add(ok);
+            gotHandle.add(h);
+            // Request misses with a null cache ptr: the probe above already
+            // decided, so skip request()'s own tryGet (no double miss-count).
+            if (!ok) this.scheduler.request(vt.key, nullptr);
+            i++;
+        }
+
+        // Dispatch newly-eligible fetches to the app's tile source.
+        list<TileKey> ready = this.scheduler.drainReady();
+        i = 0;
+        while (i < ready.count())
+        {
+            TileKey rk = ready.get(i);
+            if (this.hasTileSource) this.tileSource(rk.z, rk.tx, rk.ty);
+            i++;
+        }
+
+        // Pass 1: flat placeholder base coat (cells - layout-space fill).
+        Rect base = default;
+        base.x = 0; base.y = 0; base.w = MAP_CANVAS_W; base.h = MAP_CANVAS_H;
+        cv.drawRect(base, true, rgb(88, 92, 98));
+
+        // Pass 2: each unique cached ancestor of any missing tile, once, at its
+        // full scaled extent (points), before the resolved tiles land on top.
+        dictionary<u64, bool> ancestorDrawn = default;
+        int ancestorDraws = 0;
+        i = 0;
+        while (i < n)
+        {
+            if (!gotTile.get(i))
+            {
+                VisibleTile vt = vis.get(i);
+                AncestorResult ar = bestAncestor(&this.tileCache, vt.key);
+                if (ar.found)
+                {
+                    u64 apk = ar.key.pack();
+                    if (!ancestorDrawn.contains(apk))
+                    {
+                        ancestorDrawn.set(apk, true);
+                        u64 ah = (u64)0;
+                        if (this.tileCache.tryGet(ar.key, &ah))
+                        {
+                            int gridN = 1;
+                            int gi = 0;
+                            while (gi < ar.key.z) { gridN = gridN * 2; gi++; }
+                            double gw = (double)gridN;
+                            ScreenPt tl = this.camera.worldToScreen(
+                                (double)ar.key.tx / gw, (double)ar.key.ty / gw);
+                            double sizePts = this.camera._scale() / gw;
+                            cv.drawImage(ah, tl.x, tl.y, sizePts, sizePts);
+                            ancestorDraws++;
+                        }
+                    }
+                }
+            }
+            i++;
+        }
+
+        // Pass 3: resolved tiles at their computed dest rects (points).
+        int resolvedDraws = 0;
+        i = 0;
+        while (i < n)
+        {
+            if (gotTile.get(i))
+            {
+                VisibleTile vt = vis.get(i);
+                cv.drawImage(gotHandle.get(i), vt.destX, vt.destY, vt.destW, vt.destH);
+                resolvedDraws++;
+            }
+            i++;
+        }
+        this.lastResolvedDraws = resolvedDraws;
+        this.lastAncestorDraws = ancestorDraws;
+    }
+
+    // Build this render's CanvasView (FACTORY form - a raw `new CanvasView()`
+    // is a documented crash on the live Cocoa clone path). Rewired every render;
+    // reconcile keeps the native surface, the boxed paint closure captures `this`
+    // which is stable for the app's lifetime.
+    ICanvasView build(IUiContext ctx)
+    {
+        this.uiCtx = ctx;
+        ICanvasView cv = canvasView((ICanvas c) => { this.paint(c); });
+        cv.width = MAP_CANVAS_W;
+        cv.height = MAP_CANVAS_H;
+        cv.setKey("canvas");
+        cv.setOnPointerDown((double px, double py, int bt) => { this.pointerDown(px, py, bt); });
+        cv.setOnPointerMove((double px, double py, int bt) => { this.pointerMove(px, py, bt); });
+        cv.setOnPointerUp((double px, double py, int bt) => { this.pointerUp(px, py, bt); });
+        cv.setOnWheel((double px, double py, double dx, double dy, bool prec) => {
+            this.wheel(px, py, dx, dy, prec);
+        });
+        cv.setOnPinch((double px, double py, double sc) => { this.pinch(px, py, sc); });
+        return cv;
+    }
+};
+
+// -----------------------------------------------------------------------
+// The tile-fetch worker: generates deterministic pixels off the UI thread
+// (with a small simulated latency so async + placeholders are genuinely
+// exercised), then marshals completion back with ctx.post().
+// -----------------------------------------------------------------------
+class TileJob
+{
+    Thread th     = default;
+    int    z      = 0;
+    int    tx     = 0;
+    int    ty     = 0;
+    u64    pixels = 0u;
+    void*  owner  = nullptr;   // the MapApp* (typed void* - declared before MapApp)
+};
+
+class MapApp : IComponent
+{
+    MapView*   map   = nullptr;   // app-local control class, not a UI element: stays a pointer
+    IUiContext uiCtx = default;
+
+    list<TileJob*> jobs = default;   // in-flight fetch jobs (owned)
+    int tilesStarted   = 0;
+    int tilesCompleted = 0;
+    int regionChanges  = 0;
+
+    ~MapApp()
+    {
+        // Join + free any fetch still in flight at teardown (leak-clean).
+        while (this.jobs.count() > 0)
+        {
+            TileJob* j = this.jobs.take(0);
+            j.th.join();
+            if (j.pixels != 0u) { free((void*)j.pixels); j.pixels = 0u; }
+            delete j;
+        }
+        if (this.map != nullptr) { delete this.map; this.map = nullptr; }
+    }
+
+    // The tileSource seam: start one worker per dispatched tile.
+    void startFetch(int fz, int ftx, int fty)
+    {
+        TileJob* j = new TileJob();
+        j.z = fz; j.tx = ftx; j.ty = fty;
+        j.owner = (void*)this;
+        this.tilesStarted++;
+        j.th.start(_mapTileWorker, j);   // borrow: the app outlives + joins the worker
+        // add() takes ownership of j (last use); the completion cannot run before
+        // this returns - it is marshaled to the UI thread we are on.
+        this.jobs.add(j);
+    }
+
+    // Runs on the UI thread (via the worker's ctx.post): upload the pixels,
+    // hand the tile to the scheduler/cache, dispatch any newly-freed slot.
+    void finishTile(TileJob* doneJob)
+    {
+        doneJob.th.join();
+        TileKey k = mapKey(doneJob.z, doneJob.tx, doneJob.ty);
+        u64 img = canvasCreateImage(doneJob.pixels, MAP_TILE_PX, MAP_TILE_PX);
+        free((void*)doneJob.pixels);
+        doneJob.pixels = 0u;
+
+        bool accepted = false;
+        if (img != 0u) accepted = this.map.scheduler.tileReady(k, img, &this.map.tileCache);
+        if (!accepted && img != 0u) canvasReleaseImage(img);
+
+        // Remove + free the job wrapper.
+        int i = 0;
+        while (i < this.jobs.count())
+        {
+            if (this.jobs.get(i) == doneJob) { TileJob* owned = this.jobs.take(i); delete owned; break; }
+            i++;
+        }
+        this.tilesCompleted++;
+
+        // A completion frees an in-flight slot: promote the next queued tiles now
+        // instead of waiting for the next paint.
+        list<TileKey> more = this.map.scheduler.drainReady();
+        i = 0;
+        while (i < more.count())
+        {
+            TileKey mk = more.get(i);
+            this.startFetch(mk.z, mk.tx, mk.ty);
+            i++;
+        }
+        this.uiCtx.invalidate();
+    }
+
+    // Format zoom with 2 decimals ("3.25") without float printf plumbing.
+    string _fmtZoom()
+    {
+        double zv = this.map.camera.zoom;
+        int hundredths = (int)(zv * 100.0 + 0.5);
+        int whole = hundredths / 100;
+        int frac = hundredths % 100;
+        string fs = frac < 10 ? ("0" + frac.toString()) : frac.toString();
+        return whole.toString() + "." + fs;
+    }
+
+    string _fmtWorld(double wv)
+    {
+        int thousandths = (int)(wv * 1000.0 + 0.5);
+        int whole = thousandths / 1000;
+        int frac = thousandths % 1000;
+        if (frac < 0) frac = -frac;
+        string fs = frac.toString();
+        while (fs.length() < 3) fs = "0" + fs;
+        return whole.toString() + "." + fs;
+    }
+
+    IElement render(IUiContext ctx)
+    {
+        this.uiCtx = ctx;
+        if (this.map == nullptr)
+        {
+            this.map = new MapView();
+            this.map.init(MAP_VIEW_W_PTS, MAP_VIEW_H_PTS);
+            this.map.setTileSource((int sz, int stx, int sty) => { this.startFetch(sz, stx, sty); });
+            this.map.onRegionChange = () => { this.regionChanges = this.regionChanges + 1; };
+            this.map.hasRegionChange = true;
+        }
+
+        IView root = column(makeStyle(1, hostWidth(), 0));
+        root.style.gap = 1;
+        root.setKey("root");
+
+        // HUD: plain sibling Buttons above the canvas (no overlay machinery).
+        IView hud = row(makeStyle(0, 0, 0));
+        hud.style.gap = 1;
+        hud.setKey("hud");
+        IButton zin = button("+", () => { this.map.zoomCenter(1.0); });
+        zin.setKey("zin");
+        hud.add(zin);
+        IButton zout = button("-", () => { this.map.zoomCenter(-1.0); });
+        zout.setKey("zout");
+        hud.add(zout);
+        root.add(hud);
+
+        // Status line: zoom + center + cache counters (cheap oracle + demo HUD).
+        IText status = text("z=" + this._fmtZoom()
+            + "  center=(" + this._fmtWorld(this.map.camera.centerX)
+            + "," + this._fmtWorld(this.map.camera.centerY) + ")"
+            + "  hit=" + this.map.tileCache.hitCount.toString()
+            + " miss=" + this.map.tileCache.missCount.toString()
+            + " evict=" + this.map.tileCache.evictCount.toString());
+        status.setKey("status");
+        root.add(status);
+
+        root.add(this.map.build(ctx));
+        return root;
+    }
+};
+
+// The worker thread for one tile fetch: generate deterministic pixels, simulate a
+// few ms of latency, then post completion to the UI thread.
+int _mapTileWorker(void* arg)
+{
+    TileJob* j = (TileJob*)arg;
+    j.pixels = makeTilePixels(j.z, j.tx, j.ty);
+    sleep(3);
+    MapApp* app = (MapApp*)j.owner;
+    TileJob* posted = j;
+    app.uiCtx.post(() => { app.finishTile(posted); });
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// mapLiveProbe - a REAL run-loop oracle (the seam the headless self-test cannot
+// cover). It opens the live window, lets NSApp drive drawRect + worker ctx.post
+// completions unassisted for `secs` seconds, then reads the paint diagnostics on
+// the UI thread and closes the window. Exits 0 only if every visible tile actually
+// resolved on screen (lastResolvedDraws == visible count) - which is exactly the
+// signal the M4 grey-box bug (posted completion never repainted) would have failed.
+// Launch in the background and assert on the exit code:
+//   out/map --probe        (3s default)   ->  exit 0 = tiles resolved, 1 = grey box
+// ---------------------------------------------------------------------------
+int _mapProbeResolved = 0 - 1;   // tiles drawn resolved at the check (set on UI thread)
+int _mapProbeVisible  = 0 - 1;   // visible tile count at the check
+
+class ProbeWatch
+{
+    Thread th   = default;
+    void*  app  = nullptr;   // the MapApp* (typed void* - declared before use)
+    int    secs = 0;
+};
+
+// Watchdog thread: after `secs`, marshal a UI-thread closure that records the paint
+// diagnostics and closes the window (which ends runAppGuiNative's run loop).
+int _mapProbeWatchdog(void* arg)
+{
+    ProbeWatch* pw = (ProbeWatch*)arg;
+    sleep((i64)pw.secs * (i64)1000);
+    MapApp* app = (MapApp*)pw.app;
+    app.uiCtx.post(() =>
+    {
+        MapView* mv = app.map;
+        _mapProbeVisible  = mv.camera.visibleTiles().count();
+        _mapProbeResolved = mv.lastResolvedDraws;
+        nativeCloseWindow();
+    });
+    return 0;
+}
+
+int mapLiveProbe(int secs)
+{
+    MapApp* app = new MapApp();   // runAppGuiNative takes ownership + frees on close
+    ProbeWatch pw = default;
+    pw.app = (void*)app;
+    pw.secs = secs;
+    pw.th.start(_mapProbeWatchdog, &pw);
+    runAppGuiNative(app, "CFlat UI - Map (probe)");
+    pw.th.join();   // the watchdog already posted + returned before the window closed
+    // `app` is freed by the window's dispose() now - only the recorded globals are safe.
+    if (_mapProbeVisible > 0 && _mapProbeResolved == _mapProbeVisible)
+    {
+        printf("PROBE PASS: %d/%d visible tiles resolved live\n", _mapProbeResolved, _mapProbeVisible);
+        return 0;
+    }
+    printf("PROBE FAIL: %d/%d visible tiles resolved live (grey-box regression)\n",
+           _mapProbeResolved, _mapProbeVisible);
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// mapSelfTest - the headless suite. Cases 1-10 are the M3 engine asserts
+// (ported from the scratch harness map_engine_check.cb, 35 assertions); the
+// windowed cases launch MapApp and drive input/tiles host-neutrally.
+// ---------------------------------------------------------------------------
+
+bool _mapNearEq(double a, double b, double eps)
+{
+    double d = a - b;
+    if (d < 0.0) d = -d;
+    return d < eps;
+}
+
+// Global release-callback recorder for the LRU case (function<> field target).
+list<u64> _mapTestReleased = default;
+void _mapRecordRelease(u64 handle) { _mapTestReleased.add(handle); }
+
+// A counting ICanvas fake: the paint oracle. Records how many images were
+// blitted and how many fill rects were painted - host-independent (the Win32
+// host's real drawImage is a no-op, but this fake counts on every host).
+// Counters are module globals so pass-by-interface copy semantics cannot
+// hide the recorded values from the asserting caller.
+int _ccImageDraws = 0;
+int _ccFillDraws  = 0;
+void _ccReset() { _ccImageDraws = 0; _ccFillDraws = 0; }
+
+class CountingCanvas : ICanvas
+{
+    void clear() { }
+    void drawText(int col, int rw, const char* s, int color) { }
+    void drawRect(Rect r, bool filled, int color) { if (filled) _ccFillDraws = _ccFillDraws + 1; }
+    void drawImage(u64 img, double dx, double dy, double dw, double dh) { _ccImageDraws = _ccImageDraws + 1; }
+    void pushClip(Rect r) { }
+    void popClip() { }
+};
+
+// Paint through the counting fake with counters reset first.
+void _ccPaint(MapView* mv)
+{
+    _ccReset();
+    CountingCanvas cc = default;
+    mv.paint(cc);
+}
+
+// Host canvas-input driver checks: Cocoa routes nativeCanvasPointer/Pinch to the
+// element handlers; the Win32 host's drivers are a documented no-op parity gap,
+// so these asserts only run on macOS (a helper so if const sits at statement scope).
+void _mapDriverChecksMac(IUiTest t, MapView* mv)
+{
+    if const (__MACOS__)
+    {
+        double eps = 1e-9;
+        double scaleD = mv.camera._scale();
+        double cxd = mv.camera.centerX;
+        nativeCanvasPointer("root/canvas", 0, 50.0, 50.0);
+        nativeCanvasPointer("root/canvas", 1, 90.0, 50.0);
+        nativeCanvasPointer("root/canvas", 2, 90.0, 50.0);
+        t.expectTrue("nativeCanvasPointer drives the same pan math",
+            _mapNearEq(mv.camera.centerX, cxd + (-40.0) / scaleD, eps));
+
+        WorldPt bp = mv.camera.screenToWorld(256.0, 260.0);
+        nativeCanvasPinch("root/canvas", 256.0, 260.0, 2.0);
+        WorldPt ap = mv.camera.screenToWorld(256.0, 260.0);
+        t.expectTrue("nativeCanvasPinch zooms with anchor preserved",
+            _mapNearEq(mv.camera.zoom, 3.5, eps)
+            && _mapNearEq(bp.x, ap.x, eps) && _mapNearEq(bp.y, ap.y, eps));
+    }
+}
+
+int mapSelfTest()
+{
+    UiTestSuite s = uiTestSuite("map");
+
+    // 1. World/screen round-trip at three cameras x six screen points.
+    s.test("camera round-trip", (IUiTest t) =>
+    {
+        double eps = 1e-9;
+        MapCamera cams0; cams0.centerX = 0.5; cams0.centerY = 0.5; cams0.zoom = 0.0;
+        cams0.viewportW = 400.0; cams0.viewportH = 300.0;
+        MapCamera cams1; cams1.centerX = 0.2; cams1.centerY = 0.8; cams1.zoom = 5.0;
+        cams1.viewportW = 800.0; cams1.viewportH = 600.0;
+        MapCamera cams2; cams2.centerX = 0.9; cams2.centerY = 0.1; cams2.zoom = 12.5;
+        cams2.viewportW = 1024.0; cams2.viewportH = 768.0;
+        list<MapCamera> cams = default;
+        cams.add(cams0); cams.add(cams1); cams.add(cams2);
+
+        double[6] sxs; sxs[0] = 0.0; sxs[1] = 50.0; sxs[2] = 199.5; sxs[3] = 400.0; sxs[4] = 1023.0; sxs[5] = 512.25;
+        double[6] sys; sys[0] = 0.0; sys[1] = 30.0; sys[2] = 150.0; sys[3] = 300.0; sys[4] = 767.0;  sys[5] = 400.75;
+
+        int ci = 0;
+        while (ci < cams.count())
+        {
+            MapCamera cam = cams.get(ci);
+            int pi = 0;
+            bool allOk = true;
+            while (pi < 6)
+            {
+                WorldPt w = cam.screenToWorld(sxs[pi], sys[pi]);
+                ScreenPt s2 = cam.worldToScreen(w.x, w.y);
+                if (!_mapNearEq(s2.x, sxs[pi], eps) || !_mapNearEq(s2.y, sys[pi], eps)) allOk = false;
+                pi++;
+            }
+            t.expectTrue("round-trip screen->world->screen", allOk);
+            ci++;
+        }
+    });
+
+    // 2. Anchor-zoom invariant (in and out, different anchors).
+    s.test("anchor-zoom invariant", (IUiTest t) =>
+    {
+        double eps = 1e-9;
+        MapCamera cam; cam.centerX = 0.37; cam.centerY = 0.61; cam.zoom = 4.0;
+        cam.viewportW = 640.0; cam.viewportH = 480.0;
+
+        WorldPt before = cam.screenToWorld(200.0, 150.0);
+        cam.zoomAt(200.0, 150.0, 2.0);
+        WorldPt after = cam.screenToWorld(200.0, 150.0);
+        t.expectTrue("anchor-zoom invariant (zoom in)",
+            _mapNearEq(before.x, after.x, eps) && _mapNearEq(before.y, after.y, eps));
+
+        WorldPt before2 = cam.screenToWorld(10.0, 470.0);
+        cam.zoomAt(10.0, 470.0, -1.5);
+        WorldPt after2 = cam.screenToWorld(10.0, 470.0);
+        t.expectTrue("anchor-zoom invariant (zoom out)",
+            _mapNearEq(before2.x, after2.x, eps) && _mapNearEq(before2.y, after2.y, eps));
+    });
+
+    // 3. visibleTiles exact key set + dest rects (integer + fractional zoom).
+    s.test("visibleTiles sets", (IUiTest t) =>
+    {
+        MapCamera cam; cam.centerX = 0.5; cam.centerY = 0.5; cam.zoom = 2.0;
+        cam.viewportW = 512.0; cam.viewportH = 512.0;
+        list<VisibleTile> tiles = cam.visibleTiles();
+
+        // 512x512 at z=2 centered on (0.5,0.5) covers exactly tx,ty in {1,2}.
+        t.expectTrue("visibleTiles: exact key count at integer zoom=2", tiles.count() == 4);
+
+        bool keysOk = true;
+        int i = 0;
+        while (i < tiles.count())
+        {
+            VisibleTile vt = tiles.get(i);
+            if (vt.key.z != 2) keysOk = false;
+            if (vt.key.tx < 1 || vt.key.tx > 2) keysOk = false;
+            if (vt.key.ty < 1 || vt.key.ty > 2) keysOk = false;
+            i++;
+        }
+        t.expectTrue("visibleTiles: key set within expected tx,ty in [1,2] at z=2", keysOk);
+
+        bool foundCorner = false;
+        i = 0;
+        while (i < tiles.count())
+        {
+            VisibleTile vt = tiles.get(i);
+            if (vt.key.tx == 1 && vt.key.ty == 1)
+            {
+                if (_mapNearEq(vt.destX, 0.0, 1e-9) && _mapNearEq(vt.destY, 0.0, 1e-9)
+                    && _mapNearEq(vt.destW, 256.0, 1e-9) && _mapNearEq(vt.destH, 256.0, 1e-9))
+                    foundCorner = true;
+            }
+            i++;
+        }
+        t.expectTrue("visibleTiles: dest rect for tile (2,1,1) is (0,0,256,256)", foundCorner);
+
+        MapCamera cam2; cam2.centerX = 0.5; cam2.centerY = 0.5; cam2.zoom = 2.5;
+        cam2.viewportW = 512.0; cam2.viewportH = 512.0;
+        list<VisibleTile> tiles2 = cam2.visibleTiles();
+        // Pass the exponent via a variable: literal args pick the float pow
+        // overload (float-precision result), same workaround as the M3 harness.
+        double half = 0.5;
+        double expectedSize = 256.0 * Math.pow(2.0, half);
+        bool fracOk = tiles2.count() > 0;
+        i = 0;
+        while (i < tiles2.count())
+        {
+            VisibleTile vt = tiles2.get(i);
+            if (!_mapNearEq(vt.destW, expectedSize, 1e-9) || !_mapNearEq(vt.destH, expectedSize, 1e-9))
+                fracOk = false;
+            if (vt.key.z != 2) fracOk = false;
+            i++;
+        }
+        t.expectTrue("visibleTiles: fractional zoom=2.5 scales tile size by 2^0.5", fracOk);
+    });
+
+    // 4. Edge clamping (no negative or overflowing tile indices).
+    s.test("visibleTiles edge clamp", (IUiTest t) =>
+    {
+        MapCamera cam; cam.centerX = 0.02; cam.centerY = 0.02; cam.zoom = 2.0;
+        cam.viewportW = 512.0; cam.viewportH = 512.0;
+        list<VisibleTile> tiles = cam.visibleTiles();
+        bool clamped = tiles.count() > 0;
+        int i = 0;
+        while (i < tiles.count())
+        {
+            VisibleTile vt = tiles.get(i);
+            if (vt.key.tx < 0 || vt.key.tx >= 4) clamped = false;
+            if (vt.key.ty < 0 || vt.key.ty >= 4) clamped = false;
+            i++;
+        }
+        t.expectTrue("visibleTiles: near-corner camera clamps tile indices to grid range", clamped);
+    });
+
+    // 5. TileCache LRU + pinning + eviction release callback.
+    s.test("cache LRU + pinning", (IUiTest t) =>
+    {
+        _mapTestReleased.clear();
+        TileCache tc = default;
+        tc.init(3, _mapRecordRelease);
+
+        TileKey k0; k0.z = 1; k0.tx = 0; k0.ty = 0;
+        TileKey k1; k1.z = 1; k1.tx = 0; k1.ty = 1;
+        TileKey k2; k2.z = 1; k2.tx = 1; k2.ty = 0;
+        TileKey k3; k3.z = 1; k3.tx = 1; k3.ty = 1;
+
+        tc.insert(k0, (u64)100);
+        tc.insert(k1, (u64)101);
+        tc.insert(k2, (u64)102);
+
+        // Pin k1: it must survive eviction even though it is not the MRU.
+        list<TileKey> visible = default;
+        visible.add(mapKey(1, 0, 1));
+        tc.markVisible(visible);
+
+        tc.insert(k3, (u64)103);
+        t.expectTrue("TileCache: eviction picks LRU unpinned victim (k0), not pinned k1",
+            _mapTestReleased.count() == 1 && _mapTestReleased.get(0) == (u64)100);
+
+        u64 outHandle = (u64)0;
+        t.expectTrue("TileCache: evicted key is no longer retrievable", !tc.tryGet(k0, &outHandle));
+        t.expectTrue("TileCache: pinned key survives eviction",
+            tc.tryGet(k1, &outHandle) && outHandle == (u64)101);
+
+        // markVisible replaces the pin set: pin only k2, force another eviction.
+        list<TileKey> visible2 = default;
+        visible2.add(mapKey(1, 1, 0));
+        tc.markVisible(visible2);
+
+        TileKey k4; k4.z = 1; k4.tx = 2; k4.ty = 0;
+        tc.insert(k4, (u64)104);
+        bool evictedSecond = _mapTestReleased.count() == 2;
+        t.expectTrue("TileCache: second eviction occurred after re-pinning", evictedSecond);
+        // k1 was touched by the tryGet above (MRU); with k2 pinned, k3 is the true LRU.
+        t.expectTrue("TileCache: second eviction picks true LRU unpinned (k3)",
+            evictedSecond && _mapTestReleased.get(1) == (u64)103);
+
+        t.expectTrue("TileCache: hitCount tracks tryGet hits", tc.hitCount >= 1);
+        t.expectTrue("TileCache: missCount tracks tryGet misses", tc.missCount >= 1);
+        t.expectTrue("TileCache: evictCount tracks evictions", tc.evictCount == 2);
+    });
+
+    // 6. Scheduler dedupe.
+    s.test("scheduler dedupe", (IUiTest t) =>
+    {
+        TileScheduler sched = default;
+        sched.maxInFlight = 4;
+        TileCache tc = default;
+        tc.init(10, _mapRecordRelease);
+
+        TileKey k; k.z = 3; k.tx = 1; k.ty = 1;
+        sched.request(k, &tc);
+        sched.request(k, &tc);   // duplicate - must be a no-op
+        list<TileKey> ready = sched.drainReady();
+        t.expectTrue("TileScheduler: duplicate request() dedupes to one dispatch", ready.count() == 1);
+    });
+
+    // 7. Scheduler cancel (only queued, never in-flight).
+    s.test("scheduler cancel", (IUiTest t) =>
+    {
+        TileScheduler sched = default;
+        sched.maxInFlight = 1;
+        TileCache tc = default;
+        tc.init(10, _mapRecordRelease);
+
+        TileKey ka; ka.z = 4; ka.tx = 0; ka.ty = 0;
+        TileKey kb; kb.z = 4; kb.tx = 0; kb.ty = 1;
+        TileKey kc; kc.z = 4; kc.tx = 0; kc.ty = 2;
+        sched.request(ka, &tc);
+        sched.request(kb, &tc);
+        sched.request(kc, &tc);
+
+        list<TileKey> ready1 = sched.drainReady();
+        t.expectTrue("TileScheduler: in-flight cap limits initial dispatch to maxInFlight",
+            ready1.count() == 1 && ready1.get(0).tx == 0 && ready1.get(0).ty == 0);
+
+        // Cancel all but kc: queued kb is dropped; in-flight ka is untouched.
+        list<TileKey> stillWanted = default;
+        stillWanted.add(mapKey(4, 0, 2));
+        sched.cancelNotIn(stillWanted);
+
+        t.expectTrue("TileScheduler: tileReady on in-flight key succeeds",
+            sched.tileReady(ka, (u64)200, &tc));
+
+        list<TileKey> ready2 = sched.drainReady();
+        t.expectTrue("TileScheduler: cancelNotIn removed queued kb, kc still drains",
+            ready2.count() == 1 && ready2.get(0).ty == 2);
+    });
+
+    // 8. Scheduler in-flight cap + drain after completion.
+    s.test("scheduler cap", (IUiTest t) =>
+    {
+        TileScheduler sched = default;
+        sched.maxInFlight = 2;
+        TileCache tc = default;
+        tc.init(10, _mapRecordRelease);
+
+        TileKey k1; k1.z = 5; k1.tx = 0; k1.ty = 0;
+        TileKey k2; k2.z = 5; k2.tx = 0; k2.ty = 1;
+        TileKey k3; k3.z = 5; k3.tx = 0; k3.ty = 2;
+        sched.request(k1, &tc);
+        sched.request(k2, &tc);
+        sched.request(k3, &tc);
+
+        list<TileKey> firstDrain = sched.drainReady();
+        t.expectTrue("TileScheduler: exactly maxInFlight keys dispatch initially", firstDrain.count() == 2);
+
+        list<TileKey> secondDrain = sched.drainReady();
+        t.expectTrue("TileScheduler: no further dispatch while at the in-flight cap",
+            secondDrain.count() == 0);
+
+        t.expectTrue("TileScheduler: completing a dispatched tile succeeds",
+            sched.tileReady(k1, (u64)300, &tc));
+
+        list<TileKey> thirdDrain = sched.drainReady();
+        t.expectTrue("TileScheduler: completing a tile frees a slot for the next queued key",
+            thirdDrain.count() == 1 && thirdDrain.get(0).ty == 2);
+    });
+
+    // 9. tileReady inserts into cache and clears state correctly.
+    s.test("tileReady cache insert", (IUiTest t) =>
+    {
+        TileScheduler sched = default;
+        sched.maxInFlight = 2;
+        TileCache tc = default;
+        tc.init(10, _mapRecordRelease);
+
+        TileKey k; k.z = 6; k.tx = 3; k.ty = 3;
+        sched.request(k, &tc);
+        list<TileKey> drained = sched.drainReady();
+        t.expectTrue("TileScheduler: tileReady setup - key dispatched", drained.count() == 1);
+
+        t.expectTrue("TileScheduler: tileReady returns true for a wanted (in-flight) key",
+            sched.tileReady(k, (u64)999, &tc));
+
+        u64 outHandle = (u64)0;
+        bool found = tc.tryGet(k, &outHandle);
+        t.expectTrue("TileScheduler.tileReady: cache now holds the completed tile",
+            found && outHandle == (u64)999);
+
+        // A request for a now-cached key must dedupe against the cache.
+        sched.request(k, &tc);
+        list<TileKey> redrained = sched.drainReady();
+        t.expectTrue("TileScheduler: request() dedupes against an already-cached tile",
+            redrained.count() == 0);
+
+        // tileReady for a never-tracked key: false, no insert.
+        TileKey unknown; unknown.z = 6; unknown.tx = 9; unknown.ty = 9;
+        t.expectTrue("TileScheduler: tileReady on an untracked key returns false",
+            !sched.tileReady(unknown, (u64)111, &tc));
+        u64 dummy = (u64)0;
+        t.expectTrue("TileScheduler: tileReady on an untracked key does not insert into cache",
+            !tc.tryGet(unknown, &dummy));
+    });
+
+    // 10. bestAncestor placeholder lookup.
+    s.test("bestAncestor lookup", (IUiTest t) =>
+    {
+        TileCache tc = default;
+        tc.init(20, _mapRecordRelease);
+
+        TileKey missingChild; missingChild.z = 4; missingChild.tx = 5; missingChild.ty = 6;
+        AncestorResult r0 = bestAncestor(&tc, missingChild);
+        t.expectTrue("bestAncestor: nothing cached -> not found", !r0.found);
+
+        TileKey z1Ancestor; z1Ancestor.z = 3; z1Ancestor.tx = 2; z1Ancestor.ty = 3;
+        tc.insert(z1Ancestor, (u64)500);
+        AncestorResult r1 = bestAncestor(&tc, missingChild);
+        t.expectTrue("bestAncestor: finds immediate (delta=1) ancestor with correct sub-rect",
+            r1.found && r1.key.z == 3 && r1.key.tx == 2 && r1.key.ty == 3
+            && _mapNearEq(r1.sx, 0.5, 1e-9) && _mapNearEq(r1.sy, 0.0, 1e-9)
+            && _mapNearEq(r1.sw, 0.5, 1e-9) && _mapNearEq(r1.sh, 0.5, 1e-9));
+
+        TileKey missingChild2; missingChild2.z = 4; missingChild2.tx = 9; missingChild2.ty = 10;
+        TileKey z2Ancestor; z2Ancestor.z = 2; z2Ancestor.tx = 2; z2Ancestor.ty = 2;
+        tc.insert(z2Ancestor, (u64)600);
+        AncestorResult r2 = bestAncestor(&tc, missingChild2);
+        t.expectTrue("bestAncestor: skips missing delta=1, finds delta=2 ancestor with correct sub-rect",
+            r2.found && r2.key.z == 2 && r2.key.tx == 2 && r2.key.ty == 2
+            && _mapNearEq(r2.sx, 0.25, 1e-9) && _mapNearEq(r2.sy, 0.5, 1e-9)
+            && _mapNearEq(r2.sw, 0.25, 1e-9) && _mapNearEq(r2.sh, 0.25, 1e-9));
+    });
+
+    // 11. Deterministic tile source: same key -> byte-identical pixels; a
+    //     different key differs (the coordinate encoding is doing its job).
+    s.test("tile source determinism", (IUiTest t) =>
+    {
+        u64 pa = makeTilePixels(3, 1, 2);
+        u64 pb = makeTilePixels(3, 1, 2);
+        u64 pc = makeTilePixels(3, 2, 1);
+        int nbytes = MAP_TILE_PX * MAP_TILE_PX * 4;
+        t.expectTrue("same (z,tx,ty) -> byte-identical pixels",
+            memcmp((void*)pa, (void*)pb, (i64)nbytes) == 0);
+        t.expectTrue("different (z,tx,ty) -> different pixels",
+            memcmp((void*)pa, (void*)pc, (i64)nbytes) != 0);
+        free((void*)pa); free((void*)pb); free((void*)pc);
+    });
+
+    // 12. Windowed: pointer drag pans by exactly the drag math; precise wheel
+    //     pans; discrete wheel + pinch zoom anchored (fractional zooms); HUD
+    //     buttons zoom by whole levels at the viewport center.
+    s.test("windowed pan/zoom input", (IUiTest t) =>
+    {
+        t.launch(new MapApp(), 80, 40);
+        MapApp* a = activeApp() as MapApp;
+        t.requireTrue("app + MapView live", a != nullptr && a.map != nullptr);
+        MapView* mv = a.map;
+        double eps = 1e-9;
+
+        // Drag pan: down at (100,100), move to (130,80) -> panBy(-30, +20).
+        double scale0 = mv.camera._scale();
+        double cx0 = mv.camera.centerX;
+        double cy0 = mv.camera.centerY;
+        mv.pointerDown(100.0, 100.0, 1);
+        mv.pointerMove(130.0, 80.0, 1);
+        mv.pointerUp(130.0, 80.0, 0);
+        t.expectTrue("drag pans by exactly the pointer delta",
+            _mapNearEq(mv.camera.centerX, cx0 + (-30.0) / scale0, eps)
+            && _mapNearEq(mv.camera.centerY, cy0 + 20.0 / scale0, eps)
+            && !mv.dragging);
+
+        // Precise (trackpad) wheel pans: deltas (10,-5) -> panBy(-10, +5).
+        double cx1 = mv.camera.centerX;
+        double cy1 = mv.camera.centerY;
+        mv.wheel(200.0, 200.0, 10.0, -5.0, true);
+        t.expectTrue("precise wheel pans (no zoom change)",
+            _mapNearEq(mv.camera.centerX, cx1 + (-10.0) / scale0, eps)
+            && _mapNearEq(mv.camera.centerY, cy1 + 5.0 / scale0, eps)
+            && _mapNearEq(mv.camera.zoom, 2.0, eps));
+
+        // Discrete wheel zooms at the cursor: 2 lines -> dz=+0.5 (fractional zoom),
+        // and the world point under the cursor is preserved.
+        WorldPt beforeW = mv.camera.screenToWorld(300.0, 200.0);
+        mv.wheel(300.0, 200.0, 0.0, 2.0, false);
+        WorldPt afterW = mv.camera.screenToWorld(300.0, 200.0);
+        t.expectTrue("discrete wheel zooms at cursor (fractional, anchor preserved)",
+            _mapNearEq(mv.camera.zoom, 2.5, eps)
+            && _mapNearEq(beforeW.x, afterW.x, eps) && _mapNearEq(beforeW.y, afterW.y, eps));
+
+        // Pinch: scale 2.0 -> dz = +1, anchor preserved.
+        WorldPt beforeP = mv.camera.screenToWorld(150.0, 250.0);
+        mv.pinch(150.0, 250.0, 2.0);
+        WorldPt afterP = mv.camera.screenToWorld(150.0, 250.0);
+        t.expectTrue("pinch zooms at anchor (world point preserved)",
+            _mapNearEq(mv.camera.zoom, 3.5, eps)
+            && _mapNearEq(beforeP.x, afterP.x, eps) && _mapNearEq(beforeP.y, afterP.y, eps));
+
+        // HUD buttons: +/- zoom whole levels anchored at the viewport center.
+        WorldPt beforeC = mv.camera.screenToWorld(MAP_VIEW_W_PTS * 0.5, MAP_VIEW_H_PTS * 0.5);
+        nativeClickButton("root/hud/zin");
+        WorldPt afterC = mv.camera.screenToWorld(MAP_VIEW_W_PTS * 0.5, MAP_VIEW_H_PTS * 0.5);
+        t.expectTrue("HUD + zooms in one level at the viewport center",
+            _mapNearEq(mv.camera.zoom, 4.5, eps)
+            && _mapNearEq(beforeC.x, afterC.x, eps) && _mapNearEq(beforeC.y, afterC.y, eps));
+        nativeClickButton("root/hud/zout");
+        nativeClickButton("root/hud/zout");
+        t.expectTrue("HUD - zooms out (integer steps land on 2.5)",
+            _mapNearEq(mv.camera.zoom, 2.5, eps));
+
+        // Region-change callback fired for each gesture above.
+        t.expectTrue("onRegionChange fired per gesture", a.regionChanges >= 6);
+
+        _mapDriverChecksMac(t, mv);
+    });
+
+    // 13. Windowed: the full tile pipeline - first paint requests + dispatches,
+    //     dedupe on repaint, async completion via ctx.post, all-resolved repaint,
+    //     ancestor placeholders after a zoom, cancelNotIn after a big pan.
+    s.test("windowed tile pipeline", (IUiTest t) =>
+    {
+        t.launch(new MapApp(), 80, 40);
+        MapApp* a = activeApp() as MapApp;
+        t.requireTrue("app + MapView live", a != nullptr && a.map != nullptr);
+        MapView* mv = a.map;
+
+        // First paint (through the paint oracle): nothing cached yet, so no image
+        // draws, one base-coat fill, and maxInFlight fetches dispatched.
+        int visCount = mv.camera.visibleTiles().count();
+        _ccPaint(mv);
+        t.expectTrue("first paint: base coat, no tiles resolved",
+            _ccFillDraws >= 1 && _ccImageDraws == 0 && mv.lastResolvedDraws == 0);
+        t.expectTrue("first paint dispatches up to maxInFlight fetches",
+            a.tilesStarted == mv.scheduler.maxInFlight && visCount > mv.scheduler.maxInFlight);
+
+        // Repaint before any completion: dedupe (no new fetches started).
+        int startedBefore = a.tilesStarted;
+        _ccPaint(mv);
+        t.expectTrue("repaint dedupes in-flight + queued requests",
+            a.tilesStarted == startedBefore);
+
+        // Drain worker completions (ctx.post -> UI thread) until the whole visible
+        // set is cached; completions chain-dispatch the queued remainder.
+        bool allDone = t.waitUntil(() => a.tilesCompleted >= visCount, 5000);
+        t.expectTrue("all visible tiles complete via ctx.post", allDone);
+        t.expectTrue("every visible tile was fetched exactly once",
+            a.tilesStarted == visCount && a.tilesCompleted == visCount);
+
+        // A repaint now draws every visible tile resolved (and no placeholders).
+        _ccPaint(mv);
+        t.expectTrue("repaint draws all visible tiles resolved",
+            mv.lastResolvedDraws == visCount && mv.lastAncestorDraws == 0
+            && _ccImageDraws == visCount);
+        t.expectTrue("cache counters track the pipeline",
+            mv.tileCache.hitCount >= visCount && mv.tileCache.missCount >= visCount
+            && mv.tileCache.handles.count() == visCount);
+
+        // Zoom in one level: the z+1 tiles are missing, but their z-level
+        // ancestors are cached - the placeholder pass draws each unique ancestor
+        // once BEFORE any resolved tile.
+        mv.zoomCenter(1.0);
+        _ccPaint(mv);
+        t.expectTrue("zoomed paint draws cached ancestors as placeholders",
+            mv.lastAncestorDraws > 0 && mv.lastResolvedDraws == 0
+            && _ccImageDraws == mv.lastAncestorDraws);
+
+        // Big pan while the zoomed tiles are still queued: cancelNotIn must drop
+        // every stale queued request (only currently-visible keys stay queued).
+        int queuedBefore = mv.scheduler.queued.count();
+        t.expectTrue("zoomed paint left offscreen tiles queued", queuedBefore > 0);
+        mv.camera.panBy(1024.0, 0.0);
+        _ccPaint(mv);
+        list<VisibleTile> nowVis = mv.camera.visibleTiles();
+        bool queuedSubset = true;
+        int qi = 0;
+        while (qi < mv.scheduler.queueOrder.count())
+        {
+            u64 pk = mv.scheduler.queueOrder.get(qi);
+            if (!mv.scheduler.queued.contains(pk)) { qi++; continue; }
+            bool inVis = false;
+            int vi = 0;
+            while (vi < nowVis.count())
+            {
+                if (nowVis.get(vi).key.pack() == pk) inVis = true;
+                vi++;
+            }
+            if (!inVis) queuedSubset = false;
+            qi++;
+        }
+        t.expectTrue("big pan cancels queued offscreen tiles (queued is a subset of visible)",
+            queuedSubset);
+
+        // Let the remaining in-flight workers finish so teardown is clean.
+        t.waitUntil(() => a.jobs.count() == 0, 5000);
+    });
+
+    // 14. Engine: sustained markVisible/cancelNotIn churn must terminate.
+    //     Regression for the dictionary tombstone-saturation hang: zoom+pan storms
+    //     drove thousands of insert/remove cycles on `pinned` and `queued` until a
+    //     probe loop in dictionary.set() spun forever inside drawRect.
+    s.test("tile churn terminates", (IUiTest t) =>
+    {
+        // No release callback is set: this case never inserts, so nothing is evicted.
+        TileCache tc;
+        tc.capacity = 64;
+        TileScheduler sched;
+
+        // Each round pins and requests a fresh window of 8 tiles, then cancels the
+        // previous window - the per-frame pattern a zoom+pan storm produces.
+        int round = 0;
+        while (round < 2000)
+        {
+            list<TileKey> keys = default;
+            int i = 0;
+            while (i < 8)
+            {
+                TileKey k = default;
+                k.z = 5; k.tx = round + i; k.ty = round;
+                keys.add(k);
+                i++;
+            }
+            tc.markVisible(keys);
+            i = 0;
+            while (i < 8) { sched.request(keys.get(i), &tc); i++; }
+            sched.cancelNotIn(keys);
+            round++;
+        }
+        t.expectTrue("2000 churn rounds completed", round == 2000);
+        t.expectTrue("pinned holds exactly the last visible window", tc.pinned.count() == 8);
+
+        // Cancelling against an empty want-set drains every queued key.
+        list<TileKey> wantNothing = default;
+        sched.cancelNotIn(wantNothing);
+        t.expectTrue("cancelNotIn(empty) drains the queue", sched.queued.count() == 0);
+    });
+
+    return s.run(0, nullptr);
+}

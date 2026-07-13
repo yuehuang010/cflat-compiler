@@ -1055,6 +1055,20 @@ struct VoidHandler {
     Lambda<void()> fn = default;
 };
 
+// Regression: a method parameter whose name collides with a global core function
+// (e.g. `release`, defined in runtime.cb) must shadow it - `field = release;` had
+// mis-resolved the RHS to the global function instead of the parameter, silently
+// storing the wrong callable (or a no-op) into the field.
+struct ShadowSetter {
+    function<int(int)> releaseImage = default;
+    bool hasRelease = false;
+
+    void init(function<int(int)> release) {
+        releaseImage = release;   // 'release' is a parameter here, not core's release()
+        hasRelease = true;
+    }
+};
+
 bool testFuncPtrInStructField()
 {
     bool result = true;
@@ -1068,6 +1082,12 @@ bool testFuncPtrInStructField()
 
     h.fn = (int x) => { return x + 100; };
     result &= Test("struct field lambda", h.fn(3), 103);
+
+    // Parameter name shadows a same-named global core function on field assign.
+    ShadowSetter s;
+    s.init(doubleIt);
+    result &= Test("param shadows global fn: hasRelease", s.hasRelease ? 1 : 0, 1);
+    result &= Test("param shadows global fn: field call", s.releaseImage(6), 12);
 
     return result;
 }
