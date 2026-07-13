@@ -16,6 +16,7 @@ examples need no `-i` flag. The full reference is [`doc/UI.md`](../../doc/UI.md)
 | [06-winui](06-winui/) | A third host: WinUI 3 / XAML |
 | [07-testing](07-testing/) | Driving a UI app from an automated test |
 | [08-fedit](08-fedit/) | The flagship: a small native text editor |
+| [09-map](09-map/) | An interactive map on a canvas control, with a worker tile source |
 
 ## 01-elements
 
@@ -119,4 +120,19 @@ multiline editor - no browser engine.
 ```bash
 x64/Release/cflat.exe example/ui/08-fedit/fedit.cb -i example/ui -o out/fedit.exe
 out\fedit.exe
+```
+
+## 09-map
+
+A slippy map: pan with a drag, zoom with the wheel. It shows the pattern for a custom
+drawn control - a `CanvasView` - and for feeding it from a background thread.
+
+- `map_engine.cb` - the pure tile engine (camera, tile cache, scheduler). Imports no host
+  and no element model, so it is testable on its own.
+- `map_app.cb` - the `MapView` control, the `MapApp` component, and the headless self-test.
+  Host-neutral and with no `main()`, following the 05-gallery split.
+- `map.cb` - the Win32/Cocoa launcher.
+
+```bash
+x64/Release/cflat.exe example/ui/09-map/map.cb -i example/ui -o out/map.exe
 ```
