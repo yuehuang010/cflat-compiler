@@ -985,7 +985,15 @@ private:
             methods.push_back(std::move(m));
         }
 
-        Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods);
+        std::vector<LLVMBackend::TypeAndValue> fields;
+        for (auto* f : ctx->interfaceField())
+        {
+            LLVMBackend::TypeAndValue tv = ParseDeclarationSpecifiers(f->declarationSpecifiers());
+            tv.VariableName = f->directDeclarator()->getText();
+            fields.push_back(std::move(tv));
+        }
+
+        Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods, fields);
 
         if (auto* s = Compiler(ctx)->GetSymbolSink())
         {
@@ -2537,7 +2545,21 @@ public:
             methods.push_back(std::move(m));
         }
 
-        Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods);
+        Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods, ParseInterfaceFields(ctx));
+    }
+
+    // Field declarations in an interface body (`string title;`). The field name/type must be
+    // matched by every implementor; the vtable carries its per-implementor byte offset.
+    std::vector<LLVMBackend::TypeAndValue> ParseInterfaceFields(CFlatParser::InterfaceDefinitionContext* ctx)
+    {
+        std::vector<LLVMBackend::TypeAndValue> fields;
+        for (auto* f : ctx->interfaceField())
+        {
+            LLVMBackend::TypeAndValue tv = ParseDeclarationSpecifiers(f->declarationSpecifiers());
+            tv.VariableName = f->directDeclarator()->getText();
+            fields.push_back(std::move(tv));
+        }
+        return fields;
     }
 
     void InstantiateGenericInterface(const std::string& baseName, const std::string& mangledName,
@@ -2581,9 +2603,10 @@ public:
             methods.push_back(std::move(m));
         }
 
+        auto fields = ParseInterfaceFields(ctx);
         activeTypeSubstitutions = savedSubst;
         activePackSubstitutions = savedPackSubst;
-        Compiler()->CreateInterfaceDefinition(mangledName, parentNames, methods);
+        Compiler()->CreateInterfaceDefinition(mangledName, parentNames, methods, fields);
     }
 
     // Owner struct of a generic template keyed "Owner.method", or "" when the template is a
@@ -5894,6 +5917,14 @@ public:
                             // so we can do the class->interface fat-struct upcast when needed.
                             auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
                             right = LoadNamedVariable(rightNV);
+                            // Derived-interface -> parent-interface: re-box (a derived vtable is not
+                            // layout-compatible with the parent's once field slots exist).
+                            if (right && right->getType() == compiler->GetFatPtrType()
+                                && rightNV.TypeAndValue.IsInterface)
+                            {
+                                right = compiler->ReboxInterfaceIfNeeded(
+                                    right, rightNV.TypeAndValue.TypeName, typeAndValue.TypeName);
+                            }
                             if (right && right->getType() != compiler->GetFatPtrType())
                             {
                                 std::string structName = rightNV.TypeAndValue.TypeName;
@@ -7105,6 +7136,15 @@ public:
                     right = compiler->BuildInterfaceFatValue(vtable, dataPtr);
                 }
             }
+            // Derived-interface -> parent-interface assignment: re-box through the typedesc chain.
+            else if (operatorText == "=" && namedVar.TypeAndValue.IsInterface
+                     && !namedVar.TypeAndValue.IsInterfacePointer
+                     && right && right->getType() == compiler->GetFatPtrType()
+                     && rightNV.TypeAndValue.IsInterface)
+            {
+                right = compiler->ReboxInterfaceIfNeeded(
+                    right, rightNV.TypeAndValue.TypeName, namedVar.TypeAndValue.TypeName);
+            }
 
             // Pointer variable assigned a struct value: catch the mismatch here
             // with a clear message rather than letting LLVM assert inside CreateCast.
@@ -7148,8 +7188,9 @@ public:
             // X4 guard: copying a named owning-value into a struct field aliases its buffer (double-free).
             // Single-index GEP excluded - those are container-internal element stores that must not be flagged.
             auto* destGep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(destination);
-            bool destIsStructField = destGep && destGep->getNumIndices() == 2
-                && destGep->getSourceElementType()->isStructTy();
+            bool destIsStructField = (destGep && destGep->getNumIndices() == 2
+                && destGep->getSourceElementType()->isStructTy())
+                || namedVar.IsInterfaceField;  // reached via the interface's byte-offset slot
 
             // Closure store (Option A): closures are clone-safe, so named-source assignment auto-clones.
             // Old dest env freed for alloca/global only - skipped for struct-field GEP (slot may be uninitialized).
@@ -7257,8 +7298,9 @@ public:
             // Field-to-field copy of an owning value - REJECTED. Ownership is a runtime property, so
             // the compiler cannot safely deep-copy (would make a borrowed source owned) nor auto-move.
             auto* srcFieldGep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(rightNV.Storage);
-            bool srcIsStructField = srcFieldGep && srcFieldGep->getNumIndices() == 2
-                && srcFieldGep->getSourceElementType()->isStructTy();
+            bool srcIsStructField = (srcFieldGep && srcFieldGep->getNumIndices() == 2
+                && srcFieldGep->getSourceElementType()->isStructTy())
+                || rightNV.IsInterfaceField;
             bool selfFieldAssign = !namedVar.FieldName.empty()
                 && namedVar.FieldName == rightNV.FieldName
                 && namedVar.CallerName == rightNV.CallerName;
@@ -7882,6 +7924,24 @@ public:
         return {};
     }
 
+    // `ifaceVal == nullptr` / `!= nullptr`: rewrite the fat-ptr operand to its data pointer so the
+    // comparison is a plain pointer compare. Only fires when the other operand is a null constant.
+    void LowerInterfaceNullCompare(antlr4::ParserRuleContext* ctx,
+                                   LLVMBackend::TypedValue& lv, LLVMBackend::TypedValue& rv)
+    {
+        auto* compiler = Compiler(ctx);
+        auto* fatTy = compiler->GetFatPtrType();
+        auto isFat  = [&](const LLVMBackend::TypedValue& v)
+            { return v.value != nullptr && v.value->getType() == fatTy; };
+        auto isNull = [&](const LLVMBackend::TypedValue& v)
+            { return llvm::isa_and_nonnull<llvm::ConstantPointerNull>(v.value); };
+
+        if (isFat(lv) && isNull(rv))
+            lv.value = compiler->builder->CreateExtractValue(lv.value, { 1u }, "iface_data");
+        else if (isFat(rv) && isNull(lv))
+            rv.value = compiler->builder->CreateExtractValue(rv.value, { 1u }, "iface_data");
+    }
+
     LLVMBackend::TypedValue ParseEqualityExpression(CFlatParser::EqualityExpressionContext* ctx)
     {
         auto nextCtxs = ctx->typeCheckExpression();
@@ -7902,6 +7962,11 @@ public:
             auto rv = ParseTypeCheckExpression(nextCtxs[1]);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), rv.value);
             std::string op = ctx->children[1]->getText();
+
+            // An interface value compared against nullptr tests its DATA pointer (fat-ptr field 1):
+            // a failed `as <Interface>` yields a zeroed fat pointer, so `f != nullptr` is the
+            // hit/miss test. Reduce the fat operand to its data pointer and compare pointers.
+            LowerInterfaceNullCompare(ctx, lv, rv);
 
             auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx);
             llvm::Value* result = overload ? overload
@@ -7977,6 +8042,27 @@ public:
                                   antlr4::ParserRuleContext* ctx)
     {
         auto* compiler = Compiler(ctx);
+
+        // Interface target: true when the runtime type is any implementor of that interface.
+        // An OR-chain of typedesc compares - the same enumeration `switch` on an interface uses.
+        if (compiler->interfaceTable.count(targetTypeName))
+        {
+            auto loadedDesc = LoadTypeDescFromInterface(interfaceValue, ctx);
+            llvm::Value* result = compiler->builder->getInt1(false);
+            for (auto& [sName, sd] : compiler->dataStructures)
+            {
+                if (!sd.typeDescriptor || !compiler->StructImplementsInterface(sName, targetTypeName)) continue;
+                auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, sd.typeDescriptor);
+                result = compiler->builder->CreateOr(result, cmp);
+            }
+            for (auto& [pName, pd] : compiler->programTable)
+            {
+                if (!pd.typeDescriptor || !compiler->StructImplementsInterface(pName, targetTypeName)) continue;
+                auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, pd.typeDescriptor);
+                result = compiler->builder->CreateOr(result, cmp);
+            }
+            return result;
+        }
 
         auto targetIt = compiler->dataStructures.find(targetTypeName);
         if (targetIt == compiler->dataStructures.end())
@@ -12166,9 +12252,36 @@ public:
                         }
                         else if (interfaceVar.TypeAndValue.IsInterface)
                         {
-                            // Method name on interface variable - just record it; dispatch at call site
+                            // A name on an interface receiver: an interface FIELD resolves to an
+                            // lvalue here (data ptr + the vtable's byte-offset slot); anything else
+                            // is a method name, recorded for dispatch at the call site below.
                             primaryIdentifier = terminal->getText();
                             namedVar = {};
+
+                            auto* compiler = Compiler(ctx);
+                            const std::string& ifaceName = interfaceVar.TypeAndValue.TypeName;
+                            int ifaceFieldIdx = compiler->InterfaceFieldIndex(ifaceName, primaryIdentifier);
+                            if (ifaceFieldIdx >= 0 && !interfaceVar.TypeAndValue.IsInterfacePointer)
+                            {
+                                llvm::Value* fatVal = interfaceVar.Primary != nullptr
+                                    ? interfaceVar.Primary
+                                    : compiler->CreateLoad(compiler->GetFatPtrType(), interfaceVar.Storage);
+
+                                const auto& fieldType = (*compiler->GetInterfaceFields(ifaceName))[ifaceFieldIdx];
+                                auto* fieldLLVMType = compiler->GetType(fieldType);
+                                auto* addr = compiler->EmitInterfaceFieldAddress(
+                                    fatVal, ifaceName, primaryIdentifier, fieldLLVMType);
+                                namedVar.Storage  = addr;
+                                namedVar.BaseType = fieldLLVMType;
+                                namedVar.Primary  = llvm::isa<llvm::ArrayType>(fieldLLVMType)
+                                    ? nullptr
+                                    : compiler->CreateLoad(fieldLLVMType, addr);
+                                namedVar.TypeAndValue = fieldType;
+                                namedVar.TypeAndValue.ParentVariableName = interfaceVar.TypeAndValue.VariableName;
+                                namedVar.OwningStructName = ifaceName;
+                                namedVar.FieldName        = primaryIdentifier;
+                                namedVar.IsInterfaceField = true;
+                            }
                         }
                         else if (structVar.BaseType)
                         {

@@ -659,6 +659,9 @@ public:
         std::string CallerName;          // the variable's name at the call site, for move tracking
         std::string OwningStructName;    // when this NamedVariable is a struct-field access, the field's owning struct
         std::string FieldName;           // when this NamedVariable is a struct-field access, the field name
+        // Field reached THROUGH an interface value (data ptr + the vtable's byte-offset slot). The
+        // address is a byte GEP, not a 2-index struct GEP, so field-store rules must be told.
+        bool IsInterfaceField = false;
         // Field extracted from a BY-VALUE owning-struct temp (`makeToken().text`): may be read, but
         // persisting it (store/bind/return) double-frees so those sites reject it. See FlushOwnedStructTemps.
         bool FromOwningTempField = false;
@@ -1014,6 +1017,9 @@ private:
     std::unordered_map<std::string, std::string> cTypedefMap_;
     std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
     std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
+    // Interface fields (parents' fields first, then own), parallel to interfaceTable. Each entry's
+    // VariableName is the field name; every implementor must expose a field of the same name/type.
+    std::unordered_map<std::string, std::vector<TypeAndValue>> interfaceFields;
     std::unordered_map<std::string, std::vector<std::string>> interfaceParents;
     // Type-level annotations keyed by type/interface name ([winrt] on a class, [uuid("...")] on an
     // interface, ...). Field annotations are separate (StructData.StructFields[].Annotations).
@@ -6699,10 +6705,12 @@ public:
         pendingOwnedStructTemps  = state.pendingStructTemps;
     }
 
-    void CreateInterfaceDefinition(const std::string& name, const std::vector<std::string>& parentNames, std::vector<InterfaceMethod> methods)
+    void CreateInterfaceDefinition(const std::string& name, const std::vector<std::string>& parentNames,
+                                   std::vector<InterfaceMethod> methods, std::vector<TypeAndValue> fields = {})
     {
-        // Prepend inherited methods from parent interfaces (in order)
+        // Prepend inherited methods and fields from parent interfaces (in order)
         std::vector<InterfaceMethod> inherited;
+        std::vector<TypeAndValue> inheritedFields;
         for (const auto& parentName : parentNames)
         {
             auto it = interfaceTable.find(parentName);
@@ -6713,10 +6721,38 @@ public:
             }
             for (const auto& m : it->second)
                 inherited.push_back(m);
+            if (auto fit = interfaceFields.find(parentName); fit != interfaceFields.end())
+                for (const auto& f : fit->second)
+                    inheritedFields.push_back(f);
         }
         inherited.insert(inherited.end(), methods.begin(), methods.end());
+        inheritedFields.insert(inheritedFields.end(), fields.begin(), fields.end());
         interfaceTable[name] = std::move(inherited);
+        interfaceFields[name] = std::move(inheritedFields);
         interfaceParents[name] = parentNames;
+    }
+
+    const std::vector<TypeAndValue>* GetInterfaceFields(const std::string& ifaceName) const
+    {
+        auto it = interfaceFields.find(ResolveTypeAlias(ifaceName));
+        return it == interfaceFields.end() ? nullptr : &it->second;
+    }
+
+    // Index of `fieldName` within the interface's field list, or -1. The vtable slot for it is
+    // 1 + methodCount + index (see GetOrCreateVTable).
+    int InterfaceFieldIndex(const std::string& ifaceName, const std::string& fieldName) const
+    {
+        const auto* fields = GetInterfaceFields(ifaceName);
+        if (fields == nullptr) return -1;
+        for (int i = 0; i < (int)fields->size(); i++)
+            if ((*fields)[i].VariableName == fieldName) return i;
+        return -1;
+    }
+
+    size_t InterfaceFieldCount(const std::string& ifaceName) const
+    {
+        const auto* fields = GetInterfaceFields(ifaceName);
+        return fields == nullptr ? 0 : fields->size();
     }
 
     static bool IsPrimitiveTypeName(const std::string& name)
@@ -7052,6 +7088,48 @@ public:
         return false;
     }
 
+    // Appends one vtable slot per interface field: the implementor's BYTE OFFSET of that field,
+    // encoded as inttoptr(offset). Reads/writes through the interface GEP by it, so no thunk is
+    // needed and the field stays an lvalue. Errors when the implementor lacks a matching field.
+    void AppendInterfaceFieldOffsetSlots(const std::string& structName, const std::string& ifaceName,
+                                         llvm::StructType* structTy,
+                                         const std::vector<DeclTypeAndValue>& structFields,
+                                         std::vector<llvm::Constant*>& entries)
+    {
+        const auto* ifields = GetInterfaceFields(ifaceName);
+        if (ifields == nullptr || ifields->empty()) return;
+
+        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        const llvm::StructLayout* layout = (structTy != nullptr && !structTy->isOpaque())
+            ? module->getDataLayout().getStructLayout(structTy) : nullptr;
+
+        for (const auto& f : *ifields)
+        {
+            size_t idx = 0;
+            for (; idx < structFields.size(); idx++)
+                if (structFields[idx].VariableName == f.VariableName) break;
+
+            if (idx >= structFields.size() || layout == nullptr)
+            {
+                LogError(std::format("'{}' does not implement interface field '{}::{} {}'",
+                    structName, ifaceName, f.TypeName, f.VariableName));
+                entries.push_back(llvm::ConstantPointerNull::get(ptrTy));
+                continue;
+            }
+
+            const auto& sf = structFields[idx];
+            if (sf.TypeName != f.TypeName || sf.Pointer != f.Pointer || sf.IsInterface != f.IsInterface)
+            {
+                LogError(std::format(
+                    "'{}' field '{}' has type '{}{}' but interface '{}' declares it as '{}{}'",
+                    structName, f.VariableName, sf.TypeName, sf.Pointer ? "*" : "",
+                    ifaceName, f.TypeName, f.Pointer ? "*" : ""));
+            }
+            uint64_t offset = layout->getElementOffset((unsigned)idx);
+            entries.push_back(llvm::ConstantExpr::getIntToPtr(builder->getInt64(offset), ptrTy));
+        }
+    }
+
     llvm::GlobalVariable* GetOrCreateProgramVTable(ProgramData& pd, const std::string& structName, const std::string& ifaceName)
     {
         auto it = pd.VTables.find(ifaceName);
@@ -7107,8 +7185,10 @@ public:
             }
         }
 
+        AppendInterfaceFieldOffsetSlots(structName, ifaceName, pd.StructType, pd.ConfigFields, entries);
+
         // Trailing slot: full concrete destructor (or null) for delete-through-interface.
-        // Layout is [typedesc, method0..N-1, fullDtor]; method indices stay unchanged.
+        // Layout is [typedesc, method0..N-1, fieldOff0..M-1, fullDtor].
         if (auto* dtor = GetOrCreateFullDestructor(structName))
             entries.push_back(llvm::ConstantExpr::getBitCast(dtor, ptrTy));
         else
@@ -7197,8 +7277,10 @@ public:
             }
         }
 
+        AppendInterfaceFieldOffsetSlots(structName, ifaceName, sd.StructType, sd.StructFields, entries);
+
         // Trailing slot: full concrete destructor (or null) for delete-through-interface.
-        // Layout is [typedesc, method0..N-1, fullDtor]; method indices stay unchanged.
+        // Layout is [typedesc, method0..N-1, fieldOff0..M-1, fullDtor].
         if (auto* dtor = GetOrCreateFullDestructor(structName))
             entries.push_back(llvm::ConstantExpr::getBitCast(dtor, ptrTy));
         else
@@ -7227,6 +7309,66 @@ public:
         v = builder->CreateInsertValue(v, builder->CreateBitCast(vtable, ptrTy), { 0u });
         v = builder->CreateInsertValue(v, builder->CreateBitCast(dataPtr, ptrTy), { 1u });
         return v;
+    }
+
+    // Rebuild only when the source and destination interfaces actually differ (the common
+    // same-interface case stays a plain by-value copy, with no if-chain emitted).
+    llvm::Value* ReboxInterfaceIfNeeded(llvm::Value* fatVal, const std::string& srcIface,
+                                        const std::string& dstIface)
+    {
+        if (fatVal == nullptr || fatVal->getType() != GetFatPtrType()) return fatVal;
+        if (srcIface.empty() || dstIface.empty() || srcIface == dstIface) return fatVal;
+        if (!IsInterfaceType(srcIface) || !IsInterfaceType(dstIface)) return fatVal;
+        return RebuildInterfaceFatValue(fatVal, dstIface);
+    }
+
+    // Re-box an interface value as a DIFFERENT interface (a derived-to-parent upcast, e.g.
+    // IButton -> IElement). A derived vtable is NOT layout-compatible with its parent's once
+    // field-offset slots exist, so the fat pointer is rebuilt: match the runtime typedesc
+    // against each implementor of dstIface and pick that implementor's dstIface vtable.
+    // No match yields a zeroed fat pointer, exactly like a failed `as <Interface>`.
+    llvm::Value* RebuildInterfaceFatValue(llvm::Value* fatVal, const std::string& dstIface)
+    {
+        auto fatTy = GetFatPtrType();
+        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+
+        llvm::Value* dataPtr  = builder->CreateExtractValue(fatVal, { 1u }, "up_data");
+        llvm::Value* vtablePtr = builder->CreateExtractValue(fatVal, { 0u }, "up_vtable");
+
+        auto* resultAlloca = CreateAlloca(fatTy);
+        builder->CreateStore(llvm::ConstantAggregateZero::get(fatTy), resultAlloca);
+        auto* afterBlock = CreateBasicBlock("upcast_after");
+
+        // A null (failed-cast) source has no vtable to read a typedesc from: stay zeroed.
+        auto* liveBlock = CreateBasicBlock("upcast_live");
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(vtablePtr, llvm::ConstantPointerNull::get(ptrTy)), afterBlock, liveBlock);
+        SwitchToBlock(liveBlock);
+
+        llvm::Value* loadedDesc = builder->CreateLoad(ptrTy,
+            builder->CreateGEP(ptrTy, vtablePtr, builder->getInt32(0)), "up_typedesc");
+
+        auto emitCase = [&](const std::string& implName, llvm::GlobalVariable* typeDesc)
+        {
+            auto* matchBlock = CreateBasicBlock("upcast_match");
+            auto* nextBlock  = CreateBasicBlock("upcast_next");
+            builder->CreateCondBr(builder->CreateICmpEQ(loadedDesc, typeDesc), matchBlock, nextBlock);
+            SwitchToBlock(matchBlock);
+            builder->CreateStore(BuildInterfaceFatValue(GetOrCreateVTable(implName, dstIface), dataPtr), resultAlloca);
+            builder->CreateBr(afterBlock);
+            SwitchToBlock(nextBlock);
+        };
+
+        for (auto& [sName, sd] : dataStructures)
+            if (sd.typeDescriptor && StructImplementsInterface(sName, dstIface))
+                emitCase(sName, sd.typeDescriptor);
+        for (auto& [pName, pd] : programTable)
+            if (pd.typeDescriptor && StructImplementsInterface(pName, dstIface))
+                emitCase(pName, pd.typeDescriptor);
+
+        builder->CreateBr(afterBlock);
+        SwitchToBlock(afterBlock);
+        return builder->CreateLoad(fatTy, resultAlloca);
     }
 
     // ===== WinRT / COM produce-side codegen (see internal/plan/winmd-projection.md) =====
@@ -8603,9 +8745,46 @@ public:
         return true;
     }
 
+    // The vtable slot holding the concrete destructor: it trails the method and field-offset
+    // slots, so it moves as either count grows. Single source of truth for the dtor index.
+    int InterfaceDtorSlotIndex(const std::string& ifaceName) const
+    {
+        size_t methodCount = 0;
+        if (auto it = interfaceTable.find(ifaceName); it != interfaceTable.end())
+            methodCount = it->second.size();
+        return (int)(1 + methodCount + InterfaceFieldCount(ifaceName));
+    }
+
+    // The address of interface field `fieldName` inside the object behind fat value `fatVal`:
+    // dataPtr + vtable[1 + methodCount + fieldIdx] (the implementor's byte offset). The result is
+    // a true lvalue - reads and writes both go through it. Returns null when the name is no field.
+    llvm::Value* EmitInterfaceFieldAddress(llvm::Value* fatVal, const std::string& ifaceName,
+                                           const std::string& fieldName, llvm::Type* fieldType)
+    {
+        int fieldIdx = InterfaceFieldIndex(ifaceName, fieldName);
+        if (fieldIdx < 0) return nullptr;
+
+        size_t methodCount = 0;
+        if (auto it = interfaceTable.find(ifaceName); it != interfaceTable.end())
+            methodCount = it->second.size();
+
+        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        llvm::Value* vtablePtr = builder->CreateExtractValue(fatVal, { 0u }, "iface_vtable");
+        llvm::Value* dataPtr   = builder->CreateExtractValue(fatVal, { 1u }, "iface_data");
+
+        auto* slot = builder->CreateGEP(ptrTy, vtablePtr,
+            builder->getInt32((int)(1 + methodCount + fieldIdx)), "iface_fld_slot");
+        auto* offPtr = builder->CreateLoad(ptrTy, slot, "iface_fld_offptr");
+        auto* off    = builder->CreatePtrToInt(offPtr, builder->getInt64Ty(), "iface_fld_off");
+        auto* bytePtr = builder->CreateGEP(builder->getInt8Ty(), dataPtr, off, "iface_fld_bytes");
+        // Re-GEP at the field type (a zero-index no-op) so GetTypeFromStorage - which reads a
+        // GEP's element type - sees the field type rather than i8, and loads/stores get it right.
+        return builder->CreateGEP(fieldType, bytePtr, builder->getInt32(0), "iface_fld_addr");
+    }
+
     // delete through an interface fat pointer: the operand is a {vtable, data} struct, not a
     // raw pointer. Extract the data pointer, run the concrete destructor via the vtable's
-    // trailing dtor slot (index 1 + methodCount, runtime null-guarded), then free with
+    // trailing dtor slot (runtime null-guarded), then free with
     // operator delete. A null data pointer (already deleted) makes the whole thing a no-op.
     // When fatStorage is non-null its data field is nulled so a second delete is also a no-op.
     void DeleteInterfaceValue(llvm::Value* fatVal, const std::string& ifaceName, llvm::Value* fatStorage)
@@ -8616,10 +8795,6 @@ public:
         llvm::Value* vtablePtr = builder->CreateExtractValue(fatVal, { 0u }, "iface_vtable");
         llvm::Value* dataPtr   = builder->CreateExtractValue(fatVal, { 1u }, "iface_data");
 
-        size_t methodCount = 0;
-        if (auto it = interfaceTable.find(ifaceName); it != interfaceTable.end())
-            methodCount = it->second.size();
-
         auto* nullPtr   = llvm::ConstantPointerNull::get(ptrTy);
         auto* dataIsNull = builder->CreateICmpEQ(dataPtr, nullPtr, "iface_data_isnull");
         auto* liveBB  = CreateBasicBlock("iface_del_live");
@@ -8628,7 +8803,8 @@ public:
 
         // Live: dispatch the destructor through the vtable, guarding a null slot.
         builder->SetInsertPoint(liveBB);
-        auto* dtorSlot = builder->CreateGEP(ptrTy, vtablePtr, builder->getInt32((int)(1 + methodCount)), "iface_dtor_slot");
+        auto* dtorSlot = builder->CreateGEP(ptrTy, vtablePtr,
+            builder->getInt32(InterfaceDtorSlotIndex(ifaceName)), "iface_dtor_slot");
         auto* dtorFn   = builder->CreateLoad(ptrTy, dtorSlot, "iface_dtor");
         auto* dtorIsNull = builder->CreateICmpEQ(dtorFn, nullPtr, "iface_dtor_isnull");
         auto* callBB = CreateBasicBlock("iface_del_dtor");
@@ -8907,9 +9083,9 @@ public:
             }
             else if (param.IsInterface && nv.TypeAndValue.IsInterface)
             {
-                // Interface -> interface: pass fat struct by value.
+                // Interface -> interface: pass the fat struct by value, re-boxing on an upcast.
                 llvm::Value* val = nv.Primary ? nv.Primary : CreateLoad(nv.Storage);
-                callArgs.push_back(val);
+                callArgs.push_back(ReboxInterfaceIfNeeded(val, nv.TypeAndValue.TypeName, param.TypeName));
             }
             else if (param.Pointer)
             {
@@ -12073,6 +12249,14 @@ public:
                         {
                             result = 0;
                         }
+
+                        // Derived interface -> parent interface (IButton arg to an IElement param).
+                        // Implicit (1), not perfect, so an exact same-interface overload still wins.
+                        if (result < 0 && candidateParamItr->IsInterface && arg.TypeAndValue.IsInterface &&
+                            InterfaceInheritsFrom(arg.TypeAndValue.TypeName, candidateParamItr->TypeName))
+                        {
+                            result = 1;
+                        }
                     }
                 }
                 else
@@ -12602,9 +12786,9 @@ public:
             }
             else if (!inVariadicRange && candParamItr->IsInterface && arg.TypeAndValue.IsInterface)
             {
-                // Interface -> interface: pass fat struct by value
+                // Interface -> interface: pass fat struct by value, re-boxing on an upcast
                 llvm::Value* val = arg.Primary ? arg.Primary : CreateLoad(arg.Storage);
-                argList.push_back(val);
+                argList.push_back(ReboxInterfaceIfNeeded(val, arg.TypeAndValue.TypeName, candParamItr->TypeName));
             }
             else if (!inVariadicRange && candParamItr->Pointer)
             {

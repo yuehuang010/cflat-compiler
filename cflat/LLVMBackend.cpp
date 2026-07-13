@@ -2318,6 +2318,7 @@ void LLVMBackend::ResetForReanalysis()
     typeAliases.clear();
     functionTypeAliases.clear();
     interfaceTable.clear();
+    interfaceFields.clear();
     interfaceParents.clear();
     typeAnnotations_.clear();
     globalNamedVariable.clear();
@@ -4278,6 +4279,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     functionTable.clear();
     dataStructures.clear();
     interfaceTable.clear();
+    interfaceFields.clear();
     interfaceParents.clear();
     typeAnnotations_.clear();
     globalNamedVariable.clear();

@@ -841,11 +841,15 @@ operatorFunctionId
     ;
 
 interfaceDefinition
-    : annotationList? Interface genericIdentifier (':' Identifier (',' Identifier)*)? '{' interfaceMethod* '}' ';'
+    : annotationList? Interface genericIdentifier (':' Identifier (',' Identifier)*)? '{' (interfaceMethod | interfaceField)* '}' ';'
     ;
 
 interfaceMethod
     : declarationSpecifiers (directDeclarator | operatorFunctionId) '(' parameterTypeList? ')' ';'
+    ;
+
+interfaceField
+    : declarationSpecifiers directDeclarator ';'
     ;
 
 Auto

@@ -1,7 +1,8 @@
 # UI framework: pointers -> interfaces
 
-Status: PLANNING (gated on the F1 feasibility spike - see
-`internal/plan/interface-fields-feasibility.md`)
+Status: PLANNING - the F1 gate is CLEARED. All four language features are proven
+FEASIBLE by a working compiler prototype (see
+`internal/plan/interface-fields-feasibility.md`). Phase 1 is ready to start.
 Created: 2026-07-13
 
 ## Goal
@@ -78,9 +79,33 @@ BREAKS that prefix property, so the upcast must instead rebuild the fat pointer
 through the typedesc if-chain, like `as <Interface>` already does. Cost is
 O(#implementors of the target); for a per-widget interface that is 1.
 
-If F1 comes back NOT FEASIBLE, the fallback is accessor methods on every
-interface (~300 mechanical call-site rewrites, clumsy nested-struct handling).
-That decision gates everything below.
+### Spike verdict (2026-07-13) - all four FEASIBLE
+
+A working compiler prototype (~326 lines across `CFlat.g4`, `LLVMBackend.h/.cpp`,
+`MainListener.h`) proved all four end-to-end, with `test.bat`, `test_lsp.bat`
+(204/204), and `example.bat` (89/0/24) all green and no assertion weakened.
+
+- F1 FEASIBLE. The byte-offset-slot design works as proposed, INCLUDING the
+  nested-struct write (`b.style.gap = 1`), proven against two implementors with
+  deliberately different field offsets. Settled vtable:
+  `[typedesc, methods..., fieldOffsets..., fullDtor]`, with the dtor index now
+  computed in ONE place (`InterfaceDtorSlotIndex`). Delete-through-interface
+  still destructs exactly once.
+- F2 FEASIBLE (trivial OR-chain over implementors).
+- F3 FEASIBLE. It did NOT work before - the fat struct reached `CreateOperation`
+  as an aggregate. Now lowers to a data-pointer compare.
+- F4 FEASIBLE-WITH-CAVEATS. Assignment, call arg, and `list<IParent>.add` work;
+  RETURN POSITION IS NOT WIRED (must be finished in Phase 1). The vtable prefix
+  property was rejected as an upcast mechanism - it is only accidentally correct
+  today and already breaks for a second parent - so the upcast rebuilds the fat
+  pointer through the typedesc if-chain, as predicted.
+
+Landmine found and fixed in the spike, worth remembering: the field-store
+ownership rules classify a store as "struct field" STRUCTURALLY (a GEP with 2
+indices). An interface field's address is a BYTE gep, so destruct-before-overwrite
+was silently skipped and an owned `string` assigned through an interface field
+LEAKED. Fixed with an explicit `IsInterfaceField` flag. Any other code that
+sniffs GEP shape to infer intent has the same blind spot.
 
 ## Scope (agreed)
 
@@ -104,11 +129,30 @@ OUT (for now):
 Sequencing is COMPILER FIRST: land the language features against a green,
 untouched UI framework, so a bisect can tell a language bug from a UI bug.
 
-### Phase 1 - Language (gated on the spike)
-Implement F1-F4 with regression coverage EXTENDED INTO `Test/test_interface.cb`
-(do not create new test files). Error tests for the new diagnostics go in
-`Test/errors/` (e.g. a class missing an interface field; a field type mismatch).
-Gate: `test.bat` + `test_lsp.bat` green, UI framework untouched.
+### Phase 1 - Language (spike cleared; ~1 week)
+Productionize F1-F4 from the prototype. Regression coverage goes into
+`Test/test_interface.cb` (extend it; do not create new test files); error tests
+for the new diagnostics go in `Test/errors/`. Beyond what the spike proved, the
+following MUST be finished before F1 ships:
+
+1. RETURN-POSITION derived->parent upcast (F4's unwired case).
+2. BITCODE CACHE serialization of interface fields. `LLVMBackend.cpp:4095` /
+   `:4402` round-trip interface METHODS only. The cached set is runtime.cb's
+   closure, which does not include the UI interfaces, so this does not block the
+   UI refactor - but it silently drops fields for any cached core interface and
+   must be fixed before the feature is public.
+3. EAGER validation. Today the "implementor is missing this interface field"
+   check fires lazily at the first boxing site, not at the class definition.
+4. Field access on a NULL interface value segfaults (same as a method call on one
+   does today). F3's null-compare is the guard; decide whether that is acceptable
+   or whether it needs a diagnostic.
+5. LSP: interface fields produce no symbols. `test_lsp.bat` must still be green,
+   and hover/completion on an interface field should work before the UI refactor
+   lands (the whole point is that users write `b.title` against an interface).
+6. Untested surface: generic-interface fields (`interface IBox<T> { T value; }`)
+   and `program`-implementors.
+
+Gate: `test.bat` + `test_lsp.bat` green, UI framework UNTOUCHED.
 
 ### Phase 2 - Rename (mechanical, no semantics)
 `Element`->`IElement`, `Canvas`->`ICanvas`, `Component`->`IComponent`,
