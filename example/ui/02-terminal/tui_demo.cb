@@ -228,6 +228,131 @@ bool testRowLayout()
     return ok;
 }
 
+// -- Flex layout (Phase 1: flex weights) ---------------------------------------
+
+// Three equal flex-1 children in a 100-wide row split 34/33/33 - the floor
+// remainder goes to the earliest child, left to right - with contiguous x.
+bool testFlexEqualSplit()
+{
+    View* r = row(makeStyle(0, 0, 0));
+    View* a = view(flexStyle(1)); r.add(a);
+    View* b = view(flexStyle(1)); r.add(b);
+    View* c = view(flexStyle(1)); r.add(c);
+    Element t = r;
+
+    layoutRoot(t, 0, 0, 100);
+    Rect ra = a.nodeBounds(); Rect rb = b.nodeBounds(); Rect rc = c.nodeBounds();
+    bool ok = ra.w == 34 && rb.w == 33 && rc.w == 33
+        && ra.x == 0 && rb.x == 34 && rc.x == 67;
+
+    deleteTree(t);
+    return ok;
+}
+
+// A fixed 20-wide child plus a flex-1 child in a 100-wide row: the fixed child
+// keeps its own width and the flex child absorbs the remainder (80).
+bool testFlexFixedPlusFlex()
+{
+    View* r = row(makeStyle(0, 0, 0));
+    Box* label = box(makeStyle(0, 20, 0)); r.add(label);
+    View* field = view(flexStyle(1)); r.add(field);
+    Element t = r;
+
+    layoutRoot(t, 0, 0, 100);
+    Rect rl = label.nodeBounds(); Rect rf = field.nodeBounds();
+    bool ok = rl.w == 20 && rl.x == 0 && rf.w == 80 && rf.x == 20;
+
+    deleteTree(t);
+    return ok;
+}
+
+// flex 2 : flex 1 in a 100-wide row splits 67/33 (2/3 of 100 floors to 66, the
+// leftover remainder cell goes to the first - higher-weight - child).
+bool testFlexWeightedSplit()
+{
+    View* r = row(makeStyle(0, 0, 0));
+    View* two = view(flexStyle(2)); r.add(two);
+    View* one = view(flexStyle(1)); r.add(one);
+    Element t = r;
+
+    layoutRoot(t, 0, 0, 100);
+    Rect rt = two.nodeBounds(); Rect ro = one.nodeBounds();
+    bool ok = rt.w == 67 && rt.x == 0 && ro.w == 33 && ro.x == 67;
+
+    deleteTree(t);
+    return ok;
+}
+
+// Padding and gap are subtracted from availW before the leftover is split: a
+// 50-wide row with padding 2 and gap 3 leaves 43 for two flex-1 children.
+bool testFlexGapPadding()
+{
+    View* r = row(makeStyle(2, 0, 0));
+    r.style.gap = 3;
+    View* a = view(flexStyle(1)); r.add(a);
+    View* b = view(flexStyle(1)); r.add(b);
+    Element t = r;
+
+    layoutRoot(t, 0, 0, 50);
+    Rect ra = a.nodeBounds(); Rect rb = b.nodeBounds();
+    bool ok = ra.x == 2 && ra.w == 22 && rb.x == 27 && rb.w == 21;
+
+    deleteTree(t);
+    return ok;
+}
+
+// A no-flex tree (flex defaults to 0 on every Style) must lay out and
+// serialize exactly as before flex weights existed - only the new "flex":0
+// field is added to the JSON shape.
+bool testFlexNoFlexUnchanged()
+{
+    View* rt = view(makeStyle(1, 0, 0));
+    rt.add(text("hi"));
+    Element t = rt;
+
+    layoutRoot(t, 0, 0, 40);
+    string j = t.toJson();
+    string want = "{\"type\":\"View\",\"style\":{\"padding\":1,\"width\":0,\"height\":0,"
+        + "\"flexDirection\":0,\"color\":0,\"backgroundColor\":0,\"gap\":0,\"flex\":0},"
+        + "\"children\":[{\"type\":\"Text\",\"text\":\"hi\"}]}";
+    bool ok = j == want;
+
+    deleteTree(t);
+    return ok;
+}
+
+// Column flex: under a bounded availH, two flex-1 children split it evenly and
+// the cursor advances by each child's share (0, then 15) regardless of the
+// child's own reported height - same "advance by share" contract as the row
+// case; an empty View's own height stays content-driven (0), only the cursor
+// position proves the distribution ran. Under LAYOUT_UNBOUNDED (layoutRoot's
+// default) a flex child has no leftover to grow into, so the cursor instead
+// advances by the child's actual (here: zero) height - the intrinsic fallback.
+bool testFlexColumn()
+{
+    View* colB = column(makeStyle(0, 0, 0));
+    View* b1 = view(flexStyle(1)); colB.add(b1);
+    View* b2 = view(flexStyle(1)); colB.add(b2);
+    Element tb = colB;
+    LayoutConstraints ccB = default;
+    ccB.x = 0; ccB.y = 0; ccB.availW = 20; ccB.availH = 30;
+    Size szB = tb.layout(ccB);
+    Rect r1 = b1.nodeBounds(); Rect r2 = b2.nodeBounds();
+    bool bounded = r1.y == 0 && r2.y == 15 && szB.h == 30;
+    deleteTree(tb);
+
+    View* colU = column(makeStyle(0, 0, 0));
+    View* u1 = view(flexStyle(1)); colU.add(u1);
+    View* u2 = view(flexStyle(1)); colU.add(u2);
+    Element tu = colU;
+    Size szU = layoutRoot(tu, 0, 0, 20);
+    Rect s1 = u1.nodeBounds(); Rect s2 = u2.nodeBounds();
+    bool unbounded = s1.y == 0 && s2.y == 0 && szU.h == 0;
+    deleteTree(tu);
+
+    return bounded && unbounded;
+}
+
 // Re-render the controlled EditApp and reconcile into the live tree, so a value
 // changed by onChangeText flows back into the TextInput before the next key.
 move Element editReRender(EditApp* app, UiContext* ctx, move Element tree, int w)
@@ -339,10 +464,16 @@ int selfTest()
     total++; if (testTextInput())          pass++; else printf("  FAIL: text input editing\n");
     total++; if (testTabNav())             pass++; else printf("  FAIL: tab focus navigation\n");
     total++; if (testScrollClip())         pass++; else printf("  FAIL: scroll + clip\n");
+    total++; if (testFlexEqualSplit())     pass++; else printf("  FAIL: flex equal split\n");
+    total++; if (testFlexFixedPlusFlex())  pass++; else printf("  FAIL: flex fixed + flex mix\n");
+    total++; if (testFlexWeightedSplit())  pass++; else printf("  FAIL: flex weighted split\n");
+    total++; if (testFlexGapPadding())     pass++; else printf("  FAIL: flex gap + padding\n");
+    total++; if (testFlexNoFlexUnchanged())pass++; else printf("  FAIL: no-flex tree unchanged\n");
+    total++; if (testFlexColumn())         pass++; else printf("  FAIL: column flex bounded/unbounded\n");
 
     if (pass == total)
     {
-        printf("PASS: ui self-tests %d/%d (reconcile, repaint, reorder, components, focus, layout, textinput, tabnav, scroll)\n", pass, total);
+        printf("PASS: ui self-tests %d/%d (reconcile, repaint, reorder, components, focus, layout, textinput, tabnav, scroll, flex)\n", pass, total);
         return 0;
     }
     printf("FAIL: ui self-tests %d/%d\n", pass, total);

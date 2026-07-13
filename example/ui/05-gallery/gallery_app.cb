@@ -172,11 +172,25 @@ class GalleryApp : Component
         };
         root.add(canvas);
 
-        // Controlled TextInput + Checkbox.
+        // Controlled TextInput, form-row style: [label fixed 12][field flex 1]. The label's
+        // width is fixed so every form row below shares the same field start x - the flex
+        // View wrapper (not the TextInput itself, which stays content-sized) is what stretches
+        // with the window, per the "cursor advances by the flex share" contract in doc/UI.md.
+        View* inputRow = row(makeStyle(0, 0, 0));
+        inputRow.setKey("inputrow");
+        Box* inputLabel = box(makeStyle(0, 12, 1));
+        inputLabel.setKey("inputlabel");
+        inputLabel.add(text("Input:"));
+        inputRow.add(inputLabel);
+        View* inputField = view(flexStyle(1));
+        inputField.setKey("inputfield");
         TextInput* input = <TextInput key="input" value={this.inputText} width={24}
                 placeholder="type here"
                 onChangeText={(string s) => { this.inputText = s; ctx.invalidate(); }}/>;
-        root.add(input);
+        inputField.add(input);
+        inputRow.add(inputField);
+        root.add(inputRow);
+        // Checkbox: a single toggle reads better as an intrinsic-sized row (no field to align).
         Checkbox* chk = <Checkbox key="check" label="Enable feature" checked={this.checked}
                 onChange={(bool v) => { this.checked = v; ctx.invalidate(); }}/>;
         root.add(chk);
@@ -206,14 +220,26 @@ class GalleryApp : Component
         root.add(rg);
 
         // ComboBox authored in sugar; items added imperatively (a list-valued field is
-        // not set through a sugar attribute - the container-copy-into-field rule).
+        // not set through a sugar attribute - the container-copy-into-field rule). Same
+        // [label fixed 12][field flex 1] form-row idiom as the TextInput above, so the
+        // two fields' flex-View slots align in a column (asserted below).
+        View* comboRow = row(makeStyle(0, 0, 0));
+        comboRow.setKey("comborow");
+        Box* comboLabel = box(makeStyle(0, 12, 1));
+        comboLabel.setKey("combolabel");
+        comboLabel.add(text("Font:"));
+        comboRow.add(comboLabel);
+        View* comboField = view(flexStyle(1));
+        comboField.setKey("combofield");
         ComboBox* cb = <ComboBox key="combo" selectedIndex={this.fontIdx} width={20}
                 onChange={(int i) => { this.fontIdx = i; ctx.invalidate(); }}/>;
         cb.addItem("Consolas");
         cb.addItem("Cascadia Code");
         cb.addItem("Segoe UI");
         cb.addItem("Courier New");
-        root.add(cb);
+        comboField.add(cb);
+        comboRow.add(comboField);
+        root.add(comboRow);
 
         // Virtualized ListView authored in sugar; columns + rowText set imperatively.
         ListView* lv = <ListView key="list" rowCount={GALLERY_ROWS}
@@ -281,6 +307,47 @@ class GalleryApp : Component
         ctxbox.setKey("ctxbox");
         ctxbox.add(text("right-click me (context menu)"));
         root.add(ctxbox);
+
+        // -- Flex layout card: an explicit demo of the flex-weight idiom (doc/UI.md's "Flex
+        // weights" section) so the gallery stays a one-stop reference for it. Two shapes:
+        // (a) another [label fixed][field flex 1] row, reusing the form idiom above so all
+        //     three field rows share the same aligned start x/width; and
+        // (b) a weighted flex-2:flex-1 pair of boxes inside a fixed-width (61) container, so
+        //     the 39/19 split (leftover 58 + 1 gap cell, remainder handed to the higher-weight
+        //     child) is deterministic and independent of the host window size.
+        Text* flexTitle = text("Flex layout (flex weights)");
+        flexTitle.setKey("flextitle");
+        root.add(flexTitle);
+
+        View* flexRow = row(makeStyle(0, 0, 0));
+        flexRow.setKey("flexrow");
+        Box* flexLabel = box(makeStyle(0, 12, 1));
+        flexLabel.setKey("flexlabel");
+        flexLabel.add(text("Name:"));
+        flexRow.add(flexLabel);
+        View* flexField = view(flexStyle(1));
+        flexField.setKey("flexfield");
+        TextInput* flexInput = textInput("", (string s) => {});
+        flexInput.setKey("flexinput");
+        flexField.add(flexInput);
+        flexRow.add(flexField);
+        root.add(flexRow);
+
+        Box* flexDemo = box(makeStyle(0, 61, 3));
+        flexDemo.setKey("flexdemo");
+        View* flexPair = row(makeStyle(0, 0, 0));
+        flexPair.style.gap = 1;
+        flexPair.setKey("flexpair");
+        View* flexTwo = view(flexStyle(2));
+        flexTwo.setKey("flextwo");
+        flexTwo.add(box(makeStyle(0, 0, 1)));
+        View* flexOne = view(flexStyle(1));
+        flexOne.setKey("flexone");
+        flexOne.add(box(makeStyle(0, 0, 1)));
+        flexPair.add(flexTwo);
+        flexPair.add(flexOne);
+        flexDemo.add(flexPair);
+        root.add(flexDemo);
 
         // Status lines (existing P8/P9 asserts) + a bottom StatusBar strip.
         Text* status = text("pick=" + this._sizeName() + " font=" + this.fontIdx.toString()
@@ -402,13 +469,13 @@ int gallerySelfTest()
         // 1. Every P8 control became a real control.
         t.expectTrue("controls created",
             _exists("root/rg/r0") && _exists("root/rg/r1") && _exists("root/rg/r2")
-            && _exists("root/combo") && _exists("root/list")
+            && _exists("root/comborow/combofield/combo") && _exists("root/list")
             && _exists("root/status") && _exists("root/status2"));
 
         // 2. Initial state: r1 checked (pick=1), combo at 0, 100k rows, status echoes model.
         t.expectTrue("initial state",
             nativeIsChecked("root/rg/r1") && !nativeIsChecked("root/rg/r0") && !nativeIsChecked("root/rg/r2")
-            && nativeComboSelected("root/combo") == 0
+            && nativeComboSelected("root/comborow/combofield/combo") == 0
             && nativeListRowCount("root/list") == GALLERY_ROWS
             && _statusIs("root/status", "pick=Medium font=0 sel=-1 act=-1"));
 
@@ -419,7 +486,7 @@ int gallerySelfTest()
             && _statusIs("root/status", "pick=Large font=0 sel=-1 act=-1"));
 
         // 4. Change the combo to index 2 (routes CBN_SELCHANGE).
-        nativeComboSelect("root/combo", 2);
+        nativeComboSelect("root/comborow/combofield/combo", 2);
         t.expectTrue("combo change routed", _statusIs("root/status", "pick=Large font=2 sel=-1 act=-1"));
 
         // 5. Virtualization + rowText wiring: query two cells of row 50000.
@@ -487,7 +554,7 @@ int gallerySelfTest()
 
         // 15. All the P10 controls were created.
         t.expectTrue("P10 controls created",
-            _exists("root/btn") && _exists("root/input") && _exists("root/check")
+            _exists("root/btn") && _exists("root/inputrow/inputfield/input") && _exists("root/check")
             && _exists("root/prog") && _exists("root/slider") && _exists("root/grp") && _exists("root/img")
             && _exists("root/canvas") && _exists("root/area") && _exists("root/sbar"));
 
@@ -496,8 +563,8 @@ int gallerySelfTest()
         t.expectTrue("button click", g != nullptr && g.btnClicks == 1);
 
         // 17. TextInput: type text (routes EN_CHANGE) -> controlled onChangeText updates model.
-        nativeTypeText("root/input", "hello");
-        t.expectTrue("text input route", g != nullptr && g.inputText == "hello" && _statusIs("root/input", "hello"));
+        nativeTypeText("root/inputrow/inputfield/input", "hello");
+        t.expectTrue("text input route", g != nullptr && g.inputText == "hello" && _statusIs("root/inputrow/inputfield/input", "hello"));
 
         // 18. Checkbox: click -> controlled onChange flips the model.
         nativeClickButton("root/check");
@@ -558,6 +625,37 @@ int gallerySelfTest()
                     }
                     return keys;
                 }));
+
+        // 28. Flex form rows: the TextInput, ComboBox, and flex-card fields all use the same
+        //     [label fixed 12][field flex 1] row idiom, so their flex-View slots share the same
+        //     start x and width in a column - even though the leaf widgets they wrap differ.
+        Rect inputFieldB = nativeNodeBounds("root/inputrow/inputfield");
+        Rect comboFieldB = nativeNodeBounds("root/comborow/combofield");
+        Rect flexFieldB  = nativeNodeBounds("root/flexrow/flexfield");
+        t.expectTrue("flex form-row fields align",
+            inputFieldB.w > 0 && comboFieldB.w > 0 && flexFieldB.w > 0
+            && inputFieldB.x == comboFieldB.x && inputFieldB.w == comboFieldB.w
+            && inputFieldB.x == flexFieldB.x && inputFieldB.w == flexFieldB.w);
+
+        // 29. Flex 2:1 pair: a fixed-width (61) container makes the split deterministic
+        //     regardless of host window size. leftover = 61 - 2*inset(1) - gap(1) = 58; the
+        //     2:1 shares floor to 38/19 (allocated 57) and the 1-cell remainder goes to the
+        //     higher-weight child left to right, giving an exact 39/19 split.
+        Rect flexTwoB = nativeNodeBounds("root/flexdemo/flexpair/flextwo");
+        Rect flexOneB = nativeNodeBounds("root/flexdemo/flexpair/flexone");
+        t.expectTrue("flex 2:1 weighted split with exact remainder handling",
+            flexTwoB.w == 39 && flexOneB.w == 19
+            && flexOneB.x == flexTwoB.x + flexTwoB.w + 1);
+
+        // 30. Flex layout card: every control in the new section exists / lays out with
+        //     positive bounds (the label, the flex field's TextInput, and the demo container).
+        Rect flexDemoB = nativeNodeBounds("root/flexdemo");
+        t.expectTrue("flex section controls laid out",
+            _exists("root/flexrow/flexfield/flexinput")
+            && nativeNodeBounds("root/flexrow/flexlabel").w > 0
+            && flexFieldB.x > 0 && flexFieldB.w > 0
+            && flexDemoB.w > 0 && flexDemoB.h > 0
+            && flexTwoB.w > 0 && flexOneB.w > 0);
     });
 
     return s.run(0, nullptr);

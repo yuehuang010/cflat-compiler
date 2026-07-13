@@ -309,8 +309,10 @@ struct Style
     int color = 0;               // foreground (text / border); COLOR_DEFAULT (0) = default ink
     int backgroundColor = 0;     // fill; COLOR_DEFAULT (0) = no fill
     int gap = 0;                 // cells of space inserted between stacked children
+    int flex = 0;                // main-axis weight in a DIR_ROW/DIR_COLUMN parent; 0 = intrinsic
 };
 Style makeStyle(int padding, int width, int height);   // flexDirection column, colors default
+Style flexStyle(int flex);                             // a Style carrying only a flex weight
 int   rgb(int r, int g, int b);                        // build an explicit color
 int   COLOR_DEFAULT;                                   // 0: backend monochrome default
 ```
@@ -379,6 +381,43 @@ Size layoutRoot(Element root, int x, int y, int w);   // root pass, height unbou
 `View` reads `style.flexDirection`: `DIR_COLUMN` stacks children top-to-bottom,
 `DIR_ROW` places them left-to-right. New layout strategies are added here, and
 new widgets plug into the same pass rather than bolting on.
+
+### Flex weights
+
+`style.flex` (main-axis weight; `0` = intrinsic size, today's default behavior)
+gives a `View` child a share of its parent's leftover main-axis space, the RN
+`flex: n` idiom - `[label (width 120)] [field (flex 1)]` is the canonical form
+row, and a 2-of-3 split is `flex 2` next to `flex 1`. A `DIR_ROW`/`DIR_COLUMN`
+View with no flex child takes the original single-pass code path untouched, so
+a no-flex tree lays out and serializes identically to before flex existed.
+
+When at least one child has `flex > 0`, the parent runs a three-phase pass: (1)
+measure each flex==0 (or explicit-size) child once at a tentative position to
+learn its intrinsic size; (2) distribute the leftover (`availW`/`availH` minus
+padding, gaps, and the fixed sum, floored at 0) - each flex child's base share
+is `leftover * flex / flexSum` and the integer remainder is handed out one cell
+at a time, left to right, so shares sum to exactly `leftover`; (3) a placement
+pass lays out every child at its real position (re-stamping bounds via a second
+`layout()` call on the fixed children is fine - nothing accumulates).
+
+Key contract: the parent passes each flex child's share as its `availW`
+(row) / `availH` (column) and **advances its own cursor by the share**,
+regardless of the `Size` the child actually returns - this is what keeps
+sibling columns aligned even when a leaf paints narrower than its cell. A flex
+`View` child fills its own `availW` already (every `View` reports `w = availW`
+in both directions), so nested row containers stretch naturally; a `View`'s
+own height, however, is always content-driven (sum of its children), so a
+column-flex `View`'s reported height need not equal its share - only the
+cursor position (and thus sibling placement) reflects the distribution.
+
+If a flex child also sets an explicit `style.width` (row) / `style.height`
+(column), the explicit size wins and the child is treated as fixed (its flex
+weight is excluded from `flexSum`), mirroring RN's `flexBasis` with `grow: 0`.
+
+`DIR_COLUMN` flex only runs when `c.availH` is bounded (`< LAYOUT_UNBOUNDED`);
+under the unbounded height `layoutRoot` uses by default, a flex child has no
+leftover to grow into and falls back to intrinsic height, matching RN's
+behavior for flex on an unbounded scroll axis.
 
 ## Input: the `dispatch(Event)` seam and focus
 
