@@ -319,8 +319,12 @@ void* nsBitmapRep(void* planes, i64 w, i64 h, i64 bitsPerSample, i64 samplesPerP
     void* rep = msg0(cls("NSBitmapImageRep"), "alloc");
     function<void*(void*, void*, void*, i64, i64, i64, i64, i8, i8, void*, i64, i64)> f =
         (function<void*(void*, void*, void*, i64, i64, i64, i64, i8, i8, void*, i64, i64)>)__objcMsgSendPtr;
+    // The planes parameter is unsigned char** - an array of plane pointers, not the
+    // buffer itself (interleaved data uses a one-entry array). NULL lets AppKit allocate.
+    void* plane0 = planes;
+    void* planesArg = (planes == nullptr) ? nullptr : (void*)&plane0;
     return f(rep, sel("initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:"),
-             planes, w, h, bitsPerSample, samplesPerPixel, hasAlpha, isPlanar, colorSpaceName, bytesPerRow, bitsPerPixel);
+             planesArg, w, h, bitsPerSample, samplesPerPixel, hasAlpha, isPlanar, colorSpaceName, bytesPerRow, bitsPerPixel);
 }
 
 // performSelectorOnMainThread:withObject:waitUntilDone: - marshal a call to the main
