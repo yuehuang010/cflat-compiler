@@ -20,7 +20,7 @@
 //   int main(int argc, char** argv)
 //   {
 //       UiTestSuite s = uiTestSuite("myapp");
-//       s.test("save enables after edit", (UiTest* t) => {
+//       s.test("save enables after edit", (IUiTest t) => {
 //           t.launch(new MyApp(), 80, 30);
 //           t.type("root/name", "hello");
 //           t.expectTrue("save enabled", !t.isDisabled("root/save"));
@@ -28,12 +28,11 @@
 //       return s.run(argc, argv);
 //   }
 import "ui_native.cb";
-
-// sleep() is forward-declared (not `import "time.cb"`) so this module does not drag time.cb
-// into every consumer's closure - time.cb's Duration type collides with the WinUI winmd
-// projection, and the WinUI gallery links ui_test.cb. Only waitUntil() calls sleep; a
-// consumer that uses waitUntil must have sleep in scope (import "time.cb").
-void sleep(i64 ms);
+// os.sleep_ms is the ONLY time primitive this module uses (in waitUntil). os.cb is imported
+// rather than time.cb because time.cb's Duration type collides with the WinUI winmd projection
+// and the WinUI gallery links ui_test.cb. waitUntil is an IUiTest vtable slot, so it is emitted
+// in EVERY consumer - the sleep it calls must therefore resolve without a consumer-side import.
+import "os.cb";
 
 // -- Host + driver seam (forward declarations, defined by the backend) ---------
 // Window lifecycle + message pumping.
@@ -41,7 +40,7 @@ void startHeadlessWindow(IComponent app, const char* title, int w, int h);
 void hostDrainPosted();
 void pumpNative();
 void nativeTeardownForTest();
-UiContext* activeCtx();
+IUiContext activeCtx();
 bool hostDark();
 
 // Action drivers (drive a control the way the OS would on user input).
@@ -115,12 +114,74 @@ string _uiSafeName(string name)
 struct UiSize { int w = 0; int h = 0; };
 UiSize uiSize(int w, int h) { UiSize s = default; s.w = w; s.h = h; return s; }
 
+// -- IUiTest: the case-body contract -------------------------------------------
+// A case body receives an IUiTest (a fat pointer to the runner's per-case UiTest) and
+// drives the window through these methods. Pure METHODS - the case body never reaches a
+// field; the runner reads the tally (pass/total/aborted/launched) off its own UiTest value.
+interface IUiTest
+{
+    // Launch / pump.
+    void launch(IComponent app, int w, int h);
+    void pump();
+
+    // Actions.
+    void click(string key);
+    void type(string key, string s);
+    void setText(string key, string s);
+    void comboSelect(string key, int i);
+    void listSelect(string key, int row);
+    void listActivate(string key, int row);
+    void tabSelect(string key, int i);
+    void sliderSet(string key, int v);
+    void splitterDrag(string key, int dx, int dy);
+    void fireContextMenu(string key, int i);
+    void fireMenu(int cmd);
+    void resize(int w, int h);
+    string focusFirst();
+    string focusNext();
+
+    // Readers.
+    string controlText(string key);
+    bool isChecked(string key);
+    bool isEnabled(string key);
+    bool isDisabled(string key);
+    int comboSelected(string key);
+    int listRowCount(string key);
+    int listSelectedRow(string key);
+    string listCellText(string key, int r, int c);
+    int progressValue(string key);
+    string statusText(string key);
+    Rect bounds(string key);
+    string accessibleName(string key);
+    string focusedKey();
+    u32 accentBg(string key);
+    u32 customDrawFill(string key);
+    bool imageHasBitmap(string key);
+    int tabCount(string key);
+    int tabSelected(string key);
+    int tooltipCount();
+    bool hostIsDark();
+    bool exists(string key);
+    bool shot(string path);
+
+    // Polling.
+    bool waitUntil(Lambda<bool()> pred, int timeoutMs);
+
+    // Asserts.
+    void expectTrue(string name, bool cond);
+    void expectFalse(string name, bool cond);
+    void expectBool(string name, bool want, bool got);
+    void expectInt(string name, int want, int got);
+    void expectStr(string name, string want, string got);
+    void expectText(string name, string key, string want);
+    void requireTrue(string name, bool cond);
+};
+
 // -- UiTest: the per-case context (wraps one launched headless window) ---------
-// A case body receives a UiTest* and drives the window through the methods below.
-// Asserts record pass/fail with the key path + expected/actual in the message and
-// never abort the process; a failed require() sets `aborted` so the remaining
-// asserts in that case are skipped (counted neither pass nor total).
-class UiTest
+// The IUiTest implementor. Asserts record pass/fail with the key path + expected/actual
+// in the message and never abort the process; a failed require() sets `aborted` so the
+// remaining asserts in that case are skipped (counted neither pass nor total).
+class UiTest : IUiTest
 {
     string caseName = default;
     int    pass     = 0;
@@ -205,7 +266,7 @@ class UiTest
         {
             if (pred()) return true;
             this.pump();
-            sleep(10);
+            os.sleep_ms(10);
             i++;
         }
         return pred();
@@ -267,7 +328,7 @@ class UiTest
 class UiCase
 {
     string name = default;
-    function<void(UiTest*)> body = default;
+    function<void(IUiTest)> body = default;
 };
 
 // -- UiTestSuite: the runner ---------------------------------------------------
@@ -277,7 +338,7 @@ class UiTestSuite
     list<UiCase*> cases = default;
 
     // Register a case. `body` is cloned into the wrapper (closures clone by default).
-    void test(string caseName, function<void(UiTest*)> body)
+    void test(string caseName, function<void(IUiTest)> body)
     {
         UiCase* c = new UiCase();
         c.name = caseName;

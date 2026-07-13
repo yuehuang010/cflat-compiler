@@ -4079,6 +4079,23 @@ public:
                                 compiler->currentFunctionReturnTypeName));
                         }
 
+                        // The mirror image: an INTERFACE VALUE returned from a function whose declared
+                        // return type is not that interface (e.g. a `View*` factory whose body now
+                        // returns an `IView`). The ret operand would be a fat pointer against a
+                        // pointer return type - LLVM module verification fails with no source location.
+                        if (right != nullptr && compiler->GetFatPtrType() != nullptr
+                            && right->getType() == compiler->GetFatPtrType()
+                            && compiler->currentFunction != nullptr
+                            && compiler->currentFunction->getReturnType() != compiler->GetFatPtrType())
+                        {
+                            LogErrorContext(jump, std::format(
+                                "cannot return interface value '{}' from a function declared to return '{}' - "
+                                "declare the return type as the interface (e.g. 'move {}')",
+                                returnNV.TypeAndValue.TypeName.empty() ? "<interface>" : returnNV.TypeAndValue.TypeName,
+                                compiler->currentFunctionReturnTypeName,
+                                returnNV.TypeAndValue.TypeName.empty() ? "<interface>" : returnNV.TypeAndValue.TypeName));
+                        }
+
                         // Bond return check: bonded value may only be returned if all its sources
                         // are 'bond' parameters of the current function (not locals).
                         auto checkBondSources = [&](const std::vector<std::string>& sources) {
@@ -6679,6 +6696,17 @@ public:
                         // Propagate pointer ownership: if the RHS was a move-returning pointer call,
                         // mark this local as owning so it is freed on scope exit.
                         if (typeAndValue.Pointer && compiler->lastCallReturnsOwned)
+                        {
+                            compiler->stackNamedVariable.back().namedVariable[name].IsOwning = true;
+                            compiler->lastCallReturnsOwned = false;
+                        }
+
+                        // Same for a `move <interface>`-returning call: the fat-ptr local owns the
+                        // boxed heap object (released by an explicit `delete`; interface locals are
+                        // never auto-destructed). The flag MUST be consumed here, or it leaks into
+                        // the next declaration or return and misclassifies it as owned.
+                        if (!typeAndValue.Pointer && compiler->lastCallReturnsOwned
+                            && compiler->IsInterfaceType(typeAndValue.TypeName))
                         {
                             compiler->stackNamedVariable.back().namedVariable[name].IsOwning = true;
                             compiler->lastCallReturnsOwned = false;
@@ -14382,6 +14410,18 @@ public:
                                     if (funcPtrTV.FuncPtrParams[i].IsMove && argNVs[i].IsBonded)
                                         Compiler(ctx)->LogError("cannot pass bonded value to 'move' parameter of function pointer - bonded values cannot be transferred out of their source's scope");
                                 }
+                                // [PFX-5a] INTERFACE-typed function-pointer parameter: box a concrete
+                                // class/struct argument into a fat pointer (and upcast an already-boxed
+                                // one), exactly as the direct-call path does.
+                                for (size_t i = 0; i < pcount && i < callArgs.size(); i++)
+                                {
+                                    const auto& fp = funcPtrTV.FuncPtrParams[i];
+                                    if (fp.Pointer || fp.TypeName.empty()) continue;
+                                    if (argNVs[i].Storage == nullptr && argNVs[i].Primary == nullptr) continue;
+                                    callArgs[i] = Compiler(ctx)->CoerceArgToInterface(
+                                        argNVs[i], callArgs[i], fp.TypeName,
+                                        std::format("function pointer '{}'", functionName));
+                                }
                                 auto result = Compiler(ctx)->CreateIndirectCall(funcPtrTV, funcPtr, callArgs);
                                 // Null caller storage and mark as moved for params declared 'move' on the funcptr type.
                                 for (size_t i = 0; i < pcount; i++)
@@ -14509,9 +14549,25 @@ public:
                             if (argumentList.size() > 0)
                             {
                                 auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
-                                for (const auto& namedArgument : namedArgCtx)
+                                // The interface method's declared params (excluding 'this'), so a lambda
+                                // literal argument gets its expected signature - without it the lambda's
+                                // return type defaults to void and its `ret` fails module verification.
+                                const std::vector<LLVMBackend::TypeAndValue>* ifaceParams =
+                                    Compiler(ctx)->GetInterfaceMethodParams(
+                                        interfaceVar.TypeAndValue.TypeName, primaryIdentifier);
+                                for (size_t argIdx = 0; argIdx < namedArgCtx.size(); ++argIdx)
                                 {
+                                    const auto& namedArgument = namedArgCtx[argIdx];
+                                    lambdaExpectedType = {};
+                                    if (ifaceParams != nullptr && argIdx < ifaceParams->size())
+                                    {
+                                        const auto& p = (*ifaceParams)[argIdx];
+                                        if (p.IsFunctionPointer) lambdaExpectedType = p;
+                                        else if (const auto* enc = Compiler(ctx)->GetEncodedClosureType(p.TypeName))
+                                            lambdaExpectedType = *enc;
+                                    }
                                     auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
+                                    lambdaExpectedType = {};
                                     // Use-after-move check: a field access carries a populated Primary, so the
                                     // LoadNamedVariable check below is skipped for it - check explicitly here so
                                     // re-moving a field (or any moved variable) is rejected uniformly.
@@ -14524,6 +14580,14 @@ public:
                                         }
                                     auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
                                     if (!argValue) break;
+                                    // An owned-string CALL result passed as a by-value (borrow) argument
+                                    // has no named owner and must be freed at end-of-full-expression -
+                                    // same rule as the direct-call arg loop. string.dtor's owned-bit
+                                    // check makes this a safe no-op for a borrowed (alias) result.
+                                    if (llvm::isa<llvm::CallInst>(argValue)
+                                        && argValue->getType() == llvm::StructType::getTypeByName(
+                                               *Compiler(ctx)->context, "string"))
+                                        Compiler(ctx)->RegisterOwnedStringTemp(argValue);
                                     LLVMBackend::NamedVariable argVar;
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
@@ -14540,8 +14604,16 @@ public:
                                     argVar.BondByAddress = argNV.BondByAddress;
                                     argVar.BondedSources = argNV.BondedSources;
 
+                                    // An INTERFACE argument's LLVM type is the shared fat-ptr struct, so the
+                                    // struct-name extraction below would name it "__iface_fat_ptr" and the
+                                    // derived->parent upcast (IText -> IElement) would be silently skipped -
+                                    // storing the derived vtable in a parent slot, whose dtor index differs.
+                                    if (argNV.TypeAndValue.IsInterface && !argNV.TypeAndValue.IsInterfacePointer)
+                                    {
+                                        argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
+                                    }
                                     // Extract struct name if this is a struct type
-                                    if (auto* st = llvm::dyn_cast<llvm::StructType>(argValue->getType()))
+                                    else if (auto* st = llvm::dyn_cast<llvm::StructType>(argValue->getType()))
                                     {
                                         auto structName = st->getName().str();
                                         if (!structName.empty())

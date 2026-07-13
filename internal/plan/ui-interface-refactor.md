@@ -1,10 +1,36 @@
 # UI framework: pointers -> interfaces
 
-Status: PHASE 1 + PHASE 2 + PHASE 3 COMPLETE (2026-07-13). F1-F4 are productionized and
-shipped in the compiler, the framework-wide rename has landed, and the 22 widget
-interfaces are declared and consumed by `core/ui_native.cb`. Phase 4 (hosts) is ready to
-start - read the "Phase 4 inputs" section below first, it carries two hard constraints.
+Status: **COMPLETE (2026-07-13). ALL SEVEN PHASES DONE.** F1-F4 are productionized and
+shipped in the compiler, the framework-wide rename has landed, the 22 widget interfaces
+are declared and consumed by `core/ui_native.cb`, all three native hosts reach every
+widget through its interface, every factory returns its widget interface by `move`, both
+contexts (`IUiContext`, `IUiTest`) are interfaces, and the examples + `doc/UI.md` are on
+the new API. ZERO concrete-class downcasts remain anywhere in the framework, the hosts, or
+the examples. The only runtime gap left is Mac validation (see the checklist at the bottom).
 Created: 2026-07-13
+
+## What changed for users
+
+Concrete classes are the CONSTRUCTION type (what `new`, a factory, and a `<Button/>` sugar
+tag build). Interfaces are the USAGE type (what you declare, pass, store, and return). You
+should not need a `Button*` in app code anymore.
+
+| Before | After |
+|---|---|
+| `Button* b = button("Save", onPress);` | `IButton b = button("Save", onPress);` (factory returns `move IButton`) |
+| `Button* b = <Button title="Save"/>;` | `IButton b = <Button title="Save"/>;` (the tag still names the CLASS; it auto-boxes) |
+| `IElement render(UiContext* ctx)` | `IElement render(IUiContext ctx)` |
+| `s.test("case", (UiTest* t) => {...});` | `s.test("case", (IUiTest t) => {...});` |
+| `View* v = tree as View; if (v != nullptr)` | `IView v = tree as IView; if (v != nullptr)` |
+| `tabs.addPane(p);` | `tabs.add(p);` (`addPane` was dropped - `add(IElement)` covers it) |
+| n/a | `if (node is ITooltipped) { ... }` - `is` now accepts an interface |
+| a field needed a concrete downcast | interface FIELDS are true lvalues: `b.title = "x"`, `card.style.gap = 1` |
+
+Ownership is unchanged in FLOW and now DECLARED: a factory returns `move IX` (the caller
+owns the new node), `parent.add(child)` PUBLISHES rather than transfers (so
+configure-after-insert still works), and the tree is freed by `destroyTree()` + `delete c`
+/ `deleteTree(root)`. An interface local is never auto-destructed, so there is never a
+second owner.
 
 ## Goal
 
@@ -295,17 +321,191 @@ had a cast).
    it): calling a `Lambda<string(...)>` CLASS FIELD and binding the owned result to a
    local leaks the string. See `internal/issue/lambda-field-call-owned-string-result-leaks.md`.
 
-### Phase 4 - Hosts
-`win32.cb` (52 casts), `cocoa.cb` (52), `winui.cb` (50): `applyProps`,
-`createControl`, `nodeTooltip`, `isEnabled`, and the event routers move to
-`IX` values. NOTE: cocoa cannot be runtime-verified here (no Mac box) - it is
-compile-checked only, and must be validated on Apple Silicon before release.
+### Phase 4 - Hosts - DONE (2026-07-13)
 
-### Phase 5 - Factories
-The 24 factory signatures (`view`, `button`, `scrollView`, ... `ui_native.cb:2261+`)
-return interface values (`move IButton button(...)`) instead of `Button*`.
-JSX is unchanged: `<Button/>` still news a concrete `Button` and auto-boxes at
+The three host files were the only ones changed (`cflat/core/ui_native/win32.cb`,
+`winui.cb`, `cocoa.cb`). Every concrete-class downcast is gone: a grep for
+` as <ElementClass>` across the three returns ZERO. Gates: `test.bat` all passed,
+`test_lsp.bat` 204/204, `example.bat` 89 passed / 0 failed / 24 skipped and leak-clean
+(gallery.cb + winui_gallery.cb both self-test green). `ui_native.cb`, the factories, the
+contexts, and `example/ui/**` were NOT touched and still compile against the concrete
+classes unchanged.
+
+| Host | Concrete downcasts before | Interface downcasts after |
+|---|---|---|
+| `win32.cb` | 52 | 38 |
+| `winui.cb` | 50 | 42 |
+| `cocoa.cb` | 52 | 38 |
+| **Total** | **154** | **118** |
+
+The 36-cast net reduction is entirely the two hoisted interfaces collapsing the two
+type-switch cascades the inventory predicted:
+
+- `tooltipOf()` - a 15-way `as`-chain in BOTH win32 and cocoa (30 casts) collapsed to
+  ONE `ITooltipped t = node as ITooltipped;` each. 30 -> 2.
+- `nativeIsEnabled()` in winui - a 10-way chain collapsed to one
+  `IDisableable d = e as IDisableable;`. 10 -> 1. The `d == nullptr` case IS the old
+  fallthrough (`return true`, "controls without a disabled prop are always enabled"), so
+  the semantics are identical by construction.
+
+Everything else is a 1:1 type-level rename (`X* v = node as X` -> `IX v = node as IX`),
+since `applyProps`/`createControl` dispatch on `kind()` and need the per-widget contract.
+`nativeIsChecked` (winui) keeps its 2-way branch: `checked` lives on `ICheckbox` and
+`IRadioButton` separately (no shared interface carries it), which is what the inventory's
+summary A predicted.
+
+No interface field was missing. Every field the three hosts reach - including the
+single-host ones (`ScrollView.contentH` cocoa-only, `Image.source` + `RadioButton.groupFirst`
+win32-only) - was already on the Phase 3 union, so `ui_native.cb` needed NO change.
+The three host-internal helpers that took a concrete pointer now take the interface:
+`_syncStatusBar(u64, IStatusBar)`, `_syncCombo(u64, IComboBox)`, `_syncTabs(u64, ITabControl)`
+(+ cocoa's `_syncButtonAccent(u64, IButton)`).
+
+The event routers use the fire* wrappers throughout (`fireChangeText`, `fireChange`,
+`fireSelect`, `fireActivate`, `fireSelectTab`, `fireExpand`, `fireRatioChange`), so no
+closure field is reached to be INVOKED. The 5 closures that are READ AS VALUES to be boxed
+across the `INativeHost` u64 seam - `IListView.rowText`, `ITreeView.childCount`/`childId`/
+`label`, `ICanvasView.onPaint` - are read straight off the interface and passed to
+`_boxListRow` / `_boxTree` / `_boxCanvas` exactly as before. The clone-on-by-value-read
+proven in Phase 4 inputs holds: the gallery re-renders and stays leak-clean.
+
+COCOA IS COMPILE-CHECKED ONLY (no Mac box). It passes
+`cflat.exe cflat/core/ui_native/cocoa.cb --check --platform macos` and the `test_lsp.bat`
+bulk sweep, and its changes are a line-for-line mirror of the win32 patterns (no logic was
+touched). It MUST be validated on Apple Silicon (`./test.sh Release` + a real gallery run)
+before release.
+
+### Phase 5 - Factories - DONE (2026-07-13)
+
+All 25 factories (the 24 widget factories + `mount`) return their widget interface by
+`move`. JSX is unchanged: `<Button/>` still news a concrete `Button` and auto-boxes at
 the `IElement` slot.
+
+| Factory | Now returns |
+|---|---|
+| `view` / `row` / `column` / `toolbar` | `move IView` |
+| `text` | `move IText` |
+| `button` | `move IButton` |
+| `box` | `move IBox` |
+| `textInput` | `move ITextInput` |
+| `checkbox` | `move ICheckbox` |
+| `progressBar` | `move IProgressBar` |
+| `slider` | `move ISlider` |
+| `scrollView` | `move IScrollView` |
+| `textArea` | `move ITextArea` |
+| `statusBar` | `move IStatusBar` |
+| `radioGroup` | `move IRadioGroup` |
+| `comboBox` | `move IComboBox` |
+| `listView` | `move IListView` |
+| `tabPane` | `move ITabPane` |
+| `tabControl` | `move ITabControl` |
+| `treeView` | `move ITreeView` |
+| `splitView` | `move ISplitView` |
+| `image` | `move IImage` |
+| `groupBox` | `move IGroupBox` |
+| `canvasView` | `move ICanvasView` |
+| `mount` | `move IElement` |
+
+`mount` returns `move IElement` because `ComponentElement` deliberately has no interface
+of its own (Phase 3: zero downcasts reach a field of it) and `IElement` is the entire
+contract a caller needs - it is only ever handed straight to a parent's `add()`.
+
+**OWNERSHIP DECISION: `add(IElement child)` STAYS A BORROW.** The contract is now written
+above `interface IElement` in `ui_native.cb`:
+
+- A factory returns `move IX`, so the CALLER owns the freshly-`new`ed node. (This is
+  forced, not chosen: returning an owning heap pointer boxed into a non-`move` interface
+  return is a compile error.)
+- `add()` does not TRANSFER, it PUBLISHES: after `parent.add(child)` the parent's
+  `children` list names the node, and from that point the TREE is its single owner.
+- That is sound because an interface value carries no ownership bit and an interface local
+  is NEVER auto-destructed (`LLVMBackend.h` `EmitDestructorsForScope`: interfaces are not
+  in `dataStructures`, so no dtor is emitted; an owning `IsOwning` flag on a fat-ptr local
+  is inert). So a caller that boxed a node and handed it to a parent has nothing left to
+  free - there is no window in which two owners exist and no scope exit that could
+  double-free.
+- Making `add` `move IElement` would buy nothing and cost something. Nothing: for an
+  INTERFACE-typed argument `ApplyMoveParamTransfer` classifies the fat ptr as a borrow
+  anyway (`isInterfaceBorrow`), so no source-nulling would be emitted. Cost: `move` would
+  mark the local moved, forbidding the configure-after-insert idiom
+  (`root.add(btn); btn.title = ...;`) that the framework and examples use everywhere.
+- A node never given to a parent is the caller's to `delete` (through the fat pointer's
+  dtor slot). The tree is freed exactly once, by `destroyTree()` + `delete c` per child
+  (`list<IElement>` does not destruct its elements). Unchanged from before Phase 5.
+
+Net effect on ownership FLOW: none. Before Phase 5 a factory returned a raw `T*` that the
+compiler did not track as owning (a non-`move` pointer return), so nothing freed the local
+and the tree owned the node. After Phase 5 the caller's local is an interface value, which
+is likewise never auto-destructed, and the tree owns the node. The difference is that the
+transfer is now DECLARED (`move`) instead of implied by a convention the type system could
+not see.
+
+Three compiler changes were required (all in `MainListener.h`, all landed). The first is the
+one this phase was warned about - and it did NOT surface as a compile error or a leak, it
+surfaced as a hard 0xC0000005 in EVERY UI example at teardown:
+
+0. **THE REAL BUG: the derived->parent interface upcast was silently skipped on the
+   VIRTUAL-DISPATCH argument path.** `v.add(text("hi"))` - an `IText` value passed to
+   `IView.add(IElement)` - stored the `IText` vtable in an `IElement` slot. Methods still
+   worked (a parent's methods are a PREFIX of the child's flattened vtable, so their indices
+   coincide), which is why `toJson()` printed a perfect tree. But the DTOR SLOT does not
+   coincide: `InterfaceDtorSlotIndex(IElement)` = 14, while slot 14 of `Text_IText_vtable` is
+   `inttoptr (i64 24)` - the byte offset of the `tooltip` FIELD. So `destroyTree()`'s
+   `delete c` called address 0x18. That is exactly the observed fault address.
+   Root cause: the arg-marshalling in the interface-method-call path took the argument's
+   `TypeName` from its LLVM struct type, which for ANY interface value is the shared
+   `__iface_fat_ptr`. `ReboxInterfaceIfNeeded("__iface_fat_ptr", "IElement")` sees a
+   non-interface source and returns the value untouched - no upcast, no diagnostic. The
+   free-function call path already propagated the interface NAME correctly; the virtual path
+   did not. It now does, so the two agree. Before Phase 5 nothing ever passed a DERIVED
+   interface value to a PARENT-interface param through virtual dispatch (factories handed out
+   concrete pointers, which take the concrete->interface branch), so the gap was unreachable.
+   Verified fixed: `Text_IElement_vtable` is now emitted and the upcast if-chain appears.
+
+The other two:
+
+1. **BUG FIX - stale ownership flag on an interface declaration.** `ParseDeclaration` consumed
+   `lastCallReturnsOwned` only for a `string` or a POINTER local. An INTERFACE local
+   (`IStatusBar sb = statusBar("hi");` - the shape Phase 5 introduces) left the flag SET,
+   so it leaked into the next declaration or return and misclassified it as owned. Symptom:
+   a spurious *"returning a heap object boxed into interface 'IElement' from a non-'move'
+   function ... it will leak"* on a perfectly good `return root;` in `fedit.cb`, and (when
+   the interface local came FIRST) a following `T*` local wrongly marked owning - which
+   would have been a double free at runtime. The declaration path now consumes the flag for
+   an interface local and marks it `IsOwning` (inert at scope exit, but it is what makes
+   `return t;` from a `move IText` factory type-check as owned).
+2. **NEW DIAGNOSTIC.** Returning an interface VALUE from a function declared to return a
+   concrete pointer (`View* _card(...)` whose body now returns an `IView`) reached LLVM as a
+   fat ptr against a pointer return type and failed module verification with no source
+   location. It is now a clean error. Regression case added to the existing
+   `Test/errors/err_return_interface_value.cb` (no new test file).
+
+Also dropped: `TabControl.addPane(TabPane* p)` - the last concrete-element-pointer method in
+the framework, and a pure alias of `add(IElement)` (Phase 3 deviation 4 predicted this).
+`fedit.cb` / `fedit_jsx.cb` / `doc/UI.md` updated to `add()`.
+
+One interface field was added: `ISplitView.onRatioChange` (`Lambda<void(int)>`). It is a
+settable prop with no factory argument, so a caller holding an `ISplitView` had no way to
+wire it (`fedit.cb` does). The other 8 non-interface closure fields stay off the interfaces -
+every one of them IS a factory argument, so nothing needs to reach them.
+
+Example ripple (PURELY MECHANICAL - `Button* b = button(...)` -> `IButton b = button(...)`;
+Phase 7 still owns the JSX decls, the `as`-downcasts, and `doc/UI.md`): 14 files touched -
+`01-elements/{app,counter,counter_jsx}.cb`, `02-terminal/{boxes,tui_demo}.cb`,
+`03-canvas-win32/{win32_boxes,win32_settings,win32_shot}.cb`,
+`04-native-controls/{win32,cocoa}_native_settings.cb`, `05-gallery/gallery_app.cb`,
+`06-winui/winui_demo.cb`, `07-testing/todo_app.cb`, `08-fedit/{fedit,fedit_jsx}.cb`.
+Three example function signatures went with the factories: `tui_demo.ktext` ->
+`move IText`, `gallery_app._card` -> `move IView`, and `fedit`'s two `addPane` calls ->
+`add`. `fedit_jsx.buildTabs` stays `TabControl*` (pure JSX, no factory).
+
+Left for Phase 7 (unchanged by this phase): the JSX-result decls
+(`Button* btn = <Button .../>;` - still correct, JSX constructs the CONCRETE class), the
+`tree as View` downcasts in `counter.cb`, and the `doc/UI.md` factory signature table
+(which still advertises `View* view(Style)`).
+
+Gates: `test.bat` all passed, `test_lsp.bat` 204/204, `example.bat` 89 passed / 0 failed /
+24 skipped and LEAK-CLEAN.
 
 PREREQUISITE (landed 2026-07-13, do not regress): the `move IFace` double-free fix.
 Passing an owning pointer to a `move` interface parameter used to leave the caller
@@ -320,14 +520,172 @@ Both call paths are covered now:
   paths now share `LLVMBackend::ApplyMoveParamTransfer` so they cannot drift again.
 Regression cover: `Test/test_interface.cb` tests 29-32.
 
-### Phase 6 - Contexts
-`UiContext` struct -> class + `IUiContext` (the 64 `.theme` reads need a field or
-an accessor - F1 decides which). `UiTest*` -> `IUiTest`; the case-body signature
-`function<void(UiTest*)>` (`ui_test.cb:270`) becomes `function<void(IUiTest)>`.
+Inputs from Phase 4 (nothing here blocks Phase 5):
 
-### Phase 7 - Examples + docs
-19 example files (~290 pointer lines; `gallery_app.cb` 76, `tui_demo.cb` 57,
-`fedit.cb` 29 are the big three) and `doc/UI.md` (~58 lines).
+1. The hosts are now interface-clean, so a factory returning `move IButton` instead of
+   `Button*` has NO host-side consumer to update - the hosts already only see `IElement`
+   coming out of the tree and downcast to `IX` themselves. The blast radius of Phase 5 is
+   `ui_native.cb`'s 24 factory signatures + `example/ui/**` (Phase 7), NOT the hosts.
+2. The 4 host-internal helpers that used to take a concrete element pointer now take an
+   interface (`_syncStatusBar(u64, IStatusBar)`, `_syncCombo(u64, IComboBox)`,
+   `_syncTabs(u64, ITabControl)`, cocoa `_syncButtonAccent(u64, IButton)`). These are
+   BORROW params (a plain `IFace`, not `move IFace`), so they are unaffected by the
+   move-param transfer rule - do not convert them to `move`.
+3. `ITabControl.addPane(TabPane* p)` was already excluded from the interface (Phase 3
+   deviation 4). If Phase 5 changes `tabPane()`'s return type, `addPane` must go with it
+   or be dropped in favour of `ITabControl.add(IElement)`, which already covers it.
+
+### Phase 6 - Contexts - DONE (2026-07-13)
+
+Both conversions landed. `UiContext*` -> `IUiContext` (all ~125 occurrences) and
+`UiTest*` -> `IUiTest` (all ~24). ZERO `UiContext*` / `UiTest*` tokens remain in
+`cflat/core/**` or `example/**`. Gates: `test.bat` all passed, `test_lsp.bat` 5 smoke +
+47 fixture + 204 bulk = green, `example.bat` 89 passed / 0 failed / 24 skipped and
+LEAK-CLEAN.
+
+**`IUiContext`** - `UiContext` is now `class UiContext : IUiContext`. Contract:
+
+- ONE field: `Theme theme;`. The F1 byte-offset slot makes it a true lvalue through the
+  fat pointer, so all 64 `ctx.theme.<field>` NESTED READS (`ctx.theme.buttonBg`) and the
+  whole-struct WRITES (`ctx.theme = darkTheme();` in 8 example `render()` bodies) work
+  unchanged - no accessors were invented. `&ctx.theme` (the hosts' `themeIsDark(&ctx.theme)`)
+  also works: address-of an interface field yields the field's address.
+- 20 methods: `invalidate`, `requestRepaint`, `consumeDirty`, `consumeRepaint`, `focus`,
+  `blur`, `hasFocus`, `setHover`, `hasHover`, `setPress`, `clearPress`, `hasPress`,
+  `setNativeHandle`, `hasNativeHandle`, `nativeHandle`, `removeNativeHandle`, `bindPost`,
+  `bindThreadId`, `post`, `assertUiThread`.
+
+IDENTITY IS PRESERVED - boxing does NOT copy and introduces NO owner. The concrete
+instance still lives exactly where it did (`Win.ctx` per host window in win32/cocoa, the
+`_wCtx` / `_gCtx` global in winui / ui_canvas, a stack local in the headless examples), and
+`activeCtx()` returns `&<that instance>` boxed into `IUiContext` - a fat pointer whose data
+word IS the instance's address. Boxing a value or a `&`-address BORROWS (the source keeps
+ownership and is not zeroed), an interface local is never auto-destructed, and nothing
+`delete`s a context. Proven behaviourally: state written through one `IUiContext`
+(focus / hover / press / `nativeByKey` / `theme`) is read back through a later, independent
+`activeCtx()` by the self-tests (`UiTest.exists()`, the `themeStorm` host-vs-model lockstep
+kit) - impossible if boxing had copied.
+
+One `UiContext*` could NOT survive the change: `fedit`'s post-round-trip worker used to ride
+a `void* arg` thread payload. `IUiContext` is a FAT pointer and cannot fit a single word, so
+`fedit.cb` / `fedit_jsx.cb` hand the worker its context through a file-scope `IUiContext`
+slot set from `activeCtx()` before `Thread.start`. Assertions unchanged.
+
+**`IUiTest`** - `UiTest` is now `class UiTest : IUiTest`. ZERO fields, 46 methods (2 lifecycle
+/ 14 actions / 22 readers / `waitUntil` / 7 asserts). The runner still owns a concrete
+`UiTest t` and reads its tally (`pass`/`total`/`aborted`/`launched`) directly. New case-body
+signature - every UI self-test lambda in `example/ui/**` followed:
+
+```cflat
+s.test("save enables after edit", (IUiTest t) => { ... });   // was (UiTest* t)
+```
+
+`ui_test.cb` now imports `os.cb` and calls `os.sleep_ms(10)` instead of forward-declaring
+`sleep`: `waitUntil` is an `IUiTest` VTABLE SLOT, so it is emitted in EVERY consumer, and the
+`sleep` it calls must resolve without a consumer-side `import "time.cb"` (it previously did
+not, and every non-`waitUntil` UI example failed to link).
+
+THREE COMPILER FIXES were required - all three are the same shape as Phase 5's bug 0 ("the
+direct-call path does X, the other path does not"). Regression cover: test 33
+(`testInterfaceArgPaths`) in `Test/test_interface.cb`; the leak is additionally gated by
+`example.bat`'s `--heap-audit` UI self-tests.
+
+1. **An INTERFACE-typed parameter of a `function<>` / `Lambda<>` got the raw class value.**
+   The indirect-call path (`MainListener.h` [PFX-5]) never boxed a concrete argument into the
+   fat pointer the callee expects; the call reached LLVM as `call void %f(%UiT %v)` and failed
+   module verification with no source location. It now boxes/upcasts through the new shared
+   `LLVMBackend::CoerceArgToInterface` (which also gives a clean error when the argument's
+   class does not implement the interface). This is exactly what `function<void(IUiTest)>`
+   needs.
+2. **A lambda LITERAL argument to an INTERFACE METHOD had no expected signature.** The
+   interface-method arg loop never set `lambdaExpectedType`, so the lambda's return type
+   defaulted to `void` and `t.waitUntil(() => ..., 2000)` emitted `ret i1` in a void function.
+   The loop now reads the declared params from the interface table
+   (`LLVMBackend::GetInterfaceMethodParams`), matching the direct path.
+3. **An owned-string call RESULT passed as a borrow argument of an INTERFACE METHOD leaked.**
+   The direct-call arg loop registers any string-typed `CallInst` argument as an owned string
+   temp (freed at end-of-full-expression; `string`'s dtor no-ops on a borrow); the
+   interface-method arg loop did not. `t.expectStr("row", "alpha", t.listCellText(...))` leaked
+   one buffer per call. Same registration added.
+
+COCOA IS COMPILE-CHECKED ONLY (no Mac box): `cflat.exe cflat/core/ui_native/cocoa.cb --check
+--platform macos` passes and it is in the `test_lsp.bat` bulk sweep. Its Phase 6 diff is a
+line-for-line mirror of win32 (signature type changes only; no logic touched). It MUST be
+validated on Apple Silicon before release.
+
+### Phase 7 - Examples + docs - DONE (2026-07-13)
+
+No compiler and no `core/` change was needed: the whole phase is examples + docs. Gates:
+`test.bat` all passed, `test_lsp.bat` 204/204, `example.bat` 89 passed / 0 failed / 24
+skipped and LEAK-CLEAN. Cocoa re-checked (`--check --platform macos`, unchanged this phase).
+
+1. **`counter.cb`** - the last concrete-class downcasts in the examples are gone:
+   `View* rootView = tree as View` -> `IView rootView = tree as IView`, and
+   `rootView.children[1] as Button` -> `as IButton`, each guarded with `== nullptr`. The
+   example exists to demonstrate the model, so it now demonstrates the current one.
+
+2. **JSX-result declarations CONVERTED** (`Button* btn = <Button .../>` -> `IButton btn = ...`),
+   in `gallery_app.cb`, `todo_app.cb`, `fedit.cb`, `fedit_jsx.cb` (34 declarations).
+   Rationale: after Phases 5-6 the concrete pointer was the ONLY place a user still saw a
+   class type outside a `<Tag/>`, which made the model read as "factories give interfaces,
+   sugar gives pointers" - a distinction with no meaning, since both allocate the same class.
+   Both forms compile; consistency wins, and the converted examples now PROVE the JSX
+   auto-box in every position it is used: declaration, interface-field write
+   (`img.pixels = ...`, `lv.rowText = ...`), nested-struct write through an interface field
+   (`grp.style.width = 30`, `split.style.width = 40`), `add()` argument (including a JSX
+   child expression `grp.add(<Text .../>)`), a `{expr}` sugar child
+   (`fedit_jsx.buildTabs` now returns `move ITabControl`), `return`, and `delete` through the
+   fat pointer (`fedit`'s hand-built `IStatusBar sbx`). All leak-clean under `--heap-audit`.
+   `ContextMenu*` was deliberately NOT converted (it is not an `IElement`; see the sweep).
+
+3. **`doc/UI.md` rewritten where it was stale** (it documented an API that no longer
+   compiles):
+   - New section **"Classes construct, interfaces are used"** stating the model, plus the
+     `as` / `is` / `== nullptr` downcast idiom and the interface-field lvalue rule.
+   - The `IElement` contract block: `paint`/`dispatch` now take `IUiContext`, and the two
+     methods the doc never listed (`flexWeight()`, `nodeBounds()`) were added.
+   - New **widget-interface hierarchy** block (the `IElement -> ITooltipped -> IDisableable`
+     tree) + the implicit-upcast rule.
+   - The factory table: all 25 signatures are now `move IX ...` (and `textArea` / `mount`,
+     which the table had omitted, are listed).
+   - New **"Ownership: who frees the tree"** block (factory owns -> `add` publishes -> tree
+     frees).
+   - `UiContext` struct block -> the real `interface IUiContext` (+ what stays on the
+     concrete class), `render(UiContext* ctx)` -> `render(IUiContext ctx)`,
+     `interface IComponent { IElement render(IUiContext ctx); }`,
+     `mount` -> `move IElement`.
+   - Sugar section: a tag names a CLASS (not the lowercase factory - the old contract text
+     was wrong about this), and the result binds to the widget interface.
+   - Testing section: case bodies are `(IUiTest t) => {...}`, the API table is `IUiTest`,
+     the kit note is `function<void(IUiTest)>`.
+   - **BUG in the copy-me template found by the compile gate**: it declared
+     `int main(int argc, char** argv)` - no `extern`, which fails to link. Fixed.
+
+4. **`doc/LANGUAGE.md`** - the Phase 1 interface material (fields, `is IFace`, interface
+   null-compare, multi-level chains, boxing/ownership) was already there and correct. Two
+   coherence fixes only: the interface-field sample now declares the nested struct it uses
+   (it referenced an undefined `Rect`), and the inheritance / `is` / `as` samples were
+   renamed off `Button`/`IButton` (which collided with the earlier `class Button : IElement`
+   in the same section) onto `Press`/`IPress`. No rewrite.
+
+   **Doc samples are compile-gated, not eyeballed.** Three scratch programs were built and
+   run against the current compiler: every `doc/UI.md` sample (all 25 factories, the JSX
+   forms, `as`/`is`/null-compare, `mount`, `deleteTree`), the doc's two-file test template
+   (which is what caught the missing `extern`), and every `doc/LANGUAGE.md` interface sample.
+   All three run clean under `--heap-audit`.
+
+5. **Final raw-pointer sweep of `example/ui/**` and `cflat/core/**`.** Every survivor is
+   deliberate:
+
+   | Survivor | Why it is legitimately still a pointer |
+   |---|---|
+   | `list<IElement>* childList()` | pointer-to-LIST, not to an element. Explicitly out of scope (revisit as `childCount()`/`childAt(i)`). |
+   | `ContextMenu*` (`buildCtxMenu`/`buildTreeMenu` + the host casts) | `ContextMenu` is NOT an `IElement` - it never enters the tree. It is a menu MODEL the app builds and hands to the host as an opaque `u64` (`nativeSetContextMenu`), which the host then owns and frees. No interface, and none needed. |
+   | `GalleryApp* g = activeApp() as GalleryApp;` | a COMPONENT class, not an element. `IComponent` is `render()` only, so reading app model state needs the concrete type. Correct by design (and the doc says so). |
+   | `PostBox*` / `ListRowBox*` / `TreeBox*` / `CanvasBox*` | host-seam plumbing: closures boxed to cross the `u64` `INativeHost` seam. Never user-facing. |
+   | `View* v = new View();` etc. inside the 24 factory bodies, and `ComponentElement* ce = new ComponentElement();` inside `mount` | the CONSTRUCTION type. The pointer exists for exactly the two statements between `new` and `return`, which is the point of the model. |
+
+   Nothing else remains. Every raw element pointer in user-facing example code is gone.
 
 ## Gates (every phase)
 
@@ -357,3 +715,44 @@ an accessor - F1 decides which). `UiTest*` -> `IUiTest`; the case-body signature
 
 ~1,190 lines across the framework, of which ~255 are the irreducible field
 reach-throughs, plus the compiler work in Phase 1.
+
+## MAC VALIDATION CHECKLIST (the one thing this refactor could not gate)
+
+`cflat/core/ui_native/cocoa.cb` was touched in Phases 2, 4, 5 and 6 and has been
+COMPILE-CHECKED ONLY through all seven phases - there is no Apple Silicon box here. Its
+diffs are line-for-line mirrors of the win32 patterns (type changes only; no logic was
+touched), but "it compiles" is a weaker claim than the Win32 gates, because the whole
+point of this refactor was a change in how VALUES are laid out and dispatched at runtime.
+Run this on an arm64 Mac before release:
+
+1. `cmake --preset macos-arm64-release && cmake --build --preset macos-arm64-release`
+2. `./test.sh Release` - **expect 147 passed / 0 failed** (the Linux/macOS suite baseline).
+   This gates the LANGUAGE side of the refactor (`Test/test_interface.cb` carries the
+   interface-field, upcast, `is IFace`, null-compare, move-param and dtor-slot cases).
+3. A REAL gallery run (not just `--check`):
+   `cflat example/ui/05-gallery/gallery.cb -i example/ui --heap-audit -o out/gallery`
+   then `./out/gallery --selftest` - expect the 27/27 self-test and NO
+   `heap-audit: LEAK` line. This is the only thing that exercises the Cocoa host's
+   interface downcasts on live AppKit controls.
+4. `cflat example/ui/08-fedit/fedit.cb -i example/ui --heap-audit -o out/fedit` +
+   `./out/fedit --selftest` - the multi-widget flagship (tabs / tree / split / context
+   menu / `ctx.post`).
+
+What to watch for, in order of likelihood:
+
+- **A wrong-vtable crash at TEARDOWN, not at use.** This is Phase 5's bug 0 signature: a
+  derived-interface value stored in a parent-interface slot still dispatches METHODS
+  correctly (a parent's methods are a prefix of the child's flattened vtable), so the UI
+  looks perfect and only `delete c` in `destroyTree()` faults - jumping to a small integer
+  address (a field BYTE OFFSET read as a function pointer, e.g. 0x18). If Cocoa faults on
+  window close with a tiny fault address, this is it.
+- **A missing interface field on a Cocoa-only reach.** `ScrollView.contentH` is read only
+  by the Cocoa host; it IS on `IScrollView`, but it is the one field no Windows gate
+  exercises.
+- **`_syncButtonAccent(u64, IButton)`** - Cocoa's only host-internal helper that has no
+  win32 twin; it is a BORROW param (plain `IFace`, not `move`), so do not "fix" it by
+  adding `move`.
+- **Leaks through the boxed closures** (`IListView.rowText`, `ITreeView.childCount`/
+  `childId`/`label`, `ICanvasView.onPaint`): reading a `Lambda` interface field BY VALUE
+  clones it. Win32 proves this is leak-neutral; the Cocoa `NSTableView` dataSource /
+  `NSOutlineView` paths box the same closures, so `--heap-audit` on the gallery is the check.

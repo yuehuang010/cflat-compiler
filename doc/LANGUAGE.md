@@ -898,18 +898,20 @@ through an interface value is a true lvalue - read it, write it, or write a memb
 nested struct through it:
 
 ```c
+struct Frame { int width = 0; int height = 0; };
+
 interface IElement
 {
     int kind();
-    int  tag;        // every implementor must have `int tag`
-    Rect bounds;
+    int   tag;       // every implementor must have `int tag`
+    Frame bounds;
 };
 
 class Button : IElement
 {
-    int  pad = 0;    // implementors may lay their fields out however they like
-    int  tag = 0;
-    Rect bounds = default;
+    int   pad = 0;   // implementors may lay their fields out however they like
+    int   tag = 0;
+    Frame bounds = default;
     int kind() { return 1; }
 };
 
@@ -963,19 +965,19 @@ A derived-interface value converts **implicitly** to any of its ancestor interfa
 assignment, as a call argument, when added to a `list<IAncestor>`, and on return:
 
 ```c
-interface IElement { int kind(); };
-interface ITipped : IElement { string tip; };
-interface IButton : ITipped  { string title; };
+interface ITipped : IElement { string tip; };      // IElement as above
+interface IPress  : ITipped  { string title; };
+class Press : IPress { /* tag, bounds, tip, title, kind() */ };
 
 int kindOf(IElement e) { return e.kind(); }
 
 move IElement make()
 {
-    IButton b = new Button();
-    return b;              // IButton -> IElement
+    IPress b = new Press();
+    return b;              // IPress -> IElement
 }
 
-IButton  b = new Button();
+IPress   b = new Press();
 IElement e = b;            // implicit upcast (two levels)
 kindOf(b);                 // implicit upcast at the call
 ```
@@ -990,14 +992,14 @@ requires an upcast.
 on the right, which is true when the runtime type implements it (at any depth):
 
 ```c
-if (e is IButton) { ... }     // does the value behind `e` implement IButton?
+if (e is IPress) { ... }     // does the value behind `e` implement IPress?
 ```
 
 An interface value can be compared against `nullptr` - a failed `as` yields a null value,
 and this is the guard for it:
 
 ```c
-IButton b = e as IButton;
+IPress b = e as IPress;
 if (b != nullptr) { printf("%s\n", b.title.data()); }
 ```
 

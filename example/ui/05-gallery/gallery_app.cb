@@ -92,7 +92,7 @@ class GalleryApp : IComponent
     }
 
     // Route a context-menu command (invoked via setMenuHandler / nativeFireContextMenu).
-    void onCommand(int id, UiContext* ctx) { this.ctxFired = id; ctx.invalidate(); }
+    void onCommand(int id, IUiContext ctx) { this.ctxFired = id; ctx.invalidate(); }
 
     // Build one churn-pool element for `slot` (a fixed kind per slot). Its LOCAL key is
     // "s<slot>", so under the stress box its path is "root/stressbox/s<slot>". Kinds span
@@ -100,19 +100,19 @@ class GalleryApp : IComponent
     IElement _stressChild(int slot)
     {
         string k = "s" + slot.toString();
-        if (slot == 0) { Button* b = button("b", () => {}); b.setKey(k); return b; }
-        if (slot == 1) { Text* t = text("t"); t.setKey(k); return t; }
-        if (slot == 2) { Checkbox* c = checkbox("c", false, (bool v) => {}); c.setKey(k); return c; }
-        if (slot == 3) { TextInput* ti = textInput("", (string s) => {}); ti.width = 10; ti.setKey(k); return ti; }
-        if (slot == 4) { ProgressBar* p = progressBar(50, 10); p.setKey(k); return p; }
-        if (slot == 5) { Slider* s = slider(50, 10, (int v) => {}); s.setKey(k); return s; }
+        if (slot == 0) { IButton b = button("b", () => {}); b.setKey(k); return b; }
+        if (slot == 1) { IText t = text("t"); t.setKey(k); return t; }
+        if (slot == 2) { ICheckbox c = checkbox("c", false, (bool v) => {}); c.setKey(k); return c; }
+        if (slot == 3) { ITextInput ti = textInput("", (string s) => {}); ti.width = 10; ti.setKey(k); return ti; }
+        if (slot == 4) { IProgressBar p = progressBar(50, 10); p.setKey(k); return p; }
+        if (slot == 5) { ISlider s = slider(50, 10, (int v) => {}); s.setKey(k); return s; }
         if (slot == 6)
         {
-            GroupBox* g = groupBox("g", makeStyle(0, 10, 2)); g.setKey(k);
-            Text* gc = text("gc"); gc.setKey("gc"); g.add(gc);
+            IGroupBox g = groupBox("g", makeStyle(0, 10, 2)); g.setKey(k);
+            IText gc = text("gc"); gc.setKey("gc"); g.add(gc);
             return g;
         }
-        ComboBox* cb = comboBox(0, (int i) => {}); cb.addItem("x"); cb.addItem("y");
+        IComboBox cb = comboBox(0, (int i) => {}); cb.addItem("x"); cb.addItem("y");
         cb.width = 10; cb.setKey(k);
         return cb;
     }
@@ -121,22 +121,22 @@ class GalleryApp : IComponent
     // one-line description Text ("desc"), then the caller adds the live demo. Every
     // card shares the same inner padding/gap idiom; backgroundColor comes from the
     // active theme (not hardcoded) so cards read correctly in light and dark mode.
-    View* _card(UiContext* ctx, string key, string titleTxt, string desc)
+    move IView _card(IUiContext ctx, string key, string titleTxt, string desc)
     {
-        View* card = column(makeStyle(1, 0, 0));
+        IView card = column(makeStyle(1, 0, 0));
         card.style.gap = 1;
         card.style.backgroundColor = ctx.theme.panelBg;
         card.setKey(key);
-        Text* t = text(titleTxt);
+        IText t = text(titleTxt);
         t.setKey("title");
         card.add(t);
-        Text* d = text(desc);
+        IText d = text(desc);
         d.setKey("desc");
         card.add(d);
         return card;
     }
 
-    IElement render(UiContext* ctx)
+    IElement render(IUiContext ctx)
     {
         ctx.theme = this.dark ? darkTheme() : lightTheme();
 
@@ -153,34 +153,34 @@ class GalleryApp : IComponent
         // The whole gallery is one native ScrollView (fills the window: style.height 0)
         // holding a single column of cards, one per control, so the reference stays a
         // scrollable page regardless of how tall the full control set renders.
-        ScrollView* root = scrollView(makeStyle(0, hostWidth(), 0));
+        IScrollView root = scrollView(makeStyle(0, hostWidth(), 0));
         root.setKey("root");
 
-        View* content = column(makeStyle(1, 0, 0));
+        IView content = column(makeStyle(1, 0, 0));
         content.style.gap = 1;
         content.setKey("content");
         root.add(content);
 
-        Text* title = text("Widget Gallery (P10 - full element set)");
+        IText title = text("Widget Gallery (P10 - full element set)");
         title.setKey("title");
         content.add(title);
 
         // -- Buttons -------------------------------------------------------------------
-        View* cardBtn = this._card(ctx, "cardbtn", "Buttons",
+        IView cardBtn = this._card(ctx, "cardbtn", "Buttons",
                 "Fires onPress; supports accent style and disabled state.");
-        Button* btn = <Button key="btn" title="Click me"
+        IButton btn = <Button key="btn" title="Click me"
                 onPress={() => { this.btnClicks = this.btnClicks + 1; ctx.invalidate(); }}/>;
         cardBtn.add(btn);
-        Button* themeBtn = <Button key="themebtn" title="Toggle theme"
+        IButton themeBtn = <Button key="themebtn" title="Toggle theme"
                 onPress={() => { this.dark = !this.dark; ctx.invalidate(); }}/>;
         cardBtn.add(themeBtn);
         content.add(cardBtn);
 
         // -- Image ---------------------------------------------------------------------
         // An Image fed a procedural BGRA32 buffer through the setImageData seam.
-        View* cardImg = this._card(ctx, "cardimg", "Image",
+        IView cardImg = this._card(ctx, "cardimg", "Image",
                 "Displays a bitmap uploaded through the setImageData seam; no asset file needed.");
-        Image* img = <Image key="img" width={12} height={4} altText="gradient"/>;
+        IImage img = <Image key="img" width={12} height={4} altText="gradient"/>;
         img.pixels = this.imgPixels; img.pxW = this.imgW; img.pxH = this.imgH;
         cardImg.add(img);
         content.add(cardImg);
@@ -188,9 +188,9 @@ class GalleryApp : IComponent
         // -- ICanvas --------------------------------------------------------------------
         // A CanvasView escape hatch: the app draws with the same ICanvas API the framework
         // paints through (here, a tiny bar chart + a label) into a native child surface.
-        View* cardCanvas = this._card(ctx, "cardcanvas", "ICanvas",
+        IView cardCanvas = this._card(ctx, "cardcanvas", "ICanvas",
                 "Escape hatch: draw directly with the ICanvas API into a native child surface.");
-        CanvasView* canvas = <CanvasView key="canvas" width={24} height={6}/>;
+        ICanvasView canvas = <CanvasView key="canvas" width={24} height={6}/>;
         canvas.onPaint = (ICanvas c) => {
             int barCount = 5;
             int i = 0;
@@ -212,17 +212,17 @@ class GalleryApp : IComponent
         // width is fixed so every form row below shares the same field start x - the flex
         // View wrapper (not the TextInput itself, which stays content-sized) is what stretches
         // with the window, per the "cursor advances by the flex share" contract in doc/UI.md.
-        View* cardInput = this._card(ctx, "cardinput", "Text Input",
+        IView cardInput = this._card(ctx, "cardinput", "Text Input",
                 "Single-line editable field; controlled through onChangeText.");
-        View* inputRow = row(makeStyle(0, 0, 0));
+        IView inputRow = row(makeStyle(0, 0, 0));
         inputRow.setKey("inputrow");
-        Box* inputLabel = box(makeStyle(0, 12, 1));
+        IBox inputLabel = box(makeStyle(0, 12, 1));
         inputLabel.setKey("inputlabel");
         inputLabel.add(text("Input:"));
         inputRow.add(inputLabel);
-        View* inputField = view(flexStyle(1));
+        IView inputField = view(flexStyle(1));
         inputField.setKey("inputfield");
-        TextInput* input = <TextInput key="input" value={this.inputText} width={24}
+        ITextInput input = <TextInput key="input" value={this.inputText} width={24}
                 placeholder="type here"
                 onChangeText={(string s) => { this.inputText = s; ctx.invalidate(); }}/>;
         inputField.add(input);
@@ -231,34 +231,34 @@ class GalleryApp : IComponent
         content.add(cardInput);
 
         // -- Checkbox ----------------------------------------------------------------------
-        View* cardCheck = this._card(ctx, "cardcheck", "Checkbox",
+        IView cardCheck = this._card(ctx, "cardcheck", "Checkbox",
                 "Toggles a boolean; controlled through onChange.");
-        Checkbox* chk = <Checkbox key="check" label="Enable feature" checked={this.checked}
+        ICheckbox chk = <Checkbox key="check" label="Enable feature" checked={this.checked}
                 onChange={(bool v) => { this.checked = v; ctx.invalidate(); }}/>;
         cardCheck.add(chk);
         content.add(cardCheck);
 
         // -- Progress Bar --------------------------------------------------------------------
-        View* cardProg = this._card(ctx, "cardprog", "Progress Bar",
+        IView cardProg = this._card(ctx, "cardprog", "Progress Bar",
                 "Presentational value indicator (0..100).");
-        ProgressBar* prog = <ProgressBar key="prog" value={this.progress} width={24}/>;
+        IProgressBar prog = <ProgressBar key="prog" value={this.progress} width={24}/>;
         prog.tooltip = "download progress";   // also the control's accessible Name (P13 a11y)
         cardProg.add(prog);
         content.add(cardProg);
 
         // -- Slider ----------------------------------------------------------------------
-        View* cardSlider = this._card(ctx, "cardslider", "Slider",
+        IView cardSlider = this._card(ctx, "cardslider", "Slider",
                 "Draggable numeric control; controlled through onChange.");
-        Slider* sld = <Slider key="slider" value={this.sliderVal} width={24}
+        ISlider sld = <Slider key="slider" value={this.sliderVal} width={24}
                 onChange={(int v) => { this.sliderVal = v; ctx.invalidate(); }}/>;
         cardSlider.add(sld);
         content.add(cardSlider);
 
         // -- Group Box ---------------------------------------------------------------------
         // A GroupBox framing a couple of labels (classic-forms grouping).
-        View* cardGrp = this._card(ctx, "cardgrp", "Group Box",
+        IView cardGrp = this._card(ctx, "cardgrp", "Group Box",
                 "Frames related controls under a titled border.");
-        GroupBox* grp = <GroupBox key="grp" title="Options"/>;
+        IGroupBox grp = <GroupBox key="grp" title="Options"/>;
         grp.style.width = 30; grp.style.height = 4;
         grp.add(<Text key="gt0" text="grouped item A"/>);
         grp.add(<Text key="gt1" text="grouped item B"/>);
@@ -267,9 +267,9 @@ class GalleryApp : IComponent
 
         // -- Radio Group ---------------------------------------------------------------------
         // RadioGroup authored in sugar (controlled: each radio's checked flows down).
-        View* cardRadio = this._card(ctx, "cardradio", "Radio Group",
+        IView cardRadio = this._card(ctx, "cardradio", "Radio Group",
                 "Mutually exclusive selection; controlled through onChange.");
-        RadioGroup* rg = <RadioGroup key="rg" value={this.pick}
+        IRadioGroup rg = <RadioGroup key="rg" value={this.pick}
                 onChange={(int i) => { this.pick = i; ctx.invalidate(); }}>
             <RadioButton key="r0" label="Small"  index={0} checked={this.pick == 0}/>
             <RadioButton key="r1" label="Medium" index={1} checked={this.pick == 1}/>
@@ -283,17 +283,17 @@ class GalleryApp : IComponent
         // not set through a sugar attribute - the container-copy-into-field rule). Same
         // [label fixed 12][field flex 1] form-row idiom as the TextInput above, so the
         // two fields' flex-View slots align in a column (asserted below).
-        View* cardCombo = this._card(ctx, "cardcombo", "Combo Box",
+        IView cardCombo = this._card(ctx, "cardcombo", "Combo Box",
                 "Dropdown single-selection list; controlled through onChange.");
-        View* comboRow = row(makeStyle(0, 0, 0));
+        IView comboRow = row(makeStyle(0, 0, 0));
         comboRow.setKey("comborow");
-        Box* comboLabel = box(makeStyle(0, 12, 1));
+        IBox comboLabel = box(makeStyle(0, 12, 1));
         comboLabel.setKey("combolabel");
         comboLabel.add(text("Font:"));
         comboRow.add(comboLabel);
-        View* comboField = view(flexStyle(1));
+        IView comboField = view(flexStyle(1));
         comboField.setKey("combofield");
-        ComboBox* cb = <ComboBox key="combo" selectedIndex={this.fontIdx} width={20}
+        IComboBox cb = <ComboBox key="combo" selectedIndex={this.fontIdx} width={20}
                 onChange={(int i) => { this.fontIdx = i; ctx.invalidate(); }}/>;
         cb.addItem("Consolas");
         cb.addItem("Cascadia Code");
@@ -306,9 +306,9 @@ class GalleryApp : IComponent
 
         // -- List View ---------------------------------------------------------------------
         // Virtualized ListView authored in sugar; columns + rowText set imperatively.
-        View* cardList = this._card(ctx, "cardlist", "List View",
+        IView cardList = this._card(ctx, "cardlist", "List View",
                 "Virtualized multi-column list; handles 100k rows with few rowText calls.");
-        ListView* lv = <ListView key="list" rowCount={GALLERY_ROWS}
+        IListView lv = <ListView key="list" rowCount={GALLERY_ROWS}
                 selectedIndex={this.listSel} width={40} height={6}
                 onSelect={(int r) => { this.listSel = r; ctx.invalidate(); }}
                 onActivate={(int r) => { this.listActivated = r; ctx.invalidate(); }}/>;
@@ -326,9 +326,9 @@ class GalleryApp : IComponent
         // -- Tab Control ---------------------------------------------------------------------
         // TabControl authored in sugar (P9): keyed panes, only the active one maps to
         // native. Switching tabs is controlled through onSelectTab.
-        View* cardTabs = this._card(ctx, "cardtabs", "Tab Control",
+        IView cardTabs = this._card(ctx, "cardtabs", "Tab Control",
                 "Switches between keyed panes; only the active pane maps to native.");
-        TabControl* tabs = <TabControl key="tabs" selectedTab={this.tab} width={40} height={5}
+        ITabControl tabs = <TabControl key="tabs" selectedTab={this.tab} width={40} height={5}
                 onSelectTab={(int i) => { this.tab = i; ctx.invalidate(); }}>
             <TabPane key="p0" title="Alpha"><Text key="t0" text="Alpha pane content"/></TabPane>
             <TabPane key="p1" title="Beta"><Text key="t1" text="Beta pane content"/></TabPane>
@@ -339,9 +339,9 @@ class GalleryApp : IComponent
         // -- Tree View ---------------------------------------------------------------------
         // TreeView authored in sugar (P9): expand-on-demand node source. onSelect/onExpand
         // are attributes; the child/label callbacks are assigned imperatively (like rowText).
-        View* cardTree = this._card(ctx, "cardtree", "Tree View",
+        IView cardTree = this._card(ctx, "cardtree", "Tree View",
                 "Lazy-expanding hierarchical list; children are fetched on demand.");
-        TreeView* tree = <TreeView key="tree" width={24} height={6} selectedNode={this.treeSel}
+        ITreeView tree = <TreeView key="tree" width={24} height={6} selectedNode={this.treeSel}
                 onSelect={(int nid) => { this.treeSel = nid; ctx.invalidate(); }}
                 onExpand={(int nid) => { this.treeExpands = this.treeExpands + 1; }}/>;
         tree.childCount = (int nid) => {
@@ -366,9 +366,9 @@ class GalleryApp : IComponent
 
         // -- Split View ---------------------------------------------------------------------
         // SplitView authored in sugar (P9): two weighted panes + a draggable divider.
-        View* cardSplit = this._card(ctx, "cardsplit", "Split View",
+        IView cardSplit = this._card(ctx, "cardsplit", "Split View",
                 "Two resizable panes divided by a draggable splitter.");
-        SplitView* split = <SplitView key="split" ratio={this.splitRatio} vertical={true}
+        ISplitView split = <SplitView key="split" ratio={this.splitRatio} vertical={true}
                 onRatioChange={(int r) => { this.splitRatio = r; ctx.invalidate(); }}>
             <Box key="lp" style={makeStyle(0, 0, 3)}><Text key="lpt" text="left"/></Box>
             <Box key="rp" style={makeStyle(0, 0, 3)}><Text key="rpt" text="right"/></Box>
@@ -379,18 +379,18 @@ class GalleryApp : IComponent
 
         // -- Text Area ---------------------------------------------------------------------
         // A multiline TextArea (uncontrolled-with-sync).
-        View* cardArea = this._card(ctx, "cardarea", "Text Area",
+        IView cardArea = this._card(ctx, "cardarea", "Text Area",
                 "Multiline editable text block; reports a dirty-notify count on change.");
-        TextArea* area = <TextArea key="area" value="" width={40} height={4}
+        ITextArea area = <TextArea key="area" value="" width={40} height={4}
                 onChange={() => { this.areaEdits = this.areaEdits + 1; }}/>;
         cardArea.add(area);
         content.add(cardArea);
 
         // -- Context Menu ---------------------------------------------------------------------
         // A right-clickable panel routed through the app menu handler.
-        View* cardContext = this._card(ctx, "cardcontext", "Context Menu",
+        IView cardContext = this._card(ctx, "cardcontext", "Context Menu",
                 "Right-click panel routes commands through the app menu handler.");
-        Box* ctxbox = box(makeStyle(0, 40, 2));
+        IBox ctxbox = box(makeStyle(0, 40, 2));
         ctxbox.setKey("ctxbox");
         ctxbox.add(text("right-click me (context menu)"));
         cardContext.add(ctxbox);
@@ -404,31 +404,31 @@ class GalleryApp : IComponent
         // (b) a weighted flex-2:flex-1 pair of boxes inside a fixed-width (61) container, so
         //     the 39/19 split (leftover 58 + 1 gap cell, remainder handed to the higher-weight
         //     child) is deterministic and independent of the host window size.
-        View* cardFlex = this._card(ctx, "cardflex", "Flex Layout",
+        IView cardFlex = this._card(ctx, "cardflex", "Flex Layout",
                 "Flex-weight idiom: an aligned form-row field and a 2:1 weighted split.");
-        View* flexRow = row(makeStyle(0, 0, 0));
+        IView flexRow = row(makeStyle(0, 0, 0));
         flexRow.setKey("flexrow");
-        Box* flexLabel = box(makeStyle(0, 12, 1));
+        IBox flexLabel = box(makeStyle(0, 12, 1));
         flexLabel.setKey("flexlabel");
         flexLabel.add(text("Name:"));
         flexRow.add(flexLabel);
-        View* flexField = view(flexStyle(1));
+        IView flexField = view(flexStyle(1));
         flexField.setKey("flexfield");
-        TextInput* flexInput = textInput("", (string s) => {});
+        ITextInput flexInput = textInput("", (string s) => {});
         flexInput.setKey("flexinput");
         flexField.add(flexInput);
         flexRow.add(flexField);
         cardFlex.add(flexRow);
 
-        Box* flexDemo = box(makeStyle(0, 61, 3));
+        IBox flexDemo = box(makeStyle(0, 61, 3));
         flexDemo.setKey("flexdemo");
-        View* flexPair = row(makeStyle(0, 0, 0));
+        IView flexPair = row(makeStyle(0, 0, 0));
         flexPair.style.gap = 1;
         flexPair.setKey("flexpair");
-        View* flexTwo = view(flexStyle(2));
+        IView flexTwo = view(flexStyle(2));
         flexTwo.setKey("flextwo");
         flexTwo.add(box(makeStyle(0, 0, 1)));
-        View* flexOne = view(flexStyle(1));
+        IView flexOne = view(flexStyle(1));
         flexOne.setKey("flexone");
         flexOne.add(box(makeStyle(0, 0, 1)));
         flexPair.add(flexTwo);
@@ -439,19 +439,19 @@ class GalleryApp : IComponent
 
         // -- Status Bar ---------------------------------------------------------------------
         // Status lines (existing P8/P9 asserts) + a bottom StatusBar strip.
-        View* cardStatus = this._card(ctx, "cardstatus", "Status Bar",
+        IView cardStatus = this._card(ctx, "cardstatus", "Status Bar",
                 "Presentational strip plus the running app-wide status text.");
-        Text* status = text("pick=" + this._sizeName() + " font=" + this.fontIdx.toString()
+        IText status = text("pick=" + this._sizeName() + " font=" + this.fontIdx.toString()
             + " sel=" + this.listSel.toString() + " act=" + this.listActivated.toString());
         status.setKey("status");
         cardStatus.add(status);
 
-        Text* status2 = text("tab=" + this.tab.toString() + " tsel=" + this.treeSel.toString()
+        IText status2 = text("tab=" + this.tab.toString() + " tsel=" + this.treeSel.toString()
             + " ratio=" + this.splitRatio.toString() + " ctx=" + this.ctxFired.toString());
         status2.setKey("status2");
         cardStatus.add(status2);
 
-        StatusBar* sbar = <StatusBar key="sbar"/>;
+        IStatusBar sbar = <StatusBar key="sbar"/>;
         sbar.parts.add("Ready");
         sbar.parts.add("clicks=" + this.btnClicks.toString());
         cardStatus.add(sbar);
@@ -461,11 +461,11 @@ class GalleryApp : IComponent
         // P13 reconcile stress-soak: the pool only renders once the self-test turns `stress`
         // on. The active pool slots and their order come from the seeded LCG state, so each
         // step is a deterministic create/destroy/reorder the keyed reconciler must track.
-        View* cardStress = this._card(ctx, "cardstress", "Reconcile Stress",
+        IView cardStress = this._card(ctx, "cardstress", "Reconcile Stress",
                 "Seeded churn pool exercising keyed create/destroy/reorder (P13 hardening).");
         if (this.stress)
         {
-            Box* sbox = box(makeStyle(0, 40, 10));
+            IBox sbox = box(makeStyle(0, 40, 10));
             sbox.setKey("stressbox");
             int n = 8;
             int step = 0;
@@ -481,7 +481,7 @@ class GalleryApp : IComponent
         // The stress-step button (always present) advances the LCG one step per click. The
         // self-test drives it host-neutrally via nativeClickButton, then asserts the native
         // control census matches this.stressMask after each reconcile.
-        Button* stressBtn = button("stress-step", () => {
+        IButton stressBtn = button("stress-step", () => {
             this.stress = true;
             u32 s = (u32)this.stressSeed * 1103515245u + 12345u;
             this.stressSeed = (int)s;
@@ -558,7 +558,7 @@ int gallerySelfTest()
     // The full element set: P8 forms, P9 nav (tabs/tree/split/context), P10 visuals, then the
     // P13 hardening kits. One launch drives it all through the host-neutral drivers; control +
     // model state is the oracle (no pixels).
-    s.test("full element set + hardening", (UiTest* t) =>
+    s.test("full element set + hardening", (IUiTest t) =>
     {
         t.launch(new GalleryApp(), 60, 60);
         GalleryApp* g = activeApp() as GalleryApp;

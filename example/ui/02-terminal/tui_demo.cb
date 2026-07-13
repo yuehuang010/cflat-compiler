@@ -24,11 +24,11 @@ class Counter : IComponent
 {
     int count = 0;
 
-    IElement render(UiContext* ctx)
+    IElement render(IUiContext ctx)
     {
-        View* root = view(makeStyle(1, 0, 0));
+        IView root = view(makeStyle(1, 0, 0));
         root.add(text("Count: " + this.count.toString()));
-        Button* inc = button("+1", () => { this.count = this.count + 1; ctx.invalidate(); });
+        IButton inc = button("+1", () => { this.count = this.count + 1; ctx.invalidate(); });
         inc.setKey("inc");   // keyed so it can hold focus across re-renders
         root.add(inc);
         return root;
@@ -42,10 +42,10 @@ class EditApp : IComponent
 {
     string text = default;
 
-    IElement render(UiContext* ctx)
+    IElement render(IUiContext ctx)
     {
-        View* root = view(makeStyle(0, 0, 0));
-        TextInput* ti = textInput(this.text, (string nv) => { this.text = nv; ctx.invalidate(); });
+        IView root = view(makeStyle(0, 0, 0));
+        ITextInput ti = textInput(this.text, (string nv) => { this.text = nv; ctx.invalidate(); });
         ti.setKey("field");
         ti.width = 12;
         root.add(ti);
@@ -74,11 +74,11 @@ int diffRows(Surface* a, Surface* b, int h)
     return n;
 }
 
-Text* ktext(string k, string s) { Text* t = text(s); t.setKey(k); return t; }
+move IText ktext(string k, string s) { IText t = text(s); t.setKey(k); return t; }
 
 // Scan the grid region for the first cell that consumes a mouse-down. Returns
 // true and leaves the handler's side effects applied.
-bool clickScan(IElement tree, UiContext* ctx, int w, int h)
+bool clickScan(IElement tree, IUiContext ctx, int w, int h)
 {
     int y = 0;
     while (y < h)
@@ -126,9 +126,9 @@ bool testCounterReconcile()
 bool testKeyedReorder()
 {
     UiContext ctx = default;
-    View* x = view(makeStyle(0,0,0));
+    IView x = view(makeStyle(0,0,0));
     x.add(ktext("a","A")); x.add(ktext("b","B")); x.add(ktext("c","C"));
-    View* y = view(makeStyle(0,0,0));
+    IView y = view(makeStyle(0,0,0));
     y.add(ktext("c","C")); y.add(ktext("a","A")); y.add(ktext("b","B"));
 
     IElement t = x;
@@ -153,12 +153,12 @@ bool testComponentReconcile()
     Counter* a = new Counter(); a.count = 0;
     Counter* b = new Counter(); b.count = 0;
 
-    View* r1 = view(makeStyle(0,0,0));
+    IView r1 = view(makeStyle(0,0,0));
     r1.add(mount(a, "a", &ctx)); r1.add(mount(b, "b", &ctx));
     IElement committed = r1;
 
     a.count = 1;   // state behind component 'a' changes
-    View* r2 = view(makeStyle(0,0,0));
+    IView r2 = view(makeStyle(0,0,0));
     r2.add(mount(b, "b", &ctx)); r2.add(mount(a, "a", &ctx));   // reorder
     IElement wip = r2;
 
@@ -211,7 +211,7 @@ bool testFocusKeyboard()
 bool testRowLayout()
 {
     UiContext ctx = default;
-    View* row = view(makeStyle(0,0,0));
+    IView row = view(makeStyle(0,0,0));
     row.style.flexDirection = DIR_ROW;
     row.add(text("AB"));    // width 2
     row.add(text("CDE"));   // width 3, placed at x=2
@@ -234,10 +234,10 @@ bool testRowLayout()
 // remainder goes to the earliest child, left to right - with contiguous x.
 bool testFlexEqualSplit()
 {
-    View* r = row(makeStyle(0, 0, 0));
-    View* a = view(flexStyle(1)); r.add(a);
-    View* b = view(flexStyle(1)); r.add(b);
-    View* c = view(flexStyle(1)); r.add(c);
+    IView r = row(makeStyle(0, 0, 0));
+    IView a = view(flexStyle(1)); r.add(a);
+    IView b = view(flexStyle(1)); r.add(b);
+    IView c = view(flexStyle(1)); r.add(c);
     IElement t = r;
 
     layoutRoot(t, 0, 0, 100);
@@ -253,9 +253,9 @@ bool testFlexEqualSplit()
 // keeps its own width and the flex child absorbs the remainder (80).
 bool testFlexFixedPlusFlex()
 {
-    View* r = row(makeStyle(0, 0, 0));
-    Box* label = box(makeStyle(0, 20, 0)); r.add(label);
-    View* field = view(flexStyle(1)); r.add(field);
+    IView r = row(makeStyle(0, 0, 0));
+    IBox label = box(makeStyle(0, 20, 0)); r.add(label);
+    IView field = view(flexStyle(1)); r.add(field);
     IElement t = r;
 
     layoutRoot(t, 0, 0, 100);
@@ -270,9 +270,9 @@ bool testFlexFixedPlusFlex()
 // leftover remainder cell goes to the first - higher-weight - child).
 bool testFlexWeightedSplit()
 {
-    View* r = row(makeStyle(0, 0, 0));
-    View* two = view(flexStyle(2)); r.add(two);
-    View* one = view(flexStyle(1)); r.add(one);
+    IView r = row(makeStyle(0, 0, 0));
+    IView two = view(flexStyle(2)); r.add(two);
+    IView one = view(flexStyle(1)); r.add(one);
     IElement t = r;
 
     layoutRoot(t, 0, 0, 100);
@@ -287,10 +287,10 @@ bool testFlexWeightedSplit()
 // 50-wide row with padding 2 and gap 3 leaves 43 for two flex-1 children.
 bool testFlexGapPadding()
 {
-    View* r = row(makeStyle(2, 0, 0));
+    IView r = row(makeStyle(2, 0, 0));
     r.style.gap = 3;
-    View* a = view(flexStyle(1)); r.add(a);
-    View* b = view(flexStyle(1)); r.add(b);
+    IView a = view(flexStyle(1)); r.add(a);
+    IView b = view(flexStyle(1)); r.add(b);
     IElement t = r;
 
     layoutRoot(t, 0, 0, 50);
@@ -306,7 +306,7 @@ bool testFlexGapPadding()
 // and "flexWrap":0 fields are added to the JSON shape.
 bool testFlexNoFlexUnchanged()
 {
-    View* rt = view(makeStyle(1, 0, 0));
+    IView rt = view(makeStyle(1, 0, 0));
     rt.add(text("hi"));
     IElement t = rt;
 
@@ -331,9 +331,9 @@ bool testFlexNoFlexUnchanged()
 // advances by the child's actual (here: zero) height - the intrinsic fallback.
 bool testFlexColumn()
 {
-    View* colB = column(makeStyle(0, 0, 0));
-    View* b1 = view(flexStyle(1)); colB.add(b1);
-    View* b2 = view(flexStyle(1)); colB.add(b2);
+    IView colB = column(makeStyle(0, 0, 0));
+    IView b1 = view(flexStyle(1)); colB.add(b1);
+    IView b2 = view(flexStyle(1)); colB.add(b2);
     IElement tb = colB;
     LayoutConstraints ccB = default;
     ccB.x = 0; ccB.y = 0; ccB.availW = 20; ccB.availH = 30;
@@ -342,9 +342,9 @@ bool testFlexColumn()
     bool bounded = r1.y == 0 && r2.y == 15 && szB.h == 30;
     deleteTree(tb);
 
-    View* colU = column(makeStyle(0, 0, 0));
-    View* u1 = view(flexStyle(1)); colU.add(u1);
-    View* u2 = view(flexStyle(1)); colU.add(u2);
+    IView colU = column(makeStyle(0, 0, 0));
+    IView u1 = view(flexStyle(1)); colU.add(u1);
+    IView u2 = view(flexStyle(1)); colU.add(u2);
     IElement tu = colU;
     Size szU = layoutRoot(tu, 0, 0, 20);
     Rect s1 = u1.nodeBounds(); Rect s2 = u2.nodeBounds();
@@ -360,13 +360,13 @@ bool testFlexColumn()
 // fits three per line, the fourth wraps to line 2 at x=0.
 bool testFlexWrapFixedCells()
 {
-    View* r = row(makeStyle(0, 0, 0));
+    IView r = row(makeStyle(0, 0, 0));
     r.style.flexWrap = WRAP_WRAP;
     r.style.gap = 2;
-    Box* b1 = box(makeStyle(0, 30, 0)); r.add(b1);
-    Box* b2 = box(makeStyle(0, 30, 0)); r.add(b2);
-    Box* b3 = box(makeStyle(0, 30, 0)); r.add(b3);
-    Box* b4 = box(makeStyle(0, 30, 0)); r.add(b4);
+    IBox b1 = box(makeStyle(0, 30, 0)); r.add(b1);
+    IBox b2 = box(makeStyle(0, 30, 0)); r.add(b2);
+    IBox b3 = box(makeStyle(0, 30, 0)); r.add(b3);
+    IBox b4 = box(makeStyle(0, 30, 0)); r.add(b4);
     IElement t = r;
 
     Size sz = layoutRoot(t, 0, 0, 100);
@@ -384,12 +384,12 @@ bool testFlexWrapFixedCells()
 // the next line's y offset is that max plus the gap.
 bool testFlexWrapLineHeight()
 {
-    View* r = row(makeStyle(0, 0, 0));
+    IView r = row(makeStyle(0, 0, 0));
     r.style.flexWrap = WRAP_WRAP;
     r.style.gap = 2;
-    Box* b1 = box(makeStyle(0, 20, 1)); r.add(b1);
-    Box* b2 = box(makeStyle(0, 20, 5)); r.add(b2);
-    Box* b3 = box(makeStyle(0, 20, 1)); r.add(b3);
+    IBox b1 = box(makeStyle(0, 20, 1)); r.add(b1);
+    IBox b2 = box(makeStyle(0, 20, 5)); r.add(b2);
+    IBox b3 = box(makeStyle(0, 20, 1)); r.add(b3);
     IElement t = r;
 
     layoutRoot(t, 0, 0, 50);
@@ -404,12 +404,12 @@ bool testFlexWrapLineHeight()
 // than looping forever; the neighbors before/after still get their own lines.
 bool testFlexWrapOversizedChild()
 {
-    View* r = row(makeStyle(0, 0, 0));
+    IView r = row(makeStyle(0, 0, 0));
     r.style.flexWrap = WRAP_WRAP;
     r.style.gap = 2;
-    Box* b1 = box(makeStyle(0, 20, 0)); r.add(b1);
-    Box* b2 = box(makeStyle(0, 60, 0)); r.add(b2);
-    Box* b3 = box(makeStyle(0, 20, 0)); r.add(b3);
+    IBox b1 = box(makeStyle(0, 20, 0)); r.add(b1);
+    IBox b2 = box(makeStyle(0, 60, 0)); r.add(b2);
+    IBox b3 = box(makeStyle(0, 20, 0)); r.add(b3);
     IElement t = r;
 
     Size sz = layoutRoot(t, 0, 0, 50);
@@ -427,13 +427,13 @@ bool testFlexWrapOversizedChild()
 // of that line, not the whole row - flex distribution is per-line.
 bool testFlexWrapLineFlex()
 {
-    View* r = row(makeStyle(0, 0, 0));
+    IView r = row(makeStyle(0, 0, 0));
     r.style.flexWrap = WRAP_WRAP;
     r.style.gap = 2;
-    Box* b1 = box(makeStyle(0, 30, 0)); r.add(b1);
-    Box* b2 = box(makeStyle(0, 30, 0)); r.add(b2);
-    Box* b3 = box(makeStyle(0, 30, 0)); r.add(b3);
-    View* f = view(flexStyle(1)); r.add(f);
+    IBox b1 = box(makeStyle(0, 30, 0)); r.add(b1);
+    IBox b2 = box(makeStyle(0, 30, 0)); r.add(b2);
+    IBox b3 = box(makeStyle(0, 30, 0)); r.add(b3);
+    IView f = view(flexStyle(1)); r.add(f);
     IElement t = r;
 
     layoutRoot(t, 0, 0, 100);
@@ -446,7 +446,7 @@ bool testFlexWrapLineFlex()
 
 // Re-render the controlled EditApp and reconcile into the live tree, so a value
 // changed by onChangeText flows back into the TextInput before the next key.
-move IElement editReRender(EditApp* app, UiContext* ctx, move IElement tree, int w)
+move IElement editReRender(EditApp* app, IUiContext ctx, move IElement tree, int w)
 {
     IElement wip = app.render(ctx);
     list<Patch> p = default;
@@ -495,10 +495,10 @@ bool testTextInput()
 bool testTabNav()
 {
     UiContext ctx = default;
-    View* root = view(makeStyle(0,0,0));
-    Button* a = button("A", () => { }); a.setKey("a");
-    Button* b = button("B", () => { }); b.setKey("b");
-    Button* c = button("C", () => { }); c.setKey("c");
+    IView root = view(makeStyle(0,0,0));
+    IButton a = button("A", () => { }); a.setKey("a");
+    IButton b = button("B", () => { }); b.setKey("b");
+    IButton c = button("C", () => { }); c.setKey("c");
     root.add(a); root.add(b); root.add(c);
     IElement tree = root;
 
@@ -518,7 +518,7 @@ bool testTabNav()
 bool testScrollClip()
 {
     UiContext ctx = default;
-    ScrollView* sv = scrollView(makeStyle(0, 10, 3));   // 10x3 viewport
+    IScrollView sv = scrollView(makeStyle(0, 10, 3));   // 10x3 viewport
     sv.setKey("scroll");
     sv.add(text("L0")); sv.add(text("L1")); sv.add(text("L2"));
     sv.add(text("L3")); sv.add(text("L4"));             // 5 lines

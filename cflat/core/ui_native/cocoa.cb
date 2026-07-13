@@ -95,27 +95,13 @@ bool nativeMappable(int kind)
         || kind == ELEM_SCROLL;
 }
 
-// The concrete tooltip text a mappable node carries ("" = none), read via downcast
-// (mirror of the Win32 host); every mappable class exposes a `tooltip` field.
+// The concrete tooltip text a mappable node carries ("" = none), read through
+// ITooltipped (mirror of the Win32 host); one downcast answers for all 15 classes.
 string tooltipOf(IElement node)
 {
-    int k = node.kind();
-    if (k == ELEM_BUTTON)    { Button* b = node as Button; return "" + b.tooltip; }
-    if (k == ELEM_TEXT)      { Text* t = node as Text; return "" + t.tooltip; }
-    if (k == ELEM_TEXTINPUT) { TextInput* t = node as TextInput; return "" + t.tooltip; }
-    if (k == ELEM_CHECKBOX)  { Checkbox* c = node as Checkbox; return "" + c.tooltip; }
-    if (k == ELEM_PROGRESS)  { ProgressBar* p = node as ProgressBar; return "" + p.tooltip; }
-    if (k == ELEM_SLIDER)    { Slider* s = node as Slider; return "" + s.tooltip; }
-    if (k == ELEM_TEXTAREA)  { TextArea* a = node as TextArea; return "" + a.tooltip; }
-    if (k == ELEM_RADIO)     { RadioButton* r = node as RadioButton; return "" + r.tooltip; }
-    if (k == ELEM_COMBO)     { ComboBox* c = node as ComboBox; return "" + c.tooltip; }
-    if (k == ELEM_LIST)      { ListView* l = node as ListView; return "" + l.tooltip; }
-    if (k == ELEM_TABS)      { TabControl* t = node as TabControl; return "" + t.tooltip; }
-    if (k == ELEM_TREE)      { TreeView* t = node as TreeView; return "" + t.tooltip; }
-    if (k == ELEM_IMAGE)     { Image* im = node as Image; return "" + im.tooltip; }
-    if (k == ELEM_GROUPBOX)  { GroupBox* g = node as GroupBox; return "" + g.tooltip; }
-    if (k == ELEM_CANVAS)    { CanvasView* c = node as CanvasView; return "" + c.tooltip; }
-    return "";
+    ITooltipped t = node as ITooltipped;
+    if (t == nullptr) return "";
+    return "" + t.tooltip;
 }
 
 // An NSString for `s`, safe for an empty cflat string (whose data() can be null):
@@ -922,7 +908,7 @@ class CocoaHost : INativeHost
     // Reconcile the IElement tree to native controls: ensure a control per mappable
     // node (create on first sight, reuse by key path), sync its props, collect its
     // DIP frame, position everything, then destroy controls that left the tree.
-    void applyTree(IElement tree, UiContext* ctx)
+    void applyTree(IElement tree, IUiContext ctx)
     {
         this.applying = true;
 
@@ -983,7 +969,7 @@ class CocoaHost : INativeHost
     // (containers contribute only geometry). `parentView` is the NSView new controls
     // parent to (a ScrollView's document view inside one); (offX, offY) is the DIP
     // origin subtracted to make frames parent-relative inside a scroll container.
-    void _applyNode(IElement node, string path, UiContext* ctx,
+    void _applyNode(IElement node, string path, IUiContext ctx,
                     list<string>* keys, list<u64>* handles,
                     list<int>* fx, list<int>* fy, list<int>* fw, list<int>* fh,
                     u64 parentView, int offX, int offY)
@@ -1007,14 +993,14 @@ class CocoaHost : INativeHost
                 // native view owns the text, further pushes are explicit).
                 if (node.kind() == ELEM_TEXTAREA)
                 {
-                    TextArea* ta = node as TextArea;
+                    ITextArea ta = node as ITextArea;
                     this.setText(h, ta.value.data());
                 }
                 else if (node.kind() == ELEM_LIST)
                 {
                     // One-time ListView setup: columns, select mode, and the boxed rowText
                     // source (captures the component, so it reads live state across renders).
-                    ListView* lv = node as ListView;
+                    IListView lv = node as IListView;
                     this.setListOp(h, LISTOP_RESET_COLUMNS, 0, 0, "", 0u);
                     int ci = 0;
                     while (ci < lv.columns.count())
@@ -1030,7 +1016,7 @@ class CocoaHost : INativeHost
                 else if (node.kind() == ELEM_TREE)
                 {
                     // One-time TreeView setup: box the node-source callbacks + build the root.
-                    TreeView* tv = node as TreeView;
+                    ITreeView tv = node as ITreeView;
                     this.setListOp(h, LISTOP_TREE_SET_SRC_CB, 0, 0, "",
                                    (u64)_boxTree(tv.childCount, tv.childId, tv.label));
                     this.setListOp(h, LISTOP_TREE_REBUILD, 0, 0, "", 0u);
@@ -1039,7 +1025,7 @@ class CocoaHost : INativeHost
                 {
                     // One-time CanvasView setup: box the onPaint closure so CfCanvasView's
                     // drawRect: (which resolves the view handle -> box) can invoke it.
-                    CanvasView* cvw = node as CanvasView;
+                    ICanvasView cvw = node as ICanvasView;
                     this._setCanvasBox(h, (u64)_boxCanvas(cvw.onPaint));
                 }
             }
@@ -1057,7 +1043,7 @@ class CocoaHost : INativeHost
         // tabs), mirroring the Win32 host.
         if (node.kind() == ELEM_TABS)
         {
-            TabControl* tc = node as TabControl;
+            ITabControl tc = node as ITabControl;
             list<IElement>* panes = node.childList();
             int sel = tc.selectedTab;
             if (panes != nullptr && sel >= 0 && sel < panes.count())
@@ -1091,7 +1077,7 @@ class CocoaHost : INativeHost
                     i++;
                 }
             }
-            ScrollView* svn = node as ScrollView;
+            IScrollView svn = node as IScrollView;
             int chDip = 0;
             if (svn != nullptr) chDip = svn.contentH;
             double docW = (double)(sb.w * BASE_X) - SCROLLER_ALLOW;
@@ -1118,45 +1104,45 @@ class CocoaHost : INativeHost
         }
     }
 
-    // Push a node's current props onto its control (downcast per kind - the same
-    // structured access the reconciler uses in propsEqual).
+    // Push a node's current props onto its control (one interface downcast per kind -
+    // the same structured access the reconciler uses in propsEqual).
     void _syncProps(IElement node, u64 h)
     {
         int k = node.kind();
         if (k == ELEM_BUTTON)
         {
-            Button* b = node as Button;
+            IButton b = node as IButton;
             this.setText(h, b.title.data());
             this.setBoolProp(h, PROP_ENABLED, !b.disabled);
             this._syncButtonAccent(h, b);
         }
         else if (k == ELEM_TEXT)
         {
-            Text* t = node as Text;
+            IText t = node as IText;
             this.setText(h, t.text.data());
         }
         else if (k == ELEM_TEXTINPUT)
         {
-            TextInput* ti = node as TextInput;
+            ITextInput ti = node as ITextInput;
             this.setText(h, ti.value.data());
             this.setBoolProp(h, PROP_ENABLED, !ti.disabled);
         }
         else if (k == ELEM_CHECKBOX)
         {
-            Checkbox* c = node as Checkbox;
+            ICheckbox c = node as ICheckbox;
             this.setText(h, c.label.data());
             this.setBoolProp(h, PROP_CHECKED, c.checked);
             this.setBoolProp(h, PROP_ENABLED, !c.disabled);
         }
         else if (k == ELEM_PROGRESS)
         {
-            ProgressBar* p = node as ProgressBar;
+            IProgressBar p = node as IProgressBar;
             this.setIntProp(h, PROP_MAX, 100);
             this.setIntProp(h, PROP_VALUE, p.value);
         }
         else if (k == ELEM_SLIDER)
         {
-            Slider* s = node as Slider;
+            ISlider s = node as ISlider;
             this.setIntProp(h, PROP_MAX, 100);
             this.setIntProp(h, PROP_VALUE, s.value);
             this.setBoolProp(h, PROP_ENABLED, !s.disabled);
@@ -1166,12 +1152,12 @@ class CocoaHost : INativeHost
             // Uncontrolled: never push text here (would clobber the buffer mid-edit);
             // only sync enabled. Text is seeded once at creation and pushed
             // explicitly via nativeSetControlText (file open).
-            TextArea* ta = node as TextArea;
+            ITextArea ta = node as ITextArea;
             this.setBoolProp(h, PROP_ENABLED, !ta.disabled);
         }
         else if (k == ELEM_STATUSBAR)
         {
-            StatusBar* sb = node as StatusBar;
+            IStatusBar sb = node as IStatusBar;
             string joined = "";
             int i = 0;
             while (i < sb.parts.count())
@@ -1184,14 +1170,14 @@ class CocoaHost : INativeHost
         }
         else if (k == ELEM_RADIO)
         {
-            RadioButton* rb = node as RadioButton;
+            IRadioButton rb = node as IRadioButton;
             this.setText(h, rb.label.data());
             this.setBoolProp(h, PROP_CHECKED, rb.checked);
             this.setBoolProp(h, PROP_ENABLED, !rb.disabled);
         }
         else if (k == ELEM_COMBO)
         {
-            ComboBox* cb = node as ComboBox;
+            IComboBox cb = node as IComboBox;
             this._syncCombo(h, cb);
             this.setBoolProp(h, PROP_ENABLED, !cb.disabled);
         }
@@ -1199,28 +1185,28 @@ class CocoaHost : INativeHost
         {
             // Virtualized: push row count + controlled selection, then reload. Cell text
             // is pulled on demand via the boxed rowText (the table's dataSource).
-            ListView* lv = node as ListView;
+            IListView lv = node as IListView;
             this.setListOp(h, LISTOP_SET_ROWCOUNT, lv.rowCount, 0, "", 0u);
             this.setListOp(h, LISTOP_SET_SELECTION, lv.selectedIndex, 0, "", 0u);
             this.setBoolProp(h, PROP_ENABLED, !lv.disabled);
         }
         else if (k == ELEM_TABS)
         {
-            TabControl* tc = node as TabControl;
+            ITabControl tc = node as ITabControl;
             this._syncTabs(h, tc);
         }
         else if (k == ELEM_TREE)
         {
             // Expand-on-demand: the outline owns its tree state (built once at creation);
             // only the enabled flag is synced (selection round-trips through the delegate).
-            TreeView* tv = node as TreeView;
+            ITreeView tv = node as ITreeView;
             this.setBoolProp(h, PROP_ENABLED, !tv.disabled);
         }
         else if (k == ELEM_IMAGE)
         {
             // Upload once per distinct pixel buffer (a re-render with the same pointer is
             // a no-op); the toolkit-neutral setImageData seam builds the NSImage.
-            Image* im = node as Image;
+            IImage im = node as IImage;
             if (im.pixels != 0u && im.pixels != this._imgLastPixels(h))
             {
                 this.setImageData(h, im.pixels, im.pxW, im.pxH, im.pxW * 4);
@@ -1229,7 +1215,7 @@ class CocoaHost : INativeHost
         }
         else if (k == ELEM_GROUPBOX)
         {
-            GroupBox* g = node as GroupBox;
+            IGroupBox g = node as IGroupBox;
             msg1(u2h(h), "setTitle:", nsStr(g.title.data()));
         }
         else if (k == ELEM_CANVAS)
@@ -1242,7 +1228,7 @@ class CocoaHost : INativeHost
 
     // Accent-fill for a themed button: the same buttonBg/buttonText the
     // Win32 host feeds NM_CUSTOMDRAW is applied here through bezelColor (look policy).
-    void _syncButtonAccent(u64 h, Button* b)
+    void _syncButtonAccent(u64 h, IButton b)
     {
         int abg = pickColor(b.backgroundColor, this.ctx.theme.buttonBg);
         int afg = pickColor(b.color, this.ctx.theme.buttonText);
@@ -1251,7 +1237,7 @@ class CocoaHost : INativeHost
 
     // Repopulate an NSPopUpButton only when its item set changed, then set the
     // controlled selection (refilling every frame would reset the popup mid-interaction).
-    void _syncCombo(u64 h, ComboBox* cb)
+    void _syncCombo(u64 h, IComboBox cb)
     {
         void* ctrl = u2h(h);
         int have = (int)msgGetI64(ctrl, "numberOfItems");
@@ -1270,7 +1256,7 @@ class CocoaHost : INativeHost
     }
 
     // Rebuild the segmented tab strip on a pane-count change, then set the selection.
-    void _syncTabs(u64 h, TabControl* tc)
+    void _syncTabs(u64 h, ITabControl tc)
     {
         void* ctrl = u2h(h);
         int have = (int)msgGetI64(ctrl, "segmentCount");
@@ -1305,7 +1291,7 @@ class CocoaHost : INativeHost
     // every frame from applyTree; cheap and idempotent. Control accent colors are
     // left at the OS default (setAccent is a no-op), matching the Win32 host's
     // monochrome-default behavior.
-    void applyTheme(UiContext* ctx)
+    void applyTheme(IUiContext ctx)
     {
         bool isDark = themeIsDark(&ctx.theme);
         this.dark = isDark;
@@ -1518,10 +1504,10 @@ void _onListClickImp(void* self, void* cmd, void* table)
     if (key.length() == 0) return;
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
-    ListView* lv = e as ListView;
+    IListView lv = e as IListView;
     if (lv == nullptr) return;
     int sel = (int)msgGetI64(table, "selectedRow");
-    if (sel >= 0 && sel != lv.selectedIndex) { lv.onSelect(sel); pumpNative(); }
+    if (sel >= 0 && sel != lv.selectedIndex) { lv.fireSelect(sel); pumpNative(); }
 }
 
 void _onListDoubleClickImp(void* self, void* cmd, void* table)
@@ -1532,10 +1518,10 @@ void _onListDoubleClickImp(void* self, void* cmd, void* table)
     if (key.length() == 0) return;
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
-    ListView* lv = e as ListView;
+    IListView lv = e as IListView;
     if (lv == nullptr) return;
     int sel = (int)msgGetI64(table, "selectedRow");
-    if (sel >= 0) { lv.onActivate(sel); pumpNative(); }
+    if (sel >= 0) { lv.fireActivate(sel); pumpNative(); }
 }
 
 // The segmented tab strip changed -> onSelectTab.
@@ -1607,10 +1593,10 @@ void _onTreeWillExpandImp(void* self, void* cmd, void* note)
     if (key.length() == 0) return;
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
-    TreeView* tv = e as TreeView;
+    ITreeView tv = e as ITreeView;
     if (tv == nullptr) return;
     int nid = item != nullptr ? (int)msgGetI64(item, "integerValue") : (0 - 1);
-    if (nid >= 0) { tv.onExpand(nid); pumpNative(); }
+    if (nid >= 0) { tv.fireExpand(nid); pumpNative(); }
 }
 
 // -- ctx.post() marshaling (performSelectorOnMainThread with an NSNumber box) ---
@@ -1635,7 +1621,7 @@ void _runPostBoxImp(void* self, void* cmd, void* num)
 // This host is genuinely multi-window: each accessor resolves the servicing window
 // through curWin() (_cur is re-established at every callback entry). ctx.post
 // marshaling is real: performSelectorOnMainThread + hostDrainPosted.
-UiContext*      activeCtx() { return &curWin().ctx; }
+IUiContext      activeCtx() { return &curWin().ctx; }
 alias IComponent activeApp() { return curWin().app; }
 bool            hostDark()  { if (!hasCurWin()) return false; return curWin().dark; }
 int hostWidth()  { return curWin().w; }
@@ -1734,21 +1720,21 @@ void routeClick(void* ctrl)
     if (key.length() == 0) return;
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
-    Button* b = e as Button;
+    IButton b = e as IButton;
     if (b != nullptr) { b.fireClick(); pumpNative(); return; }
-    Checkbox* c = e as Checkbox;
+    ICheckbox c = e as ICheckbox;
     if (c != nullptr) { c.fireToggle(); pumpNative(); return; }
     // A radio routes to its enclosing RadioGroup (one key-path segment up), which owns
     // the controlled value + onChange (mirror of the Win32 host).
-    RadioButton* rb = e as RadioButton;
+    IRadioButton rb = e as IRadioButton;
     if (rb != nullptr)
     {
         string pp = _parentPath(key);
         IElement pe = findByKey(curWin().tree, keySegment(curWin().tree, 0), pp);
         if (pe != nullptr)
         {
-            RadioGroup* g = pe as RadioGroup;
-            if (g != nullptr) { g.onChange(rb.index); pumpNative(); }
+            IRadioGroup g = pe as IRadioGroup;
+            if (g != nullptr) { g.fireChange(rb.index); pumpNative(); }
         }
     }
 }
@@ -1769,10 +1755,10 @@ void routeCombo(void* ctrl)
     if (key.length() == 0) return;
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
-    ComboBox* cb = e as ComboBox;
+    IComboBox cb = e as IComboBox;
     if (cb == nullptr) return;
     int sel = (int)msgGetI64(ctrl, "indexOfSelectedItem");
-    if (sel >= 0 && sel != cb.selectedIndex) { cb.onChange(sel); pumpNative(); }
+    if (sel >= 0 && sel != cb.selectedIndex) { cb.fireChange(sel); pumpNative(); }
 }
 
 // A tab strip selection change: read the segment, fire onSelectTab.
@@ -1783,10 +1769,10 @@ void routeTabChange(void* ctrl)
     if (key.length() == 0) return;
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
-    TabControl* tc = e as TabControl;
+    ITabControl tc = e as ITabControl;
     if (tc == nullptr) return;
     int sel = (int)msgGetI64(ctrl, "selectedSegment");
-    if (sel >= 0 && sel != tc.selectedTab) { tc.onSelectTab(sel); pumpNative(); }
+    if (sel >= 0 && sel != tc.selectedTab) { tc.fireSelectTab(sel); pumpNative(); }
 }
 
 // A tree selection change: read the selected item's nodeId, fire onSelect + onExpand.
@@ -1797,10 +1783,10 @@ void routeTreeSelectItem(void* outline, void* item)
     if (key.length() == 0) return;
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
-    TreeView* tv = e as TreeView;
+    ITreeView tv = e as ITreeView;
     if (tv == nullptr) return;
     int nid = item != nullptr ? (int)msgGetI64(item, "integerValue") : (0 - 1);
-    if (nid != tv.selectedNode) { tv.onSelect(nid); pumpNative(); }
+    if (nid != tv.selectedNode) { tv.fireSelect(nid); pumpNative(); }
 }
 
 void routeEdit(void* ctrl)
@@ -1809,21 +1795,21 @@ void routeEdit(void* ctrl)
     if (key.length() == 0) return;
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
-    TextInput* ti = e as TextInput;
+    ITextInput ti = e as ITextInput;
     if (ti != nullptr)
     {
         char* c = cStr(msg0(ctrl, "stringValue"));
         string nv = c != nullptr ? (string)c : "";
-        ti.onChangeText(nv);
+        ti.fireChangeText(nv);
         pumpNative();
         return;
     }
     // A TextArea is uncontrolled: textDidChange is just a dirty NOTIFICATION; do
     // not read / push the (potentially large) buffer here.
-    TextArea* ta = e as TextArea;
+    ITextArea ta = e as ITextArea;
     if (ta != nullptr)
     {
-        ta.onChange();
+        ta.fireChange();
         pumpNative();
     }
 }
@@ -1834,7 +1820,7 @@ void routeSlider(void* ctrl)
     if (key.length() == 0) return;
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
-    Slider* s = e as Slider;
+    ISlider s = e as ISlider;
     if (s == nullptr) return;
     int pos = (int)msgGetDouble(ctrl, "doubleValue");
     s.fireSet(pos);
@@ -1988,9 +1974,9 @@ void nativeSplitterDrag(string keyPath, int dipX, int dipY)
 {
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     if (e == nullptr) return;
-    SplitView* sv = e as SplitView;
+    ISplitView sv = e as ISplitView;
     if (sv == nullptr) return;
-    sv.onRatioChange(sv._ratioAt(dipX, dipY));
+    sv.fireRatioChange(sv._ratioAt(dipX, dipY));
     pumpNative();
 }
 
@@ -2108,9 +2094,9 @@ void nativeListSelect(string keyPath, int row)
     // would (Win32's LVM_SETITEMSTATE raises a real LVN_ITEMCHANGED notify).
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     if (e == nullptr) return;
-    ListView* lv = e as ListView;
+    IListView lv = e as IListView;
     if (lv == nullptr) return;
-    if (row >= 0 && row != lv.selectedIndex) { lv.onSelect(row); pumpNative(); }
+    if (row >= 0 && row != lv.selectedIndex) { lv.fireSelect(row); pumpNative(); }
 }
 
 int nativeListSelectedRow(string keyPath)
@@ -2128,9 +2114,9 @@ void nativeListActivate(string keyPath, int row)
     if (row >= 0) nativeListSelect(keyPath, row);
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     if (e == nullptr) return;
-    ListView* lv = e as ListView;
+    IListView lv = e as IListView;
     if (lv == nullptr) return;
-    if (row >= 0) { lv.onActivate(row); pumpNative(); }
+    if (row >= 0) { lv.fireActivate(row); pumpNative(); }
 }
 
 // -- Host-neutral form/data test drivers (mirror the Win32 names) ---------------

@@ -127,7 +127,7 @@ int hostHeight() { return _wH; }
 bool hostDark()  { return _wDark; }
 
 alias IComponent activeApp() { return _wApp; }
-UiContext*      activeCtx() { return &_wCtx; }
+IUiContext      activeCtx() { return &_wCtx; }
 
 // The app's post-mount hook (live app idles; a self-test drives). Kept as a Lambda so the host
 // never calls an app-defined function by name (imported-module -> importer inversion).
@@ -653,7 +653,7 @@ class WinUI3Host : INativeHost
     }
 
     // Populate a combo's items only when the item set changed, then set the controlled selection.
-    void _syncCombo(u64 h, ComboBox* cb)
+    void _syncCombo(u64 h, IComboBox cb)
     {
         void* ic = wqi((void*)h, iidof(XamlItemsControl));
         if (ic == nullptr) return;
@@ -696,7 +696,7 @@ class WinUI3Host : INativeHost
 
     // Reconcile the IElement tree to XAML controls: create-on-first-sight (reuse by key path),
     // sync props, position, then destroy controls whose key left the tree.
-    void applyTree(IElement tree, UiContext* ctx)
+    void applyTree(IElement tree, IUiContext ctx)
     {
         this.applying = true;
         _wDark = winuiThemeIsDark(&ctx.theme);
@@ -722,7 +722,7 @@ class WinUI3Host : INativeHost
         this.applying = false;
     }
 
-    void _applyNode(IElement node, string path, UiContext* ctx, list<string>* keys)
+    void _applyNode(IElement node, string path, IUiContext ctx, list<string>* keys)
     {
         if (winuiMappable(node.kind()))
         {
@@ -742,7 +742,7 @@ class WinUI3Host : INativeHost
         // A TabControl walks ONLY its active pane into native controls (lazy inactive tabs).
         if (node.kind() == ELEM_TABS)
         {
-            TabControl* tc = node as TabControl;
+            ITabControl tc = node as ITabControl;
             list<IElement>* panes = node.childList();
             int sel = tc.selectedTab;
             if (panes != nullptr && sel >= 0 && sel < panes.count())
@@ -774,19 +774,19 @@ class WinUI3Host : INativeHost
         int k = node.kind();
         if (k == ELEM_TEXTAREA)
         {
-            TextArea* ta = node as TextArea;
+            ITextArea ta = node as ITextArea;
             this.setText(h, ta.value.data());
         }
         else if (k == ELEM_LIST)
         {
             // Box the rowText callback (captures the component, so it reads live state) - the
             // item source for the virtualized data path the list drivers query.
-            ListView* lv = node as ListView;
+            IListView lv = node as IListView;
             this.setListOp(h, LISTOP_SET_ROWTEXT_CB, 0, 0, "", (u64)_boxListRow(lv.rowText));
         }
         else if (k == ELEM_TREE)
         {
-            TreeView* tv = node as TreeView;
+            ITreeView tv = node as ITreeView;
             this.setListOp(h, LISTOP_TREE_SET_SRC_CB, 0, 0, "",
                            (u64)_boxTree(tv.childCount, tv.childId, tv.label));
             this.setListOp(h, LISTOP_TREE_REBUILD, 0, 0, "", 0u);
@@ -795,7 +795,7 @@ class WinUI3Host : INativeHost
         {
             // Box the onPaint closure so it is owned + freed on teardown (WinUI CanvasView is a
             // placeholder - no Win2D dependency - so the closure is held but not invoked).
-            CanvasView* cvw = node as CanvasView;
+            ICanvasView cvw = node as ICanvasView;
             this._setCanvasBox(h, (u64)_boxCanvas(cvw.onPaint));
         }
     }
@@ -805,44 +805,44 @@ class WinUI3Host : INativeHost
         int k = node.kind();
         if (k == ELEM_BUTTON)
         {
-            Button* b = node as Button;
+            IButton b = node as IButton;
             this.setText(h, b.title.data());
             this.setBoolProp(h, PROP_ENABLED, !b.disabled);
             int abg = pickColor(b.backgroundColor, this.appTheme().buttonBg);
             int afg = pickColor(b.color, this.appTheme().buttonText);
             this.setAccent(h, afg, abg);
         }
-        else if (k == ELEM_TEXT)      { Text* t = node as Text; this.setText(h, t.text.data()); }
+        else if (k == ELEM_TEXT)      { IText t = node as IText; this.setText(h, t.text.data()); }
         else if (k == ELEM_TEXTINPUT)
         {
-            TextInput* ti = node as TextInput;
+            ITextInput ti = node as ITextInput;
             this.setText(h, ti.value.data());
             this.setBoolProp(h, PROP_ENABLED, !ti.disabled);
         }
         else if (k == ELEM_CHECKBOX)
         {
-            Checkbox* c = node as Checkbox;
+            ICheckbox c = node as ICheckbox;
             this.setText(h, c.label.data());
             this.setBoolProp(h, PROP_CHECKED, c.checked);
             this.setBoolProp(h, PROP_ENABLED, !c.disabled);
         }
         else if (k == ELEM_PROGRESS)
         {
-            ProgressBar* p = node as ProgressBar;
+            IProgressBar p = node as IProgressBar;
             this.setIntProp(h, PROP_MAX, 100);
             this.setIntProp(h, PROP_VALUE, p.value);
         }
         else if (k == ELEM_SLIDER)
         {
-            Slider* s = node as Slider;
+            ISlider s = node as ISlider;
             this.setIntProp(h, PROP_MAX, 100);
             this.setIntProp(h, PROP_VALUE, s.value);
             this.setBoolProp(h, PROP_ENABLED, !s.disabled);
         }
-        else if (k == ELEM_TEXTAREA) { TextArea* ta = node as TextArea; this.setBoolProp(h, PROP_ENABLED, !ta.disabled); }
+        else if (k == ELEM_TEXTAREA) { ITextArea ta = node as ITextArea; this.setBoolProp(h, PROP_ENABLED, !ta.disabled); }
         else if (k == ELEM_STATUSBAR)
         {
-            StatusBar* sb = node as StatusBar;
+            IStatusBar sb = node as IStatusBar;
             string joined = "";
             int i = 0;
             while (i < sb.parts.count()) { if (i > 0) joined = joined + "   "; joined = joined + sb.parts.get(i); i++; }
@@ -850,33 +850,33 @@ class WinUI3Host : INativeHost
         }
         else if (k == ELEM_RADIO)
         {
-            RadioButton* rb = node as RadioButton;
+            IRadioButton rb = node as IRadioButton;
             this.setText(h, rb.label.data());
             this.setBoolProp(h, PROP_CHECKED, rb.checked);
             this.setBoolProp(h, PROP_ENABLED, !rb.disabled);
         }
         else if (k == ELEM_COMBO)
         {
-            ComboBox* cb = node as ComboBox;
+            IComboBox cb = node as IComboBox;
             this._syncCombo(h, cb);
             this.setBoolProp(h, PROP_ENABLED, !cb.disabled);
         }
         else if (k == ELEM_LIST)
         {
-            ListView* lv = node as ListView;
+            IListView lv = node as IListView;
             this.setListOp(h, LISTOP_SET_ROWCOUNT, lv.rowCount, 0, "", 0u);
             this.setListOp(h, LISTOP_SET_SELECTION, lv.selectedIndex, 0, "", 0u);
             this.setBoolProp(h, PROP_ENABLED, !lv.disabled);
         }
-        else if (k == ELEM_TABS)  { TabControl* tc = node as TabControl; this.setBoolProp(h, PROP_ENABLED, !tc.disabled); }
-        else if (k == ELEM_TREE)  { TreeView* tv = node as TreeView; this.setBoolProp(h, PROP_ENABLED, !tv.disabled); }
+        else if (k == ELEM_TABS)  { ITabControl tc = node as ITabControl; this.setBoolProp(h, PROP_ENABLED, !tc.disabled); }
+        else if (k == ELEM_TREE)  { ITreeView tv = node as ITreeView; this.setBoolProp(h, PROP_ENABLED, !tv.disabled); }
         else if (k == ELEM_IMAGE)
         {
-            Image* im = node as Image;
+            IImage im = node as IImage;
             if (im.pixels != 0u && im.pixels != this._imgLastPixels(h))
                 this.setImageData(h, im.pixels, im.pxW, im.pxH, im.pxW * 4);
         }
-        else if (k == ELEM_GROUPBOX) { GroupBox* g = node as GroupBox; this.setText(h, g.title.data()); }
+        else if (k == ELEM_GROUPBOX) { IGroupBox g = node as IGroupBox; this.setText(h, g.title.data()); }
     }
 
     // The current app theme (borrowed from the per-host UiContext).
@@ -960,15 +960,15 @@ void routeWinuiClick(string key)
     if (key.length() == 0) return;
     IElement e = winuiElem(key);
     if (e == nullptr) return;
-    Button* b = e as Button;
+    IButton b = e as IButton;
     if (b != nullptr) { b.fireClick(); pumpWinui(); return; }
-    Checkbox* c = e as Checkbox;
+    ICheckbox c = e as ICheckbox;
     if (c != nullptr) { c.fireToggle(); pumpWinui(); return; }
-    RadioButton* rb = e as RadioButton;
+    IRadioButton rb = e as IRadioButton;
     if (rb != nullptr)
     {
         IElement pe = winuiElem(winuiParentPath(key));
-        if (pe != nullptr) { RadioGroup* g = pe as RadioGroup; if (g != nullptr) { g.onChange(rb.index); pumpWinui(); } }
+        if (pe != nullptr) { IRadioGroup g = pe as IRadioGroup; if (g != nullptr) { g.fireChange(rb.index); pumpWinui(); } }
     }
 }
 
@@ -1339,15 +1339,15 @@ void nativeClickButton(string keyPath)
 {
     IElement e = winuiElem(keyPath);
     if (e == nullptr) return;
-    Button* b = e as Button;
+    IButton b = e as IButton;
     if (b != nullptr) { b.fireClick(); pumpWinui(); return; }
-    Checkbox* c = e as Checkbox;
+    ICheckbox c = e as ICheckbox;
     if (c != nullptr) { c.fireToggle(); pumpWinui(); return; }
-    RadioButton* rb = e as RadioButton;
+    IRadioButton rb = e as IRadioButton;
     if (rb != nullptr)
     {
         IElement pe = winuiElem(winuiParentPath(keyPath));
-        if (pe != nullptr) { RadioGroup* g = pe as RadioGroup; if (g != nullptr) { g.onChange(rb.index); pumpWinui(); } }
+        if (pe != nullptr) { IRadioGroup g = pe as IRadioGroup; if (g != nullptr) { g.fireChange(rb.index); pumpWinui(); } }
     }
 }
 
@@ -1356,8 +1356,8 @@ bool nativeIsChecked(string keyPath)
 {
     IElement e = winuiElem(keyPath);
     if (e == nullptr) return false;
-    if (e.kind() == ELEM_CHECKBOX) { Checkbox* c = e as Checkbox; return c.checked; }
-    if (e.kind() == ELEM_RADIO)    { RadioButton* rb = e as RadioButton; return rb.checked; }
+    if (e.kind() == ELEM_CHECKBOX) { ICheckbox c = e as ICheckbox; return c.checked; }
+    if (e.kind() == ELEM_RADIO)    { IRadioButton rb = e as IRadioButton; return rb.checked; }
     return false;
 }
 
@@ -1369,18 +1369,10 @@ bool nativeIsEnabled(string keyPath)
 {
     IElement e = winuiElem(keyPath);
     if (e == nullptr) return false;
-    int k = e.kind();
-    if (k == ELEM_BUTTON)    { Button* b = e as Button; return !b.disabled; }
-    if (k == ELEM_TEXTINPUT) { TextInput* t = e as TextInput; return !t.disabled; }
-    if (k == ELEM_CHECKBOX)  { Checkbox* c = e as Checkbox; return !c.disabled; }
-    if (k == ELEM_RADIO)     { RadioButton* rb = e as RadioButton; return !rb.disabled; }
-    if (k == ELEM_SLIDER)    { Slider* s = e as Slider; return !s.disabled; }
-    if (k == ELEM_TEXTAREA)  { TextArea* ta = e as TextArea; return !ta.disabled; }
-    if (k == ELEM_COMBO)     { ComboBox* cb = e as ComboBox; return !cb.disabled; }
-    if (k == ELEM_LIST)      { ListView* lv = e as ListView; return !lv.disabled; }
-    if (k == ELEM_TABS)      { TabControl* tc = e as TabControl; return !tc.disabled; }
-    if (k == ELEM_TREE)      { TreeView* tv = e as TreeView; return !tv.disabled; }
-    return true;   // controls without a disabled prop are always enabled
+    // Every disableable class implements IDisableable, so one downcast answers for all 10.
+    IDisableable d = e as IDisableable;
+    if (d == nullptr) return true;   // controls without a disabled prop are always enabled
+    return !d.disabled;
 }
 
 // WinUI tooltips ride ToolTipService (per-element attached property), not a per-window tool
@@ -1426,7 +1418,7 @@ void nativeComboSelect(string keyPath, int idx)
     void* sel = wqi((void*)h, iidof(XamlSelector));
     if (sel != nullptr) ((XamlSelector*)sel)->lpVtbl->put_SelectedIndex(sel, idx);
     IElement e = winuiElem(keyPath);
-    if (e != nullptr) { ComboBox* cb = e as ComboBox; if (cb != nullptr) { cb.onChange(idx); pumpWinui(); } }
+    if (e != nullptr) { IComboBox cb = e as IComboBox; if (cb != nullptr) { cb.fireChange(idx); pumpWinui(); } }
 }
 
 // Type `s` into a text input (live) and route onChangeText (controlled).
@@ -1438,7 +1430,7 @@ void nativeTypeText(string keyPath, string s)
     if (tx != nullptr) { bool p = _wHost.applying; _wHost.applying = true; ((XamlTextBox*)tx)->lpVtbl->put_Text(tx, hstring(s)); _wHost.applying = p; }
     _wHost._setTxt(h, s);
     IElement e = winuiElem(keyPath);
-    if (e != nullptr) { TextInput* ti = e as TextInput; if (ti != nullptr) { ti.onChangeText(s); pumpWinui(); } }
+    if (e != nullptr) { ITextInput ti = e as ITextInput; if (ti != nullptr) { ti.fireChangeText(s); pumpWinui(); } }
 }
 
 // -- ListView drivers (host-side box/model source) -----------------------------
@@ -1462,7 +1454,7 @@ void nativeListSelect(string keyPath, int row)
     if (h == 0u) return;
     _wHost._listSetSel(h, row);
     IElement e = winuiElem(keyPath);
-    if (e != nullptr) { ListView* lv = e as ListView; if (lv != nullptr && row >= 0) { lv.onSelect(row); pumpWinui(); } }
+    if (e != nullptr) { IListView lv = e as IListView; if (lv != nullptr && row >= 0) { lv.fireSelect(row); pumpWinui(); } }
 }
 int nativeListSelectedRow(string keyPath)
 {
@@ -1474,7 +1466,7 @@ void nativeListActivate(string keyPath, int row)
 {
     if (row >= 0) nativeListSelect(keyPath, row);
     IElement e = winuiElem(keyPath);
-    if (e != nullptr) { ListView* lv = e as ListView; if (lv != nullptr) { lv.onActivate(row); pumpWinui(); } }
+    if (e != nullptr) { IListView lv = e as IListView; if (lv != nullptr) { lv.fireActivate(row); pumpWinui(); } }
 }
 
 // -- Tab drivers (element-model backed; lazy panes via applyTree) --------------
@@ -1482,7 +1474,7 @@ int nativeTabSelected(string keyPath)
 {
     IElement e = winuiElem(keyPath);
     if (e == nullptr) return 0 - 1;
-    TabControl* tc = e as TabControl;
+    ITabControl tc = e as ITabControl;
     return tc != nullptr ? tc.selectedTab : (0 - 1);
 }
 int nativeTabCount(string keyPath)
@@ -1496,8 +1488,8 @@ void nativeTabSelect(string keyPath, int idx)
 {
     IElement e = winuiElem(keyPath);
     if (e == nullptr) return;
-    TabControl* tc = e as TabControl;
-    if (tc != nullptr) { tc.onSelectTab(idx); pumpWinui(); }
+    ITabControl tc = e as ITabControl;
+    if (tc != nullptr) { tc.fireSelectTab(idx); pumpWinui(); }
 }
 
 // -- Tree drivers (host-side materialized-node model) --------------------------
@@ -1525,7 +1517,7 @@ void nativeTreeExpandItem(string keyPath, u64 hItem)
     if (h == 0u) return;
     int nodeId = _wHost._treeExpand(h, hItem);
     IElement e = winuiElem(keyPath);
-    if (e != nullptr && nodeId != (0 - 1)) { TreeView* tv = e as TreeView; if (tv != nullptr) { tv.onExpand(nodeId); pumpWinui(); } }
+    if (e != nullptr && nodeId != (0 - 1)) { ITreeView tv = e as ITreeView; if (tv != nullptr) { tv.fireExpand(nodeId); pumpWinui(); } }
 }
 void nativeTreeSelectItem(string keyPath, u64 hItem)
 {
@@ -1533,7 +1525,7 @@ void nativeTreeSelectItem(string keyPath, u64 hItem)
     if (h == 0u) return;
     int nodeId = _wHost._treeItemNode(h, hItem);
     IElement e = winuiElem(keyPath);
-    if (e != nullptr) { TreeView* tv = e as TreeView; if (tv != nullptr) { tv.onSelect(nodeId); pumpWinui(); } }
+    if (e != nullptr) { ITreeView tv = e as ITreeView; if (tv != nullptr) { tv.fireSelect(nodeId); pumpWinui(); } }
 }
 int nativeTreeItemNodeId(string keyPath, u64 hItem)
 {
@@ -1547,9 +1539,9 @@ void nativeSplitterDrag(string keyPath, int dipX, int dipY)
 {
     IElement e = winuiElem(keyPath);
     if (e == nullptr) return;
-    SplitView* sv = e as SplitView;
+    ISplitView sv = e as ISplitView;
     if (sv == nullptr) return;
-    sv.onRatioChange(sv._ratioAt(dipX, dipY));
+    sv.fireRatioChange(sv._ratioAt(dipX, dipY));
     pumpWinui();
 }
 Rect nativeNodeBounds(string keyPath)
@@ -1577,7 +1569,7 @@ void nativeSliderSet(string keyPath, int v)
     void* rb = wqi((void*)h, iidof(XamlRangeBase));
     if (rb != nullptr) ((XamlRangeBase*)rb)->lpVtbl->put_Value(rb, (double)v);
     IElement e = winuiElem(keyPath);
-    if (e != nullptr) { Slider* s = e as Slider; if (s != nullptr) { s.fireSet(v); pumpWinui(); } }
+    if (e != nullptr) { ISlider s = e as ISlider; if (s != nullptr) { s.fireSet(v); pumpWinui(); } }
 }
 bool nativeImageHasBitmap(string keyPath)
 {

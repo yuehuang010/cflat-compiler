@@ -70,7 +70,7 @@ int win32HardeningSelfTest()
     // (GetNextDlgTabItem, by handle so no owned key string is allocated per step) visits >= 8
     // distinct controls and cycles back, and after advancing once more the OS-focused control
     // matches the driver's report.
-    s.test("tab ring + focus readback", (UiTest* t) =>
+    s.test("tab ring + focus readback", (IUiTest t) =>
     {
         t.launch(new GalleryApp(), 60, 60);
         u64 firstH = nativeFocusFirstH();
@@ -91,7 +91,7 @@ int win32HardeningSelfTest()
 
     // Live relayout: widening the client area re-lays-out the root wider; a tiny resize is
     // clamped (min-size floor) without crashing; key controls survive across the sequence.
-    s.test("live relayout", (UiTest* t) =>
+    s.test("live relayout", (IUiTest t) =>
     {
         t.launch(new GalleryApp(), 60, 60);
         list<UiSize> sizes = default;
@@ -106,7 +106,7 @@ int win32HardeningSelfTest()
 
     // Accessibility Name: a text-bearing control's Name is its window text; a textless control
     // (ProgressBar) gets its Name from the tooltip mirrored in by applyTree.
-    s.test("accessibility names", (UiTest* t) =>
+    s.test("accessibility names", (IUiTest t) =>
     {
         t.launch(new GalleryApp(), 60, 60);
         string btnName = t.accessibleName("root/content/cardbtn/btn");

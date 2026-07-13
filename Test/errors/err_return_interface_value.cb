@@ -8,3 +8,11 @@ class Square : IShape { int s = 0; int area() { return s * s; } };
 expect_error("cannot return local value 'Square' as interface 'IShape'") {
     IShape makeVal(int s) { Square sq; sq.s = s; return sq; }
 }
+
+// The mirror case: an interface VALUE returned where a concrete pointer is declared.
+// Without a diagnostic this reaches LLVM as a fat ptr against a pointer return type and
+// fails module verification with no source location.
+expect_error("cannot return interface value 'IShape' from a function declared to return 'Square'") {
+    move IShape makeOwned() { Square* sq = new Square(); return sq; }
+    Square* makeBad() { IShape s = makeOwned(); return s; }
+}

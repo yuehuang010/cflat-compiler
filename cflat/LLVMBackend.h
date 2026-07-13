@@ -6866,6 +6866,18 @@ public:
         return false;
     }
 
+    // The declared parameters of an interface method (implicit 'this' excluded), or nullptr.
+    // Lets the call site type a lambda-literal argument against the declared signature.
+    const std::vector<TypeAndValue>* GetInterfaceMethodParams(const std::string& ifaceName,
+                                                             const std::string& methodName) const
+    {
+        auto it = interfaceTable.find(ifaceName);
+        if (it == interfaceTable.end()) return nullptr;
+        for (const auto& m : it->second)
+            if (m.Name == methodName) return &m.Parameters;
+        return nullptr;
+    }
+
     llvm::StructType* GetFatPtrType() const
     {
         const char* fatPtrName = "__iface_fat_ptr";
@@ -7402,6 +7414,54 @@ public:
         v = builder->CreateInsertValue(v, builder->CreateBitCast(vtable, ptrTy), { 0u });
         v = builder->CreateInsertValue(v, builder->CreateBitCast(dataPtr, ptrTy), { 1u });
         return v;
+    }
+
+    // Coerce ONE call argument to an INTERFACE-typed parameter: box a concrete class/struct
+    // (value or pointer) into a fat pointer, or upcast an already-boxed interface value.
+    // Shared by the indirect (function<>/Lambda) call path so it cannot drift from the
+    // direct-call path's inline boxing. Returns `val` unchanged when nothing applies.
+    llvm::Value* CoerceArgToInterface(const NamedVariable& arg, llvm::Value* val,
+                                      const std::string& ifaceName, const std::string& calleeDesc)
+    {
+        if (val == nullptr || ifaceName.empty() || !IsInterfaceType(ifaceName)) return val;
+        if (arg.TypeAndValue.IsInterface)
+            return ReboxInterfaceIfNeeded(val, arg.TypeAndValue.TypeName, ifaceName);
+        if (val->getType() == GetFatPtrType()) return val;   // already a fat pointer
+
+        std::string structName = arg.TypeAndValue.TypeName;
+        if (structName.empty() && arg.BaseType)
+            if (auto* st = llvm::dyn_cast<llvm::StructType>(arg.BaseType))
+                structName = st->getName().str();
+
+        if (structName.empty() || !StructImplementsInterface(structName, ifaceName))
+        {
+            LogError(std::format(
+                "cannot pass '{}' as interface parameter '{}' of {} - it does not implement '{}'",
+                structName.empty() ? "<unknown>" : structName, ifaceName, calleeDesc, ifaceName));
+            return val;
+        }
+
+        auto* vtable = GetOrCreateVTable(structName, ifaceName);
+        llvm::Value* dataPtr = nullptr;
+        if (arg.TypeAndValue.Pointer)
+            dataPtr = arg.Primary != nullptr ? arg.Primary : CreateLoad(arg.Storage);
+        else if (arg.Storage != nullptr)
+            dataPtr = arg.Storage;
+        else
+        {
+            auto* structTy = arg.BaseType ? arg.BaseType : GetType(arg.TypeAndValue);
+            if (structTy == nullptr || structTy->isVoidTy() || arg.Primary == nullptr)
+            {
+                LogError(std::format(
+                    "argument for interface parameter '{}' of {} has no resolved storage",
+                    ifaceName, calleeDesc));
+                return val;
+            }
+            auto* tempAlloca = AllocaAtEntry(structTy, nullptr);
+            builder->CreateStore(arg.Primary, tempAlloca);
+            dataPtr = tempAlloca;
+        }
+        return BuildInterfaceFatValue(vtable, dataPtr);
     }
 
     // Rebuild only when the source and destination interfaces actually differ (the common

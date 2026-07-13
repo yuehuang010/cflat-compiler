@@ -25,30 +25,30 @@ import "graphic/bitmap.cb";
 // the theme.
 IElement buildDemoTree(int cw, int ch)
 {
-    Box* root = box(makeStyle(0, cw, ch));   // panel colors come from the theme
+    IBox root = box(makeStyle(0, cw, ch));   // panel colors come from the theme
 
-    Text* title = text("CFlat UI - Win32 GDI");
+    IText title = text("CFlat UI - Win32 GDI");
     title.color = rgb(33, 80, 160);          // accent override
     root.add(title);
 
-    Button* add = button("add box", () => { });   // themed (blue/white)
+    IButton add = button("add box", () => { });   // themed (blue/white)
     add.setKey("btn");                             // keyed so it can hover/press/focus
     root.add(add);
 
-    TextInput* name = textInput("hello world", (string nv) => { });  // themed field
+    ITextInput name = textInput("hello world", (string nv) => { });  // themed field
     name.width = 20;
     name.setKey("name");
     root.add(name);
 
-    ScrollView* list = scrollView(makeStyle(0, cw - 2, 6));
+    IScrollView list = scrollView(makeStyle(0, cw - 2, 6));
     int i = 0;
     while (i < 4)
     {
         Style cardStyle = makeStyle(0, 12, 3);
         cardStyle.backgroundColor = rgb(255, 248, 220);   // pale amber card (override)
         cardStyle.color = rgb(200, 150, 40);
-        Box* small = box(cardStyle);
-        Text* lbl = text("item " + i.toString());
+        IBox small = box(cardStyle);
+        IText lbl = text("item " + i.toString());
         lbl.color = rgb(150, 90, 20);
         small.add(lbl);
         list.add(small);

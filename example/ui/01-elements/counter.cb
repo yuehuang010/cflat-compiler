@@ -1,9 +1,12 @@
 // counter.cb - exercises the ui.cb library.
 //
 // Builds a Counter component, renders it to a host tree, serializes to JSON,
-// then reaches into the tree, downcasts the Button via `as`, and fires its
-// press handler twice. The handler captures `this` and mutates component
-// state, so re-rendering reflects the new count. Both trees are torn down.
+// then reaches into the tree, downcasts to the widget INTERFACE via `as`, and
+// fires the button's press handler twice. The handler captures `this` and mutates
+// component state, so re-rendering reflects the new count. Both trees are torn down.
+//
+// Classes are the CONSTRUCTION type (the factories new them); interfaces are the
+// USAGE type. A failed `as` yields a null interface value, so guard with `== nullptr`.
 
 import "ui_native.cb";
 
@@ -11,9 +14,9 @@ class Counter : IComponent
 {
     int count = 0;
 
-    IElement render(UiContext* ctx)
+    IElement render(IUiContext ctx)
     {
-        View* root = view(makeStyle(16, 0, 0));
+        IView root = view(makeStyle(16, 0, 0));
         root.add(text("Count: " + this.count.toString()));
         root.add(button("+1", () => { this.count = this.count + 1; }));
         return root;
@@ -32,15 +35,15 @@ extern int main()
     IElement tree = c.render(&ctx);
     printf("render 1: %s\n", tree.toJson().data());
 
-    // Reach the Button (children[1]) and fire its onClick twice.
-    View* rootView = tree as View;
+    // Reach the button (children[1]) and fire its onPress twice.
+    IView rootView = tree as IView;
     if (rootView == nullptr)
     {
         printf("ERROR: root is not a View\n");
         return 1;
     }
 
-    Button* inc = rootView.children[1] as Button;
+    IButton inc = rootView.children[1] as IButton;
     if (inc == nullptr)
     {
         printf("ERROR: child[1] is not a Button\n");

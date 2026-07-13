@@ -1454,6 +1454,65 @@ bool testMoveParamThroughInterfaceMethod()
     return result;
 }
 
+// --- Test 33: interface values across the two arg paths the direct path already had ---
+// Three regressions, all "the direct-call path did it, the other path did not":
+//   a) a function<>/Lambda parameter typed as an INTERFACE got the raw class value (invalid IR).
+//   b) a lambda LITERAL passed to an INTERFACE METHOD had no expected signature, so its
+//      return type defaulted to void and its `ret i1` failed module verification.
+//   c) an owned-string call result passed as a borrow argument of an INTERFACE METHOD was
+//      never registered as a temp, so its buffer leaked (proven under --heap-audit).
+interface ICase
+{
+    string label(int n);
+    void record(string name, string got);
+    bool runUntil(Lambda<bool()> pred);
+    int hits();
+};
+
+class Case : ICase
+{
+    int n = 0;
+    string label(int i) { return "row" + i.toString(); }
+    void record(string name, string got) { if (got.length() > 0) this.n = this.n + 1; }
+    bool runUntil(Lambda<bool()> pred) { return pred(); }
+    int hits() { return this.n; }
+};
+
+class CaseHolder
+{
+    function<void(ICase)> body = default;   // an INTERFACE-typed function-pointer param
+};
+
+bool testInterfaceArgPaths()
+{
+    bool result = true;
+
+    // (a) the case body is invoked through a function<> field with a CLASS VALUE argument;
+    // the indirect-call path must box it into the fat pointer the callee expects.
+    CaseHolder* h = new CaseHolder();
+    h.body = (ICase c) =>
+    {
+        // (c) label() hands back an owned string that record() only borrows.
+        c.record("first",  c.label(1));
+        c.record("second", c.label(2));
+        // (b) a lambda literal argument to an interface method - Lambda<bool()>, not void().
+        c.record("third",  c.runUntil(() => c.hits() == 2) ? c.label(3) : "");
+    };
+
+    Case t = default;
+    h.body(t);
+    result &= Test("ifacearg_value_boxed", t.hits(), 3);
+
+    // The same body, invoked with a class POINTER argument (the other boxing branch).
+    Case* p = new Case();
+    h.body(p);
+    result &= Test("ifacearg_ptr_boxed", p.hits(), 3);
+
+    delete p;
+    delete h;
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -1491,6 +1550,7 @@ extern int main()
     total++; passed += testLocalListInterfaceGrowTakeDelete() ? 1 : 0;
     total++; passed += testFieldListInterfaceTeardown()       ? 1 : 0;
     total++; passed += testMoveParamThroughInterfaceMethod()  ? 1 : 0;
+    total++; passed += testInterfaceArgPaths()                ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

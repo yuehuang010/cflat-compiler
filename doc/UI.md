@@ -41,28 +41,66 @@ deliberate. The element/seam surface was frozen in the pre-promotion hardening p
   implementation owns the cell->pixel mapping (1:1 for the TUI; `CELL_W`/`CELL_H`
   for Win32 GDI).
 - **No downcast in the hot path.** The reconciler compares node types via
-  `kind()`, never an `as` downcast. `propsEqual()` may downcast `other` because
-  the reconciler guarantees both nodes share a `kind()` first.
+  `kind()`, never an `as` downcast. `propsEqual()` may downcast `other` (to the node's
+  widget interface) because the reconciler guarantees both nodes share a `kind()` first.
+
+## Classes construct, interfaces are used
+
+Two type worlds, and the split is the single most important thing to know:
+
+- A **class** (`Button`, `View`, ...) is the CONSTRUCTION type. It is what `new`,
+  a factory, or a `<Button/>` sugar tag actually builds, and it holds the fields.
+- An **interface** (`IButton`, `IView`, ..., all rooted at `IElement`) is the USAGE
+  type. It is what you declare, pass, store, and return. Every factory hands one back,
+  and the tree stores `list<IElement>`.
+
+```cflat
+IButton b = button("Save", () => { save(); });   // factory returns `move IButton`
+IButton c = <Button title="Save"/>;              // sugar constructs a `Button`, boxes it into IButton
+b.title = "Save as";                             // an interface FIELD is a true lvalue
+root.add(b);                                     // publishes into the tree
+```
+
+You almost never need the concrete class name outside a `<Tag/>`. To go the other way -
+from a node you pulled back out of the tree - use `as` plus a null compare:
+
+```cflat
+IView rootView = tree as IView;
+if (rootView == nullptr) return 1;                    // a failed `as` yields a null value
+
+IButton inc = rootView.children[1] as IButton;        // `children` is a list<IElement>
+if (inc != nullptr) inc.fireClick();
+
+if (node is ITooltipped) { ... }                      // `is` also accepts an interface
+```
+
+Interface fields are real lvalues (read, write, and nested-struct write:
+`card.style.gap = 1`), so no accessor soup. Reaching a field on a NULL interface value
+faults exactly as calling a method on one does - guard with `== nullptr` first.
+`example/ui/01-elements/counter.cb` is the small end-to-end demo of this model. The
+full language rules are in [`doc/LANGUAGE.md`](LANGUAGE.md#interface-fields).
 
 ## The `IElement` contract
 
-Every node implements `IElement`. A node type is sugar-compatible (see below) when
+Every node class implements `IElement`. A node type is sugar-compatible (see below) when
 it implements this interface AND exposes the construction shape described later.
 
-```
+```cflat
 interface IElement
 {
-    move string toJson();                 // serialize self + subtree
-    void destroyTree();                   // free owning descendants (not self)
-    Size layout(LayoutConstraints c);     // place self, return consumed size
-    void paint(ICanvas c, UiContext* ctx); // draw self + subtree (focus-aware) via ICanvas
-    bool dispatch(Event e, UiContext* ctx); // route one input event; true if consumed
-    int  kind();                          // ELEM_* tag for the reconciler
-    bool propsEqual(IElement other);       // structured props compare (same kind)
-    list<IElement>* childList();           // children for containers, nullptr for leaves
-    string keyOf();                       // "" if unkeyed; drives keyed reconciliation
+    move string toJson();                   // serialize self + subtree
+    void destroyTree();                     // free owning descendants (not self)
+    Size layout(LayoutConstraints c);       // place self, return consumed size
+    void paint(ICanvas c, IUiContext ctx);  // draw self + subtree (focus-aware) via ICanvas
+    bool dispatch(Event e, IUiContext ctx); // route one input event; true if consumed
+    int  kind();                            // ELEM_* tag for the reconciler
+    int  flexWeight();                      // main-axis flex weight; 0 = intrinsic (leaves)
+    bool propsEqual(IElement other);        // structured props compare (same kind)
+    list<IElement>* childList();            // children for containers, nullptr for leaves
+    string keyOf();                         // "" if unkeyed; drives keyed reconciliation
     void setKey(string k);
     void collectFocusables(list<string>* keys); // append focusable keys (Tab ring)
+    Rect nodeBounds();                      // absolute frame stamped by the last layout
 };
 ```
 
@@ -75,7 +113,32 @@ Notes:
   by its owner. Use the free helper `deleteTree(move IElement root)` to tear down a
   whole tree (descendants then root), and `delete` dispatches virtually.
 - Leaves return `nullptr` from `childList()`; the reconciler uses that to choose
-  the leaf-compare path (`propsEqual`) vs the child-diff path.
+  the leaf-compare path (`propsEqual`) vs the child-diff path. `childList()` is the
+  one raw pointer left in the contract - a pointer to the child LIST, not to an element.
+
+### The widget interfaces
+
+One interface per element class, and two shared parents hoisted out of them, so a host
+(or your code) can reach a shared prop without a 15-way type switch:
+
+```
+IElement
+  +- ITooltipped  { string tooltip; }
+  |    +- IDisableable { bool disabled; }
+  |    |    +- IButton, ITextInput, ICheckbox, ISlider, ITextArea,
+  |    |       IRadioButton, IComboBox, IListView, ITabControl, ITreeView
+  |    +- IText, IProgressBar, IImage, IGroupBox, ICanvasView
+  +- IView, IBox, IStatusBar, IScrollView, IRadioGroup, ITabPane, ISplitView
+```
+
+A derived interface converts IMPLICITLY to any ancestor (assignment, call argument,
+`list<IElement>.add`, return), so `view.add(button(...))` needs no cast. `ComponentElement`
+(what `mount` returns) has no interface of its own: `IElement` is its whole contract.
+
+Each widget interface carries the props a caller reaches plus its `fire*` verbs (e.g.
+`IButton { string title; int color; int backgroundColor; void fireClick(); }`). Use LSP
+for the exact per-widget member list - the "Key props" column of the table below names the
+same fields.
 
 ## Built-in nodes
 
@@ -183,7 +246,7 @@ the flagship that composes all of them:
   (`setMenuHandler`), like a menu-bar item. `nativeFireContextMenu(keyPath, itemIndex)`
   routes an item headlessly.
 - **Toolbar (pattern, not a new element)** - a toolbar is a styled row of Buttons:
-  `View* toolbar()` returns a `DIR_ROW` View with a small gap; add `button(...)`s to it.
+  `toolbar()` returns a `DIR_ROW` `IView` with a small gap; add `button(...)`s to it.
   There is no new native control (icon support arrives with `Image` below).
 
 **Visuals + escape hatch (v15).** The last three elements complete the set, each with a ICanvas
@@ -234,34 +297,49 @@ node's laid-out frame (layout assertions). The Cocoa host provides real
 `NSSegmentedControl`/`NSOutlineView` backends (P11); the WinUI host provides real
 `TabView`/`TreeView` controls with driver-backed strips/nodes (P12). See the parity matrix.
 
-Convenience constructors return the concrete heap pointer so callers can set
-typed props, then assign into an `IElement` slot:
+Each factory news the concrete node and hands back its INTERFACE by `move` - the caller
+owns the fresh node, sets typed props through the interface, then `add()`s it to a parent:
 
+```cflat
+move IView        view(Style style);
+move IView        row(Style style);      // View with flexDirection = DIR_ROW
+move IView        column(Style style);   // View with flexDirection = DIR_COLUMN
+move IText        text(string s);
+move IButton      button(string title, Lambda<void()> onPress);
+move IBox         box(Style style);
+move ITextInput   textInput(string value, Lambda<void(string)> onChangeText);
+move ICheckbox    checkbox(string label, bool checked, Lambda<void(bool)> onChange);
+move IProgressBar progressBar(int value, int width);
+move ISlider      slider(int value, int width, Lambda<void(int)> onChange);
+move ITextArea    textArea(string value, Lambda<void()> onChange);
+move IStatusBar   statusBar(string mainText);   // add more panes with .addPart(s)
+move IRadioGroup  radioGroup(int value, Lambda<void(int)> onChange);  // add options with .addOption(label)
+move IComboBox    comboBox(int selectedIndex, Lambda<void(int)> onChange);  // add items with .addItem(s)
+move IListView    listView(int rowCount, Lambda<string(int,int)> rowText); // add columns with .addColumn(title, widthDip)
+move ITabControl  tabControl(int selectedTab, Lambda<void(int)> onSelectTab); // add panes with .add(tabPane(title))
+move ITabPane     tabPane(string title);
+move ITreeView    treeView(Lambda<int(int)> childCount, Lambda<int(int,int)> childId, Lambda<string(int)> label);
+move ISplitView   splitView(int ratio, bool vertical);   // add exactly two pane children
+move IView        toolbar();                             // DIR_ROW View + gap; add button()s
+move IImage       image(u64 pixels, int pxW, int pxH);   // borrowed top-down BGRA32 buffer
+move IGroupBox    groupBox(string title, Style style);   // titled frame; add children with .add()
+move ICanvasView  canvasView(Lambda<void(ICanvas)> onPaint);   // app-painted escape hatch
+move IScrollView  scrollView(Style style);
+move IElement     mount(IComponent c, string key, IUiContext ctx);   // a component subtree
 ```
-View*       view(Style style);
-View*       row(Style style);      // View with flexDirection = DIR_ROW
-View*       column(Style style);   // View with flexDirection = DIR_COLUMN
-Text*       text(string s);
-Button*     button(string title, Lambda<void()> onPress);
-Box*        box(Style style);
-TextInput*  textInput(string value, Lambda<void(string)> onChangeText);
-Checkbox*    checkbox(string label, bool checked, Lambda<void(bool)> onChange);
-ProgressBar* progressBar(int value, int width);
-Slider*      slider(int value, int width, Lambda<void(int)> onChange);
-StatusBar*   statusBar(string mainText);   // add more panes with .addPart(s)
-RadioGroup*  radioGroup(int value, Lambda<void(int)> onChange);  // add options with .addOption(label)
-ComboBox*    comboBox(int selectedIndex, Lambda<void(int)> onChange);  // add items with .addItem(s)
-ListView*    listView(int rowCount, Lambda<string(int,int)> rowText); // add columns with .addColumn(title, widthDip)
-TabControl*  tabControl(int selectedTab, Lambda<void(int)> onSelectTab); // add panes with .addPane(tabPane(title))
-TabPane*     tabPane(string title);
-TreeView*    treeView(Lambda<int(int)> childCount, Lambda<int(int,int)> childId, Lambda<string(int)> label);
-SplitView*   splitView(int ratio, bool vertical);   // add exactly two pane children
-View*        toolbar();                              // DIR_ROW View + gap; add button()s
-Image*       image(u64 pixels, int pxW, int pxH);    // borrowed top-down BGRA32 buffer
-GroupBox*    groupBox(string title, Style style);    // titled frame; add children with .add()
-CanvasView*  canvasView(Lambda<void(ICanvas)> onPaint);   // app-painted escape hatch
-ScrollView*  scrollView(Style style);
-```
+
+### Ownership: who frees the tree
+
+- A factory returns `move IX`, so the CALLER owns the freshly-newed node.
+- `parent.add(child)` does not TRANSFER, it PUBLISHES: the parent's `children` list now
+  names the node, and from that point the TREE is its single owner. `add` is deliberately
+  a borrow, so you can still configure the node after inserting it
+  (`root.add(b); b.title = "...";`).
+- An interface value carries no ownership bit and an interface local is NEVER
+  auto-destructed, so once you have handed a node to a parent you have nothing left to
+  free - there is no window with two owners.
+- A node you never give to a parent is yours to `delete` (dispatched through the fat
+  pointer). Tear a whole tree down with `deleteTree(move IElement root)`.
 
 **Controlled widgets** (`TextInput`, `Checkbox`) hold no state of their own: the
 component owns the value and passes it down each render; the widget fires its
@@ -360,12 +438,15 @@ int   shade(int color, int delta);                // lighten/darken (hover/press
 The theme lives on `UiContext` (`ctx.theme`), the host-owned per-app state. An app
 declares its preference in `render()`:
 
-```
-IElement render(UiContext* ctx) {
+```cflat
+IElement render(IUiContext ctx) {
     ctx.theme = lightTheme();   // or darkTheme(), or your own Theme
     ...
 }
 ```
+
+`theme` is an interface FIELD, so both the whole-struct write above and a nested read
+(`ctx.theme.buttonBg`) go straight to the host's one live `UiContext` - no copy.
 
 A default-constructed `Theme` is monochrome (every slot `0`), so a host that sets no
 theme renders exactly as the pre-color framework did - this is what keeps the GDI
@@ -495,42 +576,53 @@ identity actually changes, so dragging within one widget does not churn.
   release off-target still clears). `int shade(int color, int delta)` lightens/darkens
   every channel (clamped); an unset color stays unset.
 
-## `UiContext` (host-owned runtime state)
+## `IUiContext` (host-owned runtime state)
 
-```
-struct UiContext
+The context is passed around as the INTERFACE `IUiContext`; the concrete
+`class UiContext : IUiContext` is the host's own long-lived instance (per window on
+Win32/Cocoa, one global on WinUI, a stack local in a headless test). You declare
+`IUiContext`, never `UiContext*`.
+
+```cflat
+interface IUiContext
 {
-    bool   dirty;       // a handler changed state; host re-renders
-    string focusKey;    // keyed identity of the focused node ("" = none)
-    string hoverKey;    // node under the pointer ("" = none)
-    string pressKey;    // node pressed/held ("" = none)
-    Theme  theme;       // styling preference (default = monochrome)
-    dictionary<string, u64> nativeByKey;   // v9: key path -> native control handle
+    Theme theme;                // styling preference (default = monochrome); a true lvalue
 
-    void invalidate();          // mark the UI dirty
-    bool consumeDirty();        // read + clear the flag
-    void focus(string key);     // set focus to a keyed node
+    void invalidate();          // mark the UI dirty (host re-renders)
+    void requestRepaint();      // paint-only change (no re-render)
+    bool consumeDirty();        // read + clear the dirty flag
+    bool consumeRepaint();
+
+    void focus(string key);     // focus a keyed node
     void blur();
     bool hasFocus(string key);
-    void setHover(string key);  // repaints only when hover identity changes
+    void setHover(string key);  // repaints only when the hover identity changes
     bool hasHover(string key);
     void setPress(string key);
     void clearPress();
     bool hasPress(string key);
 
     void setNativeHandle(string key, u64 h);   // v9: shadow-map accessors
-    u64  nativeHandle(string key);             // 0 if none
     bool hasNativeHandle(string key);
+    u64  nativeHandle(string key);             // 0 if none
     void removeNativeHandle(string key);
 
+    void bindPost(u64 target, function<void(u64, u64)> hook);   // host wiring (not app code)
+    void bindThreadId(u64 uiTid, function<u64()> tidFn);
     void post(Lambda<void()> work);   // v12: run `work` on the UI thread (thread-safe)
     void assertUiThread();            // v12: debug guard (warns off the UI thread)
 };
 ```
 
-The host owns one `UiContext`, threads `&ctx` into `render()`, and drains
-`consumeDirty()` once per loop, re-rendering + reconciling only on a change.
-Event closures call `ctx.invalidate()`.
+Behind it the concrete `UiContext` holds `dirty`, the `focusKey` / `hoverKey` /
+`pressKey` keyed identities, the `Theme`, and the `dictionary<string, u64> nativeByKey`
+shadow map. Only `theme` is on the interface, because it is the only one an app touches.
+
+The host owns one `UiContext`, threads it into `render()` as an `IUiContext`, and drains
+`consumeDirty()` once per loop, re-rendering + reconciling only on a change. Event closures
+call `ctx.invalidate()`. Boxing the host's instance into the interface BORROWS it - the fat
+pointer's data word IS that instance's address, nothing is copied and nothing is owned - so
+`activeCtx()` handed out at any time reaches the same state.
 
 **`ctx.post(work)` (v12) - thread marshaling.** Call from any thread to run `work`
 back on the UI thread. The closure is cloned into a heap box and the host marshals it
@@ -542,13 +634,13 @@ clone-in / destruct-after-call, so it is leak-clean under `--heap-audit`.
 
 ## Components and the model layer
 
-```
-interface IComponent { IElement render(UiContext* ctx); };
-ComponentElement* mount(IComponent c, string key, UiContext* ctx);
+```cflat
+interface IComponent { IElement render(IUiContext ctx); };
+move IElement mount(IComponent c, string key, IUiContext ctx);
 ```
 
-A component renders itself to an `IElement` tree; `render` receives the host
-`UiContext` so its event closures can `invalidate()`. A parent component owns its
+A component renders itself to an `IElement` tree; `render` receives the host context as an
+`IUiContext` so its event closures can `invalidate()`. A parent component owns its
 children by pointer (e.g. `list<Counter*>`) and re-mounts them by key each render;
 the reconciler matches `ComponentElement`s by key and descends into the single
 inner child, so each child's subtree and state keep identity across
@@ -617,11 +709,21 @@ LIBRARY-AGNOSTIC: `<Tag>` constructs whatever type named `Tag` is in scope (the
 compiler has no dependency on this library), sets attributes as fields, and adds
 children via the tag's `add()` method.
 
-```
+```cflat
 return <View style={makeStyle(16, 0, 0)}>
          <Text text={label} />
          <Button title="+1" onPress={() => { this.count = this.count + 1; }} />
        </View>;
+```
+
+A tag names the CONCRETE class (that is what makes the sugar library-agnostic), so a
+`<Button/>` produces a `Button`. Bind it to the widget interface, exactly like a factory
+result - the boxing is implicit in every position (declaration, `add()` argument, return):
+
+```cflat
+IButton save = <Button key="save" title="Save" onPress={() => { this.save(ctx); }}/>;
+save.disabled = this.clean;      // interface field, a true lvalue
+root.add(save);
 ```
 
 - `attr="literal"` sets a string field from a static literal; `attr={expr}` sets
@@ -632,8 +734,9 @@ return <View style={makeStyle(16, 0, 0)}>
 - Children are nested elements or `{expr}` interpolations; each is `add()`-ed to
   the parent, so the tag needs an `add(IElement)` method (View/Box/ScrollView have
   one; leaves like Text do not take children).
-- The result is a heap node pointer usable wherever a constructor result is - e.g.
-  `return <View/>` or assigning to an `IElement` slot.
+- The result is a heap node usable wherever a constructor result is - e.g.
+  `return <View/>`, or bound to the node's own interface (`IView v = <View/>;`), or
+  assigned straight into an `IElement` slot.
 - `counter_jsx.cb` asserts the sugar desugars to a tree identical to the
   hand-written `counter.cb` form.
 - Sugar children are STATIC. Dynamic children compose as sugar FRAGMENTS: build the
@@ -654,16 +757,18 @@ resolves against whatever node type named `View`/`Text`/... is in scope (the
 compiler stays ignorant of this library). For a node type to be a valid sugar
 target it MUST expose:
 
-1. A constructor reachable by the tag name - either a `T* tag(...)` factory (as
-   `view`/`text`/`button`/`box` provide) or a brace-init shape - so `<View .../>`
-   lowers to constructing a `View`.
+1. A CLASS reachable by the tag name (`View`, `Button`, ...), heap-constructible with no
+   arguments - so `<View .../>` lowers to newing a `View`. The tag names the class, not
+   the lowercase factory; the factories are a convenience layer over the same classes.
 2. A children add path: a `void add(IElement child)` method backed by a
    `list<IElement>` (containers), so nested children lower to `parent.add(child)`.
-3. Prop fields settable after construction (`style`, `text`, `title`, `onPress`,
+3. PUBLIC prop fields settable after construction (`style`, `text`, `title`, `onPress`,
    `key` via `setKey`), so `prop="literal"` / `prop={expr}` attributes lower to
-   field assignments / setter calls.
+   field assignments / setter calls. This is why the node classes stay public with public
+   fields even though every other surface is now interface-typed.
 4. The full `IElement` interface (above), so the lowered tree reconciles, lays out,
-   paints, and dispatches uniformly.
+   paints, and dispatches uniformly - and so the constructed node boxes into any
+   `IElement` slot.
 
 Keeping this contract stable is what lets the sugar work unchanged if the library
 later moves to `core/`.
@@ -986,10 +1091,10 @@ class MyApp : IComponent { /* render() with setKey on everything you automate */
 import "ui_native/host.cb";   // the default host: Win32 on Windows, Cocoa on macOS
 import "ui_test.cb";
 import "myapp.cb";
-int main(int argc, char** argv)
+extern int main(int argc, char** argv)
 {
     UiTestSuite s = uiTestSuite("myapp");
-    s.test("save enables after edit", (UiTest* t) => {
+    s.test("save enables after edit", (IUiTest t) => {
         t.launch(new MyApp(), 80, 30);              // fresh invisible window per case
         t.type("root/name", "hello");
         t.expectTrue("save enabled", t.isEnabled("root/save"));
@@ -1010,7 +1115,9 @@ the test target is what you compile. This is exactly how `gallery_app.cb` / `gal
 you reorder or conditionally omit a sibling. Key everything you touch; nest keys by parent
 (`"root/split/main/editor"`).
 
-**The `UiTest` / `UiTestSuite` API** (a compact map - use LSP for the exact signatures):
+**The `IUiTest` / `UiTestSuite` API.** A case body receives an `IUiTest` - the interface over
+the runner's per-case `UiTest`. It is all methods, no fields (a compact map - use LSP for the
+exact signatures):
 
 | Group | Methods |
 |-------|---------|
@@ -1076,7 +1183,7 @@ This is precisely what `example.bat`'s `--worker-uitest` does for the template.
 ## Hardening self-tests
 
 The hardening soaks are library kits in `core/ui_test.cb` (the `import "ui_test.cb"` test framework -
-`UiTestSuite` runner + `UiTest` facade over the `native*` drivers). They are host-neutral - any
+`UiTestSuite` runner + the `IUiTest` facade over the `native*` drivers). They are host-neutral - any
 ui_native app can call them - and the gallery self-test dogfoods them. The gallery self-test
 (`gallerySelfTest`, host-neutral in `gallery_app.cb`) runs the 25 element asserts plus the two kits
 below in one case, so it is 27/27 on Win32 and WinUI 3 (leak-clean under `--heap-audit` and asan-clean
@@ -1100,9 +1207,10 @@ under `--asan` on Win32):
 
 The Win32-only `win32HardeningSelfTest` (in `gallery.cb`, gated out of the Cocoa build) is its own
 `UiTestSuite` covering focus-traversal, the `resizeStorm`-backed live relayout, and accessible-Name
-readback. Because a `UiTest` case body is a non-capturing `function<void(UiTest*)>` while the kits take
+readback. Because a case body is a non-capturing `function<void(IUiTest)>` while the kits take
 capturing `Lambda<>` closures, a case reads app state through a local downcast (e.g.
-`GalleryApp* g = activeApp() as GalleryApp;`) and passes `Lambda` predicates that capture it to the kits.
+`GalleryApp* g = activeApp() as GalleryApp;` - a component CLASS, so this one is a concrete cast)
+and passes `Lambda` predicates that capture it to the kits.
 
 To run the TUI self-tests directly:
 

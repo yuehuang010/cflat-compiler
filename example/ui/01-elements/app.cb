@@ -14,9 +14,9 @@ class Counter : IComponent
     int count = 0;
     string name = default;
 
-    IElement render(UiContext* ctx)
+    IElement render(IUiContext ctx)
     {
-        View* root = view(makeStyle(1, 0, 0));
+        IView root = view(makeStyle(1, 0, 0));
         root.add(text(this.name + ": " + this.count.toString()));
         root.add(button("+1", () => { this.count = this.count + 1; ctx.invalidate(); }));
         return root;
@@ -39,9 +39,9 @@ class CounterApp : IComponent
     }
 
     // Compose: mount each child Counter as a keyed component node.
-    IElement render(UiContext* ctx)
+    IElement render(IUiContext ctx)
     {
-        View* root = view(makeStyle(2, 0, 0));
+        IView root = view(makeStyle(2, 0, 0));
         root.add(text("=== Counters ==="));
         for (Counter* child in this.counters)
             root.add(mount(child, child.name, ctx));

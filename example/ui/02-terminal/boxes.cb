@@ -21,23 +21,23 @@ class BoxApp : IComponent
     int termH = 8;
     int clicks = 0;
 
-    IElement render(UiContext* ctx)
+    IElement render(IUiContext ctx)
     {
-        Box* root = box(makeStyle(0, this.termW, this.termH));
+        IBox root = box(makeStyle(0, this.termW, this.termH));
         root.setKey("root");
 
-        Button* add = button("add box", () => { this.clicks = this.clicks + 1; ctx.invalidate(); });
+        IButton add = button("add box", () => { this.clicks = this.clicks + 1; ctx.invalidate(); });
         add.setKey("btn");
         root.add(add);
 
-        Text* status = text("Boxes: " + this.clicks.toString() + "   (ESC to quit)");
+        IText status = text("Boxes: " + this.clicks.toString() + "   (ESC to quit)");
         status.setKey("status");
         root.add(status);
 
         int i = 0;
         while (i < this.clicks)
         {
-            Box* small = box(makeStyle(0, 6, 3));
+            IBox small = box(makeStyle(0, 6, 3));
             small.setKey("b" + i.toString());
             root.add(small);
             i++;
@@ -184,7 +184,7 @@ void flushFrame(Terminal* term, Surface* front, Surface* back, int height, bool 
 // Render the whole tree fresh into `back` and full-paint. Used for the first
 // frame and after a resize (a size change does not produce reconcile patches, so
 // it cannot ride the incremental path - we rebuild and repaint everything).
-move IElement repaintAll(BoxApp* app, UiContext* ctx, Terminal* term, Surface* front,
+move IElement repaintAll(BoxApp* app, IUiContext ctx, Terminal* term, Surface* front,
                        Surface* back, move IElement tree, int w, int h)
 {
     deleteTree(tree);

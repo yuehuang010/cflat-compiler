@@ -12,7 +12,7 @@
 //     structured propsEqual() (no stringly-typed signatures).
 //   - The library carries NO process-global mutable state: the dirty flag and the
 //     focused-node identity live in a host-owned UiContext, threaded through
-//     render(UiContext*). Single mounted app, single thread (see doc/UI.md).
+//     render(IUiContext). Single mounted app, single thread (see doc/UI.md).
 //   - v0.4 does not paint pixels in the library; nodes paint via the ICanvas seam
 //     and serialize to a renderer-friendly JSON shape.
 
@@ -576,7 +576,42 @@ void __uiRunPostBox(u64 boxPtr)
 // survives reconcile (a re-render keeps the same key -> same focus), unlike a
 // list index. Single mounted app, single thread: one UiContext per host loop,
 // threaded into render() so event closures can reach it.
-struct UiContext
+//
+// The context is passed around as the INTERFACE value `IUiContext` (a fat pointer to the
+// host's single long-lived UiContext instance - boxing a value or a `&`-address BORROWS it,
+// it is never copied and never owned by the interface). `theme` is an interface FIELD, so
+// `ctx.theme.buttonBg` through the fat pointer is a true lvalue (read and write).
+interface IUiContext
+{
+    Theme theme;
+
+    void invalidate();
+    void requestRepaint();
+    bool consumeDirty();
+    bool consumeRepaint();
+
+    void focus(string key);
+    void blur();
+    bool hasFocus(string key);
+
+    void setHover(string key);
+    bool hasHover(string key);
+    void setPress(string key);
+    void clearPress();
+    bool hasPress(string key);
+
+    void setNativeHandle(string key, u64 h);
+    bool hasNativeHandle(string key);
+    u64  nativeHandle(string key);
+    void removeNativeHandle(string key);
+
+    void bindPost(u64 target, function<void(u64, u64)> hook);
+    void bindThreadId(u64 uiTid, function<u64()> tidFn);
+    void post(Lambda<void()> work);
+    void assertUiThread();
+};
+
+class UiContext : IUiContext
 {
     bool   dirty    = false;     // a handler changed state -> re-render the tree
     bool   repaint  = false;     // layout/paint changed but the tree did not (scroll)
@@ -750,13 +785,24 @@ int ELEM_CANVAS     = 23;   // app-painted canvas child; paint callback via ICan
 //   - kind / propsEqual / childList drive the reconciler: kind() compares node
 //     type, propsEqual() is a structured same-kind props compare for change
 //     detection, childList() exposes a container's children (nullptr for leaves).
+//
+// Factory ownership. A factory (`button(...)`) returns `move IButton`: the caller
+// owns the heap node. `add(IElement child)` is a BORROW param on purpose - it does not
+// transfer, it publishes: the parent's `children` list now names the node, and from that
+// point the TREE is its single owner. That is sound because an interface value carries no
+// ownership bit and an interface local is never auto-destructed, so a caller that boxed a
+// node and handed it to a parent has nothing left to free - and it can still configure the
+// node afterwards (`b.title = ...`), which a `move` param would forbid. A node never given
+// to a parent is the caller's to `delete` (the fat pointer's dtor slot). The tree is freed
+// exactly once, by destroyTree() + `delete c` per child (list<IElement> does not destruct
+// its elements).
 interface IElement
 {
     move string toJson();
     void destroyTree();
     Size layout(LayoutConstraints c);
-    void paint(ICanvas c, UiContext* ctx);
-    bool dispatch(Event e, UiContext* ctx);
+    void paint(ICanvas c, IUiContext ctx);
+    bool dispatch(Event e, IUiContext ctx);
     int  kind();
     // Main-axis flex weight for a View-row/column distribution pass; 0 = not
     // flexible (intrinsic size). Only View carries a real Style; every other
@@ -949,6 +995,9 @@ interface ISplitView : IElement
     bool  vertical;
     Style style;
     Rect  dividerBounds;
+    // Settable prop, not a factory arg: splitView(ratio, vertical) cannot take it, so the
+    // field must be on the interface for a caller holding an ISplitView to wire it up.
+    Lambda<void(int)> onRatioChange;
     int   _ratioAt(int px, int py);
     void  add(IElement child);
     void  fireRatioChange(int r);
@@ -1407,7 +1456,7 @@ class View : IView
         return sz;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         if (this.style.backgroundColor != 0)
             cv.drawRect(this.bounds, true, this.style.backgroundColor);
@@ -1415,7 +1464,7 @@ class View : IView
             c.paint(cv, ctx);
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         for (IElement c in this.children)
         {
@@ -1498,13 +1547,13 @@ class Text : IText
         return s;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         cv.drawText(this.bounds.x, this.bounds.y, this.text.data(),
                     pickColor(this.color, ctx.theme.textColor));
     }
 
-    bool dispatch(Event e, UiContext* ctx) { return false; }
+    bool dispatch(Event e, IUiContext ctx) { return false; }
 
     void destroyTree() { }
 
@@ -1558,7 +1607,7 @@ class Button : IButton
         return s;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         // Disabled: a flat dimmed fill + gray label, no hover/press/focus affordance.
         if (this.disabled)
@@ -1585,7 +1634,7 @@ class Button : IButton
                     pickColor(this.color, ctx.theme.buttonText));
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         if (this.disabled) return false;
         if (e.kind == EV_MOUSE_DOWN)
@@ -1681,7 +1730,7 @@ class Box : IBox
         return sz;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         int bg = pickColor(this.style.backgroundColor, ctx.theme.panelBg);
         if (bg != 0)
@@ -1691,7 +1740,7 @@ class Box : IBox
             c.paint(cv, ctx);
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         for (IElement c in this.children)
         {
@@ -1784,7 +1833,7 @@ class TextInput : ITextInput
         return s;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         // Show the value, or the placeholder when empty; a focused field shows a
         // trailing '_' caret in the next cell.
@@ -1806,7 +1855,7 @@ class TextInput : ITextInput
         }
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         if (this.disabled) return false;
         if (e.kind == EV_MOUSE_DOWN)
@@ -1897,7 +1946,7 @@ class Checkbox : ICheckbox
         return s;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         int ink = pickColor(this.color, ctx.theme.textColor);
         if (this.disabled) ink = dimColor(ink);
@@ -1909,7 +1958,7 @@ class Checkbox : ICheckbox
         cv.drawText(this.bounds.x, this.bounds.y, shown.data(), ink);
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         if (this.disabled) return false;
         if (e.kind == EV_MOUSE_DOWN)
@@ -1981,7 +2030,7 @@ class ProgressBar : IProgressBar
         return s;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         int track = ctx.theme.track;
         int fill  = pickColor(this.color, ctx.theme.accent);
@@ -1995,7 +2044,7 @@ class ProgressBar : IProgressBar
         }
     }
 
-    bool dispatch(Event e, UiContext* ctx) { return false; }
+    bool dispatch(Event e, IUiContext ctx) { return false; }
     void destroyTree() { }
     int kind() { return ELEM_PROGRESS; }
     int flexWeight() { return 0; }
@@ -2054,7 +2103,7 @@ class Slider : ISlider
         return s;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         int track = ctx.theme.track;
         int fill  = ctx.theme.accent;
@@ -2073,7 +2122,7 @@ class Slider : ISlider
             cv.drawRect(this.bounds, false, ctx.theme.focusRing);
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         if (this.disabled) return false;
         if (e.kind == EV_MOUSE_DOWN)
@@ -2160,7 +2209,7 @@ class TextArea : ITextArea
 
     // ICanvas fallback: draw the pushed text, one grid row per '\n'-delimited line,
     // clipped to the region. Native hosts ignore this (the EDIT paints itself).
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         int bg = pickColor(this.backgroundColor, ctx.theme.inputBg);
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
@@ -2181,7 +2230,7 @@ class TextArea : ITextArea
         }
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         if (this.disabled) return false;
         if (e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y))
@@ -2214,7 +2263,7 @@ class TextArea : ITextArea
 };
 
 // A multiline text region seeded with `value` and notifying `onChange` on edits.
-TextArea* textArea(string value, Lambda<void()> onChange)
+move ITextArea textArea(string value, Lambda<void()> onChange)
 {
     TextArea* t = new TextArea();
     t.value = value;
@@ -2259,7 +2308,7 @@ class StatusBar : IStatusBar
     }
 
     // ICanvas fallback: the panes joined by " | " on the strip's row.
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         string line = "";
         int i = 0;
@@ -2273,7 +2322,7 @@ class StatusBar : IStatusBar
                     pickColor(0, ctx.theme.textColor));
     }
 
-    bool dispatch(Event e, UiContext* ctx) { return false; }
+    bool dispatch(Event e, IUiContext ctx) { return false; }
     void destroyTree() { }
     int kind() { return ELEM_STATUSBAR; }
     int flexWeight() { return 0; }
@@ -2298,7 +2347,7 @@ class StatusBar : IStatusBar
 };
 
 // A status bar seeded with a main-pane string (add more panes with addPart()).
-StatusBar* statusBar(string text)
+move IStatusBar statusBar(string text)
 {
     StatusBar* s = new StatusBar();
     s.parts.add("" + text);
@@ -2369,7 +2418,7 @@ class ScrollView : IScrollView
         return sz;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         if (this.style.backgroundColor != 0)
             cv.drawRect(this.bounds, true, this.style.backgroundColor);
@@ -2379,7 +2428,7 @@ class ScrollView : IScrollView
         cv.popClip();
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         if (e.kind == EV_MOUSE_DOWN)
         {
@@ -2467,9 +2516,11 @@ class ScrollView : IScrollView
     Rect nodeBounds() { return this.bounds; }
 };
 
-// Convenience constructors returning the concrete heap pointer (so callers can
-// set typed props), assignable to an IElement slot at the use site.
-View* view(Style style)
+// Convenience constructors. Each returns its widget INTERFACE by `move`: the caller
+// owns the heap node (typed props stay reachable - an interface field is an lvalue)
+// until it is handed to a parent, which becomes the single owner. See "Factory
+// ownership" above the IElement interface.
+move IView view(Style style)
 {
     View* v = new View();
     v.style = style;
@@ -2478,7 +2529,7 @@ View* view(Style style)
 
 // A View whose children flow left-to-right (row) or top-to-bottom (column). Thin
 // helpers over flexDirection so callers read declaratively.
-View* row(Style style)
+move IView row(Style style)
 {
     View* v = new View();
     v.style = style;
@@ -2486,7 +2537,7 @@ View* row(Style style)
     return v;
 }
 
-View* column(Style style)
+move IView column(Style style)
 {
     View* v = new View();
     v.style = style;
@@ -2496,14 +2547,14 @@ View* column(Style style)
 
 // Plain string params: assigning an alias/param to an owning-string field
 // deep-copies, so the field keeps its own buffer after the arg is freed.
-Text* text(string s)
+move IText text(string s)
 {
     Text* t = new Text();
     t.text = s;
     return t;
 }
 
-Button* button(string title, Lambda<void()> onPress)
+move IButton button(string title, Lambda<void()> onPress)
 {
     Button* b = new Button();
     b.title = title;
@@ -2511,7 +2562,7 @@ Button* button(string title, Lambda<void()> onPress)
     return b;
 }
 
-Box* box(Style style)
+move IBox box(Style style)
 {
     Box* b = new Box();
     b.style = style;
@@ -2519,7 +2570,7 @@ Box* box(Style style)
 }
 
 // A controlled text field bound to `value` with an onChangeText handler.
-TextInput* textInput(string value, Lambda<void(string)> onChangeText)
+move ITextInput textInput(string value, Lambda<void(string)> onChangeText)
 {
     TextInput* t = new TextInput();
     t.value = value;
@@ -2528,7 +2579,7 @@ TextInput* textInput(string value, Lambda<void(string)> onChangeText)
 }
 
 // A controlled checkbox bound to `checked` with an onChange(bool) handler.
-Checkbox* checkbox(string label, bool checked, Lambda<void(bool)> onChange)
+move ICheckbox checkbox(string label, bool checked, Lambda<void(bool)> onChange)
 {
     Checkbox* c = new Checkbox();
     c.label = label;
@@ -2538,7 +2589,7 @@ Checkbox* checkbox(string label, bool checked, Lambda<void(bool)> onChange)
 }
 
 // A presentational progress bar (value 0..100) `width` cells wide.
-ProgressBar* progressBar(int value, int width)
+move IProgressBar progressBar(int value, int width)
 {
     ProgressBar* p = new ProgressBar();
     p.value = value;
@@ -2547,7 +2598,7 @@ ProgressBar* progressBar(int value, int width)
 }
 
 // A controlled slider bound to `value` (0..100) with an onChange(int) handler.
-Slider* slider(int value, int width, Lambda<void(int)> onChange)
+move ISlider slider(int value, int width, Lambda<void(int)> onChange)
 {
     Slider* s = new Slider();
     s.value = value;
@@ -2556,7 +2607,7 @@ Slider* slider(int value, int width, Lambda<void(int)> onChange)
     return s;
 }
 
-ScrollView* scrollView(Style style)
+move IScrollView scrollView(Style style)
 {
     ScrollView* s = new ScrollView();
     s.style = style;
@@ -2596,7 +2647,7 @@ class RadioButton : IRadioButton
         return s;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         int ink = pickColor(0, ctx.theme.textColor);
         if (this.disabled) ink = dimColor(ink);
@@ -2605,7 +2656,7 @@ class RadioButton : IRadioButton
         cv.drawText(this.bounds.x, this.bounds.y, shown.data(), ink);
     }
 
-    bool dispatch(Event e, UiContext* ctx) { return false; }
+    bool dispatch(Event e, IUiContext ctx) { return false; }
     void destroyTree() { }
     int kind() { return ELEM_RADIO; }
     int flexWeight() { return 0; }
@@ -2689,12 +2740,12 @@ class RadioGroup : IRadioGroup
         return sz;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         for (IElement c in this.children) c.paint(cv, ctx);
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         if (e.kind == EV_MOUSE_DOWN)
         {
@@ -2806,7 +2857,7 @@ class ComboBox : IComboBox
         return s;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         int ink = pickColor(0, ctx.theme.inputText);
         if (this.disabled) ink = dimColor(ink);
@@ -2816,7 +2867,7 @@ class ComboBox : IComboBox
         cv.drawText(this.bounds.x, this.bounds.y, shown.data(), ink);
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         if (this.disabled) return false;
         if (e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y))
@@ -2919,7 +2970,7 @@ class ListView : IListView
 
     // ICanvas fallback: header row + only the rows that fit (virtualization is visible
     // here too - the callback is asked for at most bounds.h-1 rows regardless of count).
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         int bg = pickColor(0, ctx.theme.inputBg);
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
@@ -2953,7 +3004,7 @@ class ListView : IListView
         }
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         if (this.disabled) return false;
         if (e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y))
@@ -2996,7 +3047,7 @@ class ListView : IListView
 // -- IElement factories (thin field-setters; sugar-ready fields elsewhere) -------
 // A controlled radio group; append options with addOption(), which wires index/key
 // and seeds checked from `value`.
-RadioGroup* radioGroup(int value, Lambda<void(int)> onChange)
+move IRadioGroup radioGroup(int value, Lambda<void(int)> onChange)
 {
     RadioGroup* g = new RadioGroup();
     g.value = value;
@@ -3005,7 +3056,7 @@ RadioGroup* radioGroup(int value, Lambda<void(int)> onChange)
 }
 
 // A controlled dropdown; add items with addItem().
-ComboBox* comboBox(int selectedIndex, Lambda<void(int)> onChange)
+move IComboBox comboBox(int selectedIndex, Lambda<void(int)> onChange)
 {
     ComboBox* c = new ComboBox();
     c.selectedIndex = selectedIndex;
@@ -3014,7 +3065,7 @@ ComboBox* comboBox(int selectedIndex, Lambda<void(int)> onChange)
 }
 
 // A virtualized list; add columns with addColumn() and set `rowText`/`rowCount`.
-ListView* listView(int rowCount, Lambda<string(int,int)> rowText)
+move IListView listView(int rowCount, Lambda<string(int,int)> rowText)
 {
     ListView* lv = new ListView();
     lv.rowCount = rowCount;
@@ -3087,9 +3138,9 @@ class TabPane : ITabPane
         return s;
     }
 
-    void paint(ICanvas cv, UiContext* ctx) { for (IElement c in this.children) c.paint(cv, ctx); }
+    void paint(ICanvas cv, IUiContext ctx) { for (IElement c in this.children) c.paint(cv, ctx); }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         for (IElement c in this.children) { if (c.dispatch(e, ctx)) return true; }
         return false;
@@ -3145,7 +3196,6 @@ class TabControl : ITabControl
     string key = default;
 
     void add(IElement child) { this.children.add(child); }
-    void addPane(TabPane* p) { this.children.add(p); }
 
     void fireSelectTab(int i) { this.onSelectTab(i); }
 
@@ -3186,7 +3236,7 @@ class TabControl : ITabControl
         return s;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         int bg = pickColor(0, ctx.theme.panelBg);
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
@@ -3207,7 +3257,7 @@ class TabControl : ITabControl
             this.children.get(this.selectedTab).paint(cv, ctx);
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         if (this.disabled) return false;
         if (e.kind == EV_MOUSE_DOWN && e.y == this.bounds.y && this.bounds.contains(e.x, e.y))
@@ -3306,7 +3356,7 @@ class TreeView : ITreeView
         return s;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         int bg = pickColor(0, ctx.theme.inputBg);
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
@@ -3326,7 +3376,7 @@ class TreeView : ITreeView
         }
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         if (this.disabled) return false;
         if (e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y))
@@ -3446,13 +3496,13 @@ class SplitView : ISplitView
         return this._clampRatio((py - this.bounds.y) * 100 / this.bounds.h);
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         for (IElement c in this.children) c.paint(cv, ctx);
         cv.drawRect(this.dividerBounds, true, pickColor(this.style.color, ctx.theme.panelBorder));
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         if (e.kind == EV_MOUSE_DOWN && this.dividerBounds.contains(e.x, e.y))
         {
@@ -3578,14 +3628,14 @@ void __uiFreeContextMenu(u64 menuPtr)
 }
 
 // -- IElement factories (thin field-setters; sugar-ready fields elsewhere) -------
-TabPane* tabPane(string title)
+move ITabPane tabPane(string title)
 {
     TabPane* p = new TabPane();
     p.title = title;
     return p;
 }
 
-TabControl* tabControl(int selectedTab, Lambda<void(int)> onSelectTab)
+move ITabControl tabControl(int selectedTab, Lambda<void(int)> onSelectTab)
 {
     TabControl* t = new TabControl();
     t.selectedTab = selectedTab;
@@ -3595,7 +3645,7 @@ TabControl* tabControl(int selectedTab, Lambda<void(int)> onSelectTab)
 
 // A tree with its node source. onSelect/onExpand default to no-ops so the native host
 // never invokes an unset closure; the app overrides them.
-TreeView* treeView(Lambda<int(int)> childCount, Lambda<int(int,int)> childId, Lambda<string(int)> label)
+move ITreeView treeView(Lambda<int(int)> childCount, Lambda<int(int,int)> childId, Lambda<string(int)> label)
 {
     TreeView* t = new TreeView();
     t.childCount = childCount;
@@ -3606,7 +3656,7 @@ TreeView* treeView(Lambda<int(int)> childCount, Lambda<int(int,int)> childId, La
     return t;
 }
 
-SplitView* splitView(int ratio, bool vertical)
+move ISplitView splitView(int ratio, bool vertical)
 {
     SplitView* s = new SplitView();
     s.ratio = ratio;
@@ -3616,7 +3666,7 @@ SplitView* splitView(int ratio, bool vertical)
 
 // A toolbar is a styled row of Buttons - no new native control. This factory is
 // the documented pattern: a DIR_ROW View with a small gap. Icons arrive with Image.
-View* toolbar()
+move IView toolbar()
 {
     View* v = new View();
     v.style.flexDirection = DIR_ROW;
@@ -3663,7 +3713,7 @@ class Image : IImage
     }
 
     // ICanvas fallback: a bordered box with the alt text (a char grid has no bitmap).
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         cv.drawRect(this.bounds, false, pickColor(0, ctx.theme.panelBorder));
         string t = this.altText.length() > 0 ? this.altText : "[img]";
@@ -3671,7 +3721,7 @@ class Image : IImage
                     pickColor(0, ctx.theme.textColor));
     }
 
-    bool dispatch(Event e, UiContext* ctx) { return false; }
+    bool dispatch(Event e, IUiContext ctx) { return false; }
     void destroyTree() { }
     int kind() { return ELEM_IMAGE; }
     int flexWeight() { return 0; }
@@ -3689,7 +3739,7 @@ class Image : IImage
 };
 
 // An image bound to a borrowed BGRA32 buffer (top-down, stride = pxW*4).
-Image* image(u64 pixels, int pxW, int pxH)
+move IImage image(u64 pixels, int pxW, int pxH)
 {
     Image* im = new Image();
     im.pixels = pixels;
@@ -3740,7 +3790,7 @@ class GroupBox : IGroupBox
         return sz;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         cv.drawRect(this.bounds, false, pickColor(this.style.color, ctx.theme.panelBorder));
         cv.drawText(this.bounds.x + 2, this.bounds.y, this.title.data(),
@@ -3748,7 +3798,7 @@ class GroupBox : IGroupBox
         for (IElement c in this.children) c.paint(cv, ctx);
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         for (IElement c in this.children) { if (c.dispatch(e, ctx)) return true; }
         return false;
@@ -3787,7 +3837,7 @@ class GroupBox : IGroupBox
 };
 
 // A titled group frame sized to style.width x style.height (add children with .add()).
-GroupBox* groupBox(string title, Style style)
+move IGroupBox groupBox(string title, Style style)
 {
     GroupBox* g = new GroupBox();
     g.title = title;
@@ -3826,9 +3876,9 @@ class CanvasView : ICanvasView
     }
 
     // ICanvas fallback: the host IS a ICanvas, so delegate straight to the app's painter.
-    void paint(ICanvas cv, UiContext* ctx) { this.onPaint(cv); }
+    void paint(ICanvas cv, IUiContext ctx) { this.onPaint(cv); }
 
-    bool dispatch(Event e, UiContext* ctx) { return false; }
+    bool dispatch(Event e, IUiContext ctx) { return false; }
     void destroyTree() { }
     int kind() { return ELEM_CANVAS; }
     int flexWeight() { return 0; }
@@ -3841,7 +3891,7 @@ class CanvasView : ICanvasView
 };
 
 // A canvas view driven by an onPaint(ICanvas) closure.
-CanvasView* canvasView(Lambda<void(ICanvas)> onPaint)
+move ICanvasView canvasView(Lambda<void(ICanvas)> onPaint)
 {
     CanvasView* c = new CanvasView();
     c.onPaint = onPaint;
@@ -3881,7 +3931,7 @@ void __uiFreeCanvasBox(u64 boxPtr)
 // Move focus to the next (or previous, when backward) focusable node in tree
 // order, wrapping around. Built fresh from the live tree each time, so it tracks
 // keyed identity across re-renders. The host calls this on Tab / Shift-Tab.
-void moveFocus(IElement tree, UiContext* ctx, bool backward)
+void moveFocus(IElement tree, IUiContext ctx, bool backward)
 {
     list<string> keys = default;
     tree.collectFocusables(&keys);
@@ -4097,7 +4147,7 @@ move IElement reconcilePath(move IElement committed, move IElement wip, list<Pat
 // keeps the framework free of process-global mutable state.
 interface IComponent
 {
-    IElement render(UiContext* ctx);
+    IElement render(IUiContext ctx);
 };
 
 // -- ComponentElement: a reconciler node wrapping a component's rendered subtree -
@@ -4135,13 +4185,13 @@ class ComponentElement : IElement
         return total;
     }
 
-    void paint(ICanvas cv, UiContext* ctx)
+    void paint(ICanvas cv, IUiContext ctx)
     {
         for (IElement c in this.inner)
             c.paint(cv, ctx);
     }
 
-    bool dispatch(Event e, UiContext* ctx)
+    bool dispatch(Event e, IUiContext ctx)
     {
         for (IElement c in this.inner)
         {
@@ -4186,7 +4236,9 @@ class ComponentElement : IElement
 // component itself is owned by the caller (typically a parent component holding
 // its children by pointer); mount only renders it, it does not take ownership.
 // The UiContext threads through so the child's event closures can invalidate.
-ComponentElement* mount(IComponent c, string key, UiContext* ctx)
+// Returns `move IElement`: ComponentElement deliberately has no interface of its own
+// (nothing reaches a field of it), and IElement is the only contract a caller needs.
+move IElement mount(IComponent c, string key, IUiContext ctx)
 {
     ComponentElement* ce = new ComponentElement();
     ce.setKey(key);

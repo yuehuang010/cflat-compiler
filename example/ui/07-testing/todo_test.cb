@@ -23,12 +23,12 @@ extern int main(int argc, char** argv)
     UiTestSuite s = uiTestSuite("todo");
 
     // Every case launches its OWN fresh invisible window (the runner tears it down after),
-    // so cases are independent. A case body gets a UiTest* and drives the window through the
+    // so cases are independent. A case body gets an IUiTest and drives the window through the
     // facade (click/type/select + expect*); the runner records the result and sets the exit code.
 
     // 1. A freshly launched app: all keyed controls exist, the list is empty, and the two
     //    action buttons are disabled until there is something to act on.
-    s.test("initial state", (UiTest* t) =>
+    s.test("initial state", (IUiTest t) =>
     {
         t.launch(new TodoApp(), 44, 34);
         t.requireTrue("controls created",
@@ -42,7 +42,7 @@ extern int main(int argc, char** argv)
 
     // 2. Type a task, watch Add enable, click it, and the task lands in the list while the
     //    field clears and the status updates - the full add flow, read back through controls.
-    s.test("add a task", (UiTest* t) =>
+    s.test("add a task", (IUiTest t) =>
     {
         t.launch(new TodoApp(), 44, 34);
         t.expectTrue("add disabled when empty", t.isDisabled("root/add"));
@@ -56,7 +56,7 @@ extern int main(int argc, char** argv)
     });
 
     // 3. Add three tasks and confirm the virtualized list reports each row's cell text.
-    s.test("add several tasks", (UiTest* t) =>
+    s.test("add several tasks", (IUiTest t) =>
     {
         t.launch(new TodoApp(), 44, 34);
         t.type("root/newitem", "alpha"); t.click("root/add");
@@ -70,7 +70,7 @@ extern int main(int argc, char** argv)
 
     // 4. List interaction: select a row (Delete enables), delete it, then double-click
     //    (activate) another row to complete it - selection + delete + activate drivers.
-    s.test("select, delete, and complete", (UiTest* t) =>
+    s.test("select, delete, and complete", (IUiTest t) =>
     {
         t.launch(new TodoApp(), 44, 34);
         t.type("root/newitem", "one");   t.click("root/add");
@@ -92,7 +92,7 @@ extern int main(int argc, char** argv)
     //    ctx.post. The list is empty until the posted closure runs on the UI thread, so the
     //    test WAITS - waitUntil pumps posted work between polls. This is the ONLY place a
     //    wait is correct; every other assertion above is synchronous (drivers route inline).
-    s.test("background load lands via ctx.post", (UiTest* t) =>
+    s.test("background load lands via ctx.post", (IUiTest t) =>
     {
         t.launch(new TodoApp(), 44, 34);
         TodoApp* g = activeApp() as TodoApp;
@@ -105,7 +105,7 @@ extern int main(int argc, char** argv)
 
     // 6. A hardening kit: flip the theme many times and assert the host titlebar theme stays
     //    in lockstep with the model after every reconcile (a soak the kits generalize for you).
-    s.test("theme storm hardening kit", (UiTest* t) =>
+    s.test("theme storm hardening kit", (IUiTest t) =>
     {
         t.launch(new TodoApp(), 44, 34);
         TodoApp* g = activeApp() as TodoApp;

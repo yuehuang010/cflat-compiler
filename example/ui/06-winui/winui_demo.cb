@@ -18,27 +18,27 @@ class WinuiDemo : IComponent
     int  count   = 0;
     bool enabled = false;
 
-    IElement render(UiContext* ctx)
+    IElement render(IUiContext ctx)
     {
-        Box* root = box(makeStyle(1, hostWidth(), hostHeight()));
+        IBox root = box(makeStyle(1, hostWidth(), hostHeight()));
         root.style.gap = 1;
         root.setKey("root");
 
-        Text* title = text("WinUI 3 (native) demo");
+        IText title = text("WinUI 3 (native) demo");
         title.setKey("title");
         root.add(title);
 
-        Checkbox* en = checkbox("Enable", this.enabled,
+        ICheckbox en = checkbox("Enable", this.enabled,
                                 (bool v) => { this.enabled = v; ctx.invalidate(); });
         en.setKey("en");
         root.add(en);
 
-        Button* inc = button("Increment", () => { this.count = this.count + 1; ctx.invalidate(); });
+        IButton inc = button("Increment", () => { this.count = this.count + 1; ctx.invalidate(); });
         inc.setKey("inc");
         inc.disabled = !this.enabled;
         root.add(inc);
 
-        Text* status = text("Count: " + this.count.toString());
+        IText status = text("Count: " + this.count.toString());
         status.setKey("status");
         root.add(status);
         return root;

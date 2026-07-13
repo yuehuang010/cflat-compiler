@@ -143,7 +143,7 @@ class Editor : IComponent
 
     // Switch the active tab (TabControl onSelectTab): park the outgoing buffer, load the
     // incoming one. This is what preserves each tab's text across switches.
-    void switchTab(int idx, UiContext* ctx)
+    void switchTab(int idx, IUiContext ctx)
     {
         if (idx == this.activeTab || idx < 0 || idx >= this.tabPaths.count()) return;
         this._saveActiveToModel();
@@ -152,7 +152,7 @@ class Editor : IComponent
         ctx.invalidate();
     }
 
-    void _addTab(string path, string content, UiContext* ctx)
+    void _addTab(string path, string content, IUiContext ctx)
     {
         this._saveActiveToModel();
         this.tabPaths.add("" + path);
@@ -165,11 +165,11 @@ class Editor : IComponent
     }
 
     // Open a new (untitled) tab and make it active.
-    void newTab(UiContext* ctx) { this._addTab("", "", ctx); }
+    void newTab(IUiContext ctx) { this._addTab("", "", ctx); }
 
     // Open a file tree node into a NEW tab (its content flows into the editor). Bind the
     // fs* results to named locals so no owned-string temp is passed straight as an arg.
-    void openFileNode(int nid, UiContext* ctx)
+    void openFileNode(int nid, IUiContext ctx)
     {
         string p = fsLabel(nid);
         string c = fsContent(nid);
@@ -177,7 +177,7 @@ class Editor : IComponent
     }
 
     // Tree selection: a file node opens into a tab; a folder just updates selection.
-    void onTreeSelect(int nid, UiContext* ctx)
+    void onTreeSelect(int nid, IUiContext ctx)
     {
         this.treeSel = nid;
         if (fsIsFile(nid)) this.openFileNode(nid, ctx);
@@ -186,7 +186,7 @@ class Editor : IComponent
 
     // Authored partly in the <Tag/> sugar (P6.5); tabs/tree are dynamic so they are
     // built imperatively (sugar children are static by design).
-    IElement render(UiContext* ctx)
+    IElement render(IUiContext ctx)
     {
         ctx.theme = this.isDark ? darkTheme() : lightTheme();
         this._ensureTabs();
@@ -200,10 +200,10 @@ class Editor : IComponent
 
         int splitH = hostHeight() - (this.findOpen ? 4 : 3); if (splitH < 4) splitH = 4;
 
-        Box* root = <Box key="root" style={makeStyle(0, hostWidth(), hostHeight())} />;
+        IBox root = <Box key="root" style={makeStyle(0, hostWidth(), hostHeight())} />;
 
         // Toolbar: a styled row of Buttons (P9 pattern - no new native control).
-        View* tb = toolbar();
+        IView tb = toolbar();
         tb.setKey("tb");
         tb.add(button("New",  () => { this.onCommand(CMD_NEW, ctx); }));
         tb.add(button("Open", () => { this.onCommand(CMD_OPEN, ctx); }));
@@ -225,14 +225,14 @@ class Editor : IComponent
 
         // Split: file-tree sidebar | (tab strip + editor). The panes are plain column
         // Views (not native-mapped); their leaf controls carry the native handles.
-        SplitView* split = splitView(this.splitRatio, true);
+        ISplitView split = splitView(this.splitRatio, true);
         split.setKey("split");
         split.style.width = hostWidth(); split.style.height = splitH;
         split.onRatioChange = (int r) => { this.splitRatio = r; ctx.invalidate(); };
 
-        View* side = column(makeStyle(0, 0, 0));
+        IView side = column(makeStyle(0, 0, 0));
         side.setKey("side");
-        TreeView* tree = <TreeView key="tree" width={100} height={splitH - 1}
+        ITreeView tree = <TreeView key="tree" width={100} height={splitH - 1}
                 selectedNode={this.treeSel}
                 onSelect={(int nid) => { this.onTreeSelect(nid, ctx); }}
                 onExpand={(int nid) => { }} />;
@@ -243,12 +243,12 @@ class Editor : IComponent
         side.add(tree);
         split.add(side);
 
-        View* main = column(makeStyle(0, 0, 0));
+        IView main = column(makeStyle(0, 0, 0));
         main.setKey("main");
 
         // Document tabs: one TabPane per open doc (empty panes - the shared editor below
         // shows the active doc). selectedTab is controlled; switching saves/loads buffers.
-        TabControl* tabs = tabControl(this.activeTab, (int i) => { this.switchTab(i, ctx); });
+        ITabControl tabs = tabControl(this.activeTab, (int i) => { this.switchTab(i, ctx); });
         tabs.setKey("tabs");
         tabs.width = 100; tabs.height = 3;
         int ti = 0;
@@ -256,9 +256,9 @@ class Editor : IComponent
         {
             string tp = this.tabPaths.get(ti);
             string title = tp.length() > 0 ? baseName(tp) : "untitled";
-            TabPane* p = tabPane(title);
+            ITabPane p = tabPane(title);
             p.setKey("d" + ti.toString());
-            tabs.addPane(p);
+            tabs.add(p);
             ti++;
         }
         main.add(tabs);
@@ -266,7 +266,7 @@ class Editor : IComponent
         // The shared editor (uncontrolled native EDIT). Its key is stable across renders
         // and tab switches, so the native buffer is reused; content flows via
         // nativeSetControlText (tab switch / file open), never pushed by render.
-        TextArea* ed = <TextArea key="editor" value="" onChange={() => { this.markDirty(ctx); }}
+        ITextArea ed = <TextArea key="editor" value="" onChange={() => { this.markDirty(ctx); }}
                                  width={100} height={splitH - 4} />;
         ed.tooltip = "Editor - type your text here";
         main.add(ed);
@@ -278,7 +278,7 @@ class Editor : IComponent
         string star = this.dirty ? " *" : "";
         int tabNo = this.activeTab + 1;
         int tabN  = this.tabPaths.count();
-        StatusBar* sb = statusBar("fedit   |   " + name + star
+        IStatusBar sb = statusBar("fedit   |   " + name + star
             + "   |   tab " + tabNo.toString() + "/" + tabN.toString());
         sb.addPart(this.isDark ? "dark" : "light");
         sb.setKey("status");
@@ -286,13 +286,13 @@ class Editor : IComponent
         return root;
     }
 
-    void markDirty(UiContext* ctx)
+    void markDirty(IUiContext ctx)
     {
         if (!this.dirty) { this.dirty = true; ctx.invalidate(); }
     }
 
     // Load a file into the active tab's editor (push into the native buffer; not dirty).
-    void loadPath(string p, UiContext* ctx)
+    void loadPath(string p, IUiContext ctx)
     {
         string content = File.readAllText(p);
         nativeSetControlText(EDITOR_KEY, content);
@@ -308,14 +308,14 @@ class Editor : IComponent
         return File.writeAllText(p, content);
     }
 
-    void doSave(UiContext* ctx)
+    void doSave(IUiContext ctx)
     {
         if (this.path.length() == 0) { this.doSaveAs(ctx); return; }
         if (this.saveTo(this.path)) { this.dirty = false; ctx.invalidate(); }
         else nativeInfo("fedit", "Could not write the file.");
     }
 
-    void doSaveAs(UiContext* ctx)
+    void doSaveAs(IUiContext ctx)
     {
         string p = nativeSaveFile();
         if (p.length() == 0) return;
@@ -323,7 +323,7 @@ class Editor : IComponent
         else nativeInfo("fedit", "Could not write the file.");
     }
 
-    bool confirmDiscard(UiContext* ctx)
+    bool confirmDiscard(IUiContext ctx)
     {
         if (!this.dirty) return true;
         int r = nativeConfirm("fedit", "You have unsaved changes. Save them?");
@@ -349,7 +349,7 @@ class Editor : IComponent
         nativeSelect(EDITOR_KEY, pos, end);
     }
 
-    void onCommand(int id, UiContext* ctx)
+    void onCommand(int id, IUiContext ctx)
     {
         if (id == CMD_NEW || id == CMD_NEWTAB) this.newTab(ctx);
         else if (id == CMD_OPEN)
@@ -442,10 +442,13 @@ bool editorHas(const char* sub)
 
 int _postRan = 0;
 u64 _postRanTid = 0u;
+// The worker reads the context off a file-scope slot rather than the thread's `void* arg`:
+// IUiContext is a FAT pointer and cannot ride a single-word payload. The slot is set from
+// activeCtx() before start() and is a borrow of the host's one long-lived UiContext.
+IUiContext _postCtx = default;
 int _postWorker(void* arg)
 {
-    UiContext* c = (UiContext*)arg;
-    c.post(() => { _postRan = _postRan + 1; _postRanTid = (u64)os.thread_current_id(); });
+    _postCtx.post(() => { _postRan = _postRan + 1; _postRanTid = (u64)os.thread_current_id(); });
     return 0;
 }
 
@@ -462,7 +465,7 @@ int feditSelfTest()
     // statusbar readback -> sugar authoring (the steps build on each other). setupMenu +
     // wireHandlers run per case BEFORE the launch: nativeTeardownForTest clears the menu model
     // and the command/close handlers, so a later case must re-establish them for menu routing.
-    s.test("open / edit / save / find / statusbar / sugar", (UiTest* t) =>
+    s.test("open / edit / save / find / statusbar / sugar", (IUiTest t) =>
     {
         setupMenu();
         wireHandlers();
@@ -510,7 +513,7 @@ int feditSelfTest()
         t.expectTrue("statusbar readback", _has(stat, "fedit"));
 
         // 8. StatusBar authored via the <Tag/> sugar (host-agnostic element check).
-        StatusBar* sbx = <StatusBar key="sbx" />;
+        IStatusBar sbx = <StatusBar key="sbx" />;
         sbx.addPart("ready");
         bool sugarOk = sbx.kind() == ELEM_STATUSBAR && sbx.parts.count() == 1;
         sbx.destroyTree(); delete sbx;
@@ -520,7 +523,7 @@ int feditSelfTest()
     // -- P9 nav suite (runs on BOTH hosts) -------------------------------------
     // The Win32 and Cocoa hosts are both genuinely multi-window, so the "New Window"
     // assertion and the whole nav/data driver surface exercise on macOS too.
-    s.test("tabs / tree / split / context / multi-window / post", (UiTest* t) =>
+    s.test("tabs / tree / split / context / multi-window / post", (IUiTest t) =>
     {
         setupMenu();
         wireHandlers();
@@ -569,9 +572,9 @@ int feditSelfTest()
 
         // 14. ctx.post() round-trip from a worker thread (marshaled, runs on the UI thread).
         u64 mainTid = (u64)os.thread_current_id();
-        UiContext* c2 = activeCtx();
+        _postCtx = activeCtx();
         Thread th;
-        th.start(_postWorker, c2);
+        th.start(_postWorker, nullptr);
         th.join();
         bool queuedNotRun = _postRan == 0;
         hostDrainPosted();

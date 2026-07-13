@@ -23,45 +23,45 @@ class NativeSettings : IComponent
     int    clicks   = 0;
     string name     = default;
 
-    IElement render(UiContext* ctx)
+    IElement render(IUiContext ctx)
     {
         // Declare the styling preference; the native host reads it to theme the
         // window (dark vs aqua appearance).
         ctx.theme = this.darkMode ? darkTheme() : lightTheme();
 
-        Box* root = box(makeStyle(1, hostWidth(), hostHeight()));
+        IBox root = box(makeStyle(1, hostWidth(), hostHeight()));
         root.style.gap = 1;
         root.setKey("root");
 
-        Text* title = text("Settings (native controls)");
+        IText title = text("Settings (native controls)");
         title.setKey("title");
         root.add(title);
 
-        TextInput* nm = textInput(this.name, (string v) => { this.name = v; ctx.invalidate(); });
+        ITextInput nm = textInput(this.name, (string v) => { this.name = v; ctx.invalidate(); });
         nm.width = 24;
         nm.placeholder = "your name";
         nm.setKey("name");
         root.add(nm);
 
-        Checkbox* dark = checkbox("Dark mode", this.darkMode,
+        ICheckbox dark = checkbox("Dark mode", this.darkMode,
                                   (bool v) => { this.darkMode = v; ctx.invalidate(); });
         dark.setKey("dark");
         root.add(dark);
 
-        Checkbox* au = checkbox("Auto-save", this.autoSave,
+        ICheckbox au = checkbox("Auto-save", this.autoSave,
                                 (bool v) => { this.autoSave = v; ctx.invalidate(); });
         au.setKey("auto");
         root.add(au);
 
-        Slider* vol = slider(this.volume, 26, (int v) => { this.volume = v; ctx.invalidate(); });
+        ISlider vol = slider(this.volume, 26, (int v) => { this.volume = v; ctx.invalidate(); });
         vol.setKey("vol");
         root.add(vol);
 
-        ProgressBar* pb = progressBar(this.volume, 26);
+        IProgressBar pb = progressBar(this.volume, 26);
         pb.setKey("pb");
         root.add(pb);
 
-        Button* save = button("Save", () => { this.clicks = this.clicks + 1; ctx.invalidate(); });
+        IButton save = button("Save", () => { this.clicks = this.clicks + 1; ctx.invalidate(); });
         save.setKey("save");
         save.disabled = !this.autoSave;
         root.add(save);
@@ -69,7 +69,7 @@ class NativeSettings : IComponent
         // Status echoes both the click count and the name, so the self-test can
         // verify button + edit routing end-to-end through a separate control.
         string who = this.name.length() > 0 ? this.name : "-";
-        Text* status = text("Clicks: " + this.clicks.toString() + " / " + who);
+        IText status = text("Clicks: " + this.clicks.toString() + " / " + who);
         status.setKey("status");
         root.add(status);
         return root;

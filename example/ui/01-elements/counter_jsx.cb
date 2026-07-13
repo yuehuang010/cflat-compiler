@@ -14,7 +14,7 @@ class CounterJsx : IComponent
 {
     int count = 0;
 
-    IElement render(UiContext* ctx)
+    IElement render(IUiContext ctx)
     {
         // An owned-string expression (the interpolated label) used directly as a child
         // attribute alongside a sibling capturing closure is leak-clean: the intermediate
@@ -31,7 +31,7 @@ class CounterJsx : IComponent
 // The exact tree the sugar above desugars to, built with explicit constructors.
 IElement buildManual(int count)
 {
-    View* root = view(makeStyle(16, 0, 0));
+    IView root = view(makeStyle(16, 0, 0));
     root.add(text("Count: " + count.toString()));
     root.add(button("+1", () => { }));
     return root;

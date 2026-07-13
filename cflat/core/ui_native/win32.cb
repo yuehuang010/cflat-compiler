@@ -309,27 +309,13 @@ bool nativeMappable(int kind)
         || kind == ELEM_IMAGE || kind == ELEM_GROUPBOX || kind == ELEM_CANVAS;
 }
 
-// The concrete tooltip text a mappable node carries ("" = none). Read via downcast so
-// the IElement interface stays unchanged; every mappable class exposes a `tooltip` field.
+// The concrete tooltip text a mappable node carries ("" = none). Every tooltip-bearing
+// class implements ITooltipped, so one downcast answers for all 15 of them.
 string tooltipOf(IElement node)
 {
-    int k = node.kind();
-    if (k == ELEM_BUTTON)    { Button* b = node as Button; return "" + b.tooltip; }
-    if (k == ELEM_TEXT)      { Text* t = node as Text; return "" + t.tooltip; }
-    if (k == ELEM_TEXTINPUT) { TextInput* t = node as TextInput; return "" + t.tooltip; }
-    if (k == ELEM_CHECKBOX)  { Checkbox* c = node as Checkbox; return "" + c.tooltip; }
-    if (k == ELEM_PROGRESS)  { ProgressBar* p = node as ProgressBar; return "" + p.tooltip; }
-    if (k == ELEM_SLIDER)    { Slider* s = node as Slider; return "" + s.tooltip; }
-    if (k == ELEM_TEXTAREA)  { TextArea* a = node as TextArea; return "" + a.tooltip; }
-    if (k == ELEM_RADIO)     { RadioButton* r = node as RadioButton; return "" + r.tooltip; }
-    if (k == ELEM_COMBO)     { ComboBox* c = node as ComboBox; return "" + c.tooltip; }
-    if (k == ELEM_LIST)      { ListView* l = node as ListView; return "" + l.tooltip; }
-    if (k == ELEM_TABS)      { TabControl* t = node as TabControl; return "" + t.tooltip; }
-    if (k == ELEM_TREE)      { TreeView* t = node as TreeView; return "" + t.tooltip; }
-    if (k == ELEM_IMAGE)     { Image* im = node as Image; return "" + im.tooltip; }
-    if (k == ELEM_GROUPBOX)  { GroupBox* g = node as GroupBox; return "" + g.tooltip; }
-    if (k == ELEM_CANVAS)    { CanvasView* c = node as CanvasView; return "" + c.tooltip; }
-    return "";
+    ITooltipped t = node as ITooltipped;
+    if (t == nullptr) return "";
+    return "" + t.tooltip;
 }
 
 // Accessibility: kinds whose window text is NOT their visible content, so they expose no
@@ -912,7 +898,7 @@ class Window : INativeHost
     }
 
     // Rebuild a tab strip when its pane count changes, then set the controlled selection.
-    void _syncTabs(u64 h, TabControl* tc)
+    void _syncTabs(u64 h, ITabControl tc)
     {
         void* ctrl = u2h(h);
         int have = (int)SendMessageA(ctrl, (u32)TCM_GETITEMCOUNT, 0u, (i64)0);
@@ -1058,7 +1044,7 @@ class Window : INativeHost
     // Reconcile the IElement tree to native controls: ensure a control per mappable
     // node (create on first sight, reuse by key path), sync its props, collect its
     // frame, then batch-position everything and destroy controls that left the tree.
-    void applyTree(IElement tree, UiContext* ctx)
+    void applyTree(IElement tree, IUiContext ctx)
     {
         this.applying = true;
 
@@ -1127,7 +1113,7 @@ class Window : INativeHost
     // Recursive worker: `path` is this node's key path. Mappable nodes get a
     // control + synced props + a collected frame; every node recurses into its
     // children (containers contribute only geometry).
-    void _applyNode(IElement node, string path, UiContext* ctx,
+    void _applyNode(IElement node, string path, IUiContext ctx,
                     list<string>* keys, list<u64>* handles,
                     list<int>* fx, list<int>* fy, list<int>* fw, list<int>* fh)
     {
@@ -1142,7 +1128,7 @@ class Window : INativeHost
                 // the native EDIT owns the text, further pushes are explicit).
                 if (node.kind() == ELEM_TEXTAREA)
                 {
-                    TextArea* ta = node as TextArea;
+                    ITextArea ta = node as ITextArea;
                     this.setText(h, ta.value.data());
                 }
                 else if (node.kind() == ELEM_LIST)
@@ -1151,7 +1137,7 @@ class Window : INativeHost
                     // callback box (captures the component pointer, so it reads live
                     // state across renders - no per-frame re-box). Rows/selection are
                     // pushed every frame in _syncProps.
-                    ListView* lv = node as ListView;
+                    IListView lv = node as IListView;
                     this.setListOp(h, LISTOP_RESET_COLUMNS, 0, 0, "", 0u);
                     int ci = 0;
                     while (ci < lv.columns.count())
@@ -1170,7 +1156,7 @@ class Window : INativeHost
                 {
                     // Mark the first radio of a group as its WS_GROUP boundary so Win32
                     // auto-exclusivity is scoped correctly with multiple groups.
-                    RadioButton* rb = node as RadioButton;
+                    IRadioButton rb = node as IRadioButton;
                     if (rb.groupFirst)
                     {
                         i64 st = GetWindowLongPtrA(u2h(h), (int)GWL_STYLE);
@@ -1182,7 +1168,7 @@ class Window : INativeHost
                     // One-time TreeView setup: box the node-source callbacks (they capture
                     // the component pointer, so they read live state across renders) and
                     // build the root's children lazily. Rows expand on demand thereafter.
-                    TreeView* tv = node as TreeView;
+                    ITreeView tv = node as ITreeView;
                     this.setListOp(h, LISTOP_TREE_SET_SRC_CB, 0, 0, "",
                                    (u64)_boxTree(tv.childCount, tv.childId, tv.label));
                     this.setListOp(h, LISTOP_TREE_REBUILD, 0, 0, "", 0u);
@@ -1192,7 +1178,7 @@ class Window : INativeHost
                     // One-time CanvasView setup: box the onPaint closure (captures the
                     // component, so it reads live state across renders) and stash it in the
                     // child's USERDATA so CanvasChildProc reaches it on WM_PAINT.
-                    CanvasView* cvw = node as CanvasView;
+                    ICanvasView cvw = node as ICanvasView;
                     u64 box = (u64)_boxCanvas(cvw.onPaint);
                     this._setCanvasBox(h, box);
                     SetWindowLongPtrA(u2h(h), (int)GWLP_USERDATA, (i64)box);
@@ -1227,7 +1213,7 @@ class Window : INativeHost
         // tabs). Every other container recurses into all children; leaves have none.
         if (node.kind() == ELEM_TABS)
         {
-            TabControl* tc = node as TabControl;
+            ITabControl tc = node as ITabControl;
             list<IElement>* panes = node.childList();
             int sel = tc.selectedTab;
             if (panes != nullptr && sel >= 0 && sel < panes.count())
@@ -1254,7 +1240,7 @@ class Window : INativeHost
     }
 
     // Set a status bar's part text (single pane spanning the strip).
-    void _syncStatusBar(u64 h, StatusBar* sb)
+    void _syncStatusBar(u64 h, IStatusBar sb)
     {
         int rightEdge = -1;   // one part filling the whole width
         SendMessageA(u2h(h), (u32)SB_SETPARTS, 1u, (i64)&rightEdge);
@@ -1269,14 +1255,14 @@ class Window : INativeHost
         SendMessageA(u2h(h), (u32)SB_SETTEXTA, 0u, (i64)joined.data());
     }
 
-    // Push a node's current props onto its control (downcast per kind - the same
-    // structured access the reconciler uses in propsEqual).
+    // Push a node's current props onto its control (one interface downcast per kind -
+    // the same structured access the reconciler uses in propsEqual).
     void _syncProps(IElement node, u64 h)
     {
         int k = node.kind();
         if (k == ELEM_BUTTON)
         {
-            Button* b = node as Button;
+            IButton b = node as IButton;
             this.setText(h, b.title.data());
             this.setBoolProp(h, PROP_ENABLED, !b.disabled);
             // Accent-fill via NM_CUSTOMDRAW: a themed button gets its accent colors;
@@ -1287,31 +1273,31 @@ class Window : INativeHost
         }
         else if (k == ELEM_TEXT)
         {
-            Text* t = node as Text;
+            IText t = node as IText;
             this.setText(h, t.text.data());
         }
         else if (k == ELEM_TEXTINPUT)
         {
-            TextInput* ti = node as TextInput;
+            ITextInput ti = node as ITextInput;
             this.setText(h, ti.value.data());
             this.setBoolProp(h, PROP_ENABLED, !ti.disabled);
         }
         else if (k == ELEM_CHECKBOX)
         {
-            Checkbox* c = node as Checkbox;
+            ICheckbox c = node as ICheckbox;
             this.setText(h, c.label.data());
             this.setBoolProp(h, PROP_CHECKED, c.checked);
             this.setBoolProp(h, PROP_ENABLED, !c.disabled);
         }
         else if (k == ELEM_PROGRESS)
         {
-            ProgressBar* p = node as ProgressBar;
+            IProgressBar p = node as IProgressBar;
             this.setIntProp(h, PROP_MAX, 100);
             this.setIntProp(h, PROP_VALUE, p.value);
         }
         else if (k == ELEM_SLIDER)
         {
-            Slider* s = node as Slider;
+            ISlider s = node as ISlider;
             this.setIntProp(h, PROP_MAX, 100);
             this.setIntProp(h, PROP_VALUE, s.value);
             this.setBoolProp(h, PROP_ENABLED, !s.disabled);
@@ -1321,24 +1307,24 @@ class Window : INativeHost
             // Uncontrolled: never push text here (would clobber the buffer mid-edit);
             // only sync the enabled state. Text is seeded once at creation and
             // pushed explicitly via nativeSetControlText (file open).
-            TextArea* ta = node as TextArea;
+            ITextArea ta = node as ITextArea;
             this.setBoolProp(h, PROP_ENABLED, !ta.disabled);
         }
         else if (k == ELEM_STATUSBAR)
         {
-            StatusBar* sb = node as StatusBar;
+            IStatusBar sb = node as IStatusBar;
             this._syncStatusBar(h, sb);
         }
         else if (k == ELEM_RADIO)
         {
-            RadioButton* rb = node as RadioButton;
+            IRadioButton rb = node as IRadioButton;
             this.setText(h, rb.label.data());
             this.setBoolProp(h, PROP_CHECKED, rb.checked);
             this.setBoolProp(h, PROP_ENABLED, !rb.disabled);
         }
         else if (k == ELEM_COMBO)
         {
-            ComboBox* cb = node as ComboBox;
+            IComboBox cb = node as IComboBox;
             this._syncCombo(h, cb);
             this.setBoolProp(h, PROP_ENABLED, !cb.disabled);
         }
@@ -1346,7 +1332,7 @@ class Window : INativeHost
         {
             // Virtualized: push row count + controlled selection, then repaint. Cell
             // text is pulled on demand via the boxed rowText callback (LVN_GETDISPINFO).
-            ListView* lv = node as ListView;
+            IListView lv = node as IListView;
             this.setListOp(h, LISTOP_SET_ROWCOUNT, lv.rowCount, 0, "", 0u);
             this.setListOp(h, LISTOP_SET_SELECTION, lv.selectedIndex, 0, "", 0u);
             this.setListOp(h, LISTOP_INVALIDATE, 0, 0, "", 0u);
@@ -1355,7 +1341,7 @@ class Window : INativeHost
         else if (k == ELEM_TABS)
         {
             // Rebuild the tab strip on a pane-count change, then push the controlled tab.
-            TabControl* tc = node as TabControl;
+            ITabControl tc = node as ITabControl;
             this._syncTabs(h, tc);
             this.setBoolProp(h, PROP_ENABLED, !tc.disabled);
         }
@@ -1364,7 +1350,7 @@ class Window : INativeHost
             // Expand-on-demand: the root children were inserted once at creation; the
             // native control owns the tree state, so only the enabled flag is synced here
             // (selection round-trips through TVN_SELCHANGED, not a per-frame push).
-            TreeView* tv = node as TreeView;
+            ITreeView tv = node as ITreeView;
             this.setBoolProp(h, PROP_ENABLED, !tv.disabled);
         }
         else if (k == ELEM_IMAGE)
@@ -1372,7 +1358,7 @@ class Window : INativeHost
             // Upload the image once per distinct pixel buffer (or once from a .bmp source),
             // via the toolkit-neutral setImageData seam. A re-render with the same buffer
             // pointer is a no-op (the last-uploaded pointer is remembered per control).
-            Image* im = node as Image;
+            IImage im = node as IImage;
             if (im.pixels != 0u)
             {
                 if (im.pixels != this._imgLastPixels(h))
@@ -1389,7 +1375,7 @@ class Window : INativeHost
         }
         else if (k == ELEM_GROUPBOX)
         {
-            GroupBox* g = node as GroupBox;
+            IGroupBox g = node as IGroupBox;
             this.setText(h, g.title.data());
         }
         else if (k == ELEM_CANVAS)
@@ -1401,7 +1387,7 @@ class Window : INativeHost
 
     // Repopulate a combo only when its item set changed (count differs), then set the
     // controlled selection. Refilling every frame would reset the list mid-interaction.
-    void _syncCombo(u64 h, ComboBox* cb)
+    void _syncCombo(u64 h, IComboBox cb)
     {
         void* ctrl = u2h(h);
         int have = (int)SendMessageA(ctrl, (u32)CB_GETCOUNT, 0u, (i64)0);
@@ -1446,7 +1432,7 @@ class Window : INativeHost
     // Apply the app's Theme to the window chrome: immersive dark-mode titlebar,
     // themed control/window background + text colors (used by WM_CTLCOLOR* and
     // WM_ERASEBKGND). Called every frame from applyTree; cheap and idempotent.
-    void applyTheme(UiContext* ctx)
+    void applyTheme(IUiContext ctx)
     {
         int panel = pickColor(ctx.theme.panelBg, 0);
         int text  = pickColor(ctx.theme.textColor, 0);
@@ -1612,7 +1598,7 @@ class Window : INativeHost
     {
         if (node.kind() == ELEM_SPLIT)
         {
-            SplitView* sv = node as SplitView;
+            ISplitView sv = node as ISplitView;
             Rect d = sv.dividerBounds;
             int x0 = d.x * this.dipX(); int y0 = d.y * this.dipY();
             int x1 = x0 + d.w * this.dipX(); int y1 = y0 + d.h * this.dipY();
@@ -1785,7 +1771,7 @@ int findWindowIdx(void* hwnd)
 
 // Host-neutral accessors used by app code (mirrored by the Cocoa host). activeApp()
 // borrows the component (alias) so the window keeps ownership of it.
-UiContext*     activeCtx() { return &curWin().ctx; }
+IUiContext     activeCtx() { return &curWin().ctx; }
 alias IComponent activeApp() { return curWin().app; }
 bool           hostDark()  { if (!hasCurWin()) return false; return curWin().dark; }
 int hostWidth()  { return curWin().w; }
@@ -1889,21 +1875,21 @@ void routeClick(void* ctrl)
     if (key.length() == 0) return;
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
-    Button* b = e as Button;
+    IButton b = e as IButton;
     if (b != nullptr) { b.fireClick(); pumpNative(); return; }
-    Checkbox* c = e as Checkbox;
+    ICheckbox c = e as ICheckbox;
     if (c != nullptr) { c.fireToggle(); pumpNative(); return; }
     // A radio button routes to its enclosing RadioGroup (one key-path segment up),
     // which owns the controlled `value` + onChange.
-    RadioButton* rb = e as RadioButton;
+    IRadioButton rb = e as IRadioButton;
     if (rb != nullptr)
     {
         string pp = _parentPath(key);
         IElement pe = findByKey(wnd.tree, keySegment(wnd.tree, 0), pp);
         if (pe != nullptr)
         {
-            RadioGroup* g = pe as RadioGroup;
-            if (g != nullptr) { g.onChange(rb.index); pumpNative(); }
+            IRadioGroup g = pe as IRadioGroup;
+            if (g != nullptr) { g.fireChange(rb.index); pumpNative(); }
         }
     }
 }
@@ -1925,10 +1911,10 @@ void routeCombo(void* ctrl)
     if (key.length() == 0) return;
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
-    ComboBox* cb = e as ComboBox;
+    IComboBox cb = e as IComboBox;
     if (cb == nullptr) return;
     int sel = (int)SendMessageA(ctrl, (u32)CB_GETCURSEL, 0u, (i64)0);
-    if (sel >= 0) { cb.onChange(sel); pumpNative(); }
+    if (sel >= 0) { cb.fireChange(sel); pumpNative(); }
 }
 
 // -- ListView notifications (WM_NOTIFY) ---------------------------------------
@@ -1967,10 +1953,10 @@ void routeListSelect(void* hFrom)
     if (key.length() == 0) return;
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
-    ListView* lv = e as ListView;
+    IListView lv = e as IListView;
     if (lv == nullptr) return;
     int sel = _listSelectedRow(hFrom);
-    if (sel >= 0 && sel != lv.selectedIndex) { lv.onSelect(sel); pumpNative(); }
+    if (sel >= 0 && sel != lv.selectedIndex) { lv.fireSelect(sel); pumpNative(); }
 }
 
 void routeListActivate(void* hFrom)
@@ -1980,10 +1966,10 @@ void routeListActivate(void* hFrom)
     if (key.length() == 0) return;
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
-    ListView* lv = e as ListView;
+    IListView lv = e as IListView;
     if (lv == nullptr) return;
     int sel = _listSelectedRow(hFrom);
-    if (sel >= 0) { lv.onActivate(sel); pumpNative(); }
+    if (sel >= 0) { lv.fireActivate(sel); pumpNative(); }
 }
 
 // Dispatch a WM_NOTIFY from a child control. Returns true if we consumed it.
@@ -2034,10 +2020,10 @@ void routeTabChange(void* hFrom)
     if (key.length() == 0) return;
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
-    TabControl* tc = e as TabControl;
+    ITabControl tc = e as ITabControl;
     if (tc == nullptr) return;
     int sel = (int)SendMessageA(hFrom, (u32)TCM_GETCURSEL, 0u, (i64)0);
-    if (sel >= 0 && sel != tc.selectedTab) { tc.onSelectTab(sel); pumpNative(); }
+    if (sel >= 0 && sel != tc.selectedTab) { tc.fireSelectTab(sel); pumpNative(); }
 }
 
 // A tree selection change (TVN_SELCHANGED): read the newly-selected node's id, fire onSelect.
@@ -2051,10 +2037,10 @@ void routeTreeSelect(i64 lParam)
     if (key.length() == 0) return;
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
-    TreeView* tv = e as TreeView;
+    ITreeView tv = e as ITreeView;
     if (tv == nullptr) return;
     int nid = (int)_nmTreeItemNewParam(lParam);
-    if (nid != tv.selectedNode) { tv.onSelect(nid); pumpNative(); }
+    if (nid != tv.selectedNode) { tv.fireSelect(nid); pumpNative(); }
 }
 
 // A tree node is expanding (TVN_ITEMEXPANDING): materialize its children on demand, then
@@ -2070,9 +2056,9 @@ void routeTreeExpand(i64 lParam)
     if (key.length() == 0) return;
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
-    TreeView* tv = e as TreeView;
+    ITreeView tv = e as ITreeView;
     if (tv == nullptr) return;
-    tv.onExpand((int)_nmTreeItemNewParam(lParam));
+    tv.fireExpand((int)_nmTreeItemNewParam(lParam));
     pumpNative();
 }
 
@@ -2082,9 +2068,9 @@ void splitDragTo(Window* wnd, string key, int px, int py)
 {
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
-    SplitView* sv = e as SplitView;
+    ISplitView sv = e as ISplitView;
     if (sv == nullptr) return;
-    sv.onRatioChange(sv._ratioAt(px / wnd.dipX(), py / wnd.dipY()));
+    sv.fireRatioChange(sv._ratioAt(px / wnd.dipX(), py / wnd.dipY()));
     pumpNative();
 }
 
@@ -2139,22 +2125,22 @@ void routeEdit(void* ctrl)
     if (key.length() == 0) return;
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
-    TextInput* ti = e as TextInput;
+    ITextInput ti = e as ITextInput;
     if (ti != nullptr)
     {
         char[512] buf;
         GetWindowTextA(ctrl, buf, 512);
         string nv = (string)buf;
-        ti.onChangeText(nv);
+        ti.fireChangeText(nv);
         pumpNative();
         return;
     }
     // A TextArea is uncontrolled: EN_CHANGE is just a dirty NOTIFICATION; do not
     // read/push the (potentially large) buffer here.
-    TextArea* ta = e as TextArea;
+    ITextArea ta = e as ITextArea;
     if (ta != nullptr)
     {
-        ta.onChange();
+        ta.fireChange();
         pumpNative();
     }
 }
@@ -2211,9 +2197,9 @@ void nativeSplitterDrag(string keyPath, int dipX, int dipY)
     Window* wnd = curWin();
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), keyPath);
     if (e == nullptr) return;
-    SplitView* sv = e as SplitView;
+    ISplitView sv = e as ISplitView;
     if (sv == nullptr) return;
-    sv.onRatioChange(sv._ratioAt(dipX, dipY));
+    sv.fireRatioChange(sv._ratioAt(dipX, dipY));
     pumpNative();
 }
 
@@ -2300,7 +2286,7 @@ void routeSlider(void* ctrl)
     if (key.length() == 0) return;
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
-    Slider* s = e as Slider;
+    ISlider s = e as ISlider;
     if (s == nullptr) return;
     int pos = (int)SendMessageA(ctrl, (u32)TBM_GETPOS, 0u, (i64)0);
     s.fireSet(pos);

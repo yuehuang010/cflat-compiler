@@ -23,55 +23,55 @@ class SettingsApp : IComponent
     int    volume   = 60;
     string name     = default;
 
-    IElement render(UiContext* ctx)
+    IElement render(IUiContext ctx)
     {
         // The whole panel reskins by swapping the theme on the context.
         ctx.theme = this.darkMode ? darkTheme() : lightTheme();
 
-        Box* root = box(makeStyle(1, hostWidth(), hostHeight()));
+        IBox root = box(makeStyle(1, hostWidth(), hostHeight()));
         root.style.gap = 1;
         root.setKey("root");
 
-        Text* title = text("Settings");
+        IText title = text("Settings");
         title.setKey("title");
         root.add(title);
 
-        TextInput* nm = textInput(this.name, (string v) => { this.name = v; ctx.invalidate(); });
+        ITextInput nm = textInput(this.name, (string v) => { this.name = v; ctx.invalidate(); });
         nm.width = 24;
         nm.placeholder = "your name";
         nm.setKey("name");
         root.add(nm);
 
-        Checkbox* dark = checkbox("Dark mode", this.darkMode,
+        ICheckbox dark = checkbox("Dark mode", this.darkMode,
                                   (bool v) => { this.darkMode = v; ctx.invalidate(); });
         dark.setKey("dark");
         root.add(dark);
 
-        Checkbox* nt = checkbox("Notifications", this.notify,
+        ICheckbox nt = checkbox("Notifications", this.notify,
                                 (bool v) => { this.notify = v; ctx.invalidate(); });
         nt.setKey("notify");
         root.add(nt);
 
-        Checkbox* au = checkbox("Auto-save", this.autoSave,
+        ICheckbox au = checkbox("Auto-save", this.autoSave,
                                 (bool v) => { this.autoSave = v; ctx.invalidate(); });
         au.setKey("auto");
         root.add(au);
 
         // Volume slider + a progress bar mirroring its value.
-        Text* vlabel = text("Volume: " + this.volume.toString());
+        IText vlabel = text("Volume: " + this.volume.toString());
         vlabel.setKey("vlabel");
         root.add(vlabel);
 
-        Slider* vol = slider(this.volume, 26, (int v) => { this.volume = v; ctx.invalidate(); });
+        ISlider vol = slider(this.volume, 26, (int v) => { this.volume = v; ctx.invalidate(); });
         vol.setKey("vol");
         root.add(vol);
 
-        ProgressBar* pb = progressBar(this.volume, 26);
+        IProgressBar pb = progressBar(this.volume, 26);
         pb.setKey("pb");
         root.add(pb);
 
         // Disabled until Auto-save is enabled - demonstrates the disabled state.
-        Button* save = button("Save", () => { ctx.invalidate(); });
+        IButton save = button("Save", () => { ctx.invalidate(); });
         save.setKey("save");
         save.disabled = !this.autoSave;
         root.add(save);
@@ -79,7 +79,7 @@ class SettingsApp : IComponent
         bool named = this.name.length() > 0;
         string who = named ? this.name : "guest";
         string note = this.notify ? "  (notify on)" : "  (notify off)";
-        Text* status = text("Hello, " + who + note);
+        IText status = text("Hello, " + who + note);
         status.setKey("status");
         root.add(status);
 
@@ -88,7 +88,7 @@ class SettingsApp : IComponent
 };
 
 // Offscreen render of a built tree to a 24bpp BMP, mirroring win32_shot.cb.
-int saveTreeBmp(IElement tree, int cw, int ch, UiContext* ctx, const char* path)
+int saveTreeBmp(IElement tree, int cw, int ch, IUiContext ctx, const char* path)
 {
     int W = cw * CELL_W;
     int H = ch * CELL_H;

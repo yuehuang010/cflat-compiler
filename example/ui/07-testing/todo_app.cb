@@ -34,7 +34,7 @@ class TodoApp : IComponent
     // the UiContext the worker posts back through (captured when the load is kicked off).
     bool         loaderStarted = false;
     Thread       loader   = default;
-    UiContext*   uiCtx    = nullptr;
+    IUiContext   uiCtx    = default;
 
     // Join a still-running loader so its thread packet is freed (leak-clean under --heap-audit).
     // In normal flow finishLoad() has already joined and cleared the flag before teardown.
@@ -44,7 +44,7 @@ class TodoApp : IComponent
     }
 
     // Add the text field's contents as a new task, then clear the field (controlled).
-    void addTodo(UiContext* ctx)
+    void addTodo(IUiContext ctx)
     {
         if (this.newItem.length() == 0) return;
         this.todos.add("" + this.newItem);   // copy the live field into the owning list
@@ -53,7 +53,7 @@ class TodoApp : IComponent
     }
 
     // Remove task `r` (a "complete" gesture); keep the selection in range.
-    void completeAt(int r, UiContext* ctx)
+    void completeAt(int r, IUiContext ctx)
     {
         if (r < 0 || r >= this.todos.count()) return;
         this.todos.removeAt(r);
@@ -62,11 +62,11 @@ class TodoApp : IComponent
     }
 
     // Remove the selected task (the Delete button).
-    void deleteSelected(UiContext* ctx) { this.completeAt(this.selected, ctx); }
+    void deleteSelected(IUiContext ctx) { this.completeAt(this.selected, ctx); }
 
     // Kick off a background load: remember the context to post through, then start the worker
     // and return immediately. The list stays empty until the worker's posted closure runs.
-    void loadSample(UiContext* ctx)
+    void loadSample(IUiContext ctx)
     {
         if (this.loading) return;
         this.loading = true;
@@ -88,31 +88,31 @@ class TodoApp : IComponent
         this.uiCtx.invalidate();
     }
 
-    IElement render(UiContext* ctx)
+    IElement render(IUiContext ctx)
     {
         ctx.theme = this.dark ? darkTheme() : lightTheme();
 
-        Box* root = box(makeStyle(1, hostWidth(), hostHeight()));
+        IBox root = box(makeStyle(1, hostWidth(), hostHeight()));
         root.style.gap = 1;
         root.setKey("root");
 
-        Text* title = text("CFlat To-Do");
+        IText title = text("CFlat To-Do");
         title.setKey("title");
         root.add(title);
 
         // The new-task text field (controlled: its value flows from the model, edits flow back).
-        TextInput* input = <TextInput key="newitem" value={this.newItem} width={30}
+        ITextInput input = <TextInput key="newitem" value={this.newItem} width={30}
                 placeholder="new task"
                 onChangeText={(string s) => { this.newItem = s; ctx.invalidate(); }}/>;
         root.add(input);
 
         // Add is disabled while the field is empty, so the test can assert the enable/disable flip.
-        Button* add = <Button key="add" title="Add" onPress={() => { this.addTodo(ctx); }}/>;
+        IButton add = <Button key="add" title="Add" onPress={() => { this.addTodo(ctx); }}/>;
         add.disabled = this.newItem.length() == 0;
         root.add(add);
 
         // The task list: virtualized (row source is a callback, not a copied list), single column.
-        ListView* list = <ListView key="list" rowCount={this.todos.count()} selectedIndex={this.selected}
+        IListView list = <ListView key="list" rowCount={this.todos.count()} selectedIndex={this.selected}
                 width={40} height={8}
                 onSelect={(int r) => { this.selected = r; ctx.invalidate(); }}
                 onActivate={(int r) => { this.completeAt(r, ctx); }}/>;
@@ -121,18 +121,18 @@ class TodoApp : IComponent
         root.add(list);
 
         // Delete is disabled unless a row is selected.
-        Button* del = <Button key="delete" title="Delete selected"
+        IButton del = <Button key="delete" title="Delete selected"
                 onPress={() => { this.deleteSelected(ctx); }}/>;
         del.disabled = this.selected < 0 || this.selected >= this.todos.count();
         root.add(del);
 
         // Load sample: fills the list from a background thread (disabled while one is running).
-        Button* load = <Button key="load" title="Load sample"
+        IButton load = <Button key="load" title="Load sample"
                 onPress={() => { this.loadSample(ctx); }}/>;
         load.disabled = this.loading;
         root.add(load);
 
-        Button* theme = <Button key="theme" title="Toggle theme"
+        IButton theme = <Button key="theme" title="Toggle theme"
                 onPress={() => { this.dark = !this.dark; ctx.invalidate(); }}/>;
         root.add(theme);
 
@@ -142,7 +142,7 @@ class TodoApp : IComponent
         if (this.loading) label = "Loading...";
         else if (n == 0) label = "No tasks yet";
         else label = n.toString() + " task(s)";
-        Text* status = text(label);
+        IText status = text(label);
         status.setKey("status");
         root.add(status);
         return root;

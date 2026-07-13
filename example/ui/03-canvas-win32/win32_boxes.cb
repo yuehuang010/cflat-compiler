@@ -27,7 +27,7 @@ class BoxApp : IComponent
     int    clicks = 0;
     string label  = default;
 
-    IElement render(UiContext* ctx)
+    IElement render(IUiContext ctx)
     {
         // Declare the app's styling preference once; widgets that set no color of
         // their own inherit it. Try darkTheme() for the charcoal variant.
@@ -35,32 +35,32 @@ class BoxApp : IComponent
 
         // Outer box fills the window (in cells); it rescales on resize because
         // render() re-reads the host size every time the host rebuilds the tree.
-        Box* root = box(makeStyle(0, hostWidth(), hostHeight()));
+        IBox root = box(makeStyle(0, hostWidth(), hostHeight()));
         root.setKey("root");
 
         // Editable label field (Phase 3 TextInput): click or Tab to focus, type.
-        TextInput* name = textInput(this.label, (string nv) => { this.label = nv; ctx.invalidate(); });
+        ITextInput name = textInput(this.label, (string nv) => { this.label = nv; ctx.invalidate(); });
         name.setKey("name");
         name.width = 24;
         root.add(name);
 
-        Button* add = button("add box", () => { this.clicks = this.clicks + 1; ctx.invalidate(); });
+        IButton add = button("add box", () => { this.clicks = this.clicks + 1; ctx.invalidate(); });
         add.setKey("btn");
         root.add(add);
 
-        Text* status = text("Boxes: " + this.clicks.toString());
+        IText status = text("Boxes: " + this.clicks.toString());
         status.setKey("status");
         root.add(status);
 
         // One small bordered box per click, stacked inside a scrollable viewport.
         int viewW = hostWidth() - 4;
         if (viewW < 10) viewW = 10;
-        ScrollView* list = scrollView(makeStyle(0, viewW, 6));
+        IScrollView list = scrollView(makeStyle(0, viewW, 6));
         list.setKey("list");
         int i = 0;
         while (i < this.clicks)
         {
-            Box* small = box(makeStyle(0, 8, 3));
+            IBox small = box(makeStyle(0, 8, 3));
             small.setKey("b" + i.toString());
             list.add(small);
             i++;
@@ -121,11 +121,11 @@ int guiSelfTest()
     // Outer box (frame) containing a Text label and a ScrollView whose child box
     // is taller (5 cells) than the viewport (3 cells), so its lower border is
     // clipped away.
-    Box* rootBox = box(makeStyle(0, cw, ch));
+    IBox rootBox = box(makeStyle(0, cw, ch));
     rootBox.add(text("GUI"));
-    ScrollView* sv = scrollView(makeStyle(0, 12, 3));
+    IScrollView sv = scrollView(makeStyle(0, 12, 3));
     sv.setKey("scroll");
-    Box* tall = box(makeStyle(0, 8, 5));
+    IBox tall = box(makeStyle(0, 8, 5));
     sv.add(tall);
     rootBox.add(sv);
     IElement tree = rootBox;
@@ -194,7 +194,7 @@ int guiStateSelfTest()
     void* bmp   = CreateCompatibleBitmap(screenDC, W, H);
     void* oldBmp = SelectObject(memDC, bmp);
 
-    Button* b = button("ok", () => { });
+    IButton b = button("ok", () => { });
     b.setKey("b");
     IElement tree = b;
 
@@ -304,7 +304,7 @@ int guiWidgetSelfTest()
 
     // 1. A checked checkbox draws ink somewhere in its first row of cells.
     FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
-    Checkbox* cbx = checkbox("ok", true, (bool v) => { });
+    ICheckbox cbx = checkbox("ok", true, (bool v) => { });
     cbx.setKey("c");
     IElement ctree = cbx;
     layoutRoot(ctree, 0, 0, 20);
@@ -319,7 +319,7 @@ int guiWidgetSelfTest()
     deleteTree(ctree);
 
     // 2. Enabled vs disabled button fill: disabled is grayer (smaller channel range).
-    Button* be = button("ok", () => { });
+    IButton be = button("ok", () => { });
     be.setKey("e");
     IElement etree = be;
     FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
@@ -328,7 +328,7 @@ int guiWidgetSelfTest()
     int enabledRange = _chanRange((u32)GetPixel(memDC, CELL_W + CELL_W / 2, 2));
     deleteTree(etree);
 
-    Button* bd = button("ok", () => { });
+    IButton bd = button("ok", () => { });
     bd.setKey("d");
     bd.disabled = true;
     IElement dtree = bd;
@@ -340,7 +340,7 @@ int guiWidgetSelfTest()
 
     // 3. A 70% progress bar (width 12): the filled left is strongly blue (accent),
     //    the right trough is not.
-    ProgressBar* pb = progressBar(70, 12);
+    IProgressBar pb = progressBar(70, 12);
     pb.setKey("p");
     IElement ptree = pb;
     FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
