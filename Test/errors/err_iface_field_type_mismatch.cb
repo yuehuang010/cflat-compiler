@@ -1,0 +1,23 @@
+// An implementor that declares the interface's field NAME with a different type
+// would make the interface read the field at the right offset but at the wrong
+// type. Rejected eagerly, at the class definition.
+import "string.cb";
+
+interface ITitled
+{
+    int kind();
+    string title;
+};
+
+expect_error("has type 'int' but interface 'ITitled' declares it as 'string'") {
+    class WrongTitle : ITitled
+    {
+        int title = 0;
+        int kind() { return 1; }
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

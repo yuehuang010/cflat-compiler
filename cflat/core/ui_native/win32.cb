@@ -1,18 +1,18 @@
 // core/ui_native/win32.cb - a native Win32 host that drives REAL OS controls.
 //
-// Where ui_canvas/win32.cb PAINTS the Element tree through GDI (GdiCanvas), this
-// host is the NativeHost output stage (see ui_native.cb): the reconciled tree's stable key
+// Where ui_canvas/win32.cb PAINTS the IElement tree through GDI (GdiCanvas), this
+// host is the INativeHost output stage (see ui_native.cb): the reconciled tree's stable key
 // paths map to real child controls (BUTTON/STATIC/EDIT/checkbox/msctls_progress32/
 // trackbar/etched-panel/status bar), and the host creates/updates/destroys those
 // controls to match the tree. The OS paints, handles IME + accessibility, and owns
 // focus/Tab.
 //
-// The app-facing model (Component/Element/Theme/controlled widgets) is UNCHANGED;
+// The app-facing model (IComponent/IElement/Theme/controlled widgets) is UNCHANGED;
 // an app that renders to the GDI host renders here too - it just imports this host
 // instead.
 //
 // App-shell foundation: this host is now MULTI-WINDOW. A `Window` owns its
-// {top-level HWND, root Element/Component, UiContext, live-control bookkeeping,
+// {top-level HWND, root IElement/IComponent, UiContext, live-control bookkeeping,
 // theme}; the app holds a list<Window*> driven by ONE message loop. The former
 // single-editor host globals are gone: the free-function WndProc resolves the
 // servicing window by finding its HWND in the registry, and app code reaches the
@@ -310,8 +310,8 @@ bool nativeMappable(int kind)
 }
 
 // The concrete tooltip text a mappable node carries ("" = none). Read via downcast so
-// the Element interface stays unchanged; every mappable class exposes a `tooltip` field.
-string tooltipOf(Element node)
+// the IElement interface stays unchanged; every mappable class exposes a `tooltip` field.
+string tooltipOf(IElement node)
 {
     int k = node.kind();
     if (k == ELEM_BUTTON)    { Button* b = node as Button; return "" + b.tooltip; }
@@ -342,11 +342,11 @@ bool accessibleNameKind(int k)
         || k == ELEM_COMBO || k == ELEM_IMAGE || k == ELEM_CANVAS;
 }
 
-// -- Window: one top-level window + its Element tree, context, and controls ----
-// Implements NativeHost (each window drives its own controls). This replaces the old
+// -- Window: one top-level window + its IElement tree, context, and controls ----
+// Implements INativeHost (each window drives its own controls). This replaces the old
 // single-editor Win32Host globals; the app holds a list<Window*>. Menu declaration,
 // hInstance, and the accelerator table stay app-wide (above).
-class Window : NativeHost
+class Window : INativeHost
 {
     void* hwnd    = nullptr;
     void* font    = nullptr;
@@ -391,8 +391,8 @@ class Window : NativeHost
     list<u32>    accentBg        = default;
     list<u32>    accentFg        = default;
 
-    Component app   = default;       // the mounted component (this window owns it)
-    Element   tree  = default;       // the committed Element tree
+    IComponent app   = default;       // the mounted component (this window owns it)
+    IElement   tree  = default;       // the committed IElement tree
     UiContext ctx   = default;       // per-window runtime state
     bool      ready = false;
     int       w     = 80;            // client size in DIP units (layout width)
@@ -402,7 +402,7 @@ class Window : NativeHost
     int dipX() { return BASE_X * (int)this.dpi / 96; }
     int dipY() { return BASE_Y * (int)this.dpi / 96; }
 
-    // NativeHost: create a control of `elemKind` under `parentHandle`. Returns the HWND.
+    // INativeHost: create a control of `elemKind` under `parentHandle`. Returns the HWND.
     u64 createControl(int elemKind, u64 parentHandle, string key)
     {
         void* parent = u2h(parentHandle);
@@ -497,7 +497,7 @@ class Window : NativeHost
         }
         else if (elemKind == ELEM_CANVAS)
         {
-            // A GDI-backed child window the app paints via the Canvas API; its own WndProc
+            // A GDI-backed child window the app paints via the ICanvas API; its own WndProc
             // (CanvasChildProc) invokes the boxed onPaint closure on WM_PAINT.
             ensureCanvasClass();
             void* ch = CreateWindowExA(0u, "CFlatCanvasChild", "",
@@ -525,7 +525,7 @@ class Window : NativeHost
     }
 
     // Batched elsewhere (applyTree uses DeferWindowPos); this immediate form is the
-    // NativeHost contract for a one-off reposition. A status bar self-docks, so it is
+    // INativeHost contract for a one-off reposition. A status bar self-docks, so it is
     // repositioned by a WM_SIZE tickle rather than an absolute frame.
     void setFrame(u64 h, Rect frameDip)
     {
@@ -1055,10 +1055,10 @@ class Window : NativeHost
         SendMessageA(this.tooltip, (u32)TTM_UPDATETIPTEXTA, 0u, (i64)&ti);
     }
 
-    // Reconcile the Element tree to native controls: ensure a control per mappable
+    // Reconcile the IElement tree to native controls: ensure a control per mappable
     // node (create on first sight, reuse by key path), sync its props, collect its
     // frame, then batch-position everything and destroy controls that left the tree.
-    void applyTree(Element tree, UiContext* ctx)
+    void applyTree(IElement tree, UiContext* ctx)
     {
         this.applying = true;
 
@@ -1127,7 +1127,7 @@ class Window : NativeHost
     // Recursive worker: `path` is this node's key path. Mappable nodes get a
     // control + synced props + a collected frame; every node recurses into its
     // children (containers contribute only geometry).
-    void _applyNode(Element node, string path, UiContext* ctx,
+    void _applyNode(IElement node, string path, UiContext* ctx,
                     list<string>* keys, list<u64>* handles,
                     list<int>* fx, list<int>* fy, list<int>* fw, list<int>* fh)
     {
@@ -1228,24 +1228,24 @@ class Window : NativeHost
         if (node.kind() == ELEM_TABS)
         {
             TabControl* tc = node as TabControl;
-            list<Element>* panes = node.childList();
+            list<IElement>* panes = node.childList();
             int sel = tc.selectedTab;
             if (panes != nullptr && sel >= 0 && sel < panes.count())
             {
-                Element pane = panes.get(sel);
+                IElement pane = panes.get(sel);
                 string cp = joinKeyPath(path, keySegment(pane, sel));
                 this._applyNode(pane, cp, ctx, keys, handles, fx, fy, fw, fh);
             }
             return;
         }
 
-        list<Element>* kids = node.childList();
+        list<IElement>* kids = node.childList();
         if (kids != nullptr)
         {
             int i = 0;
             while (i < kids.count())
             {
-                Element c = kids.get(i);
+                IElement c = kids.get(i);
                 string cp = joinKeyPath(path, keySegment(c, i));
                 this._applyNode(c, cp, ctx, keys, handles, fx, fy, fw, fh);
                 i++;
@@ -1271,7 +1271,7 @@ class Window : NativeHost
 
     // Push a node's current props onto its control (downcast per kind - the same
     // structured access the reconciler uses in propsEqual).
-    void _syncProps(Element node, u64 h)
+    void _syncProps(IElement node, u64 h)
     {
         int k = node.kind();
         if (k == ELEM_BUTTON)
@@ -1479,8 +1479,8 @@ class Window : NativeHost
     // the app/tree fields is only legal from inside the owning class, hence a method.
     void dispose()
     {
-        if (this.ready) { Element t = this.tree; deleteTree(t); this.ready = false; }
-        if (this.app != nullptr) { Component a = this.app; this.app = nullptr; delete a; }
+        if (this.ready) { IElement t = this.tree; deleteTree(t); this.ready = false; }
+        if (this.app != nullptr) { IComponent a = this.app; this.app = nullptr; delete a; }
         if (this.bgBrush != nullptr) { DeleteObject(this.bgBrush); this.bgBrush = nullptr; }
         if (this.font != nullptr) { DeleteObject(this.font); this.font = nullptr; }
         // Free any ListView rowText boxes still live (DestroyWindow destroys the child
@@ -1608,7 +1608,7 @@ class Window : NativeHost
         return this._splitScan(this.tree, keySegment(this.tree, 0), px, py);
     }
 
-    string _splitScan(Element node, string path, int px, int py)
+    string _splitScan(IElement node, string path, int px, int py)
     {
         if (node.kind() == ELEM_SPLIT)
         {
@@ -1620,13 +1620,13 @@ class Window : NativeHost
             if (y1 - y0 < 6) { y0 = y0 - 3; y1 = y1 + 3; }
             if (px >= x0 && px < x1 && py >= y0 && py < y1) return "" + path;
         }
-        list<Element>* kids = node.childList();
+        list<IElement>* kids = node.childList();
         if (kids != nullptr)
         {
             int i = 0;
             while (i < kids.count())
             {
-                Element c = kids.get(i);
+                IElement c = kids.get(i);
                 string cp = joinKeyPath(path, keySegment(c, i));
                 string r = this._splitScan(c, cp, px, py);
                 if (r.length() > 0) return r;
@@ -1637,9 +1637,9 @@ class Window : NativeHost
     }
 };
 
-// -- CanvasView: a GDI-backed child the app paints via the Canvas API -----------
+// -- CanvasView: a GDI-backed child the app paints via the ICanvas API -----------
 // The escape hatch. A CanvasView maps to a "CFlatCanvasChild" window whose WndProc
-// invokes the app's boxed onPaint(Canvas) closure on WM_PAINT, handing it a
+// invokes the app's boxed onPaint(ICanvas) closure on WM_PAINT, handing it a
 // NativeGdiCanvas over the paint DC. The app draws in the SAME cell coordinates the
 // framework paints through, so any custom widget is expressible.
 
@@ -1653,9 +1653,9 @@ u32 gdiColorRef(int color)
     return (u32)(r | (g << 8) | (b << 16));
 }
 
-// A GDI implementation of the ui.cb Canvas interface, mirroring ui_canvas/win32.cb's
+// A GDI implementation of the ui.cb ICanvas interface, mirroring ui_canvas/win32.cb's
 // GdiCanvas but living in the native host (which does not import ui_canvas/win32.cb). Borrows the HDC.
-class NativeGdiCanvas : Canvas
+class NativeGdiCanvas : ICanvas
 {
     void* hdc = nullptr;
     int cellW = BASE_X;
@@ -1786,7 +1786,7 @@ int findWindowIdx(void* hwnd)
 // Host-neutral accessors used by app code (mirrored by the Cocoa host). activeApp()
 // borrows the component (alias) so the window keeps ownership of it.
 UiContext*     activeCtx() { return &curWin().ctx; }
-alias Component activeApp() { return curWin().app; }
+alias IComponent activeApp() { return curWin().app; }
 bool           hostDark()  { if (!hasCurWin()) return false; return curWin().dark; }
 int hostWidth()  { return curWin().w; }
 int hostHeight() { return curWin().h; }
@@ -1794,7 +1794,7 @@ int hostWindowCount() { return _windows.count(); }
 
 // Create a hidden window bound to `app` at DIP size w x h and build its tree. The
 // host-neutral entry the headless self-tests use (mirrored by the Cocoa host).
-void startHeadlessWindow(Component app, const char* title, int w, int h)
+void startHeadlessWindow(IComponent app, const char* title, int w, int h)
 {
     int wi = createAppWindow(app, title, false);
     curWin().w = w; curWin().h = h;
@@ -1833,18 +1833,18 @@ bool listHasStr(list<string>* xs, string want)
 }
 
 // Find the live node whose key path equals `want`. `path` is `node`'s own path.
-Element findByKey(Element node, string path, string want)
+IElement findByKey(IElement node, string path, string want)
 {
     if (path == want) return node;
-    list<Element>* kids = node.childList();
+    list<IElement>* kids = node.childList();
     if (kids != nullptr)
     {
         int i = 0;
         while (i < kids.count())
         {
-            Element c = kids.get(i);
+            IElement c = kids.get(i);
             string cp = joinKeyPath(path, keySegment(c, i));
-            Element r = findByKey(c, cp, want);
+            IElement r = findByKey(c, cp, want);
             if (r != nullptr) return r;
             i++;
         }
@@ -1872,9 +1872,9 @@ void pumpNative()
     Window* wnd = curWin();
     if (wnd.ctx.consumeDirty())
     {
-        Element wip = wnd.app.render(&wnd.ctx);
+        IElement wip = wnd.app.render(&wnd.ctx);
         list<Patch> patches = default;
-        Element committed = wnd.tree;
+        IElement committed = wnd.tree;
         wnd.tree = reconcile(committed, wip, &patches);
         layoutRootBounded(wnd.tree, 0, 0, wnd.w, wnd.h);
         wnd.applyTree(wnd.tree, &wnd.ctx);
@@ -1887,7 +1887,7 @@ void routeClick(void* ctrl)
     Window* wnd = curWin();
     string key = wnd.keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
     Button* b = e as Button;
     if (b != nullptr) { b.fireClick(); pumpNative(); return; }
@@ -1899,7 +1899,7 @@ void routeClick(void* ctrl)
     if (rb != nullptr)
     {
         string pp = _parentPath(key);
-        Element pe = findByKey(wnd.tree, keySegment(wnd.tree, 0), pp);
+        IElement pe = findByKey(wnd.tree, keySegment(wnd.tree, 0), pp);
         if (pe != nullptr)
         {
             RadioGroup* g = pe as RadioGroup;
@@ -1923,7 +1923,7 @@ void routeCombo(void* ctrl)
     Window* wnd = curWin();
     string key = wnd.keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
     ComboBox* cb = e as ComboBox;
     if (cb == nullptr) return;
@@ -1965,7 +1965,7 @@ void routeListSelect(void* hFrom)
     if (wnd.applying) return;
     string key = wnd.keyForHandle((u64)hFrom);
     if (key.length() == 0) return;
-    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
     ListView* lv = e as ListView;
     if (lv == nullptr) return;
@@ -1978,7 +1978,7 @@ void routeListActivate(void* hFrom)
     Window* wnd = curWin();
     string key = wnd.keyForHandle((u64)hFrom);
     if (key.length() == 0) return;
-    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
     ListView* lv = e as ListView;
     if (lv == nullptr) return;
@@ -2032,7 +2032,7 @@ void routeTabChange(void* hFrom)
     if (wnd.applying) return;
     string key = wnd.keyForHandle((u64)hFrom);
     if (key.length() == 0) return;
-    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
     TabControl* tc = e as TabControl;
     if (tc == nullptr) return;
@@ -2049,7 +2049,7 @@ void routeTreeSelect(i64 lParam)
     void* hFrom = nh.hwndFrom;
     string key = wnd.keyForHandle((u64)hFrom);
     if (key.length() == 0) return;
-    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
     TreeView* tv = e as TreeView;
     if (tv == nullptr) return;
@@ -2068,7 +2068,7 @@ void routeTreeExpand(i64 lParam)
     wnd._treeExpandItem((u64)hFrom, hItem);
     string key = wnd.keyForHandle((u64)hFrom);
     if (key.length() == 0) return;
-    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
     TreeView* tv = e as TreeView;
     if (tv == nullptr) return;
@@ -2080,7 +2080,7 @@ void routeTreeExpand(i64 lParam)
 // to DIPs, recomputes the ratio, and fires onRatioChange so the app re-lays-out.
 void splitDragTo(Window* wnd, string key, int px, int py)
 {
-    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
     SplitView* sv = e as SplitView;
     if (sv == nullptr) return;
@@ -2137,7 +2137,7 @@ void routeEdit(void* ctrl)
     Window* wnd = curWin();
     string key = wnd.keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
     TextInput* ti = e as TextInput;
     if (ti != nullptr)
@@ -2209,7 +2209,7 @@ void nativeFireContextMenu(string keyPath, int itemIndex)
 void nativeSplitterDrag(string keyPath, int dipX, int dipY)
 {
     Window* wnd = curWin();
-    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), keyPath);
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), keyPath);
     if (e == nullptr) return;
     SplitView* sv = e as SplitView;
     if (sv == nullptr) return;
@@ -2221,7 +2221,7 @@ void nativeSplitterDrag(string keyPath, int dipX, int dipY)
 Rect nativeNodeBounds(string keyPath)
 {
     Window* wnd = curWin();
-    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), keyPath);
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), keyPath);
     if (e == nullptr) { Rect z = default; return z; }
     return e.nodeBounds();
 }
@@ -2298,7 +2298,7 @@ void routeSlider(void* ctrl)
     Window* wnd = curWin();
     string key = wnd.keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
     Slider* s = e as Slider;
     if (s == nullptr) return;
@@ -2648,7 +2648,7 @@ void showSecondaryWindow(string title, string message)
 void buildCurrentTree()
 {
     Window* wnd = curWin();
-    if (wnd.ready) { Element old = wnd.tree; deleteTree(old); wnd.ready = false; }
+    if (wnd.ready) { IElement old = wnd.tree; deleteTree(old); wnd.ready = false; }
     wnd.tree = wnd.app.render(&wnd.ctx);
     layoutRootBounded(wnd.tree, 0, 0, wnd.w, wnd.h);
     wnd.applyTree(wnd.tree, &wnd.ctx);
@@ -2774,7 +2774,7 @@ void nativeClickButton(string keyPath)
     if (h == 0u) return;
     void* ctrl = u2h(h);
     Window* wnd = curWin();
-    Element e = findByKey(wnd.tree, keySegment(wnd.tree, 0), keyPath);
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), keyPath);
     if (e != nullptr && e.kind() == ELEM_CHECKBOX)
     {
         int cur = (int)SendMessageA(ctrl, (u32)BM_GETCHECK, 0u, (i64)0);
@@ -3205,7 +3205,7 @@ void ensureWindowClass()
 // not a Window*: an owning class pointer bound to a caller local would auto-free the
 // window at scope exit and double-free with teardown - callers use curWin() instead.
 // `show` controls visibility (the self-test creates it hidden and builds explicitly).
-int createAppWindow(Component app, const char* title, bool show)
+int createAppWindow(IComponent app, const char* title, bool show)
 {
     ensureWindowClass();
 
@@ -3239,7 +3239,7 @@ int createAppWindow(Component app, const char* title, bool show)
 
 // Open a second (or Nth) top-level application window running `app`, built + shown,
 // sharing the one message loop. This is the genuine multi-window feature ("New Window").
-void openAppWindow(Component app, const char* title)
+void openAppWindow(IComponent app, const char* title)
 {
     createAppWindow(app, title, true);
     buildNativeTree();   // build the just-created (now active) window
@@ -3251,7 +3251,7 @@ void openAppWindow(Component app, const char* title)
 //
 // The component MUST be heap-allocated (`new`): a Window stashes it and `delete`s it
 // on teardown, so it has to outlive this call.
-int runAppGuiNative(Component app, const char* title)
+int runAppGuiNative(IComponent app, const char* title)
 {
     createAppWindow(app, title, true);
     if (curWin().hwnd == nullptr) { printf("CreateWindowExA failed\n"); return 1; }

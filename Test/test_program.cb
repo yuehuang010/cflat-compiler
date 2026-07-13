@@ -1398,6 +1398,46 @@ bool testImportedCProgram() {
 }
 
 // ---------------------------------------------------------------------------
+// Interface fields on a program implementor
+// ---------------------------------------------------------------------------
+
+// A `program X : IFace` builds its own vtable (GetOrCreateProgramVTable). An
+// interface FIELD resolves to the byte offset of that program's config field,
+// so config can be read and written through the interface value.
+interface ITagged {
+    int bumped();
+    int count;
+};
+
+program TaggedProgram : ITagged {
+    int pad   = 0;
+    int count = 5;
+
+    int bumped() { return count + 1; }
+
+    int main() {
+        return count;
+    }
+};
+
+bool testProgramInterfaceField() {
+    bool ok = true;
+    TaggedProgram p;
+    ITagged t = p;                       // stack program bound to the interface (borrow)
+
+    ok &= Test("program iface field read",   t.count,    5);
+    t.count = 9;                         // write through the interface's offset slot
+    ok &= Test("program iface field write",  p.count,    9);
+    ok &= Test("program iface method",       t.bumped(), 10);
+
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    ok &= Test("program iface field drives main", p.exitCode, 9);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1455,6 +1495,7 @@ extern int main() {
     total++; passed += testImportedProgram()             ? 1 : 0;
     total++; passed += testImportedCProgram()            ? 1 : 0;
     total++; passed += testChildThreadInheritsAllocator() ? 1 : 0;
+    total++; passed += testProgramInterfaceField()        ? 1 : 0;
 
     printf("Program tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

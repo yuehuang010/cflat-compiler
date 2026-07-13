@@ -1,10 +1,10 @@
 // core/ui_canvas/term.cb - a terminal (TUI) canvas host for the ui_native.cb framework.
 //
-// This host paints the reconciled Element tree to the console through the
-// Canvas seam (SurfaceCanvas over a double-buffered Surface), diffing rows so
+// This host paints the reconciled IElement tree to the console through the
+// ICanvas seam (SurfaceCanvas over a double-buffered Surface), diffing rows so
 // only changed lines are re-blitted. Contrast with ui_native/host.cb, which
-// drives REAL OS controls through the separate NativeHost seam - this file
-// never leaves the Canvas/paint model.
+// drives REAL OS controls through the separate INativeHost seam - this file
+// never leaves the ICanvas/paint model.
 //
 // The app supplies the status line shown on the last row (see runApp below);
 // the caller also decides what to do when no TTY is available (see
@@ -38,7 +38,7 @@ void flushFrame(Terminal* term, Surface* front, Surface* back, int height, bool 
     term.flush();
 }
 
-int runApp(Component app, const char* statusLine)
+int runApp(IComponent app, const char* statusLine)
 {
     Terminal term;
     if (!term.init())
@@ -56,7 +56,7 @@ int runApp(Component app, const char* statusLine)
     Surface front; front.init(w, h);
     Surface back;  back.init(w, h);
 
-    Element tree = app.render(&ctx);
+    IElement tree = app.render(&ctx);
     layoutRoot(tree, 0, 0, w);
     back.fill(' ');
     tree.paint(canvasFor(&back), &ctx);
@@ -93,7 +93,7 @@ int runApp(Component app, const char* statusLine)
         // then repaint only the rows that actually differ.
         if (ctx.consumeDirty())
         {
-            Element wip = app.render(&ctx);
+            IElement wip = app.render(&ctx);
             list<Patch> patches = default;
             tree = reconcile(tree, wip, &patches);
             if (patches.count() > 0)

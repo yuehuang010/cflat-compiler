@@ -1,9 +1,9 @@
-// winui_demo.cb - P6 M3 flagship: an app-facing Component rendered on REAL WinUI 3 controls
-// through winui_host.cb (the NativeHost output stage). The component code is identical in shape
-// to the Win32/TUI hosts - nothing above the NativeHost seam knows it is XAML.
+// winui_demo.cb - P6 M3 flagship: an app-facing IComponent rendered on REAL WinUI 3 controls
+// through winui_host.cb (the INativeHost output stage). The component code is identical in shape
+// to the Win32/TUI hosts - nothing above the INativeHost seam knows it is XAML.
 //
 // A checkbox enables an Increment button; each click bumps a counter shown in a TextBlock. This
-// exercises the whole seam: control creation on a Canvas, property sync (enabled/checked/text),
+// exercises the whole seam: control creation on a ICanvas, property sync (enabled/checked/text),
 // and events (Checked/Unchecked, Click) flowing back through winrtDelegate into dispatch.
 //
 // Build (imports winui_host.cb, so it needs -i to find it when built from elsewhere;
@@ -13,12 +13,12 @@
 
 import "ui_native/winui.cb";
 
-class WinuiDemo : Component
+class WinuiDemo : IComponent
 {
     int  count   = 0;
     bool enabled = false;
 
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         Box* root = box(makeStyle(1, hostWidth(), hostHeight()));
         root.style.gap = 1;

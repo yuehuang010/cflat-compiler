@@ -15,7 +15,7 @@
 import "ui_canvas/win32.cb";
 import "graphic/bitmap.cb";
 
-class SettingsApp : Component
+class SettingsApp : IComponent
 {
     bool   darkMode = false;
     bool   notify   = true;
@@ -23,7 +23,7 @@ class SettingsApp : Component
     int    volume   = 60;
     string name     = default;
 
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         // The whole panel reskins by swapping the theme on the context.
         ctx.theme = this.darkMode ? darkTheme() : lightTheme();
@@ -88,7 +88,7 @@ class SettingsApp : Component
 };
 
 // Offscreen render of a built tree to a 24bpp BMP, mirroring win32_shot.cb.
-int saveTreeBmp(Element tree, int cw, int ch, UiContext* ctx, const char* path)
+int saveTreeBmp(IElement tree, int cw, int ch, UiContext* ctx, const char* path)
 {
     int W = cw * CELL_W;
     int H = ch * CELL_H;
@@ -157,7 +157,7 @@ extern int main(int argc, char** argv)
         app.darkMode = (argc > 3 && strcmp(argv[3], "dark") == 0) ? true : false;
 
         UiContext ctx = default;
-        Element tree = app.render(&ctx);
+        IElement tree = app.render(&ctx);
         ctx.focus("name");
 
         int rc = saveTreeBmp(tree, cw, ch, &ctx, argv[2]);

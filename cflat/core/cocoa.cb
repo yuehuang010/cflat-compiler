@@ -133,7 +133,7 @@ char* msgCStr(void* obj, char* selName)
     return f(obj, sel(selName));
 }
 
-// --- Additional typed msgSend casts (used by the AppKit NativeHost) ----------
+// --- Additional typed msgSend casts (used by the AppKit INativeHost) ---------
 // [obj selector:(double)v] - e.g. setDoubleValue:, setMinValue:. One double lands
 // in d0 exactly as the real signature expects.
 void* msgSetDouble(void* obj, char* selName, double v)

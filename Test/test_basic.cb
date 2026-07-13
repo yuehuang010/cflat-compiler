@@ -1942,6 +1942,48 @@ bool testVariadic()
     snprintf(buf, 64, fmt: "%d * %d = %d", 6, 7, 42);
     result &= Test("variadic_named_fmt", (const char*)buf, "6 * 7 = 42");
 
+    // C default argument promotions for a variadic slot. A sub-int value must be
+    // widened to int: a bool VARIABLE used to reach the slot as a raw i1, so "%d"
+    // printed the stack garbage in the upper bits (true printed e.g. -804465151).
+    // The true case is the one that regressed - false hid the bug behind a zero.
+    int n = 5;
+    bool bTrue  = (n == 5);
+    bool bFalse = (n == 6);
+    snprintf(buf, 64, "%d %d", bTrue, bFalse);
+    result &= Test("variadic_promote_bool_var", (const char*)buf, "1 0");
+
+    // The same value written INLINE (an i1 straight out of the compare) and via an
+    // explicit cast always worked - pin both so the three forms cannot diverge again.
+    snprintf(buf, 64, "%d %d", n == 5, n == 6);
+    result &= Test("variadic_promote_bool_expr", (const char*)buf, "1 0");
+    snprintf(buf, 64, "%d %d", (int)bTrue, (int)bFalse);
+    result &= Test("variadic_promote_bool_cast", (const char*)buf, "1 0");
+
+    // Narrower-than-int integers promote by signedness: u8 255 -> 255, not -1.
+    char cVal = 'A';
+    u8   uVal = 200;
+    i16  sVal = -300;
+    u16  wVal = 60000;
+    snprintf(buf, 64, "%d %d %d %d", cVal, uVal, sVal, wVal);
+    result &= Test("variadic_promote_narrow_ints", (const char*)buf, "65 200 -300 60000");
+
+    // A 'string' has no implicit char* decay (a typed char* param rejects it), and a
+    // variadic slot is untyped - so '.data()' is the only way to feed one to "%s".
+    // Passing the bare string is a compile error (Test/errors/err_string_vararg.cb);
+    // it used to pass the raw {ptr,len} struct, which fed the LENGTH to the next slot.
+    // These are the two shapes that broke: an argument AFTER a %s, and two %s in one call.
+    string sHello = "hello";
+    string sWorld = "world";
+    snprintf(buf, 64, "[%s] %d", sHello.data(), 42);
+    result &= Test("variadic_string_then_int", (const char*)buf, "[hello] 42");
+
+    snprintf(buf, 64, "%s %s!", sHello.data(), sWorld.data());
+    result &= Test("variadic_two_strings", (const char*)buf, "hello world!");
+
+    // The string must survive being read through .data() - the buffer is borrowed by the
+    // callee, never transferred, so the value is still usable (and still owned) afterwards.
+    result &= Test("variadic_string_intact", sHello, "hello");
+
     free(buf);
     return result;
 }

@@ -1,0 +1,14 @@
+// A 'string' is a {ptr,len} value type, not a char*. A variadic slot is untyped, so the
+// compiler cannot see that the callee wants the buffer - passing the struct silently fed
+// the LENGTH to the next slot (printf("%s %d", s, 42) printed the length, not 42) and
+// crashed on a second "%s". cflat already rejects string -> char* at a TYPED parameter,
+// so the variadic slot must reject it too; the user writes s.data().
+import "string.cb";
+
+extern int main()
+{
+    string s = "hello";
+    expect_error("cannot pass 'string' to the variadic '...'");
+    printf("%s %d\n", s, 42);
+    return 0;
+}

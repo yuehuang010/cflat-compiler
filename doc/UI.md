@@ -1,11 +1,11 @@
 # ui_native - native UI framework
 
 `ui_native` is a small React-Native-style declarative UI library for CFlat,
-shipped as a core module (`core/ui_native.cb`). It builds an `Element` tree, diffs
+shipped as a core module (`core/ui_native.cb`). It builds an `IElement` tree, diffs
 renders with a keyed reconciler, routes input through one `dispatch(Event)` seam,
 lays out in a single constraints-in/size-out pass, and paints through a
-surface-agnostic `Canvas` (TUI / Win32 GDI) or drives real OS controls through the
-`NativeHost` seam (Win32, macOS AppKit, WinUI 3).
+surface-agnostic `ICanvas` (TUI / Win32 GDI) or drives real OS controls through the
+`INativeHost` seam (Win32, macOS AppKit, WinUI 3).
 
 The framework ships with the compiler and is versioned with it - there is no
 independent framework version number. The "sugar-compatible element contract" below
@@ -16,15 +16,15 @@ deliberate. The element/seam surface was frozen in the pre-promotion hardening p
 
 - **Location:** `core/` - the framework and every host deploy next to the compiler,
   so apps import them with no `-i`:
-  - `core/ui_native.cb` - the framework + the `NativeHost` seam (the one module apps import
-    for the Canvas hosts; the Element tree, reconciler, `Theme`, `Canvas`, and the seam
+  - `core/ui_native.cb` - the framework + the `INativeHost` seam (the one module apps import
+    for the ICanvas hosts; the IElement tree, reconciler, `Theme`, `ICanvas`, and the seam
     interface + `PROP_*`/`FONT_*`/`LISTOP_*` consts all live here).
   - `core/ui_native/host.cb` - the `if const` platform shim: selects the Win32 host on
     Windows, the Cocoa host on macOS. Apps that want real OS controls import this.
-  - `core/ui_native/win32.cb` - the Win32/GDI `NativeHost` backend.
-  - `core/ui_native/cocoa.cb` - the macOS AppKit (Cocoa) `NativeHost` backend (imports
+  - `core/ui_native/win32.cb` - the Win32/GDI `INativeHost` backend.
+  - `core/ui_native/cocoa.cb` - the macOS AppKit (Cocoa) `INativeHost` backend (imports
     `core/cocoa.cb`, the objc bridge).
-  - `core/ui_native/winui.cb` - the WinUI 3 (Windows App SDK) `NativeHost` backend.
+  - `core/ui_native/winui.cb` - the WinUI 3 (Windows App SDK) `INativeHost` backend.
 - **Status:** the framework is a single source of truth (`core/ui_native.cb`); every
   host imports it directly. See the parity matrix below for per-host coverage and the
   documented WinUI 3 / Cocoa gaps.
@@ -37,29 +37,29 @@ deliberate. The element/seam surface was frozen in the pre-promotion hardening p
   in a host-owned `UiContext` that is threaded into `render()`. The Win32 host
   keeps its window singletons (`_gApp`/`_gTree`/`_gCtx`/...) in the HOST file, not
   in the library, because a stdcall `WndProc` cannot capture `this`.
-- **Cell units.** Layout and paint are in character CELLS. The `Canvas`
+- **Cell units.** Layout and paint are in character CELLS. The `ICanvas`
   implementation owns the cell->pixel mapping (1:1 for the TUI; `CELL_W`/`CELL_H`
   for Win32 GDI).
 - **No downcast in the hot path.** The reconciler compares node types via
   `kind()`, never an `as` downcast. `propsEqual()` may downcast `other` because
   the reconciler guarantees both nodes share a `kind()` first.
 
-## The `Element` contract
+## The `IElement` contract
 
-Every node implements `Element`. A node type is sugar-compatible (see below) when
+Every node implements `IElement`. A node type is sugar-compatible (see below) when
 it implements this interface AND exposes the construction shape described later.
 
 ```
-interface Element
+interface IElement
 {
     move string toJson();                 // serialize self + subtree
     void destroyTree();                   // free owning descendants (not self)
     Size layout(LayoutConstraints c);     // place self, return consumed size
-    void paint(Canvas c, UiContext* ctx); // draw self + subtree (focus-aware) via Canvas
+    void paint(ICanvas c, UiContext* ctx); // draw self + subtree (focus-aware) via ICanvas
     bool dispatch(Event e, UiContext* ctx); // route one input event; true if consumed
     int  kind();                          // ELEM_* tag for the reconciler
-    bool propsEqual(Element other);       // structured props compare (same kind)
-    list<Element>* childList();           // children for containers, nullptr for leaves
+    bool propsEqual(IElement other);       // structured props compare (same kind)
+    list<IElement>* childList();           // children for containers, nullptr for leaves
     string keyOf();                       // "" if unkeyed; drives keyed reconciliation
     void setKey(string k);
     void collectFocusables(list<string>* keys); // append focusable keys (Tab ring)
@@ -72,7 +72,7 @@ Notes:
   is freed at end-of-expression, just like a free-function result. Binding to a
   local (`string j = tree.toJson();`) is equally fine.
 - `destroyTree()` frees a node's owning DESCENDANTS only; the node itself is freed
-  by its owner. Use the free helper `deleteTree(move Element root)` to tear down a
+  by its owner. Use the free helper `deleteTree(move IElement root)` to tear down a
   whole tree (descendants then root), and `delete` dispatches virtually.
 - Leaves return `nullptr` from `childList()`; the reconciler uses that to choose
   the leaf-compare path (`propsEqual`) vs the child-diff path.
@@ -81,7 +81,7 @@ Notes:
 
 | Node | Kind | Role | Key props |
 |------|------|------|-----------|
-| `View` | `ELEM_VIEW` | flex container | `Style style`, `list<Element> children` |
+| `View` | `ELEM_VIEW` | flex container | `Style style`, `list<IElement> children` |
 | `Text` | `ELEM_TEXT` | text leaf | `string text` |
 | `Button` | `ELEM_BUTTON` | pressable leaf | `string title`, `Lambda<void()> onPress`, `bool disabled` |
 | `Box` | `ELEM_BOX` | bordered sized container | `Style style`, `children` |
@@ -101,22 +101,22 @@ Notes:
 | `SplitView` | `ELEM_SPLIT` | two weighted panes + draggable divider (container) | `int ratio`, `bool vertical`, `onRatioChange`, two pane children |
 | `Image` | `ELEM_IMAGE` | bitmap leaf (BGRA32 via `setImageData`) | `u64 pixels` (borrowed top-down BGRA32), `int pxW/pxH`, `int width/height`, `string source` (.bmp), `string altText` |
 | `GroupBox` | `ELEM_GROUPBOX` | titled group frame (container) | `string title`, `Style style`, `children` |
-| `CanvasView` | `ELEM_CANVAS` | app-painted escape hatch | `Lambda<void(Canvas)> onPaint`, `int width/height` |
+| `CanvasView` | `ELEM_CANVAS` | app-painted escape hatch | `Lambda<void(ICanvas)> onPaint`, `int width/height` |
 | `ScrollView` | `ELEM_SCROLL` | scrollable viewport (native `NSScrollView` on Cocoa; clipped canvas viewport on TUI; plain layout container on Win32/WinUI) | `Style style` (viewport), `children`, `int scrollY` |
 | `ComponentElement` | `ELEM_COMPONENT` | wraps a mounted component subtree | single inner child |
 
 **`tooltip` prop (v12):** every mappable element (`Text`/`Button`/`Box`/`TextInput`/
 `Checkbox`/`ProgressBar`/`Slider`/`TextArea`/`RadioButton`/`ComboBox`/`ListView`/`TabControl`/`TreeView`) carries a `string tooltip` field ("" = none).
 A native host attaches it to the OS control (Win32 `tooltips_class32`, Cocoa `setToolTip:`);
-Canvas hosts ignore it. Use a string literal (a bare `string` field does not auto-free).
+ICanvas hosts ignore it. Use a string literal (a bare `string` field does not auto-free).
 
 **`StatusBar` (v12):** an app-shell strip whose `parts` list holds one string per pane
 (`statusBar(mainText)` + `addPart(...)`). The Win32 host maps it to a real
 `msctls_statusbar32` (which self-docks at the window bottom); Cocoa uses a read-only
-`NSTextField` strip; a Canvas host draws one `" | "`-joined text row. Read a pane back
+`NSTextField` strip; a ICanvas host draws one `" | "`-joined text row. Read a pane back
 with `nativeStatusText(keyPath)`.
 
-**Data controls (v13).** Three controlled tier-1 data controls, each with a Canvas
+**Data controls (v13).** Three controlled tier-1 data controls, each with a ICanvas
 fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
 
 - **`RadioGroup` / `RadioButton`** - a single-choice group. `RadioGroup` is a layout
@@ -124,9 +124,9 @@ fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
   its `RadioButton` children each carry `label`/`index`/`checked` (controlled: seed
   `checked` from `value`, e.g. `checked={value == i}`, or use `group.addOption(label)`
   which wires it). Win32 maps each radio to a `BS_AUTORADIOBUTTON` (WS_GROUP on the
-  first); a click routes to the group's `onChange`. Canvas draws `(o)`/`( )` rows.
+  first); a click routes to the group's `onChange`. ICanvas draws `(o)`/`( )` rows.
 - **`ComboBox`** - a controlled dropdown (`CBS_DROPDOWNLIST`). `int selectedIndex` +
-  `list<string> items` (add with `addItem`) + `onChange(index)`. Canvas draws
+  `list<string> items` (add with `addItem`) + `onChange(index)`. ICanvas draws
   `[selected v]`.
 - **`ListView`** - a **virtualized** report-mode list. The item source is a callback,
   `Lambda<string(int,int)> rowText` (row, col -> cell text), NOT a copied list, so
@@ -138,7 +138,7 @@ fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
   `nativeListRowCount(keyPath)`.
 
 **`setListOp` seam (v13).** Property setters cannot express a data control's columns +
-item source, so the `NativeHost` interface gained ONE op-coded call:
+item source, so the `INativeHost` interface gained ONE op-coded call:
 `setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload)`, with the
 `LISTOP_*` codes (RESET_COLUMNS / ADD_COLUMN / SET_ROWCOUNT / SET_ROWTEXT_CB /
 SET_SELECT_MODE / SET_SELECTION / INVALIDATE). The op set is the deliberate common
@@ -149,7 +149,7 @@ crosses the seam - the same constraint `ctx.post` obeys. The CocoaHost (real `NS
 dataSource) and WinUI3Host (host-side box/model source the `native*` drivers query, its third
 seam validation) both implement `setListOp` fully; see the parity matrix.
 
-**Navigation chrome (v14).** Tier-2 controls, each with a Canvas fallback and a headless
+**Navigation chrome (v14).** Tier-2 controls, each with a ICanvas fallback and a headless
 self-test in `example/ui/05-gallery/gallery.cb`; `example/ui/08-fedit/fedit.cb` (fedit v2) is
 the flagship that composes all of them:
 
@@ -157,7 +157,7 @@ the flagship that composes all of them:
   active pane's controls map to native (switching a tab destroys the old pane's controls
   and creates the new pane's), so per-tab editor buffers must live in the app model, not
   an inactive native control. Controlled `selectedTab` + `onSelectTab(index)`. Win32 maps
-  the header strip to a `WC_TABCONTROL` (`SysTabControl32`); Canvas draws a bracketed
+  the header strip to a `WC_TABCONTROL` (`SysTabControl32`); ICanvas draws a bracketed
   header row plus the active pane. Tabs are inserted through the `setListOp` seam
   (`LISTOP_TAB_RESET`/`ADD`/`SET_SEL`).
 - **`TreeView`** - an **expand-on-demand** tree whose node source is three callbacks keyed
@@ -174,7 +174,7 @@ the flagship that composes all of them:
   A layout container (not a native control): the layout engine learns the weighted
   two-pane constraint. Dragging the divider fires `onRatioChange(newRatio)` (Win32 hit-
   tests the gutter in the parent `WndProc` with `SetCapture`; `nativeSplitterDrag(keyPath,
-  dipX, dipY)` drives it headlessly). Canvas draws the two panes and the divider line.
+  dipX, dipY)` drives it headlessly). ICanvas draws the two panes and the divider line.
 - **`ContextMenu`** - a per-element right-click menu reusing the P3 declarative menu model
   (`addItem(label, cmd)` / `addSeparator()`). The app builds one (the `<ContextMenu/>`
   sugar works) and registers it by key path with `nativeSetContextMenu(keyPath, (u64)m)`;
@@ -186,7 +186,7 @@ the flagship that composes all of them:
   `View* toolbar()` returns a `DIR_ROW` View with a small gap; add `button(...)`s to it.
   There is no new native control (icon support arrives with `Image` below).
 
-**Visuals + escape hatch (v15).** The last three elements complete the set, each with a Canvas
+**Visuals + escape hatch (v15).** The last three elements complete the set, each with a ICanvas
 fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
 
 - **`Image`** - a bitmap leaf. Its content is a toolkit-neutral **32-bit BGRA** buffer, not a
@@ -196,18 +196,18 @@ fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
   The app owns the buffer (a component field / global freed on teardown) - the element never
   owns pixel memory. Alternatively `source` names a `.bmp` file the host decodes directly
   (`LoadImage`; WIC/PNG/JPG decode is the same seam with a richer host-internal decoder,
-  deferred). Canvas hosts draw a bordered placeholder with the `altText`. Build one with
+  deferred). ICanvas hosts draw a bordered placeholder with the `altText`. Build one with
   `image(pixels, pxW, pxH)` or `<Image .../>` + field assignment.
 - **`GroupBox`** - a titled group frame (a `BS_GROUPBOX` BUTTON on Win32; its children position
-  as siblings inside the frame). Canvas hosts draw a bordered box with the title on the top edge.
+  as siblings inside the frame). ICanvas hosts draw a bordered box with the title on the top edge.
   Build with `groupBox(title, style)` or `<GroupBox title=... />` + `.add(child)`.
 - **`CanvasView`** - the **escape hatch**. It hosts a child surface the app paints with the SAME
-  `Canvas` API the framework paints through: `onPaint(Canvas)` receives a Canvas whose cell
+  `ICanvas` API the framework paints through: `onPaint(ICanvas)` receives a ICanvas whose cell
   origin is the view's top-left, and the app draws text/rects freely (a chart, a game board, any
   custom widget). On a native host the view maps to a GDI-backed child window that invokes the
   boxed closure on `WM_PAINT`/`WM_PRINTCLIENT` (through the `CanvasBox` seam, an opaque `u64`
-  like `ListRowBox`); on a Canvas host, `paint()` delegates straight to `onPaint`. Build with
-  `canvasView(onPaint)` or `<CanvasView .../>` + `.onPaint = (Canvas c) => {...}`.
+  like `ListRowBox`); on a ICanvas host, `paint()` delegates straight to `onPaint`. Build with
+  `canvasView(onPaint)` or `<CanvasView .../>` + `.onPaint = (ICanvas c) => {...}`.
 
 **Accent buttons (v15).** A themed push button no longer stays light in dark mode. The Win32 host
 draws it via `NM_CUSTOMDRAW` (a documented API, per the look policy): a themed `Button`
@@ -223,7 +223,7 @@ assert), not something the screenshot workflow below captures.
 (every element, light + dark, a 25-assert headless self-test). It doubles as the doc-screenshot
 source: `gallery.exe --shots <dir>` renders the live window into an offscreen bitmap via
 `PrintWindow(PW_RENDERFULLCONTENT)` and writes `gallery_light.bmp` + `gallery_dark.bmp` through
-`core/graphic/bitmap.cb` (the same technique `win32_shot.cb` uses for the Canvas host). The
+`core/graphic/bitmap.cb` (the same technique `win32_shot.cb` uses for the ICanvas host). The
 single-column gallery is taller than one screen, so the capture shows the top band (the classic
 forms + the `Image`/`CanvasView` visuals, placed high for this reason); the FULL element set is
 covered by `--selftest`, not the screenshot.
@@ -235,7 +235,7 @@ node's laid-out frame (layout assertions). The Cocoa host provides real
 `TabView`/`TreeView` controls with driver-backed strips/nodes (P12). See the parity matrix.
 
 Convenience constructors return the concrete heap pointer so callers can set
-typed props, then assign into an `Element` slot:
+typed props, then assign into an `IElement` slot:
 
 ```
 View*       view(Style style);
@@ -259,7 +259,7 @@ SplitView*   splitView(int ratio, bool vertical);   // add exactly two pane chil
 View*        toolbar();                              // DIR_ROW View + gap; add button()s
 Image*       image(u64 pixels, int pxW, int pxH);    // borrowed top-down BGRA32 buffer
 GroupBox*    groupBox(string title, Style style);    // titled frame; add children with .add()
-CanvasView*  canvasView(Lambda<void(Canvas)> onPaint);   // app-painted escape hatch
+CanvasView*  canvasView(Lambda<void(ICanvas)> onPaint);   // app-painted escape hatch
 ScrollView*  scrollView(Style style);
 ```
 
@@ -294,7 +294,7 @@ makes it ignore input and drop out of the Tab focus ring.
   on Tab / Shift-Tab. Built from the live tree, focus tracks keyed identity across
   re-renders.
 
-### Canvas clip
+### ICanvas clip
 
 `pushClip(Rect)` / `popClip()` bound subsequent drawing to a rectangle (cells);
 nested pushes intersect, and calls must be balanced. The TUI `SurfaceCanvas` keeps
@@ -361,7 +361,7 @@ The theme lives on `UiContext` (`ctx.theme`), the host-owned per-app state. An a
 declares its preference in `render()`:
 
 ```
-Element render(UiContext* ctx) {
+IElement render(UiContext* ctx) {
     ctx.theme = lightTheme();   // or darkTheme(), or your own Theme
     ...
 }
@@ -383,8 +383,8 @@ this one pass, not bespoke per-node math.
 ```
 struct LayoutConstraints { int x; int y; int availW; int availH; };
 struct Size              { int w; int h; };
-Size layoutRoot(Element root, int x, int y, int w);              // root pass, height unbounded
-Size layoutRootBounded(Element root, int x, int y, int w, int h); // root pass, height bounded to h
+Size layoutRoot(IElement root, int x, int y, int w);              // root pass, height unbounded
+Size layoutRootBounded(IElement root, int x, int y, int w, int h); // root pass, height bounded to h
 ```
 
 `layoutRootBounded` is the native-host root pass: it caps `availH` at the window's
@@ -543,11 +543,11 @@ clone-in / destruct-after-call, so it is leak-clean under `--heap-audit`.
 ## Components and the model layer
 
 ```
-interface Component { Element render(UiContext* ctx); };
-ComponentElement* mount(Component c, string key, UiContext* ctx);
+interface IComponent { IElement render(UiContext* ctx); };
+ComponentElement* mount(IComponent c, string key, UiContext* ctx);
 ```
 
-A component renders itself to an `Element` tree; `render` receives the host
+A component renders itself to an `IElement` tree; `render` receives the host
 `UiContext` so its event closures can `invalidate()`. A parent component owns its
 children by pointer (e.g. `list<Counter*>`) and re-mounts them by key each render;
 the reconciler matches `ComponentElement`s by key and descends into the single
@@ -568,22 +568,22 @@ struct Patch { int op; int nodeKind; string detail; string key; };
 
 `Patch.key` (v9) is the affected node's stable key path - the parent chain of node
 keys joined with `/`, with unkeyed nodes carrying a synthesized positional segment
-(`#i`). It lets a `NativeHost` (below) route a create/update/destroy to the right
+(`#i`). It lets a `INativeHost` (below) route a create/update/destroy to the right
 control by identity. Adding it did not change patch op/kind/count/order, so the
-Canvas self-tests are byte-identical.
+ICanvas self-tests are byte-identical.
 
 Leaf change-detection is the structured `propsEqual()` - no stringly-typed
 signatures. Children are matched by key when keyed (so middle insert/remove and
 reorder preserve the right nodes) and positionally otherwise. The patch log is
 in-memory only; a serialized wire format / OTA is out of scope.
 
-## The `Canvas` seam
+## The `ICanvas` seam
 
-Nodes paint via `Canvas` primitives in cell coordinates, never poking a surface
+Nodes paint via `ICanvas` primitives in cell coordinates, never poking a surface
 directly, so the same tree renders to any backend.
 
 ```
-interface Canvas
+interface ICanvas
 {
     void clear();
     void drawText(int col, int row, const char* s, int color);  // color via rgb(), 0 = default
@@ -630,10 +630,10 @@ return <View style={makeStyle(16, 0, 0)}>
   callback (`label={(int n) => { return name(n); }}` against a `Lambda<string(int)>`
   field) needs no annotation - the same inference a plain field assignment gets.
 - Children are nested elements or `{expr}` interpolations; each is `add()`-ed to
-  the parent, so the tag needs an `add(Element)` method (View/Box/ScrollView have
+  the parent, so the tag needs an `add(IElement)` method (View/Box/ScrollView have
   one; leaves like Text do not take children).
 - The result is a heap node pointer usable wherever a constructor result is - e.g.
-  `return <View/>` or assigning to an `Element` slot.
+  `return <View/>` or assigning to an `IElement` slot.
 - `counter_jsx.cb` asserts the sugar desugars to a tree identical to the
   hand-written `counter.cb` form.
 - Sugar children are STATIC. Dynamic children compose as sugar FRAGMENTS: build the
@@ -657,12 +657,12 @@ target it MUST expose:
 1. A constructor reachable by the tag name - either a `T* tag(...)` factory (as
    `view`/`text`/`button`/`box` provide) or a brace-init shape - so `<View .../>`
    lowers to constructing a `View`.
-2. A children add path: a `void add(Element child)` method backed by a
-   `list<Element>` (containers), so nested children lower to `parent.add(child)`.
+2. A children add path: a `void add(IElement child)` method backed by a
+   `list<IElement>` (containers), so nested children lower to `parent.add(child)`.
 3. Prop fields settable after construction (`style`, `text`, `title`, `onPress`,
    `key` via `setKey`), so `prop="literal"` / `prop={expr}` attributes lower to
    field assignments / setter calls.
-4. The full `Element` interface (above), so the lowered tree reconciles, lays out,
+4. The full `IElement` interface (above), so the lowered tree reconciles, lays out,
    paints, and dispatches uniformly.
 
 Keeping this contract stable is what lets the sugar work unchanged if the library
@@ -686,12 +686,12 @@ runtime, or Yoga.
 `Row`/`Column`, `TextInput`, `ScrollView`, and Tab focus navigation are
 implemented as thin layers over these seams (see above), not special cases.
 
-## The `NativeHost` seam (v9) - real OS controls
+## The `INativeHost` seam (v9) - real OS controls
 
-`Canvas` paints the tree pixel by pixel. `NativeHost` is the alternative output
+`ICanvas` paints the tree pixel by pixel. `INativeHost` is the alternative output
 stage: instead of painting, it drives real OS controls (HWND on Windows; AppKit
 `NSView`/`NSControl` on macOS) so the OS handles rendering, text input, IME, and
-accessibility. The app-facing model (Element tree, Component, controlled widgets,
+accessibility. The app-facing model (IElement tree, IComponent, controlled widgets,
 Theme, keyed identity) is unchanged - only the output stage differs. The contract
 lives in `core/ui_native.cb`; the implementations are `core/ui_native/win32.cb`
 (Win32/GDI) and `core/ui_native/cocoa.cb` (AppKit).
@@ -703,7 +703,7 @@ host elsewhere. Both backends expose the identical public surface
 API), so a single app source compiles to real OS controls on both platforms.
 
 ```
-interface NativeHost
+interface INativeHost
 {
     u64  createControl(int elemKind, u64 parentHandle, string key);
     void destroyControl(u64 h);
@@ -728,26 +728,26 @@ the native->`Event` translation.
 
 - **Shadow map.** `UiContext` gains `dictionary<string, u64> nativeByKey` mapping a
   node's key path to its control handle, with accessors `setNativeHandle` /
-  `nativeHandle` / `hasNativeHandle` / `removeNativeHandle`. Only a `NativeHost`
-  touches it; Canvas hosts leave it empty and inert. The handles are non-owning
+  `nativeHandle` / `hasNativeHandle` / `removeNativeHandle`. Only a `INativeHost`
+  touches it; ICanvas hosts leave it empty and inert. The handles are non-owning
   integers, so tearing the map down destroys no windows - the host destroys
   controls explicitly.
 - **DIP units.** Layout math in `ui.cb` is unit-blind integer arithmetic. A
-  Canvas/TUI host reads those integers as cells (1 DIP == 1 cell, so the TUI stays
-  byte-identical); a `NativeHost` reads them as DIPs and scales DIP->physical px at
+  ICanvas/TUI host reads those integers as cells (1 DIP == 1 cell, so the TUI stays
+  byte-identical); a `INativeHost` reads them as DIPs and scales DIP->physical px at
   the host boundary using the monitor DPI. `measureText` replaces the
   1-cell-per-char assumption for native text.
 
 ### Win32 native host: editor features (v10)
 
-`core/ui_native/win32.cb` implements `NativeHost` as a `Window` class (one
+`core/ui_native/win32.cb` implements `INativeHost` as a `Window` class (one
 per top-level window) and adds the pieces a real desktop app needs. All are
 documented-API only (no uxtheme ordinals). An app imports this host and calls
 `runAppGuiNative(new App(), title)`.
 
 - **Multi-window (v12):** the host is genuinely multi-window - the app holds an
   owning `list<Window*>` driven by ONE message loop. A `Window` owns its top-level
-  HWND, root Element/Component, `UiContext`, live-control bookkeeping, and theme.
+  HWND, root IElement/IComponent, `UiContext`, live-control bookkeeping, and theme.
   App code reaches the window currently being serviced through **`activeCtx()`** /
   **`activeApp()`** (the free-function WndProc sets it per message), so one pair of
   menu/close closures serves every window. Open another window with
@@ -788,7 +788,7 @@ Headless self-tests drive real controls through key-path helpers that every nati
 implements under the SAME name, so a self-test contains no toolkit-typed calls (no
 `SendMessage`, no `objc_msgSend`, no WinRT vtable calls) and runs against any host. The gallery
 self-test lives in the host-neutral `example/ui/05-gallery/gallery_app.cb` (the `GalleryApp`
-Component + the 25-assert self-test); its Win32/Cocoa launcher is `example/ui/05-gallery/gallery.cb`
+IComponent + the 25-assert self-test); its Win32/Cocoa launcher is `example/ui/05-gallery/gallery.cb`
 (imports the `ui_native/host.cb` shim) and its WinUI 3 launcher is `example/ui/06-winui/winui_gallery.cb`
 (imports `ui_native/winui.cb`). All three build the SAME `gallery_app.cb` - a cflat compilation shares
 one global scope across its whole import closure, so a sibling host import supplies the drivers.
@@ -834,17 +834,17 @@ model source the `setListOp` seam feeds).
   headless self-test that gates `example.bat` on behavior AND leaks (built with
   `--heap-audit`).
 - **Win32** (`core/ui_canvas/win32.cb` host + `example/ui/03-canvas-win32/win32_boxes.cb`): a native
-  GDI host reusing the framework unchanged behind the `Canvas` seam.
+  GDI host reusing the framework unchanged behind the `ICanvas` seam.
 - **Native OS controls** (`core/ui_native/host.cb` shim -> `core/ui_native/win32.cb`
-  / `core/ui_native/cocoa.cb`): the `NativeHost` seam instead of `Canvas` - real HWND
-  (Win32) or AppKit controls (macOS). See the `NativeHost` section above.
-- **WinUI 3 (Windows App SDK)** (`core/ui_native/winui.cb`): the same `NativeHost` seam
-  driving real XAML controls rooted in a `Canvas`, brought up unpackaged via
+  / `core/ui_native/cocoa.cb`): the `INativeHost` seam instead of `ICanvas` - real HWND
+  (Win32) or AppKit controls (macOS). See the `INativeHost` section above.
+- **WinUI 3 (Windows App SDK)** (`core/ui_native/winui.cb`): the same `INativeHost` seam
+  driving real XAML controls rooted in a `ICanvas`, brought up unpackaged via
   `MddBootstrapInitialize2` + `Application.Start`. An app runs on it with `runAppWinui(new App())`;
   the gallery launcher is `example/ui/06-winui/winui_gallery.cb`. Its self-tests run WITHOUT
   `--heap-audit` (the WinAppSDK runtime keeps process-lived singletons and its own heaps).
 
-### Element x host parity matrix (v17)
+### IElement x host parity matrix (v17)
 
 Y = real native control; the notes call out deliberate differences and gaps. Cocoa is
 compile-checked (`--check --platform macos`); its runtime verification on an arm64 box is
@@ -852,7 +852,7 @@ deferred (see the plan). "driver-backed" means the control is created but its it
 answered from the host-side `setListOp` box/model the `native*` drivers query - the seam and data
 path are validated, while binding a live virtualized item source is a documented enrichment.
 
-| Element      | Win32                     | Cocoa (compile-checked)   | WinUI 3                              |
+| IElement      | Win32                     | Cocoa (compile-checked)   | WinUI 3                              |
 |--------------|---------------------------|---------------------------|-------------------------------------|
 | Button       | Y BUTTON                  | Y NSButton                | Y Button                            |
 | Text         | Y STATIC                  | Y NSTextField             | Y TextBlock                         |
@@ -922,7 +922,7 @@ tooltip wiring).
   HWNDs), so the control set is FLAT and the message loop's `IsDialogMessageA` walks Tab / Shift-Tab
   across the whole set - including `ListView`, `TreeView`, `TabControl`, and `ComboBox` (no
   `WS_EX_CONTROLPARENT` is needed precisely because nothing is nested). The framework's own
-  `collectFocusables`/`moveFocus` ring (Canvas hosts) mirrors the same order; OS focus is the source
+  `collectFocusables`/`moveFocus` ring (ICanvas hosts) mirrors the same order; OS focus is the source
   of truth on a native host and `ctx.focusKey` is a keyed mirror.
 - **Default keys.** Enter activates the default push button, Space toggles a focused
   Checkbox/RadioButton, and the arrow keys move within a `RadioGroup` and a `TreeView` - all standard
@@ -971,16 +971,16 @@ purely cosmetic gain).
 drives real controls through the [host-neutral `native*` drivers](#host-neutral-test-drivers-v16-winui-added-v17)
 on an invisible window and asserts on control + model state - deterministic, no display, no OS
 input synthesis. The copy-me template is **`example/ui/07-testing/`**: `todo_app.cb` (the app) +
-`todo_test.cb` (its suite). Copy those two files, swap in your Component, and you have a suite.
+`todo_test.cb` (its suite). Copy those two files, swap in your IComponent, and you have a suite.
 
-**Shared-app-module pattern.** Split the app into a host-neutral **app module** (your Component,
+**Shared-app-module pattern.** Split the app into a host-neutral **app module** (your IComponent,
 imports only `ui_native.cb` + whatever it needs) and a **test target** that imports a host backend,
 `ui_test.cb`, and the app module:
 
 ```cflat
 // myapp.cb  - the app module (no main; host-neutral, like todo_app.cb / gallery_app.cb)
 import "ui_native.cb";
-class MyApp : Component { /* render() with setKey on everything you automate */ };
+class MyApp : IComponent { /* render() with setKey on everything you automate */ };
 
 // myapp_test.cb  - the test target
 import "ui_native/host.cb";   // the default host: Win32 on Windows, Cocoa on macOS

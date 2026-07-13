@@ -2,7 +2,7 @@
 // framework.
 //
 // The host loop itself (double-buffered paint + input dispatch) now lives in
-// core/ui_canvas/term.cb (runApp). This file owns the demo Component (Counter),
+// core/ui_canvas/term.cb (runApp). This file owns the demo IComponent (Counter),
 // the EditApp used by the TextInput test, and a headless self-test suite that
 // exercises layout + paint + dispatch (mouse + key + focus) against an
 // in-memory Surface, independent of any real console.
@@ -20,11 +20,11 @@
 
 import "ui_canvas/term.cb";
 
-class Counter : Component
+class Counter : IComponent
 {
     int count = 0;
 
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         View* root = view(makeStyle(1, 0, 0));
         root.add(text("Count: " + this.count.toString()));
@@ -38,11 +38,11 @@ class Counter : Component
 // A controlled text-field component: owns the text in its state, binds it to a
 // TextInput, and updates on each keystroke via onChangeText. Used by the
 // TextInput self-test.
-class EditApp : Component
+class EditApp : IComponent
 {
     string text = default;
 
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         View* root = view(makeStyle(0, 0, 0));
         TextInput* ti = textInput(this.text, (string nv) => { this.text = nv; ctx.invalidate(); });
@@ -78,7 +78,7 @@ Text* ktext(string k, string s) { Text* t = text(s); t.setKey(k); return t; }
 
 // Scan the grid region for the first cell that consumes a mouse-down. Returns
 // true and leaves the handler's side effects applied.
-bool clickScan(Element tree, UiContext* ctx, int w, int h)
+bool clickScan(IElement tree, UiContext* ctx, int w, int h)
 {
     int y = 0;
     while (y < h)
@@ -99,7 +99,7 @@ bool testCounterReconcile()
     Surface front; front.init(40, 6);
     Surface back;  back.init(40, 6);
 
-    Element tree = c.render(&ctx);
+    IElement tree = c.render(&ctx);
     layoutRoot(tree, 0, 0, 40);
     front.fill(' '); tree.paint(canvasFor(&front), &ctx);
     if (!front.contains("Count: 0")) { deleteTree(tree); return false; }
@@ -107,7 +107,7 @@ bool testCounterReconcile()
     bool clicked = clickScan(tree, &ctx, 40, 6);
     if (!clicked || c.count != 1 || !ctx.consumeDirty()) { deleteTree(tree); return false; }
 
-    Element wip = c.render(&ctx);
+    IElement wip = c.render(&ctx);
     list<Patch> p = default;
     tree = reconcile(tree, wip, &p);
     bool patchOk = p.count() == 1 && p.get(0).op == PATCH_UPDATE && p.get(0).nodeKind == ELEM_TEXT;
@@ -131,7 +131,7 @@ bool testKeyedReorder()
     View* y = view(makeStyle(0,0,0));
     y.add(ktext("c","C")); y.add(ktext("a","A")); y.add(ktext("b","B"));
 
-    Element t = x;
+    IElement t = x;
     list<Patch> p = default;
     t = reconcile(t, y, &p);
     bool structural = countOp(&p, PATCH_INSERT) == 0 && countOp(&p, PATCH_REMOVE) == 0;
@@ -155,12 +155,12 @@ bool testComponentReconcile()
 
     View* r1 = view(makeStyle(0,0,0));
     r1.add(mount(a, "a", &ctx)); r1.add(mount(b, "b", &ctx));
-    Element committed = r1;
+    IElement committed = r1;
 
     a.count = 1;   // state behind component 'a' changes
     View* r2 = view(makeStyle(0,0,0));
     r2.add(mount(b, "b", &ctx)); r2.add(mount(a, "a", &ctx));   // reorder
-    Element wip = r2;
+    IElement wip = r2;
 
     list<Patch> p = default;
     committed = reconcile(committed, wip, &p);
@@ -182,7 +182,7 @@ bool testFocusKeyboard()
     UiContext ctx = default;
     Counter c; c.count = 0;
 
-    Element tree = c.render(&ctx);
+    IElement tree = c.render(&ctx);
     layoutRoot(tree, 0, 0, 40);
 
     bool preKey = tree.dispatch(keyPress(KEY_ENTER), &ctx);   // nothing focused yet
@@ -195,7 +195,7 @@ bool testFocusKeyboard()
     if (!keyed || c.count != 2) { deleteTree(tree); return false; }
     ctx.consumeDirty();
 
-    Element wip = c.render(&ctx);
+    IElement wip = c.render(&ctx);
     list<Patch> p = default;
     tree = reconcile(tree, wip, &p);                          // re-render keeps key "inc"
     layoutRoot(tree, 0, 0, 40);
@@ -215,7 +215,7 @@ bool testRowLayout()
     row.style.flexDirection = DIR_ROW;
     row.add(text("AB"));    // width 2
     row.add(text("CDE"));   // width 3, placed at x=2
-    Element t = row;
+    IElement t = row;
 
     layoutRoot(t, 0, 0, 40);
     Surface s; s.init(40, 2); s.fill(' '); t.paint(canvasFor(&s), &ctx);
@@ -238,7 +238,7 @@ bool testFlexEqualSplit()
     View* a = view(flexStyle(1)); r.add(a);
     View* b = view(flexStyle(1)); r.add(b);
     View* c = view(flexStyle(1)); r.add(c);
-    Element t = r;
+    IElement t = r;
 
     layoutRoot(t, 0, 0, 100);
     Rect ra = a.nodeBounds(); Rect rb = b.nodeBounds(); Rect rc = c.nodeBounds();
@@ -256,7 +256,7 @@ bool testFlexFixedPlusFlex()
     View* r = row(makeStyle(0, 0, 0));
     Box* label = box(makeStyle(0, 20, 0)); r.add(label);
     View* field = view(flexStyle(1)); r.add(field);
-    Element t = r;
+    IElement t = r;
 
     layoutRoot(t, 0, 0, 100);
     Rect rl = label.nodeBounds(); Rect rf = field.nodeBounds();
@@ -273,7 +273,7 @@ bool testFlexWeightedSplit()
     View* r = row(makeStyle(0, 0, 0));
     View* two = view(flexStyle(2)); r.add(two);
     View* one = view(flexStyle(1)); r.add(one);
-    Element t = r;
+    IElement t = r;
 
     layoutRoot(t, 0, 0, 100);
     Rect rt = two.nodeBounds(); Rect ro = one.nodeBounds();
@@ -291,7 +291,7 @@ bool testFlexGapPadding()
     r.style.gap = 3;
     View* a = view(flexStyle(1)); r.add(a);
     View* b = view(flexStyle(1)); r.add(b);
-    Element t = r;
+    IElement t = r;
 
     layoutRoot(t, 0, 0, 50);
     Rect ra = a.nodeBounds(); Rect rb = b.nodeBounds();
@@ -308,7 +308,7 @@ bool testFlexNoFlexUnchanged()
 {
     View* rt = view(makeStyle(1, 0, 0));
     rt.add(text("hi"));
-    Element t = rt;
+    IElement t = rt;
 
     layoutRoot(t, 0, 0, 40);
     string j = t.toJson();
@@ -334,7 +334,7 @@ bool testFlexColumn()
     View* colB = column(makeStyle(0, 0, 0));
     View* b1 = view(flexStyle(1)); colB.add(b1);
     View* b2 = view(flexStyle(1)); colB.add(b2);
-    Element tb = colB;
+    IElement tb = colB;
     LayoutConstraints ccB = default;
     ccB.x = 0; ccB.y = 0; ccB.availW = 20; ccB.availH = 30;
     Size szB = tb.layout(ccB);
@@ -345,7 +345,7 @@ bool testFlexColumn()
     View* colU = column(makeStyle(0, 0, 0));
     View* u1 = view(flexStyle(1)); colU.add(u1);
     View* u2 = view(flexStyle(1)); colU.add(u2);
-    Element tu = colU;
+    IElement tu = colU;
     Size szU = layoutRoot(tu, 0, 0, 20);
     Rect s1 = u1.nodeBounds(); Rect s2 = u2.nodeBounds();
     bool unbounded = s1.y == 0 && s2.y == 0 && szU.h == 0;
@@ -367,7 +367,7 @@ bool testFlexWrapFixedCells()
     Box* b2 = box(makeStyle(0, 30, 0)); r.add(b2);
     Box* b3 = box(makeStyle(0, 30, 0)); r.add(b3);
     Box* b4 = box(makeStyle(0, 30, 0)); r.add(b4);
-    Element t = r;
+    IElement t = r;
 
     Size sz = layoutRoot(t, 0, 0, 100);
     Rect r1 = b1.nodeBounds(); Rect r2 = b2.nodeBounds();
@@ -390,7 +390,7 @@ bool testFlexWrapLineHeight()
     Box* b1 = box(makeStyle(0, 20, 1)); r.add(b1);
     Box* b2 = box(makeStyle(0, 20, 5)); r.add(b2);
     Box* b3 = box(makeStyle(0, 20, 1)); r.add(b3);
-    Element t = r;
+    IElement t = r;
 
     layoutRoot(t, 0, 0, 50);
     Rect r1 = b1.nodeBounds(); Rect r2 = b2.nodeBounds(); Rect r3 = b3.nodeBounds();
@@ -410,7 +410,7 @@ bool testFlexWrapOversizedChild()
     Box* b1 = box(makeStyle(0, 20, 0)); r.add(b1);
     Box* b2 = box(makeStyle(0, 60, 0)); r.add(b2);
     Box* b3 = box(makeStyle(0, 20, 0)); r.add(b3);
-    Element t = r;
+    IElement t = r;
 
     Size sz = layoutRoot(t, 0, 0, 50);
     Rect r1 = b1.nodeBounds(); Rect r2 = b2.nodeBounds(); Rect r3 = b3.nodeBounds();
@@ -434,7 +434,7 @@ bool testFlexWrapLineFlex()
     Box* b2 = box(makeStyle(0, 30, 0)); r.add(b2);
     Box* b3 = box(makeStyle(0, 30, 0)); r.add(b3);
     View* f = view(flexStyle(1)); r.add(f);
-    Element t = r;
+    IElement t = r;
 
     layoutRoot(t, 0, 0, 100);
     Rect rf = f.nodeBounds();
@@ -446,9 +446,9 @@ bool testFlexWrapLineFlex()
 
 // Re-render the controlled EditApp and reconcile into the live tree, so a value
 // changed by onChangeText flows back into the TextInput before the next key.
-move Element editReRender(EditApp* app, UiContext* ctx, move Element tree, int w)
+move IElement editReRender(EditApp* app, UiContext* ctx, move IElement tree, int w)
 {
-    Element wip = app.render(ctx);
+    IElement wip = app.render(ctx);
     list<Patch> p = default;
     tree = reconcile(tree, wip, &p);
     layoutRoot(tree, 0, 0, w);
@@ -463,7 +463,7 @@ bool testTextInput()
     UiContext ctx = default;
     EditApp app;   // text = ""
 
-    Element tree = app.render(&ctx);
+    IElement tree = app.render(&ctx);
     layoutRoot(tree, 0, 0, 20);
 
     if (!clickScan(tree, &ctx, 20, 2)) { deleteTree(tree); return false; }
@@ -500,7 +500,7 @@ bool testTabNav()
     Button* b = button("B", () => { }); b.setKey("b");
     Button* c = button("C", () => { }); c.setKey("c");
     root.add(a); root.add(b); root.add(c);
-    Element tree = root;
+    IElement tree = root;
 
     moveFocus(tree, &ctx, false); bool f1 = ctx.hasFocus("a");   // none -> first
     moveFocus(tree, &ctx, false); bool f2 = ctx.hasFocus("b");
@@ -522,7 +522,7 @@ bool testScrollClip()
     sv.setKey("scroll");
     sv.add(text("L0")); sv.add(text("L1")); sv.add(text("L2"));
     sv.add(text("L3")); sv.add(text("L4"));             // 5 lines
-    Element tree = sv;
+    IElement tree = sv;
 
     layoutRoot(tree, 0, 0, 10);
     Surface s; s.init(10, 6); s.fill(' '); tree.paint(canvasFor(&s), &ctx);

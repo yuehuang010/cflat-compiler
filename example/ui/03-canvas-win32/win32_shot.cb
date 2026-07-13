@@ -2,7 +2,7 @@
 //
 // The Win32 GDI host paints into a real window, but a headless build harness has
 // no display, so the rendered UI has never actually been seen. This tool closes
-// that gap: it paints the SAME Element tree the live host would, but into an
+// that gap: it paints the SAME IElement tree the live host would, but into an
 // offscreen memory DC, then reads the pixels back and writes them to a 24bpp BMP.
 // The result is a viewable snapshot of exactly what GdiCanvas produces - a real
 // visual oracle, not a single-pixel GetPixel assertion.
@@ -23,7 +23,7 @@ import "graphic/bitmap.cb";
 // inherit the context's Theme. The title is an accent override, and the cards
 // override to amber - both demonstrate that an explicit node color still beats
 // the theme.
-Element buildDemoTree(int cw, int ch)
+IElement buildDemoTree(int cw, int ch)
 {
     Box* root = box(makeStyle(0, cw, ch));   // panel colors come from the theme
 
@@ -56,7 +56,7 @@ Element buildDemoTree(int cw, int ch)
     }
     root.add(list);
 
-    Element tree = root;
+    IElement tree = root;
     return tree;
 }
 
@@ -84,7 +84,7 @@ int shoot(const char* path, int cw, int ch, Theme theme,
     full.left = 0; full.top = 0; full.right = W; full.bottom = H;
     FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
 
-    Element tree = buildDemoTree(cw, ch);
+    IElement tree = buildDemoTree(cw, ch);
     void* font = createUiFont();
     void* oldFont = SelectObject(memDC, font);
     GdiCanvas cv = default;

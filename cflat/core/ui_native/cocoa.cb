@@ -1,7 +1,7 @@
 // core/ui_native/cocoa.cb - a native macOS (AppKit) host that drives REAL OS controls.
 //
-// This is the macOS counterpart of ui_native/win32.cb: the NativeHost output
-// stage of the CFlat UI framework (see ui_native.cb). The reconciled Element tree's
+// This is the macOS counterpart of ui_native/win32.cb: the INativeHost output
+// stage of the CFlat UI framework (see ui_native.cb). The reconciled IElement tree's
 // stable key paths map to real AppKit controls (NSButton / NSTextField / NSSlider /
 // NSProgressIndicator / NSBox / NSTextView), and the host creates / updates /
 // destroys those controls to match the tree. AppKit paints them, handles IME +
@@ -97,7 +97,7 @@ bool nativeMappable(int kind)
 
 // The concrete tooltip text a mappable node carries ("" = none), read via downcast
 // (mirror of the Win32 host); every mappable class exposes a `tooltip` field.
-string tooltipOf(Element node)
+string tooltipOf(IElement node)
 {
     int k = node.kind();
     if (k == ELEM_BUTTON)    { Button* b = node as Button; return "" + b.tooltip; }
@@ -133,12 +133,12 @@ bool _isScroll(void* ctrl)
     return msgBool1(ctrl, "isKindOfClass:", cls("NSScrollView")) != (i8)0;
 }
 
-// -- CocoaHost: the NativeHost implementation ---------------------------------
+// -- CocoaHost: the INativeHost implementation ---------------------------------
 // Owns the top-level window, the flipped content view, the one shared callback
 // target (CfHostTarget), the reentrancy guard, and the per-frame live-control
 // bookkeeping (parallel key/handle lists) used to route events and destroy controls
 // that fell out of the tree.
-class CocoaHost : NativeHost
+class CocoaHost : INativeHost
 {
     void* window      = nullptr;
     void* contentView = nullptr;   // the flipped CfFlippedView
@@ -146,9 +146,9 @@ class CocoaHost : NativeHost
     bool  applying    = false;     // guard: swallow self-inflicted change notifications
     bool  dark        = false;     // last applied theme was dark
     // Per-window app + tree + context (mirror of the Win32 Window). The registry owns
-    // the window and it owns its app Component; freed in dispose().
-    Component app   = default;
-    Element   tree  = default;
+    // the window and it owns its app IComponent; freed in dispose().
+    IComponent app   = default;
+    IElement   tree  = default;
     UiContext ctx   = default;
     bool      ready = false;
     int       w     = 95;   // client size in DIP units (760pt / 8)
@@ -181,7 +181,7 @@ class CocoaHost : NativeHost
     list<u64>    imgHandles      = default;
     list<u64>    imgLastPixels   = default;
 
-    // NativeHost: create a control of `elemKind` under the flipped content view.
+    // INativeHost: create a control of `elemKind` under the flipped content view.
     // `key` is the node's key path (kept by the caller in the shadow map). Returns
     // the control (NSView*) as a u64; a TextArea returns its enclosing scroll view.
     u64 createControl(int elemKind, u64 parentHandle, string key)
@@ -353,8 +353,8 @@ class CocoaHost : NativeHost
         }
         else if (elemKind == ELEM_CANVAS)
         {
-            // A custom CfCanvasView whose drawRect: bridges to the boxed onPaint(Canvas)
-            // via a CoreGraphics-backed Canvas (CocoaCanvas). The box is stashed in
+            // A custom CfCanvasView whose drawRect: bridges to the boxed onPaint(ICanvas)
+            // via a CoreGraphics-backed ICanvas (CocoaCanvas). The box is stashed in
             // setListOp-style bookkeeping and reached through the view's key path.
             ctrl = msgRect(msg0(cls("CfCanvasView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
         }
@@ -919,10 +919,10 @@ class CocoaHost : NativeHost
         this.applyTree(this.tree, &this.ctx);
     }
 
-    // Reconcile the Element tree to native controls: ensure a control per mappable
+    // Reconcile the IElement tree to native controls: ensure a control per mappable
     // node (create on first sight, reuse by key path), sync its props, collect its
     // DIP frame, position everything, then destroy controls that left the tree.
-    void applyTree(Element tree, UiContext* ctx)
+    void applyTree(IElement tree, UiContext* ctx)
     {
         this.applying = true;
 
@@ -983,7 +983,7 @@ class CocoaHost : NativeHost
     // (containers contribute only geometry). `parentView` is the NSView new controls
     // parent to (a ScrollView's document view inside one); (offX, offY) is the DIP
     // origin subtracted to make frames parent-relative inside a scroll container.
-    void _applyNode(Element node, string path, UiContext* ctx,
+    void _applyNode(IElement node, string path, UiContext* ctx,
                     list<string>* keys, list<u64>* handles,
                     list<int>* fx, list<int>* fy, list<int>* fw, list<int>* fh,
                     u64 parentView, int offX, int offY)
@@ -1058,11 +1058,11 @@ class CocoaHost : NativeHost
         if (node.kind() == ELEM_TABS)
         {
             TabControl* tc = node as TabControl;
-            list<Element>* panes = node.childList();
+            list<IElement>* panes = node.childList();
             int sel = tc.selectedTab;
             if (panes != nullptr && sel >= 0 && sel < panes.count())
             {
-                Element pane = panes.get(sel);
+                IElement pane = panes.get(sel);
                 string cp = joinKeyPath(path, keySegment(pane, sel));
                 this._applyNode(pane, cp, ctx, keys, handles, fx, fy, fw, fh,
                                 parentView, offX, offY);
@@ -1078,13 +1078,13 @@ class CocoaHost : NativeHost
             void* scroll = u2h(ctx.nativeHandle(path));
             void* docv = msg0(scroll, "documentView");
             Rect sb = node.nodeBounds();
-            list<Element>* skids = node.childList();
+            list<IElement>* skids = node.childList();
             if (skids != nullptr)
             {
                 int i = 0;
                 while (i < skids.count())
                 {
-                    Element c = skids.get(i);
+                    IElement c = skids.get(i);
                     string cp = joinKeyPath(path, keySegment(c, i));
                     this._applyNode(c, cp, ctx, keys, handles, fx, fy, fw, fh,
                                     (u64)docv, sb.x, sb.y);
@@ -1103,13 +1103,13 @@ class CocoaHost : NativeHost
             return;
         }
 
-        list<Element>* kids = node.childList();
+        list<IElement>* kids = node.childList();
         if (kids != nullptr)
         {
             int i = 0;
             while (i < kids.count())
             {
-                Element c = kids.get(i);
+                IElement c = kids.get(i);
                 string cp = joinKeyPath(path, keySegment(c, i));
                 this._applyNode(c, cp, ctx, keys, handles, fx, fy, fw, fh,
                                 parentView, offX, offY);
@@ -1120,7 +1120,7 @@ class CocoaHost : NativeHost
 
     // Push a node's current props onto its control (downcast per kind - the same
     // structured access the reconciler uses in propsEqual).
-    void _syncProps(Element node, u64 h)
+    void _syncProps(IElement node, u64 h)
     {
         int k = node.kind();
         if (k == ELEM_BUTTON)
@@ -1235,7 +1235,7 @@ class CocoaHost : NativeHost
         else if (k == ELEM_CANVAS)
         {
             // The paint closure was boxed at creation; mark the view dirty so state
-            // changes redraw (drawRect: re-invokes onPaint through the CG-backed Canvas).
+            // changes redraw (drawRect: re-invokes onPaint through the CG-backed ICanvas).
             msgBool(u2h(h), "setNeedsDisplay:", true);
         }
     }
@@ -1323,8 +1323,8 @@ class CocoaHost : NativeHost
     // does not re-enter windowWillClose: and recurse into destroyWindowStateAt.
     void dispose(bool sendClose)
     {
-        if (this.ready) { Element t = this.tree; deleteTree(t); this.ready = false; }
-        if (this.app != nullptr) { Component a = this.app; this.app = nullptr; delete a; }
+        if (this.ready) { IElement t = this.tree; deleteTree(t); this.ready = false; }
+        if (this.app != nullptr) { IComponent a = this.app; this.app = nullptr; delete a; }
         // Free the host-owned boxes (the destroyControl path does not run for a window
         // closing wholesale). The parallel lists + ctx.nativeByKey are value fields freed
         // automatically when `delete owned` runs this window's destructor.
@@ -1424,13 +1424,13 @@ bool themeIsDark(Theme* t)
     return (r + g + b) < 384;
 }
 
-// -- CanvasView bridge: a CoreGraphics-backed Canvas -----------------------------
-// CocoaCanvas implements the ui.cb Canvas interface using AppKit drawing primitives
+// -- CanvasView bridge: a CoreGraphics-backed ICanvas -----------------------------
+// CocoaCanvas implements the ui.cb ICanvas interface using AppKit drawing primitives
 // (NSBezierPath fill/stroke, NSString drawAtPoint - both CoreGraphics-backed), so the
-// app's onPaint(Canvas) closure paints into a CfCanvasView's drawRect:. Cell coords map
+// app's onPaint(ICanvas) closure paints into a CfCanvasView's drawRect:. Cell coords map
 // to points via BASE_X/BASE_Y (like the Win32 NativeGdiCanvas). The view is flipped, so
 // row 0 is at the top, matching the framework's top-left convention.
-class CocoaCanvas : Canvas
+class CocoaCanvas : ICanvas
 {
     void clear() { }   // drawRect: already erased to the view background
 
@@ -1516,7 +1516,7 @@ void _onListClickImp(void* self, void* cmd, void* table)
     if (!curWin().ready || curWin().applying) return;
     string key = curWin().keyForHandle((u64)msg0(table, "enclosingScrollView"));
     if (key.length() == 0) return;
-    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     ListView* lv = e as ListView;
     if (lv == nullptr) return;
@@ -1530,7 +1530,7 @@ void _onListDoubleClickImp(void* self, void* cmd, void* table)
     if (!curWin().ready) return;
     string key = curWin().keyForHandle((u64)msg0(table, "enclosingScrollView"));
     if (key.length() == 0) return;
-    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     ListView* lv = e as ListView;
     if (lv == nullptr) return;
@@ -1605,7 +1605,7 @@ void _onTreeWillExpandImp(void* self, void* cmd, void* note)
     void* item = msg1(msg0(note, "userInfo"), "objectForKey:", nsStr((char*)"NSObject"));
     string key = curWin().keyForHandle((u64)msg0(outline, "enclosingScrollView"));
     if (key.length() == 0) return;
-    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     TreeView* tv = e as TreeView;
     if (tv == nullptr) return;
@@ -1636,7 +1636,7 @@ void _runPostBoxImp(void* self, void* cmd, void* num)
 // through curWin() (_cur is re-established at every callback entry). ctx.post
 // marshaling is real: performSelectorOnMainThread + hostDrainPosted.
 UiContext*      activeCtx() { return &curWin().ctx; }
-alias Component activeApp() { return curWin().app; }
+alias IComponent activeApp() { return curWin().app; }
 bool            hostDark()  { if (!hasCurWin()) return false; return curWin().dark; }
 int hostWidth()  { return curWin().w; }
 int hostHeight() { return curWin().h; }
@@ -1644,7 +1644,7 @@ int hostWindowCount() { return _windows.count(); }
 
 // Create a hidden window bound to `app` at DIP size w x h and build its tree (mirror
 // of the Win32 startHeadlessWindow; the headless self-tests use it).
-void startHeadlessWindow(Component app, const char* title, int w, int h)
+void startHeadlessWindow(IComponent app, const char* title, int w, int h)
 {
     int wi = createAppWindow(app, title, false);
     if (wi < 0) return;
@@ -1669,7 +1669,7 @@ void hostDrainPosted()
 
 // Open a second (or Nth) top-level application window running `app`, built + shown,
 // sharing the one NSApplication run loop. Genuine multi-window ("New Window").
-void openAppWindow(Component app, const char* title)
+void openAppWindow(IComponent app, const char* title)
 {
     createAppWindow(app, title, true);
     buildNativeTree();   // build the just-created (now active) window
@@ -1692,18 +1692,18 @@ bool listHasStr(list<string>* xs, string want)
 }
 
 // Find the live node whose key path equals `want`. `path` is `node`'s own path.
-Element findByKey(Element node, string path, string want)
+IElement findByKey(IElement node, string path, string want)
 {
     if (path == want) return node;
-    list<Element>* kids = node.childList();
+    list<IElement>* kids = node.childList();
     if (kids != nullptr)
     {
         int i = 0;
         while (i < kids.count())
         {
-            Element c = kids.get(i);
+            IElement c = kids.get(i);
             string cp = joinKeyPath(path, keySegment(c, i));
-            Element r = findByKey(c, cp, want);
+            IElement r = findByKey(c, cp, want);
             if (r != nullptr) return r;
             i++;
         }
@@ -1719,7 +1719,7 @@ void pumpNative()
     CocoaHost* wnd = curWin();
     if (wnd.ctx.consumeDirty())
     {
-        Element wip = wnd.app.render(&wnd.ctx);
+        IElement wip = wnd.app.render(&wnd.ctx);
         list<Patch> patches = default;
         wnd.tree = reconcile(wnd.tree, wip, &patches);
         layoutRootBounded(wnd.tree, 0, 0, wnd.w, wnd.h);
@@ -1732,7 +1732,7 @@ void routeClick(void* ctrl)
 {
     string key = curWin().keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     Button* b = e as Button;
     if (b != nullptr) { b.fireClick(); pumpNative(); return; }
@@ -1744,7 +1744,7 @@ void routeClick(void* ctrl)
     if (rb != nullptr)
     {
         string pp = _parentPath(key);
-        Element pe = findByKey(curWin().tree, keySegment(curWin().tree, 0), pp);
+        IElement pe = findByKey(curWin().tree, keySegment(curWin().tree, 0), pp);
         if (pe != nullptr)
         {
             RadioGroup* g = pe as RadioGroup;
@@ -1767,7 +1767,7 @@ void routeCombo(void* ctrl)
 {
     string key = curWin().keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     ComboBox* cb = e as ComboBox;
     if (cb == nullptr) return;
@@ -1781,7 +1781,7 @@ void routeTabChange(void* ctrl)
     if (curWin().applying) return;
     string key = curWin().keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     TabControl* tc = e as TabControl;
     if (tc == nullptr) return;
@@ -1795,7 +1795,7 @@ void routeTreeSelectItem(void* outline, void* item)
     if (curWin().applying) return;
     string key = curWin().keyForHandle((u64)msg0(outline, "enclosingScrollView"));
     if (key.length() == 0) return;
-    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     TreeView* tv = e as TreeView;
     if (tv == nullptr) return;
@@ -1807,7 +1807,7 @@ void routeEdit(void* ctrl)
 {
     string key = curWin().keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     TextInput* ti = e as TextInput;
     if (ti != nullptr)
@@ -1832,7 +1832,7 @@ void routeSlider(void* ctrl)
 {
     string key = curWin().keyForHandle((u64)ctrl);
     if (key.length() == 0) return;
-    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
     Slider* s = e as Slider;
     if (s == nullptr) return;
@@ -1986,7 +1986,7 @@ void nativeFireContextMenu(string keyPath, int itemIndex)
 // not an NSSplitView, so the layout model stays single-source).
 void nativeSplitterDrag(string keyPath, int dipX, int dipY)
 {
-    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     if (e == nullptr) return;
     SplitView* sv = e as SplitView;
     if (sv == nullptr) return;
@@ -1996,7 +1996,7 @@ void nativeSplitterDrag(string keyPath, int dipX, int dipY)
 
 Rect nativeNodeBounds(string keyPath)
 {
-    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     if (e == nullptr) { Rect z = default; return z; }
     return e.nodeBounds();
 }
@@ -2106,7 +2106,7 @@ void nativeListSelect(string keyPath, int row)
     curWin().setListOp(h, LISTOP_SET_SELECTION, row, 0, "", 0u);
     // Programmatic selectRowIndexes: fires no action; route onSelect like a click
     // would (Win32's LVM_SETITEMSTATE raises a real LVN_ITEMCHANGED notify).
-    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     if (e == nullptr) return;
     ListView* lv = e as ListView;
     if (lv == nullptr) return;
@@ -2126,7 +2126,7 @@ void nativeListActivate(string keyPath, int row)
     u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return;
     if (row >= 0) nativeListSelect(keyPath, row);
-    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     if (e == nullptr) return;
     ListView* lv = e as ListView;
     if (lv == nullptr) return;
@@ -2139,7 +2139,7 @@ void nativeClickButton(string keyPath)
     u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return;
     void* ctrl = u2h(h);
-    Element e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     // Mirror the OS auto-toggle for the two state controls before routing the click.
     if (e != nullptr && e.kind() == ELEM_CHECKBOX)
     {
@@ -2751,7 +2751,7 @@ void registerHostClasses()
         finishClass(tg);
     }
 
-    // CfCanvasView: a flipped custom NSView whose drawRect: bridges to onPaint(Canvas).
+    // CfCanvasView: a flipped custom NSView whose drawRect: bridges to onPaint(ICanvas).
     void* cvv = newClass("CfCanvasView", "NSView");
     if (cvv != nullptr)
     {
@@ -2779,7 +2779,7 @@ void registerHostClasses()
 // We return an int, not a CocoaHost*: an owning class pointer bound to a caller local
 // would auto-free the window at scope exit and double-free with teardown.
 // `show` controls visibility (the self-test creates it hidden and builds explicitly).
-int createAppWindow(Component app, const char* title, bool show)
+int createAppWindow(IComponent app, const char* title, bool show)
 {
     if (!cocoaInit()) { printf("failed to load AppKit\n"); return 0 - 1; }
     void* nsapp = msg0(cls("NSApplication"), "sharedApplication");
@@ -2838,7 +2838,7 @@ int createAppWindow(Component app, const char* title, bool show)
 void buildNativeTree()
 {
     if (!hasCurWin()) return;
-    if (curWin().ready) { Element t = curWin().tree; deleteTree(t); curWin().ready = false; }
+    if (curWin().ready) { IElement t = curWin().tree; deleteTree(t); curWin().ready = false; }
     curWin().tree = curWin().app.render(&curWin().ctx);
     layoutRootBounded(curWin().tree, 0, 0, curWin().w, curWin().h);
     curWin().applyTree(curWin().tree, &curWin().ctx);
@@ -2850,7 +2850,7 @@ void buildNativeTree()
 //
 // The component MUST be heap-allocated (`new`): the window OWNS it and `delete`s it in
 // dispose(), so it has to outlive this call and be a heap object.
-int runAppGuiNative(Component app, const char* title)
+int runAppGuiNative(IComponent app, const char* title)
 {
     if (!cocoaInit()) { printf("failed to load AppKit\n"); return 1; }
     void* pool = poolPush();
@@ -2861,7 +2861,7 @@ int runAppGuiNative(Component app, const char* title)
     void* nsapp = msg0(cls("NSApplication"), "sharedApplication");
     msg0(nsapp, "run");
 
-    // Each window OWNS its app Component and frees it in dispose(); do not double-free.
+    // Each window OWNS its app IComponent and frees it in dispose(); do not double-free.
     while (_windows.count() > 0) destroyWindowStateAt(0, true);
     poolPop(pool);
     return 0;

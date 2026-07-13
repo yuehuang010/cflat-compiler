@@ -1,5 +1,5 @@
 // win32_native_settings.cb - a settings panel rendered with REAL Win32 controls
-// through win32_native_host.cb (the NativeHost output stage), not GDI painting.
+// through win32_native_host.cb (the INativeHost output stage), not GDI painting.
 //
 // Same app-facing shape as win32_settings.cb (labels, a text field, checkboxes, a
 // slider mirrored by a progress bar, a disabled-until-enabled button), but every
@@ -16,7 +16,7 @@
 import "ui_native/win32.cb";
 import "ui_test.cb";
 
-class NativeSettings : Component
+class NativeSettings : IComponent
 {
     bool   darkMode = false;
     bool   autoSave = false;
@@ -24,7 +24,7 @@ class NativeSettings : Component
     int    clicks   = 0;
     string name     = default;
 
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         // Declare the styling preference; the native host reads it to theme the
         // titlebar (immersive dark mode) and control colors (WM_CTLCOLOR*).

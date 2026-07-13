@@ -2,11 +2,11 @@
 //
 // This is the Win32 instance of the host loop shape ui_canvas/term.cb implements
 // for the terminal: input -> dispatch (handleClick) -> drain dirty -> render ->
-// reconcile -> repaint only what changed. The framework (Element tree, reconciler,
+// reconcile -> repaint only what changed. The framework (IElement tree, reconciler,
 // model layer) is reused UNCHANGED; the only thing that differs from the TUI host
 // is the draw target (GdiCanvas instead of SurfaceCanvas) and the message pump.
 // Contrast with ui_native/win32.cb, which drives REAL Win32 controls through the
-// separate NativeHost seam rather than painting an Element tree via Canvas.
+// separate INativeHost seam rather than painting an IElement tree via ICanvas.
 //
 // A size-aware component reads hostWidth()/hostHeight() in its render() - the
 // model-layer equivalent of a "useWindowSize()" hook - so the same tree rescales
@@ -58,8 +58,8 @@ void* createUiFont()
 // right tool here, and they live in the HOST file, not the framework library.
 // _gReady guards the tree before the first build (WM_SIZE) and after teardown
 // (WM_DESTROY).
-Component _gApp   = default;
-Element   _gTree  = default;
+IComponent _gApp   = default;
+IElement   _gTree  = default;
 UiContext _gCtx   = default;
 bool      _gReady = false;
 
@@ -72,7 +72,7 @@ void pumpAfterInput(void* hwnd)
     bool needPaint = false;
     if (_gCtx.consumeDirty())
     {
-        Element wip = _gApp.render(&_gCtx);
+        IElement wip = _gApp.render(&_gCtx);
         list<Patch> patches = default;
         _gTree = reconcile(_gTree, wip, &patches);
         if (patches.count() > 0) needPaint = true;
@@ -85,11 +85,11 @@ void pumpAfterInput(void* hwnd)
     }
 }
 
-// -- GdiCanvas: the GDI implementation of the Canvas draw interface -------------
+// -- GdiCanvas: the GDI implementation of the ICanvas draw interface -------------
 // Holds the device context for the current WM_PAINT plus the cell size. drawText
 // uses DrawTextA (left-aligned, single line); drawRect frames or fills a cell
 // rectangle with a stock black brush. Borrows the HDC - owns no GDI objects.
-class GdiCanvas : Canvas
+class GdiCanvas : ICanvas
 {
     void* hdc = nullptr;
     int cellW = CELL_W;
@@ -297,7 +297,7 @@ stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
 // Register the window class, create the window, and run the message loop until
 // WM_QUIT. The component is borrowed (the caller owns it and must outlive this
 // call); we stash it in _gApp for the WndProc to render from.
-int runAppGui(Component app, const char* title)
+int runAppGui(IComponent app, const char* title)
 {
     _gApp = app;
 

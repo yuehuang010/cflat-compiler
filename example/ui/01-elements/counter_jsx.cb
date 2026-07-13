@@ -10,11 +10,11 @@
 
 import "ui_native.cb";
 
-class CounterJsx : Component
+class CounterJsx : IComponent
 {
     int count = 0;
 
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         // An owned-string expression (the interpolated label) used directly as a child
         // attribute alongside a sibling capturing closure is leak-clean: the intermediate
@@ -29,7 +29,7 @@ class CounterJsx : Component
 };
 
 // The exact tree the sugar above desugars to, built with explicit constructors.
-Element buildManual(int count)
+IElement buildManual(int count)
 {
     View* root = view(makeStyle(16, 0, 0));
     root.add(text("Count: " + count.toString()));
@@ -43,8 +43,8 @@ extern int main()
     CounterJsx c;
     c.count = 0;
 
-    Element sugar = c.render(&ctx);
-    Element manual = buildManual(0);
+    IElement sugar = c.render(&ctx);
+    IElement manual = buildManual(0);
 
     string sj = sugar.toJson();
     string mj = manual.toJson();

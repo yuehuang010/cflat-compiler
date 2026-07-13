@@ -890,7 +890,46 @@ Counter c = Counter();
 readValue(c);   // dispatches via VTable
 ```
 
+### Interface Fields
+
+An interface may declare **fields** as well as methods. Every implementor must declare a
+field of the same name and type; the check runs at the class definition. A field reached
+through an interface value is a true lvalue - read it, write it, or write a member of a
+nested struct through it:
+
+```c
+interface IElement
+{
+    int kind();
+    int  tag;        // every implementor must have `int tag`
+    Rect bounds;
+};
+
+class Button : IElement
+{
+    int  pad = 0;    // implementors may lay their fields out however they like
+    int  tag = 0;
+    Rect bounds = default;
+    int kind() { return 1; }
+};
+
+IElement e = new Button();
+e.tag = 7;               // write
+e.bounds.width = 100;    // write through a nested struct field
+int k = e.tag;           // read
+```
+
+There is no indirect call: each field costs one vtable slot holding that implementor's byte
+offset of the field, so two implementors with completely different layouts both work. Fields
+are inherited by a derived interface exactly like methods, including across several levels.
+
+Reading or writing a field on a **null** interface value (the result of a failed
+`as <Interface>`) faults, exactly as calling a method on one does. Guard with a null compare
+(see below) before reaching through a value that may have missed.
+
 ### Generic Interfaces
+
+Generic interfaces may carry fields too (`T value;` resolves to the substituted type).
 
 ```c
 interface Container<T>
@@ -920,9 +959,49 @@ interface IString : IReadonlyString
 };
 ```
 
+A derived-interface value converts **implicitly** to any of its ancestor interfaces - on
+assignment, as a call argument, when added to a `list<IAncestor>`, and on return:
+
+```c
+interface IElement { int kind(); };
+interface ITipped : IElement { string tip; };
+interface IButton : ITipped  { string title; };
+
+int kindOf(IElement e) { return e.kind(); }
+
+move IElement make()
+{
+    IButton b = new Button();
+    return b;              // IButton -> IElement
+}
+
+IButton  b = new Button();
+IElement e = b;            // implicit upcast (two levels)
+kindOf(b);                 // implicit upcast at the call
+```
+
+The conversion rebuilds the fat pointer from the runtime type, so it is correct for
+multi-level and multi-parent chains. An exact-interface overload still wins over one that
+requires an upcast.
+
 ### `is` and `as` Operators
 
-`is` tests the concrete runtime type of an interface value. `as` downcasts to a concrete struct pointer or interface; returns `nullptr` if the cast fails:
+`is` tests the concrete runtime type of an interface value. It also accepts an **interface**
+on the right, which is true when the runtime type implements it (at any depth):
+
+```c
+if (e is IButton) { ... }     // does the value behind `e` implement IButton?
+```
+
+An interface value can be compared against `nullptr` - a failed `as` yields a null value,
+and this is the guard for it:
+
+```c
+IButton b = e as IButton;
+if (b != nullptr) { printf("%s\n", b.title.data()); }
+```
+
+`as` downcasts to a concrete struct pointer or interface; returns `nullptr` if the cast fails:
 
 ```c
 IShape sc = someCircle;
@@ -961,26 +1040,24 @@ switch (shape)
 
 ### Interface Value Semantics - Current Limitations
 
-Two operations that look natural do not work correctly at this time:
-
-- **Returning an interface value from a function miscompiles.** The generated code
-  produces incorrect IR and the return value is wrong at runtime. Workaround: return
-  the concrete pointer and let the caller box it into an interface at the assignment site.
+- **An interface value returned from a function must box a HEAP object.** An interface is a
+  fat pointer (object ptr + vtable ptr), so boxing a stack local and returning it hands the
+  caller a pointer into a dead frame. The direct form is rejected at compile time; the
+  two-step form is not detected, so do not write it.
 
   ```c
-  // BROKEN - do not return an interface value
-  IShape getShape() { Circle c; IShape s = c; return s; }  // wrong output
+  IShape getShape() { Circle c; return c; }              // ERROR - would dangle
+  IShape getShape() { Circle c; IShape s = c; return s; } // DANGLES - not diagnosed
 
-  // Correct: return the concrete pointer, box at call site
-  Circle* getShape() { return new Circle(); }
-  IShape s = getShape();   // boxing at assignment works correctly
+  move IShape getShape() { return new Circle(); }        // correct: heap object
   ```
 
-- **`interface*` (pointer-to-interface) is rejected.** Interfaces are fat-pointer
-  values (object ptr + vtable ptr). You cannot take the address of an interface
-  variable. Use a concrete pointer where an indirect reference is needed.
+  Boxing a heap pointer into an interface MOVES ownership into the interface value, and
+  interface locals are not auto-destructed - the holder must `delete` it. Returning one from
+  a non-`move` function is rejected (the caller could not see that it owns the object).
 
-Both of these are known compiler limitations, not intentional language design decisions.
+- **`interface*` (pointer-to-interface) is rejected.** You cannot take the address of an
+  interface variable. Use a concrete pointer where an indirect reference is needed.
 
 ---
 

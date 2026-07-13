@@ -10,8 +10,10 @@ and `add` one boxed element. Reported by the interface-fields spike, which
 isolated it on the UNTOUCHED (stock) feature set - it is not caused by interface
 fields, and it reproduces with no interface field anywhere in the program.
 
-Status: REPORTED BY SPIKE, not yet independently re-verified. Confirm the
-64-byte figure and the exact shape before fixing.
+Status: DOES NOT REPRODUCE - disproven 2026-07-13. This is a MEASUREMENT ARTIFACT
+in the spike's harness, not a compiler/stdlib bug. See "Verification" below before
+spending any more time on it; this file is kept only so the claim is not
+re-investigated from scratch.
 
 ## Repro (sketch - from the spike's isolation program)
 
@@ -43,7 +45,34 @@ Suspect: an interface element type makes the list's own dtor fail to bind or fai
 to be registered, so scope exit never destructs the list. Compare against
 `list<int>` and `list<SomeClass*>` under the same harness.
 
-## Why it matters here
+## Verification (2026-07-13)
+
+Re-ran the reported shape under the HeapAudit oracle (compiled with -o). Every
+variant is leak-clean - `list<IFace>` destructs and frees its buffer normally:
+
+  - list<IFace> + add(new Impl) + hand-free elements, with and without clear(): 0
+  - list<IFace> grown past its initial capacity (40 elements):                   0
+  - list<IFace> as a class FIELD, freed via a destroyAll() helper:               0
+  - list<int> and list<Impl*> baselines under the same harness:                  0
+
+The oracle is not blind to the buffer: a deliberately leaked `new int[16]` (64 B,
+the same array-new shape list<T> uses for _data) IS reported, so a real buffer leak
+would have shown up.
+
+Root cause of the false report: HeapAudit is a point-in-time scan of LIVE
+allocations, so it cannot distinguish "leaked" from "still in scope" - exactly what
+heap_audit.cb's own comment on reportLeaks() warns about ("call at a quiescent
+point, e.g. after a scope has exited"). The spike called reportLeaks() while the
+`list<IFace>` was STILL LIVE in the enclosing scope, so the list's own live buffer
+was reported as a 64-byte leak. Reproduced directly: with a live `list<IFace>` in
+scope, reportLeaks() reports the 64 B buffer; adding a live `list<int>` alongside it
+reports that list's 16 B buffer too. That also explains the spike's control -
+"removing the list => zero leaks" is simply "no live buffer left to report".
+
+Nothing to fix. The element-ownership-by-convention design (dtor frees elements only
+when is_pointer(T)) is intact and is what the UI tree relies on.
+
+## Why it mattered (original motivation, now moot)
 
 The UI framework stores its entire element tree in `list<IElement>`
 (`core/ui_native.cb:799`), and the pointers -> interfaces refactor

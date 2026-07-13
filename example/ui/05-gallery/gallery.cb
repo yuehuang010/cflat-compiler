@@ -1,6 +1,6 @@
 // gallery.cb - the Win32/Cocoa launcher for the widget-gallery flagship (P8-P11).
 //
-// The GalleryApp Component + its 25-assert headless self-test live in the host-neutral
+// The GalleryApp IComponent + its 25-assert headless self-test live in the host-neutral
 // gallery_app.cb (P12 split); this file wires them to the native_host.cb shim (Win32 on
 // Windows, Cocoa on macOS), keeps the Win32-only screenshot path (PrintWindow -> BMP), and
 // owns main(). The WinUI 3 launcher is 06-winui/winui_gallery.cb (same gallery_app.cb, WinUI host).

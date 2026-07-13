@@ -1,6 +1,6 @@
 // todo_test.cb - the test target for todo_app.cb, and the "copy-me" example of the
 // ui_test.cb framework. Copy this file + todo_app.cb, rename them, and swap in your own
-// Component to get an automated, CI-ready test suite for a ui_native app.
+// IComponent to get an automated, CI-ready test suite for a ui_native app.
 //
 // It imports THREE things: a host backend (ui_native/host.cb - the default Win32/Cocoa
 // host), the test framework (ui_test.cb), and the shared app module (todo_app.cb). The

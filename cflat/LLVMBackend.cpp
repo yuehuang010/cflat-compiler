@@ -3996,7 +3996,9 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     llvm::json::Object root;
     {
         llvm::TimeTraceScope buildScope("CoreCacheJsonBuild", prefix);
-    root["version"]   = 1;
+    // Version 2 added interface FIELDS to the interface records; a v1 cache would
+    // silently drop them, so it must be rejected rather than reused.
+    root["version"]   = 2;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
 
@@ -4107,6 +4109,10 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
             llvm::json::Array ms;
             for (auto& m : methods) ms.push_back(SerializeIfaceMethod(m));
             io["methods"] = std::move(ms);
+            llvm::json::Array fs;
+            if (auto it = interfaceFields.find(name); it != interfaceFields.end())
+                for (auto& f : it->second) fs.push_back(SerializeTav(f));
+            io["fields"] = std::move(fs);
             arr.push_back(std::move(io));
         }
         root["interfaces"] = std::move(arr);
@@ -4247,7 +4253,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 1) return false;
+    if (!ver || *ver != 2) return false;
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != ComputeCoreHash(runtimeDir)) return false;
 
@@ -4423,6 +4429,14 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
                 for (auto& me : *ms)
                     if (auto* mo = me.getAsObject()) methods.push_back(DeserializeIfaceMethod(*mo));
             interfaceTable[iname] = std::move(methods);
+
+            // Interface FIELDS (byte-offset vtable slots). Parents' fields were already
+            // flattened into the list at definition time, so restore it verbatim.
+            std::vector<TAV> fields;
+            if (auto* fs = io->getArray("fields"))
+                for (auto& fe : *fs)
+                    if (auto* fo = fe.getAsObject()) fields.push_back(DeserializeTav(*fo));
+            interfaceFields[iname] = std::move(fields);
         }
 
     } // end CoreDes:Interfaces

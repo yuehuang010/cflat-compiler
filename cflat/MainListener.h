@@ -1010,9 +1010,50 @@ private:
             std::vector<std::string> memberNames;
             for (const auto& m : methods)
                 memberNames.push_back(m.Name);
+            for (const auto& f : fields)
+                memberNames.push_back(f.VariableName);
             s->Register(SymbolKind::Interface, name, Compiler(ctx)->GetSourceFilePath(),
                         (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
                         sig, memberNames, ExtractLeadingDoc(tokens_, ctx->getStart()));
+
+            // Interface FIELDS are reached like struct fields (`b.title`), so they need the same
+            // "Type.field" symbols that dot-completion, hover and go-to-definition resolve
+            // against. The interface's field list is already flattened over its parents, so an
+            // inherited field is registered under this name too - pointing at the parent's
+            // declaration site, which is where it is actually written.
+            std::unordered_map<std::string, CFlatParser::InterfaceFieldContext*> ownFields;
+            for (auto* f : ctx->interfaceField())
+                ownFields[f->directDeclarator()->getText()] = f;
+
+            const auto* allFields = Compiler(ctx)->GetInterfaceFields(name);
+            static const std::vector<LLVMBackend::TypeAndValue> kNoFields;
+            for (const auto& f : allFields != nullptr ? *allFields : kNoFields)
+            {
+                if (f.VariableName.empty()) continue;
+                std::string typeSig = f.TypeName + (f.Pointer ? "*" : "");
+                std::string key = name + "." + f.VariableName;
+
+                if (auto it = ownFields.find(f.VariableName); it != ownFields.end())
+                {
+                    auto* fc = it->second;
+                    s->Register(SymbolKind::Field, key, Compiler(ctx)->GetSourceFilePath(),
+                                (int)fc->getStart()->getLine(), (int)fc->getStart()->getCharPositionInLine(),
+                                typeSig + " " + key, {}, ExtractLeadingDoc(tokens_, fc->getStart()));
+                    continue;
+                }
+                // Inherited: reuse the parent's recorded location and doc. Copy them out before
+                // registering - Register rehashes the symbol map and would invalidate the pointer.
+                for (const auto& parent : parentNames)
+                {
+                    const SymbolDef* pd = s->Lookup(parent + "." + f.VariableName);
+                    if (pd == nullptr) continue;
+                    std::string pFile = pd->file, pDoc = pd->docComment;
+                    int pLine = pd->line, pCol = pd->column;
+                    s->Register(SymbolKind::Field, key, pFile, pLine, pCol,
+                                typeSig + " " + parent + "." + f.VariableName, {}, pDoc);
+                    break;
+                }
+            }
         }
     }
 
@@ -4100,6 +4141,22 @@ public:
                                 // `return nullptr;` for an interface return -> null fat pointer.
                                 right = llvm::ConstantAggregateZero::get(fatTy);
                             }
+                        }
+
+                        // Derived-interface -> parent-interface RETURN (`IElement f(){ IButton b = ...;
+                        // return b; }`). The returned value is already a fat pointer, but a derived
+                        // vtable is not layout-compatible with the parent's once field-offset slots
+                        // exist, so rebuild it through the typedesc chain - the same rebox the
+                        // assignment and call-argument paths do. A same-interface return is a no-op.
+                        // The ownership checks above are untouched: they fire on a returned concrete
+                        // POINTER (the boxing case), which this is not.
+                        if (auto* fatTy = compiler->GetFatPtrType();
+                            right != nullptr && fatTy != nullptr && right->getType() == fatTy
+                            && returnNV.TypeAndValue.IsInterface)
+                        {
+                            right = compiler->ReboxInterfaceIfNeeded(
+                                right, returnNV.TypeAndValue.TypeName,
+                                compiler->currentFunctionReturnTypeName);
                         }
 
                         compiler->CreateReturnCall(right, retStorage, interfaceReturnStructName);
@@ -19245,6 +19302,12 @@ public:
         compiler->programTable[name].InStreamFieldIndex      = inStreamFieldIndex;
         compiler->programTable[name].InboxArenaFieldIndex    = inboxArenaFieldIndex;
         compiler->programTable[name].OutboxFieldIndex        = outboxFieldIndex;
+
+        // A `program X : IFace` implements the interface's fields out of its config fields
+        // (user fields come first, synthetics are appended), so verify them here - eagerly,
+        // at the program definition, exactly as a class does.
+        for (const auto& iface : compiler->programTable[name].Interfaces)
+            compiler->VerifyInterfaceFields(name, iface, compiler->programTable[name].ConfigFields);
 
         // Parse the user destructor if present (at most one). Emitted as a single
         // compiler-owned ~Name() whose user body runs first, then the builtin teardown.

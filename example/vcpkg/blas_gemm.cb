@@ -82,7 +82,7 @@ int checkAgainstNaive(string label, double[] a, double[] b, double[] c,
         checked = checked + 1;
         if (!close(got, ref))
         {
-            printf("  FAIL %s: C[%d,%d] = %.12g, naive = %.12g\n", label, i, j, got, ref);
+            printf("  FAIL %s: C[%d,%d] = %.12g, naive = %.12g\n", label.data(), i, j, got, ref);
             *okOut = false;
         }
     }

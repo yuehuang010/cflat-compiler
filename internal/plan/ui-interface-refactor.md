@@ -1,8 +1,9 @@
 # UI framework: pointers -> interfaces
 
-Status: PLANNING - the F1 gate is CLEARED. All four language features are proven
-FEASIBLE by a working compiler prototype (see
-`internal/plan/interface-fields-feasibility.md`). Phase 1 is ready to start.
+Status: PHASE 1 + PHASE 2 + PHASE 3 COMPLETE (2026-07-13). F1-F4 are productionized and
+shipped in the compiler, the framework-wide rename has landed, and the 22 widget
+interfaces are declared and consumed by `core/ui_native.cb`. Phase 4 (hosts) is ready to
+start - read the "Phase 4 inputs" section below first, it carries two hard constraints.
 Created: 2026-07-13
 
 ## Goal
@@ -129,45 +130,176 @@ OUT (for now):
 Sequencing is COMPILER FIRST: land the language features against a green,
 untouched UI framework, so a bisect can tell a language bug from a UI bug.
 
-### Phase 1 - Language (spike cleared; ~1 week)
-Productionize F1-F4 from the prototype. Regression coverage goes into
-`Test/test_interface.cb` (extend it; do not create new test files); error tests
-for the new diagnostics go in `Test/errors/`. Beyond what the spike proved, the
-following MUST be finished before F1 ships:
+### Phase 1 - Language - DONE (2026-07-13)
 
-1. RETURN-POSITION derived->parent upcast (F4's unwired case).
-2. BITCODE CACHE serialization of interface fields. `LLVMBackend.cpp:4095` /
-   `:4402` round-trip interface METHODS only. The cached set is runtime.cb's
-   closure, which does not include the UI interfaces, so this does not block the
-   UI refactor - but it silently drops fields for any cached core interface and
-   must be fixed before the feature is public.
-3. EAGER validation. Today the "implementor is missing this interface field"
-   check fires lazily at the first boxing site, not at the class definition.
-4. Field access on a NULL interface value segfaults (same as a method call on one
-   does today). F3's null-compare is the guard; decide whether that is acceptable
-   or whether it needs a diagnostic.
-5. LSP: interface fields produce no symbols. `test_lsp.bat` must still be green,
-   and hover/completion on an interface field should work before the UI refactor
-   lands (the whole point is that users write `b.title` against an interface).
-6. Untested surface: generic-interface fields (`interface IBox<T> { T value; }`)
-   and `program`-implementors.
+All six items landed. Gates: `test.bat` all passed, `test_lsp.bat` green (5 smoke +
+47 fixture + 204 bulk), `example.bat` 89 passed / 0 failed / 24 skipped. The UI framework
+was not touched.
 
-Gate: `test.bat` + `test_lsp.bat` green, UI framework UNTOUCHED.
+1. RETURN-POSITION upcast - DONE (`MainListener.h`, the return path). A returned
+   fat pointer whose static interface differs from the declared return interface is
+   rebuilt through the typedesc chain, like the assignment/arg paths. The two existing
+   ownership guards are untouched: both fire on a returned concrete POINTER, which an
+   already-boxed interface value is not.
+2. BITCODE CACHE - DONE. Interface records now round-trip a `fields` array
+   (`LLVMBackend.cpp`), and the metadata `version` went 1 -> 2 so any pre-existing
+   cache is rejected instead of silently dropping fields. Verified end-to-end by
+   temporarily adding a field-carrying interface to `core/interfaces.cb`, running
+   `--init`, and reading the field through the interface on a cache HIT.
+3. EAGER validation - DONE. `LLVMBackend::VerifyInterfaceFields` runs at the CLASS
+   (via `VerifyInterfaceImplementation`) and at the `program` definition, and names the
+   class, the interface, the field, and the expected type. `AppendInterfaceFieldOffsetSlots`
+   no longer reports (it trusts the eager check), so there is exactly one message.
+   Tests: `Test/errors/err_iface_field_missing.cb`, `err_iface_field_type_mismatch.cb`.
+4. NULL interface field access - DECIDED: leave it as a runtime fault, document it.
+   It is exactly what a METHOD call on a null interface value already does, cflat has no
+   static null tracking to catch it at compile time, and F3's `!= nullptr` compare is the
+   guard (now documented in `doc/LANGUAGE.md`). Adding a runtime null check on every field
+   read would tax the hot path of the UI reconciler for a bug the type system does not
+   otherwise catch.
+5. LSP - DONE. Interface fields register as `IFace.field` symbols from their own
+   declaration site; an INHERITED field is also registered under the derived interface
+   (pointing at the parent's declaration), so dot-completion on a derived interface shows
+   the whole flattened set. Four new fixtures under `cflat/test_lsp/fixtures/`
+   (hover, completion own-field, completion inherited-field, go-to-definition).
+6. Untested surface - BOTH WORK, no compiler change was needed:
+   - Generic-interface fields (`interface IHolder<T> { T value; }`) work, including two
+     implementors with different layouts. Covered by test 28 in `Test/test_interface.cb`.
+   - `program X : IFace` implementors work: the config fields are the implementor's
+     fields and the program vtable carries their offsets. Covered by
+     `testProgramInterfaceField` in `Test/test_program.cb`.
 
-### Phase 2 - Rename (mechanical, no semantics)
+MULTI-LEVEL CHAINS WORK (the Phase 3 gating question). A 3-level chain
+(`IPress : ITipped : IWidget`) with a field introduced at EVERY level was verified end to
+end against two implementors with deliberately reversed layouts: flattening is transitive
+and identical for methods and fields (each level prepends its parent's already-flattened
+list), so the interface's slot order and every implementor's vtable agree by construction;
+the dtor slot is computed from the flattened counts at each level and still fires exactly
+once; upcasts work child->parent AND child->grandparent in all four positions (assignment,
+call arg, `list<IAncestor>.add`, return); and `is` / `as` against an ancestor two levels up
+work. **Phase 3 can use the `IElement -> ITooltipped -> IDisableable -> IButton` design; it
+does not need to repeat shared fields across the 23 widget interfaces.**
+
+Known gaps left open deliberately (neither blocks the UI refactor):
+- Returning an interface value that BORROWS a stack local (`Circle c; IShape s = c;
+  return s;`) dangles and is not diagnosed. The direct form (`return c;`) is rejected.
+  Documented in `doc/LANGUAGE.md`.
+- An implicit interface->interface conversion that is NOT an upcast (unrelated or
+  downward) silently yields a null fat pointer instead of erroring, because the static
+  type of an `as`-cast result is not tracked precisely enough to tell the two apart
+  (`IButton b = e as IButton;` reaches the assignment still carrying `IElement`). The
+  runtime rebuild is what makes that pattern correct, so it must not error.
+- GEP-shape sniffing audit (the spike's landmine): the ONLY places that infer "this is a
+  struct-field store" from a 2-index GEP are `MainListener.h` `destIsStructField` /
+  `srcIsStructField`, and both already OR in `IsInterfaceField`. The other GEP tests in
+  the codebase (`isa<GetElementPtrInst>` in the deref/load paths, `GetTypeFromStorage`)
+  are shape-agnostic and treat the interface field's re-GEP correctly. Verified
+  leak-clean under HeapAudit: overwriting an owned `string` through an interface field
+  frees the old buffer.
+- `list<IFace>` bugs found while testing, both PRE-EXISTING and unrelated to fields.
+  BOTH ARE NOW CLOSED (2026-07-13), so Phase 3 can lean on `list<IElement>`:
+  - The heap corruption when a LOCAL `list<IFace>` had an element taken out and deleted
+    was REAL and is FIXED. Root cause: passing an owning `T*` to a `move IFace` parameter
+    boxed it into a fat pointer and handed ownership to the callee, but the caller kept
+    its owning flag, so scope exit freed it again. The interface-borrow guard in
+    `CreateOverloadedFunctionCall` now excludes POINTER arguments (a struct VALUE arg
+    still borrows - its fat ptr points at the caller's alloca). Covered by
+    `Test/test_interface.cb` tests 29-31.
+  - The 64-byte buffer leak was DISPROVEN - a HeapAudit measurement artifact
+    (`reportLeaks()` was called while the list was still live in scope). See
+    `internal/issue/list-of-interface-leaks-buffer.md`; nothing to fix.
+
+### Phase 2 - Rename (mechanical, no semantics) - DONE (2026-07-13)
 `Element`->`IElement`, `Canvas`->`ICanvas`, `Component`->`IComponent`,
 `NativeHost`->`INativeHost`, across `core/ui_native.cb`, `core/ui_native/*.cb`,
-`core/ui_canvas/*.cb`, `core/ui_test.cb`, `example/ui/**`, `doc/UI.md`.
-Gate: all three suites green. Ship separately - a rename that is tangled with a
-semantic change is unreviewable.
+`core/ui_canvas/*.cb`, `core/ui_test.cb`, `core/cocoa.cb`, `example/ui/**`, `doc/UI.md`.
+28 files, 624 insertions / 624 deletions, zero compiler files touched. The one
+`"type":"Component"` STRING LITERAL in `toJson` is deliberately NOT renamed - it is a
+serialized JSON contract. Gate: all three suites green.
 
-### Phase 3 - Widget interfaces
-Declare `interface IView : IElement`, `IButton : IElement`, ... for all 23
-element classes, carrying the fields each host/reconciler actually reaches
-(derive the list from the measured 255 reach-throughs; ~45 distinct fields).
-Convert the framework internals: the 23 `propsEqual` downcasts and the layout
-flex probes (`ui_native.cb:814`, `:821`, `:850` - these reach a NESTED struct
-field, `v.style.width`).
+### Phase 3 - Widget interfaces - DONE (2026-07-13)
+
+`core/ui_native.cb` only (the sole file changed). 22 widget interfaces declared; all 32
+concrete-class downcasts in the file are gone (grep for ` as <ElementClass>` returns only
+a prose comment). Gates: `test.bat` all passed, `test_lsp.bat` 204/204, `example.bat`
+89 passed / 0 failed / 24 skipped and leak-clean. Hosts, factories, contexts, and
+examples were NOT touched and still compile against the concrete classes unchanged.
+
+Shipped hierarchy (see `internal/plan/ui-widget-interface-inventory.md` for the evidence):
+
+```
+IElement
+  +- ITooltipped  { string tooltip; }                 // 15 implementors
+  |    +- IDisableable { bool disabled; }             // 10 implementors
+  |    |    +- IButtonElement, ITextInput, ICheckbox, ISlider, ITextArea,
+  |    |       IRadioButton, IComboBox, IListView, ITabControl, ITreeView
+  |    +- IText, IProgressBar, IImageElement, IGroupBox, ICanvasView
+  +- IView, IBox, IStatusBar, IScrollView, IRadioGroup, ITabPane, ISplitView
+```
+
+The `ITooltipped -> IDisableable` chain the inventory recommended is in, and the
+multi-level upcast it depends on works. `ComponentElement` got no interface (zero
+downcasts repo-wide), so 22 interfaces for 23 classes.
+
+Deviations from the inventory, all deliberate:
+
+1. **`IButton` and `IImage` are named `IButtonElement` / `IImageElement`.** HARD NAME
+   COLLISION, not a style choice: `core/ui_native/winui.cb` consumes the WinUI winmd,
+   which projects a WinRT `IButton` (used at `winui.cb:117`) and a WinRT `IImage`
+   (`:587-589`, `iidof(IImage)` + `put_Source` through its vtable). A WinMD projection
+   and a cflat interface cannot share a name - the WinMD type wins the lookup and the
+   cflat interface value is then GEP'd as a COM struct, producing INVALID IR ("Invalid
+   bitcast ... %__iface_fat_ptr", module verification failure), not a diagnostic. Fully
+   qualified WinMD names (`Microsoft.UI.Xaml.Controls.IImage`) are NOT supported, so no
+   spelling in winui.cb can dodge it. See "Phase 4 inputs" below.
+2. **9 of the 14 closure fields are NOT interface fields.** They are reached only to be
+   INVOKED, so they got fire* wrapper methods on the class (mirroring the existing
+   `fireClick`/`fireToggle`/`fireSet`): `TextInput.fireChangeText`, `TextArea.fireChange`,
+   `RadioGroup.fireChange`, `ComboBox.fireChange`, `ListView.fireSelect`/`fireActivate`,
+   `TabControl.fireSelectTab`, `TreeView.fireSelect`/`fireExpand`,
+   `SplitView.fireRatioChange`. The 5 closures the hosts must READ AS VALUES (to clone
+   into a box across the u64 `INativeHost` seam) ARE interface fields:
+   `IListView.rowText`, `ITreeView.childCount`/`childId`/`label`, `ICanvasView.onPaint`.
+3. `RadioButton.bounds` is not an interface field - `RadioGroup.dispatch` now uses
+   `IElement.nodeBounds()`, as the inventory recommended.
+4. `TabControl.addPane(TabPane* p)` is NOT on `ITabControl` (it takes a concrete pointer
+   and no host calls it). `ITabControl.add(IElement)` covers the interface contract.
+
+All 23 `propsEqual` bodies keep their exact semantics - only the downcast type changed
+(`X* o = other as X` -> `IX o = other as IX`). The 5 deliberately special-cased ones are
+unchanged: `TextArea` still ignores `value`, `ListView` still ignores its 3 closures and
+its column CONTENTS (count only), `Image` still ignores `source`/`altText`/`tooltip`,
+`CanvasView` still compares nothing, `ComponentElement` still returns `true` (and never
+had a cast).
+
+### Phase 4 inputs (read before starting the hosts)
+
+1. **Lambda-typed interface fields WORK.** Proven end to end against two implementors
+   with deliberately different field offsets: reading the field BY VALUE into a by-value
+   `Lambda` parameter CLONES (the field is still invocable afterwards - this was the top
+   risk, E1 in the inventory), invoking through the field works, and overwriting the
+   field works. Leak-neutral: a HeapAudit run through the interface field and through the
+   equivalent concrete-class pointer report byte-identical results. So
+   `IListView.rowText` / `ITreeView.*` / `ICanvasView.onPaint` can be passed straight to
+   `_boxListRow` / `_boxTree` / `_boxCanvas` in Phase 4.
+   Owning-container interface fields (`list<string>`, `list<int>`, `list<IElement>`) are
+   also true lvalues - `o.items.count()` and `o.items.add(...)` hit the object, not a
+   copy (E2 clear).
+2. **A cflat interface name is unusable if ANY file in the import closure names a WinMD
+   type of the same name.** Today that is exactly `IButton` and `IImage` (both from
+   `winui.cb`). It is NOT a general WinUI-namespace clash: `IListView`, `ISlider`,
+   `IComboBox`, ... all exist in the WinUI winmd too but resolve to the cflat interface,
+   because winui.cb never names them as WinRT types. Phase 4 must not introduce a WinRT
+   reference whose short name matches a widget interface. Two follow-ups worth doing,
+   neither blocking:
+   - The compiler should ERROR on this collision instead of emitting invalid IR.
+   - `winui.cb:117` uses WinRT `IButton` only as an arbitrary IUnknown stand-in for the
+     slot-0 QI (its own comment says so). Switching it to `IButtonBase` (already imported
+     and used at `:437`) would free the `IButton` name; `IImage` at `:587-589` is a real
+     use and cannot be freed without qualified-name support.
+3. Pre-existing bug found while validating (does not block Phase 4, but do not build on
+   it): calling a `Lambda<string(...)>` CLASS FIELD and binding the owned result to a
+   local leaks the string. See `internal/issue/lambda-field-call-owned-string-result-leaks.md`.
 
 ### Phase 4 - Hosts
 `win32.cb` (52 casts), `cocoa.cb` (52), `winui.cb` (50): `applyProps`,
@@ -180,6 +312,19 @@ The 24 factory signatures (`view`, `button`, `scrollView`, ... `ui_native.cb:226
 return interface values (`move IButton button(...)`) instead of `Button*`.
 JSX is unchanged: `<Button/>` still news a concrete `Button` and auto-boxes at
 the `IElement` slot.
+
+PREREQUISITE (landed 2026-07-13, do not regress): the `move IFace` double-free fix.
+Passing an owning pointer to a `move` interface parameter used to leave the caller
+owning it too - a double free. This is exactly the shape Phase 5 introduces, since a
+factory hands a freshly-`new`ed widget into the tree by move. The shipped framework
+never hit it only because `View.add(IElement child)` is NOT a `move` param today (the
+caller keeps ownership and the tree borrows); the moment factories return
+`move IButton` and children are added by move, every add goes through this path.
+Both call paths are covered now:
+- direct calls: `CreateOverloadedFunctionCall` (interface-borrow guard excludes pointers)
+- virtual dispatch: `CallInterfaceMethod` had NO move-param source-nulling AT ALL; both
+  paths now share `LLVMBackend::ApplyMoveParamTransfer` so they cannot drift again.
+Regression cover: `Test/test_interface.cb` tests 29-32.
 
 ### Phase 6 - Contexts
 `UiContext` struct -> class + `IUiContext` (the 64 `.theme` reads need a field or

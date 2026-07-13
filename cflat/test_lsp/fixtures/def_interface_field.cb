@@ -1,0 +1,6 @@
+// $cursor line=3 col=62
+// $expect definition line=1
+interface IElement { int kind(); int tag; };
+interface IButton : IElement { string title; };
+class Button : IButton { int tag = 0; string title = default; int kind() { return 1; } };
+extern int main() { Button b; IButton ib = b; string t = ib.title; return ib.tag; }

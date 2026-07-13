@@ -1009,6 +1009,451 @@ bool testDowncastCallResultBorrow()
     return result;
 }
 
+// ── Tests 26-28: interface FIELDS (byte-offset vtable slots) ─────────────────
+// A 3-level interface chain that introduces a field at EVERY level, so a field
+// read through the interface must index the flattened [grandparent, parent, own]
+// field list. Two implementors lay their fields out DIFFERENTLY on purpose - a
+// fixed offset could not pass these; only the per-implementor offset slot can.
+struct WBox
+{
+    int w = 0;
+    int h = 0;
+};
+
+interface IWidget
+{
+    int kind();
+    int  tag;
+    WBox box;
+};
+
+interface ITipped : IWidget
+{
+    string tip;
+};
+
+interface IPress : ITipped
+{
+    int clicks();
+    string label;
+};
+
+int gWidgetDtorCount = 0;
+
+class Pressy : IPress
+{
+    int pad = 7;               // pushes every field off a "natural" offset
+    int tag = 0;
+    WBox box = default;
+    string tip = default;
+    string label = default;
+    int nclicks = 0;
+    int kind()   { return 1; }
+    int clicks() { return nclicks; }
+    ~Pressy() { gWidgetDtorCount = gWidgetDtorCount + 1; }
+};
+
+class Toggly : IPress
+{
+    string label = default;    // deliberately the reverse layout of Pressy
+    i64 pad2 = 0;
+    string tip = default;
+    WBox box = default;
+    int nclicks = 0;
+    int tag = 0;
+    int kind()   { return 2; }
+    int clicks() { return nclicks + 100; }
+    ~Toggly() { gWidgetDtorCount = gWidgetDtorCount + 1; }
+};
+
+class Plain : IWidget          // implements the ROOT interface only
+{
+    WBox box = default;
+    int tag = 0;
+    int kind() { return 3; }
+    ~Plain() { gWidgetDtorCount = gWidgetDtorCount + 1; }
+};
+
+// A global list keeps this test focused on the upcast itself. The LOCAL-list form
+// (take + delete at scope exit) is covered by testLocalListInterfaceTakeDelete.
+list<IWidget> _wzoo = default;
+
+// Call-argument upcast: a derived-interface value binds an ancestor-interface param.
+int widgetTag(IWidget w)  { return w.tag; }
+int widgetKind(IWidget w) { return w.kind(); }
+
+// Return-position upcast: IPress local returned from an IWidget-returning function.
+move IWidget makePressy(int t)
+{
+    Pressy* p = new Pressy();
+    p.tag   = t;
+    p.tip   = "tip";
+    p.label = "Go";
+    IPress ip = p;
+    return ip;
+}
+
+// ── Test 26: read/write interface fields across a 3-level chain ──────────────
+bool testInterfaceFieldAccess()
+{
+    bool result = true;
+    gWidgetDtorCount = 0;
+
+    Pressy* p = new Pressy();
+    p.tag = 1; p.tip = "pt"; p.label = "Go";   p.nclicks = 3;
+    Toggly* t = new Toggly();
+    t.tag = 2; t.tip = "tt"; t.label = "Flip"; t.nclicks = 9;
+
+    IPress ip = p;                             // heap pointer moves into the interface
+    IPress it = t;
+
+    // Read a field declared at each level of the chain, on both layouts.
+    result &= Test("ifld_own_a",     ip.label, "Go");
+    result &= Test("ifld_own_b",     it.label, "Flip");
+    result &= Test("ifld_parent_a",  ip.tip,   "pt");
+    result &= Test("ifld_parent_b",  it.tip,   "tt");
+    result &= Test("ifld_grand_a",   ip.tag,   1);
+    result &= Test("ifld_grand_b",   it.tag,   2);
+    // Methods still dispatch (fields do not disturb the method slots).
+    result &= Test("ifld_method_a",  ip.clicks(), 3);
+    result &= Test("ifld_method_b",  it.clicks(), 109);
+
+    // Write through the interface: int, owned string, and a NESTED struct field.
+    ip.tag = 11;
+    it.tip = "z" + "z!";                       // owned buffer; the old one must be freed
+    ip.box.w = 5;
+    it.box.h = 6;
+    result &= Test("ifld_write_int",      ip.tag,   11);
+    result &= Test("ifld_write_string",   it.tip,   "zz!");
+    result &= Test("ifld_write_nested_a", ip.box.w, 5);
+    result &= Test("ifld_write_nested_b", it.box.h, 6);
+    // The write landed in the concrete object, at that object's own offset.
+    result &= Test("ifld_write_seen_by_iface", it.kind(), 2);
+
+    delete ip;
+    delete it;
+    result &= Test("ifld_dtor_once", gWidgetDtorCount, 2);
+
+    return result;
+}
+
+// --- Test 29: boxing an owning POINTER local into a `move` interface param ---
+// Regression (heap corruption): passing an owning `T*` local to a `move IFace`
+// parameter (e.g. `list<IFace>.add`) boxes it into a fat pointer and hands
+// ownership to the callee. The source local used to keep its owning flag, so its
+// scope-exit cleanup freed the object the list still held - then `delete` on the
+// taken-out element freed it again (double free -> STATUS_HEAP_CORRUPTION at exit).
+// The dtor counters below catch the double free deterministically; the heap
+// corruption itself shows up as a non-zero process exit code.
+int gBoxDtorCount = 0;
+
+interface IBoxed { int value(); };
+
+class Boxed : IBoxed
+{
+    int v = 0;
+    int value() { return v; }
+    ~Boxed() { gBoxDtorCount = gBoxDtorCount + 1; }
+};
+
+// The UI-tree shape: the list is a CLASS FIELD, elements are handed in through a
+// `move IFace` parameter, then deleted one by one and the list is cleared.
+class BoxHolder
+{
+    list<IBoxed> children = default;
+
+    void addChild(move IBoxed c)
+    {
+        this.children.add(c);
+    }
+
+    int sum()
+    {
+        int total = 0;
+        for (IBoxed c in this.children)
+            total += c.value();
+        return total;
+    }
+
+    void destroyTree()
+    {
+        for (IBoxed c in this.children)
+            delete c;
+        this.children.clear();
+    }
+};
+
+bool testLocalListInterfaceTakeDelete()
+{
+    bool result = true;
+    gBoxDtorCount = 0;
+
+    {
+        list<IBoxed> zoo = default;      // LOCAL list - its buffer is freed at scope exit
+
+        Boxed* named = new Boxed();      // owning local, boxed into the list on add
+        named->v = 7;
+        zoo.add(named);
+        zoo.add(new Boxed());            // temporary form
+
+        result &= Test("localbox_count",      zoo.count(),      2);
+        result &= Test("localbox_elem0",      zoo[0].value(),   7);
+        // The list owns the objects now - the moved-from local must not have freed one.
+        result &= Test("localbox_no_early_dtor", gBoxDtorCount, 0);
+
+        IBoxed first = zoo.take(0);
+        delete first;
+        result &= Test("localbox_dtor_after_first", gBoxDtorCount, 1);
+
+        IBoxed second = zoo.take(0);
+        delete second;
+        result &= Test("localbox_dtor_after_second", gBoxDtorCount, 2);
+        result &= Test("localbox_empty", zoo.count(), 0);
+    }
+    // The local list's own destructor ran here (buffer freed). A double free of an
+    // element would already have corrupted the heap; the count must still be exactly 2.
+    result &= Test("localbox_dtor_total", gBoxDtorCount, 2);
+
+    return result;
+}
+
+// ── Test 27: `is <Interface>`, null-compare, and derived -> parent upcast ────
+bool testInterfaceIsNullUpcast()
+{
+    bool result = true;
+    gWidgetDtorCount = 0;
+
+    Pressy* p = new Pressy();
+    p.tag = 4; p.tip = "pt"; p.label = "Go";
+    IPress ip = p;
+    Plain* pl = new Plain();
+    pl.tag = 5;
+    IWidget iw = pl;
+
+    // `x is <Interface>`: true for an implementor, false for a non-implementor.
+    result &= Test("iface_is_self",    ip is IPress,   true);
+    result &= Test("iface_is_ancestor", ip is IWidget, true);   // two levels up
+    result &= Test("iface_is_false",   iw is IPress,   false);
+
+    // `as <Interface>` hit/miss, tested with a null-compare on the fat pointer.
+    IPress hit  = ip as IPress;
+    IPress miss = iw as IPress;
+    result &= Test("iface_null_hit",       hit  != nullptr, true);
+    result &= Test("iface_null_miss",      miss != nullptr, false);
+    result &= Test("iface_null_miss_eq",   miss == nullptr, true);
+    result &= Test("iface_null_hit_field", hit.label,       "Go");
+
+    // Upcast (derived -> parent/grandparent) in every position.
+    IWidget upAssign = ip;                                    // assignment
+    result &= Test("iface_up_assign",  upAssign.tag,  4);
+    result &= Test("iface_up_arg",     widgetTag(ip), 4);     // call argument
+    result &= Test("iface_up_arg_kind", widgetKind(ip), 1);
+    ITipped upMid = ip;                                       // one level, not two
+    result &= Test("iface_up_mid",     upMid.tip, "pt");
+
+    IWidget upRet = makePressy(6);                            // return position
+    result &= Test("iface_up_return",      upRet.tag,  6);
+    result &= Test("iface_up_return_kind", upRet.kind(), 1);
+
+    _wzoo.add(ip);                                            // list<IParent>.add
+    _wzoo.add(upRet);
+    _wzoo.add(iw);
+    int sum = 0;
+    for (int i = 0; i < _wzoo.count(); i++)
+    {
+        IWidget w = _wzoo.get(i);
+        sum = sum + w.tag * 10 + w.kind();
+    }
+    result &= Test("iface_up_list", sum, 155);   // 41 + 61 + 53
+
+    while (_wzoo.count() > 0)
+    {
+        IWidget w = _wzoo.take(0);
+        delete w;                                // dtor runs exactly once each
+    }
+    result &= Test("iface_up_list_dtor_once", gWidgetDtorCount, 3);
+
+    return result;
+}
+
+// --- Test 30: same boxing shape across a list _grow (buffer realloc) ---
+bool testLocalListInterfaceGrowTakeDelete()
+{
+    bool result = true;
+    gBoxDtorCount = 0;
+
+    {
+        list<IBoxed> zoo = default;
+        int i = 0;
+        while (i < 6)                    // > 4: forces _grow (buffer realloc)
+        {
+            Boxed* b = new Boxed();
+            b->v = i;
+            zoo.add(b);
+            i++;
+        }
+        result &= Test("growbox_count",         zoo.count(),   6);
+        result &= Test("growbox_no_early_dtor", gBoxDtorCount, 0);
+
+        int sum = 0;
+        while (zoo.count() > 0)
+        {
+            IBoxed it = zoo.take(0);
+            sum += it.value();
+            delete it;
+        }
+        result &= Test("growbox_sum",  sum,           15);   // 0+1+2+3+4+5
+        result &= Test("growbox_dtors", gBoxDtorCount, 6);
+    }
+    result &= Test("growbox_dtor_total", gBoxDtorCount, 6);
+
+    return result;
+}
+
+// A GENERIC interface with a field: the field's type is the substituted argument.
+interface IHolder<T>
+{
+    int kind();
+    T value;
+};
+
+class IntHolder : IHolder<int>
+{
+    int pad = 3;
+    int value = 0;
+    int kind() { return 1; }
+};
+
+class WideHolder : IHolder<int>
+{
+    int value = 0;
+    i64 pad = 0;
+    int kind() { return 2; }
+};
+
+// ── Test 28: fields on a GENERIC interface ──────────────────────────────────
+bool testGenericInterfaceField()
+{
+    bool result = true;
+
+    IntHolder* a = new IntHolder();
+    a.value = 11;
+    WideHolder* b = new WideHolder();
+    b.value = 22;
+
+    IHolder<int> ia = a;
+    IHolder<int> ib = b;
+    result &= Test("gen_ifld_read_a",  ia.value, 11);
+    result &= Test("gen_ifld_read_b",  ib.value, 22);
+    ia.value = 33;
+    result &= Test("gen_ifld_write_a", ia.value, 33);
+    result &= Test("gen_ifld_method",  ia.kind() * 10 + ib.kind(), 12);
+
+    delete ia;
+    delete ib;
+
+    return result;
+}
+
+// --- Test 31: the UI-tree shape - list<IFace> as a CLASS FIELD, filled via `move` ---
+bool testFieldListInterfaceTeardown()
+{
+    bool result = true;
+    gBoxDtorCount = 0;
+
+    {
+        // Field list on a STACK-allocated holder (the field's list dtor runs at scope exit).
+        BoxHolder h;
+        Boxed* a = new Boxed();
+        a->v = 3;
+        h.addChild(a);
+        h.addChild(new Boxed());
+
+        result &= Test("fieldbox_sum",           h.sum(),       3);
+        result &= Test("fieldbox_no_early_dtor", gBoxDtorCount, 0);
+
+        h.destroyTree();                 // iterate, delete each, clear
+        result &= Test("fieldbox_dtors_after_teardown", gBoxDtorCount, 2);
+        result &= Test("fieldbox_empty",                h.children.count(), 0);
+    }
+    result &= Test("fieldbox_dtor_total", gBoxDtorCount, 2);
+
+    // Same shape on a HEAP-allocated holder (the UI tree's actual layout).
+    gBoxDtorCount = 0;
+    BoxHolder* hp = new BoxHolder();
+    Boxed* b = new Boxed();
+    b->v = 5;
+    hp->addChild(b);
+    result &= Test("fieldbox_heap_sum", hp->sum(), 5);
+    hp->destroyTree();
+    result &= Test("fieldbox_heap_dtors", gBoxDtorCount, 1);
+    delete hp;
+    result &= Test("fieldbox_heap_dtor_total", gBoxDtorCount, 1);
+
+    return result;
+}
+
+// --- Test 32: a `move` parameter on an INTERFACE method (virtual dispatch) ---
+// Regression: the virtual-dispatch call path had no move-param source-nulling at all,
+// so an owning local boxed into a `move` param kept its owning flag and was freed a
+// second time at the caller's scope exit (STATUS_HEAP_CORRUPTION at process exit).
+interface IBoxSink
+{
+    void take(move IBoxed c);
+    int  total();
+    void drain();
+};
+
+class BoxSink : IBoxSink
+{
+    list<IBoxed> items = default;
+
+    void take(move IBoxed c) { this.items.add(c); }
+
+    int total()
+    {
+        int t = 0;
+        for (IBoxed i in this.items)
+            t += i.value();
+        return t;
+    }
+
+    void drain()
+    {
+        for (IBoxed i in this.items)
+            delete i;
+        this.items.clear();
+    }
+};
+
+bool testMoveParamThroughInterfaceMethod()
+{
+    bool result = true;
+    gBoxDtorCount = 0;
+
+    BoxSink* bs = new BoxSink();
+    IBoxSink sink = bs;
+
+    {
+        Boxed* p = new Boxed();      // owning local
+        p->v = 41;
+        sink.take(p);                // virtual dispatch, `move IBoxed` param
+        // `p` is moved-from here; reading it is a compile-time error.
+    }
+    // The caller's source was nulled, so `p`'s scope exit did NOT free the object the
+    // sink now owns. Without the nulling this is already 1 (and the heap is corrupt).
+    result &= Test("movevirt_source_nulled", gBoxDtorCount, 0);
+    result &= Test("movevirt_callee_owns",   sink.total(),  41);
+
+    sink.drain();                    // the real owner frees it - exactly once
+    result &= Test("movevirt_dtor_once", gBoxDtorCount, 1);
+
+    delete sink;
+    result &= Test("movevirt_dtor_total", gBoxDtorCount, 1);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -1039,6 +1484,13 @@ extern int main()
     total++; passed += testStackOwningValueBoxedToInterface() ? 1 : 0;
     total++; passed += testInterfaceFieldString()        ? 1 : 0;
     total++; passed += testDowncastCallResultBorrow()    ? 1 : 0;
+    total++; passed += testInterfaceFieldAccess()        ? 1 : 0;
+    total++; passed += testInterfaceIsNullUpcast()       ? 1 : 0;
+    total++; passed += testGenericInterfaceField()       ? 1 : 0;
+    total++; passed += testLocalListInterfaceTakeDelete()     ? 1 : 0;
+    total++; passed += testLocalListInterfaceGrowTakeDelete() ? 1 : 0;
+    total++; passed += testFieldListInterfaceTeardown()       ? 1 : 0;
+    total++; passed += testMoveParamThroughInterfaceMethod()  ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

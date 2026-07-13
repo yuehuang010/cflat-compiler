@@ -15,13 +15,13 @@
 import "ui_native.cb";
 import "terminal.cb";
 
-class BoxApp : Component
+class BoxApp : IComponent
 {
     int termW = 20;
     int termH = 8;
     int clicks = 0;
 
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         Box* root = box(makeStyle(0, this.termW, this.termH));
         root.setKey("root");
@@ -89,7 +89,7 @@ bool renderFramedAt(BoxApp* app, int w, int h)
 {
     UiContext ctx = default;
     app.termW = w; app.termH = h;
-    Element tree = app.render(&ctx);
+    IElement tree = app.render(&ctx);
     layoutRoot(tree, 0, 0, w);
     Surface s; s.init(w, h);
     s.fill(' ');
@@ -115,7 +115,7 @@ bool testClickAddsBox()
     BoxApp app; app.clicks = 0;
     app.termW = 24; app.termH = 10;
 
-    Element tree = app.render(&ctx);
+    IElement tree = app.render(&ctx);
     layoutRoot(tree, 0, 0, 24);
 
     // Dispatch a click by scanning the grid for the cell the button occupies.
@@ -131,7 +131,7 @@ bool testClickAddsBox()
     }
     if (!clicked || app.clicks != 1 || !ctx.consumeDirty()) { deleteTree(tree); return false; }
 
-    Element wip = app.render(&ctx);
+    IElement wip = app.render(&ctx);
     list<Patch> p = default;
     tree = reconcile(tree, wip, &p);
     bool oneInsert = countOp(&p, PATCH_INSERT) == 1;
@@ -184,11 +184,11 @@ void flushFrame(Terminal* term, Surface* front, Surface* back, int height, bool 
 // Render the whole tree fresh into `back` and full-paint. Used for the first
 // frame and after a resize (a size change does not produce reconcile patches, so
 // it cannot ride the incremental path - we rebuild and repaint everything).
-move Element repaintAll(BoxApp* app, UiContext* ctx, Terminal* term, Surface* front,
-                       Surface* back, move Element tree, int w, int h)
+move IElement repaintAll(BoxApp* app, UiContext* ctx, Terminal* term, Surface* front,
+                       Surface* back, move IElement tree, int w, int h)
 {
     deleteTree(tree);
-    Element fresh = app.render(ctx);
+    IElement fresh = app.render(ctx);
     layoutRoot(fresh, 0, 0, w);
     back.fill(' ');
     fresh.paint(canvasFor(back), ctx);
@@ -216,7 +216,7 @@ int runApp(BoxApp* app)
     Surface front; front.init(w, h);
     Surface back;  back.init(w, h);
 
-    Element tree = app.render(&ctx);
+    IElement tree = app.render(&ctx);
     layoutRoot(tree, 0, 0, w);
     back.fill(' ');
     tree.paint(canvasFor(&back), &ctx);
@@ -261,7 +261,7 @@ int runApp(BoxApp* app)
         // state, then repaint only the rows that actually differ.
         if (ctx.consumeDirty())
         {
-            Element wip = app.render(&ctx);
+            IElement wip = app.render(&ctx);
             list<Patch> patches = default;
             tree = reconcile(tree, wip, &patches);
             if (patches.count() > 0)

@@ -1,4 +1,4 @@
-// todo_app.cb - a small host-neutral to-do app Component, the shared module the
+// todo_app.cb - a small host-neutral to-do app IComponent, the shared module the
 // ui_test.cb template drives. This is the "copy-me" app half of the testing template:
 // the test target (todo_test.cb) imports it AND a host backend, then automates it.
 //
@@ -22,7 +22,7 @@ import "time.cb";
 // Delete button for the selected task, a "Load sample" button that fills the list from a
 // background thread, and a theme toggle. All state is controlled (the model is the source
 // of truth; render() reflects it), so the test can assert on model + control state alike.
-class TodoApp : Component
+class TodoApp : IComponent
 {
     list<string> todos    = default;   // the task list (ListView row source)
     string       newItem  = default;   // the text field's controlled value
@@ -88,7 +88,7 @@ class TodoApp : Component
         this.uiCtx.invalidate();
     }
 
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         ctx.theme = this.dark ? darkTheme() : lightTheme();
 

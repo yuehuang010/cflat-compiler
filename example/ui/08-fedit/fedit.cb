@@ -91,7 +91,7 @@ string fsContent(int nid)
     return "";
 }
 
-class Editor : Component
+class Editor : IComponent
 {
     string path     = default;   // active tab's file ("" = untitled)
     bool   dirty    = false;     // active tab's dirty flag
@@ -186,7 +186,7 @@ class Editor : Component
 
     // Authored partly in the <Tag/> sugar (P6.5); tabs/tree are dynamic so they are
     // built imperatively (sugar children are static by design).
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         ctx.theme = this.isDark ? darkTheme() : lightTheme();
         this._ensureTabs();

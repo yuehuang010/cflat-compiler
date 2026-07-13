@@ -4,7 +4,7 @@
 // This is the SAME app shape as example/ui/02-terminal/boxes.cb but it renders to a real
 // window with GDI. Nothing in the framework changed between the two - only the
 // host (core/ui_canvas/win32.cb's GdiCanvas + message loop) differs from the TUI
-// host. That is the whole point of the Canvas seam: swap the draw target, reuse
+// host. That is the whole point of the ICanvas seam: swap the draw target, reuse
 // the tree, the reconciler, and the model layer unchanged.
 //
 // The outer box is sized from hostWidth()/hostHeight() (the host's window-size
@@ -22,12 +22,12 @@
 // close the window to quit.
 import "ui_canvas/win32.cb";
 
-class BoxApp : Component
+class BoxApp : IComponent
 {
     int    clicks = 0;
     string label  = default;
 
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         // Declare the app's styling preference once; widgets that set no color of
         // their own inherit it. Try darkTheme() for the charcoal variant.
@@ -71,7 +71,7 @@ class BoxApp : Component
 };
 
 // ── Offscreen GDI readback self-test ─────────────────────────────────────────
-// Verifies the GDI Canvas path WITHOUT a visible window: it paints a tree (Box +
+// Verifies the GDI ICanvas path WITHOUT a visible window: it paints a tree (Box +
 // Text + an overflowing ScrollView) into a memory bitmap through GdiCanvas, then
 // reads pixels back to assert the geometry landed - a box border drew black, the
 // text drew ink, and the ScrollView clipped the part of its child below the
@@ -128,7 +128,7 @@ int guiSelfTest()
     Box* tall = box(makeStyle(0, 8, 5));
     sv.add(tall);
     rootBox.add(sv);
-    Element tree = rootBox;
+    IElement tree = rootBox;
 
     GdiCanvas cv = default;
     cv.hdc = memDC;
@@ -196,7 +196,7 @@ int guiStateSelfTest()
 
     Button* b = button("ok", () => { });
     b.setKey("b");
-    Element tree = b;
+    IElement tree = b;
 
     UiContext ctx = default;
     ctx.theme = lightTheme();
@@ -306,7 +306,7 @@ int guiWidgetSelfTest()
     FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
     Checkbox* cbx = checkbox("ok", true, (bool v) => { });
     cbx.setKey("c");
-    Element ctree = cbx;
+    IElement ctree = cbx;
     layoutRoot(ctree, 0, 0, 20);
     ctree.paint(cv, &ctx);
     bool checkboxInk = false;
@@ -321,7 +321,7 @@ int guiWidgetSelfTest()
     // 2. Enabled vs disabled button fill: disabled is grayer (smaller channel range).
     Button* be = button("ok", () => { });
     be.setKey("e");
-    Element etree = be;
+    IElement etree = be;
     FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
     layoutRoot(etree, 0, 0, 20);
     etree.paint(cv, &ctx);
@@ -331,7 +331,7 @@ int guiWidgetSelfTest()
     Button* bd = button("ok", () => { });
     bd.setKey("d");
     bd.disabled = true;
-    Element dtree = bd;
+    IElement dtree = bd;
     FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
     layoutRoot(dtree, 0, 0, 20);
     dtree.paint(cv, &ctx);
@@ -342,7 +342,7 @@ int guiWidgetSelfTest()
     //    the right trough is not.
     ProgressBar* pb = progressBar(70, 12);
     pb.setKey("p");
-    Element ptree = pb;
+    IElement ptree = pb;
     FillRect(memDC, &full, GetStockObject(WHITE_BRUSH));
     layoutRoot(ptree, 0, 0, 12);
     ptree.paint(cv, &ctx);

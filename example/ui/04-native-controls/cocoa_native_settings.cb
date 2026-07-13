@@ -1,5 +1,5 @@
 // cocoa_native_settings.cb - a settings panel rendered with REAL AppKit controls
-// through cocoa_native_host.cb (the macOS NativeHost output stage), not pixels.
+// through cocoa_native_host.cb (the macOS INativeHost output stage), not pixels.
 //
 // Same app-facing shape as win32_native_settings.cb (labels, a text field,
 // checkboxes, a slider mirrored by a progress bar, a disabled-until-enabled button),
@@ -15,7 +15,7 @@
 //   ./out/nsettings_mac --selftest
 import "ui_native/cocoa.cb";
 
-class NativeSettings : Component
+class NativeSettings : IComponent
 {
     bool   darkMode = false;
     bool   autoSave = false;
@@ -23,7 +23,7 @@ class NativeSettings : Component
     int    clicks   = 0;
     string name     = default;
 
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         // Declare the styling preference; the native host reads it to theme the
         // window (dark vs aqua appearance).

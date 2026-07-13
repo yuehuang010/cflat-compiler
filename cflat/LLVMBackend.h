@@ -7090,7 +7090,8 @@ public:
 
     // Appends one vtable slot per interface field: the implementor's BYTE OFFSET of that field,
     // encoded as inttoptr(offset). Reads/writes through the interface GEP by it, so no thunk is
-    // needed and the field stays an lvalue. Errors when the implementor lacks a matching field.
+    // needed and the field stays an lvalue. A missing/mismatched field was already reported by
+    // VerifyInterfaceFields at the implementor's definition; emit a null slot and keep going.
     void AppendInterfaceFieldOffsetSlots(const std::string& structName, const std::string& ifaceName,
                                          llvm::StructType* structTy,
                                          const std::vector<DeclTypeAndValue>& structFields,
@@ -7111,22 +7112,54 @@ public:
 
             if (idx >= structFields.size() || layout == nullptr)
             {
-                LogError(std::format("'{}' does not implement interface field '{}::{} {}'",
-                    structName, ifaceName, f.TypeName, f.VariableName));
                 entries.push_back(llvm::ConstantPointerNull::get(ptrTy));
                 continue;
             }
 
-            const auto& sf = structFields[idx];
-            if (sf.TypeName != f.TypeName || sf.Pointer != f.Pointer || sf.IsInterface != f.IsInterface)
-            {
-                LogError(std::format(
-                    "'{}' field '{}' has type '{}{}' but interface '{}' declares it as '{}{}'",
-                    structName, f.VariableName, sf.TypeName, sf.Pointer ? "*" : "",
-                    ifaceName, f.TypeName, f.Pointer ? "*" : ""));
-            }
             uint64_t offset = layout->getElementOffset((unsigned)idx);
             entries.push_back(llvm::ConstantExpr::getIntToPtr(builder->getInt64(offset), ptrTy));
+        }
+    }
+
+    // The declared type of an interface field / implementor field, for diagnostics.
+    static std::string InterfaceFieldTypeText(const TypeAndValue& f)
+    {
+        std::string s = f.TypeName;
+        if (f.Pointer) s += "*";
+        return s;
+    }
+
+    // Every field an interface declares must exist on the implementor with the same name and
+    // type - the vtable slot carries that field's byte offset. Runs EAGERLY, at the class or
+    // program definition, so the error points at the implementor and not at some later boxing
+    // site (AppendInterfaceFieldOffsetSlots then trusts the layout it is handed).
+    void VerifyInterfaceFields(const std::string& implName, const std::string& ifaceName,
+                               const std::vector<DeclTypeAndValue>& implFields)
+    {
+        const auto* ifields = GetInterfaceFields(ifaceName);
+        if (ifields == nullptr) return;
+
+        for (const auto& f : *ifields)
+        {
+            const DeclTypeAndValue* impl = nullptr;
+            for (const auto& sf : implFields)
+                if (sf.VariableName == f.VariableName) { impl = &sf; break; }
+
+            if (impl == nullptr)
+            {
+                LogError(std::format(
+                    "class '{}' does not implement interface field '{}::{}' (expected type '{}')",
+                    implName, ifaceName, f.VariableName, InterfaceFieldTypeText(f)));
+                continue;
+            }
+            if (impl->TypeName != f.TypeName || impl->Pointer != f.Pointer
+                || impl->IsInterface != f.IsInterface)
+            {
+                LogError(std::format(
+                    "class '{}' field '{}' has type '{}' but interface '{}' declares it as '{}'",
+                    implName, f.VariableName, InterfaceFieldTypeText(*impl), ifaceName,
+                    InterfaceFieldTypeText(f)));
+            }
         }
     }
 
@@ -8899,6 +8932,113 @@ public:
     }
 
 
+    // Transfer ownership for `move` parameters: null the caller's source storage and mark
+    // it moved, so the caller's scope exit does not free what the callee now owns. Shared by
+    // the normal call path (CreateOverloadedFunctionCall) and virtual dispatch
+    // (CallInterfaceMethod) so the two cannot drift. Call AFTER the call is emitted.
+    void ApplyMoveParamTransfer(const std::string& functionName,
+        const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args)
+    {
+        for (size_t i = 0; i < params.size() && i < args.size(); i++)
+        {
+            if (params[i].IsMove)
+            {
+                // A `move string` argument transfers ownership to the callee, which frees
+                // it on return. If the argument is an unnamed owned-string temporary (e.g.
+                // a chained-concat result passed directly), drop it from the end-of-
+                // expression cleanup list so it is not also freed by the caller.
+                if (params[i].TypeName == "string")
+                    UnregisterOwnedStringTemp(args[i].Primary);
+                // A `move` closure argument (fat Lambda<T> or an encoded closure element type, gap a)
+                // transfers env ownership to the callee. Drop the unnamed lambda temp from the end-
+                // of-expression closure cleanup so it is not also freed by the caller (double-free).
+                else if (params[i].TypeName == "__closure_fat_ptr"
+                         || IsEncodedClosureType(params[i].TypeName))
+                    UnregisterOwnedClosureTemp(args[i].Primary);
+
+                // An interface fat-ptr param built from a caller STRUCT VALUE points AT the caller's
+                // alloca, so zeroing that alloca would corrupt the data the callee sees - keep it a
+                // borrow. A POINTER argument is different: the fat ptr carries the pointer VALUE, so
+                // boxing an owning pointer into a `move` interface param transfers ownership (like
+                // `IFace x = ptr`). Its source must be nulled, or the local is freed at scope exit
+                // while the callee (e.g. list<IFace>) still holds it - a double free.
+                bool isInterfaceBorrow = params[i].IsInterface
+                    && !params[i].IsInterfacePointer
+                    && !args[i].TypeAndValue.Pointer;
+                // When the arg expression went through a cast (or similar), args[i].Storage
+                // may be cleared even though CallerName still names the original owning variable.
+                // Look up the source by name so we still null its alloca and prevent a double-free.
+                llvm::Value* srcStorage = args[i].Storage;
+                llvm::Type*  srcBaseTy  = args[i].BaseType;
+                bool isFieldAccess = !args[i].FieldName.empty();
+                // The CallerName fallback resolves the BASE variable's storage; do NOT use it
+                // for a field access or it would null the base pointer instead of the field.
+                // A field access already carries its own (GEP) Storage.
+                if (srcStorage == nullptr && !isFieldAccess && !args[i].CallerName.empty())
+                {
+                    auto ref = FindVariableStorage(args[i].CallerName);
+                    srcStorage = ref.Storage;
+                    if (srcBaseTy == nullptr) srcBaseTy = ref.BaseType;
+                }
+                if (srcStorage != nullptr && !isInterfaceBorrow)
+                {
+                    // dyn_cast_or_null: a hand-built NamedVariable may carry storage but a null
+                    // BaseType. A bare dyn_cast on a null type dereferences null and segfaults
+                    // the compiler (the pre-existing list<string>-json crash); _or_null treats a
+                    // missing type as "no match" and falls through to the diagnostic below.
+                    if (auto* ptrTy = llvm::dyn_cast_or_null<llvm::PointerType>(srcBaseTy))
+                    {
+                        // Pointer move param: null the caller's storage.
+                        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), srcStorage);
+                    }
+                    else if (params[i].TypeName == "string" && args[i].IsOwningString)
+                    {
+                        // String move param: zero out _ptr in the caller's alloca so its destructor is a no-op.
+                        // (Does not need srcBaseTy - the string layout is looked up by name.)
+                        auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+                        if (strTy)
+                        {
+                            auto* ptrField = builder->CreateStructGEP(strTy, srcStorage, 0);
+                            auto* i8ptrTy = builder->getInt8Ty()->getPointerTo();
+                            builder->CreateStore(llvm::ConstantPointerNull::get(i8ptrTy), ptrField);
+                        }
+                    }
+                    else if (auto* stTy = llvm::dyn_cast_or_null<llvm::StructType>(srcBaseTy))
+                    {
+                        // Struct move param: zero the caller's entire struct so its destructor is a no-op.
+                        builder->CreateStore(llvm::ConstantAggregateZero::get(stTy), srcStorage);
+                    }
+                    else if (srcBaseTy == nullptr && params[i].TypeName != "string")
+                    {
+                        // We have caller storage to clear but no type telling us how. This can only
+                        // arise from a malformed (hand-built) argument; emit a clear diagnostic
+                        // rather than leaving a stale value that a later destructor would double-free.
+                        LogError(std::format(
+                            "call to '{}': 'move' argument {} has no resolved type, so its source "
+                            "storage cannot be cleared after the move", functionName, i));
+                    }
+                }
+                // Compile-time: mark the caller's storage as moved so subsequent reads are rejected.
+                // Covers pointer, owning-string, and struct move params - all cases where caller storage was zeroed.
+                // Moving a FIELD (`node->left`) marks only that field, not the whole base variable.
+                if (!args[i].CallerName.empty() && srcStorage != nullptr &&
+                    !isInterfaceBorrow && srcBaseTy != nullptr)
+                {
+                    bool isPtr = llvm::isa<llvm::PointerType>(srcBaseTy);
+                    bool isOwningStr = params[i].TypeName == "string" && args[i].IsOwningString;
+                    bool isStruct = llvm::isa<llvm::StructType>(srcBaseTy);
+                    if (isPtr || isOwningStr || isStruct)
+                    {
+                        if (isFieldAccess)
+                            MarkVariableFieldMoved(args[i].CallerName, args[i].FieldName);
+                        else
+                            MarkVariableMoved(args[i].CallerName);
+                    }
+                }
+            }
+        }
+    }
+
     // Lower a by-value argument to match a declared (non-variadic) by-value parameter:
     // implicit char*/literal -> string coercion, scalar/struct upconvert, and the
     // non-owning-string -> move-param heap-copy. Shared by the normal call path
@@ -9108,6 +9248,11 @@ public:
 
         auto* callResult = builder->CreateCall(fnTy, fnPtr, callArgs);
 
+        // A `move` parameter on an INTERFACE method transfers ownership just as it does on a
+        // direct call, so the caller's source must be nulled/marked-moved here too. Without this
+        // the source keeps its owning flag and scope exit frees what the callee now owns.
+        ApplyMoveParamTransfer(ifaceName + "." + methodName, methodInfo->Parameters, extraArgNVs);
+
         // Classify the virtual result's ownership exactly like the direct-call path
         // (CreateOverloadedFunctionCall): a 'move string' / 'move T*' / 'move <interface>'
         // return hands an owned value to the caller. Set the side-channel so a binding site
@@ -9277,6 +9422,10 @@ public:
                 LogError(std::format("class '{}' does not implement '{}::{}'", structName, interfaceName, method.Name));
             }
         }
+
+        auto sdIt = dataStructures.find(structName);
+        if (sdIt != dataStructures.end())
+            VerifyInterfaceFields(structName, interfaceName, sdIt->second.StructFields);
     }
 
     llvm::Function* SynthesizeReflectFunction(const std::string& structName)
@@ -12941,6 +13090,13 @@ public:
                     // shared with virtual dispatch via CallInterfaceMethod.
                     value = LowerByValueArg(value, *candParamItr, arg);
                 }
+                else if (value->getType()->isIntegerTy(1))
+                {
+                    // C default argument promotion for a variadic slot: 'bool' (i1) widens to
+                    // int and is ALWAYS zero-extended (true -> 1, never -1). Without this the
+                    // vararg slot keeps the caller's garbage upper bits.
+                    value = Upconvert(value, builder->getInt32Ty(), true);
+                }
                 else if (value->getType()->isIntegerTy(8) || value->getType()->isIntegerTy(16))
                 {
                     // C default argument promotion for a variadic slot: widen a sub-int
@@ -12948,6 +13104,21 @@ public:
                     // signedness so that e.g. u8 255 promotes to 255, not -1. Signedness is
                     // only known here (CreateFunctionCall sees a bare llvm::Value).
                     value = PromoteToInt(value, arg.TypeAndValue.IsUnsignedInteger() != -1);
+                }
+                else if (arg.TypeAndValue.TypeName == "string" && !arg.TypeAndValue.Pointer
+                         && value->getType()->isStructTy())
+                {
+                    // A 'string' is a {ptr,len} value type, not a char*. A variadic slot is
+                    // untyped, so the compiler cannot know the callee wants the char* (the
+                    // format string is not visible here) - passing the struct silently feeds
+                    // the LENGTH to the next slot and crashes on a second '%s'. cflat already
+                    // rejects string -> char* at a typed parameter; be consistent and make the
+                    // user state the lowering.
+                    LogError(std::format(
+                        "cannot pass 'string' to the variadic '...' of '{}': a variadic slot is "
+                        "untyped and a 'string' is a {{ptr,len}} value, not a 'char*' - the length "
+                        "field would be read as the next argument. Pass the buffer explicitly with "
+                        "'.data()' (e.g. printf(\"%s\", s.data())).", functionName));
                 }
 
                 argList.push_back(value);
@@ -13022,99 +13193,8 @@ public:
             }
         }
 
-        // Null out caller's storage for move parameters; mark variable as moved for compile-time checking.
-        for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
-        {
-            if (candidate.Parameters[i].IsMove)
-            {
-                // A `move string` argument transfers ownership to the callee, which frees
-                // it on return. If the argument is an unnamed owned-string temporary (e.g.
-                // a chained-concat result passed directly), drop it from the end-of-
-                // expression cleanup list so it is not also freed by the caller.
-                if (candidate.Parameters[i].TypeName == "string")
-                    UnregisterOwnedStringTemp(matched[i].Primary);
-                // A `move` closure argument (fat Lambda<T> or an encoded closure element type, gap a)
-                // transfers env ownership to the callee. Drop the unnamed lambda temp from the end-
-                // of-expression closure cleanup so it is not also freed by the caller (double-free).
-                else if (candidate.Parameters[i].TypeName == "__closure_fat_ptr"
-                         || IsEncodedClosureType(candidate.Parameters[i].TypeName))
-                    UnregisterOwnedClosureTemp(matched[i].Primary);
-
-                // Interface fat-ptr parameters (non-pointer) borrow the caller's data - don't zero it.
-                // The fat-ptr holds a reference to the caller's struct; zeroing would corrupt that data.
-                bool isInterfaceBorrow = candidate.Parameters[i].IsInterface && !candidate.Parameters[i].IsInterfacePointer;
-                // When the arg expression went through a cast (or similar), matched[i].Storage
-                // may be cleared even though CallerName still names the original owning variable.
-                // Look up the source by name so we still null its alloca and prevent a double-free.
-                llvm::Value* srcStorage = matched[i].Storage;
-                llvm::Type*  srcBaseTy  = matched[i].BaseType;
-                bool isFieldAccess = !matched[i].FieldName.empty();
-                // The CallerName fallback resolves the BASE variable's storage; do NOT use it
-                // for a field access or it would null the base pointer instead of the field.
-                // A field access already carries its own (GEP) Storage.
-                if (srcStorage == nullptr && !isFieldAccess && !matched[i].CallerName.empty())
-                {
-                    auto ref = FindVariableStorage(matched[i].CallerName);
-                    srcStorage = ref.Storage;
-                    if (srcBaseTy == nullptr) srcBaseTy = ref.BaseType;
-                }
-                if (srcStorage != nullptr && !isInterfaceBorrow)
-                {
-                    // dyn_cast_or_null: a hand-built NamedVariable may carry storage but a null
-                    // BaseType. A bare dyn_cast on a null type dereferences null and segfaults
-                    // the compiler (the pre-existing list<string>-json crash); _or_null treats a
-                    // missing type as "no match" and falls through to the diagnostic below.
-                    if (auto* ptrTy = llvm::dyn_cast_or_null<llvm::PointerType>(srcBaseTy))
-                    {
-                        // Pointer move param: null the caller's storage.
-                        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), srcStorage);
-                    }
-                    else if (candidate.Parameters[i].TypeName == "string" && matched[i].IsOwningString)
-                    {
-                        // String move param: zero out _ptr in the caller's alloca so its destructor is a no-op.
-                        // (Does not need srcBaseTy - the string layout is looked up by name.)
-                        auto* strTy = llvm::StructType::getTypeByName(*context, "string");
-                        if (strTy)
-                        {
-                            auto* ptrField = builder->CreateStructGEP(strTy, srcStorage, 0);
-                            auto* i8ptrTy = builder->getInt8Ty()->getPointerTo();
-                            builder->CreateStore(llvm::ConstantPointerNull::get(i8ptrTy), ptrField);
-                        }
-                    }
-                    else if (auto* stTy = llvm::dyn_cast_or_null<llvm::StructType>(srcBaseTy))
-                    {
-                        // Struct move param: zero the caller's entire struct so its destructor is a no-op.
-                        builder->CreateStore(llvm::ConstantAggregateZero::get(stTy), srcStorage);
-                    }
-                    else if (srcBaseTy == nullptr && candidate.Parameters[i].TypeName != "string")
-                    {
-                        // We have caller storage to clear but no type telling us how. This can only
-                        // arise from a malformed (hand-built) argument; emit a clear diagnostic
-                        // rather than leaving a stale value that a later destructor would double-free.
-                        LogError(std::format(
-                            "call to '{}': 'move' argument {} has no resolved type, so its source "
-                            "storage cannot be cleared after the move", functionName, i));
-                    }
-                }
-                // Compile-time: mark the caller's storage as moved so subsequent reads are rejected.
-                // Covers pointer, owning-string, and struct move params - all cases where caller storage was zeroed.
-                // Moving a FIELD (`node->left`) marks only that field, not the whole base variable.
-                if (!matched[i].CallerName.empty() && srcStorage != nullptr &&
-                    !isInterfaceBorrow && srcBaseTy != nullptr)
-                {
-                    bool isPtr = llvm::isa<llvm::PointerType>(srcBaseTy);
-                    bool isOwningStr = candidate.Parameters[i].TypeName == "string" && matched[i].IsOwningString;
-                    bool isStruct = llvm::isa<llvm::StructType>(srcBaseTy);
-                    if (isPtr || isOwningStr || isStruct)
-                    {
-                        if (isFieldAccess)
-                            MarkVariableFieldMoved(matched[i].CallerName, matched[i].FieldName);
-                        else
-                            MarkVariableMoved(matched[i].CallerName);
-                    }
-                }
-            }
-        }
+        // Null out caller's storage for move parameters; mark the source moved (shared helper).
+        ApplyMoveParamTransfer(functionName, candidate.Parameters, matched);
 
         // Register a closure-returning call RESULT as an owned closure temp (lambda Option A),
         // mirroring how a lambda LITERAL is tracked at creation. A binding site (decl-init /
@@ -13872,7 +13952,10 @@ public:
                 }
                 auto valueType = value->getType();
                 // Convert 8/16-bit int to 32-bit and 16-bit/float to double (default argument promotions).
-                if (valueType->isIntegerTy(8) || valueType->isIntegerTy(16))
+                // bool (i1) is zero-extended: sign-extending it would pass true as -1.
+                if (valueType->isIntegerTy(1))
+                    callArgs.push_back(builder->CreateZExt(value, builder->getInt32Ty(), "conv"));
+                else if (valueType->isIntegerTy(8) || valueType->isIntegerTy(16))
                     callArgs.push_back(builder->CreateSExt(value, builder->getInt32Ty(), "conv"));
                 else if (valueType->is16bitFPTy() || valueType->isFloatTy())
                     callArgs.push_back(builder->CreateFPExt(value, builder->getDoubleTy(), "conv"));

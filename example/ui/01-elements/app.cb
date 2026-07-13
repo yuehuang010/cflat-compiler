@@ -9,12 +9,12 @@
 
 import "ui_native.cb";
 
-class Counter : Component
+class Counter : IComponent
 {
     int count = 0;
     string name = default;
 
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         View* root = view(makeStyle(1, 0, 0));
         root.add(text(this.name + ": " + this.count.toString()));
@@ -25,7 +25,7 @@ class Counter : Component
     void bump() { this.count = this.count + 1; }
 };
 
-class CounterApp : Component
+class CounterApp : IComponent
 {
     // Child components are held by POINTER: components have identity and mutable
     // state. list<Counter*> owns them - they are freed when the list is destroyed.
@@ -39,7 +39,7 @@ class CounterApp : Component
     }
 
     // Compose: mount each child Counter as a keyed component node.
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         View* root = view(makeStyle(2, 0, 0));
         root.add(text("=== Counters ==="));
@@ -56,7 +56,7 @@ extern int main()
     app.addCounter("alpha");
     app.addCounter("beta");
 
-    Element committed = app.render(&ctx);
+    IElement committed = app.render(&ctx);
     printf("initial:  %s\n", committed.toJson().data());
 
     // Drive state changes through the child components (persist via pointer),
@@ -65,7 +65,7 @@ extern int main()
     app.counters[0].bump();
     app.counters[1].bump();
 
-    Element wip = app.render(&ctx);
+    IElement wip = app.render(&ctx);
     list<Patch> patches = default;
     committed = reconcile(committed, wip, &patches);
 

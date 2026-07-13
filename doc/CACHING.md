@@ -68,6 +68,7 @@ core file produces a new hash and the old directory is ignored - it can be delet
 |--------|--------|
 | Core `.cb` file modified | New hash directory; old cache ignored |
 | cflat.exe rebuilt | Core files unchanged -> same hash; cache still valid |
+| Metadata schema changed | `version` in `core_*.meta.json` is bumped; an older version is rejected and the cache is rebuilt from source |
 | `--init` re-run | Overwrites the files in the current hash directory |
 | Cache absent or unreadable | Transparent fallback to full source parse |
 

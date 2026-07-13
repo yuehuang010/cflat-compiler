@@ -1,4 +1,4 @@
-// core/ui_native/host.cb - the platform import shim for the CFlat UI NativeHost backend.
+// core/ui_native/host.cb - the platform import shim for the CFlat UI INativeHost backend.
 //
 // An app that wants "real OS controls" imports THIS file instead of a specific
 // backend; the compile-time platform switch selects the Win32 host on Windows and

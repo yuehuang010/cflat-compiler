@@ -37,7 +37,7 @@ void sleep(i64 ms);
 
 // -- Host + driver seam (forward declarations, defined by the backend) ---------
 // Window lifecycle + message pumping.
-void startHeadlessWindow(Component app, const char* title, int w, int h);
+void startHeadlessWindow(IComponent app, const char* title, int w, int h);
 void hostDrainPosted();
 void pumpNative();
 void nativeTeardownForTest();
@@ -130,9 +130,9 @@ class UiTest
 
     // -- Launch / teardown ----------------------------------------------------
     // Create a fresh invisible window bound to `app` (DIP size w x h) and build its
-    // tree. `app` is a `new`-allocated Component the window takes ownership of; the
+    // tree. `app` is a `new`-allocated IComponent the window takes ownership of; the
     // runner frees it via nativeTeardownForTest after the case.
-    void launch(Component app, int w, int h)
+    void launch(IComponent app, int w, int h)
     {
         startHeadlessWindow(app, "uitest", w, h);
         this.launched = true;

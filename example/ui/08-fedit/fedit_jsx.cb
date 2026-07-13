@@ -106,7 +106,7 @@ string fsContent(int nid)
     return "";
 }
 
-class Editor : Component
+class Editor : IComponent
 {
     string path     = default;   // active tab's file ("" = untitled)
     bool   dirty    = false;     // active tab's dirty flag
@@ -222,7 +222,7 @@ class Editor : Component
     // The whole shell in one sugar tree. The static structure (toolbar, split, panes,
     // tree, editor) nests directly; the two dynamic parts compose as fragments - the
     // find bar is add()-ed only when open, and buildTabs() rides in as a {expr} child.
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         ctx.theme = this.isDark ? darkTheme() : lightTheme();
         this._ensureTabs();

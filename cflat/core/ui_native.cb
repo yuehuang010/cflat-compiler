@@ -1,10 +1,10 @@
 // ui.cb - a small React-Native-style declarative UI library for CFlat.
 //
 // Design (see doc/UI.md for the frozen v0.4 contract):
-//   - Element is an interface; every host node (View/Text/Button) implements it.
-//   - Nodes are heap-allocated and owned by their parent through the Element
+//   - IElement is an interface; every host node (View/Text/Button) implements it.
+//   - Nodes are heap-allocated and owned by their parent through the IElement
 //     interface; teardown walks the tree via destroyTree().
-//   - Children are list<Element> (avoids the T[] length-inference gap).
+//   - Children are list<IElement> (avoids the T[] length-inference gap).
 //   - Events are Lambda<void()> closures with automatic capture.
 //   - Input flows through a single dispatch(Event) seam (pointer + key), focus is
 //     a keyed identity tracked in UiContext, layout is one constraints-in /
@@ -13,7 +13,7 @@
 //   - The library carries NO process-global mutable state: the dirty flag and the
 //     focused-node identity live in a host-owned UiContext, threaded through
 //     render(UiContext*). Single mounted app, single thread (see doc/UI.md).
-//   - v0.4 does not paint pixels in the library; nodes paint via the Canvas seam
+//   - v0.4 does not paint pixels in the library; nodes paint via the ICanvas seam
 //     and serialize to a renderer-friendly JSON shape.
 
 import "list.cb";
@@ -30,7 +30,7 @@ int WRAP_WRAP = 1;   // children that would overflow availW start a new line
 
 // Shared layout/style props. Plain value struct carried by host elements. Field
 // names track React Native (flexDirection); a typed struct, not an open bag.
-// COLOR_DEFAULT (0) means "no explicit color": the Canvas falls back to its
+// COLOR_DEFAULT (0) means "no explicit color": the ICanvas falls back to its
 // monochrome default (black ink / black border / no fill), so a tree that sets no
 // colors renders exactly as it did before colors existed. 0 is deliberately the
 // sentinel because a default/zero-initialized struct field is then automatically
@@ -153,7 +153,7 @@ struct Rect
 };
 
 // Intersection of two rects (empty - zero w/h - if they do not overlap). Drives
-// the Canvas clip stack so a ScrollView only paints inside its viewport.
+// the ICanvas clip stack so a ScrollView only paints inside its viewport.
 Rect intersectRect(Rect a, Rect b)
 {
     int x0 = a.x; if (b.x > x0) x0 = b.x;
@@ -172,7 +172,7 @@ Rect intersectRect(Rect a, Rect b)
 // and returns the Size it consumed; it also stamps its own absolute `bounds` so
 // paint and hit-test agree. Container nodes drive their children with this one
 // pass; flex/row/column/scroll are STRATEGIES over it, not bespoke per-node math.
-// Layout stays in CELL units - the Canvas owns the cell->pixel mapping.
+// Layout stays in CELL units - the ICanvas owns the cell->pixel mapping.
 int LAYOUT_UNBOUNDED = 1000000;   // "no height limit" sentinel for a root pass
 
 struct LayoutConstraints
@@ -315,16 +315,16 @@ void drawBorder(Surface* s, Rect b)
     while (y < bottom) { s.put(b.x, y, '|'); s.put(right, y, '|'); y++; }
 }
 
-// -- Canvas: the surface-agnostic draw target nodes paint into -----------------
-// Nodes paint via Canvas primitives (in CELL coordinates) instead of poking a
+// -- ICanvas: the surface-agnostic draw target nodes paint into -----------------
+// Nodes paint via ICanvas primitives (in CELL coordinates) instead of poking a
 // Surface's cells directly, so the SAME tree can render to a char grid (TUI) or a
-// GDI window (Win32). A Canvas implementation owns the cell->pixel mapping.
+// GDI window (Win32). A ICanvas implementation owns the cell->pixel mapping.
 // pushClip/popClip bound subsequent drawing to a rectangle (in cells). A
 // ScrollView pushes its viewport so off-viewport children are clipped; calls
 // nest (each push intersects with the active clip) and must be balanced.
 // color is 0xRRGGBB, or COLOR_DEFAULT (-1) for the backend's monochrome default.
 // A backend with no color (the TUI char grid) ignores it.
-interface Canvas
+interface ICanvas
 {
     void clear();
     void drawText(int col, int row, const char* s, int color);
@@ -333,14 +333,14 @@ interface Canvas
     void popClip();
 };
 
-// TUI Canvas: a thin adapter over a Surface. (Surface is a struct and cannot
+// TUI ICanvas: a thin adapter over a Surface. (Surface is a struct and cannot
 // implement an interface directly, so the adapter carries the contract.) Holds a
 // borrowed Surface*; it never owns the grid. The clip stack is a fixed inline
 // array (no heap) so this stays a pure value type with no destructor - it is
-// passed as a Canvas (interface) temporary, which is not auto-destructed.
+// passed as a ICanvas (interface) temporary, which is not auto-destructed.
 int CLIP_STACK_MAX = 8;
 
-class SurfaceCanvas : Canvas
+class SurfaceCanvas : ICanvas
 {
     Surface* target = nullptr;
     Rect[8] clipStack;
@@ -360,7 +360,7 @@ class SurfaceCanvas : Canvas
         if (this._visible(x, y)) this.target.put(x, y, c);
     }
 
-    // The terminal grid has no color; `color` is accepted for the Canvas contract
+    // The terminal grid has no color; `color` is accepted for the ICanvas contract
     // and ignored.
     void drawText(int col, int row, const char* s, int color)
     {
@@ -411,7 +411,7 @@ class SurfaceCanvas : Canvas
     }
 };
 
-// A SurfaceCanvas value bound to `s`, ready to pass as a Canvas. No heap, no owner:
+// A SurfaceCanvas value bound to `s`, ready to pass as a ICanvas. No heap, no owner:
 // it just wraps the borrowed pointer for the duration of a paint call.
 SurfaceCanvas canvasFor(Surface* s)
 {
@@ -500,7 +500,7 @@ struct Theme
 
 // Resolve a color: an explicit per-node color (anything but COLOR_DEFAULT/0) wins;
 // otherwise fall back to the theme slot (itself 0 in the monochrome theme, which
-// the Canvas renders as its default ink).
+// the ICanvas renders as its default ink).
 int pickColor(int nodeColor, int themeColor)
 {
     if (nodeColor != 0) return nodeColor;
@@ -587,7 +587,7 @@ struct UiContext
 
     // Shadow map from a node's stable key path to its native control handle (an
     // opaque u64: HWND on Windows, NSView* on macOS). Populated ONLY by a
-    // NativeHost (see ui_native.cb); the Canvas hosts (TUI/GDI) never touch it, so
+    // INativeHost (see ui_native.cb); the ICanvas hosts (TUI/GDI) never touch it, so
     // it stays empty and inert for them - this is the key->handle plumbing. The
     // handles are non-owning integers, so destroying the map destroys no windows;
     // the host explicitly destroys controls.
@@ -684,7 +684,7 @@ struct UiContext
     }
     bool hasPress(string key) { return this.pressKey.length() > 0 && this.pressKey == key; }
 
-    // Native-handle shadow map accessors (used by a NativeHost). 0 = no handle.
+    // Native-handle shadow map accessors (used by a INativeHost). 0 = no handle.
     void setNativeHandle(string key, u64 h) { this.nativeByKey.set(key, h); }
     bool hasNativeHandle(string key) { return this.nativeByKey.contains(key); }
     u64  nativeHandle(string key)
@@ -713,7 +713,7 @@ class ContextMenu
     int count() { return this.labels.count(); }
 };
 
-// Node-kind tags - returned by Element.kind() so the reconciler can compare node
+// Node-kind tags - returned by IElement.kind() so the reconciler can compare node
 // types WITHOUT an `as` downcast in the hot diff path.
 int ELEM_VIEW      = 1;
 int ELEM_TEXT      = 2;
@@ -737,45 +737,256 @@ int ELEM_TREE       = 19;   // tree view, expand-on-demand callback children
 int ELEM_SPLIT      = 20;   // split view: two weighted panes + divider; container
 int ELEM_IMAGE      = 21;   // bitmap image; BGRA32 pixels pushed via setImageData
 int ELEM_GROUPBOX   = 22;   // titled group frame; container, native-mapped
-int ELEM_CANVAS     = 23;   // app-painted canvas child; paint callback via Canvas
+int ELEM_CANVAS     = 23;   // app-painted canvas child; paint callback via ICanvas
 
 // The node interface. Typed host structs implement these so the tree can be
 // walked uniformly (serialize, layout, paint, dispatch, reconcile, teardown)
 // while keeping props compile-checked.
 //   - layout takes constraints and returns the size consumed, stamping bounds.
-//   - paint draws self (and children) into the Canvas using bounds.
+//   - paint draws self (and children) into the ICanvas using bounds.
 //   - dispatch routes one Event: pointer events hit-test, key events go to the
 //     focused node. Returns true if a node consumed it. Virtual on purpose: the
 //     host never downcasts a child, it lets each node decide.
 //   - kind / propsEqual / childList drive the reconciler: kind() compares node
 //     type, propsEqual() is a structured same-kind props compare for change
 //     detection, childList() exposes a container's children (nullptr for leaves).
-interface Element
+interface IElement
 {
     move string toJson();
     void destroyTree();
     Size layout(LayoutConstraints c);
-    void paint(Canvas c, UiContext* ctx);
+    void paint(ICanvas c, UiContext* ctx);
     bool dispatch(Event e, UiContext* ctx);
     int  kind();
     // Main-axis flex weight for a View-row/column distribution pass; 0 = not
     // flexible (intrinsic size). Only View carries a real Style; every other
-    // Element implementor returns 0 (leaves are never flex children).
+    // IElement implementor returns 0 (leaves are never flex children).
     int  flexWeight();
-    bool propsEqual(Element other);   // other is guaranteed same kind() by reconcile
-    list<Element>* childList();
+    bool propsEqual(IElement other);   // other is guaranteed same kind() by reconcile
+    list<IElement>* childList();
     string keyOf();          // "" if unkeyed; drives keyed child reconciliation
     void setKey(string k);
     // Append the keys of focusable descendants (Button/TextInput) in tree order,
     // so Tab/Shift-Tab can build a focus ring. Leaves that cannot focus no-op.
     void collectFocusables(list<string>* keys);
     // The absolute frame stamped by the last layout pass (in DIP/cell units). A
-    // NativeHost reads this to position the node's OS control (v9).
+    // INativeHost reads this to position the node's OS control (v9).
     Rect nodeBounds();
 };
 
+// -- Per-widget interfaces ------------------------------------------------------
+// One interface per element class, carrying the props the reconciler and the native
+// hosts actually reach. An interface FIELD is a vtable slot holding the implementor's
+// byte offset, so `b.title` through a fat pointer is a true lvalue (read, write, and
+// nested-struct write all work). The concrete classes stay the CONSTRUCTION type
+// (JSX names them and writes their fields); these interfaces are the USAGE type.
+//
+// Two shared levels avoid repeating the two near-universal props: `tooltip` (15 of
+// the 23 classes) and `disabled` (10, all of which also carry `tooltip`), so a host
+// can resolve either with ONE downcast instead of a 15- or 10-way `as`-chain.
+// Everything else is per-widget: `value`/`label` are same-name-different-type across
+// widgets, so no further hoist is possible.
+//
+// Event closures are NOT interface fields where a fire* wrapper serves instead
+// (mirroring Button.fireClick): a closure that is only ever INVOKED is reached via
+// its wrapper. The five closures that are genuinely READ AS VALUES (boxed across the
+// INativeHost u64 seam - ListView.rowText, TreeView.childCount/childId/label,
+// CanvasView.onPaint) stay fields, since the host must clone them out.
+interface ITooltipped : IElement
+{
+    string tooltip;          // native hover tooltip; "" = none
+};
+
+interface IDisableable : ITooltipped
+{
+    bool disabled;           // dimmed + ignores input
+};
+
+interface IView : IElement
+{
+    Style style;
+    list<IElement> children;
+    void add(IElement child);
+};
+
+interface IText : ITooltipped
+{
+    string text;
+    int    color;
+};
+
+// NOT `IButton`: the WinUI winmd that ui_native/winui.cb imports projects a WinRT
+// `IButton`, and a cflat interface cannot share a name with a consumed WinMD type.
+interface IButtonElement : IDisableable
+{
+    string title;
+    int    color;
+    int    backgroundColor;
+    void   fireClick();
+};
+
+interface IBox : IElement
+{
+    Style style;
+    void  add(IElement child);
+};
+
+interface ITextInput : IDisableable
+{
+    string value;
+    string placeholder;
+    int    width;
+    void   fireChangeText(string s);
+};
+
+interface ICheckbox : IDisableable
+{
+    string label;
+    bool   checked;
+    void   fireToggle();
+};
+
+interface IProgressBar : ITooltipped
+{
+    int value;
+    int width;
+};
+
+interface ISlider : IDisableable
+{
+    int  value;
+    int  width;
+    void fireSet(int v);
+};
+
+interface ITextArea : IDisableable
+{
+    string value;
+    void   fireChange();
+};
+
+interface IStatusBar : IElement
+{
+    list<string> parts;
+    void addPart(string s);
+};
+
+interface IScrollView : IElement
+{
+    Style style;
+    int   contentH;
+    void  add(IElement child);
+};
+
+interface IRadioButton : IDisableable
+{
+    string label;
+    bool   checked;
+    int    index;
+    bool   groupFirst;
+};
+
+interface IRadioGroup : IElement
+{
+    int   value;
+    Style style;
+    void  add(IElement child);
+    void  addOption(string label);
+    void  fireChange(int v);
+};
+
+interface IComboBox : IDisableable
+{
+    list<string> items;
+    int  selectedIndex;
+    int  width;
+    void addItem(string s);
+    void fireChange(int v);
+};
+
+interface IListView : IDisableable
+{
+    list<string> columns;
+    list<int>    colWidths;
+    int  rowCount;
+    int  selectedIndex;
+    bool multiSelect;
+    Lambda<string(int,int)> rowText;   // read as a value: boxed across the host seam
+    void addColumn(string title, int widthDip);
+    void fireSelect(int row);
+    void fireActivate(int row);
+};
+
+interface ITabPane : IElement
+{
+    string title;
+    void   add(IElement child);
+};
+
+interface ITabControl : IDisableable
+{
+    list<IElement> children;
+    int    selectedTab;
+    int    width;
+    int    height;
+    string _title(int i);
+    void   add(IElement child);
+    void   fireSelectTab(int i);
+};
+
+interface ITreeView : IDisableable
+{
+    // The three node-source closures are read as values and boxed into a TreeBox.
+    Lambda<int(int)>     childCount;
+    Lambda<int(int,int)> childId;
+    Lambda<string(int)>  label;
+    int  selectedNode;
+    void fireSelect(int nodeId);
+    void fireExpand(int nodeId);
+};
+
+interface ISplitView : IElement
+{
+    int   ratio;
+    bool  vertical;
+    Style style;
+    Rect  dividerBounds;
+    int   _ratioAt(int px, int py);
+    void  add(IElement child);
+    void  fireRatioChange(int r);
+};
+
+// NOT `IImage`: same WinRT name collision as IButtonElement (winui.cb reaches the
+// XAML Image control through the projected WinRT `IImage`).
+interface IImageElement : ITooltipped
+{
+    u64    pixels;
+    int    pxW;
+    int    pxH;
+    int    width;
+    int    height;
+    string source;
+};
+
+interface IGroupBox : ITooltipped
+{
+    string title;
+    Style  style;
+    void   add(IElement child);
+};
+
+interface ICanvasView : ITooltipped
+{
+    int width;
+    int height;
+    Lambda<void(ICanvas)> onPaint;   // read as a value: boxed across the host seam
+};
+
+// ComponentElement needs no interface: nothing outside the class reaches a field of
+// it, and its propsEqual is unconditionally true. IElement covers every use.
+
 // Lay out a root element to fill (w) cells wide at (x, y), height unbounded.
-Size layoutRoot(Element root, int x, int y, int w)
+Size layoutRoot(IElement root, int x, int y, int w)
 {
     LayoutConstraints c = default;
     c.x = x; c.y = y; c.availW = w; c.availH = LAYOUT_UNBOUNDED;
@@ -785,7 +996,7 @@ Size layoutRoot(Element root, int x, int y, int w)
 // Like layoutRoot but with a BOUNDED height (h). A native host uses this so that
 // (a) DIR_COLUMN flex distributes at the root, and (b) a root ScrollView can fill
 // the window viewport. TUI/canvas hosts keep using layoutRoot (unbounded).
-Size layoutRootBounded(Element root, int x, int y, int w, int h)
+Size layoutRootBounded(IElement root, int x, int y, int w, int h)
 {
     LayoutConstraints c = default;
     c.x = x; c.y = y; c.availW = w; c.availH = h;
@@ -793,14 +1004,14 @@ Size layoutRootBounded(Element root, int x, int y, int w, int h)
 }
 
 // -- View: a flex container with a style and children -------------------------
-class View : Element
+class View : IView
 {
     Style style = default;
-    list<Element> children = default;
+    list<IElement> children = default;
     Rect bounds = default;
     string key = default;
 
-    void add(Element child)
+    void add(IElement child)
     {
         this.children.add(child);
     }
@@ -808,17 +1019,17 @@ class View : Element
     // A flex child's weight counts only when its own explicit size (width for a
     // row, height for a column) is unset - an explicit size wins over flex,
     // mirroring RN's flexBasis-with-grow-0 (see the plan doc).
-    bool isRowFlexChild(Element child)
+    bool isRowFlexChild(IElement child)
     {
         if (child.flexWeight() <= 0) return false;
-        View* v = child as View;
+        IView v = child as IView;
         return v == nullptr || v.style.width <= 0;
     }
 
-    bool isColumnFlexChild(Element child)
+    bool isColumnFlexChild(IElement child)
     {
         if (child.flexWeight() <= 0) return false;
-        View* v = child as View;
+        IView v = child as IView;
         return v == nullptr || v.style.height <= 0;
     }
 
@@ -843,11 +1054,11 @@ class View : Element
             list<int> widths;
             int mx = c.x + pad;
             int mi = 0;
-            for (Element child in this.children)
+            for (IElement child in this.children)
             {
                 if (mi > 0) mx = mx + gap;
                 int w = 0;
-                View* v = child as View;
+                IView v = child as IView;
                 if (v != nullptr && v.style.width > 0)
                 {
                     w = v.style.width;
@@ -904,7 +1115,7 @@ class View : Element
                 int k = 0;
                 while (k < count)
                 {
-                    Element child = this.children.get(start + k);
+                    IElement child = this.children.get(start + k);
                     if (this.isRowFlexChild(child)) lineFlexSum = lineFlexSum + child.flexWeight();
                     else fixedSum = fixedSum + widths[start + k];
                     k++;
@@ -919,7 +1130,7 @@ class View : Element
                 k = 0;
                 while (k < count)
                 {
-                    Element child = this.children.get(start + k);
+                    IElement child = this.children.get(start + k);
                     if (this.isRowFlexChild(child))
                     {
                         int share = 0;
@@ -945,7 +1156,7 @@ class View : Element
                 while (k < count)
                 {
                     if (k > 0) cx = cx + gap;
-                    Element child = this.children.get(start + k);
+                    IElement child = this.children.get(start + k);
                     LayoutConstraints cc = default;
                     cc.x = cx; cc.y = cy;
                     cc.availH = c.availH - 2 * pad;
@@ -980,7 +1191,7 @@ class View : Element
         else if (this.style.flexDirection == DIR_ROW)
         {
             int rowFlexSum = 0;
-            for (Element child in this.children)
+            for (IElement child in this.children)
                 if (this.isRowFlexChild(child)) rowFlexSum = rowFlexSum + child.flexWeight();
 
             if (rowFlexSum > 0)
@@ -990,7 +1201,7 @@ class View : Element
                 int fixedSum = 0;
                 int mx = c.x + pad;
                 int mi = 0;
-                for (Element child in this.children)
+                for (IElement child in this.children)
                 {
                     if (mi > 0) mx = mx + gap;
                     if (!this.isRowFlexChild(child))
@@ -1015,7 +1226,7 @@ class View : Element
                 // sum to exactly `leftover`.
                 list<int> shares;
                 int allocated = 0;
-                for (Element child in this.children)
+                for (IElement child in this.children)
                 {
                     if (this.isRowFlexChild(child))
                     {
@@ -1041,7 +1252,7 @@ class View : Element
                 int maxH = 0;
                 int pi = 0;
                 int si = 0;
-                for (Element child in this.children)
+                for (IElement child in this.children)
                 {
                     if (pi > 0) cx = cx + gap;
                     LayoutConstraints cc = default;
@@ -1073,7 +1284,7 @@ class View : Element
                 int cx = c.x + pad;
                 int maxH = 0;
                 int i = 0;
-                for (Element child in this.children)
+                for (IElement child in this.children)
                 {
                     if (i > 0) cx = cx + gap;
                     LayoutConstraints cc = default;
@@ -1094,7 +1305,7 @@ class View : Element
             // ignores it and keeps the single-line stacking behavior below.
             int colFlexSum = 0;
             if (c.availH < LAYOUT_UNBOUNDED)
-                for (Element child in this.children)
+                for (IElement child in this.children)
                     if (this.isColumnFlexChild(child)) colFlexSum = colFlexSum + child.flexWeight();
 
             if (colFlexSum > 0)
@@ -1107,7 +1318,7 @@ class View : Element
                 int fixedSum = 0;
                 int my = c.y + pad;
                 int mi = 0;
-                for (Element child in this.children)
+                for (IElement child in this.children)
                 {
                     if (mi > 0) my = my + gap;
                     if (!this.isColumnFlexChild(child))
@@ -1129,7 +1340,7 @@ class View : Element
 
                 list<int> shares;
                 int allocated = 0;
-                for (Element child in this.children)
+                for (IElement child in this.children)
                 {
                     if (this.isColumnFlexChild(child))
                     {
@@ -1150,7 +1361,7 @@ class View : Element
                 int cy = c.y + pad;
                 int pi = 0;
                 int si = 0;
-                for (Element child in this.children)
+                for (IElement child in this.children)
                 {
                     if (pi > 0) cy = cy + gap;
                     LayoutConstraints cc = default;
@@ -1179,7 +1390,7 @@ class View : Element
             {
                 int cy = c.y + pad;
                 int i = 0;
-                for (Element child in this.children)
+                for (IElement child in this.children)
                 {
                     if (i > 0) cy = cy + gap;
                     LayoutConstraints cc = default;
@@ -1200,17 +1411,17 @@ class View : Element
         return sz;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         if (this.style.backgroundColor != 0)
             cv.drawRect(this.bounds, true, this.style.backgroundColor);
-        for (Element c in this.children)
+        for (IElement c in this.children)
             c.paint(cv, ctx);
     }
 
     bool dispatch(Event e, UiContext* ctx)
     {
-        for (Element c in this.children)
+        for (IElement c in this.children)
         {
             if (c.dispatch(e, ctx))
                 return true;
@@ -1226,7 +1437,7 @@ class View : Element
 
         out = out + ",\"children\":[";
         int i = 0;
-        for (Element c in this.children)
+        for (IElement c in this.children)
         {
             if (i > 0)
                 out = out + ",";
@@ -1241,7 +1452,7 @@ class View : Element
     // child node), then drop the now-dangling list entries.
     void destroyTree()
     {
-        for (Element c in this.children)
+        for (IElement c in this.children)
         {
             c.destroyTree();
             delete c;
@@ -1253,23 +1464,23 @@ class View : Element
     int flexWeight() { return this.style.flex; }
     void collectFocusables(list<string>* keys)
     {
-        for (Element c in this.children) c.collectFocusables(keys);
+        for (IElement c in this.children) c.collectFocusables(keys);
     }
     // Containers are reconciled by child diffing, not propsEqual; compare style
     // anyway so the contract is honest if a caller ever diffs a View directly.
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        View* o = other as View;
+        IView o = other as IView;
         return o != nullptr && styleEquals(this.style, o.style);
     }
-    list<Element>* childList() { return &this.children; }
+    list<IElement>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
 };
 
 // -- Text: a leaf displaying a string -----------------------------------------
-class Text : Element
+class Text : IText
 {
     string text = default;
     int    color = 0;           // rgb(); 0 = default ink
@@ -1291,7 +1502,7 @@ class Text : Element
         return s;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         cv.drawText(this.bounds.x, this.bounds.y, this.text.data(),
                     pickColor(this.color, ctx.theme.textColor));
@@ -1304,12 +1515,12 @@ class Text : Element
     int kind() { return ELEM_TEXT; }
     int flexWeight() { return 0; }
     void collectFocusables(list<string>* keys) { }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        Text* o = other as Text;
+        IText o = other as IText;
         return o != nullptr && this.text == o.text;
     }
-    list<Element>* childList() { return nullptr; }
+    list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -1319,7 +1530,7 @@ class Text : Element
 // Names track React Native: `title` + `onPress`. A keyed button also takes focus
 // on press and re-fires on Enter/Space while focused (the keyboard-activation
 // half of the focus seam).
-class Button : Element
+class Button : IButtonElement
 {
     string title = default;
     Lambda<void()> onPress = default;
@@ -1351,7 +1562,7 @@ class Button : Element
         return s;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         // Disabled: a flat dimmed fill + gray label, no hover/press/focus affordance.
         if (this.disabled)
@@ -1417,12 +1628,12 @@ class Button : Element
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
     }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        Button* o = other as Button;
+        IButtonElement o = other as IButtonElement;
         return o != nullptr && this.title == o.title && this.disabled == o.disabled;
     }
-    list<Element>* childList() { return nullptr; }
+    list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -1433,14 +1644,14 @@ class Button : Element
 // style.width x style.height and stacks its children in the interior, inset by
 // the border plus style.padding. A box whose style.width/height is 0 falls back
 // to availW x 1, so an outer box driven by the host size scales on re-render.
-class Box : Element
+class Box : IBox
 {
     Style style = default;
-    list<Element> children = default;
+    list<IElement> children = default;
     Rect bounds = default;
     string key = default;
 
-    void add(Element child)
+    void add(IElement child)
     {
         this.children.add(child);
     }
@@ -1459,7 +1670,7 @@ class Box : Element
         int inset = 1 + this.style.padding;
         int cy = c.y + inset;
         int gi = 0;
-        for (Element child in this.children)
+        for (IElement child in this.children)
         {
             if (gi > 0) cy = cy + this.style.gap;
             LayoutConstraints cc = default;
@@ -1474,19 +1685,19 @@ class Box : Element
         return sz;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         int bg = pickColor(this.style.backgroundColor, ctx.theme.panelBg);
         if (bg != 0)
             cv.drawRect(this.bounds, true, bg);
         cv.drawRect(this.bounds, false, pickColor(this.style.color, ctx.theme.panelBorder));
-        for (Element c in this.children)
+        for (IElement c in this.children)
             c.paint(cv, ctx);
     }
 
     bool dispatch(Event e, UiContext* ctx)
     {
-        for (Element c in this.children)
+        for (IElement c in this.children)
         {
             if (c.dispatch(e, ctx))
                 return true;
@@ -1499,7 +1710,7 @@ class Box : Element
         string out = "{\"type\":\"Box\",\"style\":" + styleToJson(this.style);
         out = out + ",\"children\":[";
         int i = 0;
-        for (Element c in this.children)
+        for (IElement c in this.children)
         {
             if (i > 0)
                 out = out + ",";
@@ -1512,7 +1723,7 @@ class Box : Element
 
     void destroyTree()
     {
-        for (Element c in this.children)
+        for (IElement c in this.children)
         {
             c.destroyTree();
             delete c;
@@ -1524,14 +1735,14 @@ class Box : Element
     int flexWeight() { return 0; }
     void collectFocusables(list<string>* keys)
     {
-        for (Element c in this.children) c.collectFocusables(keys);
+        for (IElement c in this.children) c.collectFocusables(keys);
     }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        Box* o = other as Box;
+        IBox o = other as IBox;
         return o != nullptr && styleEquals(this.style, o.style);
     }
-    list<Element>* childList() { return &this.children; }
+    list<IElement>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -1545,7 +1756,7 @@ class Box : Element
 // and, while focused, inserts printable keys and deletes on Backspace. The buffer
 // it builds per keystroke is an owning `string` - exactly the field-store path
 // that string stabilization unblocked.
-class TextInput : Element
+class TextInput : ITextInput
 {
     string value       = default;
     string placeholder = default;
@@ -1557,6 +1768,8 @@ class TextInput : Element
     string tooltip = default;       // native hover tooltip; "" = none
     Rect   bounds = default;
     string key    = default;
+
+    void fireChangeText(string s) { this.onChangeText(s); }
 
     move string toJson()
     {
@@ -1575,7 +1788,7 @@ class TextInput : Element
         return s;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         // Show the value, or the placeholder when empty; a focused field shows a
         // trailing '_' caret in the next cell.
@@ -1642,12 +1855,12 @@ class TextInput : Element
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
     }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        TextInput* o = other as TextInput;
+        ITextInput o = other as ITextInput;
         return o != nullptr && this.value == o.value && this.disabled == o.disabled;
     }
-    list<Element>* childList() { return nullptr; }
+    list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -1659,7 +1872,7 @@ class TextInput : Element
 // state + invalidates, so the next render flows the new value back. Rendered as
 // "[x] label" / "[ ] label"; themed ink, hover-highlights the label, focus ring,
 // disabled dims and ignores input - all via the same UiContext state as Button.
-class Checkbox : Element
+class Checkbox : ICheckbox
 {
     string label    = default;
     bool   checked  = false;
@@ -1688,7 +1901,7 @@ class Checkbox : Element
         return s;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         int ink = pickColor(this.color, ctx.theme.textColor);
         if (this.disabled) ink = dimColor(ink);
@@ -1732,13 +1945,13 @@ class Checkbox : Element
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
     }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        Checkbox* o = other as Checkbox;
+        ICheckbox o = other as ICheckbox;
         return o != nullptr && this.checked == o.checked && this.label == o.label
             && this.disabled == o.disabled;
     }
-    list<Element>* childList() { return nullptr; }
+    list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -1747,7 +1960,7 @@ class Checkbox : Element
 // -- ProgressBar: a non-interactive themed fill bar (value 0..100) -------------
 // Draws a trough (theme.track) with the filled fraction in theme.accent. Width is
 // in cells. Purely presentational - it takes no input and no focus.
-class ProgressBar : Element
+class ProgressBar : IProgressBar
 {
     int    value = 0;          // 0..100
     int    width = 20;         // cells
@@ -1772,7 +1985,7 @@ class ProgressBar : Element
         return s;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         int track = ctx.theme.track;
         int fill  = pickColor(this.color, ctx.theme.accent);
@@ -1791,12 +2004,12 @@ class ProgressBar : Element
     int kind() { return ELEM_PROGRESS; }
     int flexWeight() { return 0; }
     void collectFocusables(list<string>* keys) { }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        ProgressBar* o = other as ProgressBar;
+        IProgressBar o = other as IProgressBar;
         return o != nullptr && this.value == o.value && this.width == o.width;
     }
-    list<Element>* childList() { return nullptr; }
+    list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -1806,7 +2019,7 @@ class ProgressBar : Element
 // Click or drag along the track to set the value; while focused, Left/Right step
 // it by 5. Renders a filled portion + a thumb in theme.accent and a focus ring.
 // Controlled: fires onChange(newValue); the parent owns the value.
-class Slider : Element
+class Slider : ISlider
 {
     int    value = 0;          // 0..100
     int    width = 20;         // cells
@@ -1845,7 +2058,7 @@ class Slider : Element
         return s;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         int track = ctx.theme.track;
         int fill  = ctx.theme.accent;
@@ -1903,12 +2116,12 @@ class Slider : Element
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
     }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        Slider* o = other as Slider;
+        ISlider o = other as ISlider;
         return o != nullptr && this.value == o.value && this.disabled == o.disabled;
     }
-    list<Element>* childList() { return nullptr; }
+    list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -1919,9 +2132,9 @@ class Slider : Element
 // is the Electron-class mistake): the NATIVE control's buffer is the source of
 // truth. `value` is the text to PUSH (initial content / file open); `onChange` is a
 // dirty NOTIFICATION (no payload) fired on edits. The app pulls the current text
-// with a host helper (nativeControlText) keyed by this node's key path. A Canvas
+// with a host helper (nativeControlText) keyed by this node's key path. A ICanvas
 // host falls back to painting `value` line by line (read-only preview).
-class TextArea : Element
+class TextArea : ITextArea
 {
     string value    = default;   // pushed content (setText); not per-keystroke state
     Lambda<void()> onChange = default;   // dirty notify (no payload)
@@ -1933,6 +2146,8 @@ class TextArea : Element
     string tooltip = default;  // native hover tooltip; "" = none
     Rect   bounds = default;
     string key    = default;
+
+    void fireChange() { this.onChange(); }
 
     move string toJson() { return "{\"type\":\"TextArea\"}"; }
 
@@ -1947,9 +2162,9 @@ class TextArea : Element
         return s;
     }
 
-    // Canvas fallback: draw the pushed text, one grid row per '\n'-delimited line,
+    // ICanvas fallback: draw the pushed text, one grid row per '\n'-delimited line,
     // clipped to the region. Native hosts ignore this (the EDIT paints itself).
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         int bg = pickColor(this.backgroundColor, ctx.theme.inputBg);
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
@@ -1991,12 +2206,12 @@ class TextArea : Element
     // Uncontrolled: the value flowing down is a PUSH, not per-keystroke state, so
     // do not treat a value difference as a prop change (that would clobber the
     // native buffer mid-edit). Same kind + same key = the same editor.
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        TextArea* o = other as TextArea;
+        ITextArea o = other as ITextArea;
         return o != nullptr && this.disabled == o.disabled;
     }
-    list<Element>* childList() { return nullptr; }
+    list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -2014,9 +2229,9 @@ TextArea* textArea(string value, Lambda<void()> onChange)
 // -- StatusBar: a bottom strip of text parts (msctls_statusbar32 on Win32) -----
 // App-shell chrome: one or more text panes. `parts` is a plain public list so
 // the <StatusBar/> sugar and imperative addPart() both work; the native host maps it
-// to a real status bar (which self-docks at the window bottom), and a Canvas host
+// to a real status bar (which self-docks at the window bottom), and a ICanvas host
 // falls back to one row of " | "-joined parts.
-class StatusBar : Element
+class StatusBar : IStatusBar
 {
     list<string> parts = default;   // text per pane; parts[0] is the main pane
     Rect   bounds = default;
@@ -2047,8 +2262,8 @@ class StatusBar : Element
         return s;
     }
 
-    // Canvas fallback: the panes joined by " | " on the strip's row.
-    void paint(Canvas cv, UiContext* ctx)
+    // ICanvas fallback: the panes joined by " | " on the strip's row.
+    void paint(ICanvas cv, UiContext* ctx)
     {
         string line = "";
         int i = 0;
@@ -2067,9 +2282,9 @@ class StatusBar : Element
     int kind() { return ELEM_STATUSBAR; }
     int flexWeight() { return 0; }
     void collectFocusables(list<string>* keys) { }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        StatusBar* o = other as StatusBar;
+        IStatusBar o = other as IStatusBar;
         if (o == nullptr) return false;
         if (this.parts.count() != o.parts.count()) return false;
         int i = 0;
@@ -2080,7 +2295,7 @@ class StatusBar : Element
         }
         return true;
     }
-    list<Element>* childList() { return nullptr; }
+    list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -2097,23 +2312,23 @@ StatusBar* statusBar(string text)
 // -- ScrollView: a clipped, vertically scrollable viewport ---------------------
 // Lays its children out in a tall virtual column shifted up by scrollY, then
 // paints them clipped to its viewport (style.width x style.height cells) via the
-// Canvas clip seam. A focused ScrollView scrolls on Up/Down; scrolling changes
+// ICanvas clip seam. A focused ScrollView scrolls on Up/Down; scrolling changes
 // layout but not the component tree, so it asks the host to repaint via
 // ctx.requestRepaint() (reconcile would otherwise produce no patches).
 // On a native host (Cocoa) the host maps this to a real NSScrollView and owns the
 // offset: it never changes scrollY (stays 0), so children lay out at content
 // coordinates from the viewport top and contentH sizes the native document view.
 // Nested ScrollViews are out of scope for the native mapping (one level only).
-class ScrollView : Element
+class ScrollView : IScrollView
 {
     Style style    = default;   // width x height = the viewport
-    list<Element> children = default;
+    list<IElement> children = default;
     int    scrollY  = 0;
     int    contentH = 0;        // total laid-out child height (set during layout)
     Rect   bounds   = default;
     string key      = default;
 
-    void add(Element child) { this.children.add(child); }
+    void add(IElement child) { this.children.add(child); }
 
     int _viewH()
     {
@@ -2144,7 +2359,7 @@ class ScrollView : Element
 
         int top = c.y - this.scrollY;
         int cy = top;
-        for (Element child in this.children)
+        for (IElement child in this.children)
         {
             LayoutConstraints cc = default;
             cc.x = c.x; cc.y = cy;
@@ -2158,12 +2373,12 @@ class ScrollView : Element
         return sz;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         if (this.style.backgroundColor != 0)
             cv.drawRect(this.bounds, true, this.style.backgroundColor);
         cv.pushClip(this.bounds);
-        for (Element c in this.children)
+        for (IElement c in this.children)
             c.paint(cv, ctx);
         cv.popClip();
     }
@@ -2173,7 +2388,7 @@ class ScrollView : Element
         if (e.kind == EV_MOUSE_DOWN)
         {
             if (!this.bounds.contains(e.x, e.y)) return false;   // outside viewport
-            for (Element c in this.children)
+            for (IElement c in this.children)
             {
                 if (c.dispatch(e, ctx)) return true;
             }
@@ -2185,7 +2400,7 @@ class ScrollView : Element
             // Forward hover/release to children only while the pointer is inside
             // the viewport, so a child inside the scroll area can hover.
             if (!this.bounds.contains(e.x, e.y)) return false;
-            for (Element c in this.children)
+            for (IElement c in this.children)
             {
                 if (c.dispatch(e, ctx)) return true;
             }
@@ -2193,7 +2408,7 @@ class ScrollView : Element
         }
         if (e.kind == EV_KEY)
         {
-            for (Element c in this.children)
+            for (IElement c in this.children)
             {
                 if (c.dispatch(e, ctx)) return true;   // a focused child consumes first
             }
@@ -2218,7 +2433,7 @@ class ScrollView : Element
         string out = "{\"type\":\"ScrollView\",\"scrollY\":" + this.scrollY.toString();
         out = out + ",\"children\":[";
         int i = 0;
-        for (Element c in this.children)
+        for (IElement c in this.children)
         {
             if (i > 0) out = out + ",";
             out = out + c.toJson();
@@ -2230,7 +2445,7 @@ class ScrollView : Element
 
     void destroyTree()
     {
-        for (Element c in this.children)
+        for (IElement c in this.children)
         {
             c.destroyTree();
             delete c;
@@ -2243,21 +2458,21 @@ class ScrollView : Element
     void collectFocusables(list<string>* keys)
     {
         if (this.key.length() > 0) keys.add("" + this.key);
-        for (Element c in this.children) c.collectFocusables(keys);
+        for (IElement c in this.children) c.collectFocusables(keys);
     }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        ScrollView* o = other as ScrollView;
+        IScrollView o = other as IScrollView;
         return o != nullptr && styleEquals(this.style, o.style);
     }
-    list<Element>* childList() { return &this.children; }
+    list<IElement>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
 };
 
 // Convenience constructors returning the concrete heap pointer (so callers can
-// set typed props), assignable to an Element slot at the use site.
+// set typed props), assignable to an IElement slot at the use site.
 View* view(Style style)
 {
     View* v = new View();
@@ -2356,9 +2571,9 @@ ScrollView* scrollView(Style style)
 // A dumb controlled leaf: `checked` is pushed down each render (index == group
 // value), `index` is its position. The enclosing RadioGroup owns selection and
 // hit-testing; a bare radio is inert on its own (the native host routes a click to
-// the group by key path). Rendered "(o) label" / "( ) label" on a Canvas host, a
+// the group by key path). Rendered "(o) label" / "( ) label" on a ICanvas host, a
 // BS_AUTORADIOBUTTON on Win32 (WS_GROUP on the first radio of the group).
-class RadioButton : Element
+class RadioButton : IRadioButton
 {
     string label      = default;
     int    index      = 0;          // position within the group (drives selection)
@@ -2385,7 +2600,7 @@ class RadioButton : Element
         return s;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         int ink = pickColor(0, ctx.theme.textColor);
         if (this.disabled) ink = dimColor(ink);
@@ -2402,13 +2617,13 @@ class RadioButton : Element
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
     }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        RadioButton* o = other as RadioButton;
+        IRadioButton o = other as IRadioButton;
         return o != nullptr && this.checked == o.checked && this.label == o.label
             && this.disabled == o.disabled;
     }
-    list<Element>* childList() { return nullptr; }
+    list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -2419,18 +2634,20 @@ class RadioButton : Element
 // (not itself a native control, like View); its RadioButton children ARE controls.
 // Selection is controlled: each render sets each child's `checked` (via addOption or
 // sugar `checked={value==i}`), and a click fires onChange(index). The group is where
-// hit-testing lives on a Canvas host; the native host routes a radio click here by
+// hit-testing lives on a ICanvas host; the native host routes a radio click here by
 // walking the key path up one segment.
-class RadioGroup : Element
+class RadioGroup : IRadioGroup
 {
-    list<Element> children = default;   // RadioButton*
+    list<IElement> children = default;   // RadioButton*
     int   value    = 0;                 // selected index (controlled)
     Lambda<void(int)> onChange = default;
     Style style    = default;
     Rect  bounds   = default;
     string key     = default;
 
-    void add(Element child) { this.children.add(child); }
+    void add(IElement child) { this.children.add(child); }
+
+    void fireChange(int v) { this.onChange(v); }
 
     // Append a wired option. `checked` is seeded from the current value at render time
     // (the controlled contract); reconcile propagates a later selection change through
@@ -2454,11 +2671,11 @@ class RadioGroup : Element
         int gap = this.style.gap;
         int cy = c.y + pad;
         int i = 0;
-        for (Element child in this.children)
+        for (IElement child in this.children)
         {
             if (child.kind() == ELEM_RADIO)
             {
-                RadioButton* rb = child as RadioButton;
+                IRadioButton rb = child as IRadioButton;
                 rb.groupFirst = i == 0;
             }
             if (i > 0) cy = cy + gap;
@@ -2476,20 +2693,21 @@ class RadioGroup : Element
         return sz;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
-        for (Element c in this.children) c.paint(cv, ctx);
+        for (IElement c in this.children) c.paint(cv, ctx);
     }
 
     bool dispatch(Event e, UiContext* ctx)
     {
         if (e.kind == EV_MOUSE_DOWN)
         {
-            for (Element c in this.children)
+            for (IElement c in this.children)
             {
                 if (c.kind() != ELEM_RADIO) continue;
-                RadioButton* rb = c as RadioButton;
-                if (!rb.disabled && rb.bounds.contains(e.x, e.y))
+                IRadioButton rb = c as IRadioButton;
+                Rect rbb = rb.nodeBounds();   // `bounds` is not an interface field; IElement exposes it
+                if (!rb.disabled && rbb.contains(e.x, e.y))
                 {
                     ctx.focus(this.key);
                     this.onChange(rb.index);
@@ -2505,7 +2723,7 @@ class RadioGroup : Element
         string out = "{\"type\":\"RadioGroup\",\"value\":" + this.value.toString();
         out = out + ",\"children\":[";
         int i = 0;
-        for (Element c in this.children)
+        for (IElement c in this.children)
         {
             if (i > 0) out = out + ",";
             out = out + c.toJson();
@@ -2517,7 +2735,7 @@ class RadioGroup : Element
 
     void destroyTree()
     {
-        for (Element c in this.children) { c.destroyTree(); delete c; }
+        for (IElement c in this.children) { c.destroyTree(); delete c; }
         this.children.clear();
     }
 
@@ -2525,14 +2743,14 @@ class RadioGroup : Element
     int flexWeight() { return 0; }
     void collectFocusables(list<string>* keys)
     {
-        for (Element c in this.children) c.collectFocusables(keys);
+        for (IElement c in this.children) c.collectFocusables(keys);
     }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        RadioGroup* o = other as RadioGroup;
+        IRadioGroup o = other as IRadioGroup;
         return o != nullptr && this.value == o.value && styleEquals(this.style, o.style);
     }
-    list<Element>* childList() { return &this.children; }
+    list<IElement>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -2541,8 +2759,8 @@ class RadioGroup : Element
 // -- ComboBox: a controlled dropdown --------------------------------------------
 // A CBS_DROPDOWNLIST on Win32 (NSPopUpButton on Cocoa later). Controlled like the
 // other widgets: `selectedIndex` + `items` flow down, a selection fires
-// onChange(index). Canvas fallback shows "[selected v]" and cycles on click.
-class ComboBox : Element
+// onChange(index). ICanvas fallback shows "[selected v]" and cycles on click.
+class ComboBox : IComboBox
 {
     list<string> items = default;
     int   selectedIndex = 0;
@@ -2554,6 +2772,8 @@ class ComboBox : Element
     string key   = default;
 
     void addItem(string s) { this.items.add("" + s); }
+
+    void fireChange(int v) { this.onChange(v); }
 
     string _selectedText()
     {
@@ -2590,7 +2810,7 @@ class ComboBox : Element
         return s;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         int ink = pickColor(0, ctx.theme.inputText);
         if (this.disabled) ink = dimColor(ink);
@@ -2627,9 +2847,9 @@ class ComboBox : Element
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
     }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        ComboBox* o = other as ComboBox;
+        IComboBox o = other as IComboBox;
         if (o == nullptr) return false;
         if (this.selectedIndex != o.selectedIndex || this.disabled != o.disabled) return false;
         if (this.items.count() != o.items.count()) return false;
@@ -2641,7 +2861,7 @@ class ComboBox : Element
         }
         return true;
     }
-    list<Element>* childList() { return nullptr; }
+    list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -2656,7 +2876,7 @@ class ComboBox : Element
 // the setListOp seam by the host. rowText/onSelect/onActivate are owning closures
 // that capture the component pointer, so they read current state even when the
 // committed node is reused across renders (no per-frame re-box needed).
-class ListView : Element
+class ListView : IListView
 {
     list<string> columns   = default;   // header titles
     list<int>    colWidths = default;    // per-column width in DIPs (parallel to columns)
@@ -2679,6 +2899,9 @@ class ListView : Element
         this.colWidths.add(widthDip);
     }
 
+    void fireSelect(int row)   { this.onSelect(row); }
+    void fireActivate(int row) { this.onActivate(row); }
+
     move string toJson()
     {
         int nc = this.columns.count();
@@ -2698,9 +2921,9 @@ class ListView : Element
         return s;
     }
 
-    // Canvas fallback: header row + only the rows that fit (virtualization is visible
+    // ICanvas fallback: header row + only the rows that fit (virtualization is visible
     // here too - the callback is asked for at most bounds.h-1 rows regardless of count).
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         int bg = pickColor(0, ctx.theme.inputBg);
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
@@ -2760,21 +2983,21 @@ class ListView : Element
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
     }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        ListView* o = other as ListView;
+        IListView o = other as IListView;
         if (o == nullptr) return false;
         return this.rowCount == o.rowCount && this.selectedIndex == o.selectedIndex
             && this.multiSelect == o.multiSelect && this.disabled == o.disabled
             && this.columns.count() == o.columns.count();
     }
-    list<Element>* childList() { return nullptr; }
+    list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
 };
 
-// -- Element factories (thin field-setters; sugar-ready fields elsewhere) -------
+// -- IElement factories (thin field-setters; sugar-ready fields elsewhere) -------
 // A controlled radio group; append options with addOption(), which wires index/key
 // and seeds checked from `value`.
 RadioGroup* radioGroup(int value, Lambda<void(int)> onChange)
@@ -2805,7 +3028,7 @@ ListView* listView(int rowCount, Lambda<string(int,int)> rowText)
 
 // -- ListView rowText callback boxing (the setListOp seam carries an opaque u64) -
 // The native host must call back into a `Lambda<string(int,int)>` when the OS asks
-// for a cell (LVN_GETDISPINFO). A Lambda type cannot cross the NativeHost interface
+// for a cell (LVN_GETDISPINFO). A Lambda type cannot cross the INativeHost interface
 // (it breaks the monomorphizer - same constraint as ctx.post), so ui.cb heap-boxes
 // the closure and the seam carries the box as a u64. The host stores the box per
 // control, invokes it through __uiListRowText, and frees it via __uiFreeListRowBox
@@ -2843,19 +3066,19 @@ void __uiFreeListRowBox(u64 boxPtr)
 // labels the tab; its children are the pane content. Only the ACTIVE pane is walked
 // into native controls by the host (lazy inactive tabs), so a re-render never
 // materializes an inactive pane's controls.
-class TabPane : Element
+class TabPane : ITabPane
 {
     string title = default;
-    list<Element> children = default;
+    list<IElement> children = default;
     Rect bounds = default;
     string key = default;
 
-    void add(Element child) { this.children.add(child); }
+    void add(IElement child) { this.children.add(child); }
 
     Size layout(LayoutConstraints c)
     {
         int cy = c.y;
-        for (Element child in this.children)
+        for (IElement child in this.children)
         {
             LayoutConstraints cc = default;
             cc.x = c.x; cc.y = cy; cc.availW = c.availW; cc.availH = c.availH;
@@ -2868,11 +3091,11 @@ class TabPane : Element
         return s;
     }
 
-    void paint(Canvas cv, UiContext* ctx) { for (Element c in this.children) c.paint(cv, ctx); }
+    void paint(ICanvas cv, UiContext* ctx) { for (IElement c in this.children) c.paint(cv, ctx); }
 
     bool dispatch(Event e, UiContext* ctx)
     {
-        for (Element c in this.children) { if (c.dispatch(e, ctx)) return true; }
+        for (IElement c in this.children) { if (c.dispatch(e, ctx)) return true; }
         return false;
     }
 
@@ -2880,14 +3103,14 @@ class TabPane : Element
     {
         string out = "{\"type\":\"TabPane\",\"title\":\"" + this.title + "\",\"children\":[";
         int i = 0;
-        for (Element c in this.children) { if (i > 0) out = out + ","; out = out + c.toJson(); i++; }
+        for (IElement c in this.children) { if (i > 0) out = out + ","; out = out + c.toJson(); i++; }
         out = out + "]}";
         return out;
     }
 
     void destroyTree()
     {
-        for (Element c in this.children) { c.destroyTree(); delete c; }
+        for (IElement c in this.children) { c.destroyTree(); delete c; }
         this.children.clear();
     }
 
@@ -2895,14 +3118,14 @@ class TabPane : Element
     int flexWeight() { return 0; }
     void collectFocusables(list<string>* keys)
     {
-        for (Element c in this.children) c.collectFocusables(keys);
+        for (IElement c in this.children) c.collectFocusables(keys);
     }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        TabPane* o = other as TabPane;
+        ITabPane o = other as ITabPane;
         return o != nullptr && this.title == o.title;
     }
-    list<Element>* childList() { return &this.children; }
+    list<IElement>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -2913,9 +3136,9 @@ class TabPane : Element
 // content maps to native controls; inactive panes are NOT walked into native (so a
 // per-tab editor buffer must live in the app model, not an inactive native control).
 // Controlled: `selectedTab` flows down, a header click fires onSelectTab(index).
-class TabControl : Element
+class TabControl : ITabControl
 {
-    list<Element> children = default;   // TabPane*
+    list<IElement> children = default;   // TabPane*
     int selectedTab = 0;                 // controlled active pane index
     Lambda<void(int)> onSelectTab = default;
     int width = 40;
@@ -2925,14 +3148,16 @@ class TabControl : Element
     Rect bounds = default;
     string key = default;
 
-    void add(Element child) { this.children.add(child); }
+    void add(IElement child) { this.children.add(child); }
     void addPane(TabPane* p) { this.children.add(p); }
+
+    void fireSelectTab(int i) { this.onSelectTab(i); }
 
     string _title(int i)
     {
         if (i < 0 || i >= this.children.count()) return "";
-        Element c = this.children.get(i);
-        TabPane* p = c as TabPane;
+        IElement c = this.children.get(i);
+        ITabPane p = c as ITabPane;
         if (p == nullptr) return "";
         return "" + p.title;
     }
@@ -2946,7 +3171,7 @@ class TabControl : Element
         this.bounds = b;
         int hdr = 2;   // the tab header strip reserves two rows
         int i = 0;
-        for (Element child in this.children)
+        for (IElement child in this.children)
         {
             LayoutConstraints cc = default;
             if (i == this.selectedTab)
@@ -2965,7 +3190,7 @@ class TabControl : Element
         return s;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         int bg = pickColor(0, ctx.theme.panelBg);
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
@@ -3012,14 +3237,14 @@ class TabControl : Element
         string out = "{\"type\":\"TabControl\",\"selectedTab\":" + this.selectedTab.toString()
                    + ",\"children\":[";
         int i = 0;
-        for (Element c in this.children) { if (i > 0) out = out + ","; out = out + c.toJson(); i++; }
+        for (IElement c in this.children) { if (i > 0) out = out + ","; out = out + c.toJson(); i++; }
         out = out + "]}";
         return out;
     }
 
     void destroyTree()
     {
-        for (Element c in this.children) { c.destroyTree(); delete c; }
+        for (IElement c in this.children) { c.destroyTree(); delete c; }
         this.children.clear();
     }
 
@@ -3030,13 +3255,13 @@ class TabControl : Element
         if (this.selectedTab >= 0 && this.selectedTab < this.children.count())
             this.children.get(this.selectedTab).collectFocusables(keys);
     }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        TabControl* o = other as TabControl;
+        ITabControl o = other as ITabControl;
         return o != nullptr && this.selectedTab == o.selectedTab
             && this.children.count() == o.children.count();
     }
-    list<Element>* childList() { return &this.children; }
+    list<IElement>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -3048,10 +3273,10 @@ class TabControl : Element
 // expanded. childCount(TREE_ROOT) gives the top-level nodes; childId(nodeId, i) the
 // i-th child's id; label(nodeId) its text. Controlled selection is `selectedNode`;
 // onSelect(nodeId) fires on a selection change, onExpand(nodeId) on expand. Native =
-// WC_TREEVIEW (SysTreeView32); the Canvas fallback renders the top-level nodes.
+// WC_TREEVIEW (SysTreeView32); the ICanvas fallback renders the top-level nodes.
 const int TREE_ROOT = -1;   // virtual root nodeId; its children are the top-level nodes
 
-class TreeView : Element
+class TreeView : ITreeView
 {
     Lambda<int(int)>     childCount = default;   // nodeId -> number of children
     Lambda<int(int,int)> childId    = default;   // (nodeId, i) -> child nodeId
@@ -3065,6 +3290,9 @@ class TreeView : Element
     string tooltip = default;
     Rect bounds = default;
     string key = default;
+
+    void fireSelect(int nodeId) { this.onSelect(nodeId); }
+    void fireExpand(int nodeId) { this.onExpand(nodeId); }
 
     move string toJson()
     {
@@ -3082,7 +3310,7 @@ class TreeView : Element
         return s;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         int bg = pickColor(0, ctx.theme.inputBg);
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
@@ -3123,12 +3351,12 @@ class TreeView : Element
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
     }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        TreeView* o = other as TreeView;
+        ITreeView o = other as ITreeView;
         return o != nullptr && this.selectedNode == o.selectedNode && this.disabled == o.disabled;
     }
-    list<Element>* childList() { return nullptr; }
+    list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -3140,12 +3368,12 @@ class TreeView : Element
 // along the split axis), reserving a 1-DIP divider gutter between them. `vertical`
 // true = side-by-side (a vertical divider), false = stacked. Dragging the divider
 // fires onRatioChange(newRatio) - the app owns the ratio (controlled), the host hit-
-// tests the gutter. The Canvas fallback draws the two panes and the divider line.
+// tests the gutter. The ICanvas fallback draws the two panes and the divider line.
 const int SPLIT_DIVIDER = 1;   // DIP thickness of the divider gutter
 
-class SplitView : Element
+class SplitView : ISplitView
 {
-    list<Element> children = default;   // exactly two panes
+    list<IElement> children = default;   // exactly two panes
     int   ratio    = 50;                 // first pane's percentage of the split axis (5..95)
     bool  vertical = true;               // true = side-by-side, false = stacked
     Lambda<void(int)> onRatioChange = default;
@@ -3154,7 +3382,9 @@ class SplitView : Element
     Rect  dividerBounds = default;       // the draggable gutter (host hit-test target)
     string key     = default;
 
-    void add(Element child) { this.children.add(child); }
+    void add(IElement child) { this.children.add(child); }
+
+    void fireRatioChange(int r) { this.onRatioChange(r); }
 
     int _clampRatio(int v) { if (v < 5) return 5; if (v > 95) return 95; return v; }
 
@@ -3220,9 +3450,9 @@ class SplitView : Element
         return this._clampRatio((py - this.bounds.y) * 100 / this.bounds.h);
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
-        for (Element c in this.children) c.paint(cv, ctx);
+        for (IElement c in this.children) c.paint(cv, ctx);
         cv.drawRect(this.dividerBounds, true, pickColor(this.style.color, ctx.theme.panelBorder));
     }
 
@@ -3236,7 +3466,7 @@ class SplitView : Element
         {
             this.onRatioChange(this._ratioAt(e.x, e.y)); return true;
         }
-        for (Element c in this.children) { if (c.dispatch(e, ctx)) return true; }
+        for (IElement c in this.children) { if (c.dispatch(e, ctx)) return true; }
         return false;
     }
 
@@ -3245,14 +3475,14 @@ class SplitView : Element
         string out = "{\"type\":\"SplitView\",\"ratio\":" + this.ratio.toString()
                    + ",\"children\":[";
         int i = 0;
-        for (Element c in this.children) { if (i > 0) out = out + ","; out = out + c.toJson(); i++; }
+        for (IElement c in this.children) { if (i > 0) out = out + ","; out = out + c.toJson(); i++; }
         out = out + "]}";
         return out;
     }
 
     void destroyTree()
     {
-        for (Element c in this.children) { c.destroyTree(); delete c; }
+        for (IElement c in this.children) { c.destroyTree(); delete c; }
         this.children.clear();
     }
 
@@ -3260,15 +3490,15 @@ class SplitView : Element
     int flexWeight() { return 0; }
     void collectFocusables(list<string>* keys)
     {
-        for (Element c in this.children) c.collectFocusables(keys);
+        for (IElement c in this.children) c.collectFocusables(keys);
     }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        SplitView* o = other as SplitView;
+        ISplitView o = other as ISplitView;
         return o != nullptr && this.ratio == o.ratio && this.vertical == o.vertical
             && styleEquals(this.style, o.style);
     }
-    list<Element>* childList() { return &this.children; }
+    list<IElement>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -3277,19 +3507,19 @@ class SplitView : Element
 // Copy controlled CONTAINER scalars from a wip node onto the retained committed node
 // during reconcile. Only the containers whose native host layout reads a scalar
 // need this - see the call in reconcilePath. Both args are named borrows (safe `as`).
-void adoptContainerProps(Element committed, Element wip)
+void adoptContainerProps(IElement committed, IElement wip)
 {
     int k = committed.kind();
     if (k == ELEM_TABS)
     {
-        TabControl* a = committed as TabControl;
-        TabControl* b = wip as TabControl;
+        ITabControl a = committed as ITabControl;
+        ITabControl b = wip as ITabControl;
         if (a != nullptr && b != nullptr) a.selectedTab = b.selectedTab;
     }
     else if (k == ELEM_SPLIT)
     {
-        SplitView* a = committed as SplitView;
-        SplitView* b = wip as SplitView;
+        ISplitView a = committed as ISplitView;
+        ISplitView b = wip as ISplitView;
         if (a != nullptr && b != nullptr) { a.ratio = b.ratio; a.vertical = b.vertical; }
     }
 }
@@ -3297,7 +3527,7 @@ void adoptContainerProps(Element committed, Element wip)
 // -- TreeView node-source boxing (the setListOp seam carries an opaque u64) ------
 // The native host must call back into the tree's childCount/childId/label closures
 // when the OS asks to expand a node (TVN_ITEMEXPANDING) or reports selection. Lambdas
-// cannot cross the NativeHost interface (monomorphizer limit - same as ctx.post /
+// cannot cross the INativeHost interface (monomorphizer limit - same as ctx.post /
 // ListRowBox), so ui.cb heap-boxes the three closures and the seam carries the box as
 // a u64. The host invokes them through __uiTree* and frees via __uiFreeTreeBox.
 class TreeBox
@@ -3351,7 +3581,7 @@ void __uiFreeContextMenu(u64 menuPtr)
     delete m;
 }
 
-// -- Element factories (thin field-setters; sugar-ready fields elsewhere) -------
+// -- IElement factories (thin field-setters; sugar-ready fields elsewhere) -------
 TabPane* tabPane(string title)
 {
     TabPane* p = new TabPane();
@@ -3405,9 +3635,9 @@ View* toolbar()
 // owns the buffer (a component field / global freed on teardown), so the element never
 // owns pixel memory - it just points at it, like the borrowed `tooltip`/`source`
 // string literals. Alternatively `source` names a .bmp file the host decodes directly.
-// A Canvas host has no bitmap surface, so it falls back to a bordered placeholder box
+// A ICanvas host has no bitmap surface, so it falls back to a bordered placeholder box
 // with the `altText` centered.
-class Image : Element
+class Image : IImageElement
 {
     u64    pixels  = 0u;         // borrowed top-down BGRA32 buffer (app-owned); 0 = none
     int    pxW     = 0;          // source pixel width
@@ -3436,8 +3666,8 @@ class Image : Element
         return s;
     }
 
-    // Canvas fallback: a bordered box with the alt text (a char grid has no bitmap).
-    void paint(Canvas cv, UiContext* ctx)
+    // ICanvas fallback: a bordered box with the alt text (a char grid has no bitmap).
+    void paint(ICanvas cv, UiContext* ctx)
     {
         cv.drawRect(this.bounds, false, pickColor(0, ctx.theme.panelBorder));
         string t = this.altText.length() > 0 ? this.altText : "[img]";
@@ -3450,13 +3680,13 @@ class Image : Element
     int kind() { return ELEM_IMAGE; }
     int flexWeight() { return 0; }
     void collectFocusables(list<string>* keys) { }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        Image* o = other as Image;
+        IImageElement o = other as IImageElement;
         return o != nullptr && this.pixels == o.pixels && this.pxW == o.pxW
             && this.pxH == o.pxH && this.width == o.width && this.height == o.height;
     }
-    list<Element>* childList() { return nullptr; }
+    list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -3476,17 +3706,17 @@ Image* image(u64 pixels, int pxW, int pxH)
 // The classic-forms grouping frame: a border with a caption, wrapping related
 // controls. A pure sized container (like Box) whose native mapping is a BS_GROUPBOX
 // (a BUTTON that draws the frame + caption); its children position as siblings inside
-// the frame. A Canvas host draws a bordered box with the title on the top edge.
-class GroupBox : Element
+// the frame. A ICanvas host draws a bordered box with the title on the top edge.
+class GroupBox : IGroupBox
 {
     string title = default;
     Style  style = default;
-    list<Element> children = default;
+    list<IElement> children = default;
     string tooltip = default;
     Rect   bounds = default;
     string key    = default;
 
-    void add(Element child) { this.children.add(child); }
+    void add(IElement child) { this.children.add(child); }
 
     Size layout(LayoutConstraints c)
     {
@@ -3500,7 +3730,7 @@ class GroupBox : Element
         int inset = 1 + this.style.padding;
         int cy = c.y + inset;   // one row down for the caption + frame
         int gi = 0;
-        for (Element child in this.children)
+        for (IElement child in this.children)
         {
             if (gi > 0) cy = cy + this.style.gap;
             LayoutConstraints cc = default;
@@ -3514,17 +3744,17 @@ class GroupBox : Element
         return sz;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
         cv.drawRect(this.bounds, false, pickColor(this.style.color, ctx.theme.panelBorder));
         cv.drawText(this.bounds.x + 2, this.bounds.y, this.title.data(),
                     pickColor(0, ctx.theme.textColor));
-        for (Element c in this.children) c.paint(cv, ctx);
+        for (IElement c in this.children) c.paint(cv, ctx);
     }
 
     bool dispatch(Event e, UiContext* ctx)
     {
-        for (Element c in this.children) { if (c.dispatch(e, ctx)) return true; }
+        for (IElement c in this.children) { if (c.dispatch(e, ctx)) return true; }
         return false;
     }
 
@@ -3532,14 +3762,14 @@ class GroupBox : Element
     {
         string out = "{\"type\":\"GroupBox\",\"title\":\"" + this.title + "\",\"children\":[";
         int i = 0;
-        for (Element c in this.children) { if (i > 0) out = out + ","; out = out + c.toJson(); i++; }
+        for (IElement c in this.children) { if (i > 0) out = out + ","; out = out + c.toJson(); i++; }
         out = out + "]}";
         return out;
     }
 
     void destroyTree()
     {
-        for (Element c in this.children) { c.destroyTree(); delete c; }
+        for (IElement c in this.children) { c.destroyTree(); delete c; }
         this.children.clear();
     }
 
@@ -3547,14 +3777,14 @@ class GroupBox : Element
     int flexWeight() { return 0; }
     void collectFocusables(list<string>* keys)
     {
-        for (Element c in this.children) c.collectFocusables(keys);
+        for (IElement c in this.children) c.collectFocusables(keys);
     }
-    bool propsEqual(Element other)
+    bool propsEqual(IElement other)
     {
-        GroupBox* o = other as GroupBox;
+        IGroupBox o = other as IGroupBox;
         return o != nullptr && this.title == o.title && styleEquals(this.style, o.style);
     }
-    list<Element>* childList() { return &this.children; }
+    list<IElement>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -3570,16 +3800,16 @@ GroupBox* groupBox(string title, Style style)
 }
 
 // -- CanvasView: the app-painted escape hatch ---------------------------------
-// Hosts a child surface the app draws with the SAME Canvas API the framework paints
-// through. `onPaint(Canvas)` receives a Canvas whose cell origin is the view's top-left;
+// Hosts a child surface the app draws with the SAME ICanvas API the framework paints
+// through. `onPaint(ICanvas)` receives a ICanvas whose cell origin is the view's top-left;
 // the app draws text/rects freely. This closes the "the framework cannot do X" gap: any
 // custom widget (a chart, a game board) is a CanvasView with a paint closure. On a native
 // host the view maps to a GDI-backed child window that invokes the boxed closure on
-// WM_PAINT (see the CanvasBox seam below); on a Canvas host, paint() delegates straight
-// to onPaint with the host's own Canvas.
-class CanvasView : Element
+// WM_PAINT (see the CanvasBox seam below); on a ICanvas host, paint() delegates straight
+// to onPaint with the host's own ICanvas.
+class CanvasView : ICanvasView
 {
-    Lambda<void(Canvas)> onPaint = default;
+    Lambda<void(ICanvas)> onPaint = default;
     int    width   = 20;         // layout width (DIP)
     int    height  = 8;          // layout height (DIP)
     string tooltip = default;
@@ -3599,23 +3829,23 @@ class CanvasView : Element
         return s;
     }
 
-    // Canvas fallback: the host IS a Canvas, so delegate straight to the app's painter.
-    void paint(Canvas cv, UiContext* ctx) { this.onPaint(cv); }
+    // ICanvas fallback: the host IS a ICanvas, so delegate straight to the app's painter.
+    void paint(ICanvas cv, UiContext* ctx) { this.onPaint(cv); }
 
     bool dispatch(Event e, UiContext* ctx) { return false; }
     void destroyTree() { }
     int kind() { return ELEM_CANVAS; }
     int flexWeight() { return 0; }
     void collectFocusables(list<string>* keys) { }
-    bool propsEqual(Element other) { CanvasView* o = other as CanvasView; return o != nullptr; }
-    list<Element>* childList() { return nullptr; }
+    bool propsEqual(IElement other) { ICanvasView o = other as ICanvasView; return o != nullptr; }
+    list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
 };
 
-// A canvas view driven by an onPaint(Canvas) closure.
-CanvasView* canvasView(Lambda<void(Canvas)> onPaint)
+// A canvas view driven by an onPaint(ICanvas) closure.
+CanvasView* canvasView(Lambda<void(ICanvas)> onPaint)
 {
     CanvasView* c = new CanvasView();
     c.onPaint = onPaint;
@@ -3623,22 +3853,22 @@ CanvasView* canvasView(Lambda<void(Canvas)> onPaint)
 }
 
 // -- CanvasView paint-callback boxing (the seam carries an opaque u64) ----------
-// The native host must invoke the app's onPaint(Canvas) closure when the OS asks the
-// child window to repaint (WM_PAINT). A Lambda cannot cross the NativeHost interface
+// The native host must invoke the app's onPaint(ICanvas) closure when the OS asks the
+// child window to repaint (WM_PAINT). A Lambda cannot cross the INativeHost interface
 // (monomorphizer limit - same as ctx.post / ListRowBox / TreeBox), so ui.cb heap-boxes
-// the closure and the seam carries the box as a u64. The host constructs its own Canvas
+// the closure and the seam carries the box as a u64. The host constructs its own ICanvas
 // (a GDI-backed one) and invokes the box through __uiCanvasPaint; it frees the box via
 // __uiFreeCanvasBox when the control is destroyed.
-class CanvasBox { Lambda<void(Canvas)> paint = default; };
+class CanvasBox { Lambda<void(ICanvas)> paint = default; };
 
-CanvasBox* _boxCanvas(Lambda<void(Canvas)> p)
+CanvasBox* _boxCanvas(Lambda<void(ICanvas)> p)
 {
     CanvasBox* b = new CanvasBox();
     b.paint = p;   // clone-in (lambdas clone-by-default)
     return b;
 }
 
-void __uiCanvasPaint(u64 boxPtr, Canvas c)
+void __uiCanvasPaint(u64 boxPtr, ICanvas c)
 {
     if (boxPtr == 0u) return;
     CanvasBox* b = (CanvasBox*)boxPtr;
@@ -3655,7 +3885,7 @@ void __uiFreeCanvasBox(u64 boxPtr)
 // Move focus to the next (or previous, when backward) focusable node in tree
 // order, wrapping around. Built fresh from the live tree each time, so it tracks
 // keyed identity across re-renders. The host calls this on Tab / Shift-Tab.
-void moveFocus(Element tree, UiContext* ctx, bool backward)
+void moveFocus(IElement tree, UiContext* ctx, bool backward)
 {
     list<string> keys = default;
     tree.collectFocusables(&keys);
@@ -3682,7 +3912,7 @@ void moveFocus(Element tree, UiContext* ctx, bool backward)
 // Tear down and free an entire owning tree: descendants first (via the node's
 // own destroyTree), then the root node itself. `move` transfers ownership of the
 // root in, so the delete is authorized; delete dispatches virtually.
-void deleteTree(move Element root)
+void deleteTree(move IElement root)
 {
     root.destroyTree();
     delete root;
@@ -3719,7 +3949,7 @@ Patch makePatch(int op, int nodeKind, string detail)
     return p;
 }
 
-// Patch identity: the affected node's stable key path lets a NativeHost route
+// Patch identity: the affected node's stable key path lets a INativeHost route
 // a create/update/destroy to the right control without re-walking the tree. `key`
 // is the parent key-path joined with the node's own key; unkeyed nodes carry the
 // positional path the reconciler synthesizes at the call site.
@@ -3743,7 +3973,7 @@ string joinKeyPath(string parent, string seg)
 // Index of the first element in `pool` whose key equals `key`, or -1. Used to
 // match keyed children by identity instead of position (so middle insert/remove
 // and reorder preserve the right nodes).
-int indexByKey(list<Element>* pool, string key)
+int indexByKey(list<IElement>* pool, string key)
 {
     int i = 0;
     while (i < pool.count())
@@ -3759,7 +3989,7 @@ int indexByKey(list<Element>* pool, string key)
 // Diff `wip` into `committed`, appending patches. Returns the node to keep in the
 // committed tree (usually `committed`; the WIP node on a replace/leaf-update).
 // Frees whichever subtree it discards. Ownership of both args transfers in.
-move Element reconcile(move Element committed, move Element wip, list<Patch>* patches)
+move IElement reconcile(move IElement committed, move IElement wip, list<Patch>* patches)
 {
     // Public entry: the root has no parent path. reconcilePath threads a stable
     // key path down the tree so each patch carries its node's identity.
@@ -3768,7 +3998,7 @@ move Element reconcile(move Element committed, move Element wip, list<Patch>* pa
 
 // The child segment for a node at position `pos`: its own key if keyed, else the
 // synthesized positional segment "#pos" so unkeyed nodes still get a stable path.
-string keySegment(Element node, int pos)
+string keySegment(IElement node, int pos)
 {
     string k = node.keyOf();
     if (k.length() > 0) return k;
@@ -3778,7 +4008,7 @@ string keySegment(Element node, int pos)
 // Reconcile threading the parent key path. Behavior (patch op/kind/count/order and
 // which subtree is freed) is IDENTICAL to the earlier reconcile; the only addition
 // is populating each patch's `key` with the affected node's joined key path.
-move Element reconcilePath(move Element committed, move Element wip, list<Patch>* patches, string parentPath)
+move IElement reconcilePath(move IElement committed, move IElement wip, list<Patch>* patches, string parentPath)
 {
     // The committed node's own segment (keyed identity; "" at the unkeyed root).
     string selfPath = joinKeyPath(parentPath, keySegment(committed, 0));
@@ -3792,7 +4022,7 @@ move Element reconcilePath(move Element committed, move Element wip, list<Patch>
     }
 
     // Same type. Leaves: structured props compare (same kind guaranteed above).
-    list<Element>* kids = committed.childList();
+    list<IElement>* kids = committed.childList();
     if (kids == nullptr)
     {
         if (!committed.propsEqual(wip))
@@ -3808,7 +4038,7 @@ move Element reconcilePath(move Element committed, move Element wip, list<Patch>
     }
 
     // Same type, container: reconcile children by key (or position when unkeyed).
-    list<Element>* newKids = wip.childList();
+    list<IElement>* newKids = wip.childList();
     int newN = newKids.count();
 
     // Controlled CONTAINER props: reconcile keeps the committed container node and
@@ -3818,14 +4048,14 @@ move Element reconcilePath(move Element committed, move Element wip, list<Patch>
     adoptContainerProps(committed, wip);
 
     // Drain committed's children into a staging list so we can rebuild in order.
-    list<Element> staged = default;
+    list<IElement> staged = default;
     while (kids.count() > 0)
         staged.add(kids.take(0));
 
     int i = 0;
     while (i < newN)
     {
-        Element newC = newKids.take(0);
+        IElement newC = newKids.take(0);
 
         // Match a committed child to reuse: by key if this child is keyed (so it
         // can move position), else positionally from the front of the staged list.
@@ -3836,7 +4066,7 @@ move Element reconcilePath(move Element committed, move Element wip, list<Patch>
 
         if (idx >= 0)
         {
-            Element oldC = staged.take(idx);
+            IElement oldC = staged.take(idx);
             kids.add(reconcilePath(oldC, newC, patches, selfPath));
         }
         else
@@ -3851,7 +4081,7 @@ move Element reconcilePath(move Element committed, move Element wip, list<Patch>
     // Any committed children left over were removed.
     while (staged.count() > 0)
     {
-        Element rem = staged.take(0);
+        IElement rem = staged.take(0);
         string remPath = joinKeyPath(selfPath, keySegment(rem, 0));
         patches.add(makePatchKeyed(PATCH_REMOVE, rem.kind(), "remove", remPath));
         deleteTree(rem);
@@ -3865,13 +4095,13 @@ move Element reconcilePath(move Element committed, move Element wip, list<Patch>
 
 // -- Components (model layer) --------------------------------------------------
 //
-// A component renders itself to a host Element tree. render() receives the
+// A component renders itself to a host IElement tree. render() receives the
 // host-owned UiContext so its event closures can call ctx.invalidate() (mark the
 // UI dirty) and the host can drain it once per loop. Threading the context in
 // keeps the framework free of process-global mutable state.
-interface Component
+interface IComponent
 {
-    Element render(UiContext* ctx);
+    IElement render(UiContext* ctx);
 };
 
 // -- ComponentElement: a reconciler node wrapping a component's rendered subtree -
@@ -3882,9 +4112,9 @@ interface Component
 // descends into the single inner child, so each child's subtree - and the state
 // behind it - keeps its identity across add/remove/reorder. The wrapper has no
 // style of its own; layout/paint/dispatch delegate to the inner subtree.
-class ComponentElement : Element
+class ComponentElement : IElement
 {
-    list<Element> inner = default;   // exactly one child: the component's render()
+    list<IElement> inner = default;   // exactly one child: the component's render()
     Rect bounds = default;
     string key = default;
 
@@ -3892,7 +4122,7 @@ class ComponentElement : Element
     {
         Size total = default;
         int cy = c.y;
-        for (Element child in this.inner)
+        for (IElement child in this.inner)
         {
             LayoutConstraints cc = default;
             cc.x = c.x; cc.y = cy;
@@ -3909,15 +4139,15 @@ class ComponentElement : Element
         return total;
     }
 
-    void paint(Canvas cv, UiContext* ctx)
+    void paint(ICanvas cv, UiContext* ctx)
     {
-        for (Element c in this.inner)
+        for (IElement c in this.inner)
             c.paint(cv, ctx);
     }
 
     bool dispatch(Event e, UiContext* ctx)
     {
-        for (Element c in this.inner)
+        for (IElement c in this.inner)
         {
             if (c.dispatch(e, ctx))
                 return true;
@@ -3928,14 +4158,14 @@ class ComponentElement : Element
     move string toJson()
     {
         string out = "{\"type\":\"Component\",\"child\":";
-        for (Element c in this.inner)
+        for (IElement c in this.inner)
             out = out + c.toJson();
         return out + "}";
     }
 
     void destroyTree()
     {
-        for (Element c in this.inner)
+        for (IElement c in this.inner)
         {
             c.destroyTree();
             delete c;
@@ -3947,10 +4177,10 @@ class ComponentElement : Element
     int flexWeight() { return 0; }
     void collectFocusables(list<string>* keys)
     {
-        for (Element c in this.inner) c.collectFocusables(keys);
+        for (IElement c in this.inner) c.collectFocusables(keys);
     }
-    bool propsEqual(Element other) { return true; }
-    list<Element>* childList() { return &this.inner; }
+    bool propsEqual(IElement other) { return true; }
+    list<IElement>* childList() { return &this.inner; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
     Rect nodeBounds() { return this.bounds; }
@@ -3960,7 +4190,7 @@ class ComponentElement : Element
 // component itself is owned by the caller (typically a parent component holding
 // its children by pointer); mount only renders it, it does not take ownership.
 // The UiContext threads through so the child's event closures can invalidate.
-ComponentElement* mount(Component c, string key, UiContext* ctx)
+ComponentElement* mount(IComponent c, string key, UiContext* ctx)
 {
     ComponentElement* ce = new ComponentElement();
     ce.setKey(key);
@@ -3969,7 +4199,7 @@ ComponentElement* mount(Component c, string key, UiContext* ctx)
 }
 
 // ============================================================================
-// NativeHost seam (merged from the former example/ui/ui_native.cb).
+// INativeHost seam (merged from the former example/ui/ui_native.cb).
 // The framework above and this seam were separate files whose combined name
 // collided with the chosen module name; they ship as one core module now.
 // ============================================================================
@@ -4037,7 +4267,7 @@ int LISTOP_TREE_REBUILD    = 21;  // clear + insert the root's children (expand-
 // The native backend contract. One instance per app drives all its windows'
 // controls. A method that takes a handle `h` operates on a control previously
 // returned by createControl.
-interface NativeHost
+interface INativeHost
 {
     // Create a control of the given ELEM_* kind under `parentHandle` (0 = the
     // window's client area). `key` is the node's stable key path, for the host's

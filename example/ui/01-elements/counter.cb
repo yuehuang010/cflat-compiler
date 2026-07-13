@@ -7,11 +7,11 @@
 
 import "ui_native.cb";
 
-class Counter : Component
+class Counter : IComponent
 {
     int count = 0;
 
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         View* root = view(makeStyle(16, 0, 0));
         root.add(text("Count: " + this.count.toString()));
@@ -29,7 +29,7 @@ extern int main()
     // First render: Count: 0. toJson() returns a `move string`; using its result
     // inline (.data() straight into printf) is leak-clean - the owned virtual-call
     // temp is freed at end-of-expression like a free-function result.
-    Element tree = c.render(&ctx);
+    IElement tree = c.render(&ctx);
     printf("render 1: %s\n", tree.toJson().data());
 
     // Reach the Button (children[1]) and fire its onClick twice.
@@ -53,7 +53,7 @@ extern int main()
     printf("count after 2 clicks: %d\n", c.count);
 
     // Re-render reflects the mutated state: Count: 2.
-    Element tree2 = c.render(&ctx);
+    IElement tree2 = c.render(&ctx);
     printf("render 2: %s\n", tree2.toJson().data());
 
     // Tear down both trees (the recursive destroyTree + delete-through-interface

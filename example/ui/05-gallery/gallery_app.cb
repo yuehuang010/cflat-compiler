@@ -1,8 +1,8 @@
-// gallery_app.cb - the host-neutral widget-gallery Component + headless self-test.
+// gallery_app.cb - the host-neutral widget-gallery IComponent + headless self-test.
 //
 // P12 split this out of gallery.cb so BOTH the Win32/Cocoa launcher (gallery.cb, via the
 // native_host.cb shim) and the WinUI 3 launcher (winui/winui_gallery.cb, via winui_host.cb)
-// can compile the SAME GalleryApp + gallerySelfTest against their own NativeHost backend.
+// can compile the SAME GalleryApp + gallerySelfTest against their own INativeHost backend.
 // This file imports ONLY ui.cb (the element model + sugar); every host free function it
 // calls (startHeadlessWindow, the native* drivers, activeApp/activeCtx, hostWidth/hostHeight/
 // hostDark, setMenuHandler, nativeSetContextMenu/nativeFireContextMenu, nativeTeardownForTest)
@@ -42,7 +42,7 @@ u64 makeGradientPixels(int w, int h)
     return p;
 }
 
-class GalleryApp : Component
+class GalleryApp : IComponent
 {
     int pick          = 1;    // RadioGroup selection (0 Small / 1 Medium / 2 Large)
     int fontIdx       = 0;    // ComboBox selection
@@ -97,7 +97,7 @@ class GalleryApp : Component
     // Build one churn-pool element for `slot` (a fixed kind per slot). Its LOCAL key is
     // "s<slot>", so under the stress box its path is "root/stressbox/s<slot>". Kinds span
     // leaf, container, and data-control families to exercise reconcile across the set.
-    Element _stressChild(int slot)
+    IElement _stressChild(int slot)
     {
         string k = "s" + slot.toString();
         if (slot == 0) { Button* b = button("b", () => {}); b.setKey(k); return b; }
@@ -136,7 +136,7 @@ class GalleryApp : Component
         return card;
     }
 
-    Element render(UiContext* ctx)
+    IElement render(UiContext* ctx)
     {
         ctx.theme = this.dark ? darkTheme() : lightTheme();
 
@@ -185,13 +185,13 @@ class GalleryApp : Component
         cardImg.add(img);
         content.add(cardImg);
 
-        // -- Canvas --------------------------------------------------------------------
-        // A CanvasView escape hatch: the app draws with the same Canvas API the framework
+        // -- ICanvas --------------------------------------------------------------------
+        // A CanvasView escape hatch: the app draws with the same ICanvas API the framework
         // paints through (here, a tiny bar chart + a label) into a native child surface.
-        View* cardCanvas = this._card(ctx, "cardcanvas", "Canvas",
-                "Escape hatch: draw directly with the Canvas API into a native child surface.");
+        View* cardCanvas = this._card(ctx, "cardcanvas", "ICanvas",
+                "Escape hatch: draw directly with the ICanvas API into a native child surface.");
         CanvasView* canvas = <CanvasView key="canvas" width={24} height={6}/>;
-        canvas.onPaint = (Canvas c) => {
+        canvas.onPaint = (ICanvas c) => {
             int barCount = 5;
             int i = 0;
             while (i < barCount)

@@ -1,0 +1,23 @@
+// An interface FIELD is a contract: every implementor must declare a field of the
+// same name (the vtable carries that implementor's byte offset for it). A class
+// that names the interface but omits the field is rejected EAGERLY, at the class
+// definition, not at some later boxing site.
+import "string.cb";
+
+interface ITitled
+{
+    int kind();
+    string title;
+};
+
+expect_error("does not implement interface field 'ITitled::title'") {
+    class Untitled : ITitled
+    {
+        int kind() { return 1; }
+    };
+}
+
+extern int main()
+{
+    return 0;
+}
