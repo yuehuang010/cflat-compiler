@@ -28,6 +28,10 @@ import "cocoa.cb";
 const int BASE_X = 8;
 const int BASE_Y = 26;
 
+// Points reserved for an NSScrollView's vertical scroller when sizing the document
+// view narrower than the viewport (autohiding, so unused when content fits).
+const double SCROLLER_ALLOW = 16.0;
+
 // NSEventModifierFlag masks (accelerators). Ctrl maps to Cmd per mac convention.
 const int MOD_CMD   = 0x100000;   // 1<<20  NSEventModifierFlagCommand
 const int MOD_SHIFT = 0x20000;    // 1<<17  NSEventModifierFlagShift
@@ -87,7 +91,8 @@ bool nativeMappable(int kind)
         || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_STATUSBAR
         || kind == ELEM_RADIO || kind == ELEM_COMBO || kind == ELEM_LIST
         || kind == ELEM_TABS || kind == ELEM_TREE
-        || kind == ELEM_IMAGE || kind == ELEM_GROUPBOX || kind == ELEM_CANVAS;
+        || kind == ELEM_IMAGE || kind == ELEM_GROUPBOX || kind == ELEM_CANVAS
+        || kind == ELEM_SCROLL;
 }
 
 // The concrete tooltip text a mappable node carries ("" = none), read via downcast
@@ -353,13 +358,31 @@ class CocoaHost : NativeHost
             // setListOp-style bookkeeping and reached through the view's key path.
             ctrl = msgRect(msg0(cls("CfCanvasView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
         }
+        else if (elemKind == ELEM_SCROLL)
+        {
+            // NSScrollView with a FLIPPED document view (CfFlippedView) so descendant
+            // frame math is y-down like the rest of the host and content pins to the
+            // top. The scroll view is the live handle; children parent to documentView.
+            void* scroll = msgRect(msg0(cls("NSScrollView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgBool(scroll, "setHasVerticalScroller:", true);
+            msgBool(scroll, "setAutohidesScrollers:", true);
+            msgInt(scroll, "setBorderType:", 0);          // NSNoBorder
+            msgBool(scroll, "setDrawsBackground:", false);
+            void* docv = msgRect(msg0(cls("CfFlippedView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msg1(scroll, "setDocumentView:", docv);
+            ctrl = scroll;
+        }
         else
         {
             ctrl = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
         }
 
-        if (this.contentView != nullptr && ctrl != nullptr)
-            msg1(this.contentView, "addSubview:", ctrl);
+        // Parent to the caller's view (a ScrollView's document view when the node is
+        // inside one), falling back to the window's content view.
+        void* parent = u2h(parentHandle);
+        if (parent == nullptr) parent = this.contentView;
+        if (parent != nullptr && ctrl != nullptr)
+            msg1(parent, "addSubview:", ctrl);
         return (u64)ctrl;
     }
 
@@ -892,7 +915,7 @@ class CocoaHost : NativeHost
     void requestLayout()
     {
         if (!this.ready) return;
-        layoutRoot(this.tree, 0, 0, this.w);
+        layoutRootBounded(this.tree, 0, 0, this.w, this.h);
         this.applyTree(this.tree, &this.ctx);
     }
 
@@ -909,7 +932,8 @@ class CocoaHost : NativeHost
         list<int> fw = default; list<int> fh = default;
 
         this._applyNode(tree, keySegment(tree, 0), ctx,
-                        &newKeys, &newHandles, &fx, &fy, &fw, &fh);
+                        &newKeys, &newHandles, &fx, &fy, &fw, &fh,
+                        (u64)this.contentView, 0, 0);
 
         // Destroy controls whose key path is no longer in the tree.
         int i = 0;
@@ -956,17 +980,28 @@ class CocoaHost : NativeHost
 
     // Recursive worker: `path` is this node's key path. Mappable nodes get a control
     // + synced props + a collected DIP frame; every node recurses into its children
-    // (containers contribute only geometry).
+    // (containers contribute only geometry). `parentView` is the NSView new controls
+    // parent to (a ScrollView's document view inside one); (offX, offY) is the DIP
+    // origin subtracted to make frames parent-relative inside a scroll container.
     void _applyNode(Element node, string path, UiContext* ctx,
                     list<string>* keys, list<u64>* handles,
-                    list<int>* fx, list<int>* fy, list<int>* fw, list<int>* fh)
+                    list<int>* fx, list<int>* fy, list<int>* fw, list<int>* fh,
+                    u64 parentView, int offX, int offY)
     {
         if (nativeMappable(node.kind()))
         {
             u64 h = ctx.nativeHandle(path);
+            // Reparent edge: a control whose key path moved across a scroll boundary
+            // now has the wrong superview - drop it so it is recreated under parentView.
+            if (h != 0u && parentView != 0u && msg0(u2h(h), "superview") != u2h(parentView))
+            {
+                this.destroyControl(h);
+                ctx.removeNativeHandle(path);
+                h = 0u;
+            }
             if (h == 0u)
             {
-                h = this.createControl(node.kind(), (u64)this.contentView, path);
+                h = this.createControl(node.kind(), parentView, path);
                 ctx.setNativeHandle(path, h);
                 // One-time seed of a TextArea's buffer (uncontrolled after; the
                 // native view owns the text, further pushes are explicit).
@@ -1014,7 +1049,8 @@ class CocoaHost : NativeHost
             Rect b = node.nodeBounds();
             keys.add("" + path);
             handles.add(h);
-            fx.add(b.x); fy.add(b.y); fw.add(b.w); fh.add(b.h);
+            // Parent-relative frame: absolute DIP minus the enclosing scroll origin.
+            fx.add(b.x - offX); fy.add(b.y - offY); fw.add(b.w); fh.add(b.h);
         }
 
         // A TabControl walks ONLY its active pane into native controls (lazy inactive
@@ -1028,8 +1064,42 @@ class CocoaHost : NativeHost
             {
                 Element pane = panes.get(sel);
                 string cp = joinKeyPath(path, keySegment(pane, sel));
-                this._applyNode(pane, cp, ctx, keys, handles, fx, fy, fw, fh);
+                this._applyNode(pane, cp, ctx, keys, handles, fx, fy, fw, fh,
+                                parentView, offX, offY);
             }
+            return;
+        }
+
+        // A ScrollView's children parent to its FLIPPED document view and are offset
+        // by the scroll node's own origin (document-relative). After the walk the
+        // document view is sized to hold the framework-computed content height.
+        if (node.kind() == ELEM_SCROLL)
+        {
+            void* scroll = u2h(ctx.nativeHandle(path));
+            void* docv = msg0(scroll, "documentView");
+            Rect sb = node.nodeBounds();
+            list<Element>* skids = node.childList();
+            if (skids != nullptr)
+            {
+                int i = 0;
+                while (i < skids.count())
+                {
+                    Element c = skids.get(i);
+                    string cp = joinKeyPath(path, keySegment(c, i));
+                    this._applyNode(c, cp, ctx, keys, handles, fx, fy, fw, fh,
+                                    (u64)docv, sb.x, sb.y);
+                    i++;
+                }
+            }
+            ScrollView* svn = node as ScrollView;
+            int chDip = 0;
+            if (svn != nullptr) chDip = svn.contentH;
+            double docW = (double)(sb.w * BASE_X) - SCROLLER_ALLOW;
+            if (docW < 1.0) docW = 1.0;
+            double docH = (double)(chDip * BASE_Y);
+            double vpH = (double)(sb.h * BASE_Y);
+            if (docH < vpH) docH = vpH;   // never shorter than the viewport
+            msgRect(docv, "setFrame:", 0.0, 0.0, docW, docH);
             return;
         }
 
@@ -1041,7 +1111,8 @@ class CocoaHost : NativeHost
             {
                 Element c = kids.get(i);
                 string cp = joinKeyPath(path, keySegment(c, i));
-                this._applyNode(c, cp, ctx, keys, handles, fx, fy, fw, fh);
+                this._applyNode(c, cp, ctx, keys, handles, fx, fy, fw, fh,
+                                parentView, offX, offY);
                 i++;
             }
         }
@@ -1651,7 +1722,7 @@ void pumpNative()
         Element wip = wnd.app.render(&wnd.ctx);
         list<Patch> patches = default;
         wnd.tree = reconcile(wnd.tree, wip, &patches);
-        layoutRoot(wnd.tree, 0, 0, wnd.w);
+        layoutRootBounded(wnd.tree, 0, 0, wnd.w, wnd.h);
         wnd.applyTree(wnd.tree, &wnd.ctx);
     }
 }
@@ -2769,7 +2840,7 @@ void buildNativeTree()
     if (!hasCurWin()) return;
     if (curWin().ready) { Element t = curWin().tree; deleteTree(t); curWin().ready = false; }
     curWin().tree = curWin().app.render(&curWin().ctx);
-    layoutRoot(curWin().tree, 0, 0, curWin().w);
+    layoutRootBounded(curWin().tree, 0, 0, curWin().w, curWin().h);
     curWin().applyTree(curWin().tree, &curWin().ctx);
     curWin().ready = true;
 }

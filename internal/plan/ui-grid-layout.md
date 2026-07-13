@@ -1,14 +1,35 @@
 # UI framework: flex weights (grid-style layout support)
 
-Status: PHASE 1 IMPLEMENTED (2026-07-12), uncommitted. Phase 2 (flexWrap) not started.
+Status: PHASE 1 and PHASE 2 (flexWrap) IMPLEMENTED (2026-07-12). Phase 1
+committed (d08998a); Phase 2 + native ScrollView + gallery remake uncommitted.
 
-- Landed: Style.flex + flexStyle() helper, Element.flexWeight() seam, View.layout
-  distribution phase (row + bounded-height column), doc/UI.md "Flex weights"
-  section, 6 new tui_demo.cb self-tests (14/14), gallery reworked onto the
-  label+flex-1 form idiom plus a new "Flex layout" card (selftest 27 -> 30).
+- Follow-on landed same day (uncommitted): native ScrollView on the Cocoa host
+  (ELEM_SCROLL -> real NSScrollView with a flipped document view; wheel and
+  scrollbars native; framework scrollY stays 0; one nesting level) plus
+  layoutRootBounded so native roots lay out with bounded height (column flex
+  works at root; ScrollView height 0 fills the window). Win32/WinUI parity gap
+  recorded in internal/issue/ui-native-scrollview-win32-winui.md.
+- Gallery remade as a scrollable reference: root ScrollView -> column of 19
+  cards, each with title + one-line description + live demo, themed card
+  background, flex form idiom inside cards; selftest 30 -> 33 (viewport-fill,
+  overflow-below-viewport, and all-card-titles asserts).
+
+- Phase 1 landed: Style.flex + flexStyle() helper, Element.flexWeight() seam,
+  View.layout distribution phase (row + bounded-height column), doc/UI.md
+  "Flex weights" section, 6 new tui_demo.cb self-tests (14/14), gallery
+  reworked onto the label+flex-1 form idiom plus a new "Flex layout" card
+  (selftest 27 -> 30).
+- Phase 2 landed: Style.flexWrap + WRAP_NONE/WRAP_WRAP consts, View.layout
+  gains a DIR_ROW wrap branch (measure -> greedy line-break -> per-line flex
+  distribution + placement, mirroring the non-wrap flex algorithm one line at
+  a time); DIR_COLUMN ignores flexWrap (documented no-op, out of scope). 4 new
+  tui_demo.cb self-tests (fixed-cell wrapping, mixed line height, oversized
+  child own-line, per-line flex leftover) - suite now 18/18. doc/UI.md gained
+  a "flexWrap (card grids)" paragraph.
 - All .cb, zero compiler changes. Edited core deployed to x64/Release/core/.
 - Verified on the arm64 mac box: test.sh Release 160/0, example_mac.sh 34/0,
-  live gallery window launched and closed cleanly (exit 0).
+  tui_demo.cb self-test 18/18, counter_jsx.cb PASS, gallery.cb --selftest
+  30/30.
 - Owed before commit: test.bat + example.bat on the Windows box (host-neutral
   .cb change; Win32/WinUI runtime coverage).
 

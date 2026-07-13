@@ -102,7 +102,7 @@ Notes:
 | `Image` | `ELEM_IMAGE` | bitmap leaf (BGRA32 via `setImageData`) | `u64 pixels` (borrowed top-down BGRA32), `int pxW/pxH`, `int width/height`, `string source` (.bmp), `string altText` |
 | `GroupBox` | `ELEM_GROUPBOX` | titled group frame (container) | `string title`, `Style style`, `children` |
 | `CanvasView` | `ELEM_CANVAS` | app-painted escape hatch | `Lambda<void(Canvas)> onPaint`, `int width/height` |
-| `ScrollView` | `ELEM_SCROLL` | clipped scrollable viewport | `Style style` (viewport), `children`, `int scrollY` |
+| `ScrollView` | `ELEM_SCROLL` | scrollable viewport (native `NSScrollView` on Cocoa; clipped canvas viewport on TUI; plain layout container on Win32/WinUI) | `Style style` (viewport), `children`, `int scrollY` |
 | `ComponentElement` | `ELEM_COMPONENT` | wraps a mounted component subtree | single inner child |
 
 **`tooltip` prop (v12):** every mappable element (`Text`/`Button`/`Box`/`TextInput`/
@@ -280,7 +280,14 @@ makes it ignore input and drop out of the Tab focus ring.
   and paints them clipped to its viewport via `pushClip`/`popClip`. A focused
   ScrollView scrolls on Up/Down. Scrolling changes layout but not the tree, so it
   calls `ctx.requestRepaint()` (the host repaints without a re-render - reconcile
-  would otherwise produce no patches).
+  would otherwise produce no patches). On the **Cocoa** host it maps to a real
+  `NSScrollView` (wheel/trackpad/scrollbars): the host keeps `scrollY` at 0, lays
+  children out at content coordinates from the viewport top, parents them to the
+  scroll view's flipped document view (document-relative frames), and sizes that
+  document view to the framework-computed `contentH`. A `style.height` of 0 fills
+  the bounded root viewport. Only one level of nesting is mapped natively (a
+  ScrollView inside a ScrollView is out of scope). On **Win32/WinUI** the node is
+  a plain layout container today - no clipping, no native scrolling.
 - **Tab navigation:** `void collectFocusables(list<string>* keys)` walks the tree
   collecting focusable node keys in order; `moveFocus(tree, ctx, backward)` builds
   that ring fresh each call and advances focus with wraparound. The host calls it
@@ -310,6 +317,7 @@ struct Style
     int backgroundColor = 0;     // fill; COLOR_DEFAULT (0) = no fill
     int gap = 0;                 // cells of space inserted between stacked children
     int flex = 0;                // main-axis weight in a DIR_ROW/DIR_COLUMN parent; 0 = intrinsic
+    int flexWrap = 0;            // WRAP_NONE (0) | WRAP_WRAP (1); DIR_ROW only
 };
 Style makeStyle(int padding, int width, int height);   // flexDirection column, colors default
 Style flexStyle(int flex);                             // a Style carrying only a flex weight
@@ -375,8 +383,14 @@ this one pass, not bespoke per-node math.
 ```
 struct LayoutConstraints { int x; int y; int availW; int availH; };
 struct Size              { int w; int h; };
-Size layoutRoot(Element root, int x, int y, int w);   // root pass, height unbounded
+Size layoutRoot(Element root, int x, int y, int w);              // root pass, height unbounded
+Size layoutRootBounded(Element root, int x, int y, int w, int h); // root pass, height bounded to h
 ```
+
+`layoutRootBounded` is the native-host root pass: it caps `availH` at the window's
+client height so (a) `DIR_COLUMN` flex distributes at the root and (b) a root
+`ScrollView` fills the viewport. TUI/canvas hosts keep using `layoutRoot`
+(unbounded); the Cocoa host uses `layoutRootBounded`.
 
 `View` reads `style.flexDirection`: `DIR_COLUMN` stacks children top-to-bottom,
 `DIR_ROW` places them left-to-right. New layout strategies are added here, and
@@ -418,6 +432,26 @@ weight is excluded from `flexSum`), mirroring RN's `flexBasis` with `grow: 0`.
 under the unbounded height `layoutRoot` uses by default, a flex child has no
 leftover to grow into and falls back to intrinsic height, matching RN's
 behavior for flex on an unbounded scroll axis.
+
+### flexWrap (card grids)
+
+`style.flexWrap = WRAP_WRAP` on a `DIR_ROW` `View` breaks children onto
+multiple lines instead of overflowing the row - the RN `flexWrap: 'wrap'`
+idiom, and the mechanism behind "gallery of cards" grids. Line-breaking is
+greedy: children are measured left to right (explicit `style.width` wins when
+set, otherwise a probe layout - the same technique used to measure fixed
+children in the non-wrap flex pass, applied to every child including flex
+ones) and a new line starts whenever the next child plus the row's `gap` would
+exceed the inner width (`availW` minus padding) AND the current line already
+holds at least one child - so a child wider than the row still gets its own
+line rather than looping forever. Each line then lays out exactly like a
+non-wrapping flex row: flex children on that line share only that line's
+leftover (same weight/remainder distribution as above), so flex is a
+PER-LINE concept, not a whole-row one. A line's height is its tallest child;
+the container's height is the sum of line heights plus `gap` between lines
+(and between the last line and the two paddings). `flexWrap` is a `DIR_ROW`-
+only feature in this phase; a `DIR_COLUMN` `View` ignores the flag and keeps
+its normal single-line stacking.
 
 ## Input: the `dispatch(Event)` seam and focus
 

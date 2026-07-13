@@ -301,9 +301,9 @@ bool testFlexGapPadding()
     return ok;
 }
 
-// A no-flex tree (flex defaults to 0 on every Style) must lay out and
+// A no-flex tree (flex/flexWrap default to 0 on every Style) must lay out and
 // serialize exactly as before flex weights existed - only the new "flex":0
-// field is added to the JSON shape.
+// and "flexWrap":0 fields are added to the JSON shape.
 bool testFlexNoFlexUnchanged()
 {
     View* rt = view(makeStyle(1, 0, 0));
@@ -313,7 +313,8 @@ bool testFlexNoFlexUnchanged()
     layoutRoot(t, 0, 0, 40);
     string j = t.toJson();
     string want = "{\"type\":\"View\",\"style\":{\"padding\":1,\"width\":0,\"height\":0,"
-        + "\"flexDirection\":0,\"color\":0,\"backgroundColor\":0,\"gap\":0,\"flex\":0},"
+        + "\"flexDirection\":0,\"color\":0,\"backgroundColor\":0,\"gap\":0,\"flex\":0,"
+        + "\"flexWrap\":0},"
         + "\"children\":[{\"type\":\"Text\",\"text\":\"hi\"}]}";
     bool ok = j == want;
 
@@ -351,6 +352,96 @@ bool testFlexColumn()
     deleteTree(tu);
 
     return bounded && unbounded;
+}
+
+// -- Flex layout (Phase 2: flexWrap) -------------------------------------------
+
+// Four 30-wide cells in a 100-wide wrapping row with gap 2: 30+2+30+2+30=94
+// fits three per line, the fourth wraps to line 2 at x=0.
+bool testFlexWrapFixedCells()
+{
+    View* r = row(makeStyle(0, 0, 0));
+    r.style.flexWrap = WRAP_WRAP;
+    r.style.gap = 2;
+    Box* b1 = box(makeStyle(0, 30, 0)); r.add(b1);
+    Box* b2 = box(makeStyle(0, 30, 0)); r.add(b2);
+    Box* b3 = box(makeStyle(0, 30, 0)); r.add(b3);
+    Box* b4 = box(makeStyle(0, 30, 0)); r.add(b4);
+    Element t = r;
+
+    Size sz = layoutRoot(t, 0, 0, 100);
+    Rect r1 = b1.nodeBounds(); Rect r2 = b2.nodeBounds();
+    Rect r3 = b3.nodeBounds(); Rect r4 = b4.nodeBounds();
+    bool ok = r1.x == 0 && r1.y == 0 && r2.x == 32 && r2.y == 0
+        && r3.x == 64 && r3.y == 0 && r4.x == 0 && r4.y == 3
+        && sz.h == 4;
+
+    deleteTree(t);
+    return ok;
+}
+
+// Mixed child heights on one line: line height is the max child height, and
+// the next line's y offset is that max plus the gap.
+bool testFlexWrapLineHeight()
+{
+    View* r = row(makeStyle(0, 0, 0));
+    r.style.flexWrap = WRAP_WRAP;
+    r.style.gap = 2;
+    Box* b1 = box(makeStyle(0, 20, 1)); r.add(b1);
+    Box* b2 = box(makeStyle(0, 20, 5)); r.add(b2);
+    Box* b3 = box(makeStyle(0, 20, 1)); r.add(b3);
+    Element t = r;
+
+    layoutRoot(t, 0, 0, 50);
+    Rect r1 = b1.nodeBounds(); Rect r2 = b2.nodeBounds(); Rect r3 = b3.nodeBounds();
+    bool ok = r1.y == 0 && r2.y == 0 && r3.x == 0 && r3.y == 7;
+
+    deleteTree(t);
+    return ok;
+}
+
+// A child wider than the row (60 in a 50-wide row) gets its own line rather
+// than looping forever; the neighbors before/after still get their own lines.
+bool testFlexWrapOversizedChild()
+{
+    View* r = row(makeStyle(0, 0, 0));
+    r.style.flexWrap = WRAP_WRAP;
+    r.style.gap = 2;
+    Box* b1 = box(makeStyle(0, 20, 0)); r.add(b1);
+    Box* b2 = box(makeStyle(0, 60, 0)); r.add(b2);
+    Box* b3 = box(makeStyle(0, 20, 0)); r.add(b3);
+    Element t = r;
+
+    Size sz = layoutRoot(t, 0, 0, 50);
+    Rect r1 = b1.nodeBounds(); Rect r2 = b2.nodeBounds(); Rect r3 = b3.nodeBounds();
+    bool ok = r1.x == 0 && r1.y == 0
+        && r2.x == 0 && r2.y == 3 && r2.w == 60
+        && r3.x == 0 && r3.y == 6
+        && sz.h == 7;
+
+    deleteTree(t);
+    return ok;
+}
+
+// A flex-1 child that wraps onto its own line (line 2) gets the full leftover
+// of that line, not the whole row - flex distribution is per-line.
+bool testFlexWrapLineFlex()
+{
+    View* r = row(makeStyle(0, 0, 0));
+    r.style.flexWrap = WRAP_WRAP;
+    r.style.gap = 2;
+    Box* b1 = box(makeStyle(0, 30, 0)); r.add(b1);
+    Box* b2 = box(makeStyle(0, 30, 0)); r.add(b2);
+    Box* b3 = box(makeStyle(0, 30, 0)); r.add(b3);
+    View* f = view(flexStyle(1)); r.add(f);
+    Element t = r;
+
+    layoutRoot(t, 0, 0, 100);
+    Rect rf = f.nodeBounds();
+    bool ok = rf.x == 0 && rf.y == 3 && rf.w == 100;
+
+    deleteTree(t);
+    return ok;
 }
 
 // Re-render the controlled EditApp and reconcile into the live tree, so a value
@@ -470,10 +561,14 @@ int selfTest()
     total++; if (testFlexGapPadding())     pass++; else printf("  FAIL: flex gap + padding\n");
     total++; if (testFlexNoFlexUnchanged())pass++; else printf("  FAIL: no-flex tree unchanged\n");
     total++; if (testFlexColumn())         pass++; else printf("  FAIL: column flex bounded/unbounded\n");
+    total++; if (testFlexWrapFixedCells())     pass++; else printf("  FAIL: flexWrap fixed cells\n");
+    total++; if (testFlexWrapLineHeight())     pass++; else printf("  FAIL: flexWrap line height\n");
+    total++; if (testFlexWrapOversizedChild()) pass++; else printf("  FAIL: flexWrap oversized child\n");
+    total++; if (testFlexWrapLineFlex())       pass++; else printf("  FAIL: flexWrap per-line flex\n");
 
     if (pass == total)
     {
-        printf("PASS: ui self-tests %d/%d (reconcile, repaint, reorder, components, focus, layout, textinput, tabnav, scroll, flex)\n", pass, total);
+        printf("PASS: ui self-tests %d/%d (reconcile, repaint, reorder, components, focus, layout, textinput, tabnav, scroll, flex, flexWrap)\n", pass, total);
         return 0;
     }
     printf("FAIL: ui self-tests %d/%d\n", pass, total);

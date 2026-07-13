@@ -24,6 +24,10 @@ import "dictionary.cb";
 int DIR_COLUMN = 0;   // stack children top-to-bottom (default)
 int DIR_ROW    = 1;   // place children left-to-right
 
+// Flex wrap mode (DIR_ROW only; see doc/UI.md "Flex weights" / flexWrap).
+int WRAP_NONE = 0;   // single line, the default (unchanged behavior)
+int WRAP_WRAP = 1;   // children that would overflow availW start a new line
+
 // Shared layout/style props. Plain value struct carried by host elements. Field
 // names track React Native (flexDirection); a typed struct, not an open bag.
 // COLOR_DEFAULT (0) means "no explicit color": the Canvas falls back to its
@@ -84,6 +88,7 @@ struct Style
     int backgroundColor = 0;        // fill; 0 = no fill
     int gap = 0;                    // cells of space between stacked children
     int flex = 0;                   // main-axis weight; 0 = intrinsic size (unset)
+    int flexWrap = 0;               // WRAP_NONE | WRAP_WRAP (DIR_ROW only)
 };
 
 Style makeStyle(int padding, int width, int height)
@@ -107,7 +112,8 @@ Style flexStyle(int flex)
 bool styleIsEmpty(Style s)
 {
     return s.padding == 0 && s.width == 0 && s.height == 0 && s.flexDirection == 0
-        && s.color == 0 && s.backgroundColor == 0 && s.gap == 0 && s.flex == 0;
+        && s.color == 0 && s.backgroundColor == 0 && s.gap == 0 && s.flex == 0
+        && s.flexWrap == 0;
 }
 
 bool styleEquals(Style a, Style b)
@@ -115,7 +121,7 @@ bool styleEquals(Style a, Style b)
     return a.padding == b.padding && a.width == b.width
         && a.height == b.height && a.flexDirection == b.flexDirection
         && a.color == b.color && a.backgroundColor == b.backgroundColor
-        && a.gap == b.gap && a.flex == b.flex;
+        && a.gap == b.gap && a.flex == b.flex && a.flexWrap == b.flexWrap;
 }
 
 string styleToJson(Style s)
@@ -127,7 +133,8 @@ string styleToJson(Style s)
          + ",\"color\":" + s.color.toString()
          + ",\"backgroundColor\":" + s.backgroundColor.toString()
          + ",\"gap\":" + s.gap.toString()
-         + ",\"flex\":" + s.flex.toString() + "}";
+         + ",\"flex\":" + s.flex.toString()
+         + ",\"flexWrap\":" + s.flexWrap.toString() + "}";
 }
 
 // -- Rect: an absolute cell rectangle assigned during layout ------------------
@@ -775,6 +782,16 @@ Size layoutRoot(Element root, int x, int y, int w)
     return root.layout(c);
 }
 
+// Like layoutRoot but with a BOUNDED height (h). A native host uses this so that
+// (a) DIR_COLUMN flex distributes at the root, and (b) a root ScrollView can fill
+// the window viewport. TUI/canvas hosts keep using layoutRoot (unbounded).
+Size layoutRootBounded(Element root, int x, int y, int w, int h)
+{
+    LayoutConstraints c = default;
+    c.x = x; c.y = y; c.availW = w; c.availH = h;
+    return root.layout(c);
+}
+
 // -- View: a flex container with a style and children -------------------------
 class View : Element
 {
@@ -814,7 +831,153 @@ class View : Element
         int pad = this.style.padding;
         Size sz = default;
         int gap = this.style.gap;
-        if (this.style.flexDirection == DIR_ROW)
+        if (this.style.flexDirection == DIR_ROW && this.style.flexWrap == WRAP_WRAP)
+        {
+            int innerW = c.availW - 2 * pad;
+
+            // Phase 1: intrinsic width of every child, used only to decide
+            // line breaks. style.width wins when set (explicit fixed size);
+            // otherwise probe layout the same way the non-wrap measure pass
+            // probes fixed children - including flex children, whose
+            // line-breaking basis is measured identically (see plan doc).
+            list<int> widths;
+            int mx = c.x + pad;
+            int mi = 0;
+            for (Element child in this.children)
+            {
+                if (mi > 0) mx = mx + gap;
+                int w = 0;
+                View* v = child as View;
+                if (v != nullptr && v.style.width > 0)
+                {
+                    w = v.style.width;
+                }
+                else
+                {
+                    LayoutConstraints cc = default;
+                    cc.x = mx; cc.y = c.y + pad;
+                    cc.availW = c.availW - 2 * pad; cc.availH = c.availH - 2 * pad;
+                    Size cs = child.layout(cc);
+                    w = cs.w;
+                }
+                widths.add(w);
+                mx = mx + w;
+                mi++;
+            }
+
+            // Phase 2: greedily break children into lines. A line always
+            // takes at least one child, so an over-wide child gets its own
+            // line rather than looping forever.
+            list<int> lineStart;
+            list<int> lineCount;
+            int n = this.children.count();
+            int idx = 0;
+            while (idx < n)
+            {
+                int start = idx;
+                int lineW = widths[idx];
+                idx++;
+                while (idx < n)
+                {
+                    int cand = lineW + gap + widths[idx];
+                    if (cand > innerW) break;
+                    lineW = cand;
+                    idx++;
+                }
+                lineStart.add(start);
+                lineCount.add(idx - start);
+            }
+
+            // Phase 3: lay out each line exactly like a non-wrapping flex
+            // row (weights + left-to-right remainder handout), then stack
+            // lines top to bottom; line height is the max child height.
+            int cy = c.y + pad;
+            int li = 0;
+            int totalLineH = 0;
+            while (li < lineStart.count())
+            {
+                int start = lineStart[li];
+                int count = lineCount[li];
+
+                int lineFlexSum = 0;
+                int fixedSum = 0;
+                int k = 0;
+                while (k < count)
+                {
+                    Element child = this.children.get(start + k);
+                    if (this.isRowFlexChild(child)) lineFlexSum = lineFlexSum + child.flexWeight();
+                    else fixedSum = fixedSum + widths[start + k];
+                    k++;
+                }
+                int gapSum = 0;
+                if (count > 1) gapSum = gap * (count - 1);
+                int leftover = innerW - fixedSum - gapSum;
+                if (leftover < 0) leftover = 0;
+
+                list<int> shares;
+                int allocated = 0;
+                k = 0;
+                while (k < count)
+                {
+                    Element child = this.children.get(start + k);
+                    if (this.isRowFlexChild(child))
+                    {
+                        int share = 0;
+                        if (lineFlexSum > 0) share = leftover * child.flexWeight() / lineFlexSum;
+                        shares.add(share);
+                        allocated = allocated + share;
+                    }
+                    k++;
+                }
+                int remainder = leftover - allocated;
+                int ri = 0;
+                while (remainder > 0 && ri < shares.count())
+                {
+                    shares.set(ri, shares[ri] + 1);
+                    remainder--;
+                    ri++;
+                }
+
+                int cx = c.x + pad;
+                int lineH = 0;
+                int si = 0;
+                k = 0;
+                while (k < count)
+                {
+                    if (k > 0) cx = cx + gap;
+                    Element child = this.children.get(start + k);
+                    LayoutConstraints cc = default;
+                    cc.x = cx; cc.y = cy;
+                    cc.availH = c.availH - 2 * pad;
+                    if (this.isRowFlexChild(child))
+                    {
+                        int share = shares[si];
+                        si++;
+                        cc.availW = share;
+                        Size cs = child.layout(cc);
+                        if (cs.h > lineH) lineH = cs.h;
+                        cx = cx + share;
+                    }
+                    else
+                    {
+                        cc.availW = c.availW - 2 * pad;
+                        Size cs = child.layout(cc);
+                        if (cs.h > lineH) lineH = cs.h;
+                        cx = cx + cs.w;
+                    }
+                    k++;
+                }
+
+                if (li > 0) totalLineH = totalLineH + gap;
+                totalLineH = totalLineH + lineH;
+                cy = cy + lineH + gap;
+                li++;
+            }
+
+            sz.w = c.availW;
+            sz.h = totalLineH + 2 * pad;
+        }
+        else if (this.style.flexDirection == DIR_ROW)
         {
             int rowFlexSum = 0;
             for (Element child in this.children)
@@ -927,6 +1090,8 @@ class View : Element
         }
         else
         {
+            // flexWrap is a DIR_ROW-only feature (phase 2 scope); DIR_COLUMN
+            // ignores it and keeps the single-line stacking behavior below.
             int colFlexSum = 0;
             if (c.availH < LAYOUT_UNBOUNDED)
                 for (Element child in this.children)
@@ -1935,6 +2100,10 @@ StatusBar* statusBar(string text)
 // Canvas clip seam. A focused ScrollView scrolls on Up/Down; scrolling changes
 // layout but not the component tree, so it asks the host to repaint via
 // ctx.requestRepaint() (reconcile would otherwise produce no patches).
+// On a native host (Cocoa) the host maps this to a real NSScrollView and owns the
+// offset: it never changes scrollY (stays 0), so children lay out at content
+// coordinates from the viewport top and contentH sizes the native document view.
+// Nested ScrollViews are out of scope for the native mapping (one level only).
 class ScrollView : Element
 {
     Style style    = default;   // width x height = the viewport
@@ -1964,6 +2133,10 @@ class ScrollView : Element
         int w = c.availW;
         if (this.style.width > 0) w = this.style.width;
         int h = this._viewH();
+        // No explicit height + a bounded height available (native host): fill the
+        // viewport. Under LAYOUT_UNBOUNDED (TUI/canvas) _viewH()'s fallback stands.
+        if (this.style.height == 0 && c.availH < LAYOUT_UNBOUNDED)
+            h = c.availH;
 
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = w; b.h = h;
