@@ -518,7 +518,7 @@ void wireGallery()
     });
 }
 
-// ── Headless state-assert self-test ──────────────────────────────────────────
+// -- Headless state-assert self-test ------------------------------------------
 // Invisible window, real controls, driven through host-neutral native* test drivers
 // exactly as the OS would on user input; control + model state is the oracle (no
 // pixels). P11 removed every toolkit-typed SendMessage so this runs against any host.

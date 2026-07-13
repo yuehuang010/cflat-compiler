@@ -52,7 +52,7 @@ move string baseName(string p)
     return substring(p, last + 1, n - last - 1);
 }
 
-// ── Fake project tree (the file-tree sidebar source) ─────────────────────────
+// -- Fake project tree (the file-tree sidebar source) -------------------------
 // A tiny in-memory file tree so the sidebar + its self-test run with no real disk
 // dependency. Node ids: 1 = "docs" folder (children 10 a.txt, 11 b.txt), 2 hello.txt,
 // 3 readme.md. childCount(nid) == 0 (nid != root) marks a file leaf.
@@ -424,7 +424,7 @@ void wireHandlers()
     });
 }
 
-// ── Headless state-assert self-test ──────────────────────────────────────────
+// -- Headless state-assert self-test ------------------------------------------
 bool _has(string s, const char* sub) { return strstr(s.data(), (char*)sub) != nullptr; }
 
 // Read the editor buffer and test a substring, keeping the owned string in THIS
