@@ -1028,7 +1028,7 @@ class Window : NativeHost
     void requestLayout()
     {
         if (!this.ready) return;
-        layoutRoot(this.tree, 0, 0, this.w);
+        layoutRootBounded(this.tree, 0, 0, this.w, this.h);
         this.applyTree(this.tree, &this.ctx);
     }
 
@@ -1876,7 +1876,7 @@ void pumpNative()
         list<Patch> patches = default;
         Element committed = wnd.tree;
         wnd.tree = reconcile(committed, wip, &patches);
-        layoutRoot(wnd.tree, 0, 0, wnd.w);
+        layoutRootBounded(wnd.tree, 0, 0, wnd.w, wnd.h);
         wnd.applyTree(wnd.tree, &wnd.ctx);
     }
 }
@@ -2650,7 +2650,7 @@ void buildCurrentTree()
     Window* wnd = curWin();
     if (wnd.ready) { Element old = wnd.tree; deleteTree(old); wnd.ready = false; }
     wnd.tree = wnd.app.render(&wnd.ctx);
-    layoutRoot(wnd.tree, 0, 0, wnd.w);
+    layoutRootBounded(wnd.tree, 0, 0, wnd.w, wnd.h);
     wnd.applyTree(wnd.tree, &wnd.ctx);
     wnd.ready = true;
 }
@@ -3116,7 +3116,7 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
             SetWindowPos(hwnd, nullptr, pr.left, pr.top,
                          pr.right - pr.left, pr.bottom - pr.top,
                          (u32)(SWP_NOZORDER | SWP_NOACTIVATE));
-        if (wnd.ready) { layoutRoot(wnd.tree, 0, 0, wnd.w); wnd.applyTree(wnd.tree, &wnd.ctx); }
+        if (wnd.ready) { layoutRootBounded(wnd.tree, 0, 0, wnd.w, wnd.h); wnd.applyTree(wnd.tree, &wnd.ctx); }
         return (i64)0;
     }
 

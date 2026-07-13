@@ -602,7 +602,7 @@ class WinUI3Host : NativeHost
     void requestLayout()
     {
         if (!_wReady) return;
-        layoutRoot(_wTree, 0, 0, _wW);
+        layoutRootBounded(_wTree, 0, 0, _wW, _wH);
         this.applyTree(_wTree, &_wCtx);
     }
 
@@ -901,7 +901,7 @@ void pumpWinui()
         Element wip = _wApp.render(&_wCtx);
         list<Patch> patches = default;
         _wTree = reconcile(_wTree, wip, &patches);
-        layoutRoot(_wTree, 0, 0, _wW);
+        layoutRootBounded(_wTree, 0, 0, _wW, _wH);
         _wHost.applyTree(_wTree, &_wCtx);
     }
 }
@@ -931,7 +931,7 @@ void buildWinuiTree()
 {
     if (_wReady) { deleteTree(_wTree); _wReady = false; }
     _wTree = _wApp.render(&_wCtx);
-    layoutRoot(_wTree, 0, 0, _wW);
+    layoutRootBounded(_wTree, 0, 0, _wW, _wH);
     _wHost.applyTree(_wTree, &_wCtx);
     _wReady = true;
 }

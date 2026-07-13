@@ -1,6 +1,7 @@
-# ScrollView is native-mapped on Cocoa only (Win32/WinUI: plain container)
+# ScrollView native scroll control + clipping is Cocoa-only (Win32/WinUI: plain container)
 
 Created: 2026-07-12 (during the ui_native scroll milestone)
+Updated: 2026-07-13 (narrowed scope - root height/layout fixed on all hosts)
 
 ## Summary
 
@@ -15,6 +16,23 @@ window simply overflows / is clipped by the window with no scrollbar.
 
 The framework-level (TUI/canvas) ScrollView is unchanged and still scrolls via
 `scrollY` + the Canvas clip seam when it holds framework focus.
+
+**2026-07-13 update**: `win32.cb` and `winui.cb` were switched to
+`layoutRootBounded` (matching `cocoa.cb`, all 7 call sites: `requestLayout`,
+`pumpNative`/`pumpWinui`, `buildCurrentTree`/`buildWinuiTree`, WM_DPICHANGED),
+so a root `ScrollView` with `style.height == 0` now correctly sizes to fill the
+window viewport (`bounds.h == hostHeight()`) on Win32 and WinUI, not just
+Cocoa - this was the `gallery.cb` / `winui_gallery.cb` regression from commit
+64965d8. This only fixes the ScrollView's own computed *bounds*; it does NOT
+add native scroll control or clipping to Win32/WinUI (see "Fix direction"
+below, still open). One side effect: because `ELEM_SCROLL` is still absent
+from `nativeMappable()` on Win32/WinUI, a ScrollView root has no native
+handle there, so a test helper like `_exists(key)` that checks
+`ctx.nativeHandle(key) != 0` returns false for it on those two hosts even
+though the element exists in the framework tree and its bounds are correct
+(fixed in `example/ui/05-gallery/gallery_app.cb`'s "root scrollview fills the
+window viewport" assertion by dropping the `_exists("root")` conjunct in favor
+of the bounds comparison alone, which already implies existence).
 
 ## Repro
 

@@ -100,7 +100,8 @@ int win32HardeningSelfTest()
         sizes.add(uiSize(60, 60));     // restore
         t.expectTrue("resize storm keeps layout sane",
             resizeStorm("root", sizes,
-                () => _exists("root/list") && _exists("root/tree") && _exists("root/status")));
+                () => _exists("root/content/cardlist/list") && _exists("root/content/cardtree/tree")
+                    && _exists("root/content/cardstatus/status")));
     });
 
     // Accessibility Name: a text-bearing control's Name is its window text; a textless control
@@ -108,8 +109,8 @@ int win32HardeningSelfTest()
     s.test("accessibility names", (UiTest* t) =>
     {
         t.launch(new GalleryApp(), 60, 60);
-        string btnName = t.accessibleName("root/btn");
-        string progName = t.accessibleName("root/prog");
+        string btnName = t.accessibleName("root/content/cardbtn/btn");
+        string progName = t.accessibleName("root/content/cardprog/prog");
         t.expectTrue("a11y names",
             strcmp(btnName.data(), "Click me") == 0 && strcmp(progName.data(), "download progress") == 0);
     });

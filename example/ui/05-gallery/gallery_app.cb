@@ -766,9 +766,14 @@ int gallerySelfTest()
 
         // 31. The root ScrollView exists and its own bounds fill the whole window viewport
         //     (the framework-computed viewport rect, independent of native scroll clipping).
+        // _exists() checks for a native HANDLE, and ScrollView (ELEM_SCROLL) is only
+        // in nativeMappable() on Cocoa (see internal/issue/ui-native-scrollview-win32-winui.md) -
+        // so it cannot gate this assertion host-neutrally. A missing tree node already
+        // yields an all-zero Rect from nativeNodeBounds, which cannot equal the (non-zero)
+        // host size below, so the bounds comparison alone proves the root exists.
         Rect scrollB = nativeNodeBounds("root");
         t.expectTrue("root scrollview fills the window viewport",
-            _exists("root") && scrollB.w == hostWidth() && scrollB.h == hostHeight());
+            scrollB.w == hostWidth() && scrollB.h == hostHeight());
 
         // 32. Overflow proof: a card far down the column (Reconcile Stress, the last card)
         //     lays out below the viewport's bottom edge, so scrolling is required to reach it -
