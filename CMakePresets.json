@@ -19,7 +19,7 @@
       "cacheVariables": {
         "VCPKG_TARGET_TRIPLET": "x64-windows-static",
         "VCPKG_HOST_TRIPLET": "x64-windows",
-        "VCPKG_INSTALLED_DIR": "${sourceDir}/vcpkg_installed/x64-windows-static"
+        "VCPKG_INSTALLED_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/vcpkg_installed"
       },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
     },

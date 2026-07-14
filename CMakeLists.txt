@@ -4,8 +4,12 @@
 #   cmake --preset win-x64-release   (or win-x64-debug)
 #   cmake --build --preset win-x64-release
 #
-# The Windows preset reuses the existing repo-root vcpkg_installed tree
-# (VCPKG_MANIFEST_INSTALL=OFF) so it does NOT trigger a 26 GB / 50 min rebuild.
+# Every preset consumes a pre-populated vcpkg_installed tree that lives OUTSIDE
+# the source dir (~/.cflat-compiler-deps on Windows and macOS), with
+# VCPKG_MANIFEST_INSTALL=OFF - so configuring never triggers a vcpkg install,
+# and every git worktree shares the one 26 GB tree. Populate it once with
+# vcpkg-build.bat (Windows); cmake_build.sh prints the `vcpkg install` line for
+# macOS. Linux uses apt LLVM, no vcpkg at all.
 #
 # Output layout so test.bat works unchanged:
 #   x64/<Config>/cflat.exe + x64/<Config>/core/** + lld-link/clang-cl/*.dll.

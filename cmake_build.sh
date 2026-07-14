@@ -69,6 +69,11 @@ if [ "$(uname -s)" = "Darwin" ] && [ -f "$cache" ]; then
   fi
 fi
 
+# `cmake --preset` reads CMakePresets.json from the CWD, so anchor to this
+# script's own checkout. Without this, running <worktree>/cmake_build.sh from
+# another directory silently configures THAT directory's tree instead.
+cd "$script_dir"
+
 echo "=== Configuring $preset ==="
 cmake --preset "$preset"
 

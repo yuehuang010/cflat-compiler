@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-REM set PATH=%CD%\vcpkg_installed\x64-windows-static\x64-windows-static\tools\llvm;%PATH%
+REM set PATH=%USERPROFILE%\.cflat-compiler-deps\vcpkg_installed\x64-windows-static\tools\llvm;%PATH%
 
 REM ===========================================================================
 REM Worker mode: compile and run a single .c test, write result file

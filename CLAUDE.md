@@ -72,7 +72,7 @@ The Windows build uses **CMake + vcpkg (Ninja + MSVC)** - this is the default pa
 
 > The CMake build writes the Windows `cflat.exe` to the `x64/<Config>/` layout, so `test.bat` / `test_lsp.bat` work unchanged after a CMake build.
 
-**Windows (Ninja + MSVC).** Use the helper - it runs `vcvars64`, sets `VCPKG_ROOT`, and reuses the existing 26 GB `vcpkg_installed` (no rebuild):
+**Windows (Ninja + MSVC).** Use the helper - it runs `vcvars64`, sets `VCPKG_ROOT`, and resolves the shared dependency tree that lives **outside the source dir** at `%USERPROFILE%\.cflat-compiler-deps\vcpkg_installed` (override with `CFLAT_VCPKG_INSTALLED`; no rebuild). On a fresh clone, populate it once with `vcpkg-build.bat`:
 
 ```bash
 ./cmake_build.bat release    # builds win-x64-release -> x64/Release/cflat.exe
@@ -116,27 +116,24 @@ Darwin runtime specifics live in `core/os.posix.cb` behind `if const (__MACOS__)
 
 ### Git worktrees
 
-`vcpkg_installed` is 12 GB (macOS) / ~26 GB (Windows) and rarely changes, so worktrees share one copy instead of each building their own.
-
-**macOS - nothing to do.** The dependency tree lives *outside* the source tree, so a plain `git worktree add` just works:
+`vcpkg_installed` is 12 GB (macOS) / ~26 GB (Windows) and rarely changes. On **both**
+platforms it lives *outside* the source tree in a fixed per-user location - macOS
+`~/.cflat-compiler-deps/vcpkg_installed`, Windows `%USERPROFILE%\.cflat-compiler-deps\vcpkg_installed`
+(override either with `CFLAT_VCPKG_INSTALLED`) - so a plain `git worktree add` just
+works with zero post-processing, no junction, no symlink, and no deletion hazard:
 
 ```bash
 git worktree add ../cflat-feature -b feature/foo
-cd ../cflat-feature && ./cmake_build.sh release   # no vcpkg step; ~270 MB of build output
-git worktree remove ../cflat-feature              # shared tree untouched
+cd ../cflat-feature && ./cmake_build.sh release   # or cmake_build.bat on Windows; no vcpkg step
+git worktree remove ../cflat-feature               # shared tree untouched
 ```
 
-The macOS preset pins `VCPKG_INSTALLED_DIR` to `~/.cflat-compiler-deps/vcpkg_installed` (not `${sourceDir}`), and `cmake_build.sh` resolves `VCPKG_ROOT` from the main checkout's gitignored `./vcpkg` clone (a linked worktree has none). No junction, no symlink, no mtime aging, and **no deletion hazard** - nothing inside a worktree points at the deps.
-
-**Windows - use the scripts.** The Windows preset still pins `VCPKG_INSTALLED_DIR` to `${sourceDir}/vcpkg_installed`, so worktrees share it via a junction:
-
-```bash
-new-worktree.bat C:\source\cflat-feature -b feature/foo   # add worktree + junction, no vcpkg rebuild
-rm-worktree.bat  C:\source\cflat-feature                  # safe remove (unlinks junction first)
-```
-
-- **Never `rm -rf` or Explorer-delete a Windows worktree** - that can follow the junction and wipe the shared 26 GB. Always use `rm-worktree.bat`.
-- See [`internal/worktree-vcpkg-sharing.md`](internal/worktree-vcpkg-sharing.md) for both mechanisms and what actually forces an LLVM source rebuild.
+`cmake_build.sh` resolves `VCPKG_ROOT` from the main checkout's gitignored `./vcpkg`
+clone (a linked worktree has none); `cmake_build.bat` does the equivalent via
+`VCPKG_ROOT`/`vcvars64`. Both scripts wipe a build dir whose cached `VCPKG_INSTALLED_DIR`
+no longer matches, since a moved dependency tree leaves stale absolute paths (`LLVM_DIR`
+etc.) behind. See [`internal/worktree-vcpkg-sharing.md`](internal/worktree-vcpkg-sharing.md)
+for the full mechanism and how to populate the shared tree on a fresh clone.
 
 **What forces a 50-min LLVM source rebuild** (on any platform): vcpkg keys its binary cache (`~/.cache/vcpkg/archives`, user-global) on an ABI hash whose inputs are the port version (registry baseline in `vcpkg-configuration.json`), the **feature list in `vcpkg.json`**, the triplet, the host compiler, and the **CMake version**. The source directory is not an input - a worktree can never cause a rebuild. Editing `vcpkg.json` features, bumping the baseline, or `brew upgrade cmake`/Xcode can.
 
