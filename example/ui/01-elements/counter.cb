@@ -55,6 +55,13 @@ extern int main()
 
     printf("count after 2 clicks: %d\n", c.count);
 
+    // Regression: a Button built via the tag sugar with no onPress has a null
+    // closure field. fireClick() must guard the call instead of crashing.
+    IButton noHandler = <Button key="nh" title="No handler"/>;
+    noHandler.fireClick();
+    printf("handler-less fireClick did not crash\n");
+    deleteTree(noHandler);
+
     // Re-render reflects the mutated state: Count: 2.
     IElement tree2 = c.render(&ctx);
     printf("render 2: %s\n", tree2.toJson().data());

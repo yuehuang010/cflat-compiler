@@ -1643,7 +1643,7 @@ class Button : IButton
 
     void fireClick()
     {
-        this.onPress();
+        if (this.onPress != nullptr) { this.onPress(); }
     }
 
     move string toJson()
@@ -1878,7 +1878,7 @@ class TextInput : ITextInput
     Rect   bounds = default;
     string key    = default;
 
-    void fireChangeText(string s) { this.onChangeText(s); }
+    void fireChangeText(string s) { if (this.onChangeText != nullptr) { this.onChangeText(s); } }
 
     move string toJson()
     {
@@ -1992,7 +1992,7 @@ class Checkbox : ICheckbox
     Rect   bounds = default;
     string key   = default;
 
-    void fireToggle() { this.onChange(!this.checked); }
+    void fireToggle() { if (this.onChange != nullptr) { this.onChange(!this.checked); } }
 
     move string toJson()
     {
@@ -2141,7 +2141,7 @@ class Slider : ISlider
     void fireSet(int v)
     {
         if (v < 0) v = 0; if (v > 100) v = 100;
-        this.onChange(v);
+        if (this.onChange != nullptr) { this.onChange(v); }
     }
 
     // Map a cell x along the track to a 0..100 value.
@@ -2256,7 +2256,7 @@ class TextArea : ITextArea
     Rect   bounds = default;
     string key    = default;
 
-    void fireChange() { this.onChange(); }
+    void fireChange() { if (this.onChange != nullptr) { this.onChange(); } }
 
     move string toJson() { return "{\"type\":\"TextArea\"}"; }
 
@@ -2758,7 +2758,7 @@ class RadioGroup : IRadioGroup
 
     void add(IElement child) { this.children.add(child); }
 
-    void fireChange(int v) { this.onChange(v); }
+    void fireChange(int v) { if (this.onChange != nullptr) { this.onChange(v); } }
 
     // Append a wired option. `checked` is seeded from the current value at render time
     // (the controlled contract); reconcile propagates a later selection change through
@@ -2884,7 +2884,7 @@ class ComboBox : IComboBox
 
     void addItem(string s) { this.items.add("" + s); }
 
-    void fireChange(int v) { this.onChange(v); }
+    void fireChange(int v) { if (this.onChange != nullptr) { this.onChange(v); } }
 
     string _selectedText()
     {
@@ -3010,8 +3010,8 @@ class ListView : IListView
         this.colWidths.add(widthDip);
     }
 
-    void fireSelect(int row)   { this.onSelect(row); }
-    void fireActivate(int row) { this.onActivate(row); }
+    void fireSelect(int row)   { if (this.onSelect != nullptr) { this.onSelect(row); } }
+    void fireActivate(int row) { if (this.onActivate != nullptr) { this.onActivate(row); } }
 
     move string toJson()
     {
@@ -3261,7 +3261,7 @@ class TabControl : ITabControl
 
     void add(IElement child) { this.children.add(child); }
 
-    void fireSelectTab(int i) { this.onSelectTab(i); }
+    void fireSelectTab(int i) { if (this.onSelectTab != nullptr) { this.onSelectTab(i); } }
 
     string _title(int i)
     {
@@ -3401,8 +3401,8 @@ class TreeView : ITreeView
     Rect bounds = default;
     string key = default;
 
-    void fireSelect(int nodeId) { this.onSelect(nodeId); }
-    void fireExpand(int nodeId) { this.onExpand(nodeId); }
+    void fireSelect(int nodeId) { if (this.onSelect != nullptr) { this.onSelect(nodeId); } }
+    void fireExpand(int nodeId) { if (this.onExpand != nullptr) { this.onExpand(nodeId); } }
 
     move string toJson()
     {
@@ -3494,7 +3494,7 @@ class SplitView : ISplitView
 
     void add(IElement child) { this.children.add(child); }
 
-    void fireRatioChange(int r) { this.onRatioChange(r); }
+    void fireRatioChange(int r) { if (this.onRatioChange != nullptr) { this.onRatioChange(r); } }
 
     int _clampRatio(int v) { if (v < 5) return 5; if (v > 95) return 95; return v; }
 
