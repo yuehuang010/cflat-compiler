@@ -10,6 +10,7 @@ import "queue.cb";
 import "interfaces.cb";
 import "array.cb";
 import "bucket_allocator.cb";
+import "cruntime.cb";
 
 // ── array<T> ─────────────────────────────────────────────────────────────────
 
@@ -1985,6 +1986,52 @@ int testDirectReturnOwnership()
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
+// The C `long` bindings in core/cruntime.cb (atol/strtol/strtoul, the abs family) and the
+// `long`/`ulong` keywords must carry the TARGET's native C long width: 32-bit on Windows
+// (LLP64), 64-bit on LP64. A 32-bit binding on LP64 truncated atol's result to garbage.
+int testCLongWidth()
+{
+    int passed = 0;
+
+    passed += Test("sizeof(int) == 4",       (i64)sizeof(int),       (i64)4);
+    passed += Test("sizeof(long long) == 8", (i64)sizeof(long long), (i64)8);
+
+    if const (__WINDOWS__)
+    {
+        // LLP64: long is 32-bit, matching MSVC. The parse functions saturate past 2^31-1.
+        passed += Test("sizeof(long) == 4",  (i64)sizeof(long),  (i64)4);
+        passed += Test("sizeof(ulong) == 4", (i64)sizeof(ulong), (i64)4);
+        passed += Test("atol max i32",   (i64)atol("2147483647"),                  (i64)2147483647);
+        passed += Test("strtol max i32", (i64)strtol("2147483647", nullptr, 10),   (i64)2147483647);
+        passed += Test("strtoul max u32",(i64)strtoul("4294967295", nullptr, 10),  (i64)4294967295);
+    }
+    else
+    {
+        // LP64: long is 64-bit. These three all truncated to 32 bits before the fix.
+        passed += Test("sizeof(long) == 8",  (i64)sizeof(long),  (i64)8);
+        passed += Test("sizeof(ulong) == 8", (i64)sizeof(ulong), (i64)8);
+        passed += Test("atol 2^32",    (i64)atol("4294967296"),                  (i64)4294967296);
+        passed += Test("strtol 2^32",  (i64)strtol("4294967296", nullptr, 10),   (i64)4294967296);
+        passed += Test("strtoul 2^33", (i64)strtoul("8589934592", nullptr, 10),  (i64)8589934592);
+    }
+
+    // Small values and the endptr tail behave identically on both ABIs.
+    passed += Test("atol small",     (i64)atol("123"),                       (i64)123);
+    passed += Test("strtol negative",(i64)strtol("-456", nullptr, 10),       (i64)-456);
+    passed += Test("strtol hex",     (i64)strtol("ff", nullptr, 16),         (i64)255);
+    char* end = nullptr;
+    i64 parsed = (i64)strtol("42abc", &end, 10);
+    passed += Test("strtol endptr value", parsed,     (i64)42);
+    passed += Test("strtol endptr tail",  (i64)*end,  (i64)'a');
+
+    // C's abs family is one function per width; each binding must match its true C width.
+    passed += Test("abs(-7)",   (i64)abs(-7),              (i64)7);
+    passed += Test("labs(-7)",  (i64)labs(-7),             (i64)7);
+    passed += Test("llabs 2^33",(i64)llabs(-8589934592),   (i64)8589934592);
+
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -2026,6 +2073,7 @@ extern int main()
     r = testStringAPI();        passed += r; total += 114;
     r = testDiscard();          passed += r; total += 3;
     r = testDirectReturnOwnership(); passed += r; total += 6;
+    r = testCLongWidth();       passed += r; total += 15;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

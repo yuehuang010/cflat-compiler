@@ -1,0 +1,21 @@
+// `concretePtr as IFace` must be rejected at compile time when the concrete class
+// does not implement IFace, instead of emitting a bogus runtime typedesc check that
+// always fails and yields a crashing null fat pointer.
+
+interface IW
+{
+    int id();
+};
+
+class Z
+{
+    int z = default;
+};
+
+extern int main()
+{
+    Z* zp = new Z();
+    expect_error("'Z' does not implement interface 'IW'");
+    IW e = zp as IW;
+    return 0;
+}

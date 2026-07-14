@@ -205,6 +205,55 @@ bool testAsToInterface()
     return result;
 }
 
+// ── Test 4b: as operator - box a CONCRETE class pointer into an interface ────
+// Regression for the bug where `concretePtr as IFace` was lowered as a runtime
+// downcast (assumes an already-boxed source) instead of a box, yielding a null
+// fat pointer and crashing on first method call. See internal/issue history.
+
+bool testAsBoxConcretePointerIntoInterface()
+{
+    bool result = true;
+
+    Circle* cp = new Circle();
+    cp.r = 4;
+
+    // The crash repro: `as` from a plain class pointer into an interface must box.
+    IDrawable d = cp as IDrawable;
+    result &= Test("as_box_ptr_area",  d.area(), 48);   // 4*4*3
+    result &= Test("as_box_ptr_is_circle", d is Circle, true);
+    d.draw();   // access through the boxed value must not fault
+
+    // Round trip: casting the boxed interface value back to the concrete
+    // pointer type must still behave exactly as before (interface source).
+    Circle* back = d as Circle;
+    result &= Test("as_box_roundtrip_nonnull", back != nullptr, true);
+    if (back != nullptr)
+        result &= Test("as_box_roundtrip_r", back.r, 4);
+
+    // `is` against a concrete pointer source folds to a compile-time constant.
+    result &= Test("concrete_ptr_is_idrawable_true", cp is IDrawable, true);
+
+    Square* sp = new Square();
+    sp.s = 5;
+    result &= Test("concrete_ptr_is_idrawable_false", sp is IDrawable, false);
+
+    // Concrete source with the SAME concrete target is an identity cast. This used to
+    // fall into the downcast path and dereference field 0 as if it were a vtable.
+    Circle* self = cp as Circle;
+    result &= Test("as_same_concrete_nonnull", self != nullptr, true);
+    if (self != nullptr)
+    {
+        result &= Test("as_same_concrete_field", self.r, 4);
+        result &= Test("as_same_concrete_method", self.area(), 48);   // 4*4*3
+    }
+    result &= Test("concrete_ptr_is_circle_true",  cp is Circle, true);
+    result &= Test("concrete_ptr_is_square_false", cp is Square, false);
+
+    delete cp;
+    delete sp;
+    return result;
+}
+
 // ── Test 5: switch on concrete type ─────────────────────────────────────────
 // Dispatches to the matching case by runtime concrete type.
 
@@ -1522,6 +1571,7 @@ extern int main()
     total++; passed += testIsOperator()          ? 1 : 0;
     total++; passed += testAsToStruct()          ? 1 : 0;
     total++; passed += testAsToInterface()       ? 1 : 0;
+    total++; passed += testAsBoxConcretePointerIntoInterface() ? 1 : 0;
     total++; passed += testSwitchConcreteType()  ? 1 : 0;
     total++; passed += testSwitchInterfaceCase() ? 1 : 0;
     total++; passed += testSwitchDefault()       ? 1 : 0;

@@ -540,19 +540,19 @@ extern int tolower(int c);
 // Parse a leading number out of a NUL-terminated string. The ato* forms return 0 on a
 // non-numeric string (no error signal); the strto* forms write the first unparsed
 // character into *endptr (pass nullptr to ignore) and take a numeric base (10, 16, ...;
-// base 0 auto-detects 0x/0 prefixes). Windows is LLP64, so C `long` is 32-bit: atol maps
-// to int and atoll/strtoll to i64.
+// base 0 auto-detects 0x/0 prefixes). The `long` forms use CFlat's `long`/`ulong`, which
+// carry C's native long width per target (32-bit on Windows/LLP64, 64-bit on LP64).
 extern int    atoi(const char* str);
-// Parse a leading 32-bit C `long` (int on Windows) from `str`; 0 if non-numeric.
-extern int    atol(const char* str);
+// Parse a leading C `long` from `str`; 0 if non-numeric.
+extern long   atol(const char* str);
 // Parse a leading 64-bit integer from `str`; 0 if non-numeric.
 extern i64    atoll(const char* str);
 // Parse a leading double from `str`; 0 if non-numeric.
 extern double atof(const char* str);
-// Parse a 32-bit integer in the given base; writes first unparsed char to *endptr.
-extern int    strtol(const char* str, char** endptr, int base);
-// Parse an unsigned 32-bit integer in the given base; *endptr gets the tail.
-extern u32    strtoul(const char* str, char** endptr, int base);
+// Parse a C `long` in the given base; writes first unparsed char to *endptr.
+extern long   strtol(const char* str, char** endptr, int base);
+// Parse a C `unsigned long` in the given base; *endptr gets the tail.
+extern ulong  strtoul(const char* str, char** endptr, int base);
 // Parse a 64-bit integer in the given base; *endptr gets the tail.
 extern i64    strtoll(const char* str, char** endptr, int base);
 // Parse an unsigned 64-bit integer in the given base; *endptr gets the tail.
@@ -561,11 +561,17 @@ extern u64    strtoull(const char* str, char** endptr, int base);
 extern double strtod(const char* str, char** endptr);
 
 // === Math Functions (basic) ===
-// Absolute value of an integer.
-extern i64 abs(i64 n);
+// C's abs family is one function per width - binding a narrower one as i64 reads the
+// callee's untouched upper 32 bits. Each is declared at its true C width here.
+// Absolute value of an int.
+extern int abs(int n);
+// Absolute value of a C `long` (32-bit on Windows/LLP64, 64-bit on LP64).
+extern long labs(long n);
+// Absolute value of a long long.
+extern i64 llabs(i64 n);
 // Absolute value of a double.
 extern double fabs(double x);
-// Absolute value of a maximum-width integer.
+// Absolute value of a maximum-width integer (intmax_t is 64-bit on both platforms).
 extern i64 imaxabs(i64 n);
 
 // === Process Control ===

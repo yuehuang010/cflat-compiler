@@ -1482,10 +1482,67 @@ int testBtreeConcurrentInsertSplits()
     return passed;
 }
 
+// ---------------------------------------------------------------------------
+// Cache-line padding with `alignas` on a MEMBER (doc/HPC.md: kill false sharing)
+// ---------------------------------------------------------------------------
+// The documented pattern puts the hot per-worker counter on its own cache line. The
+// clause used to parse and then be silently dropped by struct layout, so the padding
+// never happened and the slots still shared a line. Layout is the contract here:
+// the hot field starts at 64, the type is 64-aligned, and an array of slots strides
+// by a full line so slots[i] and slots[k] can never share one.
+struct WorkerSlot
+{
+    int id = 0;
+    alignas(64) i64 count = 0;
+};
+
+// Two hot counters, each on its own line - the classic two-writer false-sharing shape.
+struct TwoCounters
+{
+    alignas(64) i64 producer = 0;
+    alignas(64) i64 consumer = 0;
+};
+
+int testCacheLinePadding()
+{
+    int passed = 0;
+
+    passed += Test("WorkerSlot sizeof==128",   (int)sizeof(WorkerSlot),  128);
+    passed += Test("WorkerSlot alignof==64",   (int)alignof(WorkerSlot), 64);
+
+    WorkerSlot s;
+    passed += Test("WorkerSlot count on line", (int)(((i64)&s.count) - ((i64)&s.id)), 64);
+    passed += Test("WorkerSlot base%64",       (int)(((i64)&s) & 63), 0);
+
+    passed += Test("TwoCounters sizeof==128",  (int)sizeof(TwoCounters),  128);
+    passed += Test("TwoCounters alignof==64",  (int)alignof(TwoCounters), 64);
+    TwoCounters tc;
+    passed += Test("TwoCounters not sharing a line",
+                   (int)(((i64)&tc.consumer) - ((i64)&tc.producer)), 64);
+
+    // Per-worker slots in one heap array: each slot must own a full line.
+    i64 workers = 4;
+    WorkerSlot[] slots = new WorkerSlot[workers];
+    passed += Test("slots base%64", (int)(((i64)&slots[0]) & 63), 0);
+    passed += Test("slot stride==128",
+                   (int)(((i64)&slots[1]) - ((i64)&slots[0])), 128);
+    i64 w = 0;
+    while (w < workers) { slots[w].id = (int)w; slots[w].count = w * 10; w = w + 1; }
+    passed += Test("slot[3].count", (int)slots[3].count, 30);
+    passed += Test("slot[3].id",    slots[3].id,          3);
+    passed += Test("slot[1] hot%64", (int)(((i64)&slots[1].count) & 63), 0);
+    delete[_] slots;
+
+    return passed;
+}
+
 extern int main(int argc, char** argv)
 {
     int passed = 0;
     int total  = 0;
+
+    // ---- cache-line padding (alignas on a member) ----
+    passed += testCacheLinePadding(); total += 12;
 
     // ---- simd<T,N> ----
     int seed = argc;   // 1 with no args

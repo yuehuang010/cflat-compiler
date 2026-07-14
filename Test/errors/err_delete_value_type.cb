@@ -1,0 +1,36 @@
+// Reject `delete x` where x is a value-type local (a struct VALUE, not a pointer),
+// e.g. list<T>/dictionary<K,V>/any non-pointer struct. Value types are auto-destructed
+// at scope exit, so this is always a user error - see
+// internal/issue/delete-on-value-type-local-emits-invalid-ir.md (now fixed).
+
+import "string.cb";
+import "list.cb";
+
+expect_error("cannot 'delete' value-type local 'l' of type 'list<string>'") {
+    int useListValue() {
+        list<string> l = default;
+        l.add("a");
+        delete l;
+        return 0;
+    }
+}
+
+struct Point { int x = 0; int y = 0; };
+
+expect_error("cannot 'delete' value-type local 'pt' of type 'Point'") {
+    int usePlainStruct() {
+        Point pt;
+        delete pt;
+        return 0;
+    }
+}
+
+expect_error("cannot 'delete' value-type local") {
+    int usePrimitiveValue() {
+        int n = 5;
+        delete n;
+        return 0;
+    }
+}
+
+extern int main() { return 0; }

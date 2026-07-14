@@ -3370,6 +3370,34 @@ struct PlainHolder
 // recovered from the element type there too, or an aligned block goes to plain free.
 void consumeChunks(move AlignChunk* p) { }
 
+// `alignas(N)` on a MEMBER: the member's slot is padded to its boundary and the containing
+// type's alignment (and padded sizeof) rise to match - C/C++ semantics. The layout carries
+// synthetic `__padN` slots that must stay invisible to field access, brace-init and dtors.
+struct AlignMember  { int a = 0; alignas(64) int b = 0; };            // 4 + pad(60) + 4 + tail(60)
+struct alignas(128) AlignBoth { int a = 0; alignas(64) int b = 0; };  // member 64, type 128
+struct AlignFirst   { alignas(16) int a = 0; int b = 0; };            // no pad needed, align 16
+class  AlignMemberCls { int a = 0; alignas(32) int b = 0; };
+
+// A padded field list must not disturb a destructor or the memberwise copy: the string
+// field still deep-copies and frees, and the pad slots are skipped by both.
+struct AlignDtorHolder
+{
+    string tag = default;
+    alignas(64) int hot = 0;
+    int cold = 0;
+    ~AlignDtorHolder() { }
+};
+
+// An over-aligned struct used BY VALUE as a field keeps its alignment (the alignment is a
+// property of the type), so the field's slot is padded to 64 too.
+struct AlignNested { int x = 0; AlignCL cl = default; };
+
+// Union members all start at offset 0, so an `alignas` member cannot be padded - it just
+// raises the union's own alignment (and its size, which stays a multiple of that).
+union AlignUnionMember { int i = default; alignas(64) char c = default; };
+union alignas(32) AlignUnionType { int i = default; short s = default; };
+union PlainUnion { int i = default; double d = default; };
+
 bool testAlignas()
 {
     bool result = true;
@@ -3462,6 +3490,78 @@ bool testAlignas()
     ordinary[0] = 4.5;
     result &= Test("ordinary move-out after aligned allocation", ordinary[0] == 4.5, true);
     delete[_] ordinary;
+
+    // -- alignas on a MEMBER (was silently ignored: no pad, no raised alignment) --------
+    result &= Test("sizeof(AlignMember)==128",  (int)sizeof(AlignMember),  128);
+    result &= Test("alignof(AlignMember)==64",  (int)alignof(AlignMember), 64);
+
+    AlignMember am;
+    am.a = 1;
+    am.b = 2;
+    result &= Test("member alignas: offset b==64", (int)(((i64)&am.b) - ((i64)&am.a)), 64);
+    result &= Test("member alignas: &am%64",       (int)(((i64)&am) & 63), 0);
+    result &= Test("member alignas: a readback",   am.a, 1);
+    result &= Test("member alignas: b readback",   am.b, 2);
+
+    // Member alignas combined with a stricter TYPE-level alignas: the type wins for the
+    // whole struct, the member clause still places the member.
+    result &= Test("sizeof(AlignBoth)==128",  (int)sizeof(AlignBoth),  128);
+    result &= Test("alignof(AlignBoth)==128", (int)alignof(AlignBoth), 128);
+    AlignBoth ab;
+    result &= Test("AlignBoth: offset b==64", (int)(((i64)&ab.b) - ((i64)&ab.a)), 64);
+    result &= Test("AlignBoth: &ab%128",      (int)(((i64)&ab) & 127), 0);
+
+    // alignas on the FIRST member: already on its boundary (no pad), but the struct's own
+    // alignment and padded size still rise to it.
+    result &= Test("sizeof(AlignFirst)==16",  (int)sizeof(AlignFirst),  16);
+    result &= Test("alignof(AlignFirst)==16", (int)alignof(AlignFirst), 16);
+    AlignFirst af;
+    result &= Test("AlignFirst: offset b==4", (int)(((i64)&af.b) - ((i64)&af.a)), 4);
+
+    // Same on a class.
+    result &= Test("sizeof(AlignMemberCls)==64",  (int)sizeof(AlignMemberCls),  64);
+    result &= Test("alignof(AlignMemberCls)==32", (int)alignof(AlignMemberCls), 32);
+
+    // Heap: `new` must route through the aligned allocator for a member-over-aligned type.
+    AlignMember* hm = new AlignMember();
+    result &= Test("new AlignMember%64", (int)(((i64)hm) & 63), 0);
+    hm.b = 9;
+    result &= Test("new AlignMember b readback", hm.b, 9);
+    delete hm;
+
+    // Padding must not break named brace-init, the memberwise copy, or a destructor: the
+    // string field is still deep-copied/freed across the pad slots.
+    AlignDtorHolder adh = { tag = "cache-line", hot = 7, cold = 8 };
+    result &= Test("padded brace-init: hot",  adh.hot,  7);
+    result &= Test("padded brace-init: cold", adh.cold, 8);
+    result &= Test("padded brace-init: tag",  adh.tag == "cache-line", true);
+    result &= Test("padded: offset hot==64",  (int)(((i64)&adh.hot) - ((i64)&adh.tag)), 64);
+    AlignDtorHolder adhCopy = adh.copy();
+    result &= Test("padded copy: tag",  adhCopy.tag == "cache-line", true);
+    result &= Test("padded copy: hot",  adhCopy.hot, 7);
+
+    // An over-aligned struct TYPE used as a by-value field keeps its alignment.
+    result &= Test("alignof(AlignNested)==64", (int)alignof(AlignNested), 64);
+    AlignNested an2;
+    result &= Test("AlignNested: offset cl==64", (int)(((i64)&an2.cl) - ((i64)&an2.x)), 64);
+
+    // Arrays of a member-over-aligned type stride by the padded size.
+    AlignMember[3] amArr;
+    result &= Test("AlignMember[3] stride==128", (int)(((i64)&amArr[1]) - ((i64)&amArr[0])), 128);
+    result &= Test("AlignMember[3] arr[2]%64",   (int)(((i64)&amArr[2]) & 63), 0);
+
+    // Unions: alignas on a member or on the union itself raises alignment and size; a plain
+    // union is untouched.
+    result &= Test("sizeof(AlignUnionMember)==64",  (int)sizeof(AlignUnionMember),  64);
+    result &= Test("alignof(AlignUnionMember)==64", (int)alignof(AlignUnionMember), 64);
+    AlignUnionMember aum;
+    aum.i = 5;
+    result &= Test("AlignUnionMember addr%64", (int)(((i64)&aum) & 63), 0);
+    result &= Test("AlignUnionMember value",   aum.i, 5);
+    result &= Test("sizeof(AlignUnionType)==32",  (int)sizeof(AlignUnionType),  32);
+    result &= Test("alignof(AlignUnionType)==32", (int)alignof(AlignUnionType), 32);
+    result &= Test("sizeof(PlainUnion)==8",       (int)sizeof(PlainUnion),      8);
+    result &= Test("alignof(PlainUnion)==8",      (int)alignof(PlainUnion),     8);
 
     return result;
 }

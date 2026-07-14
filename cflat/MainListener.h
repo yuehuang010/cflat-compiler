@@ -67,6 +67,15 @@ static CFlatParser::ArrayPtrSuffixContext* ArrayPtrOf(Ctx* c)
 {
     return c->arrayTypeSuffix() ? c->arrayTypeSuffix()->arrayPtrSuffix() : nullptr;
 }
+// `long long` reaches the listener as two separate `long` typeSpecifiers (the grammar has no
+// combined rule), and the parse loops stop at the first one. Count them so the spelling can be
+// canonicalized to "i64": `long long` is 64-bit on every target, while bare `long` is the
+// target's native C long (i32 on Windows/LLP64, i64 on LP64) and keeps its own type name.
+// Returns the type name to use for a "long" typeSpecifier given the whole specifier list.
+static const char* LongSpellingTypeName(int longSpecifierCount)
+{
+    return longSpecifierCount >= 2 ? "i64" : "long";
+}
 // A type-argument position (tuple element, generic type arg) admits exactly the bare `T[]`
 // array-view among the bracket forms. Returns true for `T[]` (empty dims, no trailing '*').
 template <class Ctx>
@@ -711,6 +720,12 @@ private:
     {
         auto* compiler = Compiler(declSpecs);
         LLVMBackend::DeclTypeAndValue declType;
+        // `long long` arrives as two `long` typeSpecifiers; count them before the loop breaks
+        // out on the first one, so the pair can canonicalize to i64.
+        int longSpecCount = 0;
+        for (auto declSpec : declSpecs->declarationSpecifier())
+            if (declSpec->typeSpecifier() != nullptr && declSpec->typeSpecifier()->getText() == "long")
+                longSpecCount++;
         for (auto declSpec : declSpecs->declarationSpecifier())
         {
             auto typeSpec = declSpec->typeSpecifier();
@@ -842,7 +857,9 @@ private:
                 }
                 else
                 {
-                    declType.TypeName = compiler->ResolveQualifiedName(typeSpec->getText());
+                    std::string specText = typeSpec->getText();
+                    if (specText == "long") specText = LongSpellingTypeName(longSpecCount);
+                    declType.TypeName = compiler->ResolveQualifiedName(specText);
                     // Resolve type aliases (e.g. user-defined aliases)
                     declType.TypeName = compiler->ResolveTypeAlias(declType.TypeName);
                     // Peel an array alias's brackets (using Vec3 = float[3]) BEFORE the stars so
@@ -2291,6 +2308,12 @@ private:
         LLVMBackend::DeclTypeAndValue declType;
         std::string typeName;
         auto declSpecList = declSpecs->declarationSpecifier();
+        // `long long` arrives as two `long` typeSpecifiers; count them before the loop breaks
+        // out on the first one, so the pair can canonicalize to i64.
+        int longSpecCount = 0;
+        for (auto declSpec : declSpecList)
+            if (declSpec->typeSpecifier() != nullptr && declSpec->typeSpecifier()->getText() == "long")
+                longSpecCount++;
 
         for (auto declSpec : declSpecList)
         {
@@ -2480,6 +2503,7 @@ private:
                 else
                 {
                     typeName = typeSpec->getText();
+                    if (typeName == "long") typeName = LongSpellingTypeName(longSpecCount);
                     // Apply active type parameter substitutions (e.g. T -> int inside a template body)
                     bool substPointer = false;
                     bool substArrayView = false;
@@ -8501,6 +8525,7 @@ public:
 
         auto tv = ParseRelationalExpression(relCtx);
         llvm::Value* result = tv.value;
+        llvm::Type* srcElemType = tv.elemType;
 
         // Handle 'is' and 'as' operators
         auto typeSpecs = ctx->typeSpecifier();
@@ -8513,12 +8538,15 @@ public:
 
                 if (op == "is")
                 {
-                    result = GenerateIsCheck(result, targetTypeName, ctx);
+                    result = GenerateIsCheck(result, targetTypeName, ctx, srcElemType);
                 }
                 else if (op == "as")
                 {
-                    result = GenerateSafeCast(result, targetTypeName, ctx);
+                    result = GenerateSafeCast(result, targetTypeName, ctx, srcElemType);
                 }
+                // Only the first operand's static type is known here; a chained is/as
+                // operates on the previous op's result, whose element type isn't tracked.
+                srcElemType = nullptr;
             }
             return { result, false };  // is/as result is bool or pointer, not unsigned
         }
@@ -8550,10 +8578,35 @@ public:
         return compiler->builder->CreateLoad(ptrTy, typeDescField);
     }
 
+    // Returns the registered struct/class name if elemType names a concrete data structure
+    // (a plain T* source), as opposed to the shared interface fat-pointer struct or a
+    // primitive. Returns "" when the source is not a concrete struct/class pointer.
+    std::string ConcreteStructNameFromElemType(llvm::Type* elemType, LLVMBackend* compiler)
+    {
+        auto* st = elemType ? llvm::dyn_cast<llvm::StructType>(elemType) : nullptr;
+        if (!st || !st->hasName()) return "";
+        std::string name = st->getName().str();
+        return compiler->dataStructures.count(name) ? name : "";
+    }
+
     llvm::Value* GenerateIsCheck(llvm::Value* interfaceValue, const std::string& targetTypeName,
-                                  antlr4::ParserRuleContext* ctx)
+                                  antlr4::ParserRuleContext* ctx, llvm::Type* srcElemType = nullptr)
     {
         auto* compiler = Compiler(ctx);
+
+        // Concrete pointer source (e.g. `w is IW` where w is W*, not a boxed interface
+        // value): no vtable/typedesc header to load, so the answer is known at compile time.
+        std::string srcStructName = ConcreteStructNameFromElemType(srcElemType, compiler);
+        if (!srcStructName.empty())
+        {
+            if (compiler->interfaceTable.count(targetTypeName))
+                return compiler->builder->getInt1(compiler->StructImplementsInterface(srcStructName, targetTypeName));
+            if (compiler->dataStructures.count(targetTypeName))
+                return compiler->builder->getInt1(srcStructName == targetTypeName);
+
+            LogErrorContext(ctx, std::format("'{}' is not a known struct or interface type for 'is' check", targetTypeName));
+            return nullptr;
+        }
 
         // Interface target: true when the runtime type is any implementor of that interface.
         // An OR-chain of typedesc compares - the same enumeration `switch` on an interface uses.
@@ -8595,12 +8648,49 @@ public:
     }
 
     llvm::Value* GenerateSafeCast(llvm::Value* interfaceValue, const std::string& targetTypeName,
-                                  antlr4::ParserRuleContext* ctx)
+                                  antlr4::ParserRuleContext* ctx, llvm::Type* srcElemType = nullptr)
     {
         auto* compiler = Compiler(ctx);
         auto ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
 
-        // Check if target is an interface (interface-to-interface cast)
+        // CONCRETE pointer source (e.g. `w as X` where w is W*). A concrete object carries
+        // no vtable/typedesc header, so every target is resolved statically here; this branch
+        // always returns, keeping the runtime-checked downcast below interface-source-only.
+        std::string srcStructName = ConcreteStructNameFromElemType(srcElemType, compiler);
+        if (!srcStructName.empty())
+        {
+            // Interface target: box it, exactly like the plain-assignment path.
+            if (compiler->interfaceTable.count(targetTypeName))
+            {
+                if (!compiler->StructImplementsInterface(srcStructName, targetTypeName))
+                {
+                    LogErrorContext(ctx, std::format("'{}' does not implement interface '{}'", srcStructName, targetTypeName));
+                    return nullptr;
+                }
+                auto* vtable = compiler->GetOrCreateVTable(srcStructName, targetTypeName);
+                return compiler->BuildInterfaceFatValue(vtable, interfaceValue);
+            }
+
+            if (compiler->dataStructures.count(targetTypeName))
+            {
+                // Same concrete type: identity cast, the pointer is already what was asked for.
+                if (srcStructName == targetTypeName) return interfaceValue;
+
+                // Different concrete type. There is no inheritance between concrete classes and
+                // no runtime type info on the object, so this can never be a checked downcast.
+                LogErrorContext(ctx, std::format(
+                    "cannot cast '{}' to unrelated type '{}'; 'as' performs a runtime-checked downcast only from an interface value",
+                    srcStructName, targetTypeName));
+                return nullptr;
+            }
+
+            LogErrorContext(ctx, std::format("'{}' is not a known struct or interface type for 'as' cast", targetTypeName));
+            return nullptr;
+        }
+
+        // From here on the source is an INTERFACE-typed value (a fat pointer): it is the only
+        // shape that carries the vtable + typedesc header the checks below load from.
+        // Interface target: interface-to-interface runtime-checked cast.
         if (compiler->interfaceTable.count(targetTypeName))
         {
             auto fatTy = compiler->GetFatPtrType();
@@ -8674,7 +8764,7 @@ public:
             return compiler->builder->CreateLoad(fatTy, resultAlloca);
         }
 
-        // Concrete struct cast (existing logic)
+        // Concrete target from an interface source: the runtime-checked downcast.
         auto targetIt = compiler->dataStructures.find(targetTypeName);
         if (targetIt == compiler->dataStructures.end())
         {
@@ -9901,6 +9991,14 @@ public:
                 else
                 {
                     typeValue.TypeName = typeSpec->getText();
+                    // `(long long)x` / `sizeof(long long)`: two `long` specifiers, only [0] is read.
+                    if (typeValue.TypeName == "long")
+                    {
+                        int longSpecCount = 0;
+                        for (auto* ts : typeSpecs)
+                            if (ts->getText() == "long") longSpecCount++;
+                        typeValue.TypeName = LongSpellingTypeName(longSpecCount);
+                    }
                     // Apply active type-parameter substitutions (e.g. T -> int inside a generic function body).
                     auto substIt = activeTypeSubstitutions.find(typeValue.TypeName);
                     if (substIt != activeTypeSubstitutions.end())
@@ -11401,6 +11499,36 @@ public:
             // the free path below extracts the data pointer and dispatches the dtor virtually.
             isInterfaceOperand = namedVar.TypeAndValue.IsInterface
                 && !namedVar.TypeAndValue.IsInterfacePointer && !sawCast;
+
+            // Error: 'delete' on a value-type local (a struct VALUE, not a pointer). Value
+            // types are auto-destructed at scope exit, so this is always a user error; without
+            // this check the operand flows into icmp/call/bitcast instructions that require a
+            // pointer and LLVM's module verifier fails with no source location.
+            if (!namedVar.TypeAndValue.Pointer && !isInterfaceOperand)
+            {
+                std::string displayType = typeName;
+                if (size_t d = displayType.find("__"); d != std::string::npos)
+                {
+                    std::string base = displayType.substr(0, d);
+                    std::string args = displayType.substr(d + 2);
+                    std::string joined;
+                    for (size_t pos = 0; pos <= args.size(); )
+                    {
+                        size_t sep = args.find("__", pos);
+                        if (sep == std::string::npos) { joined += args.substr(pos); break; }
+                        joined += args.substr(pos, sep - pos) + ", ";
+                        pos = sep + 2;
+                    }
+                    displayType = base + "<" + joined + ">";
+                }
+                LogErrorContext(ctx, std::format(
+                    "cannot 'delete' value-type local '{}' of type '{}' - value types are "
+                    "destructed automatically at scope exit; 'delete' applies to pointers "
+                    "from 'new'",
+                    namedVar.CallerName.empty() ? "<expr>" : namedVar.CallerName, displayType));
+                return {};
+            }
+
             // A cast target renames the element type; honor it for destructor selection.
             if (sawCast)
             {
@@ -13926,7 +14054,8 @@ public:
 
                                     // Synthetic bitfield storage slots (`__bfN`) are not user-visible;
                                     // the named bitfields they pack are emitted from sd.Bitfields below.
-                                    if (field.IsBitfieldStorage) continue;
+                                    // Synthetic `__padN` alignment slots are not user-visible either.
+                                    if (field.IsBitfieldStorage || field.IsPadding) continue;
 
                                     // Skip [Private] fields
                                     bool isPrivate = false;
@@ -14291,6 +14420,9 @@ public:
                                 {
                                     const auto& field = sd.StructFields[i];
 
+                                    // Synthetic `__padN` alignment slots are not user-visible members.
+                                    if (field.IsPadding) continue;
+
                                     // Skip [Private] fields
                                     bool isPrivate = false;
                                     for (const auto& ann : field.Annotations)
@@ -14568,7 +14700,7 @@ public:
                                 "bool", "void",
                                 "char", "i8", "i16", "i32", "i64",
                                 "u8", "u16", "u32", "u64",
-                                "short", "int", "long",
+                                "short", "int", "long", "ulong",
                                 "float", "double",
                             };
                             bool isPrim = false;
@@ -17893,18 +18025,27 @@ public:
 
         if (compiler->IsVerbose())
             std::cout << "[verbose]     create struct type: " << structName << "\n";
+        // Capture `struct alignas(N) S { ... }` BEFORE layout so the padding
+        // member can be appended atomically.
+        uint64_t userAlign = 0;
+        if (auto* alignSpec = ctx->alignmentSpecifier())
+            userAlign = ParseAlignmentSpecifier(alignSpec);
         llvm::StructType* structType;
         if (isUnion)
         {
-            structType = compiler->CreateUnionType(structName, declList);
+            // A union body is one array: an over-aligned member cannot get a pad slot, it
+            // just raises the union's alignment (all members start at offset 0).
+            structType = compiler->CreateUnionType(structName, declList, userAlign);
         }
         else
         {
-            // Capture `struct alignas(N) S { ... }` BEFORE struct layout so the
-            // padding member can be appended atomically.
-            uint64_t userAlign = 0;
-            if (auto* alignSpec = ctx->alignmentSpecifier())
-                userAlign = ParseAlignmentSpecifier(alignSpec);
+            // `alignas(N)` on a MEMBER: insert synthetic `__padN` slots so the member starts on
+            // its boundary, and raise the struct's own alignment to the strictest member (which
+            // also tail-pads sizeof). Runs after PackBitfields so indices stay in sync.
+            uint64_t fieldAlign = 0;
+            declList = compiler->PadFieldsForAlignment(declList, fieldAlign,
+                anyBitfields ? &packedBitfields : nullptr);
+            if (fieldAlign > userAlign) userAlign = fieldAlign;
             structType = compiler->CreateStructType(structName, declList, userAlign,
                 anyBitfields ? &packedBitfields : nullptr);
             // A struct with zero fields still needs a sized (non-opaque) type
@@ -18061,7 +18202,7 @@ public:
             auto sd = compiler->GetDataStructure(structName);
             for (const auto& field : sd.StructFields)
             {
-                if (field.VariableName.empty()) continue;
+                if (field.VariableName.empty() || field.IsPadding) continue;
                 std::string annSig;
                 for (const auto& ann : field.Annotations)
                 {
@@ -20004,7 +20145,7 @@ public:
             auto sd = compiler->GetDataStructure(name);
             for (const auto& field : sd.StructFields)
             {
-                if (field.VariableName.empty()) continue;
+                if (field.VariableName.empty() || field.IsPadding) continue;
                 std::string annSig;
                 for (const auto& ann : field.Annotations)
                 {
@@ -20289,6 +20430,11 @@ public:
         uint64_t userAlign = 0;
         if (auto* alignSpec = ctx->alignmentSpecifier())
             userAlign = ParseAlignmentSpecifier(alignSpec);
+        // `alignas(N)` on a MEMBER: synthetic `__padN` slots align the member's slot, and the
+        // strictest member alignment becomes the class's own (raising alignof and sizeof).
+        uint64_t fieldAlign = 0;
+        declList = compiler->PadFieldsForAlignment(declList, fieldAlign);
+        if (fieldAlign > userAlign) userAlign = fieldAlign;
         auto structType = compiler->CreateStructType(structName, declList, userAlign);
         // A class with zero fields still needs a sized (non-opaque) type
         // so that alloca/sizeof work correctly (e.g. when passed via interface).
@@ -20404,7 +20550,7 @@ public:
             auto sd = compiler->GetDataStructure(structName);
             for (const auto& field : sd.StructFields)
             {
-                if (field.VariableName.empty()) continue;
+                if (field.VariableName.empty() || field.IsPadding) continue;
                 std::string annSig;
                 for (const auto& ann : field.Annotations)
                 {

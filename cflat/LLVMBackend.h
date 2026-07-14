@@ -342,6 +342,23 @@ enum class LockMode
 class LLVMBackend
 {
 public:
+    // Width of the `long` keyword, in bits. `long` follows the TARGET's native C ABI:
+    // Windows is LLP64 (32-bit long), 64-bit POSIX is LP64 (64-bit long), 32-bit is 32.
+    // Set by SetTargetLongWidth() when the target platform is resolved; a static because
+    // the nested TypeAndValue struct and the static BitfieldStorageBits() both need it,
+    // and one process compiles for exactly one target at a time. `long long` is always
+    // i64 (spelled as such by ParseDeclarationSpecifiers), and `int` is always i32.
+#if defined(_WIN32)
+    static inline int longBits_ = 32;
+#else
+    static inline int longBits_ = 64;
+#endif
+
+    static void SetTargetLongWidth(bool targetWindows, int platformBits)
+    {
+        longBits_ = (targetWindows || platformBits == 32) ? 32 : 64;
+    }
+
     enum class Operation
     {
         None,
@@ -548,8 +565,11 @@ public:
                 return 16;
             if (TypeName == "int" || TypeName == "i32" || TypeName == "u32")
                 return 32;
-            if (TypeName == "long" || TypeName == "i64" || TypeName == "u64")
+            if (TypeName == "i64" || TypeName == "u64")
                 return 64;
+            // `long`/`ulong` are target-native: 32 bits on Windows/LLP64, 64 on LP64.
+            if (TypeName == "long" || TypeName == "ulong")
+                return longBits_;
 
             return -1;
         }
@@ -562,6 +582,8 @@ public:
             if (TypeName == "u16") return 16;
             if (TypeName == "u32") return 32;
             if (TypeName == "u64") return 64;
+            // C's `unsigned long`: target-native width (u32 on Windows/LLP64, u64 on LP64).
+            if (TypeName == "ulong") return longBits_;
 
             return -1;
         }
@@ -642,6 +664,9 @@ public:
         // True on the synthesized storage slot from PackBitfields. Used to zero-initialize
         // the slot even when no per-bitfield initializer was written.
         bool IsBitfieldStorage = false;
+        // True on the synthesized `__padN` ([N x i8]) slots from PadFieldsForAlignment. Not a
+        // user-visible member: skipped by reflection, JSON, DWARF, dtor/copy and LSP field lists.
+        bool IsPadding = false;
 
         std::vector<AnnotationValue> Annotations;
     };
@@ -2081,7 +2106,8 @@ private:
         if      (tv.TypeName == "int")    basic = diBuilder->createBasicType("int", 32, DW_ATE_signed);
         else if (tv.TypeName == "char")   basic = diBuilder->createBasicType("char", 8, DW_ATE_signed_char);
         else if (tv.TypeName == "short")  basic = diBuilder->createBasicType("short", 16, DW_ATE_signed);
-        else if (tv.TypeName == "long")   basic = diBuilder->createBasicType("long", 64, DW_ATE_signed);
+        else if (tv.TypeName == "long")   basic = diBuilder->createBasicType("long", longBits_, DW_ATE_signed);
+        else if (tv.TypeName == "ulong")  basic = diBuilder->createBasicType("ulong", longBits_, DW_ATE_unsigned);
         else if (tv.TypeName == "float")  basic = diBuilder->createBasicType("float", 32, DW_ATE_float);
         else if (tv.TypeName == "double") basic = diBuilder->createBasicType("double", 64, DW_ATE_float);
         else if (tv.TypeName == "bool")   basic = diBuilder->createBasicType("bool", 1, DW_ATE_boolean);
@@ -2123,6 +2149,7 @@ private:
             for (size_t i = 0; i < fields.size() && i < n; ++i)
             {
                 const auto& f = fields[i];
+                if (f.IsPadding) continue;   // synthetic alignment slot: not a member
                 auto* fieldTy = st->getElementType((unsigned)i);
                 uint64_t fSize = DL.getTypeAllocSizeInBits(fieldTy);
                 uint64_t fAlign = (uint64_t)DL.getABITypeAlign(fieldTy).value() * 8;
@@ -2617,7 +2644,7 @@ private:
         for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
         {
             const auto& f = dsIt->second.StructFields[i];
-            if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield)
+            if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield || f.IsPadding)
                 continue;
             if (f.ConstArraySize > 0)
                 continue;
@@ -2679,7 +2706,7 @@ private:
         for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
         {
             const auto& f = dsIt->second.StructFields[i];
-            if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield)
+            if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield || f.IsPadding)
                 continue;
             if (f.ConstArraySize > 0)   // fixed-array members: out of scope (rare), documented
                 continue;
@@ -2924,8 +2951,8 @@ private:
         for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
         {
             const auto& f = dsIt->second.StructFields[i];
-            if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield)
-                continue;                       // pointer/view/simd/bitfield: shallow (pointee shared)
+            if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield || f.IsPadding)
+                continue;                       // pointer/view/simd/bitfield/pad: shallow (pointee shared)
             if (f.ConstArraySize > 0)
                 continue;                       // fixed-array members: out of scope (matches the dtor)
             if (!HasCopyOverloadFor(f.TypeName) && !IsOwningValueType(f.TypeName))
@@ -6962,7 +6989,7 @@ public:
     static bool IsPrimitiveTypeName(const std::string& name)
     {
         static const std::unordered_set<std::string> primitives = {
-            "int", "char", "short", "long", "bool", "void",
+            "int", "char", "short", "long", "ulong", "bool", "void",
             "float", "double",
             "i8", "i16", "i32", "i64",
             "u8", "u16", "u32", "u64",
@@ -9879,7 +9906,8 @@ public:
 
             // Synthetic bitfield storage slots (`__bfN`) are not user-visible;
             // the named bitfields they pack are emitted from sd.Bitfields below.
-            if (field.IsBitfieldStorage) continue;
+            // Synthetic `__padN` alignment slots are not user-visible either.
+            if (field.IsBitfieldStorage || field.IsPadding) continue;
 
             // Skip [Private] fields
             bool isPrivate = false;
@@ -10671,7 +10699,9 @@ public:
         if (typeName == "char" || typeName == "i8"  || typeName == "u8")  return 8;
         if (typeName == "short"|| typeName == "i16" || typeName == "u16") return 16;
         if (typeName == "int"  || typeName == "i32" || typeName == "u32") return 32;
-        if (typeName == "long" || typeName == "i64" || typeName == "u64") return 64;
+        if (typeName == "i64" || typeName == "u64") return 64;
+        // target-native C `long` / `unsigned long`
+        if (typeName == "long" || typeName == "ulong") return longBits_;
         return 0;
     }
 
@@ -10789,6 +10819,118 @@ public:
         return out;
     }
 
+    // Effective alignment of a struct FIELD's slot: the max of the type's ABI alignment,
+    // the field's own `alignas(N)`, and the field TYPE's `alignas` (an over-aligned struct
+    // used by value keeps its alignment, as in C++). A pointer to an over-aligned type is
+    // still just a pointer, so type-level over-alignment is only inherited by value fields.
+    uint64_t GetFieldSlotAlignment(const DeclTypeAndValue& f, llvm::Type* t) const
+    {
+        uint64_t a = 1;
+        if (t && t->isSized())
+            a = module->getDataLayout().getABITypeAlign(t).value();
+        if (f.UserAlignValue > a) a = f.UserAlignValue;
+        if (!f.Pointer && !f.ElemPointer && !f.IsInterface && !f.IsInterfacePointer
+            && !f.IsFunctionPointer && !f.IsArrayView)
+        {
+            auto it = dataStructures.find(f.TypeName);
+            if (it != dataStructures.end() && it->second.UserRequestedAlignment > a)
+                a = it->second.UserRequestedAlignment;
+        }
+        return a;
+    }
+
+    // True when some field of `in` needs more alignment than its LLVM type's ABI alignment
+    // (an `alignas(N)` member, or a by-value field of an over-aligned struct type).
+    bool FieldsNeedAlignmentPadding(const std::vector<DeclTypeAndValue>& in) const
+    {
+        for (const auto& f : in)
+        {
+            if (f.UserAlignValue > 1) return true;
+            if (f.Pointer || f.ElemPointer || f.IsInterface || f.IsInterfacePointer
+                || f.IsFunctionPointer || f.IsArrayView)
+                continue;
+            auto it = dataStructures.find(f.TypeName);
+            if (it != dataStructures.end() && it->second.UserRequestedAlignment > 1)
+                return true;
+        }
+        return false;
+    }
+
+    // Insert synthetic `__padN` ([N x i8]) slots so every over-aligned field starts on its
+    // required boundary. Mirrors PackBitfields: the returned vector IS the storage list the
+    // caller hands to CreateStructType, so StructFields and the LLVM element indices stay in
+    // lockstep and no CreateStructGEP site needs a semantic->storage index map.
+    //
+    // outMaxAlign receives the strictest field alignment (0 when no field is over-aligned);
+    // the caller folds it into the struct's `alignas`, which raises alignof and tail-pads
+    // sizeof to a multiple of it. Unions must NOT be padded (their body is one array).
+    //
+    // `bitfields` (the side-table from a preceding PackBitfields) is remapped in place: an
+    // inserted pad shifts the `__bfN` storage slots it precedes.
+    std::vector<DeclTypeAndValue> PadFieldsForAlignment(
+        const std::vector<DeclTypeAndValue>& in,
+        uint64_t& outMaxAlign,
+        std::vector<BitfieldInfo>* bitfields = nullptr)
+    {
+        outMaxAlign = 0;
+        if (in.empty() || !FieldsNeedAlignmentPadding(in))
+            return in;
+
+        const llvm::DataLayout& dl = module->getDataLayout();
+        std::vector<llvm::Type*> types;
+        types.reserve(in.size());
+        for (const auto& f : in)
+        {
+            llvm::Type* t = GetType(f);
+            // An unsized (opaque/incomplete) field has no layout; the struct is already
+            // ill-formed and CreateStructType reports it. Leave the field list untouched.
+            if (t == nullptr || !t->isSized())
+                return in;
+            types.push_back(t);
+        }
+
+        std::vector<DeclTypeAndValue> out;
+        out.reserve(in.size() * 2);
+        std::vector<unsigned> oldToNew(in.size(), 0);
+        uint64_t offset = 0;
+        int padIdx = 0;
+        for (size_t i = 0; i < in.size(); i++)
+        {
+            uint64_t abi  = dl.getABITypeAlign(types[i]).value();
+            uint64_t want = GetFieldSlotAlignment(in[i], types[i]);
+            if (want > outMaxAlign) outMaxAlign = want;
+
+            uint64_t natural = (offset + abi - 1) / abi * abi;
+            uint64_t target  = (offset + want - 1) / want * want;
+            if (target > natural)
+            {
+                // [N x i8] has alignment 1, so it lands exactly at `offset` and the real
+                // field that follows starts at `target` (a multiple of its own ABI align).
+                DeclTypeAndValue pad;
+                pad.TypeName       = "u8";
+                pad.VariableName   = "__pad" + std::to_string(padIdx++);
+                pad.ConstArraySize = target - offset;
+                pad.IsPadding      = true;
+                out.push_back(pad);
+                offset = target;
+            }
+            else
+            {
+                offset = natural;
+            }
+            oldToNew[i] = (unsigned)out.size();
+            out.push_back(in[i]);
+            offset += dl.getTypeAllocSize(types[i]);
+        }
+
+        if (bitfields != nullptr)
+            for (auto& bf : *bitfields)
+                if (bf.StorageFieldIndex < oldToNew.size())
+                    bf.StorageFieldIndex = oldToNew[bf.StorageFieldIndex];
+
+        return out;
+    }
+
     // Create StructType or OpaqueStruct
     //
     // Bitfield contract: if any entry in `typeAndValues` has IsBitfield=true,
@@ -10875,7 +11017,12 @@ public:
     // Creates a union type as a struct with a single [N x alignTy] body, where N and alignTy
     // are chosen to match the size and alignment of the largest/most-aligned member.
     // StructFields is preserved for metadata (field name lookup, type info).
-    llvm::StructType* CreateUnionType(std::string name, std::vector<DeclTypeAndValue> typeAndValues)
+    //
+    // `userAlign` is `alignas(N)` on the union itself; `alignas(N)` on a MEMBER folds into the
+    // same value (all union members start at offset 0, so an over-aligned member simply raises
+    // the union's alignment - no padding slot, which a union body could not carry anyway).
+    // The body is then grown to a multiple of it so getTypeAllocSize matches the padded sizeof.
+    llvm::StructType* CreateUnionType(std::string name, std::vector<DeclTypeAndValue> typeAndValues, uint64_t userAlign = 0)
     {
         uint64_t maxSize = 1;
         llvm::Align maxAlign(1);
@@ -10890,7 +11037,10 @@ public:
             llvm::Align al = module->getDataLayout().getABITypeAlign(t);
             if (sz > maxSize) maxSize = sz;
             if (al > maxAlign) maxAlign = al;
+            if (tv.UserAlignValue > userAlign) userAlign = tv.UserAlignValue;
         }
+        if (userAlign > 1)
+            maxSize = (maxSize + userAlign - 1) / userAlign * userAlign;
 
         // Pick an integer element type that satisfies maxAlign so the LLVM struct
         // inherits the correct ABI alignment (LLVM sets struct align = max(element aligns)).
@@ -10923,6 +11073,8 @@ public:
         sd.StructType = unionTy;
         sd.StructFields = typeAndValues;
         sd.IsUnion = true;
+        if (userAlign > 1)
+            sd.UserRequestedAlignment = userAlign;
         if (sd.typeDescriptor == nullptr)
         {
             sd.typeDescriptor = new llvm::GlobalVariable(
@@ -11009,7 +11161,7 @@ public:
 
             value = builder->getInt32(initValue);
         }
-        else if (typeName == "long" || typeName == "i64" || typeName == "u64")
+        else if (typeName == "long" || typeName == "ulong" || typeName == "i64" || typeName == "u64")
         {
             int initValue = 0;
             if (!initialValue.empty())
@@ -11017,7 +11169,11 @@ public:
                 initValue = std::stoi(initialValue);
             }
 
-            value = builder->getInt64(initValue);
+            // `long`/`ulong` narrow to the target's native width (32-bit on Windows/LLP64).
+            if ((typeName == "long" || typeName == "ulong") && longBits_ == 32)
+                value = builder->getInt32(initValue);
+            else
+                value = builder->getInt64(initValue);
         }
         else if (typeName == "float")
         {
@@ -12504,7 +12660,7 @@ public:
     {
         static const std::unordered_set<std::string> scalars = {
             "void", "char", "i8", "u8", "short", "i16", "u16", "int", "i32", "u32",
-            "long", "i64", "u64", "float", "double", "bool", "va_list", "auto" };
+            "long", "ulong", "i64", "u64", "float", "double", "bool", "va_list", "auto" };
         if (scalars.count(name)) return true;
         return enumBackingTypes.count(name) > 0 || typeAliases.count(name) > 0
             || interfaceTable.count(name) > 0 || dataStructures.count(name) > 0;
@@ -12581,7 +12737,10 @@ public:
         else if (resolvedTypeName == "char" || resolvedTypeName == "i8" || resolvedTypeName == "u8") { type = builder->getInt8Ty(); }
         else if (resolvedTypeName == "short" || resolvedTypeName == "i16" || resolvedTypeName == "u16") { type = builder->getInt16Ty(); }
         else if (resolvedTypeName == "int" || resolvedTypeName == "i32" || resolvedTypeName == "u32") { type = builder->getInt32Ty(); }
-        else if (resolvedTypeName == "long" || resolvedTypeName == "i64" || resolvedTypeName == "u64") { type = builder->getInt64Ty(); }
+        else if (resolvedTypeName == "i64" || resolvedTypeName == "u64") { type = builder->getInt64Ty(); }
+        // `long`/`ulong` are the target's native C long: i32 on Windows (LLP64), i64 on LP64.
+        else if (resolvedTypeName == "long" || resolvedTypeName == "ulong")
+            { type = (longBits_ == 32) ? builder->getInt32Ty() : builder->getInt64Ty(); }
         else if (resolvedTypeName == "float") { type = builder->getFloatTy(); }
         else if (resolvedTypeName == "double") { type = builder->getDoubleTy(); }
         else if (resolvedTypeName == "bool") { type = builder->getInt1Ty(); }

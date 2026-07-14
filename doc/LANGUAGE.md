@@ -87,6 +87,12 @@
 
 Standard C primitives are all supported: `int`, `char`, `short`, `long`, `float`, `double`, `bool`, `void`.
 
+`long` follows the native C ABI of the **target** platform, exactly as a C compiler would:
+32-bit on Windows (LLP64) and on 32-bit targets, 64-bit on macOS/Linux (LP64). `ulong` is its
+unsigned counterpart. `int` is always 32-bit and `long long` is always 64-bit on every target.
+Use `i64`/`u64` when a fixed 64-bit width is wanted regardless of target; use `long`/`ulong`
+only to match a C API that is declared with C's `long` (for example `strtol`, `labs`).
+
 ### Explicit-Width Integers
 
 CFlat provides fixed-width integer types as first-class names:

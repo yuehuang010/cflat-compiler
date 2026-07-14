@@ -1,0 +1,29 @@
+// `as` between two unrelated CONCRETE class pointers must be rejected at compile time.
+// A concrete object carries no vtable/typedesc header, so there is nothing to check at
+// runtime: the old lowering loaded field 0 as a vtable and dereferenced it, segfaulting.
+// There is no inheritance between concrete classes, so this can never be meaningful.
+
+interface IW
+{
+    int id();
+};
+
+class W : IW
+{
+    int n = default;
+    int id() { return 8; }
+};
+
+class V : IW
+{
+    int m = default;
+    int id() { return 9; }
+};
+
+extern int main()
+{
+    W* w = new W();
+    expect_error("cannot cast 'W' to unrelated type 'V'");
+    V* v = w as V;
+    return 0;
+}

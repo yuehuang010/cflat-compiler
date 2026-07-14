@@ -481,6 +481,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // triple, struct ABI, and va_list lowering off targetArm64_.
     targetMacOS_ = (platformOption == "macos" || platformOption == "macos-arm64");
     targetArm64_ = targetMacOS_;
+    // `long` follows the target's C ABI: 32-bit on Windows (LLP64) / win32, 64-bit on LP64.
+    SetTargetLongWidth(targetWindows_, platformValue);
     if (verbose) std::cout << std::format("[verbose] __PLATFORM__ = {}, __WINDOWS__ = {}, __MACOS__ = {}, arm64 = {}\n",
                                           platformValue, targetWindows_ ? 1 : 0,
                                           targetMacOS_ ? 1 : 0, targetArm64_ ? 1 : 0);
@@ -3878,8 +3880,11 @@ static llvm::json::Object SerializeDtav(const DTAV& d)
         o["bfw"]  = static_cast<int64_t>(d.BitWidth);
         o["bfo"]  = static_cast<int64_t>(d.BitOffset);
         o["bfsi"] = static_cast<int64_t>(d.StorageFieldIndex);
-        if (d.IsBitfieldStorage) o["bfs"] = true;
     }
+    // Synthetic slots: the storage slot itself has IsBitfield=false, so both flags are
+    // written outside the bitfield block or they would not round-trip.
+    if (d.IsBitfieldStorage) o["bfs"] = true;
+    if (d.IsPadding)         o["pad"] = true;
     if (d.UserAlignValue > 0) o["ua"] = static_cast<int64_t>(d.UserAlignValue);
     if (!d.Annotations.empty()) o["ann"] = SerializeAnnotations(d.Annotations);
     return o;
@@ -3897,8 +3902,9 @@ static DTAV DeserializeDtav(const llvm::json::Object& o)
         if (auto w = o.getInteger("bfw"))  d.BitWidth = static_cast<unsigned>(*w);
         if (auto w = o.getInteger("bfo"))  d.BitOffset = static_cast<unsigned>(*w);
         if (auto w = o.getInteger("bfsi")) d.StorageFieldIndex = static_cast<unsigned>(*w);
-        if (auto w = o.getBoolean("bfs"))  d.IsBitfieldStorage = *w;
     }
+    if (auto v = o.getBoolean("bfs")) d.IsBitfieldStorage = *v;
+    if (auto v = o.getBoolean("pad")) d.IsPadding = *v;
     if (auto v = o.getInteger("ua")) d.UserAlignValue = static_cast<uint64_t>(*v);
     d.Annotations = DeserializeAnnotations(o.getArray("ann"));
     return d;
@@ -4010,6 +4016,8 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
     // macos / macos-arm64 mirror the normal-compile setup in Init(): POSIX, arm64.
     targetMacOS_ = (platform == "macos" || platform == "macos-arm64");
     targetArm64_ = targetMacOS_;
+    // Core bitcode is per-platform (core_<platform>.bc), so `long` must use this target's width.
+    SetTargetLongWidth(targetWindows_, platformValue);
 
     // Reinitialize the LLVM module with the correct platform data layout BEFORE
     // RegisterBuiltinString creates pointer types, so %string fields have the right size.
