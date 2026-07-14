@@ -381,4 +381,5 @@ FodyWeavers.xsd
 build/
 out-linux/
 /.scratch/
+/scratch/
 .claude/settings.local.json

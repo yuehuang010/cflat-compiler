@@ -13,6 +13,10 @@ Keep `master` linear: every commit on `master` must have a single parent.  Do no
 ## Dependencies
 Do not modify the root `./vcpkg.json` without explicit permission.
 
+## Scratch Directory
+
+Use the repo-root `scratch/` folder for ALL temporary files - throwaway `.cb` repros, scratch scripts, intermediate outputs, compiled binaries used for one-off checks. Do not use the system temp directory or the session scratchpad; keeping temp files in `scratch/` makes them easy to inspect and clean up. `scratch/` is gitignored, and files there are never picked up by `test.bat` / `example.bat` wildcards.
+
 ## Agent Delegation: Cost vs Intelligence
 
 The main session runs on the most expensive model tier. Implementation work should be delegated to a subagent (Agent tool) at the cheapest tier that can do the job reliably; the main session plans, coordinates, and reviews the results.
