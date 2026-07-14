@@ -4047,28 +4047,44 @@ private:
                 cTypedefMap_.emplace(t.name, t.underlying);
     }
 
+    // Surface a C typedef that names a record as a CFlat type alias. Two shapes:
+    //   by value  `typedef struct tagMSG MSG;`            -> MSG            = tagMSG
+    //   handle    `typedef struct CGColorSpace *CGColorSpaceRef;` -> CGColorSpaceRef = CGColorSpace*
+    // The handle form is the C opaque-pointer idiom: the tag is often only forward-declared, which
+    // RegisterCRecords registers as an opaque shell, so the alias binds even with no struct body.
+    // Requiring the tag to be a registered record keeps both shapes confined to the bound header's
+    // own types. Trailing stars stay in the target string - GetType peels them into pointer depth.
     void CollectRecordTypedefAliases(const cflat_cinterop::ExtractResult& raw,
                                      std::vector<std::pair<std::string, std::string>>& out)
     {
-        auto trim = [](std::string& x) {
-            size_t a = x.find_first_not_of(" \t");
-            size_t b = x.find_last_not_of(" \t");
-            x = (a == std::string::npos) ? std::string{} : x.substr(a, b - a + 1);
-        };
+        static const std::unordered_set<std::string> qualifiers = {
+            "const", "volatile", "restrict", "__restrict", "__restrict__",
+            "_Nonnull", "_Nullable", "_Null_unspecified", "struct", "union" };
         for (const auto& t : raw.typedefs)
         {
             if (t.name.empty() || t.underlying.empty() || t.name == t.underlying) continue;
-            if (t.underlying.find('*') != std::string::npos) continue;   // pointer typedef (LPMSG)
+            if (t.underlying.find('(') != std::string::npos) continue;   // function pointer typedef
             if (t.underlying.find('[') != std::string::npos) continue;   // array typedef
-            std::string tag = t.underlying;
-            trim(tag);
-            if (tag.rfind("const ", 0) == 0)    { tag.erase(0, 6); trim(tag); }
-            if (tag.rfind("struct ", 0) == 0)   tag.erase(0, 7);
-            else if (tag.rfind("union ", 0) == 0) tag.erase(0, 6);
-            trim(tag);
-            if (tag.empty() || tag == t.name) continue;
+
+            // Split off the pointer depth, then tokenize what remains: the tag is the one word
+            // left after dropping cv/nullability qualifiers and the struct/union keyword.
+            std::string spelling = t.underlying;
+            int ptr = (int)std::count(spelling.begin(), spelling.end(), '*');
+            if (ptr > 2) continue;   // TypeAndValue carries at most two pointer levels
+            std::replace(spelling.begin(), spelling.end(), '*', ' ');
+
+            std::string tag;
+            bool ambiguous = false;
+            std::istringstream words(spelling);
+            for (std::string w; words >> w; )
+            {
+                if (qualifiers.count(w)) continue;
+                if (!tag.empty()) { ambiguous = true; break; }   // compound spelling we do not model
+                tag = w;
+            }
+            if (ambiguous || tag.empty() || tag == t.name) continue;
             if (dataStructures.find(tag) == dataStructures.end()) continue;  // not a registered record
-            out.emplace_back(t.name, tag);
+            out.emplace_back(t.name, tag + std::string(ptr, '*'));
         }
     }
 
@@ -4091,7 +4107,11 @@ private:
             {
                 std::string file;
                 int line = 0, col = 0;
-                if (const SymbolDef* td = s->Lookup(target))
+                // A handle alias carries pointer stars (CGColorSpaceRef -> CGColorSpace*); the
+                // symbol index is keyed on the bare tag, so peel them before looking it up.
+                std::string targetTag = target;
+                while (!targetTag.empty() && targetTag.back() == '*') targetTag.pop_back();
+                if (const SymbolDef* td = s->Lookup(targetTag))
                 {
                     file = td->file;
                     line = td->line;
@@ -4103,18 +4123,24 @@ private:
         }
     }
 
-    // Keep the transitive closure of in-scope records over their by-value field deps.
-    // Dropping a by-value dependency causes the in-scope struct to fail to size (cascades, e.g. MSG/WNDCLASSEXA).
-    void PruneRecordsToNeededClosure(std::vector<cflat_cinterop::RawRecord>& records)
+    // Keep the transitive closure of in-scope records over their by-value field deps, plus any
+    // record referenced BY VALUE from an in-scope function signature or global variable (e.g.
+    // CGRect/CGPoint: defined in a sibling out-of-scope header, but named by CGRectGetMinX's
+    // param/return types). raw.sigs/enums/globals are already scope-filtered at extraction time
+    // (LocOf in CClangExtract.cpp drops out-of-scope decls), so seeding from them cannot pull in
+    // unrelated system structs - unlike records, which are collected regardless of scope.
+    void PruneRecordsToNeededClosure(cflat_cinterop::ExtractResult& raw)
     {
+        std::vector<cflat_cinterop::RawRecord>& records = raw.records;
+
         // Last definition wins on a duplicate tag (forward decls are not definitions, so this is
         // rare); the index just needs to resolve a referenced tag to some record we can keep.
         std::unordered_map<std::string, size_t> byName;
         for (size_t i = 0; i < records.size(); ++i)
             if (!records[i].name.empty()) byName[records[i].name] = i;
 
-        // Extract the by-value dependency tag from a field type spelling.
-        // Pointer fields are pointer-sized regardless of pointee registration, so skip them.
+        // Extract the by-value dependency tag from a type spelling (field, param, return, or
+        // global var). Pointer types are pointer-sized regardless of pointee registration, so skip them.
         auto byValueDep = [](const std::string& ctype) -> std::string {
             if (ctype.find('*') != std::string::npos) return {};   // pointer: no sizing dependency
             std::string s = ctype;
@@ -4142,6 +4168,21 @@ private:
         std::vector<size_t> work;
         for (size_t i = 0; i < records.size(); ++i)
             if (records[i].inScope) { needed[i] = true; work.push_back(i); }
+
+        auto seed = [&](const std::string& ctype) {
+            std::string dep = byValueDep(ctype);
+            if (dep.empty()) return;
+            auto it = byName.find(dep);
+            if (it == byName.end() || needed[it->second]) return;
+            needed[it->second] = true;
+            work.push_back(it->second);
+        };
+        for (const auto& sig : raw.sigs)
+        {
+            seed(sig.retType);
+            for (const auto& pt : sig.paramTypes) seed(pt);
+        }
+        for (const auto& g : raw.globals) seed(g.ctype);
 
         while (!work.empty())
         {
@@ -4344,7 +4385,7 @@ private:
         // closure so dependency structs (e.g. POINT for MSG) are included but unrelated ones aren't.
         {
             llvm::TimeTraceScope recordScope("RegisterCRecords", headerPath);
-            PruneRecordsToNeededClosure(raw.records);
+            PruneRecordsToNeededClosure(raw);
             MapRawRecords(raw, outRecords);
             RegisterCRecords(outRecords, headerPath);
             // Surface `typedef struct Tag {...} Name;` as Name -> Tag aliases now that the tags
@@ -4436,6 +4477,8 @@ private:
         }
         {
             llvm::TimeTraceScope recordScope("RegisterCRecords", cSourcePath);
+            // No prune here: the .c path has no scope filter, so every top-level record is wanted.
+            // Pruning would drop the synthesized nested records (inScope=false) a pointer field names.
             MapRawRecords(raw, outRecords);
             RegisterCRecords(outRecords, cSourcePath);
         }
@@ -15353,7 +15396,14 @@ public:
         // field and left the enclosing record an incomplete shell.
         // v8 records each C function's own declaring header (CSigEntry.file) so
         // go-to-definition lands on the real prototype, not the imported umbrella header.
-        if (version != 8) return false;
+        // v9 adopts pointer-to-record typedefs as handle aliases (CGColorSpaceRef ->
+        // CGColorSpace*); a v8 entry's recordAliases dropped every one of them.
+        // v10 also seeds the needed-record closure from in-scope function-signature and
+        // global-variable by-value types, not just in-scope record fields; a v9 entry cached
+        // the narrower record set, so CGPoint/CGRect-style signature-only dependency records
+        // (defined in a sibling out-of-scope header, named only by a function's params/return)
+        // would still be missing.
+        if (version != 10) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -15415,7 +15465,7 @@ public:
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 8;
+        j["version"] = 10;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
 

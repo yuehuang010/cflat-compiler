@@ -210,4 +210,10 @@ ML_BinaryOp ml_pick_op(int which);
  * No library symbol is involved - it is purely a type. */
 typedef struct ML_Opaque ML_Opaque;
 
+/* The `Ref` form of the same idiom - a typedef of a POINTER to the opaque tag
+ * (CoreGraphics' CGColorSpaceRef, Win32's HWND). The alias must bind as a usable
+ * pointer type (ML_OpaqueRef = ML_Opaque*); it previously dropped, so the name did
+ * not resolve at all and callers had to spell the handle void*. Purely a type. */
+typedef struct ML_Opaque *ML_OpaqueRef;
+
 #endif /* MATHLIB_H */

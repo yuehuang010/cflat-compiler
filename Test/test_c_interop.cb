@@ -522,6 +522,19 @@ extern int main()
     oh = (ML_Opaque*)ohv;                        // and back via cast
     if (oh != nullptr)                           return 220;
 
+    // The `Ref` form: `typedef struct ML_Opaque *ML_OpaqueRef;` - a typedef whose
+    // target is a POINTER to the opaque tag (CGColorSpaceRef / HWND). It must bind as
+    // an alias for ML_Opaque*; the alias-adoption pass used to drop every pointer
+    // typedef, so the name did not resolve at all. Auto-externed C signatures still
+    // spell such handles void*, so the alias has to convert both ways with no cast:
+    // `h` below is a real (non-null) handle from Section K's c_get_handle().
+    ML_OpaqueRef oref = h;                       // void* from C -> handle alias
+    if (oref == nullptr)                         return 221;
+    ML_Opaque* obk = oref;                       // alias and its target are one type
+    void* obv = oref;                            // and it still decays back to void*
+    if (obk != obv)                              return 222;
+    if (c_handle_load(oref) != 0x5A5A5A5A)       return 223;   // passes to a void* param
+
     // ---- Section T: C function-pointer struct fields + typed struct pointers -
     // cinterop.c's CbVtbl is a struct of function pointers (a mini COM vtable) and
     // CbObj.vtbl points at it. The C-fn-ptr fields must import as callable thin

@@ -27,7 +27,9 @@ extern int main()
     printf("PASS: CFAbsoluteTimeGetCurrent = %f\n", now);
 
     // Auto-externed CoreGraphics C functions - no hand-written prototype above.
-    void* cs = CGColorSpaceCreateDeviceRGB();
+    // CGColorSpaceRef is the header's own handle typedef (`typedef struct CGColorSpace
+    // *CGColorSpaceRef;`), bound as an alias for the opaque CGColorSpace*.
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     if (cs == nullptr)
     {
         printf("FAIL: CGColorSpaceCreateDeviceRGB returned null\n");
@@ -41,5 +43,31 @@ extern int main()
         return 1;
     }
     printf("PASS: CGColorSpaceGetNumberOfComponents(deviceRGB) = %u\n", components);
+
+    // S4: CGPoint/CGRect by value - a struct-by-value dependency pulled in solely from a
+    // function signature (CGRectGetWidth etc. take/return CGRect/CGPoint by value, but the
+    // structs are defined in CoreFoundation/CFCGTypes.h, outside the CoreGraphics scope dirs).
+    // Also exercises arm64's HFA (homogeneous float aggregate) by-value ABI for CGRect.
+    CGRect r = default;
+    r.origin.x = 1.0;
+    r.origin.y = 2.0;
+    r.size.width = 30.0;
+    r.size.height = 40.0;
+    CGPoint pt = default;
+    pt.x = 5.0;
+    pt.y = 6.0;
+    if (CGRectGetWidth(r) != 30.0 || CGRectGetHeight(r) != 40.0 || CGRectGetMinX(r) != 1.0)
+    {
+        printf("FAIL: CGRect geometry mismatch (w=%f h=%f x=%f)\n",
+               CGRectGetWidth(r), CGRectGetHeight(r), CGRectGetMinX(r));
+        return 1;
+    }
+    if (!CGRectContainsPoint(r, pt))
+    {
+        printf("FAIL: CGRectContainsPoint returned false\n");
+        return 1;
+    }
+    printf("PASS: CGRect w=%f h=%f x=%f, CGRectContainsPoint = true\n",
+           CGRectGetWidth(r), CGRectGetHeight(r), CGRectGetMinX(r));
     return 0;
 }
