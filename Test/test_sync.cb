@@ -10,6 +10,7 @@ import "spsc_queue.cb";
 import "barrier.cb";
 import "intrinsic.cb";
 import "hpc/olock.cb";
+import "time.cb";
 
 // ---------------------------------------------------------------------------
 // Thread tests
@@ -1590,12 +1591,24 @@ struct OlockReaderCtx {
     // Reads a writer invalidated. Must stay > 0 or the readers never raced the writer
     // and the whole test is vacuous - a seqlock that never retries proves nothing.
     atomic_counter* invalid    = nullptr;
-    int             iterations = 0;
+    // Set by the writer once it is done (either it observed an invalidation or hit its
+    // iteration cap). Readers spin until this is set rather than a fixed iteration count,
+    // so they cannot stop racing before the writer does.
+    atomic_counter* done       = nullptr;
+    i64             maxLoops   = 0;  // safety cap so a stuck done flag cannot hang the test
 };
 
 struct OlockWriterCtx {
-    OlockPair* pair       = nullptr;
-    int        iterations = 0;
+    OlockPair*      pair       = nullptr;
+    int             iterations = 0;  // baseline write count
+    // Wall-clock cap (ms) once chasing an invalidation, not an iteration cap: under
+    // heavy scheduler contention the writer alone can burn through any fixed iteration
+    // budget before a starved reader thread ever gets scheduled, which would stop the
+    // writer (and unblock readers via `done`) before a race was ever possible.
+    i64             capMillis  = 0;
+    atomic_counter* invalid    = nullptr;
+    atomic_counter* done       = nullptr;
+    int             actualIterations = 0;  // out: writes actually applied
 };
 
 // Speculative read with no lock: snapshot, read both fields, validate. A
@@ -1604,8 +1617,8 @@ struct OlockWriterCtx {
 // consistency, which is the property the seqlock exists to guarantee.
 int olockReaderWorker(void* ctx) {
     OlockReaderCtx* rc = (OlockReaderCtx*)ctx;
-    int i = 0;
-    while (i < rc->iterations) {
+    i64 loops = 0;
+    while (rc->done->read() == 0 && loops < rc->maxLoops) {
         i64 v  = rc->pair->ver.read_begin();
         i64 ra = rc->pair->a;
         i64 rb = rc->pair->b;
@@ -1619,21 +1632,29 @@ int olockReaderWorker(void* ctx) {
         } else {
             rc->invalid->increment();
         }
-        i = i + 1;
+        loops = loops + 1;
     }
     return 0;
 }
 
+// Writes at least `iterations` times, then - if no reader has reported an
+// invalidation yet - keeps writing until one does, bounded by a wall-clock cap.
+// This is what makes "the race is real" deterministic instead of hoping a
+// fixed iteration count happens to overlap a reader.
 int olockWriterWorker(void* ctx) {
     OlockWriterCtx* wc = (OlockWriterCtx*)ctx;
+    Timer capTimer;
+    capTimer.start(wc->capMillis);
     int i = 0;
-    while (i < wc->iterations) {
+    while (i < wc->iterations || (wc->invalid->read() == 0 && !capTimer.isExpired())) {
         lock (wc->pair->ver) {
             wc->pair->a = wc->pair->a + 1;
             wc->pair->b = wc->pair->b + 1;
         }
         i = i + 1;
     }
+    wc->actualIterations = i;
+    wc->done->store(1);
     return 0;
 }
 
@@ -1649,10 +1670,15 @@ bool testOlockConcurrentReadersWriter() {
     atomic_counter consistent;
     atomic_counter torn;
     atomic_counter invalid;
+    atomic_counter done;
 
-    int numReaders   = 4;
-    int readerIters  = 20000;
-    int writerIters  = 20000;
+    int numReaders    = 4;
+    int writerIters   = 20000;
+    // Generous wall-clock cap: bounded by time, not iterations, so a starved writer
+    // sharing the box with other parallel test processes still gets a real chance to
+    // race a (possibly equally starved) reader before giving up.
+    i64 writerCapMillis = 15000;
+    i64 readerMaxLoops  = 2000000000;
 
     Thread*          readerThreads = new Thread[numReaders];
     OlockReaderCtx*  readerCtxs    = new OlockReaderCtx[numReaders];
@@ -1663,7 +1689,8 @@ bool testOlockConcurrentReadersWriter() {
         readerCtxs[i].consistent = &consistent;
         readerCtxs[i].torn       = &torn;
         readerCtxs[i].invalid    = &invalid;
-        readerCtxs[i].iterations = readerIters;
+        readerCtxs[i].done       = &done;
+        readerCtxs[i].maxLoops   = readerMaxLoops;
         readerThreads[i].start(olockReaderWorker, &readerCtxs[i]);
         i = i + 1;
     }
@@ -1671,6 +1698,9 @@ bool testOlockConcurrentReadersWriter() {
     OlockWriterCtx writerCtx;
     writerCtx.pair       = &pair;
     writerCtx.iterations = writerIters;
+    writerCtx.capMillis  = writerCapMillis;
+    writerCtx.invalid    = &invalid;
+    writerCtx.done       = &done;
     Thread writerThread;
     writerThread.start(olockWriterWorker, &writerCtx);
 
@@ -1681,14 +1711,15 @@ bool testOlockConcurrentReadersWriter() {
     result &= Test("olock concurrent: no torn reads observed", (int)torn.read(), 0);
     result &= Test("olock concurrent: some reads were validated",
                     (int)(validReads.read() > 0), 1);
-    // Without this the test is vacuous: if no read ever raced the writer, every read
-    // validates, torn stays 0, and the seqlock was never exercised. Measured ~33% here.
+    // The writer keeps writing past its baseline iteration count (bounded by
+    // writerCapMillis) until a reader reports an invalidation, so this is no longer
+    // a statistical hope: it fails only if the cap above is genuinely exhausted.
     result &= Test("olock concurrent: some reads were invalidated (the race is real)",
                     (int)(invalid.read() > 0), 1);
     result &= Test("olock concurrent: consistent reads == valid reads",
                     (int)(consistent.read() == validReads.read()), 1);
     result &= Test("olock concurrent: writer applied all increments",
-                    (int)pair.a, writerIters);
+                    (int)pair.a, writerCtx.actualIterations);
     result &= Test("olock concurrent: final a == b", (int)(pair.a == pair.b), 1);
 
     delete[_] readerThreads;

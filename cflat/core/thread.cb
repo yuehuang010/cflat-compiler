@@ -41,9 +41,40 @@ struct __FEnvArm64 {
 };
 int __FPCR_FLUSH_TO_ZERO = 0x01000000;   // FPCR.FZ
 
+// Linux x86-64 equivalent of MXCSR: glibc's fenv_t (bits/fenv.h) is a 32-byte
+// struct whose last word is __mxcsr, at byte offset 28. Same fegetenv/fesetenv
+// round-trip shape as Darwin, just against this larger, differently-laid-out
+// struct - it is NOT __FEnvArm64.
+struct __FEnvLinuxX64 {
+    u16 controlWord = default;
+    u16 reserved1 = default;
+    u16 statusWord = default;
+    u16 reserved2 = default;
+    u16 tags = default;
+    u16 reserved3 = default;
+    u32 eip = default;
+    u16 csSelector = default;
+    u16 opcodeAndReserved = default;
+    u32 dataOffset = default;
+    u16 dataSelector = default;
+    u16 reserved5 = default;
+    u32 mxcsr = default;             // offset 28 (6*2 + 4 + 2*2 + 4 + 2*2 = 28)
+};
+
+// MXCSR bits (Linux x86-64 can trap, unlike Apple silicon).
+int __MXCSR_FLUSH_TO_ZERO      = 0x8000;  // FTZ, bit 15
+int __MXCSR_DENORMALS_ARE_ZERO = 0x0040;  // DAZ, bit 6
+int __MXCSR_MASK_INVALID       = 0x0080;  // exception-mask bit 7
+int __MXCSR_MASK_DIVZERO       = 0x0200;  // exception-mask bit 9
+int __MXCSR_MASK_OVERFLOW      = 0x0400;  // exception-mask bit 10
+int __MXCSR_MASK_ALL           = 0x1F80;  // bits 7-12: invalid|denorm|divzero|overflow|underflow|precision
+
 if const (__MACOS__) {
     extern int fegetenv(__FEnvArm64* env);
     extern int fesetenv(__FEnvArm64* env);
+} else if const (__LINUX__) {
+    extern int fegetenv(__FEnvLinuxX64* env);
+    extern int fesetenv(__FEnvLinuxX64* env);
 }
 
 // Apply an FP config to the CURRENT thread. No-op when cfg == 0.
@@ -68,8 +99,26 @@ void __fp_apply(int cfg) {
             env.fpcr = env.fpcr | (u64)__FPCR_FLUSH_TO_ZERO;
             fesetenv(&env);
         }
+    } else if const (__LINUX__) {
+        // Linux x86 can trap: unmasking a bit (clearing it) enables that trap.
+        __FEnvLinuxX64 env = default;
+        fegetenv(&env);
+        u32 mxcsr = env.mxcsr;
+        if ((cfg & FP_TRAP_INVALID) != 0) {
+            mxcsr = mxcsr & ~(u32)__MXCSR_MASK_INVALID;
+        }
+        if ((cfg & FP_TRAP_DIVZERO) != 0) {
+            mxcsr = mxcsr & ~(u32)__MXCSR_MASK_DIVZERO;
+        }
+        if ((cfg & FP_TRAP_OVERFLOW) != 0) {
+            mxcsr = mxcsr & ~(u32)__MXCSR_MASK_OVERFLOW;
+        }
+        if ((cfg & FP_FLUSH_DENORMALS) != 0) {
+            mxcsr = mxcsr | (u32)__MXCSR_FLUSH_TO_ZERO | (u32)__MXCSR_DENORMALS_ARE_ZERO;
+        }
+        env.mxcsr = mxcsr;
+        fesetenv(&env);
     }
-    // Linux: per-thread FP env control (x86 MXCSR via fenv) not yet ported - no-op.
 }
 
 // Enable the given trap mask on the current thread (e.g. FP_TRAP_DEFAULT).
@@ -82,8 +131,14 @@ void fp_disable_traps() {
     if const (__WINDOWS__) {
         u32 cur = 0;
         _controlfp_s(&cur, (u32)_MCW_EM, (u32)_MCW_EM);
+    } else if const (__LINUX__) {
+        // Re-mask all FP exceptions (restore the non-trapping default).
+        __FEnvLinuxX64 env = default;
+        fegetenv(&env);
+        env.mxcsr = env.mxcsr | (u32)__MXCSR_MASK_ALL;
+        fesetenv(&env);
     }
-    // POSIX: no-op until the FP env is ported.
+    // macOS: no-op - Apple silicon does not implement FP exception traps.
 }
 
 // Heap packet handed to the borrow-overload entry; carries fn, ctx, and env.

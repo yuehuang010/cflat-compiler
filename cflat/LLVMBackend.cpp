@@ -2373,6 +2373,25 @@ void LLVMBackend::ResetForReanalysis()
     // stale-pointer crash class as fullDestructorCache_), so discard them with the module.
     deferredFullDtor_.clear();
     deferredFullDtorOrder_.clear();
+    // [winrt] classes and projected delegates cache module-bound objects: WinrtClassInfo holds
+    // the static vtable GlobalVariable* (and its StructType*), and the delegate maps hold the
+    // COM object StructType* + vtable GlobalVariable*. If these survive the reset, a file that
+    // forward-references a [winrt] class (e.g. `new Counter` in a method emitted before the
+    // Counter class's EmitWinrtRuntime runs) reads the prior analysis's dangling vtable global
+    // and crashes bitcasting a freed Value - the non-deterministic LSP bulk-sweep segfault.
+    winrtClasses.clear();
+    winrtDelegateObjTy_.clear();
+    winrtDelegateVtbl_.clear();
+    winrtSlotHResultType_.clear();
+    // Consume-side (imported .winmd) bookkeeping is re-derived on the next analysis's imports;
+    // clear it here so it does not accumulate stale entries across files (importedFiles below).
+    winrtEnumUnderlying_.clear();
+    winrtValueStructs_.clear();
+    winrtGenericTemplates_.clear();
+    winrtInstanceIid_.clear();
+    winrtThinInterfaces_.clear();
+    winrtConsumedModel_ = cflat_winmd::Model{};
+    winrtConsumedLspFile_.clear();
     programTable.clear();
     enumBackingTypes.clear();
     typeAliases.clear();
