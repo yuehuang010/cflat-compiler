@@ -575,6 +575,48 @@ static bool ComputeReturnsOwned(const LLVMBackend::DeclTypeAndValue& returnType,
     return false;
 }
 
+// Canonical form of a lock expression's source text. Lock-set membership is compared as
+// strings, so 'p->m' and 'p.m' must canonicalize identically: arrow becomes dot, then the
+// trailing rwlock '.read' / '.write' mode suffix is stripped. Used by every lock capture site
+// (lock statement, lock clause, positional lock group) in BOTH passes so they agree.
+inline std::string NormalizeLockText(const std::string& text)
+{
+    std::string out;
+    out.reserve(text.size());
+    for (size_t i = 0; i < text.size(); )
+    {
+        if (text[i] == '-' && i + 1 < text.size() && text[i + 1] == '>')
+        {
+            out += '.';
+            i += 2;
+        }
+        else
+        {
+            out += text[i];
+            i++;
+        }
+    }
+    if (out.ends_with(".read"))
+        out.resize(out.size() - 5);
+    else if (out.ends_with(".write"))
+        out.resize(out.size() - 6);
+    return out;
+}
+
+// Returns "read", "write", or "" (exclusive) for a raw lock expression's source text.
+inline std::string LockTextMode(const std::string& text)
+{
+    // Arrow-normalize first so 'p->rw.read' (and 'rw->read') still detect the mode suffix.
+    std::string dotted = text;
+    for (size_t i = 0; (i = dotted.find("->", i)) != std::string::npos; )
+        dotted.replace(i, 2, ".");
+    if (dotted.ends_with(".read"))
+        return "read";
+    if (dotted.ends_with(".write"))
+        return "write";
+    return "";
+}
+
 // ForwardRefScanner performs a lightweight pre-pass over the AST to register
 // all function signatures and struct type shells before the main code-gen walk.
 // This allows functions and types to be used before their definition in source.
@@ -904,7 +946,7 @@ private:
             if (auto* lockClauseCtx = func->lockClause())
             {
                 for (auto* exprCtx : lockClauseCtx->lockArgList()->expression())
-                    locks.push_back(exprCtx->getText());
+                    locks.push_back(NormalizeLockText(exprCtx->getText()));
             }
             for (const auto& extra : extraRequiredLocks)
                 locks.push_back(extra);
@@ -1189,12 +1231,8 @@ private:
         {
             auto groupArgs = lfg->lockClause()->lockArgList()->expression();
             if (groupArgs.empty()) continue;
-            std::string guardianName = groupArgs[0]->getText();
-            // Strip .read/.write rwlock suffix (same logic as GetLockArgCanonical in MainListener).
-            if (guardianName.ends_with(".read"))
-                guardianName.resize(guardianName.size() - 5);
-            else if (guardianName.ends_with(".write"))
-                guardianName.resize(guardianName.size() - 6);
+            // Same canonicalization as GetLockArgCanonical in MainListener (both passes must agree).
+            std::string guardianName = NormalizeLockText(groupArgs[0]->getText());
             // Qualify bare names to "this.<name>" so call-site substitution works.
             std::string qualifiedLock = (guardianName.find('.') == std::string::npos)
                                         ? ("this." + guardianName) : guardianName;
@@ -5104,7 +5142,7 @@ public:
                 std::string acquireMethod;
                 std::string releaseMethod;
                 std::string typeName;
-                llvm::Value* storage = nullptr;
+                llvm::Value* mutexPtr = nullptr; // address release() is called on - the mutex itself
             };
             std::vector<AcquiredLock> acquired;
 
@@ -5160,6 +5198,12 @@ public:
                     return;
                 }
 
+                // For a pointer lock arg (mutex*), Storage is the address of the pointer field
+                // (mutex**); releasing that would unlock the wrong address and leak the lock forever.
+                llvm::Value* mutexPtr = mutexNV.Storage;
+                if (mutexNV.TypeAndValue.Pointer)
+                    mutexPtr = compiler->CreateLoad(compiler->builder->getPtrTy(), mutexNV.Storage);
+
                 // Call acquire / acquire_read.
                 LLVMBackend::NamedVariable selfArg = mutexNV;
                 selfArg.TypeAndValue.VariableName = "";
@@ -5178,7 +5222,7 @@ public:
                     return;
                 }
 
-                acquired.push_back({ canonical, acquireMethod, releaseMethod, mutexTypeName, mutexNV.Storage });
+                acquired.push_back({ canonical, acquireMethod, releaseMethod, mutexTypeName, mutexPtr });
             }
 
             // Push lock scope - only supports single-mutex cleanup via StackState today.
@@ -5188,7 +5232,7 @@ public:
             {
                 compiler->stackNamedVariable.back().lockCleanup = LLVMBackend::StackState::LockCleanup{
                     .UnlockFn = FindMethodOf(acquired[0].releaseMethod, acquired[0].typeName),
-                    .MutexPtr = acquired[0].storage,
+                    .MutexPtr = acquired[0].mutexPtr,
                 };
             }
 
@@ -17678,32 +17722,23 @@ public:
     }
 
     // Extract the canonical lock expression text from a single lock arg expression.
-    // Strips a trailing '.read' or '.write' soft-keyword suffix and returns the base.
+    // Normalizes '->' to '.' and strips a trailing '.read' / '.write' soft-keyword suffix.
     // The mode suffix is handled by the caller via GetLockArgMode().
     std::string GetLockArgCanonical(CFlatParser::ExpressionContext* expr)
     {
-        return StripLockModeSuffix(expr->getText());
+        return NormalizeLockText(expr->getText());
     }
 
     // Returns "read", "write", or "" (mutex / default exclusive) for the lock arg expression.
     std::string GetLockArgMode(CFlatParser::ExpressionContext* expr)
     {
-        std::string text = expr->getText();
-        if (text.ends_with(".read"))
-            return "read";
-        if (text.ends_with(".write"))
-            return "write";
-        return "";
+        return LockTextMode(expr->getText());
     }
 
-    // Strip ".read" / ".write" rwlock mode suffix from a raw lock string.
+    // Canonicalize a raw lock string ('->' to '.', drop the rwlock mode suffix).
     static std::string StripLockModeSuffix(const std::string& text)
     {
-        if (text.ends_with(".read"))
-            return text.substr(0, text.size() - 5);
-        if (text.ends_with(".write"))
-            return text.substr(0, text.size() - 6);
-        return text;
+        return NormalizeLockText(text);
     }
 
     // Verify that the current lock-set satisfies the RequiredLocks of the function just called.

@@ -1182,6 +1182,48 @@ bool testLockAnnotations()
     return result;
 }
 
+// Guard field is a mutex* (pointer), not a value mutex. Regression: release() used to be
+// called on the address of the pointer field, so the real mutex stayed locked forever.
+struct LockPtrCounter {
+    mutex* mtx = nullptr;
+    lock(mtx) {
+        int value = default;
+    }
+};
+
+bool testLockPointerGuard()
+{
+    bool result = true;
+    mutex mm = default;
+    LockPtrCounter pc;
+    pc.mtx = &mm;
+
+    // Two sequential lock blocks: the second one deadlocks if the first never released.
+    lock(pc.mtx) { pc.value = 1; }
+    lock(pc.mtx) { pc.value = pc.value + 41; }
+    lock(pc.mtx) { result &= Test("lock_ptr_guard", pc.value, 42); }
+    return result;
+}
+
+// Regression: lock(p->mtx) must canonicalize to the same lock string as lock(p.mtx),
+// otherwise accessing a guarded field through the arrow form false-errors.
+bool testLockArrowForm()
+{
+    bool result = true;
+    LockCounter dotForm;
+    LockCounter arrowForm;
+    LockCounter* p = &arrowForm;
+
+    lock(dotForm.mtx) { dotForm.value = 7; }
+    lock(p->mtx)      { p->value = 7; }
+
+    lock(arrowForm.mtx) { result &= Test("lock_arrow_form", arrowForm.value, 7); }
+    lock(dotForm.mtx, arrowForm.mtx) {
+        result &= Test("lock_arrow_matches_dot", arrowForm.value, dotForm.value);
+    }
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 // barrier / spin_barrier tests
 // ---------------------------------------------------------------------------
@@ -1384,6 +1426,8 @@ extern int main() {
     total++; passed += testAtomicFlagReleaseAcquire()     ? 1 : 0;
     total++; passed += testAtomicI32ReleaseAcquire()      ? 1 : 0;
     total++; passed += testLockAnnotations()              ? 1 : 0;
+    total++; passed += testLockPointerGuard()             ? 1 : 0;
+    total++; passed += testLockArrowForm()                ? 1 : 0;
 
     // barrier / spin_barrier tests
     total++; passed += testBarrierSingleThreadReuse()     ? 1 : 0;

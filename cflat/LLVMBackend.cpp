@@ -1868,6 +1868,40 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
         if (asanTM)
             module->setDataLayout(asanTM->createDataLayout());
 
+        // Init() never sets a module triple (only the data layout); on macOS the
+        // real Mach-O triple is set later in EmitExecutableMachO, after this pass
+        // runs. An empty triple defaults to ELF, so the pass stamps a COMDAT on
+        // asan.module_ctor - Mach-O has no COMDATs and object emission aborts.
+        // Give it the same versioned triple EmitExecutableMachO uses so it takes
+        // the Mach-O branch instead. Windows is untouched (relies on the empty
+        // triple / ELF-shaped defaults it already worked with).
+        if (targetMacOS_)
+        {
+            module->setTargetTriple("arm64-apple-macosx11.0.0");
+
+            // Apple's asan runtime self-verifies interception at startup by
+            // dlsym-ing "puts" and checking it resolves into the asan dylib.
+            // cflat reimplements the C stdio family (cruntime.cb defines its own
+            // 'puts'), so that symbol legitimately resolves to cflat's code, not
+            // asan's interposed libc puts - a false positive that aborts every
+            // asan binary before main runs ("Interceptors are not working").
+            // Malloc/free/operator-new/delete interception is unaffected; only
+            // this one self-check is a false alarm. Bake in a default
+            // ASAN_OPTIONS to skip it via the documented __asan_default_options
+            // override hook (a strong definition here wins over the runtime's
+            // own weak default).
+            llvm::IRBuilder<> optsBuilder(*context);
+            llvm::Constant* optsStr = optsBuilder.CreateGlobalStringPtr(
+                "verify_interceptors=0", "asan_default_options_str", 0, module.get());
+            llvm::FunctionType* optsFnTy =
+                llvm::FunctionType::get(llvm::PointerType::get(*context, 0), false);
+            llvm::Function* optsFn = llvm::Function::Create(
+                optsFnTy, llvm::GlobalValue::ExternalLinkage, "__asan_default_options", module.get());
+            llvm::BasicBlock* optsBB = llvm::BasicBlock::Create(*context, "entry", optsFn);
+            optsBuilder.SetInsertPoint(optsBB);
+            optsBuilder.CreateRet(optsStr);
+        }
+
         llvm::PassBuilder PB(asanTM.get());
         llvm::LoopAnalysisManager LAM;
         llvm::FunctionAnalysisManager FAM;
@@ -1885,6 +1919,13 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
         // for this LLVM 18 toolchain, which the linked runtime must export).
         llvm::AddressSanitizerOptions asanOpts;
         asanOpts.UseAfterScope = true;
+
+        // Apple's clang-21 asan runtime only exports the Apple-specific
+        // ___asan_version_mismatch_check_apple_clang_2100, not LLVM 18's
+        // ___asan_version_mismatch_check_v8; skip the check on macOS to avoid an
+        // undefined-symbol link error (the rest of the v8 ABI IS exported).
+        if (targetMacOS_)
+            asanOpts.InsertVersionCheck = false;
 
         // The AddressSanitizer pass only instruments memory accesses in functions that carry
         // the SanitizeAddress attribute - clang stamps it on every function it compiles under

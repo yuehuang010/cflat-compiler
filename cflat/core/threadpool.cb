@@ -205,6 +205,10 @@ struct WorkerStartCtx {
 // Passed to each worker thread at startup.  All fields are pointers into
 // the owning ThreadPool; the pool MUST outlive every worker thread.
 //
+// workerIds/workerStops sit in a lock(mtx) guard group: resize()'s grow path
+// frees and swaps those arrays while workers may still be registering, so the
+// compiler now enforces that every access holds the pool lock.
+//
 struct WorkerCtx {
     mutex*          mtx             = nullptr;
     void*           drainCv         = nullptr;  // &ThreadPool._drainCv (CONDITION_VARIABLE)
@@ -214,8 +218,10 @@ struct WorkerCtx {
     channel<Task>*  qLow            = nullptr;
     stop_source*    stop            = nullptr;
     atomic_counter* inflight        = nullptr;
-    u32*            workerIds       = nullptr;  // per-worker thread-ID slots
-    stop_source*    workerStops     = nullptr;  // per-worker stop sources (for resize)
+    lock(mtx) {
+        u32*         workerIds   = nullptr;  // per-worker thread-ID slots
+        stop_source* workerStops = nullptr;  // per-worker stop sources (for resize)
+    }
     atomic_counter* drainingWorkers = nullptr;  // workers currently inside drain()
 };
 
@@ -412,8 +418,11 @@ class ThreadPool {
         _ctx.qLow            = &_qLow;
         _ctx.stop            = &_stop;
         _ctx.inflight        = &_inflight;
-        _ctx.workerIds       = _workerIds;
-        _ctx.workerStops     = _workerStops;
+        // Guarded fields: no worker exists yet, but the guard is compiler-enforced.
+        lock(_ctx.mtx) {
+            _ctx.workerIds   = _workerIds;
+            _ctx.workerStops = _workerStops;
+        }
         _ctx.drainingWorkers = &_drainingWorkers;
         _count    = workerCount;
         _capacity = workerCount;
@@ -622,7 +631,11 @@ class ThreadPool {
     // NOT thread-safe against concurrent submit(), then(), drain(), or
     // shutdown(): grow reallocates the per-worker arrays that those paths read
     // unlocked.  The caller must quiesce the pool (no other pool calls in
-    // flight) for the duration of resize().
+    // flight) for the duration of resize().  The grow path's array swap IS
+    // serialized (via the lock(_ctx.mtx) guard group on WorkerCtx, which the
+    // compiler enforces) against a worker's start/exit registration, so a
+    // worker still starting up when resize() runs cannot use-after-free the
+    // old arrays.
     //
     void resize(int newCount) {
         if (_inlineMode) { return; }
@@ -638,18 +651,23 @@ class ThreadPool {
                 Thread*      nw = new Thread[newCount];
                 u32*         ni = new u32[newCount];
                 stop_source* ns = new stop_source[newCount];
-                int i = 0;
-                while (i < oldCount) { nw[i] = _workers[i]; ni[i] = _workerIds[i]; ns[i] = _workerStops[i]; i++; }
-                while (i < newCount) { ni[i] = (u32)0; i++; }
-                delete[_] _workers;
-                delete[_] _workerIds;
-                delete[_] _workerStops;   // no destructor; _state ptrs remain valid in ns
-                _workers         = nw;
-                _workerIds       = ni;
-                _workerStops     = ns;
-                _ctx.workerIds   = ni;
-                _ctx.workerStops = ns;
-                _capacity = newCount;
+                // A worker still in its startup path may have already loaded
+                // workerIds/workerStops before this swap; lock so its read/write
+                // lands on a consistent array instead of the one being freed.
+                lock(_ctx.mtx) {
+                    int i = 0;
+                    while (i < oldCount) { nw[i] = _workers[i]; ni[i] = _workerIds[i]; ns[i] = _workerStops[i]; i++; }
+                    while (i < newCount) { ni[i] = (u32)0; i++; }
+                    delete[_] _workers;
+                    delete[_] _workerIds;
+                    delete[_] _workerStops;   // no destructor; _state ptrs remain valid in ns
+                    _workers         = nw;
+                    _workerIds       = ni;
+                    _workerStops     = ns;
+                    _ctx.workerIds   = ni;
+                    _ctx.workerStops = ns;
+                    _capacity = newCount;
+                }
             }
             _count = newCount;
             // One topology snapshot for the whole grow loop; see init() for why.
@@ -872,10 +890,15 @@ int __threadpool_worker(move void* raw) {
     if (qos != 0) { os.thread_set_qos_self(qos); }
 
     stop_token poolStop = wctx->stop->get_token();
-    stop_token myStop   = wctx->workerStops[slot].get_token();
 
-    // Register this thread's ID so drain() can detect worker-calls-drain.
-    wctx->workerIds[slot] = _tp_current_tid();
+    // resize() can free/swap workerStops/workerIds while this worker is still
+    // starting up; lock so the read/write below sees a consistent array.
+    stop_token myStop;
+    lock(wctx.mtx) {
+        myStop = wctx->workerStops[slot].get_token();
+        // Register this thread's ID so drain() can detect worker-calls-drain.
+        wctx->workerIds[slot] = _tp_current_tid();
+    }
 
     while (!poolStop.stop_requested()) {
         wctx->ready->acquire();
@@ -897,6 +920,9 @@ int __threadpool_worker(move void* raw) {
             _tp_yield();
         }
     }
-    wctx->workerIds[slot] = (u32)0;   // signal exit to resize() / _isWorkerThread()
+    // Same resize() array-swap race as startup; lock before touching workerIds.
+    lock(wctx.mtx) {
+        wctx->workerIds[slot] = (u32)0;   // signal exit to resize() / _isWorkerThread()
+    }
     return 0;
 }

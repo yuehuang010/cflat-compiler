@@ -5682,10 +5682,31 @@ private:
                 }
                 for (const auto& fw : cFrameworks_)
                     argStrs.push_back("-framework"), argStrs.push_back(fw);
-                argStrs.push_back("-lSystem");
                 // The AArch64 backend can emit compiler-rt libcalls (e.g. __multi3);
                 // clang always links libclang_rt.osx.a, so mirror it when locatable.
+                // Also the source of the asan runtime dylib below (--asan) - hoisted
+                // so we only shell out to `clang -print-resource-dir` once.
                 const std::string rtDir = CaptureToolLine("clang -print-resource-dir 2>/dev/null");
+                if (asan_)
+                {
+                    const std::string asanDylib = rtDir + "/lib/darwin/libclang_rt.asan_osx_dynamic.dylib";
+                    if (rtDir.empty() || !llvm::sys::fs::exists(asanDylib))
+                    {
+                        LogError("--asan on macOS requires the AddressSanitizer runtime "
+                                 "from Xcode or the Command Line Tools (the SDK-free "
+                                 "harvested-stub link cannot supply it); install one and retry.");
+                        return false;
+                    }
+                    // Install name is @rpath/libclang_rt.asan_osx_dynamic.dylib.
+                    // Listed before -lSystem to mirror clang's own
+                    // -fsanitize=address link order (link order does not by
+                    // itself affect interception - see the __asan_default_options
+                    // override in OptimizeModule for the real fix needed here).
+                    argStrs.push_back(asanDylib);
+                    argStrs.push_back("-rpath");
+                    argStrs.push_back(rtDir + "/lib/darwin");
+                }
+                argStrs.push_back("-lSystem");
                 if (!rtDir.empty())
                 {
                     const std::string rt = rtDir + "/lib/darwin/libclang_rt.osx.a";
@@ -5738,6 +5759,7 @@ private:
         for (const auto& fw : cFrameworks_)
             argStrs.push_back("-framework"), argStrs.push_back(fw);
         if (debugInfo) argStrs.push_back("-g");
+        if (asan_) argStrs.push_back("-fsanitize=address");
 
         std::vector<llvm::StringRef> args;
         for (auto& s : argStrs) args.push_back(s);
