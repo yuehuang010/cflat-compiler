@@ -109,12 +109,13 @@ struct CpuTopology {
 - Linux `_topo_build`: both node loops already know `node`; store it.
 - macOS + `_topo_build_uniform`: `numaId[0] = 0`.
 
-### New query API (topology.cb, alongside cpu_mask_numa)
+### New query API (topology.cb, alongside topo.maskNuma)
 
 ```cflat
-// Feature 1: domain count is the existing cpu_numa_count(); IDs:
-int numa_domain_id(int index);          // OS node ID of snapshot slot index; -1 OOR
-int numa_domain_index(int id);          // inverse lookup; -1 if unknown id
+// Feature 1: domain count is the existing snapshot's numaCount field; IDs
+// are methods on the caller-owned CpuTopology value (topo.domainId/Index):
+int domainId(int index);          // OS node ID of snapshot slot index; -1 OOR
+int domainIndex(int id);          // inverse lookup; -1 if unknown id
 
 // Feature 2: per-domain detail (id-keyed, since users hold IDs):
 struct NumaDomainInfo {
@@ -125,11 +126,15 @@ struct NumaDomainInfo {
     i64 memTotalBytes  = -1;  // -1 = OS does not expose it (Windows, macOS free-only cases)
     i64 memFreeBytes   = -1;  // -1 = unknown
 };
-bool numa_domain_info(int id, NumaDomainInfo* out);
+// Returned by value; unknown id -> NumaDomainInfo with id == -1 (no bool, no out-param).
+NumaDomainInfo domainInfo(int id);
 ```
 
-Core counts come from the memoized snapshot. Memory is queried LIVE on
-each call (free memory changes; do not memoize), via new os.cb surface:
+Core counts come from the caller-owned CpuTopology snapshot
+(CpuTopology.snapshot() is a plain value, not memoized - each call
+re-walks the OS, so callers snapshot once and reuse the value). Memory
+is queried LIVE on each call (free memory changes; do not cache it),
+via new os.cb surface:
 
 ```cflat
 namespace os {
@@ -155,7 +160,7 @@ namespace os {
 
 Masks stay u64 group-0, same as all of topology.cb. On a multi-group
 Windows box (>64 LPs), nodes whose CPUs live outside group 0 will show
-cpuMask == 0; `numa_domain_info` still reports id + memory. Document
+cpuMask == 0; `topo.domainInfo` still reports id + memory. Document
 next to the existing 64-LP limit note. (Lifting this is its own plan.)
 
 ---
@@ -183,7 +188,9 @@ struct NumaDomain {
 
     // Feature 3. Returns nullptr if `id` is unknown, already acquired
     // in-process, or `required` cannot be achieved (PROCESS on macOS).
-    static NumaDomain* acquire(int id, int required);
+    // The `move` return makes the caller's local an owning pointer that
+    // auto-deletes at scope exit; without it the domain leaked.
+    static move NumaDomain* acquire(int id, int required);
 
     // Feature 4. killRemaining: kill still-live NumaThreads before
     // dissolving the confinement. Idempotent.
@@ -244,7 +251,7 @@ Decisions settled here:
 **NUMA_ISOLATE_NONE** (always succeeds on a valid, un-acquired id):
 bookkeeping only. Domain object + thread hand-out + allocLocal; no
 scheduler interference. This is the macOS tier (threads get QoS steering
-via the existing cpu_qos_for_mask instead of pinning; allocLocal is
+via the existing topo.qosForMask instead of pinning; allocLocal is
 plain vmem_alloc).
 
 **NUMA_ISOLATE_PROCESS** (Windows + Linux; the default `required`):
@@ -352,7 +359,7 @@ inside os.posix's helper so alignment handling stays in one place).
 "query -> size -> acquire threads/memory from the same domain object"
 is the obvious flow; cross-domain mistakes require going around the
 class. ThreadPool integration is OUT OF SCOPE for v1 (pool pinMask
-already accepts cpu_mask_numa(i); a per-domain pool ctor can come later).
+already accepts topo.maskNuma(i); a per-domain pool ctor can come later).
 
 doc/HPC.md gains a "NUMA domains" section built around this worked
 example - loading a very large file from disk into memory and then
@@ -375,7 +382,9 @@ struct FileShard {
     i64  len    = 0;
 };
 
-int shardCount = cpu_numa_count();          // feature 1
+CpuTopology topo = CpuTopology.snapshot();  // caller-owned, not memoized -
+                                             // snapshot once, reuse below
+int shardCount = topo.numaCount;            // feature 1
 FileShard[8] shards = default;
 i64 fileSize = file_size(path);
 
@@ -387,15 +396,14 @@ i64 fileSize = file_size(path);
 i64 freeTotal = 0;
 int i = 0;
 while (i < shardCount) {
-    NumaDomainInfo inf = default;
-    numa_domain_info(numa_domain_id(i), &inf);
+    NumaDomainInfo inf = topo.domainInfo(topo.domainId(i));
     freeTotal = freeTotal + inf.memFreeBytes;   // -1 handling elided
     i = i + 1;
 }
 i64 covered = 0;
 i = 0;
 while (i < shardCount) {
-    shards[i].domain = NumaDomain.acquire(numa_domain_id(i), NUMA_ISOLATE_PROCESS);
+    shards[i].domain = NumaDomain.acquire(topo.domainId(i), NUMA_ISOLATE_PROCESS);
     NumaDomainInfo inf = shards[i].domain->info();
     i64 slice = (i == shardCount - 1) ? (fileSize - covered)
               : fileSize * inf.memFreeBytes / freeTotal;
@@ -476,16 +484,16 @@ the doc version is the deliverable.
   the target node + copies + frees, pointer changes). Do after v1 lands.
 - No libnuma dependency (raw syscalls + sysfs only).
 - No >64-LP / multi-group support (existing topology.cb limit).
-- cpu_mask_numa / existing topology API: unchanged, byte-compatible.
+- topo.maskNuma / existing topology API: unchanged, byte-compatible.
 
 ## Implementation steps
 
 1. **Part A** (sonnet): numaId capture in all three _topo_build paths +
-   uniform fallback; numa_domain_id/index/info; os.numa_free/total_bytes
+   uniform fallback; topo.domainId/domainIndex/domainInfo; os.numa_free/total_bytes
    + externs; extend testCpuTopology in Test/test_threadpool.cb
    (machine-independent: ids unique, index(id(i))==i, info(id) mask ==
-   cpu_mask_numa(i), memFree <= memTotal when both >= 0, unknown id ->
-   false). Docs: doc/HPC.md query subsection.
+   topo.maskNuma(i), memFree <= memTotal when both >= 0, unknown id ->
+   info().id == -1). Docs: doc/HPC.md query subsection.
 2. **os layer for Part B** (sonnet): vm_reserve_commit_numa (+vmem.cb
    wrappers), process_(get|set)_affinity, thread_bind_memory_self, all
    externs. Windows path verifiable on the dev box (VirtualAllocExNuma
@@ -523,8 +531,8 @@ the doc version is the deliverable.
    subsection (nested under "Across-core data parallelism", right after
    the existing "Pinning workers to cores" topology-masks material and
    before "Per-worker floating-point environment") with: the remote-memory/
-   first-touch motivation, the query API (numa_domain_id/index,
-   NumaDomainInfo/numa_domain_info with the verified -1 semantics per OS),
+   first-touch motivation, the query API (topo.domainId/domainIndex,
+   NumaDomainInfo/topo.domainInfo with the verified -1 semantics per OS),
    the NumaDomain/NumaThread class (acquire/release, the two confinement
    tiers and exact failure modes, acquireThread/releaseThread/join,
    allocLocal/freeLocal, info()), a trimmed per-OS capability table, the

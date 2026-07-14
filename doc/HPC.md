@@ -791,28 +791,35 @@ same time.
 
 `cpu_mask_lowest(n)` assumes cores `0..n-1` are the right ones to use, which is not true on a
 heterogeneous or multi-CCX machine - core 0 and core 1 might be on different cache domains, or one
-might be a slower efficiency core. `import "topology.cb";` gives mask constructors that understand the
-actual machine, built on a memoized `CpuTopology` snapshot (`cpu_topology()`):
+might be a slower efficiency core. `import "topology.cb";` gives mask helpers that understand the
+actual machine, exposed as methods on a `CpuTopology` snapshot value (`CpuTopology.snapshot()`).
+The snapshot is a real query, not a cheap accessor - one `GetLogicalProcessorInformationEx` call on
+Windows, a sysfs walk on Linux - and it is **not memoized**, so snapshot once and keep the value
+rather than calling `CpuTopology.snapshot()` in a loop. It is an ordinary local: the caller owns it,
+there is nothing to free, and it cannot leak:
 
-- `cpu_mask_physical(n)` - one logical CPU per physical core (skips SMT siblings), for the first `n`
+- `topo.maskPhysical(n)` - one logical CPU per physical core (skips SMT siblings), for the first `n`
   cores in enumeration order.
-- `cpu_mask_perf_cores()` / `cpu_mask_efficiency_cores()` - all logical CPUs of the performance-class
+- `topo.maskPerfCores()` / `topo.maskEfficiencyCores()` - all logical CPUs of the performance-class
   cores, and of everything below that class, split by the OS-reported `EfficiencyClass`. On a uniform
-  machine `cpu_mask_efficiency_cores()` is `0` and `cpu_mask_perf_cores()` covers everything - that is
+  machine `topo.maskEfficiencyCores()` is `0` and `topo.maskPerfCores()` covers everything - that is
   correct-by-definition, not a bug.
-- `cpu_mask_llc(domain)` / `cpu_llc_count()` - the logical CPUs sharing LLC (L3 cache / CCX) domain
-  `domain`, and how many domains exist. This is the discriminating tool when a machine does not expose
-  distinct efficiency classes but still has separate cache domains (e.g. two same-class CCXs).
-- `cpu_mask_numa(node)` / `cpu_numa_count()` - the NUMA-node equivalent.
+- `topo.maskLlc(domain)` / `topo.llcCount` - the logical CPUs sharing LLC (L3 cache / CCX) domain
+  `domain`, and how many domains exist (`llcCount` is a plain field on the snapshot). This is the
+  discriminating tool when a machine does not expose distinct efficiency classes but still has
+  separate cache domains (e.g. two same-class CCXs).
+- `topo.maskNuma(node)` / `topo.numaCount` - the NUMA-node equivalent (`numaCount` is a plain field).
 
 Worked example: pin a pool to stay inside a single LLC/CCX domain, so every worker shares one L3 cache
-and cross-core communication never crosses the slow inter-CCX link:
+and cross-core communication never crosses the slow inter-CCX link. Snapshot the topology once, up
+front, and reuse it for every mask below:
 
 ```c
 import "topology.cb";
 import "threadpool.cb";
 
-u64 llc0 = cpu_mask_llc(0);
+CpuTopology topo = CpuTopology.snapshot();   // one real query; keep this, do not re-snapshot
+u64 llc0 = topo.maskLlc(0);
 int workers = 0;
 u64 m = llc0;
 while (m != (u64)0) { m = m & (m - (u64)1); workers = workers + 1; }   // popcount(llc0)
@@ -825,8 +832,8 @@ pool.init(workers, llc0);
 `workers` here is the popcount of the mask (one worker per logical CPU in that domain); pass a smaller
 count if you want fewer workers than the domain has room for - `init` still only pins to bits within
 `llc0`. On a heterogeneous box (AMD
-Strix Point: 4 Zen5 performance cores + 6 Zen5c compact cores on two separate CCXs) `cpu_mask_llc(0)` and
-`cpu_mask_llc(1)` isolate each CCX; `cpu_mask_perf_cores()` isolates the 4 Zen5 cores directly since
+Strix Point: 4 Zen5 performance cores + 6 Zen5c compact cores on two separate CCXs) `topo.maskLlc(0)` and
+`topo.maskLlc(1)` isolate each CCX; `topo.maskPerfCores()` isolates the 4 Zen5 cores directly since
 Windows reports them at a higher `EfficiencyClass` than the Zen5c cores.
 
 Limits: masks are a bare `u64`, so only the first 64 logical processors in Windows processor group 0 are
@@ -850,8 +857,8 @@ branch. The macOS mask bits are **synthetic and informational**: they are assign
 do not correspond to any OS-visible CPU number.
 
 The actionable macOS lever is **QoS class**, which is what actually steers a thread onto the P or E
-cluster. `cpu_qos_for_mask(mask)` maps a mask to the QoS class that best expresses it - a mask contained
-in `cpu_mask_efficiency_cores()` maps to `QOS_CLASS_BACKGROUND`, one contained in `cpu_mask_perf_cores()`
+cluster. `topo.qosForMask(mask)` maps a mask to the QoS class that best expresses it - a mask contained
+in `topo.maskEfficiencyCores()` maps to `QOS_CLASS_BACKGROUND`, one contained in `topo.maskPerfCores()`
 maps to `QOS_CLASS_USER_INTERACTIVE`, and anything else (including *every* mask on a uniform,
 single-core-class machine, where there is no P/E split to express) maps to `0` / unspecified. `ThreadPool`
 applies this automatically: when `pinMask` is set, each worker calls `os.thread_set_qos_self()` on entry.
@@ -860,7 +867,7 @@ handle-taking one.
 
 ### NUMA domains (`core/numa.cb`)
 
-`cpu_mask_numa`/`cpu_mask_llc` pin a pool *inside* a memory domain; `core/numa.cb` closes the
+`topo.maskNuma`/`topo.maskLlc` pin a pool *inside* a memory domain; `core/numa.cb` closes the
 other half of the story - getting the *data* into that domain too. On a multi-socket (or
 multi-die) box, a core reading memory that lives on a **remote** node pays extra interconnect
 latency on every access - often 1.5-2x a local access - and the usual way this bites a program is
@@ -871,12 +878,12 @@ scales worse than it should." `import "numa.cb";` gives you the domain-aware pri
 both the memory and the threads deliberately, so first-touch never gets the chance to place a
 page wrong.
 
-**Query API** (`core/topology.cb`, alongside `cpu_mask_numa`): `cpu_numa_count()` is the existing
-domain count; `numa_domain_id(index)` / `numa_domain_index(id)` convert between a snapshot slot
-and the OS's own node ID (the acquisition API below is ID-keyed, since that's what a caller holds
-onto). `numa_domain_info(id, &out)` fills a `NumaDomainInfo` with that node's core counts (from
-the memoized topology snapshot) and its **live** free/total memory (queried fresh on every call,
-since free memory changes; never memoized):
+**Query API** (`core/topology.cb`, alongside `topo.maskNuma`): `topo.numaCount` is the existing
+domain count (a plain field on the snapshot); `topo.domainId(index)` / `topo.domainIndex(id)` convert
+between a snapshot slot and the OS's own node ID (the acquisition API below is ID-keyed, since that's
+what a caller holds onto). `topo.domainInfo(id)` returns a `NumaDomainInfo` by value with that node's
+core counts (from the snapshot it was called on) and its **live** free/total memory (queried fresh on
+every call, since free memory changes; never memoized):
 
 ```c
 struct NumaDomainInfo {
@@ -887,7 +894,7 @@ struct NumaDomainInfo {
     i64 memTotalBytes  = -1;  // -1 = the OS does not expose a per-node total
     i64 memFreeBytes   = -1;  // -1 = unknown
 };
-bool numa_domain_info(int id, NumaDomainInfo* out);   // false if `id` is unknown
+NumaDomainInfo domainInfo(int id);   // returned by value; inf.id == -1 if `id` is unknown
 ```
 
 `-1` means "the OS will not tell us this", not "zero": Windows has no documented per-node
@@ -902,7 +909,8 @@ and node-local memory from the *same* node, so the correct HPC pattern (data and
 touch it live together) is the path of least resistance:
 
 ```c
-NumaDomain* d = NumaDomain.acquire(numa_domain_id(0), NUMA_ISOLATE_PROCESS);
+CpuTopology topo = CpuTopology.snapshot();
+NumaDomain* d = NumaDomain.acquire(topo.domainId(0), NUMA_ISOLATE_PROCESS);
 // ... d->acquireThread / d->allocLocal ...
 d->release(false);   // or just let d go out of scope - ~NumaDomain calls release(false)
 ```
@@ -910,8 +918,9 @@ d->release(false);   // or just let d go out of scope - ~NumaDomain calls releas
 - **`NumaDomain.acquire(id, required)`** reserves domain `id` in-process (a module-level registry
   rejects double-acquire) and returns `nullptr` on exactly three failures: `id` is not a known OS
   node ID, `id` is already acquired by this process, or `required == NUMA_ISOLATE_PROCESS` on
-  macOS (no affinity API exists there to achieve it). There are two confinement tiers, weakest to
-  strongest:
+  macOS (no affinity API exists there to achieve it). The return is `move NumaDomain*` - a genuine
+  owning pointer, so a `NumaDomain*` local auto-deletes at scope exit with nothing to free by hand.
+  There are two confinement tiers, weakest to strongest:
 
   ```c
   const int NUMA_ISOLATE_NONE    = 0;  // bookkeeping only - domain object, thread hand-out,
@@ -952,8 +961,9 @@ d->release(false);   // or just let d go out of scope - ~NumaDomain calls releas
 - **`allocLocal(size)` / `freeLocal(p)`** give node-bound pages (`VirtualAllocExNuma` on Windows,
   `mmap`+`mbind(MPOL_BIND)` on Linux, a plain allocation on macOS), 64K-aligned and zeroed, freed
   symmetrically.
-- **`info()`** is a live re-query of `numa_domain_info` for this domain's ID - the same struct as
-  above, fetched through the object you already have.
+- **`info()`** is a live re-query of `domainInfo` for this domain's ID, run against the `CpuTopology`
+  snapshot the domain was acquired with (so handing out threads never re-walks the machine) - the
+  same struct as above, fetched through the object you already have.
 
 **Per-OS capability table** (single-process scope only - this library places and pins *this*
 process's own memory and threads; it does not evict or isolate other processes):
@@ -1040,7 +1050,8 @@ void joinFully(NumaThread* t) {
 int main() {
     g_loadPath = "bigfile.bin";   // set before any domain thread is spawned
 
-    int shardCount = cpu_numa_count();
+    CpuTopology topo = CpuTopology.snapshot();   // one real query; reused for every lookup below
+    int shardCount = topo.numaCount;
     FileShard[8] shards = default;
 
     File probe;
@@ -1056,8 +1067,7 @@ int main() {
     i64 freeTotal = 0;
     int i = 0;
     while (i < shardCount) {
-        NumaDomainInfo inf = default;
-        numa_domain_info(numa_domain_id(i), &inf);
+        NumaDomainInfo inf = topo.domainInfo(topo.domainId(i));
         if (inf.memFreeBytes > 0) { freeTotal = freeTotal + inf.memFreeBytes; }
         i = i + 1;
     }
@@ -1065,7 +1075,7 @@ int main() {
     i64 covered = 0;
     i = 0;
     while (i < shardCount) {
-        shards[i].domain = NumaDomain.acquire(numa_domain_id(i), NUMA_ISOLATE_PROCESS);
+        shards[i].domain = NumaDomain.acquire(topo.domainId(i), NUMA_ISOLATE_PROCESS);
         NumaDomainInfo inf = shards[i].domain->info();
         i64 slice = 0;
         if (i == shardCount - 1 || freeTotal <= 0) {
@@ -1159,8 +1169,8 @@ stragglers. On a 1-domain box the identical code degrades to "pinned threads + o
   acquire domains at startup, before spawning anything else.
 - **The existing 64-CPU / processor-group-0 limit applies here too.** Masks are a bare `u64`; a
   NUMA node whose CPUs live outside Windows processor group 0 (>64 logical processors on the
-  machine) reports `cpuMask == 0` even though `numa_domain_info` still returns valid ID and memory
-  fields. Lifting this is its own plan, same as the rest of `topology.cb`.
+  machine) reports `cpuMask == 0` even though `topo.domainInfo(id)` still returns a valid ID and
+  memory fields. Lifting this is its own plan, same as the rest of `topology.cb`.
 - **No page migration in v1.** Pages are placed correctly at allocation time (`allocLocal`) or via
   first-touch after pinning; nothing in this library *moves* an already-placed page afterward. A
   `moveToDomain(p, size, domain)` helper is a recorded post-v1 TODO (Linux can do this
@@ -1382,13 +1392,15 @@ benchmark that isolates the effect.
 
 ```c
 import "vmem.cb";
+import "topology.cb";
 
 bool avail = vmem_huge_pages_available();   // pre-flight query
 void* buf  = vmem_alloc_huge(bytes);        // best effort; degrades to normal pages
 // ... use buf ...
 vmem_free(buf);                             // same free path as vmem_alloc
 
-void* nodeBuf = vmem_alloc_numa_huge(bytes, numa_domain_id(0));   // + node-bound
+CpuTopology topo = CpuTopology.snapshot();
+void* nodeBuf = vmem_alloc_numa_huge(bytes, topo.domainId(0));   // + node-bound
 vmem_free_numa(nodeBuf);
 ```
 

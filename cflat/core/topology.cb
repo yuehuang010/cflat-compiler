@@ -15,7 +15,7 @@
 //   macOS   - sysctlbyname (hw.physicalcpu / hw.perflevelN.*). Darwin has NO
 //     CPU affinity API, so the logical-CPU bit indices here are SYNTHETIC and
 //     INFORMATIONAL - they do NOT map to real CPUs and setAffinity is a no-op.
-//     The actionable lever on macOS is QoS class steering (cpu_qos_for_mask +
+//     The actionable lever on macOS is QoS class steering (CpuTopology.qosForMask +
 //     os.thread_set_qos_self); topology is used only to classify a mask as
 //     perf vs efficiency for that purpose.
 // Any parse/query failure on any platform degrades to _topo_build_uniform (a
@@ -27,7 +27,19 @@
 // already had.
 
 import "os.cb";
-import "mutex.cb";
+
+// Per-NUMA-domain detail, keyed by OS node ID (callers hold IDs, not slot
+// indices). Core/CPU counts come from the snapshot the query was made
+// against; memory fields are queried LIVE via os.cb (free memory changes, so
+// never cached).
+struct NumaDomainInfo {
+    int id             = -1;
+    int physicalCores  = 0;   // physical cores whose coreMask intersects the node mask
+    int logicalCpus    = 0;   // popcount(cpuMask)
+    u64 cpuMask        = 0;   // logical CPUs belonging to this node
+    i64 memTotalBytes  = -1;  // -1 = OS does not expose a per-node total (e.g. Windows)
+    i64 memFreeBytes   = -1;  // -1 = unknown
+};
 
 // Fixed lane/domain caps: 64 logical CPUs (one u64 mask), up to 64 physical
 // cores, up to 8 LLC domains and 8 NUMA nodes (generous for current hardware).
@@ -41,10 +53,153 @@ struct CpuTopology {
     u64[8]  llcMask       = default; // per LLC domain: mask of member logical CPUs
     u64[8]  numaMask      = default; // per NUMA node: mask of member logical CPUs
     i32[8]  numaId        = default; // per NUMA node slot: OS node ID (sparse-safe)
-};
 
-CpuTopology* g_topology     = nullptr;
-mutex        g_topologyLock = default;
+    // Build and return a fresh topology snapshot by value. Not memoized: each
+    // call re-walks the OS (Windows: one GetLogicalProcessorInformationEx
+    // query; Linux: a sysfs walk), which is not cheap. Callers should snapshot
+    // once and keep the result rather than call this in a loop.
+    static CpuTopology snapshot() {
+        CpuTopology t = default;
+        _topo_fill(&t);
+        return t;
+    }
+
+    // One logical CPU per physical core (the lowest-set-bit SMT sibling), for
+    // the first min(n, physicalCount) cores in record/enumeration order. Does
+    // NOT sort by efficiency class - compose with maskPerfCores() for that.
+    u64 maskPhysical(int n) {
+        if (n <= 0) { return (u64)0; }
+        int cap = (n < physicalCount) ? n : physicalCount;
+        u64 result = (u64)0;
+        int i = 0;
+        while (i < cap) {
+            u64 m = coreMask[i];
+            u64 low = m & ((~m) + (u64)1);   // isolate lowest set bit
+            result = result | low;
+            i = i + 1;
+        }
+        return result;
+    }
+
+    // Union of logical CPUs (full SMT sibling sets) of every physical core
+    // whose EfficiencyClass equals the maximum EfficiencyClass observed on the
+    // machine. On a uniform machine this is every logical CPU (see
+    // maskEfficiencyCores).
+    u64 maskPerfCores() {
+        if (physicalCount == 0) { return (u64)0; }
+        u8 maxEff = coreEff[0];
+        int i = 1;
+        while (i < physicalCount) {
+            if (coreEff[i] > maxEff) { maxEff = coreEff[i]; }
+            i = i + 1;
+        }
+        u64 result = (u64)0;
+        i = 0;
+        while (i < physicalCount) {
+            if (coreEff[i] == maxEff) { result = result | coreMask[i]; }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    // Union of logical CPUs of every physical core BELOW the max
+    // EfficiencyClass. 0 on a uniform machine (all cores report the same
+    // class) - that is correct-by-definition, not a bug; maskLlc() is the
+    // discriminating tool for CCX/cache splits when the machine does not
+    // expose distinct classes.
+    u64 maskEfficiencyCores() {
+        if (physicalCount == 0) { return (u64)0; }
+        u8 maxEff = coreEff[0];
+        int i = 1;
+        while (i < physicalCount) {
+            if (coreEff[i] > maxEff) { maxEff = coreEff[i]; }
+            i = i + 1;
+        }
+        u64 result = (u64)0;
+        i = 0;
+        while (i < physicalCount) {
+            if (coreEff[i] < maxEff) { result = result | coreMask[i]; }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    // Mask of logical CPUs sharing LLC (L3) domain `domain`. 0 if out of range.
+    u64 maskLlc(int domain) {
+        if (domain < 0 || domain >= llcCount) { return (u64)0; }
+        return llcMask[domain];
+    }
+
+    // Mask of logical CPUs belonging to NUMA node `node`. 0 if out of range.
+    u64 maskNuma(int node) {
+        if (node < 0 || node >= numaCount) { return (u64)0; }
+        return numaMask[node];
+    }
+
+    // OS node ID of snapshot slot `index` (0..numaCount-1); -1 if out of range.
+    int domainId(int index) {
+        if (index < 0 || index >= numaCount) { return -1; }
+        return (int)numaId[index];
+    }
+
+    // Inverse of domainId: snapshot slot index whose OS node ID is `id`;
+    // -1 if `id` is not a node ID present in this snapshot.
+    int domainIndex(int id) {
+        int i = 0;
+        while (i < numaCount) {
+            if ((int)numaId[i] == id) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // Domain `id`'s detail. Returns a `default` NumaDomainInfo (id == -1) if
+    // `id` is not a known OS node ID in this snapshot.
+    NumaDomainInfo domainInfo(int id) {
+        int slot = domainIndex(id);
+        if (slot < 0) { NumaDomainInfo unknown = default; return unknown; }
+        u64 mask = numaMask[slot];
+
+        NumaDomainInfo out = default;
+        out.id      = id;
+        out.cpuMask = mask;
+
+        int logical = 0;
+        u64 t = mask;
+        while (t != (u64)0) { t = t & (t - (u64)1); logical = logical + 1; }
+        out.logicalCpus = logical;
+
+        int phys = 0;
+        int i = 0;
+        while (i < physicalCount) {
+            if ((coreMask[i] & mask) != (u64)0) { phys = phys + 1; }
+            i = i + 1;
+        }
+        out.physicalCores = phys;
+
+        out.memFreeBytes  = os.numa_free_bytes(id);
+        out.memTotalBytes = os.numa_total_bytes(id);
+        return out;
+    }
+
+    // The macOS QoS class that best expresses `mask` (0 == QOS_CLASS_UNSPECIFIED,
+    // 0x09 == BACKGROUND, 0x21 == USER_INTERACTIVE). A mask confined to the
+    // efficiency cores maps to BACKGROUND; one confined to the perf cores maps
+    // to USER_INTERACTIVE; anything else leaves the thread at its default (0).
+    // On a uniform machine (no P/E core-class split) there is nothing for QoS
+    // to express, so this always returns 0. On non-macOS this still computes
+    // but only threadpool's macOS path consumes it, since affinity is the
+    // actionable lever elsewhere.
+    int qosForMask(u64 mask) {
+        if (mask == (u64)0) { return 0; }
+        u64 eff = maskEfficiencyCores();
+        if (eff == (u64)0) { return 0; }   // uniform machine: no P/E split to express
+        if ((mask & ~eff) == (u64)0) { return 0x09; }
+        u64 perf = maskPerfCores();
+        if ((mask & ~perf) == (u64)0) { return 0x21; }
+        return 0;
+    }
+};
 
 // Fill `topo` with a uniform synthetic topology built from the logical CPU
 // count alone: every logical CPU is its own physical core, one shared LLC
@@ -453,7 +608,7 @@ if const (__WINDOWS__) {
                 }
                 return;
             }
-            // (c) uniform: leave coreEff at its default 0 (cpu_mask_efficiency_cores
+            // (c) uniform: leave coreEff at its default 0 (maskEfficiencyCores
             // then correctly returns 0).
         }
 
@@ -599,180 +754,11 @@ if const (__WINDOWS__) {
 
 }
 
-// Return the process-wide CpuTopology snapshot, computing it once. Never
-// returns nullptr and never returns a snapshot with a zero llcMask/coreMask
-// entry (the uniform-fallback path guarantees at least one nonempty domain).
-CpuTopology* cpu_topology() {
-    if (g_topology != nullptr) { return g_topology; }
-    g_topologyLock.acquire();
-    if (g_topology == nullptr) {
-        CpuTopology* topo = new CpuTopology;
-        _topo_build(topo);
-        g_topology = topo;
-    }
-    g_topologyLock.release();
-    return g_topology;
-}
-
-// One logical CPU per physical core (the lowest-set-bit SMT sibling), for the
-// first min(n, physicalCount) cores in record/enumeration order. Does NOT
-// sort by efficiency class - compose with cpu_mask_perf_cores() for that.
-u64 cpu_mask_physical(int n) {
-    CpuTopology* topo = cpu_topology();
-    if (n <= 0) { return (u64)0; }
-    int cap = (n < topo->physicalCount) ? n : topo->physicalCount;
-    u64 result = (u64)0;
-    int i = 0;
-    while (i < cap) {
-        u64 m = topo->coreMask[i];
-        u64 low = m & ((~m) + (u64)1);   // isolate lowest set bit
-        result = result | low;
-        i = i + 1;
-    }
-    return result;
-}
-
-// Union of logical CPUs (full SMT sibling sets) of every physical core whose
-// EfficiencyClass equals the maximum EfficiencyClass observed on the machine.
-// On a uniform machine this is every logical CPU (see cpu_mask_efficiency_cores).
-u64 cpu_mask_perf_cores() {
-    CpuTopology* topo = cpu_topology();
-    if (topo->physicalCount == 0) { return (u64)0; }
-    u8 maxEff = topo->coreEff[0];
-    int i = 1;
-    while (i < topo->physicalCount) {
-        if (topo->coreEff[i] > maxEff) { maxEff = topo->coreEff[i]; }
-        i = i + 1;
-    }
-    u64 result = (u64)0;
-    i = 0;
-    while (i < topo->physicalCount) {
-        if (topo->coreEff[i] == maxEff) { result = result | topo->coreMask[i]; }
-        i = i + 1;
-    }
-    return result;
-}
-
-// Union of logical CPUs of every physical core BELOW the max EfficiencyClass.
-// 0 on a uniform machine (all cores report the same class) - that is
-// correct-by-definition, not a bug; cpu_mask_llc() is the discriminating tool
-// for CCX/cache splits when the machine does not expose distinct classes.
-u64 cpu_mask_efficiency_cores() {
-    CpuTopology* topo = cpu_topology();
-    if (topo->physicalCount == 0) { return (u64)0; }
-    u8 maxEff = topo->coreEff[0];
-    int i = 1;
-    while (i < topo->physicalCount) {
-        if (topo->coreEff[i] > maxEff) { maxEff = topo->coreEff[i]; }
-        i = i + 1;
-    }
-    u64 result = (u64)0;
-    i = 0;
-    while (i < topo->physicalCount) {
-        if (topo->coreEff[i] < maxEff) { result = result | topo->coreMask[i]; }
-        i = i + 1;
-    }
-    return result;
-}
-
-// Number of distinct LLC (L3) domains - the loop bound for cpu_mask_llc().
-int cpu_llc_count() {
-    return cpu_topology()->llcCount;
-}
-
-// Mask of logical CPUs sharing LLC (L3) domain `domain`. 0 if out of range.
-u64 cpu_mask_llc(int domain) {
-    CpuTopology* topo = cpu_topology();
-    if (domain < 0 || domain >= topo->llcCount) { return (u64)0; }
-    return topo->llcMask[domain];
-}
-
-// Number of NUMA nodes - the loop bound for cpu_mask_numa().
-int cpu_numa_count() {
-    return cpu_topology()->numaCount;
-}
-
-// Mask of logical CPUs belonging to NUMA node `node`. 0 if out of range.
-u64 cpu_mask_numa(int node) {
-    CpuTopology* topo = cpu_topology();
-    if (node < 0 || node >= topo->numaCount) { return (u64)0; }
-    return topo->numaMask[node];
-}
-
-// OS node ID of snapshot slot `index` (0..cpu_numa_count()-1); -1 if out of range.
-int numa_domain_id(int index) {
-    CpuTopology* topo = cpu_topology();
-    if (index < 0 || index >= topo->numaCount) { return -1; }
-    return (int)topo->numaId[index];
-}
-
-// Inverse of numa_domain_id: snapshot slot index whose OS node ID is `id`;
-// -1 if `id` is not a node ID present in the current snapshot.
-int numa_domain_index(int id) {
-    CpuTopology* topo = cpu_topology();
-    int i = 0;
-    while (i < topo->numaCount) {
-        if ((int)topo->numaId[i] == id) { return i; }
-        i = i + 1;
-    }
-    return -1;
-}
-
-// Per-NUMA-domain detail, keyed by OS node ID (callers hold IDs, not slot
-// indices). Core/CPU counts come from the memoized snapshot; memory fields
-// are queried LIVE via os.cb (free memory changes, so never memoized).
-struct NumaDomainInfo {
-    int id             = -1;
-    int physicalCores  = 0;   // physical cores whose coreMask intersects the node mask
-    int logicalCpus    = 0;   // popcount(cpuMask)
-    u64 cpuMask        = 0;   // logical CPUs belonging to this node
-    i64 memTotalBytes  = -1;  // -1 = OS does not expose a per-node total (e.g. Windows)
-    i64 memFreeBytes   = -1;  // -1 = unknown
-};
-
-// Fill *out with domain `id`'s detail. Returns false (out left untouched) if
-// `id` is not a known OS node ID in the current snapshot.
-bool numa_domain_info(int id, NumaDomainInfo* out) {
-    int slot = numa_domain_index(id);
-    if (slot < 0) { return false; }
-    CpuTopology* topo = cpu_topology();
-    u64 mask = topo->numaMask[slot];
-
-    out->id      = id;
-    out->cpuMask = mask;
-
-    int logical = 0;
-    u64 t = mask;
-    while (t != (u64)0) { t = t & (t - (u64)1); logical = logical + 1; }
-    out->logicalCpus = logical;
-
-    int phys = 0;
-    int i = 0;
-    while (i < topo->physicalCount) {
-        if ((topo->coreMask[i] & mask) != (u64)0) { phys = phys + 1; }
-        i = i + 1;
-    }
-    out->physicalCores = phys;
-
-    out->memFreeBytes  = os.numa_free_bytes(id);
-    out->memTotalBytes = os.numa_total_bytes(id);
-    return true;
-}
-
-// The macOS QoS class that best expresses `mask` (0 == QOS_CLASS_UNSPECIFIED,
-// 0x09 == BACKGROUND, 0x21 == USER_INTERACTIVE). A mask confined to the
-// efficiency cores maps to BACKGROUND; one confined to the perf cores maps to
-// USER_INTERACTIVE; anything else leaves the thread at its default (0). On a
-// uniform machine (no P/E core-class split) there is nothing for QoS to
-// express, so this always returns 0. On non-macOS this still computes but
-// only threadpool's macOS path consumes it, since affinity is the actionable
-// lever elsewhere.
-int cpu_qos_for_mask(u64 mask) {
-    if (mask == (u64)0) { return 0; }
-    u64 eff = cpu_mask_efficiency_cores();
-    if (eff == (u64)0) { return 0; }   // uniform machine: no P/E split to express
-    if ((mask & ~eff) == (u64)0) { return 0x09; }
-    u64 perf = cpu_mask_perf_cores();
-    if ((mask & ~perf) == (u64)0) { return 0x21; }
-    return 0;
+// Dispatcher for CpuTopology.snapshot(): a struct method cannot forward-
+// reference a function defined inside an `if const (...) { }` block (the
+// ForwardRefScanner does not pre-register those), so snapshot() calls this
+// top-level function instead, which is defined after the platform blocks
+// above and can see whichever _topo_build() they registered.
+void _topo_fill(CpuTopology* topo) {
+    _topo_build(topo);
 }

@@ -828,29 +828,29 @@ int _testPopcount(u64 mask) {
     return count;
 }
 
-// core/topology.cb: CpuTopology snapshot + mask helpers (cpu_mask_physical,
-// cpu_mask_perf_cores/efficiency_cores, cpu_mask_llc/numa). Assertions are
+// core/topology.cb: CpuTopology snapshot + mask helpers (maskPhysical,
+// maskPerfCores/maskEfficiencyCores, maskLlc/maskNuma). Assertions are
 // machine-independent - they hold on a uniform machine (degraded/POSIX
 // fallback: 1 LLC domain, 1 NUMA node, all cores "performance" class) and on
 // a heterogeneous one (e.g. the dev box: 2 LLC domains split along CCX
 // lines, perf vs efficiency cores distinguished by EfficiencyClass).
 bool testCpuTopology() {
     bool result = true;
-    CpuTopology* topo = cpu_topology();
+    CpuTopology topo = CpuTopology.snapshot();
 
-    result &= Test("topology physicalCount >= 1", topo->physicalCount >= 1, true);
-    result &= Test("topology physicalCount <= logicalCount", topo->physicalCount <= topo->logicalCount, true);
-    result &= Test("topology llcCount >= 1", topo->llcCount >= 1, true);
+    result &= Test("topology physicalCount >= 1", topo.physicalCount >= 1, true);
+    result &= Test("topology physicalCount <= logicalCount", topo.physicalCount <= topo.logicalCount, true);
+    result &= Test("topology llcCount >= 1", topo.llcCount >= 1, true);
 
     // Every LLC mask is non-zero, and all LLC masks are pairwise disjoint.
     bool llcNonZero = true;
     bool llcDisjoint = true;
     int i = 0;
-    while (i < topo->llcCount) {
-        if (topo->llcMask[i] == (u64)0) { llcNonZero = false; }
+    while (i < topo.llcCount) {
+        if (topo.llcMask[i] == (u64)0) { llcNonZero = false; }
         int j = i + 1;
-        while (j < topo->llcCount) {
-            if ((topo->llcMask[i] & topo->llcMask[j]) != (u64)0) { llcDisjoint = false; }
+        while (j < topo.llcCount) {
+            if ((topo.llcMask[i] & topo.llcMask[j]) != (u64)0) { llcDisjoint = false; }
             j = j + 1;
         }
         i = i + 1;
@@ -861,93 +861,91 @@ bool testCpuTopology() {
     // Union of llcMask[0..llcCount-1] == union of coreMask[0..physicalCount-1].
     u64 llcUnion = (u64)0;
     i = 0;
-    while (i < topo->llcCount) { llcUnion = llcUnion | topo->llcMask[i]; i = i + 1; }
+    while (i < topo.llcCount) { llcUnion = llcUnion | topo.llcMask[i]; i = i + 1; }
     u64 coreUnion = (u64)0;
     i = 0;
-    while (i < topo->physicalCount) { coreUnion = coreUnion | topo->coreMask[i]; i = i + 1; }
+    while (i < topo.physicalCount) { coreUnion = coreUnion | topo.coreMask[i]; i = i + 1; }
     result &= Test("topology llc union == core union", (int)(llcUnion == coreUnion), 1);
 
-    // cpu_mask_physical(n): popcount == min(n, physicalCount).
-    result &= Test("mask_physical(1) popcount", _testPopcount(cpu_mask_physical(1)), 1);
-    int expectAll = topo->physicalCount;
+    // maskPhysical(n): popcount == min(n, physicalCount).
+    result &= Test("mask_physical(1) popcount", _testPopcount(topo.maskPhysical(1)), 1);
+    int expectAll = topo.physicalCount;
     if (expectAll > 64) { expectAll = 64; }
-    result &= Test("mask_physical(physicalCount) popcount", _testPopcount(cpu_mask_physical(topo->physicalCount)), expectAll);
-    result &= Test("mask_physical(physicalCount+5) popcount", _testPopcount(cpu_mask_physical(topo->physicalCount + 5)), expectAll);
+    result &= Test("mask_physical(physicalCount) popcount", _testPopcount(topo.maskPhysical(topo.physicalCount)), expectAll);
+    result &= Test("mask_physical(physicalCount+5) popcount", _testPopcount(topo.maskPhysical(topo.physicalCount + 5)), expectAll);
 
     // perf/efficiency cores partition the full core union.
-    u64 perf = cpu_mask_perf_cores();
-    u64 eff  = cpu_mask_efficiency_cores();
+    u64 perf = topo.maskPerfCores();
+    u64 eff  = topo.maskEfficiencyCores();
     result &= Test("perf | efficiency == core union", (int)((perf | eff) == coreUnion), 1);
     result &= Test("perf & efficiency == 0", (int)(perf & eff), 0);
 
-    // cpu_mask_llc(i) non-zero for every valid domain; out-of-range returns 0.
+    // maskLlc(i) non-zero for every valid domain; out-of-range returns 0.
     bool llcHelperNonZero = true;
     i = 0;
-    while (i < cpu_llc_count()) {
-        if (cpu_mask_llc(i) == (u64)0) { llcHelperNonZero = false; }
+    while (i < topo.llcCount) {
+        if (topo.maskLlc(i) == (u64)0) { llcHelperNonZero = false; }
         i = i + 1;
     }
-    result &= Test("cpu_mask_llc nonzero in range", llcHelperNonZero, true);
-    result &= Test("cpu_mask_llc(-1) == 0", (int)cpu_mask_llc(-1), 0);
-    result &= Test("cpu_mask_llc(llcCount) == 0", (int)cpu_mask_llc(cpu_llc_count()), 0);
+    result &= Test("maskLlc nonzero in range", llcHelperNonZero, true);
+    result &= Test("maskLlc(-1) == 0", (int)topo.maskLlc(-1), 0);
+    result &= Test("maskLlc(llcCount) == 0", (int)topo.maskLlc(topo.llcCount), 0);
 
     // Same shape for NUMA.
     bool numaHelperNonZero = true;
     i = 0;
-    while (i < cpu_numa_count()) {
-        if (cpu_mask_numa(i) == (u64)0) { numaHelperNonZero = false; }
+    while (i < topo.numaCount) {
+        if (topo.maskNuma(i) == (u64)0) { numaHelperNonZero = false; }
         i = i + 1;
     }
-    result &= Test("cpu_mask_numa nonzero in range", numaHelperNonZero, true);
-    result &= Test("cpu_mask_numa(-1) == 0", (int)cpu_mask_numa(-1), 0);
-    result &= Test("cpu_mask_numa(numaCount) == 0", (int)cpu_mask_numa(cpu_numa_count()), 0);
+    result &= Test("maskNuma nonzero in range", numaHelperNonZero, true);
+    result &= Test("maskNuma(-1) == 0", (int)topo.maskNuma(-1), 0);
+    result &= Test("maskNuma(numaCount) == 0", (int)topo.maskNuma(topo.numaCount), 0);
 
-    // numa_domain_id/index: valid, pairwise-distinct OS node ids; inverse holds.
+    // domainId/domainIndex: valid, pairwise-distinct OS node ids; inverse holds.
     bool numaIdsValid     = true;
     bool numaIdsDistinct  = true;
     bool numaIndexRoundtrip = true;
     i = 0;
-    while (i < cpu_numa_count()) {
-        int id = numa_domain_id(i);
+    while (i < topo.numaCount) {
+        int id = topo.domainId(i);
         if (id < 0) { numaIdsValid = false; }
         int j = i + 1;
-        while (j < cpu_numa_count()) {
-            if (numa_domain_id(j) == id) { numaIdsDistinct = false; }
+        while (j < topo.numaCount) {
+            if (topo.domainId(j) == id) { numaIdsDistinct = false; }
             j = j + 1;
         }
-        if (numa_domain_index(id) != i) { numaIndexRoundtrip = false; }
+        if (topo.domainIndex(id) != i) { numaIndexRoundtrip = false; }
         i = i + 1;
     }
-    result &= Test("numa_domain_id valid in range", numaIdsValid, true);
-    result &= Test("numa_domain_id pairwise distinct", numaIdsDistinct, true);
-    result &= Test("numa_domain_index(id(i)) == i", numaIndexRoundtrip, true);
-    result &= Test("numa_domain_id(numaCount) == -1", numa_domain_id(cpu_numa_count()), -1);
-    result &= Test("numa_domain_index(-12345) == -1", numa_domain_index(-12345), -1);
+    result &= Test("domainId valid in range", numaIdsValid, true);
+    result &= Test("domainId pairwise distinct", numaIdsDistinct, true);
+    result &= Test("domainIndex(id(i)) == i", numaIndexRoundtrip, true);
+    result &= Test("domainId(numaCount) == -1", topo.domainId(topo.numaCount), -1);
+    result &= Test("domainIndex(-12345) == -1", topo.domainIndex(-12345), -1);
 
-    // numa_domain_info: domain 0's detail matches the snapshot; unknown id fails.
-    NumaDomainInfo inf = default;
-    bool infoOk = numa_domain_info(numa_domain_id(0), &inf);
-    result &= Test("numa_domain_info(id(0)) succeeds", infoOk, true);
-    result &= Test("numa_domain_info cpuMask == cpu_mask_numa(0)", (int)(inf.cpuMask == cpu_mask_numa(0)), 1);
-    result &= Test("numa_domain_info logicalCpus == popcount(cpuMask)", inf.logicalCpus, _testPopcount(inf.cpuMask));
-    result &= Test("numa_domain_info physicalCores >= 1", inf.physicalCores >= 1, true);
-    result &= Test("numa_domain_info physicalCores <= logicalCpus", inf.physicalCores <= inf.logicalCpus, true);
+    // domainInfo: domain 0's detail matches the snapshot; unknown id fails.
+    NumaDomainInfo inf = topo.domainInfo(topo.domainId(0));
+    result &= Test("domainInfo(id(0)) succeeds", inf.id != -1, true);
+    result &= Test("domainInfo cpuMask == maskNuma(0)", (int)(inf.cpuMask == topo.maskNuma(0)), 1);
+    result &= Test("domainInfo logicalCpus == popcount(cpuMask)", inf.logicalCpus, _testPopcount(inf.cpuMask));
+    result &= Test("domainInfo physicalCores >= 1", inf.physicalCores >= 1, true);
+    result &= Test("domainInfo physicalCores <= logicalCpus", inf.physicalCores <= inf.logicalCpus, true);
 
-    NumaDomainInfo badInf = default;
-    result &= Test("numa_domain_info(unknown id) fails", numa_domain_info(-12345, &badInf), false);
+    result &= Test("domainInfo(unknown id) fails", topo.domainInfo(-12345).id == -1, true);
 
     // Memory: Windows/Linux report real free bytes; Windows total is documented
     // -1 by design (no per-node total API), so only cross-check when both sides
     // are actually known.
     if const (!__MACOS__) {
-        result &= Test("numa_domain_info memFreeBytes > 0", inf.memFreeBytes > 0, true);
+        result &= Test("domainInfo memFreeBytes > 0", inf.memFreeBytes > 0, true);
         if (inf.memTotalBytes >= 0 && inf.memFreeBytes >= 0) {
-            result &= Test("numa_domain_info memFree <= memTotal", inf.memFreeBytes <= inf.memTotalBytes, true);
+            result &= Test("domainInfo memFree <= memTotal", inf.memFreeBytes <= inf.memTotalBytes, true);
         }
     }
 
     // vmem_alloc_numa: 64K-aligned, writable, symmetric free - on every platform.
-    void* p = vmem_alloc_numa((i64)1 << 20, numa_domain_id(0));
+    void* p = vmem_alloc_numa((i64)1 << 20, topo.domainId(0));
     result &= Test("vmem_alloc_numa non-null", p != nullptr, true);
     if (p != nullptr) {
         result &= Test("vmem_alloc_numa 64K-aligned", (int)(((i64)p & (i64)0xFFFF) == 0), 1);
@@ -995,7 +993,7 @@ bool testCpuTopology() {
     }
 
     // vmem_alloc_numa_huge: same graceful-degrade contract, node-bound.
-    void* hpn = vmem_alloc_numa_huge(hugeSize, numa_domain_id(0));
+    void* hpn = vmem_alloc_numa_huge(hugeSize, topo.domainId(0));
     result &= Test("vmem_alloc_numa_huge non-null", hpn != nullptr, true);
     if (hpn != nullptr) {
         result &= Test("vmem_alloc_numa_huge 64K-aligned", (int)(((i64)hpn & (i64)0xFFFF) == 0), 1);
@@ -1024,29 +1022,29 @@ bool testCpuTopology() {
     // no cheap observable, just must not crash on a 1-node box or a real NUMA one).
     if const (!__WINDOWS__) {
         if const (!__MACOS__) {
-            os.thread_bind_memory_self(numa_domain_id(0));
+            os.thread_bind_memory_self(topo.domainId(0));
         }
     }
 
     // QoS mapping: an empty mask is always QOS_CLASS_UNSPECIFIED (0).
-    result &= Test("cpu_qos_for_mask(0) == 0", cpu_qos_for_mask(0), 0);
+    result &= Test("qosForMask(0) == 0", topo.qosForMask(0), 0);
 
     if const (__MACOS__) {
         // Apple Silicon is not SMT, so physical == logical here.
-        result &= Test("macos physicalCount == logicalCount", (int)(topo->physicalCount == topo->logicalCount), 1);
-        result &= Test("macos perf cores non-zero", (int)(cpu_mask_perf_cores() != (u64)0), 1);
-        result &= Test("macos llc count >= 1", topo->llcCount >= 1, true);
+        result &= Test("macos physicalCount == logicalCount", (int)(topo.physicalCount == topo.logicalCount), 1);
+        result &= Test("macos perf cores non-zero", (int)(topo.maskPerfCores() != (u64)0), 1);
+        result &= Test("macos llc count >= 1", topo.llcCount >= 1, true);
         // On a >1-core-class box (P + E, i.e. 2 perflevels) the efficiency set is
         // non-empty and disjoint from the perf set.
         bool twoClasses = false;
         int e = 1;
-        while (e < topo->physicalCount) {
-            if (topo->coreEff[e] != topo->coreEff[0]) { twoClasses = true; }
+        while (e < topo.physicalCount) {
+            if (topo.coreEff[e] != topo.coreEff[0]) { twoClasses = true; }
             e = e + 1;
         }
         if (twoClasses) {
-            result &= Test("macos eff cores non-zero", (int)(cpu_mask_efficiency_cores() != (u64)0), 1);
-            result &= Test("macos perf/eff disjoint", (int)((cpu_mask_perf_cores() & cpu_mask_efficiency_cores()) == (u64)0), 1);
+            result &= Test("macos eff cores non-zero", (int)(topo.maskEfficiencyCores() != (u64)0), 1);
+            result &= Test("macos perf/eff disjoint", (int)((topo.maskPerfCores() & topo.maskEfficiencyCores()) == (u64)0), 1);
         }
     }
 
@@ -1072,7 +1070,8 @@ void _numaWorkerSleep(void* arg) {
 // Machine-independent - the same assertions hold on a 1-domain WSL box.
 bool testNumaDomain() {
     bool result = true;
-    int id0 = numa_domain_id(0);
+    CpuTopology topo = CpuTopology.snapshot();
+    int id0 = topo.domainId(0);
 
     // Acquisition tier depends on the affinity API: Windows/Linux reach PROCESS,
     // macOS has no affinity API so PROCESS is refused (NONE still works).
@@ -1096,9 +1095,8 @@ bool testNumaDomain() {
     result &= Test("acquire(id0) non-null", d != nullptr, true);
     result &= Test("double-acquire(id0) null", NumaDomain.acquire(id0, NUMA_ISOLATE_NONE) == nullptr, true);
 
-    // info() through the domain matches numa_domain_info directly.
-    NumaDomainInfo direct = default;
-    numa_domain_info(id0, &direct);
+    // info() through the domain matches CpuTopology.domainInfo directly.
+    NumaDomainInfo direct = topo.domainInfo(id0);
     NumaDomainInfo via = d->info();
     result &= Test("info().physicalCores matches", via.physicalCores, direct.physicalCores);
     result &= Test("info().logicalCpus matches", via.logicalCpus, direct.logicalCpus);

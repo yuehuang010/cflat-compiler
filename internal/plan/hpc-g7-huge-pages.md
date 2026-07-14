@@ -219,7 +219,7 @@ NUMA work put the alignment logic in one shared core.
     huge pages (this *is* the graceful-degrade test);
   - if `vmem_huge_pages_available()` is true, additionally assert 2 MB
     alignment;
-  - `vmem_alloc_numa_huge` on `numa_domain_id(0)` behaves the same;
+  - `vmem_alloc_numa_huge` on `topo.domainId(0)` behaves the same;
   - `vmem_huge_page_bytes()` is 0 or 2097152, never anything else.
 - `doc/HPC.md`: a "Huge pages" section - what it buys (TLB), the API, and
   the admin steps per platform (Windows: `secpol.msc` -> Local Policies ->

@@ -122,7 +122,7 @@ i32 code = t.join();   // 42
 
 **Affinity** matters for performance work: pinning a producer and consumer (or per-core HPC workers) to separate physical cores avoids OS scheduling jitter and cross-core cache bouncing.
 
-Affinity is real on Windows (`SetThreadAffinityMask`) and Linux (`pthread_setaffinity_np`), and a **no-op on macOS**, which has no CPU affinity API. Test `os.thread_affinity_supported()` to branch. On macOS the equivalent lever is the QoS class - `os.thread_set_qos_self(qos)`, set from the target thread itself - which steers it onto the performance or efficiency cluster; `cpu_qos_for_mask()` in `topology.cb` converts a core mask into the right QoS class, and `ThreadPool` applies it automatically when `pinMask` is set. See [HPC.md](HPC.md).
+Affinity is real on Windows (`SetThreadAffinityMask`) and Linux (`pthread_setaffinity_np`), and a **no-op on macOS**, which has no CPU affinity API. Test `os.thread_affinity_supported()` to branch. On macOS the equivalent lever is the QoS class - `os.thread_set_qos_self(qos)`, set from the target thread itself - which steers it onto the performance or efficiency cluster; a `CpuTopology` snapshot's `qosForMask(mask)` method (`topology.cb`) converts a core mask into the right QoS class, and `ThreadPool` applies it automatically when `pinMask` is set. See [HPC.md](HPC.md).
 
 ```c
 Thread t;
@@ -202,8 +202,8 @@ fp_disable_traps();                 // back to masked (quiet-NaN) behavior
   argument is optional and defaults to `0`. `pinMask` can come from the simple
   `cpu_mask_lowest(n)` (cores `0..n-1`) or, for a topology-aware choice (physical
   cores, performance vs efficiency class, LLC/CCX domains, NUMA nodes), from
-  `core/topology.cb`'s `cpu_mask_physical`/`cpu_mask_perf_cores`/`cpu_mask_efficiency_cores`/
-  `cpu_mask_llc`/`cpu_mask_numa` - see [HPC.md's Pinning workers to
+  a `CpuTopology` snapshot's (`core/topology.cb`) `maskPhysical`/`maskPerfCores`/`maskEfficiencyCores`/
+  `maskLlc`/`maskNuma` methods - see [HPC.md's Pinning workers to
   cores](HPC.md#pinning-workers-to-cores-pin) for the full helper list and a worked
   per-CCX pinning example.
 - Raw `parallel_for_n(n, workers, body, pin, fpConfig)` and

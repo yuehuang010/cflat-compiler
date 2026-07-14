@@ -305,12 +305,16 @@ and both CCXs - exactly the jitter pinning exists to remove.
 
 AS-BUILT (Windows, 2026-07-09): new core/topology.cb + os.windows.cb
 externs (GetLogicalProcessorInformationEx, GetActiveProcessorCount). A
-lazily-initialized, mutex-memoized CpuTopology snapshot walks the Ex
+CpuTopology.snapshot() walks the Ex
 buffer in one RelationAll pass (RelationProcessorCore -> per-core mask
 + EfficiencyClass; RelationCache level==3 -> LLC domains, deduped;
-RelationNumaNode -> NUMA domains), exposing cpu_mask_physical(n) /
-cpu_mask_perf_cores() / cpu_mask_efficiency_cores() / cpu_mask_llc(domain)
-/ cpu_llc_count() / cpu_mask_numa(node) / cpu_numa_count() on top. The
+RelationNumaNode -> NUMA domains), exposing topo.maskPhysical(n) /
+topo.maskPerfCores() / topo.maskEfficiencyCores() / topo.maskLlc(domain)
+/ topo.llcCount / topo.maskNuma(node) / topo.numaCount on top. (Current
+API: CpuTopology is a plain value struct - CpuTopology.snapshot() is
+NOT memoized, each call re-walks the OS, so callers snapshot once and
+keep the caller-owned value rather than calling it in a loop; there is
+no process-wide singleton and nothing to free.) The
 u64-mask contract end to end (ThreadPool.init pinMask ->
 Thread.setAffinity -> os.thread_set_affinity -> SetThreadAffinityMask)
 is untouched - G5 only adds smarter mask CONSTRUCTORS. cpu_mask_lowest
@@ -326,7 +330,7 @@ installed Windows SDK header (not guessed) and confirmed by a
 throwaway smoke program against the dev box's known topology. Test:
 testCpuTopology() in Test/test_threadpool.cb, machine-independent
 assertions (physicalCount in [1,logicalCount], llcMask
-pairwise-disjoint and covering, cpu_mask_physical(n) popcount ==
+pairwise-disjoint and covering, topo.maskPhysical(n) popcount ==
 min(n,physicalCount), perf|efficiency covers all physical cores,
 perf&efficiency==0).
 
@@ -335,16 +339,16 @@ logical/10 physical, 4x Zen5 + 6x Zen5c): logicalCount=20
 physicalCount=10 llcCount=2 numaCount=1; EfficiencyClass DOES
 distinguish the two core types (Zen5 cores 0-3 = class 1, Zen5c cores
 4-9 = class 0), and on this part the class split happens to coincide
-exactly with the LLC/CCX split (cpu_mask_perf_cores()==cpu_mask_llc(0)==
-0xff, cpu_mask_efficiency_cores()==cpu_mask_llc(1)==0xfff00) - not
+exactly with the LLC/CCX split (topo.maskPerfCores()==topo.maskLlc(0)==
+0xff, topo.maskEfficiencyCores()==topo.maskLlc(1)==0xfff00) - not
 guaranteed on other hybrid parts, just observed here. Benchmark
 performance/hpc/topology_pingpong_bench.cb (cache-line ping-pong
-latency, pinned via cpu_mask_llc(), best-of-5 fresh-process runs):
+latency, pinned via topo.maskLlc(), best-of-5 fresh-process runs):
 cross-CCX line bounce is consistently ~1.8-2.2x slower than either
 intra-CCX case (~90ns intra-CCX0/Zen5, ~105ns intra-CCX1/Zen5c, ~190ns
 cross-CCX), directionally consistent with (not expected to numerically
 match) the ~2.8x one-way L3-latency figure from perf_cache_mountain.cb
-- confirming cpu_mask_llc() tracks a real hardware boundary.
+- confirming topo.maskLlc() tracks a real hardware boundary.
 
 POSIX PARITY DONE 2026-07-10 (agents): the original Windows-only scope
 was revisited and extended so all three platforms do a real topology
@@ -365,7 +369,7 @@ walk.
   NONE - Darwin has no CPU affinity API (thread_affinity_policy returns
   KERN_NOT_SUPPORTED on Apple Silicon); thread_set_affinity is an
   honest no-op and os.thread_affinity_supported() lets callers branch.
-  The actionable lever instead is QoS: cpu_qos_for_mask(mask) maps to
+  The actionable lever instead is QoS: topo.qosForMask(mask) maps to
   QOS_CLASS_BACKGROUND (subset of eff cores) / USER_INTERACTIVE (subset
   of perf cores) / 0 otherwise, INCLUDING on any uniform
   single-core-class machine, where there is no P/E split to express and

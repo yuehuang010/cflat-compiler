@@ -1,8 +1,8 @@
 // topology_pingpong_bench.cb - cache-line ping-pong latency across the G5
-// topology-aware masks (cpu_mask_llc), in three pinned configurations:
+// topology-aware masks (CpuTopology.maskLlc), in three pinned configurations:
 //
-//   intra-CCX0  - both threads on distinct physical cores inside cpu_mask_llc(0)
-//   intra-CCX1  - both threads on distinct physical cores inside cpu_mask_llc(1)
+//   intra-CCX0  - both threads on distinct physical cores inside maskLlc(0)
+//   intra-CCX1  - both threads on distinct physical cores inside maskLlc(1)
 //   cross-CCX   - one thread in llc(0), the other in llc(1)
 //
 // Two threads alternate ownership of one shared cache line (an atomic_counter
@@ -59,11 +59,11 @@ int pingB(void* ctx) {
 // topology enumeration order. Returns 0 if there is no such core (caller must
 // check before using it as an affinity mask).
 u64 pickCoreInLlc(u64 llcMask, int skip) {
-    CpuTopology* topo = cpu_topology();
+    CpuTopology topo = CpuTopology.snapshot();
     int found = 0;
     int i = 0;
-    while (i < topo->physicalCount) {
-        u64 cm = topo->coreMask[i];
+    while (i < topo.physicalCount) {
+        u64 cm = topo.coreMask[i];
         if (cm != (u64)0 && (cm & llcMask) == cm) {
             if (found == skip) {
                 return cm & ((~cm) + (u64)1);   // isolate lowest set bit
@@ -116,15 +116,15 @@ double benchConfig(char* name, u64 maskA, u64 maskB) {
 }
 
 extern int main() {
-    CpuTopology* topo = cpu_topology();
-    printf("cpu_topology(): logicalCount=%d physicalCount=%d llcCount=%d\n",
-           topo->logicalCount, topo->physicalCount, topo->llcCount);
+    CpuTopology topo = CpuTopology.snapshot();
+    printf("CpuTopology.snapshot(): logicalCount=%d physicalCount=%d llcCount=%d\n",
+           topo.logicalCount, topo.physicalCount, topo.llcCount);
 
-    if (topo->llcCount < 2) {
+    if (topo.llcCount < 2) {
         printf("Only %d LLC domain(s) found - this benchmark needs at least 2 to show a cross-CCX gap.\n",
-               topo->llcCount);
+               topo.llcCount);
         printf("Falling back to intra-CCX0 only (two distinct physical cores in llc(0)).\n");
-        u64 llc0 = cpu_mask_llc(0);
+        u64 llc0 = topo.maskLlc(0);
         u64 a = pickCoreInLlc(llc0, 0);
         u64 b = pickCoreInLlc(llc0, 1);
         if (a == (u64)0 || b == (u64)0) {
@@ -135,8 +135,8 @@ extern int main() {
         return 0;
     }
 
-    u64 llc0 = cpu_mask_llc(0);
-    u64 llc1 = cpu_mask_llc(1);
+    u64 llc0 = topo.maskLlc(0);
+    u64 llc1 = topo.maskLlc(1);
     printf("llcMask[0]=0x%llx llcMask[1]=0x%llx\n", llc0, llc1);
 
     u64 c0a = pickCoreInLlc(llc0, 0);

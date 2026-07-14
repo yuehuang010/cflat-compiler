@@ -418,6 +418,11 @@ class ThreadPool {
         _count    = workerCount;
         _capacity = workerCount;
         _workers  = new Thread[workerCount];
+        // One topology snapshot for the whole spawn loop, not one per worker
+        // (a snapshot re-walks the OS - Windows Ex query / Linux sysfs walk -
+        // which is not cheap). Only taken when pinning is actually in use.
+        CpuTopology pinTopo = default;
+        if (_pinMask != (u64)0) { pinTopo = CpuTopology.snapshot(); }
         int i = 0;
         while (i < workerCount) {
             WorkerStartCtx* sc = new WorkerStartCtx();
@@ -425,7 +430,7 @@ class ThreadPool {
             sc->slot = i;
             // Derive a macOS QoS class from this worker's pinned core set (the
             // actionable pinning lever on Darwin, where setAffinity is a no-op).
-            if (_pinMask != (u64)0) { sc->qos = cpu_qos_for_mask(__threadpool_nth_core(_pinMask, i)); }
+            if (_pinMask != (u64)0) { sc->qos = pinTopo.qosForMask(__threadpool_nth_core(_pinMask, i)); }
             _workers[i].start(__threadpool_worker, sc, _fpConfig);   // ownership transfers to worker
             if (_pinMask != (u64)0) {
                 _workers[i].setAffinity(__threadpool_nth_core(_pinMask, i));
@@ -647,13 +652,16 @@ class ThreadPool {
                 _capacity = newCount;
             }
             _count = newCount;
+            // One topology snapshot for the whole grow loop; see init() for why.
+            CpuTopology pinTopo = default;
+            if (_pinMask != (u64)0) { pinTopo = CpuTopology.snapshot(); }
             int j = oldCount;
             while (j < newCount) {
                 _workerStops[j].init();
                 WorkerStartCtx* sc = new WorkerStartCtx();
                 sc->wctx = &_ctx;
                 sc->slot = j;
-                if (_pinMask != (u64)0) { sc->qos = cpu_qos_for_mask(__threadpool_nth_core(_pinMask, j)); }
+                if (_pinMask != (u64)0) { sc->qos = pinTopo.qosForMask(__threadpool_nth_core(_pinMask, j)); }
                 _workers[j].start(__threadpool_worker, sc, _fpConfig);   // ownership transfers to worker
                 if (_pinMask != (u64)0) {
                     _workers[j].setAffinity(__threadpool_nth_core(_pinMask, j));
