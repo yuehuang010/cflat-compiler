@@ -4069,9 +4069,9 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     llvm::json::Object root;
     {
         llvm::TimeTraceScope buildScope("CoreCacheJsonBuild", prefix);
-    // Version 2 added interface FIELDS to the interface records; a v1 cache would
-    // silently drop them, so it must be rejected rather than reused.
-    root["version"]   = 2;
+    // Each version added tables an older cache lacks (v2: interface fields; v3: annotation
+    // declarations), so an older cache must be rejected rather than silently reused.
+    root["version"]   = 3;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
 
@@ -4119,6 +4119,26 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
         llvm::json::Object obj;
         for (auto& [k, v] : enumBackingTypes) obj[k] = v;
         root["enum_backing_types"] = std::move(obj);
+    }
+
+    // annotationRegistry - annotation name -> declared field names. An empty array is
+    // meaningful (a no-arg annotation), so every entry must be preserved.
+    {
+        llvm::json::Object obj;
+        for (auto& [name, fields] : annotationRegistry)
+        {
+            llvm::json::Array arr;
+            for (auto& f : fields) arr.push_back(f);
+            obj[name] = std::move(arr);
+        }
+        root["annotation_decls"] = std::move(obj);
+    }
+
+    // typeAnnotations_ - type/interface name -> annotations attached to it.
+    {
+        llvm::json::Object obj;
+        for (auto& [name, anns] : typeAnnotations_) obj[name] = SerializeAnnotations(anns);
+        root["type_annotations"] = std::move(obj);
     }
 
     // functionTable
@@ -4333,7 +4353,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 2) return false;
+    if (!ver || *ver != 3) return false;
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != ComputeCoreHash(runtimeDir)) return false;
 
@@ -4368,6 +4388,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     interfaceFields.clear();
     interfaceParents.clear();
     typeAnnotations_.clear();
+    annotationRegistry.clear();
     globalNamedVariable.clear();
     globalVariableTypes.clear();
     globalDeclSite.clear();
@@ -4412,6 +4433,23 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     if (auto* obj = root->getObject("enum_backing_types"))
         for (auto& kv : *obj)
             if (auto v = kv.second.getAsString()) enumBackingTypes[kv.first.str()] = v->str();
+
+    // annotationRegistry - annotation name -> declared field names.
+    if (auto* obj = root->getObject("annotation_decls"))
+        for (auto& kv : *obj)
+            if (auto* arr = kv.second.getAsArray())
+            {
+                std::vector<std::string> fields;
+                for (auto& f : *arr)
+                    if (auto v = f.getAsString()) fields.push_back(v->str());
+                annotationRegistry[kv.first.str()] = std::move(fields);
+            }
+
+    // typeAnnotations_ - type/interface name -> annotations attached to it.
+    if (auto* obj = root->getObject("type_annotations"))
+        for (auto& kv : *obj)
+            if (auto* arr = kv.second.getAsArray())
+                typeAnnotations_[kv.first.str()] = DeserializeAnnotations(arr);
 
     } // end CoreDes:Metadata
 
