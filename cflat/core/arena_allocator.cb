@@ -188,10 +188,10 @@ mutex       _ar_reg_lock = default;
 void _ar_reg_init_top()
 {
     if (_ar_reg_top != nullptr) return;
-    _ar_reg_lock.acquire();
-    if (_ar_reg_top == nullptr)
-        _ar_reg_top = (_AR_RegDir*)vmem_alloc((i64)65536 * (i64)sizeof(_AR_RegDir));
-    _ar_reg_lock.release();
+    lock(_ar_reg_lock) {
+        if (_ar_reg_top == nullptr)
+            _ar_reg_top = (_AR_RegDir*)vmem_alloc((i64)65536 * (i64)sizeof(_AR_RegDir));
+    }
 }
 
 // Record that the 64K page at base is owned by the given ArenaAllocator.
@@ -206,10 +206,10 @@ void _ar_reg_insert(i64 base, i8* owner)
 
     if (_ar_reg_top[hi]._table == nullptr)
     {
-        _ar_reg_lock.acquire();
-        if (_ar_reg_top[hi]._table == nullptr)
-            _ar_reg_top[hi]._table = (_AR_RegSlot*)vmem_alloc((i64)65536 * (i64)sizeof(_AR_RegSlot));
-        _ar_reg_lock.release();
+        lock(_ar_reg_lock) {
+            if (_ar_reg_top[hi]._table == nullptr)
+                _ar_reg_top[hi]._table = (_AR_RegSlot*)vmem_alloc((i64)65536 * (i64)sizeof(_AR_RegSlot));
+        }
     }
     _AR_RegSlot* tbl = _ar_reg_top[hi]._table;
     if (tbl == nullptr) return;
@@ -401,9 +401,8 @@ class ArenaAllocator : IAllocator
     // Allocate size bytes under the arena lock.
     void* alloc(i64 size)
     {
-        _lock.acquire();
-        void* r = _allocUnsynced(size);
-        _lock.release();
+        void* r;
+        lock(_lock) { r = _allocUnsynced(size); }
         return r;
     }
 
@@ -455,9 +454,7 @@ class ArenaAllocator : IAllocator
     // Lock-taking entry used by the registry router to free an owned pointer.
     void _lockedDeallocOwned(void* ptr)
     {
-        _lock.acquire();
-        _deallocOwned(ptr);
-        _lock.release();
+        lock(_lock) { _deallocOwned(ptr); }
     }
 
     // Free a pointer this arena owns. MUST be called with _lock held and only
@@ -558,10 +555,10 @@ class ArenaAllocator : IAllocator
         i64 i = (i64)0;
         while (i < (i64)sizeof(ArenaAllocator)) { raw[i] = (i8)0; i = i + (i64)1; }
 
-        _lock.acquire();
-        child->_next_sibling = _first_child;
-        _first_child         = child;
-        _lock.release();
+        lock(_lock) {
+            child->_next_sibling = _first_child;
+            _first_child         = child;
+        }
 
         IAllocator child_iface = child;
         return child_iface;

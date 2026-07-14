@@ -181,23 +181,22 @@ struct NumaDomain {
             if (required == NUMA_ISOLATE_PROCESS) { return nullptr; }
         }
 
-        _g_numaRegLock.acquire();
-        u64 bit = (u64)1 << slot;
-        if ((_g_numaAcquiredIdx & bit) != (u64)0) {
-            _g_numaRegLock.release();
-            return nullptr;   // already acquired in this process
-        }
-        _g_numaAcquiredIdx = _g_numaAcquiredIdx | bit;
         int level = NUMA_ISOLATE_NONE;
-        if (required == NUMA_ISOLATE_PROCESS) {
-            // Windows/Linux both reach PROCESS tier; the confinement itself is
-            // best-effort (skipped when the complement is empty), but the level
-            // is recorded as PROCESS regardless (addendum: single-domain box).
-            _g_numaConfineIdx = _g_numaConfineIdx | bit;
-            level = NUMA_ISOLATE_PROCESS;
-            _numa_recompute_confinement(&topo);
+        lock(_g_numaRegLock) {
+            u64 bit = (u64)1 << slot;
+            if ((_g_numaAcquiredIdx & bit) != (u64)0) {
+                return nullptr;   // already acquired in this process
+            }
+            _g_numaAcquiredIdx = _g_numaAcquiredIdx | bit;
+            if (required == NUMA_ISOLATE_PROCESS) {
+                // Windows/Linux both reach PROCESS tier; the confinement itself is
+                // best-effort (skipped when the complement is empty), but the level
+                // is recorded as PROCESS regardless (addendum: single-domain box).
+                _g_numaConfineIdx = _g_numaConfineIdx | bit;
+                level = NUMA_ISOLATE_PROCESS;
+                _numa_recompute_confinement(&topo);
+            }
         }
-        _g_numaRegLock.release();
 
         u64 domainMask = topo.numaMask[slot];
         NumaDomain* d = new NumaDomain;
@@ -215,41 +214,41 @@ struct NumaDomain {
     // via the OS thread's own lifetime. Idempotent. Recomputes process
     // confinement so releasing one domain keeps the others' confinement intact.
     void release(bool killRemaining) {
-        _lock.acquire();
-        if (_released) { _lock.release(); return; }
-        _released = true;
-        while (_threads.count() > 0) {
-            NumaThread* t = _threads.take(0);   // ownership out of the list
-            if (t->_os != nullptr) {
-                if (killRemaining) {
-                    os.thread_kill(t->_os);
-                    t->_os = nullptr;
-                    // Windows kill is synchronous, so the packet is safe to free;
-                    // on POSIX pthread_cancel is deferred (the live thread may
-                    // still read _pkt) so it is intentionally leaked.
-                    if const (__WINDOWS__) {
-                        if (t->_pkt != nullptr) { free((void*)t->_pkt); t->_pkt = nullptr; }
+        lock(_lock) {
+            if (_released) { return; }
+            _released = true;
+            while (_threads.count() > 0) {
+                NumaThread* t = _threads.take(0);   // ownership out of the list
+                if (t->_os != nullptr) {
+                    if (killRemaining) {
+                        os.thread_kill(t->_os);
+                        t->_os = nullptr;
+                        // Windows kill is synchronous, so the packet is safe to free;
+                        // on POSIX pthread_cancel is deferred (the live thread may
+                        // still read _pkt) so it is intentionally leaked.
+                        if const (__WINDOWS__) {
+                            if (t->_pkt != nullptr) { free((void*)t->_pkt); t->_pkt = nullptr; }
+                        }
+                    } else {
+                        // Let the straggler run to completion detached; the os handle
+                        // wrapper is freed, the packet is owned by the live thread.
+                        os.thread_detach(t->_os);
+                        t->_os = nullptr;
                     }
-                } else {
-                    // Let the straggler run to completion detached; the os handle
-                    // wrapper is freed, the packet is owned by the live thread.
-                    os.thread_detach(t->_os);
-                    t->_os = nullptr;
                 }
+                delete t;   // NumaThread has no destructor; frees the struct memory
             }
-            delete t;   // NumaThread has no destructor; frees the struct memory
         }
-        _lock.release();
 
         int slot = _topo.domainIndex(id);
-        _g_numaRegLock.acquire();
-        if (slot >= 0) {
-            u64 bit = (u64)1 << slot;
-            _g_numaAcquiredIdx = _g_numaAcquiredIdx & ~bit;
-            _g_numaConfineIdx  = _g_numaConfineIdx & ~bit;
-            _numa_recompute_confinement(&_topo);
+        lock(_g_numaRegLock) {
+            if (slot >= 0) {
+                u64 bit = (u64)1 << slot;
+                _g_numaAcquiredIdx = _g_numaAcquiredIdx & ~bit;
+                _g_numaConfineIdx  = _g_numaConfineIdx & ~bit;
+                _numa_recompute_confinement(&_topo);
+            }
         }
-        _g_numaRegLock.release();
     }
 
     // Release on scope exit (graceful: stragglers detached, not killed).
@@ -263,12 +262,14 @@ struct NumaDomain {
     // Returns nullptr (a borrow either way - the domain owns the thread) when no
     // free physical core remains; size work to info().physicalCores.
     alias NumaThread* acquireThread(function<void(void*)> entry, void* arg) {
-        _lock.acquire();
-        if (_released || _freeCores == (u64)0) { _lock.release(); return nullptr; }
-        u64 coreBit = _freeCores & ((~_freeCores) + (u64)1);   // lowest free core bit
-        _freeCores = _freeCores & (_freeCores - (u64)1);       // consume it
-        int coreIdx = _numa_bit_index(coreBit);
-        _lock.release();
+        u64 coreBit = 0;
+        int coreIdx = -1;
+        lock(_lock) {
+            if (_released || _freeCores == (u64)0) { return nullptr; }
+            coreBit = _freeCores & ((~_freeCores) + (u64)1);   // lowest free core bit
+            _freeCores = _freeCores & (_freeCores - (u64)1);       // consume it
+            coreIdx = _numa_bit_index(coreBit);
+        }
 
         _NumaThreadPacket* pkt = (_NumaThreadPacket*)malloc(sizeof(_NumaThreadPacket));
         pkt->userEntry = entry;
@@ -279,9 +280,9 @@ struct NumaDomain {
         void* h = os.thread_create(_numa_thread_trampoline, (void*)pkt);
         if (h == nullptr) {
             free((void*)pkt);
-            _lock.acquire();
-            _freeCores = _freeCores | coreBit;   // hand the core back
-            _lock.release();
+            lock(_lock) {
+                _freeCores = _freeCores | coreBit;   // hand the core back
+            }
             return nullptr;
         }
         // Pin to the single core (Windows/Linux); no-op on macOS (QoS in the
@@ -295,10 +296,11 @@ struct NumaDomain {
         t->_pkt     = pkt;
         t->_coreBit = coreBit;
 
-        _lock.acquire();
-        _threads.add(t);   // MOVES t into the list; the domain owns it now
-        NumaThread* borrowed = _threads.get(_threads.count() - 1);
-        _lock.release();
+        NumaThread* borrowed = nullptr;
+        lock(_lock) {
+            _threads.add(t);   // MOVES t into the list; the domain owns it now
+            borrowed = _threads.get(_threads.count() - 1);
+        }
         return borrowed;
     }
 
@@ -308,19 +310,19 @@ struct NumaDomain {
     // cleanup; on POSIX the trampoline packet is leaked, as os.thread_kill docs).
     void releaseThread(NumaThread* t) {
         if (t == nullptr) { return; }
-        _lock.acquire();
-        int idx = -1;
-        int i = 0;
-        while (i < _threads.count()) {
-            if (_threads.get(i) == t) { idx = i; break; }
-            i = i + 1;
-        }
         NumaThread* owned = nullptr;
-        if (idx >= 0) {
-            owned = _threads.take(idx);          // ownership out of the list
-            _freeCores = _freeCores | t->_coreBit;
+        lock(_lock) {
+            int idx = -1;
+            int i = 0;
+            while (i < _threads.count()) {
+                if (_threads.get(i) == t) { idx = i; break; }
+                i = i + 1;
+            }
+            if (idx >= 0) {
+                owned = _threads.take(idx);          // ownership out of the list
+                _freeCores = _freeCores | t->_coreBit;
+            }
         }
-        _lock.release();
         if (owned == nullptr) { return; }        // foreign / already released
 
         if (owned->_os != nullptr) {

@@ -730,6 +730,20 @@ bool testRwlockLockStatement() {
         shared = 77;
     }
     result &= Test("rwlock lock statement (write)", shared, 77);
+
+    // Mode suffixes: lock(rw.write) is exclusive, lock(rw.read) is shared. Nesting two
+    // read locks must not deadlock - a second shared acquire does not block.
+    int val = 0;
+    lock (rw.write) {
+        shared = 88;
+    }
+    lock (rw.read) {
+        lock (rw.read) {
+            val = shared;
+        }
+    }
+    result &= Test("rwlock lock statement (rw.write)", shared, 88);
+    result &= Test("rwlock lock statement (rw.read)", val, 88);
     return result;
 }
 

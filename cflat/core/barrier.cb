@@ -59,40 +59,39 @@ struct barrier {
     // arriver, the "leader") so a single-threaded fixup - a buffer swap, a
     // reduction combine - can run once between phases.
     bool arrive_and_wait() {
-        _mtx.acquire();
-        u64 gen = _generation;          // capture my phase before releasing the lock
-        _count  = _count - 1;
-        if (_count == 0) {
-            _generation = _generation + 1;   // advance phase -> releases the waiters
-            _count      = _total;            // re-arm for the next round
-            cv_wake_all(&_cv);
-            _mtx.release();
-            return true;                     // leader
+        lock(_mtx) {
+            u64 gen = _generation;          // capture my phase before releasing the lock
+            _count  = _count - 1;
+            if (_count == 0) {
+                _generation = _generation + 1;   // advance phase -> releases the waiters
+                _count      = _total;            // re-arm for the next round
+                cv_wake_all(&_cv);
+                return true;                     // leader
+            }
+            // Re-check _generation (not _count) on wake: it guards both spurious
+            // wakeups and the lap race - a thread that re-enters for the next phase
+            // captures the new generation, so this straggler still compares against
+            // its own captured old gen and exits only when the phase truly advanced.
+            while (gen == _generation) {
+                _mtx.sleep_cv(&_cv);
+            }
+            return false;
         }
-        // Re-check _generation (not _count) on wake: it guards both spurious
-        // wakeups and the lap race - a thread that re-enters for the next phase
-        // captures the new generation, so this straggler still compares against
-        // its own captured old gen and exits only when the phase truly advanced.
-        while (gen == _generation) {
-            _mtx.sleep_cv(&_cv);
-        }
-        _mtx.release();
-        return false;
     }
 
     // Permanently leave the group: subsequent phases expect one fewer arrival.
     // The equivalent of std::barrier::arrive_and_drop - use when a worker is
     // done for good. Counts as an arrival for the current phase.
     void arrive_and_drop() {
-        _mtx.acquire();
-        _total = _total - 1;
-        _count = _count - 1;
-        if (_count == 0) {
-            _generation = _generation + 1;
-            _count      = _total;
-            cv_wake_all(&_cv);
+        lock(_mtx) {
+            _total = _total - 1;
+            _count = _count - 1;
+            if (_count == 0) {
+                _generation = _generation + 1;
+                _count      = _total;
+                cv_wake_all(&_cv);
+            }
         }
-        _mtx.release();
     }
 
     // Release OS resources. No threads may be waiting.

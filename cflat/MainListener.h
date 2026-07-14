@@ -5165,21 +5165,16 @@ public:
                 }
                 else
                 {
-                    // For rw.read / rw.write: evaluate only the base (the postfix up to the mode suffix).
-                    // The expression is `base.read` or `base.write`. We need to evaluate `base`.
-                    // In ANTLR, exprCtx->assignmentExpression()->conditionalExpression()->...
-                    // is the full expression. We strip the trailing member access by evaluating
-                    // one level up: find the receiver of the final member access.
-                    // Simple approach: evaluate the whole expression and use the struct var (receiver).
-                    // The receiver has .Storage pointing to the rwlock; accessing .read/.write would fail
-                    // at IR gen, so we intercept the postfix expression chain manually.
-                    //
-                    // For MVP: just use the full expression text as canonical and call acquire() directly.
-                    // The mode is tracked in currentLockSet but acquire() always does exclusive for now.
-                    mutexNV = ParseAssignmentExpressionNamed(exprCtx->assignmentExpression());
-                    // If the last field access was .read or .write (non-existent field on rwlock),
-                    // mutexNV.Storage might be null. Fall back to calling acquire() on the base.
-                    // TODO: properly evaluate only the base sub-expression for rwlock.read/write.
+                    // `rw.read` / `rw.write`: the mode suffix is a soft keyword, not a real field.
+                    // Evaluate the postfix chain minus the trailing '.'/'read'/'write' children.
+                    auto* pfx = tryGetPostfixExpression(exprCtx);
+                    if (pfx == nullptr || pfx->children.size() < 3)
+                    {
+                        LogErrorContext(lockStmt, std::format(
+                            "lock: '{}' mode requires a simple lock target, e.g. 'lock(rw.{})'.", mode, mode));
+                        return;
+                    }
+                    mutexNV = ParsePostfixExpression(pfx, true, 2);
                 }
 
                 // Spill into alloca if returned by value (no storage pointer).
@@ -12120,7 +12115,8 @@ public:
     //   [PFX-5]   indirect call through a function<...> value (vtable slot, callback field)
     //   [PFX-6]   argument assembly + implicit-this prepend
     //   [PFX-7]   call lowering: [winrt] vtable dispatch | null-conditional | overloaded call
-    LLVMBackend::NamedVariable ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue = false)
+    LLVMBackend::NamedVariable ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue = false,
+                                                       size_t dropTrailingChildren = 0)
     {
         /*
         * postfixExpression
@@ -12170,8 +12166,14 @@ public:
             // `rs->lpVtbl->Release(rs)`. Set on redirect, consumed (and cleared) by the call.
             llvm::Value* pendingThinComReceiver = nullptr;
 
+            // dropTrailingChildren lets a caller (e.g. the lock statement, for `rw.read`)
+            // evaluate only the base of the postfix chain, ignoring a trailing suffix.
+            size_t childLimit = ctx->children.size();
+            childLimit -= std::min(dropTrailingChildren, childLimit);
+            size_t childIndex = 0;
             for (auto parseTree : ctx->children)
             {
+                if (childIndex++ >= childLimit) break;
                 if (parseTree->getTreeType() == antlr4::tree::ParseTreeType::TERMINAL)
                 {
                     auto terminal = dynamic_cast<antlr4::tree::TerminalNode*>(parseTree);
@@ -15374,6 +15376,28 @@ public:
             }
         }
         return singleRuleChild ? tryGetUnaryExpression(singleRuleChild) : nullptr;
+    }
+
+    // Walk down single-child rule nodes to find a PostfixExpressionContext. Used by the lock
+    // statement to isolate the base of `rw.read` / `rw.write` - the mode suffix is a soft
+    // keyword, not a real field, so evaluating the whole postfix chain fails.
+    // Returns nullptr if the path branches or never reaches a postfixExpression.
+    CFlatParser::PostfixExpressionContext* tryGetPostfixExpression(antlr4::RuleContext* ctx)
+    {
+        if (ctx->getRuleIndex() == CFlatParser::RulePostfixExpression)
+            return dynamic_cast<CFlatParser::PostfixExpressionContext*>(ctx);
+
+        antlr4::RuleContext* singleRuleChild = nullptr;
+        for (auto* child : ctx->children)
+        {
+            if (child->getTreeType() == antlr4::tree::ParseTreeType::RULE)
+            {
+                if (singleRuleChild != nullptr)
+                    return nullptr; // multiple rule children - complex expression
+                singleRuleChild = dynamic_cast<antlr4::RuleContext*>(child);
+            }
+        }
+        return singleRuleChild ? tryGetPostfixExpression(singleRuleChild) : nullptr;
     }
 
     // Extract the callee identifier from a delete operand that is a call, for diagnostics only.

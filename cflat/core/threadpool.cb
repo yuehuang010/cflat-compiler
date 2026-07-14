@@ -272,9 +272,9 @@ bool __threadpool_push_by_priority(WorkerCtx* wctx, Task t, int priority) {
 void __threadpool_release_inflight(WorkerCtx* wctx) {
     i64 remaining = wctx->inflight->decrement();
     if (remaining == 0) {
-        wctx->mtx->acquire();
-        cv_wake_all((void**)wctx->drainCv);
-        wctx->mtx->release();
+        lock(wctx.mtx) {
+            cv_wake_all((void**)wctx->drainCv);
+        }
     }
 }
 
@@ -562,23 +562,23 @@ class ThreadPool {
         _inflight.increment();
         bool submit_now  = false;
         bool duplicate   = false;
-        _lock.acquire();
-        if (dep->_hasCont) {
-            duplicate = true;
-        } else if (dep->done.load() != 0) {
-            // dep finished without a registered continuation; enqueue ourselves.
-            submit_now = true;
-        } else {
-            // Register on dep.  Transfer t.ctx into dep->_contCtx; t.ctx is
-            // nulled so the duplicate/submit_now cleanup below is a no-op.
-            dep->_contFn       = t.fn;
-            dep->_contCtx      = t.ctx;
-            t.ctx              = nullptr;
-            dep->_contHandle   = h;
-            dep->_contPriority = priority;
-            dep->_hasCont      = true;
+        lock(_lock) {
+            if (dep->_hasCont) {
+                duplicate = true;
+            } else if (dep->done.load() != 0) {
+                // dep finished without a registered continuation; enqueue ourselves.
+                submit_now = true;
+            } else {
+                // Register on dep.  Transfer t.ctx into dep->_contCtx; t.ctx is
+                // nulled so the duplicate/submit_now cleanup below is a no-op.
+                dep->_contFn       = t.fn;
+                dep->_contCtx      = t.ctx;
+                t.ctx              = nullptr;
+                dep->_contHandle   = h;
+                dep->_contPriority = priority;
+                dep->_hasCont      = true;
+            }
         }
-        _lock.release();
 
         if (duplicate) {
             __threadpool_release_inflight(&_ctx);
@@ -754,9 +754,9 @@ class ThreadPool {
             }
             _drainingWorkers.decrement();
         } else {
-            _lock.acquire();
-            while (_inflight.read() > 0) { _lock.sleep_cv(&_drainCv); }
-            _lock.release();
+            lock(_lock) {
+                while (_inflight.read() > 0) { _lock.sleep_cv(&_drainCv); }
+            }
         }
     }
 
@@ -837,26 +837,26 @@ void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
     Task cont     = default;
     int  contPrio = THREADPOOL_PRIORITY_NORMAL;
 
-    wctx->mtx->acquire();
-    if (h_ref != nullptr && h_ref->_hasCont) {
-        cont.fn     = h_ref->_contFn;
-        cont.ctx    = h_ref->_contCtx;
-        h_ref->_contCtx = nullptr;  // mark transferred; field never read after _hasCont=false
-        cont.handle = h_ref->_contHandle;
-        if (cont.handle != nullptr) {
-            // then() already initialised _cancelSrc on the cont handle.
-            cont._token = cont.handle->_cancelSrc.get_token();
+    lock(wctx.mtx) {
+        if (h_ref != nullptr && h_ref->_hasCont) {
+            cont.fn     = h_ref->_contFn;
+            cont.ctx    = h_ref->_contCtx;
+            h_ref->_contCtx = nullptr;  // mark transferred; field never read after _hasCont=false
+            cont.handle = h_ref->_contHandle;
+            if (cont.handle != nullptr) {
+                // then() already initialised _cancelSrc on the cont handle.
+                cont._token = cont.handle->_cancelSrc.get_token();
+            }
+            contPrio = h_ref->_contPriority;
+            h_ref->_hasCont = false;   // consume so we don't fire twice
+            fired = true;
         }
-        contPrio = h_ref->_contPriority;
-        h_ref->_hasCont = false;   // consume so we don't fire twice
-        fired = true;
+        if (h_ref != nullptr) {
+            // LAST touch of h_ref: a wait()er may delete the handle as soon as this
+            // makes done visible, so nothing below may read h_ref.
+            __threadpool_publish_done(h_ref, code);
+        }
     }
-    if (h_ref != nullptr) {
-        // LAST touch of h_ref: a wait()er may delete the handle as soon as this
-        // makes done visible, so nothing below may read h_ref.
-        __threadpool_publish_done(h_ref, code);
-    }
-    wctx->mtx->release();
 
     if (fired) {
         if (__threadpool_push_by_priority(wctx, cont, contPrio)) {

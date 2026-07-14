@@ -6,14 +6,17 @@
 //
 // Usage:
 //   mutex m;
-//   lock (m) {              // preferred - release is guaranteed on return
+//   lock (m) {              // preferred - release is guaranteed on return, break, continue
 //       shared_value++;
 //   }
 //
-//   m.acquire();            // manual acquire
+//   m.acquire();            // manual acquire - prefer lock (m) { }
 //   m.release();            // manual release
 //   m.sleep_cv(cvSlot);     // atomically sleep on a condition variable, releasing the lock
 //   m.destroy();            // frees any OS lock state
+//
+// Prefer the lock statement: a manual acquire/release pair can lose the release on an
+// early return or a break, and core/ takes every lock through lock (m) { } for that reason.
 //
 // NOTE: the lock is non-recursive. A thread that calls acquire() twice without an
 // intervening release() will deadlock.

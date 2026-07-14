@@ -242,23 +242,20 @@ src.cancel();
 
 ### Mutex & `lock` Statement (`core/mutex.cb`)
 
+A mutex is always taken with the `lock` statement, which releases it automatically at the end of the block - including on `return`, `break`, and `continue`:
+
 ```c
 import "mutex.cb";
 
-Mutex m;
-m.acquire();
-// critical section
-m.release();
-```
+mutex m;
 
-Use the `lock` statement for scoped acquisition - the lock is released automatically at the end of the block:
-
-```c
 lock (m)
 {
-    // automatically released at end of block
+    // critical section; automatically released at end of block
 }
 ```
+
+`m.acquire()` / `m.release()` are available for manual locking, but prefer the `lock` statement: a manual pair can lose the release on an early `return` or a `break`. Every lock in `core/` is taken through `lock (m) { }` for that reason.
 
 Multiple locks can be acquired together in one statement:
 
@@ -300,7 +297,7 @@ seq.fetchAdd(1);
 - `core/semaphore.cb` - `Semaphore` with `acquire`/`release`
 - `core/latch.cb` - `Latch` countdown; `countDown`, `wait` (one-shot - see [Barrier](#barrier-corebarriercb) for the reusable equivalent)
 - `core/barrier.cb` - `barrier` / `spin_barrier` reusable rendezvous; `arrive_and_wait`
-- `core/rwlock.cb` - `RwLock`; `acquireRead`/`releaseRead`, `acquireWrite`/`releaseWrite`
+- `core/rwlock.cb` - `rwlock`; taken with `lock(rw.read)` (shared) or `lock(rw.write)` / `lock(rw)` (exclusive)
 - `core/channel.cb` - `channel<T>` blocking MPMC queue; `send`, `recv`, `tryRecv`
 - `core/spsc_queue.cb` - `spsc_queue<T>` wait-free single-producer/single-consumer ring
 

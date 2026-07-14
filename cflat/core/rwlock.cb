@@ -6,14 +6,18 @@
 //
 // Usage:
 //   rwlock rw;
-//   rw.acquire_read();      // shared - many readers at once
-//   rw.release_read();
-//   rw.acquire_write();     // exclusive - one writer, no readers
-//   rw.release_write();
+//   lock (rw.read)  { }     // shared - many readers at once (preferred)
+//   lock (rw.write) { }     // exclusive - one writer, no readers
+//   lock (rw)       { }     // bare form is exclusive, same as rw.write
 //   rw.destroy();           // frees any OS lock state
 //
-// lock statement uses exclusive (write) semantics:
-//   lock (rw) { }           // equivalent to acquire_write() / release_write()
+//   rw.acquire_read();      // manual shared - prefer lock (rw.read) { }
+//   rw.release_read();
+//   rw.acquire_write();     // manual exclusive - prefer lock (rw.write) { }
+//   rw.release_write();
+//
+// Prefer the lock statement: a manual acquire/release pair can lose the release on an
+// early return or a break.
 
 import "os.cb";
 

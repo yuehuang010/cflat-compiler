@@ -53,9 +53,9 @@ struct stream {
         _writePos = 0;
         cv_init(&_cvFull);
         cv_init(&_cvEmpty);
-        _mu.acquire();
-        _emptyPool = _bufB;    // seed: bufB ready for first swap
-        _mu.release();
+        lock(_mu) {
+            _emptyPool = _bufB;    // seed: bufB ready for first swap
+        }
     }
 
     // Publish the current write buffer and block until the consumer returns an empty one.
@@ -63,17 +63,17 @@ struct stream {
         if (_writePos == 0) return;
         _writeBuf[_writePos] = '\0';
 
-        _mu.acquire();
-        while (_pendingFull != nullptr) { _mu.sleep_cv(&_cvFull); }
-        _pendingFull = _writeBuf;
-        _pendingLen  = _writePos;
-        cv_wake_one(&_cvFull);
+        lock(_mu) {
+            while (_pendingFull != nullptr) { _mu.sleep_cv(&_cvFull); }
+            _pendingFull = _writeBuf;
+            _pendingLen  = _writePos;
+            cv_wake_one(&_cvFull);
 
-        while (_emptyPool == nullptr) { _mu.sleep_cv(&_cvEmpty); }
-        _writeBuf  = _emptyPool;
-        _emptyPool = nullptr;
-        _writePos  = 0;
-        _mu.release();
+            while (_emptyPool == nullptr) { _mu.sleep_cv(&_cvEmpty); }
+            _writeBuf  = _emptyPool;
+            _emptyPool = nullptr;
+            _writePos  = 0;
+        }
     }
 
     // Called by the onStdout hook (p1 >> s).  Takes ownership of `data` (malloc'd by printf).
@@ -84,12 +84,12 @@ struct stream {
         // Oversized: flush pending data then send this buffer directly (bypass pool).
         if (len >= bufferSize) {
             _flushWrite();
-            _mu.acquire();
-            while (_pendingFull != nullptr) { _mu.sleep_cv(&_cvFull); }
-            _pendingFull = data;
-            _pendingLen  = len;
-            cv_wake_one(&_cvFull);
-            _mu.release();
+            lock(_mu) {
+                while (_pendingFull != nullptr) { _mu.sleep_cv(&_cvFull); }
+                _pendingFull = data;
+                _pendingLen  = len;
+                cv_wake_one(&_cvFull);
+            }
             return;
         }
 
@@ -117,12 +117,12 @@ struct stream {
             char* buf = (char*)malloc((i64)len + 1);
             memcpy(buf, data, (i64)len);
             buf[len] = '\0';
-            _mu.acquire();
-            while (_pendingFull != nullptr) { _mu.sleep_cv(&_cvFull); }
-            _pendingFull = buf;
-            _pendingLen  = len;
-            cv_wake_one(&_cvFull);
-            _mu.release();
+            lock(_mu) {
+                while (_pendingFull != nullptr) { _mu.sleep_cv(&_cvFull); }
+                _pendingFull = buf;
+                _pendingLen  = len;
+                cv_wake_one(&_cvFull);
+            }
             return;
         }
 
@@ -141,27 +141,29 @@ struct stream {
     // Called by the onStdin hook (s >> p2).  Sleeps until a buffer is available.
     // Returns nullptr on EOF (after close() has been called and all data consumed).
     char* read() {
-        _mu.acquire();
-        while (_pendingFull == nullptr && !_eof) { _mu.sleep_cv(&_cvFull); }
-        if (_pendingFull == nullptr) { _mu.release(); return nullptr; }
-        char* buf    = _pendingFull;
-        _pendingFull = nullptr;
-        cv_wake_one(&_cvFull);   // unblock producer waiting for the slot to clear
-        _mu.release();
+        char* buf = nullptr;
+        lock(_mu) {
+            while (_pendingFull == nullptr && !_eof) { _mu.sleep_cv(&_cvFull); }
+            if (_pendingFull == nullptr) { return nullptr; }
+            buf          = _pendingFull;
+            _pendingFull = nullptr;
+            cv_wake_one(&_cvFull);   // unblock producer waiting for the slot to clear
+        }
         return buf;
     }
 
     // Like read() but also returns the byte count - allows the caller to use a
     // length-bounded loop instead of scanning for '\0', enabling LLVM vectorization.
     char* read_buf(int* out_len) {
-        _mu.acquire();
-        while (_pendingFull == nullptr && !_eof) { _mu.sleep_cv(&_cvFull); }
-        if (_pendingFull == nullptr) { _mu.release(); out_len[0] = 0; return nullptr; }
-        char* buf    = _pendingFull;
-        out_len[0]   = _pendingLen;
-        _pendingFull = nullptr;
-        cv_wake_one(&_cvFull);
-        _mu.release();
+        char* buf = nullptr;
+        lock(_mu) {
+            while (_pendingFull == nullptr && !_eof) { _mu.sleep_cv(&_cvFull); }
+            if (_pendingFull == nullptr) { out_len[0] = 0; return nullptr; }
+            buf          = _pendingFull;
+            out_len[0]   = _pendingLen;
+            _pendingFull = nullptr;
+            cv_wake_one(&_cvFull);
+        }
         return buf;
     }
 
@@ -169,10 +171,10 @@ struct stream {
     // Pool buffers are returned to the empty pool; oversized buffers are freed.
     void return_buffer(char* buf) {
         if (buf == _bufA || buf == _bufB) {
-            _mu.acquire();
-            _emptyPool = buf;
-            cv_wake_one(&_cvEmpty);
-            _mu.release();
+            lock(_mu) {
+                _emptyPool = buf;
+                cv_wake_one(&_cvEmpty);
+            }
         } else {
             free((void*)buf);
         }
@@ -187,19 +189,19 @@ struct stream {
         // _emptyPool never gets set and the _cvEmpty wait in _flushWrite() hangs forever.
         if (_writePos > 0) {
             _writeBuf[_writePos] = '\0';
-            _mu.acquire();
-            while (_pendingFull != nullptr) { _mu.sleep_cv(&_cvFull); }
-            _pendingFull = _writeBuf;
-            _pendingLen  = _writePos;
-            _writePos    = 0;
-            cv_wake_one(&_cvFull);
-            _mu.release();
+            lock(_mu) {
+                while (_pendingFull != nullptr) { _mu.sleep_cv(&_cvFull); }
+                _pendingFull = _writeBuf;
+                _pendingLen  = _writePos;
+                _writePos    = 0;
+                cv_wake_one(&_cvFull);
+            }
         }
-        _mu.acquire();
-        while (_pendingFull != nullptr) { _mu.sleep_cv(&_cvFull); }
-        _eof = true;
-        cv_wake_one(&_cvFull);
-        _mu.release();
+        lock(_mu) {
+            while (_pendingFull != nullptr) { _mu.sleep_cv(&_cvFull); }
+            _eof = true;
+            cv_wake_one(&_cvFull);
+        }
     }
 
     // Free both pool buffers, the condition variables, and destroy the mutex.

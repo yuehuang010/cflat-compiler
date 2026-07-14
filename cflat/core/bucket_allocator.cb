@@ -114,10 +114,10 @@ mutex       _ba_reg_lock = default;
 void _ba_reg_init_top()
 {
     if (_ba_reg_top != nullptr) return;
-    _ba_reg_lock.acquire();
-    if (_ba_reg_top == nullptr)
-        _ba_reg_top = (_BA_RegDir*)vmem_alloc((i64)65536 * (i64)sizeof(_BA_RegDir));
-    _ba_reg_lock.release();
+    lock(_ba_reg_lock) {
+        if (_ba_reg_top == nullptr)
+            _ba_reg_top = (_BA_RegDir*)vmem_alloc((i64)65536 * (i64)sizeof(_BA_RegDir));
+    }
 }
 
 // Record that the 64K page at base is owned by the given BucketAllocator.
@@ -132,10 +132,10 @@ void _ba_reg_insert(i64 base, i8* owner)
 
     if (_ba_reg_top[hi]._table == nullptr)
     {
-        _ba_reg_lock.acquire();
-        if (_ba_reg_top[hi]._table == nullptr)
-            _ba_reg_top[hi]._table = (_BA_RegSlot*)vmem_alloc((i64)65536 * (i64)sizeof(_BA_RegSlot));
-        _ba_reg_lock.release();
+        lock(_ba_reg_lock) {
+            if (_ba_reg_top[hi]._table == nullptr)
+                _ba_reg_top[hi]._table = (_BA_RegSlot*)vmem_alloc((i64)65536 * (i64)sizeof(_BA_RegSlot));
+        }
     }
     _BA_RegSlot* tbl = _ba_reg_top[hi]._table;
     if (tbl == nullptr) return;
@@ -385,9 +385,8 @@ class BucketAllocator : IAllocator
     // Allocate size bytes under the allocator lock.
     void* alloc(i64 size)
     {
-        _lock.acquire();
-        void* r = _allocUnsynced(size);
-        _lock.release();
+        void* r;
+        lock(_lock) { r = _allocUnsynced(size); }
         return r;
     }
 
@@ -434,9 +433,7 @@ class BucketAllocator : IAllocator
     // can reach our _lock through a forward-declared BucketAllocator pointer.
     void _lockedDeallocOwned(void* ptr)
     {
-        _lock.acquire();
-        _deallocOwned(ptr);
-        _lock.release();
+        lock(_lock) { _deallocOwned(ptr); }
     }
 
     // Free a pointer this BA owns. MUST be called with _lock held and only after
@@ -505,10 +502,10 @@ class BucketAllocator : IAllocator
         i64 i = 0;
         while (i < (i64)sizeof(BucketAllocator)) { raw[i] = (i8)0; i = i + 1; }
 
-        _lock.acquire();
-        child->_next_sibling = _first_child;
-        _first_child         = child;
-        _lock.release();
+        lock(_lock) {
+            child->_next_sibling = _first_child;
+            _first_child         = child;
+        }
 
         IAllocator child_iface = child;   // pointer -> fat-ptr upcast via assignment
         return child_iface;
