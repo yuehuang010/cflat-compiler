@@ -11,9 +11,11 @@
 // real double free. Use --asan, the deterministic oracle, for double-free / use-after-free.
 //
 // The table, the lock, and the failure report live in the sibling C file
-// (diagnostic/heap_audit.c), imported below so it is compiled by clang-cl and merged
-// into the image by lld-link (requires building with -o). No CRT stdio is used; output
-// goes through Win32 WriteFile - see crashdump.c for the same pattern.
+// (diagnostic/heap_audit.c), imported below so it is compiled by the platform C driver
+// and merged into the image by the platform linker (clang-cl/lld-link on Windows, host
+// clang/ld64.lld on macOS, host clang/lld on Linux; requires building with -o). No CRT
+// stdio is used; output goes through a raw platform write (Win32 WriteFile, POSIX
+// write(2)) - see crashdump.c for the same pattern.
 //
 // Usage:
 //   import "diagnostic/heap_audit.cb";

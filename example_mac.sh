@@ -16,9 +16,10 @@
 # Run from the repo root on an Apple Silicon Mac (Homebrew tools on PATH):
 #   ./example_mac.sh            # builds Release binaries into out/, runs the gate
 #
-# Note: --heap-audit is a Windows-only diagnostic (its C shim includes <windows.h>),
-# so it is not used here; the leak-clean teardown (nativeTeardownForTest) is the same
-# code exercised by --heap-audit on the Windows box (see example.bat).
+# Note: --heap-audit's C shim (diagnostic/heap_audit.c) is portable (POSIX branch via
+# pthread/backtrace/dladdr) and works here too, but this gate does not build with it -
+# the leak-clean teardown (nativeTeardownForTest) is the same code exercised by
+# --heap-audit on the Windows box (see example.bat).
 set -u
 
 CFLAT="x64/Release/cflat"

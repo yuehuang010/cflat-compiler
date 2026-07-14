@@ -12100,6 +12100,14 @@ public:
         // Ensure the attribute is set even on pre-declared functions that skipped createFunctionProto.
         fn->addFnAttr(llvm::Attribute::NullPointerIsValid);
 
+        // Apple's arm64 ABI requires x29 (the frame pointer) to form a valid linked list of
+        // frame records for every non-leaf function; "non-leaf" matches Apple clang's own
+        // default (leaf functions may still omit it). This also lets Darwin's backtrace()
+        // (frame-pointer walk, unlike Windows' unwind-table-based CaptureStackBackTrace) and
+        // native tools (Instruments/sample/debuggers) unwind cflat-generated stacks.
+        if (targetMacOS_)
+            fn->addFnAttr("frame-pointer", "non-leaf");
+
         // The whole program (user files + core libraries) is compiled into a single module
         // and optimized with the per-module pipeline before lld-link merges any separately
         // compiled C objects. A non-extern CFlat function therefore never needs to be visible
