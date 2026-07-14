@@ -2420,6 +2420,7 @@ void LLVMBackend::ResetForReanalysis()
     lastCallLambdaCaptureNames.clear();
     lastCallRequiredLocks.clear();
     lastCallParameterNames.clear();
+    pendingGlobalGuardedBy.clear();
     vectorizeLoops_.clear();
     // Cross-thread sharing scan: per-file escaped-type set and report dedupe set.
     // The configured scan LEVEL is intentionally preserved across files in a batch.

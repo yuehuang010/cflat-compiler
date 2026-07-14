@@ -161,7 +161,7 @@ static void PrintSymbolSuggestions(const LspSymbolIndex& index, const std::strin
     }
 }
 
-static int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool showLogo)
+static int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool showProgress)
 {
     const std::vector<std::string> terms = args.getMultiOption("symbol");
     const std::vector<std::string> importDirs = args.getMultiOption("import-dir");
@@ -230,7 +230,7 @@ static int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool s
         std::cout << ".\n";
         return 1;
     }
-    if (!ok && showLogo)
+    if (!ok && showProgress)
         std::cout << "(note: analysis reported errors; results may be incomplete)\n";
 
     bool first = true;
@@ -305,7 +305,7 @@ int main(int argc, char* argv[])
     args.addFlag("grammar", 0, "Validate the grammar (parse only) of one or more source files; add -v to print the full parse-tree rule stack");
     args.addFlag("no-runtime", 0, "Do not auto-import core/runtime.cb");
     args.addFlag("no-opt", 0, "Disable baseline passes (sroa, mem2reg, instcombine, simplifycfg)");
-    args.addFlag("nologo", 0, "Hide compiler version and completion messages");
+    args.addFlag("nologo", 0, "Hide progress and summary messages (PASS/Checked/Emitted)");
     args.addFlag("ftime-trace", 0, "Write compilation time trace to <input>.time-trace.json");
     args.addMultiOption("c-include", 0, "Header search directory for C library bindings (repeatable)");
     args.addMultiOption("c-lib", 0, "Prebuilt C import library (.lib) to link (repeatable)");
@@ -421,9 +421,9 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    bool showLogo = !args.hasFlag("nologo");
-    if (showLogo)
-        std::cout << "CFlat Compiler " CFLAT_VERSION_STRING "\n";
+    // No banner and no "Done." - the version prints only for --version. --nologo still
+    // silences the progress/summary lines below (scripts parse those logs).
+    bool showProgress = !args.hasFlag("nologo");
 
     // -ftime-trace is a top-level switch: initialize the profiler up front so every
     // code path below (single compile or --check batch) is captured, and write the trace
@@ -436,7 +436,7 @@ int main(int argc, char* argv[])
         if (!ftimeTrace) return;
         if (auto err = llvm::timeTraceProfilerWrite(tracePath, ""))
             llvm::consumeError(std::move(err));
-        else if (showLogo)
+        else if (showProgress)
             std::cout << std::format("Time trace written to {}\n", tracePath);
         llvm::timeTraceProfilerCleanup();
     };
@@ -457,7 +457,7 @@ int main(int argc, char* argv[])
             if (!compiler.CheckGrammar(*args.getPositional(i)))
                 ++failures;
         }
-        if (showLogo)
+        if (showProgress)
             std::cout << std::format("Checked grammar of {} file(s), {} failed.\n",
                                      args.positionalCount(), failures);
         return failures == 0 ? 0 : 1;
@@ -498,7 +498,7 @@ int main(int argc, char* argv[])
             catch (const ExpectedErrorReceived&)  { fileOk = false; }
             if (fileOk)
             {
-                if (showLogo) std::cout << std::format("PASS: {}\n", file);
+                if (showProgress) std::cout << std::format("PASS: {}\n", file);
             }
             else
             {
@@ -506,7 +506,7 @@ int main(int argc, char* argv[])
                 ++failures;
             }
         }
-        if (showLogo)
+        if (showProgress)
             std::cout << std::format("Checked {} file(s), {} failed.\n", args.positionalCount(), failures);
 
         writeTimeTrace("check.time-trace.json");
@@ -557,9 +557,8 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    // --run: the process exit code is the JIT'd program's exit code. Suppress the trailing
-    // "Done." so --run output is exactly what the program itself printed (plus the logo,
-    // unless --nologo).
+    // --run: the process exit code is the JIT'd program's exit code, and the output is
+    // exactly what the program itself printed.
     if (runMode)
         return compiler.GetJitExitCode();
 
@@ -570,10 +569,9 @@ int main(int argc, char* argv[])
         std::string asmName = std::filesystem::path(*winmdOut).stem().string();
         if (!compiler.EmitWinmd(*winmdOut, asmName))
             return 1;
-        if (showLogo)
+        if (showProgress)
             std::cout << std::format("Emitted {}\n", *winmdOut);
     }
 
-    if (showLogo)
-        std::cout << "Done.\n";
+    return 0;
 }

@@ -569,6 +569,40 @@ lock(acct.mtx) {
 }
 ```
 
+### File-Scope Guard Groups
+
+The same construct works at file scope, over globals guarded by a global mutex. The globals in the group become guarded state; the free functions in the group implicitly require the guardian:
+
+```c
+import "mutex.cb";
+
+mutex g_reg = default;
+
+lock(g_reg) {
+    int g_count = 0;                    // guarded global
+    int g_total = 0;                    // guarded global
+
+    void regBump(int n) {               // implicitly requires g_reg
+        g_count = g_count + 1;
+        g_total = g_total + n;
+    }
+}
+```
+
+The guardian is the bare global name (there is no receiver to substitute), so both accessing a guarded global and calling a group function require `g_reg` to be held:
+
+```c
+g_count = g_count + 1;        // error: Global 'g_count' is guarded by 'g_reg': must hold 'g_reg' before accessing it.
+regBump(2);                   // error: must hold 'g_reg' before calling this function.
+
+lock(g_reg) {
+    g_count = g_count + 1;    // OK
+    regBump(2);               // OK
+}
+```
+
+A group inside `namespace N { ... }` works the same way. Reaching in with a qualified name does not bypass the guard - `N.g_count = 1` is an error unless `N.g_mtx` is held - and holding `N.g_mtx` from outside satisfies a guard written as `g_mtx` inside.
+
 ### Reader-Writer Locks
 
 Use `lock(rw.read)` or `lock(rw.write)` to distinguish read and write acquisitions on an `rwlock`:

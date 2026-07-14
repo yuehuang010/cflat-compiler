@@ -1,0 +1,16 @@
+// Calling a function declared inside a file-scope guard group without holding the guardian.
+
+import "mutex.cb";
+
+mutex g_reg = default;
+
+lock(g_reg) {
+    int g_count = 0;
+    void bump(int n) { g_count = g_count + n; }
+}
+
+expect_error("must hold 'g_reg' before calling this function") {
+    void test() {
+        bump(1);   // no lock held - error
+    }
+}

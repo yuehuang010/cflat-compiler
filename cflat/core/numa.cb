@@ -39,10 +39,14 @@ const int NUMA_ISOLATE_PROCESS = 1;   // this process's un-pinned threads kept O
 // identified by its snapshot slot index (CpuTopology.domainIndex(id)); one u64 bit
 // per slot is plenty (topology caps NUMA nodes at 8).
 mutex _g_numaRegLock    = default;
-u64   _g_numaAcquiredIdx = 0;   // bit i set: snapshot slot i is acquired in-process
-u64   _g_numaConfineIdx  = 0;   // bit i set: slot i requested PROCESS-tier confinement
-u64   _g_numaSavedCpus   = 0;   // process cpu mask captured before first confinement
-bool  _g_numaHaveSaved   = false;
+
+// Guard group: the registry state is unreachable without _g_numaRegLock held.
+lock(_g_numaRegLock) {
+    u64   _g_numaAcquiredIdx = 0;   // bit i set: snapshot slot i is acquired in-process
+    u64   _g_numaConfineIdx  = 0;   // bit i set: slot i requested PROCESS-tier confinement
+    u64   _g_numaSavedCpus   = 0;   // process cpu mask captured before first confinement
+    bool  _g_numaHaveSaved   = false;
+}
 
 // --- NumaThread trampoline -------------------------------------------------
 // Heap packet adapting the user's start to the neutral thread entry. Carries
@@ -100,9 +104,9 @@ u64 _numa_domain_free_cores(CpuTopology* topo, u64 domainMask) {
 // Recompute and apply process confinement from the registry. Confines the
 // process's default threads to the complement of all PROCESS-tier domains; if
 // that complement is empty (single-domain box - the addendum case) or no
-// PROCESS-tier domain remains, restores the saved state. Caller holds
-// _g_numaRegLock and passes its CpuTopology snapshot.
-void _numa_recompute_confinement(CpuTopology* topo) {
+// PROCESS-tier domain remains, restores the saved state. The lock clause makes the
+// "caller holds _g_numaRegLock" contract checked; the caller passes its snapshot.
+void _numa_recompute_confinement(CpuTopology* topo) lock(_g_numaRegLock) {
     if (_g_numaConfineIdx == (u64)0 && !_g_numaHaveSaved) { return; }
     u64 allCpus  = 0;
     u64 confined = 0;

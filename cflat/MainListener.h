@@ -1258,6 +1258,22 @@ private:
         Compiler(ctx)->SetTypeAnnotations(typeName, ExtractAnnotations(ctx->annotationList()));
     }
 
+    // File-scope lock group: pre-declare the free functions inside the group with the group's
+    // guardian as a RequiredLock. Unlike the struct case the guardian is NOT prefixed with
+    // "this." - a global guard has no receiver, so its canonical name is the bare global name
+    // (CheckCallSiteLocks then falls through to "global lock - no substitution").
+    // The group's declarations are globals, which the scanner does not pre-scan; ParseGlobalLockGroup
+    // stamps their GuardedBy during codegen.
+    void ScanGlobalLockGroup(CFlatParser::LockFieldGroupContext* ctx, const std::string& namespaceName = {})
+    {
+        auto groupArgs = ctx->lockClause()->lockArgList()->expression();
+        if (groupArgs.empty()) return;
+        // Same canonicalization as GetLockArgCanonical in MainListener (both passes must agree).
+        std::vector<std::string> groupLocks = { NormalizeLockText(groupArgs[0]->getText()) };
+        for (auto* func : ctx->functionDefinition())
+            ScanFunctionDefinition(func, {}, namespaceName, groupLocks);
+    }
+
 public:
     ForwardRefScanner(LLVMBackend* compiler) : compilerLLVM(compiler) {}
     void SetTokens(antlr4::BufferedTokenStream* t) { tokens_ = t; }
@@ -1781,6 +1797,8 @@ public:
                 ScanImportedProgramDefinition(alias);
             }
         }
+        else if (auto* lfg = ctx->lockFieldGroup())
+            ScanGlobalLockGroup(lfg, namespaceName);
         else if (auto expectErrDecl = ctx->expectErrorDeclaration())
         {
             // Bare-semicolon file-scope form (no inner declarations) is armed before
@@ -3218,6 +3236,10 @@ public:
         {
             ParseProgramDefinition(progDef);
         }
+        else if (auto* lfg = ctx->lockFieldGroup())
+        {
+            ParseGlobalLockGroup(lfg, namespaceName);
+        }
         else if (auto imp = ctx->importDeclaration())
         {
             if (imp->children.size() >= 2 && imp->children[1]->getText() == "program")
@@ -3251,6 +3273,9 @@ public:
                     compilerLLVM->ClearCurrentSubprogram();
                     compilerLLVM->expectedError.clear();
                     compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
+                    // The throw unwound past the `global_scope = true` restore in the
+                    // function branch; recovery resumes at file scope, so re-assert it.
+                    global_scope = true;
                 }
 
                 if (!errorReceived && !compilerLLVM->expectedError.empty())
@@ -3269,6 +3294,40 @@ public:
         // Process any generic instantiations queued while parsing the above item.
         // This is the only safe point: the IRBuilder has no active function/block.
         ProcessPendingInstantiations();
+    }
+
+    // File-scope lock group: `lock(g_mtx) { <globals> <functions> }`. The globals get
+    // GuardedBy = g_mtx (stamped in CreateGlobalVariable via pendingGlobalGuardedBy); the
+    // functions were already given RequiredLocks = {g_mtx} by ScanGlobalLockGroup.
+    void ParseGlobalLockGroup(CFlatParser::LockFieldGroupContext* ctx, const std::string& namespaceName = {})
+    {
+        auto groupArgs = ctx->lockClause()->lockArgList()->expression();
+        if (groupArgs.size() != 1)
+        {
+            LogErrorContext(ctx, "a lock group takes exactly one guardian, e.g. 'lock(g_mtx) { ... }'.");
+            return;
+        }
+        std::string guardianName = GetLockArgCanonical(groupArgs[0]);
+
+        compilerLLVM->pendingGlobalGuardedBy = guardianName;
+        try
+        {
+            for (auto* decl : ctx->declaration())
+                ParseDeclaration(decl, namespaceName);
+        }
+        catch (...)
+        {
+            compilerLLVM->pendingGlobalGuardedBy.clear();
+            throw;
+        }
+        compilerLLVM->pendingGlobalGuardedBy.clear();
+
+        for (auto* func : ctx->functionDefinition())
+        {
+            global_scope = false;
+            ParseFunctionDefinition(func, {}, namespaceName);
+            global_scope = true;
+        }
     }
 
     void ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContext* ctx, const std::string& namespaceName = {})
@@ -5232,8 +5291,12 @@ public:
             }
 
             // Update lock-set for static analysis.
+            std::vector<std::string> lockTokens;
             for (const auto& lk : acquired)
-                currentLockSet.insert(lk.canonical);
+                for (auto& tok : LockSetAliases(lk.canonical))
+                    lockTokens.push_back(std::move(tok));
+            for (const auto& tok : lockTokens)
+                currentLockSet.insert(tok);
 
             // Parse the body.
             auto* blockList = lockStmt->compoundStatement()->blockItemList();
@@ -5241,8 +5304,8 @@ public:
                 ParseBlockItemList(blockList);
 
             // Remove from lock-set.
-            for (const auto& lk : acquired)
-                currentLockSet.erase(lk.canonical);
+            for (const auto& tok : lockTokens)
+                currentLockSet.erase(tok);
 
             // Close the scope - EmitDestructorsForScope will call unlock().
             compiler->CreateBlockBreak(nullptr, true);
@@ -12454,6 +12517,8 @@ public:
                                 auto globalNV = Compiler(ctx)->GetGlobalVariableNV(primaryIdentifier);
                                 if (globalNV.Storage != nullptr)
                                 {
+                                    // Reaching into a namespace does not bypass its guard group.
+                                    CheckGlobalGuard(ctx, primaryIdentifier, globalNV);
                                     namedVar = globalNV;
                                 }
                                 else if (Compiler(ctx)->GetFunction(primaryIdentifier))
@@ -16748,7 +16813,12 @@ public:
         {
             auto globalNV = compiler->GetGlobalVariableNV(name);
             if (globalNV.Storage != nullptr)
+            {
+                CheckGlobalGuard(node, name, globalNV);
+                globalNV.IdentifierLine = (int)node->getSymbol()->getLine();
+                globalNV.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
                 return globalNV;
+            }
         }
 
         if (compiler->GetFunction(name))
@@ -16788,7 +16858,12 @@ public:
             // Sibling namespace global (registered qualified, e.g. "Cfg.W").
             auto nsGlobalNV = compiler->GetGlobalVariableNV(nsQualified);
             if (nsGlobalNV.Storage != nullptr)
+            {
+                CheckGlobalGuard(node, name, nsGlobalNV);
+                nsGlobalNV.IdentifierLine = (int)node->getSymbol()->getLine();
+                nsGlobalNV.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
                 return nsGlobalNV;
+            }
             if (compiler->GetFunction(nsQualified))
             {
                 namedVar.Primary = compiler->GetFunctionForFuncPtr(nsQualified);
@@ -17763,6 +17838,35 @@ public:
     static std::string StripLockModeSuffix(const std::string& text)
     {
         return NormalizeLockText(text);
+    }
+
+    // Lock-set tokens a held lock contributes. A namespace-qualified global ("Reg.g_mtx")
+    // also contributes its bare form, because a guard group inside "namespace Reg" names its
+    // guardian as written there ("g_mtx"). Only true namespace prefixes are stripped, so a
+    // member access like "obj.mtx" never aliases to a bare "mtx".
+    std::vector<std::string> LockSetAliases(const std::string& canonical)
+    {
+        std::vector<std::string> tokens = { canonical };
+        for (size_t i = canonical.find('.'); i != std::string::npos; i = canonical.find('.', i + 1))
+            if (compilerLLVM->IsNamespace(canonical.substr(0, i)))
+                tokens.push_back(canonical.substr(i + 1));
+        return tokens;
+    }
+
+    // Lock-set check for a global declared inside a file-scope lock group. Mirrors the
+    // struct-field check, but says "Global" so the two diagnostics are distinguishable.
+    // Templated on the node so both the bare-identifier and the namespace-qualified
+    // (Reg.g_count) access paths can report against their own context.
+    template <typename TNode>
+    void CheckGlobalGuard(TNode* node, const std::string& name,
+                          const LLVMBackend::NamedVariable& globalNV)
+    {
+        const std::string& guard = globalNV.TypeAndValue.GuardedBy;
+        if (guard.empty()) return;
+        if (currentLockSet.find(guard) != currentLockSet.end()) return;
+        LogErrorContext(node, std::format(
+            "Global '{}' is guarded by '{}': must hold '{}' before accessing it.",
+            name, guard, guard));
     }
 
     // Verify that the current lock-set satisfies the RequiredLocks of the function just called.

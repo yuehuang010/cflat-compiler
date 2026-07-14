@@ -28,7 +28,8 @@ positionals are treated as additional `.c` inputs to link. See
 | `--output` | `-o` | path | Output native executable (`.exe`). Linking is what merges `.c`/`.lib` inputs, so C interop requires this. |
 | `--out-lli` | `-l` | path | Write the LLVM IR (`.ll`) - the final, optimized IR that lands in the object. |
 | `--bitcode` | `-b` | path | Write LLVM bitcode (`.bc`). |
-| `--nologo` | | | Hide the version banner and the trailing "Done." line. Useful for scripting. |
+| `--nologo` | | | Hide the progress and summary lines (`PASS:`, `Checked N file(s)`, `Emitted ...`). Useful for scripting. |
+| `--version` | | | Print the version and exit. There is no startup banner; the version prints only here. |
 
 You can combine `-o` with `-l`/`-b` to emit the exe and the IR/bitcode in one pass.
 

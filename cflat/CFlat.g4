@@ -661,6 +661,7 @@ externalDeclaration
     | importDeclaration
     | ifConstDeclaration
     | expectErrorDeclaration
+    | lockFieldGroup
     | ';' // stray ;
     ;
 

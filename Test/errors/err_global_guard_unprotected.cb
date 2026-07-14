@@ -1,0 +1,29 @@
+// Accessing a global declared in a file-scope guard group without holding the guardian.
+
+import "mutex.cb";
+
+mutex g_reg = default;
+
+lock(g_reg) {
+    int g_count = 0;
+}
+
+expect_error("Global 'g_count' is guarded by 'g_reg'") {
+    void test() {
+        int v = g_count;
+    }
+}
+
+// Reaching into a namespace with a qualified name does not bypass its guard group.
+namespace Reg {
+    mutex g_mtx = default;
+    lock(g_mtx) {
+        int g_total = 0;
+    }
+}
+
+expect_error("Global 'Reg.g_total' is guarded by 'g_mtx'") {
+    void testQualified() {
+        int v = Reg.g_total;
+    }
+}

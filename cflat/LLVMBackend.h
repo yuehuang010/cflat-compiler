@@ -908,6 +908,9 @@ public:
     std::vector<std::string> lastCallLambdaCaptureNames;
     std::vector<std::string> lastCallRequiredLocks;  // RequiredLocks of the last resolved overload (for call-site lock checking)
     std::vector<std::string> lastCallParameterNames; // VariableName of each parameter of the last resolved overload
+    // Set while parsing the declarations of a file-scope lock group; CreateGlobalVariable
+    // stamps it onto the global's TypeAndValue.GuardedBy. Empty outside such a group.
+    std::string pendingGlobalGuardedBy;
 
     private:
 
@@ -10004,6 +10007,11 @@ public:
         if (effAlign > abiAlign)
             gVar->setAlignment(llvm::Align(effAlign));
 
+        // File-scope lock group: stamp the guardian onto the global so identifier
+        // resolution can enforce the lock-set on every access.
+        if (!pendingGlobalGuardedBy.empty())
+            typeValue.GuardedBy = pendingGlobalGuardedBy;
+
         globalNamedVariable[typeValue.VariableName] = gVar;
         globalVariableTypes[typeValue.VariableName] = typeValue;
 
@@ -10050,6 +10058,12 @@ public:
 
     llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0, uint64_t userAlign = 0)
     {
+        // No enclosing scope means a file-scope declaration reached the local path (a stale
+        // global_scope). back() on the empty scope stack is UB - diagnose instead of corrupting.
+        if (stackNamedVariable.empty())
+            LogError(std::format("internal: local variable '{}' declared with no enclosing scope",
+                                 typeValue.VariableName));
+
         auto type = GetType(typeValue, autoType);
         // An abandoned C-imported record (field type the extractor couldn't map, e.g.
         // INPUT_RECORD's anonymous union) is an unsized opaque shell - diagnose, don't emit invalid IR.

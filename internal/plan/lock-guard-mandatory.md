@@ -27,6 +27,34 @@ locks had never worked, despite being documented. `ParsePostfixExpression` gaine
 the trailing `.read`/`.write` member access (`rw.read` -> `rw`, `a.rw.read` -> `a.rw`,
 `p->rw.read` -> `p->rw`).
 
+**File-scope guard groups are now supported**: `lock(g_mtx) { <globals> <functions> }` at
+file scope guards globals with a global mutex, with the same semantics as the struct form
+(guarded globals report "Global 'x' is guarded by 'g_mtx'"; group functions gain
+`RequiredLocks = {g_mtx}`). Both bare and namespace-qualified access (`N.g_count`) are
+checked.
+
+**Adopted in `core/numa.cb`**: the four process-wide registry globals
+(`_g_numaAcquiredIdx`, `_g_numaConfineIdx`, `_g_numaSavedCpus`, `_g_numaHaveSaved`) are in a
+`lock(_g_numaRegLock)` group, and `_numa_recompute_confinement` carries a
+`lock(_g_numaRegLock)` clause - its "Caller holds _g_numaRegLock" prose comment is now a
+checked contract.
+
+**Deliberately NOT adopted in `arena_allocator.cb` / `bucket_allocator.cb`.** Their radix
+registries are lock-free on read by design: `_ar_reg_lookup` / `_ba_reg_lookup` sit on the
+`free()` hot path and take no lock, and the lock guards only *publication* of a second-level
+table (double-checked locking; x64 TSO means a thread observing a published `_table` also
+observes its zero-fill). A guard group means "hold the lock to TOUCH this", so it cannot
+express that read/write asymmetry - it would reject all ~10 fast-path reads, and satisfying
+it would serialize every `free()` through a global mutex. A guard group needs a
+read-lock-free / write-locked variant before these could adopt it.
+
+Known soundness limit: the lock-set is a set of *name strings*, so a held lock satisfies
+any guard spelled the same way. `lock(N.g_mtx)` also contributes the bare `g_mtx` (a group
+inside `namespace N` names its guardian as written there), so an unrelated guard named
+`g_mtx` in another scope would be satisfied by it. This is the same approximation the
+existing `this.mtx` -> `mtx` aliasing already makes; it yields false negatives (a missed
+error), never a false positive.
+
 ## Why not blocked
 
 **A concurrent B-tree for HPC is a planned direction, and it needs hand-over-hand lock
@@ -61,17 +89,3 @@ The check was ~25 lines (`CheckRawLockCall`, next to `CheckCallSiteLocks` in
   `os.mutex_lock` compiles unchecked). Make it a source-level property of the struct.
 - Any such rule needs an escape hatch for hand-over-hand locking, or the concurrent
   B-tree cannot be written.
-
-## Known gap: guard groups cannot be declared over globals
-
-A file-scope guard group does not parse:
-
-```cflat
-mutex g_reg = default;
-lock(g_reg) { int g_count = 0; }   // error: mismatched input 'lock' expecting end of file
-```
-
-`lock(g_reg) { ... }` as a *statement* works on a global mutex; you just cannot declare
-*what it guards*. `arena_allocator`, `bucket_allocator`, and `numa` each lock a global
-registry this way, so their registry state cannot be compiler-guarded. Allowing a guard
-group at file scope would close this.
