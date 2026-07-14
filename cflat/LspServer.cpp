@@ -1,4 +1,5 @@
 #include <llvm/Support/CrashRecoveryContext.h>
+#include <llvm/Support/thread.h>
 
 #include "LspServer.h"
 #include "LspTypes.h"
@@ -18,6 +19,7 @@
 #include <thread>
 #include <unordered_map>
 #include <atomic>
+#include <csignal>
 #include <deque>
 #if defined(_WIN32)
 #include <windows.h>
@@ -358,6 +360,67 @@ struct OpenDocument
     std::string text;
 };
 
+// Analysis worker stack size. The compiler walks ANTLR parse trees by recursive descent
+// (ParseTreeWalker -> MainListener -> nested CompileImportedFile -> ForwardRefScanner), so
+// peak stack scales with parse-tree depth and import nesting. A std::thread gets the platform
+// default - only 512 KB on macOS and 1 MB on Windows - which the deeper example/ui sources
+// exhaust, faulting the guard page. The CLI compiles on the main thread (8 MB) and never hit
+// this. 16 MB is reserved address space, committed only as touched.
+constexpr unsigned kDefaultAnalysisStackBytes = 16u * 1024 * 1024;
+
+// CFLAT_LSP_STACK_KB overrides the worker stack size, for reproducing/bisecting stack
+// exhaustion (mirrors CFLAT_LSP_POOL_SIZE). 0 or unset means the default above.
+unsigned AnalysisStackBytes()
+{
+    size_t envLen = 0;
+    char envBuf[16] = {};
+    if (getenv_s(&envLen, envBuf, sizeof(envBuf), "CFLAT_LSP_STACK_KB") == 0 && envLen > 0)
+    {
+        int kb = std::atoi(envBuf);
+        if (kb > 0) return (unsigned)kb * 1024u;
+    }
+    return kDefaultAnalysisStackBytes;
+}
+
+// Human-readable cause for a CrashRecoveryContext failure. RetCode is the POSIX signal
+// number, or the SEH exception code on Windows.
+std::string DescribeCrash(int retCode)
+{
+#if defined(_WIN32)
+    const char* name = nullptr;
+    switch ((unsigned)retCode)
+    {
+        case 0xC00000FDu: name = "stack overflow";                  break;
+        case 0xC0000005u: name = "access violation";                break;
+        case 0xC000001Du: name = "illegal instruction";             break;
+        case 0xC0000094u: name = "integer divide by zero";          break;
+        case 0xC0000374u: name = "heap corruption";                 break;
+        case 0x80000003u: name = "breakpoint / assertion";          break;
+        default: break;
+    }
+    if (name)
+        return std::format("{} (exception 0x{:08X})", name, (unsigned)retCode);
+    return std::format("exception 0x{:08X}", (unsigned)retCode);
+#else
+    // CrashRecoveryContext reports a POSIX crash as 128 + signal (see its isCrash()).
+    int sig = retCode > 128 ? retCode - 128 : retCode;
+    const char* name = nullptr;
+    switch (sig)
+    {
+        case SIGSEGV: name = "SIGSEGV (segmentation fault - bad pointer or stack exhaustion)"; break;
+        case SIGBUS:  name = "SIGBUS (bus error - bad address or stack exhaustion)";           break;
+        case SIGILL:  name = "SIGILL (illegal instruction)";                                   break;
+        case SIGFPE:  name = "SIGFPE (arithmetic fault)";                                      break;
+        case SIGABRT: name = "SIGABRT (abort - failed assertion or llvm_unreachable)";         break;
+        case SIGTRAP: name = "SIGTRAP (trap)";                                                 break;
+        default: break;
+    }
+    if (name)
+        return std::format("{}, worker stack {} KB", name, AnalysisStackBytes() / 1024);
+    return std::format("signal {}, worker stack {} KB", sig, AnalysisStackBytes() / 1024);
+#endif
+}
+
 class LspServer
 {
 public:
@@ -396,13 +459,18 @@ public:
             freeBackends_.push_back(i);
         }
 
-        // Worker pool - one thread per backend slot.
+        // Worker pool - one thread per backend slot. llvm::thread (not std::thread) so the
+        // stack size is explicit: the analysis recursion needs far more than the platform
+        // default a std::thread would get. See kDefaultAnalysisStackBytes.
+        const unsigned stackBytes = AnalysisStackBytes();
+        const std::optional<unsigned> stackArg(stackBytes);  // picks the stack-size ctor
         workers_.reserve(poolSize_);
         for (unsigned int i = 0; i < poolSize_; ++i)
-            workers_.emplace_back([this] { WorkerLoop(); });
+            workers_.emplace_back(stackArg, [this] { WorkerLoop(); });
 
         if (verbose_)
-            std::cerr << std::format("[lsp] backend pool size: {}\n", poolSize_);
+            std::cerr << std::format("[lsp] backend pool size: {}, worker stack: {} KB\n",
+                                     poolSize_, stackBytes / 1024);
     }
 
     ~LspServer()
@@ -1352,7 +1420,13 @@ private:
 
         if (!recovered)
         {
-            if (verbose_) std::cerr << std::format("[lsp] compiler crash on slot {}, replacing backend\n", slot);
+            // Name the actual fault. CrashRecoveryContext::RetCode is the signal number on
+            // POSIX and the SEH exception code on Windows; a generic wrapper here is what
+            // kept the stack-overflow root cause of this crash class dark for so long.
+            std::string cause = DescribeCrash(crc.RetCode);
+            std::cerr << std::format("[lsp] compiler crash on slot {} analyzing '{}': {}\n",
+                                     slot, filePath.empty() ? uri : filePath, cause);
+
             auto fresh = std::make_unique<LLVMBackend>();
             fresh->SetRuntimeDir(runtimeDir_);
             fresh->SetVerbose(verbose_);
@@ -1361,7 +1435,7 @@ private:
 
             lsp::Diagnostic crashDiag;
             crashDiag.range   = { {0, 0}, {0, 1} };
-            crashDiag.message = "Internal compiler error during analysis";
+            crashDiag.message = "Internal compiler error during analysis: " + cause;
             diagnostics.push_back(crashDiag);
         }
         else
@@ -1627,7 +1701,7 @@ private:
     std::mutex jobMutex_;
     std::condition_variable jobCV_;
     bool stopWorkers_ = false;
-    std::vector<std::thread> workers_;
+    std::vector<llvm::thread> workers_;  // llvm::thread: explicit (large) stack size
 
     // Per-URI generation counter - older jobs for the same URI are dropped.
     std::mutex uriGenMutex_;
@@ -1679,7 +1753,7 @@ int RunLspServer(int argc, char* argv[])
     fcntl(protocolFd, F_SETFD, FD_CLOEXEC);
 #endif
 
-    llvm::CrashRecoveryContext::Enable();
+    if (!getenv("CFLAT_LSP_NO_CRC")) llvm::CrashRecoveryContext::Enable();
 
     std::string runtimeDir = GetExeDir();
 
