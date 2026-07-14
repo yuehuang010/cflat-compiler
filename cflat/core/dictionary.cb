@@ -184,7 +184,9 @@ struct dictionary<K, V>
     }
 
     // Read the value for key.  Returns default(V) if the key is not present.
-    V get(K key)
+    // `alias`: the value stays owned by the dictionary, so the returned value must not be
+    // destructed by the caller (it aliases the slot's buffers) - same contract as list.get.
+    alias V get(K key)
     {
         if (_capacity == 0) return _missing;
         int slot = _slot(key);
@@ -253,8 +255,8 @@ struct dictionary<K, V>
         _tombstones = 0;
     }
 
-    // d[key] - same semantics as get(key): returns default(V) on miss.
-    V operator[](K key)
+    // d[key] - same semantics as get(key): returns default(V) on miss (alias borrow, see get).
+    alias V operator[](K key)
     {
         return get(key);
     }

@@ -342,6 +342,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     llvm::TimeTraceScope compileScope("Compilation", sourceFileName);
     auto rootCanonical = std::filesystem::weakly_canonical(filename).string();
     currentSourceFilePath_ = rootCanonical;
+    currentSourceIsCore_ = false;   // the root file is the user's program, never a core import
     importedFiles.insert(rootCanonical);
     importStack.push_back(rootCanonical);
     struct RootGuard {
@@ -775,6 +776,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             // bodies of deferred delete-site destructor wrappers (recursive containers whose
             // element type was incomplete when the container dtor was emitted).
             EmitDeferredFullDestructorBodies();
+            // Every return in main is now lowered: destruct global owning values on each of them.
+            EmitGlobalDestructorsInMain();
         }
         stream.close();
         if (verbose) std::cout << "[verbose]   walk complete\n";
@@ -1521,8 +1524,10 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
 
     auto savedSourceFileName = sourceFileName;
     auto savedSourceFilePath = currentSourceFilePath_;
+    auto savedSourceIsCore = currentSourceIsCore_;
     sourceFileName = std::filesystem::path(canonicalStr).filename().string();
     currentSourceFilePath_ = canonicalStr;
+    currentSourceIsCore_ = isCoreImport;
 
     // Forward-ref scan the imported file
     {
@@ -1569,6 +1574,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
 
     sourceFileName = savedSourceFileName;
     currentSourceFilePath_ = savedSourceFilePath;
+    currentSourceIsCore_ = savedSourceIsCore;
     return true;
 }
 
@@ -2128,6 +2134,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         : sourceDisplayName_;
     auto rootCanonical = std::filesystem::weakly_canonical(filePath).string();
     currentSourceFilePath_ = rootCanonical;
+    currentSourceIsCore_ = false;   // the analyzed root file is treated as user code
     importedFiles.insert(rootCanonical);
     importStack.push_back(rootCanonical);
     struct RootGuard {
@@ -2376,6 +2383,7 @@ void LLVMBackend::ResetForReanalysis()
     globalNamedVariable.clear();
     globalVariableTypes.clear();
     globalDeclSite.clear();
+    globalDtorOrder_.clear();
     namespaceTable.clear();
     stringPool.clear();
     stackNamedVariable.clear();
@@ -4363,6 +4371,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     globalNamedVariable.clear();
     globalVariableTypes.clear();
     globalDeclSite.clear();
+    globalDtorOrder_.clear();
     namespaceTable.clear();
     typeAliases.clear();
     enumBackingTypes.clear();

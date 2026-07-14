@@ -10,11 +10,14 @@
 // Headless self-test (no visible window):
 //   out\map.exe --selftest
 //
-// Note: live canvas input (drag/wheel/pinch) is Cocoa-only for now - the Win32
-// host's canvas-input drivers are a recorded parity gap
-// (internal/issue/ui-native-canvas-input-images-win32-winui.md). The self-test is
-// host-neutral: it drives MapView's public input methods directly and paints
-// through a counting Canvas fake, so it passes on both hosts.
+// Live canvas input (drag/wheel/pinch) works on Win32, Cocoa and WinUI. On Windows a
+// pinch arrives as CTRL + wheel (the platform convention a precision touchpad sends);
+// a touch-screen pinch does not reach onPinch yet. The self-test is host-neutral: it
+// drives MapView's public input methods directly and paints through a counting Canvas
+// fake, so it passes on every host.
+//
+// --probe [secs] is the LIVE run-loop oracle: it runs the real window unattended and
+// exits 0 only if every visible tile resolved on screen.
 import "ui_native/host.cb";
 import "map_app.cb";
 

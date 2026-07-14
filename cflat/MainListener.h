@@ -4310,10 +4310,16 @@ public:
                         // and `__closure_fat_ptr` are excluded - they carry a runtime owned bit that
                         // already clears on a borrow return (the string-redesign borrow path), so the
                         // `alias` compile-time machinery is only for owning STRUCTS with no runtime bit.
+                        // A borrow can only dangle when the caller could destruct it: a pointer (the
+                        // pointee is freed) or an owning value type (its destructor frees buffers the
+                        // real owner still holds). An alias of a primitive or a POD struct hands back a
+                        // plain value copy with nothing to free - e.g. `dict<string,u64>.get(k)`.
                         if ((returnNV.TypeAndValue.IsAlias || returnNV.IsAliasBorrow)
                             && returnNV.TypeAndValue.TypeName != "string"
                             && returnNV.TypeAndValue.TypeName != "__closure_fat_ptr"
-                            && !compiler->currentFunctionReturnTV.IsAlias)
+                            && !compiler->currentFunctionReturnTV.IsAlias
+                            && (returnNV.TypeAndValue.Pointer
+                                || compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)))
                         {
                             LogErrorContext(jump, std::format(
                                 "cannot return an 'alias' value '{}'; it borrows storage it does not own and "
@@ -15042,6 +15048,8 @@ public:
                                     }
                                 LLVMBackend::NamedVariable argumentNamedVar = structVar; // Copy;
                                 argumentNamedVar.TypeAndValue.VariableName = "";
+                                // An owning-value rvalue temp receiver is dropped after the call - destruct it.
+                                RegisterOwningTempReceiver(ctx, structVar, argumentNamedVar, functionName);
                                 arguments.push_back(argumentNamedVar);
                             }
                             else if (!globalScopeCall)
@@ -17133,6 +17141,55 @@ public:
         auto* tempAlloca = compiler->AllocaAtEntry(nv.BaseType, nullptr, "discardtemp");
         compiler->builder->CreateStore(nv.Primary, tempAlloca);
         compiler->RegisterOwnedStructTemp(tempAlloca, typeName);
+    }
+
+    // True when the resolved overload takes the receiver BY VALUE with `move` (an extension method
+    // like `drop(move list<string> s)`): the callee owns and frees it, so the caller must not.
+    bool MethodConsumesReceiver(const std::string& functionName, const std::string& recvType)
+    {
+        auto* compiler = Compiler();
+        auto it = compiler->functionTable.find(functionName);
+        if (it == compiler->functionTable.end()) return false;
+        for (const auto& cand : it->second)
+        {
+            const auto& params = cand.Parameters;
+            if (!params.empty() && params.front().TypeName == recvType
+                && !params.front().Pointer && params.front().IsMove)
+                return true;
+        }
+        return false;
+    }
+
+    // A method invoked on an owning-value RVALUE temp receiver (`makeList().count()`) consumes the
+    // temp as `this` and then drops it, so without this it leaks. Spill the receiver to an entry
+    // alloca, register it for end-of-full-expression destruction (FlushOwnedTemps at the block-item
+    // boundary), and bind that alloca as the `this` argument's Storage so the call and the
+    // destructor address the same object. Mirrors the field-access gate (`makeToken().text`):
+    // Storage==null is the rvalue-temp signal (a named local or a deref carries Storage and is freed
+    // by its own scope dtor - registering it would DOUBLE-FREE), an `alias` borrow return must not be
+    // destructed, string/closure values run their own owned-bit/temp-list paths, and a receiver that
+    // is a field of an already-registered owning temp (FromOwningTempField) is covered by the
+    // parent's full destructor.
+    void RegisterOwningTempReceiver(antlr4::ParserRuleContext* ctx,
+                                    const LLVMBackend::NamedVariable& receiver,
+                                    LLVMBackend::NamedVariable& thisArg,
+                                    const std::string& functionName)
+    {
+        const std::string& typeName = receiver.TypeAndValue.TypeName;
+        if (receiver.Primary == nullptr || receiver.Storage != nullptr) return;
+        if (receiver.BaseType == nullptr || !receiver.BaseType->isStructTy()) return;
+        if (receiver.TypeAndValue.Pointer) return;
+        if (typeName.empty() || typeName == "string" || typeName == "__closure_fat_ptr") return;
+        if (receiver.TypeAndValue.IsAlias || receiver.FromOwningTempField) return;
+
+        auto* compiler = Compiler(ctx);
+        if (!compiler->IsOwningValueType(typeName)) return;
+        if (MethodConsumesReceiver(functionName, typeName)) return;
+
+        auto* tempAlloca = compiler->AllocaAtEntry(receiver.BaseType, nullptr, "recvtemp");
+        compiler->builder->CreateStore(receiver.Primary, tempAlloca);
+        compiler->RegisterOwnedStructTemp(tempAlloca, typeName);
+        thisArg.Storage = tempAlloca;   // the call and the destructor address the same temp
     }
 
     void ProcessPlusPlus()

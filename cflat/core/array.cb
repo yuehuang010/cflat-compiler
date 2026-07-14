@@ -29,8 +29,9 @@ struct array<T>
     // Number of elements in the array.
     int count() { return _len; }
 
-    // Read the element at index by value (borrow - caller does not own it).
-    T get(int index) { return _ptr[index]; }
+    // Read the element at index (borrow - the element stays owned by the array, so `alias`
+    // keeps the caller from destructing it; same contract as list.get).
+    alias T get(int index) { return _ptr[index]; }
 
     // Return a pointer to the element at index (for in-place access).
     T* getPtr(int index) { return _ptr + index; }

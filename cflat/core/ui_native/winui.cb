@@ -14,12 +14,12 @@
 // init callback (the framework is up, controls create + drive + read back with plain COM calls -
 // no reposting needed) and then Exits.
 //
-// DATA CONTROLS: the ListView/TreeView/TabView XAML controls are created (so keyed identity +
-// _exists hold), but their item DISPLAY is backed by the host-side box/model bookkeeping that the
-// native* drivers query - i.e. the setListOp seam + the rowText/TreeBox callbacks are validated
-// exactly as on Win32/Cocoa, while binding a live virtualized ItemsSource is a documented visual
-// enrichment deferred for now (it needs a WinRT bindable-collection implementation).
-// See doc/UI.md parity matrix.
+// DATA CONTROLS: the ListView/TreeView/TabView XAML controls carry REAL items. The ListView is
+// bound to a virtualized item source (WItemSource - a hand-written IBindableVector over the boxed
+// rowText callback, so 100k rows cost as many rowText calls as XAML realizes rows); the TabView
+// holds real TabViewItems; the TreeView holds real TreeViewNodes, materialized on expand. Every
+// native* driver reads its answer back OUT of the control (ItemsSource/TabItems/RootNodes/
+// SelectedIndex), so an empty control cannot pass a green driver assert.
 //
 // This file has no main(); an app imports it, defines a IComponent, and calls runAppWinui() (live)
 // or the launcher runs runWinuiHeadless() with a self-test body. See winui_demo.cb / winui_gallery.cb.
@@ -45,22 +45,51 @@ using XamlApplication              = Microsoft.UI.Xaml.IApplication;
 using XamlApplicationFactory       = Microsoft.UI.Xaml.IApplicationFactory;
 using XamlApplicationStatics       = Microsoft.UI.Xaml.IApplicationStatics;
 using XamlWindow                   = Microsoft.UI.Xaml.IWindow;
+using XamlWindow2                  = Microsoft.UI.Xaml.IWindow2;
+using UiAppWindow                  = Microsoft.UI.Windowing.IAppWindow;
+using UiAppTitleBar3               = Microsoft.UI.Windowing.IAppWindowTitleBar3;
 using XamlWindowFactory            = Microsoft.UI.Xaml.IWindowFactory;
 using XamlResourceDictionary       = Microsoft.UI.Xaml.IResourceDictionary;
+using XamlRoot                     = Microsoft.UI.Xaml.IXamlRoot;
 using XamlRoutedEventHandler       = Microsoft.UI.Xaml.RoutedEventHandler;
 using XamlAppInitCallback          = Microsoft.UI.Xaml.ApplicationInitializationCallback;
+using XamlSizeChangedEventHandler  = Microsoft.UI.Xaml.SizeChangedEventHandler;
 using XamlButton                   = Microsoft.UI.Xaml.Controls.IButton;
 using XamlCanvasStatics            = Microsoft.UI.Xaml.Controls.ICanvasStatics;
 using XamlContentControl           = Microsoft.UI.Xaml.Controls.IContentControl;
 using XamlControl                  = Microsoft.UI.Xaml.Controls.IControl;
 using XamlImage                    = Microsoft.UI.Xaml.Controls.IImage;
 using XamlItemsControl             = Microsoft.UI.Xaml.Controls.IItemsControl;
+using XamlListViewBase             = Microsoft.UI.Xaml.Controls.IListViewBase;
 using XamlPanel                    = Microsoft.UI.Xaml.Controls.IPanel;
 using XamlProgressBarFactory       = Microsoft.UI.Xaml.Controls.IProgressBarFactory;
+using XamlScrollViewer             = Microsoft.UI.Xaml.Controls.IScrollViewer;
+using XamlItemsStackPanel          = Microsoft.UI.Xaml.Controls.IItemsStackPanel;
+using XamlSelectionChangedHandler  = Microsoft.UI.Xaml.Controls.SelectionChangedEventHandler;
+using XamlTextChangedHandler       = Microsoft.UI.Xaml.Controls.TextChangedEventHandler;
+using XamlDoubleTappedHandler      = Microsoft.UI.Xaml.Input.DoubleTappedEventHandler;
+using XamlTabView                  = Microsoft.UI.Xaml.Controls.ITabView;
 using XamlTabViewFactory           = Microsoft.UI.Xaml.Controls.ITabViewFactory;
+using XamlTabViewItem              = Microsoft.UI.Xaml.Controls.ITabViewItem;
+using XamlTabViewItemFactory       = Microsoft.UI.Xaml.Controls.ITabViewItemFactory;
 using XamlTextBlock                = Microsoft.UI.Xaml.Controls.ITextBlock;
 using XamlTextBox                  = Microsoft.UI.Xaml.Controls.ITextBox;
+using XamlTreeView                 = Microsoft.UI.Xaml.Controls.ITreeView;
+using XamlTreeView2                = Microsoft.UI.Xaml.Controls.ITreeView2;
+using XamlTreeView3                = Microsoft.UI.Xaml.Controls.ITreeView3;
 using XamlTreeViewFactory          = Microsoft.UI.Xaml.Controls.ITreeViewFactory;
+using XamlTreeViewNode             = Microsoft.UI.Xaml.Controls.ITreeViewNode;
+using XamlTreeViewNodeFactory      = Microsoft.UI.Xaml.Controls.ITreeViewNodeFactory;
+using XamlTreeExpandingArgs        = Microsoft.UI.Xaml.Controls.ITreeViewExpandingEventArgs;
+using XamlMenuFlyout               = Microsoft.UI.Xaml.Controls.IMenuFlyout;
+using XamlMenuFlyoutFactory        = Microsoft.UI.Xaml.Controls.IMenuFlyoutFactory;
+using XamlMenuFlyoutItem           = Microsoft.UI.Xaml.Controls.IMenuFlyoutItem;
+using XamlMenuFlyoutItemFactory    = Microsoft.UI.Xaml.Controls.IMenuFlyoutItemFactory;
+using XamlMenuFlyoutItemBase       = Microsoft.UI.Xaml.Controls.IMenuFlyoutItemBase;
+using XamlFlyoutBase               = Microsoft.UI.Xaml.Controls.Primitives.IFlyoutBase;
+using XamlBorder                   = Microsoft.UI.Xaml.Controls.IBorder;
+using XamlRectangle                = Microsoft.UI.Xaml.Shapes.IRectangle;
+using XamlShape                    = Microsoft.UI.Xaml.Shapes.IShape;
 using XamlButtonBase               = Microsoft.UI.Xaml.Controls.Primitives.IButtonBase;
 using XamlRangeBase                = Microsoft.UI.Xaml.Controls.Primitives.IRangeBase;
 using XamlSelector                 = Microsoft.UI.Xaml.Controls.Primitives.ISelector;
@@ -69,16 +98,29 @@ using XamlAutomationPeer           = Microsoft.UI.Xaml.Automation.Peers.IAutomat
 using XamlPeerStatics              = Microsoft.UI.Xaml.Automation.Peers.IFrameworkElementAutomationPeerStatics;
 using XamlInvokeProvider           = Microsoft.UI.Xaml.Automation.Provider.IInvokeProvider;
 using XamlToggleProvider           = Microsoft.UI.Xaml.Automation.Provider.IToggleProvider;
+using XamlBrush                    = Microsoft.UI.Xaml.Media.IBrush;
 using XamlImageSource              = Microsoft.UI.Xaml.Media.IImageSource;
+using XamlSolidColorBrush          = Microsoft.UI.Xaml.Media.ISolidColorBrush;
 using XamlWriteableBitmap          = Microsoft.UI.Xaml.Media.Imaging.IWriteableBitmap;
 using XamlWriteableBitmapFactory   = Microsoft.UI.Xaml.Media.Imaging.IWriteableBitmapFactory;
+using XamlPointerEventHandler      = Microsoft.UI.Xaml.Input.PointerEventHandler;
+using XamlPointerRoutedEventArgs   = Microsoft.UI.Xaml.Input.IPointerRoutedEventArgs;
+using UiPointerPoint               = Microsoft.UI.Input.IPointerPoint;
+using UiPointerPointProps          = Microsoft.UI.Input.IPointerPointProperties;
+using WfPoint                      = Windows.Foundation.Point;
 using DispatcherQueue              = Microsoft.UI.Dispatching.IDispatcherQueue;
 using DispatcherQueueStatics       = Microsoft.UI.Dispatching.IDispatcherQueueStatics;
 using DispatcherHandler            = Microsoft.UI.Dispatching.DispatcherQueueHandler;
 using WfPropertyValueStatics       = Windows.Foundation.IPropertyValueStatics;
+using WfPropertyValue              = Windows.Foundation.IPropertyValue;
 using XamlUIElementVector          = Windows.Foundation.Collections.IVector<Microsoft.UI.Xaml.UIElement>;
 using XamlObjectVector             = Windows.Foundation.Collections.IVector<object>;
+using XamlObjectIterable           = Windows.Foundation.Collections.IIterable<object>;
 using XamlResourceDictionaryVector = Windows.Foundation.Collections.IVector<Microsoft.UI.Xaml.ResourceDictionary>;
+using XamlTreeNodeVector           = Windows.Foundation.Collections.IVector<Microsoft.UI.Xaml.Controls.TreeViewNode>;
+using XamlMenuItemVector           = Windows.Foundation.Collections.IVector<Microsoft.UI.Xaml.Controls.MenuFlyoutItemBase>;
+using XamlBindableVector           = Microsoft.UI.Xaml.Interop.IBindableVector;
+using XamlBindableIterable         = Microsoft.UI.Xaml.Interop.IBindableIterable;
 
 extern stdcall i32  MddBootstrapInitialize2(u32 majorMinor, u16* versionTag, u64 minVersion, i32 options);
 extern stdcall void MddBootstrapShutdown();
@@ -103,6 +145,303 @@ Guid IID_IBufferByteAccess()
                      (u8)0x4F, (u8)0xC6, (u8)0x86, (u8)0xDA);
 }
 
+// -- IWindowNative {EECDBF0E-BAE9-4CB6-A68E-9598E1CB57BB} ----------------------
+// The classic COM interop interface every XAML Window implements; it hands out the HWND the
+// window is hosted in. Hand-declared like IBufferByteAccess above (iidof knows only winmd
+// types). The HWND is what DwmSetWindowAttribute needs to dark-mode the TITLE BAR - XAML's
+// RequestedTheme only reaches the client area.
+struct IWindowNativeVtbl
+{
+    function<i32(void*, void*, void**)> QueryInterface  = nullptr;
+    function<u32(void*)>                AddRef          = nullptr;
+    function<u32(void*)>                Release         = nullptr;
+    function<i32(void*, void**)>        GetWindowHandle = nullptr;
+};
+struct IWindowNative { IWindowNativeVtbl* lpVtbl = nullptr; };
+
+Guid IID_IWindowNative()
+{
+    return Guid.make((u32)0xEECDBF0E, (u16)0xBAE9, (u16)0x4CB6,
+                     (u8)0xA6, (u8)0x8E, (u8)0x95, (u8)0x98,
+                     (u8)0xE1, (u8)0xCB, (u8)0x57, (u8)0xBB);
+}
+
+// -- GDI, bound at runtime (the CanvasView rasterizer) --------------------------
+// CanvasView is rasterized with plain GDI into an offscreen 32bpp DIB whose bits are copied
+// into a WriteableBitmap (see WinuiGdiCanvas / WinUI3Host._paintCanvas). WinUI 3 has no Win2D
+// here by design, and this file must not import windows.h (its types collide with the WinUI
+// winmd). A `lib` clause has no home either - a `package-nuget` import takes none - so gdi32/
+// user32 cannot be put on the link line. The entry points are therefore bound at runtime
+// through kernel32's loader, which keeps the hand-declared extern surface at two functions.
+extern stdcall void* LoadLibraryA(const char* name);
+extern stdcall void* GetProcAddress(void* mod, const char* name);
+
+const int WGDI_TRANSPARENT    = 1;
+const int WGDI_DT_SINGLELINE  = 0x0020;
+const int WGDI_DT_NOPREFIX    = 0x0800;
+const int WGDI_COLORONCOLOR   = 3;
+const u32 WGDI_SRCCOPY        = 0x00CC0020u;
+const int WGDI_BLACK_BRUSH    = 4;
+
+// A 40-byte BITMAPINFOHEADER; a negative biHeight makes the DIB top-down (BGRA32 row order).
+struct WGdiBmi
+{
+    u32 biSize         = 40u;
+    i32 biWidth        = 0;
+    i32 biHeight       = 0;
+    u16 biPlanes       = 1;
+    u16 biBitCount     = 32;
+    u32 biCompression  = 0u;
+    u32 biSizeImage    = 0u;
+    i32 biXPelsPerM    = 0;
+    i32 biYPelsPerM    = 0;
+    u32 biClrUsed      = 0u;
+    u32 biClrImportant = 0u;
+};
+struct WGdiRect { i32 left = 0; i32 top = 0; i32 right = 0; i32 bottom = 0; };
+// BITMAP (GetObjectA on an HBITMAP). bmBits sits at offset 24, so the u16 pair is padded.
+struct WGdiBitmap
+{
+    i32   bmType       = 0;
+    i32   bmWidth      = 0;
+    i32   bmHeight     = 0;
+    i32   bmWidthBytes = 0;
+    u16   bmPlanes     = 0;
+    u16   bmBitsPixel  = 0;
+    u32   _pad         = 0u;
+    void* bmBits       = nullptr;
+};
+
+function<void*(void*, void*, u32, void**, void*, u32)> _wgCreateDIBSection = nullptr;
+function<void*(void*)>                          _wgCreateCompatibleDC = nullptr;
+function<i32(void*)>                            _wgDeleteDC        = nullptr;
+function<void*(void*, void*)>                   _wgSelectObject    = nullptr;
+function<i32(void*)>                            _wgDeleteObject    = nullptr;
+function<void*(u32)>                            _wgCreateSolidBrush = nullptr;
+function<void*(i32)>                            _wgGetStockObject  = nullptr;
+function<i32(void*, i32)>                       _wgSetBkMode       = nullptr;
+function<u32(void*, u32)>                       _wgSetTextColor    = nullptr;
+function<i32(void*)>                            _wgSaveDC          = nullptr;
+function<i32(void*, i32)>                       _wgRestoreDC       = nullptr;
+function<i32(void*, i32, i32, i32, i32)>        _wgIntersectClipRect = nullptr;
+function<i32(void*, i32)>                       _wgSetStretchBltMode = nullptr;
+function<i32(void*, i32, i32, i32, i32, void*, i32, i32, i32, i32, u32)> _wgStretchBlt = nullptr;
+function<i32(void*, i32, void*)>                _wgGetObjectA      = nullptr;
+function<i32()>                                 _wgGdiFlush        = nullptr;
+function<i32(void*, void*, void*)>              _wgFillRect        = nullptr;
+function<i32(void*, void*, void*)>              _wgFrameRect       = nullptr;
+function<i32(void*, char*, i32, void*, u32)>    _wgDrawTextA       = nullptr;
+bool _wgBound = false;
+bool _wgOk    = false;
+
+// Bind gdi32/user32 once. Returns false if anything is missing (every GDI path then no-ops).
+bool winuiGdiReady()
+{
+    if (_wgBound) return _wgOk;
+    _wgBound = true;
+    void* g = LoadLibraryA("gdi32.dll");
+    void* u = LoadLibraryA("user32.dll");
+    if (g == nullptr || u == nullptr) return false;
+    _wgCreateDIBSection   = (function<void*(void*, void*, u32, void**, void*, u32)>)GetProcAddress(g, "CreateDIBSection");
+    _wgCreateCompatibleDC = (function<void*(void*)>)GetProcAddress(g, "CreateCompatibleDC");
+    _wgDeleteDC           = (function<i32(void*)>)GetProcAddress(g, "DeleteDC");
+    _wgSelectObject       = (function<void*(void*, void*)>)GetProcAddress(g, "SelectObject");
+    _wgDeleteObject       = (function<i32(void*)>)GetProcAddress(g, "DeleteObject");
+    _wgCreateSolidBrush   = (function<void*(u32)>)GetProcAddress(g, "CreateSolidBrush");
+    _wgGetStockObject     = (function<void*(i32)>)GetProcAddress(g, "GetStockObject");
+    _wgSetBkMode          = (function<i32(void*, i32)>)GetProcAddress(g, "SetBkMode");
+    _wgSetTextColor       = (function<u32(void*, u32)>)GetProcAddress(g, "SetTextColor");
+    _wgSaveDC             = (function<i32(void*)>)GetProcAddress(g, "SaveDC");
+    _wgRestoreDC          = (function<i32(void*, i32)>)GetProcAddress(g, "RestoreDC");
+    _wgIntersectClipRect  = (function<i32(void*, i32, i32, i32, i32)>)GetProcAddress(g, "IntersectClipRect");
+    _wgSetStretchBltMode  = (function<i32(void*, i32)>)GetProcAddress(g, "SetStretchBltMode");
+    _wgStretchBlt         = (function<i32(void*, i32, i32, i32, i32, void*, i32, i32, i32, i32, u32)>)GetProcAddress(g, "StretchBlt");
+    _wgGetObjectA         = (function<i32(void*, i32, void*)>)GetProcAddress(g, "GetObjectA");
+    _wgGdiFlush           = (function<i32()>)GetProcAddress(g, "GdiFlush");
+    _wgFillRect           = (function<i32(void*, void*, void*)>)GetProcAddress(u, "FillRect");
+    _wgFrameRect          = (function<i32(void*, void*, void*)>)GetProcAddress(u, "FrameRect");
+    _wgDrawTextA          = (function<i32(void*, char*, i32, void*, u32)>)GetProcAddress(u, "DrawTextA");
+    _wgOk = _wgCreateDIBSection != nullptr && _wgCreateCompatibleDC != nullptr
+         && _wgSelectObject != nullptr && _wgDeleteObject != nullptr && _wgDeleteDC != nullptr
+         && _wgCreateSolidBrush != nullptr && _wgFillRect != nullptr && _wgDrawTextA != nullptr
+         && _wgGdiFlush != nullptr;
+    return _wgOk;
+}
+
+// Windows bitmap-stretches a DPI-unaware process (blurry text, oversized controls, overflow).
+// WinUI 3 normally gets PerMonitorV2 from an app manifest, which a cflat exe has none of - so opt
+// in explicitly, through the same runtime-bound user32 path the GDI entry points use.
+bool _wDpiAwareDone = false;
+void winuiEnableDpiAwareness()
+{
+    if (_wDpiAwareDone) return;
+    _wDpiAwareDone = true;
+    void* u = LoadLibraryA("user32.dll");
+    if (u == nullptr) return;
+    function<i32(void*)> setAware = (function<i32(void*)>)GetProcAddress(u, "SetProcessDpiAwarenessContext");
+    // -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2. Must run before any window or XAML init.
+    if (setAware != nullptr) setAware((void*)(i64)(0 - 4));
+}
+
+// -- Window chrome (dwmapi/user32), bound at runtime ---------------------------
+// The immersive dark-mode TITLE BAR is a DWM attribute on the HWND, exactly as the Win32 host
+// sets it. This file cannot import windows.h (its types collide with the WinUI winmd) and a
+// `package-nuget` import takes no `lib` clause, so dwmapi/user32 are bound through the loader
+// like the GDI entry points above. SetWindowPos(SWP_FRAMECHANGED) nudges the frame so the
+// title bar repaints on a live toggle instead of waiting for the next activation.
+const u32 WDWMWA_USE_IMMERSIVE_DARK_MODE = 20u;
+const u32 WSWP_FRAMECHANGED = 0x0027u;   // NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED
+
+function<i32(void*, u32, void*, u32)>             _wDwmSetAttr   = nullptr;
+function<i32(void*, void*, i32, i32, i32, i32, u32)> _wSetWindowPos = nullptr;
+bool _wChromeBound = false;
+
+void winuiBindChrome()
+{
+    if (_wChromeBound) return;
+    _wChromeBound = true;
+    void* d = LoadLibraryA("dwmapi.dll");
+    void* u = LoadLibraryA("user32.dll");
+    if (d != nullptr)
+        _wDwmSetAttr = (function<i32(void*, u32, void*, u32)>)GetProcAddress(d, "DwmSetWindowAttribute");
+    if (u != nullptr)
+        _wSetWindowPos = (function<i32(void*, void*, i32, i32, i32, i32, u32)>)GetProcAddress(u, "SetWindowPos");
+}
+
+// Framework color (0xRRGGBB, 0 = default) -> COLORREF (0x00BBGGRR).
+u32 winuiColorRef(int color)
+{
+    int r = (color >> 16) & 0xFF;
+    int g = (color >> 8) & 0xFF;
+    int b = color & 0xFF;
+    return (u32)(r | (g << 8) | (b << 16));
+}
+
+// A Windows.UI.Color (4 bytes laid out A,R,G,B) for an opaque framework color, packed into the
+// pointer-sized argument slot put_Color takes. Windows.UI.winmd is deliberately NOT imported here,
+// so the projection maps its Color parameter to an opaque pointer - and the Windows x64 ABI passes
+// a 4-byte value struct in the low 32 bits of exactly that register, so the packing IS the ABI.
+void* winuiColorArg(int color)
+{
+    u32 r = (u32)((color >> 16) & 0xFF);
+    u32 g = (u32)((color >> 8) & 0xFF);
+    u32 b = (u32)(color & 0xFF);
+    return (void*)(u64)(0xFFu | (r << 8) | (g << 16) | (b << 24));
+}
+
+// The layout cell, in XAML DIPs - the same cell model the Win32/Cocoa hosts use (their BASE_X/
+// BASE_Y). The framework's layout unit is a CELL; setFrame/measureText convert at the edges.
+// DIPs are already dpi-independent, so unlike Win32 there is no dpi factor anywhere here.
+// BASE_Y is taller than the Win32 host's 26: a XAML control is chunkier than its GDI equivalent
+// (a default Button is 32 DIPs), so a 1-cell control row would clip its own text at 26.
+const int BASE_X = 8;
+const int BASE_Y = 34;
+
+// A GDI implementation of ICanvas over an offscreen memory DC, mirroring the Win32 host's
+// NativeGdiCanvas. COORDINATES: drawText/drawRect/pushClip take CELLS, drawImage takes POINTS.
+// The WriteableBitmap behind a canvas is its DIP box rasterized at DEVICE resolution: the host
+// sizes it by the XamlRoot's RasterizationScale `s` (see _rasterScale). A cell is therefore
+// cellW x cellH device px (BASE_X/BASE_Y already scaled by `s`), and POINTS -> px is `scale` = s.
+class WinuiGdiCanvas : ICanvas
+{
+    void* hdc   = nullptr;
+    int   cellW = BASE_X;
+    int   cellH = BASE_Y;
+    double scale = 1.0;   // POINTS -> device px; drawImage takes points
+
+    void clear() { }
+
+    void drawText(int col, int row, const char* s, int color)
+    {
+        if (this.hdc == nullptr) return;
+        WGdiRect rc = default;
+        rc.left = col * this.cellW; rc.top = row * this.cellH;
+        rc.right = rc.left + 4096; rc.bottom = rc.top + this.cellH;
+        _wgSetBkMode(this.hdc, WGDI_TRANSPARENT);
+        _wgSetTextColor(this.hdc, winuiColorRef(color));
+        _wgDrawTextA(this.hdc, (char*)s, 0 - 1, &rc, (u32)(WGDI_DT_SINGLELINE | WGDI_DT_NOPREFIX));
+    }
+
+    void drawRect(Rect r, bool filled, int color)
+    {
+        if (this.hdc == nullptr) return;
+        WGdiRect rc = default;
+        rc.left = r.x * this.cellW; rc.top = r.y * this.cellH;
+        rc.right = (r.x + r.w) * this.cellW; rc.bottom = (r.y + r.h) * this.cellH;
+        if (color == 0)
+        {
+            void* stock = _wgGetStockObject(WGDI_BLACK_BRUSH);
+            if (filled) _wgFillRect(this.hdc, &rc, stock);
+            else        _wgFrameRect(this.hdc, &rc, stock);
+            return;
+        }
+        void* br = _wgCreateSolidBrush(winuiColorRef(color));
+        if (filled) _wgFillRect(this.hdc, &rc, br);
+        else        _wgFrameRect(this.hdc, &rc, br);
+        _wgDeleteObject(br);
+    }
+
+    void pushClip(Rect r)
+    {
+        if (this.hdc == nullptr) return;
+        _wgSaveDC(this.hdc);
+        _wgIntersectClipRect(this.hdc, r.x * this.cellW, r.y * this.cellH,
+                             (r.x + r.w) * this.cellW, (r.y + r.h) * this.cellH);
+    }
+    void popClip() { if (this.hdc != nullptr) _wgRestoreDC(this.hdc, 0 - 1); }
+
+    // Blit a canvas image (an HBITMAP from canvasCreateImage) into a POINTS rect. The
+    // destination edges are rounded independently so adjacent tiles meet with no seam.
+    void drawImage(u64 img, double dx, double dy, double dw, double dh)
+    {
+        if (img == 0u || this.hdc == nullptr) return;
+        if (!winuiGdiReady()) return;
+        WGdiBitmap bm = default;
+        if (_wgGetObjectA((void*)img, (i32)sizeof(WGdiBitmap), &bm) == 0) return;
+        int srcW = bm.bmWidth;
+        int srcH = bm.bmHeight;
+        if (srcW <= 0 || srcH <= 0) return;
+        int x0 = (int)(dx * this.scale);
+        int y0 = (int)(dy * this.scale);
+        int x1 = (int)((dx + dw) * this.scale);
+        int y1 = (int)((dy + dh) * this.scale);
+        if (x1 - x0 <= 0 || y1 - y0 <= 0) return;
+        void* memDC = _wgCreateCompatibleDC(nullptr);
+        if (memDC == nullptr) return;
+        void* oldBmp = _wgSelectObject(memDC, (void*)img);
+        _wgSetStretchBltMode(this.hdc, WGDI_COLORONCOLOR);
+        _wgStretchBlt(this.hdc, x0, y0, x1 - x0, y1 - y0, memDC, 0, 0, srcW, srcH, WGDI_SRCCOPY);
+        _wgSelectObject(memDC, oldBmp);
+        _wgDeleteDC(memDC);
+    }
+};
+
+// -- Canvas image handles: DIB-backed HBITMAPs ----------------------------------
+// canvasCreateImage COPIES the caller's top-down BGRA32 buffer into a 32bpp DIB section (so the
+// caller may free its pixels immediately) and returns the HBITMAP as the handle. drawImage
+// recovers the source extent from the bitmap itself (GetObjectA), so no side registry is needed -
+// nothing is tracked on the cflat heap. canvasReleaseImage deletes the bitmap.
+u64 canvasCreateImage(u64 bgraPixels, int w, int h)
+{
+    if (bgraPixels == 0u || w <= 0 || h <= 0) return 0u;
+    if (!winuiGdiReady()) return 0u;
+    WGdiBmi bi = default;
+    bi.biSize = 40u; bi.biWidth = w; bi.biHeight = 0 - h;   // negative = top-down
+    bi.biPlanes = 1; bi.biBitCount = 32; bi.biCompression = 0u;
+    void* bits = nullptr;
+    void* bmp = _wgCreateDIBSection(nullptr, &bi, 0u, &bits, nullptr, 0u);
+    if (bmp == nullptr || bits == nullptr) return 0u;
+    memcpy(bits, (void*)bgraPixels, (i64)(w * h * 4));
+    return (u64)bmp;
+}
+
+void canvasReleaseImage(u64 img)
+{
+    if (img == 0u) return;
+    if (!winuiGdiReady()) return;
+    _wgDeleteObject((void*)img);
+}
+
 // -- Host-wide singletons (one UI thread, one window) -------------------------
 WinUI3Host _wHost  = default;
 IComponent   _wApp   = default;
@@ -110,17 +449,53 @@ IElement    _wTree   = default;
 UiContext  _wCtx    = default;
 bool       _wReady  = false;
 bool       _wDark   = false;   // last applied theme was dark (drives hostDark())
-int        _wW      = 80;      // client size in DIP units (layout width/height)
-int        _wH      = 40;
+int        _wW      = 80;      // client size in CELLS (the layout unit); a live window
+int        _wH      = 40;      // overwrites both from its real size (see _winuiSyncWindowSize)
 
 // XAML plumbing captured during bring-up (all borrowed process-lived singletons).
 void* _gApp        = nullptr;   // XamlApplication* (base app; Exit ends the pump)
 void* _gDq         = nullptr;   // DispatcherQueue* for this thread
 void* _gCanvasVec  = nullptr;   // ICanvas.Children as XamlUIElementVector*
-void* _gCanvasStat = nullptr;   // XamlCanvasStatics* (SetLeft/SetTop)
+void* _gCanvasStat = nullptr;   // XamlCanvasStatics* (SetLeft/SetTop/SetZIndex)
+void* _gCanvasFe   = nullptr;   // ICanvas as XamlFrameworkElement* (its Width/Height = the scrolled extent)
 void* _gPv         = nullptr;   // WfPropertyValueStatics* (box a string as content)
 void* _gRootElem   = nullptr;   // ICanvas as XamlUIElement* (window content root; UpdateLayout target)
 void* _gRootFe     = nullptr;   // ICanvas as XamlFrameworkElement* (Loaded subscription target)
+void* _gRootPanel  = nullptr;   // root Grid as XamlPanel* (the page Background lives here)
+void* _gWinRaw     = nullptr;   // the XAML Window (raw IInspectable*), source of the HWND
+void* _gHwnd       = nullptr;   // the window's HWND (IWindowNative), cached
+void* _gScrollFe   = nullptr;   // ScrollViewer as XamlFrameworkElement* (height = viewport - status bar)
+void* _gScrollCtl  = nullptr;   // the page ScrollViewer itself (offset reset after the first mount)
+
+// The bottom status strip: a Canvas pinned to the bottom of the root Grid, OUTSIDE the
+// ScrollViewer, so a StatusBar reads as a window-bottom bar instead of scrolling away inside
+// the (taller) content document. Collapsed until an app mounts a StatusBar.
+const double WSTATUS_H = 28.0;
+void* _gStatusVec   = nullptr;   // the strip Canvas' Children (XamlUIElementVector*)
+void* _gStatusPanel = nullptr;   // the strip Canvas as XamlPanel* (its Background = the theme panel)
+void* _gStatusElem  = nullptr;   // the strip Canvas as XamlUIElement* (Visibility)
+int   _wStatusBg    = -1;        // color the strip background was last painted with
+
+// Last theme state pushed INTO XAML (see winuiApplyRootTheme). Cached so a per-frame reconcile
+// does not re-activate a brush; -1 / not-set means nothing has been pushed yet.
+bool _wXamlDark    = false;
+bool _wXamlThemeSet = false;
+int  _wPageBg      = -1;
+
+// The live XamlRoot's RasterizationScale (device px per DIP; 2.0 at 200%). Canvas bitmaps are
+// sized by it so they rasterize at device resolution instead of being upscaled by XAML. 1.0 until
+// the tree is in a window (no XamlRoot yet), which is also the headless case.
+double winuiRasterScale()
+{
+    if (_gRootElem == nullptr) return 1.0;
+    void* xr = nullptr;
+    ((XamlUIElement*)_gRootElem)->lpVtbl->get_XamlRoot(_gRootElem, &xr);
+    if (xr == nullptr) return 1.0;
+    double s = 0.0;
+    ((XamlRoot*)xr)->lpVtbl->get_RasterizationScale(xr, &s);
+    if (s <= 0.0) return 1.0;
+    return s;
+}
 
 int hostWidth()  { return _wW; }
 int hostHeight() { return _wH; }
@@ -156,6 +531,120 @@ bool winuiThemeIsDark(Theme* t)
     return (r + g + b) < 384;
 }
 
+// Scale every channel of an 0xRRGGBB color by `pct` percent (clamped implicitly - pct <= 100).
+int winuiScaleRgb(int c, int pct)
+{
+    int r = (((c >> 16) & 0xFF) * pct) / 100;
+    int g = (((c >> 8) & 0xFF) * pct) / 100;
+    int b = ((c & 0xFF) * pct) / 100;
+    return (r << 16) | (g << 8) | b;
+}
+
+// The page background behind the cards: the panel fill nudged darker, so a Box still reads as a
+// card ON a page instead of dissolving into it. Monochrome theme -> the XAML page defaults.
+int winuiPageBg(Theme* t, bool dark)
+{
+    int c = t.panelBg;
+    if (c == 0) return dark ? rgb(32, 32, 32) : rgb(243, 243, 243);
+    return winuiScaleRgb(c, dark ? 62 : 94);
+}
+
+// The window's HWND, through the Window's classic COM interop interface (IWindowNative). Cached;
+// nullptr before the Window exists (and in any host with no window at all).
+void* winuiHwnd()
+{
+    if (_gHwnd != nullptr) return _gHwnd;
+    if (_gWinRaw == nullptr) return nullptr;
+    Guid wn = IID_IWindowNative();
+    void* nat = wqi(_gWinRaw, &wn);
+    if (nat == nullptr) return nullptr;
+    void* hwnd = nullptr;
+    ((IWindowNative*)nat)->lpVtbl->GetWindowHandle(nat, &hwnd);
+    _gHwnd = hwnd;
+    return _gHwnd;
+}
+
+// Dark-mode the TITLE BAR. Two levers, because a WinUI 3 caption answers to both: the DWM
+// immersive-dark attribute on the HWND (what the Win32 host sets), and the AppWindow title bar's
+// own PreferredTheme - WinUI repaints the caption from THAT, so the DWM attribute alone is
+// overpainted. The SWP_FRAMECHANGED nudge makes the frame repaint on a live toggle.
+void winuiApplyTitleBarTheme(bool dark)
+{
+    if (_gWinRaw != nullptr)
+    {
+        void* w2 = wqi(_gWinRaw, iidof(XamlWindow2));
+        void* aw = nullptr;
+        if (w2 != nullptr) ((XamlWindow2*)w2)->lpVtbl->get_AppWindow(w2, &aw);
+        void* tb = nullptr;
+        if (aw != nullptr) ((UiAppWindow*)aw)->lpVtbl->get_TitleBar(aw, &tb);
+        void* tb3 = wqi(tb, iidof(UiAppTitleBar3));
+        // TitleBarTheme: 0 = UseDefaultAppMode, 1 = Light, 2 = Dark.
+        if (tb3 != nullptr) ((UiAppTitleBar3*)tb3)->lpVtbl->put_PreferredTheme(tb3, dark ? 2 : 1);
+    }
+    winuiBindChrome();
+    void* hwnd = winuiHwnd();
+    if (hwnd == nullptr || _wDwmSetAttr == nullptr) return;
+    int one = dark ? 1 : 0;
+    _wDwmSetAttr(hwnd, WDWMWA_USE_IMMERSIVE_DARK_MODE, (void*)&one, 4u);
+    if (_wSetWindowPos != nullptr) _wSetWindowPos(hwnd, nullptr, 0, 0, 0, 0, WSWP_FRAMECHANGED);
+}
+
+// Push the cflat theme INTO XAML. Without this the controls inherit the SYSTEM app theme, so a
+// light cflat theme (near-white panel fills) drew XAML's dark-theme WHITE text on white cards.
+// RequestedTheme on the root FrameworkElement re-themes the whole tree, so "Toggle theme" flips
+// XAML's own default brushes live; the page Background is re-synced from the theme alongside it.
+void winuiApplyRootTheme(Theme* t)
+{
+    if (_gRootFe == nullptr) return;
+    bool dark = winuiThemeIsDark(t);
+    if (!_wXamlThemeSet || dark != _wXamlDark)
+    {
+        if (dark) ((XamlFrameworkElement*)_gRootFe)->lpVtbl->put_RequestedTheme(_gRootFe, ElementTheme_Dark);
+        else      ((XamlFrameworkElement*)_gRootFe)->lpVtbl->put_RequestedTheme(_gRootFe, ElementTheme_Light);
+        winuiApplyTitleBarTheme(dark);
+        _wXamlDark = dark;
+        _wXamlThemeSet = true;
+    }
+    int bg = winuiPageBg(t, dark);
+    if (_gRootPanel != nullptr && bg != _wPageBg)
+    {
+        void* br = winuiSolidBrush(bg);
+        if (br != nullptr)
+        {
+            ((XamlPanel*)_gRootPanel)->lpVtbl->put_Background(_gRootPanel, br);
+            _wPageBg = bg;
+        }
+    }
+    // The status strip is a bar, so it carries the PANEL fill (not the page fill) - the same
+    // read the Win32 host's themed status bar has.
+    int sb = t.panelBg;
+    if (_gStatusPanel != nullptr && sb != 0 && sb != _wStatusBg)
+    {
+        void* sbr = winuiSolidBrush(sb);
+        if (sbr != nullptr)
+        {
+            ((XamlPanel*)_gStatusPanel)->lpVtbl->put_Background(_gStatusPanel, sbr);
+            _wStatusBg = sb;
+        }
+    }
+}
+
+// Show/hide the bottom status strip and shrink the ScrollViewer by its height, so the bar is
+// pinned to the window bottom and the content scrolls ABOVE it. Called after every reconcile
+// (an app can mount or drop its StatusBar) and after a window resize.
+void winuiLayoutChrome(bool barOn)
+{
+    if (_gStatusElem != nullptr)
+        ((XamlUIElement*)_gStatusElem)->lpVtbl->put_Visibility(_gStatusElem, barOn ? 0 : 1);
+    if (_gRootFe == nullptr || _gScrollFe == nullptr) return;
+    double hDip = 0.0;
+    ((XamlFrameworkElement*)_gRootFe)->lpVtbl->get_ActualHeight(_gRootFe, &hDip);
+    if (hDip <= 0.0) return;   // not arranged yet (headless): leave the ScrollViewer stretching
+    double sh = barOn ? hDip - WSTATUS_H : hDip;
+    if (sh < 1.0) sh = 1.0;
+    ((XamlFrameworkElement*)_gScrollFe)->lpVtbl->put_Height(_gScrollFe, sh);
+}
+
 // QI helper: COM QueryInterface is symmetric, so any thin interface pointer reaches slot-0 QI.
 void* wqi(void* obj, void* iid)
 {
@@ -180,6 +669,50 @@ void* boxBool(bool b)
     return boxed;
 }
 
+// A SolidColorBrush of `color`, as the IBrush* the Fill/Stroke slots expect (a COM parameter must
+// be the exact interface pointer, so the IInspectable* is QI'd down). nullptr if activation fails.
+void* winuiSolidBrush(int color)
+{
+    void* insp = nullptr;
+    RoActivateInstance(hstring("Microsoft.UI.Xaml.Media.SolidColorBrush"), &insp);
+    void* scb = wqi(insp, iidof(XamlSolidColorBrush));
+    if (scb == nullptr) return nullptr;
+    ((XamlSolidColorBrush*)scb)->lpVtbl->put_Color(scb, winuiColorArg(color));
+    return wqi(insp, iidof(XamlBrush));
+}
+
+// An items control paints the rows its panel realizes BEYOND the viewport (WinUI's ListView
+// template lets its ScrollViewer render outside its own bounds, and a UIElement.Clip does not
+// override that) - so the cached rows land on top of the neighbouring cards. Zeroing the items
+// panel's cache leaves only the rows that actually fit, which is what bounds the control.
+// The panel exists only once the control template has applied, so this is retried per pump
+// until it takes (a ListView is created, then measured on the next frame).
+void winuiZeroItemsCache(u64 h)
+{
+    void* ic = wqi((void*)h, iidof(XamlItemsControl));
+    if (ic == nullptr) return;
+    void* panel = nullptr;
+    ((XamlItemsControl*)ic)->lpVtbl->get_ItemsPanelRoot(ic, &panel);
+    if (panel == nullptr) return;
+    void* isp = wqi(panel, iidof(XamlItemsStackPanel));
+    if (isp == nullptr) return;
+    ((XamlItemsStackPanel*)isp)->lpVtbl->put_CacheLength(isp, 0.0);
+}
+
+// The fill of a Box: its own color, or a fully transparent brush when it has none. XAML does NOT
+// hit-test a Border with a null Background, and a transparent brush is still hit-testable - which
+// is what makes a right-click land on a plain Box (its ContextFlyout).
+void* winuiFillBrush(int color)
+{
+    if (color != 0) return winuiSolidBrush(color);
+    void* insp = nullptr;
+    RoActivateInstance(hstring("Microsoft.UI.Xaml.Media.SolidColorBrush"), &insp);
+    void* scb = wqi(insp, iidof(XamlSolidColorBrush));
+    if (scb == nullptr) return nullptr;
+    ((XamlSolidColorBrush*)scb)->lpVtbl->put_Color(scb, (void*)(u64)0);   // A=0: transparent
+    return wqi(insp, iidof(XamlBrush));
+}
+
 // Compose a control that has no ActivateInstance (E_NOTIMPL): factory->CreateInstance(null outer),
 // exactly like the base Application/Window. ProgressBar/TabView/TreeView are composable this way.
 void* winuiCompose(string cls, void* facIid)
@@ -190,6 +723,309 @@ void* winuiCompose(string cls, void* facIid)
     void* inner = nullptr; void* raw = nullptr;
     ((XamlApplicationFactory*)fac)->lpVtbl->CreateInstance(fac, nullptr, &inner, &raw);
     return raw;
+}
+
+// Build a real MenuFlyout from a ContextMenu (the same declarative model the Win32 host turns
+// into a TrackPopupMenu): one MenuFlyoutItem per entry, an empty label = a separator, and each
+// item's Click routed through the app menu handler. Returned as the IFlyoutBase* ContextFlyout
+// wants, or nullptr if the menu is empty / activation failed.
+void* winuiBuildFlyout(u64 menuPtr)
+{
+    if (menuPtr == 0u) return nullptr;
+    ContextMenu* cm = (ContextMenu*)menuPtr;
+    if (cm.count() == 0) return nullptr;
+    void* insp = nullptr;
+    RoActivateInstance(hstring("Microsoft.UI.Xaml.Controls.MenuFlyout"), &insp);
+    if (insp == nullptr) insp = winuiCompose("Microsoft.UI.Xaml.Controls.MenuFlyout", iidof(XamlMenuFlyoutFactory));
+    void* mf = wqi(insp, iidof(XamlMenuFlyout));
+    if (mf == nullptr) return nullptr;
+    void* items = nullptr;
+    ((XamlMenuFlyout*)mf)->lpVtbl->get_Items(mf, &items);
+    if (items == nullptr) return nullptr;
+    int i = 0;
+    while (i < cm.count())
+    {
+        string label = cm.labels.get(i);
+        int cmd = cm.cmds.get(i);
+        string cls = label.length() == 0 ? "Microsoft.UI.Xaml.Controls.MenuFlyoutSeparator"
+                                         : "Microsoft.UI.Xaml.Controls.MenuFlyoutItem";
+        void* iinsp = nullptr;
+        RoActivateInstance(hstring(cls), &iinsp);
+        if (iinsp != nullptr && label.length() > 0)
+        {
+            void* mi = wqi(iinsp, iidof(XamlMenuFlyoutItem));
+            if (mi == nullptr) mi = wqi(winuiCompose(cls, iidof(XamlMenuFlyoutItemFactory)), iidof(XamlMenuFlyoutItem));
+            if (mi != nullptr)
+            {
+                ((XamlMenuFlyoutItem*)mi)->lpVtbl->put_Text(mi, hstring(label));
+                void* hc = winrtDelegate(XamlRoutedEventHandler, (void* s, void* a) => { routeMenu(cmd); });
+                u64 tok = 0;
+                ((XamlMenuFlyoutItem*)mi)->lpVtbl->add_Click(mi, hc, &tok);
+            }
+        }
+        void* mbase = wqi(iinsp, iidof(XamlMenuFlyoutItemBase));
+        if (mbase != nullptr) ((XamlMenuItemVector*)items)->lpVtbl->Append(items, mbase);
+        i++;
+    }
+    return wqi(insp, iidof(XamlFlyoutBase));
+}
+
+// -- WItemSource: the ListView's virtualized item source -------------------------
+// A ListView item is an `object`, and the framework's ListView is a VIRTUAL list (rowCount +
+// a rowText(row, col) callback - 100k rows is the gallery's own case), so appending boxed
+// strings into ItemsControl.Items is not an option: it would materialize every row eagerly.
+// Instead the control is bound to this hand-written collection - the WinRT bindable-collection
+// XAML wants (Microsoft.UI.Xaml.Interop.IBindableVector). XAML asks for get_Size once, then
+// GetAt only for the rows it realizes, and GetAt is where the boxed rowText callback is finally
+// called. IVector<object> has the exact same vtable shape as IBindableVector, so one vtable
+// answers both IIDs; the object also exposes IBindableIterable (IBindableVector requires it).
+//
+// The object is refcounted (XAML holds a ref for as long as the control is bound), is NOT on
+// the cflat heap, and owns the ListRowBox the seam handed it - freed on final release.
+struct WSrcVtbl
+{
+    function<i32(void*, void*, void**)>    QueryInterface      = nullptr;
+    function<u32(void*)>                   AddRef              = nullptr;
+    function<u32(void*)>                   Release             = nullptr;
+    function<i32(void*, u32*, void**)>     GetIids             = nullptr;
+    function<i32(void*, void**)>           GetRuntimeClassName = nullptr;
+    function<i32(void*, i32*)>             GetTrustLevel       = nullptr;
+    function<i32(void*, u32, void**)>      GetAt               = nullptr;
+    function<i32(void*, u32*)>             GetSize             = nullptr;
+    function<i32(void*, void**)>           GetView             = nullptr;
+    function<i32(void*, void*, u32*, u8*)> IndexOf             = nullptr;
+    function<i32(void*, u32, void*)>       SetAt               = nullptr;
+    function<i32(void*, u32, void*)>       InsertAt            = nullptr;
+    function<i32(void*, u32)>              RemoveAt            = nullptr;
+    function<i32(void*, void*)>            Append              = nullptr;
+    function<i32(void*)>                   RemoveAtEnd         = nullptr;
+    function<i32(void*)>                   Clear               = nullptr;
+};
+// IInspectable + IBindableIterable.First. Reached by QI as the SECOND vtable of a WItemSource,
+// so its `self` is the address of that second slot - eight bytes into the object.
+struct WIterableVtbl
+{
+    function<i32(void*, void*, void**)> QueryInterface      = nullptr;
+    function<u32(void*)>                AddRef              = nullptr;
+    function<u32(void*)>                Release             = nullptr;
+    function<i32(void*, u32*, void**)>  GetIids             = nullptr;
+    function<i32(void*, void**)>        GetRuntimeClassName = nullptr;
+    function<i32(void*, i32*)>          GetTrustLevel       = nullptr;
+    function<i32(void*, void**)>        First               = nullptr;
+};
+// IInspectable + IBindableIterator.
+struct WIterVtbl
+{
+    function<i32(void*, void*, void**)> QueryInterface      = nullptr;
+    function<u32(void*)>                AddRef              = nullptr;
+    function<u32(void*)>                Release             = nullptr;
+    function<i32(void*, u32*, void**)>  GetIids             = nullptr;
+    function<i32(void*, void**)>        GetRuntimeClassName = nullptr;
+    function<i32(void*, i32*)>          GetTrustLevel       = nullptr;
+    function<i32(void*, void**)>        GetCurrent          = nullptr;
+    function<i32(void*, u8*)>           GetHasCurrent       = nullptr;
+    function<i32(void*, u8*)>           MoveNext            = nullptr;
+};
+struct WItemSource
+{
+    WSrcVtbl*      lpVtbl   = nullptr;   // IBindableVector / IVector<object>
+    WIterableVtbl* lpVtbl2  = nullptr;   // IBindableIterable / IIterable<object> (self = &lpVtbl2)
+    u32            rc       = 0u;
+    u64            box      = 0u;        // the boxed rowText callback (ListRowBox*), owned
+    int            rowCount = 0;
+    int            cols     = 1;
+};
+struct WItemIterator
+{
+    WIterVtbl*   lpVtbl = nullptr;
+    u32          rc     = 0u;
+    WItemSource* src    = nullptr;
+    u32          idx    = 0u;
+};
+
+WSrcVtbl      _gSrcVtbl  = default;
+WIterableVtbl _gIterableVtbl = default;
+WIterVtbl     _gIterVtbl = default;
+bool          _gSrcVtblReady = false;
+
+// Compare a REFIID against an iidof() IID pointer (16 raw bytes; both sides are Guid*).
+bool _guidEqP(void* a, void* b)
+{
+    if (a == nullptr || b == nullptr) return false;
+    u8* x = (u8*)a;
+    u8* y = (u8*)b;
+    for (i32 i = 0; i < 16; i++) { if (x[i] != y[i]) return false; }
+    return true;
+}
+
+// The display string of one row: the row's columns joined (a ListView item is ONE object).
+move string _wsRowText(WItemSource* s, int row)
+{
+    if (s.box == 0u) return "";
+    int n = s.cols > 0 ? s.cols : 1;
+    string out = "";
+    int c = 0;
+    while (c < n)
+    {
+        if (c > 0) out = out + "    ";
+        out = out + __uiListRowText(s.box, row, c);
+        c++;
+    }
+    return out;
+}
+
+i32 _wsQI(void* self, void* iid, void** out)
+{
+    WItemSource* s = (WItemSource*)self;
+    if (_guidEq(iid, IID_IUnknown()) || _guidEq(iid, IID_IInspectable())
+        || _guidEq(iid, IID_IAgileObject())
+        || _guidEqP(iid, iidof(XamlBindableVector)) || _guidEqP(iid, iidof(XamlObjectVector)))
+    { out[0] = self; s.rc = s.rc + 1u; return 0; }
+    if (_guidEqP(iid, iidof(XamlBindableIterable)) || _guidEqP(iid, iidof(XamlObjectIterable)))
+    { out[0] = (void*)&s.lpVtbl2; s.rc = s.rc + 1u; return 0; }
+    out[0] = nullptr;
+    return (i32)0x80004002;   // E_NOINTERFACE
+}
+u32 _wsAddRef(void* self)
+{
+    WItemSource* s = (WItemSource*)self;
+    s.rc = s.rc + 1u;
+    return s.rc;
+}
+u32 _wsRelease(void* self)
+{
+    WItemSource* s = (WItemSource*)self;
+    if (s.rc > 0u) s.rc = s.rc - 1u;
+    u32 left = s.rc;
+    if (left == 0u)
+    {
+        if (s.box != 0u) { __uiFreeListRowBox(s.box); s.box = 0u; }
+        free((void*)s);
+    }
+    return left;
+}
+i32 _wsGetIids(void* self, u32* count, void** iids) { count[0] = 0u; iids[0] = nullptr; return 0; }
+i32 _wsGetRcn(void* self, void** name) { name[0] = hstring("CFlatWinUI.ItemSource"); return 0; }
+i32 _wsGetTrust(void* self, i32* level) { level[0] = 0; return 0; }
+
+i32 _wsGetAt(void* self, u32 index, void** out)
+{
+    WItemSource* s = (WItemSource*)self;
+    if ((int)index >= s.rowCount) { out[0] = nullptr; return (i32)0x8000000B; }   // E_BOUNDS
+    out[0] = boxString(_wsRowText(s, (int)index));
+    return 0;
+}
+i32 _wsGetSize(void* self, u32* out)
+{
+    WItemSource* s = (WItemSource*)self;
+    out[0] = (u32)s.rowCount;
+    return 0;
+}
+i32 _wsGetView(void* self, void** out) { out[0] = nullptr; return (i32)0x80004001; }   // E_NOTIMPL
+i32 _wsIndexOf(void* self, void* value, u32* index, u8* found) { index[0] = 0u; found[0] = 0; return 0; }
+// The source is read-only (the app's rowCount + rowText ARE the collection).
+i32 _wsSetAt(void* self, u32 index, void* value)    { return (i32)0x80004001; }
+i32 _wsInsertAt(void* self, u32 index, void* value) { return (i32)0x80004001; }
+i32 _wsRemoveAt(void* self, u32 index)              { return (i32)0x80004001; }
+i32 _wsAppend(void* self, void* value)              { return (i32)0x80004001; }
+i32 _wsRemoveAtEnd(void* self)                      { return (i32)0x80004001; }
+i32 _wsClear(void* self)                            { return (i32)0x80004001; }
+
+// The iterable face sits eight bytes in (its `self` is &src.lpVtbl2), so every method there
+// steps back to the object before touching it.
+WItemSource* _wsFromIterable(void* self) { return (WItemSource*)((char*)self - 8); }
+
+i32 _wiQI(void* self, void* iid, void** out)  { return _wsQI((void*)_wsFromIterable(self), iid, out); }
+u32 _wiAddRef(void* self)                     { return _wsAddRef((void*)_wsFromIterable(self)); }
+u32 _wiRelease(void* self)                    { return _wsRelease((void*)_wsFromIterable(self)); }
+i32 _wiFirst(void* self, void** out)
+{
+    WItemSource* s = _wsFromIterable(self);
+    WItemIterator* it = (WItemIterator*)malloc((i64)sizeof(WItemIterator));
+    it.lpVtbl = &_gIterVtbl;
+    it.rc = 1u;
+    it.src = s;
+    it.idx = 0u;
+    _wsAddRef((void*)s);
+    out[0] = (void*)it;
+    return 0;
+}
+
+i32 _wtQI(void* self, void* iid, void** out)
+{
+    WItemIterator* it = (WItemIterator*)self;
+    if (_guidEq(iid, IID_IUnknown()) || _guidEq(iid, IID_IInspectable()) || _guidEq(iid, IID_IAgileObject()))
+    { out[0] = self; it.rc = it.rc + 1u; return 0; }
+    out[0] = nullptr;
+    return (i32)0x80004002;
+}
+u32 _wtAddRef(void* self) { WItemIterator* it = (WItemIterator*)self; it.rc = it.rc + 1u; return it.rc; }
+u32 _wtRelease(void* self)
+{
+    WItemIterator* it = (WItemIterator*)self;
+    if (it.rc > 0u) it.rc = it.rc - 1u;
+    u32 left = it.rc;
+    if (left == 0u) { _wsRelease((void*)it.src); free((void*)it); }
+    return left;
+}
+i32 _wtGetIids(void* self, u32* count, void** iids) { count[0] = 0u; iids[0] = nullptr; return 0; }
+i32 _wtGetRcn(void* self, void** name) { name[0] = hstring("CFlatWinUI.ItemIterator"); return 0; }
+i32 _wtGetTrust(void* self, i32* level) { level[0] = 0; return 0; }
+i32 _wtGetCurrent(void* self, void** out)
+{
+    WItemIterator* it = (WItemIterator*)self;
+    if ((int)it.idx >= it.src.rowCount) { out[0] = nullptr; return (i32)0x8000000B; }
+    out[0] = boxString(_wsRowText(it.src, (int)it.idx));
+    return 0;
+}
+i32 _wtGetHasCurrent(void* self, u8* out)
+{
+    WItemIterator* it = (WItemIterator*)self;
+    out[0] = (int)it.idx < it.src.rowCount ? (u8)1 : (u8)0;
+    return 0;
+}
+i32 _wtMoveNext(void* self, u8* out)
+{
+    WItemIterator* it = (WItemIterator*)self;
+    it.idx = it.idx + 1u;
+    out[0] = (int)it.idx < it.src.rowCount ? (u8)1 : (u8)0;
+    return 0;
+}
+
+// Wire the three static vtables once, then hand out a fresh (rc = 1) item source.
+WItemSource* winuiNewItemSource()
+{
+    if (!_gSrcVtblReady)
+    {
+        _gSrcVtblReady = true;
+        _gSrcVtbl.QueryInterface = _wsQI;      _gSrcVtbl.AddRef = _wsAddRef;
+        _gSrcVtbl.Release = _wsRelease;        _gSrcVtbl.GetIids = _wsGetIids;
+        _gSrcVtbl.GetRuntimeClassName = _wsGetRcn; _gSrcVtbl.GetTrustLevel = _wsGetTrust;
+        _gSrcVtbl.GetAt = _wsGetAt;            _gSrcVtbl.GetSize = _wsGetSize;
+        _gSrcVtbl.GetView = _wsGetView;        _gSrcVtbl.IndexOf = _wsIndexOf;
+        _gSrcVtbl.SetAt = _wsSetAt;            _gSrcVtbl.InsertAt = _wsInsertAt;
+        _gSrcVtbl.RemoveAt = _wsRemoveAt;      _gSrcVtbl.Append = _wsAppend;
+        _gSrcVtbl.RemoveAtEnd = _wsRemoveAtEnd; _gSrcVtbl.Clear = _wsClear;
+
+        _gIterableVtbl.QueryInterface = _wiQI; _gIterableVtbl.AddRef = _wiAddRef;
+        _gIterableVtbl.Release = _wiRelease;   _gIterableVtbl.GetIids = _wsGetIids;
+        _gIterableVtbl.GetRuntimeClassName = _wsGetRcn; _gIterableVtbl.GetTrustLevel = _wsGetTrust;
+        _gIterableVtbl.First = _wiFirst;
+
+        _gIterVtbl.QueryInterface = _wtQI;     _gIterVtbl.AddRef = _wtAddRef;
+        _gIterVtbl.Release = _wtRelease;       _gIterVtbl.GetIids = _wtGetIids;
+        _gIterVtbl.GetRuntimeClassName = _wtGetRcn; _gIterVtbl.GetTrustLevel = _wtGetTrust;
+        _gIterVtbl.GetCurrent = _wtGetCurrent; _gIterVtbl.GetHasCurrent = _wtGetHasCurrent;
+        _gIterVtbl.MoveNext = _wtMoveNext;
+    }
+    WItemSource* s = (WItemSource*)malloc((i64)sizeof(WItemSource));
+    s.lpVtbl = &_gSrcVtbl;
+    s.lpVtbl2 = &_gIterableVtbl;
+    s.rc = 1u;
+    s.box = 0u;
+    s.rowCount = 0;
+    s.cols = 1;
+    return s;
 }
 
 // Every framework element kind the WinUI host realizes as a XAML control.
@@ -203,31 +1039,44 @@ bool winuiMappable(int kind)
         || kind == ELEM_IMAGE || kind == ELEM_GROUPBOX || kind == ELEM_CANVAS;
 }
 
+// The style.backgroundColor of a plain (non-mapped) container - a View from view/row/column - or 0
+// for anything else. A non-zero value opts the container into a painted backdrop panel (Box is
+// excluded: it already maps to a native Border). Mirrors the Cocoa host's _containerBg.
+int winuiContainerBg(IElement node)
+{
+    if (node.kind() != ELEM_VIEW) return 0;
+    IView v = node as IView;
+    if (v == nullptr) return 0;
+    return v.style.backgroundColor;
+}
+
 class WinUI3Host : INativeHost
 {
     bool applying = false;   // guard: swallow self-inflicted Checked/Unchecked
     list<string> liveKeys = default;   // keys live this frame (drives the destroy diff)
 
-    // Text mirror (fallback for nativeControlText when a live get_Text is unavailable).
-    list<u64>    txtH = default;
-    list<string> txtV = default;
+    // ListView: parallel control handle -> the bound item source (WItemSource* as u64). The
+    // source IS the control's ItemsSource, so every list driver reads it back off the control.
+    list<u64>    listH   = default;
+    list<u64>    listSrc = default;
 
-    // ListView bookkeeping (setListOp): parallel control handle -> rowCount / rowText box / selection.
-    list<u64>    listH        = default;
-    list<int>    listRowCount = default;
-    list<u64>    listBox      = default;
-    list<int>    listSel      = default;
-
-    // TreeView bookkeeping: the boxed node source (TreeBox*) per control, and a host-side
-    // materialized-node model (synthetic item handles) that the tree drivers walk.
+    // TreeView: the boxed node source (TreeBox*) per control, plus the association a REAL
+    // TreeViewNode needs to map back to the app's integer nodeId (a node carries only Content).
     list<u64>    treeBoxH = default;
     list<u64>    treeBoxV = default;
-    list<u64>    tItemCtrl = default;   // owning control handle per materialized item
-    list<u64>    tItemH    = default;   // synthetic item handle
-    list<int>    tItemNode = default;   // app nodeId
-    list<u64>    tItemPar  = default;   // parent item handle (0 = top level)
-    list<bool>   tItemMat  = default;   // children materialized yet
-    u64          tItemSeq  = 1u;        // synthetic item-handle counter
+    list<u64>    tnCtrl   = default;   // owning control handle per registered node
+    list<u64>    tnKey    = default;   // the node's COM identity (its IUnknown*)
+    list<u64>    tnItem   = default;   // the node's ITreeViewNode* (the drivers' item handle)
+    list<int>    tnId     = default;   // app nodeId
+    list<bool>   tnMat    = default;   // children materialized yet
+
+    // StatusBar controls: hosted in the bottom strip Canvas, not the scrolling content Canvas.
+    list<u64>    sbH = default;
+
+    // Context flyouts: parallel control handle -> the MenuFlyout attached to it (as u64).
+    list<u64>    cfH    = default;
+    list<u64>    cfMenu = default;
+
 
     // Accent-button colors: parallel control handle -> (bg, fg) framework colors (0 = none).
     list<u64>    accH  = default;
@@ -239,58 +1088,85 @@ class WinUI3Host : INativeHost
     list<bool>   imgHas  = default;
     list<u64>    imgLast = default;
 
-    // CanvasView paint boxes (placeholder): parallel control handle -> CanvasBox* (as u64).
-    list<u64>    canvasH   = default;
-    list<u64>    canvasBox = default;
+    // CanvasView surfaces: parallel control handle -> CanvasBox* + the GDI/XAML surface it
+    // paints through (a top-down DIB section whose bits are copied into a WriteableBitmap).
+    list<u64>    canvasH    = default;
+    list<u64>    canvasBox  = default;
+    list<u64>    canvasBmp  = default;   // HBITMAP (DIB section), 0 = none yet
+    list<u64>    canvasBits = default;   // the DIB's pixel bits
+    list<u64>    canvasWb   = default;   // WriteableBitmap (raw IInspectable*), the Image Source
+    list<int>    canvasPxW  = default;
+    list<int>    canvasPxH  = default;
+    list<u64>    canvasDc    = default;   // cached memory DC, selected with canvasBmp, 0 = none yet
+    list<u64>    canvasDcOld = default;   // the DC's original default bitmap, restored before DeleteDC
+    list<u64>    canvasBr    = default;   // cached background brush (HBRUSH), 0 = none yet
+    list<int>    canvasBrColor = default; // color the cached brush was created with
 
     // Per-key context menus: parallel key path -> ContextMenu* (as u64). Host-owned.
     list<string> ctxKeys  = default;
     list<u64>    ctxMenus  = default;
 
-    // -- Text mirror ----------------------------------------------------------
-    void _setTxt(u64 h, string s)
-    {
-        int i = 0;
-        while (i < this.txtH.count()) { if (this.txtH.get(i) == h) { this.txtV.set(i, "" + s); return; } i++; }
-        this.txtH.add(h); this.txtV.add("" + s);
-    }
-    string _txtFor(u64 h)
-    {
-        int i = 0;
-        while (i < this.txtH.count()) { if (this.txtH.get(i) == h) return "" + this.txtV.get(i); i++; }
-        return "";
-    }
 
-    // -- ListView bookkeeping -------------------------------------------------
     int _slot(list<u64>* xs, u64 h)
     {
         int i = 0;
         while (i < xs.count()) { if (xs.get(i) == h) return i; i++; }
         return -1;
     }
-    void _listSetCount(u64 h, int n)
-    {
-        int i = this._slot(&this.listH, h);
-        if (i >= 0) { this.listRowCount.set(i, n); return; }
-        this.listH.add(h); this.listRowCount.add(n); this.listBox.add(0u); this.listSel.add(0 - 1);
-    }
-    void _listSetBox(u64 h, u64 box)
-    {
-        int i = this._slot(&this.listH, h);
-        if (i >= 0)
-        {
-            u64 old = this.listBox.get(i);
-            if (old != 0u && old != box) __uiFreeListRowBox(old);
-            this.listBox.set(i, box); return;
-        }
-        this.listH.add(h); this.listRowCount.add(0); this.listBox.add(box); this.listSel.add(0 - 1);
-    }
-    int _listCount(u64 h)  { int i = this._slot(&this.listH, h); if (i >= 0) { int v = this.listRowCount.get(i); return v; } return 0; }
-    u64 _listBoxFor(u64 h) { int i = this._slot(&this.listH, h); if (i >= 0) { u64 v = this.listBox.get(i); return v; } return 0u; }
-    void _listSetSel(u64 h, int r) { int i = this._slot(&this.listH, h); if (i >= 0) this.listSel.set(i, r); }
-    int _listGetSel(u64 h) { int i = this._slot(&this.listH, h); if (i >= 0) { int v = this.listSel.get(i); return v; } return 0 - 1; }
 
-    // -- TreeView bookkeeping -------------------------------------------------
+    // -- ListView: the bound item source --------------------------------------
+    // The source is created on first sight and bound as the control's ItemsSource; from then on
+    // it IS the list's data (XAML pulls rows out of it), so the drivers read it back off the
+    // control rather than from a host mirror.
+    u64 _listSrcFor(u64 h)
+    {
+        int i = this._slot(&this.listH, h);
+        if (i >= 0) { u64 v = this.listSrc.get(i); return v; }
+        return 0u;
+    }
+    u64 _listMakeSrc(u64 h)
+    {
+        u64 have = this._listSrcFor(h);
+        if (have != 0u) return have;
+        WItemSource* s = winuiNewItemSource();
+        this.listH.add(h); this.listSrc.add((u64)s);
+        this._listBind(h, (u64)s);
+        return (u64)s;
+    }
+    // (Re)bind the source as the control's ItemsSource. A non-observable collection is only
+    // re-read when the ItemsSource property CHANGES, so a row-count change rebinds through null.
+    void _listBind(u64 h, u64 src)
+    {
+        void* ic = wqi((void*)h, iidof(XamlItemsControl));
+        if (ic == nullptr) return;
+        ((XamlItemsControl*)ic)->lpVtbl->put_ItemsSource(ic, nullptr);
+        ((XamlItemsControl*)ic)->lpVtbl->put_ItemsSource(ic, (void*)src);
+    }
+    // The item source the CONTROL is bound to (nullptr if the control carries no items), matched
+    // against the sources this host owns before it is dereferenced.
+    WItemSource* _listLiveSrc(u64 h)
+    {
+        void* ic = wqi((void*)h, iidof(XamlItemsControl));
+        if (ic == nullptr) return nullptr;
+        void* src = nullptr;
+        ((XamlItemsControl*)ic)->lpVtbl->get_ItemsSource(ic, &src);
+        if (src == nullptr) return nullptr;
+        if (this._slot(&this.listSrc, (u64)src) < 0) return nullptr;
+        return (WItemSource*)src;
+    }
+    void _listDropSrc(u64 h)
+    {
+        int i = this._slot(&this.listH, h);
+        if (i < 0) return;
+        u64 src = this.listSrc.get(i);
+        this.listH.removeAt(i); this.listSrc.removeAt(i);
+        // Unbind first, so XAML drops its ref and the source (and its rowText box) really dies.
+        void* ic = wqi((void*)h, iidof(XamlItemsControl));
+        if (ic != nullptr) ((XamlItemsControl*)ic)->lpVtbl->put_ItemsSource(ic, nullptr);
+        if (src != 0u) _wsRelease((void*)src);
+    }
+
+    // -- TreeView: real TreeViewNodes ------------------------------------------
     void _treeSetBox(u64 h, u64 box)
     {
         int i = this._slot(&this.treeBoxH, h);
@@ -304,79 +1180,159 @@ class WinUI3Host : INativeHost
     }
     u64 _treeBoxFor(u64 h) { int i = this._slot(&this.treeBoxH, h); if (i >= 0) { u64 v = this.treeBoxV.get(i); return v; } return 0u; }
 
-    // Append a materialized item; returns its synthetic handle.
-    u64 _treeAddItem(u64 ctrl, int nodeId, u64 parent)
+    // A node's COM identity (QI for IUnknown), the stable key an interface pointer is looked up
+    // by - XAML hands the same node back through different interface pointers.
+    u64 _treeKey(u64 item)
     {
-        // Handles must never be 0 (0 is the "top-level" parent sentinel). `= default` on the host
-        // zeroes tItemSeq (field initializers are not run), so seed it to 1 on first use.
-        if (this.tItemSeq == 0u) this.tItemSeq = 1u;
-        u64 ih = this.tItemSeq; this.tItemSeq = this.tItemSeq + 1u;
-        this.tItemCtrl.add(ctrl); this.tItemH.add(ih);
-        this.tItemNode.add(nodeId); this.tItemPar.add(parent); this.tItemMat.add(false);
-        return ih;
+        if (item == 0u) return 0u;
+        Guid unk = IID_IUnknown();
+        void* p = wqi((void*)item, &unk);
+        return (u64)p;
     }
-    // Clear the tree's materialized items and re-insert the root's children (lazy).
-    void _treeBuildRoot(u64 h)
+    int _treeSlot(u64 item)
     {
-        u64 box = this._treeBoxFor(h);
-        if (box == 0u) return;
+        u64 k = this._treeKey(item);
+        if (k == 0u) return -1;
+        return this._slot(&this.tnKey, k);
+    }
+    int _treeItemNode(u64 item) { int i = this._treeSlot(item); if (i >= 0) { int v = this.tnId.get(i); return v; } return 0 - 1; }
+
+    // Create a real TreeViewNode for `nodeId`: its Content is the app's label, and a node with
+    // children is marked unrealized so XAML shows a chevron and raises Expanding on the click.
+    u64 _treeMakeNode(u64 box, int nodeId)
+    {
+        void* insp = nullptr;
+        RoActivateInstance(hstring("Microsoft.UI.Xaml.Controls.TreeViewNode"), &insp);
+        if (insp == nullptr)
+            insp = winuiCompose("Microsoft.UI.Xaml.Controls.TreeViewNode", iidof(XamlTreeViewNodeFactory));
+        void* node = wqi(insp, iidof(XamlTreeViewNode));
+        if (node == nullptr) return 0u;
+        ((XamlTreeViewNode*)node)->lpVtbl->put_Content(node, boxString(__uiTreeLabel(box, nodeId)));
+        if (__uiTreeChildCount(box, nodeId) > 0)
+            ((XamlTreeViewNode*)node)->lpVtbl->put_HasUnrealizedChildren(node, true);
+        return (u64)node;
+    }
+    void _treeRegister(u64 h, u64 item, int nodeId)
+    {
+        this.tnCtrl.add(h); this.tnKey.add(this._treeKey(item)); this.tnItem.add(item);
+        this.tnId.add(nodeId); this.tnMat.add(false);
+    }
+    void _treeForget(u64 h)
+    {
         int i = 0;
-        while (i < this.tItemCtrl.count())
+        while (i < this.tnCtrl.count())
         {
-            if (this.tItemCtrl.get(i) == h)
+            if (this.tnCtrl.get(i) == h)
             {
-                this.tItemCtrl.removeAt(i); this.tItemH.removeAt(i); this.tItemNode.removeAt(i);
-                this.tItemPar.removeAt(i); this.tItemMat.removeAt(i);
+                this.tnCtrl.removeAt(i); this.tnKey.removeAt(i); this.tnItem.removeAt(i);
+                this.tnId.removeAt(i); this.tnMat.removeAt(i);
             }
             else i++;
         }
-        int n = __uiTreeChildCount(box, TREE_ROOT);
-        int j = 0;
-        while (j < n) { this._treeAddItem(h, __uiTreeChildId(box, TREE_ROOT, j), 0u); j++; }
     }
-    int _treeItemSlot(u64 h, u64 item)
+    // The TreeView's RootNodes vector (the live root of the real node tree).
+    void* _treeRoots(u64 h)
     {
+        void* tv = wqi((void*)h, iidof(XamlTreeView));
+        if (tv == nullptr) return nullptr;
+        void* roots = nullptr;
+        ((XamlTreeView*)tv)->lpVtbl->get_RootNodes(tv, &roots);
+        return roots;
+    }
+    void* _treeChildren(u64 item)
+    {
+        if (item == 0u) return nullptr;
+        void* kids = nullptr;
+        ((XamlTreeViewNode*)item)->lpVtbl->get_Children(item, &kids);
+        return kids;
+    }
+    // Clear the control's nodes and rebuild the top level (children stay lazy).
+    void _treeBuildRoot(u64 h)
+    {
+        u64 box = this._treeBoxFor(h);
+        void* roots = this._treeRoots(h);
+        if (box == 0u || roots == nullptr) return;
+        ((XamlTreeNodeVector*)roots)->lpVtbl->Clear(roots);
+        this._treeForget(h);
+        int n = __uiTreeChildCount(box, TREE_ROOT);
         int i = 0;
-        while (i < this.tItemCtrl.count())
+        while (i < n)
         {
-            if (this.tItemCtrl.get(i) == h && this.tItemH.get(i) == item) return i;
+            int nid = __uiTreeChildId(box, TREE_ROOT, i);
+            u64 node = this._treeMakeNode(box, nid);
+            if (node != 0u)
+            {
+                ((XamlTreeNodeVector*)roots)->lpVtbl->Append(roots, (void*)node);
+                this._treeRegister(h, node, nid);
+            }
             i++;
         }
-        return -1;
     }
-    int _treeItemNode(u64 h, u64 item) { int i = this._treeItemSlot(h, item); if (i >= 0) { int v = this.tItemNode.get(i); return v; } return 0 - 1; }
-    int _treeCount(u64 h)
+    // Materialize a node's children into the REAL node tree on first expand (idempotent).
+    // Returns the app nodeId, or -1 if the node is not one of ours.
+    int _treeMaterialize(u64 h, u64 item)
     {
-        int i = 0; int c = 0;
-        while (i < this.tItemCtrl.count()) { if (this.tItemCtrl.get(i) == h) c++; i++; }
-        return c;
-    }
-    u64 _treeRoot(u64 h)
-    {
-        int i = 0;
-        while (i < this.tItemCtrl.count()) { if (this.tItemCtrl.get(i) == h && this.tItemPar.get(i) == 0u) { u64 v = this.tItemH.get(i); return v; } i++; }
-        return 0u;
-    }
-    u64 _treeFirstChild(u64 h, u64 item)
-    {
-        int i = 0;
-        while (i < this.tItemCtrl.count()) { if (this.tItemCtrl.get(i) == h && this.tItemPar.get(i) == item) { u64 v = this.tItemH.get(i); return v; } i++; }
-        return 0u;
-    }
-    // Materialize a node's children on first expand (idempotent). Returns the app nodeId expanded.
-    int _treeExpand(u64 h, u64 item)
-    {
-        int s = this._treeItemSlot(h, item);
+        int s = this._treeSlot(item);
         if (s < 0) return 0 - 1;
-        int nodeId = this.tItemNode.get(s);
-        if (this.tItemMat.get(s)) return nodeId;
-        this.tItemMat.set(s, true);
+        int nodeId = this.tnId.get(s);
+        if (this.tnMat.get(s)) return nodeId;
+        this.tnMat.set(s, true);
         u64 box = this._treeBoxFor(h);
         if (box == 0u) return nodeId;
+        void* kids = this._treeChildren(item);
+        if (kids == nullptr) return nodeId;
         int n = __uiTreeChildCount(box, nodeId);
         int i = 0;
-        while (i < n) { this._treeAddItem(h, __uiTreeChildId(box, nodeId, i), item); i++; }
+        while (i < n)
+        {
+            int cid = __uiTreeChildId(box, nodeId, i);
+            u64 child = this._treeMakeNode(box, cid);
+            if (child != 0u)
+            {
+                ((XamlTreeNodeVector*)kids)->lpVtbl->Append(kids, (void*)child);
+                this._treeRegister(h, child, cid);
+            }
+            i++;
+        }
+        ((XamlTreeViewNode*)item)->lpVtbl->put_HasUnrealizedChildren(item, false);
         return nodeId;
+    }
+    // Count the nodes actually in the control (roots + every materialized descendant).
+    int _treeCount(u64 h)
+    {
+        void* roots = this._treeRoots(h);
+        if (roots == nullptr) return 0;
+        return this._treeCountVec(roots);
+    }
+    int _treeCountVec(void* vec)
+    {
+        u32 n = 0u;
+        ((XamlTreeNodeVector*)vec)->lpVtbl->get_Size(vec, &n);
+        int total = 0;
+        u32 i = 0u;
+        while (i < n)
+        {
+            void* node = nullptr;
+            ((XamlTreeNodeVector*)vec)->lpVtbl->GetAt(vec, i, &node);
+            total = total + 1;
+            if (node != nullptr)
+            {
+                void* kids = this._treeChildren((u64)node);
+                if (kids != nullptr) total = total + this._treeCountVec(kids);
+            }
+            i = i + 1u;
+        }
+        return total;
+    }
+    u64 _treeFirstOf(void* vec)
+    {
+        if (vec == nullptr) return 0u;
+        u32 n = 0u;
+        ((XamlTreeNodeVector*)vec)->lpVtbl->get_Size(vec, &n);
+        if (n == 0u) return 0u;
+        void* node = nullptr;
+        ((XamlTreeNodeVector*)vec)->lpVtbl->GetAt(vec, 0u, &node);
+        return (u64)node;
     }
 
     // -- Accent bookkeeping (stored + reported - no NM_CUSTOMDRAW on WinUI) ------
@@ -402,17 +1358,153 @@ class WinUI3Host : INativeHost
     bool _imgHasBitmap(u64 h) { int i = this._slot(&this.imgH, h); if (i >= 0) { bool v = this.imgHas.get(i); return v; } return false; }
     u64  _imgLastPixels(u64 h) { int i = this._slot(&this.imgH, h); if (i >= 0) { u64 v = this.imgLast.get(i); return v; } return 0u; }
 
-    // -- CanvasView box bookkeeping -------------------------------------------
-    void _setCanvasBox(u64 h, u64 box)
+    // -- CanvasView box + surface bookkeeping ---------------------------------
+    // Find (or append) the canvas row for a control handle. Every canvas list is parallel.
+    int _canvasSlot(u64 h)
     {
         int i = this._slot(&this.canvasH, h);
-        if (i >= 0)
+        if (i >= 0) return i;
+        this.canvasH.add(h); this.canvasBox.add(0u);
+        this.canvasBmp.add(0u); this.canvasBits.add(0u); this.canvasWb.add(0u);
+        this.canvasPxW.add(0); this.canvasPxH.add(0);
+        this.canvasDc.add(0u); this.canvasDcOld.add(0u);
+        this.canvasBr.add(0u); this.canvasBrColor.add(0 - 1);
+        return this.canvasH.count() - 1;
+    }
+    void _setCanvasBox(u64 h, u64 box)
+    {
+        int i = this._canvasSlot(h);
+        u64 old = this.canvasBox.get(i);
+        if (old != 0u && old != box) __uiFreeCanvasBox(old);
+        this.canvasBox.set(i, box);
+    }
+    // Drop the GDI bitmap, the cached memory DC/brush, and the WriteableBitmap binding (a
+    // resize or a destroy). The DC must have its original default bitmap restored before
+    // DeleteDC, or the DC's original bitmap object leaks.
+    void _canvasFreeSurface(int i)
+    {
+        u64 dc = this.canvasDc.get(i);
+        if (dc != 0u && winuiGdiReady())
         {
-            u64 old = this.canvasBox.get(i);
-            if (old != 0u && old != box) __uiFreeCanvasBox(old);
-            this.canvasBox.set(i, box); return;
+            u64 dcOld = this.canvasDcOld.get(i);
+            if (dcOld != 0u) _wgSelectObject((void*)dc, (void*)dcOld);
+            _wgDeleteDC((void*)dc);
         }
-        this.canvasH.add(h); this.canvasBox.add(box);
+        this.canvasDc.set(i, 0u); this.canvasDcOld.set(i, 0u);
+        u64 br = this.canvasBr.get(i);
+        if (br != 0u && winuiGdiReady()) _wgDeleteObject((void*)br);
+        this.canvasBr.set(i, 0u); this.canvasBrColor.set(i, 0 - 1);
+        u64 bmp = this.canvasBmp.get(i);
+        if (bmp != 0u && winuiGdiReady()) _wgDeleteObject((void*)bmp);
+        this.canvasBmp.set(i, 0u); this.canvasBits.set(i, 0u); this.canvasWb.set(i, 0u);
+        this.canvasPxW.set(i, 0); this.canvasPxH.set(i, 0);
+    }
+
+    // Create a WriteableBitmap of w x h px and make it the Image control's Source.
+    void* _canvasMakeBitmap(u64 h, int w, int h2)
+    {
+        XamlWriteableBitmapFactory* wbf = nullptr;
+        activationFactory("Microsoft.UI.Xaml.Media.Imaging.WriteableBitmap",
+            iidof(XamlWriteableBitmapFactory), (void**)&wbf);
+        if (wbf == nullptr) return nullptr;
+        void* wbRaw = nullptr;
+        wbf->lpVtbl->CreateInstanceWithDimensions(wbf, w, h2, &wbRaw);
+        if (wbRaw == nullptr) return nullptr;
+        void* img = wqi((void*)h, iidof(XamlImage));
+        void* isrc = wqi(wbRaw, iidof(XamlImageSource));
+        if (img == nullptr || isrc == nullptr) return nullptr;
+        ((XamlImage*)img)->lpVtbl->put_Source(img, isrc);
+        return wbRaw;
+    }
+
+    // Copy the rasterized DIB into the WriteableBitmap's PixelBuffer and Invalidate it.
+    void _canvasUpload(int i, void* bits, int w, int h2)
+    {
+        u64 wbRaw = this.canvasWb.get(i);
+        if (wbRaw == 0u || bits == nullptr) return;
+        void* wb = wqi((void*)wbRaw, iidof(XamlWriteableBitmap));
+        if (wb == nullptr) return;
+        void* buf = nullptr;
+        ((XamlWriteableBitmap*)wb)->lpVtbl->get_PixelBuffer(wb, &buf);
+        if (buf == nullptr) return;
+        Guid bbaIid = IID_IBufferByteAccess();
+        void* bba = wqi(buf, &bbaIid);
+        if (bba == nullptr) return;
+        u8* dst = nullptr;
+        ((IBufferByteAccess*)bba)->lpVtbl->Buffer(bba, &dst);
+        if (dst == nullptr) return;
+        // GDI never writes the alpha channel, so the DIB comes back with A = 0 - which a
+        // WriteableBitmap (premultiplied BGRA) renders fully transparent. Force it opaque,
+        // one 32-bit pixel word at a time (OR in the top byte) rather than a separate
+        // byte-indexed alpha pass plus a memcpy.
+        u32* src = (u32*)bits;
+        u32* dstW = (u32*)dst;
+        int n = w * h2;
+        int p = 0;
+        while (p < n) { dstW[p] = src[p] | 0xFF000000u; p++; }
+        ((XamlWriteableBitmap*)wb)->lpVtbl->Invalidate(wb);
+    }
+
+    // Rasterize the canvas's boxed onPaint closure into its WriteableBitmap. This is the WinUI
+    // equivalent of the Win32 host's InvalidateRect: _syncProps calls it on every pump. `s` is the
+    // rasterization scale the pxW x pxH surface was sized at (device px per DIP).
+    void _paintCanvas(u64 h, int pxW, int pxH, double s)
+    {
+        if (h == 0u || pxW <= 0 || pxH <= 0) return;
+        if (!winuiGdiReady()) return;
+        int i = this._canvasSlot(h);
+        u64 box = this.canvasBox.get(i);
+        if (box == 0u) return;
+        if (this.canvasBmp.get(i) == 0u || this.canvasPxW.get(i) != pxW || this.canvasPxH.get(i) != pxH)
+        {
+            this._canvasFreeSurface(i);
+            WGdiBmi bi = default;
+            bi.biSize = 40u; bi.biWidth = pxW; bi.biHeight = 0 - pxH;   // negative = top-down
+            bi.biPlanes = 1; bi.biBitCount = 32; bi.biCompression = 0u;
+            void* bits = nullptr;
+            void* bmp = _wgCreateDIBSection(nullptr, &bi, 0u, &bits, nullptr, 0u);
+            if (bmp == nullptr || bits == nullptr) return;
+            void* wbRaw = this._canvasMakeBitmap(h, pxW, pxH);
+            if (wbRaw == nullptr) { _wgDeleteObject(bmp); return; }
+            this.canvasBmp.set(i, (u64)bmp); this.canvasBits.set(i, (u64)bits);
+            this.canvasWb.set(i, (u64)wbRaw);
+            this.canvasPxW.set(i, pxW); this.canvasPxH.set(i, pxH);
+        }
+        void* bits = (void*)this.canvasBits.get(i);
+        // The memory DC (with the DIB selected in) is cached across paints - only the
+        // surface (re)creation above tears it down, via _canvasFreeSurface.
+        if (this.canvasDc.get(i) == 0u)
+        {
+            void* dc = _wgCreateCompatibleDC(nullptr);
+            if (dc == nullptr) return;
+            void* old = _wgSelectObject(dc, (void*)this.canvasBmp.get(i));
+            this.canvasDc.set(i, (u64)dc); this.canvasDcOld.set(i, (u64)old);
+        }
+        void* dc = (void*)this.canvasDc.get(i);
+        // Fill the theme background first, so custom drawing sits on the app palette. The
+        // brush is cached and only recreated when the theme/background color changes.
+        WGdiRect rc = default; rc.right = pxW; rc.bottom = pxH;
+        int bgColor = this.appTheme().panelBg;
+        int fillColor = bgColor != 0 ? bgColor : 0xFFFFFF;
+        if (this.canvasBr.get(i) == 0u || this.canvasBrColor.get(i) != fillColor)
+        {
+            u64 oldBr = this.canvasBr.get(i);
+            if (oldBr != 0u) _wgDeleteObject((void*)oldBr);
+            void* br = _wgCreateSolidBrush(winuiColorRef(fillColor));
+            this.canvasBr.set(i, (u64)br); this.canvasBrColor.set(i, fillColor);
+        }
+        void* br = (void*)this.canvasBr.get(i);
+        _wgFillRect(dc, &rc, br);
+        WinuiGdiCanvas cv = default;
+        cv.hdc = dc;
+        cv.scale = s;
+        int cw = (int)(BASE_X * s); if (cw < 1) cw = 1;
+        int ch = (int)(BASE_Y * s); if (ch < 1) ch = 1;
+        cv.cellW = cw;
+        cv.cellH = ch;
+        __uiCanvasPaint(box, cv);
+        _wgGdiFlush();   // the DIB bits are only coherent once the GDI batch is flushed
+        this._canvasUpload(i, bits, pxW, pxH);
     }
 
     // -- Context menu registration --------------------------------------------
@@ -461,19 +1553,30 @@ class WinUI3Host : INativeHost
             else if (elemKind == ELEM_LIST)      cls = "Microsoft.UI.Xaml.Controls.ListView";
             else if (elemKind == ELEM_IMAGE)     cls = "Microsoft.UI.Xaml.Controls.Image";
             // GroupBox is a headered label approximation (Border+header is a deliberate look
-            // difference on WinUI); CanvasView is a placeholder Border (Win2D is a new dependency
-            // we deliberately do NOT take - the escape hatch stays Win32/Cocoa). Box is a Border.
+            // difference on WinUI); Box is a Border. CanvasView is an Image fed by a
+            // WriteableBitmap the host rasterizes with GDI (no Win2D dependency, by design).
             else if (elemKind == ELEM_GROUPBOX)  cls = "Microsoft.UI.Xaml.Controls.TextBlock";
             else if (elemKind == ELEM_BOX)       cls = "Microsoft.UI.Xaml.Controls.Border";
-            else if (elemKind == ELEM_CANVAS)    cls = "Microsoft.UI.Xaml.Controls.Border";
+            else if (elemKind == ELEM_CANVAS)    cls = "Microsoft.UI.Xaml.Controls.Image";
             else if (elemKind == ELEM_STATUSBAR) cls = "Microsoft.UI.Xaml.Controls.TextBlock";
             RoActivateInstance(hstring(cls), &insp);
         }
         if (insp == nullptr) return 0u;
 
-        // Append to the root ICanvas as a UIElement.
+        // Append to the root ICanvas as a UIElement - except a StatusBar, which lives in the
+        // bottom strip Canvas (outside the ScrollViewer), pinned to the window bottom.
         void* elem = wqi(insp, iidof(XamlUIElement));
-        if (_gCanvasVec != nullptr && elem != nullptr)
+        if (elemKind == ELEM_STATUSBAR && _gStatusVec != nullptr && elem != nullptr)
+        {
+            ((XamlUIElementVector*)_gStatusVec)->lpVtbl->Append(_gStatusVec, elem);
+            if (_gCanvasStat != nullptr)
+            {
+                ((XamlCanvasStatics*)_gCanvasStat)->lpVtbl->SetLeft(_gCanvasStat, elem, 10.0);
+                ((XamlCanvasStatics*)_gCanvasStat)->lpVtbl->SetTop(_gCanvasStat, elem, 4.0);
+            }
+            this.sbH.add((u64)insp);
+        }
+        else if (_gCanvasVec != nullptr && elem != nullptr)
             ((XamlUIElementVector*)_gCanvasVec)->lpVtbl->Append(_gCanvasVec, elem);
 
         // Wire live events (the routing closures capture the node's key path, invariant for the
@@ -500,32 +1603,180 @@ class WinUI3Host : INativeHost
                 ((XamlToggleButton*)tb)->lpVtbl->add_Unchecked(tb, hu, &t2);
             }
         }
+        else if (elemKind == ELEM_TEXTINPUT || elemKind == ELEM_TEXTAREA)
+        {
+            // Typing must reach the model: TextChanged is this host's EN_CHANGE. Self-inflicted
+            // pushes (setText during a reconcile) run under `applying` and are swallowed there.
+            void* tx = wqi(insp, iidof(XamlTextBox));
+            if (tx != nullptr)
+            {
+                void* ht = winrtDelegate(XamlTextChangedHandler, (void* s, void* a) => { routeWinuiText(key); });
+                u64 tok = 0;
+                ((XamlTextBox*)tx)->lpVtbl->add_TextChanged(tx, ht, &tok);
+            }
+        }
+        else if (elemKind == ELEM_LIST)
+        {
+            void* sel = wqi(insp, iidof(XamlSelector));
+            if (sel != nullptr)
+            {
+                void* hs = winrtDelegate(XamlSelectionChangedHandler,
+                    (void* s, void* a) => { routeWinuiListSelect(key); });
+                u64 tok = 0;
+                ((XamlSelector*)sel)->lpVtbl->add_SelectionChanged(sel, hs, &tok);
+            }
+            if (elem != nullptr)
+            {
+                void* hd = winrtDelegate(XamlDoubleTappedHandler,
+                    (void* s, void* a) => { routeWinuiListActivate(key); });
+                u64 tok2 = 0;
+                ((XamlUIElement*)elem)->lpVtbl->add_DoubleTapped(elem, hd, &tok2);
+            }
+        }
+        else if (elemKind == ELEM_TABS)
+        {
+            void* tv = wqi(insp, iidof(XamlTabView));
+            if (tv != nullptr)
+            {
+                ((XamlTabView*)tv)->lpVtbl->put_IsAddTabButtonVisible(tv, false);
+                void* hs = winrtDelegate(XamlSelectionChangedHandler,
+                    (void* s, void* a) => { routeWinuiTabChange(key); });
+                u64 tok = 0;
+                ((XamlTabView*)tv)->lpVtbl->add_SelectionChanged(tv, hs, &tok);
+            }
+        }
+        else if (elemKind == ELEM_TREE)
+        {
+            // The tree's two events are TypedEventHandler<TreeView, ...>; a `using` alias cannot
+            // name a generic DELEGATE, so they are spelled in full here.
+            void* tv3 = wqi(insp, iidof(XamlTreeView3));
+            if (tv3 != nullptr)
+            {
+                void* hs = winrtDelegate(
+                    Windows.Foundation.TypedEventHandler<Microsoft.UI.Xaml.Controls.TreeView, Microsoft.UI.Xaml.Controls.TreeViewSelectionChangedEventArgs>,
+                    (void* s, void* a) => { routeWinuiTreeSelect(key); });
+                u64 tok = 0;
+                ((XamlTreeView3*)tv3)->lpVtbl->add_SelectionChanged(tv3, hs, &tok);
+            }
+            void* tv = wqi(insp, iidof(XamlTreeView));
+            if (tv != nullptr)
+            {
+                // A node marked HasUnrealizedChildren raises Expanding on the chevron click;
+                // that is where its children are pulled from the app's node source.
+                void* he = winrtDelegate(
+                    Windows.Foundation.TypedEventHandler<Microsoft.UI.Xaml.Controls.TreeView, Microsoft.UI.Xaml.Controls.TreeViewExpandingEventArgs>,
+                    (void* s, void* a) => { routeWinuiTreeExpand(key, a); });
+                u64 tok2 = 0;
+                ((XamlTreeView*)tv)->lpVtbl->add_Expanding(tv, he, &tok2);
+            }
+        }
+        else if (elemKind == ELEM_CANVAS && elem != nullptr)
+        {
+            // Canvas input. XAML stops routing to the pressed element once the pointer leaves it,
+            // so pressed captures the pointer and released frees it; capture-lost synthesizes an
+            // up so an app can never be stranded mid-drag (the Win32 SetCapture equivalent).
+            void* hDown = winrtDelegate(XamlPointerEventHandler,
+                (void* s, void* a) => { _winuiCanvasPointer(key, a, 0); });
+            void* hMove = winrtDelegate(XamlPointerEventHandler,
+                (void* s, void* a) => { _winuiCanvasPointer(key, a, 1); });
+            void* hUp = winrtDelegate(XamlPointerEventHandler,
+                (void* s, void* a) => { _winuiCanvasPointer(key, a, 2); });
+            void* hLost = winrtDelegate(XamlPointerEventHandler,
+                (void* s, void* a) => { _winuiCanvasCaptureLost(key); });
+            void* hWheel = winrtDelegate(XamlPointerEventHandler,
+                (void* s, void* a) => { _winuiCanvasWheel(key, a); });
+            u64 t1 = 0; u64 t2 = 0; u64 t3 = 0; u64 t4 = 0; u64 t5 = 0;
+            ((XamlUIElement*)elem)->lpVtbl->add_PointerPressed(elem, hDown, &t1);
+            ((XamlUIElement*)elem)->lpVtbl->add_PointerMoved(elem, hMove, &t2);
+            ((XamlUIElement*)elem)->lpVtbl->add_PointerReleased(elem, hUp, &t3);
+            ((XamlUIElement*)elem)->lpVtbl->add_PointerCaptureLost(elem, hLost, &t4);
+            ((XamlUIElement*)elem)->lpVtbl->add_PointerWheelChanged(elem, hWheel, &t5);
+        }
         return (u64)insp;
+    }
+
+    // The backdrop panel for a filled container: a rounded Rectangle appended to the same control
+    // Canvas as everything else, pinned BEHIND its siblings with a negative Canvas.ZIndex (the
+    // reconcile walks the container before its children, but sibling order is not a paint contract).
+    u64 _createBackdrop()
+    {
+        void* insp = nullptr;
+        RoActivateInstance(hstring("Microsoft.UI.Xaml.Shapes.Rectangle"), &insp);
+        if (insp == nullptr) return 0u;
+        void* rect = wqi(insp, iidof(XamlRectangle));
+        if (rect != nullptr)
+        {
+            // 8 DIPs of corner rounding, matching the Cocoa host's backdrop layer.
+            ((XamlRectangle*)rect)->lpVtbl->put_RadiusX(rect, 8.0);
+            ((XamlRectangle*)rect)->lpVtbl->put_RadiusY(rect, 8.0);
+        }
+        void* elem = wqi(insp, iidof(XamlUIElement));
+        if (elem == nullptr) return (u64)insp;
+        if (_gCanvasVec != nullptr)
+            ((XamlUIElementVector*)_gCanvasVec)->lpVtbl->Append(_gCanvasVec, elem);
+        if (_gCanvasStat != nullptr)
+            ((XamlCanvasStatics*)_gCanvasStat)->lpVtbl->SetZIndex(_gCanvasStat, elem, 0 - 1);
+        return (u64)insp;
+    }
+
+    // Re-sync a backdrop's fill (and the theme panel border) to the container's current color.
+    // Called on every reconcile, so a theme flip re-colors the card.
+    void _syncBackdrop(u64 h, int bg)
+    {
+        void* sh = wqi((void*)h, iidof(XamlShape));
+        if (sh == nullptr) return;
+        ((XamlShape*)sh)->lpVtbl->put_Fill(sh, winuiSolidBrush(bg));
+        int pb = this.appTheme().panelBorder;
+        if (pb == 0) return;
+        ((XamlShape*)sh)->lpVtbl->put_Stroke(sh, winuiSolidBrush(pb));
+        ((XamlShape*)sh)->lpVtbl->put_StrokeThickness(sh, 1.0);
     }
 
     void destroyControl(u64 h)
     {
         if (h == 0u) return;
-        // Free any boxes this control owned.
-        u64 lb = this._listBoxFor(h); if (lb != 0u) { this._listSetBox(h, 0u); __uiFreeListRowBox(lb); }
-        u64 tb = this._treeBoxFor(h); if (tb != 0u) __uiFreeTreeBox(tb);
+        // Unbind + free anything this control owned (the item source owns its rowText box).
+        this._listDropSrc(h);
+        int ti = this._slot(&this.treeBoxH, h);
+        if (ti >= 0)
+        {
+            u64 tb = this.treeBoxV.get(ti);
+            if (tb != 0u) __uiFreeTreeBox(tb);
+            this.treeBoxH.removeAt(ti); this.treeBoxV.removeAt(ti);
+            this._treeForget(h);
+        }
         int ci = this._slot(&this.canvasH, h);
-        if (ci >= 0) { u64 cb = this.canvasBox.get(ci); if (cb != 0u) __uiFreeCanvasBox(cb); this.canvasBox.set(ci, 0u); }
+        if (ci >= 0)
+        {
+            u64 cb = this.canvasBox.get(ci);
+            if (cb != 0u) __uiFreeCanvasBox(cb);
+            this.canvasBox.set(ci, 0u);
+            this._canvasFreeSurface(ci);
+        }
         this._forgetAccent(h);
-        // Remove from the ICanvas so it leaves the visual tree (the object is refcounted).
-        if (_gCanvasVec == nullptr) return;
+        int fi = this._slot(&this.cfH, h);
+        if (fi >= 0) { this.cfH.removeAt(fi); this.cfMenu.removeAt(fi); }
+        // Remove from whichever Canvas holds it, so it leaves the visual tree (refcounted).
+        int si = this._slot(&this.sbH, h);
+        void* host = _gCanvasVec;
+        if (si >= 0) { this.sbH.removeAt(si); host = _gStatusVec; }
+        if (host == nullptr) return;
         void* elem = wqi((void*)h, iidof(XamlUIElement));
         if (elem == nullptr) return;
         u32 idx = 0u; u8 found = 0;
-        ((XamlUIElementVector*)_gCanvasVec)->lpVtbl->IndexOf(_gCanvasVec, elem, &idx, &found);
-        if (found != 0) ((XamlUIElementVector*)_gCanvasVec)->lpVtbl->RemoveAt(_gCanvasVec, idx);
+        ((XamlUIElementVector*)host)->lpVtbl->IndexOf(host, elem, &idx, &found);
+        if (found != 0) ((XamlUIElementVector*)host)->lpVtbl->RemoveAt(host, idx);
     }
 
-    // Position + size in DIPs (XAML units are DIPs, so this is a near-1:1 passthrough).
-    void setFrame(u64 h, Rect frameDip)
+    // Position + size: the layout Rect is in CELLS, XAML wants DIPs, so scale by BASE_X/BASE_Y
+    // (the Win32 host's setFrame does the same, with an extra dpi factor XAML does not need).
+    void setFrame(u64 h, Rect frameCells)
     {
-        double x = (double)frameDip.x; double y = (double)frameDip.y;
-        double w = (double)frameDip.w; double hh = (double)frameDip.h;
+        // A status bar self-docks in the bottom strip (the Win32 host's width -1 sentinel): its
+        // laid-out content frame would drop it somewhere inside the scrolling document instead.
+        if (this._slot(&this.sbH, h) >= 0) return;
+        double x = (double)(frameCells.x * BASE_X); double y = (double)(frameCells.y * BASE_Y);
+        double w = (double)(frameCells.w * BASE_X); double hh = (double)(frameCells.h * BASE_Y);
         void* elem = wqi((void*)h, iidof(XamlUIElement));
         if (elem != nullptr && _gCanvasStat != nullptr)
         {
@@ -544,7 +1795,6 @@ class WinUI3Host : INativeHost
     // (Button/CheckBox/RadioButton) takes a boxed string content. QI decides which applies.
     void setText(u64 h, const char* s)
     {
-        this._setTxt(h, (string)s);
         void* tb = wqi((void*)h, iidof(XamlTextBlock));
         if (tb != nullptr) { ((XamlTextBlock*)tb)->lpVtbl->put_Text(tb, hstring((string)s)); return; }
         void* tx = wqi((void*)h, iidof(XamlTextBox));
@@ -636,12 +1886,15 @@ class WinUI3Host : INativeHost
         this._imgMark(h, pixels);
     }
 
-    // XAML measures intrinsically; return a DIP estimate so the DIP layout pass spaces rows.
-    Size measureText(const char* s, int fontId, int wrapWidthDip)
+    // XAML measures intrinsically (a real measure needs a live tree), so estimate the text extent
+    // in DIPs and round UP to whole CELLS - the unit the layout pass works in.
+    Size measureText(const char* s, int fontId, int wrapWidthCells)
     {
+        int wDip = (int)strlen((char*)s) * 8 + 24;
+        int hDip = 32;
         Size sz = default;
-        sz.w = (int)strlen((char*)s) * 8 + 24;
-        sz.h = 32;
+        sz.w = (wDip + BASE_X - 1) / BASE_X;
+        sz.h = (hDip + BASE_Y - 1) / BASE_Y;
         return sz;
     }
 
@@ -680,18 +1933,128 @@ class WinUI3Host : INativeHost
         if (sel != nullptr) ((XamlSelector*)sel)->lpVtbl->put_SelectedIndex(sel, cb.selectedIndex);
     }
 
-    // The setListOp seam (see ui_native.cb for the cross-toolkit protocol design). On WinUI the
-    // op-coded protocol drives the host-side box/model bookkeeping the native* drivers query; the
-    // live XAML ListView/TreeView/TabView items are not bound (documented enrichment, doc/UI.md).
+    // Rebuild a TabView's items when its pane count changes, then set the controlled selection.
+    // Mirrors the Win32 host's _syncTabs, through the same LISTOP_TAB_* ops.
+    void _syncTabs(u64 h, ITabControl tc)
+    {
+        void* tv = wqi((void*)h, iidof(XamlTabView));
+        if (tv == nullptr) return;
+        void* items = nullptr;
+        ((XamlTabView*)tv)->lpVtbl->get_TabItems(tv, &items);
+        u32 have = 0u;
+        if (items != nullptr) ((XamlObjectVector*)items)->lpVtbl->get_Size(items, &have);
+        if ((int)have != tc.children.count())
+        {
+            this.setListOp(h, LISTOP_TAB_RESET, 0, 0, "", 0u);
+            int i = 0;
+            while (i < tc.children.count())
+            {
+                string t = tc._title(i);
+                this.setListOp(h, LISTOP_TAB_ADD, i, 0, t.data(), 0u);
+                i++;
+            }
+        }
+        this.setListOp(h, LISTOP_TAB_SET_SEL, tc.selectedTab, 0, "", 0u);
+    }
+
+    // The setListOp seam (see ui_native.cb for the cross-toolkit protocol design). Every op lands
+    // on the REAL control: rows through the bound item source, tabs as TabViewItems, tree nodes as
+    // TreeViewNodes. The drivers below read their answers back out of those same controls.
     void setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload)
     {
-        if (op == LISTOP_SET_ROWCOUNT)        this._listSetCount(h, arg0);
-        else if (op == LISTOP_SET_ROWTEXT_CB) this._listSetBox(h, payload);
-        else if (op == LISTOP_SET_SELECTION)  this._listSetSel(h, arg0);
+        if (op == LISTOP_RESET_COLUMNS)
+        {
+            WItemSource* s = (WItemSource*)this._listMakeSrc(h);
+            s.cols = 0;
+        }
+        else if (op == LISTOP_ADD_COLUMN)
+        {
+            // A XAML ListView item is one object, so the columns become one joined row string
+            // (the header row itself has no equivalent; see doc/UI.md's parity matrix).
+            WItemSource* s = (WItemSource*)this._listMakeSrc(h);
+            if (arg1 + 1 > s.cols) s.cols = arg1 + 1;
+        }
+        else if (op == LISTOP_SET_ROWCOUNT)
+        {
+            WItemSource* s = (WItemSource*)this._listMakeSrc(h);
+            if (s.rowCount != arg0) { s.rowCount = arg0; this._listBind(h, (u64)s); }
+        }
+        else if (op == LISTOP_SET_ROWTEXT_CB)
+        {
+            WItemSource* s = (WItemSource*)this._listMakeSrc(h);
+            if (s.box != 0u && s.box != payload) __uiFreeListRowBox(s.box);
+            s.box = payload;
+            this._listBind(h, (u64)s);
+        }
+        else if (op == LISTOP_SET_SELECT_MODE)
+        {
+            void* lvb = wqi((void*)h, iidof(XamlListViewBase));
+            if (lvb != nullptr)
+                ((XamlListViewBase*)lvb)->lpVtbl->put_SelectionMode(lvb, arg0 == 0 ? 1 : 2);
+        }
+        else if (op == LISTOP_SET_SELECTION)
+        {
+            void* sel = wqi((void*)h, iidof(XamlSelector));
+            if (sel == nullptr) return;
+            i32 cur = 0;
+            ((XamlSelector*)sel)->lpVtbl->get_SelectedIndex(sel, &cur);
+            if ((int)cur != arg0) ((XamlSelector*)sel)->lpVtbl->put_SelectedIndex(sel, arg0);
+        }
+        else if (op == LISTOP_TAB_RESET)
+        {
+            void* tv = wqi((void*)h, iidof(XamlTabView));
+            if (tv == nullptr) return;
+            void* items = nullptr;
+            ((XamlTabView*)tv)->lpVtbl->get_TabItems(tv, &items);
+            if (items != nullptr) ((XamlObjectVector*)items)->lpVtbl->Clear(items);
+        }
+        else if (op == LISTOP_TAB_ADD)
+        {
+            void* tv = wqi((void*)h, iidof(XamlTabView));
+            if (tv == nullptr) return;
+            void* items = nullptr;
+            ((XamlTabView*)tv)->lpVtbl->get_TabItems(tv, &items);
+            if (items == nullptr) return;
+            void* insp = nullptr;
+            RoActivateInstance(hstring("Microsoft.UI.Xaml.Controls.TabViewItem"), &insp);
+            if (insp == nullptr)
+                insp = winuiCompose("Microsoft.UI.Xaml.Controls.TabViewItem", iidof(XamlTabViewItemFactory));
+            void* ti = wqi(insp, iidof(XamlTabViewItem));
+            if (ti == nullptr) return;
+            ((XamlTabViewItem*)ti)->lpVtbl->put_Header(ti, boxString((string)text));
+            ((XamlTabViewItem*)ti)->lpVtbl->put_IsClosable(ti, false);
+            // The pane's Content stays EMPTY: the active pane's children are absolutely
+            // positioned on the control Canvas by the layout engine (see _applyNode).
+            ((XamlObjectVector*)items)->lpVtbl->Append(items, insp);
+        }
+        else if (op == LISTOP_TAB_SET_SEL)
+        {
+            void* tv = wqi((void*)h, iidof(XamlTabView));
+            if (tv == nullptr) return;
+            i32 cur = 0;
+            ((XamlTabView*)tv)->lpVtbl->get_SelectedIndex(tv, &cur);
+            if ((int)cur != arg0) ((XamlTabView*)tv)->lpVtbl->put_SelectedIndex(tv, arg0);
+        }
         else if (op == LISTOP_TREE_SET_SRC_CB) this._treeSetBox(h, payload);
         else if (op == LISTOP_TREE_REBUILD)    this._treeBuildRoot(h);
-        // RESET_COLUMNS/ADD_COLUMN/SET_SELECT_MODE/INVALIDATE and TAB_* are display concerns the
-        // host-model drivers do not need; the columns/tabs are carried by the element model.
+        // LISTOP_INVALIDATE: XAML repaints its own realized rows; there is nothing to invalidate
+        // (rebinding the source here would reset scroll + selection on every pump).
+    }
+
+    // Attach `menu` to the control as its ContextFlyout - a real right-click menu. The flyout is
+    // built once per (control, menu) pair; the item Click routes the app command like the menu bar.
+    void _syncContextFlyout(u64 h, u64 menu)
+    {
+        if (h == 0u || menu == 0u) return;
+        int i = this._slot(&this.cfH, h);
+        if (i >= 0 && this.cfMenu.get(i) == menu) return;
+        void* elem = wqi((void*)h, iidof(XamlUIElement));
+        if (elem == nullptr) return;
+        void* flyout = winuiBuildFlyout(menu);
+        if (flyout == nullptr) return;
+        ((XamlUIElement*)elem)->lpVtbl->put_ContextFlyout(elem, flyout);
+        if (i >= 0) { this.cfMenu.set(i, menu); return; }
+        this.cfH.add(h); this.cfMenu.add(menu);
     }
 
     // Reconcile the IElement tree to XAML controls: create-on-first-sight (reuse by key path),
@@ -700,8 +2063,9 @@ class WinUI3Host : INativeHost
     {
         this.applying = true;
         _wDark = winuiThemeIsDark(&ctx.theme);
+        winuiApplyRootTheme(&ctx.theme);
         list<string> newKeys = default;
-        this._applyNode(tree, keySegment(tree, 0), ctx, &newKeys);
+        this._applyNode(tree, keySegment(tree, 0), ctx, &newKeys, 0u);
 
         int i = 0;
         while (i < this.liveKeys.count())
@@ -719,11 +2083,44 @@ class WinUI3Host : INativeHost
         this.liveKeys.clear();
         int m = 0;
         while (m < newKeys.count()) { this.liveKeys.add("" + newKeys.get(m)); m++; }
+        this._sizeCanvas(tree);
+        winuiLayoutChrome(this.sbH.count() > 0);
         this.applying = false;
     }
 
-    void _applyNode(IElement node, string path, IUiContext ctx, list<string>* keys)
+    // Give the control Canvas an explicit extent so the enclosing ScrollViewer has something to
+    // scroll (a Canvas has no intrinsic size, so it would otherwise measure as zero). A ScrollView
+    // root sizes the document by its laid-out contentH - its children are already positioned at
+    // content coordinates, since a native host leaves scrollY at 0 and owns the offset itself.
+    void _sizeCanvas(IElement tree)
     {
+        if (_gCanvasFe == nullptr) return;
+        int wCells = _wW;
+        int hCells = _wH;
+        if (tree.kind() == ELEM_SCROLL)
+        {
+            IScrollView sv = tree as IScrollView;
+            Rect b = tree.nodeBounds();
+            if (b.w > 0) wCells = b.w;
+            if (sv != nullptr && sv.contentH > hCells) hCells = sv.contentH;
+        }
+        else
+        {
+            int bottom = winuiMaxBottom(tree);
+            if (bottom > hCells) hCells = bottom;
+        }
+        ((XamlFrameworkElement*)_gCanvasFe)->lpVtbl->put_Width(_gCanvasFe, (double)(wCells * BASE_X));
+        ((XamlFrameworkElement*)_gCanvasFe)->lpVtbl->put_Height(_gCanvasFe, (double)(hCells * BASE_Y));
+    }
+
+    // `menu` is the ContextMenu registered at (or inherited from) an ANCESTOR key path: the
+    // whole subtree under a right-clickable panel gets the same flyout, since every control is
+    // a flat sibling on the control Canvas and a routed ContextRequested cannot reach its
+    // logical parent.
+    void _applyNode(IElement node, string path, IUiContext ctx, list<string>* keys, u64 menu)
+    {
+        u64 own = this.contextMenuFor(path);
+        if (own != 0u) menu = own;
         if (winuiMappable(node.kind()))
         {
             u64 h = ctx.nativeHandle(path);
@@ -734,8 +2131,24 @@ class WinUI3Host : INativeHost
                 this._firstMount(node, h);
             }
             this._syncProps(node, h);
+            this._syncContextFlyout(h, menu);
             Rect b = node.nodeBounds();
             this.setFrame(h, b);
+            keys.add("" + path);
+        }
+        else if (winuiContainerBg(node) != 0)
+        {
+            // A plain container with a fill gets a backdrop panel keyed by the CONTAINER's own path
+            // (painted behind its children); it rides the same create/reuse/destroy/reposition
+            // reconcile as any mapped control, and recurses into its children below like any container.
+            u64 h = ctx.nativeHandle(path);
+            if (h == 0u)
+            {
+                h = this._createBackdrop();
+                ctx.setNativeHandle(path, h);
+            }
+            this._syncBackdrop(h, winuiContainerBg(node));
+            this.setFrame(h, node.nodeBounds());
             keys.add("" + path);
         }
 
@@ -749,7 +2162,7 @@ class WinUI3Host : INativeHost
             {
                 IElement pane = panes.get(sel);
                 string cp = joinKeyPath(path, keySegment(pane, sel));
-                this._applyNode(pane, cp, ctx, keys);
+                this._applyNode(pane, cp, ctx, keys, menu);
             }
             return;
         }
@@ -762,7 +2175,7 @@ class WinUI3Host : INativeHost
             {
                 IElement c = kids.get(i);
                 string cp = joinKeyPath(path, keySegment(c, i));
-                this._applyNode(c, cp, ctx, keys);
+                this._applyNode(c, cp, ctx, keys, menu);
                 i++;
             }
         }
@@ -774,14 +2187,39 @@ class WinUI3Host : INativeHost
         int k = node.kind();
         if (k == ELEM_TEXTAREA)
         {
+            // A XAML TextBox is a single centered line until it is told otherwise; a TextArea is
+            // a multiline editor, so it takes Return and wraps, and fills its whole box.
             ITextArea ta = node as ITextArea;
+            void* tx = wqi((void*)h, iidof(XamlTextBox));
+            if (tx != nullptr)
+            {
+                ((XamlTextBox*)tx)->lpVtbl->put_AcceptsReturn(tx, true);
+                ((XamlTextBox*)tx)->lpVtbl->put_TextWrapping(tx, TextWrapping_Wrap);
+            }
+            void* ctl = wqi((void*)h, iidof(XamlControl));
+            if (ctl != nullptr)
+            {
+                ((XamlControl*)ctl)->lpVtbl->put_VerticalContentAlignment(ctl, VerticalAlignment_Top);
+                ((XamlControl*)ctl)->lpVtbl->put_HorizontalContentAlignment(ctl, HorizontalAlignment_Stretch);
+            }
             this.setText(h, ta.value.data());
         }
         else if (k == ELEM_LIST)
         {
-            // Box the rowText callback (captures the component, so it reads live state) - the
-            // item source for the virtualized data path the list drivers query.
+            // One-time ListView setup: the columns (they become the joined row string), the
+            // select mode, and the boxed rowText callback (it captures the component, so it
+            // reads live state) - the item source XAML pulls realized rows out of.
             IListView lv = node as IListView;
+            this.setListOp(h, LISTOP_RESET_COLUMNS, 0, 0, "", 0u);
+            int ci = 0;
+            while (ci < lv.columns.count())
+            {
+                int wdip = 12;
+                if (ci < lv.colWidths.count()) wdip = lv.colWidths.get(ci);
+                this.setListOp(h, LISTOP_ADD_COLUMN, wdip, ci, lv.columns.get(ci).data(), 0u);
+                ci++;
+            }
+            this.setListOp(h, LISTOP_SET_SELECT_MODE, lv.multiSelect ? 1 : 0, 0, "", 0u);
             this.setListOp(h, LISTOP_SET_ROWTEXT_CB, 0, 0, "", (u64)_boxListRow(lv.rowText));
         }
         else if (k == ELEM_TREE)
@@ -793,8 +2231,8 @@ class WinUI3Host : INativeHost
         }
         else if (k == ELEM_CANVAS)
         {
-            // Box the onPaint closure so it is owned + freed on teardown (WinUI CanvasView is a
-            // placeholder - no Win2D dependency - so the closure is held but not invoked).
+            // Box the onPaint closure (owned by the host, freed on teardown). _syncProps
+            // rasterizes it into the control's WriteableBitmap on every pump.
             ICanvasView cvw = node as ICanvasView;
             this._setCanvasBox(h, (u64)_boxCanvas(cvw.onPaint));
         }
@@ -867,9 +2305,24 @@ class WinUI3Host : INativeHost
             this.setListOp(h, LISTOP_SET_ROWCOUNT, lv.rowCount, 0, "", 0u);
             this.setListOp(h, LISTOP_SET_SELECTION, lv.selectedIndex, 0, "", 0u);
             this.setBoolProp(h, PROP_ENABLED, !lv.disabled);
+            winuiZeroItemsCache(h);
         }
-        else if (k == ELEM_TABS)  { ITabControl tc = node as ITabControl; this.setBoolProp(h, PROP_ENABLED, !tc.disabled); }
+        else if (k == ELEM_TABS)
+        {
+            ITabControl tc = node as ITabControl;
+            this._syncTabs(h, tc);
+            this.setBoolProp(h, PROP_ENABLED, !tc.disabled);
+        }
         else if (k == ELEM_TREE)  { ITreeView tv = node as ITreeView; this.setBoolProp(h, PROP_ENABLED, !tv.disabled); }
+        else if (k == ELEM_BOX)
+        {
+            // A Border with a null Background is not hit-testable, so a right-click over a Box
+            // would never reach its ContextFlyout. Fill it (its own color, or transparent).
+            IBox bx = node as IBox;
+            void* bd = wqi((void*)h, iidof(XamlBorder));
+            if (bd != nullptr)
+                ((XamlBorder*)bd)->lpVtbl->put_Background(bd, winuiFillBrush(bx.style.backgroundColor));
+        }
         else if (k == ELEM_IMAGE)
         {
             IImage im = node as IImage;
@@ -877,6 +2330,17 @@ class WinUI3Host : INativeHost
                 this.setImageData(h, im.pixels, im.pxW, im.pxH, im.pxW * 4);
         }
         else if (k == ELEM_GROUPBOX) { IGroupBox g = node as IGroupBox; this.setText(h, g.title.data()); }
+        else if (k == ELEM_CANVAS)
+        {
+            // Repaint hook (the Win32 host's InvalidateRect): re-run the paint closure into the
+            // WriteableBitmap. The surface is the control's DIP box at DEVICE resolution, so the
+            // bitmap is not upscaled by XAML at a rasterization scale above 1.0.
+            Rect b = node.nodeBounds();
+            double s = winuiRasterScale();
+            int pxW = (int)(b.w * BASE_X * s); if (pxW < 1) pxW = 1;
+            int pxH = (int)(b.h * BASE_Y * s); if (pxH < 1) pxH = 1;
+            this._paintCanvas(h, pxW, pxH, s);
+        }
     }
 
     // The current app theme (borrowed from the per-host UiContext).
@@ -885,18 +2349,45 @@ class WinUI3Host : INativeHost
     // Free host-owned boxes + component (teardown). Heap-audit is off for WinUI, but keep it clean.
     void dispose()
     {
+        // The item source owns its rowText box, and XAML still holds a ref while the control is
+        // bound - so unbind first, then drop the host's ref (that is the final one).
+        while (this.listH.count() > 0) { u64 h = this.listH.get(0); this._listDropSrc(h); }
         int i = 0;
-        while (i < this.listBox.count()) { u64 b = this.listBox.get(i); if (b != 0u) __uiFreeListRowBox(b); i++; }
-        i = 0;
         while (i < this.treeBoxV.count()) { u64 b = this.treeBoxV.get(i); if (b != 0u) __uiFreeTreeBox(b); i++; }
+        this.treeBoxH.clear(); this.treeBoxV.clear();
         i = 0;
-        while (i < this.canvasBox.count()) { u64 b = this.canvasBox.get(i); if (b != 0u) __uiFreeCanvasBox(b); i++; }
+        while (i < this.canvasBox.count())
+        {
+            u64 b = this.canvasBox.get(i);
+            if (b != 0u) { __uiFreeCanvasBox(b); this.canvasBox.set(i, 0u); }
+            this._canvasFreeSurface(i);
+            i++;
+        }
         i = 0;
         while (i < this.ctxMenus.count()) { u64 m = this.ctxMenus.get(i); if (m != 0u) { ContextMenu* cm = (ContextMenu*)m; delete cm; } i++; }
     }
 };
 
 // -- Free helpers (shared by the host + routing) ------------------------------
+
+// The deepest laid-out bottom edge, in CELLS, of the subtree at `node`. The content extent the
+// control Canvas falls back to when the tree root is not a ScrollView (which carries its own).
+int winuiMaxBottom(IElement node)
+{
+    Rect b = node.nodeBounds();
+    int best = b.y + b.h;
+    list<IElement>* kids = node.childList();
+    if (kids == nullptr) return best;
+    int i = 0;
+    while (i < kids.count())
+    {
+        int cb = winuiMaxBottom(kids.get(i));
+        if (cb > best) best = cb;
+        i++;
+    }
+    return best;
+}
+
 bool winuiListHas(list<string>* xs, string want)
 {
     int i = 0;
@@ -970,6 +2461,280 @@ void routeWinuiClick(string key)
         IElement pe = winuiElem(winuiParentPath(key));
         if (pe != nullptr) { IRadioGroup g = pe as IRadioGroup; if (g != nullptr) { g.fireChange(rb.index); pumpWinui(); } }
     }
+}
+
+// A TextBox raised TextChanged (this host's EN_CHANGE): push the live text into the model. A
+// TextInput is controlled (the new text flows back down); a TextArea is uncontrolled, so the
+// change is only a dirty NOTIFICATION - its (potentially large) buffer is not read here.
+void routeWinuiText(string key)
+{
+    if (_wHost.applying) return;
+    IElement e = winuiElem(key);
+    if (e == nullptr) return;
+    ITextInput ti = e as ITextInput;
+    if (ti != nullptr)
+    {
+        u64 h = _wCtx.nativeHandle(key);
+        void* tx = h != 0u ? wqi((void*)h, iidof(XamlTextBox)) : nullptr;
+        if (tx == nullptr) return;
+        void* hs = nullptr;
+        ((XamlTextBox*)tx)->lpVtbl->get_Text(tx, &hs);
+        if (hs == nullptr) return;
+        ti.fireChangeText(fromHString(hs));
+        pumpWinui();
+        return;
+    }
+    ITextArea ta = e as ITextArea;
+    if (ta != nullptr) { ta.fireChange(); pumpWinui(); }
+}
+
+// The ListView's selected row, read off the live control (-1 if none).
+int _winuiListSel(u64 h)
+{
+    void* sel = h != 0u ? wqi((void*)h, iidof(XamlSelector)) : nullptr;
+    if (sel == nullptr) return 0 - 1;
+    i32 idx = 0;
+    ((XamlSelector*)sel)->lpVtbl->get_SelectedIndex(sel, &idx);
+    return (int)idx;
+}
+
+// A ListView selection change: route it to the model's onSelect. Guarded against the host's own
+// selection pushes during a reconcile (which would otherwise recurse through render -> apply).
+void routeWinuiListSelect(string key)
+{
+    if (_wHost.applying) return;
+    IElement e = winuiElem(key);
+    if (e == nullptr) return;
+    IListView lv = e as IListView;
+    if (lv == nullptr) return;
+    int sel = _winuiListSel(_wCtx.nativeHandle(key));
+    if (sel >= 0 && sel != lv.selectedIndex) { lv.fireSelect(sel); pumpWinui(); }
+}
+
+void routeWinuiListActivate(string key)
+{
+    IElement e = winuiElem(key);
+    if (e == nullptr) return;
+    IListView lv = e as IListView;
+    if (lv == nullptr) return;
+    int sel = _winuiListSel(_wCtx.nativeHandle(key));
+    if (sel >= 0) { lv.fireActivate(sel); pumpWinui(); }
+}
+
+// A TabView selection change: read the new tab off the control, fire onSelectTab.
+void routeWinuiTabChange(string key)
+{
+    if (_wHost.applying) return;
+    IElement e = winuiElem(key);
+    if (e == nullptr) return;
+    ITabControl tc = e as ITabControl;
+    if (tc == nullptr) return;
+    u64 h = _wCtx.nativeHandle(key);
+    void* tv = h != 0u ? wqi((void*)h, iidof(XamlTabView)) : nullptr;
+    if (tv == nullptr) return;
+    i32 sel = 0;
+    ((XamlTabView*)tv)->lpVtbl->get_SelectedIndex(tv, &sel);
+    if ((int)sel >= 0 && (int)sel != tc.selectedTab) { tc.fireSelectTab((int)sel); pumpWinui(); }
+}
+
+// A TreeView selection change: the selected NODE maps back to the app's nodeId, which is what
+// the model's onSelect takes (a TreeViewNode carries only its Content).
+void routeWinuiTreeSelect(string key)
+{
+    if (_wHost.applying) return;
+    IElement e = winuiElem(key);
+    if (e == nullptr) return;
+    ITreeView tv = e as ITreeView;
+    if (tv == nullptr) return;
+    u64 h = _wCtx.nativeHandle(key);
+    void* tv2 = h != 0u ? wqi((void*)h, iidof(XamlTreeView2)) : nullptr;
+    if (tv2 == nullptr) return;
+    void* node = nullptr;
+    ((XamlTreeView2*)tv2)->lpVtbl->get_SelectedNode(tv2, &node);
+    if (node == nullptr) return;
+    int nid = _wHost._treeItemNode((u64)node);
+    if (nid != (0 - 1) && nid != tv.selectedNode) { tv.fireSelect(nid); pumpWinui(); }
+}
+
+// A TreeView node is expanding (the chevron click): materialize its children from the app's node
+// source, then fire onExpand. Idempotent - a re-expand of a materialized node just re-fires.
+void routeWinuiTreeExpand(string key, void* args)
+{
+    IElement e = winuiElem(key);
+    if (e == nullptr) return;
+    ITreeView tv = e as ITreeView;
+    if (tv == nullptr) return;
+    void* ea = wqi(args, iidof(XamlTreeExpandingArgs));
+    if (ea == nullptr) return;
+    void* node = nullptr;
+    ((XamlTreeExpandingArgs*)ea)->lpVtbl->get_Node(ea, &node);
+    if (node == nullptr) return;
+    u64 h = _wCtx.nativeHandle(key);
+    int nid = _wHost._treeMaterialize(h, (u64)node);
+    if (nid != (0 - 1)) { tv.fireExpand(nid); pumpWinui(); }
+}
+
+// -- Canvas input routing (parity with the Win32/Cocoa hosts) -------------------
+// The CanvasView handlers take POINTS relative to the canvas origin. XAML reports the pointer
+// position in DIPs relative to the element, and this host maps one cell to one DIP (see
+// WinuiGdiCanvas), so the position passes through unscaled. Handlers resolve the LIVE element
+// per event (like routeWinuiClick); a canvas with no handler installed is a no-op - the has*
+// flag is always checked first, since reading an unset Lambda faults.
+double _wCanvasLastX = 0.0;
+double _wCanvasLastY = 0.0;
+
+ICanvasView _winuiCanvasAt(string key)
+{
+    IElement e = winuiElem(key);
+    if (e == nullptr) return nullptr;
+    return e as ICanvasView;
+}
+
+// Pressed-button bitmask, matching the other hosts (bit 0 = left, bit 1 = right).
+int _winuiCanvasButtons(void* props)
+{
+    if (props == nullptr) return 0;
+    int b = 0;
+    u8 left = 0; u8 right = 0;
+    ((UiPointerPointProps*)props)->lpVtbl->get_IsLeftButtonPressed(props, &left);
+    ((UiPointerPointProps*)props)->lpVtbl->get_IsRightButtonPressed(props, &right);
+    if (left != 0)  b = b | 1;
+    if (right != 0) b = b | 2;
+    return b;
+}
+
+// Resolve the PointerPoint for `key`'s control out of a PointerRoutedEventArgs.
+void* _winuiPointerPoint(string key, void* args)
+{
+    void* pra = wqi(args, iidof(XamlPointerRoutedEventArgs));
+    if (pra == nullptr) return nullptr;
+    u64 h = _wCtx.nativeHandle(key);
+    if (h == 0u) return nullptr;
+    void* elem = wqi((void*)h, iidof(XamlUIElement));
+    if (elem == nullptr) return nullptr;
+    void* pp = nullptr;
+    ((XamlPointerRoutedEventArgs*)pra)->lpVtbl->GetCurrentPoint(pra, elem, &pp);
+    if (pp == nullptr) return nullptr;
+    return wqi(pp, iidof(UiPointerPoint));
+}
+
+// phase: 0 = down, 1 = move, 2 = up.
+void _winuiCanvasPointer(string key, void* args, int phase)
+{
+    ICanvasView cv = _winuiCanvasAt(key);
+    if (cv == nullptr) return;
+    void* pp = _winuiPointerPoint(key, args);
+    if (pp == nullptr) return;
+    WfPoint pos = default;
+    ((UiPointerPoint*)pp)->lpVtbl->get_Position(pp, &pos);
+    void* props = nullptr;
+    ((UiPointerPoint*)pp)->lpVtbl->get_Properties(pp, &props);
+    double x = (double)pos.X;
+    double y = (double)pos.Y;
+    int buttons = _winuiCanvasButtons(props);
+    _wCanvasLastX = x; _wCanvasLastY = y;
+
+    // Drag capture: XAML routes to the element under the pointer, not the pressed one.
+    u64 h = _wCtx.nativeHandle(key);
+    void* elem = h != 0u ? wqi((void*)h, iidof(XamlUIElement)) : nullptr;
+    if (elem != nullptr && phase == 0)
+    {
+        void* pra = wqi(args, iidof(XamlPointerRoutedEventArgs));
+        void* ptr = nullptr;
+        if (pra != nullptr) ((XamlPointerRoutedEventArgs*)pra)->lpVtbl->get_Pointer(pra, &ptr);
+        u8 got = 0;
+        if (ptr != nullptr) ((XamlUIElement*)elem)->lpVtbl->CapturePointer(elem, ptr, &got);
+    }
+    else if (elem != nullptr && phase == 2)
+        ((XamlUIElement*)elem)->lpVtbl->ReleasePointerCaptures(elem);
+
+    if (phase == 0) { if (!cv.hasPointerDown) return; cv.onPointerDown(x, y, buttons); }
+    else if (phase == 1) { if (!cv.hasPointerMove) return; cv.onPointerMove(x, y, buttons); }
+    else { if (!cv.hasPointerUp) return; cv.onPointerUp(x, y, buttons); }
+    pumpWinui();
+}
+
+// The capture was stolen (a modal, Alt-Tab): synthesize an up at the last known point so the
+// app cannot be stranded mid-drag.
+void _winuiCanvasCaptureLost(string key)
+{
+    ICanvasView cv = _winuiCanvasAt(key);
+    if (cv == nullptr || !cv.hasPointerUp) return;
+    cv.onPointerUp(_wCanvasLastX, _wCanvasLastY, 0);
+    pumpWinui();
+}
+
+// A wheel notch is 120 units; report it in LINES, like the Win32 host (precise = false: XAML
+// exposes no precise-delta distinction here). Windows delivers a precision-touchpad pinch-zoom
+// as CTRL + wheel, so a ctrl-held vertical wheel dispatches to onPinch instead.
+void _winuiCanvasWheel(string key, void* args)
+{
+    ICanvasView cv = _winuiCanvasAt(key);
+    if (cv == nullptr) return;
+    void* pp = _winuiPointerPoint(key, args);
+    if (pp == nullptr) return;
+    WfPoint pos = default;
+    ((UiPointerPoint*)pp)->lpVtbl->get_Position(pp, &pos);
+    void* props = nullptr;
+    ((UiPointerPoint*)pp)->lpVtbl->get_Properties(pp, &props);
+    if (props == nullptr) return;
+    i32 delta = 0;
+    u8 horizontal = 0;
+    ((UiPointerPointProps*)props)->lpVtbl->get_MouseWheelDelta(props, &delta);
+    ((UiPointerPointProps*)props)->lpVtbl->get_IsHorizontalMouseWheel(props, &horizontal);
+    double lines = (double)delta / 120.0;
+    double x = (double)pos.X;
+    double y = (double)pos.Y;
+
+    void* pra = wqi(args, iidof(XamlPointerRoutedEventArgs));
+    i32 mods = 0;
+    if (pra != nullptr) ((XamlPointerRoutedEventArgs*)pra)->lpVtbl->get_KeyModifiers(pra, &mods);
+    bool ctrl = (mods & 1) != 0;   // VirtualKeyModifiers.Control
+
+    if (ctrl && horizontal == 0)
+    {
+        if (!cv.hasPinch) return;
+        double scale = 1.0 + lines * 0.25;   // per-event zoom factor around 1.0
+        if (scale <= 0.0) return;
+        cv.onPinch(x, y, scale);
+        pumpWinui();
+        return;
+    }
+    if (!cv.hasWheel) return;
+    double dx = horizontal != 0 ? lines : 0.0;
+    double dy = horizontal != 0 ? 0.0 : lines;
+    cv.onWheel(x, y, dx, dy, false);
+    pumpWinui();
+}
+
+// -- Canvas input drivers (the host-neutral test seam) ---------------------------
+// Like the Win32/Cocoa drivers, these call the element handler directly (the oracle is app
+// state, not OS plumbing), so they exercise the same closures the live XAML routing invokes.
+void nativeCanvasPointer(string keyPath, int phase, double x, double y)
+{
+    ICanvasView cv = _winuiCanvasAt(keyPath);
+    if (cv == nullptr) return;
+    int buttons = phase == 2 ? 0 : 1;   // down/move = left held, up = released
+    if (phase == 0) { if (cv.hasPointerDown) cv.onPointerDown(x, y, buttons); }
+    else if (phase == 1) { if (cv.hasPointerMove) cv.onPointerMove(x, y, buttons); }
+    else { if (cv.hasPointerUp) cv.onPointerUp(x, y, buttons); }
+    pumpWinui();
+}
+
+void nativeCanvasWheel(string keyPath, double x, double y, double dx, double dy)
+{
+    ICanvasView cv = _winuiCanvasAt(keyPath);
+    if (cv == nullptr || !cv.hasWheel) return;
+    cv.onWheel(x, y, dx, dy, true);
+    pumpWinui();
+}
+
+void nativeCanvasPinch(string keyPath, double x, double y, double scale)
+{
+    ICanvasView cv = _winuiCanvasAt(keyPath);
+    if (cv == nullptr || !cv.hasPinch) return;
+    cv.onPinch(x, y, scale);
+    pumpWinui();
 }
 
 // Build the initial control tree from the app's first render.
@@ -1118,13 +2883,86 @@ void winuiInitFramework()
     activationFactory("Microsoft.UI.Xaml.Controls.Canvas", iidof(XamlCanvasStatics), (void**)&_gCanvasStat);
     activationFactory("Windows.Foundation.PropertyValue", iidof(WfPropertyValueStatics), (void**)&_gPv);
 
-    void* win = wqi(winRaw, iidof(XamlWindow));
+    // The window content is Grid > ScrollViewer > Canvas. A Canvas alone reports no arranged size
+    // (ActualWidth 0, SizeChanged never fires), so it cannot tell the host how big the window is;
+    // a Grid stretches to the client area and does both - it stays the layout-extent source even
+    // now that the ScrollViewer sits between it and the Canvas. The ScrollViewer is what makes a
+    // ScrollView root really scroll (wheel/scrollbar/trackpad, all owned by XAML); the Canvas gets
+    // the content extent it scrolls over from _sizeCanvas.
+    void* grid = nullptr;
+    RoActivateInstance(hstring("Microsoft.UI.Xaml.Controls.Grid"), &grid);
     void* canvasElem = wqi(canvas, iidof(XamlUIElement));
-    _gRootElem = canvasElem;   // window content root: the headless path drives layout through this
-    _gRootFe   = wqi(canvas, iidof(XamlFrameworkElement));   // Loaded fires after the tree is live
-    if (win != nullptr && canvasElem != nullptr)
+    _gCanvasFe = wqi(canvas, iidof(XamlFrameworkElement));
+
+    void* scroller = nullptr;
+    RoActivateInstance(hstring("Microsoft.UI.Xaml.Controls.ScrollViewer"), &scroller);
+    void* scrollCtl = wqi(scroller, iidof(XamlScrollViewer));
+    _gScrollCtl = scrollCtl;
+    if (scrollCtl != nullptr)
     {
-        ((XamlWindow*)win)->lpVtbl->put_Content(win, canvasElem);
+        ((XamlScrollViewer*)scrollCtl)->lpVtbl->put_VerticalScrollBarVisibility(scrollCtl, ScrollBarVisibility_Auto);
+        ((XamlScrollViewer*)scrollCtl)->lpVtbl->put_HorizontalScrollBarVisibility(scrollCtl, ScrollBarVisibility_Disabled);
+        // A mounted items control takes focus as its template applies, and XAML would scroll the
+        // page down to it - so an app would open somewhere in the middle of its own content.
+        ((XamlScrollViewer*)scrollCtl)->lpVtbl->put_BringIntoViewOnFocusChange(scrollCtl, false);
+    }
+    void* scrollContent = wqi(scroller, iidof(XamlContentControl));
+    if (scrollContent != nullptr && canvas != nullptr)
+        ((XamlContentControl*)scrollContent)->lpVtbl->put_Content(scrollContent, canvas);
+    // The scroller is top-aligned and explicitly sized (viewport minus the status strip) by
+    // winuiLayoutChrome; the Grid has one cell, so the strip below simply overlays its bottom.
+    _gScrollFe = wqi(scroller, iidof(XamlFrameworkElement));
+    if (_gScrollFe != nullptr)
+        ((XamlFrameworkElement*)_gScrollFe)->lpVtbl->put_VerticalAlignment(_gScrollFe, VerticalAlignment_Top);
+
+    // The status strip: a second Canvas in the same Grid cell, WSTATUS_H tall and pinned to the
+    // bottom - outside the ScrollViewer, so a StatusBar is window chrome and never scrolls away.
+    void* sbar = nullptr;
+    RoActivateInstance(hstring("Microsoft.UI.Xaml.Controls.Canvas"), &sbar);
+    _gStatusPanel = wqi(sbar, iidof(XamlPanel));
+    if (_gStatusPanel != nullptr)
+    {
+        void* sbKids = nullptr;
+        ((XamlPanel*)_gStatusPanel)->lpVtbl->get_Children(_gStatusPanel, &sbKids);
+        _gStatusVec = wqi(sbKids, iidof(XamlUIElementVector));
+    }
+    void* sbFe = wqi(sbar, iidof(XamlFrameworkElement));
+    if (sbFe != nullptr)
+    {
+        ((XamlFrameworkElement*)sbFe)->lpVtbl->put_Height(sbFe, WSTATUS_H);
+        ((XamlFrameworkElement*)sbFe)->lpVtbl->put_VerticalAlignment(sbFe, VerticalAlignment_Bottom);
+        ((XamlFrameworkElement*)sbFe)->lpVtbl->put_HorizontalAlignment(sbFe, HorizontalAlignment_Stretch);
+    }
+    _gStatusElem = wqi(sbar, iidof(XamlUIElement));
+    if (_gStatusElem != nullptr)
+        ((XamlUIElement*)_gStatusElem)->lpVtbl->put_Visibility(_gStatusElem, 1);   // Collapsed
+
+    // The Grid's children are the ScrollViewer and (on top of it) the status strip; if the
+    // ScrollViewer could not be activated, fall back to the bare Canvas so an app still mounts.
+    void* scrollElem = wqi(scroller, iidof(XamlUIElement));
+    void* gridChild = scrollElem != nullptr ? scrollElem : canvasElem;
+    void* gridPanel = wqi(grid, iidof(XamlPanel));
+    _gRootPanel = gridPanel;   // the page Background (winuiApplyRootTheme) is set on this
+    if (gridPanel != nullptr && gridChild != nullptr)
+    {
+        void* gridKids = nullptr;
+        ((XamlPanel*)gridPanel)->lpVtbl->get_Children(gridPanel, &gridKids);
+        void* gridVec = wqi(gridKids, iidof(XamlUIElementVector));
+        if (gridVec != nullptr)
+        {
+            ((XamlUIElementVector*)gridVec)->lpVtbl->Append(gridVec, gridChild);
+            if (_gStatusElem != nullptr) ((XamlUIElementVector*)gridVec)->lpVtbl->Append(gridVec, _gStatusElem);
+        }
+    }
+
+    _gWinRaw = winRaw;   // the HWND (title-bar theme) is QI'd out of this
+    void* win = wqi(winRaw, iidof(XamlWindow));
+    void* rootElem = wqi(grid, iidof(XamlUIElement));
+    _gRootElem = rootElem;   // window content root: the headless path drives layout through this
+    _gRootFe   = wqi(grid, iidof(XamlFrameworkElement));   // Loaded + SizeChanged live here
+    if (win != nullptr && rootElem != nullptr)
+    {
+        ((XamlWindow*)win)->lpVtbl->put_Content(win, rootElem);
         ((XamlWindow*)win)->lpVtbl->Activate(win);
     }
 
@@ -1153,12 +2991,62 @@ void winuiInitFramework()
     _wCtx.bindThreadId(_winuiCurTid(), _winuiCurTid);
 }
 
-// Live-app init: build the tree, then hand control to the post-mount hook.
+// Adopt the live window's client size as the layout extent (in CELLS) and relayout. This is the
+// WinUI equivalent of the Win32 host's WM_SIZE - without it a live app lays out into the 80x40-
+// cell default no matter how big the window actually is. The extent is read off the root GRID
+// (_gRootFe), not the control Canvas: a Canvas has no arranged size, so its ActualWidth stays 0
+// and its SizeChanged never fires - which is exactly why the root content is a Grid.
+void _winuiSyncWindowSize()
+{
+    if (_gRootFe == nullptr || _wApp == nullptr) return;
+    double wDip = 0.0; double hDip = 0.0;
+    ((XamlFrameworkElement*)_gRootFe)->lpVtbl->get_ActualWidth(_gRootFe, &wDip);
+    ((XamlFrameworkElement*)_gRootFe)->lpVtbl->get_ActualHeight(_gRootFe, &hDip);
+    bool barOn = _wHost.sbH.count() > 0;
+    winuiLayoutChrome(barOn);
+    if (barOn) hDip = hDip - WSTATUS_H;   // the status strip is chrome, not layout extent
+    int cw = (int)(wDip / (double)BASE_X);
+    int ch = (int)(hDip / (double)BASE_Y);
+    if (cw < 1 || ch < 1) return;
+    if (cw == _wW && ch == _wH) return;
+    _wW = cw; _wH = ch;
+    // REBUILD, not just relayout: an app's render() reads hostWidth()/hostHeight(), and a
+    // reconcile keeps the mounted node's props, so the extent only reaches the tree through a
+    // fresh render. The Win32 host rebuilds its tree on WM_SIZE for the same reason.
+    if (_wReady) buildWinuiTree();
+}
+
+// Live-app init: track the window size, build the tree, then hand control to the post-mount hook.
 void winuiOnInit(void* params)
 {
     winuiInitFramework();
+    if (_gRootFe != nullptr)
+    {
+        void* h = winrtDelegate(XamlSizeChangedEventHandler, (void* s, void* a) => { _winuiSyncWindowSize(); });
+        u64 tok = 0;
+        ((XamlFrameworkElement*)_gRootFe)->lpVtbl->add_SizeChanged(_gRootFe, h, &tok);
+    }
     buildWinuiTree();
+    // Mounting the tab strip selects a tab, and XAML brings the selected item into view - which
+    // scrolls the page away from its top before the user has touched it. Put it back once the
+    // first real layout pass is done (Loaded), which is after that scroll has happened.
+    if (_gRootFe != nullptr)
+    {
+        // Two hops: the bring-into-view lands on the frame AFTER Loaded, so a single post would
+        // reset the offset before XAML moves it.
+        void* hl = winrtDelegate(XamlRoutedEventHandler,
+            (void* s, void* a) => { winuiPost(() => { winuiPost(() => { winuiScrollToTop(); }); }); });
+        u64 tok = 0;
+        ((XamlFrameworkElement*)_gRootFe)->lpVtbl->add_Loaded(_gRootFe, hl, &tok);
+    }
     if (_wHasPostMount) _wPostMount();
+}
+
+// Put the page back at its top (see winuiOnInit).
+void winuiScrollToTop()
+{
+    if (_gScrollCtl == nullptr) return;
+    ((XamlScrollViewer*)_gScrollCtl)->lpVtbl->ScrollToVerticalOffset(_gScrollCtl, 0.0);
 }
 
 // Force a synchronous measure/arrange over the mounted tree. XAML applies each control's
@@ -1205,8 +3093,10 @@ void winuiPost(Lambda<void()> fn)
 
 // -- Host-neutral entry points (mirror the Win32/Cocoa host free-function surface) --
 
-// Build a hidden window bound to `app` at DIP size w x h and build its tree. Called from
-// INSIDE the Start callback (the framework is already up), so it just mounts the tree.
+// Bind `app` to the window at a layout extent of w x h CELLS (same contract as the Win32/Cocoa
+// startHeadlessWindow) and build its tree. Called from INSIDE the Start callback (the framework
+// is already up), so it just mounts the tree. No SizeChanged hook here: the self-test's extent
+// is the one it asked for, not whatever the real window happens to measure.
 void startHeadlessWindow(IComponent app, const char* title, int w, int h)
 {
     _wApp = app; _wW = w; _wH = h;
@@ -1216,6 +3106,7 @@ void startHeadlessWindow(IComponent app, const char* title, int w, int h)
 // Bring up the whole WinUI 3 app for `app` (live). Blocks in the XAML pump until winuiExit().
 int runAppWinui(IComponent app)
 {
+    winuiEnableDpiAwareness();
     _wApp = app;
     i32 bhr = MddBootstrapInitialize2(0x00010008, nullptr, 0, 0x10);
     if (bhr != 0) { printf("winui: bootstrap failed 0x%08X\n", bhr); return 1; }
@@ -1232,6 +3123,7 @@ int runAppWinui(IComponent app)
 // Run a headless self-test body (installed via setSelfTestBody) inside the XAML pump; return its rc.
 int runWinuiHeadless()
 {
+    winuiEnableDpiAwareness();
     i32 bhr = MddBootstrapInitialize2(0x00010008, nullptr, 0, 0x10);
     if (bhr != 0) { printf("winui: bootstrap failed 0x%08X\n", bhr); return 1; }
     RoInitialize(0);
@@ -1311,7 +3203,8 @@ string winuiControlText(string key)
 
 // -- Host-neutral native* test drivers (same names as the Win32/Cocoa hosts) ----
 
-// Read the control text at keyPath (live TextBlock/TextBox get_Text, else the host mirror).
+// Read the control text at keyPath, always OFF the control: a TextBlock/TextBox has get_Text, and
+// a ContentControl (Button/CheckBox/RadioButton) carries the boxed string setText put in it.
 string nativeControlText(string keyPath)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
@@ -1320,7 +3213,16 @@ string nativeControlText(string keyPath)
     if (tb != nullptr) { void* hs = nullptr; ((XamlTextBlock*)tb)->lpVtbl->get_Text(tb, &hs); if (hs != nullptr) return fromHString(hs); }
     void* tx = wqi((void*)h, iidof(XamlTextBox));
     if (tx != nullptr) { void* hs = nullptr; ((XamlTextBox*)tx)->lpVtbl->get_Text(tx, &hs); if (hs != nullptr) return fromHString(hs); }
-    return _wHost._txtFor(h);
+    void* cc = wqi((void*)h, iidof(XamlContentControl));
+    if (cc == nullptr) return "";
+    void* content = nullptr;
+    ((XamlContentControl*)cc)->lpVtbl->get_Content(cc, &content);
+    void* pv = wqi(content, iidof(WfPropertyValue));
+    if (pv == nullptr) return "";
+    void* hs = nullptr;
+    ((WfPropertyValue*)pv)->lpVtbl->GetString(pv, &hs);
+    if (hs == nullptr) return "";
+    return fromHString(hs);
 }
 
 // Push text into the control at keyPath (guards the reentrant change under `applying`).
@@ -1392,7 +3294,14 @@ bool nativeSaveWindowBmp(string path) { return false; }
 void pumpNative() { pumpWinui(); }
 void hostDrainPosted() { pumpWinui(); }   // posted work runs on the DispatcherQueue pumpWinui drains
 void nativeTestFireMenu(int cmd) { routeMenu(cmd); }
-void nativeResizeClient(int wDip, int hDip) { _wW = wDip; _wH = hDip; }   // record only; not exercised on WinUI
+// Drive a client-area resize to w x h CELLS (the layout unit, like the Win32 driver's WM_SIZE):
+// record the new extent and relayout. No XAML window resize is synthesized.
+void nativeResizeClient(int wCells, int hCells)
+{
+    if (wCells < 1 || hCells < 1) return;
+    _wW = wCells; _wH = hCells;
+    _wHost.requestLayout();
+}
 string nativeAccessibleName(string keyPath) { return nativeControlText(keyPath); }
 string nativeFocusFirst() { return ""; }   // Win32-only Tab ring; no WinUI gate exercises focus drivers
 string nativeFocusNext() { return ""; }
@@ -1428,39 +3337,49 @@ void nativeTypeText(string keyPath, string s)
     if (h == 0u) return;
     void* tx = wqi((void*)h, iidof(XamlTextBox));
     if (tx != nullptr) { bool p = _wHost.applying; _wHost.applying = true; ((XamlTextBox*)tx)->lpVtbl->put_Text(tx, hstring(s)); _wHost.applying = p; }
-    _wHost._setTxt(h, s);
     IElement e = winuiElem(keyPath);
     if (e != nullptr) { ITextInput ti = e as ITextInput; if (ti != nullptr) { ti.fireChangeText(s); pumpWinui(); } }
 }
 
-// -- ListView drivers (host-side box/model source) -----------------------------
+// -- ListView drivers (read back off the live control's bound item source) ------
 int nativeListRowCount(string keyPath)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
     if (h == 0u) return 0;
-    return _wHost._listCount(h);
+    WItemSource* src = _wHost._listLiveSrc(h);
+    if (src == nullptr) return 0;
+    u32 n = 0u;
+    ((XamlBindableVector*)src)->lpVtbl->get_Size(src, &n);
+    return (int)n;
 }
+// The cell the control would display at (row, col): the row string XAML pulls out of the bound
+// source is the COLUMNS JOINED, so the cell is read from the same source, one column at a time.
 string nativeListCellText(string keyPath, int row, int col)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
     if (h == 0u) return "";
-    u64 box = _wHost._listBoxFor(h);
-    if (box == 0u) return "";
-    return __uiListRowText(box, row, col);
+    WItemSource* src = _wHost._listLiveSrc(h);
+    if (src == nullptr || src.box == 0u) return "";
+    return __uiListRowText(src.box, row, col);
 }
 void nativeListSelect(string keyPath, int row)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
     if (h == 0u) return;
-    _wHost._listSetSel(h, row);
+    void* sel = wqi((void*)h, iidof(XamlSelector));
+    if (sel != nullptr)
+    {
+        bool prev = _wHost.applying;
+        _wHost.applying = true;   // the model is fired below; do not also route the change
+        ((XamlSelector*)sel)->lpVtbl->put_SelectedIndex(sel, row);
+        _wHost.applying = prev;
+    }
     IElement e = winuiElem(keyPath);
     if (e != nullptr) { IListView lv = e as IListView; if (lv != nullptr && row >= 0) { lv.fireSelect(row); pumpWinui(); } }
 }
 int nativeListSelectedRow(string keyPath)
 {
-    u64 h = _wCtx.nativeHandle(keyPath);
-    if (h == 0u) return 0 - 1;
-    return _wHost._listGetSel(h);
+    return _winuiListSel(_wCtx.nativeHandle(keyPath));
 }
 void nativeListActivate(string keyPath, int row)
 {
@@ -1469,41 +3388,56 @@ void nativeListActivate(string keyPath, int row)
     if (e != nullptr) { IListView lv = e as IListView; if (lv != nullptr) { lv.fireActivate(row); pumpWinui(); } }
 }
 
-// -- Tab drivers (element-model backed; lazy panes via applyTree) --------------
+// -- Tab drivers (read back off the live TabView) -------------------------------
 int nativeTabSelected(string keyPath)
 {
-    IElement e = winuiElem(keyPath);
-    if (e == nullptr) return 0 - 1;
-    ITabControl tc = e as ITabControl;
-    return tc != nullptr ? tc.selectedTab : (0 - 1);
+    u64 h = _wCtx.nativeHandle(keyPath);
+    void* tv = h != 0u ? wqi((void*)h, iidof(XamlTabView)) : nullptr;
+    if (tv == nullptr) return 0 - 1;
+    i32 sel = 0;
+    ((XamlTabView*)tv)->lpVtbl->get_SelectedIndex(tv, &sel);
+    return (int)sel;
 }
 int nativeTabCount(string keyPath)
 {
-    IElement e = winuiElem(keyPath);
-    if (e == nullptr) return 0;
-    list<IElement>* panes = e.childList();
-    return panes != nullptr ? panes.count() : 0;
+    u64 h = _wCtx.nativeHandle(keyPath);
+    void* tv = h != 0u ? wqi((void*)h, iidof(XamlTabView)) : nullptr;
+    if (tv == nullptr) return 0;
+    void* items = nullptr;
+    ((XamlTabView*)tv)->lpVtbl->get_TabItems(tv, &items);
+    if (items == nullptr) return 0;
+    u32 n = 0u;
+    ((XamlObjectVector*)items)->lpVtbl->get_Size(items, &n);
+    return (int)n;
 }
 void nativeTabSelect(string keyPath, int idx)
 {
+    u64 h = _wCtx.nativeHandle(keyPath);
+    void* tv = h != 0u ? wqi((void*)h, iidof(XamlTabView)) : nullptr;
+    if (tv != nullptr)
+    {
+        bool prev = _wHost.applying;
+        _wHost.applying = true;   // the model is fired below; do not also route the change
+        ((XamlTabView*)tv)->lpVtbl->put_SelectedIndex(tv, idx);
+        _wHost.applying = prev;
+    }
     IElement e = winuiElem(keyPath);
     if (e == nullptr) return;
     ITabControl tc = e as ITabControl;
     if (tc != nullptr) { tc.fireSelectTab(idx); pumpWinui(); }
 }
 
-// -- Tree drivers (host-side materialized-node model) --------------------------
+// -- Tree drivers (the item handle IS the live TreeViewNode) --------------------
 u64 nativeTreeRootItem(string keyPath)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
     if (h == 0u) return 0u;
-    return _wHost._treeRoot(h);
+    return _wHost._treeFirstOf(_wHost._treeRoots(h));
 }
 u64 nativeTreeChildItem(string keyPath, u64 hItem)
 {
-    u64 h = _wCtx.nativeHandle(keyPath);
-    if (h == 0u) return 0u;
-    return _wHost._treeFirstChild(h, hItem);
+    if (hItem == 0u) return 0u;
+    return _wHost._treeFirstOf(_wHost._treeChildren(hItem));
 }
 int nativeTreeItemCount(string keyPath)
 {
@@ -1514,8 +3448,9 @@ int nativeTreeItemCount(string keyPath)
 void nativeTreeExpandItem(string keyPath, u64 hItem)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
-    if (h == 0u) return;
-    int nodeId = _wHost._treeExpand(h, hItem);
+    if (h == 0u || hItem == 0u) return;
+    int nodeId = _wHost._treeMaterialize(h, hItem);
+    ((XamlTreeViewNode*)hItem)->lpVtbl->put_IsExpanded(hItem, true);
     IElement e = winuiElem(keyPath);
     if (e != nullptr && nodeId != (0 - 1)) { ITreeView tv = e as ITreeView; if (tv != nullptr) { tv.fireExpand(nodeId); pumpWinui(); } }
 }
@@ -1523,15 +3458,21 @@ void nativeTreeSelectItem(string keyPath, u64 hItem)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
     if (h == 0u) return;
-    int nodeId = _wHost._treeItemNode(h, hItem);
+    int nodeId = _wHost._treeItemNode(hItem);
+    void* tv2 = wqi((void*)h, iidof(XamlTreeView2));
+    if (tv2 != nullptr)
+    {
+        bool prev = _wHost.applying;
+        _wHost.applying = true;   // the model is fired below; do not also route the change
+        ((XamlTreeView2*)tv2)->lpVtbl->put_SelectedNode(tv2, (void*)hItem);
+        _wHost.applying = prev;
+    }
     IElement e = winuiElem(keyPath);
     if (e != nullptr) { ITreeView tv = e as ITreeView; if (tv != nullptr) { tv.fireSelect(nodeId); pumpWinui(); } }
 }
 int nativeTreeItemNodeId(string keyPath, u64 hItem)
 {
-    u64 h = _wCtx.nativeHandle(keyPath);
-    if (h == 0u) return 0 - 1;
-    return _wHost._treeItemNode(h, hItem);
+    return _wHost._treeItemNode(hItem);
 }
 
 // -- Splitter / bounds ---------------------------------------------------------

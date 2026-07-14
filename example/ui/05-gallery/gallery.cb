@@ -109,7 +109,8 @@ int win32HardeningSelfTest()
     s.test("accessibility names", (IUiTest t) =>
     {
         t.launch(new GalleryApp(), 60, 60);
-        string btnName = t.accessibleName("root/content/cardbtn/btn");
+        // The button sits inside the card's "btnrow" wrapper - its key path includes it.
+        string btnName = t.accessibleName("root/content/cardbtn/btnrow/btn");
         string progName = t.accessibleName("root/content/cardprog/prog");
         t.expectTrue("a11y names",
             strcmp(btnName.data(), "Click me") == 0 && strcmp(progName.data(), "download progress") == 0);

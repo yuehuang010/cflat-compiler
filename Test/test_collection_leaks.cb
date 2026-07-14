@@ -116,6 +116,38 @@ class Labeler : ILabel { string tag = default; string label() { return tag + "!"
 // branches on the runtime owned bit: transfer when already owned, copy only literals/views.
 string plainOwnedStr(int n) { return "owned" + n.toString(); }
 
+// Returns an owning container BY VALUE - the caller owns the result. Used as an rvalue-temp
+// method receiver below (Bug 9).
+list<int> makeIntList(int n)
+{
+    list<int> v = default;
+    int i = 0;
+    while (i < n) { v.add(i); i++; }
+    return v;
+}
+
+// === Bug 10: global owning values were never destructed ===
+// Globals are destructed on main's normal return, in REVERSE definition order. `_gLeakGate` is
+// defined FIRST, so it is destructed LAST - its destructor observes the container globals below
+// already torn down, and fails the process if any of their buffers survived. The containers are
+// populated only at the END of main (after the in-main leak oracle), so that oracle still sees
+// zero live allocations.
+struct GlobalLeakGate
+{
+    int _pad = 0;
+    ~GlobalLeakGate()
+    {
+        if (HeapAudit.reportLeaks() != 0u)
+        {
+            printf("FAIL: global owning values were not destructed at exit.\n");
+            exit(1);
+        }
+    }
+};
+GlobalLeakGate            _gLeakGate = default;
+list<int>                 _gNums     = default;
+dictionary<string, string> _gMap     = default;
+
 extern int main()
 {
     HeapAudit.enable();
@@ -594,9 +626,33 @@ extern int main()
         }
     }
 
+    // === Bug 9: a method call on an owning-value RVALUE temp receiver frees the temp ===
+    // `makeIntList(3).count()` consumed the temp as `this` and then dropped it - its buffer leaked.
+    // An `alias` (borrow) receiver must still NOT be destructed here, or the owner double-frees.
+    {
+        total++; passed += Test("temp receiver count", makeIntList(3).count(), 3);
+        total++; passed += Test("temp receiver chained", makeIntList(2).copy().count(), 2);
+
+        dictionary<int, list<string>> holder = default;
+        list<string> hv = {"p", "q"};
+        holder.add(1, move hv);
+        // holder.get(1) is an `alias` borrow of the slot: counting through it must not free it.
+        total++; passed += Test("alias temp receiver borrowed", holder.get(1).count(), 2);
+        total++; passed += Test("alias temp receiver source live", holder.get(1).get(0), "p");
+    }
+
     // === Leak oracle: everything above must have freed on scope exit ===
     u64 leaks = HeapAudit.reportLeaks();
     total++; passed += Test("HeapAudit live allocations", (i64)leaks, (i64)0);
+
+    // === Bug 10: globals are destructed on main's normal return (see _gLeakGate above) ===
+    // Populated after the oracle above so it still sees zero; _gLeakGate's destructor re-audits
+    // once these have been torn down and fails the process if a buffer survived.
+    _gNums.add(1);
+    _gNums.add(2);
+    _gMap.set("k", "v");
+    total++; passed += Test("global list live", _gNums.count(), 2);
+    total++; passed += Test("global dict live", _gMap.get("k"), "v");
 
     if (passed == total)
     {

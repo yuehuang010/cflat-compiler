@@ -18,6 +18,7 @@
 //   §4.8       7991       Lookup / name resolution  IsKnownTypeName, GetType
 // ============================================================
 
+#include <algorithm>
 #include <deque>
 #include <functional>
 #include <ranges>
@@ -999,6 +1000,9 @@ private:
     // differs from the real file, so line (not path) is the stable identity. Cleared by
     // ResetForReanalysis like the maps above.
     std::unordered_map<std::string, int> globalDeclSite;
+    // Definition order of the globals that end-of-main destruction covers (see
+    // EmitGlobalDestructorsInMain). Excludes externs, thread-locals and core-library globals.
+    std::vector<std::string> globalDtorOrder_;
     std::unordered_map<std::string, StructData> dataStructures;
 
     // Maps annotation name -> field names declared in its body (empty vector = no-arg annotation).
@@ -1386,6 +1390,8 @@ private:
     llvm::Function* currentFunction;
     std::string sourceFileName;
     std::string currentSourceFilePath_;
+    // True while the file being scanned/walked lives under runtimeDir/core (set by CompileImportedFile).
+    bool currentSourceIsCore_ = false;
     llvm::AllocaInst* autoVaListAlloca = nullptr;
 
     std::unique_ptr<llvm::DIBuilder> diBuilder;
@@ -6237,6 +6243,60 @@ private:
         }
     }
 
+    // Destruct global owning values (list, dictionary, string, closure, ...) on the normal return
+    // path out of main, in REVERSE definition order - the global-scope analog of a scope's
+    // destructors. Emitted as a post-pass once every return in main is lowered, so it covers every
+    // `return` and the implicit fall-off return alike.
+    //
+    // Safety notes:
+    // - A moved-from global was zeroed at the move site (ApplyMoveParamTransfer stores a zeroed
+    //   aggregate into the source), so its destructor is a no-op - no double free.
+    // - Extern globals (not ours), thread-locals (main owns only its own copy) and core-library
+    //   globals are excluded at registration time (see globalDtorOrder_). Core globals are
+    //   process-lifetime infrastructure (page pools, allocator registries, their mutexes) that
+    //   threads and the allocator may still touch as the process winds down.
+    // - Pointer globals are skipped: a raw `T*` global has no owning-value destructor contract.
+    // - An early exit()/abort() bypasses main's return and therefore skips these. Accepted: there
+    //   is no atexit hook, and a hard exit leaks nothing the OS does not reclaim.
+    void EmitGlobalDestructorsInMain()
+    {
+        llvm::Function* mainFn = module->getFunction("main");
+        if (!mainFn || mainFn->isDeclaration())
+            return;
+
+        std::vector<std::pair<llvm::GlobalVariable*, llvm::Function*>> work;
+        for (auto it = globalDtorOrder_.rbegin(); it != globalDtorOrder_.rend(); ++it)
+        {
+            auto gIt = globalNamedVariable.find(*it);
+            auto tIt = globalVariableTypes.find(*it);
+            if (gIt == globalNamedVariable.end() || tIt == globalVariableTypes.end()) continue;
+
+            const TypeAndValue& tv = tIt->second;
+            if (tv.Pointer || tv.IsArrayView || tv.IsInterface || tv.ConstArraySize > 0) continue;
+            if (!IsOwningValueType(tv.TypeName)) continue;
+            if (auto* dtor = GetOrCreateFullDestructor(tv.TypeName))
+                work.emplace_back(gIt->second, dtor);
+        }
+        if (work.empty())
+            return;
+
+        // Under -g every call needs a !dbg location or the verifier rejects it; reuse the
+        // return's own location, falling back to the subprogram scope.
+        llvm::DISubprogram* sp = mainFn->getSubprogram();
+        for (llvm::BasicBlock& bb : *mainFn)
+        {
+            auto* ret = llvm::dyn_cast<llvm::ReturnInst>(bb.getTerminator());
+            if (!ret) continue;
+            llvm::IRBuilder<> b(ret);
+            if (ret->getDebugLoc())
+                b.SetCurrentDebugLocation(ret->getDebugLoc());
+            else if (sp)
+                b.SetCurrentDebugLocation(llvm::DILocation::get(*context, sp->getLine(), 0, sp));
+            for (const auto& [gVar, dtor] : work)
+                b.CreateCall(dtor->getFunctionType(), dtor, { gVar });
+        }
+    }
+
     bool JitRun(int& runExitCode)
     {
         runExitCode = 0;
@@ -10055,6 +10115,14 @@ public:
 
         globalNamedVariable[typeValue.VariableName] = gVar;
         globalVariableTypes[typeValue.VariableName] = typeValue;
+
+        // Record definition order for end-of-main destruction (see EmitGlobalDestructorsInMain).
+        // Externs (not ours to free), thread-locals (main destroys only its own copy) and
+        // core-library globals (process-lifetime infrastructure) are excluded.
+        if (!externalDecl && !threadLocal && !currentSourceIsCore_ && !typeValue.VariableName.empty()
+            && std::find(globalDtorOrder_.begin(), globalDtorOrder_.end(), typeValue.VariableName)
+               == globalDtorOrder_.end())
+            globalDtorOrder_.push_back(typeValue.VariableName);
 
         if (symbolSink_ && !typeValue.VariableName.empty())
             symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName);

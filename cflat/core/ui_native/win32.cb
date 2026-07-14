@@ -20,7 +20,8 @@
 // ctx.post() marshals a closure back to the UI thread via PostMessage(WM_APP_CALL).
 //
 // This file has no main(); an app imports it and calls runAppGuiNative().
-import "windows.h" lib { "user32.lib", "gdi32.lib", "comctl32.lib", "dwmapi.lib", "comdlg32.lib" } cache;
+import "windows.h" lib { "user32.lib", "gdi32.lib", "comctl32.lib", "dwmapi.lib", "comdlg32.lib",
+                         "uxtheme.lib" } cache;
 import "ui_native.cb";
 import "graphic/bitmap.cb";   // 24bpp BMP writer for nativeSaveWindowBmp (the shot() backend)
 
@@ -32,6 +33,9 @@ extern stdcall i32 DwmSetWindowAttribute(void* hwnd, u32 attr, void* pv, u32 cb)
 // PrintWindow + GetDIBits back the offscreen screenshot path; not surfaced by the binding.
 extern stdcall i32 PrintWindow(void* hwnd, void* hdc, u32 flags);
 extern stdcall i32 GetDIBits(void* hdc, void* hbm, u32 start, u32 lines, void* bits, void* bmi, u32 usage);
+// SetWindowTheme (uxtheme.h) is a DOCUMENTED, linkable API; only the theme NAME it is given
+// ("DarkMode_Explorer") is undocumented. A wrong/absent name degrades to the light look.
+extern stdcall i32 SetWindowTheme(void* hwnd, u16* subApp, u16* subIdList);
 
 const int PBM_SETRANGE32 = 1030;   // WM_USER+6
 const int PBM_SETPOS     = 1026;   // WM_USER+2
@@ -42,9 +46,48 @@ const int TBM_SETRANGE   = 1030;   // WM_USER+6
 const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
 
 // Status bar (msctls_statusbar32) messages.
-const int SB_SETTEXTA = 1025;   // WM_USER+1
-const int SB_GETTEXTA = 1026;   // WM_USER+2
-const int SB_SETPARTS = 1028;   // WM_USER+4
+const int SB_SETTEXTA   = 1025;   // WM_USER+1
+const int SB_GETTEXTA   = 1026;   // WM_USER+2
+const int SB_SETPARTS   = 1028;   // WM_USER+4
+const int SB_SETBKCOLOR = 0x2001; // CCM_SETBKCOLOR (ignored while the control is visual-styled)
+const int SBT_OWNERDRAW = 0x1000; // the part's text is drawn by the PARENT via WM_DRAWITEM
+const int SBARS_SIZEGRIP = 0x0100;   // the status bar draws the window's resize grip
+const u32 CLR_DEFAULT   = 0xFF000000u;   // "use the default background" for SB_SETBKCOLOR
+const u32 CLR_NONE      = 0xFFFFFFFFu;   // "restore the system default" for the TreeView colors
+
+// ProgressBar (msctls_progress32) colors. A visual-styled progress bar IGNORES both, so the
+// dark path drops its theme first (see _themeControl).
+const int PBM_SETBKCOLOR  = 0x2001;   // CCM_SETBKCOLOR, like the status bar's
+const int PBM_SETBARCOLOR = 1033;     // WM_USER+9
+
+// The owner-drawn item type (DRAWITEMSTRUCT.CtlType) for a tab item; ODS_SELECTED comes from
+// the windows.h binding.
+const int ODT_TAB = 101;
+
+// Header (SysHeader32, the ListView's column bar) item read + the custom-draw stages its
+// NM_CUSTOMDRAW walks. HDM_FIRST = 0x1200.
+const int HDM_GETITEMCOUNT = 0x1200;   // HDM_FIRST+0
+const int HDM_GETITEMA     = 0x1203;   // HDM_FIRST+3
+const int HDM_GETITEMRECT  = 0x1207;   // HDM_FIRST+7
+const int HDI_TEXT         = 0x0002;
+
+// HDITEMA (ANSI, 64-bit): pszText@8, cchTextMax@24. Only the text fields are read.
+struct HDItemA
+{
+    u32   mask       = 0u;
+    i32   cxy        = 0;
+    char* pszText    = nullptr;
+    void* hbm        = nullptr;
+    i32   cchTextMax = 0;
+    i32   fmt        = 0;
+    i64   lParam     = 0;
+    i32   iImage     = 0;
+    i32   iOrder     = 0;
+    u32   type       = 0u;
+    u32   _pad       = 0u;
+    void* pvFilter   = nullptr;
+    u32   state      = 0u;
+};
 
 // Tooltip (tooltips_class32) messages / flags.
 const int TTM_ADDTOOLA       = 1028;   // WM_USER+4
@@ -68,6 +111,11 @@ const int LVM_GETITEMTEXTA            = 0x102D;   // LVM_FIRST+45
 const int LVM_GETNEXTITEM             = 0x100C;   // LVM_FIRST+12
 const int LVM_SETEXTENDEDLISTVIEWSTYLE = 0x1036;  // LVM_FIRST+54
 const int LVM_GETITEMCOUNT            = 0x1004;   // LVM_FIRST+4
+// Dark-mode colors + the header (a SEPARATE control that needs its own theme).
+const int LVM_SETBKCOLOR     = 0x1001;   // LVM_FIRST+1
+const int LVM_GETHEADER      = 0x101F;   // LVM_FIRST+31
+const int LVM_SETTEXTCOLOR   = 0x1024;   // LVM_FIRST+36
+const int LVM_SETTEXTBKCOLOR = 0x1026;   // LVM_FIRST+38
 const int LVS_REPORT       = 0x0001;
 const int LVS_SINGLESEL    = 0x0004;
 const int LVS_SHOWSELALWAYS = 0x0008;
@@ -143,8 +191,12 @@ const int TCM_DELETEALLITEMS = 0x1309;  // TCM_FIRST+9
 const int TCM_GETCURSEL     = 0x130B;   // TCM_FIRST+11
 const int TCM_SETCURSEL     = 0x130C;   // TCM_FIRST+12
 const int TCM_GETITEMCOUNT  = 0x1304;   // TCM_FIRST+4
+const int TCM_GETITEMA      = 0x1305;   // TCM_FIRST+5
 const int TCIF_TEXT         = 0x0001;
 const int TCN_SELCHANGE     = -551;  // TCN_FIRST-1
+// uxtheme ships NO dark theme for SysTabControl32 and the control does not support
+// NM_CUSTOMDRAW, so the dark path owner-draws the tab ITEMS (WM_DRAWITEM at the frame).
+const int TCS_OWNERDRAWFIXED = 0x2000;
 
 // TCITEMA (ANSI, tightly packed like LVColumnA - cflat inserts no field padding, so
 // pointers/i64 are hand-aligned). pszText lands at offset 16, lParam at 32.
@@ -173,6 +225,9 @@ const int TVS_HASBUTTONS   = 0x0001;
 const int TVS_HASLINES     = 0x0002;
 const int TVS_LINESATROOT  = 0x0004;
 const int TVS_SHOWSELALWAYS = 0x0020;
+const int TVM_SETBKCOLOR   = 0x111D;   // TV_FIRST+29
+const int TVM_SETTEXTCOLOR = 0x111E;   // TV_FIRST+30
+const int TVM_SETLINECOLOR = 0x1128;   // TV_FIRST+40
 const int TVIF_TEXT        = 0x0001;
 const int TVIF_PARAM       = 0x0004;
 const int TVIF_CHILDREN    = 0x0040;
@@ -231,7 +286,11 @@ void* tviLast() { return (void*)((i64)0 - (i64)0xFFFE); }
 // NM_CUSTOMDRAW for themed accent buttons. NM_FIRST = 0; NM_CUSTOMDRAW = NM_FIRST-12.
 const int NM_CUSTOMDRAW      = -12;
 const int CDDS_PREPAINT      = 0x00000001;
+const int CDDS_POSTPAINT     = 0x00000002;
+const int CDDS_ITEMPREPAINT  = 0x00010001;   // CDDS_ITEM | CDDS_PREPAINT
 const int CDRF_DODEFAULT     = 0x00000000;
+const int CDRF_NOTIFYPOSTPAINT = 0x00000010;
+const int CDRF_NOTIFYITEMDRAW = 0x00000020;
 const int CDRF_SKIPDEFAULT   = 0x00000004;
 const int CDIS_SELECTED      = 0x00000001;
 const int CDIS_FOCUS         = 0x00000010;
@@ -266,6 +325,10 @@ struct BmiHeader
 const int BASE_X = 8;
 const int BASE_Y = 26;
 
+// Ceiling on the content pane's height. Mouse messages pack client coordinates as SIGNED
+// 16-bit, so a pane past 32767px would corrupt hit-testing inside the controls it parents.
+const int PANE_MAX_H = 32000;
+
 // -- App-wide host state (NOT per-window) -------------------------------------
 // The window class + hInstance + declarative menu are shared by every window; the
 // per-window state lives in Window (below). _cur is the window currently being
@@ -297,6 +360,85 @@ void setCloseQuery(Lambda<bool()> q) { _closeQuery = q; _hasCloseQuery = true; }
 
 void* u2h(u64 u) { return (void*)u; }
 
+// -- Dark mode for NON-CLIENT chrome (the frame's scrollbar) --------------------
+// A WS_VSCROLL scrollbar is non-client area: Windows paints it from the process/window
+// uxtheme app mode, which DWMWA_USE_IMMERSIVE_DARK_MODE (a titlebar attribute) does not
+// touch. There is no documented API for it, so the two uxtheme entry points below are
+// bound BY ORDINAL and every pointer is null-checked: if a future Windows build drops
+// them, the binding no-ops and the scrollbar stays light (a cosmetic degradation, never
+// a crash). SetWindowTheme itself is documented; only its theme-name string is not.
+const int UXORD_ALLOW_DARK_MODE_FOR_WINDOW = 133;
+const int UXORD_SET_PREFERRED_APP_MODE     = 135;
+const int UX_APPMODE_DEFAULT   = 0;
+const int UX_APPMODE_ALLOW_DARK = 1;
+
+function<i32(void*, i32)> _uxAllowDarkForWindow = nullptr;
+function<i32(i32)>        _uxSetPreferredAppMode = nullptr;
+bool _uxBound = false;
+
+// Bind uxtheme's dark-mode ordinals once. Absent ordinals leave the pointers null.
+void _bindUxTheme()
+{
+    if (_uxBound) return;
+    _uxBound = true;
+    void* ux = LoadLibraryA("uxtheme.dll");
+    if (ux == nullptr) return;
+    _uxAllowDarkForWindow = (function<i32(void*, i32)>)
+        GetProcAddress(ux, (const char*)(i64)UXORD_ALLOW_DARK_MODE_FOR_WINDOW);
+    _uxSetPreferredAppMode = (function<i32(i32)>)
+        GetProcAddress(ux, (const char*)(i64)UXORD_SET_PREFERRED_APP_MODE);
+}
+
+// A NUL-terminated UTF-16 copy of an ASCII string, for the LPCWSTR-only SetWindowTheme.
+void _wideAscii(string s, u16* out, int cap)
+{
+    int i = 0;
+    const char* p = s.data();
+    while (i < s.length() && i < cap - 1) { out[i] = (u16)p[i]; i++; }
+    out[i] = (u16)0;
+}
+
+// Opt one window into (or out of) the process dark mode. Ordinal-bound and null-checked:
+// an absent ordinal degrades to the light look, never a crash (see the note above).
+void _allowDark(void* hwnd, bool dark)
+{
+    _bindUxTheme();
+    if (_uxAllowDarkForWindow != nullptr)
+        _uxAllowDarkForWindow(hwnd, dark ? 1 : 0);
+}
+
+// SetWindowTheme with an ASCII sub-app name (the API takes LPCWSTR only).
+void _ctlTheme(void* hwnd, string subApp)
+{
+    u16[32] name;
+    _wideAscii(subApp, name, 32);
+    SetWindowTheme(hwnd, name, nullptr);
+}
+
+// Drop the control's visual styles (L"", L""), which is what makes a common control honor
+// its own color messages (SB_SETBKCOLOR, PBM_SETBKCOLOR) instead of painting themed.
+void _ctlThemeNone(void* hwnd)
+{
+    u16[4] empty = default;
+    empty[0] = (u16)0;        // L"" - the NUL terminator IS the whole string
+    SetWindowTheme(hwnd, empty, empty);
+}
+
+// Back to the class default: the stock native look, byte-identical to never having themed it.
+void _ctlThemeReset(void* hwnd) { SetWindowTheme(hwnd, nullptr, nullptr); }
+
+// Put window `hwnd` (and thus its non-client scrollbar) into the dark or light theme.
+void _applyDarkNonClient(void* hwnd, bool dark)
+{
+    _bindUxTheme();
+    if (_uxSetPreferredAppMode != nullptr)
+        _uxSetPreferredAppMode(dark ? UX_APPMODE_ALLOW_DARK : UX_APPMODE_DEFAULT);
+    _allowDark(hwnd, dark);
+    _ctlTheme(hwnd, dark ? "DarkMode_Explorer" : "Explorer");
+    // The scrollbar lives in the frame, so only a FRAME redraw picks the new theme up.
+    RedrawWindow(hwnd, nullptr, nullptr, (u32)(RDW_INVALIDATE | RDW_FRAME | RDW_NOCHILDREN));
+}
+
 // A node kind that maps to an OS control (vs a pure layout container that only
 // contributes geometry to its children). VIEW/SCROLL/COMPONENT are containers.
 bool nativeMappable(int kind)
@@ -308,6 +450,30 @@ bool nativeMappable(int kind)
         || kind == ELEM_TABS || kind == ELEM_TREE
         || kind == ELEM_IMAGE || kind == ELEM_GROUPBOX || kind == ELEM_CANVAS;
 }
+
+// The style.backgroundColor of a plain (non-mapped) container - a View from view/row/
+// column - or 0 for anything else. A non-zero value opts the container into a painted
+// backdrop panel behind its children (Box maps to a real control, so it is excluded).
+int _containerBg(IElement node)
+{
+    if (node.kind() == ELEM_VIEW) { IView v = node as IView; return v.style.backgroundColor; }
+    return 0;
+}
+
+// A mappable node whose CHILDREN are laid out inside its own frame. Win32 does not parent a
+// container control's contents to it (a group box / tab body / etched panel does not own its
+// children), so they are flat siblings drawn on top - which only holds if the container is
+// sunk below them in the sibling z-order. applyTree does that; these are the kinds it sinks.
+bool _containerControl(int kind)
+{
+    return kind == ELEM_GROUPBOX || kind == ELEM_TABS || kind == ELEM_BOX;
+}
+
+// HWND_BOTTOM / HWND_TOP: the ends of the sibling z-order (cast macros the header binding
+// does not surface). BOTTOM pushes a container backdrop behind its children; TOP lifts the
+// docked status bar back above the content pane.
+void* hwndBottom() { return (void*)((i64)1); }
+void* hwndTop() { return nullptr; }
 
 // The concrete tooltip text a mappable node carries ("" = none). Every tooltip-bearing
 // class implements ITooltipped, so one downcast answers for all 15 of them.
@@ -335,13 +501,31 @@ bool accessibleNameKind(int k)
 class Window : INativeHost
 {
     void* hwnd    = nullptr;
+    // The ONE child window that carries all scrollable content (see ContentPaneProc).
+    // Scrolling moves this, not the ~60 controls inside it.
+    void* content = nullptr;
+    // The root ScrollView's vertical scrollbar. It is the NON-CLIENT bar of a child "gutter"
+    // window (see ScrollGutterProc) parked in the right column of the viewport, stopping above
+    // the status bar - which owns the resize grip. The frame's own WS_VSCROLL bar cannot: it
+    // spans the whole client height, status band included, and hangs a classic size box off it.
+    void* vscroll = nullptr;
     void* font    = nullptr;
     void* tooltip = nullptr;         // lazily-created tooltips_class32 for this window
     bool  applying = false;          // guard: swallow self-inflicted EN_CHANGE
     u32   dpi     = 96u;             // window dpi (96 = 100%); drives DIP->px
     bool  dark    = false;           // last applied theme was dark (titlebar/bg)
+    bool  themed  = false;           // the app set colors (a monochrome theme = native look)
+    // The common controls (ListView/TreeView/TabControl/ProgressBar/scrollbar) currently carry
+    // the DARK theming; ctlEverDark stays true once set. Until a dark theme is applied ONCE, a
+    // light/monochrome app is never touched by SetWindowTheme or a color message (stock look).
+    bool  ctlDark     = false;
+    bool  ctlEverDark = false;
     u32   themeText = 0u;            // COLORREF for control text (WM_CTLCOLOR*)
     u32   themeBg   = 0xFFFFFFu;     // COLORREF for control/window background
+    u32   themeField = 0xFFFFFFu;    // COLORREF for a data control's BODY (ListView/TreeView)
+    u32   themeFieldText = 0u;       // COLORREF for a data control's row text
+    u32   themeTrack = 0u;           // COLORREF for the ProgressBar trough
+    u32   themeAccent = 0u;          // COLORREF for the ProgressBar filled bar
     void* bgBrush   = nullptr;       // cached solid brush of themeBg
     list<string> liveKeys    = default;   // keys with a live control this frame
     list<u64>    liveHandles = default;   // parallel handles (HWND as u64)
@@ -376,6 +560,37 @@ class Window : INativeHost
     list<u64>    accentHandles   = default;
     list<u32>    accentBg        = default;
     list<u32>    accentFg        = default;
+    // Container backdrops: a filled View maps to a plain STATIC keyed by the container's
+    // own path. Parallel HWND -> fill COLORREF (read live by WM_CTLCOLORSTATIC), the
+    // per-frame list in tree order (z-order fix), and a brush cache keyed by color.
+    list<u64>    bdHandles       = default;
+    list<u32>    bdColors        = default;
+    list<u64>    bdFrame         = default;
+    // Container CONTROLS (GroupBox/TabControl/Box) this frame, in tree order. Win32 does not
+    // parent a container's contents to it - they are flat SIBLINGS - so the container must be
+    // sunk below them in z, exactly like a backdrop (see applyTree's z pass).
+    list<u64>    ctFrame         = default;
+    bool         zDirty          = false;   // a control was created -> re-sink backdrops + containers
+    list<u32>    bdBrushColors   = default;
+    list<u64>    bdBrushes       = default;   // parallel HBRUSH (as u64); freed in dispose
+    // Status bars: parallel HWND -> the pane text last pushed, and whether that push was
+    // owner-drawn. The text is cached because SB_GETTEXT on an SBT_OWNERDRAW part returns
+    // the part's item DATA, not its string - nativeStatusText reads this instead.
+    list<u64>    sbHandles       = default;
+    list<string> sbTexts         = default;
+    list<bool>   sbOwnerDrawn    = default;
+    // Host-owned vertical scroll offset for a root ScrollView (px). The element keeps
+    // scrollY = 0 and lays children out at content coordinates; the host carries the offset
+    // on the content pane's position, and owns the frame's scrollbar.
+    int          scrollPx        = 0;
+    int          scrollMaxPx     = 0;
+    int          scrollContentPx = 0;
+    bool         sbShown         = false;
+    bool         paneClamped     = false;   // the content overflowed PANE_MAX_H (reported once)
+    // The frame's client size in PHYSICAL px (WM_SIZE). The layout size (w/h, in DIPs) is
+    // derived from it minus the scrollbar column, so showing the bar narrows the content.
+    int          clientPxW       = 0;
+    int          clientPxH       = 0;
 
     IComponent app   = default;       // the mounted component (this window owns it)
     IElement   tree  = default;       // the committed IElement tree
@@ -388,7 +603,20 @@ class Window : INativeHost
     int dipX() { return BASE_X * (int)this.dpi / 96; }
     int dipY() { return BASE_Y * (int)this.dpi / 96; }
 
+    // The parent HWND a node of `elemKind` is created under. A status bar self-docks to the
+    // FRAME (it must never scroll, and sitting above the pane is what clips the pane out of
+    // its band); all other content lives in the content pane, which is what scrolls.
+    void* parentFor(int elemKind)
+    {
+        if (elemKind == ELEM_STATUSBAR || this.content == nullptr) return this.hwnd;
+        return this.content;
+    }
+
     // INativeHost: create a control of `elemKind` under `parentHandle`. Returns the HWND.
+    // Every control gets WS_CLIPSIBLINGS: a container control (group box, tab body) and its
+    // contents are FLAT SIBLINGS, so without it the container repaints over content that was
+    // never invalidated and erases it. Only a scroll's thin exposed band repaints, so any such
+    // overpaint is permanent damage. Clipping + the z sink in applyTree are what prevent it.
     u64 createControl(int elemKind, u64 parentHandle, string key)
     {
         void* parent = u2h(parentHandle);
@@ -437,8 +665,10 @@ class Window : INativeHost
         }
         else if (elemKind == ELEM_STATUSBAR)
         {
+            // SBARS_SIZEGRIP: the strip owns the window's resize grip, which is where the user
+            // expects it (the frame has no non-client scrollbar to hang a size box off).
             cls = "msctls_statusbar32";
-            style = (u32)(WS_CHILD | WS_VISIBLE);
+            style = (u32)(WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP);
         }
         else if (elemKind == ELEM_RADIO)
         {
@@ -459,7 +689,7 @@ class Window : INativeHost
         else if (elemKind == ELEM_TABS)
         {
             cls = "SysTabControl32";
-            style = (u32)(WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS);
+            style = (u32)(WS_CHILD | WS_VISIBLE);
         }
         else if (elemKind == ELEM_TREE)
         {
@@ -487,15 +717,27 @@ class Window : INativeHost
             // (CanvasChildProc) invokes the boxed onPaint closure on WM_PAINT.
             ensureCanvasClass();
             void* ch = CreateWindowExA(0u, "CFlatCanvasChild", "",
-                (u32)(WS_CHILD | WS_VISIBLE),
+                (u32)(WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS),
                 0, 0, 10, 10, parent, nullptr, _hInst, nullptr);
             return (u64)ch;
         }
 
-        void* h = CreateWindowExA(0u, cls.data(), "", style,
+        void* h = CreateWindowExA(0u, cls.data(), "", style | (u32)WS_CLIPSIBLINGS,
                                   0, 0, 10, 10, parent, nullptr, _hInst, nullptr);
+        // A GroupBox (BS_GROUPBOX) and a Box (SS_ETCHEDFRAME) paint their frame and nothing else,
+        // leaving the interior to a parent background that a WS_CLIPCHILDREN pane cannot supply.
+        // Subclass them so they erase their own interior (see ContainerCtlProc). A TabControl
+        // joins them in DARK mode only - its unthemed body is the same bare interior.
+        if (elemKind == ELEM_GROUPBOX || elemKind == ELEM_BOX || elemKind == ELEM_TABS)
+            _subclassContainerCtl(h);
+        // A ListView's column header notifies the LISTVIEW, so its custom draw has to be
+        // intercepted there (see ListCtlProc); a pass-through in every other theme.
+        else if (elemKind == ELEM_LIST) _subclassCtl(h, (void*)ListCtlProc);
         if (this.font != nullptr)
             SendMessageA(h, (u32)WM_SETFONT, (u64)this.font, (i64)1);
+        // Theme the fresh control NOW: applyTheme only re-themes on a real theme CHANGE, so a
+        // control created later (a tab switch, a new card) would otherwise stay stock-light.
+        this._themeControl((u64)h);
         return (u64)h;
     }
 
@@ -507,6 +749,8 @@ class Window : INativeHost
         this._freeImage(h);     // no-op unless h is an Image with an HBITMAP
         this._freeCanvasBox(h); // no-op unless h is a CanvasView with a boxed painter
         this._forgetAccent(h);
+        this._freeBackdrop(h);  // no-op unless h is a container backdrop
+        this._freeStatusBar(h); // no-op unless h is a status bar with cached pane text
         DestroyWindow(u2h(h));
     }
 
@@ -607,6 +851,231 @@ class Window : INativeHost
             i++;
         }
         return false;
+    }
+
+    // -- Container backdrops (a filled View painted behind its children) ------------
+    // A solid brush for COLORREF `col`, created on first use. The cache holds one brush
+    // per distinct backdrop color (a theme flip adds one); all are freed in dispose.
+    void* _brushFor(u32 col)
+    {
+        int i = 0;
+        while (i < this.bdBrushColors.count())
+        {
+            if (this.bdBrushColors.get(i) == col) return u2h(this.bdBrushes.get(i));
+            i++;
+        }
+        void* br = CreateSolidBrush(col);
+        this.bdBrushColors.add(col);
+        this.bdBrushes.add((u64)br);
+        return br;
+    }
+
+    // A backdrop control: a plain STATIC (no SS_NOTIFY, so it stays HTTRANSPARENT and the
+    // frame still sees clicks) whose background WM_CTLCOLORSTATIC fills with its color.
+    // WS_CLIPSIBLINGS is what keeps the fill BEHIND the card's controls: z-order alone only
+    // sets the paint order, and an unclipped backdrop repaints its whole rect over them.
+    u64 _createBackdrop()
+    {
+        void* h = CreateWindowExA(0u, "STATIC", "",
+                                  (u32)(WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS),
+                                  0, 0, 10, 10, this.parentFor(ELEM_VIEW), nullptr, _hInst, nullptr);
+        return (u64)h;
+    }
+
+    // Re-sync a backdrop's fill to the container's current color (so a theme flip
+    // re-colors it) and remember it for WM_CTLCOLORSTATIC. Called every reconcile.
+    void _syncBackdrop(u64 h, int bg)
+    {
+        u32 col = this.colorRef(bg);
+        int i = 0;
+        while (i < this.bdHandles.count())
+        {
+            if (this.bdHandles.get(i) == h)
+            {
+                if (this.bdColors.get(i) != col)
+                {
+                    this.bdColors.set(i, col);
+                    InvalidateRect(u2h(h), nullptr, 1);
+                }
+                return;
+            }
+            i++;
+        }
+        this.bdHandles.add(h);
+        this.bdColors.add(col);
+    }
+
+    void _freeBackdrop(u64 h)
+    {
+        int i = 0;
+        while (i < this.bdHandles.count())
+        {
+            if (this.bdHandles.get(i) == h)
+            {
+                this.bdHandles.removeAt(i); this.bdColors.removeAt(i);
+                return;
+            }
+            i++;
+        }
+    }
+
+    // The brush control `h` paints its background with if it is a container backdrop
+    // (nullptr otherwise); `bg` receives its COLORREF. Drives WM_CTLCOLORSTATIC.
+    void* backdropBrush(u64 h, u32* bg)
+    {
+        int i = 0;
+        while (i < this.bdHandles.count())
+        {
+            if (this.bdHandles.get(i) == h)
+            {
+                u32 col = this.bdColors.get(i);
+                bg[0] = col;
+                return this._brushFor(col);
+            }
+            i++;
+        }
+        return nullptr;
+    }
+
+    // -- Root ScrollView: the host owns the offset ----------------------------------
+    // Re-measure the root ScrollView's content against the viewport and clamp the stored
+    // offset to it. The content height is 0 when the root is not a ScrollView, so a
+    // non-scrolling window ends up with scrollPx = 0 and a viewport-tall pane.
+    void _updateScroll(IElement tree)
+    {
+        this.scrollContentPx = 0;
+        if (tree.kind() == ELEM_SCROLL)
+        {
+            IScrollView sv = tree as IScrollView;
+            if (sv != nullptr) this.scrollContentPx = sv.contentH * this.dipY();
+        }
+        int maxPx = this.scrollContentPx - this.h * this.dipY();
+        if (maxPx < 0) maxPx = 0;
+        this.scrollMaxPx = maxPx;
+        if (this.scrollPx > maxPx) this.scrollPx = maxPx;
+        if (this.scrollPx < 0) this.scrollPx = 0;
+    }
+
+    // Size + place the content pane: frame-wide, tall enough for the WHOLE content, and
+    // shifted up by the scroll offset. Every control then sits at a fixed content
+    // coordinate inside it and never moves again, so a scroll is one window move.
+    void _layoutContentPane()
+    {
+        if (this.content == nullptr) return;
+        int vw = this.w * this.dipX();
+        int vh = this.h * this.dipY();
+        int ph = this.scrollContentPx > vh ? this.scrollContentPx : vh;
+        if (ph > PANE_MAX_H)
+        {
+            // Mouse messages pack client coords as SIGNED 16-bit, so a taller pane would
+            // corrupt hit-testing inside its controls. Clamp, but say so - content past the
+            // limit is unreachable, which is a bug in the app's layout, not a silent detail.
+            if (!this.paneClamped)
+                printf("ui(win32): content is %d px tall, past the %d px content-pane limit; clamped (content below is unreachable)\n",
+                       ph, PANE_MAX_H);
+            this.paneClamped = true;
+            ph = PANE_MAX_H;
+        }
+        else this.paneClamped = false;
+        SetWindowPos(this.content, nullptr, 0, 0 - this.scrollPx, vw, ph,
+                     (u32)(SWP_NOZORDER | SWP_NOACTIVATE));
+    }
+
+    // The px column the scrollbar CONTROL occupies on the right of the viewport (0 when hidden).
+    int _scrollColPx() { return this.sbShown ? GetSystemMetrics((int)SM_CXVSCROLL) : 0; }
+
+    // The px height of the docked status bar (0 if the window has none). The scrollbar stops
+    // above it, so the strip keeps the whole bottom band - including the resize grip.
+    int _statusPx()
+    {
+        if (this.sbHandles.count() == 0) return 0;
+        RECT r = default;
+        GetWindowRect(u2h(this.sbHandles.get(0)), &r);
+        return r.bottom - r.top;
+    }
+
+    // Derive the LAYOUT size (DIPs) from the client size, minus the scrollbar column. The old
+    // non-client bar shrank the client area itself and got this for free.
+    void _syncSizeDip()
+    {
+        if (this.clientPxW <= 0 || this.clientPxH <= 0) return;
+        int nw = (this.clientPxW - this._scrollColPx()) / this.dipX();
+        int nh = this.clientPxH / this.dipY();
+        if (nw < 1) nw = 1;
+        if (nh < 1) nh = 1;
+        this.w = nw; this.h = nh;
+    }
+
+    // Park the scrollbar control in the right column of the viewport, above the status bar.
+    void _layoutVScroll()
+    {
+        if (this.vscroll == nullptr || !this.sbShown) return;
+        int col = this._scrollColPx();
+        int vh = this.clientPxH - this._statusPx();
+        if (vh < 0) vh = 0;
+        SetWindowPos(this.vscroll, nullptr, this.clientPxW - col, 0, col, vh,
+                     (u32)(SWP_NOZORDER | SWP_NOACTIVATE));
+    }
+
+    // Show (or hide) the root ScrollView's scrollbar CONTROL and size its thumb to the content.
+    // A window with no overflowing root ScrollView never shows one. Showing it takes a column
+    // out of the content width, so the tree has to be laid out again - which is exactly what the
+    // old non-client bar got from the WM_SIZE its client-area change raised.
+    void _syncScrollBar()
+    {
+        if (this.vscroll == nullptr) return;
+        bool need = this.scrollMaxPx > 0;
+        if (need != this.sbShown)
+        {
+            this.sbShown = need;
+            ShowWindow(this.vscroll, need ? (int)SW_SHOW : SW_HIDE);
+            this._syncSizeDip();
+            this._layoutVScroll();
+            // Re-lay-out at the new width. Inside a build this defers to the end of it
+            // (_building/_rebuildPending), which is where the final geometry lands.
+            int wi = findWindowIdx(this.hwnd);
+            if (wi >= 0) buildWindowTree(wi);
+            return;
+        }
+        if (!need) return;
+        this._layoutVScroll();
+        SCROLLINFO si = default;
+        si.cbSize = (u32)sizeof(SCROLLINFO);
+        si.fMask  = (u32)(SIF_RANGE | SIF_PAGE | SIF_POS);
+        si.nMin   = 0;
+        si.nMax   = this.scrollContentPx - 1;
+        si.nPage  = (u32)(this.h * this.dipY());
+        si.nPos   = this.scrollPx;
+        SetScrollInfo(this.vscroll, (int)SB_VERT, &si, 1);
+    }
+
+    // The live 32-bit thumb position (WM_VSCROLL only carries 16 bits in wParam).
+    int scrollTrackPos()
+    {
+        if (this.vscroll == nullptr) return this.scrollPx;
+        SCROLLINFO si = default;
+        si.cbSize = (u32)sizeof(SCROLLINFO);
+        si.fMask  = (u32)SIF_TRACKPOS;
+        GetScrollInfo(this.vscroll, (int)SB_VERT, &si);
+        return si.nTrackPos;
+    }
+
+    // Move the root ScrollView to offset `px` (clamped). ONE window moves - the content
+    // pane - so the OS blits the still-visible band and invalidates only the strip that
+    // came into view; the controls inside never move and never repaint. (Re-positioning
+    // all ~60 controls per notch, which is what this used to do, turned one notch into ~60
+    // async WM_PAINTs and smeared the text mid-scroll.)
+    void scrollTo(int px)
+    {
+        int p = px;
+        if (p > this.scrollMaxPx) p = this.scrollMaxPx;
+        if (p < 0) p = 0;
+        if (p == this.scrollPx) return;
+        this.scrollPx = p;
+        if (this.content != nullptr)
+            SetWindowPos(this.content, nullptr, 0, 0 - this.scrollPx, 0, 0,
+                         (u32)(SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE));
+        this._syncScrollBar();   // keep the thumb on the new offset (applyTree is not run)
     }
 
     // -- Image DIB upload (setImageData seam + HBITMAP bookkeeping) -----------------
@@ -1033,7 +1502,9 @@ class Window : INativeHost
         TTInfoA ti = default;
         ti.cbSize = (u32)sizeof(TTInfoA);
         ti.uFlags = (u32)(TTF_IDISHWND | TTF_SUBCLASS);
-        ti.hwnd = this.hwnd;
+        // For a TTF_IDISHWND tool, uId is the control and hwnd is the window CONTAINING it -
+        // the content pane for content controls, the frame for the docked status bar.
+        ti.hwnd = GetParent(u2h(hCtl));
         ti.uId = (u64)u2h(hCtl);
         ti.lpszText = (char*)text.data();
         // ADD is idempotent-ish here; UPDATE keeps an existing tool's text fresh.
@@ -1047,6 +1518,8 @@ class Window : INativeHost
     void applyTree(IElement tree, IUiContext ctx)
     {
         this.applying = true;
+        this.bdFrame.clear();
+        this.ctFrame.clear();
 
         list<string> newKeys    = default;
         list<u64>    newHandles = default;
@@ -1055,6 +1528,9 @@ class Window : INativeHost
 
         this._applyNode(tree, keySegment(tree, 0), ctx,
                         &newKeys, &newHandles, &fx, &fy, &fw, &fh);
+
+        // Re-measure the root ScrollView and clamp the offset; the content pane carries it.
+        this._updateScroll(tree);
 
         // Destroy controls whose key path is no longer in the tree.
         int i = 0;
@@ -1070,29 +1546,22 @@ class Window : INativeHost
             i++;
         }
 
-        // Batch-position all live controls in one DeferWindowPos pass (flicker
-        // defense: the OS moves them together rather than one repaint each). A frame
-        // width of -1 marks a self-docking status bar, tickled with WM_SIZE instead.
-        int n = newHandles.count();
-        if (n > 0)
+        // Grow/shrink the pane BEFORE placing the controls, so a control that moved into the
+        // freshly grown band lands inside a pane that already covers it.
+        this._layoutContentPane();
+        this._positionControls(&newHandles, &fx, &fy, &fw, &fh);
+
+        // Re-sink the layers a create disturbed. CreateWindow appends a child to the END of the
+        // sibling z-order, so within the pane creation order IS top-to-bottom z: a backdrop and
+        // a container control (both created before the content they sit behind) end up ON TOP of
+        // it. Sink them, deepest first, so each list ends up bottom-most in its own tree order:
+        // containers first, then backdrops under them. Final z, bottom -> top:
+        //   backdrops (outermost lowest) < containers (outermost lowest) < every other control.
+        if (this.zDirty)
         {
-            void* hdwp = BeginDeferWindowPos(n);
-            int j = 0;
-            while (j < n)
-            {
-                if (fw.get(j) < 0)
-                {
-                    SendMessageA(u2h(newHandles.get(j)), (u32)WM_SIZE, 0u, (i64)0);
-                }
-                else
-                {
-                    hdwp = DeferWindowPos(hdwp, u2h(newHandles.get(j)), nullptr,
-                                          fx.get(j), fy.get(j), fw.get(j), fh.get(j),
-                                          (u32)(SWP_NOZORDER | SWP_NOACTIVATE));
-                }
-                j++;
-            }
-            EndDeferWindowPos(hdwp);
+            this._sinkFrame(&this.ctFrame);
+            this._sinkFrame(&this.bdFrame);
+            this.zDirty = false;
         }
 
         // Replace the live sets with copies (clear + add, not a move-assign, which
@@ -1108,6 +1577,53 @@ class Window : INativeHost
         }
         this.applyTheme(ctx);
         this.applying = false;
+        // Last: showing/hiding the scrollbar changes the client area, so let any WM_SIZE
+        // it raises land on a fully reconciled window.
+        this._syncScrollBar();
+    }
+
+    // Sink every window in `hs` to the bottom of the sibling z-order, LAST first, so that
+    // hs[0] (the outermost node in tree order) ends up bottom-most and a nested one sits above
+    // it. Everything not in `hs` is left above the whole group.
+    void _sinkFrame(list<u64>* hs)
+    {
+        int z = hs.count() - 1;
+        while (z >= 0)
+        {
+            SetWindowPos(u2h(hs.get(z)), hwndBottom(), 0, 0, 0, 0,
+                         (u32)(SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE));
+            z--;
+        }
+    }
+
+    // Batch-position controls at their CONTENT frames in one DeferWindowPos pass (flicker
+    // defense: the OS moves them together rather than one repaint each). Frames are pure
+    // content coordinates - the scroll offset rides on the content pane, so a scroll never
+    // touches this. A frame width of -1 marks a self-docking status bar (a FRAME child, so
+    // it is never batched: DeferWindowPos requires one common parent), tickled with WM_SIZE.
+    void _positionControls(list<u64>* handles, list<int>* fx, list<int>* fy,
+                           list<int>* fw, list<int>* fh)
+    {
+        int n = handles.count();
+        if (n <= 0) return;
+        u32 flags = (u32)(SWP_NOZORDER | SWP_NOACTIVATE);
+        void* hdwp = BeginDeferWindowPos(n);
+        int j = 0;
+        while (j < n)
+        {
+            if (fw.get(j) < 0)
+            {
+                SendMessageA(u2h(handles.get(j)), (u32)WM_SIZE, 0u, (i64)0);
+            }
+            else
+            {
+                hdwp = DeferWindowPos(hdwp, u2h(handles.get(j)), nullptr,
+                                      fx.get(j), fy.get(j), fw.get(j), fh.get(j),
+                                      flags);
+            }
+            j++;
+        }
+        EndDeferWindowPos(hdwp);
     }
 
     // Recursive worker: `path` is this node's key path. Mappable nodes get a
@@ -1122,8 +1638,11 @@ class Window : INativeHost
             u64 h = ctx.nativeHandle(path);
             if (h == 0u)
             {
-                h = this.createControl(node.kind(), (u64)this.hwnd, path);
+                h = this.createControl(node.kind(), (u64)this.parentFor(node.kind()), path);
                 ctx.setNativeHandle(path, h);
+                // The new control landed at the BOTTOM of the sibling z-order, i.e. under the
+                // backdrops and containers it must paint above. Re-sink them after this pass.
+                this.zDirty = true;
                 // One-time seed of a TextArea's buffer (it is uncontrolled after;
                 // the native EDIT owns the text, further pushes are explicit).
                 if (node.kind() == ELEM_TEXTAREA)
@@ -1163,6 +1682,17 @@ class Window : INativeHost
                         SetWindowLongPtrA(u2h(h), (int)GWL_STYLE, st | (i64)WS_GROUP);
                     }
                 }
+                else if (node.kind() == ELEM_STATUSBAR)
+                {
+                    // A status bar is a FRAME child, and the common control self-docks itself
+                    // to the BOTTOM of the z-order - i.e. under the content pane, which is
+                    // content-tall and would cover it. Raise it above the pane once (this
+                    // survives the per-reconcile WM_SIZE re-dock): the pane's WS_CLIPSIBLINGS
+                    // then excludes the status band, so scrolled content never paints through
+                    // the strip. That clipping is also what the old SWP_NOCOPYBITS was for.
+                    SetWindowPos(u2h(h), hwndTop(), 0, 0, 0, 0,
+                                 (u32)(SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE));
+                }
                 else if (node.kind() == ELEM_TREE)
                 {
                     // One-time TreeView setup: box the node-source callbacks (they capture
@@ -1185,6 +1715,9 @@ class Window : INativeHost
                 }
             }
             this._syncProps(node, h);
+            // A container control is drawn UNDER its (sibling) contents; remember it in tree
+            // order so applyTree's z pass can sink it there.
+            if (_containerControl(node.kind())) this.ctFrame.add(h);
             string tip = tooltipOf(node);
             if (tip.length() > 0) this.setTooltip(h, tip);
             // Name-only: mirror the tooltip into the window text of a textless control so it
@@ -1207,6 +1740,27 @@ class Window : INativeHost
                 fx.add(b.x * this.dipX()); fy.add(b.y * this.dipY());
                 fw.add(b.w * this.dipX()); fh.add(fhpx);
             }
+        }
+        else if (_containerBg(node) != 0)
+        {
+            // A plain container with a fill gets a painted backdrop panel (keyed by the
+            // container's OWN path) behind its children; it recurses into children below
+            // like any container, and rides the same create/reuse/destroy/position pass.
+            int bg = _containerBg(node);
+            u64 h = ctx.nativeHandle(path);
+            if (h == 0u)
+            {
+                h = this._createBackdrop();
+                ctx.setNativeHandle(path, h);
+                this.zDirty = true;
+            }
+            this._syncBackdrop(h, bg);
+            this.bdFrame.add(h);
+            Rect b = node.nodeBounds();
+            keys.add("" + path);
+            handles.add(h);
+            fx.add(b.x * this.dipX()); fy.add(b.y * this.dipY());
+            fw.add(b.w * this.dipX()); fh.add(b.h * this.dipY());
         }
 
         // A TabControl walks ONLY its active pane into native controls (lazy inactive
@@ -1239,7 +1793,9 @@ class Window : INativeHost
         }
     }
 
-    // Set a status bar's part text (single pane spanning the strip).
+    // Set a status bar's part text (single pane spanning the strip). The push is skipped
+    // when neither the text nor the draw mode changed, so a per-pump reconcile does not
+    // invalidate the strip (that churn is a flicker source of its own).
     void _syncStatusBar(u64 h, IStatusBar sb)
     {
         int rightEdge = -1;   // one part filling the whole width
@@ -1252,7 +1808,330 @@ class Window : INativeHost
             joined = joined + sb.parts.get(i);
             i++;
         }
-        SendMessageA(u2h(h), (u32)SB_SETTEXTA, 0u, (i64)joined.data());
+        bool owner = this.themed;
+        int slot = this._sbSlot(h);
+        if (this.sbTexts.get(slot) == joined && this.sbOwnerDrawn.get(slot) == owner) return;
+        this.sbTexts.set(slot, "" + joined);
+        this.sbOwnerDrawn.set(slot, owner);
+        this._pushStatusText(h, joined, owner);
+    }
+
+    // Push the pane text with the current draw mode. An owner-drawn part makes the control
+    // send the PARENT a WM_DRAWITEM instead of painting the text itself (see _drawStatusItem).
+    void _pushStatusText(u64 h, string text, bool owner)
+    {
+        u64 part = owner ? (u64)((int)0 | SBT_OWNERDRAW) : 0u;
+        SendMessageA(u2h(h), (u32)SB_SETTEXTA, part, (i64)text.data());
+    }
+
+    // The cache slot for status bar `h`, appended on first sight.
+    int _sbSlot(u64 h)
+    {
+        int i = 0;
+        while (i < this.sbHandles.count())
+        {
+            if (this.sbHandles.get(i) == h) return i;
+            i++;
+        }
+        this.sbHandles.add(h);
+        this.sbTexts.add("");
+        this.sbOwnerDrawn.add(false);
+        return this.sbHandles.count() - 1;
+    }
+
+    void _freeStatusBar(u64 h)
+    {
+        int i = 0;
+        while (i < this.sbHandles.count())
+        {
+            if (this.sbHandles.get(i) == h)
+            {
+                this.sbHandles.removeAt(i); this.sbTexts.removeAt(i);
+                this.sbOwnerDrawn.removeAt(i);
+                return;
+            }
+            i++;
+        }
+    }
+
+    // The text last pushed to status bar `h` ("" if none). SB_GETTEXT cannot serve this:
+    // on an SBT_OWNERDRAW part it returns the part's item data, not the string.
+    string statusTextOf(u64 h)
+    {
+        int i = 0;
+        while (i < this.sbHandles.count())
+        {
+            if (this.sbHandles.get(i) == h) return "" + this.sbTexts.get(i);
+            i++;
+        }
+        return "";
+    }
+
+    // True if `h` is one of this window's status bars.
+    bool isStatusBar(u64 h)
+    {
+        int i = 0;
+        while (i < this.sbHandles.count())
+        {
+            if (this.sbHandles.get(i) == h) return true;
+            i++;
+        }
+        return false;
+    }
+
+    // Theme ONE status bar: a msctls_statusbar32 is a COMMON CONTROL - it paints itself and
+    // ignores WM_CTLCOLORSTATIC, so the strip is colored with SB_SETBKCOLOR (which a
+    // visual-styled control ignores, hence SetWindowTheme(sb, "", "") first) and the pane text
+    // is owner-drawn by the parent. A monochrome theme keeps the native look.
+    void _themeStatusBar(u64 h)
+    {
+        void* sbh = u2h(h);
+        int slot = this._sbSlot(h);
+        if (this.themed)
+        {
+            _ctlThemeNone(sbh);   // drop visual styles: SB_SETBKCOLOR is honored
+            SendMessageA(sbh, (u32)SB_SETBKCOLOR, 0u, (i64)(u64)this.themeBg);
+        }
+        else
+        {
+            _ctlThemeReset(sbh);
+            SendMessageA(sbh, (u32)SB_SETBKCOLOR, 0u, (i64)(u64)CLR_DEFAULT);
+        }
+        this.sbOwnerDrawn.set(slot, this.themed);
+        // A copy: a by-value string arg MOVES, which would empty the cache element.
+        string cur = "" + this.sbTexts.get(slot);
+        this._pushStatusText(h, cur, this.themed);
+        InvalidateRect(sbh, nullptr, 1);
+    }
+
+    // Re-theme every live status bar (a theme change).
+    void _applyStatusTheme()
+    {
+        int i = 0;
+        while (i < this.sbHandles.count()) { this._themeStatusBar(this.sbHandles.get(i)); i++; }
+    }
+
+    // -- Dark mode for the COMMON CONTROLS -------------------------------------------
+    // A common control paints itself: it ignores WM_CTLCOLOR*, so the window brush that darkens
+    // every STATIC/BUTTON/EDIT does nothing for it. Each class needs its own route, and each is
+    // REVERSIBLE - the light path restores the class default, so a light or monochrome theme
+    // keeps the stock native look. Dispatch is by class name (the live set carries handles only).
+    void _themeControl(u64 h)
+    {
+        char[32] cn;
+        GetClassNameA(u2h(h), cn, 32);
+        if (strcmp(cn, "msctls_statusbar32") == 0) { this._themeStatusBar(h); return; }
+        // The rest are only ever touched once the window HAS been dark: an app that never goes
+        // dark keeps the stock control, untouched by SetWindowTheme or a color message.
+        if (!this.ctlEverDark) return;
+        if (strcmp(cn, "SysListView32") == 0)       this._themeListView(h);
+        else if (strcmp(cn, "SysTreeView32") == 0)  this._themeTreeView(h);
+        else if (strcmp(cn, "SysTabControl32") == 0) this._themeTabs(h);
+        else if (strcmp(cn, "msctls_progress32") == 0) this._themeProgress(h);
+    }
+
+    // ListView: the body takes DarkMode_Explorer (dark scrollbars + hot track) plus explicit
+    // row colors; the HEADER is a separate control with its own theme (ItemsView, which the
+    // dark app mode renders dark).
+    void _themeListView(u64 h)
+    {
+        void* ctrl = u2h(h);
+        void* hdr = (void*)SendMessageA(ctrl, (u32)LVM_GETHEADER, 0u, (i64)0);
+        bool dk = this.ctlDark;
+        _allowDark(ctrl, dk);
+        if (dk) _ctlTheme(ctrl, "DarkMode_Explorer"); else _ctlThemeReset(ctrl);
+        if (hdr != nullptr)
+        {
+            _allowDark(hdr, dk);
+            if (dk) _ctlTheme(hdr, "ItemsView"); else _ctlThemeReset(hdr);
+        }
+        u32 bg = dk ? this.themeField : (u32)GetSysColor((int)COLOR_WINDOW);
+        u32 tx = dk ? this.themeFieldText : (u32)GetSysColor((int)COLOR_WINDOWTEXT);
+        SendMessageA(ctrl, (u32)LVM_SETBKCOLOR, 0u, (i64)(u64)bg);
+        SendMessageA(ctrl, (u32)LVM_SETTEXTBKCOLOR, 0u, (i64)(u64)bg);
+        SendMessageA(ctrl, (u32)LVM_SETTEXTCOLOR, 0u, (i64)(u64)tx);
+        InvalidateRect(ctrl, nullptr, 1);
+    }
+
+    // TreeView: DarkMode_Explorer gives the dark expander glyphs + scrollbars; the row/line
+    // colors are control messages. CLR_NONE restores each to the system default.
+    void _themeTreeView(u64 h)
+    {
+        void* ctrl = u2h(h);
+        bool dk = this.ctlDark;
+        _allowDark(ctrl, dk);
+        if (dk) _ctlTheme(ctrl, "DarkMode_Explorer"); else _ctlThemeReset(ctrl);
+        u32 bg = dk ? this.themeField : CLR_NONE;
+        u32 tx = dk ? this.themeFieldText : CLR_NONE;
+        u32 ln = dk ? shadeRef(this.themeField, 40) : CLR_DEFAULT;
+        SendMessageA(ctrl, (u32)TVM_SETBKCOLOR, 0u, (i64)(u64)bg);
+        SendMessageA(ctrl, (u32)TVM_SETTEXTCOLOR, 0u, (i64)(u64)tx);
+        SendMessageA(ctrl, (u32)TVM_SETLINECOLOR, 0u, (i64)(u64)ln);
+        InvalidateRect(ctrl, nullptr, 1);
+    }
+
+    // TabControl: no dark uxtheme class exists and it ignores NM_CUSTOMDRAW, so dark mode drops
+    // its visual styles, owner-draws the tab ITEMS (WM_DRAWITEM -> _drawTabItem), and lets the
+    // container subclass fill the body. Light restores the theme and the stock item draw.
+    void _themeTabs(u64 h)
+    {
+        void* ctrl = u2h(h);
+        bool dk = this.ctlDark;
+        i64 st = GetWindowLongPtrA(ctrl, (int)GWL_STYLE);
+        if (dk) st = st | (i64)TCS_OWNERDRAWFIXED;
+        else st = st & ~((i64)TCS_OWNERDRAWFIXED);
+        SetWindowLongPtrA(ctrl, (int)GWL_STYLE, st);
+        if (dk) _ctlThemeNone(ctrl); else _ctlThemeReset(ctrl);
+        SetWindowPos(ctrl, nullptr, 0, 0, 0, 0,
+                     (u32)(SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED));
+        InvalidateRect(ctrl, nullptr, 1);
+    }
+
+    // ProgressBar: a visual-styled bar IGNORES both color messages, so dark mode drops the
+    // theme first and paints the trough/bar from the theme. CLR_DEFAULT restores the default.
+    void _themeProgress(u64 h)
+    {
+        void* ctrl = u2h(h);
+        bool dk = this.ctlDark;
+        if (dk) _ctlThemeNone(ctrl); else _ctlThemeReset(ctrl);
+        SendMessageA(ctrl, (u32)PBM_SETBKCOLOR, 0u, (i64)(u64)(dk ? this.themeTrack : CLR_DEFAULT));
+        SendMessageA(ctrl, (u32)PBM_SETBARCOLOR, 0u, (i64)(u64)(dk ? this.themeAccent : CLR_DEFAULT));
+        InvalidateRect(ctrl, nullptr, 1);
+    }
+
+    // Re-theme every live control. Driven ONLY by a real theme change (see applyTheme):
+    // re-theming per pump would flicker. The scroll gutter's bar is NON-CLIENT, so it rides
+    // _applyDarkNonClient with the frame instead.
+    void _applyControlTheme()
+    {
+        int i = 0;
+        while (i < this.liveHandles.count()) { this._themeControl(this.liveHandles.get(i)); i++; }
+    }
+
+    // Paint an owner-drawn LIST HEADER. The header is a separate control that paints itself from
+    // the SYSTEM colors and carries no color message - NM_CUSTOMDRAW (which reaches us through
+    // the ListView subclass, since the header notifies its parent) is the only way in. Each item
+    // is drawn at CDDS_ITEMPREPAINT; the strip PAST the last column is only ours at
+    // CDDS_POSTPAINT, because the control fills its own background after CDDS_PREPAINT.
+    bool _drawListHeader(i64 lParam, i64* result)
+    {
+        if (!this.ctlDark) return false;
+        char* p = (char*)u2h((u64)lParam);
+        u32* stagePtr = (u32*)(p + 24);
+        u32 stage = stagePtr[0];
+        if (stage == (u32)CDDS_PREPAINT)
+        {
+            result[0] = (i64)(CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT);
+            return true;
+        }
+        if (stage != (u32)CDDS_ITEMPREPAINT && stage != (u32)CDDS_POSTPAINT) return false;
+
+        NMHDR* nh = (NMHDR*)u2h((u64)lParam);
+        void** hdcPtr = (void**)(p + 32);
+        void* hdc = hdcPtr[0];
+        i32* rcPtr = (i32*)(p + 40);
+        i64* specPtr = (i64*)(p + 56);   // dwItemSpec = the column index
+        u32 fill = shadeRef(this.themeBg, 14);
+
+        RECT rc = default;
+        rc.left = rcPtr[0]; rc.top = rcPtr[1]; rc.right = rcPtr[2]; rc.bottom = rcPtr[3];
+
+        if (stage == (u32)CDDS_POSTPAINT)
+        {
+            // rc is the whole header; fill only what the columns left behind.
+            int n = (int)SendMessageA(nh.hwndFrom, (u32)HDM_GETITEMCOUNT, 0u, (i64)0);
+            if (n > 0)
+            {
+                RECT last = default;
+                SendMessageA(nh.hwndFrom, (u32)HDM_GETITEMRECT, (u64)(i64)(n - 1), (i64)&last);
+                rc.left = last.right;
+            }
+            if (rc.right > rc.left) FillRect(hdc, &rc, this._brushFor(fill));
+            result[0] = (i64)CDRF_DODEFAULT;
+            return true;
+        }
+
+        FillRect(hdc, &rc, this._brushFor(fill));
+        RECT edge = default;   // a column separator, a shade up from the fill
+        edge.left = rc.right - 1; edge.top = rc.top; edge.right = rc.right; edge.bottom = rc.bottom;
+        FillRect(hdc, &edge, this._brushFor(shadeRef(this.themeBg, 40)));
+
+        char[128] label;
+        label[0] = (char)0;
+        HDItemA hi = default;
+        hi.mask = (u32)HDI_TEXT;
+        hi.pszText = label;
+        hi.cchTextMax = 128;
+        SendMessageA(nh.hwndFrom, (u32)HDM_GETITEMA, (u64)(i64)specPtr[0], (i64)&hi);
+        rc.left = rc.left + 6;
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, this.themeText);
+        DrawTextA(hdc, label, -1, &rc,
+                  (u32)(DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS));
+        result[0] = (i64)CDRF_SKIPDEFAULT;
+        return true;
+    }
+
+    // Paint an owner-drawn TAB ITEM: the selected tab lifts a shade off the window background,
+    // the rest sit a shade below it, and the label rides in the theme's ink. `dis` is a
+    // DRAWITEMSTRUCT (CtlType@0, itemID@8, itemState@16, hwndItem@24, hDC@32, rcItem@40).
+    bool _drawTabItem(u64 dis)
+    {
+        i64 p = (i64)dis;
+        u32* typePtr = (u32*)p;
+        if (typePtr[0] != (u32)ODT_TAB || !this.ctlDark) return false;
+        u32* idPtr = (u32*)(p + 8);
+        u32* statePtr = (u32*)(p + 16);
+        void** itemPtr = (void**)(p + 24);
+        void** hdcPtr = (void**)(p + 32);
+        i32* rcPtr = (i32*)(p + 40);
+        void* ctrl = itemPtr[0];
+        void* hdc = hdcPtr[0];
+
+        RECT rc = default;
+        rc.left = rcPtr[0]; rc.top = rcPtr[1]; rc.right = rcPtr[2]; rc.bottom = rcPtr[3];
+        bool sel = (statePtr[0] & (u32)ODS_SELECTED) != 0u;
+        FillRect(hdc, &rc, this._brushFor(shadeRef(this.themeBg, sel ? 26 : 0 - 6)));
+
+        char[128] label;
+        label[0] = (char)0;
+        TCItemA ti = default;
+        ti.mask = (u32)TCIF_TEXT;
+        ti.pszText = label;
+        ti.cchTextMax = 128;
+        SendMessageA(ctrl, (u32)TCM_GETITEMA, (u64)idPtr[0], (i64)&ti);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, this.themeText);
+        DrawTextA(hdc, label, -1, &rc,
+                  (u32)(DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX));
+        return true;
+    }
+
+    // Paint an owner-drawn status pane: fill with the theme background, then the text in
+    // the theme foreground. `dis` is a DRAWITEMSTRUCT (raw offsets: hwndItem@24, hDC@32,
+    // rcItem@40). Returns false for any other owner-drawn item (a menu), which the caller
+    // then leaves to DefWindowProc.
+    bool _drawStatusItem(u64 dis)
+    {
+        i64 p = (i64)dis;
+        void** hdcPtr = (void**)(p + 32);
+        void* hdc = hdcPtr[0];
+        i32* rcPtr = (i32*)(p + 40);
+        void** itemPtr = (void**)(p + 24);
+        u64 hItem = (u64)itemPtr[0];
+        if (!this.isStatusBar(hItem)) return false;
+
+        RECT rc = default;
+        rc.left = rcPtr[0]; rc.top = rcPtr[1]; rc.right = rcPtr[2]; rc.bottom = rcPtr[3];
+        FillRect(hdc, &rc, this._brushFor(this.themeBg));
+
+        string text = this.statusTextOf(hItem);
+        rc.left = rc.left + 2;
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, this.themeText);
+        DrawTextA(hdc, (char*)text.data(), -1, &rc,
+                  (u32)(DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX));
+        return true;
     }
 
     // Push a node's current props onto its control (one interface downcast per kind -
@@ -1432,11 +2311,17 @@ class Window : INativeHost
     // Apply the app's Theme to the window chrome: immersive dark-mode titlebar,
     // themed control/window background + text colors (used by WM_CTLCOLOR* and
     // WM_ERASEBKGND). Called every frame from applyTree; cheap and idempotent.
+    // Repainting the WHOLE frame (erase included) on every applyTree is what made a drag
+    // flicker: applyTree runs per pumped event, so a pointer-move stream erased and redrew
+    // every control ~100x/sec. The frame only needs a full invalidate when the theme
+    // actually changed - individual controls invalidate themselves when their own props
+    // change (setText/setBoolProp), and a CanvasView is invalidated by update().
     void applyTheme(IUiContext ctx)
     {
         int panel = pickColor(ctx.theme.panelBg, 0);
         int text  = pickColor(ctx.theme.textColor, 0);
         bool isDark = themeIsDark(&ctx.theme);
+        bool changed = false;
 
         if (isDark != this.dark || this.bgBrush == nullptr)
         {
@@ -1444,6 +2329,12 @@ class Window : INativeHost
             int one = isDark ? 1 : 0;
             DwmSetWindowAttribute(this.hwnd, (u32)DWMWA_USE_IMMERSIVE_DARK_MODE,
                                   (void*)&one, 4u);
+            // The DWM attribute only darkens the TITLEBAR. A NON-CLIENT scrollbar is painted
+            // from the uxtheme mode, which this sets - for the frame, and for the scroll gutter
+            // whose non-client bar is the page's scrollbar.
+            _applyDarkNonClient(this.hwnd, isDark);
+            if (this.vscroll != nullptr) _applyDarkNonClient(this.vscroll, isDark);
+            changed = true;
         }
 
         // A default (monochrome) theme leaves controls at the OS default look.
@@ -1453,10 +2344,40 @@ class Window : INativeHost
         {
             if (this.bgBrush != nullptr) DeleteObject(this.bgBrush);
             this.bgBrush = CreateSolidBrush(bg);
+            changed = true;
         }
+        if (fg != this.themeText) changed = true;
+        bool nowThemed = panel != 0;
+        if (nowThemed != this.themed) changed = true;
+        this.themed = nowThemed;
         this.themeBg = bg;
         this.themeText = fg;
-        InvalidateRect(this.hwnd, nullptr, 1);
+        // The data controls (ListView/TreeView) get their own body slot so a row does not melt
+        // into the card behind it; the ProgressBar takes the trough/accent pair.
+        int field  = pickColor(ctx.theme.inputBg, panel);
+        int fieldT = pickColor(ctx.theme.inputText, text);
+        this.themeField     = field  != 0 ? this.colorRef(field)  : bg;
+        this.themeFieldText = fieldT != 0 ? this.colorRef(fieldT) : fg;
+        this.themeTrack  = this.colorRef(pickColor(ctx.theme.track, panel));
+        this.themeAccent = this.colorRef(pickColor(ctx.theme.accent, text));
+
+        // Only on a real theme change: the common controls that ignore WM_CTLCOLOR* are
+        // re-themed here, never per pump - that churn would flicker. RDW_ALLCHILDREN is required
+        // because the frame is WS_CLIPCHILDREN: a plain InvalidateRect on the parent no longer
+        // reaches the controls, and they would keep the OLD theme's colors.
+        bool wantDark = nowThemed && isDark;
+        if (wantDark != this.ctlDark || (changed && this.ctlEverDark))
+        {
+            this.ctlDark = wantDark;
+            if (wantDark) this.ctlEverDark = true;
+            this._applyControlTheme();
+        }
+        if (changed)
+        {
+            this._applyStatusTheme();
+            RedrawWindow(this.hwnd, nullptr, nullptr,
+                         (u32)(RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN));
+        }
     }
 
     // Free this window's owned cflat + GDI state (tree, component, brush, font). The
@@ -1467,6 +2388,11 @@ class Window : INativeHost
     {
         if (this.ready) { IElement t = this.tree; deleteTree(t); this.ready = false; }
         if (this.app != nullptr) { IComponent a = this.app; this.app = nullptr; delete a; }
+        // The content pane (and the controls it parents) would cascade with the frame, but
+        // teardown may run before the frame is gone - destroy it explicitly, after `ready`
+        // is false so a control's parting notification cannot re-enter the routing.
+        if (this.content != nullptr) { DestroyWindow(this.content); this.content = nullptr; }
+        if (this.vscroll != nullptr) { DestroyWindow(this.vscroll); this.vscroll = nullptr; }
         if (this.bgBrush != nullptr) { DeleteObject(this.bgBrush); this.bgBrush = nullptr; }
         if (this.font != nullptr) { DeleteObject(this.font); this.font = nullptr; }
         // Free any ListView rowText boxes still live (DestroyWindow destroys the child
@@ -1525,6 +2451,20 @@ class Window : INativeHost
         this.accentHandles.clear();
         this.accentBg.clear();
         this.accentFg.clear();
+        // Free the cached container-backdrop brushes (host-owned GDI objects).
+        int bri = 0;
+        while (bri < this.bdBrushes.count())
+        {
+            u64 br = this.bdBrushes.get(bri);
+            if (br != 0u) DeleteObject(u2h(br));
+            bri++;
+        }
+        this.bdBrushes.clear();
+        this.bdBrushColors.clear();
+        this.bdHandles.clear();
+        this.bdColors.clear();
+        this.bdFrame.clear();
+        this.ctFrame.clear();
     }
 
     // Register (or replace) the context menu for a key path; the window takes ownership.
@@ -1558,12 +2498,64 @@ class Window : INativeHost
         return 0u;
     }
 
-    // Show a control's context menu (WM_CONTEXTMENU); returns true if one was shown. The
-    // chosen command routes through the app menu handler (routeMenu), like a menu-bar item.
+    // Show a control's context menu (WM_CONTEXTMENU); returns true if one was shown.
     bool showContextMenu(void* fromCtl, i64 screenXY)
     {
         string key = this.keyForHandle((u64)fromCtl);
         if (key.length() == 0) return false;
+        return this.showContextMenuForKey(key, screenXY);
+    }
+
+    // Show the menu registered on the element under a SCREEN point, if any. A right-click over
+    // a control that answers HTTRANSPARENT (a plain STATIC - the backdrops, Box panels and Text
+    // labels all are) never reaches that control: it falls through the pane (HTTRANSPARENT by
+    // design, so the frame keeps seeing the splitter gutter) onto the FRAME, whose WM_CONTEXTMENU
+    // then carries the FRAME's handle. Resolving by point is what makes those elements clickable.
+    bool showContextMenuAt(int screenX, int screenY, i64 screenXY)
+    {
+        if (!this.ready || this.content == nullptr) return false;
+        // The pane carries the scroll offset (it sits at y = -scrollPx), so its CLIENT space is
+        // content space - mapping through it converts the screen point without a manual bias.
+        POINT pt = default;
+        pt.x = screenX;
+        pt.y = screenY;
+        ScreenToClient(this.content, &pt);
+        string key = this._ctxScan(this.tree, keySegment(this.tree, 0), pt.x, pt.y);
+        if (key.length() == 0) return false;
+        return this.showContextMenuForKey(key, screenXY);
+    }
+
+    // The deepest (and among peers, top-most) node containing the CONTENT-space point that has
+    // a context menu registered, or "". Children are scanned last-first because a later sibling
+    // is drawn over an earlier one. Ancestor bounds do NOT prune the walk: the root ScrollView's
+    // bounds are the VIEWPORT, while its children live at content coordinates past its bottom.
+    string _ctxScan(IElement node, string path, int px, int py)
+    {
+        list<IElement>* kids = node.childList();
+        if (kids != nullptr)
+        {
+            int i = kids.count() - 1;
+            while (i >= 0)
+            {
+                IElement c = kids.get(i);
+                string cp = joinKeyPath(path, keySegment(c, i));
+                string r = this._ctxScan(c, cp, px, py);
+                if (r.length() > 0) return r;
+                i--;
+            }
+        }
+        if (this.contextMenuFor(path) == 0u) return "";
+        Rect b = node.nodeBounds();
+        int x0 = b.x * this.dipX(); int y0 = b.y * this.dipY();
+        if (px < x0 || py < y0) return "";
+        if (px >= x0 + b.w * this.dipX() || py >= y0 + b.h * this.dipY()) return "";
+        return "" + path;
+    }
+
+    // Pop the menu registered on `key` at a screen point. The chosen command routes through the
+    // app menu handler (routeMenu), like a menu-bar item.
+    bool showContextMenuForKey(string key, i64 screenXY)
+    {
         u64 mp = this.contextMenuFor(key);
         if (mp == 0u) return false;
         ContextMenu* cm = (ContextMenu*)mp;
@@ -1578,10 +2570,10 @@ class Window : INativeHost
                 AppendMenuA(pop, (u32)MF_STRING, (u64)cm.cmds.get(i), cm.labels.get(i).data());
             i++;
         }
-        int x = (int)(screenXY & (i64)0xFFFF);
-        int y = (int)((screenXY >> 16) & (i64)0xFFFF);
+        // The point is SIGNED 16-bit halves: a monitor left of / above the primary is negative.
         int cmd = (int)TrackPopupMenu(pop, (u32)(TPM_RETURNCMD | TPM_RIGHTBUTTON),
-                                      x, y, 0, this.hwnd, nullptr);
+                                      _loWordSigned(screenXY), _hiWordSigned(screenXY),
+                                      0, this.hwnd, nullptr);
         DestroyMenu(pop);
         if (cmd > 0) routeMenu(cmd);
         return true;
@@ -1646,6 +2638,7 @@ class NativeGdiCanvas : ICanvas
     void* hdc = nullptr;
     int cellW = BASE_X;
     int cellH = BASE_Y;
+    double scale = 1.0;   // POINTS -> device px (dpi/96); drawImage takes points
 
     void clear() { }
 
@@ -1686,25 +2679,234 @@ class NativeGdiCanvas : ICanvas
     }
     void popClip() { RestoreDC(this.hdc, -1); }
 
-    // Canvas image blitting is not yet wired on the Win32 native host (parity gap - see
-    // internal/issue/ui-native-canvas-input-images-win32-winui.md). Documented no-op.
-    void drawImage(u64 img, double dx, double dy, double dw, double dh) { }
+    // Blit a canvas image (an HBITMAP handle from canvasCreateImage) into a POINTS rect,
+    // scaled to device pixels. The destination edges are rounded independently (right/bottom
+    // from the point extent, not width+origin) so adjacent tiles meet with no seam.
+    void drawImage(u64 img, double dx, double dy, double dw, double dh)
+    {
+        if (img == 0u || this.hdc == nullptr) return;
+        BITMAP bm = default;
+        if (GetObjectA(u2h(img), (i32)sizeof(BITMAP), &bm) == 0) return;
+        int srcW = bm.bmWidth;
+        int srcH = bm.bmHeight;
+        if (srcW <= 0 || srcH <= 0) return;
+        int x0 = (int)(dx * this.scale);
+        int y0 = (int)(dy * this.scale);
+        int x1 = (int)((dx + dw) * this.scale);
+        int y1 = (int)((dy + dh) * this.scale);
+        if (x1 - x0 <= 0 || y1 - y0 <= 0) return;
+        void* memDC = CreateCompatibleDC(this.hdc);
+        if (memDC == nullptr) return;
+        void* oldBmp = SelectObject(memDC, u2h(img));
+        SetStretchBltMode(this.hdc, (int)COLORONCOLOR);
+        StretchBlt(this.hdc, x0, y0, x1 - x0, y1 - y0,
+                   memDC, 0, 0, srcW, srcH, (u32)SRCCOPY);
+        SelectObject(memDC, oldBmp);
+        DeleteDC(memDC);
+    }
 };
 
-// Canvas image handles + input drivers: not yet wired on the Win32 native host (parity gap
-// - see internal/issue/ui-native-canvas-input-images-win32-winui.md). canvasCreateImage
-// returns a nonzero DUMMY so library code runs; the drivers are no-ops (no OS routing yet).
+// -- Canvas image handles: DIB-backed HBITMAPs -----------------------------------
+// canvasCreateImage copies the caller's top-down BGRA32 buffer into a 32bpp DIB section
+// (so the caller may free its buffer immediately, like the Cocoa NSBitmapImageRep path)
+// and returns the HBITMAP as the handle. drawImage recovers the source extent from the
+// bitmap itself (GetObjectA), so no side registry is needed - handles stay pure GDI and
+// nothing is tracked on the cflat heap. canvasReleaseImage deletes the bitmap.
 u64 canvasCreateImage(u64 bgraPixels, int w, int h)
 {
     if (bgraPixels == 0u || w <= 0 || h <= 0) return 0u;
-    return 1u;
+    void* dc = GetDC(nullptr);
+    BmiHeader bi = default;
+    bi.biSize = 40u; bi.biWidth = w; bi.biHeight = 0 - h;   // negative = top-down
+    bi.biPlanes = 1; bi.biBitCount = 32; bi.biCompression = 0u;
+    void* bits = nullptr;
+    void* bmp = CreateDIBSection(dc, &bi, (u32)DIB_RGB_COLORS, &bits, nullptr, 0u);
+    ReleaseDC(nullptr, dc);
+    if (bmp == nullptr || bits == nullptr) return 0u;
+    memcpy(bits, u2h(bgraPixels), (i64)(w * h * 4));
+    return (u64)bmp;
 }
 
-void canvasReleaseImage(u64 img) { }
+void canvasReleaseImage(u64 img)
+{
+    if (img == 0u) return;
+    DeleteObject(u2h(img));
+}
 
-void nativeCanvasPointer(string keyPath, int phase, double x, double y) { }
-void nativeCanvasWheel(string keyPath, double x, double y, double dx, double dy) { }
-void nativeCanvasPinch(string keyPath, double x, double y, double scale) { }
+// -- Canvas input: OS routing (parity with the Cocoa host) -----------------------
+// The CanvasView's pointer/wheel/pinch handlers take POINTS relative to the canvas
+// origin. Win32 hands us device pixels in client coords, so every dispatch divides by
+// the child's dpi scale. Three things AppKit does for free need doing by hand here:
+//
+//   1. Drag capture. Cocoa keeps routing mouseDragged:/mouseUp: to the mouseDown: view
+//      even when the pointer leaves it; Win32 stops sending mouse messages the moment
+//      the cursor exits the child. SetCapture on button-down (released on button-up)
+//      reproduces it, and WM_CAPTURECHANGED synthesizes a pointer-up so an app can
+//      never be stranded mid-drag if the capture is stolen (Alt-Tab, a modal dialog).
+//   2. Wheel delivery. Cocoa sends scrollWheel: to the view UNDER THE CURSOR; Win32
+//      sends WM_MOUSEWHEEL to the FOCUSED window, which for a plain child canvas is the
+//      top-level frame. The frame's WndProc therefore hit-tests the cursor against its
+//      canvas children and routes (see _routeCanvasWheel).
+//   3. Pinch. Cocoa has magnifyWithEvent:. On Windows a precision touchpad's pinch-zoom
+//      gesture is delivered as CTRL + wheel (the platform convention), so a ctrl-wheel
+//      is dispatched to onPinch rather than onWheel.
+//
+// Handlers resolve the LIVE element per event (like routeClick), not a boxed clone: the
+// tree is stable during the event pump. A canvas with no handlers installed is a no-op.
+
+// The top-level frame above `hwnd`. A control's GetParent is the CONTENT PANE, not the
+// frame, so walk up until the window is no longer a child.
+void* _frameOf(void* hwnd)
+{
+    void* h = hwnd;
+    while (h != nullptr && (GetWindowLongPtrA(h, (int)GWL_STYLE) & (i64)WS_CHILD) != (i64)0)
+        h = GetParent(h);
+    return h;
+}
+
+// Resolve the CanvasView element for a canvas child HWND, pointing _cur at its window.
+ICanvasView _canvasViewForChild(void* hwnd)
+{
+    if (!_setCurFromFrame(_frameOf(hwnd))) return nullptr;
+    if (!curWin().ready) return nullptr;
+    string key = curWin().keyForHandle((u64)hwnd);
+    if (key.length() == 0) return nullptr;
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
+    if (e == nullptr) return nullptr;
+    return e as ICanvasView;
+}
+
+// Device px -> POINTS for a canvas child (the inverse of NativeGdiCanvas.scale).
+double _canvasPtScale(void* hwnd)
+{
+    u32 dpi = GetDpiForWindow(hwnd);
+    if (dpi < 96u) dpi = 96u;
+    return 96.0 / (double)dpi;
+}
+
+// GET_X_LPARAM / GET_Y_LPARAM: the coords are SIGNED 16-bit halves (negative while a
+// captured drag runs outside the child), so sign-extend rather than mask.
+int _loWordSigned(i64 v) { return (int)((v << 48) >> 48); }
+int _hiWordSigned(i64 v) { return (int)((v << 32) >> 48); }
+
+// Pressed-button bitmask, matching Cocoa's pressedMouseButtons (bit 0 = left, bit 1 =
+// right). MK_LBUTTON/MK_RBUTTON already occupy those bits.
+int _canvasButtons(u64 wParam)
+{
+    int b = 0;
+    if ((wParam & (u64)MK_LBUTTON) != 0u) b = b | 1;
+    if ((wParam & (u64)MK_RBUTTON) != 0u) b = b | 2;
+    return b;
+}
+
+// Last pointer position in POINTS, so a capture-lost can synthesize an up at the spot
+// the drag actually stopped.
+double _canvasLastX = 0.0;
+double _canvasLastY = 0.0;
+
+// phase: 0 = down, 1 = move, 2 = up. Returns true if the canvas consumed the event.
+bool _dispatchCanvasPointer(void* hwnd, int phase, int px, int py, int buttons)
+{
+    ICanvasView cv = _canvasViewForChild(hwnd);
+    if (cv == nullptr) return false;
+    double s = _canvasPtScale(hwnd);
+    double x = (double)px * s;
+    double y = (double)py * s;
+    _canvasLastX = x; _canvasLastY = y;
+    if (phase == 0) { if (!cv.hasPointerDown) return false; cv.onPointerDown(x, y, buttons); }
+    else if (phase == 1) { if (!cv.hasPointerMove) return false; cv.onPointerMove(x, y, buttons); }
+    else { if (!cv.hasPointerUp) return false; cv.onPointerUp(x, y, buttons); }
+    pumpNative();
+    return true;
+}
+
+// A wheel notch is WHEEL_DELTA (120); report it in LINES so the delta means the same
+// thing a Cocoa legacy-mouse scrollingDelta does. precise = false: Win32 gives no
+// trackpad/precise-delta distinction, so wheel input reads as discrete lines.
+// A ctrl-wheel is the platform's pinch-zoom gesture and goes to onPinch instead.
+bool _dispatchCanvasWheel(void* hwnd, int px, int py, double lines, bool horizontal, bool ctrl)
+{
+    ICanvasView cv = _canvasViewForChild(hwnd);
+    if (cv == nullptr) return false;
+    double s = _canvasPtScale(hwnd);
+    double x = (double)px * s;
+    double y = (double)py * s;
+    if (ctrl && !horizontal)
+    {
+        if (!cv.hasPinch) return false;
+        // Per-event zoom factor around 1.0, the shape magnifyWithEvent: reports.
+        double scale = 1.0 + lines * 0.25;
+        if (scale <= 0.0) return false;
+        cv.onPinch(x, y, scale);
+        pumpNative();
+        return true;
+    }
+    if (!cv.hasWheel) return false;
+    double dx = horizontal ? lines : 0.0;
+    double dy = horizontal ? 0.0 : lines;
+    cv.onWheel(x, y, dx, dy, false);
+    pumpNative();
+    return true;
+}
+
+// Hit-test a SCREEN point against the current window's canvas children and route a wheel
+// to the one under the cursor. This is what gives Win32 the Cocoa "wheel goes to the view
+// under the mouse" behaviour despite WM_MOUSEWHEEL being focus-directed.
+bool _routeCanvasWheel(int sx, int sy, double lines, bool horizontal, bool ctrl)
+{
+    if (!hasCurWin()) return false;
+    Window* wnd = curWin();
+    int i = 0;
+    while (i < wnd.canvasHandles.count())
+    {
+        void* ch = u2h(wnd.canvasHandles.get(i));
+        RECT rc = default;
+        GetWindowRect(ch, &rc);
+        if (sx >= rc.left && sx < rc.right && sy >= rc.top && sy < rc.bottom)
+            return _dispatchCanvasWheel(ch, sx - rc.left, sy - rc.top, lines, horizontal, ctrl);
+        i++;
+    }
+    return false;
+}
+
+// -- Canvas input drivers (the host-neutral test seam) ---------------------------
+// Synthesize a handler invocation on the CanvasView at keyPath. Like the Cocoa host's,
+// these call the element handler directly (the oracle is app state, not OS plumbing), so
+// they exercise the same closures the live WndProc routing invokes.
+ICanvasView _nativeCanvasAt(string keyPath)
+{
+    if (!hasCurWin()) return nullptr;
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
+    if (e == nullptr) return nullptr;
+    return e as ICanvasView;
+}
+
+void nativeCanvasPointer(string keyPath, int phase, double x, double y)
+{
+    ICanvasView cv = _nativeCanvasAt(keyPath);
+    if (cv == nullptr) return;
+    int buttons = phase == 2 ? 0 : 1;   // down/move = left held, up = released
+    if (phase == 0) { if (cv.hasPointerDown) cv.onPointerDown(x, y, buttons); }
+    else if (phase == 1) { if (cv.hasPointerMove) cv.onPointerMove(x, y, buttons); }
+    else { if (cv.hasPointerUp) cv.onPointerUp(x, y, buttons); }
+    pumpNative();
+}
+
+void nativeCanvasWheel(string keyPath, double x, double y, double dx, double dy)
+{
+    ICanvasView cv = _nativeCanvasAt(keyPath);
+    if (cv == nullptr || !cv.hasWheel) return;
+    cv.onWheel(x, y, dx, dy, true);
+    pumpNative();
+}
+
+void nativeCanvasPinch(string keyPath, double x, double y, double scale)
+{
+    ICanvasView cv = _nativeCanvasAt(keyPath);
+    if (cv == nullptr || !cv.hasPinch) return;
+    cv.onPinch(x, y, scale);
+    pumpNative();
+}
 
 bool _canvasClassReg = false;
 
@@ -1729,16 +2931,37 @@ void _paintCanvasChild(void* hwnd, void* hdc)
     cv.hdc = hdc;
     cv.cellW = BASE_X * (int)dpi / 96;
     cv.cellH = BASE_Y * (int)dpi / 96;
+    cv.scale = (double)dpi / 96.0;
     __uiCanvasPaint(box, cv);
 }
 
 stdcall i64 CanvasChildProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
 {
+    // Double-buffered: the painter fills the background and then blits over it, so
+    // drawing straight to the window DC flashes when repaints stream in (a drag). Compose
+    // the frame in a memory DC and BitBlt it in one go.
     if (msg == WM_PAINT)
     {
         PAINTSTRUCT ps = default;
         void* hdc = BeginPaint(hwnd, &ps);
-        _paintCanvasChild(hwnd, hdc);
+        RECT rc = default; GetClientRect(hwnd, &rc);
+        int cw = rc.right - rc.left;
+        int chh = rc.bottom - rc.top;
+        void* memDC = CreateCompatibleDC(hdc);
+        void* bmp = (cw > 0 && chh > 0) ? CreateCompatibleBitmap(hdc, cw, chh) : nullptr;
+        if (memDC != nullptr && bmp != nullptr)
+        {
+            void* oldBmp = SelectObject(memDC, bmp);
+            _paintCanvasChild(hwnd, memDC);
+            BitBlt(hdc, 0, 0, cw, chh, memDC, 0, 0, (u32)SRCCOPY);
+            SelectObject(memDC, oldBmp);
+        }
+        else
+        {
+            _paintCanvasChild(hwnd, hdc);   // out of memory: draw direct rather than not at all
+        }
+        if (bmp != nullptr) DeleteObject(bmp);
+        if (memDC != nullptr) DeleteDC(memDC);
         EndPaint(hwnd, &ps);
         return (i64)0;
     }
@@ -1748,6 +2971,56 @@ stdcall i64 CanvasChildProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
         return (i64)0;
     }
     if (msg == WM_ERASEBKGND) return (i64)1;   // WM_PAINT fills the background itself
+
+    // Pointer routing. SetCapture on button-down is what makes a drag survive the cursor
+    // leaving the child (AppKit does this implicitly); WM_LBUTTONUP arrives here even
+    // outside the child while we hold it, with lParam going negative - hence the signed
+    // coord extraction.
+    if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN)
+    {
+        SetCapture(hwnd);
+        _dispatchCanvasPointer(hwnd, 0, _loWordSigned(lParam), _hiWordSigned(lParam),
+                               _canvasButtons(wParam));
+        return (i64)0;
+    }
+    if (msg == WM_MOUSEMOVE)
+    {
+        _dispatchCanvasPointer(hwnd, 1, _loWordSigned(lParam), _hiWordSigned(lParam),
+                               _canvasButtons(wParam));
+        return (i64)0;
+    }
+    if (msg == WM_LBUTTONUP || msg == WM_RBUTTONUP)
+    {
+        if (GetCapture() == hwnd) ReleaseCapture();
+        _dispatchCanvasPointer(hwnd, 2, _loWordSigned(lParam), _hiWordSigned(lParam),
+                               _canvasButtons(wParam));
+        return (i64)0;
+    }
+    // Capture stolen mid-drag (Alt-Tab, a modal): synthesize the pointer-up the app is
+    // waiting for at the last known spot, so it cannot be stranded in a dragging state.
+    if (msg == WM_CAPTURECHANGED)
+    {
+        ICanvasView cv = _canvasViewForChild(hwnd);
+        if (cv != nullptr && cv.hasPointerUp)
+        {
+            cv.onPointerUp(_canvasLastX, _canvasLastY, 0);
+            pumpNative();
+        }
+        return (i64)0;
+    }
+    // A wheel only reaches the child directly if it holds focus; the usual path is the
+    // frame's hit-test (_routeCanvasWheel). Handled here too so both routes behave alike.
+    if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL)
+    {
+        RECT rc = default;
+        GetWindowRect(hwnd, &rc);
+        double lines = (double)_hiWordSigned((i64)wParam) / 120.0;
+        bool ctrl = (wParam & (u64)MK_CONTROL) != 0u;
+        _dispatchCanvasWheel(hwnd, _loWordSigned(lParam) - rc.left,
+                             _hiWordSigned(lParam) - rc.top, lines,
+                             msg == WM_MOUSEHWHEEL, ctrl);
+        return (i64)0;
+    }
     return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
@@ -1776,6 +3049,11 @@ void ensureCanvasClass()
 // scope exit and cannot be re-aliased), so curWin() returns a borrow via `alias`.
 list<Window*> _windows = default;
 int           _cur     = -1;   // index into _windows of the servicing window
+// Re-entrancy guard for buildCurrentTree: showing/hiding the root ScrollView's scrollbar
+// resizes the client area, and the WM_SIZE it raises lands mid-build. A nested build is
+// deferred to just after the outer one (which owns the tree it is committing).
+bool          _building       = false;
+bool          _rebuildPending = false;
 
 alias Window* curWin() { return _windows.get(_cur); }
 bool hasCurWin() { return _cur >= 0 && _cur < _windows.count(); }
@@ -1786,6 +3064,118 @@ int findWindowIdx(void* hwnd)
     int i = 0;
     while (i < _windows.count()) { if (_windows.get(i).hwnd == hwnd) return i; i++; }
     return -1;
+}
+
+// Point `_cur` at the window owning `hwnd` (mirrors the Cocoa host's _setCurFromView).
+// The canvas-child routing lives above this registry, so it reaches _cur through here.
+bool _setCurFromFrame(void* hwnd)
+{
+    int i = findWindowIdx(hwnd);
+    if (i < 0) return false;
+    _cur = i;
+    return true;
+}
+
+// -- Frame-only containers: erase your own interior --------------------------------
+// A visual-styled BS_GROUPBOX and an SS_ETCHEDFRAME STATIC both draw only their FRAME (and, for
+// the group box, its title) - they never fill their interior, on the classic assumption that the
+// parent already painted the background there. Nothing does here: the content pane is
+// WS_CLIPCHILDREN (its erase skips every child rect) and the card backdrop beneath them is
+// WS_CLIPSIBLINGS (its fill skips theirs). The interior therefore keeps whatever the scroll blit
+// left in it. Neither asks the parent for a background either - the pane sees WM_ERASEBKGND only
+// for its own exposed bands and NEVER a WM_PRINTCLIENT, so uxtheme's DrawThemeParentBackground
+// hand-off is not in play. Subclass them to erase their own interior; the stock proc then draws
+// the frame + title over a clean background, unchanged in either theme.
+//
+// The fill is the WINDOW background, which is what every other control's WM_CTLCOLOR* already
+// gets - a control inside a colored card takes the theme background, not the card's fill.
+stdcall i64 ContainerCtlProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
+{
+    // The stock proc this subclass displaced; parked per-window, so BUTTON and STATIC containers
+    // share one subclass without a class-name test on every message.
+    void* orig = (void*)GetWindowLongPtrA(hwnd, (int)GWLP_USERDATA);
+    if (msg == WM_ERASEBKGND)
+    {
+        void* brush = nullptr;
+        bool dk = false;
+        if (_setCurFromFrame(_frameOf(hwnd))) { brush = curWin().bgBrush; dk = curWin().ctlDark; }
+        // A TabControl only hands its body over in DARK mode: in light it is visual-styled and
+        // paints its own body, which this flat fill would replace.
+        char[32] cn;
+        GetClassNameA(hwnd, cn, 32);
+        bool isTab = strcmp(cn, "SysTabControl32") == 0;
+        if (brush != nullptr && (dk || !isTab))
+        {
+            RECT rc = default;
+            GetClientRect(hwnd, &rc);
+            FillRect(u2h(wParam), &rc, brush);   // clipped to the update region by the DC
+            return (i64)1;
+        }
+    }
+    if (orig == nullptr) return DefWindowProcA(hwnd, msg, wParam, lParam);
+    return CallWindowProcA(orig, hwnd, msg, wParam, lParam);
+}
+
+// Displace a control's WNDPROC with `proc`, parking the stock one in GWLP_USERDATA (which the
+// subclass calls through). The ONE subclassing mechanism in this host - see ContainerCtlProc.
+void _subclassCtl(void* h, void* proc)
+{
+    i64 prev = SetWindowLongPtrA(h, (int)GWLP_WNDPROC, (i64)proc);
+    SetWindowLongPtrA(h, (int)GWLP_USERDATA, prev);
+}
+
+void _subclassContainerCtl(void* h) { _subclassCtl(h, (void*)ContainerCtlProc); }
+
+// A ListView subclass, for ONE message: the column header is a child of the LISTVIEW, so its
+// NM_CUSTOMDRAW (the only way to color a header - it has no color message and paints from the
+// system colors) notifies the ListView, not us. Everything else falls through to the stock proc.
+stdcall i64 ListCtlProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
+{
+    void* orig = (void*)GetWindowLongPtrA(hwnd, (int)GWLP_USERDATA);
+    if (msg == WM_NOTIFY)
+    {
+        NMHDR* nh = (NMHDR*)u2h((u64)lParam);
+        void* hdr = (void*)SendMessageA(hwnd, (u32)LVM_GETHEADER, 0u, (i64)0);
+        if (nh != nullptr && nh.hwndFrom == hdr && (int)nh.code == NM_CUSTOMDRAW
+            && _setCurFromFrame(_frameOf(hwnd)))
+        {
+            i64 res = (i64)CDRF_DODEFAULT;
+            if (curWin()._drawListHeader(lParam, &res)) return res;
+        }
+    }
+    if (orig == nullptr) return DefWindowProcA(hwnd, msg, wParam, lParam);
+    return CallWindowProcA(orig, hwnd, msg, wParam, lParam);
+}
+
+// -- The scroll gutter: a window whose NON-CLIENT scrollbar is the page's scrollbar ---------
+// A "SCROLLBAR" control paints its bar in its CLIENT area, which the classic (non-visual-styled)
+// user32 never themes - it comes out as a 3D classic bar in both themes. A window's NON-CLIENT
+// scrollbar is drawn by the themed path instead (it is what made the old frame bar dark), so the
+// bar here is the non-client bar of this 0-client-width child. It exists to carry that bar: it
+// paints nothing, and hands its WM_VSCROLL to the frame tagged with its own HWND.
+bool _gutterClassReg = false;
+
+stdcall i64 ScrollGutterProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
+{
+    if (msg == WM_VSCROLL)
+        return SendMessageA(GetParent(hwnd), msg, wParam, (i64)hwnd);
+    if (msg == WM_ERASEBKGND) return (i64)1;   // the client area is 0 px wide - nothing to paint
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+void ensureScrollGutterClass()
+{
+    if (_gutterClassReg) return;
+    WNDCLASSEXA wc = default;
+    wc.cbSize        = (u32)sizeof(WNDCLASSEXA);
+    wc.style         = 0u;
+    wc.lpfnWndProc   = (void*)ScrollGutterProc;
+    wc.hInstance     = _hInst;
+    wc.hCursor       = LoadCursorA(nullptr, (char*)IDC_ARROW);
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = "CFlatScrollGutter";
+    RegisterClassExA(&wc);
+    _gutterClassReg = true;
 }
 
 // Host-neutral accessors used by app code (mirrored by the Cocoa host). activeApp()
@@ -2587,10 +3977,13 @@ void nativeTestFireMenu(int cmd)
 }
 
 // Read a status bar pane's text (used by fedit's self-test to read the status line).
+// Served from the host's cache: SB_GETTEXT on an owner-drawn (themed) part returns the
+// part's item DATA, not its string, so it cannot answer this once a theme is applied.
 string nativeStatusText(string keyPath)
 {
     u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return "";
+    if (curWin().isStatusBar(h)) return curWin().statusTextOf(h);
     char[512] buf; buf[0] = '\0';
     SendMessageA(u2h(h), (u32)SB_GETTEXTA, 0u, (i64)buf);
     return "" + buf;   // owned copy (buf is a stack buffer)
@@ -2664,12 +4057,22 @@ void showSecondaryWindow(string title, string message)
 // Controls are reused by key path, so only new/removed nodes create/destroy controls.
 void buildCurrentTree()
 {
+    // A build that re-enters (the scrollbar's WM_SIZE) would overwrite the tree the outer
+    // build is still committing - and leak it. Defer it to the end of the outer build.
+    if (_building) { _rebuildPending = true; return; }
+    _building = true;
+
     Window* wnd = curWin();
     if (wnd.ready) { IElement old = wnd.tree; deleteTree(old); wnd.ready = false; }
     wnd.tree = wnd.app.render(&wnd.ctx);
     layoutRootBounded(wnd.tree, 0, 0, wnd.w, wnd.h);
     wnd.applyTree(wnd.tree, &wnd.ctx);
     wnd.ready = true;
+
+    _building = false;
+    // The deferred rebuild picks up the client size the scrollbar left behind (wnd.w/h
+    // were already updated by the WM_SIZE handler).
+    if (_rebuildPending) { _rebuildPending = false; buildCurrentTree(); }
 }
 
 // Build the window at registry index `wi` (makes it active first).
@@ -3020,18 +4423,72 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
     {
         // A worker thread marshaled a closure here via ctx.post(); run + free it.
         __uiRunPostBox((u64)lParam);
+        // A posted closure is a UI-thread mutation like any native event handler: if it
+        // called ctx.invalidate() it expects a repaint, so pump here (handlers do the same).
+        pumpNative();
         return (i64)0;
+    }
+
+    // WM_MOUSEWHEEL is focus-directed, so a wheel over an unfocused canvas child lands
+    // here on the frame. Hit-test the cursor (lParam is in SCREEN coords for wheel
+    // messages) against this window's canvas children so the wheel reaches the canvas
+    // under the pointer, the way Cocoa's scrollWheel: already does.
+    if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL)
+    {
+        double lines = (double)_hiWordSigned((i64)wParam) / 120.0;
+        bool ctrl = (wParam & (u64)MK_CONTROL) != 0u;
+        if (_routeCanvasWheel(_loWordSigned(lParam), _hiWordSigned(lParam), lines,
+                              msg == WM_MOUSEHWHEEL, ctrl))
+            return (i64)0;
+        // Not consumed by a canvas child: scroll the page (3 rows per notch, wheel-up
+        // moves the content down, i.e. a smaller offset).
+        if (msg == WM_MOUSEWHEEL && wnd.ready && wnd.scrollMaxPx > 0)
+        {
+            wnd.scrollTo(wnd.scrollPx - (int)(lines * 3.0 * (double)wnd.dipY()));
+            return (i64)0;
+        }
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
+    }
+
+    // The root ScrollView's scrollbar CONTROL (lParam is the notifying bar's HWND; a TextArea's
+    // own WS_VSCROLL bar forwards through the pane with a different one and falls through).
+    if (msg == WM_VSCROLL && wnd.vscroll != nullptr && lParam == (i64)wnd.vscroll)
+    {
+        if (wnd.ready && wnd.scrollMaxPx > 0)
+        {
+            int code = (int)(wParam & (u64)0xFFFF);
+            int line = wnd.dipY();
+            int page = wnd.h * wnd.dipY() - line;
+            if (page < line) page = line;
+            int pos = wnd.scrollPx;
+            if (code == (int)SB_LINEUP)             pos = pos - line;
+            else if (code == (int)SB_LINEDOWN)      pos = pos + line;
+            else if (code == (int)SB_PAGEUP)        pos = pos - page;
+            else if (code == (int)SB_PAGEDOWN)      pos = pos + page;
+            else if (code == (int)SB_TOP)           pos = 0;
+            else if (code == (int)SB_BOTTOM)        pos = wnd.scrollMaxPx;
+            else if (code == (int)SB_THUMBTRACK || code == (int)SB_THUMBPOSITION)
+                                                    pos = wnd.scrollTrackPos();
+            wnd.scrollTo(pos);
+        }
+        return (i64)0;
+    }
+
+    // An owner-drawn status bar pane / tab item: the control hands its drawing to the parent,
+    // which is how a common control (it ignores WM_CTLCOLOR*) gets the theme's colors.
+    if (msg == WM_DRAWITEM && lParam != (i64)0)
+    {
+        if (wnd._drawStatusItem((u64)lParam)) return (i64)1;
+        if (wnd._drawTabItem((u64)lParam)) return (i64)1;
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
     }
 
     if (msg == WM_SIZE)
     {
-        int pw = (int)(lParam & (i64)0xFFFF);
-        int ph = (int)((lParam >> 16) & (i64)0xFFFF);
-        int nw = pw / wnd.dipX();
-        int nh = ph / wnd.dipY();
-        if (nw < 1) nw = 1;
-        if (nh < 1) nh = 1;
-        wnd.w = nw; wnd.h = nh;
+        wnd.clientPxW = (int)(lParam & (i64)0xFFFF);
+        wnd.clientPxH = (int)((lParam >> 16) & (i64)0xFFFF);
+        wnd._syncSizeDip();      // the scrollbar column is not layout width
+        wnd._layoutVScroll();
         buildCurrentTree();
         return (i64)0;
     }
@@ -3068,10 +4525,20 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
         return DefWindowProcA(hwnd, msg, wParam, lParam);
     }
 
-    // Right-click over a control with a registered context menu -> TrackPopupMenu.
+    // Right-click over a control with a registered context menu -> TrackPopupMenu. wParam is the
+    // control the click landed on - but an HTTRANSPARENT one (a STATIC: every Box, Text and
+    // backdrop) is fallen THROUGH, so wParam is then this frame and resolves to no key. Hit-test
+    // the point against the element tree in that case. lParam = -1 is the keyboard menu key
+    // (no point), which has no element to resolve and falls through to the default handling.
     if (msg == WM_CONTEXTMENU)
     {
-        if (wnd.ready && wnd.showContextMenu((void*)wParam, lParam)) return (i64)0;
+        if (wnd.ready)
+        {
+            if (wnd.showContextMenu((void*)wParam, lParam)) return (i64)0;
+            if (lParam != (i64)(-1)
+                && wnd.showContextMenuAt(_loWordSigned(lParam), _hiWordSigned(lParam), lParam))
+                return (i64)0;
+        }
         return DefWindowProcA(hwnd, msg, wParam, lParam);
     }
 
@@ -3139,6 +4606,19 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
 
     if (msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLORBTN || msg == WM_CTLCOLOREDIT)
     {
+        // A container backdrop paints its own fill; every other control takes the theme.
+        if (msg == WM_CTLCOLORSTATIC)
+        {
+            u32 bdBg = 0u;
+            void* bdBrush = wnd.backdropBrush((u64)lParam, &bdBg);
+            if (bdBrush != nullptr)
+            {
+                void* bdc = u2h(wParam);
+                SetTextColor(bdc, wnd.themeText);
+                SetBkColor(bdc, bdBg);
+                return (i64)(u64)bdBrush;
+            }
+        }
         void* brush = wnd.bgBrush;
         if (brush != nullptr)
         {
@@ -3196,6 +4676,66 @@ void destroyWindowStateAt(int idx)
     _cur = _windows.count() > 0 ? 0 : -1;
 }
 
+// -- The content pane: the one window that scrolls -------------------------------
+// Every scrollable control is a child of this pane rather than of the frame, so a scroll
+// moves ONE window: the OS blits the still-visible band and invalidates only the strip
+// that came into view. The controls never move, so they never repaint - which is what
+// killed the mid-scroll smearing (~60 controls x 1 async WM_PAINT per wheel notch).
+//
+// The pane is deliberately inert: it owns no state and paints nothing but its background.
+// Parent notifications from the controls now land here instead of on the frame, so the
+// handful the frame's WndProc handles are forwarded up verbatim.
+bool _paneClassReg = false;
+
+stdcall i64 ContentPaneProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
+{
+    // Child notifications: the frame's handlers look their Window up by the FRAME HWND, so
+    // forwarding keeps them working unchanged. WM_CTLCOLOR*'s brush return value and
+    // NM_CUSTOMDRAW's CDRF_* pass straight back through the SendMessage result.
+    if (msg == WM_COMMAND || msg == WM_NOTIFY || msg == WM_HSCROLL || msg == WM_VSCROLL
+        || msg == WM_DRAWITEM || msg == WM_MEASUREITEM || msg == WM_CONTEXTMENU
+        || msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLORBTN || msg == WM_CTLCOLOREDIT)
+    {
+        return SendMessageA(GetParent(hwnd), msg, wParam, lParam);
+    }
+    // The pane is a carrier, not a surface: a press on its bare background (a SplitView
+    // gutter, or a backdrop STATIC that already answers HTTRANSPARENT) has to reach the
+    // FRAME, which owns the splitter hit-test. HTTRANSPARENT passes it through - and the
+    // pane's own children still win the hit-test, since they are searched first.
+    if (msg == WM_NCHITTEST) return (i64)HTTRANSPARENT;
+    // Paint the band a scroll just exposed in the app background; without this it flashes
+    // the wrong color on every notch.
+    if (msg == WM_ERASEBKGND)
+    {
+        void* brush = nullptr;
+        if (_setCurFromFrame(GetParent(hwnd))) brush = curWin().bgBrush;
+        if (brush == nullptr) return DefWindowProcA(hwnd, msg, wParam, lParam);
+        RECT rc = default;
+        GetClientRect(hwnd, &rc);
+        FillRect(u2h(wParam), &rc, brush);   // clipped to the update region by the DC
+        return (i64)1;
+    }
+    // Everything else (WM_MOUSEWHEEL above all) defaults through to the frame.
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+// Register the content-pane class once. No CS_HREDRAW/CS_VREDRAW (a resize must not
+// invalidate the whole content-tall pane) and no class brush (WM_ERASEBKGND fills it).
+void ensureContentPaneClass()
+{
+    if (_paneClassReg) return;
+    WNDCLASSEXA wc = default;
+    wc.cbSize        = (u32)sizeof(WNDCLASSEXA);
+    wc.style         = 0u;
+    wc.lpfnWndProc   = (void*)ContentPaneProc;
+    wc.hInstance     = _hInst;
+    wc.hCursor       = LoadCursorA(nullptr, (char*)IDC_ARROW);
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = "CFlatContentPane";
+    RegisterClassExA(&wc);
+    _paneClassReg = true;
+}
+
 // Register the window class once.
 void ensureWindowClass()
 {
@@ -3232,14 +4772,39 @@ int createAppWindow(IComponent app, const char* title, bool show)
     _cur = _windows.count() - 1;
     Window* wnd = curWin();         // borrow the just-added window
 
+    // WS_CLIPCHILDREN keeps the frame's background erase OUT of every child control's
+    // rectangle: without it the parent paints over each child before the child repaints,
+    // which is the classic Win32 flicker (very visible while scrolling).
     void* hwnd = CreateWindowExA(
-        0u, "CFlatNativeWindow", title, (u32)WS_OVERLAPPEDWINDOW,
+        0u, "CFlatNativeWindow", title, (u32)(WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN),
         CW_USEDEFAULT, CW_USEDEFAULT, 760, 560,
         nullptr, nullptr, _hInst, nullptr);
     wnd.hwnd = hwnd;               // findWindowIdx now resolves this window's messages
     wnd.dpi = GetDpiForWindow(hwnd);
     if (wnd.dpi < 96u) wnd.dpi = 96u;
     wnd.font = createUiFontDpi(wnd.dpi);
+
+    // The content pane, created before any control so every control can be parented to it.
+    // WS_EX_CONTROLPARENT is required: without it IsDialogMessageA / GetNextDlgTabItem would
+    // not recurse into the pane and the Tab ring would find no controls at all. It starts as
+    // a stub - applyTree gives it its real geometry (_layoutContentPane). A status bar must
+    // end up ABOVE it in the frame's z-order; creation order does NOT do that (the common
+    // control self-docks to the bottom), so _applyNode raises it explicitly.
+    ensureContentPaneClass();
+    wnd.content = CreateWindowExA((u32)WS_EX_CONTROLPARENT, "CFlatContentPane", "",
+        (u32)(WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS),
+        0, 0, 10, 10, hwnd, nullptr, _hInst, nullptr);
+
+    // The scroll gutter, whose NON-CLIENT bar is the page's scrollbar (see ScrollGutterProc):
+    // it stops above the status bar, and unlike the frame's own WS_VSCROLL bar it brings no
+    // size box. Hidden until the content overflows; _syncScrollBar shows + sizes it. Raised
+    // above the content pane in z, like the status bar (a later-created sibling lands below).
+    ensureScrollGutterClass();
+    wnd.vscroll = CreateWindowExA(0u, "CFlatScrollGutter", "",
+        (u32)(WS_CHILD | WS_CLIPSIBLINGS | WS_VSCROLL),
+        0, 0, 10, 10, hwnd, nullptr, _hInst, nullptr);
+    SetWindowPos(wnd.vscroll, hwndTop(), 0, 0, 0, 0,
+                 (u32)(SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE));
 
     // Install the thread-marshaling hooks so this window's ctx.post() delivers here.
     wnd.ctx.bindPost((u64)hwnd, _win32PostEnqueue);

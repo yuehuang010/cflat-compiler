@@ -1781,6 +1781,15 @@ class Box : IBox
             gi++;
         }
 
+        // The children are inset on BOTH sides, so a style.height that does not leave room for
+        // them would push the last one through the bottom frame (nothing clips it - on a native
+        // host the child is a sibling window drawn ABOVE the frame). Grow to hold them instead.
+        if (gi > 0)
+        {
+            int needH = (cy - c.y) + inset;
+            if (needH > h) { h = needH; this.bounds.h = h; }
+        }
+
         Size sz = default; sz.w = w; sz.h = h;
         return sz;
     }
@@ -3849,6 +3858,13 @@ class GroupBox : IGroupBox
             Size cs = child.layout(cc);
             cy = cy + cs.h;
             gi++;
+        }
+        // Same as Box: a height too small for the inset children would run the last one through
+        // the bottom frame, so grow to hold them rather than overflow the border.
+        if (gi > 0)
+        {
+            int needH = (cy - c.y) + inset;
+            if (needH > h) { h = needH; this.bounds.h = h; }
         }
         Size sz = default; sz.w = w; sz.h = h;
         return sz;

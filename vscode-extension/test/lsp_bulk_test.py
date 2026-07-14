@@ -222,6 +222,11 @@ def collect_files(include_win32_demo: bool) -> list[Path]:
     # global scope with it. Standalone analysis cannot resolve those drivers; todo_test.cb is
     # swept and example.bat's --worker-uitest exercises the module. Skip it here.
     files = [f for f in files if f.name != "todo_app.cb"]
+    # map_app.cb (example/ui/09-map/) is the same split: the host-neutral MapView + MapApp
+    # component, whose host drivers (hostWidth/canvasCreateImage/...) resolve from its
+    # LAUNCHER, map.cb, which shares one global scope with it. map.cb is swept, and
+    # example.bat exercises the app. Skip the standalone component here.
+    files = [f for f in files if f.name != "map_app.cb"]
     return files
 
 

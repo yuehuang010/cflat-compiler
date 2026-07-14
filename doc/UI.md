@@ -209,8 +209,9 @@ denominator of Win32 `ListView`, macOS `NSTableView`, and WinUI `ItemsView` (see
 design block above the method in `ui_native.cb`). The `rowText` callback rides as an
 opaque `u64` (a ui.cb `ListRowBox*`, invoked via `__uiListRowText`) so no `Lambda` type
 crosses the seam - the same constraint `ctx.post` obeys. The CocoaHost (real `NSTableView`
-dataSource) and WinUI3Host (host-side box/model source the `native*` drivers query, its third
-seam validation) both implement `setListOp` fully; see the parity matrix.
+dataSource) and WinUI3Host (real `ListView` bound to a hand-written `IBindableVector` over the
+same `rowText` box, so XAML pulls only the rows it realizes) both implement `setListOp` fully;
+see the parity matrix.
 
 **Navigation chrome (v14).** Tier-2 controls, each with a ICanvas fallback and a headless
 self-test in `example/ui/05-gallery/gallery.cb`; `example/ui/08-fedit/fedit.cb` (fedit v2) is
@@ -337,7 +338,7 @@ The tab/tree ops share the ONE `setListOp` seam call rather than adding interfac
 (`LISTOP_TAB_*` = 10-12, `LISTOP_TREE_*` = 20-21). `nativeNodeBounds(keyPath)` returns a
 node's laid-out frame (layout assertions). The Cocoa host provides real
 `NSSegmentedControl`/`NSOutlineView` backends (P11); the WinUI host provides real
-`TabView`/`TreeView` controls with driver-backed strips/nodes (P12). See the parity matrix.
+`TabView` items and real `TreeView` nodes, materialized on expand (P12). See the parity matrix.
 
 Each factory news the concrete node and hands back its INTERFACE by `move` - the caller
 owns the fresh node, sets typed props through the interface, then `add()`s it to a parent:
@@ -985,8 +986,8 @@ IComponent + the 25-assert self-test); its Win32/Cocoa launcher is `example/ui/0
 (imports `ui_native/winui.cb`). All three build the SAME `gallery_app.cb` - a cflat compilation shares
 one global scope across its whole import closure, so a sibling host import supplies the drivers.
 Each helper routes through the same element-model handler the OS would fire on real input, then
-re-renders; readbacks query native control state (or, for the data controls, the host-side box/
-model source the `setListOp` seam feeds).
+re-renders; readbacks query native control state (on every host, including the data controls -
+a driver reads the control's own items/selection, so an empty control cannot answer).
 
 - **Window / app:** `startHeadlessWindow(new App(), title, w, h)` (hidden window at DIP
   size, tree built), `activeApp()` / `activeCtx()`, `hostDark()`, `hostWindowCount()`,
@@ -1040,9 +1041,8 @@ model source the `setListOp` seam feeds).
 
 Y = real native control; the notes call out deliberate differences and gaps. Cocoa is
 compile-checked (`--check --platform macos`); its runtime verification on an arm64 box is
-deferred (see the plan). "driver-backed" means the control is created but its item DISPLAY is
-answered from the host-side `setListOp` box/model the `native*` drivers query - the seam and data
-path are validated, while binding a live virtualized item source is a documented enrichment.
+deferred (see the plan). On every host the data controls carry REAL items, and the `native*`
+drivers read their answers back out of the control - an empty control cannot pass a driver assert.
 
 | IElement      | Win32                     | Cocoa (compile-checked)   | WinUI 3                              |
 |--------------|---------------------------|---------------------------|-------------------------------------|
@@ -1057,15 +1057,15 @@ path are validated, while binding a live virtualized item source is a documented
 | ProgressBar  | Y msctls_progress32       | Y NSProgressIndicator     | Y ProgressBar (IRangeBase)          |
 | Slider       | Y msctls_trackbar32       | Y NSSlider                | Y Slider (IRangeBase)               |
 | ComboBox     | Y COMBOBOX                | Y NSPopUpButton           | Y ComboBox (live items + selection) |
-| ListView     | Y virtualized OWNERDATA   | Y NSTableView dataSource  | Y ListView, driver-backed items     |
-| TabControl   | Y WC_TABCONTROL           | Y NSSegmentedControl      | Y TabView, driver-backed strip      |
-| TreeView     | Y WC_TREEVIEW             | Y NSOutlineView           | Y TreeView, driver-backed nodes     |
+| ListView     | Y virtualized OWNERDATA   | Y NSTableView dataSource  | Y ListView, virtualized ItemsSource |
+| TabControl   | Y WC_TABCONTROL           | Y NSSegmentedControl      | Y TabView + TabViewItems            |
+| TreeView     | Y WC_TREEVIEW             | Y NSOutlineView           | Y TreeView + TreeViewNodes (lazy)   |
 | SplitView    | layout container          | layout container          | layout container                    |
 | StatusBar    | Y msctls_statusbar32      | Y NSTextField strip       | Y TextBlock strip                   |
 | GroupBox     | Y BS_GROUPBOX frame       | Y titled NSBox            | header label (look difference)      |
 | Image        | Y HBITMAP DIB             | Y NSImageView             | Y WriteableBitmap (BGRA upload)     |
 | CanvasView   | Y GDI child + onPaint     | Y CfCanvasView + onPaint  | placeholder (GAP - no Win2D dep)    |
-| ContextMenu  | Y TrackPopupMenu          | Y NSMenu popup            | routed via nativeFireContextMenu    |
+| ContextMenu  | Y TrackPopupMenu          | Y NSMenu popup            | Y MenuFlyout (ContextFlyout)        |
 | tooltip prop | Y tooltips_class32        | Y setToolTip:             | (not wired; deferred)               |
 | ctx.post     | Y PostMessage(WM_APP)     | Y performSelectorOnMain   | Y DispatcherQueue.TryEnqueue        |
 | multi-window | Y (Window list)           | single-window (deferred)  | single-window (deferred)            |
@@ -1078,10 +1078,9 @@ Deliberate WinUI 3 gaps in this release, all documented and non-silent:
   owned + freed, but never invoked on WinUI.
 - **GroupBox** renders as a header label rather than a titled frame (a look difference; the title
   text is what the self-test reads).
-- **ListView / TabView / TreeView** create their real XAML control but their item DISPLAY is
-  driver-backed (host-side `setListOp` box/model). Binding a live virtualized `ItemsSource` needs a
-  WinRT bindable-collection implementation and is deferred; the seam + rowText/TreeBox callbacks are
-  fully exercised (the 100k-row virtualization oracle passes: rowText fires only for queried cells).
+- **ListView columns** collapse into ONE joined row string: a XAML ListView item is a single
+  object, so there is no column header row (the `rowText(row, col)` callback is still called
+  per column, and `nativeListCellText` reads a single cell back out of the bound source).
 - **Multi-window** is single-window (mirrors the Cocoa decision); the gallery gate needs one window.
 - **tooltip** prop is not wired to `ToolTipService` yet (no self-test covers it on WinUI).
 
