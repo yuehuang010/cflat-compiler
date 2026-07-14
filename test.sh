@@ -24,15 +24,11 @@
 # shell -- and test_core for no reason at all) and were hiding thousands of lines of
 # portable coverage. Before adding a test here, prove the whole file is Windows-bound.
 #
+# C interop is NOT on this list: test_c_interop binds the mathlib fixture, which
+# cinterop/build_mathlib.sh rebuilds from source above (the archive keeps its .lib name
+# on every platform), and test_crt binds the system CRT headers straight from the SDK.
+#
 # Remaining, genuinely Windows-only:
-#   - C interop test CONTENT that is Windows-bound: a prebuilt Windows .lib
-#     (test_c_interop/mathlib.lib), or CRT header binding that redeclares a libc
-#     symbol cflat's POSIX runtime owns (test_crt/stdlib.h posix_memalign). The
-#     C-interop MECHANISM itself works on Linux/macOS now (.c compiled to
-#     ELF/Mach-O via clang, system headers bound from /usr/include - see
-#     test_import_group, which runs). diagnostic/heap_audit.c is portable
-#     (POSIX branch via pthread/backtrace/dladdr) so test_reflect and
-#     test_collection_leaks, which import it, run here too.
 #   - Windows-only features (WinMD, the Win32/console test suites)
 #   - the FP-environment control (ftz/daz), POSIX-stubbed in thread.cb
 #   - tests that spawn Windows-only commands
@@ -77,9 +73,15 @@ fi
 
 rm -rf "$RES"; mkdir -p "$RES"
 
+# Pre-build the C-interop fixture archive so test_c_interop.cb can bind it (the
+# counterpart to test.bat's build_mathlib.bat call).
+if [ -x "$SRC/cinterop/build_mathlib.sh" ]; then
+  "$SRC/cinterop/build_mathlib.sh" >/dev/null 2>&1 \
+    || echo "WARNING: failed to build cinterop fixture lib - test_c_interop may fail"
+fi
+
 # Windows-only .cb tests - see header comment for the category of each.
 SKIP="test_helper \
-  test_c_interop test_crt \
   test_windows test_windows_cache test_winmd \
   test_fpenv"
 

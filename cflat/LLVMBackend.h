@@ -3300,6 +3300,13 @@ private:
 
         // -fPIC so the object links into the position-independent image the ELF path emits.
         std::vector<std::string> argStrs = { cc, "-c", "-fPIC", cSourcePath, "-o", objPath };
+        // Match the deployment target EmitExecutableMachO links against. Without it the host
+        // clang stamps its own (newer) minos and ld64 warns on every C-interop link.
+        if (targetMacOS_)
+        {
+            argStrs.push_back("-target");
+            argStrs.push_back("arm64-apple-macosx11.0.0");
+        }
         if (cOptLevel_ >= 2)      argStrs.push_back("-O2");
         else if (cOptLevel_ == 1) argStrs.push_back("-O1");
         if (cDebugInfo_)          argStrs.push_back("-g");
@@ -3849,16 +3856,24 @@ private:
                 { "unsigned short", "u16" }, { "unsigned short int", "u16" },
                 { "int", "int" }, { "signed", "int" }, { "signed int", "int" },
                 { "unsigned", "u32" }, { "unsigned int", "u32" },
-                // Windows is LLP64: 'long' is 32-bit, 'long long' is 64-bit.
-                { "long", "i32" }, { "long int", "i32" }, { "signed long", "i32" },
-                { "unsigned long", "u32" }, { "unsigned long int", "u32" },
                 { "long long", "i64" }, { "long long int", "i64" }, { "signed long long", "i64" },
                 { "unsigned long long", "u64" }, { "unsigned long long int", "u64" },
                 { "float", "float" }, { "double", "double" }, { "long double", "double" },
             };
+            // C `long` is the one scalar whose width is target-dependent: Windows is LLP64
+            // (32-bit long), Linux/macOS are LP64 (64-bit long). `size_t` desugars to it.
+            static const std::unordered_set<std::string> cLongSigned = {
+                "long", "long int", "signed long", "signed long int" };
+            static const std::unordered_set<std::string> cLongUnsigned = {
+                "unsigned long", "unsigned long int" };
+
             auto it = scalarMap.find(base);
             if (it != scalarMap.end())
                 mapped = it->second;
+            else if (cLongSigned.count(base) > 0)
+                mapped = targetWindows_ ? "i32" : "i64";
+            else if (cLongUnsigned.count(base) > 0)
+                mapped = targetWindows_ ? "u32" : "u64";
             else if (ptr > 0)
                 mapped = "void"; // unknown pointee (struct*, function ptr, ...) -> opaque ptr
             else if (dataStructures.find(base) != dataStructures.end())
@@ -5245,6 +5260,10 @@ private:
         for (const auto& inc : cIncludeDirs_)  cacheKey += "|I" + inc;
         for (const auto& def : cDefines_)      cacheKey += "|D" + def;
         for (const auto& def : extraDefines)   cacheKey += "|d" + def;
+        // The cached bindings were produced by THIS compiler's C type mapper, and an upgrade
+        // can change it (e.g. the LP64 `long` width). Without the compiler's identity in the
+        // key, a stale entry silently outlives the code that wrote it.
+        cacheKey += "|C" + CompilerBuildStamp();
 
         uint64_t currentHash = 0;
         bool haveHash = false;
@@ -15197,11 +15216,32 @@ public:
         return h;
     }
 
+    // Identity of the running cflat binary (mtime + size), computed once. Folded into the
+    // C-header disk-cache key so bindings do not survive a compiler that would remap them.
+    static std::string CompilerBuildStamp()
+    {
+        static const std::string stamp = []() -> std::string {
+            std::string exe = PlatformExePath();
+            if (exe.empty()) return "unknown";
+            std::error_code ec;
+            auto size = std::filesystem::file_size(exe, ec);
+            if (ec) return "unknown";
+            auto mtime = std::filesystem::last_write_time(exe, ec);
+            if (ec) return "unknown";
+            long long ticks = (long long)mtime.time_since_epoch().count();
+            unsigned long long bytes = (unsigned long long)size;
+            return std::to_string(ticks) + "-" + std::to_string(bytes);
+        }();
+        return stamp;
+    }
+
     static std::string GetCHeaderCacheDir()
     {
         std::string base = GetCflatCacheDir();
         if (base.empty()) return {};
-        return base + "\\cheaders";
+        // Forward slash: Win32 accepts it, and a backslash would otherwise become part of
+        // the directory NAME on POSIX (a literal "~/.cflat\cheaders" entry).
+        return base + "/cheaders";
     }
 
     static uint64_t CHeaderDiskCacheKey(const std::string& fileForLsp,
