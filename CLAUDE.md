@@ -107,7 +107,7 @@ wsl.exe -e bash -lc "cd /mnt/c/source/cflat-compiler && cmake --preset linux-x64
 
 ```bash
 ./cmake_build.sh release   # resolves VCPKG_ROOT + openjdk PATH, then configures/builds
-./test.sh Release          # 170 passed, 0 failed
+./test.sh Release          # 174 passed, 0 failed
 ```
 
 `cmake_build.sh` is the Mac/Linux counterpart to `cmake_build.bat` (`debug` | `release`, picks the preset from `uname`). The raw `cmake --preset macos-arm64-release` still works if `VCPKG_ROOT` and `java` are already on PATH. The macOS preset points `VCPKG_INSTALLED_DIR` at a **shared tree outside the source dir** (`~/.cflat-compiler-deps/vcpkg_installed`, override with `CFLAT_VCPKG_INSTALLED`) - see [Git worktrees](#git-worktrees) below.
@@ -220,7 +220,7 @@ See [`doc/CLI.md`](doc/CLI.md) for the full reference. Most-used flags:
 
 ## Testing
 - **Windows**: `test.bat` / `test_lsp.bat` / `example.bat` (batch scripts).
-- **Linux/WSL**: `test.sh` is the `test.bat` counterpart - it compiles+runs the platform-portable subset of `Test/*.cb` (plus the `Test/errors/*.cb` negative tests) against the native ELF cflat, in parallel with a per-test timeout, and prints a PASS/FAIL/SKIP summary. Run it from inside WSL: `bash test.sh Release` (or `Debug`, `-j N`). It maintains an explicit SKIP list of Windows-only tests (Win32 APIs called in the test body, the `program` construct, C-interop, WinMD, FP-env) - these are test-content/subsystem limits, not core-library gaps. `test.sh` deliberately does **not** run `cflat --init` (a bitcode-cache warmup; pure optimization). `.gitattributes` pins `*.sh` to LF so it stays runnable on a Windows checkout.
+- **Linux/WSL**: `test.sh` is the `test.bat` counterpart - it compiles+runs the platform-portable subset of `Test/*.cb` (plus the `Test/errors/*.cb` negative tests) against the native ELF cflat, in parallel with a per-test timeout, and prints a PASS/FAIL/SKIP summary. Run it from inside WSL: `bash test.sh Release` (or `Debug`, `-j N`). It maintains an explicit SKIP list of Windows-only tests (Windows-bound C-interop content, WinMD, the Win32/console suites, FP-env) - these are test-content/subsystem limits, not core-library gaps. Keep that list honest: `test_basic`, `test_stream`, `test_process` and `test_core` each sat on it for one incidental reason (a Win32 extern, `os.windows.*` stdio, a hardcoded `cmd` shell - and `test_core` for no reason at all), hiding thousands of lines of portable coverage. Before adding a test, prove the *whole file* is Windows-bound. `test.sh` deliberately does **not** run `cflat --init` (a bitcode-cache warmup; pure optimization). `.gitattributes` pins `*.sh` to LF so it stays runnable on a Windows checkout.
 - After any portability change, **re-verify BOTH**: `test.sh` green on WSL AND `test.bat` (Release) green on Windows.
 - Always run `test.bat` after compiler changes to verify all tests pass before declaring work complete.
 - `test.bat` runs all tests in parallel and should complete in under a minute. A test that hangs will be killed after a configurable timeout (default 120 seconds, set via `TIMEOUT_SECS` at the top of `test.bat`).

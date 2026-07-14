@@ -16,8 +16,15 @@
 #
 # SKIP list: tests that cannot pass on Linux because they exercise Windows-only
 # functionality. These are TEST-CONTENT or unrelated-subsystem limitations, not
-# core-library gaps (every portable core library compiles + runs on Linux):
-#   - Win32 APIs called directly in the test body (os.windows.*, GetCurrentProcessId)
+# core-library gaps (every portable core library compiles + runs on Linux).
+#
+# Keep this list HONEST: a test whose only Windows tie is an incidental symbol does
+# not belong here. test_basic, test_stream, test_process and test_core were each
+# skipped for one such reason (a Win32 extern, os.windows.* stdio, a hardcoded `cmd`
+# shell -- and test_core for no reason at all) and were hiding thousands of lines of
+# portable coverage. Before adding a test here, prove the whole file is Windows-bound.
+#
+# Remaining, genuinely Windows-only:
 #   - C interop test CONTENT that is Windows-bound: a prebuilt Windows .lib
 #     (test_c_interop/mathlib.lib), or CRT header binding that redeclares a libc
 #     symbol cflat's POSIX runtime owns (test_crt/stdlib.h posix_memalign). The
@@ -72,11 +79,9 @@ rm -rf "$RES"; mkdir -p "$RES"
 
 # Windows-only .cb tests - see header comment for the category of each.
 SKIP="test_helper \
-  test_basic test_stream \
   test_c_interop test_crt \
   test_windows test_windows_cache test_winmd \
-  test_fpenv \
-  test_core test_process"
+  test_fpenv"
 
 # Architecture-specific skips: test_intrinsic asserts __X86__==1 and exercises the
 # x86 RDTSCP/LFENCE/PAUSE intrinsics, so it cannot pass on arm64 (Apple Silicon).

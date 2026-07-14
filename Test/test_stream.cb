@@ -22,8 +22,10 @@ program StreamConsumer {
         char* buf = (char*)malloc(256);
         int i = 0;
         while (i < lineCount) {
-            void* stdinStream = os.windows.__acrt_iob_func(0);
-            if (os.windows.fgets(buf, 256, stdinStream) == nullptr) break;
+            // __std_iob(0)/fgets are the portable runtime shims (cruntime.cb); on Windows
+            // they resolve to __acrt_iob_func(0) and the same fgets linkage symbol.
+            void* stdinStream = __std_iob(0);
+            if (fgets(buf, 256, stdinStream) == nullptr) break;
             totalLen += strlen(buf);
             i++;
         }
@@ -207,14 +209,14 @@ program StringReceiver {
 
     int main(move list<string> args) {
         char* buf = (char*)malloc(256);
-        void* stdinStream = os.windows.__acrt_iob_func(0);
-        if (os.windows.fgets(buf, 256, stdinStream) != nullptr) {
+        void* stdinStream = __std_iob(0);
+        if (fgets(buf, 256, stdinStream) != nullptr) {
             match1 = strcmp(buf, "hello\n") == 0 ? 1 : 0;
         }
-        if (os.windows.fgets(buf, 256, stdinStream) != nullptr) {
+        if (fgets(buf, 256, stdinStream) != nullptr) {
             match2 = strcmp(buf, "world\n") == 0 ? 1 : 0;
         }
-        if (os.windows.fgets(buf, 256, stdinStream) != nullptr) {
+        if (fgets(buf, 256, stdinStream) != nullptr) {
             match3 = strcmp(buf, "CFlat!\n") == 0 ? 1 : 0;
         }
         free(buf);
@@ -276,14 +278,14 @@ program CharPtrReceiver {
 
     int main(move list<string> args) {
         char* buf = (char*)malloc(256);
-        void* stdinStream = os.windows.__acrt_iob_func(0);
-        if (os.windows.fgets(buf, 256, stdinStream) != nullptr) {
+        void* stdinStream = __std_iob(0);
+        if (fgets(buf, 256, stdinStream) != nullptr) {
             match1 = strcmp(buf, "raw_one\n") == 0 ? 1 : 0;
         }
-        if (os.windows.fgets(buf, 256, stdinStream) != nullptr) {
+        if (fgets(buf, 256, stdinStream) != nullptr) {
             match2 = strcmp(buf, "raw_two\n") == 0 ? 1 : 0;
         }
-        if (os.windows.fgets(buf, 256, stdinStream) != nullptr) {
+        if (fgets(buf, 256, stdinStream) != nullptr) {
             match3 = strcmp(buf, "raw_three\n") == 0 ? 1 : 0;
         }
         free(buf);
@@ -346,23 +348,23 @@ program MixedReceiver {
 
     int main(move list<string> args) {
         char* buf = (char*)malloc(256);
-        void* stdinStream = os.windows.__acrt_iob_func(0);
+        void* stdinStream = __std_iob(0);
 
         // 1. integer
         scanf("%d", &intVal);
 
         // 2. CFlat string
-        if (os.windows.fgets(buf, 256, stdinStream) != nullptr) {
+        if (fgets(buf, 256, stdinStream) != nullptr) {
             strMatch = strcmp(buf, "greet\n") == 0 ? 1 : 0;
         }
 
         // 3. raw char*
-        if (os.windows.fgets(buf, 256, stdinStream) != nullptr) {
+        if (fgets(buf, 256, stdinStream) != nullptr) {
             rawMatch = strcmp(buf, "rawline\n") == 0 ? 1 : 0;
         }
 
         // 4. float - "%g" formats 2.5 as "2.5"; verify the exact string content
-        if (os.windows.fgets(buf, 256, stdinStream) != nullptr) {
+        if (fgets(buf, 256, stdinStream) != nullptr) {
             floatOk = strcmp(buf, "2.5\n") == 0 ? 1 : 0;
         }
 
@@ -413,8 +415,8 @@ program Questioner {
     int main(move list<string> args) {
         printf("?\n");
         char* buf = (char*)malloc(256);
-        void* stdinStream = os.windows.__acrt_iob_func(0);
-        if (os.windows.fgets(buf, 256, stdinStream) != nullptr) {
+        void* stdinStream = __std_iob(0);
+        if (fgets(buf, 256, stdinStream) != nullptr) {
             gotAnswer = strcmp(buf, "Y\n") == 0 ? 1 : 0;
         }
         free(buf);
@@ -426,8 +428,8 @@ program Questioner {
 program Responder {
     int main(move list<string> args) {
         char* buf = (char*)malloc(256);
-        void* stdinStream = os.windows.__acrt_iob_func(0);
-        if (os.windows.fgets(buf, 256, stdinStream) != nullptr) {
+        void* stdinStream = __std_iob(0);
+        if (fgets(buf, 256, stdinStream) != nullptr) {
             if (strcmp(buf, "?\n") == 0) {
                 printf("Y\n");
             }
