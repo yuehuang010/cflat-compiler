@@ -79,6 +79,14 @@ The check was ~25 lines (`CheckRawLockCall`, next to `CheckCallSiteLocks` in
 - It must be **type-directed, not name-directed**. `acquire`/`release` are also method
   names on `semaphore` (25 sites), the page pool (16 sites), and `NumaDomain`'s static
   factory (14 sites). A name-based check produces 55 false positives.
+- **Type classification now exists**: `[Capability(ILockable)]` marks a lock type in source
+  (`internal/plan/lock-capability-interface.md`, landed). The page pool and `NumaDomain` carry
+  no capability, so they are excluded for free. **But `semaphore` does carry one** - `lock (s) { }`
+  is existing tested behavior (`Test/test_sync.cb:599`) - while a semaphore is *also* a counting
+  handoff, acquired on one thread and released on another, which is non-lexical by nature.
+  So "is a lock" and "must be taken via `lock()`" are **orthogonal**, and a capability marker
+  alone is not enough to gate the check. A second marker (e.g. `[ScopedLock]` on `mutex`/`rwlock`
+  but not `semaphore`) would be required.
 - No exemptions are needed: the `lock()` statement lowers via
   `CreateOverloadedFunctionCall` and does not go through the method-call expression path;
   `core/mutex.cb` and `core/rwlock.cb` bodies call `os.*` directly and never self-call;
@@ -87,5 +95,7 @@ The check was ~25 lines (`CheckRawLockCall`, next to `CheckCallSiteLocks` in
   every future lock type (recursive_mutex, spinlock, seqlock) needs a compiler edit, and
   a user-defined lock type silently escapes it (verified: a `struct MyLock` wrapping
   `os.mutex_lock` compiles unchecked). Make it a source-level property of the struct.
+  **DONE** - `[Capability(...)]` is that property, and the `lock()` statement no longer
+  contains a lock type name or method name. See `internal/plan/lock-capability-interface.md`.
 - Any such rule needs an escape hatch for hand-over-hand locking, or the concurrent
   B-tree cannot be written.

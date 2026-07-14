@@ -18,3 +18,29 @@ expect_error("Field 'balance' is guarded by 'mtxA'") {
         }
     }
 }
+
+// lock() on a type that declares no [Capability(...)] - the receiver is not a lock type,
+// even though it duck-types the acquire/release method names.
+struct NotALock {
+    int state = 0;
+    void acquire() { state = 1; }
+    void release() { state = 0; }
+};
+
+expect_error("is not a lock type") {
+    void testNoCapability() {
+        NotALock n;
+        lock(n) {
+            n.state = 2;
+        }
+    }
+}
+
+// A [Capability(ILockable)] type must supply the full interface shape; release() is missing.
+expect_error("does not implement 'ILockable::release'") {
+    [Capability(ILockable)]
+    struct HalfLock {
+        int held = 0;
+        void acquire() { held = 1; }
+    };
+}

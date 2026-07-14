@@ -1,6 +1,39 @@
 // Core interfaces - auto-imported before string.cb so all modules can depend
 // on these contracts without importing separately.
 
+// Declares a STATIC capability: the named interfaces are checked for shape at compile
+// time, but the type never becomes an interface fat pointer (no vtable is emitted).
+// Used for lock types - see ILockable below.
+//   [Capability(ILockable, ICvWaitable)] struct mutex { ... };
+annotation Capability { string value; };
+
+// Exclusive lock contract. A type carrying [Capability(ILockable)] can be used as the
+// target of a `lock (m) { }` statement; the compiler lowers to acquire()/release().
+interface ILockable
+{
+    // Acquire the lock exclusively, blocking until it is available.
+    void acquire();
+    // Release the exclusive lock.
+    void release();
+};
+
+// Shared (reader/writer) lock contract. acquire()/release() (inherited) are the exclusive
+// mode used by `lock (rw)` / `lock (rw.write)`; the shared pair backs `lock (rw.read)`.
+interface ISharedLockable : ILockable
+{
+    // Acquire a shared (read) lock - many readers may hold it at once.
+    void acquire_read();
+    // Release the shared (read) lock.
+    void release_read();
+};
+
+// A lock that can atomically release itself and sleep on a condition variable.
+interface ICvWaitable
+{
+    // Atomically release the lock and sleep on the condvar at cvSlot, then reacquire.
+    void sleep_cv(void* cvSlot);
+};
+
 // Contract for a type that can render itself as a string.
 interface IString
 {

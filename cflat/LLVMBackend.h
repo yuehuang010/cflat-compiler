@@ -594,7 +594,10 @@ public:
     struct AnnotationValue
     {
         std::string Name;   // e.g. "JsonName"
-        std::string Value;  // raw arg text, empty for no-arg annotations
+        std::string Value;  // FIRST arg's raw text, empty for no-arg annotations
+        // All args in source order ([Capability(ILockable, ICvWaitable)] -> two entries).
+        // Value mirrors Values[0]; single-arg consumers keep reading Value.
+        std::vector<std::string> Values;
     };
 
     struct DeclTypeAndValue : public TypeAndValue
@@ -726,6 +729,9 @@ public:
         std::vector<DeclTypeAndValue> StructFields;
         llvm::Function* Destructor = nullptr;
         std::vector<std::string> Interfaces;      // Only used by classes (structs have empty list)
+        // Statically-conformed interfaces from [Capability(...)]. The shape is checked at compile
+        // time; the type is NEVER convertible to an interface fat pointer through this list.
+        std::vector<std::string> StaticInterfaces;
         std::unordered_map<std::string, llvm::GlobalVariable*> VTables; // Only used by classes
         llvm::GlobalVariable* typeDescriptor = nullptr; // unique per-struct global for type identity
         bool IsUnion = false;
@@ -9561,6 +9567,36 @@ public:
         return it->second.Interfaces;
     }
 
+    // Record the statically-conformed interfaces declared by [Capability(...)]. Kept apart from
+    // Interfaces so the fat-pointer conversion sites never see them.
+    void RegisterStructStaticInterfaces(const std::string& structName, const std::vector<std::string>& interfaces)
+    {
+        dataStructures[structName].StaticInterfaces = interfaces;
+    }
+
+    std::vector<std::string> GetStructStaticInterfaces(const std::string& structName) const
+    {
+        auto it = dataStructures.find(structName);
+        if (it == dataStructures.end()) return {};
+        return it->second.StaticInterfaces;
+    }
+
+    // True when the type declares (or inherits, through interface parents) capability `ifaceName`.
+    // Reads both the nominal and the static list, so a class ': ILockable' and a
+    // '[Capability(ILockable)]' struct both answer yes.
+    bool TypeHasCapability(const std::string& typeName, const std::string& ifaceName) const
+    {
+        auto it = dataStructures.find(typeName);
+        if (it == dataStructures.end()) return false;
+        auto declares = [&](const std::vector<std::string>& list)
+        {
+            for (const auto& i : list)
+                if (i == ifaceName || InterfaceInheritsFrom(i, ifaceName)) return true;
+            return false;
+        };
+        return declares(it->second.StaticInterfaces) || declares(it->second.Interfaces);
+    }
+
     bool TypeImplementsInterface(const std::string& typeName, const std::string& ifaceName) const
     {
         // An interface trivially satisfies a constraint to itself (e.g. arena_channel<IMessage>
@@ -9569,8 +9605,13 @@ public:
 
         auto it = dataStructures.find(typeName);
         if (it == dataStructures.end()) return false;
-        const auto& ifaces = it->second.Interfaces;
-        return std::find(ifaces.begin(), ifaces.end(), ifaceName) != ifaces.end();
+        auto has = [&](const std::vector<std::string>& list)
+        {
+            return std::find(list.begin(), list.end(), ifaceName) != list.end();
+        };
+        // Static ([Capability]) conformance satisfies a `where T : I` constraint too; only the
+        // fat-pointer CONVERSION sites are restricted to the nominal Interfaces list.
+        return has(it->second.Interfaces) || has(it->second.StaticInterfaces);
     }
 
     void VerifyInterfaceImplementation(const std::string& structName, const std::string& interfaceName)

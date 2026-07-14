@@ -18,8 +18,11 @@
 // max_count argument is ignored off Windows.
 
 import "os.cb";
+import "interfaces.cb";
 
 // Counting semaphore (opaque OS handle owned by os.*).
+// [Capability(ILockable)]: acquire()/release() make `lock (s) { }` legal on a semaphore.
+[Capability(ILockable)]
 struct semaphore {
     void* _handle = nullptr;
 

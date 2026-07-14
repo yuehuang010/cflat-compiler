@@ -22,8 +22,10 @@
 // intervening release() will deadlock.
 
 import "os.cb";
+import "interfaces.cb";
 
 // Mutual-exclusion lock (non-recursive).
+[Capability(ILockable, ICvWaitable)]
 struct mutex {
     void* _srw = nullptr;  // opaque lock slot owned by os.* (see os.cb mutex_* ).
 

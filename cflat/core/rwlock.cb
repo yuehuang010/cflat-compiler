@@ -20,8 +20,10 @@
 // early return or a break.
 
 import "os.cb";
+import "interfaces.cb";
 
 // Reader-writer lock (shared reads, exclusive writes).
+[Capability(ISharedLockable)]
 struct rwlock {
     void* _lock = nullptr;   // opaque lock slot owned by os.* (see os.cb rwlock_* ).
 

@@ -230,13 +230,20 @@ declaration
     | annotationList? enumSpecifier ';'
     ;
 
+// Identifier is accepted so an annotation can name a type/interface directly
+// (e.g. [Capability(ILockable, ICvWaitable)]), which keeps LSP go-to-definition working.
 annotationArg
     : StringLiteral
     | Constant
+    | Identifier
+    ;
+
+annotationArgList
+    : annotationArg (',' annotationArg)*
     ;
 
 annotation
-    : '[' Identifier ('(' annotationArg ')')? ']'
+    : '[' Identifier ('(' annotationArgList ')')? ']'
     ;
 
 annotationList
@@ -772,8 +779,8 @@ functionDefinition
     ;
 
 structDefinition
-    : 'struct' alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? '{' aggregateMember* '}' ';'
-    | 'union' alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? '{' aggregateMember* '}' ';'
+    : annotationList? 'struct' alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? '{' aggregateMember* '}' ';'
+    | annotationList? 'union' alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? '{' aggregateMember* '}' ';'
     ;
 
 classDefinition

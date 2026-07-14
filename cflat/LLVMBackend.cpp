@@ -3825,6 +3825,12 @@ static llvm::json::Array SerializeAnnotations(const std::vector<ANN>& anns)
         llvm::json::Object ao;
         ao["n"] = a.Name;
         if (!a.Value.empty()) ao["v"] = a.Value;
+        if (a.Values.size() > 1)
+        {
+            llvm::json::Array vs;
+            for (auto& v : a.Values) vs.push_back(v);
+            ao["vs"] = std::move(vs);
+        }
         arr.push_back(std::move(ao));
     }
     return arr;
@@ -3840,6 +3846,12 @@ static std::vector<ANN> DeserializeAnnotations(const llvm::json::Array* arr)
             ANN a;
             if (auto v = ao->getString("n")) a.Name = v->str();
             if (auto v = ao->getString("v")) a.Value = v->str();
+            if (auto* vs = ao->getArray("vs"))
+            {
+                for (auto& ve : *vs)
+                    if (auto v = ve.getAsString()) a.Values.push_back(v->str());
+            }
+            else if (!a.Value.empty()) a.Values.push_back(a.Value);
             out.push_back(std::move(a));
         }
     return out;
@@ -4133,6 +4145,13 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
             llvm::json::Array ifaces;
             for (auto& i : sd.Interfaces) ifaces.push_back(i);
             so["interfaces"] = std::move(ifaces);
+
+            if (!sd.StaticInterfaces.empty())
+            {
+                llvm::json::Array sifaces;
+                for (auto& i : sd.StaticInterfaces) sifaces.push_back(i);
+                so["static_interfaces"] = std::move(sifaces);
+            }
 
             llvm::json::Object vtabs;
             for (auto& [iname, gv] : sd.VTables)
@@ -4444,6 +4463,10 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto* ifaces = so->getArray("interfaces"))
                 for (auto& ie : *ifaces)
                     if (auto v = ie.getAsString()) sd.Interfaces.push_back(v->str());
+
+            if (auto* sifaces = so->getArray("static_interfaces"))
+                for (auto& ie : *sifaces)
+                    if (auto v = ie.getAsString()) sd.StaticInterfaces.push_back(v->str());
 
             if (auto* vtabs = so->getObject("vtables"))
                 for (auto& kv : *vtabs)

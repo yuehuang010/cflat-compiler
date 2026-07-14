@@ -127,26 +127,67 @@ inline std::string getInterfaceMethodName(CFlatParser::InterfaceMethodContext* m
     return m->directDeclarator()->getText();
 }
 
-// The quote-stripped argument text of a single annotation (empty if it has none). A string
-// literal loses its surrounding quotes; any other token is returned verbatim.
-inline std::string AnnotationArgText(CFlatParser::AnnotationContext* ann)
+// The compiler's ENTIRE lock vocabulary: the capability interfaces it knows how to lower a
+// `lock (...)` statement against, and the acquire/release method roles within each. No lock
+// TYPE is ever named here - a type opts in with [Capability(...)] in source (see
+// core/interfaces.cb). Mode is the `.read` / `.write` suffix on the lock argument; "" and
+// "write" both mean exclusive. Renaming acquire()/release() across core is a one-row edit.
+struct CapabilitySpec
 {
-    if (!ann->annotationArg()) return {};
-    std::string raw = ann->annotationArg()->getText();
+    const char* Iface;
+    const char* Acquire;
+    const char* Release;
+    const char* Mode;
+};
+static constexpr CapabilitySpec kCapabilities[] = {
+    { "ILockable",       "acquire",      "release",      ""     },
+    { "ISharedLockable", "acquire_read", "release_read", "read" },
+};
+
+// Quote-stripped text of one annotation argument. A string literal loses its surrounding
+// quotes; any other token (Constant, Identifier) is returned verbatim.
+inline std::string AnnotationArgOne(CFlatParser::AnnotationArgContext* arg)
+{
+    std::string raw = arg->getText();
     if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"')
         return raw.substr(1, raw.size() - 2);
     return raw;
 }
 
-// Extract every [Name(arg)] as a raw (name, value) pair, WITHOUT registry validation. Used by
+// Every quote-stripped argument of an annotation, in source order (empty when it has none).
+inline std::vector<std::string> AnnotationArgTexts(CFlatParser::AnnotationContext* ann)
+{
+    std::vector<std::string> out;
+    if (!ann->annotationArgList()) return out;
+    for (auto* arg : ann->annotationArgList()->annotationArg())
+        out.push_back(AnnotationArgOne(arg));
+    return out;
+}
+
+// The FIRST argument of an annotation (empty if it has none). Single-arg annotations
+// ([uuid], [JsonName], [MaxLength]) read through this; multi-arg ones read Values.
+inline std::string AnnotationArgText(CFlatParser::AnnotationContext* ann)
+{
+    auto args = AnnotationArgTexts(ann);
+    return args.empty() ? std::string{} : args.front();
+}
+
+// Extract every [Name(arg, ...)] as a raw annotation value, WITHOUT registry validation. Used by
 // the forward scan to record type-level annotations (e.g. [uuid]) before the main pass validates.
 inline std::vector<LLVMBackend::AnnotationValue> ExtractAnnotations(CFlatParser::AnnotationListContext* annList)
 {
     std::vector<LLVMBackend::AnnotationValue> result;
     if (!annList) return result;
     for (auto* ann : annList->annotation())
-        if (ann->Identifier())
-            result.push_back({ ann->Identifier()->getText(), AnnotationArgText(ann) });
+    {
+        if (!ann->Identifier()) continue;
+        auto args = AnnotationArgTexts(ann);
+        LLVMBackend::AnnotationValue av;
+        av.Name = ann->Identifier()->getText();
+        av.Value = args.empty() ? std::string{} : args.front();
+        av.Values = std::move(args);
+        result.push_back(std::move(av));
+    }
     return result;
 }
 
@@ -1245,6 +1286,26 @@ private:
     void ScanStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& namespaceName = {})
     {
         ScanStructOrClassDefinition(ctx, namespaceName);
+        // Record struct type-level annotations now (raw, like the class scan) so [Capability]
+        // is visible before any body is walked. The main pass overwrites with the validated set.
+        std::string typeName = ctx->directDeclarator()->getText();
+        if (!namespaceName.empty()) typeName = namespaceName + "." + typeName;
+        auto anns = ExtractAnnotations(ctx->annotationList());
+        auto* compiler = Compiler(ctx);
+        compiler->SetTypeAnnotations(typeName, anns);
+
+        // Pre-register [Capability(...)] on the struct shell so a lock() lowered in a body
+        // written ABOVE the lock type still classifies it. The main pass validates the names.
+        if (ctx->genericTypeParameters() == nullptr)
+        {
+            std::vector<std::string> capIfaces;
+            for (const auto& ann : anns)
+                if (ann.Name == "Capability")
+                    for (const auto& ifaceName : ann.Values)
+                        capIfaces.push_back(ifaceName);
+            if (!capIfaces.empty())
+                compiler->RegisterStructStaticInterfaces(typeName, capIfaces);
+        }
     }
 
     void ScanClassDefinition(CFlatParser::ClassDefinitionContext* ctx, const std::string& namespaceName = {})
@@ -5210,8 +5271,6 @@ public:
                 // Determine mode: strip trailing .read/.write soft keyword.
                 std::string mode = GetLockArgMode(exprCtx);
                 std::string canonical = GetLockArgCanonical(exprCtx);
-                std::string acquireMethod = (mode == "read") ? "acquire_read" : "acquire";
-                std::string releaseMethod = (mode == "read") ? "release_read" : "release";
 
                 // Evaluate the base expression (without .read/.write suffix).
                 // For .read/.write, we need the base expression's assignmentExpression context.
@@ -5248,9 +5307,47 @@ public:
 
                 if (!mutexNV.Storage)
                 {
-                    LogErrorContext(lockStmt, std::format("lock: expression '{}' must be a mutex variable.", canonical));
+                    LogErrorContext(lockStmt, std::format("lock: expression '{}' must be a lock variable.", canonical));
                     return;
                 }
+
+                std::string mutexTypeName = mutexNV.TypeAndValue.TypeName;
+
+                // A dynamically-dispatched lock cannot be named: the lock-set analysis
+                // canonicalizes targets by name, so an interface-typed value is rejected.
+                if (compiler->interfaceTable.count(mutexTypeName))
+                {
+                    LogErrorContext(lockStmt, std::format(
+                        "lock: '{}' is an interface value of type '{}'; lock() requires a concrete lock type.",
+                        canonical, mutexTypeName));
+                    return;
+                }
+
+                // Classify the receiver against the capability table. "write" and "" are both
+                // the exclusive mode; only "read" selects the shared row.
+                std::string wantMode = (mode == "read") ? "read" : "";
+                const CapabilitySpec* spec = nullptr;
+                bool hasAnyCapability = false;
+                for (const auto& cap : kCapabilities)
+                {
+                    if (!compiler->TypeHasCapability(mutexTypeName, cap.Iface)) continue;
+                    hasAnyCapability = true;
+                    if (wantMode == cap.Mode) { spec = &cap; break; }
+                }
+                if (spec == nullptr)
+                {
+                    if (!hasAnyCapability)
+                        LogErrorContext(lockStmt, std::format(
+                            "lock: type '{}' is not a lock type (missing [Capability(ILockable)]).",
+                            mutexTypeName));
+                    else
+                        LogErrorContext(lockStmt, std::format(
+                            "lock: type '{}' does not support '{}' mode (missing [Capability(ISharedLockable)]).",
+                            mutexTypeName, mode));
+                    return;
+                }
+                std::string acquireMethod = spec->Acquire;
+                std::string releaseMethod = spec->Release;
 
                 // For a pointer lock arg (mutex*), Storage is the address of the pointer field
                 // (mutex**); releasing that would unlock the wrong address and leak the lock forever.
@@ -5263,16 +5360,11 @@ public:
                 selfArg.TypeAndValue.VariableName = "";
                 compiler->CreateOverloadedFunctionCall(acquireMethod, { selfArg });
 
-                std::string mutexTypeName = mutexNV.TypeAndValue.TypeName;
                 llvm::Function* unlockFn = FindMethodOf(releaseMethod, mutexTypeName);
                 if (!unlockFn)
                 {
-                    // Fall back to plain release (e.g., mutex has no release_read).
-                    unlockFn = FindMethodOf("release", mutexTypeName);
-                }
-                if (!unlockFn)
-                {
-                    LogErrorContext(lockStmt, std::format("lock: type '{}' has no 'release' method.", mutexTypeName));
+                    LogErrorContext(lockStmt, std::format(
+                        "lock: type '{}' has no '{}' method.", mutexTypeName, releaseMethod));
                     return;
                 }
 
@@ -5643,8 +5735,8 @@ public:
                 continue;
             }
 
-            std::string argValue;
-            bool hasArg = ann->annotationArg() != nullptr;
+            auto argValues = AnnotationArgTexts(ann);
+            bool hasArg = ann->annotationArgList() != nullptr;
             bool expectsArg = !regIt->second.empty();
 
             if (hasArg && !expectsArg)
@@ -5658,10 +5750,11 @@ public:
                 continue;
             }
 
-            if (hasArg)
-                argValue = AnnotationArgText(ann);
-
-            result.push_back({ annName, argValue });
+            LLVMBackend::AnnotationValue av;
+            av.Name = annName;
+            av.Value = argValues.empty() ? std::string{} : argValues.front();
+            av.Values = std::move(argValues);
+            result.push_back(std::move(av));
         }
         return result;
     }
@@ -13548,9 +13641,20 @@ public:
                                     typeName = substIt->second;
 
                                 // The matched annotation's value: "1" for a present no-arg marker,
-                                // the argument otherwise, or "" when absent (a null match).
+                                // the argument otherwise (multi-arg forms are comma-joined),
+                                // or "" when absent (a null match).
                                 auto annText = [](const LLVMBackend::AnnotationValue* a) -> std::string {
                                     if (!a) return {};
+                                    if (a->Values.size() > 1)
+                                    {
+                                        std::string joined;
+                                        for (const auto& v : a->Values)
+                                        {
+                                            if (!joined.empty()) joined += ",";
+                                            joined += v;
+                                        }
+                                        return joined;
+                                    }
                                     return a->Value.empty() ? "1" : a->Value;
                                 };
 
@@ -17418,6 +17522,11 @@ public:
             }
         }
 
+        // Validate type-level annotations against the registry and record them for
+        // annotationof(Type,"Ann"). [Capability(...)] is consumed once the members exist.
+        auto structAnnotations = ParseAnnotationList(ctx->annotationList());
+        compiler->SetTypeAnnotations(structName, structAnnotations);
+
         if (compiler->IsVerbose())
             std::cout << "[verbose]     parse decl list: " << structName << "\n";
 
@@ -17811,6 +17920,33 @@ public:
             {
                 global_scope = false;
                 ParseDestructorDefinition(dtor, structName);
+            }
+        }
+
+        // [Capability(I, ...)]: static conformance. The interfaces go on the STATIC list - never
+        // the nominal one - so no vtable is built and the type can never become a fat pointer.
+        // Runs after the member functions so VerifyInterfaceImplementation can see them.
+        {
+            std::vector<std::string> capIfaces;
+            for (const auto& ann : structAnnotations)
+            {
+                if (ann.Name != "Capability") continue;
+                for (const auto& ifaceName : ann.Values)
+                {
+                    if (!compiler->interfaceTable.count(ifaceName))
+                    {
+                        LogErrorContext(ctx, std::format(
+                            "[Capability] on '{}': unknown interface '{}'", structName, ifaceName));
+                        continue;
+                    }
+                    capIfaces.push_back(ifaceName);
+                }
+            }
+            if (!capIfaces.empty())
+            {
+                compiler->RegisterStructStaticInterfaces(structName, capIfaces);
+                for (const auto& ifaceName : capIfaces)
+                    compiler->VerifyInterfaceImplementation(structName, ifaceName);
             }
         }
 
