@@ -30,8 +30,6 @@
 #
 # Remaining, genuinely Windows-only:
 #   - Windows-only features (WinMD, the Win32/console test suites)
-#   - the FP-environment control (ftz/daz), POSIX-stubbed in thread.cb
-#   - tests that spawn Windows-only commands
 set -u
 
 CONFIG=Release
@@ -82,8 +80,15 @@ fi
 
 # Windows-only .cb tests - see header comment for the category of each.
 SKIP="test_helper \
-  test_windows test_windows_cache test_winmd \
-  test_fpenv"
+  test_windows test_windows_cache test_winmd"
+
+# OS-specific skip: the per-thread FP environment is implemented on Windows (_controlfp_s
+# -> MXCSR) and on macOS/arm64 (FPCR.FZ via fegetenv/fesetenv), but core/thread.cb's
+# __fp_apply is still a no-op on Linux (x86 MXCSR not ported), so flush-to-zero cannot
+# take effect there. See internal/issue/fpenv-not-ported-to-linux.md.
+case "$(uname -s)" in
+  Linux) SKIP="$SKIP test_fpenv" ;;
+esac
 
 # Architecture-specific skips: test_intrinsic asserts __X86__==1 and exercises the
 # x86 RDTSCP/LFENCE/PAUSE intrinsics, so it cannot pass on arm64 (Apple Silicon).

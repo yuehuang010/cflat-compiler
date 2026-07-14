@@ -30,6 +30,7 @@
 #include <variant>
 #include <optional>
 #include <cstdlib>
+#include <cmath>
 
 #include "platform/GeneratedParser.h"
 #include "LLVMBackend.h"
@@ -20961,24 +20962,34 @@ public:
         // Floating point handling
         if (hasF || hasD || looksFloat)
         {
-            try
-            {
-                if (hasF)
-                    return std::stof(numberPart);   // explicit 'f' suffix -> float
-                if (hasD)
-                    return std::stod(numberPart);   // explicit 'd' suffix -> double
+            // strtod/strtof, NOT stod/stof: the latter throw out_of_range whenever errno is
+            // ERANGE, and strtod sets ERANGE on a legal UNDERFLOW to a subnormal even though
+            // it returns the correctly-rounded subnormal. Caught by the old blanket handler,
+            // that silently turned a subnormal literal like 1e-320 into 0.0. Only a genuine
+            // overflow (+-inf) is an error here.
+            const char* cstr = numberPart.c_str();
+            char* end = nullptr;
 
-                // No suffix: mirror the integer rule (pick the smallest type that holds the
-                // value exactly). Use float if the literal round-trips through float without
-                // loss of precision; otherwise fall back to double. So 1.5 -> f32, but a
-                // literal like 3.141592653589793 that loses precision in float stays f64.
-                double dval = std::stod(numberPart);
-                float fval = static_cast<float>(dval);
-                if (static_cast<double>(fval) == dval)
-                    return fval;
-                return dval;
+            if (hasF)
+            {
+                float f = std::strtof(cstr, &end);   // explicit 'f' suffix -> float
+                if (end == cstr || std::isinf(f)) return 0.0;
+                return f;
             }
-            catch (...) { return 0.0; }
+
+            double dval = std::strtod(cstr, &end);
+            if (end == cstr || std::isinf(dval)) return 0.0;
+            if (hasD)
+                return dval;                         // explicit 'd' suffix -> double
+
+            // No suffix: mirror the integer rule (pick the smallest type that holds the
+            // value exactly). Use float if the literal round-trips through float without
+            // loss of precision; otherwise fall back to double. So 1.5 -> f32, but a
+            // literal like 3.141592653589793 that loses precision in float stays f64.
+            float fval = static_cast<float>(dval);
+            if (static_cast<double>(fval) == dval)
+                return fval;
+            return dval;
         }
 
         // Integer handling. Support hex/octal/decimal by using base 0.

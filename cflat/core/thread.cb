@@ -32,6 +32,20 @@ int FP_TRAP_OVERFLOW = 0x04;
 int FP_TRAP_DEFAULT  = 0x1C;      // INVALID | DIVZERO | OVERFLOW
 int FP_FLUSH_DENORMALS = 0x10000;
 
+// Darwin/arm64 equivalent of MXCSR: the FPCR is per-thread hardware state, and it is
+// the second word of the fenv_t that fegetenv/fesetenv round-trip (SDK <fenv.h>).
+// Setting FPCR.FZ (bit 24) flushes denormal inputs AND outputs to zero.
+struct __FEnvArm64 {
+    u64 fpsr = default;
+    u64 fpcr = default;
+};
+int __FPCR_FLUSH_TO_ZERO = 0x01000000;   // FPCR.FZ
+
+if const (__MACOS__) {
+    extern int fegetenv(__FEnvArm64* env);
+    extern int fesetenv(__FEnvArm64* env);
+}
+
 // Apply an FP config to the CURRENT thread. No-op when cfg == 0.
 void __fp_apply(int cfg) {
     if (cfg == 0) return;
@@ -45,8 +59,17 @@ void __fp_apply(int cfg) {
         if ((cfg & FP_FLUSH_DENORMALS) != 0) {
             _controlfp_s(&cur, (u32)_DN_FLUSH, (u32)_MCW_DN);
         }
+    } else if const (__MACOS__) {
+        // Trap bits are deliberately ignored: Apple silicon does not implement FP
+        // exception traps (the FPCR trap-enable bits are RAZ/WI), so only FTZ is real.
+        if ((cfg & FP_FLUSH_DENORMALS) != 0) {
+            __FEnvArm64 env = default;
+            fegetenv(&env);
+            env.fpcr = env.fpcr | (u64)__FPCR_FLUSH_TO_ZERO;
+            fesetenv(&env);
+        }
     }
-    // POSIX: per-thread FP env control (fenv/MXCSR) not yet ported - no-op.
+    // Linux: per-thread FP env control (x86 MXCSR via fenv) not yet ported - no-op.
 }
 
 // Enable the given trap mask on the current thread (e.g. FP_TRAP_DEFAULT).
