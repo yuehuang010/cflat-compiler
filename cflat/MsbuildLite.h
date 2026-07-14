@@ -567,6 +567,9 @@ private:
                 SkipWs();
                 if (pos >= s.size() || s[pos] != ')') { bad = true; return false; }
                 pos++;
+                // Exists('') is false in MSBuild; an undefined property expands
+                // to empty, and JoinPath(base, "") would otherwise return base.
+                if (Trim(arg).empty()) { result = false; return true; }
                 std::string abs = IsAbsolutePath(arg) ? arg : JoinPath(baseDir, arg);
                 result = PathExists(abs);
                 return true;
@@ -748,16 +751,21 @@ private:
         {
             GlobRecurse(segs, idx + 1, current, results); // zero-directory match
             if (fs::exists(current, ec) && fs::is_directory(current, ec))
-                for (const auto& entry : fs::directory_iterator(current, ec))
-                    if (entry.is_directory()) GlobRecurse(segs, idx, entry.path(), results);
+            {
+                // error_code iteration: a permission fault mid-walk must not throw.
+                fs::directory_iterator it(current, ec), end;
+                for (; !ec && it != end; it.increment(ec))
+                    if (it->is_directory(ec)) GlobRecurse(segs, idx, it->path(), results);
+            }
             return;
         }
         if (!fs::exists(current, ec) || !fs::is_directory(current, ec)) return;
         std::regex re = WildcardToRegex(seg);
-        for (const auto& entry : fs::directory_iterator(current, ec))
+        fs::directory_iterator it(current, ec), end;
+        for (; !ec && it != end; it.increment(ec))
         {
-            std::string name = entry.path().filename().string();
-            if (std::regex_match(name, re)) GlobRecurse(segs, idx + 1, entry.path(), results);
+            std::string name = it->path().filename().string();
+            if (std::regex_match(name, re)) GlobRecurse(segs, idx + 1, it->path(), results);
         }
     }
 
