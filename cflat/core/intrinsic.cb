@@ -101,3 +101,14 @@ u64 cycle_count_serialized()
         __lfence();
     return c;
 }
+
+// Acquire fence: orders every load issued before it against every load and store issued
+// after it.  Needed when a validating re-read must not be hoisted above the reads it
+// validates - an acquire LOAD only orders forward, so it cannot do this job.
+//
+// Portable: no __X86__ guard.  Lowers to `dmb ishld` on arm64 and to NO instruction on x86
+// (TSO already forbids load-load reordering) while still constraining the optimizer.
+void fence_acquire()
+{
+    __atomic_acquire_fence();
+}

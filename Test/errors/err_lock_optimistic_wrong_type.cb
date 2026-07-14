@@ -1,0 +1,27 @@
+// 'optimistic' mode requires [Capability(IOptimisticLockable)] on the receiver's type.
+// IOptimisticLockable is a CHECKING capability: it has no kCapabilities row because an
+// optimistic read lowers to nothing (a method call taking a lambda), not to an
+// acquire/release pair. A plain ILockable type has no version to validate against.
+
+import "interfaces.cb";
+import "mutex.cb";
+
+// lock(this.optimistic) on a parameter of a type that is only ILockable.
+expect_error("does not support 'optimistic' mode (missing [Capability(IOptimisticLockable)])") {
+    [Capability(ILockable)]
+    struct PlainLock {
+        int held = 0;
+        void acquire() { held = 1; }
+        void release() { held = 0; }
+        void speculate(lock(this.optimistic) Lambda<void()> body) { body(); }
+    };
+}
+
+// The lock() STATEMENT rejects the same suffix on the same grounds.
+expect_error("does not support 'optimistic' mode (missing [Capability(IOptimisticLockable)])") {
+    void testOptimisticStatementOnMutex() {
+        mutex m;
+        lock(m.optimistic) {
+        }
+    }
+}

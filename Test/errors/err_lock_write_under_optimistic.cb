@@ -1,0 +1,35 @@
+// Writing a guarded field inside an optimistic read body.
+// olock.read() takes its body as a lock(this.optimistic) parameter: an optimistic reader
+// holds NOTHING, so its body must be side-effect free - that is the invariant that makes
+// version validation mean anything. A write into the node it is speculating over could
+// land in a node that is mid-split or already retired.
+
+import "hpc/olock.cb";
+
+struct Node {
+    olock ver = default;
+    lock(ver) {
+        int count = default;
+    }
+};
+
+expect_error("cannot write it inside an optimistic read of 'n.ver'") {
+    void testWriteUnderOptimistic() {
+        Node n;
+        bool valid = n.ver.read(() => {
+            n.count = 1;
+        });
+    }
+}
+
+// Reading the guarded field inside the optimistic body is the whole point - it must compile.
+void testReadUnderOptimisticIsFine() {
+    Node n;
+    int seen = 0;
+    bool valid = n.ver.read(() => {
+        seen = n.count;
+    });
+    lock (n.ver) {
+        n.count = 3;   // exclusive: a write IS allowed
+    }
+}

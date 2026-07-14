@@ -1,0 +1,511 @@
+// perf_btree_scaling.cb - Phase 5 of internal/plan/optimistic-lock-coupling.md.
+//
+// This is a FALSIFICATION EXPERIMENT, not a victory lap. The whole case for building OLC
+// (core/hpc/btree.cb, core/hpc/olock.cb) instead of just using an rwlock is a SCALING claim:
+//
+//   rwlock.acquire_read() is a STORE to a shared cache line. Every reader, on every core,
+//   writes the latch word. That line ping-pongs across the interconnect and read throughput
+//   collapses even at zero logical contention. OLC's read path issues zero stores, so a hot
+//   node's line stays Shared in every core's L1.
+//
+// If that effect does not show up here, the honest conclusion is that the tree should have
+// used rwlocks and Phases 2/4 were wasted. This file measures; it does not assume the answer.
+//
+// Design: ONE benchmark-local B+tree node type (fanout 16, i64 keys/values - NOT the generic
+// core/hpc/btree.cb, and core/hpc/btree.cb is not modified). The node carries BOTH an `olock
+// ver` and an `rwlock latch` - bloat is fine, this is a benchmark, not a shipped type. The tree
+// is built ONCE, single-threaded, then probed read-only by three descent modes that differ
+// ONLY in synchronization:
+//
+//   1. global-rwlock    - one rwlock over the whole tree; acquire_read()/release_read() once
+//                          around the entire descent. The floor.
+//   2. rwlock-coupling   - per-node rwlock read latches, hand-over-hand: latch the child, then
+//                          release the parent. The textbook answer; the real competitor.
+//   3. olc               - per-node olock optimistic version coupling, exactly as
+//                          core/hpc/btree.cb's _descendOptimistic: read_begin() the child,
+//                          THEN read_validate() the parent, restart the whole descent on any
+//                          failed validation. What we shipped.
+//
+// Zero writers, deliberately: with no writers, mode 2 has zero logical contention - every
+// reader can hold a read latch simultaneously and none ever blocks. Any slowdown in mode 2 is
+// therefore pure cache-coherence cost. If rwlock-coupling does not degrade under this, the
+// thesis is false on this hardware.
+//
+// Hardware note (Apple M5 Pro, 18 logical cores, 6 performance + 12 efficiency, heterogeneous):
+// threads scheduled onto E-cores run 2-3x slower for reasons that have NOTHING to do with
+// locking, so a raw thread-count throughput curve is not itself evidence about locking. The
+// HEADLINE METRIC is therefore the olc/coupling RATIO at each thread count: both modes pay the
+// identical heterogeneity penalty (same threads, same OS scheduler, same run), so the ratio
+// isolates the synchronization cost. Printed explicitly, per cell.
+//
+// Methodology:
+//   - Dead-code elimination is defeated by accumulating every looked-up value into a
+//     per-thread checksum, summing across threads, and asserting the total against an
+//     independently-computed expected value (same LCG stream, no tree involved).
+//   - One full untimed warmup pass before the timed trials (also touches every OS rwlock
+//     handle at least once, so lazy pthread_rwlock allocation doesn't skew trial 1).
+//   - Identical access pattern across modes: a deterministic LCG seeded per-thread-index,
+//     the SAME seed regardless of mode, so all three modes execute the exact same lookups.
+//   - Every probed key is in [1, N] and the tree holds exactly 1..N, so every lookup HITS.
+//   - Each (mode, threads, size) cell runs BEST-OF-3 timed trials.
+
+import "thread.cb";
+import "time.cb";
+import "rwlock.cb";
+import "hpc/olock.cb";
+import "atomic.cb";
+
+int FANOUT = 16;
+
+// One node type, `isLeaf`-tagged, carrying BOTH synchronization primitives so all three modes
+// share the exact same memory layout and descent shape - the only difference is which field
+// (or none) a given mode touches.
+struct pnode {
+    olock  ver    = default;   // mode 3 (olc): version lock
+    rwlock latch  = default;   // mode 2 (rwlock-coupling): per-node read latch
+    bool   isLeaf = true;      // immutable after publication; never guarded
+    int    count  = 0;
+    i64    keys[16]     = default;
+    i64    values[16]   = default;
+    pnode* children[17] = default;
+    pnode* next         = nullptr;   // leaf chain; unused by any lookup mode here
+};
+
+struct bench_tree {
+    pnode* root = nullptr;
+    i64    n     = 0;          // number of keys built into the tree
+    rwlock globalLock = default;   // mode 1 (global-rwlock): one lock for the whole tree
+    olock  rootVer    = default;   // mode 3 (olc): guards the _root slot itself, exactly
+                                    // like core/hpc/btree.cb's btree._ver
+};
+
+// -----------------------------------------------------------------------------------------
+// single-threaded build (same top-down preemptive-split algorithm as core/hpc/btree.cb,
+// specialized to i64/i64 - no generics, no ownership machinery needed for a primitive V).
+// -----------------------------------------------------------------------------------------
+
+pnode* newLeaf() {
+    pnode* n = new pnode();
+    n->isLeaf = true;
+    return n;
+}
+
+pnode* newInternal() {
+    pnode* n = new pnode();
+    n->isLeaf = false;
+    return n;
+}
+
+// First child index i with key <= n->keys[i], or n->count if key is past every separator.
+int childIndex(pnode* n, i64 key) {
+    int i = 0;
+    while (i < n->count && n->keys[i] <= key) i = i + 1;
+    return i;
+}
+
+void insertChildAt(pnode* parent, int idx, i64 sep, move pnode* rightChild) {
+    int j = parent->count;
+    while (j > idx) {
+        parent->keys[j] = parent->keys[j - 1];
+        parent->children[j + 1] = parent->children[j];
+        j = j - 1;
+    }
+    parent->keys[idx] = sep;
+    parent->children[idx + 1] = rightChild;
+    parent->count = parent->count + 1;
+}
+
+void splitChild(pnode* parent, int idx) {
+    pnode* left = parent->children[idx];
+    pnode* right = new pnode();
+    right->isLeaf = left->isLeaf;
+
+    int mid = FANOUT / 2;
+    if (left->isLeaf) {
+        int rightCount = left->count - mid;
+        int i = 0;
+        while (i < rightCount) {
+            right->keys[i] = left->keys[mid + i];
+            right->values[i] = left->values[mid + i];
+            i = i + 1;
+        }
+        right->count = rightCount;
+        left->count = mid;
+        right->next = left->next;
+        left->next = right;
+        i64 sep = right->keys[0];
+        insertChildAt(parent, idx, sep, right);
+    } else {
+        i64 sep = left->keys[mid];
+        int rightCount = left->count - mid - 1;
+        int i = 0;
+        while (i < rightCount) { right->keys[i] = left->keys[mid + 1 + i]; i = i + 1; }
+        i = 0;
+        while (i <= rightCount) { right->children[i] = left->children[mid + 1 + i]; i = i + 1; }
+        right->count = rightCount;
+        left->count = mid;
+        insertChildAt(parent, idx, sep, right);
+    }
+}
+
+void leafInsertNew(pnode* n, i64 key, i64 value) {
+    int i = 0;
+    while (i < n->count && n->keys[i] < key) i = i + 1;
+    int j = n->count;
+    while (j > i) {
+        n->keys[j] = n->keys[j - 1];
+        n->values[j] = n->values[j - 1];
+        j = j - 1;
+    }
+    n->keys[i] = key;
+    n->values[i] = value;
+    n->count = n->count + 1;
+}
+
+// Single-threaded add, called only during tree construction (before any reader thread
+// starts). Assumes key is not already present.
+void treeAdd(bench_tree* t, i64 key, i64 value) {
+    if (t->root == nullptr) t->root = newLeaf();
+
+    if (t->root->count == FANOUT) {
+        pnode* newRoot = newInternal();
+        newRoot->children[0] = t->root;
+        splitChild(newRoot, 0);
+        t->root = newRoot;
+    }
+
+    pnode* n = t->root;
+    while (!n->isLeaf) {
+        int i = childIndex(n, key);
+        if (n->children[i]->count == FANOUT) {
+            splitChild(n, i);
+            i = childIndex(n, key);
+        }
+        n = n->children[i];
+    }
+    leafInsertNew(n, key, value);
+    t->n = t->n + 1;
+}
+
+// Build a tree holding keys 1..n, values key*3, ascending insert order.
+bench_tree* buildTree(i64 n) {
+    bench_tree* t = new bench_tree();
+    i64 k = 1;
+    while (k <= n) {
+        treeAdd(t, k, k * 3);
+        k = k + 1;
+    }
+    return t;
+}
+
+int treeDepth(pnode* n) {
+    int d = 1;
+    while (n != nullptr && !n->isLeaf) { n = n->children[0]; d = d + 1; }
+    return d;
+}
+
+void freeSubtree(move pnode* n) {
+    if (n == nullptr) return;
+    if (!n->isLeaf) {
+        int i = 0;
+        while (i <= n->count) { freeSubtree(n->children[i]); i = i + 1; }
+    }
+    n->latch.destroy();   // no-op if this node's OS rwlock was never lazily allocated
+    delete n;
+}
+
+void freeTree(move bench_tree* t) {
+    freeSubtree(t->root);
+    t->globalLock.destroy();
+    delete t;
+}
+
+// -----------------------------------------------------------------------------------------
+// mode 1: global-rwlock - one lock, one acquire_read()/release_read() pair per lookup,
+// wrapping the ENTIRE descent. Every reader on every core stores to this ONE word.
+// -----------------------------------------------------------------------------------------
+bool lookupGlobalRwlock(bench_tree* t, i64 key, i64* out) {
+    t->globalLock.acquire_read();
+    pnode* n = t->root;
+    while (n != nullptr && !n->isLeaf) {
+        n = n->children[childIndex(n, key)];
+    }
+    bool found = false;
+    if (n != nullptr) {
+        int i = 0;
+        while (i < n->count && n->keys[i] < key) i = i + 1;
+        if (i < n->count && n->keys[i] == key) { *out = n->values[i]; found = true; }
+    }
+    t->globalLock.release_read();
+    return found;
+}
+
+// -----------------------------------------------------------------------------------------
+// mode 2: rwlock-coupling - hand-over-hand per-node read latches. Zero logical contention
+// (no writers, so acquire_read() never blocks) - any slowdown here vs mode 3 is pure
+// cache-coherence cost from the per-level stores.
+// -----------------------------------------------------------------------------------------
+bool lookupRwlockCoupling(bench_tree* t, i64 key, i64* out) {
+    pnode* n = t->root;
+    if (n == nullptr) return false;
+    n->latch.acquire_read();
+    while (!n->isLeaf) {
+        pnode* child = n->children[childIndex(n, key)];
+        child->latch.acquire_read();
+        n->latch.release_read();
+        n = child;
+    }
+    bool found = false;
+    int i = 0;
+    while (i < n->count && n->keys[i] < key) i = i + 1;
+    if (i < n->count && n->keys[i] == key) { *out = n->values[i]; found = true; }
+    n->latch.release_read();
+    return found;
+}
+
+// -----------------------------------------------------------------------------------------
+// mode 3: olc - optimistic version coupling, mirroring core/hpc/btree.cb's
+// _descendOptimistic()+lookup() exactly: snapshot the child's version, THEN validate the
+// parent, restart the WHOLE descent (from the tree's root slot) on any failed validation.
+// Zero stores on the validated path.
+// -----------------------------------------------------------------------------------------
+bool lookupOlc(bench_tree* t, i64 key, i64* out) {
+    while (true) {
+        i64 tv = t->rootVer.read_begin();
+        pnode* n = t->root;
+        if (n == nullptr) { if (t->rootVer.read_validate(tv)) return false; else continue; }
+
+        i64 v = n->ver.read_begin();
+        if (!t->rootVer.read_validate(tv)) continue;   // couple through the root slot
+
+        bool restart = false;
+        while (!n->isLeaf) {
+            int c = n->count;
+            if (c < 0) c = 0;
+            if (c > FANOUT) c = FANOUT;
+            int i = 0;
+            while (i < c && n->keys[i] <= key) i = i + 1;
+            pnode* child = n->children[i];
+            if (child == nullptr) { restart = true; break; }
+
+            i64 cv = child->ver.read_begin();
+            if (!n->ver.read_validate(v)) { restart = true; break; }   // the coupling point
+            n = child;
+            v = cv;
+        }
+        if (restart) continue;
+
+        int c = n->count;
+        if (c < 0) c = 0;
+        if (c > FANOUT) c = FANOUT;
+        int i = 0;
+        while (i < c && n->keys[i] < key) i = i + 1;
+        bool found = false;
+        i64 val = 0;
+        if (i < c && n->keys[i] == key) { found = true; val = n->values[i]; }
+
+        if (!n->ver.read_validate(v)) continue;
+
+        if (!found) return false;
+        *out = val;
+        return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------------------
+// deterministic access pattern (no rand()) - identical LCG for every mode.
+// -----------------------------------------------------------------------------------------
+i64 lcgNext(i64 x) {
+    return (x * (i64)1103515245 + (i64)12345) & (i64)0x7fffffff;
+}
+
+i64 threadSeed(i64 baseSeed, int threadIdx) {
+    return baseSeed + (i64)threadIdx * (i64)104729;   // distinct per-thread streams
+}
+
+// Independently computes the expected checksum for a (threads, opsPerThread, n) cell -
+// same LCG stream each thread will use, replayed WITHOUT touching the tree at all. Values
+// are key*3 by construction, so this alone proves what the correct total must be.
+i64 expectedChecksum(int threads, i64 opsPerThread, i64 n, i64 baseSeed) {
+    i64 total = 0;
+    int t = 0;
+    while (t < threads) {
+        i64 seed = threadSeed(baseSeed, t);
+        i64 i = 0;
+        while (i < opsPerThread) {
+            seed = lcgNext(seed);
+            i64 key = 1 + (seed % n);
+            total = total + key * 3;
+            i = i + 1;
+        }
+        t = t + 1;
+    }
+    return total;
+}
+
+struct LookupCtx {
+    bench_tree* tree = nullptr;
+    int mode       = 0;      // 1 = global-rwlock, 2 = rwlock-coupling, 3 = olc
+    i64 n          = 0;
+    i64 opsPerThread = 0;
+    i64 seed       = 0;
+    i64 checksum   = 0;
+};
+
+int lookupWorker(void* ctxPtr) {
+    LookupCtx* c = (LookupCtx*)ctxPtr;
+    i64 seed = c->seed;
+    i64 sum  = 0;
+    i64 i    = 0;
+    while (i < c->opsPerThread) {
+        seed = lcgNext(seed);
+        i64 key = 1 + (seed % c->n);
+        i64 val = 0;
+        bool ok = false;
+        if (c->mode == 1)      ok = lookupGlobalRwlock(c->tree, key, &val);
+        else if (c->mode == 2) ok = lookupRwlockCoupling(c->tree, key, &val);
+        else                   ok = lookupOlc(c->tree, key, &val);
+        if (ok) sum = sum + val;
+        i = i + 1;
+    }
+    c->checksum = sum;
+    return 0;
+}
+
+// Runs one pass (threads threads, opsPerThread lookups each) of `mode` against `tree`.
+// Returns elapsed microseconds via *usOut, aggregate checksum via *checksumOut.
+void runOnce(bench_tree* tree, int mode, int threads, i64 opsPerThread, i64 baseSeed,
+             i64* usOut, i64* checksumOut) {
+    LookupCtx* ctx = new LookupCtx[threads];
+    Thread* handles = new Thread[threads];
+
+    int i = 0;
+    while (i < threads) {
+        ctx[i].tree = tree;
+        ctx[i].mode = mode;
+        ctx[i].n    = tree->n;
+        ctx[i].opsPerThread = opsPerThread;
+        ctx[i].seed = threadSeed(baseSeed, i);
+        i = i + 1;
+    }
+
+    Stopwatch sw;
+    sw.start();
+    i = 0;
+    while (i < threads) { handles[i].start(lookupWorker, &ctx[i]); i = i + 1; }
+    i = 0;
+    while (i < threads) { handles[i].join(); i = i + 1; }
+    sw.stop();
+
+    i64 sum = 0;
+    i = 0;
+    while (i < threads) { sum = sum + ctx[i].checksum; i = i + 1; }
+
+    *usOut = (i64)sw.elapsed().microseconds();
+    *checksumOut = sum;
+
+    delete[_] ctx;
+    delete[_] handles;
+}
+
+// One warmup pass (untimed, also lazily initializes every OS rwlock handle the mode will
+// touch) plus TRIALS timed passes; returns the best (minimum) elapsed microseconds. Asserts
+// the checksum against the independently-computed expected value on every timed trial -
+// a mismatch means either a bug in the descent or the loop got optimized away.
+i64 runCell(bench_tree* tree, int mode, int threads, i64 opsPerThread, i64 baseSeed,
+            i64 expected, bool* okOut) {
+    i64 us = 0;
+    i64 checksum = 0;
+
+    runOnce(tree, mode, threads, opsPerThread, baseSeed, &us, &checksum);   // warmup, discarded
+
+    i64 best = -1;
+    int trial = 0;
+    while (trial < 3) {
+        runOnce(tree, mode, threads, opsPerThread, baseSeed, &us, &checksum);
+        if (checksum != expected) {
+            *okOut = false;
+            printf("  [MISMATCH] mode=%d threads=%d trial=%d checksum=%lld expected=%lld\n",
+                   mode, threads, trial, checksum, expected);
+        }
+        if (best < 0 || us < best) best = us;
+        trial = trial + 1;
+    }
+    return best;
+}
+
+i64 throughputOpsPerSec(i64 threads, i64 opsPerThread, i64 us) {
+    i64 safeUs = us;
+    if (safeUs <= (i64)0) safeUs = (i64)1;
+    i64 totalOps = threads * opsPerThread;
+    return (totalOps * (i64)1000000) / safeUs;
+}
+
+// Runs all three modes at all swept thread counts against `tree`, prints the table, and
+// returns false if any correctness mismatch was ever observed (loop-elision / descent bug).
+bool runSizeSweep(char* label, bench_tree* tree, i64 opsPerThread, i64 baseSeed) {
+    bool ok = true;
+    int[7] threadCounts = {1, 2, 4, 6, 8, 12, 18};
+
+    printf("\ntree=%s (%lld keys, depth=%d)\n", label, tree->n, treeDepth(tree->root));
+    printf("  %8s  %16s  %18s  %14s  %14s\n",
+           "threads", "global-rwlock", "rwlock-coupling", "olc", "olc/coupling");
+
+    int idx = 0;
+    while (idx < 7) {
+        int threads = threadCounts[idx];
+        i64 expected = expectedChecksum(threads, opsPerThread, tree->n, baseSeed);
+
+        i64 us1 = runCell(tree, 1, threads, opsPerThread, baseSeed, expected, &ok);
+        i64 us2 = runCell(tree, 2, threads, opsPerThread, baseSeed, expected, &ok);
+        i64 us3 = runCell(tree, 3, threads, opsPerThread, baseSeed, expected, &ok);
+
+        i64 tp1 = throughputOpsPerSec((i64)threads, opsPerThread, us1);
+        i64 tp2 = throughputOpsPerSec((i64)threads, opsPerThread, us2);
+        i64 tp3 = throughputOpsPerSec((i64)threads, opsPerThread, us3);
+
+        double ratio = (double)tp3 / (double)tp2;
+
+        printf("  %8d  %13lld/s  %15lld/s  %11lld/s  %12.2fx\n",
+               threads, tp1, tp2, tp3, ratio);
+
+        idx = idx + 1;
+    }
+    return ok;
+}
+
+extern int main()
+{
+    int cores = hardware_concurrency();
+    printf("=== btree OLC vs rwlock scaling (Phase 5, optimistic-lock-coupling.md) ===\n");
+    printf("hardware_concurrency() = %d\n", cores);
+    printf("modes: 1=global-rwlock (one lock, whole descent)  2=rwlock-coupling (per-node\n");
+    printf("       hand-over-hand read latches)  3=olc (per-node optimistic version coupling)\n");
+    printf("best-of-3 timed trials per cell, plus one untimed warmup pass.\n");
+    printf("headline metric: the olc/coupling ratio - both modes pay the identical\n");
+    printf("E-core/P-core heterogeneity penalty, so the ratio isolates sync cost.\n");
+
+    bool ok = true;
+
+    i64 smallN = 1000;
+    i64 largeN = 1000000;
+    i64 opsSmall = 500000;
+    i64 opsLarge = 150000;
+    i64 seedBase = 987654321;
+
+    bench_tree* small = buildTree(smallN);
+    ok &= runSizeSweep("small", small, opsSmall, seedBase);
+    freeTree(small);
+
+    bench_tree* large = buildTree(largeN);
+    ok &= runSizeSweep("large", large, opsLarge, seedBase + (i64)1);
+    freeTree(large);
+
+    if (!ok) {
+        printf("\n[FAIL] one or more cells reported a checksum mismatch - see [MISMATCH] lines above.\n");
+        return 1;
+    }
+    printf("\nAll checksums matched expected values (descent correctness verified; work was not optimized away).\n");
+    return 0;
+}

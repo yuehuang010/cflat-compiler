@@ -8,6 +8,8 @@ import "rwlock.cb";
 import "channel.cb";
 import "spsc_queue.cb";
 import "barrier.cb";
+import "intrinsic.cb";
+import "hpc/olock.cb";
 
 // ---------------------------------------------------------------------------
 // Thread tests
@@ -456,6 +458,18 @@ bool testAtomicI64() {
     bool ok = a.cas(1000000000000, 2000000000000);
     result &= Test("atomic i64 cas success", (int)ok, 1);
     result &= Test("atomic i64 cas result", (int)(a.load() == 2000000000000), 1);
+    return result;
+}
+
+// Portable acquire fence (Phase 1 of internal/plan/optimistic-lock-coupling.md): no
+// directly observable single-threaded behaviour, so this just proves fence_acquire()
+// compiles/lowers/does not crash, and round-trips a value through store_release()/load().
+bool testAcquireFenceAndReleaseStore() {
+    bool result = true;
+    atomic__i64 a;
+    a.store_release(7);
+    fence_acquire();
+    result &= Test("acquire fence + release store round-trip", (int)a.load(), 7);
     return result;
 }
 
@@ -1421,6 +1435,268 @@ bool testSpinBarrierThreaded() {
 }
 
 // ---------------------------------------------------------------------------
+// olock (optimistic lock coupling seqlock) tests - Phase 2 of
+// internal/plan/optimistic-lock-coupling.md.
+// ---------------------------------------------------------------------------
+
+// A validated read with no concurrent writer must succeed.
+bool testOlockValidatedReadNoWriter() {
+    bool result = true;
+    olock o;
+    i64 v = o.read_begin();
+    bool valid = o.read_validate(v);
+    result &= Test("olock read_begin/read_validate with no writer", valid, true);
+    return result;
+}
+
+// A read that spans a concurrent write must fail validation. Deterministic,
+// single-threaded: take and release the lock via lock (o) { } between
+// read_begin() and read_validate() so the version has visibly moved.
+bool testOlockReadInvalidatedByWrite() {
+    bool result = true;
+    olock o;
+    i64 v = o.read_begin();
+    lock (o) { }
+    bool valid = o.read_validate(v);
+    result &= Test("olock read invalidated by intervening write", valid, false);
+    return result;
+}
+
+// upgrade() succeeds from a clean snapshot, and fails once another write has
+// moved the version out from under the snapshot it was given.
+bool testOlockUpgrade() {
+    bool result = true;
+    olock o;
+
+    i64 v1 = o.read_begin();
+    bool ok1 = o.upgrade(v1);
+    result &= Test("olock upgrade succeeds from clean snapshot", ok1, true);
+    o.release();
+
+    i64 v2 = o.read_begin();
+    lock (o) { }   // intervening write moves the version past v2
+    bool ok2 = o.upgrade(v2);
+    result &= Test("olock upgrade fails after intervening write", ok2, false);
+    return result;
+}
+
+// lock (o) { } must compile and work on an olock - exercises the
+// [Capability(ILockable)] lowering to acquire()/release().
+bool testOlockLockStatement() {
+    bool result = true;
+    olock o;
+    int counter = 0;
+    lock (o) {
+        counter = counter + 1;
+    }
+    result &= Test("olock lock statement (ILockable)", counter, 1);
+    return result;
+}
+
+// obsolete() / is_obsolete() round-trip: a freshly retired lock reports
+// obsolete on the version snapshotted after retirement.
+bool testOlockObsoleteRoundTrip() {
+    bool result = true;
+    olock o;
+
+    i64 v0 = o.read_begin();
+    result &= Test("olock not obsolete before retirement", o.is_obsolete(v0), false);
+
+    o.acquire();
+    o.obsolete();
+
+    i64 v1 = o.read_begin();
+    result &= Test("olock obsolete after obsolete()", o.is_obsolete(v1), true);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// olock.read() - the scoped speculative bracket (Phase 3). The lock(this.optimistic)
+// parameter seeds the guard in Optimistic mode, so the body may READ the guarded
+// fields; a WRITE to one is a compile error (Test/errors/err_lock_write_under_optimistic.cb).
+// ---------------------------------------------------------------------------
+
+// A real guard group over an olock: the fields are unreachable without holding `ver`.
+struct OlockGuarded {
+    olock ver = default;
+    lock(ver) {
+        i64 x = 0;
+        i64 y = 0;
+    }
+};
+
+// The body reads both guarded fields under an optimistic snapshot; with no writer the
+// read validates and the values are the ones the exclusive writer published.
+bool testOlockScopedRead() {
+    bool result = true;
+    OlockGuarded g;
+    lock (g.ver) {
+        g.x = 11;
+        g.y = 22;
+    }
+
+    // The body's reads must escape through a pointer: a primitive local is captured by
+    // value, so it cannot carry a snapshot out. This is the closure-escape limitation
+    // that keeps a raw read_begin/read_validate descent necessary (plan 4b).
+    i64  sx = 0;
+    i64  sy = 0;
+    i64* px = &sx;
+    i64* py = &sy;
+    bool valid = g.ver.read(() => {
+        *px = g.x;     // guarded field, read-only: legal under the optimistic grant
+        *py = g.y;
+    });
+
+    result &= Test("olock.read validates with no writer", valid, true);
+    result &= Test("olock.read body saw x", (int)sx, 11);
+    result &= Test("olock.read body saw y", (int)sy, 22);
+    return result;
+}
+
+// A writer that intervenes between read_begin() and read_validate() must invalidate the
+// read. Deterministic and single-threaded: the body itself takes the exclusive lock, which
+// is exactly the version bump a concurrent writer would land.
+bool testOlockScopedReadInvalidated() {
+    bool result = true;
+    OlockGuarded g;
+
+    bool valid = g.ver.read(() => {
+        lock (g.ver) {
+            g.x = 99;   // exclusive mode inside the optimistic body: a write IS legal here
+        }
+    });
+
+    result &= Test("olock.read invalidated by an intervening writer", valid, false);
+    lock (g.ver) {
+        result &= Test("olock.read intervening write took effect", (int)g.x, 99);
+    }
+    return result;
+}
+
+// Struct guarded by an olock. Fields are deliberately left ungrouped (no
+// lock(ver) { } field group) - the raw olock API needs no grant, and Phase 4
+// (Option A) builds the tree on the raw calls.
+struct OlockPair {
+    olock ver = default;
+    i64   a   = 0;
+    i64   b   = 0;
+};
+
+struct OlockReaderCtx {
+    OlockPair*      pair       = nullptr;
+    atomic_counter* validReads = nullptr;
+    atomic_counter* consistent = nullptr;  // validated reads where a == b
+    atomic_counter* torn       = nullptr;  // validated reads where a != b - must stay 0
+    // Reads a writer invalidated. Must stay > 0 or the readers never raced the writer
+    // and the whole test is vacuous - a seqlock that never retries proves nothing.
+    atomic_counter* invalid    = nullptr;
+    int             iterations = 0;
+};
+
+struct OlockWriterCtx {
+    OlockPair* pair       = nullptr;
+    int        iterations = 0;
+};
+
+// Speculative read with no lock: snapshot, read both fields, validate. A
+// failed validation is discarded, not counted - it is an expected restart,
+// not a bug. Only fields from a validated snapshot are checked for
+// consistency, which is the property the seqlock exists to guarantee.
+int olockReaderWorker(void* ctx) {
+    OlockReaderCtx* rc = (OlockReaderCtx*)ctx;
+    int i = 0;
+    while (i < rc->iterations) {
+        i64 v  = rc->pair->ver.read_begin();
+        i64 ra = rc->pair->a;
+        i64 rb = rc->pair->b;
+        if (rc->pair->ver.read_validate(v)) {
+            rc->validReads->increment();
+            if (ra == rb) {
+                rc->consistent->increment();
+            } else {
+                rc->torn->increment();
+            }
+        } else {
+            rc->invalid->increment();
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+int olockWriterWorker(void* ctx) {
+    OlockWriterCtx* wc = (OlockWriterCtx*)ctx;
+    int i = 0;
+    while (i < wc->iterations) {
+        lock (wc->pair->ver) {
+            wc->pair->a = wc->pair->a + 1;
+            wc->pair->b = wc->pair->b + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// N reader threads spin optimistic reads over a small struct while one
+// writer mutates it under lock (o) { }. This is the test that actually
+// proves the seqlock works: every VALIDATED read must observe a == b, since
+// the writer only ever changes both fields together while holding the lock.
+bool testOlockConcurrentReadersWriter() {
+    bool result = true;
+    OlockPair pair;
+
+    atomic_counter validReads;
+    atomic_counter consistent;
+    atomic_counter torn;
+    atomic_counter invalid;
+
+    int numReaders   = 4;
+    int readerIters  = 20000;
+    int writerIters  = 20000;
+
+    Thread*          readerThreads = new Thread[numReaders];
+    OlockReaderCtx*  readerCtxs    = new OlockReaderCtx[numReaders];
+    int i = 0;
+    while (i < numReaders) {
+        readerCtxs[i].pair       = &pair;
+        readerCtxs[i].validReads = &validReads;
+        readerCtxs[i].consistent = &consistent;
+        readerCtxs[i].torn       = &torn;
+        readerCtxs[i].invalid    = &invalid;
+        readerCtxs[i].iterations = readerIters;
+        readerThreads[i].start(olockReaderWorker, &readerCtxs[i]);
+        i = i + 1;
+    }
+
+    OlockWriterCtx writerCtx;
+    writerCtx.pair       = &pair;
+    writerCtx.iterations = writerIters;
+    Thread writerThread;
+    writerThread.start(olockWriterWorker, &writerCtx);
+
+    writerThread.join();
+    i = 0;
+    while (i < numReaders) { readerThreads[i].join(); i = i + 1; }
+
+    result &= Test("olock concurrent: no torn reads observed", (int)torn.read(), 0);
+    result &= Test("olock concurrent: some reads were validated",
+                    (int)(validReads.read() > 0), 1);
+    // Without this the test is vacuous: if no read ever raced the writer, every read
+    // validates, torn stays 0, and the seqlock was never exercised. Measured ~33% here.
+    result &= Test("olock concurrent: some reads were invalidated (the race is real)",
+                    (int)(invalid.read() > 0), 1);
+    result &= Test("olock concurrent: consistent reads == valid reads",
+                    (int)(consistent.read() == validReads.read()), 1);
+    result &= Test("olock concurrent: writer applied all increments",
+                    (int)pair.a, writerIters);
+    result &= Test("olock concurrent: final a == b", (int)(pair.a == pair.b), 1);
+
+    delete[_] readerThreads;
+    delete[_] readerCtxs;
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1456,6 +1732,7 @@ extern int main() {
     total++; passed += testAtomicFlag()               ? 1 : 0;
     total++; passed += testAtomicI32()                ? 1 : 0;
     total++; passed += testAtomicI64()                ? 1 : 0;
+    total++; passed += testAcquireFenceAndReleaseStore() ? 1 : 0;
 
     // Semaphore / latch / rwlock tests
     total++; passed += testSemaphoreBasic()           ? 1 : 0;
@@ -1498,6 +1775,16 @@ extern int main() {
     total++; passed += testBarrierSingleThreadReuse()     ? 1 : 0;
     total++; passed += testBarrierThreaded()              ? 1 : 0;
     total++; passed += testSpinBarrierThreaded()          ? 1 : 0;
+
+    // olock (optimistic lock coupling) tests
+    total++; passed += testOlockValidatedReadNoWriter()     ? 1 : 0;
+    total++; passed += testOlockReadInvalidatedByWrite()    ? 1 : 0;
+    total++; passed += testOlockUpgrade()                   ? 1 : 0;
+    total++; passed += testOlockLockStatement()              ? 1 : 0;
+    total++; passed += testOlockObsoleteRoundTrip()          ? 1 : 0;
+    total++; passed += testOlockScopedRead()                 ? 1 : 0;
+    total++; passed += testOlockScopedReadInvalidated()      ? 1 : 0;
+    total++; passed += testOlockConcurrentReadersWriter()    ? 1 : 0;
 
     printf("Thread/Sync tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

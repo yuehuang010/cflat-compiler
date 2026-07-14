@@ -15,6 +15,9 @@ import "cruntime.cb";
 import "test_helper.cb";
 import "span.cb";
 import "view.cb";
+import "hpc/btree.cb";
+import "thread.cb";
+import "atomic.cb";
 
 // ---------------------------------------------------------------------------
 // int[] array-view kernels
@@ -793,6 +796,692 @@ int testArrayViewCast()
     return passed;
 }
 
+// ---------------------------------------------------------------------------
+// btree<K,V> - single-threaded B+tree ordered map (core/hpc/btree.cb).
+// ---------------------------------------------------------------------------
+
+// Deterministic pseudo-random source (no rand()).
+int btreeLcgNext(int x)
+{
+    return (int)(((i64)x * 1103515245 + 12345) & 0x7fffffff);
+}
+
+// insert 1..1000 ascending, read every key back, count() == 1000.
+int testBtreeAscending()
+{
+    int passed = 0;
+    btree<int, int> t;
+    int i = 1;
+    while (i <= 1000) { t.add(i, i * 3); i = i + 1; }
+    passed += Test("btree asc count", t.count(), 1000);
+
+    bool allOk = true;
+    i = 1;
+    while (i <= 1000) { if (t.get(i) != i * 3) allOk = false; i = i + 1; }
+    passed += Test("btree asc get-all", allOk, true);
+    return passed;
+}
+
+// insert 1000..1 descending, same checks.
+int testBtreeDescending()
+{
+    int passed = 0;
+    btree<int, int> t;
+    int i = 1000;
+    while (i >= 1) { t.add(i, i * 3); i = i - 1; }
+    passed += Test("btree desc count", t.count(), 1000);
+
+    bool allOk = true;
+    i = 1000;
+    while (i >= 1) { if (t.get(i) != i * 3) allOk = false; i = i - 1; }
+    passed += Test("btree desc get-all", allOk, true);
+    return passed;
+}
+
+// insert 1..1000 in a deterministic pseudo-random order (Fisher-Yates shuffle
+// driven by an LCG, no rand()), read every key back, count() == 1000.
+int testBtreeRandomOrder()
+{
+    int passed = 0;
+    btree<int, int> t;
+
+    int[] order = new int[1000];
+    int i = 0;
+    while (i < 1000) { order[i] = i + 1; i = i + 1; }
+
+    int x = 424242;
+    i = 999;
+    while (i > 0)
+    {
+        x = btreeLcgNext(x);
+        int j = x % (i + 1);
+        int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+        i = i - 1;
+    }
+
+    i = 0;
+    while (i < 1000) { t.add(order[i], order[i] * 7); i = i + 1; }
+    passed += Test("btree rand count", t.count(), 1000);
+
+    bool allOk = true;
+    i = 1;
+    while (i <= 1000) { if (t.get(i) != i * 7) allOk = false; i = i + 1; }
+    passed += Test("btree rand get-all", allOk, true);
+
+    int* op = move order; delete[_] op;
+    return passed;
+}
+
+// add() on a duplicate key returns false and leaves the old value untouched;
+// set() overwrites.
+int testBtreeAddSetDuplicate()
+{
+    int passed = 0;
+    btree<int, int> t;
+    passed += Test("btree dup initial add", t.add(5, 50), true);
+    passed += Test("btree dup second add returns false", t.add(5, 999), false);
+    passed += Test("btree dup value untouched", t.get(5), 50);
+    t.set(5, 555);
+    passed += Test("btree dup set overwrites", t.get(5), 555);
+    return passed;
+}
+
+// remove every key in insertion order -> count() == 0, all gets miss.
+int testBtreeRemoveAscending()
+{
+    int passed = 0;
+    btree<int, int> t;
+    int i = 1;
+    while (i <= 500) { t.add(i, i); i = i + 1; }
+
+    bool allRemoved = true;
+    i = 1;
+    while (i <= 500) { if (!t.remove(i)) allRemoved = false; i = i + 1; }
+    passed += Test("btree remove-asc all removed", allRemoved, true);
+    passed += Test("btree remove-asc count zero", t.count(), 0);
+
+    bool allMiss = true;
+    i = 1;
+    while (i <= 500) { if (t.contains(i)) allMiss = false; i = i + 1; }
+    passed += Test("btree remove-asc all miss", allMiss, true);
+    return passed;
+}
+
+// remove every key in reverse (descending) order -> same checks.
+int testBtreeRemoveDescending()
+{
+    int passed = 0;
+    btree<int, int> t;
+    int i = 1;
+    while (i <= 500) { t.add(i, i); i = i + 1; }
+
+    bool allRemoved = true;
+    i = 500;
+    while (i >= 1) { if (!t.remove(i)) allRemoved = false; i = i - 1; }
+    passed += Test("btree remove-desc all removed", allRemoved, true);
+    passed += Test("btree remove-desc count zero", t.count(), 0);
+
+    bool allMiss = true;
+    i = 1;
+    while (i <= 500) { if (t.contains(i)) allMiss = false; i = i + 1; }
+    passed += Test("btree remove-desc all miss", allMiss, true);
+    return passed;
+}
+
+// Deterministic removals against a known 40-key tree (BTREE_FANOUT=16 gives root
+// keys=[9,17,25] over four leaves of size 8,8,8,16), each engineered to hit exactly
+// one rebalance path. Verified structurally with a debug dump during development;
+// here we check behavior (count/contains) rather than internal node shape.
+int testBtreeRebalanceScenarios()
+{
+    int passed = 0;
+
+    // borrow-from-right: leaf0 (no left sibling) underflows; leaf1 has surplus to lend.
+    {
+        btree<int, int> t;
+        int i = 1;
+        while (i <= 40) { t.add(i, i); i = i + 1; }
+        t.remove(1);
+        t.remove(2);
+        passed += Test("btree borrow-right count", t.count(), 38);
+        bool ok = true;
+        i = 3;
+        while (i <= 40) { if (!t.contains(i)) ok = false; i = i + 1; }
+        passed += Test("btree borrow-right keys intact", ok, true);
+        passed += Test("btree borrow-right removed gone", t.contains(1) || t.contains(2), false);
+    }
+
+    // borrow-from-left: leaf1 underflows; its left sibling (leaf0) has surplus to lend.
+    {
+        btree<int, int> t;
+        int i = 1;
+        while (i <= 40) { t.add(i, i); i = i + 1; }
+        t.remove(9);
+        t.remove(10);
+        passed += Test("btree borrow-left count", t.count(), 38);
+        bool ok = true;
+        i = 1;
+        while (i <= 40)
+        {
+            bool skip = (i == 9 || i == 10);
+            if (!skip && !t.contains(i)) ok = false;
+            i = i + 1;
+        }
+        passed += Test("btree borrow-left keys intact", ok, true);
+        passed += Test("btree borrow-left removed gone", t.contains(9) || t.contains(10), false);
+    }
+
+    // merge-with-right: leaf0 (no left sibling) underflows; leaf1 is pre-shrunk to
+    // exactly the minimum (no surplus), so leaf1 merges into leaf0.
+    {
+        btree<int, int> t;
+        int i = 1;
+        while (i <= 40) { t.add(i, i); i = i + 1; }
+        t.remove(9);
+        t.remove(1);
+        t.remove(2);
+        passed += Test("btree merge-right count", t.count(), 37);
+        bool ok = true;
+        i = 3;
+        while (i <= 40)
+        {
+            bool skip = (i == 9);
+            if (!skip && !t.contains(i)) ok = false;
+            i = i + 1;
+        }
+        passed += Test("btree merge-right keys intact", ok, true);
+        passed += Test("btree merge-right removed gone",
+            t.contains(1) || t.contains(2) || t.contains(9), false);
+    }
+
+    // merge-with-left: leaf1 underflows with neither sibling offering a surplus (both
+    // pre-shrunk to exactly the minimum), so it merges into its LEFT sibling (leaf0) -
+    // the algorithm's default merge direction when a left sibling exists.
+    {
+        btree<int, int> t;
+        int i = 1;
+        while (i <= 40) { t.add(i, i); i = i + 1; }
+        t.remove(1);
+        t.remove(17);
+        t.remove(9);
+        t.remove(10);
+        passed += Test("btree merge-left count", t.count(), 36);
+        bool ok = true;
+        i = 2;
+        while (i <= 40)
+        {
+            bool skip = (i == 9 || i == 10 || i == 17);
+            if (!skip && !t.contains(i)) ok = false;
+            i = i + 1;
+        }
+        passed += Test("btree merge-left keys intact", ok, true);
+        passed += Test("btree merge-left removed gone",
+            t.contains(1) || t.contains(9) || t.contains(10) || t.contains(17), false);
+    }
+
+    // root collapse: the tree's only internal level drains to a single child and the
+    // root becomes that child directly (height shrinks from 2 to 1).
+    {
+        btree<int, int> t;
+        int i = 1;
+        while (i <= 24) { t.add(i, i); i = i + 1; }
+        t.remove(1);
+        i = 9;
+        while (i <= 18) { t.remove(i); i = i + 1; }
+        passed += Test("btree root-collapse count", t.count(), 13);
+        bool ok = true;
+        i = 2;
+        while (i <= 24)
+        {
+            bool skip = (i >= 9 && i <= 18);
+            if (!skip && !t.contains(i)) ok = false;
+            i = i + 1;
+        }
+        passed += Test("btree root-collapse keys intact", ok, true);
+        // the collapsed (now single-leaf) tree must still behave correctly afterward.
+        t.add(100, 100);
+        passed += Test("btree root-collapse still mutable", t.get(100), 100);
+    }
+
+    return passed;
+}
+
+// first()/next() must visit every key exactly once, in strictly ascending order.
+int testBtreeOrderedIteration()
+{
+    int passed = 0;
+    btree<int, int> t;
+    int i = 1;
+    while (i <= 200) { t.add(i, i * 2); i = i + 1; }
+
+    auto c = t.first();
+    int prevKey = -1;
+    int seenCount = 0;
+    bool ascending = true;
+    while (c.valid())
+    {
+        int k = c.key();
+        if (k <= prevKey) ascending = false;
+        prevKey = k;
+        seenCount = seenCount + 1;
+        c.next();
+    }
+    passed += Test("btree iter strictly ascending", ascending, true);
+    passed += Test("btree iter count", seenCount, 200);
+    return passed;
+}
+
+// seek(lo) + walk while valid() and key() < hi returns exactly the keys in [lo, hi).
+int testBtreeSeekRange()
+{
+    int passed = 0;
+    btree<int, int> t;
+    int i = 1;
+    while (i <= 200) { t.add(i, i); i = i + 1; }
+
+    auto c = t.seek(50);
+    int count = 0;
+    int firstSeen = -1;
+    int lastSeen = -1;
+    while (c.valid() && c.key() < 80)
+    {
+        if (firstSeen == -1) firstSeen = c.key();
+        lastSeen = c.key();
+        count = count + 1;
+        c.next();
+    }
+    passed += Test("btree range [50,80) count", count, 30);
+    passed += Test("btree range [50,80) first", firstSeen, 50);
+    passed += Test("btree range [50,80) last", lastSeen, 79);
+
+    // seek() below every key lands on the smallest key.
+    auto c2 = t.seek(0);
+    passed += Test("btree seek before-first key", c2.valid() && c2.key() == 1, true);
+
+    // seek() past every key yields an invalid cursor.
+    auto c3 = t.seek(1000);
+    passed += Test("btree seek past-end invalid", c3.valid(), false);
+    return passed;
+}
+
+// string keys: exercises the key.copy() deep-copy path and lexicographic ordering.
+int testBtreeStringKeys()
+{
+    int passed = 0;
+    btree<string, int> t;
+    t.add("banana", 2);
+    t.add("apple", 1);
+    t.add("cherry", 3);
+    t.add("date", 4);
+    t.add("fig", 5);
+
+    passed += Test("btree string count", t.count(), 5);
+    passed += Test("btree string get apple", t.get("apple"), 1);
+    passed += Test("btree string get cherry", t.get("cherry"), 3);
+    passed += Test("btree string contains missing", t.contains("grape"), false);
+
+    auto c = t.first();
+    string prev = "";
+    bool ascending = true;
+    int n = 0;
+    while (c.valid())
+    {
+        string k = c.key();
+        if (n > 0 && !(prev < k)) ascending = false;
+        prev = k;
+        n = n + 1;
+        c.next();
+    }
+    passed += Test("btree string iter ascending", ascending, true);
+    passed += Test("btree string iter count", n, 5);
+
+    passed += Test("btree string remove", t.remove("banana"), true);
+    passed += Test("btree string removed gone", t.contains("banana"), false);
+    passed += Test("btree string count after remove", t.count(), 4);
+    return passed;
+}
+
+// pointer-valued V: the tree owns the values - add() transfers ownership, set()
+// frees the old value on overwrite, and remove()/clear() free the rest.
+int testBtreePointerValues()
+{
+    int passed = 0;
+    btree<int, int*> t;
+    int i = 1;
+    while (i <= 50)
+    {
+        int* p = new int;
+        *p = i * 100;
+        t.add(i, p);
+        i = i + 1;
+    }
+    passed += Test("btree ptr count", t.count(), 50);
+
+    bool allOk = true;
+    i = 1;
+    while (i <= 50)
+    {
+        int* got = t.get(i);
+        if (got == nullptr || *got != i * 100) allOk = false;
+        i = i + 1;
+    }
+    passed += Test("btree ptr get-all", allOk, true);
+
+    // set() must free the old value before storing the new one.
+    int* fresh = new int;
+    *fresh = 9999;
+    t.set(5, fresh);
+    int* got5 = t.get(5);
+    passed += Test("btree ptr set overwrite", *got5, 9999);
+
+    // remove() frees the value; clear() frees the rest; the tree stays usable.
+    i = 1;
+    while (i <= 25) { t.remove(i); i = i + 1; }
+    passed += Test("btree ptr count after remove", t.count(), 25);
+    t.clear();
+    passed += Test("btree ptr count after clear", t.count(), 0);
+    return passed;
+}
+
+// ---------------------------------------------------------------------------
+// btree<K,V> concurrent lookup/insert - optimistic lock coupling, Phase 4 of
+// internal/plan/optimistic-lock-coupling.md.
+//
+// lookup() takes no locks at all; insert() takes exactly one (the leaf's, via
+// upgrade()) on its fast path. Neither ever frees a node, which is what makes
+// them sound with no reclamation. remove() is NOT concurrent and is never
+// called from any of these tests.
+// ---------------------------------------------------------------------------
+
+struct BtreeWriterCtx
+{
+    btree<int, int>* tree = nullptr;
+    int base     = 0;      // inserts keys base, base+stride, ... (n of them)
+    int stride   = 1;
+    int n        = 0;
+    int inserted = 0;      // written only by this thread; summed after join
+};
+
+struct BtreeReaderCtx
+{
+    btree<int, int>* tree = nullptr;
+    atomic_counter*  stop = nullptr;   // set once the writers have joined
+    int lo         = 0;    // probes keys lo + step*j, j in [0, span)
+    int step       = 1;
+    int span       = 0;
+    int cap        = 0;    // hard iteration cap, so the test cannot hang
+    int seed       = 0;
+    int lookups    = 0;    // all three written only by this thread
+    int hits       = 0;
+    int errors     = 0;    // a pre-populated key must never be missing or wrong
+};
+
+int btreeInsertWorker(void* ctx)
+{
+    BtreeWriterCtx* c = (BtreeWriterCtx*)ctx;
+    int i = 0;
+    while (i < c->n)
+    {
+        int k = c->base + c->stride * i;
+        if (c->tree->insert(k, k * 3)) c->inserted = c->inserted + 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Probes keys that are present from the start and are never removed, so every
+// lookup MUST hit with the right value - no matter how badly the writers are
+// tearing the tree underneath. That is the property OLC has to deliver.
+//
+// Runs until the writers are done (stop flag) rather than for a fixed count, so
+// the readers cover the WHOLE write window - which is what actually exercises the
+// seqlock. The flag is a shared READ, never a write: the read path still issues no
+// stores. The cap only bounds the runtime if something goes wrong.
+int btreeLookupWorker(void* ctx)
+{
+    BtreeReaderCtx* c = (BtreeReaderCtx*)ctx;
+    int x = c->seed;
+    int i = 0;
+    while (i < c->cap && c->stop->read() == 0)
+    {
+        x = btreeLcgNext(x);
+        int k = c->lo + c->step * (x % c->span);
+        int v = 0;
+        if (c->tree->lookup(k, &v))
+        {
+            if (v == k * 3) c->hits = c->hits + 1;
+            else c->errors = c->errors + 1;
+        }
+        else
+        {
+            c->errors = c->errors + 1;
+        }
+        c->lookups = c->lookups + 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Depth of the leftmost root-to-leaf path.
+int btreeDepthOf(btree_node<int, int>* n)
+{
+    int d = 0;
+    while (n != nullptr && !n->isLeaf) { n = n->children[0]; d = d + 1; }
+    return d;
+}
+
+// Every leaf sits at exactly `target` depth, and every internal node has count+1
+// live children with count in range.
+bool btreeCheckLevels(btree_node<int, int>* n, int depth, int target)
+{
+    if (n == nullptr) return false;
+    if (n->isLeaf) return depth == target;
+    if (n->count < 1 || n->count > 16) return false;
+    int i = 0;
+    while (i <= n->count)
+    {
+        if (n->children[i] == nullptr) return false;
+        if (!btreeCheckLevels(n->children[i], depth + 1, target)) return false;
+        i = i + 1;
+    }
+    return true;
+}
+
+// Walk the leaf chain: keys strictly ascending across the whole chain, every
+// value paired with its key, counts in range. Returns the total entry count.
+int btreeLeafChainTotal(btree_node<int, int>* root, bool* okOut)
+{
+    btree_node<int, int>* n = root;
+    while (n != nullptr && !n->isLeaf) n = n->children[0];
+
+    int total = 0;
+    int prev  = -1;
+    bool ok   = true;
+    while (n != nullptr)
+    {
+        if (n->count < 0 || n->count > 16) { ok = false; n = nullptr; }
+        else
+        {
+            int i = 0;
+            while (i < n->count)
+            {
+                if (n->keys[i] <= prev) ok = false;
+                if (n->values[i] != n->keys[i] * 3) ok = false;
+                prev = n->keys[i];
+                total = total + 1;
+                i = i + 1;
+            }
+            n = n->next;
+        }
+    }
+    *okOut = ok;
+    return total;
+}
+
+// N readers spin optimistic lookups over the 20000 pre-populated keys (every 5th
+// key) while M writers insert the other 80000 keys, INTERLEAVED across the whole
+// key space by residue mod 5 - so the writers are splitting and re-locking the
+// very leaves, internal nodes and root the readers are descending through. Every
+// key a writer reports inserted must be findable afterwards, and every probe of a
+// live key must hit with the right value throughout.
+int testBtreeConcurrentLookupInsert()
+{
+    int passed = 0;
+    btree<int, int> t;
+
+    int i = 5;
+    while (i <= 100000) { t.add(i, i * 3); i = i + 5; }  // 20000 keys, k % 5 == 0
+
+    int numReaders  = 4;
+    int numWriters  = 4;
+    int perWriter   = 20000;                             // 4 * 20000 = 80000 keys
+
+    atomic_counter stop;
+    Thread* readerThreads = new Thread[numReaders];
+    Thread* writerThreads = new Thread[numWriters];
+    BtreeReaderCtx* rc = new BtreeReaderCtx[numReaders];
+    BtreeWriterCtx* wc = new BtreeWriterCtx[numWriters];
+
+    i = 0;
+    while (i < numReaders)
+    {
+        rc[i].tree = &t;
+        rc[i].stop = &stop;
+        rc[i].lo   = 5;                                  // probes 5, 10, ... 100000
+        rc[i].step = 5;
+        rc[i].span = 20000;
+        rc[i].cap  = 4000000;
+        rc[i].seed = 777 + i * 13;
+        readerThreads[i].start(btreeLookupWorker, &rc[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < numWriters)
+    {
+        wc[i].tree   = &t;
+        wc[i].base   = 1 + i;                            // writer w owns k % 5 == w+1
+        wc[i].stride = 5;
+        wc[i].n      = perWriter;
+        writerThreads[i].start(btreeInsertWorker, &wc[i]);
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < numWriters) { writerThreads[i].join(); i = i + 1; }
+    stop.store(1);                                       // the readers ran the whole window
+    i = 0;
+    while (i < numReaders) { readerThreads[i].join(); i = i + 1; }
+
+    int totalInserted = 0;
+    int totalHits     = 0;
+    int totalErrors   = 0;
+    int totalLookups  = 0;
+    i = 0;
+    while (i < numWriters) { totalInserted = totalInserted + wc[i].inserted; i = i + 1; }
+    i = 0;
+    while (i < numReaders)
+    {
+        totalLookups = totalLookups + rc[i].lookups;
+        totalHits    = totalHits + rc[i].hits;
+        totalErrors  = totalErrors + rc[i].errors;
+        i = i + 1;
+    }
+
+    i64 readRetries  = t.read_restarts();
+    i64 writeRetries = t.write_restarts();
+    printf("  [btree concurrent] lookups=%d read-restarts=%lld (%.1f%%) write-restarts=%lld\n",
+           totalLookups, readRetries,
+           100.0 * (double)readRetries / (double)(totalLookups + readRetries),
+           writeRetries);
+
+    passed += Test("btree mt: every lookup of a live key hit", totalHits, totalLookups);
+    passed += Test("btree mt: no missing/torn lookup", totalErrors, 0);
+    passed += Test("btree mt: writers inserted all keys", totalInserted, 80000);
+    passed += Test("btree mt: count after concurrent inserts", t.count(), 100000);
+
+    // Without this the concurrency test is vacuous: if no read ever overlapped a
+    // writer, validation never failed and the seqlock was never exercised.
+    passed += Test("btree mt: reads were invalidated (the race is real)",
+                   (int)(readRetries > 0), 1);
+
+    // No lost keys - every key, from both families, is findable single-threaded
+    // and through the optimistic path.
+    bool allGet = true;
+    bool allOpt = true;
+    i = 1;
+    while (i <= 100000)
+    {
+        if (t.get(i) != i * 3) allGet = false;
+        int v = 0;
+        if (!t.lookup(i, &v) || v != i * 3) allOpt = false;
+        i = i + 1;
+    }
+    passed += Test("btree mt: no lost keys (get)", allGet, true);
+    passed += Test("btree mt: no lost keys (lookup)", allOpt, true);
+
+    delete[_] readerThreads;
+    delete[_] writerThreads;
+    delete[_] rc;
+    delete[_] wc;
+    return passed;
+}
+
+// Concurrent inserts into an EMPTY tree, enough to grow it several levels, so
+// every writer races through root creation, height growth, and node splits.
+// Then check the structural invariants a split must preserve.
+int testBtreeConcurrentInsertSplits()
+{
+    int passed = 0;
+    btree<int, int> t;
+
+    int numWriters = 4;
+    int perWriter  = 5000;                     // 20000 keys -> several levels at fanout 16
+
+    Thread* writerThreads = new Thread[numWriters];
+    BtreeWriterCtx* wc = new BtreeWriterCtx[numWriters];
+
+    int i = 0;
+    while (i < numWriters)
+    {
+        wc[i].tree   = &t;
+        wc[i].base   = 1 + i;                  // strided: all writers span all leaves
+        wc[i].stride = numWriters;
+        wc[i].n      = perWriter;
+        writerThreads[i].start(btreeInsertWorker, &wc[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < numWriters) { writerThreads[i].join(); i = i + 1; }
+
+    int totalInserted = 0;
+    i = 0;
+    while (i < numWriters) { totalInserted = totalInserted + wc[i].inserted; i = i + 1; }
+
+    passed += Test("btree mt-split: writers inserted all keys", totalInserted, 20000);
+    passed += Test("btree mt-split: count", t.count(), 20000);
+
+    bool allPresent = true;
+    i = 1;
+    while (i <= 20000) { if (t.get(i) != i * 3) allPresent = false; i = i + 1; }
+    passed += Test("btree mt-split: every key present", allPresent, true);
+
+    // Structural invariants: the tree really did grow, all leaves are at the same
+    // depth, and the leaf chain is a single ascending run holding every entry.
+    int depth = btreeDepthOf(t._root);
+    passed += Test("btree mt-split: tree grew several levels", (int)(depth >= 2), 1);
+    passed += Test("btree mt-split: all leaves at equal depth",
+                   btreeCheckLevels(t._root, 0, depth), true);
+
+    bool chainOk = false;
+    int chainTotal = btreeLeafChainTotal(t._root, &chainOk);
+    passed += Test("btree mt-split: leaf chain ascending + values intact", chainOk, true);
+    passed += Test("btree mt-split: leaf chain holds every entry", chainTotal, 20000);
+
+    delete[_] writerThreads;
+    delete[_] wc;
+    return passed;
+}
+
 extern int main(int argc, char** argv)
 {
     int passed = 0;
@@ -895,6 +1584,23 @@ extern int main(int argc, char** argv)
 
     delete[_] a;
     delete[_] b;
+
+    // ---- btree<K,V> ----
+    passed += testBtreeAscending();          total += 2;
+    passed += testBtreeDescending();         total += 2;
+    passed += testBtreeRandomOrder();        total += 2;
+    passed += testBtreeAddSetDuplicate();    total += 4;
+    passed += testBtreeRemoveAscending();    total += 3;
+    passed += testBtreeRemoveDescending();   total += 3;
+    passed += testBtreeRebalanceScenarios(); total += 15;
+    passed += testBtreeOrderedIteration();   total += 2;
+    passed += testBtreeSeekRange();          total += 5;
+    passed += testBtreeStringKeys();         total += 9;
+    passed += testBtreePointerValues();      total += 5;
+
+    // ---- btree<K,V> concurrent (optimistic lock coupling) ----
+    passed += testBtreeConcurrentLookupInsert();  total += 7;
+    passed += testBtreeConcurrentInsertSplits();  total += 7;
 
     printf("\n%d / %d HPC tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

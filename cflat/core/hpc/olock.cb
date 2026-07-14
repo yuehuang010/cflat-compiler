@@ -1,0 +1,95 @@
+// olock.cb - version lock (seqlock) for optimistic lock coupling.
+//
+// Version encoding:
+//   bit 0      - obsolete (node retired; any reader holding it must restart)
+//   bit 1      - write-locked
+//   bits 2..63 - change counter
+// release() adds 2, which clears bit 1 and bumps the counter in a single store.
+//
+// Readers take no lock: read_begin() snapshots the version, the caller reads the
+// guarded fields speculatively, then read_validate() checks nothing changed. A failed
+// validation means the read saw a torn state and the caller must restart. This is the
+// read side of optimistic lock coupling (Leis et al.) - see
+// internal/plan/optimistic-lock-coupling.md.
+//
+// Usage:
+//   olock ver;
+//   i64  v     = ver.read_begin();
+//   ... read guarded fields speculatively ...
+//   bool valid = ver.read_validate(v);   // false -> restart
+//
+//   lock (ver) { ... }                   // ILockable path: exclusive write
+//
+//   bool valid = ver.read(() => { ... });  // scoped speculative read; false -> restart
+
+import "interfaces.cb";
+import "atomic.cb";
+import "intrinsic.cb";   // pause(), fence_acquire()
+
+i64 OLOCK_OBSOLETE = 1;
+i64 OLOCK_LOCKED   = 2;
+
+[Capability(ILockable, IOptimisticLockable)]
+struct olock {
+    atomic__i64 _v = default;
+
+    // Snapshot the version for an optimistic read.  Spins while a writer holds the lock.
+    i64 read_begin() {
+        while (true) {
+            i64 v = _v.load();
+            if ((v & OLOCK_LOCKED) == 0) return v;
+            pause();
+        }
+    }
+
+    // True when no writer has touched the node since read_begin() returned v.
+    // The fence stops the caller's field loads from sinking below this re-read; without
+    // it the check validates data it has not read yet.
+    bool read_validate(i64 v) {
+        fence_acquire();
+        return _v.load() == v;
+    }
+
+    // Optimistic -> exclusive without re-descending.  False means a writer won the race.
+    bool upgrade(i64 v) {
+        return _v.cas(v, v | OLOCK_LOCKED);
+    }
+
+    // Speculative read: snapshot, run body, validate.  False means the body's reads are
+    // garbage and the caller must restart.  This is the third member of the acquire/release
+    // bracket family in atomic.cb (publish / observe / validate).
+    //
+    // The lock(this.optimistic) grant lets the body READ this lock's guarded fields; the
+    // compiler rejects a WRITE to one, which is what makes the speculation sound.
+    bool read(lock(this.optimistic) Lambda<void()> body) {
+        i64 v = read_begin();
+        body();
+        return read_validate(v);
+    }
+
+    // ILockable - exclusive acquire.  Backs `lock (n.ver) { }`.
+    void acquire() {
+        while (true) {
+            i64 v = read_begin();
+            if (_v.cas(v, v | OLOCK_LOCKED)) return;
+            pause();
+        }
+    }
+
+    // ILockable - release.  +2 clears OLOCK_LOCKED and bumps the counter, so every
+    // optimistic reader that snapshotted the old version now fails validation.
+    void release() {
+        _v.store_release(_v.load() + 2);
+    }
+
+    // Retire the node: readers must restart, and the memory may be reclaimed once the
+    // epoch advances.  Caller must hold the lock.
+    void obsolete() {
+        _v.store_release((_v.load() + 2) | OLOCK_OBSOLETE);
+    }
+
+    // True when the node has been retired out from under a snapshot.
+    bool is_obsolete(i64 v) {
+        return (v & OLOCK_OBSOLETE) != 0;
+    }
+};

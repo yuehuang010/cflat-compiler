@@ -1,0 +1,46 @@
+// Writing a guarded field while holding only a SHARED (read) lock.
+// A shared reader may not mutate what other readers are concurrently reading, so
+// lock(rw.read) grants reads of the guarded fields and nothing more.
+
+import "rwlock.cb";
+
+struct Counter {
+    rwlock rw = default;
+    lock(rw) {
+        int count = default;
+    }
+};
+
+expect_error("cannot write it while holding 'c.rw' in read mode") {
+    void testWriteUnderRead() {
+        Counter c;
+        lock(c.rw.read) {
+            c.count = 1;
+        }
+    }
+}
+
+// Compound assignment and ++ are writes too.
+expect_error("cannot write it while holding 'c.rw' in read mode") {
+    void testIncrementUnderRead() {
+        Counter c;
+        lock(c.rw.read) {
+            c.count++;
+        }
+    }
+}
+
+// Reading the same field under the same shared lock is legal - the check must not
+// reject a read, or lock(rw.read) would be useless.
+void testReadUnderReadIsFine() {
+    Counter c;
+    lock(c.rw.read) {
+        int v = c.count;
+    }
+    lock(c.rw.write) {
+        c.count = 5;   // exclusive: a write IS allowed
+    }
+    lock(c.rw) {
+        c.count = 6;   // bare form is exclusive, same as .write
+    }
+}

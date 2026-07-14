@@ -159,6 +159,11 @@ struct atomic__i64 {
         return __atomic_i64_cas(&_value, expected, desired);
     }
 
+    // Store with release ordering: writes issued before it cannot sink below it.
+    void store_release(i64 val) {
+        __atomic_release_store_i64(&_value, val);
+    }
+
     // Publish guarded data: run body (writes), then store val with a release fence.
     void release(i64 val, lock(this) Lambda<void()> body) {
         body();

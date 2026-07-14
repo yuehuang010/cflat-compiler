@@ -34,6 +34,19 @@ interface ICvWaitable
     void sleep_cv(void* cvSlot);
 };
 
+// Optimistic (version-validated) read contract.  A reader snapshots the version, reads
+// speculatively, then validates; a failed validation means the read is garbage - restart.
+// Readers issue no stores, so the read path never dirties the lock's cache line.
+interface IOptimisticLockable
+{
+    // Snapshot the current version, blocking while a writer holds the lock.
+    i64  read_begin();
+    // True when nothing has changed since read_begin() returned v.
+    bool read_validate(i64 v);
+    // Promote an optimistic snapshot to an exclusive lock.  False means restart.
+    bool upgrade(i64 v);
+};
+
 // Contract for a type that can render itself as a string.
 interface IString
 {

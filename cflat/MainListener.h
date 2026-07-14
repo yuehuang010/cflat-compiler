@@ -132,6 +132,10 @@ inline std::string getInterfaceMethodName(CFlatParser::InterfaceMethodContext* m
 // TYPE is ever named here - a type opts in with [Capability(...)] in source (see
 // core/interfaces.cb). Mode is the `.read` / `.write` suffix on the lock argument; "" and
 // "write" both mean exclusive. Renaming acquire()/release() across core is a one-row edit.
+//
+// IOptimisticLockable is deliberately NOT a row here: an optimistic read lowers to nothing
+// (an ordinary method call taking a lambda), so it has no acquire/release pair for a scoped
+// block to bracket. It is a CHECKING capability - see CapabilityForLockMode.
 struct CapabilitySpec
 {
     const char* Iface;
@@ -616,11 +620,9 @@ static bool ComputeReturnsOwned(const LLVMBackend::DeclTypeAndValue& returnType,
     return false;
 }
 
-// Canonical form of a lock expression's source text. Lock-set membership is compared as
-// strings, so 'p->m' and 'p.m' must canonicalize identically: arrow becomes dot, then the
-// trailing rwlock '.read' / '.write' mode suffix is stripped. Used by every lock capture site
-// (lock statement, lock clause, positional lock group) in BOTH passes so they agree.
-inline std::string NormalizeLockText(const std::string& text)
+// Arrow-normalized form of a lock expression's source text: 'p->m' becomes 'p.m'. The mode
+// suffix (if any) is left in place - see NormalizeLockText for the canonical, suffix-free form.
+inline std::string ArrowNormalizeLockText(const std::string& text)
 {
     std::string out;
     out.reserve(text.size());
@@ -637,25 +639,56 @@ inline std::string NormalizeLockText(const std::string& text)
             i++;
         }
     }
+    return out;
+}
+
+// Canonical form of a lock expression's source text. Lock-set membership is compared as
+// strings, so 'p->m' and 'p.m' must canonicalize identically: arrow becomes dot, then the
+// trailing '.read' / '.write' / '.optimistic' mode suffix is stripped. Used by every lock
+// capture site (lock statement, lock clause, positional lock group) in BOTH passes so they agree.
+inline std::string NormalizeLockText(const std::string& text)
+{
+    std::string out = ArrowNormalizeLockText(text);
     if (out.ends_with(".read"))
         out.resize(out.size() - 5);
     else if (out.ends_with(".write"))
         out.resize(out.size() - 6);
+    else if (out.ends_with(".optimistic"))
+        out.resize(out.size() - 11);
     return out;
 }
 
-// Returns "read", "write", or "" (exclusive) for a raw lock expression's source text.
+// Returns "read", "write", "optimistic", or "" (exclusive) for a raw lock expression's text.
 inline std::string LockTextMode(const std::string& text)
 {
     // Arrow-normalize first so 'p->rw.read' (and 'rw->read') still detect the mode suffix.
-    std::string dotted = text;
-    for (size_t i = 0; (i = dotted.find("->", i)) != std::string::npos; )
-        dotted.replace(i, 2, ".");
+    std::string dotted = ArrowNormalizeLockText(text);
     if (dotted.ends_with(".read"))
         return "read";
     if (dotted.ends_with(".write"))
         return "write";
+    if (dotted.ends_with(".optimistic"))
+        return "optimistic";
     return "";
+}
+
+// The held-mode a `.read` / `.write` / `.optimistic` suffix confers. "" and "write" are both
+// exclusive - the bare form `lock (m)` must never be demoted to Shared.
+inline LockMode LockModeFromSuffix(const std::string& mode)
+{
+    if (mode == "read")       return LockMode::Shared;
+    if (mode == "optimistic") return LockMode::Optimistic;
+    return LockMode::Exclusive;
+}
+
+// The capability interface a mode suffix demands of the lock's type. IOptimisticLockable is a
+// CHECKING capability - it has no kCapabilities row because an optimistic read lowers to
+// nothing (it is a method call taking a lambda, not an acquire/release pair).
+inline const char* CapabilityForLockMode(const std::string& mode)
+{
+    if (mode == "read")       return "ISharedLockable";
+    if (mode == "optimistic") return "IOptimisticLockable";
+    return "ILockable";
 }
 
 // ForwardRefScanner performs a lightweight pre-pass over the AST to register
@@ -916,8 +949,12 @@ private:
             if (auto* lc = paramDecl->lockClause())
             {
                 auto args = lc->lockArgList()->expression();
-                if (args.size() == 1 && args[0]->getText() == "this")
+                std::string lockText = args.size() == 1 ? args[0]->getText() : std::string();
+                if (args.size() == 1 && NormalizeLockText(lockText) == "this")
+                {
                     paramType.LockThis = true;
+                    paramType.LockThisMode = LockModeFromSuffix(LockTextMode(lockText));
+                }
                 else
                     Compiler(paramDecl)->LogError("lock(this) is the only supported form on function parameters");
             }
@@ -986,8 +1023,10 @@ private:
             std::vector<std::string> locks;
             if (auto* lockClauseCtx = func->lockClause())
             {
+                // Arrow-normalized but suffix-BEARING: the mode is what tells the body seeding
+                // whether the clause grants a write. Every consumer strips it (StripLockModeSuffix).
                 for (auto* exprCtx : lockClauseCtx->lockArgList()->expression())
-                    locks.push_back(NormalizeLockText(exprCtx->getText()));
+                    locks.push_back(ArrowNormalizeLockText(exprCtx->getText()));
             }
             for (const auto& extra : extraRequiredLocks)
                 locks.push_back(extra);
@@ -1941,6 +1980,8 @@ private:
     // Non-empty when the matched function parameter is declared lock(this): holds the canonical
     // receiver name (e.g. "d->ready") to seed currentLockSet during lambda body analysis.
     std::string lambdaLockThisReceiver;
+    // The mode lambdaLockThisReceiver is granted in - lock(this.optimistic) grants read-only.
+    LockMode lambdaLockThisMode = LockMode::Exclusive;
 
     // Side-channel from ParsePrimaryExpression to ParsePostfixExpression:
     // carries the cast TypeAndValue when the primary is a parenthesized cast expression,
@@ -1953,10 +1994,11 @@ private:
     // Variadic forwarding: true when the current function being codegen'd accepts '...'
     bool currentFunctionIsVariadic = false;
 
-    // Lock-set analysis: set of canonical lock expressions currently held.
-    // Cleared at function entry, seeded from the function's lock clause, and
-    // pushed/popped around lock statement bodies.
-    std::unordered_set<std::string> currentLockSet;
+    // Lock-set analysis: the canonical lock expressions currently held, and HOW each is held.
+    // Cleared at function entry, seeded from the function's lock clause, and pushed/popped
+    // around lock statement bodies. Membership grants a read of a guarded field; only
+    // LockMode::Exclusive grants a write (see CheckGuardedWrite).
+    std::unordered_map<std::string, LockMode> currentLockSet;
 
     // Generic template state lives on the backend so each LLVMBackend instance
     // owns its own copy. References below alias compilerLLVM->gts.<field> and are
@@ -5268,6 +5310,7 @@ public:
                 std::string acquireMethod;
                 std::string releaseMethod;
                 std::string typeName;
+                LockMode heldMode = LockMode::Exclusive;
                 llvm::Value* mutexPtr = nullptr; // address release() is called on - the mutex itself
             };
             std::vector<AcquiredLock> acquired;
@@ -5330,26 +5373,38 @@ public:
                 }
 
                 // Classify the receiver against the capability table. "write" and "" are both
-                // the exclusive mode; only "read" selects the shared row.
-                std::string wantMode = (mode == "read") ? "read" : "";
-                const CapabilitySpec* spec = nullptr;
-                bool hasAnyCapability = false;
-                for (const auto& cap : kCapabilities)
+                // the exclusive mode; "read" selects the shared row; "optimistic" demands
+                // IOptimisticLockable, which is a checking capability with no scoped lowering.
+                std::string wantMode = (mode == "read" || mode == "optimistic") ? mode : "";
+                const char* wantIface = CapabilityForLockMode(wantMode);
+                if (!compiler->TypeHasCapability(mutexTypeName, wantIface))
                 {
-                    if (!compiler->TypeHasCapability(mutexTypeName, cap.Iface)) continue;
-                    hasAnyCapability = true;
-                    if (wantMode == cap.Mode) { spec = &cap; break; }
-                }
-                if (spec == nullptr)
-                {
-                    if (!hasAnyCapability)
+                    if (wantMode.empty())
                         LogErrorContext(lockStmt, std::format(
                             "lock: type '{}' is not a lock type (missing [Capability(ILockable)]).",
                             mutexTypeName));
                     else
                         LogErrorContext(lockStmt, std::format(
-                            "lock: type '{}' does not support '{}' mode (missing [Capability(ISharedLockable)]).",
-                            mutexTypeName, mode));
+                            "lock: type '{}' does not support '{}' mode (missing [Capability({})]).",
+                            mutexTypeName, wantMode, wantIface));
+                    return;
+                }
+
+                const CapabilitySpec* spec = nullptr;
+                for (const auto& cap : kCapabilities)
+                {
+                    if (wantMode != cap.Mode) continue;
+                    if (!compiler->TypeHasCapability(mutexTypeName, cap.Iface)) continue;
+                    spec = &cap;
+                    break;
+                }
+                if (spec == nullptr)
+                {
+                    // Only 'optimistic' reaches here: it validates, it does not acquire, so there
+                    // is no acquire/release pair for a scoped block to bracket the body with.
+                    LogErrorContext(lockStmt, std::format(
+                        "lock: '{}' mode has no scoped form; call '{}.read(() => {{ ... }})' instead.",
+                        wantMode, canonical));
                     return;
                 }
                 std::string acquireMethod = spec->Acquire;
@@ -5374,7 +5429,8 @@ public:
                     return;
                 }
 
-                acquired.push_back({ canonical, acquireMethod, releaseMethod, mutexTypeName, mutexPtr });
+                acquired.push_back({ canonical, acquireMethod, releaseMethod, mutexTypeName,
+                                     LockModeFromSuffix(mode), mutexPtr });
             }
 
             // Push lock scope - only supports single-mutex cleanup via StackState today.
@@ -5388,22 +5444,34 @@ public:
                 };
             }
 
-            // Update lock-set for static analysis.
-            std::vector<std::string> lockTokens;
+            // Update lock-set for static analysis. Save each token's prior state so a nested
+            // `lock (m.read)` inside an outer `lock (m)` restores the outer mode on exit
+            // instead of dropping the lock from the set entirely.
+            std::vector<std::pair<std::string, std::optional<LockMode>>> savedTokens;
             for (const auto& lk : acquired)
+            {
                 for (auto& tok : LockSetAliases(lk.canonical))
-                    lockTokens.push_back(std::move(tok));
-            for (const auto& tok : lockTokens)
-                currentLockSet.insert(tok);
+                {
+                    auto it = currentLockSet.find(tok);
+                    savedTokens.emplace_back(tok,
+                        it == currentLockSet.end() ? std::optional<LockMode>{} : std::optional<LockMode>{ it->second });
+                    currentLockSet[tok] = lk.heldMode;
+                }
+            }
 
             // Parse the body.
             auto* blockList = lockStmt->compoundStatement()->blockItemList();
             if (blockList)
                 ParseBlockItemList(blockList);
 
-            // Remove from lock-set.
-            for (const auto& tok : lockTokens)
-                currentLockSet.erase(tok);
+            // Restore the lock-set.
+            for (auto it = savedTokens.rbegin(); it != savedTokens.rend(); ++it)
+            {
+                if (it->second.has_value())
+                    currentLockSet[it->first] = *it->second;
+                else
+                    currentLockSet.erase(it->first);
+            }
 
             // Close the scope - EmitDestructorsForScope will call unlock().
             compiler->CreateBlockBreak(nullptr, true);
@@ -5522,6 +5590,19 @@ public:
             genericFunctionTypeParams[name] = typeParams;
             genericFunctionConstraints[name] = ParseWhereClause(func->whereClause());
             return;
+        }
+
+        // A lock(this.read) / lock(this.optimistic) parameter grants a non-exclusive mode over
+        // `this`, so the enclosing type must actually carry that capability.
+        for (const auto& p : params)
+        {
+            if (!p.LockThis || p.LockThisMode == LockMode::Exclusive) continue;
+            std::string modeText = (p.LockThisMode == LockMode::Shared) ? "read" : "optimistic";
+            const char* wantIface = CapabilityForLockMode(modeText);
+            if (!structName.empty() && compiler->TypeHasCapability(structName, wantIface)) continue;
+            LogErrorContext(func, std::format(
+                "lock: type '{}' does not support '{}' mode (missing [Capability({})]).",
+                structName.empty() ? "<free function>" : structName, modeText, wantIface));
         }
 
         if (!structName.empty())
@@ -5644,9 +5725,10 @@ public:
             for (const auto& rawLock : sym->RequiredLocks)
             {
                 std::string canonical = StripLockModeSuffix(rawLock);
-                currentLockSet.insert(canonical);
+                LockMode heldMode = LockModeFromSuffix(LockTextMode(rawLock));
+                currentLockSet[canonical] = heldMode;
                 if (canonical.starts_with("this."))
-                    currentLockSet.insert(canonical.substr(5));
+                    currentLockSet[canonical.substr(5)] = heldMode;
             }
         }
 
@@ -7193,6 +7275,11 @@ public:
 
             auto namedVar = ParseUnaryExpression(unaryCtx);
             auto destination = namedVar.Storage;
+
+            // Guarded-field WRITE check: the lock must be held exclusively. Runs on the resolved
+            // LHS only, so a guarded field READ inside the LHS (e.g. an index 'a[n->count]') is
+            // not mistaken for a write.
+            CheckGuardedWrite(unaryCtx, namedVar);
 
             // The left side must resolve to an addressable storage location. A null Storage
             // means the LHS produced a value, not an lvalue - storing through it would
@@ -12533,6 +12620,7 @@ public:
                     {
                         if (namedVar.TypeAndValue.IsArrayView)
                             LogErrorContext(ctx, "'++' is not allowed on an array-view 'T[]' - it has no pointer arithmetic; index it with 'a[i]' instead");
+                        CheckGuardedWrite(ctx, namedVar);
                         if (namedVar.Storage)
                         {
                             llvm::Type* et = nullptr;
@@ -12555,6 +12643,7 @@ public:
                     {
                         if (namedVar.TypeAndValue.IsArrayView)
                             LogErrorContext(ctx, "'--' is not allowed on an array-view 'T[]' - it has no pointer arithmetic; index it with 'a[i]' instead");
+                        CheckGuardedWrite(ctx, namedVar);
                         if (namedVar.Storage)
                         {
                             llvm::Type* et = nullptr;
@@ -14499,6 +14588,17 @@ public:
                             break;
                         }
 
+                        // Hardware intrinsic: __atomic_acquire_fence() - portable memory-ordering
+                        // acquire fence (llvm.fence acquire). Returns nothing. Valid on every
+                        // target: lowers to `dmb ishld` on arm64 and to no instruction on x86.
+                        // Wrapped by fence_acquire() in intrinsic.cb.
+                        if (functionName == "__atomic_acquire_fence")
+                        {
+                            Compiler(ctx)->CreateFenceAcquire();
+                            namedVar = {};
+                            break;
+                        }
+
                         // Compiler intrinsics that take value arguments (bit ops, prefetch,
                         // fma, branch hints). Evaluate the argument expressions, then emit the
                         // matching LLVM intrinsic. These are wrapped by core/intrinsic.cb,
@@ -15163,6 +15263,7 @@ public:
                                     // lambda body gets currentLockSet seeded with the call-site receiver guard.
                                     lambdaExpectedType = {};
                                     lambdaLockThisReceiver = {};
+                                    lambdaLockThisMode = LockMode::Exclusive;
                                     if (funcSym && (argIdx + paramOffset) < funcSym->Parameters.size())
                                     {
                                         const auto& paramTv = funcSym->Parameters[argIdx + paramOffset];
@@ -15179,6 +15280,7 @@ public:
                                                     lambdaLockThisReceiver = parent + "." + field;
                                                 else if (!field.empty())
                                                     lambdaLockThisReceiver = field;
+                                                lambdaLockThisMode = paramTv.LockThisMode;
                                             }
                                         }
                                         // Encoded closure param (list<Lambda<...>>::add's `T value`, gap a):
@@ -16222,13 +16324,16 @@ public:
 
         // If the lambda parameter was declared lock(this), seed currentLockSet with the
         // resolved receiver guard (e.g. "d.ready") so GuardedBy checks inside the body pass.
+        // The mode comes from the suffix: lock(this.optimistic) grants reads only.
         std::string consumedLockThisReceiver = lambdaLockThisReceiver;
+        LockMode consumedLockThisMode = lambdaLockThisMode;
         lambdaLockThisReceiver = {};  // consumed - clear before body in case of nested lambdas
-        std::unordered_set<std::string> savedLockSet;
+        lambdaLockThisMode = LockMode::Exclusive;
+        std::unordered_map<std::string, LockMode> savedLockSet;
         if (!consumedLockThisReceiver.empty())
         {
             savedLockSet = currentLockSet;
-            currentLockSet.insert(consumedLockThisReceiver);
+            currentLockSet[consumedLockThisReceiver] = consumedLockThisMode;
         }
 
         // Parse body
@@ -16957,6 +17062,7 @@ public:
             "va_start", "va_end", "is_pointer", "is_primitive", "is_string", "annotationof",
             "reflect", "reflect_set", "__rdtscp", "__readcyclecounter", "__lfence", "__pause",
             "__popcount", "__ctz", "__clz", "__prefetch", "__fma", "__likely", "__unlikely",
+            "__atomic_acquire_fence",
         };
         if (kIntrinsics.count(name))
             return {};
@@ -18060,6 +18166,42 @@ public:
         LogErrorContext(node, std::format(
             "Global '{}' is guarded by '{}': must hold '{}' before accessing it.",
             name, guard, guard));
+    }
+
+    // The lock-set key a guarded variable's guard resolves to: a field reached through a
+    // receiver ("n->count") keys on "n.ver"; a self-field or guarded global keys on the bare
+    // guardian name. Mirrors the key the read-side guard checks build.
+    static std::string GuardLockKey(const LLVMBackend::TypeAndValue& tv)
+    {
+        const std::string& parent = tv.ParentVariableName;
+        return parent.empty() ? tv.GuardedBy : parent + "." + tv.GuardedBy;
+    }
+
+    // Write-side half of the guarded-access check. Reading a guarded field is legal in every
+    // held mode; WRITING one is legal only under an exclusive lock - a shared reader may not
+    // mutate what other readers are reading, and an optimistic reader holds nothing at all
+    // (its body must be side-effect free or the version validation means nothing).
+    // No-ops when the guard is not held: the read-side check has already reported that.
+    void CheckGuardedWrite(antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& target)
+    {
+        const std::string& guard = target.TypeAndValue.GuardedBy;
+        if (guard.empty()) return;
+
+        std::string key = GuardLockKey(target.TypeAndValue);
+        auto it = currentLockSet.find(key);
+        if (it == currentLockSet.end()) return;
+        if (it->second == LockMode::Exclusive) return;
+
+        const std::string& name = target.FieldName.empty()
+            ? target.TypeAndValue.VariableName : target.FieldName;
+        if (it->second == LockMode::Optimistic)
+            LogErrorContext(ctx, std::format(
+                "Field '{}' is guarded by '{}': cannot write it inside an optimistic read of '{}'.",
+                name, guard, key));
+        else
+            LogErrorContext(ctx, std::format(
+                "Field '{}' is guarded by '{}': cannot write it while holding '{}' in read mode.",
+                name, guard, key));
     }
 
     // Verify that the current lock-set satisfies the RequiredLocks of the function just called.
@@ -20661,8 +20803,12 @@ public:
             if (auto* lc = paramDecl->lockClause())
             {
                 auto args = lc->lockArgList()->expression();
-                if (args.size() == 1 && args[0]->getText() == "this")
+                std::string lockText = args.size() == 1 ? args[0]->getText() : std::string();
+                if (args.size() == 1 && NormalizeLockText(lockText) == "this")
+                {
                     paramType.LockThis = true;
+                    paramType.LockThisMode = LockModeFromSuffix(LockTextMode(lockText));
+                }
                 else
                     LogErrorContext(paramDecl, "lock(this) is the only supported form on function parameters");
             }

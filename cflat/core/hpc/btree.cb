@@ -1,0 +1,1052 @@
+// btree<K,V> - in-memory B+tree ordered map, with an optimistic-lock-coupling concurrent
+// lookup/insert path on top of the single-threaded core (see CONCURRENCY below).
+//
+// This is NOT a general-purpose container. dictionary<K,V> (hash map) beats it on point
+// lookups, and list<T> beats it on plain iteration - reach for those first. Use btree<K,V>
+// only when you need ordered iteration, range scans by key, or (later, once the concurrent
+// B-link phase lands - see internal/plan/optimistic-lock-coupling.md) many-core read scaling.
+// It lives under hpc/ so that reaching for it is a deliberate act, not the default.
+//
+// This is a B+tree, not a classic B-tree: all key/value pairs live in the leaves; internal
+// nodes hold separator keys and child pointers only. Leaves are singly linked left-to-right
+// via `next`, so a range scan walks the leaf chain without re-descending from the root - this
+// link is also load-bearing for the future concurrent B-link version, so it is kept even
+// though this single-threaded tree never needs to "catch up" a stale traversal.
+//
+// One node type (`isLeaf` flag) instead of separate leaf/internal structs: every node carries
+// both a `values` array and a `children` array, which wastes some memory on internal nodes
+// (unused `values`) and on leaves (unused `children`) - but it keeps a uniform node header,
+// which is what the concurrent version (per-node version lock, uniform layout) wants. A split
+// leaf/internal layout is a possible v2 memory optimization once the concurrent phase is not
+// still pending.
+//
+// Ordering comes from operator< on K (there is no IComparable interface in this codebase);
+// equality and greater-than are derived from < so K only needs to supply <. operator< exists
+// natively for primitive types and for `string` (core/string.cb).
+//
+// Ownership mirrors dictionary<K,V> exactly:
+//   - keys are non-owning, EXCEPT string keys, which are deep-copied on insert and destructed
+//     on removal (dictionary.cb's rationale: a plain store would alias the caller's soon-freed
+//     argument).
+//   - when V is a pointer type, the tree OWNS the values: add()/set() take ownership (move),
+//     set() frees the old value on overwrite, remove()/clear()/the destructor free values.
+//   - get() returns `alias V`: the returned value stays owned by the tree and must not be
+//     destructed by the caller; a miss returns default(V).
+//
+// CONCURRENCY. Two APIs coexist on the same tree:
+//
+//   single-threaded: add() / set() / get() / contains() / remove() / clear() / cursors.
+//                    No locks are taken. Use these when only one thread touches the tree.
+//   concurrent:      lookup() / insert(). Optimistic lock coupling (Leis et al.) on the
+//                    per-node `olock ver`. Safe against each other and against themselves
+//                    from any number of threads.
+//
+// Do not mix the two families on a live tree: remove()/set()/clear() FREE memory (a merge
+// frees a node, an overwrite frees a value) and an optimistic reader holds no lock, so a
+// free under it is a use-after-free. Reclamation is deferred (see Phase 6 of
+// internal/plan/optimistic-lock-coupling.md); lookup() and insert() are sound WITHOUT it
+// precisely because they never free anything - a split only allocates. Build the tree
+// single-threaded, or build it with insert(), then read it with lookup().
+//
+// See "concurrent (optimistic lock coupling) API" further down for the full contract.
+
+import "hpc/olock.cb";
+
+int BTREE_FANOUT = 16;   // max keys per node; internal nodes have up to 17 children
+
+// btree_node<K,V> - one node, leaf or internal, selected by isLeaf. Fixed inline arrays
+// (precedent: core/regex.cb's Match.caps) keep node storage a single flat allocation - and
+// they are what makes an optimistic (unvalidated) read safe: an index computed from a torn
+// `count` still lands inside the array, so it reads in-bounds garbage instead of faulting.
+//
+// `ver` guards every other field for the concurrent API. The fields are deliberately NOT
+// wrapped in a lock(ver) { } group: the `.optimistic` lock mode does not exist yet
+// (Phase 3/7), so the descent below is written with raw read_begin/read_validate/upgrade
+// calls and the no-side-effects rule inside a speculative region is enforced by review.
+// See optimistic-lock-coupling.md section 4b, "Option A".
+//
+// `isLeaf` is written once, before the node is published into the tree, and never again -
+// so it alone may be read without validation.
+struct btree_node<K, V>
+{
+    olock         ver          = default;    // version lock; guards everything below
+    bool          isLeaf       = true;       // immutable after publication
+    int           count        = 0;          // number of keys in use
+    K             keys[16]     = default;
+    V             values[16]   = default;     // leaf only: values[i] pairs with keys[i]
+    btree_node<K, V>* children[17] = default; // internal only: count+1 live entries
+    btree_node<K, V>* next      = nullptr;    // leaf only: next leaf in ascending key order
+};
+
+// btree_cursor<K,V> - a snapshot position in the leaf chain, produced by btree.first()/
+// seek() and advanced with next(). valid()/key()/value() read the current position.
+// Read-only: mutating the tree while a cursor is live is unchecked.
+struct btree_cursor<K, V>
+{
+    btree_node<K, V>* _leaf = nullptr;
+    int               _slot = 0;
+    V                 _missing = default;
+
+    bool valid()
+    {
+        return _leaf != nullptr && _slot < _leaf->count;
+    }
+
+    K key()
+    {
+        return _leaf->keys[_slot];
+    }
+
+    // `alias`: aliases the tree's storage, matching btree.get()'s contract.
+    alias V value()
+    {
+        if (!valid()) return _missing;
+        return _leaf->values[_slot];
+    }
+
+    void next()
+    {
+        if (_leaf == nullptr) return;
+        _slot++;
+        while (_leaf != nullptr && _slot >= _leaf->count)
+        {
+            _leaf = _leaf->next;
+            _slot = 0;
+        }
+    }
+};
+
+// btree<K,V> - ordered map on top of btree_node<K,V>. Owns values when V is a pointer type;
+// see the header comment above for the full ownership contract.
+struct btree<K, V>
+{
+    btree_node<K, V>* _root  = nullptr;
+    int               _count = 0;
+    V                 _missing = default;   // value returned by get() on a miss
+
+    // Concurrent-API state. `_ver` guards `_root` itself - a root change (tree creation,
+    // height growth) is a write to the tree's own "child pointer", and an optimistic
+    // descent couples through it exactly as it couples through an internal node.
+    olock             _ver     = default;
+    atomic_counter    _mtCount = default;   // entries added by insert(); count() adds it in
+    // Optimistic descents that failed validation and restarted, split by caller. Diagnostic
+    // only, and the ONLY store either path can issue on a lookup - and only on the rare
+    // restart edge, never on the validated path, so a successful lookup still dirties no
+    // shared cache line. A concurrent test where _readRestarts stays 0 never actually
+    // raced: the seqlock was never exercised and the test proves nothing.
+    atomic_counter    _readRestarts  = default;
+    atomic_counter    _writeRestarts = default;
+
+    // -- key ordering, derived entirely from operator< --------------------------------
+
+    bool _lt(K a, K b) { return a < b; }
+    bool _le(K a, K b) { return !(b < a); }
+    bool _eq(K a, K b) { return !(a < b) && !(b < a); }
+
+    // -- node helpers -------------------------------------------------------------------
+
+    btree_node<K, V>* _newLeaf()
+    {
+        btree_node<K, V>* n = new btree_node<K, V>();
+        n->isLeaf = true;
+        return n;
+    }
+
+    btree_node<K, V>* _newInternal()
+    {
+        btree_node<K, V>* n = new btree_node<K, V>();
+        n->isLeaf = false;
+        return n;
+    }
+
+    // Store a key into slot i of a node, deep-copying string keys (mirrors dictionary.cb).
+    void _storeKey(btree_node<K, V>* n, int i, K key)
+    {
+        if const (is_string(K)) n->keys[i] = key.copy();
+        if const (!is_string(K)) n->keys[i] = key;
+    }
+
+    // Free a value taken out of a leaf slot (pointer values are deleted, others destructed).
+    // Takes the value by move rather than a node+index: this language's ownership model
+    // will not let a helper delete/move a field reached through its own borrowed (non-move)
+    // parameter, so callers extract "move node->values[i]" themselves - which is legal there
+    // because at every call site `node` is a genuine local, not a parameter.
+    void _freeValue(move V value)
+    {
+        if const (is_pointer(V))
+            if (value != nullptr) delete value;
+        if const (!is_pointer(V))
+            value.~();
+    }
+
+    // Free a string key taken out of a leaf slot; a no-op unless K is a string (non-string
+    // keys are borrowed, never owned). See _freeValue for why this takes the key by move
+    // instead of a node+index.
+    void _freeKey(move K key)
+    {
+        if const (is_string(K)) key.~();
+    }
+
+    // Insert (sep, rightChild) into internal node parent at position idx: parent->keys[idx]
+    // = sep, parent->children[idx+1] = rightChild, shifting existing entries right. Takes
+    // ownership of rightChild (a freshly new'd node from _splitChild) - without `move` here,
+    // an unconsumed owning parameter is freed at the caller's scope exit, use-after-freeing
+    // the node this just stored into the tree.
+    void _insertChildAt(btree_node<K, V>* parent, int idx, K sep, move btree_node<K, V>* rightChild)
+    {
+        int j = parent->count;
+        while (j > idx)
+        {
+            parent->keys[j] = parent->keys[j - 1];
+            parent->children[j + 1] = parent->children[j];
+            j--;
+        }
+        parent->keys[idx] = sep;
+        parent->children[idx + 1] = rightChild;
+        parent->count++;
+    }
+
+    // Split parent->children[idx], which is full (count == BTREE_FANOUT). Leaf split: the
+    // upper half moves to a new right leaf, linked into the chain; the right leaf's first
+    // key is COPIED up as the separator (the key itself stays in the leaf). Internal split:
+    // the median key MOVES up into the parent and is removed from both children.
+    void _splitChild(btree_node<K, V>* parent, int idx)
+    {
+        btree_node<K, V>* left = parent->children[idx];
+        btree_node<K, V>* right = new btree_node<K, V>();
+        right->isLeaf = left->isLeaf;
+
+        if (left->isLeaf)
+        {
+            int mid = BTREE_FANOUT / 2;
+            int rightCount = left->count - mid;
+            int i = 0;
+            while (i < rightCount)
+            {
+                right->keys[i] = left->keys[mid + i];
+                right->values[i] = left->values[mid + i];
+                i++;
+            }
+            right->count = rightCount;
+            left->count = mid;
+            right->next = left->next;
+            left->next = right;
+
+            K sep = right->keys[0];   // copied up; stays in the leaf too
+            _insertChildAt(parent, idx, sep, right);
+        }
+        else
+        {
+            int mid = BTREE_FANOUT / 2;
+            K sep = left->keys[mid];   // moves up; removed from both children below
+            int rightCount = left->count - mid - 1;
+            int i = 0;
+            while (i < rightCount)
+            {
+                right->keys[i] = left->keys[mid + 1 + i];
+                i++;
+            }
+            i = 0;
+            while (i <= rightCount)
+            {
+                right->children[i] = left->children[mid + 1 + i];
+                i++;
+            }
+            right->count = rightCount;
+            left->count = mid;
+            _insertChildAt(parent, idx, sep, right);
+        }
+    }
+
+    // Index of the child to descend into for key, in an internal node: the first i with
+    // key < node->keys[i], or node->count if key >= every separator.
+    int _childIndex(btree_node<K, V>* n, K key)
+    {
+        int i = 0;
+        while (i < n->count && _le(n->keys[i], key)) i++;
+        return i;
+    }
+
+    // Slot holding key in leaf n, or -1 if key is absent. Read-only.
+    int _leafFind(btree_node<K, V>* n, K key)
+    {
+        int i = 0;
+        while (i < n->count && _lt(n->keys[i], key)) i++;
+        if (i < n->count && _eq(n->keys[i], key)) return i;
+        return -1;
+    }
+
+    // Place a NEW (key, value) at its sorted position in leaf n. The caller must have
+    // confirmed that key is absent (_leafFind == -1) and that n has room. Consumes value on
+    // every path. Never allocates or frees a node, and never frees a value - so it is safe
+    // to call with only n's own lock held, which is what the concurrent fast path does.
+    void _leafInsertNew(btree_node<K, V>* n, K key, move V value)
+    {
+        int i = 0;
+        while (i < n->count && _lt(n->keys[i], key)) i++;
+
+        int j = n->count;
+        while (j > i)
+        {
+            n->keys[j] = n->keys[j - 1];
+            n->values[j] = n->values[j - 1];
+            j--;
+        }
+        _storeKey(n, i, key);
+        n->values[i] = move value;
+        n->count++;
+    }
+
+    // Shared insert path for add() (overwrite=false) and set() (overwrite=true). Splits
+    // full nodes on the way down (single top-down pass), so the leaf reached is never full.
+    // Single-threaded: takes no locks.
+    bool _insertOrSet(K key, move V value, bool overwrite)
+    {
+        if (_root == nullptr) _root = _newLeaf();
+
+        if (_root->count == BTREE_FANOUT)
+        {
+            btree_node<K, V>* newRoot = _newInternal();
+            newRoot->children[0] = _root;
+            _splitChild(newRoot, 0);
+            _root = newRoot;
+        }
+
+        btree_node<K, V>* n = _root;
+        while (!n->isLeaf)
+        {
+            int i = _childIndex(n, key);
+            if (n->children[i]->count == BTREE_FANOUT)
+            {
+                _splitChild(n, i);
+                i = _childIndex(n, key);
+            }
+            n = n->children[i];
+        }
+
+        // The overwrite free stays HERE, on a genuine local `n`: the ownership model will
+        // not let a helper move a field out through its own borrowed parameter (see
+        // _freeValue). That is also why the concurrent insert() never overwrites.
+        int s = _leafFind(n, key);
+        if (s >= 0)
+        {
+            if (!overwrite) return false;
+            _freeValue(move n->values[s]);
+            n->values[s] = move value;
+            return true;
+        }
+
+        _leafInsertNew(n, key, move value);
+        _count++;
+        return true;
+    }
+
+    // Insert a new entry. Returns false if key is already present (existing value is left
+    // untouched - use set() to overwrite). When V is a pointer type, the tree takes ownership.
+    bool add(K key, move V value)
+    {
+        return _insertOrSet(key, move value, false);
+    }
+
+    // Insert or overwrite the value for key. When V is a pointer type, the tree takes
+    // ownership; on overwrite the old value is freed first.
+    void set(K key, move V value)
+    {
+        _insertOrSet(key, move value, true);
+    }
+
+    // Find the leaf that would contain key, and the in-leaf slot (or -1 on a miss).
+    // Out-params: *leafOut receives the leaf, *slotOut the slot.
+    void _find(K key, btree_node<K, V>** leafOut, int* slotOut)
+    {
+        btree_node<K, V>* n = _root;
+        while (n != nullptr && !n->isLeaf)
+            n = n->children[_childIndex(n, key)];
+
+        *leafOut = n;
+        *slotOut = -1;
+        if (n == nullptr) return;
+
+        int i = 0;
+        while (i < n->count && _lt(n->keys[i], key)) i++;
+        if (i < n->count && _eq(n->keys[i], key)) *slotOut = i;
+    }
+
+    // Returns true if key is present.
+    bool contains(K key)
+    {
+        btree_node<K, V>* leaf = nullptr;
+        int slot = -1;
+        _find(key, &leaf, &slot);
+        return slot != -1;
+    }
+
+    // Read the value for key. Returns default(V) if not present. `alias`: the value stays
+    // owned by the tree, so the caller must not destruct the returned value.
+    alias V get(K key)
+    {
+        btree_node<K, V>* leaf = nullptr;
+        int slot = -1;
+        _find(key, &leaf, &slot);
+        if (slot == -1) return _missing;
+        return leaf->values[slot];
+    }
+
+    // =====================================================================================
+    // concurrent (optimistic lock coupling) API - lookup() and insert()
+    // =====================================================================================
+    //
+    // Contract:
+    //   - lookup() and insert() are safe from any number of threads, against each other and
+    //     against themselves. Everything else on this type is single-threaded-only.
+    //   - remove() / set() / clear() / the destructor must NOT run concurrently with them.
+    //     They free memory (merge frees a node; overwrite frees a value) and an optimistic
+    //     reader holds no lock, so a free under it is a use-after-free. That needs epoch
+    //     reclamation, which is deferred - see Phase 6 of optimistic-lock-coupling.md.
+    //     insert() never frees: a split only allocates, which is exactly why it is sound
+    //     with no reclamation at all. insert() therefore has add() semantics (returns false
+    //     on a duplicate) and never overwrites.
+    //   - K must be a type whose operator< does not dereference - i.e. a primitive. The
+    //     descent compares keys read SPECULATIVELY, and a torn string/pointer key would be
+    //     dereferenced before there is any chance to validate it. int keys are the case
+    //     this is built for. V may be anything: values are only ever copied out and
+    //     validated before use, never dereferenced speculatively.
+    //
+    // The speculative-region rules, enforced here by review and not by the compiler (the
+    // node's fields are ungrouped - Option A, section 4b):
+    //   - no stores to shared memory, no allocation, no delete, no I/O;
+    //   - every array index stays inside the node's fixed storage even when `count` is torn
+    //     (hence the clamps in _childIndexSpec / _leafSlotSpec);
+    //   - nothing read speculatively is USED until validation succeeds - copy out first.
+
+    // Speculative _childIndex. `count` may be torn, so it is clamped to the node's capacity
+    // before it bounds the scan; the result is in 0..BTREE_FANOUT, always a live index of
+    // children[17]. Read-only. Garbage in, in-bounds garbage out - never a fault.
+    int _childIndexSpec(btree_node<K, V>* n, K key)
+    {
+        int c = n->count;
+        if (c < 0) c = 0;
+        if (c > BTREE_FANOUT) c = BTREE_FANOUT;
+        int i = 0;
+        while (i < c && _le(n->keys[i], key)) i++;
+        return i;
+    }
+
+    // Speculative in-leaf search: the slot holding key, or -1. Same clamp, same rules.
+    // The answer is meaningless until the caller validates the leaf's version.
+    int _leafSlotSpec(btree_node<K, V>* n, K key)
+    {
+        int c = n->count;
+        if (c < 0) c = 0;
+        if (c > BTREE_FANOUT) c = BTREE_FANOUT;
+        int i = 0;
+        while (i < c && _lt(n->keys[i], key)) i++;
+        if (i < c && _eq(n->keys[i], key)) return i;
+        return -1;
+    }
+
+    // Optimistic lock-coupled descent to the leaf that would hold key. Takes NO locks and
+    // issues NO stores.
+    //
+    // Returns false when the descent must be restarted (a validation failed - the tree
+    // changed under us and everything read is garbage). Returns true on success, with
+    // *leafOut set to the leaf and *verOut to the version snapshot that was validated for
+    // it - nullptr/0 when the tree is genuinely (and validatedly) empty.
+    //
+    // The coupling is the ORDER: snapshot the parent, read the child pointer, snapshot the
+    // CHILD's version, and only THEN validate the parent. Validating the parent after the
+    // child snapshot is what makes the child pointer trustworthy: if the parent did not
+    // move, the pointer we read out of it was real, and any later change to the child is
+    // caught by the child's own snapshot.
+    bool _descendOptimistic(K key, btree_node<K, V>** leafOut, i64* verOut)
+    {
+        *leafOut = nullptr;
+        *verOut = 0;
+
+        // The tree itself is the first "parent": _ver guards the _root slot.
+        i64 tv = _ver.read_begin();
+        btree_node<K, V>* n = _root;
+        if (n == nullptr) return _ver.read_validate(tv);   // empty only if validated
+
+        i64 v = n->ver.read_begin();
+        if (!_ver.read_validate(tv)) return false;         // couple through the root slot
+
+        while (!n->isLeaf)                                 // isLeaf: immutable, needs no guard
+        {
+            int slot = _childIndexSpec(n, key);
+            btree_node<K, V>* child = n->children[slot];   // speculative
+            // A live child pointer is never null; reading one means `count` was torn ahead
+            // of the store that filled the slot. Restart rather than dereference it.
+            if (child == nullptr) return false;
+
+            i64 cv = child->ver.read_begin();
+            if (!n->ver.read_validate(v)) return false;    // <- the coupling point
+            n = child;
+            v = cv;
+        }
+
+        *leafOut = n;
+        *verOut = v;
+        return true;
+    }
+
+    // Concurrent lookup. Fully optimistic: no locks, and on the validated path no stores at
+    // all, so a hot node's cache line stays Shared in every core's L1 - the whole point of
+    // OLC. Returns true and writes the value to *out when key is present.
+    //
+    // *out is an ALIAS when V is a pointer type, exactly like get(): the tree still owns it.
+    bool lookup(K key, V* out)
+    {
+        while (true)
+        {
+            btree_node<K, V>* leaf = nullptr;
+            i64 lv = 0;
+            if (!_descendOptimistic(key, &leaf, &lv)) { _readRestarts.increment(); continue; }
+            if (leaf == nullptr) return false;               // validated empty tree
+
+            // Speculative: search the leaf and COPY the value out. Nothing below the
+            // validate may be used, so `found` is a copy, not a reference into the node.
+            int slot = _leafSlotSpec(leaf, key);
+            V found = default;
+            if (slot >= 0) found = leaf->values[slot];
+
+            if (!leaf->ver.read_validate(lv)) { _readRestarts.increment(); continue; }
+
+            // Validated: `slot` and `found` are now real.
+            if (slot < 0) return false;
+            *out = found;
+            return true;
+        }
+        return false;
+    }
+
+    // Fast-path half of insert(): descend optimistically and hand back the target leaf
+    // EXCLUSIVELY LOCKED and with room for one more entry. Returns nullptr when the slow
+    // path is needed (empty tree, or the leaf is full and a split must happen).
+    //
+    // upgrade() is where the optimistic snapshot becomes a real exclusive lock. It is
+    // acquired NON-LEXICALLY - there is no lock() block - so every caller path must
+    // release() it by hand. That is expected and legal (lock-guard-mandatory.md).
+    btree_node<K, V>* _fastLockLeafWithRoom(K key)
+    {
+        while (true)
+        {
+            btree_node<K, V>* leaf = nullptr;
+            i64 lv = 0;
+            if (!_descendOptimistic(key, &leaf, &lv)) { _writeRestarts.increment(); continue; }
+            if (leaf == nullptr) return nullptr;              // empty tree -> slow path
+
+            // Optimistic -> exclusive. Fails if any writer touched the leaf since lv,
+            // which also means the leaf may no longer be the right one: restart.
+            if (!leaf->ver.upgrade(lv)) { _writeRestarts.increment(); continue; }
+
+            // From here `leaf` is locked, and its count can no longer move.
+            if (leaf->count >= BTREE_FANOUT)
+            {
+                leaf->ver.release();
+                return nullptr;                              // needs a split -> slow path
+            }
+            return leaf;
+        }
+        return nullptr;
+    }
+
+    // Concurrent insert. Fast path: optimistic descent + upgrade() at the leaf, touching
+    // exactly one node's lock and no parent. Slow path (rare): the leaf is full, so a
+    // split is needed - retake the whole descent under real exclusive locks.
+    //
+    // add() semantics: false if key was already present (the tree is left untouched). When
+    // V is a pointer type the tree takes ownership of value on the inserting path.
+    bool insert(K key, move V value)
+    {
+        btree_node<K, V>* leaf = _fastLockLeafWithRoom(key);
+        if (leaf == nullptr) return _insertPessimistic(key, move value);
+
+        if (_leafFind(leaf, key) >= 0)
+        {
+            leaf->ver.release();                             // non-lexical: every path
+            return false;                                    // duplicate
+        }
+        _leafInsertNew(leaf, key, move value);
+        leaf->ver.release();
+        _mtCount.increment();
+        return true;
+    }
+
+    // Slow path: exclusive lock-coupled top-down descent with preemptive splitting - the
+    // single-threaded algorithm with real locks. Hold the parent, take the child, split the
+    // child if it is full (which writes to the parent, hence the parent must still be held),
+    // then release the parent. Locks are only ever taken root-to-leaf, so there is no cycle
+    // and no deadlock. Rare, so it is written for correctness, not for speed.
+    bool _insertPessimistic(K key, move V value)
+    {
+        while (true)
+        {
+            // The tree's own lock guards _root; it is the parent of the root node and is
+            // coupled through in the same way - released only once the root is locked.
+            _ver.acquire();
+            if (_root == nullptr) _root = _newLeaf();
+            btree_node<K, V>* n = _root;
+            n->ver.acquire();
+
+            if (n->count == BTREE_FANOUT)
+            {
+                // Grow the height. newRoot is invisible until _root is stored, so locking
+                // it cannot contend; lock it BEFORE publishing so no racer can slip in.
+                btree_node<K, V>* newRoot = _newInternal();
+                newRoot->children[0] = n;
+                _splitChild(newRoot, 0);
+                newRoot->ver.acquire();
+                _root = newRoot;
+                n->ver.release();
+                n = newRoot;
+            }
+            _ver.release();                                  // coupled: n is locked
+
+            bool restart = false;
+            while (!n->isLeaf)
+            {
+                int i = _childIndex(n, key);
+                btree_node<K, V>* child = n->children[i];
+                child->ver.acquire();
+
+                if (child->count == BTREE_FANOUT)
+                {
+                    // n was not full when we took it, and holding its lock is what keeps it
+                    // that way - no other thread can reach n's children while n is held, so
+                    // it always has room for the separator. Defensive only: restart rather
+                    // than overflow keys[16] if that invariant were ever violated.
+                    if (n->count >= BTREE_FANOUT)
+                    {
+                        child->ver.release();
+                        n->ver.release();
+                        restart = true;
+                        break;
+                    }
+                    _splitChild(n, i);                       // writes n and child, both held
+                    child->ver.release();
+                    continue;                                // re-pick under the still-held n
+                }
+
+                n->ver.release();                            // coupled: child is locked
+                n = child;
+            }
+            if (restart) { _writeRestarts.increment(); continue; }
+
+            // Preemptive splitting guarantees the leaf has room; the guard is defensive
+            // (and a restart, not a corruption, if the invariant ever slipped).
+            if (n->count >= BTREE_FANOUT)
+            {
+                n->ver.release();
+                _writeRestarts.increment();
+                continue;
+            }
+
+            if (_leafFind(n, key) >= 0)
+            {
+                n->ver.release();
+                return false;                                // duplicate
+            }
+            _leafInsertNew(n, key, move value);
+            n->ver.release();
+            _mtCount.increment();
+            return true;
+        }
+        return false;
+    }
+
+    // Minimum keys a non-root node must hold after a remove.
+    int _minKeys()
+    {
+        return (BTREE_FANOUT / 2) - 1;
+    }
+
+    // Descend from the root toward key, recording the path of internal nodes visited into
+    // path/pathIdx (path[0] is the root, pathIdx[0] the child index taken from path[0], etc;
+    // path[depth-1] is the returned leaf's immediate parent) and writing the leaf reached
+    // into *leafOut. Fixed-size path buffer: a BTREE_FANOUT-ary tree at int-count scale
+    // never exceeds a depth remotely close to 64.
+    int _pathTo(K key, btree_node<K, V>** path, int* pathIdx, btree_node<K, V>** leafOut)
+    {
+        int depth = 0;
+        btree_node<K, V>* n = _root;
+        while (!n->isLeaf)
+        {
+            int i = _childIndex(n, key);
+            path[depth] = n;
+            pathIdx[depth] = i;
+            depth++;
+            n = n->children[i];
+        }
+        *leafOut = n;
+        return depth;
+    }
+
+    // Remove an entry by key. Returns true if removed (and frees the value); false if not
+    // found. Rebalances (borrow or merge) up the path on underflow, and shrinks the tree's
+    // height if the root becomes a childless internal node. The walk itself lives in
+    // _rebalanceFrom() below.
+    //
+    // SINGLE-THREADED ONLY. A merge FREES a node, and an optimistic reader inside that node
+    // holds no lock - so running this against a concurrent lookup()/insert() is a
+    // use-after-free. Concurrent remove needs epoch reclamation and is deferred (Phase 6 of
+    // internal/plan/optimistic-lock-coupling.md).
+    bool remove(K key)
+    {
+        if (_root == nullptr) return false;
+
+        btree_node<K, V>*[64] path = default;
+        int[64] pathIdx = default;
+        btree_node<K, V>* leaf = nullptr;
+        int depth = _pathTo(key, path, pathIdx, &leaf);
+
+        int i = 0;
+        while (i < leaf->count && _lt(leaf->keys[i], key)) i++;
+        if (i >= leaf->count || !_eq(leaf->keys[i], key)) return false;
+
+        _freeValue(move leaf->values[i]);
+        _freeKey(move leaf->keys[i]);
+        int j = i;
+        while (j < leaf->count - 1)
+        {
+            leaf->keys[j] = leaf->keys[j + 1];
+            leaf->values[j] = leaf->values[j + 1];
+            j++;
+        }
+        leaf->count--;
+        _count--;
+
+        // Rebalance (borrow or merge) up the path on underflow, and shrink the tree's
+        // height if the root collapses. `leaf` is only ever borrowed here - remove() does
+        // not own it (it is already linked into the tree); ownership only moves at the
+        // point a helper actually frees a node (see _mergeWithLeft/_mergeWithRight/
+        // _collapseEmptyRoot, all of which take their doomed node by `move`).
+        _rebalanceFrom(path, pathIdx, depth, leaf);
+
+        return true;
+    }
+
+    // Walk up from `node` (the node just modified by remove(), at depth `d` in the path
+    // recorded by _pathTo) rebalancing via borrow or merge on underflow. Both borrow and
+    // merge only ever touch node's immediate parent's separator (a borrow moves one entry
+    // across a single sibling boundary; a merge deletes the separator between the two
+    // nodes it joins), so no fixup above the immediate parent is ever required. `node` is
+    // borrowed - it is already part of the tree, and this function only sometimes hands
+    // it off (via `move`) to a helper that frees it.
+    void _rebalanceFrom(btree_node<K, V>** path, int* pathIdx, int depth, btree_node<K, V>* node)
+    {
+        int d = depth;
+        while (true)
+        {
+            if (d == 0)
+            {
+                // node is the root: shrink the tree's height if it is now empty (a
+                // childless internal node collapses to its only child; an empty leaf
+                // collapses the tree to nullptr). Otherwise node stays the root untouched.
+                if (node->count == 0) _collapseEmptyRoot(node->isLeaf, move node);
+                break;
+            }
+            if (node->count >= _minKeys()) break;
+
+            btree_node<K, V>* parent = path[d - 1];
+            int idx = pathIdx[d - 1];
+
+            btree_node<K, V>* leftSib = idx > 0 ? parent->children[idx - 1] : nullptr;
+            btree_node<K, V>* rightSib = idx < parent->count ? parent->children[idx + 1] : nullptr;
+
+            if (leftSib != nullptr && leftSib->count > _minKeys())
+            {
+                _borrowFromLeft(parent, idx, node, leftSib);
+                break;
+            }
+            if (rightSib != nullptr && rightSib->count > _minKeys())
+            {
+                _borrowFromRight(parent, idx, node, rightSib);
+                break;
+            }
+
+            if (leftSib != nullptr)
+                _mergeWithLeft(parent, idx, move node, leftSib);
+            else
+                _mergeWithRight(parent, idx, node, move rightSib);
+
+            node = parent;
+            d--;
+        }
+    }
+
+    // Merge node into leftSib (node is parent->children[idx], leftSib is its left sibling);
+    // node disappears. Frees node, so it is taken by move.
+    void _mergeWithLeft(btree_node<K, V>* parent, int idx, move btree_node<K, V>* node, btree_node<K, V>* leftSib)
+    {
+        int k = 0;
+        if (node->isLeaf)
+        {
+            while (k < node->count)
+            {
+                leftSib->keys[leftSib->count] = node->keys[k];
+                leftSib->values[leftSib->count] = node->values[k];
+                leftSib->count++;
+                k++;
+            }
+            leftSib->next = node->next;
+        }
+        else
+        {
+            leftSib->keys[leftSib->count] = parent->keys[idx - 1];
+            leftSib->count++;
+            while (k < node->count)
+            {
+                leftSib->keys[leftSib->count] = node->keys[k];
+                leftSib->count++;
+                k++;
+            }
+            k = 0;
+            int c = leftSib->count - node->count;
+            while (k <= node->count)
+            {
+                leftSib->children[c] = node->children[k];
+                c++;
+                k++;
+            }
+        }
+        delete node;
+
+        int m = idx - 1;
+        while (m < parent->count - 1)
+        {
+            parent->keys[m] = parent->keys[m + 1];
+            parent->children[m + 1] = parent->children[m + 2];
+            m++;
+        }
+        parent->count--;
+    }
+
+    // Merge rightSib into node (node is parent->children[idx], rightSib is its right
+    // sibling); rightSib disappears. Frees rightSib, so it is taken by move.
+    void _mergeWithRight(btree_node<K, V>* parent, int idx, btree_node<K, V>* node, move btree_node<K, V>* rightSib)
+    {
+        int k = 0;
+        if (node->isLeaf)
+        {
+            while (k < rightSib->count)
+            {
+                node->keys[node->count] = rightSib->keys[k];
+                node->values[node->count] = rightSib->values[k];
+                node->count++;
+                k++;
+            }
+            node->next = rightSib->next;
+        }
+        else
+        {
+            node->keys[node->count] = parent->keys[idx];
+            node->count++;
+            while (k < rightSib->count)
+            {
+                node->keys[node->count] = rightSib->keys[k];
+                node->count++;
+                k++;
+            }
+            k = 0;
+            int c = node->count - rightSib->count;
+            while (k <= rightSib->count)
+            {
+                node->children[c] = rightSib->children[k];
+                c++;
+                k++;
+            }
+        }
+        delete rightSib;
+
+        int m = idx;
+        while (m < parent->count - 1)
+        {
+            parent->keys[m] = parent->keys[m + 1];
+            parent->children[m + 1] = parent->children[m + 2];
+            m++;
+        }
+        parent->count--;
+    }
+
+    // Free an empty root node (node->count == 0, already verified by the caller) and shrink
+    // the tree: an internal node collapses to its only remaining child; a leaf collapses to
+    // an empty tree. Always frees node, so it is taken by move.
+    void _collapseEmptyRoot(bool wasLeaf, move btree_node<K, V>* node)
+    {
+        if (!wasLeaf)
+        {
+            btree_node<K, V>* onlyChild = node->children[0];
+            delete node;
+            _root = onlyChild;
+        }
+        else
+        {
+            delete node;
+            _root = nullptr;
+        }
+    }
+
+    // Borrow the last entry of leftSib into node (node is parent->children[idx]).
+    void _borrowFromLeft(btree_node<K, V>* parent, int idx, btree_node<K, V>* node, btree_node<K, V>* leftSib)
+    {
+        if (node->isLeaf)
+        {
+            int j = node->count;
+            while (j > 0) { node->keys[j] = node->keys[j - 1]; node->values[j] = node->values[j - 1]; j--; }
+            node->keys[0] = leftSib->keys[leftSib->count - 1];
+            node->values[0] = leftSib->values[leftSib->count - 1];
+            node->count++;
+            leftSib->count--;
+            parent->keys[idx - 1] = node->keys[0];
+        }
+        else
+        {
+            int j = node->count;
+            while (j > 0) { node->keys[j] = node->keys[j - 1]; j--; }
+            int c = node->count + 1;
+            while (c > 0) { node->children[c] = node->children[c - 1]; c--; }
+            node->keys[0] = parent->keys[idx - 1];
+            node->children[0] = leftSib->children[leftSib->count];
+            parent->keys[idx - 1] = leftSib->keys[leftSib->count - 1];
+            node->count++;
+            leftSib->count--;
+        }
+    }
+
+    // Borrow the first entry of rightSib into node (node is parent->children[idx]).
+    void _borrowFromRight(btree_node<K, V>* parent, int idx, btree_node<K, V>* node, btree_node<K, V>* rightSib)
+    {
+        if (node->isLeaf)
+        {
+            node->keys[node->count] = rightSib->keys[0];
+            node->values[node->count] = rightSib->values[0];
+            node->count++;
+            int j = 0;
+            while (j < rightSib->count - 1) { rightSib->keys[j] = rightSib->keys[j + 1]; rightSib->values[j] = rightSib->values[j + 1]; j++; }
+            rightSib->count--;
+            parent->keys[idx] = rightSib->keys[0];
+        }
+        else
+        {
+            node->keys[node->count] = parent->keys[idx];
+            node->children[node->count + 1] = rightSib->children[0];
+            node->count++;
+            parent->keys[idx] = rightSib->keys[0];
+            int j = 0;
+            while (j < rightSib->count - 1) { rightSib->keys[j] = rightSib->keys[j + 1]; j++; }
+            int c = 0;
+            while (c < rightSib->count) { rightSib->children[c] = rightSib->children[c + 1]; c++; }
+            rightSib->count--;
+        }
+    }
+
+    // Number of entries currently in the tree. The two insert families keep separate
+    // tallies (_count is plain, _mtCount is atomic because concurrent inserters race on
+    // it) and the total is their sum, so the answer is right whichever family was used.
+    int count()
+    {
+        return _count + (int)_mtCount.read();
+    }
+
+    // lookup() descents that failed validation and had to restart - i.e. reads that saw a
+    // torn tree and threw the result away. Zero under no contention.
+    i64 read_restarts()
+    {
+        return _readRestarts.read();
+    }
+
+    // insert() fast-path descents that failed validation or lost the upgrade() race.
+    i64 write_restarts()
+    {
+        return _writeRestarts.read();
+    }
+
+    // Free every node and value below n (post-order), including n itself.
+    void _freeSubtree(move btree_node<K, V>* n)
+    {
+        if (n == nullptr) return;
+        if (n->isLeaf)
+        {
+            int i = 0;
+            while (i < n->count)
+            {
+                _freeValue(move n->values[i]);
+                _freeKey(move n->keys[i]);
+                i++;
+            }
+        }
+        else
+        {
+            int i = 0;
+            while (i <= n->count)
+            {
+                _freeSubtree(n->children[i]);
+                i++;
+            }
+        }
+        delete n;
+    }
+
+    // Remove all entries, freeing owned values (and string keys) and every node.
+    // The tree is empty afterward.
+    void clear()
+    {
+        _freeSubtree(_root);
+        _root = nullptr;
+        _count = 0;
+    }
+
+    // Free every node and owned value.
+    void destroy()
+    {
+        clear();
+    }
+
+    // -- ordered iteration ----------------------------------------------------------------
+
+    // Cursor at the smallest key (invalid/empty if the tree has no entries).
+    btree_cursor<K, V> first()
+    {
+        btree_cursor<K, V> c;
+        btree_node<K, V>* n = _root;
+        while (n != nullptr && !n->isLeaf) n = n->children[0];
+        c._leaf = n;
+        c._slot = 0;
+        while (c._leaf != nullptr && c._slot >= c._leaf->count)
+        {
+            c._leaf = c._leaf->next;
+            c._slot = 0;
+        }
+        return c;
+    }
+
+    // Cursor at the first key >= key (invalid if every key is smaller).
+    btree_cursor<K, V> seek(K key)
+    {
+        btree_cursor<K, V> c;
+        btree_node<K, V>* n = _root;
+        while (n != nullptr && !n->isLeaf)
+            n = n->children[_childIndex(n, key)];
+
+        c._leaf = n;
+        c._slot = 0;
+        if (n == nullptr) return c;
+
+        int i = 0;
+        while (i < n->count && _lt(n->keys[i], key)) i++;
+        c._slot = i;
+        while (c._leaf != nullptr && c._slot >= c._leaf->count)
+        {
+            c._leaf = c._leaf->next;
+            c._slot = 0;
+        }
+        return c;
+    }
+
+    // Free all nodes and owned values.
+    ~btree()
+    {
+        clear();
+    }
+};

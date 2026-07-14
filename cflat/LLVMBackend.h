@@ -329,6 +329,16 @@ inline const std::string& MacSdkPathCached()
 }
 #endif
 
+// How a lock is held at a guarded-field access. Exclusive is `lock (m)` / `lock (rw.write)`;
+// Shared is `lock (rw.read)`; Optimistic is a version-validated speculative read - it holds
+// nothing at all. Only Exclusive permits a WRITE to a guarded field.
+enum class LockMode
+{
+    Exclusive,
+    Shared,
+    Optimistic,
+};
+
 class LLVMBackend
 {
 public:
@@ -469,6 +479,9 @@ public:
         // True when this function parameter is declared lock(this): the lambda/callback passed here
         // executes with the call-site receiver seeded into currentLockSet for GuardedBy checks.
         bool LockThis = false;
+        // The mode that grant is seeded in: lock(this) / lock(this.write) -> Exclusive,
+        // lock(this.read) -> Shared, lock(this.optimistic) -> Optimistic (reads only).
+        LockMode LockThisMode = LockMode::Exclusive;
 
         bool IsPrimitive() const
         {
@@ -3077,6 +3090,11 @@ private:
         // llvm.x86.sse2.lfence returns void and takes no arguments.
         auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::x86_sse2_lfence);
         builder->CreateCall(fn, {});
+    }
+
+    void CreateFenceAcquire()
+    {
+        builder->CreateFence(llvm::AtomicOrdering::Acquire);
     }
 
     void CreatePause()

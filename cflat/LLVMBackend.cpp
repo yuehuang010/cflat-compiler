@@ -3748,6 +3748,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (t.IsBond)                 o["bd"]  = true;
     if (t.CallConv != LLVMBackend::CallingConv::Default) o["cc"] = static_cast<int64_t>(t.CallConv);
     if (t.LockThis)               o["lt"]  = true;
+    if (t.LockThisMode != LockMode::Exclusive) o["ltm"] = static_cast<int64_t>(t.LockThisMode);
     if (!t.GuardedBy.empty())     o["gb"]  = t.GuardedBy;
     if (t.IsFunctionPointer)
     {
@@ -3798,6 +3799,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("bd")) t.IsBond = *v;
     if (auto v = o.getInteger("cc")) t.CallConv = static_cast<LLVMBackend::CallingConv>(*v);
     if (auto v = o.getBoolean("lt")) t.LockThis = *v;
+    if (auto v = o.getInteger("ltm")) t.LockThisMode = static_cast<LockMode>(*v);
     if (auto v = o.getString("gb"))  t.GuardedBy = v->str();
     if (auto v = o.getBoolean("fp")) t.IsFunctionPointer = *v;
     if (t.IsFunctionPointer)
