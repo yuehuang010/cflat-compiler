@@ -3340,6 +3340,31 @@ struct AlignPlain { int v = 0; };
 alignas(64) i64 g_align_counter = 0;
 alignas(64) AlignCL g_align_cl = default;
 
+// Over-alignment carried by the TYPE is recoverable from the static type at every free
+// site, so it survives escaping into a struct field - the destructor's `delete` routes to
+// the aligned deallocator just as the `new` routed to the aligned allocator. This is the
+// supported way to own an over-aligned buffer in a struct. (A per-site
+// `new T[n] alignas(N)` cannot escape: see Test/errors/err_aligned_new_escape.cb.)
+struct alignas(64) AlignChunk { double a = 0.0; double b = 0.0; };
+
+struct ChunkHolder
+{
+    AlignChunk[] buf = default;
+    ~ChunkHolder() { delete[_] buf; }   // aligned free, recovered from AlignChunk
+};
+
+struct PlainChunk { double a = 0.0; double b = 0.0; };
+
+struct PlainHolder
+{
+    PlainChunk[] buf = default;
+    ~PlainHolder() { delete[_] buf; }   // ordinary free
+};
+
+// A `move` param owns the block and frees it at scope exit; the alignment must be
+// recovered from the element type there too, or an aligned block goes to plain free.
+void consumeChunks(move AlignChunk* p) { }
+
 bool testAlignas()
 {
     bool result = true;
@@ -3386,6 +3411,52 @@ bool testAlignas()
     result &= Test("new double[n] alignas(4096) base%4096", (int)(((i64)&pbuf[0]) & 4095), 0);
     pbuf[0] = 3.5;
     result &= Test("page-aligned buf read", pbuf[0] == 3.5, true);
+
+    // Type-level over-alignment ESCAPING into a struct field: `new AlignChunk[n]` takes the
+    // aligned allocator, and the destructor's `delete` recovers alignof(AlignChunk) from the
+    // static type and takes the aligned deallocator. Interleaved with an ordinary-element
+    // holder so BOTH free routes churn the same heap - a mis-routed free corrupts it within
+    // a few rounds. (Before the fix, the `move` param below took the ordinary free path.)
+    int    fieldMisaligned = 0;
+    double fieldSum        = 0.0;
+    for (int i = 0; i < 64; i = i + 1)
+    {
+        ChunkHolder ch;
+        ch.buf = new AlignChunk[8];
+        if ((((i64)&ch.buf[0]) & 63) != 0) fieldMisaligned = fieldMisaligned + 1;
+        ch.buf[7].a = 7.5;
+        fieldSum = fieldSum + ch.buf[7].a;
+
+        PlainHolder ph;
+        ph.buf = new PlainChunk[8];
+        ph.buf[0].a = 0.5;
+        fieldSum = fieldSum + ph.buf[0].a;
+
+        consumeChunks(new AlignChunk[4]);   // callee owns it; freed at ITS scope exit
+    }
+    result &= Test("alignas(64) elem in field: base%64 over 64 rounds", fieldMisaligned, 0);
+    result &= Test("aligned+plain field churn sum",                    fieldSum == 512.0, true);
+
+    // Per-site `new T[n] alignas(N)` stays owned by its local: move between locals keeps the
+    // tag, so the extracted local still frees through the aligned route.
+    double[] src = new double[32] alignas(64);
+    double[] moved = move src;
+    result &= Test("move of alignas(64) local base%64", (int)(((i64)&moved[0]) & 63), 0);
+    moved[0] = 9.5;
+    result &= Test("moved aligned buf read", moved[0] == 9.5, true);
+    delete[_] moved;
+
+    // Regression (sticky tag): an aligned allocation whose result is not consumed by a local
+    // declaration must not leave its alignment behind on the compiler's pending-allocation
+    // slot, or the NEXT owning declaration - an ordinary block - inherits it and is freed
+    // through the aligned route. Here the aligned buffer is consumed by a call argument.
+    ChunkHolder sc;
+    sc.buf = new AlignChunk[4];            // aligned; must not leak the tag forward
+    double[] plainSrc = new double[8];
+    double[] ordinary = move plainSrc;     // ordinary block; must NOT inherit an aligned tag
+    ordinary[0] = 4.5;
+    result &= Test("ordinary move-out after aligned allocation", ordinary[0] == 4.5, true);
+    delete[_] ordinary;
 
     return result;
 }

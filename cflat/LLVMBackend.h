@@ -1557,12 +1557,22 @@ private:
         if (auto* dtor = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
             builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
 
-        // Free the pointer. An over-aligned buffer (`new T[n] alignas(N)`, N>16) came
-        // from the aligned allocator, so it must be freed via __delete_aligned to match;
-        // otherwise use the allocator-aware operator delete.
+        // Free the pointer. An over-aligned block came from the aligned allocator, so it must be
+        // freed via __delete_aligned to match. Two sources: the element TYPE's own alignment
+        // (`struct alignas(64) T`), recovered here from the static type just like the `delete`
+        // path does, and any per-site `new T[n] alignas(N)` excess carried on the local.
         auto* voidPtrTy = builder->getInt8Ty()->getPointerTo();
         auto* voidPtr = builder->CreateBitCast(ptrVal, voidPtrTy);
-        llvm::Function* alignedDel = namedVar.AllocAlignment > 16 ? GetFunction("__delete_aligned") : nullptr;
+        uint64_t effAlign = namedVar.AllocAlignment;
+        if (!namedVar.TypeAndValue.TypeName.empty() && !namedVar.TypeAndValue.ElemPointer)
+        {
+            TypeAndValue tv{ .TypeName = namedVar.TypeAndValue.TypeName };
+            llvm::Type* t = GetType(tv);
+            if (t != nullptr && t->isSized())
+                effAlign = std::max(effAlign, GetEffectiveAlignmentForType(tv.TypeName, t));
+        }
+        llvm::Function* alignedDel = effAlign > kDefaultNewAlign
+            ? GetFunction("__delete_aligned") : nullptr;
         if (alignedDel)
             builder->CreateCall(alignedDel->getFunctionType(), alignedDel, { voidPtr });
         else if (auto* opDel = GetFunction("operator delete"))
@@ -9221,6 +9231,21 @@ public:
         {
             if (params[i].IsMove)
             {
+                // A `move` param takes ownership and frees the block itself, but the per-site
+                // alignment of `new T[n] alignas(N)` is not in the element type, so the callee
+                // (e.g. `list<T*>.add`, whose element free is shared by every instantiation)
+                // cannot recover it. Reject rather than corrupt the heap. Alignment carried by
+                // the TYPE is not tagged and passes through freely.
+                if (args[i].AllocAlignment > kDefaultNewAlign)
+                    LogError(std::format(
+                        "cannot move the over-aligned buffer '{}' ('new T[n] alignas({})') into the 'move' parameter "
+                        "of '{}': that alignment is a property of the allocation, not of the type, so the callee "
+                        "cannot recover it and would free the block as an ordinary allocation. Keep the buffer in "
+                        "the local that allocated it, or over-align the ELEMENT TYPE instead "
+                        "('struct alignas({}) Chunk {{ ... }};').",
+                        args[i].CallerName.empty() ? args[i].TypeAndValue.TypeName : args[i].CallerName,
+                        args[i].AllocAlignment, functionName, args[i].AllocAlignment));
+
                 // A `move string` argument transfers ownership to the callee, which frees
                 // it on return. If the argument is an unnamed owned-string temporary (e.g.
                 // a chained-concat result passed directly), drop it from the end-of-
@@ -9622,6 +9647,10 @@ public:
             a = it->second.UserRequestedAlignment;
         return a;
     }
+
+    /// Alignment the default `operator new` already guarantees on x64. An allocation
+    /// that needs more routes to `operator new(size, align)` / `__delete_aligned`.
+    static constexpr uint64_t kDefaultNewAlign = 16;
 
     /// C++-style padded size: roundUp(allocSize, effectiveAlign).
     /// Used by sizeof so that arrays of over-aligned types stride correctly.

@@ -51,10 +51,47 @@ vectorize loops use `align N` moves (vs align 8 baseline). Aligned free is
 sound: per-site alignment is carried on the owning local
 (NamedVariable.AllocAlignment, threaded via lastAllocAlignment) so both the
 scope-exit auto-free (EmitOwningPtrCleanup) and explicit delete route to
-__delete_aligned; escaping the buffer into a field loses the tag (delete it
-explicitly there). doc/HPC.md gained an Alignment section. Tests:
+__delete_aligned. doc/HPC.md gained an Alignment section. Tests:
 Test/test_basic.cb testAlignas + err_new_alignas_not_power_of_two.cb. Gates
 green: test.bat, test_lsp.bat (201/0), example.bat (88/0/24).
+
+G1 free-routing fixed 2026-07-14 (agent). Three separate heap-corruption bugs,
+all from the same root: the free site chose aligned-vs-ordinary from a tag that
+only ever existed on the owning LOCAL, threaded through the sticky
+`lastAllocAlignment` global.
+
+1. per-site `new T[n] alignas(N)` escaping into a field lost the tag -> plain
+   free of an _aligned_malloc block (the reported issue);
+2. that global was never consumed unless a local DECLARATION took the `new`
+   result, so an aligned allocation stored into a field leaked its alignment
+   FORWARD onto the next owning declaration -> aligned free of an ORDINARY block
+   (corruption in the opposite direction, and not previously known);
+3. scope-exit auto-free (EmitOwningPtrCleanup) read only that tag and never the
+   static TYPE, so an owning pointer that reached a scope-exit free without
+   passing through a `new`-bound local - notably a `move T*` PARAM - freed a
+   type-over-aligned block (`struct alignas(64) T`) through the ordinary
+   deallocator. Type-level alignas was believed sound everywhere; it was not.
+
+Fix, per the C/C++ model: over-alignment that lives in the TYPE is recoverable
+from the static type at every free site, so it needs no tag and escapes freely -
+EmitOwningPtrCleanup now folds in GetEffectiveAlignmentForType exactly like the
+`delete` path already did (fixes 3). NamedVariable.AllocAlignment now carries
+ONLY the per-site EXCESS over the type's own alignment, `move` propagates it, and
+the sticky global is cleared wherever lastOwningResult is (fixes 2). That excess
+is not in any type, so it cannot survive an escape: storing it in a field,
+returning it, or moving it into a `move` param (incl. list<T*>.add) are now hard
+compile errors pointing at the type-level alternative (fixes 1, by diagnostic).
+
+`alignas` keeps its C/C++ meaning throughout - it never describes the pointee of
+a pointer. Two gaps that fell out of this are filed separately:
+internal/issue/alignas-on-member-ignored-in-layout.md (alignas on a MEMBER is a
+silent no-op in struct layout) and internal/issue/no-aligned-raw-buffer-field.md
+(no way to own an over-aligned raw `double[]` in a field; wants an allocation-
+alignment clause distinct from `alignas`).
+
+Tests: Test/test_basic.cb testAlignas (type-level alignas escaping into a field +
+move param + sticky-tag case) and Test/errors/err_aligned_new_escape.cb (the
+three rejected escapes).
 
 Today: only alignof. No way to over-align a type/field/allocation, no
 assume-aligned. simd load/store uses element alignment (safe, but forfeits

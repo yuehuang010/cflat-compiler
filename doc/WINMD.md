@@ -153,6 +153,33 @@ i32 v = r.value;                             // safe: the whole chain succeeded
 
 If `Make()` fails, `Value()` is never called and `Make`'s HRESULT propagates straight to `r`.
 
+#### Who Releases the Intermediate?
+
+Chaining through a factory - `factory->Make()?.Value()` - dispatches `Value()` on a `Counter*` the
+caller never names. COM says an `[out, retval]` interface pointer comes back **AddRef'd** (`+1`), so
+that intermediate is a reference nobody else holds. The chain therefore **releases it for you**,
+right after it has dispatched through it:
+
+```cpp
+HResult<i32> r = factory->Make()?.Value();   // the Counter that Make() produced is released here
+```
+
+This happens **only** for the shape whose `+1` is guaranteed: an unnamed temporary `HResult<T*>`
+that came straight out of a `[winrt]` vtable slot call, where `T` is a `[winrt]` class. The chain
+never releases anything else, because nothing else promises a `+1`:
+
+| Shape | Released by the chain? |
+|---|---|
+| `factory->Make()?.Value()` - temporary from a COM slot call | **Yes** - it is unreachable otherwise |
+| `HResult<Counter*> h = factory->Make();` - you named it | No - it is yours; call `h.value->Release()` |
+| `MyPlainFunc()?.Value()` - a plain (non-COM) function's `HResult` | No - it may hold a borrowed pointer |
+| `HResult<i32>` and other non-pointer `T` | No - nothing to release |
+| The chain's own **result** (`HResult<Cat*> c = f->Make()?.Adopt();`) | No - `c.value` is handed to you, so `c.value->Release()` is yours |
+| A failing chain (`Make()` returned an error) | No - no object was produced |
+
+So the rule stays the familiar COM one: **you release what a call hands you and you can still name.**
+The chain only cleans up the references it created and then dropped on your behalf.
+
 ### `com.cb` Helpers
 
 `import "com.cb";` brings in the shared COM values:

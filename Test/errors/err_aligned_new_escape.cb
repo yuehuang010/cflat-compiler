@@ -1,0 +1,44 @@
+// A per-site `new T[n] alignas(N)` deliberately keeps the alignment OUT of the element
+// type, so no free site reached through an escape can recover it - the block would be
+// handed to the ordinary deallocator and corrupt the heap. Every ownership transfer that
+// drops the tag is therefore a compile error. (Over-aligning the TYPE instead -
+// `struct alignas(64) Chunk` - is recoverable from the static type and escapes freely;
+// that path is covered positively in Test/test_basic.cb testAlignas.)
+
+import "list.cb";
+
+struct AlignEscapeHolder { double[] buf = default; };
+
+// 1. Stored into a struct field.
+expect_error("cannot store an over-aligned buffer") {
+    void alignedIntoField()
+    {
+        AlignEscapeHolder h;
+        h.buf = new double[64] alignas(64);
+    }
+}
+
+// 2. Returned to the caller.
+expect_error("cannot return the over-aligned buffer") {
+    move double[] alignedReturned()
+    {
+        double[] b = new double[64] alignas(64);
+        return b;
+    }
+}
+
+// 3. Moved into a `move` parameter - here a container, whose generic element free is
+//    shared by every instantiation and so cannot know the alignment.
+expect_error("into the 'move' parameter") {
+    void alignedIntoList()
+    {
+        list<double*> bufs;
+        double* b = new double[64] alignas(64);
+        bufs.add(b);
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

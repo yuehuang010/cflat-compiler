@@ -30,6 +30,8 @@ struct LeakPair { string name = default; list<int> nums = default; };
 // Owning Lambda<> field (lambda Option A): a closure stored in a struct field owns its heap
 // env and is freed by the struct's destructor, like a string/list field.
 struct LeakHandler { Lambda<int(int)> fn = default; };
+// Same, but the closure RETURNS an owned string - the shape that exposed the field-callee leak.
+struct LeakLabeler { Lambda<string(int)> label = default; };
 
 // Function-type alias: ownership/clone/free flow through the alias exactly as through the
 // underlying Lambda<int(int)>, so clone-by-default reassignment must not leak.
@@ -496,6 +498,25 @@ extern int main()
         Lambda<string()> localFn = () => { string t = "x" + "y"; return t; };  // owned local
         string fromLambdaLocal = localFn();
         total++; passed += Test("lambda owned local return", fromLambdaLocal.length(), 2);
+
+        // Invoking the SAME closure through a struct FIELD must behave identically. The call
+        // RESULT is a fresh value, not a read of the field, so the receiving local takes the
+        // returned buffer directly. (Regression: the result inherited the callee field's
+        // provenance and was classified as a borrow of an owning string FIELD - the local got a
+        // deep copy while the returned buffer was orphaned, leaking it.) Covered for a heap
+        // object, a stack value, and reassignment of an existing local.
+        LeakLabeler* heapLbl = new LeakLabeler();
+        heapLbl.label = (int n) => { return "n=" + n.toString(); };
+        string fromFieldHeap = heapLbl.label(7);
+        total++; passed += Test("lambda field owned return (heap)", fromFieldHeap, "n=7");
+        delete heapLbl;
+
+        LeakLabeler valLbl = default;
+        valLbl.label = (int n) => { return "v" + n.toString(); };
+        string fromFieldValue = valLbl.label(9);
+        total++; passed += Test("lambda field owned return (value)", fromFieldValue, "v9");
+        fromFieldValue = valLbl.label(10);                  // reassign from another field call
+        total++; passed += Test("lambda field owned return (reassign)", fromFieldValue, "v10");
 
         // Borrow return: list.get hands the element back as a non-owning borrow (owned bit
         // cleared). The list still owns and frees it on teardown; the local `picked` must NOT

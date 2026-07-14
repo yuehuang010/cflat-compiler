@@ -527,8 +527,8 @@ sharing between cores, and giving the vectorizer aligned buffers.
 
 Two cores writing different fields that share a cache line thrash that line back
 and forth between their L1s - the "false sharing" cliff. `alignas(64)` on a
-struct (or a field) pads it to a full cache line so per-worker slots land on
-separate lines:
+struct, local, or global pads it to a full cache line so per-worker slots land
+on separate lines:
 
 ```c
 // Per-worker accumulator: one cache line each, so worker writes never collide.
@@ -541,7 +541,9 @@ alignas(64) i64 g_counter = 0;  // a lone hot global on its own line
 `sizeof` and `alignof` both report the padded size, and array stride follows -
 `alignas(64)` on a 12-byte struct makes `sizeof == 64` and `&a[1] - &a[0] == 64`.
 This is a layout property of the type: it applies everywhere the type is used
-(fields, locals, globals, arrays, `new`).
+(fields, locals, globals, arrays, `new`) - including a heap allocation, so
+`new Chunk[n]` on an over-aligned `Chunk` takes the aligned allocator and the
+matching `delete` recovers the alignment from the same static type.
 
 ### Aligned allocation - `new T[n] alignas(N)`
 
@@ -553,13 +555,61 @@ double[] a = new double[n] alignas(64);   // base address is a multiple of 64
 ```
 
 This is an allocation property, not a type property: `sizeof(double)` is still
-8 and the buffer strides by 8. The buffer comes from the aligned allocator, so
-it must be freed by a path that knows it is over-aligned. Freeing a local it is
-bound to - either an explicit `delete[_] a;` / `delete[n] a;`, or the automatic
-scope-exit free of the owning `T[]` local - does the right thing. If you instead
-store the buffer into a struct field or hand it off elsewhere, delete it
-explicitly at that site; the aligned-free tag is tracked on the owning local,
-not on arbitrary aliases.
+8 and the buffer strides by 8.
+
+#### The buffer must stay owned by the local that allocated it
+
+The block comes from the aligned allocator, so it has to be freed through the
+matching aligned path - and because the alignment is deliberately **not in the
+type**, the only thing that knows about it is the local the `new` was bound to.
+Freeing through that local is fine: an explicit `delete[_] a;` / `delete[n] a;`,
+the automatic scope-exit free, or a `move` to another local all work.
+
+Every ownership transfer that would drop the alignment is a **compile error**,
+not a silent mis-free:
+
+```c
+struct Tile { double[] buf = default; };
+
+Tile t;
+t.buf = new double[n] alignas(64);   // error: stored into a field
+list<double*> tiles;
+tiles.add(new double[n] alignas(64));// error: moved into a `move` param
+move double[] make(i64 n) { return new double[n] alignas(64); }  // error: returned
+```
+
+A field, a parameter, a return type, and a generic container's element type all
+carry only the *type*, and `double` says nothing about 64-byte alignment - so no
+free site reached that way could pick the right deallocator.
+
+Borrowing is unrestricted: passing the buffer as a `T[]` / `span<T>` argument is
+a borrow, not a transfer, so kernels take it normally. Only *ownership* moves are
+restricted.
+
+#### To store an over-aligned buffer in a struct, over-align the type
+
+Put the alignment on the **element type**. Then it *is* part of the type, so
+every free site recovers it from the same static type the `new` used - exactly as
+in C++ - and the buffer escapes freely into fields, containers and returns:
+
+```c
+struct alignas(64) Chunk { double a = 0.0; double b = 0.0; };   // sizeof == 64
+
+struct Tiles
+{
+    Chunk[] buf = default;
+    ~Tiles() { delete[_] buf; }       // aligned free, recovered from alignof(Chunk)
+};
+
+Tiles t;
+t.buf = new Chunk[n];                 // aligned allocation - no `alignas` clause needed
+```
+
+The tradeoff is that `alignas` on a type also pads its `sizeof` and array stride
+(here `sizeof(Chunk) == 64`), which is what you want for cache-line-separated
+records but not for a flat `double[]` you want to stream through a `vectorize`
+loop. There is currently no way to own a *raw* over-aligned `double[]` in a
+struct field - keep it in a local, or wrap it in an over-aligned element type.
 
 ### Assume-aligned for the vectorizer
 

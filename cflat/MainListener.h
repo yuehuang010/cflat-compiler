@@ -4369,8 +4369,25 @@ public:
                                 returnNV.CallerName.empty() ? returnNV.TypeAndValue.TypeName : returnNV.CallerName));
                         }
 
+                        // The per-site alignment of `new T[n] alignas(N)` is not in the element
+                        // type, so the caller cannot recover it from the return type and would
+                        // free the block as an ordinary allocation. Reject it. (Alignment carried
+                        // by the TYPE is not tagged here and returns freely, as in C++.)
+                        if (returnNV.AllocAlignment > LLVMBackend::kDefaultNewAlign)
+                        {
+                            LogErrorContext(jump, std::format(
+                                "cannot return the over-aligned buffer '{}' ('new T[n] alignas({})'): that alignment "
+                                "is a property of the allocation, not of the type, so the caller cannot recover it "
+                                "from the return type and would free the block as an ordinary allocation. Over-align "
+                                "the ELEMENT TYPE instead ('struct alignas({}) Chunk {{ ... }};') - a type's "
+                                "alignment travels with it into fields, containers and returns.",
+                                returnNV.CallerName.empty() ? returnNV.TypeAndValue.TypeName : returnNV.CallerName,
+                                returnNV.AllocAlignment, returnNV.AllocAlignment));
+                        }
+
                         // Clear flags consumed by the return check.
                         compiler->lastOwningResult = false;
+                        compiler->lastAllocAlignment = 0;
                         compiler->lastCallReturnsOwned = false;
                         compiler->lastCallIsBonded = false;
                         compiler->lastCallBondByAddress = false;
@@ -7135,6 +7152,7 @@ public:
         // falsely inherits ownership and double-frees at scope exit. Mirrors the existing
         // assignment-path reset (see operatorText == "=" below).
         compilerLLVM->lastOwningResult = false;
+        compilerLLVM->lastAllocAlignment = 0;
 
         auto* condCtx = ctx->conditionalExpression();
         if (condCtx && !ctx->assignmentOperator()
@@ -7409,7 +7427,10 @@ public:
             // ownership - consuming lastOwningResult here would be wrong (the new-allocated
             // value is either moved via items.add(move p) or managed by the caller).
             // Reset the flag so it doesn't leak into the next declaration in this scope.
+            // The over-alignment tag rides the same signal and must be reset with it, or a
+            // later owning declaration adopts it and aligned-frees an ordinary block.
             compiler->lastOwningResult = false;
+            compiler->lastAllocAlignment = 0;
             auto right = LoadNamedVariable(rightNV);
 
             // A plain assignment moves the RHS value into the named lvalue; if it was an
@@ -7662,6 +7683,25 @@ public:
             bool destIsStructField = (destGep && destGep->getNumIndices() == 2
                 && destGep->getSourceElementType()->isStructTy())
                 || namedVar.IsInterfaceField;  // reached via the interface's byte-offset slot
+
+            // The per-site alignment of `new T[n] alignas(N)` is deliberately NOT part of the
+            // element type, so no free site reached through a field can recover it - the block
+            // would be freed as an ordinary allocation and corrupt the heap. Reject the store.
+            // (Alignment carried by the TYPE is not tagged here and escapes freely, as in C++.)
+            if (operatorText == "=" && destIsStructField
+                && rightNV.AllocAlignment > LLVMBackend::kDefaultNewAlign)
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot store an over-aligned buffer ('new T[n] alignas({})') into {}: that alignment is a "
+                    "property of the allocation, not of the type, so a free through the field cannot recover it. "
+                    "Keep the buffer in the local that allocated it, or over-align the ELEMENT TYPE instead "
+                    "('struct alignas({}) Chunk {{ ... }};') - a type's alignment travels with it into fields, "
+                    "containers and returns.",
+                    rightNV.AllocAlignment,
+                    namedVar.FieldName.empty() ? std::string("a field")
+                                               : std::format("field '{}'", namedVar.FieldName),
+                    rightNV.AllocAlignment));
+            }
 
             // Closure store (Option A): closures are clone-safe, so named-source assignment auto-clones.
             // Old dest env freed for alloca/global only - skipped for struct-field GEP (slot may be uninitialized).
@@ -11155,8 +11195,7 @@ public:
         // exceeds the default-new threshold (16 on x64), route to the 2-arg
         // overload `operator new(size, align)` so the allocator picks aligned
         // memory and the matching delete uses operator delete_aligned.
-        constexpr uint64_t kDefaultNewAlign = 16;
-        bool useAligned = allocAlign > kDefaultNewAlign;
+        bool useAligned = allocAlign > LLVMBackend::kDefaultNewAlign;
         llvm::Value* rawPtr = nullptr;
         std::string opNewName = typeName + ".operator new";
         LLVMBackend::NamedVariable szArg;
@@ -11265,12 +11304,19 @@ public:
         result.TypeAndValue.IsArrayView = isArray;
         result.Primary = typedPtr;
         result.BaseType = ptrTy;
-        result.AllocAlignment = useAligned ? allocAlign : 0;
+        // A free site does not need the alignment VALUE - only which deallocator to use, since
+        // __delete_aligned recovers the raw block without it. So the tag is needed only when the
+        // element TYPE alone would NOT already route there: an over-aligned type (`struct
+        // alignas(64) T`) makes both `new` and `delete` pick the aligned pair off the static
+        // type, exactly as in C++, so it escapes into fields/containers/returns untagged. Only a
+        // per-site `alignas(N)` on an ordinarily-aligned type is invisible to every free site.
+        bool typeAlreadyAligned = effAlign > LLVMBackend::kDefaultNewAlign;
+        uint64_t siteExcess = (useAligned && !typeAlreadyAligned) ? allocAlign : 0;
+        result.AllocAlignment = siteExcess;
         // A COM object's lifetime is refcounted via Release, not owning-pointer auto-free, so the
         // caller must NOT auto-delete it at scope exit.
         compiler->lastOwningResult = !isWinrtNew;
-        // Carry the over-alignment so the owning local's free routes to __delete_aligned.
-        compiler->lastAllocAlignment = useAligned ? allocAlign : 0;
+        compiler->lastAllocAlignment = siteExcess;
         return result;
     }
 
@@ -11596,7 +11642,7 @@ public:
         // Per-site over-alignment (`new T[n] alignas(N)`) is not in the static type, so
         // fold in the alignment carried on the operand; either source routes to __delete_aligned.
         if (operandAllocAlign > deleteEffAlign) deleteEffAlign = operandAllocAlign;
-        bool useAlignedDelete = deleteEffAlign > 16;
+        bool useAlignedDelete = deleteEffAlign > LLVMBackend::kDefaultNewAlign;
         if (!typeName.empty() && compiler->GetFunction(opDelName))
         {
             compiler->CreateOverloadedFunctionCall(opDelName, { ptrArg });
@@ -11682,14 +11728,17 @@ public:
         if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(ptrVal->getType()))
             compiler->builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), argNV.Storage);
 
-        // Signal ParseDeclaration to mark the target local as IsOwning.
+        // Signal ParseDeclaration to mark the target local as IsOwning. The over-alignment of the
+        // moved-from source travels with the value, so the new owner frees it the same way.
         compiler->lastOwningResult = true;
+        compiler->lastAllocAlignment = argNV.AllocAlignment;
 
         LLVMBackend::NamedVariable result;
-        result.Primary      = ptrVal;
-        result.Storage      = nullptr;
-        result.BaseType     = ptrVal ? ptrVal->getType() : nullptr;
-        result.TypeAndValue = argNV.TypeAndValue;
+        result.Primary        = ptrVal;
+        result.Storage        = nullptr;
+        result.BaseType       = ptrVal ? ptrVal->getType() : nullptr;
+        result.TypeAndValue   = argNV.TypeAndValue;
+        result.AllocAlignment = argNV.AllocAlignment;
         return result;
     }
 
@@ -12405,6 +12454,14 @@ public:
             bool hresultChainPending = false;
             llvm::Value* hresultChainStorage = nullptr;
             std::string hresultChainType;
+            // The unwrapped `.value` pointer to Release once the chain completes, or null to leave
+            // it alone. Only set for a provably-owned (+1) temporary - see the arming site [PFX-1].
+            llvm::Value* hresultChainReleasePtr = nullptr;
+            std::string hresultChainReleaseType;
+            // SSA result of the most recent [winrt] vtable slot call in THIS postfix chain. COM
+            // requires an [out,retval] interface pointer to be AddRef'd, so only such a result is
+            // a provably-owned HResult<T*>; a plain function's HResult may hold a borrowed pointer.
+            llvm::Value* lastWinrtSlotCallResult = nullptr;
             // Set when the primary was a `global::name` form whose base resolved to a dot-less
             // root function: the following call must resolve at root (skip the enclosing-namespace
             // walk). Consumed and cleared by the call dispatch so chained calls do not inherit it.
@@ -12551,6 +12608,9 @@ public:
                             auto hrSD = compiler->GetDataStructure(namedVar.TypeAndValue.TypeName);
                             if (hrSD.StructType && hrSD.StructFields.size() >= 2)
                             {
+                                // An HResult the user bound (local/field/param) carries Storage and stays
+                                // the user's to release; only a bare rvalue can be an unowned temporary.
+                                bool isTemporary = namedVar.Storage == nullptr && namedVar.Primary != nullptr;
                                 llvm::Value* hrMem = namedVar.Storage;
                                 if (!hrMem)
                                 {
@@ -12572,6 +12632,17 @@ public:
                                 hresultChainStorage = hrMem;
                                 hresultChainType    = namedVar.TypeAndValue.TypeName;
                                 nullConditionalPending = false;  // the HResult path supersedes null-ptr
+
+                                // An unnamed temporary strands its pointer, so release it - but only
+                                // where the +1 is guaranteed: a [winrt] object from a slot [out,retval].
+                                hresultChainReleasePtr = nullptr;
+                                hresultChainReleaseType.clear();
+                                if (isTemporary && namedVar.Primary == lastWinrtSlotCallResult
+                                    && valField.Pointer && compiler->IsWinrtClass(valField.TypeName))
+                                {
+                                    hresultChainReleasePtr  = valuePtr;
+                                    hresultChainReleaseType = valField.TypeName;
+                                }
                             }
                         }
                         break;
@@ -14771,25 +14842,12 @@ public:
                                             Compiler(ctx)->MarkVariableMoved(argNV.CallerName);
                                     }
                                 }
+                                // The call RESULT is a fresh value, not a read of the callee, so it must
+                                // inherit no callee provenance - rebuild it rather than clear flags.
+                                namedVar = {};
                                 namedVar.Primary = result;
-                                namedVar.Storage = nullptr;
                                 namedVar.BaseType = result ? result->getType() : nullptr;
                                 namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
-                                // The call result is a fresh value; it does not inherit the
-                                // lambda's capture-bond (the closure holds &source, but the
-                                // returned value is independent).
-                                namedVar.IsBonded = false;
-                                // Invoking a temp's function<> field (`get(i).fn(req)`) yields a fresh result,
-                                // not the borrowed field - clear the taint so storing/returning it isn't rejected.
-                                namedVar.FromOwningTempField = false;
-                                // The call result is a fresh owned value, never a borrow of the callee
-                                // variable. `namedVar` is reused from the callee (e.g. an unpacked
-                                // `alias`/nested-closure capture marked IsAliasBorrow), so clear the
-                                // borrow flag - otherwise it leaks onto the result and suppresses the
-                                // receiving local's destructor (a leak).
-                                namedVar.IsAliasBorrow = false;
-                                namedVar.BondByAddress = false;
-                                namedVar.BondedSources.clear();
                                 functionArgCounter++;
                                 break;
                             }
@@ -15324,6 +15382,9 @@ public:
                                     argVar.Storage = argNV.Storage;
                                     argVar.IsOwning = argNV.IsOwning;
                                     argVar.IsOwningString = argNV.IsOwningString;
+                                    // Propagate over-alignment so a `move` param that would inherit the block
+                                    // without its alignment tag is rejected instead of mis-freed.
+                                    argVar.AllocAlignment = argNV.AllocAlignment;
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
                                     // Propagate the array-view flag so a `T[]` argument is still seen
                                     // as a view at the call site (otherwise the noalias gate would
@@ -15457,6 +15518,14 @@ public:
                                         auto* okRes = compiler->EmitWinrtSlotCall(
                                             structVar.TypeAndValue.TypeName, functionName, argVals, rt2, rp2);
                                         if (okRes) b->CreateStore(okRes, resAlloca);
+                                        // Drop the +1 on the intermediate. Ok path only (the fail path
+                                        // produced no object), and the call above already deref'd it.
+                                        if (hresultChainReleasePtr)
+                                        {
+                                            std::string rt3; bool rp3 = false;
+                                            compiler->EmitWinrtSlotCall(hresultChainReleaseType, "Release",
+                                                { hresultChainReleasePtr }, rt3, rp3);
+                                        }
                                         b->CreateBr(mergeBB);
 
                                         compiler->SwitchToBlock(failBB);
@@ -15470,8 +15539,13 @@ public:
                                         namedVar.BaseType = resSD.StructType;
                                         namedVar.TypeAndValue.TypeName = resultHr;
                                         namedVar.TypeAndValue.Pointer = false;
+                                        // The chain's own result is a slot call's [out,retval] too, so a
+                                        // further `?.` link may release it under the same rules.
+                                        lastWinrtSlotCallResult = namedVar.Primary;
                                     }
                                     hresultChainPending = false;
+                                    hresultChainReleasePtr = nullptr;
+                                    hresultChainReleaseType.clear();
                                     globalScopeCall = false;
                                 }
                                 else
@@ -15485,6 +15559,7 @@ public:
                                     namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
                                     namedVar.TypeAndValue.TypeName = winrtResultType;
                                     namedVar.TypeAndValue.Pointer  = winrtResultPtr;
+                                    lastWinrtSlotCallResult = namedVar.Primary;
                                     globalScopeCall = false;
                                 }
                             }
@@ -16576,8 +16651,7 @@ public:
             sizeVal = compiler->GetTypeSizeBytes(elemType);
         }
 
-        constexpr uint64_t kDefaultNewAlign = 16;
-        bool useAligned = effAlign > kDefaultNewAlign;
+        bool useAligned = effAlign > LLVMBackend::kDefaultNewAlign;
         LLVMBackend::NamedVariable szArg;
         szArg.Primary = sizeVal;
         szArg.BaseType = sizeVal->getType();
@@ -16721,6 +16795,7 @@ public:
         // as view(). Clearing these keeps `return <View/>` from tripping the
         // "owning value boxed into interface return" check.
         compiler->lastOwningResult = false;
+        compiler->lastAllocAlignment = 0;
         compiler->lastCallReturnsOwned = false;
 
         return structPtr;

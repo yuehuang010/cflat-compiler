@@ -127,11 +127,14 @@ bool testQueryInterface()
 
 // === Multi-method interface: thunk forwards a parameter and a non-zero return ===
 
+int gCounterDtorCount = 0;
+
 [uuid("a1b2c3d4-e5f6-4789-8abc-def012345678")]
 interface ICounter
 {
     i32 Add(i32 by);   // returns the new total
     i32 Value();
+    Cat* Adopt();      // factory: hands back a fresh +1 reference, the caller must release it
 };
 
 [winrt] class Counter : ICounter
@@ -140,6 +143,14 @@ interface ICounter
     Counter(i32 start) { this.total = start; }
     i32 Add(i32 by) { this.total = this.total + by; return this.total; }
     i32 Value() { return this.total; }
+    // A second factory slot, so a `?.` chain can run through two produced objects in a row.
+    HResult<Cat*> Adopt()
+    {
+        HResult<Cat*> r = default;
+        r.succeed(new Cat(this.total));
+        return r;
+    }
+    ~Counter() { gCounterDtorCount = gCounterDtorCount + 1; }
 };
 
 bool testMultiMethodAndParamForwarding()
@@ -190,10 +201,22 @@ interface IMaker { Counter* Make(bool fail); };
     }
 };
 
+// A plain (non-COM) function makes no AddRef promise, so the pointer in the HResult it returns may
+// be borrowed. Only a [winrt] slot call's [out,retval] is a guaranteed +1 - see testChaining.
+Counter* gBorrowed = nullptr;
+
+HResult<Counter*> BorrowCounter()
+{
+    HResult<Counter*> r = default;
+    r.succeed(gBorrowed);
+    return r;
+}
+
 bool testChaining()
 {
     bool result = true;
     Maker* m = new Maker();
+    gCounterDtorCount = 0;
 
     // Success chain: Make(false) -> Counter*, then Value() -> 7. The chain stays HResult<i32>;
     // check once at the end. `?.` chains through the HResult (auto-detecting pointer vs value).
@@ -201,11 +224,60 @@ bool testChaining()
     result &= Test("com_chain_ok_hr", ok.hr, S_OK);
     result &= Test("com_chain_ok_value", ok.value, 7);
 
+    // The Counter that Make() manufactured is a temporary nobody else can reach - the chain owns
+    // the +1 the COM [out,retval] handed back and releases it, so it is destroyed exactly once
+    // (0 would be a leak, 2 a double-release).
+    result &= Test("com_chain_temp_released", gCounterDtorCount, 1);
+
     // Short-circuit: Make(true) fails, so Value() is never called and the failure HRESULT
-    // propagates straight through to the final HResult.
+    // propagates straight through to the final HResult. No object was made -> nothing released.
     HResult<i32> bad = m->Make(true)?.Value();
     result &= Test("com_chain_fail_hr", bad.hr, E_FAIL);
     result &= Test("com_chain_fail_value", bad.value, 0);
+    result &= Test("com_chain_fail_nothing_released", gCounterDtorCount, 1);
+
+    // Two links: Make() yields a temporary Counter and Adopt() yields a temporary Cat. Each is a
+    // produced object nobody else holds, so each is released once the chain has dispatched through
+    // it; only the final HResult<i32> survives.
+    gCatDtorCount = 0;
+    HResult<i32> two = m->Make(false)?.Adopt()?.Eat();
+    result &= Test("com_chain_two_links_hr", two.hr, S_OK);
+    result &= Test("com_chain_two_links_counter_released", gCounterDtorCount, 2);
+    result &= Test("com_chain_two_links_cat_released", gCatDtorCount, 1);
+
+    // A chain whose RESULT is a pointer hands that pointer to the CALLER: the intermediate (Make's
+    // Counter) is released, but the Cat the caller now holds is NOT - it is still alive and usable
+    // afterwards, and releasing it stays the caller's job.
+    HResult<Cat*> kept = m->Make(false)?.Adopt();
+    result &= Test("com_chain_kept_hr", kept.hr, S_OK);
+    result &= Test("com_chain_kept_intermediate_released", gCounterDtorCount, 3);
+    result &= Test("com_chain_kept_result_alive", kept.value->meals, 7);
+    result &= Test("com_chain_kept_not_released", gCatDtorCount, 1);
+    HResult<i32> keptEat = kept.value->Eat();
+    result &= Test("com_chain_kept_dispatch_after_chain", keptEat.hr, S_OK);
+    result &= Test("com_chain_kept_final_release", (int)kept.value->Release(), 0);
+    result &= Test("com_chain_kept_released_by_caller", gCatDtorCount, 2);
+
+    // No chain at all: a bound factory result stays entirely the caller's, released by hand.
+    HResult<Counter*> held = m->Make(false);
+    result &= Test("com_chain_bound_untouched", gCounterDtorCount, 3);
+    HResult<i32> heldVal = held.value->Value();
+    result &= Test("com_chain_bound_alive", heldVal.value, 7);
+    held.value->Release();
+    result &= Test("com_chain_bound_released_by_caller", gCounterDtorCount, 4);
+
+    // The chain releases ONLY what a [winrt] slot call produced. A plain function's HResult can
+    // hold a borrowed pointer, so chaining through it must leave the object alone - chain twice
+    // and it is still alive both times; releasing it stays the owner's job.
+    gBorrowed = new Counter(21);
+    HResult<i32> b1 = BorrowCounter()?.Value();
+    HResult<i32> b2 = BorrowCounter()?.Value();
+    result &= Test("com_chain_borrowed_value", b1.value, 21);
+    result &= Test("com_chain_borrowed_still_alive", b2.value, 21);
+    result &= Test("com_chain_borrowed_not_released", gCounterDtorCount, 4);
+    result &= Test("com_chain_borrowed_owner_release", (int)gBorrowed->Release(), 0);
+    result &= Test("com_chain_borrowed_released_by_owner", gCounterDtorCount, 5);
+    gBorrowed = nullptr;
 
     m->Release();
     return result;
