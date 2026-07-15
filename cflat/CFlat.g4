@@ -458,8 +458,13 @@ functionSpecifier
     | 'declspec' '(' Identifier ')'
     ;
 
+// Unified alignment specifier (PREFIX / attribute position). arg1 = SLOT / type alignment
+// (0 = natural slot). Optional arg2 = ALLOCATION alignment of the heap BLOCK a pointer /
+// array-view owns, so a field / move param / return type and the matching `new T[n]` agree
+// and the free site routes to __delete_aligned. arg2 is positional for now; a named form
+// (`alignas(alloc: 64)`) can be added later without touching the parse machinery.
 alignmentSpecifier
-    : 'alignas' '(' (typeName | constantExpression) ')'
+    : 'alignas' '(' (typeName | constantExpression) (',' constantExpression)? ')'
     ;
 
 declarator

@@ -1,0 +1,16 @@
+// `alignas(0, N)` arg2 on a field records the owned block's alignment. Storing a buffer allocated
+// with a DIFFERENT allocation alignment must be rejected: the free site would recover the wrong
+// alignment and corrupt the heap. The two clauses must agree.
+struct Matrix
+{
+    alignas(0, 64) double[] data = default;
+    ~Matrix() { delete[_] data; }
+};
+
+extern int main()
+{
+    Matrix m;
+    expect_error("alignment mismatch storing into field 'data'");
+    m.data = new double[8] alignas(0, 32);
+    return 0;
+}

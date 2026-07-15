@@ -2441,6 +2441,9 @@ void LLVMBackend::ResetForReanalysis()
     currentFunctionReturnTV = TypeAndValue{};
     pendingOwnedStringTemps.clear();
     pendingOwnedStructTemps.clear();
+    lastAllocAlignment = 0;
+    pendingInitAllocAlign = 0;
+    lastCallReturnsAllocAlign = 0;
     lastCallIsBonded = false;
     // Sibling of lastCallIsBonded: a per-call bond flag that, if left set by an aborted compile,
     // would mark the next file's first bonded value as by-address.
@@ -3803,6 +3806,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
         o["sdl"] = static_cast<int64_t>(t.SimdLanes);
     }
     if (t.IsArrayView) o["av"] = true;
+    if (t.AllocAlignValue > 0) o["aa"] = static_cast<int64_t>(t.AllocAlignValue);
     return o;
 }
 
@@ -3845,6 +3849,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("sd")) t.IsSimd = *v;
     if (auto v = o.getInteger("sdl")) t.SimdLanes = static_cast<uint64_t>(*v);
     if (auto v = o.getBoolean("av")) t.IsArrayView = *v;
+    if (auto v = o.getInteger("aa")) t.AllocAlignValue = static_cast<uint64_t>(*v);
     return t;
 }
 

@@ -485,6 +485,12 @@ public:
         // and `int* -> int[]` casts are forbidden so sub-views are unconstructible. See doc/LANGUAGE.md.
         bool IsArrayView = false;
 
+        // Allocation-alignment clause: arg2 of `alignas(slot, alloc)`. Records that the heap BLOCK
+        // this pointer/array-view owns is N-aligned so a field/param/return and the matching
+        // `new T[n]` agree and the free site routes to __delete_aligned. 0 = unset. Power of two,
+        // validated at parse time. NOT the field slot's alignment (that is UserAlignValue / arg1).
+        uint64_t AllocAlignValue = 0;
+
         // Keyed by ORIGIN (not SSA value) so copies of the same view share a scope and are not
         // treated as disjoint. Never serialized; recomputed per-function from aliasScopes_.
         int NoaliasScopeId = -1;
@@ -917,6 +923,13 @@ public:
     bool lastCallReturnsOwned = false;       // set when the last call returned an owned heap string or pointer
     bool lastOwningResult = false;           // set by ParseNewExpression/ParseMoveExpression; consumed by ParseDeclaration
     uint64_t lastAllocAlignment = 0;         // set by ParseNewExpression for `new T[n] alignas(N)` (>16); consumed by ParseDeclaration into NamedVariable.AllocAlignment
+    // Inbound alloc-align channel (symmetric to lastAllocAlignment). Set from the target
+    // declaration's AllocAlignValue BEFORE evaluating a DIRECT `new` initializer/RHS; a bare
+    // `new` reads it to drive the aligned allocator. One-shot: consumed+cleared in ParseNewExpression.
+    uint64_t pendingInitAllocAlign = 0;
+    // Return-result alloc-align channel (mirror of lastCallReturnsOwned). Set from the callee's
+    // return-type AllocAlignValue at the call; consumed in ParseDeclaration into NamedVariable.AllocAlignment.
+    uint64_t lastCallReturnsAllocAlign = 0;
     bool currentFunctionReturnsOwned = false; // true when current function is declared with move T* or move string return type
     bool currentFunctionReturnIsArrayView = false; // true when the current function's return type is a `T[]` array-view
     std::string currentFunctionReturnTypeName; // declared return TypeName of the current function (e.g. an interface name); used to box a returned concrete pointer into the interface fat pointer
@@ -1950,6 +1963,9 @@ private:
                     .Primary = nullptr,
                     .Storage = alloc,
                     .IsOwning = true,
+                    // `alignas(_, N)` on the param: the block is N-aligned, so scope-exit cleanup
+                    // frees via __delete_aligned. The call site already checked the arg agrees.
+                    .AllocAlignment = itr_nameArg->AllocAlignValue,
                 };
                 stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
             }
@@ -9277,20 +9293,30 @@ public:
         {
             if (params[i].IsMove)
             {
-                // A `move` param takes ownership and frees the block itself, but the per-site
-                // alignment of `new T[n] alignas(N)` is not in the element type, so the callee
-                // (e.g. `list<T*>.add`, whose element free is shared by every instantiation)
-                // cannot recover it. Reject rather than corrupt the heap. Alignment carried by
-                // the TYPE is not tagged and passes through freely.
-                if (args[i].AllocAlignment > kDefaultNewAlign)
-                    LogError(std::format(
-                        "cannot move the over-aligned buffer '{}' ('new T[n] alignas({})') into the 'move' parameter "
-                        "of '{}': that alignment is a property of the allocation, not of the type, so the callee "
-                        "cannot recover it and would free the block as an ordinary allocation. Keep the buffer in "
-                        "the local that allocated it, or over-align the ELEMENT TYPE instead "
-                        "('struct alignas({}) Chunk {{ ... }};').",
-                        args[i].CallerName.empty() ? args[i].TypeAndValue.TypeName : args[i].CallerName,
-                        args[i].AllocAlignment, functionName, args[i].AllocAlignment));
+                // A `move` param takes ownership and frees the block itself. The allocation alignment
+                // of an over-aligned `new T[n]` is not in the element type, so the callee can recover
+                // it only when the PARAMETER declares the same `alignas(_, N)` clause. A matching clause
+                // is allowed; a missing/mismatched one would free the block wrong and corrupt the heap.
+                // Alignment carried by the TYPE is not tagged and passes through freely.
+                if (args[i].AllocAlignment != params[i].AllocAlignValue
+                    && (args[i].AllocAlignment > kDefaultNewAlign
+                        || params[i].AllocAlignValue > kDefaultNewAlign))
+                {
+                    if (params[i].AllocAlignValue == 0)
+                        LogError(std::format(
+                            "cannot move the over-aligned buffer '{}' ('new T[n] alignas(0, {})') into the 'move' "
+                            "parameter of '{}': that alignment is a property of the allocation, not of the type, so "
+                            "the callee cannot recover it. Declare the parameter 'alignas(0, {})' so the block "
+                            "alignment is recorded, or over-align the ELEMENT TYPE instead.",
+                            args[i].CallerName.empty() ? args[i].TypeAndValue.TypeName : args[i].CallerName,
+                            args[i].AllocAlignment, functionName, args[i].AllocAlignment));
+                    else
+                        LogError(std::format(
+                            "alignment mismatch moving into the 'move' parameter of '{}': the parameter is declared "
+                            "'alignas(0, {})' but the argument was allocated 'alignas(0, {})'. The two must agree "
+                            "so the callee frees with the correct alignment.",
+                            functionName, params[i].AllocAlignValue, args[i].AllocAlignment));
+                }
 
                 // A `move string` argument transfers ownership to the callee, which frees
                 // it on return. If the argument is an unnamed owned-string temporary (e.g.
@@ -9611,6 +9637,7 @@ public:
         // does not leak. Without this the virtual path left the result classified as a borrow.
         const auto& rt = methodInfo->ReturnType;
         lastCallReturnsOwned = rt.IsMove && (rt.TypeName == "string" || rt.Pointer || rt.IsInterface);
+        lastCallReturnsAllocAlign = rt.AllocAlignValue;
         if (lastCallReturnsOwned
             && callResult->getType() == llvm::StructType::getTypeByName(*context, "string"))
             RegisterOwnedStringTemp(callResult);
@@ -13683,6 +13710,7 @@ public:
             {
                 lastCallReturnType = candidate.ReturnType;
                 lastCallReturnsOwned = false;
+                lastCallReturnsAllocAlign = 0;
                 return atomicResult;
             }
         }
@@ -13720,6 +13748,9 @@ public:
         lastCallReturnType = candidate.ReturnType;
         lastCallReturnType.IsAlias = candidate.ReturnsAlias; // mark borrow-return result; inert until consumed
         lastCallReturnsOwned = candidate.ReturnsOwned;
+        // Return-type `alignas(_, N)`: the callee hands back an N-aligned heap block. Stamp the
+        // side-channel so the receiving local frees via __delete_aligned (consumed in ParseDeclaration).
+        lastCallReturnsAllocAlign = candidate.ReturnType.AllocAlignValue;
 
         // Populate lock-check side-channels for call-site RequiredLocks verification.
         lastCallRequiredLocks = candidate.RequiredLocks;
@@ -13946,6 +13977,10 @@ public:
                             }
                             namedVar.BaseType = namedVar.Primary->getType();
                             namedVar.TypeAndValue = structField;
+                            // Field declared `alignas(_, N)`: stamp the block alignment so a bare
+                            // `delete field` inside a member (e.g. the destructor) frees via
+                            // __delete_aligned. GetMemberVariable purposely omits OwningStructName.
+                            namedVar.AllocAlignment = structField.AllocAlignValue;
                             return namedVar;
                         }
                         count++;

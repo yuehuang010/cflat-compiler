@@ -1,0 +1,12 @@
+// The inbound allocation-alignment channel only reaches a DIRECT `new` initializer. When the `new`
+// is INDIRECT (here, buried in a ternary), the declared clause cannot be threaded to the allocation,
+// so a free would use the wrong alignment. The compiler must ERROR rather than silently under-align.
+extern int main()
+{
+    bool cond = true;
+    expect_error("cannot infer allocation alignment here") {
+        alignas(0, 64) double[] buf = cond ? new double[8] : new double[4];
+        delete[_] buf;
+    }
+    return 0;
+}

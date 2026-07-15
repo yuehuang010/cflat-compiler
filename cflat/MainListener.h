@@ -31,6 +31,7 @@
 #include <optional>
 #include <cstdlib>
 #include <cmath>
+#include <charconv>
 
 #include "platform/GeneratedParser.h"
 #include "LLVMBackend.h"
@@ -940,10 +941,24 @@ private:
                 else if (funcSpec->getText() == "cdecl")
                     declType.CallConv = LLVMBackend::CallingConv::Cdecl;
             }
-            else if (declSpec->alignmentSpecifier() != nullptr)
+            else if (auto* alignSpec = declSpec->alignmentSpecifier())
             {
-                // ForwardRefScanner: alignment doesn't affect forward declarations.
-                // The codegen pass captures the actual value.
+                // ForwardRefScanner: the SLOT alignment (arg1) doesn't affect forward declarations,
+                // but arg2 (allocation alignment) must be recorded onto the registered signature so
+                // a return-type/param clause survives into the call-site checks. This pre-pass lacks
+                // the constant folder, so it best-effort parses an integer literal; the codegen pass
+                // does the full validation and error reporting.
+                auto cexprs = alignSpec->constantExpression();
+                size_t idx = (alignSpec->typeName() != nullptr) ? 0 : 1;
+                if (cexprs.size() > idx)
+                {
+                    std::string txt = cexprs[idx]->getText();
+                    uint64_t v = 0;
+                    auto res = std::from_chars(txt.data(), txt.data() + txt.size(), v);
+                    if (res.ec == std::errc() && res.ptr == txt.data() + txt.size()
+                        && v > 0 && v <= 4096 && (v & (v - 1)) == 0)
+                        declType.AllocAlignValue = v;
+                }
             }
         }
         return declType;
@@ -962,6 +977,8 @@ private:
             if (auto declarer = paramDecl->declarator())
                 if (auto directDeclarer = declarer->directDeclarator())
                     paramType.VariableName = getDirectDeclName(directDeclarer);
+            // A parameter's `alignas(_, N)` allocation alignment now rides in declarationSpecifiers
+            // (prefix), so ParseDeclarationSpecifiers above already recorded paramType.AllocAlignValue.
             if (paramType.IsMove && paramType.IsBond)
                 Compiler(paramDecl)->LogError(std::format("parameter '{}': 'bond' and 'move' are mutually exclusive", paramType.VariableName));
             if (auto* lc = paramDecl->lockClause())
@@ -2646,17 +2663,44 @@ private:
                 uint64_t alignVal = ParseAlignmentSpecifier(alignSpec);
                 if (alignVal != 0)
                     declType.UserAlignValue = alignVal;
+                // arg2 = allocation alignment of the owned heap block (was `align_alloc(N)`).
+                uint64_t allocAlign = ParseAllocAlignArg(alignSpec);
+                if (allocAlign != 0)
+                    declType.AllocAlignValue = allocAlign;
             }
         }
 
         return declType;
     }
 
-    // Evaluate `alignas(N)` / `alignas(T)` into a power-of-two byte count.
-    // Validates: power of two, 1 <= N <= 4096. Returns 0 on error (and logs).
+    // Validate a folded alignment byte count: power of two, 1 <= N <= 4096. Returns 0 on error
+    // (and logs). `what` names the clause ("alignas" / "alignas allocation alignment").
+    uint64_t ValidateAlignValue(antlr4::ParserRuleContext* ctx, int64_t signedVal, const char* what)
+    {
+        if (signedVal <= 0)
+        {
+            LogErrorContext(ctx, std::format("{}: value must be positive (got {})", what, signedVal));
+            return 0;
+        }
+        uint64_t alignVal = (uint64_t)signedVal;
+        if (alignVal > 4096)
+        {
+            LogErrorContext(ctx, std::format("{}: value {} exceeds maximum of 4096", what, alignVal));
+            return 0;
+        }
+        if ((alignVal & (alignVal - 1)) != 0)
+        {
+            LogErrorContext(ctx, std::format("{}: value {} is not a power of two", what, alignVal));
+            return 0;
+        }
+        return alignVal;
+    }
+
+    // Evaluate arg1 of `alignas(slot[, alloc])`: the SLOT / type alignment. `alignas(T)` folds
+    // the type's ABI alignment; `alignas(N)` folds a constant. Returns 0 on error (and logs) or
+    // when arg1 is the natural-slot sentinel `0`.
     uint64_t ParseAlignmentSpecifier(CFlatParser::AlignmentSpecifierContext* alignSpec)
     {
-        uint64_t alignVal = 0;
         if (auto* typeName = alignSpec->typeName())
         {
             LLVMBackend::DeclTypeAndValue dt;
@@ -2667,38 +2711,60 @@ private:
                 LogErrorContext(alignSpec, std::format("alignas: cannot resolve type '{}'", dt.TypeName));
                 return 0;
             }
-            alignVal = compilerLLVM->module->getDataLayout().getABITypeAlign(t).value();
+            uint64_t alignVal = compilerLLVM->module->getDataLayout().getABITypeAlign(t).value();
+            return ValidateAlignValue(alignSpec, (int64_t)alignVal, "alignas");
         }
-        else if (auto* cexpr = alignSpec->constantExpression())
+        auto cexprs = alignSpec->constantExpression();
+        if (cexprs.empty()) return 0;
+        llvm::Value* condVal = ParseConditionalExpression(cexprs[0]->conditionalExpression());
+        auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(condVal);
+        if (ci == nullptr)
         {
-            auto* cond = cexpr->conditionalExpression();
-            llvm::Value* condVal = ParseConditionalExpression(cond);
-            auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(condVal);
-            if (ci == nullptr)
-            {
-                LogErrorContext(alignSpec, "alignas: argument must be a constant integer expression");
-                return 0;
-            }
-            int64_t signedVal = ci->getSExtValue();
-            if (signedVal <= 0)
-            {
-                LogErrorContext(alignSpec, std::format("alignas: value must be positive (got {})", signedVal));
-                return 0;
-            }
-            alignVal = (uint64_t)signedVal;
-        }
-        if (alignVal == 0) return 0;
-        if (alignVal > 4096)
-        {
-            LogErrorContext(alignSpec, std::format("alignas: value {} exceeds maximum of 4096", alignVal));
+            LogErrorContext(alignSpec, "alignas: argument must be a constant integer expression");
             return 0;
         }
-        if ((alignVal & (alignVal - 1)) != 0)
+        int64_t signedVal = ci->getSExtValue();
+        // `alignas(0, N)` = natural slot (arg2 carries the alloc-align). A bare `alignas(0)` with no
+        // arg2 is a likely mistake and is rejected below as a non-positive alignment.
+        if (signedVal == 0 && cexprs.size() >= 2) return 0;
+        return ValidateAlignValue(alignSpec, signedVal, "alignas");
+    }
+
+    // Evaluate the optional arg2 of `alignas(slot, alloc)`: the ALLOCATION alignment of the owned
+    // heap BLOCK. Positional for now - arg2 is the trailing constantExpression (index 0 when arg1 is
+    // a type, else index 1). Returns 0 when absent or on error. A future named form (`alignas(alloc:
+    // 64)`) can be recognized here without touching any caller. Shared by declarations and `new`.
+    uint64_t ParseAllocAlignArg(CFlatParser::AlignmentSpecifierContext* alignSpec)
+    {
+        if (alignSpec == nullptr) return 0;
+        auto cexprs = alignSpec->constantExpression();
+        size_t idx = (alignSpec->typeName() != nullptr) ? 0 : 1;
+        if (cexprs.size() <= idx) return 0;
+        llvm::Value* condVal = ParseConditionalExpression(cexprs[idx]->conditionalExpression());
+        auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(condVal);
+        if (ci == nullptr)
         {
-            LogErrorContext(alignSpec, std::format("alignas: value {} is not a power of two", alignVal));
+            LogErrorContext(alignSpec, "alignas allocation alignment: argument must be a constant integer expression");
             return 0;
         }
-        return alignVal;
+        return ValidateAlignValue(alignSpec, ci->getSExtValue(), "alignas allocation alignment");
+    }
+
+    // Return the `new` expression IFF the initializer/RHS is SYNTACTICALLY exactly a `new` (a single
+    // pass-through chain assignmentExpression -> ... -> unaryExpression -> newExpression, every node
+    // having exactly one child). Any wrapping - a ternary, a binary op, a cast, a call argument -
+    // yields a multi-child node and returns nullptr. This is the safety gate for the inbound
+    // alloc-align channel: alignment is inherited only when the context provably reaches the `new`.
+    CFlatParser::NewExpressionContext* AsDirectNew(antlr4::tree::ParseTree* node)
+    {
+        while (node != nullptr)
+        {
+            if (auto* ne = dynamic_cast<CFlatParser::NewExpressionContext*>(node))
+                return ne;
+            if (node->children.size() != 1) return nullptr;
+            node = node->children[0];
+        }
+        return nullptr;
     }
 
     LLVMBackend::DeclTypeAndValue getFunctionReturnType(CFlatParser::FunctionDefinitionContext* ctx)
@@ -4196,8 +4262,17 @@ public:
                             lambdaExpectedType = compiler->currentFunctionReturnTV;
                             returnFnPtrTV = compiler->currentFunctionReturnTV;
                         }
+                        // Inbound alloc-align channel for `return new T[n];`: a function whose return
+                        // type declares `alignas(_, N)` hands the allocation alignment down to a DIRECT
+                        // `new` in the return, exactly as a decl-init does. Indirect return shapes are
+                        // rejected by the check below rather than silently under-aligned.
+                        if (assignExpr != nullptr
+                            && compiler->currentFunctionReturnTV.AllocAlignValue > LLVMBackend::kDefaultNewAlign
+                            && AsDirectNew(assignExpr) != nullptr)
+                            compiler->pendingInitAllocAlign = compiler->currentFunctionReturnTV.AllocAlignValue;
                         if (assignExpr != nullptr)
                             returnNV = ParseAssignmentExpressionNamed(assignExpr);
+                        compiler->pendingInitAllocAlign = 0;  // one-shot
                         lambdaExpectedType = {};
                         // Returning a raw `T*` as a `T[]` return type would forge the noalias
                         // contract (a view must span a whole allocation). Decay T[]->T* is fine.
@@ -4394,25 +4469,35 @@ public:
                                 returnNV.CallerName.empty() ? returnNV.TypeAndValue.TypeName : returnNV.CallerName));
                         }
 
-                        // The per-site alignment of `new T[n] alignas(N)` is not in the element
-                        // type, so the caller cannot recover it from the return type and would
-                        // free the block as an ordinary allocation. Reject it. (Alignment carried
-                        // by the TYPE is not tagged here and returns freely, as in C++.)
-                        if (returnNV.AllocAlignment > LLVMBackend::kDefaultNewAlign)
+                        // The allocation alignment of an over-aligned `new T[n]` is not in the element
+                        // type, so the caller recovers it only when the RETURN TYPE declares the same
+                        // `alignas(_, N)` clause (threaded to the caller via lastCallReturnsAllocAlign).
+                        // A matching clause is allowed; a missing/mismatched one would free the block
+                        // wrong. (Alignment carried by the TYPE returns freely, untagged, as in C++.)
+                        if (returnNV.AllocAlignment > LLVMBackend::kDefaultNewAlign
+                            && compiler->currentFunctionReturnTV.AllocAlignValue != returnNV.AllocAlignment)
                         {
-                            LogErrorContext(jump, std::format(
-                                "cannot return the over-aligned buffer '{}' ('new T[n] alignas({})'): that alignment "
-                                "is a property of the allocation, not of the type, so the caller cannot recover it "
-                                "from the return type and would free the block as an ordinary allocation. Over-align "
-                                "the ELEMENT TYPE instead ('struct alignas({}) Chunk {{ ... }};') - a type's "
-                                "alignment travels with it into fields, containers and returns.",
-                                returnNV.CallerName.empty() ? returnNV.TypeAndValue.TypeName : returnNV.CallerName,
-                                returnNV.AllocAlignment, returnNV.AllocAlignment));
+                            if (compiler->currentFunctionReturnTV.AllocAlignValue == 0)
+                                LogErrorContext(jump, std::format(
+                                    "cannot return the over-aligned buffer '{}' ('new T[n] alignas(0, {})'): that "
+                                    "alignment is a property of the allocation, not of the type, so the caller cannot "
+                                    "recover it from the return type and would free the block as an ordinary "
+                                    "allocation. Declare the return type 'alignas(0, {})' so the block alignment is "
+                                    "recorded, or over-align the ELEMENT TYPE instead.",
+                                    returnNV.CallerName.empty() ? returnNV.TypeAndValue.TypeName : returnNV.CallerName,
+                                    returnNV.AllocAlignment, returnNV.AllocAlignment));
+                            else
+                                LogErrorContext(jump, std::format(
+                                    "allocation alignment mismatch on return: the return type is declared "
+                                    "'alignas(0, {})' but the returned buffer was allocated {}-aligned. The two must "
+                                    "agree so the caller frees with the correct alignment.",
+                                    compiler->currentFunctionReturnTV.AllocAlignValue, returnNV.AllocAlignment));
                         }
 
                         // Clear flags consumed by the return check.
                         compiler->lastOwningResult = false;
                         compiler->lastAllocAlignment = 0;
+                        compiler->lastCallReturnsAllocAlign = 0;
                         compiler->lastCallReturnsOwned = false;
                         compiler->lastCallIsBonded = false;
                         compiler->lastCallBondByAddress = false;
@@ -5956,6 +6041,10 @@ public:
                     typeAndValue.Initializer = initializer;
                     typeAndValue.Annotations = annotations;
 
+                    // A field's `alignas(_, N)` allocation-alignment clause now rides in
+                    // declarationSpecifiers (prefix), so ParseDeclarationSpecifiers already set
+                    // typeAndValue.AllocAlignValue; it distributes to every declarator in this group.
+
                     // Bitfield: `int flags : 3 = 0;` - the constantExpression after ':'
                     // is the declared width in bits. Set IsBitfield + BitWidth here;
                     // the packing pass (LayoutBitfields in LLVMBackend.h) fills in
@@ -6398,6 +6487,14 @@ public:
                 if (initializer != nullptr)
                 {
                     auto assignmentExpression = initializer->assignmentExpression();
+                    // Inbound alloc-align channel: an align-declared local whose initializer is a
+                    // DIRECT `new` hands the declared allocation alignment down so the bare `new`
+                    // allocates aligned. Gated on AsDirectNew so an indirect `new` (ternary/cast/
+                    // call-arg) does NOT silently inherit - the post-check below then errors.
+                    if (assignmentExpression != nullptr
+                        && typeAndValue.AllocAlignValue > LLVMBackend::kDefaultNewAlign
+                        && AsDirectNew(assignmentExpression) != nullptr)
+                        compiler->pendingInitAllocAlign = typeAndValue.AllocAlignValue;
                     if (assignmentExpression != nullptr)
                     {
                         if (typeAndValue.IsInterface)
@@ -7055,6 +7152,46 @@ public:
                             compiler->lastAllocAlignment = 0;
                         }
 
+                        // Return-result alloc-align channel: a call whose return type declared
+                        // `alignas(_, N)` hands back an N-aligned block; stamp the receiving local so
+                        // an explicit `delete[]` (or scope-exit free) routes to __delete_aligned.
+                        if (compiler->lastCallReturnsAllocAlign > 0)
+                        {
+                            compiler->stackNamedVariable.back().namedVariable[name].AllocAlignment =
+                                compiler->lastCallReturnsAllocAlign;
+                            compiler->lastCallReturnsAllocAlign = 0;
+                        }
+
+                        // Safety boundary: an align-declared local promises a block of exactly its
+                        // allocation alignment. Record the declared value on the local (so a later
+                        // direct assignment inherits it), then verify the initializer delivered a
+                        // matching block - else a free would use the wrong alignment. A direct `new`
+                        // inherited it above; a matching aligned source (return/move) already stamped
+                        // it. Anything else could not carry the alignment: error rather than corrupt.
+                        if (typeAndValue.AllocAlignValue > LLVMBackend::kDefaultNewAlign)
+                        {
+                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            nv.TypeAndValue.AllocAlignValue = typeAndValue.AllocAlignValue;
+                            auto* initAssignExpr = initializer ? initializer->assignmentExpression() : nullptr;
+                            if (initAssignExpr != nullptr
+                                && nv.AllocAlignment != typeAndValue.AllocAlignValue)
+                            {
+                                if (AsDirectNew(initAssignExpr) != nullptr)
+                                    LogErrorContext(initAssignExpr, std::format(
+                                        "allocation alignment mismatch: the 'new' allocates {}-aligned but '{}' is "
+                                        "declared 'alignas(_, {})'. The clauses must agree so the free site recovers "
+                                        "the correct alignment.",
+                                        nv.AllocAlignment, name, typeAndValue.AllocAlignValue));
+                                else
+                                    LogErrorContext(initAssignExpr, std::format(
+                                        "cannot infer allocation alignment here - annotate the 'new' with "
+                                        "'alignas(0, {})'. '{}' is declared 'alignas(_, {})', but the initializer is "
+                                        "not a direct 'new', so the block alignment cannot be threaded to the "
+                                        "allocation and a free would use the wrong alignment.",
+                                        typeAndValue.AllocAlignValue, name, typeAndValue.AllocAlignValue));
+                            }
+                        }
+
                         // Propagate bond: if the RHS was a bonded call result, tag this local.
                         if (compiler->lastCallIsBonded)
                         {
@@ -7178,6 +7315,7 @@ public:
         // assignment-path reset (see operatorText == "=" below).
         compilerLLVM->lastOwningResult = false;
         compilerLLVM->lastAllocAlignment = 0;
+        compilerLLVM->lastCallReturnsAllocAlign = 0;
 
         auto* condCtx = ctx->conditionalExpression();
         if (condCtx && !ctx->assignmentOperator()
@@ -7442,7 +7580,19 @@ public:
                     LogErrorContext(ctx, std::format("cannot reassign '{}' while '{}' holds a bonded reference to it - assign null to '{}' first to break the bond", namedVar.CallerName, borrower, borrower));
             }
 
+            // Inbound alloc-align channel for direct assignment to an align-declared target (a field
+            // whose clause was stamped on read, or a local carrying its declared clause). A DIRECT
+            // `new` RHS inherits the target's allocation alignment; the store-check below then
+            // verifies agreement. Indirect RHS shapes are left to error on mismatch, never inferred.
+            uint64_t targetAllocAlign = namedVar.AllocAlignment > 0
+                ? namedVar.AllocAlignment
+                : namedVar.TypeAndValue.AllocAlignValue;
+            if (operatorText == "=" && targetAllocAlign > LLVMBackend::kDefaultNewAlign
+                && AsDirectNew(assignCtx) != nullptr)
+                compiler->pendingInitAllocAlign = targetAllocAlign;
+
             auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
+            compiler->pendingInitAllocAlign = 0;  // one-shot; consumed by the `new` above if direct
             lambdaExpectedType = {};
             // Reassignment / field store into an array-view: `a = rawIntPtr;` or `s.view = p;`
             // would launder a raw pointer into the noalias contract - reject (decay is one-way).
@@ -7456,6 +7606,7 @@ public:
             // later owning declaration adopts it and aligned-frees an ordinary block.
             compiler->lastOwningResult = false;
             compiler->lastAllocAlignment = 0;
+            compiler->lastCallReturnsAllocAlign = 0;
             auto right = LoadNamedVariable(rightNV);
 
             // A plain assignment moves the RHS value into the named lvalue; if it was an
@@ -7709,23 +7860,42 @@ public:
                 && destGep->getSourceElementType()->isStructTy())
                 || namedVar.IsInterfaceField;  // reached via the interface's byte-offset slot
 
-            // The per-site alignment of `new T[n] alignas(N)` is deliberately NOT part of the
-            // element type, so no free site reached through a field can recover it - the block
-            // would be freed as an ordinary allocation and corrupt the heap. Reject the store.
-            // (Alignment carried by the TYPE is not tagged here and escapes freely, as in C++.)
+            // The allocation alignment of an over-aligned `new T[n]` is NOT part of the element type,
+            // so a free through a field can only recover it when the FIELD declares the same
+            // `alignas(_, N)` clause (namedVar.AllocAlignment, stamped on the field read). A matching
+            // clause is allowed; a missing or mismatched one would free the block wrong and corrupt
+            // the heap. (Alignment carried by the TYPE is not tagged here and escapes freely, as in C++.)
+            bool rhsOverAligned  = rightNV.AllocAlignment > LLVMBackend::kDefaultNewAlign;
+            bool fieldHasClause  = namedVar.AllocAlignment > LLVMBackend::kDefaultNewAlign;
+            // A freshly-allocated array-view (`new T[n]...`) stored into an aligned field must carry
+            // the field's clause; a null store (IsArrayView false) is exempt.
+            bool rhsFreshBuffer  = rightNV.TypeAndValue.IsArrayView;
             if (operatorText == "=" && destIsStructField
-                && rightNV.AllocAlignment > LLVMBackend::kDefaultNewAlign)
+                && (rhsOverAligned || (fieldHasClause && rhsFreshBuffer))
+                && namedVar.AllocAlignment != rightNV.AllocAlignment)
             {
-                LogErrorContext(ctx, std::format(
-                    "cannot store an over-aligned buffer ('new T[n] alignas({})') into {}: that alignment is a "
-                    "property of the allocation, not of the type, so a free through the field cannot recover it. "
-                    "Keep the buffer in the local that allocated it, or over-align the ELEMENT TYPE instead "
-                    "('struct alignas({}) Chunk {{ ... }};') - a type's alignment travels with it into fields, "
-                    "containers and returns.",
-                    rightNV.AllocAlignment,
-                    namedVar.FieldName.empty() ? std::string("a field")
-                                               : std::format("field '{}'", namedVar.FieldName),
-                    rightNV.AllocAlignment));
+                std::string fieldDesc = namedVar.FieldName.empty()
+                    ? std::string("a field")
+                    : std::format("field '{}'", namedVar.FieldName);
+                if (!fieldHasClause)
+                    LogErrorContext(ctx, std::format(
+                        "cannot store an over-aligned buffer ('new T[n] alignas(0, {})') into {}: that alignment "
+                        "is a property of the allocation, not of the type, so a free through the field cannot "
+                        "recover it. Declare the field 'alignas(0, {})' so the block alignment is recorded, or "
+                        "over-align the ELEMENT TYPE instead ('struct alignas({}) Chunk {{ ... }};').",
+                        rightNV.AllocAlignment, fieldDesc, rightNV.AllocAlignment, rightNV.AllocAlignment));
+                else if (!rhsOverAligned)
+                    LogErrorContext(ctx, std::format(
+                        "alignment mismatch storing into {}: the field is declared 'alignas(0, {})' but the "
+                        "value was allocated without a matching allocation-alignment clause (ordinary alignment). "
+                        "Allocate it with 'new T[n] alignas(0, {})' so the free site recovers the correct alignment.",
+                        fieldDesc, namedVar.AllocAlignment, namedVar.AllocAlignment));
+                else
+                    LogErrorContext(ctx, std::format(
+                        "alignment mismatch storing into {}: the field is declared 'alignas(0, {})' but the "
+                        "value was allocated 'alignas(0, {})'. The two must agree so the free site recovers "
+                        "the correct alignment.",
+                        fieldDesc, namedVar.AllocAlignment, rightNV.AllocAlignment));
             }
 
             // Closure store (Option A): closures are clone-safe, so named-source assignment auto-clones.
@@ -11278,17 +11448,29 @@ public:
             sizeVal = compiler->builder->CreateMul(sizeVal, count, "arraysz");
         }
 
-        // Per-allocation alignment: `new T[n] alignas(N)`. This is an allocation
-        // property only - it must NOT change the type's sizeof/stride, so the size
-        // above stays derived from the type's effAlign. allocAlign drives the
-        // aligned operator-new route and the assume below; it is max(site, type).
+        // Per-allocation alignment. This is an allocation property only - it must NOT change the
+        // type's sizeof/stride, so the size above stays derived from the type's effAlign. allocAlign
+        // drives the aligned operator-new route and the assume below; it is max(site, type).
+        // Three sources, in priority order:
+        //   1. Explicit clause on the `new`: `alignas(N)` (1-arg = allocation, back-compat) or
+        //      `alignas(S, N)` (arg2 = allocation; the slot arg is meaningless for a heap block).
+        //   2. Otherwise a BARE `new` INHERITS the target declaration's clause via pendingInitAllocAlign
+        //      (inbound channel) - direct decl-init / direct assignment only; indirect contexts leave
+        //      it 0 so the receiving decl errors rather than silently under-align.
         uint64_t allocAlign = effAlign;
         if (auto* alignSpec = ctx->alignmentSpecifier())
         {
-            uint64_t siteAlign = ParseAlignmentSpecifier(alignSpec);
-            if (siteAlign == 0) return {};  // ParseAlignmentSpecifier already logged the reason
+            uint64_t slotAlign = ParseAlignmentSpecifier(alignSpec);  // arg1 (0 = natural / error)
+            uint64_t blockAlign = ParseAllocAlignArg(alignSpec);      // arg2 (0 = absent / error)
+            uint64_t siteAlign = (blockAlign != 0) ? blockAlign : slotAlign;
             if (siteAlign > allocAlign) allocAlign = siteAlign;
         }
+        else if (compiler->pendingInitAllocAlign > allocAlign)
+        {
+            allocAlign = compiler->pendingInitAllocAlign;
+        }
+        // One-shot: the inbound clause is consumed (or is inapplicable) at this `new`.
+        compiler->pendingInitAllocAlign = 0;
 
         // Call operator new: class-specific -> global. When effective alignment
         // exceeds the default-new threshold (16 on x64), route to the 2-arg
@@ -13199,6 +13381,9 @@ public:
                                     // can reject it when invoked outside the owning struct's own methods.
                                     namedVar.OwningStructName = structVar.TypeAndValue.TypeName;
                                     namedVar.FieldName        = primaryIdentifier;
+                                    // Field declared `alignas(_, N)`: stamp the block alignment onto the
+                                    // result so `delete obj->field` / scope-exit free via __delete_aligned.
+                                    namedVar.AllocAlignment   = fieldType.AllocAlignValue;
                                     // Propagate borrow-origin so 'move param->field' can detect
                                     // the parent pointer is a borrowed parameter.
                                     namedVar.IsBorrowed       = structVar.IsBorrowed;
@@ -21021,6 +21206,11 @@ public:
 
             if (paramType.IsMove && paramType.IsBond)
                 LogErrorContext(paramDecl, std::format("parameter '{}': 'bond' and 'move' are mutually exclusive", paramType.VariableName));
+
+            // A parameter's `alignas(_, N)` allocation alignment now rides in declarationSpecifiers
+            // (prefix): ParseDeclarationSpecifiers above already set paramType.AllocAlignValue. The
+            // block a `move` param owns is N-aligned, so the callee frees it via __delete_aligned and
+            // the call site checks the argument agrees.
 
             if (auto* lc = paramDecl->lockClause())
             {

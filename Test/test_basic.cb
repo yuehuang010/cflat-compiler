@@ -3370,6 +3370,28 @@ struct PlainHolder
 // recovered from the element type there too, or an aligned block goes to plain free.
 void consumeChunks(move AlignChunk* p) { }
 
+// `alignas(slot, alloc)` arg2 (the allocation-alignment clause): a struct can OWN a flat,
+// over-aligned raw `double[]`. arg2 records the BLOCK alignment on the field so the destructor's
+// `delete[_]` recovers it and takes the aligned deallocator. A bare `new` on the RHS INHERITS the
+// field's clause (inbound channel); an explicit `new ... alignas(0, N)` must agree (checked at the store).
+struct FlatMatrix
+{
+    alignas(0, 64) double[] data = default;
+    ~FlatMatrix() { delete[_] data; }
+};
+
+// The same clause on a `move` parameter: the callee owns the flat over-aligned block and
+// frees it at scope exit via the aligned route, recovered from the parameter's clause.
+void consumeFlat(move alignas(0, 64) double[] buf) { }
+
+// RETURN escape: a function whose RETURN TYPE declares `alignas(0, 64)` hands back a 64-aligned
+// heap block. A bare `new` in the return inherits the alignment (inbound channel); the caller's
+// receiving local is stamped so `delete[_]` routes to __delete_aligned.
+alignas(0, 64) double[] makeAlignedFlat(int n)
+{
+    return new double[n];
+}
+
 // `alignas(N)` on a MEMBER: the member's slot is padded to its boundary and the containing
 // type's alignment (and padded sizeof) rise to match - C/C++ semantics. The layout carries
 // synthetic `__padN` slots that must stay invisible to field access, brace-init and dtors.
@@ -3469,6 +3491,32 @@ bool testAlignas()
     }
     result &= Test("alignas(64) elem in field: base%64 over 64 rounds", fieldMisaligned, 0);
     result &= Test("aligned+plain field churn sum",                    fieldSum == 512.0, true);
+
+    // `alignas(0, N)` clause: own a FLAT over-aligned `double[]` in a field, and hand one to a
+    // `move` param. The block must be 64-aligned and freed through the aligned route (recovered
+    // from the field/param clause, not the element type). Churned so a mis-routed free corrupts.
+    int    flatMisaligned = 0;
+    double flatSum        = 0.0;
+    for (int i = 0; i < 64; i = i + 1)
+    {
+        FlatMatrix fm;
+        fm.data = new double[16];   // bare new INHERITS the field's clause (inbound channel)
+        if ((((i64)&fm.data[0]) & 63) != 0) flatMisaligned = flatMisaligned + 1;
+        fm.data[15] = 3.5;
+        flatSum = flatSum + fm.data[15];
+
+        consumeFlat(new double[8] alignas(0, 64));  // call-arg is indirect: clause must be explicit
+
+        // RETURN escape: a BARE caller local is auto-stamped from the return type's clause, so it
+        // frees via the aligned route with no annotation of its own.
+        double[] ret = makeAlignedFlat(4);
+        if ((((i64)&ret[0]) & 63) != 0) flatMisaligned = flatMisaligned + 1;
+        ret[3] = 1.0;
+        flatSum = flatSum + ret[3];
+        delete[_] ret;   // routes to __delete_aligned via the return-stamped alignment
+    }
+    result &= Test("alignas(0,64) flat double[] field base%64 over 64 rounds", flatMisaligned, 0);
+    result &= Test("alignas(0,64) field churn sum",                            flatSum == 288.0, true);
 
     // Per-site `new T[n] alignas(N)` stays owned by its local: move between locals keeps the
     // tag, so the extracted local still frees through the aligned route.
