@@ -11,8 +11,13 @@
 #   ./test.sh Debug      # Debug
 #   ./test.sh -j 8       # cap parallelism (default: nproc)
 #
-# Unlike test.bat this does NOT run `cflat --init` (a bitcode-cache warmup, a
-# pure optimization) - each worker parses the core closure fresh.
+# Like test.bat, after the cold pass this runs `cflat --init` and re-runs the
+# negative tests against the warm bitcode cache. --init reconstructs compiler
+# state from a hand-written serializer (a second code path), so a field the
+# analysis reads but that is missing from the serializer is silently dropped on a
+# warm cache - the expect_error then stops firing. The warm pass catches that here
+# instead of only on Windows. See
+# internal/issue/init-cache-state-drop-invisible-on-posix.md.
 #
 # SKIP list: tests that cannot pass on Linux because they exercise Windows-only
 # functionality. These are TEST-CONTENT or unrelated-subsystem limitations, not
@@ -136,7 +141,19 @@ run_err() {
   fi
 }
 
-export -f run_cb run_err is_skipped
+# Warm-cache worker: same negative test, but run after `cflat --init`, so the
+# compiler state comes from the bitcode-cache serializer rather than a fresh parse.
+# A ".warm" suffix keeps its result/log distinct from the cold run's.
+run_err_warm() {
+  local f="$1" n; n="$(basename "$f" .cb).warm"
+  if $TIMEOUT "$CFLAT" "$f" -i "$LIB" --check >"$RES/$n.log" 2>&1; then
+    echo "PASS" >"$RES/$n.result"
+  else
+    echo "FAIL" >"$RES/$n.result"
+  fi
+}
+
+export -f run_cb run_err run_err_warm is_skipped
 export CFLAT LIB RES TIMEOUT
 
 # Build the work list, then fan out across $JOBS workers via xargs -P.
@@ -157,6 +174,18 @@ fi
 
 printf '%s' "$cb_list"  | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_cb "$@"' _ {}
 printf '%s' "$err_list" | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_err "$@"' _ {}
+
+# Warm-cache pass: populate the --init bitcode cache, then re-run the negative
+# tests against it. This exercises the serializer round-trip that test.bat covers
+# on Windows but test.sh previously never did. See
+# internal/issue/init-cache-state-drop-invisible-on-posix.md.
+if "$CFLAT" --init >"$RES/_init.log" 2>&1; then
+  printf '%s' "$err_list" | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_err_warm "$@"' _ {}
+else
+  echo "FAIL: cflat --init crashed (warm-cache pass could not run)"
+  echo "FAIL" >"$RES/_init.result"
+  tail -n 8 "$RES/_init.log" 2>/dev/null
+fi
 
 # Collect.
 pass=0; fail=0; failed_names=""
