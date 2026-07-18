@@ -1,0 +1,22 @@
+// The inverse direction: the interface declares the parameter WITHOUT `move`, so a call
+// through the interface does not transfer ownership and the caller still frees the
+// argument. An implementor that declares `move` has already taken it over - that is the
+// double-free direction, and is rejected just as the missing-`move` direction is.
+struct Res { int v = 0; };
+
+interface IBorrowSink
+{
+    void take(Res* r);
+};
+
+expect_error("parameter 'r' is declared 'move' but interface 'IBorrowSink' does not declare it 'move'") {
+    class OwningSink : IBorrowSink
+    {
+        void take(move Res* r) { delete r; }
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

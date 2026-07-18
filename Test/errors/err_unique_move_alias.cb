@@ -1,0 +1,22 @@
+// Stage 3 of `unique` (Trap B in its original spelling - see
+// internal/plan/ownership-move-alias-discipline.md): `move` on a pointer copied OUT of a
+// `unique` field. The move nulls the LOCAL, never the field, so the field's synthesized
+// destructor frees the pointee a second time. Forwarding an ordinary borrow as `move` stays
+// legal - it is the programmer asserting the borrow is dead - but for a `unique` field that
+// assertion can never hold, because the field's destructor is synthesized and will run.
+// `move b.p` moves the field itself, which nulls it (Test/test_move.cb).
+struct Res { int v = 0; };
+struct Box { unique Res* p = nullptr; };
+
+void consume(move Res* n) { delete n; }
+
+extern int main()
+{
+    expect_error("cannot 'move' 'alias' - it aliases unique field 'Box.p'") {
+        Box b = default;
+        b.p = new Res();
+        Res* alias = b.p;
+        consume(move alias);
+    }
+    return 0;
+}

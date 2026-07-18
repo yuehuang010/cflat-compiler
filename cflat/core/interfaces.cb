@@ -55,31 +55,36 @@ interface IString
 };
 
 // Read-only sequence: count plus indexed element access.
+// The sequence owns its elements, so get() hands back an `alias` borrow - the ownership
+// qualifiers here are contract: a caller dispatching through the interface reads them from
+// this declaration, never from the implementor (see VerifyInterfaceMethodContract).
 interface IEnumerable<T>
 {
     // Number of elements in the sequence.
     int count();
-    // Element at the given zero-based index.
-    T   get(int index);
+    // Element at the given zero-based index (borrow - the sequence keeps ownership).
+    alias T get(int index);
 };
 
 // Mutable indexed list contract: read, write, append, and remove elements.
+// Ownership mirrors list<T>, the canonical implementor: the list owns its elements, so
+// add()/set() take ownership of the value and get()/operator[] hand back a borrow.
 interface IList<T>
 {
     // Number of elements in the list.
-    int  count();
-    // Element at the given zero-based index.
-    T    get(int index);
-    // Indexing operator - element at the given index.
-    T    operator[](int index);
-    // Overwrite the element at the given index.
-    void set(int index, T value);
-    // Append a value to the end of the list.
-    void add(T value);
+    int   count();
+    // Element at the given zero-based index (borrow - the list keeps ownership).
+    alias T get(int index);
+    // Indexing operator - element at the given index (borrow, same as get).
+    alias T operator[](int index);
+    // Overwrite the element at the given index; takes ownership of the new value.
+    void  set(int index, move T value);
+    // Append a value to the end of the list; takes ownership of the value.
+    void  add(move T value);
     // Remove the element at the given index.
-    void removeAt(int index);
+    void  removeAt(int index);
     // Remove all elements.
-    void clear();
+    void  clear();
 };
 
 // Contract for a type that can produce an integer hash of itself.

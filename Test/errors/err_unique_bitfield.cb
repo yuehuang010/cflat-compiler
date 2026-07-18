@@ -1,0 +1,9 @@
+// A bitfield has no address of its own and is not a pointer - nothing to delete.
+expect_error("a bitfield is not a pointer type") {
+    struct S { unique int flags : 3 = 0; };
+}
+
+extern int main()
+{
+    return 0;
+}

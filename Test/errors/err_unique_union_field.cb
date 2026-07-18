@@ -1,0 +1,21 @@
+// A union member cannot be `unique`. The synthesized destructor runs unconditionally and
+// cannot know which member is active, so it would free whichever bits the union currently
+// holds - an arbitrary free, not merely a leak. Consistent with the other rejections in
+// ValidateUniqueField (fixed array, array view, simd, bitfield): all of the form "the
+// synthesized destructor cannot express this". This also makes the destruction-cycle check
+// unreachable for unions - `union U { unique U* p; ... }` is rejected here first, before
+// CreateUnionType ever sees a `unique` field.
+struct Node { int v = 0; };
+
+expect_error("a union member cannot be 'unique'") {
+    union Slot
+    {
+        unique Node* item;
+        i64          raw;
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

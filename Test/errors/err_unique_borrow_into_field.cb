@@ -1,0 +1,18 @@
+// Stage 2 of `unique`: a `unique` field declares that it OWNS its pointee, and the
+// synthesized destructor deletes it. Storing a borrowed (non-`move`) parameter into it
+// therefore makes two owners - the caller frees on scope exit and the field frees at
+// teardown. This is Trap A from internal/plan/ownership-move-alias-discipline.md, which
+// is only diagnosable because the field states the ownership claim. `move Node* n` is
+// the accepted spelling (covered positively in Test/test_move.cb).
+struct Node { int v = 0; };
+
+struct Holder { unique Node* slot = nullptr; };
+
+expect_error("cannot store borrowed parameter 'n' into unique field 'Holder.slot'") {
+    void store(Holder* h, Node* n) { h->slot = n; }
+}
+
+extern int main()
+{
+    return 0;
+}

@@ -1,0 +1,26 @@
+// `unique` is part of the interface FIELD CONTRACT, not of the field's type. A store through
+// an interface's byte-offset field slot reads ownership from the INTERFACE - dynamic dispatch
+// leaves the concrete type unknown, and two implementors could disagree - so an implementor
+// that owns a field the interface declares silent gets neither guard: the reassignment never
+// frees the old pointee (leak) and Trap A never rejects a borrow (double-free). Reject the
+// disagreement instead. This is the direction that used to compile into that heap bug.
+struct Res { int v = 0; };
+
+interface IHolder
+{
+    Res* item;              // silent: no ownership claim
+    int  tag();
+};
+
+expect_error("class 'Holder' field 'item' is declared 'unique' but interface 'IHolder' does not declare it 'unique'") {
+    class Holder : IHolder
+    {
+        unique Res* item = nullptr;   // but the class claims to own it
+        int tag() { return 1; }
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

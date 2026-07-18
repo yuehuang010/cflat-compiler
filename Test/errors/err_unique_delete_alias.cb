@@ -1,0 +1,19 @@
+// Stage 3 of `unique` (Trap B): laundering a `unique` field through a plain local. The copy
+// does not null the field, so the field's synthesized destructor still frees the pointee and
+// `delete alias` is a double-free. A local bound from a `unique` field inherits the borrow, so
+// the delete routes into the existing "cannot delete an alias" check. Reads through the alias
+// stay legal (Test/test_move.cb) - only the free is rejected. `move b.p` is the sanctioned
+// extraction: it nulls the field and hands ownership to the local.
+struct Res { int v = 0; };
+struct Box { unique Res* p = nullptr; };
+
+extern int main()
+{
+    expect_error("cannot delete 'alias' - it aliases unique field 'Box.p'") {
+        Box b = default;
+        b.p = new Res();
+        Res* alias = b.p;
+        delete alias;
+    }
+    return 0;
+}

@@ -25,9 +25,11 @@
 // natively for primitive types and for `string` (core/string.cb).
 //
 // Ownership mirrors dictionary<K,V> exactly:
-//   - keys are non-owning, EXCEPT string keys, which are deep-copied on insert and destructed
-//     on removal (dictionary.cb's rationale: a plain store would alias the caller's soon-freed
-//     argument).
+//   - primitive and pointer keys are non-owning; an OWNING key (a string, or a struct that owns
+//     buffers) is deep-copied on insert and destructed on removal (dictionary.cb's rationale: a
+//     plain store would alias the caller's soon-freed argument). NOTE: owning keys are sound only
+//     for the SINGLE-THREADED API; the concurrent lookup()/insert() family requires a primitive K
+//     whose operator< does not dereference (see the speculative-descent contract below).
 //   - when V is a pointer type, the tree OWNS the values: add()/set() take ownership (move),
 //     set() frees the old value on overwrite, remove()/clear()/the destructor free values.
 //   - get() returns `alias V`: the returned value stays owned by the tree and must not be
@@ -159,12 +161,46 @@ struct btree<K, V>
         return n;
     }
 
-    // Store a key into slot i of a node, deep-copying string keys (mirrors dictionary.cb).
+    // Store a key into slot i of a node, deep-copying an owning key (mirrors dictionary.cb).
     void _storeKey(btree_node<K, V>* n, int i, K key)
     {
-        if const (is_string(K)) n->keys[i] = key.copy();
-        if const (!is_string(K)) n->keys[i] = key;
+        if const (is_primitive(K))    n->keys[i] = key;
+        else if const (is_pointer(K)) n->keys[i] = key;
+        else                          n->keys[i] = key.copy();
     }
+
+    // Return an OWNED deep copy of a key: a fresh clone of an owning key (string or a struct that
+    // owns buffers), or the value for a primitive/pointer key. A leaf-split separator is lifted
+    // into the parent, which must own it independently of the leaf's copy (the key stays in the leaf).
+    K _dupKey(K k)
+    {
+        K r = default;
+        if const (is_primitive(K))    r = k;
+        else if const (is_pointer(K)) r = k;
+        else                          r = k.copy();
+        return r;
+    }
+
+    // Abandon a key/value slot: overwrite it with a default WITHOUT freeing, for when its owned
+    // buffer was shallow-copied into another slot that now owns it. The node is a borrowed pointer
+    // parameter here, so `move` is not allowed (ownership model, see _freeValue); a plain store of
+    // a default local is a pure overwrite that never frees the old slot. The synthesized node
+    // destructor now frees ALL slots, so an abandoned OWNING-typed tail slot must read as empty.
+    // Gated to owning types only (owning keys; non-pointer non-primitive values), so a primitive
+    // or pointer instantiation - which the destructor never walks - emits nothing here.
+    void _clearKey(btree_node<K, V>* n, int i)
+    {
+        if const (!is_primitive(K)) if const (!is_pointer(K)) { K e = default; n->keys[i] = e; }
+    }
+    void _clearValue(btree_node<K, V>* n, int i)
+    {
+        if const (!is_pointer(V)) if const (!is_primitive(V)) { V e = default; n->values[i] = e; }
+    }
+
+    // Destruct an owned key slot in place (frees an owning key and zeroes it; a no-op for a
+    // borrowed/primitive key). `.~()` is a destructor call, not a `move`, so it is legal through a
+    // borrowed node parameter - used to drop a separator the tree no longer holds.
+    void _destroyKey(btree_node<K, V>* n, int i) { if const (!is_primitive(K)) if const (!is_pointer(K)) n->keys[i].~(); }
 
     // Free a value taken out of a leaf slot (pointer values are deleted, others destructed).
     // Takes the value by move rather than a node+index: this language's ownership model
@@ -179,12 +215,12 @@ struct btree<K, V>
             value.~();
     }
 
-    // Free a string key taken out of a leaf slot; a no-op unless K is a string (non-string
-    // keys are borrowed, never owned). See _freeValue for why this takes the key by move
-    // instead of a node+index.
+    // Free an owning key taken out of a leaf slot; a no-op for a primitive/pointer key (those
+    // are borrowed, never owned). See _freeValue for why this takes the key by move instead
+    // of a node+index.
     void _freeKey(move K key)
     {
-        if const (is_string(K)) key.~();
+        if const (!is_primitive(K)) if const (!is_pointer(K)) key.~();
     }
 
     // Insert (sep, rightChild) into internal node parent at position idx: parent->keys[idx]
@@ -192,16 +228,22 @@ struct btree<K, V>
     // ownership of rightChild (a freshly new'd node from _splitChild) - without `move` here,
     // an unconsumed owning parameter is freed at the caller's scope exit, use-after-freeing
     // the node this just stored into the tree.
-    void _insertChildAt(btree_node<K, V>* parent, int idx, K sep, move btree_node<K, V>* rightChild)
+    void _insertChildAt(btree_node<K, V>* parent, int idx, move K sep, move btree_node<K, V>* rightChild)
     {
         int j = parent->count;
         while (j > idx)
         {
+            // Plain rotation opens a gap at idx: `parent` is a borrowed pointer parameter, so its
+            // inline-array fields cannot be `move`d out (ownership model, see _freeValue). The
+            // rotation is sound because it only shifts entries UP into the empty tail - the source
+            // of each copy is overwritten by the next iteration, so no slot is left double-owned.
             parent->keys[j] = parent->keys[j - 1];
             parent->children[j + 1] = parent->children[j];
             j--;
         }
-        parent->keys[idx] = sep;
+        // `sep` is a `move` PARAMETER (owned by this call), so moving it into the freed slot i is
+        // legal and transfers the buffer; the old alias at slot idx was preserved one slot up.
+        parent->keys[idx] = move sep;
         parent->children[idx + 1] = rightChild;
         parent->count++;
     }
@@ -216,6 +258,10 @@ struct btree<K, V>
         btree_node<K, V>* right = new btree_node<K, V>();
         right->isLeaf = left->isLeaf;
 
+        // `left` is `parent->children[idx]` - reached through the borrowed `parent`, so it carries
+        // the same ownership taint and its inline arrays cannot be `move`d. Transfer keys/values to
+        // `right` by shallow copy, then abandon-clear left's vacated slots so left's dead tail
+        // holds no owned duplicate for the node destructor (which now frees all slots) to re-free.
         if (left->isLeaf)
         {
             int mid = BTREE_FANOUT / 2;
@@ -225,6 +271,8 @@ struct btree<K, V>
             {
                 right->keys[i] = left->keys[mid + i];
                 right->values[i] = left->values[mid + i];
+                _clearKey(left, mid + i);
+                _clearValue(left, mid + i);
                 i++;
             }
             right->count = rightCount;
@@ -232,18 +280,19 @@ struct btree<K, V>
             right->next = left->next;
             left->next = right;
 
-            K sep = right->keys[0];   // copied up; stays in the leaf too
-            _insertChildAt(parent, idx, sep, right);
+            // Separator is a COPY of right's first key (the key stays in the leaf), so the parent
+            // owns it independently. _dupKey deep-copies an owning key, or copies a primitive value.
+            _insertChildAt(parent, idx, _dupKey(right->keys[0]), right);
         }
         else
         {
             int mid = BTREE_FANOUT / 2;
-            K sep = left->keys[mid];   // moves up; removed from both children below
             int rightCount = left->count - mid - 1;
             int i = 0;
             while (i < rightCount)
             {
                 right->keys[i] = left->keys[mid + 1 + i];
+                _clearKey(left, mid + 1 + i);
                 i++;
             }
             i = 0;
@@ -254,7 +303,10 @@ struct btree<K, V>
             }
             right->count = rightCount;
             left->count = mid;
-            _insertChildAt(parent, idx, sep, right);
+            // Median key is REMOVED from left and lifted into the parent: an owned copy goes to the
+            // parent, then left's original is freed in place (copy+free, since left cannot be moved).
+            _insertChildAt(parent, idx, _dupKey(left->keys[mid]), right);
+            _destroyKey(left, mid);
         }
     }
 
@@ -288,6 +340,9 @@ struct btree<K, V>
         int j = n->count;
         while (j > i)
         {
+            // Plain rotation up: `n` is a borrowed pointer parameter, so its inline arrays cannot
+            // be `move`d. Shifting into the empty tail leaves no double-owned slot; _storeKey then
+            // overwrites the vacated slot i (its old alias survives one slot up).
             n->keys[j] = n->keys[j - 1];
             n->values[j] = n->values[j - 1];
             j--;
@@ -709,8 +764,11 @@ struct btree<K, V>
         int j = i;
         while (j < leaf->count - 1)
         {
-            leaf->keys[j] = leaf->keys[j + 1];
-            leaf->values[j] = leaf->values[j + 1];
+            // `move` down-shift clears each vacated source; the last iteration clears the old
+            // top slot [count-1], so the shrunk tail holds no stale owned duplicate for the
+            // node destructor to double-free. A primitive is copied without clearing.
+            leaf->keys[j] = move leaf->keys[j + 1];
+            leaf->values[j] = move leaf->values[j + 1];
             j++;
         }
         leaf->count--;
@@ -779,13 +837,17 @@ struct btree<K, V>
     // node disappears. Frees node, so it is taken by move.
     void _mergeWithLeft(btree_node<K, V>* parent, int idx, move btree_node<K, V>* node, btree_node<K, V>* leftSib)
     {
+        bool leafMerge = node->isLeaf;
         int k = 0;
         if (node->isLeaf)
         {
+            // `node` is a `move` parameter, so `move node->keys[k]` is legal: it transfers the
+            // owning key/value into leftSib and clears node's slot, so `delete node` (whose
+            // destructor now frees all slots) sees them empty - no double free.
             while (k < node->count)
             {
-                leftSib->keys[leftSib->count] = node->keys[k];
-                leftSib->values[leftSib->count] = node->values[k];
+                leftSib->keys[leftSib->count] = move node->keys[k];
+                leftSib->values[leftSib->count] = move node->values[k];
                 leftSib->count++;
                 k++;
             }
@@ -793,11 +855,14 @@ struct btree<K, V>
         }
         else
         {
+            // Internal merge pulls the parent separator DOWN into leftSib by shallow copy (parent
+            // is borrowed - no `move`); the fixup below overwrites that parent slot without freeing,
+            // so leftSib keeps the buffer. node's keys transfer by move (move parameter).
             leftSib->keys[leftSib->count] = parent->keys[idx - 1];
             leftSib->count++;
             while (k < node->count)
             {
-                leftSib->keys[leftSib->count] = node->keys[k];
+                leftSib->keys[leftSib->count] = move node->keys[k];
                 leftSib->count++;
                 k++;
             }
@@ -812,6 +877,11 @@ struct btree<K, V>
         }
         delete node;
 
+        // Drop the parent's now-defunct separator. A leaf merge DISCARDS it - free the owned key in
+        // place (`.~()` is legal through the borrowed parent). An internal merge already handed it
+        // to leftSib, so the shift below (which overwrites without freeing) drops it there. Then
+        // clear the vacated top slot so the node destructor never frees a stale owned duplicate.
+        if (leafMerge) _destroyKey(parent, idx - 1);
         int m = idx - 1;
         while (m < parent->count - 1)
         {
@@ -819,6 +889,7 @@ struct btree<K, V>
             parent->children[m + 1] = parent->children[m + 2];
             m++;
         }
+        _clearKey(parent, parent->count - 1);
         parent->count--;
     }
 
@@ -826,13 +897,16 @@ struct btree<K, V>
     // sibling); rightSib disappears. Frees rightSib, so it is taken by move.
     void _mergeWithRight(btree_node<K, V>* parent, int idx, btree_node<K, V>* node, move btree_node<K, V>* rightSib)
     {
+        bool leafMerge = node->isLeaf;
         int k = 0;
         if (node->isLeaf)
         {
+            // `rightSib` is a `move` parameter, so `move rightSib->keys[k]` transfers the owning
+            // key/value into node and clears rightSib's slot; `delete rightSib` then frees empties.
             while (k < rightSib->count)
             {
-                node->keys[node->count] = rightSib->keys[k];
-                node->values[node->count] = rightSib->values[k];
+                node->keys[node->count] = move rightSib->keys[k];
+                node->values[node->count] = move rightSib->values[k];
                 node->count++;
                 k++;
             }
@@ -840,11 +914,13 @@ struct btree<K, V>
         }
         else
         {
+            // Internal merge pulls the parent separator DOWN into node by shallow copy (parent is
+            // borrowed); the fixup below drops the parent slot without freeing so node keeps it.
             node->keys[node->count] = parent->keys[idx];
             node->count++;
             while (k < rightSib->count)
             {
-                node->keys[node->count] = rightSib->keys[k];
+                node->keys[node->count] = move rightSib->keys[k];
                 node->count++;
                 k++;
             }
@@ -859,6 +935,9 @@ struct btree<K, V>
         }
         delete rightSib;
 
+        // Drop the parent's defunct separator: leaf merge frees it in place; internal merge handed
+        // it to node, so the shift drops it there. Clear the vacated top slot for the destructor.
+        if (leafMerge) _destroyKey(parent, idx);
         int m = idx;
         while (m < parent->count - 1)
         {
@@ -866,6 +945,7 @@ struct btree<K, V>
             parent->children[m + 1] = parent->children[m + 2];
             m++;
         }
+        _clearKey(parent, parent->count - 1);
         parent->count--;
     }
 
@@ -890,18 +970,32 @@ struct btree<K, V>
     // Borrow the last entry of leftSib into node (node is parent->children[idx]).
     void _borrowFromLeft(btree_node<K, V>* parent, int idx, btree_node<K, V>* node, btree_node<K, V>* leftSib)
     {
+        // All three nodes are borrowed pointer parameters, so their inline arrays cannot be `move`d
+        // (ownership model, see _freeValue). Handoffs are shallow copies paired with an explicit
+        // abandon-clear of the vacated source slot; separators are freed/copied via _destroyKey /
+        // _storeKey. The synthesized node destructor frees all slots, so every vacated tail slot
+        // must be cleared. Net ownership is conserved: each buffer ends up referenced exactly once.
         if (node->isLeaf)
         {
+            // Shift node up (plain rotation into the empty tail), take leftSib's last entry by
+            // shallow copy, then abandon leftSib's vacated slot. Rewrite the separator to an owned
+            // COPY of node's new first key (the key stays in the leaf), freeing the old one first.
             int j = node->count;
             while (j > 0) { node->keys[j] = node->keys[j - 1]; node->values[j] = node->values[j - 1]; j--; }
             node->keys[0] = leftSib->keys[leftSib->count - 1];
             node->values[0] = leftSib->values[leftSib->count - 1];
             node->count++;
             leftSib->count--;
-            parent->keys[idx - 1] = node->keys[0];
+            _clearKey(leftSib, leftSib->count);
+            _clearValue(leftSib, leftSib->count);
+            _destroyKey(parent, idx - 1);
+            _storeKey(parent, idx - 1, node->keys[0]);
         }
         else
         {
+            // Rotation: separator down into node's slot 0, leftSib's last key up as the new
+            // separator - both shallow copies whose overwritten sources are preserved elsewhere,
+            // then abandon leftSib's vacated key. Children (raw pointers) shift by plain copy.
             int j = node->count;
             while (j > 0) { node->keys[j] = node->keys[j - 1]; j--; }
             int c = node->count + 1;
@@ -911,24 +1005,35 @@ struct btree<K, V>
             parent->keys[idx - 1] = leftSib->keys[leftSib->count - 1];
             node->count++;
             leftSib->count--;
+            _clearKey(leftSib, leftSib->count);
         }
     }
 
     // Borrow the first entry of rightSib into node (node is parent->children[idx]).
     void _borrowFromRight(btree_node<K, V>* parent, int idx, btree_node<K, V>* node, btree_node<K, V>* rightSib)
     {
+        // Same ownership constraints as _borrowFromLeft: shallow-copy handoffs + explicit
+        // abandon-clear of vacated slots (all nodes are borrowed parameters).
         if (node->isLeaf)
         {
+            // Take rightSib's first entry (shallow), plain down-shift the rest, then clear the
+            // stale top slot the rotation leaves; set the separator to an owned COPY of rightSib's
+            // new first key, freeing the old separator first.
             node->keys[node->count] = rightSib->keys[0];
             node->values[node->count] = rightSib->values[0];
             node->count++;
             int j = 0;
             while (j < rightSib->count - 1) { rightSib->keys[j] = rightSib->keys[j + 1]; rightSib->values[j] = rightSib->values[j + 1]; j++; }
             rightSib->count--;
-            parent->keys[idx] = rightSib->keys[0];
+            _clearKey(rightSib, rightSib->count);
+            _clearValue(rightSib, rightSib->count);
+            _destroyKey(parent, idx);
+            _storeKey(parent, idx, rightSib->keys[0]);
         }
         else
         {
+            // Rotation: parent separator down into node, rightSib's first key up as the new
+            // separator (shallow copies), plain down-shift rightSib, clear its stale top slot.
             node->keys[node->count] = parent->keys[idx];
             node->children[node->count + 1] = rightSib->children[0];
             node->count++;
@@ -938,6 +1043,7 @@ struct btree<K, V>
             int c = 0;
             while (c < rightSib->count) { rightSib->children[c] = rightSib->children[c + 1]; c++; }
             rightSib->count--;
+            _clearKey(rightSib, rightSib->count);
         }
     }
 

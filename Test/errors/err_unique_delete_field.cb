@@ -1,0 +1,20 @@
+// Stage 2 of `unique`: the synthesized destructor calls the user destructor FIRST and then
+// deletes the `unique` field, so a hand-written `delete _root;` frees it twice. This is
+// exactly what a migration produces when someone adds `unique` and forgets to remove the
+// old destructor. The rule is coherent rather than merely restrictive: with reassignment
+// destruction in place, `_root = nullptr;` frees the pointee and `_root = new Node();`
+// frees it and re-roots, so an explicit delete is never needed.
+struct Node { int v = 0; };
+
+expect_error("cannot delete unique field 'Tree._root'") {
+    struct Tree
+    {
+        unique Node* _root = nullptr;
+        ~Tree() { delete _root; }
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

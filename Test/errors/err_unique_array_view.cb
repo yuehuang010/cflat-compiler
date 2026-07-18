@@ -1,0 +1,10 @@
+// An array-view `T[]` is a borrow by construction - it never owns its buffer, so it can
+// never be the thing a synthesized destructor deletes.
+expect_error("array views are not supported - a view does not own its buffer") {
+    struct S { unique int[] view = default; };
+}
+
+extern int main()
+{
+    return 0;
+}

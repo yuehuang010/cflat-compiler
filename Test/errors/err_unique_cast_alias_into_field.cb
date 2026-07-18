@@ -1,0 +1,17 @@
+// A `(T*)` cast off a `unique` field must not defeat the store-into-field rule (Trap B). Storing
+// the cast alias into ANOTHER `unique` field would make two owners of one pointee. The cast
+// preserves borrow provenance, so the store is rejected exactly as the un-cast form is.
+struct Res { int v = 0; };
+struct Box { unique Res* p = nullptr; };
+
+extern int main()
+{
+    expect_error("cannot store 'alias' into unique field 'Box.p' - it aliases 'a.p', a unique field") {
+        Box a = default;
+        a.p = new Res();
+        Box c = default;
+        Res* alias = (Res*)a.p;
+        c.p = alias;
+    }
+    return 0;
+}

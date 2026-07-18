@@ -2369,6 +2369,12 @@ void LLVMBackend::ResetForReanalysis()
     // wrongly short-circuit on the next file.
     fullDestructorCache_.clear();
     fullDestructorInProgress_.clear();
+    // Synthesized memberwise copy() functions are also module-bound Function* objects (same
+    // stale-pointer class as fullDestructorCache_). Beyond the dangling pointer, a surviving cache
+    // entry makes GetOrCreateMemberwiseCopy return early WITHOUT re-registering the synth in the
+    // just-cleared functionTable, so a later `x.copy()` (e.g. list<OwningStruct>.copy() calling the
+    // element's copy()) fails to resolve on the second file of an LSP bulk sweep. Discard with the module.
+    memberwiseCopyCache_.clear();
     // Deferred delete-site dtor wrappers are also module-bound Function* objects (same
     // stale-pointer crash class as fullDestructorCache_), so discard them with the module.
     deferredFullDtor_.clear();
@@ -3769,7 +3775,12 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (t.IsInterfacePointer)     o["ifp"] = true;
     if (t.IsNullable)             o["nl"]  = true;
     if (t.IsMove)                 o["mv"]  = true;
+    // 'alias' joins its ownership siblings here because VerifyInterfaceMethodContract reads it:
+    // dropped on a warm cache, an interface's `alias` return would silently stop matching its
+    // implementor's and the contract check would misfire.
+    if (t.IsAlias)                o["al"]  = true;
     if (t.IsBond)                 o["bd"]  = true;
+    if (t.IsUnique)               o["uq"]  = true;
     if (t.CallConv != LLVMBackend::CallingConv::Default) o["cc"] = static_cast<int64_t>(t.CallConv);
     if (t.LockThis)               o["lt"]  = true;
     if (t.LockThisMode != LockMode::Exclusive) o["ltm"] = static_cast<int64_t>(t.LockThisMode);
@@ -3821,7 +3832,9 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("ifp"))t.IsInterfacePointer = *v;
     if (auto v = o.getBoolean("nl")) t.IsNullable = *v;
     if (auto v = o.getBoolean("mv")) t.IsMove = *v;
+    if (auto v = o.getBoolean("al")) t.IsAlias = *v;
     if (auto v = o.getBoolean("bd")) t.IsBond = *v;
+    if (auto v = o.getBoolean("uq")) t.IsUnique = *v;
     if (auto v = o.getInteger("cc")) t.CallConv = static_cast<LLVMBackend::CallingConv>(*v);
     if (auto v = o.getBoolean("lt")) t.LockThis = *v;
     if (auto v = o.getInteger("ltm")) t.LockThisMode = static_cast<LockMode>(*v);

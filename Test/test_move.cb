@@ -28,6 +28,74 @@ struct Container
     }
 };
 
+// `unique` field ownership: the compiler-synthesized destructor deletes the pointer,
+// so this needs none of ~Container's hand-written free above.
+struct UniqueBox
+{
+    unique Resource* item = nullptr;
+
+    // Bare self-field assign inside a method. This carries no FieldName (it resolves through
+    // GetMemberVariable), so the reassignment free is skipped by a runtime old-vs-new compare
+    // rather than by name matching; without it this frees and then stores a dangling pointer.
+    void selfAssignBare() { item = item; }
+};
+
+// `unique` composes with a hand-written destructor. The user dtor runs FIRST, so releasing
+// the field early leaves the synthesized delete looking at nullptr - not a double free.
+// Stage 2 note: this used to spell the release `delete item; item = nullptr;`. A hand-written
+// delete of a `unique` field is now rejected outright (err_unique_delete_field) because the
+// un-nulled form of it is a double-free, and it is no longer needed - assigning nullptr frees
+// the pointee on its own, which is exactly what this exercises.
+struct UniqueFreesItself
+{
+    unique Resource* item = nullptr;
+
+    ~UniqueFreesItself()
+    {
+        item = nullptr;
+    }
+};
+
+// Transitive: deleting the outer `unique` field runs UniqueBox's synthesized
+// destructor, which in turn deletes its own `unique` field.
+struct UniqueOuter
+{
+    unique UniqueBox* inner = nullptr;
+};
+
+/*
+ * `unique` on an INTERFACE field. Ownership has to live in the contract: a store through the
+ * interface's byte-offset slot is dispatched dynamically, so the concrete type is unknown and
+ * the access site can only learn the slot is owning from the interface itself. Both sides must
+ * agree - the two disagreements are rejected (err_unique_iface_field_impl_only /
+ * err_unique_iface_field_iface_only). This is the field analogue of `push(move T item)`.
+ */
+interface IUniqueBox
+{
+    unique Resource* item;
+    int tag();
+};
+
+class UniqueIfaceBox : IUniqueBox
+{
+    unique Resource* item = nullptr;
+    int tag() { return 1; }
+};
+
+// Reassign through the interface's field slot: the old pointee is freed here, not orphaned.
+int storeViaIface(IUniqueBox h)
+{
+    h.item = new Resource();
+    h.item->id = 21;
+    return h.tag();
+}
+
+// `nullptr` through the interface slot is the same release-early idiom as on a direct field.
+void releaseViaIface(IUniqueBox h)
+{
+    h.item = nullptr;
+}
+
 // Composite-ownership shape: 'Bag' owns its 'item' (a Resource*) and an array
 // of 'RouteEntry' (each of which owns its own 'name' Resource*). Each layer's
 // destructor frees only its own fields; cross-layer cleanup happens by chained
@@ -321,6 +389,243 @@ int testRecursiveContainerFree()
         roots.add(root);
     }
     passed += Test("recursive_container_frees_all", dtorCount, 3);
+
+    return passed;
+}
+
+int testUniqueField()
+{
+    int passed = 0;
+
+    // The synthesized destructor frees the `unique` field - UniqueBox has no user dtor.
+    dtorCount = 0;
+    {
+        UniqueBox b;
+        b.item = new Resource();
+    }
+    passed += Test("unique_field_freed_by_synth_dtor", dtorCount, 1);
+
+    // A `unique` field left null is skipped by the null check, not freed.
+    dtorCount = 0;
+    {
+        UniqueBox b;
+    }
+    passed += Test("unique_null_field_not_freed", dtorCount, 0);
+
+    // Stage 2 - the user dtor's `item = nullptr` frees it, leaving the synthesized delete
+    // a no-op: composition without a double free.
+    dtorCount = 0;
+    {
+        UniqueFreesItself u;
+        u.item = new Resource();
+    }
+    passed += Test("unique_composes_with_user_dtor", dtorCount, 1);
+
+    // Outer deletes inner; inner's synthesized dtor deletes its own `unique` field.
+    dtorCount = 0;
+    {
+        UniqueOuter o;
+        o.inner = new UniqueBox();
+        o.inner->item = new Resource();
+    }
+    passed += Test("unique_transitive_chain_freed", dtorCount, 1);
+
+    // Heap-owned struct: `delete` routes through the synthesized full destructor.
+    dtorCount = 0;
+    {
+        UniqueBox* hb = new UniqueBox();
+        hb->item = new Resource();
+        delete hb;
+        passed += Test("unique_field_freed_on_delete", dtorCount, 1);
+    }
+    passed += Test("unique_no_double_free_after_delete", dtorCount, 1);
+
+    // Brace-init is a second field-store path (EmitOneFieldInit): storing an owning local into a
+    // `unique` field must transfer ownership exactly as `=` does, or BOTH the local's scope-exit
+    // cleanup and the field's synthesized destructor free the one pointee (a double free).
+    dtorCount = 0;
+    {
+        Resource* r = new Resource();
+        UniqueBox b = { item = r };
+        passed += Test("unique_brace_init_alive_before_teardown", dtorCount, 0);
+    }
+    passed += Test("unique_brace_init_owning_local_freed_once", dtorCount, 1);
+
+    // Stage 2 - reassignment destructs first: overwriting a live `unique` field frees the
+    // old pointee rather than orphaning it. 3 stores => 2 freed on reassign, 1 at teardown.
+    dtorCount = 0;
+    {
+        UniqueBox b;
+        b.item = new Resource();
+        b.item = new Resource();
+        b.item = new Resource();
+        passed += Test("unique_reassign_frees_old", dtorCount, 2);
+    }
+    passed += Test("unique_reassign_last_freed_at_teardown", dtorCount, 3);
+
+    // Stage 2 - assigning nullptr releases the pointee early (the sanctioned idiom, and the
+    // reason a hand-written `delete` on a unique field is both unnecessary and rejected).
+    dtorCount = 0;
+    {
+        UniqueBox b;
+        b.item = new Resource();
+        b.item = nullptr;
+        passed += Test("unique_nullptr_releases_early", dtorCount, 1);
+    }
+    passed += Test("unique_nullptr_release_no_double_free", dtorCount, 1);
+
+    // Stage 2 - self-assign must not free-then-store a dangling pointer.
+    dtorCount = 0;
+    {
+        UniqueBox b;
+        b.item = new Resource();
+        b.item = b.item;
+        passed += Test("unique_self_assign_does_not_free", dtorCount, 0);
+    }
+    passed += Test("unique_self_assign_freed_once_at_teardown", dtorCount, 1);
+
+    // Stage 2 - same, spelled bare inside a method (no FieldName to match on).
+    dtorCount = 0;
+    {
+        UniqueBox b;
+        b.item = new Resource();
+        b.selfAssignBare();
+        passed += Test("unique_bare_self_assign_does_not_free", dtorCount, 0);
+    }
+    passed += Test("unique_bare_self_assign_freed_once_at_teardown", dtorCount, 1);
+
+    // Stage 2 - `move` transfers ownership into a unique field (the accepted spelling of
+    // the borrow that err_unique_borrow_into_field rejects). Freed once, by the field.
+    dtorCount = 0;
+    {
+        UniqueBox b;
+        Resource* fresh = new Resource();
+        b.item = move fresh;
+        passed += Test("unique_move_into_field_not_freed_early", dtorCount, 0);
+    }
+    passed += Test("unique_move_into_field_freed_once", dtorCount, 1);
+
+    // Stage 3 (Trap B) - `move` OUT of a unique field is the sanctioned extraction: it nulls
+    // the field, so the local owns the pointee and the synthesized dtor finds nothing to free.
+    // This is the counterpart to err_unique_delete_alias, where a plain copy is rejected.
+    dtorCount = 0;
+    {
+        UniqueBox b;
+        b.item = new Resource();
+        b.item->id = 7;
+        Resource* owned = move b.item;
+        passed += Test("unique_move_out_field_id_intact", owned->id, 7);
+        passed += Test("unique_move_out_field_not_freed_yet", dtorCount, 0);
+        delete owned;
+        passed += Test("unique_move_out_field_freed_by_local", dtorCount, 1);
+        // Scope exit: the field was nulled by the move, so the synthesized delete is a no-op.
+    }
+    passed += Test("unique_move_out_field_no_double_free", dtorCount, 1);
+
+    // Stage 3 (Trap B) - a local aliasing a `unique` field is a borrow, not an owner: reading
+    // and writing THROUGH it stays legal, and it is the field that frees, exactly once. Only
+    // `delete alias` is rejected.
+    dtorCount = 0;
+    {
+        UniqueBox b;
+        b.item = new Resource();
+        Resource* alias = b.item;
+        alias->id = 42;
+        passed += Test("unique_alias_read_through", b.item->id, 42);
+        passed += Test("unique_alias_borrow_does_not_free", dtorCount, 0);
+    }
+    passed += Test("unique_alias_freed_once_by_field", dtorCount, 1);
+
+    // Stage 3 (Trap B) - the borrow marking must not leak into an ordinary pointer field:
+    // `Container.item` is not `unique`, so laundering it through a local and deleting the
+    // local stays legal (the ~254 unmarked pointer fields keep today's semantics exactly).
+    dtorCount = 0;
+    {
+        Container c;
+        c.item = new Resource();
+        Resource* a = c.item;
+        delete a;
+        c.item = nullptr;   // ~Container would otherwise free the same pointer
+        passed += Test("plain_field_alias_delete_still_legal", dtorCount, 1);
+    }
+    passed += Test("plain_field_alias_delete_freed_once", dtorCount, 1);
+
+    // Brace-init is a second, independent field-store path (EmitOneFieldInit). A fresh
+    // allocation through it is owned by the field and freed exactly once at teardown - the
+    // borrow spelling is rejected (err_unique_brace_init_borrow).
+    dtorCount = 0;
+    {
+        UniqueBox b = { item = new Resource() };
+        b.item->id = 5;
+        passed += Test("unique_brace_init_fresh_id", b.item->id, 5);
+        passed += Test("unique_brace_init_fresh_not_freed_early", dtorCount, 0);
+    }
+    passed += Test("unique_brace_init_fresh_freed_once", dtorCount, 1);
+
+    // Brace-init with an explicit `move`: ownership transfers to the field, which frees once.
+    dtorCount = 0;
+    {
+        Resource* fresh = new Resource();
+        UniqueBox b = { item = move fresh };
+        passed += Test("unique_brace_init_move_not_freed_early", dtorCount, 0);
+    }
+    passed += Test("unique_brace_init_move_freed_once", dtorCount, 1);
+
+    // The brace-init guards are keyed on `unique`, so an ORDINARY pointer field brace-initialized
+    // from a borrow is untouched - it stores the borrow and frees nothing, exactly as before.
+    dtorCount = 0;
+    {
+        Resource* owned = new Resource();
+        owned->id = 11;
+        {
+            Container c = { item = owned };
+            passed += Test("plain_brace_init_borrow_reads_through", c.item->id, 11);
+            c.item = nullptr;   // ~Container would otherwise free the borrow
+        }
+        passed += Test("plain_brace_init_borrow_not_freed_by_field", dtorCount, 0);
+        delete owned;
+        passed += Test("plain_brace_init_borrow_freed_by_owner", dtorCount, 1);
+    }
+
+    // `move` between two `unique` fields is the sanctioned transfer: it nulls the source, so
+    // only the destination frees. The plain copy `c.item = a.item` is rejected
+    // (err_unique_field_to_field) precisely because it would leave both fields owning.
+    dtorCount = 0;
+    {
+        UniqueBox a;
+        UniqueBox c;
+        a.item = new Resource();
+        a.item->id = 13;
+        c.item = move a.item;
+        passed += Test("unique_field_to_field_move_id_intact", c.item->id, 13);
+        passed += Test("unique_field_to_field_move_source_nulled", a.item == nullptr ? 1 : 0, 1);
+        passed += Test("unique_field_to_field_move_not_freed_early", dtorCount, 0);
+    }
+    passed += Test("unique_field_to_field_move_freed_once", dtorCount, 1);
+
+    // A `unique` field reached through an interface's byte-offset slot gets the same store-site
+    // guards as a direct field read: the flag rides the interface's field declaration, which the
+    // access site binds from. Reassigning through the slot frees the old pointee.
+    dtorCount = 0;
+    {
+        UniqueIfaceBox b;
+        b.item = new Resource();
+        storeViaIface(b);
+        passed += Test("unique_iface_slot_reassign_frees_old", dtorCount, 1);
+        passed += Test("unique_iface_slot_reassign_writes_same_slot", b.item->id, 21);
+    }
+    passed += Test("unique_iface_slot_reassign_freed_at_teardown", dtorCount, 2);
+
+    // Releasing early through the interface slot frees once, and leaves the synthesized
+    // destructor looking at nullptr rather than double-freeing.
+    dtorCount = 0;
+    {
+        UniqueIfaceBox b;
+        b.item = new Resource();
+        releaseViaIface(b);
+        passed += Test("unique_iface_slot_nullptr_releases_early", dtorCount, 1);
+    }
+    passed += Test("unique_iface_slot_release_no_double_free", dtorCount, 1);
 
     return passed;
 }
@@ -722,6 +1027,9 @@ extern int main()
 
     passed += testFieldOwnership();
     total += 7;
+
+    passed += testUniqueField();
+    total += 44;
 
     passed += testParamStringToField();
     total += 1;

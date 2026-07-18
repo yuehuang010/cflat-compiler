@@ -733,7 +733,8 @@ private:
             auto storageSpec = declSpec->storageClassSpecifier();
                 if (typeSpec != nullptr)
                 {
-                    // 'move' and 'bond' are soft keywords parsed as Identifiers in typeSpecifier context
+                    // 'move', 'alias', 'bond' and 'unique' are soft keywords parsed as Identifiers
+                    // in typeSpecifier context
                     if (typeSpec->getText() == "move")
                     {
                         declType.IsMove = true;
@@ -747,6 +748,13 @@ private:
                     if (typeSpec->getText() == "bond")
                     {
                         declType.IsBond = true;
+                        continue;  // not a type; look for the actual type in next specifier
+                    }
+                    // Position validity is checked in the MainListener copy, which is the pass
+                    // whose diagnostics expect_error observes.
+                    if (typeSpec->getText() == "unique")
+                    {
+                        declType.IsUnique = true;
                         continue;  // not a type; look for the actual type in next specifier
                     }
                     // tuple type sugar: (T1, T2) -> tuple<T1, T2>
@@ -2073,6 +2081,32 @@ private:
     // unqualified nested type names (e.g. "Inner") resolve to "Outer.Inner".
     std::vector<std::string> structScopeStack;
 
+    // Set only while ParseDeclarationList parses a field's declarationSpecifiers. The
+    // 'unique' soft keyword is field-only; every other position must reject it.
+    bool inStructFieldDecl_ = false;
+    // Saves and restores rather than clearing: if a specifier parse ever nests (a generic
+    // instantiation parsing its own fields), clearing would spuriously reject the outer field.
+    struct StructFieldDeclGuard
+    {
+        bool& flag;
+        bool  prev;
+        explicit StructFieldDeclGuard(bool& f) : flag(f), prev(f) { flag = true; }
+        ~StructFieldDeclGuard() { flag = prev; }
+    };
+
+    // Set while ParseStructDefinition parses the members of a UNION body. `unique` is rejected
+    // there (ValidateUniqueField): a synthesized destructor cannot know which member is active.
+    bool inUnionFieldDecl_ = false;
+    // Carries this body's own kind and restores on exit, so a struct nested in a union - or a
+    // generic instantiation parsed mid-body - is judged by its own definition, not the enclosing one.
+    struct UnionFieldDeclGuard
+    {
+        bool& flag;
+        bool  prev;
+        UnionFieldDeclGuard(bool& f, bool isUnion) : flag(f), prev(f) { flag = isUnion; }
+        ~UnionFieldDeclGuard() { flag = prev; }
+    };
+
     std::unordered_map<std::string, CFlatParser::InterfaceDefinitionContext*>&  genericInterfaceTemplates;
     std::unordered_map<std::string, std::vector<std::string>>&                  genericInterfaceTypeParams;
     std::unordered_set<std::string>&                                            instantiatedInterfaces;
@@ -2341,7 +2375,8 @@ private:
                 // Pointer depth from a pointer alias (using Handle = void*); peeled off the
                 // resolved alias string below and combined with the declarator's stars.
                 int aliasPtrDepth = 0;
-                // 'move' and 'bond' are soft keywords parsed as Identifiers in typeSpecifier context
+                // 'move', 'alias', 'bond' and 'unique' are soft keywords parsed as Identifiers
+                // in typeSpecifier context
                 if (typeSpec->getText() == "move")
                 {
                     declType.IsMove = true;
@@ -2355,6 +2390,15 @@ private:
                 if (typeSpec->getText() == "bond")
                 {
                     declType.IsBond = true;
+                    continue;  // not a type; look for the actual type in next specifier
+                }
+                if (typeSpec->getText() == "unique")
+                {
+                    // Field-only: ParseDeclarationList arms inStructFieldDecl_ around its
+                    // specifier parse, so every other declaration position lands here.
+                    if (!inStructFieldDecl_)
+                        LogErrorContext(typeSpec, "'unique' is only allowed on a struct field; it is not valid on a local variable, parameter, or return type");
+                    declType.IsUnique = true;
                     continue;  // not a type; look for the actual type in next specifier
                 }
                 // tuple type sugar: (T1, T2) -> tuple<T1, T2>
@@ -2892,15 +2936,30 @@ public:
         Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods, ParseInterfaceFields(ctx));
     }
 
-    // Field declarations in an interface body (`string title;`). The field name/type must be
-    // matched by every implementor; the vtable carries its per-implementor byte offset.
+    /*
+     * Field declarations in an interface body (`string title;`). The field name/type must be
+     * matched by every implementor; the vtable carries its per-implementor byte offset.
+     * An interface field is a field position, so `unique` is spellable here and joins the
+     * contract every implementor must match (VerifyInterfaceFields). It has to live in the
+     * contract: through dynamic dispatch the concrete type is unknown, so the access site can
+     * only learn that the slot is owning from the interface itself.
+     */
     std::vector<LLVMBackend::TypeAndValue> ParseInterfaceFields(CFlatParser::InterfaceDefinitionContext* ctx)
     {
+        StructFieldDeclGuard fieldCtx(inStructFieldDecl_);
+        // An interface body is never a union body - disarmed explicitly because a generic
+        // interface can be instantiated from inside one (a union member typed `IFoo<int>`).
+        UnionFieldDeclGuard notUnion(inUnionFieldDecl_, false);
+
         std::vector<LLVMBackend::TypeAndValue> fields;
         for (auto* f : ctx->interfaceField())
         {
-            LLVMBackend::TypeAndValue tv = ParseDeclarationSpecifiers(f->declarationSpecifiers());
+            LLVMBackend::DeclTypeAndValue tv = ParseDeclarationSpecifiers(f->declarationSpecifiers());
             tv.VariableName = f->directDeclarator()->getText();
+            if (tv.IsUnique)
+                ValidateUniqueField(tv, f);
+            else
+                ValidateAllocAlignField(tv, f);
             fields.push_back(std::move(tv));
         }
         return fields;
@@ -5996,7 +6055,11 @@ public:
             for (auto decl : ctx)
             {
                 auto direct = decl->declarationSpecifiers();
-                auto typeAndValue = ParseDeclarationSpecifiers(direct);
+                LLVMBackend::DeclTypeAndValue typeAndValue;
+                {
+                    StructFieldDeclGuard fieldCtx(inStructFieldDecl_);
+                    typeAndValue = ParseDeclarationSpecifiers(direct);
+                }
 
                 auto annotations = ParseAnnotationList(decl->annotationList());
 
@@ -6068,12 +6131,64 @@ public:
                         }
                     }
 
+                    if (typeAndValue.IsUnique)
+                        ValidateUniqueField(typeAndValue, declarator);
+                    else
+                        ValidateAllocAlignField(typeAndValue, declarator);
+
                     result.push_back(typeAndValue);  // Copy
                 }
             }
         }
 
         return result;
+    }
+
+    // Stage 1 of `unique`: the synthesized destructor deletes exactly one raw pointer per
+    // field, so anything it cannot express that way is rejected rather than silently leaked.
+    void ValidateUniqueField(const LLVMBackend::DeclTypeAndValue& f, antlr4::ParserRuleContext* ctx)
+    {
+        std::string owner = structScopeStack.empty() ? "" : structScopeStack.back() + ".";
+        std::string field = "field '" + owner + f.VariableName + "'";
+        // Checked ahead of the field-shape rejections below: no union member can ever be 'unique',
+        // so a shape complaint would only steer the user to fix the shape and land back here.
+        if (inUnionFieldDecl_)
+            LogErrorContext(ctx, "'unique' on " + field + ": a union member cannot be 'unique' - the synthesized destructor cannot know which member is active, so it would free whichever bits the union currently holds. Drop 'unique' and free the pointer from code that knows the active member.");
+        // Gated on the element shape the single-pointer rule accepts, so a non-pointer array
+        // falls through to the pointer rejection below instead of a message about pointers.
+        if (f.ConstArraySize > 0 && f.Pointer && !f.ElemPointer)
+            LogErrorContext(ctx, "'unique' on " + field + ": fixed arrays are not supported yet - the synthesized destructor deletes a single pointer and would leak the rest");
+        if (f.IsArrayView)
+            LogErrorContext(ctx, "'unique' on " + field + ": array views are not supported - a view does not own its buffer");
+        if (f.IsSimd)
+            LogErrorContext(ctx, "'unique' on " + field + ": simd is not a pointer type");
+        if (f.IsBitfield)
+            LogErrorContext(ctx, "'unique' on " + field + ": a bitfield is not a pointer type");
+        if (!f.Pointer || f.ElemPointer)
+            LogErrorContext(ctx, "'unique' on " + field + " requires a single-indirection pointer type such as 'unique Node* n'");
+    }
+
+    // A field's `alignas(0, N)` allocation-alignment clause routes `delete field` to the aligned
+    // deallocator (__delete_aligned), recovering N from the clause. That is only sound when the
+    // compiler owns the block: a `unique` field is compiler-allocated and freed and its store site
+    // validates the source, and an array view frees a `new T[n] alignas(0, N)` buffer via `delete[_]`.
+    // On a hand-managed raw pointer the stored block may come from plain `operator new`, and the
+    // aligned free then reads a header that was never written - heap corruption. Require `unique`.
+    void ValidateAllocAlignField(const LLVMBackend::DeclTypeAndValue& f, antlr4::ParserRuleContext* ctx)
+    {
+        // Only N > kDefaultNewAlign actually selects the aligned deallocator. A `unique` or array-view
+        // field owns its allocation; a non-pointer / double-pointer field routes no scalar delete.
+        if (f.AllocAlignValue <= LLVMBackend::kDefaultNewAlign) return;
+        if (f.IsUnique || f.IsArrayView) return;
+        if (!f.Pointer || f.ElemPointer) return;
+        std::string owner = structScopeStack.empty() ? "" : structScopeStack.back() + ".";
+        LogErrorContext(ctx, std::format(
+            "alignas(0, {}) on pointer field '{}{}' selects aligned deallocation but the field is not "
+            "'unique'; the compiler cannot guarantee the block was allocated aligned, so a 'delete' of "
+            "this field would free a plain 'new' block through the aligned deallocator and corrupt the "
+            "heap. Mark the field 'unique' so the compiler owns the allocation, or remove the "
+            "alloc-alignment clause.",
+            f.AllocAlignValue, owner, f.VariableName));
     }
 
     std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseForDeclaration(CFlatParser::ForDeclarationContext* ctx)
@@ -6335,6 +6450,7 @@ public:
                 bool srcIsUnsigned = false;
                 bool srcIsBorrowed = false;
                 std::string srcBorrowedOrigin;
+                std::string srcBorrowedUniqueField; // "Struct.field" when the borrow came from a `unique` field
                 bool srcIsOwningMove = false;       // RHS is an owning pointer (move param or alias thereof via cast)
                 std::string srcOwningName;          // name of the original owning source, for nulling on transfer
                 // Concrete type inferred from the initializer, used to resolve an 'auto'
@@ -6634,6 +6750,28 @@ public:
                                 srcBorrowedOrigin = rightNV.BorrowedOrigin.empty()
                                     ? rightNV.CallerName
                                     : rightNV.BorrowedOrigin;
+                                srcBorrowedUniqueField = rightNV.BorrowedUniqueField;
+                                // Trap B: a plain copy of a `unique` field does not null the field, so the
+                                // field's synthesized destructor still frees the pointee. Treat the local as
+                                // a borrow of the field, which routes a later `delete` into the existing
+                                // "cannot delete" check while leaving reads alone. `move b.p` extracts
+                                // ownership instead: it returns a fresh NamedVariable with no Storage (and
+                                // sets lastOwningResult), so it is not a field read and never lands here.
+                                // A cast severs Storage and clears IsUnique on the type, so accept the
+                                // carried IsUniqueFieldAlias as an alternative to the direct field read -
+                                // `(T*)b.p` must stay a borrow. OwningStructName/FieldName/CallerName
+                                // survive the cast, so the diagnostics name the same owner as the un-cast form.
+                                if (!srcIsBorrowed
+                                    && !rightNV.TypeAndValue.IsMove
+                                    && ((rightNV.TypeAndValue.IsUnique
+                                            && rightNV.TypeAndValue.Pointer
+                                            && rightNV.Storage != nullptr)
+                                        || rightNV.IsUniqueFieldAlias))
+                                {
+                                    srcIsBorrowed = true;
+                                    srcBorrowedUniqueField = DescribeUniqueFieldOwner(rightNV);
+                                    srcBorrowedOrigin = DescribeUniqueFieldAccess(rightNV);
+                                }
                                 // Trigger transfer only when the RHS is an owning pointer whose
                                 // source link was severed (Storage cleared) - typically by a cast.
                                 // Direct refs ('T* q = p') keep Storage set and follow today's
@@ -6853,6 +6991,13 @@ public:
                 // warning - there is nothing to construct here.
                 bool externDeclOnly = global_scope && typeAndValue.external && right == nullptr;
 
+                // `T arr[N];` with no initializer: every element gets the same default construction
+                // the scalar branch below performs. Emitted after the alloca exists, since the
+                // default is written through the array's slots rather than into `right`.
+                bool needsArrayDefaultInit = right == nullptr && !typeAndValue.Pointer
+                    && typeAndValue.ConstArraySize > 0 && !externDeclOnly && !global_scope
+                    && compiler->GetDataStructure(typeAndValue.TypeName).StructType != nullptr;
+
                 if (right == nullptr && !typeAndValue.Pointer && typeAndValue.ConstArraySize == 0 && !externDeclOnly)
                 {
                     auto structData = compiler->GetDataStructure(typeAndValue.TypeName);
@@ -6948,6 +7093,9 @@ public:
                             "redeclaration of '{}' in the same scope; use a different name or assign to the existing variable", name));
                     auto alloc = compiler->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize, line, typeAndValue.UserAlignValue);
                     allocList.push_back(std::pair(name, alloc));
+
+                    if (needsArrayDefaultInit)
+                        EmitFixedArrayDefaultInit(alloc, typeAndValue);
 
                     // Record an unused-local candidate. RAII locals (a type with a
                     // destructor, e.g. `lock`) are exempt: the declaration itself is the
@@ -7215,6 +7363,7 @@ public:
                             {
                                 nv.IsBorrowed = true;
                                 nv.BorrowedOrigin = srcBorrowedOrigin;
+                                nv.BorrowedUniqueField = srcBorrowedUniqueField;
                             }
                         }
 
@@ -7249,6 +7398,428 @@ public:
         }
 
         return allocList;
+    }
+
+    /*
+     * Name the `unique` field a NamedVariable reads, as "Struct.field", for diagnostics.
+     * A bare self-field access inside the owning struct's own method comes from
+     * GetMemberVariable, which deliberately leaves OwningStructName/FieldName empty so the
+     * delete-encapsulation rule does not fire on self-access; recover the field from the
+     * variable name and the struct from the enclosing function. That recovers the struct for a
+     * destructor ("~Type") only - a method's frame carries the bare method name - so fall back
+     * to the unqualified field name, as the sibling `unique` diagnostics already do.
+     */
+    std::string DescribeUniqueFieldOwner(const LLVMBackend::NamedVariable& nv)
+    {
+        std::string field = nv.FieldName.empty() ? nv.TypeAndValue.VariableName : nv.FieldName;
+        std::string owner = nv.OwningStructName;
+        if (owner.empty() && compilerLLVM)
+            owner = SplitEnclosingStruct(compilerLLVM->GetCurrentFunctionName(), compilerLLVM);
+        if (field.empty()) return owner;
+        return owner.empty() ? field : owner + "." + field;
+    }
+
+    // Spell the source expression a `unique` field was read through, as the user wrote it
+    // ("b.p", or bare "p" for a self-field access), so a diagnostic can suggest `move <that>`.
+    std::string DescribeUniqueFieldAccess(const LLVMBackend::NamedVariable& nv)
+    {
+        std::string field = nv.FieldName.empty() ? nv.TypeAndValue.VariableName : nv.FieldName;
+        if (field.empty()) return nv.CallerName;
+        if (nv.FieldName.empty() || nv.CallerName.empty()) return field;
+        return nv.CallerName + "." + field;
+    }
+
+    /*
+     * True when this NamedVariable reads a `unique` field's slot directly (`a.p`, or a bare
+     * self-field access inside the owning struct's own method). `move a.p` returns a fresh
+     * NamedVariable with no Storage, so it is not a field read and never matches - which is
+     * what keeps the sanctioned transfer legal. IsInterfaceField mirrors the sibling
+     * srcIsStructField test and DOES fire: `unique` is part of the interface field contract,
+     * so a read through the interface's byte-offset slot carries the flag too.
+     */
+    bool IsUniqueFieldRead(const LLVMBackend::NamedVariable& nv)
+    {
+        // A cast severs Storage (the GEP-shape test below can't match) and clears IsUnique on the
+        // type, so the carried alias flag is the only surviving provenance. `move b.p` yields a
+        // fresh NamedVariable with the flag unset, so it stays legal.
+        if (nv.IsUniqueFieldAlias && !nv.TypeAndValue.IsMove) return true;
+        if (!nv.TypeAndValue.IsUnique || !nv.TypeAndValue.Pointer || nv.TypeAndValue.IsMove)
+            return false;
+        if (nv.IsInterfaceField) return true;
+        auto* gep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(nv.Storage);
+        return gep != nullptr && gep->getNumIndices() == 2
+            && gep->getSourceElementType()->isStructTy();
+    }
+
+    /*
+     * Trap A: storing a BORROW into a `unique` field. The field declares that it owns the pointee
+     * and its synthesized destructor deletes it, but the borrow's real owner frees it as well.
+     * Shared by the two independent field-store paths - the `=` assignment in
+     * ParseAssignmentExpression and brace-init / `<Tag attr=...>` sugar via EmitOneFieldInit - so
+     * both spell the rejection identically. `fieldDesc` names the destination field.
+     */
+    void RejectBorrowIntoUniqueField(const LLVMBackend::NamedVariable& rightNV,
+                                     const std::string& fieldDesc,
+                                     antlr4::ParserRuleContext* ctx)
+    {
+        std::string src = rightNV.CallerName.empty() ? rightNV.BorrowedOrigin : rightNV.CallerName;
+        std::string origin = rightNV.BorrowedOrigin.empty() ? src : rightNV.BorrowedOrigin;
+        // The borrow aliases another `unique` field, so the source field's synthesized
+        // destructor owns the pointee - storing it here would make two owners of one pointer.
+        if (!rightNV.BorrowedUniqueField.empty())
+            LogErrorContext(ctx, std::format(
+                "cannot store '{}' into {} - it aliases '{}', a unique field whose synthesized "
+                "destructor already frees it, and two 'unique' fields cannot own one pointer. "
+                "Use 'move {}' to transfer ownership out of the source field (which nulls it).",
+                src, fieldDesc, origin, origin));
+        else if (rightNV.FieldName.empty())
+            LogErrorContext(ctx, std::format(
+                "cannot store borrowed parameter '{}' into {} - the caller still owns it and will "
+                "free it on scope exit, leaving the field dangling. Declare the parameter 'move {}' "
+                "to transfer ownership, or drop 'unique' from the field if it only borrows.",
+                src, fieldDesc, origin));
+        else
+            LogErrorContext(ctx, std::format(
+                "cannot store '{}.{}' into {} - it is reached through borrowed parameter '{}', whose "
+                "owner still frees it, and two 'unique' fields cannot own one pointer. Use 'move' to "
+                "transfer ownership, or drop 'unique' from the field if it only borrows.",
+                src, rightNV.FieldName, fieldDesc, origin));
+    }
+
+    /*
+     * A direct `unique`-field-to-`unique`-field copy (`c.p = a.p`): both synthesized destructors
+     * free the one pointee. The Trap A reject above cannot see this - a field read off a plain
+     * local is not a borrow - and the owning-value field-to-field rule cannot either, since a raw
+     * pointer is not an owning value type. Shared by the `=` and brace-init store paths.
+     */
+    void RejectUniqueFieldToUniqueField(const LLVMBackend::NamedVariable& rightNV,
+                                        const std::string& fieldDesc,
+                                        antlr4::ParserRuleContext* ctx)
+    {
+        std::string access = DescribeUniqueFieldAccess(rightNV);
+        LogErrorContext(ctx, std::format(
+            "cannot store unique field '{}' into {} - the source field's synthesized destructor "
+            "already frees it, and two 'unique' fields cannot own one pointer. Use 'move {}' to "
+            "transfer ownership out of the source field (which nulls it).",
+            access, fieldDesc, access));
+    }
+
+    /*
+     * Reject an allocation-alignment disagreement storing into a struct field. The alignment of an
+     * over-aligned `new T[n] alignas(0, N)` is a property of the ALLOCATION, not of the type, so a
+     * free through the field can only recover it when the FIELD declares the same clause; a missing
+     * or mismatched one frees the block wrong and corrupts the heap. (Alignment carried by the TYPE
+     * is not tagged here and escapes freely, as in C++.) Shared by the two field-store paths - `=`
+     * in ParseAssignmentExpression and brace-init / `<Tag attr=...>` sugar via EmitOneFieldInit - so
+     * neither spelling can reach a mismatched free site. `fieldTV` is the destination field's
+     * declared type and `fieldAlign` its clause; `right` is the value being stored. Returns true
+     * when an error was logged.
+     */
+    bool RejectFieldAllocAlignMismatch(
+        const LLVMBackend::TypeAndValue& fieldTV,
+        uint64_t fieldAlign,
+        const LLVMBackend::NamedVariable& rightNV,
+        llvm::Value* right,
+        const std::string& fieldDesc,
+        antlr4::ParserRuleContext* ctx)
+    {
+        bool rhsOverAligned = rightNV.AllocAlignment > LLVMBackend::kDefaultNewAlign;
+        bool fieldHasClause = fieldAlign > LLVMBackend::kDefaultNewAlign;
+        // A freshly-allocated array-view (`new T[n]...`) stored into an aligned field must carry
+        // the field's clause; a null store (IsArrayView false) is exempt.
+        bool rhsFreshBuffer = rightNV.TypeAndValue.IsArrayView;
+        bool rhsNonNullPtr  = right != nullptr && !llvm::isa<llvm::ConstantPointerNull>(right);
+        // A scalar `T*` carries no array-view marker, so an INDIRECT store (`T* t = new T();
+        // f.p = t;`) slips past the test above and the free site then trusts the field's clause
+        // against a block `operator new` allocated. Demand agreement from any non-null pointer
+        // stored into a clause-bearing scalar `unique` field: that synthesized free site is the one
+        // the user never wrote and cannot audit. A field without `unique` frees nothing on its own,
+        // so a mismatch there cannot reach compiler-emitted code - any free is hand-written, and
+        // gating here keeps such code legal. Exempt: a pointee TYPE that is itself over-aligned
+        // routes BOTH `new` and `delete` to the aligned pair off the static type (as in C++), so the
+        // clause cannot disagree there and `new T alignas(...)` has no syntax. `fieldHasClause`
+        // leads so the type lookup is skipped on the (overwhelmingly common) clause-free field.
+        bool rhsIndirectPtr = fieldHasClause && rhsNonNullPtr
+            && fieldTV.IsUnique && fieldTV.Pointer && !fieldTV.IsArrayView
+            && !ElementTypeIsOverAligned(fieldTV);
+        if (!(rhsOverAligned || (fieldHasClause && (rhsFreshBuffer || rhsIndirectPtr)))
+            || fieldAlign == rightNV.AllocAlignment)
+            return false;
+
+        if (!fieldHasClause)
+            LogErrorContext(ctx, std::format(
+                "cannot store an over-aligned buffer ('new T[n] alignas(0, {})') into {}: that alignment "
+                "is a property of the allocation, not of the type, so a free through the field cannot "
+                "recover it. Declare the field 'alignas(0, {})' so the block alignment is recorded, or "
+                "over-align the ELEMENT TYPE instead ('struct alignas({}) Chunk {{ ... }};').",
+                rightNV.AllocAlignment, fieldDesc, rightNV.AllocAlignment, rightNV.AllocAlignment));
+        else if (!rhsOverAligned && rhsFreshBuffer)
+            LogErrorContext(ctx, std::format(
+                "alignment mismatch storing into {}: the field is declared 'alignas(0, {})' but the "
+                "value was allocated without a matching allocation-alignment clause (ordinary alignment). "
+                "Allocate it with 'new T[n] alignas(0, {})' so the free site recovers the correct alignment.",
+                fieldDesc, fieldAlign, fieldAlign));
+        else if (!rhsOverAligned)
+            // Scalar `new T` takes no alignment clause, so the source must inherit the
+            // field's - directly, or through an align-declared local.
+            LogErrorContext(ctx, std::format(
+                "alignment mismatch storing into {}: the field is declared 'alignas(0, {})' but the "
+                "value was allocated without a matching allocation-alignment clause (ordinary alignment). "
+                "Store the 'new' directly into the field, or declare the source 'alignas(0, {})' so its "
+                "'new' inherits the alignment, or over-align the pointee TYPE instead "
+                "('struct alignas({}) T {{ ... }};') and drop the field's clause.",
+                fieldDesc, fieldAlign, fieldAlign, fieldAlign));
+        else
+            LogErrorContext(ctx, std::format(
+                "alignment mismatch storing into {}: the field is declared 'alignas(0, {})' but the "
+                "value was allocated 'alignas(0, {})'. The two must agree so the free site recovers "
+                "the correct alignment.",
+                fieldDesc, fieldAlign, rightNV.AllocAlignment));
+        return true;
+    }
+
+    /*
+     * Ownership bookkeeping for storing an owning pointer into a slot. Two mechanisms, exactly as
+     * the `=` path has always applied them: a new-allocated local escaping to a NON-local slot
+     * (struct field, heap object) gets a lazy refcount so both sides validly hold the pointer and
+     * only the last one frees; anything else owning (a move param, or any owning pointer into a
+     * local slot) transfers by nulling the source so scope-exit cleanup skips it. Shared by the two
+     * field-store paths - `=` in ParseAssignmentExpression and brace-init / `<Tag attr=...>` sugar
+     * via EmitOneFieldInit - so a pointer stored through either spelling is freed exactly once.
+     * `destination` is the slot actually stored to; `destIsInterface` drives the moved-into-interface
+     * flag.
+     */
+    void TransferPointerOwnershipOnStore(
+        const LLVMBackend::NamedVariable& rightNV,
+        llvm::Value* destination,
+        bool destIsInterface,
+        antlr4::ParserRuleContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+
+        // Lazy refcount: if a new-allocated local is assigned to a non-local destination
+        // (struct field, heap object), create a refcount on first escape and increment it.
+        if (rightNV.IsNewAllocated && rightNV.TypeAndValue.Pointer
+            && !rightNV.CallerName.empty()
+            && destination != nullptr
+            && !llvm::isa<llvm::AllocaInst>(destination)
+            && !llvm::isa<llvm::GlobalVariable>(destination))
+        {
+            // Fetch the live RefCountStorage (rightNV is a copy; look up the actual NV).
+            llvm::Value* refAlloca = rightNV.RefCountStorage;
+            if (refAlloca == nullptr)
+            {
+                // First escape: emit the refcount alloca at function entry (initialized to 1).
+                auto savedIP = compiler->builder->saveIP();
+                auto* fn = compiler->builder->GetInsertBlock()->getParent();
+                auto* entryBB = &fn->getEntryBlock();
+                compiler->builder->SetInsertPoint(entryBB, entryBB->begin());
+                refAlloca = compiler->builder->CreateAlloca(compiler->builder->getInt32Ty(), nullptr, "refcount");
+                compiler->builder->CreateStore(compiler->builder->getInt32(1), refAlloca);
+                compiler->builder->restoreIP(savedIP);
+                compiler->SetVariableRefCountStorage(rightNV.CallerName, refAlloca);
+            }
+            // Increment for this escape.
+            auto* cur = compiler->builder->CreateLoad(compiler->builder->getInt32Ty(), refAlloca);
+            compiler->builder->CreateStore(
+                compiler->builder->CreateAdd(cur, compiler->builder->getInt32(1), "refinc"),
+                refAlloca);
+        }
+
+        // Transfer ownership: null the source alloca so EmitDestructorsForScope
+        // won't free the pointer we just stored elsewhere.
+        // Move params (IsOwning && !IsNewAllocated): null for any destination type.
+        // New-allocated locals (IsOwning && IsNewAllocated): null only for local destinations;
+        //   struct-field escapes use refcount above so both sides validly hold the pointer.
+        // When the RHS came through a cast that cleared rightNV.Storage, fall back to
+        // looking up the original variable by CallerName so the source is still nulled.
+        // Array-view RHS is excluded: `int[]` is a non-owning alias, so `view = view`
+        // must rebind the pointer only. Nulling/moving the source orphans the buffer
+        // because the destination view never frees it (the owner is the `new T[n]`
+        // variable, deleted explicitly). Mirrors the struct-move guard above.
+        if (rightNV.IsOwning
+            && rightNV.TypeAndValue.Pointer
+            && !rightNV.TypeAndValue.IsArrayView
+            && (!rightNV.IsNewAllocated
+                || destination == nullptr
+                || llvm::isa<llvm::AllocaInst>(destination)
+                || llvm::isa<llvm::GlobalVariable>(destination)))
+        {
+            llvm::Value* srcStorage = rightNV.Storage;
+            llvm::Type*  srcBaseTy  = rightNV.BaseType;
+            if (srcStorage == nullptr && !rightNV.CallerName.empty())
+            {
+                auto ref = compiler->FindVariableStorage(rightNV.CallerName);
+                srcStorage = ref.Storage;
+                srcBaseTy  = ref.BaseType;
+            }
+            if (srcStorage != nullptr)
+            {
+                if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(srcBaseTy))
+                {
+                    compiler->builder->CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy), srcStorage);
+                    // Moving a field (`x = node->left`) marks only that field, not the base.
+                    if (!rightNV.FieldName.empty())
+                        compiler->MarkVariableFieldMoved(rightNV.CallerName, rightNV.FieldName);
+                    else
+                    {
+                        compiler->MarkVariableMoved(rightNV.CallerName);
+                        // Boxing into an interface ('live = sc') transfers ownership to a handle
+                        // that is not auto-destructed; flag the source so a later 'delete sc' is
+                        // rejected (it would be a no-op and leak).
+                        if (destIsInterface)
+                            compiler->MarkVariableMovedIntoInterface(rightNV.CallerName);
+                    }
+                }
+            }
+        }
+    }
+
+    /*
+     * Closure store (Option A): closures are clone-safe, so a NAMED source is auto-cloned rather
+     * than aliased - both sides then own an independent env and each frees exactly once. A `move`
+     * source and any temp / call result (null Storage) already transferred ownership and are
+     * returned untouched. Shared by the two field-store paths - `=` in ParseAssignmentExpression
+     * and brace-init / `<Tag attr=...>` sugar via EmitOneFieldInit - so neither spelling can leave
+     * two owners of one env. Returns the value to store (the clone, or `right` unchanged).
+     */
+    llvm::Value* CloneClosureFromNamedSource(
+        const LLVMBackend::NamedVariable& rightNV,
+        llvm::Value* right,
+        antlr4::ParserRuleContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        bool namedSource = rightNV.Storage != nullptr
+            && !rightNV.TypeAndValue.IsMove
+            && rightNV.TypeAndValue.TypeName == "__closure_fat_ptr";
+        if (!namedSource)
+            return right;
+        // Fresh arg NV (Storage + closure type only) so the user-side CallerName /
+        // named-argument metadata on rightNV does not confuse copy() overload resolution.
+        LLVMBackend::NamedVariable cloneArg;
+        cloneArg.Storage  = rightNV.Storage;
+        cloneArg.BaseType = compiler->GetClosureFatPtrType();
+        cloneArg.TypeAndValue.TypeName = "__closure_fat_ptr";
+        if (auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { cloneArg }))
+            return cloned;
+        return right;
+    }
+
+    /*
+     * Storing a whole `alias` (borrow) value into a struct field: the field's always-run destructor
+     * would free a buffer the real owner still holds (double-free). Reported with the precise
+     * message ahead of the generic owning-value reject, which would wrongly suggest 'move' - you
+     * cannot move out of a borrow. Use '.copy()'. Excludes `string`/`__closure_fat_ptr` - they carry
+     * a runtime owned bit (the string-redesign borrow path); the `alias` machinery is only for
+     * owning STRUCTS with no runtime bit. A borrow can only dangle when the field could destruct it:
+     * a pointer (the pointee is freed) or an owning value type (its destructor frees buffers the
+     * real owner holds). A POD struct copy owns nothing, cannot dangle, and has no '.copy()' to
+     * suggest - and it reaches here routinely, since a by-reference lambda capture marks every
+     * non-deep-copyable struct IsAliasBorrow. Mirrors the gate on the sibling `alias`-return reject.
+     * Shared by the two field-store paths - `=` in ParseAssignmentExpression and brace-init /
+     * `<Tag attr=...>` sugar via EmitOneFieldInit. The caller gates that the destination IS a field.
+     * Returns true when an error was logged.
+     */
+    bool RejectAliasStoreIntoField(
+        const LLVMBackend::NamedVariable& rightNV,
+        llvm::Value* right,
+        antlr4::ParserRuleContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        if (!(right
+            && (rightNV.TypeAndValue.IsAlias || rightNV.IsAliasBorrow)
+            && rightNV.TypeAndValue.TypeName != "string"
+            && rightNV.TypeAndValue.TypeName != "__closure_fat_ptr"
+            && (rightNV.TypeAndValue.Pointer
+                || compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))))
+            return false;
+
+        LogErrorContext(ctx, std::format(
+            "cannot store an 'alias' value '{}' into a field; it borrows storage it does not own "
+            "and would dangle. Use '.copy()' for an independent owned copy.",
+            rightNV.CallerName.empty() ? rightNV.TypeAndValue.TypeName : rightNV.CallerName));
+        return true;
+    }
+
+    /*
+     * Copying a NAMED owning value into a struct field by value aliases its backing buffer, which
+     * both the field's destructor and the source's owner then free (double-free). Ownership is a
+     * runtime property, so the compiler can neither safely deep-copy nor auto-move; the user must
+     * say which. Shared by the two field-store paths - `=` in ParseAssignmentExpression and
+     * brace-init / `<Tag attr=...>` sugar via EmitOneFieldInit - so neither spelling can reach the
+     * double-free. The caller gates that the destination IS a field, and that the value is not a
+     * closure (clone-safe, handled by CloneClosureFromNamedSource above). Returns true when an
+     * error was logged.
+     */
+    bool RejectOwningValueCopyIntoField(
+        const LLVMBackend::NamedVariable& rightNV,
+        llvm::Value* right,
+        antlr4::ParserRuleContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        if (!(right && right->getType()->isStructTy()
+            && !rightNV.TypeAndValue.Pointer
+            && !rightNV.TypeAndValue.IsArrayView
+            && !rightNV.TypeAndValue.IsMove
+            && rightNV.TypeAndValue.TypeName != "string"  // string members are never auto-destructed (leak, not double-free)
+            // The RHS must be an addressable lvalue (variable / parameter / field) whose backing
+            // buffer is still owned by that source - that is what makes the shallow copy an alias.
+            // A function-call result, '.copy()', or any temporary has null Storage (ownership was
+            // transferred to us, nothing else frees it) and is therefore safe - this is the
+            // recommended fix, so it must NOT be flagged. (Call results carry the callee name in
+            // CallerName, so CallerName alone cannot distinguish them.)
+            && rightNV.Storage != nullptr
+            && !rightNV.CallerName.empty()
+            && compiler->GetOrCreateFullDestructor(rightNV.TypeAndValue.TypeName) != nullptr))
+            return false;
+
+        // Render the mangled generic name back to source spelling for the message
+        // (e.g. "list__int" -> "list<int>", "dictionary__string__int" -> "dictionary<string, int>").
+        std::string displayType = rightNV.TypeAndValue.TypeName;
+        if (size_t d = displayType.find("__"); d != std::string::npos)
+        {
+            std::string base = displayType.substr(0, d);
+            std::string args = displayType.substr(d + 2);
+            std::string joined;
+            for (size_t pos = 0; pos <= args.size(); )
+            {
+                size_t sep = args.find("__", pos);
+                if (sep == std::string::npos) { joined += args.substr(pos); break; }
+                joined += args.substr(pos, sep - pos) + ", ";
+                pos = sep + 2;
+            }
+            displayType = base + "<" + joined + ">";
+        }
+        LogErrorContext(ctx, std::format(
+            "copying owning value '{}' by value into a struct field aliases its backing buffer "
+            "and will double-free at teardown; use '.copy()' for an independent copy or 'move' "
+            "to transfer ownership", displayType));
+        return true;
+    }
+
+    /*
+     * Transfer ownership of a `move`d owning-string SOURCE by nulling its `_ptr` field, so the
+     * source's always-run scope-exit destructor is a no-op after the buffer has been handed to
+     * persistent storage. Shared by the two field-store paths - `=` in ParseAssignmentExpression
+     * and brace-init / `<Tag attr=...>` sugar via EmitOneFieldInit - so a moved string transfers
+     * identically through either spelling. Without it, brace-init deep-copies the moved value while
+     * `move` has already suppressed the source's destructor, orphaning the original buffer (a leak).
+     * Extracted VERBATIM from the `=` path; the caller gates operatorText == "=".
+     */
+    void TransferMoveStringOwnershipOnStore(
+        const LLVMBackend::NamedVariable& rightNV,
+        antlr4::ParserRuleContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        if (!(rightNV.IsOwningString && rightNV.Storage != nullptr && rightNV.TypeAndValue.IsMove))
+            return;
+        if (auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string"))
+        {
+            auto* ptrField = compiler->builder->CreateStructGEP(strTy, rightNV.Storage, 0);
+            compiler->builder->CreateStore(
+                llvm::ConstantPointerNull::get(compiler->builder->getPtrTy()), ptrField);
+        }
     }
 
     // True when the NamedVariable's value is the `string` value type.
@@ -7860,63 +8431,20 @@ public:
                 && destGep->getSourceElementType()->isStructTy())
                 || namedVar.IsInterfaceField;  // reached via the interface's byte-offset slot
 
-            // The allocation alignment of an over-aligned `new T[n]` is NOT part of the element type,
-            // so a free through a field can only recover it when the FIELD declares the same
-            // `alignas(_, N)` clause (namedVar.AllocAlignment, stamped on the field read). A matching
-            // clause is allowed; a missing or mismatched one would free the block wrong and corrupt
-            // the heap. (Alignment carried by the TYPE is not tagged here and escapes freely, as in C++.)
-            bool rhsOverAligned  = rightNV.AllocAlignment > LLVMBackend::kDefaultNewAlign;
-            bool fieldHasClause  = namedVar.AllocAlignment > LLVMBackend::kDefaultNewAlign;
-            // A freshly-allocated array-view (`new T[n]...`) stored into an aligned field must carry
-            // the field's clause; a null store (IsArrayView false) is exempt.
-            bool rhsFreshBuffer  = rightNV.TypeAndValue.IsArrayView;
-            if (operatorText == "=" && destIsStructField
-                && (rhsOverAligned || (fieldHasClause && rhsFreshBuffer))
-                && namedVar.AllocAlignment != rightNV.AllocAlignment)
-            {
-                std::string fieldDesc = namedVar.FieldName.empty()
-                    ? std::string("a field")
-                    : std::format("field '{}'", namedVar.FieldName);
-                if (!fieldHasClause)
-                    LogErrorContext(ctx, std::format(
-                        "cannot store an over-aligned buffer ('new T[n] alignas(0, {})') into {}: that alignment "
-                        "is a property of the allocation, not of the type, so a free through the field cannot "
-                        "recover it. Declare the field 'alignas(0, {})' so the block alignment is recorded, or "
-                        "over-align the ELEMENT TYPE instead ('struct alignas({}) Chunk {{ ... }};').",
-                        rightNV.AllocAlignment, fieldDesc, rightNV.AllocAlignment, rightNV.AllocAlignment));
-                else if (!rhsOverAligned)
-                    LogErrorContext(ctx, std::format(
-                        "alignment mismatch storing into {}: the field is declared 'alignas(0, {})' but the "
-                        "value was allocated without a matching allocation-alignment clause (ordinary alignment). "
-                        "Allocate it with 'new T[n] alignas(0, {})' so the free site recovers the correct alignment.",
-                        fieldDesc, namedVar.AllocAlignment, namedVar.AllocAlignment));
-                else
-                    LogErrorContext(ctx, std::format(
-                        "alignment mismatch storing into {}: the field is declared 'alignas(0, {})' but the "
-                        "value was allocated 'alignas(0, {})'. The two must agree so the free site recovers "
-                        "the correct alignment.",
-                        fieldDesc, namedVar.AllocAlignment, rightNV.AllocAlignment));
-            }
+            if (operatorText == "=" && destIsStructField)
+                RejectFieldAllocAlignMismatch(
+                    namedVar.TypeAndValue, namedVar.AllocAlignment, rightNV, right,
+                    namedVar.FieldName.empty()
+                        ? std::string("a field")
+                        : std::format("field '{}'", namedVar.FieldName),
+                    ctx);
 
             // Closure store (Option A): closures are clone-safe, so named-source assignment auto-clones.
             // Old dest env freed for alloca/global only - skipped for struct-field GEP (slot may be uninitialized).
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && namedVar.TypeAndValue.TypeName == "__closure_fat_ptr")
             {
-                bool namedSource = rightNV.Storage != nullptr
-                    && !rightNV.TypeAndValue.IsMove
-                    && rightNV.TypeAndValue.TypeName == "__closure_fat_ptr";
-                if (namedSource)
-                {
-                    // Fresh arg NV (Storage + closure type only) so the user-side CallerName /
-                    // named-argument metadata on rightNV does not confuse copy() overload resolution.
-                    LLVMBackend::NamedVariable cloneArg;
-                    cloneArg.Storage  = rightNV.Storage;
-                    cloneArg.BaseType = compiler->GetClosureFatPtrType();
-                    cloneArg.TypeAndValue.TypeName = "__closure_fat_ptr";
-                    if (auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { cloneArg }))
-                        right = cloned;
-                }
+                right = CloneClosureFromNamedSource(rightNV, right, ctx);
                 // Free the old env when overwriting a KNOWN-INITIALIZED destination slot, so the
                 // prior env is not orphaned. Safe slots: a whole-variable closure local/global
                 // (alloca/global), and a struct FIELD of a stack/global value-type instance - its
@@ -7943,63 +8471,16 @@ public:
                 return right;
             }
 
-            // Storing a whole `alias` (borrow) value into a struct field: the field's always-run
-            // destructor would free a buffer the real owner still holds (double-free). Caught here
-            // (with the precise message) ahead of the generic owning-value reject below, which would
-            // wrongly suggest 'move' - you cannot move out of a borrow. Use '.copy()'. Excludes
-            // `string`/`__closure_fat_ptr` - they carry a runtime owned bit (the string-redesign
-            // borrow path); the `alias` machinery is only for owning STRUCTS with no runtime bit.
-            if (operatorText == "=" && right && destIsStructField
-                && (rightNV.TypeAndValue.IsAlias || rightNV.IsAliasBorrow)
-                && rightNV.TypeAndValue.TypeName != "string"
-                && rightNV.TypeAndValue.TypeName != "__closure_fat_ptr")
-            {
-                LogErrorContext(ctx, std::format(
-                    "cannot store an 'alias' value '{}' into a field; it borrows storage it does not own "
-                    "and would dangle. Use '.copy()' for an independent owned copy.",
-                    rightNV.CallerName.empty() ? rightNV.TypeAndValue.TypeName : rightNV.CallerName));
+            // Storing a whole `alias` (borrow) value into a struct field - rejected ahead of the
+            // generic owning-value reject below so the borrow keeps its precise message.
+            if (operatorText == "=" && destIsStructField
+                && RejectAliasStoreIntoField(rightNV, right, ctx))
                 return right;
-            }
 
-            if (operatorText == "=" && right && right->getType()->isStructTy()
-                && destIsStructField
-                && !rightNV.TypeAndValue.Pointer
-                && !rightNV.TypeAndValue.IsArrayView
-                && !rightNV.TypeAndValue.IsMove
-                && rightNV.TypeAndValue.TypeName != "string"  // string members are never auto-destructed (leak, not double-free)
-                // The RHS must be an addressable lvalue (variable / parameter / field) whose backing
-                // buffer is still owned by that source - that is what makes the shallow copy an alias.
-                // A function-call result, '.copy()', or any temporary has null Storage (ownership was
-                // transferred to us, nothing else frees it) and is therefore safe - this is the
-                // recommended fix, so it must NOT be flagged. (Call results carry the callee name in
-                // CallerName, so CallerName alone cannot distinguish them.)
-                && rightNV.Storage != nullptr
-                && !rightNV.CallerName.empty()
-                && compiler->GetOrCreateFullDestructor(rightNV.TypeAndValue.TypeName) != nullptr)
-            {
-                // Render the mangled generic name back to source spelling for the message
-                // (e.g. "list__int" -> "list<int>", "dictionary__string__int" -> "dictionary<string, int>").
-                std::string displayType = rightNV.TypeAndValue.TypeName;
-                if (size_t d = displayType.find("__"); d != std::string::npos)
-                {
-                    std::string base = displayType.substr(0, d);
-                    std::string args = displayType.substr(d + 2);
-                    std::string joined;
-                    for (size_t pos = 0; pos <= args.size(); )
-                    {
-                        size_t sep = args.find("__", pos);
-                        if (sep == std::string::npos) { joined += args.substr(pos); break; }
-                        joined += args.substr(pos, sep - pos) + ", ";
-                        pos = sep + 2;
-                    }
-                    displayType = base + "<" + joined + ">";
-                }
-                LogErrorContext(ctx, std::format(
-                    "copying owning value '{}' by value into a struct field aliases its backing buffer "
-                    "and will double-free at teardown; use '.copy()' for an independent copy or 'move' "
-                    "to transfer ownership", displayType));
+            // Copying a named owning value into a struct field by value - rejected (double-free).
+            if (operatorText == "=" && destIsStructField
+                && RejectOwningValueCopyIntoField(rightNV, right, ctx))
                 return right;
-            }
 
             // Field-to-field copy of an owning value - REJECTED. Ownership is a runtime property, so
             // the compiler cannot safely deep-copy (would make a borrowed source owned) nor auto-move.
@@ -8010,6 +8491,48 @@ public:
             bool selfFieldAssign = !namedVar.FieldName.empty()
                 && namedVar.FieldName == rightNV.FieldName
                 && namedVar.CallerName == rightNV.CallerName;
+
+            // Self-assign of a `unique` field is one owner, not two, so neither reject below may
+            // fire on it. selfFieldAssign misses the bare `item = item` inside a method: that
+            // NamedVariable comes from GetMemberVariable, which deliberately leaves FieldName
+            // empty. Both sides then name a field of the same `this`, so the declared field name
+            // identifies the slot (each access re-loads `this`, so the GEPs never compare equal).
+            bool selfUniqueFieldAssign = selfFieldAssign
+                || (namedVar.FieldName.empty() && rightNV.FieldName.empty()
+                    && !namedVar.TypeAndValue.VariableName.empty()
+                    && namedVar.TypeAndValue.VariableName == rightNV.TypeAndValue.VariableName);
+
+            // Storing a BORROW into a `unique` field. The field declares that it owns the pointee and
+            // its synthesized destructor deletes it, but the borrow's real owner frees it as well.
+            // This is Trap A from internal/plan/ownership-move-alias-discipline.md, diagnosable here
+            // only because `unique` makes the ownership claim explicit. A `move` RHS, a `new` result,
+            // `nullptr`, and ownership-transferring call results are not borrows and never reach here;
+            // `h->slot = h->slot` is a self-assign, not a second owner, so it is excluded too.
+            if (operatorText == "=" && right && destIsStructField
+                && namedVar.TypeAndValue.IsUnique
+                && rightNV.IsBorrowed
+                && !rightNV.TypeAndValue.IsMove
+                && !selfUniqueFieldAssign)
+            {
+                RejectBorrowIntoUniqueField(rightNV,
+                    std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar)), ctx);
+                return right;
+            }
+
+            // Direct `unique`-field-to-`unique`-field copy (`c.p = a.p`) - two owners of one
+            // pointee. Checked after Trap A so a source reached through a borrowed parameter keeps
+            // the more precise borrow message. `move a.p` clears Storage, so it is not a field read
+            // and stays legal (it nulls the source field); self-assign is excluded above.
+            if (operatorText == "=" && right && right->getType()->isPointerTy()
+                && destIsStructField
+                && namedVar.TypeAndValue.IsUnique
+                && IsUniqueFieldRead(rightNV)
+                && !selfUniqueFieldAssign)
+            {
+                RejectUniqueFieldToUniqueField(rightNV,
+                    std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar)), ctx);
+                return right;
+            }
 
             // A plain (non-move) by-value `string` PARAMETER stored into a struct field: deep-copy it.
             // The parameter is a by-value copy of the caller's argument, but the CALLER still owns and
@@ -8139,6 +8662,43 @@ public:
                 return right;
             }
 
+            // Owning-value MOVE through a pointer-deref destination (`*pc = *pa`): a shallow store
+            // would alias owned buffers (double-free) and orphan the destination's old value (leak).
+            // A deref lvalue is neither an alloca/global (destIsLocalOwningVar) nor a 2-index
+            // struct-field GEP (destIsStructField), so both paths above skip it. Container element
+            // stores are single-index GEPs, which isDerefStorage() excludes (it rejects every GEP),
+            // so they never reach here. Destruct the old destination, move the source bits in, then
+            // zero the source so its scope-exit dtor is a no-op. Use-after-move through a pointer is
+            // left unenforced - a deref source (`*pa`) has no name to MarkVariableMoved.
+            if (operatorText == "=" && right && destination
+                && !namedVar.BitfieldStorage && !namedVar.UnionFieldType
+                && right->getType()->isStructTy()
+                && isDerefStorage()
+                && !namedVar.TypeAndValue.IsInterface
+                && !namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsInterfacePointer
+                && !namedVar.TypeAndValue.IsFunctionPointer
+                && !namedVar.TypeAndValue.IsArrayView
+                && !rightNV.TypeAndValue.IsMove
+                && destination != rightNV.Storage
+                && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))
+            {
+                if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                auto* assignResult = derefAssign(right, rhsUnsigned);
+                // Zero the moved-out source (a named local or `*pa`) so its dtor frees nothing.
+                if (rightNV.Storage != nullptr)
+                    compiler->builder->CreateStore(
+                        llvm::ConstantAggregateZero::get(right->getType()), rightNV.Storage);
+                // Enforce use-after-move only for a plain named source; a deref source has no name.
+                bool srcIsNamedVar = rightNV.Storage != nullptr
+                    && (llvm::isa<llvm::AllocaInst>(rightNV.Storage)
+                        || llvm::isa<llvm::GlobalVariable>(rightNV.Storage));
+                if (srcIsNamedVar && !rightNV.CallerName.empty())
+                    compiler->MarkVariableMoved(rightNV.CallerName);
+                return assignResult;
+            }
+
             // Destruct old value of an owning-value-type struct FIELD or whole LOCAL variable before
             // overwriting (closes the reassignment LEAK). For a struct field this guards field stores;
             // for a local/global variable it covers `r = f()` where f returns an owned temp (the named-
@@ -8160,6 +8720,27 @@ public:
                 // ownership is a runtime property (_len owned bit), so auto copy/move is unsafe for string.
                 if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                     compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+            }
+
+            // `unique T* field` reassignment: free the old pointee before overwriting it, or it
+            // leaks. Shares EmitUniqueFieldDelete with the synthesized destructor so a field is
+            // freed identically at teardown and at reassignment (a divergence between the two
+            // would be a silent heap bug). Assigning `nullptr` frees the old pointee too - that is
+            // the sanctioned "release early" idiom, and it is why `delete` on a unique field is
+            // rejected as unnecessary. Passing `right` lets the helper skip the free on a
+            // self-assign. The slot is trusted to be initialized on the same grounds the
+            // synthesized destructor already trusts it: every construction path (stack local,
+            // `new T()`, `new T[n]`, user-ctor entry) runs a default constructor that
+            // zero-initializes the fields.
+            if (operatorText == "=" && right && right->getType()->isPointerTy()
+                && destIsStructField
+                && namedVar.TypeAndValue.IsUnique)
+            {
+                compiler->EmitUniqueFieldDelete(
+                    *compiler->builder, destination,
+                    compiler->GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName),
+                    namedVar.TypeAndValue.TypeName, namedVar.TypeAndValue.AllocAlignValue,
+                    right);
             }
 
             // Destruct the old value of an owning-string LOCAL before overwriting it. Closes the
@@ -8185,94 +8766,13 @@ public:
             if (namedVar.TypeAndValue.NoaliasScopeId >= 0)
                 if (auto* st = llvm::dyn_cast_or_null<llvm::StoreInst>(assignResult))
                     compiler->AttachViewNoalias(st, namedVar.TypeAndValue.NoaliasScopeId);
-            // Lazy refcount: if a new-allocated local is assigned to a non-local destination
-            // (struct field, heap object), create a refcount on first escape and increment it.
-            if (operatorText == "=" && rightNV.IsNewAllocated && rightNV.TypeAndValue.Pointer
-                && !rightNV.CallerName.empty()
-                && destination != nullptr
-                && !llvm::isa<llvm::AllocaInst>(destination)
-                && !llvm::isa<llvm::GlobalVariable>(destination))
-            {
-                // Fetch the live RefCountStorage (rightNV is a copy; look up the actual NV).
-                llvm::Value* refAlloca = rightNV.RefCountStorage;
-                if (refAlloca == nullptr)
-                {
-                    // First escape: emit the refcount alloca at function entry (initialized to 1).
-                    auto savedIP = compiler->builder->saveIP();
-                    auto* fn = compiler->builder->GetInsertBlock()->getParent();
-                    auto* entryBB = &fn->getEntryBlock();
-                    compiler->builder->SetInsertPoint(entryBB, entryBB->begin());
-                    refAlloca = compiler->builder->CreateAlloca(compiler->builder->getInt32Ty(), nullptr, "refcount");
-                    compiler->builder->CreateStore(compiler->builder->getInt32(1), refAlloca);
-                    compiler->builder->restoreIP(savedIP);
-                    compiler->SetVariableRefCountStorage(rightNV.CallerName, refAlloca);
-                }
-                // Increment for this escape.
-                auto* cur = compiler->builder->CreateLoad(compiler->builder->getInt32Ty(), refAlloca);
-                compiler->builder->CreateStore(
-                    compiler->builder->CreateAdd(cur, compiler->builder->getInt32(1), "refinc"),
-                    refAlloca);
-            }
-            // Transfer ownership: null the source alloca so EmitDestructorsForScope
-            // won't free the pointer we just stored elsewhere.
-            // Move params (IsOwning && !IsNewAllocated): null for any destination type.
-            // New-allocated locals (IsOwning && IsNewAllocated): null only for local destinations;
-            //   struct-field escapes use refcount above so both sides validly hold the pointer.
-            // When the RHS came through a cast that cleared rightNV.Storage, fall back to
-            // looking up the original variable by CallerName so the source is still nulled.
-            // Array-view RHS is excluded: `int[]` is a non-owning alias, so `view = view`
-            // must rebind the pointer only. Nulling/moving the source orphans the buffer
-            // because the destination view never frees it (the owner is the `new T[n]`
-            // variable, deleted explicitly). Mirrors the struct-move guard above.
-            if (operatorText == "=" && rightNV.IsOwning
-                && rightNV.TypeAndValue.Pointer
-                && !rightNV.TypeAndValue.IsArrayView
-                && (!rightNV.IsNewAllocated
-                    || destination == nullptr
-                    || llvm::isa<llvm::AllocaInst>(destination)
-                    || llvm::isa<llvm::GlobalVariable>(destination)))
-            {
-                llvm::Value* srcStorage = rightNV.Storage;
-                llvm::Type*  srcBaseTy  = rightNV.BaseType;
-                if (srcStorage == nullptr && !rightNV.CallerName.empty())
-                {
-                    auto ref = compiler->FindVariableStorage(rightNV.CallerName);
-                    srcStorage = ref.Storage;
-                    srcBaseTy  = ref.BaseType;
-                }
-                if (srcStorage != nullptr)
-                {
-                    if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(srcBaseTy))
-                    {
-                        compiler->builder->CreateStore(
-                            llvm::ConstantPointerNull::get(ptrTy), srcStorage);
-                        // Moving a field (`x = node->left`) marks only that field, not the base.
-                        if (!rightNV.FieldName.empty())
-                            compiler->MarkVariableFieldMoved(rightNV.CallerName, rightNV.FieldName);
-                        else
-                        {
-                            compiler->MarkVariableMoved(rightNV.CallerName);
-                            // Boxing into an interface ('live = sc') transfers ownership to a handle
-                            // that is not auto-destructed; flag the source so a later 'delete sc' is
-                            // rejected (it would be a no-op and leak).
-                            if (namedVar.TypeAndValue.IsInterface)
-                                compiler->MarkVariableMovedIntoInterface(rightNV.CallerName);
-                        }
-                    }
-                }
-            }
+            if (operatorText == "=")
+                TransferPointerOwnershipOnStore(
+                    rightNV, destination, namedVar.TypeAndValue.IsInterface, ctx);
             // Transfer ownership for move string: null _ptr so string.dtor is a no-op
             // after the value has been moved to persistent storage (e.g. list::add).
-            if (operatorText == "=" && rightNV.IsOwningString && rightNV.Storage != nullptr
-                && rightNV.TypeAndValue.IsMove)
-            {
-                if (auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string"))
-                {
-                    auto* ptrField = compiler->builder->CreateStructGEP(strTy, rightNV.Storage, 0);
-                    compiler->builder->CreateStore(
-                        llvm::ConstantPointerNull::get(compiler->builder->getPtrTy()), ptrField);
-                }
-            }
+            if (operatorText == "=")
+                TransferMoveStringOwnershipOnStore(rightNV, ctx);
             // Reassignment to a moved variable (or field) makes it live again.
             if (operatorText == "=" && !namedVar.CallerName.empty())
             {
@@ -10740,8 +11240,42 @@ public:
             return false;
         }
 
+        // `unique` field initialized here: this is a second field-store path, so it needs the same
+        // two source rejections the `=` path applies (Trap A, and field-to-field). No reassign-free
+        // is needed - both callers construct a fresh slot, so there is no old pointee to release.
+        if (fieldType.IsUnique)
+        {
+            std::string fieldDesc = std::format("unique field '{}.{}'", typeName, fieldName);
+            if (rightNV.IsBorrowed && !rightNV.TypeAndValue.IsMove)
+                RejectBorrowIntoUniqueField(rightNV, fieldDesc, errCtx);
+            if (IsUniqueFieldRead(rightNV))
+                RejectUniqueFieldToUniqueField(rightNV, fieldDesc, errCtx);
+        }
+
         llvm::Value* val = LoadNamedVariable(rightNV);
         if (!val) return false;
+
+        // Same allocation-alignment agreement the `=` path demands: this store reaches the very
+        // same synthesized free site, so a mismatch here corrupts the heap identically.
+        RejectFieldAllocAlignMismatch(
+            fieldType, fieldType.AllocAlignValue, rightNV, val,
+            std::format("field '{}.{}'", typeName, fieldName), errCtx);
+
+        /*
+         * The `=` path's three remaining ownership rules for a field store, applied here in its
+         * order. A closure is clone-safe and takes the auto-clone; it must NOT reach the rejects
+         * (the `=` path returns early instead, and the owning-value reject would otherwise fire on
+         * a `__closure_fat_ptr`, which has a full destructor). No reassign-free accompanies the
+         * clone: both callers construct a FRESH slot, so there is no old env to release.
+         */
+        bool isClosureVal = (val->getType() == compiler->GetClosureFatPtrType());
+        if (isClosureVal)
+            val = CloneClosureFromNamedSource(rightNV, val, errCtx);
+        else
+        {
+            if (RejectAliasStoreIntoField(rightNV, val, errCtx)) return false;
+            if (RejectOwningValueCopyIntoField(rightNV, val, errCtx)) return false;
+        }
 
         // Coerce char* string literals to the string struct type
         if (fieldType.TypeName == "string" && !fieldType.Pointer
@@ -10765,8 +11299,19 @@ public:
         // rely on (e.g. text(string s) { t.text = s; }). copy() leaves the source
         // intact; the copy result is owned by the field, so it is dropped from the
         // owned-string temp-flush list below.
+        // A string source that ALREADY hands us sole ownership of its buffer is transferred, not
+        // copied - exactly as the `=` path does. Two shapes qualify: a `move`d source (Storage is
+        // nulled below via the shared helper) and a transferred owned temp (Storage == nullptr with
+        // the owning flag - a `move`d local whose storage ParseMoveExpression already zeroed, or an
+        // operator+/copy() result). Deep-copying either would orphan the one buffer (a leak): the
+        // moved-from source is already suppressed, so nothing else frees the original. A plain owned
+        // string LOCAL (Storage != nullptr, not a move) still deep-copies - it keeps its buffer, so
+        // the field needs an independent one (the known-benign divergence from the `=` path).
         else if (fieldType.TypeName == "string" && !fieldType.Pointer
-                 && val->getType()->isStructTy() && compiler->GetFunction("copy"))
+                 && val->getType()->isStructTy()
+                 && !(rightNV.TypeAndValue.IsMove
+                      || (rightNV.Storage == nullptr && rightNV.IsOwningString))
+                 && compiler->GetFunction("copy"))
         {
             LLVMBackend::NamedVariable srcNV;
             srcNV.Primary = val;
@@ -10792,24 +11337,30 @@ public:
             }
         }
 
-        // Closure (Lambda<>) field: the destination now owns the closure env, so drop
-        // it from the owned-closure temp-flush list (otherwise the env is freed twice -
-        // by the end-of-full-expression flush AND by the owner's destructor). Mirrors
-        // the field-assignment path's UnregisterOwnedClosureTemp for the temp case.
-        bool isClosureVal = (val->getType() == compiler->GetClosureFatPtrType());
-
+        llvm::Value* destination = nullptr;
         if (sd.IsUnion)
         {
             // Union: all fields alias at offset 0. Store through the raw pointer with the explicit field type.
             auto* fieldLLVMType = compiler->GetType(fieldType);
             compiler->CreateAssignment(val, structPtr, false, fieldLLVMType);
+            destination = structPtr;
         }
         else
         {
             auto* gep = compiler->builder->CreateStructGEP(sd.StructType, structPtr, (unsigned)fieldIdx, fieldName + "_init");
             compiler->builder->CreateStore(val, gep);
+            destination = gep;
         }
 
+        // The field now holds this pointer, so account for it exactly as the `=` path does: refcount
+        // a new-allocated local's escape, or null the source. Without this both the source local and
+        // the field's destructor free the one pointee.
+        TransferPointerOwnershipOnStore(rightNV, destination, fieldType.IsInterface, errCtx);
+
+        // Closure (Lambda<>) field: the destination now owns the closure env, so drop it from the
+        // owned-closure temp-flush list (otherwise the env is freed twice - by the end-of-full-
+        // expression flush AND by the owner's destructor). Mirrors the field-assignment path's
+        // UnregisterOwnedClosureTemp for the temp case; a clone result is not registered (no-op).
         if (isClosureVal)
             compiler->UnregisterOwnedClosureTemp(val);
         // The field now owns the stored string buffer (a fresh copy, or a transferred
@@ -10817,6 +11368,9 @@ public:
         // twice (flush + field destructor).
         if (fieldType.TypeName == "string" && !fieldType.Pointer && val->getType()->isStructTy())
             compiler->UnregisterOwnedStringTemp(val);
+        // A `move`d owning-string source: null its `_ptr` so the moved-from source's suppressed
+        // destructor stays a no-op and the one buffer is owned solely by this field.
+        TransferMoveStringOwnershipOnStore(rightNV, errCtx);
         return true;
     }
 
@@ -10983,6 +11537,69 @@ public:
             auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, { zero, idx }, "arrelem");
             compiler->CreateAssignment(val, elemPtr, false, elemTy);
         }
+    }
+
+    /*
+     * Default-initialize a fixed array of structs declared with no initializer (`T arr[N];`),
+     * giving every element what the scalar path gives `T one;` - the synthesized default
+     * constructor's value, field initializers included. Primitive elements are deliberately not
+     * covered: plain `int x;` is uninitialized (C semantics), so `int[N] x;` stays that way too.
+     * Multi-dimensional arrays are contiguous, so the flat element walk covers `T[N][M]` as well.
+     */
+    void EmitFixedArrayDefaultInit(llvm::Value* arrAlloc, const LLVMBackend::TypeAndValue& tv)
+    {
+        auto* compiler = Compiler();
+        auto structData = compiler->GetDataStructure(tv.TypeName);
+        auto* arrTy = llvm::dyn_cast_or_null<llvm::ArrayType>(compiler->GetType(tv));
+        if (structData.StructType == nullptr || arrTy == nullptr) return;
+
+        // Total slots: the outer extent times every inner dimension (T[N][M] is N*M structs).
+        uint64_t n = tv.ConstArraySize;
+        for (uint64_t d : tv.ConstInnerDimensions) n *= d;
+        if (n == 0) return;
+
+        // An owning default (its constructor allocates a resource) must be built independently in
+        // each slot: a single seed replicated bitwise would alias one resource across all N slots
+        // and double-free at teardown. The walk is shared with the destruction path so the two
+        // traversals cannot drift.
+        if (compiler->GetFunction(tv.TypeName) && compiler->IsOwningValueType(tv.TypeName))
+        {
+            compiler->EmitFixedArrayElementWalk(
+                *compiler->builder, arrAlloc, structData.StructType, n,
+                [&](llvm::Value* elemPtr)
+                {
+                    llvm::Value* elem = compiler->CreateOverloadedFunctionCall(tv.TypeName, {});
+                    compiler->CreateAssignment(elem, elemPtr);
+                });
+            return;
+        }
+
+        llvm::Value* seedVal = compiler->GetFunction(tv.TypeName)
+            ? compiler->CreateOverloadedFunctionCall(tv.TypeName, {})
+            : nullptr;
+
+        // No default constructor, or one that folds to all-zero: a single store of the whole
+        // array, which lowers to one memset regardless of N.
+        auto* seedConst = llvm::dyn_cast_or_null<llvm::Constant>(seedVal);
+        if (seedVal == nullptr || (seedConst != nullptr && seedConst->isNullValue()))
+        {
+            compiler->builder->CreateStore(llvm::Constant::getNullValue(arrTy), arrAlloc);
+            return;
+        }
+
+        // A non-owning non-trivial default (plain field initializers, no owned resource) is safe
+        // to replicate bitwise: seed one element and copy it into every slot.
+        auto* seedAlloc = compiler->AllocaAtEntry(structData.StructType, nullptr, "arrdefseed");
+        compiler->CreateAssignment(seedVal, seedAlloc);
+        uint64_t elemBytes = compiler->module->getDataLayout().getTypeAllocSize(structData.StructType);
+
+        compiler->EmitFixedArrayElementWalk(
+            *compiler->builder, arrAlloc, structData.StructType, n,
+            [&](llvm::Value* elemPtr)
+            {
+                compiler->builder->CreateMemCpy(
+                    elemPtr, llvm::MaybeAlign(), seedAlloc, llvm::MaybeAlign(), elemBytes);
+            });
     }
 
     // Coerce a folded element constant to the array's element type so ConstantArray::get
@@ -11601,6 +12218,22 @@ public:
         return result;
     }
 
+    // True when the pointee TYPE's own alignment (`struct alignas(64) T`) already routes `new` and
+    // `delete` to the aligned pair. Mirrors the free site's recovery in EmitOwningPtrCleanup and the
+    // `typeAlreadyAligned` test in ParseNewExpression: such a block carries no per-site tag, so a
+    // field's `alignas(0, N)` clause cannot disagree with the allocation and must not be demanded.
+    bool ElementTypeIsOverAligned(const LLVMBackend::TypeAndValue& typeAndValue) const
+    {
+        if (typeAndValue.TypeName.empty() || typeAndValue.ElemPointer)
+            return false;
+        LLVMBackend::TypeAndValue elem{ .TypeName = typeAndValue.TypeName };
+        llvm::Type* elemType = compilerLLVM->GetType(elem);
+        if (elemType == nullptr || !elemType->isSized())
+            return false;
+        return compilerLLVM->GetEffectiveAlignmentForType(elem.TypeName, elemType)
+            > LLVMBackend::kDefaultNewAlign;
+    }
+
     // If funcName is a method ("Type.method") or destructor ("~Type") whose owning
     // struct is registered, return the struct name. Returns "" for top-level
     // functions or unrecognized owners. Used by the delete-of-field rule to gate
@@ -11778,12 +12411,49 @@ public:
                 && namedVar.Storage != nullptr
                 && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
             {
+                std::string name = namedVar.CallerName.empty() ? namedVar.BorrowedOrigin : namedVar.CallerName;
+                // Trap B: the borrow came from a `unique` field, not a parameter. The field's
+                // synthesized destructor is the owner, so name it and point at `move` instead.
+                if (!namedVar.BorrowedUniqueField.empty())
+                    LogErrorContext(ctx, std::format(
+                        "cannot delete '{}' - it aliases unique field '{}', whose synthesized destructor "
+                        "already frees it, so this is a double-free. Use 'move {}' to take ownership out "
+                        "of the field (which nulls it), or let the field's destructor free it.",
+                        name, namedVar.BorrowedUniqueField, namedVar.BorrowedOrigin));
+                else
+                    LogErrorContext(ctx, std::format(
+                        "cannot delete '{}' - it aliases borrowed parameter '{}'. The caller may own "
+                        "this pointer and will free it on scope exit. Declare the source parameter "
+                        "'move {}' to take ownership.",
+                        name, namedVar.BorrowedOrigin, namedVar.BorrowedOrigin));
+                return {};
+            }
+
+            // Error: deleting a `unique` field. The synthesized destructor calls the user dtor
+            // FIRST and then deletes the field, so a hand-written `delete _root;` double-frees -
+            // exactly what a migration produces when someone adds `unique` and forgets to remove
+            // the old destructor. Keyed on IsUnique rather than FieldName: a bare self-field
+            // access (`delete _root;` inside the struct's own method - the case that matters, and
+            // the one the from-outside rule below cannot see) comes from GetMemberVariable, which
+            // purposely leaves OwningStructName/FieldName empty. `unique` only ever lands on a
+            // field, so IsUnique alone cannot misfire on a local. Checked ahead of the from-outside
+            // rule so the precise reason wins for inside and outside deletes alike.
+            if (namedVar.TypeAndValue.IsUnique)
+            {
+                std::string fieldName = namedVar.FieldName.empty()
+                    ? namedVar.TypeAndValue.VariableName : namedVar.FieldName;
+                std::string owner = namedVar.OwningStructName.empty()
+                    ? SplitEnclosingStruct(compiler->GetCurrentFunctionName(), compiler)
+                    : namedVar.OwningStructName;
+                std::string fieldDesc = owner.empty()
+                    ? std::format("'{}'", fieldName)
+                    : std::format("'{}.{}'", owner, fieldName);
                 LogErrorContext(ctx, std::format(
-                    "cannot delete '{}' - it aliases borrowed parameter '{}'. The caller may own "
-                    "this pointer and will free it on scope exit. Declare the source parameter "
-                    "'move {}' to take ownership.",
-                    namedVar.CallerName.empty() ? namedVar.BorrowedOrigin : namedVar.CallerName,
-                    namedVar.BorrowedOrigin, namedVar.BorrowedOrigin));
+                    "cannot delete unique field {} - the synthesized destructor already deletes it, so "
+                    "this is a double-free. An explicit delete is never needed: assigning '{} = nullptr;' "
+                    "frees the current pointee, and '{} = new T();' frees it and re-roots. Remove this "
+                    "delete, or drop 'unique' from the field to manage it by hand.",
+                    fieldDesc, fieldName, fieldName));
                 return {};
             }
 
@@ -11998,6 +12668,22 @@ public:
                 "cannot 'move' field '{}.{}' through borrowed parameter '{}'. Declare the "
                 "source parameter 'move {}' to transfer ownership of its fields.",
                 argNV.OwningStructName, argNV.FieldName, argNV.BorrowedOrigin, argNV.BorrowedOrigin));
+            return {};
+        }
+
+        // Reject 'move' of a local that aliases a `unique` field - Trap B in its original
+        // spelling. Moving the alias nulls the LOCAL, never the field, so the field's
+        // synthesized destructor still frees the pointee. Forwarding an ordinary borrow as
+        // 'move' stays legal (the programmer asserts the borrow is dead); for a `unique` field
+        // that assertion cannot hold, because the field's destructor is synthesized and will run.
+        if (!argNV.BorrowedUniqueField.empty())
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot 'move' '{}' - it aliases unique field '{}', and moving the alias does not "
+                "null the field, so the field's synthesized destructor still frees the pointee. "
+                "Use 'move {}' to move the field itself (which nulls it).",
+                argNV.CallerName.empty() ? argNV.BorrowedOrigin : argNV.CallerName,
+                argNV.BorrowedUniqueField, argNV.BorrowedOrigin));
             return {};
         }
 
@@ -12661,6 +13347,9 @@ public:
         out.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
         out.OwningStructName = structVar.TypeAndValue.TypeName;
         out.FieldName = fieldName;
+        // Preserve unique-field provenance across a later cast (see the sibling named-field read).
+        if (leafField.IsUnique && leafField.Pointer)
+            out.IsUniqueFieldAlias = true;
         out.IsBorrowed = structVar.IsBorrowed;
         out.BorrowedOrigin = structVar.BorrowedOrigin;
         return true;
@@ -13381,6 +14070,11 @@ public:
                                     // can reject it when invoked outside the owning struct's own methods.
                                     namedVar.OwningStructName = structVar.TypeAndValue.TypeName;
                                     namedVar.FieldName        = primaryIdentifier;
+                                    // A cast off this read (`(Res*)b.p`, `free((void*)b.p)`) severs
+                                    // Storage and rewrites the type; carry the unique provenance so
+                                    // the borrow rules still fire (see IsUniqueFieldRead / Trap B).
+                                    if (fieldType.IsUnique && fieldType.Pointer)
+                                        namedVar.IsUniqueFieldAlias = true;
                                     // Field declared `alignas(_, N)`: stamp the block alignment onto the
                                     // result so `delete obj->field` / scope-exit free via __delete_aligned.
                                     namedVar.AllocAlignment   = fieldType.AllocAlignValue;
@@ -13431,9 +14125,14 @@ public:
                             // function by name - e.g. n.toString(), n.toString(16). The base value
                             // stays in namedVar and is pushed as the self argument when '()' is
                             // dispatched below. Float bases are already covered above.
+                            // An enum is integer-backed, so it supports the same UFCS/method dispatch
+                            // as its backing type - e.g. `enumVal.copy()` routes to the copy choke point.
+                            bool baseIsEnum = !namedVar.TypeAndValue.TypeName.empty()
+                                && !Compiler(ctx)->GetEnumBackingType(namedVar.TypeAndValue.TypeName).empty();
                             bool baseIsIntegerLike =
                                 namedVar.TypeAndValue.IsInteger() >= 0
                                 || namedVar.TypeAndValue.TypeName == "bool"
+                                || baseIsEnum
                                 || (namedVar.Primary != nullptr
                                     && namedVar.Primary->getType()->isIntegerTy());
                             if (baseIsIntegerLike && Compiler(ctx)->GetFunction(terminal->getText()))
@@ -16369,13 +17068,31 @@ public:
         std::set<std::string> seenNames;
         std::vector<CaptureInfo> captures;
 
-        std::function<void(antlr4::tree::ParseTree*)> walk = [&](antlr4::tree::ParseTree* node)
+        // `shadowed` grows as we descend into nested lambdas: it holds the parameter names of the
+        // nested lambdas currently being walked, so a nested parameter that shadows an enclosing
+        // name is not mis-captured.
+        std::function<void(antlr4::tree::ParseTree*, const std::set<std::string>&)> walk =
+            [&](antlr4::tree::ParseTree* node, const std::set<std::string>& shadowed)
         {
             if (!node) return;
 
-            // Stop at nested lambdas - they capture their own closures separately.
-            if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node))
+            // A nested lambda does NOT terminate the walk: a variable it references from an
+            // ENCLOSING frame must become a TRANSITIVE capture of THIS lambda. Otherwise the inner
+            // env would store the enclosing function's alloca from a context (this lambda's body)
+            // where it does not dominate - a verifier failure. Capturing it here re-registers it as
+            // a local of this lambda (backed by this env), so the nested lambda then captures it
+            // from this frame, where it dominates (standard nested-closure lowering). Descend with
+            // the nested lambda's own parameters shadowed.
+            if (auto* nested = dynamic_cast<CFlatParser::LambdaExpressionContext*>(node))
+            {
+                std::set<std::string> inner = shadowed;
+                if (auto* pl = nested->lambdaParamList())
+                    for (auto* p : pl->lambdaParam())
+                        inner.insert(p->Identifier()->getText());
+                if (auto* body = nested->lambdaBody())
+                    walk(body, inner);
                 return;
+            }
 
             // primaryExpression::genericIdentifier is the only AST node representing a
             // standalone identifier (not a member name after '.' or a named-arg label).
@@ -16416,6 +17133,7 @@ public:
                     // to reference the OUTER storage across the closure boundary.
                     if (!seenNames.count(name)
                         && !lambdaParamNames.count(name)
+                        && !shadowed.count(name)
                         && !compiler->globalNamedVariable.count(name))
                     {
                         for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
@@ -16460,10 +17178,10 @@ public:
             }
 
             for (size_t i = 0; i < node->children.size(); i++)
-                walk(node->children[i]);
+                walk(node->children[i], shadowed);
         };
 
-        if (bodyCtx) walk(bodyCtx);
+        if (bodyCtx) walk(bodyCtx, {});
         return captures;
     }
 
@@ -16695,6 +17413,9 @@ public:
                         captureNV.TypeAndValue = captureTV;
                         captureNV.BaseType     = structTy;
                     }
+                    // A by-reference capture BORROWS the source; the env never owns it. Without this,
+                    // every CALL destructs the caller's struct through the borrowed pointer.
+                    captureNV.IsAliasBorrow = true;
                 }
                 else
                 {
@@ -17377,20 +18098,16 @@ public:
             }
         }
 
-        namedVar = compiler->GetLocalVariable(name);
+        // Locals and parameters resolved together with correct lexical precedence (innermost
+        // frame first; a local shadows a parameter within a frame). A separate local-then-argument
+        // lookup would let an ENCLOSING function's local beat a lambda's own parameter of the same
+        // name - see GetScopedLocalOrArgument.
+        namedVar = compiler->GetScopedLocalOrArgument(name);
         if (namedVar.Storage != nullptr || namedVar.Primary != nullptr)
         {
             namedVar.IdentifierLine = (int)node->getSymbol()->getLine();
             namedVar.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
             return namedVar;
-        }
-
-        auto funcArgument = compiler->GetFunctionArgument(name);
-        if (funcArgument.GetValue() != nullptr)
-        {
-            funcArgument.IdentifierLine = (int)node->getSymbol()->getLine();
-            funcArgument.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
-            return funcArgument;
         }
 
         auto memberVar = compiler->GetMemberVariable(name);
@@ -18094,6 +18811,10 @@ public:
 
         // Push scope so unqualified nested type names resolve (e.g. Inner -> Outer.Inner)
         structScopeStack.push_back(structName);
+
+        // Arm the union-member rejection for `unique` (ValidateUniqueField). Placed after the
+        // nested definitions above so an inner body is never judged by the enclosing body's kind.
+        UnionFieldDeclGuard unionCtx(inUnionFieldDecl_, ctx->Union() != nullptr);
 
         auto declarationList = MemberDeclarations(ctx);
         std::vector<llvm::Type*> types;

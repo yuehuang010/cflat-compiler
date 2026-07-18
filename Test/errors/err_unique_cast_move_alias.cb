@@ -1,0 +1,19 @@
+// A `(T*)` cast off a `unique` field must not defeat the move rule (Trap B). Moving the cast
+// alias nulls the LOCAL, never the field, so the field's synthesized destructor still frees the
+// pointee. The cast preserves borrow provenance, so `move` of the alias is rejected exactly as
+// the un-cast form is. `move b.p` moves the field itself (which nulls it).
+struct Res { int v = 0; };
+struct Box { unique Res* p = nullptr; };
+
+void consume(move Res* n) { delete n; }
+
+extern int main()
+{
+    expect_error("cannot 'move' 'alias' - it aliases unique field 'Box.p'") {
+        Box b = default;
+        b.p = new Res();
+        Res* alias = (Res*)b.p;
+        consume(move alias);
+    }
+    return 0;
+}

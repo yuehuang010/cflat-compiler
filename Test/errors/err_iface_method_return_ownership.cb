@@ -1,0 +1,79 @@
+// A `move` / `alias` RETURN is contract too: virtual dispatch classifies the result's
+// ownership from the INTERFACE's return type (it is what the call site can see), so an
+// implementor that disagrees either leaks the result or lets the caller free a borrow.
+// Both qualifiers, both directions.
+struct Res { int v = 0; };
+
+// -- `move` return: interface transfers ownership, implementor does not --
+interface IMaker
+{
+    move Res* make();
+};
+
+expect_error("the return type is not declared 'move' but interface 'IMaker' declares it 'move Res*'") {
+    class BorrowMaker : IMaker
+    {
+        Res* held = nullptr;
+        Res* make() { return this.held; }
+    };
+}
+
+// -- `move` return: implementor transfers ownership, interface does not --
+interface IBorrowMaker
+{
+    Res* make();
+};
+
+expect_error("the return type is declared 'move' but interface 'IBorrowMaker' declares it 'Res*'") {
+    class OwningMaker : IBorrowMaker
+    {
+        move Res* make() { return new Res(); }
+    };
+}
+
+// -- `alias` return: interface hands back a borrow, implementor does not --
+interface IPeeker
+{
+    alias Res* peek();
+};
+
+expect_error("the return type is not declared 'alias' but interface 'IPeeker' declares it 'alias Res*'") {
+    class PlainPeeker : IPeeker
+    {
+        Res* held = nullptr;
+        Res* peek() { return this.held; }
+    };
+}
+
+// -- `alias` return: implementor hands back a borrow, interface does not --
+interface IPlainPeeker
+{
+    Res* peek();
+};
+
+expect_error("the return type is declared 'alias' but interface 'IPlainPeeker' declares it 'Res*'") {
+    class AliasPeeker : IPlainPeeker
+    {
+        Res* held = nullptr;
+        alias Res* peek() { return this.held; }
+    };
+}
+
+// -- `bond` return: interface ties the result's lifetime, implementor does not --
+interface ITier
+{
+    bond Res* tie();
+};
+
+expect_error("the return type is declared 'Res*' but interface 'ITier' declares it 'bond Res*'") {
+    class PlainTier : ITier
+    {
+        Res* held = nullptr;
+        Res* tie() { return this.held; }
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

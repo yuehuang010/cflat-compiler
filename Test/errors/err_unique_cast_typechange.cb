@@ -1,0 +1,25 @@
+// A TYPE-CHANGING cast off a `unique` field must not defeat the borrow rules either. The pointee
+// identity (not the static type) is what makes a free unsafe, and `free((void*)field)` /
+// `(char*)field` is the common real spelling. Provenance chains through the intermediate cast, so
+// deleting the reinterpreted pointer is still rejected as a double-free.
+struct Res { int v = 0; };
+struct Box { unique Res* p = nullptr; };
+
+extern int main()
+{
+    expect_error("cannot delete 'r' - it aliases unique field 'Box.p'") {
+        Box b = default;
+        b.p = new Res();
+        void* v = (void*)b.p;
+        Res* r = (Res*)v;
+        delete r;
+    }
+    expect_error("cannot delete 'c2' - it aliases unique field 'Box.p'") {
+        Box b = default;
+        b.p = new Res();
+        char* c = (char*)b.p;
+        Res* c2 = (Res*)c;
+        delete c2;
+    }
+    return 0;
+}

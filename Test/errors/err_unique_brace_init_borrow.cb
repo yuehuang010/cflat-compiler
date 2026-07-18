@@ -1,0 +1,19 @@
+// Brace-init is a SECOND field-store path (EmitOneFieldInit), independent of the `=`
+// assignment path. Trap A must fire there identically: storing a borrowed (non-`move`)
+// parameter into a `unique` field makes two owners - the caller frees on scope exit and
+// the field's synthesized destructor frees at teardown. The `=` spelling of this is
+// covered by err_unique_borrow_into_field.cb; this pins the brace form, which used to
+// compile clean and double-free. Fresh-allocation and `move` brace-inits stay legal
+// (covered positively in Test/test_move.cb).
+struct Node { int v = 0; };
+
+struct Holder { unique Node* slot = nullptr; };
+
+expect_error("cannot store borrowed parameter 'n' into unique field 'Holder.slot'") {
+    Holder make(Node* n) { Holder h = { slot = n }; return h; }
+}
+
+extern int main()
+{
+    return 0;
+}

@@ -176,7 +176,7 @@
         },
         {
           "name": "storage.modifier.ownership.cflat",
-          "match": "\\b(move|bond|alias)\\b"
+          "match": "\\b(move|bond|alias|unique)\\b"
         },
         {
           "name": "keyword.other.operator-overload.cflat",

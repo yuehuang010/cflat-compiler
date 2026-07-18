@@ -1,0 +1,10 @@
+// `unique` marks a struct field as owning a raw pointer, so the synthesized destructor
+// can delete it. On a non-pointer field there is nothing to delete - reject at the field.
+expect_error("'unique' on field 'S.x' requires a single-indirection pointer type") {
+    struct S { unique int x = 0; };
+}
+
+extern int main()
+{
+    return 0;
+}

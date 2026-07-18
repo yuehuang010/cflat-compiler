@@ -27,11 +27,54 @@ import "test_helper.cb";
 struct LeakRow { string name = default; };
 struct LeakBox { list<int> nums = default; };
 struct LeakPair { string name = default; list<int> nums = default; };
+// Owning fixed-array FIELD (`ArrSBox items[3]`): the synthesized destructor must free EVERY element
+// (was a leak - the whole array field was skipped), and the memberwise copy() must deep-copy each
+// element so a .copy() is independent (not a shared-buffer double-free). (Multi-dimensional array
+// FIELDS are not expressible in the grammar; the flattened walk is exercised by array LOCALS.)
+// See internal/issue/fixed-array-elements-not-destructed.md.
+struct ArrSBox   { string s = default; };
+struct ArrHolder { ArrSBox items[3] = default; };
 // Owning Lambda<> field (lambda Option A): a closure stored in a struct field owns its heap
 // env and is freed by the struct's destructor, like a string/list field.
 struct LeakHandler { Lambda<int(int)> fn = default; };
 // Same, but the closure RETURNS an owned string - the shape that exposed the field-callee leak.
 struct LeakLabeler { Lambda<string(int)> label = default; };
+
+// Regression for "container copy moves-or-shares elements": copy() deep-copies value-type
+// elements (source intact), transfers owned POINTER elements to the copy (single owner - a
+// shared pointee would double-free), and bitwise-copies enum elements. LeakName needs hash()
+// and == to be a hashset element.
+enum LeakColor : int { LC_Red, LC_Green, LC_Blue };
+struct LeakName { string n = default; int hash() { return (int)n.length(); } };
+bool operator==(LeakName a, LeakName b) { return a.n == b.n; }
+
+// `unique T*` field: the struct owns the raw pointer and the SYNTHESIZED destructor frees it.
+// Without the keyword these leak - an unmarked pointer field is never auto-freed.
+struct LeakPayload { list<int> nums = default; };
+struct LeakUnique  { unique LeakPayload* slot = nullptr; };
+// Nested: freeing the outer field runs LeakUnique's synthesized dtor, which frees its own field.
+struct LeakUniqueOuter { unique LeakUnique* inner = nullptr; };
+
+// `unique` on an INTERFACE field: ownership rides the contract, because a store through the
+// interface's byte-offset slot is dispatched dynamically and cannot see the concrete type.
+// Both sides must declare it (err_unique_iface_field_impl_only / _iface_only).
+interface ILeakSlot
+{
+    unique LeakPayload* slot;
+};
+
+class LeakIfaceBox : ILeakSlot
+{
+    unique LeakPayload* slot = nullptr;
+};
+
+// Reassign through the interface slot. The old pointee - and its list<int> buffer - must be
+// freed here; a store that only overwrote the slot would orphan them silently.
+void leakStoreViaIface(ILeakSlot h, int v)
+{
+    h.slot = new LeakPayload();
+    h.slot->nums.add(v);
+}
 
 // Function-type alias: ownership/clone/free flow through the alias exactly as through the
 // underlying Lambda<int(int)>, so clone-by-default reassignment must not leak.
@@ -217,6 +260,29 @@ extern int main()
         total++; passed += Test("clear count", ls.count(), 0);
         ls.add("reused");                  // reuse the kept backing buffer after clear
         total++; passed += Test("reuse after clear", ls.get(0), "reused");
+    }
+
+    // === Fixed-array LOCAL elements are destructed (all N, not just element [0]) ===
+    // `SBox[3] a;` default-constructs every element, so every element's owning string must be
+    // freed at scope exit. The scope-exit destructor used to fire once on the array BASE pointer,
+    // freeing element [0] only and leaking the rest. Concatenations force genuinely owned buffers
+    // (a literal is borrowed and would free as a no-op, hiding the leak).
+    {
+        LeakRow[3] a;
+        a[0].name = "aa" + "bb";
+        a[1].name = "cc" + "dd";
+        a[2].name = "ee" + "ff";
+        total++; passed += Test("fixed-array elem [1] live", a[1].name, "ccdd");
+        total++; passed += Test("fixed-array elem [2] live", a[2].name, "eeff");
+    }
+
+    // Multi-dimensional arrays are contiguous, so all N*M owning elements must be freed too.
+    {
+        LeakRow[2][3] m;
+        m[0][0].name = "gg" + "hh";
+        m[1][2].name = "ii" + "jj";
+        total++; passed += Test("fixed-array multidim first", m[0][0].name, "gghh");
+        total++; passed += Test("fixed-array multidim last", m[1][2].name, "iijj");
     }
 
     // === Bug 3a: dictionary<string,string> overwrite/add move the value (no double free) ===
@@ -660,6 +726,202 @@ extern int main()
         // holder.get(1) is an `alias` borrow of the slot: counting through it must not free it.
         total++; passed += Test("alias temp receiver borrowed", holder.get(1).count(), 2);
         total++; passed += Test("alias temp receiver source live", holder.get(1).get(0), "p");
+    }
+
+    // === `unique` field ownership: the synthesized destructor frees the pointee ===
+    // Both the pointer BLOCK and the pointee's own owning fields must go; the oracle below
+    // is what proves it (dropping `unique` from LeakUnique.slot makes it fail).
+    {
+        LeakUnique u = default;
+        u.slot = new LeakPayload();
+        u.slot->nums.add(7);
+        total++; passed += Test("unique field live", u.slot->nums.count(), 1);
+
+        LeakUniqueOuter o = default;
+        o.inner = new LeakUnique();
+        o.inner->slot = new LeakPayload();
+        o.inner->slot->nums.add(8);
+        total++; passed += Test("unique nested field live", o.inner->slot->nums.get(0), 8);
+    }
+
+    // === Stage 2: reassigning a `unique` field frees the old pointee ===
+    // The leak oracle below is the only thing that proves this - a reassignment that merely
+    // overwrote the slot would orphan 32 payloads (and their list<int> buffers) silently.
+    {
+        LeakUnique u = default;
+        for (int i = 0; i < 32; i++)
+        {
+            u.slot = new LeakPayload();
+            u.slot->nums.add(i);
+        }
+        total++; passed += Test("unique reassign live", u.slot->nums.get(0), 31);
+
+        // Releasing via nullptr frees the last pointee early; teardown then finds null.
+        u.slot = nullptr;
+        total++; passed += Test("unique nullptr release", u.slot == nullptr, true);
+    }
+
+    // === Stage 3: `move` out of a `unique` field transfers ownership to the local ===
+    // The sanctioned extraction (a plain copy is rejected - err_unique_delete_alias). The move
+    // nulls the field, so exactly one owner frees: `delete owned` here, and teardown finds null.
+    // The oracle proves both halves - a lost `move` would leak, a double-free would abort.
+    {
+        LeakUnique u = default;
+        u.slot = new LeakPayload();
+        u.slot->nums.add(9);
+
+        LeakPayload* owned = move u.slot;
+        total++; passed += Test("unique move-out field nulled", u.slot == nullptr, true);
+        total++; passed += Test("unique move-out payload intact", owned->nums.get(0), 9);
+        delete owned;
+    }
+
+    // === Brace-init of a `unique` field: the second field-store path owns identically ===
+    // EmitOneFieldInit constructs a fresh slot, so it takes no reassign-free - the oracle proves
+    // the field still ends up the sole owner and frees at teardown (a lost store would leak).
+    {
+        LeakUnique u = { slot = new LeakPayload() };
+        u.slot->nums.add(4);
+        total++; passed += Test("unique brace-init live", u.slot->nums.get(0), 4);
+    }
+
+    // === Brace-init `move` of an owning STRING into a field: transfer, not deep-copy ===
+    // Regression for the brace-init/`=` parity class (instance #8): the second field-store path
+    // deep-copied a `move`d string while the move had already suppressed the source's destructor,
+    // orphaning the original buffer. The oracle (reportLeaks == 0) is what catches it; the plain
+    // `s = b` case below still deep-copies (source stays usable), so both spellings are exercised.
+    {
+        string a = "hel" + "lo";
+        ArrSBox mv = { s = move a };
+        total++; passed += Test("brace-init move-string value intact", mv.s == "hello", true);
+
+        string b = "wor" + "ld";
+        ArrSBox cp = { s = b };
+        total++; passed += Test("brace-init copy-string field intact", cp.s == "world", true);
+        total++; passed += Test("brace-init copy-string source intact", b == "world", true);
+    }
+
+    // === `move` between two `unique` fields: one owner throughout ===
+    // The plain copy is rejected (err_unique_field_to_field); this pins that the sanctioned
+    // spelling still transfers - a double-free would abort, a lost move would leak.
+    {
+        LeakUnique a = default;
+        LeakUnique c = default;
+        a.slot = new LeakPayload();
+        a.slot->nums.add(6);
+        c.slot = move a.slot;
+        total++; passed += Test("unique field-to-field move source nulled", a.slot == nullptr, true);
+        total++; passed += Test("unique field-to-field move payload intact", c.slot->nums.get(0), 6);
+    }
+
+    // === `unique` field reached through an INTERFACE's byte-offset slot ===
+    // The store site binds the flag from the interface's field declaration, so the reassign-free
+    // fires there too. The oracle is what proves it: before the contract carried `unique`, these
+    // 32 payloads (and their list<int> buffers) were orphaned one store at a time.
+    {
+        LeakIfaceBox b;
+        for (int i = 0; i < 32; i++)
+            leakStoreViaIface(b, i);
+        total++; passed += Test("unique iface-slot reassign live", b.slot->nums.get(0), 31);
+
+        // Release early through the interface slot; teardown then finds null (no double-free).
+        b.slot = nullptr;
+        total++; passed += Test("unique iface-slot nullptr release", b.slot == nullptr, true);
+    }
+
+    // === Container copy() element semantics (moves-or-shares-elements fix) ===
+    // Each container's copy() must leave a value-type source intact (deep copy), transfer an
+    // OWNED pointer element to the copy (source slot nulled - a shared pointee would double-free
+    // at teardown), and copy an enum element bitwise. The leak oracle below proves no leak /
+    // no double-free across all of it.
+    {
+        // list<owning-struct>: source survives, copy independent (was: source EMPTIED by a move).
+        list<LeakRow> ls = default;
+        LeakRow lr = default; lr.name = "aa" + "bb"; ls.add(move lr);
+        list<LeakRow> lsCopy = ls.copy();
+        total++; passed += Test("list<struct> copy source intact", ls.get(0).name, "aabb");
+        total++; passed += Test("list<struct> copy independent",   lsCopy.get(0).name, "aabb");
+
+        // list<int*>: the list OWNS its pointers, so copy() MOVES each (source slot nulled, copy owns).
+        list<int*> lp = default;
+        int* p0 = new int; *p0 = 7; lp.add(p0);
+        list<int*> lpCopy = lp.copy();
+        int* lpElem = lpCopy.get(0);
+        total++; passed += Test("list<ptr> copy transfers ownership", lp.get(0) == nullptr, true);
+        total++; passed += Test("list<ptr> copy owns pointee",        *lpElem, 7);
+
+        // list<enum>: element copy is bitwise; source and copy both hold the value (was: build failed).
+        list<LeakColor> lc = default; lc.add(LeakColor.LC_Green); lc.add(LeakColor.LC_Blue);
+        list<LeakColor> lcCopy = lc.copy();
+        total++; passed += Test("list<enum> copy source intact", (i64)lc.get(1), (i64)LeakColor.LC_Blue);
+        total++; passed += Test("list<enum> copy value",         (i64)lcCopy.get(0), (i64)LeakColor.LC_Green);
+
+        // dictionary<int, owning-struct>: the STATUS_HEAP_CORRUPTION case - now deep-copies (independent).
+        dictionary<int, LeakRow> dm = default;
+        LeakRow dv = default; dv.name = "cc" + "dd"; dm.set(1, move dv);
+        dictionary<int, LeakRow> dmCopy = dm.copy();
+        total++; passed += Test("dict<struct> copy source intact", dm.get(1).name, "ccdd");
+        total++; passed += Test("dict<struct> copy independent",   dmCopy.get(1).name, "ccdd");
+
+        // dictionary<int, int*>: the dict OWNS value pointers, so copy() MOVES them (source value nulled).
+        dictionary<int, int*> dp = default;
+        int* dpp = new int; *dpp = 9; dp.set(2, dpp);
+        dictionary<int, int*> dpCopy = dp.copy();
+        int* dpElem = dpCopy.get(2);
+        total++; passed += Test("dict<ptr-value> copy transfers ownership", dp.get(2) == nullptr, true);
+        total++; passed += Test("dict<ptr-value> copy owns pointee",        *dpElem, 9);
+
+        // hashset<owning-struct>: deep-copied into the slot and freed at teardown (no leak, source intact).
+        hashset<LeakName> hn = default;
+        LeakName nm = default; nm.n = "ee" + "ff"; hn.add(nm);
+        total++; passed += Test("hashset<struct> source intact",  nm.n, "eeff");
+        total++; passed += Test("hashset<struct> contains copy",  hn.contains(nm), true);
+    }
+
+    // === Whole-struct assignment through a pointer deref (`*pc = *pa`) auto-moves ===
+    // A shallow bitwise store used to alias owned buffers (both dtors free -> double-free) and
+    // orphan the destination's old value (leak). The deref lvalue is now recognized as an owning
+    // destination: the old destination is destructed, the source moved in, and the source zeroed
+    // so its dtor is a no-op. The leak oracle below proves single-owner freedom for both a `unique`
+    // pointer field and a plain owning `string` field (the hole was general, not `unique`-specific).
+    {
+        LeakUnique a = default;
+        LeakUnique c = default;
+        a.slot = new LeakPayload(); a.slot->nums.add(41);
+        c.slot = new LeakPayload(); c.slot->nums.add(99);   // c's old payload must be freed on the store
+        LeakUnique* pa = &a;
+        LeakUnique* pc = &c;
+        *pc = *pa;                                          // move a's payload into c; a.slot zeroed
+        total++; passed += Test("deref-assign unique source zeroed", a.slot == nullptr, true);
+        total++; passed += Test("deref-assign unique dest owns moved", c.slot->nums.get(0), 41);
+
+        LeakRow sa = default;
+        LeakRow sc = default;
+        sa.name = "de" + "ref";                             // owned "deref"
+        sc.name = "ol" + "d";                               // owned "old" - freed on the store
+        LeakRow* spa = &sa;
+        LeakRow* spc = &sc;
+        *spc = *spa;                                        // move sa.name into sc; sa.name zeroed
+        total++; passed += Test("deref-assign string dest owns moved", sc.name, "deref");
+        total++; passed += Test("deref-assign string source zeroed", sa.name.length(), 0);
+    }
+
+    // === Owning fixed-array FIELD: full destruction + independent deep copy ===
+    // The synthesized destructor walks all N elements; the memberwise copy deep-copies each, so a
+    // .copy() is independent and both structs free every element exactly once. Multi-dim exercises
+    // the flattened walk. Before the fix the whole array field was skipped (leak); a naive walk
+    // without the deep copy turned it into a .copy() double-free (the leak oracle catches both).
+    {
+        ArrHolder h = default;
+        h.items[0].s = "aa" + "bb";
+        h.items[1].s = "cc" + "dd";
+        h.items[2].s = "ee" + "ff";
+        ArrHolder h2 = h.copy();
+        h2.items[0].s = "zz" + "yy";                        // mutate copy; original must be intact
+        total++; passed += Test("arr-field copy independent (src)", h.items[0].s, "aabb");
+        total++; passed += Test("arr-field copy independent (dst)", h2.items[0].s, "zzyy");
+        total++; passed += Test("arr-field copy element 2",         h2.items[2].s, "eeff");
+        // h and h2 destruct here - every owned element must free exactly once (oracle below).
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

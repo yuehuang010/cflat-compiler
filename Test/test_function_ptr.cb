@@ -597,6 +597,62 @@ bool testCaptureStructRef()
     return result;
 }
 
+// Regression: a by-reference capture is a BORROW - the source's own scope exit is the single
+// owner. The invoker used to register the capture as an ordinary struct local, so its scope-exit
+// destructor ran through the borrowed pointer and EVERY call destructed the caller's struct.
+// A pointer field is what forces the by-reference path (ClosureCaptureDeepCopyable bails on it).
+int refCapCountOnlyDtors = 0;
+int refCapOwningDtors = 0;
+struct RefCapNode { int v = 0; };
+
+// Counting-only dtor: isolates the call-count multiplication without a real double-free.
+struct RefCapCounted
+{
+    RefCapNode* slot = nullptr;
+    ~RefCapCounted() { refCapCountOnlyDtors++; }
+};
+
+// The real owning shape (json.cb / ComPtr): deletes and does NOT null. This is the variant
+// that actually double-freed - a dtor that nulls masks the bug.
+struct RefCapOwning
+{
+    RefCapNode* slot = nullptr;
+    ~RefCapOwning() { refCapOwningDtors++; if (slot != nullptr) delete slot; }
+};
+
+bool testCaptureStructRefBorrows()
+{
+    bool result = true;
+
+    // Counting-only: 3 calls must not multiply the destructor (was 3 in-body + 1 at exit = 4).
+    refCapCountOnlyDtors = 0;
+    {
+        RefCapNode n = default;
+        RefCapCounted h = default;
+        h.slot = &n;
+        Lambda<int()> f = () => { return h.slot->v; };
+        f(); f(); f();
+        result &= Test("borrowed capture not destructed while live", refCapCountOnlyDtors, 0);
+    }
+    result &= Test("borrowed capture destructed once", refCapCountOnlyDtors, 1);
+
+    // Real owning shape: reads stay valid across calls and the pointee is freed exactly once.
+    refCapOwningDtors = 0;
+    {
+        RefCapOwning h = default;
+        h.slot = new RefCapNode();
+        h.slot->v = 3;
+        Lambda<int()> f = () => { return h.slot->v; };
+        result &= Test("owning borrow read 1", f(), 3);
+        result &= Test("owning borrow read 2", f(), 3);   // was a use-after-free: call 1 freed slot
+        result &= Test("owning borrow read 3", f(), 3);
+        result &= Test("owning borrow live dtors", refCapOwningDtors, 0);
+    }
+    result &= Test("owning borrow freed once", refCapOwningDtors, 1);
+
+    return result;
+}
+
 // Owning value type captured by an ESCAPING closure must be DEEP-COPIED into the env so
 // the closure owns an independent buffer that outlives the source scope. Before the fix,
 // list/dictionary/owning-struct captures were shallow by-reference and dangled (UAF under
@@ -1503,6 +1559,121 @@ bool testSugarLambdaAttrReturnType()
     return result;
 }
 
+// A by-reference capture is marked as a borrow to stop the env destructing the caller's value.
+// That marking lands on every struct that is not deep-copyable - which includes plain PODs. A POD
+// copy owns nothing and cannot dangle, so storing a captured POD into a field must stay legal:
+// the borrow-into-field reject applies only to pointers and owning value types.
+struct CapPoint  { int x = 0; int y = 0; };
+struct CapHolder { CapPoint p = default; };
+
+bool testClosureCapturedPodIntoField()
+{
+    bool result = true;
+
+    CapPoint src = default;
+    src.x = 5;
+    src.y = 9;
+
+    Lambda<int()> f = () => { CapHolder h = default; h.p = src; return h.p.x + h.p.y; };
+    result &= Test("captured POD stored into field", f(), 14);
+
+    // The capture borrows: the source is untouched and still readable after the call.
+    result &= Test("captured POD source intact", src.x, 5);
+    return result;
+}
+
+// Brace-init of a closure FIELD from a named source. Brace-init is a SECOND, independent
+// field-store path, so it must auto-clone the env exactly as the `=` store does (Option A
+// clone-by-default). Aliasing it instead left the source local and the field owning one env,
+// which the source's scope-exit destructor then freed under the field (use-after-free).
+struct BraceClosureBox { Lambda<int(int)> f = default; };
+
+bool testClosureBraceInitClonesEnv()
+{
+    bool result = true;
+
+    int cap = 7;
+    Lambda<int(int)> src = (int x) => { return x + cap; };
+    BraceClosureBox b = { f = src };
+
+    result &= Test("brace-init closure field call", b.f(1), 8);
+    // The clone is independent: the source is still live and callable after the store.
+    result &= Test("brace-init closure source intact", src(2), 9);
+    return result;
+}
+
+// A nested (inner) lambda that references a local of the ENCLOSING FUNCTION reaches it
+// TRANSITIVELY through the outer lambda. The outer lambda must capture it too, so the inner
+// closure reads it out of the outer env (which dominates in the outer body) rather than the
+// enclosing function's alloca (which does not) - previously a module-verification failure.
+// See internal/issue/nested-closure-transitive-capture-verify-failure.md.
+struct NestPair { int a = 0; int b = 0; };
+
+bool testNestedClosureTransitiveCapture()
+{
+    bool result = true;
+
+    // Inner captures an enclosing-function primitive local.
+    int o = 2;
+    Lambda<int()> g = () => { Lambda<int()> h = () => { return o; }; return h(); };
+    result &= Test("nested transitive capture int", g(), 2);
+
+    // Inner captures an enclosing struct local (by value).
+    NestPair p = default; p.a = 7; p.b = 3;
+    Lambda<int()> gs = () => { Lambda<int()> h = () => { return p.a + p.b; }; return h(); };
+    result &= Test("nested transitive capture struct", gs(), 10);
+
+    // Three levels deep: the capture bubbles up one frame at a time.
+    int q = 4;
+    Lambda<int()> g3 = () => {
+        Lambda<int()> h3 = () => { Lambda<int()> i3 = () => { return q * 10; }; return i3(); };
+        return h3();
+    };
+    result &= Test("nested transitive capture 3-level", g3(), 40);
+
+    // Inner captures the OUTER lambda's own parameter (no enclosing-function frame involved).
+    Lambda<int(int)> gp = (int base) => { Lambda<int()> h = () => { return base * 2; }; return h(); };
+    result &= Test("nested capture outer param", gp(21), 42);
+
+    // Inner captures NOTHING from the outer scope - the outer lambda gets no transitive capture.
+    Lambda<int()> gn = () => { Lambda<int()> h = () => { return 5; }; return h(); };
+    result &= Test("nested no-capture", gn(), 5);
+
+    return result;
+}
+
+// A lambda PARAMETER whose name matches a local (or parameter) of the ENCLOSING function must
+// shadow it: references inside the lambda resolve to the parameter, not the enclosing binding.
+// Resolving to the enclosing alloca produced a module-verification failure (the inner function
+// loaded storage that does not dominate). See internal/issue (lambda-param-shadows-enclosing-local).
+int shadowOuter(int o) { Lambda<int(int)> h = (int o) => { return o + 1; }; return h(41); }
+
+bool testLambdaParamShadowsEnclosing()
+{
+    bool result = true;
+
+    // Param shadows an enclosing LOCAL of the same name.
+    int o = 99;
+    Lambda<int(int)> h = (int o) => { return o + 1; };
+    result &= Test("lambda param shadows enclosing local", h(41), 42);
+
+    // Param shadows an enclosing PARAMETER of the same name.
+    result &= Test("lambda param shadows enclosing param", shadowOuter(999), 42);
+
+    // Nested: the inner lambda's param shadows the enclosing-function local; the outer lambda
+    // must not transitively capture the (shadowed) name.
+    int q = 7;
+    Lambda<int()> g = () => { Lambda<int(int)> hi = (int q) => { return q + 1; }; return hi(41); };
+    result &= Test("nested lambda param shadows enclosing local", g(), 42);
+
+    // A same-named enclosing local is still captured normally when NOT shadowed by a param.
+    int base = 100;
+    Lambda<int(int)> cap = (int x) => { return x + base; };
+    result &= Test("no-shadow capture still works", cap(42), 142);
+
+    return result;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1538,6 +1709,7 @@ extern int main()
     total++; passed += testCapturePrimitives()         ? 1 : 0;
     total++; passed += testCaptureString()             ? 1 : 0;
     total++; passed += testCaptureStructRef()          ? 1 : 0;
+    total++; passed += testCaptureStructRefBorrows()   ? 1 : 0;
     total++; passed += testCaptureOwningContainerEscapes() ? 1 : 0;
     total++; passed += testCaptureMultiple()           ? 1 : 0;
     total++; passed += testCaptureRegression()         ? 1 : 0;
@@ -1546,6 +1718,8 @@ extern int main()
     total++; passed += testLambdaAllocaInLoop()        ? 1 : 0;
     total++; passed += testCaptureBondReassign()       ? 1 : 0;
     total++; passed += testCaptureThis()               ? 1 : 0;
+    total++; passed += testNestedClosureTransitiveCapture() ? 1 : 0;
+    total++; passed += testLambdaParamShadowsEnclosing()  ? 1 : 0;
     total++; passed += testInterfaceReturnWithLambda()  ? 1 : 0;
 
     // Generic function pointer tests
@@ -1591,6 +1765,12 @@ extern int main()
 
     // <Tag/> sugar: lambda attribute return-type inference
     total++; passed += testSugarLambdaAttrReturnType()  ? 1 : 0;
+
+    // By-reference capture of a POD stored into a field (must not be rejected as a borrow)
+    total++; passed += testClosureCapturedPodIntoField() ? 1 : 0;
+
+    // Brace-init of a closure field auto-clones the env, same as the `=` store
+    total++; passed += testClosureBraceInitClonesEnv()   ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

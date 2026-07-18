@@ -452,6 +452,7 @@ public:
         bool IsMove = false;     // parameter declared with 'move' - function takes ownership
         bool IsAlias = false;    // return/decl declared with 'alias' - by-value borrow; caller must not free the interior
         bool IsBond = false;     // parameter declared with 'bond' - return value borrows from this parameter; return must not outlive it
+        bool IsUnique = false;   // struct/interface field declared with 'unique' - the owner owns this raw pointer; the synthesized destructor deletes it. On an interface it is contract: every implementor must agree (VerifyInterfaceFields)
         CallingConv CallConv = CallingConv::Default; // calling convention for extern declarations (Stdcall/Cdecl; Default = compiler-chosen)
 
         // Function pointer fields (IsFunctionPointer == true)
@@ -703,6 +704,13 @@ public:
         bool IsBorrowed = false;         // compile-time: true for non-move pointer parameters and locals that alias one - 'delete' is forbidden
         bool IsAliasBorrow = false;      // compile-time: local bound from an `alias` return - shallow-aliases storage it does not own, so its scope-exit destructor is suppressed
         std::string BorrowedOrigin;      // name of the borrowed parameter this value transitively aliases (for diagnostics)
+        // Set to "Struct.field" when the borrow originates from a `unique` field rather than a
+        // borrowed parameter, so the delete/store diagnostics can name the real owner (Trap B).
+        std::string BorrowedUniqueField;
+        // True when this NamedVariable reads a `unique` field. A cast severs Storage and rewrites
+        // TypeAndValue, so this out-of-band flag preserves the field provenance the borrow rules
+        // key on (delete/move/store-into-field), keeping `(T*)b.p` a tracked alias.
+        bool IsUniqueFieldAlias = false;
         llvm::Value* RefCountStorage = nullptr; // lazy i32 alloca at function entry; non-null only when pointer escaped to a field
         std::string CallerName;          // the variable's name at the call site, for move tracking
         std::string OwningStructName;    // when this NamedVariable is a struct-field access, the field's owning struct
@@ -1767,6 +1775,31 @@ private:
         pendingOwnedStructTemps.clear();
     }
 
+    // Register a by-value owning-struct RVALUE temp passed as a BORROW argument for destruction at
+    // the end of the current full expression. A borrow param does not free it and it has no named
+    // owner, so without this it leaks its owned field(s) (e.g. a string). The caller gates on the
+    // param NOT being `move` (a move param transfers ownership to the callee). The temp is
+    // identified exactly as the owned-STRING arg path (see RegisterOwnedStringTemp at the arg site):
+    // a `CallInst` result is a freshly produced value with no named owner, whereas a named local
+    // (loaded value) is freed by its own scope dtor - registering it would DOUBLE-FREE. That
+    // distinction is essential because an operator operand reaches here with Storage cleared, so
+    // Storage alone cannot tell a named operand from a temp. Alias/pointer/string/closure values and
+    // fields of an already-registered owning temp (FromOwningTempField) run their own paths.
+    void RegisterBorrowedOwningStructTemp(const NamedVariable& arg)
+    {
+        const std::string& typeName = arg.TypeAndValue.TypeName;
+        if (arg.Primary == nullptr || arg.Storage != nullptr || arg.BaseType == nullptr) return;
+        if (!llvm::isa<llvm::CallInst>(arg.Primary)) return;   // only a produced temp, not a named local
+        if (!arg.BaseType->isStructTy() || arg.Primary->getType() != arg.BaseType) return;
+        if (arg.TypeAndValue.Pointer || arg.TypeAndValue.IsAlias || arg.FromOwningTempField) return;
+        if (typeName.empty() || typeName == "string" || typeName == "__closure_fat_ptr") return;
+        if (!IsOwningValueType(typeName)) return;
+
+        auto* tempAlloca = AllocaAtEntry(arg.BaseType, nullptr, "argtemp");
+        builder->CreateStore(arg.Primary, tempAlloca);
+        RegisterOwnedStructTemp(tempAlloca, typeName);
+    }
+
     // Free all unnamed owned temporaries (string, closure, struct) at an end-of-full-expression
     // boundary. The return path keeps the three explicit (it interleaves Unregister between them).
     void FlushOwnedTemps()
@@ -1817,8 +1850,8 @@ private:
                     if (namedVar.BorrowsOwnedString || namedVar.IsAliasBorrow) continue;
                     EnsureStringDtorRegistered();
                     if (it->second.Destructor == nullptr) continue;
-                    auto* fn = it->second.Destructor;
-                    builder->CreateCall(fn->getFunctionType(), fn, { namedVar.Storage });
+                    EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType,
+                                                  it->second.Destructor);
                     continue;
                 }
                 // Non-string struct local: run the full destructor (user dtor + members).
@@ -1826,8 +1859,9 @@ private:
                 if (namedVar.IsAliasBorrow) continue;
                 // Skip the struct value being moved out via `return` - the caller now owns it.
                 if (namedVar.Storage == returnedStructDtorSkipAlloca) continue;
+                // A fixed-array local (`T[N] a;`) owns every element - destruct all N.
                 if (auto* fn = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
-                    builder->CreateCall(fn->getFunctionType(), fn, { namedVar.Storage });
+                    EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, fn);
             }
         }
 
@@ -2647,7 +2681,8 @@ private:
     // immediate binding site, but a copy that escapes that tracking (e.g. a for-in loop variable)
     // is still destructed - clearing the runtime bit makes that destructor a safe no-op, mirroring
     // what ClearStringOwnedBit already does for a scalar string borrow return. Pointer/view/simd/
-    // bitfield/fixed-array fields carry no value-level owned bit and are left untouched (matches the
+    // bitfield fields carry no value-level owned bit and are left untouched. An owning fixed-array
+    // value field IS cleared element-by-element (FULLY-LIVE contract, in lockstep with the
     // destructor and memberwise-copy field selection).
     llvm::Value* ClearStructOwnedBits(llvm::Value* value, const std::string& typeName)
     {
@@ -2663,7 +2698,37 @@ private:
             if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield || f.IsPadding)
                 continue;
             if (f.ConstArraySize > 0)
+            {
+                // Owning fixed-array value field: clear the owned bit on every element so an
+                // escaped shallow borrow does not free buffers the container still owns. Spill to
+                // memory and walk (a pointer walk handles multi-dimensional + large N; ExtractValue
+                // would need constant per-dimension indices and could not loop).
+                if (f.TypeName != "string" && !IsOwningValueType(f.TypeName))
+                    continue;
+                llvm::Type* fieldTy = structTy->getElementType(i);
+                llvm::Type* elemTy = nullptr;
+                uint64_t n = PeelFixedArrayType(fieldTy, elemTy);
+                auto* slot = AllocaAtEntry(fieldTy, nullptr, "fbarr.slot");
+                builder->CreateStore(builder->CreateExtractValue(value, { i }, "fbarr.fld"), slot);
+                EmitFixedArrayElementWalk(*builder, slot, elemTy, n, [&](llvm::Value* elemPtr) {
+                    if (f.TypeName == "string")
+                    {
+                        auto* strTy  = llvm::StructType::getTypeByName(*context, "string");
+                        auto* lenPtr = builder->CreateStructGEP(strTy, elemPtr, 1, "fbarr.lenp");
+                        auto* len    = builder->CreateLoad(builder->getInt32Ty(), lenPtr, "fbarr.len");
+                        auto* masked = builder->CreateAnd(len, builder->getInt32(0x7FFFFFFF), "fbarr.noown");
+                        builder->CreateStore(masked, lenPtr);
+                    }
+                    else
+                    {
+                        auto* sub = builder->CreateLoad(elemTy, elemPtr, "fbarr.sub");
+                        builder->CreateStore(ClearStructOwnedBits(sub, f.TypeName), elemPtr);
+                    }
+                });
+                auto* reloaded = builder->CreateLoad(fieldTy, slot, "fbarr.reload");
+                value = builder->CreateInsertValue(value, reloaded, { i }, "fbarr.set");
                 continue;
+            }
             if (f.TypeName == "string")
             {
                 auto* len    = builder->CreateExtractValue(value, { i, 1u }, "fborrow.len");
@@ -2678,6 +2743,129 @@ private:
             }
         }
         return value;
+    }
+
+    // Above this element count a fixed array's per-element work (default-init, destruction) is
+    // emitted as a runtime loop instead of unrolled, so a large `T[1000000]` stays O(1) IR.
+    static constexpr uint64_t kMaxUnrolledArrayElements = 16;
+
+    /*
+     * Peel a fixed array's LLVM type down to its innermost element type and return the total
+     * element count ([N x [M x T]] -> T, N*M). Multi-dimensional arrays are contiguous, so a flat
+     * walk of that count reaches every element. Returns 0 for a non-array type, leaving `elemTy`
+     * untouched. Derived from the LLVM type rather than the declaration's dimensions so an array
+     * alias (`using Vec3 = float[3];`), whose dims never reach ConstArraySize, is covered too.
+     */
+    static uint64_t PeelFixedArrayType(llvm::Type* ty, llvm::Type*& elemTy)
+    {
+        auto* arrTy = llvm::dyn_cast_or_null<llvm::ArrayType>(ty);
+        if (arrTy == nullptr) return 0;
+        uint64_t n = 1;
+        while (arrTy != nullptr)
+        {
+            n *= arrTy->getNumElements();
+            elemTy = arrTy->getElementType();
+            arrTy = llvm::dyn_cast<llvm::ArrayType>(elemTy);
+        }
+        return n;
+    }
+
+    /*
+     * Walk the `n` contiguous elements of the fixed array at `base`, invoking `emitElem` on each
+     * element pointer. Small arrays are unrolled; above kMaxUnrolledArrayElements a runtime loop
+     * keeps the IR O(1) in N. The loop counter is a phi, so no alloca lands in the loop body (see
+     * AllocaAtEntry). Drives the caller's builder, so this serves both the main codegen builder
+     * and the local builder inside a synthesized destructor.
+     */
+    void EmitFixedArrayElementWalk(llvm::IRBuilder<>& b, llvm::Value* base, llvm::Type* elemTy,
+                                   uint64_t n, const std::function<void(llvm::Value*)>& emitElem)
+    {
+        if (base == nullptr || elemTy == nullptr || n == 0) return;
+
+        if (n <= kMaxUnrolledArrayElements)
+        {
+            for (uint64_t i = 0; i < n; i++)
+                emitElem(b.CreateInBoundsGEP(elemTy, base, { b.getInt64(i) }, "arrelem"));
+            return;
+        }
+
+        auto* fn = b.GetInsertBlock()->getParent();
+        auto* preBB  = b.GetInsertBlock();
+        auto* loopBB = llvm::BasicBlock::Create(*context, "arrwalk.loop", fn);
+        auto* doneBB = llvm::BasicBlock::Create(*context, "arrwalk.done", fn);
+        b.CreateBr(loopBB);
+
+        b.SetInsertPoint(loopBB);
+        auto* idx = b.CreatePHI(b.getInt64Ty(), 2, "arrwalk.i");
+        idx->addIncoming(b.getInt64(0), preBB);
+        emitElem(b.CreateInBoundsGEP(elemTy, base, { idx }, "arrelem"));
+        auto* next = b.CreateAdd(idx, b.getInt64(1), "arrwalk.next");
+        idx->addIncoming(next, b.GetInsertBlock());
+        b.CreateCondBr(b.CreateICmpULT(next, b.getInt64(n)), loopBB, doneBB);
+        b.SetInsertPoint(doneBB);
+    }
+
+    /*
+     * Call `dtor` on `storage`: once when it holds a scalar, once per element when it holds a
+     * fixed array. `T[N] a;` owns all N elements - calling the destructor on the base pointer
+     * alone destructs element [0] and leaks the rest. Elements are destructed in declaration
+     * order, matching the synthesized destructor's field order.
+     */
+    void EmitFullDestructorOverStorage(llvm::IRBuilder<>& b, llvm::Value* storage,
+                                       llvm::Type* storageTy, llvm::Function* dtor)
+    {
+        if (storage == nullptr || dtor == nullptr) return;
+        auto callDtor = [&](llvm::Value* p) { b.CreateCall(dtor->getFunctionType(), dtor, { p }); };
+        llvm::Type* elemTy = nullptr;
+        uint64_t n = PeelFixedArrayType(storageTy, elemTy);
+        if (n == 0)
+            callDtor(storage);
+        else
+            EmitFixedArrayElementWalk(b, storage, elemTy, n, callDtor);
+    }
+
+    // `unique T* field`: null-checked delete of the pointee. Emitted into the synthesized
+    // .dtorfull wrapper at teardown, and (with `replacement` set) ahead of a reassignment store,
+    // so a field is freed identically on both paths. Mirrors EmitOwningPtrCleanup but drives the
+    // caller's local builder.
+    //
+    // `replacement` is the pointer about to be stored: when the field already holds it, this is a
+    // self-assign and the free is skipped (freeing would leave the store dangling). The test is at
+    // runtime because the spellings that reach here - `h->slot = h->slot`, a bare `item = item`
+    // inside a method (whose NamedVariable carries no FieldName), a source that merely aliases the
+    // field - are not all distinguishable by name at the assignment site. Pass null at teardown,
+    // where there is no incoming value.
+    void EmitUniqueFieldDelete(llvm::IRBuilder<>& b, llvm::Value* fieldPtr,
+                               llvm::Function* pointeeDtor, const std::string& typeName,
+                               uint64_t allocAlign, llvm::Value* replacement = nullptr)
+    {
+        auto* ptrTy = llvm::PointerType::get(*context, 0);
+        auto* ptrVal = b.CreateLoad(ptrTy, fieldPtr, "uq.ptr");
+        auto* skip = b.CreateICmpEQ(ptrVal, llvm::ConstantPointerNull::get(ptrTy), "uq.isnull");
+        if (replacement != nullptr && replacement->getType() == ptrTy)
+            skip = b.CreateOr(skip, b.CreateICmpEQ(ptrVal, replacement, "uq.same"), "uq.skip");
+        auto* fn = b.GetInsertBlock()->getParent();
+        auto* deleteBB = llvm::BasicBlock::Create(*context, "uq.delete", fn);
+        auto* afterBB  = llvm::BasicBlock::Create(*context, "uq.after", fn);
+        b.CreateCondBr(skip, afterBB, deleteBB);
+
+        b.SetInsertPoint(deleteBB);
+        if (pointeeDtor != nullptr)
+            b.CreateCall(pointeeDtor->getFunctionType(), pointeeDtor, { ptrVal });
+
+        // An over-aligned block came from the aligned allocator, so it must be freed via
+        // __delete_aligned to match - same rule as the `delete` site and EmitOwningPtrCleanup.
+        uint64_t effAlign = allocAlign;
+        TypeAndValue tv{ .TypeName = typeName };
+        if (llvm::Type* t = GetType(tv); t != nullptr && t->isSized())
+            effAlign = std::max(effAlign, GetEffectiveAlignmentForType(typeName, t));
+        llvm::Function* del = effAlign > kDefaultNewAlign ? GetFunction("__delete_aligned")
+                                                          : GetFunction("operator delete");
+        if (del != nullptr)
+            b.CreateCall(del->getFunctionType(), del, { ptrVal });
+
+        b.CreateBr(afterBB);
+        b.SetInsertPoint(afterBB);
     }
 
     llvm::Function* GetOrCreateFullDestructor(const std::string& typeName)
@@ -2717,19 +2905,35 @@ private:
         llvm::Function* userDtor = dsIt->second.Destructor;
 
         // Collect member fields that need destruction.
-        struct MemberWork { unsigned Index; llvm::Function* Dtor; };
+        struct MemberWork { unsigned Index; llvm::Function* Dtor; bool IsUniquePtr; std::string TypeName; uint64_t AllocAlign; };
         std::vector<MemberWork> work;
         for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
         {
             const auto& f = dsIt->second.StructFields[i];
+            // `unique T* field`: the struct owns the pointee. Unlike a value member this is
+            // pushed even when the pointee is trivially destructible - the block still needs freeing.
+            if (f.IsUnique && f.Pointer && !f.ElemPointer && !f.IsArrayView && !f.IsSimd
+                && !f.IsBitfield && !f.IsPadding && f.ConstArraySize == 0)
+            {
+                work.push_back({ i, GetFullDestructorForDelete(f.TypeName), true, f.TypeName, f.AllocAlignValue });
+                continue;
+            }
             if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield || f.IsPadding)
                 continue;
-            if (f.ConstArraySize > 0)   // fixed-array members: out of scope (rare), documented
+            // Owning fixed-array value field (`SBox items[3]`): the FULLY-LIVE contract requires
+            // every element be a live owned value, so destruct all N (EmitFullDestructorOverStorage
+            // below walks them). Pointer/view/simd/bitfield arrays never reach here - the field-shape
+            // skip above already caught them (e.g. btree_node's `children[17]` is a pointer array).
+            if (f.ConstArraySize > 0)
+            {
+                if (llvm::Function* elemDtor = GetOrCreateFullDestructor(f.TypeName))
+                    work.push_back({ i, elemDtor, false, f.TypeName, 0 });
                 continue;
+            }
             // `string` members ARE destructed: the owned bit in _len tells the dtor whether to free.
             // A borrowed string (literal/view; bit clear) is safely left alone by the dtor.
             if (llvm::Function* childDtor = GetOrCreateFullDestructor(f.TypeName))
-                work.push_back({ i, childDtor });
+                work.push_back({ i, childDtor, false, f.TypeName, 0 });
         }
 
         fullDestructorInProgress_.erase(typeName);
@@ -2762,7 +2966,11 @@ private:
         for (const auto& w : work)
         {
             auto* fieldPtr = b.CreateStructGEP(structTy, self, w.Index, "fld");
-            b.CreateCall(w.Dtor->getFunctionType(), w.Dtor, { fieldPtr });
+            if (w.IsUniquePtr)
+                EmitUniqueFieldDelete(b, fieldPtr, w.Dtor, w.TypeName, w.AllocAlign);
+            else
+                // Scalar field: one call; owning fixed-array field: one call per element.
+                EmitFullDestructorOverStorage(b, fieldPtr, structTy->getElementType(w.Index), w.Dtor);
         }
 
         b.CreateRetVoid();
@@ -2850,6 +3058,41 @@ private:
         if (dataStructures.find(typeName) == dataStructures.end())
             return false;
         return GetOrCreateFullDestructor(typeName) != nullptr;
+    }
+
+    // True when `typeName` owns a raw pointer via `unique` - directly, or through a by-value
+    // member that does. Such a type has no memberwise copy: cloning a `unique` field would need a
+    // generic deep-clone of the pointee, which does not exist, and a shallow copy would hand the
+    // same pointer to two synthesized destructors. `outPath` receives the offending field path
+    // (e.g. "h.slot") for diagnostics. Value-member cycles are impossible (infinite size), but
+    // `seen` guards defensively so a malformed registry cannot recurse forever.
+    bool TypeOwnsUniquePointer(const std::string& typeName, std::string* outPath = nullptr,
+                               std::unordered_set<std::string>* seen = nullptr) const
+    {
+        std::unordered_set<std::string> localSeen;
+        if (seen == nullptr) seen = &localSeen;
+        if (!seen->insert(typeName).second) return false;
+        auto it = dataStructures.find(typeName);
+        if (it == dataStructures.end()) return false;
+        for (const auto& f : it->second.StructFields)
+        {
+            if (f.IsUnique && f.Pointer && !f.ElemPointer)
+            {
+                if (outPath) *outPath = f.VariableName;
+                return true;
+            }
+            // Only by-value struct members can carry the claim onward; a pointer member is a
+            // borrow the copy shallow-shares by design.
+            if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield || f.IsPadding)
+                continue;
+            std::string sub;
+            if (TypeOwnsUniquePointer(f.TypeName, &sub, seen))
+            {
+                if (outPath) *outPath = f.VariableName + "." + sub;
+                return true;
+            }
+        }
+        return false;
     }
 
     bool HasCopyOverloadFor(const std::string& typeName) const
@@ -2970,7 +3213,24 @@ private:
             if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield || f.IsPadding)
                 continue;                       // pointer/view/simd/bitfield/pad: shallow (pointee shared)
             if (f.ConstArraySize > 0)
-                continue;                       // fixed-array members: out of scope (matches the dtor)
+            {
+                // Owning fixed-array value field: deep-copy every element so the copy is
+                // independent (FULLY-LIVE contract, in lockstep with the destructor).
+                if (!HasCopyOverloadFor(f.TypeName) && !IsOwningValueType(f.TypeName))
+                    continue;                   // POD element array: the shallow copy is correct
+                llvm::Type* elemTy = nullptr;
+                uint64_t n = PeelFixedArrayType(structTy->getElementType(i), elemTy);
+                auto* base = builder->CreateStructGEP(structTy, resultSlot, i, "fldarr");
+                EmitFixedArrayElementWalk(*builder, base, elemTy, n, [&](llvm::Value* elemPtr) {
+                    NamedVariable elemNV;
+                    elemNV.Storage  = elemPtr;
+                    elemNV.BaseType = elemTy;
+                    elemNV.TypeAndValue.TypeName = f.TypeName;
+                    if (auto* copied = CreateOverloadedFunctionCall("copy", { elemNV }))
+                        builder->CreateStore(copied, elemPtr);
+                });
+                continue;
+            }
             if (!HasCopyOverloadFor(f.TypeName) && !IsOwningValueType(f.TypeName))
                 continue;                       // POD field: the shallow copy is already correct
             auto* fieldPtr = builder->CreateStructGEP(structTy, resultSlot, i, "fld");
@@ -6362,6 +6622,10 @@ private:
             if (gIt == globalNamedVariable.end() || tIt == globalVariableTypes.end()) continue;
 
             const TypeAndValue& tv = tIt->second;
+            // A global that is DIRECTLY an owning fixed array (`SBox g[3];`) is still skipped: not
+            // part of the struct-field triad (dtor/copy/clear), and skipping only leaks at exit
+            // (OS reclaims) - never a double free. A scalar global whose struct type merely
+            // CONTAINS an owning array field is handled correctly by its now-array-aware full dtor.
             if (tv.Pointer || tv.IsArrayView || tv.IsInterface || tv.ConstArraySize > 0) continue;
             if (!IsOwningValueType(tv.TypeName)) continue;
             if (auto* dtor = GetOrCreateFullDestructor(tv.TypeName))
@@ -7425,6 +7689,19 @@ public:
         return s;
     }
 
+    // An interface method's parameter/return as declared, ownership qualifiers included, for
+    // diagnostics - so a message can quote the exact spelling the fix needs.
+    static std::string InterfaceMethodTypeText(const TypeAndValue& tv, const std::string& name = "")
+    {
+        std::string s;
+        if (tv.IsMove)  s += "move ";
+        if (tv.IsAlias) s += "alias ";
+        if (tv.IsBond)  s += "bond ";
+        s += InterfaceFieldTypeText(tv);
+        if (!name.empty()) s += " " + name;
+        return s;
+    }
+
     // Every field an interface declares must exist on the implementor with the same name and
     // type - the vtable slot carries that field's byte offset. Runs EAGERLY, at the class or
     // program definition, so the error points at the implementor and not at some later boxing
@@ -7456,6 +7733,152 @@ public:
                     implName, f.VariableName, InterfaceFieldTypeText(*impl), ifaceName,
                     InterfaceFieldTypeText(f)));
             }
+            // 'unique' is part of the field contract, not of the field's type: a store through the
+            // interface's byte-offset slot reads ownership from the INTERFACE, because dynamic
+            // dispatch leaves the concrete type unknown. Both directions of disagreement are heap
+            // bugs, so both are rejected - the same uniformity 'push(move T item)' already imposes.
+            if (impl->IsUnique != f.IsUnique)
+            {
+                if (impl->IsUnique)
+                    LogError(std::format(
+                        "class '{}' field '{}' is declared 'unique' but interface '{}' does not declare "
+                        "it 'unique' - a store through the interface's field slot would neither free the "
+                        "old pointee (it leaks) nor reject a borrow, which the class's synthesized "
+                        "destructor then frees. Declare the field 'unique {} {}' on interface '{}', or "
+                        "drop 'unique' from class '{}'.",
+                        implName, f.VariableName, ifaceName,
+                        InterfaceFieldTypeText(f), f.VariableName, ifaceName, implName));
+                else
+                    LogError(std::format(
+                        "class '{}' field '{}' is not declared 'unique' but interface '{}' declares it "
+                        "'unique' - a store through the interface's field slot would free the old pointee, "
+                        "which class '{}' does not own. Declare the field 'unique {} {}' on class '{}', or "
+                        "drop 'unique' from interface '{}'.",
+                        implName, f.VariableName, ifaceName, implName,
+                        InterfaceFieldTypeText(f), f.VariableName, implName, ifaceName));
+            }
+        }
+    }
+
+    /*
+     * An interface method's ownership qualifiers are contract, not local sugar. Virtual dispatch
+     * reads them from the INTERFACE - CallInterfaceMethod feeds the interface's Parameters to
+     * ApplyMoveParamTransfer and classifies the result from the interface's ReturnType - so the
+     * implementor's own spelling is never consulted at the call site. Both directions of
+     * disagreement are heap bugs, so both are rejected; the same rule VerifyInterfaceFields
+     * imposes on fields.
+     *
+     * Runs on the symbol overload resolution ALREADY selected (on TypeName/Pointer), so a
+     * violation names the real mismatch instead of claiming the method is missing. 'Pointer' is
+     * deliberately absent: it is a selection key in VerifyInterfaceImplementation's match loop,
+     * so a pointer mismatch is already reported there as "does not implement".
+     */
+    void VerifyInterfaceMethodContract(const std::string& implName, const std::string& ifaceName,
+                                       const InterfaceMethod& method, const FunctionSymbol& sym)
+    {
+        for (size_t i = 0; i < method.Parameters.size(); i++)
+        {
+            const auto& ip = method.Parameters[i];
+            const auto& cp = sym.Parameters[i + 1];   // Parameters[0] is the implicit 'this'
+            std::string pname = !cp.VariableName.empty() ? cp.VariableName
+                              : (!ip.VariableName.empty() ? ip.VariableName
+                                                          : std::format("#{}", i + 1));
+            if (cp.IsMove != ip.IsMove)
+            {
+                if (ip.IsMove)
+                    LogError(std::format(
+                        "class '{}' method '{}': parameter '{}' is not declared 'move' but interface "
+                        "'{}' declares it 'move' - a call through the interface transfers ownership of "
+                        "the argument, so the caller stops freeing it while class '{}' never takes it "
+                        "over (the argument leaks). Declare the parameter '{}' on class '{}', or drop "
+                        "'move' from interface '{}'.",
+                        implName, method.Name, pname, ifaceName, implName,
+                        InterfaceMethodTypeText(ip, pname), implName, ifaceName));
+                else
+                    LogError(std::format(
+                        "class '{}' method '{}': parameter '{}' is declared 'move' but interface '{}' "
+                        "does not declare it 'move' - a call through the interface does not transfer "
+                        "ownership, so the caller still frees the argument that class '{}' has already "
+                        "taken over (a double free). Drop 'move' from class '{}', or declare the "
+                        "parameter '{}' on interface '{}'.",
+                        implName, method.Name, pname, ifaceName, implName, implName,
+                        InterfaceMethodTypeText(cp, pname), ifaceName));
+            }
+            // 'bond' and 'move' are mutually exclusive, so report only the more severe disagreement.
+            else if (cp.IsBond != ip.IsBond)
+            {
+                LogError(std::format(
+                    "class '{}' method '{}': parameter '{}' is declared '{}' but interface '{}' "
+                    "declares it '{}' - 'bond' is part of the method's contract, and a call through "
+                    "the interface reads the contract from the interface, so the borrow the two "
+                    "disagree about would go untracked. Make the two declarations agree.",
+                    implName, method.Name, pname, InterfaceMethodTypeText(cp), ifaceName,
+                    InterfaceMethodTypeText(ip)));
+            }
+            else if (cp.IsAlias != ip.IsAlias)
+            {
+                LogError(std::format(
+                    "class '{}' method '{}': parameter '{}' is declared '{}' but interface '{}' "
+                    "declares it '{}' - 'alias' makes the parameter a borrow whose destructor is "
+                    "suppressed, and a call through the interface reads the contract from the "
+                    "interface, so the borrow the two disagree about would go untracked. Make the "
+                    "two declarations agree.",
+                    implName, method.Name, pname, InterfaceMethodTypeText(cp), ifaceName,
+                    InterfaceMethodTypeText(ip)));
+            }
+        }
+
+        const auto& ir = method.ReturnType;
+        const auto& cr = sym.ReturnType;
+        if (cr.IsMove != ir.IsMove)
+        {
+            if (ir.IsMove)
+                LogError(std::format(
+                    "class '{}' method '{}': the return type is not declared 'move' but interface "
+                    "'{}' declares it '{}' - a call through the interface hands the caller an owned "
+                    "value to free, while class '{}' returns one it still owns (a double free). "
+                    "Declare the return '{}' on class '{}', or drop 'move' from interface '{}'.",
+                    implName, method.Name, ifaceName, InterfaceMethodTypeText(ir), implName,
+                    InterfaceMethodTypeText(ir), implName, ifaceName));
+            else
+                LogError(std::format(
+                    "class '{}' method '{}': the return type is declared 'move' but interface '{}' "
+                    "declares it '{}' - a call through the interface treats the result as a borrow "
+                    "and never frees it, while class '{}' hands over ownership (the result leaks). "
+                    "Drop 'move' from class '{}', or declare the return '{}' on interface '{}'.",
+                    implName, method.Name, ifaceName, InterfaceMethodTypeText(ir), implName,
+                    implName, InterfaceMethodTypeText(cr), ifaceName));
+        }
+        if (cr.IsAlias != ir.IsAlias)
+        {
+            if (ir.IsAlias)
+                LogError(std::format(
+                    "class '{}' method '{}': the return type is not declared 'alias' but interface "
+                    "'{}' declares it '{}' - a call through the interface treats the result as a "
+                    "borrow and suppresses its destructor, while class '{}' returns a value the "
+                    "caller must destroy (the result leaks). Declare the return '{}' on class '{}', "
+                    "or drop 'alias' from interface '{}'.",
+                    implName, method.Name, ifaceName, InterfaceMethodTypeText(ir), implName,
+                    InterfaceMethodTypeText(ir), implName, ifaceName));
+            else
+                LogError(std::format(
+                    "class '{}' method '{}': the return type is declared 'alias' but interface '{}' "
+                    "declares it '{}' - a call through the interface destroys the result at scope "
+                    "exit, while class '{}' returns a borrow of storage it still owns (a double "
+                    "free). Drop 'alias' from class '{}', or declare the return '{}' on interface "
+                    "'{}'.",
+                    implName, method.Name, ifaceName, InterfaceMethodTypeText(ir), implName,
+                    implName, InterfaceMethodTypeText(cr), ifaceName));
+        }
+        if (cr.IsBond != ir.IsBond)
+        {
+            LogError(std::format(
+                "class '{}' method '{}': the return type is declared '{}' but interface '{}' "
+                "declares it '{}' - 'bond' is part of the return contract, and a call through the "
+                "interface reads the contract from the interface, so the borrow the two disagree "
+                "about would go untracked. Make the two declarations agree.",
+                implName, method.Name, InterfaceMethodTypeText(cr), ifaceName,
+                InterfaceMethodTypeText(ir)));
         }
     }
 
@@ -9828,7 +10251,14 @@ public:
                         }
                     }
 
-                    if (paramsMatch) { found = true; break; }
+                    // Selection matched on type alone; the ownership qualifiers on the chosen
+                    // overload are contract and are validated separately (see the function).
+                    if (paramsMatch)
+                    {
+                        found = true;
+                        VerifyInterfaceMethodContract(structName, interfaceName, method, sym);
+                        break;
+                    }
                 }
             }
 
@@ -10958,6 +11388,41 @@ public:
         return out;
     }
 
+    // True when a chain of `unique` pointer fields starting at `from` reaches `target`.
+    // Pointee types not yet registered are skipped: a cycle needs every member present, so
+    // the last one registered is the one that closes the chain and reports.
+    bool UniqueChainReaches(const std::string& from, const std::string& target) const
+    {
+        std::unordered_set<std::string> seen;
+        std::vector<std::string> pending{ from };
+        while (!pending.empty())
+        {
+            std::string t = std::move(pending.back());
+            pending.pop_back();
+            if (t == target) return true;
+            if (!seen.insert(t).second) continue;
+            auto it = dataStructures.find(t);
+            if (it == dataStructures.end()) continue;
+            for (const auto& f : it->second.StructFields)
+                if (f.IsUnique && f.Pointer && !f.ElemPointer)
+                    pending.push_back(f.TypeName);
+        }
+        return false;
+    }
+
+    // D2: a `unique` field whose pointee transitively reaches a `unique` field of the same
+    // type would synthesize a self-recursive destructor that overflows the stack on a long chain.
+    void RejectUniqueDestructionCycles(const std::string& name, const std::vector<LLVMBackend::DeclTypeAndValue>& fields)
+    {
+        for (const auto& f : fields)
+        {
+            if (!f.IsUnique || !f.Pointer || f.ElemPointer) continue;
+            if (!UniqueChainReaches(f.TypeName, name)) continue;
+            LogError("'unique' on field '" + name + "." + f.VariableName + "' forms a destruction cycle back to '"
+                     + name + "': the synthesized destructor would recurse without bound. Drop 'unique' and write a destructor with an iterative teardown.");
+        }
+    }
+
     // Create StructType or OpaqueStruct
     //
     // Bitfield contract: if any entry in `typeAndValues` has IsBitfield=true,
@@ -11010,6 +11475,7 @@ public:
                 if (userAlign > 1)
                     dataStructures[name].UserRequestedAlignment = userAlign;
 
+                RejectUniqueDestructionCycles(name, typeAndValues);
                 return myStruct;
             }
 
@@ -11023,6 +11489,7 @@ public:
             if (userAlign > 1)
                 structData.UserRequestedAlignment = userAlign;
 
+            RejectUniqueDestructionCycles(name, typeAndValues);
             return structData.StructType;
         }
         else
@@ -13322,10 +13789,59 @@ public:
         {
             // The closure fat type gets an env-cloning copy (not a memberwise one - both its
             // fields are pointers, which a memberwise copy would shallow-share and double-free).
-            if (arguments[0].TypeAndValue.TypeName == "__closure_fat_ptr")
+            const std::string& copyType = arguments[0].TypeAndValue.TypeName;
+            std::string uniquePath;
+            if (copyType == "__closure_fat_ptr")
                 EnsureClosureLifetimeRegistered();
-            else
-                GetOrCreateMemberwiseCopy(arguments[0].TypeAndValue.TypeName);
+            else if (TypeOwnsUniquePointer(copyType, &uniquePath))
+            {
+                // The single choke point for "someone wants a copy of this type and it has no
+                // copy() of its own" - covers a user `.copy()`, a containing type's field copy,
+                // and a by-value closure capture alike.
+                LogError(std::format(
+                    "cannot copy '{}': its field '{}.{}' is 'unique', so it owns a raw pointer that has "
+                    "no generic deep-clone. A memberwise copy would share the pointer between two owners "
+                    "and double-free at teardown. Write a 'copy()' method for '{}' that clones the pointee "
+                    "itself, or 'move' the value to transfer ownership instead of copying it.",
+                    copyType, copyType, uniquePath, copyType));
+                return nullptr;
+            }
+            else if (IsOwningValueType(copyType))
+                // Only an owning value type needs the deep memberwise synth; a POD struct is
+                // handled by the bitwise fallback below, so synthesizing one would be dead.
+                GetOrCreateMemberwiseCopy(copyType);
+        }
+
+        // Bitwise-copy fallback. The copy is deep only for an OWNING value type (string, a struct
+        // with owning fields, a container, a closure), all handled above by the memberwise synth /
+        // closure copy / unique error, or by a real copy() overload found in resolution below. Every
+        // OTHER value reaching copy() - a pointer (incl. an interface pointer), a thin function
+        // value, an enum, a primitive, a POD struct - has no deep-copy: the copy is the same bits
+        // (it shares any pointee). Return them bitwise here, mirroring how '.~()' gracefully no-ops
+        // on these types (GetOrCreateFullDestructor returns null). Firing before resolution also lets
+        // list<enum>/list<IShape> copy() resolve and keeps a thin function off __closure_fat_ptr.copy.
+        // arguments[0] is read only after the size==1 short-circuit (a 0-arg call must not index it).
+        // A pointer copy is always a bitwise share (it copies the address, not the pointee), even
+        // when the pointee type owns resources - so a pointer bypasses the owning / real-copy
+        // guards that only apply to a by-value receiver.
+        if (functionName == "copy" && arguments.size() == 1
+            && arguments[0].TypeAndValue.TypeName != "__closure_fat_ptr"
+            && (arguments[0].TypeAndValue.Pointer
+                || (!IsOwningValueType(arguments[0].TypeAndValue.TypeName)
+                    && !HasRealCopyOverloadFor(arguments[0].TypeAndValue.TypeName))))
+        {
+            const auto& arg = arguments[0];
+            // A bitwise copy has the receiver's own type; publish it so the caller classifies the
+            // result correctly (e.g. keeps IsInterface, so it binds to an interface parameter).
+            lastCallReturnType = arg.TypeAndValue;
+            // Interface element: the slot holds a bare fat {vtable,data} value. Load that from
+            // Storage (Primary is a mis-classified single pointer) so it binds an interface param.
+            if (arg.TypeAndValue.IsInterface && arg.Storage != nullptr)
+                return CreateLoad(GetFatPtrType(), arg.Storage);
+            if (arg.Primary != nullptr)
+                return arg.Primary;
+            if (arg.Storage != nullptr)
+                return arg.BaseType ? CreateLoad(arg.BaseType, arg.Storage) : CreateLoad(arg.Storage);
         }
 
         auto funcSym = functionTable.find(functionName);
@@ -13663,6 +14179,12 @@ public:
                     // Canonical by-value arg lowering (string coercion + move heap-copy);
                     // shared with virtual dispatch via CallInterfaceMethod.
                     value = LowerByValueArg(value, *candParamItr, arg);
+
+                    // An owning-struct RVALUE temp passed to a by-value BORROW param has no named
+                    // owner and the callee will not free it; register it for end-of-full-expression
+                    // destruction. A `move` param is excluded (the callee takes and frees it).
+                    if (!candParamItr->IsMove)
+                        RegisterBorrowedOwningStructTemp(arg);
                 }
                 else if (value->getType()->isIntegerTy(1))
                 {
@@ -13906,6 +14428,35 @@ public:
         return {};
     }
 
+    // Resolve a bare identifier to a local or parameter with correct LEXICAL precedence:
+    // innermost frame first, and within a single frame a local (namedVariable) shadows a
+    // parameter (functionArgument). This is what lets a lambda / nested-function PARAMETER
+    // shadow a same-named local of an ENCLOSING function. Consulting GetLocalVariable and
+    // GetFunctionArgument in sequence cannot express this - the former walks EVERY frame's
+    // namedVariable before any functionArgument is seen, so an enclosing local wrongly wins
+    // over the inner param (a module-verification failure: the inner function loads the
+    // enclosing alloca, which does not dominate). Returns an empty NamedVariable if unbound.
+    NamedVariable GetScopedLocalOrArgument(const std::string& name)
+    {
+        for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = stackFrame.namedVariable.find(name); it != stackFrame.namedVariable.end())
+            {
+                auto nv = it->second;
+                nv.CallerName = name;
+                return nv;
+            }
+            if (auto it = stackFrame.functionArgument.find(name); it != stackFrame.functionArgument.end())
+            {
+                auto nv = it->second;
+                nv.CallerName = name;
+                return nv;
+            }
+        }
+
+        return {};
+    }
+
     bool IsFunctionParameter(const std::string& name) const
     {
         if (name.empty()) return false;
@@ -13977,6 +14528,10 @@ public:
                             }
                             namedVar.BaseType = namedVar.Primary->getType();
                             namedVar.TypeAndValue = structField;
+                            // Preserve unique-field provenance across a later cast so a bare
+                            // self-field read (`(Res*)p` inside a method) stays a tracked alias.
+                            if (structField.IsUnique && structField.Pointer)
+                                namedVar.IsUniqueFieldAlias = true;
                             // Field declared `alignas(_, N)`: stamp the block alignment so a bare
                             // `delete field` inside a member (e.g. the destructor) frees via
                             // __delete_aligned. GetMemberVariable purposely omits OwningStructName.

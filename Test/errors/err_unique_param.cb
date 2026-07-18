@@ -1,0 +1,12 @@
+// `unique` on a parameter would read as an ownership transfer, which is what `move`
+// already means. Reject rather than let the two spellings drift apart.
+struct N { int v = 0; };
+
+expect_error("'unique' is only allowed on a struct field") {
+    int takes(unique N* p) { return p->v; }
+}
+
+extern int main()
+{
+    return 0;
+}

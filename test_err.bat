@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-if "%CFLAT_CONFIG%"=="" set CFLAT_CONFIG=Debug
+if "%CFLAT_CONFIG%"=="" set CFLAT_CONFIG=Release
 set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
 set SRC=Test
 set LIB=Test\library

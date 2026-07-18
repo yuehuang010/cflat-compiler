@@ -1,0 +1,18 @@
+// Stage 3 of `unique` (Trap B): a local that aliases a `unique` field, stored into ANOTHER
+// `unique` field. Both fields would claim the same pointee and both synthesized destructors
+// would free it. Stage 2 rejects a borrowed PARAMETER stored into a unique field; this is the
+// same rule reached through a unique-field alias, and reports the field rather than a parameter.
+struct Res { int v = 0; };
+struct Box { unique Res* p = nullptr; };
+
+extern int main()
+{
+    expect_error("cannot store 'alias' into unique field 'Box.p' - it aliases 'a.p', a unique field") {
+        Box a = default;
+        a.p = new Res();
+        Box c = default;
+        Res* alias = a.p;
+        c.p = alias;
+    }
+    return 0;
+}

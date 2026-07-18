@@ -1,0 +1,13 @@
+// `unique T* field[N]`: the synthesized destructor deletes ONE pointer per field, it does
+// not loop over the slots yet. Accepting this would silently leak every element but the
+// first, so reject until the array form is implemented.
+struct Node { int v = 0; };
+
+expect_error("fixed arrays are not supported yet") {
+    struct Tree { unique Node* kids[8] = default; };
+}
+
+extern int main()
+{
+    return 0;
+}

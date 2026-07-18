@@ -1,0 +1,20 @@
+// `alignas(0, N)` on a pointer field routes `delete field` to the aligned deallocator, recovering N
+// from the clause. On a NON-`unique` (hand-managed) field the stored block may come from plain
+// `operator new` with no aligned header, so the aligned free corrupts the heap (issue repro:
+// scratch/rv_align_ctl.cb, exit 127). The clause is only sound on a `unique` field, whose store site
+// validates the source and whose free the compiler owns, so it is rejected at declaration here.
+struct Res { i64 v = 0; };
+
+// The error fires when the struct's field is parsed - no instantiation is required.
+expect_error("selects aligned deallocation but the field is not 'unique'") {
+    struct H
+    {
+        alignas(0, 64) Res* p = nullptr;      // NOT unique - hand-managed
+        ~H() { if (p != nullptr) delete p; }  // the user's own delete
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

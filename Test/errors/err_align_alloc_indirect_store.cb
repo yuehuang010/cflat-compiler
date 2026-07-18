@@ -1,0 +1,16 @@
+// `alignas(0, N)` on a pointer field records the owned block's alignment, so the free site routes
+// to __delete_aligned. Storing a plain-`new` pointer INDIRECTLY (via a local) must be rejected: the
+// block has no aligned header, and the synthesized free would corrupt the heap. A scalar `new` takes
+// no alignment clause, so the source must inherit the field's - directly, or via an aligned local.
+struct Res { i64 v = 0; };
+struct Holder { alignas(0, 64) unique Res* p = nullptr; };
+
+extern int main()
+{
+    Holder h = default;
+    expect_error("Store the 'new' directly into the field") {
+        Res* t = new Res();
+        h.p = t;
+    }
+    return 0;
+}

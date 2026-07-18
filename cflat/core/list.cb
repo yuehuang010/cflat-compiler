@@ -144,16 +144,23 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     }
 
     // -- ICopyable ----------------------------------------------------------
-    // Return an independent deep copy of this list. String elements are deep-copied;
-    // primitive and pointer elements are copied by value (a list of pointers shares pointees).
+    // Return a copy of this list. Element handling depends on T:
+    //   - primitive T: copied by value (the source is untouched).
+    //   - other value types (string, or a struct with owning fields): deep-copied via copy(),
+    //     so the two lists own independent buffers and the source is untouched.
+    //   - pointer T: the list OWNS its pointers (the destructor frees them), so each element is
+    //     MOVED to the copy - ownership transfers and the SOURCE slot is nulled. A shared copy
+    //     would hand one pointee to two owners and double-free at teardown; a raw pointer has no
+    //     generic deep-clone. Use move/take explicitly, or a list of values, if that is a surprise.
     move list<T> copy()
     {
         list<T> result;
         int i = 0;
         while (i < _size)
         {
-            if const (is_string(T)) result.add(_data[i].copy());
-            else                    result.add(_data[i]);
+            if const (is_primitive(T))    result.add(_data[i]);
+            else if const (is_pointer(T)) result.add(_data[i]);
+            else                          result.add(_data[i].copy());
             i++;
         }
         return move result;
@@ -172,8 +179,9 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         int i = 0;
         while (i < _size)
         {
-            if const (is_string(T)) result.add(_data[i].copy());
-            else                    result.add(_data[i]);
+            if const (is_primitive(T))    result.add(_data[i]);
+            else if const (is_pointer(T)) result.add(_data[i]);
+            else                          result.add(_data[i].copy());
             i++;
         }
 

@@ -113,13 +113,14 @@ struct dictionary<K, V>
         }
         int insertSlot = slot;
         if (firstDeleted != -1) { insertSlot = firstDeleted; _tombstones--; }
-        // Store the key. A `string` key is deep-copied so the slot owns an independent buffer:
-        // a plain store would alias the caller's `key` argument (a soon-freed temp/local),
-        // leaving the stored key dangling once that buffer is freed. The destructor/remove()/
-        // clear() free this owned copy. All other key types are stored as-is - the dictionary
-        // BORROWS pointer keys (it never frees them), matching its original contract.
-        if const (is_string(K))  _keys[insertSlot] = key.copy();
-        if const (!is_string(K)) _keys[insertSlot] = key;
+        // Store the key. An owning key (a `string`, or a struct that owns buffers) is deep-copied
+        // so the slot owns an independent buffer: a plain store would alias the caller's `key`
+        // argument (a soon-freed temp/local), leaving the stored key dangling once that buffer is
+        // freed. The destructor/remove()/clear() free this owned copy. Primitive and pointer keys
+        // are stored as-is - the dictionary BORROWS pointer keys (it never frees them).
+        if const (is_primitive(K))    _keys[insertSlot] = key;
+        else if const (is_pointer(K)) _keys[insertSlot] = key;
+        else                          _keys[insertSlot] = key.copy();
         _values[insertSlot] = move value;
         _status[insertSlot] = 1;
         _count++;
@@ -160,10 +161,11 @@ struct dictionary<K, V>
         {
             updateSlot = slot;
             if (firstDeleted != -1) { updateSlot = firstDeleted; _tombstones--; }
-            // Deep-copy a string key into the slot; store all other key types as-is.
+            // Deep-copy an owning key into the slot; store primitive/pointer keys as-is.
             // See add() for the rationale (avoid aliasing the soon-freed caller argument).
-            if const (is_string(K))  _keys[updateSlot] = key.copy();
-            if const (!is_string(K)) _keys[updateSlot] = key;
+            if const (is_primitive(K))    _keys[updateSlot] = key;
+            else if const (is_pointer(K)) _keys[updateSlot] = key;
+            else                          _keys[updateSlot] = key.copy();
             _status[updateSlot] = 1;
             _count++;
         }
@@ -212,8 +214,8 @@ struct dictionary<K, V>
                     if (_values[slot] != nullptr) delete _values[slot];
                 if const (!is_pointer(V))
                     _values[slot].~();
-                // Destruct the owned key too (string etc.); primitive/pointer keys: no-op/unmanaged.
-                if const (is_string(K))
+                // Destruct the owned key too (string, owning struct); primitive/pointer keys: unmanaged.
+                if const (!is_primitive(K)) if const (!is_pointer(K))
                     _keys[slot].~();
                 _status[slot] = 2;
                 _count--;
@@ -244,7 +246,7 @@ struct dictionary<K, V>
                     if (_values[i] != nullptr) delete _values[i];
                 if const (!is_pointer(V))
                     _values[i].~();
-                if const (is_string(K))
+                if const (!is_primitive(K)) if const (!is_pointer(K))
                     _keys[i].~();
             }
             i++;
@@ -261,10 +263,14 @@ struct dictionary<K, V>
         return get(key);
     }
 
-    // Return an independent deep copy of this dictionary. The copy owns its own backing
-    // arrays; string keys and string values are deep-copied so each dictionary frees its
-    // own buffers. Primitive and pointer keys/values are copied by value (a dictionary of
-    // pointer values shares pointees - same contract as list.copy()).
+    // Return a copy of this dictionary; the copy owns its own backing arrays. Element handling:
+    //   - primitive key/value: copied by value.
+    //   - string / owning-struct key or value: deep-copied via copy(), so each dictionary owns
+    //     independent buffers (a plain store would hand both dictionaries one buffer -> double free).
+    //   - pointer KEY: shared (the dictionary borrows key pointers - it never frees them).
+    //   - pointer VALUE: the dictionary OWNS value pointers (the destructor frees them), so each is
+    //     MOVED to the copy - ownership transfers and the SOURCE value slot is nulled. Sharing would
+    //     hand one pointee to two owners and double-free at teardown; a raw pointer has no deep-clone.
     move dictionary<K, V> copy()
     {
         dictionary<K, V> result;
@@ -277,10 +283,12 @@ struct dictionary<K, V>
             result._status[i] = _status[i];
             if (_status[i] == 1)
             {
-                if const (is_string(K))  result._keys[i]   = _keys[i].copy();
-                if const (!is_string(K)) result._keys[i]   = _keys[i];
-                if const (is_string(V))  result._values[i] = _values[i].copy();
-                if const (!is_string(V)) result._values[i] = _values[i];
+                if const (is_primitive(K))    result._keys[i] = _keys[i];
+                else if const (is_pointer(K)) result._keys[i] = _keys[i];
+                else                          result._keys[i] = _keys[i].copy();
+                if const (is_primitive(V))    result._values[i] = _values[i];
+                else if const (is_pointer(V)) result._values[i] = move _values[i];
+                else                          result._values[i] = _values[i].copy();
             }
             i++;
         }
@@ -301,10 +309,10 @@ struct dictionary<K, V>
                     if (_values[i] != nullptr) delete _values[i];
                 if const (!is_pointer(V))
                     _values[i].~();
-                // String keys are deep-copied into the slot by add()/set(), so the dictionary
-                // owns them and must free them here; other key types are stored as-is and
+                // Owning keys are deep-copied into the slot by add()/set(), so the dictionary
+                // owns them and must free them here; primitive/pointer keys are stored as-is and
                 // stay caller-managed (pointer keys are never freed).
-                if const (is_string(K))
+                if const (!is_primitive(K)) if const (!is_pointer(K))
                     _keys[i].~();
             }
             i++;

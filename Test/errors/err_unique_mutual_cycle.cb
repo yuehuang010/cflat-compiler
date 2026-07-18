@@ -1,0 +1,12 @@
+// D2 is transitive, not just self-referential: A owns a B which owns an A, so the two
+// synthesized destructors would call each other without bound. The cycle is reported by
+// the member that closes it (B, registered last).
+expect_error("forms a destruction cycle back to 'B'") {
+    struct A { unique B* b = nullptr; };
+    struct B { unique A* a = nullptr; };
+}
+
+extern int main()
+{
+    return 0;
+}

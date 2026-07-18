@@ -1,0 +1,25 @@
+// The other direction of the interface field ownership contract: the interface declares the
+// field `unique`, so a store through its byte-offset slot frees the old pointee - but the
+// implementor never claimed to own it, and its synthesized destructor does not free the field.
+// The interface slot would free a pointee the concrete type only borrows. Both directions of
+// disagreement are rejected; the accepted spelling is `unique` on BOTH.
+struct Res { int v = 0; };
+
+interface IHolder
+{
+    unique Res* item;       // the contract owns the pointee
+    int  tag();
+};
+
+expect_error("class 'Holder' field 'item' is not declared 'unique' but interface 'IHolder' declares it 'unique'") {
+    class Holder : IHolder
+    {
+        Res* item = nullptr;          // but the class only borrows it
+        int tag() { return 1; }
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

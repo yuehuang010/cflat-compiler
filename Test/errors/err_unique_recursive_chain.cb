@@ -1,0 +1,12 @@
+// D2: `unique Node* next` on a sibling chain synthesizes a destructor that calls itself
+// once per link, so a long list overflows the stack (C++ has the identical bug with a
+// unique_ptr list). Rejected in Stage 1 - a hand-written iterative teardown opts out by
+// simply not using the keyword.
+expect_error("forms a destruction cycle back to 'Node'") {
+    struct Node { int v = 0; unique Node* next = nullptr; };
+}
+
+extern int main()
+{
+    return 0;
+}

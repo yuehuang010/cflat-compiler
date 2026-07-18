@@ -1,0 +1,16 @@
+// Brace-init is a SECOND field-store path (EmitOneFieldInit), and it reaches the very same
+// synthesized `unique` free site as `=`. The alignment agreement must therefore hold here too:
+// a plain-`new` block stored into an `alignas(0, 64)` field would be freed via __delete_aligned
+// against a block that has no aligned header, corrupting the heap. `h.p = t;` is rejected; the
+// `Holder h = { p = t };` spelling must be rejected identically.
+struct Res { i64 v = 0; };
+struct Holder { alignas(0, 64) unique Res* p = nullptr; };
+
+extern int main()
+{
+    expect_error("Store the 'new' directly into the field") {
+        Res* t = new Res();
+        Holder h = { p = t };
+    }
+    return 0;
+}

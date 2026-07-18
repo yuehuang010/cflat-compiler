@@ -2601,6 +2601,9 @@ extern int main()
     total++; passed += testConstFold()                   ? 1 : 0;
     total++; passed += testFloatLiteralWidth()            ? 1 : 0;
     total++; passed += testFloatDoubleWiden()             ? 1 : 0;
+    total++; passed += testFixedArrayDefaultInit()        ? 1 : 0;
+    total++; passed += testFixedArrayDefaultInitDirtied() ? 1 : 0;
+    total++; passed += testFixedArrayDestruction()        ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -3384,6 +3387,22 @@ struct FlatMatrix
 // frees it at scope exit via the aligned route, recovered from the parameter's clause.
 void consumeFlat(move alignas(0, 64) double[] buf) { }
 
+// The clause on a SCALAR pointer field: it records the block alignment so the synthesized `unique`
+// free routes to __delete_aligned. Both inbound channels must reach it - a direct `new`, and an
+// align-declared local stored indirectly. A plain-`new` local is rejected at the store
+// (Test/errors/err_align_alloc_indirect_store.cb): its block has no aligned header.
+struct AlignedRes { i64 v = 0; };
+struct ResHolder  { alignas(0, 64) unique AlignedRes* p = nullptr; };
+
+// Alignment carried by the pointee TYPE needs no field clause: `new` and `delete` both pick the
+// aligned pair off the static type, so it escapes into a field freely, as in C++.
+struct alignas(64) WideRes { i64 v = 0; };
+struct WideHolder { unique WideRes* w = nullptr; };
+
+// A clause WITHOUT `unique` on a scalar pointer field is now REJECTED at declaration: the clause
+// selects the aligned deallocator for a hand-managed pointer whose block may be a plain `new`, which
+// would corrupt the heap. See Test/errors/err_alignas_alloc_requires_unique.cb.
+
 // RETURN escape: a function whose RETURN TYPE declares `alignas(0, 64)` hands back a 64-aligned
 // heap block. A bare `new` in the return inherits the alignment (inbound channel); the caller's
 // receiving local is stamped so `delete[_]` routes to __delete_aligned.
@@ -3517,6 +3536,32 @@ bool testAlignas()
     }
     result &= Test("alignas(0,64) flat double[] field base%64 over 64 rounds", flatMisaligned, 0);
     result &= Test("alignas(0,64) field churn sum",                            flatSum == 288.0, true);
+
+    // The clause on a SCALAR `unique T*` field. Churned so a mis-routed free corrupts the heap.
+    // Guards the store check against OVER-rejecting the three shapes that must stay legal: a
+    // direct `new`, a null release, and an indirect store whose source agrees with the field.
+    int scalarMisaligned = 0;
+    for (int i = 0; i < 16; i = i + 1)
+    {
+        ResHolder rh = default;
+        rh.p = new AlignedRes();            // direct: the bare `new` inherits the field's clause
+        if ((((i64)rh.p) & 63) != 0) scalarMisaligned = scalarMisaligned + 1;
+        rh.p = nullptr;                     // sanctioned release: frees it, must stay legal
+        alignas(0, 64) AlignedRes* src = new AlignedRes();
+        rh.p = src;                         // indirect: the source carries the matching clause
+        if ((((i64)rh.p) & 63) != 0) scalarMisaligned = scalarMisaligned + 1;
+
+        // Alignment from the TYPE alone: no clause anywhere, indirect store, still 64-aligned
+        // and still freed through the aligned route (recovered from the static type).
+        WideHolder wh = default;
+        WideRes* wsrc = new WideRes();
+        wh.w = wsrc;
+        if ((((i64)wh.w) & 63) != 0) scalarMisaligned = scalarMisaligned + 1;
+    }
+    result &= Test("alignas(0,64) scalar unique field base%64 over 16 rounds", scalarMisaligned, 0);
+
+    // A clause on a NON-`unique` scalar pointer field is a compile error now
+    // (Test/errors/err_alignas_alloc_requires_unique.cb), so there is no positive case here.
 
     // Per-site `new T[n] alignas(N)` stays owned by its local: move between locals keeps the
     // tag, so the extracted local still frees through the aligned route.
@@ -3711,6 +3756,98 @@ bool testFloatDoubleWiden()
     double y = c ? 0.0 : (g_widenGlobal * 2.0);   // bare literal on taken branch
     result &= Test("widen_ternary_double_branch", x == 2.0, true);
     result &= Test("widen_ternary_literal_branch", y == 0.0, true);
+
+    return result;
+}
+
+// Regression: a fixed array of structs declared with no initializer was left as stack garbage,
+// while the scalar declaration was default-constructed. Every element must now read exactly as
+// the scalar does - field initializers included, not merely zeroed.
+struct ArrDefZero    { int n = 0; int* p = nullptr; };
+struct ArrDefNonZero { int n = 5; int m = 7; };
+struct ArrDefString  { int n = 3; string s = default; };
+
+// Fill the frame with a recognizable pattern so a later declaration that reads uninitialized
+// stack sees garbage rather than incidental zeros.
+void dirtyTheStack()
+{
+    i64[64] junk;
+    int i = 0;
+    while (i < 64) { junk[i] = 0x5A5A5A5A5A5A5A5A; i++; }
+}
+
+bool testFixedArrayDefaultInit()
+{
+    bool result = true;
+
+    ArrDefZero[4] z;
+    result &= Test("arrdef_zero_first", z[0].n == 0 && z[0].p == nullptr, true);
+    result &= Test("arrdef_zero_last",  z[3].n == 0 && z[3].p == nullptr, true);
+
+    // Field initializers must be applied to every element, matching the scalar path.
+    ArrDefNonZero one;
+    ArrDefNonZero[4] nz;
+    result &= Test("arrdef_scalar_parity", nz[0].n == one.n && nz[0].m == one.m, true);
+    result &= Test("arrdef_nonzero_last",  nz[3].n == 5 && nz[3].m == 7, true);
+
+    // Multi-dimensional arrays are contiguous; the last slot proves the whole extent is covered.
+    ArrDefNonZero[2][3] m;
+    result &= Test("arrdef_multidim_first", m[0][0].n == 5 && m[0][0].m == 7, true);
+    result &= Test("arrdef_multidim_last",  m[1][2].n == 5 && m[1][2].m == 7, true);
+
+    // Above the unroll limit this fills via a runtime loop.
+    ArrDefNonZero[64] big;
+    result &= Test("arrdef_loop_first", big[0].n == 5, true);
+    result &= Test("arrdef_loop_last",  big[63].n == 5, true);
+
+    // A garbage _len would make the string destructor free a garbage _ptr at scope exit.
+    ArrDefString[4] s;
+    result &= Test("arrdef_string_len", s[0].s.length() == 0 && s[3].s.length() == 0, true);
+    result &= Test("arrdef_string_field", s[0].n == 3 && s[3].n == 3, true);
+
+    return result;
+}
+
+// Dirty the frame first, then re-check: the values must come from default construction,
+// not from a stack that happened to be zero.
+bool testFixedArrayDefaultInitDirtied()
+{
+    dirtyTheStack();
+    return testFixedArrayDefaultInit();
+}
+
+// Destruction is the mirror of default-init above: `T[N] a;` default-constructs every element,
+// so scope exit must destruct every element too. The scope-exit destructor used to be a single
+// call on the array BASE pointer - i.e. element [0] only - leaking the other N-1.
+int arrDtorCount = 0;
+struct ArrDtor { int n = 0; ~ArrDtor() { arrDtorCount++; } };
+
+bool testFixedArrayDestruction()
+{
+    bool result = true;
+
+    arrDtorCount = 0;
+    { ArrDtor[4] a; }
+    result &= Test("arrdtor_all_elements", arrDtorCount, 4);
+
+    // A scalar declaration is unchanged: exactly one destructor.
+    arrDtorCount = 0;
+    { ArrDtor one; }
+    result &= Test("arrdtor_scalar_parity", arrDtorCount, 1);
+
+    // Multi-dimensional arrays are contiguous, so the flat walk covers all N*M elements.
+    arrDtorCount = 0;
+    { ArrDtor[2][3] m; }
+    result &= Test("arrdtor_multidim", arrDtorCount, 6);
+
+    arrDtorCount = 0;
+    { ArrDtor[2][3][4] deep; }
+    result &= Test("arrdtor_multidim_deep", arrDtorCount, 24);
+
+    // Above the unroll limit this destructs via a runtime loop rather than unrolled calls.
+    arrDtorCount = 0;
+    { ArrDtor[64] big; }
+    result &= Test("arrdtor_loop", arrDtorCount, 64);
 
     return result;
 }

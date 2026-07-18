@@ -17,6 +17,17 @@ class Holder
     }
 };
 
+// Part 2: the SAME store, spelled as brace-init. Brace-init is a second, independent field-store
+// path, so it must reject identically - otherwise the rule above is bypassed by changing spelling
+// and the double-free comes back (it did: ASAN reported it).
+struct BraceHolder { list<int> items = default; };
+
+void braceInitCopy(list<int> src)
+{
+    expect_error("copying owning value 'list<int>' by value into a struct field");
+    BraceHolder h = { items = src };
+}
+
 extern int main()
 {
     return 0;

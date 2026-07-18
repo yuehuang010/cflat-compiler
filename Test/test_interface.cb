@@ -1562,6 +1562,82 @@ bool testInterfaceArgPaths()
     return result;
 }
 
+// --- Test 34: an AGREEING ownership contract still binds and still transfers ---
+// The companion to the err_iface_method_* tests: the implementor matches the interface on
+// every ownership qualifier, so the vtable binds and each qualifier keeps its meaning
+// through dynamic dispatch. `move` param -> callee owns; `move` return -> caller owns;
+// `alias` return -> caller borrows and must not free.
+int gOwnDtorCount = 0;
+
+struct Owned
+{
+    int v = 0;
+    ~Owned() { gOwnDtorCount++; }
+};
+
+interface IOwnerBox
+{
+    void put(move Owned* o);      // ownership transferred to the box
+    move Owned* release();         // ownership transferred back to the caller
+    alias Owned* peek();           // borrow - the box keeps ownership
+};
+
+class OwnerBox : IOwnerBox
+{
+    Owned* held = nullptr;
+
+    void put(move Owned* o)
+    {
+        if (held != nullptr) delete held;
+        held = o;
+    }
+
+    move Owned* release()
+    {
+        Owned* out = move held;   // `move` out of the field: the box stops owning it
+        return out;
+    }
+
+    alias Owned* peek() { return held; }
+
+    ~OwnerBox() { if (held != nullptr) delete held; }
+};
+
+bool testInterfaceMethodOwnershipContract()
+{
+    bool result = true;
+    gOwnDtorCount = 0;
+
+    OwnerBox* obp = new OwnerBox();
+    IOwnerBox box = obp;
+
+    {
+        Owned* o = new Owned();
+        o->v = 21;
+        box.put(move o);            // `move` param: the box takes ownership, caller is nulled
+    }
+    // The caller's scope exit must NOT free what the box now owns.
+    result &= Test("contract_move_param_no_free", gOwnDtorCount, 0);
+
+    {
+        Owned* borrowed = box.peek();   // `alias` return: a borrow, not freed at scope exit
+        result &= Test("contract_alias_return_value", borrowed->v, 21);
+    }
+    result &= Test("contract_alias_return_no_free", gOwnDtorCount, 0);
+
+    {
+        Owned* taken = box.release();   // `move` return: the caller owns it now
+        result &= Test("contract_move_return_value", taken->v, 21);
+        delete taken;                    // freed exactly once, by the new owner
+    }
+    result &= Test("contract_move_return_freed_once", gOwnDtorCount, 1);
+
+    delete box;                          // box is empty - nothing double-freed
+    result &= Test("contract_dtor_total", gOwnDtorCount, 1);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -1601,6 +1677,7 @@ extern int main()
     total++; passed += testFieldListInterfaceTeardown()       ? 1 : 0;
     total++; passed += testMoveParamThroughInterfaceMethod()  ? 1 : 0;
     total++; passed += testInterfaceArgPaths()                ? 1 : 0;
+    total++; passed += testInterfaceMethodOwnershipContract()  ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

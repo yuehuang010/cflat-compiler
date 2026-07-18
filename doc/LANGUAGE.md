@@ -1072,7 +1072,7 @@ switch (shape)
 
 ## Ownership / Lifetime (`move` keyword)
 
-CFlat uses **context-based ownership**: local variables and struct fields own their pointers; function parameters borrow by default.
+CFlat uses **context-based ownership**: a local variable owns the pointer it allocates, and a function parameter borrows by default. A struct field is the exception - it owns nothing unless you say so, with [`unique`](#unique-field-ownership).
 
 The `move` keyword on a parameter definition transfers ownership into the callee - the resource is freed when the function returns:
 
@@ -1227,6 +1227,58 @@ int* p = ForwardBorrow(&a);   // p is bonded to a
 ```
 
 `bond` and `move` are mutually exclusive on the same parameter. `bond` is a soft keyword (text-matched at parse time), so identifiers and methods named `bond` still work in other contexts.
+
+### `unique` Field Ownership
+
+A raw pointer field is **not** owned by default - nothing frees it, so it leaks unless you write a destructor. `unique` marks the field as owning, and the compiler-synthesized destructor deletes the pointee for you:
+
+```c
+struct Tree
+{
+    unique Node* _root = nullptr;   // the synthesized destructor deletes _root
+};
+```
+
+That replaces the hand-written form, which is what you would otherwise have to write:
+
+```c
+struct Tree
+{
+    Node* _root = nullptr;
+    ~Tree() { if (_root != nullptr) delete _root; }
+};
+```
+
+`unique` is **opt-in and additive**: an unmarked `T*` field behaves exactly as it always has. Mark only the fields your struct genuinely owns. It composes with `alignas(0, N)` - an over-aligned pointee is freed through the matching aligned path.
+
+**Assigning to a `unique` field frees whatever it held.** There is no need to delete first, and no way to leak the old value:
+
+```c
+Tree t = default;
+t._root = new Node();     // field was null: nothing to free
+t._root = new Node();     // frees the FIRST node, then stores the new one
+t._root = nullptr;        // frees it early - the release idiom
+```
+
+**Rules the compiler enforces:**
+
+| Rule | Why |
+|---|---|
+| `delete _root;` is **rejected** | The synthesized destructor already deletes it - an explicit delete is a double-free. Assign `nullptr` instead; it frees the pointee. |
+| Storing a **borrowed** parameter is **rejected** | The caller still owns it and frees it on scope exit, so the field would dangle. Declare the parameter `move` to transfer ownership. |
+| A struct with a `unique` field has **no memberwise copy** | Copying would hand one pointer to two owners. Like `unique_ptr`, it is move-only: `move` it, or write your own `copy()` that clones the pointee. |
+| A local aliasing a `unique` field cannot be `delete`d or `move`d | The alias does not null the field, so the field's destructor would still free the pointee. Use `move t._root` to move the **field** itself, which nulls it. |
+| **Recursive** ownership is **rejected** | A `unique` field whose pointee type reaches a `unique` field of the same type (a tree or a linked list) would recurse without bound on teardown. There is no good general answer - the recursive teardown overflows on a degenerate shape, and an iterative one needs an allocation during destruction that can itself fail. A recursive data structure knows the shape of its own data, so its author writes the destructor. |
+| **Fixed arrays** (`unique Node* kids[8];`) are **rejected** | The synthesized destructor deletes a single pointer and would leak the rest. |
+
+**Taking ownership back out** of a `unique` field is what `move` is for - it nulls the field, so the destructor skips it:
+
+```c
+Node* n = move t._root;   // t._root is now nullptr; you own n
+delete n;                 // your responsibility
+```
+
+`unique` is a soft keyword (text-matched at parse time), so identifiers named `unique` still work in other contexts. It is valid only on a struct field - not on a local, parameter, or return type.
 
 ### Memory Deallocation (`delete`)
 

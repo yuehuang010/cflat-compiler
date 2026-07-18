@@ -1,0 +1,27 @@
+// A direct copy between two `unique` fields gives one pointee two owners: both synthesized
+// destructors free it. Neither sibling rule catches this - the Trap A reject keys on
+// IsBorrowed (false for a field read off a plain LOCAL, as here), and the owning-value
+// field-to-field rule keys on IsOwningValueType (false for a raw pointer). The LAUNDERED
+// spelling (`Node* p = a.slot; c.slot = p;`) is rejected by err_unique_alias_into_field.cb;
+// this pins the shorter, more natural spelling, which used to compile clean and double-free.
+// `c.slot = move a.slot` stays legal - it nulls the source (Test/test_move.cb).
+// A source reached through a BORROWED PARAMETER hits Trap A first, which reports the more
+// precise borrow reason - that ordering is deliberate, so the source here is a local.
+struct Node { int v = 0; };
+
+struct Holder { unique Node* slot = nullptr; };
+
+expect_error("cannot store unique field 'a.slot' into unique field 'Holder.slot'") {
+    void steal()
+    {
+        Holder a = default;
+        Holder c = default;
+        a.slot = new Node();
+        c.slot = a.slot;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

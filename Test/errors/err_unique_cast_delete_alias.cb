@@ -1,0 +1,17 @@
+// A `(T*)` cast off a `unique` field must not defeat the delete rule (Trap B). The cast severs
+// the field's Storage, but the pointee identity is unchanged, so `delete` of the cast alias is
+// still a double-free (the field's synthesized destructor also frees it). The cast preserves
+// borrow provenance so the local stays a tracked alias. `move b.p` is the sanctioned extraction.
+struct Res { int v = 0; };
+struct Box { unique Res* p = nullptr; };
+
+extern int main()
+{
+    expect_error("cannot delete 'alias' - it aliases unique field 'Box.p'") {
+        Box b = default;
+        b.p = new Res();
+        Res* alias = (Res*)b.p;
+        delete alias;
+    }
+    return 0;
+}

@@ -1,0 +1,22 @@
+// An interface method's `move` is contract: a call through the interface transfers
+// ownership of the argument, so the caller stops freeing it. An implementor that
+// declares the same parameter WITHOUT `move` only borrows and frees nothing, and the
+// pointee is orphaned. Rejected eagerly, at the class definition.
+struct Res { int v = 0; };
+
+interface ISink
+{
+    void take(move Res* r);
+};
+
+expect_error("parameter 'r' is not declared 'move' but interface 'ISink' declares it 'move'") {
+    class BorrowSink : ISink
+    {
+        void take(Res* r) { }
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

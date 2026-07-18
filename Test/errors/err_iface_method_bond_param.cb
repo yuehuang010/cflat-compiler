@@ -1,0 +1,35 @@
+// `bond` is part of a method's contract the same way `move` is: the virtual call site reads
+// the contract from the INTERFACE, never from the concrete implementor, so an implementor
+// that disagrees leaves the borrow it describes untracked through dynamic dispatch.
+struct Res { int v = 0; };
+
+interface IBorrower
+{
+    int* lend(Res* src);
+};
+
+expect_error("parameter 'src' is declared 'bond Res*' but interface 'IBorrower' declares it 'Res*'") {
+    class BondBorrower : IBorrower
+    {
+        int* lend(bond Res* src) { return &src->v; }
+    };
+}
+
+// `alias` on a parameter is contract the same way `bond` is: an implementor that omits it
+// suppresses the argument's destructor on only one side of dynamic dispatch.
+interface IAliaser
+{
+    void take(alias Res* src);
+};
+
+expect_error("parameter 'src' is declared 'Res*' but interface 'IAliaser' declares it 'alias Res*'") {
+    class PlainTaker : IAliaser
+    {
+        void take(Res* src) { }
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

@@ -15,6 +15,14 @@ void stash(list<Token> toks, Holder h)
     h.tok = toks.get(0);               // alias borrow stored into an owning field
 }
 
+// The same borrow, spelled as brace-init. Brace-init is a second, independent field-store path,
+// so it must reject identically - otherwise the rule above is bypassed by changing spelling.
+void stashBraceInit(list<Token> toks)
+{
+    expect_error("cannot store an 'alias' value");
+    Holder h = { tok = toks.get(0) };
+}
+
 extern int main()
 {
     return 0;

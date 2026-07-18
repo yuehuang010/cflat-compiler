@@ -1,0 +1,16 @@
+// Stage 2 of `unique`: a struct that owns a raw pointer has no memberwise copy. The
+// synthesized `.copy()` shallow-copies pointer fields (there is no generic deep-clone for a
+// raw pointer), which would hand one pointee to two synthesized destructors. Refused at the
+// synthesis site instead. `Holder b = a;` still works - that MOVES, leaving one owner.
+struct Node { int v = 0; };
+
+struct Holder { unique Node* slot = nullptr; };
+
+expect_error("cannot copy 'Holder': its field 'Holder.slot' is 'unique'") {
+    Holder duplicate(Holder* h) { return h->slot == nullptr ? Holder() : h.copy(); }
+}
+
+extern int main()
+{
+    return 0;
+}
