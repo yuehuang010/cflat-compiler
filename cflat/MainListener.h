@@ -3997,6 +3997,7 @@ public:
             namedVar.Storage = alloca;
             namedVar.BaseType = fieldLLVMType;
             compiler->stackNamedVariable.back().namedVariable[varName] = namedVar;
+            compiler->RecordMoveGenBind(varName); // fresh tuple-destructure binding
         }
     }
 
@@ -4271,6 +4272,7 @@ public:
                     nv.TypeAndValue.Pointer  = true;
                     nv.IsOwning    = false;
                     compiler->stackNamedVariable.back().namedVariable[it->second.boundVarName] = nv;
+                    compiler->RecordMoveGenBind(it->second.boundVarName); // fresh type-case arm binding
                 }
 
                 ParseStatement(labeledStatement->statement());
@@ -4997,6 +4999,7 @@ public:
                         auto* iterI = compiler->builder->CreateLoad(i8PtrTy, iteratorAlloca);
                         auto* elemOut = compiler->builder->CreateBitCast(elemAlloca, i8PtrTy);
                         compiler->EmitWinrtThinSlotCall(iterI, iteratorName, "get_Current", { elemOut });
+                        compiler->RecordMoveGenBind(varName); // element is a fresh binding each iteration
                         ParseControlledBody(bodyStmt);
                         compiler->CreateContinueCall();
 
@@ -5110,6 +5113,7 @@ public:
                     if (elemVal)
                         compiler->CreateAssignment(elemVal, elemAlloca);
 
+                    compiler->RecordMoveGenBind(varName); // element is a fresh binding each iteration
                     ParseControlledBody(bodyStmt);
                     compiler->CreateContinueCall();
 
@@ -10177,6 +10181,9 @@ public:
         auto* compiler = Compiler();
         if (namedVar.IdentifierLine > 0)
         {
+            if (!namedVar.IsElementAccess)
+                compiler->RecordMoveUse(namedVar.CallerName, namedVar.FieldName,
+                                        namedVar.IdentifierLine, namedVar.IdentifierColumn);
             if (auto moved = compiler->MovedUseSubject(namedVar); !moved.empty())
             {
                 compiler->currentLine = namedVar.IdentifierLine;
@@ -10925,6 +10932,9 @@ public:
                 // The address of an element borrows, it does not own - clear IsOwning so taking
                 // `&a[i]` does not move/consume the owning buffer `a` it points into.
                 namedVar.IsOwning = false;
+                // Move-dataflow: taking a variable's address (e.g. an out-parameter `receive(&v)`)
+                // may reinitialize it, so treat it as a revive - the value is live again afterward.
+                compiler->RecordMoveGenRevive(namedVar.CallerName);
             }
             else if (opText == "*")
             {
@@ -14654,6 +14664,9 @@ public:
                             structVar = {};
                         }
 
+                        // A subscript result is an element (container slot): move-dataflow leaves
+                        // index/deref lvalues untracked, so mark it so USE-recording skips it.
+                        namedVar.IsElementAccess = true;
                         break;
                     }
                     case CFlatParser::RuleGenericTypeParameters:
@@ -15813,11 +15826,16 @@ public:
 
                                         // Compile-time use-after-move check: arg is a moved variable (or field).
                                         if (argNV.IdentifierLine > 0)
+                                        {
+                                            if (!argNV.IsElementAccess)
+                                                Compiler(ctx)->RecordMoveUse(argNV.CallerName, argNV.FieldName,
+                                                                             argNV.IdentifierLine, argNV.IdentifierColumn);
                                             if (auto moved = Compiler(ctx)->MovedUseSubject(argNV); !moved.empty())
                                             {
                                                 // (Same diagnostic shape as direct-call site; conservative - only fires when source storage was already moved.)
                                                 Compiler(ctx)->LogError(std::format("use of moved variable '{}'", moved));
                                             }
+                                        }
                                     }
                                 }
                                 // Bond/move ownership-mismatch checks against the funcptr's per-param flags.
@@ -15976,12 +15994,17 @@ public:
                                     // LoadNamedVariable check below is skipped for it - check explicitly here so
                                     // re-moving a field (or any moved variable) is rejected uniformly.
                                     if (argNV.IdentifierLine > 0)
+                                    {
+                                        if (!argNV.IsElementAccess)
+                                            Compiler(ctx)->RecordMoveUse(argNV.CallerName, argNV.FieldName,
+                                                                         argNV.IdentifierLine, argNV.IdentifierColumn);
                                         if (auto moved = Compiler(ctx)->MovedUseSubject(argNV); !moved.empty())
                                         {
                                             Compiler(ctx)->currentLine = argNV.IdentifierLine;
                                             Compiler(ctx)->currentColumn = argNV.IdentifierColumn;
                                             Compiler(ctx)->LogError(std::format("use of moved variable '{}'", moved));
                                         }
+                                    }
                                     auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
                                     if (!argValue) break;
                                     // An owned-string CALL result passed as a by-value (borrow) argument
@@ -16215,12 +16238,17 @@ public:
                                 // Use-after-move check for the method receiver.
                                 // LoadNamedVariable is not called for receivers, so check here.
                                 if (structVar.IdentifierLine > 0)
+                                {
+                                    if (!structVar.IsElementAccess)
+                                        Compiler(ctx)->RecordMoveUse(structVar.CallerName, structVar.FieldName,
+                                                                     structVar.IdentifierLine, structVar.IdentifierColumn);
                                     if (auto moved = Compiler(ctx)->MovedUseSubject(structVar); !moved.empty())
                                     {
                                         Compiler(ctx)->currentLine = structVar.IdentifierLine;
                                         Compiler(ctx)->currentColumn = structVar.IdentifierColumn;
                                         Compiler(ctx)->LogError(std::format("use of moved variable '{}'", moved));
                                     }
+                                }
                                 LLVMBackend::NamedVariable argumentNamedVar = structVar; // Copy;
                                 argumentNamedVar.TypeAndValue.VariableName = "";
                                 // An owning-value rvalue temp receiver is dropped after the call - destruct it.
@@ -16372,12 +16400,17 @@ public:
                                     // LoadNamedVariable check below is skipped for it - check explicitly here so
                                     // re-moving a field (or any moved variable) is rejected uniformly.
                                     if (argNV.IdentifierLine > 0)
+                                    {
+                                        if (!argNV.IsElementAccess)
+                                            Compiler(ctx)->RecordMoveUse(argNV.CallerName, argNV.FieldName,
+                                                                         argNV.IdentifierLine, argNV.IdentifierColumn);
                                         if (auto moved = Compiler(ctx)->MovedUseSubject(argNV); !moved.empty())
                                         {
                                             Compiler(ctx)->currentLine = argNV.IdentifierLine;
                                             Compiler(ctx)->currentColumn = argNV.IdentifierColumn;
                                             Compiler(ctx)->LogError(std::format("use of moved variable '{}'", moved));
                                         }
+                                    }
                                     // Load from storage if Primary isn't populated (simple variable reference)
                                     auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
                                     lambdaExpectedType = {};
@@ -17374,6 +17407,7 @@ public:
                 }
 
                 auto& captureNV = compiler->stackNamedVariable.back().namedVariable[cap.Name];
+                compiler->RecordMoveGenBind(cap.Name); // fresh capture binding in the lambda body
 
                 if (cap.ByReference)
                 {

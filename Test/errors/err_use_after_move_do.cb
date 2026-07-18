@@ -1,0 +1,16 @@
+// Loop-carried use-after-move in a do-while: p is moved in the body and the back-edge
+// re-enters the body with p already moved.
+expect_error("use of moved variable 'p'");
+struct Node { int v = default; };
+void sink(move Node* n) { delete n; }
+int main()
+{
+    Node* p = new Node;
+    int i = 0;
+    do
+    {
+        sink(p);
+        i = i + 1;
+    } while (i < 3);
+    return 0;
+}

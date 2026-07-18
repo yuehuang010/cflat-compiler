@@ -1,0 +1,19 @@
+// Loop-carried use-after-move at FIELD granularity: the owning field b.it is moved every
+// iteration without being reassigned, so the back-edge re-reaches the move with b.it moved.
+// Verifies field-level move-paths flow through the loop fixpoint.
+expect_error("use of moved variable 'b.it'");
+struct Item { int v = default; };
+struct Box { Item* it = default; };
+void take(move Item* x) { delete x; }
+int main()
+{
+    Box b;
+    b.it = new Item;
+    int i = 0;
+    while (i < 3)
+    {
+        take(b.it);
+        i = i + 1;
+    }
+    return 0;
+}

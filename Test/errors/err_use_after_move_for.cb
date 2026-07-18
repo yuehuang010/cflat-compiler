@@ -1,0 +1,15 @@
+// Loop-carried use-after-move: a classic for-loop moves p every iteration without
+// reassigning it, so on the second iteration p is already moved. The linear checker
+// misses this; the move-dataflow fixpoint catches it via the back-edge.
+expect_error("use of moved variable 'p'");
+struct Node { int v = default; };
+void sink(move Node* n) { delete n; }
+int main()
+{
+    Node* p = new Node;
+    for (int i = 0; i < 3; i = i + 1)
+    {
+        sink(p);
+    }
+    return 0;
+}

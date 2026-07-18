@@ -82,6 +82,7 @@
 #include "WinmdSignature.h"
 #include <array>
 #include "CompilerManager.h"
+#include "MoveDataflow.h"
 
 #include "LspSymbolIndex.h"
 #include "CFlatErrorListener.h"
@@ -736,6 +737,10 @@ public:
         bool BitfieldUnsigned   = false;
         int IdentifierLine = 0;          // source location for use-after-move error reporting
         int IdentifierColumn = 0;
+        // True when a subscript '[i]' produced this NamedVariable (an array/pointer element).
+        // Move-dataflow treats index/deref lvalues as untracked (permissive), so USE-recording
+        // skips these - moving out of a container slot is neither checked nor flagged.
+        bool IsElementAccess = false;
 
         llvm::Value* GetValue() const
         {
@@ -1049,6 +1054,9 @@ private:
     std::unique_ptr<llvm::LLVMContext> context;
 
     std::vector<StackState> stackNamedVariable;
+    // Per-llvm::Function move-event log (move-dataflow). Appended in emission
+    // order; consumed and cleared by RunMoveDataflow. Cleared by ResetForReanalysis.
+    std::unordered_map<llvm::Function*, std::vector<movedf::Event>> moveEventLog_;
     std::unordered_map<std::string, llvm::GlobalVariable*> globalNamedVariable;
     std::unordered_map<std::string, TypeAndValue> globalVariableTypes;
     // Declaration LINE of each global, for same-scope redeclaration detection. A true in-source
@@ -2071,6 +2079,8 @@ private:
             }
             if (symbolSink_ && !itr_nameArg->VariableName.empty())
                 symbolSink_->RegisterVariable(itr_nameArg->VariableName, itr_nameArg->TypeName);
+
+            RecordMoveGenBind(itr_nameArg->VariableName); // fresh parameter binding
 
             itr_nameArg++;
         }
@@ -10751,6 +10761,9 @@ public:
         namedVariable.Storage = alloc;
         namedVariable.TypeAndValue = typeValue;
         namedVariable.BaseType = type;
+        RecordMoveGenBind(typeValue.VariableName); // fresh local binding
+
+
 
         if (symbolSink_ && !typeValue.VariableName.empty())
             symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName,
@@ -10779,6 +10792,7 @@ public:
         namedVariable.Storage = nullptr;
         namedVariable.TypeAndValue = typeValue;
         namedVariable.BaseType = value->getType();
+        RecordMoveGenBind(typeValue.VariableName); // fresh inlined-param binding
 
         if (symbolSink_ && !typeValue.VariableName.empty())
             symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName);
@@ -14689,6 +14703,7 @@ public:
     void MarkVariableMoved(const std::string& name)
     {
         if (name.empty()) return;
+        RecordMoveKill(name);
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
@@ -14705,6 +14720,7 @@ public:
     void MarkVariableMovedIntoInterface(const std::string& name)
     {
         if (name.empty()) return;
+        RecordMoveKill(name);
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
@@ -14717,6 +14733,7 @@ public:
     void MarkVariableUnmoved(const std::string& name)
     {
         if (name.empty()) return;
+        RecordMoveGenRevive(name);
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
@@ -14733,6 +14750,7 @@ public:
     void MarkVariableFieldMoved(const std::string& name, const std::string& field)
     {
         if (name.empty() || field.empty()) return;
+        RecordMoveKillField(name, field);
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
@@ -14746,6 +14764,7 @@ public:
     void MarkVariableFieldUnmoved(const std::string& name, const std::string& field)
     {
         if (name.empty() || field.empty()) return;
+        RecordMoveGenReviveField(name, field);
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
@@ -14766,6 +14785,85 @@ public:
         if (!nv.FieldName.empty() && nv.MovedFields.count(nv.FieldName))
             return nv.CallerName + "." + nv.FieldName;
         return "";
+    }
+
+    // --- Move-dataflow event recording (Stage 1: engine, verify-only). ---
+    // Each helper tags the event with the block currently being emitted into; when no block
+    // is active (e.g. during the ForwardRefScanner pre-pass) the event is dropped.
+    void RecordMoveEvent(movedf::EventKind kind, const std::string& name,
+                         const std::string& field, int line, int col)
+    {
+        if (name.empty()) return;
+        if (!builder) return;
+        llvm::BasicBlock* bb = builder->GetInsertBlock();
+        if (!bb || !bb->getParent()) return;
+        moveEventLog_[bb->getParent()].push_back(
+            movedf::Event{ bb, kind, name, field, line, col });
+    }
+    void RecordMoveKill(const std::string& name)
+        { RecordMoveEvent(movedf::EventKind::KillWhole, name, "", 0, 0); }
+    void RecordMoveKillField(const std::string& name, const std::string& field)
+        { RecordMoveEvent(movedf::EventKind::KillField, name, field, 0, 0); }
+    void RecordMoveGenRevive(const std::string& name)
+        { RecordMoveEvent(movedf::EventKind::GenReviveWhole, name, "", 0, 0); }
+    void RecordMoveGenReviveField(const std::string& name, const std::string& field)
+        { RecordMoveEvent(movedf::EventKind::GenReviveField, name, field, 0, 0); }
+    void RecordMoveGenBind(const std::string& name)
+        { RecordMoveEvent(movedf::EventKind::GenBind, name, "", 0, 0); }
+    void RecordMoveUse(const std::string& name, const std::string& field, int line, int col)
+        { RecordMoveEvent(movedf::EventKind::Use, name, field, line, col); }
+
+    // Solve the MaybeMoved fixpoint per llvm::Function over the emitted module. This is the
+    // source of truth for loop-carried / cross-block / switch use-after-move (the inline
+    // linear checker owns straight-line + if/else and aborts before this runs). On any
+    // divergence, report the globally earliest (line, col) as a real error via LogError.
+    void RunMoveDataflow()
+    {
+        // Escape hatch: skip the pass entirely without a rebuild if it ever misfires.
+        const char* off = std::getenv("CFLAT_MOVE_DF_OFF");
+        if (off && off[0] != '\0') { moveEventLog_.clear(); return; }
+
+        const char* gate = std::getenv("CFLAT_MOVE_DF_VERIFY");
+        bool verify = gate && gate[0] != '\0';
+
+        movedf::Divergence earliest;
+        bool haveEarliest = false;
+        int total = 0;
+        if (module)
+        {
+            for (auto& F : *module)
+            {
+                if (F.isDeclaration() || F.empty()) continue;
+                auto it = moveEventLog_.find(&F);
+                if (it == moveEventLog_.end()) continue;
+                auto diverged = movedf::AnalyzeFunction(&F, it->second);
+                total += (int)diverged.size();
+                for (const auto& d : diverged)
+                {
+                    if (verify)
+                        fprintf(stderr, "MOVE-DF: %s: maybe-moved use of '%s' at %d:%d\n",
+                                F.getName().str().c_str(), d.path.c_str(), d.line, d.col);
+                    // Only report a use with a real source location; pick globally earliest.
+                    if (d.line <= 0) continue;
+                    if (!haveEarliest || d.line < earliest.line ||
+                        (d.line == earliest.line && d.col < earliest.col))
+                        { earliest = d; haveEarliest = true; }
+                }
+            }
+        }
+        if (verify)
+            fprintf(stderr, "MOVE-DF: summary: %d maybe-moved use(s)\n", total);
+
+        // Clear BEFORE LogError - it throws, so this is the only reliable clear point on the
+        // single-file CLI path (ResetForReanalysis also clears, but may not be reached here).
+        moveEventLog_.clear();
+
+        if (haveEarliest)
+        {
+            SetSourceLocation(earliest.line, earliest.col);
+            LogError(std::format(
+                "use of moved variable '{}' (moved on an earlier loop iteration)", earliest.path));
+        }
     }
 
     // Mark a pre-declared string local as owning its heap buffer. Used when a plain

@@ -784,6 +784,12 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         stream.close();
         if (verbose) std::cout << "[verbose]   walk complete\n";
 
+        // Move-dataflow: solve the MaybeMoved fixpoint over the fully-emitted module and report
+        // any loop-carried / cross-block use-after-move the inline checker missed (LogError).
+        // Must run INSIDE this try and BEFORE the did-not-occur check so a matching error is
+        // caught as ExpectedErrorReceived (file-scope expect_error stays armed to here).
+        RunMoveDataflow();
+
         }
         catch (const ExpectedErrorReceived&)
         {
@@ -2325,6 +2331,10 @@ void LLVMBackend::ResetForReanalysis()
     // Destroy module and builder BEFORE the context: both hold internal
     // references to the context, and their destructors must not run against
     // an already-freed context object.
+    // Drop any move-dataflow events keyed by the old module's Functions before the module
+    // (and those Functions) are destroyed - stale keys must never survive the reset.
+    moveEventLog_.clear();
+
     module.reset();
     builder.reset();
     context = std::make_unique<llvm::LLVMContext>();

@@ -908,6 +908,39 @@ extern int main()
     passed += Test("move_return_forward_freed_once", dtorCount, 1);
     total++;
 
+    // Test 6a: move-in-loop with reassign each iteration. The reassignment revives the
+    // pointer across the back-edge, so this is NOT a loop-carried use-after-move and must
+    // compile clean (guards the move-dataflow pass against a false positive).
+    dtorCount = 0;
+    {
+        Resource* r = new Resource();
+        int i = 0;
+        while (i < 3)
+        {
+            consume(r);          // moves + frees r (dtor +1)
+            r = new Resource();  // revive: fresh owner for the next iteration
+            i = i + 1;
+        }
+        consume(r);              // free the last one
+    }
+    passed += Test("move_loop_reassign_revive", dtorCount, 4);
+    total++;
+
+    // Test 6b: fresh owning local declared inside the loop each iteration - the binding
+    // dominates every use, so no loop-carried move; must compile clean.
+    dtorCount = 0;
+    {
+        int i = 0;
+        while (i < 3)
+        {
+            Resource* q = new Resource();
+            consume(q);
+            i = i + 1;
+        }
+    }
+    passed += Test("move_loop_fresh_local", dtorCount, 3);
+    total++;
+
     // Worker-style ownership transfer (mirrors repro_new_struct.cb without threads).
     // Caller 'new's a Slot, hands it to a function via 'move'; callee writes through
     // ->slot and returns. Expect exactly one destructor, observed value updated.

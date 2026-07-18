@@ -1,0 +1,20 @@
+// Loop-carried use-after-move where the move is CONDITIONAL: after the branch merge p is
+// only maybe-moved, and the loop back-edge carries that maybe-moved state to the next
+// iteration's move. Exercises the union join at the if-merge plus the back-edge.
+expect_error("use of moved variable 'p'");
+struct Node { int v = default; };
+void sink(move Node* n) { delete n; }
+int main()
+{
+    Node* p = new Node;
+    int i = 0;
+    while (i < 5)
+    {
+        if (i == 2)
+        {
+            sink(p);
+        }
+        i = i + 1;
+    }
+    return 0;
+}

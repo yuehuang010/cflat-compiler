@@ -1,0 +1,13 @@
+// Loop-carried use-after-move: p is moved into sink() on iteration 1, then used again on
+// iteration 2 via the back-edge. The inline linear checker misses this; the move-dataflow
+// fixpoint catches it at end-of-compile. File-scope bare-semicolon form (armed until then).
+expect_error("use of moved variable 'p'");
+struct Node { int v = default; };
+void sink(move Node* n) { delete n; }
+int main()
+{
+    Node* p = new Node;
+    int i = 0;
+    while (i < 3) { sink(p); i++; }
+    return 0;
+}
