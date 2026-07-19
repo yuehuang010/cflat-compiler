@@ -7,4 +7,23 @@ expect_error("cannot initialize unique 's' from a borrowed value") {
     void boxStack() { Circle t; unique IShape s = t; }
 }
 
+// Assignment leg: stack-boxing into an already-owning `unique` interface local would point the
+// owning slot at a stack address that scope-exit teardown then frees (heap corruption) - rejected.
+expect_error("cannot assign a borrowed value to unique interface 's'") {
+    void boxStackAssign() { unique IShape s = new Circle(); Circle t; s = t; }
+}
+
+// Param leg: a `unique` interface param takes ownership and frees at scope exit, so a stack value
+// (whose boxed data pointer is a stack address) must not be bound to it.
+void sink(unique IShape s) {}
+expect_error("cannot pass a stack value to unique interface parameter 's'") {
+    void passStack() { Circle t; sink(t); }
+}
+
+// A `unique` LOCAL is freed automatically at scope exit; an explicit delete is unnecessary and the
+// message is local-specific (not the field wording).
+expect_error("cannot delete unique local 's'") {
+    void delLocal() { unique IShape s = new Circle(); delete s; }
+}
+
 extern int main() { return 0; }

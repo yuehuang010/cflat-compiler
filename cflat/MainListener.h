@@ -7501,7 +7501,11 @@ public:
                         // source would create a second owner of one pointer - reject it. A `unique`
                         // INTERFACE local additionally rejects stack boxing (`unique IShape s = t;`):
                         // only heap `new` sources are legal (no silent heap-promotion of a stack value).
-                        bool srcIsNullLiteral = right != nullptr && llvm::isa<llvm::ConstantPointerNull>(right);
+                        // A raw null pointer, or the null fat-ptr an interface `= nullptr` upcasts
+                        // to (a null aggregate, not a ConstantPointerNull), owns nothing - allowed.
+                        bool srcIsNullLiteral = right != nullptr
+                            && llvm::isa<llvm::Constant>(right)
+                            && llvm::cast<llvm::Constant>(right)->isNullValue();
                         bool destUniqueLoc = (typeAndValue.Pointer && !typeAndValue.ElemPointer)
                             || typeAndValue.IsInterface;
                         if (initializer && typeAndValue.IsUnique && destUniqueLoc
@@ -8298,6 +8302,13 @@ public:
             // Reset the flag so it doesn't leak into the next declaration in this scope.
             // The over-alignment tag rides the same signal and must be reset with it, or a
             // later owning declaration adopts it and aligned-frees an ordinary block.
+            // Capture whether the RHS is an OWNED source (direct `new`, a move-returning call,
+            // or a `move` expression) before the flags are cleared: the D5 assignment reject for
+            // a `unique` interface local (below, after the upcast) needs it to tell a heap-owned
+            // source from a stack box / borrow.
+            bool srcIsOwnedForUniqueIface = compiler->lastOwningResult
+                || compiler->lastCallReturnsOwned
+                || rightNV.TypeAndValue.IsMove;
             compiler->lastOwningResult = false;
             compiler->lastAllocAlignment = 0;
             compiler->lastCallReturnsAllocAlign = 0;
@@ -8506,6 +8517,43 @@ public:
             {
                 right = compiler->ReboxInterfaceIfNeeded(
                     right, rightNV.TypeAndValue.TypeName, namedVar.TypeAndValue.TypeName);
+            }
+
+            // D5 (assignment leg): a `unique` interface local owns a heap-boxed object, and its
+            // scope-exit teardown frees the fat-ptr data pointer. Reassigning it from a borrowed
+            // value or a stack box would either create a second owner (leak / double-free) or point
+            // the owning slot at a STACK address that teardown then frees (heap corruption). Only a
+            // heap `new`, a `move`, a move-returning call, or nullptr is legal - mirror decl-init
+            // (ParseDeclaration). A null value (raw null or the null fat-ptr from the nullptr upcast
+            // above) owns nothing and is allowed.
+            bool destUniqueIface = namedVar.TypeAndValue.IsUnique
+                && namedVar.TypeAndValue.IsInterface
+                && !namedVar.TypeAndValue.IsInterfacePointer;
+            bool srcIsNullForUniqueIface = right != nullptr
+                && llvm::isa<llvm::Constant>(right)
+                && llvm::cast<llvm::Constant>(right)->isNullValue();
+            if (operatorText == "=" && destUniqueIface
+                && !srcIsOwnedForUniqueIface && !srcIsNullForUniqueIface)
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot assign a borrowed value to unique interface '{}' - the source still owns "
+                    "it (or is a stack value), so this would leak or free a stack address at scope "
+                    "exit; assign 'new', a 'move' expression, a move-returning call, or 'nullptr'",
+                    namedVar.CallerName));
+                return right;
+            }
+
+            // A valid owning reassignment to a `unique` interface LOCAL frees the OLD pointee first
+            // (its scope-exit teardown only sees the final value), then adopts ownership of the new
+            // one. `s = nullptr` frees the old and stores null (release-early). Self-assign cannot
+            // occur - the reject above only admits new / move / move-call / null.
+            if (operatorText == "=" && destUniqueIface
+                && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination)))
+            {
+                auto* oldFat = compiler->builder->CreateLoad(compiler->GetFatPtrType(), destination);
+                compiler->DeleteInterfaceValue(oldFat, namedVar.TypeAndValue.TypeName, nullptr);
+                if (srcIsOwnedForUniqueIface && !namedVar.CallerName.empty())
+                    compiler->SetVariableOwning(namedVar.CallerName, true);
             }
 
             // Pointer variable assigned a struct value: catch the mismatch here
@@ -12573,11 +12621,29 @@ public:
             // the old destructor. Keyed on IsUnique rather than FieldName: a bare self-field
             // access (`delete _root;` inside the struct's own method - the case that matters, and
             // the one the from-outside rule below cannot see) comes from GetMemberVariable, which
-            // purposely leaves OwningStructName/FieldName empty. `unique` only ever lands on a
-            // field, so IsUnique alone cannot misfire on a local. Checked ahead of the from-outside
-            // rule so the precise reason wins for inside and outside deletes alike.
+            // purposely leaves OwningStructName/FieldName empty. `unique` now also lands on LOCALS
+            // and params; the alloca-storage test inside splits those out to a local-specific
+            // message. Checked ahead of the from-outside rule so the precise reason wins for inside
+            // and outside deletes alike.
             if (namedVar.TypeAndValue.IsUnique)
             {
+                // A `unique` LOCAL (alloca storage, no field name) is freed automatically at scope
+                // exit, and reassignment frees the current pointee first. Distinguish it from the
+                // field case (whose storage is a GEP off `this`) so the advice fits.
+                bool isLocal = namedVar.Storage != nullptr
+                    && llvm::isa<llvm::AllocaInst>(namedVar.Storage)
+                    && namedVar.FieldName.empty();
+                if (isLocal)
+                {
+                    std::string nm = namedVar.CallerName.empty()
+                        ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
+                    LogErrorContext(ctx, std::format(
+                        "cannot delete unique local '{}' - a unique local is freed automatically at "
+                        "scope exit (and reassigning it frees the current object first), so an explicit "
+                        "delete is unnecessary. Let it go out of scope to release it.",
+                        nm));
+                    return {};
+                }
                 std::string fieldName = namedVar.FieldName.empty()
                     ? namedVar.TypeAndValue.VariableName : namedVar.FieldName;
                 std::string owner = namedVar.OwningStructName.empty()

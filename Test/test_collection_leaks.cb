@@ -160,6 +160,9 @@ int g_shapeDtor = 0;
 interface IShapeLeak { int area(); };
 class CircleLeak : IShapeLeak { int r = 0; int area() { return r * r; } ~CircleLeak() { g_shapeDtor = g_shapeDtor + 1; } };
 
+// A `unique` interface PARAM takes ownership: the callee frees the boxed object at scope exit.
+void sinkShape(unique IShapeLeak s) {}
+
 // PLAIN (non-`move`) string return that hands back a freshly owned concat. Passing its result -
 // or an owned local bound from it - bare into list<string>.add(move)/set(move) used to LEAK: the
 // move-arg lowering heap-copied a fresh buffer for the slot (the static owned flag is unset for a
@@ -965,6 +968,51 @@ extern int main()
             total++; passed += Test("bare list<iface> view frees nothing", g_shapeDtor, 0);
         }
         total++; passed += Test("bare list<iface> owner frees all", g_shapeDtor, 2);
+    }
+
+    // === Scalar `unique` interface local/param teardown (the stage-5 leak, finally fixed) ===
+    // A scalar `unique IShapeLeak` local owns its heap-boxed object and frees it at scope exit
+    // through the vtable dtor slot - mirroring the container leg above and the `unique Circle*`
+    // scalar. A `unique IShapeLeak` PARAM (a synthesized move param) frees it in the callee.
+    {
+        g_shapeDtor = 0;
+        { unique IShapeLeak s = new CircleLeak(); }
+        total++; passed += Test("scalar unique iface local teardown", g_shapeDtor, 1);
+
+        g_shapeDtor = 0;
+        sinkShape(new CircleLeak());
+        total++; passed += Test("unique iface move-param teardown", g_shapeDtor, 1);
+
+        // nullptr owns nothing: scope exit is a null-guarded no-op, no dtor runs.
+        g_shapeDtor = 0;
+        { unique IShapeLeak s = nullptr; }
+        total++; passed += Test("scalar unique iface null no-op", g_shapeDtor, 0);
+
+        // Consuming an owning local by move/pass transfers ownership to the callee; the source is
+        // disowned so it frees exactly ONCE (double-free before the fix).
+        g_shapeDtor = 0;
+        { unique IShapeLeak s = new CircleLeak(); sinkShape(move s); }
+        total++; passed += Test("consume unique iface local by move frees once", g_shapeDtor, 1);
+
+        g_shapeDtor = 0;
+        { unique IShapeLeak s = new CircleLeak(); sinkShape(s); }
+        total++; passed += Test("consume unique iface local by pass frees once", g_shapeDtor, 1);
+
+        // Moving an owning local into an owning container: the container owns it, the source is
+        // disowned - freed exactly once at the container's teardown.
+        g_shapeDtor = 0;
+        {
+            list<unique IShapeLeak> xs;
+            unique IShapeLeak s = new CircleLeak();
+            xs.add(move s);
+        }
+        total++; passed += Test("move unique iface local into container frees once", g_shapeDtor, 1);
+
+        // Reassigning an owning `unique` interface local frees the OLD object first, then the new
+        // one at scope exit: two objects created, two freed, none leaked.
+        g_shapeDtor = 0;
+        { unique IShapeLeak s = new CircleLeak(); s = new CircleLeak(); }
+        total++; passed += Test("reassign unique iface local frees old and new", g_shapeDtor, 2);
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

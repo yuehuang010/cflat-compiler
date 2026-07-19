@@ -1539,6 +1539,36 @@ private:
         }
     }
 
+    // Set a named local's ownership flag (e.g. a `unique` interface local adopting a new owned
+    // value on reassignment, so its scope-exit teardown frees the current pointee).
+    void SetVariableOwning(const std::string& varName, bool value)
+    {
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            auto it = frame.namedVariable.find(varName);
+            if (it != frame.namedVariable.end())
+            {
+                it->second.IsOwning = value;
+                return;
+            }
+        }
+    }
+
+    // True when the named variable currently owns its value (freed on scope exit). Used to decide
+    // whether consuming it (into a move interface param) must disown the source.
+    bool IsVariableOwning(const std::string& name) const
+    {
+        if (name.empty()) return false;
+        for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                return it->second.IsOwning;
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                return it->second.IsOwning;
+        }
+        return false;
+    }
+
     struct VarStorageRef { llvm::Value* Storage = nullptr; llvm::Type* BaseType = nullptr; };
     VarStorageRef FindVariableStorage(const std::string& name) const
     {
@@ -1645,6 +1675,30 @@ private:
 
         builder->CreateBr(afterBB);
         builder->SetInsertPoint(afterBB);
+    }
+
+    // True when this variable owns a heap-boxed interface value freed at scope exit: a `unique`
+    // interface local (IsOwning set from its `new` / move source) or a `unique` interface param.
+    // IsUnique is load-bearing: the generic `list<T>::add(move T value)` is ALWAYS a move param,
+    // but for a borrow `list<IShape>` (T not unique) `value` does not own and must NOT be freed -
+    // only a genuinely `unique` interface value does. Its Storage is a fat-ptr {i8*,i8*} slot, so
+    // EmitOwningPtrCleanup (single pointer) must not run on it - EmitOwningInterfaceCleanup handles
+    // the fat-ptr teardown instead.
+    bool IsOwningInterfaceValue(const NamedVariable& namedVar) const
+    {
+        return namedVar.IsOwning && namedVar.Storage != nullptr
+            && namedVar.TypeAndValue.IsUnique
+            && namedVar.TypeAndValue.IsInterface && !namedVar.TypeAndValue.IsInterfacePointer;
+    }
+
+    // Free a `unique`/`move` interface VALUE (local or param): load the fat value from its slot
+    // and route through DeleteInterfaceValue (vtable dtor slot + operator delete), nulling the
+    // slot's data field so a prior explicit delete (which also nulls it) makes this a no-op. The
+    // interface name is the value's TypeName.
+    void EmitOwningInterfaceCleanup(const NamedVariable& namedVar)
+    {
+        auto* fatVal = builder->CreateLoad(GetFatPtrType(), namedVar.Storage);
+        DeleteInterfaceValue(fatVal, namedVar.TypeAndValue.TypeName, namedVar.Storage);
     }
 
     void RegisterOwnedStringTemp(llvm::Value* value)
@@ -1843,6 +1897,13 @@ private:
 
         for (const auto& [varName, namedVar] : frame.namedVariable)
         {
+            // A `unique` interface local owns a heap-boxed object: free it via the vtable dtor slot
+            // + operator delete (mirrors the owning-pointer path; data field nulled so a prior delete no-ops).
+            if (IsOwningInterfaceValue(namedVar))
+            {
+                EmitOwningInterfaceCleanup(namedVar);
+                continue;
+            }
             if (namedVar.TypeAndValue.Pointer && namedVar.IsOwning)
             {
                 if (namedVar.RefCountStorage == nullptr)
@@ -1887,13 +1948,14 @@ private:
         // Clean up owning function parameters (move params)
         for (const auto& [varName, namedVar] : frame.functionArgument)
         {
-            // A `move` interface fat-ptr param is owning, but its Storage is a {i8*,i8*} slot,
-            // not a single pointer - so EmitOwningPtrCleanup must not run on it. Interface
-            // ownership is released by an explicit `delete` (interface locals are likewise not
-            // auto-destructed at scope exit); the move flag only authorizes that delete.
-            if (namedVar.IsOwning && namedVar.Storage != nullptr
-                && namedVar.TypeAndValue.IsInterface && !namedVar.TypeAndValue.IsInterfacePointer)
+            // Any interface fat-ptr param is handled here, never falling through to EmitOwningPtrCleanup
+            // (which would bitcast the {i8*,i8*} slot - invalid IR); only a `unique` (owning) one is freed.
+            if (namedVar.TypeAndValue.IsInterface && !namedVar.TypeAndValue.IsInterfacePointer)
+            {
+                if (IsOwningInterfaceValue(namedVar))
+                    EmitOwningInterfaceCleanup(namedVar);
                 continue;
+            }
             if (namedVar.IsOwning && namedVar.Storage != nullptr)
                 EmitOwningPtrCleanup(namedVar);
 
@@ -9819,6 +9881,22 @@ public:
                     srcStorage = ref.Storage;
                     if (srcBaseTy == nullptr) srcBaseTy = ref.BaseType;
                 }
+                // An OWNING interface VALUE arg (an owning `unique IShape` local) moved into a
+                // move interface param transfers ownership: null the source fat-ptr's data field so
+                // its scope-exit teardown sees null and no-ops, else callee and source double-free.
+                // Raw struct-value boxes are rejected at the call site, so only a real interface
+                // value reaches here; the owning check keeps a borrow source untouched.
+                if (params[i].IsInterface && !params[i].IsInterfacePointer
+                    && args[i].TypeAndValue.IsInterface
+                    && (args[i].IsOwning || IsVariableOwning(args[i].CallerName))
+                    && srcStorage != nullptr)
+                {
+                    auto* dataField = builder->CreateStructGEP(GetFatPtrType(), srcStorage, 1);
+                    builder->CreateStore(
+                        llvm::ConstantPointerNull::get(builder->getInt8Ty()->getPointerTo()), dataField);
+                    if (!args[i].CallerName.empty() && !isFieldAccess)
+                        MarkVariableMoved(args[i].CallerName);
+                }
                 if (srcStorage != nullptr && !isInterfaceBorrow)
                 {
                     // dyn_cast_or_null: a hand-built NamedVariable may carry storage but a null
@@ -14110,6 +14188,21 @@ public:
 
             if (!inVariadicRange && candParamItr->IsInterface && !arg.TypeAndValue.IsInterface)
             {
+                // A `unique` interface param takes ownership and frees its boxed object at scope
+                // exit. A struct VALUE source would box a STACK address as the data pointer, so
+                // that teardown would free a stack address (heap corruption). Only a heap pointer
+                // (`new`) may transfer ownership here. Gated on IsUnique, not IsMove: a borrow
+                // `list<IShape>::add(move T value)` is a move param but does not own, so a stack
+                // value bound to it stays legal.
+                if (candParamItr->IsUnique && !arg.TypeAndValue.Pointer)
+                {
+                    LogError(std::format(
+                        "call to '{}': cannot pass a stack value to unique interface parameter '{}' - "
+                        "it takes ownership and frees the object at scope exit, so the source must be "
+                        "a heap 'new' (or a 'move' of an owned interface value), not a stack value",
+                        functionName, candParamItr->VariableName));
+                    return nullptr;
+                }
                 // Derive struct name from TypeName if available, else from BaseType
                 std::string structName = arg.TypeAndValue.TypeName;
                 if (structName.empty() && arg.BaseType)
