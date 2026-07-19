@@ -90,7 +90,9 @@ pre-existing shadowing limitation - do not "fix" it in Stage 1).
 
 ## Rollout (staged - each stage independently verifiable with ./test.sh)
 
-Stage 0 (DONE): internal/issue/move-state-loop-merge.md records the gap; this file is the design.
+Stage 0 (DONE): ~~internal/issue/move-state-loop-merge.md~~ **FIXED 2026-07-18, issue file
+deleted.** It recorded the gap (loop back-edge silence read as sound when it was not); this file
+is the design that closed it.
 
 Stage 1 (DONE): engine, verify-only, NO behavior change. cflat/MoveDataflow.h holds the
 per-llvm::Function MAY/union fixpoint over the emitted LLVM CFG; LLVMBackend records move
@@ -112,8 +114,8 @@ must not leak). Escape hatch: CFLAT_MOVE_DF_OFF disables the pass. Regression:
 Test/errors/err_use_after_move_loop.cb (file-scope bare form). Verified: ./test.sh Release
 391/0/8, no regressions.
 
->> The loop-merge soundness gap (internal/issue/move-state-loop-merge.md) is CLOSED by
->> Stages 1+2. That issue file can be deleted once this is committed.
+>> The loop-merge soundness gap (~~internal/issue/move-state-loop-merge.md~~ **FIXED
+>> 2026-07-18, issue file deleted.**) is CLOSED by Stages 1+2.
 
 Stage 3 (BLOCKED / discretionary - NOT done): share the engine. parameterize the meet (union
 for move MAY-state; intersection for lock MUST-state) and reuse it for the lock hand-over-hand
@@ -159,5 +161,6 @@ engine lands.
 
 ## Related
 
-- internal/issue/move-state-loop-merge.md (the gap this closes)
+- ~~internal/issue/move-state-loop-merge.md~~ **FIXED 2026-07-18, issue file deleted.** (the
+  gap this closed: use-after-move across a loop back-edge was unsound silence, not a proof)
 - internal/plan/lock-hand-over-hand.md, internal/plan/lock-checker.md (share the merge engine)

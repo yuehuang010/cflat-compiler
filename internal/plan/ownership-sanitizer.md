@@ -84,8 +84,10 @@ Fix, in order:
    loop-exit move-state into the loop-header state (conservatively: any owned variable
    moved anywhere in the body is "possibly-MOVED" at the header). Bounded change - the
    Save/Restore/Merge scaffolding already exists for if/else. This is a LANGUAGE
-   SOUNDNESS FIX, not a sanitizer feature. Tracked as a known issue:
-   internal/issue/move-state-loop-merge.md. NOTE the shared machinery with the lock
+   SOUNDNESS FIX, not a sanitizer feature. Was tracked as a known issue:
+   ~~internal/issue/move-state-loop-merge.md~~ **FIXED 2026-07-18, issue file deleted** (shipped
+   as the move-dataflow fixpoint, cflat/MoveDataflow.h; loop-carried use-after-move is now a
+   compile error). NOTE the shared machinery with the lock
    hand-over-hand typestate (internal/plan/lock-hand-over-hand.md) - a "possibly-X at a
    join point" merge should be built ONCE and shared (move-state is a MAY/union analysis;
    held-locks is a MUST/intersection analysis - same plumbing, opposite meet).
@@ -152,7 +154,8 @@ rest. The differentiated value is entirely in the shadow MAP.
 
 - M0 DONE (committed): loop back-edge move-state soundness, shipped as the move-dataflow
   fixpoint (internal/plan/move-dataflow.md, cflat/MoveDataflow.h). Loop-carried
-  use-after-move is now a compile error. internal/issue/move-state-loop-merge.md is closed.
+  use-after-move is now a compile error. ~~internal/issue/move-state-loop-merge.md~~
+  **FIXED 2026-07-18, issue file deleted.**
 - M1 DONE (uncommitted working tree): `--sanitize=ownership` (+ `-fsanitize=ownership`),
   per-owning-pointer-local i64 origin slot (set on move, cleared on revive), deref guard
   `if (origin!=0 && ptr==null) __cflat_own_trap(useLoc, originLoc)`, pure-cflat trap shim
@@ -327,8 +330,9 @@ Ordering: Stage 1 first (foundation, clearly correct, thread-safe). Stage 2 afte
 
 ## Related
 
-- internal/issue/move-state-loop-merge.md - the M0 static soundness fix (loop back-edge
-  move-state merge) that this plan's split depends on.
+- ~~internal/issue/move-state-loop-merge.md~~ **FIXED 2026-07-18, issue file deleted.** - was
+  the M0 static soundness fix (loop back-edge move-state merge) that this plan's split depends
+  on; now shipped as the move-dataflow fixpoint (internal/plan/move-dataflow.md).
 - internal/plan/lock-hand-over-hand.md - also pointer-variable typestate; the loop-merge
   "possibly-X at a join point" machinery should be built ONCE and shared (move-state =
   MAY/union; held-locks = MUST/intersection - same plumbing, opposite meet).

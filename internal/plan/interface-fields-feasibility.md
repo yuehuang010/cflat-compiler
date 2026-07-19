@@ -140,6 +140,12 @@ Every value is the expected one. HeapAudit reports ONE 64-byte leak, which is th
 (a `list<IFace>` with one `add` and no interface fields anywhere leaks the same 64 bytes).
 With the list removed, the program is 100% leak-clean.
 
+> DIAGNOSED 2026-07-18, see `internal/plan/interface-value-ownership.md`. This leak is not just
+> the backing buffer: a container never destroys interface elements at all, because
+> `is_pointer` is false for an interface name and both dtor paths gate on `dataStructures`,
+> which excludes interfaces. It is not fixable in the container - the fat pointer records no
+> provenance, so freeing would corrupt stack-boxed elements. Needs a language-level answer.
+
 Diagnostics also work:
 ```
 'Missing' does not implement interface field 'IE::string title'

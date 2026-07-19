@@ -239,7 +239,9 @@ too, so it would not close the hole - pure ceremony.
 
 **CORRECTION 2026-07-16: "every construction path" was overstated - a FIXED ARRAY OF STRUCTS is not
 reliably zero-initialized.** See
-[fixed-array-of-structs-not-default-initialized](../issue/fixed-array-of-structs-not-default-initialized.md).
+~~fixed-array-of-structs-not-default-initialized~~ **FIXED 2026-07-18, issue file deleted**
+(`EmitFixedArrayDefaultInit` in `MainListener.h` now default-inits fixed-array locals, mirroring
+the scalar path).
 The paths actually verified above (scalar stack local, `new T()`, `new T[n]`, user-ctor entry) all
 hold and were tested; **array-of-struct elements were never tested and are never initialized**.
 `D_string[4]` yields a garbage `string` header whose destructor reads the owned bit out of garbage
@@ -455,16 +457,15 @@ recorded and untouched. Migration stays BLOCKED on finding 2 alone.
    compares only `TypeName` and ignores `IsMove` entirely - a separate pre-existing bug, see
    [interface-method-ownership-contract-unchecked](../issue/interface-method-ownership-contract-unchecked.md).
    That is the right direction, not an inconsistency to level down.
-2. **A `(T*)` cast defeats all three Stage 3 rules.** STILL OPEN - moved to
-   [cast-defeats-unique-borrow-tracking](../issue/cast-defeats-unique-borrow-tracking.md) 2026-07-16,
-   because **the correct behavior is undecided** (should a cast preserve borrow provenance, be an
-   explicit escape hatch, or be rejected on a `unique` field?) and that decision is the maintainer's,
-   not a remediation task. `Res* a = (Res*)b.p; delete a;` compiles and double-frees while the
-   un-cast form is rejected; same for `move` and store-into-field. Worse than the field-to-field
-   blocker was: the escaping spelling is the identical code PLUS a cast - exactly what a user
-   reaches for when the compiler rejects a pointer assignment - and the `delete` diagnostic steers
-   toward `move`, which the same cast also bypasses. **This is the sole remaining migration
-   blocker.**
+2. **A `(T*)` cast defeats all three Stage 3 rules.** ~~cast-defeats-unique-borrow-tracking~~
+   **FIXED 2026-07-17, issue file deleted.** Was moved out 2026-07-16 because **the correct
+   behavior was undecided** (should a cast preserve borrow provenance, be an explicit escape
+   hatch, or be rejected on a `unique` field?) and that decision was the maintainer's, not a
+   remediation task. `Res* a = (Res*)b.p; delete a;` used to compile and double-free while the
+   un-cast form was rejected; same for `move` and store-into-field - the escaping spelling was
+   the identical code PLUS a cast, and the `delete` diagnostic steered toward `move`, which the
+   same cast also bypassed. Decided: a cast PRESERVES borrow provenance. Fixed via
+   `NamedVariable::IsUniqueFieldAlias`, covered by four `err_unique_cast_*` tests.
 3. **Brace-init / element sugar bypasses Trap A.** `Box c = { item = borrowed };` compiles and
    double-frees; the identical `=` spelling is correctly rejected. `EmitOneFieldInit`
    (`MainListener.h:10881`) is a SECOND independent field-store path - it handles `string` deep-copy,
@@ -493,8 +494,8 @@ interaction, which is the part a `unique` reader needs.
 | ~~closure-capture-owning-struct-double-free~~ | **FIXED 2026-07-16, issue file deleted.** Was the worst of the five for this feature's pitch: a `unique`-field struct captured in a closure double-freed, and the only workaround was writing a destructor to make `unique` safe. Root cause was NOT the env teardown (the issue file's guess, wrong - the env is uninvolved, and a by-reference capture owns nothing): the LAMBDA INVOKER BODY registered the capture as an ordinary named local without `IsAliasBorrow`, so `EmitDestructorsForScope` destructed the caller's struct through the borrowed pointer **on every call**. Fix: one line, `captureNV.IsAliasBorrow = true` (`MainListener.h:17033`). Verified: 3 calls -> 0 in-body dtor runs, 1 at the owner's scope exit. |
 | ~~interface-method-ownership-contract-unchecked~~ | **FIXED 2026-07-16, issue file deleted.** Stage 5 made interface FIELDS enforce ownership agreement; methods did not, so `VerifyInterfaceMethodContract` (`LLVMBackend.h`) now checks param `IsMove` plus return `IsMove`/`IsAlias`/`IsBond` on the selected overload. It also forced a real `core/interfaces.cb` correction (`IEnumerable`/`IList` were declaring plain returns for what `list<T>` actually hands back as `alias` borrows, and plain params for what it takes by `move`) and exposed that **`IsAlias` was never in the `--init` round-trip** - now `"al"`, alongside `"mv"`/`"bd"`/`"uq"`. |
 | ~~alloc-align-clause-indirect-store-unchecked~~ | **FIXED 2026-07-16, issue file deleted.** An indirect store of a plain-`new` block into an `alignas(0,N)` field now errors instead of routing `__delete_aligned` at it. The naive rule ("require agreement whenever the field has a clause") OVER-rejects: type-carried alignment (`struct alignas(64) T`) yields `AllocAlignment == 0` and so "disagrees" with a `64` clause while being perfectly correct - `ElementTypeIsOverAligned` carves it out, mirroring the free site's own recovery. Also note the pre-existing message was unsatisfiable for scalars: the grammar only hangs `alignmentSpecifier` off the ARRAY form of `new`, so there is no `new T alignas(...)` to follow the old advice with. |
-| [deref-assign-owning-struct-double-free](../issue/deref-assign-owning-struct-double-free.md) | `*pc = *pa` is a shorter whole-struct spelling of the field-to-field family. `c = a;` correctly auto-moves; the deref lvalue is not a move site. A plain `string` field reproduces it. |
-| [container-copy-moves-or-shares-elements](../issue/container-copy-moves-or-shares-elements.md) | **Do not read a green `list<Box>.copy()` as evidence the `unique` copy guard held** - it passes only because the source is silently emptied, so no second owner exists. Once container copy routes through copy resolution it will correctly report the `unique` copy error. Wider than first thought: `list<T*>` nulls source elements too (the doc comment says the opposite), and `dictionary<K,V>.copy()` CRASHES with heap corruption. Blocked on a compiler decision - see the issue. |
+| ~~deref-assign-owning-struct-double-free~~ | **FIXED 2026-07-18, issue file deleted.** Was a shorter whole-struct spelling of the field-to-field family: `*pc = *pa` double-freed while `c = a;` correctly auto-moves, because the deref lvalue was not treated as a move site. Fixed via auto-move for pointer-deref lvalues, so `*pc = *pa` no longer double-frees; a plain `string` field reproduced it too. |
+| [interface-value-ownership](interface-value-ownership.md) (plan) | The crash and silent-empty-source parts of `container-copy-moves-or-shares-elements` are FIXED (shipped 2026-07-17: container copy now routes through copy resolution and correctly reports the `unique` copy error; `list<T*>` and `dictionary<K,V>.copy()` no longer crash/mis-null). The residual was PROMOTED TO A PLAN 2026-07-18, not left as an issue: `list<IShape>` leaks every heap-boxed element (confirmed, `leaks=3` under HeapAudit), and it cannot be fixed in the container - a fat pointer records no provenance, so freeing would corrupt stack-boxed elements instead. Needs a language-level ownership answer; option 2 there (owning vs borrowed interface types) is this plan's natural extension. |
 
 ### Non-blocking cleanups
 
@@ -622,7 +623,7 @@ held, including the one flagged for verification.**
 ## Migration
 
 Opt-in, so nothing breaks. **UNBLOCKED 2026-07-17** - the sole remaining blocker,
-[cast-defeats-unique-borrow-tracking](../issue/cast-defeats-unique-borrow-tracking.md), was decided
+~~cast-defeats-unique-borrow-tracking~~ (FIXED 2026-07-17, issue file deleted), was decided
 (Option 1: a cast PRESERVES borrow provenance) and FIXED that day via an out-of-band
 `NamedVariable::IsUniqueFieldAlias` flag that survives the cast while `Storage` stays severed (so
 `srcIsOwningMove` is untouched). All three rules (`delete`/`move`/store-into-field) now fire on
