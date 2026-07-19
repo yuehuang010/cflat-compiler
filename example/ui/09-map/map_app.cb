@@ -377,7 +377,7 @@ class MapApp : IComponent
     MapView*   map   = nullptr;   // app-local control class, not a UI element: stays a pointer
     IUiContext uiCtx = default;
 
-    list<TileJob*> jobs = default;   // in-flight fetch jobs (owned)
+    list<unique TileJob*> jobs = default;   // in-flight fetch jobs (owned)
     int tilesStarted   = 0;
     int tilesCompleted = 0;
     int regionChanges  = 0;

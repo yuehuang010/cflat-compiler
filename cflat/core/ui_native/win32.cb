@@ -3047,7 +3047,7 @@ void ensureCanvasClass()
 // The list OWNS the windows; app code reaches the servicing one by index (_cur). We
 // never bind a Window* to a long-lived variable (an owning class pointer auto-frees at
 // scope exit and cannot be re-aliased), so curWin() returns a borrow via `alias`.
-list<Window*> _windows = default;
+list<unique Window*> _windows = default;
 int           _cur     = -1;   // index into _windows of the servicing window
 // Re-entrancy guard for buildCurrentTree: showing/hiding the root ScrollView's scrollbar
 // resizes the client area, and the WM_SIZE it raises lands mid-build. A nested build is
@@ -4870,7 +4870,7 @@ void nativeTeardownForTest()
         else destroyWindowStateAt(0);
     }
     _cur = -1;
-    { list<Window*> lw = move _windows; }
+    { list<unique Window*> lw = move _windows; }
     { list<string> a3 = move _menuTop; }
     { list<int>    a4 = move _menuItemTopIdx; }
     { list<string> a5 = move _menuItemLabel; }

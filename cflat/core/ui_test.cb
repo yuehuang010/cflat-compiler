@@ -342,7 +342,7 @@ class UiCase
 class UiTestSuite
 {
     string name = default;
-    list<UiCase*> cases = default;
+    list<unique UiCase*> cases = default;
 
     // Register a case. `body` is cloned into the wrapper (closures clone by default).
     void test(string caseName, function<void(IUiTest)> body)

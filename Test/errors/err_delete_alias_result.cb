@@ -12,7 +12,7 @@ struct Box { int v = 0; };
 // delete of a plain alias-returning get() result on a pointer list.
 expect_error("cannot delete the alias (borrowed) result of 'get'") {
     int useGetPlain() {
-        list<Box*> l;
+        list<unique Box*> l;
         l.add(new Box());
         delete l.get(0);
         return 0;
@@ -22,7 +22,7 @@ expect_error("cannot delete the alias (borrowed) result of 'get'") {
 // Cast-laundered form: peeling the cast still reaches the alias call result.
 expect_error("cannot delete the alias (borrowed) result of 'get'") {
     int useGetCast() {
-        list<Box*> l;
+        list<unique Box*> l;
         l.add(new Box());
         delete (Box*)l.get(0);
         return 0;
@@ -35,7 +35,7 @@ struct Widget { function<void()> onClick = nullptr; };
 
 expect_error("cannot delete the alias (borrowed) result of 'get'") {
     int useGetClosureField() {
-        list<Widget*> l;
+        list<unique Widget*> l;
         l.add(new Widget());
         int i = 0;
         while (i < l.count()) { delete l.get(i); i++; }

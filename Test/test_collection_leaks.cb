@@ -154,6 +154,12 @@ InnerTok returnMovedInner(int n) { return makeOuterTok(n).inner; }
 interface ILabel { string label(); };
 class Labeler : ILabel { string tag = default; string label() { return tag + "!"; } };
 
+// Interface-element ownership: `list<unique IShapeLeak>` owns its boxed elements and frees them
+// through the vtable dtor slot; bare `list<IShapeLeak>` borrows and frees nothing.
+int g_shapeDtor = 0;
+interface IShapeLeak { int area(); };
+class CircleLeak : IShapeLeak { int r = 0; int area() { return r * r; } ~CircleLeak() { g_shapeDtor = g_shapeDtor + 1; } };
+
 // PLAIN (non-`move`) string return that hands back a freshly owned concat. Passing its result -
 // or an owned local bound from it - bare into list<string>.add(move)/set(move) used to LEAK: the
 // move-arg lowering heap-copied a fresh buffer for the slot (the static owned flag is unset for a
@@ -842,13 +848,18 @@ extern int main()
         total++; passed += Test("list<struct> copy source intact", ls.get(0).name, "aabb");
         total++; passed += Test("list<struct> copy independent",   lsCopy.get(0).name, "aabb");
 
-        // list<int*>: the list OWNS its pointers, so copy() MOVES each (source slot nulled, copy owns).
+        // list<int*> is a BORROWED view now: copy() shallow-copies the pointers (no move, no
+        // ownership transfer) - the source keeps its slot and both lists alias the same pointee,
+        // which the caller owns and frees once. (Owning lists use list<unique int*>, whose copy()
+        // is a compile error - see err_unique_list_copy.cb.)
         list<int*> lp = default;
         int* p0 = new int; *p0 = 7; lp.add(p0);
         list<int*> lpCopy = lp.copy();
         int* lpElem = lpCopy.get(0);
-        total++; passed += Test("list<ptr> copy transfers ownership", lp.get(0) == nullptr, true);
-        total++; passed += Test("list<ptr> copy owns pointee",        *lpElem, 7);
+        total++; passed += Test("list<ptr> borrow copy keeps source", lp.get(0) != nullptr, true);
+        total++; passed += Test("list<ptr> borrow copy aliases same", lp.get(0) == lpElem, true);
+        total++; passed += Test("list<ptr> borrow copy sees pointee", *lpElem, 7);
+        int* lpOwner = lpCopy.take(0); delete lpOwner;   // free the shared int exactly once
 
         // list<enum>: element copy is bitwise; source and copy both hold the value (was: build failed).
         list<LeakColor> lc = default; lc.add(LeakColor.LC_Green); lc.add(LeakColor.LC_Blue);
@@ -922,6 +933,38 @@ extern int main()
         total++; passed += Test("arr-field copy independent (dst)", h2.items[0].s, "zzyy");
         total++; passed += Test("arr-field copy element 2",         h2.items[2].s, "eeff");
         // h and h2 destruct here - every owned element must free exactly once (oracle below).
+    }
+
+    // === Interface-element list ownership (the plan's Evidence leak, finally fixed) ===
+    // list<unique IShapeLeak> OWNS boxed elements (freed via the vtable dtor slot); a bare
+    // list<IShapeLeak> BORROWS and frees nothing - scope-owned objects survive.
+    {
+        g_shapeDtor = 0;
+        {
+            list<unique IShapeLeak> shapes;
+            shapes.add(new CircleLeak());
+            shapes.add(new CircleLeak());
+            shapes.add(new CircleLeak());
+            IShapeLeak taken = shapes.take(0);
+            delete taken;
+            total++; passed += Test("list<unique iface> take+delete dtor", g_shapeDtor, 1);
+        }
+        total++; passed += Test("list<unique iface> dtor frees rest", g_shapeDtor, 3);
+
+        g_shapeDtor = 0;
+        {
+            list<unique IShapeLeak> owner;
+            owner.add(new CircleLeak());
+            owner.add(new CircleLeak());
+            {
+                list<IShapeLeak> view;
+                view.add(owner.get(0));
+                view.add(owner.get(1));
+                total++; passed += Test("bare list<iface> view count", view.count(), 2);
+            }
+            total++; passed += Test("bare list<iface> view frees nothing", g_shapeDtor, 0);
+        }
+        total++; passed += Test("bare list<iface> owner frees all", g_shapeDtor, 2);
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

@@ -992,6 +992,11 @@ The conversion rebuilds the fat pointer from the runtime type, so it is correct 
 multi-level and multi-parent chains. An exact-interface overload still wins over one that
 requires an upcast.
 
+The upcast is purely a type conversion - it does not change ownership. Adding to
+`list<IAncestor>` still borrows (never frees) unless the list's element type is
+`list<unique IAncestor>`, exactly as for the exact interface type; see
+[`unique` Ownership](#unique-ownership).
+
 ### `is` and `as` Operators
 
 `is` tests the concrete runtime type of an interface value. It also accepts an **interface**
@@ -1072,7 +1077,7 @@ switch (shape)
 
 ## Ownership / Lifetime (`move` keyword)
 
-CFlat uses **context-based ownership**: a local variable owns the pointer it allocates, and a function parameter borrows by default. A struct field is the exception - it owns nothing unless you say so, with [`unique`](#unique-field-ownership).
+CFlat uses **context-based ownership**: a local variable owns the pointer it allocates, and a function parameter borrows by default. A struct field owns nothing unless you say so, with [`unique`](#unique-ownership). A **container** of pointers or interfaces (`list<T*>`, `list<IShape>`) borrows its elements by default too - it never frees them - unless the element type itself is marked `unique` (`list<unique T*>`, `list<unique IShape>`); see [`unique` Ownership](#unique-ownership) for the container form and its rules.
 
 The `move` keyword on a parameter definition transfers ownership into the callee - the resource is freed when the function returns:
 
@@ -1228,7 +1233,21 @@ int* p = ForwardBorrow(&a);   // p is bonded to a
 
 `bond` and `move` are mutually exclusive on the same parameter. `bond` is a soft keyword (text-matched at parse time), so identifiers and methods named `bond` still work in other contexts.
 
-### `unique` Field Ownership
+### `unique` Ownership
+
+`unique` is a qualifier on a pointer or interface type. It is legal on a struct field
+(the original position), a **local variable**, a **function parameter**, and a **generic
+type argument** (`list<unique Circle*>`, `list<unique IShape>`). It is not legal on a
+value type (`unique int`, `unique Circle` where `Circle` is not a pointer) - error
+`unique requires a pointer or interface type; '<T>' is neither` - and it is not legal
+in return position, as a tuple element type, or as an explicit generic-function type
+argument (`identity<unique N*>(n)`); transfer out of a return is `move`.
+
+At runtime `unique` is free - it is still just a pointer or a fat interface pointer, no
+wrapper and no extra field. It only changes what the compiler statically requires and
+enforces at the declaration site that carries it.
+
+#### Field ownership (original form)
 
 A raw pointer field is **not** owned by default - nothing frees it, so it leaks unless you write a destructor. `unique` marks the field as owning, and the compiler-synthesized destructor deletes the pointee for you:
 
@@ -1278,7 +1297,177 @@ Node* n = move t._root;   // t._root is now nullptr; you own n
 delete n;                 // your responsibility
 ```
 
-`unique` is a soft keyword (text-matched at parse time), so identifiers named `unique` still work in other contexts. It is valid only on a struct field - not on a local, parameter, or return type.
+`unique` is a soft keyword (text-matched at parse time), so identifiers named `unique` still work in other contexts.
+
+#### Local ownership
+
+A `unique` local is an **owning location**, exactly like a `unique` field: it must be
+initialized from `new`, a `move` expression, a call that returns `move T*`, or `nullptr`.
+Initializing it from a borrowed source is rejected - a borrowed value already has an
+owner, and a second owning handle to the same pointer is a double-free waiting to happen:
+
+```c
+struct Resource { int id = 0; ~Resource() {} };
+
+void takes(Resource* borrowed)
+{
+    unique Resource* u = borrowed;   // error: cannot initialize unique 'u' from a
+                                      // borrowed value - the source still owns it;
+                                      // use 'new', a 'move' expression, or a
+                                      // move-returning call, or drop 'unique'
+}
+
+{
+    unique Resource* a = new Resource();   // OK: freed once at scope exit
+}
+```
+
+**Reading a `unique` local without `move` yields a borrow**, not a transfer - the
+declared type stays unique, the storage stays owned by `a`, and there is no
+double-free:
+
+```c
+unique Resource* b = new Resource();
+Resource* view = b;        // borrow: `b` still owns the Resource
+printf("%d\n", view->id);
+// b is freed once at scope exit
+```
+
+`delete` on a `unique` local is rejected, the same as on a `unique` field - assign
+`nullptr` to free it early, or let scope exit free it.
+
+#### Parameter ownership
+
+A `unique`-typed parameter is exactly a synthesized `move` parameter - the two
+spellings are defined to be equivalent, so they cannot drift apart. The callee's
+signature is what declares the ownership sink; the call site is unchanged (no
+call-site `move`), and the caller's variable is nulled after the call:
+
+```c
+void sink(unique Resource* r) { /* r is owned here; freed on return unless moved out */ }
+void borrow(Resource* r)      { /* caller still owns r */ }
+
+unique Resource* c = new Resource();
+sink(c);      // transfers ownership; c is nulled after the call
+
+unique Resource* d = new Resource();
+borrow(d);    // plain-pointer parameter: this is a BORROW, not a transfer - d still
+              // owns it and frees it once at scope exit
+```
+
+Passing a `unique` value to a plain (non-`move`, non-`unique`) parameter is always a
+borrow - you cannot hand ownership to something that did not ask for it.
+
+#### `unique` interface values
+
+`unique` on an interface-typed local or parameter follows the same owning-location
+rule, with one extra restriction: boxing into a `unique` interface only accepts a
+**heap** source. Boxing a stack value would require a silent heap-promotion, which the
+compiler refuses to do implicitly:
+
+```c
+interface IShape { int area(); };
+class Circle : IShape { int r = 0; int area() { return r * r; } ~Circle() {} };
+
+unique IShape s = new Circle();   // OK: heap source
+
+Circle t;
+unique IShape bad = t;            // error: cannot initialize unique 'bad' from a
+                                   // borrowed value - ... (t is a stack value)
+```
+
+Deleting a `unique IShape` dispatches the concrete implementor's destructor through the
+vtable, then frees the object - exactly like `delete` on a scalar interface value today.
+
+#### `unique` containers
+
+A container's element type is itself a type argument, so `unique` there follows the
+same rule as everywhere else: it marks the element position as an owning slot. A
+`list<T*>` or `list<IShape>` with a **bare** element type is a **borrowed view** - it
+never frees its elements, no matter how they were added. Mark the element type
+`unique` to make the list own them:
+
+```c
+import "list.cb";
+
+struct Payload { int v = 0; ~Payload() {} };
+
+list<unique Payload*> owner;         // OWNS its elements
+owner.add(new Payload());
+owner.add(new Payload());
+// owner's destructor deletes every element it still holds
+
+list<Payload*> view;                 // BORROWS - never frees
+view.add(new Payload());             // caller (or nobody) is still responsible for freeing
+```
+
+`list<unique T*>` and `list<T*>` (likewise `list<unique IShape>` and `list<IShape>`)
+are **distinct instantiations** with no implicit conversion between them - a function
+that takes one does not accept the other.
+
+Container access mirrors the local/parameter rules:
+
+- `[]` / `get(i)` return a **borrow** (`alias`) - reading an element never transfers it out.
+- `take(i)` removes an element and transfers ownership to the caller.
+- `set(i, move value)` destructs the old owning element (if any) before storing the new one.
+- `removeAt(i)` / `clear()` / the destructor free every owning element they discard.
+- `.copy()` on a `unique`-element list is a **compile error**: "cannot copy a list of
+  unique elements; use move or copy elements explicitly" - a bitwise copy of an owning
+  element would hand one pointee to two owners. Bare-pointer lists are unaffected:
+  `.copy()` on a borrowed view produces another (correctly) aliasing shallow copy.
+
+> **Breaking change.** Before `unique` existed in this position, a bare `list<T*>` /
+> `list<IShape>` owned its pointer/interface elements by default. That is no longer
+> true: a bare element type is now always a borrowed view. Code that relied on the old
+> owning-by-default behavior must add `unique` to the element type
+> (`list<T*>` -> `list<unique T*>`) or it will silently stop freeing its elements.
+>
+> As of this writing `dictionary<K,V>` and `hashset<T>` have **not** been migrated to
+> `is_unique` - their pointer-valued keys/values still key off `is_pointer` and own bare
+> pointer elements exactly as before. Only `list<T>` follows the `unique` rule above;
+> migrating the other containers is planned but not yet done. Check `is_pointer(V)` vs
+> `is_unique(T)` in the container's source if in doubt.
+
+**Pitfall: feeding a borrowed list from a named owning local leaks.** `list<T>.add`
+takes `move T`, so adding a *named* pointer local always nulls the source - even when
+the target list is a bare (borrowed) list that will never free it:
+
+```c
+list<Payload*> view;               // borrowed - never frees
+Payload* p = new Payload();
+view.add(p);                       // p is nulled; nobody owns the Payload anymore - LEAK
+```
+
+Feed a borrowed list from an rvalue borrow instead (e.g. `owner[i]`, which is already a
+borrow and is not nulled by `add`):
+
+```c
+list<unique Payload*> owner;
+owner.add(new Payload());
+
+list<Payload*> view;
+view.add(owner[0]);                // OK: owner[0] is a borrow; owner still owns it
+```
+
+#### `is_unique(T)` and `compile_error`
+
+`is_unique(T)` is a compile-time intrinsic, the `unique` counterpart to `is_pointer(T)`:
+inside a generic instantiation it returns 1 if `T` resolves to a `unique`-qualified
+pointer or interface type, 0 otherwise. Like the other `is_*` intrinsics it is only
+meaningful inside `if const`:
+
+```c
+if const (is_unique(T))
+{
+    // T is `unique X*` or `unique IShape` in this instantiation - this branch owns
+}
+```
+
+`compile_error("message")` is a builtin usable inside `if const` in generic code. It
+marks the enclosing method as poisoned for that instantiation; the error only fires if
+the method is actually called (not merely instantiated), which is what lets
+`list<unique T*>.copy()` exist in source without breaking every unique-list
+instantiation that never calls `.copy()`.
 
 ### Memory Deallocation (`delete`)
 
@@ -1328,6 +1517,13 @@ explicitly between `delete[n]` (with destructors) and `delete[_]` (without).
 > and deep-copy a borrowed (non-owning) argument, so strings stored in containers are
 > safe. A plain `string s2 = s1;` assignment also shares the buffer - own an
 > independent copy with `s1.copy()`.
+>
+> For `list<unique T*>` / `list<unique IShape>` specifically, `.copy()` is not merely
+> unsafe - it is a **compile error** ("cannot copy a list of unique elements; use move
+> or copy elements explicitly"), because a bitwise copy of a `unique` element would
+> hand one pointee to two owners. Bare (borrowed) `list<T*>` still allows `.copy()`,
+> and it is correct there: two lists of non-owning references aliasing the same objects
+> is exactly what "borrowed" means. See [`unique` Ownership](#unique-ownership).
 
 ### Discarding a Result (`_`)
 

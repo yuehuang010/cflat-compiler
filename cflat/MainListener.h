@@ -220,10 +220,44 @@ static std::string getDirectDeclName(CFlatParser::DirectDeclaratorContext* d)
 // "int[]" -> "intview"). A type-arg string carries its reference kind as a suffix: "*" for a
 // pointer, "[]" for a noalias array-view (see PeelTypeArgSuffix). Both must fold to symbol-safe
 // text so the mangled name stays a valid identifier.
+// The `unique` ownership qualifier is carried as a leading "unique " prefix on a resolved
+// type-argument string (decision D10: single space, star attached, e.g. "unique Circle*").
+static const char kUniqueQualifierPrefix[] = "unique ";
+static const size_t kUniqueQualifierPrefixLen = sizeof(kUniqueQualifierPrefix) - 1;
+
+// True if a type-parameter entry carries the `unique` qualifier: a leading Identifier
+// (grammar: `Identifier? typeSpecifier ...`) whose text is exactly "unique".
+static bool TypeArgHasUnique(CFlatParser::TypeParameterEntryContext* entry)
+{
+    return entry != nullptr && entry->Identifier() != nullptr
+        && entry->Identifier()->getText() == "unique";
+}
+
+// Strip a leading "unique " qualifier off a resolved type-arg string, returning whether it
+// was present. The bare base (e.g. "Circle*") remains so it resolves to the same LLVM type
+// as the unqualified spelling; is_unique consults the un-stripped substitution string.
+static bool StripUniqueQualifier(std::string& name)
+{
+    if (name.compare(0, kUniqueQualifierPrefixLen, kUniqueQualifierPrefix) == 0)
+    {
+        name.erase(0, kUniqueQualifierPrefixLen);
+        return true;
+    }
+    return false;
+}
+
 static std::string MangleTypeArg(const std::string& typeName)
 {
     std::string result;
-    for (size_t i = 0; i < typeName.size(); i++)
+    size_t start = 0;
+    // The `unique` qualifier (D10) mangles to a "unique_" token so list<unique Circle*>
+    // monomorphizes distinctly from list<Circle*>.
+    if (typeName.compare(0, kUniqueQualifierPrefixLen, kUniqueQualifierPrefix) == 0)
+    {
+        result += "unique_";
+        start = kUniqueQualifierPrefixLen;
+    }
+    for (size_t i = start; i < typeName.size(); i++)
     {
         if (typeName[i] == '*') result += "ptr";
         else if (typeName[i] == '[' && i + 1 < typeName.size() && typeName[i + 1] == ']')
@@ -290,8 +324,13 @@ static std::string BuildEncodedClosureName(bool isThin, const std::string& ret, 
 // is a plain pointer. They never combine ("T[]*" is rejected at the grammar/listener). Suffixes
 // were appended in source order, so peel from the right until none remain. Returns the bare base
 // type name in `name`.
-static void PeelTypeArgSuffix(std::string& name, bool& pointer, bool& arrayView)
+static void PeelTypeArgSuffix(std::string& name, bool& pointer, bool& arrayView, bool* unique = nullptr)
 {
+    // A `unique` qualifier is a leading prefix (D10); peel it first so the suffix loop and any
+    // re-mangling see the bare type. Callers resolving to an LLVM type discard it; callers that
+    // re-mangle a nested arg re-prepend it from *unique.
+    bool hadUnique = StripUniqueQualifier(name);
+    if (unique != nullptr) *unique = hadUnique;
     for (;;)
     {
         if (name.size() >= 2 && name.compare(name.size() - 2, 2, "[]") == 0)
@@ -834,9 +873,11 @@ private:
                         std::vector<std::string> typeArgs;
                     for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                     {
-                        // Closure type args (gap a) encode to a symbol-safe name; others keep the
-                        // pre-existing raw getText() spelling.
-                        if (entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
+                        // Closure type args (gap a) encode to a symbol-safe name; a `unique`-qualified
+                        // arg routes through ResolveForwardTypeArg so its canonical "unique T*" text
+                        // (D10) matches the queueing path; others keep the raw getText() spelling.
+                        if ((entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
+                            || TypeArgHasUnique(entry))
                             typeArgs.push_back(ResolveForwardTypeArg(entry));
                         else
                             typeArgs.push_back(entry->getText());
@@ -985,6 +1026,11 @@ private:
             if (auto declarer = paramDecl->declarator())
                 if (auto directDeclarer = declarer->directDeclarator())
                     paramType.VariableName = getDirectDeclName(directDeclarer);
+            // D4: a `unique` parameter is a synthesized move parameter (mirrors the codegen copy),
+            // so the forward-declared signature agrees on the move flag.
+            if (paramType.IsUnique && ((paramType.Pointer && !paramType.ElemPointer
+                && !paramType.IsArrayView) || paramType.IsInterface))
+                paramType.IsMove = true;
             // A parameter's `alignas(_, N)` allocation alignment now rides in declarationSpecifiers
             // (prefix), so ParseDeclarationSpecifiers above already recorded paramType.AllocAlignValue.
             if (paramType.IsMove && paramType.IsBond)
@@ -1429,6 +1475,7 @@ public:
     // the main pass.
     std::string ResolveForwardTypeArg(CFlatParser::TypeParameterEntryContext* entry)
     {
+        bool isUnique = TypeArgHasUnique(entry);
         auto* typeSpec = entry->typeSpecifier();
         std::string resolved;
         std::string innerBase;
@@ -1454,6 +1501,10 @@ public:
             resolved += "*";
         else if (IsArrayViewArg(entry))
             resolved += "[]";
+        // Carry the `unique` qualifier into the mangled/instantiation string (D10); the main
+        // pass validates position/type and emits diagnostics.
+        if (isUnique)
+            resolved = std::string(kUniqueQualifierPrefix) + resolved;
         return resolved;
     }
 
@@ -1643,8 +1694,10 @@ public:
             std::string mangledName = compiler->ResolveGenericBaseAlias(baseName);
             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
             {
-                // Closure type args (gap a) encode to a symbol-safe name; others keep raw getText().
-                if (entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
+                // Closure and `unique`-qualified args encode via ResolveForwardTypeArg so the shell
+                // name matches the authoritative ParseUsingDeclaration; others keep raw getText().
+                if ((entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
+                    || TypeArgHasUnique(entry))
                     mangledName += "__" + MangleTypeArg(ResolveForwardTypeArg(entry));
                 else
                     mangledName += "__" + MangleTypeArg(entry->getText());
@@ -2180,6 +2233,12 @@ private:
     std::string ResolveTypeArgEntry(CFlatParser::TypeParameterEntryContext* entry)
     {
         auto* typeSpec = entry->typeSpecifier();
+        // `unique` ownership qualifier (D10): a leading Identifier == "unique". Any other leading
+        // Identifier is an unknown qualifier.
+        bool isUnique = TypeArgHasUnique(entry);
+        if (entry->Identifier() != nullptr && !isUnique)
+            LogErrorContext(entry, std::format("unknown type qualifier '{}'; only 'unique' is allowed "
+                "on a generic type argument", entry->Identifier()->getText()));
         bool hasPointer = entry->pointer() != nullptr;
         // `T[]` as a generic/tuple type arg is a noalias array-view member; `[N]` and `[]*`
         // are not valid in a type-argument position (reject with one clear message).
@@ -2213,6 +2272,8 @@ private:
             // Closure type as a generic argument (gap a): encode to a symbol-safe name and register
             // the call descriptor + backing value type. The encoded name never carries a pointer/
             // array-view suffix (a closure arg is a value), so return it directly.
+            if (isUnique)
+                LogErrorContext(entry, "unique requires a pointer or interface type");
             return EncodeClosureCodegen(typeSpec->functionPointerSpecifier());
         }
         else
@@ -2222,19 +2283,28 @@ private:
             auto substIt = activeTypeSubstitutions.find(resolved);
             if (substIt != activeTypeSubstitutions.end())
             {
-                // A substituted arg may itself carry "*"/"[]" (e.g. a pack param bound to "int[]");
-                // peel those onto the flags so they re-encode once below.
+                // A substituted arg may itself carry "*"/"[]" (e.g. a pack param bound to "int[]")
+                // or a "unique " prefix (T bound to "unique Circle*"); peel those onto flags so
+                // they re-encode once below.
+                bool substUnique = false;
                 resolved = substIt->second;
-                PeelTypeArgSuffix(resolved, hasPointer, hasArrayView);
+                PeelTypeArgSuffix(resolved, hasPointer, hasArrayView, &substUnique);
+                isUnique = isUnique || substUnique;
             }
             // A function-type alias (using IntFn = Lambda<int(int)>) used as a generic arg resolves
             // to the SAME encoded closure type as the direct spelling (canonicalization / gap a).
             if (!hasPointer && !hasArrayView)
                 if (auto fit = Compiler(entry)->functionTypeAliases.find(resolved);
                     fit != Compiler(entry)->functionTypeAliases.end())
+                {
+                    if (isUnique)
+                        LogErrorContext(entry, "unique requires a pointer or interface type");
                     return EncodeClosureFromSig(Compiler(entry), fit->second);
+                }
         }
 
+        // The bare base (before the pointer/view suffix) drives the D1 type check below.
+        std::string uniqueBase = resolved;
         // Array-view wins the suffix encoding ("[]"); pointer and array-view never combine here.
         if (hasArrayView)
             resolved += "[]";
@@ -2243,6 +2313,15 @@ private:
             if (Compiler(entry)->IsInterfaceType(resolved))
                 LogErrorContext(entry, std::format("pointer '*' is not allowed on interface type '{}'", resolved));
             resolved += "*";
+        }
+        // D1: unique is only meaningful on a pointer or interface type; carry it as a leading
+        // prefix (D10) so this instantiation mangles distinctly and is_unique(T) can see it.
+        if (isUnique)
+        {
+            if (!hasPointer && !Compiler(entry)->IsInterfaceType(uniqueBase))
+                LogErrorContext(entry, std::format("unique requires a pointer or interface type; "
+                    "'{}' is neither", uniqueBase));
+            resolved = std::string(kUniqueQualifierPrefix) + resolved;
         }
         return resolved;
     }
@@ -2301,6 +2380,7 @@ private:
         if (substIt != activeTypeSubstitutions.end())
         {
             name = substIt->second;
+            StripUniqueQualifier(name);  // resolve to the underlying type; unique is not a signature type
             while (!name.empty() && name.back() == '*') { name.pop_back(); outPointer = true; }
         }
         return name;
@@ -2394,10 +2474,9 @@ private:
                 }
                 if (typeSpec->getText() == "unique")
                 {
-                    // Field-only: ParseDeclarationList arms inStructFieldDecl_ around its
-                    // specifier parse, so every other declaration position lands here.
-                    if (!inStructFieldDecl_)
-                        LogErrorContext(typeSpec, "'unique' is only allowed on a struct field; it is not valid on a local variable, parameter, or return type");
+                    // `unique` is now legal on a field (validated by ValidateUniqueField) and on a
+                    // local/param (an owning location, validated at the end of this function once the
+                    // pointer/interface shape is known - D1/D5). Return-type unique stays unsupported.
                     declType.IsUnique = true;
                     continue;  // not a type; look for the actual type in next specifier
                 }
@@ -2519,7 +2598,13 @@ private:
                     baseName = Compiler(declSpecs)->ResolveGenericBaseAlias(baseName);
                     std::vector<std::string> typeArgs;
                     for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
+                    {
+                        // `tuple` is a plain aggregate with no destructor, so a `unique` element would
+                        // never be freed - reject it rather than silently drop the ownership.
+                        if (baseName == "tuple" && TypeArgHasUnique(entry))
+                            LogErrorContext(entry, "unique is not supported as a tuple element type");
                         typeArgs.push_back(ResolveTypeArgEntry(entry));
+                    }
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
                     declType.TypeName = mangledName;
                     // A namespace-qualified generic names an imported winmd template: build the
@@ -2572,7 +2657,10 @@ private:
                     if (substIt != activeTypeSubstitutions.end())
                     {
                         // A substituted type may carry a "*" (pointer) or "[]" (noalias array-view)
-                        // suffix - e.g. a tuple pack param bound to "int[]". Extract it into flags.
+                        // suffix - e.g. a tuple pack param bound to "int[]". A leading "unique "
+                        // qualifier is stripped here: unique-as-a-storage-location semantics apply to
+                        // the direct `unique` spelling only (post-substitution container ownership is a
+                        // later stage), so the resolved type is the bare pointee.
                         typeName = substIt->second;
                         PeelTypeArgSuffix(typeName, substPointer, substArrayView);
                     }
@@ -2687,6 +2775,16 @@ private:
                         declType.IsNullable = true;
                         declType.Pointer = true;
                     }
+                }
+                // Direct `unique` on a local/param (D4/D5): it qualifies a single-indirection pointer
+                // or an interface only (D1). A field is validated separately by ValidateUniqueField.
+                if (declType.IsUnique && !inStructFieldDecl_)
+                {
+                    bool uniqueSingleIndirect = (declType.Pointer && !declType.ElemPointer
+                        && !declType.IsArrayView) || declType.IsInterface;
+                    if (!uniqueSingleIndirect)
+                        LogErrorContext(declSpec, std::format(
+                            "unique requires a pointer or interface type; '{}' is neither", declType.TypeName));
                 }
                 break;
             }
@@ -2831,6 +2929,7 @@ private:
         if (substIt != activeTypeSubstitutions.end())
         {
             resolved.TypeName = substIt->second;
+            StripUniqueQualifier(resolved.TypeName);  // default-value resolution uses the bare type
             while (!resolved.TypeName.empty() && resolved.TypeName.back() == '*')
             {
                 resolved.TypeName.pop_back();
@@ -7396,6 +7495,26 @@ public:
                             }
                         }
 
+                        // D5: a `unique` local is an owning location; it must be initialized from an
+                        // owned source (new, a `move` expression, or a move-returning call), which the
+                        // branches above leave owning, or from nullptr (owns nothing). A borrowed/plain
+                        // source would create a second owner of one pointer - reject it. A `unique`
+                        // INTERFACE local additionally rejects stack boxing (`unique IShape s = t;`):
+                        // only heap `new` sources are legal (no silent heap-promotion of a stack value).
+                        bool srcIsNullLiteral = right != nullptr && llvm::isa<llvm::ConstantPointerNull>(right);
+                        bool destUniqueLoc = (typeAndValue.Pointer && !typeAndValue.ElemPointer)
+                            || typeAndValue.IsInterface;
+                        if (initializer && typeAndValue.IsUnique && destUniqueLoc
+                            && !srcIsMove && !srcIsNullLiteral)
+                        {
+                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            if (!nv.IsOwning && !nv.IsNewAllocated)
+                                LogErrorContext(initDecl, std::format(
+                                    "cannot initialize unique '{}' from a borrowed value - the source still "
+                                    "owns it; use 'new', a 'move' expression, or a move-returning call, or "
+                                    "drop 'unique'", name));
+                        }
+
                     }
                 }
             }
@@ -11163,6 +11282,7 @@ public:
         // Apply active type substitutions (for generic templates)
         auto it = activeTypeSubstitutions.find(name);
         if (it != activeTypeSubstitutions.end()) name = it->second;
+        StripUniqueQualifier(name);  // resolve to the underlying LLVM type; unique is a storage marker
         return Compiler(ctx)->ResolveQualifiedName(name);
     }
 
@@ -14284,6 +14404,10 @@ public:
                             std::vector<std::string> typeArgs;
                             for (auto* entry : prevPrimary->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                             {
+                                // `unique` in an explicit function type argument is not supported: this
+                                // path takes the raw getText() spelling and cannot carry the qualifier.
+                                if (TypeArgHasUnique(entry))
+                                    LogErrorContext(entry, "unique is not supported as an explicit generic function type argument");
                                 std::string arg = entry->getText();
                                 // Apply active type substitutions to each type argument
                                 auto it = activeTypeSubstitutions.find(arg);
@@ -14705,6 +14829,10 @@ public:
                             std::vector<std::string> typeArgs;
                             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                             {
+                                // `unique` on an explicit method/function type argument is unsupported
+                                // (raw getText() spelling cannot carry the qualifier).
+                                if (TypeArgHasUnique(entry))
+                                    LogErrorContext(entry, "unique is not supported as an explicit generic function type argument");
                                 std::string arg = entry->getText();
                                 auto it = activeTypeSubstitutions.find(arg);
                                 if (it != activeTypeSubstitutions.end())
@@ -15607,6 +15735,60 @@ public:
                             }
                             namedVar.Primary = llvm::ConstantInt::get(
                                 llvm::Type::getInt1Ty(*Compiler(ctx)->context), isPtr ? 1 : 0);
+                            namedVar.TypeAndValue.TypeName = "int";
+                            break;
+                        }
+
+                        // Compile-time intrinsic: is_unique(T) - returns 1 if the type parameter T
+                        // resolves to a `unique`-qualified (owning) type in the current instantiation,
+                        // 0 otherwise. Orthogonal to is_pointer (unique Circle* is both). Outside a
+                        // generic substitution context it returns 0 (same convention as is_pointer).
+                        // Returns i1 typed "int" - use under `if const`, do not printf it directly.
+                        if (functionName == "is_unique")
+                        {
+                            bool isUniq = false;
+                            if (argumentList.size() > 0)
+                            {
+                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                if (!namedArgCtx.empty())
+                                {
+                                    std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
+                                    auto substIt = activeTypeSubstitutions.find(argText);
+                                    if (substIt != activeTypeSubstitutions.end())
+                                    {
+                                        const std::string& resolved = substIt->second;
+                                        isUniq = resolved.compare(0, kUniqueQualifierPrefixLen,
+                                            kUniqueQualifierPrefix) == 0;
+                                    }
+                                }
+                            }
+                            namedVar.Primary = llvm::ConstantInt::get(
+                                llvm::Type::getInt1Ty(*Compiler(ctx)->context), isUniq ? 1 : 0);
+                            namedVar.TypeAndValue.TypeName = "int";
+                            break;
+                        }
+
+                        // Compile-time intrinsic: compile_error("msg") - raises a compile error with
+                        // the given message when this branch is INSTANTIATED (live for the current
+                        // monomorphization); a no-op in dead `if const` branches (never codegen'd).
+                        // Used by list.cb to reject copy() of a unique-element list.
+                        if (functionName == "compile_error")
+                        {
+                            std::string msg = "compile_error";
+                            if (argumentList.size() > 0)
+                            {
+                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                if (!namedArgCtx.empty())
+                                    msg = DequoteStringLiteral(namedArgCtx[0]->assignmentExpression()->getText());
+                            }
+                            // Deferred: methods are instantiated eagerly (whole class body), so firing
+                            // now would reject mere declaration. Poison the enclosing function; the
+                            // error fires later only if it is actually CALLED (CheckPoisonedFunctionCalls).
+                            auto* curBlock = Compiler(ctx)->builder->GetInsertBlock();
+                            if (curBlock != nullptr && curBlock->getParent() != nullptr)
+                                Compiler(ctx)->poisonedFunctions[curBlock->getParent()->getName().str()] = msg;
+                            namedVar.Primary = llvm::ConstantInt::get(
+                                llvm::Type::getInt1Ty(*Compiler(ctx)->context), 0);
                             namedVar.TypeAndValue.TypeName = "int";
                             break;
                         }
@@ -18226,7 +18408,8 @@ public:
 
         // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
-            "va_start", "va_end", "is_pointer", "is_primitive", "is_string", "annotationof",
+            "va_start", "va_end", "is_pointer", "is_unique", "is_primitive", "is_string", "annotationof",
+            "compile_error",
             "reflect", "reflect_set", "__rdtscp", "__readcyclecounter", "__lfence", "__pause",
             "__popcount", "__ctz", "__clz", "__prefetch", "__fma", "__likely", "__unlikely",
             "__atomic_acquire_fence",
@@ -21981,6 +22164,14 @@ public:
                     paramType.VariableName = directDeclarer->getText();
                 }
             }
+
+            // D4: a `unique` parameter is a synthesized move parameter - the callee declares the
+            // ownership sink, so passing a named unique value transfers and nulls it via the existing
+            // move machinery. Post-substitution unique params already carry IsMove (set in
+            // ParseDeclarationSpecifiers); this covers the direct `unique X*` spelling.
+            if (paramType.IsUnique && ((paramType.Pointer && !paramType.ElemPointer
+                && !paramType.IsArrayView) || paramType.IsInterface))
+                paramType.IsMove = true;
 
             if (paramType.IsMove && paramType.IsBond)
                 LogErrorContext(paramDecl, std::format("parameter '{}': 'bond' and 'move' are mutually exclusive", paramType.VariableName));

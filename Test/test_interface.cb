@@ -1292,6 +1292,29 @@ bool testInterfaceIsNullUpcast()
     result &= Test("iface_null_miss_eq",   miss == nullptr, true);
     result &= Test("iface_null_hit_field", hit.label,       "Go");
 
+    // F3: null-compare on interface values, independent of `as`. A default-initialized
+    // interface value is a zeroed fat pointer {null, null} and must compare == nullptr;
+    // boxing (either a stack struct or a heap object) must compare != nullptr. Both operand
+    // orders and both operators are covered.
+    IPress defIface = default;
+    result &= Test("iface_default_eq_null",         defIface == nullptr, true);
+    result &= Test("iface_default_ne_null",          defIface != nullptr, false);
+    result &= Test("iface_default_reversed_eq",      nullptr == defIface, true);
+    result &= Test("iface_default_reversed_ne",      nullptr != defIface, false);
+
+    StackBox boxSrc;
+    boxSrc.v = 99;
+    IStackBox boxedStack = boxSrc;
+    result &= Test("iface_boxed_stack_ne_null",      boxedStack != nullptr, true);
+    result &= Test("iface_boxed_stack_eq_null",      boxedStack == nullptr, false);
+    result &= Test("iface_boxed_stack_reversed_ne",  nullptr != boxedStack, true);
+    result &= Test("iface_boxed_stack_reversed_eq",  nullptr == boxedStack, false);
+
+    result &= Test("iface_boxed_heap_ne_null",       iw != nullptr, true);
+    result &= Test("iface_boxed_heap_eq_null",       iw == nullptr, false);
+    result &= Test("iface_boxed_heap_reversed_ne",   nullptr != iw, true);
+    result &= Test("iface_boxed_heap_reversed_eq",   nullptr == iw, false);
+
     // Upcast (derived -> parent/grandparent) in every position.
     IWidget upAssign = ip;                                    // assignment
     result &= Test("iface_up_assign",  upAssign.tag,  4);

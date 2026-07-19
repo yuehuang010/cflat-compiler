@@ -167,7 +167,7 @@ struct NumaDomain {
     u64 cpuMask = 0;                   // logical CPUs of the domain
     // internal hand-out state
     u64                  _freeCores = 0;         // one bit per AVAILABLE physical core
-    list<NumaThread*>    _threads   = default;   // live hand-outs (domain owns them)
+    list<unique NumaThread*>    _threads   = default;   // live hand-outs (domain owns them)
     mutex                _lock      = default;
     bool                 _released  = false;
     CpuTopology          _topo      = default;   // snapshot this domain was built from

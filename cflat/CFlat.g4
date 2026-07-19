@@ -392,7 +392,7 @@ typeParameterList
     ;
 
 typeParameterEntry
-    : typeSpecifier pointer? arrayTypeSuffix? Ellipsis?   // `T[]` arg = a noalias array-view; `[N]`/`[]*` rejected in the listener
+    : Identifier? typeSpecifier pointer? arrayTypeSuffix? Ellipsis?   // leading Identifier is the `unique` ownership qualifier (soft keyword, validated in the listener); `T[]` arg = a noalias array-view; `[N]`/`[]*` rejected in the listener
     ;
 
 whereClause

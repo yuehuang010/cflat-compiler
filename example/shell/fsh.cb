@@ -149,7 +149,7 @@ struct Job {
 list<string>* gHistory     = nullptr;
 list<string>* gAliasNames  = nullptr;
 list<string>* gAliasValues = nullptr;
-list<Job*>*   gJobs        = nullptr;
+list<unique Job*>*   gJobs        = nullptr;
 int  gNextJobId = 1;
 int  gLastExit  = 0;
 int  gExitCode  = 0;
@@ -1688,7 +1688,7 @@ extern int main(int argc, char** argv)
     gHistory     = new list<string>;
     gAliasNames  = new list<string>;
     gAliasValues = new list<string>;
-    gJobs        = new list<Job*>;
+    gJobs        = new list<unique Job*>;
 
     enableVT();
     loadHistory();

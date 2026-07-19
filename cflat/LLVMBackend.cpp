@@ -804,6 +804,11 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         // caught as ExpectedErrorReceived (file-scope expect_error stays armed to here).
         RunMoveDataflow();
 
+        // Fire deferred compile_error() diagnostics for any poisoned function that is actually
+        // called (e.g. copy() on a list of unique elements). Inside the try + before the
+        // did-not-occur check so a file-scope expect_error catches it.
+        CheckPoisonedFunctionCalls();
+
         }
         catch (const ExpectedErrorReceived&)
         {
@@ -2473,6 +2478,7 @@ void LLVMBackend::ResetForReanalysis()
     currentFunctionReturnTV = TypeAndValue{};
     pendingOwnedStringTemps.clear();
     pendingOwnedStructTemps.clear();
+    poisonedFunctions.clear();
     lastAllocAlignment = 0;
     pendingInitAllocAlign = 0;
     lastCallReturnsAllocAlign = 0;

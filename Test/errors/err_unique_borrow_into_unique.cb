@@ -1,0 +1,13 @@
+// D5: a `unique` local is an owning location. Initializing it from a borrowed value
+// (here a plain-pointer parameter, which the caller still owns) without `move` would
+// create two owners of one pointer - a compile error.
+struct N { int v = 0; ~N() {} };
+
+expect_error("cannot initialize unique 'u' from a borrowed value") {
+    void takes(N* borrowed) { unique N* u = borrowed; }
+}
+
+extern int main()
+{
+    return 0;
+}

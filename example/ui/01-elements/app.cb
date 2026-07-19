@@ -29,7 +29,7 @@ class CounterApp : IComponent
 {
     // Child components are held by POINTER: components have identity and mutable
     // state. list<Counter*> owns them - they are freed when the list is destroyed.
-    list<Counter*> counters = default;
+    list<unique Counter*> counters = default;
 
     void addCounter(string name)
     {

@@ -3,7 +3,8 @@
 
 import "memory.cb";   // __active_allocator (for copy(IAllocator))
 
-// list<T> - mutable growable owning array (vector<T>-like) for any value type T.
+// list<T> - mutable growable array (vector<T>-like) for any value type T. Owns its elements
+// only when T is `unique` (or a value type with owned buffers); bare pointer/interface lists borrow.
 class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
 {
     T*  _data     = nullptr;
@@ -27,8 +28,8 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         _capacity = newCap;
     }
 
-    // Append a value to the end.  When T is a pointer type, the list takes
-    // ownership - add(), removeAt(), clear(), and the destructor all free elements.
+    // Append a value to the end. The list frees elements (add/removeAt/clear/dtor) only when T
+    // is `unique`; a bare `list<T*>` / `list<IFace>` is a borrowed view and frees nothing.
     void add(move T value)
     {
         if (_size >= _capacity) _grow();
@@ -58,16 +59,16 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         return _data[index];
     }
 
-    // Overwrite the element at index.  Takes ownership when T is a pointer type.
-    // The old element is freed/destructed before the new one is stored.
+    // Overwrite the element at index. When T is `unique` the list owns the element, so the old
+    // one is freed first; a value type is destructed; a bare (borrowed) pointer is just overwritten.
     void set(int index, move T value)
     {
         _checkBounds(index, "set");
-        if const (is_pointer(T))
+        if const (is_unique(T))
         {
             if (_data[index] != nullptr) delete _data[index];
         }
-        else
+        else if const (!is_pointer(T))
         {
             _data[index].~();
         }
@@ -93,14 +94,17 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     }
 
     // Remove the element at index, shifting subsequent elements left.
-    // When T is a pointer type, the removed element is freed. For value types with
-    // owned buffers (e.g. string or a nested container), the element is destructed.
+    // When T is `unique` the removed element is freed. For value types with owned buffers
+    // (e.g. string or a nested container), the element is destructed. A bare (borrowed) pointer
+    // is simply dropped - the list never owned it.
     void removeAt(int index)
     {
         _checkBounds(index, "removeAt");
-        if const (is_pointer(T))
-            delete _data[index];
-        else
+        if const (is_unique(T))
+        {
+            if (_data[index] != nullptr) delete _data[index];
+        }
+        else if const (!is_pointer(T))
             _data[index].~();
         int i = index;
         while (i < _size - 1)
@@ -117,12 +121,12 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         return _size;
     }
 
-    // Remove all elements. Pointer elements are freed; value types with owned
-    // buffers (e.g. string or nested containers) are destructed. Backing buffer
+    // Remove all elements. `unique` elements are freed; value types with owned buffers (e.g.
+    // string or nested containers) are destructed; bare pointers are dropped. Backing buffer
     // is kept - capacity is unchanged.
     void clear()
     {
-        if const (is_pointer(T))
+        if const (is_unique(T))
         {
             int i = 0;
             while (i < _size)
@@ -131,7 +135,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
                 i++;
             }
         }
-        else
+        else if const (!is_pointer(T))
         {
             int i = 0;
             while (i < _size)
@@ -154,12 +158,21 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     //     generic deep-clone. Use move/take explicitly, or a list of values, if that is a surprise.
     move list<T> copy()
     {
+        // A `unique` list owns its elements; a bitwise element copy would hand one pointee to two
+        // owners and double-free. There is no generic deep-clone, so copying is a compile error.
+        if const (is_unique(T))
+        {
+            compile_error("cannot copy a list of unique elements; use move or copy elements explicitly");
+            list<T> none;
+            return move none;
+        }
         list<T> result;
         int i = 0;
         while (i < _size)
         {
             if const (is_primitive(T))    result.add(_data[i]);
-            else if const (is_pointer(T)) result.add(_data[i]);
+            // Bare (borrowed) pointer: shallow-alias via a temp so the source slot is not moved out.
+            else if const (is_pointer(T)) { T tmp = _data[i]; result.add(tmp); }
             else                          result.add(_data[i].copy());
             i++;
         }
@@ -172,6 +185,12 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // by temporarily installing it as the active allocator.
     move list<T> copy(IAllocator alloc)
     {
+        if const (is_unique(T))
+        {
+            compile_error("cannot copy a list of unique elements; use move or copy elements explicitly");
+            list<T> none;
+            return move none;
+        }
         IAllocator saved = __active_allocator;
         __active_allocator = alloc;
 
@@ -180,7 +199,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         while (i < _size)
         {
             if const (is_primitive(T))    result.add(_data[i]);
-            else if const (is_pointer(T)) result.add(_data[i]);
+            else if const (is_pointer(T)) { T tmp = _data[i]; result.add(tmp); }
             else                          result.add(_data[i].copy());
             i++;
         }
@@ -249,10 +268,12 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         return _data[index];
     }
 
-    // Free all elements (pointers freed, value types destructed) then the buffer.
+    // Free all elements then the buffer. Only a `unique` list owns its elements: scalar `delete`
+    // dispatches raw pointer vs interface value by type. A bare `list<T*>` / `list<IFace>` is a
+    // borrowed view and never frees its elements (their real owner does).
     ~list()
     {
-        if const (is_pointer(T))
+        if const (is_unique(T))
         {
             int i = 0;
             while (i < _size)

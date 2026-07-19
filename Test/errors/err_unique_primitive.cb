@@ -1,0 +1,5 @@
+// D1: `unique` in a generic type argument requires a pointer or interface type.
+// A primitive (or value-struct) type argument is a compile error.
+expect_error("unique requires a pointer or interface type") {
+    void useUniqueInt() { list<unique int> x; }
+}

@@ -637,7 +637,7 @@ bool testListPointer()
     bool result = true;
 
     {
-        list<Employee*> employees;
+        list<unique Employee*> employees;
 
         Employee* e1 = new Employee;
         e1->id = 1;
@@ -684,7 +684,7 @@ bool testListPointerClear()
 
     empDtorCount = 0;
     {
-        list<Employee*> employees;
+        list<unique Employee*> employees;
         Employee* e1 = new Employee; e1->id = 1;
         Employee* e2 = new Employee; e2->id = 2;
         Employee* e3 = new Employee; e3->id = 3;
@@ -706,6 +706,67 @@ bool testListPointerClear()
     }
     result &= Test("list<ptr> dtor after clear", empDtorCount, 4);
 
+    return result;
+}
+
+// `unique` in generic type-argument position: list<unique Employee*> OWNS its elements (frees
+// them), while a bare list<Employee*> is a DISTINCT instantiation that BORROWS (never frees).
+struct UniqueChecker<T>
+{
+    int check()
+    {
+        if const (is_unique(T))
+            return 1;
+        else
+            return 0;
+    }
+};
+
+bool testListUniquePointer()
+{
+    bool result = true;
+
+    empDtorCount = 0;
+    {
+        // Owning list frees its elements; a bare list (distinct instantiation) coexists and only
+        // BORROWS - it holds an aliased element and frees nothing.
+        list<unique Employee*> owning;
+
+        Employee* e1 = new Employee; e1->id = 1;
+        Employee* e2 = new Employee; e2->id = 2;
+        owning.add(e1);
+        owning.add(e2);
+
+        list<Employee*> borrowed;
+        borrowed.add(owning.get(0));
+
+        result &= Test("list<unique ptr> count",     owning.count(),      2);
+        result &= Test("list<unique ptr> get id",    owning.get(0)->id,   1);
+        result &= Test("list<ptr> borrow count",     borrowed.count(),    1);
+        result &= Test("list<ptr> borrow same elem", borrowed.get(0)->id, 1);
+
+        // removeAt on the unique list frees the element; the bare list's dtor frees nothing.
+        owning.removeAt(0);
+        result &= Test("list<unique ptr> removeAt dtor", empDtorCount, 1);
+        result &= Test("list<unique ptr> count after remove", owning.count(), 1);
+        // owning frees e2 at scope exit; borrowed frees nothing
+    }
+    // 1 (removeAt e1) + 1 (owning dtor e2) = 2
+    result &= Test("list<unique ptr> cleanup dtor", empDtorCount,     2);
+
+    return result;
+}
+
+bool testIsUniqueIntrinsic()
+{
+    bool result = true;
+    // is_unique is true only inside a unique instantiation; is_pointer holds for both.
+    UniqueChecker<unique Employee*> cu = default;
+    UniqueChecker<Employee*>        cp = default;
+    UniqueChecker<int>              ci = default;
+    result &= Test("is_unique unique Employee*", cu.check(), 1);
+    result &= Test("is_unique Employee*",        cp.check(), 0);
+    result &= Test("is_unique int",              ci.check(), 0);
     return result;
 }
 
@@ -1113,7 +1174,7 @@ bool testSortPointer()
 {
     bool ok = true;
 
-    list<Point*> pts;
+    list<unique Point*> pts;
     Point* sp1 = new Point; sp1->x = 30;
     Point* sp2 = new Point; sp2->x = 10;
     Point* sp3 = new Point; sp3->x = 50;
@@ -2518,6 +2579,8 @@ extern int main()
     total++; passed += testForStruct()                   ? 1 : 0;
     total++; passed += testListPointer()                 ? 1 : 0;
     total++; passed += testListPointerClear()            ? 1 : 0;
+    total++; passed += testListUniquePointer()           ? 1 : 0;
+    total++; passed += testIsUniqueIntrinsic()           ? 1 : 0;
     total++; passed += testHashsetPointer()              ? 1 : 0;
     total++; passed += testDictionaryPointer()           ? 1 : 0;
     total++; passed += testDoubleNestedGeneric()         ? 1 : 0;

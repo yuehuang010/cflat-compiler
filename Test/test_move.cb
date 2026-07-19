@@ -169,6 +169,13 @@ void borrow(Resource* r)
     int x = r->id;
 }
 
+// D4: a `unique` parameter is a synthesized move parameter - it takes ownership and
+// frees the Resource when the function returns, exactly like `consume(move Resource*)`.
+void sinkUnique(unique Resource* r)
+{
+    int x = r->id;
+}
+
 // Move/borrow overload pair: 'move' participates in mangling and overload selection.
 // probe(move Resource*) returns 100 + id and takes ownership (deletes r).
 // probe(Resource*)      returns 200 + id and borrows.
@@ -364,7 +371,7 @@ int testDeleteNullCascade()
 struct TreeBox
 {
     int id = 0;
-    list<TreeBox*> children = default;
+    list<unique TreeBox*> children = default;
     ~TreeBox()
     {
         dtorCount = dtorCount + 1;
@@ -380,7 +387,7 @@ int testRecursiveContainerFree()
     // which frees child; and so on. All three freed exactly once.
     dtorCount = 0;
     {
-        list<TreeBox*> roots;
+        list<unique TreeBox*> roots;
         TreeBox* root  = new TreeBox(); root->id  = 1;
         TreeBox* child = new TreeBox(); child->id = 2;
         TreeBox* grand = new TreeBox(); grand->id = 3;
@@ -839,6 +846,48 @@ int testStructWithStringFieldIntoList()
     return passed;
 }
 
+// D4/D5: `unique` on a local/parameter. A `unique X*` local is an owning location; a
+// `unique X*` parameter is a synthesized move parameter. All checks are dtor-count based.
+int testUniqueLocalAndParam()
+{
+    int passed = 0;
+
+    // D5: unique local from new is an owning location - freed exactly once at scope exit.
+    dtorCount = 0;
+    { unique Resource* a = new Resource(); }
+    passed += Test("unique_local_from_new_freed_once", dtorCount, 1);
+
+    // D5: loading from a unique location without move yields a borrow - the borrowed local
+    // is not freed, so the owner frees once (no double free).
+    dtorCount = 0;
+    {
+        unique Resource* b = new Resource();
+        Resource* borrowed = b;
+        int x = borrowed->id;
+    }
+    passed += Test("unique_borrow_out_no_double_free", dtorCount, 1);
+
+    // D4: passing a named unique value to a unique (synthesized move) parameter transfers
+    // ownership - the callee frees it; the caller must not (no double free).
+    dtorCount = 0;
+    {
+        unique Resource* c = new Resource();
+        sinkUnique(c);
+    }
+    passed += Test("unique_synth_move_param_freed_once", dtorCount, 1);
+
+    // D4: passing a unique value to a plain-pointer parameter is a borrow - the caller keeps
+    // ownership and frees once at scope exit.
+    dtorCount = 0;
+    {
+        unique Resource* d = new Resource();
+        borrow(d);
+    }
+    passed += Test("unique_to_plain_param_borrows", dtorCount, 1);
+
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -981,7 +1030,7 @@ extern int main()
     // not by list; list entry is nulled so no double-free
     dtorCount = 0;
     {
-        list<Resource*> items;
+        list<unique Resource*> items;
         Resource* a = new Resource();
         Resource* b = new Resource();
         items.add(a);
@@ -1072,6 +1121,9 @@ extern int main()
 
     passed += testBorrowStringFieldIntoLocal();
     total += 3;
+
+    passed += testUniqueLocalAndParam();
+    total += 4;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

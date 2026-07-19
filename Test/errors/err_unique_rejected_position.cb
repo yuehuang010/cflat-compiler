@@ -1,0 +1,12 @@
+// `unique` is not supported as an explicit generic function type argument - that path
+// takes the raw spelling and cannot carry the qualifier. Reject rather than mis-mangle.
+struct N { int v = 0; ~N() {} };
+T identity<T>(T x) { return x; }
+
+extern int main()
+{
+    expect_error("unique is not supported as an explicit generic function type argument");
+    N* n = new N;
+    identity<unique N*>(n);
+    return 0;
+}

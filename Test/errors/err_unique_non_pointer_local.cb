@@ -1,0 +1,12 @@
+// D1: `unique` is now legal on a local/param, but only on a pointer or interface type.
+// A `unique` value-typed local is a compile error.
+struct N { int v = 0; };
+
+expect_error("unique requires a pointer or interface type") {
+    int takes() { unique N local; return local.v; }
+}
+
+extern int main()
+{
+    return 0;
+}

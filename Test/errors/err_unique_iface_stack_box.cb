@@ -1,0 +1,10 @@
+// Stage-4 boxing rule: a `unique` interface local owns a heap object, so it may only be boxed
+// from a heap `new` source. Boxing a stack value would need a silent heap-promotion - rejected.
+interface IShape { int area(); };
+class Circle : IShape { int r = 0; int area() { return r * r; } ~Circle() {} };
+
+expect_error("cannot initialize unique 's' from a borrowed value") {
+    void boxStack() { Circle t; unique IShape s = t; }
+}
+
+extern int main() { return 0; }

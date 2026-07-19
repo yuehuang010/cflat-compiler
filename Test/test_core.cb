@@ -645,7 +645,7 @@ int testListPtrOwnership()
     int passed = 0;
     g_dtor_count = 0;
 
-    list<Tracked*> l;
+    list<unique Tracked*> l;
     l.add(new Tracked());
     l.add(new Tracked());
     l.add(new Tracked());

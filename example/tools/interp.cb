@@ -217,8 +217,8 @@ class Stmt
     int kind = default;
     string name = default;        // SAssign target
     Node* expr = default;         // SPrint value / SAssign value / SIf,SWhile condition
-    list<Stmt*> thenBody = default;  // SIf then-branch / SWhile body
-    list<Stmt*> elseBody = default;  // SIf else-branch
+    list<unique Stmt*> thenBody = default;  // SIf then-branch / SWhile body
+    list<unique Stmt*> elseBody = default;  // SIf else-branch
 
     // Free the expression tree; thenBody/elseBody auto-free their Stmt* elements
     // (and recurse into this destructor) when the lists are destructed.
@@ -227,7 +227,7 @@ class Stmt
 
 void execStmt(Stmt* s, Env* env);
 
-void execAll(list<Stmt*>* stmts, Env* env)
+void execAll(list<unique Stmt*>* stmts, Env* env)
 {
     int i = 0;
     while (i < stmts->count())
@@ -339,9 +339,9 @@ class Parser
         return nullptr;
     }
 
-    list<Stmt*> parseBlock()
+    list<unique Stmt*> parseBlock()
     {
-        list<Stmt*> stmts = default;
+        list<unique Stmt*> stmts = default;
         expect(Tok.LBrace, "'{'");
         while (!check(Tok.RBrace) && !check(Tok.End))
             stmts.add(parseStatement());
@@ -472,9 +472,9 @@ class Parser
         return makeNum(0.0);
     }
 
-    list<Stmt*> parseProgram()
+    list<unique Stmt*> parseProgram()
     {
-        list<Stmt*> prog = default;
+        list<unique Stmt*> prog = default;
         while (!check(Tok.End))
             prog.add(parseStatement());
         return prog;
@@ -491,7 +491,7 @@ void run(string source)
 
     Parser parser;
     parser.init(&tokens);
-    list<Stmt*> prog = parser.parseProgram();
+    list<unique Stmt*> prog = parser.parseProgram();
 
     Env env;
     execAll(&prog, &env);

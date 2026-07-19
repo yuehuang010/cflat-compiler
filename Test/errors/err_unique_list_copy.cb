@@ -1,0 +1,12 @@
+// A list of `unique` elements is move-only: copy() would hand one pointee to two owners and
+// double-free. The compile_error fires when copy() is actually called (deferred past eager
+// instantiation), so a file-scope expect_error catches it.
+import "list.cb";
+struct C { int r = 0; ~C() {} };
+expect_error("cannot copy a list of unique elements");
+extern int main()
+{
+    list<unique C*> u;
+    list<unique C*> v = u.copy();
+    return 0;
+}

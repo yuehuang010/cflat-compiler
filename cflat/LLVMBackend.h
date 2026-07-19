@@ -971,6 +971,10 @@ public:
     std::vector<llvm::MDNode*> aliasScopes_;
     std::map<std::string, int> viewScopeByOrigin_; // origin name -> index into aliasScopes_
 
+    // Functions whose live `if const` branch hit compile_error("msg") during eager instantiation.
+    // The error fires later only if the function is actually called (CheckPoisonedFunctionCalls).
+    std::unordered_map<std::string, std::string> poisonedFunctions;
+
     bool lastCallIsBonded = false;           // set when the last call returned a bonded (borrowed) value
     bool lastCallBondByAddress = false;      // set when the bond originates from a by-address lambda capture (kind A)
     std::vector<std::string> lastCallBondedSources; // bond parameter names the last call's return borrows from
@@ -3496,6 +3500,26 @@ private:
                                      ? builder->CreateSExt(intVal, destTy)
                                      : builder->CreateZExt(intVal, destTy);
         return intVal; // same width - no-op
+    }
+
+    // Fire deferred compile_error() diagnostics: a poisoned function errors only if it has a real
+    // call (a CallBase user). A vtable slot references the function without calling it, so a mere
+    // declaration of a unique-element list (whose copy() is poisoned) stays legal.
+    void CheckPoisonedFunctionCalls()
+    {
+        for (const auto& [name, msg] : poisonedFunctions)
+        {
+            llvm::Function* f = module->getFunction(name);
+            if (f == nullptr) continue;
+            for (auto* u : f->users())
+            {
+                if (llvm::isa<llvm::CallBase>(u))
+                {
+                    LogError(msg);
+                    break;
+                }
+            }
+        }
     }
 
     bool VerifyModule()

@@ -20,11 +20,11 @@ Method-level API discovery is via the LSP (hover / completion / `--symbol`); thi
 | `string.cb` | `string` - owned/borrowed UTF-8 value type; `IString` implementation |
 | `wstring.cb` | `wstring` - owned UTF-16 string for Win32 `...W` / WinRT APIs |
 | `array.cb` | `array<T>` - owning fixed-size heap array with destructor support |
-| `list.cb` | `list<T>` - growable array |
+| `list.cb` | `list<T>` - growable array. Element ownership keys off `is_unique(T)`: bare `list<T*>` / `list<IShape>` is a borrowed view (never frees elements); `list<unique T*>` / `list<unique IShape>` owns them (destructor/`removeAt`/`clear`/`set` free; `take(i)` transfers out; `[]`/`get` return a borrow; `.copy()` on a unique-element list is a compile error). See doc/LANGUAGE.md's "`unique` Ownership" section. |
 | `span.cb` | `span<T>` - non-owning NOALIAS window (`T[]` + len); `as_view()` decays to `view<T>`. See `doc/HPC.md` |
 | `view.cb` | `view<T>` - non-owning MAY-ALIAS window (`T*` + len); `slice(start,end)`; sibling of `span<T>` |
-| `hashset.cb` | `hashset<T>` - open-addressed set; T must be integer-like |
-| `dictionary.cb` | `dictionary<K,V>` - hash map |
+| `hashset.cb` | `hashset<T>` - open-addressed set; T must be integer-like. NOT yet migrated to `is_unique`: pointer-valued elements still own/free based on `is_pointer(T)` alone, unlike `list<T>`; `unique` has no effect here yet (migration planned). |
+| `dictionary.cb` | `dictionary<K,V>` - hash map. NOT yet migrated to `is_unique`: pointer-valued keys/values still own/free based on `is_pointer(K)`/`is_pointer(V)` alone, unlike `list<T>`; `unique` has no effect here yet (migration planned). |
 | `stack.cb` | `stack<T>` - LIFO |
 | `queue.cb` | `queue<T>` - FIFO |
 | `pair.cb` | `pair<A,B>` - two-field generic struct |

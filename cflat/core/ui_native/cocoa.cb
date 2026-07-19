@@ -1606,7 +1606,7 @@ class CocoaHost : INativeHost
 // never bind a CocoaHost* to a long-lived variable (an owning class pointer auto-frees
 // at scope exit and cannot be re-aliased), so curWin() returns a borrow via `alias`.
 // _windows.add(fresh) MOVES ownership in; only _windows.take(idx) transfers it back out.
-list<CocoaHost*> _windows = default;
+list<unique CocoaHost*> _windows = default;
 int              _cur     = 0 - 1;   // index into _windows of the servicing window
 
 alias CocoaHost* curWin() { return _windows.get(_cur); }
@@ -3474,7 +3474,7 @@ void nativeTeardownForTest()
     // this function used to free inline now belong to dispose(); do not free them twice.
     while (_windows.count() > 0) destroyWindowStateAt(0, true);
     _cur = 0 - 1;
-    { list<CocoaHost*> lw = move _windows; }
+    { list<unique CocoaHost*> lw = move _windows; }
     _menuBuilt = false;
     { list<string> a3 = move _menuTop; }
     { list<int>    a4 = move _menuItemTopIdx; }

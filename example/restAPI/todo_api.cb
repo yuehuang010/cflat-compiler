@@ -46,7 +46,7 @@ struct Todo {
 
 // ── Shared state ────────────────────────────────────────────────────────────────
 
-list<Todo*> g_todos  = default;   // owns its elements (delete frees each Todo)
+list<unique Todo*> g_todos  = default;   // owns its elements (delete frees each Todo)
 mutex       g_lock   = default;   // guards g_todos + g_nextId
 int         g_nextId = 1;
 stop_source g_stop   = default;   // flipped by POST /shutdown

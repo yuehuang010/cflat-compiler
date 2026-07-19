@@ -80,7 +80,7 @@ program ListOwnership {
     int count = 0;
 
     int main(move list<string> args) {
-        list<Resource*> items;
+        list<unique Resource*> items;
         int i = 0;
         while (i < count) {
             Resource* r = new Resource;
