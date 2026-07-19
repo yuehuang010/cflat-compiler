@@ -8783,7 +8783,11 @@ public:
                 if (!namedVar.FieldName.empty())
                     compiler->MarkVariableFieldUnmoved(namedVar.CallerName, namedVar.FieldName);
                 else
+                {
                     compiler->MarkVariableUnmoved(namedVar.CallerName);
+                    // --sanitize=ownership (M1): the local is live again - reset its origin slot.
+                    compiler->ClearOwnMoveOrigin(destination);
+                }
             }
             // Reassignment to a bonded variable breaks the bond (per design: bond is to the instance).
             if (operatorText == "=" && !namedVar.CallerName.empty())
@@ -10959,7 +10963,11 @@ public:
                     namedVar.TypeAndValue.IsInterfacePointer = false;
                 }
                 auto* pointeeType = compiler->GetType(namedVar.TypeAndValue);
+                llvm::Value* baseStorage = namedVar.Storage;
                 llvm::Value* loadedPtr = compiler->CreateLoad(namedVar.Storage);
+                // --sanitize=ownership (M1): guard `*p` deref of a moved-from local.
+                compiler->EmitOwnDerefGuard(baseStorage, loadedPtr,
+                    ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
                 // The deref'd location: loadedPtr is the address; pointeeType is what it holds.
                 // Storing it in Storage (not Primary) makes it usable as both lvalue and rvalue.
                 namedVar.Storage  = loadedPtr;
@@ -12735,6 +12743,11 @@ public:
         if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(ptrVal->getType()))
             compiler->builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), argNV.Storage);
 
+        // --sanitize=ownership (M1): record the move site for a tracked owning-pointer local.
+        // A field-path move (OwningStructName set) is M2 scope, so its GEP is naturally untracked.
+        compiler->SetOwnMoveOrigin(argNV.Storage,
+            ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
+
         // Signal ParseDeclaration to mark the target local as IsOwning. The over-alignment of the
         // moved-from source travels with the value, so the new owner frees it the same way.
         compiler->lastOwningResult = true;
@@ -13578,6 +13591,12 @@ public:
                             if (sd.StructType)
                             {
                                 llvm::Value* ptrVal = LoadNamedVariable(namedVar);
+                                // --sanitize=ownership: guard `p->f` / `p.f` deref against a null
+                                // (moved/freed) pointer. SKIP `?.` - the null-conditional operator
+                                // legitimately tolerates null and short-circuits, so it is not a bug.
+                                if (!nullConditionalPending)
+                                    Compiler(ctx)->EmitOwnDerefGuard(namedVar.Storage, ptrVal,
+                                        ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
                                 structVar.Storage      = ptrVal;
                                 structVar.Primary      = nullptr;
                                 structVar.BaseType     = sd.StructType;
@@ -14639,7 +14658,11 @@ public:
                                 elementTypeAndValue.IsInterfacePointer = false;
                             }
                             auto elementType = Compiler(ctx)->GetType(elementTypeAndValue);
+                            llvm::Value* subBaseStorage = namedVar.Storage;
                             auto ptrValue = LoadNamedVariable(namedVar);
+                            // --sanitize=ownership (M1): guard `p[i]` deref of a moved-from local.
+                            Compiler(ctx)->EmitOwnDerefGuard(subBaseStorage, ptrValue,
+                                ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
                             namedVar.Storage = Compiler(ctx)->CreateGEP(elementType, ptrValue, rvalue);
                             namedVar.BaseType = elementType;
                             namedVar.TypeAndValue = elementTypeAndValue;

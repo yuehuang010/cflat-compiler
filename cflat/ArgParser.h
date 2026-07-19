@@ -71,6 +71,15 @@ public:
 				continue;
 			}
 
+			// Ownership sanitizer (M1). clang-style spellings all map to the "sanitize-ownership"
+			// flag; debug-only runtime instrumentation for use-after-move on owning pointer locals.
+			if (arg == "-fsanitize=ownership" || arg == "--fsanitize=ownership"
+				|| arg == "--sanitize=ownership")
+			{
+				m_flagValues["sanitize-ownership"] = true;
+				continue;
+			}
+
 			if (arg == "--help" || arg == "-h")
 			{
 				printUsage();

@@ -1230,6 +1230,13 @@ private:
     // Off by default; when off, codegen/linking is byte-for-byte identical (no overhead).
     bool asan_ = false;
 
+    // --sanitize=ownership (M1): debug-only runtime instrumentation. Off by default; when off,
+    // codegen is byte-for-byte identical. ownOriginSlots_ maps an owning-pointer local's storage
+    // alloca to a hidden i64 "move origin" slot (0 = live, ((i64)line<<32)|col = moved-at-site).
+    // Module-bound values - cleared by ResetForReanalysis.
+    bool sanitizeOwnership_ = false;
+    std::unordered_map<llvm::Value*, llvm::Value*> ownOriginSlots_;
+
     // --heap-audit: when set, force-import diagnostic/heap_audit.cb and instrument main
     // with HeapAudit.enable()/reportLeaks() (see InjectHeapAuditIntoMain). Report-only.
     bool heapAudit_ = false;
@@ -9798,6 +9805,9 @@ public:
                     {
                         // Pointer move param: null the caller's storage.
                         builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), srcStorage);
+                        // --sanitize=ownership (M1): record this move site for a tracked pointer local.
+                        if (!isFieldAccess)
+                            SetOwnMoveOrigin(srcStorage, currentLine, currentColumn);
                     }
                     else if (params[i].TypeName == "string" && args[i].IsOwningString)
                     {
@@ -10726,6 +10736,82 @@ public:
         return a;
     }
 
+    // --sanitize=ownership (M1): allocate the hidden i64 origin slot beside a pointer local's
+    // storage and zero-init it at the declaration point (which dominates every later use). Keyed
+    // on the local's alloca. Called from CreateLocalVariable; no-op unless the flag is on.
+    void CreateOwnOriginSlot(llvm::Value* storage)
+    {
+        if (!sanitizeOwnership_ || storage == nullptr) return;
+        if (ownOriginSlots_.count(storage)) return;
+        auto* slot = AllocaAtEntry(builder->getInt64Ty(), nullptr, "own_origin");
+        builder->CreateStore(builder->getInt64(0), slot);
+        ownOriginSlots_[storage] = slot;
+    }
+
+    // --sanitize=ownership (M1): record a move site into an owning-pointer local's origin slot,
+    // encoded as ((i64)line<<32)|col (never 0 for a real 1-based line). No-op if untracked.
+    void SetOwnMoveOrigin(llvm::Value* storage, size_t line, size_t col)
+    {
+        if (!sanitizeOwnership_ || storage == nullptr) return;
+        auto it = ownOriginSlots_.find(storage);
+        if (it == ownOriginSlots_.end()) return;
+        uint64_t enc = ((uint64_t)line << 32) | (uint32_t)col;
+        builder->CreateStore(builder->getInt64(enc), it->second);
+    }
+
+    // --sanitize=ownership (M1): reset an origin slot to live (0) when a moved-from local is
+    // reassigned (revive). No-op if untracked.
+    void ClearOwnMoveOrigin(llvm::Value* storage)
+    {
+        if (!sanitizeOwnership_ || storage == nullptr) return;
+        auto it = ownOriginSlots_.find(storage);
+        if (it == ownOriginSlots_.end()) return;
+        builder->CreateStore(builder->getInt64(0), it->second);
+    }
+
+    // --sanitize=ownership: guard a DEREFERENCE (p->f, *p, p[i]). A null pointer here is a
+    // use-after-move / use-after-free by definition - `move` and `delete` both null the slot,
+    // and that null travels with the slot through container realloc, so it is the sound, relocation-
+    // proof signal (no object shadow map, no address-reuse false positives). Trap on ptr==null. If
+    // the base is a tracked owning local with a recorded move origin, report "moved at X"; otherwise
+    // report a generic null deref. A null-COMPARE never reaches here (only real deref sites call this).
+    void EmitOwnDerefGuard(llvm::Value* storage, llvm::Value* loadedPtr, size_t useLine, size_t useCol)
+    {
+        if (!sanitizeOwnership_ || loadedPtr == nullptr) return;
+        if (!loadedPtr->getType()->isPointerTy()) return;
+        llvm::Function* trapFn = GetFunction("__cflat_own_trap");
+        if (trapFn == nullptr) return;  // shim not linked; nothing to call
+
+        // An origin slot exists only for a tracked owning local; its value is the move site (or 0).
+        llvm::Value* originSlot = nullptr;
+        if (storage != nullptr)
+        {
+            auto it = ownOriginSlots_.find(storage);
+            if (it != ownOriginSlots_.end()) originSlot = it->second;
+        }
+
+        auto* isNull = builder->CreateICmpEQ(loadedPtr,
+            llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(loadedPtr->getType())), "own_null");
+        llvm::Function* fn = builder->GetInsertBlock()->getParent();
+        auto* trapBB = llvm::BasicBlock::Create(*context, "own_trap", fn);
+        auto* contBB = llvm::BasicBlock::Create(*context, "own_cont", fn);
+        builder->CreateCondBr(isNull, trapBB, contBB);
+
+        builder->SetInsertPoint(trapBB);
+        llvm::Value* originLine = builder->getInt32(0);
+        llvm::Value* originCol  = builder->getInt32(0);
+        if (originSlot != nullptr)
+        {
+            auto* origin = builder->CreateLoad(builder->getInt64Ty(), originSlot, "own_origin_v");
+            originLine = builder->CreateTrunc(builder->CreateLShr(origin, builder->getInt64(32)), builder->getInt32Ty());
+            originCol  = builder->CreateTrunc(builder->CreateAnd(origin, builder->getInt64(0xffffffff)), builder->getInt32Ty());
+        }
+        builder->CreateCall(trapFn->getFunctionType(), trapFn,
+            { builder->getInt32((uint32_t)useLine), builder->getInt32((uint32_t)useCol), originLine, originCol });
+        builder->CreateBr(contBB);  // trap aborts; keep the IR well-formed
+        builder->SetInsertPoint(contBB);
+    }
+
     llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0, uint64_t userAlign = 0)
     {
         // No enclosing scope means a file-scope declaration reached the local path (a stale
@@ -10762,6 +10848,9 @@ public:
         namedVariable.TypeAndValue = typeValue;
         namedVariable.BaseType = type;
         RecordMoveGenBind(typeValue.VariableName); // fresh local binding
+        // --sanitize=ownership (M1): give every pointer local a zero-initialized move-origin slot.
+        if (typeValue.Pointer)
+            CreateOwnOriginSlot(alloc);
 
 
 
@@ -15948,6 +16037,9 @@ public:
     bool IsVerbose() const { return verbose; }
     // Enable AddressSanitizer instrumentation + runtime linking. Best paired with -g.
     void SetAsan(bool v) { asan_ = v; }
+    // Enable the ownership sanitizer (M1). Implies -g (forced in Compile()).
+    void SetSanitizeOwnership(bool v) { sanitizeOwnership_ = v; }
+    bool IsSanitizeOwnership() const { return sanitizeOwnership_; }
     // Instrument the program with the HeapAudit leak/double-free oracle without source edits.
     void SetHeapAudit(bool v) { heapAudit_ = v; }
     void SetRunMode(bool v) { runMode_ = v; }

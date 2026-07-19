@@ -284,6 +284,7 @@ int main(int argc, char* argv[])
     args.addOption("bitcode", 'b', "Output bitcode file path (.bc)");
     args.addFlag("debug-info", 'g', "Emit DWARF debug information");
     args.addFlag("asan", 0, "Instrument with AddressSanitizer and link the asan runtime (pair with -g for source-line reports). Alias: -fsanitize=address");
+    args.addFlag("sanitize-ownership", 0, "Debug-only ownership sanitizer (M1): instrument dereferences of moved-from owning pointer locals and report 'value moved at L:C, dereferenced after move at L:C' at runtime, then abort. Implies -g. Spellings: --sanitize=ownership, -fsanitize=ownership.");
     args.addFlag("heap-audit", 0, "Instrument the program with the HeapAudit leak oracle: auto-import diagnostic/heap_audit.cb, enable it at main entry, and report still-live allocations at every return. Report-only - leaks print to stderr but do not change the exit code or abort. No double-free detection; use --asan for double-free/use-after-free. Requires -o (links a C diagnostic object).");
     args.addFlag("run", 0, "JIT-compile and run the program in-process without writing an exe to disk. Entry must be 'int main()' or 'int main(int argc, char** argv)'; arguments after a bare '--' are passed as argv[1..]. The process exit code is the program's exit code. Read-only: cannot be combined with -o, -l/--out-lli, or -b/--bitcode.");
     args.addMultiOption("import-dir", 'i', "Directory to search for imported modules (repeatable; searched in order, first match wins)");
@@ -520,6 +521,7 @@ int main(int argc, char* argv[])
     compiler.SetNoCache(args.hasFlag("no-cache"));
     compiler.SetCHeaderCacheDeep(args.hasFlag("c-header-cache-deep"));
     compiler.SetAsan(args.hasFlag("asan"));
+    compiler.SetSanitizeOwnership(args.hasFlag("sanitize-ownership"));
 
     bool heapAudit = args.hasFlag("heap-audit");
     if (heapAudit && !args.getOption("output"))

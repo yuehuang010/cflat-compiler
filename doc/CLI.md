@@ -171,6 +171,7 @@ parse-verified only (no registration). Authoring COM objects with `[winrt] class
 |--------|-------|-------|-------------|
 | `--debug-info` | `-g` | | Emit DWARF debug information. |
 | `--asan` | | | Instrument with AddressSanitizer and link the asan runtime (pair with `-g` for source-line reports). Alias: `-fsanitize=address`. |
+| `--sanitize=ownership` | | | Debug-only ownership sanitizer: trap on a dereference of a moved-from owning pointer. Implies `-g`. Aliases: `-fsanitize=ownership`, `--fsanitize=ownership`. See [below](#ownership-sanitizer). |
 | `--heap-audit` | | | Instrument the program with the HeapAudit leak oracle (no source edits). Requires `-o`. See [below](#heap-audit). |
 | `--verbose` | `-v` | | Print detailed diagnostic messages during compilation. |
 | `--check` | | | Check one or more source files for errors without emitting output (batch; every positional is an independent source). |
@@ -180,6 +181,41 @@ parse-verified only (no registration). Authoring COM objects with `[winrt] class
 
 Diagnostic message conventions: [`doc/DIAGNOSTIC.md`](DIAGNOSTIC.md). Threading-specific
 analysis: [`doc/THREADING.md`](THREADING.md).
+
+### Ownership sanitizer
+
+`--sanitize=ownership` instruments the program for **use-after-move** - the bug class
+AddressSanitizer structurally cannot see, because after a move the object is still valid,
+addressable memory. It is debug-only and off by default; a build without the flag is
+byte-identical to a normal build.
+
+```bash
+cflat.exe app.cb -i lib --sanitize=ownership -o app.exe
+app.exe
+# ownership violation: value moved at 40:9, dereferenced after move at 55:5
+```
+
+How it works: `move x` and `delete x` already null the source storage, and that null
+survives being copied into a field or a container slot. The sanitizer guards the three
+dereference lowerings (`p->f`, `*p`, `p[i]`) with a null check, so a use-after-move or
+use-after-free is caught through any provenance - locals, struct fields, container
+elements. For an owning local the compiler also keeps a hidden move-origin slot, which
+turns the report into "moved at L:C, dereferenced after move at L:C"; other provenances
+get a generic null-dereference message.
+
+Behavior and limits:
+
+- **A null *comparison* never traps.** `p == nullptr` after `move p` is legal CFlat and is
+  asserted by existing tests; only a dereference is instrumented.
+- **`?.` is excluded.** Null-conditional access legitimately tolerates null, so it is not
+  guarded.
+- **Loop-carried use-after-move is already a compile error**, caught statically by the move
+  dataflow pass. The runtime guard only ever fires on the explicit-`move` form the language
+  permits.
+- **No double-free / use-after-drop via a non-null dangling alias.** Detecting an alias that
+  still points at freed memory needs allocator-level tracking; use `--asan` for that.
+- Implies `-g` so traps carry source locations. The trap shim is
+  `core/diagnostic/own_sanitize.cb`, linked only under the flag.
 
 ### Heap audit
 

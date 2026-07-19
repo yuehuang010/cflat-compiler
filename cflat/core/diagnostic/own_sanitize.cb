@@ -1,0 +1,27 @@
+// own_sanitize.cb - runtime trap shim for --sanitize=ownership.
+//
+// Auto-imported ONLY under --sanitize=ownership (see LLVMBackend.cpp, next to the
+// heap_audit auto-import). Under the flag the compiler guards every owned-pointer
+// DEREFERENCE (p->f, *p, p[i]) with `if (ptr == null) __cflat_own_trap(...)`. A null
+// owned pointer being dereferenced is a use-after-move / use-after-free by definition
+// (move and delete both null the slot, and that null travels with the slot through
+// container realloc). A null-COMPARISON (`p == nullptr`) is legal and never guarded.
+//
+// When the dereferenced binding is a local with a recorded move origin, originLine/
+// originCol name where it was moved; otherwise they are 0 (origin not tracked) and a
+// generic message is printed. Kept PURE CFLAT to stay cross-platform.
+
+// Report a null owned-pointer dereference and abort. originLine/originCol name where the
+// value was moved (0 if not tracked); useLine/useCol name the dereference site.
+void __cflat_own_trap(int useLine, int useCol, int originLine, int originCol) {
+    if (originLine != 0) {
+        fprintf(__std_iob(2),
+            "ownership violation: value moved at %d:%d, dereferenced after move at %d:%d\n",
+            originLine, originCol, useLine, useCol);
+    } else {
+        fprintf(__std_iob(2),
+            "ownership violation: null owned pointer dereferenced at %d:%d (moved or freed on an earlier path)\n",
+            useLine, useCol);
+    }
+    abort();
+}

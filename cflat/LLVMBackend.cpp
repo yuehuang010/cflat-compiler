@@ -354,7 +354,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     auto exePath = checkOnly ? std::optional<std::string>{} : args.getOption("output");
     auto lliPath = checkOnly ? std::optional<std::string>{} : args.getOption("out-lli");
     auto bitcodePath = checkOnly ? std::string{} : args.getOption("bitcode").value_or("");
-    bool debugInfo = args.hasFlag("debug-info");
+    // --sanitize=ownership implies -g so the emitted move/use locations are meaningful.
+    bool debugInfo = args.hasFlag("debug-info") || sanitizeOwnership_;
 
     importSearchDirs = args.getMultiOption("import-dir");
     // Default target platform = native host OS. Overridable with --platform for
@@ -572,6 +573,19 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             CompileImportedFile(auditPath.string(), "heap_audit.cb");
         else
             LogError("--heap-audit: diagnostic/heap_audit.cb not found next to the compiler; "
+                     "cannot instrument.");
+    }
+
+    // --sanitize=ownership: pull in the trap shim (defines __cflat_own_trap) so the compiler-
+    // emitted deref guards have a symbol to call. Flag-gated import - normal builds pay nothing.
+    if (sanitizeOwnership_ && !runtimeDir.empty())
+    {
+        auto ownPath = std::filesystem::path(runtimeDir) / "core" / "diagnostic" / "own_sanitize.cb";
+        if (verbose) std::cout << std::format("[verbose] --sanitize=ownership: importing {}\n", ownPath.string());
+        if (std::filesystem::exists(ownPath))
+            CompileImportedFile(ownPath.string(), "own_sanitize.cb");
+        else
+            LogError("--sanitize=ownership: diagnostic/own_sanitize.cb not found next to the compiler; "
                      "cannot instrument.");
     }
 
@@ -2334,6 +2348,8 @@ void LLVMBackend::ResetForReanalysis()
     // Drop any move-dataflow events keyed by the old module's Functions before the module
     // (and those Functions) are destroyed - stale keys must never survive the reset.
     moveEventLog_.clear();
+    // Origin slots hold llvm::Value* into the module being discarded - drop them too.
+    ownOriginSlots_.clear();
 
     module.reset();
     builder.reset();
