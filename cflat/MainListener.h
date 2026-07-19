@@ -4807,7 +4807,7 @@ public:
                 // end-of-full-expression destruction (FlushOwnedTemps at the block-item boundary).
                 if (auto* assign = express->assignmentExpression())
                 {
-                    auto resultNV = ParseAssignmentExpressionNamed(assign);
+                    auto resultNV = ParseAssignmentExpressionNamed(assign, true);
                     ProcessPlusPlus();
                     RegisterDiscardedOwningStructTemp(resultNV);
                     return;
@@ -8061,7 +8061,8 @@ public:
     // Returns a NamedVariable (preserving TypeName) for simple single-child expression chains.
     // Used by ParseDeclaration to get the struct TypeName for struct->interface upcasting.
     // Falls back to value-only for complex expressions (ternary, binary ops, etc.).
-    LLVMBackend::NamedVariable ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx)
+    LLVMBackend::NamedVariable ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx,
+                                                              bool discardResult = false)
     {
         // Snapshot and clear the owned-return flag so FinishAssignmentExpressionNamed
         // can tell whether THIS expression (not a stale prior call) ended in an
@@ -8119,8 +8120,13 @@ public:
                                                     auto muls = adds[0]->castExpression();
                                                     if (muls.size() == 1)
                                                     {
+                                                        // Pure single-child passthrough all the way down:
+                                                        // this fast path IS the only shape where a bare
+                                                        // return-block call reaches the inliner, so forward
+                                                        // discardResult unchanged. Any operator/value context
+                                                        // takes the fallback below with discardResult=false.
                                                         return FinishAssignmentExpressionNamed(
-                                                            ParseCastExpression(muls[0]), savedOwned);
+                                                            ParseCastExpression(muls[0], false, discardResult), savedOwned);
                                                     }
                                                 }
                                             }
@@ -10737,7 +10743,8 @@ public:
         return {};
     }
 
-    LLVMBackend::NamedVariable ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue = false)
+    LLVMBackend::NamedVariable ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue = false,
+                                                   bool discardResult = false)
     {
         auto* compiler = Compiler(ctx);
         auto unaryCtx = ctx->unaryExpression();
@@ -10746,7 +10753,8 @@ public:
 
         if (unaryCtx != nullptr)
         {
-            return ParseUnaryExpression(unaryCtx);
+            // Single-child passthrough: forward discardResult unchanged.
+            return ParseUnaryExpression(unaryCtx, discardResult);
         }
         else if (castExp && typeName)
         {
@@ -10964,7 +10972,8 @@ public:
         return typeValue;
     }
 
-    LLVMBackend::NamedVariable ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx)
+    LLVMBackend::NamedVariable ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx,
+                                                    bool discardResult = false)
     {
         auto* compiler = Compiler(ctx);
         auto postFixCtx = ctx->postfixExpression();
@@ -11103,7 +11112,8 @@ public:
                 }
             }
 
-            return ParsePostfixExpression(postFixCtx);
+            // Single-child passthrough: forward discardResult unchanged.
+            return ParsePostfixExpression(postFixCtx, false, 0, discardResult);
         }
         else if (auto* newCtx = ctx->newExpression())
         {
@@ -13687,7 +13697,7 @@ public:
     //   [PFX-6]   argument assembly + implicit-this prepend
     //   [PFX-7]   call lowering: [winrt] vtable dispatch | null-conditional | overloaded call
     LLVMBackend::NamedVariable ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue = false,
-                                                       size_t dropTrailingChildren = 0)
+                                                       size_t dropTrailingChildren = 0, bool discardResult = false)
     {
         /*
         * postfixExpression
@@ -16227,6 +16237,38 @@ public:
                         // A 'return' inside the block returns from the caller function.
                         if (const auto* rb = Compiler(ctx)->GetReturnBlock(functionName))
                         {
+                            // A return-block call in a VALUE context is invalid: the block's inner
+                            // 'return' emits a ret that exits the CALLER, so there is no SSA value to
+                            // consume. Reject before inlining (emitting after the ret would leave a
+                            // terminator mid-block -> module verification failure).
+                            if (!discardResult)
+                            {
+                                LogErrorContext(ctx, std::format(
+                                    "return-block function '{}' cannot be called in a value context (its "
+                                    "'return' exits the caller, not the block) - call it as a bare statement",
+                                    functionName));
+                                return {};
+                            }
+
+                            // The inlined 'return' emits a ret against the CALLER's declared return type.
+                            // If the return-block's declared return type does not match the caller's, LLVM
+                            // fails module verification (ret type mismatch). Reject with a clear diagnostic.
+                            const std::string& callerRetName = Compiler(ctx)->currentFunctionReturnTypeName;
+                            bool callerRetIsPtr = Compiler(ctx)->currentFunction != nullptr
+                                && Compiler(ctx)->currentFunction->getReturnType()->isPointerTy();
+                            if (rb->ReturnType.TypeName != callerRetName
+                                || rb->ReturnType.Pointer != callerRetIsPtr)
+                            {
+                                std::string callerName = Compiler(ctx)->currentFunction != nullptr
+                                    ? Compiler(ctx)->currentFunction->getName().str() : "<unknown>";
+                                LogErrorContext(ctx, std::format(
+                                    "return-block function '{}' returns '{}' but the calling function '{}' "
+                                    "declares return type '{}' - the inlined 'return' would not match the "
+                                    "caller's return type",
+                                    functionName, rb->ReturnType.TypeName, callerName, callerRetName));
+                                return {};
+                            }
+
                             Compiler(ctx)->InitializeBlock(nullptr, true);
 
                             // Determine if the first param is an implicit 'this'

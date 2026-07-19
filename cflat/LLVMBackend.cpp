@@ -2458,7 +2458,6 @@ void LLVMBackend::ResetForReanalysis()
     fileScopeExpectedError_.clear();
     currentFunction = nullptr;
     autoVaListAlloca = nullptr;
-    returnCapture = std::nullopt;
     autoReturnCapture = std::nullopt;
 
     // Transient per-call / per-expression result state. These are normally produced and

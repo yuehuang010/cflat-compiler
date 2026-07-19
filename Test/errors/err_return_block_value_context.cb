@@ -1,0 +1,24 @@
+// Return-block functions inline their body at the call site: the inner 'return'
+// exits the CALLER, not the block. Two shapes must be rejected with a clear
+// compiler error rather than an LLVM module-verification failure ("Terminator
+// found in the middle of a basic block" / "ret type mismatch"):
+//   1. calling one in a value context - the inlined 'return' terminates the
+//      caller's block, so there is no SSA value to consume, and
+//   2. calling one whose declared return type does not match the caller's
+//      declared return type - the inlined 'ret' would not match the caller.
+
+int compute(int x) { return { return x * 2; }; }
+
+// Value context: 'int y = compute(5)' expects a value, but the inlined 'return'
+// already exited the caller - nothing is produced.
+expect_error("cannot be called in a value context") {
+    int useValue() { int y = compute(5); return y; }
+}
+
+// Return-type mismatch: compute returns 'int', but this caller declares 'void',
+// so the inlined 'ret i32' would not match the caller's void return type.
+expect_error("would not match the caller's return type") {
+    void useVoid() { compute(5); }
+}
+
+extern int main() { return 0; }

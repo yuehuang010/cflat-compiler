@@ -912,12 +912,6 @@ public:
         TypeAndValue ReturnType;
     };
 
-    struct ReturnCaptureContext
-    {
-        llvm::AllocaInst* CaptureAlloca;   // nullptr for void return
-        llvm::BasicBlock* ContinuationBlock;
-    };
-
     // 'auto' return-type inference: CreateReturnCall emits UnreachableInst placeholders instead
     // of ret; the caller splices BBs and replaces placeholders after unifying all return types.
     struct AutoReturnSite
@@ -1446,7 +1440,6 @@ private:
     void ProcessPendingMacroSources();
     std::unordered_map<std::string, std::string> namespaceAliasTable;
     std::unordered_map<std::string, ReturnBlockEntry> returnBlockTable;
-    std::optional<ReturnCaptureContext> returnCapture;
     std::optional<std::vector<AutoReturnSite>> autoReturnCapture; // active when emitting an 'auto' generic instantiation
     std::unordered_map<llvm::Constant*, int32_t> stringLiteralLenByPtr;
     bool strConcatRegistered = false;
@@ -15571,15 +15564,6 @@ public:
             return;
         }
 
-        // If we are inlining a return-block, capture the value and branch to continuation.
-        if (returnCapture)
-        {
-            if (value != nullptr && returnCapture->CaptureAlloca != nullptr)
-                builder->CreateStore(value, returnCapture->CaptureAlloca);
-            builder->CreateBr(returnCapture->ContinuationBlock);
-            return;
-        }
-
         if (autoVaListAlloca)
             CreateVaEnd(autoVaListAlloca);
 
@@ -15633,16 +15617,6 @@ public:
             }
             builder->CreateRet(value);
         }
-    }
-
-    void BeginReturnCapture(llvm::AllocaInst* captureAlloca, llvm::BasicBlock* continuationBlock)
-    {
-        returnCapture = { captureAlloca, continuationBlock };
-    }
-
-    void EndReturnCapture()
-    {
-        returnCapture.reset();
     }
 
     void BeginAutoReturnCapture() { autoReturnCapture.emplace(); }
