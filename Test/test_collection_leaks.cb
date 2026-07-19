@@ -163,6 +163,29 @@ class CircleLeak : IShapeLeak { int r = 0; int area() { return r * r; } ~CircleL
 // A `unique` interface PARAM takes ownership: the callee frees the boxed object at scope exit.
 void sinkShape(unique IShapeLeak s) {}
 
+// Regression (mirrors ui_native.cb reconcilePath): mutually-exclusive branches that each consume
+// a `move` interface param exactly once and immediately return must COMPILE - a move inside a
+// branch that unconditionally returns must not leak its moved state to the fall-through path. At
+// runtime each owned object is freed exactly once.
+move IShapeLeak pickShape(move IShapeLeak a, move IShapeLeak b, int sel)
+{
+    if (sel == 0) { sinkShape(a); return b; }
+    if (sel == 1) { sinkShape(a); return b; }
+    sinkShape(b);
+    return a;
+}
+
+// Pointer flavor of the same exclusive-return pattern: must compile and free each object once.
+struct PtrLeak { int v = 0; ~PtrLeak() { g_shapeDtor = g_shapeDtor + 1; } };
+void delPtr(move PtrLeak* p) {}
+move PtrLeak* pickPtr(move PtrLeak* a, move PtrLeak* b, int sel)
+{
+    if (sel == 0) { delPtr(a); return b; }
+    if (sel == 1) { delPtr(a); return b; }
+    delPtr(b);
+    return a;
+}
+
 // PLAIN (non-`move`) string return that hands back a freshly owned concat. Passing its result -
 // or an owned local bound from it - bare into list<string>.add(move)/set(move) used to LEAK: the
 // move-arg lowering heap-copied a fresh buffer for the slot (the static owned flag is unset for a
@@ -1013,6 +1036,27 @@ extern int main()
         g_shapeDtor = 0;
         { unique IShapeLeak s = new CircleLeak(); s = new CircleLeak(); }
         total++; passed += Test("reassign unique iface local frees old and new", g_shapeDtor, 2);
+
+        // Exclusive branches each consuming a move interface param once and returning: the
+        // returning branch's move must not poison the fall-through path (compile regression), and
+        // every object frees exactly once. Each sel exercises one path; sel=2 is the fall-through.
+        g_shapeDtor = 0;
+        { unique IShapeLeak r = pickShape(new CircleLeak(), new CircleLeak(), 0); }
+        total++; passed += Test("exclusive-branch consume path 0 frees both", g_shapeDtor, 2);
+        g_shapeDtor = 0;
+        { unique IShapeLeak r = pickShape(new CircleLeak(), new CircleLeak(), 1); }
+        total++; passed += Test("exclusive-branch consume path 1 frees both", g_shapeDtor, 2);
+        g_shapeDtor = 0;
+        { unique IShapeLeak r = pickShape(new CircleLeak(), new CircleLeak(), 2); }
+        total++; passed += Test("exclusive-branch consume fall-through frees both", g_shapeDtor, 2);
+
+        // Pointer flavor of the exclusive-return pattern: compiles and frees each object once.
+        g_shapeDtor = 0;
+        { unique PtrLeak* r = pickPtr(new PtrLeak(), new PtrLeak(), 0); }
+        total++; passed += Test("exclusive-branch ptr consume path 0 frees both", g_shapeDtor, 2);
+        g_shapeDtor = 0;
+        { unique PtrLeak* r = pickPtr(new PtrLeak(), new PtrLeak(), 2); }
+        total++; passed += Test("exclusive-branch ptr consume fall-through frees both", g_shapeDtor, 2);
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

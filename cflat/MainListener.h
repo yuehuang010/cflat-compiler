@@ -5286,6 +5286,11 @@ public:
 
                 compiler->InitializeBlock(blockTrue, false);
                 ParseControlledBody(innerStatement[0]);
+                // Only a `return` branch's moves truly vanish (the path exits the function). A
+                // break/continue branch REJOINS later code (post-loop / next iteration), so its
+                // moves must survive as maybe-moved - keep merging those. Capture before
+                // CreateBlockBreak adds its own terminator.
+                bool thenReturned = compiler->IsInsertBlockReturned();
                 auto thenMovedState = compiler->SaveMovedState();
 
                 compiler->CreateBlockBreak(blockResume, true);
@@ -5298,11 +5303,28 @@ public:
                     // else statement
                     compiler->InitializeBlock(blockElse, true);
                     ParseControlledBody(innerStatement[1]);
+                    bool elseReturned = compiler->IsInsertBlockReturned();
                     auto elseMovedState = compiler->SaveMovedState();
                     compiler->CreateBlockBreak(blockResume, true);
 
-                    // Merge: variable is moved if moved in either branch.
-                    compiler->MergeMovedStates(thenMovedState, elseMovedState);
+                    // Drop only a RETURNING branch's moves (dead path to resume); a break/continue
+                    // branch still merges. If both fall through (or break/continue), a var is moved
+                    // if moved in either.
+                    if (thenReturned && !elseReturned)
+                        compiler->RestoreMovedState(elseMovedState);
+                    else if (!thenReturned && elseReturned)
+                        compiler->RestoreMovedState(thenMovedState);
+                    else if (thenReturned && elseReturned)
+                        compiler->RestoreMovedState(preIfMovedState);
+                    else
+                        compiler->MergeMovedStates(thenMovedState, elseMovedState);
+                }
+                else if (thenReturned)
+                {
+                    // No else: the resume path is the condition-false path, which never ran the
+                    // then-branch. Only a RETURN discards its moves; break/continue keeps them
+                    // (they rejoin later code) via the fall-through thenMovedState left in place.
+                    compiler->RestoreMovedState(preIfMovedState);
                 }
 
                 // resume

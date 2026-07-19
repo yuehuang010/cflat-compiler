@@ -1728,6 +1728,17 @@ private:
         return b != nullptr && b->getTerminator() == nullptr;
     }
 
+    // True when the insert block ended in a `return` (function exit). Distinguishes a returning
+    // branch (whose moves never rejoin later code) from a break/continue one (which does rejoin),
+    // so move-state can be safely discarded only for the former.
+    bool IsInsertBlockReturned() const
+    {
+        auto* b = builder->GetInsertBlock();
+        if (b == nullptr) return false;
+        auto* term = b->getTerminator();
+        return term != nullptr && llvm::isa<llvm::ReturnInst>(term);
+    }
+
     // Free-safety check for a pending owned temp registered in block `bb`: the value
     // defined there may be freed at `curBlock` iff `bb` dominates `curBlock` (every
     // path to here passed through its definition). Same-block is the trivial case;

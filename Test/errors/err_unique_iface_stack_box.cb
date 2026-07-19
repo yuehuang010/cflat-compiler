@@ -26,4 +26,16 @@ expect_error("cannot delete unique local 's'") {
     void delLocal() { unique IShape s = new Circle(); delete s; }
 }
 
+// Move-flow: a `move` inside a loop branch that BREAKS rejoins post-loop code, so the value stays
+// maybe-moved - consuming it again after the loop is a use-after-move flagged by the inline checker
+// (a returning branch would be fine; only break/continue keep the move alive). The CONTINUE variant
+// is covered separately by the loop-carried move-dataflow pass.
+expect_error("use of moved variable 'committed'") {
+    void loopBreakConsume(move IShape committed, int n) {
+        int i = 0;
+        while (i < n) { if (i == 3) { sink(committed); break; } i = i + 1; }
+        sink(committed);
+    }
+}
+
 extern int main() { return 0; }
