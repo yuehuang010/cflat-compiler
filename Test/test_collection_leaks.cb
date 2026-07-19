@@ -186,6 +186,33 @@ move PtrLeak* pickPtr(move PtrLeak* a, move PtrLeak* b, int sel)
     return a;
 }
 
+// A `move` consumed in a branch that returns, with a DEAD statement after the return: the branch
+// must still read as returned (the dead statement reopens a live block that would otherwise hide
+// the return), so its move does not spuriously poison the fall-through use of the same param.
+move IShapeLeak deadCodePick(move IShapeLeak a, move IShapeLeak b, int sel)
+{
+    if (sel == 0) { sinkShape(a); return b; int dead = 5; }
+    sinkShape(a);
+    return b;
+}
+
+// Return-block functions inline an early CALLER-EXIT (their `return` returns from the caller). The
+// move analysis must model that exit: an UNCONDITIONAL return-block makes the enclosing branch
+// return (a following move is dead), while a CONDITIONAL one may fall through (a following move
+// stays live). Both must compile and free each object exactly once.
+void rbExitLeak() { return { return; }; }
+void rbMaybeLeak(int x) { return { if (x < 0) { return; } }; }
+void rbUncondFree(move PtrLeak* a, int c)
+{
+    if (c > 0) { rbExitLeak(); delPtr(a); }   // rbExitLeak returns from here; delPtr(a) is dead
+    delPtr(a);
+}
+void rbCondFree(move PtrLeak* a, int c)
+{
+    rbMaybeLeak(c);                            // may return here (c < 0) or fall through (c >= 0)
+    delPtr(a);
+}
+
 // PLAIN (non-`move`) string return that hands back a freshly owned concat. Passing its result -
 // or an owned local bound from it - bare into list<string>.add(move)/set(move) used to LEAK: the
 // move-arg lowering heap-copied a fresh buffer for the slot (the static owned flag is unset for a
@@ -1057,6 +1084,26 @@ extern int main()
         g_shapeDtor = 0;
         { unique PtrLeak* r = pickPtr(new PtrLeak(), new PtrLeak(), 2); }
         total++; passed += Test("exclusive-branch ptr consume fall-through frees both", g_shapeDtor, 2);
+
+        // Dead code after a return in a consuming branch must not spuriously flag the fall-through
+        // use of the same param (compile regression); each object still frees exactly once.
+        g_shapeDtor = 0;
+        { unique IShapeLeak r = deadCodePick(new CircleLeak(), new CircleLeak(), 0); }
+        total++; passed += Test("dead-code-after-return returning path frees both", g_shapeDtor, 2);
+        g_shapeDtor = 0;
+        { unique IShapeLeak r = deadCodePick(new CircleLeak(), new CircleLeak(), 1); }
+        total++; passed += Test("dead-code-after-return fall-through frees both", g_shapeDtor, 2);
+
+        // Return-block early-exit: an unconditional return-block makes the branch return (the move
+        // after it is dead); a conditional one may fall through. Both compile and free exactly once.
+        g_shapeDtor = 0; rbUncondFree(new PtrLeak(), 1);
+        total++; passed += Test("return-block unconditional exit frees once", g_shapeDtor, 1);
+        g_shapeDtor = 0; rbUncondFree(new PtrLeak(), 0);
+        total++; passed += Test("return-block unconditional skip frees once", g_shapeDtor, 1);
+        g_shapeDtor = 0; rbCondFree(new PtrLeak(), 5);
+        total++; passed += Test("return-block conditional fall-through frees once", g_shapeDtor, 1);
+        g_shapeDtor = 0; rbCondFree(new PtrLeak(), -1);
+        total++; passed += Test("return-block conditional exit frees once", g_shapeDtor, 1);
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

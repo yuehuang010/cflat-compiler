@@ -2211,6 +2211,21 @@ private:
     enum class VectorizeFpTier { None, Contract, Reassoc };
     VectorizeFpTier vectorizeFpTier_ = VectorizeFpTier::None;
 
+    // True when the current straight-line statement sequence has hit a `return` (making any
+    // following statements dead). The if/else move-merge samples this per branch to decide
+    // whether a branch's moves are on a dead path - immune to dead code after a return, which
+    // reopens a live block and hides the ret terminator. Set only by the return handler (not
+    // break/continue, per the 8302e10 distinction); loops/switch restore it (they fall through).
+    bool straightLineReturned_ = false;
+
+    // Save/restore straightLineReturned_ across a construct that falls through (loop, switch):
+    // a return in its body must not mark the enclosing straight-line as returned.
+    struct ReturnFlagGuard {
+        bool* flag; bool saved;
+        explicit ReturnFlagGuard(bool* f) : flag(f), saved(*f) {}
+        ~ReturnFlagGuard() { *flag = saved; }
+    };
+
     // Set the builder's fast-math flags for the loop body according to the tier.
     // contract lets mul+add fuse to fma; reassoc additionally lets the optimizer
     // regroup FP expressions and split reduction accumulators (implies contract).
@@ -4387,6 +4402,9 @@ public:
         {
             if (jump->Return())
             {
+                // Mark the straight-line as returned so the if/else move-merge treats this branch's
+                // moves as dead-path even if a (dead) statement follows the return.
+                straightLineReturned_ = true;
                 if (jump->Default() != nullptr)
                 {
                     // return default; - zero-initialize the return type (null for pointers/interfaces, 0 for integers)
@@ -4800,6 +4818,9 @@ public:
         }
         else if (iterationStatement != nullptr)
         {
+            // A loop falls through to its resume (it may run zero times or exit normally), so a
+            // return in its body does not mark the enclosing straight-line as returned.
+            ReturnFlagGuard returnFlagGuard(&straightLineReturned_);
             // Consume the vectorize request immediately so it binds only to this
             // loop level (a nested loop in the body re-reads a cleared flag).
             bool doVectorize = vectorizeActive_;
@@ -5284,17 +5305,22 @@ public:
 
                 auto preIfMovedState = compiler->SaveMovedState();
 
-                compiler->InitializeBlock(blockTrue, false);
-                ParseControlledBody(innerStatement[0]);
                 // Only a `return` branch's moves truly vanish (the path exits the function). A
                 // break/continue branch REJOINS later code (post-loop / next iteration), so its
-                // moves must survive as maybe-moved - keep merging those. Capture before
-                // CreateBlockBreak adds its own terminator.
-                bool thenReturned = compiler->IsInsertBlockReturned();
+                // moves must survive as maybe-moved - keep merging those. Track "this branch
+                // returned" via straightLineReturned_ (set by the return handler), which is immune
+                // to dead code after a return that would hide the ret terminator from a block check.
+                bool enclosingReturned = straightLineReturned_;
+
+                compiler->InitializeBlock(blockTrue, false);
+                straightLineReturned_ = false;
+                ParseControlledBody(innerStatement[0]);
+                bool thenReturned = straightLineReturned_;
                 auto thenMovedState = compiler->SaveMovedState();
 
                 compiler->CreateBlockBreak(blockResume, true);
 
+                bool elseReturned = false;
                 if (blockElse != nullptr)
                 {
                     // Restore pre-branch moved state so else doesn't inherit if-branch moves.
@@ -5302,8 +5328,9 @@ public:
 
                     // else statement
                     compiler->InitializeBlock(blockElse, true);
+                    straightLineReturned_ = false;
                     ParseControlledBody(innerStatement[1]);
-                    bool elseReturned = compiler->IsInsertBlockReturned();
+                    elseReturned = straightLineReturned_;
                     auto elseMovedState = compiler->SaveMovedState();
                     compiler->CreateBlockBreak(blockResume, true);
 
@@ -5327,12 +5354,20 @@ public:
                     compiler->RestoreMovedState(preIfMovedState);
                 }
 
+                // The enclosing straight-line has unconditionally returned iff it already had, or
+                // this if returns on every path (both branches return; a no-else if falls through).
+                straightLineReturned_ = enclosingReturned
+                    || (blockElse != nullptr && thenReturned && elseReturned);
+
                 // resume
                 compiler->InitializeBlock(blockResume, false);
                 return;
             }
             else if (selectionStatement->Switch())
             {
+                // Conservatively treat a switch as falling through (a return in one case must not
+                // mark the enclosing straight-line as returned); restore the flag after the body.
+                ReturnFlagGuard returnFlagGuard(&straightLineReturned_);
                 auto expression = selectionStatement->expression();
                 auto body = selectionStatement->statement(0)->compoundStatement();
 
@@ -5820,6 +5855,9 @@ public:
 
             auto wrapperFn = compiler->CreateFunctionDefinition(name, returnType, wrapperParams, false, false, line);
             compiler->InitializeBlock(&wrapperFn->front(), false);
+            // Fresh straight-line for the wrapper body; restore the enclosing walk's flag on exit.
+            ReturnFlagGuard wrapperReturnFlagGuard(&straightLineReturned_);
+            straightLineReturned_ = false;
 
             // Clear each arg's VariableName: MatchFunction treats a non-empty VariableName as a
             // NAMED argument, which hard-errors on same-named methods of unrelated types instead of rejecting.
@@ -6007,6 +6045,10 @@ public:
             return;
 
         compiler->InitializeBlock(&fn->front(), false);
+        // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
+        // exit so a nested lambda's return does not leak into the surrounding expression.
+        ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
+        straightLineReturned_ = false;
 
         // Make the enclosing namespace visible to body resolution so an unqualified
         // sibling reference (bare "helper" inside "namespace N") resolves to "N.helper".
@@ -17671,6 +17713,10 @@ public:
 
         auto* fn = compiler->CreateFunctionDefinition(lambdaName, returnType, allParams);
         compiler->InitializeBlock(&fn->front(), false);
+        // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
+        // exit so a nested lambda's return does not leak into the surrounding expression.
+        ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
+        straightLineReturned_ = false;
 
         // Unpack captured variables from env (the trailing param) into the invoker's scope.
         if (!captures.empty() && closureStructTy)
@@ -22089,6 +22135,10 @@ public:
         // Open constructor function - no this* parameter; returns the struct by value
         auto fn = compiler->CreateFunctionDefinition(structName, returnType, allParams, false, varargs, line);
         compiler->InitializeBlock(&fn->front(), false);
+        // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
+        // exit so a nested lambda's return does not leak into the surrounding expression.
+        ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
+        straightLineReturned_ = false;
 
         // Get the struct's LLVM type (without pointer)
         auto* structLLVMType = llvm::cast<llvm::StructType>(compiler->GetType(returnType, nullptr, false));
@@ -22173,6 +22223,10 @@ public:
         compiler->RegisterDestructor(structName, fn);
 
         compiler->InitializeBlock(&fn->front(), false);
+        // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
+        // exit so a nested lambda's return does not leak into the surrounding expression.
+        ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
+        straightLineReturned_ = false;
 
         auto blockItemList = ctx->compoundStatement()->blockItemList();
         if (blockItemList)
@@ -22205,6 +22259,10 @@ public:
         compiler->RegisterDestructor(name, fn);
 
         compiler->InitializeBlock(&fn->front(), false);
+        // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
+        // exit so a nested lambda's return does not leak into the surrounding expression.
+        ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
+        straightLineReturned_ = false;
 
         auto blockItemList = ctx->compoundStatement()->blockItemList();
         if (blockItemList)

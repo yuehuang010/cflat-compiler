@@ -38,4 +38,28 @@ expect_error("use of moved variable 'committed'") {
     }
 }
 
+// A genuine straight-line use-after-move must still be flagged even with dead code (a return and a
+// trailing statement) later in the function - the dead-code-after-return handling must not suppress
+// it.
+expect_error("use of moved variable 'committed'") {
+    void realUseAfterMove(move IShape committed) {
+        sink(committed);
+        sink(committed);
+        return;
+        int dead = 5;
+    }
+}
+
+// A CONDITIONAL return-block function may fall through (its inner `return` exits the caller only on
+// the taken path), so a use-after-move after it must still be flagged - the return-block's inlined
+// return must not be treated as an unconditional caller exit.
+void rbMaybe(int x) { return { if (x < 0) { return; } }; }
+expect_error("use of moved variable 'committed'") {
+    void rbFallThroughUseAfterMove(move IShape committed, int c) {
+        rbMaybe(c);
+        sink(committed);
+        sink(committed);
+    }
+}
+
 extern int main() { return 0; }
