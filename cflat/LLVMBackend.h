@@ -3076,7 +3076,11 @@ private:
             const auto& f = dsIt->second.StructFields[i];
             // `unique T* field`: the struct owns the pointee. Unlike a value member this is
             // pushed even when the pointee is trivially destructible - the block still needs freeing.
-            if (f.IsUnique && f.Pointer && !f.ElemPointer && !f.IsArrayView && !f.IsSimd
+            // IsUniqueTypeArg matches the array arm below: a scalar field made `unique` by generic
+            // substitution (`struct Holder<T> { T _v; }` as `Holder<unique C*>`) was released by
+            // nothing and leaked silently. A boxed `unique IFace` is a fat pointer, so !f.Pointer
+            // excludes it - it still leaks, and needs the IsIface emitter the array arm has.
+            if ((f.IsUnique || f.IsUniqueTypeArg) && f.Pointer && !f.ElemPointer && !f.IsArrayView && !f.IsSimd
                 && !f.IsBitfield && !f.IsPadding && f.ConstArraySize == 0)
             {
                 work.push_back({ i, GetFullDestructorForDelete(f.TypeName), true, f.TypeName, f.AllocAlignValue });

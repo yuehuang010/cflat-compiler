@@ -59,6 +59,13 @@ struct LeakUnique  { unique LeakPayload* slot = nullptr; };
 // Nested: freeing the outer field runs LeakUnique's synthesized dtor, which frees its own field.
 struct LeakUniqueOuter { unique LeakUnique* inner = nullptr; };
 
+// Generic struct with a bare SCALAR field `T v`: instantiated with `unique PtrLeak*`, the field
+// is made unique by SUBSTITUTION - there is no `unique` token on the field declaration itself.
+// The synthesized destructor's scalar-free arm must widen from IsUnique to
+// (IsUnique || IsUniqueTypeArg) (LLVMBackend.h ~line 3079) or this pointee silently leaks.
+// Instantiated with a plain `PtrLeak*` instead, the field is a BORROW and must free nothing.
+struct LeakGenSlot<T> { T v = default; };
+
 // `unique` on an INTERFACE field: ownership rides the contract, because a store through the
 // interface's byte-offset slot is dispatched dynamically and cannot see the concrete type.
 // Both sides must declare it (err_unique_iface_field_impl_only / _iface_only).
@@ -817,6 +824,35 @@ extern int main()
         total++; passed += Test("unique nested field live", o.inner->slot->nums.get(0), 8);
     }
 
+    // === Stage 1.5: generic struct field made `unique` by SUBSTITUTION (no `unique` token on the
+    // field declaration - it arrives via the type argument) ===
+    // LeakGenSlot<unique PtrLeak*> must free its pointee exactly once on scope exit (the leak this
+    // pins: before the LLVMBackend.h fix, the synthesized destructor's scalar arm only checked
+    // IsUnique, so a field that is unique purely by substitution was never freed).
+    {
+        g_shapeDtor = 0;
+        {
+            LeakGenSlot<unique PtrLeak*> h = default;
+            h.v = new PtrLeak();
+            total++; passed += Test("generic unique-substitution field live", g_shapeDtor, 0);
+        }
+        total++; passed += Test("generic unique-substitution field dtor runs once", g_shapeDtor, 1);
+
+        // LeakGenSlot<PtrLeak*> (NON-unique type argument): the field is a BORROW, so the struct's
+        // synthesized destructor must free NOTHING - the pointee only dies when the test deletes it.
+        // This pins that the widened predicate did not start freeing borrows too.
+        g_shapeDtor = 0;
+        {
+            LeakGenSlot<PtrLeak*> h2 = default;
+            h2.v = new PtrLeak();
+            total++; passed += Test("generic borrow-substitution field live", g_shapeDtor, 0);
+            PtrLeak* extracted = h2.v;          // borrow read; not an ownership transfer
+            delete extracted;                  // caller frees the borrowed pointee manually
+            total++; passed += Test("generic borrow-substitution caller frees", g_shapeDtor, 1);
+        }
+        total++; passed += Test("generic borrow-substitution field frees nothing itself", g_shapeDtor, 1);
+    }
+
     // === Stage 2: reassigning a `unique` field frees the old pointee ===
     // The leak oracle below is the only thing that proves this - a reassignment that merely
     // overwrote the slot would orphan 32 payloads (and their list<int> buffers) silently.
@@ -987,6 +1023,18 @@ extern int main()
             d.add(4, new PtrLeak());                   // repopulate; the dtor must free it
         }
         total++; passed += Test("dict<unique ptr> dtor frees remaining", g_shapeDtor, 5);
+
+        // Regression: a refused duplicate-key add() must free the rejected unique value, not drop
+        // it - see internal/issue/duplicate-add-leaks-unique-value.md.
+        g_shapeDtor = 0;
+        {
+            dictionary<int, unique PtrLeak*> d;
+            d.add(1, new PtrLeak());
+            bool dup = d.add(1, new PtrLeak());        // duplicate: refused value must be freed here
+            total++; passed += Test("dict<unique ptr> dup add rejected", dup, false);
+            total++; passed += Test("dict<unique ptr> dup add frees refused value", g_shapeDtor, 1);
+        }
+        total++; passed += Test("dict<unique ptr> dup add dtor frees remaining", g_shapeDtor, 2);
 
         // bare pointer values: the dict frees NOTHING (add()'s move-param nulls the caller local, so
         // the pointee is reached back through get()). remove() and teardown must leave it alive.

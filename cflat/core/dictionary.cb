@@ -152,6 +152,15 @@ struct dictionary<K, V>
         else                            _values[index].~();
     }
 
+    // Free a value handed to add() as a synthesized move sink that the dictionary is refusing
+    // (duplicate key). Takes `value` by `move` so the parameter's own scope-exit destructor does
+    // the freeing (deletes a `unique` pointee); a bare `delete value` on the plain parameter is
+    // rejected by the compiler as deleting a borrow. See btree.cb's `_freeValue` for the same
+    // pattern. Call sites must gate on `is_unique(V)` - never hand a borrowed pointer here.
+    void _freeValue(move V value)
+    {
+    }
+
     // Locate the slot to insert `key` into, or -1 if the key is already present. Sets up the
     // tombstone reuse bookkeeping shared by add() and set().
     int _insertSlotFor(alias K key)
@@ -184,7 +193,15 @@ struct dictionary<K, V>
             _maybeRehash();
 
             int insertSlot = _insertSlotFor(key);
-            if (insertSlot == -1) return false;
+            if (insertSlot == -1)
+            {
+                // Duplicate: the dictionary refuses the entry. A `unique` argument was already
+                // handed over (a unique-substituted plain parameter is a synthesized move sink)
+                // and the caller kept no handle to it, so it must be freed here or it leaks.
+                // Borrowed / value arguments are left untouched.
+                if const (is_unique(V)) _freeValue(move value);
+                return false;
+            }
             _placeKeyAt(insertSlot, key);
             _placeValueAt(insertSlot, value);
             _status[insertSlot] = 1;
