@@ -689,6 +689,60 @@ static bool ComputeReturnsOwned(const LLVMBackend::DeclTypeAndValue& returnType,
     return false;
 }
 
+// Collect the 'return <expr>;' expressions a function body owns itself. A nested lambda's
+// returns belong to the lambda, so its subtree is skipped.
+static void CollectOwnReturnExpressions(antlr4::tree::ParseTree* node,
+                                        std::vector<CFlatParser::ExpressionContext*>& out)
+{
+    if (node == nullptr) return;
+    if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr) return;
+    if (auto* jump = dynamic_cast<CFlatParser::JumpStatementContext*>(node))
+        if (jump->expression() != nullptr) out.push_back(jump->expression());
+    for (auto* child : node->children)
+        CollectOwnReturnExpressions(child, out);
+}
+
+enum class ValueStructReturnKind { NotApplicable, AllBorrowedParam, Mixed };
+
+// Classify the by-value STRUCT returns of a function whose return type carries no ownership
+// annotation: does every 'return' hand back a borrowed by-value parameter of the return type,
+// or do the paths disagree? The unique-ownership gate lives in the callers - a copyable struct
+// has nothing to duplicate, so mixed returns stay legal for it.
+static ValueStructReturnKind ClassifyValueStructReturns(
+    CFlatParser::FunctionDefinitionContext* func,
+    const LLVMBackend::DeclTypeAndValue& returnType,
+    const std::vector<LLVMBackend::TypeAndValue>& allParams,
+    std::string* outBorrowedParamName)
+{
+    if (func == nullptr || func->compoundStatement() == nullptr) return ValueStructReturnKind::NotApplicable;
+    if (returnType.TypeName.empty() || returnType.Pointer || returnType.ElemPointer) return ValueStructReturnKind::NotApplicable;
+    if (returnType.IsMove || returnType.IsAlias || returnType.external) return ValueStructReturnKind::NotApplicable;
+
+    std::vector<CFlatParser::ExpressionContext*> returns;
+    CollectOwnReturnExpressions(func->compoundStatement(), returns);
+    if (returns.empty()) return ValueStructReturnKind::NotApplicable;
+
+    int borrowed = 0;
+    int other = 0;
+    for (auto* expr : returns)
+    {
+        const std::string text = expr->getText();
+        bool isBorrowedParam = false;
+        for (const auto& p : allParams)
+        {
+            if (p.VariableName != text) continue;
+            if (p.TypeName != returnType.TypeName) continue;
+            if (p.Pointer || p.ElemPointer || p.IsMove || p.IsAlias) continue;
+            isBorrowedParam = true;
+            if (outBorrowedParamName && outBorrowedParamName->empty()) *outBorrowedParamName = p.VariableName;
+            break;
+        }
+        if (isBorrowedParam) ++borrowed; else ++other;
+    }
+    if (borrowed == 0) return ValueStructReturnKind::NotApplicable;
+    return other == 0 ? ValueStructReturnKind::AllBorrowedParam : ValueStructReturnKind::Mixed;
+}
+
 // Arrow-normalized form of a lock expression's source text: 'p->m' becomes 'p.m'. The mode
 // suffix (if any) is left in place - see NormalizeLockText for the canonical, suffix-free form.
 inline std::string ArrowNormalizeLockText(const std::string& text)
@@ -1149,6 +1203,16 @@ private:
         bool returnsOwned = ComputeReturnsOwned(returnType, name, allParams);
 
         compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwned, false, returnType.CallConv);
+
+        // An unannotated by-value struct return whose every path hands back a borrowed
+        // parameter is an 'alias' (borrow) return - queue the inference so callers do not
+        // free the result. The unique-ownership gate is applied when the queue is resolved.
+        {
+            std::string borrowedParam;
+            if (ClassifyValueStructReturns(func, returnType, allParams, &borrowedParam)
+                == ValueStructReturnKind::AllBorrowedParam)
+                compiler->QueueAliasReturnInference(name, returnType.TypeName, allParams);
+        }
 
         // Populate RequiredLocks from the function's lock clause and any extra locks
         // inherited from a positional lock group (extraRequiredLocks).
@@ -2762,6 +2826,11 @@ private:
                         // of that type is a move sink, so the caller's source must be nulled.
                         // An `alias`-declared parameter is an explicit borrow and stays one.
                         if (substUniqueArg && !declType.IsAlias) declType.IsUniqueTypeArg = true;
+                        // An `alias` borrow of a `unique` element (list's `alias T get` with
+                        // T = `unique X*`): the CONTAINER owns the pointee and frees it, so a later
+                        // `delete` of a local bound to this return double-frees. Record it here (the
+                        // move-sink flag above is suppressed on an alias borrow) for the delete check.
+                        if (substUniqueArg && declType.IsAlias) declType.IsBorrowOfUniqueElement = true;
                     }
                     // Resolve namespace-qualified type names (alias expansion + parent namespace search)
                     typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName);
@@ -3078,6 +3147,9 @@ public:
         this->parser = parser;
         this->compilerLLVM = compilerLLVM;
         this->sourceFileName = filename;
+        // The forward-ref scan for this file is complete, so every struct's fields are
+        // registered and the queued 'alias' return inference can be gated on ownership.
+        compilerLLVM->ResolvePendingAliasReturnInference();
     }
 
     void SetImportNamespace(const std::string& ns) { importNamespace_ = ns; }
@@ -4823,6 +4895,26 @@ public:
                             LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
                         }
 
+                        // Plain 'return h' of a 'move' owning-struct PARAMETER copies its owning bits
+                        // into the caller's return slot without releasing the parameter, so both the
+                        // returned value and the expiring parameter free the same storage (double-free).
+                        // An explicit 'return move h' detaches the source (returnExprOwned, empty
+                        // CallerName), so it is not flagged. An owned LOCAL returned plain transfers
+                        // correctly and is not a parameter, so it is excluded too.
+                        if (compiler->currentFunctionReturnTV.IsMove
+                            && !compiler->currentFunctionReturnTV.Pointer
+                            && right != nullptr
+                            && !returnExprOwned
+                            && IsMoveOwningStructParameter(compiler, returnNV.CallerName))
+                        {
+                            LogErrorContext(jump, std::format(
+                                "cannot return 'move' parameter '{}' by a plain 'return' - it copies the "
+                                "parameter's owning fields without releasing it, so both the returned value "
+                                "and the expiring parameter free the same storage (double-free). Write "
+                                "'return move {}' to transfer ownership to the caller.",
+                                returnNV.CallerName, returnNV.CallerName));
+                        }
+
                         // `return new T();` where the declared return type is the VALUE struct 'T'.
                         // The operand is a 'T*' against a struct return type - LLVM rejects the
                         // module with no source location, so diagnose it here instead.
@@ -6367,6 +6459,33 @@ public:
             returnType.IsNullable = false;
         }
 
+        // Struct fields are registered during this walk, not the forward-ref scan, so the
+        // queued 'alias' return inference becomes evaluable only now.
+        compiler->ResolvePendingAliasReturnInference();
+
+        // Ownership of an unannotated by-value STRUCT return that transitively owns a 'unique'
+        // pointer. All paths returning a borrowed parameter means the result is a borrow, so
+        // infer 'alias'; paths that disagree give the caller no answer at all, so reject.
+        // Copyable returns are untouched - a copy duplicates no ownership.
+        if (compiler->TypeOwnsUniquePointer(returnType.TypeName))
+        {
+            std::string borrowedParam;
+            auto returnKind = ClassifyValueStructReturns(func, returnType, allParams, &borrowedParam);
+            if (returnKind == ValueStructReturnKind::Mixed)
+            {
+                LogErrorContext(func, std::format(
+                    "function returns borrowed parameter '{}' on one path and an owned value on another, "
+                    "so the caller cannot know whether to free the result. Make all returns borrowed "
+                    "(declare 'alias {}'), or all returns owned (declare 'move {}' and take ownership in "
+                    "with a 'move {} {}' parameter).",
+                    borrowedParam, returnType.TypeName, returnType.TypeName,
+                    returnType.TypeName, borrowedParam));
+                return;
+            }
+            if (returnKind == ValueStructReturnKind::AllBorrowedParam)
+                returnType.IsAlias = true;
+        }
+
         bool returnsOwned = ComputeReturnsOwned(returnType, name, allParams);
 
         // Pre-scan parameter types, return type, and function body to queue and emit any
@@ -6992,6 +7111,10 @@ public:
                 // The local shallow-aliases storage it does not own, so its scope-exit destructor
                 // must be suppressed (IsAliasBorrow) - otherwise it double-frees the source's buffer.
                 bool srcIsAlias = false;
+                // True when the initializer borrows an element the owning container frees
+                // (`B* g = l.get(0)` on a `list<unique B*>`). A later `delete g` double-frees.
+                bool srcBorrowsOwnedElement = false;
+                std::string srcOwnedElementContainer;
                 // Implied move of a `move`-temp's owning field (`string s = makeToken().text`): the temp
                 // owns the field, so the local adopts it and the source field in the temp is zeroed.
                 bool srcMovableTempField = false;
@@ -7303,6 +7426,11 @@ public:
                                 srcStorage = rightNV.Storage;
                                 srcBaseType = rightNV.BaseType;
                                 srcIsMove = rightNV.TypeAndValue.IsMove;
+                                // Borrow of an element the owning container frees (list<unique X*>
+                                // .get). Capture it so the local is tagged for the delete check.
+                                srcBorrowsOwnedElement = rightNV.TypeAndValue.IsBorrowOfUniqueElement;
+                                srcOwnedElementContainer = rightNV.TypeAndValue.ParentVariableName.empty()
+                                    ? rightNV.CallerName : rightNV.TypeAndValue.ParentVariableName;
                                 // Alias if the RHS is an `alias` call result OR a read of an
                                 // alias-borrow local (chained `Token t2 = t1;`) - both borrow.
                                 srcIsAlias = rightNV.TypeAndValue.IsAlias || rightNV.IsAliasBorrow;
@@ -7880,6 +8008,19 @@ public:
                                 nv.IsBorrowed = true;
                                 nv.BorrowedOrigin = srcBorrowedOrigin;
                                 nv.BorrowedUniqueField = srcBorrowedUniqueField;
+                            }
+                        }
+
+                        // Tag a local that borrows a container-owned element (list<unique X*>.get)
+                        // so a later `delete` of it is rejected. A genuine transfer (move/new) sets
+                        // lastOwningResult and is skipped; the tag is delete-only (see BorrowsOwnedElement).
+                        if (srcBorrowsOwnedElement && typeAndValue.Pointer && !compiler->lastOwningResult)
+                        {
+                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            if (!nv.IsOwning && !nv.IsNewAllocated)
+                            {
+                                nv.BorrowsOwnedElement = true;
+                                nv.OwnedElementContainer = srcOwnedElementContainer;
                             }
                         }
 
@@ -9390,6 +9531,18 @@ public:
                     && ((!rightNV.FieldName.empty() && !rightNV.OwningStructName.empty())
                         || rightNV.BorrowsOwnedString);
                 compiler->SetVariableBorrowsOwnedString(namedVar.CallerName, rhsBorrowsField);
+            }
+            // Refresh the container-owned-element borrow taint on a reassigned pointer local: it
+            // now borrows a container-owned element iff the new RHS does, so `g = new B()` after
+            // `g = l.get(0)` clears it and a later `delete g` is allowed (item 2 false positive).
+            if (operatorText == "=" && !namedVar.CallerName.empty() && namedVar.FieldName.empty()
+                && namedVar.TypeAndValue.Pointer)
+            {
+                bool rhsBorrowsElem = rightNV.TypeAndValue.IsBorrowOfUniqueElement
+                    && !compiler->lastOwningResult;
+                std::string container = rightNV.TypeAndValue.ParentVariableName.empty()
+                    ? rightNV.CallerName : rightNV.TypeAndValue.ParentVariableName;
+                compiler->SetVariableBorrowsOwnedElement(namedVar.CallerName, rhsBorrowsElem, container);
             }
             return assignResult;
         }
@@ -13000,6 +13153,27 @@ public:
                 return {};
             }
 
+            // Error: deleting a local bound to a container-owned element (list<unique X*>.get).
+            // The container owns the pointee and its destructor frees it, so this delete is a
+            // guaranteed double-free. Binding the borrow to a named local defeated the direct-call
+            // check; this tag (set at decl-init) catches the laundered form.
+            if (!namedVar.IsOwning
+                && namedVar.BorrowsOwnedElement
+                && namedVar.Storage != nullptr
+                && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
+            {
+                std::string name = namedVar.CallerName.empty()
+                    ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
+                std::string owner = namedVar.OwnedElementContainer.empty()
+                    ? "its container" : "'" + namedVar.OwnedElementContainer + "'";
+                LogErrorContext(ctx, std::format(
+                    "cannot delete '{}' - it borrows an element that {} owns, whose "
+                    "destructor already frees it, so this is a double-free. Remove and free through "
+                    "the owner instead (e.g. the container's removeAt/erase), or do not delete a borrow.",
+                    name, owner));
+                return {};
+            }
+
             // Error: deleting a borrowed (non-move) parameter directly. If the caller owns the
             // pointer, it will be freed again when the caller's scope exits - double-free.
             // Restrict to direct alloca storage (simple variable reference, not field access)
@@ -13316,6 +13490,20 @@ public:
         auto nv = compiler->GetScopedLocalOrArgument(name);
         if (nv.TypeAndValue.Pointer || nv.TypeAndValue.IsMove || nv.IsOwningStruct) return false;
         return compiler->IsDataStructure(nv.TypeAndValue.TypeName);
+    }
+
+    // A 'move' by-value struct parameter whose type owns storage (e.g. `move Holder h` where
+    // Holder holds a unique pointer). Returning such a parameter by a PLAIN `return h` copies
+    // its owning bits without releasing the parameter, so both the returned value and the
+    // expiring parameter free the same storage. 'return move h' is the correct transfer form.
+    bool IsMoveOwningStructParameter(LLVMBackend* compiler, const std::string& name)
+    {
+        if (compiler == nullptr || name.empty()) return false;
+        if (!compiler->IsFunctionParameter(name)) return false;
+        auto nv = compiler->GetScopedLocalOrArgument(name);
+        if (nv.TypeAndValue.Pointer || nv.TypeAndValue.ElemPointer || !nv.TypeAndValue.IsMove)
+            return false;
+        return compiler->IsOwningValueType(nv.TypeAndValue.TypeName);
     }
 
     // The variable an alias-origin description like "h.p" was reached through ("h"); the whole

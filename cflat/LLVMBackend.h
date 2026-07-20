@@ -462,6 +462,12 @@ public:
         // Distinct from IsUnique (the written field/local qualifier), which drives destructor
         // synthesis and must not be set from a substitution.
         bool IsUniqueTypeArg = false;
+        // An `alias` borrow (accessor return such as list's `alias T get`) whose type argument
+        // substituted to a `unique X*` element - i.e. the CONTAINER owns the pointee and its
+        // destructor frees it. Distinct from IsUniqueTypeArg (suppressed on alias borrows): this
+        // records "borrow of an element the owner will free", so a later `delete` of a local bound
+        // to it can be rejected as a double-free. Read ONLY by the delete-of-owned-element check.
+        bool IsBorrowOfUniqueElement = false;
         bool IsBond = false;     // parameter declared with 'bond' - return value borrows from this parameter; return must not outlive it
         bool IsUnique = false;   // struct/interface field declared with 'unique' - the owner owns this raw pointer; the synthesized destructor deletes it. On an interface it is contract: every implementor must agree (VerifyInterfaceFields)
         CallingConv CallConv = CallingConv::Default; // calling convention for extern declarations (Stdcall/Cdecl; Default = compiler-chosen)
@@ -726,6 +732,12 @@ public:
         // TypeAndValue, so this out-of-band flag preserves the field provenance the borrow rules
         // key on (delete/move/store-into-field), keeping `(T*)b.p` a tracked alias.
         bool IsUniqueFieldAlias = false;
+        // compile-time: this local is bound from an accessor return that borrows an element the
+        // owning CONTAINER frees (list's `alias T get` with a `unique X*` element). A `delete` of
+        // this local double-frees. Consulted ONLY by the delete-of-owned-element check; kept off
+        // the general IsBorrowed path so it does not affect store/return/move diagnostics.
+        bool BorrowsOwnedElement = false;
+        std::string OwnedElementContainer; // container variable name, for the delete diagnostic
         llvm::Value* RefCountStorage = nullptr; // lazy i32 alloca at function entry; non-null only when pointer escaped to a field
         std::string CallerName;          // the variable's name at the call site, for move tracking
         std::string OwningStructName;    // when this NamedVariable is a struct-field access, the field's owning struct
@@ -1629,6 +1641,20 @@ private:
                 { it->second.BorrowsOwnedString = value; return; }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
                 { it->second.BorrowsOwnedString = value; return; }
+        }
+    }
+
+    // Refresh the container-owned-element borrow taint after a reassignment: `g = new B()`
+    // over `g = l.get(0)` clears it so a later `delete g` is allowed (see BorrowsOwnedElement).
+    void SetVariableBorrowsOwnedElement(const std::string& name, bool value, const std::string& container)
+    {
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                { it->second.BorrowsOwnedElement = value; it->second.OwnedElementContainer = value ? container : ""; return; }
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                { it->second.BorrowsOwnedElement = value; it->second.OwnedElementContainer = value ? container : ""; return; }
         }
     }
 
@@ -3266,6 +3292,66 @@ private:
         if (!HasUserCopyMethod(typeName))
             return false;
         return GetOrCreateFullDestructor(typeName) != nullptr;
+    }
+
+    // A function whose unannotated by-value struct return always hands back a borrowed
+    // parameter. The 'alias' inference cannot be applied during the forward-ref scan (the
+    // returned struct's fields may not be registered yet), so it is queued here and resolved
+    // once the scan of the translation unit has finished.
+    struct PendingAliasReturn
+    {
+        std::string FunctionName;
+        std::string ReturnTypeName;
+        std::vector<std::string> ParamTypeNames;
+    };
+    std::vector<PendingAliasReturn> pendingAliasReturnInference;
+
+    void QueueAliasReturnInference(const std::string& functionName, const std::string& returnTypeName,
+                                   const std::vector<TypeAndValue>& params)
+    {
+        PendingAliasReturn pending;
+        pending.FunctionName = functionName;
+        pending.ReturnTypeName = returnTypeName;
+        for (const auto& p : params)
+            pending.ParamTypeNames.push_back(p.TypeName + (p.Pointer ? "*" : ""));
+        pendingAliasReturnInference.push_back(std::move(pending));
+    }
+
+    // Apply the queued 'alias' return inference, now that every struct's fields are known.
+    // Only a return type that transitively owns a 'unique' pointer is affected: a copyable
+    // struct return duplicates nothing, so it keeps its plain by-value semantics.
+    void ResolvePendingAliasReturnInference()
+    {
+        if (pendingAliasReturnInference.empty()) return;
+        auto pending = std::move(pendingAliasReturnInference);
+        pendingAliasReturnInference.clear();
+        for (const auto& p : pending)
+        {
+            // The forward-ref scan registers an EMPTY struct shell; fields arrive during the
+            // codegen walk. Until then the ownership gate cannot be evaluated - stay queued.
+            auto structIt = dataStructures.find(p.ReturnTypeName);
+            if (structIt == dataStructures.end() || structIt->second.StructFields.empty())
+            {
+                pendingAliasReturnInference.push_back(p);
+                continue;
+            }
+            if (!TypeOwnsUniquePointer(p.ReturnTypeName)) continue;
+            auto it = functionTable.find(p.FunctionName);
+            if (it == functionTable.end()) continue;
+            for (auto& sym : it->second)
+            {
+                if (sym.ReturnType.TypeName != p.ReturnTypeName) continue;
+                if (sym.ReturnType.Pointer || sym.ReturnType.IsMove) continue;
+                if (sym.Parameters.size() != p.ParamTypeNames.size()) continue;
+                bool same = true;
+                for (size_t i = 0; i < sym.Parameters.size(); ++i)
+                    if (sym.Parameters[i].TypeName + (sym.Parameters[i].Pointer ? "*" : "") != p.ParamTypeNames[i])
+                    { same = false; break; }
+                if (!same) continue;
+                sym.ReturnsAlias = true;
+                sym.ReturnType.IsAlias = true;
+            }
+        }
     }
 
     bool IsOwningValueType(const std::string& typeName)

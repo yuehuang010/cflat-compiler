@@ -861,6 +861,20 @@ extern int main()
             total++; passed += Test("generic borrow-substitution caller frees", g_shapeDtor, 1);
         }
         total++; passed += Test("generic borrow-substitution field frees nothing itself", g_shapeDtor, 1);
+
+        // Item 2 (delete-borrow reassignment): a local that borrows a unique-list element and is
+        // then REASSIGNED to a fresh allocation must be deletable - the borrow tag clears on
+        // reassign. Without the fix this whole file fails to COMPILE (the delete is wrongly rejected).
+        g_shapeDtor = 0;
+        {
+            list<unique PtrLeak*> lu = default;
+            lu.add(new PtrLeak());
+            PtrLeak* g = lu.get(0);         // borrows the list-owned element
+            g = new PtrLeak();              // now owns a fresh alloc; borrow tag cleared
+            delete g;                       // frees the fresh alloc only (allowed)
+            total++; passed += Test("reassigned borrow delete frees fresh once", g_shapeDtor, 1);
+        }                                    // list frees its original element at teardown
+        total++; passed += Test("reassigned borrow list frees original at teardown", g_shapeDtor, 2);
     }
 
     // === Stage 2: reassigning a `unique` field frees the old pointee ===

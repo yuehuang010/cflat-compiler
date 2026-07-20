@@ -864,9 +864,44 @@ alias FactoryHolder* makeManual() { return new FactoryHolder(); }
 // RAII mode: a 'move' pointer return transfers ownership to a `unique` local.
 move FactoryHolder* makeOwning() { return new FactoryHolder(); }
 
+// An unannotated by-value struct return whose every path hands back a borrowed parameter is
+// inferred as an 'alias' (borrow) return, so the caller does not become a second owner.
+struct AliasInferHolder { unique Resource* p = nullptr; };
+AliasInferHolder passthruHolder(AliasInferHolder h) { return h; }
+
+// Gate guard: the uniformity rule fires only for a return type that owns a 'unique' pointer.
+// A COPYABLE struct duplicates no ownership, so MIXED returns stay legal for it.
+struct CopyableHolder { int v = 0; };
+CopyableHolder pickCopyable(CopyableHolder h, int c)
+{
+    if (c != 0)
+        return h;
+    CopyableHolder t = default;
+    t.v = 99;
+    return t;
+}
+
 int testUniqueLocalAndParam()
 {
     int passed = 0;
+
+    // Inferred 'alias' return: 'a' stays the only owner, so the payload is freed exactly once.
+    dtorCount = 0;
+    {
+        AliasInferHolder a = default;
+        a.p = new Resource();
+        AliasInferHolder b = passthruHolder(a);
+        int touch = b.p->id;
+    }
+    passed += Test("inferred_alias_return_freed_once", dtorCount, 1);
+
+    // Copyable gate: mixed borrowed/owned returns remain legal and both branches are correct.
+    {
+        CopyableHolder src = default;
+        src.v = 7;
+        passed += Test("copyable_mixed_return_borrow_branch", pickCopyable(src, 1).v, 7);
+        passed += Test("copyable_mixed_return_owned_branch", pickCopyable(src, 0).v, 99);
+    }
 
     // C escape hatch: bare pointer return, explicit `delete` frees the payload exactly once.
     dtorCount = 0;
@@ -1302,7 +1337,7 @@ extern int main()
     total += 3;
 
     passed += testUniqueLocalAndParam();
-    total += 8;
+    total += 11;
 
     passed += testValueMoveArgDeferred();
     total += 5;

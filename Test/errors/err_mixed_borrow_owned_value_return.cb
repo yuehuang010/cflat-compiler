@@ -1,0 +1,43 @@
+// A by-value struct return that owns a `unique` pointer must give ONE ownership answer.
+// Returning a borrowed parameter on one path and a fresh owned value on another leaves the
+// caller unable to decide whether to free the result, so it is rejected at the definition.
+
+struct Payload
+{
+    int v = 0;
+};
+
+struct Holder
+{
+    unique Payload* p = nullptr;
+};
+
+expect_error("returns borrowed parameter 'h' on one path and an owned value on another") {
+    Holder pick(Holder h, int c)
+    {
+        if (c != 0)
+            return h;
+        Holder t = default;
+        t.p = new Payload();
+        return t;
+    }
+}
+
+// Both sanctioned spellings stay legal: all-borrowed via 'alias', all-owned via 'move'.
+// The all-owned form must transfer with 'return move h' - a plain 'return h' of a 'move'
+// owning-struct parameter double-frees and is rejected (see err_move_param_plain_return.cb).
+alias Holder pickBorrowed(Holder h, int c)
+{
+    return h;
+}
+
+move Holder pickOwned(move Holder h, int c)
+{
+    return move h;
+}
+
+extern int main()
+{
+    printf("PASS\n");
+    return 0;
+}

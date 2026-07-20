@@ -1,0 +1,18 @@
+// A `list<unique B*>` OWNS its elements: the container's destructor frees each one. Binding an
+// element borrow to a named local (`B* g = l.get(0)`) and then deleting it double-frees - the
+// list frees the same pointee again at teardown. The direct-call form (`delete l.get(0)`) was
+// already caught; this pins the named-local (laundered) form. Remedy: removeAt through the owner.
+import "list.cb";
+
+struct B { int v = 0; ~B() { printf("bdtor\n"); } };
+
+expect_error("borrows an element that its container owns") {
+    void leak() {
+        list<unique B*> l;
+        l.add(new B());
+        B* g = l.get(0);
+        delete g;
+    }
+}
+
+extern int main() { return 0; }

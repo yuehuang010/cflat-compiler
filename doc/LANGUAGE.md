@@ -1128,15 +1128,17 @@ move Resource* forwardResource(move Resource* r)
 }
 ```
 
-**Rules at return sites** - the compiler enforces that the returned expression is genuinely owned:
+**Rules at return sites** - the compiler enforces that the returned expression is genuinely owned. The last two rows depend on the *declared return type*, so it is spelled out per row:
 
-| Returned expression | Allowed? |
-|---|---|
-| Result of `new` | Yes |
-| `move` parameter | Yes |
-| Result of another `move T*`-returning call | Yes |
-| Borrowed parameter (`Resource* r`) | **Error** |
-| `nullptr` | Yes (no ownership transferred) |
+| Returned expression | Declared return type | Allowed? |
+|---|---|---|
+| Result of `new` | `move T*` | Yes |
+| `move` parameter | `move T*` | Yes |
+| Result of another `move T*`-returning call | `move T*` | Yes |
+| Borrowed parameter (`Resource* r`) | `move T*` | **Error** - returned expression is not owned |
+| `nullptr` | `move T*` | Yes (no ownership transferred) |
+| `return new T()` | value struct `T` (not `T*`) | **Error** - returning a pointer where a value is declared |
+| `return new T()` | bare pointer `T*` | **Error** - use `move T*` or `alias T*` |
 
 ```c
 move Widget* leak(Widget* w)
@@ -1144,6 +1146,16 @@ move Widget* leak(Widget* w)
     return w;   // compile error: returned expression is not owned
 }
 ```
+
+A **bare pointer return of a fresh allocation** is a deliberate anti-leak error: a bare `T*` return gives the caller no ownership signal, so a forgotten `delete` is a silent leak. The two remedies name themselves in the diagnostic:
+
+```c
+Holder* make() { return new Holder(); }        // error: bare 'Holder*' gives no ownership signal
+move Holder*  makeOwned()  { return new Holder(); }   // OK: caller owns it (adopt with `unique Holder* x = makeOwned();`)
+alias Holder* makeBorrow() { return new Holder(); }   // OK: ownership tracking off; caller frees it by hand
+```
+
+Returning `new T()` where the declared return type is the *value* struct `T` (not `T*`) is rejected for the same family of reasons - that is returning a pointer where a value is declared; declare the return type `T*` (or `move T*`), or dereference to return a copy.
 
 - **Local variable propagation**: assigning the result of a `move T*` call to a local variable transfers ownership - the local is freed at scope exit just like a `new`-allocated pointer.
 - **Forwarding**: a `move T*` function can return a `move` parameter directly; the cleanup that would normally run at scope exit is suppressed so the resource isn't freed prematurely.
@@ -1190,6 +1202,27 @@ void  stash(list<Token> toks, Holder h) { h.tok = toks.get(0); }   // error: sto
 - `alias` is a soft keyword detected by text matching, not an ANTLR token - identifiers named `alias` still work.
 - `alias` applies to **owning struct value types**. `string` (and closures) are excluded: they carry a runtime owned bit that already clears on a borrow return, so `return someList.get(i)` for a `string` is safe without `alias`.
 - The discriminator for choosing `alias`: tag it when the source **still owns** the element after the call (a peek, like `list.get`). If the call **consumes/releases** the element (the source no longer owns it, like `channel.receive`/`pop` whose producer side is `push(move T)`), leave it owning.
+
+**Inference and mixed returns for owning value structs.** When a function returns an owning struct *by value* whose type transitively owns a `unique` pointer, the compiler analyses every return to decide whether the caller frees the result:
+
+- **A uniform borrowed-parameter return infers `alias`.** `Holder passthru(Holder h) { return h; }`, where `Holder` transitively owns a `unique` pointer, needs no annotation - every path returns the borrowed parameter, so the compiler infers an `alias` return and the caller does not free the result. Writing `alias Holder` explicitly is equivalent.
+
+- **Mixed returns are an error.** A function that returns a borrowed parameter on one path and a freshly owned value on another is rejected at its definition, because the caller cannot know whether to free the result. The diagnostic names both remedies: make all returns borrowed (`alias Holder`), or make all returns owned (`move Holder`, taking the argument as a `move Holder h` parameter).
+
+```c
+struct Payload { int v = 0; ~Payload() {} };
+struct Holder  { unique Payload* p = nullptr; };
+
+// error: returns borrowed parameter 'h' on one path and an owned value on another
+Holder pick(Holder h, int c)
+{
+    if (c != 0) return h;              // borrowed
+    Holder t = default; t.p = new Payload();
+    return t;                          // freshly owned
+}
+```
+
+- **The gate is ownership, not copyability.** Both the inference and the mixed-return error apply **only** when the returned struct transitively owns a `unique` pointer. A copyable struct with the identical mixed-return shape is completely fine - returning it by value just copies, and there is no ownership to duplicate. Do not read the mixed-return rule as a general ban on returning different values on different paths.
 
 ### `bond` Lifetime Keyword
 
@@ -1288,7 +1321,6 @@ t._root = nullptr;        // frees it early - the release idiom
 | A struct with a `unique` field has **no memberwise copy** | Copying would hand one pointer to two owners. Like `unique_ptr`, it is move-only: `move` it, or write your own `copy()` that clones the pointee. |
 | A local aliasing a `unique` field cannot be `delete`d or `move`d | The alias does not null the field, so the field's destructor would still free the pointee. Use `move t._root` to move the **field** itself, which nulls it. |
 | **Recursive** ownership is **rejected** | A `unique` field whose pointee type reaches a `unique` field of the same type (a tree or a linked list) would recurse without bound on teardown. There is no good general answer - the recursive teardown overflows on a degenerate shape, and an iterative one needs an allocation during destruction that can itself fail. A recursive data structure knows the shape of its own data, so its author writes the destructor. |
-| **Fixed arrays** (`unique Node* kids[8];`) are **rejected** | The synthesized destructor deletes a single pointer and would leak the rest. |
 
 **Taking ownership back out** of a `unique` field is what `move` is for - it nulls the field, so the destructor skips it:
 
@@ -1296,6 +1328,8 @@ t._root = nullptr;        // frees it early - the release idiom
 Node* n = move t._root;   // t._root is now nullptr; you own n
 delete n;                 // your responsibility
 ```
+
+**The synthesized destructor also covers a `unique` field that is a fixed array, or one made `unique` only through a generic type argument** - not just a directly-written scalar `unique` field. A `unique Node* kids[8];` field frees each live element in turn, and a field whose type becomes owning only via substitution (`Holder<unique C*> h;`, where `struct Holder<T> { T _v; }`) is released the same way. Every such delete is null-checked, so slots left null - or nulled by an earlier `move` - are skipped.
 
 `unique` is a soft keyword (text-matched at parse time), so identifiers named `unique` still work in other contexts.
 
@@ -1424,11 +1458,12 @@ Container access mirrors the local/parameter rules:
 > owning-by-default behavior must add `unique` to the element type
 > (`list<T*>` -> `list<unique T*>`) or it will silently stop freeing its elements.
 >
-> As of this writing `dictionary<K,V>` and `hashset<T>` have **not** been migrated to
-> `is_unique` - their pointer-valued keys/values still key off `is_pointer` and own bare
-> pointer elements exactly as before. Only `list<T>` follows the `unique` rule above;
-> migrating the other containers is planned but not yet done. Check `is_pointer(V)` vs
-> `is_unique(T)` in the container's source if in doubt.
+> All standard containers now follow this rule uniformly. `list`, `array`, `dictionary`,
+> `hashset`, `btree`, `queue`, and `stack` have all been migrated to borrow-by-default: a
+> bare pointer or interface element (or dictionary value) is a borrowed view the container
+> never frees, and you mark the element type `unique` to make the container own it. Keys in
+> keyed containers stay borrowed regardless - a key is read for comparison on every lookup,
+> so it can never be an owning slot.
 
 **Pitfall: feeding a borrowed list from a named owning local leaks.** `list<T>.add`
 takes `move T`, so adding a *named* pointer local always nulls the source - even when

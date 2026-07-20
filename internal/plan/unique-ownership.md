@@ -387,32 +387,73 @@ count does not need doubling.
   `list<T*>`). On a parameter or return it is load-bearing and unchanged: `list.get()`,
   `queue.peek()`, `hashset.add(alias T)` and the borrowed arm of `dequeue()`/`pop()` all use it.
 
+### Ownership at function boundaries (SETTLED 2026-07-20)
+
+Harvested from `internal/issue/borrowed-struct-unique-field-stored-into-owning-slot.md`, deleted
+on closure. Repros survive as `scratch/moveborrow/*.cb` and `scratch/borrowstore/repro.cb`.
+Shipped over commits `7548c7f`, `fa2e5b3` and the follow-on batch.
+
+**The settled rules.** All are gated on the returned/stored struct transitively owning a `unique`
+pointer (`TypeOwnsUniquePointer`, `LLVMBackend.h:3286`) - see the GATE note below.
+
+| Situation | Behaviour |
+|---|---|
+| `move` of a borrowed POINTER param into a `unique` field | ERROR (a store into a `unique` field is a deferred `delete`) |
+| `move` of a field out of a BORROWED struct param | ERROR |
+| assignment from a `move` PARAM into an owning slot | transfers, matching the owned-local path |
+| `return new T()` where the return type is the VALUE struct `T` | ERROR (was invalid IR) |
+| `move T` value return of a borrowed struct param | ERROR (reuses the pointer form's message) |
+| `return new T()` where the return type is a BARE `T*` | ERROR - use `move T*` or `alias T*` |
+| value return, ALL returns yield a borrowed param | `alias` INFERRED; caller does not delete |
+| value return, returns DISAGREE (borrowed on one path, owned on another) | ERROR |
+
+**THE GATE: ownership, not copyability.** Measured (`scratch/moveborrow/p1.cb`): the identical
+mixed-return function with a COPYABLE struct is completely correct, because returning by value
+copies and there is no ownership to duplicate. Mixed returns stay legal for every other type.
+Consequently these diagnostics must never be phrased as copyability complaints - copyability is
+the gate, not the problem. Name the conflicting returns and both remedies.
+
+**MEASURED DEAD ENDS - do not retry these.**
+
+- **Do NOT check at the call/parameter boundary.** Rejecting a `unique`-owning struct passed by
+  value cost 13 suite failures: a genuine false positive on `bool operator==(LeakHolder a,
+  LeakHolder b)` (by-value passing is a SAFE read - measured `dtor=1`, not 2), plus 12
+  preemptions of the six `err_*_noncopyable_*` container poisons, which are better targeted. The
+  check belongs at the STORE, which is where it now lives.
+- **Do NOT widen `ComputeReturnsOwned`** (`MainListener.h:684`). A previous widening caused a
+  SIGABRT in `move list<T> copy()`, and carrying `CallerName` caused a false "use of moved
+  variable". A `move S` VALUE return is deliberately NOT `currentFunctionReturnsOwned`; key off
+  the DECLARED return type instead (`currentFunctionReturnTV.IsMove && !Pointer`). This trap
+  derailed two separate attempts.
+- **`alias` is VIRAL through locals.** A local bound from an `alias` return cannot be returned
+  from a non-`alias` function. Migrating `json.cb`/`xml.cb` `_allocNode()` cascaded to every
+  node-returning parser helper and the public `JsonParser::parse`. Semantically right, but budget
+  for propagation, not a one-line edit.
+
+**KNOWN REMAINING GAP: the indirect fresh-allocation forms still leak silently.**
+`T* h = new T(); return h;` and the `unique`-local form are NOT caught; only the direct
+`return new T()` is. Provenance IS reachable at the return, but widening the gate produced
+**250 of 460 tests failing**, because it rejects `cflat/core/function.cb:9`
+(`i8* __closure_env_alloc(i64 n) { i8* base = new i8[n]; return base; }`) and siblings that every
+program imports. Closing it requires migrating core's raw-memory plumbing FIRST - `function.cb`
+and `arena.cb` are the only two allocator-ish core files using the two-step form. Open design
+question before anyone attempts it: if every raw-memory primitive becomes `alias`, the marker
+stops signalling "I know what I am doing" at exactly the layer where ownership mistakes cost
+most. Decide `move` vs `alias` per primitive rather than blanket-`alias`ing to clear the failures.
+
 ### Deferred by maintainer ruling - do not action as part of the above
 
 - **Lifetime / dangling for borrowed containers: ignored, none planned.** A `list<T*>` outliving
   its owner is undetectable. The hazard pre-existed unnamed; borrow-by-default makes it the
   blessed pattern, which raises the stakes but does not change the risk.
-- **Blocker 1 is NO LONGER DORMANT - it is a reachable double free.** A plain by-value param
-  BORROWS an owning value while local init MOVES it. Storing that borrowed struct into an owning
-  slot duplicates a `unique` pointer into two owners and aborts at teardown, with no diagnostic.
-  NOT a lifetime bug: it reproduces with both values in the same scope, so the
-  "lifetime/dangling is ignored" ruling below does not cover it.
-  **RULED 2026-07-20: this is NOT a language-design issue and needs no borrow/move redesign.**
-  A six-leg measured matrix (`internal/issue/borrowed-struct-unique-field-stored-into-owning-slot.md`,
-  repros in `scratch/moveborrow/`) shows assignment into a `unique` slot already transfers
-  correctly from an owned local and from a new'd local pointer. What is missing is diagnostics on
-  stores that CANNOT transfer, plus one unrecognised owner. All four items below are DONE
-  (2026-07-20); the remaining gap is the by-value RETURN escape, see the issue file. Items:
-  1. `move` of a borrowed POINTER param into a unique field must error - route through the
-     existing borrowed-param check at `MainListener.h:12955` (`delete` of one is already blocked;
-     a store into a unique field is a deferred delete). Not covered by any call-boundary rule,
-     since a bare `T*` param is copyable and stays so.
-  2. `move` of a field out of a BORROWED struct param must error. The compiler currently routes
-     users INTO this: the existing (correct) alias diagnostic recommends `move h.p`, which is
-     safe when `h` is owned and a double free when `h` is borrowed.
-  3. Assignment from a `move` PARAM into an owning slot must transfer, matching the owned-local
-     path that already works.
-  4. After (2), split the alias diagnostic's wording on borrowed vs owned source.
+- **Blocker 1 is RESOLVED 2026-07-20.** It was a reachable double free: a plain by-value param
+  BORROWS an owning value while local init MOVES it, so storing that borrowed struct into an
+  owning slot duplicated a `unique` pointer into two owners and aborted at teardown, with no
+  diagnostic. NOT a lifetime bug - it reproduced with both values in the same scope. RULED and
+  fixed as a set of missing DIAGNOSTICS plus one unrecognised owner; no borrow/move redesign was
+  needed. Its issue file was deleted on closure; the durable findings are in
+  "Ownership at function boundaries" below. Repros survive in `scratch/moveborrow/` and
+  `scratch/borrowstore/`.
 - **Standing question (positional asymmetry):** bare `Circle* c = new Circle();` is owning while
   bare `list<Circle*>` is borrowed - same spelling, opposite defaults by position. Endpoint (a),
   containers erase provenance so they force you to say it, is where the design landed. Endpoint
