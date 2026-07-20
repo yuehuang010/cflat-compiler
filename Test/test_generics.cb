@@ -709,8 +709,8 @@ bool testListPointerClear()
     return result;
 }
 
-// `alias` in generic type-argument position: list<unique Employee*> OWNS its elements (frees
-// them), while list<alias Employee*> is a DISTINCT instantiation that BORROWS (never frees).
+// list<unique Employee*> OWNS its elements (frees them), while bare list<Employee*> is a
+// DISTINCT instantiation that BORROWS (never frees).
 struct UniqueChecker<T>
 {
     int check()
@@ -728,8 +728,8 @@ bool testListUniquePointer()
 
     empDtorCount = 0;
     {
-        // Owning list frees its elements; an `alias` list (distinct instantiation) coexists and
-        // only BORROWS - it holds an aliased element and frees nothing.
+        // Owning list frees its elements; a borrowing list (distinct instantiation) coexists
+        // and only BORROWS - it holds an aliased element and frees nothing.
         list<unique Employee*> owning;
 
         Employee* e1 = new Employee; e1->id = 1;
@@ -737,7 +737,7 @@ bool testListUniquePointer()
         owning.add(e1);
         owning.add(e2);
 
-        list<alias Employee*> borrowed;
+        list<Employee*> borrowed;
         borrowed.add(owning.get(0));
 
         result &= Test("list<unique ptr> count",     owning.count(),      2);
@@ -745,7 +745,7 @@ bool testListUniquePointer()
         result &= Test("list<ptr> borrow count",     borrowed.count(),    1);
         result &= Test("list<ptr> borrow same elem", borrowed.get(0)->id, 1);
 
-        // removeAt on the unique list frees the element; the alias list's dtor frees nothing.
+        // removeAt on the unique list frees the element; the borrowing list's dtor frees nothing.
         owning.removeAt(0);
         result &= Test("list<unique ptr> removeAt dtor", empDtorCount, 1);
         result &= Test("list<unique ptr> count after remove", owning.count(), 1);
@@ -770,48 +770,16 @@ bool testIsUniqueIntrinsic()
     return result;
 }
 
-// `alias` in generic type-argument position: list<alias Employee*> is a distinct, BORROWING
-// instantiation. Its `add(move T)` is NOT an ownership sink - the caller keeps the pointer and
-// frees it exactly once. `move` on an alias-typed value is a silent no-op (like `move int`).
-struct AliasChecker<T>
-{
-    int isAlias()  { if const (is_alias(T))   return 1; else return 0; }
-    int isUnique() { if const (is_unique(T))  return 1; else return 0; }
-    int isPtr()    { if const (is_pointer(T)) return 1; else return 0; }
-};
-
-// Separate template (pointer instantiations only): T is alias-qualified here, so `move v`
-// must be a no-op that leaves the source readable.
-struct AliasMover<T>
-{
-    int moveRoundtrip(T v) { T w = move v; return v.id + w.id; }
-};
-
-bool testIsAliasIntrinsic()
-{
-    bool result = true;
-    AliasChecker<alias Employee*>  ca = default;
-    AliasChecker<unique Employee*> cu = default;
-    AliasChecker<Employee*>        cp = default;
-    AliasChecker<int>              ci = default;
-    // is_alias is orthogonal to is_unique and is_pointer.
-    result &= Test("is_alias alias Employee*",   ca.isAlias(),  1);
-    result &= Test("is_alias unique Employee*",  cu.isAlias(),  0);
-    result &= Test("is_alias Employee*",         cp.isAlias(),  0);
-    result &= Test("is_alias int",               ci.isAlias(),  0);
-    result &= Test("is_unique alias Employee*",  ca.isUnique(), 0);
-    result &= Test("is_pointer alias Employee*", ca.isPtr(),    1);
-    return result;
-}
-
-bool testListAliasPointer()
+// A bare pointer element BORROWS: `add()` is NOT an ownership sink - the caller keeps the
+// pointer and frees it exactly once. (Formerly spelled list<alias Employee*>.)
+bool testListBorrowedPointer()
 {
     bool result = true;
 
     empDtorCount = 0;
     {
-        // The alias list borrows: add() does not consume, and the list frees nothing.
-        list<alias Employee*> borrowing;
+        // The borrowing list: add() does not consume, and the list frees nothing.
+        list<Employee*> borrowing;
 
         Employee* e1 = new Employee; e1->id = 1;
         Employee* e2 = new Employee; e2->id = 2;
@@ -819,26 +787,21 @@ bool testListAliasPointer()
         borrowing.add(e2);
 
         // e1/e2 are still usable after add() - no use-after-move.
-        result &= Test("list<alias ptr> count",        borrowing.count(),      2);
-        result &= Test("list<alias ptr> src usable",   e1->id,                 1);
-        result &= Test("list<alias ptr> get id",       borrowing.get(0)->id,   1);
-        result &= Test("list<alias ptr> no dtor yet",  empDtorCount,           0);
+        result &= Test("borrowed list<ptr> count",        borrowing.count(),      2);
+        result &= Test("borrowed list<ptr> src usable",   e1->id,                 1);
+        result &= Test("borrowed list<ptr> get id",       borrowing.get(0)->id,   1);
+        result &= Test("borrowed list<ptr> no dtor yet",  empDtorCount,           0);
 
         // removeAt on a borrowing list must NOT free the element.
         borrowing.removeAt(0);
-        result &= Test("list<alias ptr> removeAt no dtor", empDtorCount, 0);
-
-        // Explicit move of an alias-typed value is a no-op; the caller still frees exactly once.
-        AliasMover<alias Employee*> ac = default;
-        result &= Test("alias move roundtrip", ac.moveRoundtrip(e2), 4);
-        result &= Test("alias move src intact", e2->id, 2);
+        result &= Test("borrowed list<ptr> removeAt no dtor", empDtorCount, 0);
 
         delete e1;
         delete e2;
-        result &= Test("list<alias ptr> caller frees", empDtorCount, 2);
+        result &= Test("borrowed list<ptr> caller frees", empDtorCount, 2);
     }
     // The borrowing list's destructor freed nothing extra.
-    result &= Test("list<alias ptr> dtor frees nothing", empDtorCount, 2);
+    result &= Test("borrowed list<ptr> dtor frees nothing", empDtorCount, 2);
 
     return result;
 }
@@ -2820,8 +2783,7 @@ extern int main()
     total++; passed += testListPointerClear()            ? 1 : 0;
     total++; passed += testListUniquePointer()           ? 1 : 0;
     total++; passed += testIsUniqueIntrinsic()           ? 1 : 0;
-    total++; passed += testListAliasPointer()            ? 1 : 0;
-    total++; passed += testIsAliasIntrinsic()            ? 1 : 0;
+    total++; passed += testListBorrowedPointer()         ? 1 : 0;
     total++; passed += testHashsetPointer()              ? 1 : 0;
     total++; passed += testDictionaryPointer()           ? 1 : 0;
     total++; passed += testDoubleNestedGeneric()         ? 1 : 0;

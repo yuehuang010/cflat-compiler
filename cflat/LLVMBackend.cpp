@@ -3811,7 +3811,6 @@ static llvm::json::Object SerializeTav(const TAV& t)
     // dropped on a warm cache, an interface's `alias` return would silently stop matching its
     // implementor's and the contract check would misfire.
     if (t.IsAlias)                o["al"]  = true;
-    if (t.IsAliasTypeArg)         o["alt"] = true;
     if (t.IsUniqueTypeArg)        o["unt"] = true;
     if (t.IsBond)                 o["bd"]  = true;
     if (t.IsUnique)               o["uq"]  = true;
@@ -3867,7 +3866,6 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("nl")) t.IsNullable = *v;
     if (auto v = o.getBoolean("mv")) t.IsMove = *v;
     if (auto v = o.getBoolean("al")) t.IsAlias = *v;
-    if (auto v = o.getBoolean("alt")) t.IsAliasTypeArg = *v;
     if (auto v = o.getBoolean("unt")) t.IsUniqueTypeArg = *v;
     if (auto v = o.getBoolean("bd")) t.IsBond = *v;
     if (auto v = o.getBoolean("uq")) t.IsUnique = *v;

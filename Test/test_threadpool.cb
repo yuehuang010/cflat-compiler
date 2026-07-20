@@ -713,6 +713,79 @@ bool testPriorityOrdering() {
     return result;
 }
 
+// --- Continuation dropped on queue saturation -------------------------------
+//
+// When a continuation cannot be enqueued because its priority queue is full, it
+// is dropped. Two things must still happen: its ctx must be released through the
+// caller's ctxDtor (not leaked, and not assumed to be `delete`), and its handle
+// must be published done, or the caller's ~TaskHandle spins on done forever.
+
+struct DropPayload { int v = 0; };
+
+atomic_counter g_contDropDtor = default;   // fires only for the dropped continuation
+
+void __dropContDtor(move void* p) {
+    g_contDropDtor.increment();
+    DropPayload* d = (DropPayload*)p;
+    delete d;
+}
+
+void __dropPlainDtor(move void* p) {
+    DropPayload* d = (DropPayload*)p;
+    delete d;
+}
+
+// Occupies the single worker long enough for the LOW queue to fill.
+int __dropBlocker(move void* ctx, stop_token tok) {
+    DropPayload* d = (DropPayload*)ctx;
+    delete d;
+    for (i64 i = 0; i < 20000000; i++) { }
+    return 0;
+}
+
+int __dropBody(move void* ctx, stop_token tok) {
+    DropPayload* d = (DropPayload*)ctx;
+    delete d;
+    return 0;
+}
+
+bool testContinuationDroppedOnSaturation() {
+    bool result = true;
+
+    // Shrink the queues so saturation is reachable; capacity is read at init().
+    int savedCap = THREADPOOL_QUEUE_CAPACITY;
+    THREADPOOL_QUEUE_CAPACITY = 2;
+
+    {
+        ThreadPool pool;
+        pool.init(1);
+
+        TaskHandle* dep = pool.submit(__dropBlocker, new DropPayload(),
+                                      THREADPOOL_PRIORITY_NORMAL, __dropPlainDtor);
+        // Registered on the still-running dep, so it parks in dep->_contCtx.
+        TaskHandle* cont = pool.then(dep, __dropBody, new DropPayload(),
+                                     THREADPOOL_PRIORITY_LOW, __dropContDtor);
+        // Fill the LOW queue; the only worker is busy on dep so nothing drains it.
+        for (int i = 0; i < 2; i++) {
+            pool.submitDetached(__dropBody, new DropPayload(),
+                                THREADPOOL_PRIORITY_LOW, __dropPlainDtor);
+        }
+
+        pool.drain();
+        pool.shutdown();
+
+        // Released exactly once, through the caller's own dtor.
+        result &= Test("dropped continuation frees ctx via ctxDtor",
+                       (int)g_contDropDtor.read(), 1);
+        // If done were never published this scope exit would hang in ~TaskHandle.
+        result &= Test("dropped continuation handle is published done",
+                       cont->done.load() != 0, true);
+    }
+
+    THREADPOOL_QUEUE_CAPACITY = savedCap;
+    return result;
+}
+
 // --- Program-hosted ThreadPool test ---
 
 program ThreadPoolProgram {
@@ -1200,6 +1273,7 @@ extern int main() {
     total++; passed += testThenChain()                   ? 1 : 0;
     total++; passed += testThenDuplicateRegistration()   ? 1 : 0;
     total++; passed += testThenAfterDepCompleted()       ? 1 : 0;
+    total++; passed += testContinuationDroppedOnSaturation() ? 1 : 0;
     total++; passed += testDrainFromWithinTask()         ? 1 : 0;
     total++; passed += testResizeGrowShrinkGrow()        ? 1 : 0;
     total++; passed += testSubmitAfterShutdown()         ? 1 : 0;

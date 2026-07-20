@@ -1,0 +1,7 @@
+// `alias` as a generic type ARGUMENT was removed: bare means BORROW, so `list<alias T*>` and
+// `list<T*>` meant the same thing. `alias` on parameters and returns is unaffected.
+import "list.cb";
+
+expect_error("'alias' is not allowed in a generic argument") {
+    list<alias int*> bad = default;
+}

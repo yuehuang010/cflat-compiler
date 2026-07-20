@@ -181,6 +181,12 @@ move IShapeLeak pickShape(move IShapeLeak a, move IShapeLeak b, int sel)
 
 // Pointer flavor of the same exclusive-return pattern: must compile and free each object once.
 struct PtrLeak { int v = 0; ~PtrLeak() { g_shapeDtor = g_shapeDtor + 1; } };
+
+// `unique T* f[N]` as a struct FIELD: the synthesized destructor walks the array and releases
+// every slot. UniqSlotBag is the hand-written spelling; UniqSlotBox<V> is the same shape reached
+// through generic substitution (btree_node's), which used to be accepted and silently leak.
+struct UniqSlotBag { unique PtrLeak* slots[4] = default; };
+struct UniqSlotBox<V> { V slots[4] = default; };
 // Non-copyable value element: owns a `unique` pointer and has no copy(), so the COPYING
 // dictionary/hashset insert is poisoned and only the `move` transfer overload is usable.
 struct LeakHolder { unique PtrLeak* slot = nullptr; int k = 0; int hash() { return k; } };
@@ -909,19 +915,19 @@ extern int main()
         total++; passed += Test("list<struct> copy source intact", ls.get(0).name, "aabb");
         total++; passed += Test("list<struct> copy independent",   lsCopy.get(0).name, "aabb");
 
-        // list<alias int*> is the BORROWED view: copy() shallow-copies the pointers (no move, no
+        // list<int*> is the BORROWED view: copy() shallow-copies the pointers (no move, no
         // ownership transfer) - the source keeps its slot and both lists alias the same pointee,
-        // which the caller owns and frees once. (Owning lists - bare list<int*> or
-        // list<unique int*> - have a copy() that is a compile error - see err_unique_list_copy.cb.)
-        list<alias int*> lp = default;
+        // which the caller owns and frees once. (An OWNING list<unique int*> has a copy() that is
+        // a compile error - see err_unique_list_copy.cb.)
+        list<int*> lp = default;
         int* p0 = new int; *p0 = 7; lp.add(p0);
-        list<alias int*> lpCopy = lp.copy();
+        list<int*> lpCopy = lp.copy();
         int* lpElem = lpCopy.get(0);
         total++; passed += Test("list<ptr> borrow copy keeps source", lp.get(0) != nullptr, true);
         total++; passed += Test("list<ptr> borrow copy aliases same", lp.get(0) == lpElem, true);
         total++; passed += Test("list<ptr> borrow copy sees pointee", *lpElem, 7);
-        // `alias` add() borrows, so p0 stays usable and frees the shared int exactly once.
-        // (Not via lpCopy.take(0): see internal/issue/alias-list-take-double-free.md.)
+        // A bare pointer element borrows, so p0 stays usable and frees the shared int once.
+        // (Not via lpCopy.take(0): see internal/issue/delete-borrow-via-named-local.md.)
         delete p0;
 
         // list<enum>: element copy is bitwise; source and copy both hold the value (was: build failed).
@@ -1711,6 +1717,27 @@ extern int main()
             total++; passed += Test("btree<unique iface> count after removes", (i64)t.count(), (i64)250);
         }
         total++; passed += Test("btree<unique iface> dtor frees remaining", g_shapeDtor, 405);
+
+        // A `unique` fixed-array FIELD is released slot by slot by the synthesized destructor -
+        // written by hand, and reached through generic substitution. A null slot is skipped, so
+        // moving one element out leaves exactly N-1 for teardown.
+        {
+            g_shapeDtor = 0;
+            { UniqSlotBag b = default; int i = 0; while (i < 4) { b.slots[i] = new PtrLeak(); i = i + 1; } }
+            total++; passed += Test("unique ptr array field frees all N", g_shapeDtor, 4);
+
+            g_shapeDtor = 0;
+            { UniqSlotBox<unique IShapeLeak> b = default; int i = 0; while (i < 4) { b.slots[i] = new CircleLeak(); i = i + 1; } }
+            total++; passed += Test("substituted unique iface array field frees all N", g_shapeDtor, 4);
+
+            g_shapeDtor = 0;
+            {
+                UniqSlotBag b = default; int i = 0; while (i < 4) { b.slots[i] = new PtrLeak(); i = i + 1; }
+                { unique PtrLeak* taken = move b.slots[2]; }
+                total++; passed += Test("moved-out element freed by its local", g_shapeDtor, 1);
+            }
+            total++; passed += Test("unique ptr array field frees N-1 after move-out", g_shapeDtor, 4);
+        }
 
         // Value elements are COPIED; the caller's source stays intact and independently mutable.
         {

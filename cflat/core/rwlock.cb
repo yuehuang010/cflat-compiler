@@ -58,8 +58,15 @@ struct rwlock {
         os.rwlock_write_unlock(&_lock);
     }
 
-    // Release any underlying OS lock state.
+    // Release any underlying OS lock state. Idempotent: os.rwlock_destroy nulls
+    // the slot, so a later destructor call is a no-op.
     void destroy() {
+        os.rwlock_destroy(&_lock);
+    }
+
+    // RAII teardown. MUST NOT BE COPIED - there is no copy suppression for a
+    // void* slot, so a copy would double-destroy one OS lock.
+    ~rwlock() {
         os.rwlock_destroy(&_lock);
     }
 };

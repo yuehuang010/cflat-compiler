@@ -35,7 +35,7 @@ struct dictionary<K, V>
         // instantiation is a compile error (deferred: fires only if _slot is actually called).
         if const (is_unique(K))
         {
-            compile_error("dictionary keys cannot be 'unique'; a lookup reads the key for hashing/equality and would move it out. Use 'dictionary<alias K*, V>' for a borrowed key, or a primitive/owning-value key, and manage the key lifetime separately.");
+            compile_error("dictionary keys cannot be 'unique'; a lookup reads the key for hashing/equality and would move it out. Use 'dictionary<K*, V>' for a borrowed key, or a primitive/owning-value key, and manage the key lifetime separately.");
         }
         int h = 0;
         if const (is_primitive(K))
@@ -129,7 +129,7 @@ struct dictionary<K, V>
     // unique-substituted parameter is a synthesized move sink); a bare pointer or interface
     // value is aliased (BORROWED); a value type is deep-copied so the caller's original stays
     // independent. `is_pointer(V)` is true for a bare, `unique` or `alias` pointer AND for an
-    // interface value, so it subsumes the alias case - do not add an is_alias arm.
+    // interface value, so it covers every borrowed spelling.
     void _placeValueAt(int index, V value)
     {
         if const (is_unique(V))         _values[index] = move value;

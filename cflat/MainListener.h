@@ -247,28 +247,13 @@ static bool StripUniqueQualifier(std::string& name)
 }
 
 // The `alias` borrow qualifier on a generic type argument is carried the same way as `unique`:
-// a leading "alias " prefix on the resolved type-argument string (e.g. "alias Res*").
-static const char kAliasQualifierPrefix[] = "alias ";
-static const size_t kAliasQualifierPrefixLen = sizeof(kAliasQualifierPrefix) - 1;
-
-// True if a type-parameter entry carries the `alias` qualifier: a leading Identifier
-// (grammar: `Identifier? typeSpecifier ...`) whose text is exactly "alias".
+// True if a type-parameter entry carries the removed `alias` qualifier: a leading Identifier
+// (grammar: `Identifier? typeSpecifier ...`) whose text is exactly "alias". Detection only -
+// `alias` in a generic argument is rejected (a bare pointer element already borrows).
 static bool TypeArgHasAlias(CFlatParser::TypeParameterEntryContext* entry)
 {
     return entry != nullptr && entry->Identifier() != nullptr
         && entry->Identifier()->getText() == "alias";
-}
-
-// Strip a leading "alias " qualifier off a resolved type-arg string, returning whether it was
-// present. The bare base remains so it resolves to the same LLVM type as the unqualified spelling.
-static bool StripAliasQualifier(std::string& name)
-{
-    if (name.compare(0, kAliasQualifierPrefixLen, kAliasQualifierPrefix) == 0)
-    {
-        name.erase(0, kAliasQualifierPrefixLen);
-        return true;
-    }
-    return false;
 }
 
 static std::string MangleTypeArg(const std::string& typeName)
@@ -281,13 +266,6 @@ static std::string MangleTypeArg(const std::string& typeName)
     {
         result += "unique_";
         start = kUniqueQualifierPrefixLen;
-    }
-    // The `alias` qualifier likewise mangles to an "alias_" token so list<alias Res*>
-    // monomorphizes distinctly from list<Res*>.
-    else if (typeName.compare(0, kAliasQualifierPrefixLen, kAliasQualifierPrefix) == 0)
-    {
-        result += "alias_";
-        start = kAliasQualifierPrefixLen;
     }
     for (size_t i = start; i < typeName.size(); i++)
     {
@@ -356,12 +334,8 @@ static std::string BuildEncodedClosureName(bool isThin, const std::string& ret, 
 // is a plain pointer. They never combine ("T[]*" is rejected at the grammar/listener). Suffixes
 // were appended in source order, so peel from the right until none remain. Returns the bare base
 // type name in `name`.
-static void PeelTypeArgSuffix(std::string& name, bool& pointer, bool& arrayView, bool* unique = nullptr,
-    bool* aliasQual = nullptr)
+static void PeelTypeArgSuffix(std::string& name, bool& pointer, bool& arrayView, bool* unique = nullptr)
 {
-    // `alias` is a leading prefix like `unique`; peel it first for the same reasons.
-    bool hadAlias = StripAliasQualifier(name);
-    if (aliasQual != nullptr) *aliasQual = hadAlias;
     // A `unique` qualifier is a leading prefix (D10); peel it first so the suffix loop and any
     // re-mangling see the bare type. Callers resolving to an LLVM type discard it; callers that
     // re-mangle a nested arg re-prepend it from *unique.
@@ -943,7 +917,7 @@ private:
                         // arg routes through ResolveForwardTypeArg so its canonical "unique T*" text
                         // (D10) matches the queueing path; others keep the raw getText() spelling.
                         if ((entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
-                            || TypeArgHasUnique(entry) || TypeArgHasAlias(entry))
+                            || TypeArgHasUnique(entry))
                             typeArgs.push_back(ResolveForwardTypeArg(entry));
                         else
                             typeArgs.push_back(entry->getText());
@@ -1094,7 +1068,7 @@ private:
                     paramType.VariableName = getDirectDeclName(directDeclarer);
             // D4: a `unique` parameter is a synthesized move parameter (mirrors the codegen copy),
             // so the forward-declared signature agrees on the move flag.
-            if (paramType.IsUnique && !paramType.IsAliasTypeArg
+            if (paramType.IsUnique
                 && ((paramType.Pointer && !paramType.ElemPointer
                 && !paramType.IsArrayView) || paramType.IsInterface))
                 paramType.IsMove = true;
@@ -1543,7 +1517,6 @@ public:
     std::string ResolveForwardTypeArg(CFlatParser::TypeParameterEntryContext* entry)
     {
         bool isUnique = TypeArgHasUnique(entry);
-        bool isAliasArg = TypeArgHasAlias(entry);
         auto* typeSpec = entry->typeSpecifier();
         std::string resolved;
         std::string innerBase;
@@ -1573,9 +1546,6 @@ public:
         // pass validates position/type and emits diagnostics.
         if (isUnique)
             resolved = std::string(kUniqueQualifierPrefix) + resolved;
-        // Same for `alias` so the shell name matches the codegen mangled name exactly.
-        if (isAliasArg)
-            resolved = std::string(kAliasQualifierPrefix) + resolved;
         return resolved;
     }
 
@@ -1768,7 +1738,7 @@ public:
                 // Closure and `unique`-qualified args encode via ResolveForwardTypeArg so the shell
                 // name matches the authoritative ParseUsingDeclaration; others keep raw getText().
                 if ((entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
-                    || TypeArgHasUnique(entry) || TypeArgHasAlias(entry))
+                    || TypeArgHasUnique(entry))
                     mangledName += "__" + MangleTypeArg(ResolveForwardTypeArg(entry));
                 else
                     mangledName += "__" + MangleTypeArg(entry->getText());
@@ -2352,10 +2322,14 @@ private:
         // `unique` ownership qualifier (D10): a leading Identifier == "unique". Any other leading
         // Identifier is an unknown qualifier.
         bool isUnique = TypeArgHasUnique(entry);
-        bool isAliasArg = TypeArgHasAlias(entry);
-        if (entry->Identifier() != nullptr && !isUnique && !isAliasArg)
-            LogErrorContext(entry, std::format("unknown type qualifier '{}'; only 'unique' and 'alias' "
-                "are allowed on a generic type argument", entry->Identifier()->getText()));
+        // `alias` as a generic type ARGUMENT was removed: bare means borrow, so `list<alias T*>`
+        // and `list<T*>` meant the same thing. `alias` on parameters/returns is unaffected.
+        if (TypeArgHasAlias(entry))
+            LogErrorContext(entry, "'alias' is not allowed in a generic argument; write 'list<T*>' - "
+                "a bare pointer element is already borrowed");
+        else if (entry->Identifier() != nullptr && !isUnique)
+            LogErrorContext(entry, std::format("unknown type qualifier '{}'; only 'unique' "
+                "is allowed on a generic type argument", entry->Identifier()->getText()));
         bool hasPointer = entry->pointer() != nullptr;
         // `T[]` as a generic/tuple type arg is a noalias array-view member; `[N]` and `[]*`
         // are not valid in a type-argument position (reject with one clear message).
@@ -2391,8 +2365,6 @@ private:
             // array-view suffix (a closure arg is a value), so return it directly.
             if (isUnique)
                 LogErrorContext(entry, "unique requires a pointer or interface type");
-            if (isAliasArg)
-                LogErrorContext(entry, "alias requires a pointer or interface type");
             return EncodeClosureCodegen(typeSpec->functionPointerSpecifier());
         }
         else
@@ -2406,11 +2378,9 @@ private:
                 // or a "unique " prefix (T bound to "unique Circle*"); peel those onto flags so
                 // they re-encode once below.
                 bool substUnique = false;
-                bool substAlias = false;
                 resolved = substIt->second;
-                PeelTypeArgSuffix(resolved, hasPointer, hasArrayView, &substUnique, &substAlias);
+                PeelTypeArgSuffix(resolved, hasPointer, hasArrayView, &substUnique);
                 isUnique = isUnique || substUnique;
-                isAliasArg = isAliasArg || substAlias;
             }
             // A function-type alias (using IntFn = Lambda<int(int)>) used as a generic arg resolves
             // to the SAME encoded closure type as the direct spelling (canonicalization / gap a).
@@ -2420,8 +2390,6 @@ private:
                 {
                     if (isUnique)
                         LogErrorContext(entry, "unique requires a pointer or interface type");
-                    if (isAliasArg)
-                        LogErrorContext(entry, "alias requires a pointer or interface type");
                     return EncodeClosureFromSig(Compiler(entry), fit->second);
                 }
         }
@@ -2445,17 +2413,6 @@ private:
                 LogErrorContext(entry, std::format("unique requires a pointer or interface type; "
                     "'{}' is neither", uniqueBase));
             resolved = std::string(kUniqueQualifierPrefix) + resolved;
-        }
-        // `alias` is the non-owning twin of `unique`: same D1 shape requirement, carried as a
-        // leading prefix so the instantiation mangles distinctly and is_alias(T) can see it.
-        if (isAliasArg)
-        {
-            if (isUnique)
-                LogErrorContext(entry, "'unique' and 'alias' are mutually exclusive on a generic type argument");
-            if (!hasPointer && !Compiler(entry)->IsInterfaceType(uniqueBase))
-                LogErrorContext(entry, std::format("alias requires a pointer or interface type; "
-                    "'{}' is neither", uniqueBase));
-            resolved = std::string(kAliasQualifierPrefix) + resolved;
         }
         return resolved;
     }
@@ -2515,7 +2472,6 @@ private:
         {
             name = substIt->second;
             StripUniqueQualifier(name);  // resolve to the underlying type; unique is not a signature type
-            StripAliasQualifier(name);
             while (!name.empty() && name.back() == '*') { name.pop_back(); outPointer = true; }
         }
         return name;
@@ -2797,23 +2753,12 @@ private:
                         // the direct `unique` spelling only (post-substitution container ownership is a
                         // later stage), so the resolved type is the bare pointee.
                         typeName = substIt->second;
-                        bool substAliasArg = false;
                         bool substUniqueArg = false;
-                        PeelTypeArgSuffix(typeName, substPointer, substArrayView, &substUniqueArg, &substAliasArg);
+                        PeelTypeArgSuffix(typeName, substPointer, substArrayView, &substUniqueArg);
                         // A `unique` type argument is an OWNING location: a plain by-value parameter
                         // of that type is a move sink, so the caller's source must be nulled.
                         // An `alias`-declared parameter is an explicit borrow and stays one.
                         if (substUniqueArg && !declType.IsAlias) declType.IsUniqueTypeArg = true;
-                        // An `alias`-qualified type argument is a non-owning machine word: a `move`
-                        // parameter of that type is not a sink, exactly like `move int` today.
-                        if (substAliasArg)
-                        {
-                            // A written `move` that degrades to a no-op here still hands back a
-                            // borrow the owner retains; mark it so the delete checks can key on it.
-                            if (declType.IsMove) declType.IsAlias = true;
-                            declType.IsAliasTypeArg = true;
-                            declType.IsMove = false;
-                        }
                     }
                     // Resolve namespace-qualified type names (alias expansion + parent namespace search)
                     typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName);
@@ -3085,7 +3030,6 @@ private:
         {
             resolved.TypeName = substIt->second;
             StripUniqueQualifier(resolved.TypeName);  // default-value resolution uses the bare type
-            StripAliasQualifier(resolved.TypeName);
             while (!resolved.TypeName.empty() && resolved.TypeName.back() == '*')
             {
                 resolved.TypeName.pop_back();
@@ -6666,10 +6610,8 @@ public:
         // so a shape complaint would only steer the user to fix the shape and land back here.
         if (inUnionFieldDecl_)
             LogErrorContext(ctx, "'unique' on " + field + ": a union member cannot be 'unique' - the synthesized destructor cannot know which member is active, so it would free whichever bits the union currently holds. Drop 'unique' and free the pointer from code that knows the active member.");
-        // Gated on the element shape the single-pointer rule accepts, so a non-pointer array
-        // falls through to the pointer rejection below instead of a message about pointers.
-        if (f.ConstArraySize > 0 && f.Pointer && !f.ElemPointer)
-            LogErrorContext(ctx, "'unique' on " + field + ": fixed arrays are not supported yet - the synthesized destructor deletes a single pointer and would leak the rest");
+        // `unique T* f[N]` is allowed since 2026-07-20: the synthesized destructor walks the array
+        // and releases each slot (EmitOwningUniqueArrayCleanup, shared with the array-LOCAL path).
         if (f.IsArrayView)
             LogErrorContext(ctx, "'unique' on " + field + ": array views are not supported - a view does not own its buffer");
         if (f.IsSimd)
@@ -11750,7 +11692,6 @@ public:
         auto it = activeTypeSubstitutions.find(name);
         if (it != activeTypeSubstitutions.end()) name = it->second;
         StripUniqueQualifier(name);  // resolve to the underlying LLVM type; unique is a storage marker
-        StripAliasQualifier(name);
         return Compiler(ctx)->ResolveQualifiedName(name);
     }
 
@@ -13332,11 +13273,6 @@ public:
                 argNV.BorrowedUniqueField, argNV.BorrowedOrigin));
             return {};
         }
-
-        // An `alias`-qualified generic type argument is a non-owning machine word: `move` on it
-        // is a silent no-op copy, exactly like `move int`. Source is left untouched.
-        if (argNV.TypeAndValue.IsAliasTypeArg)
-            return argNV;
 
         llvm::Value* ptrVal = LoadNamedVariable(argNV);
 
@@ -16309,7 +16245,6 @@ public:
                                         {
                                             std::string bare = resolved;
                                             StripUniqueQualifier(bare);
-                                            StripAliasQualifier(bare);
                                             isPtr = Compiler(ctx)->interfaceTable.count(bare) > 0;
                                         }
                                     }
@@ -16368,7 +16303,6 @@ public:
                                     {
                                         std::string bare = substIt->second;
                                         StripUniqueQualifier(bare);
-                                        StripAliasQualifier(bare);
                                         if (!bare.empty() && bare.back() != '*')
                                             isIface = Compiler(ctx)->interfaceTable.count(bare) > 0;
                                     }
@@ -16376,34 +16310,6 @@ public:
                             }
                             namedVar.Primary = llvm::ConstantInt::get(
                                 llvm::Type::getInt1Ty(*Compiler(ctx)->context), isIface ? 1 : 0);
-                            namedVar.TypeAndValue.TypeName = "int";
-                            break;
-                        }
-
-                        // Compile-time intrinsic: is_alias(T) - returns 1 if the type parameter T
-                        // resolves to an `alias`-qualified (non-owning) type in the current
-                        // instantiation, 0 otherwise. Orthogonal to is_pointer/is_unique.
-                        // Returns i1 typed "int" - use under `if const`, do not printf it directly.
-                        if (functionName == "is_alias")
-                        {
-                            bool isAliasArg = false;
-                            if (argumentList.size() > 0)
-                            {
-                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
-                                if (!namedArgCtx.empty())
-                                {
-                                    std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
-                                    auto substIt = activeTypeSubstitutions.find(argText);
-                                    if (substIt != activeTypeSubstitutions.end())
-                                    {
-                                        const std::string& resolved = substIt->second;
-                                        isAliasArg = resolved.compare(0, kAliasQualifierPrefixLen,
-                                            kAliasQualifierPrefix) == 0;
-                                    }
-                                }
-                            }
-                            namedVar.Primary = llvm::ConstantInt::get(
-                                llvm::Type::getInt1Ty(*Compiler(ctx)->context), isAliasArg ? 1 : 0);
                             namedVar.TypeAndValue.TypeName = "int";
                             break;
                         }
@@ -16428,7 +16334,6 @@ public:
                                     {
                                         std::string base = substIt->second;
                                         StripUniqueQualifier(base);
-                                        StripAliasQualifier(base);
                                         auto* be = Compiler(ctx);
                                         // A pointer (bare/unique/alias) or a non-struct type is always
                                         // copyable; a struct is refused only by the unique-owner rule.
@@ -19138,7 +19043,7 @@ public:
 
         // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
-            "va_start", "va_end", "is_pointer", "is_unique", "is_alias", "is_interface", "is_copyable", "is_primitive", "is_string", "annotationof",
+            "va_start", "va_end", "is_pointer", "is_unique", "is_interface", "is_copyable", "is_primitive", "is_string", "annotationof",
             "compile_error",
             "reflect", "reflect_set", "__rdtscp", "__readcyclecounter", "__lfence", "__pause",
             "__popcount", "__ctz", "__clz", "__prefetch", "__fma", "__likely", "__unlikely",
@@ -22913,7 +22818,7 @@ public:
             // ownership sink, so passing a named unique value transfers and nulls it via the existing
             // move machinery. Post-substitution unique params already carry IsMove (set in
             // ParseDeclarationSpecifiers); this covers the direct `unique X*` spelling.
-            if (paramType.IsUnique && !paramType.IsAliasTypeArg
+            if (paramType.IsUnique
                 && ((paramType.Pointer && !paramType.ElemPointer
                 && !paramType.IsArrayView) || paramType.IsInterface))
                 paramType.IsMove = true;

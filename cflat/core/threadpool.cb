@@ -63,6 +63,8 @@ struct TaskHandle {
     // All fields are protected by the pool's _lock; never access them directly.
     function<int(move void*, stop_token)> _contFn       = default;
     void*                                 _contCtx      = nullptr;
+    // Release for _contCtx if the continuation is never run (queue saturation).
+    function<void(move void*)>            _contDtor     = default;
     TaskHandle*                           _contHandle   = nullptr;
     int                                   _contPriority = 1;   // THREADPOOL_PRIORITY_NORMAL
     bool                                  _hasCont      = false;
@@ -573,6 +575,7 @@ class ThreadPool {
                 // nulled so the duplicate/submit_now cleanup below is a no-op.
                 dep->_contFn       = t.fn;
                 dep->_contCtx      = t.ctx;
+                dep->_contDtor     = ctxDtor;   // kept so a dropped continuation frees ctx correctly
                 t.ctx              = nullptr;
                 dep->_contHandle   = h;
                 dep->_contPriority = priority;
@@ -836,11 +839,13 @@ void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
     bool fired    = false;
     Task cont     = default;
     int  contPrio = THREADPOOL_PRIORITY_NORMAL;
+    function<void(move void*)> contDtor = default;   // release for cont.ctx if it is dropped
 
     lock(wctx.mtx) {
         if (h_ref != nullptr && h_ref->_hasCont) {
             cont.fn     = h_ref->_contFn;
             cont.ctx    = h_ref->_contCtx;
+            contDtor    = h_ref->_contDtor;
             h_ref->_contCtx = nullptr;  // mark transferred; field never read after _hasCont=false
             cont.handle = h_ref->_contHandle;
             if (cont.handle != nullptr) {
@@ -863,11 +868,22 @@ void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
             wctx->ready->release();
         } else {
             // Queue saturated: roll back the pre-reserved slot so drain() can
-            // make forward progress.  The continuation is silently dropped -
-            // sizing THREADPOOL_QUEUE_CAPACITY appropriately is the user's job.
+            // make forward progress.  The continuation is dropped - sizing
+            // THREADPOOL_QUEUE_CAPACITY appropriately is the user's job.
             // A bare decrement is enough: the release-and-wake for self below
             // will observe inflight and wake drain() if this was the last task.
             wctx->inflight->decrement();
+            // cont.ctx was transferred out of the handle under the lock above, so
+            // this thread owns it exclusively; free it OUTSIDE the lock (the user
+            // dtor must not run under the pool lock) via the same helper every
+            // other drop path uses.
+            void* lostCont = cont.ctx;
+            cont.ctx = nullptr;
+            __threadpool_drop_ctx(contDtor, move lostCont);
+            // The continuation's handle was handed to the caller by then(). It
+            // will never run, so publish done (failed) or the caller's
+            // ~TaskHandle spins on done forever.
+            if (cont.handle != nullptr) { __threadpool_publish_done(cont.handle, -1); }
         }
     }
 

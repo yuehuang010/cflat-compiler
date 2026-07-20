@@ -782,6 +782,107 @@ bool testRwlockWithThreads() {
 }
 
 // ---------------------------------------------------------------------------
+// RAII teardown for the sync primitives.
+//
+// mutex/rwlock/condvar/event/semaphore/barrier release their OS state from a
+// destructor at scope exit. destroy() stays public and is IDEMPOTENT (it nulls
+// the slot/handle), so an explicit destroy() followed by scope exit must not
+// double-release. A double release aborts under the macOS allocator, so
+// "returns normally" is the assertion here.
+// ---------------------------------------------------------------------------
+
+// Explicit destroy() then scope exit - the numa.cb:261 pattern. Must not
+// double-release the underlying OS object.
+bool testLockDestroyIsIdempotent() {
+    bool result = true;
+
+    {
+        mutex m;
+        lock (m) { }
+        m.destroy();
+        m.destroy();      // idempotent: slot already nulled
+    }                     // ~mutex() must be a no-op
+
+    {
+        rwlock rw;
+        lock (rw.write) { }
+        rw.destroy();
+        rw.destroy();
+    }                     // ~rwlock() must be a no-op
+
+    result &= Test("lock destroy() is idempotent", true, true);
+    return result;
+}
+
+// A destroyed lock is re-usable: os.*_lock lazily re-creates the OS state when
+// the slot is null, so teardown can never leave a caller with a dead lock.
+bool testLockUsableAfterDestroy() {
+    bool result = true;
+    mutex m;
+    int counter = 0;
+    lock (m) { counter = counter + 1; }
+    m.destroy();
+    lock (m) { counter = counter + 1; }   // slot lazily re-created
+    result &= Test("lock usable after destroy", counter, 2);
+    return result;
+}
+
+// Same idempotency contract for the handle-based primitives.
+bool testEventSemaphoreBarrierDestroyIdempotent() {
+    bool result = true;
+
+    {
+        semaphore s;
+        s.init(1, 1);
+        s.destroy();
+        s.destroy();
+    }                     // ~semaphore() must be a no-op
+
+    {
+        latch l;          // latch embeds an event by value
+        l.init(1);
+        l.count_down();
+        l.wait();
+        l.destroy();
+        l.destroy();
+    }                     // ~event() on l._ev must be a no-op
+
+    {
+        barrier b;
+        b.init(1);
+        b.destroy();
+        b.destroy();
+    }                     // ~barrier() must be a no-op
+
+    // Never-initialised shells: the destructor must tolerate a null handle.
+    {
+        semaphore sUnused;
+        barrier   bUnused;
+        mutex     mUnused;
+        rwlock    rwUnused;
+    }
+
+    result &= Test("event/semaphore/barrier destroy() idempotent", true, true);
+    return result;
+}
+
+// Repeated scope-entry must not accumulate OS lock state. This is a smoke test
+// for the destructor actually running; the quantitative oracle is an RSS probe
+// (a leak here is ~200 bytes per iteration on Darwin).
+bool testLockScopeExitReleasesRepeatedly() {
+    bool result = true;
+    int n = 0;
+    for (int i = 0; i < 2000; i++) {
+        mutex  m;
+        rwlock rw;
+        lock (m) { n = n + 1; }
+        lock (rw.write) { }
+    }
+    result &= Test("lock scope exit releases repeatedly", n, 2000);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // channel<int> tests
 // ---------------------------------------------------------------------------
 
@@ -1776,6 +1877,12 @@ extern int main() {
     total++; passed += testRwlockShared()             ? 1 : 0;
     total++; passed += testRwlockLockStatement()      ? 1 : 0;
     total++; passed += testRwlockWithThreads()        ? 1 : 0;
+
+    // RAII teardown of the sync primitives
+    total++; passed += testLockDestroyIsIdempotent()  ? 1 : 0;
+    total++; passed += testLockUsableAfterDestroy()   ? 1 : 0;
+    total++; passed += testEventSemaphoreBarrierDestroyIdempotent() ? 1 : 0;
+    total++; passed += testLockScopeExitReleasesRepeatedly()        ? 1 : 0;
 
     // Embedded sub-struct initialization tests
     total++; passed += testEmbeddedAtomicFlagInitialized()    ? 1 : 0;

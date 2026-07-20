@@ -23,9 +23,18 @@ struct event {
         os.event_wait(_h);
     }
 
-    // Release the OS event.
+    // Release the OS event. Idempotent: the handle is nulled, so a later
+    // destructor call is a no-op.
     void destroy() {
-        os.event_destroy(_h);
-        _h = nullptr;
+        if (_h != nullptr) {
+            os.event_destroy(_h);
+            _h = nullptr;
+        }
+    }
+
+    // RAII teardown. MUST NOT BE COPIED - there is no copy suppression for a
+    // void* handle, so a copy would double-destroy one OS event.
+    ~event() {
+        destroy();
     }
 };

@@ -29,7 +29,6 @@
 //   btree<K, V>              value elements, deep-COPIED on insert
 //   btree<K, V*>             BORROWS the value - never freed (the caller owns it)
 //   btree<K, IShape>         BORROWS - never freed
-//   btree<K, alias V*>       same as bare, spelled explicitly
 //   btree<K, unique V*>      OWNS: freed on overwrite, on remove(), and at teardown
 //   btree<K, unique IShape>  OWNS and frees
 //
@@ -196,18 +195,18 @@ struct btree<K, V>
     // buffer was shallow-copied into another slot that now owns it. The node is a borrowed pointer
     // parameter here, so `move` is not allowed (ownership model, see _freeValue); a plain store of
     // a default local is a pure overwrite that never frees the old slot. The synthesized node
-    // destructor frees ALL VALUE-TYPE slots, so an abandoned owning-typed tail slot must read as
-    // empty. Gated to owning value types only. A POINTER slot (bare, alias or `unique`) needs no
-    // clearing: the synthesized destructor does not free a unique-substituted array slot (measured),
-    // and every explicit free here is bounded by `count`, so a stale duplicate above count is
-    // unreachable - which is why the `unique` leg needs no extra work on the split/borrow paths.
+    // destructor frees ALL OWNING slots - value types, and (since 2026-07-20) every slot of a
+    // `unique`-substituted array - so an abandoned owning-typed tail slot must read as empty or
+    // it is freed twice. Gated to owning types: a BARE pointer / interface slot is borrowed and
+    // the destructor still leaves it alone, so clearing it would be pure cost.
     void _clearKey(btree_node<K, V>* n, int i)
     {
         if const (!is_primitive(K)) if const (!is_pointer(K)) { K e = default; n->keys[i] = e; }
     }
     void _clearValue(btree_node<K, V>* n, int i)
     {
-        if const (!is_pointer(V)) if const (!is_primitive(V)) { V e = default; n->values[i] = e; }
+        if const (is_unique(V))       { V e = default; n->values[i] = e; }
+        else if const (!is_pointer(V)) if const (!is_primitive(V)) { V e = default; n->values[i] = e; }
     }
 
     // Destruct an owned key slot in place (frees an owning key and zeroes it; a no-op for a
@@ -259,9 +258,9 @@ struct btree<K, V>
     // Store a value into a slot that holds NO live value yet, per the ownership rule: `unique`
     // is TAKEN (a unique-substituted parameter is a synthesized move sink); a bare pointer or
     // interface value is aliased (BORROWED); a value type is deep-copied so the caller's
-    // original stays independent. `is_pointer(V)` is true for a bare, `unique` or `alias`
-    // pointer AND for an interface value, so it subsumes the alias case - do not add an
-    // is_alias arm. Mirrors list._placeAt / dictionary._placeValueAt exactly.
+    // original stays independent. `is_pointer(V)` is true for a bare or `unique` pointer AND
+    // for an interface value, so it covers every borrowed spelling.
+    // Mirrors list._placeAt / dictionary._placeValueAt exactly.
     //
     // Writes straight into the destination slot rather than returning the value: a
     // `move V`-RETURNING helper leaks a value type's owning fields, see

@@ -43,7 +43,7 @@ class stack<T>
     // parameter is a synthesized move sink); a bare pointer or interface is aliased; a
     // value type is deep-copied so the caller's original stays independent.
     // `is_pointer(T)` is true for a bare, `unique` or `alias` pointer AND for an interface
-    // value, so it subsumes the alias case - do not add an is_alias arm, it is unreachable.
+    // value, so it covers every borrowed spelling.
     void _placeAt(int index, T value)
     {
         if const (is_unique(T))         _data[index] = move value;

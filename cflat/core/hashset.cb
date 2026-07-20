@@ -27,7 +27,7 @@ struct hashset<T>
         // instantiation is a compile error (deferred: fires only if _slot is actually called).
         if const (is_unique(T))
         {
-            compile_error("hashset elements cannot be 'unique'; set elements are key-like and a lookup reads the element for hashing/equality, which would move it out. Use 'hashset<alias T*>' to hold borrowed elements and manage their lifetime separately.");
+            compile_error("hashset elements cannot be 'unique'; set elements are key-like and a lookup reads the element for hashing/equality, which would move it out. Use 'hashset<T*>' to hold borrowed elements and manage their lifetime separately.");
         }
         int h = 0;
         if const (is_primitive(T))
@@ -164,8 +164,8 @@ struct hashset<T>
     // `string` (or any other value type with owning fields) is deep-copied so the slot owns an
     // independent buffer: a plain store would alias the caller's `value` argument (a soon-freed
     // temp/local) and dangle once it is freed. remove()/clear()/the destructor free that copy.
-    // `is_pointer(T)` is true for bare, `unique`, `alias` and interface types alike, so it
-    // subsumes the alias case - do not add an is_alias arm, it is unreachable.
+    // `is_pointer(T)` is true for bare, `unique` and interface types alike, so it covers
+    // every borrowed spelling.
     void _placeAt(int index, alias T value)
     {
         if const (is_primitive(T))      _keys[index] = value;

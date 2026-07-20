@@ -153,7 +153,7 @@ class File
         {
             string line = readLine();
             if (line.length() == 0 && atEnd()) break;
-            lines->add(line);
+            lines->add(move line);
         }
         return lines;
     }
@@ -781,7 +781,7 @@ class Directory
             string fullPath = Path.combine(path, name);
             bool isDir = _fs_isDir(fullPath.data());
             if (isDir) Directory._collectRecursive(fullPath, result);
-            result->add(fullPath);
+            result->add(move fullPath);
             i++;
         }
         delete entries;

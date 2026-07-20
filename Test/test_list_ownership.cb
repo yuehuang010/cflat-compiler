@@ -141,20 +141,22 @@ int testBarePointerBorrows()
     return passed;
 }
 
-int testAliasPointerBorrows()
+// The spelling `list<alias Res*>` was removed; a bare pointer element already borrows.
+// These are the same borrow assertions, re-pointed at the surviving spelling.
+int testBorrowedPointerElementBorrows()
 {
     int passed = 0;
     g_dtor = 0;
     Res* p = new Res(2);
     {
-        list<alias Res*> l = default;
+        list<Res*> l = default;
         l.add(p);
-        passed += Test("list<alias T*> source usable", p.id, 2);
-        passed += Test("list<alias T*> stored", l[0].id, 2);
+        passed += Test("borrowed list<T*> source usable", p.id, 2);
+        passed += Test("borrowed list<T*> stored", l[0].id, 2);
     }
-    passed += Test("list<alias T*> dtor frees nothing", g_dtor, 0);
+    passed += Test("borrowed list<T*> dtor frees nothing", g_dtor, 0);
     delete p;
-    passed += Test("list<alias T*> caller frees once", g_dtor, 1);
+    passed += Test("borrowed list<T*> caller frees once", g_dtor, 1);
     return passed;
 }
 
@@ -361,7 +363,6 @@ int testIsCopyable()
     CopyProbe<int> a = default;
     CopyProbe<Res*> b = default;
     CopyProbe<unique Res*> c = default;
-    CopyProbe<alias Res*> d = default;
     CopyProbe<string> e = default;
     CopyProbe<IShape> f = default;
     CopyProbe<Val> g = default;
@@ -369,7 +370,6 @@ int testIsCopyable()
     passed += Test("is_copyable(int)", a.copyable(), 1);
     passed += Test("is_copyable(Res*)", b.copyable(), 1);
     passed += Test("is_copyable(unique Res*)", c.copyable(), 1);
-    passed += Test("is_copyable(alias Res*)", d.copyable(), 1);
     passed += Test("is_copyable(string)", e.copyable(), 1);
     passed += Test("is_copyable(IShape)", f.copyable(), 1);
     passed += Test("is_copyable(Val)", g.copyable(), 1);
@@ -389,7 +389,7 @@ extern int main()
     total += 2;  passed += testStringCopySemantics();
     total += 1;  passed += testStringMoveSemantics();
     total += 5;  passed += testBarePointerBorrows();
-    total += 4;  passed += testAliasPointerBorrows();
+    total += 4;  passed += testBorrowedPointerElementBorrows();
     total += 3;  passed += testUniquePointerOwns();
     total += 2;  passed += testUniquePointerSetFreesOld();
     total += 5;  passed += testBareInterfaceBorrows();
@@ -398,7 +398,7 @@ extern int main()
     total += 5;  passed += testCopyBorrowedPointer();
     total += 7;  passed += testIListContract();
     total += 3;  passed += testNonCopyableMoveOnly();
-    total += 8;  passed += testIsCopyable();
+    total += 7;  passed += testIsCopyable();
     total += 7;  passed += testSort();
 
     // Every ownership rule above is only meaningful if nothing leaked.

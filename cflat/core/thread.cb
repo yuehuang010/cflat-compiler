@@ -198,6 +198,12 @@ struct Thread {
     // Borrow overload: caller retains ownership of ctx. The thread's fn must not
     // free ctx, and the caller must keep it alive until join() returns.
     bool start(function<int(void*)> fn, void* ctx, int fpConfig = 0) {
+        // A second start() would leak the prior handle and _args, and abandon a
+        // running thread that could then never be joined.
+        if (_handle != nullptr) {
+            fprintf(__std_iob(2), "Thread.start: thread is already started (join or terminate it first).\n");
+            abort();
+        }
         __ThreadArgs* args = (__ThreadArgs*)malloc(sizeof(__ThreadArgs));
         args->fn  = fn;
         args->ctx = ctx;
@@ -225,6 +231,12 @@ struct Thread {
     // Callers needing recovery should validate inputs (e.g. handle limits)
     // before invoking start().
     bool start(function<int(move void*)> fn, move void* ctx, int fpConfig = 0) {
+        // A second start() would leak the prior handle and _args, and abandon a
+        // running thread that could then never be joined.
+        if (_handle != nullptr) {
+            fprintf(__std_iob(2), "Thread.start: thread is already started (join or terminate it first).\n");
+            abort();
+        }
         __ThreadArgsMove* args = (__ThreadArgsMove*)malloc(sizeof(__ThreadArgsMove));
         args->fn  = fn;
         args->ctx = ctx;          // assignment transfers ctx into args->ctx; ctx local is auto-nulled

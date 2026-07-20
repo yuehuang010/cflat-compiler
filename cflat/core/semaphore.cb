@@ -51,11 +51,18 @@ struct semaphore {
         os.sem_post(_handle, n);
     }
 
-    // Release the OS object.
+    // Release the OS object. Idempotent: the handle is nulled, so a later
+    // destructor call is a no-op.
     void destroy() {
         if (_handle != nullptr) {
             os.sem_destroy(_handle);   // os.sem_destroy frees the block; do not free here.
             _handle = nullptr;
         }
+    }
+
+    // RAII teardown. MUST NOT BE COPIED - there is no copy suppression for a
+    // void* handle, so a copy would double-destroy one OS semaphore.
+    ~semaphore() {
+        destroy();
     }
 };

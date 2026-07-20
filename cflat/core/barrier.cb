@@ -94,10 +94,17 @@ struct barrier {
         }
     }
 
-    // Release OS resources. No threads may be waiting.
+    // Release OS resources. No threads may be waiting. Idempotent: both slots
+    // are nulled, so a later destructor call is a no-op.
     void destroy() {
         cv_destroy(&_cv);   // POSIX: free the heap condvar. Windows: no-op.
         _mtx.destroy();     // POSIX: free the heap mutex. Windows: SRW no-op.
+    }
+
+    // RAII teardown. MUST NOT BE COPIED - the void* slots have no copy
+    // suppression, so a copy would double-destroy one OS condvar.
+    ~barrier() {
+        destroy();
     }
 };
 

@@ -36,7 +36,7 @@ class XmlBuilder : IReflector
             else tag = "item";
         }
         _openTag(tag);
-        _tags.add(tag);
+        _tags.add(move tag);
     }
 
     // Close the current object element.

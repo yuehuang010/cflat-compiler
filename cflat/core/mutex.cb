@@ -47,8 +47,15 @@ struct mutex {
         os.cond_wait((void**)cvSlot, &_srw);
     }
 
-    // Release any underlying OS lock state.
+    // Release any underlying OS lock state. Idempotent: os.mutex_destroy nulls
+    // the slot, so a later destructor call is a no-op.
     void destroy() {
+        os.mutex_destroy(&_srw);
+    }
+
+    // RAII teardown. MUST NOT BE COPIED - there is no copy suppression for a
+    // void* slot, so a copy would double-destroy one OS lock.
+    ~mutex() {
         os.mutex_destroy(&_srw);
     }
 };
@@ -101,8 +108,15 @@ struct condvar {
         os.cond_broadcast(&_slot);
     }
 
-    // Release the condvar's OS state.
+    // Release the condvar's OS state. Idempotent: os.cond_destroy nulls the
+    // slot, so a later destructor call is a no-op.
     void destroy() {
+        os.cond_destroy(&_slot);
+    }
+
+    // RAII teardown. MUST NOT BE COPIED - there is no copy suppression for a
+    // void* slot, so a copy would double-destroy one OS condvar.
+    ~condvar() {
         os.cond_destroy(&_slot);
     }
 };

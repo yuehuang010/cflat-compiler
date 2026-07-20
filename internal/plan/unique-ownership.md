@@ -21,6 +21,73 @@ the ledger is a one-line-per-item record of what landed. The detailed blow-by-bl
 completed migration was removed on 2026-07-20 to keep this section readable - it is preserved
 in git history, and the durable LESSONS from it are hoisted into "Rules that still bind" below.
 
+### RESUMING FROM A FRESH CONTEXT - read this first
+
+Written 2026-07-20 at the end of a long working session, so the next context can pick up
+without re-deriving anything. Delete this subsection once its contents are stale.
+
+**Where the tree stands.** Last commit is `54d6803` (all six container migrations). Everything
+after that is UNCOMMITTED in the working tree and verified green - no agents in flight:
+
+- `alias` removed as a generic TYPE ARGUMENT. Parameter/return `alias` is UNTOUCHED and
+  load-bearing - do not confuse the two.
+- The synthesized struct destructor now releases a `unique` fixed-array FIELD element by
+  element; `btree` joined the existing abandon-clear protocol via `_clearValue` rather than
+  needing a new opt-out spelling.
+- Six core types went RAII (`mutex`, `rwlock`, `condvar`, `event`, `semaphore`, `barrier`).
+  `Thread` and the pools were SKIPPED with evidence - see NEXT item 4.
+- A 3-site `move` optimisation (`filesystem.cb` x2, `xml.cb`).
+- Issue files: three deleted (fixed), two filed (`thread-cannot-go-raii.md`,
+  `pools-no-destructor-shutdown-ordering.md`), plus the earlier survey.
+
+**Verified baselines to measure against:** `bash test.sh Release` = 448 passed, 0 failed,
+8 skipped. `bash example_mac.sh` = 35 passed, 0 failed. macOS host - do NOT add
+"needs Windows verification" caveats; the maintainer owns that and is aware.
+
+**Standing instructions from the maintainer.** Do NOT commit (stash is allowed); keep `master`
+linear, no merge commits. Use the repo-root `scratch/` for ALL temp files. Never use the `haiku`
+agent tier. Do not create new `Test/*.cb` files (`Test/errors/err_*.cb` IS sanctioned). Do not
+revert changes to check a baseline - ask first. Do not weaken test assertions to make something
+pass. The maintainer's standing steer this session was "continue until blocked" and "do not let
+commit block you" - so keep batches logically separable for slice-committing rather than idling
+on commit boundaries.
+
+**THE THREE PENDING DECISIONS WERE ANSWERED 2026-07-20** - see NEXT items 3 and 4 for the
+full rulings. In short: (1) the synthesized destructor will release `unique` fixed-array fields
+element by element, which is BREAKING for `btree` and must migrate it in the same change
+- LANDED 2026-07-20, see the ledger;
+(2) core's manual-lifecycle types go RAII, with copy suppression handled by AUDIT-AND-DISCIPLINE
+for now - extending `unique` to non-`delete` releases is the preferred long-term answer but was
+explicitly NOT chosen yet - LANDED 2026-07-20 for six types, see the ledger;
+(3) `~Thread()` on a still-running thread is an ERROR (compile-time
+ideal, runtime acceptable), never a silent join or detach - NOT IMPLEMENTED: the audit found a
+real copy path AND a deliberate detach pattern in `channel.operator>>` that the ruling's own
+semantics would abort. See `internal/issue/thread-cannot-go-raii.md`.
+
+**Process lessons from this session - these cost real time, do not relearn them.**
+
+- **VERIFY EVERY AGENT CLAIM INDEPENDENTLY.** Across ~8 agents, THREE filed root causes turned
+  out to be wrong and were only caught by re-running the repro by hand. The corrected diagnoses
+  are recorded in "Resolved 2026-07-20" below and are worth more than the fixes themselves. An
+  agent reporting green is not evidence; re-run the suite and the specific repro yourself.
+- **Agents that push back are usually right.** Four agents this session contradicted part of
+  their brief (the field-migration survey found ZERO of a supposed 34 targets; another proved a
+  filed root cause wrong; another refused a "fix" that would have broken shipping code). Every
+  one of them was correct. Write briefs that invite this explicitly.
+- **Do NOT run two agents in parallel when they share an acceptance gate.** Disjoint SOURCE
+  files are not disjoint when both edit the same test file or both gate on the full suite. This
+  polluted one agent's gate and produced a phantom failure it correctly refused to own.
+- **Split multi-bug issue files.** Three findings once lived in one file whose own instructions
+  said "delete when fixed" - fixing the titular bug would have silently discarded the other two.
+- **A counting oracle cannot distinguish "both correct" from "both inverted."** This hid a fully
+  inverted move-overload pair for hours. Assert identity or an observable effect, never counts
+  alone.
+
+**What is genuinely finished.** All six containers (`list`, `hashset`, `dictionary`, `btree`,
+`array`, `queue`/`stack`) are on ONE rule. The field migration is CANCELLED with evidence, not
+deferred. `alias`-as-type-argument is removed. What remains in NEXT is either blocked on a
+decision above or is the low-priority optimisation in item 5.
+
 ### THE RULE (settled, and now uniform across core)
 
 **BARE BORROWS, `unique` OWNS - pointers and interface fat pointers alike.**
@@ -42,29 +109,141 @@ the call sites - C#-like local readability, with the complexity paid once in the
 
 ### NEXT - in priority order
 
-1. **Core FIELD migration - unblocked since 2026-07-17, NOT started.** The ~34 verified-owning
-   pointer fields (of 254 scalar pointer fields across 144 structs) each gain `unique` and DELETE
-   a hand-written destructor. See Part I "Migration" for the cleared blockers and the
-   do-not-migrate-by-name warning. The TYPE-ARGUMENT migration (~30 `list<...>` declarations)
-   happened in Part II Stage 5; the FIELD migration did not.
+1. **Core FIELD migration - CANCELLED 2026-07-20. There are ZERO migratable fields.** The
+   long-standing "~34 verified-owning pointer fields" claim is WRONG, and was wrong under a
+   looser criterion than the one that governs migratability. Full evidence in
+   `internal/plan/unique-field-migration-survey.md`.
 
-2. **Remove `alias` as a generic type ARGUMENT.** Ruled 2026-07-19: once bare means borrow,
-   `list<alias T*>` and bare `list<T*>` mean the same thing, so the type-argument form is
-   redundant surface area. **`alias` on PARAMETERS and RETURNS must STAY** - it is load-bearing
-   there (`get()`, `peek()`, and the `dequeue` design above all depend on it). Do this only
-   after every container has landed, so nothing is mid-migration when the spelling disappears.
+   **The decisive test is mechanical.** A field is migratable only if a hand-written destructor
+   frees it with a plain scalar `delete field;` - that is the only release the synthesized
+   `unique` teardown emits. Across all of `cflat/core`, exactly TWO scalar `delete`s occur
+   inside a destructor (`json.cb:219`, `xml.cb:223`) and BOTH delete a local loop variable while
+   walking a sibling chain, not a field. Independently re-verified 2026-07-20.
 
-3. **`unique` field-shape rule is skipped under generic substitution - STILL OPEN, and the
-   originally filed fix direction is WRONG.** See
-   `internal/issue/unique-field-check-skipped-on-substituted-generic-type.md`. Re-validating at
-   monomorphization would reject `btree<K, unique C*>` and `btree<K, unique IFace>`, both of
-   which hand-write teardown and are correct today. What is missing is the DISTINCTION ("is this
-   field's release synthesized?"), not the check. The live hole is a generic struct with a
-   `unique V values[N]` field and NO hand-written teardown: nothing diagnoses it, nothing frees
-   it. Two fix directions are recorded in the issue file; both are breaking for `btree` and
-   neither has been attempted.
+   Every genuinely-owning pointer field in core is released some OTHER way: `free()`,
+   `delete[]`, an OS or allocator call (`vm_release`, `CloseHandle`, `DestroyWindow`, objc
+   `release`), a refcount, or a recursive chain walk. `unique` expresses none of those.
 
-4. **Optimisation, not a leak:** `list<string>` named-lvalue sites still deep-copy where the
+   Reconciled counts: 243 structs, 105 with scalar pointer fields, 203 such fields, 35
+   destructors - 78 borrowing, 125 owning-but-opts-out, **0 migratable**. The 34-vs-0 gap is a
+   CRITERION gap, not tree drift: under "the struct frees this pointer somewhere in teardown"
+   the owning count is ~30-35, which reproduces the old number.
+
+   **Do not revive this as a sweep.** If a core consumer for `unique` fields is genuinely
+   wanted, the only structurally plausible route is reworking `JsonNode` / `XmlNode` to hold
+   children in a `list<unique T*>` - a real design change with hot-path risk, to be argued on
+   its own merits rather than smuggled in as "the field migration".
+
+2. **Remove `alias` as a generic type ARGUMENT - DONE 2026-07-20.** See the ledger row.
+
+3. **`unique` field-shape rule skipped under generic substitution - DONE 2026-07-20.**
+   The synthesized destructor now releases a `unique` fixed-array FIELD element by element.
+   See the ledger row for the `btree` decision and the diagnostic outcome.
+
+4. **Teardown gaps in core - DONE 2026-07-20, with two documented SKIPS.** The RAII ruling
+   below was executed. Six types went RAII, two were skipped with filed evidence. See the
+   ledger row and the "RAII migration outcome" table immediately after this item.
+
+   Original item text kept below for the reasoning trail.
+
+   **Teardown gaps in core, found 2026-07-20 by the field-migration survey.** These are the
+   survey's real yield and are INDEPENDENT of the ownership workstream. All share one shape:
+   core types with a MANUAL lifecycle (`init` / `start` / `destroy`) and no destructor, where
+   the manual call is easy to miss or to double up. **Worth treating as ONE design question -
+   should these types be RAII or stay manual - rather than four separate patches.**
+
+   - `internal/issue/rwlock-os-state-never-destroyed.md` - `rwlock.destroy()` has ZERO callers
+     tree-wide; every POSIX instance leaks its pthread state. Invisible on Windows (inline
+     SRWLOCK), which is why it was never noticed. Independently re-verified.
+   - `internal/issue/threadpool-continuation-ctx-leak-on-drop.md` - `threadpool.cb:861-871`
+     drops `cont.ctx` on the queue-saturation path. The most concrete leak found.
+   - `internal/issue/unguarded-double-init-leaks.md` - `stream.init()` and `Thread.start()` have
+     no re-entry guard. `Thread.start()` twice also ABANDONS a running thread that can then
+     never be joined - a correctness bug, not just a leak.
+   - Not filed separately, recorded in the survey: `block_pool` / `arena_channel` / `page_pool`
+     have no destructors and require manual `destroy()`; `event.destroy()` lacks the null check
+     its `semaphore.destroy()` counterpart has; `ui_native/win32.cb:509` `Window.tooltip` has no
+     teardown call (Windows-only, unverifiable from macOS).
+
+   NOT bugs, recorded so they are not "rediscovered": `NumaThread._pkt` leaks by design on POSIX
+   detach/kill; `stop_token._state` is a deliberate shared alias that any shape-based scan would
+   misclassify as owning - migrating it would be actively wrong.
+
+   **RULED 2026-07-20 - go RAII, matching the C++ model.** Add destructors; make `destroy()`
+   idempotent (null the slot, null-check in the destructor) so the one existing manual call
+   (`numa.cb:261`) does not become a double release.
+
+   **The copy-suppression problem, and the interim answer.** C++ RAII is safe because these
+   types are non-copyable by the type system (`std::mutex` deletes copy AND move). cflat's only
+   non-copyability mechanism is `unique`, which requires a single-indirection pointer and emits
+   `delete` - it cannot express `void* _lock` released by `os.rwlock_destroy()`. Maintainer's
+   ruling: the RIGHT long-term answer is extending `unique` to cover non-`delete` releases
+   (giving teardown and copy suppression from one mechanism), **but that choice is NOT being
+   made yet.** For now use DISCIPLINE: audit each type for any copy path (passed by value,
+   stored in a copying container, returned by value); if none exists, add the destructor and
+   document that the type must not be copied. **If a copy path DOES exist for a type, do not add
+   its destructor - report it instead.** A destructor on a copyable value struct double-destroys
+   one OS resource per copy.
+
+   **RULED 2026-07-20 - `~Thread()` with a still-running thread is an ERROR, not a guess.**
+   Compile-time rejection is ideal; a runtime error is the acceptable fallback. Do NOT silently
+   join (a blocking destructor can deadlock at scope exit) and do NOT silently detach (the
+   thread outlives its owner and can outlive data it references). This mirrors C++ calling
+   `std::terminate()` when a joinable `std::thread` is destroyed.
+
+   **OUTCOME 2026-07-20 - the RAII migration, with its copy-path audit.** Executed on macOS;
+   `test.sh Release` 448/0/8 and `example_mac.sh` 35/0 both green after.
+
+   | Type | Copy path found | Verdict |
+   |---|---|---|
+   | `mutex` | none | **RAII** - `~mutex()` |
+   | `rwlock` | none | **RAII** - `~rwlock()` |
+   | `condvar` | none (zero uses tree-wide) | **RAII** - `~condvar()` |
+   | `event` | none (only `latch._ev`; `latch` never copied) | **RAII** - `~event()` + null guard in `destroy()` |
+   | `semaphore` | none (only `ThreadPool._ready` + 3 locals) | **RAII** - `~semaphore()` |
+   | `barrier` | none (2 locals; workers get `barrier*`) | **RAII** - `~barrier()` |
+   | `Thread` | **YES** - `nw[i] = _workers[i]` in `ThreadPool.resize()`, `threadpool.cb:659` | **SKIPPED** - `internal/issue/thread-cannot-go-raii.md` |
+   | `block_pool` / `arena_channel` / `page_pool` | n/a - blocked on a precondition, not a copy | **SKIPPED** - `internal/issue/pools-no-destructor-shutdown-ordering.md` |
+
+   Transitive containment was audited too (`event` -> `latch`; `mutex` -> `BucketAllocator`
+   -> `block_pool` -> `arena_channel`; `mutex` -> `barrier`/`stream`/`ThreadPool`/
+   `ArenaAllocator`/`NumaDomain`). No copy at any level. Interface-typed use of the two
+   allocators is not a copy - an interface value is a fat pointer.
+
+   **Idempotency came free.** `os.mutex_destroy` / `rwlock_destroy` / `cond_destroy`
+   (`os.cb:675-739`) already null-check AND null the slot, and `event.destroy()` /
+   `semaphore.destroy()` already null their handle. So `numa.cb:261`'s explicit
+   `_lock.destroy()`, `barrier.destroy()`'s `_mtx.destroy()`, and `stream`'s `~stream()`
+   are all no-ops by the time the member destructor runs. No double release.
+
+   **A safety property worth knowing: destroying a lock cannot strand a caller.**
+   `os.mutex_lock` / `rwlock_*_lock` go through `ensure_mutex` / `ensure_rwlock`, which
+   lazily RE-CREATE the OS object when the slot is null. So a use-after-destroy on a lock
+   silently re-allocates rather than being UB. This materially de-risks the whole change -
+   including the shutdown-ordering question for the registry-lock globals
+   (`_ba_reg_lock`, `_ar_reg_lock`, `_g_numaRegLock`). Pinned by
+   `testLockUsableAfterDestroy` in `Test/test_sync.cb`.
+
+   **`~Thread()` is the one place the ruling itself did not survive contact.** Besides the
+   copy path, core DELIBERATELY detaches a running thread from a scope-local `Thread` in
+   `channel<T>.operator>>` (`channel.cb:349-350`) - every `a >> b` pipe. An
+   error-on-still-running destructor aborts that path; verified experimentally (suite went
+   447/1/8, isolated to `testChannelPipeSingle`). So `Thread` needs an explicit `detach()`
+   in addition to copy suppression before it can be RAII. The double-`start()` guard from
+   the same issue DID land.
+
+   **Oracles used, and where HeapAudit was vacuous.** HeapAudit tracks `new` only, and every
+   lock's OS state is `calloc`'d inside `os.posix` - so HeapAudit is **VACUOUS for all six
+   RAII types** and was not used as evidence for them. Instead: peak-RSS over 800k
+   construct/lock/scope-exit cycles (`scratch/lock_raii_probe.cb`), 1.5 MB with RAII vs
+   43.8 MB for a negative control that skips the release - i.e. the oracle was proven
+   non-vacuous, and 200k x 200-byte Darwin `pthread_rwlock_t` is exactly the observed gap.
+   Double-release would abort under the macOS allocator, so "returns normally" is the
+   idempotency assertion. For the threadpool continuation ctx HeapAudit IS valid (the ctx is
+   `new`ed by the caller), but the stronger oracle is a DISTINCT per-path dtor whose counter
+   identifies WHICH release ran - not a bare count.
+
+5. **Optimisation, not a leak:** `list<string>` named-lvalue sites still deep-copy where the
    source is provably dead. Adding `move` at those call sites is a pure win with no semantic
    change. Ruled an optimisation 2026-07-19 (`live = 0` verified), so it is not urgent.
 
@@ -130,8 +309,10 @@ count does not need doubling.
 - **The `if const (!is_pointer(T))` guard on a transfer overload is DESIGN, not a workaround.**
   A borrowing container must not accept ownership of a pointer element - nothing would ever free
   it. For `unique T*` the plain parameter is already a synthesized move sink (D4).
-- **Never add an `is_alias` arm.** `is_pointer(T)` is true for bare, `unique`, `alias` AND
-  interface types, so it subsumes the alias case; an `is_alias` arm is unreachable dead code.
+- **There is no `is_alias(T)` intrinsic.** It was removed with the `alias` type ARGUMENT on
+  2026-07-20 (the only thing it could ever observe was an alias-qualified type arg). The rule it
+  encoded still binds in its general form: `is_pointer(T)` is true for bare, `unique` AND
+  interface types, so a chained `else if const` on `is_pointer` covers every borrowed spelling.
 - **`compile_error()` needs a STRING LITERAL.** A named constant silently emits garbage
   (`internal/issue/compile-error-non-literal-emits-garbage.md`), which is why the same poison
   message is repeated verbatim at several sites instead of being factored out.
@@ -154,9 +335,10 @@ count does not need doubling.
 - **`--init` serializer rule:** any new `TypeAndValue` / `StructData` / `AnnotationValue` field
   that an analysis reads MUST join the round-trip in `LLVMBackend.cpp` in the SAME change, or it
   is silently dropped on a warm cache and `expect_error` tests stop firing.
-- **`alias` is pointer/interface only.** `list<alias string>` is rejected. The `unique`/`alias`
-  symmetry is deliberately incomplete for value types - a borrowed string has no representation.
-  Document it; do not "fix" it.
+- **`alias` is pointer/interface only, and it is a PARAMETER/RETURN qualifier ONLY.** In a
+  generic ARGUMENT it is rejected outright since 2026-07-20 (`list<alias T*>` -> write
+  `list<T*>`). On a parameter or return it is load-bearing and unchanged: `list.get()`,
+  `queue.peek()`, `hashset.add(alias T)` and the borrowed arm of `dequeue()`/`pop()` all use it.
 
 ### Deferred by maintainer ruling - do not action as part of the above
 
@@ -188,11 +370,14 @@ count does not need doubling.
 
 ### Open issues owned by this workstream
 
-Filed and NOT fixed. Container work is done; these are the compiler-side remainder.
+Filed and NOT fixed. Container work is done. The first nine are the compiler-side remainder;
+the last two are the RAII migration's two documented SKIPS (see NEXT item 4). The three core
+teardown gaps the field-migration survey filed (`rwlock-os-state-never-destroyed`,
+`threadpool-continuation-ctx-leak-on-drop`, `unguarded-double-init-leaks`) were all FIXED on
+2026-07-20 and their files deleted.
 
 | File | What |
 |---|---|
-| `unique-field-check-skipped-on-substituted-generic-type.md` | field rule skipped under substitution |
 | `duplicate-add-leaks-unique-value.md` | `dictionary<K, unique V*>.add()` leaks on a duplicate key |
 | `move-return-named-struct-local-leaks-fields.md` | `return move r;` leaks a struct local's owning FIELDS |
 | `user-copy-method-result-leaks-in-container.md` | a hand-written `copy()` returning `move v` leaks once stored |
@@ -202,6 +387,8 @@ Filed and NOT fixed. Container work is done; these are the compiler-side remaind
 | `if-const-global-condition-crash.md` | `if const` on a global condition crashes |
 | `delete-borrow-via-named-local.md` | `delete` on a borrow via a named local is not rejected |
 | `generic-interface-explicit-type-arg-base-clause.md` | explicit base-clause form drops `*` / `unique` |
+| `thread-cannot-go-raii.md` | `Thread` is value-copied in `ThreadPool.resize()` AND deliberately detached by `channel.operator>>`; needs `detach()` + copy suppression before RAII |
+| `pools-no-destructor-shutdown-ordering.md` | `arena_channel`/`block_pool`/`page_pool` teardown has a quiescence precondition a destructor cannot check |
 
 ### Completed ledger
 
@@ -219,6 +406,11 @@ Filed and NOT fixed. Container work is done; these are the compiler-side remaind
 | 2026-07-20 | **`array` migrated** | uncommitted |
 | 2026-07-20 | **`queue` + `stack` migrated** - `_placeAt`/`_releaseAt`, plain + guarded-`move` insert, `dequeue()`/`pop()` return kind selected by member-scope `if const` (`alias` for a borrowed element), release-walk destructor. Fixed a pre-existing `queue._grow()` capacity bug: `if (_size >= _capacity)` ignored `_front`, so enqueueing after a partial drain wrote PAST the buffer | uncommitted |
 | 2026-07-20 | **`unique IFace` cluster: 2 of 3 FIXED** (+ a third, unrelated bug found with them). Owning fixed-array locals were never walked at scope exit (`unique C*[4]` leaked identically - never interface-specific); substitution set `IsUniqueTypeArg` on a `V* out` param so a POINTER TO the owning location read as a sink and dangled; `IsOwningInterfaceValue` tested only `IsUnique`, which substitution never sets, so `btree<K, unique IFace>` freed nothing. Unblocked `btree<K, unique IFace>` | uncommitted |
+| 2026-07-20 | **`alias` REMOVED as a generic type ARGUMENT** (NEXT item 2). Bare means borrow, so `list<alias T*>` was a synonym for `list<T*>`. Chose a HARD ERROR over silent acceptance so the dead spelling cannot rot. Deleted: `StripAliasQualifier`, `kAliasQualifierPrefix`, `MangleTypeArg`'s `alias_` token, `PeelTypeArgSuffix`'s alias out-param, the `is_alias(T)` intrinsic, `TypeAndValue.IsAliasTypeArg` and its `o["alt"]` cache entry. `IsAlias` (param/return) UNTOUCHED. `dictionary`/`hashset` poison messages now recommend the bare spelling | uncommitted |
+| 2026-07-20 | **Synthesized destructor now RELEASES a `unique` fixed-array FIELD** (NEXT item 3). `GetOrCreateFullDestructor` routes `unique T* f[N]` / `unique IFace f[N]` - written, or reached through a `unique` generic type argument (`IsUnique \|\| IsUniqueTypeArg`) - through the existing `EmitOwningUniqueArrayCleanup` walk, with the member builder and `currentFunction` temporarily retargeted at the wrapper body. `btree` took option (a): `_clearValue` now abandon-clears a `unique` slot exactly as it already did for an owning VALUE slot, so every stale split/borrow duplicate reads null and the node destructor frees each live slot once. `_freeValue`/`_freeKey` are UNCHANGED and still needed (remove/overwrite/clear happen before teardown). Declaration-time rule relaxed: `unique T* f[N]` is now accepted and the "fixed arrays are not supported yet" message is DELETED. Interface fields stay rejected in EVERY shape - scalar `unique IFace x` is refused by the same single-indirection rule, so relaxing only the array form would be incoherent; that message never blamed the removed limitation | uncommitted |
+| 2026-07-20 | **Core manual-lifecycle types went RAII** (NEXT item 4). `mutex`, `rwlock`, `condvar`, `event`, `semaphore`, `barrier` gained destructors after a copy-path audit found ZERO copy paths for each (including transitively, through `latch`, `stream`, `barrier`, `ThreadPool`, `NumaDomain`, and the `BucketAllocator` -> `block_pool` -> `arena_channel` chain). Idempotency was already free - every `os.*_destroy` nulls its slot - so `numa.cb:261`, `barrier.destroy()` and `~stream()` did not become double releases. `Thread` SKIPPED (real copy path + deliberate detach); pools SKIPPED (quiescence precondition). Oracle: peak RSS over 800k lock cycles, 1.5 MB vs 43.8 MB for a negative control - HeapAudit is VACUOUS here (lock state is `calloc`'d, not `new`ed) | uncommitted |
+| 2026-07-20 | **`stream.init()` and `Thread.start()` re-entry guards** - both now reject a second call with a diagnostic + `abort()` (the `list._checkBounds` idiom) instead of leaking prior state; `start()` also no longer abandons a running thread that could never be joined | uncommitted |
+| 2026-07-20 | **`threadpool` continuation-drop leak FIXED, plus a hang found with it.** The queue-saturation path now releases `cont.ctx` through `__threadpool_drop_ctx` outside the pool lock. Required a new `TaskHandle._contDtor` field: `then()` was silently DISCARDING the caller's `ctxDtor` when the continuation was deferred, so the drop path could not have used the right release. Companion bug fixed on the same branch: the drop never published `done` on the continuation's handle, so any caller holding it spun forever in `~TaskHandle`. Both pinned by `testContinuationDroppedOnSaturation` (`Test/test_threadpool.cb`), verified non-vacuous | uncommitted |
 | 2026-07-20 | **Interface array FIELD sizing bug FIXED** - `IFace v[N]` allocated ONE element with a correct 16-byte stride, silently clobbering everything after it. Plus a second bug found while verifying: the subscript handler never refreshed `interfaceVar`, so `a[i].method()` dispatched off the stale base address (affects LOCALS too) | uncommitted |
 
 ---

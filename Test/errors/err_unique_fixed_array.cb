@@ -1,10 +1,16 @@
-// `unique T* field[N]`: the synthesized destructor deletes ONE pointer per field, it does
-// not loop over the slots yet. Accepting this would silently leak every element but the
-// first, so reject until the array form is implemented.
+// `unique T* field[N]` is ACCEPTED since 2026-07-20: the synthesized destructor walks the
+// array and releases every slot (EmitOwningUniqueArrayCleanup, shared with the array LOCAL
+// path). Runtime coverage lives in Test/test_collection_leaks.cb.
 struct Node { int v = 0; };
+interface IS { int id(); };
 
-expect_error("fixed arrays are not supported yet") {
-    struct Tree { unique Node* kids[8] = default; };
+struct Tree { unique Node* kids[8] = default; };
+
+// An INTERFACE field is still rejected in every shape - scalar and array alike. The array form
+// is not singled out: `unique IS one` is refused by the same rule, so relaxing only the array
+// would be incoherent. Nothing here blames the (now removed) single-pointer destructor limit.
+expect_error("requires a single-indirection pointer type") {
+    struct Bad { unique IS slots[4] = default; };
 }
 
 extern int main()

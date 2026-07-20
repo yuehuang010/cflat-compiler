@@ -47,6 +47,12 @@ struct stream {
 
     // Allocate the two pool buffers and condition variables; seed bufB as the first empty.
     void init() {
+        // Re-initialising would leak _bufA/_bufB and both condvars, and would
+        // strand any thread already waiting on the old state.
+        if (_bufA != nullptr) {
+            fprintf(__std_iob(2), "stream.init: stream is already initialised.\n");
+            abort();
+        }
         _bufA = (char*)malloc((i64)bufferSize);
         _bufB = (char*)malloc((i64)bufferSize);
         _writeBuf = _bufA;

@@ -452,10 +452,6 @@ public:
         bool IsNullable = false;
         bool IsMove = false;     // parameter declared with 'move' - function takes ownership
         bool IsAlias = false;    // return/decl declared with 'alias' - by-value borrow; caller must not free the interior
-        // This type came from a generic type argument qualified with `alias` - a non-owning
-        // machine word, so `move` on it is a no-op. Distinct from IsAlias (the return/decl
-        // borrow qualifier); reusing that would trip RejectAliasStoreIntoField / delete checks.
-        bool IsAliasTypeArg = false;
         // This type came from a generic type argument qualified with `unique`. It records only
         // that provenance - it is set on ANY declaration whose type substitutes to `unique X*`
         // (locals and fields included), not just parameters, because the substitution branch has
@@ -3010,6 +3006,32 @@ private:
         b.SetInsertPoint(afterBB);
     }
 
+    // Release a `unique` fixed-array FIELD slot by slot from the synthesized destructor, reusing
+    // the very walk a `unique` array LOCAL already gets. The member builder and currentFunction
+    // are retargeted at the wrapper body because that walk drives them and creates basic blocks.
+    void EmitUniqueArrayFieldRelease(llvm::IRBuilder<>& b, llvm::Value* fieldPtr,
+                                     llvm::Type* fieldTy, const std::string& typeName,
+                                     bool isIface, uint64_t allocAlign)
+    {
+        if (fieldTy == nullptr || !fieldTy->isArrayTy() || b.GetInsertBlock() == nullptr) return;
+        NamedVariable nv;
+        nv.Storage = fieldPtr;
+        nv.BaseType = fieldTy;
+        nv.AllocAlignment = allocAlign;
+        nv.TypeAndValue.TypeName = typeName;
+        nv.TypeAndValue.IsInterface = isIface;
+
+        auto* savedBB = builder->GetInsertBlock();
+        auto savedIt = builder->GetInsertPoint();
+        auto* savedFn = currentFunction;
+        currentFunction = b.GetInsertBlock()->getParent();
+        builder->SetInsertPoint(b.GetInsertBlock());
+        EmitOwningUniqueArrayCleanup(nv);
+        b.SetInsertPoint(builder->GetInsertBlock());
+        currentFunction = savedFn;
+        if (savedBB != nullptr) builder->SetInsertPoint(savedBB, savedIt);
+    }
+
     llvm::Function* GetOrCreateFullDestructor(const std::string& typeName)
     {
         // `string` full dtor is the lazily registered string dtor. Resolve live (never cache)
@@ -3047,7 +3069,7 @@ private:
         llvm::Function* userDtor = dsIt->second.Destructor;
 
         // Collect member fields that need destruction.
-        struct MemberWork { unsigned Index; llvm::Function* Dtor; bool IsUniquePtr; std::string TypeName; uint64_t AllocAlign; };
+        struct MemberWork { unsigned Index; llvm::Function* Dtor; bool IsUniquePtr; std::string TypeName; uint64_t AllocAlign; bool IsUniqueArray = false; bool IsIface = false; };
         std::vector<MemberWork> work;
         for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
         {
@@ -3058,6 +3080,18 @@ private:
                 && !f.IsBitfield && !f.IsPadding && f.ConstArraySize == 0)
             {
                 work.push_back({ i, GetFullDestructorForDelete(f.TypeName), true, f.TypeName, f.AllocAlignValue });
+                continue;
+            }
+            // `unique T* f[N]` / `unique IFace f[N]`, written or reached through a `unique` generic
+            // type argument: the struct owns every slot, so release element by element. Null slots
+            // are skipped by the scalar emitters, so a partially-filled array frees only live entries.
+            if ((f.IsUnique || f.IsUniqueTypeArg) && f.ConstArraySize > 0
+                && !f.ElemPointer && !f.IsArrayView && !f.IsSimd && !f.IsBitfield && !f.IsPadding
+                && f.ConstInnerDimensions.empty()
+                && (f.Pointer || (f.IsInterface && !f.IsInterfacePointer)))
+            {
+                bool iface = f.IsInterface && !f.IsInterfacePointer;
+                work.push_back({ i, nullptr, false, f.TypeName, f.AllocAlignValue, true, iface });
                 continue;
             }
             if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield || f.IsPadding)
@@ -3108,7 +3142,10 @@ private:
         for (const auto& w : work)
         {
             auto* fieldPtr = b.CreateStructGEP(structTy, self, w.Index, "fld");
-            if (w.IsUniquePtr)
+            if (w.IsUniqueArray)
+                EmitUniqueArrayFieldRelease(b, fieldPtr, structTy->getElementType(w.Index),
+                                            w.TypeName, w.IsIface, w.AllocAlign);
+            else if (w.IsUniquePtr)
                 EmitUniqueFieldDelete(b, fieldPtr, w.Dtor, w.TypeName, w.AllocAlign);
             else
                 // Scalar field: one call; owning fixed-array field: one call per element.
@@ -13669,7 +13706,7 @@ public:
             bool argIsUnbound = arg.Storage == nullptr
                 && FindVariableStorage(arg.CallerName).Storage == nullptr;
             bool argIsRValue = argIsUnbound && arg.FieldName.empty()
-                && !arg.TypeAndValue.Pointer && !arg.TypeAndValue.IsAliasTypeArg
+                && !arg.TypeAndValue.Pointer
                 && (arg.IsOwningString || arg.IsOwningStruct
                     || IsDataStructure(arg.TypeAndValue.TypeName));
             bool argOwning = arg.IsExplicitMove || argIsRValue;
