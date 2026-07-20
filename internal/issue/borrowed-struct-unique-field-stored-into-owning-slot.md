@@ -236,20 +236,20 @@ IR - `ret ptr %0` from a function whose LLVM return type is `%Holder` - and surf
 write a proper error message") this needs a real diagnostic at the return. A pointer is not a
 value struct; there is no ownership question here, just a missing type error.
 
-**J3 (bare POINTER return type) is NOT a defect - it is the C escape hatch. Do NOT reject it.**
-An earlier revision of this file called J3 a silent leak that must be rejected at the return.
-That was WRONG and acting on it would have broken deliberate, working behaviour. Re-measured:
+**J3: SUPERSEDED by the MAINTAINER RULING of 2026-07-20 below. J3 is now an ERROR.**
+
+A previous revision of this section said the bare pointer return was the C escape hatch and must
+NOT be rejected. That is no longer the rule. The escape hatch still exists, but it is now
+EXPLICIT: `alias T*`. See "IMPLEMENTED 2026-07-20: bare-pointer fresh-allocation return" below.
 
 | Mode | Signature | Caller | Result |
 |------|-----------|--------|--------|
-| C / manual (`scratch/moveborrow/l1.cb`) | `Holder* make()` | `Holder* b = make(); delete b;` | clean, exit 0 |
+| bare / unannotated (`scratch/moveborrow/l1.cb`) | `Holder* make()` | `Holder* b = make(); delete b;` | **now a compile ERROR** |
+| manual, explicit (`scratch/moveborrow/n1.cb`) | `alias Holder* make()` | `Holder* b = make(); delete b;` | clean, exit 0 |
 | RAII (`scratch/moveborrow/l2.cb`) | `move Holder* make()` | `unique Holder* b = make();` | clean, freed at scope exit |
 
-Bare pointer return means MANUAL lifetime - the C idiom, and `delete` works. The J3 "leak" was
-the repro never calling `delete`, which is C behaving like C, not a compiler bug. J4
-("cannot initialize unique 'b' from a borrowed value") is likewise CORRECT: adopting ownership
-requires the `move` return type, which is the RAII mode above. The two modes are already
-coherent and complete for pointers; the only thing to preserve here is that they stay that way.
+J4 ("cannot initialize unique 'b' from a borrowed value") remains CORRECT: adopting ownership
+requires the `move` return type.
 
 **Mixed returns must be rejected at the definition.** I1/I2 show ownership of the return value is
 branch-dependent under one signature, and J3/J4/J5 show no annotation makes such a function
@@ -305,3 +305,58 @@ site to transfer, or `alias` on the parameter to borrow explicitly.
 - This is the concrete cost of "no-copy is not no-alias": `unique` gained real copy suppression
   for all six lock types in commit `6e0a1c1`, but suppression does not reach a pointer that
   escapes inside a copied struct.
+
+## IMPLEMENTED 2026-07-20: bare-pointer fresh-allocation return is an ERROR
+
+Returning a FRESH ALLOCATION from a function whose declared return type is a BARE `T*` is now
+rejected. Rationale: a bare pointer return gives the caller no signal that it owns the result, so
+"the caller forgot to delete" is a silent leak the compiler should catch. Both remedies already
+existed and needed no new semantics; only the diagnostic was missing.
+
+Check: `cflat/MainListener.h`, in the return-statement handler, immediately after the
+interface-return ownership check. Gated on `AsDirectNew(assignExpr)`, a pointer return type that
+is not `move`, not `alias`, not returns-owned, and not an array view.
+
+Diagnostic names BOTH remedies: `move T*` (caller adopts with `unique T* x = f();`) and
+`alias T*` (caller manages the lifetime by hand).
+
+Regression test `Test/errors/err_return_new_from_bare_pointer_return.cb`, which also pins both
+remedies as positive cases. `Test/test_move.cb`'s `makeManual` migrated from a bare `FactoryHolder*`
+to `alias FactoryHolder*`, keeping it a positive guard for the new explicit escape hatch.
+
+### SCOPE: direct form only
+
+Only `return new T();` is covered. The two-step (`T* h = new T(); return h;`,
+`scratch/moveborrow/m1.cb`) and unique-local (`scratch/moveborrow/m5.cb`) forms leak identically
+and are NOT covered.
+
+Provenance IS reachable at the return for both - measured by probing the existing move-return
+ownership check, which accepts `move T* f() { T* h = new T(); return h; }` and the `unique` local
+form, so `IsOwningValue(right) || lastOwningResult` is already true there. The blocker is not
+information, it is BLAST RADIUS: widening the gate to indirect provenance was measured at
+**250 of 460 tests failing**, because it rejects `core/function.cb:12`
+(`i8* __closure_env_alloc(i64 n) { i8* base = new i8[n]; return base; }`) and other core
+allocator/closure primitives, which every program imports. Covering the indirect forms therefore
+requires migrating the core raw-memory plumbing to `alias`/`move` first; it is not a one-line
+widening.
+
+### Migration performed
+
+- `cflat/core/json.cb` and `cflat/core/xml.cb` `_allocNode()` -> `alias`. These are MIXED-return
+  arena allocators (arena node = caller must not free; heap node = caller frees), so `move` would
+  be actively WRONG - it would tell the caller to adopt arena memory, turning a leak into a double
+  free. `alias` is correct.
+- `alias` is VIRAL through locals: a local bound from an `alias` return cannot be returned from a
+  non-`alias` function. The json/xml migration therefore cascaded to every node-returning parser
+  helper (`_parseNumber/_parseLiteral/_parseObject/_parseArray/_parseValue`, `_parseElement`) and
+  to the public `JsonParser::parse`. That cascade is semantically right - the whole parsed node
+  graph is manually managed - but it is the main migration cost to expect elsewhere.
+- `Test/test_basic.cb:3411` (`return new double[n];`) is NOT hit: its return type is the array
+  view `alignas(0, 64) double[]`, and array-view returns are excluded from the check.
+
+### Measured blast radius (macOS, Release)
+
+Before migration: 2 failures (`test_move`, `test_reflect`) - both predicted sites, no surprises.
+After migration: `./test.sh Release` 460 passed / 0 failed / 8 skipped; `example_mac.sh` 35/0;
+`test_lsp.sh` 152/0. The rule is VIABLE - it rejected no legitimate site that lacked a correct
+one-word migration.

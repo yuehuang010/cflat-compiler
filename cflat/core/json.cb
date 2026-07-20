@@ -400,8 +400,9 @@ struct JsonParser
     int    _len   = 0;
     Arena* _arena = nullptr;
 
-    // Allocate a node from the arena when set, else from the heap.
-    JsonNode* _allocNode()
+    // Allocate a node from the arena when set, else from the heap. 'alias' because ownership is
+    // branch-dependent: arena nodes must not be freed, heap nodes are freed by the parser itself.
+    alias JsonNode* _allocNode()
     {
         if (_arena != nullptr)
             return (JsonNode*)_arena.zalloc((i64)sizeof(JsonNode));
@@ -511,7 +512,7 @@ struct JsonParser
     }
 
     // Parse a JSON number into an int or float node.
-    JsonNode* _parseNumber()
+    alias JsonNode* _parseNumber()
     {
         JsonNode* node = _allocNode();
         int start = _pos;
@@ -574,7 +575,7 @@ struct JsonParser
     }
 
     // Parse a true/false/null literal into a bool or null node.
-    JsonNode* _parseLiteral()
+    alias JsonNode* _parseLiteral()
     {
         JsonNode* node = _allocNode();
         if (_src[_pos] == 't') { node.kind = 1; node.boolVal = true;  _pos += 4; }
@@ -584,7 +585,7 @@ struct JsonParser
     }
 
     // Parse a {...} object into a keyed object node.
-    JsonNode* _parseObject()
+    alias JsonNode* _parseObject()
     {
         _consume(); // {
         JsonNode* node = _allocNode();
@@ -614,7 +615,7 @@ struct JsonParser
     }
 
     // Parse a [...] array into an array node.
-    JsonNode* _parseArray()
+    alias JsonNode* _parseArray()
     {
         _consume(); // [
         JsonNode* node = _allocNode();
@@ -637,7 +638,7 @@ struct JsonParser
     }
 
     // Parse any JSON value (string, object, array, literal, or number).
-    JsonNode* _parseValue()
+    alias JsonNode* _parseValue()
     {
         _skipWs();
         i8 c = _peek();
@@ -656,7 +657,7 @@ struct JsonParser
     }
 
     // Parse a top-level JSON object into a heap JsonNode tree; caller deletes it.
-    static JsonNode* parse(string json)
+    static alias JsonNode* parse(string json)
     {
         JsonParser p;
         p._src = json.data();

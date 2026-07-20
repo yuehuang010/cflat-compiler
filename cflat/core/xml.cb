@@ -412,8 +412,9 @@ struct XmlParser
     int    _len   = 0;
     Arena* _arena = nullptr;
 
-    // Allocate a node from the arena when set, else from the heap.
-    XmlNode* _allocNode()
+    // Allocate a node from the arena when set, else from the heap. 'alias' because ownership is
+    // branch-dependent: arena nodes must not be freed, heap nodes are freed by the parser itself.
+    alias XmlNode* _allocNode()
     {
         if (_arena != nullptr)
             return (XmlNode*)_arena.zalloc((i64)sizeof(XmlNode));
@@ -522,7 +523,7 @@ struct XmlParser
     }
 
     // Parse one element and return its node, or nullptr if at a closing tag or EOF.
-    XmlNode* _parseElement()
+    alias XmlNode* _parseElement()
     {
         _skipWs();
         if (_pos >= _len || _src[_pos] != '<') return nullptr;

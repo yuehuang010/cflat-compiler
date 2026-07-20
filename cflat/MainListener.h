@@ -4865,6 +4865,31 @@ public:
                                 compiler->currentFunctionReturnTypeName));
                         }
 
+                        // A FRESH ALLOCATION handed back through a BARE pointer return type gives the
+                        // caller no signal that it owns the result, so a forgotten 'delete' is a silent
+                        // leak. Require the intent to be explicit: 'move T*' transfers ownership (the
+                        // caller adopts with `unique T* x = f();`), 'alias T*' opts out of ownership
+                        // tracking and the caller frees by hand. Scoped to the DIRECT `return new T();`
+                        // form - indirect provenance (`T* h = new T(); return h;`) is not tracked here.
+                        if (assignExpr != nullptr && AsDirectNew(assignExpr) != nullptr
+                            && compiler->currentFunctionReturnTV.Pointer
+                            && !compiler->currentFunctionReturnTV.IsMove
+                            && !compiler->currentFunctionReturnTV.IsAlias
+                            && !compiler->currentFunctionReturnsOwned
+                            && !compiler->currentFunctionReturnIsArrayView
+                            && compiler->currentFunction != nullptr
+                            && compiler->currentFunction->getReturnType()->isPointerTy())
+                        {
+                            LogErrorContext(jump, std::format(
+                                "returning a fresh allocation from a function whose return type is the bare "
+                                "pointer '{}*' gives the caller no signal that it owns the result - a forgotten "
+                                "'delete' is a silent leak. Declare the return type 'move {}*' to transfer "
+                                "ownership to the caller (which adopts it with 'unique {}* x = f();'), or "
+                                "'alias {}*' to opt out of ownership tracking and manage the lifetime by hand.",
+                                compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName,
+                                compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName));
+                        }
+
                         // The mirror image: an INTERFACE VALUE returned from a function whose declared
                         // return type is not that interface (e.g. a `View*` factory whose body now
                         // returns an `IView`). The ret operand would be a fat pointer against a

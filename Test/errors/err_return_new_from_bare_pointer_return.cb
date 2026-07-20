@@ -1,0 +1,21 @@
+// Returning a fresh allocation through a BARE pointer return type gives the caller no ownership
+// signal, so a forgotten 'delete' is a silent leak. The sanctioned spellings are 'move T*'
+// (caller adopts with `unique T* x = f();`) and 'alias T*' (caller frees by hand).
+struct Leaky { int v = 0; };
+
+expect_error("returning a fresh allocation from a function whose return type is the bare pointer 'Leaky*'") {
+    Leaky* makeLeaky() { return new Leaky(); }
+}
+
+// Both remedies must stay legal.
+move Leaky* makeOwned() { return new Leaky(); }
+alias Leaky* makeManual() { return new Leaky(); }
+
+extern int main()
+{
+    unique Leaky* a = makeOwned();
+    Leaky* b = makeManual();
+    delete b;
+    printf("PASS: expected error received\n");
+    return 0;
+}
