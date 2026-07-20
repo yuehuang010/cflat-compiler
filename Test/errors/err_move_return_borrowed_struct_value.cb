@@ -1,0 +1,12 @@
+// A borrowed by-value struct parameter is not owned, so returning it from a function that
+// declares a 'move' VALUE return type made the caller a second owner of the same `unique`
+// pointee (double free). The pointer form of this check already existed; this pins the
+// value-struct form.
+struct Payload { int v = 0; ~Payload() { printf("pdtor\n"); } };
+struct Holder  { unique Payload* p = nullptr; };
+
+expect_error("function declares 'move' return type but returned expression is not owned") {
+    move Holder passthru(Holder h) { return h; }
+}
+
+extern int main() { return 0; }

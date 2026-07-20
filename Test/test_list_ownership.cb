@@ -36,6 +36,20 @@ class NonCopyable
     unique Res* r = default;
 };
 
+// Transitive: the unique pointer is one level down, reached through a by-value member.
+// Pins the recursive walk in TypeOwnsUniquePointer, not just the direct-field case.
+class NestedNonCopyable
+{
+    NonCopyable inner = default;
+};
+
+// A user-written copy() opts a unique-owning type back in to copyability.
+class CopyableOwner
+{
+    unique Res* r = default;
+    CopyableOwner copy() { CopyableOwner c; return move c; }
+};
+
 interface IShape { int area(); };
 
 class Sq : IShape
@@ -367,6 +381,8 @@ int testIsCopyable()
     CopyProbe<IShape> f = default;
     CopyProbe<Val> g = default;
     CopyProbe<NonCopyable> h = default;
+    CopyProbe<NestedNonCopyable> i = default;
+    CopyProbe<CopyableOwner> j = default;
     passed += Test("is_copyable(int)", a.copyable(), 1);
     passed += Test("is_copyable(Res*)", b.copyable(), 1);
     passed += Test("is_copyable(unique Res*)", c.copyable(), 1);
@@ -374,6 +390,8 @@ int testIsCopyable()
     passed += Test("is_copyable(IShape)", f.copyable(), 1);
     passed += Test("is_copyable(Val)", g.copyable(), 1);
     passed += Test("is_copyable(NonCopyable)", h.copyable(), 0);
+    passed += Test("is_copyable(NestedNonCopyable)", i.copyable(), 0);
+    passed += Test("is_copyable(CopyableOwner)", j.copyable(), 1);
     return passed;
 }
 
@@ -398,7 +416,7 @@ extern int main()
     total += 5;  passed += testCopyBorrowedPointer();
     total += 7;  passed += testIListContract();
     total += 3;  passed += testNonCopyableMoveOnly();
-    total += 7;  passed += testIsCopyable();
+    total += 9;  passed += testIsCopyable();
     total += 7;  passed += testSort();
 
     // Every ownership rule above is only meaningful if nothing leaked.

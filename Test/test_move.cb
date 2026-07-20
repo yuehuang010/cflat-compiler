@@ -848,9 +848,53 @@ int testStructWithStringFieldIntoList()
 
 // D4/D5: `unique` on a local/parameter. A `unique X*` local is an owning location; a
 // `unique X*` parameter is a synthesized move parameter. All checks are dtor-count based.
+// A `move` parameter of a struct type OWNS its copy, so assigning it into an owning slot must
+// TRANSFER (exactly as an owned local does). Copying instead left two owners of one `unique`
+// pointer and double-freed when the parameter destructed at function exit.
+struct MoveParamHolder { unique Resource* p = nullptr; };
+MoveParamHolder moveParamSink = default;
+void stashOwnedHolder(move MoveParamHolder h) { moveParamSink = h; }
+
+// The two POINTER-return factory modes must both stay legal. These pin them against an
+// over-eager rejection of `return new T()` (which is only an error for a VALUE return type).
+struct FactoryHolder { unique Resource* p = nullptr; };
+// C / manual mode: a bare pointer return means the caller owns the lifetime by hand.
+FactoryHolder* makeManual() { return new FactoryHolder(); }
+// RAII mode: a 'move' pointer return transfers ownership to a `unique` local.
+move FactoryHolder* makeOwning() { return new FactoryHolder(); }
+
 int testUniqueLocalAndParam()
 {
     int passed = 0;
+
+    // C escape hatch: bare pointer return, explicit `delete` frees the payload exactly once.
+    dtorCount = 0;
+    {
+        FactoryHolder* m = makeManual();
+        m->p = new Resource();
+        delete m;
+    }
+    passed += Test("bare_ptr_factory_manual_delete", dtorCount, 1);
+
+    // RAII mode: `move` pointer return adopted by a `unique` local, freed once at scope exit.
+    dtorCount = 0;
+    {
+        unique FactoryHolder* o = makeOwning();
+        o->p = new Resource();
+    }
+    passed += Test("move_ptr_factory_unique_local", dtorCount, 1);
+
+    // Assignment from a `move` struct parameter transfers: nothing is freed while the pointee
+    // is still owned, and clearing the destination field frees it exactly once.
+    dtorCount = 0;
+    {
+        MoveParamHolder a = default;
+        a.p = new Resource();
+        stashOwnedHolder(move a);
+    }
+    passed += Test("move_param_struct_assign_transfers", dtorCount, 0);
+    moveParamSink.p = nullptr;
+    passed += Test("move_param_struct_assign_freed_once", dtorCount, 1);
 
     // D5: unique local from new is an owning location - freed exactly once at scope exit.
     dtorCount = 0;
@@ -1257,7 +1301,7 @@ extern int main()
     total += 3;
 
     passed += testUniqueLocalAndParam();
-    total += 4;
+    total += 8;
 
     passed += testValueMoveArgDeferred();
     total += 5;

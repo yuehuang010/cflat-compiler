@@ -4809,6 +4809,37 @@ public:
                                 LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
                         }
 
+                        // Same ownership rule as above, widened to BY-VALUE STRUCT returns. A
+                        // borrowed by-value struct parameter is not owned, so handing it back as a
+                        // 'move' result makes the caller a second owner of the same unique pointee.
+                        // A 'move S' struct-VALUE return is deliberately not `currentFunctionReturnsOwned`
+                        // (see the NOTE on ComputeReturnsOwned), so key off the declared return type.
+                        if (compiler->currentFunctionReturnTV.IsMove
+                            && !compiler->currentFunctionReturnTV.Pointer
+                            && right != nullptr
+                            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)
+                            && IsBorrowedStructParameter(compiler, returnNV.CallerName))
+                        {
+                            LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
+                        }
+
+                        // `return new T();` where the declared return type is the VALUE struct 'T'.
+                        // The operand is a 'T*' against a struct return type - LLVM rejects the
+                        // module with no source location, so diagnose it here instead.
+                        if (right != nullptr && returnNV.TypeAndValue.Pointer
+                            && compiler->currentFunction != nullptr
+                            && compiler->currentFunction->getReturnType()->isStructTy()
+                            && !returnNV.TypeAndValue.TypeName.empty()
+                            && returnNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName)
+                        {
+                            LogErrorContext(jump, std::format(
+                                "cannot return pointer '{}*' from a function declared to return value type '{}' - "
+                                "declare the return type '{}*' (or 'move {}*' to transfer ownership to the caller), "
+                                "or dereference the pointer to return a copy.",
+                                returnNV.TypeAndValue.TypeName, compiler->currentFunctionReturnTypeName,
+                                compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName));
+                        }
+
                         // Inverse check, scoped to INTERFACE returns. A concrete implementer pointer
                         // boxed into an interface return is still a bare pointer here (boxing happens
                         // just below). The caller receives a { vtable, data } fat pointer with no idea
@@ -9174,7 +9205,9 @@ public:
                 && rightNV.Storage != nullptr
                 && (llvm::isa<llvm::AllocaInst>(rightNV.Storage) || llvm::isa<llvm::GlobalVariable>(rightNV.Storage))
                 && !rightNV.CallerName.empty()
-                && !rightNV.TypeAndValue.IsMove
+                // A `move` PARAMETER is an owner (IsOwningStruct) and destructs at function exit,
+                // so assigning it into an owning slot must TRANSFER just like an owned local.
+                && (!rightNV.TypeAndValue.IsMove || rightNV.IsOwningStruct)
                 && !rightNV.TypeAndValue.Pointer
                 && !rightNV.TypeAndValue.IsArrayView
                 && !rightNV.TypeAndValue.IsInterfacePointer
@@ -13245,10 +13278,48 @@ public:
         return false;
     }
 
+    /*
+     * True when `name` is a by-value STRUCT parameter of the current function that was NOT
+     * declared `move` - i.e. the callee only borrows the caller's struct. Moving a `unique`
+     * field out of such a parameter nulls the callee's copy while the caller's original still
+     * holds the pointer, so both free it. A `move` parameter (leg E) owns its copy and is safe.
+     */
+    bool IsBorrowedStructParameter(LLVMBackend* compiler, const std::string& name)
+    {
+        if (compiler == nullptr || name.empty()) return false;
+        if (!compiler->IsFunctionParameter(name)) return false;
+        auto nv = compiler->GetScopedLocalOrArgument(name);
+        if (nv.TypeAndValue.Pointer || nv.TypeAndValue.IsMove || nv.IsOwningStruct) return false;
+        return compiler->IsDataStructure(nv.TypeAndValue.TypeName);
+    }
+
+    // The variable an alias-origin description like "h.p" was reached through ("h"); the whole
+    // string when there is no dot.
+    static std::string BorrowedOriginRoot(const std::string& origin)
+    {
+        auto dot = origin.find('.');
+        return dot == std::string::npos ? origin : origin.substr(0, dot);
+    }
+
     LLVMBackend::NamedVariable ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto argNV = ParseUnaryExpression(ctx->unaryExpression());
+
+        // Reject 'move h.p' where `h` is a BORROWED by-value struct parameter: the move nulls the
+        // callee's copy of the field, but the caller's original still holds the pointer, so both
+        // synthesized destructors free it. Declaring the parameter 'move' makes the callee the owner.
+        if (!argNV.OwningStructName.empty()
+            && IsBorrowedStructParameter(compiler, argNV.TypeAndValue.ParentVariableName))
+        {
+            const std::string& parent = argNV.TypeAndValue.ParentVariableName;
+            LogErrorContext(ctx, std::format(
+                "cannot 'move' field '{}.{}' out of borrowed by-value parameter '{}' - the move nulls "
+                "only the callee's copy, so the caller's struct still frees the pointee (double-free). "
+                "Declare the parameter 'move {}' to take ownership, or 'alias {}' to borrow explicitly.",
+                argNV.OwningStructName, argNV.FieldName, parent, parent, parent));
+            return {};
+        }
 
         // Reject 'move param->field' (or any field whose parent traces to a borrowed
         // parameter): the caller still owns the parent struct and will see a nulled field
@@ -13271,12 +13342,25 @@ public:
         // that assertion cannot hold, because the field's destructor is synthesized and will run.
         if (!argNV.BorrowedUniqueField.empty())
         {
-            LogErrorContext(ctx, std::format(
-                "cannot 'move' '{}' - it aliases unique field '{}', and moving the alias does not "
-                "null the field, so the field's synthesized destructor still frees the pointee. "
-                "Use 'move {}' to move the field itself (which nulls it).",
-                argNV.CallerName.empty() ? argNV.BorrowedOrigin : argNV.CallerName,
-                argNV.BorrowedUniqueField, argNV.BorrowedOrigin));
+            std::string name = argNV.CallerName.empty() ? argNV.BorrowedOrigin : argNV.CallerName;
+            std::string root = BorrowedOriginRoot(argNV.BorrowedOrigin);
+            // 'move <origin>' is the right remedy only when the struct holding the field is OWNED.
+            // If it is a borrowed by-value parameter, that advice is itself a double-free.
+            if (IsBorrowedStructParameter(compiler, root))
+                LogErrorContext(ctx, std::format(
+                    "cannot 'move' '{}' - it aliases unique field '{}', and moving the alias does not "
+                    "null the field, so the field's synthesized destructor still frees the pointee. "
+                    "'move {}' is not a remedy here either: '{}' is a borrowed by-value parameter, so "
+                    "it would null only the callee's copy. Declare the parameter 'move {}' to take "
+                    "ownership, or 'alias {}' to borrow explicitly.",
+                    name, argNV.BorrowedUniqueField, argNV.BorrowedOrigin, root, root, root));
+            else
+                LogErrorContext(ctx, std::format(
+                    "cannot 'move' '{}' - it aliases unique field '{}', and moving the alias does not "
+                    "null the field, so the field's synthesized destructor still frees the pointee. "
+                    "Use 'move {}' to move the field itself (which nulls it), provided the struct "
+                    "holding it is owned here.",
+                    name, argNV.BorrowedUniqueField, argNV.BorrowedOrigin));
             return {};
         }
 
@@ -13382,6 +13466,11 @@ public:
         result.BaseType       = ptrVal ? ptrVal->getType() : nullptr;
         result.TypeAndValue   = argNV.TypeAndValue;
         result.AllocAlignment = argNV.AllocAlignment;
+        // A 'move' of a BORROWED pointer parameter transfers nothing - the caller still owns the
+        // pointee. Carry the provenance so a store into a `unique` field (a deferred delete, exactly
+        // like the already-blocked `delete b`) is rejected instead of double-freeing.
+        result.IsBorrowed     = argNV.IsBorrowed;
+        result.BorrowedOrigin = argNV.BorrowedOrigin;
         return result;
     }
 

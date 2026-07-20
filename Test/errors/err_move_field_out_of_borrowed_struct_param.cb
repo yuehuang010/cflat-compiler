@@ -1,0 +1,17 @@
+// 'move h.p' where h is a BORROWED by-value struct parameter nulls only the callee's copy of
+// the field; the caller's original still holds the pointer, so both synthesized destructors
+// free it. Declaring the parameter 'move' makes the callee the owner and the move legal.
+
+struct Payload { int v = 0; };
+struct Holder  { unique Payload* p = nullptr; };
+
+Holder stash = default;
+
+expect_error("cannot 'move' field 'Holder.p' out of borrowed by-value parameter 'h'") {
+    void badFieldMove(Holder h) { stash.p = move h.p; }
+}
+
+// The same field move out of an OWNED ('move') parameter is the sanctioned transfer.
+void goodFieldMove(move Holder h) { stash.p = move h.p; }
+
+extern int main() { return 0; }

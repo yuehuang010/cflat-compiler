@@ -1,0 +1,17 @@
+// 'move' of a borrowed (non-move) POINTER parameter into a `unique` field is a deferred
+// delete of a pointer the caller still owns - the field's synthesized destructor frees it,
+// and so does the caller. Writing 'move' must not launder the borrow.
+
+struct Payload { int v = 0; };
+struct Holder  { unique Payload* p = nullptr; };
+
+Holder stash = default;
+
+expect_error("cannot store borrowed parameter 'b' into unique field 'Holder.p'") {
+    void badStash(Payload* b) { stash.p = move b; }
+}
+
+// A 'move' parameter transfers ownership - storing it into the unique field is valid.
+void goodStash(move Payload* b) { stash.p = b; }
+
+extern int main() { return 0; }

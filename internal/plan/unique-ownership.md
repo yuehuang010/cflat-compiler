@@ -392,9 +392,27 @@ count does not need doubling.
 - **Lifetime / dangling for borrowed containers: ignored, none planned.** A `list<T*>` outliving
   its owner is undetectable. The hazard pre-existed unnamed; borrow-by-default makes it the
   blessed pattern, which raises the stakes but does not change the risk.
-- **Blocker 1 remains unresolved, but is DORMANT.** A plain by-value param still BORROWS an
-  owning value while local init MOVES it. Nothing currently exercises the gap, but the asymmetry
-  is still in the language and will resurface for the next generic that stores a value param.
+- **Blocker 1 is NO LONGER DORMANT - it is a reachable double free.** A plain by-value param
+  BORROWS an owning value while local init MOVES it. Storing that borrowed struct into an owning
+  slot duplicates a `unique` pointer into two owners and aborts at teardown, with no diagnostic.
+  NOT a lifetime bug: it reproduces with both values in the same scope, so the
+  "lifetime/dangling is ignored" ruling below does not cover it.
+  **RULED 2026-07-20: this is NOT a language-design issue and needs no borrow/move redesign.**
+  A six-leg measured matrix (`internal/issue/borrowed-struct-unique-field-stored-into-owning-slot.md`,
+  repros in `scratch/moveborrow/`) shows assignment into a `unique` slot already transfers
+  correctly from an owned local and from a new'd local pointer. What is missing is diagnostics on
+  stores that CANNOT transfer, plus one unrecognised owner. All four items below are DONE
+  (2026-07-20); the remaining gap is the by-value RETURN escape, see the issue file. Items:
+  1. `move` of a borrowed POINTER param into a unique field must error - route through the
+     existing borrowed-param check at `MainListener.h:12955` (`delete` of one is already blocked;
+     a store into a unique field is a deferred delete). Not covered by any call-boundary rule,
+     since a bare `T*` param is copyable and stays so.
+  2. `move` of a field out of a BORROWED struct param must error. The compiler currently routes
+     users INTO this: the existing (correct) alias diagnostic recommends `move h.p`, which is
+     safe when `h` is owned and a double free when `h` is borrowed.
+  3. Assignment from a `move` PARAM into an owning slot must transfer, matching the owned-local
+     path that already works.
+  4. After (2), split the alias diagnostic's wording on borrowed vs owned source.
 - **Standing question (positional asymmetry):** bare `Circle* c = new Circle();` is owning while
   bare `list<Circle*>` is borrowed - same spelling, opposite defaults by position. Endpoint (a),
   containers erase provenance so they force you to say it, is where the design landed. Endpoint

@@ -1,0 +1,11 @@
+// `return new T();` from a function whose declared return type is the VALUE struct 'T'.
+// The operand is a 'T*' against a struct return type; without this diagnostic the compiler
+// emitted invalid IR and failed late with a bare "module verification failed".
+struct Payload { int v = 0; ~Payload() { printf("pdtor\n"); } };
+struct Holder  { unique Payload* p = nullptr; ~Holder() { printf("hdtor\n"); } };
+
+expect_error("cannot return pointer 'Holder*' from a function declared to return value type 'Holder'") {
+    Holder mk() { return new Holder(); }
+}
+
+extern int main() { return 0; }
