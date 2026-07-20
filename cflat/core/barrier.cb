@@ -41,7 +41,10 @@ import "intrinsic.cb";   // pause() - spin-loop hint (x86; compiles away elsewhe
 // ---------------------------------------------------------------------------
 struct barrier {
     mutex _mtx        = default;
-    void* _cv         = nullptr;   // condvar slot: Win32 CONDITION_VARIABLE inline / POSIX heap pthread_cond_t*
+    // unique: copy suppression only. cv_destroy (os.cond_destroy) nulls the slot
+    // after releasing it, so the synthesized null-checked delete never fires.
+    // Removing that null turns this into a delete on non-`new` memory.
+    unique void* _cv  = nullptr;   // condvar slot: Win32 CONDITION_VARIABLE inline / POSIX heap pthread_cond_t*
     int   _total      = 0;         // participants expected each phase (N)
     int   _count      = 0;         // arrivals still pending in the current phase
     u64   _generation = 0;         // phase id; bumped when a phase completes
@@ -101,8 +104,9 @@ struct barrier {
         _mtx.destroy();     // POSIX: free the heap mutex. Windows: SRW no-op.
     }
 
-    // RAII teardown. MUST NOT BE COPIED - the void* slots have no copy
-    // suppression, so a copy would double-destroy one OS condvar.
+    // RAII teardown. `unique` on _cv (and transitively via _mtx) suppresses copy,
+    // so a barrier cannot be duplicated into two owners that would both destroy
+    // one OS condvar/mutex.
     ~barrier() {
         destroy();
     }

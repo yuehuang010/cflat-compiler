@@ -761,10 +761,19 @@ namespace os
         }
     }
 
-    void sem_destroy(void* s) {
+    // Takes the slot by address and nulls it after releasing, matching
+    // mutex_destroy/cond_destroy/rwlock_destroy. Load-bearing for semaphore's
+    // `unique void* _handle`: a plain `_handle = nullptr;` assignment at the
+    // call site would be treated as a unique-field reassignment and trigger a
+    // synthesized delete of the OLD (already-freed) handle - a double free.
+    // Nulling here, through the pointer, is a plain store the compiler does
+    // not intercept.
+    void sem_destroy(void** slot) {
+        void* s = slot[0];
         if (s == nullptr) return;
         if const (__WINDOWS__) { os.windows.CloseHandle(s); }
         else { os.posix.sem_destroy(s); free(s); }
+        slot[0] = nullptr;
     }
 
     // === Event (manual-reset) ==============================================
@@ -806,7 +815,15 @@ namespace os
         }
     }
 
-    void event_destroy(void* handle) {
+    // Takes the slot by address and nulls it after releasing, matching
+    // mutex_destroy/cond_destroy/rwlock_destroy. Load-bearing for event's
+    // `unique void* _h`: a plain `_h = nullptr;` assignment at the call site
+    // would be treated as a unique-field reassignment and trigger a
+    // synthesized delete of the OLD (already-freed) handle - a double free.
+    // Nulling here, through the pointer, is a plain store the compiler does
+    // not intercept.
+    void event_destroy(void** slot) {
+        void* handle = slot[0];
         if (handle == nullptr) return;
         if const (__WINDOWS__) { os.windows.CloseHandle(handle); }
         else {
@@ -815,6 +832,7 @@ namespace os
             if (e->_mtx != nullptr) { os.posix.pthread_mutex_destroy(e->_mtx); free(e->_mtx); }
             free(handle);
         }
+        slot[0] = nullptr;
     }
 
     // === Threads ===========================================================

@@ -24,7 +24,10 @@ import "interfaces.cb";
 // [Capability(ILockable)]: acquire()/release() make `lock (s) { }` legal on a semaphore.
 [Capability(ILockable)]
 struct semaphore {
-    void* _handle = nullptr;
+    // unique: copy suppression only. os.sem_destroy nulls the slot after
+    // releasing it, so the synthesized null-checked delete never fires. Removing
+    // that null turns this into a delete on non-`new` memory.
+    unique void* _handle = nullptr;
 
     // Create the semaphore.  Must be called before acquire/release.
     //   initial   - starting signal count (0 = fully blocked)
@@ -51,17 +54,15 @@ struct semaphore {
         os.sem_post(_handle, n);
     }
 
-    // Release the OS object. Idempotent: the handle is nulled, so a later
-    // destructor call is a no-op.
+    // Release the OS object. Idempotent: os.sem_destroy nulls _handle through
+    // the pointer, so a later destructor call is a no-op. Do NOT assign
+    // `_handle = nullptr` here directly - see os.sem_destroy's comment.
     void destroy() {
-        if (_handle != nullptr) {
-            os.sem_destroy(_handle);   // os.sem_destroy frees the block; do not free here.
-            _handle = nullptr;
-        }
+        os.sem_destroy(&_handle);
     }
 
-    // RAII teardown. MUST NOT BE COPIED - there is no copy suppression for a
-    // void* handle, so a copy would double-destroy one OS semaphore.
+    // RAII teardown. `unique` on _handle suppresses copy, so a semaphore cannot be
+    // duplicated into two owners that would both try to destroy one OS semaphore.
     ~semaphore() {
         destroy();
     }

@@ -6,7 +6,10 @@ import "os.cb";
 // Manual-reset event: once set(), it stays signaled until destroyed, so every
 // past and future wait() returns immediately (no missed-wakeup race).
 struct event {
-    void* _h = nullptr;   // opaque event handle owned by os.* (see os.cb event_* ).
+    // unique: copy suppression only. os.event_destroy nulls the slot after
+    // releasing it, so the synthesized null-checked delete never fires. Removing
+    // that null turns this into a delete on non-`new` memory.
+    unique void* _h = nullptr;
 
     // Create the event (starts unsignaled).
     void init() {
@@ -23,17 +26,15 @@ struct event {
         os.event_wait(_h);
     }
 
-    // Release the OS event. Idempotent: the handle is nulled, so a later
-    // destructor call is a no-op.
+    // Release the OS event. Idempotent: os.event_destroy nulls _h through the
+    // pointer, so a later destructor call is a no-op. Do NOT assign
+    // `_h = nullptr` here directly - see os.event_destroy's comment.
     void destroy() {
-        if (_h != nullptr) {
-            os.event_destroy(_h);
-            _h = nullptr;
-        }
+        os.event_destroy(&_h);
     }
 
-    // RAII teardown. MUST NOT BE COPIED - there is no copy suppression for a
-    // void* handle, so a copy would double-destroy one OS event.
+    // RAII teardown. `unique` on _h suppresses copy, so an event cannot be
+    // duplicated into two owners that would both try to destroy one OS event.
     ~event() {
         destroy();
     }
