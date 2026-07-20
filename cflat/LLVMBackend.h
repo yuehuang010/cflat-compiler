@@ -709,7 +709,7 @@ public:
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
         bool IsExplicitMove = false;
         bool MovedIntoInterface = false; // compile-time: ownership was boxed into an interface local ('IFace x = ptr'); 'delete ptr' is a no-op that leaks - delete the interface instead
-        std::set<std::string> MovedFields; // compile-time: field names moved out of this variable via a 'move' of a sub-path (e.g. `node->left`) - the base stays usable
+        std::unordered_set<std::string> MovedFields; // compile-time: field names moved out of this variable via a 'move' of a sub-path (e.g. `node->left`) - the base stays usable
         bool IsBonded = false;           // compile-time: true when this variable holds a bonded (borrowed) return value
         bool BondByAddress = false;      // bond originates from a by-address lambda capture; reassigning the source is safe
         std::vector<std::string> BondedSources; // names of bond parameters this value borrows from
@@ -3032,6 +3032,29 @@ private:
         if (savedBB != nullptr) builder->SetInsertPoint(savedBB, savedIt);
     }
 
+    // Release a scalar `unique IFace` FIELD (a {i8*,i8*} fat pointer) from the synthesized
+    // destructor, reusing the same vtable-dtor-slot walk a `unique` interface LOCAL gets.
+    void EmitUniqueInterfaceFieldRelease(llvm::IRBuilder<>& b, llvm::Value* fieldPtr,
+                                         const std::string& ifaceName)
+    {
+        if (fieldPtr == nullptr || b.GetInsertBlock() == nullptr) return;
+        NamedVariable nv;
+        nv.Storage = fieldPtr;
+        nv.BaseType = GetFatPtrType();
+        nv.TypeAndValue.TypeName = ifaceName;
+        nv.TypeAndValue.IsInterface = true;
+
+        auto* savedBB = builder->GetInsertBlock();
+        auto savedIt = builder->GetInsertPoint();
+        auto* savedFn = currentFunction;
+        currentFunction = b.GetInsertBlock()->getParent();
+        builder->SetInsertPoint(b.GetInsertBlock());
+        EmitOwningInterfaceCleanup(nv);
+        b.SetInsertPoint(builder->GetInsertBlock());
+        currentFunction = savedFn;
+        if (savedBB != nullptr) builder->SetInsertPoint(savedBB, savedIt);
+    }
+
     llvm::Function* GetOrCreateFullDestructor(const std::string& typeName)
     {
         // `string` full dtor is the lazily registered string dtor. Resolve live (never cache)
@@ -3069,7 +3092,7 @@ private:
         llvm::Function* userDtor = dsIt->second.Destructor;
 
         // Collect member fields that need destruction.
-        struct MemberWork { unsigned Index; llvm::Function* Dtor; bool IsUniquePtr; std::string TypeName; uint64_t AllocAlign; bool IsUniqueArray = false; bool IsIface = false; };
+        struct MemberWork { unsigned Index; llvm::Function* Dtor; bool IsUniquePtr; std::string TypeName; uint64_t AllocAlign; bool IsUniqueArray = false; bool IsIface = false; bool IsUniqueIface = false; };
         std::vector<MemberWork> work;
         for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
         {
@@ -3078,12 +3101,21 @@ private:
             // pushed even when the pointee is trivially destructible - the block still needs freeing.
             // IsUniqueTypeArg matches the array arm below: a scalar field made `unique` by generic
             // substitution (`struct Holder<T> { T _v; }` as `Holder<unique C*>`) was released by
-            // nothing and leaked silently. A boxed `unique IFace` is a fat pointer, so !f.Pointer
-            // excludes it - it still leaks, and needs the IsIface emitter the array arm has.
+            // nothing and leaked silently.
             if ((f.IsUnique || f.IsUniqueTypeArg) && f.Pointer && !f.ElemPointer && !f.IsArrayView && !f.IsSimd
                 && !f.IsBitfield && !f.IsPadding && f.ConstArraySize == 0)
             {
                 work.push_back({ i, GetFullDestructorForDelete(f.TypeName), true, f.TypeName, f.AllocAlignValue });
+                continue;
+            }
+            // Scalar `unique IFace field`: a boxed interface value is a {i8*,i8*} fat pointer, so
+            // f.Pointer is false above. Route it to the fat-pointer-aware emitter (vtable dtor
+            // slot + operator delete), the same release the array arm gives each element.
+            if ((f.IsUnique || f.IsUniqueTypeArg) && f.IsInterface && !f.IsInterfacePointer
+                && !f.ElemPointer && !f.IsArrayView && !f.IsSimd && !f.IsBitfield && !f.IsPadding
+                && f.ConstArraySize == 0)
+            {
+                work.push_back({ i, nullptr, false, f.TypeName, 0, false, true, true });
                 continue;
             }
             // `unique T* f[N]` / `unique IFace f[N]`, written or reached through a `unique` generic
@@ -3146,7 +3178,9 @@ private:
         for (const auto& w : work)
         {
             auto* fieldPtr = b.CreateStructGEP(structTy, self, w.Index, "fld");
-            if (w.IsUniqueArray)
+            if (w.IsUniqueIface)
+                EmitUniqueInterfaceFieldRelease(b, fieldPtr, w.TypeName);
+            else if (w.IsUniqueArray)
                 EmitUniqueArrayFieldRelease(b, fieldPtr, structTy->getElementType(w.Index),
                                             w.TypeName, w.IsIface, w.AllocAlign);
             else if (w.IsUniquePtr)
@@ -15281,7 +15315,7 @@ public:
     struct MovedStateSnapshot
     {
         std::map<std::string, bool> moved;
-        std::map<std::string, std::set<std::string>> movedFields;
+        std::map<std::string, std::unordered_set<std::string>> movedFields;
     };
 
     // Snapshots the IsMoved flag and per-field moved set for all variables in all active scopes.
@@ -15344,7 +15378,7 @@ public:
             auto ef = elseState.movedFields.find(name);
             if (tf != thenState.movedFields.end() && ef != elseState.movedFields.end())
             {
-                std::set<std::string> merged = tf->second;
+                std::unordered_set<std::string> merged = tf->second;
                 merged.insert(ef->second.begin(), ef->second.end());
                 nv.MovedFields = std::move(merged);
             }

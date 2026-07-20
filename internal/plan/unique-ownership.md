@@ -156,12 +156,16 @@ the call sites - C#-like local readability, with the complexity paid once in the
    null-checked, so it degrades to a no-op. This is not luck - the wrapper runs the user dtor
    FIRST precisely so hand-written free-and-null logic wins (see "Rules that still bind").
 
-   **THE REMAINING GAP: scalar `unique IFace` is still released by nothing.** The widened guard
-   requires `f.Pointer`, and a boxed interface value is a `{i8*,i8*}` fat pointer, so
-   `Holder<unique IShape>` still measures `dtor=0 leaks=1`. It fails SAFELY - declining the case
-   rather than handing a fat pointer to a raw-pointer emitter, which would corrupt. Closing it
-   means plumbing the `IsIface` flag and fat-pointer emitter the array arm already carries.
-   Filed: `internal/issue/unique-iface-scalar-field-not-released.md`.
+   **The scalar `unique IFace` gap - CLOSED 2026-07-20.** The widened guard required `f.Pointer`,
+   and a boxed interface value is a `{i8*,i8*}` fat pointer, so `Holder<unique IShape>` measured
+   `dtor=0 leaks=1`. Closed by giving the scalar arm its own interface branch
+   (`f.IsInterface && !f.IsInterfacePointer`) routing to `EmitUniqueInterfaceFieldRelease`, which
+   retargets the builder at the wrapper body and reuses `EmitOwningInterfaceCleanup` (vtable dtor
+   slot + `operator delete`) - the same release the array arm gives each element. Both spellings
+   now measure `dtor=1 leaks=0`. With the destructor able to express it, `ValidateUniqueField`
+   was relaxed for the interface-VALUE case, so a WRITTEN `unique IShape x;` field is now legal
+   in both scalar and fixed-array shape. `Test/errors/err_unique_fixed_array.cb` swapped its
+   now-stale interface rejection for a still-valid double-indirection one. Issue file deleted.
 
 4. **Teardown gaps in core - DONE 2026-07-20, with two documented SKIPS.** The RAII ruling
    below was executed. Six types went RAII, two were skipped with filed evidence. See the
@@ -404,12 +408,39 @@ count does not need doubling.
 
 ### Polish debt
 
-- `delete` on a unique LOCAL reports a message worded "unique field" (Part II Stage 3).
-- Part I "Non-blocking cleanups": dead `TypeOwnsUniquePointer` bail in
-  `GetOrCreateMemberwiseCopy`; Trap A prints `unique field ''` for bare self-field access;
-  `unique int x[4]` reports a pointer-flavored message; one duplicate test in `test_move.cb`; a
-  stale "frees and nulls" comment; `std::set` vs `unordered_set` inconsistency. Not re-verified
-  since 2026-07-16 - some may have been cleaned up in passing.
+RE-VERIFIED 2026-07-20 (see Completed ledger for the fix commit-in-progress). Five of the
+seven filed items were already stale (fixed in passing by later work) and reproduced clean;
+two were real and fixed:
+- `delete` on a unique LOCAL: STALE. Already reports "cannot delete unique local 'n' - a unique
+  local is freed automatically at scope exit ...", not "unique field".
+- Dead `TypeOwnsUniquePointer` bail in `GetOrCreateMemberwiseCopy`: STALE AS DESCRIBED - no such
+  bail exists inside that function (never has, per `git log -S`). The only `TypeOwnsUniquePointer`
+  gate is the choke point in `CreateOverloadedFunctionCall` (before the call to
+  `GetOrCreateMemberwiseCopy`), and it is reachable (reproduced: copying a struct with a `unique`
+  field and no user `copy()` hits it). Left unchanged.
+- Trap A `unique field ''` for bare self-field access: STALE. Reproduced `delete n;` inside the
+  owning struct's own method - reports "cannot delete unique field 'n' - ..." with the field name
+  filled in, not empty.
+- `unique int x[4]` pointer-flavored message: STALE. `int` is genuinely not a pointer type, so
+  "requires a single-indirection pointer type such as 'unique Node* n'" is the correct rejection
+  reason (confirmed against the ACCEPTED cases: `unique Node* kids[8]` and `unique IS one/slots[4]`
+  both compile; only a non-pointer element type or double indirection still reports this message).
+- Stale "frees and nulls" comment: STALE - that exact phrase does not appear anywhere in the tree
+  (`grep -rn "frees and nulls"` matches only this plan doc's own polish-debt line).
+- One duplicate test in `test_move.cb`: REAL, FIXED. Commit `54d6803` added
+  `testPtrMoveOverloadIdentity()` (covering `probe()`'s plain/move overload pair with STRONGER
+  assertions - it also checks the borrowed pointer stays readable) in the same commit that touched
+  the inline `main()` "Test 8" block, leaving `main()`'s `probe(a)`/`probe(move a)` checks
+  (`probe_plain_call_picks_borrow`, `probe_plain_call_freed_at_scope_exit`,
+  `probe_picks_move_for_explicit_move`, `probe_move_freed_once`) a strict subset of the new
+  function's coverage. Removed the redundant inline block; kept the `delegateProbe` sub-case
+  (not covered elsewhere).
+- `std::set` vs `std::unordered_set` inconsistency: REAL, FIXED. The move-dataflow tracking code
+  (`NamedVariable::MovedFields`, `MovedStateSnapshot::movedFields`, all of `MoveDataflow.h`'s
+  `MovedSet`/`visited`/`seen`) used `std::set` exclusively while the rest of the file's dedup/seen
+  sets (`TypeOwnsUniquePointer`, `fullDestructorInProgress_`, etc.) use `std::unordered_set`. None
+  of the `std::set` usages relied on sorted iteration (only `insert`/`count`/`erase`/`operator==`),
+  so switched all of them to `std::unordered_set` to match the dominant convention.
 
 ### Open issues owned by this workstream
 
@@ -419,17 +450,19 @@ teardown gaps the field-migration survey filed (`rwlock-os-state-never-destroyed
 `threadpool-continuation-ctx-leak-on-drop`, `unguarded-double-init-leaks`) were all FIXED on
 2026-07-20 and their files deleted, as was `duplicate-add-leaks-unique-value.md`.
 
-Two of these are probably ONE defect seen twice, and should be investigated together:
-`user-copy-method-result-leaks-in-container.md` (root cause never confirmed) and
-`move-return-named-struct-local-leaks-fields.md` both bottom out in ownership flags not
-surviving onto a `move`-returned struct value. Treat that as a hypothesis to test, not a
-conclusion - this workstream's own record shows the one-bug hypothesis failing before.
+**The two-defects-or-one question is SETTLED: one defect.** Verified 2026-07-20 by a 2x2
+matrix on linked binaries - the controlling variable is `return move r`, not the `move` return
+TYPE and not a container. Both original issue files stated repros that were wrong on
+load-bearing points and were consolidated into
+`move-return-named-struct-local-strips-owned-bits.md`. The plan's own conjecture (ownership
+flags "not surviving") was also wrong: the compiler ACTIVELY emits an `and ..., 0x7FFFFFFF` to
+strip the owned bits. Note this is the one time the one-bug hypothesis HELD - the `unique
+IFace` cluster went the other way, so keep testing it rather than assuming either outcome.
 
 | File | What |
 |---|---|
 | `unique-iface-scalar-field-not-released.md` | scalar `unique IFace` field (written or substituted) is released by nothing - the fat-pointer half of NEXT item 3 |
-| `move-return-named-struct-local-leaks-fields.md` | `return move r;` leaks a struct local's owning FIELDS |
-| `user-copy-method-result-leaks-in-container.md` | a hand-written `copy()` returning `move v` leaks once stored |
+| `move-return-named-struct-local-strips-owned-bits.md` | `return move <named struct local>` is misclassified as a borrow return and STRIPS the owned bits - silent leak on any hand-written `copy()` that move-returns. Consolidates two earlier files whose repros were both wrong |
 | `interface-conformance-matches-first-overload.md` | conformance matches first declared overload |
 | `compile-error-non-literal-emits-garbage.md` | `compile_error(CONST)` emits a stray character |
 | `if-const-no-constant-folding-path.md` | `&&` / `||` do not const-fold |
@@ -457,6 +490,7 @@ conclusion - this workstream's own record shows the one-bug hypothesis failing b
 | 2026-07-20 | **Synthesized destructor now RELEASES a `unique` fixed-array FIELD** (NEXT item 3). `GetOrCreateFullDestructor` routes `unique T* f[N]` / `unique IFace f[N]` - written, or reached through a `unique` generic type argument (`IsUnique \|\| IsUniqueTypeArg`) - through the existing `EmitOwningUniqueArrayCleanup` walk, with the member builder and `currentFunction` temporarily retargeted at the wrapper body. `btree` took option (a): `_clearValue` now abandon-clears a `unique` slot exactly as it already did for an owning VALUE slot, so every stale split/borrow duplicate reads null and the node destructor frees each live slot once. `_freeValue`/`_freeKey` are UNCHANGED and still needed (remove/overwrite/clear happen before teardown). Declaration-time rule relaxed: `unique T* f[N]` is now accepted and the "fixed arrays are not supported yet" message is DELETED. Interface fields stay rejected in EVERY shape - scalar `unique IFace x` is refused by the same single-indirection rule, so relaxing only the array form would be incoherent; that message never blamed the removed limitation | commit `4cce536` |
 | 2026-07-20 | **Core manual-lifecycle types went RAII** (NEXT item 4). `mutex`, `rwlock`, `condvar`, `event`, `semaphore`, `barrier` gained destructors after a copy-path audit found ZERO copy paths for each (including transitively, through `latch`, `stream`, `barrier`, `ThreadPool`, `NumaDomain`, and the `BucketAllocator` -> `block_pool` -> `arena_channel` chain). Idempotency was already free - every `os.*_destroy` nulls its slot - so `numa.cb:261`, `barrier.destroy()` and `~stream()` did not become double releases. `Thread` SKIPPED (real copy path + deliberate detach); pools SKIPPED (quiescence precondition). Oracle: peak RSS over 800k lock cycles, 1.5 MB vs 43.8 MB for a negative control - HeapAudit is VACUOUS here (lock state is `calloc`'d, not `new`ed) | commit `4cce536` |
 | 2026-07-20 | **`stream.init()` and `Thread.start()` re-entry guards** - both now reject a second call with a diagnostic + `abort()` (the `list._checkBounds` idiom) instead of leaking prior state; `start()` also no longer abandons a running thread that could never be joined | commit `4cce536` |
+| 2026-07-20 | **`return move <named struct local>` no longer strips the owned bits.** `ParseMoveExpression`'s struct-VALUE branch never set `lastOwningResult`, so the return site classified it as a BORROW and emitted `and i32 %x, 0x7FFFFFFF`; the caller got a non-owning struct, its destructor found nothing, and every owning field (e.g. a `string`) leaked. Hit any hand-written `copy()` that move-returns, with OR without a `move` return type, container or not. Setting `lastOwningResult = true` in that branch is the whole fix - it also drops the stray `dtorfull` on the zeroed source. Two suggested extras were REJECTED after measurement: carrying `CallerName` re-marks the origin in the move tracker (false 'use of moved variable'), and widening `ComputeReturnsOwned` to accept a `move` struct-VALUE return type DOUBLE-FREES (`move list<T> copy()` results become owned temps while the receiving local also destructs) | working tree |
 | 2026-07-20 | **`threadpool` continuation-drop leak FIXED, plus a hang found with it.** The queue-saturation path now releases `cont.ctx` through `__threadpool_drop_ctx` outside the pool lock. Required a new `TaskHandle._contDtor` field: `then()` was silently DISCARDING the caller's `ctxDtor` when the continuation was deferred, so the drop path could not have used the right release. Companion bug fixed on the same branch: the drop never published `done` on the continuation's handle, so any caller holding it spun forever in `~TaskHandle`. Both pinned by `testContinuationDroppedOnSaturation` (`Test/test_threadpool.cb`), verified non-vacuous | commit `4cce536` |
 | 2026-07-20 | **`dictionary<K, unique V*>.add()` duplicate-key leak FIXED.** Under borrow-by-default `add(alias K key, V value)` takes a plain parameter that IS a synthesized move sink once `V` is `unique`, so the bare `return false;` on the duplicate path dropped an already-transferred value. Added `_freeValue(move V value)` with an EMPTY body (the move param's own scope-exit destructor is the release - `btree.cb:244`'s pattern) called under `if const (is_unique(V))`. Measured `dtor=1 leaks=1` before, `dtor=2 leaks=0` after. `hashset` audited and NOT affected: `_slot()` poisons any unique-element instantiation with `compile_error`, so `hashset<unique T*>` never compiles. Issue file deleted | UNCOMMITTED (staged) |
 | 2026-07-20 | **Synthesized destructor's SCALAR arm widened to `IsUnique \|\| IsUniqueTypeArg`** (NEXT item 3, second pass). A scalar field made `unique` purely by substitution was released by nothing: `Holder<unique C*>` measured `dtor=0 leaks=1`, now `dtor=1 leaks=0`. All three suites unchanged from baseline (448/0/8, 35/0, 152/0) because core has NO such field - the benefit is application-level generics, so the suite could not pin it and `Test/test_collection_leaks.cb` gained `LeakGenSlot<T>` legs in both the `unique` and the borrow direction. Scalar `unique IFace` remains unreleased (fat pointer fails the `f.Pointer` guard) and is filed separately | UNCOMMITTED |

@@ -38,6 +38,14 @@ struct LeakPair { string name = default; list<int> nums = default; };
 // See internal/issue/fixed-array-elements-not-destructed.md.
 struct ArrSBox   { string s = default; };
 struct ArrHolder { ArrSBox items[3] = default; };
+
+// `return move <named struct local>` was classified as a BORROW return, so the compiler
+// emitted `and i32 %x, 0x7FFFFFFF` to strip the owned bits off the returned aggregate. The
+// caller got a non-owning struct, its destructor found nothing to free, and the owning
+// `string` field leaked. Both a plain return type and a `move` return type were affected.
+struct MvRow { string name = default; MvRow copy() { MvRow v; v.name = name.copy(); return move v; } };
+MvRow      mvPlainType() { MvRow r = default; r.name = "mv" + "a"; return move r; }
+move MvRow mvMoveType()  { MvRow r = default; r.name = "mv" + "b"; return move r; }
 // Owning Lambda<> field (lambda Option A): a closure stored in a struct field owns its heap
 // env and is freed by the struct's destructor, like a string/list field.
 struct LeakHandler { Lambda<int(int)> fn = default; };
@@ -194,6 +202,8 @@ struct PtrLeak { int v = 0; ~PtrLeak() { g_shapeDtor = g_shapeDtor + 1; } };
 // through generic substitution (btree_node's), which used to be accepted and silently leak.
 struct UniqSlotBag { unique PtrLeak* slots[4] = default; };
 struct UniqSlotBox<V> { V slots[4] = default; };
+// Scalar `unique IFace` field: a boxed interface value is a fat pointer, released via vtable dtor.
+struct UniqIfaceSlot { unique IShapeLeak v = default; };
 // Non-copyable value element: owns a `unique` pointer and has no copy(), so the COPYING
 // dictionary/hashset insert is poisoned and only the `move` transfer overload is usable.
 struct LeakHolder { unique PtrLeak* slot = nullptr; int k = 0; int hash() { return k; } };
@@ -1787,6 +1797,33 @@ extern int main()
             total++; passed += Test("unique ptr array field frees N-1 after move-out", g_shapeDtor, 4);
         }
 
+        // A SCALAR `unique IShapeLeak` field is a {i8*,i8*} fat pointer, so it is released through
+        // the vtable dtor slot - written by hand, and reached through generic substitution.
+        {
+            g_shapeDtor = 0;
+            { UniqIfaceSlot s = default; s.v = new CircleLeak(); }
+            total++; passed += Test("written unique iface scalar field frees once", g_shapeDtor, 1);
+
+            g_shapeDtor = 0;
+            { LeakGenSlot<unique IShapeLeak> h = default; h.v = new CircleLeak(); }
+            total++; passed += Test("substituted unique iface scalar field frees once", g_shapeDtor, 1);
+
+            // Null slot: teardown must no-op, not dispatch through a null vtable.
+            g_shapeDtor = 0;
+            { UniqIfaceSlot s = default; }
+            total++; passed += Test("null unique iface scalar field frees nothing", g_shapeDtor, 0);
+
+            // NON-unique type argument: the field is a BORROW and must be freed by nobody but us.
+            g_shapeDtor = 0;
+            {
+                CircleLeak* owned = new CircleLeak();
+                { LeakGenSlot<IShapeLeak> h2 = default; h2.v = owned; }
+                total++; passed += Test("borrowed iface scalar field frees nothing", g_shapeDtor, 0);
+                delete owned;
+            }
+            total++; passed += Test("borrowed iface scalar field caller frees", g_shapeDtor, 1);
+        }
+
         // Value elements are COPIED; the caller's source stays intact and independently mutable.
         {
             btree<int, LeakRow> t = default;
@@ -1821,6 +1858,22 @@ extern int main()
             total++; passed += Test("btree<noncopy> move set frees old", g_shapeDtor, 1);
         }
         total++; passed += Test("btree<noncopy> teardown frees rest", g_shapeDtor, 2);
+    }
+
+    // === `return move <named struct local>` must transfer ownership, not strip it ===
+    // Each leg leaked one string buffer before the fix; the oracle below is what fails.
+    {
+        MvRow a = mvPlainType();
+        total++; passed += Test("move-return, plain return type", a.name, "mva");
+        MvRow b = mvMoveType();
+        total++; passed += Test("move-return, move return type", b.name, "mvb");
+        MvRow s = default; s.name = "mv" + "c";
+        MvRow c = s.copy();                    // hand-written copy() that move-returns
+        total++; passed += Test("move-return, user copy()", c.name, "mvc");
+        list<MvRow> l = default;
+        l.add(s.copy());                       // copy() result stored in a container
+        total++; passed += Test("move-return copy into list", l.get(0).name, "mvc");
+        mvPlainType();                         // discarded owned return must still be freed
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

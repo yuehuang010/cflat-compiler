@@ -683,6 +683,9 @@ static bool ComputeReturnsOwned(const LLVMBackend::DeclTypeAndValue& returnType,
     // (its LLVM type is a { vtable, data } fat pointer), so it needs its own case.
     if (returnType.IsMove && (returnType.Pointer || returnType.IsInterface))
         return true;
+    // NOTE: a 'move S' struct-VALUE return is deliberately NOT returns-owned. The returned
+    // aggregate already carries its owning fields' bits, so the receiving local frees them;
+    // also registering it as an owned temp at the call site double-frees (e.g. list<T>.copy()).
     return false;
 }
 
@@ -6618,7 +6621,10 @@ public:
             LogErrorContext(ctx, "'unique' on " + field + ": simd is not a pointer type");
         if (f.IsBitfield)
             LogErrorContext(ctx, "'unique' on " + field + ": a bitfield is not a pointer type");
-        if (!f.Pointer || f.ElemPointer)
+        // A boxed interface VALUE is a {i8*,i8*} fat pointer, not a single-indirection pointer, but
+        // the synthesized destructor releases it through the vtable dtor slot - so allow it.
+        bool ifaceValue = f.IsInterface && !f.IsInterfacePointer && !f.ElemPointer;
+        if ((!f.Pointer || f.ElemPointer) && !ifaceValue)
             LogErrorContext(ctx, "'unique' on " + field + " requires a single-indirection pointer type such as 'unique Node* n'");
     }
 
@@ -13319,11 +13325,17 @@ public:
                 if (structType)
                     compiler->builder->CreateStore(
                         llvm::ConstantAggregateZero::get(structType), argNV.Storage);
+                // Signal ownership transfer exactly as the POINTER branch below does. Without it
+                // `return move r` is classified as a BORROW and its owned bits are stripped (leak).
+                compiler->lastOwningResult = true;
+
                 LLVMBackend::NamedVariable result;
                 result.Primary      = ptrVal;       // original value captured before zeroing
                 result.Storage      = nullptr;      // prevent re-load from zeroed storage
                 result.BaseType     = argNV.BaseType;
                 result.TypeAndValue = argNV.TypeAndValue;
+                // CallerName is deliberately NOT carried: the source is already detached and
+                // zeroed, and keeping it re-marks the origin in the move tracker (false positives).
                 // Carry the owning flag so 'move s' directly as a 'move string' arg TRANSFERS the buffer;
                 // without it, the defensive copy in CreateOverloadedFunctionCall orphans the original.
                 if (NamedVarIsString(argNV))

@@ -12,9 +12,9 @@
 
 #include <algorithm>
 #include <map>
-#include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -54,7 +54,7 @@ namespace movedf
     };
 
     // Maybe-moved lattice element: the set of maybe-moved move-paths.
-    using MovedSet = std::set<std::string>;
+    using MovedSet = std::unordered_set<std::string>;
 
     // USE-check rule (mirrors LLVMBackend::MovedUseSubject): path "name" is moved if
     // "name" is in the set; path "name.field" is moved if "name" OR "name.field" is.
@@ -106,7 +106,7 @@ namespace movedf
     inline std::unordered_map<llvm::BasicBlock*, int> ComputeRpoIndex(llvm::Function* F)
     {
         std::vector<llvm::BasicBlock*> post;
-        std::set<llvm::BasicBlock*> visited;
+        std::unordered_set<llvm::BasicBlock*> visited;
         // Iterative post-order DFS from entry (stack of block + child-iteration cursor).
         std::vector<std::pair<llvm::BasicBlock*, llvm::succ_iterator>> stack;
         llvm::BasicBlock* entry = &F->getEntryBlock();
@@ -204,7 +204,7 @@ namespace movedf
 
         // Diagnose: replay each block's events against BOTH its fixpoint IN and its acyclic IN.
         // Report a use maybe-moved in the fixpoint but NOT in the acyclic (linear) view.
-        std::set<std::string> seen; // dedup identical path+location report keys
+        std::unordered_set<std::string> seen; // dedup identical path+location report keys
         for (auto& BB : *F)
         {
             if (!rpo.count(&BB)) continue;

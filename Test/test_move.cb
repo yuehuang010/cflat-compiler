@@ -1190,34 +1190,11 @@ extern int main()
     passed += Test("list_dtor_remaining_freed", dtorCount, 2);
     total++;
 
-    // Test 8: move-vs-borrow overload selection.
-    // A PLAIN call passes an owning pointer as a BORROW (returns 200+id, no free) - writing
-    // no 'move' at the call site must never silently consume the caller's pointee.
-    dtorCount = 0;
-    {
-        Resource* a = new Resource();
-        a->id = 5;
-        int v = probe(a);
-        passed += Test("probe_plain_call_picks_borrow", v, 205);
-        total++;
-        // 'a' still owned here; freed at scope exit.
-    }
-    passed += Test("probe_plain_call_freed_at_scope_exit", dtorCount, 1);
-    total++;
-
-    // Explicit 'move' on a pointer -> picks the 'move' overload (returns 100+id, frees r).
-    dtorCount = 0;
-    {
-        Resource* a = new Resource();
-        a->id = 5;
-        int v = probe(move a);
-        passed += Test("probe_picks_move_for_explicit_move", v, 105);
-        total++;
-        // 'a' moved into probe; scope exit is a no-op.
-    }
-    passed += Test("probe_move_freed_once", dtorCount, 1);
-    total++;
-
+    // Test 8: move-vs-borrow overload selection via a second, unrelated function
+    // (delegateProbe). probe()'s own plain/move overload pair is covered by
+    // testPtrMoveOverloadIdentity() below (ptr_ovl_plain_picks_borrow /
+    // ptr_ovl_explicit_move_picks_move), which also asserts the borrowed pointer stays
+    // usable after the call - removed the redundant probe() duplicate that used to sit here.
     // Borrowed pointer (non-move param) -> picks 'borrow' overload (returns 200+id, no free).
     dtorCount = 0;
     {

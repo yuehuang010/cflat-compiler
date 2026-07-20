@@ -6,11 +6,15 @@ interface IS { int id(); };
 
 struct Tree { unique Node* kids[8] = default; };
 
-// An INTERFACE field is still rejected in every shape - scalar and array alike. The array form
-// is not singled out: `unique IS one` is refused by the same rule, so relaxing only the array
-// would be incoherent. Nothing here blames the (now removed) single-pointer destructor limit.
+// An INTERFACE field is ACCEPTED since 2026-07-20 in both shapes: the synthesized destructor
+// releases a boxed interface value through its vtable dtor slot (scalar and per array slot).
+struct IfaceHolder { unique IS one = default; };
+struct IfaceSlots { unique IS slots[4] = default; };
+
+// A DOUBLE-indirection field is still rejected: the destructor deletes exactly one pointer,
+// which cannot express freeing an outer block plus the pointees it holds.
 expect_error("requires a single-indirection pointer type") {
-    struct Bad { unique IS slots[4] = default; };
+    struct Bad { unique Node** kids = default; };
 }
 
 extern int main()
