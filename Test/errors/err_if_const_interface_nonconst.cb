@@ -1,0 +1,14 @@
+// Interface-scope `if const` must reject a condition that is not a compile-time constant.
+int ifConstIfaceRuntimeValue() { return 1; }
+
+expect_error("'if const' condition must be a compile-time constant expression");
+
+interface IBadIfConstMember
+{
+    if const (ifConstIfaceRuntimeValue()) { int a(); }
+};
+
+extern int main()
+{
+    return 0;
+}

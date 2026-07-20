@@ -4665,14 +4665,13 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
 
 // Tear down the window at index `idx`: free its cflat + GDI state, remove it from the
 // registry, and delete it. The HWND + child controls are destroyed by Windows; child
-// controls cascade. `list.take` transfers ownership so the Window is deletable.
+// controls cascade. `removeAt` frees the element, since the list owns `unique` elements.
 void destroyWindowStateAt(int idx)
 {
     if (idx < 0 || idx >= _windows.count()) return;
     _cur = idx;
     curWin().dispose();
-    Window* owned = _windows.take(idx);
-    delete owned;
+    _windows.removeAt(idx);   // the list owns its `unique` elements; this frees the Window
     _cur = _windows.count() > 0 ? 0 : -1;
 }
 

@@ -805,6 +805,17 @@ aggregateMember
     | structDefinition
     | classDefinition
     | lockFieldGroup
+    | ifConstMember
+    ;
+
+// Member-scope `if const`. Mirrors the file-scope ifConstDeclaration/ifConstBlock pair so the
+// then/else arms are indexable via ifConstMemberBlock().
+ifConstMember
+    : 'if' 'const' '(' expression ')' '{' ifConstMemberBlock '}' ('else' ('{' ifConstMemberBlock '}' | ifConstMember))?
+    ;
+
+ifConstMemberBlock
+    : aggregateMember*
     ;
 
 lockFieldGroup
@@ -861,7 +872,26 @@ operatorFunctionId
     ;
 
 interfaceDefinition
-    : annotationList? Interface genericIdentifier (':' Identifier (',' Identifier)*)? '{' (interfaceMethod | interfaceField)* '}' ';'
+    : annotationList? Interface genericIdentifier (':' Identifier (',' Identifier)*)? '{' interfaceMember* '}' ';'
+    ;
+
+// An interface body member. Extracted into a named rule for the same reason aggregateMember was
+// (see above): it gives the if-const alternative a single place to hang off, and lets both passes
+// route every member walk through one resolution step.
+interfaceMember
+    : interfaceMethod
+    | interfaceField
+    | ifConstInterfaceMember
+    ;
+
+// Interface-scope `if const`. Mirrors ifConstMember so the then/else arms are indexable via
+// ifConstInterfaceBlock().
+ifConstInterfaceMember
+    : 'if' 'const' '(' expression ')' '{' ifConstInterfaceBlock '}' ('else' ('{' ifConstInterfaceBlock '}' | ifConstInterfaceMember))?
+    ;
+
+ifConstInterfaceBlock
+    : interfaceMember*
     ;
 
 interfaceMethod

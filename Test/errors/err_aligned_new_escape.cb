@@ -27,12 +27,14 @@ expect_error("cannot return the over-aligned buffer") {
     }
 }
 
-// 3. Moved into a `move` parameter - here a container, whose generic element free is
-//    shared by every instantiation and so cannot know the alignment.
+// 3. Moved into a `move` parameter - here a container that OWNS its elements
+//    (list<unique T*> frees at teardown), whose generic element free is shared by every
+//    instantiation and so cannot know the alignment. A bare list<T*> only BORROWS, so it
+//    is not an escape at all - `unique` is what makes this case an ownership transfer.
 expect_error("into the 'move' parameter") {
     void alignedIntoList()
     {
-        list<double*> bufs;
+        list<unique double*> bufs;
         double* b = new double[64] alignas(64);
         bufs.add(b);
     }

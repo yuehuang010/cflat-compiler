@@ -1,0 +1,14 @@
+// stack<T> COPIES a value element on the plain push(). A value type that owns a `unique`
+// pointer has no copy(), so the plain overload is poisoned instead of failing to instantiate.
+// The transfer overload s.push(move x) stays usable - see test_collection_leaks.cb.
+import "stack.cb";
+class SRes { int id = default; };
+class SHolder { unique SRes* r = default; int k = default; };
+expect_error("write 'move' at the call site (s.push(move x))");
+extern int main()
+{
+    stack<SHolder> s;
+    SHolder h = default;
+    s.push(h);
+    return 0;
+}

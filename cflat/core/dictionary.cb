@@ -2,13 +2,21 @@
 // as hashset<T> (parallel status/keys arrays with linear probing), extended
 // with a parallel values array.  K must be a primitive or pointer type, or
 // implement hash().  K is non-owning - the caller manages the lifetime of any
-// heap-allocated keys.  When V is a pointer type, the dictionary owns the
-// values: add()/set() take ownership, set() frees the old value on overwrite,
-// remove() and clear() free values, and the destructor frees any remaining.
+// heap-allocated keys.  A `unique` key is REJECTED (compile error): every
+// lookup reads the key for hashing/equality, and a `unique` argument would be
+// destructively moved out of the caller by that read - keys must be borrowed.
+// The dictionary owns its VALUES only when V is `unique`: add()/set() take
+// ownership, set() frees the old value on overwrite, remove() and clear() free
+// values, and the destructor frees any remaining. A bare `dictionary<K, V*>` /
+// `dictionary<K, IFace>` is a borrowed view and frees nothing (the real owner does).
+// A VALUE-TYPE V is COPIED on insert - `d.add(k, s)` leaves the caller's `s` intact.
+// Write `d.add(k, move s)` / `d.set(k, move s)` to transfer instead; those transfer
+// overloads exist for value types only (a borrowing container must not take ownership,
+// and for `unique V*` the plain parameter is already a synthesized move sink).
 
 import "hashset.cb";
 
-// dictionary<K,V> - open-addressing hash map; owns the values when V is a pointer type.
+// dictionary<K,V> - open-addressing hash map; owns the values only when V is `unique`.
 struct dictionary<K, V>
 {
     K*    _keys     = nullptr;
@@ -20,11 +28,20 @@ struct dictionary<K, V>
     V     _missing  = default;   // value returned by get() on a miss
 
     // Hash key to a starting bucket index in [0, _capacity).
-    int _slot(K key)
+    int _slot(alias K key)
     {
+        // A `unique` key cannot be borrowed for hashing: reading it here would move it out of the
+        // caller. Poison the shared hash path so ANY dictionary operation on a unique-key
+        // instantiation is a compile error (deferred: fires only if _slot is actually called).
+        if const (is_unique(K))
+        {
+            compile_error("dictionary keys cannot be 'unique'; a lookup reads the key for hashing/equality and would move it out. Use 'dictionary<alias K*, V>' for a borrowed key, or a primitive/owning-value key, and manage the key lifetime separately.");
+        }
         int h = 0;
         if const (is_primitive(K))
             h = Hash(key) % _capacity;
+        else if const (is_interface(K))
+            compile_error("dictionary<K, V> does not support an interface key type; an interface value is a fat pointer with no stable identity to hash");
         else if const (is_pointer(K))
             h = Hash((i64)key) % _capacity;
         else
@@ -95,85 +112,174 @@ struct dictionary<K, V>
         delete[] oldStatus;
     }
 
-    // Insert a new entry.  Returns true if added, false if key already present
-    // (existing value is left untouched - use set() to overwrite).
-    // When V is a pointer type the dictionary takes ownership of the value.
-    bool add(K key, move V value)
+    // Store the key into a slot that holds no live key yet. An owning key (a `string`, or a
+    // struct that owns buffers) is deep-copied so the slot owns an independent buffer: a plain
+    // store would alias the caller's `key` argument (a soon-freed temp/local), leaving the
+    // stored key dangling once that buffer is freed. remove()/clear()/the destructor free this
+    // owned copy. Primitive and pointer keys are stored as-is - the dictionary BORROWS pointer
+    // keys (it never frees them).
+    void _placeKeyAt(int index, alias K key)
     {
-        if (_capacity == 0) _init(8);
-        _maybeRehash();
+        if const (is_primitive(K))    _keys[index] = key;
+        else if const (is_pointer(K)) _keys[index] = key;
+        else                          _keys[index] = key.copy();
+    }
 
+    // Store a value into a slot that holds no live value yet. `unique` takes ownership (a
+    // unique-substituted parameter is a synthesized move sink); a bare pointer or interface
+    // value is aliased (BORROWED); a value type is deep-copied so the caller's original stays
+    // independent. `is_pointer(V)` is true for a bare, `unique` or `alias` pointer AND for an
+    // interface value, so it subsumes the alias case - do not add an is_alias arm.
+    void _placeValueAt(int index, V value)
+    {
+        if const (is_unique(V))         _values[index] = move value;
+        else if const (is_pointer(V))   _values[index] = value;
+        else if const (is_primitive(V)) _values[index] = value;
+        else if const (!is_copyable(V)) compile_error("this dictionary value type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (d.add(k, move x) / d.set(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else                            _values[index] = value.copy();
+    }
+
+    // Release the value in a live slot: `unique` is freed, a value type is destructed, a bare
+    // pointer or interface value is left to its real owner.
+    void _releaseValueAt(int index)
+    {
+        if const (is_unique(V))
+        {
+            if (_values[index] != nullptr) delete _values[index];
+        }
+        else if const (is_pointer(V))   { }
+        else if const (is_primitive(V)) { }
+        else                            _values[index].~();
+    }
+
+    // Locate the slot to insert `key` into, or -1 if the key is already present. Sets up the
+    // tombstone reuse bookkeeping shared by add() and set().
+    int _insertSlotFor(alias K key)
+    {
         int slot = _slot(key);
         int firstDeleted = -1;
         while (_status[slot] != 0)
         {
-            if (_status[slot] == 1 && _keys[slot] == key) return false;
+            if (_status[slot] == 1 && _keys[slot] == key) return -1;
             if (_status[slot] == 2 && firstDeleted == -1) firstDeleted = slot;
             slot = (slot + 1) % _capacity;
         }
-        int insertSlot = slot;
-        if (firstDeleted != -1) { insertSlot = firstDeleted; _tombstones--; }
-        // Store the key. An owning key (a `string`, or a struct that owns buffers) is deep-copied
-        // so the slot owns an independent buffer: a plain store would alias the caller's `key`
-        // argument (a soon-freed temp/local), leaving the stored key dangling once that buffer is
-        // freed. The destructor/remove()/clear() free this owned copy. Primitive and pointer keys
-        // are stored as-is - the dictionary BORROWS pointer keys (it never frees them).
-        if const (is_primitive(K))    _keys[insertSlot] = key;
-        else if const (is_pointer(K)) _keys[insertSlot] = key;
-        else                          _keys[insertSlot] = key.copy();
-        _values[insertSlot] = move value;
-        _status[insertSlot] = 1;
-        _count++;
+        if (firstDeleted != -1) { _tombstones--; return firstDeleted; }
+        return slot;
+    }
+
+    // Insert a new entry.  Returns true if added, false if key already present
+    // (existing value is left untouched - use set() to overwrite).
+    // A value type V is COPIED (the caller's value is left intact); a bare pointer/interface
+    // value is borrowed (the dictionary never frees it); when V is `unique` the dictionary
+    // TAKES ownership - a unique-substituted parameter is a synthesized move sink.
+    bool add(alias K key, V value)
+    {
+        // Poison the copying overload for a non-copyable V so the class still instantiates and
+        // `add(k, move x)` stays usable; the dead arm emits no call to the poisoned _placeValueAt.
+        if const (!is_copyable(V)) compile_error("this dictionary value type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (d.add(k, move x) / d.set(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else
+        {
+            if (_capacity == 0) _init(8);
+            _maybeRehash();
+
+            int insertSlot = _insertSlotFor(key);
+            if (insertSlot == -1) return false;
+            _placeKeyAt(insertSlot, key);
+            _placeValueAt(insertSlot, value);
+            _status[insertSlot] = 1;
+            _count++;
+        }
         return true;
     }
 
     // Insert or overwrite the value for key.
-    // When V is a pointer type the dictionary takes ownership of the value.
-    // On overwrite, the old value is freed before the new one is stored.
-    void set(K key, move V value)
+    // A value type V is COPIED; a bare pointer/interface value is borrowed; when V is `unique`
+    // the dictionary takes ownership. On overwrite the old value is released first (a `unique`
+    // value is freed, a value type destructed, a borrowed pointer just dropped).
+    void set(alias K key, V value)
     {
-        if (_capacity == 0) _init(8);
-        _maybeRehash();
-
-        int slot = _slot(key);
-        int firstDeleted = -1;
-        int updateSlot = -1;
-        bool overwrite = false;
-        while (_status[slot] != 0)
-        {
-            if (_status[slot] == 1 && _keys[slot] == key)
-            {
-                updateSlot = slot;
-                overwrite = true;
-                break;
-            }
-            if (_status[slot] == 2 && firstDeleted == -1) firstDeleted = slot;
-            slot = (slot + 1) % _capacity;
-        }
-        if (overwrite)
-        {
-            if const (is_pointer(V))
-                if (_values[updateSlot] != nullptr) delete _values[updateSlot];
-            if const (!is_pointer(V))
-                _values[updateSlot].~();
-        }
+        if const (!is_copyable(V)) compile_error("this dictionary value type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (d.add(k, move x) / d.set(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
         else
         {
-            updateSlot = slot;
-            if (firstDeleted != -1) { updateSlot = firstDeleted; _tombstones--; }
-            // Deep-copy an owning key into the slot; store primitive/pointer keys as-is.
-            // See add() for the rationale (avoid aliasing the soon-freed caller argument).
-            if const (is_primitive(K))    _keys[updateSlot] = key;
-            else if const (is_pointer(K)) _keys[updateSlot] = key;
-            else                          _keys[updateSlot] = key.copy();
-            _status[updateSlot] = 1;
-            _count++;
+            if (_capacity == 0) _init(8);
+            _maybeRehash();
+
+            int updateSlot = _insertSlotFor(key);
+            if (updateSlot == -1)
+            {
+                updateSlot = _findSlot(key);
+                _releaseValueAt(updateSlot);
+            }
+            else
+            {
+                _placeKeyAt(updateSlot, key);
+                _status[updateSlot] = 1;
+                _count++;
+            }
+            _placeValueAt(updateSlot, value);
         }
-        _values[updateSlot] = move value;
+    }
+
+    // Transfer overloads - the caller writes `move` to give up ownership instead of paying for
+    // a deep copy. Offered for VALUE elements only; the `!is_pointer(V)` guard is the design,
+    // not a workaround: a bare pointer / interface value is BORROWED, so accepting ownership
+    // would strand it (nothing ever frees it), and for `unique V*` the plain parameter is
+    // already a synthesized move sink. is_pointer(V) covers bare, `unique`, `alias` and
+    // interface values alike. Declared AFTER the plain overloads so the IDictionary contract
+    // check matches the plain ones first.
+    if const (!is_pointer(V))
+    {
+        bool add(alias K key, move V value)
+        {
+            if (_capacity == 0) _init(8);
+            _maybeRehash();
+
+            int insertSlot = _insertSlotFor(key);
+            if (insertSlot == -1) return false;
+            _placeKeyAt(insertSlot, key);
+            _values[insertSlot] = move value;
+            _status[insertSlot] = 1;
+            _count++;
+            return true;
+        }
+
+        void set(alias K key, move V value)
+        {
+            if (_capacity == 0) _init(8);
+            _maybeRehash();
+
+            int updateSlot = _insertSlotFor(key);
+            if (updateSlot == -1)
+            {
+                updateSlot = _findSlot(key);
+                _releaseValueAt(updateSlot);
+            }
+            else
+            {
+                _placeKeyAt(updateSlot, key);
+                _status[updateSlot] = 1;
+                _count++;
+            }
+            _values[updateSlot] = move value;
+        }
+    }
+
+    // Index of the live slot holding `key`, or -1 if absent.
+    int _findSlot(alias K key)
+    {
+        if (_capacity == 0) return -1;
+        int slot = _slot(key);
+        while (_status[slot] != 0)
+        {
+            if (_status[slot] == 1 && _keys[slot] == key) return slot;
+            slot = (slot + 1) % _capacity;
+        }
+        return -1;
     }
 
     // Returns true if key is present.
-    bool contains(K key)
+    bool contains(alias K key)
     {
         if (_capacity == 0) return false;
         int slot = _slot(key);
@@ -188,7 +294,7 @@ struct dictionary<K, V>
     // Read the value for key.  Returns default(V) if the key is not present.
     // `alias`: the value stays owned by the dictionary, so the returned value must not be
     // destructed by the caller (it aliases the slot's buffers) - same contract as list.get.
-    alias V get(K key)
+    alias V get(alias K key)
     {
         if (_capacity == 0) return _missing;
         int slot = _slot(key);
@@ -201,8 +307,9 @@ struct dictionary<K, V>
     }
 
     // Remove an entry by key.  Returns true if removed, false if not found.
-    // When V is a pointer type, the value is freed.
-    bool remove(K key)
+    // When V is `unique`, the owned value is freed; a bare pointer/interface
+    // value is dropped (the dictionary never owned it).
+    bool remove(alias K key)
     {
         if (_capacity == 0) return false;
         int slot = _slot(key);
@@ -210,9 +317,12 @@ struct dictionary<K, V>
         {
             if (_status[slot] == 1 && _keys[slot] == key)
             {
-                if const (is_pointer(V))
+                // Free a `unique` (owned) value; destruct a value type; leave a bare pointer/interface.
+                if const (is_unique(V))
+                {
                     if (_values[slot] != nullptr) delete _values[slot];
-                if const (!is_pointer(V))
+                }
+                else if const (!is_pointer(V))
                     _values[slot].~();
                 // Destruct the owned key too (string, owning struct); primitive/pointer keys: unmanaged.
                 if const (!is_primitive(K)) if const (!is_pointer(K))
@@ -233,8 +343,8 @@ struct dictionary<K, V>
         return _count;
     }
 
-    // Remove all entries. When V is a pointer type, frees each value.
-    // Backing arrays are kept - capacity is unchanged.
+    // Remove all entries. When V is `unique`, frees each owned value; a value type is
+    // destructed; a bare pointer/interface value is dropped. Backing arrays are kept.
     void clear()
     {
         int i = 0;
@@ -242,9 +352,11 @@ struct dictionary<K, V>
         {
             if (_status[i] == 1)
             {
-                if const (is_pointer(V))
+                if const (is_unique(V))
+                {
                     if (_values[i] != nullptr) delete _values[i];
-                if const (!is_pointer(V))
+                }
+                else if const (!is_pointer(V))
                     _values[i].~();
                 if const (!is_primitive(K)) if const (!is_pointer(K))
                     _keys[i].~();
@@ -258,7 +370,7 @@ struct dictionary<K, V>
     }
 
     // d[key] - same semantics as get(key): returns default(V) on miss (alias borrow, see get).
-    alias V operator[](K key)
+    alias V operator[](alias K key)
     {
         return get(key);
     }
@@ -268,11 +380,19 @@ struct dictionary<K, V>
     //   - string / owning-struct key or value: deep-copied via copy(), so each dictionary owns
     //     independent buffers (a plain store would hand both dictionaries one buffer -> double free).
     //   - pointer KEY: shared (the dictionary borrows key pointers - it never frees them).
-    //   - pointer VALUE: the dictionary OWNS value pointers (the destructor frees them), so each is
-    //     MOVED to the copy - ownership transfers and the SOURCE value slot is nulled. Sharing would
-    //     hand one pointee to two owners and double-free at teardown; a raw pointer has no deep-clone.
+    //   - bare pointer VALUE: shared (the dictionary borrows value pointers), so each is shallow-
+    //     copied - both dictionaries alias the same pointee, which the real owner frees once.
+    //   - `unique` VALUE: the dictionary OWNS its values; a bitwise element copy would hand one
+    //     pointee to two owners and double-free. There is no generic deep-clone, so copying a
+    //     dictionary of unique values is a compile error (use move or copy elements explicitly).
     move dictionary<K, V> copy()
     {
+        if const (is_unique(V))
+        {
+            compile_error("cannot copy a dictionary of unique values; use move or copy elements explicitly");
+            dictionary<K, V> none;
+            return move none;
+        }
         dictionary<K, V> result;
         if (_capacity == 0) return move result;
         result._init(_capacity);
@@ -287,7 +407,8 @@ struct dictionary<K, V>
                 else if const (is_pointer(K)) result._keys[i] = _keys[i];
                 else                          result._keys[i] = _keys[i].copy();
                 if const (is_primitive(V))    result._values[i] = _values[i];
-                else if const (is_pointer(V)) result._values[i] = move _values[i];
+                else if const (is_pointer(V)) result._values[i] = _values[i];
+                else if const (!is_copyable(V)) compile_error("cannot copy this dictionary: its value type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the dictionary instead of copying it");
                 else                          result._values[i] = _values[i].copy();
             }
             i++;
@@ -297,7 +418,8 @@ struct dictionary<K, V>
         return move result;
     }
 
-    // Free owned values and string keys, then the backing arrays.
+    // Free owned (`unique`) values and string keys, then the backing arrays. A bare
+    // pointer/interface value is borrowed and never freed here (its real owner frees it).
     ~dictionary()
     {
         int i = 0;
@@ -305,9 +427,11 @@ struct dictionary<K, V>
         {
             if (_status[i] == 1)
             {
-                if const (is_pointer(V))
+                if const (is_unique(V))
+                {
                     if (_values[i] != nullptr) delete _values[i];
-                if const (!is_pointer(V))
+                }
+                else if const (!is_pointer(V))
                     _values[i].~();
                 // Owning keys are deep-copied into the slot by add()/set(), so the dictionary
                 // owns them and must free them here; primitive/pointer keys are stored as-is and

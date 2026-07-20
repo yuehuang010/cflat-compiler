@@ -801,6 +801,9 @@ int testArrayViewCast()
 // ---------------------------------------------------------------------------
 
 // Deterministic pseudo-random source (no rand()).
+int g_btreeDtor = 0;
+struct BtreeRes { int v = 0; ~BtreeRes() { g_btreeDtor = g_btreeDtor + 1; } };
+
 int btreeLcgNext(int x)
 {
     return (int)(((i64)x * 1103515245 + 12345) & 0x7fffffff);
@@ -1141,12 +1144,15 @@ int testBtreeStringKeys()
     return passed;
 }
 
-// pointer-valued V: the tree owns the values - add() transfers ownership, set()
+// `unique` pointer-valued V: the tree OWNS the values - add() takes ownership, set()
 // frees the old value on overwrite, and remove()/clear() free the rest.
+// (Retargeted from bare `btree<int, int*>` by the borrow-by-default migration: bare now
+// BORROWS and frees nothing, which is the `borrowed view` case covered right below. The
+// assertions here are about OWNERSHIP, so they moved to the spelling that still owns.)
 int testBtreePointerValues()
 {
     int passed = 0;
-    btree<int, int*> t;
+    btree<int, unique int*> t;
     int i = 1;
     while (i <= 50)
     {
@@ -1180,6 +1186,64 @@ int testBtreePointerValues()
     passed += Test("btree ptr count after remove", t.count(), 25);
     t.clear();
     passed += Test("btree ptr count after clear", t.count(), 0);
+    return passed;
+}
+
+// bare `btree<K, V*>` is a BORROWED view: it frees nothing, ever. remove(), clear() and the
+// destructor must leave every pointee alive, and the caller frees each exactly once.
+int testBtreeBorrowedPointerValues()
+{
+    int passed = 0;
+    g_btreeDtor = 0;
+    BtreeRes*[40] owned = default;
+    {
+        btree<int, BtreeRes*> t;
+        int i = 0;
+        while (i < 40) { owned[i] = new BtreeRes(); t.add(i * 7 % 40, owned[i]); i = i + 1; }
+        int j = 0;
+        while (j < 20) { t.remove(j * 7 % 40); j = j + 1; }
+        passed += Test("btree borrow: remove frees nothing", g_btreeDtor, 0);
+    }
+    passed += Test("btree borrow: dtor frees nothing", g_btreeDtor, 0);
+    int k = 0;
+    while (k < 40) { delete owned[k]; k = k + 1; }
+    passed += Test("btree borrow: caller frees exactly once", g_btreeDtor, 40);
+    return passed;
+}
+
+// VALUE elements are COPIED on insert; the `move` overloads are the opt-in transfer.
+// The caller's source must stay intact and independently mutable after a plain add()/set().
+int testBtreeValueCopySemantics()
+{
+    int passed = 0;
+    btree<int, string> t;
+
+    string src = "or" + "ig";
+    t.add(1, src);
+    src = "MUT" + "ATED";
+    passed += Test("btree<val> add copies (slot)",   t.get(1), "orig");
+    passed += Test("btree<val> add copies (source)", src, "MUTATED");
+
+    string src2 = "se" + "cond";
+    t.set(1, src2);
+    src2 = "AGA" + "IN";
+    passed += Test("btree<val> set copies (slot)",   t.get(1), "second");
+    passed += Test("btree<val> set copies (source)", src2, "AGAIN");
+
+    string mv = "mo" + "ved";
+    t.add(2, move mv);
+    passed += Test("btree<val> add(move) transfers", t.get(2), "moved");
+    string mv2 = "mov" + "ed2";
+    t.set(2, move mv2);
+    passed += Test("btree<val> set(move) transfers", t.get(2), "moved2");
+
+    // Keys are BORROWED: the caller's key survives the insert and stays independent.
+    btree<string, int> ks;
+    string key = "app" + "le";
+    ks.add(key, 1);
+    key = "cha" + "nged";
+    passed += Test("btree key borrowed (caller key usable)", key, "changed");
+    passed += Test("btree key deep-copied into slot", ks.get("apple"), 1);
     return passed;
 }
 
@@ -1654,6 +1718,8 @@ extern int main(int argc, char** argv)
     passed += testBtreeSeekRange();          total += 5;
     passed += testBtreeStringKeys();         total += 9;
     passed += testBtreePointerValues();      total += 5;
+    passed += testBtreeBorrowedPointerValues(); total += 3;
+    passed += testBtreeValueCopySemantics();    total += 8;
 
     // ---- btree<K,V> concurrent (optimistic lock coupling) ----
     passed += testBtreeConcurrentLookupInsert();  total += 7;

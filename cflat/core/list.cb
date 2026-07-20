@@ -1,17 +1,37 @@
-// list<T> - mutable growable owning array (similar to vector<T>).
-// Supports any value type T.
+// list<T> - mutable growable array, shaped like std::vector<T>.
+//
+// THE RULE: BARE BORROWS, `unique` OWNS - for pointers AND fat pointers (interface values)
+// alike. Pointer and interface elements take the same code path, because an interface value
+// IS a fat pointer { vtable*, data* } and is_pointer(T) reports it as one.
+//
+//   list<T>              value elements, deep-copied on insert   (std::vector<T>)
+//   list<T*>             BORROWS - never freed                   (std::vector<T*>)
+//   list<IShape>         BORROWS - never freed
+//   list<alias T*>       same as bare, spelled explicitly
+//   list<unique T*>      OWNS and frees        (std::vector<unique_ptr<T>>)
+//   list<unique IShape>  OWNS and frees
+//
+// Aligning on BORROW rather than OWN is forced, not preferred: boxing a STACK value into an
+// interface is idiomatic (`Circle c; shapes.add(c);`) and deleting a stack-boxed interface
+// value runs the destructor and then aborts.
+//
+// THE TRADE-OFF, stated plainly: insertion COPIES a value type rather than moving it, so
+// `l.add(s)` leaves `s` intact. That is a local inversion of the language's move-by-default
+// (`string b = a` moves). Write `l.add(move s)` to transfer instead. This is not a
+// preference - it is what makes the design implementable today: a plain by-value parameter
+// BORROWS an owning value rather than taking it, so a copying body is the only one that is
+// sound. See internal/plan/unique-ownership.md, "Blocker 1".
 
 import "memory.cb";   // __active_allocator (for copy(IAllocator))
 
-// list<T> - mutable growable array (vector<T>-like) for any value type T. Owns its elements
-// only when T is `unique` (or a value type with owned buffers); bare pointer/interface lists borrow.
 class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
 {
     T*  _data     = nullptr;
     int _size     = 0;
     int _capacity = 0;
 
-    // Double the backing buffer capacity, moving existing elements over.
+    // Double the backing buffer, moving existing elements over. Moving (not copying) is
+    // correct here because the old buffer is discarded immediately after.
     void _grow()
     {
         int newCap = _capacity == 0 ? 4 : _capacity * 2;
@@ -22,25 +42,14 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
             newData[i] = move _data[i];
             i++;
         }
-        // Elements were moved out (zeroed); just free the old buffer - no destructor calls needed.
         if (_data != nullptr) delete[_] _data;
         _data = newData;
         _capacity = newCap;
     }
 
-    // Append a value to the end. The list frees elements (add/removeAt/clear/dtor) only when T
-    // is `unique`; a bare `list<T*>` / `list<IFace>` is a borrowed view and frees nothing.
-    void add(move T value)
-    {
-        if (_size >= _capacity) _grow();
-        _data[_size] = move value;
-        _size++;
-    }
-
-    // A bad index is a program bug, not a recoverable state: get()/operator[] hand back
-    // an alias (a borrow of a slot that does not exist), so there is no value to return
-    // in its place. Report and abort rather than reading past the buffer, which silently
-    // corrupts or faults far from the actual mistake.
+    // A bad index is a program bug, not a recoverable state: get()/operator[] hand back an
+    // alias (a borrow of a slot that does not exist), so there is no value to return in its
+    // place. Report and abort rather than reading past the buffer.
     void _checkBounds(int index, const char* op)
     {
         if (index < 0 || index >= _size)
@@ -50,119 +59,144 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         }
     }
 
-    // Read the element at index (borrow - caller does not receive ownership).
-    // `alias`: the element stays owned by the list, so the returned value must not
-    // be freed by the caller. Use `.copy()` to take an independent owned copy.
+    // Store into a slot that holds no live element yet. `unique` takes ownership (a unique
+    // parameter is a synthesized move sink); a bare pointer or interface is aliased; a
+    // value type is deep-copied so the caller's original stays independent.
+    // `is_pointer(T)` is true for a bare, `unique` or `alias` pointer AND for an interface
+    // value, so it subsumes the alias case - do not add an is_alias arm, it is unreachable.
+    void _placeAt(int index, T value)
+    {
+        if const (is_unique(T))         _data[index] = move value;
+        else if const (is_pointer(T))   _data[index] = value;
+        else if const (is_primitive(T)) _data[index] = value;
+        else if const (!is_copyable(T)) compile_error("this list element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (l.add(move x) / l.set(i, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else                            _data[index] = value.copy();
+    }
+
+    // Release the element in a live slot: `unique` is freed, a value type is destructed, a
+    // bare pointer or interface is left to its real owner.
+    void _releaseAt(int index)
+    {
+        if const (is_unique(T))
+        {
+            if (_data[index] != nullptr) delete _data[index];
+        }
+        else if const (is_pointer(T))   { }
+        else if const (is_primitive(T)) { }
+        else                            _data[index].~();
+    }
+
+    // Append value. A value type is COPIED (the caller's value is left intact); a bare
+    // pointer or interface is aliased; a `unique` element is TAKEN - a unique-typed
+    // parameter is a synthesized move sink, so the caller's source is nulled for it.
+    void add(T value)
+    {
+        // Poison the copying overload for a non-copyable T so the class still instantiates and
+        // `add(move x)` stays usable; the dead arm emits no call to the poisoned _placeAt.
+        if const (!is_copyable(T)) compile_error("this list element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (l.add(move x) / l.set(i, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else
+        {
+            if (_size >= _capacity) _grow();
+            _placeAt(_size, value);
+            _size++;
+        }
+    }
+
+    // Transfer overloads - the caller writes `move` to give up ownership instead of paying
+    // for a copy. Offered for VALUE elements only, and the `!is_pointer(T)` guard is the
+    // design, not a workaround: a bare pointer / interface list BORROWS, so accepting
+    // ownership there would strand the element (nothing ever frees it), and for `unique T*`
+    // the plain parameter is already a synthesized move sink, so a second overload would be
+    // redundant. is_pointer(T) covers bare, `unique`, `alias` and interface elements alike.
+    if const (!is_pointer(T))
+    {
+        void add(move T value)
+        {
+            if (_size >= _capacity) _grow();
+            _data[_size] = move value;
+            _size++;
+        }
+
+    }
+
+    // Overwrite the element at index with a COPY. The old element is released first.
+    void set(int index, T value)
+    {
+        if const (!is_copyable(T)) compile_error("this list element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (l.add(move x) / l.set(i, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else
+        {
+            _checkBounds(index, "set");
+            _releaseAt(index);
+            _placeAt(index, value);
+        }
+    }
+
+    // set()'s transfer counterpart, guarded exactly like add(move T) above. Declared AFTER
+    // the plain set() so the interface contract check matches the plain overload first.
+    if const (!is_pointer(T))
+    {
+        void set(int index, move T value)
+        {
+            _checkBounds(index, "set");
+            _releaseAt(index);
+            _data[index] = move value;
+        }
+    }
+
+    // Element at index (borrow - the list keeps ownership). Use .copy() for an
+    // independent value.
     alias T get(int index)
     {
         _checkBounds(index, "get");
         return _data[index];
     }
 
-    // Overwrite the element at index. When T is `unique` the list owns the element, so the old
-    // one is freed first; a value type is destructed; a bare (borrowed) pointer is just overwritten.
-    void set(int index, move T value)
+    // l[index] - same semantics as get(index) (alias borrow, see get).
+    alias T operator[](int index)
     {
-        _checkBounds(index, "set");
-        if const (is_unique(T))
-        {
-            if (_data[index] != nullptr) delete _data[index];
-        }
-        else if const (!is_pointer(T))
-        {
-            _data[index].~();
-        }
-        _data[index] = move value;
-    }
-
-    // Remove the element at index and return it, transferring ownership to the
-    // caller.  The array slot is nulled so the list holds no dangling pointer.
-    // Use removeAt() when you want the list to free; use take() when you want
-    // to keep the element.  Only meaningful for pointer element types.
-    move T take(int index)
-    {
-        _checkBounds(index, "take");
-        T removed = move _data[index];
-        int i = index;
-        while (i < _size - 1)
-        {
-            _data[i] = _data[i + 1];
-            i++;
-        }
-        _size--;
-        return removed;
-    }
-
-    // Remove the element at index, shifting subsequent elements left.
-    // When T is `unique` the removed element is freed. For value types with owned buffers
-    // (e.g. string or a nested container), the element is destructed. A bare (borrowed) pointer
-    // is simply dropped - the list never owned it.
-    void removeAt(int index)
-    {
-        _checkBounds(index, "removeAt");
-        if const (is_unique(T))
-        {
-            if (_data[index] != nullptr) delete _data[index];
-        }
-        else if const (!is_pointer(T))
-            _data[index].~();
-        int i = index;
-        while (i < _size - 1)
-        {
-            _data[i] = _data[i + 1];
-            i++;
-        }
-        _size--;
+        _checkBounds(index, "operator[]");
+        return _data[index];
     }
 
     // Number of elements currently in the list.
-    int count()
+    int count() { return _size; }
+
+    // Remove the element at index, shifting the rest left. The removed element is freed
+    // (`unique`) or destructed (value type); a bare pointer or interface is just dropped.
+    void removeAt(int index)
     {
-        return _size;
+        _checkBounds(index, "removeAt");
+        _releaseAt(index);
+        int i = index;
+        while (i < _size - 1)
+        {
+            _data[i] = move _data[i + 1];
+            i++;
+        }
+        _size--;
     }
 
-    // Remove all elements. `unique` elements are freed; value types with owned buffers (e.g.
-    // string or nested containers) are destructed; bare pointers are dropped. Backing buffer
-    // is kept - capacity is unchanged.
+    // Remove all elements. The backing buffer is kept - capacity is unchanged.
     void clear()
     {
-        if const (is_unique(T))
+        int i = 0;
+        while (i < _size)
         {
-            int i = 0;
-            while (i < _size)
-            {
-                if (_data[i] != nullptr) delete _data[i];
-                i++;
-            }
-        }
-        else if const (!is_pointer(T))
-        {
-            int i = 0;
-            while (i < _size)
-            {
-                _data[i].~();
-                i++;
-            }
+            _releaseAt(i);
+            i++;
         }
         _size = 0;
     }
 
     // -- ICopyable ----------------------------------------------------------
-    // Return a copy of this list. Element handling depends on T:
-    //   - primitive T: copied by value (the source is untouched).
-    //   - other value types (string, or a struct with owning fields): deep-copied via copy(),
-    //     so the two lists own independent buffers and the source is untouched.
-    //   - pointer T: the list OWNS its pointers (the destructor frees them), so each element is
-    //     MOVED to the copy - ownership transfers and the SOURCE slot is nulled. A shared copy
-    //     would hand one pointee to two owners and double-free at teardown; a raw pointer has no
-    //     generic deep-clone. Use move/take explicitly, or a list of values, if that is a surprise.
+    // Deep copy. A list of `unique` elements cannot be copied: there is no generic
+    // deep-clone for the pointee, so a bitwise copy would hand one object to two owners.
+    // Bare pointer / interface elements are borrowed, so they are shallow-copied.
     move list<T> copy()
     {
-        // A `unique` list owns its elements; a bitwise element copy would hand one pointee to two
-        // owners and double-free. There is no generic deep-clone, so copying is a compile error.
         if const (is_unique(T))
         {
-            compile_error("cannot copy a list of unique elements; use move or copy elements explicitly");
+            compile_error("cannot copy a list of unique elements; copy the pointees explicitly, or use list<T*> for a borrowing copy");
             list<T> none;
             return move none;
         }
@@ -171,23 +205,22 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         while (i < _size)
         {
             if const (is_primitive(T))    result.add(_data[i]);
-            // Bare (borrowed) pointer: shallow-alias via a temp so the source slot is not moved out.
             else if const (is_pointer(T)) { T tmp = _data[i]; result.add(tmp); }
+            else if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
             else                          result.add(_data[i].copy());
             i++;
         }
         return move result;
     }
 
-    // Return an independent copy whose backing array and (string) element
-    // buffers are all allocated from `alloc`, so the copy is owned - and freed -
-    // by that allocator. Routes the internal `new` allocations through `alloc`
-    // by temporarily installing it as the active allocator.
+    // Return an independent copy whose backing array and (string) element buffers are all
+    // allocated from `alloc`, so the copy is owned - and freed - by that allocator. Routes
+    // the internal `new` allocations through `alloc` by installing it as the active allocator.
     move list<T> copy(IAllocator alloc)
     {
         if const (is_unique(T))
         {
-            compile_error("cannot copy a list of unique elements; use move or copy elements explicitly");
+            compile_error("cannot copy a list of unique elements; copy the pointees explicitly, or use list<T*> for a borrowing copy");
             list<T> none;
             return move none;
         }
@@ -200,6 +233,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         {
             if const (is_primitive(T))    result.add(_data[i]);
             else if const (is_pointer(T)) { T tmp = _data[i]; result.add(tmp); }
+            else if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
             else                          result.add(_data[i].copy());
             i++;
         }
@@ -261,16 +295,9 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
             _qsort(0, _size - 1, compare);
     }
 
-    // l[index] - same semantics as get(index) (alias borrow, see get).
-    alias T operator[](int index)
-    {
-        _checkBounds(index, "operator[]");
-        return _data[index];
-    }
-
-    // Free all elements then the buffer. Only a `unique` list owns its elements: scalar `delete`
-    // dispatches raw pointer vs interface value by type. A bare `list<T*>` / `list<IFace>` is a
-    // borrowed view and never frees its elements (their real owner does).
+    // Frees `unique` elements; bare pointers and bare interface values are left to their
+    // real owner. Value elements are NOT released here - `delete[_size]` runs their
+    // destructors as it frees the buffer, so doing it above would destruct them twice.
     ~list()
     {
         if const (is_unique(T))
@@ -278,13 +305,10 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
             int i = 0;
             while (i < _size)
             {
-                if (_data[i] != nullptr)
-                    delete _data[i];
+                if (_data[i] != nullptr) delete _data[i];
                 i++;
             }
         }
-        // Value-type elements (including string): call destructor on each then free the buffer.
-        // String elements are guaranteed owned (heap-copied at the move call site) so dtor is safe.
         if (_data != nullptr) delete[_size] _data;
     }
 };

@@ -1,0 +1,15 @@
+// btree<K,V> copies a VALUE element on the plain add()/set()/insert(). A struct that owns a
+// `unique` pointer has no copy(), so the copying overloads are poisoned - but the container
+// must still instantiate, and t.add(k, move x) must stay usable (test_collection_leaks.cb
+// covers that leg). The diagnostic has to name `move` AND an overload that actually exists.
+import "hpc/btree.cb";
+class BtreeInner  { int v = default; };
+class BtreeHolder { unique BtreeInner* slot = default; };
+expect_error("write 'move' at the call site");
+extern int main()
+{
+    btree<int, BtreeHolder> t = default;
+    BtreeHolder h = default;
+    t.add(1, h);
+    return 0;
+}

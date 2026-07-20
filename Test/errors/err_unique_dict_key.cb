@@ -1,0 +1,12 @@
+// A `unique` dictionary KEY is rejected: every lookup reads the key for hashing/equality, and a
+// `unique` argument would be destructively moved out of the caller by that read. The compile_error
+// is on the shared _slot() hash path, so any real dictionary operation fires it (deferred).
+import "dictionary.cb";
+struct Foo { int hash() { return 1; } };
+expect_error("dictionary keys cannot be 'unique'");
+extern int main()
+{
+    dictionary<unique Foo*, int> d;
+    d.add(new Foo(), 5);
+    return 0;
+}

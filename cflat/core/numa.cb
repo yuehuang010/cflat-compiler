@@ -222,7 +222,7 @@ struct NumaDomain {
             if (_released) { return; }
             _released = true;
             while (_threads.count() > 0) {
-                NumaThread* t = _threads.take(0);   // ownership out of the list
+                NumaThread* t = _threads.get(0);   // borrow; removeAt below frees it
                 if (t->_os != nullptr) {
                     if (killRemaining) {
                         os.thread_kill(t->_os);
@@ -240,7 +240,7 @@ struct NumaDomain {
                         t->_os = nullptr;
                     }
                 }
-                delete t;   // NumaThread has no destructor; frees the struct memory
+                _threads.removeAt(0);   // the list owns `unique` elements; this frees t
             }
         }
 
@@ -314,7 +314,10 @@ struct NumaDomain {
     // cleanup; on POSIX the trampoline packet is leaked, as os.thread_kill docs).
     void releaseThread(NumaThread* t) {
         if (t == nullptr) { return; }
-        NumaThread* owned = nullptr;
+        // The handles are copied out under _lock and the kill happens AFTER it is released:
+        // os.thread_kill on a thread that is itself blocked acquiring _lock would deadlock.
+        void*              osHandle = nullptr;
+        _NumaThreadPacket* pkt      = nullptr;
         lock(_lock) {
             int idx = -1;
             int i = 0;
@@ -322,21 +325,22 @@ struct NumaDomain {
                 if (_threads.get(i) == t) { idx = i; break; }
                 i = i + 1;
             }
-            if (idx >= 0) {
-                owned = _threads.take(idx);          // ownership out of the list
-                _freeCores = _freeCores | t->_coreBit;
-            }
-        }
-        if (owned == nullptr) { return; }        // foreign / already released
+            if (idx < 0) { return; }             // foreign / already released
+            _freeCores = _freeCores | t->_coreBit;
 
-        if (owned->_os != nullptr) {
-            os.thread_kill(owned->_os);
+            // Take the handles before removeAt frees the struct, and null them in place so
+            // nothing else can reap the same thread twice.
+            NumaThread* owned = _threads.get(idx);   // borrow; removeAt below frees it
+            osHandle = owned->_os;
             owned->_os = nullptr;
-            if const (__WINDOWS__) {
-                if (owned->_pkt != nullptr) { free((void*)owned->_pkt); owned->_pkt = nullptr; }
-            }
+            if const (__WINDOWS__) { pkt = owned->_pkt; owned->_pkt = nullptr; }
+            _threads.removeAt(idx);
         }
-        delete owned;   // NumaThread has no destructor; frees the struct memory
+
+        if (osHandle != nullptr) {
+            os.thread_kill(osHandle);
+            if const (__WINDOWS__) { if (pkt != nullptr) { free((void*)pkt); } }
+        }
     }
 
     // Domain-local memory: node-bound pages (VirtualAllocExNuma / mmap+mbind);

@@ -1,0 +1,14 @@
+// Paired with err_moved_out_param_unique_iface.cb: the moved-variable check must fire
+// identically for a `unique` POINTER and a `unique` INTERFACE out-parameter. The interface
+// spelling once compiled while this one errored - keep both so they cannot diverge again.
+import "hpc/btree.cb";
+class MvNode { int v = 0; };
+expect_error("use of moved variable 's'");
+extern int main()
+{
+    btree<int, unique MvNode*> t = default;
+    unique MvNode* s = new MvNode();
+    t.add(1, move s);
+    t.lookup(1, &s);
+    return 0;
+}

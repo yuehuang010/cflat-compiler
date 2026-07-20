@@ -1,0 +1,14 @@
+// array<T> for a non-copyable T (owns a `unique` pointer, no copy()) must still
+// instantiate: the copying set() is poisoned instead, and errors only when called.
+// The transfer overload a.set(i, move x) stays usable - see test_collection_leaks.cb.
+import "array.cb";
+class Res { int id = default; };
+class Holder { unique Res* r = default; int k = default; };
+expect_error("write 'move' at the call site");
+extern int main()
+{
+    array<Holder> a; a.init(1);
+    Holder h = default;
+    a.set(0, h);
+    return 0;
+}

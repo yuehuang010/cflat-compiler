@@ -1029,7 +1029,7 @@ bool testDowncastCallResultBorrow()
     bool result = true;
     gDcDtorCount = 0;
 
-    _dcZoo.add(new Pokable());   // the list is the sole owner of this heap object
+    _dcZoo.add(new Pokable());   // a bare list BORROWS; this function frees it below
 
     {
         // Downcast of a CALL RESULT (r-value) - must be a BORROW, not owning.
@@ -1051,7 +1051,8 @@ bool testDowncastCallResultBorrow()
     result &= Test("dc_object_still_live",   dcActive().poke(), 9);
 
     // The real owner frees the heap object exactly once.
-    IPokable owned = _dcZoo.take(0);
+    IPokable owned = _dcZoo.get(0);   // the list only borrows; the caller frees
+    _dcZoo.removeAt(0);
     delete owned;
     result &= Test("dc_owner_frees_once", gDcDtorCount, 1);
 
@@ -1238,29 +1239,28 @@ bool testLocalListInterfaceTakeDelete()
     gBoxDtorCount = 0;
 
     {
-        list<IBoxed> zoo = default;      // LOCAL list - its buffer is freed at scope exit
-
-        Boxed* named = new Boxed();      // owning local, boxed into the list on add
+        Boxed* named = new Boxed();      // the CALLER owns; a bare list only borrows
         named->v = 7;
-        zoo.add(named);
-        zoo.add(new Boxed());            // temporary form
+        Boxed* other = new Boxed();
+        {
+            list<IBoxed> zoo = default;  // LOCAL list - its buffer is freed at scope exit
+            zoo.add(named);              // boxed into the list as a BORROW
+            zoo.add(other);
 
-        result &= Test("localbox_count",      zoo.count(),      2);
-        result &= Test("localbox_elem0",      zoo[0].value(),   7);
-        // The list owns the objects now - the moved-from local must not have freed one.
-        result &= Test("localbox_no_early_dtor", gBoxDtorCount, 0);
+            result &= Test("localbox_count",      zoo.count(),      2);
+            result &= Test("localbox_elem0",      zoo[0].value(),   7);
+            // A borrowing list frees nothing, so the sources are still live and undestructed.
+            result &= Test("localbox_no_early_dtor", gBoxDtorCount, 0);
 
-        IBoxed first = zoo.take(0);
-        delete first;
-        result &= Test("localbox_dtor_after_first", gBoxDtorCount, 1);
-
-        IBoxed second = zoo.take(0);
-        delete second;
-        result &= Test("localbox_dtor_after_second", gBoxDtorCount, 2);
-        result &= Test("localbox_empty", zoo.count(), 0);
+            zoo.removeAt(0);
+            result &= Test("localbox_removeAt_frees_nothing", gBoxDtorCount, 0);
+            zoo.removeAt(0);
+            result &= Test("localbox_empty", zoo.count(), 0);
+        }
+        // The list's destructor ran; it owned nothing, so still no element destructors.
+        result &= Test("localbox_dtor_after_list", gBoxDtorCount, 0);
     }
-    // The local list's own destructor ran here (buffer freed). A double free of an
-    // element would already have corrupted the heap; the count must still be exactly 2.
+    // The owning locals freed each object exactly once at scope exit.
     result &= Test("localbox_dtor_total", gBoxDtorCount, 2);
 
     return result;
@@ -1340,7 +1340,8 @@ bool testInterfaceIsNullUpcast()
 
     while (_wzoo.count() > 0)
     {
-        IWidget w = _wzoo.take(0);
+        IWidget w = _wzoo.get(0);
+        _wzoo.removeAt(0);
         delete w;                                // dtor runs exactly once each
     }
     result &= Test("iface_up_list_dtor_once", gWidgetDtorCount, 3);
@@ -1355,7 +1356,9 @@ bool testLocalListInterfaceGrowTakeDelete()
     gBoxDtorCount = 0;
 
     {
-        list<IBoxed> zoo = default;
+        // `unique` so the list OWNS the boxes across the realloc - the shape under test is
+        // that _grow moves fat-pointer elements intact, which only an owning list can assert.
+        list<unique IBoxed> zoo = default;
         int i = 0;
         while (i < 6)                    // > 4: forces _grow (buffer realloc)
         {
@@ -1370,9 +1373,8 @@ bool testLocalListInterfaceGrowTakeDelete()
         int sum = 0;
         while (zoo.count() > 0)
         {
-            IBoxed it = zoo.take(0);
-            sum += it.value();
-            delete it;
+            sum += zoo[0].value();
+            zoo.removeAt(0);             // the owning list frees each box exactly once
         }
         result &= Test("growbox_sum",  sum,           15);   // 0+1+2+3+4+5
         result &= Test("growbox_dtors", gBoxDtorCount, 6);
@@ -1661,6 +1663,67 @@ bool testInterfaceMethodOwnershipContract()
     return result;
 }
 
+// An interface-typed FIXED ARRAY held as a struct FIELD used to lower to a SINGLE fat pointer
+// instead of [N x {ptr,ptr}]: sizeof reported one element for any N while indexing used the
+// correct 16-byte stride, so writes past v[0] silently clobbered the following fields.
+struct IfaceArrField
+{
+    int head = default;
+    IShape vals[8] = default;
+    int* tail[9] = default;
+};
+
+bool testInterfaceArrayField()
+{
+    bool result = true;
+
+    // sizeof must count all N elements, and the field must not be smaller than the local form.
+    result &= Test("iface_arr_field_sizeof_8", (i64)sizeof(IfaceArrField), (i64)(8 + 8 * 16 + 9 * 8));
+
+    IfaceArrField s = default;
+    s.head = 77;
+    int[9] sentinel = default;
+    for (int i = 0; i < 9; i++) { sentinel[i] = i + 500; s.tail[i] = &sentinel[i]; }
+
+    // Stride must match the element size sizeof now reports.
+    result &= Test("iface_arr_field_stride", (i64)((i8*)&s.vals[1] - (i8*)&s.vals[0]), (i64)16);
+
+    Square[8] sqs = default;
+    Circle[8] cis = default;
+    for (int i = 0; i < 8; i++)
+    {
+        sqs[i].s = i + 1;
+        cis[i].r = i + 1;
+        if (i % 2 == 0) s.vals[i] = sqs[i];
+        else            s.vals[i] = cis[i];
+    }
+
+    // Per-element round trip: each slot keeps the implementation stored into it, and dispatch
+    // through s.vals[i] reaches that element - not element 0.
+    int bad = 0;
+    for (int i = 0; i < 8; i++)
+    {
+        int expect = (i % 2 == 0) ? (i + 1) * (i + 1) : (i + 1) * (i + 1) * 3;
+        if (s.vals[i].area() != expect) bad++;
+    }
+    result &= Test("iface_arr_field_roundtrip", bad, 0);
+
+    // Nothing adjacent in the struct was overwritten by the element writes.
+    int clobbered = 0;
+    for (int i = 0; i < 9; i++)
+        if (s.tail[i] != &sentinel[i] || *s.tail[i] != i + 500) clobbered++;
+    result &= Test("iface_arr_field_tail_intact", clobbered, 0);
+    result &= Test("iface_arr_field_head_intact", s.head, 77);
+
+    // The array LOCAL form must keep dispatching per element too.
+    IShape[4] loc = default;
+    for (int i = 0; i < 4; i++) loc[i] = sqs[i];
+    result &= Test("iface_arr_local_elem0", loc[0].area(), 1);
+    result &= Test("iface_arr_local_elem3", loc[3].area(), 16);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -1701,6 +1764,7 @@ extern int main()
     total++; passed += testMoveParamThroughInterfaceMethod()  ? 1 : 0;
     total++; passed += testInterfaceArgPaths()                ? 1 : 0;
     total++; passed += testInterfaceMethodOwnershipContract()  ? 1 : 0;
+    total++; passed += testInterfaceArrayField()               ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -1,0 +1,13 @@
+// An explicit `move` on a VALUE-type argument bound to a BORROWING parameter transfers
+// nothing: the callee never takes ownership, so the write reads as a transfer but is a
+// no-op. Before this diagnostic the source was eagerly consumed and the buffer leaked
+// with no error at all.
+void borrows(string s) { }
+
+extern int main()
+{
+    string a = "hel" + "lo";
+    expect_error("BORROWS its argument");
+    borrows(move a);
+    return 0;
+}

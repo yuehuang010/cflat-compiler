@@ -452,6 +452,20 @@ public:
         bool IsNullable = false;
         bool IsMove = false;     // parameter declared with 'move' - function takes ownership
         bool IsAlias = false;    // return/decl declared with 'alias' - by-value borrow; caller must not free the interior
+        // This type came from a generic type argument qualified with `alias` - a non-owning
+        // machine word, so `move` on it is a no-op. Distinct from IsAlias (the return/decl
+        // borrow qualifier); reusing that would trip RejectAliasStoreIntoField / delete checks.
+        bool IsAliasTypeArg = false;
+        // This type came from a generic type argument qualified with `unique`. It records only
+        // that provenance - it is set on ANY declaration whose type substitutes to `unique X*`
+        // (locals and fields included), not just parameters, because the substitution branch has
+        // no parameter-context signal. The move-sink meaning lives in the CONSUMERS, which
+        // iterate parameters only (ApplyMoveParamTransfer, DiagnoseExplicitMoveToBorrowParam).
+        // A new consumer must therefore check it is looking at a parameter before treating it as
+        // a sink; reading it off a local and nulling that source would free what nobody owns.
+        // Distinct from IsUnique (the written field/local qualifier), which drives destructor
+        // synthesis and must not be set from a substitution.
+        bool IsUniqueTypeArg = false;
         bool IsBond = false;     // parameter declared with 'bond' - return value borrows from this parameter; return must not outlive it
         bool IsUnique = false;   // struct/interface field declared with 'unique' - the owner owns this raw pointer; the synthesized destructor deletes it. On an interface it is contract: every implementor must agree (VerifyInterfaceFields)
         CallingConv CallConv = CallingConv::Default; // calling convention for extern declarations (Stdcall/Cdecl; Default = compiler-chosen)
@@ -694,6 +708,10 @@ public:
         bool BorrowsOwnedString = false; // true when a string local was initialized/assigned from an owning string FIELD (a non-owning alias of a heap buffer some struct still owns) - storing it into another field would double-free, so the field-store path rejects it
         bool IsOwningStruct = false;     // true for move parameters of struct types with destructors - destructor called on scope exit
         bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
+        // compile-time: this argument was written 'move x' at a call site and is a VALUE type
+        // (string/owning struct/closure). Zeroing is deferred to ApplyMoveParamTransfer so the
+        // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
+        bool IsExplicitMove = false;
         bool MovedIntoInterface = false; // compile-time: ownership was boxed into an interface local ('IFace x = ptr'); 'delete ptr' is a no-op that leaks - delete the interface instead
         std::set<std::string> MovedFields; // compile-time: field names moved out of this variable via a 'move' of a sub-path (e.g. `node->left`) - the base stays usable
         bool IsBonded = false;           // compile-time: true when this variable holds a bonded (borrowed) return value
@@ -968,6 +986,10 @@ public:
     // Functions whose live `if const` branch hit compile_error("msg") during eager instantiation.
     // The error fires later only if the function is actually called (CheckPoisonedFunctionCalls).
     std::unordered_map<std::string, std::string> poisonedFunctions;
+
+    // Source location of the FIRST emitted call to each function, by mangled name. Lets an
+    // end-of-module diagnostic (CheckPoisonedFunctionCalls) point at the real call site.
+    std::unordered_map<std::string, std::pair<size_t, size_t>> firstCallLocation_;
 
     bool lastCallIsBonded = false;           // set when the last call returned a bonded (borrowed) value
     bool lastCallBondByAddress = false;      // set when the bond originates from a by-address lambda capture (kind A)
@@ -1677,10 +1699,13 @@ private:
     // only a genuinely `unique` interface value does. Its Storage is a fat-ptr {i8*,i8*} slot, so
     // EmitOwningPtrCleanup (single pointer) must not run on it - EmitOwningInterfaceCleanup handles
     // the fat-ptr teardown instead.
+    // IsUniqueTypeArg is checked alongside IsUnique: generic substitution records a `unique` type
+    // ARGUMENT there and never sets IsUnique, so `move V value` with V = `unique IFace` would
+    // otherwise read as a borrow and leak (the `unique C*` spelling is owning unconditionally).
     bool IsOwningInterfaceValue(const NamedVariable& namedVar) const
     {
         return namedVar.IsOwning && namedVar.Storage != nullptr
-            && namedVar.TypeAndValue.IsUnique
+            && (namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg)
             && namedVar.TypeAndValue.IsInterface && !namedVar.TypeAndValue.IsInterfacePointer;
     }
 
@@ -1692,6 +1717,42 @@ private:
     {
         auto* fatVal = builder->CreateLoad(GetFatPtrType(), namedVar.Storage);
         DeleteInterfaceValue(fatVal, namedVar.TypeAndValue.TypeName, namedVar.Storage);
+    }
+
+    // True when a fixed-array local (`unique T*[N]` / `unique IFace[N]`) owns every element and
+    // must be torn down slot by slot. A directly-declared unique array FIELD is rejected outright;
+    // a LOCAL is legal, so its N elements need the per-element release the scalar path gives one.
+    bool IsOwningUniqueArray(const NamedVariable& namedVar) const
+    {
+        // IsOwning is deliberately NOT required: it is set from a scalar's single `new` source and
+        // an array has none. `unique` on the declaration is itself the ownership statement here.
+        if (namedVar.Storage == nullptr || namedVar.BaseType == nullptr) return false;
+        if (namedVar.IsAliasBorrow || namedVar.TypeAndValue.IsAlias) return false;
+        if (!namedVar.TypeAndValue.IsUnique && !namedVar.TypeAndValue.IsUniqueTypeArg) return false;
+        if (namedVar.TypeAndValue.ConstArraySize == 0) return false;
+        return namedVar.BaseType->isArrayTy();
+    }
+
+    // Release each element of an owning fixed-array local by reusing the scalar cleanup emitters
+    // over a per-element GEP. Unrolled: N is a compile-time constant and stays small in practice.
+    void EmitOwningUniqueArrayCleanup(const NamedVariable& namedVar)
+    {
+        auto* arrTy = llvm::cast<llvm::ArrayType>(namedVar.BaseType);
+        auto* elemTy = arrTy->getElementType();
+        uint64_t count = arrTy->getNumElements();
+        bool isIface = namedVar.TypeAndValue.IsInterface && !namedVar.TypeAndValue.IsInterfacePointer;
+        for (uint64_t i = 0; i < count; i++)
+        {
+            auto* elemPtr = builder->CreateConstInBoundsGEP2_64(arrTy, namedVar.Storage, 0, i, "uniq.elem");
+            NamedVariable elem = namedVar;
+            elem.Storage = elemPtr;
+            elem.BaseType = elemTy;
+            elem.TypeAndValue.ConstArraySize = 0;
+            if (isIface)
+                EmitOwningInterfaceCleanup(elem);
+            else if (elemTy->isPointerTy())
+                EmitOwningPtrCleanup(elem);
+        }
     }
 
     void RegisterOwnedStringTemp(llvm::Value* value)
@@ -1892,6 +1953,11 @@ private:
         {
             // A `unique` interface local owns a heap-boxed object: free it via the vtable dtor slot
             // + operator delete (mirrors the owning-pointer path; data field nulled so a prior delete no-ops).
+            if (IsOwningUniqueArray(namedVar))
+            {
+                EmitOwningUniqueArrayCleanup(namedVar);
+                continue;
+            }
             if (IsOwningInterfaceValue(namedVar))
             {
                 EmitOwningInterfaceCleanup(namedVar);
@@ -3570,6 +3636,10 @@ private:
             {
                 if (llvm::isa<llvm::CallBase>(u))
                 {
+                    // Point the diagnostic at the call site rather than wherever the walk ended.
+                    auto locIt = firstCallLocation_.find(name);
+                    if (locIt != firstCallLocation_.end())
+                        SetSourceLocation(locIt->second.first, locIt->second.second);
                     LogError(msg);
                     break;
                 }
@@ -9805,12 +9875,48 @@ public:
     // it moved, so the caller's scope exit does not free what the callee now owns. Shared by
     // the normal call path (CreateOverloadedFunctionCall) and virtual dispatch
     // (CallInterfaceMethod) so the two cannot drift. Call AFTER the call is emitted.
+    /*
+     * An explicit 'move x' argument bound to a BORROWING parameter transfers nothing: the
+     * callee never destructs it and the deferred zeroing never runs, so the write reads as
+     * ownership transfer but is a no-op. Only diagnose when the value actually owns a
+     * resource - a non-owning value type has nothing to orphan, so 'move' there is harmless.
+     */
+    void DiagnoseExplicitMoveToBorrowParam(const std::string& functionName,
+        const std::string& paramName, const std::string& paramType, bool paramIsMove,
+        const NamedVariable& arg)
+    {
+        if (!arg.IsExplicitMove || paramIsMove) return;
+        // Owns a resource? A destructor on the value type is the general signal; the
+        // owning-* flags cover the cases (string locals, move params) that lack one.
+        if (!(arg.IsOwningString || arg.IsOwningStruct || arg.IsOwning
+              || TypeHasDestructor(arg.TypeAndValue.TypeName))) return;
+        LogError(std::format(
+            "call to '{}': parameter '{}' BORROWS its argument, so 'move {}' transfers nothing - "
+            "the callee never takes ownership and the value would be orphaned. Drop the 'move', "
+            "or declare the parameter 'move {}'.",
+            functionName, paramName,
+            arg.CallerName.empty() ? arg.TypeAndValue.TypeName : arg.CallerName,
+            paramType));
+    }
+
+    void DiagnoseExplicitMoveToBorrowParam(const std::string& functionName,
+        const TypeAndValue& param, const NamedVariable& arg)
+    {
+        // A `unique`-typed parameter is a sink even without the `move` keyword: the type
+        // itself says the callee takes ownership, so an explicit `move` at the call site is fine.
+        DiagnoseExplicitMoveToBorrowParam(
+            functionName, param.VariableName, param.TypeName, param.IsMove || param.IsUniqueTypeArg, arg);
+    }
+
     void ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args)
     {
         for (size_t i = 0; i < params.size() && i < args.size(); i++)
         {
-            if (params[i].IsMove)
+            // A `unique`-typed parameter is a synthesized move sink: the callee owns and frees it,
+            // so the caller's source must be nulled exactly as for an explicit `move` param.
+            // Without this, `list<unique T*>::add(T value)` leaves the caller owning too.
+            if (params[i].IsMove || params[i].IsUniqueTypeArg)
             {
                 // A `move` param takes ownership and frees the block itself. The allocation alignment
                 // of an over-aligned `new T[n]` is not in the element type, so the callee can recover
@@ -10164,6 +10270,9 @@ public:
         // A `move` parameter on an INTERFACE method transfers ownership just as it does on a
         // direct call, so the caller's source must be nulled/marked-moved here too. Without this
         // the source keeps its owning flag and scope exit frees what the callee now owns.
+        for (size_t i = 0; i < methodInfo->Parameters.size() && i < extraArgNVs.size(); i++)
+            DiagnoseExplicitMoveToBorrowParam(ifaceName + "." + methodName,
+                methodInfo->Parameters[i], extraArgNVs[i]);
         ApplyMoveParamTransfer(ifaceName + "." + methodName, methodInfo->Parameters, extraArgNVs);
 
         // Classify the virtual result's ownership exactly like the direct-call path
@@ -13424,6 +13533,7 @@ public:
         // resolvedTypeName is final; hoist the struct/interface map lookups once.
         auto dsIt = dataStructures.find(resolvedTypeName);
         bool isInterface = interfaceTable.count(resolvedTypeName) > 0;
+        bool skipPointerWrap = false;
 
         if (resolvedTypeName == "void") { type = builder->getVoidTy(); }
         else if (resolvedTypeName == "char" || resolvedTypeName == "i8" || resolvedTypeName == "u8") { type = builder->getInt8Ty(); }
@@ -13445,10 +13555,14 @@ public:
             {
                 auto* fatTy = GetFatPtrType();
                 if (typeAndValue.ElemPointer)
-                    return fatTy->getPointerTo()->getPointerTo(); // {i8*,i8*}** (T* where T=IFace*)
-                if (allowPointer && typeAndValue.IsInterfacePointer)
-                    return fatTy->getPointerTo();                 // {i8*,i8*}* (T* where T=IFace, or T=IFace*)
-                return fatTy;                                     // {i8*,i8*}  (bare fat ptr)
+                    type = fatTy->getPointerTo()->getPointerTo(); // {i8*,i8*}** (T* where T=IFace*)
+                else if (allowPointer && typeAndValue.IsInterfacePointer)
+                    type = fatTy->getPointerTo();                 // {i8*,i8*}* (T* where T=IFace, or T=IFace*)
+                else
+                    type = fatTy;                                 // {i8*,i8*}  (bare fat ptr)
+                // The arms above already encode every pointer level an interface can have, so the
+                // generic wrap below must not run; only the array wrap at the tail still applies.
+                skipPointerWrap = true;
             }
             else
             {
@@ -13492,7 +13606,7 @@ public:
         bool wantPointer = typeAndValue.Pointer || aliasPtrDepth >= 1;
         bool wantElemPointer = typeAndValue.ElemPointer || aliasPtrDepth >= 2
             || (typeAndValue.Pointer && aliasPtrDepth >= 1);
-        if (allowPointer && wantPointer)
+        if (allowPointer && wantPointer && !skipPointerWrap)
         {
             // Note: LLVM doesn't have void ptr, instead use i8 ptr.
             if (type->isVoidTy())
@@ -13527,11 +13641,56 @@ public:
         return type;
     }
 
+    /*
+     * Tie-breaker between overloads that differ only in 'move': for each parameter, score +1
+     * when the param's IsMove agrees with whether the caller-side argument is an owning lvalue
+     * (so the borrow overload wins for non-owning args, the move overload for owning ones).
+     * For function-pointer parameters, also score +1 when the named function arg has an
+     * overload whose per-param IsMove flags match the candidate param's FuncPtrParams exactly
+     * (so the move-typed start() wins for a move-typed fn).
+     */
+    int ScoreMoveAgreement(const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate) const
+    {
+        int moveScore = 0;
+        auto pi = candidate.Parameters.begin();
+        for (const auto& arg : arguments)
+        {
+            if (pi == candidate.Parameters.end()) break;
+            /*
+             * An explicit 'move' at the call site is a direct request for the move
+             * overload, and the ONLY thing that selects it for a NAMED lvalue: passing an
+             * owning variable plainly (value OR pointer) means "borrow".
+             * An RVALUE prefers the move overload the way C++ binds an rvalue to 'T&&'
+             * over 'const T&' - the temporary dies right after the call, so a borrow
+             * overload would deep-copy for nothing. "Rvalue" = no addressable storage and
+             * a CallerName naming nothing in scope (for a call result CallerName holds the
+             * CALLEE's name). Restricted to aggregates, where the copy actually costs.
+             */
+            bool argIsUnbound = arg.Storage == nullptr
+                && FindVariableStorage(arg.CallerName).Storage == nullptr;
+            bool argIsRValue = argIsUnbound && arg.FieldName.empty()
+                && !arg.TypeAndValue.Pointer && !arg.TypeAndValue.IsAliasTypeArg
+                && (arg.IsOwningString || arg.IsOwningStruct
+                    || IsDataStructure(arg.TypeAndValue.TypeName));
+            bool argOwning = arg.IsExplicitMove || argIsRValue;
+            if (pi->IsMove == argOwning)
+                moveScore++;
+            if (pi->IsFunctionPointer && !arg.CallerName.empty()
+                && HasFunctionWithMoveFlags(arg.CallerName, pi->FuncPtrParams))
+            {
+                moveScore += 2;  // weight funcptr-IsMove match heavily so it can break a tie
+            }
+            ++pi;
+        }
+        return moveScore;
+    }
+
     std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> candidates) const
     {
         std::pair<std::vector<NamedVariable>, FunctionSymbol> possibleResult;
         std::pair<std::vector<NamedVariable>, FunctionSymbol> bestPerfect;
         int bestPerfectScore = -1;  // moveScore is always >= 0; -1 means "no perfect match yet"
+        int bestPossibleScore = -1; // same, for the promotion/implicit tier
         // int score = 0; // 2 for promotionMatch, 1 for implicitMatch
 
         for (const auto& pair : candidates)
@@ -13541,7 +13700,9 @@ public:
             if (candidate.Variadic)
             {
                 // Variadic is a fallback: prefer any exact non-variadic match over it.
+                // Reset the score so a later non-variadic candidate always overrides it.
                 possibleResult = pair;
+                bestPossibleScore = -1;
                 continue;
             }
 
@@ -13703,30 +13864,7 @@ public:
 
             if (perfectMatch)
             {
-                // Tie-breaker between perfect-match overloads that differ only in 'move':
-                // for each parameter, score +1 when the param's IsMove agrees with whether
-                // the caller-side argument is an owning lvalue (so the borrow overload wins
-                // for non-owning args, and the move overload wins for owning ones).
-                // For function-pointer parameters, also score +1 when the named function arg
-                // has an overload whose per-param IsMove flags match the candidate param's
-                // FuncPtrParams exactly (so the move-typed start() wins for a move-typed fn).
-                int moveScore = 0;
-                auto pi = candidate.Parameters.begin();
-                for (const auto& arg : arguments)
-                {
-                    if (pi == candidate.Parameters.end()) break;
-                    bool argOwning = !arg.CallerName.empty() &&
-                        (arg.IsOwning || arg.IsOwningString || arg.IsOwningStruct) &&
-                        !arg.IsMoved;
-                    if (pi->IsMove == argOwning)
-                        moveScore++;
-                    if (pi->IsFunctionPointer && !arg.CallerName.empty()
-                        && HasFunctionWithMoveFlags(arg.CallerName, pi->FuncPtrParams))
-                    {
-                        moveScore += 2;  // weight funcptr-IsMove match heavily so it can break a tie
-                    }
-                    ++pi;
-                }
+                int moveScore = ScoreMoveAgreement(arguments, candidate);
                 if (moveScore > bestPerfectScore)
                 {
                     bestPerfectScore = moveScore;
@@ -13735,9 +13873,18 @@ public:
                 continue;
             }
 
+            // Promotion/implicit tier needs the SAME move tie-break as the perfect tier: an
+            // int LITERAL key is only a promotion match, so `d.add(1, namedLvalue)` used to
+            // degrade both overloads to this tier and silently keep the last-declared one -
+            // the `move` overload - consuming the caller's variable.
             if (promotionMatch || implicitMatch)
             {
-                possibleResult = pair;
+                int moveScore = ScoreMoveAgreement(arguments, candidate);
+                if (moveScore >= bestPossibleScore)   // >= keeps the pre-existing last-wins tie
+                {
+                    bestPossibleScore = moveScore;
+                    possibleResult = pair;
+                }
             }
         }
 
@@ -14456,6 +14603,7 @@ public:
         {
             if (candidate.Parameters[i].IsMove && matched[i].IsBonded)
                 LogError(std::format("parameter '{}': cannot pass bonded value to 'move' parameter - bonded values cannot be transferred out of their source's scope", candidate.Parameters[i].VariableName));
+            DiagnoseExplicitMoveToBorrowParam(functionName, candidate.Parameters[i], matched[i]);
         }
 
         // C-extern ABI lowering: when the resolved candidate has struct-by-value params or
@@ -14463,6 +14611,12 @@ public:
         // byval ptr / sret). The current argList still holds CFlat-natural struct values -
         // EmitAbiLoweredCall rewrites it to match the recipe and reloads the struct return
         // for the caller. Otherwise fall through to the existing call path.
+        // Remember where this callee was first called, so an end-of-module diagnostic
+        // (CheckPoisonedFunctionCalls) can point at the real call site.
+        if (candidate.Function != nullptr)
+            firstCallLocation_.emplace(candidate.Function->getName().str(),
+                std::make_pair(currentLine, currentColumn));
+
         llvm::Value* result = candidate.Recipe.hasLowering
             ? EmitAbiLoweredCall(candidate, argList)
             : CreateFunctionCall(candidate.Function, argList);
@@ -15116,6 +15270,23 @@ public:
         {
             for (auto& [name, nv] : frame.functionArgument) restoreOne(name, nv);
             for (auto& [name, nv] : frame.namedVariable) restoreOne(name, nv);
+        }
+    }
+
+    // ORs a snapshot into the LIVE state: a variable (or field) moved in the snapshot becomes
+    // moved now. Used to fold each break/continue path's moves back in at loop exit.
+    void MergeMovedStateInto(const MovedStateSnapshot& state)
+    {
+        auto mergeOne = [&](const std::string& name, NamedVariable& nv) {
+            if (auto it = state.moved.find(name); it != state.moved.end() && it->second)
+                nv.IsMoved = true;
+            if (auto it = state.movedFields.find(name); it != state.movedFields.end())
+                nv.MovedFields.insert(it->second.begin(), it->second.end());
+        };
+        for (auto& frame : stackNamedVariable)
+        {
+            for (auto& [name, nv] : frame.functionArgument) mergeOne(name, nv);
+            for (auto& [name, nv] : frame.namedVariable) mergeOne(name, nv);
         }
     }
 

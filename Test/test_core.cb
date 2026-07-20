@@ -650,16 +650,15 @@ int testListPtrOwnership()
     l.add(new Tracked());
     l.add(new Tracked());
 
-    // take() transfers ownership to the caller; delete then frees it exactly once.
-    Tracked* taken = l.take(0);
-    delete taken;
-    passed += Test("list<T*> take+delete dtor once", g_dtor_count, 1);
-    passed += Test("list<T*> count after take",      l.count(),   2);
-
-    // removeAt() frees the pointer element in place (dtor fires once more).
+    // The list owns its `unique` elements: removeAt frees in place, exactly once.
+    // take() is gone with the borrow-by-default list (plan item 5).
     l.removeAt(0);
-    passed += Test("list<T*> removeAt frees element", g_dtor_count, 2);
-    passed += Test("list<T*> count after removeAt",   l.count(),   1);
+    passed += Test("list<unique T*> removeAt frees element", g_dtor_count, 1);
+    passed += Test("list<unique T*> count after removeAt",   l.count(),   2);
+
+    l.removeAt(0);
+    passed += Test("list<unique T*> removeAt frees again",   g_dtor_count, 2);
+    passed += Test("list<unique T*> count after 2nd removeAt", l.count(),  1);
 
     // The remaining element is freed by the list destructor at scope exit.
     return passed;
@@ -1574,7 +1573,7 @@ int testStringAPI()
             {
                 string tmp = words.get(jj).copy();
                 words.set(jj, words.get(jj + 1).copy());
-                words.set(jj + 1, move tmp);
+                words.set(jj + 1, tmp);
             }
             jj++;
         }

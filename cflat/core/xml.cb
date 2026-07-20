@@ -42,10 +42,11 @@ class XmlBuilder : IReflector
     // Close the current object element.
     void endObject()
     {
+        // Close BEFORE removing: get() hands back a borrow of the slot, and removeAt
+        // destructs that string, so using the borrow afterwards reads freed memory.
         int last = _tags.count() - 1;
-        string tag = _tags.get(last);
+        _closeTag(_tags.get(last));
         _tags.removeAt(last);
-        _closeTag(tag);
     }
 
     // Open an array element named `name`.
@@ -58,10 +59,11 @@ class XmlBuilder : IReflector
     // Close the current array element.
     void endArray()
     {
+        // Close BEFORE removing: get() hands back a borrow of the slot, and removeAt
+        // destructs that string, so using the borrow afterwards reads freed memory.
         int last = _tags.count() - 1;
-        string tag = _tags.get(last);
+        _closeTag(_tags.get(last));
         _tags.removeAt(last);
-        _closeTag(tag);
     }
 
     // Emit an integer field as <tag>value</tag>.

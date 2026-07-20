@@ -4208,12 +4208,16 @@ move IElement reconcilePath(move IElement committed, move IElement wip, list<Pat
     // Drain committed's children into a staging list so we can rebuild in order.
     list<IElement> staged = default;
     while (kids.count() > 0)
-        staged.add(kids.take(0));
+    {
+        staged.add(kids.get(0));
+        kids.removeAt(0);   // borrowing list: drops the entry, frees nothing
+    }
 
     int i = 0;
     while (i < newN)
     {
-        IElement newC = newKids.take(0);
+        IElement newC = newKids.get(0);
+        newKids.removeAt(0);   // borrowing list: drops the entry, frees nothing
 
         // Match a committed child to reuse: by key if this child is keyed (so it
         // can move position), else positionally from the front of the staged list.
@@ -4224,7 +4228,8 @@ move IElement reconcilePath(move IElement committed, move IElement wip, list<Pat
 
         if (idx >= 0)
         {
-            IElement oldC = staged.take(idx);
+            IElement oldC = staged.get(idx);
+            staged.removeAt(idx);
             kids.add(reconcilePath(oldC, newC, patches, selfPath));
         }
         else
@@ -4239,7 +4244,8 @@ move IElement reconcilePath(move IElement committed, move IElement wip, list<Pat
     // Any committed children left over were removed.
     while (staged.count() > 0)
     {
-        IElement rem = staged.take(0);
+        IElement rem = staged.get(0);
+        staged.removeAt(0);
         string remPath = joinKeyPath(selfPath, keySegment(rem, 0));
         patches.add(makePatchKeyed(PATCH_REMOVE, rem.kind(), "remove", remPath));
         deleteTree(rem);

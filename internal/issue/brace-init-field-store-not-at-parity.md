@@ -98,4 +98,4 @@ extraction, one rule at a time, each with its own regression test.
 
 ## Related
 
-- `internal/plan/field-ownership-unique.md` - instances 1-4 and the shared-helper precedent.
+- `internal/plan/unique-ownership.md` (Part I) - instances 1-4 and the shared-helper precedent.

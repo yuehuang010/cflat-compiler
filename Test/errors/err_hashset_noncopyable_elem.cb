@@ -1,0 +1,18 @@
+// hashset<T> for a non-copyable T (owns a `unique` pointer, no copy()) must still
+// instantiate: the copying add() is poisoned instead, and errors only when called.
+// The transfer overload s.add(move x) stays usable - see test_collection_leaks.cb.
+import "hashset.cb";
+class Res { int id = default; };
+class Holder { unique Res* r = default;
+    int k = default;
+    bool operator==(alias Holder o) { return k == o.k; }
+    int hash() { return k; }
+};
+expect_error("write 'move' at the call site");
+extern int main()
+{
+    hashset<Holder> s = default;
+    Holder h = default;
+    s.add(h);
+    return 0;
+}

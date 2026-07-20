@@ -1,0 +1,14 @@
+// list<T> for a non-copyable T (owns a `unique` pointer, no copy()) must still
+// instantiate: the copying add() is poisoned instead, and errors only when called.
+// The poison is deferred past eager instantiation, so use a file-scope expect_error.
+import "list.cb";
+class Res { int id = default; };
+class Holder { unique Res* r = default; };
+expect_error("write 'move' at the call site");
+extern int main()
+{
+    list<Holder> l = default;
+    Holder h = default;
+    l.add(h);
+    return 0;
+}

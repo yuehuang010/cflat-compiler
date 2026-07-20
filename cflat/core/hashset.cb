@@ -4,6 +4,12 @@
 // POINTER elements are BORROWED - callers own them and are responsible for freeing them.
 // VALUE-TYPE elements with owning fields (string, or a struct that owns buffers) are DEEP-COPIED
 // on add() so the slot owns an independent buffer, and are freed by remove()/clear()/the destructor.
+// `s.add(x)` therefore leaves the caller's `x` intact; write `s.add(move x)` to transfer instead.
+// That transfer overload exists for value elements only - a borrowing container must not take
+// ownership of a pointer element, since nothing would ever free it.
+// A `unique` element is REJECTED (compile error): set elements are key-like - contains()/remove()
+// read the element for hashing/equality, and a `unique` argument would be destructively moved out
+// by that read. Use a borrowed element and manage its lifetime separately.
 
 struct hashset<T>
 {
@@ -14,11 +20,20 @@ struct hashset<T>
     int   _tombstones = 0;     // number of deleted (status==2) slots
 
     // Hash value to a starting bucket index in [0, _capacity).
-    int _slot(T value)
+    int _slot(alias T value)
     {
+        // A `unique` element cannot be borrowed for hashing: reading it here would move it out of
+        // the caller. Poison the shared hash path so ANY hashset operation on a unique-element
+        // instantiation is a compile error (deferred: fires only if _slot is actually called).
+        if const (is_unique(T))
+        {
+            compile_error("hashset elements cannot be 'unique'; set elements are key-like and a lookup reads the element for hashing/equality, which would move it out. Use 'hashset<alias T*>' to hold borrowed elements and manage their lifetime separately.");
+        }
         int h = 0;
         if const (is_primitive(T))
             h = Hash(value) % _capacity;
+        else if const (is_interface(T))
+            compile_error("hashset<T> does not support an interface key type; an interface value is a fat pointer with no stable identity to hash");
         else if const (is_pointer(T))
             h = Hash((i64)value) % _capacity;
         else
@@ -85,37 +100,82 @@ struct hashset<T>
         delete[] oldStatus;
     }
 
-    // Insert value. Returns true if added, false if already present.
-    bool add(T value)
+    // Insert value. Returns true if added, false if already present. A value-type element is
+    // deep-COPIED (the caller's value is left intact); a pointer element is BORROWED.
+    bool add(alias T value)
     {
-        if (_capacity == 0) _init(8);
-        _maybeRehash();
-
-        int slot = _slot(value);
-        int firstDeleted = -1;
-        while (_status[slot] != 0)
+        // Poison the copying overload for a non-copyable T so the class still instantiates and
+        // `add(move x)` stays usable; the dead arm emits no call to the poisoned _placeAt.
+        if const (!is_copyable(T)) compile_error("this hashset element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (s.add(move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else
         {
-            if (_status[slot] == 1 && _keys[slot] == value) return false;
-            if (_status[slot] == 2 && firstDeleted == -1) firstDeleted = slot;
-            slot = (slot + 1) % _capacity;
+            if (_capacity == 0) _init(8);
+            _maybeRehash();
+
+            int slot = _slot(value);
+            int firstDeleted = -1;
+            while (_status[slot] != 0)
+            {
+                if (_status[slot] == 1 && _keys[slot] == value) return false;
+                if (_status[slot] == 2 && firstDeleted == -1) firstDeleted = slot;
+                slot = (slot + 1) % _capacity;
+            }
+            int insertSlot = slot;
+            if (firstDeleted != -1) { insertSlot = firstDeleted; _tombstones--; }
+            _placeAt(insertSlot, value);
+            _status[insertSlot] = 1;
+            _count++;
         }
-        int insertSlot = slot;
-        if (firstDeleted != -1) { insertSlot = firstDeleted; _tombstones--; }
-        // Store the element. Primitive and pointer elements are stored as-is - the set BORROWS
-        // pointer elements (it never frees them), matching its original contract. A `string` (or
-        // any other value type with owning fields) is deep-copied so the slot owns an independent
-        // buffer: a plain store would alias the caller's `value` argument (a soon-freed temp/
-        // local) and dangle once it is freed. The destructor/remove()/clear() free this owned copy.
-        if const (is_primitive(T))    _keys[insertSlot] = value;
-        else if const (is_pointer(T)) _keys[insertSlot] = value;
-        else                          _keys[insertSlot] = value.copy();
-        _status[insertSlot] = 1;
-        _count++;
         return true;
     }
 
+    // Transfer overload - the caller writes `move` to give up ownership instead of paying for a
+    // deep copy. Offered for VALUE elements only; the `!is_pointer(T)` guard is the design, not a
+    // workaround: a bare pointer / interface element is BORROWED, so accepting ownership would
+    // strand it (nothing ever frees it). is_pointer(T) covers bare, `unique`, `alias` and
+    // interface elements alike (a `unique` element is separately rejected by _slot). Declared
+    // AFTER the plain add() so an interface contract check matches the plain overload first.
+    if const (!is_pointer(T))
+    {
+        bool add(move T value)
+        {
+            if (_capacity == 0) _init(8);
+            _maybeRehash();
+
+            int slot = _slot(value);
+            int firstDeleted = -1;
+            while (_status[slot] != 0)
+            {
+                if (_status[slot] == 1 && _keys[slot] == value) return false;
+                if (_status[slot] == 2 && firstDeleted == -1) firstDeleted = slot;
+                slot = (slot + 1) % _capacity;
+            }
+            int insertSlot = slot;
+            if (firstDeleted != -1) { insertSlot = firstDeleted; _tombstones--; }
+            _keys[insertSlot] = move value;
+            _status[insertSlot] = 1;
+            _count++;
+            return true;
+        }
+    }
+
+    // Store the element into a slot that holds no live element yet. Primitive and pointer
+    // elements are stored as-is - the set BORROWS pointer elements (it never frees them). A
+    // `string` (or any other value type with owning fields) is deep-copied so the slot owns an
+    // independent buffer: a plain store would alias the caller's `value` argument (a soon-freed
+    // temp/local) and dangle once it is freed. remove()/clear()/the destructor free that copy.
+    // `is_pointer(T)` is true for bare, `unique`, `alias` and interface types alike, so it
+    // subsumes the alias case - do not add an is_alias arm, it is unreachable.
+    void _placeAt(int index, alias T value)
+    {
+        if const (is_primitive(T))      _keys[index] = value;
+        else if const (is_pointer(T))   _keys[index] = value;
+        else if const (!is_copyable(T)) compile_error("this hashset element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (s.add(move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else                            _keys[index] = value.copy();
+    }
+
     // Returns true if value is in the set.
-    bool contains(T value)
+    bool contains(alias T value)
     {
         if (_capacity == 0) return false;
         int slot = _slot(value);
@@ -128,7 +188,7 @@ struct hashset<T>
     }
 
     // Remove value. Returns true if removed, false if not found.
-    bool remove(T value)
+    bool remove(alias T value)
     {
         if (_capacity == 0) return false;
         int slot = _slot(value);

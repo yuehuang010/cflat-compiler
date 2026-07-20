@@ -1,0 +1,13 @@
+// A dictionary of `unique` values is move-only: copy() would hand one pointee to two owners and
+// double-free. The compile_error fires when copy() is actually called (deferred past eager
+// instantiation), so a file-scope expect_error catches it.
+import "dictionary.cb";
+struct C { int r = 0; ~C() {} };
+expect_error("cannot copy a dictionary of unique values");
+extern int main()
+{
+    dictionary<int, unique C*> u;
+    u.add(1, new C());
+    dictionary<int, unique C*> v = u.copy();
+    return 0;
+}

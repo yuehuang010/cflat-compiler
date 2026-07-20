@@ -1,0 +1,14 @@
+// Member-scope `if const` must reject a condition that is not a compile-time constant.
+int ifConstRuntimeValue() { return 1; }
+
+expect_error("'if const' condition must be a compile-time constant expression");
+
+class BadIfConstMember
+{
+    if const (ifConstRuntimeValue()) { int a = 1; }
+};
+
+extern int main()
+{
+    return 0;
+}

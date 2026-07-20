@@ -1,0 +1,411 @@
+// Ownership validation for list<T>: the six quadrants of the borrow-by-default rule.
+//
+// The claim under test: bare BORROWS and `unique` OWNS, uniformly for pointers AND
+// interface values. Aligning on OWN instead is impossible, because boxing a STACK value
+// into an interface is idiomatic and freeing a stack-boxed interface value aborts.
+// Every ownership assertion is backed by a destructor count AND the HeapAudit
+// leak oracle, since the failure mode of an ownership rule is a leak or a double free,
+// neither of which a plain value assertion would catch. HeapAudit needs an -o build.
+//
+// Also covers the trade-off list accepts: value-type insertion COPIES (the caller's
+// value stays intact), with `move` at the call site to transfer instead.
+import "string.cb";
+import "list.cb";
+import "diagnostic/heap_audit.cb";
+import "test_helper.cb";
+
+int g_dtor = 0;
+
+class Res
+{
+    int id = default;
+    Res(int i) { id = i; }
+    ~Res() { g_dtor = g_dtor + 1; }
+};
+
+class Val
+{
+    int id = default;
+    ~Val() { g_dtor = g_dtor + 1; }
+};
+
+// A non-copyable value type: it owns a `unique` pointer and has no copy(), so copy
+// synthesis is refused. is_copyable(NonCopyable) is 0 and list accepts it move-only.
+class NonCopyable
+{
+    unique Res* r = default;
+};
+
+interface IShape { int area(); };
+
+class Sq : IShape
+{
+    int s = default;
+    Sq(int v) { s = v; }
+    int area() { return s * s; }
+    ~Sq() { g_dtor = g_dtor + 1; }
+};
+
+// --- primitives -----------------------------------------------------------------
+
+int testPrimitives()
+{
+    int passed = 0;
+    list<int> l = default;
+    l.add(10);
+    l.add(20);
+    l.add(30);
+    passed += Test("list<int> count", l.count(), 3);
+    passed += Test("list<int> [0]", l[0], 10);
+    passed += Test("list<int> get(2)", l.get(2), 30);
+    passed += Test("list<int> count is 3", l.count(), 3);
+    l.removeAt(l.count() - 1);
+    passed += Test("list<int> count after removeAt last", l.count(), 2);
+    l.removeAt(0);
+    passed += Test("list<int> count after removeAt", l.count(), 1);
+    passed += Test("list<int> [0] after removeAt", l[0], 20);
+    l.clear();
+    passed += Test("list<int> count after clear", l.count(), 0);
+    return passed;
+}
+
+// --- value types: insertion COPIES -----------------------------------------------
+
+int testValueCopySemantics()
+{
+    int passed = 0;
+    g_dtor = 0;
+    {
+        list<Val> l = default;
+        Val a = default;
+        a.id = 1;
+        l.add(a);
+        passed += Test("list<Val> stored value", l[0].id, 1);
+        // Mutating the source must not touch the stored copy - proves a deep copy, not an alias.
+        a.id = 42;
+        passed += Test("list<Val> copy is independent", l[0].id, 1);
+        passed += Test("list<Val> source intact", a.id, 42);
+    }
+    // Two destructors: the stored copy and the source local.
+    passed += Test("list<Val> dtor count", g_dtor, 2);
+    return passed;
+}
+
+int testStringCopySemantics()
+{
+    int passed = 0;
+    {
+        list<string> l = default;
+        string s = "hel" + "lo";
+        l.add(s);
+        passed += Test("list<string> source intact after add", s.length(), 5);
+        passed += Test("list<string> stored", l[0].length(), 5);
+    }
+    return passed;
+}
+
+// A `move` at the call site transfers instead of copying - the opt-in escape from the
+// copy default. Reading `s` afterwards is a compile error, so the assertion is on the
+// stored value plus leak-freedom.
+int testStringMoveSemantics()
+{
+    int passed = 0;
+    {
+        list<string> l = default;
+        string s = "wor" + "ld";
+        l.add(move s);
+        passed += Test("list<string> stored after move", l[0].length(), 5);
+    }
+    return passed;
+}
+
+// --- bare pointer: BORROWS --------------------------------------------------------
+
+int testBarePointerBorrows()
+{
+    int passed = 0;
+    g_dtor = 0;
+    Res* p = new Res(1);
+    {
+        list<Res*> l = default;
+        l.add(p);
+        // The source is NOT consumed - a borrowing container leaves it usable.
+        passed += Test("list<T*> source usable after add", p.id, 1);
+        passed += Test("list<T*> stored", l[0].id, 1);
+        l.clear();
+        passed += Test("list<T*> clear frees nothing", g_dtor, 0);
+    }
+    passed += Test("list<T*> dtor frees nothing", g_dtor, 0);
+    delete p;
+    passed += Test("list<T*> caller frees exactly once", g_dtor, 1);
+    return passed;
+}
+
+int testAliasPointerBorrows()
+{
+    int passed = 0;
+    g_dtor = 0;
+    Res* p = new Res(2);
+    {
+        list<alias Res*> l = default;
+        l.add(p);
+        passed += Test("list<alias T*> source usable", p.id, 2);
+        passed += Test("list<alias T*> stored", l[0].id, 2);
+    }
+    passed += Test("list<alias T*> dtor frees nothing", g_dtor, 0);
+    delete p;
+    passed += Test("list<alias T*> caller frees once", g_dtor, 1);
+    return passed;
+}
+
+// --- unique pointer: OWNS ---------------------------------------------------------
+
+int testUniquePointerOwns()
+{
+    int passed = 0;
+    g_dtor = 0;
+    {
+        list<unique Res*> l = default;
+        l.add(new Res(1));
+        l.add(new Res(2));
+        passed += Test("list<unique T*> count", l.count(), 2);
+        l.removeAt(l.count() - 1);
+        passed += Test("list<unique T*> removeAt frees", g_dtor, 1);
+    }
+    passed += Test("list<unique T*> dtor frees the rest", g_dtor, 2);
+    return passed;
+}
+
+int testUniquePointerSetFreesOld()
+{
+    int passed = 0;
+    g_dtor = 0;
+    {
+        list<unique Res*> l = default;
+        l.add(new Res(1));
+        l.set(0, new Res(2));
+        passed += Test("list<unique T*> set frees old element", g_dtor, 1);
+    }
+    passed += Test("list<unique T*> set total dtors", g_dtor, 2);
+    return passed;
+}
+
+// --- interfaces: the alignment claim ----------------------------------------------
+
+// The case list<T> cannot support: a bare interface container holding a STACK value.
+// Freeing it would abort, so bare MUST borrow - and list borrows bare pointers too,
+// which is the whole point of the design.
+int testBareInterfaceBorrows()
+{
+    int passed = 0;
+    g_dtor = 0;
+    {
+        Sq q = default;
+        q.s = 3;
+        {
+            list<IShape> l = default;
+            l.add(q);
+            passed += Test("list<IShape> virtual dispatch", l[0].area(), 9);
+            l.clear();
+            passed += Test("list<IShape> clear frees nothing", g_dtor, 0);
+        }
+        passed += Test("list<IShape> dtor frees nothing", g_dtor, 0);
+        passed += Test("list<IShape> stack source still usable", q.area(), 9);
+    }
+    // Only the stack Sq's own destructor runs.
+    passed += Test("list<IShape> stack source dtor once", g_dtor, 1);
+    return passed;
+}
+
+int testUniqueInterfaceOwns()
+{
+    int passed = 0;
+    g_dtor = 0;
+    {
+        list<unique IShape> l = default;
+        l.add(new Sq(7));
+        passed += Test("list<unique IShape> virtual dispatch", l[0].area(), 49);
+    }
+    passed += Test("list<unique IShape> dtor frees", g_dtor, 1);
+    return passed;
+}
+
+// --- copy() -----------------------------------------------------------------------
+
+int testCopyValue()
+{
+    int passed = 0;
+    {
+        list<Val> src = default;
+        Val a = default;
+        a.id = 5;
+        src.add(a);
+        list<Val> dst = src.copy();
+        passed += Test("list<Val> copy count", dst.count(), 1);
+        passed += Test("list<Val> copy value", dst[0].id, 5);
+        passed += Test("list<Val> copy source intact", src[0].id, 5);
+    }
+    return passed;
+}
+
+int testCopyBorrowedPointer()
+{
+    int passed = 0;
+    g_dtor = 0;
+    Res* p = new Res(9);
+    {
+        list<Res*> src = default;
+        src.add(p);
+        list<Res*> dst = src.copy();
+        passed += Test("list<T*> copy count", dst.count(), 1);
+        // Both containers borrow the SAME pointee - a borrowing copy is a shallow alias.
+        passed += Test("list<T*> copy aliases same element", dst[0].id, 9);
+        passed += Test("list<T*> copy source intact", src[0].id, 9);
+    }
+    passed += Test("list<T*> two borrowing copies free nothing", g_dtor, 0);
+    delete p;
+    passed += Test("list<T*> owner frees exactly once", g_dtor, 1);
+    return passed;
+}
+
+// --- IList<T> contract -----------------------------------------------------------
+
+// list satisfies IList with no `move` anywhere in the contract; calls through the
+// interface must behave identically to direct calls.
+int testIListContract()
+{
+    int passed = 0;
+    g_dtor = 0;
+    Res* p = new Res(4);
+    {
+        list<Res*> concrete = default;
+        IList<Res*> l = concrete;
+        l.add(p);
+        passed += Test("IList count through interface", l.count(), 1);
+        passed += Test("IList get() through interface", l.get(0).id, 4);
+        passed += Test("IList count through interface", l.count(), 1);
+        // Insertion through the contract borrows too - no move in the signature.
+        passed += Test("IList add did not consume source", p.id, 4);
+        l.clear();
+        passed += Test("IList clear through interface", l.count(), 0);
+        passed += Test("IList clear freed nothing", g_dtor, 0);
+    }
+    delete p;
+    passed += Test("IList owner frees once", g_dtor, 1);
+    return passed;
+}
+
+// --- non-copyable element type: move-only insertion -----------------------------
+
+int testNonCopyableMoveOnly()
+{
+    int passed = 0;
+    g_dtor = 0;
+    {
+        list<NonCopyable> l = default;
+        NonCopyable h = default;
+        h.r = new Res(7);
+        // add(T) is poisoned for a non-copyable T; the move overload must still work.
+        l.add(move h);
+        passed += Test("non-copyable move add count", l.count(), 1);
+        passed += Test("non-copyable move add freed nothing yet", g_dtor, 0);
+    }
+    passed += Test("non-copyable element freed exactly once", g_dtor, 1);
+    return passed;
+}
+
+// --- sort() ----------------------------------------------------------------------
+
+// sort is orthogonal to ownership - it permutes slots in place and must neither free
+// nor copy elements. Exercised on a value leg and on the borrowing pointer leg.
+int testSort()
+{
+    int passed = 0;
+    g_dtor = 0;
+    list<int> li = default;
+    li.add(30); li.add(10); li.add(20);
+    li.sort((int a, int b) => { return a < b; });
+    passed += Test("sort<int> [0]", li[0], 10);
+    passed += Test("sort<int> [2]", li[2], 30);
+
+    Res* r1 = new Res(3);
+    Res* r2 = new Res(1);
+    Res* r3 = new Res(2);
+    {
+        list<Res*> lp = default;
+        lp.add(r1); lp.add(r2); lp.add(r3);
+        lp.sort((Res* a, Res* b) => { return a.id < b.id; });
+        passed += Test("sort<T*> [0]", lp[0].id, 1);
+        passed += Test("sort<T*> [2]", lp[2].id, 3);
+        passed += Test("sort<T*> freed nothing", g_dtor, 0);
+    }
+    passed += Test("sort<T*> dtor freed nothing", g_dtor, 0);
+    delete r1; delete r2; delete r3;
+    passed += Test("sort<T*> owner frees each once", g_dtor, 3);
+    return passed;
+}
+
+// is_copyable(T) must agree with the compiler's own copy refusal for every T.
+class CopyProbe<T>
+{
+    int copyable()
+    {
+        if const (is_copyable(T)) return 1;
+        else                      return 0;
+    }
+};
+
+int testIsCopyable()
+{
+    int passed = 0;
+    CopyProbe<int> a = default;
+    CopyProbe<Res*> b = default;
+    CopyProbe<unique Res*> c = default;
+    CopyProbe<alias Res*> d = default;
+    CopyProbe<string> e = default;
+    CopyProbe<IShape> f = default;
+    CopyProbe<Val> g = default;
+    CopyProbe<NonCopyable> h = default;
+    passed += Test("is_copyable(int)", a.copyable(), 1);
+    passed += Test("is_copyable(Res*)", b.copyable(), 1);
+    passed += Test("is_copyable(unique Res*)", c.copyable(), 1);
+    passed += Test("is_copyable(alias Res*)", d.copyable(), 1);
+    passed += Test("is_copyable(string)", e.copyable(), 1);
+    passed += Test("is_copyable(IShape)", f.copyable(), 1);
+    passed += Test("is_copyable(Val)", g.copyable(), 1);
+    passed += Test("is_copyable(NonCopyable)", h.copyable(), 0);
+    return passed;
+}
+
+extern int main()
+{
+    HeapAudit.enable();
+
+    int passed = 0;
+    int total  = 0;
+
+    total += 8;  passed += testPrimitives();
+    total += 4;  passed += testValueCopySemantics();
+    total += 2;  passed += testStringCopySemantics();
+    total += 1;  passed += testStringMoveSemantics();
+    total += 5;  passed += testBarePointerBorrows();
+    total += 4;  passed += testAliasPointerBorrows();
+    total += 3;  passed += testUniquePointerOwns();
+    total += 2;  passed += testUniquePointerSetFreesOld();
+    total += 5;  passed += testBareInterfaceBorrows();
+    total += 2;  passed += testUniqueInterfaceOwns();
+    total += 3;  passed += testCopyValue();
+    total += 5;  passed += testCopyBorrowedPointer();
+    total += 7;  passed += testIListContract();
+    total += 3;  passed += testNonCopyableMoveOnly();
+    total += 8;  passed += testIsCopyable();
+    total += 7;  passed += testSort();
+
+    // Every ownership rule above is only meaningful if nothing leaked.
+    int leaks = (int)HeapAudit.reportLeaks();
+    total += 1;
+    passed += Test("list no leaks across all cases", leaks, 0);
+
+    printf("%d/%d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

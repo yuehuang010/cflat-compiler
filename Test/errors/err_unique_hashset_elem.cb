@@ -1,0 +1,12 @@
+// A `unique` hashset ELEMENT is rejected: set elements are key-like - contains()/remove() read the
+// element for hashing/equality, and a `unique` argument would be destructively moved out by that
+// read. The compile_error is on the shared _slot() hash path, so any real operation fires it.
+import "hashset.cb";
+struct Foo { int hash() { return 1; } };
+expect_error("hashset elements cannot be 'unique'");
+extern int main()
+{
+    hashset<unique Foo*> s;
+    s.add(new Foo());
+    return 0;
+}

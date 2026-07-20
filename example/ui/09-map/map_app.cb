@@ -387,10 +387,10 @@ class MapApp : IComponent
         // Join + free any fetch still in flight at teardown (leak-clean).
         while (this.jobs.count() > 0)
         {
-            TileJob* j = this.jobs.take(0);
+            TileJob* j = this.jobs.get(0);   // borrow; removeAt below frees it
             j.th.join();
             if (j.pixels != 0u) { free((void*)j.pixels); j.pixels = 0u; }
-            delete j;
+            this.jobs.removeAt(0);
         }
         if (this.map != nullptr) { delete this.map; this.map = nullptr; }
     }
@@ -426,7 +426,7 @@ class MapApp : IComponent
         int i = 0;
         while (i < this.jobs.count())
         {
-            if (this.jobs.get(i) == doneJob) { TileJob* owned = this.jobs.take(i); delete owned; break; }
+            if (this.jobs.get(i) == doneJob) { this.jobs.removeAt(i); break; }
             i++;
         }
         this.tilesCompleted++;

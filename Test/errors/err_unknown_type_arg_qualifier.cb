@@ -1,0 +1,7 @@
+// Only `unique` and `alias` are admitted as generic type-argument qualifiers.
+import "list.cb";
+class Res { int id = default; };
+
+expect_error("unknown type qualifier 'borrow'; only 'unique' and 'alias' are allowed") {
+    list<borrow Res*> bad = default;
+}

@@ -74,8 +74,8 @@ struct Resource {
     int value = 0;
 };
 
-// ListOwnership: adds `count` heap-allocated Resource* into a list<Resource*>
-// via move; the list destructor frees all elements, leaving zero leaks.
+// ListOwnership: adds `count` heap-allocated Resource* into a list<unique Resource*>;
+// the list destructor frees all elements, leaving zero leaks.
 program ListOwnership {
     int count = 0;
 
@@ -86,7 +86,7 @@ program ListOwnership {
             Resource* r = new Resource;
             r->id    = i;
             r->value = i * 10;
-            items.add(move r);
+            items.add(r);   // `unique` element type: the parameter is already a sink
             i++;
         }
         return 0;

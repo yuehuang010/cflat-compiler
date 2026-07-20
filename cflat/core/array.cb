@@ -1,8 +1,15 @@
 // array<T> - owning fixed-size heap array with destructor support.
-// Use init(size) to allocate; the destructor frees and calls ~T() on each element.
+// Use init(size) to allocate; the destructor frees the buffer and, for `unique` elements,
+// frees each pointee first.
 // Stackable or heap-allocated: array<T> a; a.init(n);  or  array<T>* a = new array<T>;  a->init(n);
+//
+// THE RULE, same as list<T> (see list.cb for the full rationale):
+//   array<T>             value elements, deep-copied on set()
+//   array<T*>            BORROWS - never freed
+//   array<IShape>        BORROWS - never freed
+//   array<unique T*>     OWNS and frees
+//   array<unique IShape> OWNS and frees
 
-// array<T> - owning fixed-size heap array; init(size) allocates, the destructor frees and ~T()s each element.
 struct array<T>
 {
     T*  _ptr = nullptr;
@@ -15,11 +22,48 @@ struct array<T>
         _len = size;
     }
 
-    // Free the buffer, calling ~T() on each element.
+    // Store the value into a slot whose prior element has already been released.
+    // `unique` takes ownership; a bare pointer or interface is aliased (borrowed); a
+    // value type is deep-copied so the caller's original stays independent.
+    // `is_pointer(T)` is true for a bare, `unique` or `alias` pointer AND for an
+    // interface value, so it subsumes the alias case - do not add an is_alias arm.
+    void _placeAt(int index, T value)
+    {
+        if const (is_unique(T))         _ptr[index] = move value;
+        else if const (is_pointer(T))   _ptr[index] = value;
+        else if const (is_primitive(T)) _ptr[index] = value;
+        else if const (!is_copyable(T)) compile_error("this array element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (a.set(i, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else                            _ptr[index] = value.copy();
+    }
+
+    // Release the element in a slot before overwriting it: `unique` is freed, a value
+    // type is destructed, a bare pointer or interface is left to its real owner.
+    void _releaseAt(int index)
+    {
+        if const (is_unique(T))
+        {
+            if (_ptr[index] != nullptr) delete _ptr[index];
+        }
+        else if const (is_pointer(T))   { }
+        else if const (is_primitive(T)) { }
+        else                            _ptr[index].~();
+    }
+
+    // Free `unique` elements, then the buffer (which destructs value elements as it frees).
+    // Bare pointers and bare interface values are left to their real owner.
     ~array()
     {
         if (_ptr != nullptr)
         {
+            if const (is_unique(T))
+            {
+                int i = 0;
+                while (i < _len)
+                {
+                    if (_ptr[i] != nullptr) delete _ptr[i];
+                    i++;
+                }
+            }
             delete[_len] _ptr;
             _ptr = nullptr;
             _len = 0;
@@ -36,20 +80,30 @@ struct array<T>
     // Return a pointer to the element at index (for in-place access).
     T* getPtr(int index) { return _ptr + index; }
 
-    // Overwrite the element at index. Takes ownership when T owns resources (a pointer
-    // element, or a value-type with owned buffers such as string or a nested container).
-    // The old element is freed/destructed before the new one is stored.
-    void set(int index, move T value)
+    // Overwrite the element at index with a COPY (value types) or a borrow (pointer /
+    // interface types). The old element is released first.
+    void set(int index, T value)
     {
-        if const (is_pointer(T))
-        {
-            if (_ptr[index] != nullptr) delete _ptr[index];
-        }
+        if const (!is_copyable(T)) compile_error("this array element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (a.set(i, move x)) to transfer ownership instead, or give the type a 'copy()' method");
         else
         {
-            _ptr[index].~();
+            _releaseAt(index);
+            _placeAt(index, value);
         }
-        _ptr[index] = move value;
+    }
+
+    // set()'s transfer counterpart, offered for VALUE elements only - the `!is_pointer(T)`
+    // guard is the design, not a workaround: a bare pointer / interface array BORROWS, so
+    // accepting ownership here would strand the element (nothing would ever free it), and
+    // for `unique T*` the plain parameter above is already a synthesized move sink.
+    // Declared AFTER the plain set() so the interface contract check matches it first.
+    if const (!is_pointer(T))
+    {
+        void set(int index, move T value)
+        {
+            _releaseAt(index);
+            _ptr[index] = move value;
+        }
     }
 
     // a[index] - same semantics as get(index).

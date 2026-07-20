@@ -246,6 +246,31 @@ static bool StripUniqueQualifier(std::string& name)
     return false;
 }
 
+// The `alias` borrow qualifier on a generic type argument is carried the same way as `unique`:
+// a leading "alias " prefix on the resolved type-argument string (e.g. "alias Res*").
+static const char kAliasQualifierPrefix[] = "alias ";
+static const size_t kAliasQualifierPrefixLen = sizeof(kAliasQualifierPrefix) - 1;
+
+// True if a type-parameter entry carries the `alias` qualifier: a leading Identifier
+// (grammar: `Identifier? typeSpecifier ...`) whose text is exactly "alias".
+static bool TypeArgHasAlias(CFlatParser::TypeParameterEntryContext* entry)
+{
+    return entry != nullptr && entry->Identifier() != nullptr
+        && entry->Identifier()->getText() == "alias";
+}
+
+// Strip a leading "alias " qualifier off a resolved type-arg string, returning whether it was
+// present. The bare base remains so it resolves to the same LLVM type as the unqualified spelling.
+static bool StripAliasQualifier(std::string& name)
+{
+    if (name.compare(0, kAliasQualifierPrefixLen, kAliasQualifierPrefix) == 0)
+    {
+        name.erase(0, kAliasQualifierPrefixLen);
+        return true;
+    }
+    return false;
+}
+
 static std::string MangleTypeArg(const std::string& typeName)
 {
     std::string result;
@@ -256,6 +281,13 @@ static std::string MangleTypeArg(const std::string& typeName)
     {
         result += "unique_";
         start = kUniqueQualifierPrefixLen;
+    }
+    // The `alias` qualifier likewise mangles to an "alias_" token so list<alias Res*>
+    // monomorphizes distinctly from list<Res*>.
+    else if (typeName.compare(0, kAliasQualifierPrefixLen, kAliasQualifierPrefix) == 0)
+    {
+        result += "alias_";
+        start = kAliasQualifierPrefixLen;
     }
     for (size_t i = start; i < typeName.size(); i++)
     {
@@ -324,8 +356,12 @@ static std::string BuildEncodedClosureName(bool isThin, const std::string& ret, 
 // is a plain pointer. They never combine ("T[]*" is rejected at the grammar/listener). Suffixes
 // were appended in source order, so peel from the right until none remain. Returns the bare base
 // type name in `name`.
-static void PeelTypeArgSuffix(std::string& name, bool& pointer, bool& arrayView, bool* unique = nullptr)
+static void PeelTypeArgSuffix(std::string& name, bool& pointer, bool& arrayView, bool* unique = nullptr,
+    bool* aliasQual = nullptr)
 {
+    // `alias` is a leading prefix like `unique`; peel it first for the same reasons.
+    bool hadAlias = StripAliasQualifier(name);
+    if (aliasQual != nullptr) *aliasQual = hadAlias;
     // A `unique` qualifier is a leading prefix (D10); peel it first so the suffix loop and any
     // re-mangling see the bare type. Callers resolving to an LLVM type discard it; callers that
     // re-mangle a nested arg re-prepend it from *unique.
@@ -384,29 +420,35 @@ static bool PeelAliasArrayDims(std::string& name, std::vector<uint64_t>& dims)
 // per-kind children (declarations, methods, ...) are nested one level under aggregateMember
 // rather than being direct children of the struct/class context. These helpers flatten an
 // aggregate's members back into the per-kind vectors the listener expects, preserving source
-// Collect all aggregate members for which the getter returns non-null.
-// Templated on the context type so it works for both StructDefinitionContext and
-// ClassDefinitionContext (both expose aggregateMember()).
-template <typename Result, typename TCtx, typename Getter>
-static std::vector<Result*> MemberFilter(TCtx* ctx, Getter g)
+// Collect all members of an already-resolved member list for which the getter returns non-null.
+// The list is resolved (member-scope `if const` branches spliced in) by each pass's own
+// ResolveAggregateMembers, since the two passes use different branch-selection policies.
+template <typename Result, typename Member, typename Getter>
+static std::vector<Result*> MemberFilter(const std::vector<Member*>& members, Getter g)
 {
     std::vector<Result*> out;
-    for (auto* m : ctx->aggregateMember())
+    for (auto* m : members)
         if (auto* x = g(m)) out.push_back(x);
     return out;
 }
-template <typename TCtx>
-static auto MemberDeclarations(TCtx* ctx)       { return MemberFilter<CFlatParser::DeclarationContext>      (ctx, [](auto* m){ return m->declaration();        }); }
-template <typename TCtx>
-static auto MemberFunctionDefinitions(TCtx* ctx) { return MemberFilter<CFlatParser::FunctionDefinitionContext>(ctx, [](auto* m){ return m->functionDefinition();  }); }
-template <typename TCtx>
-static auto MemberDestructorDefinitions(TCtx* ctx){ return MemberFilter<CFlatParser::DestructorDefinitionContext>(ctx, [](auto* m){ return m->destructorDefinition(); }); }
-template <typename TCtx>
-static auto MemberStructDefinitions(TCtx* ctx)  { return MemberFilter<CFlatParser::StructDefinitionContext>  (ctx, [](auto* m){ return m->structDefinition();    }); }
-template <typename TCtx>
-static auto MemberClassDefinitions(TCtx* ctx)   { return MemberFilter<CFlatParser::ClassDefinitionContext>   (ctx, [](auto* m){ return m->classDefinition();     }); }
-template <typename TCtx>
-static auto MemberLockFieldGroups(TCtx* ctx)    { return MemberFilter<CFlatParser::LockFieldGroupContext>    (ctx, [](auto* m){ return m->lockFieldGroup();      }); }
+
+// The per-kind flatteners (MemberDeclarations, MemberFunctionDefinitions, ...) are defined as
+// member functions of ForwardRefScanner and of MainListener via this macro, so unqualified call
+// sites inside each class pick up that pass's own ResolveAggregateMembers.
+#define CFLAT_DEFINE_MEMBER_FLATTENERS()                                                                                                                                              \
+    template <typename TCtx> auto MemberDeclarations(TCtx* ctx)        { return MemberFilter<CFlatParser::DeclarationContext>         (ResolveAggregateMembers(ctx), [](auto* m){ return m->declaration();          }); } \
+    template <typename TCtx> auto MemberFunctionDefinitions(TCtx* ctx) { return MemberFilter<CFlatParser::FunctionDefinitionContext>  (ResolveAggregateMembers(ctx), [](auto* m){ return m->functionDefinition();   }); } \
+    template <typename TCtx> auto MemberDestructorDefinitions(TCtx* ctx){ return MemberFilter<CFlatParser::DestructorDefinitionContext>(ResolveAggregateMembers(ctx), [](auto* m){ return m->destructorDefinition(); }); } \
+    template <typename TCtx> auto MemberStructDefinitions(TCtx* ctx)   { return MemberFilter<CFlatParser::StructDefinitionContext>    (ResolveAggregateMembers(ctx), [](auto* m){ return m->structDefinition();     }); } \
+    template <typename TCtx> auto MemberClassDefinitions(TCtx* ctx)    { return MemberFilter<CFlatParser::ClassDefinitionContext>     (ResolveAggregateMembers(ctx), [](auto* m){ return m->classDefinition();      }); } \
+    template <typename TCtx> auto MemberLockFieldGroups(TCtx* ctx)     { return MemberFilter<CFlatParser::LockFieldGroupContext>      (ResolveAggregateMembers(ctx), [](auto* m){ return m->lockFieldGroup();       }); }
+
+// Interface bodies parse through the named `interfaceMember` rule, so methods and fields are nested
+// one level under it. Same macro shape as the aggregate flatteners: each pass gets its own copy so
+// the unqualified ResolveInterfaceMembers call binds to that pass's branch-selection policy.
+#define CFLAT_DEFINE_INTERFACE_FLATTENERS()                                                                                                                                           \
+    std::vector<CFlatParser::InterfaceMethodContext*> InterfaceMethods(CFlatParser::InterfaceDefinitionContext* ctx) { return MemberFilter<CFlatParser::InterfaceMethodContext>(ResolveInterfaceMembers(ctx), [](auto* m){ return m->interfaceMethod(); }); } \
+    std::vector<CFlatParser::InterfaceFieldContext*>  InterfaceFields(CFlatParser::InterfaceDefinitionContext* ctx)  { return MemberFilter<CFlatParser::InterfaceFieldContext> (ResolveInterfaceMembers(ctx), [](auto* m){ return m->interfaceField();  }); }
 
 // simd<T,N>: validate the lane count N. It must be a plain power-of-2 integer literal in [2,64]
 // (the explicit SIMD type is the hardware-control escape hatch, so a non-power-of-2 that would
@@ -756,6 +798,30 @@ private:
         return compilerLLVM;
     }
 
+    // The scanner cannot evaluate an `if const` condition (no active type substitutions, no
+    // expression codegen), so it skips those members rather than register a not-taken signature.
+    template <typename TCtx>
+    std::vector<CFlatParser::AggregateMemberContext*> ResolveAggregateMembers(TCtx* ctx)
+    {
+        std::vector<CFlatParser::AggregateMemberContext*> out;
+        for (auto* m : ctx->aggregateMember())
+            if (!m->ifConstMember()) out.push_back(m);
+        return out;
+    }
+
+    // Same reasoning as ResolveAggregateMembers: the scanner cannot evaluate the condition, so it
+    // skips if-const interface members rather than register a not-taken method into the contract.
+    std::vector<CFlatParser::InterfaceMemberContext*> ResolveInterfaceMembers(CFlatParser::InterfaceDefinitionContext* ctx)
+    {
+        std::vector<CFlatParser::InterfaceMemberContext*> out;
+        for (auto* m : ctx->interfaceMember())
+            if (!m->ifConstInterfaceMember()) out.push_back(m);
+        return out;
+    }
+
+    CFLAT_DEFINE_MEMBER_FLATTENERS()
+    CFLAT_DEFINE_INTERFACE_FLATTENERS()
+
     LLVMBackend::DeclTypeAndValue ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs)
     {
         auto* compiler = Compiler(declSpecs);
@@ -877,7 +943,7 @@ private:
                         // arg routes through ResolveForwardTypeArg so its canonical "unique T*" text
                         // (D10) matches the queueing path; others keep the raw getText() spelling.
                         if ((entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
-                            || TypeArgHasUnique(entry))
+                            || TypeArgHasUnique(entry) || TypeArgHasAlias(entry))
                             typeArgs.push_back(ResolveForwardTypeArg(entry));
                         else
                             typeArgs.push_back(entry->getText());
@@ -1028,7 +1094,8 @@ private:
                     paramType.VariableName = getDirectDeclName(directDeclarer);
             // D4: a `unique` parameter is a synthesized move parameter (mirrors the codegen copy),
             // so the forward-declared signature agrees on the move flag.
-            if (paramType.IsUnique && ((paramType.Pointer && !paramType.ElemPointer
+            if (paramType.IsUnique && !paramType.IsAliasTypeArg
+                && ((paramType.Pointer && !paramType.ElemPointer
                 && !paramType.IsArrayView) || paramType.IsInterface))
                 paramType.IsMove = true;
             // A parameter's `alignas(_, N)` allocation alignment now rides in declarationSpecifiers
@@ -1215,7 +1282,7 @@ private:
             parentNames.push_back(term->getText());
 
         std::vector<LLVMBackend::InterfaceMethod> methods;
-        for (auto method : ctx->interfaceMethod())
+        for (auto method : InterfaceMethods(ctx))
         {
             LLVMBackend::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
@@ -1227,7 +1294,7 @@ private:
         }
 
         std::vector<LLVMBackend::TypeAndValue> fields;
-        for (auto* f : ctx->interfaceField())
+        for (auto* f : InterfaceFields(ctx))
         {
             LLVMBackend::TypeAndValue tv = ParseDeclarationSpecifiers(f->declarationSpecifiers());
             tv.VariableName = f->directDeclarator()->getText();
@@ -1263,7 +1330,7 @@ private:
             // inherited field is registered under this name too - pointing at the parent's
             // declaration site, which is where it is actually written.
             std::unordered_map<std::string, CFlatParser::InterfaceFieldContext*> ownFields;
-            for (auto* f : ctx->interfaceField())
+            for (auto* f : InterfaceFields(ctx))
                 ownFields[f->directDeclarator()->getText()] = f;
 
             const auto* allFields = Compiler(ctx)->GetInterfaceFields(name);
@@ -1476,6 +1543,7 @@ public:
     std::string ResolveForwardTypeArg(CFlatParser::TypeParameterEntryContext* entry)
     {
         bool isUnique = TypeArgHasUnique(entry);
+        bool isAliasArg = TypeArgHasAlias(entry);
         auto* typeSpec = entry->typeSpecifier();
         std::string resolved;
         std::string innerBase;
@@ -1505,6 +1573,9 @@ public:
         // pass validates position/type and emits diagnostics.
         if (isUnique)
             resolved = std::string(kUniqueQualifierPrefix) + resolved;
+        // Same for `alias` so the shell name matches the codegen mangled name exactly.
+        if (isAliasArg)
+            resolved = std::string(kAliasQualifierPrefix) + resolved;
         return resolved;
     }
 
@@ -1697,7 +1768,7 @@ public:
                 // Closure and `unique`-qualified args encode via ResolveForwardTypeArg so the shell
                 // name matches the authoritative ParseUsingDeclaration; others keep raw getText().
                 if ((entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
-                    || TypeArgHasUnique(entry))
+                    || TypeArgHasUnique(entry) || TypeArgHasAlias(entry))
                     mangledName += "__" + MangleTypeArg(ResolveForwardTypeArg(entry));
                 else
                     mangledName += "__" + MangleTypeArg(entry->getText());
@@ -2215,8 +2286,17 @@ private:
     // following statements dead). The if/else move-merge samples this per branch to decide
     // whether a branch's moves are on a dead path - immune to dead code after a return, which
     // reopens a live block and hides the ret terminator. Set only by the return handler (not
-    // break/continue, per the 8302e10 distinction); loops/switch restore it (they fall through).
+    // break/continue - see straightLineJumped_); loops/switch restore it (they fall through).
     bool straightLineReturned_ = false;
+
+    // Set by the break/continue handlers. Like a return, a break/continue branch does NOT reach
+    // the if's resume block, so its moves must not leak onto the fall-through path. Unlike a
+    // return the moves are not dead: they are collected in loopBreakMovedStates_ and merged
+    // back at loop exit, so a use-after-move past the loop is still diagnosed.
+    bool straightLineJumped_ = false;
+
+    // Per-loop stack of moved-state snapshots taken at each break/continue inside the body.
+    std::vector<std::vector<LLVMBackend::MovedStateSnapshot>> loopBreakMovedStates_;
 
     // Save/restore straightLineReturned_ across a construct that falls through (loop, switch):
     // a return in its body must not mark the enclosing straight-line as returned.
@@ -2224,6 +2304,27 @@ private:
         bool* flag; bool saved;
         explicit ReturnFlagGuard(bool* f) : flag(f), saved(*f) {}
         ~ReturnFlagGuard() { *flag = saved; }
+    };
+
+    // Snapshot the moved state at a break/continue so the innermost loop can merge it back
+    // at loop exit. No-op outside a loop (a switch break has no such rejoin bookkeeping).
+    void RecordLoopExitMovedState()
+    {
+        if (loopBreakMovedStates_.empty()) return;
+        loopBreakMovedStates_.back().push_back(Compiler()->SaveMovedState());
+    }
+
+    // Scopes one loop's break/continue snapshot list, then ORs them into the live state on
+    // exit so moves performed on a breaking path stay visible to code after the loop.
+    struct LoopMovedStateGuard {
+        MainListener* self; LLVMBackend* compiler;
+        LoopMovedStateGuard(MainListener* s, LLVMBackend* c) : self(s), compiler(c)
+            { self->loopBreakMovedStates_.emplace_back(); }
+        ~LoopMovedStateGuard() {
+            for (const auto& snap : self->loopBreakMovedStates_.back())
+                compiler->MergeMovedStateInto(snap);
+            self->loopBreakMovedStates_.pop_back();
+        }
     };
 
     // Set the builder's fast-math flags for the loop body according to the tier.
@@ -2251,9 +2352,10 @@ private:
         // `unique` ownership qualifier (D10): a leading Identifier == "unique". Any other leading
         // Identifier is an unknown qualifier.
         bool isUnique = TypeArgHasUnique(entry);
-        if (entry->Identifier() != nullptr && !isUnique)
-            LogErrorContext(entry, std::format("unknown type qualifier '{}'; only 'unique' is allowed "
-                "on a generic type argument", entry->Identifier()->getText()));
+        bool isAliasArg = TypeArgHasAlias(entry);
+        if (entry->Identifier() != nullptr && !isUnique && !isAliasArg)
+            LogErrorContext(entry, std::format("unknown type qualifier '{}'; only 'unique' and 'alias' "
+                "are allowed on a generic type argument", entry->Identifier()->getText()));
         bool hasPointer = entry->pointer() != nullptr;
         // `T[]` as a generic/tuple type arg is a noalias array-view member; `[N]` and `[]*`
         // are not valid in a type-argument position (reject with one clear message).
@@ -2289,6 +2391,8 @@ private:
             // array-view suffix (a closure arg is a value), so return it directly.
             if (isUnique)
                 LogErrorContext(entry, "unique requires a pointer or interface type");
+            if (isAliasArg)
+                LogErrorContext(entry, "alias requires a pointer or interface type");
             return EncodeClosureCodegen(typeSpec->functionPointerSpecifier());
         }
         else
@@ -2302,9 +2406,11 @@ private:
                 // or a "unique " prefix (T bound to "unique Circle*"); peel those onto flags so
                 // they re-encode once below.
                 bool substUnique = false;
+                bool substAlias = false;
                 resolved = substIt->second;
-                PeelTypeArgSuffix(resolved, hasPointer, hasArrayView, &substUnique);
+                PeelTypeArgSuffix(resolved, hasPointer, hasArrayView, &substUnique, &substAlias);
                 isUnique = isUnique || substUnique;
+                isAliasArg = isAliasArg || substAlias;
             }
             // A function-type alias (using IntFn = Lambda<int(int)>) used as a generic arg resolves
             // to the SAME encoded closure type as the direct spelling (canonicalization / gap a).
@@ -2314,6 +2420,8 @@ private:
                 {
                     if (isUnique)
                         LogErrorContext(entry, "unique requires a pointer or interface type");
+                    if (isAliasArg)
+                        LogErrorContext(entry, "alias requires a pointer or interface type");
                     return EncodeClosureFromSig(Compiler(entry), fit->second);
                 }
         }
@@ -2337,6 +2445,17 @@ private:
                 LogErrorContext(entry, std::format("unique requires a pointer or interface type; "
                     "'{}' is neither", uniqueBase));
             resolved = std::string(kUniqueQualifierPrefix) + resolved;
+        }
+        // `alias` is the non-owning twin of `unique`: same D1 shape requirement, carried as a
+        // leading prefix so the instantiation mangles distinctly and is_alias(T) can see it.
+        if (isAliasArg)
+        {
+            if (isUnique)
+                LogErrorContext(entry, "'unique' and 'alias' are mutually exclusive on a generic type argument");
+            if (!hasPointer && !Compiler(entry)->IsInterfaceType(uniqueBase))
+                LogErrorContext(entry, std::format("alias requires a pointer or interface type; "
+                    "'{}' is neither", uniqueBase));
+            resolved = std::string(kAliasQualifierPrefix) + resolved;
         }
         return resolved;
     }
@@ -2396,6 +2515,7 @@ private:
         {
             name = substIt->second;
             StripUniqueQualifier(name);  // resolve to the underlying type; unique is not a signature type
+            StripAliasQualifier(name);
             while (!name.empty() && name.back() == '*') { name.pop_back(); outPointer = true; }
         }
         return name;
@@ -2677,7 +2797,23 @@ private:
                         // the direct `unique` spelling only (post-substitution container ownership is a
                         // later stage), so the resolved type is the bare pointee.
                         typeName = substIt->second;
-                        PeelTypeArgSuffix(typeName, substPointer, substArrayView);
+                        bool substAliasArg = false;
+                        bool substUniqueArg = false;
+                        PeelTypeArgSuffix(typeName, substPointer, substArrayView, &substUniqueArg, &substAliasArg);
+                        // A `unique` type argument is an OWNING location: a plain by-value parameter
+                        // of that type is a move sink, so the caller's source must be nulled.
+                        // An `alias`-declared parameter is an explicit borrow and stays one.
+                        if (substUniqueArg && !declType.IsAlias) declType.IsUniqueTypeArg = true;
+                        // An `alias`-qualified type argument is a non-owning machine word: a `move`
+                        // parameter of that type is not a sink, exactly like `move int` today.
+                        if (substAliasArg)
+                        {
+                            // A written `move` that degrades to a no-op here still hands back a
+                            // borrow the owner retains; mark it so the delete checks can key on it.
+                            if (declType.IsMove) declType.IsAlias = true;
+                            declType.IsAliasTypeArg = true;
+                            declType.IsMove = false;
+                        }
                     }
                     // Resolve namespace-qualified type names (alias expansion + parent namespace search)
                     typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName);
@@ -2711,6 +2847,10 @@ private:
                 }
                 bool hasExplicitPointer = declSpec->pointer() != nullptr;
                 bool hasDblPointer = hasExplicitPointer && declSpec->pointer()->Star().size() >= 2;
+                // An explicit declarator star over a `unique` type ARGUMENT (`V* out`) declares a
+                // POINTER TO the owning location, not the owning location - it is an out-param, not
+                // a sink. Left set, the call site nulls the caller's variable and it dangles.
+                if (hasExplicitPointer) declType.IsUniqueTypeArg = false;
                 bool substPointer = declType.Pointer; // T was already a pointer (e.g. T=IMessage*)
                 if (aliasPtrDepth > 0)
                 {
@@ -2945,6 +3085,7 @@ private:
         {
             resolved.TypeName = substIt->second;
             StripUniqueQualifier(resolved.TypeName);  // default-value resolution uses the bare type
+            StripAliasQualifier(resolved.TypeName);
             while (!resolved.TypeName.empty() && resolved.TypeName.back() == '*')
             {
                 resolved.TypeName.pop_back();
@@ -3032,8 +3173,10 @@ public:
             return;
         }
 
+        ResolvedInterfaceMembersScope memberScope(resolvedInterfaceMembers_, (const void*)ctx);
+
         std::vector<LLVMBackend::InterfaceMethod> methods;
-        for (auto method : ctx->interfaceMethod())
+        for (auto method : InterfaceMethods(ctx))
         {
             LLVMBackend::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
@@ -3066,7 +3209,7 @@ public:
         UnionFieldDeclGuard notUnion(inUnionFieldDecl_, false);
 
         std::vector<LLVMBackend::TypeAndValue> fields;
-        for (auto* f : ctx->interfaceField())
+        for (auto* f : InterfaceFields(ctx))
         {
             LLVMBackend::DeclTypeAndValue tv = ParseDeclarationSpecifiers(f->declarationSpecifiers());
             tv.VariableName = f->directDeclarator()->getText();
@@ -3105,8 +3248,12 @@ public:
         for (const auto& [k, v] : packSubstitutions)
             activePackSubstitutions[k] = v;
 
+        // Entered after the substitutions are installed: this instantiation must re-evaluate the
+        // if-const conditions under its own T, not reuse another instantiation's branch selection.
+        ResolvedInterfaceMembersScope memberScope(resolvedInterfaceMembers_, (const void*)ctx);
+
         std::vector<LLVMBackend::InterfaceMethod> methods;
-        for (auto method : ctx->interfaceMethod())
+        for (auto method : InterfaceMethods(ctx))
         {
             LLVMBackend::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
@@ -3696,6 +3843,189 @@ public:
             global_scope = true;
         }
     }
+
+    // Cache of resolved aggregate member lists, keyed on the struct/class context. Cleared for a
+    // given ctx at the start of its walk so each generic instantiation re-evaluates conditions.
+    std::map<const void*, std::vector<CFlatParser::AggregateMemberContext*>> resolvedMembers_;
+
+    // RAII scope for one struct/class body walk. Drops the cached entry for ctx so this walk
+    // re-resolves under its own type substitutions, and restores the previous entry on exit so a
+    // re-entrant walk of the same template ctx (a nested type pulling in another instantiation)
+    // cannot leave the outer walk looking at the inner instantiation's branch selection.
+    struct ResolvedMembersScope
+    {
+        std::map<const void*, std::vector<CFlatParser::AggregateMemberContext*>>* map = nullptr;
+        const void* key = nullptr;
+        bool had = false;
+        std::vector<CFlatParser::AggregateMemberContext*> saved;
+
+        ResolvedMembersScope(std::map<const void*, std::vector<CFlatParser::AggregateMemberContext*>>& m, const void* k)
+            : map(&m), key(k)
+        {
+            auto it = map->find(key);
+            if (it != map->end())
+            {
+                had = true;
+                saved = std::move(it->second);
+                map->erase(it);
+            }
+        }
+        ~ResolvedMembersScope()
+        {
+            map->erase(key);
+            if (had) map->emplace(key, std::move(saved));
+        }
+    };
+
+    void AppendResolvedMembers(const std::vector<CFlatParser::AggregateMemberContext*>& members,
+                               std::vector<CFlatParser::AggregateMemberContext*>& out)
+    {
+        for (auto* m : members)
+        {
+            if (auto* ifConst = m->ifConstMember()) AppendIfConstMembers(ifConst, out);
+            else out.push_back(m);
+        }
+    }
+
+    // Member-scope `if const`: same semantics as the file-scope ParseIfConstDeclaration, but the
+    // selected branch's members are spliced into the enclosing aggregate's member list.
+    void AppendIfConstMembers(CFlatParser::IfConstMemberContext* ctx,
+                              std::vector<CFlatParser::AggregateMemberContext*>& out)
+    {
+        auto condition = ParseExpression(ctx->expression());
+        auto constInt = llvm::dyn_cast_or_null<llvm::ConstantInt>(condition);
+        if (!constInt)
+        {
+            LogErrorContext(ctx, "'if const' condition must be a compile-time constant expression");
+            return;
+        }
+
+        bool taken = constInt->getZExtValue() != 0;
+        auto ifBlocks = ctx->ifConstMemberBlock();
+        if (ifBlocks.empty())
+            return;
+
+        CFlatParser::IfConstMemberBlockContext* branchBlock = nullptr;
+        if (taken)
+        {
+            branchBlock = ifBlocks[0];
+        }
+        else if (auto* elseIf = ctx->ifConstMember())
+        {
+            // Chained `else if const` - the else arm is another if const, not a brace block.
+            AppendIfConstMembers(elseIf, out);
+            return;
+        }
+        else if (ifBlocks.size() > 1)
+        {
+            branchBlock = ifBlocks[1];
+        }
+
+        if (branchBlock)
+            AppendResolvedMembers(branchBlock->aggregateMember(), out);
+    }
+
+    template <typename TCtx>
+    const std::vector<CFlatParser::AggregateMemberContext*>& ResolveAggregateMembers(TCtx* ctx)
+    {
+        auto it = resolvedMembers_.find((const void*)ctx);
+        if (it != resolvedMembers_.end()) return it->second;
+
+        std::vector<CFlatParser::AggregateMemberContext*> out;
+        AppendResolvedMembers(ctx->aggregateMember(), out);
+        return resolvedMembers_.emplace((const void*)ctx, std::move(out)).first->second;
+    }
+
+    void AppendResolvedInterfaceMembers(const std::vector<CFlatParser::InterfaceMemberContext*>& members,
+                                        std::vector<CFlatParser::InterfaceMemberContext*>& out)
+    {
+        for (auto* m : members)
+        {
+            if (auto* ifConst = m->ifConstInterfaceMember()) AppendIfConstInterfaceMembers(ifConst, out);
+            else out.push_back(m);
+        }
+    }
+
+    // Interface-scope `if const`: same semantics as AppendIfConstMembers, but splicing the selected
+    // branch's methods/fields into the enclosing interface's member list.
+    void AppendIfConstInterfaceMembers(CFlatParser::IfConstInterfaceMemberContext* ctx,
+                                       std::vector<CFlatParser::InterfaceMemberContext*>& out)
+    {
+        auto condition = ParseExpression(ctx->expression());
+        auto constInt = llvm::dyn_cast_or_null<llvm::ConstantInt>(condition);
+        if (!constInt)
+        {
+            LogErrorContext(ctx, "'if const' condition must be a compile-time constant expression");
+            return;
+        }
+
+        bool taken = constInt->getZExtValue() != 0;
+        auto ifBlocks = ctx->ifConstInterfaceBlock();
+        if (ifBlocks.empty())
+            return;
+
+        CFlatParser::IfConstInterfaceBlockContext* branchBlock = nullptr;
+        if (taken)
+        {
+            branchBlock = ifBlocks[0];
+        }
+        else if (auto* elseIf = ctx->ifConstInterfaceMember())
+        {
+            // Chained `else if const` - the else arm is another if const, not a brace block.
+            AppendIfConstInterfaceMembers(elseIf, out);
+            return;
+        }
+        else if (ifBlocks.size() > 1)
+        {
+            branchBlock = ifBlocks[1];
+        }
+
+        if (branchBlock)
+            AppendResolvedInterfaceMembers(branchBlock->interfaceMember(), out);
+    }
+
+    // Cache of resolved interface member lists, keyed on the interface context. Dropped for the
+    // duration of a walk by ResolvedInterfaceMembersScope so each instantiation re-evaluates.
+    std::map<const void*, std::vector<CFlatParser::InterfaceMemberContext*>> resolvedInterfaceMembers_;
+
+    const std::vector<CFlatParser::InterfaceMemberContext*>& ResolveInterfaceMembers(CFlatParser::InterfaceDefinitionContext* ctx)
+    {
+        auto it = resolvedInterfaceMembers_.find((const void*)ctx);
+        if (it != resolvedInterfaceMembers_.end()) return it->second;
+
+        std::vector<CFlatParser::InterfaceMemberContext*> out;
+        AppendResolvedInterfaceMembers(ctx->interfaceMember(), out);
+        return resolvedInterfaceMembers_.emplace((const void*)ctx, std::move(out)).first->second;
+    }
+
+    // RAII counterpart to ResolvedMembersScope for one interface body walk.
+    struct ResolvedInterfaceMembersScope
+    {
+        std::map<const void*, std::vector<CFlatParser::InterfaceMemberContext*>>* map = nullptr;
+        const void* key = nullptr;
+        bool had = false;
+        std::vector<CFlatParser::InterfaceMemberContext*> saved;
+
+        ResolvedInterfaceMembersScope(std::map<const void*, std::vector<CFlatParser::InterfaceMemberContext*>>& m, const void* k)
+            : map(&m), key(k)
+        {
+            auto it = map->find(key);
+            if (it != map->end())
+            {
+                had = true;
+                saved = std::move(it->second);
+                map->erase(it);
+            }
+        }
+        ~ResolvedInterfaceMembersScope()
+        {
+            map->erase(key);
+            if (had) map->emplace(key, std::move(saved));
+        }
+    };
+
+    CFLAT_DEFINE_MEMBER_FLATTENERS()
+    CFLAT_DEFINE_INTERFACE_FLATTENERS()
 
     void ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContext* ctx, const std::string& namespaceName = {})
     {
@@ -4788,11 +5118,15 @@ public:
             }
             else if (jump->Continue())
             {
+                RecordLoopExitMovedState();
+                straightLineJumped_ = true;
                 compiler->CreateContinueCall();
                 return;
             }
             else if (jump->Break())
             {
+                RecordLoopExitMovedState();
+                straightLineJumped_ = true;
                 compiler->CreateBreakCall();
                 return;
             }
@@ -4821,6 +5155,8 @@ public:
             // A loop falls through to its resume (it may run zero times or exit normally), so a
             // return in its body does not mark the enclosing straight-line as returned.
             ReturnFlagGuard returnFlagGuard(&straightLineReturned_);
+            ReturnFlagGuard jumpFlagGuard(&straightLineJumped_);
+            LoopMovedStateGuard loopMovedGuard(this, compiler);
             // Consume the vectorize request immediately so it binds only to this
             // loop level (a nested loop in the body re-reads a cleared flag).
             bool doVectorize = vectorizeActive_;
@@ -5311,11 +5647,13 @@ public:
                 // returned" via straightLineReturned_ (set by the return handler), which is immune
                 // to dead code after a return that would hide the ret terminator from a block check.
                 bool enclosingReturned = straightLineReturned_;
+                bool enclosingJumped = straightLineJumped_;
 
                 compiler->InitializeBlock(blockTrue, false);
                 straightLineReturned_ = false;
+                straightLineJumped_ = false;
                 ParseControlledBody(innerStatement[0]);
-                bool thenReturned = straightLineReturned_;
+                bool thenReturned = straightLineReturned_ || straightLineJumped_;
                 auto thenMovedState = compiler->SaveMovedState();
 
                 compiler->CreateBlockBreak(blockResume, true);
@@ -5329,14 +5667,15 @@ public:
                     // else statement
                     compiler->InitializeBlock(blockElse, true);
                     straightLineReturned_ = false;
+                    straightLineJumped_ = false;
                     ParseControlledBody(innerStatement[1]);
-                    elseReturned = straightLineReturned_;
+                    elseReturned = straightLineReturned_ || straightLineJumped_;
                     auto elseMovedState = compiler->SaveMovedState();
                     compiler->CreateBlockBreak(blockResume, true);
 
-                    // Drop only a RETURNING branch's moves (dead path to resume); a break/continue
-                    // branch still merges. If both fall through (or break/continue), a var is moved
-                    // if moved in either.
+                    // Drop an EXITING branch's moves (return/break/continue never reach resume).
+                    // A break/continue path's moves are re-merged at loop exit, so they are not
+                    // lost. If both fall through, a var is moved if moved in either.
                     if (thenReturned && !elseReturned)
                         compiler->RestoreMovedState(elseMovedState);
                     else if (!thenReturned && elseReturned)
@@ -5349,14 +5688,16 @@ public:
                 else if (thenReturned)
                 {
                     // No else: the resume path is the condition-false path, which never ran the
-                    // then-branch. Only a RETURN discards its moves; break/continue keeps them
-                    // (they rejoin later code) via the fall-through thenMovedState left in place.
+                    // then-branch, so an exiting (return/break/continue) then-branch contributes
+                    // no moves here. A break/continue's moves rejoin at loop exit instead.
                     compiler->RestoreMovedState(preIfMovedState);
                 }
 
                 // The enclosing straight-line has unconditionally returned iff it already had, or
                 // this if returns on every path (both branches return; a no-else if falls through).
                 straightLineReturned_ = enclosingReturned
+                    || (blockElse != nullptr && thenReturned && elseReturned);
+                straightLineJumped_ = enclosingJumped
                     || (blockElse != nullptr && thenReturned && elseReturned);
 
                 // resume
@@ -5867,6 +6208,10 @@ public:
             {
                 auto arg = compiler->GetFunctionArgument(params[i].VariableName);
                 arg.TypeAndValue.VariableName = "";   // forward positionally, never as a named arg
+                // A 'move' parameter must forward AS a move, or the wrapper binds the borrow
+                // overload and its own scope-exit teardown frees what the callee kept.
+                if (params[i].IsMove)
+                    arg.IsExplicitMove = true;
                 callArgs.push_back(arg);
             }
 
@@ -11405,6 +11750,7 @@ public:
         auto it = activeTypeSubstitutions.find(name);
         if (it != activeTypeSubstitutions.end()) name = it->second;
         StripUniqueQualifier(name);  // resolve to the underlying LLVM type; unique is a storage marker
+        StripAliasQualifier(name);
         return Compiler(ctx)->ResolveQualifiedName(name);
     }
 
@@ -12619,11 +12965,17 @@ public:
             if (namedVar.TypeAndValue.IsAlias && namedVar.Storage == nullptr)
             {
                 std::string calleeName = DeleteOperandCalleeName(ue);
+                // A borrowing container hands back a borrow even from take()/removeAt(), so
+                // steering to them would be circular - point at the real owner instead.
+                bool calleeIsOwningAccessor = (calleeName == "take" || calleeName == "removeAt");
                 LogErrorContext(ctx, std::format(
                     "cannot delete the alias (borrowed) result of '{}': the owner still holds it, so "
-                    "this delete would double-free when the owner frees it. Use an owning accessor "
-                    "such as take()/removeAt(), or let the owner free it.",
-                    calleeName.empty() ? "<call>" : calleeName));
+                    "this delete would double-free when the owner frees it. {}",
+                    calleeName.empty() ? "<call>" : calleeName,
+                    calleeIsOwningAccessor
+                        ? "This container only borrows its elements, so it has no owning accessor - "
+                          "free through the owner, or use an owning container such as 'list<unique T*>'."
+                        : "Use an owning accessor such as take()/removeAt(), or let the owner free it."));
                 return {};
             }
 
@@ -12930,6 +13282,22 @@ public:
         return {};
     }
 
+    // True when this 'move' expression sits DIRECTLY in a call-argument position. Walks up
+    // through single-child pass-through expression nodes only, so 'f(move a)' matches while
+    // 'f(g(move a))' or 'f(move a + b)' does not.
+    static bool IsDirectCallArgument(antlr4::ParserRuleContext* ctx)
+    {
+        for (auto* node = ctx->parent; node != nullptr; )
+        {
+            if (dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(node) != nullptr)
+                return true;
+            auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+            if (rule == nullptr || rule->children.size() != 1) return false;
+            node = rule->parent;
+        }
+        return false;
+    }
+
     LLVMBackend::NamedVariable ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
@@ -12965,15 +13333,52 @@ public:
             return {};
         }
 
+        // An `alias`-qualified generic type argument is a non-owning machine word: `move` on it
+        // is a silent no-op copy, exactly like `move int`. Source is left untouched.
+        if (argNV.TypeAndValue.IsAliasTypeArg)
+            return argNV;
+
         llvm::Value* ptrVal = LoadNamedVariable(argNV);
 
         // move on a named struct value type: capture the value, then zero the source storage
         // to leave it in a "moved-from" (default) state - enables safe delete[n] on the source.
         // Primitive value types (int, etc.) remain a no-op.
+        // An interface fat-pointer ELEMENT (`move arr[i]`) takes no deferred transfer path (that one
+        // would mark the whole array moved), and an interface is not a dataStructures entry, so the
+        // slot below never zeroes. Zero the {i8*,i8*} here or the array teardown double-frees it.
+        if (!argNV.TypeAndValue.Pointer && argNV.IsElementAccess && argNV.Storage
+            && argNV.TypeAndValue.IsInterface && !argNV.TypeAndValue.IsInterfacePointer)
+        {
+            compiler->builder->CreateStore(
+                llvm::ConstantAggregateZero::get(compiler->GetFatPtrType()), argNV.Storage);
+            LLVMBackend::NamedVariable result;
+            result.Primary      = ptrVal;
+            result.Storage      = nullptr;
+            result.BaseType     = argNV.BaseType;
+            result.TypeAndValue = argNV.TypeAndValue;
+            return result;
+        }
+
         if (!argNV.TypeAndValue.Pointer)
         {
             if (argNV.Storage && compiler->IsDataStructure(argNV.TypeAndValue.TypeName))
             {
+                // Directly a call argument: DEFER the zeroing to ApplyMoveParamTransfer, which
+                // runs after overload resolution and knows whether the bound parameter is 'move'.
+                // Zeroing here would consume the value even for a borrowing param (silent leak)
+                // and would strip CallerName, inverting the move/borrow overload tie-breaker.
+                // An ELEMENT access (`move a->keys[i]`) is excluded: the deferred path keeps
+                // CallerName, and the move-tracking it drives marks the WHOLE field moved even
+                // though only one element left. Keep the eager behavior there.
+                if (IsDirectCallArgument(ctx) && !argNV.IsElementAccess)
+                {
+                    if (NamedVarIsString(argNV))
+                        argNV.IsOwningString = argNV.IsOwningString
+                            || (!argNV.CallerName.empty() && compiler->IsVariableOwningString(argNV.CallerName));
+                    argNV.IsExplicitMove = true;
+                    return argNV;
+                }
+
                 llvm::Type* structType = compiler->GetType(argNV.TypeAndValue);
                 if (structType)
                     compiler->builder->CreateStore(
@@ -12997,6 +13402,16 @@ public:
         {
             LogErrorContext(ctx, "'move' expression requires an addressable source (field or local).");
             return {};
+        }
+
+        // Directly a call argument: DEFER the nulling to ApplyMoveParamTransfer, exactly as the
+        // value path above. Returning a DETACHED variable here strips CallerName/IsOwning and
+        // inverts the move/borrow tie-breaker, so 'take(move p)' picked the BORROW overload.
+        // Element accesses stay eager (the deferred path would mark the whole field moved).
+        if (IsDirectCallArgument(ctx) && !argNV.IsElementAccess)
+        {
+            argNV.IsExplicitMove = true;
+            return argNV;
         }
 
         // Null the source (field GEP or local alloca) to transfer ownership.
@@ -14548,6 +14963,8 @@ public:
                                 // path takes the raw getText() spelling and cannot carry the qualifier.
                                 if (TypeArgHasUnique(entry))
                                     LogErrorContext(entry, "unique is not supported as an explicit generic function type argument");
+                                if (TypeArgHasAlias(entry))
+                                    LogErrorContext(entry, "alias is not supported as an explicit generic function type argument");
                                 std::string arg = entry->getText();
                                 // Apply active type substitutions to each type argument
                                 auto it = activeTypeSubstitutions.find(arg);
@@ -14942,13 +15359,27 @@ public:
                         if (namedVar.Storage)
                             namedVar.Primary = nullptr;
 
-                        if (namedVar.BaseType && namedVar.BaseType->isStructTy())
+                        // An indexed element of an interface array is itself an interface value:
+                        // refresh interfaceVar or `a[i].method()` would dispatch off the stale base
+                        // address captured for `a`, silently ignoring the index.
+                        if (namedVar.Storage && namedVar.BaseType == Compiler(ctx)->GetFatPtrType())
+                        {
+                            interfaceVar = namedVar;
+                            structVar = {};
+                        }
+                        else if (namedVar.BaseType && namedVar.BaseType->isStructTy())
                         {
                             structVar = namedVar;
+                            interfaceVar = {};
                         }
                         else if (!namedVar.Storage)
                         {
                             structVar = {};
+                            interfaceVar = {};
+                        }
+                        else
+                        {
+                            interfaceVar = {};
                         }
 
                         // A subscript result is an element (container slot): move-dataflow leaves
@@ -14973,6 +15404,8 @@ public:
                                 // (raw getText() spelling cannot carry the qualifier).
                                 if (TypeArgHasUnique(entry))
                                     LogErrorContext(entry, "unique is not supported as an explicit generic function type argument");
+                                if (TypeArgHasAlias(entry))
+                                    LogErrorContext(entry, "alias is not supported as an explicit generic function type argument");
                                 std::string arg = entry->getText();
                                 auto it = activeTypeSubstitutions.find(arg);
                                 if (it != activeTypeSubstitutions.end())
@@ -15870,6 +16303,15 @@ public:
                                     {
                                         const std::string& resolved = substIt->second;
                                         isPtr = !resolved.empty() && resolved.back() == '*';
+                                        // An interface value is a fat pointer { vtable*, data* },
+                                        // so it belongs on the pointer (borrow) arm too.
+                                        if (!isPtr)
+                                        {
+                                            std::string bare = resolved;
+                                            StripUniqueQualifier(bare);
+                                            StripAliasQualifier(bare);
+                                            isPtr = Compiler(ctx)->interfaceTable.count(bare) > 0;
+                                        }
                                     }
                                 }
                             }
@@ -15904,6 +16346,105 @@ public:
                             }
                             namedVar.Primary = llvm::ConstantInt::get(
                                 llvm::Type::getInt1Ty(*Compiler(ctx)->context), isUniq ? 1 : 0);
+                            namedVar.TypeAndValue.TypeName = "int";
+                            break;
+                        }
+
+                        // Compile-time intrinsic: is_interface(T) - returns 1 if the type parameter T
+                        // resolves to an interface VALUE (a fat pointer { vtable*, data* }), 0 otherwise.
+                        // is_pointer(T) is also true for an interface value, so this is the
+                        // discriminator a container needs when the two must behave differently.
+                        if (functionName == "is_interface")
+                        {
+                            bool isIface = false;
+                            if (argumentList.size() > 0)
+                            {
+                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                if (!namedArgCtx.empty())
+                                {
+                                    std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
+                                    auto substIt = activeTypeSubstitutions.find(argText);
+                                    if (substIt != activeTypeSubstitutions.end())
+                                    {
+                                        std::string bare = substIt->second;
+                                        StripUniqueQualifier(bare);
+                                        StripAliasQualifier(bare);
+                                        if (!bare.empty() && bare.back() != '*')
+                                            isIface = Compiler(ctx)->interfaceTable.count(bare) > 0;
+                                    }
+                                }
+                            }
+                            namedVar.Primary = llvm::ConstantInt::get(
+                                llvm::Type::getInt1Ty(*Compiler(ctx)->context), isIface ? 1 : 0);
+                            namedVar.TypeAndValue.TypeName = "int";
+                            break;
+                        }
+
+                        // Compile-time intrinsic: is_alias(T) - returns 1 if the type parameter T
+                        // resolves to an `alias`-qualified (non-owning) type in the current
+                        // instantiation, 0 otherwise. Orthogonal to is_pointer/is_unique.
+                        // Returns i1 typed "int" - use under `if const`, do not printf it directly.
+                        if (functionName == "is_alias")
+                        {
+                            bool isAliasArg = false;
+                            if (argumentList.size() > 0)
+                            {
+                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                if (!namedArgCtx.empty())
+                                {
+                                    std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
+                                    auto substIt = activeTypeSubstitutions.find(argText);
+                                    if (substIt != activeTypeSubstitutions.end())
+                                    {
+                                        const std::string& resolved = substIt->second;
+                                        isAliasArg = resolved.compare(0, kAliasQualifierPrefixLen,
+                                            kAliasQualifierPrefix) == 0;
+                                    }
+                                }
+                            }
+                            namedVar.Primary = llvm::ConstantInt::get(
+                                llvm::Type::getInt1Ty(*Compiler(ctx)->context), isAliasArg ? 1 : 0);
+                            namedVar.TypeAndValue.TypeName = "int";
+                            break;
+                        }
+
+                        // Compile-time intrinsic: is_copyable(T) - returns 1 if a value of T can be
+                        // copied, 0 if copying it would be refused. Mirrors the refusal condition in
+                        // CreateOverloadedFunctionCall exactly: only a by-value struct with no copy()
+                        // that transitively owns a `unique` pointer is non-copyable. Outside a generic
+                        // substitution context it returns 0 (same convention as is_pointer/is_unique).
+                        // Returns i1 typed "int" - use under `if const`, do not printf it directly.
+                        if (functionName == "is_copyable")
+                        {
+                            bool isCopyable = false;
+                            if (argumentList.size() > 0)
+                            {
+                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                if (!namedArgCtx.empty())
+                                {
+                                    std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
+                                    auto substIt = activeTypeSubstitutions.find(argText);
+                                    if (substIt != activeTypeSubstitutions.end())
+                                    {
+                                        std::string base = substIt->second;
+                                        StripUniqueQualifier(base);
+                                        StripAliasQualifier(base);
+                                        auto* be = Compiler(ctx);
+                                        // A pointer (bare/unique/alias) or a non-struct type is always
+                                        // copyable; a struct is refused only by the unique-owner rule.
+                                        if (!base.empty() && base.back() == '*')
+                                            isCopyable = true;
+                                        else if (be->dataStructures.count(base) == 0)
+                                            isCopyable = true;
+                                        else if (be->HasCopyOverloadFor(base))
+                                            isCopyable = true;
+                                        else
+                                            isCopyable = !be->TypeOwnsUniquePointer(base);
+                                    }
+                                }
+                            }
+                            namedVar.Primary = llvm::ConstantInt::get(
+                                llvm::Type::getInt1Ty(*Compiler(ctx)->context), isCopyable ? 1 : 0);
                             namedVar.TypeAndValue.TypeName = "int";
                             break;
                         }
@@ -16206,6 +16747,11 @@ public:
                                 // Null caller storage and mark as moved for params declared 'move' on the funcptr type.
                                 for (size_t i = 0; i < pcount; i++)
                                 {
+                                    if (i < argNVs.size())
+                                        Compiler(ctx)->DiagnoseExplicitMoveToBorrowParam(
+                                            functionName, std::format("{}", i),
+                                            funcPtrTV.FuncPtrParams[i].TypeName,
+                                            funcPtrTV.FuncPtrParams[i].IsMove, argNVs[i]);
                                     if (!funcPtrTV.FuncPtrParams[i].IsMove) continue;
                                     auto& argNV = argNVs[i];
                                     if (argNV.Storage != nullptr && argNV.TypeAndValue.Pointer)
@@ -16398,6 +16944,10 @@ public:
                                     argVar.Storage = argNV.Storage;
                                     argVar.IsOwning = argNV.IsOwning;
                                     argVar.IsOwningString = argNV.IsOwningString;
+                                    argVar.IsOwningStruct = argNV.IsOwningStruct;
+                                    // Explicit 'move' at the call site: drives move-overload selection
+                                    // and the borrow-param diagnostic after overload resolution.
+                                    argVar.IsExplicitMove = argNV.IsExplicitMove;
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
                                     argVar.CallerName = argNV.CallerName;
                                     // Per-field move tracking: moving `node->left` marks only that field.
@@ -16809,6 +17359,10 @@ public:
                                     argVar.Storage = argNV.Storage;
                                     argVar.IsOwning = argNV.IsOwning;
                                     argVar.IsOwningString = argNV.IsOwningString;
+                                    argVar.IsOwningStruct = argNV.IsOwningStruct;
+                                    // Explicit 'move' at the call site: drives move-overload selection
+                                    // and the borrow-param diagnostic after overload resolution.
+                                    argVar.IsExplicitMove = argNV.IsExplicitMove;
                                     // Propagate over-alignment so a `move` param that would inherit the block
                                     // without its alignment tag is rejected instead of mis-freed.
                                     argVar.AllocAlignment = argNV.AllocAlignment;
@@ -18584,7 +19138,7 @@ public:
 
         // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
-            "va_start", "va_end", "is_pointer", "is_unique", "is_primitive", "is_string", "annotationof",
+            "va_start", "va_end", "is_pointer", "is_unique", "is_alias", "is_interface", "is_copyable", "is_primitive", "is_string", "annotationof",
             "compile_error",
             "reflect", "reflect_set", "__rdtscp", "__readcyclecounter", "__lfence", "__pause",
             "__popcount", "__ctz", "__clz", "__prefetch", "__fma", "__likely", "__unlikely",
@@ -19160,6 +19714,7 @@ public:
 
     void ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {})
     {
+        ResolvedMembersScope memberScope_(resolvedMembers_, (const void*)ctx);
         auto* compiler = Compiler(ctx);
         auto decl = ctx->directDeclarator();
         std::string baseName = decl->getText();
@@ -21543,6 +22098,7 @@ public:
 
     void ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {})
     {
+        ResolvedMembersScope memberScope_(resolvedMembers_, (const void*)ctx);
         auto* compiler = Compiler(ctx);
         auto decl = ctx->directDeclarator();
         std::string baseName = decl->getText();
@@ -22357,7 +22913,8 @@ public:
             // ownership sink, so passing a named unique value transfers and nulls it via the existing
             // move machinery. Post-substitution unique params already carry IsMove (set in
             // ParseDeclarationSpecifiers); this covers the direct `unique X*` spelling.
-            if (paramType.IsUnique && ((paramType.Pointer && !paramType.ElemPointer
+            if (paramType.IsUnique && !paramType.IsAliasTypeArg
+                && ((paramType.Pointer && !paramType.ElemPointer
                 && !paramType.IsArrayView) || paramType.IsInterface))
                 paramType.IsMove = true;
 

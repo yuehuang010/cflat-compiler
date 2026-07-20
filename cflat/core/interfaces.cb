@@ -67,8 +67,9 @@ interface IEnumerable<T>
 };
 
 // Mutable indexed list contract: read, write, append, and remove elements.
-// Ownership mirrors list<T>, the canonical implementor: the list owns its elements, so
-// add()/set() take ownership of the value and get()/operator[] hand back a borrow.
+// Ownership mirrors list<T>, the canonical implementor: insertion COPIES a value element and
+// only BORROWS a bare pointer / interface element, so the caller keeps what it passes.
+// Only a `unique` element type transfers ownership into the list.
 interface IList<T>
 {
     // Number of elements in the list.
@@ -77,10 +78,10 @@ interface IList<T>
     alias T get(int index);
     // Indexing operator - element at the given index (borrow, same as get).
     alias T operator[](int index);
-    // Overwrite the element at the given index; takes ownership of the new value.
-    void  set(int index, move T value);
-    // Append a value to the end of the list; takes ownership of the value.
-    void  add(move T value);
+    // Overwrite the element at the given index with a COPY of value.
+    void  set(int index, T value);
+    // Append a COPY of value to the end of the list; the caller's value stays intact.
+    void  add(T value);
     // Remove the element at the given index.
     void  removeAt(int index);
     // Remove all elements.

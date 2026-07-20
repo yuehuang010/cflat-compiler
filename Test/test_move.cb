@@ -888,6 +888,152 @@ int testUniqueLocalAndParam()
     return passed;
 }
 
+// Explicit `move` on a VALUE-type call argument (string / owning struct / closure) defers
+// the ownership transfer until the callee's parameter move-ness is known. Passing to a
+// BORROWING param must leave the source intact (the eager zeroing used to consume it and
+// leak the buffer with no diagnostic), and an explicit `move` must select the `move`
+// overload rather than the plain one.
+int movePlain(string s)      { return (int)s.length(); }
+int moveOwns(move string s)  { return (int)s.length(); }
+
+int ovlPick(string s)        { return 1; }
+int ovlPick(move string s)   { return 2; }
+
+int testValueMoveArgDeferred()
+{
+    int passed = 0;
+
+    // Borrowing param: the source keeps its buffer after the call.
+    {
+        string a = "hel" + "lo";
+        int seen = movePlain(a);
+        passed += Test("value_move_borrow_callee_sees_len", seen, 5);
+        passed += Test("value_move_borrow_source_intact", (int)a.length(), 5);
+    }
+
+    // move param: ownership transfers, the source is left empty (moved-from).
+    {
+        string b = "wor" + "ld";
+        int seen = moveOwns(move b);
+        passed += Test("value_move_owner_callee_sees_len", seen, 5);
+    }
+
+    // Overload selection: a plain argument BORROWS, an explicit `move` picks the move
+    // overload. This pair used to resolve exactly backwards.
+    {
+        string c = "abc" + "de";
+        passed += Test("value_move_ovl_plain_arg_borrows", ovlPick(c), 1);
+        string d = "fgh" + "ij";
+        passed += Test("value_move_ovl_explicit_move_owns", ovlPick(move d), 2);
+    }
+
+    return passed;
+}
+
+// ---------------------------------------------------------------------------
+// Move/borrow overload IDENTITY tests. These deliberately assert WHICH overload
+// ran (via a distinct return code / copy counter), never a call count: a counting
+// oracle cannot see a fully INVERTED borrow/move pair.
+// ---------------------------------------------------------------------------
+
+// Generic-substituted pointer params: Box<T>.put(T) borrows, put(move T) owns.
+struct Box<T>
+{
+    int lastPick = 0;
+    int put(T p)      { lastPick = 1; return 1; }
+    int put(move T p) { lastPick = 2; delete p; return 2; }
+};
+
+int g_rvalCopies = 0;
+class Tracked
+{
+    int id = default;
+    Tracked copy() { g_rvalCopies = g_rvalCopies + 1; Tracked t = default; t.id = id; return t; }
+};
+Tracked makeTracked() { Tracked t = default; t.id = 9; return t; }
+
+// Borrow overload deep-copies (as a copy-by-default container would); move transfers.
+int rvalPick(Tracked v)      { Tracked keep = v.copy(); return 1; }
+int rvalPick(move Tracked v) { return 2; }
+
+int testPtrMoveOverloadIdentity()
+{
+    int passed = 0;
+
+    // Plain call on an owning pointer BORROWS: the callee must not free it, and the
+    // caller's pointer must NOT be marked moved (it is still readable afterwards).
+    dtorCount = 0;
+    {
+        Resource* a = new Resource();
+        a->id = 7;
+        passed += Test("ptr_ovl_plain_picks_borrow", probe(a), 207);
+        passed += Test("ptr_ovl_plain_not_moved", a->id, 7);   // still usable: not consumed
+        passed += Test("ptr_ovl_plain_not_freed_yet", dtorCount, 0);
+    }
+    passed += Test("ptr_ovl_plain_freed_at_scope_exit", dtorCount, 1);
+
+    // Explicit move picks the MOVE overload, which frees exactly once inside the call.
+    dtorCount = 0;
+    {
+        Resource* b = new Resource();
+        b->id = 8;
+        passed += Test("ptr_ovl_explicit_move_picks_move", probe(move b), 108);
+        passed += Test("ptr_ovl_explicit_move_freed_in_callee", dtorCount, 1);
+    }
+    passed += Test("ptr_ovl_explicit_move_freed_once", dtorCount, 1);
+
+    // Same rules through a generic substitution (T = Resource*).
+    dtorCount = 0;
+    {
+        Box<Resource*> box;
+        Resource* c = new Resource();
+        c->id = 3;
+        passed += Test("generic_ptr_ovl_plain_picks_borrow", box.put(c), 1);
+        passed += Test("generic_ptr_ovl_plain_not_freed", dtorCount, 0);
+        delete c;
+    }
+    passed += Test("generic_ptr_ovl_borrow_freed_by_caller", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Box<Resource*> box;
+        Resource* d = new Resource();
+        d->id = 4;
+        passed += Test("generic_ptr_ovl_explicit_move_picks_move", box.put(move d), 2);
+        passed += Test("generic_ptr_ovl_move_freed_in_callee", dtorCount, 1);
+    }
+    passed += Test("generic_ptr_ovl_move_freed_once", dtorCount, 1);
+
+    return passed;
+}
+
+int testRValuePrefersMoveOverload()
+{
+    int passed = 0;
+
+    // An unnamed temporary prefers the MOVE overload (nothing to preserve), so the
+    // borrow overload's deep copy is not paid.
+    g_rvalCopies = 0;
+    passed += Test("rvalue_arg_picks_move", rvalPick(makeTracked()), 2);
+    passed += Test("rvalue_arg_no_copy", g_rvalCopies, 0);
+
+    // A named lvalue still BORROWS - that is the semantics, and it must not regress.
+    Tracked t = default;
+    t.id = 3;
+    g_rvalCopies = 0;
+    passed += Test("named_lvalue_arg_picks_borrow", rvalPick(t), 1);
+    passed += Test("named_lvalue_arg_copies", g_rvalCopies, 1);
+
+    // Explicit move on a named lvalue picks the move overload, no copy.
+    Tracked u = default;
+    u.id = 4;
+    g_rvalCopies = 0;
+    passed += Test("named_lvalue_explicit_move_picks_move", rvalPick(move u), 2);
+    passed += Test("named_lvalue_explicit_move_no_copy", g_rvalCopies, 0);
+
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -1026,8 +1172,9 @@ extern int main()
     passed += Test("worker_move_delete_freed_once", dtorCount, 1);
     total++;
 
-    // Test 7: list::take - transfers ownership out of list; element freed by caller,
-    // not by list; list entry is nulled so no double-free
+    // Test 7: list<unique T*> OWNS its elements - removeAt frees one in place, the
+    // destructor frees the rest. take() went away with the borrow-by-default list:
+    // extraction from an owning container is deliberately undesigned (plan item 5).
     dtorCount = 0;
     {
         list<unique Resource*> items;
@@ -1035,26 +1182,36 @@ extern int main()
         Resource* b = new Resource();
         items.add(a);
         items.add(b);
-        {
-            Resource* taken = items.take(0);
-            // taken owns the first element; b still in list
-        }
-        // taken freed at scope exit: dtorCount == 1
-        passed += Test("list_take_owned_freed", dtorCount, 1);
+        items.removeAt(0);
+        passed += Test("list_removeAt_owned_freed", dtorCount, 1);
         total++;
         // list goes out of scope; remaining element (b) freed by list destructor
     }
-    passed += Test("list_take_remaining_freed", dtorCount, 2);
+    passed += Test("list_dtor_remaining_freed", dtorCount, 2);
     total++;
 
     // Test 8: move-vs-borrow overload selection.
-    // Owning local -> picks 'move' overload (returns 100+id, frees r).
+    // A PLAIN call passes an owning pointer as a BORROW (returns 200+id, no free) - writing
+    // no 'move' at the call site must never silently consume the caller's pointee.
     dtorCount = 0;
     {
         Resource* a = new Resource();
         a->id = 5;
         int v = probe(a);
-        passed += Test("probe_picks_move_for_owning", v, 105);
+        passed += Test("probe_plain_call_picks_borrow", v, 205);
+        total++;
+        // 'a' still owned here; freed at scope exit.
+    }
+    passed += Test("probe_plain_call_freed_at_scope_exit", dtorCount, 1);
+    total++;
+
+    // Explicit 'move' on a pointer -> picks the 'move' overload (returns 100+id, frees r).
+    dtorCount = 0;
+    {
+        Resource* a = new Resource();
+        a->id = 5;
+        int v = probe(move a);
+        passed += Test("probe_picks_move_for_explicit_move", v, 105);
         total++;
         // 'a' moved into probe; scope exit is a no-op.
     }
@@ -1124,6 +1281,15 @@ extern int main()
 
     passed += testUniqueLocalAndParam();
     total += 4;
+
+    passed += testValueMoveArgDeferred();
+    total += 5;
+
+    passed += testPtrMoveOverloadIdentity();
+    total += 13;
+
+    passed += testRValuePrefersMoveOverload();
+    total += 6;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

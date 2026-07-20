@@ -19,6 +19,10 @@ import "string.cb";
 import "list.cb";
 import "dictionary.cb";
 import "hashset.cb";
+import "hpc/btree.cb";
+import "array.cb";
+import "queue.cb";
+import "stack.cb";
 import "diagnostic/heap_audit.cb";
 import "test_helper.cb";
 
@@ -177,6 +181,10 @@ move IShapeLeak pickShape(move IShapeLeak a, move IShapeLeak b, int sel)
 
 // Pointer flavor of the same exclusive-return pattern: must compile and free each object once.
 struct PtrLeak { int v = 0; ~PtrLeak() { g_shapeDtor = g_shapeDtor + 1; } };
+// Non-copyable value element: owns a `unique` pointer and has no copy(), so the COPYING
+// dictionary/hashset insert is poisoned and only the `move` transfer overload is usable.
+struct LeakHolder { unique PtrLeak* slot = nullptr; int k = 0; int hash() { return k; } };
+bool operator==(LeakHolder a, LeakHolder b) { return a.k == b.k; }
 void delPtr(move PtrLeak* p) {}
 move PtrLeak* pickPtr(move PtrLeak* a, move PtrLeak* b, int sel)
 {
@@ -901,18 +909,20 @@ extern int main()
         total++; passed += Test("list<struct> copy source intact", ls.get(0).name, "aabb");
         total++; passed += Test("list<struct> copy independent",   lsCopy.get(0).name, "aabb");
 
-        // list<int*> is a BORROWED view now: copy() shallow-copies the pointers (no move, no
+        // list<alias int*> is the BORROWED view: copy() shallow-copies the pointers (no move, no
         // ownership transfer) - the source keeps its slot and both lists alias the same pointee,
-        // which the caller owns and frees once. (Owning lists use list<unique int*>, whose copy()
-        // is a compile error - see err_unique_list_copy.cb.)
-        list<int*> lp = default;
+        // which the caller owns and frees once. (Owning lists - bare list<int*> or
+        // list<unique int*> - have a copy() that is a compile error - see err_unique_list_copy.cb.)
+        list<alias int*> lp = default;
         int* p0 = new int; *p0 = 7; lp.add(p0);
-        list<int*> lpCopy = lp.copy();
+        list<alias int*> lpCopy = lp.copy();
         int* lpElem = lpCopy.get(0);
         total++; passed += Test("list<ptr> borrow copy keeps source", lp.get(0) != nullptr, true);
         total++; passed += Test("list<ptr> borrow copy aliases same", lp.get(0) == lpElem, true);
         total++; passed += Test("list<ptr> borrow copy sees pointee", *lpElem, 7);
-        int* lpOwner = lpCopy.take(0); delete lpOwner;   // free the shared int exactly once
+        // `alias` add() borrows, so p0 stays usable and frees the shared int exactly once.
+        // (Not via lpCopy.take(0): see internal/issue/alias-list-take-double-free.md.)
+        delete p0;
 
         // list<enum>: element copy is bitwise; source and copy both hold the value (was: build failed).
         list<LeakColor> lc = default; lc.add(LeakColor.LC_Green); lc.add(LeakColor.LC_Blue);
@@ -927,19 +937,445 @@ extern int main()
         total++; passed += Test("dict<struct> copy source intact", dm.get(1).name, "ccdd");
         total++; passed += Test("dict<struct> copy independent",   dmCopy.get(1).name, "ccdd");
 
-        // dictionary<int, int*>: the dict OWNS value pointers, so copy() MOVES them (source value nulled).
+        // dictionary<int, int*> is a BORROWED view now: copy() shallow-copies the value pointers
+        // (no move, no ownership transfer) - the source keeps its slot and both dicts alias the same
+        // pointee, which the caller owns and frees once. (Owning dicts use dictionary<int, unique
+        // int*>, whose copy() is a compile error - see err_unique_dict_copy.cb.)
         dictionary<int, int*> dp = default;
-        int* dpp = new int; *dpp = 9; dp.set(2, dpp);
+        int* dpp = new int; *dpp = 9; dp.set(2, dpp);       // borrowed: dpp stays usable and owning
         dictionary<int, int*> dpCopy = dp.copy();
         int* dpElem = dpCopy.get(2);
-        total++; passed += Test("dict<ptr-value> copy transfers ownership", dp.get(2) == nullptr, true);
-        total++; passed += Test("dict<ptr-value> copy owns pointee",        *dpElem, 9);
+        int* dpSrc  = dp.get(2);
+        total++; passed += Test("dict<ptr-value> borrow copy keeps source", dpSrc != nullptr, true);
+        total++; passed += Test("dict<ptr-value> borrow copy aliases same", dpSrc == dpElem, true);
+        total++; passed += Test("dict<ptr-value> borrow copy sees pointee", *dpElem, 9);
+        // Free through the still-owning SOURCE pointer, not through the borrowed slot value:
+        // deleting a named borrow leaves the owner to free again at scope exit (double free).
+        delete dpp;     // free the shared int exactly once (both dicts borrow it)
 
         // hashset<owning-struct>: deep-copied into the slot and freed at teardown (no leak, source intact).
         hashset<LeakName> hn = default;
         LeakName nm = default; nm.n = "ee" + "ff"; hn.add(nm);
         total++; passed += Test("hashset<struct> source intact",  nm.n, "eeff");
         total++; passed += Test("hashset<struct> contains copy",  hn.contains(nm), true);
+    }
+
+    // === Stage 6: unique dictionary VALUE ownership (dtor + leak oracle) ===
+    // dictionary<K, unique V*> OWNS its values: freed on remove()/set()-overwrite/clear()/teardown.
+    // A bare dictionary<K, V*> BORROWS and frees nothing. Interface values ride the vtable dtor slot.
+    // hashset<T*> borrows its (key-like) elements. The HeapAudit oracle proves no leak / no double-free.
+    {
+        // unique pointer values: free on remove, overwrite, clear, and dtor (PtrLeak bumps g_shapeDtor).
+        g_shapeDtor = 0;
+        {
+            dictionary<int, unique PtrLeak*> d;
+            d.add(1, new PtrLeak());
+            d.add(2, new PtrLeak());
+            d.add(3, new PtrLeak());
+            d.remove(2);                               // frees the value at key 2
+            total++; passed += Test("dict<unique ptr> remove frees value", g_shapeDtor, 1);
+            d.set(3, new PtrLeak());                   // overwrite key 3: old value freed first
+            total++; passed += Test("dict<unique ptr> overwrite frees old", g_shapeDtor, 2);
+            d.clear();                                 // frees the values at keys 1 and 3
+            total++; passed += Test("dict<unique ptr> clear frees rest", g_shapeDtor, 4);
+            d.add(4, new PtrLeak());                   // repopulate; the dtor must free it
+        }
+        total++; passed += Test("dict<unique ptr> dtor frees remaining", g_shapeDtor, 5);
+
+        // bare pointer values: the dict frees NOTHING (add()'s move-param nulls the caller local, so
+        // the pointee is reached back through get()). remove() and teardown must leave it alive.
+        g_shapeDtor = 0;
+        PtrLeak* survivor = nullptr;
+        {
+            dictionary<int, PtrLeak*> view;
+            view.add(1, new PtrLeak());
+            PtrLeak* held = view.get(1);               // borrow the stored pointer
+            view.remove(1);                            // borrowed: must NOT free
+            total++; passed += Test("dict<bare ptr> remove frees nothing", g_shapeDtor, 0);
+            delete held;                               // caller frees the removed pointee once
+            total++; passed += Test("dict<bare ptr> caller frees removed", g_shapeDtor, 1);
+            view.add(2, new PtrLeak());
+            survivor = view.get(2);                    // stays in the dict; teardown must not free it
+        }
+        total++; passed += Test("dict<bare ptr> dtor frees nothing", g_shapeDtor, 1);
+        delete survivor;                               // caller frees the survivor once
+        total++; passed += Test("dict<bare ptr> caller frees survivor", g_shapeDtor, 2);
+
+        // unique interface values: owned, freed through the vtable dtor slot (CircleLeak bumps g_shapeDtor).
+        g_shapeDtor = 0;
+        {
+            dictionary<int, unique IShapeLeak> d;
+            d.add(1, new CircleLeak());
+            d.add(2, new CircleLeak());
+            d.remove(1);                               // frees the value at key 1 via the vtable dtor
+            total++; passed += Test("dict<unique iface> remove frees", g_shapeDtor, 1);
+        }
+        total++; passed += Test("dict<unique iface> dtor frees rest", g_shapeDtor, 2);
+
+        // hashset<ptr> BORROWS its elements (add() takes a plain param - no move/null): remove(),
+        // clear(), and the destructor free nothing; the caller owns and frees the pointees.
+        g_shapeDtor = 0;
+        {
+            PtrLeak* h1 = new PtrLeak();
+            PtrLeak* h2 = new PtrLeak();
+            {
+                hashset<PtrLeak*> hs;
+                hs.add(h1);
+                hs.add(h2);
+                hs.remove(h1);                         // borrowed: frees nothing
+                total++; passed += Test("hashset<ptr> remove frees nothing", g_shapeDtor, 0);
+            }                                          // dtor frees nothing
+            total++; passed += Test("hashset<ptr> dtor frees nothing", g_shapeDtor, 0);
+            delete h1; delete h2;                      // caller frees both pointees once
+            total++; passed += Test("hashset<ptr> caller frees", g_shapeDtor, 2);
+        }
+    }
+
+    // === Borrow-by-default migration of dictionary / hashset: VALUE elements are COPIED ===
+    // add()/set() take a plain `V value` and deep-copy it, so the caller's source stays intact
+    // and independent; the `move` transfer overload is the opt-in that hands the buffer over.
+    // A dictionary<K, V*> / <K, IFace> BORROWS (covered above); this covers the value legs.
+    {
+        // dictionary value COPIED: mutating the source after insert must not touch the slot.
+        dictionary<int, LeakRow> dv = default;
+        LeakRow src = default; src.name = "or" + "ig";
+        dv.add(1, src);
+        src.name = "MUT" + "ATED";
+        total++; passed += Test("dict<val> add copies (slot)",   dv.get(1).name, "orig");
+        total++; passed += Test("dict<val> add copies (source)", src.name, "MUTATED");
+
+        // set() copies too, and releases the old owned element (no leak, no double free).
+        LeakRow src2 = default; src2.name = "se" + "cond";
+        dv.set(1, src2);
+        src2.name = "AGA" + "IN";
+        total++; passed += Test("dict<val> set copies (slot)",   dv.get(1).name, "second");
+        total++; passed += Test("dict<val> set copies (source)", src2.name, "AGAIN");
+
+        // The move overloads still transfer: no copy, the slot adopts the caller's buffer.
+        LeakRow mv = default; mv.name = "mo" + "ved";
+        dv.add(2, move mv);
+        total++; passed += Test("dict<val> add(move) transfers", dv.get(2).name, "moved");
+        LeakRow mv2 = default; mv2.name = "mov" + "ed2";
+        dv.set(2, move mv2);
+        total++; passed += Test("dict<val> set(move) transfers", dv.get(2).name, "moved2");
+        dv.remove(1);
+        total++; passed += Test("dict<val> remove count", dv.count(), 1);
+
+        // hashset elements are deep-copied on add(); the source stays usable and independent.
+        hashset<LeakName> hv = default;
+        LeakName hs1 = default; hs1.n = "el" + "em";
+        hv.add(hs1);
+        total++; passed += Test("hashset<val> add copies (contains)", hv.contains(hs1), true);
+        total++; passed += Test("hashset<val> add copies (source)",   hs1.n, "elem");
+
+        // hashset's transfer counterpart - value elements only, same guard as dictionary's.
+        LeakName hs2 = default; hs2.n = "gon" + "e";
+        hv.add(move hs2);
+        LeakName probe = default; probe.n = "gon" + "e";
+        total++; passed += Test("hashset<val> add(move) transfers", hv.contains(probe), true);
+        total++; passed += Test("hashset<val> count after move add", hv.count(), 2);
+    }
+
+    // === Non-copyable value element stays USABLE through the transfer overload ===
+    // A struct owning a `unique` pointer has no copy(), so the copying add()/set() are poisoned
+    // (see err_dict_noncopyable_value.cb / err_hashset_noncopyable_elem.cb). The container must
+    // still instantiate and work via `move`, and must free the owned pointee exactly once.
+    {
+        g_shapeDtor = 0;
+        {
+            dictionary<int, LeakHolder> d = default;
+            LeakHolder h1 = default; h1.slot = new PtrLeak(); h1.k = 1;
+            d.add(1, move h1);
+            total++; passed += Test("dict<noncopy> move add count", d.count(), 1);
+            LeakHolder h2 = default; h2.slot = new PtrLeak(); h2.k = 2;
+            d.set(1, move h2);                     // overwrite releases the old holder's pointee
+            total++; passed += Test("dict<noncopy> move set frees old", g_shapeDtor, 1);
+
+            hashset<LeakHolder> s = default;
+            LeakHolder h3 = default; h3.slot = new PtrLeak(); h3.k = 3;
+            s.add(move h3);
+            LeakHolder sProbe = default; sProbe.k = 3;
+            total++; passed += Test("hashset<noncopy> move add", s.contains(sProbe), true);
+        }
+        total++; passed += Test("noncopy containers free on teardown", g_shapeDtor, 3);
+    }
+
+    // === array<T> borrow-by-default migration (mirrors list<T>/hashset<T>/dictionary<K,V>) ===
+    // array<T> value elements are COPIED (plain set) / TRANSFERRED (set(move)); array<T*> and
+    // array<IShapeLeak> BORROW (never freed by the array, heap- or stack-boxed alike);
+    // array<unique T*> OWNS (frees on overwrite and teardown); a non-copyable value element is
+    // poisoned on the plain overload but usable via set(move) (see err_array_noncopyable_elem.cb).
+    {
+        // array<int> primitive - trivial.
+        array<int> ai; ai.init(3);
+        ai.set(0, 10); ai.set(1, 20); ai.set(2, 30);
+        total++; passed += Test("array<int> get(1)", ai.get(1), 20);
+        total++; passed += Test("array<int> count", ai.count(), 3);
+
+        // array<string> value: plain set COPIES (source survives, independently mutable);
+        // set(move) transfers.
+        array<string> asv; asv.init(2);
+        string src = "or" + "ig";
+        asv.set(0, src);
+        src = "MUT" + "ATED";
+        total++; passed += Test("array<val> set copies (slot)",   asv.get(0), "orig");
+        total++; passed += Test("array<val> set copies (source)", src, "MUTATED");
+        string mvs = "mo" + "ved";
+        asv.set(1, move mvs);
+        total++; passed += Test("array<val> set(move) transfers", asv.get(1), "moved");
+
+        // array<T*> bare pointer: BORROWS. Elements are passed as fresh `new` expressions (never
+        // named owning locals - a named `PtrLeak* p = new PtrLeak();` local is itself an owning
+        // local freed at ITS OWN scope exit, which would confound this oracle); get() hands back
+        // an alias (borrow) that the caller frees explicitly.
+        g_shapeDtor = 0;
+        {
+            array<PtrLeak*> ap; ap.init(2);
+            ap.set(0, new PtrLeak());
+            ap.set(1, new PtrLeak());
+            PtrLeak* bp0 = ap.get(0);
+            PtrLeak* bp1 = ap.get(1);
+            total++; passed += Test("array<ptr> dtor frees nothing before death", g_shapeDtor, 0);
+            delete bp0; delete bp1;
+        }
+        total++; passed += Test("array<ptr> caller frees both", g_shapeDtor, 2);
+
+        // array<IShapeLeak> heap-boxed interface: BORROWS.
+        g_shapeDtor = 0;
+        {
+            array<IShapeLeak> ash; ash.init(2);
+            ash.set(0, new CircleLeak());
+            ash.set(1, new CircleLeak());
+            IShapeLeak bs0 = ash.get(0);
+            IShapeLeak bs1 = ash.get(1);
+            total++; passed += Test("array<iface> heap dtor frees nothing before death", g_shapeDtor, 0);
+            delete bs0; delete bs1;
+        }
+        total++; passed += Test("array<iface> heap caller frees both", g_shapeDtor, 2);
+
+        // array<IShapeLeak> STACK-boxed interface: BORROWS - the array must not delete a
+        // stack-boxed object (that would run the dtor and then abort/corrupt on the real
+        // scope-exit destruction below).
+        g_shapeDtor = 0;
+        {
+            CircleLeak stc0; stc0.r = 1;
+            CircleLeak stc1; stc1.r = 2;
+            {
+                array<IShapeLeak> ash2; ash2.init(2);
+                ash2.set(0, stc0);
+                ash2.set(1, stc1);
+            }
+            total++; passed += Test("array<iface> stack-boxed array dtor frees nothing", g_shapeDtor, 0);
+        }
+        // stc0/stc1 destruct on scope exit above -> +2, proving they were never double-freed.
+        total++; passed += Test("array<iface> stack-boxed source destructs once", g_shapeDtor, 2);
+
+        // array<unique T*>: OWNS - overwrite frees the old element, teardown frees the rest.
+        g_shapeDtor = 0;
+        {
+            array<unique PtrLeak*> au; au.init(2);
+            au.set(0, new PtrLeak());
+            au.set(1, new PtrLeak());
+            au.set(1, new PtrLeak());   // overwrite: old element at index 1 freed first
+            total++; passed += Test("array<unique ptr> overwrite frees old", g_shapeDtor, 1);
+        }
+        total++; passed += Test("array<unique ptr> teardown frees remaining", g_shapeDtor, 3);
+
+        // array<LeakHolder>: non-copyable value element (owns a `unique` field, no copy()).
+        // The plain set() is poisoned at compile time (err_array_noncopyable_elem.cb); set(move)
+        // works and the array frees both owned pointees on teardown - LEAKS=0.
+        g_shapeDtor = 0;
+        {
+            array<LeakHolder> ah; ah.init(2);
+            LeakHolder ah0 = default; ah0.slot = new PtrLeak(); ah0.k = 1;
+            ah.set(0, move ah0);
+            LeakHolder ah1 = default; ah1.slot = new PtrLeak(); ah1.k = 2;
+            ah.set(1, move ah1);
+            total++; passed += Test("array<noncopy> move set ks", ah.get(0).k * 10 + ah.get(1).k, 12);
+        }
+        total++; passed += Test("array<noncopy> teardown frees both slots", g_shapeDtor, 2);
+    }
+
+    // === queue<T> / stack<T> borrow-by-default migration (mirrors list<T>/array<T>) ===
+    // Before this change both were self-inconsistent: enqueue/push took `move T` (claiming
+    // ownership of a pointer element) while the destructor guarded with `if const
+    // (!is_pointer(T))` and freed nothing, so a pointer queue/stack drained by nobody leaked
+    // every element. Now bare BORROWS, `unique` OWNS, and dequeue()/pop() return `alias` for a
+    // borrowed element and `move` for an owned or value one.
+    {
+        // Primitives - trivial. Enough inserts to force several _grow()s, and for queue the
+        // _front offset path: drain half, refill, and confirm FIFO order survives the repack.
+        queue<int> qi;
+        int qn = 0;
+        while (qn < 40) { qi.enqueue(qn); qn++; }
+        total++; passed += Test("queue<int> count after grows", qi.count(), 40);
+        int qbad = 0; int qd = 0;
+        while (qd < 20) { if (qi.dequeue() != qd) qbad++; qd++; }
+        total++; passed += Test("queue<int> FIFO across grows", qbad, 0);
+        int qr = 0;
+        while (qr < 30) { qi.enqueue(100 + qr); qr++; }   // _front > 0: forces the repack path
+        total++; passed += Test("queue<int> count after _front repack", qi.count(), 50);
+        total++; passed += Test("queue<int> front after repack", qi.dequeue(), 20);
+
+        stack<int> si;
+        int sn = 0;
+        while (sn < 40) { si.push(sn); sn++; }
+        total++; passed += Test("stack<int> count after grows", si.count(), 40);
+        total++; passed += Test("stack<int> pop LIFO", si.pop(), 39);
+
+        // Value elements: the plain insert COPIES (source survives and is independently
+        // mutable); the guarded `move` overload transfers.
+        queue<string> qs;
+        string qsrc = "or" + "ig";
+        qs.enqueue(qsrc);
+        qsrc = "MUT" + "ATED";
+        total++; passed += Test("queue<val> enqueue copies (slot)",   qs.peek(), "orig");
+        total++; passed += Test("queue<val> enqueue copies (source)", qsrc, "MUTATED");
+        string qmv = "mo" + "ved";
+        qs.enqueue(move qmv);
+        total++; passed += Test("queue<val> dequeue 1", qs.dequeue(), "orig");
+        total++; passed += Test("queue<val> enqueue(move) transfers", qs.dequeue(), "moved");
+
+        stack<string> ss;
+        string ssrc = "or" + "ig";
+        ss.push(ssrc);
+        ssrc = "MUT" + "ATED";
+        total++; passed += Test("stack<val> push copies (slot)",   ss.peek(), "orig");
+        total++; passed += Test("stack<val> push copies (source)", ssrc, "MUTATED");
+        string smv = "mo" + "ved";
+        ss.push(move smv);
+        total++; passed += Test("stack<val> push(move) transfers", ss.pop(), "moved");
+
+        // Bare pointer BORROWS: dequeue()/pop() hand back an alias, the container frees
+        // nothing, and the caller frees each element exactly once. Elements are fresh `new`
+        // expressions, never named owning locals (those are freed at their own scope exit).
+        g_shapeDtor = 0;
+        {
+            queue<PtrLeak*> qp;
+            qp.enqueue(new PtrLeak());
+            qp.enqueue(new PtrLeak());
+            PtrLeak* qb0 = qp.dequeue();
+            PtrLeak* qb1 = qp.peek();
+            total++; passed += Test("queue<ptr> dequeue frees nothing", g_shapeDtor, 0);
+            delete qb0; delete qb1;
+        }
+        total++; passed += Test("queue<ptr> caller frees both", g_shapeDtor, 2);
+
+        g_shapeDtor = 0;
+        {
+            stack<PtrLeak*> sp;
+            sp.push(new PtrLeak());
+            sp.push(new PtrLeak());
+            PtrLeak* sb0 = sp.pop();
+            PtrLeak* sb1 = sp.peek();
+            total++; passed += Test("stack<ptr> pop frees nothing", g_shapeDtor, 0);
+            delete sb0; delete sb1;
+        }
+        total++; passed += Test("stack<ptr> caller frees both", g_shapeDtor, 2);
+
+        // Heap-boxed interface elements BORROW, exactly like bare pointers.
+        g_shapeDtor = 0;
+        {
+            queue<IShapeLeak> qf;
+            qf.enqueue(new CircleLeak());
+            qf.enqueue(new CircleLeak());
+            IShapeLeak qf0 = qf.dequeue();
+            IShapeLeak qf1 = qf.peek();
+            total++; passed += Test("queue<iface> heap frees nothing", g_shapeDtor, 0);
+            delete qf0; delete qf1;
+        }
+        total++; passed += Test("queue<iface> heap caller frees both", g_shapeDtor, 2);
+
+        // STACK-boxed interface elements BORROW - deleting one would run the dtor and then
+        // abort/corrupt on the real scope-exit destruction below.
+        g_shapeDtor = 0;
+        {
+            CircleLeak sbc0; sbc0.r = 1;
+            CircleLeak sbc1; sbc1.r = 2;
+            {
+                stack<IShapeLeak> sf;
+                sf.push(sbc0);
+                sf.push(sbc1);
+            }
+            total++; passed += Test("stack<iface> stack-boxed dtor frees nothing", g_shapeDtor, 0);
+        }
+        total++; passed += Test("stack<iface> stack-boxed sources destruct once", g_shapeDtor, 2);
+
+        // `unique T*` OWNS: dequeue()/pop() transfer out (the caller then frees), and teardown
+        // frees everything still held.
+        g_shapeDtor = 0;
+        {
+            queue<unique PtrLeak*> qu;
+            qu.enqueue(new PtrLeak());
+            qu.enqueue(new PtrLeak());
+            qu.enqueue(new PtrLeak());
+            PtrLeak* qtaken = qu.dequeue();
+            total++; passed += Test("queue<unique ptr> dequeue frees nothing", g_shapeDtor, 0);
+            delete qtaken;
+            total++; passed += Test("queue<unique ptr> caller frees taken", g_shapeDtor, 1);
+        }
+        total++; passed += Test("queue<unique ptr> teardown frees rest", g_shapeDtor, 3);
+
+        g_shapeDtor = 0;
+        {
+            stack<unique PtrLeak*> su;
+            su.push(new PtrLeak());
+            su.push(new PtrLeak());
+            su.push(new PtrLeak());
+            PtrLeak* staken = su.pop();
+            total++; passed += Test("stack<unique ptr> pop frees nothing", g_shapeDtor, 0);
+            delete staken;
+            total++; passed += Test("stack<unique ptr> caller frees taken", g_shapeDtor, 1);
+        }
+        total++; passed += Test("stack<unique ptr> teardown frees rest", g_shapeDtor, 3);
+
+        // `unique IFace` OWNS - freed through the vtable dtor slot.
+        g_shapeDtor = 0;
+        {
+            queue<unique IShapeLeak> qui;
+            qui.enqueue(new CircleLeak());
+            qui.enqueue(new CircleLeak());
+            IShapeLeak quitaken = qui.dequeue();
+            delete quitaken;
+            total++; passed += Test("queue<unique iface> caller frees taken", g_shapeDtor, 1);
+        }
+        total++; passed += Test("queue<unique iface> teardown frees rest", g_shapeDtor, 2);
+
+        g_shapeDtor = 0;
+        {
+            stack<unique IShapeLeak> sui;
+            sui.push(new CircleLeak());
+            sui.push(new CircleLeak());
+            IShapeLeak suitaken = sui.pop();
+            delete suitaken;
+            total++; passed += Test("stack<unique iface> caller frees taken", g_shapeDtor, 1);
+        }
+        total++; passed += Test("stack<unique iface> teardown frees rest", g_shapeDtor, 2);
+
+        // Non-copyable value element (owns a `unique` field, no copy()): the plain insert is
+        // poisoned at compile time (err_queue/err_stack_noncopyable_elem.cb) but the `move`
+        // overload works and teardown frees both owned pointees.
+        g_shapeDtor = 0;
+        {
+            queue<LeakHolder> qh;
+            LeakHolder qh0 = default; qh0.slot = new PtrLeak(); qh0.k = 1;
+            qh.enqueue(move qh0);
+            LeakHolder qh1 = default; qh1.slot = new PtrLeak(); qh1.k = 2;
+            qh.enqueue(move qh1);
+            total++; passed += Test("queue<noncopy> move enqueue front k", qh.peek().k, 1);
+        }
+        total++; passed += Test("queue<noncopy> teardown frees both slots", g_shapeDtor, 2);
+
+        g_shapeDtor = 0;
+        {
+            stack<LeakHolder> sh;
+            LeakHolder sh0 = default; sh0.slot = new PtrLeak(); sh0.k = 1;
+            sh.push(move sh0);
+            LeakHolder sh1 = default; sh1.slot = new PtrLeak(); sh1.k = 2;
+            sh.push(move sh1);
+            total++; passed += Test("stack<noncopy> move push top k", sh.peek().k, 2);
+        }
+        total++; passed += Test("stack<noncopy> teardown frees both slots", g_shapeDtor, 2);
     }
 
     // === Whole-struct assignment through a pointer deref (`*pc = *pa`) auto-moves ===
@@ -998,9 +1434,8 @@ extern int main()
             shapes.add(new CircleLeak());
             shapes.add(new CircleLeak());
             shapes.add(new CircleLeak());
-            IShapeLeak taken = shapes.take(0);
-            delete taken;
-            total++; passed += Test("list<unique iface> take+delete dtor", g_shapeDtor, 1);
+            shapes.removeAt(0);
+            total++; passed += Test("list<unique iface> removeAt frees box", g_shapeDtor, 1);
         }
         total++; passed += Test("list<unique iface> dtor frees rest", g_shapeDtor, 3);
 
@@ -1104,6 +1539,213 @@ extern int main()
         total++; passed += Test("return-block conditional fall-through frees once", g_shapeDtor, 1);
         g_shapeDtor = 0; rbCondFree(new PtrLeak(), -1);
         total++; passed += Test("return-block conditional exit frees once", g_shapeDtor, 1);
+    }
+
+    // A fixed-array LOCAL of `unique` elements owns every slot and releases each one at scope
+    // exit - an interface array through the vtable dtor slot, a pointer array through delete.
+    // An element moved out is nulled, so it is freed exactly once, by the sink.
+    {
+        g_shapeDtor = 0;
+        {
+            unique IShapeLeak[4] arr = default;
+            int i = 0;
+            while (i < 4) { arr[i] = new CircleLeak(); i = i + 1; }
+        }
+        total++; passed += Test("unique iface array frees all elements", g_shapeDtor, 4);
+
+        g_shapeDtor = 0;
+        {
+            unique IShapeLeak[4] arr = default;
+            int i = 0;
+            while (i < 4) { arr[i] = new CircleLeak(); i = i + 1; }
+            sinkShape(move arr[0]);
+            total++; passed += Test("unique iface array move-out frees one", g_shapeDtor, 1);
+        }
+        total++; passed += Test("unique iface array frees the remaining three", g_shapeDtor, 4);
+
+        g_shapeDtor = 0;
+        {
+            unique PtrLeak*[4] arr = default;
+            int i = 0;
+            while (i < 4) { arr[i] = new PtrLeak(); i = i + 1; }
+            delPtr(move arr[0]);
+            total++; passed += Test("unique ptr array move-out frees one", g_shapeDtor, 1);
+        }
+        total++; passed += Test("unique ptr array frees the remaining three", g_shapeDtor, 4);
+    }
+
+    // === hpc/btree<K,V> borrow-by-default migration (the last container converted) ===
+    // Bare btree<K, V*> BORROWS; btree<K, unique V*> OWNS (frees on overwrite, remove, clear
+    // and teardown); a VALUE element is COPIED on insert and TRANSFERRED via the move overload;
+    // KEYS are always borrowed. Exercised at a scale that forces multi-level splits AND enough
+    // erases to force merges/rebalances, since a mishandled split is a fill-factor-specific
+    // double free. btree<K, unique IFace> owns its fat-pointer values the same way.
+    {
+        // unique values: freed on remove / overwrite / clear / teardown, exactly once each.
+        g_shapeDtor = 0;
+        {
+            btree<int, unique PtrLeak*> t;
+            t.add(1, new PtrLeak());
+            t.add(2, new PtrLeak());
+            t.add(3, new PtrLeak());
+            t.remove(2);
+            total++; passed += Test("btree<unique ptr> remove frees value", g_shapeDtor, 1);
+            t.set(3, new PtrLeak());
+            total++; passed += Test("btree<unique ptr> overwrite frees old", g_shapeDtor, 2);
+            t.add(1, new PtrLeak());               // duplicate: refused, must free not leak
+            total++; passed += Test("btree<unique ptr> refused duplicate frees", g_shapeDtor, 3);
+            t.clear();
+            total++; passed += Test("btree<unique ptr> clear frees rest", g_shapeDtor, 5);
+            // Scale past a single leaf so splits and merges are on the tested path.
+            int i = 0;
+            while (i < 300) { t.add(i * 37 % 300, new PtrLeak()); i = i + 1; }
+            int r = 0;
+            while (r < 150) { t.remove(r * 37 % 300); r = r + 1; }
+            total++; passed += Test("btree<unique ptr> scaled removes free", g_shapeDtor, 155);
+            total++; passed += Test("btree<unique ptr> count after removes", t.count(), 150);
+        }
+        total++; passed += Test("btree<unique ptr> dtor frees remaining", g_shapeDtor, 305);
+
+        // bare pointer values BORROW: nothing is freed by the tree, on any path.
+        g_shapeDtor = 0;
+        {
+            PtrLeak*[120] owned = default;
+            {
+                btree<int, PtrLeak*> view;
+                int i = 0;
+                while (i < 120) { owned[i] = new PtrLeak(); view.add(i * 7 % 120, owned[i]); i = i + 1; }
+                int r = 0;
+                while (r < 60) { view.remove(r * 7 % 120); r = r + 1; }
+                total++; passed += Test("btree<bare ptr> remove frees nothing", g_shapeDtor, 0);
+            }
+            total++; passed += Test("btree<bare ptr> dtor frees nothing", g_shapeDtor, 0);
+            int k = 0;
+            while (k < 120) { delete owned[k]; k = k + 1; }
+            total++; passed += Test("btree<bare ptr> caller frees exactly once", g_shapeDtor, 120);
+        }
+
+        // Bare INTERFACE values BORROW, exactly like bare pointers: the tree stores fat pointers
+        // to objects a list owns, frees none of them, and every element must survive the inline
+        // node array intact (this is the regression for the interface-array-field mis-sizing that
+        // used to clobber children[] and segfault past ~128 inserts). 400 keys forces multi-level
+        // splits; 150 removes force merges/rebalances.
+        g_shapeDtor = 0;
+        {
+            list<unique IShapeLeak> ifaceOwner;
+            int i = 0;
+            while (i < 400) { CircleLeak* c = new CircleLeak(); c->r = i; ifaceOwner.add(c); i = i + 1; }
+            {
+                btree<int, IShapeLeak> iview;
+                int j = 0;
+                while (j < 400) { int k = j * 37 % 400; iview.add(k, ifaceOwner.get(k)); j = j + 1; }
+                total++; passed += Test("btree<bare iface> count", (i64)iview.count(), (i64)400);
+                // Per-element round trip: every slot must hold the object stored under that key,
+                // and dispatch through it must reach that object's own area().
+                int bad = 0;
+                int k2 = 0;
+                while (k2 < 400)
+                {
+                    IShapeLeak s = default;
+                    if (!iview.lookup(k2, &s) || s.area() != k2 * k2) bad = bad + 1;
+                    k2 = k2 + 1;
+                }
+                total++; passed += Test("btree<bare iface> per-element round trip", bad, 0);
+                int r = 0;
+                while (r < 150) { iview.remove(r); r = r + 1; }
+                total++; passed += Test("btree<bare iface> count after removes", (i64)iview.count(), (i64)250);
+                int bad2 = 0;
+                int k3 = 150;
+                while (k3 < 400)
+                {
+                    IShapeLeak s = default;
+                    if (!iview.lookup(k3, &s) || s.area() != k3 * k3) bad2 = bad2 + 1;
+                    k3 = k3 + 1;
+                }
+                total++; passed += Test("btree<bare iface> round trip after merges", bad2, 0);
+                iview.clear();
+                total++; passed += Test("btree<bare iface> clear frees nothing", g_shapeDtor, 0);
+            }
+            total++; passed += Test("btree<bare iface> dtor frees nothing", g_shapeDtor, 0);
+        }
+        total++; passed += Test("btree<bare iface> owner frees all", g_shapeDtor, 400);
+
+        // `unique` INTERFACE values OWN, exactly like `unique` pointers: the tree frees each boxed
+        // object through the vtable dtor slot on remove, overwrite, clear and teardown, exactly
+        // once. 400 keys force multi-level splits and 150 removes force merges/rebalances, so a
+        // fill-factor-specific double free would abort here rather than leak quietly.
+        g_shapeDtor = 0;
+        {
+            btree<int, unique IShapeLeak> t = default;
+            t.add(1, new CircleLeak());
+            t.add(2, new CircleLeak());
+            t.add(3, new CircleLeak());
+            t.remove(2);
+            total++; passed += Test("btree<unique iface> remove frees value", g_shapeDtor, 1);
+            t.set(3, new CircleLeak());
+            total++; passed += Test("btree<unique iface> overwrite frees old", g_shapeDtor, 2);
+            t.add(1, new CircleLeak());            // duplicate: refused, must free not leak
+            total++; passed += Test("btree<unique iface> refused duplicate frees", g_shapeDtor, 3);
+            t.clear();
+            total++; passed += Test("btree<unique iface> clear frees rest", g_shapeDtor, 5);
+            int i = 0;
+            while (i < 400)
+            {
+                CircleLeak* c = new CircleLeak(); c->r = i * 37 % 400;
+                t.add(i * 37 % 400, c);
+                i = i + 1;
+            }
+            total++; passed += Test("btree<unique iface> count after inserts", (i64)t.count(), (i64)400);
+            // Dispatch through an owned slot must still reach the object stored under that key.
+            int bad = 0;
+            int k2 = 0;
+            while (k2 < 400)
+            {
+                IShapeLeak s = default;
+                if (!t.lookup(k2, &s) || s.area() != k2 * k2) bad = bad + 1;
+                k2 = k2 + 1;
+            }
+            total++; passed += Test("btree<unique iface> per-element round trip", bad, 0);
+            int r = 0;
+            while (r < 150) { t.remove(r); r = r + 1; }
+            total++; passed += Test("btree<unique iface> scaled removes free", g_shapeDtor, 155);
+            total++; passed += Test("btree<unique iface> count after removes", (i64)t.count(), (i64)250);
+        }
+        total++; passed += Test("btree<unique iface> dtor frees remaining", g_shapeDtor, 405);
+
+        // Value elements are COPIED; the caller's source stays intact and independently mutable.
+        {
+            btree<int, LeakRow> t = default;
+            LeakRow src = default; src.name = "or" + "ig";
+            t.add(1, src);
+            src.name = "MUT" + "ATED";
+            total++; passed += Test("btree<val> add copies (slot)",   t.get(1).name, "orig");
+            total++; passed += Test("btree<val> add copies (source)", src.name, "MUTATED");
+            LeakRow mv = default; mv.name = "mo" + "ved";
+            t.add(2, move mv);
+            total++; passed += Test("btree<val> add(move) transfers", t.get(2).name, "moved");
+            LeakRow mv2 = default; mv2.name = "mv" + "2";
+            t.set(2, move mv2);
+            total++; passed += Test("btree<val> set(move) frees old", t.get(2).name, "mv2");
+            // Scale the value leg too: splits move owning buffers between nodes.
+            int i = 0;
+            while (i < 300) { LeakRow r = default; r.name = "n" + toString(i); t.set(10 + i * 41 % 300, move r); i = i + 1; }
+            int d = 0;
+            while (d < 200) { t.remove(10 + d * 41 % 300); d = d + 1; }
+            total++; passed += Test("btree<val> survives split+merge", (i64)(t.count() > 0), (i64)1);
+        }
+
+        // A non-copyable value element (owns a `unique`, no copy()) is poisoned on the copying
+        // add()/set() (see err_btree_noncopyable_value.cb) but stays usable through `move`.
+        g_shapeDtor = 0;
+        {
+            btree<int, LeakHolder> t = default;
+            LeakHolder h1 = default; h1.slot = new PtrLeak(); h1.k = 1;
+            t.add(1, move h1);
+            LeakHolder h2 = default; h2.slot = new PtrLeak(); h2.k = 2;
+            t.set(1, move h2);                     // overwrite releases the old holder's pointee
+            total++; passed += Test("btree<noncopy> move set frees old", g_shapeDtor, 1);
+        }
+        total++; passed += Test("btree<noncopy> teardown frees rest", g_shapeDtor, 2);
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

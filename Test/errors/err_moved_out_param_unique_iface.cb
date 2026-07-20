@@ -1,0 +1,14 @@
+// Paired with err_moved_out_param_unique_ptr.cb - see that file. The INTERFACE spelling is a
+// {vtable*, data*} fat pointer, and the ownership dataflow must treat it as an owning thing.
+import "hpc/btree.cb";
+interface IMvShape { int area(); };
+class MvCircle : IMvShape { int r = 0; int area() { return r * r; } };
+expect_error("use of moved variable 's'");
+extern int main()
+{
+    btree<int, unique IMvShape> t = default;
+    unique IMvShape s = new MvCircle();
+    t.add(1, move s);
+    t.lookup(1, &s);
+    return 0;
+}

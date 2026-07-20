@@ -1408,7 +1408,9 @@ that takes one does not accept the other.
 Container access mirrors the local/parameter rules:
 
 - `[]` / `get(i)` return a **borrow** (`alias`) - reading an element never transfers it out.
-- `take(i)` removes an element and transfers ownership to the caller.
+- `removeAt(i)` drops the entry; on an owning list it frees the element. There is no
+  extraction verb: `get(i)` already hands back the element, and transferring ownership out
+  of a container is a deliberately undesigned operation.
 - `set(i, move value)` destructs the old owning element (if any) before storing the new one.
 - `removeAt(i)` / `clear()` / the destructor free every owning element they discard.
 - `.copy()` on a `unique`-element list is a **compile error**: "cannot copy a list of

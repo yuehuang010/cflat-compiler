@@ -359,7 +359,8 @@ struct TileScheduler
         list<TileKey> ready = default;
         while (inFlight.count() < maxInFlight && queueOrder.count() > 0)
         {
-            u64 pk = queueOrder.take(0);
+            u64 pk = queueOrder.get(0);
+            queueOrder.removeAt(0);
             if (!queued.contains(pk)) continue;   // was cancelled while queued
             queued.remove(pk);
             inFlight.set(pk, true);

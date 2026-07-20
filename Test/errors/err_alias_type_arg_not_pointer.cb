@@ -1,0 +1,7 @@
+// `alias` on a generic type argument is the non-owning twin of `unique`, and like `unique`
+// it is only meaningful on a pointer or interface type (D1).
+import "list.cb";
+
+expect_error("alias requires a pointer or interface type; 'int' is neither") {
+    list<alias int> bad = default;
+}

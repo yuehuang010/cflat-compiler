@@ -1,10 +1,29 @@
 // stack<T> - LIFO (Last In First Out) using simple array.
+//
+// THE RULE: BARE BORROWS, `unique` OWNS - for pointers AND fat pointers (interface values)
+// alike, exactly as in list.cb. An interface value IS a fat pointer { vtable*, data* }, and
+// is_pointer(T) reports it as one, so pointer and interface elements share every code path.
+//
+//   stack<T>              value elements, copied on insert
+//   stack<T*>             BORROWS - never freed
+//   stack<IShape>         BORROWS - never freed
+//   stack<unique T*>      OWNS and frees
+//   stack<unique IShape>  OWNS and frees
+//
+// pop()'s RETURN KIND follows the same rule: an owned element transfers out (`move`), a
+// borrowed one is handed back as `alias` (the caller must not free it - the real owner still
+// owns it), and a value element transfers out because its slot is gone.
+//
+// THE TRADE-OFF, as in list: push() COPIES a value element, so `s.push(v)` leaves `v` intact.
+// Write `s.push(move v)` to transfer instead.
 class stack<T>
 {
     T*  _data     = nullptr;
     int _size     = 0;
     int _capacity = 0;
 
+    // Double the backing buffer, moving existing elements over. Moving (not copying) is
+    // correct here because the old buffer is discarded immediately after.
     void _grow()
     {
         int newCap = _capacity == 0 ? 4 : _capacity * 2;
@@ -20,22 +39,93 @@ class stack<T>
         _capacity = newCap;
     }
 
-    // Push a value. An owning element (string, nested container) is moved into the slot
-    // so the stack takes ownership; the destructor frees it. A plain copy would share the
-    // element's buffer with the caller's temporary and dangle when it frees.
-    void push(move T value)
+    // Store into a slot that holds no live element yet. `unique` takes ownership (a unique
+    // parameter is a synthesized move sink); a bare pointer or interface is aliased; a
+    // value type is deep-copied so the caller's original stays independent.
+    // `is_pointer(T)` is true for a bare, `unique` or `alias` pointer AND for an interface
+    // value, so it subsumes the alias case - do not add an is_alias arm, it is unreachable.
+    void _placeAt(int index, T value)
     {
-        if (_size >= _capacity) _grow();
-        _data[_size] = move value;
-        _size++;
+        if const (is_unique(T))         _data[index] = move value;
+        else if const (is_pointer(T))   _data[index] = value;
+        else if const (is_primitive(T)) _data[index] = value;
+        else if const (!is_copyable(T)) compile_error("this stack element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (s.push(move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else                            _data[index] = value.copy();
     }
 
-    // Remove and return the top element, transferring ownership to the caller.
-    move T pop()
+    // Release the element in a live slot: `unique` is freed, a value type is destructed, a
+    // bare pointer or interface is left to its real owner.
+    void _releaseAt(int index)
     {
-        _size--;
-        T value = move _data[_size];
-        return value;
+        if const (is_unique(T))
+        {
+            if (_data[index] != nullptr) delete _data[index];
+        }
+        else if const (is_pointer(T))   { }
+        else if const (is_primitive(T)) { }
+        else                            _data[index].~();
+    }
+
+    // Push a value. A value type is COPIED (the caller's value is left intact); a bare pointer
+    // or interface is aliased; a `unique` element is TAKEN - a unique-typed parameter is a
+    // synthesized move sink, so the caller's source is nulled for it.
+    void push(T value)
+    {
+        // Poison the copying overload for a non-copyable T so the class still instantiates and
+        // `push(move x)` stays usable; the dead arm emits no call to the poisoned _placeAt.
+        if const (!is_copyable(T)) compile_error("this stack element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (s.push(move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else
+        {
+            if (_size >= _capacity) _grow();
+            _placeAt(_size, value);
+            _size++;
+        }
+    }
+
+    // Transfer overload - the caller writes `move` to give up ownership instead of paying for
+    // a copy. Offered for VALUE elements only, and the `!is_pointer(T)` guard is the design,
+    // not a workaround: a bare pointer / interface stack BORROWS, so accepting ownership there
+    // would strand the element, and for `unique T*` the plain parameter is already a move sink.
+    // Declared AFTER the plain push() so conformance matches the plain overload first.
+    if const (!is_pointer(T))
+    {
+        void push(move T value)
+        {
+            if (_size >= _capacity) _grow();
+            _data[_size] = move value;
+            _size++;
+        }
+    }
+
+    // Remove and return the top element. The return kind follows ownership: an owned element
+    // transfers out, a borrowed pointer / interface comes back as an alias the caller must not
+    // free, and a value element transfers out because its slot is gone.
+    if const (is_unique(T))
+    {
+        move T pop()
+        {
+            _size--;
+            T value = move _data[_size];
+            return value;
+        }
+    }
+    else if const (is_pointer(T))
+    {
+        alias T pop()
+        {
+            _size--;
+            T value = _data[_size];
+            return value;
+        }
+    }
+    else
+    {
+        move T pop()
+        {
+            _size--;
+            T value = move _data[_size];
+            return value;
+        }
     }
 
     // Borrow the top element without removing it (caller must not free it).
@@ -54,18 +144,14 @@ class stack<T>
         return _size;
     }
 
+    // Release every live element, then free the backing buffer.
     ~stack()
     {
-        // Destruct owning value elements (string, nested containers); raw pointer
-        // elements are left to the caller. Then free the backing buffer.
-        if const (!is_pointer(T))
+        int i = 0;
+        while (i < _size)
         {
-            int i = 0;
-            while (i < _size)
-            {
-                _data[i].~();
-                i++;
-            }
+            _releaseAt(i);
+            i++;
         }
         if (_data != nullptr) delete[_] _data;
     }

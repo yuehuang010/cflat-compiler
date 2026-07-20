@@ -709,8 +709,8 @@ bool testListPointerClear()
     return result;
 }
 
-// `unique` in generic type-argument position: list<unique Employee*> OWNS its elements (frees
-// them), while a bare list<Employee*> is a DISTINCT instantiation that BORROWS (never frees).
+// `alias` in generic type-argument position: list<unique Employee*> OWNS its elements (frees
+// them), while list<alias Employee*> is a DISTINCT instantiation that BORROWS (never frees).
 struct UniqueChecker<T>
 {
     int check()
@@ -728,8 +728,8 @@ bool testListUniquePointer()
 
     empDtorCount = 0;
     {
-        // Owning list frees its elements; a bare list (distinct instantiation) coexists and only
-        // BORROWS - it holds an aliased element and frees nothing.
+        // Owning list frees its elements; an `alias` list (distinct instantiation) coexists and
+        // only BORROWS - it holds an aliased element and frees nothing.
         list<unique Employee*> owning;
 
         Employee* e1 = new Employee; e1->id = 1;
@@ -737,7 +737,7 @@ bool testListUniquePointer()
         owning.add(e1);
         owning.add(e2);
 
-        list<Employee*> borrowed;
+        list<alias Employee*> borrowed;
         borrowed.add(owning.get(0));
 
         result &= Test("list<unique ptr> count",     owning.count(),      2);
@@ -745,7 +745,7 @@ bool testListUniquePointer()
         result &= Test("list<ptr> borrow count",     borrowed.count(),    1);
         result &= Test("list<ptr> borrow same elem", borrowed.get(0)->id, 1);
 
-        // removeAt on the unique list frees the element; the bare list's dtor frees nothing.
+        // removeAt on the unique list frees the element; the alias list's dtor frees nothing.
         owning.removeAt(0);
         result &= Test("list<unique ptr> removeAt dtor", empDtorCount, 1);
         result &= Test("list<unique ptr> count after remove", owning.count(), 1);
@@ -767,6 +767,79 @@ bool testIsUniqueIntrinsic()
     result &= Test("is_unique unique Employee*", cu.check(), 1);
     result &= Test("is_unique Employee*",        cp.check(), 0);
     result &= Test("is_unique int",              ci.check(), 0);
+    return result;
+}
+
+// `alias` in generic type-argument position: list<alias Employee*> is a distinct, BORROWING
+// instantiation. Its `add(move T)` is NOT an ownership sink - the caller keeps the pointer and
+// frees it exactly once. `move` on an alias-typed value is a silent no-op (like `move int`).
+struct AliasChecker<T>
+{
+    int isAlias()  { if const (is_alias(T))   return 1; else return 0; }
+    int isUnique() { if const (is_unique(T))  return 1; else return 0; }
+    int isPtr()    { if const (is_pointer(T)) return 1; else return 0; }
+};
+
+// Separate template (pointer instantiations only): T is alias-qualified here, so `move v`
+// must be a no-op that leaves the source readable.
+struct AliasMover<T>
+{
+    int moveRoundtrip(T v) { T w = move v; return v.id + w.id; }
+};
+
+bool testIsAliasIntrinsic()
+{
+    bool result = true;
+    AliasChecker<alias Employee*>  ca = default;
+    AliasChecker<unique Employee*> cu = default;
+    AliasChecker<Employee*>        cp = default;
+    AliasChecker<int>              ci = default;
+    // is_alias is orthogonal to is_unique and is_pointer.
+    result &= Test("is_alias alias Employee*",   ca.isAlias(),  1);
+    result &= Test("is_alias unique Employee*",  cu.isAlias(),  0);
+    result &= Test("is_alias Employee*",         cp.isAlias(),  0);
+    result &= Test("is_alias int",               ci.isAlias(),  0);
+    result &= Test("is_unique alias Employee*",  ca.isUnique(), 0);
+    result &= Test("is_pointer alias Employee*", ca.isPtr(),    1);
+    return result;
+}
+
+bool testListAliasPointer()
+{
+    bool result = true;
+
+    empDtorCount = 0;
+    {
+        // The alias list borrows: add() does not consume, and the list frees nothing.
+        list<alias Employee*> borrowing;
+
+        Employee* e1 = new Employee; e1->id = 1;
+        Employee* e2 = new Employee; e2->id = 2;
+        borrowing.add(e1);
+        borrowing.add(e2);
+
+        // e1/e2 are still usable after add() - no use-after-move.
+        result &= Test("list<alias ptr> count",        borrowing.count(),      2);
+        result &= Test("list<alias ptr> src usable",   e1->id,                 1);
+        result &= Test("list<alias ptr> get id",       borrowing.get(0)->id,   1);
+        result &= Test("list<alias ptr> no dtor yet",  empDtorCount,           0);
+
+        // removeAt on a borrowing list must NOT free the element.
+        borrowing.removeAt(0);
+        result &= Test("list<alias ptr> removeAt no dtor", empDtorCount, 0);
+
+        // Explicit move of an alias-typed value is a no-op; the caller still frees exactly once.
+        AliasMover<alias Employee*> ac = default;
+        result &= Test("alias move roundtrip", ac.moveRoundtrip(e2), 4);
+        result &= Test("alias move src intact", e2->id, 2);
+
+        delete e1;
+        delete e2;
+        result &= Test("list<alias ptr> caller frees", empDtorCount, 2);
+    }
+    // The borrowing list's destructor freed nothing extra.
+    result &= Test("list<alias ptr> dtor frees nothing", empDtorCount, 2);
+
     return result;
 }
 
@@ -813,7 +886,10 @@ bool testDictionaryPointer()
 
     empDtorCount = 0;
     {
-        dictionary<int, Employee*> d;
+        // `unique Employee*` value: the dictionary OWNS the pointees and frees them on
+        // remove()/set()-overwrite/clear()/teardown (a bare `dictionary<int, Employee*>` would
+        // borrow and free nothing). add()/set() take ownership - the caller's local is moved out.
+        dictionary<int, unique Employee*> d;
         Employee* e1 = new Employee; e1->id = 1; e1->salary = 100;
         Employee* e2 = new Employee; e2->id = 2; e2->salary = 200;
         Employee* e3 = new Employee; e3->id = 3; e3->salary = 300;
@@ -2474,12 +2550,13 @@ bool testListOfListOfListByValue()
     return result;
 }
 
-// list<list<int>*> - the idiomatic owning-pointer nesting. The outer list owns
-// the inner list pointers and frees them in its destructor.
+// list<unique list<int>*> - the idiomatic owning-pointer nesting. `unique` so the outer
+// list OWNS the inner list pointers and frees them in its destructor (bare would borrow
+// and leak them here).
 bool testListOfListPtr()
 {
     bool result = true;
-    list<list<int>*> ll;
+    list<unique list<int>*> ll;
 
     list<int>* a = new list<int>();
     a.add(10); a.add(20); a.add(30);
@@ -2495,12 +2572,13 @@ bool testListOfListPtr()
     return result;
 }
 
-// dictionary<int, list<int>*> - a generic used as the value type argument of
-// another generic.
+// dictionary<int, unique list<int>*> - a generic used as the value type argument of
+// another generic. `unique` so the dictionary OWNS the nested list and frees it at teardown
+// (a bare `dictionary<int, list<int>*>` would borrow and leak the added list here).
 bool testDictOfListPtr()
 {
     bool result = true;
-    dictionary<int, list<int>*> d;
+    dictionary<int, unique list<int>*> d;
 
     list<int>* a = new list<int>();
     a.add(100); a.add(200);
@@ -2560,6 +2638,167 @@ bool testGenericAlias()
     return result;
 }
 
+// --- member-scope `if const`: per-instantiation member dispatch ---
+
+class IfConstRes
+{
+    int id = default;
+};
+
+class IfConstBox<T>
+{
+    T _v = default;
+    if const (is_unique(T))
+    {
+        int leg = 1;
+        void set(move T value) { _v = move value; }
+    }
+    else if const (is_pointer(T))
+    {
+        int leg = 2;
+        void set(T value) { _v = value; }
+    }
+    else
+    {
+        int leg = 3;
+        struct IfConstTag { int q; };
+        void set(move T value) { _v = move value; }
+        int tag() { IfConstTag t; t.q = leg; return t.q; }
+    }
+};
+
+class IfConstPlat
+{
+    if const (__MACOS__)        { int which() { return 1; } }
+    else if const (__WINDOWS__) { int which() { return 1; } }
+    else                        { int which() { return 1; } }
+};
+
+bool testIfConstMemberScope()
+{
+    bool result = true;
+
+    unique IfConstRes* u = new IfConstRes();
+    u->id = 7;
+    IfConstBox<unique IfConstRes*> a;
+    a.set(move u);
+    result &= Test("ifconst_member_unique_leg", a.leg, 1);
+
+    IfConstRes* raw = new IfConstRes();
+    raw->id = 8;
+    IfConstBox<IfConstRes*> b;
+    b.set(raw);
+    result &= Test("ifconst_member_pointer_leg", b.leg, 2);
+    result &= Test("ifconst_member_pointer_val", b._v->id, 8);
+    delete raw;
+
+    IfConstBox<string> c;
+    string s = "hi";
+    c.set(move s);
+    result &= Test("ifconst_member_value_leg",  c.leg, 3);
+    result &= Test("ifconst_member_nested_str", c.tag(), 3);
+
+    IfConstPlat p;
+    result &= Test("ifconst_member_nongeneric", p.which(), 1);
+
+    return result;
+}
+
+// --- interface-scope `if const`: per-instantiation contract selection ---
+
+struct IfConstVal { int x = default; };
+
+interface IIfConstBox<T>
+{
+    int count();
+    if const (is_string(T))         { void set(move T value); string label; }
+    else if const (is_primitive(T)) { void set(T value);      int label;    }
+    else                            { void set(move T value); int label;    }
+    int tag();
+};
+
+class IfConstSBox : IIfConstBox<string>
+{
+    string _v = default;
+    string label = default;
+    int n = default;
+    int count() { return n; }
+    void set(move string value) { _v = move value; n = n + 1; }
+    int tag() { return 1; }
+};
+
+class IfConstIBox : IIfConstBox<int>
+{
+    int _v = default;
+    int label = default;
+    int n = default;
+    int count() { return n; }
+    void set(int value) { _v = value; n = n + 1; }
+    int tag() { return 2; }
+};
+
+class IfConstVBox : IIfConstBox<IfConstVal>
+{
+    IfConstVal _v = default;
+    int label = default;
+    int n = default;
+    int count() { return n; }
+    void set(move IfConstVal value) { _v = move value; n = n + 1; }
+    int tag() { return 3; }
+};
+
+interface IIfConstPlat
+{
+    if const (__MACOS__)        { int which(); }
+    else if const (__WINDOWS__) { int which(); }
+    else                        { int which(); }
+};
+
+class IfConstPlatImpl : IIfConstPlat
+{
+    int which() { return 9; }
+};
+
+bool testIfConstInterfaceScope()
+{
+    bool result = true;
+
+    IfConstSBox s = default;
+    IfConstIBox i = default;
+    IfConstVBox v = default;
+
+    string str = "hi";
+    s.set(move str);
+    s.label = "sl";
+    i.set(5);
+    i.label = 7;
+    IfConstVal mv = default;
+    v.set(move mv);
+    v.label = 8;
+
+    // Virtual dispatch through each instantiation's interface value.
+    IIfConstBox<string>     a = s;
+    IIfConstBox<int>        b = i;
+    IIfConstBox<IfConstVal> c = v;
+
+    result &= Test("ifconst_iface_string_tag",  a.tag(),   1);
+    result &= Test("ifconst_iface_prim_tag",    b.tag(),   2);
+    result &= Test("ifconst_iface_value_tag",   c.tag(),   3);
+    result &= Test("ifconst_iface_string_cnt",  a.count(), 1);
+    result &= Test("ifconst_iface_prim_cnt",    b.count(), 1);
+    result &= Test("ifconst_iface_value_cnt",   c.count(), 1);
+
+    // Interface FIELDS declared inside an if const branch, read through the interface.
+    result &= Test("ifconst_iface_prim_field",  b.label,   7);
+    result &= Test("ifconst_iface_value_field", c.label,   8);
+
+    IfConstPlatImpl p = default;
+    IIfConstPlat ip = p;
+    result &= Test("ifconst_iface_nongeneric",  ip.which(), 9);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -2581,6 +2820,8 @@ extern int main()
     total++; passed += testListPointerClear()            ? 1 : 0;
     total++; passed += testListUniquePointer()           ? 1 : 0;
     total++; passed += testIsUniqueIntrinsic()           ? 1 : 0;
+    total++; passed += testListAliasPointer()            ? 1 : 0;
+    total++; passed += testIsAliasIntrinsic()            ? 1 : 0;
     total++; passed += testHashsetPointer()              ? 1 : 0;
     total++; passed += testDictionaryPointer()           ? 1 : 0;
     total++; passed += testDoubleNestedGeneric()         ? 1 : 0;
@@ -2636,6 +2877,8 @@ extern int main()
     total++; passed += testSortInterface()               ? 1 : 0;
     total++; passed += testSortCapturedKey()             ? 1 : 0;
     total++; passed += testSortEdgeCases()               ? 1 : 0;
+    total++; passed += testIfConstMemberScope()          ? 1 : 0;
+    total++; passed += testIfConstInterfaceScope()       ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
