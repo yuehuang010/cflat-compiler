@@ -84,6 +84,10 @@ interface IList<T>
     void  add(T value);
     // Remove the element at the given index.
     void  removeAt(int index);
+    // Remove the element at the given index and return it. Ownership defers to T: a `unique`
+    // element transfers out to the caller, a bare pointer / interface returns a borrow, a value
+    // transfers. No keyword at the call site - the returned T carries its own ownership.
+    T     take(int index);
     // Remove all elements.
     void  clear();
 };

@@ -175,6 +175,25 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         _size--;
     }
 
+    // Remove the element at index and return it, shifting the rest left. Ownership DEFERS to T:
+    // a `unique` element transfers out (the caller owns it), a bare pointer / interface returns a
+    // borrow, a value transfers. No keyword at the call site - the returned T carries its own
+    // ownership. The moved-from slot is overwritten by the shift, or falls beyond _size for the
+    // last element, so it is never destructed twice.
+    T take(int index)
+    {
+        _checkBounds(index, "take");
+        T v = move _data[index];
+        int i = index;
+        while (i < _size - 1)
+        {
+            _data[i] = move _data[i + 1];
+            i++;
+        }
+        _size--;
+        return v;
+    }
+
     // Remove all elements. The backing buffer is kept - capacity is unchanged.
     void clear()
     {
@@ -197,7 +216,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         {
             compile_error("cannot copy a list of unique elements; copy the pointees explicitly, or use list<T*> for a borrowing copy");
             list<T> none;
-            return move none;
+            return none;
         }
         list<T> result;
         int i = 0;
@@ -209,7 +228,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
             else                          result.add(_data[i].copy());
             i++;
         }
-        return move result;
+        return result;
     }
 
     // Return an independent copy whose backing array and (string) element buffers are all
@@ -221,7 +240,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         {
             compile_error("cannot copy a list of unique elements; copy the pointees explicitly, or use list<T*> for a borrowing copy");
             list<T> none;
-            return move none;
+            return none;
         }
         IAllocator saved = __active_allocator;
         __active_allocator = alloc;
@@ -238,7 +257,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         }
 
         __active_allocator = saved;
-        return move result;
+        return result;
     }
 
     // Lomuto partition: pivot at _data[hi], returns final pivot index.

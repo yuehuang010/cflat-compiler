@@ -212,6 +212,16 @@ the call sites - C#-like local readability, with the complexity paid once in the
    its destructor - report it instead.** A destructor on a copyable value struct double-destroys
    one OS resource per copy.
 
+   **Side-barred design note (2026-07-20) - copyable/movable are ORTHOGONAL, and some core types
+   are address-PINNED, not just non-copyable.** When the extension is eventually designed, "non-
+   copyable" is not enough. `move` in cflat is a blind relocate-and-zero with NO fixup hook (there
+   is no move constructor), so any type referenced by its own address is broken by a `move` even
+   with no copy: `ThreadPool` stores interior pointers into its own fields (`_ctx.mtx = &_lock`,
+   etc., `threadpool.cb:415-428`; workers hold `wctx = &_ctx`), and lock/`barrier` owners are held
+   by worker `barrier*`. These sit in the PINNED (non-movable) quadrant, orthogonal to copyability.
+   So a complete design needs a `pinned`/non-movable mark INDEPENDENT of `unique` (move-only) - one
+   does not imply the other. Deferred with the extension itself; recorded so it is not re-derived.
+
    **RULED 2026-07-20 - `~Thread()` with a still-running thread is an ERROR, not a guess.**
    Compile-time rejection is ideal; a runtime error is the acceptable fallback. Do NOT silently
    join (a blocking destructor can deadlock at scope exit) and do NOT silently detach (the

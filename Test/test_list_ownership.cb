@@ -311,6 +311,91 @@ int testIListContract()
     return passed;
 }
 
+// --- take(): remove-and-return, ownership defers to T ---------------------------
+
+// A value struct that owns a heap resource (a string) - the case a plain `return v` of a
+// move-initialized local used to double-free. take() now relies on implicit-move-on-return
+// (plain `return v` transfers), so this pins the moved element survives the hand-off intact.
+struct TakeRow { string s = default; TakeRow copy() { TakeRow r; r.s = s.copy(); return move r; } };
+
+// take() is a single bare `T take(int)` - no `if const`, no keyword at the call site.
+// Ownership defers to T: unique transfers out, a bare pointer returns a borrow, a value
+// (incl. heap-owning) transfers. The same holds through the IList<T> interface.
+int testTake()
+{
+    int passed = 0;
+    // unique element: take transfers ownership to the caller.
+    g_dtor = 0;
+    {
+        list<unique Res*> l = default;
+        l.add(new Res(1)); l.add(new Res(2)); l.add(new Res(3));
+        Res* taken = l.take(1);                       // take the middle
+        passed += Test("take unique leaves list smaller", l.count(), 2);
+        passed += Test("take unique freed nothing yet", g_dtor, 0);
+        delete taken;                                 // caller owns it
+        passed += Test("take unique caller frees once", g_dtor, 1);
+    }                                                  // list frees the remaining 2
+    passed += Test("take unique list frees rest at teardown", g_dtor, 3);
+
+    // bare pointer element: take returns a borrow; the real owner frees.
+    g_dtor = 0;
+    Res* owner = new Res(9);
+    {
+        list<Res*> l = default;
+        l.add(owner);
+        Res* borrowed = l.take(0);
+        passed += Test("take borrow returns the element", borrowed.id, 9);
+    }                                                  // list frees nothing (borrow)
+    passed += Test("take borrow list freed nothing", g_dtor, 0);
+    delete owner;
+    passed += Test("take borrow owner frees once", g_dtor, 1);
+
+    // unique element through the IList<T> interface (virtual dispatch preserves ownership).
+    g_dtor = 0;
+    {
+        list<unique Res*> concrete = default;
+        concrete.add(new Res(5));
+        IList<unique Res*> l = concrete;
+        Res* taken = l.take(0);
+        delete taken;
+    }
+    passed += Test("take unique via interface frees once", g_dtor, 1);
+
+    // value element owning heap: take transfers the value, no double-free of the moved-from slot.
+    {
+        list<TakeRow> l = default;
+        TakeRow a = default; a.s = "aa" + "aa"; l.add(a);
+        TakeRow b = default; b.s = "bb" + "bb"; l.add(b);
+        TakeRow got = l.take(0);
+        passed += Test("take value-heap returns the element", got.s == "aaaa", true);
+        passed += Test("take value-heap leaves list smaller", l.count(), 1);
+    }
+    return passed;
+}
+
+// --- implicit move on return ----------------------------------------------------
+
+// A `move` owning-struct parameter returned by a PLAIN `return h` transfers implicitly
+// (implicit-move-on-return): the caller becomes the sole owner, no double-free. NonCopyable
+// has no copy(), so this body compiles ONLY because the plain return is treated as a move -
+// a copy would be rejected. Pins the behavior that once required an explicit `return move h`.
+move NonCopyable fwdOwner(move NonCopyable h) { return h; }
+
+int testImplicitMoveReturn()
+{
+    int passed = 0;
+    g_dtor = 0;
+    {
+        NonCopyable src = default;
+        src.r = new Res(4);
+        NonCopyable dst = fwdOwner(move src);          // src -> param -> dst, one owner throughout
+        passed += Test("implicit-move return kept the resource", dst.r->id, 4);
+        passed += Test("implicit-move return freed nothing yet", g_dtor, 0);
+    }                                                  // dst's scope exit frees exactly once
+    passed += Test("implicit-move return frees exactly once", g_dtor, 1);
+    return passed;
+}
+
 // --- non-copyable element type: move-only insertion -----------------------------
 
 int testNonCopyableMoveOnly()
@@ -415,6 +500,8 @@ extern int main()
     total += 3;  passed += testCopyValue();
     total += 5;  passed += testCopyBorrowedPointer();
     total += 7;  passed += testIListContract();
+    total += 10; passed += testTake();
+    total += 3;  passed += testImplicitMoveReturn();
     total += 3;  passed += testNonCopyableMoveOnly();
     total += 9;  passed += testIsCopyable();
     total += 7;  passed += testSort();

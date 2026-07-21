@@ -4801,6 +4801,45 @@ public:
                             returnNV = ParseAssignmentExpressionNamed(assignExpr);
                         compiler->pendingInitAllocAlign = 0;  // one-shot
                         lambdaExpectedType = {};
+
+                        // Implicit move on `return <local>;` (C++-style, narrow). Triggers only when the
+                        // return expression is a BARE IDENTIFIER naming a local (or by-value parameter)
+                        // whose owning value-struct type matches the function's return type; then it is
+                        // treated exactly as `return move <local>;` - snapshot the value, zero the source
+                        // so its scope-exit destructor is a no-op, and hand ownership to the caller. A
+                        // borrowing local (alias / borrowed field / borrowed by-value param) is excluded so
+                        // the alias path still wins and no second owner is created (which would double-free).
+                        if (assignExpr != nullptr && express != nullptr)
+                        {
+                            std::string retName = express->getText();
+                            LLVMBackend::NamedVariable localNV = compiler->GetScopedLocalOrArgument(retName);
+                            bool movableLocalReturn =
+                                !retName.empty()
+                                && !localNV.TypeAndValue.TypeName.empty()
+                                && !localNV.TypeAndValue.Pointer && !localNV.TypeAndValue.ElemPointer
+                                && localNV.Storage != nullptr
+                                && compiler->IsDataStructure(localNV.TypeAndValue.TypeName)
+                                && compiler->IsOwningValueType(localNV.TypeAndValue.TypeName)
+                                && localNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName
+                                && !compiler->currentFunctionReturnTV.Pointer
+                                && !localNV.IsAliasBorrow && !localNV.BorrowsOwnedString
+                                && localNV.BorrowedUniqueField.empty()
+                                && !compiler->IsBorrowStringParamStorage(localNV.Storage)
+                                && !IsBorrowedStructParameter(compiler, retName);
+                            if (movableLocalReturn)
+                            {
+                                llvm::Value* snapshot = LoadNamedVariable(localNV);
+                                if (llvm::Type* st = compiler->GetType(localNV.TypeAndValue))
+                                    compiler->builder->CreateStore(
+                                        llvm::ConstantAggregateZero::get(st), localNV.Storage);
+                                compiler->lastOwningResult = true;
+                                returnNV.Primary = snapshot;
+                                returnNV.Storage = nullptr;
+                                returnNV.CallerName.clear();
+                                returnNV.IdentifierLine = 0;
+                            }
+                        }
+
                         // Returning a raw `T*` as a `T[]` return type would forge the noalias
                         // contract (a view must span a whole allocation). Decay T[]->T* is fine.
                         if (compiler->currentFunctionReturnIsArrayView
