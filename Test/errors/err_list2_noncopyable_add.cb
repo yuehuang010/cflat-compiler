@@ -1,14 +1,16 @@
-// list<T> for a non-copyable T (owns a `unique` pointer, no copy()) must still
-// instantiate: the copying add() is poisoned instead, and errors only when called.
-// The poison is deferred past eager instantiation, so use a file-scope expect_error.
+// list<T> insert is MOVE-BY-DEFAULT for a NON-COPYABLE T (owns a `unique` pointer, no copy()):
+// it cannot be copied, so `l.add(h)` TAKES ownership - the caller's source is consumed and nulled,
+// no `move` keyword required. Reusing the moved-from local afterward is therefore a use-of-moved
+// error. The sound transfer + teardown is exercised in test_collection_leaks.cb.
 import "list.cb";
 class Res { int id = default; };
 class Holder { unique Res* r = default; };
-expect_error("write 'move' at the call site");
+expect_error("use of moved variable 'h'");
 extern int main()
 {
     list<Holder> l = default;
     Holder h = default;
     l.add(h);
+    int k = h.r == nullptr ? 0 : 1;
     return 0;
 }

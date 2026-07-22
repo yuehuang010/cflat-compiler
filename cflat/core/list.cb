@@ -68,7 +68,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         if const (is_unique(T))         _data[index] = move value;
         else if const (is_pointer(T))   _data[index] = value;
         else if const (is_primitive(T)) _data[index] = value;
-        else if const (!is_copyable(T)) compile_error("this list element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (l.add(move x) / l.set(i, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else if const (!is_copyable(T)) _data[index] = move value;
         else                            _data[index] = value.copy();
     }
 
@@ -85,18 +85,29 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         else                            _data[index].~();
     }
 
-    // Append value. A value type is COPIED (the caller's value is left intact); a bare
-    // pointer or interface is aliased; a `unique` element is TAKEN - a unique-typed
-    // parameter is a synthesized move sink, so the caller's source is nulled for it.
-    void add(T value)
+    // Append value. A COPYABLE element (string, closure, a struct with copy(), a bare pointer or
+    // interface borrow, a primitive) goes through _placeAt, which COPIES a value (caller's
+    // original left intact) or ALIASES a borrow. A NON-COPYABLE element (a struct that owns a
+    // `unique` and has no copy(), or a `unique` pointer) cannot be copied, so it is MOVED by
+    // default - the caller's source is consumed. The by-value param becomes a synthesized move
+    // sink only when a top-level `move value` appears in THIS method's body - an inlined
+    // `_data[slot] = move value` OR a call argument like `_placeAt(slot, move value)` both count.
+    // A plain `_placeAt(slot, value)` (no `move`) does NOT mark the param a sink.
+    if const (is_copyable(T))
     {
-        // Poison the copying overload for a non-copyable T so the class still instantiates and
-        // `add(move x)` stays usable; the dead arm emits no call to the poisoned _placeAt.
-        if const (!is_copyable(T)) compile_error("this list element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (l.add(move x) / l.set(i, move x)) to transfer ownership instead, or give the type a 'copy()' method");
-        else
+        void add(T value)
         {
             if (_size >= _capacity) _grow();
             _placeAt(_size, value);
+            _size++;
+        }
+    }
+    else
+    {
+        void add(T value)
+        {
+            if (_size >= _capacity) _grow();
+            _data[_size] = move value;
             _size++;
         }
     }
@@ -118,15 +129,25 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
 
     }
 
-    // Overwrite the element at index with a COPY. The old element is released first.
-    void set(int index, T value)
+    // Overwrite the element at index. The old element is released first, then the new one is
+    // stored: a COPYABLE value is copied (caller's original intact), a borrow aliased; a
+    // NON-COPYABLE owning value is moved (consumed), same rule as add() above.
+    if const (is_copyable(T))
     {
-        if const (!is_copyable(T)) compile_error("this list element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (l.add(move x) / l.set(i, move x)) to transfer ownership instead, or give the type a 'copy()' method");
-        else
+        void set(int index, T value)
         {
             _checkBounds(index, "set");
             _releaseAt(index);
             _placeAt(index, value);
+        }
+    }
+    else
+    {
+        void set(int index, T value)
+        {
+            _checkBounds(index, "set");
+            _releaseAt(index);
+            _data[index] = move value;
         }
     }
 

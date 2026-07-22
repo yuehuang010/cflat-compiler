@@ -1,14 +1,17 @@
-// queue<T> COPIES a value element on the plain enqueue(). A value type that owns a `unique`
-// pointer has no copy(), so the plain overload is poisoned instead of failing to instantiate.
-// The transfer overload q.enqueue(move x) stays usable - see test_collection_leaks.cb.
+// queue<T> insert is MOVE-BY-DEFAULT: the by-value enqueue() parameter is a synthesized move
+// sink, so `q.enqueue(h)` TAKES ownership of an owning element (here a non-copyable QHolder that
+// owns a `unique` pointer) - the caller's source is consumed and nulled, no `move` keyword and no
+// copy() required. Reusing the moved-from local afterward is therefore a use-of-moved error.
+// The sound transfer + teardown is exercised in test_collection_leaks.cb.
 import "queue.cb";
 class QRes { int id = default; };
 class QHolder { unique QRes* r = default; int k = default; };
-expect_error("write 'move' at the call site (q.enqueue(move x))");
+expect_error("use of moved variable 'h'");
 extern int main()
 {
     queue<QHolder> q;
     QHolder h = default;
     q.enqueue(h);
+    int k = h.k;
     return 0;
 }

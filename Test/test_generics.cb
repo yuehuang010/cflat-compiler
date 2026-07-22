@@ -2370,6 +2370,25 @@ bool testThisInGenericMethod()
     return result;
 }
 
+// Zero-arg constructor on a generic class: its body must run on declaration.
+// Regression for a pre-declare crash (null parameterTypeList fell into the
+// method branch and dereferenced a null return-type context).
+class CtorBox<T>
+{
+    T* _data = nullptr;
+    int _n = 0;
+    CtorBox() { _data = new T[4]; _n = 4; _data[0] = 42; }
+};
+
+bool testGenericZeroArgCtor()
+{
+    CtorBox<int> b;
+    bool result = true;
+    result &= Test("gen_ctor_n",    b._n,        4);
+    result &= Test("gen_ctor_data", b._data[0],  42);
+    return result;
+}
+
 // =============================================================
 // auto return-type inference on generic functions
 // =============================================================
@@ -2823,6 +2842,7 @@ extern int main()
     total++; passed += testThisReturnsSelf()             ? 1 : 0;
     total++; passed += testThisMemberAccess()            ? 1 : 0;
     total++; passed += testThisInGenericMethod()         ? 1 : 0;
+    total++; passed += testGenericZeroArgCtor()          ? 1 : 0;
     total++; passed += testGenericArgInference()         ? 1 : 0;
     total++; passed += testReturnOnlyTypeParam()         ? 1 : 0;
     total++; passed += testNestedGenericInnerMethod()    ? 1 : 0;

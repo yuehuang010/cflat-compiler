@@ -49,7 +49,7 @@ class stack<T>
         if const (is_unique(T))         _data[index] = move value;
         else if const (is_pointer(T))   _data[index] = value;
         else if const (is_primitive(T)) _data[index] = value;
-        else if const (!is_copyable(T)) compile_error("this stack element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (s.push(move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else if const (!is_copyable(T)) _data[index] = move value;
         else                            _data[index] = value.copy();
     }
 
@@ -66,18 +66,29 @@ class stack<T>
         else                            _data[index].~();
     }
 
-    // Push a value. A value type is COPIED (the caller's value is left intact); a bare pointer
-    // or interface is aliased; a `unique` element is TAKEN - a unique-typed parameter is a
-    // synthesized move sink, so the caller's source is nulled for it.
-    void push(T value)
+    // Push a value. A COPYABLE element (string, closure, a struct with copy(), a bare pointer or
+    // interface borrow, a primitive) goes through _placeAt, which COPIES a value (caller's
+    // original left intact) or ALIASES a borrow. A NON-COPYABLE element (a struct that owns a
+    // `unique` and has no copy(), or a `unique` pointer) cannot be copied, so it is MOVED by
+    // default - the caller's source is consumed. The by-value param becomes a synthesized move
+    // sink only when a top-level `move value` appears in THIS method's body - an inlined
+    // `_data[slot] = move value` OR a call argument like `_placeAt(slot, move value)` both count.
+    // A plain `_placeAt(slot, value)` (no `move`) does NOT mark the param a sink.
+    if const (is_copyable(T))
     {
-        // Poison the copying overload for a non-copyable T so the class still instantiates and
-        // `push(move x)` stays usable; the dead arm emits no call to the poisoned _placeAt.
-        if const (!is_copyable(T)) compile_error("this stack element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (s.push(move x)) to transfer ownership instead, or give the type a 'copy()' method");
-        else
+        void push(T value)
         {
             if (_size >= _capacity) _grow();
             _placeAt(_size, value);
+            _size++;
+        }
+    }
+    else
+    {
+        void push(T value)
+        {
+            if (_size >= _capacity) _grow();
+            _data[_size] = move value;
             _size++;
         }
     }

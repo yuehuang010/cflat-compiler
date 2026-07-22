@@ -247,13 +247,40 @@ static bool StripUniqueQualifier(std::string& name)
 }
 
 // The `alias` borrow qualifier on a generic type argument is carried the same way as `unique`:
-// True if a type-parameter entry carries the removed `alias` qualifier: a leading Identifier
-// (grammar: `Identifier? typeSpecifier ...`) whose text is exactly "alias". Detection only -
-// `alias` in a generic argument is rejected (a bare pointer element already borrows).
+// a leading "alias " prefix on the resolved type-arg string. It denotes a pure borrow element
+// (list<alias T*>) - behaviorally identical to a bare pointer element, but instantiated
+// distinctly so accessor returns can be tagged for the delete-of-borrow check.
+static const char kAliasQualifierPrefix[] = "alias ";
+static const size_t kAliasQualifierPrefixLen = sizeof(kAliasQualifierPrefix) - 1;
+
+// True if a type-parameter entry carries the `alias` qualifier: a leading Identifier
+// (grammar: `Identifier? typeSpecifier ...`) whose text is exactly "alias".
 static bool TypeArgHasAlias(CFlatParser::TypeParameterEntryContext* entry)
 {
     return entry != nullptr && entry->Identifier() != nullptr
         && entry->Identifier()->getText() == "alias";
+}
+
+// Strip a leading "alias " qualifier off a resolved type-arg string, returning whether it was
+// present. The bare base (e.g. "Circle*") remains so it resolves to the same LLVM type as the
+// unqualified spelling; the alias prefix only drives distinct monomorphization + borrow tagging.
+static bool StripAliasQualifier(std::string& name)
+{
+    if (name.compare(0, kAliasQualifierPrefixLen, kAliasQualifierPrefix) == 0)
+    {
+        name.erase(0, kAliasQualifierPrefixLen);
+        return true;
+    }
+    return false;
+}
+
+// Strip both leading ownership qualifiers (`unique `, `alias `) off a resolved type-arg string.
+// Neither is a signature/LLVM type - they resolve to the same underlying type - so callers that
+// only want the bare base drop both. Order is irrelevant (the two are mutually exclusive).
+static void StripOwnershipQualifiers(std::string& name)
+{
+    StripUniqueQualifier(name);
+    StripAliasQualifier(name);
 }
 
 static std::string MangleTypeArg(const std::string& typeName)
@@ -266,6 +293,13 @@ static std::string MangleTypeArg(const std::string& typeName)
     {
         result += "unique_";
         start = kUniqueQualifierPrefixLen;
+    }
+    // The `alias` qualifier mangles to an "alias_" token so list<alias Circle*>
+    // monomorphizes distinctly from list<Circle*> (mutually exclusive with unique).
+    else if (typeName.compare(0, kAliasQualifierPrefixLen, kAliasQualifierPrefix) == 0)
+    {
+        result += "alias_";
+        start = kAliasQualifierPrefixLen;
     }
     for (size_t i = start; i < typeName.size(); i++)
     {
@@ -334,13 +368,16 @@ static std::string BuildEncodedClosureName(bool isThin, const std::string& ret, 
 // is a plain pointer. They never combine ("T[]*" is rejected at the grammar/listener). Suffixes
 // were appended in source order, so peel from the right until none remain. Returns the bare base
 // type name in `name`.
-static void PeelTypeArgSuffix(std::string& name, bool& pointer, bool& arrayView, bool* unique = nullptr)
+static void PeelTypeArgSuffix(std::string& name, bool& pointer, bool& arrayView,
+    bool* unique = nullptr, bool* aliasOut = nullptr)
 {
-    // A `unique` qualifier is a leading prefix (D10); peel it first so the suffix loop and any
-    // re-mangling see the bare type. Callers resolving to an LLVM type discard it; callers that
-    // re-mangle a nested arg re-prepend it from *unique.
+    // A `unique` or `alias` qualifier is a leading prefix; peel it first so the suffix loop and
+    // any re-mangling see the bare type. Callers resolving to an LLVM type discard it; callers
+    // that re-mangle a nested arg re-prepend it from *unique / *aliasOut. The two are exclusive.
     bool hadUnique = StripUniqueQualifier(name);
     if (unique != nullptr) *unique = hadUnique;
+    bool hadAlias = StripAliasQualifier(name);
+    if (aliasOut != nullptr) *aliasOut = hadAlias;
     for (;;)
     {
         if (name.size() >= 2 && name.compare(name.size() - 2, 2, "[]") == 0)
@@ -814,6 +851,116 @@ inline const char* CapabilityForLockMode(const std::string& mode)
     return "ILockable";
 }
 
+// True if executing `node` can RETURN from the enclosing function - a `return` (value,
+// return-block, or `return default`) that is not inside a nested lambda. `break`/`continue`
+// exit a loop, not the function, so they do not count (jump->Return() is null for them).
+inline bool SubtreeContainsFunctionReturn(antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return false;
+    if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node)) return false;
+    if (auto* jump = dynamic_cast<CFlatParser::JumpStatementContext*>(node))
+        if (jump->Return() != nullptr) return true;
+    for (auto* child : node->children)
+        if (SubtreeContainsFunctionReturn(child)) return true;
+    return false;
+}
+
+// Tri-state evaluator for an `if const` condition under the CURRENT monomorphization:
+// returns 1 (branch taken / live), 0 (not taken / dead), or -1 (cannot decide at all).
+// Supplied by the main pass (where type substitutions are active); empty for the scanner.
+using IfConstEvaluator = std::function<int(CFlatParser::ExpressionContext*)>;
+
+// Collect names UNCONDITIONALLY moved by the function body: a top-level `move <bare-param>`
+// not nested inside any runtime conditional/loop/labeled construct, ternary, or lambda, AND not
+// preceded by a statement that can return early. Drives the owning-value move-sink inference;
+// a conditional, nested, or possibly-skipped move must NOT mark a param a sink. An `if const`
+// whose condition is a compile-time constant for this instantiation is NOT runtime-conditional:
+// its live branch is straight-line code, so `evalIfConst` lets us descend into it.
+inline void CollectUnconditionalMovedNames(antlr4::tree::ParseTree* node, std::unordered_set<std::string>& out,
+                                           const IfConstEvaluator& evalIfConst = {})
+{
+    if (node == nullptr) return;
+    if (auto* sel = dynamic_cast<CFlatParser::SelectionStatementContext*>(node))
+    {
+        // `if const (COND)`: the live branch (COND-true, or the else on COND-false) executes
+        // unconditionally for this instantiation, so descend into it. A dead branch is skipped;
+        // an undecidable condition (-1) is treated conservatively as runtime-conditional.
+        if (evalIfConst && sel->If() && sel->Const())
+        {
+            int taken = evalIfConst(sel->expression());
+            auto inner = sel->statement();
+            if (taken == 1 && inner.size() > 0)
+                CollectUnconditionalMovedNames(inner[0], out, evalIfConst);
+            else if (taken == 0 && inner.size() > 1)
+                CollectUnconditionalMovedNames(inner[1], out, evalIfConst);
+        }
+        // A runtime `if`/`switch` (or an undecidable if-const) is conditional - stop descending.
+        return;
+    }
+    // A move reached only through one of these executes conditionally (or in a captured
+    // scope), so it cannot make the parameter a sink - stop descending here.
+    if (dynamic_cast<CFlatParser::IterationStatementContext*>(node)
+        || dynamic_cast<CFlatParser::LabeledStatementContext*>(node)
+        || dynamic_cast<CFlatParser::LambdaExpressionContext*>(node))
+        return;
+    // A ternary `a ? b : c` (or `a ?? b`) makes its branches conditional.
+    if (auto* cond = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
+        if (cond->children.size() > 1) return;
+    if (auto* mv = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
+        if (auto* u = mv->unaryExpression())
+            out.insert(u->getText());
+    for (auto* child : node->children)
+    {
+        CollectUnconditionalMovedNames(child, out, evalIfConst);
+        // A statement that can return from the function makes every LATER sibling conditional,
+        // so a `move` after an early exit (e.g. `if (b) return; g = move v;`) is not a sink -
+        // consuming the caller there would leak on the not-moved path.
+        if (SubtreeContainsFunctionReturn(child)) break;
+    }
+}
+
+// A parameter shape that can carry an owning VALUE (a value struct or `string`). Excludes
+// borrows (pointers, interface values, array-views), function pointers, arrays, and params
+// already carrying a move/alias/unique qualifier. The definitive "type owns a resource" test
+// runs at the call site on the concrete (monomorphized) type, so this only rejects shapes
+// that can never be an owning sink.
+inline bool ParamIsOwningSinkEligible(const LLVMBackend::TypeAndValue& p)
+{
+    if (p.Pointer || p.ElemPointer) return false;
+    if (p.IsInterface || p.IsInterfacePointer) return false;
+    // A THIN C function pointer (function<...> / __c_fn_ptr, or an encoded __thinfn) owns NOTHING,
+    // so it can never be an owning sink. A FAT closure (Lambda<...> / __closure_fat_ptr, or an
+    // encoded __fatfn) is an OWNING VALUE like string - it owns its captured env - so it IS
+    // sink-eligible: moved into the slot on insert, freed on teardown. The concrete
+    // owns-a-resource gate still runs at the call site on the monomorphized type.
+    if (p.IsThinFnPtr() || p.TypeName.rfind("__thinfn", 0) == 0) return false;
+    if (p.IsArrayView || p.IsSimd) return false;
+    if (p.ConstArraySize > 0) return false;
+    if (p.IsMove || p.IsUniqueTypeArg || p.IsAlias) return false;
+    if (p.IsBorrowOfUniqueElement || p.IsBorrowOfAliasElement) return false;
+    return true;
+}
+
+// Owning-value move-sink inference: a plain by-value parameter the body UNCONDITIONALLY moves
+// becomes a synthesized sink (IsOwningSink) so the caller's owning source is nulled at the call
+// site. The concrete "owns a resource" gate is applied by the consumers, so a non-owning T (e.g.
+// int, a bare T* borrow) is left untouched. The scan is STRUCTURAL (does the body move the
+// param?), independent of T, so it runs on generic-CLASS-method instantiations too -
+// ParseFunctionDefinition calls this on the monomorphized param list.
+inline void ApplyOwningSinkInference(CFlatParser::FunctionDefinitionContext* func,
+                                     std::vector<LLVMBackend::TypeAndValue>& allParams,
+                                     const IfConstEvaluator& evalIfConst = {})
+{
+    auto* body = func->compoundStatement();
+    if (body == nullptr) return;
+    std::unordered_set<std::string> movedNames;
+    CollectUnconditionalMovedNames(body, movedNames, evalIfConst);
+    for (auto& p : allParams)
+        if (!p.VariableName.empty() && movedNames.count(p.VariableName)
+            && ParamIsOwningSinkEligible(p))
+            p.IsOwningSink = true;
+}
+
 // ForwardRefScanner performs a lightweight pre-pass over the AST to register
 // all function signatures and struct type shells before the main code-gen walk.
 // This allows functions and types to be used before their definition in source.
@@ -1200,6 +1347,8 @@ private:
 
         std::vector<LLVMBackend::TypeAndValue> allParams(params.begin(), params.end());
 
+        ApplyOwningSinkInference(func, allParams);
+
         bool returnsOwned = ComputeReturnsOwned(returnType, name, allParams);
 
         compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwned, false, returnType.CallConv);
@@ -1584,6 +1733,7 @@ public:
     std::string ResolveForwardTypeArg(CFlatParser::TypeParameterEntryContext* entry)
     {
         bool isUnique = TypeArgHasUnique(entry);
+        bool isAlias = TypeArgHasAlias(entry);
         auto* typeSpec = entry->typeSpecifier();
         std::string resolved;
         std::string innerBase;
@@ -1609,10 +1759,12 @@ public:
             resolved += "*";
         else if (IsArrayViewArg(entry))
             resolved += "[]";
-        // Carry the `unique` qualifier into the mangled/instantiation string (D10); the main
-        // pass validates position/type and emits diagnostics.
+        // Carry the `unique` / `alias` qualifier into the mangled/instantiation string; the main
+        // pass validates position/type and emits diagnostics. The two are mutually exclusive.
         if (isUnique)
             resolved = std::string(kUniqueQualifierPrefix) + resolved;
+        else if (isAlias)
+            resolved = std::string(kAliasQualifierPrefix) + resolved;
         return resolved;
     }
 
@@ -2389,13 +2541,14 @@ private:
         // `unique` ownership qualifier (D10): a leading Identifier == "unique". Any other leading
         // Identifier is an unknown qualifier.
         bool isUnique = TypeArgHasUnique(entry);
-        // `alias` as a generic type ARGUMENT was removed: bare means borrow, so `list<alias T*>`
-        // and `list<T*>` meant the same thing. `alias` on parameters/returns is unaffected.
-        if (TypeArgHasAlias(entry))
-            LogErrorContext(entry, "'alias' is not allowed in a generic argument; write 'list<T*>' - "
-                "a bare pointer element is already borrowed");
-        else if (entry->Identifier() != nullptr && !isUnique)
-            LogErrorContext(entry, std::format("unknown type qualifier '{}'; only 'unique' "
+        // `alias` as a generic type ARGUMENT is a pure-borrow element spelling (list<alias T*>):
+        // behaviorally identical to a bare pointer element, but instantiated distinctly so a later
+        // `delete` of a local bound to a get()/[] result can be rejected. Exclusive with `unique`.
+        bool isAlias = TypeArgHasAlias(entry);
+        if (isUnique && isAlias)
+            LogErrorContext(entry, "'unique' and 'alias' cannot both qualify a generic type argument");
+        else if (entry->Identifier() != nullptr && !isUnique && !isAlias)
+            LogErrorContext(entry, std::format("unknown type qualifier '{}'; only 'unique' or 'alias' "
                 "is allowed on a generic type argument", entry->Identifier()->getText()));
         bool hasPointer = entry->pointer() != nullptr;
         // `T[]` as a generic/tuple type arg is a noalias array-view member; `[N]` and `[]*`
@@ -2445,9 +2598,11 @@ private:
                 // or a "unique " prefix (T bound to "unique Circle*"); peel those onto flags so
                 // they re-encode once below.
                 bool substUnique = false;
+                bool substAlias = false;
                 resolved = substIt->second;
-                PeelTypeArgSuffix(resolved, hasPointer, hasArrayView, &substUnique);
+                PeelTypeArgSuffix(resolved, hasPointer, hasArrayView, &substUnique, &substAlias);
                 isUnique = isUnique || substUnique;
+                isAlias = isAlias || substAlias;
             }
             // A function-type alias (using IntFn = Lambda<int(int)>) used as a generic arg resolves
             // to the SAME encoded closure type as the direct spelling (canonicalization / gap a).
@@ -2480,6 +2635,15 @@ private:
                 LogErrorContext(entry, std::format("unique requires a pointer or interface type; "
                     "'{}' is neither", uniqueBase));
             resolved = std::string(kUniqueQualifierPrefix) + resolved;
+        }
+        // alias mirrors D1: only meaningful on a pointer or interface element (a pure borrow),
+        // and is carried as a leading prefix so this instantiation mangles distinctly.
+        else if (isAlias)
+        {
+            if (!hasPointer && !Compiler(entry)->IsInterfaceType(uniqueBase))
+                LogErrorContext(entry, std::format("alias requires a pointer or interface type; "
+                    "'{}' is neither", uniqueBase));
+            resolved = std::string(kAliasQualifierPrefix) + resolved;
         }
         return resolved;
     }
@@ -2538,7 +2702,7 @@ private:
         if (substIt != activeTypeSubstitutions.end())
         {
             name = substIt->second;
-            StripUniqueQualifier(name);  // resolve to the underlying type; unique is not a signature type
+            StripOwnershipQualifiers(name);  // resolve to the underlying type; not signature types
             while (!name.empty() && name.back() == '*') { name.pop_back(); outPointer = true; }
         }
         return name;
@@ -2821,7 +2985,8 @@ private:
                         // later stage), so the resolved type is the bare pointee.
                         typeName = substIt->second;
                         bool substUniqueArg = false;
-                        PeelTypeArgSuffix(typeName, substPointer, substArrayView, &substUniqueArg);
+                        bool substAliasArg = false;
+                        PeelTypeArgSuffix(typeName, substPointer, substArrayView, &substUniqueArg, &substAliasArg);
                         // A `unique` type argument is an OWNING location: a plain by-value parameter
                         // of that type is a move sink, so the caller's source must be nulled.
                         // An `alias`-declared parameter is an explicit borrow and stays one.
@@ -2831,6 +2996,13 @@ private:
                         // `delete` of a local bound to this return double-frees. Record it here (the
                         // move-sink flag above is suppressed on an alias borrow) for the delete check.
                         if (substUniqueArg && declType.IsAlias) declType.IsBorrowOfUniqueElement = true;
+                        // An `alias` element (list<alias X*>) is a pure borrow whose owner lives
+                        // elsewhere, so ANY value of that element type is a borrow - not only the
+                        // `alias T get` return but also `take()`'s plain-T return (take removes the
+                        // slot but never transfers ownership the container never held). Tag every
+                        // such value so a later `delete` of a bound local is rejected as a
+                        // double-free. Never a move sink (IsUniqueTypeArg stays clear).
+                        if (substAliasArg) declType.IsBorrowOfAliasElement = true;
                     }
                     // Resolve namespace-qualified type names (alias expansion + parent namespace search)
                     typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName);
@@ -3101,7 +3273,7 @@ private:
         if (substIt != activeTypeSubstitutions.end())
         {
             resolved.TypeName = substIt->second;
-            StripUniqueQualifier(resolved.TypeName);  // default-value resolution uses the bare type
+            StripOwnershipQualifiers(resolved.TypeName);  // default-value resolution uses the bare type
             while (!resolved.TypeName.empty() && resolved.TypeName.back() == '*')
             {
                 resolved.TypeName.pop_back();
@@ -6397,6 +6569,69 @@ public:
         }
     }
 
+    // True if `node`'s subtree contains a construct whose ParseExpression EMITS control-flow IR
+    // rather than folding to a ConstantInt: a multi-operand `&&` / `||` (short-circuit blocks) or a
+    // ternary `?:`. A single-operand logical node just delegates (no IR), so it does not count.
+    // The valid if-const conditions (constant idents, `!`, comparisons, intrinsic predicate calls)
+    // all fold; only these shapes would insert instructions into a stale/foreign function during
+    // the speculative pre-body evaluation, so the sink evaluator refuses to run on them.
+    static bool IfConstConditionEmitsControlFlow(antlr4::tree::ParseTree* node)
+    {
+        if (node == nullptr) return false;
+        if (auto* a = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(node))
+            if (a->inclusiveOrExpression().size() > 1) return true;
+        if (auto* o = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node))
+            if (o->logicalAndExpression().size() > 1) return true;
+        if (auto* c = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
+            if (c->children.size() > 1) return true;
+        for (auto* child : node->children)
+            if (IfConstConditionEmitsControlFlow(child)) return true;
+        return false;
+    }
+
+    // Tri-state evaluate an `if const` condition for the active instantiation WITHOUT emitting
+    // code: 1 (taken), 0 (not taken), -1 (not a compile-time constant / cannot decide). A valid
+    // if-const condition folds to a ConstantInt, so nothing is inserted; the insert point is
+    // saved/restored defensively. Feeds owning-sink inference (CollectUnconditionalMovedNames).
+    int EvaluateIfConstForSink(CFlatParser::ExpressionContext* expr)
+    {
+        if (expr == nullptr) return -1;
+        // Defensive: a `&&` / `||` / ternary condition would emit real control-flow IR into the
+        // stale insert point (this runs pre-body, before the function's entry block exists), which
+        // the save/restore below cannot undo. Such a condition never folds to a ConstantInt anyway,
+        // so the decision is already -1; refuse it up front to avoid the stray emission entirely.
+        if (IfConstConditionEmitsControlFlow(expr)) return -1;
+        auto* compiler = Compiler(expr);
+        llvm::BasicBlock* savedBlock = compiler->builder->GetInsertBlock();
+        llvm::BasicBlock::iterator savedIt;
+        if (savedBlock != nullptr) savedIt = compiler->builder->GetInsertPoint();
+        // Suppress diagnostics: a non-constant/ill-formed condition (e.g. `if const (x)` where x is
+        // a runtime local not yet in scope during this pre-body pass) must not error here - it is
+        // re-evaluated and reported at real body codegen. Any such case is simply "cannot decide".
+        int result = -1;
+        // Save/restore rather than force to false, so a (future) nested speculative eval cannot
+        // clobber an outer suppression that is still active.
+        bool savedSuppress = compiler->suppressErrors_;
+        compiler->suppressErrors_ = true;
+        try
+        {
+            llvm::Value* v = ParseExpression(expr);
+            compiler->suppressErrors_ = savedSuppress;
+            if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(v))
+                result = (ci->getZExtValue() != 0) ? 1 : 0;
+        }
+        catch (const SpeculativeEvalAbort&) { compiler->suppressErrors_ = savedSuppress; }
+        catch (...) { compiler->suppressErrors_ = savedSuppress; throw; }
+        if (savedBlock != nullptr) compiler->builder->SetInsertPoint(savedBlock, savedIt);
+        return result;
+    }
+
+    // Bind EvaluateIfConstForSink as the if-const evaluator passed to ApplyOwningSinkInference.
+    IfConstEvaluator SinkIfConstEvaluator()
+    {
+        return [this](CFlatParser::ExpressionContext* e) { return EvaluateIfConstForSink(e); };
+    }
+
     void ParseFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {}, const std::string& nameOverride = {})
     {
         auto* compiler = Compiler(func);
@@ -6452,6 +6687,13 @@ public:
         }
 
         std::vector<LLVMBackend::TypeAndValue> allParams(params.begin(), params.end());
+
+        // Owning-value move-sink inference on the concrete (monomorphized) param list. For a
+        // non-generic method ScanFunctionDefinition already set this on the pre-declared symbol,
+        // so this is redundant there; for a generic-CLASS-method instantiation it is the ONLY
+        // place the sink flag reaches the emitted FunctionSymbol (no forward-scan pre-declaration).
+        // Pass the if-const evaluator so a move inside a LIVE if-const branch marks the param a sink.
+        ApplyOwningSinkInference(func, allParams, SinkIfConstEvaluator());
 
         // Record unused-parameter candidates. Restricted to free, non-extern functions:
         // a method's params are constrained by interface/override conformance, and an
@@ -7154,6 +7396,9 @@ public:
                 // (`B* g = l.get(0)` on a `list<unique B*>`). A later `delete g` double-frees.
                 bool srcBorrowsOwnedElement = false;
                 std::string srcOwnedElementContainer;
+                // True when the borrowed element's owner lives outside the container (list<alias X*>);
+                // selects the alias delete message instead of the unique-element one.
+                bool srcElementExternallyOwned = false;
                 // Implied move of a `move`-temp's owning field (`string s = makeToken().text`): the temp
                 // owns the field, so the local adopts it and the source field in the temp is zeroed.
                 bool srcMovableTempField = false;
@@ -7467,7 +7712,9 @@ public:
                                 srcIsMove = rightNV.TypeAndValue.IsMove;
                                 // Borrow of an element the owning container frees (list<unique X*>
                                 // .get). Capture it so the local is tagged for the delete check.
-                                srcBorrowsOwnedElement = rightNV.TypeAndValue.IsBorrowOfUniqueElement;
+                                srcBorrowsOwnedElement = rightNV.TypeAndValue.IsBorrowOfUniqueElement
+                                    || rightNV.TypeAndValue.IsBorrowOfAliasElement;
+                                srcElementExternallyOwned = rightNV.TypeAndValue.IsBorrowOfAliasElement;
                                 srcOwnedElementContainer = rightNV.TypeAndValue.ParentVariableName.empty()
                                     ? rightNV.CallerName : rightNV.TypeAndValue.ParentVariableName;
                                 // Alias if the RHS is an `alias` call result OR a read of an
@@ -8060,6 +8307,7 @@ public:
                             {
                                 nv.BorrowsOwnedElement = true;
                                 nv.OwnedElementContainer = srcOwnedElementContainer;
+                                nv.BorrowedElementExternallyOwned = srcElementExternallyOwned;
                             }
                         }
 
@@ -9577,11 +9825,14 @@ public:
             if (operatorText == "=" && !namedVar.CallerName.empty() && namedVar.FieldName.empty()
                 && namedVar.TypeAndValue.Pointer)
             {
-                bool rhsBorrowsElem = rightNV.TypeAndValue.IsBorrowOfUniqueElement
+                bool rhsBorrowsElem = (rightNV.TypeAndValue.IsBorrowOfUniqueElement
+                    || rightNV.TypeAndValue.IsBorrowOfAliasElement)
+                    && !compiler->lastOwningResult;
+                bool rhsExternallyOwned = rightNV.TypeAndValue.IsBorrowOfAliasElement
                     && !compiler->lastOwningResult;
                 std::string container = rightNV.TypeAndValue.ParentVariableName.empty()
                     ? rightNV.CallerName : rightNV.TypeAndValue.ParentVariableName;
-                compiler->SetVariableBorrowsOwnedElement(namedVar.CallerName, rhsBorrowsElem, container);
+                compiler->SetVariableBorrowsOwnedElement(namedVar.CallerName, rhsBorrowsElem, container, rhsExternallyOwned);
             }
             return assignResult;
         }
@@ -11947,7 +12198,7 @@ public:
         // Apply active type substitutions (for generic templates)
         auto it = activeTypeSubstitutions.find(name);
         if (it != activeTypeSubstitutions.end()) name = it->second;
-        StripUniqueQualifier(name);  // resolve to the underlying LLVM type; unique is a storage marker
+        StripOwnershipQualifiers(name);  // resolve to the underlying LLVM type; storage markers only
         return Compiler(ctx)->ResolveQualifiedName(name);
     }
 
@@ -13205,6 +13456,17 @@ public:
                     ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
                 std::string owner = namedVar.OwnedElementContainer.empty()
                     ? "its container" : "'" + namedVar.OwnedElementContainer + "'";
+                if (namedVar.BorrowedElementExternallyOwned)
+                {
+                    // Container-agnostic: any 'alias'-element container (list<alias T*>,
+                    // queue<alias T*>, ...) hands back pure borrows owned elsewhere.
+                    LogErrorContext(ctx, std::format(
+                        "cannot delete '{}' - {} declares its elements 'alias' (a pure borrow owned "
+                        "elsewhere), so deleting this double-frees when the real owner releases it. Do "
+                        "not delete a borrow, or use a 'unique'-element container if it should own them.",
+                        name, owner));
+                    return {};
+                }
                 LogErrorContext(ctx, std::format(
                     "cannot delete '{}' - it borrows an element that {} owns, whose "
                     "destructor already frees it, so this is a double-free. Remove and free through "
@@ -16597,7 +16859,7 @@ public:
                                         if (!isPtr)
                                         {
                                             std::string bare = resolved;
-                                            StripUniqueQualifier(bare);
+                                            StripOwnershipQualifiers(bare);
                                             isPtr = Compiler(ctx)->interfaceTable.count(bare) > 0;
                                         }
                                     }
@@ -16655,7 +16917,7 @@ public:
                                     if (substIt != activeTypeSubstitutions.end())
                                     {
                                         std::string bare = substIt->second;
-                                        StripUniqueQualifier(bare);
+                                        StripOwnershipQualifiers(bare);
                                         if (!bare.empty() && bare.back() != '*')
                                             isIface = Compiler(ctx)->interfaceTable.count(bare) > 0;
                                     }
@@ -16686,7 +16948,7 @@ public:
                                     if (substIt != activeTypeSubstitutions.end())
                                     {
                                         std::string base = substIt->second;
-                                        StripUniqueQualifier(base);
+                                        StripOwnershipQualifiers(base);
                                         auto* be = Compiler(ctx);
                                         // A pointer (bare/unique/alias) or a non-struct type is always
                                         // copyable; a struct is refused only by the unique-owner rule.
@@ -16753,7 +17015,11 @@ public:
                                     std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
                                     auto substIt = activeTypeSubstitutions.find(argText);
                                     if (substIt != activeTypeSubstitutions.end())
-                                        isPrim = kPrimitiveTypes.count(substIt->second) > 0;
+                                    {
+                                        std::string base = substIt->second;
+                                        StripOwnershipQualifiers(base);
+                                        isPrim = kPrimitiveTypes.count(base) > 0;
+                                    }
                                 }
                             }
                             namedVar.Primary = llvm::ConstantInt::get(
@@ -16777,7 +17043,11 @@ public:
                                     std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
                                     auto substIt = activeTypeSubstitutions.find(argText);
                                     if (substIt != activeTypeSubstitutions.end())
-                                        isStr = (substIt->second == "string");
+                                    {
+                                        std::string base = substIt->second;
+                                        StripOwnershipQualifiers(base);
+                                        isStr = (base == "string");
+                                    }
                                 }
                             }
                             namedVar.Primary = llvm::ConstantInt::get(
@@ -16931,6 +17201,21 @@ public:
                             : Compiler(ctx)->GetEncodedClosureType(namedVar.TypeAndValue.TypeName);
                         if (namedVar.TypeAndValue.IsFunctionPointer || encClosure != nullptr)
                         {
+                            // Use-after-move at the CALLEE: invoking `f(...)` reads the closure `f`,
+                            // so a moved-from closure local must be diagnosed exactly as a plain read
+                            // would (mirrors LoadNamedVariable). Without this, `sink(move f); f(1)`
+                            // dereferences a nulled env and segfaults instead of failing to compile.
+                            if (namedVar.IdentifierLine > 0 && !namedVar.IsElementAccess)
+                            {
+                                Compiler(ctx)->RecordMoveUse(namedVar.CallerName, namedVar.FieldName,
+                                                             namedVar.IdentifierLine, namedVar.IdentifierColumn);
+                                if (auto moved = Compiler(ctx)->MovedUseSubject(namedVar); !moved.empty())
+                                {
+                                    Compiler(ctx)->currentLine = namedVar.IdentifierLine;
+                                    Compiler(ctx)->currentColumn = namedVar.IdentifierColumn;
+                                    Compiler(ctx)->LogError(std::format("use of moved variable '{}'", moved));
+                                }
+                            }
                             LLVMBackend::TypeAndValue funcPtrTV =
                                 encClosure ? *encClosure : namedVar.TypeAndValue;
                             llvm::Value* funcPtr = nullptr;
@@ -19906,13 +20191,20 @@ public:
 
             std::string funcName = getFunctionName(func);
 
-            // Constructor overload - pre-declare without this* parameter
-            if (funcName == baseName && func->parameterTypeList())
+            // Constructor overload - pre-declare without this* parameter.
+            // A zero-arg ctor has a null parameterTypeList; ParseParameterTypeList
+            // returns empty for null, so do not gate the ctor branch on it.
+            if (funcName == baseName)
             {
                 auto* declParamList = func->parameterTypeList();
                 auto declParams = this->ParseParameterTypeList(declParamList);
-                bool declVarargs = declParamList->Ellipsis() != nullptr;
+                bool declVarargs = declParamList && declParamList->Ellipsis() != nullptr;
                 std::vector<LLVMBackend::TypeAndValue> ctorAllParams(declParams.begin(), declParams.end());
+                // Sink inference on the monomorphized ctor params - this is where a generic-class
+                // instantiation registers its FunctionSymbol, so ParseFunctionDefinition (which
+                // sees alreadyDeclared) cannot set the flag later. The if-const evaluator lets a
+                // move inside a live if-const branch mark the param a sink for this instantiation.
+                ApplyOwningSinkInference(func, ctorAllParams, SinkIfConstEvaluator());
                 compiler->CreateFunctionDeclaration(structName, returnType, ctorAllParams, false, declVarargs);
                 continue;
             }
@@ -19939,6 +20231,11 @@ public:
             }
 
             std::vector<LLVMBackend::TypeAndValue> declAllParams(declParams.begin(), declParams.end());
+            // Owning-value move-sink inference on the monomorphized method params: a
+            // generic-class instantiation registers its FunctionSymbol HERE, so the flag must be
+            // set now (ParseFunctionDefinition sees alreadyDeclared and does not re-register). The
+            // if-const evaluator lets a move inside a live if-const branch mark the param a sink.
+            ApplyOwningSinkInference(func, declAllParams, SinkIfConstEvaluator());
             bool declReturnsOwned = ComputeReturnsOwned(declReturnType, declName, declAllParams);
             compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs, declReturnsOwned, !isStaticLike);
         }

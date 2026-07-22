@@ -1,0 +1,11 @@
+// A fat closure (Lambda<T>) is an OWNING VALUE like string: moving it into a `move` sink
+// consumes it, so INVOKING it afterwards must be diagnosed as a use-after-move, not segfault.
+void sink(move Lambda<int(int)> f) {}
+
+extern int main()
+{
+    expect_error("use of moved variable 'f'");
+    Lambda<int(int)> f = (int x) => x + 1;
+    sink(move f);
+    int r = f(1);
+}

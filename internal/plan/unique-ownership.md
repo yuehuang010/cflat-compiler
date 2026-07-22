@@ -221,6 +221,9 @@ the call sites - C#-like local readability, with the complexity paid once in the
    by worker `barrier*`. These sit in the PINNED (non-movable) quadrant, orthogonal to copyability.
    So a complete design needs a `pinned`/non-movable mark INDEPENDENT of `unique` (move-only) - one
    does not imply the other. Deferred with the extension itself; recorded so it is not re-derived.
+   The move-ctor/fixup-hook half of this is shared with the container-transparency goal - see
+   `internal/plan/container-ownership-transparency.md` (gap 3), which pursues "container owns iff T
+   owns" by making an owning VALUE's by-value param a move-sink like `unique T*`.
 
    **RULED 2026-07-20 - `~Thread()` with a still-running thread is an ERROR, not a guess.**
    Compile-time rejection is ideal; a runtime error is the acceptable fallback. Do NOT silently

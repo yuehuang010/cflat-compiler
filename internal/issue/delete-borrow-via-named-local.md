@@ -1,10 +1,10 @@
-# `delete` of a borrowed named local - one case open, two approaches rejected
+# `delete` of a borrowed named local - opt-in spelling closes it; bare case still open
 
 Filed 2026-07-19. Three narrow double-free forms are FIXED (below). The general bare-pointer case
-(1a) is OPEN: two different compile-time errors were built for it and BOTH were rejected - a blanket
-reject (1b) breaks blessed idioms, and an owner-linked local check (1a-attempt) only covers the
-intra-function case and was judged not good enough. History (the reverted spikes, the false-positive
-analyses, and the free-function bisection that corrected the mental model) is in git.
+(1a) is still OPEN, but there is now an OPT-IN mitigation: `list<alias T*>` is a distinct pure-borrow
+spelling whose accessor results reject `delete`. Two earlier compile-time errors that tried to close
+1a for BARE `list<T*>` without annotation were both rejected (history in git); the `alias` spelling
+sidesteps them by making the borrow intent part of the type.
 
 ## Fixed (do not re-investigate)
 
@@ -21,7 +21,55 @@ These three are sound because they need NO provenance: the direct form deletes a
 (null Storage), and the unique form keys on element-TYPE ownership. Both are decidable at the delete
 site alone.
 
-## Open - the general bare-pointer double-free (1a)
+## Mitigated by an opt-in spelling: `list<alias T*>` (added 2026-07-21, SPIKE - kept, uncommitted)
+
+`alias` was revived as a generic type ARGUMENT (it had been banned as redundant). `list<alias T*>` is
+a DISTINCT type from `list<T*>` - the qualifier is carried as a leading `"alias "` prefix through
+monomorphization (mangles `alias_`, so `list__alias_B_ptr` != `list__B_ptr`), exactly like `unique`.
+It is a modifier ON the type (C++ `const int*` vs `int*`): dropping it is a different type.
+
+Semantics: `list<alias T*>` BORROWS its elements identically to `list<T*>` inside the body (never
+frees), but declares "these elements are owned elsewhere", so EVERY accessor result is a borrow the
+caller must not free:
+
+```cflat
+list<alias B*> l; B* p = new B(); l.add(p);
+B* o = l.get(0);  delete o;   // ERROR (laundered get/[] borrow)
+B* o = l.take(0); delete o;   // ERROR (take removes the slot but never transferred ownership)
+```
+vs the unchanged manual-free spelling, where the same code is legal:
+```cflat
+list<B*> l; l.add(new B());
+B* o = l.get(0); delete o;    // OK - manual-free idiom (F)
+```
+
+Mechanism (mirrors `unique`): the accessor return type carries `TypeAndValue.IsBorrowOfAliasElement`
+(`--init` key `"bae"`), propagated to `NamedVariable.BorrowsOwnedElement` +
+`BorrowedElementExternallyOwned` (message selector), rejected by the SAME delete check. The
+derivation gate is `if (substAliasArg) ...` (NOT gated on the return being spelled `alias`), so it
+covers `take()`'s plain-`T` return too - an `alias X*` value is a borrow no matter which accessor
+produced it. Invariant: **`list<alias T*>` yields only non-deletable borrows from every accessor.**
+Regressions: `Test/errors/err_delete_alias_borrow.cb` (get + take legs, cold and warm cache),
+`err_alias_type_arg_rejected.cb` (repurposed: `alias` still requires a pointer/interface element),
+plus a positive leg in `Test/test_list_ownership.cb`. Suites: `test.sh` 466/0/8, `example_mac` 35/0,
+`test_lsp` green.
+
+What this does NOT do: it is OPT-IN. A user who writes bare `list<B*>` for a borrow-of-a-live-owner
+(the E case below) still gets no error. The `alias` spelling gives the borrow intent a checkable home;
+it does not make bare `list<B*>` safe.
+
+### Known residuals of the alias spike
+- The delete diagnostic says "its container" rather than the container's variable name (the accessor
+  result carries an empty container name - same limitation as the `unique`-element message).
+- Shallower than C++ `const`: the qualifier lives on the CONTAINER instantiation, but accessors hand
+  back a bare `B*`, so the borrow-ness is re-projected onto each accessor's return via the flag rather
+  than riding the result's own type. That is why `take()` needed its own gate fix and `get()` did not
+  cover it for free.
+- Stale comments elsewhere still say the spelling was removed (`test_generics.cb:774`,
+  `test_list_ownership.cb:158`); not yet refreshed.
+- `queue<T>` / `dequeue()` are NOT yet aligned - see the open question below.
+
+## Open - the general BARE-pointer double-free (1a, unannotated)
 
 ```cflat
 list<B*> l; B* p = new B(); l.add(p);   // E: p is a LIVE owning local; list<B*> only BORROWS
@@ -32,7 +80,9 @@ B* o = l.get(0); delete o;              // o is the sole handle -> LEGAL (would 
 ```
 Same `list<B*>`; the only difference is the `add` argument (named owner vs rvalue). E must be
 rejected, F must stay legal. They are identical at the delete site, so distinguishing them needs
-add-site / interprocedural provenance. Both attempts to build a compile-time error were rejected:
+add-site / interprocedural provenance. The `alias` spelling above lets a user OPT IN to rejecting the
+laundered delete, but for the bare spelling with no annotation both compile-time attempts were
+rejected:
 
 ### Rejected approach A - blanket reject (was called "1b"). SPIKED, NOT VIABLE, reverted 2026-07-20.
 Reject any delete of a get()-borrow named local (or, equivalently, reject an owning rvalue handed to
@@ -45,27 +95,18 @@ the DOWNSTREAM free, so it cannot tell E from F. Do not re-spike as a local rule
 ### Rejected approach B - owner-linked local taint. SPIKED VIABLE, but REVERTED 2026-07-20 as not good enough.
 Tag the container variable at the add site when `add`/`set` receives a LIVE owning named local
 through a borrowing param; propagate to `get()` views; reject their delete. This DID distinguish E
-from F: it caught E, left F/rvalue/call-result/unique/move idioms legal, and all three suites stayed
-green (464/0/8, 35/0, 152/0) with +147 lines and no `--init` change. It was implemented, verified,
-then deliberately REVERTED because it is INTRA-PROCEDURAL and gives FALSE COVERAGE:
-
-- Split the add into another function and the check misses the bug entirely - it compiles clean and
-  DOUBLE-FREES at runtime (exit 134). Verified:
-  ```cflat
-  class Bag { list<B*> l = default; void put(B* p) { l.add(p); } void delFirst() { B* o = l.get(0); delete o; } };
-  Bag bag; B* p = new B(); bag.put(p); bag.delFirst();   // compiles; 134 at runtime
-  ```
-  Two independent reasons: (1) inside `put`, `p` is a borrowed PARAMETER, not a live owning local, so
-  the add-site heuristic never fires; (2) the container tag is per-function-body local state that does
-  not persist from `put`'s analysis into `delFirst`'s.
-- Also coarse even intra-function: the taint is per-container-VARIABLE, so a container that MIXES a
-  named-owner add and rvalue adds over-taints all its views (over-rejects; no suite code hit it).
+from F and kept all suites green, but was deliberately REVERTED because it is INTRA-PROCEDURAL and
+gives FALSE COVERAGE: split the add into another function (`Bag.put(p)` / `Bag.delFirst()`) and it
+compiles clean but DOUBLE-FREES at runtime (exit 134). Two reasons: (1) inside the split function `p`
+is a borrowed PARAMETER, not a live owning local, so the add-site heuristic never fires; (2) the
+container tag is per-function-body local state that does not persist across functions.
 
 Maintainer ruling: a partial error that only catches the same-function shape is worse than none - it
-lulls the caller into thinking the double-free is caught while the cross-function form still ships. So
-the local-scope error was reverted. A real fix needs interprocedural escape/ownership analysis ("does
-any live owner still hold this element?"), the same capability approach A also lacked. Deferred until
-that analysis exists; do NOT reintroduce a local-scope-only error for it.
+lulls the caller into thinking the double-free is caught while the cross-function form still ships. A
+real fix for the BARE case needs interprocedural escape/ownership analysis ("does any live owner still
+hold this element?"), the same capability approach A also lacked. Deferred until that analysis exists;
+do NOT reintroduce a local-scope-only error for the bare spelling. The `alias` opt-in is the
+recommended path for callers who want the check today.
 
 ## Related
 - `internal/plan/unique-ownership.md` - the `alias` design.

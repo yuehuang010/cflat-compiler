@@ -91,6 +91,11 @@
 
 struct ExpectedErrorReceived {};
 
+// Thrown by LogError while suppressErrors_ is set, so a SPECULATIVE compile-time evaluation
+// (e.g. owning-sink if-const probing) can bail without emitting a diagnostic or exiting; the
+// real diagnostic still fires when the same construct is later evaluated for real.
+struct SpeculativeEvalAbort {};
+
 // Resolved lld-link and MSVC/Windows SDK lib paths.
 // Persisted to %USERPROFILE%\.cflat\linker_paths_<arch>.json; loaded before falling back to live discovery.
 struct LinkerPaths {
@@ -468,6 +473,14 @@ public:
         // records "borrow of an element the owner will free", so a later `delete` of a local bound
         // to it can be rejected as a double-free. Read ONLY by the delete-of-owned-element check.
         bool IsBorrowOfUniqueElement = false;
+        // Set by the ForwardRefScanner body-scan on a plain by-value parameter the callee body
+        // UNCONDITIONALLY moves (top-level `move <param>`): a synthesized move-sink whose caller
+        // source is nulled at the call site. Consumers still gate on the concrete type owning a
+        // resource (IsOwningValueType(T) || T=="string"), so a non-owning T stays harmless.
+        bool IsOwningSink = false;
+        // Pure-borrow element (list<alias T*>) whose owner lives elsewhere; a later delete of a
+        // local bound to this accessor result double-frees when the real owner releases it.
+        bool IsBorrowOfAliasElement = false;
         bool IsBond = false;     // parameter declared with 'bond' - return value borrows from this parameter; return must not outlive it
         bool IsUnique = false;   // struct/interface field declared with 'unique' - the owner owns this raw pointer; the synthesized destructor deletes it. On an interface it is contract: every implementor must agree (VerifyInterfaceFields)
         CallingConv CallConv = CallingConv::Default; // calling convention for extern declarations (Stdcall/Cdecl; Default = compiler-chosen)
@@ -723,6 +736,11 @@ public:
         // Used to diagnose capturing lambdas passed to C function-pointer params (C ABI can't carry state).
         std::vector<std::string> LambdaCaptureNames;
         bool IsBorrowed = false;         // compile-time: true for non-move pointer parameters and locals that alias one - 'delete' is forbidden
+        // compile-time: true for a plain by-value OWNING-VALUE parameter (string / owning struct /
+        // fat closure) that is NOT a sink (no `move` in body, not `move`/unique). Such a param
+        // bitwise-aliases the caller's value - the caller keeps ownership - so feeding it into a
+        // CONSUMING param (sink/`move`/unique) or moving it out would launder ownership and double-free.
+        bool IsBorrowedOwningValue = false;
         bool IsAliasBorrow = false;      // compile-time: local bound from an `alias` return - shallow-aliases storage it does not own, so its scope-exit destructor is suppressed
         std::string BorrowedOrigin;      // name of the borrowed parameter this value transitively aliases (for diagnostics)
         // Set to "Struct.field" when the borrow originates from a `unique` field rather than a
@@ -737,6 +755,9 @@ public:
         // this local double-frees. Consulted ONLY by the delete-of-owned-element check; kept off
         // the general IsBorrowed path so it does not affect store/return/move diagnostics.
         bool BorrowsOwnedElement = false;
+        // Set alongside BorrowsOwnedElement when the element is a list<alias T*> pure borrow (owner
+        // elsewhere) rather than a container-owned unique element. Selects the delete message only.
+        bool BorrowedElementExternallyOwned = false;
         std::string OwnedElementContainer; // container variable name, for the delete diagnostic
         llvm::Value* RefCountStorage = nullptr; // lazy i32 alloca at function entry; non-null only when pointer escaped to a field
         std::string CallerName;          // the variable's name at the call site, for move tracking
@@ -1021,6 +1042,10 @@ public:
 
     void LogError(std::string message) const
     {
+        // Speculative compile-time evaluation: swallow the diagnostic and unwind. The construct
+        // is re-evaluated for real later, where the diagnostic (if any) fires normally.
+        if (suppressErrors_)
+            throw SpeculativeEvalAbort{};
         if (diagnosticSink_)
         {
             // LSP mode: cout is redirected to stderr and would duplicate the diagnostic already
@@ -1421,6 +1446,9 @@ private:
     int lambdaCounter = 0;
     int pipeStreamCounter = 0;   // uniquifies synthesized hidden `stream` locals for `producer >> consumer` piping
     std::string expectedError;
+    // While set, LogError throws SpeculativeEvalAbort instead of emitting/exiting - used by
+    // speculative compile-time probing (owning-sink if-const evaluation) to bail cleanly.
+    bool suppressErrors_ = false;
     size_t expectedErrorScopeDepth = SIZE_MAX;  // SIZE_MAX = scoped block form (checked manually after block); else stackNamedVariable depth for bare-semicolon form
     // Armed before ProcessImports so import-time errors can match. An unmatched expectation
     // at end of compilation is a did-not-occur failure.
@@ -1592,6 +1620,22 @@ private:
         return false;
     }
 
+    // True when `name` resolves to a plain by-value owning-value parameter that only BORROWS the
+    // caller's value (see NamedVariable::IsBorrowedOwningValue). Used to reject laundering it into
+    // a consuming param or moving it out.
+    bool IsVariableBorrowedOwningValue(const std::string& name) const
+    {
+        if (name.empty()) return false;
+        for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                return it->second.IsBorrowedOwningValue;
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                return it->second.IsBorrowedOwningValue;
+        }
+        return false;
+    }
+
     struct VarStorageRef { llvm::Value* Storage = nullptr; llvm::Type* BaseType = nullptr; };
     VarStorageRef FindVariableStorage(const std::string& name) const
     {
@@ -1646,15 +1690,18 @@ private:
 
     // Refresh the container-owned-element borrow taint after a reassignment: `g = new B()`
     // over `g = l.get(0)` clears it so a later `delete g` is allowed (see BorrowsOwnedElement).
-    void SetVariableBorrowsOwnedElement(const std::string& name, bool value, const std::string& container)
+    void SetVariableBorrowsOwnedElement(const std::string& name, bool value,
+        const std::string& container, bool externallyOwned = false)
     {
         if (name.empty()) return;
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
-                { it->second.BorrowsOwnedElement = value; it->second.OwnedElementContainer = value ? container : ""; return; }
+                { it->second.BorrowsOwnedElement = value; it->second.OwnedElementContainer = value ? container : "";
+                  it->second.BorrowedElementExternallyOwned = value && externallyOwned; return; }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
-                { it->second.BorrowsOwnedElement = value; it->second.OwnedElementContainer = value ? container : ""; return; }
+                { it->second.BorrowsOwnedElement = value; it->second.OwnedElementContainer = value ? container : "";
+                  it->second.BorrowedElementExternallyOwned = value && externallyOwned; return; }
         }
     }
 
@@ -2207,6 +2254,13 @@ private:
                     .BaseType = structTy,
                     .Storage = alloc,
                 };
+                // A plain by-value OWNING-VALUE param (string/owning struct/fat closure) that is
+                // NOT a sink borrows the caller's value - the caller keeps ownership. Mark it so a
+                // downstream consuming call (a sink/`move`/unique param) is rejected, not laundered.
+                if (!itr_nameArg->IsOwningSink && !itr_nameArg->IsMove
+                    && !itr_nameArg->IsUniqueTypeArg && !itr_nameArg->IsAlias
+                    && IsOwningValueOrClosureType(itr_nameArg->TypeName))
+                    namedVar.IsBorrowedOwningValue = true;
                 stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
             }
             else
@@ -3352,6 +3406,15 @@ private:
                 sym.ReturnType.IsAlias = true;
             }
         }
+    }
+
+    // A type that owns a resource BY VALUE: `string`, an owning value struct, or a FAT closure
+    // (Lambda<...>) which owns its captured env. A thin C function pointer owns nothing and is
+    // excluded. Used to gate move-sink transfer / borrow-laundering diagnostics.
+    bool IsOwningValueOrClosureType(const std::string& typeName)
+    {
+        return typeName == "string" || IsOwningValueType(typeName)
+            || typeName == "__closure_fat_ptr" || IsEncodedClosureType(typeName);
     }
 
     bool IsOwningValueType(const std::string& typeName)
@@ -10049,8 +10112,12 @@ public:
         if (!arg.IsExplicitMove || paramIsMove) return;
         // Owns a resource? A destructor on the value type is the general signal; the
         // owning-* flags cover the cases (string locals, move params) that lack one.
+        // TypeHasDestructor only sees a USER-declared dtor, so a value type that owns via a
+        // SYNTHESIZED dtor (e.g. Holder{unique T*}, with no hand-written ~) slips through -
+        // IsOwningValueType closes that gap (it forces the memberwise dtor and checks it).
         if (!(arg.IsOwningString || arg.IsOwningStruct || arg.IsOwning
-              || TypeHasDestructor(arg.TypeAndValue.TypeName))) return;
+              || TypeHasDestructor(arg.TypeAndValue.TypeName)
+              || IsOwningValueType(arg.TypeAndValue.TypeName))) return;
         LogError(std::format(
             "call to '{}': parameter '{}' BORROWS its argument, so 'move {}' transfers nothing - "
             "the callee never takes ownership and the value would be orphaned. Drop the 'move', "
@@ -10065,8 +10132,12 @@ public:
     {
         // A `unique`-typed parameter is a sink even without the `move` keyword: the type
         // itself says the callee takes ownership, so an explicit `move` at the call site is fine.
+        // An inferred owning-value sink (body unconditionally moves the param, owning concrete
+        // type) is likewise a real sink, so `move` into it transfers rather than "nothing".
+        bool paramIsSink = param.IsMove || param.IsUniqueTypeArg
+            || (param.IsOwningSink && IsOwningValueOrClosureType(param.TypeName));
         DiagnoseExplicitMoveToBorrowParam(
-            functionName, param.VariableName, param.TypeName, param.IsMove || param.IsUniqueTypeArg, arg);
+            functionName, param.VariableName, param.TypeName, paramIsSink, arg);
     }
 
     void ApplyMoveParamTransfer(const std::string& functionName,
@@ -10074,10 +10145,50 @@ public:
     {
         for (size_t i = 0; i < params.size() && i < args.size(); i++)
         {
+            // A plain by-value parameter the callee body unconditionally moves is a synthesized
+            // move sink too - but only when the concrete type owns a resource AND the matched arg
+            // is itself an OWNER (not a borrow/alias). A borrow arg has nothing to transfer, so
+            // nulling it would orphan a value the caller still needs.
+            // A fat closure (Lambda<...>) is an OWNING VALUE like string: it owns its captured env.
+            // Admit __closure_fat_ptr and any encoded closure element type; a thin C fn ptr owns
+            // nothing and never reaches here as a sink (ParamIsOwningSinkEligible rejects it).
+            bool paramOwnsResource = IsOwningValueOrClosureType(params[i].TypeName);
+            // A borrow/alias arg has no ownership to transfer - nulling it would orphan a value
+            // the caller still relies on.
+            bool argIsBorrow = args[i].IsBorrowed || args[i].IsAliasBorrow
+                || args[i].BorrowsOwnedString || args[i].BorrowsOwnedElement
+                || args[i].TypeAndValue.IsAlias;
+            // A named local of an owning VALUE type is itself an owner (a by-value borrow is
+            // excluded above, and a moved-from read is caught by the use-after-move machinery).
+            // A closure arg is an owner either as a named closure local (CallerName + owning param)
+            // or as a freshly-lowered lambda RVALUE TEMP (no CallerName, tracked in the pending
+            // closure-temp set); consuming the temp transfers its env into the slot.
+            bool argIsOwner = !argIsBorrow
+                && (args[i].IsOwning || args[i].IsOwningString || args[i].IsOwningStruct
+                    || IsVariableOwning(args[i].CallerName) || IsVariableOwningString(args[i].CallerName)
+                    || IsOwnedClosureTemp(args[i].Primary)
+                    || (!args[i].CallerName.empty() && paramOwnsResource));
+            bool isOwningSink = params[i].IsOwningSink && argIsOwner && paramOwnsResource;
+            // Ownership-laundering guard: the arg is a value this function only BORROWS (a plain
+            // by-value owning-value param of the current function) but the callee's param CONSUMES
+            // it (a sink / `move` / unique). Transferring would null this function's alias while the
+            // TRUE owner (a caller further up) still frees the resource - a silent double-free.
+            bool paramConsumesOwningValue = paramOwnsResource
+                && (params[i].IsMove || params[i].IsUniqueTypeArg || params[i].IsOwningSink);
+            if (paramConsumesOwningValue
+                && IsVariableBorrowedOwningValue(args[i].CallerName))
+            {
+                LogError(std::format(
+                    "call to '{}': parameter '{}' takes ownership of a value this function only "
+                    "borrows ('{}' is a by-value parameter, so the caller keeps ownership). Accept "
+                    "the parameter as a sink (move it in the body), or pass a copy with '.copy()'.",
+                    functionName, params[i].VariableName, args[i].CallerName));
+                continue;
+            }
             // A `unique`-typed parameter is a synthesized move sink: the callee owns and frees it,
             // so the caller's source must be nulled exactly as for an explicit `move` param.
             // Without this, `list<unique T*>::add(T value)` leaves the caller owning too.
-            if (params[i].IsMove || params[i].IsUniqueTypeArg)
+            if (params[i].IsMove || params[i].IsUniqueTypeArg || isOwningSink)
             {
                 // A `move` param takes ownership and frees the block itself. The allocation alignment
                 // of an over-aligned `new T[n]` is not in the element type, so the callee can recover
@@ -14703,8 +14814,13 @@ public:
 
                     // An owning-struct RVALUE temp passed to a by-value BORROW param has no named
                     // owner and the callee will not free it; register it for end-of-full-expression
-                    // destruction. A `move` param is excluded (the callee takes and frees it).
-                    if (!candParamItr->IsMove)
+                    // destruction. A param that TAKES ownership is excluded (it frees the temp): a
+                    // `move` param, or an inferred owning-value move-SINK - otherwise the sink slot
+                    // AND this end-of-expr flush both free the temp -> double-free.
+                    bool paramTakesOwnership = candParamItr->IsMove
+                        || (candParamItr->IsOwningSink
+                            && (candParamItr->TypeName == "string" || IsOwningValueType(candParamItr->TypeName)));
+                    if (!paramTakesOwnership)
                         RegisterBorrowedOwningStructTemp(arg);
                 }
                 else if (value->getType()->isIntegerTy(1))
@@ -14831,9 +14947,14 @@ public:
         // never bound is freed by FlushOwnedClosureTemps at end-of-full-expression. Exclude the
         // `copy` clone - its result is always consumed by an owner or stored into a struct field by
         // the synthesized memberwise copy, so flushing it would double-free a now-owned field.
+        // A monomorphized generic `T` return (e.g. queue<Lambda>::dequeue) has a bare-T static
+        // ReturnType, not IsFunctionPointer, yet the runtime value IS a closure fat struct. Gate on
+        // the concrete LLVM type so the returned env temp is cleaned up at end-of-expr (no leak).
+        // An `alias T` BORROW return (e.g. queue<Lambda>::peek) must NOT be registered - freeing a
+        // borrowed env would double-free the slot the container still owns.
         if (result != nullptr
-            && candidate.ReturnType.IsFunctionPointer
             && functionName != "copy"
+            && !candidate.ReturnsAlias
             && result->getType() == GetClosureFatPtrType())
             RegisterOwnedClosureTemp(result);
 

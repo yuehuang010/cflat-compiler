@@ -1,7 +1,7 @@
-// `alias` as a generic type ARGUMENT was removed: bare means BORROW, so `list<alias T*>` and
-// `list<T*>` meant the same thing. `alias` on parameters and returns is unaffected.
+// `list<alias T*>` is now a valid pure-borrow element spelling, but `alias` still requires a
+// pointer or interface element - a bare value element cannot be an alias. This pins that check.
 import "list.cb";
 
-expect_error("'alias' is not allowed in a generic argument") {
-    list<alias int*> bad = default;
+expect_error("alias requires a pointer or interface type") {
+    list<alias int> bad = default;
 }

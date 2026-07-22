@@ -197,6 +197,11 @@ move IShapeLeak pickShape(move IShapeLeak a, move IShapeLeak b, int sel)
 // Pointer flavor of the same exclusive-return pattern: must compile and free each object once.
 struct PtrLeak { int v = 0; ~PtrLeak() { g_shapeDtor = g_shapeDtor + 1; } };
 
+// Trivial POD value struct (no owning fields, no destructor): the "copies, exit 0" row of the
+// container double-free matrix - a multi-field aggregate is a distinct copy/store path from a
+// scalar `int`, and its teardown must free nothing (a spurious free would abort HeapAudit).
+struct QPoint { int x = 0; int y = 0; };
+
 // `unique T* f[N]` as a struct FIELD: the synthesized destructor walks the array and releases
 // every slot. UniqSlotBag is the hand-written spelling; UniqSlotBox<V> is the same shape reached
 // through generic substitution (btree_node's), which used to be accepted and silently leak.
@@ -208,6 +213,34 @@ struct UniqIfaceSlot { unique IShapeLeak v = default; };
 // dictionary/hashset insert is poisoned and only the `move` transfer overload is usable.
 struct LeakHolder { unique PtrLeak* slot = nullptr; int k = 0; int hash() { return k; } };
 bool operator==(LeakHolder a, LeakHolder b) { return a.k == b.k; }
+
+// Stage 3 (owning-value move-sink): a free function whose plain by-value owning param is
+// UNCONDITIONALLY moved becomes a synthesized sink - a caller's owning local is consumed with
+// NO `move` keyword and its source nulled, so exactly one owner frees. Direct (non-container)
+// regression for internal/plan/container-ownership-transparency.md gap 1.
+string     g_sinkStr    = default;
+LeakHolder g_sinkHolder = default;
+LeakRow    g_sinkRow    = default;
+void strSink(string s)     { g_sinkStr = move s; }
+void holderSink(LeakHolder v) { g_sinkHolder = move v; }
+// Copyable owning-value struct sink: the arg below is a `.copy()` RVALUE TEMP - it must move
+// into the slot and NOT also be freed at end-of-full-expression (else slot + temp double-free).
+void rowSink(LeakRow v)    { g_sinkRow = move v; }
+// Owning-value CLOSURE sink (Increment 1): a fat Lambda is an owning value like string, so a plain
+// by-value param the body moves is a synthesized sink - the caller's closure (named local OR rvalue
+// temp) is consumed with NO `move` keyword, its env transferred into the slot (single owner).
+Lambda<int(int)> g_sinkFn = default;
+void fnSink(Lambda<int(int)> f) { g_sinkFn = move f; }
+// If-const laundering residual (internal/issue/borrow-launder-residual-if-const-body-move.md):
+// a generic method whose ONLY move of its by-value param sits inside a LIVE `if const` branch
+// must classify the param a move-sink for that instantiation (caller nulled, single owner), not a
+// borrow. For non-copyable LeakHolder the `!is_copyable` arm is live, so `v` is consumed and the
+// local `s` frees the held PtrLeak exactly once - no leak, and the nulled source is no double-free.
+struct IfConstProbe<T> {
+    void take(T v) {
+        if const (!is_copyable(T)) { T s = move v; }
+    }
+};
 void delPtr(move PtrLeak* p) {}
 move PtrLeak* pickPtr(move PtrLeak* a, move PtrLeak* b, int sel)
 {
@@ -1301,6 +1334,31 @@ extern int main()
         total++; passed += Test("stack<int> count after grows", si.count(), 40);
         total++; passed += Test("stack<int> pop LIFO", si.pop(), 39);
 
+        // Trivial POD value struct (QPoint{int x,y}): a multi-field aggregate is a distinct
+        // copy/store path from a scalar. The plain insert COPIES (source stays independently
+        // mutable); dequeue/pop hands the value back; teardown frees nothing (no owning field).
+        {
+            queue<QPoint> qpt;
+            QPoint qp0 = default; qp0.x = 1; qp0.y = 2;
+            qpt.enqueue(qp0);
+            qp0.x = 99;                        // mutate source: the copied slot must be unaffected
+            total++; passed += Test("queue<pod> enqueue copies (slot x)", qpt.peek().x, 1);
+            total++; passed += Test("queue<pod> enqueue copies (source x)", qp0.x, 99);
+            QPoint qp1 = default; qp1.x = 3; qp1.y = 4;
+            qpt.enqueue(qp1);
+            QPoint qout = qpt.dequeue();
+            total++; passed += Test("queue<pod> dequeue value", qout.y, 2);
+            total++; passed += Test("queue<pod> count after dequeue", qpt.count(), 1);
+
+            stack<QPoint> spt;
+            QPoint sp0 = default; sp0.x = 5; sp0.y = 6;
+            spt.push(sp0);
+            QPoint sp1 = default; sp1.x = 7; sp1.y = 8;
+            spt.push(sp1);
+            total++; passed += Test("stack<pod> peek top", spt.peek().x, 7);
+            total++; passed += Test("stack<pod> pop LIFO value", spt.pop().y, 8);
+        }
+
         // Value elements: the plain insert COPIES (source survives and is independently
         // mutable); the guarded `move` overload transfers.
         queue<string> qs;
@@ -1888,6 +1946,101 @@ extern int main()
         l.add(s.copy());                       // copy() result stored in a container
         total++; passed += Test("move-return copy into list", l.get(0).name, "mvc");
         mvPlainType();                         // discarded owned return must still be freed
+    }
+
+    // === Stage 3: owning-value by-value param is a move-sink (move-by-default, no keyword) ===
+    // A free sink(string)/sink(Holder) that UNCONDITIONALLY moves its param consumes an owning
+    // local passed WITHOUT `move`; the caller's source is nulled so exactly one owner frees. A
+    // double-free would abort HeapAudit (exit 134); a leak would trip the oracle below.
+    {
+        g_shapeDtor = 0;
+        {
+            string sv = "sink" + "str";
+            strSink(sv);                       // move-by-default: sv consumed, no keyword
+        }
+        total++; passed += Test("owning-value string sink consumes source", g_sinkStr, "sinkstr");
+        string emptyS = default;
+        g_sinkStr = move emptyS;               // release the buffer strSink now owns
+
+        {
+            LeakHolder hv = default; hv.slot = new PtrLeak(); hv.k = 9;
+            holderSink(hv);                    // move-by-default: hv consumed
+        }
+        total++; passed += Test("owning-value struct sink consumes source", g_sinkHolder.k, 9);
+        total++; passed += Test("owning-value struct sink single owner (no premature free)", g_shapeDtor, 0);
+        LeakHolder emptyH = default;
+        g_sinkHolder = move emptyH;            // assignment frees the held PtrLeak exactly once
+        total++; passed += Test("owning-value struct sink frees once on release", g_shapeDtor, 1);
+
+        // Owning-value struct RVALUE TEMP into a sink (the rvalue-temp move-sink enabler, case A):
+        // `rowSink(lr.copy())` moves the COPY temp into g_sinkRow; the temp must not ALSO be freed
+        // at end-of-full-expression, or slot + temp double-free (rc 134). The source lr survives.
+        {
+            LeakRow lr = default; lr.name = "row" + "src";
+            rowSink(lr.copy());
+            total++; passed += Test("struct-temp sink source survives", lr.name, "rowsrc");
+        }
+        total++; passed += Test("struct-temp sink slot value", g_sinkRow.name, "rowsrc");
+        LeakRow emptyR = default;
+        g_sinkRow = move emptyR;               // release the slot's buffer exactly once
+
+        // Owning-value CLOSURE local + RVALUE TEMP into a sink (Increment 1 closure enabler). A fat
+        // Lambda flows through the SAME owning-value move-sink as string: passed WITHOUT `move` the
+        // closure is consumed (source nulled), env transferred, single owner - no leak/double-free.
+        {
+            int cbase = 40;
+            Lambda<int(int)> cf = (int x) => x + cbase;
+            fnSink(cf);                        // move-by-default: cf consumed
+        }
+        total++; passed += Test("closure sink consumes named local", g_sinkFn(2), 42);
+        {
+            int cbase = 100;
+            fnSink((int x) => x + cbase);      // rvalue-temp closure into sink: no double-free
+        }
+        total++; passed += Test("closure sink consumes rvalue temp", g_sinkFn(1), 101);
+        Lambda<int(int)> emptyF = default;
+        g_sinkFn = move emptyF;                // release the env the sink now owns
+
+        // If-const live-branch sink: a generic method that moves its by-value owning param into a
+        // local inside a LIVE `if const (!is_copyable(T))` branch consumes the caller's value (nulls
+        // it, single owner). Previously the param read as a borrow -> caller + local double-freed.
+        g_shapeDtor = 0;
+        {
+            IfConstProbe<LeakHolder> p;
+            LeakHolder hv = default; hv.slot = new PtrLeak(); hv.k = 7;
+            p.take(hv);                        // move-by-default via live if-const branch: hv consumed
+        }
+        total++; passed += Test("if-const live-branch sink frees once", g_shapeDtor, 1);
+    }
+
+    // === Increment 1: container<Lambda> dequeue-and-invoke-inline frees the returned env (bug d) ===
+    // Insert stays copy-on-insert (Increment 2 collapses it); the concern is the dequeue/pop RESULT
+    // - a monomorphized generic-T closure temp invoked inline must free at end-of-full-expression,
+    // not leak (the registration gate previously required a static IsFunctionPointer return type).
+    {
+        queue<Lambda<int(int)>> q = default;
+        int a = 100; int b = 200; int c = 300;
+        q.enqueue((int x) => x + a);
+        q.enqueue((int x) => x + b);
+        q.enqueue((int x) => x + c);
+        total++; passed += Test("queue<Lambda> peek invoke", q.peek()(1), 101);
+        int qr0 = q.dequeue()(1);              // dequeue-and-invoke-inline: returned env must free
+        int qr1 = q.dequeue()(1);
+        int qr2 = q.dequeue()(1);
+        total++; passed += Test("queue<Lambda> dequeue-inline slot0", qr0, 101);
+        total++; passed += Test("queue<Lambda> dequeue-inline slot1", qr1, 201);
+        total++; passed += Test("queue<Lambda> dequeue-inline slot2", qr2, 301);
+    }
+    {
+        stack<Lambda<int(int)>> s = default;
+        int a = 10; int b = 20;
+        s.push((int x) => x + a);
+        s.push((int x) => x + b);
+        total++; passed += Test("stack<Lambda> peek invoke", s.peek()(1), 21);
+        int sr0 = s.pop()(1);                  // pop-and-invoke-inline: returned env must free
+        int sr1 = s.pop()(1);
+        total++; passed += Test("stack<Lambda> pop-inline top", sr0, 21);
+        total++; passed += Test("stack<Lambda> pop-inline next", sr1, 11);
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

@@ -135,7 +135,7 @@ struct dictionary<K, V>
         if const (is_unique(V))         _values[index] = move value;
         else if const (is_pointer(V))   _values[index] = value;
         else if const (is_primitive(V)) _values[index] = value;
-        else if const (!is_copyable(V)) compile_error("this dictionary value type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (d.add(k, move x) / d.set(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else if const (!is_copyable(V)) _values[index] = move value;
         else                            _values[index] = value.copy();
     }
 
@@ -182,12 +182,11 @@ struct dictionary<K, V>
     // A value type V is COPIED (the caller's value is left intact); a bare pointer/interface
     // value is borrowed (the dictionary never frees it); when V is `unique` the dictionary
     // TAKES ownership - a unique-substituted parameter is a synthesized move sink.
-    bool add(alias K key, V value)
+    // A COPYABLE value is COPIED (caller's original left intact); on a duplicate key the by-value
+    // copy is simply discarded, so the caller keeps its value either way.
+    if const (is_copyable(V))
     {
-        // Poison the copying overload for a non-copyable V so the class still instantiates and
-        // `add(k, move x)` stays usable; the dead arm emits no call to the poisoned _placeValueAt.
-        if const (!is_copyable(V)) compile_error("this dictionary value type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (d.add(k, move x) / d.set(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
-        else
+        bool add(alias K key, V value)
         {
             if (_capacity == 0) _init(8);
             _maybeRehash();
@@ -195,10 +194,10 @@ struct dictionary<K, V>
             int insertSlot = _insertSlotFor(key);
             if (insertSlot == -1)
             {
-                // Duplicate: the dictionary refuses the entry. A `unique` argument was already
-                // handed over (a unique-substituted plain parameter is a synthesized move sink)
-                // and the caller kept no handle to it, so it must be freed here or it leaks.
-                // Borrowed / value arguments are left untouched.
+                // A `unique V*` is is_copyable but its param is a move sink (the caller's value was
+                // consumed), so a refused duplicate must free it or it leaks. A plain COPYABLE
+                // value (string, copyable struct) discards its by-value copy here; the caller keeps
+                // the original untouched.
                 if const (is_unique(V)) _freeValue(move value);
                 return false;
             }
@@ -206,18 +205,56 @@ struct dictionary<K, V>
             _placeValueAt(insertSlot, value);
             _status[insertSlot] = 1;
             _count++;
+            return true;
         }
-        return true;
+    }
+    // A NON-COPYABLE owning value (a struct that owns a `unique` and has no copy(), or a `unique`
+    // pointer) is MOVED by default - like C++ emplace/insert(&&), add() CONSUMES the value on
+    // EVERY path: placed on insert, freed on a duplicate key (the caller kept no handle, so
+    // leaving it would leak). Both paths funnel through the explicit `move V` sink below so the
+    // plain add() param is inferred a move sink (a top-level move into a call argument counts) and
+    // the caller's source is nulled. For "insert only if absent without losing x", use
+    // `if (!d.contains(k)) d.add(k, move x)` - the move is on the taken branch only.
+    else
+    {
+        // Explicit sink: the dictionary owns `value` on entry. On the refused (duplicate) path it
+        // is handed to _freeValue, whose `move V` parameter frees it on scope exit (this covers a
+        // bare `unique V*`, which a plain move-param does NOT auto-delete, as well as an owning
+        // struct); on insert it is moved into the slot.
+        bool _placeOrInsertSink(int insertSlot, alias K key, move V value)
+        {
+            if (insertSlot == -1)
+            {
+                _freeValue(move value);
+                return false;
+            }
+            _placeKeyAt(insertSlot, key);
+            _values[insertSlot] = move value;
+            _status[insertSlot] = 1;
+            _count++;
+            return true;
+        }
+
+        bool add(alias K key, V value)
+        {
+            if (_capacity == 0) _init(8);
+            _maybeRehash();
+            int insertSlot = _insertSlotFor(key);
+            return _placeOrInsertSink(insertSlot, key, move value);
+        }
     }
 
     // Insert or overwrite the value for key.
     // A value type V is COPIED; a bare pointer/interface value is borrowed; when V is `unique`
     // the dictionary takes ownership. On overwrite the old value is released first (a `unique`
     // value is freed, a value type destructed, a borrowed pointer just dropped).
-    void set(alias K key, V value)
+    // A COPYABLE value is COPIED (caller's original intact); a NON-COPYABLE owning value is MOVED
+    // (consumed). On overwrite the old value is released first. set() always takes the value
+    // (insert-or-assign), so - unlike add() - there is no duplicate-refusal path; the final
+    // top-level move makes the non-copyable set() param an inferred sink.
+    if const (is_copyable(V))
     {
-        if const (!is_copyable(V)) compile_error("this dictionary value type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (d.add(k, move x) / d.set(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
-        else
+        void set(alias K key, V value)
         {
             if (_capacity == 0) _init(8);
             _maybeRehash();
@@ -235,6 +272,28 @@ struct dictionary<K, V>
                 _count++;
             }
             _placeValueAt(updateSlot, value);
+        }
+    }
+    else
+    {
+        void set(alias K key, V value)
+        {
+            if (_capacity == 0) _init(8);
+            _maybeRehash();
+
+            int updateSlot = _insertSlotFor(key);
+            if (updateSlot == -1)
+            {
+                updateSlot = _findSlot(key);
+                _releaseValueAt(updateSlot);
+            }
+            else
+            {
+                _placeKeyAt(updateSlot, key);
+                _status[updateSlot] = 1;
+                _count++;
+            }
+            _values[updateSlot] = move value;
         }
     }
 

@@ -1,7 +1,7 @@
-// `unique` is the only admitted generic type-argument qualifier.
+// `unique` and `alias` are the only admitted generic type-argument qualifiers.
 import "list.cb";
 class Res { int id = default; };
 
-expect_error("unknown type qualifier 'borrow'; only 'unique' is allowed") {
+expect_error("unknown type qualifier 'borrow'; only 'unique' or 'alias' is allowed") {
     list<borrow Res*> bad = default;
 }

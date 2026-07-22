@@ -1,0 +1,38 @@
+// Stage 3 (owning-value move-sink): a plain by-value owning parameter that the callee body
+// UNCONDITIONALLY moves is a synthesized sink. Passing an owning local to it WITHOUT the `move`
+// keyword consumes the source (move-by-default), so a later read is "use of moved variable" -
+// exactly as a `unique T*` sink already behaves. Both owner kinds (copyable string, non-copyable
+// Holder{unique T*}) must be consumed. See internal/plan/container-ownership-transparency.md gap 1.
+import "string.cb";
+
+struct P { int v = 0; };
+struct Holder { unique P* slot = nullptr; int k = 0; };
+
+string g_s = default;
+Holder g_h = default;
+
+void strSink(string s)    { g_s = move s; }
+void holderSink(Holder v) { g_h = move v; }
+
+// Copyable owner (string): the plain call nulls the caller's source.
+expect_error("use of moved variable") {
+    void useStr()
+    {
+        string x = "a" + "b";
+        strSink(x);
+        int n = x.length();
+    }
+}
+
+// Non-copyable owner (owns via synthesized destructor): same move-by-default consumption.
+expect_error("use of moved variable") {
+    void useHolder()
+    {
+        Holder h = default;
+        h.slot = new P();
+        holderSink(h);
+        int k = h.k;
+    }
+}
+
+extern int main() { return 0; }

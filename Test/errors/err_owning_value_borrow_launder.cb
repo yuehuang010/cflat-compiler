@@ -1,0 +1,20 @@
+// Ownership laundering through a sink chain: `f` borrows an owning-value parameter (its body has
+// no `move`, so `f(h)` does NOT null the caller's `h`), then plain-forwards it to `g`, whose
+// by-value param is an inferred move sink. Consuming the borrowed alias would free the resource
+// while the true owner (`h` in main) still frees it - a silent double-free. The forward must be
+// a compile error: accept `f`'s parameter as a sink, or pass a copy with `.copy()`.
+class R { int id = default; };
+class Holder { unique R* r = default; int k = default; };
+
+void g(Holder v) { Holder s = move v; }   // inferred sink: consumes its argument
+
+expect_error("takes ownership of a value this function only borrows") {
+    void f(Holder v) { g(v); }            // f only borrows v - forwarding into g's sink launders
+}
+
+extern int main()
+{
+    Holder h = default;
+    h.r = new R();
+    return 0;
+}

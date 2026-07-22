@@ -1,0 +1,36 @@
+// `move <owning value>` into a plain (non-move) by-value parameter transfers NOTHING: the
+// parameter BORROWS, so the callee never takes ownership and the caller's source would be
+// orphaned (a double-free once the collapse removes the defensive copy). A `string` (copyable
+// owner) already errored here; the gap was a value struct that owns via a SYNTHESIZED destructor
+// (Holder{unique T*}, no hand-written ~), which TypeHasDestructor could not see. IsOwningValueType
+// closes it. To transfer, declare the parameter `move Holder`; to borrow, drop the `move`.
+import "string.cb";
+
+struct P { int v = 0; };
+struct Holder { unique P* slot = nullptr; int k = 0; };
+
+Holder g_sink = default;
+
+// Owning struct (synth dtor) moved into a plain borrow param - the case this fix added.
+expect_error("transfers nothing") {
+    void sinkHolder(Holder value) { g_sink.k = value.k; }
+    void useHolder()
+    {
+        Holder h = default;
+        h.slot = new P();
+        sinkHolder(move h);
+    }
+}
+
+// The copyable-owner (string) form was already rejected; keep it as a co-located regression so
+// the two owning kinds stay symmetric.
+expect_error("transfers nothing") {
+    void sinkStr(string value) { int n = value.length(); }
+    void useStr()
+    {
+        string s = "a" + "b";
+        sinkStr(move s);
+    }
+}
+
+extern int main() { return 0; }

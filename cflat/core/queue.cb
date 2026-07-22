@@ -41,22 +41,27 @@ class queue<T>
         _front = 0;
     }
 
-    // Store into a slot that holds no live element yet. `unique` takes ownership (a unique
-    // parameter is a synthesized move sink); a bare pointer or interface is aliased; a
-    // value type is deep-copied so the caller's original stays independent.
-    // `is_pointer(T)` is true for a bare, `unique` or `alias` pointer AND for an interface
-    // value, so it covers every borrowed spelling.
+    // Store into a slot that holds no live element yet. Ownership defers to T: a `unique`
+    // pointer transfers (its by-value param is a move sink); a bare pointer or interface is
+    // aliased; a COPYABLE value (string, closure, a struct with copy()) is deep-copied so the
+    // caller's original stays independent; a NON-COPYABLE owning value (a struct that owns a
+    // `unique` and has no copy()) is MOVED by default - it cannot be copied, so `enqueue(x)`
+    // consumes x. `is_pointer(T)` covers bare, `unique`, `alias` and interface spellings.
     void _placeAt(int index, T value)
     {
         if const (is_unique(T))         _data[index] = move value;
         else if const (is_pointer(T))   _data[index] = value;
         else if const (is_primitive(T)) _data[index] = value;
-        else if const (!is_copyable(T)) compile_error("this queue element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (q.enqueue(move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else if const (!is_copyable(T)) _data[index] = move value;
         else                            _data[index] = value.copy();
     }
 
     // Release the element in a live slot: `unique` is freed, a value type is destructed, a
-    // bare pointer or interface is left to its real owner.
+    // bare pointer or interface is left to its real owner. NOTE: this still needs `if const`.
+    // The `T value = move _data[index]` collapse is UNSOUND at teardown - the compiler mishandles
+    // a move-out-into-a-dropped-local for two element kinds: a bare pointer BORROW over-owns
+    // (drop emits a spurious `delete` -> double-free) and a `unique` INTERFACE under-owns (drop
+    // frees nothing -> leak). Both are compiler gaps; the collapse waits on the Stage 3 enabler.
     void _releaseAt(int index)
     {
         if const (is_unique(T))
@@ -76,18 +81,29 @@ class queue<T>
         if (_size == 0) _front = 0;
     }
 
-    // Append a value. A value type is COPIED (the caller's value is left intact); a bare
-    // pointer or interface is aliased; a `unique` element is TAKEN - a unique-typed parameter
-    // is a synthesized move sink, so the caller's source is nulled for it.
-    void enqueue(T value)
+    // Append a value. A COPYABLE element (string, closure, a struct with copy(), a bare pointer
+    // or interface borrow, a primitive) goes through _placeAt, which COPIES a value (caller's
+    // original left intact) or ALIASES a borrow. A NON-COPYABLE element (a struct that owns a
+    // `unique` and has no copy(), or a `unique` pointer) cannot be copied, so it is MOVED by
+    // default - the caller's source is consumed. The by-value param becomes a synthesized move
+    // sink only when a top-level `move value` appears in THIS method's body - an inlined
+    // `_data[slot] = move value` OR a call argument like `_placeAt(slot, move value)` both count.
+    // A plain `_placeAt(slot, value)` (no `move`) does NOT mark the param a sink.
+    if const (is_copyable(T))
     {
-        // Poison the copying overload for a non-copyable T so the class still instantiates and
-        // `enqueue(move x)` stays usable; the dead arm emits no call to the poisoned _placeAt.
-        if const (!is_copyable(T)) compile_error("this queue element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (q.enqueue(move x)) to transfer ownership instead, or give the type a 'copy()' method");
-        else
+        void enqueue(T value)
         {
             if (_front + _size >= _capacity) _grow();
             _placeAt(_front + _size, value);
+            _size++;
+        }
+    }
+    else
+    {
+        void enqueue(T value)
+        {
+            if (_front + _size >= _capacity) _grow();
+            _data[_front + _size] = move value;
             _size++;
         }
     }
@@ -107,35 +123,16 @@ class queue<T>
         }
     }
 
-    // Remove and return the front element. The return kind follows ownership: an owned element
-    // transfers out, a borrowed pointer / interface comes back as an alias the caller must not
-    // free, and a value element transfers out because its slot is gone.
-    if const (is_unique(T))
+    // Remove and return the front element. Ownership DEFERS to T, so no `if const`: a `unique`
+    // element transfers out (the caller owns it), a bare pointer / interface returns a borrow
+    // (the real owner keeps it; a `queue<alias T*>` still rejects deleting the result), and a
+    // value transfers because its slot is gone. `move _data[_front]` nulls the moved-from slot,
+    // which _advance then drops, so it is never released twice. Mirrors list.take().
+    T dequeue()
     {
-        move T dequeue()
-        {
-            T value = move _data[_front];
-            _advance();
-            return value;
-        }
-    }
-    else if const (is_pointer(T))
-    {
-        alias T dequeue()
-        {
-            T value = _data[_front];
-            _advance();
-            return value;
-        }
-    }
-    else
-    {
-        move T dequeue()
-        {
-            T value = move _data[_front];
-            _advance();
-            return value;
-        }
+        T value = move _data[_front];
+        _advance();
+        return value;
     }
 
     // Borrow the front element without removing it (caller must not free it).

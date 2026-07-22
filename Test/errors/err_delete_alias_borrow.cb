@@ -1,0 +1,33 @@
+// list<alias T*> elements are pure borrows owned elsewhere. Binding a get() result to a named
+// local (`B* o = l.get(0)`) and then deleting it launders the direct-call check; the decl-init
+// tag must still reject it as a double-free (the real owner frees the pointee, not the container).
+import "list.cb";
+
+class B { int x = 0; ~B() {} };
+
+expect_error("a pure borrow owned elsewhere") {
+    void leak() {
+        list<alias B*> l = default;
+        B* p = new B();
+        l.add(p);
+        B* o = l.get(0);
+        delete o;
+        delete p;
+    }
+}
+
+// take() returns plain T, but for an alias element the taken value is still a borrow (take
+// removes the slot yet never transfers ownership the container never held), so deleting it
+// is the same double-free and must be rejected too.
+expect_error("a pure borrow owned elsewhere") {
+    void leakTake() {
+        list<alias B*> l = default;
+        B* p = new B();
+        l.add(p);
+        B* o = l.take(0);
+        delete o;
+        delete p;
+    }
+}
+
+extern int main() { return 0; }

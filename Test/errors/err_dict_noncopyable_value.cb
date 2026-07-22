@@ -1,14 +1,17 @@
-// dictionary<K,V> for a non-copyable V (owns a `unique` pointer, no copy()) must still
-// instantiate: the copying add()/set() are poisoned instead, and error only when called.
-// The transfer overload d.add(k, move x) stays usable - see test_collection_leaks.cb.
+// dictionary<K,V> insert is MOVE-BY-DEFAULT for a NON-COPYABLE value V (owns a `unique` pointer,
+// no copy()): it cannot be copied, so `d.add(k, h)` TAKES ownership - the caller's source is
+// consumed and nulled, no `move` keyword required (add() consumes on every path: placed on insert,
+// freed on a duplicate key). Reusing the moved-from local afterward is a use-of-moved error.
+// The sound transfer + teardown is exercised in test_collection_leaks.cb.
 import "dictionary.cb";
 class Res { int id = default; };
 class Holder { unique Res* r = default; };
-expect_error("write 'move' at the call site");
+expect_error("use of moved variable 'h'");
 extern int main()
 {
     dictionary<int, Holder> d = default;
     Holder h = default;
     d.add(1, h);
+    int k = h.r == nullptr ? 0 : 1;
     return 0;
 }
