@@ -1,0 +1,15 @@
+// compile_error() takes a string LITERAL. Passing a named const char* constant used to
+// slip past the parser and emit a garbage single-char message (the dequote just strips the
+// first/last char). It must now be rejected with a clear diagnostic. Generics + `if const`
+// are required to actually reach the compile_error call.
+const char* MSG = "boom";
+class B<T> { void f() { if const (!is_copyable(T)) compile_error(MSG); } };
+class R { int i = default; };
+class H { unique R* r = default; };
+expect_error("compile_error requires a string literal");
+extern int main()
+{
+    B<H> b = default;
+    b.f();
+    return 0;
+}

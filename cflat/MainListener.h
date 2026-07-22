@@ -17199,7 +17199,18 @@ public:
                             {
                                 auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
                                 if (!namedArgCtx.empty())
-                                    msg = DequoteStringLiteral(namedArgCtx[0]->assignmentExpression()->getText());
+                                {
+                                    // Argument must be a string LITERAL - DequoteStringLiteral just
+                                    // strips the first/last char, so a bare identifier would yield
+                                    // garbage. Reject anything not quoted.
+                                    std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
+                                    if (argText.size() < 2 || argText.front() != '"' || argText.back() != '"')
+                                    {
+                                        LogErrorContext(ctx, "compile_error requires a string literal");
+                                        break;
+                                    }
+                                    msg = DequoteStringLiteral(argText);
+                                }
                             }
                             // Deferred: methods are instantiated eagerly (whole class body), so firing
                             // now would reject mere declaration. Poison the enclosing function; the
