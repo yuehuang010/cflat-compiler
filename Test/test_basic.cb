@@ -1258,6 +1258,15 @@ bool testFormatString()
 // if const compile-time conditional tests
 // =============================================================
 
+// Constant-folding inputs for `if const`: a const global scalar, a const bool, and an
+// enum member. These are true compile-time constants and must be usable in a condition.
+const int IF_CONST_SEVEN = 7;
+const bool IF_CONST_FEATURE = true;
+const int IF_CONST_NEG = -5;
+const u32 IF_CONST_BIG = 0xFFFFFFFF;
+const int IF_CONST_NEG8 = -8;
+enum IfConstFlags : int { IFC_OFF = 0, IFC_ON = 1 };
+
 bool testIfConst()
 {
     bool result = true;
@@ -1306,6 +1315,98 @@ bool testIfConst()
     else
     {
         result &= Test("if_const_neq_true", 0, 1);  // should not execute
+    }
+
+    // Test 6: if const folds a const global scalar - enters true branch
+    if const (IF_CONST_SEVEN == 7)
+    {
+        result &= Test("if_const_global_const", 1, 1);
+    }
+    else
+    {
+        result &= Test("if_const_global_const", 0, 1);  // should not execute
+    }
+
+    // Test 7: if const folds a const bool global - enters true branch
+    if const (IF_CONST_FEATURE)
+    {
+        result &= Test("if_const_global_bool", 1, 1);
+    }
+    else
+    {
+        result &= Test("if_const_global_bool", 0, 1);  // should not execute
+    }
+
+    // Test 8: if const folds an enum member comparison - enters else branch
+    if const (IfConstFlags.IFC_ON == 0)
+    {
+        result &= Test("if_const_enum_member", 0, 1);  // should not execute
+    }
+    else
+    {
+        result &= Test("if_const_enum_member", 1, 1);
+    }
+
+    // Test 9: short-circuit || over constant operands (one platform macro is always set)
+    if const (__WINDOWS__ || __MACOS__ || __LINUX__)
+    {
+        result &= Test("if_const_short_circuit_or", 1, 1);
+    }
+    else
+    {
+        result &= Test("if_const_short_circuit_or", 0, 1);  // should not execute
+    }
+
+    // Test 10: short-circuit && mixing a const global and an enum member
+    if const (IF_CONST_SEVEN > 3 && IfConstFlags.IFC_ON == 1)
+    {
+        result &= Test("if_const_short_circuit_and", 1, 1);
+    }
+    else
+    {
+        result &= Test("if_const_short_circuit_and", 0, 1);  // should not execute
+    }
+
+    // Test 11: signed comparison of a NEGATIVE const (-5 < 5) - enters true branch.
+    // Guards against zero-extending the sign away and reversing the ordered compare.
+    if const (IF_CONST_NEG < 5)
+    {
+        result &= Test("if_const_neg_lt", 1, 1);
+    }
+    else
+    {
+        result &= Test("if_const_neg_lt", 0, 1);  // should not execute
+    }
+
+    // Test 12: signed comparison of a NEGATIVE const (-5 > 0) - enters else branch.
+    if const (IF_CONST_NEG > 0)
+    {
+        result &= Test("if_const_neg_gt", 0, 1);  // should not execute
+    }
+    else
+    {
+        result &= Test("if_const_neg_gt", 1, 1);
+    }
+
+    // Test 13: UNSIGNED right shift (LShr) folds at the operand width, not 64 bits.
+    // 0xFFFFFFFF >> 1 must be 0x7FFFFFFF (zero-fill), not a sign-filled value.
+    if const ((IF_CONST_BIG >> 1) == 0x7FFFFFFF)
+    {
+        result &= Test("if_const_ushr", 1, 1);
+    }
+    else
+    {
+        result &= Test("if_const_ushr", 0, 1);  // should not execute
+    }
+
+    // Test 14: SIGNED right shift (AShr) of a negative const: -8 >> 1 must be -4.
+    if const ((IF_CONST_NEG8 >> 1) == -4)
+    {
+        result &= Test("if_const_sshr", 1, 1);
+    }
+    else
+    {
+        result &= Test("if_const_sshr", 0, 1);  // should not execute
     }
 
     return result;

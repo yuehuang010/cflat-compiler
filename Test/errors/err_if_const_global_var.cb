@@ -1,0 +1,13 @@
+// A file-scope `if const` whose condition reads a mutable global variable is NOT a
+// compile-time constant. It must be rejected with a clean diagnostic - previously this
+// SIGSEGV'd the compiler because the condition emitted a load with no active insert block.
+int ifConstMutableFlag = 1;
+
+expect_error("'if const' condition must be a compile-time constant expression");
+
+if const (ifConstMutableFlag) { int fileScopeDecl = 1; }
+
+extern int main()
+{
+    return 0;
+}

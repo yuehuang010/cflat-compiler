@@ -4037,6 +4037,21 @@ public:
 
     // Cache of resolved aggregate member lists, keyed on the struct/class context. Cleared for a
     // given ctx at the start of its walk so each generic instantiation re-evaluates conditions.
+    // LLVM names of globals whose initializer is a true compile-time constant for `if const`:
+    // const-qualified global scalars and enum members. A plain mutable global is excluded, so
+    // its initializer is never folded into an if-const decision (it stays a runtime value).
+    std::unordered_set<std::string> constFoldableGlobals_;
+
+    // True when a global declaration carries the `const` type qualifier.
+    static bool DeclSpecHasConst(CFlatParser::DeclarationSpecifiersContext* declSpec)
+    {
+        if (declSpec == nullptr) return false;
+        for (auto* ds : declSpec->declarationSpecifier())
+            if (auto* q = ds->typeQualifier())
+                if (q->getText() == "const") return true;
+        return false;
+    }
+
     std::map<const void*, std::vector<CFlatParser::AggregateMemberContext*>> resolvedMembers_;
 
     // RAII scope for one struct/class body walk. Drops the cached entry for ctx so this walk
@@ -4083,15 +4098,14 @@ public:
     void AppendIfConstMembers(CFlatParser::IfConstMemberContext* ctx,
                               std::vector<CFlatParser::AggregateMemberContext*>& out)
     {
-        auto condition = ParseExpression(ctx->expression());
-        auto constInt = llvm::dyn_cast_or_null<llvm::ConstantInt>(condition);
-        if (!constInt)
+        int decision = DecideIfConstCondition(ctx->expression());
+        if (decision < 0)
         {
             LogErrorContext(ctx, "'if const' condition must be a compile-time constant expression");
             return;
         }
 
-        bool taken = constInt->getZExtValue() != 0;
+        bool taken = decision != 0;
         auto ifBlocks = ctx->ifConstMemberBlock();
         if (ifBlocks.empty())
             return;
@@ -4142,15 +4156,14 @@ public:
     void AppendIfConstInterfaceMembers(CFlatParser::IfConstInterfaceMemberContext* ctx,
                                        std::vector<CFlatParser::InterfaceMemberContext*>& out)
     {
-        auto condition = ParseExpression(ctx->expression());
-        auto constInt = llvm::dyn_cast_or_null<llvm::ConstantInt>(condition);
-        if (!constInt)
+        int decision = DecideIfConstCondition(ctx->expression());
+        if (decision < 0)
         {
             LogErrorContext(ctx, "'if const' condition must be a compile-time constant expression");
             return;
         }
 
-        bool taken = constInt->getZExtValue() != 0;
+        bool taken = decision != 0;
         auto ifBlocks = ctx->ifConstInterfaceBlock();
         if (ifBlocks.empty())
             return;
@@ -4221,15 +4234,14 @@ public:
     void ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContext* ctx, const std::string& namespaceName = {})
     {
         auto expression = ctx->expression();
-        auto condition = ParseExpression(expression);
-        auto constInt = llvm::dyn_cast<llvm::ConstantInt>(condition);
-        if (!constInt)
+        int decision = DecideIfConstCondition(expression);
+        if (decision < 0)
         {
             LogErrorContext(ctx, "'if const' condition must be a compile-time constant expression");
             return;
         }
 
-        bool taken = constInt->getZExtValue() != 0;
+        bool taken = decision != 0;
         auto ifBlocks = ctx->ifConstBlock();
 
         if (ifBlocks.empty())
@@ -5908,15 +5920,14 @@ public:
                 auto expression = selectionStatement->expression();
                 auto innerStatement = selectionStatement->statement();
 
-                auto condition = ParseExpression(expression);
-                auto constInt = llvm::dyn_cast<llvm::ConstantInt>(condition);
-                if (!constInt)
+                int decision = DecideIfConstCondition(expression);
+                if (decision < 0)
                 {
                     LogErrorContext(selectionStatement, "'if const' condition must be a compile-time constant expression");
                     return;
                 }
 
-                bool taken = constInt->getZExtValue() != 0;
+                bool taken = decision != 0;
                 if (taken)
                     ParseStatement(innerStatement[0]);
                 else if (innerStatement.size() > 1)
@@ -6569,26 +6580,6 @@ public:
         }
     }
 
-    // True if `node`'s subtree contains a construct whose ParseExpression EMITS control-flow IR
-    // rather than folding to a ConstantInt: a multi-operand `&&` / `||` (short-circuit blocks) or a
-    // ternary `?:`. A single-operand logical node just delegates (no IR), so it does not count.
-    // The valid if-const conditions (constant idents, `!`, comparisons, intrinsic predicate calls)
-    // all fold; only these shapes would insert instructions into a stale/foreign function during
-    // the speculative pre-body evaluation, so the sink evaluator refuses to run on them.
-    static bool IfConstConditionEmitsControlFlow(antlr4::tree::ParseTree* node)
-    {
-        if (node == nullptr) return false;
-        if (auto* a = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(node))
-            if (a->inclusiveOrExpression().size() > 1) return true;
-        if (auto* o = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node))
-            if (o->logicalAndExpression().size() > 1) return true;
-        if (auto* c = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
-            if (c->children.size() > 1) return true;
-        for (auto* child : node->children)
-            if (IfConstConditionEmitsControlFlow(child)) return true;
-        return false;
-    }
-
     // Tri-state evaluate an `if const` condition for the active instantiation WITHOUT emitting
     // code: 1 (taken), 0 (not taken), -1 (not a compile-time constant / cannot decide). A valid
     // if-const condition folds to a ConstantInt, so nothing is inserted; the insert point is
@@ -6596,40 +6587,177 @@ public:
     int EvaluateIfConstForSink(CFlatParser::ExpressionContext* expr)
     {
         if (expr == nullptr) return -1;
-        // Defensive: a `&&` / `||` / ternary condition would emit real control-flow IR into the
-        // stale insert point (this runs pre-body, before the function's entry block exists), which
-        // the save/restore below cannot undo. Such a condition never folds to a ConstantInt anyway,
-        // so the decision is already -1; refuse it up front to avoid the stray emission entirely.
-        if (IfConstConditionEmitsControlFlow(expr)) return -1;
-        auto* compiler = Compiler(expr);
-        llvm::BasicBlock* savedBlock = compiler->builder->GetInsertBlock();
-        llvm::BasicBlock::iterator savedIt;
-        if (savedBlock != nullptr) savedIt = compiler->builder->GetInsertPoint();
-        // Suppress diagnostics: a non-constant/ill-formed condition (e.g. `if const (x)` where x is
-        // a runtime local not yet in scope during this pre-body pass) must not error here - it is
-        // re-evaluated and reported at real body codegen. Any such case is simply "cannot decide".
-        int result = -1;
-        // Save/restore rather than force to false, so a (future) nested speculative eval cannot
-        // clobber an outer suppression that is still active.
-        bool savedSuppress = compiler->suppressErrors_;
-        compiler->suppressErrors_ = true;
-        try
-        {
-            llvm::Value* v = ParseExpression(expr);
-            compiler->suppressErrors_ = savedSuppress;
-            if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(v))
-                result = (ci->getZExtValue() != 0) ? 1 : 0;
-        }
-        catch (const SpeculativeEvalAbort&) { compiler->suppressErrors_ = savedSuppress; }
-        catch (...) { compiler->suppressErrors_ = savedSuppress; throw; }
-        if (savedBlock != nullptr) compiler->builder->SetInsertPoint(savedBlock, savedIt);
-        return result;
+        // Runs PRE-BODY, when the builder points at a FOREIGN, already-terminated function block.
+        // Route through the shared evaluator with forceScratch=true so every emitted leaf lands in
+        // a throwaway function - never leaking instructions past that foreign block's terminator -
+        // and suppress=true so an ill-formed condition (e.g. a not-yet-in-scope local) is silently
+        // "cannot decide" here, to be re-evaluated and reported at real body codegen.
+        auto v = EvalIfConstConstant(expr, /*forceScratch*/ true, /*suppress*/ true);
+        if (!v) return -1;
+        return (*v != 0) ? 1 : 0;
     }
 
     // Bind EvaluateIfConstForSink as the if-const evaluator passed to ApplyOwningSinkInference.
     IfConstEvaluator SinkIfConstEvaluator()
     {
         return [this](CFlatParser::ExpressionContext* e) { return EvaluateIfConstForSink(e); };
+    }
+
+    // Emit a non-short-circuiting `if const` leaf (a comparison / arithmetic / primary / call
+    // subtree, no `&&` `||` `?:` at this level) into a THROWAWAY function and fold it. The scratch
+    // function gives the builder a live insert block, so a global/enum load or any other emitting
+    // shape cannot dereference a null insert block at declaration scope. Returns the folded integer,
+    // or nullopt when the subtree does not fold to a compile-time constant. Diagnostics are
+    // suppressed: a non-constant condition is reported once by the caller, not here.
+    std::optional<int64_t> EmitAndFoldIfConstLeaf(antlr4::tree::ParseTree* node, bool forceScratch, bool suppress)
+    {
+        if (node == nullptr) return std::nullopt;
+        auto* compiler = Compiler();
+
+        // Statement scope (a live insert block that is the function body currently being emitted):
+        // emit into it directly, exactly as the pre-evaluator code did. The dead leaf IR left
+        // behind is harmless (a plain if-const decision, later DCE'd). forceScratch overrides this
+        // for the owning-sink pre-body scan, where the "current" block is a FOREIGN, already-
+        // terminated function block; emitting there would leak instructions past its terminator.
+        if (!forceScratch && compiler->builder->GetInsertBlock() != nullptr)
+        {
+            llvm::Value* v = EmitIfConstLeafValue(node);
+            uint64_t folded = 0;
+            if (v && TryFoldConstInt(v, folded, &constFoldableGlobals_))
+                return (int64_t)folded;
+            return std::nullopt;
+        }
+
+        // No usable insert block (declaration / member / interface scope) or forceScratch: emit
+        // into a throwaway function (mirrors EvalGlobalArrayDim) so the builder has a valid, private
+        // block. This is the crash fix - a global/enum load can no longer dereference a null insert
+        // block - and it also keeps the owning-sink scan from corrupting a foreign function.
+        auto savedState = compiler->SaveBuilderState();
+        auto* savedFn = compiler->currentFunction;
+        auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
+        auto* tmpFn = llvm::Function::Create(
+            voidTy, llvm::Function::PrivateLinkage, "__if_const_eval_tmp", compiler->module.get());
+        auto* tmpBB = llvm::BasicBlock::Create(*compiler->context, "entry", tmpFn);
+        compiler->builder->SetInsertPoint(tmpBB);
+        compiler->currentFunction = tmpFn;
+        bool savedSuppress = compiler->suppressErrors_;
+        if (suppress) compiler->suppressErrors_ = true;
+
+        std::optional<int64_t> result = std::nullopt;
+        try
+        {
+            llvm::Value* v = EmitIfConstLeafValue(node);
+            uint64_t folded = 0;
+            if (v && TryFoldConstInt(v, folded, &constFoldableGlobals_))
+                result = (int64_t)folded;
+        }
+        catch (const SpeculativeEvalAbort&) {}
+        catch (...)
+        {
+            compiler->suppressErrors_ = savedSuppress;
+            compiler->currentFunction = savedFn;
+            tmpFn->eraseFromParent();
+            compiler->RestoreBuilderState(savedState);
+            throw;
+        }
+        compiler->suppressErrors_ = savedSuppress;
+        compiler->currentFunction = savedFn;
+        tmpFn->eraseFromParent();
+        compiler->RestoreBuilderState(savedState);
+        return result;
+    }
+
+    // Dispatch a leaf `if const` subtree to the matching typed Parse method for emission. The
+    // recursive evaluator only ever bottoms out at an inclusiveOrExpression (the level just below
+    // the short-circuit operators), but the other wrapper types are handled defensively.
+    llvm::Value* EmitIfConstLeafValue(antlr4::tree::ParseTree* node)
+    {
+        if (auto* i = dynamic_cast<CFlatParser::InclusiveOrExpressionContext*>(node))
+            return ParseInclusiveOrExpression(i);
+        if (auto* a = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(node))
+            return ParseLogicalAndExpression(a);
+        if (auto* o = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node))
+            return ParseLogicalOrExpression(o);
+        if (auto* c = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
+            return ParseConditionalExpression(c);
+        if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+            return ParseAssignmentExpression(asn);
+        if (auto* e = dynamic_cast<CFlatParser::ExpressionContext*>(node))
+            return ParseExpression(e);
+        return nullptr;
+    }
+
+    // Recursively fold an `if const` condition subtree to a compile-time integer WITHOUT
+    // committing IR to the live function. Short-circuit `&&` / `||` / ternary `?:` are evaluated
+    // here, BEFORE emission, so their branch+phi lowering never blocks folding; every remaining
+    // leaf is routed through a discarded scratch function (EmitAndFoldIfConstLeaf) so a global or
+    // enum load cannot crash on a null insert block. Returns nullopt when the subtree is not a
+    // compile-time constant.
+    std::optional<int64_t> EvalIfConstConstant(antlr4::tree::ParseTree* node, bool forceScratch, bool suppress)
+    {
+        if (node == nullptr) return std::nullopt;
+
+        if (auto* c = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
+        {
+            // Ternary `cond ? a : b` short-circuits to one arm; `x ?? y` is not an integer const.
+            if (c->expression() != nullptr)
+            {
+                auto cond = EvalIfConstConstant(c->logicalOrExpression(), forceScratch, suppress);
+                if (!cond) return std::nullopt;
+                return (*cond != 0) ? EvalIfConstConstant(c->expression(), forceScratch, suppress)
+                                    : EvalIfConstConstant(c->conditionalExpression(), forceScratch, suppress);
+            }
+            if (c->children.size() > 1) return std::nullopt;  // `??` null-coalescing
+            return EvalIfConstConstant(c->logicalOrExpression(), forceScratch, suppress);
+        }
+        if (auto* o = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node))
+        {
+            auto operands = o->logicalAndExpression();
+            if (operands.size() == 1) return EvalIfConstConstant(operands[0], forceScratch, suppress);
+            // OR: any known-true wins; all-known-false is false; otherwise undecidable.
+            bool allKnownFalse = true;
+            for (auto* op : operands)
+            {
+                auto v = EvalIfConstConstant(op, forceScratch, suppress);
+                if (v && *v != 0) return (int64_t)1;
+                if (!v) allKnownFalse = false;
+            }
+            return allKnownFalse ? std::optional<int64_t>(0) : std::nullopt;
+        }
+        if (auto* a = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(node))
+        {
+            auto operands = a->inclusiveOrExpression();
+            if (operands.size() == 1) return EvalIfConstConstant(operands[0], forceScratch, suppress);
+            // AND: any known-false wins; all-known-true is true; otherwise undecidable.
+            bool allKnownTrue = true;
+            for (auto* op : operands)
+            {
+                auto v = EvalIfConstConstant(op, forceScratch, suppress);
+                if (v && *v == 0) return (int64_t)0;
+                if (!v) allKnownTrue = false;
+            }
+            return allKnownTrue ? std::optional<int64_t>(1) : std::nullopt;
+        }
+        if (auto* e = dynamic_cast<CFlatParser::ExpressionContext*>(node))
+            return EvalIfConstConstant(e->assignmentExpression(), forceScratch, suppress);
+        if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+        {
+            if (asn->conditionalExpression() != nullptr)
+                return EvalIfConstConstant(asn->conditionalExpression(), forceScratch, suppress);
+            return std::nullopt;  // an actual assignment is not a constant
+        }
+        // No short-circuit control flow at or below this node: emit-and-fold the leaf.
+        return EmitAndFoldIfConstLeaf(node, forceScratch, suppress);
+    }
+
+    // Tri-state decision for an `if const` condition: 1 (taken), 0 (not taken), -1 (not a
+    // compile-time constant). Single entry point for the four if-const evaluation sites; never
+    // requires a live insert block and never leaves a half-built block behind.
+    int DecideIfConstCondition(CFlatParser::ExpressionContext* expr)
+    {
+        auto v = EvalIfConstConstant(expr, /*forceScratch*/ false, /*suppress*/ false);
+        if (!v) return -1;
+        return (*v != 0) ? 1 : 0;
     }
 
     void ParseFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {}, const std::string& nameOverride = {})
@@ -7179,6 +7307,8 @@ public:
             // Create a typed constant using the backing type
             llvm::Constant* c = compiler->CreateConstant(backingType, std::to_string(value));
             compiler->CreateGlobalVariable(tv, c);
+            // Enum members are true compile-time constants: foldable in an `if const` condition.
+            constFoldableGlobals_.insert(tv.VariableName);
 
             current = value + 1;
         }
@@ -7989,6 +8119,11 @@ public:
                     }
                     auto constant = llvm::dyn_cast_or_null<llvm::Constant>(right);
                     compiler->CreateGlobalVariable(typeAndValue, constant, typeAndValue.threadLocal, typeAndValue.UserAlignValue, externDeclOnly);
+                    // A const-qualified global scalar with a constant-int initializer is foldable
+                    // in an `if const` condition; a mutable global is not (see constFoldableGlobals_).
+                    if (!externDeclOnly && DeclSpecHasConst(declSpec)
+                        && llvm::isa_and_nonnull<llvm::ConstantInt>(constant))
+                        constFoldableGlobals_.insert(typeAndValue.VariableName);
                     // Record the variable's declaration site so LSP go-to-definition
                     // on the variable name lands on the global itself, not on its
                     // (possibly unregistered, e.g. generic-instantiation) type.
@@ -12781,11 +12916,20 @@ public:
     // Fold an evaluated size expression to a compile-time unsigned integer. Handles literals,
     // loads of a global int with a constant initializer (cflat `const int N = ...`), integer
     // arithmetic (W*H etc.), and integer width casts. Returns false if it is not foldable.
-    static bool TryFoldConstInt(llvm::Value* v, uint64_t& out)
+    // constGlobals (optional): when non-null, a load of a GLOBAL only folds if the global's name
+    // is in the set. This restricts if-const folding to true compile-time constants (const scalars,
+    // enum members) and excludes mutable globals. When null, any global with a const-int initializer
+    // folds (the original behavior, used by EvalGlobalArrayDim).
+    static bool TryFoldConstInt(llvm::Value* v, uint64_t& out,
+                                const std::unordered_set<std::string>* constGlobals = nullptr)
     {
+        // Values are carried SIGN-extended to 64 bits (getSExtValue) so the signed ICmp cases
+        // below can reinterpret `out` as int64_t correctly for negative constants. For same-width
+        // operands, sign-extension preserves the unsigned ordering too, so the unsigned predicates
+        // stay correct; ZExt casts re-zero the upper bits from the source width (see below).
         if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(v))
         {
-            out = ci->getZExtValue();
+            out = (uint64_t)ci->getSExtValue();
             return true;
         }
         if (auto* ld = llvm::dyn_cast<llvm::LoadInst>(v))
@@ -12794,7 +12938,10 @@ public:
                 if (gv->hasInitializer())
                     if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(gv->getInitializer()))
                     {
-                        out = ci->getZExtValue();
+                        if (constGlobals != nullptr
+                            && constGlobals->count(std::string(gv->getName())) == 0)
+                            return false;
+                        out = (uint64_t)ci->getSExtValue();
                         return true;
                     }
             return false;
@@ -12802,7 +12949,7 @@ public:
         if (auto* bo = llvm::dyn_cast<llvm::BinaryOperator>(v))
         {
             uint64_t l = 0, r = 0;
-            if (!TryFoldConstInt(bo->getOperand(0), l) || !TryFoldConstInt(bo->getOperand(1), r))
+            if (!TryFoldConstInt(bo->getOperand(0), l, constGlobals) || !TryFoldConstInt(bo->getOperand(1), r, constGlobals))
                 return false;
             switch (bo->getOpcode())
             {
@@ -12814,8 +12961,39 @@ public:
                 case llvm::Instruction::SRem:
                 case llvm::Instruction::URem: if (r == 0) return false; out = l % r; return true;
                 case llvm::Instruction::Shl:  out = l << r; return true;
+                // Right shifts are width-aware: leaves are carried sign-extended to 64 bits, so a
+                // bare `>>` would fill from bit 63 (wrong for a narrower operand). Fold at the
+                // instruction's own width W, then re-sign-extend the W-bit result to 64.
                 case llvm::Instruction::LShr:
-                case llvm::Instruction::AShr: out = l >> r; return true;
+                case llvm::Instruction::AShr:
+                {
+                    unsigned W = bo->getType()->getIntegerBitWidth();
+                    uint64_t mask = (W < 64) ? (((uint64_t)1 << W) - 1) : ~(uint64_t)0;
+                    uint64_t signBitW = (uint64_t)1 << (W - 1);
+                    bool isAShr = bo->getOpcode() == llvm::Instruction::AShr;
+                    uint64_t res;
+                    // Over-shift (r >= W, or a negative r that sign-extended to a huge value) is UB in
+                    // C++ `>>` and poison at the source level. Fold it deterministically: LShr -> 0,
+                    // AShr -> all-ones-in-W when the operand's sign bit is set, else 0.
+                    if (r >= W)
+                        res = (isAShr && (l & signBitW)) ? mask : 0;
+                    else if (!isAShr)
+                        res = (l & mask) >> r;                       // zero-fill within W bits
+                    else
+                    {
+                        // Arithmetic shift: interpret l as a W-bit signed value (already sext'd) and
+                        // shift, filling from the sign bit.
+                        res = (uint64_t)((int64_t)l >> r);
+                    }
+                    // Sign-extend the W-bit result back to 64 so downstream signed compares are valid.
+                    if (W < 64)
+                    {
+                        res &= mask;
+                        if (res & signBitW) res |= ~mask;
+                    }
+                    out = res;
+                    return true;
+                }
                 case llvm::Instruction::And:  out = l & r; return true;
                 case llvm::Instruction::Or:   out = l | r; return true;
                 case llvm::Instruction::Xor:  out = l ^ r; return true;
@@ -12824,11 +13002,52 @@ public:
         }
         if (auto* cast = llvm::dyn_cast<llvm::CastInst>(v))
         {
+            // Trunc / SExt pass the sign-extended operand through unchanged (SExt of a value
+            // already sign-extended from its own width is a no-op at 64 bits).
             if (cast->getOpcode() == llvm::Instruction::Trunc ||
-                cast->getOpcode() == llvm::Instruction::ZExt ||
                 cast->getOpcode() == llvm::Instruction::SExt)
-                return TryFoldConstInt(cast->getOperand(0), out);
+                return TryFoldConstInt(cast->getOperand(0), out, constGlobals);
+            // ZExt must discard the sign bits the leaf fold added: re-zero above the source width.
+            if (cast->getOpcode() == llvm::Instruction::ZExt)
+            {
+                if (!TryFoldConstInt(cast->getOperand(0), out, constGlobals)) return false;
+                unsigned srcBits = cast->getSrcTy()->getIntegerBitWidth();
+                if (srcBits < 64) out &= ((uint64_t)1 << srcBits) - 1;
+                return true;
+            }
             return false;
+        }
+        if (auto* cmp = llvm::dyn_cast<llvm::ICmpInst>(v))
+        {
+            uint64_t l = 0, r = 0;
+            if (!TryFoldConstInt(cmp->getOperand(0), l, constGlobals) || !TryFoldConstInt(cmp->getOperand(1), r, constGlobals))
+                return false;
+            bool res = false;
+            // Signed predicates reinterpret the raw bits as int64_t, matching the uint64
+            // arithmetic convention used above for the other opcodes.
+            switch (cmp->getPredicate())
+            {
+                case llvm::CmpInst::ICMP_EQ:  res = (l == r); break;
+                case llvm::CmpInst::ICMP_NE:  res = (l != r); break;
+                case llvm::CmpInst::ICMP_UGT: res = (l > r); break;
+                case llvm::CmpInst::ICMP_UGE: res = (l >= r); break;
+                case llvm::CmpInst::ICMP_ULT: res = (l < r); break;
+                case llvm::CmpInst::ICMP_ULE: res = (l <= r); break;
+                case llvm::CmpInst::ICMP_SGT: res = ((int64_t)l >  (int64_t)r); break;
+                case llvm::CmpInst::ICMP_SGE: res = ((int64_t)l >= (int64_t)r); break;
+                case llvm::CmpInst::ICMP_SLT: res = ((int64_t)l <  (int64_t)r); break;
+                case llvm::CmpInst::ICMP_SLE: res = ((int64_t)l <= (int64_t)r); break;
+                default: return false;
+            }
+            out = res ? 1 : 0;
+            return true;
+        }
+        if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(v))
+        {
+            uint64_t c = 0;
+            if (!TryFoldConstInt(sel->getCondition(), c, constGlobals))
+                return false;
+            return TryFoldConstInt(c ? sel->getTrueValue() : sel->getFalseValue(), out, constGlobals);
         }
         return false;
     }
