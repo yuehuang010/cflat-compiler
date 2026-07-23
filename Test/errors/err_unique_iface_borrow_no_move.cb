@@ -1,0 +1,26 @@
+// A `unique <interface>` local owns its boxed heap object. Initializing another
+// `unique` interface local from it WITHOUT `move` ('unique IThing b = a;') would
+// create a second owner of the one box - a leak or double free at scope exit. Only
+// 'new', a 'move' expression, a move-returning call, or 'nullptr' is legal. The
+// paired transfer form 'unique IThing b = move a;' is exercised in test_interface.cb.
+
+interface IThing { int get(); };
+
+class Thing : IThing
+{
+    int v = 0;
+    int get() { return v; }
+};
+
+expect_error("cannot initialize unique 'b' from a borrowed value") {
+    void borrowNoMove()
+    {
+        unique IThing a = new Thing();
+        unique IThing b = a;   // borrowed, no 'move' -> rejected
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

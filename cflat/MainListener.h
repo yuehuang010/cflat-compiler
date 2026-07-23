@@ -14211,6 +14211,32 @@ public:
             return result;
         }
 
+        // move of a named OWNING `unique <interface>` local: an interface fat value is not a
+        // dataStructures entry, so the branches below never zero it and the source keeps owning the
+        // boxed heap object. Transfer it exactly as a thin `unique R*` move does - capture the value,
+        // zero the source slot, mark it moved, and signal lastOwningResult so the init/assign path
+        // adopts ownership (freeing any old destination box first). A direct call arg is deferred to
+        // ApplyMoveParamTransfer; a non-owning (borrowed) source keeps the borrow-forward behavior.
+        // The gate is ownership (IsVariableOwning), not strictly `unique`: a non-unique owning
+        // interface local (e.g. from a move-returning call) is equally safe to move - it is not
+        // auto-freed at scope exit, so consuming it here leaks nothing.
+        if (!argNV.TypeAndValue.Pointer && argNV.Storage
+            && argNV.TypeAndValue.IsInterface && !argNV.TypeAndValue.IsInterfacePointer
+            && !IsDirectCallArgument(ctx)
+            && !argNV.CallerName.empty() && compiler->IsVariableOwning(argNV.CallerName))
+        {
+            compiler->builder->CreateStore(
+                llvm::ConstantAggregateZero::get(compiler->GetFatPtrType()), argNV.Storage);
+            compiler->MarkVariableMoved(argNV.CallerName);
+            compiler->lastOwningResult = true;
+            LLVMBackend::NamedVariable result;
+            result.Primary      = ptrVal;
+            result.Storage      = nullptr;
+            result.BaseType     = argNV.BaseType;
+            result.TypeAndValue = argNV.TypeAndValue;
+            return result;
+        }
+
         if (!argNV.TypeAndValue.Pointer)
         {
             if (argNV.Storage && compiler->IsDataStructure(argNV.TypeAndValue.TypeName))

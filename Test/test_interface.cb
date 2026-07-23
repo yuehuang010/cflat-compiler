@@ -660,6 +660,40 @@ bool testMoveInterfaceParam()
     return gDelIfaceDtorCount == 1;
 }
 
+// ---- Test 16b: move a `unique <interface>` local to another local ----------
+// 'unique IThing b = move a;' (init) and 'b = move a;' (reassign over a live b)
+// must transfer the sole boxed owner: the source becomes moved (nulled, its
+// scope-exit teardown a no-op) and the destination owns it - exactly one
+// destruction per object, zero leaks. Non-move borrowing stays rejected (see
+// Test/errors/err_unique_iface_borrow_no_move.cb).
+bool testMoveUniqueInterfaceLocal()
+{
+    bool result = true;
+
+    // Init form: b adopts a's box; a is moved-from. b frees exactly once at scope exit.
+    gDelIfaceDtorCount = 0;
+    {
+        unique ICounted a = makeCounted();      // v = 7
+        unique ICounted b = move a;             // transfer: a moved, b owns
+        result &= Test("uniq_iface_init_move_value", b.value(), 7);
+    }
+    result &= Test("uniq_iface_init_move_dtor", gDelIfaceDtorCount, 1);
+
+    // Reassign over a LIVE destination: y's old box is freed first, then y adopts x's.
+    // One destruction at the reassign (old y) + one at scope exit (moved-in box) = 2.
+    gDelIfaceDtorCount = 0;
+    {
+        unique ICounted x = makeCounted();      // v = 7
+        unique ICounted y = new Counted();      // a distinct live box
+        y = move x;                             // free old y (dtor #1), y adopts x, x moved
+        result &= Test("uniq_iface_reassign_live_freed_old", gDelIfaceDtorCount, 1);
+        result &= Test("uniq_iface_reassign_value", y.value(), 7);
+    }
+    result &= Test("uniq_iface_reassign_total_dtor", gDelIfaceDtorCount, 2);
+
+    return result;
+}
+
 // Closure-owning node for the move-return regression: its destructor counts
 // destructions so we can prove the concrete object (and the function<> env it
 // owns) is destructed exactly once - no double-free, no leak.
@@ -1831,6 +1865,7 @@ extern int main()
     total++; passed += testChannelInterface()    ? 1 : 0;
     total++; passed += testDeleteThroughInterface() ? 1 : 0;
     total++; passed += testMoveInterfaceParam()     ? 1 : 0;
+    total++; passed += testMoveUniqueInterfaceLocal() ? 1 : 0;
     total++; passed += testMoveReturnClosureInterface() ? 1 : 0;
     total++; passed += testStringInheritedInterfaceChain() ? 1 : 0;
     total++; passed += testStringInterfaceList()         ? 1 : 0;
