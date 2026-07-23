@@ -8770,7 +8770,11 @@ public:
                 srcStorage = ref.Storage;
                 srcBaseTy  = ref.BaseType;
             }
-            if (srcStorage != nullptr)
+            // Self-assign (`a = a`): source slot == destination slot. The value was already
+            // stored back into the same slot, so nulling it would zero the live pointer and
+            // segfault on the next deref. Skip the transfer - the slot still owns its pointee.
+            // Mirrors the struct-move `destination != rightNV.Storage` self-assign guard.
+            if (srcStorage != nullptr && srcStorage != destination)
             {
                 if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(srcBaseTy))
                 {

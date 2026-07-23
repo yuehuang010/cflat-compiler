@@ -236,6 +236,22 @@ int testUniquePointerSetFreesOld()
     return passed;
 }
 
+// Self-assign of a thin `unique T*` local (`a = a`) is a no-op: the slot keeps its
+// pointee (no spurious free, no zeroed slot). Regression for the self-move segfault.
+int testUniquePointerSelfAssign()
+{
+    int passed = 0;
+    g_dtor = 0;
+    {
+        unique Res* a = new Res(5);
+        a = a;
+        passed += Test("unique self-assign keeps value", a->id, 5);
+        passed += Test("unique self-assign no premature free", g_dtor, 0);
+    }
+    passed += Test("unique self-assign frees once at scope exit", g_dtor, 1);
+    return passed;
+}
+
 // --- interfaces: the alignment claim ----------------------------------------------
 
 // The case list<T> cannot support: a bare interface container holding a STACK value.
@@ -526,6 +542,7 @@ extern int main()
     total += 7;  passed += testAliasPointerElementBorrows();
     total += 3;  passed += testUniquePointerOwns();
     total += 2;  passed += testUniquePointerSetFreesOld();
+    total += 3;  passed += testUniquePointerSelfAssign();
     total += 5;  passed += testBareInterfaceBorrows();
     total += 2;  passed += testUniqueInterfaceOwns();
     total += 3;  passed += testCopyValue();
