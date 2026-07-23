@@ -151,8 +151,9 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         }
     }
 
-    // set()'s transfer counterpart, guarded exactly like add(move T) above. Declared AFTER
-    // the plain set() so the interface contract check matches the plain overload first.
+    // set()'s transfer counterpart, guarded exactly like add(move T) above. Declaration order
+    // relative to the plain set() does not matter: interface conformance accepts the class if
+    // any overload satisfies the contract, and dispatch binds the contract-matching overload.
     if const (!is_pointer(T))
     {
         void set(int index, move T value)

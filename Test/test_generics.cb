@@ -2781,6 +2781,76 @@ bool testIfConstInterfaceScope()
     return result;
 }
 
+// --- interface conformance with overloaded contract methods (declaration order) ---
+// A class may declare both a `move` and a plain overload of a contract method that differ
+// only in move-ness. Conformance must accept the class if ANY overload satisfies the plain
+// interface contract, regardless of which overload is declared first, and interface dispatch
+// must bind the conforming (plain) overload so a call through the interface never transfers
+// ownership the contract did not promise.
+
+interface IOrderSink<T>
+{
+    void put(T value);
+    int  moves();
+    int  plains();
+    int  slot();
+};
+
+// move overload declared BEFORE the plain one - the order that used to be falsely rejected.
+class OrderMoveFirst<T> : IOrderSink<T>
+{
+    T   _slot   = default;
+    int _moves  = 0;
+    int _plains = 0;
+    if const (!is_pointer(T)) { void put(move T value) { _slot = move value; _moves = _moves + 1; } }
+    void put(T value) { _slot = value; _plains = _plains + 1; }
+    int  moves()  { return _moves; }
+    int  plains() { return _plains; }
+    int  slot()   { return _slot; }
+};
+
+// Reverse order (plain first, move second) - must keep conforming too.
+class OrderPlainFirst<T> : IOrderSink<T>
+{
+    T   _slot   = default;
+    int _moves  = 0;
+    int _plains = 0;
+    void put(T value) { _slot = value; _plains = _plains + 1; }
+    if const (!is_pointer(T)) { void put(move T value) { _slot = move value; _moves = _moves + 1; } }
+    int  moves()  { return _moves; }
+    int  plains() { return _plains; }
+    int  slot()   { return _slot; }
+};
+
+bool testConformanceOverloadOrder()
+{
+    bool result = true;
+
+    // Direct call selects the plain overload for a plain (copyable) argument.
+    OrderMoveFirst<int> mf = default;
+    int a = 5;
+    mf.put(a);
+    result &= Test("conf_order_mf_direct_plain", mf.plains(), 1);
+
+    // Dispatch through the plain interface must bind the plain overload, not the move one -
+    // a plain call must not transfer ownership. moves() stays 0.
+    IOrderSink<int> mfi = mf;
+    mfi.put(11);
+    result &= Test("conf_order_mf_iface_plains", mfi.plains(), 2);
+    result &= Test("conf_order_mf_iface_nomove", mfi.moves(),  0);
+    result &= Test("conf_order_mf_iface_slot",   mfi.slot(),   11);
+
+    // Reverse declaration order still conforms and dispatches the plain overload.
+    OrderPlainFirst<int> pf = default;
+    IOrderSink<int> pfi = pf;
+    pfi.put(22);
+    result &= Test("conf_order_pf_iface_plains", pfi.plains(), 1);
+    result &= Test("conf_order_pf_iface_nomove", pfi.moves(),  0);
+    result &= Test("conf_order_pf_iface_slot",   pfi.slot(),   22);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -2861,6 +2931,7 @@ extern int main()
     total++; passed += testSortEdgeCases()               ? 1 : 0;
     total++; passed += testIfConstMemberScope()          ? 1 : 0;
     total++; passed += testIfConstInterfaceScope()       ? 1 : 0;
+    total++; passed += testConformanceOverloadOrder()    ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

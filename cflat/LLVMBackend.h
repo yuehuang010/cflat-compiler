@@ -8163,6 +8163,34 @@ public:
      * deliberately absent: it is a selection key in VerifyInterfaceImplementation's match loop,
      * so a pointer mismatch is already reported there as "does not implement".
      */
+    /*
+     * Non-diagnostic mirror of VerifyInterfaceMethodContract's ownership comparisons: true when
+     * the class overload's qualifiers agree with the interface method on every axis the contract
+     * check enforces (sink-ness, bond, alias - params and return). Lets the caller pick, from all
+     * same-name same-signature overloads, any that conforms before deciding to report a mismatch.
+     */
+    bool InterfaceMethodContractConforms(const InterfaceMethod& method, const FunctionSymbol& sym) const
+    {
+        for (size_t i = 0; i < method.Parameters.size(); i++)
+        {
+            const auto& ip = method.Parameters[i];
+            const auto& cp = sym.Parameters[i + 1];   // Parameters[0] is the implicit 'this'
+            bool cpMove = cp.IsMove || cp.IsUniqueTypeArg;
+            bool ipMove = ip.IsMove || ip.IsUniqueTypeArg;
+            if (cpMove != ipMove) return false;
+            if (cp.IsBond != ip.IsBond) return false;
+            if (cp.IsAlias != ip.IsAlias) return false;
+        }
+        const auto& ir = method.ReturnType;
+        const auto& cr = sym.ReturnType;
+        bool crMove = cr.IsMove || cr.IsUniqueTypeArg;
+        bool irMove = ir.IsMove || ir.IsUniqueTypeArg;
+        if (crMove != irMove) return false;
+        if (cr.IsAlias != ir.IsAlias) return false;
+        if (cr.IsBond != ir.IsBond) return false;
+        return true;
+    }
+
     void VerifyInterfaceMethodContract(const std::string& implName, const std::string& ifaceName,
                                        const InterfaceMethod& method, const FunctionSymbol& sym)
     {
@@ -8310,6 +8338,7 @@ public:
             if (funcIt != functionTable.end())
             {
                 size_t expectedParamCount = 1 + method.Parameters.size();
+                llvm::Function* fallback = nullptr;
                 for (const auto& sym : funcIt->second)
                 {
                     if (sym.Parameters.size() != expectedParamCount) continue;
@@ -8320,8 +8349,15 @@ public:
                         if (sym.Parameters[1 + pi].TypeName != method.Parameters[pi].TypeName)
                         { paramsMatch = false; break; }
                     }
-                    if (paramsMatch) { fn = sym.Function; break; }
+                    if (paramsMatch)
+                    {
+                        // Prefer the overload whose ownership contract matches the interface method;
+                        // fall back to the first type-match if none conform (see GetOrCreateVTable).
+                        if (!fallback) fallback = sym.Function;
+                        if (InterfaceMethodContractConforms(method, sym)) { fn = sym.Function; break; }
+                    }
                 }
+                if (fn == nullptr) fn = fallback;
             }
             if (fn == nullptr)
             {
@@ -8395,6 +8431,7 @@ public:
                 // method.Parameters excludes 'this'; sym.Parameters[0] is 'this'.
                 // Match by struct this-pointer and remaining params to distinguish overloads.
                 size_t expectedParamCount = 1 + method.Parameters.size();
+                llvm::Function* fallback = nullptr;
                 for (const auto& sym : funcIt->second)
                 {
                     if (sym.Parameters.size() != expectedParamCount) continue;
@@ -8410,10 +8447,18 @@ public:
                     }
                     if (paramsMatch)
                     {
-                        fn = sym.Function;
-                        break;
+                        // Bind the overload whose ownership contract matches the interface method,
+                        // so dispatch honors the interface's move/alias/bond spelling regardless of
+                        // class declaration order. Fall back to the first type-match if none conform.
+                        if (!fallback) fallback = sym.Function;
+                        if (InterfaceMethodContractConforms(method, sym))
+                        {
+                            fn = sym.Function;
+                            break;
+                        }
                     }
                 }
+                if (fn == nullptr) fn = fallback;
             }
             if (fn == nullptr)
             {
@@ -10732,6 +10777,12 @@ public:
         for (const auto& method : ifaceIt->second)
         {
             bool found = false;
+            // A class may declare several overloads of the contract method that share the interface
+            // method's name/type/arity but differ in ownership qualifiers (e.g. a `move` and a plain
+            // 'set'). The class conforms if ANY of them satisfies the contract, so remember the first
+            // signature-matching candidate to blame only if none conform.
+            const FunctionSymbol* firstCandidate = nullptr;
+            bool anyConforms = false;
             auto funcIt = functionTable.find(method.Name);
             if (funcIt != functionTable.end())
             {
@@ -10754,13 +10805,17 @@ public:
                         }
                     }
 
-                    // Selection matched on type alone; the ownership qualifiers on the chosen
-                    // overload are contract and are validated separately (see the function).
+                    // Selection matches on type alone; the ownership qualifiers are contract and are
+                    // validated across all matching overloads below, accepting if any conforms.
                     if (paramsMatch)
                     {
                         found = true;
-                        VerifyInterfaceMethodContract(structName, interfaceName, method, sym);
-                        break;
+                        if (!firstCandidate) firstCandidate = &sym;
+                        if (InterfaceMethodContractConforms(method, sym))
+                        {
+                            anyConforms = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -10768,6 +10823,12 @@ public:
             if (!found)
             {
                 LogError(std::format("class '{}' does not implement '{}::{}'", structName, interfaceName, method.Name));
+            }
+            else if (!anyConforms)
+            {
+                // No overload agrees with the contract; report the ownership mismatch against the
+                // first signature-matching candidate so the diagnostic names a real overload.
+                VerifyInterfaceMethodContract(structName, interfaceName, method, *firstCandidate);
             }
         }
 
