@@ -79,9 +79,12 @@ but do not block this plan (containers allocate through their own machinery).
 - Factor the per-type release ladder out of `EmitDestructorsForScope` into one reusable
   helper: delete for thin `unique T*`, vtable-dtor+free for unique interface, full dtor for
   owning value/string/closure, no-op for borrows/primitives. Scope-exit calls it per local.
-- BONUS: this helper is the `drop <lvalue>;` primitive from the container brainstorm
-  (Option 1) - exposing it as a statement afterward is a small grammar+ParseStatement change
-  and collapses every `_releaseAt`/`_freeValue` ladder. Track that as its own follow-on.
+- BONUS: this helper backs the user-facing EXPLICIT RELEASE form. DECIDED (2026-07-23):
+  the one spelling is `_ = move <local>;` ("move to nowhere"). Two alternatives were
+  considered and REJECTED: a `drop` statement (new surface syntax; briefly shipped as a
+  soft keyword, then removed) and reusing `delete` (pointer-only reader intuition, and its
+  variable semantics are the opposite - delete leaves the name readable, release kills it).
+  Extending the release form collapses every `_releaseAt`/`_freeValue` ladder - follow-on.
 - Files: `cflat/LLVMBackend.h`. Verify: all suites green, zero test deltas.
 - Depends: none.
 
@@ -146,7 +149,8 @@ but do not block this plan (containers allocate through their own machinery).
 ### Part 6 - Container payoff: slot stores join the semantics, ladders collapse   [opus, medium risk]
 - Lift the deliberate single-index-GEP exclusion so `_data[i] = value` in generic code gets
   the total semantics; then collapse `_placeAt`/`_storeValue` in queue/stack/list/dictionary
-  to a plain store, and `_releaseAt`/`_freeValue` to `drop` (from Part 1's follow-on).
+  to a plain store, and `_releaseAt`/`_freeValue` to the explicit release
+  `_ = move _data[i];` (needs the Part 1 follow-on extended to subscript lvalues).
 - Two things to prove here:
   - drop-old on a DEAD slot is a no-op (containers zero moved-out slots; the leak matrix
     must show teardown/insert-over-dead-slot clean for every element kind);
@@ -158,8 +162,8 @@ but do not block this plan (containers allocate through their own machinery).
   `Test/test_collection_leaks.cb`.
 - Verify: full leak matrix green; container `if const` count drops to the policy split only.
 - Depends: 4, 5. Also unblocks re-visiting the read-side
-  `internal/issue/move-out-into-dropped-local-ownership.md` via `drop` instead of
-  move-into-dropped-local.
+  `internal/issue/move-out-into-dropped-local-ownership.md` via explicit release
+  (`_ = move`) instead of move-into-dropped-local.
 
 ### Cross-cutting constraints (every part)
 - Any change to type parsing goes in BOTH `ParseDeclarationSpecifiers` copies. Errors via
@@ -176,3 +180,102 @@ but do not block this plan (containers allocate through their own machinery).
 - 2026-07-22: probe matrix + code survey done; four soundness issues filed. Parts 1-3 are
   unconditional wins (bug fixes + refactor) and can proceed independently of the Part 4
   decision. Part 4 awaits maintainer sign-off on the copy-on-assign flip.
+- 2026-07-23: Parts 2-3 landed (all four unique-* soundness issues fixed + deleted; commits
+  ff55e6b/4d2a80d/ee8d279/454bf50). Part 4 THE FLIP SIGNED OFF by maintainer and SHIPPED:
+  copyable owners (string, closures already did, containers, structs with copy()) now COPY
+  on a NAMED-source `=` across all four contexts (4a local reassign, 4b decl-init, 4c field
+  + brace-init store, 4d deref store); non-copyable owners keep move-with-consume; borrows and
+  temp/call-result sources unchanged (xml.cb-style field borrows still alias). Predicate is the
+  shared `IsCopyableType` (LLVMBackend.h), which the is_copyable intrinsic now also calls; the
+  copy is emitted by `EmitCopyableOwnerCopy` (string -> deep copy, else copy() overload/synth).
+  Test deltas: 4 now-legal err tests deleted (err_container_copy_into_field, err_field_to_field_copy,
+  err_string_field_alias_via_local, err_string_owned_local_into_field); positive `testCopyOnAssignFlip`
+  added to test_move.cb; deref-assign + a field-to-field value-struct leg added to test_collection_leaks.cb.
+  REVIEW FIX (not in the agent's first pass): copyable value-STRUCT field-to-field (`b.f = a.f`)
+  double-copied (RejectOwningValueCopyIntoField AND the dedicated field-to-field block both copied),
+  orphaning the first copy = leak; fixed by threading an `outCopied` flag so the field-to-field block
+  only copies when Reject bailed. Regression leg added under the HeapAudit oracle.
+  Verified: test.sh 474/0/8, example_mac.sh 35/0, test_lsp.sh green. Remaining: Part 5 (unify the
+  hand-mirrored assignment paths) and Part 6 (container slot-store payoff) are the follow-ons.
+- 2026-07-23: Parts 1, 5, 6 all landed (uncommitted working tree at report time; Part 4 was
+  committed separately as 397ec21). Suites green throughout: test.sh 476/0/8 (cold+warm),
+  example_mac.sh 35/0, test_lsp.sh 152/0.
+  - PART 1 DONE. `DropValue(const NamedVariable&)` extracted from EmitDestructorsForScope (pure
+    verbatim refactor, zero delta) - the per-local release ladder is now one reusable method the
+    scope loop calls. Its follow-on explicit-release form is `_ = move <bare-local>;` (the canonical
+    spelling). It is intercepted in the `_ =` discard branch of ParseAssignmentExpression when the
+    RHS is a top-level `move` over a bare identifier naming a live local; it releases the local via
+    DropValue, nulls the slot, marks it moved (use-after = error). SPELLING DECISION (2026-07-23):
+    an earlier `drop <bare-local>;` soft-keyword statement was removed and reusing `delete` was
+    rejected - `_ = move` is the ONE spelling. Promoting it also fixed two latent leaks in the old
+    generic discard path (`_ = move` of a thin `unique T*` or owning-struct local leaked) and added
+    the missing moved-from marking. LIMITATION: only a bare-name local; NOT a subscript lvalue - that
+    gap is why Part 6 STEP D was deferred. Coverage: test_collection_leaks.cb leg +
+    err_discard_move_use_after.cb.
+  - PART 5 DONE (STEP 1; STEPS 2-3 deliberately deferred). The copy-vs-move source classification
+    (where the Part 4 bugs lived) is now ONE shared helper `ClassifyOwningAssignSource` routed
+    through decl-init, reassign, and deref - the hand-mirroring of that decision is gone. STEP 2
+    (route drop-old through DropValue) was NOT done: DropValue's alias/borrow/string-owned-bit skips
+    DIFFER from the current unconditional destruct-old, so swapping is not provably zero-delta (it
+    may even fix a latent double-free on reassign-over-alias) - left specialized per the plan's
+    "resists unification, leave it" clause. STEP 3 (field-store fold) already shares
+    RejectAliasStoreIntoField/RejectOwningValueCopyIntoField; the rest is genuinely path-specific.
+  - PART 6 DONE - MAXIMAL insert-side collapse achieved. The single-index-GEP exclusion is LIFTED
+    (MainListener.h, new gated block ~10186): a `_data[i] = value` store of a NAMED owning source
+    (alloca/global-backed param/local) into a container slot now defers to T via the shared
+    ClassifyOwningAssignSource/EmitCopyableOwnerCopy/CloneClosureFromNamedSource - COPY a copyable
+    owner, MOVE+consume a non-copyable/unique, CLONE a closure. So `_placeAt`/`_placeValueAt`
+    collapsed to a SINGLE LINE `_data[index] = value;` (zero if const) in queue/stack/list/dictionary
+    - the 5-way is_unique/is_pointer/is_primitive/!is_copyable ladder is gone (if const per container:
+    queue/stack 11->7, list 20->16, dictionary 32->28). KEY SOUNDNESS FINDING (hit the hard gate,
+    fixed soundly not reverted): the lifted slot store must NOT drop-old - a container writes only
+    into a DEAD/EMPTY slot (set() calls _releaseAt first), and drop-old there double-destructs the
+    default-constructed slot (a `list<Val>` with a side-effecting dtor proved it: count 3 != 2).
+    Removing drop-old fixed it and also mooted the interface-slot-not-zeroed hazard (garbage slots
+    are overwritten, never read). Gated to owning element types so raw non-owning arrays and
+    grow-loop GEP-source moves (`newData[i] = move _data[j]`) fall through untouched. Leak matrix
+    333/333 HeapAudit-clean across every element kind (int, POD, string, Holder{unique R*}, R*,
+    unique R*, IShape, unique IShape).
+  - STILL if const (accepted): the enqueue/add METHOD-LEVEL is_copyable split (it controls SINK-ness
+    - whether the caller's arg is consumed - via `move value` in the non-copyable arm, not store
+    semantics; keeping it is the plan's accepted sink-inference fallback), and `_releaseAt`/`_freeValue`
+    (Part 6 STEP D, the teardown-side explicit-release collapse, deferred - needs `_ = move` extended
+    to a subscript lvalue, a separate riskier codegen change). These are the only remaining container
+    if const.
+  - OPEN FOLLOW-ONS (not blocking): Part 5 STEP 2 (DropValue-based drop-old unification, which may
+    surface/fix a latent reassign-over-alias double-free); Part 7 (member-wise move hook, from the
+    sibling plan).
+- 2026-07-23 (Part 5 STEP 2 INVESTIGATED - recommend NOT doing the unification; no correctness
+  payoff). Probed the "may fix a latent reassign-over-alias double-free" hypothesis with a HeapAudit
+  probe. The double-free is REAL but its source is NOT the drop-old scatter STEP 2 would touch: a
+  plain `Res b = a;` (no alias, no reassign) of a value struct with a USER destructor over a RAW
+  pointer (no `unique`, no `copy()`) shallow bit-copies -> two owners -> double-free. Root cause is
+  `IsCopyableType` mis-classifying such a struct as copyable (only checks `TypeOwnsUniquePointer`,
+  blind to raw-pointer-with-user-dtor); `ClosureCaptureDeepCopyable` already guards the identical
+  hazard. Filed `internal/issue/copy-of-user-dtor-raw-pointer-struct-double-frees.md` (FLIP-adjacent,
+  needs delta enumeration + sign-off). CONCLUSION: STEP 2 routing drop-old through DropValue would
+  NOT fix this and has no other correctness payoff - it is pure cosmetic unification of very delicate
+  code with a real regression risk. Per the plan's "resists unification, leave it" clause, STEP 2
+  stays deferred. Also filed `internal/issue/discard-move-vs-decl-move-element-ownership-disparity.md`
+  (the `_ = move <element>` vs `T tmp = move <element>` gap from Part 6 STEP D).
+- 2026-07-23 (STEP D DONE - collapse via `T tmp = move`, NOT `_ = move`). The `_ = move _data[i]`
+  route was ABANDONED after a design probe: container element ownership (`unique` vs borrow) is a
+  GENERIC-TYPE-BINDING property (only in activeTypeSubstitutions, what is_unique(T) reads), ABSENT
+  from the element lvalue - `queue<unique Box*>` and `queue<Box*>` share a byte-identical `Box**`
+  buffer and a slot read demotes to a bare `Box*` (IsUnique=0). A `_`-discard has no destination type
+  to recover ownership from, so it silently stripped owned elements -> leak. Fable adjudicated the
+  fork: use a real `T tmp = move _data[i];` local (a T-typed decl DOES carry ownership via
+  substitution) and FIX the underlying move-out-into-a-dropped-local bug (the plan's "Stage 3
+  enabler"; issue move-out-into-dropped-local-ownership.md now DELETED). Root cause: two element-move
+  branches in ParseMoveExpression conferred ownership blind to the demoted element kind - the pointer
+  branch set lastOwningResult unconditionally (bare `T*` element -> spurious delete -> double-free),
+  the interface branch set nothing (`unique <iface>` element -> under-owned -> leak). Fix: a compiler
+  flag `lastMovedFromContainerSlot` (set on an IsElementAccess move, reset at ParseAssignmentExpression
+  entry AND in ResetForReanalysis) gates a decl-init override that RE-DERIVES the dropped local's
+  ownership from the DESTINATION type (IsUniqueTypeArg): unique thin-ptr / unique interface -> owning;
+  bare ptr / bare interface -> non-owning; value/string untouched. Strictly gated to element-slot
+  sources, so `Box* b = move owned;` (named local) stays source-keyed and the dequeue RETURN path
+  (returnedStructDtorSkipAlloca) is unaffected. Collapsed queue/stack/list `_releaseAt` and dictionary
+  `_releaseValueAt` to one line (array.cb + dictionary KEY release left as-is). Verified: leak matrix
+  352/352 (19 new in-body-drop legs across every element kind), test.sh 476/0/8, example_mac 35/0,
+  test_lsp 152/0. Only remaining container if const: the enqueue/add is_copyable SINK split (accepted).

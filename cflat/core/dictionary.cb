@@ -132,24 +132,23 @@ struct dictionary<K, V>
     // interface value, so it covers every borrowed spelling.
     void _placeValueAt(int index, V value)
     {
-        if const (is_unique(V))         _values[index] = move value;
-        else if const (is_pointer(V))   _values[index] = value;
-        else if const (is_primitive(V)) _values[index] = value;
-        else if const (!is_copyable(V)) _values[index] = move value;
-        else                            _values[index] = value.copy();
+        // Part 6: the value slot store defers entirely to V via the total-assignment semantics - a
+        // COPYABLE owner COPIES into the slot, a `unique` pointer or interface TRANSFERS (its
+        // by-value param is a move sink, consumed with no keyword), a bare pointer / interface
+        // BORROW aliases, a primitive copies. It does NOT drop the old slot: a live slot is released
+        // by the caller first, so this only ever writes an EMPTY slot. The old 5-way
+        // is_unique/is_pointer/is_primitive/!is_copyable ladder is gone. The KEY side is untouched.
+        _values[index] = value;
     }
 
-    // Release the value in a live slot: `unique` is freed, a value type is destructed, a bare
-    // pointer or interface value is left to its real owner.
+    // Release the value in a live slot by moving it into a local and letting that local drop:
+    // ownership DEFERS to V, so no `if const`. A `unique` value (thin `unique V*` or a `unique`
+    // interface fat pointer) transfers into `tmp` and its drop frees it once; a bare pointer /
+    // interface BORROW transfers a borrow and its drop frees nothing; a value type / string is
+    // moved out and destructed by the drop. `move _values[index]` nulls the moved-from slot.
     void _releaseValueAt(int index)
     {
-        if const (is_unique(V))
-        {
-            if (_values[index] != nullptr) delete _values[index];
-        }
-        else if const (is_pointer(V))   { }
-        else if const (is_primitive(V)) { }
-        else                            _values[index].~();
+        V tmp = move _values[index];
     }
 
     // Free a value handed to add() as a synthesized move sink that the dictionary is refusing

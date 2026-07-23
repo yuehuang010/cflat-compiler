@@ -979,6 +979,11 @@ public:
     TypeAndValue lastCallReturnType;        // set by CreateOverloadedFunctionCall for post-call TypeAndValue queries
     bool lastCallReturnsOwned = false;       // set when the last call returned an owned heap string or pointer
     bool lastOwningResult = false;           // set by ParseNewExpression/ParseMoveExpression; consumed by ParseDeclaration
+    // Set by ParseMoveExpression when the move source is a container element SLOT (`move _data[i]`,
+    // a single-index-GEP subscript); consumed by ParseDeclaration to re-derive a dropped local's
+    // ownership from the DEST type (the element read demoted `unique` away). Reset at the start of
+    // ParseAssignmentExpressionNamed alongside lastOwningResult, so it reflects only THIS RHS.
+    bool lastMovedFromContainerSlot = false;
     uint64_t lastAllocAlignment = 0;         // set by ParseNewExpression for `new T[n] alignas(N)` (>16); consumed by ParseDeclaration into NamedVariable.AllocAlignment
     // Inbound alloc-align channel (symmetric to lastAllocAlignment). Set from the target
     // declaration's AllocAlignValue BEFORE evaluating a DIRECT `new` initializer/RHS; a bare
@@ -1660,6 +1665,22 @@ private:
         return {};
     }
 
+    // Return the live NamedVariable a name binds to (namedVariable then functionArgument, inner
+    // scope first), or nullptr. The `drop` statement needs the same object scope-exit cleanup
+    // reads so a value is released identically both ways.
+    NamedVariable* FindLiveNamedVariable(const std::string& name)
+    {
+        if (name.empty()) return nullptr;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                return &it->second;
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                return &it->second;
+        }
+        return nullptr;
+    }
+
     bool IsVariableOwningString(const std::string& name) const
     {
         if (name.empty()) return false;
@@ -2035,6 +2056,82 @@ private:
         ownedReturnTemps_.clear();
     }
 
+    // Release the resource a single named local owns, exactly as scope-exit cleanup does. Borrows,
+    // primitives, and moved/aliased locals are no-ops. Shared by EmitDestructorsForScope and the
+    // `drop` statement so a value is released identically at scope exit and on explicit drop.
+    void DropValue(const NamedVariable& namedVar)
+    {
+        // A `unique` interface local owns a heap-boxed object: free it via the vtable dtor slot
+        // + operator delete (mirrors the owning-pointer path; data field nulled so a prior delete no-ops).
+        if (IsOwningUniqueArray(namedVar))
+        {
+            EmitOwningUniqueArrayCleanup(namedVar);
+            return;
+        }
+        if (IsOwningInterfaceValue(namedVar))
+        {
+            EmitOwningInterfaceCleanup(namedVar);
+            return;
+        }
+        if (namedVar.TypeAndValue.Pointer && namedVar.IsOwning)
+        {
+            if (namedVar.RefCountStorage == nullptr)
+            {
+                EmitOwningPtrCleanup(namedVar);
+            }
+            else
+            {
+                auto* cur = builder->CreateLoad(builder->getInt32Ty(), namedVar.RefCountStorage);
+                auto* dec = builder->CreateSub(cur, builder->getInt32(1), "refdec");
+                builder->CreateStore(dec, namedVar.RefCountStorage);
+                EmitConditionalOwningPtrCleanup(namedVar, dec);
+            }
+            return;
+        }
+        if (namedVar.TypeAndValue.Pointer) return;
+        auto it = dataStructures.find(namedVar.TypeAndValue.TypeName);
+        if (it != dataStructures.end())
+        {
+            // String dtor is emitted unconditionally - the runtime OWNED bit (_len high bit) decides.
+            // Legacy IsOwningString skipped genuinely-owned strings the compiler couldn't prove owned, leaking their buffer.
+            if (namedVar.TypeAndValue.TypeName == "string")
+            {
+                if (namedVar.BorrowsOwnedString || namedVar.IsAliasBorrow) return;
+                EnsureStringDtorRegistered();
+                if (it->second.Destructor == nullptr) return;
+                EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType,
+                                              it->second.Destructor);
+                return;
+            }
+            // Non-string struct local: run the full destructor (user dtor + members).
+            // Skip an `alias`-bound local - it borrows storage it does not own (double-free).
+            if (namedVar.IsAliasBorrow) return;
+            // Skip the struct value being moved out via `return` - the caller now owns it.
+            if (namedVar.Storage == returnedStructDtorSkipAlloca) return;
+            // A fixed-array local (`T[N] a;`) owns every element - destruct all N.
+            if (auto* fn = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+                EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, fn);
+        }
+    }
+
+    // True when DropValue would release a real resource for this local (owning ptr/interface/
+    // array/struct/string). Borrows, primitives, aliased/return-moved locals own nothing, so an
+    // explicit `drop` on them is a harmless no-op. Mirrors DropValue's branch conditions exactly.
+    bool OwnsDroppableResource(const NamedVariable& namedVar) const
+    {
+        if (IsOwningUniqueArray(namedVar)) return true;
+        if (IsOwningInterfaceValue(namedVar)) return true;
+        if (namedVar.TypeAndValue.Pointer && namedVar.IsOwning) return true;
+        if (namedVar.TypeAndValue.Pointer) return false;
+        auto it = dataStructures.find(namedVar.TypeAndValue.TypeName);
+        if (it == dataStructures.end()) return false;
+        if (namedVar.TypeAndValue.TypeName == "string")
+            return !(namedVar.BorrowsOwnedString || namedVar.IsAliasBorrow);
+        if (namedVar.IsAliasBorrow) return false;
+        if (namedVar.Storage == returnedStructDtorSkipAlloca) return false;
+        return true;
+    }
+
     void EmitDestructorsForScope(const StackState& frame)
     {
         if (!IsInsertBlockLive())
@@ -2050,57 +2147,7 @@ private:
 
         for (const auto& [varName, namedVar] : frame.namedVariable)
         {
-            // A `unique` interface local owns a heap-boxed object: free it via the vtable dtor slot
-            // + operator delete (mirrors the owning-pointer path; data field nulled so a prior delete no-ops).
-            if (IsOwningUniqueArray(namedVar))
-            {
-                EmitOwningUniqueArrayCleanup(namedVar);
-                continue;
-            }
-            if (IsOwningInterfaceValue(namedVar))
-            {
-                EmitOwningInterfaceCleanup(namedVar);
-                continue;
-            }
-            if (namedVar.TypeAndValue.Pointer && namedVar.IsOwning)
-            {
-                if (namedVar.RefCountStorage == nullptr)
-                {
-                    EmitOwningPtrCleanup(namedVar);
-                }
-                else
-                {
-                    auto* cur = builder->CreateLoad(builder->getInt32Ty(), namedVar.RefCountStorage);
-                    auto* dec = builder->CreateSub(cur, builder->getInt32(1), "refdec");
-                    builder->CreateStore(dec, namedVar.RefCountStorage);
-                    EmitConditionalOwningPtrCleanup(namedVar, dec);
-                }
-                continue;
-            }
-            if (namedVar.TypeAndValue.Pointer) continue;
-            auto it = dataStructures.find(namedVar.TypeAndValue.TypeName);
-            if (it != dataStructures.end())
-            {
-                // String dtor is emitted unconditionally - the runtime OWNED bit (_len high bit) decides.
-                // Legacy IsOwningString skipped genuinely-owned strings the compiler couldn't prove owned, leaking their buffer.
-                if (namedVar.TypeAndValue.TypeName == "string")
-                {
-                    if (namedVar.BorrowsOwnedString || namedVar.IsAliasBorrow) continue;
-                    EnsureStringDtorRegistered();
-                    if (it->second.Destructor == nullptr) continue;
-                    EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType,
-                                                  it->second.Destructor);
-                    continue;
-                }
-                // Non-string struct local: run the full destructor (user dtor + members).
-                // Skip an `alias`-bound local - it borrows storage it does not own (double-free).
-                if (namedVar.IsAliasBorrow) continue;
-                // Skip the struct value being moved out via `return` - the caller now owns it.
-                if (namedVar.Storage == returnedStructDtorSkipAlloca) continue;
-                // A fixed-array local (`T[N] a;`) owns every element - destruct all N.
-                if (auto* fn = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
-                    EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, fn);
-            }
+            DropValue(namedVar);
         }
 
         // Clean up owning function parameters (move params)
@@ -3499,6 +3546,24 @@ private:
             if (!sym.Parameters.empty() && sym.Parameters[0].TypeName == typeName)
                 return true;
         return false;
+    }
+
+    // True when a value of `typeName` can be COPIED (an independent duplicate) rather than
+    // requiring a move. Mirrors the is_copyable intrinsic exactly: strip ownership qualifiers,
+    // then a pointer or a non-struct type (string, primitives, closures) is copyable; a struct
+    // is copyable iff it has a copy() overload or does not transitively own a `unique` pointer.
+    // This is the predicate for the copy-on-assign flip (copyable owners copy, non-copyable move).
+    bool IsCopyableType(const std::string& typeNameIn) const
+    {
+        std::string base = typeNameIn;
+        // Strip a leading ownership qualifier ("unique " / "alias "); they are mutually exclusive.
+        if (base.rfind("unique ", 0) == 0) base = base.substr(7);
+        else if (base.rfind("alias ", 0) == 0) base = base.substr(6);
+        if (base.empty()) return false;
+        if (base.back() == '*') return true;
+        if (dataStructures.count(base) == 0) return true;
+        if (HasCopyOverloadFor(base)) return true;
+        return !TypeOwnsUniquePointer(base);
     }
 
     // True when `typeName` has an AUTHOR-written (library/user) copy() - not the memberwise

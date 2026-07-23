@@ -49,28 +49,24 @@ class queue<T>
     // consumes x. `is_pointer(T)` covers bare, `unique`, `alias` and interface spellings.
     void _placeAt(int index, T value)
     {
-        if const (is_unique(T))         _data[index] = move value;
-        else if const (is_pointer(T))   _data[index] = value;
-        else if const (is_primitive(T)) _data[index] = value;
-        else if const (!is_copyable(T)) _data[index] = move value;
-        else                            _data[index] = value.copy();
+        // Part 6: the slot store defers entirely to T via the total-assignment semantics - a
+        // COPYABLE owner (string, a struct with copy()) COPIES into the slot, a `unique` pointer or
+        // interface TRANSFERS (its by-value param is a move sink, consumed with no keyword), a bare
+        // pointer / interface BORROW aliases, a primitive copies. It does NOT drop the old slot: a
+        // live slot is released by the caller first, so this only ever writes an EMPTY slot. The old
+        // 5-way is_unique/is_pointer/is_primitive/!is_copyable ladder is gone.
+        _data[index] = value;
     }
 
-    // Release the element in a live slot: `unique` is freed, a value type is destructed, a
-    // bare pointer or interface is left to its real owner. NOTE: this still needs `if const`.
-    // The `T value = move _data[index]` collapse is UNSOUND at teardown - the compiler mishandles
-    // a move-out-into-a-dropped-local for two element kinds: a bare pointer BORROW over-owns
-    // (drop emits a spurious `delete` -> double-free) and a `unique` INTERFACE under-owns (drop
-    // frees nothing -> leak). Both are compiler gaps; the collapse waits on the Stage 3 enabler.
+    // Release the element in a live slot by moving it into a local and letting that local drop:
+    // ownership DEFERS to T, so no `if const`. A `unique` element (thin `unique T*` or a `unique`
+    // interface fat pointer) transfers into `tmp` and its drop frees it once; a bare pointer /
+    // interface BORROW transfers a borrow and its drop frees nothing; a value type / string is
+    // moved out and destructed by the drop. `move _data[index]` nulls the moved-from slot, so the
+    // buffer teardown below never sees a live element there.
     void _releaseAt(int index)
     {
-        if const (is_unique(T))
-        {
-            if (_data[index] != nullptr) delete _data[index];
-        }
-        else if const (is_pointer(T))   { }
-        else if const (is_primitive(T)) { }
-        else                            _data[index].~();
+        T tmp = move _data[index];
     }
 
     // Drop the front slot after its element has been handed out.

@@ -340,6 +340,24 @@ extern int main()
         total++; passed += Test("split(char) trailing empty", segs.get(3), "");
     }
 
+    // === `_ = move <local>;` explicitly releases an owning local; scope-exit must not double-free ===
+    // Releasing a string / unique pointer / owning container frees its buffer NOW; the slot is nulled
+    // so the scope-exit destructor is a no-op. HeapAudit (reportLeaks below) proves no leak and no
+    // double-free. A borrow/primitive release is a harmless no-op, so the value stays usable.
+    {
+        string s = "a long enough string to force a heap buffer allocation here";
+        total++; passed += Test("release precheck len", (int)s.length(), 59);
+        _ = move s;                        // frees the buffer now; scope exit sees a nulled slot
+
+        list<string> ls = {"one", "two", "three"};
+        total++; passed += Test("release list precheck", ls.count(), 3);
+        _ = move ls;                       // frees the list and its owned elements now
+
+        int keep = 41;
+        _ = move keep;                     // primitive: no-op, still usable
+        total++; passed += Test("release primitive is no-op", keep, 41);
+    }
+
     // === Bug 2a: list<string>.set overwrites and frees the old owning element ===
     {
         list<string> ls = {"aaa", "bbb", "ccc"};
@@ -1370,6 +1388,24 @@ extern int main()
         total++; passed += Test("queue<val> dequeue 1", qs.dequeue(), "orig");
         total++; passed += Test("queue<val> enqueue(move) transfers", qs.dequeue(), "moved");
 
+        // Leave LIVE owning-string elements at scope exit: many COPY-inserts (forcing several
+        // _grow()s), a partial dequeue, then more inserts, and NO final drain. Each insert stores
+        // into a fresh/grown slot, so the total-assignment drop-old must be a no-op there; the
+        // queue destructor then releases every live slot exactly once. The named source stays
+        // independently owned and frees once at its own scope exit (COPY, not alias/move).
+        {
+            queue<string> ql;
+            int qi2 = 0;
+            while (qi2 < 12) { ql.enqueue("q" + qi2.toString()); qi2++; }   // grows repeatedly (copy-in)
+            total++; passed += Test("queue<val> live-teardown count", ql.count(), 12);
+            total++; passed += Test("queue<val> live-teardown front", ql.dequeue(), "q0");   // one out
+            string qkeep = "ke" + "ep";
+            ql.enqueue(qkeep);                                              // COPY a named local in
+            total++; passed += Test("queue<val> live-teardown source live", qkeep, "keep");
+            total++; passed += Test("queue<val> live-teardown mid", ql.peek(), "q1");
+            // ql leaves scope here holding 12 live owning strings -> all freed exactly once
+        }
+
         stack<string> ss;
         string ssrc = "or" + "ig";
         ss.push(ssrc);
@@ -1512,12 +1548,13 @@ extern int main()
         total++; passed += Test("stack<noncopy> teardown frees both slots", g_shapeDtor, 2);
     }
 
-    // === Whole-struct assignment through a pointer deref (`*pc = *pa`) auto-moves ===
+    // === Whole-struct assignment through a pointer deref (`*pc = *pa`) ===
     // A shallow bitwise store used to alias owned buffers (both dtors free -> double-free) and
-    // orphan the destination's old value (leak). The deref lvalue is now recognized as an owning
-    // destination: the old destination is destructed, the source moved in, and the source zeroed
-    // so its dtor is a no-op. The leak oracle below proves single-owner freedom for both a `unique`
-    // pointer field and a plain owning `string` field (the hole was general, not `unique`-specific).
+    // orphan the destination's old value (leak). The deref lvalue is now an owning destination:
+    // the old destination is destructed first, then the source is transferred in. Per THE FLIP,
+    // a NON-copyable owner (`unique` payload) MOVES - the source is zeroed; a COPYABLE owner
+    // (a plain owning `string` field) COPIES - the source stays LIVE and gets an independent
+    // buffer. The leak oracle below proves single-owner freedom for both.
     {
         LeakUnique a = default;
         LeakUnique c = default;
@@ -1525,7 +1562,7 @@ extern int main()
         c.slot = new LeakPayload(); c.slot->nums.add(99);   // c's old payload must be freed on the store
         LeakUnique* pa = &a;
         LeakUnique* pc = &c;
-        *pc = *pa;                                          // move a's payload into c; a.slot zeroed
+        *pc = *pa;                                          // non-copyable: move a's payload into c; a.slot zeroed
         total++; passed += Test("deref-assign unique source zeroed", a.slot == nullptr, true);
         total++; passed += Test("deref-assign unique dest owns moved", c.slot->nums.get(0), 41);
 
@@ -1535,9 +1572,23 @@ extern int main()
         sc.name = "ol" + "d";                               // owned "old" - freed on the store
         LeakRow* spa = &sa;
         LeakRow* spc = &sc;
-        *spc = *spa;                                        // move sa.name into sc; sa.name zeroed
-        total++; passed += Test("deref-assign string dest owns moved", sc.name, "deref");
-        total++; passed += Test("deref-assign string source zeroed", sa.name.length(), 0);
+        *spc = *spa;                                        // copyable: COPY sa.name into sc; sa stays live
+        total++; passed += Test("deref-assign string dest owns copy", sc.name, "deref");
+        total++; passed += Test("deref-assign string source stays live", sa.name, "deref");
+    }
+
+    // === Field-to-field copy of a copyable owning VALUE STRUCT (`b.f = a.f`) ===
+    // THE FLIP copies a copyable owner field-to-field, leaving the source field live. The copy runs
+    // through RejectOwningValueCopyIntoField; the dedicated field-to-field block must NOT copy a
+    // second time (that orphaned the first copy - a leak the oracle below catches). The old
+    // destination field is destructed before the copy is stored.
+    {
+        LeakBox a = default; a.nums.add(1); a.nums.add(2);
+        LeakBox b = default; b.nums.add(9);                 // b's old list freed on the store
+        b.nums = a.nums;                                    // copyable value struct: single copy
+        b.nums.add(3);
+        total++; passed += Test("field-to-field src list stays independent", a.nums.count(), 2);
+        total++; passed += Test("field-to-field dest list is an independent copy", b.nums.count(), 3);
     }
 
     // === Owning fixed-array FIELD: full destruction + independent deep copy ===
@@ -1587,6 +1638,112 @@ extern int main()
             total++; passed += Test("bare list<iface> view frees nothing", g_shapeDtor, 0);
         }
         total++; passed += Test("bare list<iface> owner frees all", g_shapeDtor, 2);
+    }
+
+    // === STEP D: `_releaseAt` collapse - in-body drop of a moved-out element over EVERY kind ===
+    // list.set()/list.removeAt() release the old/removed element by `T tmp = move _data[i]` and let
+    // tmp DROP in-body (not returned) - the exact path the container-teardown collapse relies on.
+    // Ownership must defer to T: a bare-pointer / interface BORROW frees nothing (a spurious free
+    // double-frees), `unique` (thin ptr AND fat interface) and owning values free exactly once.
+    {
+        // int: primitive, drop is a no-op.
+        {
+            list<int> li = {10, 20, 30};
+            li.removeAt(1);
+            total++; passed += Test("releaseAt int removeAt count", li.count(), 2);
+            li.set(0, 99);
+            total++; passed += Test("releaseAt int set", li.get(0), 99);
+        }
+        // POD struct: no owning fields, drop frees nothing.
+        {
+            list<QPoint> lq = default;
+            QPoint a = default; a.x = 1; a.y = 2; lq.add(a);
+            QPoint b = default; b.x = 3; b.y = 4; lq.add(b);
+            lq.removeAt(0);
+            total++; passed += Test("releaseAt POD removeAt count", lq.count(), 1);
+            QPoint c = default; c.x = 5; c.y = 6; lq.set(0, c);
+            total++; passed += Test("releaseAt POD set", lq.get(0).x, 5);
+        }
+        // string: owning value, drop destructs the buffer (leak / double-free caught by the oracle).
+        {
+            list<string> ls = {"aaa", "bbb", "ccc"};
+            ls.removeAt(1);                    // "bbb" destructed in-body via the moved-out local
+            total++; passed += Test("releaseAt string removeAt", ls.get(1), "ccc");
+            ls.set(0, plainOwnedStr(7));       // old "aaa" destructed in-body
+            total++; passed += Test("releaseAt string set", ls.get(0), "owned7");
+        }
+        // owning value struct with a `unique` member: drop runs the synthesized destructor (frees
+        // the held PtrLeak once). Non-copyable, so add/set use the move overload.
+        {
+            g_shapeDtor = 0;
+            list<LeakHolder> lh = default;
+            LeakHolder h0 = default; h0.slot = new PtrLeak(); h0.k = 1; lh.add(move h0);
+            LeakHolder h1 = default; h1.slot = new PtrLeak(); h1.k = 2; lh.add(move h1);
+            lh.removeAt(0);                    // frees h0's PtrLeak in-body
+            total++; passed += Test("releaseAt owning-val removeAt frees member", g_shapeDtor, 1);
+            LeakHolder h2 = default; h2.slot = new PtrLeak(); h2.k = 3; lh.set(0, move h2);
+            total++; passed += Test("releaseAt owning-val set frees old member", g_shapeDtor, 2);
+        }
+        // bare P* BORROW: the list never owned the pointee - the in-body drop must free NOTHING (a
+        // spurious delete here is the double-free the fix removed). The caller frees them.
+        {
+            g_shapeDtor = 0;
+            PtrLeak* p0 = new PtrLeak();
+            PtrLeak* p1 = new PtrLeak();
+            list<PtrLeak*> lp = default;
+            lp.add(p0);
+            lp.add(p1);
+            lp.removeAt(0);                    // borrow: frees nothing
+            total++; passed += Test("releaseAt bare-ptr removeAt frees nothing", g_shapeDtor, 0);
+            lp.set(0, p0);                     // overwrite with a borrow: frees nothing
+            total++; passed += Test("releaseAt bare-ptr set frees nothing", g_shapeDtor, 0);
+            delete p0; delete p1;              // caller owns both
+            total++; passed += Test("releaseAt bare-ptr caller frees both", g_shapeDtor, 2);
+        }
+        // `unique P*` thin pointer: the list OWNS - the in-body drop frees the removed / overwritten
+        // pointee exactly once.
+        {
+            g_shapeDtor = 0;
+            list<unique PtrLeak*> lu = default;
+            lu.add(new PtrLeak());
+            lu.add(new PtrLeak());
+            lu.removeAt(0);                    // frees the removed pointee
+            total++; passed += Test("releaseAt unique-ptr removeAt frees one", g_shapeDtor, 1);
+            lu.set(0, new PtrLeak());          // frees the overwritten pointee
+            total++; passed += Test("releaseAt unique-ptr set frees old", g_shapeDtor, 2);
+        }
+        // IShapeLeak BORROW: bare interface value, the list frees nothing on the in-body drop.
+        {
+            g_shapeDtor = 0;
+            {
+                list<unique IShapeLeak> owner;
+                owner.add(new CircleLeak());
+                owner.add(new CircleLeak());
+                {
+                    list<IShapeLeak> view;
+                    view.add(owner.get(0));
+                    view.add(owner.get(1));
+                    view.removeAt(0);          // borrow: frees nothing
+                    total++; passed += Test("releaseAt iface-borrow removeAt frees nothing", g_shapeDtor, 0);
+                    view.set(0, owner.get(1)); // overwrite borrow: frees nothing
+                    total++; passed += Test("releaseAt iface-borrow set frees nothing", g_shapeDtor, 0);
+                }
+                total++; passed += Test("releaseAt iface-borrow view no free", g_shapeDtor, 0);
+            }                                  // owner frees both boxes here
+            total++; passed += Test("releaseAt iface-borrow owner frees all", g_shapeDtor, 2);
+        }
+        // `unique IShapeLeak` fat pointer: the list OWNS - the in-body drop frees the boxed object
+        // via the vtable dtor slot exactly once (the leak the fix closed).
+        {
+            g_shapeDtor = 0;
+            list<unique IShapeLeak> lui = default;
+            lui.add(new CircleLeak());
+            lui.add(new CircleLeak());
+            lui.removeAt(0);                   // frees the removed box via the vtable dtor
+            total++; passed += Test("releaseAt unique-iface removeAt frees box", g_shapeDtor, 1);
+            lui.set(0, new CircleLeak());      // frees the overwritten box
+            total++; passed += Test("releaseAt unique-iface set frees old box", g_shapeDtor, 2);
+        }
     }
 
     // === Scalar `unique` interface local/param teardown (the stage-5 leak, finally fixed) ===

@@ -2468,6 +2468,7 @@ void LLVMBackend::ResetForReanalysis()
     lastCallReturnType = TypeAndValue{};
     lastCallReturnsOwned = false;
     lastOwningResult = false;
+    lastMovedFromContainerSlot = false;
     lastAllocAlignment = 0;
     currentFunctionReturnsOwned = false;
     // Siblings of currentFunctionReturnsOwned, set together in createFunctionBlock; an aborted

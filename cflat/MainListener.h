@@ -7329,6 +7329,56 @@ public:
         }
     }
 
+    // Descend a single-child expression chain from `ctx` to a top-level `move` expression, if one
+    // is the entire expression. Returns null when any operator (binary, unary, sizeof, cast) sits
+    // above the move, since then the move is not the whole RHS.
+    static CFlatParser::MoveExpressionContext* TopLevelMoveExpression(antlr4::tree::ParseTree* node)
+    {
+        while (node != nullptr)
+        {
+            if (auto* mv = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
+                return mv;
+            if (node->children.size() != 1) return nullptr;
+            node = node->children[0];
+        }
+        return nullptr;
+    }
+
+    // True when `text` is a single bare identifier (no `.`, `[`, `(`, `*`, etc.), so a `move <text>`
+    // names a variable rather than a field/index/call/deref.
+    static bool IsBareIdentifierText(const std::string& text)
+    {
+        if (text.empty() || (!std::isalpha((unsigned char)text[0]) && text[0] != '_'))
+            return false;
+        for (char c : text)
+            if (!std::isalnum((unsigned char)c) && c != '_') return false;
+        return true;
+    }
+
+    // Explicitly release a live owning local NOW (the `_ = move x;` form): run the same per-type
+    // teardown scope exit uses, null the slot so exit is a no-op, and mark the local moved-from so
+    // a later read is a compile error. Borrows and primitives own no resource - a harmless no-op.
+    void ReleaseOwningLocalNow(antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable* nv,
+                               const std::string& name)
+    {
+        auto* compiler = Compiler(ctx);
+        compiler->SetCurrentDebugLocation(ctx->getStart()->getLine());
+        if (nv->IsMoved || nv->MovedIntoInterface)
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot discard '{}': it was already moved", name));
+            return;
+        }
+        if (!compiler->OwnsDroppableResource(*nv))
+            return;
+        compiler->DropValue(*nv);
+        if (nv->Storage != nullptr && nv->BaseType != nullptr)
+            compiler->builder->CreateStore(llvm::Constant::getNullValue(nv->BaseType), nv->Storage);
+        nv->IsOwning = false;
+        nv->RefCountStorage = nullptr;
+        compiler->MarkVariableMoved(name);
+    }
+
     std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CFlatParser::DeclarationSpecifiersContext* declSpec, CFlatParser::InitDeclaratorListContext* initDecl, const std::string& namespaceName = {})
     {
         auto* compiler = Compiler(declSpec);
@@ -7527,6 +7577,7 @@ public:
                 llvm::Value* srcStorage = nullptr;
                 llvm::Type* srcBaseType = nullptr;
                 bool srcIsMove = false;
+                bool srcMovedFromSlot = false;
                 std::string srcCallerName;
                 // True when the initializer is (or transitively aliases) an owning string FIELD,
                 // e.g. `string t = b.name;`. Such a local borrows a heap buffer some struct still
@@ -8194,6 +8245,14 @@ public:
 
                     if (right != nullptr)
                     {
+                        // Consume the container-element-slot move signal HERE, at the point common to
+                        // both the interface and non-interface init branches (each parsed the RHS in
+                        // its own branch), and BEFORE CreateAssignment could parse a nested element
+                        // move (brace init). ParseAssignmentExpressionNamed reset it at RHS entry, so
+                        // it reflects only THIS initializer's top-level `move <element slot>`.
+                        srcMovedFromSlot = compiler->lastMovedFromContainerSlot;
+                        compiler->lastMovedFromContainerSlot = false;
+
                         // simd<T,N> initialized from a scalar: splat across all lanes.
                         if (typeAndValue.IsSimd && !right->getType()->isVectorTy())
                             right = compiler->SplatToSimd(right, typeAndValue);
@@ -8235,20 +8294,22 @@ public:
                             }
                             else
                             {
-                                // `right` already holds a's loaded {fields} value (transferred into b
-                                // by the CreateAssignment below). ZERO a's storage so a's always-run
-                                // scope-exit destructor is a no-op on the moved-out value (cflat value-
-                                // type moves zero the source rather than skip the dtor - this stays
-                                // correct under conditional moves, no runtime drop flag needed). Mark a
-                                // moved for the compile-time use-after-move diagnostic.
-                                compiler->builder->CreateStore(
-                                    llvm::ConstantAggregateZero::get(right->getType()), srcStorage);
-                                compiler->MarkVariableMoved(srcCallerName);
-                                // `string` frees its local via the separate IsOwningString gate
-                                // (not the unconditional value-type path), so mark the moved-into
-                                // local owning - it now holds whatever `a` owned (the owned bit
-                                // rode along in the shallow store below). The dtor is owned-bit-
-                                // gated, so moving a borrowed string stays a scope-exit no-op.
+                                // THE FLIP via the shared decision: a copyable owner COPIES (source
+                                // stays LIVE), a non-copyable owner MOVES. A Move here transfers a's
+                                // loaded {fields} into b (the CreateAssignment below), so ZERO a's
+                                // storage - a's always-run scope-exit destructor then no-ops on the
+                                // moved-out value (cflat value-type move = zero source, not skip dtor)
+                                // and a is marked moved for the use-after-move diagnostic.
+                                AssignSourceKind kind;
+                                right = ClassifyOwningAssignSource(right, typeAndValue.TypeName, false, direct, kind);
+                                if (kind == AssignSourceKind::Move)
+                                {
+                                    compiler->builder->CreateStore(
+                                        llvm::ConstantAggregateZero::get(right->getType()), srcStorage);
+                                    compiler->MarkVariableMoved(srcCallerName);
+                                }
+                                // `string` frees its local via the IsOwningString gate; a copied or
+                                // moved-in local owns its buffer, so mark it owning.
                                 if (typeAndValue.TypeName == "string")
                                     compiler->stackNamedVariable.back().namedVariable[name].IsOwningString = true;
                             }
@@ -8378,6 +8439,40 @@ public:
                             nv.AllocAlignment = compiler->lastAllocAlignment;
                             compiler->lastOwningResult = false;
                             compiler->lastAllocAlignment = 0;
+                        }
+
+                        // Move OUT of a container element slot (`T tmp = move _data[i]`): the pointer/
+                        // interface element read demoted `unique`-ness away (a slot read hands out a
+                        // borrow), so the ownership channels above cannot tell an owning element from a
+                        // borrowed one - they mark EVERY moved pointer local owning. Re-derive the
+                        // dropped local's ownership from the DESTINATION type, which DOES carry the
+                        // element's ownership via generic substitution (IsUniqueTypeArg). This is keyed
+                        // strictly to element-slot sources (lastMovedFromContainerSlot), so a move of a named
+                        // local / param / field stays source-keyed. Value struct / string destinations
+                        // are left untouched (their drop is already correct via the struct/runtime-bit
+                        // path). Fixes: a bare `T*` element over-owning (spurious delete -> double-free)
+                        // and a `unique <interface>` element under-owning (drop frees nothing -> leak).
+                        if (srcMovedFromSlot)
+                        {
+                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            bool destUnique = typeAndValue.IsUniqueTypeArg || typeAndValue.IsUnique;
+                            bool destThinPtr = typeAndValue.Pointer && !typeAndValue.ElemPointer
+                                && !typeAndValue.IsInterface;
+                            bool destUniqueIface = typeAndValue.IsInterface
+                                && !typeAndValue.IsInterfacePointer;
+                            if (destUnique && (destThinPtr || destUniqueIface))
+                            {
+                                // Owning element: the drop must free exactly once (EmitOwningPtrCleanup
+                                // for a thin ptr, EmitOwningInterfaceCleanup via the vtable for a fat one).
+                                nv.IsOwning = true;
+                            }
+                            else if ((destThinPtr || destUniqueIface) && !destUnique)
+                            {
+                                // Borrow element: the container never owned the pointee, so the drop must
+                                // free nothing. Clear the ownership the pointer channel spuriously set.
+                                nv.IsOwning = false;
+                                nv.IsNewAllocated = false;
+                            }
                         }
 
                         // Return-result alloc-align channel: a call whose return type declared
@@ -8829,6 +8924,62 @@ public:
     }
 
     /*
+     * Produce an INDEPENDENT copy of a copyable-owner value `right` for the copy-on-assign flip:
+     * where T is a copyable owner (IsCopyableType), a named-source `dest = src` COPIES instead of
+     * moving, leaving the source live. `string` uses the dedicated deep-copy; any other copyable
+     * value type routes through copy() (a real overload or the memberwise synth). rightNV names the
+     * source; a fresh arg NV (Storage/type only, no CallerName) keeps copy() overload resolution
+     * from being confused by the source's named-argument metadata, mirroring CloneClosureFromNamedSource.
+     */
+    llvm::Value* EmitCopyableOwnerCopy(
+        const LLVMBackend::NamedVariable& rightNV,
+        llvm::Value* right,
+        antlr4::ParserRuleContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        if (rightNV.TypeAndValue.TypeName == "string")
+            return compiler->EmitOwnedStringDeepCopy(right);
+        // Pass the loaded by-value struct (Primary), not the source Storage: copy()/the memberwise
+        // synth take `self` BY VALUE. A fresh arg NV (value + type only, no CallerName) keeps
+        // overload resolution from being confused by the source's named-argument metadata.
+        LLVMBackend::NamedVariable srcNV;
+        srcNV.Primary  = right;
+        srcNV.BaseType = right->getType();
+        srcNV.TypeAndValue.TypeName = rightNV.TypeAndValue.TypeName;
+        if (auto* copied = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
+            return copied;
+        return right;
+    }
+
+    // The copy-vs-move classification shared by the decl-init, reassign, and deref assignment paths.
+    enum class AssignSourceKind { Copy, Move };
+
+    /*
+     * ONE decision point for `dest = src` where dest is a NON-closure owning value type (struct /
+     * string) and `right` is the loaded source struct value. THE FLIP: a copyable owner with a NAMED
+     * (non-`move`) source COPIES - returns an independent duplicate, source stays live (outKind=Copy).
+     * A non-copyable owner (owns a `unique`, no copy()) - or an explicit `move` source - MOVES:
+     * returns `right` unchanged and reports outKind=Move, so the caller consumes the source (zero its
+     * storage + MarkVariableMoved). Callers gate that dest is an owning value type and `right` is a
+     * struct value; closures clone via CloneClosureFromNamedSource and are handled at their own sites.
+     */
+    llvm::Value* ClassifyOwningAssignSource(
+        llvm::Value* right, const std::string& destTypeName, bool srcIsMove,
+        antlr4::ParserRuleContext* ctx, AssignSourceKind& outKind)
+    {
+        auto* compiler = Compiler(ctx);
+        if (compiler->IsCopyableType(destTypeName) && !srcIsMove)
+        {
+            outKind = AssignSourceKind::Copy;
+            LLVMBackend::NamedVariable copySrc;
+            copySrc.TypeAndValue.TypeName = destTypeName;
+            return EmitCopyableOwnerCopy(copySrc, right, ctx);
+        }
+        outKind = AssignSourceKind::Move;
+        return right;
+    }
+
+    /*
      * Storing a whole `alias` (borrow) value into a struct field: the field's always-run destructor
      * would free a buffer the real owner still holds (double-free). Reported with the precise
      * message ahead of the generic owning-value reject, which would wrongly suggest 'move' - you
@@ -8871,15 +9022,22 @@ public:
      * say which. Shared by the two field-store paths - `=` in ParseAssignmentExpression and
      * brace-init / `<Tag attr=...>` sugar via EmitOneFieldInit - so neither spelling can reach the
      * double-free. The caller gates that the destination IS a field, and that the value is not a
-     * closure (clone-safe, handled by CloneClosureFromNamedSource above). Returns true when an
-     * error was logged.
+     * closure (clone-safe, handled by CloneClosureFromNamedSource above).
+     *
+     * THE FLIP: when the source is a COPYABLE owner (IsCopyableType), `right` is replaced with an
+     * independent copy in place and the store PROCEEDS (returns false); the source stays live. Only
+     * a NON-copyable owner (owns a `unique`, no copy()) is rejected. Returns true when an error was
+     * logged.
      */
     bool RejectOwningValueCopyIntoField(
         const LLVMBackend::NamedVariable& rightNV,
-        llvm::Value* right,
+        llvm::Value*& right,
+        bool isSelfAssign,
+        bool& outCopied,
         antlr4::ParserRuleContext* ctx)
     {
         auto* compiler = Compiler(ctx);
+        outCopied = false;
         if (!(right && right->getType()->isStructTy()
             && !rightNV.TypeAndValue.Pointer
             && !rightNV.TypeAndValue.IsArrayView
@@ -8895,6 +9053,20 @@ public:
             && !rightNV.CallerName.empty()
             && compiler->GetOrCreateFullDestructor(rightNV.TypeAndValue.TypeName) != nullptr))
             return false;
+
+        // Copyable owner: COPY into the field (independent duplicate), leave the source live and
+        // proceed with the store. The copy is produced before any old-field destruct at the caller.
+        // A self-assign stores the same bits back (the self-store skips the old-field free), so it
+        // must NOT copy - a copy would orphan (leak) the field's current buffer.
+        if (compiler->IsCopyableType(rightNV.TypeAndValue.TypeName))
+        {
+            if (!isSelfAssign)
+            {
+                right = EmitCopyableOwnerCopy(rightNV, right, ctx);
+                outCopied = true;
+            }
+            return false;
+        }
 
         // Render the mangled generic name back to source spelling for the message
         // (e.g. "list__int" -> "list<int>", "dictionary__string__int" -> "dictionary<string, int>").
@@ -9010,6 +9182,9 @@ public:
         compilerLLVM->lastOwningResult = false;
         compilerLLVM->lastAllocAlignment = 0;
         compilerLLVM->lastCallReturnsAllocAlign = 0;
+        // Only a `move <element slot>` parsed WITHIN this RHS may key the container-slot ownership
+        // override (see ParseDeclaration); clear any value left by a prior statement.
+        compilerLLVM->lastMovedFromContainerSlot = false;
 
         auto* condCtx = ctx->conditionalExpression();
         if (condCtx && !ctx->assignmentOperator()
@@ -9148,6 +9323,25 @@ public:
                 if (operatorText != "=")
                     LogErrorContext(unaryCtx,
                         "'_' is a discard target; only '_ = expr' is allowed, not compound assignment.");
+
+                // `_ = move <bare local>;` explicitly releases the owning local NOW: it runs the
+                // same per-type teardown as scope exit, then the local is moved-from (a later read
+                // is a compile error). Only the top-level bare-identifier move form is special;
+                // `_ = move obj.field`, `_ = <call>()`, `_ = expr` keep the generic discard below.
+                if (auto* mv = TopLevelMoveExpression(assignCtx))
+                {
+                    auto* inner = mv->unaryExpression();
+                    std::string name = inner ? inner->getText() : std::string();
+                    if (IsBareIdentifierText(name))
+                    {
+                        if (auto* nv = compiler->FindLiveNamedVariable(name))
+                        {
+                            ReleaseOwningLocalNow(unaryCtx, nv, name);
+                            return nullptr;
+                        }
+                    }
+                }
+
                 auto rhsNV = ParseAssignmentExpressionNamed(assignCtx);
                 RegisterDiscardedOwningStructTemp(rhsNV);
                 return rhsNV.Primary;
@@ -9643,19 +9837,9 @@ public:
                 return right;
             }
 
-            // Storing a whole `alias` (borrow) value into a struct field - rejected ahead of the
-            // generic owning-value reject below so the borrow keeps its precise message.
-            if (operatorText == "=" && destIsStructField
-                && RejectAliasStoreIntoField(rightNV, right, ctx))
-                return right;
-
-            // Copying a named owning value into a struct field by value - rejected (double-free).
-            if (operatorText == "=" && destIsStructField
-                && RejectOwningValueCopyIntoField(rightNV, right, ctx))
-                return right;
-
-            // Field-to-field copy of an owning value - REJECTED. Ownership is a runtime property, so
-            // the compiler cannot safely deep-copy (would make a borrowed source owned) nor auto-move.
+            // Field-identity of the two sides, computed up front so the field-store rejects/copies
+            // below can all recognize a self-assign. Ownership is a runtime property, so a
+            // field-to-field of a NON-copyable owner cannot be safely duplicated (see the rejects).
             auto* srcFieldGep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(rightNV.Storage);
             bool srcIsStructField = (srcFieldGep && srcFieldGep->getNumIndices() == 2
                 && srcFieldGep->getSourceElementType()->isStructTy())
@@ -9673,6 +9857,21 @@ public:
                 || (namedVar.FieldName.empty() && rightNV.FieldName.empty()
                     && !namedVar.TypeAndValue.VariableName.empty()
                     && namedVar.TypeAndValue.VariableName == rightNV.TypeAndValue.VariableName);
+
+            // Storing a whole `alias` (borrow) value into a struct field - rejected ahead of the
+            // generic owning-value reject below so the borrow keeps its precise message.
+            if (operatorText == "=" && destIsStructField
+                && RejectAliasStoreIntoField(rightNV, right, ctx))
+                return right;
+
+            // Copying a named owning value into a struct field by value. THE FLIP copies a copyable
+            // owner in place (proceeds); a non-copyable owner is rejected. A self-assign is a no-op
+            // (no copy - copying would leak the old buffer the self-store never frees). `rejectCopied`
+            // records whether it produced the copy, so the field-to-field block below does not copy again.
+            bool rejectCopied = false;
+            if (operatorText == "=" && destIsStructField
+                && RejectOwningValueCopyIntoField(rightNV, right, selfUniqueFieldAssign, rejectCopied, ctx))
+                return right;
 
             // Storing a BORROW into a `unique` field. The field declares that it owns the pointee and
             // its synthesized destructor deletes it, but the borrow's real owner frees it as well.
@@ -9766,8 +9965,12 @@ public:
                 return right;
             }
 
-            // Assigning an owned string local into a string field - REJECTED. A static copy would
-            // make borrowed strings owned (breaking deliberate borrows like xml.cb's `b._rootTag = rt`).
+            // Assigning a named string LOCAL into a string field. THE FLIP: a NAMED OWNED source
+            // (IsOwningString, not a field-borrow) COPIES into the field (independent buffer),
+            // leaving the source live; the old field value is destructed below before the copy is
+            // stored. A pure field-BORROW source (BorrowsOwnedString, not owning) stays REJECTED -
+            // copying it would silently turn a deliberate borrow into an owned duplicate (e.g.
+            // xml.cb's `b._rootTag = rt`).
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && destIsStructField
                 && NamedVarIsString(namedVar)
@@ -9777,12 +9980,21 @@ public:
                 && !rightNV.TypeAndValue.IsMove
                 && !selfFieldAssign)
             {
-                LogErrorContext(ctx, std::format(
-                    "assigning a non-owning string '{}' into a struct field; use 'move' to transfer "
-                    "ownership or '.copy()' for an independent copy", rightNV.CallerName));
-                return right;
+                if (rightNV.IsOwningString && !rightNV.BorrowsOwnedString)
+                    right = compiler->EmitOwnedStringDeepCopy(right);
+                else
+                {
+                    LogErrorContext(ctx, std::format(
+                        "assigning a non-owning string '{}' into a struct field; use 'move' to transfer "
+                        "ownership or '.copy()' for an independent copy", rightNV.CallerName));
+                    return right;
+                }
             }
 
+            // Field-to-field copy of an owning value. THE FLIP: a copyable owner COPIES field-to-field
+            // (independent duplicate), leaving the source field live; the old destination field is
+            // destructed below before the copy is stored. A NON-copyable owner (owns a `unique`, no
+            // copy()) stays REJECTED - it has no safe generic duplicate.
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && destIsStructField && srcIsStructField
                 && !selfFieldAssign
@@ -9790,11 +10002,22 @@ public:
                 && rightNV.TypeAndValue.TypeName == namedVar.TypeAndValue.TypeName
                 && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))
             {
-                LogErrorContext(ctx, std::format(
-                    "field-to-field copy of owning value '{}' aliases its backing buffer and will "
-                    "double-free at teardown; use '.copy()' for an independent copy or 'move' to "
-                    "transfer ownership", namedVar.TypeAndValue.TypeName));
-                return right;
+                if (compiler->IsCopyableType(namedVar.TypeAndValue.TypeName))
+                {
+                    // RejectOwningValueCopyIntoField above already copied this copyable owner
+                    // (rejectCopied) - copying again would orphan (leak) the first copy. Only copy
+                    // here when it bailed (e.g. a source with no CallerName it could not classify).
+                    if (!rejectCopied)
+                        right = EmitCopyableOwnerCopy(rightNV, right, ctx);
+                }
+                else
+                {
+                    LogErrorContext(ctx, std::format(
+                        "field-to-field copy of owning value '{}' aliases its backing buffer and will "
+                        "double-free at teardown; use '.copy()' for an independent copy or 'move' to "
+                        "transfer ownership", namedVar.TypeAndValue.TypeName));
+                    return right;
+                }
             }
 
             // Owning-value MOVE at reassignment: a shallow store aliases owned buffers (double-free).
@@ -9822,18 +10045,27 @@ public:
                 && destination != rightNV.Storage
                 && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
             {
-                if (auto* dtor = compiler->GetOrCreateFullDestructor(rightNV.TypeAndValue.TypeName))
+                // THE FLIP via the shared decision: a copyable owner COPIES (source stays live), a
+                // non-copyable owner MOVES. The copy/right value is produced BEFORE the old
+                // destination is destructed (self-assign is guarded by destination != rightNV.Storage
+                // above). On a Move, zero the moved-out source so its always-run scope-exit destructor
+                // is a no-op (cflat value-type move = zero the source) and mark it moved.
+                AssignSourceKind kind;
+                llvm::Value* toStore = ClassifyOwningAssignSource(
+                    right, rightNV.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
+                if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                     compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
-                compiler->builder->CreateStore(right, destination);
-                // Zero the moved-out source so its always-run scope-exit destructor is a no-op
-                // (cflat value-type move = zero the source, see the decl-init move above).
-                compiler->builder->CreateStore(
-                    llvm::ConstantAggregateZero::get(right->getType()), rightNV.Storage);
-                compiler->MarkVariableMoved(rightNV.CallerName);
+                compiler->builder->CreateStore(toStore, destination);
+                if (kind == AssignSourceKind::Move)
+                {
+                    compiler->builder->CreateStore(
+                        llvm::ConstantAggregateZero::get(toStore->getType()), rightNV.Storage);
+                    compiler->MarkVariableMoved(rightNV.CallerName);
+                }
                 // The destination is now live again (it may have been moved-from earlier).
                 if (!namedVar.CallerName.empty() && namedVar.FieldName.empty())
                     compiler->MarkVariableUnmoved(namedVar.CallerName);
-                return right;
+                return toStore;
             }
 
             // Owning-value MOVE through a pointer-deref destination (`*pc = *pa`): a shallow store
@@ -9857,19 +10089,29 @@ public:
                 && destination != rightNV.Storage
                 && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))
             {
+                // THE FLIP via the shared decision: a copyable owner COPIES into the deref lvalue
+                // (source stays live - no zero, no mark-moved); a non-copyable owner MOVES. Produce
+                // the value before destructing the old destination. The guard excludes an explicit
+                // `move` source, so pass srcIsMove=false.
+                AssignSourceKind kind;
+                llvm::Value* toStore = ClassifyOwningAssignSource(
+                    right, namedVar.TypeAndValue.TypeName, false, ctx, kind);
                 if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                     compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
-                auto* assignResult = derefAssign(right, rhsUnsigned);
-                // Zero the moved-out source (a named local or `*pa`) so its dtor frees nothing.
-                if (rightNV.Storage != nullptr)
-                    compiler->builder->CreateStore(
-                        llvm::ConstantAggregateZero::get(right->getType()), rightNV.Storage);
-                // Enforce use-after-move only for a plain named source; a deref source has no name.
-                bool srcIsNamedVar = rightNV.Storage != nullptr
-                    && (llvm::isa<llvm::AllocaInst>(rightNV.Storage)
-                        || llvm::isa<llvm::GlobalVariable>(rightNV.Storage));
-                if (srcIsNamedVar && !rightNV.CallerName.empty())
-                    compiler->MarkVariableMoved(rightNV.CallerName);
+                auto* assignResult = derefAssign(toStore, rhsUnsigned);
+                if (kind == AssignSourceKind::Move)
+                {
+                    // Zero the moved-out source (a named local or `*pa`) so its dtor frees nothing.
+                    if (rightNV.Storage != nullptr)
+                        compiler->builder->CreateStore(
+                            llvm::ConstantAggregateZero::get(toStore->getType()), rightNV.Storage);
+                    // Enforce use-after-move only for a plain named source; a deref source has no name.
+                    bool srcIsNamedVar = rightNV.Storage != nullptr
+                        && (llvm::isa<llvm::AllocaInst>(rightNV.Storage)
+                            || llvm::isa<llvm::GlobalVariable>(rightNV.Storage));
+                    if (srcIsNamedVar && !rightNV.CallerName.empty())
+                        compiler->MarkVariableMoved(rightNV.CallerName);
+                }
                 return assignResult;
             }
 
@@ -9999,6 +10241,88 @@ public:
             {
                 if (auto* dtor = compiler->GetOrCreateFullDestructor("string"))
                     compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+            }
+
+            // Part 6: single-index GEP (container element slot) store of an OWNING element type.
+            // Lift the deliberate exclusion so `_data[i] = value` in generic container code defers to
+            // T: COPY a copyable owner (source stays live), MOVE a non-copyable owner / unique
+            // pointer (consume + zero + mark the source), or CLONE a closure. Gated to owning element
+            // types, so raw non-owning arrays (primitives, borrows, bare pointers, interface values)
+            // keep their plain store below. This does NOT drop the old slot value: a container
+            // releases a live slot itself (list.set -> `_releaseAt` then `_placeAt`) and only ever
+            // stores into an EMPTY slot here, so a drop-old would double-destruct the (default-
+            // constructed) slot - `list<Val>` with a side-effecting dtor proved that. Returns early:
+            // it does the source-consume itself, so the generic Transfer*OnStore helpers must not run.
+            // Fire ONLY for a NAMED owning source (a by-value param / local, alloca- or
+            // global-backed) - `_data[i] = value` / `_data[i] = move value` in collapsed container
+            // code. An rvalue temp (`value.copy()`, `new T()`) and a GEP-source move
+            // (`newData[i] = move _data[j]` in a grow loop) have no such storage and fall through to
+            // the existing plain store, so un-collapsed containers are untouched by the lift.
+            bool srcIsNamedLocal = rightNV.Storage != nullptr
+                && (llvm::isa<llvm::AllocaInst>(rightNV.Storage)
+                    || llvm::isa<llvm::GlobalVariable>(rightNV.Storage))
+                && !rightNV.CallerName.empty();
+            auto* destSlotGep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(destination);
+            bool destIsElemSlot = operatorText == "=" && right && srcIsNamedLocal
+                && destSlotGep && destSlotGep->getNumIndices() == 1
+                && !destIsStructField && !namedVar.IsInterfaceField
+                && !namedVar.BitfieldStorage && !namedVar.UnionFieldType
+                && !namedVar.TypeAndValue.IsArrayView;
+            const std::string& slotElemType = namedVar.TypeAndValue.TypeName;
+
+            if (destIsElemSlot && slotElemType == "__closure_fat_ptr"
+                && right->getType()->isStructTy())
+            {
+                // Closure element: clone a named source (self-safe - the clone reads the source env
+                // first), transfer a `move` source. No drop-old (empty slot; see the block header).
+                if (!rightNV.TypeAndValue.IsMove)
+                    right = CloneClosureFromNamedSource(rightNV, right, ctx);
+                compiler->builder->CreateStore(right, destination);
+                compiler->UnregisterOwnedClosureTemp(right);
+                return right;
+            }
+
+            if (destIsElemSlot && namedVar.TypeAndValue.IsUnique && namedVar.TypeAndValue.Pointer
+                && right->getType()->isPointerTy())
+            {
+                // unique T* element: store the new pointer, then null + mark-moved a NAMED owning
+                // source so exactly one owner frees. No drop-old (empty slot; see the block header).
+                compiler->builder->CreateStore(right, destination);
+                if (rightNV.Storage != nullptr && !rightNV.CallerName.empty()
+                    && rightNV.FieldName.empty()
+                    && (llvm::isa<llvm::AllocaInst>(rightNV.Storage)
+                        || llvm::isa<llvm::GlobalVariable>(rightNV.Storage)))
+                {
+                    if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(rightNV.BaseType))
+                    {
+                        compiler->builder->CreateStore(
+                            llvm::ConstantPointerNull::get(ptrTy), rightNV.Storage);
+                        compiler->MarkVariableMoved(rightNV.CallerName);
+                    }
+                }
+                return right;
+            }
+
+            if (destIsElemSlot && right->getType()->isStructTy()
+                && (compiler->IsOwningValueType(slotElemType) || slotElemType == "string"))
+            {
+                // Owning value struct / string element: COPY a copyable owner (source stays live),
+                // MOVE a non-copyable owner or an explicit `move`. No drop-old (empty slot; see the
+                // block header). On a Move, zero the moved-out NAMED source so its dtor is a no-op.
+                AssignSourceKind slotKind;
+                llvm::Value* toStore = ClassifyOwningAssignSource(
+                    right, slotElemType, rightNV.TypeAndValue.IsMove, ctx, slotKind);
+                compiler->builder->CreateStore(toStore, destination);
+                if (slotKind == AssignSourceKind::Move && rightNV.Storage != nullptr)
+                {
+                    compiler->builder->CreateStore(
+                        llvm::ConstantAggregateZero::get(toStore->getType()), rightNV.Storage);
+                    if (!rightNV.CallerName.empty()
+                        && (llvm::isa<llvm::AllocaInst>(rightNV.Storage)
+                            || llvm::isa<llvm::GlobalVariable>(rightNV.Storage)))
+                        compiler->MarkVariableMoved(rightNV.CallerName);
+                }
+                return toStore;
             }
 
             auto* assignResult = derefAssign(right, rhsUnsigned);
@@ -12557,7 +12881,10 @@ public:
         else
         {
             if (RejectAliasStoreIntoField(rightNV, val, errCtx)) return false;
-            if (RejectOwningValueCopyIntoField(rightNV, val, errCtx)) return false;
+            // Brace-init always targets a FRESH slot, so a self-assign is impossible here. There is no
+            // second copy path in brace-init, so the copied flag is unused.
+            bool braceCopied = false;
+            if (RejectOwningValueCopyIntoField(rightNV, val, false, braceCopied, errCtx)) return false;
         }
 
         // Coerce char* string literals to the string struct type
@@ -14214,6 +14541,9 @@ public:
         {
             compiler->builder->CreateStore(
                 llvm::ConstantAggregateZero::get(compiler->GetFatPtrType()), argNV.Storage);
+            // The element read demoted `unique` away; let the decl site re-derive ownership of a
+            // dropped local from the DESTINATION type (a `unique IShape` slot must free on drop).
+            compiler->lastMovedFromContainerSlot = true;
             LLVMBackend::NamedVariable result;
             result.Primary      = ptrVal;
             result.Storage      = nullptr;
@@ -14322,6 +14652,12 @@ public:
         // moved-from source travels with the value, so the new owner frees it the same way.
         compiler->lastOwningResult = true;
         compiler->lastAllocAlignment = argNV.AllocAlignment;
+        // Element-slot source (`move _data[i]`): the pointer read demoted `unique` to a bare borrow,
+        // so let the decl site re-key ownership off the DEST type - a bare `T*` element must NOT own
+        // (no spurious delete -> double-free), a `unique T*` element must own. A named local / param
+        // / field source stays source-keyed (IsElementAccess false leaves lastOwningResult in force).
+        if (argNV.IsElementAccess)
+            compiler->lastMovedFromContainerSlot = true;
 
         LLVMBackend::NamedVariable result;
         result.Primary        = ptrVal;
@@ -17299,16 +17635,10 @@ public:
                                         std::string base = substIt->second;
                                         StripOwnershipQualifiers(base);
                                         auto* be = Compiler(ctx);
-                                        // A pointer (bare/unique/alias) or a non-struct type is always
-                                        // copyable; a struct is refused only by the unique-owner rule.
-                                        if (!base.empty() && base.back() == '*')
-                                            isCopyable = true;
-                                        else if (be->dataStructures.count(base) == 0)
-                                            isCopyable = true;
-                                        else if (be->HasCopyOverloadFor(base))
-                                            isCopyable = true;
-                                        else
-                                            isCopyable = !be->TypeOwnsUniquePointer(base);
+                                        // Shared predicate: a pointer (bare/unique/alias) or a
+                                        // non-struct type is copyable; a struct is refused only by
+                                        // the unique-owner rule (drives the copy-on-assign flip too).
+                                        isCopyable = be->IsCopyableType(base);
                                     }
                                 }
                             }

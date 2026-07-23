@@ -792,6 +792,79 @@ int testBorrowStringFieldIntoLocal()
     return passed;
 }
 
+// ── THE FLIP: copyable owners COPY on assign (Part 4) ─────────────────────────────────
+// A copyable owner (string, list<T>) assigned from a NAMED source COPIES an independent
+// duplicate and leaves the source LIVE - the opposite of the old move-on-assign. Mutating
+// one side must not disturb the other. Covers every flipped site: decl-init, local reassign,
+// field-to-field, owned-local-into-field, plain container store, and brace-init.
+struct FlipRow  { string name = default; };
+struct FlipBag  { list<int> xs = default; };
+
+int testCopyOnAssignFlip()
+{
+    int passed = 0;
+
+    // decl-init copy: source string stays live and independent of the copy.
+    {
+        string a = "he" + "llo";
+        string b = a;
+        b = b + "!";
+        passed += Test("flip_declinit_string_src_live", a, "hello");
+        passed += Test("flip_declinit_string_copy_indep", b, "hello!");
+    }
+
+    // local reassign copy: list source stays live; growing the copy does not grow the source.
+    {
+        list<int> xs = default; xs.add(1); xs.add(2);
+        list<int> ys = default;
+        ys = xs;
+        ys.add(3);
+        passed += Test("flip_reassign_list_src_count", xs.count(), 2);
+        passed += Test("flip_reassign_list_copy_count", ys.count(), 3);
+    }
+
+    // field-to-field string copy: independent buffers.
+    {
+        FlipRow r1 = default; r1.name = ("wor" + "ld");
+        FlipRow r2 = default;
+        r2.name = r1.name;
+        r2.name = r2.name + "!";
+        passed += Test("flip_field_to_field_src", r1.name, "world");
+        passed += Test("flip_field_to_field_copy", r2.name, "world!");
+    }
+
+    // owned string LOCAL into field copies; the local stays usable afterward.
+    {
+        FlipRow r = default;
+        string tmp = "fre" + "sh";
+        r.name = tmp;
+        tmp = tmp + "!";
+        passed += Test("flip_local_into_field_field", r.name, "fresh");
+        passed += Test("flip_local_into_field_src", tmp, "fresh!");
+    }
+
+    // plain container store into field copies; the source list stays independent.
+    {
+        list<int> xs = default; xs.add(5); xs.add(6);
+        FlipBag h = default;
+        h.xs = xs;
+        xs.add(7);
+        passed += Test("flip_plainstore_bag_count", h.xs.count(), 2);
+        passed += Test("flip_plainstore_src_count", xs.count(), 3);
+    }
+
+    // brace-init container into field copies; the source list stays independent.
+    {
+        list<int> ys = default; ys.add(8);
+        FlipBag h2 = { xs = ys };
+        ys.add(9);
+        passed += Test("flip_braceinit_bag_count", h2.xs.count(), 1);
+        passed += Test("flip_braceinit_src_count", ys.count(), 2);
+    }
+
+    return passed;
+}
+
 // ── value struct with an owning string field, moved into a list<T> via add() ──────────
 // `list<T>.add(move T value)` MOVES the struct into `_data[i]`, so the list becomes the
 // sole owner of each element's owning string field. Reading elements back - especially via
@@ -1335,6 +1408,9 @@ extern int main()
 
     passed += testBorrowStringFieldIntoLocal();
     total += 3;
+
+    passed += testCopyOnAssignFlip();
+    total += 12;
 
     passed += testUniqueLocalAndParam();
     total += 11;

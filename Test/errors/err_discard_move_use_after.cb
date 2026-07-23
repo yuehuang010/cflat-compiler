@@ -1,0 +1,24 @@
+// `_ = move <local>;` explicitly releases an owning local NOW and nulls its slot, so a later use
+// of that variable must be diagnosed as a use-after-move (not a use-after-free at runtime). This
+// mirrors explicit `move`: the released resource is gone, so reading it is illegal. Covered for a
+// string and for a unique T* owning local.
+import "string.cb";
+
+struct Payload { int k = 0; };
+
+void releaseString()
+{
+    expect_error("use of moved variable 's'");
+    string s = "a long enough heap-backed string value for the discard test";
+    _ = move s;
+    int n = s.length();
+}
+
+extern int main()
+{
+    expect_error("use of moved variable 'p'");
+    unique Payload* p = new Payload();
+    _ = move p;
+    int k = p->k;
+    return 0;
+}
