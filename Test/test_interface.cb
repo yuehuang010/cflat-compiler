@@ -1429,6 +1429,91 @@ bool testGenericInterfaceField()
     return result;
 }
 
+// A generic interface named in a base clause with an EXPLICIT pointer / unique-pointer type
+// argument (class : IGSetter<GISetElem*>). Regression: the explicit form once stripped the
+// declarator '*' and the 'unique' qualifier from both the mangled interface name and the
+// substituted method signature, so the class could not satisfy its own contract.
+int gGISetElemDtorCount = default;
+
+class GISetElem
+{
+    int id = default;
+    ~GISetElem() { gGISetElemDtorCount = gGISetElemDtorCount + 1; }
+};
+
+interface IGSetter<T>
+{
+    void set(T value);
+    int  peek();
+};
+
+class PtrSetter : IGSetter<GISetElem*>
+{
+    GISetElem* _v = default;
+    void set(GISetElem* value) { _v = value; }
+    int  peek() { if (_v == nullptr) { return -1; } return _v->id; }
+};
+
+class UniqSetter : IGSetter<unique GISetElem*>
+{
+    unique GISetElem* _v = default;
+    void set(unique GISetElem* value) { _v = value; }
+    int  peek() { if (_v == nullptr) { return -1; } return _v->id; }
+};
+
+// Test 28b: explicit pointer / unique-pointer type argument on a generic interface base
+bool testGenericInterfaceExplicitPtrArg()
+{
+    bool result = true;
+
+    // Direct call: explicit borrow pointer argument keeps its '*'.
+    GISetElem e = default;
+    e.id = 7;
+    PtrSetter s = default;
+    s.set(&e);
+    result &= Test("gen_iface_ptr_direct", s.peek(), 7);
+
+    // Virtual dispatch through the generic-interface fat pointer.
+    PtrSetter* sp = new PtrSetter();
+    IGSetter<GISetElem*> ig = sp;
+    GISetElem e2 = default;
+    e2.id = 5;
+    ig.set(&e2);
+    result &= Test("gen_iface_ptr_vdispatch", ig.peek(), 5);
+    delete ig;
+
+    // Explicit `unique` pointer argument, direct call: the substituted contract param is a move
+    // sink, and the owning field frees the element exactly once at scope exit.
+    gGISetElemDtorCount = 0;
+    {
+        UniqSetter u = default;
+        GISetElem* h = new GISetElem();
+        h->id = 9;
+        u.set(h);
+        result &= Test("gen_iface_uniq_direct",      u.peek(), 9);
+        result &= Test("gen_iface_uniq_not_early",    gGISetElemDtorCount, 0);
+    }
+    result &= Test("gen_iface_uniq_freed_once",       gGISetElemDtorCount, 1);
+
+    // Explicit `unique` argument dispatched through the generic-interface fat pointer: ownership
+    // transfers across the vtable into the owning field, and delete-through-interface frees the
+    // element exactly once (no leak, no double free).
+    gGISetElemDtorCount = 0;
+    {
+        UniqSetter* up = new UniqSetter();
+        IGSetter<unique GISetElem*> iu = up;
+        GISetElem* h2 = new GISetElem();
+        h2->id = 3;
+        iu.set(h2);
+        result &= Test("gen_iface_uniq_vdispatch",       iu.peek(), 3);
+        result &= Test("gen_iface_uniq_v_not_early",      gGISetElemDtorCount, 0);
+        delete iu;
+        result &= Test("gen_iface_uniq_v_freed_once",     gGISetElemDtorCount, 1);
+    }
+
+    return result;
+}
+
 // --- Test 31: the UI-tree shape - list<IFace> as a CLASS FIELD, filled via `move` ---
 bool testFieldListInterfaceTeardown()
 {
@@ -1758,6 +1843,7 @@ extern int main()
     total++; passed += testInterfaceFieldAccess()        ? 1 : 0;
     total++; passed += testInterfaceIsNullUpcast()       ? 1 : 0;
     total++; passed += testGenericInterfaceField()       ? 1 : 0;
+    total++; passed += testGenericInterfaceExplicitPtrArg() ? 1 : 0;
     total++; passed += testLocalListInterfaceTakeDelete()     ? 1 : 0;
     total++; passed += testLocalListInterfaceGrowTakeDelete() ? 1 : 0;
     total++; passed += testFieldListInterfaceTeardown()       ? 1 : 0;

@@ -8173,9 +8173,13 @@ public:
             std::string pname = !cp.VariableName.empty() ? cp.VariableName
                               : (!ip.VariableName.empty() ? ip.VariableName
                                                           : std::format("#{}", i + 1));
-            if (cp.IsMove != ip.IsMove)
+            // Compare sink-ness: a `unique` type argument makes a by-value parameter a move sink
+            // just like `move` (ApplyMoveParamTransfer), so the two spellings must agree.
+            bool cpMove = cp.IsMove || cp.IsUniqueTypeArg;
+            bool ipMove = ip.IsMove || ip.IsUniqueTypeArg;
+            if (cpMove != ipMove)
             {
-                if (ip.IsMove)
+                if (ipMove)
                     LogError(std::format(
                         "class '{}' method '{}': parameter '{}' is not declared 'move' but interface "
                         "'{}' declares it 'move' - a call through the interface transfers ownership of "
@@ -8220,9 +8224,12 @@ public:
 
         const auto& ir = method.ReturnType;
         const auto& cr = sym.ReturnType;
-        if (cr.IsMove != ir.IsMove)
+        // Sink-ness, matching the parameter check: a `unique` type-argument return owns like `move`.
+        bool crMove = cr.IsMove || cr.IsUniqueTypeArg;
+        bool irMove = ir.IsMove || ir.IsUniqueTypeArg;
+        if (crMove != irMove)
         {
-            if (ir.IsMove)
+            if (irMove)
                 LogError(std::format(
                     "class '{}' method '{}': the return type is not declared 'move' but interface "
                     "'{}' declares it '{}' - a call through the interface hands the caller an owned "

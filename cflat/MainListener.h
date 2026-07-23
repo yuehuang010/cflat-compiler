@@ -23264,25 +23264,24 @@ public:
             std::vector<std::string> args;
             for (auto* entry : gtp->typeParameterList()->typeParameterEntry())
             {
-                std::string name = entry->typeSpecifier() ? entry->typeSpecifier()->getText() : entry->getText();
-                bool isPack = entry->Ellipsis() != nullptr;
-                if (isPack)
+                if (entry->Ellipsis() != nullptr)
                 {
-                    // Expand pack substitution: T... -> [int, float, ...]
+                    // Pack: expand T... -> [int, float, ...] via the pack substitution (keyed by the
+                    // bare parameter name). A non-substituted element keeps its `*`/`unique` suffix.
+                    std::string name = entry->typeSpecifier() ? entry->typeSpecifier()->getText() : entry->getText();
                     auto packIt = activePackSubstitutions.find(name);
                     if (packIt != activePackSubstitutions.end())
                         for (const auto& t : packIt->second)
                             args.push_back(t);
                     else
-                        args.push_back(name);
+                        args.push_back(ResolveTypeArgEntry(entry));
                 }
                 else
                 {
-                    auto substIt = activeTypeSubstitutions.find(name);
-                    if (substIt != activeTypeSubstitutions.end())
-                        args.push_back(substIt->second);
-                    else
-                        args.push_back(name);
+                    // Reconstruct the full type-arg spelling (element + `*`/`[]` + `unique`/`alias`)
+                    // via the canonical path; the bare typeSpecifier text dropped the declarator
+                    // suffix and `unique` on the explicit base-clause form (class PB : IB<R*>).
+                    args.push_back(ResolveTypeArgEntry(entry));
                 }
             }
             return args;
