@@ -347,6 +347,12 @@ closure-env leak was fixed. See the closure issue file (updated) for detail.
 
 ## Acceptance (revised)
 
+SUCCESSOR (2026-07-22): the maintainer judged the shipped shape still too `if const`-heavy;
+the forward direction is [[ownership-transparent-assignment]] (make `=` itself total over T:
+copy-if-copyable / move-if-owner / alias-if-borrow / drop-old-dest), which would collapse the
+remaining `_placeAt`/`_releaseAt` ladders. That plan's probe work also surfaced four
+assignment soundness bugs (see `internal/issue/unique-*.md`).
+
 `queue|stack|list<int|Point|string|Lambda|Holder|CopyableStruct|T*|unique T*|IShape|unique IShape>`:
 insert/read/iterate correct, teardown frees each owned resource exactly once (HeapAudit clean, no 134),
 borrows never freed, `add(copyable)` COPIES (source intact), `add(non-copyable-owner)` MOVES by default
