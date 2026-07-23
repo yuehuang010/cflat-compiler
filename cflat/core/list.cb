@@ -336,17 +336,21 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // Frees `unique` elements; bare pointers and bare interface values are left to their
     // real owner. Value elements are NOT released here - `delete[_size]` runs their
     // destructors as it frees the buffer, so doing it above would destruct them twice.
+    // NOTE: this deliberately keeps the direct delete-site loop rather than the clear()-style
+    // `_releaseAt` collapse. A self-referential `list<unique T*>` (T incomplete when the list
+    // is monomorphized, e.g. TreeBox) needs the delete SITE's deferred destructor resolution;
+    // the discard-release path binds the element dtor early to a null dtor and leaks the
+    // subtree. See internal/issue/list-dtor-releaseat-collapse-incomplete-type.md.
+    // Release every live element (ownership defers to T via _releaseAt), then free the
+    // backing buffer only - elements are already released, so no per-element dtor pass.
     ~list()
     {
-        if const (is_unique(T))
+        int i = 0;
+        while (i < _size)
         {
-            int i = 0;
-            while (i < _size)
-            {
-                if (_data[i] != nullptr) delete _data[i];
-                i++;
-            }
+            _releaseAt(i);
+            i++;
         }
-        if (_data != nullptr) delete[_size] _data;
+        if (_data != nullptr) delete[_] _data;
     }
 };

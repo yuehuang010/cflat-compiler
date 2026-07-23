@@ -1772,8 +1772,10 @@ private:
 
         builder->SetInsertPoint(cleanupBB);
 
-        // Call the full destructor (user dtor + member fields) if the type needs one.
-        if (auto* dtor = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+        // Call the full destructor (user dtor + member fields) if the type needs one. Resolve
+        // through the delete-site resolver: a pointee still incomplete here (self-referential
+        // element) binds the deferred stub instead of silently dropping the call.
+        if (auto* dtor = GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName))
             builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
 
         // Free the pointer. An over-aligned block came from the aligned allocator, so it must be

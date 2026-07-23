@@ -150,6 +150,14 @@ struct dictionary<K, V>
         _ = move _values[index];
     }
 
+    // Release the key in a live slot the same way as a value: ownership defers to K. An owning
+    // key (string, owning struct) deep-copied into the slot is destructed; a bare pointer key
+    // BORROW frees nothing; a primitive key is a no-op. `move _keys[index]` nulls the slot.
+    void _releaseKeyAt(int index)
+    {
+        _ = move _keys[index];
+    }
+
     // Free a value handed to add() as a synthesized move sink that the dictionary is refusing
     // (duplicate key). Takes `value` by `move` so the parameter's own scope-exit destructor does
     // the freeing (deletes a `unique` pointee); a bare `delete value` on the plain parameter is
@@ -391,16 +399,8 @@ struct dictionary<K, V>
         {
             if (_status[slot] == 1 && _keys[slot] == key)
             {
-                // Free a `unique` (owned) value; destruct a value type; leave a bare pointer/interface.
-                if const (is_unique(V))
-                {
-                    if (_values[slot] != nullptr) delete _values[slot];
-                }
-                else if const (!is_pointer(V))
-                    _values[slot].~();
-                // Destruct the owned key too (string, owning struct); primitive/pointer keys: unmanaged.
-                if const (!is_primitive(K)) if const (!is_pointer(K))
-                    _keys[slot].~();
+                _releaseValueAt(slot);
+                _releaseKeyAt(slot);
                 _status[slot] = 2;
                 _count--;
                 _tombstones++;
@@ -426,14 +426,8 @@ struct dictionary<K, V>
         {
             if (_status[i] == 1)
             {
-                if const (is_unique(V))
-                {
-                    if (_values[i] != nullptr) delete _values[i];
-                }
-                else if const (!is_pointer(V))
-                    _values[i].~();
-                if const (!is_primitive(K)) if const (!is_pointer(K))
-                    _keys[i].~();
+                _releaseValueAt(i);
+                _releaseKeyAt(i);
             }
             i++;
         }
@@ -501,17 +495,8 @@ struct dictionary<K, V>
         {
             if (_status[i] == 1)
             {
-                if const (is_unique(V))
-                {
-                    if (_values[i] != nullptr) delete _values[i];
-                }
-                else if const (!is_pointer(V))
-                    _values[i].~();
-                // Owning keys are deep-copied into the slot by add()/set(), so the dictionary
-                // owns them and must free them here; primitive/pointer keys are stored as-is and
-                // stay caller-managed (pointer keys are never freed).
-                if const (!is_primitive(K)) if const (!is_pointer(K))
-                    _keys[i].~();
+                _releaseValueAt(i);
+                _releaseKeyAt(i);
             }
             i++;
         }

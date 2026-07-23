@@ -106,35 +106,14 @@ class stack<T>
         }
     }
 
-    // Remove and return the top element. The return kind follows ownership: an owned element
-    // transfers out, a borrowed pointer / interface comes back as an alias the caller must not
-    // free, and a value element transfers out because its slot is gone.
-    if const (is_unique(T))
+    // Remove and return the top element. Ownership DEFERS to T: a `unique` element transfers
+    // out, a bare pointer / interface comes back as a borrow (a `stack<alias T*>` still rejects
+    // deleting the result), a value transfers because its slot is gone. Mirrors queue.dequeue().
+    T pop()
     {
-        move T pop()
-        {
-            _size--;
-            T value = move _data[_size];
-            return value;
-        }
-    }
-    else if const (is_pointer(T))
-    {
-        alias T pop()
-        {
-            _size--;
-            T value = _data[_size];
-            return value;
-        }
-    }
-    else
-    {
-        move T pop()
-        {
-            _size--;
-            T value = move _data[_size];
-            return value;
-        }
+        _size--;
+        T value = move _data[_size];
+        return value;
     }
 
     // Borrow the top element without removing it (caller must not free it).

@@ -278,6 +278,34 @@ explicitly-accepted policy (listed at the end).
   `stack<alias T*>` still rejects deleting the result). Mirror it.
 - Verify: leak matrix (393) + new legs for pop-on-owning-elements and dict remove()/clear()
   over every K/V kind; suites cold+warm.
+- DONE 2026-07-23 (dictionary + stack legs); list ~() DEFERRED. Dictionary remove()/clear()/~()
+  now route V+K release through `_releaseValueAt(slot)` + a new `_releaseKeyAt(slot)` =
+  `_ = move _keys[slot];` (all 12 `if const` gone); stack.pop() collapsed to the plain
+  `T pop() { _size--; T value = move _data[_size]; return value; }`. Both .cb-only, no compiler
+  change. The list ~() collapse could NOT land: swapping the direct `is_unique(T)` delete loop for
+  the `_releaseAt` discard-release LEAKS a self-referential owning element (a `list<unique TreeBox*>`
+  monomorphized while TreeBox is incomplete - test_move.cb::recursive_container_frees_all went 3->0).
+  Root cause: the direct `delete` SITE gets deferred/late destructor resolution; the discard-release
+  path binds the element dtor early to a null dtor. Kept ~list() as the direct-delete loop; filed
+  internal/issue/list-dtor-releaseat-collapse-incomplete-type.md (needs the compiler-side late
+  resolution before the collapse - out of 9a's ".cb-only, no compiler change" scope). Existing 393
+  leak legs already cover stack.pop / dict remove/clear over every owning K/V kind. Verified:
+  leak oracle 393/EXIT=0, test.sh Release 476/0/8, example_mac 35/0, test_lsp 152/0.
+- ESCALATION (2026-07-23, probed at HEAD): the deferred-leg root cause was a LIVE LEAK, not just a
+  collapse blocker - SELF-REFERENTIAL unique elements (struct holding `<container><unique Self*>`)
+  leaked the whole subtree through ~dictionary()/~stack()/~queue() and list clear()/removeAt() (0 of
+  3 freed, probe scratch/selfref_leak_repro.cb). Only ~list() survived (kept the direct-delete
+  loop) and only list had a self-ref test, which is why suites stayed green.
+- RESOLVED + 9a COMPLETE (2026-07-23): one-line compiler fix - EmitOwningPtrCleanup (the thin
+  `unique T*` DropValue arm, LLVMBackend.h ~1776) now resolves the pointee dtor through
+  GetFullDestructorForDelete instead of the eager GetOrCreateFullDestructor, so a pointee still
+  incomplete at emit time binds the same deferred `.dtordeferred` stub the `delete` site uses
+  (body patched at finalization) instead of silently dropping the call. With that, the third 9a
+  leg landed: ~list() collapsed to the `_releaseAt(i)` loop + buffer-only `delete[_]`, uniform
+  with queue/stack. Regression legs added to test_move.cb::testSelfRefContainerRelease (6 legs:
+  dict/stack/queue self-ref teardown, dict remove(), list clear()/removeAt(); 137->143).
+  internal/issue/list-dtor-releaseat-collapse-incomplete-type.md deleted. Verified: selfref probe
+  clean under HeapAudit, test_move 143/143, leak oracle 393/EXIT=0, test.sh Release 476/0/8.
 
 #### 9b - TOTAL `.copy()` over T   [opus, compiler change - the one new totality this part needs]
 - Make `.copy()` well-formed for EVERY T: identity bit-copy for primitive/enum/pointer/

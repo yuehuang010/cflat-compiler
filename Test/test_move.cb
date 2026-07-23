@@ -1,4 +1,7 @@
 import "list.cb";
+import "stack.cb";
+import "queue.cb";
+import "dictionary.cb";
 import "test_helper.cb";
 
 int dtorCount = 0;
@@ -396,6 +399,127 @@ int testRecursiveContainerFree()
         roots.add(root);
     }
     passed += Test("recursive_container_frees_all", dtorCount, 3);
+
+    return passed;
+}
+
+// Same self-referential-element hazard as TreeBox, applied to dictionary/stack/queue
+// teardown and to list's other non-dtor release paths (clear/removeAt). Each element
+// struct monomorphizes its own container field while the struct is still incomplete.
+struct DictNode
+{
+    int id = 0;
+    dictionary<int, unique DictNode*> kids = default;
+    ~DictNode()
+    {
+        dtorCount = dtorCount + 1;
+    }
+};
+
+struct StkNode
+{
+    int id = 0;
+    stack<unique StkNode*> kids = default;
+    ~StkNode()
+    {
+        dtorCount = dtorCount + 1;
+    }
+};
+
+struct QueNode
+{
+    int id = 0;
+    queue<unique QueNode*> kids = default;
+    ~QueNode()
+    {
+        dtorCount = dtorCount + 1;
+    }
+};
+
+int testSelfRefContainerRelease()
+{
+    int passed = 0;
+
+    // dictionary teardown: scope exit frees the whole root -> child -> grand chain.
+    dtorCount = 0;
+    {
+        dictionary<int, unique DictNode*> roots;
+        DictNode* root  = new DictNode(); root->id  = 1;
+        DictNode* child = new DictNode(); child->id = 2;
+        DictNode* grand = new DictNode(); grand->id = 3;
+        child->kids.set(0, grand);
+        root->kids.set(0, child);
+        roots.set(0, root);
+    }
+    passed += Test("dict_selfref_dtor_frees_all", dtorCount, 3);
+
+    // dictionary remove(): the removed entry's subtree is freed immediately, before scope exit.
+    dtorCount = 0;
+    {
+        dictionary<int, unique DictNode*> roots;
+        DictNode* root  = new DictNode(); root->id  = 1;
+        DictNode* child = new DictNode(); child->id = 2;
+        DictNode* grand = new DictNode(); grand->id = 3;
+        child->kids.set(0, grand);
+        root->kids.set(0, child);
+        roots.set(0, root);
+        roots.remove(0);
+        passed += Test("dict_selfref_remove_frees_all", dtorCount, 3);
+    }
+
+    // stack teardown: scope exit frees the whole chain.
+    dtorCount = 0;
+    {
+        stack<unique StkNode*> roots;
+        StkNode* root  = new StkNode(); root->id  = 1;
+        StkNode* child = new StkNode(); child->id = 2;
+        StkNode* grand = new StkNode(); grand->id = 3;
+        child->kids.push(grand);
+        root->kids.push(child);
+        roots.push(root);
+    }
+    passed += Test("stack_selfref_dtor_frees_all", dtorCount, 3);
+
+    // queue teardown: scope exit frees the whole chain.
+    dtorCount = 0;
+    {
+        queue<unique QueNode*> roots;
+        QueNode* root  = new QueNode(); root->id  = 1;
+        QueNode* child = new QueNode(); child->id = 2;
+        QueNode* grand = new QueNode(); grand->id = 3;
+        child->kids.enqueue(grand);
+        root->kids.enqueue(child);
+        roots.enqueue(root);
+    }
+    passed += Test("queue_selfref_dtor_frees_all", dtorCount, 3);
+
+    // list clear(): the whole chain is freed immediately, before scope exit.
+    dtorCount = 0;
+    {
+        list<unique TreeBox*> roots;
+        TreeBox* root  = new TreeBox(); root->id  = 1;
+        TreeBox* child = new TreeBox(); child->id = 2;
+        TreeBox* grand = new TreeBox(); grand->id = 3;
+        child->children.add(grand);
+        root->children.add(child);
+        roots.add(root);
+        roots.clear();
+        passed += Test("list_selfref_clear_frees_all", dtorCount, 3);
+    }
+
+    // list removeAt(0): same shape, freed via removeAt instead of clear().
+    dtorCount = 0;
+    {
+        list<unique TreeBox*> roots;
+        TreeBox* root  = new TreeBox(); root->id  = 1;
+        TreeBox* child = new TreeBox(); child->id = 2;
+        TreeBox* grand = new TreeBox(); grand->id = 3;
+        child->children.add(grand);
+        root->children.add(child);
+        roots.add(root);
+        roots.removeAt(0);
+        passed += Test("list_selfref_removeat_frees_all", dtorCount, 3);
+    }
 
     return passed;
 }
@@ -1393,6 +1517,9 @@ extern int main()
 
     passed += testRecursiveContainerFree();
     total += 1;
+
+    passed += testSelfRefContainerRelease();
+    total += 6;
 
     passed += testFieldOwnership();
     total += 7;
