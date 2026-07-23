@@ -6451,15 +6451,16 @@ public:
                                      LockModeFromSuffix(mode), mutexPtr });
             }
 
-            // Push lock scope - only supports single-mutex cleanup via StackState today.
-            // For multi-lock, push one scope per mutex so each gets its own cleanup slot.
+            // Push the lock scope and register a cleanup for every acquired mutex, so
+            // scope exit releases all of them (in reverse) instead of only the first.
             compiler->InitializeBlock(nullptr, true);
-            if (!acquired.empty())
+            for (const auto& lk : acquired)
             {
-                compiler->stackNamedVariable.back().lockCleanup = LLVMBackend::StackState::LockCleanup{
-                    .UnlockFn = FindMethodOf(acquired[0].releaseMethod, acquired[0].typeName),
-                    .MutexPtr = acquired[0].mutexPtr,
-                };
+                compiler->stackNamedVariable.back().lockCleanups.push_back(
+                    LLVMBackend::StackState::LockCleanup{
+                        .UnlockFn = FindMethodOf(lk.releaseMethod, lk.typeName),
+                        .MutexPtr = lk.mutexPtr,
+                    });
             }
 
             // Update lock-set for static analysis. Save each token's prior state so a nested
@@ -13495,6 +13496,16 @@ public:
         // returns memory aligned to allocAlign. Emit only for the array-view result.
         if (isArray && useAligned)
             compiler->builder->CreateAlignmentAssumption(compiler->module->getDataLayout(), typedPtr, (unsigned)allocAlign);
+
+        // Zero a pointer-element array buffer. No per-element ctor runs for pointer slots
+        // (see the typeIsPtr skip below), so an owning array (`array<unique T*>`) would
+        // otherwise `delete` uninitialized garbage in its release/teardown paths. A borrow
+        // array benefits too: an unset slot reads null instead of a stale heap pointer.
+        if (isArray && count && typeIsPtr)
+        {
+            llvm::Align ptrAlign = compiler->module->getDataLayout().getABITypeAlign(elemType);
+            compiler->builder->CreateMemSet(typedPtr, compiler->builder->getInt8(0), sizeVal, ptrAlign);
+        }
 
         // For array new of a class type: call default constructor for each element (like C++).
         // Skip when typeIsPtr - the element is a pointer (e.g. Point*), not a struct; calling

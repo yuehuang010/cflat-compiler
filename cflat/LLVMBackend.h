@@ -889,14 +889,17 @@ public:
         bool isFunction = false;
         std::string functionName;
 
-        // Set when this scope was entered via a `lock` statement.
-        // unlock() is called on scope exit (return, or normal block close).
+        // Set when this scope was entered via a `lock` statement. unlock() is called
+        // on scope exit (return, or normal block close). A multi-lock `lock(a, b)`
+        // acquires several mutexes in one scope, so every acquired lock needs its own
+        // cleanup entry - releasing only the first leaves the rest locked, and a still
+        // -locked mutex trips its `unique` slot destructor into freeing a live lock.
         struct LockCleanup
         {
             llvm::Function* UnlockFn = nullptr;
             llvm::Value*    MutexPtr = nullptr; // pointer to the mutex struct
         };
-        std::optional<LockCleanup> lockCleanup;
+        std::vector<LockCleanup> lockCleanups;
 
         void ClearBlock()
         {
@@ -2131,11 +2134,11 @@ private:
             }
         }
 
-        // Release lock held by this scope (lock statement).
-        if (frame.lockCleanup.has_value())
+        // Release locks held by this scope (lock statement). Acquired in argument
+        // order, so release in reverse to respect nested lock ordering.
+        for (auto it = frame.lockCleanups.rbegin(); it != frame.lockCleanups.rend(); ++it)
         {
-            auto& lc = frame.lockCleanup.value();
-            builder->CreateCall(lc.UnlockFn->getFunctionType(), lc.UnlockFn, { lc.MutexPtr });
+            builder->CreateCall(it->UnlockFn->getFunctionType(), it->UnlockFn, { it->MutexPtr });
         }
     }
 
