@@ -1,6 +1,9 @@
 # Ownership-transparent assignment: `dest = src` defers to T
 
-Opened 2026-07-22. GOAL, multi-change, iterative. This is "Option 5" from the container
+Opened 2026-07-22. COMPLETE 2026-07-23 (R4 close-out; see Status). Two follow-ons live in
+internal/issue/: move-copyable-param-overload-uaf.md (pre-existing UAF, gap 2) and
+discard-move-global-string-leaks.md; btree _freeValue retirement needs borrowed-slot
+ownership recovery (noted in STEP R3 DONE). GOAL, multi-change, iterative. This is "Option 5" from the container
 brainstorm - the maximal successor to [[container-ownership-transparency]]: instead of
 containers dispatching ownership with `if const`, ASSIGNMENT ITSELF becomes total over T:
 
@@ -430,6 +433,103 @@ the incomplete-type deferred-dtor compiler fix), 9b (total .copy()) shipped. GAT
 8c-first spike narrowed THE RULE's blast radius to "entry defers to T like stores already do";
 maintainer has engaged the track (spike requested 2026-07-23) - explicit sign-off on landing
 8a+8b is the only open decision.
+STEP R1 DONE 2026-07-23 (uncommitted at report time). 8a+8b landed as one compiler change.
+Mechanism: consume detection is STRUCTURAL - CollectConsumedStoreNames (MainListener.h ~929)
+finds params consumed by a plain `=`/slot store, decl-init, or conditional `move` on at least
+one path (descends conditionals/loops, not lambdas); ApplyOwningSinkInference flags them
+IsOwningSink + IsConsumeInferredSink (new TypeAndValue field, serialized as "cis"). The
+copyability decision is DEFERRED to OwningSinkConsumesConcrete (LLVMBackend.h ~3612), the
+single discriminator all concrete-type consumers consult (call-site poison, laundering guard,
+rvalue-temp ownership, borrow marking, 8a drop) - required because the ForwardRefScanner
+cannot resolve copyability during the forward pass. A consume-inferred sink consumes ONLY a
+non-copyable owner; copyable T stays a borrow (store is a copy) - zero delta for existing
+code. 8a: a consuming sink param is marked IsOwningStruct at entry (createFunctionBlock
+~2370), riding the EXISTING scope-exit/early-return destructor loops; no-op on moved-out
+slots. Explicit `move T` exit-drop path unchanged (already sound - the "murky" dict
+_freeValue case verified freed-once); _freeValue retirement deferred to R3. Pre-flight: NO
+existing tests flipped; the 3 use-after-move err tests still fire. Tests: +11 oracle legs
+(405->416, incl. conditional-consume both-paths and rvalue-temp-into-copyable-sink),
+err_inferred_sink_use_after_move.cb (poison via inference alone, no containers/keywords),
+scratch bag_probe validates R2's collapsed single body works end-to-end. Verified (also
+independently re-run): test.sh Release 482/0/8 cold+warm, oracle 416 HeapAudit+asan clean
+cold+warm, example_mac 35/0, test_lsp green, --init warm probe explicit. Deferred as future
+enhancement: call-arg consume inference (case-b of THE RULE) - today that shape is already a
+clean compile error (laundering guard), so it is sound to defer. Incidental pre-existing gap
+found and filed: internal/issue/discard-move-global-string-leaks.md (`_ = move <global
+string>` leaks; unrelated to sinks). NEXT: R2.
+STEP R2 DONE 2026-07-23 (.cb-only, uncommitted). queue.enqueue / stack.push / list.add /
+list.set each collapsed to a single body with the DIRECT store spelling
+(`_data[slot] = value;`) - NOT via _placeAt: R1's deferred call-arg consume inference means
+passing the param to _placeAt trips the ownership-laundering guard (clean compile error, as
+designed), while the in-body store is what CollectConsumedStoreNames sees. _placeAt deleted
+from all three files (no remaining callers). Transfer overloads and dictionary untouched.
+Oracle legs added for the inference-driven consumed-caller and copyable caller-keeps paths
+on all four methods (416->431). The 3 use-after-move err tests fire via inference now.
+Verified (independently re-run): test.sh Release 482/0/8 cold+warm, oracle 431 clean
+cold+warm, example_mac 35/0. NEXT: R3 (dictionary + _placeOrInsertSink/_freeValue/btree).
+STEP R3 BLOCKED 2026-07-23 (attempt cleanly reverted; tree back at R2 state, baseline
+re-verified). The dictionary collapse is NOT .cb-only: two compiler gaps found, both filed
+in internal/issue/ with minimal repros preserved in scratch/.
+(1) sink-param-thin-unique-exit-drop-gap.md - PRIMARY: `unique V*` is is_copyable, so R1's
+consume-inference never IsOwningStruct-marks it and 8a's exit drop skips it; the duplicate
+refusal `return false;` path LEAKS the refused value (non-copyable owning structs drop
+correctly). This is exactly the murky-move-param case the 8a bullet prescribed making
+DropValue-total and R1 deferred. Caller-contract check PASSED for the working rows (refusal
+consumes non-copyable V, keeps copyable V - matches shipped).
+(2) move-copyable-param-overload-uaf.md - SECONDARY, pre-existing UAF: `V x = move
+<copyable param>` steals the CALLER's buffer when a sibling `move V` overload + `alias K`
+param coexist (ASan repro matrix r3_mock4/mA/mB/mC).
+btree.cb examined: its _freeValue usage is materially different (explicit `move V` overloads
+releasing borrowed-node inline-array slots via `move n->values[i]` - load-bearing slot
+clear); its collapse needs the same fix (1) plus borrowed-slot ownership recovery - separate
+follow-on. R3 lands after fix (1) (and (2) if the typed-local spelling is wanted); every
+other row of the collapse was verified HeapAudit-clean against shipped semantics.
+STEP R3 DONE 2026-07-23 (uncommitted). Fix (1) authorized and landed as the compiler change the
+8a bullet prescribed; the dictionary collapse re-landed with the bare `return false;` refusal
+spelling (fix (2) NOT needed - the bare-return path never uses the typed-local; gap 2 stays filed).
+COMPILER FIX (1), two edits: (a) createFunctionBlock (LLVMBackend.h ~2275) computes uniqueAutoSink
+= IsUniqueTypeArg && !IsAlias && !IsBorrowOfUniqueElement, and routes such a PLAIN (non-move)
+unique-type-arg param through the owning branches - the interface-value arm sets IsOwning =
+IsMove || uniqueAutoSink (EmitOwningInterfaceCleanup at exit), the pointer branch condition becomes
+(IsMove || uniqueAutoSink) && Pointer (EmitOwningPtrCleanup at exit) - mirroring exactly the
+call-site null condition (ApplyMoveParamTransfer line ~10409 nulls the caller on IsUniqueTypeArg),
+so entry-ownership == caller-consumed and no path double-frees. (b) Part 6 slot-store (MainListener.h
+~10393) gained a `unique <interface>` element arm: the thin-pointer arm already nulled the source on
+move-out, but the interface fat-ptr store fell through WITHOUT nulling, so once the param was owning
+its scope-exit freed a value already handed to the slot (ASan double-free in _placeValueAt). The new
+arm stores the fat value then ConstantAggregateZero + MarkVariableMoved the named source, so the
+moved-out slot is a no-op at exit. No new serialized field (uniqueAutoSink is a local; IsOwning/
+IsUniqueTypeArg already ride the cache) - warm-cache oracle + err tests re-verified explicitly.
+Pre-flight: grep found no by-value unique-param body that hand-frees + relies on no exit drop (only
+comments and btree node deletes); full suite green pre-collapse confirms zero flip. Unique-INTERFACE
+sinks ARE covered (arm (b)). DICTIONARY COLLAPSE: single-body add (`if (insertSlot == -1) return
+false;` + direct `_values[slot] = value`) and set (direct store, overwrite via _releaseValueAt);
+deleted _placeOrInsertSink, _freeValue, _placeValueAt (now unused), the inner is_unique(V)
+duplicate-free, and both is_copyable(V) add/set if-const splits. Kept: the `!is_pointer(V)` transfer
+overloads, the _slot key-policy compile_error guards, copy()'s dead-branch is_unique/is_copyable
+guards. btree.cb UNTOUCHED (follow-on now has fix (1) but still needs borrowed-slot recovery).
+Tests: +21 oracle legs (431->452: dup-refusal across primitive/string/copyable-struct/non-copyable-
+holder/thin-unique/unique-iface incl. NAMED sources, plain-set non-copyable overwrite, and a
+container-free gap-1 shape `_r3UniqueSink`). Verified: test.sh Release 482/0/8 cold+warm, oracle 452
+HeapAudit+asan clean cold+warm, example_mac 35/0, test_lsp 152/0, dictionary err tests fire cold+warm.
+issue sink-param-thin-unique-exit-drop-gap.md DELETED (fixed); move-copyable-param-overload-uaf.md
+KEPT (gap 2, separate session).
+STEP R4 DONE 2026-07-23 - PLAN COMPLETE. Residual container `if const` inventory verified
+equal to the accepted-permanent-residue list: 5x `!is_pointer` transfer-overload guards
+(list add/set, stack push, queue enqueue, dictionary set), the copy() diagnostic ladders
+(is_unique dead-branch guards + tailored !is_copyable messages in list x2 / dictionary),
+and dictionary _slot hash dispatch + the is_unique(K) key-policy rejection. Every OWNERSHIP
+decision - store, release, return, copy, and (new in Part 8) function ENTRY - defers to T
+with zero `if const`. 9c stands as KEEP, 9d as DEFER. Final sweep (independently re-run):
+test.sh Release 482/0/8, leak oracle 452 HeapAudit clean, example_mac 35/0, test_lsp 152/0
+(agent-run post-R3). Open follow-ons moved to the plan header. Whole R1-R4 changeset is one
+uncommitted working tree for maintainer review.
+GATE RESOLVED 2026-07-23: maintainer signed off via design principle rather than a literal
+yes - "CFlat is alias/borrow by default (between C++ copy-default and Rust move-default);
+the goal is easy, memory-safe, performant user code, OFFLOADING the copy/move decision to
+the compiler." That principle selects inference (8b) over annotation, accepts the
+caller-side use-after-move errors as the compiler doing its job, and endorses the 8a
+exit-drop (no value falls on the floor). R1 may proceed.
 
 ## Status
 

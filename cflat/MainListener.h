@@ -919,6 +919,32 @@ inline void CollectUnconditionalMovedNames(antlr4::tree::ParseTree* node, std::u
     }
 }
 
+// Collect bare source names CONSUMED by a plain store ANYWHERE in the body (at-least-one-path):
+// the RHS of a plain `=` assignment (`X = value`, incl. a slot store `_data[i] = value`), a decl
+// initializer (`T x = value`), or a `move <name>` (conditional too). Unlike
+// CollectUnconditionalMovedNames this DESCENDS into runtime conditionals/loops - 8a's total
+// scope-exit drop makes a not-taken path sound. Lambdas / nested functions are a different scope
+// and are not descended into. The caller intersects with the param list; a non-bare RHS (`v.f`,
+// `v + 1`) never equals a param name, so it is naturally excluded (only a whole-value move counts).
+inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unordered_set<std::string>& out)
+{
+    if (node == nullptr) return;
+    if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node)) return;
+    if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(node)) return;
+    if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+        if (asn->assignmentOperator() != nullptr && asn->assignmentOperator()->getText() == "="
+            && asn->assignmentExpression() != nullptr)
+            out.insert(asn->assignmentExpression()->getText());
+    if (auto* init = dynamic_cast<CFlatParser::InitDeclaratorContext*>(node))
+        if (auto* iz = init->initializer(); iz != nullptr && iz->assignmentExpression() != nullptr)
+            out.insert(iz->assignmentExpression()->getText());
+    if (auto* mv = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
+        if (auto* u = mv->unaryExpression())
+            out.insert(u->getText());
+    for (auto* child : node->children)
+        CollectConsumedStoreNames(child, out);
+}
+
 // A parameter shape that can carry an owning VALUE (a value struct or `string`). Excludes
 // borrows (pointers, interface values, array-views), function pointers, arrays, and params
 // already carrying a move/alias/unique qualifier. The definitive "type owns a resource" test
@@ -941,12 +967,16 @@ inline bool ParamIsOwningSinkEligible(const LLVMBackend::TypeAndValue& p)
     return true;
 }
 
-// Owning-value move-sink inference: a plain by-value parameter the body UNCONDITIONALLY moves
-// becomes a synthesized sink (IsOwningSink) so the caller's owning source is nulled at the call
-// site. The concrete "owns a resource" gate is applied by the consumers, so a non-owning T (e.g.
-// int, a bare T* borrow) is left untouched. The scan is STRUCTURAL (does the body move the
-// param?), independent of T, so it runs on generic-CLASS-method instantiations too -
-// ParseFunctionDefinition calls this on the monomorphized param list.
+// Owning-value move-sink inference: a plain by-value parameter is a synthesized sink (IsOwningSink)
+// so the caller's owning source is nulled at the call site. Two triggers:
+//  (1) an UNCONDITIONAL top-level `move <param>` - the explicit opt-out; consumes any owner.
+//  (2) STEP R1 (8b): the body CONSUMES the param via a plain `=`/slot store or a conditional `move`
+//      on at least one path. This is flagged STRUCTURALLY (IsConsumeInferredSink) because the
+//      scanner cannot resolve a struct's copyability during the forward pass; the concrete
+//      NON-COPYABLE-owner gate runs later (OwningSinkConsumesConcrete) at the call site / definition
+//      where the monomorphized type is fully known. A copyable owner's store is a COPY, so it stays
+//      a borrow there. Both scans are structural (independent of T), so this runs on generic-class
+//      instantiations too - ParseFunctionDefinition calls it on the monomorphized param list.
 inline void ApplyOwningSinkInference(CFlatParser::FunctionDefinitionContext* func,
                                      std::vector<LLVMBackend::TypeAndValue>& allParams,
                                      const IfConstEvaluator& evalIfConst = {})
@@ -955,10 +985,19 @@ inline void ApplyOwningSinkInference(CFlatParser::FunctionDefinitionContext* fun
     if (body == nullptr) return;
     std::unordered_set<std::string> movedNames;
     CollectUnconditionalMovedNames(body, movedNames, evalIfConst);
+    std::unordered_set<std::string> consumedNames;
+    CollectConsumedStoreNames(body, consumedNames);
     for (auto& p : allParams)
-        if (!p.VariableName.empty() && movedNames.count(p.VariableName)
-            && ParamIsOwningSinkEligible(p))
+    {
+        if (p.VariableName.empty() || !ParamIsOwningSinkEligible(p)) continue;
+        if (movedNames.count(p.VariableName))
             p.IsOwningSink = true;
+        else if (consumedNames.count(p.VariableName))
+        {
+            p.IsOwningSink = true;
+            p.IsConsumeInferredSink = true;
+        }
+    }
 }
 
 // ForwardRefScanner performs a lightweight pre-pass over the AST to register
@@ -10347,6 +10386,28 @@ public:
                             llvm::ConstantPointerNull::get(ptrTy), rightNV.Storage);
                         compiler->MarkVariableMoved(rightNV.CallerName);
                     }
+                }
+                return right;
+            }
+
+            if (destIsElemSlot && right->getType()->isStructTy()
+                && rightNV.TypeAndValue.IsInterface && !rightNV.TypeAndValue.IsInterfacePointer
+                && (rightNV.TypeAndValue.IsUnique || rightNV.TypeAndValue.IsUniqueTypeArg))
+            {
+                // unique <interface> element: store the fat value, then zero + mark-moved a NAMED
+                // owning source so exactly one owner frees (mirrors the unique-pointer arm for the
+                // fat-ptr slot). Without the zero a plain (non-move) unique-interface sink param -
+                // now owning at entry (8a) - is freed again at its scope exit. No drop-old (empty
+                // slot; see the block header). A bare (borrow) interface element never reaches here.
+                compiler->builder->CreateStore(right, destination);
+                if (rightNV.Storage != nullptr && !rightNV.CallerName.empty()
+                    && rightNV.FieldName.empty()
+                    && (llvm::isa<llvm::AllocaInst>(rightNV.Storage)
+                        || llvm::isa<llvm::GlobalVariable>(rightNV.Storage)))
+                {
+                    compiler->builder->CreateStore(
+                        llvm::ConstantAggregateZero::get(right->getType()), rightNV.Storage);
+                    compiler->MarkVariableMoved(rightNV.CallerName);
                 }
                 return right;
             }

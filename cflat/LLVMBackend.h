@@ -487,6 +487,16 @@ public:
         // source is nulled at the call site. Consumers still gate on the concrete type owning a
         // resource (IsOwningValueType(T) || T=="string"), so a non-owning T stays harmless.
         bool IsOwningSink = false;
+        // Set alongside IsOwningSink when the sink was inferred STRUCTURALLY from a CONSUMING STORE
+        // (a plain `=`/slot store or a conditional `move`), not an unconditional top-level `move`.
+        // The scanner cannot resolve a struct's owns-resource/copyability during the forward pass
+        // (the full destructor / copy() may not exist yet), so the consume sink is recorded
+        // structurally here and the copyability decision is deferred to OwningSinkConsumesConcrete,
+        // evaluated at the call site / definition where the monomorphized type is fully known: such
+        // a sink CONSUMES (and exit-drops) only a NON-COPYABLE owner; a copyable owner's store is a
+        // COPY, so the param stays a borrow and the caller keeps its value. An unconditional-`move`
+        // sink leaves this false and consumes any owner, exactly as before.
+        bool IsConsumeInferredSink = false;
         // Pure-borrow element (list<alias T*>) whose owner lives elsewhere; a later delete of a
         // local bound to this accessor result double-frees when the real owner releases it.
         bool IsBorrowOfAliasElement = false;
@@ -2264,6 +2274,14 @@ private:
         {
             arg.setName(itr_nameArg->VariableName);
 
+            // 8a (thin unique): a plain (non-move) `unique`-type-arg pointer / interface param is a
+            // synthesized sink - ApplyMoveParamTransfer nulls the caller on IsUniqueTypeArg - but
+            // unlike an explicit `move` param it was never routed through scope-exit cleanup, so a
+            // path that does not move it out leaked. Mark it owning so EmitOwningPtrCleanup /
+            // EmitOwningInterfaceCleanup release it on the not-moved path (a no-op on a nulled slot).
+            bool uniqueAutoSink = itr_nameArg->IsUniqueTypeArg && !itr_nameArg->IsAlias
+                && !itr_nameArg->IsBorrowOfUniqueElement;
+
             if (itr_nameArg->IsInterface && !itr_nameArg->IsInterfacePointer)
             {
                 // Interface args arrive by value ({i8*,i8*}). Store in a temp alloca so
@@ -2277,12 +2295,13 @@ private:
                     .Primary = nullptr,
                     .Storage = tmp,
                     // A `move` interface param takes ownership: mark it owning so 'delete x' is
-                    // permitted (not a borrow) and scope exit destructs it if not deleted.
-                    .IsOwning = itr_nameArg->IsMove,
+                    // permitted (not a borrow) and scope exit destructs it if not deleted. A plain
+                    // `unique <iface>` sink (uniqueAutoSink) is likewise owning at entry (8a).
+                    .IsOwning = itr_nameArg->IsMove || uniqueAutoSink,
                 };
                 stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
             }
-            else if (itr_nameArg->IsMove && itr_nameArg->Pointer)
+            else if ((itr_nameArg->IsMove || uniqueAutoSink) && itr_nameArg->Pointer)
             {
                 // move parameter: alloca a slot so we can null it out on scope exit
                 auto* ptrTy = GetType(*itr_nameArg, nullptr, true);
@@ -2345,10 +2364,19 @@ private:
                 // A plain by-value OWNING-VALUE param (string/owning struct/fat closure) that is
                 // NOT a sink borrows the caller's value - the caller keeps ownership. Mark it so a
                 // downstream consuming call (a sink/`move`/unique param) is rejected, not laundered.
-                if (!itr_nameArg->IsOwningSink && !itr_nameArg->IsMove
+                // A consume-inferred sink of a COPYABLE type does NOT consume (store is a copy), so
+                // it is still a borrow here - OwningSinkConsumesConcrete makes that call per T.
+                if (!OwningSinkConsumesConcrete(*itr_nameArg) && !itr_nameArg->IsMove
                     && !itr_nameArg->IsUniqueTypeArg && !itr_nameArg->IsAlias
                     && IsOwningValueOrClosureType(itr_nameArg->TypeName))
                     namedVar.IsBorrowedOwningValue = true;
+                // 8a: an owning sink that CONSUMES for this concrete type (a non-copyable owner) OWNS
+                // the value on entry. A path that does not move it out must release it at scope exit,
+                // or the poisoned caller's value leaks. Marking it owning routes it through the
+                // scope-exit full destructor (a no-op on a moved-out/nulled slot, same as a local).
+                if (OwningSinkConsumesConcrete(*itr_nameArg) && IsOwningValueType(itr_nameArg->TypeName)
+                    && !IsCopyableType(itr_nameArg->TypeName))
+                    namedVar.IsOwningStruct = true;
                 stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
             }
             else
@@ -3581,6 +3609,20 @@ private:
             return false;
         if (HasCopyOverloadFor(base)) return true;
         return !TypeOwnsUniquePointer(base);
+    }
+
+    // True when an owning-sink parameter actually CONSUMES its argument for the concrete
+    // (monomorphized) type. An unconditional-`move` inferred sink consumes any owner (existing
+    // behavior). A CONSUME-inferred sink (plain-store/conditional-move body, flagged structurally by
+    // the scanner) consumes ONLY a non-copyable owner: a copyable owner's store is a COPY, so the
+    // caller keeps its value and the param stays a borrow. This is the single copyability
+    // discriminator every concrete-type consumer (call-site poison, scope-exit drop, rvalue-temp
+    // ownership) consults, so the structural scanner flag and the full-info decision stay in sync.
+    bool OwningSinkConsumesConcrete(const TypeAndValue& p)
+    {
+        if (!p.IsOwningSink) return false;
+        if (p.IsConsumeInferredSink) return !IsCopyableType(p.TypeName);
+        return true;
     }
 
     // True when `typeName` has an AUTHOR-written (library/user) copy() - not the memberwise
@@ -10320,7 +10362,7 @@ public:
         // An inferred owning-value sink (body unconditionally moves the param, owning concrete
         // type) is likewise a real sink, so `move` into it transfers rather than "nothing".
         bool paramIsSink = param.IsMove || param.IsUniqueTypeArg
-            || (param.IsOwningSink && IsOwningValueOrClosureType(param.TypeName));
+            || (OwningSinkConsumesConcrete(param) && IsOwningValueOrClosureType(param.TypeName));
         DiagnoseExplicitMoveToBorrowParam(
             functionName, param.VariableName, param.TypeName, paramIsSink, arg);
     }
@@ -10353,13 +10395,13 @@ public:
                     || IsVariableOwning(args[i].CallerName) || IsVariableOwningString(args[i].CallerName)
                     || IsOwnedClosureTemp(args[i].Primary)
                     || (!args[i].CallerName.empty() && paramOwnsResource));
-            bool isOwningSink = params[i].IsOwningSink && argIsOwner && paramOwnsResource;
+            bool isOwningSink = OwningSinkConsumesConcrete(params[i]) && argIsOwner && paramOwnsResource;
             // Ownership-laundering guard: the arg is a value this function only BORROWS (a plain
             // by-value owning-value param of the current function) but the callee's param CONSUMES
             // it (a sink / `move` / unique). Transferring would null this function's alias while the
             // TRUE owner (a caller further up) still frees the resource - a silent double-free.
             bool paramConsumesOwningValue = paramOwnsResource
-                && (params[i].IsMove || params[i].IsUniqueTypeArg || params[i].IsOwningSink);
+                && (params[i].IsMove || params[i].IsUniqueTypeArg || OwningSinkConsumesConcrete(params[i]));
             if (paramConsumesOwningValue
                 && IsVariableBorrowedOwningValue(args[i].CallerName))
             {
@@ -15022,8 +15064,10 @@ public:
                     // destruction. A param that TAKES ownership is excluded (it frees the temp): a
                     // `move` param, or an inferred owning-value move-SINK - otherwise the sink slot
                     // AND this end-of-expr flush both free the temp -> double-free.
+                    // A CONSUME-inferred sink of a copyable owner does NOT take ownership (its store
+                    // is a copy), so an rvalue temp must still be registered for end-of-expr freeing.
                     bool paramTakesOwnership = candParamItr->IsMove
-                        || (candParamItr->IsOwningSink
+                        || (OwningSinkConsumesConcrete(*candParamItr)
                             && (candParamItr->TypeName == "string" || IsOwningValueType(candParamItr->TypeName)));
                     if (!paramTakesOwnership)
                         RegisterBorrowedOwningStructTemp(arg);

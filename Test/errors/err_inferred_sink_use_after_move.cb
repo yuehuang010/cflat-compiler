@@ -1,0 +1,18 @@
+// STEP R1 (8b): a plain by-value NON-COPYABLE-owner parameter whose body STORES it (a plain `=`,
+// no `move` keyword and no container in sight) is inferred an owning move sink. The caller's
+// argument is therefore CONSUMED at the call site - reading it afterward is a use-of-moved error.
+// This proves the consumption-gated inference fires on a plain assignment alone, independent of the
+// literal-`move` container path the other noncopyable err tests exercise.
+class Res { int id = default; };
+class Holder { unique Res* r = default; };
+Holder g_slot = default;
+void store(Holder h) { g_slot = h; }
+expect_error("use of moved variable 'a'");
+extern int main()
+{
+    Holder a = default;
+    a.r = new Res();
+    store(a);
+    int k = a.r == nullptr ? 0 : 1;
+    return k;
+}

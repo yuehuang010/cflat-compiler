@@ -238,6 +238,30 @@ struct UniqIfaceSlot { unique IShapeLeak v = default; };
 struct LeakHolder { unique PtrLeak* slot = nullptr; int k = 0; int hash() { return k; } };
 bool operator==(LeakHolder a, LeakHolder b) { return a.k == b.k; }
 
+// === STEP R1 (8a + 8b): consumption-gated sink inference + total scope-exit release ===
+// A plain by-value NON-COPYABLE-owner param whose body STORES it (no `move` keyword) is inferred a
+// move sink: the caller's value is CONSUMED (single owner) and freed once. A COPYABLE-owner param
+// stores a COPY - the caller keeps its value (two independent frees). A CONDITIONAL (at-least-one-
+// path) consume is made sound by the 8a scope-exit drop: on the not-taken path the owning-sink param
+// releases its still-live value instead of leaking. These free functions exercise the inference
+// WITHOUT any container machinery (the whole positive signal used to live only in the 3 err tests).
+LeakHolder g_r1SinkSlot = default;
+// (8b) plain non-generic sink: a store of the non-copyable param consumes the caller.
+void r1TakeHolder(LeakHolder hh) { g_r1SinkSlot = hh; }
+// (8b) generic sink via a plain SLOT store: for a copyable T the store COPIES (caller keeps), for a
+// non-copyable owner it MOVES (caller consumed). Same body, T's monomorphization alone decides.
+void r1StoreInto<T>(T* slot, T v) { slot[0] = v; }
+// (8a) explicit `move T` param consumed on only ONE path: the not-taken path must drop at scope exit.
+void r1MaybeKeepMove(move LeakHolder mh, int c) { if (c != 0) g_r1SinkSlot = mh; }
+// (8a + 8b) INFERRED sink (plain param, no `move`) consumed on only ONE path: the not-taken path
+// must drop at scope exit (the at-least-one-path relaxation is sound only because of that drop).
+void r1MaybeStore(LeakHolder mh, int c) { if (c != 0) g_r1SinkSlot = mh; }
+// A COPYABLE owning struct (synthesized-copy-safe: a real copy(), no raw pointer): a store consumes
+// nothing, so an RVALUE-temp argument must still be freed at end-of-expression (not orphaned as if
+// the sink took ownership). Exercises the copyable-sink rvalue-temp path.
+struct R1CpBox { string s = default; R1CpBox copy() { R1CpBox c = default; c.s = s.copy(); return move c; } };
+R1CpBox r1MkBox() { R1CpBox r = default; r.s = "rv" + "box"; return move r; }
+
 // Regression for internal/issue/discard-move-vs-decl-move-element-ownership-disparity.md:
 // `_ = move _data[i]` (the DISCARD form) must release an owning container element exactly like
 // `T tmp = move _data[i]` (the DECL form) - an owning `unique T*`/`unique IFace` element frees
@@ -382,6 +406,17 @@ struct GlobalLeakGate
 GlobalLeakGate            _gLeakGate = default;
 list<int>                 _gNums     = default;
 dictionary<string, string> _gMap     = default;
+
+// STEP R3 gap-1 shape (no container): a plain `unique V*` sink param whose body does NOT move it
+// out on some path. Before the 8a thin-unique fix the not-moved-out path LEAKED (a plain unique
+// pointer param entered as a borrow and was never released); now it is owning at entry and the
+// scope-exit drop frees it exactly once. The moved-out path transfers into the caller's list.
+bool _r3UniqueSink(bool consume, unique PtrLeak* p, list<unique PtrLeak*>* out)
+{
+    if (!consume) return false;     // not moved out - scope-exit drop frees p once
+    out->add(p);                    // moved out into the caller's list
+    return true;
+}
 
 extern int main()
 {
@@ -1257,6 +1292,94 @@ extern int main()
         }
         total++; passed += Test("dict<unique iface> dtor frees rest", g_shapeDtor, 2);
 
+        // === STEP R3: collapsed add() duplicate-key REFUSAL defers to V (8a exit-drop) ===
+        // The refused value is released by the sink param's scope-exit drop: an owner is freed
+        // exactly once (the caller was consumed and kept no handle), a copyable value leaves the
+        // caller intact, a primitive/borrow is a no-op. Named unique/iface sources exercise the
+        // gap-1 fix (a plain thin-unique / unique-interface sink released on the not-moved path).
+        {
+            // primitive V: refusal is a pure no-op (nothing owned).
+            dictionary<int, int> dp = default;
+            dp.add(1, 10);
+            total++; passed += Test("dict<int> dup add rejected", dp.add(1, 20), false);
+            total++; passed += Test("dict<int> dup add keeps value", dp.get(1), 10);
+
+            // copyable string V (NAMED source): refusal keeps the caller's string intact.
+            dictionary<int, string> ds = default;
+            string s1 = "aa" + "aa";
+            ds.add(1, s1);
+            string s2 = "bb" + "bb";
+            total++; passed += Test("dict<string> dup add rejected", ds.add(1, s2), false);
+            total++; passed += Test("dict<string> dup refusal keeps caller", s2, "bbbb");
+            total++; passed += Test("dict<string> dup add value untouched", ds.get(1), "aaaa");
+
+            // copyable owning-struct V (LeakRow, synthesized copy): refusal keeps the caller.
+            dictionary<int, LeakRow> dc = default;
+            LeakRow r1 = default; r1.name = "or" + "ig";
+            dc.add(1, r1);
+            LeakRow r2 = default; r2.name = "ke" + "pt";
+            total++; passed += Test("dict<copyable struct> dup add rejected", dc.add(1, r2), false);
+            total++; passed += Test("dict<copyable struct> dup refusal keeps caller", r2.name, "kept");
+
+            // non-copyable owning struct V (LeakHolder, NAMED source): refused value freed once,
+            // caller CONSUMED (poisoned - never read after). Inserted + refused each free a pointee.
+            g_shapeDtor = 0;
+            {
+                dictionary<int, LeakHolder> dh = default;
+                LeakHolder h1 = default; h1.slot = new PtrLeak(); h1.k = 1;
+                dh.add(1, h1);
+                LeakHolder h2 = default; h2.slot = new PtrLeak(); h2.k = 1;
+                total++; passed += Test("dict<noncopy holder> dup add rejected", dh.add(1, h2), false);
+                total++; passed += Test("dict<noncopy holder> dup refusal frees refused once", g_shapeDtor, 1);
+            }
+            total++; passed += Test("dict<noncopy holder> dtor frees inserted", g_shapeDtor, 2);
+
+            // thin unique V* (NAMED source): gap-1 fix - a plain unique sink released on refusal.
+            g_shapeDtor = 0;
+            {
+                dictionary<int, unique PtrLeak*> du;
+                du.add(1, new PtrLeak());
+                unique PtrLeak* p = new PtrLeak();
+                total++; passed += Test("dict<unique ptr> named dup add rejected", du.add(1, move p), false);
+                total++; passed += Test("dict<unique ptr> named dup frees refused once", g_shapeDtor, 1);
+            }
+            total++; passed += Test("dict<unique ptr> named dup dtor frees inserted", g_shapeDtor, 2);
+
+            // unique interface (NAMED source): gap-1 interface arm - fat-ptr sink released on refusal.
+            g_shapeDtor = 0;
+            {
+                dictionary<int, unique IShapeLeak> di;
+                di.add(1, new CircleLeak());
+                unique IShapeLeak c = new CircleLeak();
+                total++; passed += Test("dict<unique iface> named dup add rejected", di.add(1, move c), false);
+                total++; passed += Test("dict<unique iface> named dup frees refused once", g_shapeDtor, 1);
+            }
+            total++; passed += Test("dict<unique iface> named dup dtor frees inserted", g_shapeDtor, 2);
+
+            // plain (inferred-sink) set() overwrite for a non-copyable V: releases old, stores new.
+            g_shapeDtor = 0;
+            {
+                dictionary<int, LeakHolder> dov = default;
+                LeakHolder a = default; a.slot = new PtrLeak(); a.k = 5;
+                dov.set(5, a);
+                LeakHolder b = default; b.slot = new PtrLeak(); b.k = 5;
+                dov.set(5, b);                     // overwrite: releases the old holder's pointee
+                total++; passed += Test("dict<noncopy> plain set overwrite frees old", g_shapeDtor, 1);
+            }
+            total++; passed += Test("dict<noncopy> plain set dtor frees current", g_shapeDtor, 2);
+
+            // gap-1 shape without a container: plain unique* sink, not-moved-out path frees once.
+            g_shapeDtor = 0;
+            {
+                list<unique PtrLeak*> keep = default;
+                _r3UniqueSink(false, new PtrLeak(), &keep);   // refuse: scope-exit drop frees it
+                total++; passed += Test("gap1 plain unique* sink refuse frees once", g_shapeDtor, 1);
+                _r3UniqueSink(true, new PtrLeak(), &keep);      // consume: transferred into keep
+                total++; passed += Test("gap1 plain unique* sink consume deferred", g_shapeDtor, 1);
+            }
+            total++; passed += Test("gap1 plain unique* sink list teardown frees moved-out", g_shapeDtor, 2);
+        }
+
         // hashset<ptr> BORROWS its elements (add() takes a plain param - no move/null): remove(),
         // clear(), and the destructor free nothing; the caller owns and frees the pointees.
         g_shapeDtor = 0;
@@ -1664,6 +1787,50 @@ extern int main()
             total++; passed += Test("stack<noncopy> move push top k", sh.peek().k, 2);
         }
         total++; passed += Test("stack<noncopy> teardown frees both slots", g_shapeDtor, 2);
+
+        // === STEP R2: collapsed single-body enqueue/push - PLAIN insert (no `move` keyword) ===
+        // The single body defers to T: enqueue.cb/stack.cb's plain enqueue(T)/push(T) infer an
+        // owning sink for a non-copyable element (the store consumes it, no keyword needed at the
+        // call site) and copy a copyable element (caller keeps its value, verified independent).
+        g_shapeDtor = 0;
+        {
+            queue<LeakHolder> qh2;
+            LeakHolder qh2a = default; qh2a.slot = new PtrLeak(); qh2a.k = 11;
+            qh2.enqueue(qh2a);   // no `move`; inferred sink consumes qh2a (see err_queue_noncopyable_elem.cb)
+            LeakHolder qh2b = default; qh2b.slot = new PtrLeak(); qh2b.k = 12;
+            qh2.enqueue(qh2b);
+            total++; passed += Test("queue<noncopy> inferred enqueue front k", qh2.peek().k, 11);
+        }
+        total++; passed += Test("queue<noncopy> inferred teardown frees both", g_shapeDtor, 2);
+
+        g_shapeDtor = 0;
+        {
+            stack<LeakHolder> sh2;
+            LeakHolder sh2a = default; sh2a.slot = new PtrLeak(); sh2a.k = 21;
+            sh2.push(sh2a);      // no `move`; inferred sink consumes sh2a (see err_stack_noncopyable_elem.cb)
+            LeakHolder sh2b = default; sh2b.slot = new PtrLeak(); sh2b.k = 22;
+            sh2.push(sh2b);
+            total++; passed += Test("stack<noncopy> inferred push top k", sh2.peek().k, 22);
+        }
+        total++; passed += Test("stack<noncopy> inferred teardown frees both", g_shapeDtor, 2);
+
+        // Caller-keeps leg (copyable element, plain insert): the source stays live and
+        // independent after enqueue/push - the single body COPIES for a copyable T.
+        {
+            queue<LeakRow> qr2;
+            LeakRow qr2src = default; qr2src.name = "or" + "ig";
+            qr2.enqueue(qr2src);
+            qr2src.name = "MUT" + "ATED";
+            total++; passed += Test("queue<val> inferred enqueue copies (slot)",   qr2.peek().name, "orig");
+            total++; passed += Test("queue<val> inferred enqueue copies (source)", qr2src.name, "MUTATED");
+
+            stack<LeakRow> sr2;
+            LeakRow sr2src = default; sr2src.name = "or" + "ig";
+            sr2.push(sr2src);
+            sr2src.name = "MUT" + "ATED";
+            total++; passed += Test("stack<val> inferred push copies (slot)",   sr2.peek().name, "orig");
+            total++; passed += Test("stack<val> inferred push copies (source)", sr2src.name, "MUTATED");
+        }
     }
 
     // === `_ = move _data[i]` DISCARD-FORM element release parity (every element kind) ===
@@ -1914,6 +2081,39 @@ extern int main()
             total++; passed += Test("releaseAt owning-val removeAt frees member", g_shapeDtor, 1);
             LeakHolder h2 = default; h2.slot = new PtrLeak(); h2.k = 3; lh.set(0, move h2);
             total++; passed += Test("releaseAt owning-val set frees old member", g_shapeDtor, 2);
+        }
+        // === STEP R2: collapsed single-body list.add/list.set - PLAIN insert (no `move`) ===
+        // Single body defers to T: a non-copyable element is CONSUMED via inference (no keyword
+        // needed at the call site, see err_list2_noncopyable_add.cb); a copyable element COPIES,
+        // leaving the caller's source live and independent.
+        {
+            g_shapeDtor = 0;
+            list<LeakHolder> lh2 = default;
+            LeakHolder lh2a = default; lh2a.slot = new PtrLeak(); lh2a.k = 31;
+            lh2.add(lh2a);      // no `move`; inferred sink consumes lh2a
+            LeakHolder lh2b = default; lh2b.slot = new PtrLeak(); lh2b.k = 32;
+            lh2.add(lh2b);
+            total++; passed += Test("list<noncopy> inferred add k", lh2.get(0).k * 10 + lh2.get(1).k, 342);
+            LeakHolder lh2c = default; lh2c.slot = new PtrLeak(); lh2c.k = 33;
+            lh2.set(0, lh2c);   // no `move`; inferred sink consumes lh2c, old slot released first
+            total++; passed += Test("list<noncopy> inferred set frees old", g_shapeDtor, 1);
+        }
+        total++; passed += Test("list<noncopy> inferred teardown frees remaining", g_shapeDtor, 3);
+
+        // Caller-keeps leg (copyable element, plain insert): source stays live and independent.
+        {
+            list<LeakRow> lr2 = default;
+            LeakRow lr2src = default; lr2src.name = "or" + "ig";
+            lr2.add(lr2src);
+            lr2src.name = "MUT" + "ATED";
+            total++; passed += Test("list<val> inferred add copies (slot)",   lr2.get(0).name, "orig");
+            total++; passed += Test("list<val> inferred add copies (source)", lr2src.name, "MUTATED");
+
+            LeakRow lr2set = default; lr2set.name = "se" + "cond";
+            lr2.set(0, lr2set);
+            lr2set.name = "AGA" + "IN";
+            total++; passed += Test("list<val> inferred set copies (slot)",   lr2.get(0).name, "second");
+            total++; passed += Test("list<val> inferred set copies (source)", lr2set.name, "AGAIN");
         }
         // bare P* BORROW: the list never owned the pointee - the in-body drop must free NOTHING (a
         // spurious delete here is the double-free the fix removed). The caller frees them.
@@ -2534,6 +2734,72 @@ extern int main()
             total++; passed += Test("dict<str,unique ptr> rehash live before teardown", g_shapeDtor, 0);
         }
         total++; passed += Test("dict<str,unique ptr> rehash teardown frees each once", g_shapeDtor, 40);
+    }
+
+    // === STEP R1 (8a + 8b): consumption-gated sink inference + total scope-exit release ===
+    {
+        // (8b) plain non-generic sink: storing the non-copyable param consumes the caller; the
+        // global owns the single live value, freed once when released.
+        g_shapeDtor = 0;
+        {
+            LeakHolder h = default; h.slot = new PtrLeak();
+            r1TakeHolder(h);   // no `move` keyword; h is consumed by inference
+            total++; passed += Test("r1 plain sink: global holds, not yet freed", g_shapeDtor, 0);
+        }
+        _ = move g_r1SinkSlot;
+        total++; passed += Test("r1 plain sink: freed exactly once", g_shapeDtor, 1);
+
+        // (8b) generic sink at a COPYABLE T (string): the store COPIES, so the caller keeps its
+        // value and both the original and the slot copy free independently (two frees, no leak).
+        {
+            string dst = default;
+            string src = "r1cp" + "y";
+            r1StoreInto(&dst, src);   // copyable -> src NOT consumed
+            total++; passed += Test("r1 generic sink copyable: caller kept", src, "r1cpy");
+            total++; passed += Test("r1 generic sink copyable: slot copy",   dst, "r1cpy");
+        }
+
+        // (8b) generic sink at a NON-COPYABLE owner: the SAME call site MOVES, consuming the caller;
+        // the destination local owns the single value, freed exactly once.
+        g_shapeDtor = 0;
+        {
+            LeakHolder dst = default;
+            LeakHolder h = default; h.slot = new PtrLeak();
+            r1StoreInto(&dst, h);   // non-copyable -> h consumed (poisoned)
+            total++; passed += Test("r1 generic sink noncopyable: live before teardown", g_shapeDtor, 0);
+        }
+        total++; passed += Test("r1 generic sink noncopyable: freed exactly once", g_shapeDtor, 1);
+
+        // (8a) explicit `move T` param, conditional consume - NOT taken: the param drops at scope exit.
+        g_shapeDtor = 0;
+        { LeakHolder h = default; h.slot = new PtrLeak(); r1MaybeKeepMove(move h, 0); }
+        total++; passed += Test("r1 move-param not-consumed: dropped once", g_shapeDtor, 1);
+        // (8a) explicit `move T` param, conditional consume - TAKEN: the value moves into the global.
+        g_shapeDtor = 0;
+        { LeakHolder h = default; h.slot = new PtrLeak(); r1MaybeKeepMove(move h, 1); }
+        _ = move g_r1SinkSlot;
+        total++; passed += Test("r1 move-param consumed: freed once", g_shapeDtor, 1);
+
+        // (8a + 8b) INFERRED sink, conditional consume - NOT taken: the not-taken path must drop the
+        // param (the at-least-one-path relaxation is sound only because of this scope-exit release).
+        g_shapeDtor = 0;
+        { LeakHolder h = default; h.slot = new PtrLeak(); r1MaybeStore(h, 0); }
+        total++; passed += Test("r1 inferred-sink not-consumed: dropped once", g_shapeDtor, 1);
+        // (8a + 8b) INFERRED sink, conditional consume - TAKEN: the value moves into the global.
+        g_shapeDtor = 0;
+        { LeakHolder h = default; h.slot = new PtrLeak(); r1MaybeStore(h, 1); }
+        _ = move g_r1SinkSlot;
+        total++; passed += Test("r1 inferred-sink consumed: freed once", g_shapeDtor, 1);
+
+        // (8b) COPYABLE sink receiving an RVALUE temp: the store COPIES, so the caller keeps nothing
+        // but the temp must still be freed at end-of-expression (not orphaned as an owned sink). The
+        // slot copy and the temp are both freed - a leak here means the copyable sink wrongly claimed
+        // ownership of the temp.
+        {
+            R1CpBox dst = default;
+            r1StoreInto(&dst, r1MkBox());   // generic sink at copyable T; rvalue temp argument
+            total++; passed += Test("r1 copyable sink rvalue-temp: slot copy", dst.s, "rvbox");
+        }
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

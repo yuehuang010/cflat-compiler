@@ -58,22 +58,6 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         }
     }
 
-    // Store into a slot that holds no live element yet. `unique` takes ownership (a unique
-    // parameter is a synthesized move sink); a bare pointer or interface is aliased; a
-    // value type is deep-copied so the caller's original stays independent.
-    // `is_pointer(T)` is true for a bare, `unique` or `alias` pointer AND for an interface
-    // value, so it covers every borrowed spelling.
-    void _placeAt(int index, T value)
-    {
-        // Part 6: the slot store defers entirely to T via the total-assignment semantics - a
-        // COPYABLE owner COPIES into the slot, a `unique` pointer or interface TRANSFERS (its
-        // by-value param is a move sink, consumed with no keyword), a bare pointer / interface
-        // BORROW aliases, a primitive copies. It does NOT drop the old slot: a live slot is released
-        // by the caller first, so this only ever writes an EMPTY slot. The old 5-way
-        // is_unique/is_pointer/is_primitive/!is_copyable ladder is gone.
-        _data[index] = value;
-    }
-
     // Release the element in a live slot by moving it into the discard sink and letting that drop:
     // ownership DEFERS to T, so no `if const`. A `unique` element (thin `unique T*` or a `unique`
     // interface fat pointer) is freed once; a bare pointer / interface BORROW frees nothing; a
@@ -83,31 +67,16 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         _ = move _data[index];
     }
 
-    // Append value. A COPYABLE element (string, closure, a struct with copy(), a bare pointer or
-    // interface borrow, a primitive) goes through _placeAt, which COPIES a value (caller's
-    // original left intact) or ALIASES a borrow. A NON-COPYABLE element (a struct that owns a
-    // `unique` and has no copy(), or a `unique` pointer) cannot be copied, so it is MOVED by
-    // default - the caller's source is consumed. The by-value param becomes a synthesized move
-    // sink only when a top-level `move value` appears in THIS method's body - an inlined
-    // `_data[slot] = move value` OR a call argument like `_placeAt(slot, move value)` both count.
-    // A plain `_placeAt(slot, value)` (no `move`) does NOT mark the param a sink.
-    if const (is_copyable(T))
+    // Append value. The store defers entirely to T, single body, no `if const`: a COPYABLE owner
+    // (string, a struct with copy(), a primitive) COPIES so the caller keeps its value; a bare
+    // pointer or interface BORROW is aliased; a NON-COPYABLE owner or `unique` pointer is
+    // CONSUMED - the plain store here is inferred as an owning sink for that instantiation, so
+    // the caller's argument is moved and poisoned with no `move` keyword needed at the call site.
+    void add(T value)
     {
-        void add(T value)
-        {
-            if (_size >= _capacity) _grow();
-            _placeAt(_size, value);
-            _size++;
-        }
-    }
-    else
-    {
-        void add(T value)
-        {
-            if (_size >= _capacity) _grow();
-            _data[_size] = move value;
-            _size++;
-        }
+        if (_size >= _capacity) _grow();
+        _data[_size] = value;
+        _size++;
     }
 
     // Transfer overloads - the caller writes `move` to give up ownership instead of paying
@@ -128,25 +97,14 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     }
 
     // Overwrite the element at index. The old element is released first, then the new one is
-    // stored: a COPYABLE value is copied (caller's original intact), a borrow aliased; a
-    // NON-COPYABLE owning value is moved (consumed), same rule as add() above.
-    if const (is_copyable(T))
+    // stored: single body, no `if const`, same store rule as add() above - a COPYABLE value is
+    // copied (caller's original intact), a borrow aliased, a NON-COPYABLE owner or `unique`
+    // pointer is CONSUMED (inferred owning sink, no `move` keyword needed at the call site).
+    void set(int index, T value)
     {
-        void set(int index, T value)
-        {
-            _checkBounds(index, "set");
-            _releaseAt(index);
-            _placeAt(index, value);
-        }
-    }
-    else
-    {
-        void set(int index, T value)
-        {
-            _checkBounds(index, "set");
-            _releaseAt(index);
-            _data[index] = move value;
-        }
+        _checkBounds(index, "set");
+        _releaseAt(index);
+        _data[index] = value;
     }
 
     // set()'s transfer counterpart, guarded exactly like add(move T) above. Declaration order

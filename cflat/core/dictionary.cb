@@ -123,22 +123,6 @@ struct dictionary<K, V>
         _keys[index] = key.copy();
     }
 
-    // Store a value into a slot that holds no live value yet. `unique` takes ownership (a
-    // unique-substituted parameter is a synthesized move sink); a bare pointer or interface
-    // value is aliased (BORROWED); a value type is deep-copied so the caller's original stays
-    // independent. `is_pointer(V)` is true for a bare, `unique` or `alias` pointer AND for an
-    // interface value, so it covers every borrowed spelling.
-    void _placeValueAt(int index, V value)
-    {
-        // Part 6: the value slot store defers entirely to V via the total-assignment semantics - a
-        // COPYABLE owner COPIES into the slot, a `unique` pointer or interface TRANSFERS (its
-        // by-value param is a move sink, consumed with no keyword), a bare pointer / interface
-        // BORROW aliases, a primitive copies. It does NOT drop the old slot: a live slot is released
-        // by the caller first, so this only ever writes an EMPTY slot. The old 5-way
-        // is_unique/is_pointer/is_primitive/!is_copyable ladder is gone. The KEY side is untouched.
-        _values[index] = value;
-    }
-
     // Release the value in a live slot by moving it into the discard sink and letting that drop:
     // ownership DEFERS to V, so no `if const`. A `unique` value (thin `unique V*` or a `unique`
     // interface fat pointer) is freed once; a bare pointer / interface BORROW frees nothing; a
@@ -154,15 +138,6 @@ struct dictionary<K, V>
     void _releaseKeyAt(int index)
     {
         _ = move _keys[index];
-    }
-
-    // Free a value handed to add() as a synthesized move sink that the dictionary is refusing
-    // (duplicate key). Takes `value` by `move` so the parameter's own scope-exit destructor does
-    // the freeing (deletes a `unique` pointee); a bare `delete value` on the plain parameter is
-    // rejected by the compiler as deleting a borrow. See btree.cb's `_freeValue` for the same
-    // pattern. Call sites must gate on `is_unique(V)` - never hand a borrowed pointer here.
-    void _freeValue(move V value)
-    {
     }
 
     // Locate the slot to insert `key` into, or -1 if the key is already present. Sets up the
@@ -181,124 +156,54 @@ struct dictionary<K, V>
         return slot;
     }
 
-    // Insert a new entry.  Returns true if added, false if key already present
-    // (existing value is left untouched - use set() to overwrite).
-    // A value type V is COPIED (the caller's value is left intact); a bare pointer/interface
-    // value is borrowed (the dictionary never frees it); when V is `unique` the dictionary
-    // TAKES ownership - a unique-substituted parameter is a synthesized move sink.
-    // A COPYABLE value is COPIED (caller's original left intact); on a duplicate key the by-value
-    // copy is simply discarded, so the caller keeps its value either way.
-    if const (is_copyable(V))
+    // Insert a new entry. Returns true if added, false if the key is already present (the existing
+    // value is left untouched - use set() to overwrite).
+    // Store semantics DEFER to V via the direct slot store `_values[slot] = value` (Part 6/8): a
+    // COPYABLE value is COPIED (the caller keeps its original intact), a bare pointer / interface
+    // value is BORROWED (the dictionary never frees it), and a NON-COPYABLE owner or a `unique V*` /
+    // `unique <iface>` is MOVED - the direct store classifies as a consuming store, so the plain
+    // `value` param is inferred an owning sink (no `move` keyword) and the caller's named source is
+    // CONSUMED. On a duplicate key the value is REFUSED: the still-live sink param drops at scope
+    // exit (8a), freeing an owner exactly once (the caller already gave it up); a copyable value's
+    // by-value copy is a no-op drop and the caller keeps its original either way.
+    bool add(alias K key, V value)
     {
-        bool add(alias K key, V value)
-        {
-            if (_capacity == 0) _init(8);
-            _maybeRehash();
+        if (_capacity == 0) _init(8);
+        _maybeRehash();
+        int insertSlot = _insertSlotFor(key);
+        if (insertSlot == -1) return false;
+        _placeKeyAt(insertSlot, key);
+        _values[insertSlot] = value;
+        _status[insertSlot] = 1;
+        _count++;
+        return true;
+    }
 
-            int insertSlot = _insertSlotFor(key);
-            if (insertSlot == -1)
-            {
-                // A `unique V*` is is_copyable but its param is a move sink (the caller's value was
-                // consumed), so a refused duplicate must free it or it leaks. A plain COPYABLE
-                // value (string, copyable struct) discards its by-value copy here; the caller keeps
-                // the original untouched.
-                if const (is_unique(V)) _freeValue(move value);
-                return false;
-            }
-            _placeKeyAt(insertSlot, key);
-            _placeValueAt(insertSlot, value);
-            _status[insertSlot] = 1;
+    // Insert or overwrite the value for key. Store semantics DEFER to V exactly as in add(): a
+    // COPYABLE value is COPIED (caller's original intact), a bare pointer / interface value is
+    // BORROWED, a NON-COPYABLE owner / `unique` value is MOVED (the direct slot store infers the
+    // plain `value` param an owning sink, consuming the caller). On overwrite the old value is
+    // released first via _releaseValueAt (a `unique` value is freed, a value type destructed, a
+    // borrowed pointer just dropped). set() always takes the value (insert-or-assign), so - unlike
+    // add() - there is no duplicate-refusal path.
+    void set(alias K key, V value)
+    {
+        if (_capacity == 0) _init(8);
+        _maybeRehash();
+
+        int updateSlot = _insertSlotFor(key);
+        if (updateSlot == -1)
+        {
+            updateSlot = _findSlot(key);
+            _releaseValueAt(updateSlot);
+        }
+        else
+        {
+            _placeKeyAt(updateSlot, key);
+            _status[updateSlot] = 1;
             _count++;
-            return true;
         }
-    }
-    // A NON-COPYABLE owning value (a struct that owns a `unique` and has no copy(), or a `unique`
-    // pointer) is MOVED by default - like C++ emplace/insert(&&), add() CONSUMES the value on
-    // EVERY path: placed on insert, freed on a duplicate key (the caller kept no handle, so
-    // leaving it would leak). Both paths funnel through the explicit `move V` sink below so the
-    // plain add() param is inferred a move sink (a top-level move into a call argument counts) and
-    // the caller's source is nulled. For "insert only if absent without losing x", use
-    // `if (!d.contains(k)) d.add(k, move x)` - the move is on the taken branch only.
-    else
-    {
-        // Explicit sink: the dictionary owns `value` on entry. On the refused (duplicate) path it
-        // is handed to _freeValue, whose `move V` parameter frees it on scope exit (this covers a
-        // bare `unique V*`, which a plain move-param does NOT auto-delete, as well as an owning
-        // struct); on insert it is moved into the slot.
-        bool _placeOrInsertSink(int insertSlot, alias K key, move V value)
-        {
-            if (insertSlot == -1)
-            {
-                _freeValue(move value);
-                return false;
-            }
-            _placeKeyAt(insertSlot, key);
-            _values[insertSlot] = move value;
-            _status[insertSlot] = 1;
-            _count++;
-            return true;
-        }
-
-        bool add(alias K key, V value)
-        {
-            if (_capacity == 0) _init(8);
-            _maybeRehash();
-            int insertSlot = _insertSlotFor(key);
-            return _placeOrInsertSink(insertSlot, key, move value);
-        }
-    }
-
-    // Insert or overwrite the value for key.
-    // A value type V is COPIED; a bare pointer/interface value is borrowed; when V is `unique`
-    // the dictionary takes ownership. On overwrite the old value is released first (a `unique`
-    // value is freed, a value type destructed, a borrowed pointer just dropped).
-    // A COPYABLE value is COPIED (caller's original intact); a NON-COPYABLE owning value is MOVED
-    // (consumed). On overwrite the old value is released first. set() always takes the value
-    // (insert-or-assign), so - unlike add() - there is no duplicate-refusal path; the final
-    // top-level move makes the non-copyable set() param an inferred sink.
-    if const (is_copyable(V))
-    {
-        void set(alias K key, V value)
-        {
-            if (_capacity == 0) _init(8);
-            _maybeRehash();
-
-            int updateSlot = _insertSlotFor(key);
-            if (updateSlot == -1)
-            {
-                updateSlot = _findSlot(key);
-                _releaseValueAt(updateSlot);
-            }
-            else
-            {
-                _placeKeyAt(updateSlot, key);
-                _status[updateSlot] = 1;
-                _count++;
-            }
-            _placeValueAt(updateSlot, value);
-        }
-    }
-    else
-    {
-        void set(alias K key, V value)
-        {
-            if (_capacity == 0) _init(8);
-            _maybeRehash();
-
-            int updateSlot = _insertSlotFor(key);
-            if (updateSlot == -1)
-            {
-                updateSlot = _findSlot(key);
-                _releaseValueAt(updateSlot);
-            }
-            else
-            {
-                _placeKeyAt(updateSlot, key);
-                _status[updateSlot] = 1;
-                _count++;
-            }
-            _values[updateSlot] = move value;
-        }
+        _values[updateSlot] = value;
     }
 
     // Transfer overloads - the caller writes `move` to give up ownership instead of paying for
