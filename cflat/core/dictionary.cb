@@ -112,17 +112,15 @@ struct dictionary<K, V>
         delete[] oldStatus;
     }
 
-    // Store the key into a slot that holds no live key yet. An owning key (a `string`, or a
-    // struct that owns buffers) is deep-copied so the slot owns an independent buffer: a plain
-    // store would alias the caller's `key` argument (a soon-freed temp/local), leaving the
-    // stored key dangling once that buffer is freed. remove()/clear()/the destructor free this
-    // owned copy. Primitive and pointer keys are stored as-is - the dictionary BORROWS pointer
-    // keys (it never frees them).
+    // Store the key into a slot that holds no live key yet. The total `.copy()` does the right
+    // thing per K: a primitive or pointer key copies by identity (the dictionary BORROWS pointer
+    // keys - it never frees them), while an owning key (a `string`, or a struct that owns buffers)
+    // is deep-copied so the slot owns an independent buffer. The explicit .copy() is required
+    // because `key` is an `alias K` param: a plain `=` from an alias source would ALIAS the
+    // caller's soon-freed argument, leaving the stored key dangling once that buffer is freed.
     void _placeKeyAt(int index, alias K key)
     {
-        if const (is_primitive(K))    _keys[index] = key;
-        else if const (is_pointer(K)) _keys[index] = key;
-        else                          _keys[index] = key.copy();
+        _keys[index] = key.copy();
     }
 
     // Store a value into a slot that holds no live value yet. `unique` takes ownership (a
@@ -455,35 +453,46 @@ struct dictionary<K, V>
     //     dictionary of unique values is a compile error (use move or copy elements explicitly).
     move dictionary<K, V> copy()
     {
+        // The whole table walk lives in the `else` so it is a dead if const branch for a `unique`
+        // value type: eager instantiation would otherwise codegen `_values[i].copy()` on an owned
+        // pointer (a deref-copy of the pointee), so keep it out of the unique monomorphization.
         if const (is_unique(V))
         {
             compile_error("cannot copy a dictionary of unique values; use move or copy elements explicitly");
             dictionary<K, V> none;
             return move none;
         }
-        dictionary<K, V> result;
-        if (_capacity == 0) return move result;
-        result._init(_capacity);
-        int i = 0;
-        while (i < _capacity)
+        else
         {
-            // Preserve the exact table layout (empty/occupied/deleted) so probe sequences match.
-            result._status[i] = _status[i];
-            if (_status[i] == 1)
+            dictionary<K, V> result;
+            if (_capacity == 0) return move result;
+            result._init(_capacity);
+            int i = 0;
+            while (i < _capacity)
             {
-                if const (is_primitive(K))    result._keys[i] = _keys[i];
-                else if const (is_pointer(K)) result._keys[i] = _keys[i];
-                else                          result._keys[i] = _keys[i].copy();
-                if const (is_primitive(V))    result._values[i] = _values[i];
-                else if const (is_pointer(V)) result._values[i] = _values[i];
-                else if const (!is_copyable(V)) compile_error("cannot copy this dictionary: its value type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the dictionary instead of copying it");
-                else                          result._values[i] = _values[i].copy();
+                // Preserve the exact table layout (empty/occupied/deleted) so probe sequences match.
+                result._status[i] = _status[i];
+                if (_status[i] == 1)
+                {
+                    // Total .copy() per slot: identity for a primitive/pointer key or value (the
+                    // pointer is BORROWED - both dictionaries share the pointee, freed once by the real
+                    // owner), deep for a copyable owner. The plain `=` slot store must not turn a deep
+                    // copy into an alias, which is why .copy() produces the independent value first. A
+                    // non-copyable owning value keeps its tailored error, in a dead `if const` branch.
+                    // A `unique` key is policy-rejected on the hash path; keep its .copy() out of this
+                    // eager instantiation (a `unique` element would deref-copy the pointee) with a dead
+                    // if const branch, so the real key-policy error still fires first.
+                    if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'");
+                    else                    result._keys[i] = _keys[i].copy();
+                    if const (!is_copyable(V)) compile_error("cannot copy this dictionary: its value type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the dictionary instead of copying it");
+                    else                       result._values[i] = _values[i].copy();
+                }
+                i++;
             }
-            i++;
+            result._count = _count;
+            result._tombstones = _tombstones;
+            return move result;
         }
-        result._count = _count;
-        result._tombstones = _tombstones;
-        return move result;
     }
 
     // Free owned (`unique`) values and string keys, then the backing arrays. A bare

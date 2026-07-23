@@ -227,28 +227,35 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     }
 
     // -- ICopyable ----------------------------------------------------------
-    // Deep copy. A list of `unique` elements cannot be copied: there is no generic
-    // deep-clone for the pointee, so a bitwise copy would hand one object to two owners.
-    // Bare pointer / interface elements are borrowed, so they are shallow-copied.
+    // Deep copy. Every element is copied via the total `.copy()`: a primitive/enum/bare pointer/
+    // interface borrow copies by identity (shallow - a pointer share), a copyable owner (string,
+    // struct with a real or synthesized copy()) deep-copies. A list of `unique` elements cannot be
+    // copied (no generic deep-clone for the owned pointee), and a non-copyable owning element (owns
+    // a `unique`, no copy()) is rejected with a tailored message; both guards keep the offending
+    // `.copy()` in a dead `if const` branch so a mere declaration stays legal (fires only if called).
     move list<T> copy()
     {
+        // The result-building lives in the `else` so it is a DEAD if const branch for a `unique`
+        // element type: eager instantiation would otherwise codegen `_data[i].copy()` on an owned
+        // pointer (a deref-copy of the pointee), so keep it out of the unique monomorphization.
         if const (is_unique(T))
         {
             compile_error("cannot copy a list of unique elements; copy the pointees explicitly, or use list<T*> for a borrowing copy");
             list<T> none;
             return none;
         }
-        list<T> result;
-        int i = 0;
-        while (i < _size)
+        else
         {
-            if const (is_primitive(T))    result.add(_data[i]);
-            else if const (is_pointer(T)) { T tmp = _data[i]; result.add(tmp); }
-            else if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
-            else                          result.add(_data[i].copy());
-            i++;
+            list<T> result;
+            int i = 0;
+            while (i < _size)
+            {
+                if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
+                else                       result.add(_data[i].copy());
+                i++;
+            }
+            return result;
         }
-        return result;
     }
 
     // Return an independent copy whose backing array and (string) element buffers are all
@@ -256,28 +263,32 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // the internal `new` allocations through `alloc` by installing it as the active allocator.
     move list<T> copy(IAllocator alloc)
     {
+        // Result-building sits in the `else` so it is a dead if const branch for a `unique` element
+        // type (see the no-arg copy() above for why eager instantiation forces this).
         if const (is_unique(T))
         {
             compile_error("cannot copy a list of unique elements; copy the pointees explicitly, or use list<T*> for a borrowing copy");
             list<T> none;
             return none;
         }
-        IAllocator saved = __active_allocator;
-        __active_allocator = alloc;
-
-        list<T> result;
-        int i = 0;
-        while (i < _size)
+        else
         {
-            if const (is_primitive(T))    result.add(_data[i]);
-            else if const (is_pointer(T)) { T tmp = _data[i]; result.add(tmp); }
-            else if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
-            else                          result.add(_data[i].copy());
-            i++;
-        }
+            IAllocator saved = __active_allocator;
+            __active_allocator = alloc;
 
-        __active_allocator = saved;
-        return result;
+            list<T> result;
+            int i = 0;
+            while (i < _size)
+            {
+                // Total .copy() per element (identity for borrows, deep for copyable owners).
+                if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
+                else                       result.add(_data[i].copy());
+                i++;
+            }
+
+            __active_allocator = saved;
+            return result;
+        }
     }
 
     // Lomuto partition: pivot at _data[hi], returns final pivot index.

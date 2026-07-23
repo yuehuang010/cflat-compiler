@@ -1,0 +1,15 @@
+// dictionary.copy() over a NON-COPYABLE OWNING value: a struct that owns a `unique` pointer and
+// has no hand-written copy() cannot be duplicated per-slot (the memberwise synth would share the
+// raw pointer between two owners -> double-free). The tailored per-dictionary compile_error fires
+// when copy() is actually called (deferred past eager instantiation), so a file-scope expect_error
+// catches it.
+import "dictionary.cb";
+struct Inner { int v = 0; };
+struct NC { unique Inner* p = nullptr; ~NC() {} };
+expect_error("cannot copy this dictionary: its value type owns a 'unique' pointer and has no 'copy()'");
+extern int main()
+{
+    dictionary<int, NC> src = default;
+    dictionary<int, NC> dup = src.copy();
+    return 0;
+}

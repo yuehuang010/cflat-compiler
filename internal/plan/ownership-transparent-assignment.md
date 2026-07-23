@@ -215,6 +215,21 @@ CollectUnconditionalMovedNames, MainListener.h ~880-960), so the two arms differ
   copy() diagnostic ladders.
 - Depends: 6. GATE: maintainer sign-off on THE RULE (it makes previously-leaking/rejected
   conditional-consume bodies well-defined and changes explicit `move T` param exit semantics).
+- SPIKE 2026-07-23 (8c-first, .cb-only, restored after): collapsed enqueue/push/add/set to the
+  single `_placeAt(slot, value)` body with NO compiler change and probed every matrix row.
+  RESULT: every row works TODAY except one - the non-copyable owning VALUE struct, which
+  COMPILES, does NOT poison the caller, and DOUBLE-FREES (the Part 6 slot store classifies as
+  MOVE and steals the param's unique ptr, but the param entered as a BORROW - store defers to
+  T, ENTRY does not; that asymmetry is the entire gap). `unique R*`/`unique IThing` rows work
+  because unique params already auto-sink. Blast radius under collapse: exactly the 3 err tests
+  asserting "use of moved variable 'h'" (x cold+warm = 6 fails); leak oracle stayed 405 green
+  (the positive suite never plain-inserts a non-copyable value - the whole signal lives in
+  those err tests; add positive consumed-caller legs when 8b lands). Overload-identity item
+  answered: the single plain add(T) coexists and resolves correctly against add(move T).
+  MINIMAL DELTA CONFIRMED: 8b (sink inference accepts a MOVE-CLASSIFIED plain store, gated to
+  ParamIsOwningSinkEligible types) is the functional fix; 8a (scope-exit DropValue on sink
+  params) is the soundness invariant behind it - runtime no-op for these four methods,
+  mandatory before dictionary's conditional-consume add. They ship together per THE RULE.
 
 #### API-surface matrix: `list.add(x)` semantics per monomorphized T (probed 2026-07-23)
 
@@ -325,6 +340,26 @@ explicitly-accepted policy (listed at the end).
   the generic one - decide on message quality at implementation.
 - `--init`: any new TypeAndValue/StructData field must ride the cache round-trip same-change.
 - Verify: copy() legs across all element kinds; err tests keep firing for non-copyable copy.
+- DONE 2026-07-23. The backend's CreateOverloadedFunctionCall already carried a total
+  bitwise-identity copy arm (primitives/enums/interface-borrows); the only gap was routing a
+  BARE-POINTER receiver of `.copy()` to it instead of auto-deref-copying the pointee. Two edits
+  in ParsePostfixExpression (MainListener.h ~15550 arm + stash, ~16744 [PFX-copy-ptr] dispatch):
+  a non-owning pointer receiver followed by `.copy` stashes the loaded pointer value/type (the
+  auto-deref mutates namedVar before the call is reached) and the call routes it through the
+  identity arm; a `unique`/owning pointer never arms the flag, keeping its actionable error.
+  NO new serialized fields (function-locals only), warm cache probed explicitly. Ladders
+  collapsed: list.copy() x2 -> `result.add(_data[i].copy());`, dictionary.copy() key+value ->
+  `.copy()` one-liners, _placeKeyAt -> `_keys[index] = key.copy();`. Instantiation subtlety:
+  compile_error poisons but does NOT stop codegen, and unique-element containers eagerly
+  instantiate copy(), so the table/loop walks moved into the `else` of the is_unique guards and
+  the non-copyable tailored errors sit in dead `if const` branches (kept per plan - better than
+  the generic memberwise diagnostic). Tests: +12 copy() legs in test_collection_leaks.cb
+  (393->405: int identity, string deep, borrowed-pointer shallow, dict<string,string> deep,
+  primitive-local `a.copy()`); new err_list_noncopyable_owner_copy.cb +
+  err_dict_noncopyable_owner_copy.cb; err_unique_memberwise_copy.cb retargeted to a Holder
+  VALUE (its `h.copy()` on Holder* is now legitimately pointer-identity - same assertion).
+  Verified: test.sh Release 480/0/8 (cold+warm), leak oracle 405/EXIT=0 under HeapAudit,
+  example_mac 35/0, test_lsp all passed.
 
 #### 9c - `move T` overload elision   [optional; recommend KEEP the guards]
 - The 5 `!is_pointer` guards (queue 111, stack 99, list 119/155, dict 305) gate the explicit
@@ -359,6 +394,42 @@ Every OWNERSHIP decision - store, release, return, copy - defers to T with zero 
 - Verify on the current host (`test.sh Release`, `example_mac.sh`, `test_lsp.sh`) before
   declaring a part done; never dilute an assertion; never convert a compile error into a
   silent double-free.
+
+### Roadmap to completion (as of 2026-07-23, after 9a+9b landed and the 8c-first spike)
+
+Remaining work is the Part 8 track plus close-out. Order and tiering:
+
+1. STEP R1 - 8a+8b in ONE compiler change [opus]. 8b: sink inference accepts a MOVE-CLASSIFIED
+   plain store/call-arg (no literal `move` keyword), gated to ParamIsOwningSinkEligible types;
+   8a: total scope-exit DropValue on owning-sink params (inferred AND explicit `move T`) - the
+   invariant that makes 8b's at-least-one-path relaxation sound. Ship together per THE RULE.
+   Before flipping, enumerate: existing `move T` bodies that hand-free AND rely on no exit drop
+   (double-free risk); the 3 err tests asserting "use of moved variable" must keep firing (via
+   inference instead of the literal move); IsOwningSink already serializes as "osk" - any NEW
+   flag rides the --init round-trip same-change. Verify: suites cold+warm + POSITIVE
+   consumed-caller legs (the spike proved the oracle is blind to this row - all signal
+   currently lives in 3 err tests).
+2. STEP R2 - 8c simple four [sonnet, .cb-only]. Collapse queue.enqueue / stack.push / list.add
+   / list.set to the spike-validated single `_placeAt(slot, value)` body; keep the
+   `!is_pointer(T)` transfer overloads. Add leak-oracle legs: consumed-caller (non-copyable)
+   and caller-keeps (copyable) across all four methods. The spike already validated overload
+   coexistence and every other matrix row.
+3. STEP R3 - 8c dictionary [opus]. Collapse add/set conditional-consume bodies to
+   `if (insertSlot == -1) return false;` + plain stores; delete `_placeOrInsertSink`,
+   `_freeValue` (btree.cb also uses the pattern - update it), and the inner `is_unique(V)`
+   duplicate-free. This is the first REAL exercise of 8a's exit drop (the refused-duplicate
+   value must drop at scope exit, previously the leak that forced unconditional-move
+   inference). New leak legs: add-duplicate refusal across every V kind.
+4. STEP R4 - close-out. Confirm the remaining container `if const` inventory equals the
+   "accepted permanent residue" list exactly (transfer-overload guards, copy() diagnostics,
+   hash dispatch + key-policy rejections); 9c stays KEEP, 9d stays DEFER; full sweep
+   (test.sh cold+warm, example_mac, test_lsp, leak oracle); then mark this plan COMPLETE.
+
+Done and out of scope of the roadmap: Parts 1-6 shipped; Part 9a (release/return unification +
+the incomplete-type deferred-dtor compiler fix), 9b (total .copy()) shipped. GATE STATUS: the
+8c-first spike narrowed THE RULE's blast radius to "entry defers to T like stores already do";
+maintainer has engaged the track (spike requested 2026-07-23) - explicit sign-off on landing
+8a+8b is the only open decision.
 
 ## Status
 
@@ -500,3 +571,13 @@ Every OWNERSHIP decision - store, release, return, copy - defers to T with zero 
   discard-slot-move path through `--init` bitcode, exercising the "eou" round-trip) was explicitly
   probed: full leak matrix (374) HeapAudit-clean against a warm cache. Suites green: test.sh Release
   476/0/8 (cold+warm), example_mac 35/0, test_lsp 152/0.
+- 2026-07-23 (evening): 9a COMPLETED including the compiler fix (EmitOwningPtrCleanup resolves
+  through GetFullDestructorForDelete - the live self-ref leak through dict/stack/queue teardown
+  is fixed, ~list() collapsed, 6 self-ref regression legs in test_move.cb, issue file deleted).
+  9b DONE (total `.copy()` over T; mechanism and collapses in the 9b section). 8c-first SPIKE
+  run and restored (record in the Part 8 section): the single-body insert surface works for
+  every matrix row except the non-copyable owning VALUE struct, which compiles, skips
+  poisoning, and DOUBLE-FREES - store defers to T, entry does not; minimal delta confirmed as
+  8b (move-classified consume inference) + 8a (scope-exit DropValue invariant). Roadmap
+  section (R1-R4) added before Status. Suites green at every step: test.sh Release 480/0/8
+  (cold+warm), leak oracle 405 under HeapAudit, example_mac 35/0, test_lsp green.

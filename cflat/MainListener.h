@@ -15453,6 +15453,12 @@ public:
             // root function: the following call must resolve at root (skip the enclosing-namespace
             // walk). Consumed and cleared by the call dispatch so chained calls do not inherit it.
             bool globalScopeCall = false;
+            // Armed by [PFX-1] when a bare-pointer BORROW receiver is followed by `.copy` - the next
+            // call is a pointer-identity copy (see [PFX-copy-ptr]). The pointer value/type are stashed
+            // because the auto-deref mutates namedVar. Consumed and cleared by the call.
+            bool pendingPtrCopyIdentity = false;
+            llvm::Value* pendingPtrCopyValue = nullptr;
+            LLVMBackend::TypeAndValue pendingPtrCopyType;
             // Consumed-COM sugar receiver: when [PFX-2a] redirects a thin interface pointer through
             // its lpVtbl, this holds the original object pointer so the following call ([PFX-5])
             // can inject it as the implicit `this` first argument - `rs->Release()` dispatches as
@@ -15544,6 +15550,25 @@ public:
                                 }
                             }
                         }
+                        // Total .copy() over a bare-pointer BORROW receiver: the following `copy()` is a
+                        // pointer-identity copy (shares the pointee), handled by [PFX-copy-ptr]. The
+                        // auto-deref below still runs (a harmless load) and leaves namedVar as the pointer,
+                        // so the arm keys off namedVar; this flag only records that the receiver is a
+                        // non-owning pointer so a `unique`/owning pointer keeps its actionable error.
+                        if ((tokenType == CFlatParser::Dot || tokenType == CFlatParser::Arrow)
+                            && namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsInterface
+                            && !(namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg
+                                 || namedVar.IsOwning || namedVar.TypeAndValue.ElementOwningUnique)
+                            && NextMemberName(ctx, parseTree) == "copy")
+                        {
+                            // Capture the pointer VALUE now: the auto-deref below leaves namedVar in a
+                            // deref'd (non-pointer) shape by the time the call is reached, so [PFX-copy-ptr]
+                            // reads this stashed value/type rather than the mutated namedVar.
+                            pendingPtrCopyIdentity = true;
+                            pendingPtrCopyValue = namedVar.Primary ? namedVar.Primary : LoadNamedVariable(namedVar);
+                            pendingPtrCopyType  = namedVar.TypeAndValue;
+                        }
+
                         // For any member access on a pointer to a known struct, load the pointer
                         // so subsequent field/method lookups work. '.' auto-deduces the dereference
                         // just like '->'; '?.' does the same but also arms the null-conditional check.
@@ -16718,6 +16743,34 @@ public:
                         std::string functionName = primaryIdentifier;
 
                         auto argumentList = ctx->argumentExpressionList();
+
+                        // [PFX-copy-ptr] Total .copy() over a bare-pointer BORROW receiver. [PFX-1] armed
+                        // this and stashed the pointer value/type (the auto-deref since mutated namedVar).
+                        // A pointer copy shares the pointee (shallow), so .copy() is IDENTITY - route the
+                        // stashed pointer through copy()'s bitwise-identity arm. A `unique`/owning pointer
+                        // never arms this flag (it keeps its auto-deref error), so no silent double-free.
+                        if (functionName == "copy" && pendingPtrCopyIdentity
+                            && (argumentList.empty()
+                                || (functionArgCounter < (int)argumentList.size()
+                                    && argumentList[functionArgCounter]->argumentNamedExpression().empty())))
+                        {
+                            pendingPtrCopyIdentity = false;
+                            auto* compiler = Compiler(ctx);
+                            LLVMBackend::NamedVariable selfArg;
+                            selfArg.Primary  = pendingPtrCopyValue;
+                            selfArg.BaseType = pendingPtrCopyValue ? pendingPtrCopyValue->getType() : nullptr;
+                            selfArg.TypeAndValue = pendingPtrCopyType;
+                            selfArg.TypeAndValue.VariableName = "";
+                            llvm::Value* result = compiler->CreateOverloadedFunctionCall("copy", { selfArg });
+                            namedVar = {};
+                            namedVar.Primary  = result;
+                            namedVar.BaseType = result ? result->getType() : nullptr;
+                            namedVar.TypeAndValue = compiler->lastCallReturnType;
+                            structVar = {};
+                            interfaceVar = {};
+                            functionArgCounter++;
+                            break;
+                        }
 
                         // Lambda<T>.toFunction(): lower a fat closure to a thin `function<T>` C pointer.
                         // Returns the bare code ptr when the closure does not capture (env null), or a

@@ -1142,6 +1142,57 @@ extern int main()
         total++; passed += Test("hashset<struct> contains copy",  hn.contains(nm), true);
     }
 
+    // === Part 9b: TOTAL .copy() over T - the per-element copy() defers to the element kind ===
+    // Each element's `.copy()` is identity for a primitive/enum/borrow and a deep copy for a
+    // copyable owner. The legs below exercise the kinds the collapsed list/dictionary copy() relies
+    // on; the HeapAudit oracle proves the borrow legs alias (no double-free) and the deep legs are
+    // independent (no leak, source intact).
+    {
+        // list<int>: primitive elements copy by identity (value copy).
+        list<int> li = default; li.add(10); li.add(20);
+        list<int> liCopy = li.copy();
+        total++; passed += Test("list<int> copy value", liCopy.get(1), 20);
+        li.set(0, 99);                                  // mutate source
+        total++; passed += Test("list<int> copy independent of source", liCopy.get(0), 10);
+
+        // list<string>: DEEP copy - mutating the source leaves the copy unchanged, both freed once.
+        list<string> lstr = default;
+        lstr.add("aa" + "bb");                          // genuinely owned buffer
+        list<string> lstrCopy = lstr.copy();
+        total++; passed += Test("list<string> deep copy value", lstrCopy.get(0), "aabb");
+        lstr.set(0, "cc" + "dd");                       // reassign source element (old owned buffer freed)
+        total++; passed += Test("list<string> source mutated", lstr.get(0), "ccdd");
+        total++; passed += Test("list<string> deep copy unchanged", lstrCopy.get(0), "aabb");
+
+        // list<struct-ptr> BORROW: copy() shallow-copies the pointers - both lists alias the same
+        // pointee (caller owns it and frees once). This exercises the pointer-to-STRUCT identity arm.
+        g_shapeDtor = 0;
+        PtrLeak* sp = new PtrLeak();
+        {
+            list<PtrLeak*> lsp = default; lsp.add(sp);
+            list<PtrLeak*> lspCopy = lsp.copy();
+            total++; passed += Test("list<struct-ptr> borrow copy aliases same", lsp.get(0) == lspCopy.get(0), true);
+        }
+        total++; passed += Test("list<struct-ptr> two borrow copies free nothing", g_shapeDtor, 0);
+        delete sp;                                      // caller owns the pointee, frees it once
+        total++; passed += Test("list<struct-ptr> owner frees exactly once", g_shapeDtor, 1);
+
+        // dictionary<string, string>: DEEP copy of both key and value; both dicts freed once.
+        dictionary<string, string> ds = default;
+        ds.set("k" + "1", "v" + "1");
+        dictionary<string, string> dsCopy = ds.copy();
+        total++; passed += Test("dict<string,string> deep copy value", dsCopy.get("k1"), "v1");
+        ds.set("k1", "v" + "2");                         // overwrite source value (old freed)
+        total++; passed += Test("dict<string,string> source mutated", ds.get("k1"), "v2");
+        total++; passed += Test("dict<string,string> deep copy unchanged", dsCopy.get("k1"), "v1");
+
+        // Plain primitive local .copy() is identity - a value copy, independent of the source.
+        int a = 7;
+        int b = a.copy();
+        a = 42;
+        total++; passed += Test("primitive local .copy() identity", b, 7);
+    }
+
     // === Stage 6: unique dictionary VALUE ownership (dtor + leak oracle) ===
     // dictionary<K, unique V*> OWNS its values: freed on remove()/set()-overwrite/clear()/teardown.
     // A bare dictionary<K, V*> BORROWS and frees nothing. Interface values ride the vtable dtor slot.

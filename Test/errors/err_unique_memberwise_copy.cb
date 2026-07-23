@@ -6,8 +6,10 @@ struct Node { int v = 0; };
 
 struct Holder { unique Node* slot = nullptr; };
 
+// `.copy()` on a Holder VALUE dispatches its memberwise copy, which is refused at the synthesis
+// site. (A `.copy()` on a `Holder*` is a pointer-identity borrow copy, so it must be a value here.)
 expect_error("cannot copy 'Holder': its field 'Holder.slot' is 'unique'") {
-    Holder duplicate(Holder* h) { return h->slot == nullptr ? Holder() : h.copy(); }
+    Holder duplicate(Holder h) { Holder c = h.copy(); return move c; }
 }
 
 extern int main()
