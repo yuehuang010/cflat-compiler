@@ -725,14 +725,12 @@ extern int main()
         // statement (regression: this unbound temp used to leak its text+extra buffers).
         total++; passed += Test("plain-temp field read", makePlainTok(8).text.length(), 4);   // "tok8"
 
-        // A bare discarded owning-struct call (no bind, no field read) is destructed at the end of
-        // the full expression (regression: this used to leak the whole temp - no field-access site
-        // hooked it). Covered by the HeapAudit oracle below; both move and plain returns apply.
-        makeTempTok(80);
-        makePlainTok(81);
-
-        // `_ = expr` is an explicit discard: same end-of-full-expression destruction as the bare
-        // form, but works for any result (scalar/string/struct). Covered by the oracle below.
+        // A discarded owning-struct call must be an explicit `_ =` discard (a bare `makeTempTok(80);`
+        // statement is now a compile error - mandatory nodiscard). The explicit discard is destructed
+        // at the end of the full expression (regression: the temp was formerly dropped undestructed -
+        // no field-access site hooked it). Covered by the HeapAudit oracle below; move and plain apply.
+        _ = makeTempTok(80);
+        _ = makePlainTok(81);
         _ = makeTempTok(82);
         _ = makePlainTok(83);
 
@@ -1945,7 +1943,7 @@ extern int main()
         list<MvRow> l = default;
         l.add(s.copy());                       // copy() result stored in a container
         total++; passed += Test("move-return copy into list", l.get(0).name, "mvc");
-        mvPlainType();                         // discarded owned return must still be freed
+        _ = mvPlainType();                     // explicit discard: owned return still freed
     }
 
     // === Stage 3: owning-value by-value param is a move-sink (move-by-default, no keyword) ===

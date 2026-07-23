@@ -5459,7 +5459,9 @@ public:
                 // end-of-full-expression destruction (FlushOwnedTemps at the block-item boundary).
                 if (auto* assign = express->assignmentExpression())
                 {
+                    bool bareExpr = assign->assignmentOperator() == nullptr;
                     auto resultNV = ParseAssignmentExpressionNamed(assign, true);
+                    if (bareExpr) DiagnoseDiscardedOwningReturn(assign, resultNV);
                     ProcessPlusPlus();
                     RegisterDiscardedOwningStructTemp(resultNV);
                     return;
@@ -5611,7 +5613,16 @@ public:
                     if (declaration)
                         ParseForDeclaration(declaration);
                     if (expressionCtx)
-                        ParseExpression(expressionCtx);
+                    {
+                        // for-init is a discard position too: a bare owning-return call must error
+                        // and any owned temp must be freed here (mirrors the statement/for-update).
+                        auto* initAssign = expressionCtx->assignmentExpression();
+                        bool bareExpr = initAssign->assignmentOperator() == nullptr;
+                        auto nv = ParseAssignmentExpressionNamed(initAssign, true);
+                        if (bareExpr) DiagnoseDiscardedOwningReturn(initAssign, nv);
+                        ProcessPlusPlus();
+                        compiler->FlushOwnedTemps();
+                    }
 
                     compiler->CreateBlockBreak(blockCondition, false);
 
@@ -5642,7 +5653,10 @@ public:
                     auto assignments = forIncrementCtx->assignmentExpression();
                     for (auto assign : assignments)
                     {
-                        ParseAssignmentExpression(assign);
+                        // A for-update is a discard position too (its value is unused).
+                        bool bareExpr = assign->assignmentOperator() == nullptr;
+                        auto nv = ParseAssignmentExpressionNamed(assign, true);
+                        if (bareExpr) DiagnoseDiscardedOwningReturn(assign, nv);
                         ProcessPlusPlus();
                     }
 
@@ -10129,6 +10143,12 @@ public:
                         return { owned, true };
                     }
                 }
+                // A ternary is a transparent wrapper: if a branch is an owning return, the select
+                // result carries that ownership, so ledger it so a discarded ternary is caught.
+                if (const std::string* fn = compiler->FindOwnedReturnTemp(trueValue))
+                    compiler->RegisterOwnedReturnTemp(selectValue, *fn);
+                else if (const std::string* fn = compiler->FindOwnedReturnTemp(falseValue))
+                    compiler->RegisterOwnedReturnTemp(selectValue, *fn);
                 return { selectValue, false };
             }
 
@@ -20100,6 +20120,36 @@ public:
         auto* tempAlloca = compiler->AllocaAtEntry(nv.BaseType, nullptr, "discardtemp");
         compiler->builder->CreateStore(nv.Primary, tempAlloca);
         compiler->RegisterOwnedStructTemp(tempAlloca, typeName);
+    }
+
+    // Mandatory-nodiscard: an owning RETURN value used as a bare discarded statement (or a bare
+    // for-update) must be consumed, not dropped. Value identity picks out exactly the top-level
+    // result - an inner call passed as an argument, a member/index/comparison operand, an
+    // assignment target, or a `delete`d value is a DIFFERENT value and is never flagged.
+    void DiagnoseDiscardedOwningReturn(antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& nv)
+    {
+        auto* compiler = Compiler(ctx);
+        std::string fnName;
+        if (const std::string* fn = compiler->FindOwnedReturnTemp(nv.Primary))
+            fnName = *fn;                             // string / pointer / interface owning return
+        else if (IsDiscardedOwningStructResult(nv))
+            fnName = nv.CallerName.empty() ? "<call>" : nv.CallerName;  // owning-value struct return
+        else
+            return;
+        LogErrorContext(ctx, std::format(
+            "owning return value of '{}' must not be discarded; bind it, move it, delete it, "
+            "pass it on, or discard it explicitly with '_ ='", fnName));
+    }
+
+    // The owning-value STRUCT rvalue-return gate (mirror of RegisterDiscardedOwningStructTemp):
+    // an rvalue temp (Storage==null) of an owning value type, not an alias/field/string/closure.
+    bool IsDiscardedOwningStructResult(const LLVMBackend::NamedVariable& nv)
+    {
+        const std::string& t = nv.TypeAndValue.TypeName;
+        if (nv.Primary == nullptr || nv.Storage != nullptr || nv.BaseType == nullptr) return false;
+        if (nv.TypeAndValue.Pointer || nv.TypeAndValue.IsAlias || nv.FromOwningTempField) return false;
+        if (t.empty() || t == "string" || t == "__closure_fat_ptr") return false;
+        return Compiler()->IsOwningValueType(t);
     }
 
     // True when the resolved overload takes the receiver BY VALUE with `move` (an extension method

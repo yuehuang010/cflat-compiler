@@ -2477,6 +2477,7 @@ void LLVMBackend::ResetForReanalysis()
     currentFunctionReturnTV = TypeAndValue{};
     pendingOwnedStringTemps.clear();
     pendingOwnedStructTemps.clear();
+    ownedReturnTemps_.clear();
     poisonedFunctions.clear();
     firstCallLocation_.clear();
     lastAllocAlignment = 0;

@@ -997,6 +997,13 @@ public:
     // EmitDestructorsForScope; freed at end-of-full-expression by FlushOwnedStringTemps.
     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingOwnedStringTemps;
 
+    // Discard-detection ledger: SSA results of owning-RETURN calls (string / pointer /
+    // interface / owning-value struct), keyed by value for identity. Read by the no-discard
+    // check to reject an unconsumed owning return; never freed here (existing free paths own
+    // that); cleared each full expression in FlushOwnedTemps.
+    struct OwnedReturnTemp { llvm::Value* Value; std::string FnName; };
+    std::vector<OwnedReturnTemp> ownedReturnTemps_;
+
     // Lambda literals with unclaimed heap envs (no named owner). Closure analog of
     // pendingOwnedStringTemps; freed at end-of-full-expression by FlushOwnedClosureTemps.
     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingOwnedClosureTemps;
@@ -1843,6 +1850,24 @@ private:
             [&](const std::pair<llvm::Value*, llvm::BasicBlock*>& e) { return e.first == value; });
     }
 
+    // Record an owning-RETURN call result for the no-discard check (see ownedReturnTemps_).
+    void RegisterOwnedReturnTemp(llvm::Value* value, const std::string& fnName)
+    {
+        if (value == nullptr) return;
+        for (auto& e : ownedReturnTemps_)
+            if (e.Value == value) { e.FnName = fnName; return; }
+        ownedReturnTemps_.push_back({ value, fnName });
+    }
+
+    // Returns the callee name if `value` is a still-unconsumed owning return, else nullptr.
+    const std::string* FindOwnedReturnTemp(llvm::Value* value) const
+    {
+        if (value == nullptr) return nullptr;
+        for (const auto& e : ownedReturnTemps_)
+            if (e.Value == value) return &e.FnName;
+        return nullptr;
+    }
+
     // True when the insert block is active (non-null, no terminator yet).
     // Guards the Flush* functions: emitting into a terminated block is illegal IR.
     bool IsInsertBlockLive() const
@@ -2003,6 +2028,8 @@ private:
         FlushOwnedStringTemps();
         FlushOwnedClosureTemps();
         FlushOwnedStructTemps();
+        // Detection-only ledger: end of a full expression retires its owning-return results.
+        ownedReturnTemps_.clear();
     }
 
     void EmitDestructorsForScope(const StackState& frame)
@@ -7555,6 +7582,7 @@ public:
         std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingStringTemps;
         std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingClosureTemps;
         std::vector<PendingOwnedStructTemp> pendingStructTemps;
+        std::vector<OwnedReturnTemp> ownedReturnTemps;
     };
 
     BuilderState SaveBuilderState()
@@ -7566,9 +7594,11 @@ public:
         s.pendingStringTemps  = std::move(pendingOwnedStringTemps);
         s.pendingClosureTemps = std::move(pendingOwnedClosureTemps);
         s.pendingStructTemps  = std::move(pendingOwnedStructTemps);
+        s.ownedReturnTemps    = std::move(ownedReturnTemps_);
         pendingOwnedStringTemps.clear();
         pendingOwnedClosureTemps.clear();
         pendingOwnedStructTemps.clear();
+        ownedReturnTemps_.clear();
         return s;
     }
 
@@ -7584,6 +7614,7 @@ public:
         pendingOwnedStringTemps  = state.pendingStringTemps;
         pendingOwnedClosureTemps = state.pendingClosureTemps;
         pendingOwnedStructTemps  = state.pendingStructTemps;
+        ownedReturnTemps_        = state.ownedReturnTemps;
     }
 
     // True if `name` is a type projected from an imported .winmd (always fully qualified) or a
@@ -10607,7 +10638,11 @@ public:
         // (mirrors the direct path's RegisterOwnedStringTemp) so e.g. `tree.toJson().data()`
         // does not leak. Without this the virtual path left the result classified as a borrow.
         const auto& rt = methodInfo->ReturnType;
-        lastCallReturnsOwned = rt.IsMove && (rt.TypeName == "string" || rt.Pointer || rt.IsInterface);
+        // A substituted `unique X*` type-arg return owns like `move` (see the direct-call path).
+        lastCallReturnsOwned = (rt.IsMove || rt.IsUniqueTypeArg)
+            && (rt.TypeName == "string" || rt.Pointer || rt.IsInterface);
+        if (lastCallReturnsOwned)
+            RegisterOwnedReturnTemp(callResult, ifaceName + "." + methodName);
         lastCallReturnsAllocAlign = rt.AllocAlignValue;
         if (lastCallReturnsOwned
             && callResult->getType() == llvm::StructType::getTypeByName(*context, "string"))
@@ -14981,7 +15016,17 @@ public:
         // Cache the resolved return type so callers can populate TypeAndValue after the call.
         lastCallReturnType = candidate.ReturnType;
         lastCallReturnType.IsAlias = candidate.ReturnsAlias; // mark borrow-return result; inert until consumed
-        lastCallReturnsOwned = candidate.ReturnsOwned;
+        // A substituted `unique X*` type-arg return owns like `move` (Pointer-gated: a struct
+        // VALUE return e.g. list<T>.copy() may carry IsUniqueTypeArg but is not owned here).
+        lastCallReturnsOwned = candidate.ReturnsOwned
+            || (candidate.ReturnType.IsUniqueTypeArg && candidate.ReturnType.Pointer);
+        // Ledger the owning-return result by value for the no-discard check: string / pointer /
+        // interface via lastCallReturnsOwned, plus a by-value owning-value STRUCT return (move S).
+        bool ownedValueStructReturn = !candidate.ReturnType.Pointer
+            && candidate.ReturnType.TypeName != "string"
+            && IsOwningValueType(candidate.ReturnType.TypeName);
+        if (lastCallReturnsOwned || ownedValueStructReturn)
+            RegisterOwnedReturnTemp(result, functionName);
         // Return-type `alignas(_, N)`: the callee hands back an N-aligned heap block. Stamp the
         // side-channel so the receiving local frees via __delete_aligned (consumed in ParseDeclaration).
         lastCallReturnsAllocAlign = candidate.ReturnType.AllocAlignValue;

@@ -55,7 +55,7 @@ int testFileClass()
     string line2 = r->readLine();
     passed += Test("readLine 1", line1.data(), "hello");
     passed += Test("readLine 2", line2.data(), "world");
-    r->readLine();
+    string skipped = r->readLine();   // owning return: bind so it is freed, not discarded
     passed += Test("atEnd", r->atEnd(), true);
     delete r;
 

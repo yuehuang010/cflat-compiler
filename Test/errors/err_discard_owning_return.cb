@@ -1,0 +1,40 @@
+// Mandatory nodiscard: a call whose RETURN type is owned must not be dropped in a discard
+// position - the returned heap object would never be consumed. Detection is by value identity of
+// the full-expression result, so paren/ternary wrappers are covered and an owned value passed on
+// (argument, delete, bind, return) is not flagged. `_ = expr` is the explicit-discard opt-out.
+// Each block below is compiled on its own and must raise the exact message substring.
+
+// Owned POINTER return discarded (the real leak class).
+expect_error("owning return value of 'makePtr' must not be discarded") {
+    class R1 { int id = default; };
+    move R1* makePtr() { return new R1; }
+    void useIt() { makePtr(); }
+}
+
+// Paren-wrapped discard is still caught (a paren is a transparent wrapper).
+expect_error("owning return value of 'makePtr2' must not be discarded") {
+    class R2 { int id = default; };
+    move R2* makePtr2() { return new R2; }
+    void useIt2() { ((makePtr2())); }
+}
+
+// Ternary discard is caught (both arms are owning returns; the select carries the ownership).
+expect_error("owning return value of 'makePtr3' must not be discarded") {
+    class R3 { int id = default; };
+    move R3* makePtr3() { return new R3; }
+    void useIt3(bool c) { c ? makePtr3() : makePtr3(); }
+}
+
+// Owned STRING return discarded (uniform policy - strings error too, not only pointers).
+expect_error("owning return value of 'makeStr' must not be discarded") {
+    move string makeStr() { string s = "x"; return s.copy(); }
+    void useIt4() { makeStr(); }
+}
+
+// A bare owning-return call in for-INIT position is a discard too (a for-init DECLARATION,
+// `for (int i = 0; ...)`, is unaffected - only a bare owning-call expression errors).
+expect_error("owning return value of 'makePtr5' must not be discarded") {
+    class R5 { int id = default; };
+    move R5* makePtr5() { return new R5; }
+    void useIt5() { int i = 0; for (makePtr5(); i < 0; i = i + 1) { } }
+}

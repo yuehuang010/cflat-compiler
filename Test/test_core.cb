@@ -1505,6 +1505,16 @@ OwnedRet makeOwnedRet()
     return o;             // by-value move-out: `o`'s dtor must not run here
 }
 
+// Owning-POINTER return helpers for the no-discard consumption regression. g_ptr_dtor proves an
+// owning pointer return is freed exactly once when consumed - no double-free from the value-identity
+// owned-return tracking, no missed free.
+int g_ptr_dtor = 0;
+class PtrOwned { int v = default; ~PtrOwned() { g_ptr_dtor++; } };
+move PtrOwned* makePtrOwned() { return new PtrOwned; }
+void sinkPtr(move PtrOwned* p) { delete p; }
+move string makeOwnedStr() { string s = "hello"; return s.copy(); }
+int viaClosureLen(function<int(string)> f, string s) { return f(s); }
+
 int testStringAPI()
 {
     int passed = 0;
@@ -1863,6 +1873,15 @@ int testStringAPI()
         passed += Test("helper-return owned-string 0", n0, "known");
         passed += Test("helper-return owned-string 1", n1, "other");
     }
+    // No-discard owning-return consumption: a `move string` return (pickName) must still
+    // compile when its result is CONSUMED - bound to a local, or passed straight into a
+    // move-sink parameter. Only DISCARDING such a call in statement position is the hard
+    // error (regression: Test/errors/err_discard_owning_return.cb).
+    {
+        string bound = pickName(0u);                              // bound - freed at scope exit
+        passed += Test("no-discard: bound owning return", bound, "known");
+        passed += Test("no-discard: owning return into move-sink", consumeMoveLen(pickName(1u)), 5);
+    }
     // Owned-string TERNARY regression: a conditional whose branch reads an owning
     // string field/local used to shallow-alias that buffer, then free it at scope
     // exit (use-after-free / heap corruption). The ternary now deep-copies its
@@ -1923,12 +1942,9 @@ int testDiscard()
 {
     int passed = 0;
 
-    // Bare-statement owning-struct temp: destructed exactly once (no leak, no double-free).
-    g_owned_ret_dtor = 0;
-    { makeOwnedRet(); }
-    passed += Test("bare discard destructs once", g_owned_ret_dtor, 1);
-
-    // `_ = expr` owning-struct temp: same single destruction.
+    // A bare `makeOwnedRet();` is now a compile error (mandatory nodiscard - see
+    // Test/errors/err_discard_owning_return.cb). `_ = expr` is the explicit discard and still
+    // destructs the owning-struct temp exactly once (no double-free).
     g_owned_ret_dtor = 0;
     { _ = makeOwnedRet(); }
     passed += Test("'_ =' discard destructs once", g_owned_ret_dtor, 1);
@@ -1937,6 +1953,28 @@ int testDiscard()
     g_discard_side = 0;
     _ = discardSide(7);
     passed += Test("'_ =' runs RHS side effect", g_discard_side, 1);
+
+    // Consuming an owning POINTER return must compile and free exactly once (no double-free from
+    // the value-identity owned-return tracking, no missed free). Bind+delete, then a move-sink arg.
+    g_ptr_dtor = 0;
+    { PtrOwned* p = makePtrOwned(); delete p; }
+    passed += Test("owning ptr bound+deleted frees once", g_ptr_dtor, 1);
+    g_ptr_dtor = 0;
+    sinkPtr(makePtrOwned());
+    passed += Test("owning ptr into move-sink frees once", g_ptr_dtor, 1);
+
+    // An owning return passed as a closure / function<> ARGUMENT is consumed by the call and must
+    // NOT be flagged as discarded (regression for the closure-arg false positive).
+    passed += Test("owning str into closure arg", viaClosureLen((string s) => s.length(), makeOwnedStr()), 5);
+
+    // A CONSUMED owning call in for-INIT position (assigned to a local) compiles and frees once;
+    // a bare owning call in for-init errors instead (Test/errors/err_discard_owning_return.cb).
+    g_ptr_dtor = 0;
+    PtrOwned* fp = default;
+    int fi = 0;
+    for (fp = makePtrOwned(); fi < 0; fi = fi + 1) { }
+    delete fp;
+    passed += Test("owning ptr consumed in for-init frees once", g_ptr_dtor, 1);
 
     return passed;
 }
@@ -2069,8 +2107,8 @@ extern int main()
     r = testStringSwitch();     passed += r; total += 6;
     r = testStringBuilder();    passed += r; total += 20;
     r = testStringView();       passed += r; total += 12;
-    r = testStringAPI();        passed += r; total += 114;
-    r = testDiscard();          passed += r; total += 3;
+    r = testStringAPI();        passed += r; total += 116;
+    r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
 
