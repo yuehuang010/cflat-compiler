@@ -55,14 +55,13 @@ class stack<T>
         _data[index] = value;
     }
 
-    // Release the element in a live slot by moving it into a local and letting that local drop:
+    // Release the element in a live slot by moving it into the discard sink and letting that drop:
     // ownership DEFERS to T, so no `if const`. A `unique` element (thin `unique T*` or a `unique`
-    // interface fat pointer) transfers into `tmp` and its drop frees it once; a bare pointer /
-    // interface BORROW transfers a borrow and its drop frees nothing; a value type / string is
-    // moved out and destructed by the drop. `move _data[index]` nulls the moved-from slot.
+    // interface fat pointer) is freed once; a bare pointer / interface BORROW frees nothing; a
+    // value type / string is destructed. `move _data[index]` nulls the moved-from slot.
     void _releaseAt(int index)
     {
-        T tmp = move _data[index];
+        _ = move _data[index];
     }
 
     // Push a value. A COPYABLE element (string, closure, a struct with copy(), a bare pointer or

@@ -467,6 +467,15 @@ public:
         // Distinct from IsUnique (the written field/local qualifier), which drives destructor
         // synthesis and must not be set from a substitution.
         bool IsUniqueTypeArg = false;
+        // A buffer pointer (`T* _data`, substituted with T = `unique X*` / `unique IFace`) whose
+        // indexed ELEMENT is an owning `unique` value. The pointer model strips the element's
+        // `unique`-ness on a slot read (a read hands out a borrow, so IsUniqueTypeArg is cleared
+        // by the explicit-pointer rule), so this out-of-band flag remembers the element ownership.
+        // Read ONLY by the container-slot move-out recovery (ApplyMovedSlotOwnership): it lets
+        // `_ = move _data[i]` (which has no destination type to re-derive from) release the element
+        // exactly as `T tmp = move _data[i]` does. Plain reads ignore it, so a slot read still
+        // demotes to a borrow. Propagated onto the element value by the subscript path.
+        bool ElementOwningUnique = false;
         // An `alias` borrow (accessor return such as list's `alias T get`) whose type argument
         // substituted to a `unique X*` element - i.e. the CONTAINER owns the pointee and its
         // destructor frees it. Distinct from IsUniqueTypeArg (suppressed on alias borrows): this
@@ -3562,6 +3571,12 @@ private:
         if (base.empty()) return false;
         if (base.back() == '*') return true;
         if (dataStructures.count(base) == 0) return true;
+        // A struct with a user destructor over a raw pointer/view field, but no HAND-WRITTEN copy(),
+        // is NOT copyable: the memberwise synth would shallow-share the raw pointer while the dtor
+        // frees it on both instances (double-free). Checked before the generic copy()-overload test
+        // so an on-demand-registered synth cannot mask it.
+        if (!HasRealCopyOverloadFor(base) && StructSynthCopyUnsafe(base))
+            return false;
         if (HasCopyOverloadFor(base)) return true;
         return !TypeOwnsUniquePointer(base);
     }
@@ -3598,6 +3613,23 @@ private:
             if (f.Pointer || f.ElemPointer || f.IsArrayView)
                 return false;
         return true;
+    }
+
+    // True when a value struct owns a raw resource that its memberwise synth would shallow-share:
+    // the author wrote a destructor AND a field is a raw pointer/view. Copying such a type via the
+    // synth bit-copies the pointer while the dtor frees it on both instances (double-free), so it is
+    // NOT copyable without a hand-written copy(). `string`/closures have dedicated deep-copy/clone
+    // paths and are excluded. Narrower than ClosureCaptureDeepCopyable's raw-pointer test by the
+    // user-dtor gate: a raw pointer with NO destructor is a borrow the synth shallow-shares by design.
+    bool StructSynthCopyUnsafe(const std::string& typeName) const
+    {
+        if (typeName == "string" || typeName == "__closure_fat_ptr") return false;
+        auto it = dataStructures.find(typeName);
+        if (it == dataStructures.end() || it->second.Destructor == nullptr) return false;
+        for (const auto& f : it->second.StructFields)
+            if (f.Pointer || f.ElemPointer || f.IsArrayView)
+                return true;
+        return false;
     }
 
     // True when `typeName` defines `operator->` (its implicit `this` is the sole parameter).

@@ -3814,6 +3814,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     // implementor's and the contract check would misfire.
     if (t.IsAlias)                o["al"]  = true;
     if (t.IsUniqueTypeArg)        o["unt"] = true;
+    if (t.ElementOwningUnique)    o["eou"] = true;
     if (t.IsOwningSink)           o["osk"] = true;
     if (t.IsBorrowOfUniqueElement) o["bue"] = true;
     if (t.IsBorrowOfAliasElement) o["bae"] = true;
@@ -3872,6 +3873,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("mv")) t.IsMove = *v;
     if (auto v = o.getBoolean("al")) t.IsAlias = *v;
     if (auto v = o.getBoolean("unt")) t.IsUniqueTypeArg = *v;
+    if (auto v = o.getBoolean("eou")) t.ElementOwningUnique = *v;
     if (auto v = o.getBoolean("osk")) t.IsOwningSink = *v;
     if (auto v = o.getBoolean("bue")) t.IsBorrowOfUniqueElement = *v;
     if (auto v = o.getBoolean("bae")) t.IsBorrowOfAliasElement = *v;

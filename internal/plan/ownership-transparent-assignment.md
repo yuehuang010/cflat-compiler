@@ -79,20 +79,15 @@ but do not block this plan (containers allocate through their own machinery).
 - Factor the per-type release ladder out of `EmitDestructorsForScope` into one reusable
   helper: delete for thin `unique T*`, vtable-dtor+free for unique interface, full dtor for
   owning value/string/closure, no-op for borrows/primitives. Scope-exit calls it per local.
-- BONUS: this helper backs the user-facing EXPLICIT RELEASE form. DECIDED (2026-07-23):
-  the one spelling is `_ = move <local>;` ("move to nowhere"). Two alternatives were
-  considered and REJECTED: a `drop` statement (new surface syntax; briefly shipped as a
-  soft keyword, then removed) and reusing `delete` (pointer-only reader intuition, and its
-  variable semantics are the opposite - delete leaves the name readable, release kills it).
-  Extending the release form collapses every `_releaseAt`/`_freeValue` ladder - follow-on.
+- BONUS: this helper backs the user-facing EXPLICIT RELEASE form `_ = move <local>;`
+  ("move to nowhere") - decided 2026-07-23 as the one spelling.
 - Files: `cflat/LLVMBackend.h`. Verify: all suites green, zero test deltas.
 - Depends: none.
 
 ### Part 2 - Total drop-old-destination on reassign   [opus, medium risk]
 - Route the five scattered destruct-old blocks through DropValue and COVER THE HOLES:
   unique-LOCAL reassign frees the old pointee (fixes the leak issue), unique FIELD store
-  stops silently aliasing (fixes the unguarded-alias issue; either consume the source or,
-  interim, reject the plain form requiring `move`).
+  stops silently aliasing (fixes the unguarded-alias issue).
 - Ordering rule everywhere: produce/clone the source value BEFORE dropping the old dest
   (the closure block is the pattern); keep the `destination != source` self-assign guard.
 - Files: `cflat/MainListener.h` (ParseAssignmentExpression), `cflat/LLVMBackend.h`.
@@ -102,8 +97,7 @@ but do not block this plan (containers allocate through their own machinery).
   unique-field-store-unguarded-alias.md (delete the issue files when fixed).
 
 ### Part 3 - Unique edge unification   [opus, low-medium risk]
-- Fix the self-assign segfault (guard or reject - decide at implementation; rejection
-  matches existing unique diagnostics).
+- Fix the self-assign segfault (landed as a guard; ff55e6b).
 - Unify the two ownership predicates so `move <named unique local>` transfers for unique
   INTERFACES exactly as for thin uniques (init AND reassign), consuming + nulling the
   source, dropping any old dest via DropValue.
@@ -149,21 +143,18 @@ but do not block this plan (containers allocate through their own machinery).
 ### Part 6 - Container payoff: slot stores join the semantics, ladders collapse   [opus, medium risk]
 - Lift the deliberate single-index-GEP exclusion so `_data[i] = value` in generic code gets
   the total semantics; then collapse `_placeAt`/`_storeValue` in queue/stack/list/dictionary
-  to a plain store, and `_releaseAt`/`_freeValue` to the explicit release
-  `_ = move _data[i];` (needs the Part 1 follow-on extended to subscript lvalues).
+  to a plain store, and `_releaseAt`/`_freeValue` to a move-out release (landed as
+  `T tmp = move _data[i];` - see STEP D in Status).
 - Two things to prove here:
   - drop-old on a DEAD slot is a no-op (containers zero moved-out slots; the leak matrix
     must show teardown/insert-over-dead-slot clean for every element kind);
-  - sink inference interplay: with no literal top-level `move value` in the collapsed
-    insert body, either extend inference to count "param assigned with move semantics" as
-    sink-marking, or keep the single `is_copyable(T)` method split as the one surviving
-    `if const` (acceptable fallback - it is the intended policy split anyway).
+  - sink inference interplay: the method-level `is_copyable(T)` split stays as the one
+    surviving `if const` (it controls sink-ness and is the intended policy split anyway).
 - Files: `cflat/MainListener.h`, `cflat/LLVMBackend.h`, `cflat/core/{queue,stack,list,dictionary}.cb`,
   `Test/test_collection_leaks.cb`.
 - Verify: full leak matrix green; container `if const` count drops to the policy split only.
-- Depends: 4, 5. Also unblocks re-visiting the read-side
-  `internal/issue/move-out-into-dropped-local-ownership.md` via explicit release
-  (`_ = move`) instead of move-into-dropped-local.
+- Depends: 4, 5. The read-side move-out-into-dropped-local bug was fixed directly as the
+  STEP D enabler.
 
 ### Cross-cutting constraints (every part)
 - Any change to type parsing goes in BOTH `ParseDeclarationSpecifiers` copies. Errors via
@@ -206,8 +197,7 @@ but do not block this plan (containers allocate through their own machinery).
     spelling). It is intercepted in the `_ =` discard branch of ParseAssignmentExpression when the
     RHS is a top-level `move` over a bare identifier naming a live local; it releases the local via
     DropValue, nulls the slot, marks it moved (use-after = error). SPELLING DECISION (2026-07-23):
-    an earlier `drop <bare-local>;` soft-keyword statement was removed and reusing `delete` was
-    rejected - `_ = move` is the ONE spelling. Promoting it also fixed two latent leaks in the old
+    `_ = move` is the ONE spelling. Promoting it also fixed two latent leaks in the old
     generic discard path (`_ = move` of a thin `unique T*` or owning-struct local leaked) and added
     the missing moved-from marking. LIMITATION: only a bare-name local; NOT a subscript lvalue - that
     gap is why Part 6 STEP D was deferred. Coverage: test_collection_leaks.cb leg +
@@ -279,3 +269,40 @@ but do not block this plan (containers allocate through their own machinery).
   `_releaseValueAt` to one line (array.cb + dictionary KEY release left as-is). Verified: leak matrix
   352/352 (19 new in-body-drop legs across every element kind), test.sh 476/0/8, example_mac 35/0,
   test_lsp 152/0. Only remaining container if const: the enqueue/add is_copyable SINK split (accepted).
+  Committed as c396327 (squash of Parts 1/4/5/6 + STEP D; the separate Part 4 commit 397ec21 was
+  folded in by rebase).
+- 2026-07-23 (IsCopyableType double-free FIXED; commit b1c52c9). `IsCopyableType` (LLVMBackend.h) now
+  rejects a value struct with a USER destructor over a raw pointer/view field and no HAND-WRITTEN
+  copy() (new `StructSynthCopyUnsafe` helper, gated by `!HasRealCopyOverloadFor` so
+  string/closures/containers with a real copy() are unaffected; mirrors the guard
+  `ClosureCaptureDeepCopyable` already applied for closure capture). Such a type is now non-copyable,
+  so `T b = a;` MOVES (single owner) and a field store gives the actionable ".copy()/move" error - no
+  more silent shallow-copy double-free. Regression: `Test/test_collection_leaks.cb` RawResLeak (move,
+  one free) + RawResCopyable (real copy(), two independent frees) under HeapAudit. Issue file deleted.
+- 2026-07-23 (`_ = move <element>` disparity FIXED; commit b1c52c9). SUPERSEDES the STEP D "abandoned"
+  verdict on the discard spelling: `_ = move _data[i]` now releases an owning container element
+  exactly like `T tmp = move _data[i]`, via ONE shared recovery + the existing DropValue (no bespoke
+  per-kind release codegen). Mechanism: the buffer field `T* _data` (T = `unique X*`/`unique IFace`)
+  has its element `unique`-ness stripped by the explicit-pointer rule (slot reads stay borrows); a
+  new `TypeAndValue.ElementOwningUnique` flag (LLVMBackend.h; `--init` key `"eou"` added both
+  directions) preserves it so the move site can re-derive. Shared helper `ApplyMovedSlotOwnership`
+  (extracted from the decl-init recovery block, behavior-preserving there) drives both spellings; the
+  `_ =` discard branch materializes the detached value into a temp and DropValue-frees it (owning
+  ptr/iface/value/string once; borrow nothing). En route it fixed two bugs the discard path had for
+  slot moves: over-freeing a borrow pointer element and leaking a string element (both from the old
+  RegisterDiscardedOwningStructTemp fallthrough). Regression: `DiscardBag<T>` in
+  test_collection_leaks.cb releasing via `_ = move _data[i]` in both discardAll AND its destructor,
+  over every element kind (leak matrix now 374, HeapAudit-clean). Suites green (independently
+  re-verified): test.sh 476/0/8, example_mac 35/0, test_lsp 152/0. Issue file deleted. Both follow-on
+  issues from the STEP 2 investigation are now resolved.
+- NET STATE after commits c396327 + b1c52c9: BOTH release spellings are sound and DropValue-backed -
+  `_ = move <bare local>` and `_ = move _data[i]` (slot), as well as `T tmp = move _data[i]`.
+  Remaining open follow-ons: Part 5 STEP 2 (recommended NOT to do) and Part 7 (member-wise move
+  hook, sibling plan).
+- 2026-07-23 (containers switched to the discard spelling; uncommitted spike, .cb-only). The core
+  containers' `_releaseAt`/`_releaseValueAt` (queue/stack/list `T tmp = move _data[i];`, dictionary
+  `V tmp = move _values[i];`) now use `_ = move <slot>;` - the original Part 6 spelling, viable since
+  the b1c52c9 disparity fix; no compiler change needed. The warm-cache risk (core code hitting the
+  discard-slot-move path through `--init` bitcode, exercising the "eou" round-trip) was explicitly
+  probed: full leak matrix (374) HeapAudit-clean against a warm cache. Suites green: test.sh Release
+  476/0/8 (cold+warm), example_mac 35/0, test_lsp 152/0.

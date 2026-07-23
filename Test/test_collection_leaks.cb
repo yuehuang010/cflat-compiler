@@ -197,6 +197,30 @@ move IShapeLeak pickShape(move IShapeLeak a, move IShapeLeak b, int sel)
 // Pointer flavor of the same exclusive-return pattern: must compile and free each object once.
 struct PtrLeak { int v = 0; ~PtrLeak() { g_shapeDtor = g_shapeDtor + 1; } };
 
+// Regression: a value struct with a USER destructor over a RAW pointer field (not `unique`) and NO
+// copy() is NON-copyable - the memberwise synth would shallow-share the pointer while the dtor frees
+// it on both copies (double-free). IsCopyableType now rejects that shape, so `RawResLeak b = a;`
+// MOVES (single owner). A sibling with a hand-written copy() stays copyable (deep, independent).
+int g_rawNodeFreed = 0;
+struct RawResNodeLeak { int v = 0; };
+struct RawResLeak
+{
+    RawResNodeLeak* node = default;
+    ~RawResLeak() { if (node != nullptr) { g_rawNodeFreed = g_rawNodeFreed + 1; delete node; } }
+};
+RawResLeak mkRawRes(int n) { RawResLeak r = default; r.node = new RawResNodeLeak(); r.node.v = n; return move r; }
+struct RawResCopyable
+{
+    RawResNodeLeak* node = default;
+    RawResCopyable copy()
+    {
+        RawResCopyable c = default;
+        if (node != nullptr) { c.node = new RawResNodeLeak(); c.node.v = node.v; }
+        return move c;
+    }
+    ~RawResCopyable() { if (node != nullptr) { g_rawNodeFreed = g_rawNodeFreed + 1; delete node; } }
+};
+
 // Trivial POD value struct (no owning fields, no destructor): the "copies, exit 0" row of the
 // container double-free matrix - a multi-field aggregate is a distinct copy/store path from a
 // scalar `int`, and its teardown must free nothing (a spurious free would abort HeapAudit).
@@ -213,6 +237,49 @@ struct UniqIfaceSlot { unique IShapeLeak v = default; };
 // dictionary/hashset insert is poisoned and only the `move` transfer overload is usable.
 struct LeakHolder { unique PtrLeak* slot = nullptr; int k = 0; int hash() { return k; } };
 bool operator==(LeakHolder a, LeakHolder b) { return a.k == b.k; }
+
+// Regression for internal/issue/discard-move-vs-decl-move-element-ownership-disparity.md:
+// `_ = move _data[i]` (the DISCARD form) must release an owning container element exactly like
+// `T tmp = move _data[i]` (the DECL form) - an owning `unique T*`/`unique IFace` element frees
+// exactly ONCE, a bare borrow element frees NOTHING. DiscardBag exercises the discard spelling
+// directly (in `discardAll` AND in the destructor's teardown loop) so the two forms are proven
+// equivalent for every element kind. Ownership DEFERS to T, so there is no `if const` here: the
+// slot-move re-derives the element's true ownership at the move site (ElementOwningUnique).
+struct DiscardBag<T>
+{
+    T*  _data  = nullptr;
+    int _count = 0;
+
+    void _ensure()
+    {
+        // Fixed capacity keeps the helper minimal; every test bag holds well under 16 elements.
+        if (_data == nullptr) _data = new T[16];
+    }
+
+    void add(T value)
+    {
+        _ensure();
+        _data[_count] = move value;   // move-sink for `unique`; copy/move for a value type
+        _count++;
+    }
+
+    // Release EVERY element to nowhere via the discard-move form, leaving zeroed dead slots.
+    void discardAll()
+    {
+        for (int i = 0; i < _count; i++) _ = move _data[i];
+        _count = 0;
+    }
+
+    int count() { return _count; }
+
+    ~DiscardBag()
+    {
+        // Teardown ALSO uses the discard form: any element still held frees exactly once; a slot
+        // already emptied by discardAll is zeroed, so a second move over it is a safe no-op.
+        for (int i = 0; i < _count; i++) _ = move _data[i];
+        if (_data != nullptr) delete[_] _data;
+    }
+};
 
 // Stage 3 (owning-value move-sink): a free function whose plain by-value owning param is
 // UNCONDITIONALLY moved becomes a synthesized sink - a caller's owning local is consumed with
@@ -1548,6 +1615,119 @@ extern int main()
         total++; passed += Test("stack<noncopy> teardown frees both slots", g_shapeDtor, 2);
     }
 
+    // === `_ = move _data[i]` DISCARD-FORM element release parity (every element kind) ===
+    // Guards internal/issue/discard-move-vs-decl-move-element-ownership-disparity.md: the discard
+    // spelling must release an owning container element exactly like `T tmp = move _data[i]`. Each
+    // owning kind must free EXACTLY once (no leak via a stripped owner, no double-free via the
+    // zeroed slot); each borrow kind must free NOTHING. discardAll uses the discard form; the
+    // DiscardBag destructor uses it too, so both discard sites are covered.
+    {
+        // int + POD value elements: no dtor, so the discard/teardown must free NOTHING (a spurious
+        // free would abort the HeapAudit oracle). Just prove it compiles and stays clean.
+        {
+            DiscardBag<int> bi = default;
+            bi.add(10); bi.add(20); bi.add(30);
+            bi.discardAll();
+            total++; passed += Test("discard<int> count after discardAll", bi.count(), 0);
+
+            DiscardBag<QPoint> bp = default;
+            QPoint p0 = default; p0.x = 1; bp.add(p0);
+            QPoint p1 = default; p1.x = 2; bp.add(p1);
+            bp.discardAll();
+            total++; passed += Test("discard<pod> count after discardAll", bp.count(), 0);
+        }
+
+        // string element (owning value): the buffer frees exactly once via RegisterDiscardedOwningStructTemp.
+        {
+            DiscardBag<string> bs = default;
+            bs.add("dsc" + "0");        // owned concat -> forced heap buffer
+            bs.add("dsc" + "1");
+            bs.discardAll();            // both string buffers freed here
+            total++; passed += Test("discard<string> count after discardAll", bs.count(), 0);
+        }
+
+        // owning-value struct element (owns a string): freed once through its full destructor.
+        {
+            DiscardBag<LeakRow> br = default;
+            LeakRow r0 = default; r0.name = "row" + "A"; br.add(r0);
+            LeakRow r1 = default; r1.name = "row" + "B"; br.add(r1);
+            br.discardAll();
+            total++; passed += Test("discard<owning-value> count after discardAll", br.count(), 0);
+        }
+
+        // LeakHolder{unique PtrLeak*} value element (non-copyable): the full dtor frees the unique field.
+        g_shapeDtor = 0;
+        {
+            DiscardBag<LeakHolder> bh = default;
+            LeakHolder h0 = default; h0.slot = new PtrLeak(); h0.k = 1; bh.add(move h0);
+            LeakHolder h1 = default; h1.slot = new PtrLeak(); h1.k = 2; bh.add(move h1);
+            bh.discardAll();
+            total++; passed += Test("discard holder-unique-ptr discardAll frees both", g_shapeDtor, 2);
+        }
+        total++; passed += Test("discard holder-unique-ptr teardown noop", g_shapeDtor, 2);
+
+        // bare `PtrLeak*` BORROW element: discard frees NOTHING; the caller owns and frees each.
+        g_shapeDtor = 0;
+        {
+            PtrLeak* k0 = new PtrLeak();
+            PtrLeak* k1 = new PtrLeak();
+            {
+                DiscardBag<PtrLeak*> bb = default;
+                bb.add(k0); bb.add(k1);
+                bb.discardAll();
+                total++; passed += Test("discard<borrow-ptr> frees nothing", g_shapeDtor, 0);
+            }                                       // teardown of a borrow bag also frees nothing
+            total++; passed += Test("discard<borrow-ptr> teardown frees nothing", g_shapeDtor, 0);
+            delete k0; delete k1;
+        }
+        total++; passed += Test("discard<borrow-ptr> caller frees both", g_shapeDtor, 2);
+
+        // `unique PtrLeak*` OWNING element: discardAll frees each once; nothing left for teardown.
+        g_shapeDtor = 0;
+        {
+            DiscardBag<unique PtrLeak*> bu = default;
+            bu.add(new PtrLeak()); bu.add(new PtrLeak()); bu.add(new PtrLeak());
+            bu.discardAll();
+            total++; passed += Test("discard<unique-ptr> discardAll frees all", g_shapeDtor, 3);
+        }
+        total++; passed += Test("discard<unique-ptr> teardown noop", g_shapeDtor, 3);
+
+        // `unique PtrLeak*` OWNING element released by the DESTRUCTOR's discard form (no discardAll):
+        // teardown's `_ = move _data[i]` must free every still-held element exactly once.
+        g_shapeDtor = 0;
+        {
+            DiscardBag<unique PtrLeak*> bt = default;
+            bt.add(new PtrLeak()); bt.add(new PtrLeak());
+            total++; passed += Test("discard<unique-ptr> pre-teardown live", g_shapeDtor, 0);
+        }                                           // destructor discard-move frees both here
+        total++; passed += Test("discard<unique-ptr> teardown discard frees both", g_shapeDtor, 2);
+
+        // bare `IShapeLeak` interface BORROW element: discard frees NOTHING; caller frees each.
+        g_shapeDtor = 0;
+        {
+            IShapeLeak f0 = new CircleLeak();
+            IShapeLeak f1 = new CircleLeak();
+            {
+                DiscardBag<IShapeLeak> bf = default;
+                bf.add(f0); bf.add(f1);
+                bf.discardAll();
+                total++; passed += Test("discard<borrow-iface> frees nothing", g_shapeDtor, 0);
+            }
+            delete f0; delete f1;
+        }
+        total++; passed += Test("discard<borrow-iface> caller frees both", g_shapeDtor, 2);
+
+        // `unique IShapeLeak` OWNING interface element: freed once via the vtable dtor slot.
+        g_shapeDtor = 0;
+        {
+            DiscardBag<unique IShapeLeak> bui = default;
+            bui.add(new CircleLeak()); bui.add(new CircleLeak());
+            bui.discardAll();
+            total++; passed += Test("discard<unique-iface> discardAll frees both", g_shapeDtor, 2);
+        }
+        total++; passed += Test("discard<unique-iface> teardown noop", g_shapeDtor, 2);
+    }
+
     // === Whole-struct assignment through a pointer deref (`*pc = *pa`) ===
     // A shallow bitwise store used to alias owned buffers (both dtors free -> double-free) and
     // orphan the destination's old value (leak). The deref lvalue is now an owning destination:
@@ -2196,6 +2376,30 @@ extern int main()
         int sr1 = s.pop()(1);
         total++; passed += Test("stack<Lambda> pop-inline top", sr0, 21);
         total++; passed += Test("stack<Lambda> pop-inline next", sr1, 11);
+    }
+
+    // === Regression: copy of a user-dtor raw-pointer struct MOVES (no shallow-copy double-free) ===
+    // `RawResLeak b = a;` has no copy() and owns a raw `node` its dtor deletes, so IsCopyableType
+    // makes it non-copyable: the init MOVES (a is consumed, its node nulled) and exactly ONE delete
+    // runs. A shallow copy would delete the shared node twice -> HeapAudit abort (exit 134). The
+    // sibling WITH a copy() deep-copies (source stays live, two independent nodes freed once each).
+    {
+        g_rawNodeFreed = 0;
+        {
+            RawResLeak a = mkRawRes(7);
+            RawResLeak b = a;                  // non-copyable -> MOVE: single owner
+            total++; passed += Test("raw-ptr struct copy is move (value)", b.node.v, 7);
+        }
+        total++; passed += Test("raw-ptr struct move frees node once", g_rawNodeFreed, 1);
+
+        g_rawNodeFreed = 0;
+        {
+            RawResCopyable a = default; a.node = new RawResNodeLeak(); a.node.v = 5;
+            RawResCopyable b = a;              // has copy() -> deep COPY: source a stays live
+            total++; passed += Test("raw-ptr copy() source live", a.node.v, 5);
+            total++; passed += Test("raw-ptr copy() independent value", b.node.v, 5);
+        }
+        total++; passed += Test("raw-ptr copy() frees two independent nodes", g_rawNodeFreed, 2);
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

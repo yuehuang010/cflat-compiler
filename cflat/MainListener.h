@@ -3039,6 +3039,11 @@ private:
                 // An explicit declarator star over a `unique` type ARGUMENT (`V* out`) declares a
                 // POINTER TO the owning location, not the owning location - it is an out-param, not
                 // a sink. Left set, the call site nulls the caller's variable and it dangles.
+                // A buffer of `unique` elements (`T* _data`, T = `unique X*`/`unique IFace`): the
+                // explicit star makes this a pointer-TO the owning location, so IsUniqueTypeArg is
+                // cleared (a slot read is a borrow), but remember the element ownership so a
+                // `move _data[i]` out of the slot can re-derive it (ApplyMovedSlotOwnership).
+                if (hasExplicitPointer && declType.IsUniqueTypeArg) declType.ElementOwningUnique = true;
                 if (hasExplicitPointer) declType.IsUniqueTypeArg = false;
                 bool substPointer = declType.Pointer; // T was already a pointer (e.g. T=IMessage*)
                 if (aliasPtrDepth > 0)
@@ -7379,6 +7384,35 @@ public:
         compiler->MarkVariableMoved(name);
     }
 
+    // Recover ownership of a local/temp that was `move`d out of a container element slot. The slot
+    // read demoted the element's `unique`-ness (a plain read hands out a borrow), so its TRUE
+    // ownership is taken from `elemOwnershipType`: the DECLARED destination type for
+    // `T tmp = move _data[i]` (its IsUniqueTypeArg), or the moved element value's ElementOwningUnique
+    // for the `_ = move _data[i]` discard form (which has no destination type). An owning thin
+    // `unique T*` / `unique <iface>` element is marked owning so DropValue frees it exactly once; a
+    // bare borrow element clears ownership so DropValue frees nothing.
+    static void ApplyMovedSlotOwnership(LLVMBackend::NamedVariable& nv,
+                                        const LLVMBackend::TypeAndValue& elemOwnershipType)
+    {
+        bool unique = elemOwnershipType.IsUniqueTypeArg || elemOwnershipType.IsUnique
+            || elemOwnershipType.ElementOwningUnique;
+        bool thinPtr = elemOwnershipType.Pointer && !elemOwnershipType.ElemPointer
+            && !elemOwnershipType.IsInterface;
+        bool uniqueIface = elemOwnershipType.IsInterface && !elemOwnershipType.IsInterfacePointer;
+        if (unique && (thinPtr || uniqueIface))
+        {
+            nv.IsOwning = true;
+            // DropValue/OwnsDroppableResource gate the interface arm on IsUnique/IsUniqueTypeArg;
+            // ensure it fires for an element recovered purely via ElementOwningUnique.
+            if (uniqueIface) nv.TypeAndValue.IsUniqueTypeArg = true;
+        }
+        else if ((thinPtr || uniqueIface) && !unique)
+        {
+            nv.IsOwning = false;
+            nv.IsNewAllocated = false;
+        }
+    }
+
     std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CFlatParser::DeclarationSpecifiersContext* declSpec, CFlatParser::InitDeclaratorListContext* initDecl, const std::string& namespaceName = {})
     {
         auto* compiler = Compiler(declSpec);
@@ -8454,25 +8488,12 @@ public:
                         // and a `unique <interface>` element under-owning (drop frees nothing -> leak).
                         if (srcMovedFromSlot)
                         {
+                            // Re-derive the dropped local's ownership from the DESTINATION type (the
+                            // shared recovery the `_ = move _data[i]` discard form also uses). An owning
+                            // element frees once (EmitOwningPtrCleanup for a thin ptr, the vtable dtor
+                            // for a fat one); a bare borrow element clears the spuriously-set ownership.
                             auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
-                            bool destUnique = typeAndValue.IsUniqueTypeArg || typeAndValue.IsUnique;
-                            bool destThinPtr = typeAndValue.Pointer && !typeAndValue.ElemPointer
-                                && !typeAndValue.IsInterface;
-                            bool destUniqueIface = typeAndValue.IsInterface
-                                && !typeAndValue.IsInterfacePointer;
-                            if (destUnique && (destThinPtr || destUniqueIface))
-                            {
-                                // Owning element: the drop must free exactly once (EmitOwningPtrCleanup
-                                // for a thin ptr, EmitOwningInterfaceCleanup via the vtable for a fat one).
-                                nv.IsOwning = true;
-                            }
-                            else if ((destThinPtr || destUniqueIface) && !destUnique)
-                            {
-                                // Borrow element: the container never owned the pointee, so the drop must
-                                // free nothing. Clear the ownership the pointer channel spuriously set.
-                                nv.IsOwning = false;
-                                nv.IsNewAllocated = false;
-                            }
+                            ApplyMovedSlotOwnership(nv, typeAndValue);
                         }
 
                         // Return-result alloc-align channel: a call whose return type declared
@@ -9343,6 +9364,33 @@ public:
                 }
 
                 auto rhsNV = ParseAssignmentExpressionNamed(assignCtx);
+
+                // `_ = move <container element slot>;` (e.g. `_ = move _data[i]`): the slot read
+                // demoted an owning element to a borrow and there is no destination type to
+                // re-derive from, so recover the element's true ownership from ElementOwningUnique
+                // (stamped on the buffer field at instantiation, carried onto the element by the
+                // subscript). ParseMoveExpression detached the value (Storage null) and already
+                // zeroed the slot, so materialize the value into a temp and run the SAME DropValue
+                // teardown the `T tmp = move _data[i]` form gets: an owning ptr/iface/value/string
+                // element frees exactly once, a bare borrow element frees nothing. This branch fully
+                // owns the slot-move discard - it must NOT fall through to the struct-temp helper
+                // (which mishandles a detached pointer element as an owning value and over-frees).
+                bool slotMove = compiler->lastMovedFromContainerSlot;
+                compiler->lastMovedFromContainerSlot = false;
+                if (slotMove && rhsNV.Primary != nullptr && rhsNV.BaseType != nullptr)
+                {
+                    LLVMBackend::NamedVariable slotNV;
+                    slotNV.TypeAndValue = rhsNV.TypeAndValue;
+                    slotNV.BaseType     = rhsNV.BaseType;
+                    ApplyMovedSlotOwnership(slotNV, rhsNV.TypeAndValue);
+                    auto* tmp = compiler->CreateAlloca(rhsNV.BaseType);
+                    compiler->builder->CreateStore(rhsNV.Primary, tmp);
+                    slotNV.Storage = tmp;
+                    if (compiler->OwnsDroppableResource(slotNV))
+                        compiler->DropValue(slotNV);
+                    return rhsNV.Primary;
+                }
+
                 RegisterDiscardedOwningStructTemp(rhsNV);
                 return rhsNV.Primary;
             }
@@ -14605,6 +14653,11 @@ public:
                 // Signal ownership transfer exactly as the POINTER branch below does. Without it
                 // `return move r` is classified as a BORROW and its owned bits are stripped (leak).
                 compiler->lastOwningResult = true;
+                // A value/string ELEMENT (`_ = move _data[i]`) is detached here with Storage null,
+                // so the discard path cannot free it via a Storage-backed temp helper. Flag the
+                // slot move so the discard site materializes the value and runs its full teardown.
+                if (argNV.IsElementAccess)
+                    compiler->lastMovedFromContainerSlot = true;
 
                 LLVMBackend::NamedVariable result;
                 result.Primary      = ptrVal;       // original value captured before zeroing

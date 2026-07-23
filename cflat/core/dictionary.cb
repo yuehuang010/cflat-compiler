@@ -141,14 +141,13 @@ struct dictionary<K, V>
         _values[index] = value;
     }
 
-    // Release the value in a live slot by moving it into a local and letting that local drop:
+    // Release the value in a live slot by moving it into the discard sink and letting that drop:
     // ownership DEFERS to V, so no `if const`. A `unique` value (thin `unique V*` or a `unique`
-    // interface fat pointer) transfers into `tmp` and its drop frees it once; a bare pointer /
-    // interface BORROW transfers a borrow and its drop frees nothing; a value type / string is
-    // moved out and destructed by the drop. `move _values[index]` nulls the moved-from slot.
+    // interface fat pointer) is freed once; a bare pointer / interface BORROW frees nothing; a
+    // value type / string is destructed. `move _values[index]` nulls the moved-from slot.
     void _releaseValueAt(int index)
     {
-        V tmp = move _values[index];
+        _ = move _values[index];
     }
 
     // Free a value handed to add() as a synthesized move sink that the dictionary is refusing
