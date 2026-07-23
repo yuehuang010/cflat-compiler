@@ -9916,6 +9916,39 @@ public:
                     right);
             }
 
+            // `unique T* LOCAL` reassignment (`b = a`): free the old pointee before overwriting,
+            // or the destination's prior object leaks - the field case just above closes this for
+            // struct fields, but a thin unique LOCAL fell through to the plain store. Scope exit
+            // frees a unique local via EmitOwningPtrCleanup ONLY when IsOwning is set, so we also
+            // adopt ownership below. Reuse EmitUniqueFieldDelete for the drop-old so the store-site
+            // free matches teardown (a null old pointee is a safe no-op). The outer
+            // destination != rightNV.Storage guard - and passing `right` to skip on an equal
+            // pointee - make self-assign `a = a` free nothing and keep its live pointer, mirroring
+            // the transfer-side self-assign guard in TransferPointerOwnershipOnStore.
+            if (operatorText == "=" && right && right->getType()->isPointerTy()
+                && !destIsStructField && destIsLocalOwningVar
+                && namedVar.TypeAndValue.IsUnique
+                && namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsInterface
+                && !namedVar.TypeAndValue.IsInterfacePointer
+                && !namedVar.TypeAndValue.IsFunctionPointer
+                && !namedVar.TypeAndValue.IsArrayView
+                && destination != rightNV.Storage)
+            {
+                compiler->EmitUniqueFieldDelete(
+                    *compiler->builder, destination,
+                    compiler->GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName),
+                    namedVar.TypeAndValue.TypeName, namedVar.TypeAndValue.AllocAlignValue,
+                    right);
+                // When the RHS transfers ownership (owning local, move param, or `new` temp -
+                // exactly what TransferPointerOwnershipOnStore nulls), the destination adopts it.
+                // A NON-owning destination (`unique R* b = nullptr; b = a;`) would otherwise be
+                // skipped by the Pointer && IsOwning scope-exit gate and leak the transferred
+                // pointee. Mirrors init and the unique-interface-local reassignment above.
+                if (rightNV.IsOwning && !namedVar.CallerName.empty())
+                    compiler->SetVariableOwning(namedVar.CallerName, true);
+            }
+
             // Destruct the old value of an owning-string LOCAL before overwriting it. Closes the
             // reassignment leak where a pre-declared string local reassigned in a loop
             // (`last = name.copy();`) dropped each prior owned buffer. The string dtor checks the

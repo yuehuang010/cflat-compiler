@@ -252,6 +252,46 @@ int testUniquePointerSelfAssign()
     return passed;
 }
 
+// Reassigning a live `unique T*` local from another (`b = a`) is a move: it must free b's
+// OLD pointee at the store (or it leaks), mark a moved, and leave exactly one surviving
+// pointee to free at scope exit. Regression for the unique-local reassign leak.
+int testUniquePointerReassignFreesOld()
+{
+    int passed = 0;
+    g_dtor = 0;
+    {
+        unique Res* a = new Res(1);
+        unique Res* b = new Res(2);
+        b = a;
+        // b's old pointee (id 2) is freed right at the store; a is now moved into b.
+        passed += Test("unique reassign frees old pointee at store", g_dtor, 1);
+        passed += Test("unique reassign keeps moved value", b->id, 1);
+    }
+    // The surviving pointee (originally a's, now b's) frees once at scope exit.
+    passed += Test("unique reassign two total dtors", g_dtor, 2);
+    return passed;
+}
+
+// Reassigning into a NON-owning `unique T*` local (`b = nullptr; b = a;`) must make the
+// destination adopt ownership, or the transferred pointee is skipped at scope exit and
+// leaks. Exactly one destruction at scope exit, 0 leaks.
+int testUniquePointerReassignNullDest()
+{
+    int passed = 0;
+    g_dtor = 0;
+    {
+        unique Res* a = new Res(3);
+        unique Res* b = nullptr;
+        b = a;
+        // b's old pointee is null, so nothing frees at the store.
+        passed += Test("unique reassign null-dest no store free", g_dtor, 0);
+        passed += Test("unique reassign null-dest keeps value", b->id, 3);
+    }
+    // The transferred pointee frees exactly once at scope exit (b now owns it).
+    passed += Test("unique reassign null-dest one dtor", g_dtor, 1);
+    return passed;
+}
+
 // --- interfaces: the alignment claim ----------------------------------------------
 
 // The case list<T> cannot support: a bare interface container holding a STACK value.
@@ -543,6 +583,8 @@ extern int main()
     total += 3;  passed += testUniquePointerOwns();
     total += 2;  passed += testUniquePointerSetFreesOld();
     total += 3;  passed += testUniquePointerSelfAssign();
+    total += 3;  passed += testUniquePointerReassignFreesOld();
+    total += 3;  passed += testUniquePointerReassignNullDest();
     total += 5;  passed += testBareInterfaceBorrows();
     total += 2;  passed += testUniqueInterfaceOwns();
     total += 3;  passed += testCopyValue();
