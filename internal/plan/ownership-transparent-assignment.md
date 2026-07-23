@@ -156,6 +156,172 @@ but do not block this plan (containers allocate through their own machinery).
 - Depends: 4, 5. The read-side move-out-into-dropped-local bug was fixed directly as the
   STEP D enabler.
 
+### Part 8 - Collapse the enqueue/add SINK split (conditional-consume sink params)   [opus, medium-high risk - DECISION GATE]
+
+The last container `if const (is_copyable(T))` splits (queue.enqueue, stack.push, list.add/set,
+dictionary.add/set + its `_placeOrInsertSink`/`_freeValue` machinery and the inner
+`is_unique(V)` duplicate-free) exist ONLY for SINK-ness: whether the caller's argument is
+consumed. Store semantics are already total (Part 6); sink inference is not - it requires a
+literal, UNCONDITIONAL top-level `move value` in the compiled arm (ApplyOwningSinkInference /
+CollectUnconditionalMovedNames, MainListener.h ~880-960), so the two arms differ only in
+`_placeAt(slot, value)` vs `_data[slot] = move value`.
+
+- PROBED 2026-07-23 (scratch/sink_probe.cb): a plain by-value param of a non-copyable owning
+  struct COMPILES TODAY AS A BORROW (read-only body: caller keeps the value, no param dtor).
+  Therefore a blanket type-based "non-copyable owner by-value = sink" rule would change the
+  behavior of EXISTING VALID programs - rejected. The rule must be consumption-gated.
+- THE RULE (proposed): a plain by-value param whose monomorphized type is a NON-COPYABLE OWNER
+  (owns-resource && !IsCopyableType; ParamIsOwningSinkEligible shape) and whose body consumes it
+  on AT LEAST ONE path (source of a plain `=`/slot store that classifies as MOVE for this
+  instantiation, or an owning call-arg - no `move` keyword required) becomes an OWNING SINK:
+  the caller's named arg is consumed at the call site (as today's inferred sinks), the param
+  slot OWNS the value, and any path that does not move it out DROPS it at scope exit via
+  DropValue (moved-out paths see a nulled slot - no-op, same as locals). Read-only bodies stay
+  borrows: zero delta for existing code.
+- Why conditional consumption becomes sound: today's inference demands UNCONDITIONAL move
+  because consuming the caller on a not-moved path leaks. Total scope-exit DropValue on the
+  sink param closes exactly that leak, so a conditional store (dictionary add's duplicate
+  refusal) no longer needs the `_placeOrInsertSink` funnel or `_freeValue` - the refused value
+  drops at scope exit.
+- Sub-stages:
+  - 8a: total scope-exit release for sink params (inferred AND explicit `move T`) via DropValue.
+    This also fixes the murky bare-`unique V*` move-param behavior (dictionary.cb's two comments
+    at ~154 and ~220 contradict each other on whether it auto-deletes; make it DropValue-total
+    and retire the empty-body `_freeValue` pattern - also used by btree.cb, update it too).
+    Enumerate double-free risk: existing `move T` bodies that hand-free AND rely on no exit drop.
+  - 8b: extend inference per THE RULE (classification-based consume detection + the
+    at-least-one-path relaxation, gated to non-copyable-owner param types only).
+  - 8c: collapse the containers: single-body enqueue/push/add/set with `_data[slot] = value;`,
+    dictionary add becomes `if (insertSlot == -1) return false;` + plain stores; delete
+    `_placeOrInsertSink`, `_freeValue`, the `is_unique(V)` inner free. Keep the `move T`
+    transfer overloads (`!is_pointer` guards) - they remain the copyable opt-out.
+- Deltas to enumerate BEFORE flipping (Part 4 discipline): user functions whose body consumes a
+  non-copyable-owner by-value param on some path (previously a leak or an error - flag every
+  test/err-test that flips); overload identity (IsOwningSink must not change signature matching
+  - verify `add(move T)` still coexists/resolves against a now-sink plain `add(T)`);
+  `--init` round-trip for any new flag (IsOwningSink already ships as "osk"); grow-loop
+  `newData[i] = move _data[j]` stays untouched.
+- LOAD-BEARING INVARIANT (probed 2026-07-23, both HeapAudit-clean): once elements are INSIDE a
+  container, all internal motion is move-semantics with zero copies - but two paths spell it as
+  RAW BIT-COPY relocation that works only because slot-to-slot GEP stores and non-owning named
+  sources bypass the Part 6 owning-store gate: dictionary REHASH (`_keys[slot] = oldKeys[i]`
+  bit-copy + `delete[_]` buffer-only free) and list SORT/_partition (`T tmp = _data[i]` borrow
+  bit-shuffle swaps; probed with string and owning-struct elements - suites only sort int/Res*).
+  Any future widening of the slot-store gate to GEP/element sources would double-copy or
+  double-free BOTH paths - re-probe them on any change there.
+- Verify: new leak legs - dictionary add-duplicate refusal across every V kind; caller-consumed
+  (err use-after-move) + caller-keeps (copyable) legs for enqueue/add/set; suites cold+warm;
+  remaining container `if const` = only the `!is_pointer` transfer-overload guards and the
+  copy() diagnostic ladders.
+- Depends: 6. GATE: maintainer sign-off on THE RULE (it makes previously-leaking/rejected
+  conditional-consume bodies well-defined and changes explicit `move T` param exit semantics).
+
+#### API-surface matrix: `list.add(x)` semantics per monomorphized T (probed 2026-07-23)
+
+The call site is invariant (`l.add(x)`); T's monomorphization ALONE decides copy-vs-move-vs-alias.
+Empirical (scratch probes, HeapAudit + dtor counters, all green). Same rules apply to
+queue.enqueue / stack.push / list.set / dictionary add/set VALUES (dictionary KEYS always copy -
+separate policy).
+
+| element T                             | class            | caller's x after add | slot gets      | frees        |
+|---------------------------------------|------------------|----------------------|----------------|--------------|
+| primitive / enum / POD struct         | trivial          | kept                 | bit copy       | n/a          |
+| `string`                              | copyable owner   | kept, independent    | deep copy      | both, once each |
+| struct w/ hand-written `copy()`       | copyable owner   | kept (2 indep frees) | `copy()`       | both, once each |
+| struct w/ synthesized memberwise copy | copyable owner   | kept                 | synth copy     | both, once each |
+| container (`list<int>` etc. as T)     | copyable owner   | kept                 | `copy()`       | both, once each |
+| `Lambda<...>` closure                 | copyable owner   | kept                 | env clone      | both, once each |
+| struct owning `unique`, no `copy()`   | NON-copyable     | CONSUMED, name poisoned | moved       | container    |
+| struct w/ user dtor + raw ptr, no `copy()` | NON-copyable (SynthCopyUnsafe) | CONSUMED, poisoned | moved | container |
+| bare `R*` / `alias R*`                | borrow           | kept, pointee untouched | aliased     | real owner   |
+| interface value (`IThing`)            | borrow (fat view)| kept                 | aliased        | real owner   |
+| `unique R*`                           | owning ptr (auto-sink) | CONSUMED, poisoned | transferred | container (`delete`) |
+| `unique IThing`                       | owning iface     | CONSUMED, poisoned   | transferred    | container (vtable dtor) |
+
+- POISONING RULE (stronger than expected): consumption at a CALL-ARG position marks the caller's
+  name moved and ANY later read is a compile error ("use of moved variable") - including reads
+  that just null-check. This applies to implicit sink consumption (`l.add(holder)`) AND the
+  explicit spelling (`l.add(move s)`) alike. Contrast: local-to-local `b = move a` leaves `a`
+  readable-as-null by design. So the call-arg form is already stricter than assignment.
+- Caller opt-outs are the ONLY degrees of freedom: `add(move x)` forces transfer of a copyable
+  owner (overload exists for value types only - `!is_pointer(T)` guard); `.copy()` at the call
+  site pre-copies. There is no opt-in to copy a non-copyable (by construction).
+- Part 8 relevance: the matrix is already total and caller-visible-stable; Part 8 changes NO
+  cell - it only removes the `if const` scaffolding that implements the copyable/non-copyable
+  row split, and makes dictionary add's duplicate-refusal path uniform.
+- Syntactic wrinkle (found adding the sort legs): a lambda PARAMETER list cannot carry the
+  `unique` qualifier - the compare for a `list<unique PtrLeak*>` is written with the bare
+  pointee type, `(PtrLeak* a, PtrLeak* b) => ...`, and substitution still matches
+  `Lambda<bool(T,T)>` (the element is handed to the compare as a borrow).
+- Coverage (2026-07-23): sort-on-owning-elements and forced-rehash legs added to
+  test_collection_leaks.cb (internal count 374 -> 393); suites green.
+
+### Part 9 - Collapse the RESIDUAL container `if const` (full inventory, 2026-07-23)
+
+Everything left in queue/stack/list/dictionary after Parts 6+8, clustered by what unblocks it.
+Target end state: ZERO ownership-driven `if const` in the containers; the only residue is
+explicitly-accepted policy (listed at the end).
+
+#### 9a - Release/return unification   [sonnet, .cb-only, NO compiler change - available NOW]
+- Dictionary remove()/clear()/~() each inline the SAME V-release ladder `_releaseValueAt`
+  already collapsed (dict 395-402, 429-435, 504-513: `is_unique(V)` delete / `!is_pointer(V)`
+  destruct / key `!is_primitive(K) !is_pointer(K)` destruct - 12 `if const`). Route all three
+  through `_releaseValueAt(slot)` plus a new `_releaseKeyAt(slot)` = `_ = move _keys[slot];`
+  (the discard slot-move handles owning string/struct keys, is a no-op for primitives, frees
+  nothing for pointer borrows - same DropValue recovery as values).
+- list ~() keeps a `is_unique(T)` free-loop (list 341) and relies on `delete[_size]` running
+  value dtors; collapse to the clear()-style `_releaseAt(i)` loop + buffer-only `delete[_]`
+  (uniform with queue/stack teardown, which already loop `_releaseAt`).
+- stack.pop() still carries the 3-way return-kind ladder (stack 112-137: `move T` / `alias T`
+  / `move T`). queue.dequeue() and list.take() ALREADY ship the collapsed form - plain
+  `T pop() { _size--; T value = move _data[_size]; return value; }` defers to T (a
+  `stack<alias T*>` still rejects deleting the result). Mirror it.
+- Verify: leak matrix (393) + new legs for pop-on-owning-elements and dict remove()/clear()
+  over every K/V kind; suites cold+warm.
+
+#### 9b - TOTAL `.copy()` over T   [opus, compiler change - the one new totality this part needs]
+- Make `.copy()` well-formed for EVERY T: identity bit-copy for primitive/enum/pointer/
+  interface-borrow; the real or synthesized copy for copyable owners; the existing actionable
+  compile error ("give the type a 'copy()' method, or 'move' ...") for non-copyable owners and
+  `unique` pointees. This is the copy-side twin of Part 1's total DropValue.
+- Collapses every per-element copy ladder to a one-liner:
+  - list.copy() x2 (list 245-248, 272-275) -> `result.add(_data[i].copy());`
+  - dictionary.copy() value+key ladders (dict 480-486) -> `result._keys[i] = _keys[i].copy();`
+    `result._values[i] = _values[i].copy();`
+  - `_placeKeyAt` (dict 123-125) -> `_keys[index] = key.copy();` (the alias-source key store
+    MUST copy - a plain `=` from an `alias K` param would alias, which is why this ladder
+    could not ride Part 4's flip).
+- The top-of-copy() `is_unique` guards (list 235/259, dict 464) fold into the same diagnostic;
+  KEEP at most one tailored `if const (!is_copyable(T)) compile_error(...)` per copy() if the
+  container-specific message ("...or 'move' the list instead of copying it") is worth more than
+  the generic one - decide on message quality at implementation.
+- `--init`: any new TypeAndValue/StructData field must ride the cache round-trip same-change.
+- Verify: copy() legs across all element kinds; err tests keep firing for non-copyable copy.
+
+#### 9c - `move T` overload elision   [optional; recommend KEEP the guards]
+- The 5 `!is_pointer` guards (queue 111, stack 99, list 119/155, dict 305) gate the explicit
+  transfer overloads: meaningless for borrows (would strand the element), redundant/ambiguous
+  for `unique` (plain param is already a sink). Collapsing needs a compiler rule that SKIPS
+  instantiating a `move T` overload when T substitutes to a pointer/interface kind - implicit
+  overload elision. RECOMMENDATION: not worth it - the guard is one self-documenting line
+  encoding real policy, and silent elision is more magical than the thing it removes. Revisit
+  only if overload elision falls out of other work.
+#### 9d - Hash dispatch   [optional, orthogonal to ownership]
+- `_slot` (dict 41-49) dispatches hashing: `Hash(key)` primitives / `Hash((i64)key)` pointers /
+  `key.hash()` structs. Collapse requires a TOTAL `Hash(T)` (identity-address for pointers,
+  member `.hash()` required for structs) - a trait-shaped feature, not ownership. Defer unless
+  a hashset/btree unification wants it too.
+- The `is_unique(K)` and `is_interface(K)` key REJECTIONS (dict 36-44) are policy diagnostics
+  with tailored messages - they stay as `compile_error` guards regardless.
+
+#### Accepted permanent residue (after 9a+9b land, if 9c/9d are declined)
+- 5x `!is_pointer` transfer-overload guards (policy: who may write `move x` at the call site).
+- Up to 3x tailored non-copyable copy() messages (message quality over genericity).
+- Dictionary `_slot` hash dispatch + 2 key-policy rejections.
+Every OWNERSHIP decision - store, release, return, copy - defers to T with zero `if const`.
+- Depends: 9a on nothing (start immediately); 9b on nothing besides Part 4 (landed); 9c/9d
+  independent. Part 8 (sink split) remains the separate caller-contract track.
+
 ### Cross-cutting constraints (every part)
 - Any change to type parsing goes in BOTH `ParseDeclarationSpecifiers` copies. Errors via
   `LogError`/`LogErrorContext` only. ASCII only. Inline comments <= 2 lines.

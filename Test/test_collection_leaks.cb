@@ -2402,6 +2402,89 @@ extern int main()
         total++; passed += Test("raw-ptr copy() frees two independent nodes", g_rawNodeFreed, 2);
     }
 
+    // === Regression: list<T>.sort() relocates elements via a raw bit-copy swap in _qsort /
+    // _partition / _medianPivot (`T tmp = _data[i]; _data[i] = _data[j]; _data[j] = tmp;`). That
+    // shuffle bypasses the ownership machinery, so it must be exercised over OWNING element types
+    // too, not just int / bare pointers - a copy/move miscount here would show up as a leak or a
+    // double free at scope exit below.
+    {
+        // list<string>: sort must reorder without leaking or double-freeing any owned buffer.
+        {
+            list<string> ls = {"pear", "apple", "mango", "banana", "kiwi", "grape"};
+            ls.sort((string a, string b) => { return a < b; });
+            total++; passed += Test("list<string> sort count", ls.count(), 6);
+            total++; passed += Test("list<string> sort first", ls.get(0), "apple");
+            total++; passed += Test("list<string> sort last",  ls.get(5), "pear");
+        }
+
+        // list<LeakRow>: an OWNING value struct (string field) sorted by that field.
+        {
+            list<LeakRow> rows = default;
+            LeakRow r1 = default; r1.name = "delta";   rows.add(r1);
+            LeakRow r2 = default; r2.name = "alpha";   rows.add(r2);
+            LeakRow r3 = default; r3.name = "charlie"; rows.add(r3);
+            LeakRow r4 = default; r4.name = "bravo";   rows.add(r4);
+            rows.sort((LeakRow a, LeakRow b) => { return a.name < b.name; });
+            total++; passed += Test("list<LeakRow> sort count", rows.count(), 4);
+            total++; passed += Test("list<LeakRow> sort first", rows.get(0).name, "alpha");
+            total++; passed += Test("list<LeakRow> sort last",  rows.get(3).name, "delta");
+        }
+
+        // list<unique PtrLeak*>: sort by a field; every element must be freed exactly once at
+        // scope exit (the swap only relocates the pointer bits, ownership count is unaffected).
+        g_shapeDtor = 0;
+        {
+            list<unique PtrLeak*> lu = default;
+            PtrLeak* p0 = new PtrLeak(); p0.v = 40; lu.add(move p0);
+            PtrLeak* p1 = new PtrLeak(); p1.v = 10; lu.add(move p1);
+            PtrLeak* p2 = new PtrLeak(); p2.v = 30; lu.add(move p2);
+            PtrLeak* p3 = new PtrLeak(); p3.v = 20; lu.add(move p3);
+            lu.sort((PtrLeak* a, PtrLeak* b) => { return a.v < b.v; });
+            total++; passed += Test("list<unique ptr> sort count",  lu.count(), 4);
+            total++; passed += Test("list<unique ptr> sort first",  lu.get(0).v, 10);
+            total++; passed += Test("list<unique ptr> sort last",   lu.get(3).v, 40);
+            total++; passed += Test("list<unique ptr> sort live before teardown", g_shapeDtor, 0);
+        }
+        total++; passed += Test("list<unique ptr> sort teardown frees each once", g_shapeDtor, 4);
+    }
+
+    // === Regression: dictionary<K,V>._maybeRehash relocates every live entry into a fresh, larger
+    // buffer via a raw bit-copy (`_keys[slot] = oldKeys[i]; _values[slot] = oldValues[i];`) plus a
+    // buffer-only `delete[_]` of the old arrays. Force MULTIPLE rehashes (initial capacity is 8,
+    // doubling on load factor) over OWNING keys and OWNING values to prove the relocation neither
+    // leaks nor double-frees.
+    {
+        // dictionary<string, string>: owning keys AND owning values, well past several rehashes.
+        {
+            dictionary<string, string> d = default;
+            int i = 0;
+            while (i < 120) { d.add("k" + i.toString(), "v" + i.toString()); i++; }
+            total++; passed += Test("dict<str,str> rehash count",        d.count(), 120);
+            total++; passed += Test("dict<str,str> rehash lookup early", d.get("k0"),   "v0");
+            total++; passed += Test("dict<str,str> rehash lookup mid",   d.get("k60"),  "v60");
+            total++; passed += Test("dict<str,str> rehash lookup last",  d.get("k119"), "v119");
+        }
+
+        // dictionary<string, unique PtrLeak*>: owning keys AND owning unique-pointer values,
+        // rehashed several times (8 -> 16 -> 32 -> 64); every value must free exactly once.
+        g_shapeDtor = 0;
+        {
+            dictionary<string, unique PtrLeak*> d2 = default;
+            int i = 0;
+            while (i < 40)
+            {
+                PtrLeak* p = new PtrLeak();
+                p.v = i;
+                d2.add("k" + i.toString(), move p);
+                i++;
+            }
+            total++; passed += Test("dict<str,unique ptr> rehash count",  d2.count(), 40);
+            total++; passed += Test("dict<str,unique ptr> rehash lookup", d2.get("k20").v, 20);
+            total++; passed += Test("dict<str,unique ptr> rehash live before teardown", g_shapeDtor, 0);
+        }
+        total++; passed += Test("dict<str,unique ptr> rehash teardown frees each once", g_shapeDtor, 40);
+    }
+
     // === Leak oracle: everything above must have freed on scope exit ===
     u64 leaks = HeapAudit.reportLeaks();
     total++; passed += Test("HeapAudit live allocations", (i64)leaks, (i64)0);
