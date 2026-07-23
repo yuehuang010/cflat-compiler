@@ -292,6 +292,28 @@ int testUniquePointerReassignNullDest()
     return passed;
 }
 
+// Storing a named owning `unique T*` local into a `unique T*` struct FIELD (`w.f = a`) must
+// TRANSFER, not alias: the field becomes the sole owner and `a` is consumed (nulled + marked
+// moved). Without the transfer both handles co-owned one pointee (silent alias; UAF one
+// perturbation away) - the refcount-alias path was never consulted at the field free.
+struct WrapRes { unique Res* f = default; };
+int testUniquePointerFieldStoreTransfers()
+{
+    int passed = 0;
+    g_dtor = 0;
+    {
+        WrapRes w = default;
+        unique Res* a = new Res(7);
+        w.f = a;
+        // a is now moved into the field; nothing frees at the store, one live pointee remains.
+        passed += Test("unique field store no premature free", g_dtor, 0);
+        passed += Test("unique field store field owns value", w.f->id, 7);
+    }
+    // The field's sole pointee frees exactly once at w's teardown (a was consumed, frees nothing).
+    passed += Test("unique field store one dtor at scope exit", g_dtor, 1);
+    return passed;
+}
+
 // --- interfaces: the alignment claim ----------------------------------------------
 
 // The case list<T> cannot support: a bare interface container holding a STACK value.
@@ -585,6 +607,7 @@ extern int main()
     total += 3;  passed += testUniquePointerSelfAssign();
     total += 3;  passed += testUniquePointerReassignFreesOld();
     total += 3;  passed += testUniquePointerReassignNullDest();
+    total += 3;  passed += testUniquePointerFieldStoreTransfers();
     total += 5;  passed += testBareInterfaceBorrows();
     total += 2;  passed += testUniqueInterfaceOwns();
     total += 3;  passed += testCopyValue();

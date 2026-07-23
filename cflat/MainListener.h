@@ -9905,6 +9905,7 @@ public:
             // synthesized destructor already trusts it: every construction path (stack local,
             // `new T()`, `new T[n]`, user-ctor entry) runs a default constructor that
             // zero-initializes the fields.
+            bool consumedUniqueFieldSource = false;
             if (operatorText == "=" && right && right->getType()->isPointerTy()
                 && destIsStructField
                 && namedVar.TypeAndValue.IsUnique)
@@ -9914,6 +9915,39 @@ public:
                     compiler->GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName),
                     namedVar.TypeAndValue.TypeName, namedVar.TypeAndValue.AllocAlignValue,
                     right);
+
+                // Transfer, not alias: storing a named OWNING `unique T*` local into a unique
+                // pointer field must CONSUME the source (null its slot + mark moved) so the field
+                // is the sole owner - mirrors the unique-LOCAL reassign and the by-value move sink.
+                // Otherwise TransferPointerOwnershipOnStore's refcount-alias path (new-allocated
+                // local escaping to a field) leaves both handles live over one pointee - and the
+                // field free never consults that refcount, so a UAF is one perturbation away. A
+                // `new`/call temp (null Storage) is already a sole owner and left as-is; a store
+                // back into the same slot is skipped so it does not dangle; the null-out below is
+                // what makes the source's scope-exit free a no-op.
+                llvm::Value* srcStorage = rightNV.Storage;
+                llvm::Type*  srcBaseTy  = rightNV.BaseType;
+                if (srcStorage == nullptr && !rightNV.CallerName.empty())
+                {
+                    auto ref = compiler->FindVariableStorage(rightNV.CallerName);
+                    srcStorage = ref.Storage;
+                    srcBaseTy  = ref.BaseType;
+                }
+                if (rightNV.IsOwning && rightNV.TypeAndValue.Pointer
+                    && !rightNV.TypeAndValue.IsArrayView
+                    && !rightNV.TypeAndValue.IsMove
+                    && !rightNV.CallerName.empty()
+                    && rightNV.FieldName.empty()
+                    && srcStorage != nullptr && srcStorage != destination)
+                {
+                    if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(srcBaseTy))
+                    {
+                        compiler->builder->CreateStore(
+                            llvm::ConstantPointerNull::get(ptrTy), srcStorage);
+                        compiler->MarkVariableMoved(rightNV.CallerName);
+                        consumedUniqueFieldSource = true;
+                    }
+                }
             }
 
             // `unique T* LOCAL` reassignment (`b = a`): free the old pointee before overwriting,
@@ -9972,7 +10006,9 @@ public:
             if (namedVar.TypeAndValue.NoaliasScopeId >= 0)
                 if (auto* st = llvm::dyn_cast_or_null<llvm::StoreInst>(assignResult))
                     compiler->AttachViewNoalias(st, namedVar.TypeAndValue.NoaliasScopeId);
-            if (operatorText == "=")
+            // Skip when the unique-field store above already consumed the source: it did the
+            // transfer explicitly, and re-running here would take the aliasing refcount path.
+            if (operatorText == "=" && !consumedUniqueFieldSource)
                 TransferPointerOwnershipOnStore(
                     rightNV, destination, namedVar.TypeAndValue.IsInterface, ctx);
             // Transfer ownership for move string: null _ptr so string.dtor is a no-op
