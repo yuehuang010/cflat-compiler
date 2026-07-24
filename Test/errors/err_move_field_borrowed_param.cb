@@ -36,6 +36,35 @@ expect_error("cannot 'move' field 'Node.next' through borrowed parameter 'n'") {
     }
 }
 
+// Element of a RETURNED TEMPORARY (`mk().slots[i]`): the inline array field is extracted out
+// of a by-value temp as a register value, so the slot has no address to GEP into (this used
+// to crash the compiler, rc=139, with or without 'move'). Rejected by a dedicated guard, not
+// by the 'move'-specific machinery - pin the substring the guard actually emits, not the
+// whole-field guard's shared prefix, so a future refactor that re-routes 'move' into the
+// older guard cannot leave the plain read/store forms free to regress to a segfault.
+Node mkNode() { Node n = default; n.slots[0] = new Resource(); return n; }
+expect_error("inline array field of a temporary") {
+    int stealFromTemp() {
+        Resource* taken = move mkNode().slots[0];
+        return taken == nullptr ? 0 : 1;
+    }
+}
+
+// Bare read (no 'move'): same crash before the fix, same guard now.
+expect_error("inline array field of a temporary") {
+    int readFromTemp() {
+        Resource* v = mkNode().slots[0];
+        return v == nullptr ? 0 : 1;
+    }
+}
+
+// Store form: writing through the same unaddressable slot.
+expect_error("inline array field of a temporary") {
+    void storeIntoTemp() {
+        mkNode().slots[0] = nullptr;
+    }
+}
+
 // Sanity: 'move' on the parameter authorizes 'move' on its fields.
 void stealItemOk(move Container* c) {
     Resource* taken = move c->item;

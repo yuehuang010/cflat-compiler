@@ -16700,6 +16700,29 @@ public:
                             structVar = {};
                             break;
                         }
+                        // A null-Storage base with no addressable backing would build the GEPs below
+                        // on a null pointer and crash. Split by shape: an inline array field of a
+                        // by-value temporary vs. any other non-indexable temporary (scalar, fat
+                        // pointer, or a struct rvalue that reached here with no operator[] match).
+                        else if (namedVar.Storage == nullptr && llvm::isa<llvm::ArrayType>(namedVar.BaseType))
+                        {
+                            LogErrorContext(expressCtx,
+                                "'[]' requires an addressable source (field or local) - an inline array "
+                                "field of a temporary value has no storage. Bind the call result to a "
+                                "local first, then index it.");
+                            namedVar = {};
+                            structVar = {};
+                            break;
+                        }
+                        else if (namedVar.Storage == nullptr && !namedVar.TypeAndValue.Pointer)
+                        {
+                            LogErrorContext(expressCtx,
+                                "'[]' requires an addressable source (field or local) - cannot apply "
+                                "'[]' to a non-indexable temporary value.");
+                            namedVar = {};
+                            structVar = {};
+                            break;
+                        }
                         else if (auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(namedVar.BaseType))
                         {
                             // Fixed-size array (char buf[N] or char* words[N]): two-index GEP {0, i}.
