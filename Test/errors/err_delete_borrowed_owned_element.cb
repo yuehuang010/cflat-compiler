@@ -15,4 +15,15 @@ expect_error("borrows an element that its container owns") {
     }
 }
 
+// Recovering a BARE-pointer element slot through a borrowed node pointer yields a BORROW
+// (recovery clears IsOwning/IsNewAllocated), so deleting it is rejected: the caller may own
+// the pointee. `move n->values[i]` is now legal for the slot, but `delete taken` is not.
+struct SlotNode<K, V> { V values[16] = default; int count = 0; };
+expect_error("cannot delete 'taken' - it aliases borrowed parameter 'n'") {
+    void deleteRecoveredBorrow(SlotNode<int, B*>* n, int i) {
+        B* taken = move n->values[i];
+        delete taken;
+    }
+}
+
 extern int main() { return 0; }

@@ -262,6 +262,39 @@ void r1MaybeStore(LeakHolder mh, int c) { if (c != 0) g_r1SinkSlot = mh; }
 struct R1CpBox { string s = default; R1CpBox copy() { R1CpBox c = default; c.s = s.copy(); return move c; } };
 R1CpBox r1MkBox() { R1CpBox r = default; r.s = "rv" + "box"; return move r; }
 
+// === Borrowed-slot recovery: `move n->values[i]` through a BORROWED node pointer ===
+// A node is reachable only through a borrow (btree's shape: parent children[i], leaf next),
+// yet an element SLOT is now releasable/transferable through that borrow. The slot GEP nulls
+// the ONE real object, so ownership is recovered from the element type V (no callee copy is
+// nulled, no caller alias is surprised). Whole-field moves through a borrow stay rejected.
+// Mirrors dictionary's `_ = move _values[i]` (base `this`), now allowed for any borrowed base.
+// The node struct is generic (btree_node's inline-array shape); the helpers take borrowed
+// pointers of concrete instantiations because a generic free fn cannot infer/take a `unique`
+// element type argument. Each helper's `n` is a borrowed (non-move) pointer param - the path
+// this change legalizes; a whole-field `move n->keys` would still be rejected.
+struct SlotNode<K, V>
+{
+    K keys[16] = default;
+    V values[16] = default;
+    int count = 0;
+};
+// Discard-release slot i through a borrowed node pointer (dictionary's `_releaseValueAt` shape).
+void snDiscardUPtr(SlotNode<int, unique PtrLeak*>* n, int i)   { _ = move n->values[i]; }
+void snDiscardIface(SlotNode<int, unique IShapeLeak>* n, int i){ _ = move n->values[i]; }
+void snDiscardBare(SlotNode<int, PtrLeak*>* n, int i)          { _ = move n->values[i]; }
+void snDiscardStr(SlotNode<int, string>* n, int i)            { _ = move n->values[i]; }
+void snDiscardHolder(SlotNode<int, LeakHolder>* n, int i)      { _ = move n->values[i]; }
+// Recover slot i into a typed local, which drops at scope exit (frees once for owning V).
+void snTypedUPtr(SlotNode<int, unique PtrLeak*>* n, int i)     { unique PtrLeak* taken = move n->values[i]; }
+void snTypedIface(SlotNode<int, unique IShapeLeak>* n, int i)  { unique IShapeLeak taken = move n->values[i]; }
+void snTypedBare(SlotNode<int, PtrLeak*>* n, int i)            { PtrLeak* taken = move n->values[i]; }
+void snTypedHolder(SlotNode<int, LeakHolder>* n, int i)        { LeakHolder taken = move n->values[i]; }
+// Slot-to-slot transfer between two BORROWED nodes: single owner throughout, no copy.
+void snMoveAcross(SlotNode<int, unique PtrLeak*>* dst, int j, SlotNode<int, unique PtrLeak*>* src, int i)
+{
+    dst->values[j] = move src->values[i];
+}
+
 // Regression for internal/issue/discard-move-vs-decl-move-element-ownership-disparity.md:
 // `_ = move _data[i]` (the DISCARD form) must release an owning container element exactly like
 // `T tmp = move _data[i]` (the DECL form) - an owning `unique T*`/`unique IFace` element frees
@@ -2343,6 +2376,112 @@ extern int main()
             total++; passed += Test("unique ptr array move-out frees one", g_shapeDtor, 1);
         }
         total++; passed += Test("unique ptr array frees the remaining three", g_shapeDtor, 4);
+    }
+
+    // === Borrowed-slot recovery: `move n->values[i]` through a borrowed node pointer ===
+    // The exact shape btree needs (a node reached only through a borrow, releasing/transferring
+    // an owning value SLOT). Discard-release, typed-local recovery, and slot-to-slot transfer,
+    // across every element kind {unique R*, unique IShape, bare R*, string, Holder{unique R*}}.
+    // Plus a caller-still-holds-n leg: the base must NOT be consume-inferred as a sink.
+    {
+        // (1) unique R* (thin unique pointer): frees exactly once per release path.
+        g_shapeDtor = 0;
+        {
+            SlotNode<int, unique PtrLeak*> n = default;
+            n.values[0] = new PtrLeak();
+            n.values[1] = new PtrLeak();
+            n.values[2] = new PtrLeak();
+            n.count = 3;
+            SlotNode<int, unique PtrLeak*>* np = &n;
+            snDiscardUPtr(np, 0);                          // discard-release slot 0
+            total++; passed += Test("bsr unique-ptr discard frees one", g_shapeDtor, 1);
+            snTypedUPtr(np, 1);                            // recover slot 1 into a typed local, drops
+            total++; passed += Test("bsr unique-ptr typed-local frees one", g_shapeDtor, 2);
+            // Caller still holds np: base was not consumed. count + the untouched slot are readable.
+            total++; passed += Test("bsr caller still holds count", np->count, 3);
+            total++; passed += Test("bsr caller still holds live slot", np->values[2] != nullptr, true);
+        }
+        total++; passed += Test("bsr unique-ptr teardown frees the last", g_shapeDtor, 3);
+
+        // (2) unique IShape (fat unique interface value): released via the vtable dtor slot.
+        g_shapeDtor = 0;
+        {
+            SlotNode<int, unique IShapeLeak> n = default;
+            n.values[0] = new CircleLeak();
+            n.values[1] = new CircleLeak();
+            n.count = 2;
+            SlotNode<int, unique IShapeLeak>* np = &n;
+            snDiscardIface(np, 0);
+            total++; passed += Test("bsr unique-iface discard frees one", g_shapeDtor, 1);
+            snTypedIface(np, 1);
+            total++; passed += Test("bsr unique-iface typed-local frees one", g_shapeDtor, 2);
+        }
+        total++; passed += Test("bsr unique-iface teardown frees nothing left", g_shapeDtor, 2);
+
+        // (3) bare R* (borrow): the tree owns nothing, so a slot release frees NOTHING.
+        g_shapeDtor = 0;
+        {
+            PtrLeak* a = new PtrLeak();
+            PtrLeak* b = new PtrLeak();
+            {
+                SlotNode<int, PtrLeak*> n = default;
+                n.values[0] = a;
+                n.values[1] = b;
+                n.count = 2;
+                SlotNode<int, PtrLeak*>* np = &n;
+                snDiscardBare(np, 0);
+                snTypedBare(np, 1);
+                total++; passed += Test("bsr bare-ptr release frees nothing", g_shapeDtor, 0);
+            }
+            total++; passed += Test("bsr bare-ptr node teardown frees nothing", g_shapeDtor, 0);
+            delete a;
+            delete b;
+            total++; passed += Test("bsr bare-ptr caller frees exactly once", g_shapeDtor, 2);
+        }
+
+        // (4) string (value element owning a heap buffer): recovery empties the slot, no leak.
+        {
+            SlotNode<int, string> n = default;
+            n.values[0] = "a sufficiently long borrowed-slot string element zero";
+            n.values[1] = "a sufficiently long borrowed-slot string element one!";
+            n.count = 2;
+            SlotNode<int, string>* np = &n;
+            string taken = move np->values[0];             // typed-local recovery of a value element
+            total++; passed += Test("bsr string typed-local recovers value", taken.startsWith("a suff"), true);
+            total++; passed += Test("bsr string slot emptied after move", (int)np->values[0].length(), 0);
+            snDiscardStr(np, 1);                            // discard-release the other buffer now
+            total++; passed += Test("bsr string discard emptied slot", (int)np->values[1].length(), 0);
+        }
+
+        // (5) Holder{unique R*} (value struct owning a unique field): the moved value frees its field.
+        g_shapeDtor = 0;
+        {
+            SlotNode<int, LeakHolder> n = default;
+            n.values[0].slot = new PtrLeak(); n.values[0].k = 7;
+            n.values[1].slot = new PtrLeak(); n.values[1].k = 9;
+            n.count = 2;
+            SlotNode<int, LeakHolder>* np = &n;
+            snDiscardHolder(np, 0);
+            total++; passed += Test("bsr holder discard frees the unique field", g_shapeDtor, 1);
+            snTypedHolder(np, 1);
+            total++; passed += Test("bsr holder typed-local frees the unique field", g_shapeDtor, 2);
+        }
+        total++; passed += Test("bsr holder teardown frees nothing left", g_shapeDtor, 2);
+
+        // (6) slot-to-slot transfer across two BORROWED nodes: single owner throughout, no double-free.
+        g_shapeDtor = 0;
+        {
+            SlotNode<int, unique PtrLeak*> src = default;
+            SlotNode<int, unique PtrLeak*> dst = default;
+            src.values[0] = new PtrLeak(); src.count = 1;
+            SlotNode<int, unique PtrLeak*>* sp = &src;
+            SlotNode<int, unique PtrLeak*>* dp = &dst;
+            snMoveAcross(dp, 3, sp, 0);                    // dst->values[3] = move src->values[0]
+            total++; passed += Test("bsr slot-to-slot transfer frees nothing yet", g_shapeDtor, 0);
+            total++; passed += Test("bsr slot-to-slot source emptied", sp->values[0] == nullptr, true);
+            total++; passed += Test("bsr slot-to-slot dest owns value", dp->values[3] != nullptr, true);
+        }
+        total++; passed += Test("bsr slot-to-slot single owner freed once at teardown", g_shapeDtor, 1);
     }
 
     // === hpc/btree<K,V> borrow-by-default migration (the last container converted) ===

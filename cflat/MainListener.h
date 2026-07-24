@@ -14629,9 +14629,12 @@ public:
         // Reject 'move param->field' (or any field whose parent traces to a borrowed
         // parameter): the caller still owns the parent struct and will see a nulled field
         // it never agreed to surrender. Require the parent parameter to be declared 'move'.
+        // Element slots (n->values[i]) are exempt: IsBorrowed only tags pointer bases, so the
+        // slot GEP nulls the one real object - recovery derives ownership from the element type.
         if (!argNV.OwningStructName.empty()
             && argNV.IsBorrowed
-            && !argNV.BorrowedOrigin.empty())
+            && !argNV.BorrowedOrigin.empty()
+            && !argNV.IsElementAccess)
         {
             LogErrorContext(ctx, std::format(
                 "cannot 'move' field '{}.{}' through borrowed parameter '{}'. Declare the "

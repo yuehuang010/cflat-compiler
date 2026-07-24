@@ -24,6 +24,18 @@ expect_error("cannot 'move' field 'Container.item' through borrowed parameter 'c
     }
 }
 
+// Element-adjacent whole-field shape: a node with an inline array field AND a `next` pointer.
+// Element SLOTS through a borrowed pointer (`move n->slots[i]`) are now legal, but a WHOLE
+// field move (`move n->next`) through the same borrow stays rejected - the exemption is
+// element-slot-specific, not "the struct happens to hold an array".
+struct Node { Resource* slots[4] = default; Node* next = nullptr; };
+expect_error("cannot 'move' field 'Node.next' through borrowed parameter 'n'") {
+    void stealNext(Node* n) {
+        Node* taken = move n->next;
+        delete taken;
+    }
+}
+
 // Sanity: 'move' on the parameter authorizes 'move' on its fields.
 void stealItemOk(move Container* c) {
     Resource* taken = move c->item;
