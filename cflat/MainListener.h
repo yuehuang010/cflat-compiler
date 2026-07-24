@@ -10584,6 +10584,249 @@ public:
         return nullptr;
     }
 
+    /*
+     * Align the two '?:' arm values onto one LLVM type so the join (a PHI, or a select in the
+     * constant-context fallback) has matching operand types. `atTrue`/`atFalse` reposition the
+     * builder into the block that produced the corresponding arm - required by the branching
+     * lowering, where a coercion instruction must land on its own arm's path, not at the join.
+     * Returns false, after logging, on a genuine mismatch.
+     */
+    bool UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContext* ctx,
+                              llvm::Value*& trueValue, llvm::Value*& falseValue,
+                              const std::function<void()>& atTrue,
+                              const std::function<void()>& atFalse)
+    {
+        auto* compiler = Compiler(ctx);
+        if (!trueValue || !falseValue || trueValue->getType() == falseValue->getType())
+            return true;
+
+        auto* ft = falseValue->getType();
+        auto* tt = trueValue->getType();
+        auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string");
+        if (ft->isIntegerTy() && tt->isIntegerTy())
+        {
+            unsigned fb = ft->getIntegerBitWidth();
+            unsigned tb = tt->getIntegerBitWidth();
+            if (fb < tb) { atFalse(); falseValue = compiler->Upconvert(falseValue, tt); }
+            else         { atTrue();  trueValue  = compiler->Upconvert(trueValue,  ft); }
+        }
+        else if (ft->isFloatingPointTy() && tt->isFloatingPointTy())
+        {
+            // Widen the narrower branch (e.g. float literal 1.0 -> double).
+            unsigned fb = ft->getScalarSizeInBits();
+            unsigned tb = tt->getScalarSizeInBits();
+            if (fb < tb) { atFalse(); falseValue = compiler->Upconvert(falseValue, tt); }
+            else         { atTrue();  trueValue  = compiler->Upconvert(trueValue,  ft); }
+        }
+        else if (ft->isFloatingPointTy() && tt->isIntegerTy())
+        {
+            // Mixed int/float (e.g. cond ? 1 : 2.5): promote the integer side.
+            atTrue();
+            trueValue = compiler->Upconvert(trueValue, ft);
+        }
+        else if (ft->isIntegerTy() && tt->isFloatingPointTy())
+        {
+            atFalse();
+            falseValue = compiler->Upconvert(falseValue, tt);
+        }
+        else if (strTy && tt == strTy && ft->isPointerTy())
+        {
+            // string vs char* literal (e.g. cond ? prefix : "0"): wrap the raw
+            // pointer into a non-owning string so both branches are `string`.
+            atFalse();
+            falseValue = compiler->WrapStringLiteralAsString(falseValue);
+        }
+        else if (strTy && ft == strTy && tt->isPointerTy())
+        {
+            atTrue();
+            trueValue = compiler->WrapStringLiteralAsString(trueValue);
+        }
+        else
+        {
+            auto describe = [](llvm::Type* t) -> std::string {
+                if (auto* st = llvm::dyn_cast<llvm::StructType>(t))
+                    return (st->hasName() ? st->getName().str() : std::string("struct"));
+                if (t->isPointerTy()) return "pointer";
+                if (t->isIntegerTy()) return "i" + std::to_string(t->getIntegerBitWidth());
+                if (t->isFloatTy())   return "float";
+                if (t->isDoubleTy())  return "double";
+                return "value";
+            };
+            // ctx->expression() is the true branch; ctx->conditionalExpression() the false.
+            LogErrorContext(ctx, std::format(
+                "ternary branches have incompatible types '{}' and '{}'",
+                describe(tt), describe(ft)));
+            return false;
+        }
+        return true;
+    }
+
+    /*
+     * Make one '?:' arm's string value an INDEPENDENT owned buffer inside the arm's own block.
+     * The raw value may alias an owning field/local buffer (binding the result would free it
+     * twice) and a call-result temp has no other owner. Deep-copy it, then free the consumed
+     * temp here - the join cannot free it, since an arm value does not dominate the join.
+     */
+    llvm::Value* AdoptTernaryStringArm(LLVMBackend* compiler, llvm::Value* value, bool& deepCopied)
+    {
+        auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string");
+        if (strTy == nullptr || value == nullptr || value->getType() != strTy) return value;
+
+        auto* owned = compiler->EmitOwnedStringDeepCopy(value);
+        if (owned == value) return value;
+        deepCopied = true;
+        // A temp nothing else owns: already registered, or a plain (non-`move`) string-returning
+        // CALL, which the call path does not register. A local/field read is neither - its owner frees it.
+        if (compiler->IsPendingOwnedStringTemp(value) || llvm::isa<llvm::CallInst>(value))
+        {
+            compiler->UnregisterOwnedStringTemp(value);
+            compiler->EmitOwnedStringTempFree(value);
+        }
+        return owned;
+    }
+
+    /*
+     * Close one '?:' arm. ORDER IS LOAD-BEARING and is the whole point of this function: the deep
+     * copy MUST be emitted before the arm's flush. An arm value can BORROW from a temp the flush
+     * destroys - `c ? makeToken("hi").text : "-"` yields a string aliasing the owning-struct temp's
+     * buffer - so copying afterwards would memcpy from freed memory (use-after-free), and not
+     * copying at all would leak the parent. Then flush what the arm registered: those entries are
+     * keyed to the arm's block, which does not dominate the join, so the end-of-statement flush
+     * would skip them (OwnedTempDominatesHere) and every buffer would leak. The yielded value is
+     * kept unless the copy above already consumed it.
+     */
+    void FinishTernaryArm(LLVMBackend* compiler, llvm::Value*& value,
+                          const LLVMBackend::OwnedTempMark& mark, bool& deepCopied)
+    {
+        value = AdoptTernaryStringArm(compiler, value, deepCopied);
+        compiler->FlushOwnedTempsSince(mark, deepCopied ? nullptr : value);
+    }
+
+    /*
+     * Lower `cond ? a : b` as a real branch, mirroring the '??' lowering directly below: the true
+     * arm is emitted into its own block, the false arm into its own, and the two join through a PHI
+     * in the resume block. Only the selected arm's code runs, so a `move` or a dereference in the
+     * other arm has no effect - the eager CreateSelect form executed both unconditionally.
+     */
+    LLVMBackend::TypedValue ParseTernaryBranches(
+        CFlatParser::ConditionalExpressionContext* ctx,
+        const LLVMBackend::TypedValue& condTv,
+        CFlatParser::ExpressionContext* expressionTrueCtx,
+        CFlatParser::ConditionalExpressionContext* expressionFalseCtx)
+    {
+        auto* compiler = Compiler(ctx);
+        if (condTv.value == nullptr) return {};
+
+        auto* trueBlock   = compiler->CreateBasicBlock("ternary_true");
+        auto* falseBlock  = compiler->CreateBasicBlock("ternary_false");
+        auto* resumeBlock = compiler->CreateBasicBlock("ternary_resume");
+
+        // Coerces a non-bool condition to i1; leaves the insert point in trueBlock.
+        compiler->CreateConditionJump(condTv.value, trueBlock, falseBlock);
+
+        llvm::Value* trueValue  = nullptr;
+        llvm::Value* falseValue = nullptr;
+        llvm::BranchInst* trueBr  = nullptr;
+        llvm::BranchInst* falseBr = nullptr;
+        bool trueOwnedString  = false;
+        bool falseOwnedString = false;
+        LLVMBackend::OwnedTempMark trueMark  = compiler->MarkOwnedTemps();
+        LLVMBackend::OwnedTempMark falseMark = trueMark;
+        try
+        {
+            trueValue = ParseExpression(expressionTrueCtx);
+            FinishTernaryArm(compiler, trueValue, trueMark, trueOwnedString);
+            trueBr    = compiler->CreateJump(resumeBlock);
+
+            compiler->SwitchToBlock(falseBlock);
+            falseMark  = compiler->MarkOwnedTemps();
+            falseValue = ParseConditionalExpression(expressionFalseCtx);
+            FinishTernaryArm(compiler, falseValue, falseMark, falseOwnedString);
+            falseBr    = compiler->CreateJump(resumeBlock);
+        }
+        catch (...)
+        {
+            // An error thrown mid-arm leaves half-emitted blocks; terminate them so the module
+            // still verifies when the error is caught (expect_error) and compilation continues.
+            if (compiler->IsInsertBlockLive()) compiler->builder->CreateBr(resumeBlock);
+            for (auto* bb : { trueBlock, falseBlock })
+            {
+                if (bb->getTerminator() != nullptr) continue;
+                compiler->SwitchToBlock(bb);
+                compiler->builder->CreateBr(resumeBlock);
+            }
+            compiler->SwitchToBlock(resumeBlock);
+            // Drop, without emitting anything, whatever the aborted arms registered: those
+            // entries are keyed to arm blocks and would otherwise outlive this expression.
+            compiler->DiscardOwnedTempsSince(falseMark);
+            compiler->DiscardOwnedTempsSince(trueMark);
+            throw;
+        }
+
+        // An arm whose own lowering terminated its block never reaches the join; the ternary can
+        // then only yield the other arm, so no PHI is needed (and none is legal).
+        if (trueBr == nullptr || falseBr == nullptr)
+        {
+            compiler->SwitchToBlock(resumeBlock);
+            if (trueBr == nullptr && falseBr == nullptr) return {};
+            return { trueBr != nullptr ? trueValue : falseValue, false };
+        }
+
+        if (trueValue == nullptr || falseValue == nullptr)
+        {
+            compiler->SwitchToBlock(resumeBlock);
+            return {};
+        }
+
+        auto atTrue  = [&]() { compiler->builder->SetInsertPoint(trueBr); };
+        auto atFalse = [&]() { compiler->builder->SetInsertPoint(falseBr); };
+        if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, atTrue, atFalse))
+        {
+            compiler->SwitchToBlock(resumeBlock);
+            return {};
+        }
+
+        if (trueValue->getType()->isVoidTy())
+        {
+            compiler->SwitchToBlock(resumeBlock);
+            LogErrorContext(ctx, "ternary branches must produce a value; 'void' is not allowed");
+            return {};
+        }
+
+        // An arm that only BECAME a string in unification is a wrapped char* literal, borrowing
+        // nothing the flush could free, so copying after it is safe (see FinishTernaryArm).
+        auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string");
+        bool ownedString = false;
+        if (strTy != nullptr && trueValue->getType() == strTy)
+        {
+            if (!trueOwnedString)  { atTrue();  trueValue  = AdoptTernaryStringArm(compiler, trueValue,  trueOwnedString); }
+            if (!falseOwnedString) { atFalse(); falseValue = AdoptTernaryStringArm(compiler, falseValue, falseOwnedString); }
+            ownedString = trueOwnedString && falseOwnedString;
+        }
+
+        auto* trueEnd  = trueBr->getParent();
+        auto* falseEnd = falseBr->getParent();
+        compiler->SwitchToBlock(resumeBlock);
+        auto* phi = compiler->builder->CreatePHI(trueValue->getType(), 2, "ternary");
+        phi->addIncoming(trueValue,  trueEnd);
+        phi->addIncoming(falseValue, falseEnd);
+
+        if (ownedString)
+        {
+            compiler->RegisterOwnedStringTemp(phi);
+            compiler->lastCallReturnsOwned = true;
+            return { phi, true };
+        }
+
+        // A ternary is a transparent wrapper: if an arm is an owning return, the joined value
+        // carries that ownership, so ledger it so a discarded ternary is still caught.
+        if (compiler->FindOwnedReturnTemp(trueValue))
+            compiler->PropagateOwnedReturnTemp(trueValue, phi);
+        else if (compiler->FindOwnedReturnTemp(falseValue))
+            compiler->PropagateOwnedReturnTemp(falseValue, phi);
+        return { phi, false };
+    }
+
     LLVMBackend::TypedValue ParseConditionalExpression(CFlatParser::ConditionalExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
@@ -10632,13 +10875,18 @@ public:
             }
             else if (expressionFalseCtx != nullptr && (expressionTrueCtx != nullptr))
             {
-                // '?:' lowers to an eager CreateSelect below - BOTH arms execute unconditionally,
-                // so a deref that is only sound under one branch's condition is not actually safe
-                // in either arm. Suppress the same-block explicit-move-null guard while lowering
-                // them (a depth counter, not a bool - ternaries can nest). RAII, not manual
-                // increment/decrement: either arm may LogError (which throws) or return early,
-                // and the counter must still unwind so a caught error elsewhere in the compile
-                // does not silently disable the guard for the rest of the file.
+                // In a function, branch so only the selected arm runs. A constant context (enum,
+                // bitfield width, alignas, global init) has no live block and keeps the eager form.
+                auto* insertBB = compiler->builder->GetInsertBlock();
+                if (insertBB != nullptr && insertBB->getTerminator() == nullptr
+                    && compiler->currentFunction != nullptr
+                    && insertBB->getParent() == compiler->currentFunction)
+                {
+                    return ParseTernaryBranches(ctx, condTv, expressionTrueCtx, expressionFalseCtx);
+                }
+
+                // Eager fallback: BOTH arms execute unconditionally, so a deref only sound under
+                // one arm's condition is unsafe here - suppress the same-block moved-null guard.
                 llvm::Value* trueValue  = nullptr;
                 llvm::Value* falseValue = nullptr;
                 {
@@ -10659,67 +10907,9 @@ public:
                 RegisterBorrowedStringOperandTemp(compiler, trueValue);
                 RegisterBorrowedStringOperandTemp(compiler, falseValue);
 
-                // Align branch types so LLVM select has matching operand types. A select
-                // with mismatched operands asserts inside LLVM ("Invalid operands for
-                // select"), so every unifiable case is coerced here and any remaining
-                // genuine mismatch is reported as a clean diagnostic before CreateSelect.
-                if (falseValue && trueValue && falseValue->getType() != trueValue->getType())
-                {
-                    auto* ft = falseValue->getType();
-                    auto* tt = trueValue->getType();
-                    auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string");
-                    if (ft->isIntegerTy() && tt->isIntegerTy())
-                    {
-                        unsigned fb = ft->getIntegerBitWidth();
-                        unsigned tb = tt->getIntegerBitWidth();
-                        if (fb < tb) falseValue = compiler->Upconvert(falseValue, tt);
-                        else         trueValue  = compiler->Upconvert(trueValue,  ft);
-                    }
-                    else if (ft->isFloatingPointTy() && tt->isFloatingPointTy())
-                    {
-                        // Widen the narrower branch (e.g. float literal 1.0 -> double).
-                        unsigned fb = ft->getScalarSizeInBits();
-                        unsigned tb = tt->getScalarSizeInBits();
-                        if (fb < tb) falseValue = compiler->Upconvert(falseValue, tt);
-                        else         trueValue  = compiler->Upconvert(trueValue,  ft);
-                    }
-                    else if (ft->isFloatingPointTy() && tt->isIntegerTy())
-                    {
-                        // Mixed int/float (e.g. cond ? 1 : 2.5): promote the integer side.
-                        trueValue = compiler->Upconvert(trueValue, ft);
-                    }
-                    else if (ft->isIntegerTy() && tt->isFloatingPointTy())
-                    {
-                        falseValue = compiler->Upconvert(falseValue, tt);
-                    }
-                    else if (strTy && tt == strTy && ft->isPointerTy())
-                    {
-                        // string vs char* literal (e.g. cond ? prefix : "0"): wrap the raw
-                        // pointer into a non-owning string so both branches are `string`.
-                        falseValue = compiler->WrapStringLiteralAsString(falseValue);
-                    }
-                    else if (strTy && ft == strTy && tt->isPointerTy())
-                    {
-                        trueValue = compiler->WrapStringLiteralAsString(trueValue);
-                    }
-                    else
-                    {
-                        auto describe = [](llvm::Type* t) -> std::string {
-                            if (auto* st = llvm::dyn_cast<llvm::StructType>(t))
-                                return (st->hasName() ? st->getName().str() : std::string("struct"));
-                            if (t->isPointerTy()) return "pointer";
-                            if (t->isIntegerTy()) return "i" + std::to_string(t->getIntegerBitWidth());
-                            if (t->isFloatTy())   return "float";
-                            if (t->isDoubleTy())  return "double";
-                            return "value";
-                        };
-                        // ctx->expression() is the true branch; ctx->conditionalExpression() the false.
-                        LogErrorContext(ctx, std::format(
-                            "ternary branches have incompatible types '{}' and '{}'",
-                            describe(tt), describe(ft)));
-                        return {};
-                    }
-                }
+                auto here = []() {};   // eager form: both arms already live in the current block
+                if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, here, here))
+                    return {};
 
                 // LLVM's select requires an i1 condition; a non-bool CFlat condition
                 // (int, char, pointer, float) must be lowered the same way if/while do.

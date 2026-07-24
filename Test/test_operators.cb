@@ -124,6 +124,10 @@ struct OuterBox
 
 import "test_helper.cb";
 
+// Records that it ran, so a ternary arm that must NOT execute can be detected.
+int g_sideEffects = 0;
+int bumpSideEffect(int amount) { g_sideEffects = g_sideEffects + amount; return amount; }
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 extern int main()
@@ -334,6 +338,7 @@ extern int main()
 
     // Ternary condition coercion. A non-bool '?:' condition used to be handed to LLVM's
     // 'select' raw (which demands i1), so `int cond ? a : b` failed module verification.
+    int terPassed = 0;
     int    terI  = 3;
     int    terI0 = 0;
     char   terC  = 'x';
@@ -348,20 +353,36 @@ extern int main()
     int*   terPn = nullptr;
     bool   terB  = true;
 
-    Test("ternary int cond nonzero",   terI  ? 1 : 0, 1);
-    Test("ternary int cond zero",      terI0 ? 1 : 0, 0);
-    Test("ternary char cond nonzero",  terC  ? 1 : 0, 1);
-    Test("ternary char cond zero",     terC0 ? 1 : 0, 0);
-    Test("ternary u64 cond nonzero",   terU  ? 1 : 0, 1);
-    Test("ternary u64 cond zero",      terU0 ? 1 : 0, 0);
-    Test("ternary double cond nonzero", terD ? 1 : 0, 1);
-    Test("ternary double cond zero",   terD0 ? 1 : 0, 0);
-    Test("ternary float cond nonzero", terF  ? 1 : 0, 1);
-    Test("ternary ptr cond non-null",  terP  ? 1 : 0, 1);
-    Test("ternary ptr cond null",      terPn ? 1 : 0, 0);
-    Test("ternary bool cond",          terB  ? 1 : 0, 1);
+    terPassed += Test("ternary int cond nonzero",   terI  ? 1 : 0, 1);
+    terPassed += Test("ternary int cond zero",      terI0 ? 1 : 0, 0);
+    terPassed += Test("ternary char cond nonzero",  terC  ? 1 : 0, 1);
+    terPassed += Test("ternary char cond zero",     terC0 ? 1 : 0, 0);
+    terPassed += Test("ternary u64 cond nonzero",   terU  ? 1 : 0, 1);
+    terPassed += Test("ternary u64 cond zero",      terU0 ? 1 : 0, 0);
+    terPassed += Test("ternary double cond nonzero", terD ? 1 : 0, 1);
+    terPassed += Test("ternary double cond zero",   terD0 ? 1 : 0, 0);
+    terPassed += Test("ternary float cond nonzero", terF  ? 1 : 0, 1);
+    terPassed += Test("ternary ptr cond non-null",  terP  ? 1 : 0, 1);
+    terPassed += Test("ternary ptr cond null",      terPn ? 1 : 0, 0);
+    terPassed += Test("ternary bool cond",          terB  ? 1 : 0, 1);
     // Non-bool condition in a branch of if/while must keep working too.
-    if (terD) { Test("if double cond nonzero", 1, 1); }
+    if (terD) { terPassed += Test("if double cond nonzero", 1, 1); }
 
-    return 0;
+    // Only the SELECTED arm runs. The ternary used to compute both arms eagerly and combine
+    // them with a select, so a side effect in the not-taken arm still happened.
+    g_sideEffects = 0;
+    int scT = true  ? bumpSideEffect(1) : bumpSideEffect(100);
+    terPassed += Test("ternary picks true arm",      scT, 1);
+    terPassed += Test("ternary skips false arm",     g_sideEffects, 1);
+    g_sideEffects = 0;
+    int scF = false ? bumpSideEffect(1) : bumpSideEffect(100);
+    terPassed += Test("ternary picks false arm",     scF, 100);
+    terPassed += Test("ternary skips true arm",      g_sideEffects, 100);
+    // Nested ternary: exactly one leaf arm runs.
+    g_sideEffects = 0;
+    int scN = terI0 ? bumpSideEffect(1) : (terI ? bumpSideEffect(10) : bumpSideEffect(1000));
+    terPassed += Test("nested ternary picks one leaf", scN, 10);
+    terPassed += Test("nested ternary skips others",   g_sideEffects, 10);
+
+    return terPassed == 19 ? 0 : 1;
 }

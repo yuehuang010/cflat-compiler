@@ -1082,10 +1082,11 @@ public:
     std::unordered_map<std::string, std::pair<size_t, size_t>> firstCallLocation_;
 
     // Depth counter, not a bool: '?:' arms can nest (a ? (b ? c : d) : e), so a plain flag would
-    // clear early on the inner ternary's exit. Non-zero while lowering EITHER arm of a '?:' -
-    // both arms execute unconditionally (CreateSelect, no branch), so a deref inside either one
-    // that would be sound under the OTHER arm's condition must not be guarded (see
-    // IsExplicitlyMovedNullHere). Not part of the --init cache round-trip (transient per-call state).
+    // clear early on the inner ternary's exit. Non-zero while lowering either arm of a '?:' in the
+    // EAGER constant-context form, where both arms execute unconditionally (CreateSelect, no
+    // branch), so a deref inside either one that would be sound under the OTHER arm's condition
+    // must not be guarded (see IsExplicitlyMovedNullHere). The normal in-function lowering
+    // branches and does not raise this. Not part of the --init cache round-trip (transient state).
     int suppressExplicitNullDerefGuard_ = 0;
     bool lastCallIsBonded = false;           // set when the last call returned a bonded (borrowed) value
     bool lastCallBondByAddress = false;      // set when the bond originates from a by-address lambda capture (kind A)
@@ -1928,6 +1929,16 @@ private:
         pendingOwnedStringTemps.emplace_back(value, builder->GetInsertBlock());
     }
 
+    // True when `value` is a registered, still-unclaimed owned string temp (a produced value with
+    // no named owner) rather than a local/field read whose own owner frees it.
+    bool IsPendingOwnedStringTemp(llvm::Value* value) const
+    {
+        if (value == nullptr) return false;
+        for (const auto& e : pendingOwnedStringTemps)
+            if (e.first == value) return true;
+        return false;
+    }
+
     void UnregisterOwnedStringTemp(llvm::Value* value)
     {
         if (value == nullptr) return;
@@ -2028,6 +2039,23 @@ private:
         return dt->dominates(bb, curBlock);
     }
 
+    // Free one owned string temp at the current insert point. The dtor is owned-bit gated, so
+    // running it on a borrow value is a no-op. Caller owns dominance safety.
+    void EmitOwnedStringTempFree(llvm::Value* value)
+    {
+        auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+        if (value == nullptr || strTy == nullptr || value->getType() != strTy) return;
+        EnsureStringDtorRegistered();
+        auto it = dataStructures.find("string");
+        if (it == dataStructures.end() || it->second.Destructor == nullptr) return;
+        // The destructor takes a string*; spill the SSA value to an entry-block
+        // alloca (never a loop body - see AllocaAtEntry) and free through it.
+        auto* tmp = AllocaAtEntry(strTy, nullptr, "concat.tmp");
+        builder->CreateStore(value, tmp);
+        builder->CreateCall(it->second.Destructor->getFunctionType(),
+                            it->second.Destructor, { tmp });
+    }
+
     void FlushOwnedStringTemps()
     {
         if (pendingOwnedStringTemps.empty()) return;
@@ -2036,20 +2064,10 @@ private:
         if (IsInsertBlockLive())
         {
             std::optional<llvm::DominatorTree> domTree;
-            auto* strTy = llvm::StructType::getTypeByName(*context, "string");
             for (auto& [value, bb] : pendingOwnedStringTemps)
             {
                 if (value == nullptr || !OwnedTempDominatesHere(bb, curBlock, domTree)) continue; // dominance safety
-                if (strTy == nullptr || value->getType() != strTy) continue;
-                EnsureStringDtorRegistered();
-                auto it = dataStructures.find("string");
-                if (it == dataStructures.end() || it->second.Destructor == nullptr) continue;
-                // The destructor takes a string*; spill the SSA value to an entry-block
-                // alloca (never a loop body - see AllocaAtEntry) and free through it.
-                auto* tmp = AllocaAtEntry(strTy, nullptr, "concat.tmp");
-                builder->CreateStore(value, tmp);
-                builder->CreateCall(it->second.Destructor->getFunctionType(),
-                                    it->second.Destructor, { tmp });
+                EmitOwnedStringTempFree(value);
             }
         }
         pendingOwnedStringTemps.clear();
@@ -2078,6 +2096,20 @@ private:
         return false;
     }
 
+    // Free one owned closure temp at the current insert point. Caller owns dominance safety.
+    void EmitOwnedClosureTempFree(llvm::Value* value)
+    {
+        auto* closureTy = GetClosureFatPtrType();
+        if (value == nullptr || closureTy == nullptr || value->getType() != closureTy) return;
+        auto* dtor = GetOrCreateFullDestructor("__closure_fat_ptr");
+        if (dtor == nullptr) return;
+        // The dtor takes a __closure_fat_ptr*; spill the SSA value to an entry-block
+        // alloca (never a loop body - see AllocaAtEntry) and free through it.
+        auto* tmp = AllocaAtEntry(closureTy, nullptr, "closure.tmp");
+        builder->CreateStore(value, tmp);
+        builder->CreateCall(dtor->getFunctionType(), dtor, { tmp });
+    }
+
     void FlushOwnedClosureTemps()
     {
         if (pendingOwnedClosureTemps.empty()) return;
@@ -2085,20 +2117,12 @@ private:
         auto* curBlock = builder->GetInsertBlock();
         if (IsInsertBlockLive())
         {
-            auto* closureTy = GetClosureFatPtrType();
-            auto* dtor = GetOrCreateFullDestructor("__closure_fat_ptr");
-            if (dtor != nullptr)
             {
                 std::optional<llvm::DominatorTree> domTree;
                 for (auto& [value, bb] : pendingOwnedClosureTemps)
                 {
                     if (value == nullptr || !OwnedTempDominatesHere(bb, curBlock, domTree)) continue; // dominance safety
-                    if (value->getType() != closureTy) continue;
-                    // The dtor takes a __closure_fat_ptr*; spill the SSA value to an entry-block
-                    // alloca (never a loop body - see AllocaAtEntry) and free through it.
-                    auto* tmp = AllocaAtEntry(closureTy, nullptr, "closure.tmp");
-                    builder->CreateStore(value, tmp);
-                    builder->CreateCall(dtor->getFunctionType(), dtor, { tmp });
+                    EmitOwnedClosureTempFree(value);
                 }
             }
         }
@@ -2211,6 +2235,108 @@ private:
 
     // Free all unnamed owned temporaries (string, closure, struct) at an end-of-full-expression
     // boundary. The return path keeps the three explicit (it interleaves Unregister between them).
+    // Sizes of the four pending owned-temp ledgers, so a nested lowering can free exactly what
+    // IT registered (see FlushOwnedTempsSince).
+    struct OwnedTempMark
+    {
+        size_t Strings  = 0;
+        size_t Closures = 0;
+        size_t Structs  = 0;
+        size_t Ptrs     = 0;
+    };
+
+    // Drop the ledger entries added since index `from`, preserving only the entry for `keep`.
+    template <typename ListT, typename GetT>
+    static void TrimOwnedTempsSince(ListT& list, size_t from, llvm::Value* keep, GetT get)
+    {
+        size_t write = from;
+        for (size_t i = from; i < list.size(); ++i)
+            if (get(list[i]) == keep) list[write++] = list[i];
+        list.resize(write);
+    }
+
+    OwnedTempMark MarkOwnedTemps() const
+    {
+        return { pendingOwnedStringTemps.size(), pendingOwnedClosureTemps.size(),
+                 pendingOwnedStructTemps.size(), pendingOwnedPtrTemps.size() };
+    }
+
+    /*
+     * Free every owned temp registered since `mark` at the CURRENT insert point, except `keep`
+     * (the one value the caller hands onward). This is an end-of-SCOPE flush for a region that
+     * the end-of-full-expression flush cannot reach: a '?:' arm registers its temps in the arm's
+     * own block, which does not dominate the join, so FlushOwnedTemps would silently skip them
+     * (OwnedTempDominatesHere) and every one of those buffers would leak.
+     */
+    void FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* keep)
+    {
+        // Value-based frees first: they emit plain calls into the current block, while the
+        // pointer free below opens new blocks and moves the insert point out from under them.
+        {
+            std::optional<llvm::DominatorTree> domTree;
+            auto* curBlock = builder->GetInsertBlock();
+            bool live = IsInsertBlockLive();
+            for (size_t i = mark.Strings; live && i < pendingOwnedStringTemps.size(); ++i)
+            {
+                auto& [value, bb] = pendingOwnedStringTemps[i];
+                if (value == nullptr || value == keep) continue;
+                if (!OwnedTempDominatesHere(bb, curBlock, domTree)) continue;
+                EmitOwnedStringTempFree(value);
+            }
+            for (size_t i = mark.Closures; live && i < pendingOwnedClosureTemps.size(); ++i)
+            {
+                auto& [value, bb] = pendingOwnedClosureTemps[i];
+                if (value == nullptr || value == keep) continue;
+                if (!OwnedTempDominatesHere(bb, curBlock, domTree)) continue;
+                EmitOwnedClosureTempFree(value);
+            }
+            for (size_t i = mark.Structs; live && i < pendingOwnedStructTemps.size(); ++i)
+            {
+                auto& t = pendingOwnedStructTemps[i];
+                if (t.Alloca == nullptr || t.Alloca == keep) continue;
+                if (!OwnedTempDominatesHere(t.Block, curBlock, domTree)) continue;
+                if (auto* dtor = GetOrCreateFullDestructor(t.TypeName))
+                    builder->CreateCall(dtor->getFunctionType(), dtor, { t.Alloca });
+            }
+        }
+        auto pairValue   = [](const std::pair<llvm::Value*, llvm::BasicBlock*>& e) { return e.first; };
+        auto structValue = [](const PendingOwnedStructTemp& e) { return e.Alloca; };
+        auto ptrValue    = [](const PendingOwnedPtrTemp& e) { return e.Value; };
+
+        // Collect the pointer temps before trimming: each free opens blocks, so the insert block
+        // and dominator tree are recomputed per temp - exactly as FlushOwnedPtrTemps does.
+        std::vector<PendingOwnedPtrTemp> ptrTemps;
+        for (size_t i = mark.Ptrs; i < pendingOwnedPtrTemps.size(); ++i)
+            if (pendingOwnedPtrTemps[i].Value != keep) ptrTemps.push_back(pendingOwnedPtrTemps[i]);
+
+        TrimOwnedTempsSince(pendingOwnedStringTemps,  mark.Strings,  keep, pairValue);
+        TrimOwnedTempsSince(pendingOwnedClosureTemps, mark.Closures, keep, pairValue);
+        TrimOwnedTempsSince(pendingOwnedStructTemps,  mark.Structs,  keep, structValue);
+        TrimOwnedTempsSince(pendingOwnedPtrTemps,     mark.Ptrs,     keep, ptrValue);
+
+        for (auto& t : ptrTemps)
+        {
+            if (t.Value == nullptr || !IsInsertBlockLive()) continue;
+            std::optional<llvm::DominatorTree> domTree;
+            if (!OwnedTempDominatesHere(t.Block, builder->GetInsertBlock(), domTree)) continue;
+            EmitOwnedPtrTempFree(t.Value, t.TypeName, t.AllocAlign);
+        }
+    }
+
+    // Drop the ledger entries registered since `mark` WITHOUT emitting any free. For an aborted
+    // region (an arm whose lowering threw): those entries are keyed to blocks that no longer
+    // reach the join, so leaving them would carry a stale key past this expression.
+    void DiscardOwnedTempsSince(const OwnedTempMark& mark)
+    {
+        auto pairValue   = [](const std::pair<llvm::Value*, llvm::BasicBlock*>& e) { return e.first; };
+        auto structValue = [](const PendingOwnedStructTemp& e) { return e.Alloca; };
+        auto ptrValue    = [](const PendingOwnedPtrTemp& e) { return e.Value; };
+        TrimOwnedTempsSince(pendingOwnedStringTemps,  mark.Strings,  nullptr, pairValue);
+        TrimOwnedTempsSince(pendingOwnedClosureTemps, mark.Closures, nullptr, pairValue);
+        TrimOwnedTempsSince(pendingOwnedStructTemps,  mark.Structs,  nullptr, structValue);
+        TrimOwnedTempsSince(pendingOwnedPtrTemps,     mark.Ptrs,     nullptr, ptrValue);
+    }
+
     void FlushOwnedTemps()
     {
         FlushOwnedStringTemps();
@@ -15913,8 +16039,9 @@ public:
     // The full explicit-move-null deref predicate: fires only for a DEREFERENCE in the SAME
     // block the move was recorded in (never across a branch/merge/loop back-edge - see
     // ExplicitNullBlock), never once the address has escaped (see AddressEscaped), and never
-    // while lowering a '?:' arm (see suppressExplicitNullDerefGuard_ - both arms run
-    // unconditionally, so a same-block deref there is not actually unconditionally unsound).
+    // while lowering a '?:' arm in the EAGER constant-context form (see
+    // suppressExplicitNullDerefGuard_ - only there do both arms run unconditionally; the normal
+    // in-function lowering branches, so its arms are separate blocks and need no suppression).
     // This is deliberately narrower than a real null-narrowing analysis - see the field comment.
     bool IsExplicitlyMovedNullHere(const NamedVariable& nv) const
     {

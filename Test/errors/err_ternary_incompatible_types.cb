@@ -15,6 +15,19 @@ expect_error("ternary branches have incompatible types") {
     }
 }
 
+// Arms that produce no value at all: a `void` call in each branch has nothing to join.
+// This used to reach the LLVM join operation with a void operand and fail module
+// verification ("Instruction operands must be first-class values") instead of being
+// reported as a source-level error.
+void sideEffectOnly() { }
+
+expect_error("ternary branches must produce a value") {
+    int bothVoid(bool c) {
+        c ? sideEffectOnly() : sideEffectOnly();
+        return 0;
+    }
+}
+
 // A CONDITION that is not a scalar has no truth value. An aggregate reached LLVM's branch /
 // select operand unchanged and died with the opaque "module verification failed" instead of a
 // source-level error naming the problem.

@@ -1644,6 +1644,92 @@ int testRValuePrefersMoveOverload()
     return passed;
 }
 
+// A ternary evaluates ONLY the selected arm. It used to compute both arms eagerly and combine
+// them with LLVM's `select`, so a `move` or an owning call in the not-taken arm still ran.
+int testTernaryArmsShortCircuit()
+{
+    int passed = 0;
+
+    // False condition: the `move` arm never runs, so the source keeps its object and frees
+    // it exactly once at scope exit.
+    dtorCount = 0;
+    {
+        unique Resource* a = new Resource();
+        a->id = 21;
+        bool c = false;
+        unique Resource* b = c ? move a : nullptr;
+        passed += Test("ternary_untaken_move_source_intact", a == nullptr ? 1 : 0, 0);
+        passed += Test("ternary_untaken_move_value_survives", a->id, 21);
+        passed += Test("ternary_untaken_move_dest_null", b == nullptr ? 1 : 0, 1);
+        passed += Test("ternary_untaken_move_no_early_free", dtorCount, 0);
+    }
+    passed += Test("ternary_untaken_move_freed_once", dtorCount, 1);
+
+    // True condition: ownership transfers through the ternary, still exactly one free.
+    dtorCount = 0;
+    {
+        unique Resource* a = new Resource();
+        a->id = 22;
+        bool c = true;
+        unique Resource* b = c ? move a : nullptr;
+        passed += Test("ternary_taken_move_source_nulled", a == nullptr ? 1 : 0, 1);
+        passed += Test("ternary_taken_move_value_moved", b->id, 22);
+    }
+    passed += Test("ternary_taken_move_freed_once", dtorCount, 1);
+
+    // An owning-returning CALL in the not-taken arm must never be invoked.
+    dtorCount = 0;
+    {
+        bool c = false;
+        unique Resource* a = c ? makeOwnedResource() : nullptr;
+        passed += Test("ternary_untaken_owning_call_not_run", a == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("ternary_untaken_owning_call_no_free", dtorCount, 0);
+
+    // ... and when it IS taken the result is adopted and freed exactly once.
+    dtorCount = 0;
+    {
+        bool c = true;
+        unique Resource* a = c ? makeOwnedResource() : nullptr;
+        a->id = 23;
+        passed += Test("ternary_taken_owning_call_adopted", a->id, 23);
+    }
+    passed += Test("ternary_taken_owning_call_freed_once", dtorCount, 1);
+
+    // A bare `new` in an arm is adopted by the unique local, freed once.
+    dtorCount = 0;
+    {
+        bool c = true;
+        unique Resource* a = c ? new Resource() : nullptr;
+        passed += Test("ternary_new_arm_alive", a == nullptr ? 1 : 0, 0);
+    }
+    passed += Test("ternary_new_arm_freed_once", dtorCount, 1);
+
+    // String arms: an owning FIELD read in an arm is deep-copied, never aliased, so the
+    // field still owns its own buffer after the ternary result goes out of scope.
+    {
+        FlipRow row = default;
+        row.name = "" + "fieldval";
+        bool c = true;
+        {
+            string picked = c ? row.name : "-";
+            passed += Test("ternary_string_field_arm_value", picked == "fieldval" ? 1 : 0, 1);
+        }
+        passed += Test("ternary_string_field_survives", row.name == "fieldval" ? 1 : 0, 1);
+        string other = !c ? row.name : "-";
+        passed += Test("ternary_string_literal_arm_value", other == "-" ? 1 : 0, 1);
+    }
+
+    // A string-returning CALL in an arm: only the selected call runs and its temp is freed.
+    {
+        bool c = true;
+        string s = c ? echoString("left") : echoString("right");
+        passed += Test("ternary_string_call_arm_value", s == "left" ? 1 : 0, 1);
+    }
+
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -1886,6 +1972,9 @@ extern int main()
 
     passed += testRValuePrefersMoveOverload();
     total += 6;
+
+    passed += testTernaryArmsShortCircuit();
+    total += 18;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

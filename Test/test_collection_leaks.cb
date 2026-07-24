@@ -203,6 +203,10 @@ struct PtrLeak { int v = 0; ~PtrLeak() { g_shapeDtor = g_shapeDtor + 1; } };
 // pointer cannot escape: a comparison operand and a scalar-field deref. A call ARGUMENT is not
 // such a site (see retainPtrTemp below) and still leaks. Adopting sites (local, `unique` local,
 // container, `return`, `move` parameter) must still free it EXACTLY once - never twice.
+// Opaque-at-compile-time true, so a '?:' condition below cannot be folded away.
+int g_armGate = 1;
+bool RuntimeTrue() { return g_armGate != 0; }
+
 move PtrLeak* mkPtrTemp(int n) { PtrLeak* p = new PtrLeak(); p.v = n; return p; }
 move PtrLeak* fwdPtrTemp(int n) { return mkPtrTemp(n); }
 void sinkPtrTemp(move PtrLeak* p) { delete p; }
@@ -3261,6 +3265,84 @@ extern int main()
         g_shapeDtor = 0;
         if (ptrSpins < 0 && mkPtrTemp(12) != nullptr) { }
         total++; passed += Test("short-circuited owning-ptr temp", g_shapeDtor, 0);
+    }
+
+    // === Owned temps registered INSIDE a '?:' arm ===
+    // A ternary arm is lowered into its own basic block, which does not dominate the join, so the
+    // end-of-full-expression flush skips (OwnedTempDominatesHere) every temp the arm registered and
+    // each buffer leaks. The arm therefore flushes its own registrations at its own end, keeping
+    // only the value it yields to the join. Every row must be exactly one free - the HeapAudit
+    // oracle below catches the leak and a double free aborts the process.
+    {
+        bool armCond = RuntimeTrue();
+
+        // Concat inside the selected arm: the concat operand temp is arm-local, the concat result
+        // is the yielded value. Both must be released, exactly once each.
+        {
+            string armConcat = armCond ? (plainOwnedStr(1) + "y") : plainOwnedStr(3);
+            total++; passed += Test("ternary arm concat value", armConcat, "owned1y");
+        }
+        // Symmetric: the registrations live in the FALSE arm's block instead.
+        {
+            string armConcatF = !armCond ? plainOwnedStr(1) : (plainOwnedStr(2) + "y");
+            total++; passed += Test("ternary false-arm concat value", armConcatF, "owned2y");
+        }
+        // Nested ternary: the inner join's own owned temp is registered in a block nested inside
+        // the outer arm, so it is only reachable by the per-arm flush.
+        {
+            string armNested = armCond ? (armCond ? plainOwnedStr(1) : plainOwnedStr(2))
+                                       : plainOwnedStr(3);
+            total++; passed += Test("nested ternary arm value", armNested, "owned1");
+        }
+        // Comparison operand inside an arm: the temp is consumed by the comparison, so nothing
+        // is yielded and the arm's flush is the only thing that can free it.
+        {
+            bool armCmp = armCond ? (plainOwnedStr(1) == "owned1") : false;
+            total++; passed += Test("ternary arm string comparison", armCmp, true);
+        }
+        // Same shape on the owning-POINTER ledger: the destructor must still run (a skipped flush
+        // drops the RAII side effect entirely, not just the memory).
+        g_shapeDtor = 0;
+        {
+            bool armPtr = armCond ? (mkPtrTemp(13) != nullptr) : false;
+            total++; passed += Test("ternary arm owning-ptr comparison", armPtr, true);
+        }
+        total++; passed += Test("ternary arm owning-ptr temp freed once", g_shapeDtor, 1);
+
+        // The NOT-taken arm never runs, so its temp is never created and never freed.
+        g_shapeDtor = 0;
+        {
+            bool armSkip = !armCond ? (mkPtrTemp(14) != nullptr) : false;
+            total++; passed += Test("ternary untaken arm owning-ptr not created", armSkip, false);
+        }
+        total++; passed += Test("ternary untaken arm frees nothing", g_shapeDtor, 0);
+
+        // The plain shape (a bare call in each arm) - the yielded temp itself must be released.
+        {
+            string armPlain = armCond ? plainOwnedStr(4) : plainOwnedStr(5);
+            total++; passed += Test("ternary plain call arm value", armPlain, "owned4");
+        }
+
+        // ORDERING: an owning FIELD read off a by-value owning-struct temp yields a string that
+        // BORROWS the temp's buffer, and the temp is registered under its own spill alloca - a key
+        // the yielded value can never equal, so the arm's flush always destroys the parent. The
+        // deep copy must therefore be emitted BEFORE that flush; emitting it after copies from
+        // freed memory and these rows read empty/garbage (use-after-free under --asan).
+        {
+            string armField = armCond ? makeTempTok(31).text : "-";
+            total++; passed += Test("ternary arm owning-struct field read", armField, "tok31");
+        }
+        {
+            string armFieldF = !armCond ? "-" : makeTempTok(32).text;
+            total++; passed += Test("ternary false-arm owning-struct field read", armFieldF, "tok32");
+        }
+        // Same shape re-entered per iteration: the copy and the flush must stay ordered on the
+        // back edge too, not just on a straight-line path.
+        for (int armSpin = 0; armSpin < 3; armSpin++)
+        {
+            string armLoop = armCond ? makeTempTok(33).text : "-";
+            total++; passed += Test("ternary arm owning-struct field read in loop", armLoop, "tok33");
+        }
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

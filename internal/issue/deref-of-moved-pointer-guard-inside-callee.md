@@ -140,6 +140,20 @@ Carried over from the now-closed cross-block issue. All cost a diagnostic; none 
   The containment test is strictest exactly where the bug is most certain. Not an oversight to
   fix: `if (n > 0)` is indistinguishable from a guard, and containment is what buys the
   false-positive-freedom above.
+
+  A `?:` arm is one of these conditional positions:
+  ```cflat
+  unique R* b = move a;
+  return c ? a->v : 0;           // NOT reported; segfaults when c is true
+  ```
+  The arm is control-dependent on the ternary condition, which the move is not, so containment
+  fails exactly as it does for the `if` above. This became true when `?:` started lowering to a
+  real branch; before that both arms shared one basic block, which is the same accident that made
+  the eager lowering unsound. It makes `?:` consistent with the equivalent `if` form, which has
+  always had this false negative. Do NOT close it by carving ternary arms out of the
+  control-dependence rule: being guard-shape-agnostic is where the false-positive-freedom comes
+  from, and special-casing shapes is precisely how the earlier designs reintroduced false
+  positives.
 - A deref inside a branch/loop condition, a `?:` arm, or a short-circuit `&&`/`||` right-hand side
   is suppressed by the same two conditions rather than by any special case.
 - The `&`-escape latch (`AddressEscaped`) remains a permanent, function-wide "never diagnose this
