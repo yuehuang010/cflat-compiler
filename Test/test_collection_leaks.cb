@@ -2704,6 +2704,175 @@ extern int main()
             total++; passed += Test("btree<noncopy> move set frees old", g_shapeDtor, 1);
         }
         total++; passed += Test("btree<noncopy> teardown frees rest", g_shapeDtor, 2);
+
+        // === Stage 2 collapse regression legs (borrowed-slot recovery) ===
+
+        // Duplicate refusal with a NAMED (not temporary) source, for every owning V kind: the
+        // gap-1 exit-drop must free the refused argument on scope exit with no explicit release
+        // call in add()/insert() anymore.
+        g_shapeDtor = 0;
+        {
+            btree<int, unique PtrLeak*> t = default;
+            t.add(1, new PtrLeak());
+            unique PtrLeak* p = new PtrLeak();
+            total++; passed += Test("btree<unique ptr> named dup add rejected", t.add(1, move p), false);
+            total++; passed += Test("btree<unique ptr> named dup frees refused once", g_shapeDtor, 1);
+        }
+        total++; passed += Test("btree<unique ptr> named dup dtor frees inserted", g_shapeDtor, 2);
+
+        g_shapeDtor = 0;
+        {
+            btree<int, unique IShapeLeak> t = default;
+            t.add(1, new CircleLeak());
+            unique IShapeLeak c = new CircleLeak();
+            total++; passed += Test("btree<unique iface> named dup add rejected", t.add(1, move c), false);
+            total++; passed += Test("btree<unique iface> named dup frees refused once", g_shapeDtor, 1);
+        }
+        total++; passed += Test("btree<unique iface> named dup dtor frees inserted", g_shapeDtor, 2);
+
+        g_shapeDtor = 0;
+        {
+            btree<int, LeakHolder> t = default;
+            LeakHolder h1 = default; h1.slot = new PtrLeak(); h1.k = 1;
+            t.add(1, move h1);
+            LeakHolder h2 = default; h2.slot = new PtrLeak(); h2.k = 1;
+            total++; passed += Test("btree<noncopy holder> named dup add rejected", t.add(1, move h2), false);
+            total++; passed += Test("btree<noncopy holder> named dup frees refused once", g_shapeDtor, 1);
+        }
+        total++; passed += Test("btree<noncopy holder> named dup dtor frees inserted", g_shapeDtor, 2);
+
+        // insert()'s duplicate refusal is the same gap-1 exit-drop, but AFTER the leaf lock's
+        // non-lexical release() - confirm the free still happens exactly once, not before/never.
+        g_shapeDtor = 0;
+        {
+            btree<int, unique PtrLeak*> t = default;
+            t.insert(1, new PtrLeak());
+            unique PtrLeak* p = new PtrLeak();
+            total++; passed += Test("btree<unique ptr> insert() named dup rejected", t.insert(1, move p), false);
+            total++; passed += Test("btree<unique ptr> insert() named dup frees refused once", g_shapeDtor, 1);
+        }
+        total++; passed += Test("btree<unique ptr> insert() named dup dtor frees inserted", g_shapeDtor, 2);
+
+        // Owning K (string): the leaf-split separator is a `_dupKey` copy, the internal-split
+        // median is lifted by a straight `move left->keys[mid]`, and a merge/borrow bit-relocates
+        // the parent's separator into the sibling before dropping it - exercise all of it under
+        // HeapAudit + ASan at a scale (300 keys, both an ascending and a descending 250-remove
+        // pass, forcing INTERNAL-node splits and INTERNAL-node merges/borrows, not just leaf-
+        // level ones) big enough to have caught the borrowed-slot-recovery regression where an
+        // internal borrow/merge fixup used `move` through a slot still aliased by a bit-relocate
+        // copy one line above it (UAF/double-free, ASan-only - silent under plain HeapAudit).
+        {
+            btree<string, int> t = default;
+            int i = 0;
+            while (i < 300) { t.add("key" + toString(i), i); i = i + 1; }
+            total++; passed += Test("btree<string key> count after split-heavy inserts", t.count(), 300);
+            int bad = 0;
+            int k = 0;
+            while (k < 300) { if (t.get("key" + toString(k)) != k) bad = bad + 1; k = k + 1; }
+            total++; passed += Test("btree<string key> round trip after splits", bad, 0);
+            // Ascending removes: forces the LEFTMOST internal/leaf nodes to rebalance against
+            // their only (right) sibling.
+            int d = 0;
+            while (d < 250) { t.remove("key" + toString(d)); d = d + 1; }
+            total++; passed += Test("btree<string key> count after ascending removes", t.count(), 50);
+            int bad2 = 0;
+            int k2 = 250;
+            while (k2 < 300) { if (t.get("key" + toString(k2)) != k2) bad2 = bad2 + 1; k2 = k2 + 1; }
+            total++; passed += Test("btree<string key> round trip after ascending removes", bad2, 0);
+            t.clear();
+            total++; passed += Test("btree<string key> clear after ascending empties", t.count(), 0);
+        }
+        {
+            btree<string, int> t = default;
+            int i = 0;
+            while (i < 300) { t.add("key" + toString(i), i); i = i + 1; }
+            // Descending removes: forces the RIGHTMOST internal/leaf nodes to rebalance against
+            // their only (left) sibling - the complementary alias ordering from the ascending pass.
+            int d = 299;
+            while (d >= 50) { t.remove("key" + toString(d)); d = d - 1; }
+            total++; passed += Test("btree<string key> count after descending removes", t.count(), 50);
+            int bad3 = 0;
+            int k3 = 0;
+            while (k3 < 50) { if (t.get("key" + toString(k3)) != k3) bad3 = bad3 + 1; k3 = k3 + 1; }
+            total++; passed += Test("btree<string key> round trip after descending removes", bad3, 0);
+            t.clear();
+            total++; passed += Test("btree<string key> clear after descending empties", t.count(), 0);
+        }
+
+        // Owning VALUE, leaf-level BORROW specifically (not merge): keep the donor sibling
+        // strictly above minKeys so the rebalance MUST take _borrowFromLeft/_borrowFromRight,
+        // not a merge - pins the identical alias-then-move-free defect class in the value slots
+        // (node->values[0] / the rightSib value down-shift), which the wider scale legs above
+        // exercise but don't isolate.
+        g_shapeDtor = 0;
+        {
+            // 20 ascending inserts -> two leaves (0..7, 8..19); removing 2 from the front
+            // underflows the left leaf (8 -> 6 < minKeys=7) while the right leaf keeps its
+            // surplus (12 > 7), so the fixup MUST be _borrowFromRight.
+            btree<int, unique PtrLeak*> t = default;
+            int i = 0;
+            while (i < 20) { PtrLeak* v = new PtrLeak(); v->v = i; t.add(i, v); i = i + 1; }
+            t.remove(0);
+            t.remove(1);
+            total++; passed += Test("btree value borrow-from-right frees exactly", g_shapeDtor, 2);
+            int bad4 = 0;
+            int k4 = 2;
+            while (k4 < 20) { PtrLeak* v = t.get(k4); if (v == nullptr || v->v != k4) bad4 = bad4 + 1; k4 = k4 + 1; }
+            total++; passed += Test("btree value borrow-from-right round trip", bad4, 0);
+        }
+        total++; passed += Test("btree value borrow-from-right teardown frees rest", g_shapeDtor, 20);
+
+        g_shapeDtor = 0;
+        {
+            // Same tree shape; removing 6 from the back underflows the right leaf (12 -> 6) while
+            // the left leaf (8) keeps its surplus, so the fixup MUST be _borrowFromLeft.
+            btree<int, unique PtrLeak*> t = default;
+            int i = 0;
+            while (i < 20) { PtrLeak* v = new PtrLeak(); v->v = i; t.add(i, v); i = i + 1; }
+            int hi = 19;
+            while (hi >= 14) { t.remove(hi); hi = hi - 1; }
+            total++; passed += Test("btree value borrow-from-left frees exactly", g_shapeDtor, 6);
+            int bad5 = 0;
+            int k5 = 0;
+            while (k5 < 14) { PtrLeak* v = t.get(k5); if (v == nullptr || v->v != k5) bad5 = bad5 + 1; k5 = k5 + 1; }
+            total++; passed += Test("btree value borrow-from-left round trip", bad5, 0);
+        }
+        total++; passed += Test("btree value borrow-from-left teardown frees rest", g_shapeDtor, 20);
+
+        // Remove-to-underflow rebalances in BOTH directions: the leftmost leaf has no left
+        // sibling, so its underflow can only borrow/merge with the sibling on its RIGHT;
+        // the rightmost leaf has no right sibling, so its underflow can only borrow/merge with
+        // the sibling on its LEFT. Ascending keys give predictable leaf boundaries.
+        g_shapeDtor = 0;
+        {
+            btree<int, unique PtrLeak*> t = default;
+            int i = 0;
+            while (i < 200) { PtrLeak* v = new PtrLeak(); v->v = i; t.add(i, v); i = i + 1; }
+
+            // Low-end removes: forces the leftmost leaves to rebalance against their right
+            // sibling only (_borrowFromRight / _mergeWithRight on that edge).
+            int lo = 0;
+            while (lo < 70) { t.remove(lo); lo = lo + 1; }
+            total++; passed += Test("btree rebalance low-end frees exactly", g_shapeDtor, 70);
+
+            // High-end removes: forces the rightmost leaves to rebalance against their left
+            // sibling only (_borrowFromLeft / _mergeWithLeft on that edge).
+            int hi = 199;
+            while (hi >= 130) { t.remove(hi); hi = hi - 1; }
+            total++; passed += Test("btree rebalance high-end frees exactly", g_shapeDtor, 140);
+
+            int bad3 = 0;
+            int k3 = 70;
+            while (k3 < 130)
+            {
+                PtrLeak* v = t.get(k3);
+                if (v == nullptr || v->v != k3) bad3 = bad3 + 1;
+                k3 = k3 + 1;
+            }
+            total++; passed += Test("btree rebalance survivors round trip", bad3, 0);
+            total++; passed += Test("btree rebalance survivor count", t.count(), 60);
+        }
+        total++; passed += Test("btree rebalance both-directions dtor frees rest", g_shapeDtor, 200);
     }
 
     // === `return move <named struct local>` must transfer ownership, not strip it ===
