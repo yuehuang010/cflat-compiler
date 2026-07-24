@@ -14637,6 +14637,17 @@ public:
             return {};
         }
 
+        // 'move' of a whole value this function only BORROWS (a plain by-value owning-value
+        // parameter - string/owning-struct copyable arg the caller still owns): the buffer belongs
+        // to the caller, so transferring it would free the caller's live value (heap-use-after-free).
+        // Degrade to a plain read; the enclosing copy machinery deep-copies a copyable owner, exactly
+        // as `dest = value` (no `move`) would. A direct call argument keeps the deferred path (its
+        // laundering is caught in ApplyMoveParamTransfer); a field/element source is handled above.
+        if (argNV.FieldName.empty() && !argNV.IsElementAccess
+            && !argNV.CallerName.empty() && !IsDirectCallArgument(ctx)
+            && compiler->IsVariableBorrowedOwningValue(argNV.CallerName))
+            return argNV;
+
         llvm::Value* ptrVal = LoadNamedVariable(argNV);
 
         // move on a named struct value type: capture the value, then zero the source storage

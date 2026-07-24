@@ -332,6 +332,29 @@ struct IfConstProbe<T> {
         if const (!is_copyable(T)) { T s = move v; }
     }
 };
+// internal/issue/move-copyable-param-overload-uaf.md: a generic method with a plain
+// `V value` overload AND a sibling `move V value` overload, whose plain body refuses via a
+// TYPED-LOCAL `V refused = move value;` on a COPYABLE V. `value` only BORROWS the caller's
+// buffer (a copyable owning-value stays a borrow), so the typed-local `move` must DEEP-COPY
+// (release its own copy), never steal the caller's buffer - stealing frees the caller's live
+// value (heap-use-after-free + double free). R3Cnt.copy() counts invocations: the refusal
+// must copy exactly once (transfer would copy zero times and leave the caller a dangling alias).
+int g_r3CopyCount = 0;
+struct R3Cnt { string s = default; R3Cnt copy() { R3Cnt c = default; c.s = s.copy(); g_r3CopyCount++; return move c; } };
+struct MoveOverBag<K, V>
+{
+    V* _buf = nullptr; int _n = 0;
+    void _init() { _buf = new V[4]; }
+    bool add(alias K key, V value)
+    {
+        if (_n == 0) _init();
+        if (_n >= 1) { V refused = move value; return false; }
+        _buf[_n] = value; _n++; return true;
+    }
+    if const (!is_pointer(V))
+    { bool add(alias K key, move V value) { if (_n == 0) _init(); _buf[_n] = move value; _n++; return true; } }
+    ~MoveOverBag() { int i = 0; while (i < _n) { _ = move _buf[i]; i++; } if (_buf != nullptr) delete[_] _buf; }
+};
 void delPtr(move PtrLeak* p) {}
 move PtrLeak* pickPtr(move PtrLeak* a, move PtrLeak* b, int sel)
 {
@@ -1367,6 +1390,22 @@ extern int main()
                 total++; passed += Test("dict<noncopy> plain set overwrite frees old", g_shapeDtor, 1);
             }
             total++; passed += Test("dict<noncopy> plain set dtor frees current", g_shapeDtor, 2);
+
+            // move-copyable-param-overload-uaf: a plain `V value` overload with a sibling `move V`
+            // overload, refusing via a typed-local `V refused = move value;` on a COPYABLE V. The
+            // param only BORROWS, so the refusal must DEEP-COPY (copy() called once), not steal the
+            // caller's buffer. Pre-fix it transferred (copy() zero times) -> caller's live value was
+            // freed (heap-use-after-free + double free); post-fix the caller stays intact.
+            {
+                MoveOverBag<int, R3Cnt> mob = default;
+                R3Cnt ma = default; ma.s = "mo" + "aa";
+                R3Cnt mb = default; mb.s = "mo" + "bb";
+                mob.add(1, ma);
+                g_r3CopyCount = 0;
+                total++; passed += Test("r3 move-overload refusal rejects dup", mob.add(1, mb), false);
+                total++; passed += Test("r3 move-overload refusal deep-copies once", (i64)g_r3CopyCount, (i64)1);
+                total++; passed += Test("r3 move-overload refusal keeps caller", mb.s, "mobb");
+            }
 
             // gap-1 shape without a container: plain unique* sink, not-moved-out path frees once.
             g_shapeDtor = 0;
