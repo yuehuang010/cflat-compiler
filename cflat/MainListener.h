@@ -9632,6 +9632,16 @@ public:
             bool srcIsOwnedForUniqueIface = compiler->lastOwningResult
                 || compiler->lastCallReturnsOwned
                 || rightNV.TypeAndValue.IsMove;
+            // Same question for a `unique T*` LOCAL reassignment, but answered ONLY from
+            // properties of THIS RHS. lastOwningResult is deliberately excluded: it is a sticky
+            // global that a `new` anywhere in the RHS sets - including as a call ARGUMENT - so
+            // `b = addr(new R())` would inherit it and adopt a pointer the call merely borrowed
+            // (freeing a global). The syntactic tests below see the RHS shape itself, and
+            // lastCallReturnsOwned is derived from the resolved callee's declared `move`/unique
+            // return type, so an ordinary borrow-returning call cannot fake ownership.
+            bool srcIsOwnedPtrRhs = AsDirectNew(assignCtx) != nullptr
+                || TopLevelMoveExpression(assignCtx) != nullptr
+                || compiler->lastCallReturnsOwned;
             compiler->lastOwningResult = false;
             compiler->lastAllocAlignment = 0;
             compiler->lastCallReturnsAllocAlign = 0;
@@ -10340,6 +10350,24 @@ public:
                 && !namedVar.TypeAndValue.IsArrayView
                 && destination != rightNV.Storage)
             {
+                // `move` of a BORROWED pointer parameter transfers nothing - the caller still owns
+                // the pointee and frees it at its own scope exit. Adopting it into this owning slot
+                // would free the caller's live object here and again there. ParseMoveExpression
+                // carries IsBorrowed precisely so a store into an owning location can be rejected;
+                // this is the LOCAL counterpart of RejectBorrowIntoUniqueField.
+                if (rightNV.IsBorrowed)
+                {
+                    std::string src = rightNV.BorrowedOrigin.empty()
+                        ? rightNV.CallerName : rightNV.BorrowedOrigin;
+                    LogErrorContext(ctx, std::format(
+                        "cannot assign borrowed parameter '{}' to unique local '{}' - the caller "
+                        "still owns it and frees it on scope exit, so this would free it twice. "
+                        "Declare the parameter 'move {}' to transfer ownership, or drop 'unique' "
+                        "from '{}' if it only borrows.",
+                        src, namedVar.CallerName, src, namedVar.CallerName));
+                    return right;
+                }
+
                 compiler->EmitUniqueFieldDelete(
                     *compiler->builder, destination,
                     compiler->GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName),
@@ -10350,7 +10378,10 @@ public:
                 // A NON-owning destination (`unique R* b = nullptr; b = a;`) would otherwise be
                 // skipped by the Pointer && IsOwning scope-exit gate and leak the transferred
                 // pointee. Mirrors init and the unique-interface-local reassignment above.
-                if (rightNV.IsOwning && !namedVar.CallerName.empty())
+                // srcIsOwnedPtrRhs covers the DETACHED owned sources whose NamedVariable carries
+                // no IsOwning at all - `b = move a`, `b = new R()`, `b = moveReturningCall()`: an
+                // explicit `move` returns a Storage-less value, so only the RHS shape identifies it.
+                if ((rightNV.IsOwning || srcIsOwnedPtrRhs) && !namedVar.CallerName.empty())
                     compiler->SetVariableOwning(namedVar.CallerName, true);
             }
 

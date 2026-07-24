@@ -1264,6 +1264,118 @@ int testUniqueLocalAndParam()
     return passed;
 }
 
+// RAII factory used by the reassignment tests: a `move` pointer return is an owned source,
+// so a `unique` local adopts it whether it lands via decl-init or plain reassignment.
+move Resource* makeOwnedResource() { return new Resource(); }
+
+// Hands back its FIRST parameter unchanged - a pure BORROW, owning nothing. The second
+// parameter exists only so a `new` can be evaluated as a call ARGUMENT: ownership must be
+// judged from the RHS itself, not from a sticky "something allocated" flag the argument set.
+Resource* borrowFirstResource(Resource* a, Resource* b) { return a; }
+
+// Reassigning a `unique` pointer LOCAL through plain `=` (not a decl-initializer) must
+// transfer ownership exactly as `unique R* b = move a;` does. Before the fix the destination
+// stayed non-owning, so scope exit skipped it and the moved-in object leaked.
+int testUniqueLocalReassignMove()
+{
+    int passed = 0;
+
+    // Plain '=' reassignment from an explicit `move`: the destination adopts ownership and
+    // frees the pointee exactly once at scope exit (used to leak - nothing was freed).
+    dtorCount = 0;
+    {
+        unique Resource* a = new Resource();
+        a->id = 17;
+        unique Resource* b = nullptr;
+        b = move a;
+        passed += Test("unique_reassign_move_value_survives", b->id, 17);
+        passed += Test("unique_reassign_move_source_nulled", a == nullptr ? 1 : 0, 1);
+        passed += Test("unique_reassign_move_no_early_free", dtorCount, 0);
+    }
+    passed += Test("unique_reassign_move_freed_once", dtorCount, 1);
+
+    // Destination ALREADY owns a live object (the case decl-init cannot reach): the old
+    // pointee is freed at the assignment - not leaked - and the moved-in one at scope exit.
+    // Two objects, two destructor runs: no leak, no double free.
+    dtorCount = 0;
+    {
+        unique Resource* src = new Resource();
+        src->id = 20;
+        unique Resource* dst = new Resource();
+        dst->id = 21;
+        dst = move src;
+        passed += Test("unique_reassign_move_drops_old_at_assign", dtorCount, 1);
+        passed += Test("unique_reassign_move_holds_new", dst->id, 20);
+    }
+    passed += Test("unique_reassign_move_old_and_new_freed_once", dtorCount, 2);
+
+    // A direct `new` RHS is an owned source too - the same adoption applies.
+    dtorCount = 0;
+    {
+        unique Resource* c = nullptr;
+        c = new Resource();
+    }
+    passed += Test("unique_reassign_new_freed_once", dtorCount, 1);
+
+    // A move-returning call is an owned source - parity with `unique R* x = makeOwnedResource();`.
+    dtorCount = 0;
+    {
+        unique Resource* d = nullptr;
+        d = makeOwnedResource();
+    }
+    passed += Test("unique_reassign_move_call_freed_once", dtorCount, 1);
+
+    // Chained reassignment moves: ownership walks to the last holder, freed exactly once.
+    dtorCount = 0;
+    {
+        unique Resource* e0 = new Resource();
+        e0->id = 30;
+        unique Resource* e1 = nullptr;
+        unique Resource* e2 = nullptr;
+        e1 = move e0;
+        e2 = move e1;
+        passed += Test("unique_reassign_chain_value", e2->id, 30);
+    }
+    passed += Test("unique_reassign_chain_freed_once", dtorCount, 1);
+
+    // A moved-from source is live again after being reassigned: both objects are freed once.
+    dtorCount = 0;
+    {
+        unique Resource* f0 = new Resource();
+        unique Resource* f1 = nullptr;
+        f1 = move f0;
+        f0 = new Resource();
+    }
+    passed += Test("unique_reassign_revived_source_freed_once", dtorCount, 2);
+
+    // Release-early: assigning nullptr frees the old pointee at the assignment, and the
+    // now-empty owning slot is a no-op at scope exit.
+    dtorCount = 0;
+    {
+        unique Resource* g = new Resource();
+        g = nullptr;
+        passed += Test("unique_reassign_null_releases_now", dtorCount, 1);
+    }
+    passed += Test("unique_reassign_null_no_double_free", dtorCount, 1);
+
+    // A BORROW-returning call must not be mistaken for an owned source just because a `new`
+    // was evaluated as one of its ARGUMENTS. `h` and the return value name one pointee; if the
+    // unique local adopted it, scope exit would free it twice. Exactly one destructor runs -
+    // the argument allocation is deliberately unowned and leaks, so it never counts.
+    dtorCount = 0;
+    {
+        unique Resource* h = new Resource();
+        h->id = 5;
+        unique Resource* borrowed = nullptr;
+        borrowed = borrowFirstResource(h, new Resource());
+        passed += Test("unique_reassign_borrow_call_value", borrowed->id, 5);
+        passed += Test("unique_reassign_borrow_call_no_early_free", dtorCount, 0);
+    }
+    passed += Test("unique_reassign_borrow_call_not_adopted", dtorCount, 1);
+
+    return passed;
+}
+
 // Explicit `move` on a VALUE-type call argument (string / owning struct / closure) defers
 // the ownership transfer until the callee's parameter move-ness is known. Passing to a
 // BORROWING param must leave the source intact (the eager zeroing used to consume it and
@@ -1640,6 +1752,9 @@ extern int main()
 
     passed += testUniqueLocalAndParam();
     total += 11;
+
+    passed += testUniqueLocalReassignMove();
+    total += 17;
 
     passed += testValueMoveArgDeferred();
     total += 5;

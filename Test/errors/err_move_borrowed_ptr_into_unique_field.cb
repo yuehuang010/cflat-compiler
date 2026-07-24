@@ -14,4 +14,15 @@ expect_error("cannot store borrowed parameter 'b' into unique field 'Holder.p'")
 // A 'move' parameter transfers ownership - storing it into the unique field is valid.
 void goodStash(move Payload* b) { stash.p = b; }
 
+// Same laundering, same hazard, but into a `unique` LOCAL instead of a `unique` FIELD. The
+// local's scope-exit teardown frees the pointee the caller still owns, so the caller frees
+// it a second time. Reassignment through plain '=' is the only way in - decl-init has its
+// own D5 reject - and it must not silently adopt a borrow either.
+expect_error("cannot assign borrowed parameter 'b' to unique local 'k'") {
+    void badLocal(Payload* b) { unique Payload* k = nullptr; k = move b; }
+}
+
+// A 'move' parameter transfers ownership - reassigning it into a unique local is valid.
+void goodLocal(move Payload* b) { unique Payload* k = nullptr; k = move b; }
+
 extern int main() { return 0; }
