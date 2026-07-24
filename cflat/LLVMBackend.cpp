@@ -2478,6 +2478,7 @@ void LLVMBackend::ResetForReanalysis()
     currentFunctionReturnTV = TypeAndValue{};
     pendingOwnedStringTemps.clear();
     pendingOwnedStructTemps.clear();
+    pendingOwnedPtrTemps.clear();
     ownedReturnTemps_.clear();
     poisonedFunctions.clear();
     firstCallLocation_.clear();

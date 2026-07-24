@@ -1033,7 +1033,16 @@ public:
     // interface / owning-value struct), keyed by value for identity. Read by the no-discard
     // check to reject an unconsumed owning return; never freed here (existing free paths own
     // that); cleared each full expression in FlushOwnedTemps.
-    struct OwnedReturnTemp { llvm::Value* Value; std::string FnName; };
+    // TypeName/AllocAlign/IsOwningPtr also drive the owned-POINTER temp cleanup below: the
+    // consuming operand site only sees the SSA value, so the pointee type is carried here.
+    struct OwnedReturnTemp
+    {
+        llvm::Value* Value;
+        std::string FnName;
+        std::string TypeName;
+        uint64_t AllocAlign = 0;
+        bool IsOwningPtr = false;
+    };
     std::vector<OwnedReturnTemp> ownedReturnTemps_;
 
     // Lambda literals with unclaimed heap envs (no named owner). Closure analog of
@@ -1044,6 +1053,19 @@ public:
     // FlushOwnedStructTemps. Struct analog of the string/closure temp lists. Block = dominance guard.
     struct PendingOwnedStructTemp { llvm::Value* Alloca; std::string TypeName; llvm::BasicBlock* Block; };
     std::vector<PendingOwnedStructTemp> pendingOwnedStructTemps;
+
+    // Owning-POINTER call results (`move R*`) consumed as a SUBEXPRESSION operand, so no named
+    // local ever adopts them (`if (makePtr() != nullptr)`). Pointer analog of the string/closure/
+    // struct temp lists; freed at end-of-full-expression by FlushOwnedPtrTemps. Registered only at
+    // sites that provably consume-and-discard the pointer (see RegisterOwnedPtrTemp).
+    struct PendingOwnedPtrTemp
+    {
+        llvm::Value* Value;
+        std::string TypeName;
+        uint64_t AllocAlign = 0;
+        llvm::BasicBlock* Block = nullptr;
+    };
+    std::vector<PendingOwnedPtrTemp> pendingOwnedPtrTemps;
 
     // Per-function noalias metadata for T[] views. Proves pairwise disjointness for span<T> fields
     // where the noalias parameter attribute cannot reach. Reset in createFunctionBlock.
@@ -1907,21 +1929,71 @@ private:
     }
 
     // Record an owning-RETURN call result for the no-discard check (see ownedReturnTemps_).
-    void RegisterOwnedReturnTemp(llvm::Value* value, const std::string& fnName)
+    // `retType` also carries the pointee type/alignment the owned-pointer temp cleanup needs.
+    void RegisterOwnedReturnTemp(llvm::Value* value, const std::string& fnName,
+                                 const TypeAndValue& retType)
     {
         if (value == nullptr) return;
+        bool isOwningPtr = retType.Pointer && value->getType()->isPointerTy()
+            && !retType.IsInterface && !retType.ElemPointer && retType.ConstArraySize == 0;
         for (auto& e : ownedReturnTemps_)
             if (e.Value == value) { e.FnName = fnName; return; }
-        ownedReturnTemps_.push_back({ value, fnName });
+        ownedReturnTemps_.push_back({ value, fnName, retType.TypeName,
+                                      retType.AllocAlignValue, isOwningPtr });
+    }
+
+    // Propagate an existing ledger entry onto a derived value (e.g. a '?:' select result).
+    void PropagateOwnedReturnTemp(llvm::Value* from, llvm::Value* to)
+    {
+        const OwnedReturnTemp* src = FindOwnedReturnEntry(from);
+        if (src == nullptr || to == nullptr) return;
+        OwnedReturnTemp copy = *src;
+        copy.Value = to;
+        for (auto& e : ownedReturnTemps_)
+            if (e.Value == to) { e = copy; return; }
+        ownedReturnTemps_.push_back(copy);
+    }
+
+    // Returns the ledger entry if `value` is a still-unconsumed owning return, else nullptr.
+    const OwnedReturnTemp* FindOwnedReturnEntry(llvm::Value* value) const
+    {
+        if (value == nullptr) return nullptr;
+        for (const auto& e : ownedReturnTemps_)
+            if (e.Value == value) return &e;
+        return nullptr;
     }
 
     // Returns the callee name if `value` is a still-unconsumed owning return, else nullptr.
     const std::string* FindOwnedReturnTemp(llvm::Value* value) const
     {
-        if (value == nullptr) return nullptr;
-        for (const auto& e : ownedReturnTemps_)
-            if (e.Value == value) return &e.FnName;
-        return nullptr;
+        const OwnedReturnTemp* e = FindOwnedReturnEntry(value);
+        return e == nullptr ? nullptr : &e->FnName;
+    }
+
+    /*
+     * Register an owning-POINTER call result that an enclosing expression consumes without
+     * adopting it, and that the pointer provably cannot ESCAPE from: a comparison operand (the
+     * result is a bool) or a scalar-field deref base (the read copies a self-contained value).
+     * A CALL ARGUMENT is deliberately NOT such a site - a borrow parameter may legally RETAIN its
+     * argument, so freeing it here would be a use-after-free; it stays a leak. Gated on the
+     * owning-return ledger, so a BORROW-returning call (also a CallInst) is never registered and
+     * cannot be double-freed. UnregisterOwnedPtrTemp guards the sink invariant (no caller-side
+     * free may remain registered for an argument a callee took ownership of).
+     */
+    void RegisterOwnedPtrTemp(llvm::Value* value)
+    {
+        const OwnedReturnTemp* e = FindOwnedReturnEntry(value);
+        if (e == nullptr || !e->IsOwningPtr) return;
+        for (const auto& p : pendingOwnedPtrTemps)
+            if (p.Value == value) return;   // idempotent: one buffer, one free
+        pendingOwnedPtrTemps.push_back({ value, e->TypeName, e->AllocAlign, builder->GetInsertBlock() });
+    }
+
+    void UnregisterOwnedPtrTemp(llvm::Value* value)
+    {
+        if (value == nullptr) return;
+        std::erase_if(pendingOwnedPtrTemps,
+            [&](const PendingOwnedPtrTemp& p) { return p.Value == value; });
     }
 
     // True when the insert block is active (non-null, no terminator yet).
@@ -2052,6 +2124,59 @@ private:
         pendingOwnedStructTemps.clear();
     }
 
+    // Free one unowned owning-pointer temp: null guard, full destructor, then the matching
+    // deallocator. Value-based twin of EmitOwningPtrCleanup (which loads from a named local's
+    // storage); the temp is a bare SSA pointer with no slot to load from or null out.
+    void EmitOwnedPtrTempFree(llvm::Value* ptrVal, const std::string& typeName, uint64_t allocAlign)
+    {
+        auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(ptrVal->getType());
+        if (ptrTy == nullptr) return;
+        auto* isNull = builder->CreateICmpEQ(ptrVal, llvm::ConstantPointerNull::get(ptrTy));
+        auto* cleanupBB = llvm::BasicBlock::Create(*context, "tmpptr.cleanup", builder->GetInsertBlock()->getParent());
+        auto* afterBB   = llvm::BasicBlock::Create(*context, "tmpptr.after",   builder->GetInsertBlock()->getParent());
+        builder->CreateCondBr(isNull, afterBB, cleanupBB);
+
+        builder->SetInsertPoint(cleanupBB);
+        if (auto* dtor = GetFullDestructorForDelete(typeName))
+            builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
+
+        // Over-aligned blocks come from the aligned allocator and must be freed through
+        // __delete_aligned - the same rule as EmitOwningPtrCleanup and the `delete` site.
+        auto* voidPtr = builder->CreateBitCast(ptrVal, builder->getInt8Ty()->getPointerTo());
+        uint64_t effAlign = allocAlign;
+        if (!typeName.empty())
+        {
+            TypeAndValue tv{ .TypeName = typeName };
+            llvm::Type* t = GetType(tv);
+            if (t != nullptr && t->isSized())
+                effAlign = std::max(effAlign, GetEffectiveAlignmentForType(typeName, t));
+        }
+        llvm::Function* del = effAlign > kDefaultNewAlign
+            ? GetFunction("__delete_aligned") : GetFunction("operator delete");
+        if (del)
+            builder->CreateCall(del->getFunctionType(), del, { voidPtr });
+
+        builder->CreateBr(afterBB);
+        builder->SetInsertPoint(afterBB);
+    }
+
+    // Free every owning-pointer temp nothing adopted. Each free opens new blocks, so the insert
+    // block and the dominator tree are recomputed per temp instead of hoisted out of the loop.
+    void FlushOwnedPtrTemps()
+    {
+        if (pendingOwnedPtrTemps.empty()) return;
+
+        auto temps = std::move(pendingOwnedPtrTemps);
+        pendingOwnedPtrTemps.clear();
+        for (auto& t : temps)
+        {
+            if (t.Value == nullptr || !IsInsertBlockLive()) continue;
+            std::optional<llvm::DominatorTree> domTree;
+            if (!OwnedTempDominatesHere(t.Block, builder->GetInsertBlock(), domTree)) continue; // dominance safety
+            EmitOwnedPtrTempFree(t.Value, t.TypeName, t.AllocAlign);
+        }
+    }
+
     // Register a by-value owning-struct RVALUE temp passed as a BORROW argument for destruction at
     // the end of the current full expression. A borrow param does not free it and it has no named
     // owner, so without this it leaks its owned field(s) (e.g. a string). The caller gates on the
@@ -2084,6 +2209,9 @@ private:
         FlushOwnedStringTemps();
         FlushOwnedClosureTemps();
         FlushOwnedStructTemps();
+        // Last: freeing a pointer temp opens blocks, which would move the insert point out from
+        // under the value-based flushes above.
+        FlushOwnedPtrTemps();
         // Detection-only ledger: end of a full expression retires its owning-return results.
         ownedReturnTemps_.clear();
     }
@@ -3696,6 +3824,24 @@ private:
         for (const auto& sym : it->second)
             if (!sym.Parameters.empty() && sym.Parameters[0].TypeName == typeName)
                 return true;
+        return false;
+    }
+
+    // True when `memberName` is a plain SCALAR field of `typeName` (no pointer, array, string,
+    // struct, interface or function pointer). Reading such a field yields a self-contained value
+    // that cannot alias the object's heap storage - the property the owning-pointer temp cleanup
+    // needs before it may free a pointee that was only dereferenced to reach a member.
+    bool MemberIsScalarField(const std::string& typeName, const std::string& memberName) const
+    {
+        auto ds = dataStructures.find(typeName);
+        if (ds == dataStructures.end()) return false;
+        for (const auto& f : ds->second.StructFields)
+        {
+            if (f.VariableName != memberName) continue;
+            return !f.Pointer && !f.IsInterface && !f.IsFunctionPointer
+                && f.ConstArraySize == 0 && f.TypeName != "string"
+                && dataStructures.find(f.TypeName) == dataStructures.end();
+        }
         return false;
     }
 
@@ -7737,6 +7883,7 @@ public:
         std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingStringTemps;
         std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingClosureTemps;
         std::vector<PendingOwnedStructTemp> pendingStructTemps;
+        std::vector<PendingOwnedPtrTemp> pendingPtrTemps;
         std::vector<OwnedReturnTemp> ownedReturnTemps;
     };
 
@@ -7749,10 +7896,12 @@ public:
         s.pendingStringTemps  = std::move(pendingOwnedStringTemps);
         s.pendingClosureTemps = std::move(pendingOwnedClosureTemps);
         s.pendingStructTemps  = std::move(pendingOwnedStructTemps);
+        s.pendingPtrTemps     = std::move(pendingOwnedPtrTemps);
         s.ownedReturnTemps    = std::move(ownedReturnTemps_);
         pendingOwnedStringTemps.clear();
         pendingOwnedClosureTemps.clear();
         pendingOwnedStructTemps.clear();
+        pendingOwnedPtrTemps.clear();
         ownedReturnTemps_.clear();
         return s;
     }
@@ -7769,6 +7918,7 @@ public:
         pendingOwnedStringTemps  = state.pendingStringTemps;
         pendingOwnedClosureTemps = state.pendingClosureTemps;
         pendingOwnedStructTemps  = state.pendingStructTemps;
+        pendingOwnedPtrTemps     = state.pendingPtrTemps;
         ownedReturnTemps_        = state.ownedReturnTemps;
     }
 
@@ -10466,6 +10616,10 @@ public:
                          || IsEncodedClosureType(params[i].TypeName))
                     UnregisterOwnedClosureTemp(args[i].Primary);
 
+                // Invariant guard: a sink parameter owns its argument, so no caller-side
+                // end-of-expression free may remain registered for it.
+                UnregisterOwnedPtrTemp(args[i].Primary);
+
                 // An interface fat-ptr param built from a caller STRUCT VALUE points AT the caller's
                 // alloca, so zeroing that alloca would corrupt the data the callee sees - keep it a
                 // borrow. A POINTER argument is different: the fat ptr carries the pointer VALUE, so
@@ -10797,7 +10951,7 @@ public:
         lastCallReturnsOwned = (rt.IsMove || rt.IsUniqueTypeArg)
             && (rt.TypeName == "string" || rt.Pointer || rt.IsInterface);
         if (lastCallReturnsOwned)
-            RegisterOwnedReturnTemp(callResult, ifaceName + "." + methodName);
+            RegisterOwnedReturnTemp(callResult, ifaceName + "." + methodName, rt);
         lastCallReturnsAllocAlign = rt.AllocAlignValue;
         if (lastCallReturnsOwned
             && callResult->getType() == llvm::StructType::getTypeByName(*context, "string"))
@@ -15183,7 +15337,7 @@ public:
             && candidate.ReturnType.TypeName != "string"
             && IsOwningValueType(candidate.ReturnType.TypeName);
         if (lastCallReturnsOwned || ownedValueStructReturn)
-            RegisterOwnedReturnTemp(result, functionName);
+            RegisterOwnedReturnTemp(result, functionName, candidate.ReturnType);
         // Return-type `alignas(_, N)`: the callee hands back an N-aligned heap block. Stamp the
         // side-channel so the receiving local frees via __delete_aligned (consumed in ParseDeclaration).
         lastCallReturnsAllocAlign = candidate.ReturnType.AllocAlignValue;

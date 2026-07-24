@@ -197,6 +197,21 @@ move IShapeLeak pickShape(move IShapeLeak a, move IShapeLeak b, int sel)
 // Pointer flavor of the same exclusive-return pattern: must compile and free each object once.
 struct PtrLeak { int v = 0; ~PtrLeak() { g_shapeDtor = g_shapeDtor + 1; } };
 
+// An owning-POINTER call result BURIED in a subexpression has no named owner, so nothing used to
+// free it - it leaked. It is now registered as an owned-pointer temp and released at
+// end-of-full-expression, exactly like the owned string/closure/struct temps - but ONLY where the
+// pointer cannot escape: a comparison operand and a scalar-field deref. A call ARGUMENT is not
+// such a site (see retainPtrTemp below) and still leaks. Adopting sites (local, `unique` local,
+// container, `return`, `move` parameter) must still free it EXACTLY once - never twice.
+move PtrLeak* mkPtrTemp(int n) { PtrLeak* p = new PtrLeak(); p.v = n; return p; }
+move PtrLeak* fwdPtrTemp(int n) { return mkPtrTemp(n); }
+void sinkPtrTemp(move PtrLeak* p) { delete p; }
+// A BORROW parameter may legally RETAIN its argument (store it somewhere outliving the call);
+// CFlat does not diagnose that. So an owning-ptr temp passed as an argument must NOT be freed by
+// the caller at end-of-expression - that is a use-after-free, not a leak fix. It stays a leak.
+PtrLeak* g_retainedPtr = nullptr;
+void retainPtrTemp(PtrLeak* p) { g_retainedPtr = p; }
+
 // Regression: a value struct with a USER destructor over a RAW pointer field (not `unique`) and NO
 // copy() is NON-copyable - the memberwise synth would shallow-share the pointer while the dtor frees
 // it on both copies (double-free). IsCopyableType now rejects that shape, so `RawResLeak b = a;`
@@ -3183,6 +3198,69 @@ extern int main()
             _ = move g_discardGlobalRow;     // field buffer freed now; global slot nulled
         }
         total++; passed += Test("global struct discard: field reads as empty", g_discardGlobalRow.name, "");
+    }
+
+    // === Owned POINTER temp buried in a subexpression (nodiscard-residual-gaps Gap 2) ===
+    // `if (mkPtrTemp() != nullptr)` used to leak (dtor never ran): the comparison CONSUMES the
+    // owning temp as an operand, so the mandatory-nodiscard check cannot see it and nothing freed
+    // it. Every row must be exactly one free - the HeapAudit oracle below catches a leak and a
+    // double free aborts the process.
+    {
+        g_shapeDtor = 0;
+        if (mkPtrTemp(1) != nullptr) { }
+        total++; passed += Test("owning-ptr temp as comparison operand", g_shapeDtor, 1);
+
+        g_shapeDtor = 0;
+        bool sameTemp = mkPtrTemp(2) == mkPtrTemp(3);       // two temps, both evaluated
+        total++; passed += Test("two owning-ptr comparison operands", g_shapeDtor, 2);
+        total++; passed += Test("distinct owning-ptr temps differ", sameTemp, false);
+
+        // A retaining callee: the argument must survive the call, so the caller frees nothing.
+        g_shapeDtor = 0;
+        retainPtrTemp(mkPtrTemp(4));                        // callee stores the borrow in a global
+        total++; passed += Test("retained borrow argument survives the call", g_retainedPtr->v, 4);
+        total++; passed += Test("retained borrow argument not freed by caller", g_shapeDtor, 0);
+        delete g_retainedPtr;                               // caller-side release keeps the oracle at zero
+        g_retainedPtr = nullptr;
+        total++; passed += Test("retained borrow argument freed exactly once", g_shapeDtor, 1);
+
+        g_shapeDtor = 0;
+        sinkPtrTemp(mkPtrTemp(5));                          // `move` param owns it - caller must not free
+        total++; passed += Test("owning-ptr temp into move parameter", g_shapeDtor, 1);
+
+        g_shapeDtor = 0;
+        mkPtrTemp(6)->v = 9;                                // scalar-field deref, then discarded
+        total++; passed += Test("owning-ptr temp scalar-field deref", g_shapeDtor, 1);
+
+        // ADOPTED: a plain local, a `unique` local, an escaping `return` and a container element
+        // each already had an owner - a flush that ignored adoption would double-free here.
+        g_shapeDtor = 0;
+        { PtrLeak* adopted = mkPtrTemp(7); }
+        total++; passed += Test("owning-ptr return adopted by local", g_shapeDtor, 1);
+
+        g_shapeDtor = 0;
+        { unique PtrLeak* uadopted = mkPtrTemp(8); }
+        total++; passed += Test("owning-ptr return adopted as unique", g_shapeDtor, 1);
+
+        g_shapeDtor = 0;
+        { PtrLeak* escaped = fwdPtrTemp(9); }
+        total++; passed += Test("owning-ptr return escaping via return", g_shapeDtor, 1);
+
+        g_shapeDtor = 0;
+        { list<unique PtrLeak*> ownedPtrs = default; ownedPtrs.add(mkPtrTemp(10)); }
+        total++; passed += Test("owning-ptr temp stored in container", g_shapeDtor, 1);
+
+        // A loop guard is re-evaluated every iteration, so the free happens per iteration in the
+        // condition block (4 evaluations: 3 that enter the body plus the one that exits).
+        g_shapeDtor = 0;
+        int ptrSpins = 0;
+        while (mkPtrTemp(11) != nullptr && ptrSpins < 3) { ptrSpins = ptrSpins + 1; }
+        total++; passed += Test("owning-ptr temp in loop condition", g_shapeDtor, 4);
+
+        // A short-circuited right operand never runs, so its temp is never created OR freed.
+        g_shapeDtor = 0;
+        if (ptrSpins < 0 && mkPtrTemp(12) != nullptr) { }
+        total++; passed += Test("short-circuited owning-ptr temp", g_shapeDtor, 0);
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

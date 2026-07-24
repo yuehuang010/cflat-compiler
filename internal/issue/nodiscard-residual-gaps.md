@@ -5,8 +5,22 @@ implemented by value identity: every owning-return call result is ledgered
 (`ownedReturnTemps_` in `LLVMBackend.h`), and at a discard position (bare expression
 statement, for-init, for-update) `DiagnoseDiscardedOwningReturn` (`MainListener.h`) fires
 only when the full expression's RESULT value is a still-unconsumed owning return. That design
-leaves two holes by construction. Both are bounded; neither is a regression introduced by the
-feature. Do not fix as part of the nodiscard work.
+leaves one hole by construction (Gap 1 below). It is bounded and is not a regression introduced
+by the feature. Do not fix as part of the nodiscard work.
+
+(Gap 2 - a buried owning temp consumed by an enclosing expression, e.g.
+`if (makePtr() != nullptr) { }` - was a real LEAK and has been FIXED: an owning-POINTER call
+result consumed as a comparison operand or as a scalar-field deref base is now registered in
+`pendingOwnedPtrTemps` and freed at end-of-full-expression, the pointer analog of the existing
+`pendingOwnedStringTemps` / `pendingOwnedStructTemps` machinery. Both sites are ones the pointer
+provably cannot escape from - a comparison yields a bool, a scalar field read copies a
+self-contained value.
+
+An owning-POINTER temp passed as a CALL ARGUMENT still leaks and is deliberately left alone: a
+borrow parameter may legally RETAIN its argument (store it in a global / a field / return it),
+which CFlat does not diagnose, so freeing it in the caller is a use-after-free rather than a leak
+fix. Deciding it needs interprocedural escape analysis. `Test/test_collection_leaks.cb` pins the
+retaining-callee shape as a positive test so this is not silently "fixed" later.)
 
 ## Gap 1 - indirect (closure / function<> / fnptr) owning return, bare-discarded
 
@@ -19,20 +33,6 @@ policy error is not raised.
   owned-temp machinery; only the nodiscard diagnostic is absent.
 - Fix direction (if ever wanted): ledger owning returns at the indirect-call emission site
   too, keyed by the resolved callee's return-ownership.
-
-## Gap 2 - buried owning temp consumed by an enclosing expression
-
-`if (makePtr() != nullptr) { }` (and any owning call used only as an operand /
-subexpression of a discarded statement or a condition) leaks (`dtor == 0`): the comparison
-CONSUMES the owning temp as an operand, so nodiscard - which only inspects the full
-expression's RESULT value - cannot and must not see it.
-
-- This is the broad PRE-EXISTING "buried owning temp in a subexpression" cleanup gap, not a
-  nodiscard concern. It references the general owned-temp-in-subexpression cleanup work
-  (the `pendingOwnedStringTemps` / `pendingOwnedStructTemps` flush machinery already handles
-  strings/structs used as operands; the owned-POINTER analog is the missing piece).
-- nodiscard deliberately does not flag it: the value is consumed by the comparison, so it is
-  not the discarded result.
 
 ## Note - IsUniqueTypeArg interface-return branch is defensive/untested
 

@@ -10737,10 +10737,10 @@ public:
                 }
                 // A ternary is a transparent wrapper: if a branch is an owning return, the select
                 // result carries that ownership, so ledger it so a discarded ternary is caught.
-                if (const std::string* fn = compiler->FindOwnedReturnTemp(trueValue))
-                    compiler->RegisterOwnedReturnTemp(selectValue, *fn);
-                else if (const std::string* fn = compiler->FindOwnedReturnTemp(falseValue))
-                    compiler->RegisterOwnedReturnTemp(selectValue, *fn);
+                if (compiler->FindOwnedReturnTemp(trueValue))
+                    compiler->PropagateOwnedReturnTemp(trueValue, selectValue);
+                else if (compiler->FindOwnedReturnTemp(falseValue))
+                    compiler->PropagateOwnedReturnTemp(falseValue, selectValue);
                 return { selectValue, false };
             }
 
@@ -10947,12 +10947,16 @@ public:
             // and the next (possibly a named variable) would be mis-registered and double-freed.
             // Each owned-string operand that is a call result is a temporary the comparison only
             // borrows; register it for end-of-statement cleanup (see RegisterBorrowedStringOperandTemp).
+            // An owning-POINTER operand (`makePtr() != nullptr`) is the same shape: the comparison
+            // yields a bool, so the pointer cannot escape and the temp is freed at the same point.
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto lv = ParseTypeCheckExpression(nextCtxs[0]);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), lv.value);
+            Compiler(ctx)->RegisterOwnedPtrTemp(lv.value);
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto rv = ParseTypeCheckExpression(nextCtxs[1]);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), rv.value);
+            Compiler(ctx)->RegisterOwnedPtrTemp(rv.value);
             std::string op = ctx->children[1]->getText();
 
             // An interface value compared against nullptr tests its DATA pointer (fat-ptr field 1):
@@ -11267,12 +11271,15 @@ public:
             // `s < other.toString()`) is an owned temp the relational operator only borrows.
             // Reset lastCallReturnsOwned before each operand and register each call-result
             // operand for end-of-statement cleanup (see RegisterBorrowedStringOperandTemp).
+            // Owning-POINTER operands are registered here too - see ParseEqualityExpression.
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto lv = ParseShiftExpression(nextCtxs[0]);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), lv.value);
+            Compiler(ctx)->RegisterOwnedPtrTemp(lv.value);
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto rv = ParseShiftExpression(nextCtxs[1]);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), rv.value);
+            Compiler(ctx)->RegisterOwnedPtrTemp(rv.value);
             std::string op = ctx->children[1]->getText();
 
             auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx);
@@ -15673,6 +15680,17 @@ public:
                     {
                         prevToken = tokenType;
                         nullConditionalPending = (tokenType == CFlatParser::QuestionDot);
+                        // [PFX-1b] Unadopted owning-POINTER receiver (`makePtr()->v = 1;`): free it
+                        // at end-of-expression. SCALAR member only - see MemberIsScalarField.
+                        if ((tokenType == CFlatParser::Dot || tokenType == CFlatParser::Arrow)
+                            && namedVar.TypeAndValue.Pointer && namedVar.Primary != nullptr)
+                        {
+                            std::string scalarMember = NextMemberName(ctx, parseTree);
+                            if (!scalarMember.empty()
+                                && Compiler(ctx)->MemberIsScalarField(
+                                       namedVar.TypeAndValue.TypeName, scalarMember))
+                                Compiler(ctx)->RegisterOwnedPtrTemp(namedVar.Primary);
+                        }
                         // [PFX-1a] user operator-> : forward-on-miss. CFlat's `.` and `->` are flexible
                         // (either token works on a value or a pointer). When the member that follows is
                         // NOT a member of a value-type receiver but that type defines `operator->`, forward
