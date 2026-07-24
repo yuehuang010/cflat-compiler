@@ -7,6 +7,16 @@ void consume(move MoveResource* r) { delete r; }
 struct Holder { MoveResource* item = nullptr; };
 void Holder(Holder* self) {}
 
+// Dereference-of-explicitly-moved-pointer coverage. Explicit 'move' of a thin `unique`
+// pointer/interface local nulls it but, by design, leaves it plain-readable (a == nullptr,
+// passing it along, etc. stay legal - see test_move.cb's explicit_move_local_* cases); only a
+// SAME-BLOCK DEREFERENCE ('->'/'.'/'*'/'[]') of the moved-out source is rejected. Cross-block
+// cases (conditional move, loop-carried) are a known, deliberately narrow gap - see
+// internal/issue/deref-of-moved-pointer-across-blocks-not-diagnosed.md.
+struct UniqueThing { int v = 0; int get() { return v; } };
+interface IUniqueThing { int get(); };
+class UniqueIfaceThing : IUniqueThing { int v = 0; int get() { return v; } };
+
 // use after move - assign move param to struct field, then read param again
 expect_error("use of moved variable 'child'") {
     void storeAndRead(Holder* h, move MoveResource* child)
@@ -61,6 +71,55 @@ extern int main()
         MoveResource* r2 = new MoveResource();
         consume(r2);
         int x = r2->id;
+    }
+
+    // Dereference (field access) of an explicitly-moved thin `unique` pointer local. A plain
+    // read of the same moved-out local (ut == nullptr) stays legal; only the '->' deref errors.
+    expect_error("dereference of moved variable 'ut'") {
+        unique UniqueThing* ut = new UniqueThing();
+        unique UniqueThing* ut2 = move ut;
+        int y = ut->v;
+    }
+
+    // Dereference via a method-receiver call is rejected identically to a field access.
+    expect_error("dereference of moved variable 'ut3'") {
+        unique UniqueThing* ut3 = new UniqueThing();
+        unique UniqueThing* ut4 = move ut3;
+        int y = ut3->get();
+    }
+
+    // Same for a `unique <interface>` local.
+    expect_error("dereference of moved variable 'ui'") {
+        unique IUniqueThing ui = new UniqueIfaceThing();
+        unique IUniqueThing ui2 = move ui;
+        int y = ui.get();
+    }
+
+    // Explicit `*` dereference of an explicitly-moved thin `unique` pointer local.
+    expect_error("dereference of moved variable 'ut5'") {
+        unique UniqueThing* ut5 = new UniqueThing();
+        unique UniqueThing* ut6 = move ut5;
+        UniqueThing star = *ut5;
+    }
+
+    // Index dereference ('[]') of an explicitly-moved thin `unique` pointer local.
+    expect_error("dereference of moved variable 'ut7'") {
+        unique int* ut7 = new int[4];
+        unique int* ut8 = move ut7;
+        int idx = ut7[0];
+    }
+
+    // Exception-safety of the '?:' arm-lowering suppression (suppressExplicitNullDerefGuard_):
+    // an error thrown WHILE lowering a ternary arm must not leak the suppression past the error
+    // (RAII, not manual increment/decrement) - otherwise this later, unrelated same-block deref
+    // would be silently un-guarded for the rest of the compile.
+    expect_error("Undefined variable undefined_symbol_xyz.") {
+        int bogus = 1 ? undefined_symbol_xyz : 2;
+    }
+    unique UniqueThing* ut9 = new UniqueThing();
+    unique UniqueThing* ut10 = move ut9;
+    expect_error("dereference of moved variable 'ut9'") {
+        int y = ut9->v;
     }
 
     // use after move - move happens inside an if, read happens after the if

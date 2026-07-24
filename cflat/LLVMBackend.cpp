@@ -2485,6 +2485,9 @@ void LLVMBackend::ResetForReanalysis()
     pendingInitAllocAlign = 0;
     lastCallReturnsAllocAlign = 0;
     lastCallIsBonded = false;
+    // Left non-zero by an aborted compile mid-ternary, this would wrongly suppress the deref
+    // guard for the next file's straight-line code.
+    suppressExplicitNullDerefGuard_ = 0;
     // Sibling of lastCallIsBonded: a per-call bond flag that, if left set by an aborted compile,
     // would mark the next file's first bonded value as by-address.
     lastCallBondByAddress = false;

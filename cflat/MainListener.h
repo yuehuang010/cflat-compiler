@@ -2534,6 +2534,15 @@ private:
         ~ReturnFlagGuard() { *flag = saved; }
     };
 
+    // Increments suppressExplicitNullDerefGuard_ for the ctor->dtor lifetime, unwinding even if
+    // lowering a '?:' arm throws (LogError) or returns early - see the call site's comment.
+    struct SuppressExplicitNullDerefGuardScope {
+        LLVMBackend* compiler;
+        explicit SuppressExplicitNullDerefGuardScope(LLVMBackend* c) : compiler(c)
+            { compiler->suppressExplicitNullDerefGuard_++; }
+        ~SuppressExplicitNullDerefGuardScope() { compiler->suppressExplicitNullDerefGuard_--; }
+    };
+
     // Snapshot the moved state at a break/continue so the innermost loop can merge it back
     // at loop exit. No-op outside a loop (a switch break has no such rejoin bookkeeping).
     void RecordLoopExitMovedState()
@@ -10489,6 +10498,7 @@ public:
                 else
                 {
                     compiler->MarkVariableUnmoved(namedVar.CallerName);
+                    compiler->MarkVariableNotExplicitlyMovedNull(namedVar.CallerName);
                     // --sanitize=ownership (M1): the local is live again - reset its origin slot.
                     compiler->ClearOwnMoveOrigin(destination);
                 }
@@ -10583,8 +10593,20 @@ public:
             }
             else if (expressionFalseCtx != nullptr && (expressionTrueCtx != nullptr))
             {
-                auto trueValue  = ParseExpression(expressionTrueCtx);
-                llvm::Value* falseValue = ParseConditionalExpression(expressionFalseCtx);
+                // '?:' lowers to an eager CreateSelect below - BOTH arms execute unconditionally,
+                // so a deref that is only sound under one branch's condition is not actually safe
+                // in either arm. Suppress the same-block explicit-move-null guard while lowering
+                // them (a depth counter, not a bool - ternaries can nest). RAII, not manual
+                // increment/decrement: either arm may LogError (which throws) or return early,
+                // and the counter must still unwind so a caught error elsewhere in the compile
+                // does not silently disable the guard for the rest of the file.
+                llvm::Value* trueValue  = nullptr;
+                llvm::Value* falseValue = nullptr;
+                {
+                    SuppressExplicitNullDerefGuardScope suppressGuard(compiler);
+                    trueValue  = ParseExpression(expressionTrueCtx);
+                    falseValue = ParseConditionalExpression(expressionFalseCtx);
+                }
 
                 // A branch that is a plain (non-`move`) string-returning CALL yields a fresh owned
                 // temp the call path did not register (only `move` returns are). CreateSelect below
@@ -12668,6 +12690,9 @@ public:
                 // Move-dataflow: taking a variable's address (e.g. an out-parameter `receive(&v)`)
                 // may reinitialize it, so treat it as a revive - the value is live again afterward.
                 compiler->RecordMoveGenRevive(namedVar.CallerName);
+                // The escaped address could rewrite the pointee (e.g. `fill(&a)`) - latch the
+                // explicit-move-null deref guard off for good, per MarkVariableAddressEscaped.
+                compiler->MarkVariableAddressEscaped(namedVar.CallerName);
             }
             else if (opText == "*")
             {
@@ -12694,6 +12719,12 @@ public:
                 auto* pointeeType = compiler->GetType(namedVar.TypeAndValue);
                 llvm::Value* baseStorage = namedVar.Storage;
                 llvm::Value* loadedPtr = compiler->CreateLoad(namedVar.Storage);
+                // A `*p` dereference of an explicitly-moved-null thin pointer local is statically
+                // null - reject it, same as the '->'/'.' guard.
+                if (compiler->IsExplicitlyMovedNullHere(namedVar))
+                    LogErrorContext(ctx, std::format(
+                        "dereference of moved variable '{}' (it is null after the move)",
+                        namedVar.CallerName));
                 // --sanitize=ownership (M1): guard `*p` deref of a moved-from local.
                 compiler->EmitOwnDerefGuard(baseStorage, loadedPtr,
                     ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
@@ -14724,6 +14755,9 @@ public:
             compiler->builder->CreateStore(
                 llvm::ConstantAggregateZero::get(compiler->GetFatPtrType()), argNV.Storage);
             compiler->MarkVariableMoved(argNV.CallerName);
+            // Same-block deref guard (see ExplicitlyMovedNull): distinct from IsMoved above,
+            // which already rejects every read of a moved interface local, same block or not.
+            compiler->MarkVariableExplicitlyMovedNull(argNV.CallerName);
             compiler->lastOwningResult = true;
             LLVMBackend::NamedVariable result;
             result.Primary      = ptrVal;
@@ -14802,6 +14836,12 @@ public:
         // Null the source (field GEP or local alloca) to transfer ownership.
         if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(ptrVal->getType()))
             compiler->builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), argNV.Storage);
+
+        // Explicit 'move a' of a whole thin pointer local: nulled but plain-readable (only a later
+        // SAME-BLOCK deref errors - see MarkVariableExplicitlyMovedNull). Excludes a field-path move.
+        if (argNV.FieldName.empty() && argNV.OwningStructName.empty() && !argNV.IsElementAccess
+            && !argNV.CallerName.empty())
+            compiler->MarkVariableExplicitlyMovedNull(argNV.CallerName);
 
         // --sanitize=ownership (M1): record the move site for a tracked owning-pointer local.
         // A field-path move (OwningStructName set) is M2 scope, so its GEP is naturally untracked.
@@ -15687,6 +15727,12 @@ public:
                             if (sd.StructType)
                             {
                                 llvm::Value* ptrVal = LoadNamedVariable(namedVar);
+                                // Deref of an explicitly-moved-null thin pointer local is statically
+                                // null - reject it (plain reads stay legal). SKIP `?.`.
+                                if (Compiler(ctx)->IsExplicitlyMovedNullHere(namedVar) && !nullConditionalPending)
+                                    LogErrorContext(ctx, std::format(
+                                        "dereference of moved variable '{}' (it is null after the move)",
+                                        namedVar.CallerName));
                                 // --sanitize=ownership: guard `p->f` / `p.f` deref against a null
                                 // (moved/freed) pointer. SKIP `?.` - the null-conditional operator
                                 // legitimately tolerates null and short-circuits, so it is not a bug.
@@ -15940,6 +15986,13 @@ public:
                             namedVar = {};
 
                             auto* compiler = Compiler(ctx);
+                            // Same-block explicit-move-null deref guard (see IsExplicitlyMovedNullHere):
+                            // fires only when this deref is in the SAME block the move was recorded
+                            // in, never across a branch/merge/loop back-edge. SKIP '?.'.
+                            if (compiler->IsExplicitlyMovedNullHere(interfaceVar) && !nullConditionalPending)
+                                LogErrorContext(ctx, std::format(
+                                    "dereference of moved variable '{}' (it is null after the move)",
+                                    interfaceVar.CallerName));
                             const std::string& ifaceName = interfaceVar.TypeAndValue.TypeName;
                             int ifaceFieldIdx = compiler->InterfaceFieldIndex(ifaceName, primaryIdentifier);
                             if (ifaceFieldIdx >= 0 && !interfaceVar.TypeAndValue.IsInterfacePointer)
@@ -16785,6 +16838,12 @@ public:
                             auto elementType = Compiler(ctx)->GetType(elementTypeAndValue);
                             llvm::Value* subBaseStorage = namedVar.Storage;
                             auto ptrValue = LoadNamedVariable(namedVar);
+                            // An indexed deref (`p[i]`) of an explicitly-moved-null thin pointer local
+                            // is statically null - reject it, same as the '->'/'.'/'*' guards.
+                            if (Compiler(ctx)->IsExplicitlyMovedNullHere(namedVar))
+                                LogErrorContext(ctx, std::format(
+                                    "dereference of moved variable '{}' (it is null after the move)",
+                                    namedVar.CallerName));
                             // --sanitize=ownership (M1): guard `p[i]` deref of a moved-from local.
                             Compiler(ctx)->EmitOwnDerefGuard(subBaseStorage, ptrValue,
                                 ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());

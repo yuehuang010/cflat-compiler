@@ -747,6 +747,11 @@ public:
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
         bool IsExplicitMove = false;
         bool MovedIntoInterface = false; // compile-time: ownership was boxed into an interface local ('IFace x = ptr'); 'delete ptr' is a no-op that leaks - delete the interface instead
+        // compile-time: explicitly 'move'd-out thin pointer local - null but plain-readable by
+        // design; only a same-block '->'/'.'/'*'/'[]' DEREFERENCE is rejected (see MarkVariableExplicitlyMovedNull).
+        bool ExplicitlyMovedNull = false;
+        llvm::BasicBlock* ExplicitNullBlock = nullptr; // the block the move was recorded in - the deref guard only fires inside this same block
+        bool AddressEscaped = false; // '&name' was taken - the pointee may have been rewritten through it, so the deref guard is latched off for good
         std::unordered_set<std::string> MovedFields; // compile-time: field names moved out of this variable via a 'move' of a sub-path (e.g. `node->left`) - the base stays usable
         bool IsBonded = false;           // compile-time: true when this variable holds a bonded (borrowed) return value
         bool BondByAddress = false;      // bond originates from a by-address lambda capture; reassigning the source is safe
@@ -1054,6 +1059,12 @@ public:
     // end-of-module diagnostic (CheckPoisonedFunctionCalls) point at the real call site.
     std::unordered_map<std::string, std::pair<size_t, size_t>> firstCallLocation_;
 
+    // Depth counter, not a bool: '?:' arms can nest (a ? (b ? c : d) : e), so a plain flag would
+    // clear early on the inner ternary's exit. Non-zero while lowering EITHER arm of a '?:' -
+    // both arms execute unconditionally (CreateSelect, no branch), so a deref inside either one
+    // that would be sound under the OTHER arm's condition must not be guarded (see
+    // IsExplicitlyMovedNullHere). Not part of the --init cache round-trip (transient per-call state).
+    int suppressExplicitNullDerefGuard_ = 0;
     bool lastCallIsBonded = false;           // set when the last call returned a bonded (borrowed) value
     bool lastCallBondByAddress = false;      // set when the bond originates from a by-address lambda capture (kind A)
     std::vector<std::string> lastCallBondedSources; // bond parameter names the last call's return borrows from
@@ -15635,6 +15646,83 @@ public:
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
                 { it->second.IsMoved = false; return; }
         }
+    }
+
+    // Marks a thin pointer local as explicitly-moved-and-null in the CURRENT block (see
+    // ExplicitlyMovedNull on NamedVariable). No-op once AddressEscaped latches - an escaped
+    // address may have rewritten the pointee, so the deref guard can never be sound again.
+    // Deliberately does not touch IsMoved: plain reads of this variable must stay legal.
+    void MarkVariableExplicitlyMovedNull(const std::string& name)
+    {
+        if (name.empty() || !builder) return;
+        llvm::BasicBlock* bb = builder->GetInsertBlock();
+        if (!bb) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+            {
+                if (it->second.AddressEscaped) return;
+                it->second.ExplicitlyMovedNull = true;
+                it->second.ExplicitNullBlock = bb;
+                return;
+            }
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+            {
+                if (it->second.AddressEscaped) return;
+                it->second.ExplicitlyMovedNull = true;
+                it->second.ExplicitNullBlock = bb;
+                return;
+            }
+        }
+    }
+
+    // Reassigning the local makes it live again - clears the deref guard set by an explicit move.
+    void MarkVariableNotExplicitlyMovedNull(const std::string& name)
+    {
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                { it->second.ExplicitlyMovedNull = false; it->second.ExplicitNullBlock = nullptr; return; }
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                { it->second.ExplicitlyMovedNull = false; it->second.ExplicitNullBlock = nullptr; return; }
+        }
+    }
+
+    // '&name' escaped the address - latch off the deref guard permanently (see AddressEscaped
+    // on NamedVariable): the pointee may be rewritten through the escaped pointer from here on.
+    void MarkVariableAddressEscaped(const std::string& name)
+    {
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+            {
+                it->second.AddressEscaped = true;
+                it->second.ExplicitlyMovedNull = false;
+                it->second.ExplicitNullBlock = nullptr;
+                return;
+            }
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+            {
+                it->second.AddressEscaped = true;
+                it->second.ExplicitlyMovedNull = false;
+                it->second.ExplicitNullBlock = nullptr;
+                return;
+            }
+        }
+    }
+
+    // The full explicit-move-null deref predicate: fires only for a DEREFERENCE in the SAME
+    // block the move was recorded in (never across a branch/merge/loop back-edge - see
+    // ExplicitNullBlock), never once the address has escaped (see AddressEscaped), and never
+    // while lowering a '?:' arm (see suppressExplicitNullDerefGuard_ - both arms run
+    // unconditionally, so a same-block deref there is not actually unconditionally unsound).
+    // This is deliberately narrower than a real null-narrowing analysis - see the field comment.
+    bool IsExplicitlyMovedNullHere(const NamedVariable& nv) const
+    {
+        return nv.ExplicitlyMovedNull && !nv.AddressEscaped && suppressExplicitNullDerefGuard_ == 0
+            && builder && nv.ExplicitNullBlock == builder->GetInsertBlock();
     }
 
     // Per-field move tracking. Moving a struct sub-path (e.g. `node->left`) into a 'move'

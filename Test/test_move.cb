@@ -85,6 +85,16 @@ class UniqueIfaceBox : IUniqueBox
     int tag() { return 1; }
 };
 
+// Fixture for the cross-block `unique <interface>` deref regression below: a plain interface
+// (no owning field), so its dtor is a no-op and does not perturb dtorCount.
+interface IGuardBox { int tag(); };
+class GuardBoxImpl : IGuardBox { int tag() { return 42; } };
+
+// Returns false, but not as a compile-time-foldable literal: keeps the 'if' below a genuine
+// runtime branch (not eliminated) for the cross-block interface regression.
+int gGuardFlag = 0;
+bool RuntimeFalse() { return gGuardFlag != 0; }
+
 // Reassign through the interface's field slot: the old pointee is freed here, not orphaned.
 int storeViaIface(IUniqueBox h)
 {
@@ -198,6 +208,21 @@ int probe(Resource* r)
 int delegateProbe(Resource* r)
 {
     return probe(r);
+}
+
+// Helper for the explicit-move readable-as-null regression below: a plain read/pass of a
+// moved-out pointer (no dereference) must stay legal, so this only compares against nullptr.
+int isNullResource(Resource* r)
+{
+    return r == nullptr ? 1 : 0;
+}
+
+// Helper for the address-escape cross-block regression below: rewrites *slot through an
+// escaped address, exercising the AddressEscaped latch on the caller's moved-out local.
+void refillResource(Resource** slot, int id)
+{
+    *slot = new Resource();
+    (*slot)->id = id;
 }
 
 // move T* return type - ownership propagates to caller
@@ -733,6 +758,80 @@ int testUniqueField()
         passed += Test("unique_field_to_field_move_not_freed_early", dtorCount, 0);
     }
     passed += Test("unique_field_to_field_move_freed_once", dtorCount, 1);
+
+    // Explicit 'move' of a whole thin `unique` pointer LOCAL (not a field): the source is nulled
+    // but, by design, stays plain-readable - only a SAME-BLOCK DEREFERENCE of it is a compile
+    // error (see Test/errors/err_move.cb's dereference-of-explicitly-moved-pointer legs). Covers
+    // a nullptr comparison, passing it to a function, and comparing it as an int - none of these
+    // are dereferences, so all must still compile and run correctly.
+    dtorCount = 0;
+    {
+        unique Resource* p = new Resource();
+        p->id = 7;
+        unique Resource* q = move p;
+        passed += Test("explicit_move_local_dest_intact", q->id, 7);
+        passed += Test("explicit_move_local_source_nulled", p == nullptr ? 1 : 0, 1);
+        passed += Test("explicit_move_local_source_pass_to_function", isNullResource(p), 1);
+        passed += Test("explicit_move_local_source_compare_as_int", (int)(p == nullptr), 1);
+        passed += Test("explicit_move_local_not_freed_early", dtorCount, 0);
+
+        // Reassigning the moved-out source makes it live again: a subsequent DEREFERENCE
+        // must compile and run correctly (the deref guard only fires while still moved-null).
+        p = new Resource();
+        p->id = 9;
+        passed += Test("explicit_move_local_reassign_then_deref", p->id, 9);
+    }
+    passed += Test("explicit_move_local_freed_once_each", dtorCount, 2);
+
+    // Cross-block positive legs (the deliberately-narrow same-block predicate must NOT fire on
+    // these - see internal/issue/deref-of-moved-pointer-across-blocks-not-diagnosed.md):
+    dtorCount = 0;
+    {
+        // F1 shape: a null-guarded deref in a DIFFERENT block from the move (an 'if', which
+        // actually branches - unlike '?:', which lowers to an eager select in the SAME block
+        // and so is NOT covered; see the ternary caveat in the issue file). The move's block-id
+        // latch means the guard cannot see this, so it must compile and run correctly.
+        unique Resource* g = new Resource();
+        g->id = 11;
+        unique Resource* g2 = move g;
+        int guarded = -1;
+        if (g != nullptr) { guarded = g->id; }
+        passed += Test("cross_block_null_guarded_deref", guarded, -1);
+
+        // F2 shape: the address of a moved-out local escapes to an out-parameter that may
+        // rewrite it; a later deref must compile and run correctly (AddressEscaped latch).
+        unique Resource* h = new Resource();
+        unique Resource* h2 = move h;
+        refillResource(&h, 13);
+        passed += Test("address_escape_then_deref", h->id, 13);
+
+        // F3 shape: move happens only inside one conditional arm (decl-init, not a reassignment -
+        // reassigning a previously-nullptr `unique` local via 'move' is a separate, pre-existing
+        // ownership-tracking gap, out of scope here and not exercised by this regression); a
+        // GUARDED deref after the branch merges must compile and run correctly (the same-block
+        // predicate never sees the branch's block). Uses 'if', not '?:' - see the ternary caveat
+        // above: '?:' lowers to an eager select that evaluates BOTH arms unconditionally, so a
+        // ternary-guarded deref of a pointer that is null in the untaken arm crashes regardless
+        // of this fix (also pre-existing, also out of scope).
+        unique Resource* k = new Resource();
+        k->id = 17;
+        if (k != nullptr) { unique Resource* k2 = move k; }
+        int afterBranch = -1;
+        if (k != nullptr) { afterBranch = k->id; }
+        passed += Test("cross_block_conditional_move_then_deref", afterBranch, -1);
+
+        // F3 shape, `unique <interface>` local: this is the exact shape that initially slipped
+        // through, because the interface deref site checked the flat IsMoved flag (OR-merged
+        // across if/else branches) instead of the same-block predicate. Unlike a thin pointer, an
+        // interface local has no post-move null-check escape hatch here (ANY read of a possibly-
+        // moved interface is pre-existing-rejected - see err_move.cb's whole-variable-move legs),
+        // so this is an UNGUARDED deref after a conditional move that is never actually taken at
+        // runtime (RuntimeFalse()) - it must compile clean and run correctly.
+        unique IGuardBox ig = new GuardBoxImpl();
+        if (RuntimeFalse()) { unique IGuardBox ig2 = move ig; }
+        passed += Test("cross_block_conditional_move_then_deref_interface", ig.tag(), 42);
+    }
+    passed += Test("cross_block_legs_no_leak", dtorCount, 4);
 
     // A `unique` field reached through an interface's byte-offset slot gets the same store-site
     // guards as a direct field read: the flag rides the interface's field declaration, which the
@@ -1525,7 +1624,7 @@ extern int main()
     total += 7;
 
     passed += testUniqueField();
-    total += 44;
+    total += 56;
 
     passed += testParamStringToField();
     total += 1;
