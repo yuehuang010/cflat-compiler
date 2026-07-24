@@ -312,6 +312,16 @@ struct DiscardBag<T>
 string     g_sinkStr    = default;
 LeakHolder g_sinkHolder = default;
 LeakRow    g_sinkRow    = default;
+
+// Regression for internal/issue/discard-move-global-string-leaks.md: `_ = move <global>` must
+// release a GLOBAL owner (string or owning struct) exactly like a local - the discard-release
+// recognizer previously matched only locals/element slots, so a global destination silently kept
+// the moved-out buffer live (a leak). Both globals stay un-reassigned after their discard (the
+// no-reassign-before-exit shape): the leak oracle below deterministically catches a missing free,
+// and main's own EmitGlobalDestructorsInMain teardown call on return must see the nulled slot and
+// no-op - a double free there is only caught under an --asan run, not by HeapAudit itself.
+string  g_discardGlobalStr = default;
+LeakRow g_discardGlobalRow = default;
 void strSink(string s)     { g_sinkStr = move s; }
 void holderSink(LeakHolder v) { g_sinkHolder = move v; }
 // Copyable owning-value struct sink: the arg below is a `.copy()` RVALUE TEMP - it must move
@@ -2839,6 +2849,32 @@ extern int main()
             r1StoreInto(&dst, r1MkBox());   // generic sink at copyable T; rvalue temp argument
             total++; passed += Test("r1 copyable sink rvalue-temp: slot copy", dst.s, "rvbox");
         }
+    }
+
+    // === Regression: internal/issue/discard-move-global-string-leaks.md ===
+    // Both legs leave the global un-reassigned after the discard (no-reassign-before-exit): the
+    // leak oracle just below deterministically catches a missing free (must still see zero), and
+    // the FINAL exit-time global teardown (past this function's `return`, see _gLeakGate) must not
+    // double-free the already-nulled slot - a double free there is only caught under --asan, not
+    // by HeapAudit's own reportLeaks (which counts live allocations, not frees).
+    {
+        // (a) global STRING discard.
+        {
+            string a = "hello there this is a heap buffer for sure";
+            string b = "world and more text to force a heap buffer";
+            g_discardGlobalStr = a + b;
+            _ = move g_discardGlobalStr;     // buffer freed now; global slot nulled
+        }
+        total++; passed += Test("global string discard: reads as empty", g_discardGlobalStr, "");
+
+        // (b) global OWNING STRUCT discard (a struct with an owning string field).
+        {
+            LeakRow row = default;
+            row.name = "owned-by-global-row-buffer-abcdefgh";
+            g_discardGlobalRow = row;
+            _ = move g_discardGlobalRow;     // field buffer freed now; global slot nulled
+        }
+        total++; passed += Test("global struct discard: field reads as empty", g_discardGlobalRow.name, "");
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

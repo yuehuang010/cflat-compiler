@@ -7423,6 +7423,30 @@ public:
         compiler->MarkVariableMoved(name);
     }
 
+    // Explicitly release a live owning GLOBAL NOW (the `_ = move g;` form). Globals have no
+    // stackNamedVariable frame, so this mirrors ReleaseOwningLocalNow but resolves the
+    // NamedVariable via GetGlobalVariableNV (globalNamedVariable/globalVariableTypes) instead.
+    // Nulling the global's storage after DropValue is load-bearing: EmitGlobalDestructorsInMain
+    // runs the same type's full destructor over every global at exit, and that destructor reads
+    // the runtime owned-bit from storage - zeroing it here makes that later call a no-op instead
+    // of a double free.
+    // Only covers the shapes OwnsDroppableResource recognizes (string, owning value struct); a
+    // `unique T*` / unique-interface / closure global is NOT released here, matching
+    // EmitGlobalDestructorsInMain's own Pointer/IsInterface skip at exit.
+    void ReleaseOwningGlobalNow(antlr4::ParserRuleContext* ctx, const std::string& name)
+    {
+        auto* compiler = Compiler(ctx);
+        compiler->SetCurrentDebugLocation(ctx->getStart()->getLine());
+        auto nv = compiler->GetGlobalVariableNV(name);
+        if (nv.Storage == nullptr)
+            return;
+        if (!compiler->OwnsDroppableResource(nv))
+            return;
+        compiler->DropValue(nv);
+        if (nv.BaseType != nullptr)
+            compiler->builder->CreateStore(llvm::Constant::getNullValue(nv.BaseType), nv.Storage);
+    }
+
     // Recover ownership of a local/temp that was `move`d out of a container element slot. The slot
     // read demoted the element's `unique`-ness (a plain read hands out a borrow), so its TRUE
     // ownership is taken from `elemOwnershipType`: the DECLARED destination type for
@@ -9386,8 +9410,11 @@ public:
 
                 // `_ = move <bare local>;` explicitly releases the owning local NOW: it runs the
                 // same per-type teardown as scope exit, then the local is moved-from (a later read
-                // is a compile error). Only the top-level bare-identifier move form is special;
-                // `_ = move obj.field`, `_ = <call>()`, `_ = expr` keep the generic discard below.
+                // is a compile error). `_ = move <bare global>;` gets the same NOW-release, minus
+                // the compile-time moved-from tracking (globals have no stackNamedVariable frame to
+                // hold it) - the nulled storage still makes a later read see it as moved-out at
+                // runtime. Only the top-level bare-identifier move form is special; `_ = move
+                // obj.field`, `_ = <call>()`, `_ = expr` keep the generic discard below.
                 if (auto* mv = TopLevelMoveExpression(assignCtx))
                 {
                     auto* inner = mv->unaryExpression();
@@ -9397,6 +9424,11 @@ public:
                         if (auto* nv = compiler->FindLiveNamedVariable(name))
                         {
                             ReleaseOwningLocalNow(unaryCtx, nv, name);
+                            return nullptr;
+                        }
+                        if (compiler->GetGlobalVariable(name) != nullptr)
+                        {
+                            ReleaseOwningGlobalNow(unaryCtx, name);
                             return nullptr;
                         }
                     }
