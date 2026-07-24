@@ -1177,6 +1177,13 @@ private:
     // Per-llvm::Function move-event log (move-dataflow). Appended in emission
     // order; consumed and cleared by RunMoveDataflow. Cleared by ResetForReanalysis.
     std::unordered_map<llvm::Function*, std::vector<movedf::Event>> moveEventLog_;
+    // Per-llvm::Function explicit-move null-state event log. Separate stream from moveEventLog_
+    // on purpose (see the nulldf namespace comment); consumed per function by
+    // RunNullDerefDataflow and swept by RunMoveDataflow. Cleared by ResetForReanalysis.
+    std::unordered_map<llvm::Function*, std::vector<nulldf::Event>> nullEventLog_;
+    // Functions proven to never return, so a `if (cond) { die(); }` guard suppresses like an
+    // inline exit() would. Populated as each body completes; cleared by ResetForReanalysis.
+    nulldf::NoReturnSet provenNoReturn_;
     std::unordered_map<std::string, llvm::GlobalVariable*> globalNamedVariable;
     std::unordered_map<std::string, TypeAndValue> globalVariableTypes;
     // Declaration LINE of each global, for same-scope redeclaration detection. A true in-source
@@ -15818,6 +15825,7 @@ public:
                 if (it->second.AddressEscaped) return;
                 it->second.ExplicitlyMovedNull = true;
                 it->second.ExplicitNullBlock = bb;
+                RecordNullSet(name);
                 return;
             }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
@@ -15825,6 +15833,7 @@ public:
                 if (it->second.AddressEscaped) return;
                 it->second.ExplicitlyMovedNull = true;
                 it->second.ExplicitNullBlock = bb;
+                RecordNullSet(name);
                 return;
             }
         }
@@ -15834,6 +15843,7 @@ public:
     void MarkVariableNotExplicitlyMovedNull(const std::string& name)
     {
         if (name.empty()) return;
+        RecordNullClear(name);
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
@@ -15848,6 +15858,7 @@ public:
     void MarkVariableAddressEscaped(const std::string& name)
     {
         if (name.empty()) return;
+        RecordNullEscape(name);
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
@@ -15877,6 +15888,17 @@ public:
     {
         return nv.ExplicitlyMovedNull && !nv.AddressEscaped && suppressExplicitNullDerefGuard_ == 0
             && builder && nv.ExplicitNullBlock == builder->GetInsertBlock();
+    }
+
+    // Cross-block half: log this dereference for the MAY-null fixpoint. Only whole-local owning
+    // pointers/interfaces can ever receive a SetNull event, so nothing else is worth logging.
+    void RecordNullDerefFor(const NamedVariable& nv, int line, int col)
+    {
+        if (nv.CallerName.empty() || !nv.FieldName.empty() || nv.AddressEscaped) return;
+        if (!(nv.ExplicitlyMovedNull || nv.IsOwning || nv.TypeAndValue.IsUnique
+              || nv.TypeAndValue.IsUniqueTypeArg))
+            return;
+        RecordNullDeref(nv.CallerName, line, col);
     }
 
     // Per-field move tracking. Moving a struct sub-path (e.g. `node->left`) into a 'move'
@@ -15944,10 +15966,72 @@ public:
         { RecordMoveEvent(movedf::EventKind::GenReviveWhole, name, "", 0, 0); }
     void RecordMoveGenReviveField(const std::string& name, const std::string& field)
         { RecordMoveEvent(movedf::EventKind::GenReviveField, name, field, 0, 0); }
+    // A fresh binding also re-initializes the null-state: a local declared inside a loop body is
+    // live again on every iteration, so its previous iteration's explicit move must not carry.
     void RecordMoveGenBind(const std::string& name)
-        { RecordMoveEvent(movedf::EventKind::GenBind, name, "", 0, 0); }
+        { RecordMoveEvent(movedf::EventKind::GenBind, name, "", 0, 0); RecordNullClear(name); }
     void RecordMoveUse(const std::string& name, const std::string& field, int line, int col)
         { RecordMoveEvent(movedf::EventKind::Use, name, field, line, col); }
+
+    // --- Explicit-move null-state event recording (cross-block deref diagnostic). ---
+    // Same block-tagging discipline as RecordMoveEvent: dropped when no block is being
+    // emitted into (e.g. the ForwardRefScanner pre-pass).
+    void RecordNullEvent(nulldf::EventKind kind, const std::string& name, int line, int col)
+    {
+        if (name.empty() || !builder) return;
+        llvm::BasicBlock* bb = builder->GetInsertBlock();
+        if (!bb || !bb->getParent()) return;
+        nullEventLog_[bb->getParent()].push_back(nulldf::Event{ bb, kind, name, line, col });
+    }
+    void RecordNullSet(const std::string& name)
+        { RecordNullEvent(nulldf::EventKind::SetNull, name, 0, 0); }
+    void RecordNullClear(const std::string& name)
+        { RecordNullEvent(nulldf::EventKind::ClearNull, name, 0, 0); }
+    void RecordNullEscape(const std::string& name)
+        { RecordNullEvent(nulldf::EventKind::Escape, name, 0, 0); }
+    // Any NON-dereference read. Recorded broadly on purpose: an unrecorded read is the only way
+    // a guard could slip past the read-kill, and an extra one only costs a diagnostic.
+    void RecordNullRead(const std::string& name)
+        { RecordNullEvent(nulldf::EventKind::Read, name, 0, 0); }
+    void RecordNullDeref(const std::string& name, int line, int col)
+        { RecordNullEvent(nulldf::EventKind::Deref, name, line, col); }
+
+    // Drop a function's null-state log without analyzing it (an aborted body has a partial CFG).
+    void DiscardNullDerefEvents(llvm::Function* F)
+    {
+        if (F) nullEventLog_.erase(F);
+    }
+
+    // Solve the MAY-null fixpoint for ONE function as soon as its body is fully lowered, so the
+    // resulting error still lands inside an enclosing scoped expect_error block. Reports the
+    // earliest dereference of a maybe-null explicitly-moved local (LogError).
+    void RunNullDerefDataflow(llvm::Function* F)
+    {
+        if (!F) return;
+        // Prove F never returns BEFORE anything can throw, so a wrapper like
+        // `void die() { printf(...); exit(1); }` is known by the time its callers are analyzed.
+        // Order-dependent, and never in the false-positive direction: proving a wrapper noreturn
+        // can only suppress a report or sharpen control dependence into a correct one.
+        if (nulldf::FunctionNeverReturns(F, &provenNoReturn_)) provenNoReturn_.insert(F);
+        auto it = nullEventLog_.find(F);
+        if (it == nullEventLog_.end()) return;
+        std::vector<nulldf::Event> events = std::move(it->second);
+        nullEventLog_.erase(it);
+
+        const char* off = std::getenv("CFLAT_NULL_DF_OFF");
+        if (off && off[0] != '\0') return;
+
+        auto diverged = nulldf::AnalyzeFunction(F, events, &provenNoReturn_);
+        if (diverged.empty()) return;
+        const nulldf::Divergence* earliest = nullptr;
+        for (const auto& d : diverged)
+            if (!earliest || d.line < earliest->line ||
+                (d.line == earliest->line && d.col < earliest->col))
+                earliest = &d;
+        SetSourceLocation(earliest->line, earliest->col);
+        LogError(std::format(
+            "dereference of moved variable '{}' (it is null after the move)", earliest->name));
+    }
 
     // Solve the MaybeMoved fixpoint per llvm::Function over the emitted module. This is the
     // source of truth for loop-carried / cross-block / switch use-after-move (the inline
@@ -15955,6 +16039,13 @@ public:
     // divergence, report the globally earliest (line, col) as a real error via LogError.
     void RunMoveDataflow()
     {
+        // Sweep any function whose null-state log was not consumed at end-of-body (lambdas and
+        // synthesized bodies do not go through the named-function completion point).
+        if (module)
+            for (auto& F : *module)
+                if (!F.isDeclaration() && !F.empty()) RunNullDerefDataflow(&F);
+        nullEventLog_.clear();
+
         // Escape hatch: skip the pass entirely without a rebuild if it ever misfires.
         const char* off = std::getenv("CFLAT_MOVE_DF_OFF");
         if (off && off[0] != '\0') { moveEventLog_.clear(); return; }

@@ -1,6 +1,6 @@
 # '?:' (ternary) with a non-bool (e.g. `int`) condition fails LLVM module verification
 
-Opened while testing deref-of-moved-pointer-across-blocks-not-diagnosed.md. Tripped over
+Opened while testing the cross-block moved-pointer deref diagnostic. Tripped over
 directly while writing a ternary repro for that unrelated issue - not caused or fixed by
 it. Filed separately from ternary-arms-evaluated-eagerly-not-short-circuited.md: that
 file is about the ARMS being evaluated unconditionally (unsound but well-typed IR); this

@@ -10,9 +10,9 @@ void Holder(Holder* self) {}
 // Dereference-of-explicitly-moved-pointer coverage. Explicit 'move' of a thin `unique`
 // pointer/interface local nulls it but, by design, leaves it plain-readable (a == nullptr,
 // passing it along, etc. stay legal - see test_move.cb's explicit_move_local_* cases); only a
-// SAME-BLOCK DEREFERENCE ('->'/'.'/'*'/'[]') of the moved-out source is rejected. Cross-block
-// cases (conditional move, loop-carried) are a known, deliberately narrow gap - see
-// internal/issue/deref-of-moved-pointer-across-blocks-not-diagnosed.md.
+// DEREFERENCE ('->'/'.'/'*'/'[]') of the moved-out source is rejected. A same-block deref is
+// rejected inline; a cross-block one (conditional move, loop-carried) by the MAY-null fixpoint
+// at end-of-body, unless a dominating null guard narrows it back to non-null.
 struct UniqueThing { int v = 0; int get() { return v; } };
 interface IUniqueThing { int get(); };
 class UniqueIfaceThing : IUniqueThing { int v = 0; int get() { return v; } };
@@ -45,6 +45,35 @@ expect_error("use of moved variable 'root.left'") {
     {
         consumeTree(root->left);
         consumeTree(root->left);   // same field moved twice -> error
+    }
+}
+
+// Cross-block dereference of an explicitly-moved thin `unique` pointer local. The move is in
+// one branch and the (unguarded) deref is after the merge, so the same-block guard cannot see
+// it; the MAY-null fixpoint over the function's CFG reports it at end-of-body instead. A
+// dominating null guard would narrow it back to non-null - see test_move.cb's narrowing legs.
+expect_error("dereference of moved variable 'cb1'") {
+    int condMoveThenDeref(int n)
+    {
+        unique UniqueThing* cb1 = new UniqueThing();
+        if (n > 100) { unique UniqueThing* cb2 = move cb1; }
+        return cb1->v;
+    }
+}
+
+// Loop-carried: iteration 1 dereferences what iteration 0 moved out (via the back-edge).
+expect_error("dereference of moved variable 'lc1'") {
+    int loopCarriedMoveThenDeref()
+    {
+        unique UniqueThing* lc1 = new UniqueThing();
+        unique UniqueThing* lc2 = nullptr;
+        int total = 0;
+        for (int i = 0; i < 2; i++)
+        {
+            total = total + lc1->v;
+            if (lc2 == nullptr) { lc2 = move lc1; }
+        }
+        return total;
     }
 }
 

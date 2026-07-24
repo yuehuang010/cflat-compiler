@@ -30,6 +30,7 @@
 #include <variant>
 #include <optional>
 #include <cstdlib>
+#include <cctype>
 #include <cmath>
 #include <charconv>
 
@@ -7054,6 +7055,9 @@ public:
                     compilerLLVM->expectedError.clear();
                     compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
                     compiler->ClearCurrentSubprogram();
+                    // The body was aborted mid-way: its CFG is partial, so its null-state log
+                    // must be dropped rather than analyzed by the end-of-module sweep.
+                    compiler->DiscardNullDerefEvents(fn);
                     expectErrorHandled = true;
                 }
                 else
@@ -7087,6 +7091,10 @@ public:
                 compiler->builder->CreateUnreachable();
 
             compiler->ClearCurrentSubprogram();
+
+            // The body's CFG is complete - solve the MAY-null fixpoint here so the error still
+            // lands inside an enclosing scoped expect_error rather than at end-of-module.
+            compiler->RunNullDerefDataflow(fn);
         }
 
         if (isAutoReturn)
@@ -11968,6 +11976,9 @@ public:
     llvm::Value* LoadNamedVariable(LLVMBackend::NamedVariable& namedVar)
     {
         auto* compiler = Compiler();
+        // Every value read of a named local. A dereference site records its Deref event BEFORE
+        // calling this, so the read below cannot swallow its own check (see RecordNullRead).
+        compiler->RecordNullRead(namedVar.CallerName);
         if (namedVar.IdentifierLine > 0)
         {
             if (!namedVar.IsElementAccess)
@@ -12756,13 +12767,15 @@ public:
                 }
                 auto* pointeeType = compiler->GetType(namedVar.TypeAndValue);
                 llvm::Value* baseStorage = namedVar.Storage;
-                llvm::Value* loadedPtr = compiler->CreateLoad(namedVar.Storage);
                 // A `*p` dereference of an explicitly-moved-null thin pointer local is statically
                 // null - reject it, same as the '->'/'.' guard.
+                compiler->RecordNullDerefFor(namedVar, ctx->getStart()->getLine(),
+                    ctx->getStart()->getCharPositionInLine());
                 if (compiler->IsExplicitlyMovedNullHere(namedVar))
                     LogErrorContext(ctx, std::format(
                         "dereference of moved variable '{}' (it is null after the move)",
                         namedVar.CallerName));
+                llvm::Value* loadedPtr = compiler->CreateLoad(namedVar.Storage);
                 // --sanitize=ownership (M1): guard `*p` deref of a moved-from local.
                 compiler->EmitOwnDerefGuard(baseStorage, loadedPtr,
                     ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
@@ -15775,13 +15788,16 @@ public:
                             auto sd = Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName);
                             if (sd.StructType)
                             {
-                                llvm::Value* ptrVal = LoadNamedVariable(namedVar);
                                 // Deref of an explicitly-moved-null thin pointer local is statically
                                 // null - reject it (plain reads stay legal). SKIP `?.`.
+                                if (!nullConditionalPending)
+                                    Compiler(ctx)->RecordNullDerefFor(namedVar, ctx->getStart()->getLine(),
+                                        ctx->getStart()->getCharPositionInLine());
                                 if (Compiler(ctx)->IsExplicitlyMovedNullHere(namedVar) && !nullConditionalPending)
                                     LogErrorContext(ctx, std::format(
                                         "dereference of moved variable '{}' (it is null after the move)",
                                         namedVar.CallerName));
+                                llvm::Value* ptrVal = LoadNamedVariable(namedVar);
                                 // --sanitize=ownership: guard `p->f` / `p.f` deref against a null
                                 // (moved/freed) pointer. SKIP `?.` - the null-conditional operator
                                 // legitimately tolerates null and short-circuits, so it is not a bug.
@@ -16035,9 +16051,8 @@ public:
                             namedVar = {};
 
                             auto* compiler = Compiler(ctx);
-                            // Same-block explicit-move-null deref guard (see IsExplicitlyMovedNullHere):
-                            // fires only when this deref is in the SAME block the move was recorded
-                            // in, never across a branch/merge/loop back-edge. SKIP '?.'.
+                            // Same-block guard only, and no Deref event: an interface local keeps
+                            // the same-block rule on purpose (see the issue file, gap 1). SKIP '?.'.
                             if (compiler->IsExplicitlyMovedNullHere(interfaceVar) && !nullConditionalPending)
                                 LogErrorContext(ctx, std::format(
                                     "dereference of moved variable '{}' (it is null after the move)",
@@ -16886,13 +16901,15 @@ public:
                             }
                             auto elementType = Compiler(ctx)->GetType(elementTypeAndValue);
                             llvm::Value* subBaseStorage = namedVar.Storage;
-                            auto ptrValue = LoadNamedVariable(namedVar);
                             // An indexed deref (`p[i]`) of an explicitly-moved-null thin pointer local
                             // is statically null - reject it, same as the '->'/'.'/'*' guards.
+                            Compiler(ctx)->RecordNullDerefFor(namedVar, ctx->getStart()->getLine(),
+                                ctx->getStart()->getCharPositionInLine());
                             if (Compiler(ctx)->IsExplicitlyMovedNullHere(namedVar))
                                 LogErrorContext(ctx, std::format(
                                     "dereference of moved variable '{}' (it is null after the move)",
                                     namedVar.CallerName));
+                            auto ptrValue = LoadNamedVariable(namedVar);
                             // --sanitize=ownership (M1): guard `p[i]` deref of a moved-from local.
                             Compiler(ctx)->EmitOwnDerefGuard(subBaseStorage, ptrValue,
                                 ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());

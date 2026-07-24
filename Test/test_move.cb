@@ -95,6 +95,11 @@ class GuardBoxImpl : IGuardBox { int tag() { return 42; } };
 int gGuardFlag = 0;
 bool RuntimeFalse() { return gGuardFlag != 0; }
 
+// A wrapper that never returns on ANY path. It carries no LLVM 'noreturn' attribute, so the
+// moved-deref analysis has to PROVE it (nulldf::FunctionNeverReturns) for a `if (c) { dieNow(); }`
+// guard to suppress. Never actually called - the guard below is behind RuntimeFalse().
+void dieNow() { printf("unreachable handoff\n"); exit(1); }
+
 // Reassign through the interface's field slot: the old pointee is freed here, not orphaned.
 int storeViaIface(IUniqueBox h)
 {
@@ -783,8 +788,8 @@ int testUniqueField()
     }
     passed += Test("explicit_move_local_freed_once_each", dtorCount, 2);
 
-    // Cross-block positive legs (the deliberately-narrow same-block predicate must NOT fire on
-    // these - see internal/issue/deref-of-moved-pointer-across-blocks-not-diagnosed.md):
+    // Cross-block positive legs: neither the same-block predicate nor the MAY-null fixpoint may
+    // fire on these (see internal/issue/deref-of-moved-pointer-guard-inside-callee.md):
     dtorCount = 0;
     {
         // F1 shape: a null-guarded deref in a DIFFERENT block from the move (an 'if', which
@@ -832,6 +837,123 @@ int testUniqueField()
         passed += Test("cross_block_conditional_move_then_deref_interface", ig.tag(), 42);
     }
     passed += Test("cross_block_legs_no_leak", dtorCount, 4);
+
+    // Guard legs for the cross-block moved-deref analysis. Every leg below dereferences a local
+    // that IS maybe-moved on the merged path, but under a guard - so the deref sits inside a
+    // branch the move was not under, and the control-dependence rule must suppress it. A
+    // regression shows up here as a COMPILE ERROR, not as a wrong value.
+    dtorCount = 0;
+    {
+        unique Resource* n1 = new Resource();
+        n1->id = 19;
+        if (RuntimeFalse()) { unique Resource* n1b = move n1; }
+        int narrowed = -1;
+        if (n1 == nullptr) { narrowed = -2; } else { narrowed = n1->id; }
+        passed += Test("cross_block_else_branch_narrowing", narrowed, 19);
+
+        // The guard is the loop's own condition, which reads the pointer - the read alone
+        // suppresses, and the body may dereference even though it moves the local out.
+        unique Resource* n2 = new Resource();
+        n2->id = 23;
+        int loopSeen = 0;
+        while (n2 != nullptr)
+        {
+            loopSeen = n2->id;
+            unique Resource* n2b = move n2;
+        }
+        passed += Test("loop_condition_narrowing_then_deref", loopSeen, 23);
+
+        // A guarded move followed by a guarded deref: the deref's branch is not one the move
+        // was under, so it is suppressed.
+        unique Resource* n3 = new Resource();
+        n3->id = 29;
+        if (n3 != nullptr) { unique Resource* n3b = move n3; }
+        int afterGuardedMove = -1;
+        if (n3 != nullptr) { afterGuardedMove = n3->id; }
+        passed += Test("guarded_move_then_guarded_deref", afterGuardedMove, -1);
+
+        // The `x == nullptr` repair guard with NO else. The merge block is NOT control-dependent
+        // on that branch, so this leg is carried by the read-kill: forming the guard reads the
+        // pointer, and a read between the move and the deref suppresses the report.
+        unique Resource* n4 = new Resource();
+        n4->id = 31;
+        if (RuntimeFalse()) { unique Resource* n4b = move n4; }
+        if (n4 == nullptr) { n4 = new Resource(); n4->id = 37; }
+        passed += Test("repair_guard_narrowing_then_deref", n4->id, 31);
+
+        // Short-circuit '&&' OUTSIDE a branch condition (here an initializer). The RHS block is
+        // control-dependent on the LHS test, and the LHS reads the pointer - suppressed twice
+        // over, with no special-casing of '&&' anywhere in the compiler.
+        unique Resource* n5 = new Resource();
+        n5->id = 41;
+        if (RuntimeFalse()) { unique Resource* n5b = move n5; }
+        bool shortCircuit = n5 != nullptr && n5->id == 41;
+        passed += Test("short_circuit_and_outside_condition", shortCircuit ? 1 : 0, 1);
+
+        // The null guard hoisted into a bool local. No alias tracking is involved: the deref
+        // simply sits inside `if (live)`, a branch the move was not under.
+        unique Resource* n6 = new Resource();
+        n6->id = 43;
+        if (RuntimeFalse()) { unique Resource* n6b = move n6; }
+        bool live = n6 != nullptr;
+        int viaBool = -1;
+        if (live) { viaBool = n6->id; }
+        passed += Test("bool_alias_guard_narrowing", viaBool, 43);
+
+        // The same through the opposite polarity, with the deref in the else arm.
+        unique Resource* n7 = new Resource();
+        n7->id = 47;
+        if (RuntimeFalse()) { unique Resource* n7b = move n7; }
+        bool gone = n7 == nullptr;
+        int viaNegBool = -1;
+        if (gone) { viaNegBool = -2; } else { viaNegBool = n7->id; }
+        passed += Test("bool_alias_negated_guard_narrowing", viaNegBool, 47);
+
+        // An INDIRECT guard bool: the null test happens inside a helper, so nothing about the
+        // guard is interpretable - which is exactly the point, the rule never interprets it.
+        unique Resource* n8 = new Resource();
+        n8->id = 53;
+        if (RuntimeFalse()) { unique Resource* n8b = move n8; }
+        bool present = isNullResource(n8) == 0;
+        int viaHelper = -1;
+        if (present) { viaHelper = n8->id; }
+        passed += Test("indirect_bool_guard_narrowing", viaHelper, 53);
+
+        // The correlated-scrutinee guard: the move and the deref are guarded by two conditions on
+        // the SAME unrelated value, and the pointer is never mentioned in either. No amount of
+        // guard recognition can see this one - only the fact that the deref sits under a branch
+        // the move was not under. This is the shape that defeats every read-based rule.
+        int sel = RuntimeFalse() ? 200 : 1;
+        unique Resource* n9 = new Resource();
+        n9->id = 59;
+        if (sel > 100) { unique Resource* n9b = move n9; }
+        int viaCorrelated = -1;
+        if (sel <= 100) { viaCorrelated = n9->id; }
+        passed += Test("correlated_scrutinee_guard", viaCorrelated, 59);
+
+        // A TERMINATING guard rather than a skipping one: the branch does not step around the
+        // deref, it ends the process. Control dependence alone cannot see that (the deref still
+        // post-dominates the branch), so ComputePostDominators has to treat an exit()/abort()
+        // block as an end of the program. The exit is never reached at runtime here - the point
+        // of the leg is that it COMPILES.
+        unique Resource* n10 = new Resource();
+        n10->id = 61;
+        bool handedOff = false;
+        if (RuntimeFalse()) { unique Resource* n10b = move n10; handedOff = true; }
+        if (handedOff) { printf("unreachable handoff\n"); exit(1); }
+        passed += Test("terminating_guard_then_deref", n10->id, 61);
+
+        // Same terminating guard, but routed through a wrapper instead of a literal exit() call.
+        // Suppression here depends on the wrapper having been PROVEN never-returning when its
+        // body completed, which is why dieNow is defined above this function and not below it.
+        unique Resource* n11 = new Resource();
+        n11->id = 67;
+        bool handedOff2 = false;
+        if (RuntimeFalse()) { unique Resource* n11b = move n11; handedOff2 = true; }
+        if (handedOff2) { dieNow(); }
+        passed += Test("terminating_wrapper_guard_then_deref", n11->id, 67);
+    }
+    passed += Test("guard_legs_no_leak", dtorCount, 11);
 
     // A `unique` field reached through an interface's byte-offset slot gets the same store-site
     // guards as a direct field read: the flag rides the interface's field declaration, which the
@@ -1736,7 +1858,7 @@ extern int main()
     total += 7;
 
     passed += testUniqueField();
-    total += 56;
+    total += 68;
 
     passed += testParamStringToField();
     total += 1;

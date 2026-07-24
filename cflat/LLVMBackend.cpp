@@ -2489,6 +2489,10 @@ void LLVMBackend::ResetForReanalysis()
     // Left non-zero by an aborted compile mid-ternary, this would wrongly suppress the deref
     // guard for the next file's straight-line code.
     suppressExplicitNullDerefGuard_ = 0;
+    // Same hazard for the cross-block half: a stale event log from an aborted compile would
+    // misattribute the next file's deref diagnostic.
+    nullEventLog_.clear();
+    provenNoReturn_.clear();
     // Sibling of lastCallIsBonded: a per-call bond flag that, if left set by an aborted compile,
     // would mark the next file's first bonded value as by-address.
     lastCallBondByAddress = false;

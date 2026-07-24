@@ -1,6 +1,6 @@
 # '?:' (ternary) evaluates BOTH arms unconditionally, not just the selected one
 
-Opened while testing deref-of-moved-pointer-across-blocks-not-diagnosed.md (a same-block
+Opened while testing the cross-block moved-pointer deref diagnostic (a same-block
 dereference-of-explicitly-moved-pointer deref guard). Tripped over directly while writing
 regression coverage for that fix; unrelated to it and not caused or fixed by it.
 
@@ -38,7 +38,7 @@ extern int main() {
     unique R* k = new R();
     // ... k becomes null via some earlier control flow ...
     unique R* dummy = nullptr;
-    // (see deref-of-moved-pointer-across-blocks-not-diagnosed.md for a full move-then-branch
+    // (see deref-of-moved-pointer-guard-inside-callee.md for a full move-then-branch
     // setup that leaves k null here)
     int r = (k == nullptr) ? -1 : k->v;   // k->v is still COMPUTED even when the '-1' arm is
                                            // the one actually selected - segfaults if k is null
