@@ -15,4 +15,14 @@ expect_error("ternary branches have incompatible types") {
     }
 }
 
+// A CONDITION that is not a scalar has no truth value. An aggregate reached LLVM's branch /
+// select operand unchanged and died with the opaque "module verification failed" instead of a
+// source-level error naming the problem.
+expect_error("condition must be a scalar") {
+    int stringCondition() {
+        string s = "abc";
+        return s ? 1 : 0;
+    }
+}
+
 extern int main() { return 0; }

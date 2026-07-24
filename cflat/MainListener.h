@@ -10721,7 +10721,10 @@ public:
                     }
                 }
 
-                auto* selectValue = compiler->CreateSelect(condTv.value, falseValue, trueValue);
+                // LLVM's select requires an i1 condition; a non-bool CFlat condition
+                // (int, char, pointer, float) must be lowered the same way if/while do.
+                auto* selectCond = compiler->CoerceToBoolCondition(condTv.value);
+                auto* selectValue = compiler->CreateSelect(selectCond, falseValue, trueValue);
 
                 // Owning-string ternary: a branch that reads an owning string FIELD or a named
                 // owning local (`cond ? this.name : "-"`) yields a struct whose OWNED bit rides

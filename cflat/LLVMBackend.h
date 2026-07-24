@@ -13381,17 +13381,49 @@ public:
         return llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, "strcmp", module.get());
     }
 
+    /// <summary>
+    /// Lower an arbitrary scalar condition value to the i1 LLVM demands of a branch or a
+    /// select. Shared by the if/while/for path (CreateConditionJump) and by '?:'.
+    /// </summary>
+    llvm::Value* CoerceToBoolCondition(llvm::Value* cond)
+    {
+        if (cond == nullptr || cond->getType()->isIntegerTy(1))
+            return cond;
+
+        if (cond->getType()->isPointerTy())
+            return builder->CreateIsNotNull(cond);
+
+        if (cond->getType()->isFloatingPointTy())
+        {
+            // Non-zero (and non-NaN-equal) floating point is true.
+            return builder->CreateFCmpUNE(cond, llvm::ConstantFP::get(cond->getType(), 0.0), "tobool");
+        }
+
+        if (cond->getType()->isIntegerTy())
+            return builder->CreateICmpNE(cond, llvm::ConstantInt::get(cond->getType(), 0), "tobool");
+
+        // An aggregate (a `string`, any struct) has no truth value. Diagnose it here rather than
+        // handing it to CreateCondBr / CreateSelect, which fails module verification opaquely.
+        LogError(std::format(
+            "condition must be a scalar (bool, integer, pointer or floating point), not '{}'"
+            " - compare it explicitly",
+            DescribeConditionType(cond->getType())));
+        return builder->getFalse();
+    }
+
+    // Short type name for a rejected condition operand.
+    std::string DescribeConditionType(llvm::Type* t) const
+    {
+        if (auto* st = llvm::dyn_cast<llvm::StructType>(t))
+            return st->hasName() ? st->getName().str() : std::string("struct");
+        if (t->isArrayTy())  return "array";
+        if (t->isVectorTy()) return "vector";
+        return "value";
+    }
+
     llvm::BranchInst* CreateConditionJump(llvm::Value* cond, llvm::BasicBlock* trueBlock, llvm::BasicBlock* falseBlock)
     {
-        if (cond->getType()->isPointerTy())
-        {
-            cond = builder->CreateIsNotNull(cond);
-        }
-        else if (!cond->getType()->isIntegerTy(1))
-        {
-            // Convert non-boolean integer to i1 (nonzero = true)
-            cond = builder->CreateICmpNE(cond, llvm::ConstantInt::get(cond->getType(), 0), "tobool");
-        }
+        cond = CoerceToBoolCondition(cond);
 
         auto branchInst = builder->CreateCondBr(cond, trueBlock, falseBlock);
         builder->SetInsertPoint(trueBlock);
