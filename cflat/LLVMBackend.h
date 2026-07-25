@@ -812,6 +812,10 @@ public:
         // Move-dataflow treats index/deref lvalues as untracked (permissive), so USE-recording
         // skips these - moving out of a container slot is neither checked nor flagged.
         bool IsElementAccess = false;
+        // compile-time: Storage points at a SPILL of a by-value temporary (an inline array field
+        // extracted out of a returned temp). The copy is shallow and dies with the full expression,
+        // so reads are fine but 'move' and stores through it are rejected.
+        bool IsTempSpillStorage = false;
 
         llvm::Value* GetValue() const
         {
@@ -1044,6 +1048,18 @@ public:
         bool IsOwningPtr = false;
     };
     std::vector<OwnedReturnTemp> ownedReturnTemps_;
+
+    // Owning-POINTER SSA values produced by `new`, keyed by value identity, plus any value they
+    // propagate onto (a '?:' phi/select whose arm is one). Lets a `unique T*` assignment ask
+    // "does the RHS VALUE carry ownership" instead of "what does the RHS look like". Detection
+    // only: nothing here is freed, and a value reaching a call's RESULT is a different value, so
+    // `b = addr(new R())` (borrow return) is never in it. Retired each full expression.
+    std::vector<llvm::Value*> ownedNewTemps_;
+
+    // Concrete element (class) TypeName behind a pointer SSA value produced by `new`, keyed by
+    // value identity. A '?:' phi carries no NamedVariable TypeName, so the interface upcast
+    // recovers each arm's class from here. Retired with ownedNewTemps_.
+    std::vector<std::pair<llvm::Value*, std::string>> valueElementTypeNames_;
 
     // Lambda literals with unclaimed heap envs (no named owner). Closure analog of
     // pendingOwnedStringTemps; freed at end-of-full-expression by FlushOwnedClosureTemps.
@@ -2007,6 +2023,50 @@ private:
         pendingOwnedPtrTemps.push_back({ value, e->TypeName, e->AllocAlign, builder->GetInsertBlock() });
     }
 
+    // Ledger a `new` result (see ownedNewTemps_). Detection only - never drives a free.
+    void RegisterOwnedNewTemp(llvm::Value* value)
+    {
+        if (value == nullptr || !value->getType()->isPointerTy()) return;
+        if (IsOwnedNewTemp(value)) return;
+        ownedNewTemps_.push_back(value);
+    }
+
+    bool IsOwnedNewTemp(llvm::Value* value) const
+    {
+        if (value == nullptr) return false;
+        return std::find(ownedNewTemps_.begin(), ownedNewTemps_.end(), value) != ownedNewTemps_.end();
+    }
+
+    // Carry the owning bit from an arm value onto a derived value ('?:' phi / select result).
+    void PropagateOwnedNewTemp(llvm::Value* from, llvm::Value* to)
+    {
+        if (IsOwnedNewTemp(from)) RegisterOwnedNewTemp(to);
+    }
+
+    // Ledger the class a `new` result points at (see valueElementTypeNames_).
+    void RegisterValueElementTypeName(llvm::Value* value, const std::string& typeName)
+    {
+        if (value == nullptr || typeName.empty() || !value->getType()->isPointerTy()) return;
+        for (auto& entry : valueElementTypeNames_)
+            if (entry.first == value) { entry.second = typeName; return; }
+        valueElementTypeNames_.push_back({ value, typeName });
+    }
+
+    std::string FindValueElementTypeName(llvm::Value* value) const
+    {
+        if (value == nullptr) return {};
+        for (const auto& entry : valueElementTypeNames_)
+            if (entry.first == value) return entry.second;
+        return {};
+    }
+
+    // A named owner adopted the value; retire the entry so nothing else claims it.
+    void ConsumeOwnedNewTemp(llvm::Value* value)
+    {
+        if (value == nullptr) return;
+        std::erase(ownedNewTemps_, value);
+    }
+
     void UnregisterOwnedPtrTemp(llvm::Value* value)
     {
         if (value == nullptr) return;
@@ -2345,8 +2405,10 @@ private:
         // Last: freeing a pointer temp opens blocks, which would move the insert point out from
         // under the value-based flushes above.
         FlushOwnedPtrTemps();
-        // Detection-only ledger: end of a full expression retires its owning-return results.
+        // Detection-only ledgers: end of a full expression retires its owning results.
         ownedReturnTemps_.clear();
+        ownedNewTemps_.clear();
+        valueElementTypeNames_.clear();
     }
 
     // Release the resource a single named local owns, exactly as scope-exit cleanup does. Borrows,
@@ -8018,6 +8080,8 @@ public:
         std::vector<PendingOwnedStructTemp> pendingStructTemps;
         std::vector<PendingOwnedPtrTemp> pendingPtrTemps;
         std::vector<OwnedReturnTemp> ownedReturnTemps;
+        std::vector<llvm::Value*> ownedNewTemps;
+        std::vector<std::pair<llvm::Value*, std::string>> valueElementTypeNames;
     };
 
     BuilderState SaveBuilderState()
@@ -8031,11 +8095,15 @@ public:
         s.pendingStructTemps  = std::move(pendingOwnedStructTemps);
         s.pendingPtrTemps     = std::move(pendingOwnedPtrTemps);
         s.ownedReturnTemps    = std::move(ownedReturnTemps_);
+        s.ownedNewTemps       = std::move(ownedNewTemps_);
+        s.valueElementTypeNames = std::move(valueElementTypeNames_);
         pendingOwnedStringTemps.clear();
         pendingOwnedClosureTemps.clear();
         pendingOwnedStructTemps.clear();
         pendingOwnedPtrTemps.clear();
         ownedReturnTemps_.clear();
+        ownedNewTemps_.clear();
+        valueElementTypeNames_.clear();
         return s;
     }
 
@@ -8053,6 +8121,8 @@ public:
         pendingOwnedStructTemps  = state.pendingStructTemps;
         pendingOwnedPtrTemps     = state.pendingPtrTemps;
         ownedReturnTemps_        = state.ownedReturnTemps;
+        ownedNewTemps_           = state.ownedNewTemps;
+        valueElementTypeNames_   = state.valueElementTypeNames;
     }
 
     // True if `name` is a type projected from an imported .winmd (always fully qualified) or a
@@ -10558,23 +10628,77 @@ public:
 
     // Wraps a raw i8* string literal pointer in a string struct { _ptr, _len } by value.
     // Called automatically when assigning a string literal to a string-typed variable.
+    // For a runtime (non-literal) char*, the length is not known at compile time: derive it
+    // via `operator string(const char*)` if available (matches the runtime coercion used
+    // elsewhere), else fall back to a direct strlen call. Never sets the OWNED bit - the
+    // result is a non-owning borrow over the caller's buffer.
     llvm::Value* WrapStringLiteralAsString(llvm::Value* strLitPtr)
     {
         auto* strTy = llvm::StructType::getTypeByName(*context, "string");
         if (!strTy) return strLitPtr;
 
-        int32_t len = 0;
-        if (auto* c = llvm::dyn_cast<llvm::Constant>(strLitPtr))
+        auto* c = llvm::dyn_cast<llvm::Constant>(strLitPtr);
+        if (c)
         {
             auto it = stringLiteralLenByPtr.find(c);
             if (it != stringLiteralLenByPtr.end())
-                len = it->second;
+            {
+                llvm::Value* strVal = llvm::UndefValue::get(strTy);
+                strVal = builder->CreateInsertValue(strVal, strLitPtr, { 0u });
+                strVal = builder->CreateInsertValue(strVal, builder->getInt32(it->second), { 1u });
+                return strVal;
+            }
         }
+
+        // Not a known literal: derive the length at runtime. Requires an active insert point
+        // (no builder block at file scope) - fall back to a zero-length wrap rather than crash.
+        if (builder->GetInsertBlock() == nullptr)
+        {
+            llvm::Value* strVal = llvm::UndefValue::get(strTy);
+            strVal = builder->CreateInsertValue(strVal, strLitPtr, { 0u });
+            strVal = builder->CreateInsertValue(strVal, builder->getInt32(0), { 1u });
+            return strVal;
+        }
+
+        if (GetFunction("operator string"))
+        {
+            // Save/restore the post-call flag channel: this injected call must not clobber
+            // flags the caller is mid-statement consuming from its own pending call.
+            TypeAndValue savedReturnType = lastCallReturnType;
+            bool savedReturnsOwned = lastCallReturnsOwned;
+
+            NamedVariable argNV;
+            argNV.Primary = strLitPtr;
+            argNV.BaseType = strLitPtr->getType();
+            argNV.TypeAndValue.TypeName = "char";
+            argNV.TypeAndValue.Pointer = true;
+            llvm::Value* result = CreateOverloadedFunctionCall("operator string", { argNV });
+
+            lastCallReturnType = savedReturnType;
+            lastCallReturnsOwned = savedReturnsOwned;
+            return result;
+        }
+
+        // No operator string overload registered (string.cb not imported): derive length
+        // via a direct strlen call, non-owning.
+        auto* strlenFn = GetOrDeclareStrlen();
+        auto* len64 = builder->CreateCall(strlenFn, { strLitPtr }, "charptr_strlen");
+        auto* len32 = builder->CreateTrunc(len64, builder->getInt32Ty(), "charptr_len32");
 
         llvm::Value* strVal = llvm::UndefValue::get(strTy);
         strVal = builder->CreateInsertValue(strVal, strLitPtr, { 0u });
-        strVal = builder->CreateInsertValue(strVal, builder->getInt32(len), { 1u });
+        strVal = builder->CreateInsertValue(strVal, len32, { 1u });
         return strVal;
+    }
+
+    llvm::Function* GetOrDeclareStrlen()
+    {
+        if (auto* fn = module->getFunction("strlen"))
+            return fn;
+        auto* i64Ty = builder->getInt64Ty();
+        auto* ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto* fnTy = llvm::FunctionType::get(i64Ty, { ptrTy }, false);
+        return llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, "strlen", module.get());
     }
 
     // Deep-copy a string VALUE into a freshly heap-allocated, NUL-terminated owned buffer
@@ -12960,6 +13084,17 @@ public:
         }
     }
 
+    // True for a struct-typed operand that is NOT one of the fat-pointer carriers, which
+    // have their own field-extract comparison against nullptr.
+    static bool IsPlainStructOperand(llvm::Value* v)
+    {
+        auto* st = v ? llvm::dyn_cast<llvm::StructType>(v->getType()) : nullptr;
+        if (!st) return false;
+        if (st->isLiteral() || !st->hasName()) return true;
+        std::string n = st->getName().str();
+        return n != "__iface_fat_ptr" && n != "__closure_fat_ptr";
+    }
+
     llvm::Value* CreateOperation(std::string oper, llvm::Value* left, llvm::Value* right)
     {
         if (left == nullptr)
@@ -13044,8 +13179,17 @@ public:
                 intVal = Upconvert(intVal, i64Ty);
                 return builder->CreateGEP(builder->getInt8Ty(), ptrVal, intVal, "ptrarith");
             }
+            case Operation::Equal:
+            case Operation::NotEqual:
+                // Backstop: ptr vs a plain struct value can never form a valid icmp. Without this
+                // the integer path below emits mismatched operands and fails module verification.
+                // Fat-ptr structs are excluded - they legitimately compare by extracted field.
+                if (IsPlainStructOperand(left) || IsPlainStructOperand(right))
+                    LogError("cannot compare a pointer with a struct value - declare an 'operator==' whose first "
+                             "parameter is the pointer type, or dereference the pointer");
+                break;
             default:
-                break;  // ==, !=, logical ops, etc. fall through to the integer path below
+                break;  // logical ops, etc. fall through to the integer path below
             }
         }
 

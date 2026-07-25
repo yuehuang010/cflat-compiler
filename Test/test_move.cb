@@ -1495,6 +1495,49 @@ int testUniqueLocalReassignMove()
     }
     passed += Test("unique_reassign_borrow_call_not_adopted", dtorCount, 1);
 
+    // A '?:' is a transparent wrapper: an owning `new` in the TAKEN arm reaches the assignment
+    // as the ternary's RESULT value, so the unique local adopts it and frees it exactly once.
+    dtorCount = 0;
+    {
+        bool takeNew = true;
+        unique Resource* t0 = nullptr;
+        t0 = takeNew ? new Resource() : nullptr;
+        passed += Test("unique_reassign_ternary_new_no_early_free", dtorCount, 0);
+    }
+    passed += Test("unique_reassign_ternary_new_freed_once", dtorCount, 1);
+
+    // The other arm is taken at runtime: nothing was allocated, so nothing may be freed.
+    dtorCount = 0;
+    {
+        bool takeNew = false;
+        unique Resource* t1 = nullptr;
+        t1 = takeNew ? new Resource() : nullptr;
+    }
+    passed += Test("unique_reassign_ternary_untaken_arm_no_free", dtorCount, 0);
+
+    // Both arms allocate, but '?:' branches for real - only the selected arm runs, so exactly
+    // one object exists and it is freed once.
+    dtorCount = 0;
+    {
+        bool takeFirst = true;
+        unique Resource* t2 = nullptr;
+        t2 = takeFirst ? new Resource() : new Resource();
+    }
+    passed += Test("unique_reassign_ternary_both_arms_freed_once", dtorCount, 1);
+
+    // The ternary's owning bit must ride the RESULT value only: a `new` wrapped in a '?:' that
+    // sits in ARGUMENT position still feeds a BORROW return, which must not be adopted.
+    dtorCount = 0;
+    {
+        bool useNew = true;
+        unique Resource* t3 = new Resource();
+        t3->id = 9;
+        unique Resource* t4 = nullptr;
+        t4 = borrowFirstResource(t3, useNew ? new Resource() : nullptr);
+        passed += Test("unique_reassign_ternary_arg_borrow_value", t4->id, 9);
+    }
+    passed += Test("unique_reassign_ternary_arg_borrow_not_adopted", dtorCount, 1);
+
     return passed;
 }
 
@@ -1640,6 +1683,225 @@ int testRValuePrefersMoveOverload()
     g_rvalCopies = 0;
     passed += Test("named_lvalue_explicit_move_picks_move", rvalPick(move u), 2);
     passed += Test("named_lvalue_explicit_move_no_copy", g_rvalCopies, 0);
+
+    return passed;
+}
+
+/*
+ * Reassignment of a `unique <interface>` LOCAL. The owning-source test for this leg used the
+ * sticky global `lastOwningResult`, which a `new` ANYWHERE in the RHS sets - including in call
+ * ARGUMENT position - so `k = pick(g, new SqMove())` adopted a borrow of `g` and both handles
+ * freed it (exit 134). The reject is now keyed to the RHS shape itself, and the borrow form is
+ * a compile error (err_unique_iface_stack_box). These legs pin that the three genuinely owning
+ * forms still transfer and free exactly once.
+ */
+interface IShapeMove { int area(); };
+int sqMoveCtorCount = 0;
+class SqMove : IShapeMove
+{
+    int s = 0;
+    SqMove() { sqMoveCtorCount = sqMoveCtorCount + 1; }
+    int area() { return s * s; }
+    ~SqMove() { dtorCount = dtorCount + 1; }
+};
+
+move IShapeMove makeShapeMove() { return new SqMove(); }
+
+int ciMoveCtorCount = 0;
+class CiMove : IShapeMove
+{
+    int r = 0;
+    CiMove() { ciMoveCtorCount = ciMoveCtorCount + 1; }
+    int area() { return r + 7; }
+    ~CiMove() { dtorCount = dtorCount + 1; }
+};
+
+bool identityBool(bool b) { return b; }
+
+/*
+ * A '?:' RHS bound to an INTERFACE slot. The ternary result carries no concrete TypeName, so the
+ * struct -> fat-pointer upcast used to be skipped and a raw pointer was bitcast into the fat
+ * struct (invalid IR). Each arm is now boxed inside its own branch, so arms with different
+ * concrete classes work too - and only the taken arm allocates.
+ */
+int testUniqueInterfaceTernary()
+{
+    int passed = 0;
+
+    // Declaration initializer, non-null arm taken: adopted, freed exactly once.
+    dtorCount = 0;
+    {
+        unique IShapeMove k = identityBool(true) ? new SqMove() : nullptr;
+        passed += Test("unique_iface_ternary_decl_area", k.area(), 0);
+        passed += Test("unique_iface_ternary_decl_alive", dtorCount, 0);
+    }
+    passed += Test("unique_iface_ternary_decl_freed_once", dtorCount, 1);
+
+    // Null arm taken: nothing allocated, nothing freed.
+    dtorCount = 0;
+    {
+        unique IShapeMove k = identityBool(false) ? new SqMove() : nullptr;
+    }
+    passed += Test("unique_iface_ternary_decl_null_no_free", dtorCount, 0);
+
+    // Reassignment leg: the old (null) box is released, the new one adopted and freed once.
+    dtorCount = 0;
+    {
+        unique IShapeMove k = nullptr;
+        k = identityBool(true) ? new SqMove() : nullptr;
+        passed += Test("unique_iface_ternary_assign_alive", dtorCount, 0);
+    }
+    passed += Test("unique_iface_ternary_assign_freed_once", dtorCount, 1);
+
+    // Different concrete classes per arm: only the taken arm is constructed and freed.
+    dtorCount = 0;
+    ciMoveCtorCount = 0;
+    sqMoveCtorCount = 0;
+    {
+        unique IShapeMove k = identityBool(false) ? new SqMove() : new CiMove();
+        passed += Test("unique_iface_ternary_mixed_area", k.area(), 7);
+        passed += Test("unique_iface_ternary_mixed_taken_arm", ciMoveCtorCount, 1);
+        passed += Test("unique_iface_ternary_mixed_untaken_arm", sqMoveCtorCount, 0);
+    }
+    passed += Test("unique_iface_ternary_mixed_freed_once", dtorCount, 1);
+
+    // Both arms null: owns nothing, no free, no crash.
+    dtorCount = 0;
+    {
+        unique IShapeMove k = identityBool(true) ? nullptr : nullptr;
+    }
+    passed += Test("unique_iface_ternary_both_null", dtorCount, 0);
+
+    // Non-unique interface local takes the same upcast path; it does not own, so free by hand.
+    dtorCount = 0;
+    {
+        IShapeMove k = identityBool(true) ? new SqMove() : nullptr;
+        passed += Test("iface_ternary_plain_decl_area", k.area(), 0);
+        delete k;
+    }
+    passed += Test("iface_ternary_plain_decl_freed_once", dtorCount, 1);
+
+    return passed;
+}
+
+int testUniqueInterfaceReassign()
+{
+    int passed = 0;
+
+    // Direct `new` RHS: the local adopts the box and frees it once at scope exit.
+    dtorCount = 0;
+    {
+        unique IShapeMove k = nullptr;
+        k = new SqMove();
+        passed += Test("unique_iface_reassign_new_alive", dtorCount, 0);
+    }
+    passed += Test("unique_iface_reassign_new_freed_once", dtorCount, 1);
+
+    // A move-returning call transfers ownership through lastCallReturnsOwned.
+    dtorCount = 0;
+    {
+        unique IShapeMove k = nullptr;
+        k = makeShapeMove();
+        passed += Test("unique_iface_reassign_movecall_alive", dtorCount, 0);
+    }
+    passed += Test("unique_iface_reassign_movecall_freed_once", dtorCount, 1);
+
+    // `move` of an OWNING interface local: the source is consumed, so exactly one free.
+    dtorCount = 0;
+    {
+        unique IShapeMove g = new SqMove();
+        unique IShapeMove k = nullptr;
+        k = move g;
+        passed += Test("unique_iface_reassign_move_alive", dtorCount, 0);
+    }
+    passed += Test("unique_iface_reassign_move_freed_once", dtorCount, 1);
+
+    // Reassigning an already-owning slot frees the OLD box at the store, the new one at exit.
+    dtorCount = 0;
+    {
+        unique IShapeMove k = new SqMove();
+        k = new SqMove();
+        passed += Test("unique_iface_reassign_drops_old_at_assign", dtorCount, 1);
+    }
+    passed += Test("unique_iface_reassign_old_and_new_freed_once", dtorCount, 2);
+
+    return passed;
+}
+
+/*
+ * `_ = <call>();` on a `move T*`-returning function. The discarded thing is the RETURNED
+ * POINTER, so the destructor must run against that pointer and the block must be freed. It
+ * used to spill the pointer VALUE into a temp and destruct the pointer's own bits as if they
+ * were the object: the real allocation leaked and the dtor body ran on a wild address.
+ */
+int discardDtorCount = 0;
+int discardSeenValue = 0;
+
+struct DiscardProbe
+{
+    int v = 0;
+    ~DiscardProbe()
+    {
+        discardDtorCount = discardDtorCount + 1;
+        discardSeenValue = v;
+    }
+};
+
+move DiscardProbe* makeDiscardProbe()
+{
+    DiscardProbe* p = new DiscardProbe();
+    p->v = 7;
+    return p;
+}
+
+int discardOwnerDtorCount = 0;
+int discardOwnerNameOk = 0;
+
+// Owning-member variant: the generated teardown frees `name`. If the dtor ran against a wild
+// address this would free an arbitrary pointer instead of this object's buffer.
+struct DiscardOwner
+{
+    string name = default;
+    int tag = 0;
+    ~DiscardOwner()
+    {
+        discardOwnerDtorCount = discardOwnerDtorCount + 1;
+        if (name == "payload" && tag == 9)
+            discardOwnerNameOk = 1;
+    }
+};
+
+move DiscardOwner* makeDiscardOwner()
+{
+    DiscardOwner* p = new DiscardOwner();
+    p->name = "pay" + "load";
+    p->tag = 9;
+    return p;
+}
+
+int testDiscardMoveReturningCall()
+{
+    int passed = 0;
+
+    discardDtorCount = 0;
+    discardSeenValue = 0;
+    _ = makeDiscardProbe();
+    passed += Test("discard_move_ptr_freed_once", discardDtorCount, 1);
+    passed += Test("discard_move_ptr_dtor_sees_field", discardSeenValue, 7);
+
+    discardOwnerDtorCount = 0;
+    discardOwnerNameOk = 0;
+    _ = makeDiscardOwner();
+    passed += Test("discard_move_owner_freed_once", discardOwnerDtorCount, 1);
+    passed += Test("discard_move_owner_member_intact", discardOwnerNameOk, 1);
+
+    // Two discards in a row: each call frees its OWN result, no cross-talk.
+    discardDtorCount = 0;
+    discardSeenValue = 0;
+    _ = makeDiscardProbe();
+    _ = makeDiscardProbe();
+    passed += Test("discard_move_ptr_freed_each_time", discardDtorCount, 2);
+    passed += Test("discard_move_ptr_field_still_right", discardSeenValue, 7);
 
     return passed;
 }
@@ -1962,7 +2224,7 @@ extern int main()
     total += 11;
 
     passed += testUniqueLocalReassignMove();
-    total += 17;
+    total += 23;
 
     passed += testValueMoveArgDeferred();
     total += 5;
@@ -1975,6 +2237,15 @@ extern int main()
 
     passed += testTernaryArmsShortCircuit();
     total += 18;
+
+    passed += testUniqueInterfaceReassign();
+    total += 8;
+
+    passed += testUniqueInterfaceTernary();
+    total += 13;
+
+    passed += testDiscardMoveReturningCall();
+    total += 6;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

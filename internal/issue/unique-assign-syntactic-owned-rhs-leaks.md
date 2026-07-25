@@ -1,39 +1,27 @@
-# `unique` local assignment adopts ownership only from SYNTACTIC RHS shapes - indirect forms leak
+# `unique` assignment: owning value laundered through a BORROW-returning call still leaks
 
-Filed 2026-07-24, surfaced while fixing `unique-pointer-reassign-via-move-loses-ownership.md`
-(fixed in d33b9cf). These shapes leaked on master before that commit too - d33b9cf neither
-caused nor fixed them - but they are the direct residual of the formulation it chose, so they
-belong together.
+Filed 2026-07-24. Narrowed 2026-07-24 after the `?:` leg was fixed by the `ownedNewTemps_`
+value-identity ledger, and again after the `unique` INTERFACE ternary was fixed by the
+`valueElementTypeNames_` ledger; the remaining residual is the borrow-return chain.
 
-## Summary
+## Status
 
-d33b9cf made `unique T*` local reassignment adopt ownership using a deliberately SYNTACTIC test
-(MainListener.h:9635-9645):
+FIXED: the `?:` leg. `unique T*` local reassignment now also adopts when the RHS VALUE is a
+still-live entry in `ownedNewTemps_` (LLVMBackend.h) - a `new` result, propagated onto a `?:`
+phi/select at `MainListener.h` `ParseTernaryBranches` / `ParseConditionalExpression`. Pinned by
+`unique_reassign_ternary_*` in `Test/test_move.cb`.
 
-```cpp
-bool srcIsOwnedPtrRhs = AsDirectNew(assignCtx) != nullptr
-    || TopLevelMoveExpression(assignCtx) != nullptr
-    || compiler->lastCallReturnsOwned;
-```
+FIXED: the `unique` INTERFACE ternary (`unique IShape k = cond ? new Sq() : nullptr;`). It was
+never an ownership bug - the interface upcast keys off `rightNV.TypeAndValue.TypeName`, which a
+`?:` phi does not carry, so a raw `ptr` was bitcast into `%__iface_fat_ptr`. `new` now ledgers its
+concrete class by value identity (`valueElementTypeNames_`), and `UpcastTernaryPhiToInterface`
+boxes each arm inside the arm's own branch, joining the fat pointers with a second phi - which
+also handles arms of DIFFERENT concrete classes. Pinned by `unique_iface_ternary_*` /
+`iface_ternary_*` in `Test/test_move.cb` and `Test/test_interface.cb`.
 
-`AsDirectNew` and `TopLevelMoveExpression` are strict single-child chain walks, so they cannot
-see through any wrapper. That strictness is load-bearing and CORRECT - it is exactly what stops
-a `new` nested in a call argument (`b = addr(new R());`) from marking a borrow-returning call's
-result as owned, which was a double-free found in review. The cost is that an owning value
-reaching the RHS through any indirection is not adopted, and leaks.
+RESIDUAL: the one item below.
 
-## Repros (both verified against d33b9cf: exit 0, no dtor printed)
-
-```cflat
-struct R { int v = 0; ~R() { printf("dtor\n"); } };
-extern int main()
-{
-    bool cond = true;
-    unique R* b = nullptr;
-    b = cond ? new R() : nullptr;      // owning `new` inside a ternary arm - LEAKS
-    return 0;
-}
-```
+## Residual - owning call laundered through a borrow-returning method (LEAKS)
 
 ```cflat
 struct R { int v = 0; ~R() { printf("dtor\n"); }  R* self() { return this; } };
@@ -41,41 +29,28 @@ move R* make() { return new R(); }
 extern int main()
 {
     unique R* b = nullptr;
-    b = make()->self();                // owning call laundered through a borrow-returning
-    return 0;                          // method - LEAKS
+    b = make()->self();                // owning temp from make() is never freed - LEAKS
+    return 0;
 }
 ```
 
-Harm is LEAK, not corruption. Erring toward the leak was the intended trade: the alternative
-(a looser test) produced a free of a global's address.
+`self()` returns a BORROW. Its result is a DIFFERENT SSA value from `make()`'s owning result, so
+no value-identity ledger can see it as owning - which is the point: adopting a borrow-returning
+call's result is only sound if the result provably aliases the owning temp, and nothing proves
+that in general. Adopting it unconditionally would double-free (`make()`'s temp is separately
+eligible for `pendingOwnedPtrTemps` cleanup). Harm here is a LEAK, and a leak is the accepted
+trade; a double free is not. Leave it leaking unless an alias proof exists.
 
-## What IS covered, for contrast
+## What IS covered
 
-- `b = new R();` - direct new, adopted.
-- `b = move a;` - top-level move, adopted.
-- `b = makeOwned();` - direct owning call, adopted via `lastCallReturnsOwned`.
-- `b = (R*)make();` - cast around an owning call, adopted (the `lastCallReturnsOwned` leg
-  survives the cast). Note this one LEAKED on master and is fixed by d33b9cf.
-- `b = addr(new R());` - correctly NOT adopted (the `new` is an argument, not the result).
+- `b = new R();`, `b = move a;`, `b = makeOwned();`, `b = (R*)make();` - adopted.
+- `b = cond ? new R() : nullptr;` and `b = cond ? new R() : new R();` - adopted (this fix).
+- `b = addr(new R());` - correctly NOT adopted (the `new` is an ARGUMENT; the RHS result value is
+  the borrow-returning call's own result). Also pinned for the ternary-in-argument shape
+  (`borrowFirstResource(t3, useNew ? new Resource() : nullptr)`).
 
-## Fix direction
-
-The principled version is to stop asking "what does the RHS look like" and instead ask "does the
-RHS's resulting VALUE carry ownership" - i.e. propagate an owning-ness bit on the value itself
-through ternary arms, casts, and borrow-returning method chains, the way
-`ownedReturnTemps_` already ledgers owning call results by value identity for the
-mandatory-nodiscard check.
-
-That ledger is the natural vehicle: if the RHS value is a still-unconsumed entry in
-`ownedReturnTemps_`, the assignment should adopt it and consume the entry. The ternary case
-additionally needs the ledger entry propagated from whichever arm produced it to the select
-result (`internal/issue/nodiscard-residual-gaps.md` and the owned-pointer-temp work touch the
-same propagation point).
-
-Do NOT fix this by loosening `AsDirectNew` / `TopLevelMoveExpression` to look through wrappers -
-that reintroduces the `b = addr(new R());` double free.
+Do NOT fix any of this by loosening `AsDirectNew` / `TopLevelMoveExpression` to look through
+wrappers - that reintroduces the `b = addr(new R());` double free. Ask whether the RHS's
+resulting VALUE carries ownership, not what the RHS looks like.
 
 Ties into `internal/plan/ownership-transparent-assignment.md`.
-
-Regression test: extend `Test/test_move.cb`'s `testUniqueLocalReassignMove` with dtor-count legs
-for both shapes.

@@ -5,8 +5,19 @@
 // 'Math.sin(nullary() * 0.5)' tripped an LLVM assert inside fmul.
 
 import "math.cb";
+import "string.cb";
 
 double nullary() { return 3.14; }
+
+struct P { int v = 0; int getv() { return this->v; } };
+
+interface IShape { int area(); };
+
+class Sq : IShape
+{
+    int s = 0;
+    int area() { return this->s * this->s; }
+};
 
 // Scalar conversion path (CreateCast): declaration initializer.
 expect_error("is a function used as a value") {
@@ -32,6 +43,57 @@ expect_error("is a function used as a value") {
     {
         double s = Math.sin * 2.0;
         return 0;
+    }
+}
+
+// Member access that NAMES a method without '()'. Used to return an empty
+// NamedVariable that every caller dereferenced -> raw SIGSEGV, no diagnostic.
+expect_error("'getv' is a method of 'P'") {
+    int test_struct_method_no_parens()
+    {
+        P p = default;
+        return (int)p.getv;
+    }
+}
+
+// Same shape on a core type - 'length' is a method of string, not a field.
+expect_error("'length' is a method of 'string'") {
+    int test_string_method_no_parens()
+    {
+        string t = "lit";
+        return (int)t.length;
+    }
+}
+
+// Interface receiver: the method name resolves through the vtable contract, not
+// a field, and went down the same crashing path.
+expect_error("'area' is a method of 'IShape'") {
+    int test_interface_method_no_parens()
+    {
+        Sq* q = new Sq();
+        IShape i = q;
+        return (int)i.area;
+    }
+}
+
+// Discarded expression statement: no cast to crash on, but the method name was
+// silently dropped instead of diagnosed.
+expect_error("'getv' is a method of 'P'") {
+    int test_method_no_parens_discarded()
+    {
+        P p = default;
+        p.getv;
+        return 0;
+    }
+}
+
+// Primitive UFCS receiver: the base value stayed live and the method name was
+// silently dropped, so '(int)n.toString' compiled to just 'n'.
+expect_error("'toString' is a method of 'int'") {
+    int test_primitive_ufcs_no_parens()
+    {
+        int n = 5;
+        return (int)n.toString;
     }
 }
 

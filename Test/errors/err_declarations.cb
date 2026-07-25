@@ -62,6 +62,18 @@ expect_error("no overload of 'operator string'") {
     }
 }
 
+// A raw-pointer left operand with a struct right operand and no matching overload used to
+// fall through to the builtin comparison and emit a malformed icmp (ptr vs struct).
+expect_error("no overload of 'operator==' matches operands 'Point*' and 'Point'") {
+    int test_ptr_vs_struct_no_overload()
+    {
+        Point p;
+        Point* pp = &p;
+        if (pp == p) { return 1; }
+        return 0;
+    }
+}
+
 extern int main()
 {
     return 0;

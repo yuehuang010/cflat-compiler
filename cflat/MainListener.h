@@ -5374,6 +5374,30 @@ public:
                                     compiler->currentFunctionReturnTV.AllocAlignValue, returnNV.AllocAlignment));
                         }
 
+                        /*
+                         * Returning a closure read from a FIELD / ELEMENT (`return p->get;`), the
+                         * mirror of the decl-init clone. A whole-variable closure local returns by
+                         * move (its storage is handed to the caller and its dtor suppressed), but a
+                         * field read has no such transfer: the raw TAGGED OWNED env would be handed
+                         * to the caller while the struct still owns it, and both free it. Clone so
+                         * the caller gets an independent env; a `move` source already transferred.
+                         */
+                        if (right != nullptr
+                            && right->getType()->isStructTy()
+                            && returnNV.TypeAndValue.TypeName == "__closure_fat_ptr"
+                            && !returnNV.TypeAndValue.IsMove
+                            && returnNV.Storage != nullptr
+                            && !llvm::isa<llvm::AllocaInst>(returnNV.Storage)
+                            && !llvm::isa<llvm::GlobalVariable>(returnNV.Storage))
+                        {
+                            LLVMBackend::NamedVariable srcNV;
+                            srcNV.Storage  = returnNV.Storage;
+                            srcNV.BaseType = compiler->GetClosureFatPtrType();
+                            srcNV.TypeAndValue.TypeName = "__closure_fat_ptr";
+                            if (auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
+                                right = cloned;
+                        }
+
                         // Clear flags consumed by the return check.
                         compiler->lastOwningResult = false;
                         compiler->lastAllocAlignment = 0;
@@ -7676,6 +7700,7 @@ public:
                 bool srcIsBorrowed = false;
                 std::string srcBorrowedOrigin;
                 std::string srcBorrowedUniqueField; // "Struct.field" when the borrow came from a `unique` field
+                std::string srcBorrowedField;       // RHS field name, when the borrow came through a field read
                 bool srcIsOwningMove = false;       // RHS is an owning pointer (move param or alias thereof via cast)
                 std::string srcOwningName;          // name of the original owning source, for nulling on transfer
                 // Concrete type inferred from the initializer, used to resolve an 'auto'
@@ -7866,7 +7891,12 @@ public:
                                 // Catch the case where the RHS is a known type that doesn't implement the interface.
                                 bool rhsIsKnownType = !structName.empty() &&
                                     (compiler->dataStructures.count(structName) || compiler->programTable.count(structName));
-                                if (rhsIsKnownType && !compiler->StructImplementsInterface(structName, typeAndValue.TypeName))
+                                // A '?:' result carries no TypeName: box each arm in its own branch.
+                                llvm::Value* ternaryFat = structName.empty()
+                                    ? UpcastTernaryPhiToInterface(right, typeAndValue.TypeName) : nullptr;
+                                if (ternaryFat != nullptr)
+                                    right = ternaryFat;
+                                else if (rhsIsKnownType && !compiler->StructImplementsInterface(structName, typeAndValue.TypeName))
                                 {
                                     LogErrorContext(assignmentExpression,
                                         std::format("'{}' does not implement interface '{}'", structName, typeAndValue.TypeName));
@@ -7984,6 +8014,7 @@ public:
                                     ? rightNV.CallerName
                                     : rightNV.BorrowedOrigin;
                                 srcBorrowedUniqueField = rightNV.BorrowedUniqueField;
+                                srcBorrowedField = rightNV.FieldName;
                                 // Trap B: a plain copy of a `unique` field does not null the field, so the
                                 // field's synthesized destructor still frees the pointee. Treat the local as
                                 // a borrow of the field, which routes a later `delete` into the existing
@@ -8371,6 +8402,32 @@ public:
                         if (typeAndValue.IsSimd && !right->getType()->isVectorTy())
                             right = compiler->SplatToSimd(right, typeAndValue);
 
+                        /*
+                         * Closure decl-init from a FIELD / ELEMENT (Option A clone). The
+                         * whole-variable block below only accepts an alloca/global source, so
+                         * `Lambda<...> h = t.get;` (Storage is a GEP, or the base pointer when the
+                         * closure is field 0) fell through and shallow-stored the source's TAGGED
+                         * OWNED env: h's scope-exit dtor and the struct's field dtor then free the
+                         * same block - double free. Clone instead, so each side owns an independent
+                         * env; cloning a borrowed/null env is a no-op, and a `move` source or a
+                         * temp/call result (null Storage) already transferred ownership.
+                         */
+                        if (right->getType()->isStructTy()
+                            && srcStorage != nullptr
+                            && !llvm::isa<llvm::AllocaInst>(srcStorage)
+                            && !llvm::isa<llvm::GlobalVariable>(srcStorage)
+                            && !srcIsMove
+                            && srcInferredTypeName == "__closure_fat_ptr"
+                            && typeAndValue.TypeName == "__closure_fat_ptr")
+                        {
+                            LLVMBackend::NamedVariable srcNV;
+                            srcNV.Storage  = srcStorage;
+                            srcNV.BaseType = compiler->GetClosureFatPtrType();
+                            srcNV.TypeAndValue.TypeName = "__closure_fat_ptr";
+                            if (auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
+                                right = cloned;
+                        }
+
                         // Owning-value MOVE at decl-init (string-redesign FINAL MODEL): `OwningType
                         // b = a;` where a is a plain named local/global of a value type that owns
                         // resources (has a full destructor). A shallow struct store aliases a's
@@ -8546,6 +8603,22 @@ public:
                         // (move params have IsOwning but not IsNewAllocated).
                         if (compiler->lastOwningResult)
                         {
+                            // `move` of a BORROWED pointer transfers nothing - the real owner still
+                            // frees the pointee, so adopting it here frees it twice. ParseMoveExpression
+                            // sets lastOwningResult unconditionally and records the true provenance in
+                            // IsBorrowed, so consult that; the `=` path has the same gate.
+                            // An element-SLOT move (`move n->values[i]`) nulls the one real slot even
+                            // through a borrowed base, so it transfers; ownership is re-derived below.
+                            if (srcIsBorrowed && !srcMovedFromSlot && typeAndValue.IsUnique
+                                && typeAndValue.Pointer && !typeAndValue.ElemPointer)
+                            {
+                                bool srcIsField = !srcBorrowedField.empty();
+                                std::string srcDesc = srcIsField
+                                    ? std::format("{}.{}", srcCallerName, srcBorrowedField)
+                                    : srcBorrowedOrigin;
+                                RejectBorrowIntoUniqueLocal(srcDesc, BorrowedOriginRoot(srcBorrowedOrigin),
+                                                            srcIsField, name, true, initDecl);
+                            }
                             auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
                             nv.IsOwning = true;
                             nv.IsNewAllocated = true;
@@ -8691,8 +8764,9 @@ public:
                         // A raw null pointer, or the null fat-ptr an interface `= nullptr` upcasts
                         // to (a null aggregate, not a ConstantPointerNull), owns nothing - allowed.
                         bool srcIsNullLiteral = right != nullptr
-                            && llvm::isa<llvm::Constant>(right)
-                            && llvm::cast<llvm::Constant>(right)->isNullValue();
+                            && ((llvm::isa<llvm::Constant>(right)
+                                    && llvm::cast<llvm::Constant>(right)->isNullValue())
+                                || IsAllNullPhi(right));
                         bool destUniqueLoc = (typeAndValue.Pointer && !typeAndValue.ElemPointer)
                             || typeAndValue.IsInterface;
                         if (initializer && typeAndValue.IsUnique && destUniqueLoc
@@ -8798,6 +8872,36 @@ public:
                 "owner still frees it, and two 'unique' fields cannot own one pointer. Use 'move' to "
                 "transfer ownership, or drop 'unique' from the field if it only borrows.",
                 src, rightNV.FieldName, fieldDesc, origin));
+    }
+
+    /*
+     * The LOCAL counterpart of RejectBorrowIntoUniqueField: a BORROW stored into a `unique` local.
+     * The local's scope-exit teardown frees the pointee and so does its real owner, so this would
+     * free it twice. Shared by the decl-init and `=` reassignment paths so both spell it the same.
+     * `srcIsField` selects the wording: only a plain borrowed PARAMETER can be fixed by declaring
+     * the parameter 'move', so the field form suggests dropping 'unique' instead.
+     */
+    void RejectBorrowIntoUniqueLocal(const std::string& srcDesc, const std::string& originName,
+                                     bool srcIsField, const std::string& localName,
+                                     bool isInit, antlr4::ParserRuleContext* ctx)
+    {
+        const char* srcKind = srcIsField ? "" : "borrowed parameter ";
+        std::string lead = isInit
+            ? std::format("cannot initialize unique local '{}' from {}'{}'",
+                          localName, srcKind, srcDesc)
+            : std::format("cannot assign {}'{}' to unique local '{}'",
+                          srcKind, srcDesc, localName);
+        if (srcIsField)
+            LogErrorContext(ctx, std::format(
+                "{} - it is reached through borrowed parameter '{}', whose owner still frees it, so "
+                "this would free it twice. Drop 'unique' from '{}' if it only borrows.",
+                lead, originName, localName));
+        else
+            LogErrorContext(ctx, std::format(
+                "{} - the caller still owns it and frees it on scope exit, so this would free it "
+                "twice. Declare the parameter 'move {}' to transfer ownership, or drop 'unique' "
+                "from '{}' if it only borrows.",
+                lead, originName, localName));
     }
 
     /*
@@ -9377,6 +9481,70 @@ public:
         }
     }
 
+    /*
+     * Upcast a '?:' result to an interface fat pointer. A ternary phi carries no NamedVariable
+     * TypeName, so the ordinary upcast is skipped and a raw `ptr` would be bitcast into the fat
+     * struct type - invalid IR. Box each incoming arm inside the arm's OWN block, which also
+     * covers arms with DIFFERENT concrete classes (each gets its own vtable), and join the fat
+     * pointers with a second phi. A null arm contributes a null fat pointer. Returns nullptr
+     * when this does not apply, leaving the caller's normal path untouched.
+     */
+    llvm::Value* UpcastTernaryPhiToInterface(llvm::Value* right, const std::string& interfaceName)
+    {
+        auto* compiler = compilerLLVM;
+        auto* phi = llvm::dyn_cast_or_null<llvm::PHINode>(right);
+        if (phi == nullptr || interfaceName.empty() || !phi->getType()->isPointerTy()) return nullptr;
+        unsigned count = phi->getNumIncomingValues();
+        if (count == 0) return nullptr;
+        // Resolve every arm first: a partial rewrite would leave half-boxed IR behind.
+        std::vector<std::string> armTypes(count);
+        for (unsigned i = 0; i < count; i++)
+        {
+            llvm::Value* incoming = phi->getIncomingValue(i);
+            if (llvm::isa<llvm::ConstantPointerNull>(incoming)) continue;
+            armTypes[i] = compiler->FindValueElementTypeName(incoming);
+            if (armTypes[i].empty()
+                || !compiler->StructImplementsInterface(armTypes[i], interfaceName)
+                || phi->getIncomingBlock(i)->getTerminator() == nullptr)
+                return nullptr;
+        }
+
+        auto* savedBlock = compiler->builder->GetInsertBlock();
+        auto savedPoint = compiler->builder->GetInsertPoint();
+        auto* fatTy = compiler->GetFatPtrType();
+        std::vector<llvm::Value*> boxed(count, nullptr);
+        for (unsigned i = 0; i < count; i++)
+        {
+            if (armTypes[i].empty())
+            {
+                boxed[i] = llvm::Constant::getNullValue(fatTy);
+                continue;
+            }
+            compiler->builder->SetInsertPoint(phi->getIncomingBlock(i)->getTerminator());
+            auto* vtable = compiler->GetOrCreateVTable(armTypes[i], interfaceName);
+            boxed[i] = compiler->BuildInterfaceFatValue(vtable, phi->getIncomingValue(i));
+        }
+        compiler->builder->SetInsertPoint(phi);
+        auto* fatPhi = compiler->builder->CreatePHI(fatTy, count, "ternary_iface");
+        for (unsigned i = 0; i < count; i++)
+            fatPhi->addIncoming(boxed[i], phi->getIncomingBlock(i));
+        compiler->builder->SetInsertPoint(savedBlock, savedPoint);
+        return fatPhi;
+    }
+
+    // True when every arm of a '?:' phi is a null pointer, so the joined value owns nothing.
+    bool IsAllNullPhi(llvm::Value* value) const
+    {
+        auto* phi = llvm::dyn_cast_or_null<llvm::PHINode>(value);
+        if (phi == nullptr || phi->getNumIncomingValues() == 0) return false;
+        for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+        {
+            auto* constant = llvm::dyn_cast<llvm::Constant>(phi->getIncomingValue(i));
+            if (constant == nullptr || !constant->isNullValue()) return false;
+        }
+        return true;
+    }
+
     // Soundness gate for the thin int[] array-view: reject binding a raw `T*` into a `T[]`.
     // A view carries a noalias contract - it always spans a whole, distinct allocation - which
     // lets the -O2 vectorizer drop its runtime alias check. A raw `T*` may alias or point
@@ -9479,6 +9647,15 @@ public:
                     return rhsNV.Primary;
                 }
 
+                // `_ = <call>();` on an owning-POINTER return (`move R*`): the thing being dropped
+                // is the returned POINTER, so free THAT (dtor + delete) at end-of-full-expression.
+                if (const auto* owned = compiler->FindOwnedReturnEntry(rhsNV.Primary);
+                    owned != nullptr && owned->IsOwningPtr)
+                {
+                    compiler->RegisterOwnedPtrTemp(rhsNV.Primary);
+                    return rhsNV.Primary;
+                }
+
                 RegisterDiscardedOwningStructTemp(rhsNV);
                 return rhsNV.Primary;
             }
@@ -9490,6 +9667,17 @@ public:
             // LHS only, so a guarded field READ inside the LHS (e.g. an index 'a[n->count]') is
             // not mistaken for a write.
             CheckGuardedWrite(unaryCtx, namedVar);
+
+            // Storing through a temp spill (`mk().vals[0] = x`) writes into a shallow copy that dies
+            // with the full expression - the write is unobservable, so reject it rather than emit a
+            // silently discarded store. The READ form is legal (the spill exists for it).
+            if (namedVar.IsTempSpillStorage)
+            {
+                LogErrorContext(unaryCtx,
+                    "cannot assign into an inline array field of a temporary value - the slot lives in "
+                    "a copy that dies at the end of the expression, so the store is discarded. Bind the "
+                    "call result to a local first, then assign into it.");
+            }
 
             // The left side must resolve to an addressable storage location. A null Storage
             // means the LHS produced a value, not an lvalue - storing through it would
@@ -9637,8 +9825,17 @@ public:
             // or a `move` expression) before the flags are cleared: the D5 assignment reject for
             // a `unique` interface local (below, after the upcast) needs it to tell a heap-owned
             // source from a stack box / borrow.
-            bool srcIsOwnedForUniqueIface = compiler->lastOwningResult
+            // lastOwningResult is a sticky global that a `new` ANYWHERE in the RHS sets, including
+            // as a call argument, so `k = pick(g, new Sq())` adopted a borrow (double-free). Trust
+            // it only when the RHS itself is a direct `new` or a top-level `move` - it stays the
+            // ownership signal there, since a `move` of a BORROWED interface never sets it.
+            // The value-identity leg (IsOwnedNewTemp) sees an owning `new` that reached the RESULT
+            // through a transparent wrapper (a '?:' arm); a `new` in ARGUMENT position never does.
+            bool srcIsOwnedForUniqueIface =
+                (compiler->lastOwningResult
+                    && (AsDirectNew(assignCtx) != nullptr || TopLevelMoveExpression(assignCtx) != nullptr))
                 || compiler->lastCallReturnsOwned
+                || compiler->IsOwnedNewTemp(rightNV.Primary)
                 || rightNV.TypeAndValue.IsMove;
             // Same question for a `unique T*` LOCAL reassignment, but answered ONLY from
             // properties of THIS RHS. lastOwningResult is deliberately excluded: it is a sticky
@@ -9647,9 +9844,13 @@ public:
             // (freeing a global). The syntactic tests below see the RHS shape itself, and
             // lastCallReturnsOwned is derived from the resolved callee's declared `move`/unique
             // return type, so an ordinary borrow-returning call cannot fake ownership.
+            // The IsOwnedNewTemp leg asks the same question BY VALUE IDENTITY instead of by shape,
+            // so a `new` that reached the RESULT through a '?:' arm adopts; one in ARGUMENT
+            // position produces a different value (the borrow-returning call's result) and does not.
             bool srcIsOwnedPtrRhs = AsDirectNew(assignCtx) != nullptr
                 || TopLevelMoveExpression(assignCtx) != nullptr
-                || compiler->lastCallReturnsOwned;
+                || compiler->lastCallReturnsOwned
+                || compiler->IsOwnedNewTemp(rightNV.Primary);
             compiler->lastOwningResult = false;
             compiler->lastAllocAlignment = 0;
             compiler->lastCallReturnsAllocAlign = 0;
@@ -9832,6 +10033,10 @@ public:
                 if (!namedVar.TypeAndValue.IsInterfacePointer && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(right))
                     right = llvm::Constant::getNullValue(compiler->GetFatPtrType());
                 std::string structName = rightNV.TypeAndValue.TypeName;
+                // A '?:' result carries no TypeName: box each arm in its own branch.
+                if (structName.empty() && !namedVar.TypeAndValue.IsInterfacePointer)
+                    if (auto* ternaryFat = UpcastTernaryPhiToInterface(right, namedVar.TypeAndValue.TypeName))
+                        right = ternaryFat;
                 if (!structName.empty() && compiler->StructImplementsInterface(structName, namedVar.TypeAndValue.TypeName))
                 {
                     auto vtable = compiler->GetOrCreateVTable(structName, namedVar.TypeAndValue.TypeName);
@@ -9871,8 +10076,9 @@ public:
                 && namedVar.TypeAndValue.IsInterface
                 && !namedVar.TypeAndValue.IsInterfacePointer;
             bool srcIsNullForUniqueIface = right != nullptr
-                && llvm::isa<llvm::Constant>(right)
-                && llvm::cast<llvm::Constant>(right)->isNullValue();
+                && ((llvm::isa<llvm::Constant>(right)
+                        && llvm::cast<llvm::Constant>(right)->isNullValue())
+                    || IsAllNullPhi(right));
             if (operatorText == "=" && destUniqueIface
                 && !srcIsOwnedForUniqueIface && !srcIsNullForUniqueIface)
             {
@@ -9894,7 +10100,10 @@ public:
                 auto* oldFat = compiler->builder->CreateLoad(compiler->GetFatPtrType(), destination);
                 compiler->DeleteInterfaceValue(oldFat, namedVar.TypeAndValue.TypeName, nullptr);
                 if (srcIsOwnedForUniqueIface && !namedVar.CallerName.empty())
+                {
                     compiler->SetVariableOwning(namedVar.CallerName, true);
+                    compiler->ConsumeOwnedNewTemp(rightNV.Primary);
+                }
             }
 
             // Pointer variable assigned a struct value: catch the mismatch here
@@ -10365,14 +10574,13 @@ public:
                 // this is the LOCAL counterpart of RejectBorrowIntoUniqueField.
                 if (rightNV.IsBorrowed)
                 {
-                    std::string src = rightNV.BorrowedOrigin.empty()
+                    std::string origin = rightNV.BorrowedOrigin.empty()
                         ? rightNV.CallerName : rightNV.BorrowedOrigin;
-                    LogErrorContext(ctx, std::format(
-                        "cannot assign borrowed parameter '{}' to unique local '{}' - the caller "
-                        "still owns it and frees it on scope exit, so this would free it twice. "
-                        "Declare the parameter 'move {}' to transfer ownership, or drop 'unique' "
-                        "from '{}' if it only borrows.",
-                        src, namedVar.CallerName, src, namedVar.CallerName));
+                    bool srcIsField = !rightNV.FieldName.empty();
+                    std::string srcDesc = srcIsField
+                        ? std::format("{}.{}", rightNV.CallerName, rightNV.FieldName) : origin;
+                    RejectBorrowIntoUniqueLocal(srcDesc, BorrowedOriginRoot(origin), srcIsField,
+                                                namedVar.CallerName, false, ctx);
                     return right;
                 }
 
@@ -10390,7 +10598,10 @@ public:
                 // no IsOwning at all - `b = move a`, `b = new R()`, `b = moveReturningCall()`: an
                 // explicit `move` returns a Storage-less value, so only the RHS shape identifies it.
                 if ((rightNV.IsOwning || srcIsOwnedPtrRhs) && !namedVar.CallerName.empty())
+                {
                     compiler->SetVariableOwning(namedVar.CallerName, true);
+                    compiler->ConsumeOwnedNewTemp(rightNV.Primary);
+                }
             }
 
             // Destruct the old value of an owning-string LOCAL before overwriting it. Closes the
@@ -10824,6 +11035,8 @@ public:
             compiler->PropagateOwnedReturnTemp(trueValue, phi);
         else if (compiler->FindOwnedReturnTemp(falseValue))
             compiler->PropagateOwnedReturnTemp(falseValue, phi);
+        compiler->PropagateOwnedNewTemp(trueValue, phi);
+        compiler->PropagateOwnedNewTemp(falseValue, phi);
         return { phi, false };
     }
 
@@ -10942,6 +11155,10 @@ public:
                     compiler->PropagateOwnedReturnTemp(trueValue, selectValue);
                 else if (compiler->FindOwnedReturnTemp(falseValue))
                     compiler->PropagateOwnedReturnTemp(falseValue, selectValue);
+                // Eager form: BOTH arms allocate, so only the selected one can be adopted and the
+                // other leaks regardless - propagate the bit so the winner is at least adopted.
+                compiler->PropagateOwnedNewTemp(trueValue, selectValue);
+                compiler->PropagateOwnedNewTemp(falseValue, selectValue);
                 return { selectValue, false };
             }
 
@@ -11165,7 +11382,7 @@ public:
             // hit/miss test. Reduce the fat operand to its data pointer and compare pointers.
             LowerInterfaceNullCompare(ctx, lv, rv);
 
-            auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx);
+            auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx, lv.elemType);
             llvm::Value* result = overload ? overload
                                            : Compiler(ctx)->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
             return { result, false };  // == != result is bool, not unsigned
@@ -11483,7 +11700,7 @@ public:
             Compiler(ctx)->RegisterOwnedPtrTemp(rv.value);
             std::string op = ctx->children[1]->getText();
 
-            auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx);
+            auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx, lv.elemType);
             llvm::Value* result = overload ? overload
                                            : Compiler(ctx)->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
             return { result, false };  // comparison result is bool, not unsigned
@@ -12340,9 +12557,81 @@ public:
             compiler->RegisterOwnedStringTemp(operand);
     }
 
+    // Comparisons are the only operators that may dispatch off a raw-pointer left operand.
+    // Arithmetic on a pointer keeps its builtin GEP/ptrdiff meaning.
+    static bool IsComparisonOperatorText(const std::string& op)
+    {
+        return op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=";
+    }
+
+    // Pointer-valued left operand (e.g. `R* r; r == k`): select an `operator op(T*, U)`
+    // declared over the POINTEE struct. The pointer is passed straight through as `this` -
+    // never copied into an alloca, which would change aliasing for a mutating operator.
+    llvm::Value* TryPointerLhsOperatorOverload(
+        llvm::Value* lvalue, const std::string& op, llvm::Value* rvalue,
+        antlr4::ParserRuleContext* ctx, llvm::Type* lhsElemType)
+    {
+        auto* compiler = Compiler(ctx);
+
+        // LOAD-BEARING: the RHS must NOT be pointer-typed. Both-pointer operands (including
+        // `p == nullptr`) always stay on the builtin address comparison and never dispatch.
+        if (!rvalue || rvalue->getType()->isPointerTy()) return nullptr;
+        if (!IsComparisonOperatorText(op)) return nullptr;
+
+        std::string opName = "operator" + op;
+        std::string pointee = ConcreteStructNameFromElemType(lhsElemType, compiler);
+
+        if (!pointee.empty() && compiler->GetFunction(opName))
+        {
+            auto funcSym = compiler->functionTable.find(opName);
+            if (funcSym != compiler->functionTable.end())
+            {
+                for (const auto& candidate : funcSym->second)
+                {
+                    if (candidate.Parameters.empty()) continue;
+                    if (candidate.Parameters[0].TypeName != pointee || !candidate.Parameters[0].Pointer) continue;
+
+                    LLVMBackend::NamedVariable thisNV;
+                    thisNV.TypeAndValue.TypeName = pointee;
+                    thisNV.TypeAndValue.Pointer  = true;
+                    thisNV.Primary  = lvalue;
+                    thisNV.BaseType = lhsElemType;
+
+                    LLVMBackend::NamedVariable rightNV;
+                    rightNV.Primary  = rvalue;
+                    rightNV.BaseType = rvalue->getType();
+                    if (auto* rst = llvm::dyn_cast<llvm::StructType>(rvalue->getType()))
+                        if (!rst->isLiteral() && rst->hasName())
+                            rightNV.TypeAndValue.TypeName = rst->getName().str();
+
+                    auto* result = compiler->CreateOverloadedFunctionCall(opName, { thisNV, rightNV });
+                    TrackOwnedStringOperatorResult(compiler, result);
+                    return result;
+                }
+            }
+        }
+
+        // A struct-valued RHS can never reach a valid builtin comparison against a pointer,
+        // so name the failure here instead of emitting a malformed icmp.
+        if (rvalue->getType()->isStructTy())
+        {
+            std::string lhsName = pointee.empty() ? "pointer" : pointee + "*";
+            auto* rst = llvm::cast<llvm::StructType>(rvalue->getType());
+            std::string rhsName = (!rst->isLiteral() && rst->hasName()) ? rst->getName().str() : "struct";
+            LogErrorContext(ctx, std::format(
+                "no overload of '{}' matches operands '{}' and '{}'; overloaded operators dispatch on a struct value "
+                "or struct pointer left operand with a matching declared overload", opName, lhsName, rhsName));
+            return nullptr;
+        }
+
+        return nullptr;
+    }
+
+    // lhsElemType is the POINTEE type when lvalue is a pointer (TypedValue::elemType);
+    // it is what makes an `operator op(T*, U)` candidate findable under opaque pointers.
     llvm::Value* TryBinaryOperatorOverload(
         llvm::Value* lvalue, const std::string& op, llvm::Value* rvalue,
-        antlr4::ParserRuleContext* ctx)
+        antlr4::ParserRuleContext* ctx, llvm::Type* lhsElemType = nullptr)
     {
         if (!lvalue) return nullptr;
         auto* compiler = Compiler(ctx);
@@ -12359,6 +12648,10 @@ public:
         }
 
         auto* ty = lvalue->getType();
+
+        if (ty->isPointerTy())
+            return TryPointerLhsOperatorOverload(lvalue, op, rvalue, ctx, lhsElemType);
+
         if (!ty->isStructTy()) return nullptr;
         auto* structTy = llvm::cast<llvm::StructType>(ty);
         if (structTy->isLiteral() || !structTy->hasName()) return nullptr;
@@ -14335,6 +14628,14 @@ public:
         // caller must NOT auto-delete it at scope exit.
         compiler->lastOwningResult = !isWinrtNew;
         compiler->lastAllocAlignment = siteExcess;
+        // Ledger the result BY VALUE so an owning `new` reaching an assignment through a
+        // transparent wrapper (a '?:' arm) is still recognized as owning. See ownedNewTemps_.
+        if (!isWinrtNew && !isArray)
+            compiler->RegisterOwnedNewTemp(typedPtr);
+        // Ledger the concrete class too: a '?:' phi carries no TypeName, and the interface
+        // upcast needs one per arm. See valueElementTypeNames_.
+        if (!isArray)
+            compiler->RegisterValueElementTypeName(typedPtr, typeName);
         return result;
     }
 
@@ -14885,6 +15186,18 @@ public:
     {
         auto* compiler = Compiler(ctx);
         auto argNV = ParseUnaryExpression(ctx->unaryExpression());
+
+        // Reject 'move' through a temp spill (`move mk().vals[i]`): the subscript spilled a SHALLOW
+        // copy of the extracted array, so nulling a slot there leaves the original temporary still
+        // holding the pointer - a leak or a double free. Reads of the spill stay legal.
+        if (argNV.IsTempSpillStorage)
+        {
+            LogErrorContext(ctx,
+                "cannot 'move' out of an inline array field of a temporary value - the slot lives in "
+                "a shallow copy that dies with the expression, so the original still owns the pointee. "
+                "Bind the call result to a local first, then move out of it.");
+            return {};
+        }
 
         // Reject 'move h.p' where `h` is a BORROWED by-value struct parameter: the move nulls the
         // callee's copy of the field, but the caller's original still holds the pointer, so both
@@ -15855,6 +16168,13 @@ public:
             // can inject it as the implicit `this` first argument - `rs->Release()` dispatches as
             // `rs->lpVtbl->Release(rs)`. Set on redirect, consumed (and cleared) by the call.
             llvm::Value* pendingThinComReceiver = nullptr;
+            // [PFX-2-dangle] Armed by [PFX-2] for a `.`/`->` member name; cleared by the next suffix
+            // token (a call `(` above all). Still armed at the end of the chain means the member was
+            // never called - `obj.method` without '()' - which otherwise returns an empty
+            // NamedVariable that callers dereference (SIGSEGV). See the exit check below.
+            std::string danglingMemberName;
+            std::string danglingMemberOwner;
+            bool danglingIsMethod = false;
 
             // dropTrailingChildren lets a caller (e.g. the lock statement, for `rw.read`)
             // evaluate only the base of the postfix chain, ignoring a trailing suffix.
@@ -15872,6 +16192,14 @@ public:
                     // so it works as a member name (e.g. File.move(...)).
                     if (tokenType == CFlatParser::Move)
                         tokenType = CFlatParser::Identifier;
+                    // Any suffix other than the member name itself consumes the pending member
+                    // access ('(' calls it, '[' / '++' / '--' / '.' start a new link).
+                    if (tokenType != CFlatParser::Identifier)
+                    {
+                        danglingMemberName.clear();
+                        danglingMemberOwner.clear();
+                        danglingIsMethod = false;
+                    }
                     switch (tokenType)
                     {
                     case CFlatParser::LeftBracket:
@@ -16167,6 +16495,12 @@ public:
                     // member fn / [winrt] vtable slot / UFCS target. Unresolved -> "Unknown identifier".
                     case CFlatParser::Identifier:
                     {
+                        // [PFX-2-dangle] Arm for any member name; the branches below refine the
+                        // owner / method flag, and the tail of this case disarms on a real field.
+                        if (prevToken == CFlatParser::Dot || prevToken == CFlatParser::Arrow
+                            || prevToken == CFlatParser::QuestionDot)
+                            danglingMemberName = terminal->getText();
+
                         if (!namespaceContext.empty())
                         {
                             // "$global$:<alias>" sentinel: file-scoped import alias.
@@ -16272,6 +16606,13 @@ public:
                                 namedVar.OwningStructName = ifaceName;
                                 namedVar.FieldName        = primaryIdentifier;
                                 namedVar.IsInterfaceField = true;
+                            }
+                            else if (compiler->HasInterfaceMethod(ifaceName, primaryIdentifier))
+                            {
+                                // Not an interface field but a contract method: dispatched at the
+                                // call below. Arm [PFX-2-dangle] in case no '()' follows.
+                                danglingMemberOwner = ifaceName;
+                                danglingIsMethod    = true;
                             }
                         }
                         else if (structVar.BaseType)
@@ -16528,6 +16869,12 @@ public:
                                 // Lambda<T>.toFunction() builtin, or a [winrt] COM vtable slot (e.g.
                                 // AddRef/Release/QueryInterface). All are lowered at the call dispatch below.
                                 namedVar = {};
+                                // Arm [PFX-2-dangle]: without a following '()' this is `obj.method`.
+                                danglingMemberOwner = structVar.TypeAndValue.TypeName;
+                                if (danglingMemberOwner.empty())
+                                    if (auto* st = llvm::dyn_cast<llvm::StructType>(structVar.BaseType))
+                                        danglingMemberOwner = st->getName().str();
+                                danglingIsMethod = true;
                             }
                             else if (LLVMBackend::NamedVariable anonNV;
                                      ResolveTransparentAnonField(ctx, structVar, primaryIdentifier, anonNV))
@@ -16580,6 +16927,10 @@ public:
                             // n.toString()). Record the method name; the base value stays in namedVar.
                             // Actual dispatch happens when '()' is processed below.
                             primaryIdentifier = terminal->getText();
+                            // Arm [PFX-2-dangle]: the base value stays in namedVar, so without a
+                            // following '()' the method name would be silently dropped.
+                            danglingMemberOwner = namedVar.TypeAndValue.TypeName;
+                            danglingIsMethod = true;
                         }
                         else
                         {
@@ -16610,6 +16961,16 @@ public:
                             // parent struct left over from the previous chain link.
                             structVar = {};
                             interfaceVar = {};
+                        }
+
+                        // [PFX-2-dangle] Disarm when the name resolved to a real value (a field, a
+                        // namespace global, an enum member, ...); a confirmed method name stays armed.
+                        if (!danglingIsMethod
+                            && (namedVar.Primary != nullptr || namedVar.Storage != nullptr
+                                || namedVar.BaseType != nullptr || !namespaceContext.empty()))
+                        {
+                            danglingMemberName.clear();
+                            danglingMemberOwner.clear();
                         }
 
                         break;
@@ -16984,6 +17345,20 @@ public:
                             rvalue = idxIsUnsigned
                                 ? Compiler(ctx)->builder->CreateZExt(rvalue, idxI64Ty, "idxzext")
                                 : Compiler(ctx)->builder->CreateSExt(rvalue, idxI64Ty, "idxsext");
+                        }
+
+                        // An inline array FIELD read off a by-value temporary (`mk().vals[i]`) is an
+                        // extractvalue - a register with no address to GEP into. Spill it to a local so
+                        // the element access below has a base, matching C's rule that the returned temp
+                        // has automatic storage to the end of the full expression. The copy is SHALLOW,
+                        // so tag the storage: 'move' and stores through it stay rejected.
+                        if (namedVar.Storage == nullptr && namedVar.Primary != nullptr
+                            && namedVar.BaseType && llvm::isa<llvm::ArrayType>(namedVar.BaseType))
+                        {
+                            auto* spill = Compiler(ctx)->CreateAlloca(namedVar.BaseType);
+                            Compiler(ctx)->CreateAssignment(namedVar.Primary, spill);
+                            namedVar.Storage = spill;
+                            namedVar.IsTempSpillStorage = true;
                         }
 
                         if (namedVar.BaseType && namedVar.BaseType->isVectorTy())
@@ -19473,6 +19848,30 @@ public:
                 }
             }
 
+            // [PFX-2-dangle] The chain ended on a member name that was never called. For a method
+            // that is a missing '()'; otherwise the name resolved to nothing at all. Either way the
+            // NamedVariable below is empty and every caller dereferences it - diagnose here.
+            if (!danglingMemberName.empty()
+                && (danglingIsMethod
+                    || (namedVar.Primary == nullptr && namedVar.Storage == nullptr
+                        && namedVar.BaseType == nullptr)))
+            {
+                if (danglingIsMethod)
+                {
+                    std::string owner = danglingMemberOwner.empty()
+                        ? std::string("the receiver") : std::format("'{}'", danglingMemberOwner);
+                    LogErrorContext(ctx, std::format(
+                        "'{}' is a method of {}; did you mean to call it? Write '{}()'.",
+                        danglingMemberName, owner, danglingMemberName));
+                }
+                else
+                {
+                    LogErrorContext(ctx, std::format(
+                        "'{}' does not name a value here. If it is a method, call it: '{}()'.",
+                        danglingMemberName, danglingMemberName));
+                }
+            }
+
             return namedVar;
         }
 
@@ -21106,7 +21505,9 @@ public:
         const std::string& typeName = nv.TypeAndValue.TypeName;
         if (nv.Primary == nullptr || nv.Storage != nullptr || nv.BaseType == nullptr) return;
         if (typeName.empty() || typeName == "string" || typeName == "__closure_fat_ptr") return;
-        if (nv.TypeAndValue.IsAlias || nv.FromOwningTempField) return;
+        // A POINTER rvalue is not a struct value: spilling it would destruct the pointer's own
+        // bits as if they were the object. Owning pointers are handled by the owned-ptr temp list.
+        if (nv.TypeAndValue.Pointer || nv.TypeAndValue.IsAlias || nv.FromOwningTempField) return;
 
         auto* compiler = Compiler();
         if (!compiler->IsOwningValueType(typeName)) return;

@@ -120,6 +120,16 @@ struct OuterBox
     Box operator->() { return inner; }
 };
 
+// ── PtrNode/PtrKey: free operator with a RAW-POINTER left operand ────────────
+// `node == key` must select operator==(PtrNode*, PtrKey). `node == nullptr` must
+// stay the builtin address check and never route into overload resolution.
+
+struct PtrKey { int v = 0; };
+struct PtrNode { int v = 0; };
+
+bool operator==(PtrNode* a, PtrKey b) { return a->v == b.v; }
+bool operator!=(PtrNode* a, PtrKey b) { return a->v != b.v; }
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 import "test_helper.cb";
@@ -384,5 +394,27 @@ extern int main()
     terPassed += Test("nested ternary picks one leaf", scN, 10);
     terPassed += Test("nested ternary skips others",   g_sideEffects, 10);
 
-    return terPassed == 19 ? 0 : 1;
+    // Raw-pointer left operand selects the free operator==(PtrNode*, PtrKey). The pointer
+    // is passed straight through as `this` - it is never copied into a temporary alloca.
+    int ptrOpPassed = 0;
+    PtrNode* pnode = new PtrNode();
+    pnode->v = 42;
+    PtrKey pkey = default;
+    pkey.v = 42;
+    ptrOpPassed += Test("ptr lhs operator== match",     pnode == pkey, true);
+    ptrOpPassed += Test("ptr lhs operator!= match",     pnode != pkey, false);
+    pkey.v = 7;
+    ptrOpPassed += Test("ptr lhs operator== mismatch",  pnode == pkey, false);
+    ptrOpPassed += Test("ptr lhs operator!= mismatch",  pnode != pkey, true);
+
+    // ANTI-REGRESSION: ptr-vs-ptr must NEVER enter overload dispatch. `p == nullptr` is
+    // the builtin address check, so it is false while allocated and true once nulled.
+    ptrOpPassed += Test("ptr == nullptr builtin, allocated", pnode == nullptr, false);
+    ptrOpPassed += Test("ptr != nullptr builtin, allocated", pnode != nullptr, true);
+    delete pnode;
+    pnode = nullptr;
+    ptrOpPassed += Test("ptr == nullptr builtin, nulled",    pnode == nullptr, true);
+    ptrOpPassed += Test("ptr != nullptr builtin, nulled",    pnode != nullptr, false);
+
+    return (terPassed == 19 && ptrOpPassed == 8) ? 0 : 1;
 }

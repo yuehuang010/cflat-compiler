@@ -2230,6 +2230,34 @@ struct ArrayHolder
     i8 data[16] = default;
 };
 
+// Inline array field of a RETURNED TEMPORARY. The field read is an extractvalue (a register
+// with no address), so the subscript spills it to a local before the element GEP - C's rule
+// that the returned temp has automatic storage to the end of the full expression. Before the
+// spill this shape crashed the compiler, then errored. The 'move' and store forms stay
+// rejected (Test/errors/err_move_field_borrowed_param.cb): both act on the shallow spill.
+struct TempPack
+{
+    int vals[4] = default;
+    i8 tag[4] = default;
+};
+
+TempPack mkTempPack()
+{
+    TempPack p = default;
+    p.vals[0] = 7; p.vals[1] = 11; p.vals[3] = 13;
+    p.tag[0] = (i8)'Z';
+    return p;
+}
+
+// Owning element type: each element of the temporary's array runs its destructor exactly
+// once at end of full expression, whether the element is read whole or indexed.
+int gTempElemDtors = 0;
+struct TempElem { int v = 0; ~TempElem() { gTempElemDtors++; } };
+struct TempElemBag { TempElem items[3] = default; };
+struct TempElemOne { TempElem item = default; };
+TempElemBag mkTempElemBag() { TempElemBag b = default; b.items[1].v = 42; return b; }
+TempElemOne mkTempElemOne() { TempElemOne o = default; o.item.v = 7; return o; }
+
 int sumFixedBuf(i8* buf, int len)
 {
     int sum = 0;
@@ -2332,6 +2360,26 @@ bool testFixedArrays()
     gConstNameArr[8]  = 6;   // index 8 only valid if size folded to 9
     result &= Test("fixed_global_constexpr_size", gConstExprArr[80], 5);
     result &= Test("fixed_global_constname_size", gConstNameArr[8], 6);
+
+    // Inline array field of a returned temporary: constant index, variable index, and a
+    // non-int element type. Each call gets its own spill, so two reads do not alias.
+    result &= Test("fixed_temp_field_const_idx", mkTempPack().vals[0], 7);
+    result &= Test("fixed_temp_field_last_idx",  mkTempPack().vals[3], 13);
+    int ti = 1;
+    result &= Test("fixed_temp_field_var_idx",   mkTempPack().vals[ti], 11);
+    result &= Test("fixed_temp_field_i8_elem",   (int)mkTempPack().tag[0], 'Z');
+    result &= Test("fixed_temp_field_expr",      mkTempPack().vals[0] + mkTempPack().vals[1], 18);
+
+    // Owning element type: the temporary's own destruction runs one dtor per element and is
+    // NOT re-run against the spill. Parity with the whole-field read of a one-element struct.
+    gTempElemDtors = 0;
+    int oneVal = mkTempElemOne().item.v;
+    result &= Test("fixed_temp_whole_field_val",  oneVal, 7);
+    result &= Test("fixed_temp_whole_field_dtor", gTempElemDtors, 1);
+    gTempElemDtors = 0;
+    int bagVal = mkTempElemBag().items[1].v;
+    result &= Test("fixed_temp_elem_val",  bagVal, 42);
+    result &= Test("fixed_temp_elem_dtor", gTempElemDtors, 3);
 
     // Global fixed array: variable-index write and a loop sum.
     int gi = 0;

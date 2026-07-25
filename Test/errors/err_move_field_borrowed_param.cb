@@ -37,11 +37,13 @@ expect_error("cannot 'move' field 'Node.next' through borrowed parameter 'n'") {
 }
 
 // Element of a RETURNED TEMPORARY (`mk().slots[i]`): the inline array field is extracted out
-// of a by-value temp as a register value, so the slot has no address to GEP into (this used
-// to crash the compiler, rc=139, with or without 'move'). Rejected by a dedicated guard, not
-// by the 'move'-specific machinery - pin the substring the guard actually emits, not the
-// whole-field guard's shared prefix, so a future refactor that re-routes 'move' into the
-// older guard cannot leave the plain read/store forms free to regress to a segfault.
+// of a by-value temp as a register value, so the slot has no address of its own. The plain
+// READ form is legal - the subscript spills the extracted array to a local, matching C's rule
+// that the returned temp has automatic storage to the end of the full expression (positive
+// coverage in Test/test_basic.cb, testFixedArrays). MOVE and STORE stay rejected: both would
+// act on that SHALLOW spill, so a move nulls a slot the original temp still owns (leak or
+// double free) and a store is discarded when the spill dies. Pin the substring those two
+// guards emit, not the whole-field guard's shared prefix.
 Node mkNode() { Node n = default; n.slots[0] = new Resource(); return n; }
 expect_error("inline array field of a temporary") {
     int stealFromTemp() {
@@ -50,15 +52,7 @@ expect_error("inline array field of a temporary") {
     }
 }
 
-// Bare read (no 'move'): same crash before the fix, same guard now.
-expect_error("inline array field of a temporary") {
-    int readFromTemp() {
-        Resource* v = mkNode().slots[0];
-        return v == nullptr ? 0 : 1;
-    }
-}
-
-// Store form: writing through the same unaddressable slot.
+// Store form: the write lands in the spilled copy and is immediately discarded.
 expect_error("inline array field of a temporary") {
     void storeIntoTemp() {
         mkNode().slots[0] = nullptr;

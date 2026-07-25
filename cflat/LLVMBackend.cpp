@@ -2480,6 +2480,8 @@ void LLVMBackend::ResetForReanalysis()
     pendingOwnedStructTemps.clear();
     pendingOwnedPtrTemps.clear();
     ownedReturnTemps_.clear();
+    ownedNewTemps_.clear();
+    valueElementTypeNames_.clear();
     poisonedFunctions.clear();
     firstCallLocation_.clear();
     lastAllocAlignment = 0;

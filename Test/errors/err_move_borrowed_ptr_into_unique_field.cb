@@ -25,4 +25,14 @@ expect_error("cannot assign borrowed parameter 'b' to unique local 'k'") {
 // A 'move' parameter transfers ownership - reassigning it into a unique local is valid.
 void goodLocal(move Payload* b) { unique Payload* k = nullptr; k = move b; }
 
+// Same laundering at DECL-INIT. The plain `unique Payload* k = b;` form is caught by D5, but
+// the 'move' spelling signalled ownership unconditionally, so the local adopted the borrow and
+// freed it at scope exit while the caller still owned it (double free, exit 134).
+expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
+    void badInit(Payload* b) { unique Payload* k = move b; }
+}
+
+// A 'move' parameter transfers ownership - initializing a unique local from it is valid.
+void goodInit(move Payload* b) { unique Payload* k = move b; }
+
 extern int main() { return 0; }

@@ -1301,6 +1301,47 @@ bool testLocalListInterfaceTakeDelete()
 }
 
 // ── Test 27: `is <Interface>`, null-compare, and derived -> parent upcast ────
+bool ternaryPick(bool b) { return b; }
+
+/*
+ * A '?:' bound to an interface slot. The ternary result carries no concrete TypeName, so the
+ * class -> fat-pointer upcast used to be skipped and a raw pointer was bitcast into the fat
+ * struct (invalid IR). Each arm is boxed inside its own branch now, so a null arm and arms of
+ * DIFFERENT concrete classes both work; only the taken arm is evaluated.
+ */
+bool testInterfaceTernaryUpcast()
+{
+    bool result = true;
+    gWidgetDtorCount = 0;
+
+    // Declaration initializer with a null arm - the concrete arm wins.
+    IPress a = ternaryPick(true) ? new Pressy() : nullptr;
+    result &= Test("iface_ternary_decl_nonnull", a != nullptr, true);
+    result &= Test("iface_ternary_decl_kind", a.kind(), 1);
+
+    // Null arm taken.
+    IPress b = ternaryPick(false) ? new Pressy() : nullptr;
+    result &= Test("iface_ternary_decl_null", b == nullptr, true);
+
+    // Arms of different concrete classes: each arm gets its own vtable.
+    IPress c = ternaryPick(true) ? new Pressy() : new Toggly();
+    IPress d = ternaryPick(false) ? new Pressy() : new Toggly();
+    result &= Test("iface_ternary_mixed_true_kind",  c.kind(), 1);
+    result &= Test("iface_ternary_mixed_false_kind", d.kind(), 2);
+
+    // Plain assignment to an existing interface local takes the same path.
+    IPress e = default;
+    e = ternaryPick(true) ? new Toggly() : nullptr;
+    result &= Test("iface_ternary_assign_kind", e.kind(), 2);
+    delete e;
+    e = ternaryPick(false) ? new Toggly() : nullptr;
+    result &= Test("iface_ternary_assign_null", e == nullptr, true);
+
+    delete a; delete c; delete d;
+    result &= Test("iface_ternary_dtor_count", gWidgetDtorCount, 4);
+    return result;
+}
+
 bool testInterfaceIsNullUpcast()
 {
     bool result = true;
@@ -1877,6 +1918,7 @@ extern int main()
     total++; passed += testDowncastCallResultBorrow()    ? 1 : 0;
     total++; passed += testInterfaceFieldAccess()        ? 1 : 0;
     total++; passed += testInterfaceIsNullUpcast()       ? 1 : 0;
+    total++; passed += testInterfaceTernaryUpcast()      ? 1 : 0;
     total++; passed += testGenericInterfaceField()       ? 1 : 0;
     total++; passed += testGenericInterfaceExplicitPtrArg() ? 1 : 0;
     total++; passed += testLocalListInterfaceTakeDelete()     ? 1 : 0;

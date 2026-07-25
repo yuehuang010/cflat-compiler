@@ -13,6 +13,19 @@ expect_error("cannot assign a borrowed value to unique interface 's'") {
     void boxStackAssign() { unique IShape s = new Circle(); Circle t; s = t; }
 }
 
+// Sticky-flag leg: the owning-source test used the global `lastOwningResult`, which a `new`
+// ANYWHERE in the RHS sets - including in call ARGUMENT position. `pick(g, new Circle())` merely
+// BORROWS g and hands it back, but the argument's `new` made the slot adopt it, so g was freed
+// by both handles (double free, exit 134). Ownership is now keyed to the RHS shape itself.
+IShape pick(IShape a, IShape b) { return a; }
+expect_error("cannot assign a borrowed value to unique interface 's'") {
+    void borrowViaNewArg() {
+        unique IShape g = new Circle();
+        unique IShape s = nullptr;
+        s = pick(g, new Circle());
+    }
+}
+
 // Param leg: a `unique` interface param takes ownership and frees at scope exit, so a stack value
 // (whose boxed data pointer is a stack address) must not be bound to it.
 void sink(unique IShape s) {}

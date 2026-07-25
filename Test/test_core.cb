@@ -1109,6 +1109,25 @@ int testHashsetChurn()
 
 struct StringRow { string name = default; };
 
+struct CPToken { string text = default; };
+
+CPToken makeCPToken(string t)
+{
+    CPToken tk = default;
+    tk.text = "" + t;
+    return tk;
+}
+
+char* giveCharPtr()
+{
+    return "wxyz";
+}
+
+int lenOfString(string s)
+{
+    return (int)s.length();
+}
+
 int testString()
 {
     int passed = 0;
@@ -1175,6 +1194,25 @@ int testString()
     // (a non-owning wrap would alias the buffer and change with it).
     mbuf[0] = 'Z';
     passed += Test("char[N] toString owned", fromArr.data(), "abc");
+
+    // Assigning a runtime (non-literal) char* to a string must derive the length via
+    // strlen/operator string, not silently leave it at 0 (charptr-to-string-conversion
+    // bug). Covers: struct-field char* on declaration-init, char* returned from a
+    // function, and the ternary unification path.
+    CPToken tk = makeCPToken("hello");
+    string s1 = tk.text.data();
+    passed += Test("charptr field assign length", s1.length(), 5);
+
+    string s2 = giveCharPtr();
+    passed += Test("charptr from function length", s2.length(), 4);
+
+    function<int(string)> fp = lenOfString;
+    int viaFp = fp(giveCharPtr());
+    passed += Test("charptr via function<> indirect call length", viaFp, 4);
+
+    bool trueCond = true;
+    string s3 = trueCond ? tk.text.data() : tk.text;
+    passed += Test("charptr ternary length", s3.length(), 5);
 
     return passed;
 }
@@ -2100,7 +2138,7 @@ extern int main()
     r = testStackQueueOwning(); passed += r; total += 7;
     r = testListPtrOwnership(); passed += r; total += 4;
     r = testFor();              passed += r; total += 10;
-    r = testString();           passed += r; total += 22;
+    r = testString();           passed += r; total += 26;
     r = testStringConcat();     passed += r; total += 10;
     r = testStringIString();    passed += r; total += 4;
     r = testStringInterpolation(); passed += r; total += 6;
