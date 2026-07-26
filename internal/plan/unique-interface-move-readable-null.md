@@ -5,6 +5,11 @@ Status: DESIGN, not started. Promoted from the residual section of
 LANGUAGE semantics change to what a moved-from interface local is, not the one-line
 `RecordNullDerefFor` call that residual advertised.
 
+This plan also absorbs `internal/issue/mixed-ternary-interface-fat-ptr-uaf.md` (folded in
+2026-07-25, issue file deleted) - see "Part 2" at the bottom. The two items share the
+interface-ownership surface and the same test files; land Part 2 first or together, since
+Part 1's diagnostic work builds on the same explicit-move path Part 2's ledger gating touches.
+
 ## The gap
 
 A conditional or loop-carried move of a `unique <interface>` local followed by a dispatch is
@@ -117,3 +122,95 @@ plain-readable, dereference-rejected** - then turn the diagnostic on.
 
 `./cmake_build.sh release && ./test.sh Release` - the bar is the full suite green, with the
 two rewritten `test_move.cb` / `err_move.cb` legs proven RED by reverting step 3.
+
+---
+
+# Part 2: strict ownership join for the interface `?:` (mixed fat-pointer UAF)
+
+Absorbed from `internal/issue/mixed-ternary-interface-fat-ptr-uaf.md` (filed 2026-07-25).
+Harm is a USE-AFTER-FREE plus a double free, not a leak.
+
+## Symptom
+
+A `?:` whose arms mix an owning value and a live BORROW propagates the owning bit onto the
+joined value regardless of which arm the condition selects. When the BORROW arm is taken, a
+`unique` local adopts a fat pointer someone else owns, destroys it at scope exit, and the
+real owner then destroys it again.
+
+```cflat
+interface IShapeMove { int area(); };
+int dtorCount = 0;
+class SqMove : IShapeMove
+{
+    int s = 3;
+    SqMove() { }
+    int area() { return s * s; }
+    ~SqMove() { dtorCount = dtorCount + 1; }
+};
+bool identityBool(bool b) { return b; }
+move IShapeMove makeShapeMove() { return new SqMove(); }
+
+extern int main()
+{
+    unique IShapeMove owner = new SqMove();
+    IShapeMove borrowed = owner;
+    {
+        unique IShapeMove k = identityBool(false) ? makeShapeMove() : borrowed;
+        printf("area=%d\n", k.area());
+    }
+    printf("after inner dtorCount=%d (expect 0)\n", dtorCount);
+    printf("owner still alive area=%d\n", owner.area());
+    return 0;
+}
+```
+
+Observed: `dtorCount=1` after the inner scope (the borrow was destroyed), garbage from
+`owner.area()`, then SIGABRT (exit 134) when `owner` is destroyed a second time.
+
+## Root cause
+
+`PropagateTernaryOwnership` (`cflat/LLVMBackend.h`) applies the strict "every arm must be
+owning or null" rule only when the joined value `isPointerTy()`. An interface value is a
+`{i8*,i8*}` fat pointer - a STRUCT type - so it takes the older either-arm branch: whichever
+arm carries an owning-return ledger entry stamps the join, and the entry then drives adoption
+at `unique IShapeMove k = ...` and the scope-exit release in `EmitOwningInterfaceCleanup`.
+
+This is the same unsoundness the raw-pointer path had before the strict rule; the pointer
+side was closed by commits c873f15 ("Stop a mixed '?:' pointer join from laundering
+ownership into its receiver") and c315ae0 ("Judge a pointer binding's ownership by value
+identity, not by a sticky flag"). Those commits are the template: value-identity ledgers
+(`ownedNewTemps_`, owning-return ledger, `movedOutPtrValues_`), `TernaryArmJoinsOwning` as
+the single join predicate, `ClearOwnedResultChannels()` on a mixed join, and
+`CallerReleaseSuppressed` keeping suppressed entries visible to the no-discard diagnostic.
+
+## Fix direction
+
+Extend the strict all-arms rule to interface fat pointers: treat an arm as joinable only when
+it is an owning temp (owning-return ledger or owning-`new` ledger) or a
+null/zeroinitializer constant, and suppress ADOPTION as well as release for a mixed join,
+keeping the entry visible to the no-discard check exactly as the pointer path now does
+(`CallerReleaseSuppressed`). With the pointer-side machinery landed, the work is mostly
+extending the `isPointerTy()` gate in `PropagateTernaryOwnership` / `TernaryArmJoinsOwning`
+to recognize the fat-pointer struct type, plus per-arm boxing considerations
+(`UpcastTernaryPhiToInterface` boxes each arm in its own branch already).
+
+Things to plan for:
+
+- `Test/test_move.cb`'s `testUniqueInterfaceTernary` pins the current either-arm adoption
+  behaviour across 13 assertions. Narrowing the rule requires REWORKING those expectations
+  (the mixed cases become "not adopted, the allocating arm leaks" - or a
+  borrow-into-unique compile error, matching what c873f15 chose for `unique T*`), not
+  reverting the rule. Do not weaken the rule to keep the old counts.
+- The `move` arm of an interface ternary needs the same value-identity treatment the pointer
+  side got via `movedOutPtrValues_`, including the `IsBorrowed` gate from c315ae0 - a
+  `move` of a borrowed interface must not ledger as owning.
+- The other owning-value struct joins (`string`, owning-value structs, closure fat pointers)
+  reach the same either-arm branch and should be audited for the same shape at the same
+  time. Their release paths differ (`FlushOwnedStringTemps` / `FlushOwnedStructTemps`), so
+  each needs its own "is this arm actually owning" test rather than a shared
+  pointer-only gate.
+
+A leak on the mixed join is the accepted trade, exactly as on the pointer path; a
+use-after-free is not. For a `unique` receiver, prefer the pointer path's precedent: a mixed
+join into `unique` is a compile error ("cannot initialize unique ... from a borrowed
+value"), not a silent borrow.
