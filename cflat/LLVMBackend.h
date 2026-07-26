@@ -2357,6 +2357,8 @@ private:
      * store to a global or a field, a `return`, a ptrtoint, a hand-off into another retaining or
      * unanalyzable parameter slot, or a `delete` (which routes through the extern deallocator).
      * A recursion cycle answers "retains", so mutual recursion terminates conservatively.
+     * "Retain" also covers the pointee's CONTENTS: freeing the argument runs its destructor, so a
+     * pointer the callee reads out of it (or parks into it) that outlives the call counts too.
      */
     bool ParameterRetainsArgument(const llvm::Function* fn, unsigned argIndex, int depth = 0)
     {
@@ -2392,8 +2394,8 @@ private:
         return true;
     }
 
-    // Worklist half of ParameterRetainsArgument: true when `root`, or any pointer derived from it,
-    // can outlive the call. An unrecognized user counts as an escape.
+    // Worklist half of ParameterRetainsArgument: true when `root`, any pointer derived from it, or
+    // any pointer read out of its pointee can outlive the call. An unrecognized user escapes.
     bool OwningPtrEscapes(const llvm::Value* root, int depth)
     {
         llvm::SmallPtrSet<const llvm::Value*, 16> visited;
@@ -2412,26 +2414,45 @@ private:
                 if (llvm::isa<llvm::ReturnInst>(inst)) return true;
                 if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(inst))
                 {
-                    if (st->getValueOperand() != v) continue;       // writing THROUGH the pointer
+                    if (st->getValueOperand() != v)
+                    {
+                        // Writing THROUGH the pointer: a scalar, an already-tracked value, a fresh
+                        // allocation or a `move` param is fine - a CALLER-owned pointer is not.
+                        if (visited.contains(st->getValueOperand())) continue;
+                        if (TypeHoldsPointer(st->getValueOperand()->getType())
+                            && StoredValueMayBeCallerOwned(st->getValueOperand(), 0)) return true;
+                        continue;
+                    }
+                    // The tracked value is parked in a stack slot (the parameter prologue shape):
+                    // track the SLOT, so every later read of it - or of one field of it - is
+                    // judged by these same rules. Any other destination is a global or a field.
                     const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(st->getPointerOperand());
-                    if (slot == nullptr || !AllocaIsLoadStoreOnly(slot)) return true;
-                    // A stack slot whose address never leaves keeps the pointer local; follow
-                    // whatever is read back out of it (the parameter prologue has this shape).
-                    for (const llvm::User* su : slot->users())
-                        if (const auto* ld = llvm::dyn_cast<llvm::LoadInst>(su))
-                            if (visited.insert(ld).second) work.push_back(ld);
+                    if (slot == nullptr) return true;
+                    if (visited.insert(slot).second) work.push_back(slot);
                     continue;
                 }
                 if (const auto* ld = llvm::dyn_cast<llvm::LoadInst>(inst))
                 {
-                    if (ld->getPointerOperand() == v) continue;     // reading THROUGH the pointer
-                    return true;
+                    // A scalar read THROUGH the pointer stops here; a pointer (or an aggregate
+                    // holding one) dies with the pointee's destructor, so keep following it. A
+                    // whole read out of a tracked SLOT is followed whatever its type: a union
+                    // lowers to a byte blob the type walk cannot see the pointer through.
+                    if ((llvm::isa<llvm::AllocaInst>(v) || TypeHoldsPointer(ld->getType()))
+                        && visited.insert(ld).second) work.push_back(ld);
+                    continue;
                 }
                 if (const auto* call = llvm::dyn_cast<llvm::CallBase>(inst))
                 {
                     const llvm::Function* callee = call->getCalledFunction();
                     if (callee == nullptr) return true;             // indirect / virtual dispatch
-                    if (CallIsPointerOpaqueIntrinsic(callee)) continue;
+                    if (CallIsPointerOpaqueIntrinsic(callee))
+                    {
+                        // llvm.mem* with the tracked pointer as SOURCE (operand 1) copies the
+                        // pointee's bytes - including any pointer it owns - out of the call.
+                        if (callee->getName().starts_with("llvm.mem") && call->arg_size() > 1
+                            && call->getArgOperand(1) == v) return true;
+                        continue;
+                    }
                     bool passedAsArg = false;
                     for (unsigned i = 0; i < call->arg_size(); ++i)
                     {
@@ -2440,6 +2461,14 @@ private:
                         if (ParameterRetainsArgument(callee, i, depth + 1)) return true;
                     }
                     if (!passedAsArg) return true;                  // used as the callee operand
+                    continue;
+                }
+                if (const auto* ev = llvm::dyn_cast<llvm::ExtractValueInst>(inst))
+                {
+                    // Projecting a `string`'s length out of the aggregate copies a scalar; only a
+                    // pointer projection can still name the pointee's memory.
+                    if (TypeHoldsPointer(ev->getType()) && visited.insert(ev).second)
+                        work.push_back(ev);
                     continue;
                 }
                 if (llvm::isa<llvm::GetElementPtrInst>(inst) || llvm::isa<llvm::BitCastInst>(inst)
@@ -2455,9 +2484,96 @@ private:
         return false;
     }
 
+    /*
+     * Backward origin walk for the store-through rule: can `val` name memory the CALLER still
+     * owns? False only for something the callee provably produced itself - a non-global constant,
+     * an owning-return call result (a fresh allocation), or a `move` parameter whose ownership the
+     * caller has already given up. Every other origin, a plain parameter included, answers true.
+     */
+    bool StoredValueMayBeCallerOwned(const llvm::Value* val, int depth) const
+    {
+        if (val == nullptr || depth > kMaxRetainDepth) return true;
+        if (llvm::isa<llvm::Constant>(val)) return llvm::isa<llvm::GlobalValue>(val);
+        if (const auto* arg = llvm::dyn_cast<llvm::Argument>(val))
+            return !ParameterIsMove(arg->getParent(), arg->getArgNo());
+        if (const auto* call = llvm::dyn_cast<llvm::CallBase>(val))
+            return !CalleeReturnsOwned(call->getCalledFunction());
+        if (const auto* ld = llvm::dyn_cast<llvm::LoadInst>(val))
+        {
+            const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(ld->getPointerOperand());
+            if (slot == nullptr || !AllocaIsLoadStoreOnly(slot)) return true;
+            for (const llvm::User* u : slot->users())
+                if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(u))
+                    if (st->getPointerOperand() == slot
+                        && StoredValueMayBeCallerOwned(st->getValueOperand(), depth + 1)) return true;
+            return false;
+        }
+        if (llvm::isa<llvm::PHINode>(val) || llvm::isa<llvm::SelectInst>(val)
+            || llvm::isa<llvm::ExtractValueInst>(val) || llvm::isa<llvm::InsertValueInst>(val)
+            || llvm::isa<llvm::BitCastInst>(val))
+        {
+            for (const llvm::Use& op : llvm::cast<llvm::Instruction>(val)->operands())
+                if (StoredValueMayBeCallerOwned(op.get(), depth + 1)) return true;
+            return false;
+        }
+        return true;
+    }
+
+    // cflat-level facts about an emitted function, by llvm::Function identity. A miss answers the
+    // conservative way for its caller (not owning / not `move`).
+    const FunctionSymbol* FindSymbolForFunction(const llvm::Function* fn) const
+    {
+        if (fn == nullptr) return nullptr;
+        for (const auto& entry : functionTable)
+            for (const auto& sym : entry.second)
+                if (sym.Function == fn) return &sym;
+        return nullptr;
+    }
+
+    bool CalleeReturnsOwned(const llvm::Function* fn) const
+    {
+        const FunctionSymbol* sym = FindSymbolForFunction(fn);
+        return sym != nullptr && sym->ReturnsOwned;
+    }
+
+    // True when llvm argument `argIndex` is a cflat `move` parameter. An ABI-lowered or otherwise
+    // unmappable signature answers false, so the store-through rule stays conservative.
+    bool ParameterIsMove(const llvm::Function* fn, unsigned argIndex) const
+    {
+        const FunctionSymbol* sym = FindSymbolForFunction(fn);
+        if (sym == nullptr || sym->Recipe.hasLowering) return false;
+        // A method's Parameters may or may not carry the implicit `this`, so map by arity: 1:1
+        // when the counts match, shifted by one when the llvm signature has exactly one more.
+        size_t i = argIndex;
+        if (fn->arg_size() == sym->Parameters.size() + 1 && sym->IsMethod)
+        {
+            if (argIndex == 0) return false;                // `this` is never a `move` parameter
+            i = argIndex - 1;
+        }
+        else if (fn->arg_size() != sym->Parameters.size()) return false;
+        return i < sym->Parameters.size() && sym->Parameters[i].IsMove;
+    }
+
+    // True when a loaded value can carry a pointer INTO the pointee's ownership graph, so it
+    // cannot be treated as a self-contained scalar copy.
+    bool TypeHoldsPointer(const llvm::Type* t) const
+    {
+        if (t == nullptr || t->isPointerTy()) return true;
+        // A cflat union lowers to a byte blob, so the field walk below cannot see the pointer
+        // arm: answer from the declaration instead.
+        if (const auto* st = llvm::dyn_cast<llvm::StructType>(t); st != nullptr && st->hasName())
+        {
+            auto it = dataStructures.find(st->getName().str());
+            if (it != dataStructures.end() && it->second.IsUnion) return true;
+        }
+        for (unsigned i = 0; i < t->getNumContainedTypes(); ++i)
+            if (TypeHoldsPointer(t->getContainedType(i))) return true;
+        return false;
+    }
+
     // llvm.dbg.* / llvm.lifetime.* / llvm.mem* touch the POINTEE (or only debug info), never the
-    // pointer value itself, so they cannot retain it. Every other intrinsic is left to the
-    // general call path, whose declaration-only body answers "retains".
+    // pointer value itself. Every other intrinsic is left to the general call path, whose
+    // declaration-only body answers "retains"; an llvm.mem* READING the pointee is caught there.
     bool CallIsPointerOpaqueIntrinsic(const llvm::Function* callee) const
     {
         llvm::StringRef n = callee->getName();

@@ -13,6 +13,11 @@ struct Resource
     {
         dtorCount = dtorCount + 1;
     }
+    // A method that RETURNS `this`: the receiver escapes into the result, so an owning receiver
+    // temp must never be released at the statement boundary.
+    Resource* self() { return this; }
+    // A method that only READS through `this`: the receiver provably cannot outlive the call.
+    int idOf() { return id; }
 };
 
 struct Container
@@ -1388,6 +1393,7 @@ int testUniqueLocalAndParam()
 // RAII factory used by the reassignment tests: a `move` pointer return is an owned source,
 // so a `unique` local adopts it whether it lands via decl-init or plain reassignment.
 move Resource* makeOwnedResource() { return new Resource(); }
+move Resource* makeIdResource(int id) { Resource* r = new Resource(); r->id = id; return r; }
 
 // Hands back its FIRST parameter unchanged - a pure BORROW, owning nothing. The second
 // parameter exists only so a `new` can be evaluated as a call ARGUMENT: ownership must be
@@ -1399,6 +1405,60 @@ Resource* borrowFirstResource(Resource* a, Resource* b) { return a; }
 // between the borrow return and a double free.
 Resource* g_retainedResource = nullptr;
 Resource* retainSecondResource(Resource* a, Resource* b) { g_retainedResource = b; return a; }
+
+// A holder that OWNS its resource. `borrowKid` hands back a pointer read THROUGH the holder, so
+// the holder's destructor would free what the caller is left holding: releasing an owning holder
+// temp at the statement boundary is a use-after-free, not a leak fix.
+struct ResHolder
+{
+    unique Resource* kid = nullptr;
+    string tag = "";
+    Resource* borrowKid() { return kid; }
+    string borrowTag() { return tag; }
+    // Reads a pointer-bearing field without handing it out - the temp is still freeable.
+    int tagLen() { return (int)tag.length(); }
+};
+
+// A by-value SNAPSHOT of the pointee copies its pointer-bearing fields out (an `llvm.mem*` whose
+// source is the receiver), so the receiver temp must survive the copy.
+struct BigRes
+{
+    string tag = "";
+    int n = 0;
+    ~BigRes() { dtorCount = dtorCount + 1; }
+    BigRes snapshot() { return *this; }
+    int justN() { return n; }
+};
+move BigRes* makeBig()
+{
+    BigRes* g = new BigRes();
+    string t = "snap";
+    g->tag = t.copy();
+    g->n = 9;
+    return g;
+}
+
+// Parking a pointer INTO the pointee. `adoptKid` takes a borrow the CALLER still owns, so the
+// receiver temp must not be freed; `takeKid` takes ownership, so it may be.
+struct RawHolder
+{
+    Resource* kid = nullptr;
+    ~RawHolder() { if (kid != nullptr) { delete kid; } }
+    void adoptKid(Resource* c) { kid = c; }
+    void takeKid(move Resource* c) { kid = c; }
+};
+move RawHolder* makeRawHolder() { return new RawHolder(); }
+move ResHolder* makeHolder(int id)
+{
+    ResHolder* h = new ResHolder();
+    h->kid = new Resource();
+    h->kid->id = id;
+    string t = "held";
+    h->tag = t.copy();
+    return h;
+}
+// Same question in ARGUMENT position, one level out from the receiver.
+Resource* kidOfHolder(ResHolder* h) { return h->kid; }
 
 // Reassigning a `unique` pointer LOCAL through plain `=` (not a decl-initializer) must
 // transfer ownership exactly as `unique R* b = move a;` does. Before the fix the destination
@@ -1682,6 +1742,104 @@ int testUniqueLocalReassignMove()
         passed += Test("unique_reassign_mixed_join_no_early_free", dtorCount, 0);
     }
     passed += Test("unique_reassign_mixed_join_owner_freed_once", dtorCount, 1);
+
+    // An owning temp used as a METHOD-CALL RECEIVER is the same question as an owning temp in
+    // ARGUMENT position - `this` IS argument 0 - so the escape analysis decides it. `idOf` only
+    // reads through `this`, so the temp is released at end-of-full-expression instead of leaking.
+    dtorCount = 0;
+    int recvRead = makeIdResource(40)->idOf();
+    passed += Test("recv_temp_nonescaping_value", recvRead, 40);
+    passed += Test("recv_temp_nonescaping_freed_once", dtorCount, 1);
+
+    // `self()` RETURNS the receiver, so the analysis answers "retains" and no release runs. The
+    // borrow reaches `b`, which never adopted it (the result is a different SSA value from the
+    // owning temp, and no alias proof exists), so scope exit frees nothing either: this shape
+    // LEAKS by design. dtorCount deliberately stays 0 - see
+    // internal/issue/unique-assign-syntactic-owned-rhs-leaks.md. A free at either point would be
+    // a use-after-free through `b`, which the last two legs prove is still live.
+    dtorCount = 0;
+    {
+        unique Resource* b = nullptr;
+        b = makeIdResource(41)->self();
+        passed += Test("recv_temp_escaping_value", b->id, 41);
+        passed += Test("recv_temp_escaping_not_freed_at_stmt", dtorCount, 0);
+        passed += Test("recv_temp_escaping_still_dispatchable", b->idOf(), 41);
+    }
+    passed += Test("recv_temp_escaping_leaks_by_design", dtorCount, 0);
+
+    // The receiver hands back a pointer READ THROUGH itself, and it OWNS that pointee: releasing
+    // the holder temp would run its destructor and leave `kid` dangling. It must leak instead.
+    dtorCount = 0;
+    {
+        Resource* kid = makeHolder(42)->borrowKid();
+        passed += Test("recv_temp_owned_field_not_freed", dtorCount, 0);
+        passed += Test("recv_temp_owned_field_readable", kid->id, 42);
+    }
+    // Pinned AFTER scope exit too: the holder is owned by nobody, so it leaks - it must not be
+    // freed late either, which would be the same use-after-free one statement further on.
+    passed += Test("recv_temp_owned_field_leaks_after_scope", dtorCount, 0);
+
+    // Same hazard through a `string` field: the {ptr,len} copy names the holder's buffer.
+    dtorCount = 0;
+    {
+        string heldTag = makeHolder(43)->borrowTag();
+        passed += Test("recv_temp_string_field_not_freed", dtorCount, 0);
+        passed += Test("recv_temp_string_field_readable", heldTag == "held" ? 1 : 0, 1);
+    }
+    passed += Test("recv_temp_string_field_leaks_after_scope", dtorCount, 0);
+
+    // And one level out, in ARGUMENT position rather than receiver position.
+    dtorCount = 0;
+    {
+        Resource* argKid = kidOfHolder(makeHolder(44));
+        passed += Test("arg_temp_owned_field_not_freed", dtorCount, 0);
+        passed += Test("arg_temp_owned_field_readable", argKid->id, 44);
+    }
+    passed += Test("arg_temp_owned_field_leaks_after_scope", dtorCount, 0);
+
+    // Reading a pointer-bearing field WITHOUT handing it out keeps the temp freeable: the
+    // aggregate is followed through its projections, and a length read is a scalar.
+    dtorCount = 0;
+    int heldLen = makeHolder(45)->tagLen();
+    passed += Test("recv_temp_projected_scalar_value", heldLen, 4);
+    passed += Test("recv_temp_projected_scalar_freed_once", dtorCount, 1);
+
+    // A by-value SNAPSHOT of the pointee: the copy carries the holder's string buffer out, so the
+    // receiver temp must survive it (it leaks). The snapshot's own destructor is the only one
+    // that runs at scope exit; reading the copied fields proves nothing was freed under it.
+    dtorCount = 0;
+    {
+        BigRes snap = makeBig()->snapshot();
+        passed += Test("recv_temp_snapshot_not_freed", dtorCount, 0);
+        passed += Test("recv_temp_snapshot_tag_readable", snap.tag == "snap" ? 1 : 0, 1);
+        passed += Test("recv_temp_snapshot_scalar_readable", snap.n, 9);
+    }
+    passed += Test("recv_temp_snapshot_copy_freed_once", dtorCount, 1);
+
+    // A method that only reads a scalar out of the same struct still frees the temp.
+    dtorCount = 0;
+    int bigN = makeBig()->justN();
+    passed += Test("recv_temp_scalar_getter_value", bigN, 9);
+    passed += Test("recv_temp_scalar_getter_freed_once", dtorCount, 1);
+
+    // Parking a CALLER-owned borrow inside the receiver: freeing the receiver temp would run its
+    // destructor over `mine`, which the caller frees again at scope exit (a double free that used
+    // to abort). Nothing is freed at the statement, and `mine` is freed exactly once.
+    dtorCount = 0;
+    {
+        unique Resource* mine = new Resource();
+        mine->id = 46;
+        makeRawHolder()->adoptKid(mine);
+        passed += Test("recv_temp_parked_borrow_not_freed", dtorCount, 0);
+        passed += Test("recv_temp_parked_borrow_readable", mine->id, 46);
+    }
+    passed += Test("recv_temp_parked_borrow_freed_once", dtorCount, 1);
+
+    // Same shape with a `move` parameter: the callee owns what it parks, so the receiver temp is
+    // released at the statement and its destructor frees the transferred resource exactly once.
+    dtorCount = 0;
+    makeRawHolder()->takeKid(new Resource());
+    passed += Test("recv_temp_parked_move_param_freed_once", dtorCount, 1);
 
     return passed;
 }
@@ -3221,7 +3379,7 @@ extern int main()
     total += 11;
 
     passed += testUniqueLocalReassignMove();
-    total += 52;
+    total += 79;
 
     passed += testValueMoveArgDeferred();
     total += 5;
