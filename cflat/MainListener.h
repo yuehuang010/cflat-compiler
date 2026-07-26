@@ -7715,6 +7715,9 @@ public:
                 // CallerName marks a named lvalue source whose buffer is still owned elsewhere.
                 llvm::Value* srcStorage = nullptr;
                 llvm::Type* srcBaseType = nullptr;
+                // The initializer's RESULT VALUE, before any decl-site coercion. Ownership
+                // adoption is answered from this by value identity, never from a sticky flag.
+                llvm::Value* srcPrimary = nullptr;
                 bool srcIsMove = false;
                 bool srcMovedFromSlot = false;
                 std::string srcCallerName;
@@ -7877,6 +7880,7 @@ public:
                             // so we can do the class->interface fat-struct upcast when needed.
                             auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
                             right = LoadNamedVariable(rightNV);
+                            srcPrimary = rightNV.Primary;
                             // Derived-interface -> parent-interface: re-box (a derived vtable is not
                             // layout-compatible with the parent's once field slots exist).
                             if (right && right->getType() == compiler->GetFatPtrType()
@@ -8050,6 +8054,7 @@ public:
                                 srcInferredElemPointer = rightNV.TypeAndValue.ElemPointer;
                                 srcStorage = rightNV.Storage;
                                 srcBaseType = rightNV.BaseType;
+                                srcPrimary = rightNV.Primary;
                                 srcIsMove = rightNV.TypeAndValue.IsMove;
                                 // Borrow of an element the owning container frees (list<unique X*>
                                 // .get). Capture it so the local is tagged for the delete check.
@@ -8598,10 +8603,32 @@ public:
                             compiler->lastCallReturnsOwned = false;
                         }
 
-                        // Propagate new-allocation: mark local as owning its heap pointer.
-                        // IsNewAllocated is set alongside IsOwning to enable refcount-on-field-escape
-                        // (move params have IsOwning but not IsNewAllocated).
-                        if (compiler->lastOwningResult)
+                        /*
+                         * Propagate new-allocation: mark local as owning its heap pointer.
+                         * IsNewAllocated is set alongside IsOwning to enable refcount-on-field-escape
+                         * (move params have IsOwning but not IsNewAllocated).
+                         * lastOwningResult is a sticky per-expression channel that a `new` ANYWHERE in
+                         * the initializer sets, including in a call's ARGUMENT list, so
+                         * `T* r = borrows(p, new T());` adopted the call's BORROW return and freed a
+                         * pointee its real owner freed again. For a POINTER destination the channel is
+                         * therefore only trusted when it agrees with the initializer's RESULT VALUE:
+                         * the initializer is a direct `new` / top-level `move` (whose result is the
+                         * owned thing by construction), or the result value is itself ledgered owned
+                         * (an owning `new` or move-returning call that reached the result through a
+                         * transparent wrapper such as a '?:' arm, or a pointer a `move` detached).
+                         * Non-pointer destinations (owning struct, string, interface fat ptr) run their
+                         * own release paths and keep the channel's plain reading.
+                         */
+                        auto* initAssignExprOwn = initializer ? initializer->assignmentExpression() : nullptr;
+                        bool initResultOwns = compiler->lastOwningResult
+                            && (!typeAndValue.Pointer
+                                || (initAssignExprOwn != nullptr
+                                    && (AsDirectNew(initAssignExprOwn) != nullptr
+                                        || TopLevelMoveExpression(initAssignExprOwn) != nullptr))
+                                || compiler->IsOwnedNewTemp(srcPrimary)
+                                || compiler->IsOwningPtrTempValue(srcPrimary)
+                                || compiler->IsMovedOutPtrValue(srcPrimary));
+                        if (initResultOwns)
                         {
                             // `move` of a BORROWED pointer transfers nothing - the real owner still
                             // frees the pointee, so adopting it here frees it twice. ParseMoveExpression
@@ -8627,6 +8654,10 @@ public:
                             compiler->lastOwningResult = false;
                             compiler->lastAllocAlignment = 0;
                         }
+                        // A channel the value-identity gate rejected is stale (a `new` from an argument
+                        // list); retire it here so no later declaration or return reads it as owned.
+                        compiler->lastOwningResult = false;
+                        compiler->lastAllocAlignment = 0;
 
                         // Move OUT of a container element slot (`T tmp = move _data[i]`): the pointer/
                         // interface element read demoted `unique`-ness away (a slot read hands out a
@@ -9850,10 +9881,15 @@ public:
             // The owning-RETURN leg is asked BY VALUE IDENTITY too (IsOwningPtrTempValue), not from
             // the bare lastCallReturnsOwned side-channel: that flag fires for any owning call in the
             // RHS, including an unselected '?:' arm, so a suppressed mixed join adopted a borrow.
+            // The IsMovedOutPtrValue leg keeps this in step with the DECLARATION path: a non-mixed
+            // '?:' join of `move` arms owns, but is in no other ledger, so `b = c ? move a : nullptr;`
+            // left the moved-out object owned by nobody (leak). A MIXED join never reaches the
+            // ledger, so it still borrows here.
             bool srcIsOwnedPtrRhs = AsDirectNew(assignCtx) != nullptr
                 || TopLevelMoveExpression(assignCtx) != nullptr
                 || compiler->IsOwningPtrTempValue(rightNV.Primary)
-                || compiler->IsOwnedNewTemp(rightNV.Primary);
+                || compiler->IsOwnedNewTemp(rightNV.Primary)
+                || compiler->IsMovedOutPtrValue(rightNV.Primary);
             compiler->lastOwningResult = false;
             compiler->lastAllocAlignment = 0;
             compiler->lastCallReturnsAllocAlign = 0;
@@ -15406,7 +15442,11 @@ public:
         compiler->lastOwningResult = true;
         // Same fact, by VALUE IDENTITY, for consumers that must not trust the sticky flag: the
         // source is nulled, so nothing owns this value until a receiver adopts it (see a '?:' join).
-        compiler->RegisterMovedOutPtrValue(ptrVal);
+        // A BORROWED source transfers nothing - nulling the callee's copy leaves the real owner
+        // sole owner - so it must not enter the ledger, or a join scores it owning and the receiver
+        // frees a live pointee. The ledger thus carries provenance: membership means "owns".
+        if (!argNV.IsBorrowed)
+            compiler->RegisterMovedOutPtrValue(ptrVal);
         compiler->lastAllocAlignment = argNV.AllocAlignment;
         // Element-slot source (`move _data[i]`): the pointer read demoted `unique` to a bare borrow,
         // so let the decl site re-key ownership off the DEST type - a bare `T*` element must NOT own

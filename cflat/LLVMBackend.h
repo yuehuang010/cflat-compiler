@@ -1089,6 +1089,8 @@ public:
     // source, so nobody owns the value until a receiver adopts it - but it is not a `new` result and
     // carries no free-site type, so it belongs in neither ledger above. Lets a '?:' join ask "is
     // this arm owning" of the VALUE, so parens/casts around the move cannot change the answer.
+    // Membership carries PROVENANCE: a move of a BORROWED source transfers nothing (the real owner
+    // still frees the pointee), so ParseMoveExpression keeps it OUT and the join scores it mixed.
     // Retired with ownedNewTemps_.
     std::vector<llvm::Value*> movedOutPtrValues_;
 
@@ -2205,6 +2207,10 @@ private:
             PropagateOwnedNewTemp(trueValue, joined);
         else
             PropagateOwnedNewTemp(falseValue, joined);
+        // A join of `move` arms carries the detachment out on the JOINED value, so a receiver can
+        // still recognise the result as owning by value identity rather than by a sticky flag.
+        if (IsMovedOutPtrValue(trueValue) || IsMovedOutPtrValue(falseValue))
+            RegisterMovedOutPtrValue(joined);
         return false;
     }
 
@@ -11574,6 +11580,10 @@ public:
         // (mirrors the direct path's RegisterOwnedStringTemp) so e.g. `tree.toJson().data()`
         // does not leak. Without this the virtual path left the result classified as a borrow.
         const auto& rt = methodInfo->ReturnType;
+        // Same argument-list retirement as the direct-call path: the result is a different value
+        // than anything a `new`/`move` in the argument list produced.
+        lastOwningResult = false;
+        lastAllocAlignment = 0;
         // A substituted `unique X*` type-arg return owns like `move` (see the direct-call path).
         lastCallReturnsOwned = (rt.IsMove || rt.IsUniqueTypeArg)
             && (rt.TypeName == "string" || rt.Pointer || rt.IsInterface);
@@ -16010,6 +16020,10 @@ public:
         // Cache the resolved return type so callers can populate TypeAndValue after the call.
         lastCallReturnType = candidate.ReturnType;
         lastCallReturnType.IsAlias = candidate.ReturnsAlias; // mark borrow-return result; inert until consumed
+        // The call RESULT is now the current expression value, so a `new`/`move` that ran only in
+        // the ARGUMENT list describes a different value: retire its sticky channels here.
+        lastOwningResult = false;
+        lastAllocAlignment = 0;
         // A substituted `unique X*` type-arg return owns like `move` (Pointer-gated: a struct
         // VALUE return e.g. list<T>.copy() may carry IsUniqueTypeArg but is not owned here).
         lastCallReturnsOwned = candidate.ReturnsOwned

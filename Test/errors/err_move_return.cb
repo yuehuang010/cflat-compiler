@@ -10,4 +10,19 @@ move Widget* borrowLeak(Widget* w)
     return nullptr;
 }
 
+// The same rule when the returned expression is a BORROW-returning CALL that merely evaluated a
+// `new` in its ARGUMENT list. The allocation is the argument's, not the result's, so the function
+// hands back a pointer it does not own. This used to compile silently: the `new` set the sticky
+// lastOwningResult channel and the return check read it instead of the returned value.
+Widget* g_heldWidget = nullptr;
+Widget* retainSecond(Widget* a, Widget* b) { g_heldWidget = b; return a; }
+
+move Widget* argNewLeak(Widget* w)
+{
+    expect_error("function declares 'move' return type but returned expression is not owned") {
+        return retainSecond(w, new Widget());
+    }
+    return nullptr;
+}
+
 extern int main() { return 0; }

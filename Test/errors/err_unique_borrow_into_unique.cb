@@ -20,6 +20,17 @@ expect_error("cannot initialize unique 'u2' from a borrowed value") {
     }
 }
 
+// Same rule when the borrow is laundered through a `move` of a BORROWED PARAMETER. The move nulls
+// only the callee's copy, so the caller remains sole owner and the join owns nothing - adopting it
+// destroyed the caller's live object inside the callee. Rejecting it here matches the direct
+// `unique N* u = move borrowed;` spelling, which was already an error.
+expect_error("cannot initialize unique 'u3' from a borrowed value") {
+    void borrowedMoveJoin(N* borrowed, bool c)
+    {
+        unique N* u3 = c ? move borrowed : nullptr;
+    }
+}
+
 extern int main()
 {
     return 0;

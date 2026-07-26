@@ -1395,6 +1395,12 @@ move Resource* makeOwnedResource() { return new Resource(); }
 // judged from the RHS itself, not from a sticky "something allocated" flag the argument set.
 Resource* borrowFirstResource(Resource* a, Resource* b) { return a; }
 
+// Same borrow return, but the second parameter ESCAPES into a global, so the argument-release
+// path registers nothing and the declaration's own classification is the only thing standing
+// between the borrow return and a double free.
+Resource* g_retainedResource = nullptr;
+Resource* retainSecondResource(Resource* a, Resource* b) { g_retainedResource = b; return a; }
+
 // Reassigning a `unique` pointer LOCAL through plain `=` (not a decl-initializer) must
 // transfer ownership exactly as `unique R* b = move a;` does. Before the fix the destination
 // stayed non-owning, so scope exit skipped it and the moved-in object leaked.
@@ -1555,6 +1561,128 @@ int testUniqueLocalReassignMove()
         passed += Test("unique_reassign_ternary_arg_null_no_free", dtorCount, 0);
     }
     passed += Test("unique_reassign_ternary_arg_null_arm_freed_once", dtorCount, 1);
+
+    // Same question at a DECLARATION, which used to read the sticky flag instead of the RHS.
+    // A plain `T*` declared from a BORROW-returning call adopted the return whenever a `new` had
+    // run anywhere in the ARGUMENT list, so the local and the real owner freed one pointee twice.
+    // borrowFirstResource does not retain, so the argument allocation is released at
+    // end-of-full-expression (one destructor); `h` accounts for the second at scope exit.
+    dtorCount = 0;
+    {
+        unique Resource* h = new Resource();
+        h->id = 21;
+        Resource* res = borrowFirstResource(h, new Resource());
+        passed += Test("decl_borrow_call_arg_new_value", res->id, 21);
+        passed += Test("decl_borrow_call_arg_new_temp_freed", dtorCount, 1);
+    }
+    passed += Test("decl_borrow_call_arg_new_owner_freed_once", dtorCount, 2);
+
+    // The same shape with a RETAINING callee, which is the form that aborted: the argument
+    // allocation escapes into a global, so no end-of-expression release runs and the only
+    // destructor inside the scope would be a wrong one. `h` is freed once at scope exit; the
+    // retained allocation is the global's to delete.
+    dtorCount = 0;
+    {
+        unique Resource* h = new Resource();
+        h->id = 22;
+        Resource* res = retainSecondResource(h, new Resource());
+        passed += Test("decl_retaining_call_arg_new_value", res->id, 22);
+        passed += Test("decl_retaining_call_arg_new_no_early_free", dtorCount, 0);
+    }
+    passed += Test("decl_retaining_call_arg_new_owner_freed_once", dtorCount, 1);
+    delete g_retainedResource;
+    g_retainedResource = nullptr;
+    passed += Test("decl_retaining_call_arg_new_retained_freed", dtorCount, 2);
+
+    // Nested-`?:` flavour of the same leak-through: the `new` sits inside a ternary that is itself
+    // an ARGUMENT, and the selected path never reaches it. The declaration must still borrow.
+    dtorCount = 0;
+    {
+        unique Resource* keep = new Resource();
+        keep->id = 23;
+        Resource* live = keep;
+        Resource* res = borrowFirstResource(
+            keep, identityBool(false) ? (identityBool(true) ? new Resource() : live) : nullptr);
+        passed += Test("decl_nested_ternary_arg_borrow_value", res->id, 23);
+        passed += Test("decl_nested_ternary_arg_no_early_free", dtorCount, 0);
+    }
+    passed += Test("decl_nested_ternary_arg_owner_freed_once", dtorCount, 1);
+
+    // The value-identity gate must not cost a DIRECT allocation its adoption: a plain `T*` and a
+    // `unique T*` declared from `new` both own, and free exactly once at scope exit.
+    dtorCount = 0;
+    {
+        Resource* plain = new Resource();
+        plain->id = 24;
+        passed += Test("decl_direct_new_plain_value", plain->id, 24);
+    }
+    passed += Test("decl_direct_new_plain_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique Resource* owned = new Resource();
+        owned->id = 25;
+    }
+    passed += Test("decl_direct_new_unique_freed_once", dtorCount, 1);
+
+    // A move-returning call and a top-level `move` are owned sources at a declaration too.
+    dtorCount = 0;
+    {
+        Resource* fromCall = makeOwnedResource();
+        fromCall->id = 26;
+    }
+    passed += Test("decl_move_return_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique Resource* src = new Resource();
+        src->id = 27;
+        Resource* dst = move src;
+        passed += Test("decl_top_level_move_value", dst->id, 27);
+        passed += Test("decl_top_level_move_source_nulled", src == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("decl_top_level_move_freed_once", dtorCount, 1);
+
+    // A non-mixed '?:' join of `move` arms owns, and the REASSIGNMENT path must adopt it exactly
+    // as the declaration path does. It is in neither the owning-`new` nor the owning-return ledger
+    // (a move has no free-site type), so before the value-identity leg the destination stayed
+    // non-owning and the moved-out object was owned by nobody - a leak, not a double free.
+    dtorCount = 0;
+    {
+        unique Resource* a = new Resource();
+        a->id = 28;
+        unique Resource* b = nullptr;
+        b = identityBool(true) ? move a : nullptr;
+        passed += Test("unique_reassign_move_join_value", b->id, 28);
+        passed += Test("unique_reassign_move_join_source_nulled", a == nullptr ? 1 : 0, 1);
+        passed += Test("unique_reassign_move_join_no_early_free", dtorCount, 0);
+    }
+    passed += Test("unique_reassign_move_join_freed_once", dtorCount, 1);
+
+    // Same through a NESTED join, where the inner join's ownership must survive the outer one.
+    dtorCount = 0;
+    {
+        unique Resource* a = new Resource();
+        a->id = 29;
+        unique Resource* b = nullptr;
+        b = identityBool(true) ? (identityBool(true) ? move a : nullptr) : nullptr;
+        passed += Test("unique_reassign_nested_move_join_value", b->id, 29);
+    }
+    passed += Test("unique_reassign_nested_move_join_freed_once", dtorCount, 1);
+
+    // The safety direction: a MIXED join never enters the ledger, so a reassignment still BORROWS
+    // it. Adopting would free a pointee `owner` frees again at scope exit.
+    dtorCount = 0;
+    {
+        unique Resource* owner = new Resource();
+        owner->id = 30;
+        Resource* live = owner;
+        Resource* b = nullptr;
+        b = identityBool(false) ? makeOwnedResource() : live;
+        passed += Test("unique_reassign_mixed_join_borrow_value", b->id, 30);
+        passed += Test("unique_reassign_mixed_join_no_early_free", dtorCount, 0);
+    }
+    passed += Test("unique_reassign_mixed_join_owner_freed_once", dtorCount, 1);
 
     return passed;
 }
@@ -1924,6 +2052,24 @@ int testDiscardMoveReturningCall()
     return passed;
 }
 
+// `move` of a BORROWED parameter transfers nothing: nulling the callee's copy leaves the CALLER
+// the sole owner. Neither helper may adopt the join - the pointee is still the caller's, and
+// freeing it here destroys a live object the caller frees again at its own scope exit.
+int borrowedMoveJoinsNull(Resource* borrowed, bool c)
+{
+    Resource* b = nullptr;
+    b = c ? move borrowed : nullptr;
+    return b == nullptr ? -1 : b->id;
+}
+
+// The same borrowed move paired with a genuinely OWNING arm, which is the shape that used to
+// abort: the borrow arm fails join-eligibility, so the join is mixed and the result borrows.
+int borrowedMoveJoinsOwning(Resource* borrowed, bool c)
+{
+    Resource* v = c ? move borrowed : makeOwnedResource();
+    return v->id;
+}
+
 // A ternary evaluates ONLY the selected arm. It used to compute both arms eagerly and combine
 // them with LLVM's `select`, so a `move` or an owning call in the not-taken arm still ran.
 int testTernaryArmsShortCircuit()
@@ -2054,6 +2200,73 @@ int testTernaryArmsShortCircuit()
         passed += Test("ternary_paren_move_false_arm_source_nulled", a == nullptr ? 1 : 0, 1);
     }
     passed += Test("ternary_paren_move_false_arm_freed_once", dtorCount, 1);
+
+    // A NESTED non-mixed join whose inner arm is a `move`. Arm ownership is answered from the
+    // joined value, so the inner join must hand its detachment out to the OUTER join or the outer
+    // one scores mixed - which rejected this as a borrow-into-unique and left the object unowned.
+    dtorCount = 0;
+    {
+        unique Resource* a = new Resource();
+        a->id = 43;
+        unique Resource* v = identityBool(true) ? (identityBool(true) ? move a : nullptr) : nullptr;
+        passed += Test("ternary_nested_move_join_value", v->id, 43);
+        passed += Test("ternary_nested_move_join_source_nulled", a == nullptr ? 1 : 0, 1);
+        passed += Test("ternary_nested_move_join_no_early_free", dtorCount, 0);
+    }
+    passed += Test("ternary_nested_move_join_freed_once", dtorCount, 1);
+
+    // Same nesting with an allocating outer arm: both arms own, so the join owns and only the
+    // selected arm ever runs - exactly one object exists and it is freed once.
+    dtorCount = 0;
+    {
+        unique Resource* a = new Resource();
+        a->id = 44;
+        unique Resource* v = identityBool(true) ? (identityBool(true) ? move a : nullptr) : new Resource();
+        passed += Test("ternary_nested_move_new_join_value", v->id, 44);
+        passed += Test("ternary_nested_move_new_join_no_early_free", dtorCount, 0);
+    }
+    passed += Test("ternary_nested_move_new_join_freed_once", dtorCount, 1);
+
+    // Safety direction for the same shape: pair the owning inner join with a LIVE BORROW arm and
+    // the outer join is mixed again, so the receiver borrows. The untaken `move` never runs, so
+    // `a` keeps its object and `owner` keeps its own - two destructors, no double free.
+    dtorCount = 0;
+    {
+        unique Resource* owner = new Resource();
+        owner->id = 45;
+        unique Resource* a = new Resource();
+        a->id = 46;
+        Resource* v = identityBool(false) ? (identityBool(true) ? move a : nullptr) : owner;
+        passed += Test("ternary_nested_move_mixed_join_borrow_value", v->id, 45);
+        passed += Test("ternary_nested_move_mixed_join_no_early_free", dtorCount, 0);
+    }
+    passed += Test("ternary_nested_move_mixed_join_both_freed_once", dtorCount, 2);
+
+    // A `move` of a BORROWED parameter is the one move that owns NOTHING, so it must not make its
+    // arm join-eligible. Scoring it owning made the join uniform, the receiver adopted it, and the
+    // caller's live object was destroyed inside the callee (use-after-free on return, then a second
+    // destructor at the caller's scope exit). The caller stays the sole owner: one destructor.
+    dtorCount = 0;
+    {
+        unique Resource* owner = new Resource();
+        owner->id = 47;
+        passed += Test("ternary_borrowed_move_join_null_value", borrowedMoveJoinsNull(owner, true), 47);
+        passed += Test("ternary_borrowed_move_join_null_no_free", dtorCount, 0);
+        passed += Test("ternary_borrowed_move_join_null_owner_alive", owner->id, 47);
+    }
+    passed += Test("ternary_borrowed_move_join_null_owner_freed_once", dtorCount, 1);
+
+    // Same borrowed move paired with an OWNING arm - the join is mixed, so the result borrows and
+    // the untaken allocating arm never runs.
+    dtorCount = 0;
+    {
+        unique Resource* owner = new Resource();
+        owner->id = 48;
+        passed += Test("ternary_borrowed_move_mixed_join_value", borrowedMoveJoinsOwning(owner, true), 48);
+        passed += Test("ternary_borrowed_move_mixed_join_no_free", dtorCount, 0);
+        passed += Test("ternary_borrowed_move_mixed_join_owner_alive", owner->id, 48);
+    }
+    passed += Test("ternary_borrowed_move_mixed_join_owner_freed_once", dtorCount, 1);
 
     // String arms: an owning FIELD read in an arm is deep-copied, never aliased, so the
     // field still owns its own buffer after the ternary result goes out of scope.
@@ -2312,7 +2525,7 @@ extern int main()
     total += 11;
 
     passed += testUniqueLocalReassignMove();
-    total += 26;
+    total += 52;
 
     passed += testValueMoveArgDeferred();
     total += 5;
@@ -2324,7 +2537,7 @@ extern int main()
     total += 6;
 
     passed += testTernaryArmsShortCircuit();
-    total += 33;
+    total += 51;
 
     passed += testUniqueInterfaceReassign();
     total += 8;
