@@ -825,16 +825,15 @@ int testUniqueField()
         if (k != nullptr) { afterBranch = k->id; }
         passed += Test("cross_block_conditional_move_then_deref", afterBranch, -1);
 
-        // F3 shape, `unique <interface>` local: this is the exact shape that initially slipped
-        // through, because the interface deref site checked the flat IsMoved flag (OR-merged
-        // across if/else branches) instead of the same-block predicate. Unlike a thin pointer, an
-        // interface local has no post-move null-check escape hatch here (ANY read of a possibly-
-        // moved interface is pre-existing-rejected - see err_move.cb's whole-variable-move legs),
-        // so this is an UNGUARDED deref after a conditional move that is never actually taken at
-        // runtime (RuntimeFalse()) - it must compile clean and run correctly.
+        // F3 shape, `unique <interface>` local: a moved interface local is nulled but plain-
+        // readable, exactly like a moved thin pointer, so the same null-check escape hatch
+        // applies. The GUARDED deref after the conditional move must compile and run correctly;
+        // the unguarded form is a compile error (err_move.cb).
         unique IGuardBox ig = new GuardBoxImpl();
         if (RuntimeFalse()) { unique IGuardBox ig2 = move ig; }
-        passed += Test("cross_block_conditional_move_then_deref_interface", ig.tag(), 42);
+        int ifaceGuarded = -1;
+        if (ig != nullptr) { ifaceGuarded = ig.tag(); }
+        passed += Test("cross_block_conditional_move_then_deref_interface", ifaceGuarded, 42);
     }
     passed += Test("cross_block_legs_no_leak", dtorCount, 4);
 
@@ -1927,6 +1926,26 @@ int testUniqueInterfaceTernary()
     }
     passed += Test("iface_ternary_plain_decl_freed_once", dtorCount, 1);
 
+    // MIXED fat-pointer join: one arm allocates, the other yields a LIVE borrow of a `unique`
+    // interface local. Which arm runs is not knowable, so the join owns nothing a receiver may
+    // free - a plain local only borrows it. It used to adopt whichever arm the phi selected and
+    // destroy the owner's box, which the owner then destroyed again (abort). The allocating arm
+    // leaks when selected; that is the accepted trade. The `unique` receiver spelling of this is
+    // a compile error (Test/errors/err_move.cb).
+    dtorCount = 0;
+    {
+        unique IShapeMove owner = new SqMove();
+        IShapeMove borrowed = owner;
+        {
+            IShapeMove k = identityBool(false) ? makeShapeMove() : borrowed;
+            passed += Test("iface_ternary_mixed_join_borrow_value", k.area(), 0);
+            passed += Test("iface_ternary_mixed_join_no_early_free", dtorCount, 0);
+        }
+        passed += Test("iface_ternary_mixed_join_no_adoption", dtorCount, 0);
+        passed += Test("iface_ternary_mixed_join_owner_alive", owner.area(), 0);
+    }
+    passed += Test("iface_ternary_mixed_join_owner_freed_once", dtorCount, 1);
+
     return passed;
 }
 
@@ -1970,6 +1989,103 @@ int testUniqueInterfaceReassign()
         passed += Test("unique_iface_reassign_drops_old_at_assign", dtorCount, 1);
     }
     passed += Test("unique_iface_reassign_old_and_new_freed_once", dtorCount, 2);
+
+    return passed;
+}
+
+/*
+ * `unique <interface>` move as a plain-readable null (bf26a15, design record
+ * internal/plan/unique-interface-move-readable-null.md): explicit `move` of an interface local
+ * zeroes both fat-pointer slots and leaves the source LEGAL TO READ (comparisons, reassignment,
+ * pass-along) - only a DEREFERENCE is rejected (Test/errors/err_move.cb's `ui` leg). These legs
+ * pin the runtime behaviour of the readable-null contract itself, mirroring the thin-pointer
+ * `explicit_move_local_*` and `cross_block_*` legs in testUniqueField above.
+ */
+int testUniqueInterfaceMoveExtra()
+{
+    int passed = 0;
+
+    // Readable-after-move basics: source compares null both ways, dest dispatches, one free.
+    dtorCount = 0;
+    {
+        unique IShapeMove a = new SqMove();
+        unique IShapeMove b = move a;
+        passed += Test("iface_move_source_eq_null", a == nullptr ? 1 : 0, 1);
+        passed += Test("iface_move_source_neq_null", a != nullptr ? 1 : 0, 0);
+        passed += Test("iface_move_dest_dispatches", b.area(), 0);
+        passed += Test("iface_move_no_early_free", dtorCount, 0);
+    }
+    passed += Test("iface_move_freed_once", dtorCount, 1);
+
+    // Move-of-moved: the second move's receiver is null too, no dtor effect, no crash.
+    dtorCount = 0;
+    {
+        unique IShapeMove a = new SqMove();
+        unique IShapeMove b = move a;
+        unique IShapeMove c = move a;
+        passed += Test("iface_move_of_moved_dest_null", c == nullptr ? 1 : 0, 1);
+        passed += Test("iface_move_of_moved_no_early_free", dtorCount, 0);
+    }
+    passed += Test("iface_move_of_moved_freed_once", dtorCount, 1);
+
+    // Reassignment after move: the local is re-owned and dispatches; both boxes freed once each.
+    dtorCount = 0;
+    {
+        unique IShapeMove a = new SqMove();
+        unique IShapeMove b = move a;
+        a = new SqMove();
+        passed += Test("iface_move_reassign_dispatches", a.area(), 0);
+    }
+    passed += Test("iface_move_reassign_freed_twice", dtorCount, 2);
+
+    // Guarded cross-block deref, move NOT taken: guard passes, real dispatch value.
+    dtorCount = 0;
+    {
+        unique IShapeMove ig = new SqMove();
+        if (RuntimeFalse()) { unique IShapeMove ig2 = move ig; }
+        int t = -1;
+        if (ig != nullptr) { t = ig.area(); }
+        passed += Test("iface_guard_not_taken_dispatches", t, 0);
+    }
+    passed += Test("iface_guard_not_taken_freed_once", dtorCount, 1);
+
+    // Guarded cross-block deref, move TAKEN (a genuine runtime-true branch): guard fails, the
+    // sentinel path runs, no crash - the moved-to inner local frees the box.
+    dtorCount = 0;
+    {
+        unique IShapeMove ig = new SqMove();
+        if (identityBool(true)) { unique IShapeMove ig2 = move ig; }
+        int t = -1;
+        if (ig != nullptr) { t = ig.area(); }
+        passed += Test("iface_guard_taken_sentinel", t, -1);
+    }
+    passed += Test("iface_guard_taken_freed_once", dtorCount, 1);
+
+    // Loop-carried move under a guard: the move only fires on the second iteration, and the
+    // post-loop guarded deref sees the (by-then-moved) local and takes the sentinel path.
+    dtorCount = 0;
+    {
+        unique IShapeMove ig = new SqMove();
+        for (int i = 0; i < 2; i++)
+        {
+            if (ig != nullptr && identityBool(i == 1)) { unique IShapeMove ig2 = move ig; }
+        }
+        int t = -1;
+        if (ig != nullptr) { t = ig.area(); }
+        passed += Test("iface_loop_carried_guard_sentinel", t, -1);
+    }
+    passed += Test("iface_loop_carried_guard_freed_once", dtorCount, 1);
+
+    // Pass-along of a moved (null) interface local: plain assignability to a non-unique
+    // interface local stays legal (a read, not a dereference) and observes the null.
+    dtorCount = 0;
+    {
+        unique IShapeMove a = new SqMove();
+        unique IShapeMove b = move a;
+        IShapeMove d = a;
+        passed += Test("iface_move_assign_to_plain_is_null", d == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("iface_move_assign_to_plain_freed_once", dtorCount, 1);
 
     return passed;
 }
@@ -2640,7 +2756,10 @@ extern int main()
     total += 8;
 
     passed += testUniqueInterfaceTernary();
-    total += 13;
+    total += 18;
+
+    passed += testUniqueInterfaceMoveExtra();
+    total += 18;
 
     passed += testDiscardMoveReturningCall();
     total += 6;

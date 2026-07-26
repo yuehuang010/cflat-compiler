@@ -185,7 +185,14 @@ Carried over from the now-closed cross-block issue. All cost a diagnostic; none 
   name again" bit. Intentionally conservative and NOT a defect - do not "fix" it into something
   that produces false positives.
 
-## Separate residual: `unique <interface>` locals are still same-block only
+## Separate residual: `unique <interface>` locals are still same-block only [FIXED 2026-07-26]
+
+FIXED by Part 1 of `internal/plan/unique-interface-move-readable-null.md`: the interface
+explicit-move path no longer calls `MarkVariableMoved` (a moved interface local is nulled but
+plain-readable, like a moved thin pointer), and the interface member-access arm now calls
+`RecordNullDerefFor` for both method receivers and interface field access. Cross-block coverage
+is `Test/errors/err_move.cb`'s `ci1` leg; the repair guard is `test_move.cb`'s
+`cross_block_conditional_move_then_deref_interface`. Original text below.
 
 Promoted to a plan - see `internal/plan/unique-interface-move-readable-null.md`. In short: the
 interface dispatch site records no dereference event, so a cross-block move of a

@@ -77,12 +77,96 @@ expect_error("dereference of moved variable 'lc1'") {
     }
 }
 
+// Same cross-block shape on a `unique <interface>` local: the moved-from interface is nulled but
+// plain-readable, so the unguarded dispatch after the merge is caught by the MAY-null fixpoint.
+// The guarded spelling (`if (ci1 != nullptr)`) compiles - see test_move.cb's interface leg.
+expect_error("dereference of moved variable 'ci1'") {
+    int condMoveThenDerefIface(int n)
+    {
+        unique IUniqueThing ci1 = new UniqueIfaceThing();
+        if (n > 100) { unique IUniqueThing ci2 = move ci1; }
+        return ci1.get();
+    }
+}
+
+// Loop-carried move of a `unique <interface>` local: iteration 1 dereferences what iteration 0
+// moved out (via the back-edge) - the interface counterpart of the thin-pointer `lc1` leg above.
+expect_error("dereference of moved variable 'lc1i'") {
+    int loopCarriedMoveThenDerefIface()
+    {
+        unique IUniqueThing lc1i = new UniqueIfaceThing();
+        unique IUniqueThing lc2i = nullptr;
+        int total = 0;
+        for (int i = 0; i < 2; i++)
+        {
+            total = total + lc1i.get();
+            if (lc2i == nullptr) { lc2i = move lc1i; }
+        }
+        return total;
+    }
+}
+
+// Move in BOTH branches of an if/else, then an unguarded deref after the merge: every path is
+// moved, so this is strictly worse than the single-branch `ci1` leg above and must still error.
+expect_error("dereference of moved variable 'bi1'") {
+    int bothBranchesMoveThenDerefIface(int n)
+    {
+        unique IUniqueThing bi1 = new UniqueIfaceThing();
+        if (n > 100) { unique IUniqueThing bi2 = move bi1; } else { unique IUniqueThing bi3 = move bi1; }
+        return bi1.get();
+    }
+}
+
+// An unrelated guard (on a DIFFERENT variable) does not narrow `wg1`: the deref below is still
+// unconditional relative to the move, so it must error exactly as the unguarded form does - the
+// fixpoint is name-keyed, not silenced by an arbitrary nearby branch.
+expect_error("dereference of moved variable 'wg1'") {
+    int wrongVarGuardIface(int n, IUniqueThing other)
+    {
+        unique IUniqueThing wg1 = new UniqueIfaceThing();
+        if (n > 100) { unique IUniqueThing wg2 = move wg1; }
+        if (other != nullptr) { }
+        return wg1.get();
+    }
+}
+
 // Reading a moved field must still error.
 expect_error("use of moved variable 'root.left'") {
     void readMovedField(Tree* root)
     {
         consumeTree(root->left);
         Tree* alias = root->left;  // read of moved field -> error
+    }
+}
+
+// A '?:' whose arms MIX an owning interface value and a LIVE borrow. An interface value is a
+// {vtable, data} fat pointer - a struct - so the join used to take the either-arm rule and let
+// the allocating arm stamp it owning whichever arm ran. The `unique` receiver then destroyed the
+// borrow arm's box and its real owner destroyed it again (use-after-free, then abort). Which arm
+// runs is not knowable, so the join owns nothing an owning receiver may free: reject it, exactly
+// as the thin-pointer spelling is rejected (Test/errors/err_unique_borrow_into_unique.cb).
+move IUniqueThing makeUniqueIface() { return new UniqueIfaceThing(); }
+
+expect_error("cannot initialize unique 'mixedIface' from a borrowed value") {
+    int mixedIfaceJoinIntoUnique(bool c)
+    {
+        unique IUniqueThing ifaceOwner = new UniqueIfaceThing();
+        IUniqueThing borrowedIface = ifaceOwner;
+        unique IUniqueThing mixedIface = c ? makeUniqueIface() : borrowedIface;
+        return mixedIface.get();
+    }
+}
+
+// Same mixed join, spelled as an ASSIGNMENT to an already-declared unique interface local rather
+// than a decl-initializer. The assign-form reject has its own wording (LValue assignment path).
+expect_error("cannot assign a borrowed value to unique interface 'mixedIfaceAssign'") {
+    int mixedIfaceJoinIntoUniqueAssign(bool c)
+    {
+        unique IUniqueThing ifaceOwnerA = new UniqueIfaceThing();
+        IUniqueThing borrowedIfaceA = ifaceOwnerA;
+        unique IUniqueThing mixedIfaceAssign = nullptr;
+        mixedIfaceAssign = c ? makeUniqueIface() : borrowedIfaceA;
+        return mixedIfaceAssign.get();
     }
 }
 

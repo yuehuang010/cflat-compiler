@@ -9560,6 +9560,29 @@ public:
         for (unsigned i = 0; i < count; i++)
             fatPhi->addIncoming(boxed[i], phi->getIncomingBlock(i));
         compiler->builder->SetInsertPoint(savedBlock, savedPoint);
+
+        /*
+         * Carry the per-arm ownership verdict onto the boxed join. The ledgers track the RAW thin
+         * arms, and the receiver now adopts a different value (fatPhi), so the verdict must travel
+         * with it or a join with a live BORROW arm is destroyed by its receiver and again by its
+         * real owner. The diagnostic entry rides along either way (a suppressed one stays visible
+         * to the no-discard check); the thin phi's own entries are retired so nothing misfires off
+         * a value that only feeds the boxing.
+         */
+        bool armsAllOwn = true;
+        for (unsigned i = 0; i < count; i++)
+            if (!compiler->TernaryArmJoinsOwning(phi->getIncomingValue(i))) armsAllOwn = false;
+        compiler->PropagateOwnedReturnTemp(phi, fatPhi);
+        if (armsAllOwn)
+        {
+            if (compiler->IsMovedOutPtrValue(phi)) compiler->RegisterMovedOutPtrValue(fatPhi);
+        }
+        else
+        {
+            compiler->SuppressCallerRelease(fatPhi);
+            compiler->SuppressCallerRelease(phi);
+            compiler->ClearOwnedResultChannels();
+        }
         return fatPhi;
     }
 
@@ -15368,7 +15391,7 @@ public:
         // move of a named OWNING `unique <interface>` local: an interface fat value is not a
         // dataStructures entry, so the branches below never zero it and the source keeps owning the
         // boxed heap object. Transfer it exactly as a thin `unique R*` move does - capture the value,
-        // zero the source slot, mark it moved, and signal lastOwningResult so the init/assign path
+        // zero the source slot, and signal lastOwningResult so the init/assign path
         // adopts ownership (freeing any old destination box first). A direct call arg is deferred to
         // ApplyMoveParamTransfer; a non-owning (borrowed) source keeps the borrow-forward behavior.
         // The gate is ownership (IsVariableOwning), not strictly `unique`: a non-unique owning
@@ -15381,11 +15404,14 @@ public:
         {
             compiler->builder->CreateStore(
                 llvm::ConstantAggregateZero::get(compiler->GetFatPtrType()), argNV.Storage);
-            compiler->MarkVariableMoved(argNV.CallerName);
-            // Same-block deref guard (see ExplicitlyMovedNull): distinct from IsMoved above,
-            // which already rejects every read of a moved interface local, same block or not.
+            // Same-block deref guard only (see ExplicitlyMovedNull). The local stays plain-readable
+            // as a zeroed fat pointer, exactly as a moved thin `unique R*` stays readable as null.
             compiler->MarkVariableExplicitlyMovedNull(argNV.CallerName);
             compiler->lastOwningResult = true;
+            // Same fact by VALUE IDENTITY, as the thin-pointer move path does: a '?:' join must be
+            // able to score this arm owning without trusting the sticky flag. The enclosing
+            // IsVariableOwning gate keeps a move of a BORROWED interface out of the ledger.
+            compiler->RegisterMovedOutPtrValue(ptrVal);
             LLVMBackend::NamedVariable result;
             result.Primary      = ptrVal;
             result.Storage      = nullptr;
@@ -16660,8 +16686,11 @@ public:
                             namedVar = {};
 
                             auto* compiler = Compiler(ctx);
-                            // Same-block guard only, and no Deref event: an interface local keeps
-                            // the same-block rule on purpose (see the issue file, gap 1). SKIP '?.'.
+                            // Deref of a moved interface local (method receiver or interface field)
+                            // is null - record it for the cross-block MAY-null fixpoint. SKIP '?.'.
+                            if (!nullConditionalPending)
+                                compiler->RecordNullDerefFor(interfaceVar, ctx->getStart()->getLine(),
+                                    ctx->getStart()->getCharPositionInLine());
                             if (compiler->IsExplicitlyMovedNullHere(interfaceVar) && !nullConditionalPending)
                                 LogErrorContext(ctx, std::format(
                                     "dereference of moved variable '{}' (it is null after the move)",

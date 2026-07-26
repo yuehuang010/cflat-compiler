@@ -1,6 +1,13 @@
 # `unique <interface>` move: readable-as-null, and cross-block deref diagnosis
 
-Status: DESIGN, not started. Promoted from the residual section of
+Status: IMPLEMENTED (2026-07-26), landed as commit bf26a15 "Implement Unique interface".
+All five implementation-order steps below are done and the macOS suite is green (482/0/8,
+test.sh Release), with the diagnostic proven load-bearing by a red-proof. Remaining follow-up
+work discovered during implementation is tracked in its own issue files, NOT here:
+`internal/issue/ternary-owning-struct-borrow-arm-double-free.md` (struct-join double free,
+found by the step-5 audit) and `internal/issue/ternary-iface-borrow-arm-module-verify.md`
+(borrowed thin-pointer arm in an interface ternary fails module verification). This file is
+kept as the design record. Promoted from the residual section of
 `internal/issue/deref-of-moved-pointer-guard-inside-callee.md` because closing it is a
 LANGUAGE semantics change to what a moved-from interface local is, not the one-line
 `RecordNullDerefFor` call that residual advertised.
@@ -27,7 +34,7 @@ The equivalent thin-pointer program IS diagnosed by the cross-block MAY-null fix
 
 ## Why it is not a one-line fix
 
-The interface deref site (`cflat/MainListener.h:16577-16586`, the
+The interface deref site (`cflat/MainListener.h:16654-16668`, the
 `interfaceVar.TypeAndValue.IsInterface` arm of member access) deliberately records NO `Deref`
 event and checks only the same-block `IsExplicitlyMovedNullHere`. Adding
 `RecordNullDerefFor(interfaceVar, ...)` there would make the fixpoint fire - and the
@@ -48,7 +55,7 @@ The asymmetry is in the two explicit-move paths:
 
 | | thin `unique R*` local | `unique <interface>` local |
 |---|---|---|
-| site | `cflat/MainListener.h:15398-15401` | `cflat/MainListener.h:15307-15317` |
+| site | `cflat/MainListener.h:15463-15484` | `cflat/MainListener.h:15377-15395` |
 | zero the slot | yes (null store) | yes (`ConstantAggregateZero` fat ptr) |
 | `MarkVariableExplicitlyMovedNull` | yes | yes |
 | `MarkVariableMoved` (sets `IsMoved`) | **no** | **yes** |
@@ -65,15 +72,17 @@ Bring `unique <interface>` locals onto the thin-pointer contract - **moved means
 plain-readable, dereference-rejected** - then turn the diagnostic on.
 
 1. **Drop `MarkVariableMoved` from the interface explicit-move path**
-   (`cflat/MainListener.h:15315`), keeping the zero-store, `MarkVariableExplicitlyMovedNull`,
+   (`cflat/MainListener.h:15384`), keeping the zero-store, `MarkVariableExplicitlyMovedNull`,
    and `lastOwningResult`. This is the semantics change: reads of a moved interface local
    become legal and observe a zeroed fat pointer.
-2. **Confirm the zeroed fat pointer compares equal to `nullptr`.** The comparison lowers on
-   the data pointer; a `ConstantAggregateZero` fat value has a null data pointer, so
-   `ig == nullptr` should already be true. Verify, and if the comparison reads the vtable slot
-   instead, fix it to test the data pointer.
+2. **[RESOLVED - no change needed] The zeroed fat pointer compares equal to `nullptr`.**
+   Verified: the equality path normalizes an interface-vs-null compare by extracting the
+   DATA slot (`{1u}`, `cflat/MainListener.h:11408-11411`; fat layout is `{vtable, data}`),
+   and the move path stores `ConstantAggregateZero`, which zeroes BOTH slots - so
+   `ig == nullptr` is true after a move and no stale vtable survives (this also discharges
+   the last risk bullet below).
 3. **Record the `Deref` event at the interface dispatch site**
-   (`cflat/MainListener.h:16577-16586`): call `RecordNullDerefFor(interfaceVar, line, col)`,
+   (`cflat/MainListener.h:16654-16668`): call `RecordNullDerefFor(interfaceVar, line, col)`,
    skipping `?.` exactly as the `->`/`.` site does. `RecordNullDerefFor`
    (`cflat/LLVMBackend.h:16198`) already accepts a non-pointer owning/unique local, and
    `nulldf` is name-keyed, so no dataflow change is needed.
@@ -84,7 +93,7 @@ plain-readable, dereference-rejected** - then turn the diagnostic on.
    thin-pointer diagnostic's whole-local-only rule (`RecordNullDerefFor` bails on a non-empty
    `FieldName`).
 
-## Test fallout - the part that needs a decision
+## Test fallout - DECIDED as follows
 
 - `Test/test_move.cb`, `cross_block_conditional_move_then_deref_interface` (line ~837)
   asserts that the unguarded program above **compiles clean and returns 42**. Closing this
@@ -183,34 +192,87 @@ identity, not by a sticky flag"). Those commits are the template: value-identity
 the single join predicate, `ClearOwnedResultChannels()` on a mixed join, and
 `CallerReleaseSuppressed` keeping suppressed entries visible to the no-discard diagnostic.
 
-## Fix direction
+## Fix design (finalized 2026-07-26)
 
-Extend the strict all-arms rule to interface fat pointers: treat an arm as joinable only when
-it is an owning temp (owning-return ledger or owning-`new` ledger) or a
-null/zeroinitializer constant, and suppress ADOPTION as well as release for a mixed join,
-keeping the entry visible to the no-discard check exactly as the pointer path now does
-(`CallerReleaseSuppressed`). With the pointer-side machinery landed, the work is mostly
-extending the `isPointerTy()` gate in `PropagateTernaryOwnership` / `TernaryArmJoinsOwning`
-to recognize the fat-pointer struct type, plus per-arm boxing considerations
-(`UpcastTernaryPhiToInterface` boxes each arm in its own branch already).
+Extend the strict all-arms rule to interface fat pointers: an arm joins as owning only when
+it is an owning temp (owning-return ledger or owning-`new` ledger), a moved-out value, or a
+null/zeroinitializer constant; a mixed join suppresses ADOPTION as well as release, keeping
+the entry visible to the no-discard check exactly as the pointer path does
+(`CallerReleaseSuppressed`, `ClearOwnedResultChannels`).
 
-Things to plan for:
+Verified structure of the join paths (this shapes the implementation):
 
-- `Test/test_move.cb`'s `testUniqueInterfaceTernary` pins the current either-arm adoption
-  behaviour across 13 assertions. Narrowing the rule requires REWORKING those expectations
-  (the mixed cases become "not adopted, the allocating arm leaks" - or a
-  borrow-into-unique compile error, matching what c873f15 chose for `unique T*`), not
-  reverting the rule. Do not weaken the rule to keep the old counts.
-- The `move` arm of an interface ternary needs the same value-identity treatment the pointer
-  side got via `movedOutPtrValues_`, including the `IsBorrowed` gate from c315ae0 - a
-  `move` of a borrowed interface must not ledger as owning.
-- The other owning-value struct joins (`string`, owning-value structs, closure fat pointers)
-  reach the same either-arm branch and should be audited for the same shape at the same
-  time. Their release paths differ (`FlushOwnedStringTemps` / `FlushOwnedStructTemps`), so
-  each needs its own "is this arm actually owning" test rather than a shared
-  pointer-only gate.
+- `PropagateTernaryOwnership` already runs on EVERY ternary join - phi at
+  `cflat/MainListener.h:11103`, select at `:11219` - regardless of type. Only the
+  `mixedPtrJoin` gate inside it (`cflat/LLVMBackend.h:2225`) is `isPointerTy()`-only; the
+  either-arm ledger stamping above that gate is what launders ownership today (the comment
+  at `:2219-2220` documents the either-arm rule for non-pointer joins as the then-status quo
+  and must be rewritten with this change).
+- There are TWO interface join shapes, and they see different arm values:
+  1. **Thin-arm phi, upcast to fat** (`UpcastTernaryPhiToInterface`,
+     `cflat/MainListener.h:9523`): the ORIGINAL phi's incoming values are the raw thin
+     pointers (the `new` result, the borrowed load) - exactly the values the existing
+     pointer ledgers already track. Run `TernaryArmJoinsOwning` on
+     `phi->getIncomingValue(i)` per arm (a null arm stays joinable) and carry the verdict
+     onto the new fat phi: mixed => `SuppressCallerRelease(fatPhi)` +
+     `ClearOwnedResultChannels()`; all-owning => propagate the ledger entries onto the fat
+     phi exactly as `PropagateTernaryOwnership` does for the thin one.
+  2. **Already-fat arms** (both arms interface-typed, e.g. `cond ? makeShapeMove() :
+     borrowed`): the phi is fat-typed from the start and `PropagateTernaryOwnership` sees
+     fat STRUCT values. The owning-return ledger already holds fat call results by value
+     identity (that is what stamps the join today), so the fix is widening the
+     `mixedPtrJoin` gate to `isPointerTy() || type == GetFatPtrType()`, with
+     `TernaryArmJoinsOwning` unchanged - it is value-identity-based and
+     `Constant::isNullValue()` already covers `ConstantAggregateZero`. Caveat:
+     `GetFatPtrType()` is shared with closure/lambda fat values, so widening the gate pulls
+     closure joins under the strict rule too - audit that this is sound (a mixed closure
+     join suppressing is safe; wrongly freeing one is not) before shipping.
+- **The `move`-arm gap is real, and it is the Part 1 coupling**: the interface
+  explicit-move path (`cflat/MainListener.h:15377-15395`) sets only the sticky
+  `lastOwningResult` - it never ledgers the moved-out fat value, unlike the thin path's
+  `RegisterMovedOutPtrValue(ptrVal)` at `:15489`. Add the same call for the captured fat
+  value (`movedOutPtrValues_` stores `llvm::Value*`, so fat values fit as-is). The
+  borrowed-source gate ba1b886 added on the thin path is supplied here by the existing
+  `IsVariableOwning(CallerName)` condition guarding the whole branch - a `move` of a
+  borrowed interface never enters it, so it can never ledger as owning.
 
-A leak on the mixed join is the accepted trade, exactly as on the pointer path; a
-use-after-free is not. For a `unique` receiver, prefer the pointer path's precedent: a mixed
-join into `unique` is a compile error ("cannot initialize unique ... from a borrowed
-value"), not a silent borrow.
+DECIDED policies (mirroring the pointer path, commits c873f15 / c315ae0 / ba1b886):
+
+- A mixed join into a `unique <interface>` (or owning) receiver is a COMPILE ERROR, using
+  ba1b886's "cannot initialize unique ... from a borrowed value" wording - not a silent
+  borrow. A mixed join observed by a plain (borrow) local is a suppressed borrow; the
+  allocating arm leaks, and the no-discard diagnostic still fires on a discarded join.
+- A leak on the mixed join is the accepted trade, exactly as on the pointer path; a
+  use-after-free is not.
+
+Test fallout - RE-ASSESSED against the current tree, milder than originally feared:
+
+- `Test/test_move.cb` `testUniqueInterfaceTernary` (line 1873): the earlier claim that its
+  13 assertions pin either-arm adoption of MIXED joins is WRONG for the current tree.
+  Every leg is owning/null, owning/owning (`new SqMove() : new CiMove()`), or null/null -
+  all satisfy the strict all-arms rule and keep passing unchanged. No rework needed.
+- No existing leg covers a genuinely mixed (borrow-arm) interface join. Add two: the UAF
+  repro above as an `expect_error` leg in `Test/errors/err_move.cb` (unique receiver =>
+  compile error), and a plain-borrow-receiver leg in `testUniqueInterfaceTernary`
+  asserting no adoption (dtorCount stays 0 inside and after the inner scope, owner still
+  dispatchable - the accepted leak is not observable via dtorCount).
+- The other owning-value struct joins (`string`, owning-value structs, closure fat
+  pointers beyond the shared-type caveat above) reach the same either-arm stamping and
+  should be AUDITED for the same shape, but fixing them is OUT OF SCOPE here - their
+  release paths differ (`FlushOwnedStringTemps` / `FlushOwnedStructTemps`) and each needs
+  its own per-arm owning test. File one `internal/issue/` entry per confirmed repro.
+
+## Implementation order
+
+1. [DONE] Part 2, already-fat gate: widen `mixedPtrJoin` to the fat-pointer type, add the
+   mixed-join-into-unique compile error, add the two test legs. This alone closes the UAF.
+2. [DONE] Part 2, thin-arm upcast: per-arm verdict around `UpcastTernaryPhiToInterface`.
+3. [DONE] Part 2, move-arm ledgering: `RegisterMovedOutPtrValue` of the captured fat value in the
+   interface explicit-move path.
+4. [DONE] Part 1 steps 1, 3, 4 (drop `MarkVariableMoved`; record `Deref` events at dispatch and
+   interface-field sites), then the Part 1 test rewrites. Step 2 needs no code.
+5. [DONE 2026-07-26] The string/struct/closure join audit, filing issues only. Verdicts:
+   string SOUND (every ternary string arm is deep-copied before the phi); closures untouched
+   (separate __closure_fat_ptr type); owning-value STRUCT join is a confirmed double free -
+   filed as internal/issue/ternary-owning-struct-borrow-arm-double-free.md (compound of the
+   non-strict struct join AND a decl-init gap that shallow-copies a ternary phi).

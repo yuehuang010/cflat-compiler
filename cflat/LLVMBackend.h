@@ -2170,7 +2170,19 @@ private:
     {
         if (arm == nullptr) return false;
         if (auto* c = llvm::dyn_cast<llvm::Constant>(arm); c != nullptr && c->isNullValue()) return true;
-        return IsOwningPtrTempValue(arm) || IsMovedOutPtrValue(arm);
+        if (IsOwningPtrTempValue(arm) || IsMovedOutPtrValue(arm)) return true;
+        // An INTERFACE fat value owns through the owning-RETURN ledger, which the pointer-only
+        // IsOwningPtrTempValue cannot see; a suppressed entry already reads as absent there.
+        return IsInterfaceFatValue(arm) && FindOwnedReturnEntry(arm) != nullptr;
+    }
+
+    // True when `value` is an interface fat pointer ({vtable, data}), the STRUCT-typed shape an
+    // interface-typed '?:' arm or join carries. The closure fat pointer is a different named type.
+    bool IsInterfaceFatValue(const llvm::Value* value) const
+    {
+        if (value == nullptr) return false;
+        auto* st = llvm::dyn_cast<llvm::StructType>(value->getType());
+        return st != nullptr && st->hasName() && st->getName() == "__iface_fat_ptr";
     }
 
     // Drop every sticky per-expression "the result is owned" side-channel. These carry no value
@@ -2216,13 +2228,18 @@ private:
      * the phi selected and destroy a pointee someone else still owns. The owning-`new` ledger drives
      * adoption and release only, so a mixed join does not enter it at all. The caller must also
      * ClearOwnedResultChannels on a mixed join: those side-channels have no value identity and
-     * would otherwise let the receiver adopt anyway. Non-pointer joins (string / owning struct /
-     * interface fat ptr) run their own release paths, so the either-arm rule stands.
+     * would otherwise let the receiver adopt anyway. An INTERFACE fat-pointer join runs the same
+     * strict rule: it is a struct type, so it used to take the either-arm branch and let one
+     * owning arm stamp a join whose other arm was a live borrow - the receiver then destroyed a
+     * box its real owner destroyed again (use-after-free plus double free). The remaining
+     * non-pointer joins (string / owning struct / closure fat ptr) run their own release paths,
+     * so the either-arm rule still stands for them.
      */
     bool PropagateTernaryOwnership(llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined)
     {
         if (joined == nullptr) return false;
-        bool mixedPtrJoin = joined->getType()->isPointerTy()
+        bool strictJoin = joined->getType()->isPointerTy() || IsInterfaceFatValue(joined);
+        bool mixedPtrJoin = strictJoin
             && (!TernaryArmJoinsOwning(trueValue) || !TernaryArmJoinsOwning(falseValue));
         // Diagnostic lookup: a suppressed arm must still hand its FnName to the join, or a
         // discarded nested mixed ternary stops being reported.
@@ -2429,10 +2446,12 @@ private:
         return {};
     }
 
-    // Ledger a pointer value a `move` expression detached (see movedOutPtrValues_).
+    // Ledger a value a `move` expression detached (see movedOutPtrValues_). An INTERFACE fat
+    // pointer is accepted too - it is a struct, but it is detached by the same move contract.
     void RegisterMovedOutPtrValue(llvm::Value* value)
     {
-        if (value == nullptr || !value->getType()->isPointerTy()) return;
+        if (value == nullptr || (!value->getType()->isPointerTy() && !IsInterfaceFatValue(value)))
+            return;
         for (llvm::Value* v : movedOutPtrValues_)
             if (v == value) return;
         movedOutPtrValues_.push_back(value);
