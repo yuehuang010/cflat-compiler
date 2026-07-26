@@ -162,21 +162,14 @@ Carried over from the now-closed cross-block issue. All cost a diagnostic; none 
 
 ## Separate residual: `unique <interface>` locals are still same-block only
 
-The interface member/method dispatch site records no dereference event, so a conditional or
-loop-carried move of a `unique <interface>` local followed by a dispatch is not diagnosed:
-
-```cflat
-unique IBox ig = new BoxImpl();
-if (RuntimeFalse()) { unique IBox ig2 = move ig; }
-int t = ig.tag();          // NOT diagnosed; segfaults if the branch is ever taken
-```
-
-Deliberate: `Test/test_move.cb`'s `cross_block_conditional_move_then_deref_interface` asserts that
-exactly this program compiles clean and runs. The shape is structurally identical to the
-thin-pointer form, so there is no sound way to diagnose one and not the other - closing this needs
-a decision on that test's intent first. The mechanical change is one call to
-`RecordNullDerefFor(interfaceVar, ...)` at the interface dispatch site in `MainListener.h`;
-`nulldf` already handles the name uniformly.
+Promoted to a plan - see `internal/plan/unique-interface-move-readable-null.md`. In short: the
+interface dispatch site records no dereference event, so a cross-block move of a
+`unique <interface>` local followed by a dispatch is not diagnosed. It is NOT the one-line
+`RecordNullDerefFor` call it looks like: the interface explicit-move path also sets `IsMoved`,
+which poisons every read, so the repair guard (`if (ig != nullptr)`) that makes the thin-pointer
+diagnostic livable is itself rejected. Enabling the diagnostic first requires giving moved
+interface locals the thin-pointer contract (nulled but plain-readable), which inverts the intent
+of `Test/test_move.cb`'s `cross_block_conditional_move_then_deref_interface`.
 
 ## Not a residual: dynamic reachability
 
