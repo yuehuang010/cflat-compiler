@@ -1046,15 +1046,39 @@ public:
         std::string TypeName;
         uint64_t AllocAlign = 0;
         bool IsOwningPtr = false;
+        // Set on a '?:' join whose arms mix ownership: the entry stays VISIBLE to the no-discard
+        // check but must never drive a caller-side free. See PropagateTernaryOwnership.
+        bool CallerReleaseSuppressed = false;
     };
     std::vector<OwnedReturnTemp> ownedReturnTemps_;
 
     // Owning-POINTER SSA values produced by `new`, keyed by value identity, plus any value they
     // propagate onto (a '?:' phi/select whose arm is one). Lets a `unique T*` assignment ask
-    // "does the RHS VALUE carry ownership" instead of "what does the RHS look like". Detection
-    // only: nothing here is freed, and a value reaching a call's RESULT is a different value, so
-    // `b = addr(new R())` (borrow return) is never in it. Retired each full expression.
-    std::vector<llvm::Value*> ownedNewTemps_;
+    // "does the RHS VALUE carry ownership" instead of "what does the RHS look like". A value
+    // reaching a call's RESULT is a different value, so `b = addr(new R())` (borrow return) is
+    // never in it. Retired each full expression.
+    // TypeName/AllocAlign give a raw `new` the same free-site identity an owning RETURN has, so a
+    // provably non-escaping consuming site can register it in pendingOwnedPtrTemps.
+    struct OwnedNewTemp
+    {
+        llvm::Value* Value;
+        std::string TypeName;
+        uint64_t AllocAlign = 0;
+    };
+    std::vector<OwnedNewTemp> ownedNewTemps_;
+
+    // Per-(callee, parameter) result of ParameterRetainsArgument. Cached only for callees whose
+    // body is complete. Keyed on a raw llvm::Function*, so an entry MUST be dropped before that
+    // function dies or LLVM could hand the same address to a later Function::Create: see
+    // ForgetFunctionEscapeMemo (erasure) and ResetForReanalysis / DropModuleEscapeMemo (module
+    // rebuilds - ResetForReanalysis is not the only one).
+    static constexpr int kMaxRetainDepth = 8;
+    static constexpr size_t kMaxRetainUses = 256;
+    std::map<std::pair<const llvm::Function*, unsigned>, bool> paramRetainsMemo_;
+    std::set<std::pair<const llvm::Function*, unsigned>> paramRetainsInProgress_;
+    // Functions whose emission is SUSPENDED while a nested one is emitted (lambda invoker,
+    // generic instantiation, global-array initializer). Pushed/popped by Save/RestoreBuilderState.
+    std::vector<const llvm::Function*> suspendedFunctions_;
 
     // Concrete element (class) TypeName behind a pointer SSA value produced by `new`, keyed by
     // value identity. A '?:' phi carries no NamedVariable TypeName, so the interface upcast
@@ -1977,9 +2001,10 @@ private:
     }
 
     // Propagate an existing ledger entry onto a derived value (e.g. a '?:' select result).
+    // Copies CallerReleaseSuppressed with it, so suppression rides every derived join.
     void PropagateOwnedReturnTemp(llvm::Value* from, llvm::Value* to)
     {
-        const OwnedReturnTemp* src = FindOwnedReturnEntry(from);
+        const OwnedReturnTemp* src = FindOwnedReturnEntryForDiagnostic(from);
         if (src == nullptr || to == nullptr) return;
         OwnedReturnTemp copy = *src;
         copy.Value = to;
@@ -1988,8 +2013,23 @@ private:
         ownedReturnTemps_.push_back(copy);
     }
 
-    // Returns the ledger entry if `value` is a still-unconsumed owning return, else nullptr.
+    /*
+     * Ledger lookup for every OWNERSHIP question: the entry if `value` is a still-unconsumed
+     * owning return, else nullptr. A CallerReleaseSuppressed entry reads as ABSENT here - it
+     * survives only to keep the no-discard diagnostic firing, and treating its presence as
+     * ownership is what re-admits a freed borrow (a mixed '?:' join). Flag-blind reads are
+     * opt-in through FindOwnedReturnEntryForDiagnostic, so forgetting the qualifier now costs
+     * a leak instead of a double free.
+     */
     const OwnedReturnTemp* FindOwnedReturnEntry(llvm::Value* value) const
+    {
+        const OwnedReturnTemp* e = FindOwnedReturnEntryForDiagnostic(value);
+        return (e != nullptr && e->CallerReleaseSuppressed) ? nullptr : e;
+    }
+
+    // Raw lookup, suppression included. ONLY the no-discard diagnostic and suppression-preserving
+    // propagation may use this - a suppressed entry must never answer an ownership question.
+    const OwnedReturnTemp* FindOwnedReturnEntryForDiagnostic(llvm::Value* value) const
     {
         if (value == nullptr) return nullptr;
         for (const auto& e : ownedReturnTemps_)
@@ -1998,9 +2038,10 @@ private:
     }
 
     // Returns the callee name if `value` is a still-unconsumed owning return, else nullptr.
+    // Diagnostic-only, so deliberately flag-blind: a suppressed join is still a discard.
     const std::string* FindOwnedReturnTemp(llvm::Value* value) const
     {
-        const OwnedReturnTemp* e = FindOwnedReturnEntry(value);
+        const OwnedReturnTemp* e = FindOwnedReturnEntryForDiagnostic(value);
         return e == nullptr ? nullptr : &e->FnName;
     }
 
@@ -2008,39 +2049,303 @@ private:
      * Register an owning-POINTER call result that an enclosing expression consumes without
      * adopting it, and that the pointer provably cannot ESCAPE from: a comparison operand (the
      * result is a bool) or a scalar-field deref base (the read copies a self-contained value).
-     * A CALL ARGUMENT is deliberately NOT such a site - a borrow parameter may legally RETAIN its
-     * argument, so freeing it here would be a use-after-free; it stays a leak. Gated on the
-     * owning-return ledger, so a BORROW-returning call (also a CallInst) is never registered and
-     * cannot be double-freed. UnregisterOwnedPtrTemp guards the sink invariant (no caller-side
-     * free may remain registered for an argument a callee took ownership of).
+     * A CALL ARGUMENT is such a site only when the callee's matching parameter provably does not
+     * RETAIN it (see ParameterRetainsArgument) - the call site checks that before calling here.
+     * Gated on the owning-return / owning-`new` ledgers, so a BORROW-returning call (also a
+     * CallInst) is never registered and cannot be double-freed. UnregisterOwnedPtrTemp guards the
+     * sink invariant (no caller-side free may remain registered for an argument a callee took
+     * ownership of).
      */
     void RegisterOwnedPtrTemp(llvm::Value* value)
     {
-        const OwnedReturnTemp* e = FindOwnedReturnEntry(value);
-        if (e == nullptr || !e->IsOwningPtr) return;
+        std::string typeName;
+        uint64_t allocAlign = 0;
+        if (const OwnedReturnTemp* e = FindOwnedReturnEntry(value); e != nullptr && e->IsOwningPtr)
+        {
+            typeName = e->TypeName;
+            allocAlign = e->AllocAlign;
+        }
+        else if (const OwnedNewTemp* n = FindOwnedNewTemp(value); n != nullptr && !n->TypeName.empty())
+        {
+            typeName = n->TypeName;
+            allocAlign = n->AllocAlign;
+        }
+        else return;
         for (const auto& p : pendingOwnedPtrTemps)
             if (p.Value == value) return;   // idempotent: one buffer, one free
-        pendingOwnedPtrTemps.push_back({ value, e->TypeName, e->AllocAlign, builder->GetInsertBlock() });
+        pendingOwnedPtrTemps.push_back({ value, typeName, allocAlign, builder->GetInsertBlock() });
     }
 
-    // Ledger a `new` result (see ownedNewTemps_). Detection only - never drives a free.
-    void RegisterOwnedNewTemp(llvm::Value* value)
+    // True when `value` is a still-unadopted owning-POINTER temp: an owning-RETURN call result or
+    // a raw `new` result. Exactly the set RegisterOwnedPtrTemp accepts.
+    bool IsOwningPtrTempValue(llvm::Value* value) const
+    {
+        if (value == nullptr || !value->getType()->isPointerTy()) return false;
+        const OwnedReturnTemp* e = FindOwnedReturnEntry(value);
+        if (e != nullptr && e->IsOwningPtr) return true;
+        const OwnedNewTemp* n = FindOwnedNewTemp(value);
+        return n != nullptr && !n->TypeName.empty();
+    }
+
+    /*
+     * Register every owning-pointer ARGUMENT of the just-emitted call whose matching parameter
+     * provably does not RETAIN it, so the caller frees it at end-of-full-expression instead of
+     * leaking it. Everything not proven safe is left alone (a bounded leak beats a use-after-free).
+     */
+    void RegisterNonEscapingOwningPtrArgs(llvm::Value* callResult)
+    {
+        auto* call = llvm::dyn_cast_or_null<llvm::CallInst>(callResult);
+        if (call == nullptr) return;
+        const llvm::Function* callee = call->getCalledFunction();
+        if (callee == nullptr || callee->isDeclaration()) return;
+        for (unsigned i = 0; i < call->arg_size(); ++i)
+        {
+            llvm::Value* argVal = call->getArgOperand(i);
+            if (!IsOwningPtrTempValue(argVal)) continue;
+            if (ParameterRetainsArgument(callee, i)) continue;
+            RegisterOwnedPtrTemp(argVal);
+        }
+    }
+
+    // Drop every escape-analysis answer recorded for `fn`. Must run before the function is
+    // erased: the memo is keyed on the raw pointer, which LLVM may reuse for a new function.
+    void ForgetFunctionEscapeMemo(const llvm::Function* fn)
+    {
+        if (fn == nullptr) return;
+        std::erase_if(paramRetainsMemo_, [&](const auto& kv) { return kv.first.first == fn; });
+        std::erase_if(paramRetainsInProgress_, [&](const auto& k) { return k.first == fn; });
+        std::erase(suspendedFunctions_, fn);
+    }
+
+    // Drop every escape-analysis answer: the whole module (and every Function* in it) is going away.
+    void DropModuleEscapeMemo()
+    {
+        paramRetainsMemo_.clear();
+        paramRetainsInProgress_.clear();
+        suspendedFunctions_.clear();
+    }
+
+    // Keep `value` visible to the no-discard check but bar every caller-side free path from it,
+    // including one an earlier operand site already registered.
+    void SuppressCallerRelease(llvm::Value* value)
+    {
+        if (value == nullptr) return;
+        for (auto& e : ownedReturnTemps_)
+            if (e.Value == value) e.CallerReleaseSuppressed = true;
+        std::erase_if(ownedNewTemps_, [&](const OwnedNewTemp& n) { return n.Value == value; });
+        UnregisterOwnedPtrTemp(value);
+    }
+
+    /*
+     * True when a '?:' arm may join an OWNING result: a null constant (whose free is a no-op) or a
+     * value the caller could legally free. Join-eligibility is deliberately THE SAME PREDICATE as
+     * free-eligibility (IsOwningPtrTempValue is "exactly the set RegisterOwnedPtrTemp accepts"),
+     * so any condition added to one is automatically honoured by the other. Everything else - a
+     * live borrow, a suppressed join, an entry that is not a freeable owning pointer - fails here
+     * and forces the join to be treated as mixed, i.e. suppressed and leaked rather than freed.
+     */
+    bool TernaryArmJoinsOwning(llvm::Value* arm) const
+    {
+        if (arm == nullptr) return false;
+        if (auto* c = llvm::dyn_cast<llvm::Constant>(arm); c != nullptr && c->isNullValue()) return true;
+        return IsOwningPtrTempValue(arm);
+    }
+
+    /*
+     * Ledger a '?:' phi/select result as owning. A ternary is a transparent wrapper, so ownership
+     * rides out on the joined value. The two ledgers serve different purposes and a MIXED pointer
+     * join (`cond ? makePtr() : borrowedPtr`) must split them: DETECTION still applies, so a
+     * discarded mixed ternary is caught by the no-discard check exactly as on master, while
+     * RELEASE is suppressed - a caller-side free would fire on whatever the phi selected and
+     * destroy a pointee someone else still owns. The owning-`new` ledger drives adoption and
+     * release only, so a mixed join does not enter it at all. Non-pointer joins (string / owning
+     * struct / interface fat ptr) run their own release paths, so the either-arm rule stands.
+     */
+    void PropagateTernaryOwnership(llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined)
+    {
+        if (joined == nullptr) return;
+        bool mixedPtrJoin = joined->getType()->isPointerTy()
+            && (!TernaryArmJoinsOwning(trueValue) || !TernaryArmJoinsOwning(falseValue));
+        // Diagnostic lookup: a suppressed arm must still hand its FnName to the join, or a
+        // discarded nested mixed ternary stops being reported.
+        if (FindOwnedReturnEntryForDiagnostic(trueValue) != nullptr)
+            PropagateOwnedReturnTemp(trueValue, joined);
+        else
+            PropagateOwnedReturnTemp(falseValue, joined);
+        if (mixedPtrJoin)
+        {
+            SuppressCallerRelease(joined);
+            return;
+        }
+        if (IsOwnedNewTemp(trueValue))
+            PropagateOwnedNewTemp(trueValue, joined);
+        else
+            PropagateOwnedNewTemp(falseValue, joined);
+    }
+
+    /*
+     * Escape analysis: "can parameter `argIndex` of `fn` RETAIN its argument past the call?".
+     * Conservative by construction - true (retains, caller must not free) for anything not proven
+     * safe: an unseen body (extern / imported / varargs), an indirect or virtual-dispatch callee, a
+     * store to a global or a field, a `return`, a ptrtoint, a hand-off into another retaining or
+     * unanalyzable parameter slot, or a `delete` (which routes through the extern deallocator).
+     * A recursion cycle answers "retains", so mutual recursion terminates conservatively.
+     */
+    bool ParameterRetainsArgument(const llvm::Function* fn, unsigned argIndex, int depth = 0)
+    {
+        if (fn == nullptr || fn->isVarArg()) return true;
+        if (argIndex >= fn->arg_size() || depth > kMaxRetainDepth) return true;
+        auto key = std::make_pair(fn, argIndex);
+        if (auto it = paramRetainsMemo_.find(key); it != paramRetainsMemo_.end()) return it->second;
+        // Gate the ANSWER, not just the cache: a half-emitted body has not yet grown the store
+        // that escapes, so trusting it would free a pointer the callee goes on to retain.
+        if (!FunctionBodyIsComplete(fn)) return true;
+        if (!paramRetainsInProgress_.insert(key).second) return true;   // cycle: assume retaining
+        bool retains = OwningPtrEscapes(fn->getArg(argIndex), depth);
+        paramRetainsInProgress_.erase(key);
+        paramRetainsMemo_[key] = retains;
+        return retains;
+    }
+
+    /*
+     * True only when `fn`'s body can no longer grow. cflat emits IR as it walks the tree, and it
+     * emits functions NESTED (a lambda invoker, a generic instantiation or a global initializer
+     * suspends its enclosing function through SaveBuilderState), so neither "has a body" nor
+     * "is not currentFunction" proves completeness. Three tests, all required: not a declaration,
+     * not the function being emitted, not an enclosing function whose emission is suspended, and
+     * no block still open for appending (the belt-and-braces catch for any un-paired path).
+     */
+    bool FunctionBodyIsComplete(const llvm::Function* fn) const
+    {
+        if (fn == nullptr || fn->isDeclaration() || fn == currentFunction) return false;
+        if (std::find(suspendedFunctions_.begin(), suspendedFunctions_.end(), fn)
+            != suspendedFunctions_.end()) return false;
+        for (const auto& bb : *fn)
+            if (bb.getTerminator() == nullptr) return false;
+        return true;
+    }
+
+    // Worklist half of ParameterRetainsArgument: true when `root`, or any pointer derived from it,
+    // can outlive the call. An unrecognized user counts as an escape.
+    bool OwningPtrEscapes(const llvm::Value* root, int depth)
+    {
+        llvm::SmallPtrSet<const llvm::Value*, 16> visited;
+        llvm::SmallVector<const llvm::Value*, 16> work;
+        visited.insert(root);
+        work.push_back(root);
+        while (!work.empty())
+        {
+            if (visited.size() > kMaxRetainUses) return true;
+            const llvm::Value* v = work.pop_back_val();
+            for (const llvm::User* u : v->users())
+            {
+                const auto* inst = llvm::dyn_cast<llvm::Instruction>(u);
+                if (inst == nullptr) return true;
+                if (llvm::isa<llvm::ICmpInst>(inst)) continue;      // a bool result cannot retain
+                if (llvm::isa<llvm::ReturnInst>(inst)) return true;
+                if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(inst))
+                {
+                    if (st->getValueOperand() != v) continue;       // writing THROUGH the pointer
+                    const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(st->getPointerOperand());
+                    if (slot == nullptr || !AllocaIsLoadStoreOnly(slot)) return true;
+                    // A stack slot whose address never leaves keeps the pointer local; follow
+                    // whatever is read back out of it (the parameter prologue has this shape).
+                    for (const llvm::User* su : slot->users())
+                        if (const auto* ld = llvm::dyn_cast<llvm::LoadInst>(su))
+                            if (visited.insert(ld).second) work.push_back(ld);
+                    continue;
+                }
+                if (const auto* ld = llvm::dyn_cast<llvm::LoadInst>(inst))
+                {
+                    if (ld->getPointerOperand() == v) continue;     // reading THROUGH the pointer
+                    return true;
+                }
+                if (const auto* call = llvm::dyn_cast<llvm::CallBase>(inst))
+                {
+                    const llvm::Function* callee = call->getCalledFunction();
+                    if (callee == nullptr) return true;             // indirect / virtual dispatch
+                    if (CallIsPointerOpaqueIntrinsic(callee)) continue;
+                    bool passedAsArg = false;
+                    for (unsigned i = 0; i < call->arg_size(); ++i)
+                    {
+                        if (call->getArgOperand(i) != v) continue;
+                        passedAsArg = true;
+                        if (ParameterRetainsArgument(callee, i, depth + 1)) return true;
+                    }
+                    if (!passedAsArg) return true;                  // used as the callee operand
+                    continue;
+                }
+                if (llvm::isa<llvm::GetElementPtrInst>(inst) || llvm::isa<llvm::BitCastInst>(inst)
+                    || llvm::isa<llvm::AddrSpaceCastInst>(inst) || llvm::isa<llvm::PHINode>(inst)
+                    || llvm::isa<llvm::SelectInst>(inst))
+                {
+                    if (visited.insert(inst).second) work.push_back(inst);
+                    continue;
+                }
+                return true;   // ptrtoint, atomics, anything unmodelled: assume it escapes
+            }
+        }
+        return false;
+    }
+
+    // llvm.dbg.* / llvm.lifetime.* / llvm.mem* touch the POINTEE (or only debug info), never the
+    // pointer value itself, so they cannot retain it. Every other intrinsic is left to the
+    // general call path, whose declaration-only body answers "retains".
+    bool CallIsPointerOpaqueIntrinsic(const llvm::Function* callee) const
+    {
+        llvm::StringRef n = callee->getName();
+        return n.starts_with("llvm.dbg.") || n.starts_with("llvm.lifetime.")
+            || n.starts_with("llvm.mem");
+    }
+
+    // True when a stack slot is only loaded from and stored into directly - its address never
+    // leaves, so a pointer parked there cannot escape through the slot.
+    bool AllocaIsLoadStoreOnly(const llvm::AllocaInst* slot) const
+    {
+        for (const llvm::User* u : slot->users())
+        {
+            if (llvm::isa<llvm::LoadInst>(u)) continue;
+            if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(u))
+                if (st->getPointerOperand() == slot) continue;
+            // Only debug/lifetime markers are inert here: llvm.mem* would copy the parked
+            // POINTER VALUE out of the slot, which is an escape.
+            if (const auto* call = llvm::dyn_cast<llvm::CallBase>(u))
+                if (const llvm::Function* f = call->getCalledFunction(); f != nullptr
+                    && (f->getName().starts_with("llvm.dbg.")
+                        || f->getName().starts_with("llvm.lifetime."))) continue;
+            return false;
+        }
+        return true;
+    }
+
+    // Ledger a `new` result (see ownedNewTemps_).
+    void RegisterOwnedNewTemp(llvm::Value* value, const std::string& typeName = {}, uint64_t allocAlign = 0)
     {
         if (value == nullptr || !value->getType()->isPointerTy()) return;
-        if (IsOwnedNewTemp(value)) return;
-        ownedNewTemps_.push_back(value);
+        for (auto& e : ownedNewTemps_)
+            if (e.Value == value) return;
+        ownedNewTemps_.push_back({ value, typeName, allocAlign });
+    }
+
+    const OwnedNewTemp* FindOwnedNewTemp(llvm::Value* value) const
+    {
+        if (value == nullptr) return nullptr;
+        for (const auto& e : ownedNewTemps_)
+            if (e.Value == value) return &e;
+        return nullptr;
     }
 
     bool IsOwnedNewTemp(llvm::Value* value) const
     {
-        if (value == nullptr) return false;
-        return std::find(ownedNewTemps_.begin(), ownedNewTemps_.end(), value) != ownedNewTemps_.end();
+        return FindOwnedNewTemp(value) != nullptr;
     }
 
     // Carry the owning bit from an arm value onto a derived value ('?:' phi / select result).
     void PropagateOwnedNewTemp(llvm::Value* from, llvm::Value* to)
     {
-        if (IsOwnedNewTemp(from)) RegisterOwnedNewTemp(to);
+        const OwnedNewTemp* src = FindOwnedNewTemp(from);
+        if (src == nullptr || to == nullptr) return;
+        RegisterOwnedNewTemp(to, src->TypeName, src->AllocAlign);
     }
 
     // Ledger the class a `new` result points at (see valueElementTypeNames_).
@@ -2064,7 +2369,10 @@ private:
     void ConsumeOwnedNewTemp(llvm::Value* value)
     {
         if (value == nullptr) return;
-        std::erase(ownedNewTemps_, value);
+        std::erase_if(ownedNewTemps_, [&](const OwnedNewTemp& e) { return e.Value == value; });
+        // Adoption wins over any end-of-expression release already registered for the same
+        // value (e.g. `u = cond ? new R() : nullptr` after a comparison registered it).
+        UnregisterOwnedPtrTemp(value);
     }
 
     void UnregisterOwnedPtrTemp(llvm::Value* value)
@@ -3554,11 +3862,16 @@ private:
         auto* savedBB = builder->GetInsertBlock();
         auto savedIt = builder->GetInsertPoint();
         auto* savedFn = currentFunction;
+        // Same protocol SaveBuilderState uses: the outer function is suspended mid-body while
+        // this dtor is emitted, so the escape analysis must not read it as complete.
+        if (savedFn != nullptr) suspendedFunctions_.push_back(savedFn);
         currentFunction = b.GetInsertBlock()->getParent();
         builder->SetInsertPoint(b.GetInsertBlock());
         EmitOwningUniqueArrayCleanup(nv);
         b.SetInsertPoint(builder->GetInsertBlock());
         currentFunction = savedFn;
+        if (savedFn != nullptr && !suspendedFunctions_.empty()
+            && suspendedFunctions_.back() == savedFn) suspendedFunctions_.pop_back();
         if (savedBB != nullptr) builder->SetInsertPoint(savedBB, savedIt);
     }
 
@@ -3577,11 +3890,15 @@ private:
         auto* savedBB = builder->GetInsertBlock();
         auto savedIt = builder->GetInsertPoint();
         auto* savedFn = currentFunction;
+        // Suspend the outer function for the duration - see EmitUniqueArrayFieldRelease.
+        if (savedFn != nullptr) suspendedFunctions_.push_back(savedFn);
         currentFunction = b.GetInsertBlock()->getParent();
         builder->SetInsertPoint(b.GetInsertBlock());
         EmitOwningInterfaceCleanup(nv);
         b.SetInsertPoint(builder->GetInsertBlock());
         currentFunction = savedFn;
+        if (savedFn != nullptr && !suspendedFunctions_.empty()
+            && suspendedFunctions_.back() == savedFn) suspendedFunctions_.pop_back();
         if (savedBB != nullptr) builder->SetInsertPoint(savedBB, savedIt);
     }
 
@@ -8080,7 +8397,7 @@ public:
         std::vector<PendingOwnedStructTemp> pendingStructTemps;
         std::vector<PendingOwnedPtrTemp> pendingPtrTemps;
         std::vector<OwnedReturnTemp> ownedReturnTemps;
-        std::vector<llvm::Value*> ownedNewTemps;
+        std::vector<OwnedNewTemp> ownedNewTemps;
         std::vector<std::pair<llvm::Value*, std::string>> valueElementTypeNames;
     };
 
@@ -8097,6 +8414,9 @@ public:
         s.ownedReturnTemps    = std::move(ownedReturnTemps_);
         s.ownedNewTemps       = std::move(ownedNewTemps_);
         s.valueElementTypeNames = std::move(valueElementTypeNames_);
+        // Mark the function we are leaving mid-body INCOMPLETE for the escape analysis
+        // (see FunctionBodyIsComplete); RestoreBuilderState pops it back off.
+        if (currentFunction != nullptr) suspendedFunctions_.push_back(currentFunction);
         pendingOwnedStringTemps.clear();
         pendingOwnedClosureTemps.clear();
         pendingOwnedStructTemps.clear();
@@ -8110,6 +8430,9 @@ public:
     void RestoreBuilderState(const BuilderState& state)
     {
         builder->restoreIP(state.ip);
+        // Pop the suspend marker SaveBuilderState pushed for this frame (see suspendedFunctions_).
+        if (!suspendedFunctions_.empty() && suspendedFunctions_.back() == state.function)
+            suspendedFunctions_.pop_back();
         currentFunction = state.function;
         currentSubprogram = state.subprogram;
         builder->SetCurrentDebugLocation(state.debugLoc);
@@ -15621,6 +15944,10 @@ public:
             ? EmitAbiLoweredCall(candidate, argList)
             : CreateFunctionCall(candidate.Function, argList);
 
+        // Runs before ApplyMoveParamTransfer, whose UnregisterOwnedPtrTemp still has the
+        // last word for a sink parameter.
+        RegisterNonEscapingOwningPtrArgs(result);
+
         // Extern C function returning a function pointer: the LLVM-level return type is a
         // bare ptr but CFlat function<T> variables hold the {fn, env} closure fat struct.
         // Wrap via a per-signature thunk so the indirect-call path (which always prepends
@@ -17083,6 +17410,7 @@ public:
             // Discard the placeholder; the existing definition wins.
             if (!oldFn->use_empty())
                 LogError(std::format("'auto' return: recursive call in function '{}' is not yet supported", functionName));
+            ForgetFunctionEscapeMemo(oldFn);
             oldFn->eraseFromParent();
             return existing;
         }
@@ -17164,6 +17492,7 @@ public:
         if (!oldFn->use_empty())
             LogError(std::format("'auto' return: recursive call in function '{}' is not yet supported - declare the return type explicitly", functionName));
 
+        ForgetFunctionEscapeMemo(oldFn);
         oldFn->eraseFromParent();
         return newFn;
     }

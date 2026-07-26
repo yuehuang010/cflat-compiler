@@ -1482,8 +1482,10 @@ int testUniqueLocalReassignMove()
 
     // A BORROW-returning call must not be mistaken for an owned source just because a `new`
     // was evaluated as one of its ARGUMENTS. `h` and the return value name one pointee; if the
-    // unique local adopted it, scope exit would free it twice. Exactly one destructor runs -
-    // the argument allocation is deliberately unowned and leaks, so it never counts.
+    // unique local adopted it, scope exit would free it twice. The `b` parameter of
+    // borrowFirstResource provably does not retain its argument, so the unnamed argument
+    // allocation is released at end-of-full-expression (it used to leak): one destructor runs
+    // there, and `h` accounts for the second at scope exit.
     dtorCount = 0;
     {
         unique Resource* h = new Resource();
@@ -1491,9 +1493,9 @@ int testUniqueLocalReassignMove()
         unique Resource* borrowed = nullptr;
         borrowed = borrowFirstResource(h, new Resource());
         passed += Test("unique_reassign_borrow_call_value", borrowed->id, 5);
-        passed += Test("unique_reassign_borrow_call_no_early_free", dtorCount, 0);
+        passed += Test("unique_reassign_borrow_call_arg_temp_freed", dtorCount, 1);
     }
-    passed += Test("unique_reassign_borrow_call_not_adopted", dtorCount, 1);
+    passed += Test("unique_reassign_borrow_call_not_adopted", dtorCount, 2);
 
     // A '?:' is a transparent wrapper: an owning `new` in the TAKEN arm reaches the assignment
     // as the ternary's RESULT value, so the unique local adopts it and frees it exactly once.
@@ -1526,7 +1528,9 @@ int testUniqueLocalReassignMove()
     passed += Test("unique_reassign_ternary_both_arms_freed_once", dtorCount, 1);
 
     // The ternary's owning bit must ride the RESULT value only: a `new` wrapped in a '?:' that
-    // sits in ARGUMENT position still feeds a BORROW return, which must not be adopted.
+    // sits in ARGUMENT position still feeds a BORROW return, which must not be adopted. The
+    // selected arm's allocation is a non-retained argument temp, so it is freed at
+    // end-of-full-expression (null-guarded, so the nullptr arm frees nothing); `t3` is the second.
     dtorCount = 0;
     {
         bool useNew = true;
@@ -1536,7 +1540,21 @@ int testUniqueLocalReassignMove()
         t4 = borrowFirstResource(t3, useNew ? new Resource() : nullptr);
         passed += Test("unique_reassign_ternary_arg_borrow_value", t4->id, 9);
     }
-    passed += Test("unique_reassign_ternary_arg_borrow_not_adopted", dtorCount, 1);
+    passed += Test("unique_reassign_ternary_arg_borrow_not_adopted", dtorCount, 2);
+
+    // Same shape with the nullptr arm selected: nothing was allocated for the argument, so the
+    // end-of-expression release is a no-op and only `t5` is destroyed.
+    dtorCount = 0;
+    {
+        bool useNew = false;
+        unique Resource* t5 = new Resource();
+        t5->id = 11;
+        unique Resource* t6 = nullptr;
+        t6 = borrowFirstResource(t5, useNew ? new Resource() : nullptr);
+        passed += Test("unique_reassign_ternary_arg_null_borrow_value", t6->id, 11);
+        passed += Test("unique_reassign_ternary_arg_null_no_free", dtorCount, 0);
+    }
+    passed += Test("unique_reassign_ternary_arg_null_arm_freed_once", dtorCount, 1);
 
     return passed;
 }
@@ -2224,7 +2242,7 @@ extern int main()
     total += 11;
 
     passed += testUniqueLocalReassignMove();
-    total += 23;
+    total += 26;
 
     passed += testValueMoveArgDeferred();
     total += 5;

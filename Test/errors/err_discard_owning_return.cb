@@ -25,6 +25,33 @@ expect_error("owning return value of 'makePtr3' must not be discarded") {
     void useIt3(bool c) { c ? makePtr3() : makePtr3(); }
 }
 
+// A MIXED ternary (one owning arm, one live borrow) is still DETECTED even though the caller
+// deliberately does not free it: releasing that join would destroy whatever the phi selected,
+// so detection and release are separate ledgers. See PropagateTernaryOwnership.
+expect_error("owning return value of 'makePtr6' must not be discarded") {
+    class R6 { int id = default; };
+    move R6* makePtr6() { return new R6; }
+    R6* g_borrowed6 = nullptr;
+    void useIt6(bool c) { c ? makePtr6() : g_borrowed6; }
+}
+
+// The mirrored form: the owning arm is the FALSE arm, so either-arm detection is exercised.
+expect_error("owning return value of 'makePtr7' must not be discarded") {
+    class R7 { int id = default; };
+    move R7* makePtr7() { return new R7; }
+    R7* g_borrowed7 = nullptr;
+    void useIt7(bool c) { c ? g_borrowed7 : makePtr7(); }
+}
+
+// A NESTED mixed ternary discarded: the inner join is release-SUPPRESSED, and suppression must
+// not silence the check - detection rides the join outward even though no free is emitted.
+expect_error("owning return value of 'makePtr8' must not be discarded") {
+    class R8 { int id = default; };
+    move R8* makePtr8() { return new R8; }
+    R8* g_borrowed8 = nullptr;
+    void useIt8(bool a, bool b) { a ? (b ? makePtr8() : g_borrowed8) : nullptr; }
+}
+
 // Owned STRING return discarded (uniform policy - strings error too, not only pointers).
 expect_error("owning return value of 'makeStr' must not be discarded") {
     move string makeStr() { string s = "x"; return s.copy(); }

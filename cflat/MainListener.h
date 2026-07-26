@@ -11029,14 +11029,9 @@ public:
             return { phi, true };
         }
 
-        // A ternary is a transparent wrapper: if an arm is an owning return, the joined value
-        // carries that ownership, so ledger it so a discarded ternary is still caught.
-        if (compiler->FindOwnedReturnTemp(trueValue))
-            compiler->PropagateOwnedReturnTemp(trueValue, phi);
-        else if (compiler->FindOwnedReturnTemp(falseValue))
-            compiler->PropagateOwnedReturnTemp(falseValue, phi);
-        compiler->PropagateOwnedNewTemp(trueValue, phi);
-        compiler->PropagateOwnedNewTemp(falseValue, phi);
+        // A ternary is a transparent wrapper: ownership rides out on the joined value.
+        // Mixed owning/borrow POINTER joins are handled in PropagateTernaryOwnership.
+        compiler->PropagateTernaryOwnership(trueValue, falseValue, phi);
         return { phi, false };
     }
 
@@ -11149,16 +11144,9 @@ public:
                         return { owned, true };
                     }
                 }
-                // A ternary is a transparent wrapper: if a branch is an owning return, the select
-                // result carries that ownership, so ledger it so a discarded ternary is caught.
-                if (compiler->FindOwnedReturnTemp(trueValue))
-                    compiler->PropagateOwnedReturnTemp(trueValue, selectValue);
-                else if (compiler->FindOwnedReturnTemp(falseValue))
-                    compiler->PropagateOwnedReturnTemp(falseValue, selectValue);
-                // Eager form: BOTH arms allocate, so only the selected one can be adopted and the
-                // other leaks regardless - propagate the bit so the winner is at least adopted.
-                compiler->PropagateOwnedNewTemp(trueValue, selectValue);
-                compiler->PropagateOwnedNewTemp(falseValue, selectValue);
+                // Eager form: both arms already ran, so only the selected one can be adopted
+                // and the other leaks regardless. See PropagateTernaryOwnership.
+                compiler->PropagateTernaryOwnership(trueValue, falseValue, selectValue);
                 return { selectValue, false };
             }
 
@@ -14631,7 +14619,7 @@ public:
         // Ledger the result BY VALUE so an owning `new` reaching an assignment through a
         // transparent wrapper (a '?:' arm) is still recognized as owning. See ownedNewTemps_.
         if (!isWinrtNew && !isArray)
-            compiler->RegisterOwnedNewTemp(typedPtr);
+            compiler->RegisterOwnedNewTemp(typedPtr, typeName, siteExcess);
         // Ledger the concrete class too: a '?:' phi carries no TypeName, and the interface
         // upcast needs one per arm. See valueElementTypeNames_.
         if (!isArray)

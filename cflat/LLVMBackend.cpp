@@ -2482,6 +2482,8 @@ void LLVMBackend::ResetForReanalysis()
     ownedReturnTemps_.clear();
     ownedNewTemps_.clear();
     valueElementTypeNames_.clear();
+    // Keyed by llvm::Function*, which a rebuilt module invalidates.
+    DropModuleEscapeMemo();
     poisonedFunctions.clear();
     firstCallLocation_.clear();
     lastAllocAlignment = 0;
@@ -4120,6 +4122,7 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
         module.reset();
         functionTable.clear();
         dataStructures.clear();
+        DropModuleEscapeMemo();   // every llvm::Function* just died with the module
         context = std::make_unique<llvm::LLVMContext>();
         module  = std::make_unique<llvm::Module>("cflat", *context);
         builder = std::make_unique<llvm::IRBuilder<>>(*context);
@@ -4487,6 +4490,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     // now dangle (they pointed into the old module/context we just destroyed).
     functionTable.clear();
     dataStructures.clear();
+    DropModuleEscapeMemo();   // every llvm::Function* just died with the old module
     interfaceTable.clear();
     interfaceFields.clear();
     interfaceParents.clear();

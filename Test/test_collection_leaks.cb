@@ -200,12 +200,17 @@ struct PtrLeak { int v = 0; ~PtrLeak() { g_shapeDtor = g_shapeDtor + 1; } };
 // An owning-POINTER call result BURIED in a subexpression has no named owner, so nothing used to
 // free it - it leaked. It is now registered as an owned-pointer temp and released at
 // end-of-full-expression, exactly like the owned string/closure/struct temps - but ONLY where the
-// pointer cannot escape: a comparison operand and a scalar-field deref. A call ARGUMENT is not
-// such a site (see retainPtrTemp below) and still leaks. Adopting sites (local, `unique` local,
-// container, `return`, `move` parameter) must still free it EXACTLY once - never twice.
+// pointer cannot escape: a comparison operand, a scalar-field deref, and a call ARGUMENT whose
+// parameter provably does not retain it (see borrowPtrTemp vs retainPtrTemp below). A raw `new`
+// carries the same ledger identity, so it is covered at all three sites too. Adopting sites
+// (local, `unique` local, container, `return`, `move` parameter) must still free it EXACTLY
+// once - never twice.
 // Opaque-at-compile-time true, so a '?:' condition below cannot be folded away.
 int g_armGate = 1;
 bool RuntimeTrue() { return g_armGate != 0; }
+// A second independent gate, so a NESTED ternary can steer its inner and outer conditions apart.
+int g_armGate2 = 0;
+bool RuntimeTrue2() { return g_armGate2 != 0; }
 
 move PtrLeak* mkPtrTemp(int n) { PtrLeak* p = new PtrLeak(); p.v = n; return p; }
 move PtrLeak* fwdPtrTemp(int n) { return mkPtrTemp(n); }
@@ -215,6 +220,35 @@ void sinkPtrTemp(move PtrLeak* p) { delete p; }
 // the caller at end-of-expression - that is a use-after-free, not a leak fix. It stays a leak.
 PtrLeak* g_retainedPtr = nullptr;
 void retainPtrTemp(PtrLeak* p) { g_retainedPtr = p; }
+// The escape analysis proves these parameters do NOT retain: the pointer is only read through,
+// compared, or handed to another provably non-retaining parameter. The caller may free the temp.
+int g_borrowSeen = 0;
+void borrowPtrTemp(PtrLeak* p) { if (p != nullptr) { g_borrowSeen = p.v; } }
+void fwdBorrowPtrTemp(PtrLeak* p) { borrowPtrTemp(p); }
+// `a` is RETURNED (an escape), `b` is untouched - so only the `b` slot may be released.
+PtrLeak* firstPtrTemp(PtrLeak* a, PtrLeak* b) { return a; }
+// Retaining transitively: the pointer reaches a global through a second call.
+void fwdRetainPtrTemp(PtrLeak* p) { retainPtrTemp(p); }
+// A SELF-RECURSIVE callee: at the inner call site this body is still being emitted, so the
+// escape below it does not exist in the IR yet. The analysis must answer "retains" for any
+// function whose body can still grow, or the inner argument is freed while the global holds it.
+PtrLeak* g_recKept = nullptr;
+void recRetain(PtrLeak* p, int depth)
+{
+    if (depth > 0) { recRetain(mkPtrTemp(31), 0); return; }
+    g_recKept = p;
+}
+// Same hazard one level out: a lambda invoker is emitted NESTED, suspending this function
+// mid-body. A call from inside the lambda must not cache an answer taken from the half-emitted
+// body - a later call site in another function would reuse it. The guarded call never runs.
+PtrLeak* g_lamKept = nullptr;
+int g_lamGate = 0;
+void lamRetain(PtrLeak* p)
+{
+    function<int(int)> f = (int x) => { if (g_lamGate != 0) { lamRetain(new PtrLeak()); } return x; };
+    int q = f(1);
+    g_lamKept = p;
+}
 
 // Regression: a value struct with a USER destructor over a RAW pointer field (not `unique`) and NO
 // copy() is NON-copyable - the memberwise synth would shallow-share the pointer while the dtor frees
@@ -3227,6 +3261,112 @@ extern int main()
         delete g_retainedPtr;                               // caller-side release keeps the oracle at zero
         g_retainedPtr = nullptr;
         total++; passed += Test("retained borrow argument freed exactly once", g_shapeDtor, 1);
+
+        // Transitively retaining: the pointer reaches the same global one call deeper.
+        g_shapeDtor = 0;
+        fwdRetainPtrTemp(mkPtrTemp(14));
+        total++; passed += Test("transitively retained argument survives", g_retainedPtr->v, 14);
+        total++; passed += Test("transitively retained argument not freed by caller", g_shapeDtor, 0);
+        delete g_retainedPtr;
+        g_retainedPtr = nullptr;
+        total++; passed += Test("transitively retained argument freed exactly once", g_shapeDtor, 1);
+
+        // A NON-retaining borrow parameter: the temp provably cannot outlive the call, so the
+        // caller releases it at end-of-full-expression instead of leaking it.
+        g_shapeDtor = 0;
+        borrowPtrTemp(mkPtrTemp(10));
+        total++; passed += Test("non-retaining borrow argument read before free", g_borrowSeen, 10);
+        total++; passed += Test("non-retaining borrow argument freed by caller", g_shapeDtor, 1);
+
+        // Same, one call deeper: the forwarded slot is itself provably non-retaining.
+        g_shapeDtor = 0;
+        fwdBorrowPtrTemp(mkPtrTemp(11));
+        total++; passed += Test("forwarded non-retaining argument freed by caller", g_shapeDtor, 1);
+
+        // A raw `new` in argument position carries the same ledger identity as an owning return.
+        g_shapeDtor = 0;
+        borrowPtrTemp(new PtrLeak());
+        total++; passed += Test("raw new argument freed by caller", g_shapeDtor, 1);
+
+        // A raw `new` as a comparison operand (the ledger-identity half of the fix).
+        g_shapeDtor = 0;
+        if (new PtrLeak() != nullptr) { }
+        total++; passed += Test("raw new comparison operand freed", g_shapeDtor, 1);
+
+        // Mixed slots: `a` is returned (retains, must not be freed), `b` does not (freed here).
+        g_shapeDtor = 0;
+        PtrLeak* kept = mkPtrTemp(12);
+        PtrLeak* firstBack = firstPtrTemp(kept, mkPtrTemp(13));
+        total++; passed += Test("returned argument slot still live", firstBack->v, 12);
+        total++; passed += Test("unretained argument slot freed", g_shapeDtor, 1);
+        delete kept;
+        total++; passed += Test("returned argument slot freed exactly once", g_shapeDtor, 2);
+
+        // A '?:' ARGUMENT whose other arm is a LIVE BORROW must not carry ownership out: the
+        // free would fire on whatever the phi selected and destroy a pointee the caller owns.
+        // Arm 1 - the borrow arm is taken (the shape that used to abort).
+        g_shapeDtor = 0;
+        PtrLeak* live = mkPtrTemp(20);
+        g_armGate = 0;
+        borrowPtrTemp(RuntimeTrue() ? mkPtrTemp(21) : live);
+        total++; passed += Test("mixed ternary arg: live borrow arm survives", live->v, 20);
+        total++; passed += Test("mixed ternary arg: live borrow arm not freed", g_shapeDtor, 0);
+        borrowPtrTemp(RuntimeTrue() ? new PtrLeak() : live);   // raw-`new` flavor of the same join
+        total++; passed += Test("mixed ternary arg: raw new arm borrow survives", live->v, 20);
+        total++; passed += Test("mixed ternary arg: raw new arm borrow not freed", g_shapeDtor, 0);
+        // Arm 2 - the allocating arm is taken. firstPtrTemp RETURNS it (an escape), so the caller
+        // frees nothing and the object is recovered through the return value.
+        g_armGate = 1;
+        PtrLeak* fromNewArm = firstPtrTemp(RuntimeTrue() ? mkPtrTemp(22) : live, nullptr);
+        total++; passed += Test("mixed ternary arg: allocating arm reaches callee", fromNewArm->v, 22);
+        total++; passed += Test("mixed ternary arg: allocating arm not freed early", g_shapeDtor, 0);
+        delete fromNewArm;
+        delete live;
+        total++; passed += Test("mixed ternary arg: both owners freed exactly once", g_shapeDtor, 2);
+
+        // A NESTED mixed ternary: the inner join is mixed (owning arm + live borrow) and stays in
+        // the return ledger so the no-discard check can still see it. It must NOT read back as an
+        // owning arm of the OUTER join, or the outer re-registers the borrow through the `new`
+        // ledger and frees it. Both arm orders, plus the comparison-operand registration site.
+        g_shapeDtor = 0;
+        PtrLeak* held = mkPtrTemp(50);
+        g_armGate = 1;    // outer condition true
+        g_armGate2 = 0;   // inner condition false: the inner join selects the live borrow
+        borrowPtrTemp(RuntimeTrue() ? (RuntimeTrue2() ? mkPtrTemp(51) : held) : new PtrLeak());
+        total++; passed += Test("nested mixed ternary arg: borrow survives", held->v, 50);
+        total++; passed += Test("nested mixed ternary arg: nothing freed", g_shapeDtor, 0);
+
+        g_armGate = 0;    // arm-swapped: the mixed join is now the FALSE arm of the outer
+        borrowPtrTemp(RuntimeTrue() ? new PtrLeak() : (RuntimeTrue2() ? mkPtrTemp(52) : held));
+        total++; passed += Test("nested mixed ternary arg swapped: borrow survives", held->v, 50);
+        total++; passed += Test("nested mixed ternary arg swapped: nothing freed", g_shapeDtor, 0);
+
+        g_armGate = 1;    // same join at the COMPARISON operand site
+        if ((RuntimeTrue() ? (RuntimeTrue2() ? mkPtrTemp(53) : held) : new PtrLeak()) != nullptr)
+        {
+            total++; passed += Test("nested mixed ternary compare: took the borrow", held->v, 50);
+        }
+        total++; passed += Test("nested mixed ternary compare: nothing freed", g_shapeDtor, 0);
+        delete held;
+        total++; passed += Test("nested mixed ternary: borrowed owner freed exactly once", g_shapeDtor, 1);
+
+        // An escape emitted AFTER the call site that observes it: a self-recursive callee, and a
+        // callee suspended mid-body by a nested lambda invoker. Both must answer "retains".
+        g_shapeDtor = 0;
+        recRetain(nullptr, 1);
+        total++; passed += Test("self-recursive callee: inner argument still live", g_recKept->v, 31);
+        total++; passed += Test("self-recursive callee: inner argument not freed", g_shapeDtor, 0);
+        delete g_recKept;
+        g_recKept = nullptr;
+        total++; passed += Test("self-recursive callee: inner argument freed exactly once", g_shapeDtor, 1);
+
+        g_shapeDtor = 0;
+        lamRetain(mkPtrTemp(41));
+        total++; passed += Test("nested-emission callee: argument still live", g_lamKept->v, 41);
+        total++; passed += Test("nested-emission callee: argument not freed", g_shapeDtor, 0);
+        delete g_lamKept;
+        g_lamKept = nullptr;
+        total++; passed += Test("nested-emission callee: argument freed exactly once", g_shapeDtor, 1);
 
         g_shapeDtor = 0;
         sinkPtrTemp(mkPtrTemp(5));                          // `move` param owns it - caller must not free

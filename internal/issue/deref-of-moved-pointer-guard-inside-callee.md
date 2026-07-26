@@ -42,6 +42,31 @@ dependence cannot otherwise separate `dieIf(moved);` from the deref that follows
 block. That is out of proportion, and correlated-flag reasoning is the exact family that produced
 false positives in the three earlier designs of this diagnostic.
 
+## Decision: what is deferred, and what is deliberately not special-cased
+
+Maintainer decision, 2026-07-25. Two halves, and only one of them is on the table.
+
+**The control-flow half is fixable and is the eventual direction.** Block-granular control
+dependence is what puts `dieIf(moved);` and `return a->v;` in one block and so leaves `CD*(D)`
+empty. Splitting a caller block at a call site is a mechanical transform with a decidable effect
+on the post-dominator and control-dependence sets - a deterministic property of the caller's CFG,
+requiring no guess about runtime behaviour. Deferred on cost, not on soundness.
+
+**The `exit()`-like half is deliberately NOT special-cased further at this time.** No
+"may-not-return" modelling, no interprocedural conditional-termination analysis, no widening of
+the `BlockTerminatesProgram` name list, and no attempt to correlate a callee's termination
+condition with the moved flag. What exists today stays exactly as it is and is the whole of it:
+the LLVM `noreturn` attribute, the `provenNoReturn_` side table fed by `FunctionNeverReturns`, and
+the four-name fallback (`exit` / `abort` / `_Exit` / `quick_exit`). A conditionally-terminating
+callee therefore keeps producing this false positive, and the workarounds below remain the answer.
+
+Consequence to accept knowingly: the two halves COMPOSE, and neither is sufficient alone. Splitting
+caller blocks without the termination modelling does not close the repro at the top of this file.
+After a split the CFG through `dieIf(moved);` is still a straight line - one successor, no branch -
+so `CD*(D)` stays empty. Making the split bite would require modelling the call as having a
+not-returning successor, which is exactly the half being declined. Do the control-flow work on its
+own merits (it sharpens control dependence generally); do not file it as a fix for this repro.
+
 ## Boundary statement
 
 The diagnostic's guarantee is: **any guard VISIBLE IN THE CALLER'S CFG suppresses.** Skipping
