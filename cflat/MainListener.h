@@ -16483,6 +16483,20 @@ public:
             std::string danglingMemberOwner;
             bool danglingIsMethod = false;
 
+            // Whole-chain '?.' short-circuit: links after the first '?.' run in a shared "access"
+            // block, so a null anywhere upstream skips the REST of the chain (merged at the end).
+            llvm::BasicBlock* ncChainNullBlock = nullptr;
+            auto ncEnterGuard = [&](llvm::Value* testPtr)
+            {
+                auto* compiler = Compiler(ctx);
+                if (ncChainNullBlock == nullptr)
+                    ncChainNullBlock = compiler->CreateBasicBlock("nc_null");
+                auto* accessBlock = compiler->CreateBasicBlock("nc_access");
+                // CreateConditionJump already leaves the insert point at accessBlock.
+                compiler->CreateConditionJump(testPtr, accessBlock, ncChainNullBlock);
+                nullConditionalPending = false;
+            };
+
             // dropTrailingChildren lets a caller (e.g. the lock statement, for `rw.read`)
             // evaluate only the base of the postfix chain, ignoring a trailing suffix.
             size_t childLimit = ctx->children.size();
@@ -17034,41 +17048,43 @@ public:
 
                                 if (nullConditionalPending && structVar.Storage != nullptr)
                                 {
-                                    // Null-conditional field access: emit a null check branch
+                                    // An ARRAY field must stay Storage-only here (no load), same as
+                                    // the non-guarded arm below - a later '[i]' subscript needs the GEP.
+                                    ncEnterGuard(structVar.Storage);
+
                                     auto* fieldLLVMType = Compiler(ctx)->GetType(fieldType);
-                                    auto* resultAlloca = Compiler(ctx)->CreateAlloca(fieldLLVMType);
-
-                                    auto* nullBlock = Compiler(ctx)->CreateBasicBlock("nc_null");
-                                    auto* accessBlock = Compiler(ctx)->CreateBasicBlock("nc_access");
-                                    auto* resumeBlock = Compiler(ctx)->CreateBasicBlock("nc_resume");
-
-                                    Compiler(ctx)->CreateConditionJump(structVar.Storage, accessBlock, nullBlock);
-                                    // insert point is now accessBlock
-
-                                    llvm::Value* fieldGEP;
                                     if (dataStructure.IsUnion)
-                                        fieldGEP = structVar.Storage;  // union: all fields at offset 0
+                                    {
+                                        namedVar.Storage = structVar.Storage;  // union: all fields at offset 0
+                                        namedVar.UnionFieldType = fieldLLVMType;
+                                        if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
+                                        {
+                                            namedVar.Primary = nullptr;
+                                            namedVar.BaseType = fieldLLVMType;
+                                        }
+                                        else
+                                        {
+                                            namedVar.Primary = Compiler(ctx)->CreateLoad(fieldLLVMType, namedVar.Storage);
+                                            namedVar.BaseType = namedVar.Primary->getType();
+                                        }
+                                    }
                                     else
-                                        fieldGEP = Compiler(ctx)->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
-                                    auto* fieldVal = dataStructure.IsUnion
-                                        ? Compiler(ctx)->CreateLoad(fieldLLVMType, fieldGEP)
-                                        : Compiler(ctx)->CreateLoad(fieldGEP);
-                                    Compiler(ctx)->CreateAssignment(fieldVal, resultAlloca);
-                                    Compiler(ctx)->CreateJump(resumeBlock);
-
-                                    Compiler(ctx)->SwitchToBlock(nullBlock);
-                                    Compiler(ctx)->CreateAssignment(llvm::Constant::getNullValue(fieldLLVMType), resultAlloca);
-                                    Compiler(ctx)->CreateJump(resumeBlock);
-
-                                    Compiler(ctx)->SwitchToBlock(resumeBlock);
-                                    auto* result = Compiler(ctx)->CreateLoad(resultAlloca);
-
-                                    namedVar.Storage = nullptr;
-                                    namedVar.Primary = result;
-                                    namedVar.BaseType = result->getType();
+                                    {
+                                        namedVar.UnionFieldType = nullptr;
+                                        namedVar.Storage = Compiler(ctx)->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
+                                        if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
+                                        {
+                                            namedVar.Primary = nullptr;
+                                            namedVar.BaseType = fieldLLVMType;
+                                        }
+                                        else
+                                        {
+                                            namedVar.Primary = Compiler(ctx)->CreateLoad(namedVar.Storage);
+                                            namedVar.BaseType = namedVar.Primary->getType();
+                                        }
+                                    }
                                     namedVar.TypeAndValue = fieldType;
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
-                                    nullConditionalPending = false;
                                 }
                                 else
                                 {
@@ -19265,6 +19281,10 @@ public:
                                     "return-block function '{}' cannot be called in a value context (its "
                                     "'return' exits the caller, not the block) - call it as a bare statement",
                                     functionName));
+                                // A '?.' earlier in this chain may have left the insert point mid-chain
+                                // (an "access" block with no terminator yet) - close it before bailing.
+                                if (!Compiler(ctx)->IsBlockTerminated())
+                                    Compiler(ctx)->builder->CreateUnreachable();
                                 return {};
                             }
 
@@ -19284,6 +19304,8 @@ public:
                                     "declares return type '{}' - the inlined 'return' would not match the "
                                     "caller's return type",
                                     functionName, rb->ReturnType.TypeName, callerName, callerRetName));
+                                if (!Compiler(ctx)->IsBlockTerminated())
+                                    Compiler(ctx)->builder->CreateUnreachable();
                                 return {};
                             }
 
@@ -19474,28 +19496,14 @@ public:
 
                                 if (nullConditionalPending)
                                 {
-                                    // Null-conditional interface method call: an interface receiver is
-                                    // a fat {vtable,data} value, so the null test is on the DATA slot
-                                    // (index 1) - ifacePtr itself is always a live alloca address and
-                                    // is never null. Mirrors the thin-pointer '?.' method-call template.
+                                    // Fat {vtable,data} receiver: test the DATA slot (index 1), not
+                                    // ifacePtr itself (always a live alloca address, never null).
                                     auto* compiler = Compiler(ctx);
                                     auto* fatTy = compiler->GetFatPtrType();
                                     auto* ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
                                     auto* dataField = compiler->CreateStructGEP(fatTy, ifacePtr, 1);
                                     auto* dataPtr = compiler->CreateLoad(ptrTy, dataField);
-
-                                    const auto* retTypeTV = compiler->GetInterfaceMethodReturnType(
-                                        interfaceVar.TypeAndValue.TypeName, primaryIdentifier);
-                                    auto* retType = retTypeTV ? compiler->GetType(*retTypeTV) : nullptr;
-                                    bool hasResult = retType && !retType->isVoidTy();
-                                    auto* resultAlloca = hasResult ? compiler->CreateAlloca(retType) : nullptr;
-
-                                    auto* nullBlock = compiler->CreateBasicBlock("nc_null");
-                                    auto* accessBlock = compiler->CreateBasicBlock("nc_access");
-                                    auto* resumeBlock = compiler->CreateBasicBlock("nc_resume");
-
-                                    compiler->CreateConditionJump(dataPtr, accessBlock, nullBlock);
-                                    // insert point is now accessBlock
+                                    ncEnterGuard(dataPtr);
 
                                     namedVar.Primary = compiler->CallInterfaceMethod(
                                         ifacePtr, interfaceVar.TypeAndValue.TypeName, primaryIdentifier, extraArgs);
@@ -19503,31 +19511,6 @@ public:
                                     namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
                                     if (namedVar.Primary)
                                         namedVar.TypeAndValue = compiler->lastCallReturnType;
-
-                                    if (hasResult && namedVar.Primary)
-                                    {
-                                        compiler->CreateAssignment(namedVar.Primary, resultAlloca);
-                                        compiler->CreateJump(resumeBlock);
-
-                                        compiler->SwitchToBlock(nullBlock);
-                                        compiler->CreateAssignment(llvm::Constant::getNullValue(retType), resultAlloca);
-                                        compiler->CreateJump(resumeBlock);
-
-                                        compiler->SwitchToBlock(resumeBlock);
-                                        auto* result = compiler->CreateLoad(resultAlloca);
-                                        namedVar.Primary = result;
-                                        namedVar.BaseType = result->getType();
-                                    }
-                                    else
-                                    {
-                                        compiler->CreateJump(resumeBlock);
-                                        compiler->SwitchToBlock(nullBlock);
-                                        compiler->CreateJump(resumeBlock);
-                                        compiler->SwitchToBlock(resumeBlock);
-                                        namedVar = {};
-                                    }
-
-                                    nullConditionalPending = false;
                                 }
                                 else
                                 {
@@ -19566,6 +19549,30 @@ public:
                                 allArgs.push_back(ifaceArg);
                                 for (const auto& e : extraArgs)
                                     allArgs.push_back(e);
+
+                                if (nullConditionalPending)
+                                {
+                                    // Gate on the fat receiver's data slot, same as the vtable-method
+                                    // arm above - this path used to never consult nullConditionalPending.
+                                    auto* compiler = Compiler(ctx);
+                                    llvm::Value* ifacePtr = interfaceVar.Storage;
+                                    if (ifacePtr == nullptr && interfaceVar.Primary != nullptr)
+                                    {
+                                        auto fatTy = compiler->GetFatPtrType();
+                                        ifacePtr = compiler->CreateAlloca(fatTy);
+                                        compiler->CreateAssignment(interfaceVar.Primary, ifacePtr);
+                                    }
+                                    // No Storage and no Primary (an unspillable receiver): fall through
+                                    // unguarded - nullConditionalPending stays armed but unconsumed here.
+                                    if (ifacePtr != nullptr)
+                                    {
+                                        auto* fatTy = compiler->GetFatPtrType();
+                                        auto* ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
+                                        auto* dataField = compiler->CreateStructGEP(fatTy, ifacePtr, 1);
+                                        auto* dataPtr = compiler->CreateLoad(ptrTy, dataField);
+                                        ncEnterGuard(dataPtr);
+                                    }
+                                }
 
                                 namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(extFuncName, allArgs);
                                 namedVar.Storage = nullptr;
@@ -20079,8 +20086,8 @@ public:
                             }
                             else if (nullConditionalPending && structVar.Storage != nullptr)
                             {
-                                // Null-conditional method call: gate the call on a null check
-                                // Resolve generic extension method if needed
+                                // Resolve generic extension method if needed, then gate the call
+                                // (and the rest of the chain, via ncEnterGuard) on the receiver.
                                 std::string resolvedFuncName = functionName;
                                 if (!Compiler(ctx)->GetFunction(functionName) && genericFunctionTemplates.count(functionName))
                                 {
@@ -20096,16 +20103,8 @@ public:
                                         if (!inst.empty()) { resolvedFuncName = inst; break; }
                                     }
                                 }
-                                auto* retType = Compiler(ctx)->GetFunctionReturnType(resolvedFuncName);
-                                bool  hasResult = retType && !retType->isVoidTy();
-                                auto* resultAlloca = hasResult ? Compiler(ctx)->CreateAlloca(retType) : nullptr;
 
-                                auto* nullBlock = Compiler(ctx)->CreateBasicBlock("nc_null");
-                                auto* accessBlock = Compiler(ctx)->CreateBasicBlock("nc_access");
-                                auto* resumeBlock = Compiler(ctx)->CreateBasicBlock("nc_resume");
-
-                                Compiler(ctx)->CreateConditionJump(structVar.Storage, accessBlock, nullBlock);
-                                // insert point is now accessBlock
+                                ncEnterGuard(structVar.Storage);
 
                                 namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(resolvedFuncName, arguments, globalScopeCall);
                                 globalScopeCall = false;
@@ -20121,31 +20120,10 @@ public:
                                 }
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
-
-                                if (hasResult && namedVar.Primary)
-                                {
-                                    Compiler(ctx)->CreateAssignment(namedVar.Primary, resultAlloca);
-                                    Compiler(ctx)->CreateJump(resumeBlock);
-
-                                    Compiler(ctx)->SwitchToBlock(nullBlock);
-                                    Compiler(ctx)->CreateAssignment(llvm::Constant::getNullValue(retType), resultAlloca);
-                                    Compiler(ctx)->CreateJump(resumeBlock);
-
-                                    Compiler(ctx)->SwitchToBlock(resumeBlock);
-                                    auto* result = Compiler(ctx)->CreateLoad(resultAlloca);
-                                    namedVar.Primary = result;
-                                    namedVar.BaseType = result->getType();
-                                }
-                                else
-                                {
-                                    Compiler(ctx)->CreateJump(resumeBlock);
-                                    Compiler(ctx)->SwitchToBlock(nullBlock);
-                                    Compiler(ctx)->CreateJump(resumeBlock);
-                                    Compiler(ctx)->SwitchToBlock(resumeBlock);
-                                    namedVar = {};
-                                }
-
-                                nullConditionalPending = false;
+                                // A further chain link (e.g. `a?.nxt().get()`) must reclassify against
+                                // nxt()'s result below, not the stale pre-call receiver type.
+                                if (namedVar.Primary)
+                                    namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
                             }
                             else
                             {
@@ -20214,7 +20192,88 @@ public:
                         break;
                     }
 
-                    default: { LogErrorContext(ctx, std::format("Unexpected token '{}' in postfix expression.", parseTree->getText())); return {}; }
+                    default: {
+                        LogErrorContext(ctx, std::format("Unexpected token '{}' in postfix expression.", parseTree->getText()));
+                        if (!Compiler(ctx)->IsBlockTerminated())
+                            Compiler(ctx)->builder->CreateUnreachable();
+                        return {};
+                    }
+                    }
+                }
+            }
+
+            // Whole-chain '?.' merge: at least one '?.' fired (ncEnterGuard), so merge the FINAL
+            // link's result against the chain's null default here, once, instead of per-link.
+            if (ncChainNullBlock != nullptr)
+            {
+                auto* compiler = Compiler(ctx);
+                auto* resumeBlock = compiler->CreateBasicBlock("nc_resume");
+
+                // A whole ARRAY as the chain's final result (e.g. `p?.arr`) can't be loaded into
+                // a register, so it is excluded below and merged by ADDRESS here instead: a PHI
+                // between the real GEP (access path) and a fresh zeroed array (null path).
+                bool isArrayFinal = namedVar.Primary == nullptr && namedVar.Storage != nullptr
+                    && namedVar.BaseType != nullptr && llvm::isa<llvm::ArrayType>(namedVar.BaseType);
+
+                if (isArrayFinal)
+                {
+                    llvm::Type* arrType = namedVar.BaseType;
+                    llvm::Value* liveArrayPtr = namedVar.Storage;
+                    auto* accessPred = compiler->builder->GetInsertBlock();
+                    compiler->CreateJump(resumeBlock);
+
+                    compiler->SwitchToBlock(ncChainNullBlock);
+                    auto* zeroAlloca = compiler->CreateAlloca(arrType);
+                    compiler->builder->CreateStore(llvm::Constant::getNullValue(arrType), zeroAlloca);
+                    auto* nullPred = compiler->builder->GetInsertBlock();
+                    compiler->CreateJump(resumeBlock);
+
+                    compiler->SwitchToBlock(resumeBlock);
+                    auto* phi = compiler->builder->CreatePHI(liveArrayPtr->getType(), 2);
+                    phi->addIncoming(liveArrayPtr, accessPred);
+                    phi->addIncoming(zeroAlloca, nullPred);
+                    namedVar.Storage = phi;
+                    namedVar.Primary = nullptr;
+                    namedVar.BaseType = arrType;
+                }
+                else
+                {
+                    // A Storage-only SCALAR final link (embedded/union field) has no Primary yet -
+                    // load it now so the merge below gets a real value, not a silent blank.
+                    if (namedVar.Primary == nullptr && namedVar.Storage != nullptr && namedVar.BaseType != nullptr)
+                    {
+                        namedVar.Primary = compiler->CreateLoad(namedVar.BaseType, namedVar.Storage);
+                    }
+
+                    llvm::Type* finalType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
+                    // A void call's result is a non-null CallInst of void type - CreateAlloca(void)
+                    // is an LLVM DataLayout trap, so void must NOT be treated as "has a result".
+                    bool hasResult = finalType != nullptr && !finalType->isVoidTy();
+
+                    if (hasResult)
+                    {
+                        auto* resultAlloca = compiler->CreateAlloca(finalType);
+                        compiler->CreateAssignment(namedVar.Primary, resultAlloca);
+                        compiler->CreateJump(resumeBlock);
+
+                        compiler->SwitchToBlock(ncChainNullBlock);
+                        compiler->CreateAssignment(llvm::Constant::getNullValue(finalType), resultAlloca);
+                        compiler->CreateJump(resumeBlock);
+
+                        compiler->SwitchToBlock(resumeBlock);
+                        auto* result = compiler->CreateLoad(resultAlloca);
+                        namedVar.Storage = nullptr;
+                        namedVar.Primary = result;
+                        namedVar.BaseType = result->getType();
+                    }
+                    else
+                    {
+                        // Genuinely no result (void, or nothing at all) - merge control flow only.
+                        compiler->CreateJump(resumeBlock);
+                        compiler->SwitchToBlock(ncChainNullBlock);
+                        compiler->CreateJump(resumeBlock);
+                        compiler->SwitchToBlock(resumeBlock);
+                        namedVar = {};
                     }
                 }
             }

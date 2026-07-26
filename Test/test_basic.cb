@@ -1910,6 +1910,47 @@ class NcCounterImpl : INcCounter
     int get() { return v; }
 };
 
+// Chained '?.' fixture: a factory interface whose method returns ANOTHER interface, so
+// `factory?.mk().get()` must short-circuit the WHOLE chain (not just `mk()`) when the
+// receiver is null - a null intermediate must never reach the unguarded `.get()`.
+interface INcFactory { INcCounter mk(); };
+class NcFactoryImpl : INcFactory
+{
+    NcCounterImpl* inner = nullptr;
+    NcFactoryImpl(int val) { inner = new NcCounterImpl(val); }
+    INcCounter mk() { return inner; }
+};
+
+// Extension (UFCS) function on the interface type, for the '?.' + extension-function gap:
+// `recv?.doubled()` binds to this free function (not a vtable method) and must still short-
+// circuit on a null receiver instead of passing it straight into the callee.
+int ncDoubled(INcCounter c) { return c.get() * 2; }
+
+// Fixture for a VOID-returning '?.' call (struct receiver): a void CallInst is a non-null
+// value of void type, so the chain-end merge must not mistake it for "has a result".
+struct NcBumper
+{
+    int hits = 0;
+    void bump() { hits = hits + 1; }
+};
+
+// Fixture for a '?.' chain ending on an array element: the merge must handle a Storage-only
+// final link (no Primary yet) instead of silently producing undef.
+struct NcBag
+{
+    int arr[4] = default;
+};
+
+// Fixture pinning CURRENT correct thin-pointer chain behavior: `a?.nxt().get()` must dispatch
+// the SECOND link on nxt()'s result, not on the original receiver `a`.
+struct NcNode
+{
+    int v = 0;
+    NcNode* next = nullptr;
+    NcNode* nxt() { return next; }
+    int get() { return v; }
+};
+
 bool testNullableTypes()
 {
     bool result = true;
@@ -1948,6 +1989,65 @@ bool testNullableTypes()
     result &= Test("?. on null interface receiver",     nullIface?.get(), 0);
     INcCounter realIface = new NcCounterImpl(77);
     result &= Test("?. on non-null interface receiver", realIface?.get(), 77);
+
+    // Chained '?.' on an interface receiver: `factory?.mk().get()` must guard the WHOLE
+    // chain, not just the first link - a null factory must short-circuit before `.get()`
+    // ever dispatches on the (otherwise null) intermediate `mk()` result.
+    INcFactory nullFactory = nullptr;
+    result &= Test("?. chained call on null interface receiver",     nullFactory?.mk().get(), 0);
+    INcFactory realFactory = new NcFactoryImpl(88);
+    result &= Test("?. chained call on non-null interface receiver", realFactory?.mk().get(), 88);
+
+    // '?.' resolving to an extension (UFCS) function rather than a vtable method: must also
+    // short-circuit on a null receiver instead of passing it straight into the callee.
+    result &= Test("?. extension call on null interface receiver",     nullIface?.ncDoubled(), 0);
+    result &= Test("?. extension call on non-null interface receiver", realIface?.ncDoubled(), 154);
+
+    // A VOID-returning '?.' call statement must not crash the compiler (a void CallInst is a
+    // non-null value of void type - the chain-end merge must treat it as "no result").
+    NcBumper* nullBumper = nullptr;
+    nullBumper?.bump();
+    NcBumper bumperVal = NcBumper();
+    result &= Test("void ?. call on null receiver does not crash", bumperVal.hits, 0);
+    NcBumper* realBumper = &bumperVal;
+    realBumper?.bump();
+    result &= Test("void ?. call on non-null receiver runs",       bumperVal.hits, 1);
+
+    // A '?.' chain ending on an array element: the merge must load the Storage-only final
+    // link instead of producing undef.
+    NcBag bagVal = NcBag();
+    bagVal.arr[1] = 7;
+    NcBag* realBag = &bagVal;
+    NcBag* nullBag = nullptr;
+    result &= Test("?. chain to array element on non-null receiver", realBag?.arr[1], 7);
+    result &= Test("?. chain to array element on null receiver",     nullBag?.arr[1], 0);
+
+    // Thin-pointer chained '?.': `a?.nxt().get()` must dispatch '.get()' on nxt()'s RESULT,
+    // not on the original receiver 'a' (pinning current, correct behavior).
+    NcNode nodeB = NcNode();
+    nodeB.v = 42;
+    NcNode nodeA = NcNode();
+    nodeA.v = 1;
+    nodeA.next = &nodeB;
+    NcNode* pa = &nodeA;
+    NcNode* pz = nullptr;
+    result &= Test("thin ?. chained call on non-null receiver", pa?.nxt().get(), 42);
+    result &= Test("thin ?. chained call on null receiver",     pz?.nxt().get(), 0);
+
+    // A '?.' chain whose FINAL link is a whole ARRAY (not a loaded scalar): the merge must
+    // produce a real address on both paths (a live GEP, or a fresh zeroed array), not blank
+    // the NamedVariable - a for-in over `p?.arr` must sum the real elements when non-null and
+    // iterate a zeroed array when null.
+    NcBag bagArr = NcBag();
+    bagArr.arr[0] = 1; bagArr.arr[1] = 2; bagArr.arr[2] = 3;
+    NcBag* pBag = &bagArr;
+    NcBag* zBag = nullptr;
+    int arrTotal = 0;
+    for (int v in pBag?.arr) arrTotal = arrTotal + v;
+    result &= Test("?. chain to whole array on non-null receiver", arrTotal, 6);
+    int arrTotalNull = 0;
+    for (int v in zBag?.arr) arrTotalNull = arrTotalNull + v;
+    result &= Test("?. chain to whole array on null receiver", arrTotalNull, 0);
 
     return result;
 }
