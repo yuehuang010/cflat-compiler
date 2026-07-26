@@ -1863,6 +1863,22 @@ class CiMove : IShapeMove
 
 bool identityBool(bool b) { return b; }
 
+// Interface INHERITANCE fixture for the '?:' rebox tests below: IDrawableBase extends
+// IShapeBase, so a Circle's IDrawableBase vtable has an extra 'draw' slot the IShapeBase
+// vtable does not - joining/rebinding across the two needs a real rebox, not a raw copy.
+interface IShapeBase { int area(); };
+interface IDrawableBase : IShapeBase { void draw(); };
+int circleCtorCount = 0;
+int circleDrawCount = 0;
+class Circle : IDrawableBase
+{
+    int r = 4;
+    Circle() { circleCtorCount = circleCtorCount + 1; }
+    int area() { return r * r; }
+    void draw() { circleDrawCount = circleDrawCount + 1; }
+    ~Circle() { dtorCount = dtorCount + 1; }
+};
+
 /*
  * A '?:' RHS bound to an INTERFACE slot. The ternary result carries no concrete TypeName, so the
  * struct -> fat-pointer upcast used to be skipped and a raw pointer was bitcast into the fat
@@ -2003,6 +2019,232 @@ int testUniqueInterfaceTernary()
         passed += Test("iface_ternary_thin_borrow_same_class_no_adoption", dtorCount, 0);
     }
     passed += Test("iface_ternary_thin_borrow_same_class_owner_freed_once", dtorCount, 1);
+
+    // A BORROWED already-FAT arm (a plain interface-local read, not a thin pointer) mixed with a
+    // THIN 'new' arm - the fat/thin harmonizer branch, not the all-thin boxing path above. A plain
+    // receiver only borrows the join: no adoption, no double free, owner freed once at its exit.
+    dtorCount = 0;
+    {
+        unique IShapeMove owner = new SqMove();
+        IShapeMove borrowed = owner;
+        sqMoveCtorCount = 0;
+        {
+            IShapeMove k = identityBool(true) ? borrowed : new SqMove();
+            passed += Test("iface_ternary_fat_borrow_vs_new_value", k.area(), 0);
+            passed += Test("iface_ternary_fat_borrow_vs_new_untaken_new", sqMoveCtorCount, 0);
+            passed += Test("iface_ternary_fat_borrow_vs_new_no_early_free", dtorCount, 0);
+        }
+        passed += Test("iface_ternary_fat_borrow_vs_new_no_adoption", dtorCount, 0);
+        passed += Test("iface_ternary_fat_borrow_vs_new_owner_alive", owner.area(), 0);
+    }
+    passed += Test("iface_ternary_fat_borrow_vs_new_owner_freed_once", dtorCount, 1);
+
+    /*
+     * `move` of an interface-TYPED local mixed with a THIN arm (`new SqMove()` / `nullptr`). The
+     * move evaluates directly to the fat {vtable,data} struct (no lazy-boxing step for an
+     * already-fat-typed local), while the sibling arm is still thin at the point the ternary
+     * harmonizer runs - the fat-vs-thin case UnifyTernaryArmTypes now boxes the thin arm in its
+     * own block instead of rejecting the pair as "incompatible types".
+     */
+
+    // move-arm TAKEN: g's box transfers to k (one free, at k's scope exit); the untaken 'new' arm
+    // never runs (short-circuit); g reads as null afterward (readable-null move contract).
+    dtorCount = 0;
+    {
+        unique IShapeMove g = new SqMove();
+        sqMoveCtorCount = 0;
+        {
+            unique IShapeMove k = identityBool(true) ? move g : new SqMove();
+            passed += Test("iface_ternary_move_vs_new_taken_area", k.area(), 0);
+            passed += Test("iface_ternary_move_vs_new_taken_new_arm_not_run", sqMoveCtorCount, 0);
+            passed += Test("iface_ternary_move_vs_new_taken_g_reads_null", g == nullptr ? 1 : 0, 1);
+            passed += Test("iface_ternary_move_vs_new_taken_no_early_free", dtorCount, 0);
+        }
+        passed += Test("iface_ternary_move_vs_new_taken_freed_once", dtorCount, 1);
+    }
+    passed += Test("iface_ternary_move_vs_new_taken_g_exit_noop", dtorCount, 1);
+
+    // move-arm NOT taken: the 'new' arm runs and is adopted by k (freed once at k's scope exit);
+    // g's own object is untouched and still dispatches, freed once at its own scope exit. g is a
+    // CiMove (area 7): a SqMove's default field is 0, so area()==0 cannot tell "g alive" apart
+    // from "g zeroed" - CiMove's nonzero area proves the real object, not a zeroed box.
+    dtorCount = 0;
+    sqMoveCtorCount = 0;
+    {
+        unique IShapeMove g = new CiMove();
+        sqMoveCtorCount = 0;
+        {
+            unique IShapeMove k = identityBool(false) ? move g : new SqMove();
+            passed += Test("iface_ternary_move_vs_new_untaken_new_ran", sqMoveCtorCount, 1);
+            passed += Test("iface_ternary_move_vs_new_untaken_g_not_null", g == nullptr ? 1 : 0, 0);
+            int gArea = -1;
+            if (g != nullptr) { gArea = g.area(); }
+            passed += Test("iface_ternary_move_vs_new_untaken_g_area", gArea, 7);
+            passed += Test("iface_ternary_move_vs_new_untaken_no_early_free", dtorCount, 0);
+        }
+        passed += Test("iface_ternary_move_vs_new_untaken_k_freed_once", dtorCount, 1);
+    }
+    passed += Test("iface_ternary_move_vs_new_untaken_g_freed_too", dtorCount, 2);
+
+    // Arm order reversed (`new` first, `move` second): same accounting, other arm order.
+    dtorCount = 0;
+    {
+        unique IShapeMove g = new SqMove();
+        {
+            unique IShapeMove k = identityBool(false) ? new SqMove() : move g;
+            passed += Test("iface_ternary_new_vs_move_taken_area", k.area(), 0);
+            passed += Test("iface_ternary_new_vs_move_taken_g_reads_null", g == nullptr ? 1 : 0, 1);
+        }
+        passed += Test("iface_ternary_new_vs_move_taken_freed_once", dtorCount, 1);
+    }
+    passed += Test("iface_ternary_new_vs_move_taken_g_exit_noop", dtorCount, 1);
+
+    // `nullptr` as the thin arm, move TAKEN: same one-free/readable-null accounting as the
+    // `new` sibling above.
+    dtorCount = 0;
+    {
+        unique IShapeMove g = new SqMove();
+        {
+            unique IShapeMove k = identityBool(true) ? move g : nullptr;
+            passed += Test("iface_ternary_move_vs_null_taken_area", k.area(), 0);
+            passed += Test("iface_ternary_move_vs_null_taken_g_reads_null", g == nullptr ? 1 : 0, 1);
+            passed += Test("iface_ternary_move_vs_null_taken_no_early_free", dtorCount, 0);
+        }
+        passed += Test("iface_ternary_move_vs_null_taken_freed_once", dtorCount, 1);
+    }
+    passed += Test("iface_ternary_move_vs_null_taken_g_exit_noop", dtorCount, 1);
+
+    // `nullptr` as the thin arm, move NOT taken: k is null (frees nothing), g stays alive and is
+    // freed exactly once at its own scope exit. g is a CiMove (area 7) for the same
+    // discriminating-value reason as the leg above (a SqMove's area is 0 either way).
+    dtorCount = 0;
+    {
+        unique IShapeMove g = new CiMove();
+        {
+            unique IShapeMove k = identityBool(false) ? move g : nullptr;
+            passed += Test("iface_ternary_move_vs_null_untaken_k_null", k == nullptr ? 1 : 0, 1);
+            int gAliveArea = -1;
+            if (g != nullptr) { gAliveArea = g.area(); }
+            passed += Test("iface_ternary_move_vs_null_untaken_g_alive", gAliveArea, 7);
+            passed += Test("iface_ternary_move_vs_null_untaken_no_early_free", dtorCount, 0);
+        }
+        passed += Test("iface_ternary_move_vs_null_untaken_k_null_no_free", dtorCount, 0);
+    }
+    passed += Test("iface_ternary_move_vs_null_untaken_g_freed_once", dtorCount, 1);
+
+    return passed;
+}
+
+/*
+ * Interface INHERITANCE mismatch through a '?:' join: the fat arm's ledgered interface differs
+ * from the receiver's declared interface (derived vs parent, or parent vs derived). A derived
+ * vtable is not layout-compatible with its parent's once field-offset slots exist, so an
+ * un-reboxed join dispatches through the wrong vtable slot (e.g. calls 'draw' where the
+ * destructor was expected). ReboxInterfaceIfNeeded/RebuildInterfaceFatValue - the same runtime
+ * typedesc-matching rebox a plain (non-ternary) derived-to-parent move already used - now also
+ * fires for a '?:' join via the per-arm ledger (RegisterFatInterfaceValueTypeName /
+ * PropagateFatInterfaceJoin), which also fixes the PRE-EXISTING all-fat case (both arms already
+ * fat, e.g. two `move`s of a derived-typed local, joined into a parent-typed receiver).
+ */
+int testTernaryInterfaceInheritanceRebox()
+{
+    int passed = 0;
+
+    // Fat arm (move of a DERIVED-typed local) vs thin 'new' arm; receiver is the PARENT interface.
+    dtorCount = 0;
+    circleDrawCount = 0;
+    {
+        unique IDrawableBase g = new Circle();
+        {
+            unique IShapeBase k = identityBool(true) ? move g : new Circle();
+            passed += Test("iface_inherit_move_derived_vs_new_area", k.area(), 16);
+            passed += Test("iface_inherit_move_derived_vs_new_no_wrong_dispatch", circleDrawCount, 0);
+            passed += Test("iface_inherit_move_derived_vs_new_no_early_free", dtorCount, 0);
+        }
+        passed += Test("iface_inherit_move_derived_vs_new_freed_once", dtorCount, 1);
+    }
+
+    // Same shape, move NOT taken: the thin 'new' arm (parent-interface receiver) runs and frees
+    // correctly; g (derived-typed) stays alive and frees once at its own scope exit.
+    dtorCount = 0;
+    circleCtorCount = 0;
+    {
+        unique IDrawableBase g = new Circle();
+        circleCtorCount = 0;
+        {
+            unique IShapeBase k = identityBool(false) ? move g : new Circle();
+            passed += Test("iface_inherit_move_derived_vs_new_untaken_new_ran", circleCtorCount, 1);
+            passed += Test("iface_inherit_move_derived_vs_new_untaken_area", k.area(), 16);
+            int gArea = -1;
+            if (g != nullptr) { gArea = g.area(); }
+            passed += Test("iface_inherit_move_derived_vs_new_untaken_g_alive", gArea, 16);
+        }
+        passed += Test("iface_inherit_move_derived_vs_new_untaken_k_freed_once", dtorCount, 1);
+    }
+    passed += Test("iface_inherit_move_derived_vs_new_untaken_g_freed_too", dtorCount, 2);
+
+    // PRE-EXISTING all-fat case: both arms already fat (two derived-typed moves), receiver is the
+    // PARENT interface. This miscompiled on master too (draw() called instead of the destructor);
+    // the same rebox now fixes it, since PropagateFatInterfaceJoin ledgers the phi's interface.
+    dtorCount = 0;
+    circleDrawCount = 0;
+    {
+        unique IDrawableBase g1 = new Circle();
+        unique IDrawableBase g2 = new Circle();
+        {
+            unique IShapeBase k = identityBool(true) ? move g1 : move g2;
+            passed += Test("iface_inherit_allfat_area", k.area(), 16);
+            passed += Test("iface_inherit_allfat_no_wrong_dispatch", circleDrawCount, 0);
+        }
+        passed += Test("iface_inherit_allfat_freed_once", dtorCount, 1);
+    }
+
+    // DIFFERENT-interface fat arms: one arm a PARENT-typed move, the other a DERIVED-typed move.
+    // PropagateFatInterfaceJoin cannot pick either arm's name here, so it ledgers the ambiguous
+    // sentinel, forcing ReboxInterfaceIfNeeded to always rebuild at the receiver - this is the
+    // reviewer's exact repro (derived arm taken used to call 'draw' instead of the destructor).
+    dtorCount = 0;
+    circleDrawCount = 0;
+    {
+        unique IShapeBase gs = new Circle();
+        unique IDrawableBase gd = new Circle();
+        {
+            unique IShapeBase k = identityBool(false) ? move gs : move gd;
+            passed += Test("iface_inherit_diffarm_false_taken_area", k.area(), 16);
+            passed += Test("iface_inherit_diffarm_false_taken_no_wrong_dispatch", circleDrawCount, 0);
+        }
+        passed += Test("iface_inherit_diffarm_false_taken_freed_once", dtorCount, 1);
+    }
+
+    // Same different-interface arms, opposite direction: the PARENT-typed arm is taken.
+    dtorCount = 0;
+    circleDrawCount = 0;
+    {
+        unique IShapeBase gs2 = new Circle();
+        unique IDrawableBase gd2 = new Circle();
+        {
+            unique IShapeBase k = identityBool(true) ? move gs2 : move gd2;
+            passed += Test("iface_inherit_diffarm_true_taken_area", k.area(), 16);
+            passed += Test("iface_inherit_diffarm_true_taken_no_wrong_dispatch", circleDrawCount, 0);
+        }
+        passed += Test("iface_inherit_diffarm_true_taken_freed_once", dtorCount, 1);
+    }
+
+    // Reverse direction: fat arm is a PARENT-typed local, receiver is the DERIVED interface - the
+    // extra 'draw' vtable slot is filled in fresh by the rebox, not inherited from the parent box.
+    dtorCount = 0;
+    circleDrawCount = 0;
+    {
+        unique IShapeBase g = new Circle();
+        {
+            unique IDrawableBase k = identityBool(false) ? move g : new Circle();
+            passed += Test("iface_inherit_parent_vs_new_area", k.area(), 16);
+            k.draw();
+            passed += Test("iface_inherit_parent_vs_new_draw_ran", circleDrawCount, 1);
+            passed += Test("iface_inherit_parent_vs_new_no_early_free", dtorCount, 0);
+        }
+        passed += Test("iface_inherit_parent_vs_new_freed_once", dtorCount, 1);
+    }
 
     return passed;
 }
@@ -2997,7 +3239,10 @@ extern int main()
     total += 8;
 
     passed += testUniqueInterfaceTernary();
-    total += 35;
+    total += 67;
+
+    passed += testTernaryInterfaceInheritanceRebox();
+    total += 22;
 
     passed += testUniqueInterfaceMoveExtra();
     total += 22;

@@ -157,6 +157,19 @@ expect_error("cannot initialize unique 'mixedIface' from a borrowed value") {
     }
 }
 
+// Same mixed join, but the THIN arm goes through the new fat/thin harmonizer branch instead of
+// an already-fat owning call: a borrowed already-fat arm mixed with a thin `new` arm still owns
+// nothing a `unique` receiver may free.
+expect_error("cannot initialize unique 'fatBorrowVsNewUnique' from a borrowed value") {
+    int fatBorrowVsNewArmIntoUnique(bool c)
+    {
+        unique IUniqueThing thinOwner = new UniqueIfaceThing();
+        IUniqueThing thinBorrowed = thinOwner;
+        unique IUniqueThing fatBorrowVsNewUnique = c ? thinBorrowed : new UniqueIfaceThing();
+        return fatBorrowVsNewUnique.get();
+    }
+}
+
 // Same mixed join, spelled as an ASSIGNMENT to an already-declared unique interface local rather
 // than a decl-initializer. The assign-form reject has its own wording (LValue assignment path).
 expect_error("cannot assign a borrowed value to unique interface 'mixedIfaceAssign'") {
@@ -255,6 +268,35 @@ expect_error("mixes an owning and a borrowed 'JoinBox' arm into a return slot") 
     JoinBox joinIntoReturnSlot(JoinBox borrowed, bool c)
     {
         return c ? makeJoinBox() : borrowed;
+    }
+}
+
+/*
+ * `move` of an interface-TYPED local (already fat, {vtable,data}) paired with a THIN arm whose
+ * concrete class cannot be recovered - a FIELD read, same shape as fieldArmIntoIface above but
+ * with the fat side coming from `move` instead of a second `new`. Exercises the fat-vs-thin case
+ * in UnifyTernaryArmTypes, not the already-fat-phi path fieldArmIntoIface exercises.
+ */
+expect_error("cannot convert '?:' arm to interface 'IUniqueThing': the arm's concrete class cannot be determined") {
+    int moveVsFieldArmIntoIface(bool c)
+    {
+        unique IUniqueThing g = new UniqueIfaceThing();
+        IfaceArmHolder fh;
+        fh.p = new UniqueIfaceThing();
+        IUniqueThing k = c ? move g : fh.p;
+        return k.get();
+    }
+}
+
+// `move` of an interface-TYPED local paired with a THIN arm whose class does NOT implement the
+// target interface. UniqueThing is a plain struct - no vtable for IUniqueThing exists at all.
+expect_error("cannot convert '?:' arm to interface 'IUniqueThing': 'UniqueThing' does not implement it") {
+    int moveVsNonImplementingArmIntoIface(bool c)
+    {
+        unique IUniqueThing g2 = new UniqueIfaceThing();
+        UniqueThing* notIface = new UniqueThing();
+        IUniqueThing k2 = c ? move g2 : notIface;
+        return k2.get();
     }
 }
 

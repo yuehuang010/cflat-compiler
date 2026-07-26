@@ -1085,6 +1085,10 @@ public:
     // recovers each arm's class from here. Retired with ownedNewTemps_.
     std::vector<std::pair<llvm::Value*, std::string>> valueElementTypeNames_;
 
+    // Interface name a fat interface value ({vtable,data}) was produced against, keyed by value
+    // identity (see RegisterFatInterfaceValueTypeName). Retired with valueElementTypeNames_.
+    std::vector<std::pair<llvm::Value*, std::string>> fatInterfaceValueTypeNames_;
+
     // Pointer SSA values detached by a `move` expression, keyed by value identity. A move nulls its
     // source, so nobody owns the value until a receiver adopts it - but it is not a `new` result and
     // carries no free-site type, so it belongs in neither ledger above. Lets a '?:' join ask "is
@@ -2324,6 +2328,28 @@ private:
         return false;
     }
 
+    // Sentinel ledgered as a '?:' join's "interface" when its two arms disagree (e.g. a
+    // derived-typed move joined with a parent-typed move): no single name is correct, so
+    // ReboxInterfaceIfNeeded must rebox unconditionally instead of trusting either arm's name.
+    static constexpr const char* kAmbiguousFatInterface = "<ambiguous>";
+
+    // Ledger a '?:' join's interface from whichever arm's own ledger entry is known - the joined
+    // phi/select carries no NamedVariable of its own to read a TypeName from. When both arms are
+    // known and DIFFER, ledger the ambiguous sentinel instead of picking one arbitrarily - the
+    // unpicked arm's own interface would otherwise silently skip its rebox at the receiver.
+    void PropagateFatInterfaceJoin(llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined)
+    {
+        if (!IsInterfaceFatValue(joined)) return;
+        std::string trueIface = FindFatInterfaceValueTypeName(trueValue);
+        std::string falseIface = FindFatInterfaceValueTypeName(falseValue);
+        std::string ifaceName;
+        if (!trueIface.empty() && !falseIface.empty() && trueIface != falseIface)
+            ifaceName = kAmbiguousFatInterface;
+        else
+            ifaceName = !trueIface.empty() ? trueIface : falseIface;
+        RegisterFatInterfaceValueTypeName(joined, ifaceName);
+    }
+
     /*
      * Escape analysis: "can parameter `argIndex` of `fn` RETAIN its argument past the call?".
      * Conservative by construction - true (retains, caller must not free) for anything not proven
@@ -2487,6 +2513,32 @@ private:
         const OwnedNewTemp* src = FindOwnedNewTemp(from);
         if (src == nullptr || to == nullptr) return;
         RegisterOwnedNewTemp(to, src->TypeName, src->AllocAlign);
+    }
+
+    // Ledger the interface a fat interface value ({vtable,data}) was produced against, keyed by
+    // value identity. The fat struct is ONE shared LLVM type for every interface, so a '?:' arm
+    // that mixes a fat arm with a thin arm needs this to learn which interface to box the thin
+    // arm into (UnifyTernaryArmTypes). Retired with ownedNewTemps_ (see FlushOwnedTemps).
+    void RegisterFatInterfaceValueTypeName(llvm::Value* value, const std::string& ifaceName)
+    {
+        if (value == nullptr || ifaceName.empty() || !IsInterfaceFatValue(value)) return;
+        for (auto& entry : fatInterfaceValueTypeNames_)
+            if (entry.first == value) { entry.second = ifaceName; return; }
+        fatInterfaceValueTypeNames_.push_back({ value, ifaceName });
+    }
+
+    std::string FindFatInterfaceValueTypeName(const llvm::Value* value) const
+    {
+        for (const auto& entry : fatInterfaceValueTypeNames_)
+            if (entry.first == value) return entry.second;
+        return {};
+    }
+
+    // Best-effort source interface for ReboxInterfaceIfNeeded: prefer the caller's NamedVariable
+    // TypeName; fall back to the ledger for a '?:' join, which carries no NamedVariable at all.
+    std::string ResolveFatInterfaceSrcName(const llvm::Value* value, const std::string& declaredName) const
+    {
+        return !declaredName.empty() ? declaredName : FindFatInterfaceValueTypeName(value);
     }
 
     // Ledger the class a `new` result points at (see valueElementTypeNames_).
@@ -2943,6 +2995,7 @@ private:
         ownedReturnTemps_.clear();
         ownedNewTemps_.clear();
         valueElementTypeNames_.clear();
+        fatInterfaceValueTypeNames_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
         nonOwningStructJoins_.clear();
@@ -8628,6 +8681,7 @@ public:
         std::vector<OwnedReturnTemp> ownedReturnTemps;
         std::vector<OwnedNewTemp> ownedNewTemps;
         std::vector<std::pair<llvm::Value*, std::string>> valueElementTypeNames;
+        std::vector<std::pair<llvm::Value*, std::string>> fatInterfaceValueTypeNames;
         std::vector<llvm::Value*> movedOutPtrValues;
         std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues;
         std::vector<llvm::Value*> nonOwningStructJoins;
@@ -8646,6 +8700,7 @@ public:
         s.ownedReturnTemps    = std::move(ownedReturnTemps_);
         s.ownedNewTemps       = std::move(ownedNewTemps_);
         s.valueElementTypeNames = std::move(valueElementTypeNames_);
+        s.fatInterfaceValueTypeNames = std::move(fatInterfaceValueTypeNames_);
         s.movedOutPtrValues   = std::move(movedOutPtrValues_);
         s.movedBorrowedPtrValues = std::move(movedBorrowedPtrValues_);
         s.nonOwningStructJoins = std::move(nonOwningStructJoins_);
@@ -8659,6 +8714,7 @@ public:
         ownedReturnTemps_.clear();
         ownedNewTemps_.clear();
         valueElementTypeNames_.clear();
+        fatInterfaceValueTypeNames_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
         nonOwningStructJoins_.clear();
@@ -8684,6 +8740,7 @@ public:
         ownedReturnTemps_        = state.ownedReturnTemps;
         ownedNewTemps_           = state.ownedNewTemps;
         valueElementTypeNames_   = state.valueElementTypeNames;
+        fatInterfaceValueTypeNames_ = state.fatInterfaceValueTypeNames;
         movedOutPtrValues_       = state.movedOutPtrValues;
         movedBorrowedPtrValues_  = state.movedBorrowedPtrValues;
         nonOwningStructJoins_    = state.nonOwningStructJoins;
@@ -9669,12 +9726,15 @@ public:
     }
 
     // Rebuild only when the source and destination interfaces actually differ (the common
-    // same-interface case stays a plain by-value copy, with no if-chain emitted).
+    // same-interface case stays a plain by-value copy, with no if-chain emitted). The ambiguous
+    // sentinel (a '?:' join whose two arms disagreed - see PropagateFatInterfaceJoin) always
+    // rebuilds: neither arm's name can be trusted, but the runtime typedesc match can.
     llvm::Value* ReboxInterfaceIfNeeded(llvm::Value* fatVal, const std::string& srcIface,
                                         const std::string& dstIface)
     {
-        if (fatVal == nullptr || fatVal->getType() != GetFatPtrType()) return fatVal;
-        if (srcIface.empty() || dstIface.empty() || srcIface == dstIface) return fatVal;
+        if (fatVal == nullptr || fatVal->getType() != GetFatPtrType() || dstIface.empty()) return fatVal;
+        if (srcIface == kAmbiguousFatInterface) return RebuildInterfaceFatValue(fatVal, dstIface);
+        if (srcIface.empty() || srcIface == dstIface) return fatVal;
         if (!IsInterfaceType(srcIface) || !IsInterfaceType(dstIface)) return fatVal;
         return RebuildInterfaceFatValue(fatVal, dstIface);
     }

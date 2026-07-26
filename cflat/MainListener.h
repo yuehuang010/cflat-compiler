@@ -5502,12 +5502,14 @@ public:
                         // The ownership checks above are untouched: they fire on a returned concrete
                         // POINTER (the boxing case), which this is not.
                         if (auto* fatTy = compiler->GetFatPtrType();
-                            right != nullptr && fatTy != nullptr && right->getType() == fatTy
-                            && returnNV.TypeAndValue.IsInterface)
+                            right != nullptr && fatTy != nullptr && right->getType() == fatTy)
                         {
+                            // A '?:' result carries no NamedVariable TypeName; fall back to the
+                            // per-value ledger a ternary join stamps (PropagateFatInterfaceJoin).
+                            std::string srcIface = compiler->ResolveFatInterfaceSrcName(right,
+                                returnNV.TypeAndValue.IsInterface ? returnNV.TypeAndValue.TypeName : std::string());
                             right = compiler->ReboxInterfaceIfNeeded(
-                                right, returnNV.TypeAndValue.TypeName,
-                                compiler->currentFunctionReturnTypeName);
+                                right, srcIface, compiler->currentFunctionReturnTypeName);
                         }
 
                         compiler->CreateReturnCall(right, retStorage, interfaceReturnStructName);
@@ -7889,12 +7891,14 @@ public:
                             right = LoadNamedVariable(rightNV);
                             srcPrimary = rightNV.Primary;
                             // Derived-interface -> parent-interface: re-box (a derived vtable is not
-                            // layout-compatible with the parent's once field slots exist).
-                            if (right && right->getType() == compiler->GetFatPtrType()
-                                && rightNV.TypeAndValue.IsInterface)
+                            // layout-compatible with the parent's once field slots exist). A '?:'
+                            // result has no NamedVariable TypeName, so fall back to its join ledger.
+                            if (right && right->getType() == compiler->GetFatPtrType())
                             {
+                                std::string srcIface = compiler->ResolveFatInterfaceSrcName(right,
+                                    rightNV.TypeAndValue.IsInterface ? rightNV.TypeAndValue.TypeName : std::string());
                                 right = compiler->ReboxInterfaceIfNeeded(
-                                    right, rightNV.TypeAndValue.TypeName, typeAndValue.TypeName);
+                                    right, srcIface, typeAndValue.TypeName);
                             }
                             if (right && right->getType() != compiler->GetFatPtrType())
                             {
@@ -10204,13 +10208,15 @@ public:
                 }
             }
             // Derived-interface -> parent-interface assignment: re-box through the typedesc chain.
+            // A '?:' RHS carries no NamedVariable TypeName, so fall back to its join ledger.
             else if (operatorText == "=" && namedVar.TypeAndValue.IsInterface
                      && !namedVar.TypeAndValue.IsInterfacePointer
-                     && right && right->getType() == compiler->GetFatPtrType()
-                     && rightNV.TypeAndValue.IsInterface)
+                     && right && right->getType() == compiler->GetFatPtrType())
             {
+                std::string srcIface = compiler->ResolveFatInterfaceSrcName(right,
+                    rightNV.TypeAndValue.IsInterface ? rightNV.TypeAndValue.TypeName : std::string());
                 right = compiler->ReboxInterfaceIfNeeded(
-                    right, rightNV.TypeAndValue.TypeName, namedVar.TypeAndValue.TypeName);
+                    right, srcIface, namedVar.TypeAndValue.TypeName);
             }
 
             // D5 (assignment leg): a `unique` interface local owns a heap-boxed object, and its
@@ -10978,6 +10984,49 @@ public:
         return nullptr;
     }
 
+    // Box a THIN '?:' arm (`new T()` / `nullptr` / a borrowed pointer) into the interface fat
+    // struct, matching a sibling arm already fat (e.g. `move` of an interface-typed local).
+    // Caller must position the builder in the thin arm's own block first (atTrue/atFalse).
+    llvm::Value* BoxTernaryThinArmToInterface(llvm::Value* thinValue, const std::string& interfaceName,
+                                              std::string& armFailure)
+    {
+        auto* compiler = compilerLLVM;
+        auto* fatTy = compiler->GetFatPtrType();
+        if (auto* c = llvm::dyn_cast<llvm::Constant>(thinValue); c != nullptr && c->isNullValue())
+            return llvm::Constant::getNullValue(fatTy);
+
+        std::string className = compiler->ResolvePointerElementTypeName(thinValue);
+        if (className.empty())
+        {
+            armFailure = "the arm's concrete class cannot be determined; bind the arm to a "
+                         "local variable of the class type first";
+            return nullptr;
+        }
+        if (!compiler->StructImplementsInterface(className, interfaceName))
+        {
+            armFailure = std::format("'{}' does not implement it", className);
+            return nullptr;
+        }
+        auto* vtable = compiler->GetOrCreateVTable(className, interfaceName);
+        auto* boxed = compiler->BuildInterfaceFatValue(vtable, thinValue);
+        // Ledger which interface this box was built against, so the sibling fat arm's interface
+        // (both arms now agree) survives to the eventual phi and the receiver's rebox check.
+        compiler->RegisterFatInterfaceValueTypeName(boxed, interfaceName);
+
+        // Carry the ownership verdict onto the box: a fat arm is scored owning only via the
+        // owning-RETURN ledger (a struct is never an owning-POINTER temp).
+        if (compiler->TernaryArmJoinsOwning(thinValue))
+        {
+            if (compiler->IsMovedOutPtrValue(thinValue))
+                compiler->RegisterMovedOutPtrValue(boxed);
+            else
+                compiler->RegisterOwnedReturnTemp(boxed, "?:", LLVMBackend::TypeAndValue{});
+        }
+        // thinValue's move-of-borrow provenance is dropped here: unreachable today (scored
+        // non-owning above already), and the ledger refuses a struct (boxed) regardless.
+        return boxed;
+    }
+
     /*
      * Align the two '?:' arm values onto one LLVM type so the join (a PHI, or a select in the
      * constant-context fallback) has matching operand types. `atTrue`/`atFalse` reposition the
@@ -11034,6 +11083,37 @@ public:
         {
             atTrue();
             trueValue = compiler->WrapStringLiteralAsString(trueValue);
+        }
+        else if (auto* fatTy = compiler->GetFatPtrType();
+                 (ft == fatTy && tt->isPointerTy()) || (tt == fatTy && ft->isPointerTy()))
+        {
+            // One arm already carries the interface fat struct (e.g. `move` of an
+            // interface-TYPED local, which evaluates directly to {vtable,data} since the local
+            // itself is already fat-typed); the other is still a thin pointer (`new T()` /
+            // `nullptr`). Learn which interface from the fat arm's ledgered TypeName - the fat
+            // struct itself does not say which interface it is, since every interface shares
+            // this one LLVM type - then box the thin arm into the SAME interface, in its own
+            // arm block, mirroring UpcastTernaryPhiToInterface's per-arm boxing.
+            bool trueIsFat = (tt == fatTy);
+            llvm::Value*& fatValue  = trueIsFat ? trueValue : falseValue;
+            llvm::Value*& thinValue = trueIsFat ? falseValue : trueValue;
+            std::string interfaceName = compiler->FindFatInterfaceValueTypeName(fatValue);
+            if (interfaceName.empty())
+            {
+                LogErrorContext(ctx, "cannot convert '?:' arms to a common interface type: the "
+                    "fat arm's interface could not be determined");
+                return false;
+            }
+            std::string armFailure;
+            (trueIsFat ? atFalse : atTrue)();
+            llvm::Value* boxed = BoxTernaryThinArmToInterface(thinValue, interfaceName, armFailure);
+            if (boxed == nullptr)
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot convert '?:' arm to interface '{}': {}", interfaceName, armFailure));
+                return false;
+            }
+            thinValue = boxed;
         }
         else
         {
@@ -11219,6 +11299,7 @@ public:
         // otherwise adopt the phi whichever arm ran and double-free the borrow arm's live pointee.
         if (compiler->PropagateTernaryOwnership(trueValue, falseValue, phi))
             compiler->ClearOwnedResultChannels();
+        compiler->PropagateFatInterfaceJoin(trueValue, falseValue, phi);
         return { phi, false };
     }
 
@@ -11335,6 +11416,7 @@ public:
                 // and the other leaks regardless. See PropagateTernaryOwnership.
                 if (compiler->PropagateTernaryOwnership(trueValue, falseValue, selectValue))
                     compiler->ClearOwnedResultChannels();
+                compiler->PropagateFatInterfaceJoin(trueValue, falseValue, selectValue);
                 return { selectValue, false };
             }
 
@@ -12559,7 +12641,22 @@ public:
         return elem;
     }
 
+    // Read a named local/field's value, then (when it is a whole interface value, i.e. a fat
+    // {vtable,data} struct) ledger which interface it belongs to by VALUE IDENTITY - the fat
+    // struct is one shared LLVM type for every interface, so a later '?:' fat-vs-thin harmonizer
+    // (UnifyTernaryArmTypes) has no other way to learn which interface a `move` of an
+    // interface-typed local produced.
     llvm::Value* LoadNamedVariable(LLVMBackend::NamedVariable& namedVar)
+    {
+        auto* compiler = Compiler();
+        llvm::Value* result = LoadNamedVariableImpl(namedVar);
+        if (result != nullptr && namedVar.TypeAndValue.IsInterface
+            && !namedVar.TypeAndValue.IsInterfacePointer && !namedVar.TypeAndValue.Pointer)
+            compiler->RegisterFatInterfaceValueTypeName(result, namedVar.TypeAndValue.TypeName);
+        return result;
+    }
+
+    llvm::Value* LoadNamedVariableImpl(LLVMBackend::NamedVariable& namedVar)
     {
         auto* compiler = Compiler();
         // Every value read of a named local. A dereference site records its Deref event BEFORE
