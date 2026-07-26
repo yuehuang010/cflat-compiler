@@ -10284,6 +10284,23 @@ public:
                 return right;
             }
 
+            // Same store through a '?:' join that laundered a borrowed `move`: the joined value
+            // carries no IsBorrowed, yet the field adopted a live pointee and double-freed (abort).
+            std::string fieldBorrowMoveOrigin;
+            if (operatorText == "=" && right && destIsStructField
+                && namedVar.TypeAndValue.IsUnique
+                && !rightNV.TypeAndValue.IsMove
+                && !selfUniqueFieldAssign
+                && compiler->IsMovedBorrowedPtrValue(rightNV.Primary, &fieldBorrowMoveOrigin))
+            {
+                LLVMBackend::NamedVariable borrowSrc = {};
+                borrowSrc.CallerName     = fieldBorrowMoveOrigin;
+                borrowSrc.BorrowedOrigin = fieldBorrowMoveOrigin;
+                RejectBorrowIntoUniqueField(borrowSrc,
+                    std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar)), ctx);
+                return right;
+            }
+
             // Direct `unique`-field-to-`unique`-field copy (`c.p = a.p`) - two owners of one
             // pointee. Checked after Trap A so a source reached through a borrowed parameter keeps
             // the more precise borrow message. `move a.p` clears Storage, so it is not a field read
@@ -10620,6 +10637,16 @@ public:
                         ? std::format("{}.{}", rightNV.CallerName, rightNV.FieldName) : origin;
                     RejectBorrowIntoUniqueLocal(srcDesc, BorrowedOriginRoot(origin), srcIsField,
                                                 namedVar.CallerName, false, ctx);
+                    return right;
+                }
+
+                // Same rejection when a '?:' join laundered the borrowed move: the joined VALUE
+                // carries no IsBorrowed, yet every arm owned nothing. The DECLARATION form errors.
+                std::string borrowMoveOrigin;
+                if (compiler->IsMovedBorrowedPtrValue(rightNV.Primary, &borrowMoveOrigin))
+                {
+                    RejectBorrowIntoUniqueLocal(borrowMoveOrigin, BorrowedOriginRoot(borrowMoveOrigin),
+                                                false, namedVar.CallerName, false, ctx);
                     return right;
                 }
 
@@ -13596,6 +13623,17 @@ public:
             std::string fieldDesc = std::format("unique field '{}.{}'", typeName, fieldName);
             if (rightNV.IsBorrowed && !rightNV.TypeAndValue.IsMove)
                 RejectBorrowIntoUniqueField(rightNV, fieldDesc, errCtx);
+            // A '?:' join carries no IsBorrowed, so the ledger is the only surviving provenance;
+            // same reject as the `=` path, keeping the two field-store paths in lockstep.
+            std::string braceBorrowMoveOrigin;
+            if (!rightNV.TypeAndValue.IsMove
+                && compiler->IsMovedBorrowedPtrValue(rightNV.Primary, &braceBorrowMoveOrigin))
+            {
+                LLVMBackend::NamedVariable borrowSrc = {};
+                borrowSrc.CallerName     = braceBorrowMoveOrigin;
+                borrowSrc.BorrowedOrigin = braceBorrowMoveOrigin;
+                RejectBorrowIntoUniqueField(borrowSrc, fieldDesc, errCtx);
+            }
             if (IsUniqueFieldRead(rightNV))
                 RejectUniqueFieldToUniqueField(rightNV, fieldDesc, errCtx);
         }
@@ -15445,8 +15483,13 @@ public:
         // A BORROWED source transfers nothing - nulling the callee's copy leaves the real owner
         // sole owner - so it must not enter the ledger, or a join scores it owning and the receiver
         // frees a live pointee. The ledger thus carries provenance: membership means "owns".
+        // The other side of that provenance: a borrowed source is ledgered as provably NON-owning,
+        // so a receiver that must own the value rejects it even after a '?:' join laundered it.
         if (!argNV.IsBorrowed)
             compiler->RegisterMovedOutPtrValue(ptrVal);
+        else
+            compiler->RegisterMovedBorrowedPtrValue(ptrVal,
+                argNV.BorrowedOrigin.empty() ? argNV.CallerName : argNV.BorrowedOrigin);
         compiler->lastAllocAlignment = argNV.AllocAlignment;
         // Element-slot source (`move _data[i]`): the pointer read demoted `unique` to a bare borrow,
         // so let the decl site re-key ownership off the DEST type - a bare `T*` element must NOT own

@@ -1094,6 +1094,14 @@ public:
     // Retired with ownedNewTemps_.
     std::vector<llvm::Value*> movedOutPtrValues_;
 
+    // The negative counterpart of movedOutPtrValues_: pointer SSA values a `move` of a BORROWED
+    // source produced, with the borrow's origin name for the diagnostic. Such a move nulls only the
+    // borrower's copy, so the value provably owns NOTHING and every owning destination rejects it -
+    // a `unique` LOCAL (reassignment) and a `unique` FIELD (both the `=` and the brace-init store
+    // paths). Carried through a '?:' join whose arms are all borrowed moves or null, so the
+    // laundered spelling is rejected exactly like the direct one. Retired with ownedNewTemps_.
+    std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues_;
+
     // Lambda literals with unclaimed heap envs (no named owner). Closure analog of
     // pendingOwnedStringTemps; freed at end-of-full-expression by FlushOwnedClosureTemps.
     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingOwnedClosureTemps;
@@ -2176,6 +2184,30 @@ private:
     }
 
     /*
+     * Carry "this value came from a `move` of a BORROW" out of a '?:' join, so a receiver that must
+     * own the result rejects the laundered spelling exactly as it rejects the direct one. Only a
+     * join whose arms are ALL borrowed moves or null qualifies: that join provably owns nothing on
+     * every path. A MIXED join (one owning arm) keeps its existing borrow-and-suppress behaviour -
+     * which arm runs is not knowable, so it is not provably non-owning and stays a plain borrow.
+     */
+    void PropagateMovedBorrowedPtrValue(llvm::Value* trueValue, llvm::Value* falseValue,
+                                        llvm::Value* joined)
+    {
+        if (joined == nullptr || !joined->getType()->isPointerTy()) return;
+        auto isNullArm = [](llvm::Value* arm) {
+            auto* c = llvm::dyn_cast_or_null<llvm::Constant>(arm);
+            return c != nullptr && c->isNullValue();
+        };
+        std::string origin;
+        bool trueBorrowMove  = IsMovedBorrowedPtrValue(trueValue, &origin);
+        bool falseBorrowMove = IsMovedBorrowedPtrValue(falseValue, trueBorrowMove ? nullptr : &origin);
+        if (!trueBorrowMove && !falseBorrowMove) return;
+        if (!trueBorrowMove && !isNullArm(trueValue)) return;
+        if (!falseBorrowMove && !isNullArm(falseValue)) return;
+        RegisterMovedBorrowedPtrValue(joined, origin);
+    }
+
+    /*
      * Ledger a '?:' phi/select result as owning, and report whether the join was MIXED. A ternary
      * is a transparent wrapper, so ownership rides out on the joined value. The two ledgers serve
      * different purposes and a MIXED pointer join (`cond ? makePtr() : borrowedPtr`) must split
@@ -2198,6 +2230,7 @@ private:
             PropagateOwnedReturnTemp(trueValue, joined);
         else
             PropagateOwnedReturnTemp(falseValue, joined);
+        PropagateMovedBorrowedPtrValue(trueValue, falseValue, joined);
         if (mixedPtrJoin)
         {
             SuppressCallerRelease(joined);
@@ -2410,6 +2443,29 @@ private:
         if (value == nullptr) return false;
         for (llvm::Value* v : movedOutPtrValues_)
             if (v == value) return true;
+        return false;
+    }
+
+    // Ledger a pointer value a `move` of a BORROWED source produced (see movedBorrowedPtrValues_).
+    void RegisterMovedBorrowedPtrValue(llvm::Value* value, const std::string& originName)
+    {
+        if (value == nullptr || !value->getType()->isPointerTy()) return;
+        for (const auto& e : movedBorrowedPtrValues_)
+            if (e.first == value) return;
+        movedBorrowedPtrValues_.push_back({ value, originName });
+    }
+
+    // True when `value` provably owns nothing because a `move` of a borrow produced it. `originOut`
+    // receives the borrow's origin name so the diagnostic can name the real owner.
+    bool IsMovedBorrowedPtrValue(llvm::Value* value, std::string* originOut = nullptr) const
+    {
+        if (value == nullptr) return false;
+        for (const auto& e : movedBorrowedPtrValues_)
+            if (e.first == value)
+            {
+                if (originOut != nullptr) *originOut = e.second;
+                return true;
+            }
         return false;
     }
 
@@ -2766,6 +2822,7 @@ private:
         ownedNewTemps_.clear();
         valueElementTypeNames_.clear();
         movedOutPtrValues_.clear();
+        movedBorrowedPtrValues_.clear();
     }
 
     // Release the resource a single named local owns, exactly as scope-exit cleanup does. Borrows,
@@ -8449,6 +8506,7 @@ public:
         std::vector<OwnedNewTemp> ownedNewTemps;
         std::vector<std::pair<llvm::Value*, std::string>> valueElementTypeNames;
         std::vector<llvm::Value*> movedOutPtrValues;
+        std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues;
     };
 
     BuilderState SaveBuilderState()
@@ -8465,6 +8523,7 @@ public:
         s.ownedNewTemps       = std::move(ownedNewTemps_);
         s.valueElementTypeNames = std::move(valueElementTypeNames_);
         s.movedOutPtrValues   = std::move(movedOutPtrValues_);
+        s.movedBorrowedPtrValues = std::move(movedBorrowedPtrValues_);
         // Mark the function we are leaving mid-body INCOMPLETE for the escape analysis
         // (see FunctionBodyIsComplete); RestoreBuilderState pops it back off.
         if (currentFunction != nullptr) suspendedFunctions_.push_back(currentFunction);
@@ -8476,6 +8535,7 @@ public:
         ownedNewTemps_.clear();
         valueElementTypeNames_.clear();
         movedOutPtrValues_.clear();
+        movedBorrowedPtrValues_.clear();
         return s;
     }
 
@@ -8499,6 +8559,7 @@ public:
         ownedNewTemps_           = state.ownedNewTemps;
         valueElementTypeNames_   = state.valueElementTypeNames;
         movedOutPtrValues_       = state.movedOutPtrValues;
+        movedBorrowedPtrValues_  = state.movedBorrowedPtrValues;
     }
 
     // True if `name` is a type projected from an imported .winmd (always fully qualified) or a

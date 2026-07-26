@@ -2070,6 +2070,42 @@ int borrowedMoveJoinsOwning(Resource* borrowed, bool c)
     return v->id;
 }
 
+// The borrowed-move join laundered through a NESTED '?:' into a PLAIN pointer. A plain pointer
+// only ever borrows, so this stays legal - the rejection added for a `unique` receiver keys on
+// the destination being an owning location, not on the join.
+int borrowedMoveNestedJoinsNull(Resource* borrowed, bool c)
+{
+    Resource* b = nullptr;
+    b = c ? (c ? move borrowed : nullptr) : nullptr;
+    return b == nullptr ? -1 : b->id;
+}
+
+// A borrowed move paired with a LIVE BORROW arm is a MIXED join: which arm runs is not knowable,
+// so it is not provably non-owning and keeps the existing silent-borrow behaviour even into a
+// `unique` local. Nothing is adopted, so both callers' objects survive and each is freed once.
+int borrowedMoveMixedJoinIntoUnique(Resource* borrowed, Resource* other, bool c)
+{
+    unique Resource* b = nullptr;
+    b = c ? move borrowed : other;
+    return b == nullptr ? -1 : b->id;
+}
+
+// The FIELD boundary of the same rule. The all-borrowed-move-or-null join into a `unique` field is
+// now rejected (it aborted: the field freed the caller's live pointee), but this MIXED join is not
+// in the ledger, so it still stores and the field owns the arm that actually ran.
+void borrowedMoveMixedJoinIntoField(UniqueBox* box, Resource* borrowed, bool c)
+{
+    box->item = c ? move borrowed : makeOwnedResource();
+}
+
+// The BRACE-INIT store path (EmitOneFieldInit) is the third destination that rejects the laundered
+// borrow, so its mixed-join spelling must stay accepted too - the two field paths run the same rule.
+int borrowedMoveMixedBraceInit(Resource* borrowed, bool c)
+{
+    UniqueBox box = { item = c ? move borrowed : makeOwnedResource() };
+    return box.item != nullptr ? 1 : 0;
+}
+
 // A ternary evaluates ONLY the selected arm. It used to compute both arms eagerly and combine
 // them with LLVM's `select`, so a `move` or an owning call in the not-taken arm still ran.
 int testTernaryArmsShortCircuit()
@@ -2267,6 +2303,67 @@ int testTernaryArmsShortCircuit()
         passed += Test("ternary_borrowed_move_mixed_join_owner_alive", owner->id, 48);
     }
     passed += Test("ternary_borrowed_move_mixed_join_owner_freed_once", dtorCount, 1);
+
+    // Nested laundering of the same borrowed move into a PLAIN pointer: still a borrow, and the
+    // caller stays the sole owner. The `unique` spelling of this is now a compile error
+    // (Test/errors/err_unique_borrow_into_unique.cb); the plain one must keep compiling.
+    dtorCount = 0;
+    {
+        unique Resource* owner = new Resource();
+        owner->id = 49;
+        passed += Test("ternary_borrowed_move_nested_join_value",
+                       borrowedMoveNestedJoinsNull(owner, true), 49);
+        passed += Test("ternary_borrowed_move_nested_join_no_free", dtorCount, 0);
+        passed += Test("ternary_borrowed_move_nested_join_owner_alive", owner->id, 49);
+    }
+    passed += Test("ternary_borrowed_move_nested_join_owner_freed_once", dtorCount, 1);
+
+    // The boundary of that rejection: a borrowed move MIXED with a live borrow arm still assigns
+    // into a `unique` local and still borrows. Neither object is adopted, so each owner frees its
+    // own exactly once.
+    dtorCount = 0;
+    {
+        unique Resource* owner = new Resource();
+        owner->id = 50;
+        unique Resource* other = new Resource();
+        other->id = 51;
+        passed += Test("ternary_borrowed_move_mixed_unique_value",
+                       borrowedMoveMixedJoinIntoUnique(owner, other, false), 51);
+        passed += Test("ternary_borrowed_move_mixed_unique_no_free", dtorCount, 0);
+        passed += Test("ternary_borrowed_move_mixed_unique_owner_alive", owner->id, 50);
+    }
+    passed += Test("ternary_borrowed_move_mixed_unique_both_freed_once", dtorCount, 2);
+
+    // Same boundary for a `unique` FIELD destination: the mixed join still stores, the field owns
+    // the arm that ran and frees it once at teardown, and the borrowed caller keeps its own object.
+    dtorCount = 0;
+    {
+        unique Resource* owner = new Resource();
+        owner->id = 52;
+        {
+            UniqueBox box = default;
+            borrowedMoveMixedJoinIntoField(&box, owner, false);
+            passed += Test("ternary_borrowed_move_mixed_field_value",
+                           box.item != nullptr ? 1 : 0, 1);
+            passed += Test("ternary_borrowed_move_mixed_field_no_early_free", dtorCount, 0);
+        }
+        passed += Test("ternary_borrowed_move_mixed_field_freed_once", dtorCount, 1);
+        passed += Test("ternary_borrowed_move_mixed_field_owner_alive", owner->id, 52);
+    }
+    passed += Test("ternary_borrowed_move_mixed_field_owner_freed_once", dtorCount, 2);
+
+    // Same boundary on the brace-init field path: the mixed join still initializes the field, which
+    // frees the allocated arm when the holder dies, and the borrowed caller keeps its own object.
+    dtorCount = 0;
+    {
+        unique Resource* owner = new Resource();
+        owner->id = 53;
+        passed += Test("brace_borrowed_move_mixed_field_value",
+                       borrowedMoveMixedBraceInit(owner, false), 1);
+        passed += Test("brace_borrowed_move_mixed_field_freed_once", dtorCount, 1);
+        passed += Test("brace_borrowed_move_mixed_field_owner_alive", owner->id, 53);
+    }
+    passed += Test("brace_borrowed_move_mixed_field_owner_freed_once", dtorCount, 2);
 
     // String arms: an owning FIELD read in an arm is deep-copied, never aliased, so the
     // field still owns its own buffer after the ternary result goes out of scope.
@@ -2537,7 +2634,7 @@ extern int main()
     total += 6;
 
     passed += testTernaryArmsShortCircuit();
-    total += 51;
+    total += 68;
 
     passed += testUniqueInterfaceReassign();
     total += 8;

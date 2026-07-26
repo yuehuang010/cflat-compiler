@@ -31,6 +31,50 @@ expect_error("cannot initialize unique 'u3' from a borrowed value") {
     }
 }
 
+// The REASSIGNMENT spelling of the same laundered borrow. The direct `b = move borrowed;` was
+// already rejected, but routing it through a '?:' join whose arms are all borrowed moves or null
+// silently borrowed into the owning slot. Every path owns nothing, so reject it like the direct
+// form and like the declaration above.
+expect_error("cannot assign borrowed parameter 'borrowed' to unique local 'b4'") {
+    void borrowedMoveJoinReassign(N* borrowed, bool c)
+    {
+        unique N* b4 = nullptr;
+        b4 = c ? move borrowed : nullptr;
+    }
+}
+
+// Same through a NESTED join - the provenance survives the outer join, so the laundering depth
+// does not change the answer.
+expect_error("cannot assign borrowed parameter 'borrowed' to unique local 'b5'") {
+    void borrowedMoveNestedJoinReassign(N* borrowed, bool c)
+    {
+        unique N* b5 = nullptr;
+        b5 = c ? (c ? move borrowed : nullptr) : nullptr;
+    }
+}
+
+// The same laundering into a `unique` FIELD, where it was not merely a missed diagnostic: the
+// field adopted the caller's live pointee, the synthesized destructor freed it inside the callee,
+// and the caller freed it again (abort). The direct `h->p = move borrowed;` already errored.
+struct Holder { unique N* p = nullptr; };
+
+expect_error("cannot store borrowed parameter 'borrowed' into unique field 'Holder.p'") {
+    void borrowedMoveJoinIntoField(Holder* h, N* borrowed, bool c)
+    {
+        h->p = c ? move borrowed : nullptr;
+    }
+}
+
+// The BRACE-INIT field path (EmitOneFieldInit) is a third store site with the same hole: the direct
+// `{ p = borrowed }` already errored, but the join spelling compiled and aborted the same way. Both
+// field paths spell the rejection identically.
+expect_error("cannot store borrowed parameter 'borrowed' into unique field 'Holder.p'") {
+    void borrowedMoveJoinBraceInit(N* borrowed, bool c)
+    {
+        Holder h = { p = c ? move borrowed : nullptr };
+    }
+}
+
 extern int main()
 {
     return 0;
