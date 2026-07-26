@@ -1901,6 +1901,15 @@ struct NullableContainer
     NullablePoint* inner = nullptr;
 };
 
+// Interface receiver fixture for '?.' on a fat {vtable,data} value (not a thin pointer).
+interface INcCounter { int get(); };
+class NcCounterImpl : INcCounter
+{
+    int v = 0;
+    NcCounterImpl(int val) { v = val; }
+    int get() { return v; }
+};
+
 bool testNullableTypes()
 {
     bool result = true;
@@ -1931,6 +1940,14 @@ bool testNullableTypes()
     result &= Test("?. on member ptr",           nc.inner?.x, 99);
     NullableContainer nc2;
     result &= Test("?. on null member ptr",      nc2.inner?.x, 0);
+
+    // '?.' on an INTERFACE receiver: the receiver is a fat {vtable,data} struct value, not a
+    // thin pointer, so the null-conditional lowering must branch on the DATA slot instead of
+    // treating the struct itself as the null test (used to segfault - see git history).
+    INcCounter nullIface = nullptr;
+    result &= Test("?. on null interface receiver",     nullIface?.get(), 0);
+    INcCounter realIface = new NcCounterImpl(77);
+    result &= Test("?. on non-null interface receiver", realIface?.get(), 77);
 
     return result;
 }

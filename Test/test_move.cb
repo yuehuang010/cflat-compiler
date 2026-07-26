@@ -2087,6 +2087,30 @@ int testUniqueInterfaceMoveExtra()
     }
     passed += Test("iface_move_assign_to_plain_freed_once", dtorCount, 1);
 
+    // `?.` on a maybe-moved `unique <interface>` receiver: the deref sites skip the Deref
+    // event under nullConditionalPending (the '?.' legitimately tolerates null), so this
+    // must compile without the cross-block moved-deref diagnostic firing, and must dispatch
+    // correctly on both the not-moved and moved (null) paths. CiMove.area() (r+7, r=0) is a
+    // NONZERO real result, distinct from the '?.' short-circuit's zero default, so '?? -1'
+    // unambiguously tells which path ran.
+    dtorCount = 0;
+    {
+        unique IShapeMove ig = new CiMove();
+        if (RuntimeFalse()) { unique IShapeMove ig2 = move ig; }
+        int t = ig?.area() ?? -1;
+        passed += Test("iface_nullcond_guard_not_taken_dispatches", t, 7);
+    }
+    passed += Test("iface_nullcond_guard_not_taken_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique IShapeMove ig = new CiMove();
+        if (identityBool(true)) { unique IShapeMove ig2 = move ig; }
+        int t = ig?.area() ?? -1;
+        passed += Test("iface_nullcond_guard_taken_short_circuits", t, -1);
+    }
+    passed += Test("iface_nullcond_guard_taken_freed_once", dtorCount, 1);
+
     return passed;
 }
 
@@ -2759,7 +2783,7 @@ extern int main()
     total += 18;
 
     passed += testUniqueInterfaceMoveExtra();
-    total += 18;
+    total += 22;
 
     passed += testDiscardMoveReturningCall();
     total += 6;

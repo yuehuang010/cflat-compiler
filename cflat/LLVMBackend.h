@@ -8751,6 +8751,18 @@ public:
         return nullptr;
     }
 
+    // The declared return type of an interface method, or nullptr. Lets a `?.` call site
+    // build the null-path default value's type without invoking the method.
+    const TypeAndValue* GetInterfaceMethodReturnType(const std::string& ifaceName,
+                                                    const std::string& methodName) const
+    {
+        auto it = interfaceTable.find(ifaceName);
+        if (it == interfaceTable.end()) return nullptr;
+        for (const auto& m : it->second)
+            if (m.Name == methodName) return &m.ReturnType;
+        return nullptr;
+    }
+
     llvm::StructType* GetFatPtrType() const
     {
         const char* fatPtrName = "__iface_fat_ptr";

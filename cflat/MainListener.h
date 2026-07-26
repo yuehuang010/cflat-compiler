@@ -19272,20 +19272,81 @@ public:
                                     ifacePtr = Compiler(ctx)->CreateAlloca(fatTy);
                                     Compiler(ctx)->CreateAssignment(interfaceVar.Primary, ifacePtr);
                                 }
-                                namedVar.Primary = Compiler(ctx)->CallInterfaceMethod(
-                                    ifacePtr,
-                                    interfaceVar.TypeAndValue.TypeName,
-                                    primaryIdentifier,
-                                    extraArgs
-                                );
-                                namedVar.Storage = nullptr;
-                                namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
-                                // Populate TypeAndValue from the interface method's return type and
-                                // re-classify the result so a chained member/method call on it works
-                                // (e.g. `e.toJson().data()` or `e.mk().get()`). Without this the result
-                                // has no struct receiver and the chained call re-dispatches the stale name.
-                                if (namedVar.Primary)
-                                    namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+
+                                if (nullConditionalPending)
+                                {
+                                    // Null-conditional interface method call: an interface receiver is
+                                    // a fat {vtable,data} value, so the null test is on the DATA slot
+                                    // (index 1) - ifacePtr itself is always a live alloca address and
+                                    // is never null. Mirrors the thin-pointer '?.' method-call template.
+                                    auto* compiler = Compiler(ctx);
+                                    auto* fatTy = compiler->GetFatPtrType();
+                                    auto* ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
+                                    auto* dataField = compiler->CreateStructGEP(fatTy, ifacePtr, 1);
+                                    auto* dataPtr = compiler->CreateLoad(ptrTy, dataField);
+
+                                    const auto* retTypeTV = compiler->GetInterfaceMethodReturnType(
+                                        interfaceVar.TypeAndValue.TypeName, primaryIdentifier);
+                                    auto* retType = retTypeTV ? compiler->GetType(*retTypeTV) : nullptr;
+                                    bool hasResult = retType && !retType->isVoidTy();
+                                    auto* resultAlloca = hasResult ? compiler->CreateAlloca(retType) : nullptr;
+
+                                    auto* nullBlock = compiler->CreateBasicBlock("nc_null");
+                                    auto* accessBlock = compiler->CreateBasicBlock("nc_access");
+                                    auto* resumeBlock = compiler->CreateBasicBlock("nc_resume");
+
+                                    compiler->CreateConditionJump(dataPtr, accessBlock, nullBlock);
+                                    // insert point is now accessBlock
+
+                                    namedVar.Primary = compiler->CallInterfaceMethod(
+                                        ifacePtr, interfaceVar.TypeAndValue.TypeName, primaryIdentifier, extraArgs);
+                                    namedVar.Storage = nullptr;
+                                    namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
+                                    if (namedVar.Primary)
+                                        namedVar.TypeAndValue = compiler->lastCallReturnType;
+
+                                    if (hasResult && namedVar.Primary)
+                                    {
+                                        compiler->CreateAssignment(namedVar.Primary, resultAlloca);
+                                        compiler->CreateJump(resumeBlock);
+
+                                        compiler->SwitchToBlock(nullBlock);
+                                        compiler->CreateAssignment(llvm::Constant::getNullValue(retType), resultAlloca);
+                                        compiler->CreateJump(resumeBlock);
+
+                                        compiler->SwitchToBlock(resumeBlock);
+                                        auto* result = compiler->CreateLoad(resultAlloca);
+                                        namedVar.Primary = result;
+                                        namedVar.BaseType = result->getType();
+                                    }
+                                    else
+                                    {
+                                        compiler->CreateJump(resumeBlock);
+                                        compiler->SwitchToBlock(nullBlock);
+                                        compiler->CreateJump(resumeBlock);
+                                        compiler->SwitchToBlock(resumeBlock);
+                                        namedVar = {};
+                                    }
+
+                                    nullConditionalPending = false;
+                                }
+                                else
+                                {
+                                    namedVar.Primary = Compiler(ctx)->CallInterfaceMethod(
+                                        ifacePtr,
+                                        interfaceVar.TypeAndValue.TypeName,
+                                        primaryIdentifier,
+                                        extraArgs
+                                    );
+                                    namedVar.Storage = nullptr;
+                                    namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
+                                    // Populate TypeAndValue from the interface method's return type and
+                                    // re-classify the result so a chained member/method call on it works
+                                    // (e.g. `e.toJson().data()` or `e.mk().get()`). Without this the result
+                                    // has no struct receiver and the chained call re-dispatches the stale name.
+                                    if (namedVar.Primary)
+                                        namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+                                }
                                 interfaceVar = {};
                                 structVar = {};
                                 ClassifyPostfixCallResult(ctx, namedVar, structVar, interfaceVar);
