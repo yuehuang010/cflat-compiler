@@ -16,6 +16,20 @@ void Holder(Holder* self) {}
 struct UniqueThing { int v = 0; int get() { return v; } };
 interface IUniqueThing { int get(); };
 class UniqueIfaceThing : IUniqueThing { int v = 0; int get() { return v; } };
+// No class implements this one, so an IUniqueThing -> IUnrelatedThing upcast can never match a
+// vtable at runtime; it must be rejected statically instead of yielding a null-vtable fat value.
+interface IUnrelatedThing { int poke(); };
+// Brace-init of an interface-typed field is its own store path; it must re-box like `=` does.
+struct UnrelatedSlot { IUnrelatedThing s = default; };
+
+// Neither of these has an implementor, so the source's concrete class is unknowable and the
+// source-side check stays silent. The zero-case backstop inside the rebuild is what must reject it:
+// with nothing to match, the conversion would hand back a null-vtable fat value.
+interface INoImplA { int nia(); };
+interface INoImplB { int nib(); };
+expect_error("cannot convert to interface 'INoImplB' - no class implements it") {
+    INoImplB convNoImpl(INoImplA x) { INoImplB y = x; return y; }
+}
 
 // use after move - assign move param to struct field, then read param again
 expect_error("use of moved variable 'child'") {
@@ -377,6 +391,33 @@ extern int main()
         MoveResource* r4 = new MoveResource();
         if (0) { } else { consume(r4); }
         consume(r4);
+    }
+
+    // Moving a `unique` interface local into an interface its class does not implement used to
+    // build a null-vtable fat pointer and segfault on the next call. Direct spelling.
+    expect_error("no class implementing 'IUniqueThing' implements 'IUnrelatedThing'") {
+        unique IUniqueThing ug = new UniqueIfaceThing();
+        unique IUnrelatedThing uk = move ug;
+    }
+
+    // Same conversion through a '?:' whose fat arm is the move and whose thin arm is boxed
+    // against the fat arm's interface - the receiver's interface is still the one that must match.
+    expect_error("no class implementing 'IUniqueThing' implements 'IUnrelatedThing'") {
+        unique IUniqueThing ug2 = new UniqueIfaceThing();
+        unique IUnrelatedThing uk2 = 1 ? move ug2 : new UniqueIfaceThing();
+    }
+
+    // Brace-init spelling: a fat value bound to a struct field of a different interface. It used
+    // to store the source vtable unchanged, so the field's method 0 called the source's method 0.
+    expect_error("no class implementing 'IUniqueThing' implements 'IUnrelatedThing'") {
+        IUniqueThing ub = new UniqueIfaceThing();
+        UnrelatedSlot slot = { s = ub };
+    }
+
+    // Array brace-init binds elements through its own store path, with the same defect.
+    expect_error("no class implementing 'IUniqueThing' implements 'IUnrelatedThing'") {
+        IUniqueThing ub2 = new UniqueIfaceThing();
+        IUnrelatedThing[2] uarr = { ub2, ub2 };
     }
 
     return 0;

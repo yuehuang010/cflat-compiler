@@ -1342,6 +1342,51 @@ bool testInterfaceTernaryUpcast()
     return result;
 }
 
+/*
+ * Brace-init binds an interface-typed struct field or array element through its own store path,
+ * separate from `=`. Each must re-box the source to the DESTINATION's interface; otherwise the slot
+ * keeps the source's vtable and its slot 0 answers the destination interface's method 0.
+ * The two interfaces below are unrelated and their method 0 identities differ, so a missing rebox
+ * is observable: it returns kick()'s 100 where hum()'s 5 is expected.
+ */
+interface IKick { int kick(); };
+interface IHum  { int hum(); };
+
+class KickHum : IKick, IHum
+{
+    int v = 5;
+    int kick() { return 100; }
+    int hum()  { return v; }
+};
+
+struct HumSlot { IHum s = default; };
+
+bool testInterfaceBraceInitField()
+{
+    bool result = true;
+
+    // Stack instance, so the boxed slots borrow and nothing needs freeing.
+    KickHum kh = KickHum();
+    IKick k = &kh;
+
+    // Already-fat source (IKick) into an IHum field: needs the rebox.
+    HumSlot fromIface = { s = k };
+    result &= Test("iface_braceinit_field_from_iface", fromIface.s.hum(), 5);
+
+    // Thin concrete pointer into the same field: the pre-existing boxing path.
+    HumSlot fromPtr = { s = &kh };
+    result &= Test("iface_braceinit_field_from_ptr", fromPtr.s.hum(), 5);
+
+    // Same two sources through the ARRAY brace-init element path.
+    IHum[2] arrFromIface = { k, k };
+    result &= Test("iface_braceinit_arr_from_iface", arrFromIface[0].hum(), 5);
+    result &= Test("iface_braceinit_arr_from_iface1", arrFromIface[1].hum(), 5);
+
+    IHum[2] arrFromPtr = { &kh, &kh };
+    result &= Test("iface_braceinit_arr_from_ptr", arrFromPtr[0].hum(), 5);
+    return result;
+}
+
 bool testInterfaceIsNullUpcast()
 {
     bool result = true;
@@ -1917,6 +1962,7 @@ extern int main()
     total++; passed += testInterfaceFieldString()        ? 1 : 0;
     total++; passed += testDowncastCallResultBorrow()    ? 1 : 0;
     total++; passed += testInterfaceFieldAccess()        ? 1 : 0;
+    total++; passed += testInterfaceBraceInitField()     ? 1 : 0;
     total++; passed += testInterfaceIsNullUpcast()       ? 1 : 0;
     total++; passed += testInterfaceTernaryUpcast()      ? 1 : 0;
     total++; passed += testGenericInterfaceField()       ? 1 : 0;

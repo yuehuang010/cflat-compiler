@@ -1555,6 +1555,9 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     sourceFileName = std::filesystem::path(canonicalStr).filename().string();
     currentSourceFilePath_ = canonicalStr;
     currentSourceIsCore_ = isCoreImport;
+    // Files that follow this import are not scanned yet, so no interface-implementor claim made
+    // while codegen'ing it can be proven complete (see InterfaceImplementorSetIsUncertain).
+    ImportedFileCompileScope importDepthScope(this);
 
     // Forward-ref scan the imported file
     {
@@ -2437,6 +2440,9 @@ void LLVMBackend::ResetForReanalysis()
     interfaceTable.clear();
     interfaceFields.clear();
     interfaceParents.clear();
+    scannedInterfaceImpls.clear();
+    uncertainInterfaceImpls.clear();
+    importCompileDepth_ = 0;   // a throw out of an import walk can leave the RAII depth stranded
     typeAnnotations_.clear();
     globalNamedVariable.clear();
     globalVariableTypes.clear();
@@ -4498,6 +4504,9 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     interfaceTable.clear();
     interfaceFields.clear();
     interfaceParents.clear();
+    scannedInterfaceImpls.clear();
+    uncertainInterfaceImpls.clear();
+    importCompileDepth_ = 0;   // a throw out of an import walk can leave the RAII depth stranded
     typeAnnotations_.clear();
     annotationRegistry.clear();
     globalNamedVariable.clear();

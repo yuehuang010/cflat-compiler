@@ -1301,6 +1301,16 @@ private:
     // VariableName is the field name; every implementor must expose a field of the same name/type.
     std::unordered_map<std::string, std::vector<TypeAndValue>> interfaceFields;
     std::unordered_map<std::string, std::vector<std::string>> interfaceParents;
+    // Class name -> base-clause interface names, scanned before codegen so a conversion site sees
+    // classes declared LATER. STATIC-CHECK ONLY: driving vtable emission off it would cache a
+    // vtable built against a still-opaque StructType (null field offsets, empty destructor).
+    std::unordered_map<std::string, std::vector<std::string>> scannedInterfaceImpls;
+    // Interfaces whose real implementor set is a main-pass fact: named in a generic class's base
+    // clause, or spelled generically. Never prove a conversion impossible against one of these.
+    std::unordered_set<std::string> uncertainInterfaceImpls;
+    // Depth of nested CompileImportedFile scan/walk. Above zero the files that follow this import
+    // have not been scanned yet, so the implementor registry is provably incomplete.
+    int importCompileDepth_ = 0;
     // Type-level annotations keyed by type/interface name ([winrt] on a class, [uuid("...")] on an
     // interface, ...). Field annotations are separate (StructData.StructFields[].Annotations).
     std::unordered_map<std::string, std::vector<AnnotationValue>> typeAnnotations_;
@@ -9841,6 +9851,115 @@ public:
         return BuildInterfaceFatValue(vtable, dataPtr);
     }
 
+    // Record a class's base-clause interface names from the ForwardRefScanner pass, so the static
+    // conversion check below sees the whole file instead of only textually earlier declarations.
+    void RecordScannedStructInterfaces(const std::string& structName, std::vector<std::string> ifaceNames)
+    {
+        if (structName.empty() || ifaceNames.empty()) return;
+        scannedInterfaceImpls[structName] = std::move(ifaceNames);
+    }
+
+    // Mark an interface whose implementor set cannot be settled before codegen (a generic class
+    // names it, or it is itself spelled generically), so the check never proves anything about it.
+    void RecordUncertainInterfaceImpl(const std::string& ifaceName)
+    {
+        if (!ifaceName.empty()) uncertainInterfaceImpls.insert(ifaceName);
+    }
+
+    // RAII bracket for importCompileDepth_. LogError THROWS on several paths (SpeculativeEvalAbort,
+    // CompilerAbortException, ExpectedErrorReceived) and FailCompilation throws in batch mode, so a
+    // bare decrement would leak the depth and silently disable the check for the rest of the process.
+    struct ImportedFileCompileScope
+    {
+        LLVMBackend* backend_;
+        explicit ImportedFileCompileScope(LLVMBackend* backend) : backend_(backend)
+        {
+            backend_->importCompileDepth_++;
+        }
+        ~ImportedFileCompileScope()
+        {
+            if (backend_->importCompileDepth_ > 0) backend_->importCompileDepth_--;
+        }
+        ImportedFileCompileScope(const ImportedFileCompileScope&) = delete;
+        ImportedFileCompileScope& operator=(const ImportedFileCompileScope&) = delete;
+    };
+
+    // True when nothing may be PROVEN about who implements `ifaceName`: a generic class could
+    // still supply it, or later files simply have not been scanned yet (import-time codegen).
+    bool InterfaceImplementorSetIsUncertain(const std::string& ifaceName) const
+    {
+        if (importCompileDepth_ > 0) return true;
+        if (uncertainInterfaceImpls.count(ifaceName) > 0) return true;
+        // A monomorphized name (IFoo__int) inherits its template's uncertainty.
+        if (size_t p = ifaceName.find("__"); p != std::string::npos)
+            return uncertainInterfaceImpls.count(ifaceName.substr(0, p)) > 0;
+        return false;
+    }
+
+    // Whether `typeName` may provide `ifaceName`, directly or by interface inheritance. Answers
+    // from the codegen registry AND the scanner's forward registry, so it is declaration-order
+    // independent - unlike RebuildInterfaceFatValue's case loop, which additionally needs a
+    // typedesc global and so can only see classes already emitted.
+    bool TypeMayProvideInterface(const std::string& typeName, const std::string& ifaceName) const
+    {
+        if (StructImplementsInterface(typeName, ifaceName)) return true;
+        auto it = scannedInterfaceImpls.find(typeName);
+        if (it == scannedInterfaceImpls.end()) return false;
+        // Exact names only - no trailing-component heuristic. A base clause is a bare Identifier in
+        // the grammar and a namespaced interface still registers unqualified, so both sides are
+        // already bare; a `using` alias is resolved, which the scanner could not do yet.
+        std::string want = ResolveTypeAlias(ifaceName);
+        for (const auto& declaredRaw : it->second)
+        {
+            std::string declared = ResolveTypeAlias(declaredRaw);
+            if (declared == want || InterfaceInheritsFrom(declared, want)) return true;
+        }
+        return false;
+    }
+
+    // Shared by the static check and RebuildInterfaceFatValue's zero-case backstop, so the two
+    // can never disagree about whether an implementor exists.
+    bool AnyTypeMayProvideInterface(const std::string& ifaceName) const
+    {
+        for (const auto& [name, sd] : dataStructures)
+            if (TypeMayProvideInterface(name, ifaceName)) return true;
+        for (const auto& [name, pd] : programTable)
+            if (TypeMayProvideInterface(name, ifaceName)) return true;
+        for (const auto& [name, ifaces] : scannedInterfaceImpls)
+            if (TypeMayProvideInterface(name, ifaceName)) return true;
+        return false;
+    }
+
+    // True only when an interface -> interface conversion provably cannot succeed: both names are
+    // real interfaces, neither inherits the other, neither implementor set is uncertain, and every
+    // known implementor of `srcIface` lacks `dstIface`. Any doubt returns false: the check may only
+    // reject what it can PROVE impossible, so a legal upcast is never rejected.
+    bool InterfaceConversionIsProvablyImpossible(const std::string& srcIfaceIn,
+                                                 const std::string& dstIfaceIn) const
+    {
+        std::string srcIface = ResolveTypeAlias(srcIfaceIn);
+        std::string dstIface = ResolveTypeAlias(dstIfaceIn);
+        if (srcIface.empty() || dstIface.empty() || srcIface == dstIface) return false;
+        if (!IsInterfaceType(srcIface) || !IsInterfaceType(dstIface)) return false;
+        if (InterfaceInheritsFrom(srcIface, dstIface) || InterfaceInheritsFrom(dstIface, srcIface))
+            return false;
+        if (InterfaceImplementorSetIsUncertain(srcIface) || InterfaceImplementorSetIsUncertain(dstIface))
+            return false;
+
+        bool sawSourceImplementor = false;
+        auto consider = [&](const std::string& name) -> bool
+        {
+            if (!TypeMayProvideInterface(name, srcIface)) return true;
+            sawSourceImplementor = true;
+            return !TypeMayProvideInterface(name, dstIface);
+        };
+        for (const auto& [name, sd] : dataStructures)         if (!consider(name)) return false;
+        for (const auto& [name, pd] : programTable)           if (!consider(name)) return false;
+        for (const auto& [name, ifaces] : scannedInterfaceImpls) if (!consider(name)) return false;
+        // No implementor at all means the registry cannot answer the question - stay silent.
+        return sawSourceImplementor;
+    }
+
     // Rebuild only when the source and destination interfaces actually differ (the common
     // same-interface case stays a plain by-value copy, with no if-chain emitted). The ambiguous
     // sentinel (a '?:' join whose two arms disagreed - see PropagateFatInterfaceJoin) always
@@ -9852,6 +9971,15 @@ public:
         if (srcIface == kAmbiguousFatInterface) return RebuildInterfaceFatValue(fatVal, dstIface);
         if (srcIface.empty() || srcIface == dstIface) return fatVal;
         if (!IsInterfaceType(srcIface) || !IsInterfaceType(dstIface)) return fatVal;
+        // A rebuild with no possible typedesc match would silently yield a null vtable that the
+        // next method call dispatches through. Reject it here, where both names are still known.
+        if (InterfaceConversionIsProvablyImpossible(srcIface, dstIface))
+        {
+            LogError(std::format(
+                "cannot convert interface '{}' to interface '{}' - no class implementing '{}' "
+                "implements '{}'", srcIface, dstIface, srcIface, dstIface));
+            return fatVal;
+        }
         return RebuildInterfaceFatValue(fatVal, dstIface);
     }
 
@@ -9892,12 +10020,23 @@ public:
             SwitchToBlock(nextBlock);
         };
 
+        int emittedCases = 0;
         for (auto& [sName, sd] : dataStructures)
             if (sd.typeDescriptor && StructImplementsInterface(sName, dstIface))
-                emitCase(sName, sd.typeDescriptor);
+            { emitCase(sName, sd.typeDescriptor); emittedCases++; }
         for (auto& [pName, pd] : programTable)
             if (pd.typeDescriptor && StructImplementsInterface(pName, dstIface))
-                emitCase(pName, pd.typeDescriptor);
+            { emitCase(pName, pd.typeDescriptor); emittedCases++; }
+
+        // Backstop for callers that reached here without a static check: with no case to match,
+        // the result is a guaranteed null vtable that the next method call dispatches through.
+        // Only when NO implementor can exist at all - a merely not-yet-emitted one (declared later
+        // in the file, generic, or in a file this import precedes) must stay silent.
+        if (emittedCases == 0 && !InterfaceImplementorSetIsUncertain(dstIface)
+            && !AnyTypeMayProvideInterface(dstIface))
+            LogError(std::format(
+                "cannot convert to interface '{}' - no class implements it",
+                dstIface));
 
         builder->CreateBr(afterBlock);
         SwitchToBlock(afterBlock);

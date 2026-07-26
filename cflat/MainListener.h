@@ -455,6 +455,28 @@ static std::vector<Result*> MemberFilter(const std::vector<Member*>& members, Ge
     template <typename TCtx> auto MemberClassDefinitions(TCtx* ctx)    { return MemberFilter<CFlatParser::ClassDefinitionContext>     (ResolveAggregateMembers(ctx), [](auto* m){ return m->classDefinition();      }); } \
     template <typename TCtx> auto MemberLockFieldGroups(TCtx* ctx)     { return MemberFilter<CFlatParser::LockFieldGroupContext>      (ResolveAggregateMembers(ctx), [](auto* m){ return m->lockFieldGroup();       }); }
 
+// Base-clause interface identifiers of a class definition. Only `classDefinition` carries a base
+// clause in the grammar, so the struct overload answers empty and keeps the scan templated.
+inline std::vector<CFlatParser::GenericIdentifierContext*> BaseClauseIdentifiers(CFlatParser::ClassDefinitionContext* ctx) { return ctx->genericIdentifier(); }
+inline std::vector<CFlatParser::GenericIdentifierContext*> BaseClauseIdentifiers(CFlatParser::StructDefinitionContext*)    { return {}; }
+
+/*
+ * A class inside an `if const` block is invisible to ForwardRefScanner - the taken branch is a
+ * MainListener fact - so it never reaches scannedInterfaceImpls and no conversion may be proven
+ * impossible against the interfaces it names. Walk the whole subtree (nested namespaces, nested
+ * `if const`, else arms) and mark every base-clause interface uncertain instead.
+ */
+inline void MarkIfConstClassImplsUncertain(LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+{
+    if (compiler == nullptr || node == nullptr) return;
+    if (auto* cls = dynamic_cast<CFlatParser::ClassDefinitionContext*>(node))
+        for (auto* genId : BaseClauseIdentifiers(cls))
+            if (genId->Identifier())
+                compiler->RecordUncertainInterfaceImpl(genId->Identifier()->getText());
+    for (auto* child : node->children)
+        MarkIfConstClassImplsUncertain(compiler, child);
+}
+
 // Interface bodies parse through the named `interfaceMember` rule, so methods and fields are nested
 // one level under it. Same macro shape as the aggregate flatteners: each pass gets its own copy so
 // the unqualified ResolveInterfaceMembers call binds to that pass's branch-selection policy.
@@ -1629,12 +1651,40 @@ private:
                                 getFunctionSignatureText(func), {}, fdoc);
                 }
             }
+            // A generic class's real base clause needs main-pass type-arg substitution, and its
+            // instances appear only on demand: never prove anything about the interfaces it names.
+            for (auto* genId : BaseClauseIdentifiers(ctx))
+                if (genId->Identifier())
+                    compiler->RecordUncertainInterfaceImpl(genId->Identifier()->getText());
             return;
         }
 
         std::string typeName = ctx->directDeclarator()->getText();
         if (!namespaceName.empty())
             typeName = namespaceName + "." + typeName;
+
+        // Record the declared interface list before any codegen, so a conversion site can see
+        // implementors declared LATER in the file. Static-check only - see scannedInterfaceImpls.
+        {
+            std::vector<std::string> scannedIfaces;
+            for (auto* genId : BaseClauseIdentifiers(ctx))
+            {
+                if (!genId->Identifier()) continue;
+                std::string ifaceBaseName = genId->Identifier()->getText();
+                // A generic interface spelling only mangles after substitution; record the
+                // template as uncertain rather than guessing the instance name.
+                if (genId->genericTypeParameters() != nullptr)
+                    compiler->RecordUncertainInterfaceImpl(ifaceBaseName);
+                else
+                    scannedIfaces.push_back(ifaceBaseName);
+            }
+            compiler->RecordScannedStructInterfaces(typeName, scannedIfaces);
+        }
+        // Member-scope `if const` is skipped by ResolveAggregateMembers for the same reason, so a
+        // nested class inside one is invisible too - mark what it names uncertain.
+        for (auto* m : ctx->aggregateMember())
+            if (auto* icm = m->ifConstMember())
+                MarkIfConstClassImplsUncertain(compiler, icm);
 
         // Register opaque struct so the type is known for pointer/field use
         compiler->CreateStructType(typeName, {});
@@ -2313,7 +2363,9 @@ public:
             catch (const ExpectedErrorReceived&) {}
             compilerLLVM->expectedError.clear();
         }
-        // if const declarations are skipped here; they are handled in MainListener
+        else if (auto* ifConst = ctx->ifConstDeclaration())
+            MarkIfConstClassImplsUncertain(compilerLLVM, ifConst);
+        // if const declarations are otherwise skipped here; they are handled in MainListener
         // which has access to expression evaluation and can determine the taken branch
     }
 
@@ -13802,6 +13854,41 @@ public:
     // wrapped to the string struct, an implementer pointer is boxed into an interface
     // fat pointer, unions store at offset 0. Shared by EmitFieldInitializer (brace
     // init) and ParseElementExpression (<Tag attr=...> sugar). Returns false on error.
+    /*
+     * Coerce one brace-initializer value to an INTERFACE destination slot: box a thin concrete
+     * pointer/value into the fat struct, or re-box an already-fat value to the destination's own
+     * interface. Shared by the struct-field and the fixed-array / array-view element paths, so a
+     * brace list cannot store a source vtable that dispatches the destination interface's slots.
+     * Returns `val` unchanged when nothing applies.
+     */
+    llvm::Value* CoerceInitValueToInterface(
+        LLVMBackend::NamedVariable& rightNV,
+        llvm::Value* val,
+        const std::string& ifaceName,
+        antlr4::ParserRuleContext* errCtx)
+    {
+        auto* compiler = Compiler(errCtx);
+        if (val == nullptr || ifaceName.empty()) return val;
+
+        if (val->getType() == compiler->GetFatPtrType())
+        {
+            std::string srcIface = compiler->ResolveFatInterfaceSrcName(val,
+                rightNV.TypeAndValue.IsInterface ? rightNV.TypeAndValue.TypeName : std::string());
+            return compiler->ReboxInterfaceIfNeeded(val, srcIface, ifaceName);
+        }
+
+        std::string srcName = rightNV.TypeAndValue.TypeName;
+        if (srcName.empty() || !compiler->StructImplementsInterface(srcName, ifaceName)) return val;
+        auto vtable = compiler->GetOrCreateVTable(srcName, ifaceName);
+        llvm::Value* dataPtr = rightNV.TypeAndValue.Pointer ? val : rightNV.Storage;
+        if (!dataPtr)
+        {
+            dataPtr = compiler->CreateAlloca(val->getType());
+            compiler->CreateAssignment(val, dataPtr);
+        }
+        return compiler->BuildInterfaceFatValue(vtable, dataPtr);
+    }
+
     bool EmitOneFieldInit(
         llvm::Value* structPtr,
         const LLVMBackend::StructData& sd,
@@ -13925,21 +14012,12 @@ public:
             if (auto* copied = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
                 val = copied;
         }
-        // Coerce struct pointer to interface fat pointer
-        else if (fieldType.IsInterface && val->getType() != compiler->GetFatPtrType())
+        // Box a thin concrete source, or re-box an already-fat one to the FIELD's interface exactly
+        // as the `=` path does. Without the rebox the field keeps the SOURCE's vtable and its slot 0
+        // answers the field interface's method 0 - a silently wrong call, no crash, no error.
+        else if (fieldType.IsInterface)
         {
-            std::string srcName = rightNV.TypeAndValue.TypeName;
-            if (!srcName.empty() && compiler->StructImplementsInterface(srcName, fieldType.TypeName))
-            {
-                auto vtable = compiler->GetOrCreateVTable(srcName, fieldType.TypeName);
-                llvm::Value* dataPtr = rightNV.TypeAndValue.Pointer ? val : rightNV.Storage;
-                if (!dataPtr)
-                {
-                    dataPtr = compiler->CreateAlloca(val->getType());
-                    compiler->CreateAssignment(val, dataPtr);
-                }
-                val = compiler->BuildInterfaceFatValue(vtable, dataPtr);
-            }
+            val = CoerceInitValueToInterface(rightNV, val, fieldType.TypeName, errCtx);
         }
 
         llvm::Value* destination = nullptr;
@@ -14137,6 +14215,9 @@ public:
                 LLVMBackend::NamedVariable tmp = nv;
                 CoerceElementToString(compiler, tmp, val, fi);
             }
+            // Interface element: same boxing/rebox the struct-field brace path applies.
+            if (!tv.ElemPointer && compiler->IsInterfaceType(tv.TypeName))
+                val = CoerceInitValueToInterface(nv, val, tv.TypeName, fi);
 
             llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
             auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, { zero, idx }, "arrelem");
@@ -14562,6 +14643,9 @@ public:
                 LLVMBackend::NamedVariable tmp = nv;
                 CoerceElementToString(compiler, tmp, val, fi);
             }
+            // Interface element: same boxing/rebox the struct-field brace path applies.
+            if (!elemTV.Pointer && compiler->IsInterfaceType(elemTV.TypeName))
+                val = CoerceInitValueToInterface(nv, val, elemTV.TypeName, fi);
 
             llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
             auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, backing, { zero, idx }, "arrview_elem");
