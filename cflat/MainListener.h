@@ -7896,10 +7896,16 @@ public:
                                 bool rhsIsKnownType = !structName.empty() &&
                                     (compiler->dataStructures.count(structName) || compiler->programTable.count(structName));
                                 // A '?:' result carries no TypeName: box each arm in its own branch.
+                                std::string ternaryArmFailure;
                                 llvm::Value* ternaryFat = structName.empty()
-                                    ? UpcastTernaryPhiToInterface(right, typeAndValue.TypeName) : nullptr;
+                                    ? UpcastTernaryPhiToInterface(right, typeAndValue.TypeName, &ternaryArmFailure)
+                                    : nullptr;
                                 if (ternaryFat != nullptr)
                                     right = ternaryFat;
+                                else if (!ternaryArmFailure.empty())
+                                    LogErrorContext(assignmentExpression, std::format(
+                                        "cannot convert '?:' arm to interface '{}': {}",
+                                        typeAndValue.TypeName, ternaryArmFailure));
                                 else if (rhsIsKnownType && !compiler->StructImplementsInterface(structName, typeAndValue.TypeName))
                                 {
                                     LogErrorContext(assignmentExpression,
@@ -9517,10 +9523,17 @@ public:
      * TypeName, so the ordinary upcast is skipped and a raw `ptr` would be bitcast into the fat
      * struct type - invalid IR. Box each incoming arm inside the arm's OWN block, which also
      * covers arms with DIFFERENT concrete classes (each gets its own vtable), and join the fat
-     * pointers with a second phi. A null arm contributes a null fat pointer. Returns nullptr
-     * when this does not apply, leaving the caller's normal path untouched.
+     * pointers with a second phi. A null arm contributes a null fat pointer. An arm's concrete
+     * class comes from ResolvePointerElementTypeName, which answers a BORROWED arm (a plain load,
+     * absent from the `new`-site ledger) from the loaded binding's declared type - otherwise that
+     * arm would fail to resolve and the caller would bitcast a raw `ptr` into the fat struct.
+     * Returns nullptr when this does not apply, leaving the caller's normal path untouched.
+     * `armFailure` (when given) is set ONLY for a pointer '?:' that genuinely targets this
+     * interface but has an arm that cannot be boxed - the caller must diagnose that instead of
+     * bitcasting a raw `ptr` into the fat struct. It stays empty for every "does not apply" bail.
      */
-    llvm::Value* UpcastTernaryPhiToInterface(llvm::Value* right, const std::string& interfaceName)
+    llvm::Value* UpcastTernaryPhiToInterface(llvm::Value* right, const std::string& interfaceName,
+                                             std::string* armFailure = nullptr)
     {
         auto* compiler = compilerLLVM;
         auto* phi = llvm::dyn_cast_or_null<llvm::PHINode>(right);
@@ -9533,11 +9546,21 @@ public:
         {
             llvm::Value* incoming = phi->getIncomingValue(i);
             if (llvm::isa<llvm::ConstantPointerNull>(incoming)) continue;
-            armTypes[i] = compiler->FindValueElementTypeName(incoming);
-            if (armTypes[i].empty()
-                || !compiler->StructImplementsInterface(armTypes[i], interfaceName)
-                || phi->getIncomingBlock(i)->getTerminator() == nullptr)
+            armTypes[i] = compiler->ResolvePointerElementTypeName(incoming);
+            if (armTypes[i].empty())
+            {
+                if (armFailure != nullptr)
+                    *armFailure = "the arm's concrete class cannot be determined; bind the arm to a "
+                                  "local variable of the class type first";
                 return nullptr;
+            }
+            if (!compiler->StructImplementsInterface(armTypes[i], interfaceName))
+            {
+                if (armFailure != nullptr)
+                    *armFailure = std::format("'{}' does not implement it", armTypes[i]);
+                return nullptr;
+            }
+            if (phi->getIncomingBlock(i)->getTerminator() == nullptr) return nullptr;
         }
 
         auto* savedBlock = compiler->builder->GetInsertBlock();
@@ -10097,8 +10120,17 @@ public:
                 std::string structName = rightNV.TypeAndValue.TypeName;
                 // A '?:' result carries no TypeName: box each arm in its own branch.
                 if (structName.empty() && !namedVar.TypeAndValue.IsInterfacePointer)
-                    if (auto* ternaryFat = UpcastTernaryPhiToInterface(right, namedVar.TypeAndValue.TypeName))
+                {
+                    std::string ternaryArmFailure;
+                    auto* ternaryFat = UpcastTernaryPhiToInterface(
+                        right, namedVar.TypeAndValue.TypeName, &ternaryArmFailure);
+                    if (ternaryFat != nullptr)
                         right = ternaryFat;
+                    else if (!ternaryArmFailure.empty())
+                        LogErrorContext(ctx, std::format(
+                            "cannot convert '?:' arm to interface '{}': {}",
+                            namedVar.TypeAndValue.TypeName, ternaryArmFailure));
+                }
                 if (!structName.empty() && compiler->StructImplementsInterface(structName, namedVar.TypeAndValue.TypeName))
                 {
                     auto vtable = compiler->GetOrCreateVTable(structName, namedVar.TypeAndValue.TypeName);

@@ -170,6 +170,47 @@ expect_error("cannot assign a borrowed value to unique interface 'mixedIfaceAssi
     }
 }
 
+// A BORROWED THIN-POINTER arm joined into an interface slot. A plain receiver only borrows the
+// mixed join (see test_move.cb's iface_ternary_thin_* legs), but a `unique` receiver must own
+// what it frees, so this spelling stays rejected exactly like the fat-pointer one above.
+expect_error("cannot initialize unique 'thinBorrowIntoUnique' from a borrowed value") {
+    int thinBorrowArmIntoUnique(bool c)
+    {
+        unique UniqueIfaceThing* thinOwner = new UniqueIfaceThing();
+        unique IUniqueThing thinBorrowIntoUnique = c ? new UniqueIfaceThing() : thinOwner;
+        return thinBorrowIntoUnique.get();
+    }
+}
+
+struct IfaceArmHolder { UniqueIfaceThing* p = default; };
+void IfaceArmHolder(IfaceArmHolder* self) {}
+UniqueIfaceThing* gIfaceArmPtr = default;
+
+/*
+ * An arm whose concrete class cannot be recovered. Boxing an arm needs its class to pick a
+ * vtable; a local or parameter supplies it from its declared type, but a FIELD or GLOBAL arm
+ * does not, and the upcast used to bail and leave a raw `ptr` bitcast into the fat struct -
+ * invalid IR caught only by module verification, with no source location. Diagnose it instead.
+ */
+expect_error("cannot convert '?:' arm to interface 'IUniqueThing': the arm's concrete class cannot be determined") {
+    int fieldArmIntoIface(bool c)
+    {
+        unique UniqueIfaceThing* fieldOwner = new UniqueIfaceThing();
+        IfaceArmHolder fh;
+        fh.p = fieldOwner;
+        IUniqueThing fieldArm = c ? new UniqueIfaceThing() : fh.p;
+        return fieldArm.get();
+    }
+}
+
+expect_error("cannot convert '?:' arm to interface 'IUniqueThing': the arm's concrete class cannot be determined") {
+    int globalArmIntoIface(bool c)
+    {
+        IUniqueThing globalArm = c ? new UniqueIfaceThing() : gIfaceArmPtr;
+        return globalArm.get();
+    }
+}
+
 extern int main()
 {
     // use after move - pass to another call

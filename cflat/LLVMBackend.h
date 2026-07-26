@@ -2446,6 +2446,46 @@ private:
         return {};
     }
 
+    // Declared class of the live pointer binding whose storage slot is `storage`. Answers from the
+    // DECLARED type, which a borrowed value has and the `new`-site ledger does not record.
+    std::string FindDeclaredElementTypeNameForStorage(const llvm::Value* storage) const
+    {
+        if (storage == nullptr) return {};
+        // Only a SINGLE-LEVEL thin `T*` names the class its loaded value points AT. A `T**`
+        // (ElemPointer), a `T[]` view, a simd/const-array slot or an interface slot all load to a
+        // bare ptr whose TypeName is the ELEMENT class, so boxing one would attach a class vtable
+        // to something that is not an instance of it - silent type confusion.
+        auto pick = [](const NamedVariable& nv) -> std::string {
+            const auto& tv = nv.TypeAndValue;
+            if (!tv.Pointer || tv.ElemPointer || tv.IsArrayView || tv.IsSimd
+                || tv.IsInterface || tv.IsInterfacePointer || tv.ConstArraySize != 0)
+                return {};
+            return tv.TypeName;
+        };
+        for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            for (const auto& [name, nv] : frame.namedVariable)
+                if (nv.Storage == storage) return pick(nv);
+            for (const auto& [name, nv] : frame.functionArgument)
+                if (nv.Storage == storage) return pick(nv);
+        }
+        return {};
+    }
+
+    /*
+     * Resolve the concrete class a pointer VALUE points at. The `new`-site ledger answers an
+     * owning temp; a BORROWED value is a plain load of a typed local, which is in no ledger, so
+     * fall back to the declared type of the binding the load came from.
+     */
+    std::string ResolvePointerElementTypeName(llvm::Value* value) const
+    {
+        std::string name = FindValueElementTypeName(value);
+        if (!name.empty()) return name;
+        auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(value);
+        if (load == nullptr) return {};
+        return FindDeclaredElementTypeNameForStorage(load->getPointerOperand());
+    }
+
     // Ledger a value a `move` expression detached (see movedOutPtrValues_). An INTERFACE fat
     // pointer is accepted too - it is a struct, but it is detached by the same move contract.
     void RegisterMovedOutPtrValue(llvm::Value* value)

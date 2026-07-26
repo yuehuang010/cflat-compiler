@@ -1946,6 +1946,64 @@ int testUniqueInterfaceTernary()
     }
     passed += Test("iface_ternary_mixed_join_owner_freed_once", dtorCount, 1);
 
+    /*
+     * BORROWED THIN-POINTER arm bound to a PLAIN interface local. The borrow arm is a plain load,
+     * so it is in no `new`-site ledger and its class used to be unresolvable - the upcast bailed
+     * and a raw `ptr` was bitcast into the fat struct (module verification failure, no source
+     * location). The arm is now boxed from its DECLARED type. The join is still MIXED, so a plain
+     * receiver only borrows it: no adoption, no release, and the owner frees its box exactly once.
+     */
+    // The two arms carry DIFFERENT concrete classes (area 0 vs 7), so the returned value alone
+    // pins WHICH arm ran and that each arm was boxed with its own vtable.
+    dtorCount = 0;
+    sqMoveCtorCount = 0;
+    ciMoveCtorCount = 0;
+    {
+        unique CiMove* owner = new CiMove();
+        {
+            // false: the BORROWED arm is selected - the receiver must not free the owner's box.
+            IShapeMove k = identityBool(false) ? new SqMove() : owner;
+            passed += Test("iface_ternary_thin_borrow_arm_value", k.area(), 7);
+            passed += Test("iface_ternary_thin_borrow_arm_untaken_new", sqMoveCtorCount, 0);
+            passed += Test("iface_ternary_thin_borrow_arm_owner_ctor", ciMoveCtorCount, 1);
+            passed += Test("iface_ternary_thin_borrow_arm_no_early_free", dtorCount, 0);
+        }
+        passed += Test("iface_ternary_thin_borrow_arm_no_adoption", dtorCount, 0);
+        passed += Test("iface_ternary_thin_borrow_arm_owner_alive", owner->area(), 7);
+    }
+    passed += Test("iface_ternary_thin_borrow_arm_owner_freed_once", dtorCount, 1);
+
+    // Same shape, condition inverted: the `new` arm runs (its area 0 proves it was selected) and
+    // leaks by accepted design; the borrowed owner is still freed exactly once at its own exit.
+    dtorCount = 0;
+    sqMoveCtorCount = 0;
+    {
+        unique CiMove* owner = new CiMove();
+        {
+            IShapeMove k = identityBool(true) ? new SqMove() : owner;
+            passed += Test("iface_ternary_thin_new_arm_value", k.area(), 0);
+            passed += Test("iface_ternary_thin_new_arm_taken_new", sqMoveCtorCount, 1);
+            passed += Test("iface_ternary_thin_new_arm_no_early_free", dtorCount, 0);
+        }
+        passed += Test("iface_ternary_thin_new_arm_no_adoption", dtorCount, 0);
+        passed += Test("iface_ternary_thin_new_arm_owner_alive", owner->area(), 7);
+    }
+    passed += Test("iface_ternary_thin_new_arm_owner_freed_once", dtorCount, 1);
+
+    // Both arms the SAME class: the value cannot discriminate here, so this leg pins the ownership
+    // accounting - a borrowed same-class arm is still not adopted and the owner frees exactly once.
+    dtorCount = 0;
+    {
+        unique SqMove* owner = new SqMove();
+        {
+            IShapeMove k = identityBool(false) ? new SqMove() : owner;
+            passed += Test("iface_ternary_thin_borrow_same_class_value", k.area(), 0);
+            passed += Test("iface_ternary_thin_borrow_same_class_no_early_free", dtorCount, 0);
+        }
+        passed += Test("iface_ternary_thin_borrow_same_class_no_adoption", dtorCount, 0);
+    }
+    passed += Test("iface_ternary_thin_borrow_same_class_owner_freed_once", dtorCount, 1);
+
     return passed;
 }
 
@@ -2780,7 +2838,7 @@ extern int main()
     total += 8;
 
     passed += testUniqueInterfaceTernary();
-    total += 18;
+    total += 35;
 
     passed += testUniqueInterfaceMoveExtra();
     total += 22;
