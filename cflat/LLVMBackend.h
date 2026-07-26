@@ -1102,6 +1102,14 @@ public:
     // laundered spelling is rejected exactly like the direct one. Retired with ownedNewTemps_.
     std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues_;
 
+    // '?:' joins of an OWNING-VALUE STRUCT whose arms did not all provably own, keyed by value
+    // identity. Such a phi may carry a live borrow's bits, so every receiver that would otherwise
+    // adopt it (a fresh local, an existing owning local, a struct field) must BORROW instead: the
+    // untaken owning arm leaks, which beats destroying a pointee its real owner destroys again.
+    // A struct value has no runtime owned bit, so this ledger is the only carrier. Retired with
+    // ownedNewTemps_.
+    std::vector<llvm::Value*> nonOwningStructJoins_;
+
     // Lambda literals with unclaimed heap envs (no named owner). Closure analog of
     // pendingOwnedStringTemps; freed at end-of-full-expression by FlushOwnedClosureTemps.
     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingOwnedClosureTemps;
@@ -2166,14 +2174,58 @@ private:
      * borrow, a suppressed join, an entry that is not a freeable owning pointer - fails here and
      * forces the join to be treated as mixed, i.e. suppressed and leaked rather than freed.
      */
-    bool TernaryArmJoinsOwning(llvm::Value* arm) const
+    bool TernaryArmJoinsOwning(llvm::Value* arm)
     {
         if (arm == nullptr) return false;
         if (auto* c = llvm::dyn_cast<llvm::Constant>(arm); c != nullptr && c->isNullValue()) return true;
         if (IsOwningPtrTempValue(arm) || IsMovedOutPtrValue(arm)) return true;
-        // An INTERFACE fat value owns through the owning-RETURN ledger, which the pointer-only
-        // IsOwningPtrTempValue cannot see; a suppressed entry already reads as absent there.
-        return IsInterfaceFatValue(arm) && FindOwnedReturnEntry(arm) != nullptr;
+        // An INTERFACE fat value and a by-value OWNING STRUCT both own through the owning-RETURN
+        // ledger, which the pointer-only IsOwningPtrTempValue cannot see; a suppressed entry
+        // already reads as absent there. A plain LOAD of a named local/parameter is never in that
+        // ledger, so a borrowed struct arm correctly scores non-owning.
+        if (IsInterfaceFatValue(arm) || IsOwningValueStructValue(arm))
+            return FindOwnedReturnEntry(arm) != nullptr;
+        return false;
+    }
+
+    /*
+     * True when `value` is a by-value struct of an OWNING-VALUE type (a `unique` field, directly or
+     * transitively, so GetOrCreateFullDestructor synthesizes a field-deleting destructor). This is
+     * the struct analog of IsInterfaceFatValue: such a join is adopted by its receiver (a fresh
+     * local of that type destructs unconditionally at scope exit), so it needs the same strict
+     * all-arms-owning join rule. `string` and the two fat-pointer shapes run their own release
+     * paths and are excluded.
+     */
+    bool IsOwningValueStructValue(llvm::Value* value)
+    {
+        if (value == nullptr) return false;
+        auto* st = llvm::dyn_cast<llvm::StructType>(value->getType());
+        if (st == nullptr) return false;
+        if (st->hasName() && (st->getName() == "string" || st->getName() == "__iface_fat_ptr"
+                              || st->getName() == "__closure_fat_ptr"))
+            return false;
+        for (const auto& [name, ds] : dataStructures)
+            if (ds.StructType == st) return IsOwningValueType(name);
+        return false;
+    }
+
+    // Ledger a '?:' join of an owning-value STRUCT whose arms did not all provably own: the joined
+    // bits may be a live borrow, so no receiver may adopt (destruct) them. See ReceiverAdoptsJoin.
+    void RegisterNonOwningStructJoin(llvm::Value* value)
+    {
+        if (value == nullptr) return;
+        for (auto* v : nonOwningStructJoins_)
+            if (v == value) return;
+        nonOwningStructJoins_.push_back(value);
+    }
+
+    // True when `value` is a suppressed owning-value struct join (see RegisterNonOwningStructJoin).
+    bool IsNonOwningStructJoin(llvm::Value* value) const
+    {
+        if (value == nullptr) return false;
+        for (auto* v : nonOwningStructJoins_)
+            if (v == value) return true;
+        return false;
     }
 
     // True when `value` is an interface fat pointer ({vtable, data}), the STRUCT-typed shape an
@@ -2231,14 +2283,19 @@ private:
      * would otherwise let the receiver adopt anyway. An INTERFACE fat-pointer join runs the same
      * strict rule: it is a struct type, so it used to take the either-arm branch and let one
      * owning arm stamp a join whose other arm was a live borrow - the receiver then destroyed a
-     * box its real owner destroyed again (use-after-free plus double free). The remaining
-     * non-pointer joins (string / owning struct / closure fat ptr) run their own release paths,
-     * so the either-arm rule still stands for them.
+     * box its real owner destroyed again (use-after-free plus double free). A by-value OWNING
+     * STRUCT join runs the same strict rule for the same reason, and additionally records the
+     * suppression by value identity (see RegisterNonOwningStructJoin) because a struct carries no
+     * runtime owned bit. `string` and the closure fat pointer keep the either-arm rule: their
+     * runtime owned bit already makes a borrowed arm's release a no-op, and every string arm is
+     * deep-copied into an independent buffer before the join (see AdoptTernaryStringArm).
      */
     bool PropagateTernaryOwnership(llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined)
     {
         if (joined == nullptr) return false;
-        bool strictJoin = joined->getType()->isPointerTy() || IsInterfaceFatValue(joined);
+        bool owningStructJoin = IsOwningValueStructValue(joined);
+        bool strictJoin = joined->getType()->isPointerTy() || IsInterfaceFatValue(joined)
+            || owningStructJoin;
         bool mixedPtrJoin = strictJoin
             && (!TernaryArmJoinsOwning(trueValue) || !TernaryArmJoinsOwning(falseValue));
         // Diagnostic lookup: a suppressed arm must still hand its FnName to the join, or a
@@ -2251,6 +2308,9 @@ private:
         if (mixedPtrJoin)
         {
             SuppressCallerRelease(joined);
+            // A struct join carries no runtime owned bit, so suppression must be recorded by VALUE
+            // identity: the receiver reads it to borrow instead of adopting.
+            if (owningStructJoin) RegisterNonOwningStructJoin(joined);
             return true;
         }
         if (IsOwnedNewTemp(trueValue))
@@ -2490,7 +2550,10 @@ private:
     // pointer is accepted too - it is a struct, but it is detached by the same move contract.
     void RegisterMovedOutPtrValue(llvm::Value* value)
     {
-        if (value == nullptr || (!value->getType()->isPointerTy() && !IsInterfaceFatValue(value)))
+        // A by-value OWNING STRUCT is the third movable shape (its source is zeroed, exactly as a
+        // pointer is nulled), so a '?:' join can score a `move` of one owning.
+        if (value == nullptr || (!value->getType()->isPointerTy() && !IsInterfaceFatValue(value)
+                                 && !IsOwningValueStructValue(value)))
             return;
         for (llvm::Value* v : movedOutPtrValues_)
             if (v == value) return;
@@ -2882,6 +2945,7 @@ private:
         valueElementTypeNames_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
+        nonOwningStructJoins_.clear();
     }
 
     // Release the resource a single named local owns, exactly as scope-exit cleanup does. Borrows,
@@ -8566,6 +8630,7 @@ public:
         std::vector<std::pair<llvm::Value*, std::string>> valueElementTypeNames;
         std::vector<llvm::Value*> movedOutPtrValues;
         std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues;
+        std::vector<llvm::Value*> nonOwningStructJoins;
     };
 
     BuilderState SaveBuilderState()
@@ -8583,6 +8648,7 @@ public:
         s.valueElementTypeNames = std::move(valueElementTypeNames_);
         s.movedOutPtrValues   = std::move(movedOutPtrValues_);
         s.movedBorrowedPtrValues = std::move(movedBorrowedPtrValues_);
+        s.nonOwningStructJoins = std::move(nonOwningStructJoins_);
         // Mark the function we are leaving mid-body INCOMPLETE for the escape analysis
         // (see FunctionBodyIsComplete); RestoreBuilderState pops it back off.
         if (currentFunction != nullptr) suspendedFunctions_.push_back(currentFunction);
@@ -8595,6 +8661,7 @@ public:
         valueElementTypeNames_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
+        nonOwningStructJoins_.clear();
         return s;
     }
 
@@ -8619,6 +8686,7 @@ public:
         valueElementTypeNames_   = state.valueElementTypeNames;
         movedOutPtrValues_       = state.movedOutPtrValues;
         movedBorrowedPtrValues_  = state.movedBorrowedPtrValues;
+        nonOwningStructJoins_    = state.nonOwningStructJoins;
     }
 
     // True if `name` is a type projected from an imported .winmd (always fully qualified) or a
@@ -16166,7 +16234,13 @@ public:
             && candidate.ReturnType.TypeName != "string"
             && IsOwningValueType(candidate.ReturnType.TypeName);
         if (lastCallReturnsOwned || ownedValueStructReturn)
+        {
             RegisterOwnedReturnTemp(result, functionName, candidate.ReturnType);
+            // An `alias` return hands back a BORROW the callee still owns. Keep the entry VISIBLE
+            // to the no-discard check, but never let it answer an ownership question - otherwise a
+            // '?:' arm scores it owning and the receiving local destroys the callee's live value.
+            if (candidate.ReturnsAlias) SuppressCallerRelease(result);
+        }
         // Return-type `alignas(_, N)`: the callee hands back an N-aligned heap block. Stamp the
         // side-channel so the receiving local frees via __delete_aligned (consumed in ParseDeclaration).
         lastCallReturnsAllocAlign = candidate.ReturnType.AllocAlignValue;

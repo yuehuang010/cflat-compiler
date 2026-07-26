@@ -2051,6 +2051,165 @@ int testUniqueInterfaceReassign()
     return passed;
 }
 
+// By-value owning-struct producer for the '?:' join legs below: the result is a fresh owner the
+// caller adopts (registered in the owning-RETURN ledger), unlike a plain load of a named local.
+UniqueBox makeUniqueBox(int id)
+{
+    UniqueBox b;
+    b.item = new Resource();
+    b.item->id = id;
+    return b;
+}
+
+// An `alias`-returning accessor hands back a BORROW of a field the wrapper still owns. Its call
+// result must NOT score as an owning '?:' arm, or the join adopts and destroys the wrapper's value.
+struct BoxWrap
+{
+    UniqueBox b;
+    alias UniqueBox borrow() { return this.b; }
+};
+
+// `alias` is the sanctioned pass-through for a mixed join in a RETURN slot: the borrow travels to
+// the caller instead of transferring, so the reject that fires for a plain return must not fire.
+alias UniqueBox pickBorrowedBox(UniqueBox borrowed, bool c)
+{
+    return c ? makeUniqueBox(7) : borrowed;
+}
+
+/*
+ * A '?:' joining an OWNING-VALUE STRUCT (a `unique` field, so a full field-deleting destructor is
+ * synthesized) runs the same strict all-arms-owning rule the interface fat pointer does. A MIXED
+ * join - one arm a move-returning call, the other a live borrowed parameter - used to be adopted
+ * by the receiving local, whose scope-exit destructor deleted the BORROW arm's pointee while its
+ * real owner deleted it again (abort). The join now owns nothing: the local borrows it (the
+ * untaken owning arm leaks, the accepted trade), and every destination that cannot carry the
+ * suppression - an existing owning local, a struct field, a return slot - rejects it outright
+ * (Test/errors/err_move.cb). An ALL-OWNING join still adopts and frees exactly once.
+ */
+int testOwningStructTernaryJoin()
+{
+    int passed = 0;
+
+    // MIXED join, BORROW arm taken: nothing is freed early and the owner survives intact.
+    dtorCount = 0;
+    {
+        UniqueBox owner = makeUniqueBox(42);
+        {
+            UniqueBox k = identityBool(false) ? makeUniqueBox(7) : owner;
+            passed += Test("struct_ternary_mixed_false_value", k.item->id, 42);
+            passed += Test("struct_ternary_mixed_false_no_free", dtorCount, 0);
+        }
+        passed += Test("struct_ternary_mixed_false_no_adoption", dtorCount, 0);
+        passed += Test("struct_ternary_mixed_false_owner_alive", owner.item->id, 42);
+    }
+    passed += Test("struct_ternary_mixed_false_owner_freed_once", dtorCount, 1);
+
+    // MIXED join, OWNING arm taken: the receiver still only borrows, so the owner is untouched
+    // and the selected arm leaks. The point is that nothing is freed TWICE.
+    dtorCount = 0;
+    {
+        UniqueBox owner = makeUniqueBox(42);
+        {
+            UniqueBox k = identityBool(true) ? makeUniqueBox(7) : owner;
+            passed += Test("struct_ternary_mixed_true_value", k.item->id, 7);
+            passed += Test("struct_ternary_mixed_true_no_free", dtorCount, 0);
+        }
+        passed += Test("struct_ternary_mixed_true_no_adoption", dtorCount, 0);
+        passed += Test("struct_ternary_mixed_true_owner_alive", owner.item->id, 42);
+    }
+    passed += Test("struct_ternary_mixed_true_owner_freed_once", dtorCount, 1);
+
+    // ALL-BORROW join: neither arm owns, so the receiver borrows and the owner frees exactly once.
+    dtorCount = 0;
+    {
+        UniqueBox owner = makeUniqueBox(9);
+        {
+            UniqueBox k = identityBool(false) ? owner : owner;
+            passed += Test("struct_ternary_all_borrow_value", k.item->id, 9);
+        }
+        passed += Test("struct_ternary_all_borrow_no_adoption", dtorCount, 0);
+        passed += Test("struct_ternary_all_borrow_owner_alive", owner.item->id, 9);
+    }
+    passed += Test("struct_ternary_all_borrow_owner_freed_once", dtorCount, 1);
+
+    // ALL-OWNING join, false arm: adopted, and freed exactly once at scope exit.
+    dtorCount = 0;
+    {
+        UniqueBox k = identityBool(false) ? makeUniqueBox(1) : makeUniqueBox(2);
+        passed += Test("struct_ternary_all_owning_false_value", k.item->id, 2);
+        passed += Test("struct_ternary_all_owning_false_alive", dtorCount, 0);
+    }
+    passed += Test("struct_ternary_all_owning_false_freed_once", dtorCount, 1);
+
+    // ALL-OWNING join, true arm: only the taken arm is constructed, and it is freed once.
+    dtorCount = 0;
+    {
+        UniqueBox k = identityBool(true) ? makeUniqueBox(1) : makeUniqueBox(2);
+        passed += Test("struct_ternary_all_owning_true_value", k.item->id, 1);
+        passed += Test("struct_ternary_all_owning_true_alive", dtorCount, 0);
+    }
+    passed += Test("struct_ternary_all_owning_true_freed_once", dtorCount, 1);
+
+    // ALL-OWNING join into an EXISTING owning local: the old value is released, the join adopted,
+    // and the whole sequence accounts for exactly two frees.
+    dtorCount = 0;
+    {
+        UniqueBox k = makeUniqueBox(5);
+        k = identityBool(true) ? makeUniqueBox(6) : makeUniqueBox(7);
+        passed += Test("struct_ternary_all_owning_assign_value", k.item->id, 6);
+        passed += Test("struct_ternary_all_owning_assign_old_freed", dtorCount, 1);
+    }
+    passed += Test("struct_ternary_all_owning_assign_total", dtorCount, 2);
+
+    // ALL-MOVE join: an explicit `move` of an owning struct local detaches it (the source is
+    // zeroed), so BOTH arms provably own and the join is adopted, not suppressed. The receiver
+    // frees the taken arm at its scope exit; the untaken arm's own local still frees its value.
+    dtorCount = 0;
+    {
+        UniqueBox p = makeUniqueBox(1);
+        UniqueBox q = makeUniqueBox(2);
+        {
+            UniqueBox k = identityBool(true) ? move p : move q;
+            passed += Test("struct_ternary_move_join_value", k.item->id, 1);
+            passed += Test("struct_ternary_move_join_alive", dtorCount, 0);
+        }
+        passed += Test("struct_ternary_move_join_adopted_freed_once", dtorCount, 1);
+    }
+    passed += Test("struct_ternary_move_join_total", dtorCount, 2);
+
+    // An `alias`-returning call is a BORROW, so pairing it with a genuinely owning arm is a MIXED
+    // join. It used to score owning (every by-value owning-struct return entered the owning-return
+    // ledger regardless of `alias`) and the receiver destroyed the wrapper's live value.
+    dtorCount = 0;
+    {
+        BoxWrap w;
+        w.b = makeUniqueBox(5);
+        {
+            UniqueBox k = identityBool(true) ? w.borrow() : makeUniqueBox(2);
+            passed += Test("struct_ternary_alias_arm_value", k.item->id, 5);
+            passed += Test("struct_ternary_alias_arm_no_free", dtorCount, 0);
+        }
+        passed += Test("struct_ternary_alias_arm_no_adoption", dtorCount, 0);
+        passed += Test("struct_ternary_alias_arm_owner_alive", w.b.item->id, 5);
+    }
+    passed += Test("struct_ternary_alias_arm_owner_freed_once", dtorCount, 1);
+
+    // The `alias` RETURN slot accepts the mixed join (the reject is gated on a non-alias return),
+    // and its result borrows in the caller too - the owner is still freed exactly once.
+    dtorCount = 0;
+    {
+        UniqueBox owner = makeUniqueBox(4);
+        {
+            UniqueBox k = pickBorrowedBox(owner, false);
+            passed += Test("struct_ternary_alias_return_value", k.item->id, 4);
+        }
+        passed += Test("struct_ternary_alias_return_no_adoption", dtorCount, 0);
+    }
+    passed += Test("struct_ternary_alias_return_owner_freed_once", dtorCount, 1);
+
+    return passed;
+}
+
 /*
  * `unique <interface>` move as a plain-readable null (bf26a15, design record
  * internal/plan/unique-interface-move-readable-null.md): explicit `move` of an interface local
@@ -2842,6 +3001,9 @@ extern int main()
 
     passed += testUniqueInterfaceMoveExtra();
     total += 22;
+
+    passed += testOwningStructTernaryJoin();
+    total += 35;
 
     passed += testDiscardMoveReturningCall();
     total += 6;

@@ -5349,6 +5349,13 @@ public:
                                 returnNV.CallerName.empty() ? returnNV.TypeAndValue.TypeName : returnNV.CallerName));
                         }
 
+                        // Same hazard through a suppressed (mixed) '?:' join of an owning-value
+                        // struct: the caller adopts and destroys bits a live borrow still owns.
+                        // An `alias` function passes the borrow through, exactly as above.
+                        if (!compiler->currentFunctionReturnTV.IsAlias)
+                            RejectNonOwningStructJoinStore(right, compiler->currentFunctionReturnTypeName,
+                                                           "a return slot", jump);
+
                         // The allocation alignment of an over-aligned `new T[n]` is not in the element
                         // type, so the caller recovers it only when the RETURN TYPE declares the same
                         // `alignas(_, N)` clause (threaded to the caller via lastCallReturnsAllocAlign).
@@ -8561,6 +8568,26 @@ public:
                             nv.IsOwning = false;
                         }
 
+                        /*
+                         * MIXED '?:' join of an owning-value STRUCT (`Box k = c ? makeBox() : borrowed;`).
+                         * The phi is a pure SSA value - no Storage, no CallerName - so the move-vs-copy
+                         * decision above never sees it and the shallow CreateAssignment just ran. `k` is a
+                         * fresh local of an owning-value type, so its scope-exit full destructor would
+                         * DELETE whatever the phi selected, including a borrow arm's live pointee its real
+                         * owner deletes again. Which arm ran is not knowable, so borrow (suppress the
+                         * destructor) exactly as the `alias` case above does - the untaken owning arm
+                         * leaks, which is the trade already shipped for mixed pointer/interface joins.
+                         */
+                        if (!typeAndValue.Pointer && right->getType()->isStructTy()
+                            && compiler->IsNonOwningStructJoin(right)
+                            && compiler->IsOwningValueType(typeAndValue.TypeName))
+                        {
+                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            nv.IsAliasBorrow = true;
+                            nv.IsOwningString = false;
+                            nv.IsOwning = false;
+                        }
+
                         // Apply field initializer overrides after the default value is stored.
                         // A brace list targeting a generic container (list/array/dictionary) is
                         // desugared into add/init+set/set calls; otherwise it is a struct field-init.
@@ -9254,6 +9281,33 @@ public:
             "cannot store an 'alias' value '{}' into a field; it borrows storage it does not own "
             "and would dangle. Use '.copy()' for an independent owned copy.",
             rightNV.CallerName.empty() ? rightNV.TypeAndValue.TypeName : rightNV.CallerName));
+        return true;
+    }
+
+    /*
+     * A MIXED '?:' join of an owning-value STRUCT (`c ? makeBox() : borrowed`) may carry a live
+     * borrow's bits on the path actually taken, so PropagateTernaryOwnership suppressed the join
+     * and ledgered it non-owning. A DECLARATION can receive it (the new local is marked a borrow
+     * and its destructor suppressed), but an existing owning local, a struct field, and a return
+     * slot all destruct UNCONDITIONALLY with no per-value flag to carry the suppression - the
+     * store would hand a second destroyer to storage its real owner still frees. Reject instead.
+     * A function declared `alias` is the sanctioned escape hatch for the RETURN slot (it hands the
+     * borrow through instead of transferring), so its caller gates on currentFunctionReturnTV.
+     * Returns true when an error was logged.
+     */
+    bool RejectNonOwningStructJoinStore(llvm::Value* right, const std::string& destTypeName,
+                                        const char* destKind, antlr4::ParserRuleContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        if (right == nullptr || !right->getType()->isStructTy()) return false;
+        if (!compiler->IsNonOwningStructJoin(right)) return false;
+        if (destTypeName.empty() || !compiler->IsOwningValueType(destTypeName)) return false;
+        LogErrorContext(ctx, std::format(
+            "cannot store a '?:' result that mixes an owning and a borrowed '{}' arm into {}; its "
+            "destructor would free a value another owner still frees. Assign each arm in its own "
+            "branch, declare the function 'alias' to hand the borrow through, or write a 'copy()' "
+            "method for '{}' and copy the arm into an independent owned value.",
+            destTypeName, destKind, destTypeName));
         return true;
     }
 
@@ -10306,6 +10360,14 @@ public:
                 || (namedVar.FieldName.empty() && rightNV.FieldName.empty()
                     && !namedVar.TypeAndValue.VariableName.empty()
                     && namedVar.TypeAndValue.VariableName == rightNV.TypeAndValue.VariableName);
+
+            // A suppressed (mixed) '?:' join of an owning-value struct: neither an existing owning
+            // local nor a field can carry the suppression, so reject before any store path runs.
+            if (operatorText == "="
+                && RejectNonOwningStructJoinStore(right, namedVar.TypeAndValue.TypeName,
+                                                  destIsStructField ? "a struct field"
+                                                                    : "an owning variable", ctx))
+                return right;
 
             // Storing a whole `alias` (borrow) value into a struct field - rejected ahead of the
             // generic owning-value reject below so the borrow keeps its precise message.
@@ -13714,6 +13776,8 @@ public:
             val = CloneClosureFromNamedSource(rightNV, val, errCtx);
         else
         {
+            if (RejectNonOwningStructJoinStore(val, fieldType.TypeName, "a struct field", errCtx))
+                return false;
             if (RejectAliasStoreIntoField(rightNV, val, errCtx)) return false;
             // Brace-init always targets a FRESH slot, so a self-assign is impossible here. There is no
             // second copy path in brace-init, so the copied flag is unused.
@@ -15479,6 +15543,12 @@ public:
                 // Signal ownership transfer exactly as the POINTER branch below does. Without it
                 // `return move r` is classified as a BORROW and its owned bits are stripped (leak).
                 compiler->lastOwningResult = true;
+                // Same fact by VALUE IDENTITY, as the pointer/interface branches do: the source is
+                // zeroed, so a '?:' join must be able to score this arm owning without the sticky
+                // flag. A move of a BORROWED source transfers nothing (the real owner still frees
+                // it), so it stays OUT - the join then scores it non-owning and suppresses.
+                if (!argNV.IsBorrowed)
+                    compiler->RegisterMovedOutPtrValue(ptrVal);
                 // A value/string ELEMENT (`_ = move _data[i]`) is detached here with Storage null,
                 // so the discard path cannot free it via a Storage-backed temp helper. Flag the
                 // slot move so the discard site materializes the value and runs its full teardown.

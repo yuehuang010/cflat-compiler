@@ -2484,6 +2484,7 @@ void LLVMBackend::ResetForReanalysis()
     valueElementTypeNames_.clear();
     movedOutPtrValues_.clear();
     movedBorrowedPtrValues_.clear();
+    nonOwningStructJoins_.clear();
     // Keyed by llvm::Function*, which a rebuilt module invalidates.
     DropModuleEscapeMemo();
     poisonedFunctions.clear();

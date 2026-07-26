@@ -211,6 +211,53 @@ expect_error("cannot convert '?:' arm to interface 'IUniqueThing': the arm's con
     }
 }
 
+/*
+ * MIXED '?:' join of an OWNING-VALUE STRUCT (a `unique` field, so its destructor deletes the
+ * field). The join may carry the borrow arm's live bits, so no destination whose destructor runs
+ * UNCONDITIONALLY may take it. A DECLARATION can (the new local is marked a borrow), so that
+ * spelling stays legal and is exercised in Test/test_move.cb; these three are the destinations
+ * with no per-value flag to carry the suppression, and each used to double-free.
+ */
+struct JoinBox { unique UniqueThing* item = nullptr; };
+struct JoinHolder { JoinBox box; };
+
+JoinBox makeJoinBox()
+{
+    JoinBox b;
+    b.item = new UniqueThing();
+    return b;
+}
+
+expect_error("mixes an owning and a borrowed 'JoinBox' arm into an owning variable") {
+    void joinIntoOwningLocal(JoinBox borrowed, bool c)
+    {
+        JoinBox k;
+        k = c ? makeJoinBox() : borrowed;
+    }
+}
+
+expect_error("mixes an owning and a borrowed 'JoinBox' arm into a struct field") {
+    void joinIntoStructField(JoinBox borrowed, bool c)
+    {
+        JoinHolder h;
+        h.box = c ? makeJoinBox() : borrowed;
+    }
+}
+
+expect_error("mixes an owning and a borrowed 'JoinBox' arm into a struct field") {
+    void joinIntoBraceInitField(JoinBox borrowed, bool c)
+    {
+        JoinHolder h = { box = c ? makeJoinBox() : borrowed };
+    }
+}
+
+expect_error("mixes an owning and a borrowed 'JoinBox' arm into a return slot") {
+    JoinBox joinIntoReturnSlot(JoinBox borrowed, bool c)
+    {
+        return c ? makeJoinBox() : borrowed;
+    }
+}
+
 extern int main()
 {
     // use after move - pass to another call
