@@ -9847,9 +9847,12 @@ public:
             // The IsOwnedNewTemp leg asks the same question BY VALUE IDENTITY instead of by shape,
             // so a `new` that reached the RESULT through a '?:' arm adopts; one in ARGUMENT
             // position produces a different value (the borrow-returning call's result) and does not.
+            // The owning-RETURN leg is asked BY VALUE IDENTITY too (IsOwningPtrTempValue), not from
+            // the bare lastCallReturnsOwned side-channel: that flag fires for any owning call in the
+            // RHS, including an unselected '?:' arm, so a suppressed mixed join adopted a borrow.
             bool srcIsOwnedPtrRhs = AsDirectNew(assignCtx) != nullptr
                 || TopLevelMoveExpression(assignCtx) != nullptr
-                || compiler->lastCallReturnsOwned
+                || compiler->IsOwningPtrTempValue(rightNV.Primary)
                 || compiler->IsOwnedNewTemp(rightNV.Primary);
             compiler->lastOwningResult = false;
             compiler->lastAllocAlignment = 0;
@@ -11031,7 +11034,11 @@ public:
 
         // A ternary is a transparent wrapper: ownership rides out on the joined value.
         // Mixed owning/borrow POINTER joins are handled in PropagateTernaryOwnership.
-        compiler->PropagateTernaryOwnership(trueValue, falseValue, phi);
+        // A mixed join owns NOTHING the receiver may free, so the sticky per-expression ownership
+        // side-channels must be cleared too: they carry no value identity, so a declaration would
+        // otherwise adopt the phi whichever arm ran and double-free the borrow arm's live pointee.
+        if (compiler->PropagateTernaryOwnership(trueValue, falseValue, phi))
+            compiler->ClearOwnedResultChannels();
         return { phi, false };
     }
 
@@ -11146,7 +11153,8 @@ public:
                 }
                 // Eager form: both arms already ran, so only the selected one can be adopted
                 // and the other leaks regardless. See PropagateTernaryOwnership.
-                compiler->PropagateTernaryOwnership(trueValue, falseValue, selectValue);
+                if (compiler->PropagateTernaryOwnership(trueValue, falseValue, selectValue))
+                    compiler->ClearOwnedResultChannels();
                 return { selectValue, false };
             }
 
@@ -15396,6 +15404,9 @@ public:
         // Signal ParseDeclaration to mark the target local as IsOwning. The over-alignment of the
         // moved-from source travels with the value, so the new owner frees it the same way.
         compiler->lastOwningResult = true;
+        // Same fact, by VALUE IDENTITY, for consumers that must not trust the sticky flag: the
+        // source is nulled, so nothing owns this value until a receiver adopts it (see a '?:' join).
+        compiler->RegisterMovedOutPtrValue(ptrVal);
         compiler->lastAllocAlignment = argNV.AllocAlignment;
         // Element-slot source (`move _data[i]`): the pointer read demoted `unique` to a bare borrow,
         // so let the decl site re-key ownership off the DEST type - a bare `T*` element must NOT own

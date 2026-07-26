@@ -1985,6 +1985,76 @@ int testTernaryArmsShortCircuit()
     }
     passed += Test("ternary_new_arm_freed_once", dtorCount, 1);
 
+    // MIXED pointer join: one arm allocates, the other yields a LIVE borrow. The join owns
+    // nothing the receiver may free (which arm ran is not knowable at the declaration), so the
+    // local borrows - it used to adopt whichever arm the phi picked and double-free the owner's
+    // pointee. The allocating arm leaks when selected; that is the accepted trade.
+    dtorCount = 0;
+    {
+        unique Resource* owner = new Resource();
+        owner->id = 31;
+        bool takeOwning = false;
+        Resource* mixed = takeOwning ? makeOwnedResource() : owner;
+        passed += Test("ternary_mixed_join_borrow_value", mixed->id, 31);
+        passed += Test("ternary_mixed_join_no_early_free", dtorCount, 0);
+    }
+    passed += Test("ternary_mixed_join_owner_freed_once", dtorCount, 1);
+
+    // Same through a NESTED '?:' - the inner mixed join is suppressed, and the suppression must
+    // survive the outer join instead of being overruled by the outer arm's `new`.
+    dtorCount = 0;
+    {
+        unique Resource* owner = new Resource();
+        owner->id = 32;
+        bool outer = true;
+        bool inner = false;
+        Resource* mixed = outer ? (inner ? makeOwnedResource() : owner) : new Resource();
+        passed += Test("ternary_nested_mixed_join_borrow_value", mixed->id, 32);
+        passed += Test("ternary_nested_mixed_join_no_early_free", dtorCount, 0);
+    }
+    passed += Test("ternary_nested_mixed_join_owner_freed_once", dtorCount, 1);
+
+    // A mixed join whose BORROW arm merely CONTAINS a `new` in ARGUMENT position. That `new` does
+    // not make the arm own its result, so the join stays mixed; scoring the arm owning turned the
+    // borrow into a freeable temp and double-freed the real owner. The argument temp itself is a
+    // non-retained allocation, freed at end-of-full-expression.
+    dtorCount = 0;
+    {
+        unique Resource* owner = new Resource();
+        owner->id = 33;
+        bool c = true;
+        Resource* joined = c ? borrowFirstResource(owner, new Resource()) : makeOwnedResource();
+        passed += Test("ternary_mixed_join_arg_new_borrow_value", joined->id, 33);
+        passed += Test("ternary_mixed_join_arg_new_temp_freed", dtorCount, 1);
+    }
+    passed += Test("ternary_mixed_join_arg_new_owner_freed_once", dtorCount, 2);
+
+    // A PARENTHESIZED `move` arm. Arm ownership is answered by value identity, so a wrapper around
+    // the move cannot turn it into a borrow - scoring it one left the moved-out object owned by
+    // nobody (leak) and made a `unique` receiver a spurious borrow-init error.
+    dtorCount = 0;
+    {
+        unique Resource* a = new Resource();
+        a->id = 41;
+        bool c = true;
+        Resource* b = c ? (move a) : nullptr;
+        passed += Test("ternary_paren_move_arm_value", b->id, 41);
+        passed += Test("ternary_paren_move_arm_no_early_free", dtorCount, 0);
+    }
+    passed += Test("ternary_paren_move_arm_freed_once", dtorCount, 1);
+
+    // Same wrapper in the FALSE arm, adopted by a `unique` receiver.
+    dtorCount = 0;
+    {
+        unique Resource* a = new Resource();
+        a->id = 42;
+        bool c = false;
+        unique Resource* b = c ? nullptr : (move a);
+        passed += Test("ternary_paren_move_false_arm_value", b->id, 42);
+        passed += Test("ternary_paren_move_false_arm_source_nulled", a == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("ternary_paren_move_false_arm_freed_once", dtorCount, 1);
+
     // String arms: an owning FIELD read in an arm is deep-copied, never aliased, so the
     // field still owns its own buffer after the ternary result goes out of scope.
     {
@@ -2254,7 +2324,7 @@ extern int main()
     total += 6;
 
     passed += testTernaryArmsShortCircuit();
-    total += 18;
+    total += 33;
 
     passed += testUniqueInterfaceReassign();
     total += 8;

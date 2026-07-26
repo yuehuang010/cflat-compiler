@@ -7,6 +7,19 @@ expect_error("cannot initialize unique 'u' from a borrowed value") {
     void takes(N* borrowed) { unique N* u = borrowed; }
 }
 
+// Same rule through a MIXED '?:' join, where the borrow arm reads a live `unique` LOCAL. Which
+// arm runs is not knowable here, and adopting the join freed the local's pointee a second time
+// (abort at scope exit). The join owns nothing, so the `unique` initialization is rejected.
+move N* makeN() { return new N; }
+
+expect_error("cannot initialize unique 'u2' from a borrowed value") {
+    void mixedJoin(bool a, bool b)
+    {
+        unique N* owned = new N;
+        unique N* u2 = a ? (b ? makeN() : owned) : new N;
+    }
+}
+
 extern int main()
 {
     return 0;

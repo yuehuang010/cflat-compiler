@@ -2482,6 +2482,7 @@ void LLVMBackend::ResetForReanalysis()
     ownedReturnTemps_.clear();
     ownedNewTemps_.clear();
     valueElementTypeNames_.clear();
+    movedOutPtrValues_.clear();
     // Keyed by llvm::Function*, which a rebuilt module invalidates.
     DropModuleEscapeMemo();
     poisonedFunctions.clear();

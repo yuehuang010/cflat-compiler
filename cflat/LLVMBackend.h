@@ -1085,6 +1085,13 @@ public:
     // recovers each arm's class from here. Retired with ownedNewTemps_.
     std::vector<std::pair<llvm::Value*, std::string>> valueElementTypeNames_;
 
+    // Pointer SSA values detached by a `move` expression, keyed by value identity. A move nulls its
+    // source, so nobody owns the value until a receiver adopts it - but it is not a `new` result and
+    // carries no free-site type, so it belongs in neither ledger above. Lets a '?:' join ask "is
+    // this arm owning" of the VALUE, so parens/casts around the move cannot change the answer.
+    // Retired with ownedNewTemps_.
+    std::vector<llvm::Value*> movedOutPtrValues_;
+
     // Lambda literals with unclaimed heap envs (no named owner). Closure analog of
     // pendingOwnedStringTemps; freed at end-of-full-expression by FlushOwnedClosureTemps.
     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingOwnedClosureTemps;
@@ -2137,33 +2144,50 @@ private:
     }
 
     /*
-     * True when a '?:' arm may join an OWNING result: a null constant (whose free is a no-op) or a
-     * value the caller could legally free. Join-eligibility is deliberately THE SAME PREDICATE as
-     * free-eligibility (IsOwningPtrTempValue is "exactly the set RegisterOwnedPtrTemp accepts"),
-     * so any condition added to one is automatically honoured by the other. Everything else - a
-     * live borrow, a suppressed join, an entry that is not a freeable owning pointer - fails here
-     * and forces the join to be treated as mixed, i.e. suppressed and leaked rather than freed.
+     * True when a '?:' arm may join an OWNING result: a null constant (whose free is a no-op), a
+     * value the caller could legally free, or a pointer a `move` detached from its source. The
+     * free-eligibility core is deliberately THE SAME PREDICATE the release path uses
+     * (IsOwningPtrTempValue is "exactly the set RegisterOwnedPtrTemp accepts"), so any condition
+     * added to one is automatically honoured by the other; the other two legs own without being
+     * freeable HERE (a null frees nothing, a moved-out value has no free-site type yet).
+     * Every leg is answered by VALUE IDENTITY, never by the arm's syntax: parentheses or a cast
+     * around a `move` must not change the answer, and a `new` sitting in ARGUMENT position inside
+     * a borrow arm must not be mistaken for the arm owning its result. Everything else - a live
+     * borrow, a suppressed join, an entry that is not a freeable owning pointer - fails here and
+     * forces the join to be treated as mixed, i.e. suppressed and leaked rather than freed.
      */
     bool TernaryArmJoinsOwning(llvm::Value* arm) const
     {
         if (arm == nullptr) return false;
         if (auto* c = llvm::dyn_cast<llvm::Constant>(arm); c != nullptr && c->isNullValue()) return true;
-        return IsOwningPtrTempValue(arm);
+        return IsOwningPtrTempValue(arm) || IsMovedOutPtrValue(arm);
+    }
+
+    // Drop every sticky per-expression "the result is owned" side-channel. These carry no value
+    // identity, so a join that owns nothing must clear them or the receiver adopts anyway.
+    void ClearOwnedResultChannels()
+    {
+        lastOwningResult = false;
+        lastCallReturnsOwned = false;
+        lastAllocAlignment = 0;
+        lastCallReturnsAllocAlign = 0;
     }
 
     /*
-     * Ledger a '?:' phi/select result as owning. A ternary is a transparent wrapper, so ownership
-     * rides out on the joined value. The two ledgers serve different purposes and a MIXED pointer
-     * join (`cond ? makePtr() : borrowedPtr`) must split them: DETECTION still applies, so a
-     * discarded mixed ternary is caught by the no-discard check exactly as on master, while
-     * RELEASE is suppressed - a caller-side free would fire on whatever the phi selected and
-     * destroy a pointee someone else still owns. The owning-`new` ledger drives adoption and
-     * release only, so a mixed join does not enter it at all. Non-pointer joins (string / owning
-     * struct / interface fat ptr) run their own release paths, so the either-arm rule stands.
+     * Ledger a '?:' phi/select result as owning, and report whether the join was MIXED. A ternary
+     * is a transparent wrapper, so ownership rides out on the joined value. The two ledgers serve
+     * different purposes and a MIXED pointer join (`cond ? makePtr() : borrowedPtr`) must split
+     * them: DETECTION still applies, so a discarded mixed ternary is caught by the no-discard check
+     * exactly as on master, while RELEASE is suppressed - a caller-side free would fire on whatever
+     * the phi selected and destroy a pointee someone else still owns. The owning-`new` ledger drives
+     * adoption and release only, so a mixed join does not enter it at all. The caller must also
+     * ClearOwnedResultChannels on a mixed join: those side-channels have no value identity and
+     * would otherwise let the receiver adopt anyway. Non-pointer joins (string / owning struct /
+     * interface fat ptr) run their own release paths, so the either-arm rule stands.
      */
-    void PropagateTernaryOwnership(llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined)
+    bool PropagateTernaryOwnership(llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined)
     {
-        if (joined == nullptr) return;
+        if (joined == nullptr) return false;
         bool mixedPtrJoin = joined->getType()->isPointerTy()
             && (!TernaryArmJoinsOwning(trueValue) || !TernaryArmJoinsOwning(falseValue));
         // Diagnostic lookup: a suppressed arm must still hand its FnName to the join, or a
@@ -2175,12 +2199,13 @@ private:
         if (mixedPtrJoin)
         {
             SuppressCallerRelease(joined);
-            return;
+            return true;
         }
         if (IsOwnedNewTemp(trueValue))
             PropagateOwnedNewTemp(trueValue, joined);
         else
             PropagateOwnedNewTemp(falseValue, joined);
+        return false;
     }
 
     /*
@@ -2363,6 +2388,23 @@ private:
         for (const auto& entry : valueElementTypeNames_)
             if (entry.first == value) return entry.second;
         return {};
+    }
+
+    // Ledger a pointer value a `move` expression detached (see movedOutPtrValues_).
+    void RegisterMovedOutPtrValue(llvm::Value* value)
+    {
+        if (value == nullptr || !value->getType()->isPointerTy()) return;
+        for (llvm::Value* v : movedOutPtrValues_)
+            if (v == value) return;
+        movedOutPtrValues_.push_back(value);
+    }
+
+    bool IsMovedOutPtrValue(llvm::Value* value) const
+    {
+        if (value == nullptr) return false;
+        for (llvm::Value* v : movedOutPtrValues_)
+            if (v == value) return true;
+        return false;
     }
 
     // A named owner adopted the value; retire the entry so nothing else claims it.
@@ -2717,6 +2759,7 @@ private:
         ownedReturnTemps_.clear();
         ownedNewTemps_.clear();
         valueElementTypeNames_.clear();
+        movedOutPtrValues_.clear();
     }
 
     // Release the resource a single named local owns, exactly as scope-exit cleanup does. Borrows,
@@ -8399,6 +8442,7 @@ public:
         std::vector<OwnedReturnTemp> ownedReturnTemps;
         std::vector<OwnedNewTemp> ownedNewTemps;
         std::vector<std::pair<llvm::Value*, std::string>> valueElementTypeNames;
+        std::vector<llvm::Value*> movedOutPtrValues;
     };
 
     BuilderState SaveBuilderState()
@@ -8414,6 +8458,7 @@ public:
         s.ownedReturnTemps    = std::move(ownedReturnTemps_);
         s.ownedNewTemps       = std::move(ownedNewTemps_);
         s.valueElementTypeNames = std::move(valueElementTypeNames_);
+        s.movedOutPtrValues   = std::move(movedOutPtrValues_);
         // Mark the function we are leaving mid-body INCOMPLETE for the escape analysis
         // (see FunctionBodyIsComplete); RestoreBuilderState pops it back off.
         if (currentFunction != nullptr) suspendedFunctions_.push_back(currentFunction);
@@ -8424,6 +8469,7 @@ public:
         ownedReturnTemps_.clear();
         ownedNewTemps_.clear();
         valueElementTypeNames_.clear();
+        movedOutPtrValues_.clear();
         return s;
     }
 
@@ -8446,6 +8492,7 @@ public:
         ownedReturnTemps_        = state.ownedReturnTemps;
         ownedNewTemps_           = state.ownedNewTemps;
         valueElementTypeNames_   = state.valueElementTypeNames;
+        movedOutPtrValues_       = state.movedOutPtrValues;
     }
 
     // True if `name` is a type projected from an imported .winmd (always fully qualified) or a
