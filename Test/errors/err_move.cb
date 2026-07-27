@@ -209,6 +209,14 @@ expect_error("cannot initialize unique 'thinBorrowIntoUnique' from a borrowed va
     }
 }
 
+// Borrows an interface value; the call-argument spelling of the class -> interface upcast.
+int takesIface(IUniqueThing s) { return s.get(); }
+
+// Same upcast reached through VIRTUAL dispatch: an interface method whose parameter is itself
+// an interface, so the argument is boxed by CallInterfaceMethod rather than the direct-call path.
+interface ISink { int take(IUniqueThing s); };
+class SinkImpl : ISink { int n = 0; int take(IUniqueThing s) { return s.get() + n; } };
+
 struct IfaceArmHolder { UniqueIfaceThing* p = default; };
 void IfaceArmHolder(IfaceArmHolder* self) {}
 UniqueIfaceThing* gIfaceArmPtr = default;
@@ -418,6 +426,68 @@ extern int main()
     expect_error("no class implementing 'IUniqueThing' implements 'IUnrelatedThing'") {
         IUniqueThing ub2 = new UniqueIfaceThing();
         IUnrelatedThing[2] uarr = { ub2, ub2 };
+    }
+
+    // Direct decl-init from a 'T**' binding. The declared TypeName implements the interface, but
+    // the slot holds a POINTER to the instance pointer - boxing it type-confuses the vtable.
+    expect_error("cannot convert 'UniqueIfaceThing**' to interface 'IUniqueThing'") {
+        unique UniqueIfaceThing* pOwner = new UniqueIfaceThing();
+        UniqueIfaceThing** ppOwner = &pOwner;
+        IUniqueThing kpp = ppOwner;
+    }
+
+    // Same hole through a 'T[]' array view: the view's storage is the element buffer, not one
+    // instance, so the class vtable must not be attached to it.
+    expect_error("cannot convert 'UniqueIfaceThing[]' to interface 'IUniqueThing'") {
+        UniqueIfaceThing[] vview = new UniqueIfaceThing[4];
+        IUniqueThing kview = vview;
+    }
+
+    // Fixed 'T[N]' slot: the storage is N inlined elements, so attaching the class vtable to the
+    // whole slot is the same confusion - the shape guard's ConstArraySize arm rejects it.
+    expect_error("cannot convert 'UniqueIfaceThing[3]' to interface 'IUniqueThing'") {
+        UniqueIfaceThing[3] ffix;
+        IUniqueThing kfix = ffix;
+    }
+
+    // Plain '=' assignment spelling of the 'T**' case (a separate upcast site from decl-init).
+    expect_error("cannot convert 'UniqueIfaceThing**' to interface 'IUniqueThing'") {
+        unique UniqueIfaceThing* pOwner2 = new UniqueIfaceThing();
+        UniqueIfaceThing** ppOwner2 = &pOwner2;
+        IUniqueThing kasg = nullptr;
+        kasg = ppOwner2;
+    }
+
+    // Call-ARGUMENT spelling: boxing into an interface PARAMETER is a separate site from the
+    // direct upcasts above, and it read garbage through the wrongly attached vtable.
+    expect_error("cannot convert 'UniqueIfaceThing**' to interface 'IUniqueThing'") {
+        unique UniqueIfaceThing* pOwner3 = new UniqueIfaceThing();
+        UniqueIfaceThing** ppOwner3 = &pOwner3;
+        int kcall = takesIface(ppOwner3);
+    }
+
+    // Array-view argument to the same interface parameter.
+    expect_error("cannot convert 'UniqueIfaceThing[]' to interface 'IUniqueThing'") {
+        UniqueIfaceThing[] vview2 = new UniqueIfaceThing[4];
+        int kcallv = takesIface(vview2);
+    }
+
+    // Interface-METHOD argument spelling: the vtable-dispatch path boxes its arguments in its own
+    // builder, so a 'T**' reaching an interface parameter there is a distinct hole from the above.
+    expect_error("cannot convert 'UniqueIfaceThing**' to interface 'IUniqueThing'") {
+        unique UniqueIfaceThing* pOwner4 = new UniqueIfaceThing();
+        UniqueIfaceThing** ppOwner4 = &pOwner4;
+        unique SinkImpl* sinkOwner = new SinkImpl();
+        ISink vsink = sinkOwner;
+        int kvcall = vsink.take(ppOwner4);
+    }
+
+    // Array-view argument through the same virtual-dispatch parameter.
+    expect_error("cannot convert 'UniqueIfaceThing[]' to interface 'IUniqueThing'") {
+        UniqueIfaceThing[] vview3 = new UniqueIfaceThing[4];
+        unique SinkImpl* sinkOwner2 = new SinkImpl();
+        ISink vsink2 = sinkOwner2;
+        int kvcallv = vsink2.take(vview3);
     }
 
     return 0;

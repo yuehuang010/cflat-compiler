@@ -5518,6 +5518,14 @@ public:
                             {
                                 LogErrorContext(jump, std::format("'{}' does not implement interface '{}'", structName, ifaceName));
                             }
+                            else if (!structName.empty()
+                                     && RejectPointerShapedInterfaceUpcast(
+                                            jump, returnNV.TypeAndValue, ifaceName))
+                            {
+                                // Diagnosed: a pointer/view-shaped binding cannot carry the vtable.
+                                // Empty body only because LogErrorContext throws; otherwise this
+                                // must not fall through to CreateReturnCall with an unboxed ptr.
+                            }
                             else if (!structName.empty())
                             {
                                 if (returnNV.TypeAndValue.Pointer)
@@ -7974,7 +7982,10 @@ public:
                                     LogErrorContext(assignmentExpression,
                                         std::format("'{}' does not implement interface '{}'", structName, typeAndValue.TypeName));
                                 }
-                                else if (!structName.empty() && compiler->StructImplementsInterface(structName, typeAndValue.TypeName))
+                                else if (!structName.empty()
+                                         && compiler->StructImplementsInterface(structName, typeAndValue.TypeName)
+                                         && !RejectPointerShapedInterfaceUpcast(
+                                                assignmentExpression, rightNV.TypeAndValue, typeAndValue.TypeName))
                                 {
                                     auto vtable = compiler->GetOrCreateVTable(structName, typeAndValue.TypeName);
                                     // BuildInterfaceFatValue needs a *pointer* to the struct data,
@@ -9644,6 +9655,30 @@ public:
     }
 
     /*
+     * Provable shape mismatch on a DIRECT class->interface upcast (decl-init, '=', return, and
+     * brace/element init). The shape test and the message live on LLVMBackend
+     * (DescribePointerShapedInterfaceSource) so the call-argument boxing sites there reject the
+     * same spellings with the same diagnostic. Returns true (and logs) when rejected.
+     *
+     * Its "true" return never actually reaches a caller: LogErrorContext never returns (it throws,
+     * or exits through FailCompilation). Every call site still guards on it (an empty 'else if'
+     * body, or a '&& !Reject(...)' conjunct) so that if LogErrorContext ever started returning,
+     * control would not fall through into the boxing code and emit a fat pointer built over
+     * wrong-shaped storage.
+     */
+    bool RejectPointerShapedInterfaceUpcast(antlr4::ParserRuleContext* errCtx,
+                                            const LLVMBackend::TypeAndValue& src,
+                                            const std::string& interfaceName)
+    {
+        if (interfaceName.empty()) return false;
+        std::string shape = compilerLLVM->DescribePointerShapedInterfaceSource(src);
+        if (shape.empty()) return false;
+        LogErrorContext(errCtx, compilerLLVM->FormatPointerShapedInterfaceUpcastError(
+            shape, src.TypeName, interfaceName));
+        return true;
+    }
+
+    /*
      * Upcast a '?:' result to an interface fat pointer. A ternary phi carries no NamedVariable
      * TypeName, so the ordinary upcast is skipped and a raw `ptr` would be bitcast into the fat
      * struct type - invalid IR. Box each incoming arm inside the arm's OWN block, which also
@@ -10256,7 +10291,10 @@ public:
                             "cannot convert '?:' arm to interface '{}': {}",
                             namedVar.TypeAndValue.TypeName, ternaryArmFailure));
                 }
-                if (!structName.empty() && compiler->StructImplementsInterface(structName, namedVar.TypeAndValue.TypeName))
+                if (!structName.empty()
+                    && compiler->StructImplementsInterface(structName, namedVar.TypeAndValue.TypeName)
+                    && !RejectPointerShapedInterfaceUpcast(
+                           ctx, rightNV.TypeAndValue, namedVar.TypeAndValue.TypeName))
                 {
                     auto vtable = compiler->GetOrCreateVTable(structName, namedVar.TypeAndValue.TypeName);
                     llvm::Value* dataPtr;
@@ -13894,6 +13932,7 @@ public:
 
         std::string srcName = rightNV.TypeAndValue.TypeName;
         if (srcName.empty() || !compiler->StructImplementsInterface(srcName, ifaceName)) return val;
+        if (RejectPointerShapedInterfaceUpcast(errCtx, rightNV.TypeAndValue, ifaceName)) return val;
         auto vtable = compiler->GetOrCreateVTable(srcName, ifaceName);
         llvm::Value* dataPtr = rightNV.TypeAndValue.Pointer ? val : rightNV.Storage;
         if (!dataPtr)
@@ -19542,6 +19581,10 @@ public:
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
+                                    // Propagate the pointer SHAPE flags: without them a `T**` or a
+                                    // `T[]` looks like a thin `T*` and gets boxed into an interface param.
+                                    argVar.TypeAndValue.ElemPointer = argNV.TypeAndValue.ElemPointer;
+                                    argVar.TypeAndValue.IsArrayView = argNV.TypeAndValue.IsArrayView;
                                     argVar.CallerName = argNV.CallerName;
                                     // Per-field move tracking: moving `node->left` marks only that field.
                                     argVar.FieldName = argNV.FieldName;
@@ -20010,6 +20053,9 @@ public:
                                     // as a view at the call site (otherwise the noalias gate would
                                     // false-reject a legitimate view passed to a `T[]` parameter).
                                     argVar.TypeAndValue.IsArrayView = argNV.TypeAndValue.IsArrayView;
+                                    // Same for `T**`: without it the argument looks like a plain `T*` and a
+                                    // pointer-to-pointer would be boxed into an interface parameter.
+                                    argVar.TypeAndValue.ElemPointer = argNV.TypeAndValue.ElemPointer;
                                     // Propagate bond info so bond-to-move checks work at the call site.
                                     argVar.IsBonded = argNV.IsBonded;
                                     argVar.BondByAddress = argNV.BondByAddress;

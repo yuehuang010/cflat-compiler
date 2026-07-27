@@ -9336,6 +9336,37 @@ public:
         return false;
     }
 
+    /*
+     * Shape of a source that provably cannot be boxed into an interface fat pointer. A `T**`
+     * (ElemPointer), a `T[]` view, a fixed `T[N]` slot and a simd lane vector all carry the
+     * ELEMENT class as their TypeName while loading to a bare ptr, so the ordinary upcast would
+     * attach that class's vtable to storage that is not an instance of it - silent type
+     * confusion. Returns an empty string for every shape that stays on its normal path (a thin
+     * `T*`, a `unique T*`, a borrowed class pointer, a by-value class, an already-fat interface).
+     */
+    std::string DescribePointerShapedInterfaceSource(const TypeAndValue& src) const
+    {
+        if (src.TypeName.empty()) return "";
+        if (src.IsInterface || src.IsInterfacePointer) return "";
+        if (src.ElemPointer) return src.TypeName + "**";
+        if (src.IsArrayView) return src.TypeName + "[]";
+        if (src.ConstArraySize != 0) return std::format("{}[{}]", src.TypeName, src.ConstArraySize);
+        if (src.IsSimd) return src.TypeName + " simd vector";
+        return "";
+    }
+
+    // Message for a rejected pointer-shaped class -> interface upcast. Shared by every site that
+    // boxes into an interface so all spellings report the same diagnostic.
+    std::string FormatPointerShapedInterfaceUpcastError(const std::string& shape,
+                                                        const std::string& typeName,
+                                                        const std::string& interfaceName) const
+    {
+        return std::format(
+            "cannot convert '{}' to interface '{}' - only a single instance pointer '{}*' or a "
+            "'{}' value can be boxed into an interface fat pointer; index or dereference it first",
+            shape, interfaceName, typeName, typeName);
+    }
+
     // Appends one vtable slot per interface field: the implementor's BYTE OFFSET of that field,
     // encoded as inttoptr(offset). Reads/writes through the interface GEP by it, so no thunk is
     // needed and the field stays an lvalue. A missing/mismatched field was already reported by
@@ -12027,6 +12058,14 @@ public:
             if (param.IsInterface && !nv.TypeAndValue.IsInterface)
             {
                 // Concrete struct/pointer -> interface fat ptr upconversion.
+                // Reject a pointer-shaped source: it is not an instance of its element class.
+                std::string argShape = DescribePointerShapedInterfaceSource(nv.TypeAndValue);
+                if (!argShape.empty())
+                {
+                    LogError(FormatPointerShapedInterfaceUpcastError(
+                        argShape, nv.TypeAndValue.TypeName, param.TypeName));
+                    return nullptr;
+                }
                 std::string structName = nv.TypeAndValue.TypeName;
                 if (structName.empty() && nv.BaseType)
                 {
@@ -16229,6 +16268,15 @@ public:
                         "it takes ownership and frees the object at scope exit, so the source must be "
                         "a heap 'new' (or a 'move' of an owned interface value), not a stack value",
                         functionName, candParamItr->VariableName));
+                    return nullptr;
+                }
+                // A pointer-shaped source (`T**`, `T[]`, `T[N]`, simd) is not an instance of its
+                // element class, so boxing it would attach that class's vtable to the wrong storage.
+                std::string argShape = DescribePointerShapedInterfaceSource(arg.TypeAndValue);
+                if (!argShape.empty())
+                {
+                    LogError(FormatPointerShapedInterfaceUpcastError(
+                        argShape, arg.TypeAndValue.TypeName, candParamItr->TypeName));
                     return nullptr;
                 }
                 // Derive struct name from TypeName if available, else from BaseType
