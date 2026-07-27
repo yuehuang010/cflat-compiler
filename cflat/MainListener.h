@@ -9617,6 +9617,21 @@ public:
                         else if (bits == 32) result.TypeAndValue.TypeName = "u32";
                         else if (bits == 64) result.TypeAndValue.TypeName = "u64";
                     }
+                    // A '?:' join of two interface values yields a phi/select with no NamedVariable
+                    // of its own to carry IsInterface/TypeName - it is a bare fat {vtable,data}
+                    // struct. Recover the interface identity from the per-value ledger that
+                    // PropagateFatInterfaceJoin stamped during the join, so a by-value call argument
+                    // (which reads TypeAndValue, not the ledger) matches an interface parameter
+                    // instead of showing the raw "__iface_fat_ptr" struct name to overload resolution.
+                    else if (result.BaseType == compilerLLVM->GetFatPtrType())
+                    {
+                        std::string ifaceName = compilerLLVM->FindFatInterfaceValueTypeName(result.Primary);
+                        if (!ifaceName.empty() && ifaceName != LLVMBackend::kAmbiguousFatInterface)
+                        {
+                            result.TypeAndValue.IsInterface = true;
+                            result.TypeAndValue.TypeName = ifaceName;
+                        }
+                    }
                 }
             }
             else

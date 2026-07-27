@@ -2407,6 +2407,82 @@ int testTernaryInterfaceInheritanceRebox()
     return passed;
 }
 
+// Fixtures for the '?:' join-as-by-value-call-argument regression: a ternary phi/select of two
+// interface values carried no IsInterface/TypeName of its own, so overload resolution saw the
+// raw "__iface_fat_ptr" LLVM struct name instead of the interface name and rejected every
+// by-value interface parameter (fix: ParseAssignmentExpressionNamed's ternary fallback now
+// recovers the interface name from the PropagateFatInterfaceJoin ledger).
+int useShapeMoveByValue(IShapeMove s) { return s.area(); }
+IShapeMove pickShapeMoveByValue(bool cond, IShapeMove a, IShapeMove b) { return cond ? a : b; }
+
+int testIfaceTernaryByValueCallArg()
+{
+    int passed = 0;
+
+    // The original repro: a '?:' join of two plain (non-unique) interface locals passed BY VALUE
+    // to a function parameter typed as the interface. Used to fail overload resolution entirely
+    // ("no overload of 'useShapeMoveByValue' matches the given arguments").
+    dtorCount = 0;
+    {
+        unique IShapeMove ownerA = new SqMove();
+        unique IShapeMove ownerB = new CiMove();
+        IShapeMove a = ownerA;
+        IShapeMove b = ownerB;
+        passed += Test("iface_ternary_byval_call_arg_true", useShapeMoveByValue(identityBool(true) ? a : b), 0);
+        passed += Test("iface_ternary_byval_call_arg_false", useShapeMoveByValue(identityBool(false) ? a : b), 7);
+    }
+    passed += Test("iface_ternary_byval_call_arg_freed_twice", dtorCount, 2);
+
+    // Assignment to an interface local.
+    dtorCount = 0;
+    {
+        unique IShapeMove ownerA = new SqMove();
+        unique IShapeMove ownerB = new CiMove();
+        IShapeMove a = ownerA;
+        IShapeMove b = ownerB;
+        IShapeMove c;
+        c = identityBool(false) ? a : b;
+        passed += Test("iface_ternary_byval_assign", c.area(), 7);
+    }
+    passed += Test("iface_ternary_byval_assign_freed_twice", dtorCount, 2);
+
+    // Return of the join.
+    dtorCount = 0;
+    {
+        unique IShapeMove ownerA = new SqMove();
+        unique IShapeMove ownerB = new CiMove();
+        IShapeMove a = ownerA;
+        IShapeMove b = ownerB;
+        IShapeMove picked = pickShapeMoveByValue(true, a, b);
+        passed += Test("iface_ternary_byval_return", picked.area(), 0);
+    }
+    passed += Test("iface_ternary_byval_return_freed_twice", dtorCount, 2);
+
+    // Borrowed vs owning arm mix passed by value: neither arm dominates, so the join owns
+    // nothing; the by-value parameter still resolves and reads the correct arm's area().
+    dtorCount = 0;
+    {
+        unique IShapeMove owner = new SqMove();
+        IShapeMove borrowed = owner;
+        passed += Test("iface_ternary_byval_mixed_owning_call_arg",
+            useShapeMoveByValue(identityBool(false) ? makeShapeMove() : borrowed), 0);
+    }
+    passed += Test("iface_ternary_byval_mixed_owning_freed_once", dtorCount, 1);
+
+    // Method call directly on the join (no intermediate local at all).
+    dtorCount = 0;
+    {
+        unique IShapeMove ownerA = new SqMove();
+        unique IShapeMove ownerB = new CiMove();
+        IShapeMove a = ownerA;
+        IShapeMove b = ownerB;
+        passed += Test("iface_ternary_byval_direct_method_call", (identityBool(false) ? a : b).area(), 7);
+    }
+    passed += Test("iface_ternary_byval_direct_method_call_freed_twice", dtorCount, 2);
+
+    return passed;
+}
+
 int testUniqueInterfaceReassign()
 {
     int passed = 0;
@@ -3401,6 +3477,9 @@ extern int main()
 
     passed += testTernaryInterfaceInheritanceRebox();
     total += 22;
+
+    passed += testIfaceTernaryByValueCallArg();
+    total += 11;
 
     passed += testUniqueInterfaceMoveExtra();
     total += 22;
