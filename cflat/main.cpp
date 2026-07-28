@@ -319,6 +319,7 @@ int main(int argc, char* argv[])
     args.addOption("nuget-packages-dir", 0, "Explicit NuGet global packages folder (overrides NUGET_PACKAGES / %USERPROFILE%\\.nuget\\packages discovery)");
     args.addFlag("nuget-no-install", 0, "Do not download NuGet packages; error out if a package-nuget package is not already in the packages folder");
     args.addFlag("init", 0, "Populate %USERPROFILE%\\.cflat\\ cache with linker paths, core bitcode, and the compiler path, then exit");
+    args.addFlag("init-clear", 0, "Delete the %USERPROFILE%\\.cflat\\ (macOS/Linux ~/.cflat) cache directory and exit; re-run --init afterward to repopulate it");
     args.addFlag("print-supported-cpus", 0, "List target CPUs supported on Windows x86/x64, then exit");
     args.addFlag("print-host-cpu", 0, "Print the LLVM name of the host CPU (what --cpu native resolves to), then exit");
     args.addOption("cpu", 0, "Target CPU for code generation (name from --print-supported-cpus, or 'native'); sets ISA features + tuning", "");
@@ -346,6 +347,16 @@ int main(int argc, char* argv[])
 
     // Locate runtime.cb next to this executable (needed for lld-link discovery too).
     std::string runtimeDir = GetExeDir();
+
+    // --init and --init-clear are opposites; refuse rather than guessing which one was meant.
+    if (args.hasFlag("init") && args.hasFlag("init-clear"))
+    {
+        std::cout << "Error: --init and --init-clear cannot be combined. Pass --init-clear to delete the cache, then --init to repopulate it.\n";
+        return 1;
+    }
+
+    if (args.hasFlag("init-clear"))
+        return LLVMBackend::RunInitClear(args.hasFlag("verbose")) ? 0 : 1;
 
     if (args.hasFlag("init"))
     {

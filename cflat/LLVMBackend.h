@@ -19964,6 +19964,10 @@ public:
     // Prints discovered paths to stdout. Returns false if the cache dir cannot be created.
     static bool RunInit(const std::string& runtimeDir, bool verbose);
 
+    // Delete the whole %USERPROFILE%\.cflat / ~/.cflat cache tree (inverse of RunInit).
+    // Prints what was removed. Returns false on a real failure; a missing cache is success.
+    static bool RunInitClear(bool verbose);
+
 #if defined(__APPLE__)
     // Harvest libSystem's reexported symbols from the live dyld shared cache and
     // write a flattened tbd stub to <cacheDir>/macsdk/usr/lib/libSystem.tbd, so the

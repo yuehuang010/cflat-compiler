@@ -2794,6 +2794,150 @@ std::string LLVMBackend::GetCflatCacheDir()
 #endif
 }
 
+/*
+    --init-clear: remove the entire compiler cache tree so the next --init rebuilds it from
+    scratch. Everything cached lives under the one root (core bitcode, compiler_path.txt,
+    linker_paths_*.json, the synthesized import libs, the cheaders/ C-header cache, and the
+    macOS macsdk stubs), so a single recursive delete covers it. The target is exactly whatever
+    GetCflatCacheDir returns, i.e. where --init writes; it is not canonicalised. The name/parent
+    checks below cannot fail today and exist to catch a future change to GetCflatCacheDir.
+*/
+bool LLVMBackend::RunInitClear(bool verbose)
+{
+    std::string cacheDir = GetCflatCacheDir();
+    if (cacheDir.empty())
+    {
+        std::cout << "Error: could not determine cache directory (HOME/USERPROFILE not set).\n";
+        return false;
+    }
+
+    std::filesystem::path root(cacheDir);
+    if (verbose)
+        std::cout << std::format("[verbose] resolved cache directory: {}\n", root.string());
+
+    // Defence-in-depth only (see the comment above): GetCflatCacheDir always appends
+    // ".cflat", so neither of these can trip as the code stands today.
+    if (root.filename() != ".cflat")
+    {
+        std::cout << std::format("Error: refusing to delete '{}': the path does not end in '.cflat'.\n", root.string());
+        return false;
+    }
+    if (!root.has_parent_path() || root.parent_path() == root || root == root.root_path())
+    {
+        std::cout << std::format("Error: refusing to delete '{}': it has no parent directory or is a filesystem root.\n", root.string());
+        return false;
+    }
+
+    // symlink_status (not status) so a symlinked root is seen as a link, never followed.
+    // Check not_found before ec: a missing path reports ENOENT through ec on some libraries.
+    std::error_code ec;
+    std::filesystem::file_status st = std::filesystem::symlink_status(root, ec);
+    if (st.type() == std::filesystem::file_type::not_found)
+    {
+        std::cout << std::format("Cache directory: {}\n", root.string());
+        std::cout << "  Nothing to clear (the cache directory does not exist).\n";
+        return true;
+    }
+    if (ec)
+    {
+        std::cout << std::format("Error: could not inspect {}: {}\n", root.string(), ec.message());
+        return false;
+    }
+
+    // A symlinked cache root points somewhere we were never asked to touch, so remove
+    // only the link itself and leave the target tree intact.
+    if (std::filesystem::is_symlink(st))
+    {
+        // remove() returns false with ec CLEARED when the path is already gone (a race
+        // against symlink_status above); only a set ec is a real failure.
+        if (!std::filesystem::remove(root, ec) && ec)
+        {
+            std::cout << std::format("Error: could not remove symlink {}: {}\n", root.string(), ec.message());
+            return false;
+        }
+        std::cout << std::format("Cache directory: {}\n", root.string());
+        std::cout << "  Removed the symlink only; its target tree was left untouched.\n";
+        std::cout << "Run 'cflat --init' to repopulate the cache.\n";
+        return true;
+    }
+
+    if (!std::filesystem::is_directory(st))
+    {
+        std::cout << std::format("Error: refusing to delete '{}': it is not a directory.\n", root.string());
+        return false;
+    }
+
+    /*
+        remove_all does not report a count, so walk the tree first and tally what will go.
+        Classify with symlink_status, never status: file_size/is_directory on a directory_entry
+        follow symlinks, which would bill a link's target bytes to a file remove_all leaves
+        on disk. skip_permission_denied is deliberately NOT used - it swallows an unreadable
+        subtree without setting ec, so the count would silently undercount and we would have
+        no offending path to name if the delete then fails.
+    */
+    uintmax_t fileCount = 0, dirCount = 1, linkCount = 0, byteCount = 0;   // dirCount counts root
+    std::string blockedPath;
+    bool walkIncomplete = false;
+    std::filesystem::recursive_directory_iterator it(root, ec), end;
+    if (ec)
+    {
+        blockedPath = root.string();
+        walkIncomplete = true;
+    }
+    while (!walkIncomplete && it != end)
+    {
+        // An entry we cannot stat is still deleted by remove_all, just not classifiable here.
+        std::error_code statEc;
+        std::filesystem::file_status entrySt = std::filesystem::symlink_status(it->path(), statEc);
+        if (!statEc)
+        {
+            if (std::filesystem::is_symlink(entrySt))
+                ++linkCount;
+            else if (std::filesystem::is_directory(entrySt))
+                ++dirCount;
+            else
+            {
+                ++fileCount;
+                if (uintmax_t sz = std::filesystem::file_size(it->path(), statEc); !statEc)
+                    byteCount += sz;
+            }
+        }
+
+        // Capture the entry before incrementing: a failure here is the descent into it.
+        std::filesystem::path current = it->path();
+        it.increment(ec);
+        if (ec)
+        {
+            blockedPath = current.string();
+            walkIncomplete = true;
+        }
+    }
+    if (walkIncomplete && verbose)
+        std::cout << std::format("[verbose] could not fully walk {} (blocked at {}); counts are a lower bound.\n",
+                                 root.string(), blockedPath);
+
+    std::error_code rmEc;
+    std::filesystem::remove_all(root, rmEc);
+    if (rmEc)
+    {
+        // remove_all deletes what it can before failing, so the cache is likely half gone.
+        std::cout << std::format("Error: could not fully remove {}: {}\n", root.string(), rmEc.message());
+        if (!blockedPath.empty())
+            std::cout << std::format("  Blocked at: {} (check its permissions).\n", blockedPath);
+        else
+            std::cout << "  The blocking path was not reported by the filesystem; check permissions under the cache directory.\n";
+        std::cout << "  The cache is now PARTIALLY deleted. Run 'cflat --init' to repopulate it either way.\n";
+        return false;
+    }
+
+    std::cout << std::format("Cache directory: {}\n", root.string());
+    std::cout << std::format("  Removed {} file(s) and {} symlink(s) in {} directory(ies), {} bytes total{}.\n",
+                             fileCount, linkCount, dirCount, byteCount, walkIncomplete ? " (at least)" : "");
+    std::cout << "Run 'cflat --init' to repopulate the cache (on macOS this also re-harvests the\n";
+    std::cout << "libSystem link stub at macsdk/usr/lib/libSystem.tbd that self-contained linking needs).\n";
+    return true;
+}
+
 bool LLVMBackend::WriteCompilerPathToCache()
 {
     std::string cacheDir = GetCflatCacheDir();

@@ -6,7 +6,7 @@ companion to `cflat --help`; both derive from the flag registrations in
 
 ```
 cflat <input> [options]
-cflat --init | --version | --help | --print-supported-cpus | --print-host-cpu
+cflat --init | --init-clear | --version | --help | --print-supported-cpus | --print-host-cpu
 cflat lsp                       # run the Language Server (see the VS Code extension)
 cflat lsp --lsp-pool-size N      # cap concurrent analyses to N backends/workers
 ```
@@ -144,6 +144,7 @@ AppKit / Foundation / CoreFoundation / `libobjc` tbd stubs under `~/.cflat/macsd
 | Switch | Description |
 |--------|-------------|
 | `--init` | Populate the compiler cache, then exit. Run once after installing or updating cflat. On Windows this is `%USERPROFILE%\.cflat\` (linker paths for x64/x86 + core bitcode + the compiler path for VS Code auto-detection); on macOS this is `~/.cflat/` (the compiler path record, the libSystem link stub at `macsdk/usr/lib/libSystem.tbd`, and core bitcode). |
+| `--init-clear` | Recursively delete the whole cache directory (`%USERPROFILE%\.cflat\` on Windows, `~/.cflat` elsewhere - taken verbatim from the environment, same path `--init` writes), then exit. Reports the path and how many files/bytes were removed; a missing cache is reported and exits 0; a partial delete (permissions) says so and exits 1. If the cache root is a symlink, only the link is removed and its target is left alone. Re-run `--init` afterward - on macOS that also re-harvests the `macsdk/usr/lib/libSystem.tbd` stub that self-contained linking depends on. Note `--init` does not rebuild the `cheaders/` C-header cache; that is re-earned lazily by the next compile that imports a `cache`-clause header. Cannot be combined with `--init`. |
 | `--no-cache` | Bypass the core bitcode cache and reparse the core libraries from source. |
 | `--c-header-cache-deep` | For C headers opted in with the `cache` import clause, validate every transitively included file (mtime/hash), not just the top header. |
 
