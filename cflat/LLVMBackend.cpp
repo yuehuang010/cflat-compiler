@@ -342,6 +342,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     llvm::TimeTraceScope compileScope("Compilation", sourceFileName);
     auto rootCanonical = std::filesystem::weakly_canonical(filename).string();
     currentSourceFilePath_ = rootCanonical;
+    analyzedRootPath_ = rootCanonical;
     currentSourceIsCore_ = false;   // the root file is the user's program, never a core import
     importedFiles.insert(rootCanonical);
     importStack.push_back(rootCanonical);
@@ -2167,6 +2168,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         : sourceDisplayName_;
     auto rootCanonical = std::filesystem::weakly_canonical(filePath).string();
     currentSourceFilePath_ = rootCanonical;
+    analyzedRootPath_ = rootCanonical;
     currentSourceIsCore_ = false;   // the analyzed root file is treated as user code
     importedFiles.insert(rootCanonical);
     importStack.push_back(rootCanonical);
@@ -2454,6 +2456,7 @@ void LLVMBackend::ResetForReanalysis()
     coreInterfaceDefs_.clear();
     scannedInterfaceImpls.clear();
     uncertainInterfaceImpls.clear();
+    analyzedRootPath_.clear();
     importCompileDepth_ = 0;   // a throw out of an import walk can leave the RAII depth stranded
     typeAnnotations_.clear();
     globalNamedVariable.clear();

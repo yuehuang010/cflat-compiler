@@ -1404,6 +1404,9 @@ private:
     // Override name for diagnostics: LSP analyzes a temp copy, so this carries the real
     // source path so diagnostics and __FILE__ don't show the temp name.
     std::string sourceDisplayName_;
+    // Canonical path of the root file handed to Compile()/Analyze() - under the LSP that is the
+    // temp copy, which DefinitionSitePath() maps back to the real document.
+    std::string analyzedRootPath_;
 
     // Per-backend generic-template state, shared with MainListener via references.
     GenericTemplateState gts;
@@ -8939,34 +8942,89 @@ public:
     // nested cwd. A non-core (user) site is shown relative to the cwd when that stays inside the
     // tree; anything that would leak an absolute path or a cwd-dependent ".." chain (cross-drive
     // on Windows, or a canonicalize failure) falls back to the bare basename instead.
+    // path::native() is a wstring on Windows; compare on the portable .string() form instead.
+    static bool RelativePathEscapesUp(const std::filesystem::path& rel)
+    {
+        return rel.string().rfind("..", 0) == 0;
+    }
+
+    // The path half of a "path(line,col)" def-site; empty if the site is not in that shape.
+    static std::filesystem::path DefSitePath(const std::string& site)
+    {
+        auto openParen = site.rfind('(');
+        if (openParen == std::string::npos) return {};
+        return std::filesystem::path(site.substr(0, openParen));
+    }
+
+    // The def-site path relative to the INSTALLED core tree (runtimeDir/core), or empty if it
+    // does not live there.
+    std::string InstalledCoreRelative(const std::filesystem::path& p) const
+    {
+        if (runtimeDir.empty()) return {};
+        std::error_code ec;
+        auto coreDir = std::filesystem::weakly_canonical(std::filesystem::path(runtimeDir) / "core", ec);
+        if (ec) return {};
+        auto rel = p.lexically_relative(coreDir);
+        if (rel.empty() || RelativePathEscapesUp(rel)) return {};
+        return rel.string();
+    }
+
+    // The path tail below the last "core" directory component ("a/core/ui/x.cb" -> "ui/x.cb"),
+    // or empty when no such component precedes the filename.
+    static std::string TailBelowCoreDir(const std::filesystem::path& p)
+    {
+        std::vector<std::filesystem::path> parts(p.begin(), p.end());
+        for (size_t k = parts.size(); k-- > 0;)
+        {
+            if (k + 1 >= parts.size() || parts[k].string() != "core") continue;
+            std::filesystem::path tail;
+            for (size_t j = k + 1; j < parts.size(); ++j) tail /= parts[j];
+            return tail.string();
+        }
+        return {};
+    }
+
+    /*
+     * A core .cb file exists twice on disk: the installed copy under runtimeDir/core that every
+     * program implicitly imports, and the source-tree copy a maintainer edits. Compiling the
+     * source copy directly - which the LSP does for every open file - registers the same logical
+     * interface under two canonical paths, and the full-path identity key would call that a
+     * redefinition. Treat the two as one file when exactly one side is the installed core copy
+     * and the other names the same path below its own "core" directory. The residual hole is a
+     * user file that sits at <anything>/core/<same relative name> and reuses a core interface
+     * name; the far likelier collision - a user file anywhere else - still reports.
+     */
+    bool IsSameCoreFileDefSite(const std::string& siteA, const std::string& siteB) const
+    {
+        auto pathA = DefSitePath(siteA), pathB = DefSitePath(siteB);
+        if (pathA.empty() || pathB.empty()) return false;
+
+        std::string installedA = InstalledCoreRelative(pathA), installedB = InstalledCoreRelative(pathB);
+        if (installedA.empty() == installedB.empty()) return false;
+
+        const std::string& installedRel = installedA.empty() ? installedB : installedA;
+        const std::filesystem::path& other = installedA.empty() ? pathA : pathB;
+        std::string otherTail = TailBelowCoreDir(other);
+        return !otherTail.empty() && otherTail == installedRel;
+    }
+
     std::string ShortenDefSiteForDisplay(const std::string& site, bool isCore) const
     {
         auto openParen = site.rfind('(');
         if (openParen == std::string::npos) return site;
         std::filesystem::path p(site.substr(0, openParen));
         std::string suffix = site.substr(openParen);
-        // path::native() is a wstring on Windows; compare on the portable .string() form instead.
-        auto startsWithDotDot = [](const std::filesystem::path& rel)
-        {
-            std::string s = rel.string();
-            return s.rfind("..", 0) == 0;
-        };
 
-        if (isCore && !runtimeDir.empty())
+        if (isCore)
         {
-            std::error_code ec;
-            auto coreDir = std::filesystem::weakly_canonical(std::filesystem::path(runtimeDir) / "core", ec);
-            if (!ec)
-            {
-                auto rel = p.lexically_relative(coreDir);
-                if (!rel.empty() && !startsWithDotDot(rel))
-                    return (std::filesystem::path("core") / rel).string() + suffix;
-            }
+            std::string rel = InstalledCoreRelative(p);
+            if (!rel.empty())
+                return (std::filesystem::path("core") / rel).string() + suffix;
         }
 
         std::error_code ec;
         auto rel = std::filesystem::relative(p, ec);
-        if (!ec && !rel.empty() && !startsWithDotDot(rel))
+        if (!ec && !rel.empty() && !RelativePathEscapesUp(rel))
             return rel.string() + suffix;
         return p.filename().string() + suffix;
     }
@@ -8980,7 +9038,8 @@ public:
         if (!definitionSite.empty())
         {
             auto siteIt = interfaceDefSites.find(name);
-            if (siteIt != interfaceDefSites.end() && siteIt->second != definitionSite)
+            if (siteIt != interfaceDefSites.end() && siteIt->second != definitionSite
+                && !IsSameCoreFileDefSite(siteIt->second, definitionSite))
             {
                 bool siteIsCore = coreInterfaceDefs_.count(name) != 0;
                 std::string displaySite = ShortenDefSiteForDisplay(siteIt->second, siteIsCore);
@@ -18684,6 +18743,21 @@ public:
 
     std::string GetSourceFileName() const { return sourceFileName; }
     std::string GetSourceFilePath() const { return currentSourceFilePath_; }
+
+    // The path that identifies the file currently being walked, for def-site identity. The LSP
+    // analyzes a temp copy of the open document, so the root file's own path is a throwaway name
+    // in %TEMP%; report the real document instead, or the copy reads as a second definition of
+    // everything the real file already defines (it is imported under its real path).
+    std::string DefinitionSitePath() const
+    {
+        if (sourceFileDir_.empty() || sourceDisplayName_.empty()
+            || currentSourceFilePath_ != analyzedRootPath_)
+            return currentSourceFilePath_;
+        std::error_code ec;
+        auto real = std::filesystem::weakly_canonical(
+            std::filesystem::path(sourceFileDir_) / sourceDisplayName_, ec);
+        return ec ? currentSourceFilePath_ : real.string();
+    }
 
     std::string GetCurrentFunctionName() const
     {

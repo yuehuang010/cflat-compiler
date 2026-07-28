@@ -500,7 +500,7 @@ inline void AppendInterfaceNameCandidates(LLVMBackend* compiler, const std::stri
 // redefinition apart from the same definition being registered twice (forward scan then codegen
 // walk, or a re-imported file reached via a different path spelling) and, reformatted for
 // display, as the location named in the "already defined at" diagnostic. The path here is the
-// canonical full path (GetSourceFilePath()), not the basename: two co-imported files sharing a
+// canonical full path (DefinitionSitePath()), not the basename: two co-imported files sharing a
 // basename (e.g. "da/common.cb" and "db/common.cb") must compare unequal, while the SAME file
 // reached via two spellings (relative vs absolute, a different -i dir, ../) must compare equal -
 // import resolution already canonicalizes every import target before this runs, so one file has
@@ -509,7 +509,7 @@ inline void AppendInterfaceNameCandidates(LLVMBackend* compiler, const std::stri
 inline std::string DefinitionSiteText(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx)
 {
     if (compiler == nullptr || ctx == nullptr || ctx->getStart() == nullptr) return {};
-    return std::format("{}({},{})", compiler->GetSourceFilePath(),
+    return std::format("{}({},{})", compiler->DefinitionSitePath(),
                        (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine());
 }
 
