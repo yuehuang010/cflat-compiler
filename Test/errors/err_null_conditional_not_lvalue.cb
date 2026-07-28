@@ -1,0 +1,36 @@
+// A guarded '?.' chain merges into a phi, so it yields a VALUE, not an address:
+// it cannot be assigned to, and no read-modify-write operator can apply to it.
+// This holds for a thin-pointer receiver and for an interface receiver alike.
+interface INcW { int kind(); int tag; };
+class NcW : INcW { int pad = 7; int tag = 0; int kind() { return 1; } };
+struct NcS { int x = 0; };
+
+extern int main()
+{
+    NcW* a = new NcW();
+    INcW iface = a;
+    NcS sv = NcS();
+    NcS* sp = &sv;
+
+    expect_error("Left side of assignment is not an addressable lvalue") {
+        iface?.tag = 9;
+    }
+    expect_error("Left side of assignment is not an addressable lvalue") {
+        sp?.x = 9;
+    }
+    // '++' / '--' used to emit a raw LLVM verifier dump ("Instruction does not
+    // dominate all uses") because the GEP lives in the guarded access block.
+    expect_error("'++' cannot be applied to a null-conditional '?.' access") {
+        iface?.tag++;
+    }
+    expect_error("'--' cannot be applied to a null-conditional '?.' access") {
+        iface?.tag--;
+    }
+    expect_error("'++' cannot be applied to a null-conditional '?.' access") {
+        sp?.x++;
+    }
+    expect_error("'--' cannot be applied to a null-conditional '?.' access") {
+        sp?.x--;
+    }
+    return 0;
+}

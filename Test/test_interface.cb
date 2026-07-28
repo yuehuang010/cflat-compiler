@@ -1222,6 +1222,124 @@ bool testInterfaceFieldAccess()
     return result;
 }
 
+// A pointer field and an interface-typed field, so the '?.' guard is exercised on
+// field types beyond int/string/struct. 'probe' additionally makes the short-circuit
+// OBSERVABLE: a zero on the null path proves nothing (a zeroed field reads zero too),
+// but a call counter that stays 0 could only happen if the chain was really skipped.
+int gNcProbeCalls = 0;
+
+interface IProbe { int probe(); };
+
+class ProbeImpl : IProbe
+{
+    int z = 41;
+    int probe() { gNcProbeCalls = gNcProbeCalls + 1; return z; }
+};
+
+interface IHolder
+{
+    int kind();
+    int*    ptr;
+    IWidget inner;
+    IProbe  probe;
+};
+
+class Holder : IHolder
+{
+    i64 pad3 = 0;              // keep the fields off a natural offset
+    int*    ptr = nullptr;
+    IWidget inner = default;
+    IProbe  probe = default;
+    int kind() { return 4; }
+};
+
+// Test 26b: '?.' on an interface FIELD must short-circuit instead of dereferencing
+// a null fat pointer (the field address is data + vtable[slot], so BOTH halves of a
+// null receiver would fault before this guard existed).
+bool testInterfaceFieldNullConditional()
+{
+    bool result = true;
+
+    IPress nullPress = default;
+    // Every field type reachable through the 3-level chain, on a null receiver.
+    result &= Test("ifld_nc_null_int",    nullPress?.tag,   0);
+    result &= Test("ifld_nc_null_string", nullPress?.tip,   "");
+    result &= Test("ifld_nc_null_label",  nullPress?.label, "");
+    // '??' must compose with the guarded field read. On its own this leg is weak - '??'
+    // treats an int 0 as null - so the live sentinel leg below is what pins the value.
+    result &= Test("ifld_nc_null_coalesce", nullPress?.tag ?? -1, -1);
+    // A struct field, and a chain that continues PAST the '?.' - the whole chain
+    // must short-circuit, not just the first link.
+    WBox nullBox = nullPress?.box;
+    result &= Test("ifld_nc_null_struct_w", nullBox.w, 0);
+    result &= Test("ifld_nc_null_chain_w",  nullPress?.box.w, 0);
+    result &= Test("ifld_nc_null_chain_h",  nullPress?.box.h, 0);
+
+    // A null derived at RUNTIME (a failed 'as'), not folded from 'default'.
+    Plain* pl = new Plain();
+    pl.tag = 5;
+    IWidget plainIface = pl;
+    IPress missed = plainIface as IPress;
+    result &= Test("ifld_nc_runtime_null_is_null", missed == nullptr, true);
+    result &= Test("ifld_nc_runtime_null_tag",     missed?.tag, 0);
+
+    // Non-null receivers still read the REAL field, at each implementor's own offset -
+    // the per-implementor offset slot must survive the guard.
+    Pressy* p = new Pressy();
+    p.tag = 31; p.tip = "pt"; p.label = "Go"; p.box.w = 3; p.box.h = 4;
+    Toggly* t = new Toggly();
+    t.tag = 32; t.tip = "tt"; t.label = "Flip"; t.box.w = 5; t.box.h = 6;
+    IPress ip = p;
+    IPress it = t;
+    result &= Test("ifld_nc_live_tag_a",   ip?.tag,   31);
+    result &= Test("ifld_nc_live_tag_b",   it?.tag,   32);
+    result &= Test("ifld_nc_live_tip_a",   ip?.tip,   "pt");
+    result &= Test("ifld_nc_live_tip_b",   it?.tip,   "tt");
+    result &= Test("ifld_nc_live_label_b", it?.label, "Flip");
+    result &= Test("ifld_nc_live_chain_a", ip?.box.w, 3);
+    result &= Test("ifld_nc_live_chain_b", it?.box.h, 6);
+    result &= Test("ifld_nc_live_coalesce", ip?.tag ?? -1, 31);
+    // Methods on the same receivers are unaffected.
+    result &= Test("ifld_nc_live_method_b", it?.clicks(), 100);
+
+    // Pointer-typed and interface-typed fields, null and live.
+    IHolder nullHolder = default;
+    int* np = nullHolder?.ptr;
+    result &= Test("ifld_nc_null_ptr_field", np == nullptr, true);
+    IWidget ni = nullHolder?.inner;
+    result &= Test("ifld_nc_null_iface_field", ni == nullptr, true);
+
+    int cell = 91;
+    Holder* h = new Holder();
+    h.ptr = &cell;
+    Plain* pl2 = new Plain();
+    pl2.tag = 6;
+    IWidget plain2 = pl2;
+    h.inner = plain2;                          // the holder owns this one
+    h.probe = new ProbeImpl();
+    IHolder ih = h;
+    int* lp = ih?.ptr;
+    result &= Test("ifld_nc_live_ptr_field", *lp, 91);
+    IWidget li = ih?.inner;
+    result &= Test("ifld_nc_live_iface_field", li.tag, 6);
+
+    // The ONLY assertions here whose expected value cannot also come from an unguarded
+    // read: a call sitting past the guarded field must not run on the null path. The
+    // live legs prove the counter itself works, so a stuck 0 is not a false pass.
+    gNcProbeCalls = 0;
+    result &= Test("ifld_nc_null_chain_call_result",  nullHolder?.probe.probe(), 0);
+    result &= Test("ifld_nc_null_chain_no_call",      gNcProbeCalls, 0);
+    result &= Test("ifld_nc_live_chain_call_result",  ih?.probe.probe(), 41);
+    result &= Test("ifld_nc_live_chain_did_call",     gNcProbeCalls, 1);
+
+    delete ip;
+    delete it;
+    delete ih;
+    delete plainIface;
+
+    return result;
+}
+
 // --- Test 29: boxing an owning POINTER local into a `move` interface param ---
 // Regression (heap corruption): passing an owning `T*` local to a `move IFace`
 // parameter (e.g. `list<IFace>.add`) boxes it into a fat pointer and hands
@@ -2243,6 +2361,7 @@ extern int main()
     total++; passed += testInterfaceFieldString()        ? 1 : 0;
     total++; passed += testDowncastCallResultBorrow()    ? 1 : 0;
     total++; passed += testInterfaceFieldAccess()        ? 1 : 0;
+    total++; passed += testInterfaceFieldNullConditional() ? 1 : 0;
     total++; passed += testInterfaceBraceInitField()     ? 1 : 0;
     total++; passed += testInterfaceIsNullUpcast()       ? 1 : 0;
     total++; passed += testInterfaceTernaryUpcast()      ? 1 : 0;

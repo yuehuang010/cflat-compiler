@@ -16655,6 +16655,26 @@ public:
                 compiler->CreateConditionJump(testPtr, accessBlock, ncChainNullBlock);
                 nullConditionalPending = false;
             };
+            // A guarded chain merges into a phi, so it yields a VALUE and has no single
+            // address - read-modify-write operators have nothing to write back through.
+            auto NullConditionalNotWritable = [&](const char* op)
+            {
+                // LogErrorContext throws, so the chain's half-built blocks must be closed HERE
+                // or the aborted walk leaves an unterminated 'nc_null' behind (same guard the
+                // return-block bailouts below use).
+                auto* compiler = Compiler(ctx);
+                if (!compiler->IsBlockTerminated())
+                    compiler->builder->CreateUnreachable();
+                if (ncChainNullBlock != nullptr && ncChainNullBlock->getTerminator() == nullptr)
+                {
+                    compiler->SwitchToBlock(ncChainNullBlock);
+                    compiler->builder->CreateUnreachable();
+                }
+                return std::format(
+                    "'{}' cannot be applied to a null-conditional '?.' access - the guarded chain "
+                    "yields a value, not an addressable location. Null-check the receiver and use "
+                    "a plain '.' access instead.", op);
+            };
 
             // dropTrailingChildren lets a caller (e.g. the lock statement, for `rw.read`)
             // evaluate only the base of the postfix chain, ignoring a trailing suffix.
@@ -16928,6 +16948,11 @@ public:
                     {
                         if (namedVar.TypeAndValue.IsArrayView)
                             LogErrorContext(ctx, "'++' is not allowed on an array-view 'T[]' - it has no pointer arithmetic; index it with 'a[i]' instead");
+                        if (ncChainNullBlock != nullptr)
+                        {
+                            LogErrorContext(ctx, NullConditionalNotWritable("++"));
+                            break;
+                        }
                         CheckGuardedWrite(ctx, namedVar);
                         if (namedVar.Storage)
                         {
@@ -16951,6 +16976,11 @@ public:
                     {
                         if (namedVar.TypeAndValue.IsArrayView)
                             LogErrorContext(ctx, "'--' is not allowed on an array-view 'T[]' - it has no pointer arithmetic; index it with 'a[i]' instead");
+                        if (ncChainNullBlock != nullptr)
+                        {
+                            LogErrorContext(ctx, NullConditionalNotWritable("--"));
+                            break;
+                        }
                         CheckGuardedWrite(ctx, namedVar);
                         if (namedVar.Storage)
                         {
@@ -17074,6 +17104,19 @@ public:
                                 llvm::Value* fatVal = interfaceVar.Primary != nullptr
                                     ? interfaceVar.Primary
                                     : compiler->CreateLoad(compiler->GetFatPtrType(), interfaceVar.Storage);
+
+                                // '?.' on an interface FIELD: the address is data + vtable[slot], so
+                                // BOTH halves must be live or the offset load itself faults.
+                                if (nullConditionalPending)
+                                {
+                                    auto* vtPtr = compiler->builder->CreateExtractValue(fatVal, { 0u }, "nc_iface_vtable");
+                                    auto* dtPtr = compiler->builder->CreateExtractValue(fatVal, { 1u }, "nc_iface_data");
+                                    auto* live = compiler->builder->CreateAnd(
+                                        compiler->builder->CreateICmpNE(vtPtr, llvm::Constant::getNullValue(vtPtr->getType())),
+                                        compiler->builder->CreateICmpNE(dtPtr, llvm::Constant::getNullValue(dtPtr->getType())),
+                                        "nc_iface_live");
+                                    ncEnterGuard(live);
+                                }
 
                                 const auto& fieldType = (*compiler->GetInterfaceFields(ifaceName))[ifaceFieldIdx];
                                 auto* fieldLLVMType = compiler->GetType(fieldType);
