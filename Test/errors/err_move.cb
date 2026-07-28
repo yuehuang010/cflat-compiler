@@ -22,14 +22,10 @@ interface IUnrelatedThing { int poke(); };
 // Brace-init of an interface-typed field is its own store path; it must re-box like `=` does.
 struct UnrelatedSlot { IUnrelatedThing s = default; };
 
-// Neither of these has an implementor, so the source's concrete class is unknowable and the
-// source-side check stays silent. The zero-case backstop inside the rebuild is what must reject it:
-// with nothing to match, the conversion would hand back a null-vtable fat value.
-interface INoImplA { int nia(); };
-interface INoImplB { int nib(); };
-expect_error("cannot convert to interface 'INoImplB' - no class implements it") {
-    INoImplB convNoImpl(INoImplA x) { INoImplB y = x; return y; }
-}
+// The zero-implementor rebox backstop ("cannot convert to interface 'X' - no class implements
+// it") lives in Test/errors/err_iface_rebox_no_implementor.cb: it now fires at finalization,
+// after every scope has closed, so it needs the file-scope form of expect_error and cannot
+// share a file with the scoped-block expectations below.
 
 // use after move - assign move param to struct field, then read param again
 expect_error("use of moved variable 'child'") {

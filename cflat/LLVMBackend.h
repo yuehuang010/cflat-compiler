@@ -1665,6 +1665,34 @@ private:
     // a delete site when the element type is not yet complete; bodies emitted at finalization.
     std::unordered_map<std::string, llvm::Function*> deferredFullDtor_;
     std::vector<std::string> deferredFullDtorOrder_;
+    // One conversion site that needed a rebox thunk. Finalization has no parse context and no
+    // meaningful scanner state of its own, so everything the zero-implementor diagnostic needs
+    // is captured HERE, at the site, while it is still true.
+    struct InterfaceReboxSite
+    {
+        std::string File;
+        size_t Line = 0;
+        size_t Column = 0;
+        bool InImport = false;    // site is inside a file being imported (importCompileDepth_ > 0)
+        bool Uncertain = false;   // destination's implementor set was unprovable at the site
+    };
+
+    // One deferred interface -> interface rebox thunk per destination interface (see
+    // GetOrCreateInterfaceReboxThunk). The typedesc if-chain inside it is emitted at
+    // finalization, when every implementor is registered. Every site that shares the thunk is
+    // recorded, not just the first: the diagnostic must report the user's line rather than a
+    // library's, and must stay silent if ANY sharer could not be reasoned about.
+    struct DeferredInterfaceRebox
+    {
+        std::string DstInterface;
+        llvm::Function* Thunk = nullptr;
+        std::vector<InterfaceReboxSite> Sites;
+    };
+    std::vector<DeferredInterfaceRebox> deferredIfaceRebox_;
+    std::unordered_map<std::string, size_t> deferredIfaceReboxIndex_;
+    // Set once EmitDeferredInterfaceReboxBodies has run. A thunk handed out after that would
+    // reach the verifier bodyless (internal linkage), so it is emitted on the spot instead.
+    bool deferredIfaceReboxDrained_ = false;
     std::unordered_map<std::string, llvm::Function*> memberwiseCopyCache_;
     std::function<void(const std::string&, size_t, size_t, const std::string&, int)> diagnosticSink_;
     std::function<void(int, int, int, int, const std::string&)> hintRegionSink_;
@@ -2342,6 +2370,14 @@ private:
     // derived-typed move joined with a parent-typed move): no single name is correct, so
     // ReboxInterfaceIfNeeded must rebox unconditionally instead of trusting either arm's name.
     static constexpr const char* kAmbiguousFatInterface = "<ambiguous>";
+
+    // Symbol prefix of the deferred interface -> interface rebox thunks. The destination
+    // interface name follows verbatim, so the pair round-trips through a bitcode module.
+    static constexpr std::string_view kInterfaceReboxPrefix = "__iface_rebox.";
+
+    // Stand-in file name for a rebox site recovered from the core bitcode cache, whose real
+    // location died with the compile that built the cache.
+    static constexpr std::string_view kCoreBitcodeCacheOrigin = "<core bitcode cache>";
 
     // Ledger a '?:' join's interface from whichever arm's own ledger entry is known - the joined
     // phi/select carries no NamedVariable of its own to read a TypeName from. When both arms are
@@ -10016,16 +10052,163 @@ public:
 
     // Re-box an interface value as a DIFFERENT interface (a derived-to-parent upcast, e.g.
     // IButton -> IElement). A derived vtable is NOT layout-compatible with its parent's once
-    // field-offset slots exist, so the fat pointer is rebuilt: match the runtime typedesc
-    // against each implementor of dstIface and pick that implementor's dstIface vtable.
-    // No match yields a zeroed fat pointer, exactly like a failed `as <Interface>`.
+    // field-offset slots exist, so the fat pointer is rebuilt by matching the runtime typedesc
+    // against each implementor of dstIface. That if-chain CANNOT be emitted here: the
+    // implementor registry is only as complete as the walk has got, so a class declared later
+    // in the file, monomorphized later, or defined in the file that imports this core library
+    // would be missing and the conversion would silently yield a null vtable. Emit a call to a
+    // per-destination thunk instead and fill its body at finalization.
     llvm::Value* RebuildInterfaceFatValue(llvm::Value* fatVal, const std::string& dstIface)
     {
+        llvm::Function* thunk = GetOrCreateInterfaceReboxThunk(dstIface);
+        return builder->CreateCall(thunk->getFunctionType(), thunk, { fatVal }, "up_rebox");
+    }
+
+    // Get-or-create the empty `__iface_rebox.<dstIface>` thunk. One thunk per destination
+    // interface: the lowering depends only on dstIface, so every site can share it.
+    llvm::Function* GetOrCreateInterfaceReboxThunk(const std::string& dstIface)
+    {
+        // Capture the site's context now: at finalization importCompileDepth_ is 0 and the
+        // scanner's uncertainty registry no longer describes what was knowable here.
+        InterfaceReboxSite site{ sourceFileName, currentLine, currentColumn,
+                                 importCompileDepth_ > 0,
+                                 InterfaceImplementorSetIsUncertain(dstIface) };
+
+        if (auto it = deferredIfaceReboxIndex_.find(dstIface); it != deferredIfaceReboxIndex_.end())
+        {
+            deferredIfaceRebox_[it->second].Sites.push_back(std::move(site));
+            return deferredIfaceRebox_[it->second].Thunk;
+        }
+        auto* fatTy = GetFatPtrType();
+        auto* fnTy = llvm::FunctionType::get(fatTy, { fatTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                          std::string(kInterfaceReboxPrefix) + dstIface, *module);
+        fn->arg_begin()->setName("src");
+        deferredIfaceReboxIndex_[dstIface] = deferredIfaceRebox_.size();
+        deferredIfaceRebox_.push_back(DeferredInterfaceRebox{ dstIface, fn, { std::move(site) } });
+        // Backstop: a bodyless internal function fails the verifier, so a late thunk is filled
+        // in on the spot. It fires MID-BODY, so it needs the full builder bracket.
+        if (deferredIfaceReboxDrained_)
+        {
+            FullBuilderStateScope outer(this);
+            InterfaceReboxEmitScope park(this);
+            EmitInterfaceReboxBody(deferredIfaceRebox_.back());
+        }
+        return fn;
+    }
+
+    // Exception-safe bracket around SaveBuilderState/RestoreBuilderState. Needed wherever a
+    // nested emission happens MID-BODY: it also parks the enclosing function's return contract,
+    // its pending owned temps, and the suspended-function marker FunctionBodyIsComplete reads.
+    struct FullBuilderStateScope
+    {
+        LLVMBackend* backend_;
+        BuilderState state_;
+        explicit FullBuilderStateScope(LLVMBackend* backend)
+            : backend_(backend), state_(backend->SaveBuilderState()) {}
+        ~FullBuilderStateScope() { backend_->RestoreBuilderState(state_); }
+        FullBuilderStateScope(const FullBuilderStateScope&) = delete;
+        FullBuilderStateScope& operator=(const FullBuilderStateScope&) = delete;
+    };
+
+    // RAII park of the member builder state around the finalization pass. GetOrCreateVTable can
+    // LogError and LogError THROWS, so a plain save/restore pair would leave the builder pointing
+    // into a half-built thunk (the hazard ImportedFileCompileScope exists to prevent). The
+    // recorded-location fields are parked too: the diagnostic overwrites them to report.
+    struct InterfaceReboxEmitScope
+    {
+        LLVMBackend* backend_;
+        llvm::IRBuilderBase::InsertPoint ip_;
+        llvm::Function* function_;
+        llvm::DISubprogram* subprogram_;
+        llvm::DebugLoc debugLoc_;
+        std::string file_;
+        size_t line_;
+        size_t column_;
+        explicit InterfaceReboxEmitScope(LLVMBackend* backend)
+            : backend_(backend), ip_(backend->builder->saveIP()),
+              function_(backend->currentFunction), subprogram_(backend->currentSubprogram),
+              debugLoc_(backend->builder->getCurrentDebugLocation()),
+              file_(backend->sourceFileName), line_(backend->currentLine),
+              column_(backend->currentColumn)
+        {
+            // No DISubprogram covers a thunk, so any inherited debug location would name a
+            // scope from another function and fail the verifier.
+            backend_->currentSubprogram = nullptr;
+            backend_->builder->SetCurrentDebugLocation(llvm::DebugLoc());
+        }
+        ~InterfaceReboxEmitScope()
+        {
+            backend_->currentFunction = function_;
+            backend_->currentSubprogram = subprogram_;
+            backend_->builder->restoreIP(ip_);
+            backend_->builder->SetCurrentDebugLocation(debugLoc_);
+            backend_->sourceFileName = file_;
+            backend_->currentLine = line_;
+            backend_->currentColumn = column_;
+        }
+        InterfaceReboxEmitScope(const InterfaceReboxEmitScope&) = delete;
+        InterfaceReboxEmitScope& operator=(const InterfaceReboxEmitScope&) = delete;
+    };
+
+    // Re-adopt bodyless rebox thunks found in a module restored from the core bitcode cache.
+    // The cache is built from a runtime.cb-only compile that never finalizes, so a thunk it
+    // handed out would otherwise reach the verifier with no body.
+    void AdoptInterfaceReboxThunksFromModule()
+    {
+        for (llvm::Function& fn : module->functions())
+        {
+            if (!fn.empty()) continue;
+            llvm::StringRef name = fn.getName();
+            llvm::StringRef prefix(kInterfaceReboxPrefix.data(), kInterfaceReboxPrefix.size());
+            if (!name.starts_with(prefix)) continue;
+            std::string dstIface = name.substr(prefix.size()).str();
+            if (deferredIfaceReboxIndex_.count(dstIface) > 0) continue;
+            // The real site is in the core library this cache was built from, and is long gone.
+            // Record it as an import site so the diagnostic never reports an empty location.
+            InterfaceReboxSite site{ std::string(kCoreBitcodeCacheOrigin), 0, 0, true, true };
+            deferredIfaceReboxIndex_[dstIface] = deferredIfaceRebox_.size();
+            deferredIfaceRebox_.push_back(
+                DeferredInterfaceRebox{ dstIface, &fn, { std::move(site) } });
+        }
+    }
+
+    // Emit the typedesc if-chain for every rebox thunk handed out during the walk. Runs once at
+    // finalization, when every struct body, destructor, vtable and generic monomorphization
+    // exists, so the chain sees the COMPLETE implementor set regardless of declaration order.
+    void EmitDeferredInterfaceReboxBodies()
+    {
+        // Set BEFORE the early return: from here on any new thunk must be filled in eagerly.
+        deferredIfaceReboxDrained_ = true;
+        if (deferredIfaceRebox_.empty()) return;
+        // The bodies drive the member builder (CreateBasicBlock/SwitchToBlock/AllocaAtEntry all
+        // key off it), so park the walk's insert point, function and debug scope around them.
+        InterfaceReboxEmitScope park(this);
+        // Index-based and re-reading size(): a nested get-or-create may append while this runs,
+        // and draining to a fixed point is required - a bodyless internal function fails verify.
+        for (size_t i = 0; i < deferredIfaceRebox_.size(); i++)
+            EmitInterfaceReboxBody(deferredIfaceRebox_[i]);
+    }
+
+    // Body of one rebox thunk: match the source fat pointer's runtime typedesc against every
+    // implementor of the destination interface and rebuild the pair from that implementor's
+    // destination vtable. No match yields a zeroed fat pointer, like a failed `as <Interface>`.
+    // Taken BY VALUE: emitting a body can append to deferredIfaceRebox_ and reallocate it.
+    void EmitInterfaceReboxBody(DeferredInterfaceRebox site)
+    {
+        llvm::Function* fn = site.Thunk;
+        if (!fn->empty()) return;
+        const std::string& dstIface = site.DstInterface;
+
         auto fatTy = GetFatPtrType();
         auto ptrTy = builder->getInt8Ty()->getPointerTo();
 
-        llvm::Value* dataPtr  = builder->CreateExtractValue(fatVal, { 1u }, "up_data");
-        llvm::Value* vtablePtr = builder->CreateExtractValue(fatVal, { 0u }, "up_vtable");
+        currentFunction = fn;
+        SwitchToBlock(llvm::BasicBlock::Create(*context, "entry", fn));
+
+        llvm::Value* src = &*fn->arg_begin();
+        llvm::Value* dataPtr   = builder->CreateExtractValue(src, { 1u }, "up_data");
+        llvm::Value* vtablePtr = builder->CreateExtractValue(src, { 0u }, "up_vtable");
 
         auto* resultAlloca = CreateAlloca(fatTy);
         builder->CreateStore(llvm::ConstantAggregateZero::get(fatTy), resultAlloca);
@@ -10051,27 +10234,58 @@ public:
             SwitchToBlock(nextBlock);
         };
 
-        int emittedCases = 0;
+        // Snapshot the implementor names first: GetOrCreateVTable inside emitCase can register
+        // further types and invalidate an iterator over dataStructures / programTable.
+        std::vector<std::pair<std::string, llvm::GlobalVariable*>> impls;
         for (auto& [sName, sd] : dataStructures)
             if (sd.typeDescriptor && StructImplementsInterface(sName, dstIface))
-            { emitCase(sName, sd.typeDescriptor); emittedCases++; }
+                impls.emplace_back(sName, sd.typeDescriptor);
         for (auto& [pName, pd] : programTable)
             if (pd.typeDescriptor && StructImplementsInterface(pName, dstIface))
-            { emitCase(pName, pd.typeDescriptor); emittedCases++; }
-
-        // Backstop for callers that reached here without a static check: with no case to match,
-        // the result is a guaranteed null vtable that the next method call dispatches through.
-        // Only when NO implementor can exist at all - a merely not-yet-emitted one (declared later
-        // in the file, generic, or in a file this import precedes) must stay silent.
-        if (emittedCases == 0 && !InterfaceImplementorSetIsUncertain(dstIface)
-            && !AnyTypeMayProvideInterface(dstIface))
-            LogError(std::format(
-                "cannot convert to interface '{}' - no class implements it",
-                dstIface));
+                impls.emplace_back(pName, pd.typeDescriptor);
+        for (const auto& [implName, typeDesc] : impls)
+            emitCase(implName, typeDesc);
 
         builder->CreateBr(afterBlock);
         SwitchToBlock(afterBlock);
-        return builder->CreateLoad(fatTy, resultAlloca);
+        builder->CreateRet(builder->CreateLoad(fatTy, resultAlloca));
+
+        ReportInterfaceReboxHasNoImplementor(site, impls.empty());
+    }
+
+    // With no case to match, every call of the thunk returns a null vtable that the next method
+    // call dispatches through. An empty case list is NOT by itself proof of that: a generic
+    // implementor that was never monomorphized never reaches dataStructures, and a site inside
+    // an import cannot see the importing file at all. Report only when nothing is left open -
+    // a missed error is acceptable, a falsely rejected program is not.
+    void ReportInterfaceReboxHasNoImplementor(const DeferredInterfaceRebox& site, bool noCases)
+    {
+        if (!noCases) return;
+        const InterfaceReboxSite* reportAt = nullptr;
+        for (const auto& s : site.Sites)
+        {
+            // A site inside an import is never blamed: it is dead code in a library the user
+            // does not own, and the location would point into a file they cannot edit.
+            if (s.InImport) continue;
+            // A site that could not settle the implementor set - a generic implementor that was
+            // never monomorphized, an `if const` base clause - proves nothing.
+            if (s.Uncertain) return;
+            if (reportAt == nullptr) reportAt = &s;
+        }
+        // Every site was inside an import (or the thunk was adopted from the bitcode cache):
+        // stay silent, matching the importCompileDepth_ suppression this check used to have.
+        if (reportAt == nullptr) return;
+        // The scanner registry may still know a type that supplies the interface even though
+        // nothing was monomorphized from it.
+        if (AnyTypeMayProvideInterface(site.DstInterface)) return;
+
+        // Caller parks these (InterfaceReboxEmitScope); LogError has no parse context here.
+        sourceFileName = reportAt->File;
+        currentLine = reportAt->Line;
+        currentColumn = reportAt->Column;
+        LogError(std::format(
+            "cannot convert to interface '{}' - no class implements it",
+            site.DstInterface));
     }
 
     // ===== WinRT / COM produce-side codegen (see internal/plan/winmd-projection.md) =====

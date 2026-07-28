@@ -788,6 +788,9 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
             auto walker = antlr4::tree::ParseTreeWalker();
             walker.walk(myListener.get(), computeUnit);
+            // Now that every implementor is registered, emit the interface rebox if-chains.
+            // Before the destructor pass: building a vtable here can bind a new deferred dtor.
+            EmitDeferredInterfaceReboxBodies();
             // Now that every type and generic monomorphization is registered, fill in the
             // bodies of deferred delete-site destructor wrappers (recursive containers whose
             // element type was incomplete when the container dtor was emitted).
@@ -2330,6 +2333,9 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
         auto walker = antlr4::tree::ParseTreeWalker();
         walker.walk(myListener.get(), computeUnit);
+        // Now that every implementor is registered, emit the interface rebox if-chains.
+        // Before the destructor pass: building a vtable here can bind a new deferred dtor.
+        EmitDeferredInterfaceReboxBodies();
         // Now that every type and generic monomorphization is registered, fill in the
         // bodies of deferred delete-site destructor wrappers (recursive containers whose
         // element type was incomplete when the container dtor was emitted).
@@ -2413,6 +2419,10 @@ void LLVMBackend::ResetForReanalysis()
     // stale-pointer crash class as fullDestructorCache_), so discard them with the module.
     deferredFullDtor_.clear();
     deferredFullDtorOrder_.clear();
+    // Same for the deferred interface rebox thunks: Function* into the discarded module.
+    deferredIfaceRebox_.clear();
+    deferredIfaceReboxIndex_.clear();
+    deferredIfaceReboxDrained_ = false;
     // [winrt] classes and projected delegates cache module-bound objects: WinrtClassInfo holds
     // the static vtable GlobalVariable* (and its StructType*), and the delegate maps hold the
     // COM object StructType* + vtable GlobalVariable*. If these survive the reset, a file that
@@ -4507,6 +4517,12 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     scannedInterfaceImpls.clear();
     uncertainInterfaceImpls.clear();
     importCompileDepth_ = 0;   // a throw out of an import walk can leave the RAII depth stranded
+    // Every Function* here died with the old module. Re-adopt any bodyless rebox thunk baked
+    // into the cached bitcode so finalization still fills it in rather than tripping the verifier.
+    deferredIfaceRebox_.clear();
+    deferredIfaceReboxIndex_.clear();
+    deferredIfaceReboxDrained_ = false;
+    AdoptInterfaceReboxThunksFromModule();
     typeAnnotations_.clear();
     annotationRegistry.clear();
     globalNamedVariable.clear();

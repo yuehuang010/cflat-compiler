@@ -1,0 +1,21 @@
+// An interface -> interface rebox whose DESTINATION interface has no implementor at all can
+// only ever hand back a null-vtable fat value, which the next method call dispatches through.
+// Neither interface has an implementor, so the source-side impossibility check stays silent
+// (the source's concrete class is unknowable); the zero-implementor backstop inside the rebox
+// lowering is what must reject this.
+//
+// The backstop fires at FINALIZATION - the typedesc if-chain is emitted once every implementor
+// is registered, so that an implementor declared later in the file, monomorphized later, or
+// defined in the file that imports this one is not missed. By then every scope has closed, so
+// this needs the bare-semicolon file-scope form of expect_error rather than a scoped block.
+expect_error("cannot convert to interface 'INoImplB' - no class implements it");
+
+interface INoImplA { int nia(); };
+interface INoImplB { int nib(); };
+
+INoImplB convNoImpl(INoImplA x) { INoImplB y = x; return y; }
+
+extern int main()
+{
+    return 0;
+}

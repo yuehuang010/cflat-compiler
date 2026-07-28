@@ -1,0 +1,23 @@
+// Helper for test_interface.cb's testInterfaceReboxAcrossImport.
+//
+// This file is code-gen'd during ProcessImports, BEFORE the importing file is forward-ref
+// scanned, so the derived-to-parent rebox inside rbxImportedWiden can never see the importer's
+// implementing class. Lowering the typedesc if-chain at the conversion site therefore produced
+// an empty chain and a null-vtable fat pointer; the chain is emitted at finalization instead.
+// This is the shape example/ui/* is built on: the widget interfaces and the helpers that widen
+// them live in a core library, the concrete controls live in the user's file.
+
+interface IRbxImported { int rbxiArea(); };
+interface IRbxImportedChild : IRbxImported { int rbxiPoke(); };
+
+IRbxImported rbxImportedWiden(IRbxImportedChild b) { IRbxImported e = b; return e; }
+
+// A widening helper for an interface that NO program in this build implements. Dead code in an
+// imported library must not hard-fail the importer: at finalization the thunk's case list is
+// empty, but every site sharing it is inside an import - the user owns neither the file nor the
+// fix, and the diagnostic would point at a line they cannot edit. Nothing implements these two
+// on purpose; adding an implementor would defeat the test.
+interface IRbxOrphan { int rbxoArea(); };
+interface IRbxOrphanChild : IRbxOrphan { int rbxoPoke(); };
+
+IRbxOrphan rbxOrphanWiden(IRbxOrphanChild b) { IRbxOrphan e = b; return e; }

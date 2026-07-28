@@ -1,6 +1,7 @@
 import "test_helper.cb";
 import "list.cb";
 import "channel.cb";
+import "library/iface_rebox_lib.cb";
 
 // === Interfaces ===
 
@@ -1868,6 +1869,121 @@ bool testInterfaceMethodOwnershipContract()
     return result;
 }
 
+// A derived-to-parent upcast used to lower its typedesc if-chain AT the conversion site, so it
+// only tested implementors registered so far. Every helper below is defined ABOVE the class it
+// must dispatch to; the chain is emitted at finalization now, so declaration order is irrelevant.
+interface IRbxElement { int rbxArea(); };
+interface IRbxButton : IRbxElement { int rbxPoke(); };
+
+// Helper #1 sits above EVERY implementor of IRbxButton - the chain would have been empty.
+IRbxElement rbxWidenEarly(IRbxButton b) { IRbxElement e = b; return e; }
+
+class RbxEarly : IRbxButton
+{
+    int r = 2;
+    RbxEarly() {}
+    int rbxArea() { return r * r; }
+    int rbxPoke() { return 1; }
+};
+
+// Helper #2 sits BETWEEN two implementors - the chain would have held only RbxEarly.
+IRbxElement rbxWidenMiddle(IRbxButton b) { IRbxElement e = b; return e; }
+
+class RbxLate : IRbxButton
+{
+    int r = 4;
+    RbxLate() {}
+    int rbxArea() { return r * r; }
+    int rbxPoke() { return 7; }
+};
+
+// A generic implementor does not exist at all until its instantiation site is reached.
+class RbxBox<T> : IRbxButton
+{
+    T v = default;
+    RbxBox(T x) { v = x; }
+    int rbxArea() { return (int)v * 3; }
+    int rbxPoke() { return 9; }
+};
+
+bool testInterfaceReboxDeclarationOrder()
+{
+    bool result = true;
+
+    IRbxButton early = new RbxEarly();
+    IRbxButton late  = new RbxLate();
+
+    result &= Test("rebox_early_helper_early_impl", rbxWidenEarly(early).rbxArea(), 4);
+    result &= Test("rebox_early_helper_late_impl",  rbxWidenEarly(late).rbxArea(), 16);
+    result &= Test("rebox_mid_helper_early_impl",   rbxWidenMiddle(early).rbxArea(), 4);
+    result &= Test("rebox_mid_helper_late_impl",    rbxWidenMiddle(late).rbxArea(), 16);
+
+    IRbxButton boxed = new RbxBox<int>(7);
+    result &= Test("rebox_generic_impl_early_helper", rbxWidenEarly(boxed).rbxArea(), 21);
+    result &= Test("rebox_generic_impl_mid_helper",   rbxWidenMiddle(boxed).rbxArea(), 21);
+
+    // A null (failed-cast) source must still rebox to a null fat value, not match a case.
+    IRbxButton none = default;
+    result &= Test("rebox_null_source_stays_null", rbxWidenEarly(none) == nullptr, true);
+
+    delete early;
+    delete late;
+    delete boxed;
+    return result;
+}
+
+// The rebox site is in the IMPORTED iface_rebox_lib.cb, code-gen'd before this file is even
+// scanned; the only implementor of its interface is right here, in the importing file.
+class RbxImportedCtl : IRbxImportedChild
+{
+    int r = 5;
+    RbxImportedCtl() {}
+    int rbxiArea() { return r * r; }
+    int rbxiPoke() { return 3; }
+};
+
+bool testInterfaceReboxAcrossImport()
+{
+    bool result = true;
+
+    IRbxImportedChild ctl = new RbxImportedCtl();
+    result &= Test("rebox_across_import_area", rbxImportedWiden(ctl).rbxiArea(), 25);
+
+    IRbxImportedChild none = default;
+    result &= Test("rebox_across_import_null", rbxImportedWiden(none) == nullptr, true);
+
+    delete ctl;
+    return result;
+}
+
+// A generic class only enters the type registry once it is MONOMORPHIZED. This one never is,
+// so at finalization the destination interface has no registered implementor and the thunk's
+// case list is empty - yet the program is legal. The zero-implementor backstop must stay silent
+// here (the scanner marks an interface a generic class names as unprovable) rather than reject
+// it; a false rejection is a source-compatibility break.
+interface IRbxUninstBase { int rbxuArea(); };
+interface IRbxUninstChild : IRbxUninstBase { int rbxuPoke(); };
+
+class RbxNeverInstantiated<T> : IRbxUninstBase
+{
+    T v = default;
+    RbxNeverInstantiated() {}
+    int rbxuArea() { return 1; }
+};
+
+IRbxUninstBase rbxUninstWiden(IRbxUninstChild c) { IRbxUninstBase e = c; return e; }
+
+bool testInterfaceReboxUninstantiatedGeneric()
+{
+    bool result = true;
+
+    // Compiling this file at all is the regression: the rebox below has no case to emit.
+    IRbxUninstChild none = default;
+    result &= Test("rebox_uninstantiated_generic_null", rbxUninstWiden(none) == nullptr, true);
+
+    return result;
+}
+
 // An interface-typed FIXED ARRAY held as a struct FIELD used to lower to a SINGLE fat pointer
 // instead of [N x {ptr,ptr}]: sizeof reported one element for any N while indexing used the
 // correct 16-byte stride, so writes past v[0] silently clobbered the following fields.
@@ -1974,6 +2090,9 @@ extern int main()
     total++; passed += testInterfaceArgPaths()                ? 1 : 0;
     total++; passed += testInterfaceMethodOwnershipContract()  ? 1 : 0;
     total++; passed += testInterfaceArrayField()               ? 1 : 0;
+    total++; passed += testInterfaceReboxDeclarationOrder()    ? 1 : 0;
+    total++; passed += testInterfaceReboxAcrossImport()        ? 1 : 0;
+    total++; passed += testInterfaceReboxUninstantiatedGeneric() ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;
