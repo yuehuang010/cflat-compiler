@@ -10,6 +10,37 @@ expect_error("interface 'IDupIface' is already defined at")
     interface IDupIface { i64 b(); };
 }
 
+// The def-site key used to be a bare basename ("file(line,col)" from GetSourceFileName()), so
+// two files sharing a basename could collide invisibly whenever their definitions also landed
+// on the same line and column. iface_defsite_helper/err_duplicate_interface_name.cb below
+// shares THIS file's basename on purpose and is padded so its "interface IFooDefsite" lands on
+// the exact same line/col as the one in the block below - reproducing the pre-fix hole (old key
+// would compare equal: same basename, same line, same col, stayed silent). The fixed key uses
+// the canonical full path, so the two files now compare unequal and the guard fires here, during
+// this file's own body walk (not an import-time abort, so it coexists with the IDupIface case
+// above).
+//
+// The expect_error text below pins the helper's exact reported basename+(line,col) tail:
+// "err_duplicate_interface_name.cb(41,4)". On the FIXED compiler the guard fires regardless of
+// whether the two files' line/col still coincide - full path identity does not care - so this
+// pinned tail is not load-bearing for pass/fail today. It exists as a tripwire: if the padding
+// below (or the helper's own padding, see that file's line 41) ever drifts apart, this
+// exact-location match breaks and the test fails LOUDLY (mismatched expect_error text) instead
+// of quietly stopping to exercise the historical same-line/col coincidence that made this
+// regression reproducible pre-fix. THIS LINE MUST STAY AT LINE 41, COLUMN 4 (four-space indent)
+// to keep matching the helper file's line 41. The pin deliberately starts AFTER the directory
+// portion (Test/library/iface_defsite_helper/), not at "already defined at": expect_error does
+// a plain substring find(), and ShortenDefSiteForDisplay renders that directory with NATIVE path
+// separators (forward slash here, backslash on Windows) - a substring spanning "at" through the
+// directory into the basename would never match on one platform or the other. Anchoring on the
+// basename+(line,col)+trailing-clause tail alone stays a true substring on both.
+import "iface_defsite_helper/err_duplicate_interface_name.cb";
+
+expect_error("err_duplicate_interface_name.cb(41,4) - an interface name must be unique within its namespace")
+{
+    interface IFooDefsite { i64 b(); };
+}
+
 extern int main()
 {
     return 0;

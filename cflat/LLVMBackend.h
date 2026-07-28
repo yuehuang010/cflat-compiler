@@ -8931,6 +8931,46 @@ public:
             || IsWinrtFullName(name);
     }
 
+    // interfaceDefSites stores "canonicalPath(line,col)" - the full path is needed for identity
+    // (two co-imported files sharing a basename must not compare equal), but an absolute,
+    // machine-specific path is poor diagnostic output. A core def-site sits at a fixed offset
+    // under the install (runtimeDir/core), so show it install-relative ("core/x.cb") - that is
+    // stable across working directories, unlike cwd-relative which chains ".." from a deeply
+    // nested cwd. A non-core (user) site is shown relative to the cwd when that stays inside the
+    // tree; anything that would leak an absolute path or a cwd-dependent ".." chain (cross-drive
+    // on Windows, or a canonicalize failure) falls back to the bare basename instead.
+    std::string ShortenDefSiteForDisplay(const std::string& site, bool isCore) const
+    {
+        auto openParen = site.rfind('(');
+        if (openParen == std::string::npos) return site;
+        std::filesystem::path p(site.substr(0, openParen));
+        std::string suffix = site.substr(openParen);
+        // path::native() is a wstring on Windows; compare on the portable .string() form instead.
+        auto startsWithDotDot = [](const std::filesystem::path& rel)
+        {
+            std::string s = rel.string();
+            return s.rfind("..", 0) == 0;
+        };
+
+        if (isCore && !runtimeDir.empty())
+        {
+            std::error_code ec;
+            auto coreDir = std::filesystem::weakly_canonical(std::filesystem::path(runtimeDir) / "core", ec);
+            if (!ec)
+            {
+                auto rel = p.lexically_relative(coreDir);
+                if (!rel.empty() && !startsWithDotDot(rel))
+                    return (std::filesystem::path("core") / rel).string() + suffix;
+            }
+        }
+
+        std::error_code ec;
+        auto rel = std::filesystem::relative(p, ec);
+        if (!ec && !rel.empty() && !startsWithDotDot(rel))
+            return rel.string() + suffix;
+        return p.filename().string() + suffix;
+    }
+
     void CreateInterfaceDefinition(const std::string& name, const std::vector<std::string>& parentNames,
                                    std::vector<InterfaceMethod> methods, std::vector<TypeAndValue> fields = {},
                                    const std::string& definitionSite = {})
@@ -8942,15 +8982,17 @@ public:
             auto siteIt = interfaceDefSites.find(name);
             if (siteIt != interfaceDefSites.end() && siteIt->second != definitionSite)
             {
-                if (coreInterfaceDefs_.count(name))
+                bool siteIsCore = coreInterfaceDefs_.count(name) != 0;
+                std::string displaySite = ShortenDefSiteForDisplay(siteIt->second, siteIsCore);
+                if (siteIsCore)
                     LogError(std::format(
                         "interface '{}' collides with the core library interface of the same name "
                         "defined at {} - declare it inside a namespace, or rename it (an interface "
-                        "name must be unique within its namespace)", name, siteIt->second));
+                        "name must be unique within its namespace)", name, displaySite));
                 else
                     LogError(std::format(
                         "interface '{}' is already defined at {} - an interface name must be unique "
-                        "within its namespace", name, siteIt->second));
+                        "within its namespace", name, displaySite));
                 return;
             }
         }

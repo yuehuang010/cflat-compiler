@@ -496,12 +496,20 @@ inline void AppendInterfaceNameCandidates(LLVMBackend* compiler, const std::stri
     }
 }
 
-// "file(line,col)" of a definition, used to tell a genuine redefinition apart from the same
-// definition being registered twice (forward scan then codegen walk, or a re-imported file).
+// "path(line,col)" of a definition, used both as the IDENTITY key that tells a genuine
+// redefinition apart from the same definition being registered twice (forward scan then codegen
+// walk, or a re-imported file reached via a different path spelling) and, reformatted for
+// display, as the location named in the "already defined at" diagnostic. The path here is the
+// canonical full path (GetSourceFilePath()), not the basename: two co-imported files sharing a
+// basename (e.g. "da/common.cb" and "db/common.cb") must compare unequal, while the SAME file
+// reached via two spellings (relative vs absolute, a different -i dir, ../) must compare equal -
+// import resolution already canonicalizes every import target before this runs, so one file has
+// exactly one canonical path regardless of spelling. See ShortenDefSiteForDisplay() for the
+// user-facing form.
 inline std::string DefinitionSiteText(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx)
 {
     if (compiler == nullptr || ctx == nullptr || ctx->getStart() == nullptr) return {};
-    return std::format("{}({},{})", compiler->GetSourceFileName(),
+    return std::format("{}({},{})", compiler->GetSourceFilePath(),
                        (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine());
 }
 

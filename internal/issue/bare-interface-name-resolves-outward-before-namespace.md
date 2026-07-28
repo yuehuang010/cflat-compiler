@@ -82,7 +82,7 @@ Try the enclosing-namespace-qualified candidate BEFORE the bare file-scope candi
 resolving an interface name from inside a namespace, so the innermost declaration wins.
 Order matters more than the candidate set; the candidates are already computed.
 
-Watch for the hazard recorded in finding 3 of `iface-namespace-follow-ups.md`: a surplus
+Watch for the hazard recorded in finding 2 of `iface-namespace-follow-ups.md`: a surplus
 enclosing-namespace candidate can SET `sawSourceImplementor` in
 `InterfaceConversionIsProvablyImpossible` (`cflat/LLVMBackend.h:10069-10080`), so a
 reordering here can CREATE an impossibility proof, not merely weaken one.

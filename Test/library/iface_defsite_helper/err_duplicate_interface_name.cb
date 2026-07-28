@@ -1,0 +1,41 @@
+// Helper for the basename-collision regression in
+// Test/errors/err_duplicate_interface_name.cb. This file deliberately shares that
+// file's basename (both named err_duplicate_interface_name.cb - this one nested under
+// Test/library/iface_defsite_helper) and its interface definition below is padded so
+// it lands on the EXACT same line and column as the second 'interface IFooDefsite' in
+// that test file's body, reproducing the pre-fix hole: the old def-site key was
+// 'basename(line,col)' only, so two different files at the same basename+line+col
+// compared equal and the guard stayed silent. The fixed key uses the full canonical
+// path, so these two files now compare unequal and the guard fires correctly.
+//
+// Not run directly: Test/library is an import dir, not a test source, and
+// test.sh/test.bat only pick up Test/test_*.cb and Test/errors/err_*.cb by wildcard -
+// files nested under Test/library are never treated as tests.
+//
+// TRIPWIRE: Test/errors/err_duplicate_interface_name.cb pins this file's reported
+// basename+(line,col) tail, "err_duplicate_interface_name.cb(41,4)", in its expect_error
+// text - deliberately NOT the directory prefix, since ShortenDefSiteForDisplay renders
+// that with native path separators (forward slash here, backslash on Windows) and a
+// hardcoded directory would fail to match on one platform. That pin is not load-bearing
+// for pass/fail on the fixed compiler (full-path identity fires regardless of line/col),
+// but it fails LOUDLY if this definition ever moves off line 41 column 4, which is the
+// only defense this coincidence has against silently rotting. If you must edit the
+// padding below, update the (41,4) references in both files together.
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+    interface IFooDefsite { int a(); };

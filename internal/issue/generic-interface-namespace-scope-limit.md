@@ -41,7 +41,7 @@ non-generic one: qualify the `genericInterfaceTemplates` / `TypeParams` / `PackI
 keys, `MaterializeGenericInterface`, and `MangledGenericName`. **`MangledGenericName` is
 the hard part** - it currently produces `IBox__int`, and a dotted namespace in the mangled
 symbol needs a decision (`ga.IBox__int` is already emitted as a lookup key today and
-fails; see finding 5 of [[iface-namespace-follow-ups]]).
+fails; see finding 4 of [[iface-namespace-follow-ups]]).
 
 Per CLAUDE.md's load-bearing `--init` rule, any key change here MUST be applied to the
 cache round-trip in `LLVMBackend.cpp` in the same change, or it is silently dropped on a

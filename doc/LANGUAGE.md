@@ -896,9 +896,13 @@ interface IHashable { int myhash(); };   // error: collides with core/interfaces
 
 ```
 interface 'IHashable' collides with the core library interface of the same name defined
-at interfaces.cb(96,0) - declare it inside a namespace, or rename it (an interface name
-must be unique within its namespace)
+at core/interfaces.cb(96,0) - declare it inside a namespace, or rename it (an interface
+name must be unique within its namespace)
 ```
+
+The core definition site is always shown relative to the compiler install
+(`core/interfaces.cb`), not the current working directory, so this text is stable no
+matter where the compile is run from.
 
 Fix it by declaring the interface inside a namespace (see [Namespaces &
 Modules](#namespaces--modules)) so it no longer shares file scope with the core name, or
