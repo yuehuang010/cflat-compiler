@@ -36,6 +36,14 @@ conversion and "no class implements it" is literally true. The cost is that a
 program which is correct on Windows fails to compile on macOS because of a
 conversion that is dead there.
 
+## A serious attempt at this was SHELVED - read it first
+
+An eight-round attempt to keep the rejection but NAME the guarding `if const` in the
+message was shelved on 2026-07-27 after nine distinct defects. The design invariant
+survived a hostile independent review; the defect rate simply did not converge. The
+branch, a ~60-file repro corpus, the nine defects and five open handoff items are all
+recorded in `iface-ifconst-blame-attempt-shelved.md`. Do not restart this from scratch.
+
 ## Fix direction
 
 Decide the intended semantics before writing code:
