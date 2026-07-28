@@ -1,0 +1,36 @@
+// The only implementor sits in a chained `else if const` whose own condition IS satisfied on this
+// host. It is dead only because an EARLIER arm of the chain was taken, so that earlier arm is what
+// must carry the "not taken in this build" claim; '__ARM64__ || __X64__' holds here and may only be
+// stated as position. Naming it as the reason would tell the user a satisfied guard is dead.
+//
+// `if const (X) {...} else if const (Y) {...}` is the idiomatic platform-dispatch shape, so the
+// chained node has to contribute a chain level of its own - see err_iface_rebox_ifconst_else_if_chain.
+//
+// Like the other rebox tests, the check fires at FINALIZATION, so this needs the bare-semicolon
+// file-scope form of expect_error.
+expect_error("the only class implementing it, 'ElseIfOnly', is declared inside the else path of an 'if const (__MACOS__ || __WINDOWS__ || __LINUX__)' that is not taken in this build, further nested inside an 'if const (__ARM64__ || __X64__)' branch");
+
+interface IElseIf { int eif(); };
+interface IElseIfChild : IElseIf { int eifc(); };
+
+if const (__MACOS__ || __WINDOWS__ || __LINUX__)
+{
+    int elseIfLive = 1;
+}
+else if const (__ARM64__ || __X64__)
+{
+    class ElseIfOnly : IElseIfChild
+    {
+        int v = 0;
+        ElseIfOnly() {}
+        int eif() { return v; }
+        int eifc() { return v; }
+    };
+}
+
+IElseIf widenElseIf(IElseIfChild c) { IElseIf e = c; return e; }
+
+extern int main()
+{
+    return 0;
+}

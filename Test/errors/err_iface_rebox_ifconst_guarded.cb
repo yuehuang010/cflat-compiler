@@ -1,0 +1,33 @@
+// A destination interface whose ONLY implementor sits inside an `if const` arm this build did
+// not take is still rejected - on this platform the class does not exist, so the conversion can
+// only ever hand back a null-vtable fat value. What must differ is the wording: the plain
+// "no class implements it" text sends the user hunting for a missing class, when the class is
+// right there behind a platform guard.
+//
+// Like err_iface_rebox_no_implementor.cb, the check fires at FINALIZATION, after every scope has
+// closed, so this needs the bare-semicolon file-scope form of expect_error. The guard is a
+// combination no host can satisfy, so the arm is not taken on any platform this suite runs on.
+expect_error("the only class implementing it, 'GuardedOnly', is declared inside an 'if const (__WINDOWS__ && __MACOS__)' branch that is not taken in this build");
+
+interface IGuarded { int ig(); };
+interface IGuardedChild : IGuarded { int igc(); };
+
+// Base clause names IGuardedChild, not IGuarded: the uncertainty marking covers IGuardedChild
+// only (it is never propagated up the inheritance chain), so IGuarded reaches the check.
+if const (__WINDOWS__ && __MACOS__)
+{
+    class GuardedOnly : IGuardedChild
+    {
+        int v = 0;
+        GuardedOnly() {}
+        int ig() { return v; }
+        int igc() { return v; }
+    };
+}
+
+IGuarded widenGuarded(IGuardedChild c) { IGuarded e = c; return e; }
+
+extern int main()
+{
+    return 0;
+}

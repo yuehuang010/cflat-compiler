@@ -2495,6 +2495,7 @@ void LLVMBackend::ResetForReanalysis()
     coreInterfaceDefs_.clear();
     scannedInterfaceImpls.clear();
     uncertainInterfaceImpls.clear();
+    ifConstGuardedImpls_.clear();
     analyzedRootPath_.clear();
     importCompileDepth_ = 0;   // a throw out of an import walk can leave the RAII depth stranded
     typeAnnotations_.clear();
@@ -4910,6 +4911,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     coreInterfaceDefs_.clear();
     scannedInterfaceImpls.clear();
     uncertainInterfaceImpls.clear();
+    ifConstGuardedImpls_.clear();
     importCompileDepth_ = 0;   // a throw out of an import walk can leave the RAII depth stranded
     // Every Function* here died with the old module. Re-adopt any bodyless rebox thunk baked
     // into the cached bitcode so finalization still fills it in rather than tripping the verifier.

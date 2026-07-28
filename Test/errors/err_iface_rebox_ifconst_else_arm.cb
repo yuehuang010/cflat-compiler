@@ -1,0 +1,33 @@
+// A plain `else` arm is a CHILD of the same `if const` node as the then arm, so a naive walk
+// attributes its classes to the `if` condition - exactly backwards. The guard below is true on
+// every host, so it is the ELSE arm that is dead, and the message must say so rather than
+// blaming the (satisfied) 'if const (...)' condition.
+//
+// Like the other rebox tests, the check fires at FINALIZATION, so this needs the bare-semicolon
+// file-scope form of expect_error.
+expect_error("declared inside the else arm of an 'if const (__WINDOWS__ || __LINUX__ || __MACOS__)' that is not taken in this build");
+
+interface IElseArm { int iea(); };
+interface IElseArmChild : IElseArm { int ieac(); };
+
+if const (__WINDOWS__ || __LINUX__ || __MACOS__)
+{
+    int elseArmDummy = 0;
+}
+else
+{
+    class ElseOnly : IElseArmChild
+    {
+        int v = 0;
+        ElseOnly() {}
+        int iea() { return v; }
+        int ieac() { return v; }
+    };
+}
+
+IElseArm widenElse(IElseArmChild c) { IElseArm e = c; return e; }
+
+extern int main()
+{
+    return 0;
+}

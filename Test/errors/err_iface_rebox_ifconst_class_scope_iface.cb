@@ -1,0 +1,38 @@
+// Blame candidates must come from the NAMESPACE-only scope, never from class-name prefixes.
+// Struct and namespace nesting share one dotted key space, so 'N.Outer.IFoo' below is a real
+// registered interface while 'N.Outer' is a CLASS - but the resolver never walks class-name
+// prefixes, so 'Impl : IFoo' inside the class could never have registered against it. A blame
+// list built from the full accumulated scope resolved 'IFoo' -> 'N.Outer.IFoo' and fabricated
+// "'N.Outer.Impl' ... implementing 'IRoot'"; with the arm taken, the same file fails with
+// "unknown interface: 'IFoo'", proving Impl implements nothing. Plain wording is correct.
+//
+// Non-vacuity: discriminates against an intermediate branch build (scope-passing defect found
+// in review), not against master. The check fires at FINALIZATION - bare file-scope form.
+expect_error("cannot convert to interface 'IRoot' - no class implements it");
+
+interface IRoot { int root(); };
+namespace N.Outer { interface IFoo : IRoot { int f(); }; }
+
+namespace N
+{
+    class Outer
+    {
+        int x = 0;
+        Outer() {}
+        if const (__WINDOWS__ && __MACOS__)
+        {
+            class Impl : IFoo
+            {
+                int v = 0;
+                Impl() {}
+                int root() { return 0; }
+                int f() { return v; }
+            };
+        }
+    };
+}
+
+interface IChild : IRoot { int c(); };
+IRoot widen(IChild c) { IRoot e = c; return e; }
+
+extern int main() { return 0; }

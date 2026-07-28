@@ -1,0 +1,36 @@
+// Nested `if const`: the guard chain must be COMPOSED, not overwritten by the innermost arm.
+// Here the outer guard is unsatisfiable on every host and the inner guard is true on every host,
+// so naming only the innermost arm would tell the user that a satisfied guard is "not taken" and
+// send them grepping for the wrong thing. The outermost dead arm is what carries the claim; the
+// inner arms are stated as position only, never as a second takenness claim.
+//
+// MainListener peels one chain level per arm it takes, so an outer arm that IS taken drops out and
+// the claim always lands on an arm nobody was shown to take (see err_iface_rebox_ifconst_taken_arm).
+//
+// Like the other rebox tests, the check fires at FINALIZATION, so this needs the bare-semicolon
+// file-scope form of expect_error.
+expect_error("declared inside an 'if const (__WINDOWS__ && __MACOS__)' branch that is not taken in this build, further nested inside an 'if const (__WINDOWS__ || __LINUX__ || __MACOS__)' branch");
+
+interface INested { int ins(); };
+interface INestedChild : INested { int insc(); };
+
+if const (__WINDOWS__ && __MACOS__)
+{
+    if const (__WINDOWS__ || __LINUX__ || __MACOS__)
+    {
+        class NestedOnly : INestedChild
+        {
+            int v = 0;
+            NestedOnly() {}
+            int ins() { return v; }
+            int insc() { return v; }
+        };
+    }
+}
+
+INested widenNested(INestedChild c) { INested e = c; return e; }
+
+extern int main()
+{
+    return 0;
+}

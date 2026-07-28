@@ -61,8 +61,8 @@ REVERTED - see its file for the three discriminators that cannot work.
 stale by 22 tests). Six P1s fixed on 2026-07-31 (`99d73f3`, `696060d`, `8c29ca7`, `d65f000`, `4000fa1`,
 `4097959`) and two more on 2026-08-01 (`funcptr-call-result-into-closure-param-garbage`,
 `unique-field-to-field-copy-double-frees`); the design records are at the bottom. **P1 is being
-cleared before P2 starts** - that includes `iface-ifconst-base-clause-implementor`, so the
-parked `fix/iface-ifconst` branch stays parked.
+cleared before P2 starts.** (`iface-ifconst-base-clause-implementor` has since LANDED via the
+revived `fix/iface-ifconst` branch - see its landed record at the bottom.)
 
 > Deliberately no commit hash here. Every previous revision of this line named a `master` that
 > was stale within the day (it has read `4097959` and `3b6e3e8` in turn, each wrong by the time
@@ -126,12 +126,9 @@ record at the bottom. Still open unchanged:
 They are one defect family - argument and return lowering for callable values - and a future pass
 should scope them together rather than one at a time.
 
-**`fix/iface-ifconst` is rebased and parked** at `2dc0b51` (was 24 commits stale; rebased with
-two trivial conflicts, all five hook points untouched by master). Nothing from it has landed. It
-was shelved for DEFECT RATE - 9 defects over 8 review rounds - not staleness, and master's plain
-`no class implements it` is unhelpful but never wrong, which is the safe side. Its `scratch/`
-corpus (97 files) is where a revival starts. The rebase moved it to base `64b6118`, so it needs
-another rebase onto `696060d` before any future merge.
+**`fix/iface-ifconst` has LANDED** (2026-08-04). The shelved attempt was revived, its one
+outstanding defect (the blame fallback fabrication, defect 9) fixed by the known fix on record,
+and the branch rebased onto master and merged. See the landed design record at the bottom.
 
 ---
 
@@ -177,9 +174,8 @@ Other live state:
   marshaling change; applying it conflicted only because those files were later moved and
   rewritten. Its commit was `d2db363`, recoverable with `git stash apply d2db363` until gc prunes
   it - but nothing unique remains in it.
-- **`fix/iface-ifconst` is SHELVED, not pending.** Branch `23418c2`, worktree
-  `../cflat-fix-iface-ifconst`, with its ~60-file repro corpus in `scratch/` - the most valuable
-  artifact of that attempt. Read [[iface-ifconst-blame-attempt-shelved]] before touching it.
+- **`fix/iface-ifconst` LANDED on 2026-08-04** after the shelved attempt's defect 9 was fixed;
+  the design record at the bottom carries what the shelving doc used to hold.
 - The `as` / `is` family is **DONE**: routing (2 issues), boxing guards (2 issues) and the
   return dangle are all closed. What remains under `as` is diagnostic quality.
 - The "may a user file-scope interface share a name with a core interface" product question is
@@ -310,7 +306,6 @@ than left implicit when that fix was scoped to argument binding. It also added
 | [[sizeof-of-generic-instantiation]] | false reject | `sizeof(B<int>)` -> `unknown type`. The operand skips the generic mangling/queue path. Check `alignof` and cast operands too. |
 | [[function-type-as-generic-interface-type-argument]] | false reject | `C<function<int(int)>>` fails on both binaries. Clean failure. |
 | [[bare-interface-name-resolves-outward-before-namespace]] | false reject | Outer scope wins for non-generic interface names, opposite to the ratified generic rule. |
-| [[iface-ifconst-base-clause-implementor]] | false reject | Implementor inside a non-taken `if const` -> "no class implements it". |
 | [[macos-header-import-and-framework-link]] | false reject | Two gaps block first-class Apple-API binding: header import hard-codes a Linux triple on Darwin (`objc/runtime.h` registers 1 of ~80 functions), and there is no `-framework` / `-F` link channel. The macOS demos work around both with dlopen + typed `objc_msgSend` casts. |
 | [[unique-assign-syntactic-owned-rhs-leaks]] | ownership | Owning value laundered through a BORROW-returning call still leaks. |
 | [[alias-borrow-local-launder-gaps]] | ownership | An `IsAliasBorrow` owning-struct local launders its borrow through `=` and through `move`. |
@@ -356,7 +351,6 @@ than left implicit when that fix was scoped to argument binding. It also added
 | [[insert-block-liveness-not-audited-repo-wide]] | latent | `GetInsertBlock() != nullptr` is used repo-wide as a liveness test and is not one - nothing clears the insert point at end-of-function, so at declaration scope it points at the PREVIOUS function's terminated last block. `if const` was one instance (fixed, `fix/ifconst-ir`). SMALLER than it sounds: of 49 `GetInsertBlock()` uses in `LLVMBackend.h` only 3 are null-compares and only ONE (`12488`) is on the shared builder - and that one is unreachable by construction, since the only declaration-scope route needs a non-constant global initializer, which is rejected earlier. Read the fix-direction section before reaching for the one-line "just clear it" fix. |
 | [[nondeterministic-ir-switch-case-order]] | methodology | No miscompile - a METHODOLOGY hazard. Read it before using "0 IR diffs" as proof. |
 | [[iface-namespace-follow-ups]] | follow-up | Items 2-6 of the round-1 review of `c9acb6c`. Item 1 is RESOLVED (`853cb87`); items 4 and 5 were fixed by `15809e0`. Item 5's remainder (annotation/template key split) is reachable only on the Windows `[uuid]` / `[winrt]` path. |
-| [[iface-ifconst-blame-attempt-shelved]] | shelved | READ BEFORE attempting the `if const` blame diagnostic again. A serious attempt shelved after eight review rounds / nine defects. |
 | [[global-struct-no-initializer-ignores-field-defaults]] | miscompile | A global struct with NO initializer at all zeroes instead of honoring its fields' own `= default` expressions (`struct S { int a = 9; }; S gs;` reads `0`, not `9`). The LOCAL declarator handles this correctly (calls the default constructor). Lower severity than the sibling P1/P2 findings in this family because a working spelling exists. Found while reviewing the fix for `global-struct-positional-init-silently-zeroes` (FIXED and deleted - see the `fix/global-positional` landed record below). Filed 2026-08-02. |
 
 ### UI and Win32 (`ui/`)
@@ -2844,3 +2838,61 @@ change): with `CFLAT_CACHE_DIR` equalized all seven agree.
 
 Bar: macOS arm64 Release `./test.sh` 576 passed / 0 failed / 8 skipped, `example_mac.sh`
 35 passed / 0 failed.
+
+## Landed: `fix/iface-ifconst` (2026-08-04) - name the guarding `if const` in the zero-implementor rebox error
+
+Closes `iface-ifconst-base-clause-implementor` (P2) and retires the shelved-attempt record
+`iface-ifconst-blame-attempt-shelved` (P3), whose essentials are preserved here. The 2026-07-27
+attempt (8 review rounds, 9 defects) was revived, its one outstanding defect fixed, and merged.
+
+**Semantics decision (ratified by landing):** a conversion to an interface whose only
+implementors sit inside non-taken `if const` arms stays a HARD ERROR - the class genuinely does
+not exist in this build - but the message now names the class and the guarding arm chain:
+`the only class implementing it, 'X', is declared inside an 'if const (COND)' branch that is not
+taken in this build`. Making the conversion legal (uncertainty) was considered and rejected: it
+turns a compile error into a null-vtable segfault.
+
+**Design (survived a hostile independent audit - do not re-derive):** at scan time every class
+inside an `if const` subtree is recorded with the CHAIN of levels it sits under, outermost first.
+As MainListener decides each arm it RETRACTS (arm taken - class live), PEELS one level (a nested
+`if const` gets its own decision), or FORGETS outright (subtree walk abandoned by a fired
+`expect_error` - a peel would leave a front level the walk never reached). Invariant: the front
+of a surviving chain is an arm nobody was shown to take, so naming it is truthful. The registry
+(`ifConstGuardedImpls_`) is diagnostic-only, never gates acceptance, and is never serialized
+(warm-cache diagnostics are byte-identical, so the `--init` serializer rule does not bite).
+
+**Decisions that must NOT be retried:**
+- Do NOT propagate uncertainty up the interface inheritance chain - tried and reverted; one
+  unrelated generic disables the impossible-conversion guard for a whole ancestor chain.
+- Blame is SUPPRESSED (never uncertainty) for classes under a generic TEMPLATE body - members
+  reconcile zero or N times and the peel is not idempotent.
+- The last-component fallback of a qualified base spelling feeds SUPPRESSION only, never blame.
+  This was the shelving defect (round 9): with the qualified spelling unregistered (its namespace
+  declared only inside the untaken arm), blame resolved through the fallback and fabricated an
+  implements-claim against an unrelated same-named file-scope interface. Regression:
+  `err_iface_rebox_ifconst_unregistered_ns_iface.cb` (unregistered cell) alongside
+  `err_iface_rebox_ifconst_unrelated_iface.cb` (registered cell). Rule of thumb, twice-proven:
+  over-broad candidate sets are SAFE for suppression and FABRICATE CLAIMS for blame.
+- The reachability argument to check any future change against: blame escapes suppression via a
+  PARENT of a surplus candidate, because `FindIfConstGuardedImplementor` matches through
+  `InterfaceInheritsFrom` while uncertainty deliberately does not propagate up.
+
+**Product decision (q5 shape):** when an unqualified base spelling inside an arm resolves to a
+GLOBAL interface, blame follows the resolver even though, were the arm live, the class would fail
+`does not implement` checks. The resolver and the diagnostic agree, which is the most truth
+available at scan time. Accepted as-is.
+
+**Known minor residue (accepted):** the candidate list a blame resolves through is
+alias-resolved twice (`ResolveInterfaceName` at record, `ResolveTypeAlias` at resolve) - benign
+in plain CFlat, untested against `import package "*.h"` / WinMD where a second alias hop is
+plausible; condition text truncation (120 bytes) can land mid-identifier. Class-site candidates
+are built from the accumulated NAMESPACE-only scope (namespaces opened inside the arm included,
+class names excluded): the resolver never walks class-name prefixes, so a class-rung candidate is
+a name the class could never have registered against, and feeding it to blame fabricates a claim
+(struct and namespace nesting share one dotted key space, so such a name CAN be a registered
+interface). Regression: `err_iface_rebox_ifconst_class_scope_iface.cb`.
+
+Verified: batch `--check` (multi-file, both orders) shows no stale-registry leakage across
+`ResetForReanalysis`. Bar: macOS arm64 Release `./test.sh` 596 passed / 0 failed / 8 skipped,
+`example_mac.sh` 35 passed / 0 failed. Review: two opus rounds; round 1 found the class-rung
+scope defect (fixed as above), round 2 clean.

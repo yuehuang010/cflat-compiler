@@ -1,0 +1,30 @@
+// The `if const` wording must NOT be used when the arm is actually taken. The scanner cannot
+// resolve an `if const` (the taken branch is a MainListener fact), so it records classes from
+// EVERY arm; MainListener retracts the entries for the arm it takes. Without that retraction this
+// file would be told the class is "not taken in this build" when the arm is plainly live - the
+// real cause here is that a generic class was never monomorphized, so nothing reached the
+// implementor registry. Vague-but-true beats specific-and-false, so the plain text is expected.
+//
+// The guard is true on every host, so the arm is taken everywhere this suite runs.
+expect_error("cannot convert to interface 'ITakenArm' - no class implements it");
+
+interface ITakenArm { int ita(); };
+interface ITakenArmChild : ITakenArm { int itac(); };
+
+if const (__WINDOWS__ || __LINUX__ || __MACOS__)
+{
+    class TakenGen<T> : ITakenArmChild
+    {
+        T v;
+        TakenGen() {}
+        int ita() { return 0; }
+        int itac() { return 0; }
+    };
+}
+
+ITakenArm widenTaken(ITakenArmChild c) { ITakenArm e = c; return e; }
+
+extern int main()
+{
+    return 0;
+}

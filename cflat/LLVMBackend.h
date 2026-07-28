@@ -360,6 +360,21 @@ inline std::string DequoteStringLiteral(const std::string& raw)
     return raw.size() >= 2 ? raw.substr(1, raw.size() - 2) : raw;
 }
 
+// Longest run of quoted-back user source allowed in one diagnostic. An `if const` condition may be
+// arbitrarily long and may nest, so both a single condition and the composed nesting chain are
+// bounded - a multi-kilobyte single-line error message helps nobody.
+inline constexpr size_t kIfConstConditionTextLimit = 120;
+
+// Cut `text` to at most `limit` bytes, appending "...". The cut backs off any UTF-8 continuation
+// byte, so a sliced comment inside a condition cannot leave half a character behind.
+inline std::string TruncateDiagnosticText(std::string text, size_t limit)
+{
+    if (text.size() <= limit) return text;
+    size_t cut = limit;
+    while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) cut--;
+    return text.substr(0, cut) + "...";
+}
+
 #if defined(__APPLE__)
 // Run a shell command and return its trimmed first stdout line ("" on failure).
 // Used for xcrun SDK discovery and the clang compiler-rt resource dir.
@@ -1858,6 +1873,22 @@ private:
     // Interfaces whose real implementor set is a main-pass fact: named in a generic class's base
     // clause, or spelled generically. Never prove a conversion impossible against one of these.
     std::unordered_set<std::string> uncertainInterfaceImpls;
+    // A class declared inside an `if const` arm that MainListener did NOT take, with a phrase
+    // describing that arm. The scanner records every arm; the entries for the arm MainListener
+    // takes are retracted as it takes them, so only genuinely absent classes are left. DIAGNOSTIC
+    // ONLY: it never decides whether a program is accepted, it only explains a rejection.
+    struct IfConstGuardedImpl
+    {
+        std::string ClassName;      // qualified: namespace and enclosing class included
+        // Every `if const` arm or chained else path the class sits under, OUTERMOST first. A level
+        // is peeled as it is taken, so GuardChain[0] is always one nobody was shown to take.
+        std::vector<std::string> GuardChain;
+        const void* Node = nullptr; // ClassDefinitionContext, the retraction/peel key
+        // One CANDIDATE LIST per base-clause entry, in the resolver's own priority order. The
+        // scanner cannot resolve a spelling yet, so the pick is deferred to the blame site.
+        std::vector<std::vector<std::string>> InterfaceCandidates;
+    };
+    std::vector<IfConstGuardedImpl> ifConstGuardedImpls_;
     // Depth of nested CompileImportedFile scan/walk. Above zero the files that follow this import
     // have not been scanned yet, so the implementor registry is provably incomplete.
     int importCompileDepth_ = 0;
@@ -10907,6 +10938,82 @@ public:
         if (!ifaceName.empty()) uncertainInterfaceImpls.insert(ifaceName);
     }
 
+    // Remember a class the scanner found inside an `if const` arm, with the full chain of arms it
+    // sits under. Read by the zero-implementor diagnostic only - it must never gate acceptance.
+    void RecordIfConstGuardedInterfaceImpl(const std::string& className,
+                                           std::vector<std::string> guardChain, const void* node,
+                                           std::vector<std::vector<std::string>> ifaceCandidates)
+    {
+        if (className.empty() || ifaceCandidates.empty()) return;
+        ifConstGuardedImpls_.push_back(IfConstGuardedImpl{
+            className, std::move(guardChain), node, std::move(ifaceCandidates) });
+    }
+
+    // Withdraw a class's entry because MainListener took the arm it sits in - it is live after all.
+    void RetractIfConstGuardedInterfaceImpl(const void* node)
+    {
+        if (node == nullptr) return;
+        std::erase_if(ifConstGuardedImpls_,
+                      [node](const IfConstGuardedImpl& g) { return g.Node == node; });
+    }
+
+    // MainListener took an OUTER arm the class sits under, but the class is behind a further nested
+    // `if const` that gets its own decision. Drop just that outer level, so whatever remains at the
+    // front of the chain is still an arm nobody has been shown to take.
+    void PeelIfConstGuardedInterfaceImpl(const void* node)
+    {
+        if (node == nullptr) return;
+        for (auto& g : ifConstGuardedImpls_)
+            if (g.Node == node && !g.GuardChain.empty())
+                g.GuardChain.erase(g.GuardChain.begin());
+    }
+
+    /*
+     * The ONE name a scanned base-clause spelling actually denotes, out of the candidates the
+     * scanner could not choose between. Candidates arrive in the resolver's priority order (exact
+     * spelling first, then the enclosing namespaces innermost-out, then a bare last component), so
+     * the first that names a registered interface is the one the class would have registered
+     * against. Empty when the entry names no interface at all - a base class, or an unknown name.
+     * Called only from the finalization diagnostic, by which point every interface is registered.
+     */
+    std::string ResolveGuardedBaseCandidate(const std::vector<std::string>& candidates) const
+    {
+        for (const auto& raw : candidates)
+        {
+            std::string resolved = ResolveTypeAlias(raw);
+            if (interfaceTable.count(resolved) > 0) return resolved;
+        }
+        return {};
+    }
+
+    // Look for classes that would implement `ifaceName` but sit inside an `if const` arm that this
+    // build did not take. Returns the first such class plus how many distinct ones there are.
+    bool FindIfConstGuardedImplementor(const std::string& ifaceName, std::string& classOut,
+                                       std::vector<std::string>& guardChainOut,
+                                       size_t& countOut) const
+    {
+        std::string want = ResolveTypeAlias(ifaceName);
+        std::unordered_set<std::string> seen;
+        countOut = 0;
+        for (const auto& guarded : ifConstGuardedImpls_)
+        {
+            bool provides = false;
+            for (const auto& candidates : guarded.InterfaceCandidates)
+            {
+                // Blame rests on a FACT, so only the resolved name may be tested. A surplus
+                // candidate here would fabricate an implements-claim the class never made.
+                std::string declared = ResolveGuardedBaseCandidate(candidates);
+                if (declared.empty()) continue;
+                if (declared == want || InterfaceInheritsFrom(declared, want)) { provides = true; break; }
+            }
+            if (!provides) continue;
+            if (!seen.insert(guarded.ClassName).second) continue;
+            if (countOut == 0) { classOut = guarded.ClassName; guardChainOut = guarded.GuardChain; }
+            countOut++;
+        }
+        return countOut > 0;
+    }
+
     // RAII bracket for importCompileDepth_. LogError THROWS on several paths (SpeculativeEvalAbort,
     // CompilerAbortException, ExpectedErrorReceived) and FailCompilation throws in batch mode, so a
     // bare decrement would leak the depth and silently disable the check for the rest of the process.
@@ -11363,6 +11470,37 @@ public:
         sourceFileName = reportAt->File;
         currentLine = reportAt->Line;
         currentColumn = reportAt->Column;
+
+        // Same rejection either way - only the wording differs. A class guarded by an `if const`
+        // arm this build did not take is absent for a reason the user can act on, so name it.
+        std::string guardedClass;
+        std::vector<std::string> guardChain;
+        size_t guardedCount = 0;
+        if (FindIfConstGuardedImplementor(site.DstInterface, guardedClass, guardChain, guardedCount))
+        {
+            // Chain[0] is the arm this build did not take; the rest is where the class sits INSIDE
+            // it - stated as position, never as another takenness claim, since those are unknown.
+            std::string guard = guardChain.empty() ? "an 'if const' branch" : guardChain.front();
+            std::string nest;
+            for (size_t i = 1; i < guardChain.size(); i++)
+                nest += (i == 1 ? "" : ", then ") + guardChain[i];
+            guard = TruncateDiagnosticText(guard, kIfConstConditionTextLimit);
+            nest = TruncateDiagnosticText(nest, kIfConstConditionTextLimit);
+            if (guardedCount == 1)
+                LogError(std::format(
+                    "cannot convert to interface '{}' - the only class implementing it, '{}', is "
+                    "declared inside {} that is not taken in this build{}",
+                    site.DstInterface, guardedClass, guard,
+                    nest.empty() ? "" : std::format(", further nested inside {}", nest)));
+            else
+                LogError(std::format(
+                    "cannot convert to interface '{}' - all {} classes implementing it are declared "
+                    "inside 'if const' arms that are not taken in this build (for example '{}', "
+                    "declared inside {}{})",
+                    site.DstInterface, guardedCount, guardedClass, guard,
+                    nest.empty() ? "" : std::format(", further nested inside {}", nest)));
+            return;
+        }
         LogError(std::format(
             "cannot convert to interface '{}' - no class implements it",
             site.DstInterface));

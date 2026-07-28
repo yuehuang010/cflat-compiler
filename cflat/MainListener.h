@@ -613,33 +613,185 @@ inline std::string DefinitionSiteText(LLVMBackend* compiler, antlr4::ParserRuleC
                        (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine());
 }
 
+// Source text of a parse subtree with runs of whitespace collapsed to one space, so a condition
+// reads as written instead of as getText()'s token concatenation. Length-bounded per condition;
+// the composed nesting chain is bounded again where the diagnostic assembles it.
+inline std::string CollapsedSourceText(antlr4::ParserRuleContext* ctx)
+{
+    if (ctx == nullptr) return {};
+    auto* startTok = ctx->getStart();
+    auto* stopTok = ctx->getStop();
+    if (startTok == nullptr || stopTok == nullptr) return {};
+    auto* input = startTok->getInputStream();
+    if (input == nullptr) return ctx->getText();
+    std::string raw = input->getText(
+        antlr4::misc::Interval(startTok->getStartIndex(), stopTok->getStopIndex()));
+    std::string out;
+    bool pendingSpace = false;
+    for (char c : raw)
+    {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { pendingSpace = true; continue; }
+        if (pendingSpace && !out.empty()) out += ' ';
+        pendingSpace = false;
+        out += c;
+    }
+    if (out.empty()) return ctx->getText();
+    return TruncateDiagnosticText(std::move(out), kIfConstConditionTextLimit);
+}
+
+// The `if const (...)` condition governing this node, if the node is itself an `if const` at file,
+// member, or interface scope. Empty when it is any other kind of node.
+inline std::string IfConstConditionText(antlr4::tree::ParseTree* node)
+{
+    if (auto* d = dynamic_cast<CFlatParser::IfConstDeclarationContext*>(node))
+        return CollapsedSourceText(d->expression());
+    if (auto* m = dynamic_cast<CFlatParser::IfConstMemberContext*>(node))
+        return CollapsedSourceText(m->expression());
+    if (auto* i = dynamic_cast<CFlatParser::IfConstInterfaceMemberContext*>(node))
+        return CollapsedSourceText(i->expression());
+    return {};
+}
+
+// True for the brace block of one `if const` arm. Both the then arm and a plain `else` arm are
+// children of the SAME `if const` node, so the arms can only be told apart by their order here.
+// A chained `else if const` is not a block - it is a nested node that carries its own condition.
+inline bool IsIfConstArmBlock(antlr4::tree::ParseTree* node)
+{
+    return dynamic_cast<CFlatParser::IfConstBlockContext*>(node) != nullptr
+        || dynamic_cast<CFlatParser::IfConstMemberBlockContext*>(node) != nullptr
+        || dynamic_cast<CFlatParser::IfConstInterfaceBlockContext*>(node) != nullptr;
+}
+
+// Dotted name of a namespace definition, used to qualify class names recorded from inside one.
+inline std::string NamespaceDefinitionName(CFlatParser::NamespaceDefinitionContext* ctx)
+{
+    std::string name;
+    for (auto* id : ctx->Identifier())
+        name += (name.empty() ? "" : ".") + id->getText();
+    return name;
+}
+
+inline std::string JoinQualified(const std::string& outer, const std::string& inner)
+{
+    if (inner.empty()) return outer;
+    return outer.empty() ? inner : outer + "." + inner;
+}
+
 /*
  * A class inside an `if const` block is invisible to ForwardRefScanner - the taken branch is a
  * MainListener fact - so it never reaches scannedInterfaceImpls and no conversion may be proven
  * impossible against the interfaces it names. Walk the whole subtree (nested namespaces, nested
- * `if const`, else arms) and mark every base-clause interface uncertain instead.
+ * `if const`, else arms) and mark every base-clause interface uncertain instead. The qualified
+ * class name, its parse node, and the CHAIN of levels it sits under (outermost first) are recorded
+ * alongside, purely so the diagnostic can explain itself. A level is an arm block, or the else path
+ * of a chained `else if const`. No level is known to be untaken here - MainListener retracts or
+ * peels the entry (RetractIfConstArmGuardedImpls) as it takes each one.
  */
 inline void MarkIfConstClassImplsUncertain(LLVMBackend* compiler, antlr4::tree::ParseTree* node,
-                                           const std::string& namespaceName = {})
+                                           const std::string& namespaceName = {},
+                                           const std::vector<std::string>& guardChain = {},
+                                           const std::string& qualifier = {},
+                                           bool inGenericTemplate = false)
 {
     if (compiler == nullptr || node == nullptr) return;
+    std::string scope = qualifier;
+    std::string nsScope = namespaceName;
+    if (auto* ns = dynamic_cast<CFlatParser::NamespaceDefinitionContext*>(node))
+    {
+        scope = JoinQualified(scope, NamespaceDefinitionName(ns));
+        nsScope = JoinQualified(nsScope, NamespaceDefinitionName(ns));
+    }
+    bool childGeneric = inGenericTemplate;
     if (auto* cls = dynamic_cast<CFlatParser::ClassDefinitionContext*>(node))
     {
+        // Suppression takes EVERY candidate (a surplus one only weakens a proof), while blame keeps
+        // them grouped per base entry so the blame site can pick the one name each entry resolves to.
+        std::vector<std::vector<std::string>> named;
         for (auto* spec : BaseClauseIdentifiers(cls))
         {
             std::string spelled = BaseSpecifierName(spec);
             if (spelled.empty()) continue;
+            // Candidates come from the NAMESPACE-only scope: the resolver never walks class-name
+            // prefixes, so a class-rung candidate is a name the class could never register against.
             std::vector<std::string> candidates;
-            AppendInterfaceNameCandidates(compiler, namespaceName, spelled, candidates);
-            // The last component covers a qualified spelling whose namespace this walk cannot see.
-            if (auto dot = spelled.rfind('.'); dot != std::string::npos)
-                candidates.push_back(spelled.substr(dot + 1));
+            AppendInterfaceNameCandidates(compiler, nsScope, spelled, candidates);
             for (const auto& c : candidates)
                 compiler->RecordUncertainInterfaceImpl(c);
+            // Last component of a qualified spelling: SUPPRESSION only - resolving blame through
+            // it fabricates an implements-claim against an unrelated same-named interface.
+            if (auto dot = spelled.rfind('.'); dot != std::string::npos)
+                compiler->RecordUncertainInterfaceImpl(spelled.substr(dot + 1));
+            named.push_back(std::move(candidates));
         }
+        // A class inside a generic TEMPLATE body is reconciled once per instantiation - zero times
+        // when the template is never used - and the peel below is not idempotent, so never blame it.
+        if (auto* dd = cls->directDeclarator())
+        {
+            scope = JoinQualified(scope, dd->getText());
+            if (!inGenericTemplate)
+                compiler->RecordIfConstGuardedInterfaceImpl(scope, guardChain, (const void*)cls,
+                                                            std::move(named));
+        }
+        if (cls->genericTypeParameters() != nullptr) childGeneric = true;
+    }
+    else if (auto* st = dynamic_cast<CFlatParser::StructDefinitionContext*>(node))
+    {
+        if (auto* dd = st->directDeclarator()) scope = JoinQualified(scope, dd->getText());
+        if (st->genericTypeParameters() != nullptr) childGeneric = true;
+    }
+
+    std::string cond = IfConstConditionText(node);
+    size_t armIndex = 0;
+    for (auto* child : node->children)
+    {
+        // APPEND, never replace: a class under `if const (A) { if const (B) { ... } }` sits under
+        // both arms, and dropping A would leave the message blaming a guard that may well hold.
+        std::vector<std::string> childChain = guardChain;
+        if (!cond.empty() && IsIfConstArmBlock(child))
+            childChain.push_back(armIndex++ == 0
+                ? std::format("an 'if const ({})' branch", cond)
+                : std::format("the else arm of an 'if const ({})'", cond));
+        // A chained `else if const` is a nested node, not an arm block, but it is still a LEVEL:
+        // reaching it means this node's own arm was rejected, and that fact must stay visible.
+        else if (!cond.empty() && !IfConstConditionText(child).empty())
+            childChain.push_back(std::format("the else path of an 'if const ({})'", cond));
+        MarkIfConstClassImplsUncertain(compiler, child, nsScope, childChain, scope, childGeneric);
+    }
+}
+
+/*
+ * MainListener decided to TAKE this arm, so the diagnostic must never claim its classes are absent
+ * because of it. A class sitting directly in the arm is live - retract it outright. A class behind
+ * a FURTHER nested `if const` only loses this one level: that inner arm gets its own decision, and
+ * is retracted or peeled in turn when MainListener reaches it. Callers that descend into a chained
+ * `else if const` pass nested=true, since taking the else PATH is one level and nothing more.
+ */
+inline void RetractIfConstArmGuardedImpls(LLVMBackend* compiler, antlr4::tree::ParseTree* node,
+                                          bool nested = false)
+{
+    if (compiler == nullptr || node == nullptr) return;
+    if (auto* cls = dynamic_cast<CFlatParser::ClassDefinitionContext*>(node))
+    {
+        if (nested) compiler->PeelIfConstGuardedInterfaceImpl((const void*)cls);
+        else        compiler->RetractIfConstGuardedInterfaceImpl((const void*)cls);
     }
     for (auto* child : node->children)
-        MarkIfConstClassImplsUncertain(compiler, child, namespaceName);
+        RetractIfConstArmGuardedImpls(compiler, child,
+                                      nested || !IfConstConditionText(child).empty());
+}
+
+/*
+ * The walk of this subtree was ABANDONED - LogError threw and an `expect_error` block swallowed it -
+ * so no `if const` inside it was ever decided. Nothing here may be claimed untaken: drop every entry
+ * outright rather than peel, since a peel would leave a front level the walk never even reached.
+ */
+inline void ForgetIfConstGuardedImpls(LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+{
+    if (compiler == nullptr || node == nullptr) return;
+    if (auto* cls = dynamic_cast<CFlatParser::ClassDefinitionContext*>(node))
+        compiler->RetractIfConstGuardedInterfaceImpl((const void*)cls);
+    for (auto* child : node->children)
+        ForgetIfConstGuardedImpls(compiler, child);
 }
 
 // Interface bodies parse through the named `interfaceMember` rule, so methods and fields are nested
@@ -1995,7 +2147,7 @@ private:
         // nested class inside one is invisible too - mark what it names uncertain.
         for (auto* m : ctx->aggregateMember())
             if (auto* icm = m->ifConstMember())
-                MarkIfConstClassImplsUncertain(compiler, icm, namespaceName);
+                MarkIfConstClassImplsUncertain(compiler, icm, namespaceName, {}, typeName);
 
         // Register opaque struct so the type is known for pointer/field use
         compiler->CreateStructType(typeName, {});
@@ -3332,7 +3484,7 @@ public:
             compilerLLVM->expectedError.clear();
         }
         else if (auto* ifConst = ctx->ifConstDeclaration())
-            MarkIfConstClassImplsUncertain(compilerLLVM, ifConst, namespaceName);
+            MarkIfConstClassImplsUncertain(compilerLLVM, ifConst, namespaceName, {}, namespaceName);
         // if const declarations are otherwise skipped here; they are handled in MainListener
         // which has access to expression evaluation and can determine the taken branch
     }
@@ -5251,6 +5403,8 @@ public:
                 catch (const ExpectedErrorReceived&)
                 {
                     errorReceived = true;
+                    // The rest of the block never ran, so its `if const` arms were never decided.
+                    ForgetIfConstGuardedImpls(compilerLLVM, expectErrDecl);
                     compilerLLVM->AbortFunctionBlocks(0);
                     compilerLLVM->ClearCurrentSubprogram();
                     compilerLLVM->RestoreFileScopeExpectedError();
@@ -5393,7 +5547,9 @@ public:
         }
         else if (auto* elseIf = ctx->ifConstMember())
         {
-            // Chained `else if const` - the else arm is another if const, not a brace block.
+            // Chained `else if const` - the else arm is another if const, not a brace block. Taking
+            // the else PATH peels exactly the level the scanner appended for it (nested=true).
+            RetractIfConstArmGuardedImpls(compilerLLVM, elseIf, /*nested=*/true);
             AppendIfConstMembers(elseIf, out);
             return;
         }
@@ -5403,7 +5559,11 @@ public:
         }
 
         if (branchBlock)
+        {
+            // Taken arm - see the matching retraction in ParseIfConstDeclaration.
+            RetractIfConstArmGuardedImpls(compilerLLVM, branchBlock);
             AppendResolvedMembers(branchBlock->aggregateMember(), out);
+        }
     }
 
     template <typename TCtx>
@@ -5530,7 +5690,9 @@ public:
         }
         else if (auto* elseIf = ctx->ifConstDeclaration())
         {
-            // Chained `else if const` - the else arm is another if const, not a brace block.
+            // Chained `else if const` - the else arm is another if const, not a brace block. Taking
+            // the else PATH peels exactly the level the scanner appended for it (nested=true).
+            RetractIfConstArmGuardedImpls(compilerLLVM, elseIf, /*nested=*/true);
             ParseIfConstDeclaration(elseIf, namespaceName);
             return;
         }
@@ -5541,6 +5703,10 @@ public:
 
         if (!branchBlock)
             return;
+
+        // This arm IS taken, so its classes are live: withdraw the scanner's guarded-implementor
+        // note for them before any diagnostic can claim they are absent from this build.
+        RetractIfConstArmGuardedImpls(compilerLLVM, branchBlock);
 
         auto branchDecls = branchBlock->externalDeclaration();
 
@@ -7805,6 +7971,9 @@ public:
                 catch (const ExpectedErrorReceived&)
                 {
                     errorReceived = true;
+                    // The rest of the block never ran (see the file-scope catch). Today the grammar
+                    // puts no classDefinition in a function body, so this is a defensive no-op.
+                    ForgetIfConstGuardedImpls(compilerLLVM, cs);
                     // Pop any extra nested frames without destructors (error path).
                     while (compilerLLVM->stackNamedVariable.size() > savedDepth)
                         compilerLLVM->stackNamedVariable.pop_back();
@@ -8604,6 +8773,9 @@ public:
                 if (!compilerLLVM->expectedError.empty() &&
                     compilerLLVM->expectedErrorScopeDepth == funcDepth)
                 {
+                    // The rest of the body never ran; defensive no-op while the grammar puts no
+                    // classDefinition in a function body (see the file-scope catch for the real case).
+                    ForgetIfConstGuardedImpls(compilerLLVM, blockItemList);
                     compilerLLVM->AbortFunctionBlocks(funcDepth - 1);
                     compilerLLVM->RestoreFileScopeExpectedError();
                     compiler->ClearCurrentSubprogram();

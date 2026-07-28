@@ -1,0 +1,43 @@
+// Chained `else if const` followed by a plain `else`. The class sits in the final `else`, and the
+// governing fact is that the FIRST arm of the chain was taken - the chained condition
+// (__WINDOWS__ && __MACOS__) is false on every host and was never even reached.
+//
+// A chained `else if const` parses as a nested `if const` node rather than an arm block, so it is
+// easy to contribute nothing to the guard chain. That would leave the message blaming
+// '__WINDOWS__ && __MACOS__' - a condition a reader evaluates to FALSE and therefore concludes the
+// else arm is the LIVE one, i.e. the cited evidence points opposite to the conclusion. The chained
+// node is a LEVEL: it is reported as "the else path of an 'if const (...)'", which carries the
+// takenness claim and names a condition whose truth agrees with it.
+//
+// Like the other rebox tests, the check fires at FINALIZATION, so this needs the bare-semicolon
+// file-scope form of expect_error.
+expect_error("the only class implementing it, 'DeadElse', is declared inside the else path of an 'if const (__MACOS__ || __WINDOWS__ || __LINUX__)' that is not taken in this build, further nested inside the else arm of an 'if const (__WINDOWS__ && __MACOS__)'");
+
+interface IChain { int ich(); };
+interface IChainChild : IChain { int ichc(); };
+
+if const (__MACOS__ || __WINDOWS__ || __LINUX__)
+{
+    int chainLive = 1;
+}
+else if const (__WINDOWS__ && __MACOS__)
+{
+    int chainUnreached = 2;
+}
+else
+{
+    class DeadElse : IChainChild
+    {
+        int v = 0;
+        DeadElse() {}
+        int ich() { return v; }
+        int ichc() { return v; }
+    };
+}
+
+IChain widenChain(IChainChild c) { IChain e = c; return e; }
+
+extern int main()
+{
+    return 0;
+}

@@ -1,0 +1,41 @@
+// A class inside a GENERIC class template's `if const` must never be blamed. MainListener
+// reconciles a member-scope `if const` once per instantiation - zero times when the template is
+// never used, N times when it is - and the peel that drops a taken level is not idempotent, so
+// neither count leaves the invariant the message rests on: that the front of a surviving chain is
+// an arm nobody was shown to take. Here the inner guard holds on every host, so blaming it would
+// tell the user a satisfied guard is "not taken".
+//
+// The scanner therefore records no guarded implementor at all from inside a template body, which
+// is already what a template at plain file scope does (its generic registration returns before the
+// mark). Only the plain zero-implementor wording may be used.
+//
+// The check fires at FINALIZATION, so this needs the bare-semicolon file-scope expect_error.
+expect_error("cannot convert to interface 'IGenBody' - no class implements it");
+
+interface IGenBody { int gb(); };
+interface IGenBodyChild : IGenBody { int gbc(); };
+
+if const (__WINDOWS__ || __LINUX__ || __MACOS__)
+{
+    class GenBodyHolder<T>
+    {
+        T val = default;
+        if const (__WINDOWS__ || __LINUX__ || __MACOS__)
+        {
+            class Inner : IGenBodyChild
+            {
+                int v = 0;
+                Inner() {}
+                int gb() { return v; }
+                int gbc() { return v; }
+            };
+        }
+    };
+}
+
+IGenBody widenGenBody(IGenBodyChild c) { IGenBody e = c; return e; }
+
+extern int main()
+{
+    return 0;
+}

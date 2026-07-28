@@ -1,0 +1,40 @@
+// A guarded class may only be blamed for an interface its base clause actually names. The scanner
+// cannot resolve a base-clause spelling yet - an interface later in the file is not registered - so
+// it records every name the spelling COULD denote. That over-broad set is safe for suppression (a
+// surplus entry only weakens an impossibility proof) but never for blame: a surplus name would have
+// the message assert an implements-relationship the class never declared.
+//
+// Here 'nsb.NsGuarded' names 'nsb.IBlame', which has nothing to do with 'IBlameRoot'. The bare last
+// component 'IBlame' of that qualified spelling also names a FILE-SCOPE interface that does inherit
+// 'IBlameRoot', and uncertainty is deliberately not propagated up the inheritance chain, so a
+// conversion to the parent escapes suppression and reaches the blame path. Only the resolved name
+// may be tested there, so the plain zero-implementor wording is the correct one.
+//
+// The check fires at FINALIZATION, so this needs the bare-semicolon file-scope expect_error.
+expect_error("cannot convert to interface 'IBlameRoot' - no class implements it");
+
+interface IBlameRoot { int root(); };
+interface IBlame : IBlameRoot { int fs(); };
+interface IBlameChild : IBlame { int fsc(); };
+
+namespace nsb
+{
+    interface IBlame { int inner(); };
+
+    if const (__WINDOWS__ && __MACOS__)
+    {
+        class NsGuarded : nsb.IBlame
+        {
+            int v = 0;
+            NsGuarded() {}
+            int inner() { return v; }
+        };
+    }
+};
+
+IBlameRoot widenRoot(IBlameChild c) { IBlameRoot e = c; return e; }
+
+extern int main()
+{
+    return 0;
+}

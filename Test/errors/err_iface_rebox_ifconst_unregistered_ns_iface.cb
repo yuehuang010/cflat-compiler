@@ -1,0 +1,37 @@
+// Companion cell to err_iface_rebox_ifconst_unrelated_iface.cb: there the same-named namespace
+// interface is declared OUTSIDE the arm, so the qualified spelling resolves and blame is cleanly
+// ruled out. Here 'Win32.INative' exists ONLY inside the untaken arm, so it is never registered,
+// and the blame resolver used to fall through to the bare last component 'INative' - a FILE-SCOPE
+// interface that does inherit 'IHandleRoot' - fabricating "'Win32.WinFile' ... implementing
+// 'IHandleRoot'" for a class whose base clause names neither. The last-component fallback may feed
+// suppression only, never blame, so the plain zero-implementor wording is the correct one.
+//
+// Non-vacuity: this leg discriminates against the pre-fix BRANCH binary (which printed the
+// fabricated blame), not against master (whose plain wording already matched).
+// The check fires at FINALIZATION, so this needs the bare-semicolon file-scope expect_error.
+expect_error("cannot convert to interface 'IHandleRoot' - no class implements it");
+
+interface IHandleRoot { int root(); };
+interface INative : IHandleRoot { int h(); };
+interface IHandleChild : INative { int hc(); };
+
+if const (__WINDOWS__ && __MACOS__)
+{
+    namespace Win32
+    {
+        interface INative { int nativeHandle(); };
+        class WinFile : Win32.INative
+        {
+            int v = 0;
+            WinFile() {}
+            int nativeHandle() { return v; }
+        };
+    }
+}
+
+IHandleRoot widen(IHandleChild c) { IHandleRoot e = c; return e; }
+
+extern int main()
+{
+    return 0;
+}
