@@ -2365,6 +2365,30 @@ namespace nsc
     class NsD : INsDerived { int value() { return 3; } int extra() { return 4; } };
 };
 
+// core/interfaces.cb is implicitly loaded, so it already owns the file-scope name
+// "IHashable" (see Test/errors/err_iface_name_collides_with_core.cb for the resulting
+// error). Declaring a same-named interface inside a namespace is the documented
+// workaround: it registers as "nsCore.IHashable", distinct from the core one. A bare
+// "IHashable" spelling still resolves outward to the core interface first (it already
+// matches at file scope before the enclosing-namespace walk runs), so the base clause
+// and the variable type below use the qualified spelling "nsCore.IHashable".
+namespace nsCore
+{
+    interface IHashable { int myhash(); };
+    class NsHashable : nsCore.IHashable { int myhash() { return 99; } };
+};
+
+bool testNamespacedInterfaceShadowsCoreName()
+{
+    bool result = true;
+
+    nsCore.NsHashable h;
+    nsCore.IHashable v = h;
+    result &= Test("ns_iface_shadows_core_name", v.myhash(), 99);
+
+    return result;
+}
+
 bool testNamespacedInterfaces()
 {
     bool result = true;
@@ -2450,6 +2474,7 @@ extern int main()
     total++; passed += testInterfaceReboxUninstantiatedGeneric() ? 1 : 0;
     total++; passed += testInterfaceOverloadDispatch()           ? 1 : 0;
     total++; passed += testNamespacedInterfaces()                ? 1 : 0;
+    total++; passed += testNamespacedInterfaceShadowsCoreName()   ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -1310,6 +1310,10 @@ private:
     // and the codegen walk both register the SAME definition, so the guard compares sites rather
     // than mere presence; a second definition at a different site is a redefinition.
     std::unordered_map<std::string, std::string> interfaceDefSites;
+    // Subset of interfaceDefSites keys whose recorded definition came from a core library file
+    // (currentSourceIsCore_ was true when the site was recorded). Lets the redefinition guard in
+    // CreateInterfaceDefinition tell a core/user name collision apart from a user/user one.
+    std::unordered_set<std::string> coreInterfaceDefs_;
     // Class name -> base-clause interface names, scanned before codegen so a conversion site sees
     // classes declared LATER. STATIC-CHECK ONLY: driving vtable emission off it would cache a
     // vtable built against a still-opaque StructType (null field offsets, empty destructor).
@@ -8938,9 +8942,15 @@ public:
             auto siteIt = interfaceDefSites.find(name);
             if (siteIt != interfaceDefSites.end() && siteIt->second != definitionSite)
             {
-                LogError(std::format(
-                    "interface '{}' is already defined at {} - an interface name must be unique "
-                    "within its namespace", name, siteIt->second));
+                if (coreInterfaceDefs_.count(name))
+                    LogError(std::format(
+                        "interface '{}' collides with the core library interface of the same name "
+                        "defined at {} - declare it inside a namespace, or rename it (an interface "
+                        "name must be unique within its namespace)", name, siteIt->second));
+                else
+                    LogError(std::format(
+                        "interface '{}' is already defined at {} - an interface name must be unique "
+                        "within its namespace", name, siteIt->second));
                 return;
             }
         }
@@ -8960,7 +8970,13 @@ public:
         // Recorded only once every rejection above is past, so the site map never claims a name
         // that interfaceTable does not actually hold (LogError throws out of this function).
         if (!definitionSite.empty())
+        {
             interfaceDefSites[name] = definitionSite;
+            if (currentSourceIsCore_)
+                coreInterfaceDefs_.insert(name);
+            else
+                coreInterfaceDefs_.erase(name);
+        }
 
         // Prepend inherited methods and fields from parent interfaces (in order)
         std::vector<InterfaceMethod> inherited;

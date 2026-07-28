@@ -882,6 +882,48 @@ class ScaledValue : IReadable, IScalable
 > the parser rejects it. Use `struct` for plain data aggregates with no interface
 > contracts; use `class` when you need VTable dispatch.
 
+### Interface Names Must Be Unique Within Their Namespace
+
+An interface name must be unique within the namespace it is declared in - defining a
+second interface with the same name at the same scope is an error. `core/interfaces.cb`
+is implicitly loaded by every compile, so its interface names (`IString`, `IList`,
+`IHashable`, `IEnumerable`, and others) already occupy file scope; a file-scope
+interface that reuses one of those names collides with the core definition:
+
+```c
+interface IHashable { int myhash(); };   // error: collides with core/interfaces.cb's IHashable
+```
+
+```
+interface 'IHashable' collides with the core library interface of the same name defined
+at interfaces.cb(96,0) - declare it inside a namespace, or rename it (an interface name
+must be unique within its namespace)
+```
+
+Fix it by declaring the interface inside a namespace (see [Namespaces &
+Modules](#namespaces--modules)) so it no longer shares file scope with the core name, or
+by picking a different name:
+
+```c
+namespace MyApp
+{
+    interface IHashable { int myhash(); };   // OK - distinct namespace
+};
+```
+
+A **bare** `IHashable` still resolves outward to the core interface first, even from
+inside `MyApp` - it matches the file-scope name before the enclosing-namespace walk
+runs. Spell it qualified (`MyApp.IHashable`) in a base clause or variable type declared
+inside the same namespace.
+
+A plain name collision between two user-defined interfaces at the same scope reports the
+same rule without the core-specific wording:
+
+```
+interface 'IFoo' is already defined at repro.cb(1,0) - an interface name must be unique
+within its namespace
+```
+
 ### Interface Parameters (VTable Dispatch)
 
 A function accepting an interface type works with any implementing class or struct:

@@ -1,0 +1,14 @@
+// core/interfaces.cb is implicitly loaded by every compile, so a file-scope interface
+// that reuses one of its names (IHashable, IString, IList, ...) collides with the core
+// definition. The message must say so and point at the fix (namespace or rename) rather
+// than the generic "already defined" wording used for a user-vs-user collision - see
+// err_duplicate_interface_name.cb for that case.
+expect_error("interface 'IHashable' collides with the core library interface of the same name defined at")
+{
+    interface IHashable { int myhash(); };
+}
+
+extern int main()
+{
+    return 0;
+}
