@@ -2450,6 +2450,7 @@ void LLVMBackend::ResetForReanalysis()
     interfaceTable.clear();
     interfaceFields.clear();
     interfaceParents.clear();
+    interfaceDefSites.clear();
     scannedInterfaceImpls.clear();
     uncertainInterfaceImpls.clear();
     importCompileDepth_ = 0;   // a throw out of an import walk can leave the RAII depth stranded
@@ -4328,6 +4329,8 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
         {
             llvm::json::Object io;
             io["name"] = name;
+            if (auto it = interfaceDefSites.find(name); it != interfaceDefSites.end())
+                io["defsite"] = it->second;
             llvm::json::Array parents;
             if (auto it = interfaceParents.find(name); it != interfaceParents.end())
                 for (auto& p : it->second) parents.push_back(p);
@@ -4514,6 +4517,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     interfaceTable.clear();
     interfaceFields.clear();
     interfaceParents.clear();
+    interfaceDefSites.clear();
     scannedInterfaceImpls.clear();
     uncertainInterfaceImpls.clear();
     importCompileDepth_ = 0;   // a throw out of an import walk can leave the RAII depth stranded
@@ -4676,6 +4680,8 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             auto name = io->getString("name");
             if (!name) continue;
             std::string iname = name->str();
+            if (auto site = io->getString("defsite"))
+                interfaceDefSites[iname] = site->str();
             if (auto* parents = io->getArray("parents"))
             {
                 std::vector<std::string> plist;

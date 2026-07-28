@@ -457,8 +457,53 @@ static std::vector<Result*> MemberFilter(const std::vector<Member*>& members, Ge
 
 // Base-clause interface identifiers of a class definition. Only `classDefinition` carries a base
 // clause in the grammar, so the struct overload answers empty and keeps the scan templated.
-inline std::vector<CFlatParser::GenericIdentifierContext*> BaseClauseIdentifiers(CFlatParser::ClassDefinitionContext* ctx) { return ctx->genericIdentifier(); }
-inline std::vector<CFlatParser::GenericIdentifierContext*> BaseClauseIdentifiers(CFlatParser::StructDefinitionContext*)    { return {}; }
+inline std::vector<CFlatParser::BaseSpecifierContext*> BaseClauseIdentifiers(CFlatParser::ClassDefinitionContext* ctx) { return ctx->baseSpecifier(); }
+inline std::vector<CFlatParser::BaseSpecifierContext*> BaseClauseIdentifiers(CFlatParser::StructDefinitionContext*)    { return {}; }
+
+// The dotted name a base-clause entry spells, without its generic type arguments:
+// `IS` -> "IS", `shapes.IS` -> "shapes.IS". Empty when the entry has no identifier.
+inline std::string BaseSpecifierName(CFlatParser::BaseSpecifierContext* spec)
+{
+    if (spec == nullptr) return {};
+    std::string name;
+    for (auto* id : spec->Identifier())
+        name += (name.empty() ? "" : ".") + id->getText();
+    return name;
+}
+
+/*
+ * Every name a base-clause spelling could be registered under, appended to `out`. The resolver
+ * answers one name once the interface is registered; during the forward scan an interface
+ * declared later in the same namespace is not yet visible, so the enclosing-namespace
+ * candidates are added too. The static conversion check only ever PROVES impossibility, so a
+ * surplus candidate can weaken a proof but can never cause a false rejection.
+ */
+inline void AppendInterfaceNameCandidates(LLVMBackend* compiler, const std::string& namespaceName,
+                                          const std::string& spelled, std::vector<std::string>& out)
+{
+    if (spelled.empty()) return;
+    std::string resolved = compiler->ResolveInterfaceName(spelled);
+    out.push_back(resolved);
+    if (spelled.find('.') != std::string::npos || namespaceName.empty()) return;
+    std::string prefix = namespaceName;
+    while (true)
+    {
+        std::string candidate = prefix + "." + spelled;
+        if (candidate != resolved) out.push_back(candidate);
+        auto dot = prefix.rfind('.');
+        if (dot == std::string::npos) break;
+        prefix = prefix.substr(0, dot);
+    }
+}
+
+// "file(line,col)" of a definition, used to tell a genuine redefinition apart from the same
+// definition being registered twice (forward scan then codegen walk, or a re-imported file).
+inline std::string DefinitionSiteText(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx)
+{
+    if (compiler == nullptr || ctx == nullptr || ctx->getStart() == nullptr) return {};
+    return std::format("{}({},{})", compiler->GetSourceFileName(),
+                       (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine());
+}
 
 /*
  * A class inside an `if const` block is invisible to ForwardRefScanner - the taken branch is a
@@ -466,15 +511,27 @@ inline std::vector<CFlatParser::GenericIdentifierContext*> BaseClauseIdentifiers
  * impossible against the interfaces it names. Walk the whole subtree (nested namespaces, nested
  * `if const`, else arms) and mark every base-clause interface uncertain instead.
  */
-inline void MarkIfConstClassImplsUncertain(LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+inline void MarkIfConstClassImplsUncertain(LLVMBackend* compiler, antlr4::tree::ParseTree* node,
+                                           const std::string& namespaceName = {})
 {
     if (compiler == nullptr || node == nullptr) return;
     if (auto* cls = dynamic_cast<CFlatParser::ClassDefinitionContext*>(node))
-        for (auto* genId : BaseClauseIdentifiers(cls))
-            if (genId->Identifier())
-                compiler->RecordUncertainInterfaceImpl(genId->Identifier()->getText());
+    {
+        for (auto* spec : BaseClauseIdentifiers(cls))
+        {
+            std::string spelled = BaseSpecifierName(spec);
+            if (spelled.empty()) continue;
+            std::vector<std::string> candidates;
+            AppendInterfaceNameCandidates(compiler, namespaceName, spelled, candidates);
+            // The last component covers a qualified spelling whose namespace this walk cannot see.
+            if (auto dot = spelled.rfind('.'); dot != std::string::npos)
+                candidates.push_back(spelled.substr(dot + 1));
+            for (const auto& c : candidates)
+                compiler->RecordUncertainInterfaceImpl(c);
+        }
+    }
     for (auto* child : node->children)
-        MarkIfConstClassImplsUncertain(compiler, child);
+        MarkIfConstClassImplsUncertain(compiler, child, namespaceName);
 }
 
 // Interface bodies parse through the named `interfaceMember` rule, so methods and fields are nested
@@ -1515,7 +1572,8 @@ private:
         }
     }
 
-    void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx)
+    void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
+                                 const std::string& namespaceName = {})
     {
         // Generic interface templates are not pre-declared; they are instantiated on demand.
         auto* nameGid = ctx->genericIdentifier();
@@ -1523,15 +1581,19 @@ private:
             return;
 
         if (!nameGid || !nameGid->Identifier()) return;
+        // Registered under the enclosing namespace like a struct or class, so two namespaces may
+        // each declare their own "IV" without one silently overwriting the other.
         std::string name = nameGid->Identifier()->getText();
+        if (!namespaceName.empty())
+            name = namespaceName + "." + name;
 
         // Record the interface's type-level annotations now (raw, unvalidated) so [uuid] is
         // available before a [winrt] class implementing it is emitted. The main pass validates.
         Compiler(ctx)->SetTypeAnnotations(name, ExtractAnnotations(ctx->annotationList()));
 
         std::vector<std::string> parentNames;
-        for (auto* term : ctx->Identifier())
-            parentNames.push_back(term->getText());
+        for (auto* spec : ctx->baseSpecifier())
+            parentNames.push_back(Compiler(ctx)->ResolveInterfaceName(BaseSpecifierName(spec)));
 
         std::vector<LLVMBackend::InterfaceMethod> methods;
         for (auto method : InterfaceMethods(ctx))
@@ -1553,7 +1615,8 @@ private:
             fields.push_back(std::move(tv));
         }
 
-        Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods, fields);
+        Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods, fields,
+                                                 DefinitionSiteText(Compiler(ctx), ctx));
 
         if (auto* s = Compiler(ctx)->GetSymbolSink())
         {
@@ -1653,9 +1716,13 @@ private:
             }
             // A generic class's real base clause needs main-pass type-arg substitution, and its
             // instances appear only on demand: never prove anything about the interfaces it names.
-            for (auto* genId : BaseClauseIdentifiers(ctx))
-                if (genId->Identifier())
-                    compiler->RecordUncertainInterfaceImpl(genId->Identifier()->getText());
+            for (auto* spec : BaseClauseIdentifiers(ctx))
+            {
+                std::vector<std::string> candidates;
+                AppendInterfaceNameCandidates(compiler, namespaceName, BaseSpecifierName(spec), candidates);
+                for (const auto& c : candidates)
+                    compiler->RecordUncertainInterfaceImpl(c);
+            }
             return;
         }
 
@@ -1667,16 +1734,16 @@ private:
         // implementors declared LATER in the file. Static-check only - see scannedInterfaceImpls.
         {
             std::vector<std::string> scannedIfaces;
-            for (auto* genId : BaseClauseIdentifiers(ctx))
+            for (auto* spec : BaseClauseIdentifiers(ctx))
             {
-                if (!genId->Identifier()) continue;
-                std::string ifaceBaseName = genId->Identifier()->getText();
+                std::string ifaceBaseName = BaseSpecifierName(spec);
+                if (ifaceBaseName.empty()) continue;
                 // A generic interface spelling only mangles after substitution; record the
                 // template as uncertain rather than guessing the instance name.
-                if (genId->genericTypeParameters() != nullptr)
+                if (spec->genericTypeParameters() != nullptr)
                     compiler->RecordUncertainInterfaceImpl(ifaceBaseName);
                 else
-                    scannedIfaces.push_back(ifaceBaseName);
+                    AppendInterfaceNameCandidates(compiler, namespaceName, ifaceBaseName, scannedIfaces);
             }
             compiler->RecordScannedStructInterfaces(typeName, scannedIfaces);
         }
@@ -1684,7 +1751,7 @@ private:
         // nested class inside one is invisible too - mark what it names uncertain.
         for (auto* m : ctx->aggregateMember())
             if (auto* icm = m->ifConstMember())
-                MarkIfConstClassImplsUncertain(compiler, icm);
+                MarkIfConstClassImplsUncertain(compiler, icm, namespaceName);
 
         // Register opaque struct so the type is known for pointer/field use
         compiler->CreateStructType(typeName, {});
@@ -2330,7 +2397,7 @@ public:
         else if (auto classDef = ctx->classDefinition())
             ScanClassDefinition(classDef, namespaceName);
         else if (auto iface = ctx->interfaceDefinition())
-            ScanInterfaceDefinition(iface);
+            ScanInterfaceDefinition(iface, namespaceName);
         else if (auto usingDecl = ctx->usingDeclaration())
             ScanUsingDeclaration(usingDecl);
         else if (auto progDef = ctx->programDefinition())
@@ -2364,7 +2431,7 @@ public:
             compilerLLVM->expectedError.clear();
         }
         else if (auto* ifConst = ctx->ifConstDeclaration())
-            MarkIfConstClassImplsUncertain(compilerLLVM, ifConst);
+            MarkIfConstClassImplsUncertain(compilerLLVM, ifConst, namespaceName);
         // if const declarations are otherwise skipped here; they are handled in MainListener
         // which has access to expression evaluation and can determine the taken branch
     }
@@ -3445,26 +3512,32 @@ public:
         return parser ? dynamic_cast<antlr4::BufferedTokenStream*>(parser->getTokenStream()) : nullptr;
     }
 
-    void ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx)
+    void ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
+                                  const std::string& namespaceName = {})
     {
         auto* nameGid = ctx->genericIdentifier();
         if (!nameGid || !nameGid->Identifier()) return;
 
-        std::string name = nameGid->Identifier()->getText();
+        std::string baseName = nameGid->Identifier()->getText();
+        // Qualified by the enclosing namespace, exactly like a struct or class, so two namespaces
+        // may each declare their own "IV". A generic template keeps its bare key (below): its
+        // instantiation machinery is keyed on the unqualified template name throughout.
+        std::string name = namespaceName.empty() ? baseName : namespaceName + "." + baseName;
 
         // Validate type-level annotations (e.g. [uuid("...")]) against the registry and replace the
         // forward scan's raw record with the validated set, so an unknown annotation that errored
         // does not linger as queryable.
         Compiler(ctx)->SetTypeAnnotations(name, ParseAnnotationList(ctx->annotationList()));
 
-        // Collect parent interface names from direct Identifier terminals (after ':')
+        // Collect parent interface names, resolved to the names they are registered under.
         std::vector<std::string> parentNames;
-        for (auto* term : ctx->Identifier())
-            parentNames.push_back(term->getText());
+        for (auto* spec : ctx->baseSpecifier())
+            parentNames.push_back(Compiler(ctx)->ResolveInterfaceName(BaseSpecifierName(spec)));
 
         // Generic interface template - store for on-demand instantiation
         if (nameGid->genericTypeParameters() != nullptr)
         {
+            std::string name = baseName;
             auto typeParams = ParseGenericTypeParameters(nameGid->genericTypeParameters());
             genericInterfaceTemplates[name] = ctx;
             genericInterfaceTypeParams[name] = typeParams;
@@ -3494,7 +3567,8 @@ public:
             methods.push_back(std::move(m));
         }
 
-        Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods, ParseInterfaceFields(ctx));
+        Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods, ParseInterfaceFields(ctx),
+                                                 DefinitionSiteText(Compiler(ctx), ctx));
     }
 
     /*
@@ -3559,8 +3633,8 @@ public:
 
         // Collect parent interface names
         std::vector<std::string> parentNames;
-        for (auto* term : ctx->Identifier())
-            parentNames.push_back(term->getText());
+        for (auto* spec : ctx->baseSpecifier())
+            parentNames.push_back(Compiler()->ResolveInterfaceName(BaseSpecifierName(spec)));
 
         // Apply substitutions to instantiate the interface methods
         auto savedSubst = activeTypeSubstitutions;
@@ -4037,7 +4111,7 @@ public:
 
         if (iface != nullptr)
         {
-            ParseInterfaceDefinition(iface);
+            ParseInterfaceDefinition(iface, namespaceName);
         }
         else if (ns != nullptr)
         {
@@ -25011,8 +25085,8 @@ public:
         std::string winrtVtblName;
         if (isWinrt)
         {
-            auto ids = ctx->genericIdentifier();
-            if (ids.empty() || !ids[0]->Identifier())
+            auto ids = ctx->baseSpecifier();
+            if (ids.empty() || BaseSpecifierName(ids[0]).empty())
             {
                 LogErrorContext(ctx, "[winrt] class '" + structName + "' must implement exactly one interface");
                 return;
@@ -25022,7 +25096,9 @@ public:
                 LogErrorContext(ctx, "[winrt] class '" + structName + "' may implement only one interface in this milestone");
                 return;
             }
-            winrtIface = ids[0]->Identifier()->getText();
+            // Passed through verbatim: a WinMD projected interface is registered under its own
+            // fully qualified spelling and must not go through CFlat namespace resolution.
+            winrtIface = BaseSpecifierName(ids[0]);
             winrtVtblName = compiler->CreateWinrtVtableStruct(structName, winrtIface);
 
             // The value-returning member-call sugar `recv->Method()` produces an HResult<T>, a
@@ -25374,15 +25450,19 @@ public:
 
         {
             std::vector<std::string> earlyIfaceNames;
-            for (auto* genId : ctx->genericIdentifier())
+            for (auto* spec : ctx->baseSpecifier())
             {
-                if (!genId->Identifier()) continue;
-                std::string ifaceBaseName = genId->Identifier()->getText();
+                std::string ifaceBaseName = BaseSpecifierName(spec);
+                if (ifaceBaseName.empty()) continue;
                 std::string ifaceName = ifaceBaseName;
-                if (genId->genericTypeParameters() != nullptr)
+                if (spec->genericTypeParameters() != nullptr)
                 {
-                    auto concreteTypeArgs = resolveImplsTypeArgs(genId->genericTypeParameters());
+                    auto concreteTypeArgs = resolveImplsTypeArgs(spec->genericTypeParameters());
                     ifaceName = MangledGenericName(ifaceBaseName, concreteTypeArgs);
+                }
+                else
+                {
+                    ifaceName = compiler->ResolveInterfaceName(ifaceBaseName);
                 }
                 earlyIfaceNames.push_back(ifaceName);
             }
@@ -25449,15 +25529,16 @@ public:
 
         // Record interfaces and verify implementations
         std::vector<std::string> ifaceNames;
-        for (auto* genId : ctx->genericIdentifier())
+        for (auto* spec : ctx->baseSpecifier())
         {
-            if (!genId->Identifier()) continue;
-            std::string ifaceBaseName = genId->Identifier()->getText();
-            std::string ifaceName = ifaceBaseName;
+            std::string ifaceBaseName = BaseSpecifierName(spec);
+            if (ifaceBaseName.empty()) continue;
+            std::string ifaceName = compiler->ResolveInterfaceName(ifaceBaseName);
 
-            if (genId->genericTypeParameters() != nullptr)
+            if (spec->genericTypeParameters() != nullptr)
             {
-                auto concreteTypeArgs = resolveImplsTypeArgs(genId->genericTypeParameters());
+                ifaceName = ifaceBaseName;
+                auto concreteTypeArgs = resolveImplsTypeArgs(spec->genericTypeParameters());
                 ifaceName = MangledGenericName(ifaceBaseName, concreteTypeArgs);
 
                 // Build substitution maps for the interface template's type params (pack-aware)

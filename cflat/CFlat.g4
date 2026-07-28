@@ -789,7 +789,15 @@ structDefinition
     ;
 
 classDefinition
-    : annotationList? Class alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? (':' genericIdentifier (',' genericIdentifier)*)? '{' aggregateMember* '}' ';'
+    : annotationList? Class alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? (':' baseSpecifier (',' baseSpecifier)*)? '{' aggregateMember* '}' ';'
+    ;
+
+// A base-clause entry: the name of an implemented interface, optionally namespace-qualified
+// (`shapes.IS`) and optionally generic (`IBox<int>`). A base clause is always a type position,
+// so the dotted form is a namespace path - never member access - which is why this is its own
+// rule rather than genericIdentifier (used in expression positions too).
+baseSpecifier
+    : Identifier ('.' Identifier)* genericTypeParameters?
     ;
 
 // A struct/class body member. Extracted into a named rule (rather than an inline
@@ -872,7 +880,7 @@ operatorFunctionId
     ;
 
 interfaceDefinition
-    : annotationList? Interface genericIdentifier (':' Identifier (',' Identifier)*)? '{' interfaceMember* '}' ';'
+    : annotationList? Interface genericIdentifier (':' baseSpecifier (',' baseSpecifier)*)? '{' interfaceMember* '}' ';'
     ;
 
 // An interface body member. Extracted into a named rule for the same reason aggregateMember was

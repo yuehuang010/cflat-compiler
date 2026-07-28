@@ -1306,6 +1306,10 @@ private:
     // VariableName is the field name; every implementor must expose a field of the same name/type.
     std::unordered_map<std::string, std::vector<TypeAndValue>> interfaceFields;
     std::unordered_map<std::string, std::vector<std::string>> interfaceParents;
+    // Interface name -> "file(line,col)" of the definition that registered it. The forward scan
+    // and the codegen walk both register the SAME definition, so the guard compares sites rather
+    // than mere presence; a second definition at a different site is a redefinition.
+    std::unordered_map<std::string, std::string> interfaceDefSites;
     // Class name -> base-clause interface names, scanned before codegen so a conversion site sees
     // classes declared LATER. STATIC-CHECK ONLY: driving vtable emission off it would cache a
     // vtable built against a still-opaque StructType (null field offsets, empty destructor).
@@ -8924,8 +8928,23 @@ public:
     }
 
     void CreateInterfaceDefinition(const std::string& name, const std::vector<std::string>& parentNames,
-                                   std::vector<InterfaceMethod> methods, std::vector<TypeAndValue> fields = {})
+                                   std::vector<InterfaceMethod> methods, std::vector<TypeAndValue> fields = {},
+                                   const std::string& definitionSite = {})
     {
+        // A second interface definition claiming a registered name used to overwrite it in
+        // silence, so every use of the first one dispatched through the second one's contract.
+        if (!definitionSite.empty())
+        {
+            auto siteIt = interfaceDefSites.find(name);
+            if (siteIt != interfaceDefSites.end() && siteIt->second != definitionSite)
+            {
+                LogError(std::format(
+                    "interface '{}' is already defined at {} - an interface name must be unique "
+                    "within its namespace", name, siteIt->second));
+                return;
+            }
+        }
+
         // A CFlat interface value is a fat pointer; a WinMD interface is a COM struct with an
         // lpVtbl. If a name meant both, the use site would GEP the fat pointer as a COM struct and
         // emit invalid IR. WinMD types are registered fully qualified so they can never take a bare
@@ -8937,6 +8956,11 @@ public:
                 "(a WinMD type and a CFlat interface cannot share a name)", name, name, it->second));
             return;
         }
+
+        // Recorded only once every rejection above is past, so the site map never claims a name
+        // that interfaceTable does not actually hold (LogError throws out of this function).
+        if (!definitionSite.empty())
+            interfaceDefSites[name] = definitionSite;
 
         // Prepend inherited methods and fields from parent interfaces (in order)
         std::vector<InterfaceMethod> inherited;
@@ -18663,6 +18687,33 @@ public:
         }
         auto it = namespaceAliasTable.find(name);
         return it != namespaceAliasTable.end() ? it->second : name;
+    }
+
+    /*
+     * Resolve a base-clause / parent-list interface spelling to the name the interface is
+     * registered under. A bare name walks outward through the enclosing namespaces ("IV" inside
+     * "one" -> "one.IV"), a qualified name is canonicalized through namespace aliases. Only an
+     * actual interface match is accepted, so a same-named sibling function never hijacks the
+     * name; when nothing matches, the spelling is returned so the caller can report it verbatim.
+     */
+    std::string ResolveInterfaceName(const std::string& spelled) const
+    {
+        std::string name = ResolveTypeAlias(spelled);
+        if (interfaceTable.count(name)) return name;
+        if (!currentNamespace_.empty() && name.find('.') == std::string::npos)
+        {
+            std::string prefix = currentNamespace_;
+            while (true)
+            {
+                std::string candidate = prefix + "." + name;
+                if (interfaceTable.count(candidate)) return candidate;
+                auto dot = prefix.rfind('.');
+                if (dot == std::string::npos) break;
+                prefix = prefix.substr(0, dot);
+            }
+        }
+        std::string qualified = ResolveTypeAlias(ResolveQualifiedName(name));
+        return interfaceTable.count(qualified) ? qualified : name;
     }
 
     // Resolves a qualified name (e.g. "MathAdv.MyNumber") to its canonical registered name

@@ -1,0 +1,17 @@
+// An interface declared inside a namespace is scoped to it, exactly like a struct or class:
+// the bare name is NOT visible from outside. Before namespace-qualified registration the bare
+// name did resolve from anywhere, which is what let two same-named interfaces in different
+// namespaces collide. Reach it as 'nsscope.IScoped', or from a sibling declaration inside the
+// namespace where the bare name still resolves outward.
+namespace nsscope
+{
+    interface IScoped { int v(); };
+    class Scoped : IScoped { int v() { return 1; } };
+};
+
+extern int main()
+{
+    expect_error("unknown type 'IScoped'");
+    IScoped leaked = default;
+    return 0;
+}

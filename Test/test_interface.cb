@@ -2328,6 +2328,76 @@ bool testInterfaceOverloadDispatch()
     return result;
 }
 
+// === Namespaced interfaces ===
+// An interface is registered under its enclosing namespace, so two namespaces may each declare
+// their own "INsCounter" with a DIFFERENT contract without one silently replacing the other.
+interface INsGlobal { int gid(); };
+
+namespace nsa
+{
+    interface INsCounter { int value(); };
+    class NsA : INsCounter { int value() { return 11; } };
+    // Bare sibling name in a parameter position resolves to nsa.INsCounter.
+    int callBare(INsCounter c) { return c.value(); }
+    // The same interface spelled with its full name.
+    int callQualified(nsa.INsCounter c) { return c.value(); }
+};
+
+namespace nsb
+{
+    // Same simple name, i64 contract: dispatching an nsa implementor through THIS one used to
+    // read a zero-extended i32 as an i64 and yield 4294967295 for -1.
+    interface INsCounter { i64 value(); };
+    class NsB : INsCounter { i64 value() { return -1; } };
+    i64 callBare(INsCounter c) { return c.value(); }
+
+    // Qualified base clause: implement the interface that lives in another namespace.
+    class NsCross : nsa.INsCounter { int value() { return 42; } };
+
+    // Bare base clause that walks outward to a file-scope interface.
+    class NsOuter : INsGlobal { int gid() { return 7; } };
+};
+
+namespace nsc
+{
+    // Interface inheritance across namespaces via a qualified parent name.
+    interface INsDerived : nsa.INsCounter { int extra(); };
+    class NsD : INsDerived { int value() { return 3; } int extra() { return 4; } };
+};
+
+bool testNamespacedInterfaces()
+{
+    bool result = true;
+
+    nsa.NsA a;
+    result &= Test("ns_iface_bare_param",      nsa.callBare(a),      11);
+    result &= Test("ns_iface_qualified_param", nsa.callQualified(a), 11);
+
+    // Each namespace keeps its own contract; the i64 side must return a true -1.
+    nsb.NsB b;
+    result &= Test("ns_iface_i64_contract", (int)(nsb.callBare(b) == -1 ? 1 : 0), 1);
+
+    // Qualified base clause, boxed through the qualified interface type from file scope.
+    nsb.NsCross cross;
+    nsa.INsCounter q = cross;
+    result &= Test("ns_iface_qualified_base", q.value(), 42);
+
+    // Bare base clause resolving outward to the file-scope interface.
+    nsb.NsOuter outer;
+    INsGlobal g = outer;
+    result &= Test("ns_iface_outward_base", g.gid(), 7);
+
+    // Cross-namespace interface inheritance: the derived slot list keeps the parent's method.
+    nsc.NsD d;
+    nsc.INsDerived nd = d;
+    result &= Test("ns_iface_inherited_own",    nd.extra(), 4);
+    result &= Test("ns_iface_inherited_parent", nd.value(), 3);
+    nsa.INsCounter up = d;
+    result &= Test("ns_iface_upcast_parent",    up.value(), 3);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -2379,6 +2449,7 @@ extern int main()
     total++; passed += testInterfaceReboxAcrossImport()        ? 1 : 0;
     total++; passed += testInterfaceReboxUninstantiatedGeneric() ? 1 : 0;
     total++; passed += testInterfaceOverloadDispatch()           ? 1 : 0;
+    total++; passed += testNamespacedInterfaces()                ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

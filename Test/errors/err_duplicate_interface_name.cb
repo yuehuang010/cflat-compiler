@@ -1,0 +1,16 @@
+// A second interface definition claiming a name that is already registered used to
+// overwrite the first one in silence, so every use of the first interface dispatched
+// through the second one's contract (an i32 method read back as an i64, or a bogus
+// "does not implement" on a method the class never declared). Two interfaces named
+// the same in DIFFERENT namespaces are fine - each registers as "ns.IFace" - but a
+// redefinition within one scope is now rejected.
+expect_error("interface 'IDupIface' is already defined at")
+{
+    interface IDupIface { int a(); };
+    interface IDupIface { i64 b(); };
+}
+
+extern int main()
+{
+    return 0;
+}
