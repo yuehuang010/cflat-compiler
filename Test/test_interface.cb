@@ -2378,6 +2378,22 @@ namespace nsCore
     class NsHashable : nsCore.IHashable { int myhash() { return 99; } };
 };
 
+namespace nsCtor
+{
+    // A namespaced class with an explicit no-arg constructor used to crash the compiler:
+    // the forward-ref scanner's constructor-overload check compared the ctor's bare
+    // source name against the namespace-qualified type name, never matched, and fell
+    // through to the plain member-function path where the ctor's absent return-type
+    // specifier was dereferenced as null.
+    interface INsCtorThing { int id(); };
+    class NsCtorThing : INsCtorThing
+    {
+        int v = 0;
+        NsCtorThing() { v = 55; }
+        int id() { return v; }
+    };
+};
+
 bool testNamespacedInterfaceShadowsCoreName()
 {
     bool result = true;
@@ -2385,6 +2401,19 @@ bool testNamespacedInterfaceShadowsCoreName()
     nsCore.NsHashable h;
     nsCore.IHashable v = h;
     result &= Test("ns_iface_shadows_core_name", v.myhash(), 99);
+
+    return result;
+}
+
+bool testNamespacedClassExplicitCtor()
+{
+    bool result = true;
+
+    nsCtor.NsCtorThing t = nsCtor.NsCtorThing();
+    result &= Test("ns_class_explicit_ctor", t.id(), 55);
+
+    nsCtor.INsCtorThing i = t;
+    result &= Test("ns_class_explicit_ctor_via_iface", i.id(), 55);
 
     return result;
 }
@@ -2473,6 +2502,7 @@ extern int main()
     total++; passed += testInterfaceReboxAcrossImport()        ? 1 : 0;
     total++; passed += testInterfaceReboxUninstantiatedGeneric() ? 1 : 0;
     total++; passed += testInterfaceOverloadDispatch()           ? 1 : 0;
+    total++; passed += testNamespacedClassExplicitCtor()          ? 1 : 0;
     total++; passed += testNamespacedInterfaces()                ? 1 : 0;
     total++; passed += testNamespacedInterfaceShadowsCoreName()   ? 1 : 0;
 

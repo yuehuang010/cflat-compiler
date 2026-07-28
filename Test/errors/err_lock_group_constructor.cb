@@ -1,0 +1,23 @@
+// A constructor guards nothing (no instance exists until it returns), so it has no place
+// inside a lock field group. This used to crash the compiler: the forward-ref scanner
+// scanned the ctor as an ordinary member function and dereferenced its absent
+// return-type specifier as null.
+import "thread.cb";
+
+expect_error("constructor 'C' is not allowed inside a lock field group") {
+    class C
+    {
+        mutex m;
+        int v = 0;
+        lock (m)
+        {
+            C() { v = 1; }
+            int get() { return v; }
+        }
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

@@ -1,0 +1,18 @@
+// 'program' instances are built by the runtime entry trampoline, not by a hand-written
+// constructor. This used to crash the compiler: the forward-ref scanner scanned the ctor
+// as an ordinary member function and dereferenced its absent return-type specifier.
+import "list.cb";
+
+expect_error("program 'P' does not support a user-defined constructor") {
+    program P
+    {
+        int v = 0;
+        P() { v = 1; }
+        int main(move list<string> args) { return v; }
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

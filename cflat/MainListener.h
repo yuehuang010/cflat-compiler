@@ -1121,6 +1121,13 @@ private:
 
     LLVMBackend::DeclTypeAndValue ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs)
     {
+        // A null context here means a caller tried to scan a declaration with no return-type
+        // specifier as an ordinary member function. Diagnose rather than dereference it.
+        if (declSpecs == nullptr)
+        {
+            compilerLLVM->LogError("expected a return type here");
+            return {};
+        }
         auto* compiler = Compiler(declSpecs);
         LLVMBackend::DeclTypeAndValue declType;
         // `long long` arrives as two `long` typeSpecifiers; count them before the loop breaks
@@ -1694,7 +1701,8 @@ private:
         {
             if (auto* s = compiler->GetSymbolSink())
             {
-                std::string typeName = ctx->directDeclarator()->getText();
+                std::string genBaseTypeName = ctx->directDeclarator()->getText();
+                std::string typeName = genBaseTypeName;
                 if (!namespaceName.empty())
                     typeName = namespaceName + "." + typeName;
                 std::string keyword = ctx->getStart()->getText();
@@ -1705,7 +1713,8 @@ private:
                 for (auto* func : MemberFunctionDefinitions(ctx))
                 {
                     std::string funcName = getFunctionName(func);
-                    if (funcName == typeName || funcName.empty()) continue;
+                    // Ctors use the bare name (same fix as the non-generic path below).
+                    if (funcName == genBaseTypeName || funcName.empty()) continue;
                     std::string qualName = typeName + "." + funcName;
                     std::string fdoc = ExtractLeadingDoc(tokens_, func->getStart());
                     s->Register(SymbolKind::Function, qualName, compiler->GetSourceFilePath(),
@@ -1726,7 +1735,8 @@ private:
             return;
         }
 
-        std::string typeName = ctx->directDeclarator()->getText();
+        std::string baseTypeName = ctx->directDeclarator()->getText();
+        std::string typeName = baseTypeName;
         if (!namespaceName.empty())
             typeName = namespaceName + "." + typeName;
 
@@ -1778,7 +1788,9 @@ private:
         // Pre-declare member functions (and detect constructor overloads)
         for (auto func : MemberFunctionDefinitions(ctx))
         {
-            if (getFunctionName(func) == typeName)
+            // Ctors are written with the bare type name - match baseTypeName, not the
+            // namespace-qualified typeName, or a namespaced class's ctor falls through below.
+            if (getFunctionName(func) == baseTypeName)
             {
                 // Constructor overload - no implicit this* parameter, returns the type
                 if (!func->parameterTypeList()) continue; // no-arg already declared above
@@ -1821,7 +1833,19 @@ private:
                                         ? ("this." + guardianName) : guardianName;
             std::vector<std::string> groupLocks = { qualifiedLock };
             for (auto* func : lfg->functionDefinition())
-                ScanFunctionDefinition(func, typeName, {}, groupLocks);
+            {
+                // A constructor guards nothing yet (no instance exists until it returns),
+                // so it has no place inside a lock field group - reject it cleanly here.
+                // A constructor is ONLY a function with no declarationSpecifiers - an ordinary
+                // method that happens to share the class's name (e.g. `int C()`) is NOT one.
+                if (func->declarationSpecifiers() == nullptr && getFunctionName(func) == baseTypeName)
+                {
+                    Compiler(func)->LogError(std::format(
+                        "constructor '{}' is not allowed inside a lock field group", baseTypeName));
+                }
+                else
+                    ScanFunctionDefinition(func, typeName, {}, groupLocks);
+            }
         }
     }
 
@@ -2255,7 +2279,17 @@ public:
 
         // Pre-declare member functions (including user's main) and destructor
         for (auto func : ctx->functionDefinition())
-            ScanFunctionDefinition(func, name);
+        {
+            // 'program' has no user-constructor concept - its instance is built by the
+            // runtime entry trampoline, not a hand-written ctor. Reject it cleanly here.
+            // A constructor is ONLY a function with no declarationSpecifiers - an ordinary
+            // method that happens to share the program's name is NOT one.
+            if (func->declarationSpecifiers() == nullptr && getFunctionName(func) == name)
+                Compiler(func)->LogError(std::format(
+                    "program '{}' does not support a user-defined constructor", name));
+            else
+                ScanFunctionDefinition(func, name);
+        }
         for (auto dtor : ctx->destructorDefinition())
         {
             LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
@@ -2926,6 +2960,12 @@ private:
 
     LLVMBackend::DeclTypeAndValue ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs)
     {
+        // Same defensive guard as the ForwardRefScanner copy above.
+        if (declSpecs == nullptr)
+        {
+            Compiler()->LogError("expected a return type here");
+            return {};
+        }
         LLVMBackend::DeclTypeAndValue declType;
         std::string typeName;
         auto declSpecList = declSpecs->declarationSpecifier();
@@ -23109,7 +23149,13 @@ public:
                 for (auto* func : lfg->functionDefinition())
                 {
                     global_scope = false;
-                    ParseFunctionDefinition(func, structName);
+                    // Same rejection as the scanner - a constructor is ONLY a function
+                    // with no declarationSpecifiers (a same-named method is NOT one).
+                    if (func->declarationSpecifiers() == nullptr && getFunctionName(func) == baseName)
+                        Compiler(func)->LogError(std::format(
+                            "constructor '{}' is not allowed inside a lock field group", baseName));
+                    else
+                        ParseFunctionDefinition(func, structName);
                 }
             }
         }
@@ -24991,7 +25037,13 @@ public:
             for (auto func : ctx->functionDefinition())
             {
                 global_scope = false;
-                ParseFunctionDefinition(func, name);
+                // Same rejection as the scanner - a constructor is ONLY a function with
+                // no declarationSpecifiers (a same-named method is NOT one).
+                if (func->declarationSpecifiers() == nullptr && getFunctionName(func) == name)
+                    Compiler(func)->LogError(std::format(
+                        "program '{}' does not support a user-defined constructor", name));
+                else
+                    ParseFunctionDefinition(func, name);
             }
         }
 
@@ -25512,7 +25564,13 @@ public:
                 for (auto* func : lfg->functionDefinition())
                 {
                     global_scope = false;
-                    ParseFunctionDefinition(func, structName);
+                    // Same rejection as the scanner - a constructor is ONLY a function
+                    // with no declarationSpecifiers (a same-named method is NOT one).
+                    if (func->declarationSpecifiers() == nullptr && getFunctionName(func) == baseName)
+                        Compiler(func)->LogError(std::format(
+                            "constructor '{}' is not allowed inside a lock field group", baseName));
+                    else
+                        ParseFunctionDefinition(func, structName);
                 }
             }
         }

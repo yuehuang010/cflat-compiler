@@ -1286,6 +1286,10 @@ struct LockAccount {
         int balance = default;
         void deposit(int n) { balance = balance + n; }
         int getBalance()    { return balance; }
+        // Regression: a method sharing the struct's own name IS an ordinary method, not a
+        // constructor - it has a return type, which a real constructor never has. Must not
+        // be rejected by the ctor-in-lock-group guard.
+        int LockAccount()   { return balance; }
     }
 };
 
@@ -1308,6 +1312,7 @@ bool testLockAnnotations()
     lock(acct.mtx) {
         acct.deposit(100);
         result &= Test("lock_account", acct.getBalance(), 100);
+        result &= Test("lock_account_method_shares_type_name", acct.LockAccount(), 100);
     }
     return result;
 }

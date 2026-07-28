@@ -1303,6 +1303,29 @@ program NoArgsMain {
     }
 };
 
+// Regression: a method sharing the program's own name IS an ordinary method, not a
+// constructor - it has a return type, which a real constructor never has. Must not be
+// rejected by the ctor-in-'program' guard.
+program NamedMethodProgram {
+    int result = 0;
+
+    int NamedMethodProgram() { return 55; }
+
+    int main(move list<string> args) {
+        return NamedMethodProgram();
+    }
+};
+
+bool testProgramMethodSharesProgramName() {
+    bool ok = true;
+    NamedMethodProgram p;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    ok &= Test("program method shares program name", p.exitCode, 55);
+    return ok;
+}
+
 bool testNoArgsMain() {
     bool ok = true;
     NoArgsMain p;
@@ -1490,6 +1513,7 @@ extern int main() {
     total++; passed += testKillInfiniteLoop()            ? 1 : 0;
     total++; passed += testSupervisorSpawnsChildren()    ? 1 : 0;
     total++; passed += testTrackHandles()                ? 1 : 0;
+    total++; passed += testProgramMethodSharesProgramName() ? 1 : 0;
     total++; passed += testNoArgsMain()                  ? 1 : 0;
     total++; passed += testArgcArgvMain()                ? 1 : 0;
     total++; passed += testImportedProgram()             ? 1 : 0;

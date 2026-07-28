@@ -1,0 +1,29 @@
+// A class assigned to an interface it does NOT implement must be rejected with a clean
+// diagnostic, even when the class implements a DIFFERENT, same-named interface declared
+// in an enclosing namespace ('Win32.IHandle' here, distinct from file-scope 'IHandle').
+// This used to SIGSEGV: the forward-ref scanner's constructor-overload check compared a
+// namespaced class's ctor against its namespace-qualified type name, never matched, and
+// fell through to the ordinary member-function path, which dereferenced a null
+// declaration-specifier for the ctor's absent return type.
+interface IHandleRoot { int root(); };
+interface IHandle : IHandleRoot { int h(); };
+
+namespace Win32
+{
+    interface IHandle { int nativeHandle(); };
+    class WinFile : Win32.IHandle
+    {
+        int v = 0;
+        WinFile() {}
+        int nativeHandle() { return v; }
+    };
+};
+
+expect_error("does not implement interface 'IHandleRoot'") {
+    extern int main()
+    {
+        Win32.WinFile w = Win32.WinFile();
+        IHandleRoot e = w;
+        return e.root();
+    }
+}
