@@ -4,6 +4,18 @@ expect_error("array views are not supported - a view does not own its buffer") {
     struct S { unique int[] view = default; };
 }
 
+// Same rule for a LOCAL view, and for a view whose element type is an INTERFACE. The
+// interface form used to slip past as if it were one owning fat value.
+expect_error("array views are not supported - a view does not own its buffer") {
+    int takesLocal() { unique int[] v = new int[2]; return v[0]; }
+}
+
+interface IOwned { int val(); };
+
+expect_error("array views are not supported - a view does not own its buffer") {
+    int takesIface() { unique IOwned[] v = new IOwned[2]; return 0; }
+}
+
 extern int main()
 {
     return 0;

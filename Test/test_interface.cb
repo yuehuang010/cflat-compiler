@@ -2045,6 +2045,101 @@ bool testInterfaceArrayField()
     return result;
 }
 
+// An `IShape[]` array VIEW - element type an INTERFACE - used to lower as one bare fat struct
+// instead of a pointer to a run of them, so every element GEP and the view's `noalias` parameter
+// attribute were built against the struct type and the module failed LLVM verification.
+int ifaceViewSum(IShape[] items, int n)
+{
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += items[i].area();
+    return sum;
+}
+
+void ifaceViewSetSecond(IShape[] items, IShape v)
+{
+    items[1] = v;
+}
+
+// A view of interfaces held as a struct FIELD, and one RETURNED across a call boundary.
+struct IfaceViewHolder
+{
+    IShape[] items = default;
+    int n = 0;
+    int sum() { int s = 0; for (int i = 0; i < n; i++) s += items[i].area(); return s; }
+};
+
+IShape[] ifaceViewFresh(int n)
+{
+    return new IShape[n];
+}
+
+
+bool testInterfaceArrayViewOfInterfaces()
+{
+    bool result = true;
+
+    Square[4] sqs = default;
+    Circle[4] cis = default;
+    for (int i = 0; i < 4; i++) { sqs[i].s = i + 1; cis[i].r = i + 1; }
+
+    IShape[] view = new IShape[4];
+    for (int i = 0; i < 4; i++) view[i] = sqs[i];
+
+    // Reading an element and dispatching through it, across a call that takes the view.
+    result &= Test("iface_view_sum", ifaceViewSum(view, 4), 1 + 4 + 9 + 16);
+
+    // Writing an element through a view the callee received as a parameter.
+    ifaceViewSetSecond(view, cis[2]);
+    result &= Test("iface_view_write_through", ifaceViewSum(view, 4), 1 + 27 + 9 + 16);
+
+    // Rebox: a DERIVED interface value stored into an IShape slot goes through the
+    // interface-to-interface rebox path, not a plain fat-struct copy.
+    IDrawable d = cis[3];
+    view[0] = d;
+    result &= Test("iface_view_rebox_elem", view[0].area(), 48);
+
+    // An element read out into a bare interface local keeps that element's target.
+    IShape e = view[2];
+    result &= Test("iface_view_elem_local", e.area(), 9);
+
+    // An empty view is legal; iterating it touches nothing.
+    IShape[] empty = new IShape[0];
+    result &= Test("iface_view_empty", ifaceViewSum(empty, 0), 0);
+
+    // The view rides in a struct FIELD and dispatches per element from a method.
+    IfaceViewHolder h = default;
+    h.items = view;
+    h.n = 4;
+    result &= Test("iface_view_field_sum", h.sum(), 48 + 27 + 9 + 16);
+
+    // A '?:' over two views picks a view, not an interface box - both arms are already
+    // pointers, so nothing needs boxing and the join must not demand a concrete class.
+    bool pick = h.n == 4;
+    IShape[] chosen = pick ? view : empty;
+    result &= Test("iface_view_ternary", chosen[2].area(), 9);
+
+    // A view RETURNED from a function. Its unwritten elements must read as null interfaces.
+    // NOTE: this pins the SEMANTICS, not the buffer-zeroing that implements them - macOS's
+    // allocator scrubs freed blocks, so no .cb-level heap pollution can tell a missing memset
+    // from a present one here. The memset itself is guarded by reading the emitted IR.
+    IShape[] fresh = ifaceViewFresh(3);
+    int nonNull = 0;
+    for (int i = 0; i < 3; i++) if (fresh[i] != nullptr) nonNull++;
+    result &= Test("iface_view_new_zeroed", nonNull, 0);
+
+    fresh[1] = sqs[2];
+    result &= Test("iface_view_returned_write", fresh[1].area(), 9);
+    result &= Test("iface_view_null_guard_count", fresh[1] != nullptr, true);
+
+    // Freeing a view of interfaces frees the BUFFER, exactly as a struct view does; it must
+    // not take the by-value interface teardown (which used to crash the compiler outright).
+    delete fresh;
+    delete empty;
+    delete view;
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -2090,6 +2185,7 @@ extern int main()
     total++; passed += testInterfaceArgPaths()                ? 1 : 0;
     total++; passed += testInterfaceMethodOwnershipContract()  ? 1 : 0;
     total++; passed += testInterfaceArrayField()               ? 1 : 0;
+    total++; passed += testInterfaceArrayViewOfInterfaces()    ? 1 : 0;
     total++; passed += testInterfaceReboxDeclarationOrder()    ? 1 : 0;
     total++; passed += testInterfaceReboxAcrossImport()        ? 1 : 0;
     total++; passed += testInterfaceReboxUninstantiatedGeneric() ? 1 : 0;

@@ -454,6 +454,11 @@ public:
         bool ElemPointer = false; // true when this is T** (pointer to pointer), e.g. T* field where T is a pointer type
         bool IsInterface = false;
         bool IsInterfacePointer = false; // true when T is interface AND this is a pointer TO that fat-ptr (e.g. T* field where T=IMessage, or channel<IMessage*>)
+        // True when this type IS one bare interface fat value ({vtable,data} by value). DERIVED,
+        // never stored, so it cannot drift. An `IFace[]` array view is a thin POINTER to a run of
+        // fat values, not one of them - it must take the pointer paths, so it is excluded here.
+        // Prefer this over spelling `IsInterface && !IsInterfacePointer` at a new site.
+        bool IsFatInterfaceValue() const { return IsInterface && !IsInterfacePointer && !IsArrayView; }
         bool IsNullable = false;
         bool IsMove = false;     // parameter declared with 'move' - function takes ownership
         bool IsAlias = false;    // return/decl declared with 'alias' - by-value borrow; caller must not free the interior
@@ -1975,7 +1980,7 @@ private:
     {
         return namedVar.IsOwning && namedVar.Storage != nullptr
             && (namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg)
-            && namedVar.TypeAndValue.IsInterface && !namedVar.TypeAndValue.IsInterfacePointer;
+            && namedVar.TypeAndValue.IsFatInterfaceValue();
     }
 
     // Free a `unique`/`move` interface VALUE (local or param): load the fat value from its slot
@@ -2009,7 +2014,7 @@ private:
         auto* arrTy = llvm::cast<llvm::ArrayType>(namedVar.BaseType);
         auto* elemTy = arrTy->getElementType();
         uint64_t count = arrTy->getNumElements();
-        bool isIface = namedVar.TypeAndValue.IsInterface && !namedVar.TypeAndValue.IsInterfacePointer;
+        bool isIface = namedVar.TypeAndValue.IsFatInterfaceValue();
         for (uint64_t i = 0; i < count; i++)
         {
             auto* elemPtr = builder->CreateConstInBoundsGEP2_64(arrTy, namedVar.Storage, 0, i, "uniq.elem");
@@ -3262,7 +3267,7 @@ private:
         {
             // Any interface fat-ptr param is handled here, never falling through to EmitOwningPtrCleanup
             // (which would bitcast the {i8*,i8*} slot - invalid IR); only a `unique` (owning) one is freed.
-            if (namedVar.TypeAndValue.IsInterface && !namedVar.TypeAndValue.IsInterfacePointer)
+            if (namedVar.TypeAndValue.IsFatInterfaceValue())
             {
                 if (IsOwningInterfaceValue(namedVar))
                     EmitOwningInterfaceCleanup(namedVar);
@@ -3368,7 +3373,9 @@ private:
             bool uniqueAutoSink = itr_nameArg->IsUniqueTypeArg && !itr_nameArg->IsAlias
                 && !itr_nameArg->IsBorrowOfUniqueElement;
 
-            if (itr_nameArg->IsInterface && !itr_nameArg->IsInterfacePointer)
+            // An `IFace[]` view arrives as a thin pointer to a run of fat structs, not as one
+            // fat struct by value, so it must fall through to the pointer-parameter path below.
+            if (itr_nameArg->IsFatInterfaceValue())
             {
                 // Interface args arrive by value ({i8*,i8*}). Store in a temp alloca so
                 // Storage is a {i8*,i8*}* pointer suitable for CallInterfaceMethod GEP.
@@ -3549,7 +3556,7 @@ private:
         }
 
         // Interface fat pointer {i8* vtable, i8* data} - cached once.
-        if (tv.IsInterface && !tv.IsInterfacePointer)
+        if (tv.IsFatInterfaceValue())
         {
             auto it = diTypeCache.find("__interface_fatptr");
             if (it != diTypeCache.end()) return it->second;
@@ -4402,8 +4409,8 @@ private:
             // Scalar `unique IFace field`: a boxed interface value is a {i8*,i8*} fat pointer, so
             // f.Pointer is false above. Route it to the fat-pointer-aware emitter (vtable dtor
             // slot + operator delete), the same release the array arm gives each element.
-            if ((f.IsUnique || f.IsUniqueTypeArg) && f.IsInterface && !f.IsInterfacePointer
-                && !f.ElemPointer && !f.IsArrayView && !f.IsSimd && !f.IsBitfield && !f.IsPadding
+            if ((f.IsUnique || f.IsUniqueTypeArg) && f.IsFatInterfaceValue()
+                && !f.ElemPointer && !f.IsSimd && !f.IsBitfield && !f.IsPadding
                 && f.ConstArraySize == 0)
             {
                 work.push_back({ i, nullptr, false, f.TypeName, 0, false, true, true });
@@ -4415,9 +4422,9 @@ private:
             if ((f.IsUnique || f.IsUniqueTypeArg) && f.ConstArraySize > 0
                 && !f.ElemPointer && !f.IsArrayView && !f.IsSimd && !f.IsBitfield && !f.IsPadding
                 && f.ConstInnerDimensions.empty()
-                && (f.Pointer || (f.IsInterface && !f.IsInterfacePointer)))
+                && (f.Pointer || f.IsFatInterfaceValue()))
             {
-                bool iface = f.IsInterface && !f.IsInterfacePointer;
+                bool iface = f.IsFatInterfaceValue();
                 work.push_back({ i, nullptr, false, f.TypeName, f.AllocAlignValue, true, iface });
                 continue;
             }
@@ -12019,8 +12026,7 @@ public:
                 // boxing an owning pointer into a `move` interface param transfers ownership (like
                 // `IFace x = ptr`). Its source must be nulled, or the local is freed at scope exit
                 // while the callee (e.g. list<IFace>) still holds it - a double free.
-                bool isInterfaceBorrow = params[i].IsInterface
-                    && !params[i].IsInterfacePointer
+                bool isInterfaceBorrow = params[i].IsFatInterfaceValue()
                     && !args[i].TypeAndValue.Pointer;
                 // When the arg expression went through a cast (or similar), args[i].Storage
                 // may be cleared even though CallerName still names the original owning variable.
@@ -12042,8 +12048,8 @@ public:
                 // its scope-exit teardown sees null and no-ops, else callee and source double-free.
                 // Raw struct-value boxes are rejected at the call site, so only a real interface
                 // value reaches here; the owning check keeps a borrow source untouched.
-                if (params[i].IsInterface && !params[i].IsInterfacePointer
-                    && args[i].TypeAndValue.IsInterface
+                if (params[i].IsFatInterfaceValue()
+                    && args[i].TypeAndValue.IsFatInterfaceValue()
                     && (args[i].IsOwning || IsVariableOwning(args[i].CallerName))
                     && srcStorage != nullptr)
                 {
@@ -15697,7 +15703,9 @@ public:
                 auto* fatTy = GetFatPtrType();
                 if (typeAndValue.ElemPointer)
                     type = fatTy->getPointerTo()->getPointerTo(); // {i8*,i8*}** (T* where T=IFace*)
-                else if (allowPointer && typeAndValue.IsInterfacePointer)
+                // An `IFace[]` array view is a thin pointer to a run of fat structs, so it lowers
+                // like `IFace*`; without this it would lower to the bare struct and every GEP fails.
+                else if (allowPointer && (typeAndValue.IsInterfacePointer || typeAndValue.IsArrayView))
                     type = fatTy->getPointerTo();                 // {i8*,i8*}* (T* where T=IFace, or T=IFace*)
                 else
                     type = fatTy;                                 // {i8*,i8*}  (bare fat ptr)

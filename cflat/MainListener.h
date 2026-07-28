@@ -3230,9 +3230,15 @@ private:
                 // or an interface only (D1). A field is validated separately by ValidateUniqueField.
                 if (declType.IsUnique && !inStructFieldDecl_)
                 {
+                    // A view never owns its buffer, so it can never be the thing a scope-exit
+                    // teardown deletes. Same rule (and wording) as the field form.
+                    if (declType.IsArrayView)
+                        LogErrorContext(declSpec, std::format(
+                            "'unique' on '{}[]': array views are not supported - a view does not "
+                            "own its buffer", declType.TypeName));
                     bool uniqueSingleIndirect = (declType.Pointer && !declType.ElemPointer
-                        && !declType.IsArrayView) || declType.IsInterface;
-                    if (!uniqueSingleIndirect)
+                        && !declType.IsArrayView) || declType.IsFatInterfaceValue();
+                    if (!uniqueSingleIndirect && !declType.IsArrayView)
                         LogErrorContext(declSpec, std::format(
                             "unique requires a pointer or interface type; '{}' is neither", declType.TypeName));
                 }
@@ -7376,7 +7382,7 @@ public:
             LogErrorContext(ctx, "'unique' on " + field + ": a bitfield is not a pointer type");
         // A boxed interface VALUE is a {i8*,i8*} fat pointer, not a single-indirection pointer, but
         // the synthesized destructor releases it through the vtable dtor slot - so allow it.
-        bool ifaceValue = f.IsInterface && !f.IsInterfacePointer && !f.ElemPointer;
+        bool ifaceValue = f.IsFatInterfaceValue() && !f.ElemPointer;
         if ((!f.Pointer || f.ElemPointer) && !ifaceValue)
             LogErrorContext(ctx, "'unique' on " + field + " requires a single-indirection pointer type such as 'unique Node* n'");
     }
@@ -7571,7 +7577,7 @@ public:
             || elemOwnershipType.ElementOwningUnique;
         bool thinPtr = elemOwnershipType.Pointer && !elemOwnershipType.ElemPointer
             && !elemOwnershipType.IsInterface;
-        bool uniqueIface = elemOwnershipType.IsInterface && !elemOwnershipType.IsInterfacePointer;
+        bool uniqueIface = elemOwnershipType.IsFatInterfaceValue();
         if (unique && (thinPtr || uniqueIface))
         {
             nv.IsOwning = true;
@@ -7943,7 +7949,7 @@ public:
                         compiler->pendingInitAllocAlign = typeAndValue.AllocAlignValue;
                     if (assignmentExpression != nullptr)
                     {
-                        if (typeAndValue.IsInterface)
+                        if (typeAndValue.IsFatInterfaceValue())
                         {
                             // For interface declarations, preserve NamedVariable type info
                             // so we can do the class->interface fat-struct upcast when needed.
@@ -10314,8 +10320,7 @@ public:
             }
             // Derived-interface -> parent-interface assignment: re-box through the typedesc chain.
             // A '?:' RHS carries no NamedVariable TypeName, so fall back to its join ledger.
-            else if (operatorText == "=" && namedVar.TypeAndValue.IsInterface
-                     && !namedVar.TypeAndValue.IsInterfacePointer
+            else if (operatorText == "=" && namedVar.TypeAndValue.IsFatInterfaceValue()
                      && right && right->getType() == compiler->GetFatPtrType())
             {
                 std::string srcIface = compiler->ResolveFatInterfaceSrcName(right,
@@ -10332,8 +10337,7 @@ public:
             // (ParseDeclaration). A null value (raw null or the null fat-ptr from the nullptr upcast
             // above) owns nothing and is allowed.
             bool destUniqueIface = namedVar.TypeAndValue.IsUnique
-                && namedVar.TypeAndValue.IsInterface
-                && !namedVar.TypeAndValue.IsInterfacePointer;
+                && namedVar.TypeAndValue.IsFatInterfaceValue();
             bool srcIsNullForUniqueIface = right != nullptr
                 && ((llvm::isa<llvm::Constant>(right)
                         && llvm::cast<llvm::Constant>(right)->isNullValue())
@@ -10976,7 +10980,7 @@ public:
             }
 
             if (destIsElemSlot && right->getType()->isStructTy()
-                && rightNV.TypeAndValue.IsInterface && !rightNV.TypeAndValue.IsInterfacePointer
+                && rightNV.TypeAndValue.IsFatInterfaceValue()
                 && (rightNV.TypeAndValue.IsUnique || rightNV.TypeAndValue.IsUniqueTypeArg))
             {
                 // unique <interface> element: store the fat value, then zero + mark-moved a NAMED
@@ -12755,8 +12759,8 @@ public:
     {
         auto* compiler = Compiler();
         llvm::Value* result = LoadNamedVariableImpl(namedVar);
-        if (result != nullptr && namedVar.TypeAndValue.IsInterface
-            && !namedVar.TypeAndValue.IsInterfacePointer && !namedVar.TypeAndValue.Pointer)
+        if (result != nullptr && namedVar.TypeAndValue.IsFatInterfaceValue()
+            && !namedVar.TypeAndValue.Pointer)
             compiler->RegisterFatInterfaceValueTypeName(result, namedVar.TypeAndValue.TypeName);
         return result;
     }
@@ -14957,11 +14961,9 @@ public:
         if (isArray && useAligned)
             compiler->builder->CreateAlignmentAssumption(compiler->module->getDataLayout(), typedPtr, (unsigned)allocAlign);
 
-        // Zero a pointer-element array buffer. No per-element ctor runs for pointer slots
-        // (see the typeIsPtr skip below), so an owning array (`array<unique T*>`) would
-        // otherwise `delete` uninitialized garbage in its release/teardown paths. A borrow
-        // array benefits too: an unset slot reads null instead of a stale heap pointer.
-        if (isArray && count && typeIsPtr)
+        // Zero a pointer- or interface-element buffer: no per-element ctor runs for either, so an
+        // unset slot must read null, not a stale pointer or a garbage vtable an indirect call uses.
+        if (isArray && count && (typeIsPtr || compiler->IsInterfaceType(typeName)))
         {
             llvm::Align ptrAlign = compiler->module->getDataLayout().getABITypeAlign(elemType);
             compiler->builder->CreateMemSet(typedPtr, compiler->builder->getInt8(0), sizeVal, ptrAlign);
@@ -15157,8 +15159,7 @@ public:
             operandAllocAlign = namedVar.AllocAlignment;
             // An interface value is a {vtable, data} fat struct, not a raw pointer; flag it so
             // the free path below extracts the data pointer and dispatches the dtor virtually.
-            isInterfaceOperand = namedVar.TypeAndValue.IsInterface
-                && !namedVar.TypeAndValue.IsInterfacePointer && !sawCast;
+            isInterfaceOperand = namedVar.TypeAndValue.IsFatInterfaceValue() && !sawCast;
 
             // Error: 'delete' on a value-type local (a struct VALUE, not a pointer). Value
             // types are auto-destructed at scope exit, so this is always a user error; without
@@ -15704,7 +15705,7 @@ public:
         // would mark the whole array moved), and an interface is not a dataStructures entry, so the
         // slot below never zeroes. Zero the {i8*,i8*} here or the array teardown double-frees it.
         if (!argNV.TypeAndValue.Pointer && argNV.IsElementAccess && argNV.Storage
-            && argNV.TypeAndValue.IsInterface && !argNV.TypeAndValue.IsInterfacePointer)
+            && argNV.TypeAndValue.IsFatInterfaceValue())
         {
             compiler->builder->CreateStore(
                 llvm::ConstantAggregateZero::get(compiler->GetFatPtrType()), argNV.Storage);
@@ -15729,7 +15730,7 @@ public:
         // interface local (e.g. from a move-returning call) is equally safe to move - it is not
         // auto-freed at scope exit, so consuming it here leaks nothing.
         if (!argNV.TypeAndValue.Pointer && argNV.Storage
-            && argNV.TypeAndValue.IsInterface && !argNV.TypeAndValue.IsInterfacePointer
+            && argNV.TypeAndValue.IsFatInterfaceValue()
             && !IsDirectCallArgument(ctx)
             && !argNV.CallerName.empty() && compiler->IsVariableOwning(argNV.CallerName))
         {
