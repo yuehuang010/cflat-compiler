@@ -1,0 +1,24 @@
+// Too FEW arguments to an interface method used to reach LLVM as a call with a missing
+// operand ("Incorrect number of arguments passed to called function!"). Arity is checked
+// during slot selection now, so it is a normal diagnostic.
+interface IOne
+{
+    int go(int a);
+};
+
+class One : IOne
+{
+    int go(int a) { return 100 + a; }
+};
+
+extern int main()
+{
+    One o;
+    IOne io = o;
+
+    expect_error("no overload of interface method 'IOne.go' takes 0 argument(s); expected 1") {
+        int tooFew = io.go();
+    }
+
+    return 0;
+}

@@ -3481,6 +3481,7 @@ public:
         std::vector<LLVMBackend::InterfaceMethod> methods;
         for (auto method : InterfaceMethods(ctx))
         {
+            if (RejectVariadicInterfaceMethod(name, method)) continue;
             LLVMBackend::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
             m.Name = getInterfaceMethodName(method);
@@ -3494,6 +3495,24 @@ public:
         }
 
         Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods, ParseInterfaceFields(ctx));
+    }
+
+    /*
+     * A variadic interface method has no working lowering: the vtable slot's FunctionType is
+     * built from the DECLARED parameters only (InterfaceMethod::Parameters excludes the '...'),
+     * so the call site dropped every surplus argument - and, before the signature-based slot
+     * selection, even the fixed ones. Reject the declaration honestly instead of miscompiling it.
+     */
+    bool RejectVariadicInterfaceMethod(const std::string& ifaceName,
+                                       CFlatParser::InterfaceMethodContext* method)
+    {
+        auto* paramList = method->parameterTypeList();
+        if (paramList == nullptr || paramList->Ellipsis() == nullptr) return false;
+        LogErrorContext(method, std::format(
+            "interface method '{}.{}' cannot be variadic - '...' is not dispatchable through a "
+            "vtable; declare a fixed-parameter overload instead",
+            ifaceName, getInterfaceMethodName(method)));
+        return true;
     }
 
     /*
@@ -3558,6 +3577,7 @@ public:
         std::vector<LLVMBackend::InterfaceMethod> methods;
         for (auto method : InterfaceMethods(ctx))
         {
+            if (RejectVariadicInterfaceMethod(mangledName, method)) continue;
             LLVMBackend::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
             m.Name = getInterfaceMethodName(method);
@@ -19532,7 +19552,8 @@ public:
                                 // return type defaults to void and its `ret` fails module verification.
                                 const std::vector<LLVMBackend::TypeAndValue>* ifaceParams =
                                     Compiler(ctx)->GetInterfaceMethodParams(
-                                        interfaceVar.TypeAndValue.TypeName, primaryIdentifier);
+                                        interfaceVar.TypeAndValue.TypeName, primaryIdentifier,
+                                        namedArgCtx.size());
                                 for (size_t argIdx = 0; argIdx < namedArgCtx.size(); ++argIdx)
                                 {
                                     const auto& namedArgument = namedArgCtx[argIdx];

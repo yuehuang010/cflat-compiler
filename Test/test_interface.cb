@@ -2140,6 +2140,76 @@ bool testInterfaceArrayViewOfInterfaces()
     return result;
 }
 
+/*
+ * Interface method dispatch used to pick the vtable slot by NAME alone, so every overload in a
+ * set resolved to the first slot and surplus arguments were silently discarded. The vtable was
+ * always populated per full signature; only the call site was wrong.
+ */
+interface IOvArity
+{
+    int go(int a);
+    int go(int a, int b);
+};
+
+class OvArity : IOvArity
+{
+    // Declared in the OPPOSITE order from the contract: slot order follows the interface.
+    int go(int a, int b) { return a * b; }
+    int go(int a) { return 100 + a; }
+};
+
+interface IOvType
+{
+    int pick(int a);
+    int pick(const char* s);
+    int pick(double d);
+};
+
+class OvType : IOvType
+{
+    int pick(const char* s) { return 2; }
+    int pick(double d) { return 3; }
+    int pick(int a) { return 1; }
+};
+
+interface IOvBase { int mix(int a); };
+interface IOvChild : IOvBase { int mix(int a, int b); };
+
+class OvChild : IOvChild
+{
+    int mix(int a) { return 100 + a; }
+    int mix(int a, int b) { return a * b; }
+};
+
+bool testInterfaceOverloadDispatch()
+{
+    bool result = true;
+
+    OvArity oa;
+    IOvArity ia = oa;
+    result &= Test("iface_ov_arity_1", ia.go(7), 107);
+    result &= Test("iface_ov_arity_2", ia.go(7, 3), 21);
+
+    OvType ot;
+    IOvType it = ot;
+    result &= Test("iface_ov_type_int", it.pick(7), 1);
+    result &= Test("iface_ov_type_str", it.pick("hi"), 2);
+    result &= Test("iface_ov_type_dbl", it.pick(1.5), 3);
+
+    // Parent declares one overload, child the other: the flattened slot list must keep both.
+    OvChild oc;
+    IOvChild ic = oc;
+    result &= Test("iface_ov_inherited_1", ic.mix(7), 107);
+    result &= Test("iface_ov_inherited_2", ic.mix(7, 3), 21);
+
+    // Same selection through the '?.' null-conditional call path on a non-null receiver.
+    IOvArity? na = oa;
+    result &= Test("iface_ov_nullcond_1", na?.go(7), 107);
+    result &= Test("iface_ov_nullcond_2", na?.go(7, 3), 21);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -2189,6 +2259,7 @@ extern int main()
     total++; passed += testInterfaceReboxDeclarationOrder()    ? 1 : 0;
     total++; passed += testInterfaceReboxAcrossImport()        ? 1 : 0;
     total++; passed += testInterfaceReboxUninstantiatedGeneric() ? 1 : 0;
+    total++; passed += testInterfaceOverloadDispatch()           ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

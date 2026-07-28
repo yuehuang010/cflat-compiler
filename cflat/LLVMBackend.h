@@ -9073,20 +9073,42 @@ public:
         return false;
     }
 
-    // The declared parameters of an interface method (implicit 'this' excluded), or nullptr.
-    // Lets the call site type a lambda-literal argument against the declared signature.
-    const std::vector<TypeAndValue>* GetInterfaceMethodParams(const std::string& ifaceName,
-                                                             const std::string& methodName) const
+    /*
+     * The name-matching slot whose arity is argCount, or the first name match when no slot has
+     * that arity (or argCount is npos). Name alone is not a key - an overloaded contract has
+     * several slots under one name, and picking the first is what made dispatch miscompile.
+     */
+    const InterfaceMethod* FindInterfaceMethod(const std::string& ifaceName,
+                                               const std::string& methodName,
+                                               size_t argCount = (size_t)-1) const
     {
         auto it = interfaceTable.find(ifaceName);
         if (it == interfaceTable.end()) return nullptr;
+        const InterfaceMethod* firstByName = nullptr;
         for (const auto& m : it->second)
-            if (m.Name == methodName) return &m.Parameters;
-        return nullptr;
+        {
+            if (m.Name != methodName) continue;
+            if (firstByName == nullptr) firstByName = &m;
+            if (argCount != (size_t)-1 && m.Parameters.size() == argCount) return &m;
+        }
+        return firstByName;
+    }
+
+    // The declared parameters of an interface method (implicit 'this' excluded), or nullptr.
+    // Lets the call site type a lambda-literal argument against the declared signature.
+    const std::vector<TypeAndValue>* GetInterfaceMethodParams(const std::string& ifaceName,
+                                                             const std::string& methodName,
+                                                             size_t argCount = (size_t)-1) const
+    {
+        const InterfaceMethod* m = FindInterfaceMethod(ifaceName, methodName, argCount);
+        return m != nullptr ? &m->Parameters : nullptr;
     }
 
     // The declared return type of an interface method, or nullptr. Lets a `?.` call site
     // build the null-path default value's type without invoking the method.
+    // Name-only first match, unlike the signature-aware slot selection in
+    // ResolveInterfaceMethodSlot: currently unused, so give it FindInterfaceMethod's
+    // arity argument before wiring up any caller that can see an overload set.
     const TypeAndValue* GetInterfaceMethodReturnType(const std::string& ifaceName,
                                                     const std::string& methodName) const
     {
@@ -12220,6 +12242,97 @@ public:
         return value;
     }
 
+    /*
+     * Pick the vtable slot for an interface method call by FULL SIGNATURE. Slots are gathered by
+     * name, filtered by arity, then ranked with the same scorer the direct-call path uses
+     * (ComputeOverloadFunction), so `io.go(a)` and `io.go(a, b)` reach different slots.
+     * GetOrCreateVTable already populates each slot from the matching implementor overload, so
+     * only the call site needed the signature match. Returns the slot index, or -1 after an error.
+     * matchedArgs receives the arguments reordered against the winning slot's parameters.
+     */
+    int ResolveInterfaceMethodSlot(const std::string& ifaceName, const std::string& methodName,
+        const std::vector<InterfaceMethod>& methods, const std::vector<NamedVariable>& args,
+        std::vector<NamedVariable>& matchedArgs)
+    {
+        matchedArgs = args;
+
+        std::vector<int> byName;
+        for (int i = 0; i < (int)methods.size(); i++)
+            if (methods[i].Name == methodName) byName.push_back(i);
+
+        if (byName.empty())
+        {
+            LogError(std::format("interface '{}' has no method '{}'", ifaceName, methodName));
+            return -1;
+        }
+
+        // A variadic interface method is rejected at its declaration (no vtable lowering exists
+        // for '...'), so every slot here has a fixed parameter list and arity is exact.
+        std::vector<int> byArity;
+        for (int idx : byName)
+            if (methods[idx].Parameters.size() == args.size()) byArity.push_back(idx);
+
+        if (byArity.empty())
+        {
+            // Distinct arities only: same-arity overloads differ by TYPE, and listing "1 or 1"
+            // would read as nonsense. Sorted so the list is stable across declaration order.
+            std::vector<size_t> arities;
+            for (int idx : byName) arities.push_back(methods[idx].Parameters.size());
+            std::sort(arities.begin(), arities.end());
+            arities.erase(std::unique(arities.begin(), arities.end()), arities.end());
+
+            std::string expected;
+            for (size_t i = 0; i < arities.size(); i++)
+            {
+                if (i > 0) expected += (i + 1 == arities.size()) ? " or " : ", ";
+                expected += std::to_string(arities[i]);
+            }
+            LogError(std::format(
+                "no overload of interface method '{}.{}' takes {} argument(s); expected {}",
+                ifaceName, methodName, args.size(), expected));
+            return -1;
+        }
+
+        if (byArity.size() == 1)
+        {
+            // Route a single match through MatchFunction anyway so a named argument
+            // (`f(count: n)`) still lands in its declared slot.
+            if (!args.empty())
+            {
+                auto matched = MatchFunction(args, methods[byArity[0]].Parameters);
+                if (!matched.empty()) matchedArgs = matched;
+            }
+            return byArity[0];
+        }
+
+        std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> candidates;
+        for (int idx : byArity)
+        {
+            std::vector<NamedVariable> matched;
+            if (!args.empty())
+            {
+                matched = MatchFunction(args, methods[idx].Parameters, false, true);
+                if (matched.empty()) continue;
+            }
+            FunctionSymbol sym;
+            sym.UniqueName = std::to_string(idx);   // slot index carrier; also the "matched" marker
+            sym.ReturnType = methods[idx].ReturnType;
+            sym.Parameters = methods[idx].Parameters;
+            candidates.emplace_back(matched, sym);
+        }
+
+        const auto& [scored, winner] = ComputeOverloadFunction(candidates);
+        if (!winner.UniqueName.empty())
+        {
+            if (!scored.empty()) matchedArgs = scored;
+            return std::stoi(winner.UniqueName);
+        }
+
+        // Same arity, no type winner: keep the historical first-slot pick rather than reject a
+        // program the scorer cannot rank (an unresolved generic argument lands here).
+        return byArity[0];
+    }
+
     llvm::Value* CallInterfaceMethod(llvm::Value* ifacePtr, const std::string& ifaceName,
         const std::string& methodName, const std::vector<NamedVariable>& extraArgNVs)
     {
@@ -12239,22 +12352,12 @@ public:
             return nullptr;
         }
 
-        int methodIdx = -1;
-        const InterfaceMethod* methodInfo = nullptr;
-        for (int i = 0; i < (int)ifaceIt->second.size(); i++)
-        {
-            if (ifaceIt->second[i].Name == methodName)
-            {
-                methodIdx = i;
-                methodInfo = &ifaceIt->second[i];
-                break;
-            }
-        }
+        std::vector<NamedVariable> callArgNVs;
+        int methodIdx = ResolveInterfaceMethodSlot(ifaceName, methodName, ifaceIt->second,
+                                                   extraArgNVs, callArgNVs);
         if (methodIdx < 0)
-        {
-            LogError(std::format("interface '{}' has no method '{}'", ifaceName, methodName));
             return nullptr;
-        }
+        const InterfaceMethod* methodInfo = &ifaceIt->second[methodIdx];
 
         // Method indices start at 1 (slot 0 is type ID)
         auto fnPtrField = builder->CreateGEP(ptrTy, vtablePtr, builder->getInt32(methodIdx + 1));
@@ -12270,10 +12373,12 @@ public:
             paramTypes.push_back(GetType(p));
         auto fnTy = llvm::FunctionType::get(retTy, paramTypes, false);
 
+        // callArgNVs is arity-matched to Parameters by the resolver, so no clamp here: a
+        // mismatched arity was already rejected instead of silently truncating the call.
         std::vector<llvm::Value*> callArgs = { dataPtr };
-        for (size_t i = 0; i < extraArgNVs.size() && i < methodInfo->Parameters.size(); i++)
+        for (size_t i = 0; i < callArgNVs.size() && i < methodInfo->Parameters.size(); i++)
         {
-            const auto& nv = extraArgNVs[i];
+            const auto& nv = callArgNVs[i];
             const auto& param = methodInfo->Parameters[i];
             if (param.IsInterface && !nv.TypeAndValue.IsInterface)
             {
@@ -12341,10 +12446,10 @@ public:
         // A `move` parameter on an INTERFACE method transfers ownership just as it does on a
         // direct call, so the caller's source must be nulled/marked-moved here too. Without this
         // the source keeps its owning flag and scope exit frees what the callee now owns.
-        for (size_t i = 0; i < methodInfo->Parameters.size() && i < extraArgNVs.size(); i++)
+        for (size_t i = 0; i < methodInfo->Parameters.size() && i < callArgNVs.size(); i++)
             DiagnoseExplicitMoveToBorrowParam(ifaceName + "." + methodName,
-                methodInfo->Parameters[i], extraArgNVs[i]);
-        ApplyMoveParamTransfer(ifaceName + "." + methodName, methodInfo->Parameters, extraArgNVs);
+                methodInfo->Parameters[i], callArgNVs[i]);
+        ApplyMoveParamTransfer(ifaceName + "." + methodName, methodInfo->Parameters, callArgNVs);
 
         // Classify the virtual result's ownership exactly like the direct-call path
         // (CreateOverloadedFunctionCall): a 'move string' / 'move T*' / 'move <interface>'
@@ -16043,7 +16148,9 @@ public:
         return possibleResult;
     }
 
-    std::vector<LLVMBackend::NamedVariable> MatchFunction(const std::vector<LLVMBackend::NamedVariable>& inputArguments, const std::vector<LLVMBackend::TypeAndValue>& targetArguments, bool isVariadic = false)
+    // `probe` = scoring one candidate of an overload set: a mismatch only disqualifies THIS
+    // candidate, so it returns {} instead of reporting - a losing candidate must never error.
+    std::vector<LLVMBackend::NamedVariable> MatchFunction(const std::vector<LLVMBackend::NamedVariable>& inputArguments, const std::vector<LLVMBackend::TypeAndValue>& targetArguments, bool isVariadic = false, bool probe = false)
     {
         // Two pass match.
         // 1) Align named arguments to fixed parameters by name.
@@ -16074,6 +16181,10 @@ public:
                 if (it != targetArguments.end())
                 {
                     posMap[posIndex] = std::distance(targetArguments.begin(), it);
+                }
+                else if (probe)
+                {
+                    return {};  // named but none matched - disqualify this candidate silently.
                 }
                 else
                 {

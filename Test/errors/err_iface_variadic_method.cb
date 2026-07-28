@@ -1,0 +1,14 @@
+// The grammar accepts '...' in an interface method, but there is no vtable lowering for it:
+// the slot's FunctionType is built from the declared parameters alone, so every variadic
+// argument was silently dropped at the call site. Reject the declaration instead.
+expect_error("interface method 'IVar.p' cannot be variadic") {
+    interface IVar
+    {
+        int p(const char* fmt, ...);
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

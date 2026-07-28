@@ -1,0 +1,26 @@
+// Interface dispatch selects the vtable slot by full signature. A call whose argument count
+// matches no overload in the set is rejected here - it used to be silently truncated to the
+// first same-named slot (surplus args dropped) or to reach LLVM with a wrong arg count.
+interface IOvA
+{
+    int go(int a);
+    int go(int a, int b);
+};
+
+class OvA : IOvA
+{
+    int go(int a) { return 100 + a; }
+    int go(int a, int b) { return a * b; }
+};
+
+extern int main()
+{
+    OvA o;
+    IOvA io = o;
+
+    expect_error("no overload of interface method 'IOvA.go' takes 3 argument(s); expected 1 or 2") {
+        int tooMany = io.go(1, 2, 3);
+    }
+
+    return 0;
+}
