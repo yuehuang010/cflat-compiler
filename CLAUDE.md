@@ -35,6 +35,38 @@ Guidelines:
 - If an agent at one tier fails or flails, escalate one tier with the failure context - do not retry the same tier with the same prompt, and do not silently absorb the work into the main session for convenience.
 - Independent sub-tasks should be spawned in parallel when they touch disjoint files.
 
+## Skills
+
+Project skills are **authored and tracked in `internal/skill/<name>/SKILL.md`** (tracked in
+git, like `internal/plan/` and `internal/issue/`). `.gitignore` ignores all of `.claude/`,
+so a skill living only under `.claude/skills/` is invisible to git and lost on a fresh
+clone - that is why the source of truth is `internal/skill/`.
+
+**Claude Code only auto-discovers project skills under `.claude/skills/`**, so a skill in
+`internal/skill/` is NOT invocable as `/<name>` - verified: with nothing under
+`.claude/skills/`, a fresh session reports no project skills. `internal/skill/` is the
+tracked, reviewable home; it is deliberately not the live one, and no symlink bridges them.
+
+Two ways to use a skill from here:
+
+- **Read it directly.** The file is a plain procedure - point at
+  `internal/skill/<name>/SKILL.md` and follow it. This is the default and needs no setup.
+- **Activate it for a session**, if you want the `/<name>` slash command:
+
+  ```bash
+  mkdir -p .claude/skills/<name>
+  cp internal/skill/<name>/SKILL.md .claude/skills/<name>/SKILL.md   # restart the session to pick it up
+  ```
+
+  That copy is gitignored and can drift. `internal/skill/` stays the source of truth: edit
+  there, re-copy, and never edit the copy under `.claude/`.
+
+Current skills:
+
+| Skill | Purpose |
+|-------|---------|
+| `fix-issue` | Fix an `internal/issue/` entry in an isolated worktree with a delegated agent, review with an opus code-review agent until clean, then merge to `master` as a single-parent commit. This skill is the one place the "do not commit" rule is lifted. |
+
 ## Text Output
 
 - Use plain ASCII characters for readable text in source files, comments, log messages, and documentation. Avoid Unicode punctuation such as en/em dashes, smart quotes, and ellipsis characters. Use ASCII `-`, `"`, `'`, and three dots `...` instead.

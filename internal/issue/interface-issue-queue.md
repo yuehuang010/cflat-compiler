@@ -9,6 +9,24 @@ here in the same change.
 
 Last updated 2026-07-28.
 
+## Resume point
+
+- master is `8a23621`, linear, tree clean.
+- Last recorded full verification was at `bf46022`: **504 passed / 0 failed / 8 skipped**,
+  examples **35 / 0**, LSP **152 / 0**. Five commits have landed since, three of which add
+  error tests, so that count is stale as a number - rerun before treating it as a baseline.
+- Queue head is [[generic-interface-namespace-scope-limit]].
+- **`fix/iface-ifconst` is SHELVED, not pending.** Branch is at `23418c2`, worktree present
+  at `../cflat-fix-iface-ifconst` with its ~60-file repro corpus in `scratch/` - the most
+  valuable artifact of that attempt. Read
+  [[iface-ifconst-blame-attempt-shelved]] before touching it; do not restart from scratch
+  and do not re-litigate the grammar facts recorded there.
+- `stash@{0}: review-fixes-and-untracked-plans` is pre-existing and intact. Its contents
+  have never been confirmed by the user - do not drop it.
+- The old "may a user file-scope interface share a name with a core interface" product
+  question is **RESOLVED** (hard error, kept and polished, shipped as `853cb87`). Do not
+  reopen it.
+
 ## Closed in the 2026-07-28 session
 
 - **`as` cast of a stack value to an interface crashed the compiler** - fixed. Root cause
@@ -75,8 +93,7 @@ Last updated 2026-07-28.
   on the Windows `[uuid]` / `[winrt]` path.
 - [[iface-ifconst-blame-attempt-shelved]] - READ BEFORE attempting the `if const` blame
   diagnostic again. A serious attempt shelved after eight review rounds / nine defects.
-  Branch `fix/iface-ifconst` @ `23418c2`; the linked worktree was on the macOS box and is
-  not present in this checkout.
+  See the resume point above for branch and worktree state.
 
 ## The structural theme
 
@@ -106,3 +123,74 @@ matching no category - which closes the whole family at once.
 [[constructor-discriminator-inconsistent-name-only-sites]],
 [[array-view-params-unconditionally-noalias]],
 [[expect-error-leaves-outer-nullcond-block-unterminated]].
+
+## Working notes from the fix-issue rounds
+
+Accumulated across the interface sessions. These are the notes that changed an outcome
+more than once; keep them with the queue rather than in any one issue file.
+
+**On reviews**
+
+- A review round found a CONFIRMED defect in nearly every round of this work. Never skip
+  them. Reviews repeatedly caught the fix agent's REASONING while its code was fine.
+- Never let the agent that wrote a fix be the only one to hunt for its consequences.
+  Rounds 6 and 7 of the `if const` attempt each INTRODUCED the next defect while fixing
+  the previous one, and self-review missed both times.
+- **When an agent cites a justification, check it still holds AFTER the change it is
+  justifying.** The shape-8 defect: "the Mark site feeds only `uncertainInterfaceImpls`,
+  which can only weaken a proof" was true when written and false after its own edit.
+  Over-broad candidate sets are SAFE for suppression and UNSAFE for blame.
+- Point reviewers at the TRUE master binary (`x64/Release/cflat`); make them rebuild BOTH
+  sides and verify the master binary's identity themselves.
+- **Verify the PROOF, not just the answer.** One proof drove both binaries with `--check`,
+  was vacuous, and still reported the right conclusion. Demand real `-o` codegen.
+  (Correction: `--check` DOES reach the zero-implementor rebox diagnostic - the blanket
+  claim that it never reaches rebox finalization is too strong.)
+- Make reviewers state how they validated their own harness is non-vacuous. One reviewer
+  ran its classifier against known-differing files in both directions first, and caught
+  that 2 of its 3 real diffs were HIDDEN because `expect_error` output looks like a
+  diagnostic on both sides.
+
+**On agent reports**
+
+- Agents have reported work that did not exist: one returned a status update as if it had
+  implemented the feature (worktree had 0 commits, 0 modified files); one claimed a review
+  round "found the correctness core clean" while that review was still RUNNING. **After
+  every agent report, check `git rev-list --count master..HEAD`, `git log`,
+  `git status --porcelain`, and the diff yourself before believing any of it.**
+- An agent that delegates can orphan a child that keeps writing to the worktree with no
+  one watching. Detect that before spawning a replacement, or two writers corrupt the
+  same files.
+- Counterexample worth trusting: an agent reporting a bug ITS OWN tests caught is doing
+  real work. Fabricated reports do not contain self-inflicted findings.
+
+**On the code**
+
+- **`LogError` THROWS - treat it as a control-flow edge.** Three bugs traced to state or
+  an IR bracket left open on the unwind path. Brief every fix agent on it.
+- A "this is dead code, so it needs no handling" justification is a deferred bug. Make the
+  agent prove the grammar constraint it depends on.
+- Before tightening a name-only discriminator, sweep `core/` and `example/` first. A
+  name-only rejection once turned `int C()` in a lock group - which master compiles and
+  runs correctly - into a hard error with a factually false message, and **the suite could
+  not see it: no in-repo `.cb` used the construct.**
+
+**On tests and docs**
+
+- **A test that pins a PATH in `expect_error` breaks on the other platform.**
+  `ShortenDefSiteForDisplay` returns native separators, deliberately. Pin the
+  basename + (line,col) TAIL only: separator- and cwd-agnostic, still a loud tripwire.
+  `expect_error` is a plain `.find()` substring check (`LLVMBackend.h:1201`).
+- **Docs must not sell an unreachable guard as the safety story.** `--init-clear`'s four
+  safety guards are provably dead code today; the doc called them "deliberately defensive"
+  and was rewritten to state the real contract. Apply such a correction to the COMMIT
+  MESSAGE too, since that outlives the doc.
+- Bugs needing 2+ `expect_error` legs in ONE function are a recurring blind spot.
+
+**On process**
+
+- Issue files can be wrong: one repro did not reproduce as written, another described a
+  fault milder than reality. Have the fix agent verify the repro FIRST and report what it
+  actually saw.
+- When an agent proposes diverging from the issue file's fix direction, treat it as a RISK.
+- Tell agents to use repo-root `scratch/` and never run `git stash`.
