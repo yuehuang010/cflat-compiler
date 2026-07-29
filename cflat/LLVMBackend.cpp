@@ -2504,6 +2504,7 @@ void LLVMBackend::ResetForReanalysis()
     ownedNewTemps_.clear();
     valueElementTypeNames_.clear();
     fatInterfaceValueTypeNames_.clear();
+    interfaceBoxRecords_.clear();
     movedOutPtrValues_.clear();
     movedBorrowedPtrValues_.clear();
     nonOwningStructJoins_.clear();

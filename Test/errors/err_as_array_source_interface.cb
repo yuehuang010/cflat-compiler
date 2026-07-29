@@ -67,6 +67,15 @@ expect_error("cannot convert 'Circle[3]' to interface 'IShape' - only a single i
     void globalPointerArray() { IShape s = gPtrArr as IShape; }
 }
 
+// An array VIEW parameter is the one pointer-shaped source the value classifier CANNOT see: it
+// lowers to a raw `ptr` with a class elemType, indistinguishable from a plain `Circle*`. Only
+// the source binding's TypeAndValue (IsArrayView) answers it, so this leg pins that the 'as'
+// spelling carries the binding through and rejects with the plain spelling's exact wording
+// instead of silently boxing element 0.
+expect_error("cannot convert 'Circle[]' to interface 'IShape' - only a single instance pointer 'Circle*' or a 'Circle' value can be boxed into an interface fat pointer; index or dereference it first") {
+    int viewParam(Circle[] v) { IShape s = v as IShape; return s.area(); }
+}
+
 // The 'is' spelling shares the classifier, so it shares the message.
 expect_error("cannot convert 'Circle[3]' to interface 'IShape' - only a single instance pointer 'Circle*' or a 'Circle' value can be boxed into an interface fat pointer; index or dereference it first") {
     void isSpelling() { Circle[3] arr; bool b = arr is IShape; }

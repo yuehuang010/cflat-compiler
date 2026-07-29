@@ -219,7 +219,11 @@ bool testAsBoxConcretePointerIntoInterface()
     cp.r = 4;
 
     // The crash repro: `as` from a plain class pointer into an interface must box.
-    IDrawable d = cp as IDrawable;
+    // Boxing an OWNING pointer moves ownership into the box (same as `IDrawable d = boxed;`),
+    // so the boxed object is a separate allocation from `cp`, which stays live below.
+    Circle* boxed = new Circle();
+    boxed.r = 4;
+    IDrawable d = boxed as IDrawable;
     result &= Test("as_box_ptr_area",  d.area(), 48);   // 4*4*3
     result &= Test("as_box_ptr_is_circle", d is Circle, true);
     d.draw();   // access through the boxed value must not fault
@@ -250,8 +254,43 @@ bool testAsBoxConcretePointerIntoInterface()
     result &= Test("concrete_ptr_is_circle_true",  cp is Circle, true);
     result &= Test("concrete_ptr_is_square_false", cp is Square, false);
 
+    // `d` owns what `boxed` used to; deleting the interface is the only correct release.
+    delete d;
     delete cp;
     delete sp;
+    return result;
+}
+
+/*
+ * Boxing an OWNING pointer with `as` transfers ownership into the box, exactly as the plain
+ * `move IDrawable f() { return sq; }` spelling does. Before the boxing paths were consolidated
+ * this callee ran its own scope-exit free on the object it had just handed out, so the caller
+ * read freed memory and then freed it a second time.
+ */
+move IDrawable makeHeapBoxed(int r)
+{
+    Circle* sq = new Circle();
+    sq.r = r;
+    return sq as IDrawable;
+}
+
+bool testAsBoxTransfersOwnership()
+{
+    bool result = true;
+
+    // The use-after-free repro: the returned box must still name a live object.
+    IDrawable h = makeHeapBoxed(7);
+    result &= Test("as_move_return_area", h.area(), 147);   // 7*7*3
+    delete h;
+
+    // The double-free repro: the source local is nulled and marked moved, so only the box
+    // owns the object - a second free at scope exit would abort the run before it reports.
+    Circle* owned = new Circle();
+    owned.r = 3;
+    IDrawable box = owned as IDrawable;
+    result &= Test("as_box_owning_area", box.area(), 27);   // 3*3*3
+    delete box;
+
     return result;
 }
 
@@ -2662,6 +2701,7 @@ extern int main()
     total++; passed += testAsToInterface()       ? 1 : 0;
     total++; passed += testAsBoxConcretePointerIntoInterface() ? 1 : 0;
     total++; passed += testAsBoxStackValueIntoInterface()      ? 1 : 0;
+    total++; passed += testAsBoxTransfersOwnership()           ? 1 : 0;
     total++; passed += testSwitchConcreteType()  ? 1 : 0;
     total++; passed += testSwitchInterfaceCase() ? 1 : 0;
     total++; passed += testSwitchDefault()       ? 1 : 0;

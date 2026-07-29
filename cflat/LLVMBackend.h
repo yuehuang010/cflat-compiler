@@ -1094,6 +1094,58 @@ public:
     // identity (see RegisterFatInterfaceValueTypeName). Retired with valueElementTypeNames_.
     std::vector<std::pair<llvm::Value*, std::string>> fatInterfaceValueTypeNames_;
 
+    /*
+     * What each class->interface boxing site actually boxed, recorded BY the boxing site instead
+     * of recovered afterwards by walking emitted IR (which is how the return-path lifetime check
+     * has to work today, and why it keeps missing shapes). Keyed by value identity on both the
+     * produced fat value and its data half, so a '?:' join is answerable through either. Lives
+     * for the whole function body - the guards that read it run in a LATER statement than the
+     * boxing - and is parked/cleared with the other per-function ledgers.
+     */
+    enum class InterfaceBoxSource
+    {
+        Unknown,
+        FrameStorage,  // an alloca in the boxing frame - the fat pointer dies with the frame
+        Heap,          // a `new` result / owning local - somebody must delete the box
+        Parameter,     // a pointer parameter - the caller owns the lifetime
+        Global         // a global - outlives everything
+    };
+
+    struct InterfaceBoxRecord
+    {
+        llvm::Value* FatValue = nullptr;
+        llvm::Value* DataPointer = nullptr;
+        std::string SourceClassName;
+        std::string InterfaceName;
+        InterfaceBoxSource Source = InterfaceBoxSource::Unknown;
+        // The owning source was nulled and marked moved at this site, so the box is the sole owner.
+        bool OwnershipTransferred = false;
+    };
+
+    std::vector<InterfaceBoxRecord> interfaceBoxRecords_;
+
+    void RegisterInterfaceBox(const InterfaceBoxRecord& record)
+    {
+        if (record.FatValue == nullptr) return;
+        for (auto& entry : interfaceBoxRecords_)
+            if (entry.FatValue == record.FatValue) { entry = record; return; }
+        interfaceBoxRecords_.push_back(record);
+    }
+
+    const InterfaceBoxRecord* FindInterfaceBoxByFatValue(const llvm::Value* value) const
+    {
+        for (const auto& entry : interfaceBoxRecords_)
+            if (entry.FatValue == value) return &entry;
+        return nullptr;
+    }
+
+    const InterfaceBoxRecord* FindInterfaceBoxByDataPointer(const llvm::Value* value) const
+    {
+        for (const auto& entry : interfaceBoxRecords_)
+            if (entry.DataPointer == value) return &entry;
+        return nullptr;
+    }
+
     // Pointer SSA values detached by a `move` expression, keyed by value identity. A move nulls its
     // source, so nobody owns the value until a receiver adopts it - but it is not a `new` result and
     // carries no free-site type, so it belongs in neither ledger above. Lets a '?:' join ask "is
@@ -3401,6 +3453,9 @@ private:
         aliasDomain_ = nullptr;
         aliasScopes_.clear();
         viewScopeByOrigin_.clear();
+        // Boxing provenance is per-function value identity; a prior function's entries must not
+        // answer a lookup here (see interfaceBoxRecords_).
+        interfaceBoxRecords_.clear();
 
         // populate function arguments
         auto itr_nameArg = arguments.begin();
@@ -8894,6 +8949,7 @@ public:
         std::vector<OwnedNewTemp> ownedNewTemps;
         std::vector<std::pair<llvm::Value*, std::string>> valueElementTypeNames;
         std::vector<std::pair<llvm::Value*, std::string>> fatInterfaceValueTypeNames;
+        std::vector<InterfaceBoxRecord> interfaceBoxRecords;
         std::vector<llvm::Value*> movedOutPtrValues;
         std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues;
         std::vector<llvm::Value*> nonOwningStructJoins;
@@ -8913,6 +8969,7 @@ public:
         s.ownedNewTemps       = std::move(ownedNewTemps_);
         s.valueElementTypeNames = std::move(valueElementTypeNames_);
         s.fatInterfaceValueTypeNames = std::move(fatInterfaceValueTypeNames_);
+        s.interfaceBoxRecords = std::move(interfaceBoxRecords_);
         s.movedOutPtrValues   = std::move(movedOutPtrValues_);
         s.movedBorrowedPtrValues = std::move(movedBorrowedPtrValues_);
         s.nonOwningStructJoins = std::move(nonOwningStructJoins_);
@@ -8927,6 +8984,7 @@ public:
         ownedNewTemps_.clear();
         valueElementTypeNames_.clear();
         fatInterfaceValueTypeNames_.clear();
+        interfaceBoxRecords_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
         nonOwningStructJoins_.clear();
@@ -8953,6 +9011,7 @@ public:
         ownedNewTemps_           = state.ownedNewTemps;
         valueElementTypeNames_   = state.valueElementTypeNames;
         fatInterfaceValueTypeNames_ = state.fatInterfaceValueTypeNames;
+        interfaceBoxRecords_    = state.interfaceBoxRecords;
         movedOutPtrValues_       = state.movedOutPtrValues;
         movedBorrowedPtrValues_  = state.movedBorrowedPtrValues;
         nonOwningStructJoins_    = state.nonOwningStructJoins;

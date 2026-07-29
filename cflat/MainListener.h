@@ -5550,22 +5550,7 @@ public:
                                 compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName));
                         }
 
-                        // Inverse check, scoped to INTERFACE returns. A concrete implementer pointer
-                        // boxed into an interface return is still a bare pointer here (boxing happens
-                        // just below). The caller receives a { vtable, data } fat pointer with no idea
-                        // it owns the boxed heap object, so it never frees it (leak). Require
-                        // 'move <interface>' so the transfer is explicit and the caller knows to
-                        // 'delete' it (interface locals are not auto-destructed). Raw and struct 'T*'
-                        // returns are deliberately not covered - owning-pointer factories are a valid
-                        // manual-memory pattern in this codebase.
-                        if (right != nullptr && right->getType()->isPointerTy()
-                            && !llvm::isa<llvm::Constant>(right)
-                            && compiler->currentFunction != nullptr
-                            && compiler->GetFatPtrType() != nullptr
-                            && compiler->currentFunction->getReturnType() == compiler->GetFatPtrType()
-                            && !compiler->currentFunctionReturnsOwned
-                            && (compiler->IsOwningValue(right) || compiler->lastCallReturnsOwned
-                                || compiler->lastOwningResult))
+                        if (ReturnLeaksOwnershipIntoInterface(right, compiler))
                         {
                             LogErrorContext(jump, std::format(
                                 "returning a heap object boxed into interface '{}' from a non-'move' function "
@@ -8285,49 +8270,13 @@ public:
                                         std::format("'{}' does not implement interface '{}'", structName, typeAndValue.TypeName));
                                 }
                                 else if (!structName.empty()
-                                         && compiler->StructImplementsInterface(structName, typeAndValue.TypeName)
-                                         && !RejectPointerShapedInterfaceUpcast(
-                                                assignmentExpression, rightNV.TypeAndValue, typeAndValue.TypeName))
+                                         && compiler->StructImplementsInterface(structName, typeAndValue.TypeName))
                                 {
-                                    auto vtable = compiler->GetOrCreateVTable(structName, typeAndValue.TypeName);
-                                    // BuildInterfaceFatValue needs a *pointer* to the struct data,
-                                    // not the loaded struct value.
-                                    // - Pointer types (e.g. StringData*): the loaded value IS the pointer -> use it directly.
-                                    // - Value types (e.g. Point by value): use the alloca address; spill if no storage.
-                                    llvm::Value* dataPtr;
-                                    if (rightNV.TypeAndValue.Pointer)
-                                    {
-                                        // RHS is already a pointer to the class (e.g. Circle* c)
-                                        dataPtr = right;
-                                    }
-                                    else
-                                    {
-                                        dataPtr = rightNV.Storage;
-                                        if (!dataPtr)
-                                        {
-                                            dataPtr = compiler->CreateAlloca(right->getType());
-                                            compiler->CreateAssignment(right, dataPtr);
-                                        }
-                                    }
-                                    right = compiler->BuildInterfaceFatValue(vtable, dataPtr);
-                                    // Transfer ownership of an owning RHS pointer local into the
-                                    // interface box: null the source and mark it moved so its
-                                    // scope-exit cleanup won't double-free the object that
-                                    // 'delete <iface>' now owns. Mirrors the assignment path.
-                                    if (rightNV.IsOwning && rightNV.TypeAndValue.Pointer
-                                        && rightNV.Storage != nullptr)
-                                    {
-                                        if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(rightNV.BaseType))
-                                        {
-                                            compiler->builder->CreateStore(
-                                                llvm::ConstantPointerNull::get(ptrTy), rightNV.Storage);
-                                            if (!rightNV.CallerName.empty())
-                                            {
-                                                compiler->MarkVariableMoved(rightNV.CallerName);
-                                                compiler->MarkVariableMovedIntoInterface(rightNV.CallerName);
-                                            }
-                                        }
-                                    }
+                                    // Shared boxing helper: shape rejection, data-pointer selection
+                                    // and the owning-source transfer all live there now.
+                                    right = BoxConcreteIntoInterface(
+                                        assignmentExpression, right, rightNV.TypeAndValue.Pointer,
+                                        structName, typeAndValue.TypeName, &rightNV);
                                 }
                                 else if (typeAndValue.TypeName == "string" &&
                                          right->getType() == compiler->builder->getInt8Ty()->getPointerTo())
@@ -9978,6 +9927,138 @@ public:
         LogErrorContext(errCtx, compilerLLVM->FormatPointerShapedInterfaceUpcastError(
             shape, src.TypeName, interfaceName));
         return true;
+    }
+
+    /*
+     * Where the object a boxing site is about to box actually lives. `srcNV` decides the cases the
+     * IR cannot: a borrowed pointer parameter and an owning local both arrive as a load.
+     */
+    LLVMBackend::InterfaceBoxSource ClassifyInterfaceBoxSource(llvm::Value* dataPtr,
+                                                              const LLVMBackend::NamedVariable* srcNV,
+                                                              bool ownershipTransferred)
+    {
+        using Source = LLVMBackend::InterfaceBoxSource;
+        if (dataPtr == nullptr) return Source::Unknown;
+        if (ownershipTransferred || (srcNV != nullptr && srcNV->IsOwning)
+            || compilerLLVM->IsOwningValue(dataPtr))
+            return Source::Heap;
+        if (srcNV != nullptr && !srcNV->CallerName.empty()
+            && compilerLLVM->IsFunctionParameter(srcNV->CallerName))
+            return Source::Parameter;
+        llvm::Value* base = dataPtr->stripPointerCasts();
+        while (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(base))
+            base = gep->getPointerOperand()->stripPointerCasts();
+        if (llvm::isa<llvm::GlobalVariable>(base)) return Source::Global;
+        if (llvm::isa<llvm::Argument>(base)) return Source::Parameter;
+        if (llvm::isa<llvm::AllocaInst>(base)) return Source::FrameStorage;
+        return Source::Unknown;
+    }
+
+    /*
+     * The shared class->interface boxing site: the decl-init path and 'as' both route here, so
+     * they cannot drift apart again. NOT yet the only one - the assignment-STATEMENT and
+     * call-argument paths are still open-coded. Applies the implements check, the pointer-shape
+     * rejection, data-pointer selection and the owning-source transfer in that order, then
+     * ledgers what it boxed so later guards can ask instead of re-deriving it from emitted IR. `srcNV` is null when the operand has no named binding (a '?:' arm, an
+     * arithmetic result); the binding-dependent guards are then skipped by construction.
+     * Every LogError below throws, so no partially-built fat value or ledger entry escapes.
+     */
+    llvm::Value* BoxConcreteIntoInterface(antlr4::ParserRuleContext* errCtx, llvm::Value* srcValue,
+                                          bool sourceIsPointer, const std::string& structName,
+                                          const std::string& interfaceName,
+                                          const LLVMBackend::NamedVariable* srcNV)
+    {
+        auto* compiler = compilerLLVM;
+        if (!compiler->StructImplementsInterface(structName, interfaceName))
+        {
+            LogErrorContext(errCtx, std::format("'{}' does not implement interface '{}'",
+                                                structName, interfaceName));
+            return nullptr;
+        }
+        if (srcNV != nullptr
+            && RejectPointerShapedInterfaceUpcast(errCtx, srcNV->TypeAndValue, interfaceName))
+            return nullptr;
+
+        // A pointer source IS the data pointer; a value source needs its address, preferring the
+        // binding's own storage over a spill.
+        llvm::Value* dataPtr = srcValue;
+        if (!sourceIsPointer)
+            dataPtr = srcNV != nullptr && srcNV->Storage != nullptr
+                ? srcNV->Storage : AddressOfClassValueOperand(srcValue, compiler);
+
+        auto* vtable = compiler->GetOrCreateVTable(structName, interfaceName);
+        llvm::Value* fat = compiler->BuildInterfaceFatValue(vtable, dataPtr);
+
+        // Ownership transfer: null the owning source and mark it moved so its scope-exit free
+        // cannot double-free the object the interface box now owns.
+        bool transferred = false;
+        if (srcNV != nullptr && srcNV->IsOwning && sourceIsPointer && srcNV->Storage != nullptr)
+        {
+            if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(srcNV->BaseType))
+            {
+                compiler->builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), srcNV->Storage);
+                transferred = true;
+                if (!srcNV->CallerName.empty())
+                {
+                    compiler->MarkVariableMoved(srcNV->CallerName);
+                    compiler->MarkVariableMovedIntoInterface(srcNV->CallerName);
+                }
+            }
+        }
+
+        LLVMBackend::InterfaceBoxRecord record;
+        record.FatValue = fat;
+        record.DataPointer = dataPtr;
+        record.SourceClassName = structName;
+        record.InterfaceName = interfaceName;
+        record.Source = ClassifyInterfaceBoxSource(dataPtr, srcNV, transferred);
+        record.OwnershipTransferred = transferred;
+        compiler->RegisterInterfaceBox(record);
+        return fat;
+    }
+
+    // True when any boxing site reachable through `fatValue` (following '?:' joins) boxed a heap
+    // object whose ownership it took over. Answers a join through the arms' data pointers.
+    bool FatValueOwnsHeapBox(llvm::Value* fatValue)
+    {
+        if (fatValue == nullptr) return false;
+        if (auto* rec = compilerLLVM->FindInterfaceBoxByFatValue(fatValue))
+            if (rec->Source == LLVMBackend::InterfaceBoxSource::Heap) return true;
+        std::vector<llvm::Value*> dataPtrs;
+        std::unordered_set<const llvm::Value*> seen;
+        CollectFatValueFields(fatValue, 1u, dataPtrs, seen);
+        for (auto* data : dataPtrs)
+            if (auto* rec = compilerLLVM->FindInterfaceBoxByDataPointer(data))
+                if (rec->Source == LLVMBackend::InterfaceBoxSource::Heap) return true;
+        return false;
+    }
+
+    /*
+     * Inverse of the fresh-allocation return check, scoped to INTERFACE returns. A concrete
+     * implementer pointer boxed into an interface return is still a bare pointer at the return
+     * site (boxing happens just after). The caller receives a { vtable, data } fat pointer with
+     * no idea it owns the boxed heap object, so it never frees it (leak). Require
+     * 'move <interface>' so the transfer is explicit and the caller knows to 'delete' it
+     * (interface locals are not auto-destructed). Raw and struct 'T*' returns are deliberately
+     * not covered - owning-pointer factories are a valid manual-memory pattern in this codebase.
+     *
+     * A `return p as IShape;` operand is ALREADY a fat pointer, so the bare-pointer test cannot
+     * see the heap object it carries; the boxing site's provenance ledger answers for it. A
+     * frame-local arm is the worse defect and has its own unconditional diagnostic later on the
+     * return path, so that shape is handed to it rather than blamed on ownership here.
+     */
+    bool ReturnLeaksOwnershipIntoInterface(llvm::Value* right, LLVMBackend* compiler)
+    {
+        if (right == nullptr || compiler->currentFunctionReturnsOwned) return false;
+        auto* fatTy = compiler->GetFatPtrType();
+        if (fatTy == nullptr || compiler->currentFunction == nullptr
+            || compiler->currentFunction->getReturnType() != fatTy)
+            return false;
+        if (right->getType() == fatTy)
+            return FrameLocalDataOfFatValue(right) == nullptr && FatValueOwnsHeapBox(right);
+        return right->getType()->isPointerTy() && !llvm::isa<llvm::Constant>(right)
+            && (compiler->IsOwningValue(right) || compiler->lastCallReturnsOwned
+                || compiler->lastOwningResult);
     }
 
     /*
@@ -12055,6 +12136,46 @@ public:
         return {};
     }
 
+    // The single-child multiplicative body: reduce a parsed cast-expression binding to the
+    // TypedValue the arithmetic chain hands upward. Shared so an 'as' operand can keep the
+    // NamedVariable and still produce byte-identical TypedValue state.
+    LLVMBackend::TypedValue TypedValueOfNamedOperand(LLVMBackend::NamedVariable& namedVar,
+                                                     antlr4::ParserRuleContext* ctx)
+    {
+        bool isUnsigned = namedVar.TypeAndValue.IsUnsignedInteger() != -1;
+        llvm::Type* elemType = nullptr;
+        if (namedVar.TypeAndValue.Pointer)
+        {
+            auto elemTV = namedVar.TypeAndValue;
+            elemTV.ElemPointer ? (elemTV.ElemPointer = false) : (elemTV.Pointer = false, elemTV.IsInterfacePointer = false);
+            elemType = Compiler(ctx)->GetType(elemTV);
+        }
+        LLVMBackend::TypedValue result{ LoadNamedVariable(namedVar), isUnsigned };
+        result.elemType = elemType;
+        result.isArrayView = namedVar.TypeAndValue.IsArrayView;
+        return result;
+    }
+
+    /*
+     * The castExpression an 'is'/'as' operand reduces to when relational -> shift -> additive ->
+     * multiplicative is a pure single-child passthrough. Parsing it through ParseCastExpression
+     * keeps the source's NamedVariable (Storage, IsOwning, CallerName, TypeAndValue), which every
+     * boxing guard needs and which the TypedValue-returning chain discards. Returns nullptr for
+     * any other shape (a '?:', an arithmetic operand); those legitimately have no named source.
+     */
+    CFlatParser::CastExpressionContext* SoleCastOperandOf(CFlatParser::RelationalExpressionContext* relCtx)
+    {
+        if (relCtx == nullptr) return nullptr;
+        auto shifts = relCtx->shiftExpression();
+        if (shifts.size() != 1) return nullptr;
+        auto adds = shifts[0]->additiveExpression();
+        if (adds.size() != 1) return nullptr;
+        auto muls = adds[0]->multiplicativeExpression();
+        if (muls.size() != 1) return nullptr;
+        auto casts = muls[0]->castExpression();
+        return casts.size() == 1 ? casts[0] : nullptr;
+    }
+
     LLVMBackend::TypedValue ParseTypeCheckExpression(CFlatParser::TypeCheckExpressionContext* ctx)
     {
         auto relCtx = ctx->relationalExpression();
@@ -12064,12 +12185,26 @@ public:
             return {};
         }
 
-        auto tv = ParseRelationalExpression(relCtx);
+        // An 'is'/'as' operand is parsed through the cast level when it is a plain passthrough,
+        // so the source binding survives; every other shape keeps today's relational path.
+        auto typeSpecs = ctx->typeSpecifier();
+        LLVMBackend::NamedVariable srcNV;
+        const LLVMBackend::NamedVariable* srcBinding = nullptr;
+        LLVMBackend::TypedValue tv;
+        auto* castOperand = typeSpecs.empty() ? nullptr : SoleCastOperandOf(relCtx);
+        if (castOperand != nullptr)
+        {
+            srcNV = ParseCastExpression(castOperand);
+            tv = TypedValueOfNamedOperand(srcNV, castOperand);
+            srcBinding = &srcNV;
+        }
+        else
+        {
+            tv = ParseRelationalExpression(relCtx);
+        }
         llvm::Value* result = tv.value;
         llvm::Type* srcElemType = tv.elemType;
 
-        // Handle 'is' and 'as' operators
-        auto typeSpecs = ctx->typeSpecifier();
         if (typeSpecs.size() > 0)
         {
             for (size_t i = 0; i < typeSpecs.size(); i++)
@@ -12083,11 +12218,12 @@ public:
                 }
                 else if (op == "as")
                 {
-                    result = GenerateSafeCast(result, targetTypeName, ctx, srcElemType);
+                    result = GenerateSafeCast(result, targetTypeName, ctx, srcElemType, srcBinding);
                 }
                 // Only the first operand's static type is known here; a chained is/as
                 // operates on the previous op's result, whose element type isn't tracked.
                 srcElemType = nullptr;
+                srcBinding = nullptr;
             }
             return { result, false };  // is/as result is bool or pointer, not unsigned
         }
@@ -12430,7 +12566,8 @@ public:
     }
 
     llvm::Value* GenerateSafeCast(llvm::Value* interfaceValue, const std::string& targetTypeName,
-                                  antlr4::ParserRuleContext* ctx, llvm::Type* srcElemType = nullptr)
+                                  antlr4::ParserRuleContext* ctx, llvm::Type* srcElemType = nullptr,
+                                  const LLVMBackend::NamedVariable* srcBinding = nullptr)
     {
         auto* compiler = Compiler(ctx);
         auto ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
@@ -12488,18 +12625,12 @@ public:
         // below interface-source-only.
         if (srcKind == CastSourceKind::ConcretePointer || srcKind == CastSourceKind::ConcreteValue)
         {
-            // Interface target: box it, exactly like the plain-assignment path.
+            // Interface target: the shared boxing helper, so this spelling carries the same
+            // implements/shape/ownership guards the plain-assignment spelling does.
             if (compiler->interfaceTable.count(targetTypeName))
             {
-                if (!compiler->StructImplementsInterface(srcStructName, targetTypeName))
-                {
-                    LogErrorContext(ctx, std::format("'{}' does not implement interface '{}'", srcStructName, targetTypeName));
-                    return nullptr;
-                }
-                auto* vtable = compiler->GetOrCreateVTable(srcStructName, targetTypeName);
-                llvm::Value* dataPtr = srcIsValue ? AddressOfClassValueOperand(interfaceValue, compiler)
-                                                  : interfaceValue;
-                return compiler->BuildInterfaceFatValue(vtable, dataPtr);
+                return BoxConcreteIntoInterface(ctx, interfaceValue, !srcIsValue, srcStructName,
+                                                targetTypeName, srcBinding);
             }
 
             if (compiler->dataStructures.count(targetTypeName))
@@ -13717,18 +13848,7 @@ public:
         if (nextCtxs.size() == 1)
         {
             auto namedVar = ParseCastExpression(nextCtxs[0]);
-            bool isUnsigned = namedVar.TypeAndValue.IsUnsignedInteger() != -1;
-            llvm::Type* elemType = nullptr;
-            if (namedVar.TypeAndValue.Pointer)
-            {
-                auto elemTV = namedVar.TypeAndValue;
-                elemTV.ElemPointer ? (elemTV.ElemPointer = false) : (elemTV.Pointer = false, elemTV.IsInterfacePointer = false);
-                elemType = Compiler(nextCtxs[0])->GetType(elemTV);
-            }
-            LLVMBackend::TypedValue result{ LoadNamedVariable(namedVar), isUnsigned };
-            result.elemType = elemType;
-            result.isArrayView = namedVar.TypeAndValue.IsArrayView;
-            return result;
+            return TypedValueOfNamedOperand(namedVar, nextCtxs[0]);
         }
         else if (nextCtxs.size() > 1)
         {

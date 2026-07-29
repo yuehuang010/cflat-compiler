@@ -55,16 +55,43 @@ weighting when prioritising this.
 
 ## Fix direction
 
-The check belongs wherever the boxing decision ends up living rather than as another
-value-shape walk bolted onto the return path - see the consolidation argument in
-[[as-boxing-skips-ownership-transfer]]. A boxing site that recorded WHAT it boxed (frame
-storage vs heap vs parameter) would answer this by construction, at the declaration of `r`,
-without any def-use walking at the return.
+**The prerequisite now EXISTS - this is no longer a design problem, only a wiring one.**
+The boxing consolidation added exactly the thing this issue asked for: a provenance ledger,
+`LLVMBackend::interfaceBoxRecords_`, written by `BoxConcreteIntoInterface`
+(`MainListener.h:9969`) and keyed on BOTH the produced fat value and its data half. Each
+record carries `{FatValue, DataPointer, SourceClassName, InterfaceName, Source,
+OwnershipTransferred}` where `Source` is one of Unknown / FrameStorage / Heap / Parameter /
+Global.
+
+It is deliberately NOT retired by `FlushOwnedTemps` - unlike its sibling ledgers - precisely
+so a record written at the declaration of `r` is still there at the `return` in a later
+statement, which is this issue's shape.
+
+So the fix is: at the return path, look the returned value up in the ledger instead of
+walking IR. A record with `Source == FrameStorage` is the dangle, whether the value came
+straight from the boxing site or through an intermediate local. That answers
+`IShape r = loc as IShape; return r;` by construction, because the fact was recorded where
+the boxing happened rather than recovered from the shape of the returned expression.
+
+`FrameLocalDataOfFatValue` (`MainListener.h:5129`) can then be reduced to a fallback for
+values with no ledger record (a fat pointer that arrived from a call, say), or removed if
+the ledger proves complete.
+
+**Read [[interface-boxing-sites-not-fully-consolidated]] BEFORE starting.** This change adds
+the ledger's SECOND consumer, and unlike the first it will not sit behind the
+`FrameLocalDataOfFatValue(right) == nullptr` gate that currently makes two known sharp edges
+unreachable: `ClassifyInterfaceBoxSource` tests ownership before storage shape (so a
+by-value class local with an owning binding can be labelled `Heap` with an alloca data
+pointer), and `FindInterfaceBoxByDataPointer` returns the first of several records sharing a
+data pointer. Both must be resolved as part of this work.
+
+Note also that the ledger only has a record when the source had a NamedVariable - see
+[[interface-boxing-guards-are-binding-dependent]] for the shapes that produce no binding.
 
 ## Related
 
-- [[as-boxing-skips-ownership-transfer]] - the structural argument, and the reason the
-  frame-lifetime check is currently a fourth copy of boxing bookkeeping.
-- [[as-boxing-skips-pointer-shape-rejection]]
-- The array-shaped-operand gap this used to link is FIXED; see the closed section of
-  [[interface-issue-queue]].
+- [[interface-boxing-sites-not-fully-consolidated]] - REQUIRED READING; the ledger sharp
+  edges this change would expose.
+- [[interface-boxing-guards-are-binding-dependent]] - the shapes the ledger cannot see.
+- The two `as`-boxing issues this used to link (ownership transfer, pointer-shape rejection)
+  are FIXED; see the closed section of [[interface-issue-queue]].

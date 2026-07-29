@@ -15,10 +15,14 @@ Last updated 2026-07-28.
 - Full verification re-run on macOS at that commit: **512 passed / 0 failed / 8 skipped**,
   examples **35 / 0**. (Baseline immediately before it was 510/0/8; the +2 are the new
   ternary legs in `Test/test_interface.cb`.) LSP was NOT re-run - it is Windows-only.
-- Queue head is the Family A ownership consolidation, below. `?:` and array-shape routing
-  are done; the remaining four `as`-family entries all need the SAME prerequisite: the
-  source `NamedVariable` threaded into `ParseTypeCheckExpression`, which currently discards
-  it. Do that plumbing first as its own step, then the consolidated boxing helper.
+- Queue head is [[interface-return-dangle-defeated-by-intermediate-local]] - the LAST member
+  of the `as`/`is` family still open, and now the cheapest it will ever be: the provenance
+  ledger it needs already exists, so it is a lookup replacing an IR walk. Read
+  [[interface-boxing-sites-not-fully-consolidated]] first - that change adds the ledger's
+  second consumer and will expose two currently-inert sharp edges.
+- The `as`/`is` family is otherwise DONE: routing (2 issues) and boxing guards (2 issues) are
+  closed. What remains under `as` are the follow-ups those fixes surfaced, all of which are
+  PLAIN-path or diagnostic-quality rather than `as` defects.
 - **`fix/iface-ifconst` is SHELVED, not pending.** Branch is at `23418c2`, worktree present
   at `../cflat-fix-iface-ifconst` with its ~60-file repro corpus in `scratch/` - the most
   valuable artifact of that attempt. Read
@@ -29,6 +33,29 @@ Last updated 2026-07-28.
 - The old "may a user file-scope interface share a name with a core interface" product
   question is **RESOLVED** (hard error, kept and polished, shipped as `853cb87`). Do not
   reopen it.
+
+## Closed in the 2026-07-29 session
+
+- **`as` boxing skipped every ownership guard the plain spelling applies** - fixed, closing
+  BOTH `as-boxing-skips-ownership-transfer` (all four manifestations) and
+  `as-boxing-skips-pointer-shape-rejection`. `GenerateSafeCast` carried the fewest of the six
+  guards, so `x as IFace` skipped ownership transfer, pointer-shape rejection, and the
+  non-`move` ownership-escape rejection. Now one `BoxConcreteIntoInterface`
+  (`MainListener.h:9969`) carries all of them, and the declaration-init path and the `as`
+  path both route through it.
+  - Prerequisite that unblocked it: the source `NamedVariable` is now plumbed into
+    `ParseTypeCheckExpression` via `SoleCastOperandOf`, reusing the single-child passthrough
+    idiom already in `ParseAssignmentExpressionNamed`. This was built and verified
+    BEHAVIOUR-NEUTRAL before any guard was added - do that in this order if you touch it.
+  - It also added the provenance ledger `interfaceBoxRecords_`, which is the prerequisite for
+    [[interface-return-dangle-defeated-by-intermediate-local]] - that issue's fix direction
+    has been rewritten to use it and is now wiring, not design.
+  - **The change BREAKS source that was only memory-correct because the transfer was missing**
+    - boxing an owning local with `as` and then still using the local is now `use of moved`,
+    exactly as the plain spelling always said. The repo's own `Test/test_interface.cb`
+    contained such a program and was adapted (every assertion retained, a `delete` added).
+    Nothing in `core/` or `example/` was affected: every `as <Interface>` there is an
+    interface-to-interface downcast, never a class-to-interface box.
 
 ## Closed in the 2026-07-28 session
 
@@ -73,11 +100,11 @@ Last updated 2026-07-28.
 | [[duplicate-constructor-signature-hangs-compiler]] | Hang/OOM (exit 137), no diagnostic. Namespaced classes newly route onto this path. |
 | [[generic-interface-registered-as-opaque-struct]] | LLVM verifier failure + false rejections. `IFace<T>` unusable in most positions. |
 | [[global-primitive-array-boxed-into-interface]] | Silent miscompile, escapes the verifier. PLAIN path, not `as`. |
-| [[as-boxing-skips-ownership-transfer]] | asan double-free / use-after-free. Four manifestations, one root cause. |
+| [[interface-boxing-guards-are-binding-dependent]] | Double free (exit 134). Parens or `?:` erase the binding the guards key off. |
+| [[return-ternary-join-concrete-pointers-not-boxed]] | Verifier abort, no source diagnostic. PLAIN path; `as` is now better. |
 | [[generic-interface-namespace-scope-limit]] | Silent miscompile. DELIBERATE scope limit of `c9acb6c`, recorded so it is not lost. |
 | [[iface-thin-function-param-no-lowering]] | Module verification failure, no diagnostic. Any `function<>` interface parameter. |
-| [[interface-return-dangle-defeated-by-intermediate-local]] | Dangling fat pointer, no diagnostic. Both spellings. |
-| [[as-boxing-skips-pointer-shape-rejection]] | Silently boxes element 0 of an array view. |
+| [[interface-return-dangle-defeated-by-intermediate-local]] | Dangling fat pointer, no diagnostic. Both spellings. QUEUE HEAD. |
 
 ## Open - false rejections and accept-set problems
 
@@ -96,6 +123,7 @@ Last updated 2026-07-28.
 | [[interface-collision-message-prefix-still-basename]] | The `file(line,col):` prefix is still a bare basename. |
 | [[paren-as-cast-method-call-not-parsed]] | `(x as IFoo).m()` -> `unknown function '(xasIFoo)'`. Operand-shape independent. |
 | [[as-cast-unbound-pointer-shape-generic-message]] | Correctly rejected, generic wording. Struct field and LOCAL `T*[N]` only. |
+| [[interface-boxing-sites-not-fully-consolidated]] | No live defect. Two open-coded sites + two inert ledger sharp edges. |
 
 ## Open - latent / no repro found
 
@@ -115,12 +143,21 @@ Last updated 2026-07-28.
 
 ## The structural theme
 
-Three separate issues above are instances of one pattern, stated in full in
-[[as-boxing-skips-ownership-transfer]]: **interface boxing bookkeeping is duplicated
-across four sites** - assignment, return, `?:`, and `as` - and shapes keep falling
-through the gaps between them. The frame-lifetime check added in the 2026-07-28 `as`
-fix is itself the fourth copy, and recovers information by walking emitted IR precisely
-because the boxing site recorded nothing.
+**Interface boxing bookkeeping was duplicated across four sites** - assignment, return,
+`?:`, and `as` - each carrying a different subset of the six guards, and shapes kept falling
+through the gaps. This was the single largest source of entries in this queue.
+
+It is now PARTLY resolved: `BoxConcreteIntoInterface` (`MainListener.h:9969`) is the shared
+site for the declaration-init and `as` paths and carries every guard, and it records
+provenance so later checks can look a fact up instead of recovering it by walking IR.
+The remaining work is tracked in [[interface-boxing-sites-not-fully-consolidated]] (two
+sites still open-coded) and [[interface-boxing-guards-are-binding-dependent]] (the guards
+key off a NamedVariable, so any spelling that erases the binding still slips through).
+
+The lesson worth carrying to the next duplication: **the guards were only as good as the
+information reaching them.** Every fix in this family was blocked on plumbing - the source
+`NamedVariable` reaching `ParseTypeCheckExpression` - not on the guard logic itself, which
+already existed and was correct. Look for the missing input before writing a new check.
 
 A third theme, from the named-arguments work: **replay loops report the first failing
 candidate rather than the relevant one**. Two entries above are that shape

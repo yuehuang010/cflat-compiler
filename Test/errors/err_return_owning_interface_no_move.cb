@@ -20,6 +20,30 @@ expect_error("transfers ownership the caller cannot see - it will leak") {
     }
 }
 
+// The 'as' spelling reaches the return already boxed into a fat pointer, so the pointer-shaped
+// operand test above cannot see the heap object it carries. The boxing site's provenance ledger
+// is what answers here; without it this compiled and the callee ran its own scope-exit free on
+// the object it had just handed out (use-after-free, not merely the leak the message names).
+expect_error("transfers ownership the caller cannot see - it will leak") {
+    IThing makeThingAs()
+    {
+        Thing* t = new Thing();
+        t->n = 5;
+        return t as IThing;
+    }
+}
+
+// A '?:' join of two heap-boxed arms: the ledger has to follow the join through both arms'
+// data pointers, not just the joined value, or this shape slips past.
+expect_error("transfers ownership the caller cannot see - it will leak") {
+    IThing pickThing(int c)
+    {
+        Thing* a = new Thing(); a->n = 1;
+        Thing* b = new Thing(); b->n = 2;
+        return c > 0 ? (a as IThing) : (b as IThing);
+    }
+}
+
 extern int main()
 {
     return 0;

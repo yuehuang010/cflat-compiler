@@ -62,10 +62,13 @@ pointer and looking THAT up - the base of `h.pp` is the `H` binding, and the bas
 decayed local array is the array's own alloca. Then describe the field/element type from
 the struct layout in `dataStructures` rather than from a variable binding.
 
-This is the same "the boxing site should record what it boxed rather than recovering it
-by walking IR" argument made in [[as-boxing-skips-ownership-transfer]] - a consolidated
-boxing helper that carried provenance would answer this without any GEP walking. Prefer
-that over adding a third recovery path if the consolidation happens first.
+This is the same "the boxing site should record what it boxed rather than recovering it by
+walking IR" argument that drove the boxing consolidation, which has since landed:
+`BoxConcreteIntoInterface` (`MainListener.h:9969`) now records provenance per box. That does
+NOT close this issue - the shapes here fail EARLIER, at the point of recovering a declared
+type to name in the message, before any boxing record exists. But it means the recovery
+should be written once, in the helper, rather than as a third walk bolted onto the
+classifier. See [[interface-boxing-sites-not-fully-consolidated]].
 
 ## Guard rail
 
@@ -75,4 +78,4 @@ issue is fixed, update that comment and add legs for both shapes.
 
 ## Related
 
-[[as-boxing-skips-ownership-transfer]], [[interface-issue-queue]]
+[[interface-boxing-sites-not-fully-consolidated]], [[interface-issue-queue]]
