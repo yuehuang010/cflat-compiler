@@ -1106,7 +1106,7 @@ public:
     {
         Unknown,
         FrameStorage,  // an alloca in the boxing frame - the fat pointer dies with the frame
-        Heap,          // a `new` result / owning local - somebody must delete the box
+        Heap,          // a `new` result / owning pointer local - somebody must delete the box
         Parameter,     // a pointer parameter - the caller owns the lifetime
         Global         // a global - outlives everything
     };
@@ -1139,10 +1139,14 @@ public:
         return nullptr;
     }
 
-    const InterfaceBoxRecord* FindInterfaceBoxByDataPointer(const llvm::Value* value) const
+    // The only data-pointer lookup, deliberately provenance-filtered: a caller must say which
+    // kind of box it means, so a record of another kind can never answer for it. Records that
+    // share BOTH a data pointer and a Source are still resolved first-registered-wins.
+    const InterfaceBoxRecord* FindInterfaceBoxByDataPointer(const llvm::Value* value,
+                                                            InterfaceBoxSource source) const
     {
         for (const auto& entry : interfaceBoxRecords_)
-            if (entry.DataPointer == value) return &entry;
+            if (entry.DataPointer == value && entry.Source == source) return &entry;
         return nullptr;
     }
 

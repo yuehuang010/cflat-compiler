@@ -30,32 +30,44 @@ started.
 Verified today: the assignment-statement leg's ownership bookkeeping lives elsewhere and
 happens to agree with the helper's, including the use-of-moved diagnostic.
 
-## Two sharp edges in the new code, both inert today
+## Two sharp edges - one CLOSED, one NARROWED
 
-Recorded here so they are not lost - neither has a reachable failure:
+Both were inert (no reachable failure - the ledger's one consumer, `FatValueOwnsHeapBox`,
+was gated behind `FrameLocalDataOfFatValue(right) == nullptr`, which rejected every
+alloca-rooted data pointer before the lookup ran), but were closed as preventive hardening
+so a future second consumer of the ledger does not inherit them silently:
 
-- `ClassifyInterfaceBoxSource` (`MainListener.h:9957-9979`) tests
-  `ownershipTransferred || srcNV->IsOwning || IsOwningValue(dataPtr)` -> `Heap` BEFORE it
-  tests `isa<AllocaInst>` -> `FrameStorage`, so a by-value class local whose binding is
-  `IsOwning` would be classified `Heap` with an alloca data pointer.
-- `RegisterInterfaceBox` dedupes on `FatValue` only, so two records can share a
-  `DataPointer` and `FindInterfaceBoxByDataPointer` returns the first.
+- `ClassifyInterfaceBoxSource` (`MainListener.h`) now tests `isa<AllocaInst>` ->
+  `FrameStorage` BEFORE the ownership test, so a by-value class local whose binding is
+  `IsOwning` is classified `FrameStorage`, not `Heap`.
+- `FindInterfaceBoxByDataPointer` (`LLVMBackend.h`) now takes an `InterfaceBoxSource`
+  parameter and filters on it; the old unfiltered single-argument overload was deleted, so
+  there is only one data-pointer lookup and a caller must say which kind of box it means.
+  Its one caller, `FatValueOwnsHeapBox`, now passes `InterfaceBoxSource::Heap`. This
+  NARROWS the edge rather than closing it - see the note below.
 
-Both are unreachable because the ledger has exactly ONE consumer today
-(`FatValueOwnsHeapBox`, `MainListener.h:5570`) and that call site is gated behind
-`FrameLocalDataOfFatValue(right) == nullptr`, which rejects every alloca-rooted data
-pointer before the lookup runs.
+Verified behaviourally invisible: compared the fix binary against master on the ~67-program
+corpus under `scratch/rev*` in the sibling `cflat-fix-return-dangle` worktree (interface
+boxing/ownership/dangle shapes), plus `Test/test_interface.cb` and
+`Test/errors/err_return_interface_value.cb` - identical exit codes and stdout in every case.
 
-**This matters for whoever closes
-[[interface-return-dangle-defeated-by-intermediate-local]]**, because that change adds the
-SECOND consumer of the ledger and it will not be behind that gate. Fix the classifier
-ordering as part of that work, or prove the new consumer is insensitive to it.
+Note what is NOT fixed by this: `RegisterInterfaceBox` still dedupes on `FatValue` only, so
+two records sharing BOTH a `DataPointer` and the same `Source` would still resolve to
+whichever was registered first. The provenance filter narrows the sharp edge (a `Heap`
+lookup can no longer see a `FrameStorage` record over the same pointer, and vice versa) but
+does not remove the same-source collision case.
+
+Be clear about which case that leaves: the motivating example - two interfaces boxed over
+ONE object - lands on the SAME `Source`, so the filter does not discriminate it at all. It
+is harmless today only because such a pair is either same-`Source` (both `Global`, both
+`FrameStorage`) or impossible: a second box off an owning binding is a hard `use of moved
+variable` error. Closing this properly means keying the dedupe on `(FatValue, DataPointer,
+Source)` in `RegisterInterfaceBox`, not on `FatValue` alone.
 
 ## Fix direction
 
-Route the two remaining sites through `BoxConcreteIntoInterface`, then restore the
-"this is the only place" claim in its comment. Reorder `ClassifyInterfaceBoxSource` so the
-storage-shape test precedes the ownership test.
+Route the two remaining open-coded sites (assignment-statement, call-argument) through
+`BoxConcreteIntoInterface`, then restore the "this is the only place" claim in its comment.
 
 ## Related
 

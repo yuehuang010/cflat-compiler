@@ -9939,18 +9939,20 @@ public:
     {
         using Source = LLVMBackend::InterfaceBoxSource;
         if (dataPtr == nullptr) return Source::Unknown;
+        llvm::Value* base = dataPtr->stripPointerCasts();
+        while (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(base))
+            base = gep->getPointerOperand()->stripPointerCasts();
+        // Storage shape decides the FRAME case before ownership does: a by-value class local with
+        // an owning binding still lives in this frame, and a box over it dies with the frame.
+        if (llvm::isa<llvm::AllocaInst>(base)) return Source::FrameStorage;
         if (ownershipTransferred || (srcNV != nullptr && srcNV->IsOwning)
             || compilerLLVM->IsOwningValue(dataPtr))
             return Source::Heap;
         if (srcNV != nullptr && !srcNV->CallerName.empty()
             && compilerLLVM->IsFunctionParameter(srcNV->CallerName))
             return Source::Parameter;
-        llvm::Value* base = dataPtr->stripPointerCasts();
-        while (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(base))
-            base = gep->getPointerOperand()->stripPointerCasts();
         if (llvm::isa<llvm::GlobalVariable>(base)) return Source::Global;
         if (llvm::isa<llvm::Argument>(base)) return Source::Parameter;
-        if (llvm::isa<llvm::AllocaInst>(base)) return Source::FrameStorage;
         return Source::Unknown;
     }
 
@@ -10028,8 +10030,9 @@ public:
         std::unordered_set<const llvm::Value*> seen;
         CollectFatValueFields(fatValue, 1u, dataPtrs, seen);
         for (auto* data : dataPtrs)
-            if (auto* rec = compilerLLVM->FindInterfaceBoxByDataPointer(data))
-                if (rec->Source == LLVMBackend::InterfaceBoxSource::Heap) return true;
+            if (compilerLLVM->FindInterfaceBoxByDataPointer(
+                    data, LLVMBackend::InterfaceBoxSource::Heap) != nullptr)
+                return true;
         return false;
     }
 

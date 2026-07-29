@@ -94,12 +94,10 @@ Two further lessons, both cheap to re-learn the hard way:
 - **The governing asymmetry**: a false rejection is a blocker, a missed dangle is merely
   today's behaviour. When the analysis is unsure, ACCEPT.
 
-Genuinely useful work the attempt produced, worth keeping if it is retried: the
-`ClassifyInterfaceBoxSource` ordering fix (storage shape must be tested before ownership, or
-a by-value class local with an owning binding is mislabelled `Heap`), and the provenance
-filter on `FindInterfaceBoxByDataPointer` (two interfaces boxed over one object share a data
-pointer, so an unfiltered lookup can answer about the wrong box). Both are described in
-[[interface-boxing-sites-not-fully-consolidated]] and neither depends on the failed analysis.
+Two pieces of the attempt were salvaged and have ALREADY LANDED on master, so do not redo
+them: the `ClassifyInterfaceBoxSource` ordering fix (storage shape is now tested before
+ownership) and the provenance filter on `FindInterfaceBoxByDataPointer`. See
+[[interface-boxing-sites-not-fully-consolidated]] for what they did and what they left open.
 
 ## Fix direction
 
@@ -132,11 +130,12 @@ the ledger proves complete.
 
 **Read [[interface-boxing-sites-not-fully-consolidated]] BEFORE starting.** This change adds
 the ledger's SECOND consumer, and unlike the first it will not sit behind the
-`FrameLocalDataOfFatValue(right) == nullptr` gate that currently makes two known sharp edges
-unreachable: `ClassifyInterfaceBoxSource` tests ownership before storage shape (so a
-by-value class local with an owning binding can be labelled `Heap` with an alloca data
-pointer), and `FindInterfaceBoxByDataPointer` returns the first of several records sharing a
-data pointer. Both must be resolved as part of this work.
+`FrameLocalDataOfFatValue(right) == nullptr` gate that made the ledger's sharp edges
+unreachable. Both edges recorded there have since been addressed on master - the classifier
+ordering is FIXED, and the data-pointer lookup is now provenance-filtered - so this work no
+longer has to resolve them first. One residue remains and a second consumer must not assume
+otherwise: `RegisterInterfaceBox` still dedupes on `FatValue` alone, so two records sharing
+both a data pointer and a `Source` resolve first-registered-wins.
 
 Note also that the ledger only has a record when the source had a NamedVariable - see
 [[interface-boxing-guards-are-binding-dependent]] for the shapes that produce no binding.
