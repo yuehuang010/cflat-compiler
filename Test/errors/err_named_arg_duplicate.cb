@@ -1,0 +1,27 @@
+// Two named arguments naming the SAME parameter leave another parameter unbound. The
+// matcher used to accept that permutation and hand the call site a default-constructed
+// argument, which crashed the compiler on the interface path (no Storage to load from).
+// Rejecting it inside MatchFunction closes the hole for every call path at once.
+interface IF { int f(int a, int b); };
+
+class N : IF { int f(int a, int b) { return a * 10 + b; } };
+
+int freeFn(int a, int b) { return a * 10 + b; }
+
+extern int main()
+{
+    N n;
+    IF io = n;
+
+    // Interface (vtable) dispatch.
+    expect_error("duplicate named argument 'a'") {
+        int viaIface = io.f(a: 1, a: 2);
+    }
+
+    // Direct call: the same rejection, from the same place.
+    expect_error("duplicate named argument 'b'") {
+        int viaDirect = freeFn(b: 1, b: 2);
+    }
+
+    return 0;
+}

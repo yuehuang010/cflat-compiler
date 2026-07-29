@@ -2386,6 +2386,110 @@ bool testInterfaceOverloadDispatch()
     return result;
 }
 
+// === Named arguments on the interface call path ===
+// Named args used to be silently ignored on virtual dispatch: the synthesized call
+// argument never carried its VariableName, so MatchFunction saw zero named args and
+// bound everything positionally - f(b: 2, a: 1) computed as if it were f(2, 1).
+interface INArg { int f(int a, int b); };
+class NArgImpl : INArg { int f(int a, int b) { return a * 10 + b; } };
+
+// Interface names win: the implementor spells its params differently, so a correct
+// fix must bind against the INTERFACE's declared names, not NArgDiffNames's.
+class NArgDiffNames : INArg { int f(int x, int y) { return x * 10 + y; } };
+
+// Extension method: no vtable slot for 'f', so this routes through
+// CreateOverloadedFunctionCall (the general overload resolver) instead of
+// CallInterfaceMethod's vtable dispatch.
+int nargExt(INArg io, int p, int q) { return p * 10 + q; }
+
+interface INArgGeneric<T> { T f(T a, T b); };
+class NArgGenericImpl : INArgGeneric<int> { int f(int a, int b) { return a * 10 + b; } };
+
+// The receiver arrives as an interface-typed PARAMETER rather than a local.
+int nargViaParam(INArg io) { return io.f(b: 2, a: 1); }
+
+// OVERLOADED interface method: the slot is picked by full signature, so the names must be
+// matched against the slot that declares them - and the winning slot's permutation applied.
+// A losing slot's name mismatch must not error out of the search either.
+interface INArgOv
+{
+    int f(int a, int b);
+    int f(double c, double d);
+};
+class NArgOvImpl : INArgOv
+{
+    int f(int a, int b) { return a * 10 + b; }
+    int f(double c, double d) { return (int)(c * 100.0 + d); }
+};
+
+// Two same-arity slots the type scorer cannot rank: the argument type implements neither
+// parameter type, so every candidate scores negative and resolution falls back to the first
+// slot. That fallback must still apply the named-argument permutation. The three classes share
+// one `int t` layout on purpose - the point is to defeat the scorer, not the field read.
+class NArgP { int t = 0; };
+class NArgQ { int t = 0; };
+class NArgR { int t = 0; };
+interface INArgUnrank
+{
+    int g(NArgP* p, NArgP* q);
+    int g(NArgQ* p, NArgQ* q);
+};
+class NArgUnrankImpl : INArgUnrank
+{
+    int g(NArgP* p, NArgP* q) { return p.t * 10 + q.t; }
+    int g(NArgQ* p, NArgQ* q) { return q.t * 10 + p.t; }
+};
+
+bool testInterfaceNamedArguments()
+{
+    bool result = true;
+
+    NArgImpl n;
+    INArg io = n;
+    result &= Test("iface_named_full",       io.f(b: 2, a: 1), 12);
+    result &= Test("iface_named_partial",    io.f(2, a: 1), 12);
+
+    INArg? ncio = n;
+    result &= Test("iface_named_nullcond",   ncio?.f(b: 2, a: 1), 12);
+
+    unique INArg uio = new NArgImpl();
+    result &= Test("iface_named_unique",     uio.f(b: 2, a: 1), 12);
+
+    INArg extIo = n;
+    result &= Test("iface_named_ext",        extIo.nargExt(q: 2, p: 1), 12);
+
+    NArgGenericImpl ng;
+    INArgGeneric<int> gio = ng;
+    result &= Test("iface_named_generic",    gio.f(b: 2, a: 1), 12);
+
+    NArgDiffNames d;
+    INArg dio = d;
+    result &= Test("iface_named_iface_wins", dio.f(b: 2, a: 1), 12);
+
+    // Receiver reached through an array element and through a parameter.
+    INArg[2] arr = { n, n };
+    result &= Test("iface_named_array_elem",  arr[1].f(b: 2, a: 1), 12);
+    result &= Test("iface_named_param_recv",  nargViaParam(io), 12);
+
+    // Overloaded slots: the names select and reorder within the matching slot, and a name
+    // that only the OTHER slot declares must still reach its own slot.
+    NArgOvImpl ov;
+    INArgOv ovio = ov;
+    result &= Test("iface_named_ov_int",      ovio.f(b: 2, a: 1), 12);
+    result &= Test("iface_named_ov_double",   ovio.f(d: 2.0, c: 1.0), 102);
+    result &= Test("iface_named_ov_positional", ovio.f(1, 2), 12);
+
+    // No type winner: the fallback first-slot pick must still carry the permutation.
+    // p is the second argument here, so a dropped permutation would score 12 instead.
+    NArgUnrankImpl ur;
+    INArgUnrank urio = ur;
+    NArgR* r1 = new NArgR(); r1.t = 1;
+    NArgR* r2 = new NArgR(); r2.t = 2;
+    result &= Test("iface_named_unrank_perm", urio.g(q: r1, p: r2), 21);
+
+    return result;
+}
+
 // === Namespaced interfaces ===
 // An interface is registered under its enclosing namespace, so two namespaces may each declare
 // their own "INsCounter" with a DIFFERENT contract without one silently replacing the other.
@@ -2561,6 +2665,7 @@ extern int main()
     total++; passed += testInterfaceReboxAcrossImport()        ? 1 : 0;
     total++; passed += testInterfaceReboxUninstantiatedGeneric() ? 1 : 0;
     total++; passed += testInterfaceOverloadDispatch()           ? 1 : 0;
+    total++; passed += testInterfaceNamedArguments()              ? 1 : 0;
     total++; passed += testNamespacedClassExplicitCtor()          ? 1 : 0;
     total++; passed += testNamespacedInterfaces()                ? 1 : 0;
     total++; passed += testNamespacedInterfaceShadowsCoreName()   ? 1 : 0;

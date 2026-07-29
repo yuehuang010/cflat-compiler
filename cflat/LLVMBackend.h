@@ -12471,6 +12471,19 @@ public:
 
         // Same arity, no type winner: keep the historical first-slot pick rather than reject a
         // program the scorer cannot rank (an unresolved generic argument lands here).
+        if (!args.empty())
+        {
+            // Nothing scored, so re-run the probed loop above non-probed to recover the specific
+            // named-argument diagnostic every candidate swallowed (LogError does not return). An
+            // all-positional call cannot fail here: arity already matches, so pass 2 always binds.
+            for (int idx : byArity)
+                MatchFunction(args, methods[idx].Parameters, false, false);
+
+            // The fallback slot still needs its permutation - matchedArgs is raw call order,
+            // so without this a reordered named call would bind its arguments backwards.
+            auto matched = MatchFunction(args, methods[byArity[0]].Parameters);
+            if (!matched.empty()) matchedArgs = matched;
+        }
         return byArity[0];
     }
 
@@ -16289,118 +16302,139 @@ public:
         return possibleResult;
     }
 
+    // How a call site's arguments bind to declared parameter slots (see ComputeArgumentPositions).
+    struct ArgumentBinding
+    {
+        bool Ok = false;
+        bool UnknownName = false;    // a named argument matched no parameter
+        bool DuplicateName = false;  // two named arguments claimed the same parameter
+        std::string FailedName;      // the offending name for the two flags above
+        // PosMap[i] = declared parameter index for call argument i. A variadic overflow
+        // argument gets an index at or past the last declared parameter.
+        std::vector<int64_t> PosMap;
+    };
+
+    /*
+     * Bind call-site arguments to declared parameter slots. Two passes: named arguments claim
+     * their parameter by name, then the unnamed ones fill the remaining slots left to right
+     * (for a variadic target, the overflow lands on trailing slots). `argNames[i]` is "" for a
+     * positional argument; `firstTarget` skips leading parameters the call site does not supply
+     * (an implicit 'this'). Pure - it reports failure through the result instead of diagnosing,
+     * so a probing caller and a diagnosing one can share one implementation. This is also the
+     * only way to learn an argument's DECLARED parameter before its value exists (lambda-literal
+     * type seeding), which is why it is separate from MatchFunction.
+     */
+    static ArgumentBinding ComputeArgumentPositions(const std::vector<std::string>& argNames,
+        const std::vector<TypeAndValue>& targetArguments, bool isVariadic, size_t firstTarget = 0)
+    {
+        ArgumentBinding binding;
+
+        if (firstTarget > targetArguments.size())
+            return binding;
+
+        const size_t inputSize = argNames.size();
+        const size_t paramSize = targetArguments.size() - firstTarget;
+
+        if (isVariadic ? inputSize < paramSize : inputSize != paramSize)
+            return binding;
+
+        binding.PosMap.assign(inputSize, -1);
+        std::vector<bool> usedTargetMap(paramSize);
+
+        // Pass 1: named arguments - resolve to their fixed-param position by name.
+        for (size_t posIndex = 0; posIndex < inputSize; posIndex++)
+        {
+            if (argNames[posIndex].empty())
+                continue;
+
+            auto it = std::find_if(targetArguments.begin() + firstTarget, targetArguments.end(),
+                [&](const auto& typeAndName) { return argNames[posIndex] == typeAndName.VariableName; });
+
+            if (it == targetArguments.end())
+            {
+                binding.UnknownName = true;
+                binding.FailedName = argNames[posIndex];
+                return binding;
+            }
+
+            size_t slot = (size_t)std::distance(targetArguments.begin() + firstTarget, it);
+            // A second named argument for the same parameter would leave another slot unbound,
+            // so the caller would read a default-constructed argument. Reject instead.
+            if (usedTargetMap[slot])
+            {
+                binding.DuplicateName = true;
+                binding.FailedName = argNames[posIndex];
+                return binding;
+            }
+            usedTargetMap[slot] = true;
+            binding.PosMap[posIndex] = (int64_t)(firstTarget + slot);
+        }
+
+        // Pass 2: unnamed arguments - assign to the next free fixed-param slot; for
+        // variadic targets, arguments that overflow the fixed params go to trailing slots.
+        size_t targetIndex = 0;
+        size_t nextVariadicIdx = paramSize;
+
+        for (size_t posIndex = 0; posIndex < inputSize; posIndex++)
+        {
+            if (!argNames[posIndex].empty())
+                continue;
+
+            bool assigned = false;
+            while (targetIndex < paramSize)
+            {
+                if (!usedTargetMap[targetIndex])
+                {
+                    binding.PosMap[posIndex] = (int64_t)(firstTarget + targetIndex);
+                    usedTargetMap[targetIndex] = true;
+                    targetIndex++;
+                    assigned = true;
+                    break;
+                }
+                targetIndex++;
+            }
+
+            if (!assigned)
+            {
+                if (!isVariadic)
+                    return binding;
+                binding.PosMap[posIndex] = (int64_t)(firstTarget + nextVariadicIdx++);
+            }
+        }
+
+        if (std::find(binding.PosMap.begin(), binding.PosMap.end(), -1) != binding.PosMap.end())
+            return binding;
+
+        binding.Ok = true;
+        return binding;
+    }
+
     // `probe` = scoring one candidate of an overload set: a mismatch only disqualifies THIS
     // candidate, so it returns {} instead of reporting - a losing candidate must never error.
     std::vector<LLVMBackend::NamedVariable> MatchFunction(const std::vector<LLVMBackend::NamedVariable>& inputArguments, const std::vector<LLVMBackend::TypeAndValue>& targetArguments, bool isVariadic = false, bool probe = false)
     {
-        // Two pass match.
-        // 1) Align named arguments to fixed parameters by name.
-        // 2) Fill remaining unnamed arguments into the next available fixed-param slot;
-        //    for variadic functions, overflow args are assigned to trailing variadic positions.
-
-        const size_t inputSize = inputArguments.size();
-        const size_t paramSize = targetArguments.size();
-
-        if (isVariadic ? inputSize < paramSize : inputSize != paramSize)
-            return {};
-
-        // posMap[i] = destination index in the result vector for inputArguments[i].
-        // Fixed-param slots: 0..paramSize-1; variadic slots: paramSize, paramSize+1, ...
-        std::vector<int64_t> posMap(inputSize, -1);
-
-        // Pass 1: named arguments - resolve to their fixed-param position by name.
-        int posIndex = 0;
+        std::vector<std::string> argNames;
+        argNames.reserve(inputArguments.size());
         for (const auto& input : inputArguments)
+            argNames.push_back(input.TypeAndValue.VariableName);
+
+        auto binding = ComputeArgumentPositions(argNames, targetArguments, isVariadic);
+        if (!binding.Ok)
         {
-            if (input.TypeAndValue.VariableName != "")
-            {
-                auto it = std::find_if(targetArguments.begin(), targetArguments.end(), [&](const auto& typeAndName)
-                    {
-                        return input.TypeAndValue.VariableName == typeAndName.VariableName;
-                    });
-
-                if (it != targetArguments.end())
-                {
-                    posMap[posIndex] = std::distance(targetArguments.begin(), it);
-                }
-                else if (probe)
-                {
-                    return {};  // named but none matched - disqualify this candidate silently.
-                }
-                else
-                {
-                    // named but none matched.
-                    LogError(std::format("named argument '{}' does not match any parameter", input.TypeAndValue.VariableName));
-                }
-            }
-
-            posIndex++;
-        }
-
-        // Mark fixed-param slots claimed by named arguments so pass 2 skips them.
-        std::vector<bool> usedTargetMap(paramSize);
-        for (int64_t pos : posMap)
-        {
-            if (pos >= 0)
-                usedTargetMap[pos] = true;
-        }
-
-        // Pass 2: unnamed arguments - assign to the next free fixed-param slot; for
-        // variadic functions, arguments that overflow the fixed params go to trailing slots.
-        bool successful = true;
-        posIndex = 0;
-        int targetIndex = 0;
-        size_t nextVariadicIdx = paramSize;
-
-        for (const auto& input : inputArguments)
-        {
-            if (input.TypeAndValue.VariableName == "")
-            {
-                bool assigned = false;
-                while (targetIndex < (int)paramSize)
-                {
-                    if (!usedTargetMap[targetIndex])
-                    {
-                        posMap[posIndex] = targetIndex;
-                        usedTargetMap[targetIndex] = true;
-                        targetIndex++;
-                        assigned = true;
-                        break;
-                    }
-                    targetIndex++;
-                }
-
-                if (!assigned)
-                {
-                    if (isVariadic)
-                        posMap[posIndex] = (int64_t)nextVariadicIdx++;
-                    else
-                    {
-                        successful = false;
-                        break;
-                    }
-                }
-            }
-
-            posIndex++;
-        }
-
-        if (successful && std::find(posMap.begin(), posMap.end(), -1) != posMap.end())
-        {
-            successful = false;
-        }
-
-        if (!successful)
-        {
+            // LogError does not return, so a reported failure never falls through to the
+            // reconstruction below - and an unbound slot can therefore never reach a caller.
+            if (!probe && binding.UnknownName)
+                LogError(std::format("named argument '{}' does not match any parameter", binding.FailedName));
+            if (!probe && binding.DuplicateName)
+                LogError(std::format("duplicate named argument '{}'", binding.FailedName));
             return {};
         }
 
-        // Reconstruct arguments in matched order.
-        std::vector<LLVMBackend::NamedVariable> result(inputSize);
-        for (int i = 0; i < (int)inputSize; i++)
-        {
-            result[posMap[i]] = inputArguments[i];
-        }
+        // Reconstruct arguments in matched order. firstTarget is 0 here, so every PosMap entry
+        // indexes the result directly.
+        std::vector<LLVMBackend::NamedVariable> result(inputArguments.size());
+        for (size_t i = 0; i < inputArguments.size(); i++)
+            result[binding.PosMap[i]] = inputArguments[i];
         return result;
     }
 
@@ -16606,7 +16640,11 @@ public:
             if (candidate.Variadic)
             {
                 // Route through MatchFunction so named fixed params are reordered correctly.
-                auto matched = MatchFunction(arguments, candidate.Parameters, true);
+                // probe=true: a LOSING candidate's named-arg mismatch must not hard-error
+                // out of this loop while a later candidate might still match - see the
+                // non-probed re-run below for how the diagnostic is recovered when nothing
+                // scores at all.
+                auto matched = MatchFunction(arguments, candidate.Parameters, true, true);
                 if (matched.size() > 0)
                 {
                     resolvedCandidate.emplace_back(matched, candidate);
@@ -16620,7 +16658,7 @@ public:
             }
             else
             {
-                auto matched = MatchFunction(arguments, candidate.Parameters);
+                auto matched = MatchFunction(arguments, candidate.Parameters, false, true);
                 if (matched.size() > 0)
                 {
                     resolvedCandidate.emplace_back(matched, candidate);
@@ -16632,6 +16670,22 @@ public:
 
         if (candidate.Function == nullptr)
         {
+            // No candidate scored even non-diagnostically - re-run the exact same loop
+            // non-probed (the pre-fix behavior) so a genuine named-argument mismatch still
+            // reports MatchFunction's specific message via LogError (which throws/exits, so
+            // this never falls through if it fires). This only runs when NOTHING matched
+            // above, so a real winner found by the probed loop can never be shadowed by a
+            // losing candidate's diagnostic - that was the bug. If every candidate fails for
+            // a reason other than a name miss (arity/etc, silent under either probe value),
+            // this loop is a no-op and control falls through to the generic dump below.
+            for (const auto& c : candidates)
+            {
+                if (c.Variadic)
+                    MatchFunction(arguments, c.Parameters, true, false);
+                else if (!(arguments.size() == 0 && c.Parameters.size() == 0))
+                    MatchFunction(arguments, c.Parameters, false, false);
+            }
+
             std::string msg = std::format("no overload of '{}' matches the given arguments.\n", functionName);
 
             // Call arguments

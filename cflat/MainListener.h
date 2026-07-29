@@ -19907,13 +19907,31 @@ public:
                                     Compiler(ctx)->GetInterfaceMethodParams(
                                         interfaceVar.TypeAndValue.TypeName, primaryIdentifier,
                                         namedArgCtx.size());
+                                // A named argument makes the call-site index diverge from the declared
+                                // one, so map through the same binder MatchFunction uses.
+                                std::vector<int64_t> declaredIdx(namedArgCtx.size());
+                                for (size_t i = 0; i < declaredIdx.size(); ++i)
+                                    declaredIdx[i] = (int64_t)i;
+                                if (ifaceParams != nullptr)
+                                {
+                                    std::vector<std::string> argNames;
+                                    argNames.reserve(namedArgCtx.size());
+                                    for (const auto& na : namedArgCtx)
+                                        argNames.push_back(na->Identifier() ? na->Identifier()->getText()
+                                                                            : std::string());
+                                    auto binding = LLVMBackend::ComputeArgumentPositions(
+                                        argNames, *ifaceParams, false);
+                                    if (binding.Ok) declaredIdx = binding.PosMap;
+                                }
                                 for (size_t argIdx = 0; argIdx < namedArgCtx.size(); ++argIdx)
                                 {
                                     const auto& namedArgument = namedArgCtx[argIdx];
+                                    auto argName = namedArgument->Identifier();
                                     lambdaExpectedType = {};
-                                    if (ifaceParams != nullptr && argIdx < ifaceParams->size())
+                                    if (ifaceParams != nullptr && declaredIdx[argIdx] >= 0
+                                        && declaredIdx[argIdx] < (int64_t)ifaceParams->size())
                                     {
-                                        const auto& p = (*ifaceParams)[argIdx];
+                                        const auto& p = (*ifaceParams)[declaredIdx[argIdx]];
                                         if (p.IsFunctionPointer) lambdaExpectedType = p;
                                         else if (const auto* enc = Compiler(ctx)->GetEncodedClosureType(p.TypeName))
                                             lambdaExpectedType = *enc;
@@ -19946,6 +19964,10 @@ public:
                                                *Compiler(ctx)->context, "string"))
                                         Compiler(ctx)->RegisterOwnedStringTemp(argValue);
                                     LLVMBackend::NamedVariable argVar;
+                                    // Named-argument binding uses the INTERFACE's declared parameter
+                                    // names, not the implementor's - matches virtual dispatch.
+                                    if (argName)
+                                        argVar.TypeAndValue.VariableName = argName->getText();
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
                                     argVar.Storage = argNV.Storage;
@@ -19955,6 +19977,9 @@ public:
                                     // Explicit 'move' at the call site: drives move-overload selection
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
+                                    // Propagate over-alignment so a `move` param that would inherit the block
+                                    // without its alignment tag is rejected instead of mis-freed.
+                                    argVar.AllocAlignment = argNV.AllocAlignment;
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
                                     // Propagate the pointer SHAPE flags: without them a `T**` or a
                                     // `T[]` looks like a thin `T*` and gets boxed into an interface param.
@@ -19968,6 +19993,11 @@ public:
                                     argVar.IsBonded = argNV.IsBonded;
                                     argVar.BondByAddress = argNV.BondByAddress;
                                     argVar.BondedSources = argNV.BondedSources;
+
+                                    // Preserve unsigned-integer TypeName so Upconvert (LowerByValueArg)
+                                    // chooses ZExt over SExt - without it a u8 200 arrives as -56.
+                                    if (argNV.TypeAndValue.IsUnsignedInteger() != -1)
+                                        argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
 
                                     // An INTERFACE argument's LLVM type is the shared fat-ptr struct, so the
                                     // struct-name extraction below would name it "__iface_fat_ptr" and the
@@ -20287,6 +20317,23 @@ public:
                                 }
                                 size_t paramOffset = arguments.empty() ? 0 : 1; // offset for implicit 'this'
 
+                                // A named argument makes the call-site index diverge from the declared
+                                // one, so map through the same binder MatchFunction uses.
+                                std::vector<int64_t> declaredIdx(namedArgCtx.size());
+                                for (size_t i = 0; i < declaredIdx.size(); ++i)
+                                    declaredIdx[i] = (int64_t)(i + paramOffset);
+                                if (funcSym != nullptr)
+                                {
+                                    std::vector<std::string> argNames;
+                                    argNames.reserve(namedArgCtx.size());
+                                    for (const auto& na : namedArgCtx)
+                                        argNames.push_back(na->Identifier() ? na->Identifier()->getText()
+                                                                            : std::string());
+                                    auto binding = LLVMBackend::ComputeArgumentPositions(
+                                        argNames, funcSym->Parameters, funcSym->Variadic, paramOffset);
+                                    if (binding.Ok) declaredIdx = binding.PosMap;
+                                }
+
                                 for (size_t argIdx = 0; argIdx < namedArgCtx.size(); ++argIdx)
                                 {
                                     const auto& namedArgument = namedArgCtx[argIdx];
@@ -20321,7 +20368,9 @@ public:
                                     {
                                         auto* argNameToken = namedArgument->Identifier();
                                         std::string namedParam = argNameToken ? argNameToken->getText() : "";
-                                        int effectiveIdx = namedParam.empty() ? (int)(argIdx + paramOffset) : -1;
+                                        // Positional brace-init: use the bound slot, not the call-site
+                                        // index, so an earlier named argument cannot shift it.
+                                        int effectiveIdx = namedParam.empty() ? (int)declaredIdx[argIdx] : -1;
                                         std::string structType = ResolveInitializerArgType(ctx, functionName, effectiveIdx, namedParam);
                                         if (!structType.empty())
                                         {
@@ -20351,9 +20400,10 @@ public:
                                     lambdaExpectedType = {};
                                     lambdaLockThisReceiver = {};
                                     lambdaLockThisMode = LockMode::Exclusive;
-                                    if (funcSym && (argIdx + paramOffset) < funcSym->Parameters.size())
+                                    if (funcSym && declaredIdx[argIdx] >= 0
+                                        && declaredIdx[argIdx] < (int64_t)funcSym->Parameters.size())
                                     {
-                                        const auto& paramTv = funcSym->Parameters[argIdx + paramOffset];
+                                        const auto& paramTv = funcSym->Parameters[declaredIdx[argIdx]];
                                         if (paramTv.IsFunctionPointer)
                                         {
                                             lambdaExpectedType = paramTv;

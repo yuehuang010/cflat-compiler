@@ -1,0 +1,40 @@
+// A named argument that matches no declared parameter must be rejected on the
+// interface call path exactly as it already is on the direct call path - not
+// silently accepted (or worse, silently bound to the wrong slot).
+interface IF { int f(int a, int b); };
+
+class N : IF { int f(int a, int b) { return a * 10 + b; } };
+
+// Overloaded slots: every same-arity slot is probed silently, so when NONE of them can bind
+// the name the diagnostic has to be recovered by re-running the search non-probed. Without
+// that recovery this compiled and dispatched to the first slot with the names ignored.
+interface IFOv
+{
+    int f(int a, int b);
+    int f(double c, double d);
+};
+
+class NOv : IFOv
+{
+    int f(int a, int b) { return a * 10 + b; }
+    int f(double c, double d) { return (int)(c * 100.0 + d); }
+};
+
+extern int main()
+{
+    N n;
+    IF io = n;
+
+    expect_error("named argument 'zz' does not match any parameter") {
+        int bogus = io.f(zz: 1, a: 2);
+    }
+
+    NOv nov;
+    IFOv ovio = nov;
+
+    expect_error("named argument 'zz' does not match any parameter") {
+        int bogusOv = ovio.f(zz: 1, a: 2);
+    }
+
+    return 0;
+}
