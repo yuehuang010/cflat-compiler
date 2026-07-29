@@ -88,9 +88,10 @@
           "end": "\"",
           "patterns": [
             {
+              "comment": "Mirrors ParseFormatString in MainListener.h: a '{' is an interpolation only when it is unescaped, is not one of a literal '{{' pair, has a matching '}' inside the SAME literal, and does not open JSON-ish text (content starting with '\"' or '\\'). Everything else is a literal brace, so a string like \"{\\\"type\\\":\\\"View\\\"}\" stays plain. The end also stops at the line break: a string literal never wraps, and an interpolation left open would swallow the following lines as embedded expression.",
               "name": "meta.interpolation.cflat",
-              "begin": "(?<!\\\\)\\{",
-              "end": "\\}",
+              "begin": "(?<![\\\\{])\\{(?![{\"\\\\])(?=[^\"]*\\})",
+              "end": "\\}|$",
               "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.cflat" } },
               "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.cflat" } },
               "contentName": "meta.embedded.expression.cflat",
@@ -181,6 +182,14 @@
         {
           "name": "keyword.other.operator-overload.cflat",
           "match": "\\boperator\\b"
+        },
+        {
+          "comment": "'vectorize' loop modifier with its optional FP-math flag: vectorize(contract) for (...)",
+          "match": "\\b(vectorize)\\b(?:\\s*\\(\\s*(contract|reassoc)\\s*\\))?",
+          "captures": {
+            "1": { "name": "keyword.control.vectorize.cflat" },
+            "2": { "name": "keyword.other.vectorize-flag.cflat" }
+          }
         }
       ]
     },
@@ -291,9 +300,9 @@
       ]
     },
     "generic-type-args": {
-      "comment": "Type names inside generic angle brackets, e.g. array<Explosion>, list<Foo*>, dictionary<string, int>. The lookbehind requires an identifier immediately before '<' and the lookahead requires the content to look like a type-arg list, which avoids matching arithmetic comparisons.",
-      "begin": "(?<=[A-Za-z_][A-Za-z0-9_])\\s*<(?=\\s*[A-Za-z_][A-Za-z0-9_]*\\s*\\*?\\s*[,>])",
-      "end": ">",
+      "comment": "Type names inside generic angle brackets, e.g. array<Explosion>, list<Foo*>, dictionary<string, int>. The lookbehind requires an identifier immediately before '<' and the lookahead requires the content to look like a type-arg list, which avoids matching arithmetic comparisons. The '<' must ABUT the identifier ('list<int>', never 'list <int>') so a spaced comparison like 'sa < sb, true' is not mistaken for a type-arg list. The end also stops at the line break: a generic never wraps, and without it a false positive would swallow every following line until the next '>' - inverting code and string spans for the rest of the file.",
+      "begin": "(?<=[A-Za-z_][A-Za-z0-9_])<(?=\\s*[A-Za-z_][A-Za-z0-9_]*\\s*\\*?\\s*[,>])",
+      "end": ">|$",
       "patterns": [
         { "include": "#keywords-type" },
         { "include": "#keywords-qualifier" },

@@ -11,5 +11,14 @@ extern int main() {
     list<int> xs = default;
     xs.add(doubleIt(21));
     int total = xs.get(0);
-    return total + s.length() + xs.count();
+    // Each switch arm ends in `break;`, but the `case:` after it is a fresh entry point -
+    // regression for the bug where everything past the first arm was faded "unreachable".
+    int kind = 0;
+    switch (s)
+    {
+        case "hi":  kind = 1; break;
+        case "bye": kind = 2; break;
+        default:    kind = 3; break;
+    }
+    return total + s.length() + xs.count() + kind;
 }

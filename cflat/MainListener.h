@@ -4726,25 +4726,41 @@ public:
         auto blockItems = ctx->blockItem();
 
         // Unreachable-code hint (LSP only): a direct return/break/continue ends the
-        // block, so any items after it are dead. Report the span once and let normal
-        // codegen proceed unchanged (the loop below reopens a dead block for them).
+        // block, so the items after it are dead - but only up to the next label. A
+        // `case:`/`default:`/goto label is a fresh entry point, so a switch body (whose
+        // arms each end in `break;`) has no dead code at all. Report each dead run and
+        // let normal codegen proceed unchanged (the loop below reopens a dead block).
         if (auto* compiler = Compiler(ctx); compiler->HasHintRegionSink())
         {
+            auto isLabel = [](CFlatParser::BlockItemContext* item)
+            {
+                auto* stmt = item->statement();
+                return stmt != nullptr && stmt->labeledStatement() != nullptr;
+            };
+
             for (size_t i = 0; i + 1 < blockItems.size(); ++i)
             {
                 auto* stmt = blockItems[i]->statement();
                 if (!stmt || stmt->jumpStatement() == nullptr) continue;
-                auto* firstDead = blockItems[i + 1];
-                auto* lastDead  = blockItems.back();
-                auto* startTok  = firstDead->getStart();
-                auto* stopTok   = lastDead->getStop();
-                int endCol = (int)stopTok->getCharPositionInLine()
-                           + (int)stopTok->getText().size();
-                compiler->ReportHintRegion(
-                    (int)startTok->getLine(), (int)startTok->getCharPositionInLine(),
-                    (int)stopTok->getLine(), endCol,
-                    "unreachable code");
-                break;
+
+                size_t deadEnd = i + 1;
+                while (deadEnd < blockItems.size() && !isLabel(blockItems[deadEnd]))
+                    ++deadEnd;
+
+                if (deadEnd > i + 1)
+                {
+                    auto* startTok = blockItems[i + 1]->getStart();
+                    auto* stopTok  = blockItems[deadEnd - 1]->getStop();
+                    int endCol = (int)stopTok->getCharPositionInLine()
+                               + (int)stopTok->getText().size();
+                    compiler->ReportHintRegion(
+                        (int)startTok->getLine(), (int)startTok->getCharPositionInLine(),
+                        (int)stopTok->getLine(), endCol,
+                        "unreachable code");
+                }
+                // Resume past the label that revives the block (it can never itself be a
+                // direct jump item, so skipping it as a candidate loses nothing).
+                i = deadEnd;
             }
         }
 
