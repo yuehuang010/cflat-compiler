@@ -53,7 +53,60 @@ IShape f() { Square s; IShape r = s as IShape; return r; } // accepted, still da
 That is the worst shape for a diagnostic to have - it teaches the wrong workaround. Worth
 weighting when prioritising this.
 
+## ATTEMPTED 2026-07-29 AND ABANDONED - read this before trying again
+
+Three analyses were written against the "Fix direction" below. All three passed the full
+suite (512/0/8) and all three were caught by adversarial review REJECTING LEGAL PROGRAMS.
+The attempt is preserved on branch `fix/return-dangle-provenance` (commit `446f028`,
+based on `4b045a4`); it was never merged. Repros are in that worktree under `scratch/rev*/`.
+
+| # | How the reaching store was chosen | Legal programs it rejected |
+|---|-----------------------------------|----------------------------|
+| 1 | Last store in LAYOUT order | `if`/`else` with the return in the `else`; early return out of a `then`; return inside a `while` body |
+| 2 | Nearest store that DOMINATES the return | Both arms overwrite the slot; the `switch` form; nested `if`/`else` where every leaf overwrites; an `if`/`else if` chain |
+| 3 | Backward walk stopping at the first store on each path (kill-aware may-reach), rejecting only when EVERY reaching value is a frame box | `return <interface local>` lexically inside any loop - `for`, `while`, `do`/`while`, nested, and independent of `move` |
+
+Each analysis fixed the previous one's counterexamples and introduced its own. Attempt 3's
+failure is the important one, because it is STRUCTURAL rather than a smarter-query problem:
+
+**The guard is computed while the function is still being emitted.** At a `return` inside a
+loop body, stores later in the body do not exist yet and the latch->header back-edge is not
+wired. Attempt 3 assumed missing CFG information is monotone toward acceptance. Under the
+all-frame rejection rule it is not - dropping the NON-frame store is exactly what makes the
+predicate fire. Missing information causes a false rejection.
+
+That rule is itself forced, not a free choice. Rejecting when ANY frame box may reach breaks
+`if (c > 0) {...} else if (c <= 0) {...}`, which is exhaustive by arithmetic but not by CFG,
+so the emitted graph carries an edge delivering the pre-`if` frame box to the return. That
+shape is CFG-indistinguishable from a real conditional dangle; only path-sensitive reasoning
+about the conditions separates them.
+
+**Any future attempt must run over a COMPLETE CFG** - a post-emission pass over the finished
+function - or decline to answer whenever the walk could still be missing an edge or a store.
+A query that is precise at emission time cannot be sound in the rejecting direction.
+
+Two further lessons, both cheap to re-learn the hard way:
+
+- **A green suite proves nothing here.** All three attempts were 512/0/8. No in-repo `.cb`
+  used the shapes that broke. Any retry must add POSITIVE tests - legal programs that must
+  keep compiling - not just `expect_error` legs, and must verify them against the CURRENT
+  compiler too, since they assert behaviour both binaries share.
+- **The governing asymmetry**: a false rejection is a blocker, a missed dangle is merely
+  today's behaviour. When the analysis is unsure, ACCEPT.
+
+Genuinely useful work the attempt produced, worth keeping if it is retried: the
+`ClassifyInterfaceBoxSource` ordering fix (storage shape must be tested before ownership, or
+a by-value class local with an owning binding is mislabelled `Heap`), and the provenance
+filter on `FindInterfaceBoxByDataPointer` (two interfaces boxed over one object share a data
+pointer, so an unfiltered lookup can answer about the wrong box). Both are described in
+[[interface-boxing-sites-not-fully-consolidated]] and neither depends on the failed analysis.
+
 ## Fix direction
+
+> The claim below that this is "only a wiring one" is WRONG - see the abandoned-attempt
+> section above. The ledger is necessary but not sufficient: it answers what a value IS,
+> while the hard part is which store REACHES the return, and that cannot be answered
+> soundly at emission time. Keep the ledger; discard the "just look it up" framing.
 
 **The prerequisite now EXISTS - this is no longer a design problem, only a wiring one.**
 The boxing consolidation added exactly the thing this issue asked for: a provenance ledger,

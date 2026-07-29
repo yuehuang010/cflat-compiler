@@ -7,19 +7,25 @@ Not a separate issue - an index. Each row points at the file that owns the detai
 When an issue is fixed its file is deleted (the repo convention), so delete its row
 here in the same change.
 
-Last updated 2026-07-28.
+Last updated 2026-07-29.
 
 ## Resume point
 
-- master is the `as`/`is` source-routing fix, linear, tree clean.
+- master is the boxing-consolidation fix (`4b045a4`), linear, tree clean.
 - Full verification re-run on macOS at that commit: **512 passed / 0 failed / 8 skipped**,
-  examples **35 / 0**. (Baseline immediately before it was 510/0/8; the +2 are the new
-  ternary legs in `Test/test_interface.cb`.) LSP was NOT re-run - it is Windows-only.
+  examples **35 / 0**. (Baseline before the `as`/`is` work was 510/0/8.) LSP was NOT re-run -
+  it is Windows-only.
 - Queue head is [[interface-return-dangle-defeated-by-intermediate-local]] - the LAST member
-  of the `as`/`is` family still open, and now the cheapest it will ever be: the provenance
-  ledger it needs already exists, so it is a lookup replacing an IR walk. Read
-  [[interface-boxing-sites-not-fully-consolidated]] first - that change adds the ledger's
-  second consumer and will expose two currently-inert sharp edges.
+  of the `as`/`is` family still open. **It was ATTEMPTED on 2026-07-29 and ABANDONED after
+  three analyses each rejected legal programs; read that file's abandoned-attempt section
+  before touching it.** An earlier note here called it "the cheapest it will ever be, a
+  lookup replacing an IR walk" - that was wrong. The ledger answers what a value IS; the
+  hard part is which store REACHES the return, and that cannot be answered soundly while
+  the function is still being emitted. The attempt is preserved on branch
+  `fix/return-dangle-provenance` (`f39410e`, worktree `../cflat-fix-return-dangle`) with its
+  repro corpus in `scratch/rev*/`.
+- Note for this whole family: all three failed attempts passed the suite at 512/0/8. A green
+  suite does not detect a false rejection here - no in-repo `.cb` uses the shapes involved.
 - The `as`/`is` family is otherwise DONE: routing (2 issues) and boxing guards (2 issues) are
   closed. What remains under `as` are the follow-ups those fixes surfaced, all of which are
   PLAIN-path or diagnostic-quality rather than `as` defects.
