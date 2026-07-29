@@ -13,8 +13,9 @@
 // That shape is rejected, just not with the shared wording. A LOCAL array of pointers
 // (`Circle*[3]` as a local) is the same exception for the same reason - it decays to a
 // getelementptr with no named binding - even though the GLOBAL spelling of it, tested below,
-// does get the shared wording. A primitive array (`int[3]`) is deliberately left alone: the
-// plain spelling still ACCEPTS it, so rejecting it here would diverge in the other direction.
+// does get the shared wording. A PRIMITIVE array (`int[3]`) is rejected by both spellings now,
+// with its own primitive wording - see err_primitive_array_interface_box.cb. The local-array
+// exception above applies to it too: only the GLOBAL spelling reaches the shared message.
 //
 // Each shape below reaches the classifier as a DIFFERENT llvm value - a decayed getelementptr,
 // a GlobalVariable, a nested array type, a loaded `ptr` - so they are separate cases rather

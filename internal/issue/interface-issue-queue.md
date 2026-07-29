@@ -11,12 +11,13 @@ Last updated 2026-07-29.
 
 ## Resume point
 
-- master is the boxing-consolidation fix (`4b045a4`), linear, tree clean.
-- Full verification re-run on macOS at that commit: **512 passed / 0 failed / 8 skipped**,
-  examples **35 / 0**. (Baseline before the `as`/`is` work was 510/0/8.) LSP was NOT re-run -
-  it is Windows-only.
-- Queue head is [[interface-return-dangle-defeated-by-intermediate-local]] - the LAST member
-  of the `as`/`is` family still open. **It was ATTEMPTED on 2026-07-29 and ABANDONED after
+- master is the closure-parameter lowering fix (`df32dd8`), linear, tree clean. The
+  primitive-array boxing fix sits on top of it.
+- Full verification re-run on macOS with that fix: **520 passed / 0 failed / 8 skipped**,
+  examples **35 / 0**. (Baseline at `df32dd8` was 518/0/8; the new error test adds two, cold
+  and warm cache.) LSP was NOT re-run - it is Windows-only.
+- Queue head is STILL [[interface-return-dangle-defeated-by-intermediate-local]] - the
+  primitive-array fix did not touch it - the LAST member of the `as`/`is` family still open. **It was ATTEMPTED on 2026-07-29 and ABANDONED after
   three analyses each rejected legal programs; read that file's abandoned-attempt section
   before touching it.** An earlier note here called it "the cheapest it will ever be, a
   lookup replacing an IR walk" - that was wrong. The ledger answers what a value IS; the
@@ -41,6 +42,37 @@ Last updated 2026-07-29.
   reopen it.
 
 ## Closed in the 2026-07-29 session
+
+- **A primitive-element array boxed into an interface was accepted and miscompiled** -
+  fixed, closing `global-primitive-array-boxed-into-interface`. The real mechanism is
+  UNREACHABILITY, not a guard that failed to fire: `RejectPointerShapedInterfaceUpcast` sits
+  behind a `StructImplementsInterface()` early-out at every boxing site, and `"int"` never
+  satisfies that, so the shape guard could only ever see class sources. The plain-assignment
+  chain then fell out of its if/else with a raw `ptr` in hand and stored it into the fat
+  slot.
+  - The GLOBAL vs LOCAL divergence is purely **Constant vs Instruction**. A global array
+    operand is an `llvm::Constant`, so IRBuilder folds the bitcast into a ConstantExpr, which
+    the module verifier does not subject to the instruction-level bitcast check - it verified
+    clean and detonated later in SelectionDAG. A local array decays to a GEP instruction, so
+    a real `bitcast` INSTRUCTION is emitted and the verifier rejects it. Same source bug, two
+    completely different-looking outcomes.
+  - The issue file's runtime description was **wrong for the decl-init spelling**: "exit 139"
+    was the COMPILER segfaulting during ISel, not the program. It was **right for the
+    brace-init spelling**, which was found later in review - `Holder h = { s = gInt };` links
+    clean and the PROGRAM exits 139. Both are in the fix.
+  - Four boxing sites needed the guard, and the fourth (`CoerceInitValueToInterface`, shared
+    by brace-init and the `<Tag attr=...>` element path) was missed on the first pass for
+    exactly the reason the root-cause account names. When a guard is placed after an
+    implements check, ASSUME there are more copies of that early-out and go find them.
+  - Guard polarity, which is the reusable part: it proves three things before rejecting -
+    registered interface target, builtin-primitive source element, provably pointer-shaped
+    source - and accepts everything it cannot prove. A 493-file corpus sweep plus ~30 hand
+    probes found no false rejection. Parens do NOT defeat it; an `auto` intermediate does,
+    and that is filed as [[auto-binding-of-fixed-array-loses-shape]] rather than patched by
+    widening the guard.
+  - `as` and plain now agree, byte-identical, for the GLOBAL spelling. The LOCAL spelling
+    still gets the classifier's generic message - the same documented exception a local
+    `Circle*[3]` has, since a decayed GEP has no named binding to describe.
 
 - **Duplicate constructor signature crashed the compiler with no diagnostic** - fixed,
   closing `duplicate-constructor-signature-hangs-compiler`. The issue file's guess (runaway
@@ -156,7 +188,6 @@ Last updated 2026-07-29.
 | Issue | Severity |
 |---|---|
 | [[generic-interface-registered-as-opaque-struct]] | LLVM verifier failure + false rejections. `IFace<T>` unusable in most positions. |
-| [[global-primitive-array-boxed-into-interface]] | Silent miscompile, escapes the verifier. PLAIN path, not `as`. |
 | [[interface-boxing-guards-are-binding-dependent]] | Double free (exit 134). Parens or `?:` erase the binding the guards key off. |
 | [[return-ternary-join-concrete-pointers-not-boxed]] | Verifier abort, no source diagnostic. PLAIN path; `as` is now better. |
 | [[generic-interface-namespace-scope-limit]] | Silent miscompile. DELIBERATE scope limit of `c9acb6c`, recorded so it is not lost. |
@@ -165,6 +196,10 @@ Last updated 2026-07-29.
 | [[function-array-body-silently-truncated]] | Silent miscompile, exit 133. NOT interface-related; filed here because it has no other queue. |
 | [[nondeterministic-ir-switch-case-order]] | No miscompile - a METHODOLOGY hazard. NOT interface-related; listed here for the same reason as the row above: it is the only index. Read it before using "0 IR diffs" as proof. |
 | [[closure-param-accepts-data-pointer]] | SIGSEGV, no diagnostic. DIRECT-path residue; the virtual path is now guarded. |
+| [[auto-binding-of-fixed-array-loses-shape]] | Silent miscompile (`auto` on an array is not indexable), and it defeats the primitive-array guard. Fix the deduction, NOT the guard. |
+| [[null-coalesce-join-into-interface-not-boxed]] | Verifier failure, no diagnostic. A THIRD join shape - not the `?:` double-free entry, not the return-path entry. |
+| [[fixed-array-copy-invalid-bitcast]] | Verifier failure, no diagnostic. NOT interface-related; filed here because it has no other queue. |
+| [[fixed-array-parameter-not-callable]] | False rejection: a `T[N]` parameter registers as a bare `T`, so no call resolves. NOT interface-related; same reason as the row above. |
 
 ## Open - false rejections and accept-set problems
 

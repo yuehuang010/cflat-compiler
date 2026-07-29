@@ -1,0 +1,96 @@
+// A PRIMITIVE-element array boxed into an interface. Nothing implements an interface here - `int`
+// is not a class - so the class-array advice ("index or dereference it first") would be wrong and
+// this shape gets its own wording.
+//
+// Why this needed its own guard: every boxing site only consults the pointer-shape rejection AFTER
+// StructImplementsInterface() has said yes, and that is never true for a primitive. The plain
+// spelling therefore fell out of its if/else chain with a raw ptr still in hand and stored it into
+// the fat-pointer slot. The LOCAL spelling produced a real `bitcast ptr to %__iface_fat_ptr` that
+// the module verifier caught; the GLOBAL spelling folded to a constant-expression bitcast that
+// verified clean and then crashed the backend (or silently vanished when the value was unused).
+//
+// Every spelling below - global decl-init, local decl-init, the assignment STATEMENT, an array
+// VIEW, brace-init of an interface FIELD, brace-init of an interface ARRAY ELEMENT, and 'as' -
+// reports the same text. 'as' was already stricter than plain for this shape and the two must not
+// drift apart again.
+//
+// The 'as' agreement is pinned for the GLOBAL spelling only. A LOCAL array decays to a
+// getelementptr with no named binding, so `a as IShape` still reports the classifier's generic
+// "requires an interface value" text - the same documented exception a local `Circle*[3]` has.
+// See err_as_array_source_interface.cb for that scope note.
+
+interface IShape
+{
+    int area();
+};
+
+// A GLOBAL fixed array: the source is the GlobalVariable itself, so the bad bitcast folded into a
+// ConstantExpr and slipped past the verifier. This was the silent miscompile.
+int[3] gInt;
+expect_error("cannot convert 'int[3]' to interface 'IShape' - 'int' is a primitive type and can never implement an interface") {
+    void globalArray() { IShape s = gInt; }
+}
+
+// A LOCAL fixed array decays to a getelementptr, so the same store became a real bitcast
+// INSTRUCTION. Rejected up front now instead of surviving to the module verifier.
+expect_error("cannot convert 'int[3]' to interface 'IShape' - 'int' is a primitive type and can never implement an interface") {
+    void localArray() { int[3] a; IShape s = a; }
+}
+
+// The assignment STATEMENT is a separate boxing site from decl-init and missed it the same way.
+expect_error("cannot convert 'int[3]' to interface 'IShape' - 'int' is a primitive type and can never implement an interface") {
+    void assignStatement() { IShape s; s = gInt; }
+}
+
+// An array VIEW carries the element type too; a view of primitives is just as unboxable.
+expect_error("cannot convert 'int[]' to interface 'IShape' - 'int' is a primitive type and can never implement an interface") {
+    void arrayView() { int[3] a; int[] v = a; IShape s = v; }
+}
+
+// The 'as' spelling used to land in the classifier's Unknown bucket and report the generic
+// "requires an interface value" text. It now shares the plain spelling's wording exactly.
+expect_error("cannot convert 'int[3]' to interface 'IShape' - 'int' is a primitive type and can never implement an interface") {
+    void asSpelling() { IShape s = gInt as IShape; }
+}
+
+// BRACE-INIT is its own boxing site (CoerceInitValueToInterface, shared with the `<Tag attr=...>`
+// element path) and it repeats the same early-out: the shape guard sits AFTER the implements
+// check, so a primitive never reached it. This leg was a live silent miscompile - it linked and
+// the program exited 139 - after the four legs above were already fixed.
+class Holder
+{
+    IShape s = default;
+};
+expect_error("cannot convert 'int[3]' to interface 'IShape' - 'int' is a primitive type and can never implement an interface") {
+    void braceInitField() { Holder h = { s = gInt }; }
+}
+
+// A `T**` through the same site. Not an array at all, so it pins that the guard keys off the
+// declared TYPE rather than off anything array-specific.
+int** gpp;
+expect_error("cannot convert 'int**' to interface 'IShape' - 'int' is a primitive type and can never implement an interface") {
+    void braceInitPtrPtr() { Holder h = { s = gpp }; }
+}
+
+// The fixed-array ELEMENT leg of the same site. Both elements are the same bad source, so this
+// also pins that the first rejection throws before a second element can be lowered.
+expect_error("cannot convert 'int[3]' to interface 'IShape' - 'int' is a primitive type and can never implement an interface") {
+    void braceInitArrayElement() { IShape[2] arr = { gInt, gInt }; }
+}
+
+// A simd vector through the same site. On the pre-fix compiler this LINKED AND RAN - a silent
+// miscompile storing a vector in a fat-pointer slot - so it is pinned here deliberately.
+expect_error("cannot convert 'int simd vector' to interface 'IShape' - 'int' is a primitive type and can never implement an interface") {
+    void braceInitSimd() { simd<int,4> sv; Holder h = { s = sv }; }
+}
+
+// The `<Tag attr=...>` element path shares CoerceInitValueToInterface with brace-init. It reached
+// the site as a compiler SIGSEGV before the guard, so pin it rather than leave it to the field leg.
+expect_error("cannot convert 'int[3]' to interface 'IShape' - 'int' is a primitive type and can never implement an interface") {
+    void tagElement() { Holder* h = <Holder s={gInt} />; }
+}
+
+extern int main()
+{
+    return 0;
+}

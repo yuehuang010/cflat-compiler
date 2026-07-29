@@ -8334,6 +8334,13 @@ public:
                                         assignmentExpression, right, rightNV.TypeAndValue.Pointer,
                                         structName, typeAndValue.TypeName, &rightNV);
                                 }
+                                // Provably unboxable: a primitive-element array / view / 'T**'.
+                                // The helper throws; the empty body keeps control out of the store.
+                                else if (RejectPrimitiveShapedInterfaceUpcast(
+                                             assignmentExpression, rightNV.TypeAndValue,
+                                             typeAndValue.TypeName))
+                                {
+                                }
                                 else if (typeAndValue.TypeName == "string" &&
                                          right->getType() == compiler->builder->getInt8Ty()->getPointerTo())
                                 {
@@ -9986,6 +9993,29 @@ public:
     }
 
     /*
+     * The one pointer-shaped source RejectPointerShapedInterfaceUpcast never gets to see: an
+     * `int[3]` and friends never reach BoxConcreteIntoInterface at all, because every boxing site
+     * only calls it once StructImplementsInterface() said yes - and a primitive implements
+     * nothing. The plain-assignment chain then fell out of its if/else with a raw ptr and stored
+     * it into the fat slot.
+     *
+     * Polarity: this proves all three of - the target is a REGISTERED interface, the source
+     * element is a BUILTIN primitive, and the source is pointer-SHAPED - before rejecting. A class
+     * element, a generic type parameter, an unresolved name, a plain scalar, an already-fat value:
+     * none of them is proven wrong here, so all of them return false and keep today's behaviour.
+     */
+    bool RejectPrimitiveShapedInterfaceUpcast(antlr4::ParserRuleContext* errCtx,
+                                              const LLVMBackend::TypeAndValue& src,
+                                              const std::string& interfaceName)
+    {
+        if (interfaceName.empty() || compilerLLVM->interfaceTable.count(interfaceName) == 0)
+            return false;
+        if (!LLVMBackend::IsPrimitiveTypeName(compilerLLVM->ResolveTypeAlias(src.TypeName)))
+            return false;
+        return RejectPointerShapedInterfaceUpcast(errCtx, src, interfaceName);
+    }
+
+    /*
      * Where the object a boxing site is about to box actually lives. `srcNV` decides the cases the
      * IR cannot: a borrowed pointer parameter and an owning local both arrive as a load.
      */
@@ -10752,6 +10782,13 @@ public:
                         }
                     }
                     right = compiler->BuildInterfaceFatValue(vtable, dataPtr);
+                }
+                // Same provable rejection as the decl-init spelling; a fat-ptr DESTINATION only,
+                // since an 'IFoo*' slot stores a pointer and never bitcasts to the fat struct.
+                else if (namedVar.TypeAndValue.IsFatInterfaceValue())
+                {
+                    RejectPrimitiveShapedInterfaceUpcast(
+                        ctx, rightNV.TypeAndValue, namedVar.TypeAndValue.TypeName);
                 }
             }
             // Derived-interface -> parent-interface assignment: re-box through the typedesc chain.
@@ -12401,9 +12438,12 @@ public:
         if (storage != nullptr)
         {
             const auto* declared = compiler->FindDeclaredTypeAndValueForStorage(storage);
-            // Requiring a REGISTERED class keeps primitives out: the plain spelling still accepts
-            // `IShape s = someIntArray;`, so rejecting it here would diverge the other way.
-            if (declared != nullptr && compiler->dataStructures.count(declared->TypeName)
+            // A REGISTERED class or a BUILTIN primitive element: both are named types whose
+            // boxability is decidable, and both spellings must reject a primitive array in step.
+            bool namedElement = declared != nullptr
+                && (compiler->dataStructures.count(declared->TypeName)
+                    || LLVMBackend::IsPrimitiveTypeName(compiler->ResolveTypeAlias(declared->TypeName)));
+            if (namedElement
                 && !compiler->DescribePointerShapedInterfaceSource(*declared).empty())
             {
                 shape = *declared;  // copy out now; the pointer aliases live map storage
@@ -14699,6 +14739,9 @@ public:
         }
 
         std::string srcName = rightNV.TypeAndValue.TypeName;
+        // Proven BEFORE the implements early-out: a primitive satisfies it never, so a guard
+        // placed after it can only ever see class sources (see RejectPrimitiveShapedInterfaceUpcast).
+        if (RejectPrimitiveShapedInterfaceUpcast(errCtx, rightNV.TypeAndValue, ifaceName)) return val;
         if (srcName.empty() || !compiler->StructImplementsInterface(srcName, ifaceName)) return val;
         if (RejectPointerShapedInterfaceUpcast(errCtx, rightNV.TypeAndValue, ifaceName)) return val;
         auto vtable = compiler->GetOrCreateVTable(srcName, ifaceName);

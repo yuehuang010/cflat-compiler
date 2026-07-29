@@ -9662,6 +9662,13 @@ public:
                                                         const std::string& typeName,
                                                         const std::string& interfaceName) const
     {
+        // A PRIMITIVE element gets its own wording: "index or dereference it first" is useless
+        // advice when no value of that element type could ever implement the interface.
+        if (IsPrimitiveTypeName(ResolveTypeAlias(typeName)))
+            return std::format(
+                "cannot convert '{}' to interface '{}' - '{}' is a primitive type and can never "
+                "implement an interface",
+                shape, interfaceName, typeName);
         return std::format(
             "cannot convert '{}' to interface '{}' - only a single instance pointer '{}*' or a "
             "'{}' value can be boxed into an interface fat pointer; index or dereference it first",
