@@ -2,6 +2,7 @@ import "test_helper.cb";
 import "list.cb";
 import "channel.cb";
 import "library/iface_rebox_lib.cb";
+import "function.cb";
 
 // === Interfaces ===
 
@@ -2567,6 +2568,82 @@ bool testInterfaceNamedArguments()
     return result;
 }
 
+// === Function-pointer parameters through an interface slot ===
+// A thin `function<>` parameter is a bare code pointer, so a closure fat struct handed to a
+// virtual slot must be lowered to its invoker exactly as the direct call path does. The fat
+// `Lambda<>` spelling keeps its {code, env} pair and carries captures.
+interface IFnParam
+{
+    int run(function<int(int)> fn);
+    int two(int a, function<int(int)> fn);
+    int lam(Lambda<int(int)> fn);
+    int lam2(Lambda<int(int)> fn, int a);
+};
+class FnParamImpl : IFnParam
+{
+    int run(function<int(int)> fn) { return fn(5); }
+    int two(int a, function<int(int)> fn) { return fn(a); }
+    int lam(Lambda<int(int)> fn) { return fn(5); }
+    int lam2(Lambda<int(int)> fn, int a) { return fn(a); }
+};
+int fnParamTriple(int x) { return x * 3; }
+int fnParamQuad(int x) { return x * 4; }
+// Direct-path twin: the interface and direct arms must accept the same argument shapes.
+class FnParamDirect { int lam(Lambda<int(int)> fn) { return fn(5); } };
+
+bool testInterfaceFunctionPointerParam()
+{
+    bool result = true;
+
+    FnParamImpl impl;
+    IFnParam io = impl;
+
+    // Non-capturing lambda into a thin `function<>` slot: positional and named.
+    result &= Test("iface_thinfn_positional", io.run((int x) => { return x * 4; }), 20);
+    result &= Test("iface_thinfn_named",      io.run(fn: (int x) => { return x * 4; }), 20);
+
+    // A named function and a stored thin `function<>` value are already bare pointers.
+    result &= Test("iface_thinfn_namedfunc",  io.run(fnParamTriple), 15);
+    function<int(int)> stored = fnParamTriple;
+    result &= Test("iface_thinfn_variable",   io.run(stored), 15);
+
+    // Second parameter slot, positional and reordered by name.
+    result &= Test("iface_thinfn_slot2",      io.two(3, (int x) => { return x + 1; }), 4);
+    result &= Test("iface_thinfn_slot2_named", io.two(fn: (int x) => { return x + 1; }, a: 3), 4);
+
+    // The fat `Lambda<>` spelling still carries captures, in both argument orders.
+    int factor = 7;
+    result &= Test("iface_fatlambda",         io.lam((int x) => { return x * factor; }), 35);
+    result &= Test("iface_fatlambda_named",   io.lam2(fn: (int x) => { return x * factor; }, a: 2), 14);
+
+    // Mirror direction: a fat `Lambda<>` slot fed a NAMED function ({shim, null}) or a stored
+    // thin `function<>` value ({code, null}). A lambda literal is already fat, so only these
+    // two shapes exercise the widening - positionally and by name, in both slot positions.
+    result &= Test("iface_fat_from_func",         io.lam(fnParamTriple), 15);
+    result &= Test("iface_fat_from_func_named",   io.lam(fn: fnParamTriple), 15);
+    result &= Test("iface_fat_from_thin",         io.lam(stored), 15);
+    result &= Test("iface_fat_from_thin_named",   io.lam(fn: stored), 15);
+    result &= Test("iface_fat_from_func_slot2",   io.lam2(fnParamTriple, 4), 12);
+    result &= Test("iface_fat_from_thin_slot2",   io.lam2(fn: stored, a: 4), 12);
+
+    // An already-fat `Lambda<>` variable must pass through the widening untouched.
+    Lambda<int(int)> fatvar = (int x) => { return x * factor; };
+    result &= Test("iface_fat_from_fatvar",       io.lam(fatvar), 35);
+
+    // A `?:` join carries no recorded provenance - neither arm's type survives into the join -
+    // so the widen must ACCEPT what it cannot disprove. Pinned on both arms: an allowlist gate
+    // rejected these through the interface while the direct path kept accepting them.
+    int k = 1;
+    function<int(int)> altThin = fnParamQuad;
+    FnParamDirect direct;
+    result &= Test("iface_fat_from_ternary",      io.lam(k > 0 ? stored : altThin), 15);
+    result &= Test("direct_fat_from_ternary",     direct.lam(k > 0 ? stored : altThin), 15);
+    result &= Test("iface_fat_from_ternary_func", io.lam(k > 0 ? fnParamTriple : fnParamQuad), 15);
+    result &= Test("direct_fat_from_ternary_func", direct.lam(k > 0 ? fnParamTriple : fnParamQuad), 15);
+
+    return result;
+}
+
 // === Namespaced interfaces ===
 // An interface is registered under its enclosing namespace, so two namespaces may each declare
 // their own "INsCounter" with a DIFFERENT contract without one silently replacing the other.
@@ -3347,6 +3424,7 @@ extern int main()
     total++; passed += testNamespacedInterfaces()                ? 1 : 0;
     total++; passed += testInterfaceReturnDangleCorpus()          ? 1 : 0;
     total++; passed += testNamespacedInterfaceShadowsCoreName()   ? 1 : 0;
+    total++; passed += testInterfaceFunctionPointerParam()         ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

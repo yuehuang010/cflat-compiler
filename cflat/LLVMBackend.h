@@ -9565,9 +9565,9 @@ public:
             }
             return builder->CreateBitCast(val, BuildThinFnPtrType(retTV), "thinret");
         }
-        if (auto* fn = llvm::dyn_cast<llvm::Function>(val)) return WrapBareValueAsFatStruct(fn);
-        if (!valIsStruct && val->getType()->isPointerTy()) return WidenThinToFat(val);   // thin -> fat
-        return val;   // already a fat closure value
+        // Same widening the call paths use; routed through the shared helper so the three
+        // sites cannot drift. An already-fat closure value is returned untouched.
+        return WidenBareOrThinToClosureFat(val);
     }
 
     // Widen a thin `function<T>` (bare C ptr) to a fat `Lambda<T>` value {code, null}. No thunk:
@@ -12379,11 +12379,102 @@ public:
         }
     }
 
+    // Is this argument PROVABLY a data pointer being passed to a closure parameter? Deliberately
+    // one-sided: it answers yes only when the frontend positively recorded a pointer that is not
+    // a closure. Anything it cannot prove (a ternary join, a `??` load, a future spelling whose
+    // provenance nothing records) must come back false, because the caller ACCEPTS on false. An
+    // allowlist here would false-reject every shape nobody enumerated, which this project ranks
+    // as the worse failure; a missed diagnostic only restores the pre-existing behaviour.
+    bool ArgumentIsProvablyDataPointer(llvm::Value* value, const NamedVariable& arg) const
+    {
+        if (llvm::isa<llvm::Function>(value)) return false;               // a named function
+        if (llvm::isa<llvm::ConstantPointerNull>(value)) return false;    // parity with the direct path
+        if (arg.TypeAndValue.IsFunctionPointer) return false;             // a closure value
+        // The only positive evidence available here: the declared type is a pointer. A join,
+        // a call result with no recorded shape, or a bare identifier leaves this false.
+        return arg.TypeAndValue.Pointer;
+    }
+
+    // Name a data-pointer argument for the closure-parameter rejection. The interface argument
+    // loop propagates shape flags but NOT TypeName, so this often has to stay generic - that is
+    // deliberate and must not be "fixed" by widening propagation into that loop.
+    std::string DescribeNonFunctionArgument(const NamedVariable& arg) const
+    {
+        const auto& tn = arg.TypeAndValue.TypeName;
+        if (tn.empty())
+            return "a non-function pointer value";
+        return std::format("a '{}{}' value", tn, arg.TypeAndValue.Pointer ? "*" : "");
+    }
+
+    // Mirror of LowerClosureFatToThinFnPtr: widen what a fat `Lambda<>` parameter expects.
+    // A named function becomes {shim, null} and a thin `function<>` value becomes {code, null};
+    // an already-fat value and a non-pointer are returned untouched. Shared by the normal call
+    // path and virtual dispatch so the two cannot drift.
+    llvm::Value* WidenBareOrThinToClosureFat(llvm::Value* val)
+    {
+        if (auto* fn = llvm::dyn_cast<llvm::Function>(val))
+            return WrapBareValueAsFatStruct(fn);
+        if (val && !val->getType()->isStructTy() && val->getType()->isPointerTy())
+            return WidenThinToFat(val);   // thin function<T> -> fat Lambda<T> {code, null}
+        return val;
+    }
+
+    // Lower a closure fat struct {code, env} to the bare code pointer that a thin
+    // `function<>` / extern-C function-pointer parameter expects. The closure ABI is env-last,
+    // so a NON-capturing invoker (compile-time-null env, set only by ParseLambdaExpression when
+    // the lambda captured nothing) is directly callable as a bare C function pointer. Anything
+    // else would silently drop its captured state across that ABI and is rejected instead.
+    // LogError never returns (it throws, or calls the [[noreturn]] FailCompilation), so the two
+    // `return nullptr` below are unreachable and no caller can observe a null result. They exist
+    // only to satisfy the compiler's return-path analysis - do not add null checks against them.
+    llvm::Value* LowerClosureFatToThinFnPtr(llvm::Value* val, llvm::Type* targetTy,
+        const std::string& paramName, const std::vector<std::string>& captureNames)
+    {
+        auto* envField = builder->CreateExtractValue(val, {1u}, "closure_env");
+        if (llvm::isa<llvm::ConstantPointerNull>(envField))
+        {
+            auto* codeField = builder->CreateExtractValue(val, {0u}, "closure_code");
+            return builder->CreateBitCast(codeField, targetTy, "noncap_lambda_cfn");
+        }
+        if (!captureNames.empty())
+        {
+            // A capturing lambda literal - name what it captures so the user can see
+            // exactly which variables to drop (or replace with a named function).
+            // Names are already de-duplicated; show at most 5, then summarize the rest.
+            const size_t count = captureNames.size();
+            const size_t shown = count < 5 ? count : 5;
+            std::string list;
+            for (size_t k = 0; k < shown; k++)
+            {
+                if (k != 0) list += ", ";
+                list += captureNames[k];
+            }
+            std::string more = count > shown
+                ? std::format(", ... (and {} more)", count - shown) : "";
+            LogError(std::format(
+                "cannot pass to C function-pointer parameter '{}': this lambda captured {} {} [{}{}]. "
+                "A C callback is a bare code pointer and cannot carry captured state - "
+                "pass a non-capturing lambda or a named function.",
+                paramName, count, (count == 1 ? "variable" : "variables"), list, more));
+            return nullptr;   // unreachable: LogError above does not return
+        }
+        // A stored function<> value - its captures are not known at the call site.
+        LogError(std::format(
+            "cannot pass to C function-pointer parameter '{}': this 'function<>' value may store captured state. "
+            "A C callback is a bare code pointer - pass a non-capturing lambda or a named function.",
+            paramName));
+        return nullptr;   // unreachable: LogError above does not return
+    }
+
     // Lower a by-value argument to match a declared (non-variadic) by-value parameter:
     // implicit char*/literal -> string coercion, scalar/struct upconvert, and the
     // non-owning-string -> move-param heap-copy. Shared by the normal call path
     // (CreateOverloadedFunctionCall) and virtual dispatch (CallInterfaceMethod) so the
     // two argument-lowering paths cannot drift. Returns the lowered call-arg value.
+    // The function-pointer guards below are reachable ONLY from virtual dispatch:
+    // CreateOverloadedFunctionCall handles an IsFunctionPointer parameter in an earlier branch,
+    // and the one call it makes to this function is guarded by !inVariadicRange, so no direct
+    // call can arrive here with such a parameter.
     llvm::Value* LowerByValueArg(llvm::Value* value, const TypeAndValue& param, const NamedVariable& arg)
     {
         // Encoded thin closure param (list<function<...>>::add's `T value`, gap a): the element is a
@@ -12397,6 +12488,31 @@ public:
             auto* asI8    = builder->CreateBitCast(value, i8PtrTy, "thinfn_i8");
             llvm::Value* wrapped = llvm::UndefValue::get(wrapTy);
             return builder->CreateInsertValue(wrapped, asI8, { 0u });
+        }
+        // Function-pointer parameter fed the other flavour's representation, both directions.
+        if (param.IsFunctionPointer && value)
+        {
+            // Thin `function<>` slot fed a closure fat struct (a lambda literal or a Lambda<> value).
+            if (param.IsThinFnPtr() && value->getType()->isStructTy())
+            {
+                return LowerClosureFatToThinFnPtr(value, GetType(param),
+                    param.VariableName, arg.LambdaCaptureNames);
+            }
+            // Fat `Lambda<>` slot. Under opaque pointers a data pointer is indistinguishable from
+            // code, so reject only what is PROVABLY data and widen everything else.
+            if (!param.IsThinFnPtr() && !value->getType()->isStructTy()
+                && value->getType()->isPointerTy())
+            {
+                if (ArgumentIsProvablyDataPointer(value, arg))
+                {
+                    LogError(std::format(
+                        "cannot pass {} to closure parameter '{}': only a named function, a "
+                        "'function<>' value or a lambda converts to a closure - a data pointer "
+                        "would be called as code.",
+                        DescribeNonFunctionArgument(arg), param.VariableName));
+                }
+                return WidenBareOrThinToClosureFat(value);
+            }
         }
         if (param.TypeName == "string" && !param.Pointer
             && value && value->getType() == builder->getInt8Ty()->getPointerTo())
@@ -17005,10 +17121,7 @@ public:
                                     arg.CallerName, candParamItr->VariableName));
                             }
                         }
-                        if (auto* fn = llvm::dyn_cast<llvm::Function>(val))
-                            val = WrapBareValueAsFatStruct(fn);
-                        else if (val && val->getType()->isPointerTy())
-                            val = WidenThinToFat(val);   // thin function<T> -> fat Lambda<T> {code, null}
+                        val = WidenBareOrThinToClosureFat(val);
                     }
                 }
                 else
@@ -17024,51 +17137,12 @@ public:
                     if (val && val->getType()->isStructTy())
                     {
                         // The argument is a CFlat closure fat struct {code, env} - a lambda or a
-                        // `function<>` variable. A C function pointer is a bare code address with no
-                        // env slot. The closure ABI is env-last, so the invoker of a *non-capturing*
-                        // lambda (env is the trailing param and is never read) is directly callable
-                        // as a C function pointer: the C caller simply never supplies the trailing
-                        // env arg. Detect non-capturing by a compile-time-null env field (set only
-                        // when the lambda captured nothing - see ParseLambdaExpression) and pass the
-                        // bare invoker (field 0). A capturing lambda or a `function<>` variable
-                        // cannot be statically proven non-capturing, so it loses captured state
-                        // across the C ABI and is rejected instead of silently miscompiling.
-                        auto* envField = builder->CreateExtractValue(val, {1u}, "closure_env");
-                        if (llvm::isa<llvm::ConstantPointerNull>(envField))
-                        {
-                            auto* codeField = builder->CreateExtractValue(val, {0u}, "closure_code");
-                            val = builder->CreateBitCast(codeField, llvmParamTy, "noncap_lambda_cfn");
-                        }
-                        else if (!arg.LambdaCaptureNames.empty())
-                        {
-                            // A capturing lambda literal - name what it captures so the user can see
-                            // exactly which variables to drop (or replace with a named function).
-                            // Names are already de-duplicated; show at most 5, then summarize the rest.
-                            const auto& caps = arg.LambdaCaptureNames;
-                            const size_t count = caps.size();
-                            const size_t shown = count < 5 ? count : 5;
-                            std::string list;
-                            for (size_t k = 0; k < shown; k++)
-                            {
-                                if (k != 0) list += ", ";
-                                list += caps[k];
-                            }
-                            std::string more = count > shown
-                                ? std::format(", ... (and {} more)", count - shown) : "";
-                            LogError(std::format(
-                                "cannot pass to C function-pointer parameter '{}': this lambda captured {} {} [{}{}]. "
-                                "A C callback is a bare code pointer and cannot carry captured state - "
-                                "pass a non-capturing lambda or a named function.",
-                                candParamItr->VariableName, count, (count == 1 ? "variable" : "variables"), list, more));
-                        }
-                        else
-                        {
-                            // A stored function<> value - its captures are not known at the call site.
-                            LogError(std::format(
-                                "cannot pass to C function-pointer parameter '{}': this 'function<>' value may store captured state. "
-                                "A C callback is a bare code pointer - pass a non-capturing lambda or a named function.",
-                                candParamItr->VariableName));
-                        }
+                        // `function<>` variable. A C function pointer is a bare code address with
+                        // no env slot; the shared helper passes a provably non-capturing invoker
+                        // and rejects anything that would lose captured state across the C ABI.
+                        // A rejection does not return, so this never stores null.
+                        val = LowerClosureFatToThinFnPtr(val, llvmParamTy,
+                            candParamItr->VariableName, arg.LambdaCaptureNames);
                     }
                     else if (val && !val->getType()->isPointerTy())
                     {

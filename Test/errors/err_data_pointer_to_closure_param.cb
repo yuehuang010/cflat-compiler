@@ -1,0 +1,35 @@
+import "function.cb";
+
+// A fat `Lambda<>` parameter reached through a VIRTUAL slot widens a named function or a
+// `function<>` value into a {code, null} closure. Under opaque pointers every data pointer has
+// the same LLVM type as a code pointer, so the widen must gate on argument PROVENANCE: without
+// it a `void*` / `int*` / `char*` lands in the code slot and is then CALLED (SIGSEGV/SIGBUS at
+// runtime). These reject at compile time instead, naming the parameter.
+
+expect_error("cannot pass a non-function pointer value to closure parameter 'f'") {
+    interface IClosureArg { int lam(Lambda<int(int)> f); };
+    class ClosureArgImpl : IClosureArg { int lam(Lambda<int(int)> f) { return f(5); } };
+
+    int passVoidPointer()
+    {
+        ClosureArgImpl impl;
+        IClosureArg io = impl;
+        int q = 1;
+        void* vp = &q;
+        return io.lam(vp);
+    }
+}
+
+expect_error("only a named function, a 'function<>' value or a lambda converts to a closure") {
+    interface IClosureArg2 { int lam(Lambda<int(int)> f); };
+    class ClosureArgImpl2 : IClosureArg2 { int lam(Lambda<int(int)> f) { return f(5); } };
+
+    int passIntPointer()
+    {
+        ClosureArgImpl2 impl;
+        IClosureArg2 io = impl;
+        int q = 1;
+        int* ip = &q;
+        return io.lam(ip);
+    }
+}

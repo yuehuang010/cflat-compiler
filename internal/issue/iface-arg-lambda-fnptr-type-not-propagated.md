@@ -39,8 +39,10 @@ The interface arm (`MainListener.h` ~:19945) has no counterpart, so a lambda arg
    different closure signatures would need `FuncPtrParams` to be ranked apart. Not pursued:
    `ComputeOverloadFunction` ranks on `TypeName`, and both slots present an encoded closure
    type name that the argument (`__closure_fat_ptr`) matches equally well either way, so
-   propagating the type does not obviously break the tie. Blocked in practice by
-   `iface-thin-function-param-no-lowering.md` for the thin `function<>` spelling.
+   propagating the type does not obviously break the tie. The thin `function<>` spelling used
+   to be blocked outright on this path; that lowering gap is now fixed (the interface argument
+   loop copies `LambdaCaptureNames`, and `LowerByValueArg` lowers the fat struct to a bare
+   invoker), so a tie-breaking shape could now be built if one is ever found.
 
 ## Fix direction
 

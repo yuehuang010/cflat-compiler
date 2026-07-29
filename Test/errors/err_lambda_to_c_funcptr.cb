@@ -20,6 +20,35 @@ expect_error("this lambda captured 1 variable [bias]") {
     }
 }
 
+// The same rule holds through a virtual (interface) slot, positionally and by name: the thin
+// `function<>` parameter is still a bare code pointer, so a capturing lambda is rejected there
+// with the same diagnostic rather than reaching the LLVM verifier.
+expect_error("this lambda captured 1 variable [factor]") {
+    interface IFnErr { void run(function<int(int)> fn); };
+    class FnErrImpl : IFnErr { void run(function<int(int)> fn) { printf("%d\n", fn(5)); } };
+
+    void callIfacePositional()
+    {
+        FnErrImpl impl;
+        IFnErr io = impl;
+        int factor = 4;
+        io.run((int x) => { return x * factor; });
+    }
+}
+
+expect_error("this lambda captured 1 variable [scale]") {
+    interface IFnErrNamed { void run(function<int(int)> fn); };
+    class FnErrNamedImpl : IFnErrNamed { void run(function<int(int)> fn) { printf("%d\n", fn(5)); } };
+
+    void callIfaceNamed()
+    {
+        FnErrNamedImpl impl;
+        IFnErrNamed io = impl;
+        int scale = 4;
+        io.run(fn: (int x) => { return x * scale; });
+    }
+}
+
 // More than 5 captures: the diagnostic lists the first 5 and summarizes the remainder.
 expect_error("this lambda captured 7 variables [c0, c1, c2, c3, c4, ... (and 2 more)]") {
     extern void qsort(void* base, u64 num, u64 size, function<int(void*, void*)> cmp);

@@ -67,6 +67,32 @@ Last updated 2026-07-29.
     Twelve modifier spellings and fourteen return-type spellings were probed; the forward
     direction (every real return type yields "member") had no counterexample.
 
+- **A function-pointer parameter on an interface method was never lowered, in EITHER
+  direction** - fixed, closing `iface-thin-function-param-no-lowering`. The direct call path
+  converts a closure fat struct to a bare invoker for a thin `function<>` slot, and widens a
+  named function / thin value into a fat struct for a `Lambda<>` slot; `CallInterfaceMethod`
+  did neither, so both spellings died in the verifier with no source location and the
+  fat-to-thin miss also lost its capture-naming diagnostic. Both conversions are now the
+  shared helpers `LowerClosureFatToThinFnPtr` and `WidenBareOrThinToClosureFat`, reached on
+  the virtual path through `LowerByValueArg` under guards only virtual dispatch can satisfy;
+  the interface argument loop also copies `LambdaCaptureNames`. Direct-path IR proven
+  byte-identical across twelve modules.
+  - The issue was originally filed and first fixed for the fat-to-thin half ONLY, because the
+    regression test used lambda literals - the one shape that half handles. A named function
+    or a stored `function<>` value into a `Lambda<>` slot still aborted. If you add a closure
+    test here, cover all four source shapes (literal, named function, thin variable, fat
+    variable) against BOTH slot flavours - that is what the 19 assertions in
+    `testInterfaceFunctionPointerParam` do.
+  - The widen must not key off `isPointerTy()`: under opaque pointers every data pointer looks
+    like a code pointer, and the first cut of the fix would have put a `void*` in a closure's
+    code slot and called it. The guard REJECTS ONLY WHAT IT CAN PROVE IS DATA and widens
+    everything else. That polarity is load-bearing: the intermediate allowlist version
+    (accept only a named function, an `IsFunctionPointer` value or null) false-rejected a
+    legal `io.lam(k > 0 ? a : b)`, because a `?:` join carries none of the three. Read
+    [[closure-param-accepts-data-pointer]] before touching this - it records why an allowlist
+    cannot work here, that the direct path still has the hole, and that the durable fix is
+    frontend-recorded provenance rather than interrogating the `llvm::Value`.
+
 - **`as` boxing skipped every ownership guard the plain spelling applies** - fixed, closing
   BOTH `as-boxing-skips-ownership-transfer` (all four manifestations) and
   `as-boxing-skips-pointer-shape-rejection`. `GenerateSafeCast` carried the fewest of the six
@@ -121,8 +147,9 @@ Last updated 2026-07-29.
   the fields the interface arm failed to copy: a FALSE REJECTION of legal `alignas` code on
   a `move` parameter, and a SILENT MISCOMPILE where `u8 200` through an interface widened to
   `-56`. Both fixed. Residue is [[named-arg-replay-reports-losing-candidate]],
-  [[iface-slot-replay-blames-wrong-slot]], [[iface-thin-function-param-no-lowering]], and
-  [[iface-arg-lambda-fnptr-type-not-propagated]].
+  [[iface-slot-replay-blames-wrong-slot]], and
+  [[iface-arg-lambda-fnptr-type-not-propagated]]. (The thin-`function<>` parameter entry
+  that was also listed here is closed - see the 2026-07-29 session below.)
 
 ## Open - crashes and silent miscompiles
 
@@ -133,8 +160,11 @@ Last updated 2026-07-29.
 | [[interface-boxing-guards-are-binding-dependent]] | Double free (exit 134). Parens or `?:` erase the binding the guards key off. |
 | [[return-ternary-join-concrete-pointers-not-boxed]] | Verifier abort, no source diagnostic. PLAIN path; `as` is now better. |
 | [[generic-interface-namespace-scope-limit]] | Silent miscompile. DELIBERATE scope limit of `c9acb6c`, recorded so it is not lost. |
-| [[iface-thin-function-param-no-lowering]] | Module verification failure, no diagnostic. Any `function<>` interface parameter. |
 | [[interface-return-dangle-defeated-by-intermediate-local]] | Dangling fat pointer, no diagnostic. Both spellings. QUEUE HEAD. |
+| [[iface-call-does-no-argument-type-matching]] | Silent miscompile then SIGBUS. An `int` reaches a closure slot; the direct path rejects it. |
+| [[function-array-body-silently-truncated]] | Silent miscompile, exit 133. NOT interface-related; filed here because it has no other queue. |
+| [[nondeterministic-ir-switch-case-order]] | No miscompile - a METHODOLOGY hazard. NOT interface-related; listed here for the same reason as the row above: it is the only index. Read it before using "0 IR diffs" as proof. |
+| [[closure-param-accepts-data-pointer]] | SIGSEGV, no diagnostic. DIRECT-path residue; the virtual path is now guarded. |
 
 ## Open - false rejections and accept-set problems
 

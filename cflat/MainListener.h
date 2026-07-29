@@ -20427,6 +20427,22 @@ public:
                                     argVar.IsBonded = argNV.IsBonded;
                                     argVar.BondByAddress = argNV.BondByAddress;
                                     argVar.BondedSources = argNV.BondedSources;
+                                    // Propagate lambda capture names so a capturing lambda passed to a
+                                    // thin `function<>` parameter names its captures in the rejection
+                                    // diagnostic, exactly as the direct call path does.
+                                    // Argument PROVENANCE for a closure parameter: without it the
+                                    // widen guard in LowerByValueArg cannot tell a `function<>`
+                                    // value from an arbitrary data pointer. TypeName is left alone
+                                    // so overload scoring is unaffected.
+                                    argVar.TypeAndValue.IsFunctionPointer = argNV.TypeAndValue.IsFunctionPointer;
+                                    // Reading the side channel RETIRES it, like the two other
+                                    // consumers, so a stale list cannot reach the next argument.
+                                    argVar.LambdaCaptureNames = argNV.LambdaCaptureNames;
+                                    if (argVar.LambdaCaptureNames.empty() && lastLambdaType.IsFunctionPointer)
+                                    {
+                                        argVar.LambdaCaptureNames = Compiler(ctx)->lastCallLambdaCaptureNames;
+                                        Compiler(ctx)->lastCallLambdaCaptureNames.clear();
+                                    }
 
                                     // Preserve unsigned-integer TypeName so Upconvert (LowerByValueArg)
                                     // chooses ZExt over SExt - without it a u8 200 arrives as -56.
