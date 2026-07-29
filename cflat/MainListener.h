@@ -12141,6 +12141,171 @@ public:
         return compiler->dataStructures.count(name) ? name : "";
     }
 
+    /*
+     * Source categories for an 'is' / 'as' operand. The old code inferred "this must be an
+     * interface fat pointer" from the ABSENCE of a concrete struct name, so every shape the two
+     * name helpers did not recognise (a pointer '?:' join, a fixed-array slot) silently took the
+     * fat-pointer path and read unrelated storage as {vtable,data}. Classification is positive
+     * now: a shape that matches no category is diagnosed instead of falling through.
+     */
+    enum class CastSourceKind
+    {
+        ConcretePointer,     // T* whose elemType names a registered class
+        ConcreteValue,       // a loaded T aggregate of a registered class
+        TernaryPointerJoin,  // '?:' phi of concrete pointers - box/answer per arm
+        PointerShaped,       // T[N] and friends: no single instance to box
+        InterfaceValue,      // a real fat pointer (or a pointer to one)
+        Unknown
+    };
+
+    /*
+     * Fill `shape` for a source that is pointer-SHAPED rather than one instance: a fixed `T[N]`,
+     * a nested `T[N][M]`, or a `T**`. The fields mirror what DescribePointerShapedInterfaceSource
+     * reads, so the rejection message comes out byte-identical to the plain-assignment spelling -
+     * including reporting only the OUTER dimension of a nested array. A fixed array arrives in
+     * three guises: the loaded aggregate, the decayed `getelementptr [N x %T]`, or (for a global)
+     * the GlobalVariable itself. Returns false when the source is not one of these shapes.
+     */
+    bool ClassifyPointerShapedSource(llvm::Value* value, llvm::Type* elemType, LLVMBackend* compiler,
+                                     LLVMBackend::TypeAndValue& shape)
+    {
+        llvm::Type* valueType = value->getType();
+        llvm::ArrayType* arrayType = llvm::dyn_cast<llvm::ArrayType>(valueType);
+        if (arrayType == nullptr && valueType->isPointerTy())
+        {
+            if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
+                arrayType = llvm::dyn_cast<llvm::ArrayType>(gep->getSourceElementType());
+            else if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(value))
+                arrayType = llvm::dyn_cast<llvm::ArrayType>(global->getValueType());
+        }
+        if (arrayType != nullptr)
+        {
+            // Unwrap inner dimensions to reach the class; the reported size stays the outer one.
+            llvm::Type* inner = arrayType->getElementType();
+            while (auto* nested = llvm::dyn_cast<llvm::ArrayType>(inner)) inner = nested->getElementType();
+            std::string elem = ConcreteStructNameFromElemType(inner, compiler);
+            // An array OF POINTERS names no class this way; fall through to the declared type.
+            if (!elem.empty())
+            {
+                shape.TypeName = elem;
+                shape.ConstArraySize = arrayType->getNumElements();
+                return true;
+            }
+        }
+
+        // Shapes no llvm type can name: a `T**`, and a global whose array ELEMENT is itself a
+        // pointer. Both come from the binding's declared type instead.
+        const llvm::Value* storage = nullptr;
+        if (llvm::isa<llvm::GlobalVariable>(value)) storage = value;
+        else if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+        {
+            // Gated on a POINTER elemType, which a plain `T*` and an array VIEW are not - both
+            // were already classified as concrete pointers above.
+            if (elemType != nullptr && elemType->isPointerTy()) storage = load->getPointerOperand();
+        }
+        if (storage != nullptr)
+        {
+            const auto* declared = compiler->FindDeclaredTypeAndValueForStorage(storage);
+            // Requiring a REGISTERED class keeps primitives out: the plain spelling still accepts
+            // `IShape s = someIntArray;`, so rejecting it here would diverge the other way.
+            if (declared != nullptr && compiler->dataStructures.count(declared->TypeName)
+                && !compiler->DescribePointerShapedInterfaceSource(*declared).empty())
+            {
+                shape = *declared;  // copy out now; the pointer aliases live map storage
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /*
+     * Classify an 'is'/'as' source. `structName` is set for the two concrete kinds; `shape` is
+     * set for PointerShaped and is the spelling used in the shared rejection message.
+     *
+     * Unknown is REACHABLE and is a hard error, not a dead bucket. Known spellings that land
+     * there: the `select` a chained `(x as C) as I` lowers to, the join a `??` produces, and any
+     * other bare `ptr` with no elemType. All of them miscompiled into a bogus fat pointer before
+     * this classification existed, so the error is the improvement - but do not assume the bucket
+     * is empty.
+     */
+    CastSourceKind ClassifyCastSource(llvm::Value* value, llvm::Type* elemType, LLVMBackend* compiler,
+                                      std::string& structName, LLVMBackend::TypeAndValue& shape)
+    {
+        structName.clear();
+        shape = LLVMBackend::TypeAndValue{};
+        if (value == nullptr) return CastSourceKind::Unknown;
+        llvm::Type* valueType = value->getType();
+        auto* fatTy = compiler->GetFatPtrType();
+
+        // A genuine interface value: the fat aggregate itself, or a pointer to one.
+        if (valueType == fatTy) return CastSourceKind::InterfaceValue;
+        if (valueType->isPointerTy() && elemType == fatTy) return CastSourceKind::InterfaceValue;
+
+        structName = ConcreteStructNameFromElemType(elemType, compiler);
+        if (!structName.empty()) return CastSourceKind::ConcretePointer;
+        structName = ConcreteStructNameFromValue(value, compiler);
+        if (!structName.empty()) return CastSourceKind::ConcreteValue;
+
+        // An `arr[i]` element access is NOT pointer-shaped: it carries a class elemType and was
+        // already classified as a concrete pointer above.
+        if (ClassifyPointerShapedSource(value, elemType, compiler, shape))
+            return CastSourceKind::PointerShaped;
+
+        // A '?:' join of pointers carries no elemType; each arm has its own concrete class.
+        if (valueType->isPointerTy())
+            if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+                if (phi->getNumIncomingValues() > 0) return CastSourceKind::TernaryPointerJoin;
+
+        return CastSourceKind::Unknown;
+    }
+
+    // Concrete class of every arm of a pointer '?:' join. Returns false (with `failure` set) when
+    // an arm's class cannot be resolved. A null arm yields an empty name and is never an instance.
+    bool ResolveTernaryArmClasses(llvm::Value* value, LLVMBackend* compiler,
+                                  std::vector<std::string>& armTypes, std::string& failure)
+    {
+        auto* phi = llvm::cast<llvm::PHINode>(value);
+        armTypes.assign(phi->getNumIncomingValues(), std::string());
+        for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+        {
+            llvm::Value* incoming = phi->getIncomingValue(i);
+            if (llvm::isa<llvm::ConstantPointerNull>(incoming)) continue;
+            armTypes[i] = compiler->ResolvePointerElementTypeName(incoming);
+            if (armTypes[i].empty())
+            {
+                failure = "the arm's concrete class cannot be determined; bind the arm to a "
+                          "local variable of the class type first";
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Join per-arm i1 answers back onto a pointer '?:'. Uniform answers fold to a constant;
+    // a mixed join becomes an i1 phi placed alongside the pointer phi it mirrors.
+    llvm::Value* JoinTernaryArmPredicates(llvm::Value* value, const std::vector<bool>& answers,
+                                          LLVMBackend* compiler)
+    {
+        // No arms means nothing can match; test this first, or the all-quantifiers below are
+        // both vacuously true and an empty join would answer TRUE.
+        if (answers.empty()) return compiler->builder->getInt1(false);
+        bool allTrue = true, allFalse = true;
+        for (bool a : answers) { if (a) allFalse = false; else allTrue = false; }
+        if (allTrue) return compiler->builder->getInt1(true);
+        if (allFalse) return compiler->builder->getInt1(false);
+
+        auto* phi = llvm::cast<llvm::PHINode>(value);
+        auto* savedBlock = compiler->builder->GetInsertBlock();
+        auto savedPoint = compiler->builder->GetInsertPoint();
+        compiler->builder->SetInsertPoint(phi);
+        auto* answerPhi = compiler->builder->CreatePHI(compiler->builder->getInt1Ty(),
+                                                       phi->getNumIncomingValues(), "ternary_is");
+        for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+            answerPhi->addIncoming(compiler->builder->getInt1(answers[i]), phi->getIncomingBlock(i));
+        compiler->builder->SetInsertPoint(savedBlock, savedPoint);
+        return answerPhi;
+    }
+
     // Boxing a class value into an interface needs the object's ADDRESS. A loaded value came
     // straight from its storage, so reuse that; anything else (a call result) is spilled.
     llvm::Value* AddressOfClassValueOperand(llvm::Value* value, LLVMBackend* compiler)
@@ -12157,13 +12322,64 @@ public:
     {
         auto* compiler = Compiler(ctx);
 
+        std::string srcStructName;
+        LLVMBackend::TypeAndValue srcShape;
+        CastSourceKind srcKind = ClassifyCastSource(interfaceValue, srcElemType, compiler,
+                                                    srcStructName, srcShape);
+
+        // Interface target: shared helper, shared wording. Guard on its bool exactly as the other
+        // call sites do, so control cannot reach the concrete-target message if it stopped throwing.
+        if (srcKind == CastSourceKind::PointerShaped)
+        {
+            if (compiler->interfaceTable.count(targetTypeName)
+                && RejectPointerShapedInterfaceUpcast(ctx, srcShape, targetTypeName))
+                return nullptr;
+            LogErrorContext(ctx, std::format(
+                "'is' needs an interface value or a single class instance, not '{}'",
+                compiler->DescribePointerShapedInterfaceSource(srcShape)));
+            return nullptr;
+        }
+
+        // A '?:' join has one concrete class per arm, so the answer is per arm too.
+        if (srcKind == CastSourceKind::TernaryPointerJoin)
+        {
+            std::vector<std::string> armTypes;
+            std::string failure;
+            if (!ResolveTernaryArmClasses(interfaceValue, compiler, armTypes, failure))
+            {
+                LogErrorContext(ctx, std::format("cannot test '?:' arm against '{}': {}",
+                                                 targetTypeName, failure));
+                return nullptr;
+            }
+            bool targetIsInterface = compiler->interfaceTable.count(targetTypeName) != 0;
+            if (!targetIsInterface && !compiler->dataStructures.count(targetTypeName))
+            {
+                LogErrorContext(ctx, std::format("'{}' is not a known struct or interface type for 'is' check", targetTypeName));
+                return nullptr;
+            }
+            std::vector<bool> answers(armTypes.size(), false);
+            for (size_t i = 0; i < armTypes.size(); i++)
+            {
+                if (armTypes[i].empty()) continue;
+                answers[i] = targetIsInterface
+                    ? compiler->StructImplementsInterface(armTypes[i], targetTypeName)
+                    : armTypes[i] == targetTypeName;
+            }
+            return JoinTernaryArmPredicates(interfaceValue, answers, compiler);
+        }
+
+        if (srcKind == CastSourceKind::Unknown)
+        {
+            LogErrorContext(ctx, std::format(
+                "'is' requires an interface value or a class instance on the left of '{}'; this "
+                "expression is neither", targetTypeName));
+            return nullptr;
+        }
+
         // Concrete source, pointer (e.g. `w is IW` where w is W*) or stack value (`s is IW`),
         // not a boxed interface value: no vtable/typedesc header to load, so the answer is
         // known at compile time.
-        std::string srcStructName = ConcreteStructNameFromElemType(srcElemType, compiler);
-        if (srcStructName.empty())
-            srcStructName = ConcreteStructNameFromValue(interfaceValue, compiler);
-        if (!srcStructName.empty())
+        if (srcKind == CastSourceKind::ConcretePointer || srcKind == CastSourceKind::ConcreteValue)
         {
             if (compiler->interfaceTable.count(targetTypeName))
                 return compiler->builder->getInt1(compiler->StructImplementsInterface(srcStructName, targetTypeName));
@@ -12219,18 +12435,58 @@ public:
         auto* compiler = Compiler(ctx);
         auto ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
 
+        std::string srcStructName;
+        LLVMBackend::TypeAndValue srcShape;
+        CastSourceKind srcKind = ClassifyCastSource(interfaceValue, srcElemType, compiler,
+                                                    srcStructName, srcShape);
+        bool srcIsValue = srcKind == CastSourceKind::ConcreteValue;
+
+        // Not one object: same rejection, same wording, as the plain-assignment spelling. Guarded
+        // on the helper's bool like every other call site (see its comment for why).
+        if (srcKind == CastSourceKind::PointerShaped)
+        {
+            if (compiler->interfaceTable.count(targetTypeName)
+                && RejectPointerShapedInterfaceUpcast(ctx, srcShape, targetTypeName))
+                return nullptr;
+            LogErrorContext(ctx, std::format(
+                "cannot cast '{}' to '{}' - index or dereference it first to get a single instance",
+                compiler->DescribePointerShapedInterfaceSource(srcShape), targetTypeName));
+            return nullptr;
+        }
+
+        // A '?:' join carries no single concrete class: box each arm in its own block, exactly
+        // as the plain-assignment path does.
+        if (srcKind == CastSourceKind::TernaryPointerJoin)
+        {
+            if (compiler->interfaceTable.count(targetTypeName))
+            {
+                std::string armFailure;
+                if (auto* fat = UpcastTernaryPhiToInterface(interfaceValue, targetTypeName, &armFailure))
+                    return fat;
+                LogErrorContext(ctx, armFailure.empty()
+                    ? std::format("cannot convert '?:' result to interface '{}'", targetTypeName)
+                    : std::format("cannot convert '?:' arm to interface '{}': {}", targetTypeName, armFailure));
+                return nullptr;
+            }
+            LogErrorContext(ctx, std::format(
+                "cannot cast a '?:' result to '{}'; 'as' performs a runtime-checked downcast only "
+                "from an interface value - bind the '?:' to a local first", targetTypeName));
+            return nullptr;
+        }
+
+        if (srcKind == CastSourceKind::Unknown)
+        {
+            LogErrorContext(ctx, std::format(
+                "'as' requires an interface value or a class instance on the left of '{}'; this "
+                "expression is neither", targetTypeName));
+            return nullptr;
+        }
+
         // CONCRETE source, pointer (e.g. `w as X` where w is W*) or stack value (`s as X`).
         // A concrete object carries no vtable/typedesc header, so every target is resolved
         // statically here; this branch always returns, keeping the runtime-checked downcast
         // below interface-source-only.
-        std::string srcStructName = ConcreteStructNameFromElemType(srcElemType, compiler);
-        bool srcIsValue = false;
-        if (srcStructName.empty())
-        {
-            srcStructName = ConcreteStructNameFromValue(interfaceValue, compiler);
-            srcIsValue = !srcStructName.empty();
-        }
-        if (!srcStructName.empty())
+        if (srcKind == CastSourceKind::ConcretePointer || srcKind == CastSourceKind::ConcreteValue)
         {
             // Interface target: box it, exactly like the plain-assignment path.
             if (compiler->interfaceTable.count(targetTypeName))
@@ -12263,9 +12519,8 @@ public:
             return nullptr;
         }
 
-        // From here on the source is an INTERFACE-typed value (a fat pointer): it is the only
-        // shape that carries the vtable + typedesc header the checks below load from.
-        // Interface target: interface-to-interface runtime-checked cast.
+        // Only InterfaceValue reaches here, so the source carries the vtable + typedesc header
+        // the checks below load from. Interface target: runtime-checked interface-to-interface.
         if (compiler->interfaceTable.count(targetTypeName))
         {
             auto fatTy = compiler->GetFatPtrType();

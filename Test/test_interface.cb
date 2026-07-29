@@ -1520,6 +1520,44 @@ bool testInterfaceTernaryUpcast()
 }
 
 /*
+ * The `as` / `is` spelling of the same '?:' join. GenerateSafeCast/GenerateIsCheck used to
+ * treat any operand they could not name as an interface fat pointer, so a pointer '?:' - a
+ * `select`/phi of two raw ptrs - was read as {vtable,data} and the program segfaulted with no
+ * diagnostic. Both spellings now route through the per-arm boxing the plain assignment uses.
+ */
+bool testInterfaceTernaryAsCast()
+{
+    bool result = true;
+    gWidgetDtorCount = 0;
+
+    // Borrowed arms of the SAME class: the join boxes per arm and the taken arm dispatches.
+    Pressy* p = new Pressy();
+    Pressy* q = new Pressy();
+    IPress same = (ternaryPick(true) ? p : q) as IPress;
+    result &= Test("iface_ternary_as_same_kind", same.kind(), 1);
+    result &= Test("iface_ternary_as_is_true", (ternaryPick(true) ? p : q) is IPress, true);
+
+    // Arms of DIFFERENT concrete classes: each arm carries its own vtable through the cast.
+    Toggly* t = new Toggly();
+    IPress mixedTrue  = (ternaryPick(true)  ? p : t) as IPress;
+    IPress mixedFalse = (ternaryPick(false) ? p : t) as IPress;
+    result &= Test("iface_ternary_as_mixed_true_kind",  mixedTrue.kind(),  1);
+    result &= Test("iface_ternary_as_mixed_false_kind", mixedFalse.kind(), 2);
+
+    // A null arm contributes a null fat pointer, exactly as on the assignment path.
+    IPress nulled = (ternaryPick(false) ? p : nullptr) as IPress;
+    result &= Test("iface_ternary_as_null_arm", nulled == nullptr, true);
+
+    // 'is' against a CONCRETE class is answered per arm, so a mixed join is not a constant.
+    result &= Test("iface_ternary_is_concrete_true",  (ternaryPick(true)  ? p : t) is Pressy, true);
+    result &= Test("iface_ternary_is_concrete_false", (ternaryPick(false) ? p : t) is Pressy, false);
+
+    delete p; delete q; delete t;
+    result &= Test("iface_ternary_as_dtor_count", gWidgetDtorCount, 3);
+    return result;
+}
+
+/*
  * Brace-init binds an interface-typed struct field or array element through its own store path,
  * separate from `=`. Each must re-box the source to the DESTINATION's interface; otherwise the slot
  * keeps the source's vtable and its slot 0 answers the destination interface's method 0.
@@ -2651,6 +2689,7 @@ extern int main()
     total++; passed += testInterfaceBraceInitField()     ? 1 : 0;
     total++; passed += testInterfaceIsNullUpcast()       ? 1 : 0;
     total++; passed += testInterfaceTernaryUpcast()      ? 1 : 0;
+    total++; passed += testInterfaceTernaryAsCast()      ? 1 : 0;
     total++; passed += testGenericInterfaceField()       ? 1 : 0;
     total++; passed += testGenericInterfaceExplicitPtrArg() ? 1 : 0;
     total++; passed += testLocalListInterfaceTakeDelete()     ? 1 : 0;

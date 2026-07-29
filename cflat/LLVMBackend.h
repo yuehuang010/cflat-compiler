@@ -2763,6 +2763,38 @@ private:
     }
 
     /*
+     * The DECLARED type of the binding whose storage slot is `storage` - a local, an argument, or
+     * a global - or nullptr. Storage-keyed counterpart to FindLiveNamedVariable, for callers that
+     * need the whole TypeAndValue rather than just a class name: FindDeclaredElementTypeNameForStorage
+     * deliberately answers "" for the pointer-shaped bindings (a `T**`, a view, a const-array slot),
+     * which is exactly what a shape DIAGNOSTIC needs to see. Read-only: never box off this, these
+     * are the shapes that must NOT be boxed.
+     *
+     * A global keeps its declared type in globalVariableTypes, parallel to globalNamedVariable and
+     * written with it, so the GlobalVariable is matched by identity and the type fetched by name.
+     * Callers must COPY the result before anything can pop a scope or touch either map - the
+     * pointer aliases live map storage and does not survive a rehash.
+     */
+    const TypeAndValue* FindDeclaredTypeAndValueForStorage(const llvm::Value* storage) const
+    {
+        if (storage == nullptr) return nullptr;
+        for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            for (const auto& [name, nv] : frame.namedVariable)
+                if (nv.Storage == storage) return &nv.TypeAndValue;
+            for (const auto& [name, nv] : frame.functionArgument)
+                if (nv.Storage == storage) return &nv.TypeAndValue;
+        }
+        for (const auto& [name, gVar] : globalNamedVariable)
+        {
+            if (gVar != storage) continue;
+            auto typeIt = globalVariableTypes.find(name);
+            return typeIt != globalVariableTypes.end() ? &typeIt->second : nullptr;
+        }
+        return nullptr;
+    }
+
+    /*
      * Resolve the concrete class a pointer VALUE points at. The `new`-site ledger answers an
      * owning temp; a BORROWED value is a plain load of a typed local, which is in no ledger, so
      * fall back to the declared type of the binding the load came from.

@@ -66,4 +66,5 @@ without any def-use walking at the return.
 - [[as-boxing-skips-ownership-transfer]] - the structural argument, and the reason the
   frame-lifetime check is currently a fourth copy of boxing bookkeeping.
 - [[as-boxing-skips-pointer-shape-rejection]]
-- [[as-cast-array-shaped-source-no-diagnostic]]
+- The array-shaped-operand gap this used to link is FIXED; see the closed section of
+  [[interface-issue-queue]].

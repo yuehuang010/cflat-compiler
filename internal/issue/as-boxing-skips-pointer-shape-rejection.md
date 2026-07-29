@@ -54,4 +54,8 @@ paths into one helper" recommendation covers this issue as well.
 ## Related
 
 - [[as-boxing-skips-ownership-transfer]] - the structural fix direction lives there.
-- [[as-cast-array-shaped-source-no-diagnostic]]
+- The array-shaped-operand gap this used to link is FIXED; see the closed section of
+  [[interface-issue-queue]]. NOTE that fix did NOT close this issue: `GenerateSafeCast` now
+  classifies its source positively, but an array VIEW parameter still arrives as a raw `ptr`
+  with a class elemType, so it is classified as a concrete pointer and still boxes element 0.
+  Confirmed still reproducing after that change.

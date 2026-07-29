@@ -1,0 +1,88 @@
+// A pointer-SHAPED source is not one object: it has no single data slot to hang an interface
+// fat pointer's data field off. `arr as IFace` used to fall through to the INTERFACE-source
+// path, which read that storage as {vtable,data} and produced an exe that segfaulted with no
+// diagnostic at all.
+//
+// SCOPE OF THE GUARANTEE, precisely. For the shapes tested below - a local array, a global
+// array, a nested array, a global array OF POINTERS, a local `T**` and a global `T**` - the
+// interface-target message is byte-identical to the plain `IShape s = src;` spelling, because
+// both come from RejectPointerShapedInterfaceUpcast. That is NOT a blanket guarantee for every
+// pointer-shaped source: a pointer-shaped STRUCT FIELD (`h.pp` where `H.pp` is `Circle**`)
+// loads through a getelementptr rather than a named binding, so the classifier has no declared
+// type to describe and it falls to the generic "requires an interface value" message instead.
+// That shape is rejected, just not with the shared wording. A LOCAL array of pointers
+// (`Circle*[3]` as a local) is the same exception for the same reason - it decays to a
+// getelementptr with no named binding - even though the GLOBAL spelling of it, tested below,
+// does get the shared wording. A primitive array (`int[3]`) is deliberately left alone: the
+// plain spelling still ACCEPTS it, so rejecting it here would diverge in the other direction.
+//
+// Each shape below reaches the classifier as a DIFFERENT llvm value - a decayed getelementptr,
+// a GlobalVariable, a nested array type, a loaded `ptr` - so they are separate cases rather
+// than one case spelled six ways.
+
+interface IShape
+{
+    int area();
+};
+
+class Circle : IShape
+{
+    int r = default;
+    int area() { return r * r; }
+};
+
+// A local fixed array: decays to `getelementptr [3 x %Circle]`.
+expect_error("cannot convert 'Circle[3]' to interface 'IShape' - only a single instance pointer 'Circle*' or a 'Circle' value can be boxed into an interface fat pointer; index or dereference it first") {
+    void localArray() { Circle[3] arr; IShape s = arr as IShape; }
+}
+
+// A GLOBAL fixed array arrives as the GlobalVariable itself, not as a getelementptr.
+Circle[3] gArr;
+expect_error("cannot convert 'Circle[3]' to interface 'IShape' - only a single instance pointer 'Circle*' or a 'Circle' value can be boxed into an interface fat pointer; index or dereference it first") {
+    void globalArray() { IShape s = gArr as IShape; }
+}
+
+// A NESTED array reports only its OUTER dimension, exactly as the plain spelling does.
+expect_error("cannot convert 'Circle[2]' to interface 'IShape' - only a single instance pointer 'Circle*' or a 'Circle' value can be boxed into an interface fat pointer; index or dereference it first") {
+    void nestedArray() { Circle[2][2] n; IShape s = n as IShape; }
+}
+
+// A `Circle**` loads to a bare `ptr` whose TypeName is the ELEMENT class, so boxing it would
+// attach Circle's vtable to a pointer slot rather than to a Circle.
+expect_error("cannot convert 'Circle**' to interface 'IShape' - only a single instance pointer 'Circle*' or a 'Circle' value can be boxed into an interface fat pointer; index or dereference it first") {
+    void ptrToPtr() { Circle* c = new Circle(); Circle** pp = &c; IShape s = pp as IShape; delete c; }
+}
+
+// A GLOBAL `Circle**` lives in globalNamedVariable, not in any stack frame, so it is found only
+// because the storage-keyed lookup searches globals too.
+Circle** gPtrPtr;
+expect_error("cannot convert 'Circle**' to interface 'IShape' - only a single instance pointer 'Circle*' or a 'Circle' value can be boxed into an interface fat pointer; index or dereference it first") {
+    void globalPtrToPtr() { IShape s = gPtrPtr as IShape; }
+}
+
+// A global array OF POINTERS names no class through its llvm type (`[3 x ptr]`), so the array
+// branch cannot answer it and it must fall through to the declared type.
+Circle*[3] gPtrArr;
+expect_error("cannot convert 'Circle[3]' to interface 'IShape' - only a single instance pointer 'Circle*' or a 'Circle' value can be boxed into an interface fat pointer; index or dereference it first") {
+    void globalPointerArray() { IShape s = gPtrArr as IShape; }
+}
+
+// The 'is' spelling shares the classifier, so it shares the message.
+expect_error("cannot convert 'Circle[3]' to interface 'IShape' - only a single instance pointer 'Circle*' or a 'Circle' value can be boxed into an interface fat pointer; index or dereference it first") {
+    void isSpelling() { Circle[3] arr; bool b = arr is IShape; }
+}
+
+// CONCRETE target: the shared helper only speaks about interfaces, so these two spellings are
+// the live consumers of the classifier's own messages. Without them nothing pins that branch.
+expect_error("cannot cast 'Circle[3]' to 'Circle' - index or dereference it first to get a single instance") {
+    void concreteTargetAs() { Circle[3] arr; Circle* c = arr as Circle; }
+}
+
+expect_error("'is' needs an interface value or a single class instance, not 'Circle[3]'") {
+    void concreteTargetIs() { Circle[3] arr; bool b = arr is Circle; }
+}
+
+extern int main()
+{
+    return 0;
+}

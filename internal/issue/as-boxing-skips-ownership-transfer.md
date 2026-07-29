@@ -173,6 +173,10 @@ adding a fifth copy is not.
 ## Related
 
 - [[as-boxing-skips-pointer-shape-rejection]] - the same gap, different guard.
-- [[as-cast-array-shaped-source-no-diagnostic]] - an operand shape none of the paths cover.
+- The array-shaped-operand gap this used to link is FIXED (see the closed section of
+  [[interface-issue-queue]]). Its residue is
+  [[as-cast-unbound-pointer-shape-generic-message]], which is diagnostic-quality only and is
+  itself evidence for the consolidation argued below: parity was missed for exactly the two
+  shapes whose provenance had to be recovered by walking IR.
 - [[interface-return-dangle-defeated-by-intermediate-local]] - the frame-lifetime check's own
   blind spot, and why provenance-at-the-boxing-site would close it by construction.

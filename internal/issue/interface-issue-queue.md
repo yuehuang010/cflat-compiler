@@ -11,11 +11,14 @@ Last updated 2026-07-28.
 
 ## Resume point
 
-- master is `8a23621`, linear, tree clean.
-- Last recorded full verification was at `bf46022`: **504 passed / 0 failed / 8 skipped**,
-  examples **35 / 0**, LSP **152 / 0**. Five commits have landed since, three of which add
-  error tests, so that count is stale as a number - rerun before treating it as a baseline.
-- Queue head is [[generic-interface-namespace-scope-limit]].
+- master is the `as`/`is` source-routing fix, linear, tree clean.
+- Full verification re-run on macOS at that commit: **512 passed / 0 failed / 8 skipped**,
+  examples **35 / 0**. (Baseline immediately before it was 510/0/8; the +2 are the new
+  ternary legs in `Test/test_interface.cb`.) LSP was NOT re-run - it is Windows-only.
+- Queue head is the Family A ownership consolidation, below. `?:` and array-shape routing
+  are done; the remaining four `as`-family entries all need the SAME prerequisite: the
+  source `NamedVariable` threaded into `ParseTypeCheckExpression`, which currently discards
+  it. Do that plumbing first as its own step, then the consolidated boxing helper.
 - **`fix/iface-ifconst` is SHELVED, not pending.** Branch is at `23418c2`, worktree present
   at `../cflat-fix-iface-ifconst` with its ~60-file repro corpus in `scratch/` - the most
   valuable artifact of that attempt. Read
@@ -28,6 +31,21 @@ Last updated 2026-07-28.
   reopen it.
 
 ## Closed in the 2026-07-28 session
+
+- **`as` / `is` fell through to the interface-source path on any unrecognised operand** -
+  fixed, closing BOTH `as-cast-pointer-ternary-operand-compiler-crash` and
+  `as-cast-array-shaped-source-no-diagnostic`. They were one defect:
+  `GenerateSafeCast` / `GenerateIsCheck` inferred "this is a fat pointer" from the ABSENCE
+  of a concrete struct name, so a pointer `?:` phi and a decayed `T[N]` both read unrelated
+  storage as {vtable,data}. Replaced with `ClassifyCastSource`, a positive routing decision;
+  `Unknown` is now diagnosed rather than miscompiled. The two shapes needed DIFFERENT
+  answers, which is the part worth remembering: the ternary had to be made to BOX (the plain
+  spelling already worked, so rejecting it would have regressed expressiveness), while the
+  array had to be REJECTED with the plain spelling's exact wording. Three review rounds; the
+  residue is the two new entries below. **The severity in the ternary issue file was wrong** -
+  it was recorded as a compiler crash with zero output, but the compiler never crashed:
+  `--run` JITs the miscompiled program in-process, so the program's SIGSEGV looked like the
+  compiler's. Verify crash claims with `-o` before believing them.
 
 - **`as` cast of a stack value to an interface crashed the compiler** - fixed. Root cause
   was `elemType` propagation: `ParseMultiplicativeExpression` populates
@@ -52,10 +70,9 @@ Last updated 2026-07-28.
 
 | Issue | Severity |
 |---|---|
-| [[as-cast-pointer-ternary-operand-compiler-crash]] | SIGSEGV, zero output, `--check` passes clean. Ordinary source. |
 | [[duplicate-constructor-signature-hangs-compiler]] | Hang/OOM (exit 137), no diagnostic. Namespaced classes newly route onto this path. |
 | [[generic-interface-registered-as-opaque-struct]] | LLVM verifier failure + false rejections. `IFace<T>` unusable in most positions. |
-| [[as-cast-array-shaped-source-no-diagnostic]] | Compiles clean, exe segfaults. Sibling of the pointer-`?:` crash. |
+| [[global-primitive-array-boxed-into-interface]] | Silent miscompile, escapes the verifier. PLAIN path, not `as`. |
 | [[as-boxing-skips-ownership-transfer]] | asan double-free / use-after-free. Four manifestations, one root cause. |
 | [[generic-interface-namespace-scope-limit]] | Silent miscompile. DELIBERATE scope limit of `c9acb6c`, recorded so it is not lost. |
 | [[iface-thin-function-param-no-lowering]] | Module verification failure, no diagnostic. Any `function<>` interface parameter. |
@@ -78,6 +95,7 @@ Last updated 2026-07-28.
 | [[iface-slot-replay-blames-wrong-slot]] | Message names a parameter that IS declared. Same root shape as the row above; fix together. |
 | [[interface-collision-message-prefix-still-basename]] | The `file(line,col):` prefix is still a bare basename. |
 | [[paren-as-cast-method-call-not-parsed]] | `(x as IFoo).m()` -> `unknown function '(xasIFoo)'`. Operand-shape independent. |
+| [[as-cast-unbound-pointer-shape-generic-message]] | Correctly rejected, generic wording. Struct field and LOCAL `T*[N]` only. |
 
 ## Open - latent / no repro found
 
@@ -110,13 +128,19 @@ candidate rather than the relevant one**. Two entries above are that shape
 Both files agree the durable fix is a single `ScoreCandidates(probe)` helper called twice,
 which also removes the desync hazard of two hand-maintained loop pairs.
 
-A second, smaller theme: `GenerateSafeCast` / `GenerateIsCheck` decide "concrete source"
-by pattern-matching the operand's LLVM type and fall through to the interface-source path
-on anything unrecognised. Two crash issues above are that fall-through
-([[as-cast-pointer-ternary-operand-compiler-crash]],
-[[as-cast-array-shaped-source-no-diagnostic]]). The fix direction both files agree on is a
-positive routing decision - classify the source explicitly and `LogError` on anything
-matching no category - which closes the whole family at once.
+A second, smaller theme, now CLOSED and worth keeping as precedent: `GenerateSafeCast` /
+`GenerateIsCheck` used to decide "concrete source" by pattern-matching the operand's LLVM
+type and fall through to the interface-source path on anything unrecognised. The fix was
+the positive routing decision both issue files predicted, and it did close the family at
+once. Two lessons transfer to the boxing consolidation above:
+
+- **Check the plain spelling before choosing reject-vs-support.** The two fall-through
+  shapes needed opposite answers, and only the plain-assignment control told us which.
+- **A guard is only as good as the shapes that can reach it.** Parity with the plain
+  spelling was achieved for six source shapes and missed for two
+  ([[as-cast-unbound-pointer-shape-generic-message]]) purely because a GEP-derived source
+  has no storage key to look up. Provenance recorded AT the boxing site would not have had
+  that failure mode - which is the argument for the consolidation, made concrete.
 
 ## Adjacent - found during interface reviews, not interface bugs
 
