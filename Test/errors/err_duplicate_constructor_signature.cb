@@ -1,0 +1,23 @@
+// Two constructors with the same parameter TYPES are one signature - parameter names
+// do not participate. Before this was diagnosed, the second body was emitted into the
+// already-finished first function and indexed a function scope that was never opened,
+// which crashed the compiler with no diagnostic at all.
+// File-scope bare form: the error is raised by the forward-ref scanner, before the
+// code-gen walk, so the expectation has to be armed at file scope.
+expect_error("duplicate constructor 'C(int)'");
+
+namespace ns
+{
+    class C
+    {
+        int x = 0;
+        C(int a) { x = a; }
+        C(int b) { x = b; }
+        int g() { return x; }
+    };
+};
+
+extern int main()
+{
+    return 0;
+}

@@ -42,6 +42,31 @@ Last updated 2026-07-29.
 
 ## Closed in the 2026-07-29 session
 
+- **Duplicate constructor signature crashed the compiler with no diagnostic** - fixed,
+  closing `duplicate-constructor-signature-hangs-compiler`. The issue file's guess (runaway
+  recursion or an unbounded loop) was WRONG. `CreateFunctionDefinition` early-returns an
+  already-bodied function BEFORE `createFunctionBlock`, which is the only thing that pushes a
+  function scope onto `stackNamedVariable`; `ParseFunctionDefinition` guards for exactly that
+  and returns, `ParseConstructorDefinition` did not, so `RegisterThisPointer` indexed
+  `stackNamedVariable.back()` on an empty deque. The "corrupted map, huge bogus size" in the
+  crash dump was that empty-container read, not stack smashing - which is why duplicate
+  METHODS and duplicate free functions never crashed. Fix is a mangled-name duplicate check in
+  the forward-ref scanner's constructor pre-declare loop plus the missing guard. Generic class
+  templates are not covered by the eager check (the scanner returns early for them); the guard
+  is what keeps them from crashing, and they silently drop the second body like methods do.
+  - The message's parameter renderer is cosmetically lossy on four shapes - `int*[]` and
+    `void*[]` drop `ElemPointer` and print `int[]` / `void[]`, `move B*` prints `B*`, and
+    `function<int(int)>` prints the internal `__c_fn_ptr`. Diagnostic text only.
+  - The noun is picked by "declares a typeSpecifier", NOT by `declarationSpecifiers() == nullptr`:
+    per `CFlat.g4:783` a real ctor may carry `inline`/`static`/`const`/`extern`/`stdcall`, so the
+    latter test silently drops the diagnostic on those. Verified - do not "simplify" it back.
+    That rule has four exceptions, all message-wording only: `move` IS a `typeSpecifier`
+    (`CFlat.g4:323`), and `unique`/`alias`/`bond` are not grammar keywords at all - they parse
+    as `genericIdentifier`, also a `typeSpecifier` - so a ctor carrying one of the four reads as
+    "member". The duplicate is still caught and the crash still fixed; only the noun is wrong.
+    Twelve modifier spellings and fourteen return-type spellings were probed; the forward
+    direction (every real return type yields "member") had no counterexample.
+
 - **`as` boxing skipped every ownership guard the plain spelling applies** - fixed, closing
   BOTH `as-boxing-skips-ownership-transfer` (all four manifestations) and
   `as-boxing-skips-pointer-shape-rejection`. `GenerateSafeCast` carried the fewest of the six
@@ -103,7 +128,6 @@ Last updated 2026-07-29.
 
 | Issue | Severity |
 |---|---|
-| [[duplicate-constructor-signature-hangs-compiler]] | Hang/OOM (exit 137), no diagnostic. Namespaced classes newly route onto this path. |
 | [[generic-interface-registered-as-opaque-struct]] | LLVM verifier failure + false rejections. `IFace<T>` unusable in most positions. |
 | [[global-primitive-array-boxed-into-interface]] | Silent miscompile, escapes the verifier. PLAIN path, not `as`. |
 | [[interface-boxing-guards-are-binding-dependent]] | Double free (exit 134). Parens or `?:` erase the binding the guards key off. |

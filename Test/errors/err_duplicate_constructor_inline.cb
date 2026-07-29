@@ -1,0 +1,19 @@
+// A constructor MAY carry 'inline' / 'static' / 'const' / 'extern' / 'stdcall': per
+// CFlat.g4:783 those are functionSpecifier / storageClassSpecifier / typeQualifier, never
+// typeSpecifier, so the function still declares no return type and is still a constructor.
+// The duplicate-signature check must therefore not key off "has declarationSpecifiers" -
+// this shape regressed to silently dropping the second body when it briefly did.
+// File-scope bare form: the error comes from the forward-ref scanner, before the code-gen walk.
+expect_error("duplicate constructor 'C(int)'");
+
+class C
+{
+    int x = 0;
+    inline C(int a) { x = a; }
+    inline C(int b) { x = b + 100; }
+};
+
+extern int main()
+{
+    return 0;
+}

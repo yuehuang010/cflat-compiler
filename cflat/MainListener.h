@@ -1088,6 +1088,39 @@ inline void ApplyOwningSinkInference(CFlatParser::FunctionDefinitionContext* fun
     }
 }
 
+// True when the function declares a RETURN TYPE, which is what separates an ordinary member
+// from a constructor. Not the same as having declarationSpecifiers: per CFlat.g4:783 a ctor
+// may carry 'inline'/'static'/'const'/'extern'/'stdcall' - those are functionSpecifier,
+// storageClassSpecifier and typeQualifier, never typeSpecifier.
+// KNOWN IMPRECISION, message wording only: 'move' IS a typeSpecifier (CFlat.g4:323), and
+// 'unique'/'alias'/'bond' are not grammar keywords at all - they parse as genericIdentifier,
+// also a typeSpecifier. So a ctor carrying one of those four reads as "member" in the
+// duplicate diagnostic. The duplicate is still caught; only the noun is wrong.
+inline bool FunctionDeclaresReturnType(CFlatParser::FunctionDefinitionContext* func)
+{
+    auto* specs = func->declarationSpecifiers();
+    if (specs == nullptr) return false;
+    for (auto* spec : specs->declarationSpecifier())
+        if (spec->typeSpecifier() != nullptr) return true;
+    return false;
+}
+
+// Render a parameter type list for a diagnostic, e.g. "int, string*". Types only:
+// parameter names are not part of a function signature.
+inline std::string DescribeParameterTypes(const std::vector<LLVMBackend::TypeAndValue>& params)
+{
+    std::string text;
+    for (const auto& p : params)
+    {
+        if (!text.empty()) text += ", ";
+        text += p.TypeName;
+        // An array-view param carries Pointer too, but spells as 'T[]', never 'T[]*'.
+        if (p.IsArrayView) text += "[]";
+        else if (p.Pointer) text += p.ElemPointer ? "**" : "*";
+    }
+    return text;
+}
+
 // ForwardRefScanner performs a lightweight pre-pass over the AST to register
 // all function signatures and struct type shells before the main code-gen walk.
 // This allows functions and types to be used before their definition in source.
@@ -1793,7 +1826,9 @@ private:
         LLVMBackend::TypeAndValue returnType{ .TypeName = typeName };
         compiler->CreateFunctionDeclaration(typeName, returnType, {});
 
-        // Pre-declare member functions (and detect constructor overloads)
+        // Pre-declare member functions (and detect constructor overloads).
+        // Ctor signatures seen so far in this body, keyed by mangled name -> declaring line.
+        std::map<std::string, size_t> seenCtorSignatures;
         for (auto func : MemberFunctionDefinitions(ctx))
         {
             // Ctors are written with the bare type name - match baseTypeName, not the
@@ -1801,9 +1836,30 @@ private:
             if (getFunctionName(func) == baseTypeName)
             {
                 // Constructor overload - no implicit this* parameter, returns the type
-                if (!func->parameterTypeList()) continue; // no-arg already declared above
-                auto ctorParams = ParseParameterTypeList(func->parameterTypeList());
-                std::vector<LLVMBackend::TypeAndValue> allCtorParams(ctorParams.begin(), ctorParams.end());
+                std::vector<LLVMBackend::TypeAndValue> allCtorParams;
+                if (func->parameterTypeList() != nullptr)
+                {
+                    auto ctorParams = ParseParameterTypeList(func->parameterTypeList());
+                    allCtorParams.assign(ctorParams.begin(), ctorParams.end());
+                }
+
+                // Two members whose parameter TYPES match collide on one mangled name, and the
+                // main pass then re-emits a body into an already-finished function. Reject here.
+                // varargs is not part of the mangled key - ComputeMangledName ignores it.
+                std::string ctorKey = compiler->ComputeMangledName(typeName, returnType, allCtorParams);
+                auto seen = seenCtorSignatures.find(ctorKey);
+                if (seen != seenCtorSignatures.end())
+                {
+                    // A same-named member with a return type is not a constructor - say "member".
+                    const char* noun = FunctionDeclaresReturnType(func) ? "member" : "constructor";
+                    Compiler(func)->LogError(std::format(
+                        "duplicate {} '{}({})' - a {} with the same parameter types is "
+                        "already defined on line {}. Parameter names are not part of the signature.",
+                        noun, baseTypeName, DescribeParameterTypes(allCtorParams), noun, seen->second));
+                }
+                seenCtorSignatures[ctorKey] = func->getStart()->getLine();
+
+                if (func->parameterTypeList() == nullptr) continue; // no-arg already declared above
                 compiler->CreateFunctionDeclaration(typeName, returnType, allCtorParams);
             }
             else
@@ -26364,6 +26420,12 @@ public:
 
         // Open constructor function - no this* parameter; returns the struct by value
         auto fn = compiler->CreateFunctionDefinition(structName, returnType, allParams, false, varargs, line);
+
+        // CreateFunctionDefinition took its !fn->empty() early return, so no function scope was
+        // pushed. Continuing would index one. Same guard as ParseFunctionDefinition.
+        if (!fn->empty() && fn->getEntryBlock().getTerminator() != nullptr)
+            return;
+
         compiler->InitializeBlock(&fn->front(), false);
         // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
         // exit so a nested lambda's return does not leak into the surrounding expression.
