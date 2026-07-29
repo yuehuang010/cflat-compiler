@@ -10,7 +10,7 @@ import {
 } from 'vscode-languageclient/node';
 
 let client: LanguageClient | undefined;
-let outputChannel: vscode.OutputChannel;
+let outputChannel: vscode.LogOutputChannel;
 let logFilePath: string;
 
 // Resolve the compiler exe: an explicit cflat.executablePath setting always wins; otherwise
@@ -238,7 +238,9 @@ function compileForDebug(cflatExe: string, source: string, outExe: string): Then
 }
 
 export function activate(context: vscode.ExtensionContext): void {
-    outputChannel = vscode.window.createOutputChannel('cflat Language Server');
+    // Must be a log channel: vscode-languageclient 10 types clientOptions.outputChannel
+    // as LogOutputChannel, which extends OutputChannel.
+    outputChannel = vscode.window.createOutputChannel('cflat Language Server', { log: true });
     context.subscriptions.push(outputChannel);
 
     outputChannel.appendLine('=== cflat Extension Activating ===');

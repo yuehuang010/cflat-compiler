@@ -13,7 +13,7 @@ async function main() {
         external: ['vscode'],
         format: 'cjs',
         platform: 'node',
-        target: 'node18',
+        target: 'node20',
         minify: production,
         sourcemap: production ? false : 'inline',
     });
