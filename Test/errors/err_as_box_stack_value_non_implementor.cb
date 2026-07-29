@@ -1,0 +1,26 @@
+// `stackValue as IFace` must be rejected at compile time when the concrete class does
+// not implement IFace, the same way the concrete-POINTER form already is. A class VALUE
+// operand used to fall through to the interface-source path and read the plain class
+// aggregate as a fat pointer, crashing the compiler with no diagnostic.
+
+interface IW
+{
+    int id();
+};
+
+class Z
+{
+    int z = default;
+};
+
+// The cast result is NOT bound to an interface declaration: the assignment path emits a
+// byte-identical message, so a declaration target would let this test keep passing even if
+// the value branch silently regressed to falling through. Only GenerateSafeCast can produce
+// the error for this spelling.
+extern int main()
+{
+    Z zv;
+    expect_error("'Z' does not implement interface 'IW'");
+    bool b = (zv as IW) != nullptr;
+    return 0;
+}

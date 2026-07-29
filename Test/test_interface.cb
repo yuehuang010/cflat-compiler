@@ -255,6 +255,64 @@ bool testAsBoxConcretePointerIntoInterface()
     return result;
 }
 
+// A class returned BY VALUE: the `as` operand has no storage of its own, so the
+// boxing path has to spill it before it can hand out a data pointer.
+Circle makeStackCircle()
+{
+    Circle made;
+    made.r = 5;
+    return made;
+}
+
+// -- Test 4c: as/is on a concrete class STACK VALUE ---------------------------
+// Regression for the compiler crash where a class VALUE operand (which carries no
+// elemType - only pointer operands get one) fell through to the interface-source
+// path and read the plain class aggregate as a fat pointer: `extractvalue` with an
+// out-of-range index asserted in Debug and segfaulted in Release, with no diagnostic.
+
+bool testAsBoxStackValueIntoInterface()
+{
+    bool result = true;
+
+    Circle c;
+    c.r = 4;
+
+    // The crash repro: `as` from a class stack VALUE into an interface must box.
+    IDrawable d = c as IDrawable;
+    result &= Test("as_box_value_area",      d.area(), 48);   // 4*4*3
+    result &= Test("as_box_value_is_circle", d is Circle, true);
+    d.draw();   // access through the boxed value must not fault
+
+    // The box refers to the object itself, not a copy - same as `IDrawable x = c;`.
+    c.r = 10;
+    result &= Test("as_box_value_aliases_source", d.area(), 300);   // 10*10*3
+
+    // Boxing a by-value call result spills it to a slot the fat pointer can point at.
+    IDrawable made = makeStackCircle() as IDrawable;
+    result &= Test("as_box_value_call_result", made.area(), 75);    // 5*5*3
+
+    // Round trip back to the concrete pointer through the interface source path.
+    Circle* back = d as Circle;
+    result &= Test("as_box_value_roundtrip_nonnull", back != nullptr, true);
+    if (back != nullptr)
+        result &= Test("as_box_value_roundtrip_r", back.r, 10);
+
+    // Same concrete target is an identity cast and keeps the value.
+    Circle copy = c as Circle;
+    result &= Test("as_box_value_identity", copy.r, 10);
+
+    // `is` on a class value folds to a compile-time constant, exactly as it does
+    // for a pointer operand. This used to emit invalid IR for the same reason.
+    Square sq;
+    sq.s = 6;
+    result &= Test("value_is_idrawable_true",  c is IDrawable,  true);
+    result &= Test("value_is_idrawable_false", sq is IDrawable, false);
+    result &= Test("value_is_circle_true",     c is Circle,     true);
+    result &= Test("value_is_square_false",    c is Square,     false);
+
+    return result;
+}
+
 // ── Test 5: switch on concrete type ─────────────────────────────────────────
 // Dispatches to the matching case by runtime concrete type.
 
@@ -2461,6 +2519,7 @@ extern int main()
     total++; passed += testAsToStruct()          ? 1 : 0;
     total++; passed += testAsToInterface()       ? 1 : 0;
     total++; passed += testAsBoxConcretePointerIntoInterface() ? 1 : 0;
+    total++; passed += testAsBoxStackValueIntoInterface()      ? 1 : 0;
     total++; passed += testSwitchConcreteType()  ? 1 : 0;
     total++; passed += testSwitchInterfaceCase() ? 1 : 0;
     total++; passed += testSwitchDefault()       ? 1 : 0;

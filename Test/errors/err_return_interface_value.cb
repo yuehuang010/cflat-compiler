@@ -9,6 +9,34 @@ expect_error("cannot return local value 'Square' as interface 'IShape'") {
     IShape makeVal(int s) { Square sq; sq.s = s; return sq; }
 }
 
+// The `as` spelling of the same dangle. It arrives at the return already boxed, so the
+// rejection cannot key on "the operand is not a fat pointer yet"; it keys on the fat
+// pointer's data half being this frame's own storage. Without that, this compiled clean
+// and returned a pointer into the dead frame.
+expect_error("cannot return local value 'Square' as interface 'IShape'") {
+    IShape makeValCast(int s) { Square sq; sq.s = s; return sq as IShape; }
+}
+
+// The same dangle with no named local at all: the boxed temporary is spilled to a slot
+// in this frame, so the returned fat pointer dies with it.
+expect_error("cannot return local value 'Square' as interface 'IShape'") {
+    Square makeSquare(int s) { Square sq; sq.s = s; return sq; }
+    IShape makeTempCast(int s) { return makeSquare(s) as IShape; }
+}
+
+// A '?:' join where only ONE arm is a frame local. The other arm being heap does not save
+// it - the returned fat pointer dangles whenever the local arm is taken - so the check has
+// to follow the join and reject on any frame-local arm. This shape is reachable only
+// through `as`: `return c > 0 ? loc : h;` is rejected earlier as incompatible arm types.
+expect_error("cannot return local value 'Square' as interface 'IShape'") {
+    IShape pickArm(int c)
+    {
+        Square loc; loc.s = 7;
+        Square* h = new Square(); h.s = 9;
+        return c > 0 ? (loc as IShape) : (h as IShape);
+    }
+}
+
 // The mirror case: an interface VALUE returned where a concrete pointer is declared.
 // Without a diagnostic this reaches LLVM as a fat ptr against a pointer return type and
 // fails module verification with no source location.

@@ -5060,6 +5060,131 @@ public:
             Compiler(body)->FlushOwnedTemps();
     }
 
+    // Trace one candidate DATA pointer to the frame alloca it addresses, or nullptr when it
+    // outlives the frame (heap, global, by-reference parameter, or anything loaded).
+    llvm::AllocaInst* FrameLocalDataPointer(llvm::Value* data,
+                                            std::unordered_set<const llvm::Value*>& seen)
+    {
+        if (data == nullptr || !seen.insert(data).second) return nullptr;
+        data = data->stripPointerCasts();
+        // An element/field address (`arr[0] as IShape`) is frame-local iff its base is.
+        while (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(data))
+            data = gep->getPointerOperand()->stripPointerCasts();
+        // A '?:' arrives as a join of the two arms' data pointers. It dangles if EITHER arm
+        // does, so the first frame-local incoming decides it.
+        if (auto* phi = llvm::dyn_cast<llvm::PHINode>(data))
+        {
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+                if (auto* slot = FrameLocalDataPointer(phi->getIncomingValue(i), seen)) return slot;
+            return nullptr;
+        }
+        if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(data))
+        {
+            if (auto* slot = FrameLocalDataPointer(sel->getTrueValue(), seen)) return slot;
+            return FrameLocalDataPointer(sel->getFalseValue(), seen);
+        }
+        return llvm::dyn_cast<llvm::AllocaInst>(data);
+    }
+
+    // Collect the values inserted at `index` of a fat pointer, following the '?:' joins that can
+    // sit between the boxing site and here. One entry per reachable boxing site.
+    void CollectFatValueFields(llvm::Value* fatValue, unsigned index,
+                               std::vector<llvm::Value*>& out,
+                               std::unordered_set<const llvm::Value*>& seen)
+    {
+        if (fatValue == nullptr || !seen.insert(fatValue).second) return;
+        if (auto* phi = llvm::dyn_cast<llvm::PHINode>(fatValue))
+        {
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+                CollectFatValueFields(phi->getIncomingValue(i), index, out, seen);
+            return;
+        }
+        if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(fatValue))
+        {
+            CollectFatValueFields(sel->getTrueValue(), index, out, seen);
+            CollectFatValueFields(sel->getFalseValue(), index, out, seen);
+            return;
+        }
+        llvm::Value* agg = fatValue;
+        while (auto* iv = llvm::dyn_cast<llvm::InsertValueInst>(agg))
+        {
+            if (iv->getNumIndices() == 1 && iv->getIndices()[0] == index)
+            {
+                out.push_back(iv->getInsertedValueOperand());
+                return;
+            }
+            agg = iv->getAggregateOperand();
+        }
+        // The base of the chain folds to a constant once the vtable is inserted into undef,
+        // so the vtable half usually lives here rather than in an insertvalue.
+        if (auto* c = llvm::dyn_cast<llvm::Constant>(agg))
+            if (auto* elem = c->getAggregateElement(index);
+                elem != nullptr && !llvm::isa<llvm::UndefValue>(elem))
+                out.push_back(elem);
+    }
+
+    // The data half of an already-built interface fat pointer, when it is provably THIS frame's
+    // own storage. Returns the alloca, or nullptr when the pointer outlives the frame. A '?:'
+    // that is frame-local on ONE arm still dangles, so any frame-local arm answers.
+    llvm::AllocaInst* FrameLocalDataOfFatValue(llvm::Value* fatValue)
+    {
+        std::vector<llvm::Value*> dataPtrs;
+        std::unordered_set<const llvm::Value*> seenFat, seenData;
+        CollectFatValueFields(fatValue, 1u, dataPtrs, seenFat);
+        for (auto* data : dataPtrs)
+            if (auto* slot = FrameLocalDataPointer(data, seenData)) return slot;
+        return nullptr;
+    }
+
+    // The class that owns a vtable global, or "" if it is not a registered vtable.
+    std::string VTableOwnerName(llvm::GlobalVariable* vtable, LLVMBackend* compiler)
+    {
+        for (auto& [sName, sd] : compiler->dataStructures)
+            for (auto& [iName, vt] : sd.VTables) if (vt == vtable) return sName;
+        for (auto& [pName, pd] : compiler->programTable)
+            for (auto& [iName, vt] : pd.VTables) if (vt == vtable) return pName;
+        return "";
+    }
+
+    // The class a fat pointer was boxed from, read off the VTABLE it carries. The vtable is the
+    // only operand that still names the class once the cast erased the operand's type; the data
+    // pointer's storage does not (a `Square` field of a `Wrap` local allocas as `Wrap`, and an
+    // element of a `Square[3]` local allocas as an array). Empty when no single class answers -
+    // e.g. a '?:' joining two different implementors.
+    std::string BoxedStructNameOfFatValue(llvm::Value* fatValue, LLVMBackend* compiler)
+    {
+        std::vector<llvm::Value*> vtables;
+        std::unordered_set<const llvm::Value*> seen;
+        CollectFatValueFields(fatValue, 0u, vtables, seen);
+        std::string found;
+        for (auto* v : vtables)
+        {
+            auto* g = llvm::dyn_cast<llvm::GlobalVariable>(v->stripPointerCasts());
+            std::string name = g != nullptr ? VTableOwnerName(g, compiler) : std::string();
+            if (name.empty() || (!found.empty() && found != name)) return "";
+            found = name;
+        }
+        return found;
+    }
+
+    // One wording for both spellings that reach it: `return sq;` and `return sq as IShape;`.
+    // An empty structName means the boxed class could not be pinned down - say nothing about it
+    // rather than naming the wrong type and advising a 'new' that would not compile.
+    void LogInterfaceReturnDangle(antlr4::ParserRuleContext* ctx, const std::string& structName,
+                                  const std::string& ifaceName)
+    {
+        if (structName.empty())
+        {
+            LogErrorContext(ctx, std::format("cannot return a local value as interface '{}' - "
+                "the interface fat pointer would dangle once this function returns; "
+                "allocate the object on the heap and return the pointer", ifaceName));
+            return;
+        }
+        LogErrorContext(ctx, std::format("cannot return local value '{}' as interface '{}' - "
+            "the interface fat pointer would dangle once this function returns; "
+            "allocate on the heap ('new {}') and return the pointer", structName, ifaceName, structName));
+    }
+
     void ParseStatement(CFlatParser::StatementContext* statement)
     {
         auto* compiler = Compiler(statement);
@@ -5662,15 +5787,21 @@ public:
                             retStorage = compiler->FindVariableStorage(returnNV.CallerName).Storage;
 
                         // Interface return upcast. When the function's declared return type is an
-                        // interface (LLVM { ptr vtable, ptr data } fat pointer) but the returned
-                        // expression is a concrete implementer (not already a fat pointer), build
-                        // the fat pointer here - mirroring the assignment/parameter upcast. Without
+                        // interface (LLVM { ptr vtable, ptr data } fat pointer), box a concrete
+                        // implementer here - mirroring the assignment/parameter upcast. Without
                         // this the `ret` operand is a bare pointer and module verification fails.
+                        // An operand that is ALREADY a fat pointer still enters when its data half
+                        // is this frame's storage (`return sq as IShape;`): the boxing happened
+                        // upstream, but the dangle it creates is this path's to reject.
                         std::string interfaceReturnStructName;
+                        llvm::AllocaInst* returnedFatFrameSlot =
+                            right != nullptr && right->getType() == compiler->GetFatPtrType()
+                                ? FrameLocalDataOfFatValue(right) : nullptr;
                         if (auto* fatTy = compiler->GetFatPtrType();
                             right != nullptr && fatTy != nullptr && compiler->currentFunction != nullptr
                             && compiler->currentFunction->getReturnType() == fatTy
-                            && right->getType() != fatTy && !returnNV.TypeAndValue.IsInterface)
+                            && ((right->getType() != fatTy && !returnNV.TypeAndValue.IsInterface)
+                                || returnedFatFrameSlot != nullptr))
                         {
                             const std::string& ifaceName = compiler->currentFunctionReturnTypeName;
                             std::string structName = returnNV.TypeAndValue.TypeName;
@@ -5678,7 +5809,16 @@ public:
                                 if (auto* st = llvm::dyn_cast<llvm::StructType>(returnNV.BaseType))
                                     structName = st->getName().str();
 
-                            if (!structName.empty() && !compiler->StructImplementsInterface(structName, ifaceName))
+                            if (returnedFatFrameSlot != nullptr)
+                            {
+                                // Already boxed against this frame's storage. The implements/shape
+                                // checks below cannot apply (the operand is no longer the class),
+                                // and returnNV describes the fat pointer rather than what was boxed
+                                // - so name the class from the vtable the value carries, or say
+                                // nothing about it when no single class answers.
+                                LogInterfaceReturnDangle(jump, BoxedStructNameOfFatValue(right, compiler), ifaceName);
+                            }
+                            else if (!structName.empty() && !compiler->StructImplementsInterface(structName, ifaceName))
                             {
                                 LogErrorContext(jump, std::format("'{}' does not implement interface '{}'", structName, ifaceName));
                             }
@@ -5706,9 +5846,7 @@ public:
                                     // local lives in this frame, so boxing it would return a
                                     // dangling pointer. Reject with a clear diagnostic steering to
                                     // a heap allocation (rather than emitting UB / a verifier dump).
-                                    LogErrorContext(jump, std::format("cannot return local value '{}' as interface '{}' - "
-                                        "the interface fat pointer would dangle once this function returns; "
-                                        "allocate on the heap ('new {}') and return the pointer", structName, ifaceName, structName));
+                                    LogInterfaceReturnDangle(jump, structName, ifaceName);
                                 }
                             }
                             else if (llvm::isa<llvm::Constant>(right) && right->getType()->isPointerTy())
@@ -11992,14 +12130,39 @@ public:
         return compiler->dataStructures.count(name) ? name : "";
     }
 
+    // A class VALUE operand (e.g. `s as IMore` where s is a stack `Impl`) arrives as the loaded
+    // aggregate and carries no elemType - only pointer sources get one. Its concrete type is
+    // still statically known, so recover the name from the value's own type.
+    std::string ConcreteStructNameFromValue(llvm::Value* value, LLVMBackend* compiler)
+    {
+        auto* st = value ? llvm::dyn_cast<llvm::StructType>(value->getType()) : nullptr;
+        if (!st || !st->hasName()) return "";
+        std::string name = st->getName().str();
+        return compiler->dataStructures.count(name) ? name : "";
+    }
+
+    // Boxing a class value into an interface needs the object's ADDRESS. A loaded value came
+    // straight from its storage, so reuse that; anything else (a call result) is spilled.
+    llvm::Value* AddressOfClassValueOperand(llvm::Value* value, LLVMBackend* compiler)
+    {
+        if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+            return load->getPointerOperand();
+        auto* slot = compiler->CreateAlloca(value->getType());
+        compiler->CreateAssignment(value, slot);
+        return slot;
+    }
+
     llvm::Value* GenerateIsCheck(llvm::Value* interfaceValue, const std::string& targetTypeName,
                                   antlr4::ParserRuleContext* ctx, llvm::Type* srcElemType = nullptr)
     {
         auto* compiler = Compiler(ctx);
 
-        // Concrete pointer source (e.g. `w is IW` where w is W*, not a boxed interface
-        // value): no vtable/typedesc header to load, so the answer is known at compile time.
+        // Concrete source, pointer (e.g. `w is IW` where w is W*) or stack value (`s is IW`),
+        // not a boxed interface value: no vtable/typedesc header to load, so the answer is
+        // known at compile time.
         std::string srcStructName = ConcreteStructNameFromElemType(srcElemType, compiler);
+        if (srcStructName.empty())
+            srcStructName = ConcreteStructNameFromValue(interfaceValue, compiler);
         if (!srcStructName.empty())
         {
             if (compiler->interfaceTable.count(targetTypeName))
@@ -12056,10 +12219,17 @@ public:
         auto* compiler = Compiler(ctx);
         auto ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
 
-        // CONCRETE pointer source (e.g. `w as X` where w is W*). A concrete object carries
-        // no vtable/typedesc header, so every target is resolved statically here; this branch
-        // always returns, keeping the runtime-checked downcast below interface-source-only.
+        // CONCRETE source, pointer (e.g. `w as X` where w is W*) or stack value (`s as X`).
+        // A concrete object carries no vtable/typedesc header, so every target is resolved
+        // statically here; this branch always returns, keeping the runtime-checked downcast
+        // below interface-source-only.
         std::string srcStructName = ConcreteStructNameFromElemType(srcElemType, compiler);
+        bool srcIsValue = false;
+        if (srcStructName.empty())
+        {
+            srcStructName = ConcreteStructNameFromValue(interfaceValue, compiler);
+            srcIsValue = !srcStructName.empty();
+        }
         if (!srcStructName.empty())
         {
             // Interface target: box it, exactly like the plain-assignment path.
@@ -12071,7 +12241,9 @@ public:
                     return nullptr;
                 }
                 auto* vtable = compiler->GetOrCreateVTable(srcStructName, targetTypeName);
-                return compiler->BuildInterfaceFatValue(vtable, interfaceValue);
+                llvm::Value* dataPtr = srcIsValue ? AddressOfClassValueOperand(interfaceValue, compiler)
+                                                  : interfaceValue;
+                return compiler->BuildInterfaceFatValue(vtable, dataPtr);
             }
 
             if (compiler->dataStructures.count(targetTypeName))
