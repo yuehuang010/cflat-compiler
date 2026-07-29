@@ -18434,6 +18434,29 @@ public:
         return false;
     }
 
+    /*
+     * The PROVABLE negative of IsOwningValue, for guards whose false positive is a false rejection.
+     * IsOwningValue answers only a LoadInst, so its `false` conflates "this binding does not own"
+     * with "this value is not a load at all" - keying a rejection off it rejects legal code (that
+     * is exactly how a '?:' phi came to be rejected as not-owned). This answers true ONLY when the
+     * loaded slot IS a live binding that declares itself non-owning. A call result, a phi, a field
+     * GEP, an unresolvable slot: all answer false, i.e. "cannot tell", and are left accepted.
+     */
+    bool IsProvablyNonOwningPointerLoad(llvm::Value* value) const
+    {
+        auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(value);
+        if (load == nullptr || !load->getType()->isPointerTy()) return false;
+        auto* slot = load->getPointerOperand();
+        for (const auto& frame : stackNamedVariable)
+        {
+            for (const auto& [varName, nv] : frame.namedVariable)
+                if (nv.Storage == slot) return !nv.IsOwning;
+            for (const auto& [varName, nv] : frame.functionArgument)
+                if (nv.Storage == slot) return !nv.IsOwning;
+        }
+        return false;
+    }
+
     // True when `storage` is the slot of a plain (borrow) string PARAMETER - a `string s`
     // argument this frame does NOT own. The slot holds a {ptr,len} copied by value from the
     // caller with the runtime OWNED bit intact (correct: the callee must not free a borrow),

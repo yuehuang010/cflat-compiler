@@ -74,6 +74,39 @@ Last updated 2026-07-29.
     still gets the classifier's generic message - the same documented exception a local
     `Circle*[3]` has, since a decayed GEP has no named binding to describe.
 
+- **Returning a `?:` join of concrete pointers as an interface aborted the compile with a raw
+  LLVM verifier dump** - fixed, closing `return-ternary-join-concrete-pointers-not-boxed`. The
+  issue file's account was RIGHT as far as it went (the return path had no
+  `UpcastTernaryPhiToInterface` call, so a phi of raw `ptr` reached `CreateReturnCall`), but it
+  missed two things. First, the plain spelling under a `move` return type did not reach the
+  verifier at all - it was a FALSE REJECTION ("returned expression is not owned"), because a phi
+  is not a `LoadInst` and so fails `IsOwningValue`. Second, boxing alone is not enough: the
+  helper builds its fat value with `BuildInterfaceFatValue` directly and never ledgered an
+  `InterfaceBoxRecord`, so `FatValueOwnsHeapBox` could not see the join and the non-`move` heap
+  arm silently leaked instead of being rejected - and nothing nulled the arms' owning locals, so
+  the callee's scope-exit free ran on the object it had just handed out (correct-looking compile,
+  garbage value). Fix: call the helper from the return path BEFORE the ownership and dangle
+  checks so all of them inspect the fat pointer exactly as they do for the `as` spelling; ledger
+  each arm's box with the ordinary provenance classification; and, only for a `move` return, null
+  each OWNING arm's source inside that arm's own block so the untaken arm still runs its normal
+  null-guarded free (verified 200 constructions / 200 destructions over 100 alternating calls).
+  - Boxing EARLY has a trap that cost one review round: the whole-expression owned-return check is
+    gated on `right->getType()->isPointerTy()`, so once the arms are boxed it is skipped
+    ENTIRELY. That is what cured the false rejection above - and it equally removed the check for
+    arms that are NOT owned, turning `move IW f(int c, W* p, W* q){ return c > 0 ? p : q; }` from
+    REJECTED into a compiling double free (exit 134). The check therefore had to move INTO the
+    per-arm walk. Its polarity is deliberately the opposite of the whole-expression one: it
+    rejects only an arm it can PROVE owns nothing (`IsProvablyNonOwningPointerLoad` - a load whose
+    slot is a live binding that declares itself non-owning) and accepts every "cannot tell" shape,
+    because `IsOwningValue` answers only a `LoadInst` and reading its `false` as "not owned" is
+    precisely what produced the original false rejection. `move` parameters, direct `new` arms and
+    move-returning call results were all re-verified as still accepted.
+  - The dangle gap of [[interface-return-dangle-defeated-by-intermediate-local]] applies to this
+    shape too and was deliberately left alone: `Square a; Square* p = &a; return c ? p : q;`
+    boxes and compiles, exactly as the non-ternary `return p;` does today.
+  - A DIRECT `&local` arm names no class, so it is now rejected by the arm-boxing diagnostic
+    rather than the dangle one. A rejection either way; the wording is about the wrong thing.
+
 - **Duplicate constructor signature crashed the compiler with no diagnostic** - fixed,
   closing `duplicate-constructor-signature-hangs-compiler`. The issue file's guess (runaway
   recursion or an unbounded loop) was WRONG. `CreateFunctionDefinition` early-returns an
@@ -189,7 +222,6 @@ Last updated 2026-07-29.
 |---|---|
 | [[generic-interface-registered-as-opaque-struct]] | LLVM verifier failure + false rejections. `IFace<T>` unusable in most positions. |
 | [[interface-boxing-guards-are-binding-dependent]] | Double free (exit 134). Parens or `?:` erase the binding the guards key off. |
-| [[return-ternary-join-concrete-pointers-not-boxed]] | Verifier abort, no source diagnostic. PLAIN path; `as` is now better. |
 | [[generic-interface-namespace-scope-limit]] | Silent miscompile. DELIBERATE scope limit of `c9acb6c`, recorded so it is not lost. |
 | [[interface-return-dangle-defeated-by-intermediate-local]] | Dangling fat pointer, no diagnostic. Both spellings. QUEUE HEAD. |
 | [[iface-call-does-no-argument-type-matching]] | Silent miscompile then SIGBUS. An `int` reaches a closure slot; the direct path rejects it. |

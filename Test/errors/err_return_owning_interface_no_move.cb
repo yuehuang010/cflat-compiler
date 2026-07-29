@@ -44,6 +44,43 @@ expect_error("transfers ownership the caller cannot see - it will leak") {
     }
 }
 
+// The PLAIN spelling of the same join. It has no 'as', so nothing boxed the arms upstream and the
+// operand reaching the return was a raw pointer phi - the module used to fail verification with no
+// source location. The return path boxes each arm itself now and ledgers its provenance, so this
+// shape lands on the same diagnostic as the 'as' spelling above instead of aborting the compile.
+expect_error("transfers ownership the caller cannot see - it will leak") {
+    IThing pickThingPlain(int c)
+    {
+        Thing* a = new Thing(); a->n = 1;
+        Thing* b = new Thing(); b->n = 2;
+        return c > 0 ? a : b;
+    }
+}
+
+// The MIRROR hazard, on the 'move' side of the same join. A 'move' interface return transfers
+// every arm to the caller, so an arm that owns nothing makes the caller a second owner of a live
+// borrow - it destroys a pointee the real owner destroys again (exit 134, not a leak). Boxing the
+// join turns the return operand into a struct, which skips the whole-expression owned-return check
+// (it is gated on a pointer operand), so the arms are checked one at a time instead. Both arms
+// borrowed here; the non-ternary `move IThing f(Thing* p){ return p; }` is rejected the same way.
+expect_error("function declares 'move' return type but returned expression is not owned") {
+    move IThing pickBorrowed(int c, Thing* p, Thing* q)
+    {
+        return c > 0 ? p : q;
+    }
+}
+
+// Mixed join: one owning arm, one borrowed. The owning arm must not license the borrowed one -
+// taking the borrowed branch is the double free above, and it is the branch a whole-join verdict
+// keyed off "some arm owns" would wave through.
+expect_error("function declares 'move' return type but returned expression is not owned") {
+    move IThing pickMixed(int c, Thing* borrowed)
+    {
+        Thing* owned = new Thing(); owned->n = 1;
+        return c > 0 ? owned : borrowed;
+    }
+}
+
 extern int main()
 {
     return 0;

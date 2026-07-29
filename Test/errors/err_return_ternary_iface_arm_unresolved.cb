@@ -1,0 +1,39 @@
+// A '?:' returned as an interface is boxed one arm at a time, and each arm's concrete class comes
+// from the arm VALUE (a `new`-site ledger entry, or the declared type of the binding a load came
+// from). An arm that is neither - here the address of a by-value local - names no class, so no
+// vtable can be chosen. That used to fall through to the `ret` as a raw pointer and abort the
+// compile with a bare LLVM verifier dump and no source location; it is a diagnostic now.
+
+interface IThing { int value(); };
+
+class Thing : IThing
+{
+    int n = 0;
+    int value() { return n; }
+};
+
+expect_error("cannot convert '?:' arm to interface 'IThing'") {
+    IThing pickAddressOfLocal(int c)
+    {
+        Thing a; a.n = 1;
+        Thing b; b.n = 2;
+        return c > 0 ? &a : &b;
+    }
+}
+
+// The mirror on the DECLARATION path, which has carried this diagnostic all along - the two
+// spellings must keep agreeing about which joins can be boxed.
+expect_error("cannot convert '?:' arm to interface 'IThing'") {
+    int bindAddressOfLocal(int c)
+    {
+        Thing a; a.n = 1;
+        Thing b; b.n = 2;
+        IThing t = c > 0 ? &a : &b;
+        return t.value();
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

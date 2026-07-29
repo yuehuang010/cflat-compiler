@@ -5223,6 +5223,16 @@ public:
         return found;
     }
 
+    // The concrete class the interface-return upcast keys off: the binding's declared TypeName,
+    // or the LLVM struct name when the binding carries only a type. Empty for a '?:' join, which
+    // has no binding at all - that is what routes the join to the per-arm boxing instead.
+    std::string ReturnUpcastStructName(const LLVMBackend::NamedVariable& nv)
+    {
+        if (!nv.TypeAndValue.TypeName.empty()) return nv.TypeAndValue.TypeName;
+        if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(nv.BaseType)) return st->getName().str();
+        return {};
+    }
+
     // One wording for both spellings that reach it: `return sq;` and `return sq as IShape;`.
     // An empty structName means the boxed class could not be pinned down - say nothing about it
     // rather than naming the wrong type and advising a 'new' that would not compile.
@@ -5488,6 +5498,40 @@ public:
                         if (right && returnFnPtrTV.IsFunctionPointer)
                             right = compiler->CoerceToFuncPtrReturn(right, returnFnPtrTV);
                         ProcessPlusPlus();
+
+                        /*
+                         * A '?:' join of concrete implementer pointers carries no NamedVariable
+                         * TypeName, so the interface-return upcast further down cannot see a class
+                         * to box and a bare `ptr` would reach the `ret`. Box each arm in its own
+                         * branch HERE - before the ownership and dangle checks - so every one of
+                         * them inspects the fat pointer, exactly as they already do for the
+                         * `return c ? (x as I) : (y as I);` spelling. The helper bails to nullptr
+                         * for anything that is not a pointer '?:' targeting this interface, so the
+                         * normal path is untouched; it only reports an armFailure for a join that
+                         * genuinely targets the interface and cannot be boxed, which today reaches
+                         * the verifier as a raw type mismatch with no source location.
+                         */
+                        if (auto* fatTy = compiler->GetFatPtrType();
+                            right != nullptr && fatTy != nullptr && compiler->currentFunction != nullptr
+                            && compiler->currentFunction->getReturnType() == fatTy
+                            && right->getType()->isPointerTy()
+                            && !returnNV.TypeAndValue.IsInterface
+                            && ReturnUpcastStructName(returnNV).empty())
+                        {
+                            std::string ternaryArmFailure;
+                            bool ternaryArmNotOwned = false;
+                            const std::string& ifaceName = compiler->currentFunctionReturnTypeName;
+                            if (auto* fat = UpcastTernaryPhiToInterface(
+                                    right, ifaceName, &ternaryArmFailure,
+                                    compiler->currentFunctionReturnsOwned, &ternaryArmNotOwned))
+                                right = fat;
+                            else if (ternaryArmNotOwned)
+                                LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
+                            else if (!ternaryArmFailure.empty())
+                                LogErrorContext(jump, std::format(
+                                    "cannot convert '?:' arm to interface '{}': {}",
+                                    ifaceName, ternaryArmFailure));
+                        }
 
                         // String ownership transfer (runtime-bit model). Classify the returned
                         // value once, before the owned-return flags below are cleared.
@@ -5845,10 +5889,7 @@ public:
                                 || returnedFatFrameSlot != nullptr))
                         {
                             const std::string& ifaceName = compiler->currentFunctionReturnTypeName;
-                            std::string structName = returnNV.TypeAndValue.TypeName;
-                            if (structName.empty() && returnNV.BaseType)
-                                if (auto* st = llvm::dyn_cast<llvm::StructType>(returnNV.BaseType))
-                                    structName = st->getName().str();
+                            std::string structName = ReturnUpcastStructName(returnNV);
 
                             if (returnedFatFrameSlot != nullptr)
                             {
@@ -10163,9 +10204,18 @@ public:
      * `armFailure` (when given) is set ONLY for a pointer '?:' that genuinely targets this
      * interface but has an arm that cannot be boxed - the caller must diagnose that instead of
      * bitcasting a raw `ptr` into the fat struct. It stays empty for every "does not apply" bail.
+     * `transferArmOwnership` is set ONLY by the `move`-interface RETURN path: the box escapes the
+     * frame there, so an OWNING arm local is nulled inside its own arm block and the untaken arm
+     * still runs its ordinary null-guarded scope-exit free (no leak, no double free). Every other
+     * caller keeps the box inside the frame and must not disturb the arms' owners. It also arms
+     * the per-arm ownership check that reports through `armNotOwned`: transferring an arm that
+     * owns nothing would make the caller a second owner of a live borrow, so the caller must
+     * raise the ordinary not-owned return diagnostic instead of boxing.
      */
     llvm::Value* UpcastTernaryPhiToInterface(llvm::Value* right, const std::string& interfaceName,
-                                             std::string* armFailure = nullptr)
+                                             std::string* armFailure = nullptr,
+                                             bool transferArmOwnership = false,
+                                             bool* armNotOwned = nullptr)
     {
         auto* compiler = compilerLLVM;
         auto* phi = llvm::dyn_cast_or_null<llvm::PHINode>(right);
@@ -10193,6 +10243,23 @@ public:
                 return nullptr;
             }
             if (phi->getIncomingBlock(i)->getTerminator() == nullptr) return nullptr;
+            /*
+             * A 'move' return transfers EVERY arm, so an arm that owns nothing would hand the
+             * caller a second owner of a live borrow (double free). The whole-expression check on
+             * the return path cannot see this: boxing turns the operand into a struct and that
+             * check is gated on a pointer operand. Ask per arm instead - but PROVABLY, since the
+             * accept side is the safe one here: only a load off a live binding that declares
+             * itself non-owning is rejected. A call result, a phi, a field GEP or an unresolvable
+             * slot all answer "cannot tell" and are accepted, which is what keeps this from
+             * reopening the false rejection that the whole-expression check used to produce.
+             */
+            if (transferArmOwnership && !compiler->TernaryArmJoinsOwning(incoming)
+                && !compiler->IsMovedOutPtrValue(incoming)
+                && compiler->IsProvablyNonOwningPointerLoad(incoming))
+            {
+                if (armNotOwned != nullptr) *armNotOwned = true;
+                return nullptr;
+            }
         }
 
         auto* savedBlock = compiler->builder->GetInsertBlock();
@@ -10208,7 +10275,34 @@ public:
             }
             compiler->builder->SetInsertPoint(phi->getIncomingBlock(i)->getTerminator());
             auto* vtable = compiler->GetOrCreateVTable(armTypes[i], interfaceName);
-            boxed[i] = compiler->BuildInterfaceFatValue(vtable, phi->getIncomingValue(i));
+            llvm::Value* armData = phi->getIncomingValue(i);
+            boxed[i] = compiler->BuildInterfaceFatValue(vtable, armData);
+
+            // Ownership transfer for an escaping box (see transferArmOwnership). Null the arm's
+            // OWNING source in the arm's OWN block, so only the untaken arm is freed at scope exit.
+            bool transferred = false;
+            if (transferArmOwnership)
+                if (auto* load = llvm::dyn_cast<llvm::LoadInst>(armData);
+                    load != nullptr && load->getType()->isPointerTy() && compiler->IsOwningValue(load))
+                {
+                    compiler->builder->CreateStore(
+                        llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(load->getType())),
+                        load->getPointerOperand());
+                    transferred = true;
+                }
+            // NO MarkVariableMoved here, unlike BoxConcreteIntoInterface: the transfer is
+            // RUNTIME-conditional, so a compile-time flag false-rejects the not-taken path.
+
+            // Ledger the box with the same provenance classification the single-value site records,
+            // so the guards that ask WHERE a boxed object lives can answer a join too.
+            LLVMBackend::InterfaceBoxRecord record;
+            record.FatValue = boxed[i];
+            record.DataPointer = armData;
+            record.SourceClassName = armTypes[i];
+            record.InterfaceName = interfaceName;
+            record.Source = ClassifyInterfaceBoxSource(armData, nullptr, transferred);
+            record.OwnershipTransferred = transferred;
+            compiler->RegisterInterfaceBox(record);
         }
         compiler->builder->SetInsertPoint(phi);
         auto* fatPhi = compiler->builder->CreatePHI(fatTy, count, "ternary_iface");

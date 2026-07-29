@@ -1598,6 +1598,80 @@ bool testInterfaceTernaryAsCast()
 }
 
 /*
+ * The RETURN spelling of the same '?:' join. A ternary result carries no NamedVariable TypeName,
+ * so the interface-return upcast found no class to box and a bare `ptr` reached the `ret` - the
+ * module failed verification with no source location. Each arm is boxed in its own branch on the
+ * return path too now. A 'move' return additionally transfers each OWNING arm's ownership inside
+ * that arm's block, so the UNTAKEN arm still runs its ordinary scope-exit free: the dtor counts
+ * below prove neither a leak nor a double free.
+ */
+move IPress ternaryReturnOwned(int c)
+{
+    Pressy* x = new Pressy(); x.nclicks = 3;
+    Pressy* y = new Pressy(); y.nclicks = 4;
+    return c > 0 ? x : y;
+}
+
+move IPress ternaryReturnOwnedMixedClass(int c)
+{
+    Pressy* x = new Pressy();
+    Toggly* y = new Toggly();
+    return c > 0 ? x : y;
+}
+
+// Borrowed pointer PARAMETERS: nothing is owned here, so a plain (non-'move') return is legal.
+IPress ternaryReturnBorrowed(int c, Pressy* p, Toggly* q)
+{
+    return c > 0 ? p : q;
+}
+
+bool testInterfaceTernaryReturnUpcast()
+{
+    bool result = true;
+    gWidgetDtorCount = 0;
+
+    // 'move' return of a join of two owning locals: the taken arm reaches the caller intact.
+    move IPress taken = ternaryReturnOwned(1);
+    result &= Test("iface_ternary_ret_taken_kind", taken.kind(), 1);
+    result &= Test("iface_ternary_ret_taken_clicks", taken.clicks(), 3);
+    // The untaken arm was freed at the callee's scope exit; the taken one is still live.
+    result &= Test("iface_ternary_ret_untaken_freed", gWidgetDtorCount, 1);
+    delete taken;
+    result &= Test("iface_ternary_ret_taken_freed", gWidgetDtorCount, 2);
+
+    move IPress other = ternaryReturnOwned(0);
+    result &= Test("iface_ternary_ret_other_clicks", other.clicks(), 4);
+    delete other;
+    result &= Test("iface_ternary_ret_no_leak", gWidgetDtorCount, 4);
+
+    // Arms of DIFFERENT concrete classes: each arm carries its own vtable through the return.
+    move IPress mixedTrue = ternaryReturnOwnedMixedClass(1);
+    result &= Test("iface_ternary_ret_mixed_true_kind", mixedTrue.kind(), 1);
+    delete mixedTrue;
+    move IPress mixedFalse = ternaryReturnOwnedMixedClass(0);
+    result &= Test("iface_ternary_ret_mixed_false_kind", mixedFalse.kind(), 2);
+    delete mixedFalse;
+    result &= Test("iface_ternary_ret_mixed_dtor_count", gWidgetDtorCount, 8);
+
+    // Borrowed arms through a plain return: the caller still owns both objects.
+    Pressy* p = new Pressy(); p.nclicks = 11;
+    Toggly* q = new Toggly();  q.nclicks = 12;
+    IPress bp = ternaryReturnBorrowed(1, p, q);
+    IPress bq = ternaryReturnBorrowed(0, p, q);
+    result &= Test("iface_ternary_ret_borrow_true_kind",  bp.kind(), 1);
+    result &= Test("iface_ternary_ret_borrow_false_kind", bq.kind(), 2);
+    result &= Test("iface_ternary_ret_borrow_clicks", bp.clicks(), 11);
+    // The callee owns neither arm, so it must free neither - and both objects stay usable here.
+    // (The 'move' spelling of this same borrowed join is rejected; see err_return_owning_*.cb.)
+    result &= Test("iface_ternary_ret_borrow_no_free", gWidgetDtorCount, 8);
+    result &= Test("iface_ternary_ret_borrow_src_live", p.nclicks + q.nclicks, 23);
+    result &= Test("iface_ternary_ret_borrow_src_kind", p.kind() + q.kind(), 3);
+    delete p; delete q;
+    result &= Test("iface_ternary_ret_borrow_dtor_count", gWidgetDtorCount, 10);
+    return result;
+}
+
+/*
  * Brace-init binds an interface-typed struct field or array element through its own store path,
  * separate from `=`. Each must re-box the source to the DESTINATION's interface; otherwise the slot
  * keeps the source's vtable and its slot 0 answers the destination interface's method 0.
@@ -3405,6 +3479,7 @@ extern int main()
     total++; passed += testInterfaceIsNullUpcast()       ? 1 : 0;
     total++; passed += testInterfaceTernaryUpcast()      ? 1 : 0;
     total++; passed += testInterfaceTernaryAsCast()      ? 1 : 0;
+    total++; passed += testInterfaceTernaryReturnUpcast() ? 1 : 0;
     total++; passed += testGenericInterfaceField()       ? 1 : 0;
     total++; passed += testGenericInterfaceExplicitPtrArg() ? 1 : 0;
     total++; passed += testLocalListInterfaceTakeDelete()     ? 1 : 0;
