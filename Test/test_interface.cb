@@ -2690,6 +2690,604 @@ bool testNamespacedInterfaces()
     return result;
 }
 
+// =============================================================
+// Interface-return-dangle positive corpus
+//
+// These pin LEGAL programs (current compiler accepts them and prints the
+// correct answer). Most were discovered while chasing
+// internal/issue/interface-return-dangle-defeated-by-intermediate-local.md;
+// a few (noted on the leg itself) are synthesized variants added later to
+// close a coverage gap without duplicating an existing shape. Three
+// separate fix attempts each passed the whole suite and each was caught
+// only by adversarial review rejecting one of these shapes. Keep every
+// shape below so a future attempt is reviewable by ./test.sh.
+// =============================================================
+
+// guards an early return inside a then-arm whose RETURNED value is not the frame box
+// (the arm does write the frame box first - that is the point)
+move IShape dangleThenArmEarlyReturn(int c)
+{
+    Square loc; loc.s = 3;
+    Square* h = new Square(); h.s = 9;
+    IShape r = h as IShape;
+    if (c > 0)
+    {
+        r = loc as IShape;
+        Square* h2 = new Square(); h2.s = 11;
+        return h2 as IShape;
+    }
+    return r;
+}
+
+// guards the else-arm return that layout-order selection rejected (attempt 1)
+move IShape dangleElseArmReturn(int c)
+{
+    Square loc; loc.s = 3;
+    Square* h = new Square(); h.s = 9;
+    IShape r = h as IShape;
+    if (c > 0) { r = loc as IShape; printf("%d\n", r.area()); }
+    else { return r; }
+    Square* h2 = new Square(); h2.s = 11;
+    return h2 as IShape;
+}
+
+// guards an early return sibling to the fallthrough path inside a switch case
+move IShape dangleSwitchCaseEarlyReturn(int c)
+{
+    Square loc; loc.s = 3;
+    Square* h = new Square(); h.s = 9;
+    IShape r = h as IShape;
+    switch (c)
+    {
+        case 1: { r = loc as IShape; printf("%d\n", r.area()); Square* h3 = new Square(); return h3 as IShape; }
+        default: break;
+    }
+    return r;
+}
+
+// guards a while loop that may run zero times, never touching the frame box
+move IShape dangleWhileLoopZeroIterations(int n)
+{
+    Square loc; loc.s = 3;
+    Square* h = new Square(); h.s = 9;
+    IShape r = h as IShape;
+    int i = 0;
+    while (i < n) { r = loc as IShape; Square* h4 = new Square(); return h4 as IShape; }
+    return r;
+}
+
+// guards both if/else arms overwriting the slot before return (attempt 2: dominance)
+move IShape dangleIfElseBothArmsOverwrite(int c)
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    if (c > 0)
+    {
+        Square* h1 = new Square(); h1.s = 9;
+        r = h1 as IShape;
+    }
+    else
+    {
+        Square* h2 = new Square(); h2.s = 9;
+        r = h2 as IShape;
+    }
+    return r;
+}
+
+// guards a switch where every case overwrites the slot before return
+move IShape dangleSwitchBothCasesOverwrite(int c)
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    switch (c)
+    {
+        case 1: { Square* a = new Square(); a.s = 9; r = a as IShape; break; }
+        default: { Square* b = new Square(); b.s = 9; r = b as IShape; break; }
+    }
+    return r;
+}
+
+// guards nested if/else where every leaf overwrites the slot
+move IShape dangleNestedIfAllLeavesOverwrite(int c)
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    if (c > 0)
+    {
+        if (c > 5) { Square* a = new Square(); a.s = 9; r = a as IShape; }
+        else { Square* b = new Square(); b.s = 9; r = b as IShape; }
+    }
+    else { Square* d = new Square(); d.s = 9; r = d as IShape; }
+    return r;
+}
+
+// guards an if/else-if chain that is exhaustive by arithmetic but not by CFG shape
+move IShape dangleIfElseIfChainExhaustiveByArithmetic(int c)
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    if (c > 0) { Square* a = new Square(); a.s = 9; r = a as IShape; }
+    else if (c <= 0) { Square* b = new Square(); b.s = 9; r = b as IShape; }
+    return r;
+}
+
+Square gDangleCorpusGlobal = default;
+
+// guards boxing a global lvalue (not the frame box) into an interface return
+IShape dangleGlobalBoxedSquare()
+{
+    gDangleCorpusGlobal.s = 9;
+    return gDangleCorpusGlobal as IShape;
+}
+
+// guards boxing a pointer parameter (passed by value, as pointers are) straight into the
+// return. A by-value STRUCT parameter ("Square p") boxed DIRECTLY ("return p as IShape;")
+// is REJECTED by this compiler, but routed through an intermediate local first
+// ("IShape r = p as IShape; return r;") it currently compiles and runs - that gap is the
+// open bug in internal/issue/interface-return-dangle-defeated-by-intermediate-local.md.
+IShape danglePointerParamDirect(Square* p)
+{
+    return p as IShape;
+}
+
+class SquareBox
+{
+    Square* sq = nullptr;
+};
+
+// guards a heap object reached through a by-value struct field held by a local
+move IShape dangleHeapFieldThroughLocalHolder()
+{
+    SquareBox hd;
+    hd.sq = new Square();
+    hd.sq.s = 9;
+    IShape r = hd.sq as IShape;
+    return r;
+}
+
+// guards a pointer parameter rebound through a local before the return
+IShape danglePtrParamThroughLocal(Square* p)
+{
+    IShape r = p as IShape;
+    return r;
+}
+
+// guards a straight-line heap pointer boxed into a local then returned unmodified
+move IShape dangleHeapPointerHeldInLocal()
+{
+    Square* h = new Square(); h.s = 9;
+    IShape r = h as IShape;
+    return r;
+}
+
+// guards a for-loop return that yields the heap box stored on the prior iteration
+// (attempt 3: incomplete CFG at emission time)
+move IShape dangleForLoopReturnPreviousIteration()
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    for (int i = 0; i < 2; i++)
+    {
+        if (i == 1) { return r; }
+        Square* h = new Square(); h.s = 9;
+        r = h as IShape;
+    }
+    return r;
+}
+
+// guards a while-loop return that yields the heap box stored on the prior iteration
+move IShape dangleWhileLoopReturnPreviousIteration()
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    int i = 0;
+    while (i < 5)
+    {
+        if (i > 0) { return r; }
+        Square* h = new Square(); h.s = 9;
+        r = h as IShape;
+        i++;
+    }
+    return r;
+}
+
+// guards a do/while-loop return that yields the heap box stored on the prior iteration
+move IShape dangleDoWhileLoopReturnPreviousIteration()
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    int i = 0;
+    do
+    {
+        if (i > 0) { return r; }
+        Square* h = new Square(); h.s = 9;
+        r = h as IShape;
+        i++;
+    } while (i < 5);
+    return r;
+}
+
+// guards a return from inside a nested loop that yields a prior outer-loop store.
+// "delete r" is guarded on i > 0: iteration 0's box would otherwise be dropped, unfreeable,
+// when iteration 1 overwrites r - proven with a dtor-counting mirror (ctor==dtor==3).
+move IShape dangleNestedLoopReturnFromInner()
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    for (int i = 0; i < 3; i++)
+    {
+        for (int j = 0; j < 2; j++) { if (i == 2) { return r; } }
+        Square* h = new Square(); h.s = 9;
+        if (i > 0) { delete r; }
+        r = h as IShape;
+    }
+    return r;
+}
+
+// guards a heap store already emitted where only the loop back-edge link was missing
+move IShape dangleLoopMissingBackedgeAnalysis()
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    for (int i = 0; i < 2; i++)
+    {
+        if (i == 0) { Square* h = new Square(); h.s = 9; r = h as IShape; }
+        else { return r; }
+    }
+    return r;
+}
+
+// same for-loop-previous-iteration shape but with a non-move return type
+IShape dangleForLoopReturnNonMoveType()
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    for (int i = 0; i < 2; i++)
+    {
+        if (i == 1) { return r; }
+        Square* h = new Square(); h.s = 9;
+        r = h as IShape;
+    }
+    return r;
+}
+
+// guards a return-after-store within the same loop iteration, reached on a later pass.
+// "delete r" is guarded on i > 0 for the same reason as dangleNestedLoopReturnFromInner -
+// proven with a dtor-counting mirror (ctor==dtor==3).
+move IShape dangleLoopReturnAfterStoreSameIteration()
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    for (int i = 0; i < 3; i++)
+    {
+        Square* h = new Square(); h.s = 9;
+        if (i > 0) { delete r; }
+        r = h as IShape;
+        if (i == 1) { return r; }
+    }
+    return r;
+}
+
+// guards a break out of the loop before the post-loop return of the last stored box
+move IShape dangleLoopBreakThenReturn()
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    for (int i = 0; i < 3; i++)
+    {
+        Square* h = new Square(); h.s = 9;
+        r = h as IShape;
+        if (i == 0) { break; }
+    }
+    return r;
+}
+
+// guards a while(true) loop whose body stores a heap box over the frame box, then breaks -
+// distinct from leg 21 (dangleLoopBreakThenReturn), which is a bounded for-loop, not while(true)
+move IShape dangleWhileTrueLoopStoreThenBreak()
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    while (true)
+    {
+        Square* h = new Square(); h.s = 9;
+        r = h as IShape;
+        break;
+    }
+    return r;
+}
+
+// guards a slot stored only inside a loop that may run zero times
+move IShape dangleLoopOnlyStoreMayRunZeroTimes(int n)
+{
+    IShape r = default;
+    for (int i = 0; i < n; i++) { Square* h = new Square(); h.s = 9; r = h as IShape; }
+    return r;
+}
+
+// Synthesized (not from a scratch/ repro): guards 3-level-deep nesting where one leaf is
+// itself a loop, not just a wider if/else (a bare alpha-rename of
+// dangleNestedIfAllLeavesOverwrite would collide with this shape otherwise - this one is a
+// level deeper and mixes a loop leaf in). The loop leaf's
+// "delete r" is guarded on i > 0 for the same reason as dangleNestedLoopReturnFromInner -
+// proven with a dtor-counting mirror (ctor==dtor==3).
+move IShape dangleDeepNestedIfLeavesAllOverwrite(int c, int d, int e)
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    if (c > 0) {
+        if (d > 0) {
+            if (e > 0) { Square* a = new Square(); a.s = 9; r = a as IShape; }
+            else {
+                for (int i = 0; i < 2; i++)
+                {
+                    Square* b = new Square(); b.s = 9;
+                    if (i > 0) { delete r; }
+                    r = b as IShape;
+                }
+            }
+        } else {
+            Square* g = new Square(); g.s = 9; r = g as IShape;
+        }
+    } else {
+        Square* h = new Square(); h.s = 9; r = h as IShape;
+    }
+    return r;
+}
+
+// guards a ?: initializer later rebound to a heap box before return.
+// h0 is NOT leaked on the path this leg exercises: the compiler emits a select over the
+// ternary and a cleanup that frees the chosen pointer, so h0 is freed when c > 0. Do not
+// "fix" it by adding "delete h0" - that is rejected outright ("its ownership was boxed
+// into an interface... delete through the interface instead") because the compiler treats
+// h0 as consumed by the ternary regardless of which arm runs. Shape is from the
+// verified-legal repro scratch/rev3/n7_ternary_rebound.cb.
+move IShape dangleTernaryInitializerReboundLater(int c)
+{
+    Square loc; loc.s = 3;
+    Square* h0 = new Square(); h0.s = 1;
+    IShape r = c > 0 ? (loc as IShape) : (h0 as IShape);
+    Square* h = new Square(); h.s = 9;
+    r = h as IShape;
+    return r;
+}
+
+// guards two interface locals over the same class where only one is ever returned
+move IShape dangleTwoInterfaceLocalsSameClass(int c)
+{
+    Square loc; loc.s = 3;
+    IShape a = loc as IShape;
+    Square* h = new Square(); h.s = 9;
+    IShape b = h as IShape;
+    if (c > 0) { return b; }
+    return b;
+}
+
+// guards an interface local declared and discarded in an inner scope before the real return
+move IShape dangleInnerScopeLocalDiscarded()
+{
+    { Square loc; loc.s = 3; IShape q = loc as IShape; }
+    Square* h = new Square(); h.s = 9;
+    IShape r = h as IShape;
+    return r;
+}
+
+// guards a slot-to-slot interface copy (one interface local assigned from another),
+// distinct from leg 26 which declares two locals but never copies one into the other
+move IShape dangleSlotToSlotInterfaceCopy()
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    Square* h = new Square(); h.s = 9;
+    IShape src = h as IShape;
+    r = src;
+    return r;
+}
+
+struct DangleShapeFieldHolder { IShape s = default; };
+
+// guards an interface value round-tripped through a struct field, distinct from leg 11
+// which holds a raw Square* field rather than an already-boxed IShape field
+move IShape dangleStructFieldRoundTrip()
+{
+    Square* h = new Square(); h.s = 9;
+    DangleShapeFieldHolder hd;
+    hd.s = h as IShape;
+    IShape r = hd.s;
+    return r;
+}
+
+int dangleUseShapeArg(IShape x) { return x.area(); }
+
+// guards an interface local passed as an argument before being returned
+move IShape dangleInterfaceLocalPassedAsArg()
+{
+    Square* h = new Square(); h.s = 9;
+    IShape r = h as IShape;
+    int q = dangleUseShapeArg(r);
+    return r;
+}
+
+// guards "return r;" from INSIDE a nested { } scope, where scope-exit emission meets the
+// return check; leg 27 opens an inner scope but returns outside it, this returns inside it
+move IShape dangleReturnFromNestedScope()
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    {
+        Square* h = new Square(); h.s = 9;
+        r = h as IShape;
+        return r;
+    }
+}
+
+// guards a bare "continue;" driving the loop back-edge (rev3/n4_loop_continue.cb, despite
+// its name, contains no continue statement - nothing else in the corpus does either).
+// "delete r" is guarded on i > 0 for the same reason as dangleNestedLoopReturnFromInner -
+// proven with a dtor-counting mirror (ctor==dtor==3).
+move IShape dangleLoopContinueThenReturnPrevious()
+{
+    Square loc; loc.s = 3;
+    IShape r = loc as IShape;
+    for (int i = 0; i < 3; i++)
+    {
+        if (i == 2) { return r; }
+        Square* h = new Square(); h.s = 9;
+        if (i > 0) { delete r; }
+        r = h as IShape;
+        continue;
+    }
+    return r;
+}
+
+// guards a "move" pointer parameter boxed directly into the return - no other leg has a
+// move-qualified parameter
+move IShape dangleAdoptMovePointerParam(move Square* p)
+{
+    return p as IShape;
+}
+
+bool testInterfaceReturnDangleCorpus()
+{
+    bool result = true;
+
+    IShape v01 = dangleThenArmEarlyReturn(0);
+    result &= Test("dangle_then_arm_early_return", v01.area(), 81);
+    delete v01;
+
+    IShape v02 = dangleElseArmReturn(0);
+    result &= Test("dangle_else_arm_return", v02.area(), 81);
+    delete v02;
+
+    IShape v03 = dangleSwitchCaseEarlyReturn(0);
+    result &= Test("dangle_switch_case_early_return", v03.area(), 81);
+    delete v03;
+
+    IShape v04 = dangleWhileLoopZeroIterations(0);
+    result &= Test("dangle_while_loop_zero_iterations", v04.area(), 81);
+    delete v04;
+
+    IShape v05 = dangleIfElseBothArmsOverwrite(1);
+    result &= Test("dangle_if_else_both_arms_overwrite", v05.area(), 81);
+    delete v05;
+
+    IShape v06 = dangleSwitchBothCasesOverwrite(1);
+    result &= Test("dangle_switch_both_cases_overwrite", v06.area(), 81);
+    delete v06;
+
+    IShape v07 = dangleNestedIfAllLeavesOverwrite(1);
+    result &= Test("dangle_nested_if_all_leaves_overwrite", v07.area(), 81);
+    delete v07;
+
+    IShape v08 = dangleIfElseIfChainExhaustiveByArithmetic(1);
+    result &= Test("dangle_if_elseif_chain_exhaustive_by_arithmetic", v08.area(), 81);
+    delete v08;
+
+    IShape v09 = dangleGlobalBoxedSquare();
+    result &= Test("dangle_global_boxed_square", v09.area(), 81);
+
+    Square* p10 = new Square(); p10.s = 9;
+    IShape v10 = danglePointerParamDirect(p10);
+    result &= Test("dangle_pointer_param_direct", v10.area(), 81);
+    delete p10;
+
+    IShape v11 = dangleHeapFieldThroughLocalHolder();
+    result &= Test("dangle_heap_field_through_local_holder", v11.area(), 81);
+    delete v11;
+
+    Square* p12 = new Square(); p12.s = 9;
+    IShape v12 = danglePtrParamThroughLocal(p12);
+    result &= Test("dangle_ptr_param_through_local", v12.area(), 81);
+    delete p12;
+
+    IShape v13 = dangleHeapPointerHeldInLocal();
+    result &= Test("dangle_heap_pointer_held_in_local", v13.area(), 81);
+    delete v13;
+
+    IShape v14 = dangleForLoopReturnPreviousIteration();
+    result &= Test("dangle_for_loop_return_previous_iteration", v14.area(), 81);
+    delete v14;
+
+    IShape v15 = dangleWhileLoopReturnPreviousIteration();
+    result &= Test("dangle_while_loop_return_previous_iteration", v15.area(), 81);
+    delete v15;
+
+    IShape v16 = dangleDoWhileLoopReturnPreviousIteration();
+    result &= Test("dangle_dowhile_loop_return_previous_iteration", v16.area(), 81);
+    delete v16;
+
+    IShape v17 = dangleNestedLoopReturnFromInner();
+    result &= Test("dangle_nested_loop_return_from_inner", v17.area(), 81);
+    delete v17;
+
+    IShape v18 = dangleLoopMissingBackedgeAnalysis();
+    result &= Test("dangle_loop_missing_backedge_analysis", v18.area(), 81);
+    delete v18;
+
+    IShape v19 = dangleForLoopReturnNonMoveType();
+    result &= Test("dangle_for_loop_return_non_move_type", v19.area(), 81);
+    delete v19;
+
+    IShape v20 = dangleLoopReturnAfterStoreSameIteration();
+    result &= Test("dangle_loop_return_after_store_same_iteration", v20.area(), 81);
+    delete v20;
+
+    IShape v21 = dangleLoopBreakThenReturn();
+    result &= Test("dangle_loop_break_then_return", v21.area(), 81);
+    delete v21;
+
+    IShape v22 = dangleWhileTrueLoopStoreThenBreak();
+    result &= Test("dangle_while_true_loop_store_then_break", v22.area(), 81);
+    delete v22;
+
+    IShape v23 = dangleLoopOnlyStoreMayRunZeroTimes(1);
+    result &= Test("dangle_loop_only_store_may_run_zero_times", v23.area(), 81);
+    delete v23;
+
+    IShape v24 = dangleDeepNestedIfLeavesAllOverwrite(1, 1, 0);
+    result &= Test("dangle_deep_nested_if_leaves_all_overwrite", v24.area(), 81);
+    delete v24;
+
+    IShape v25 = dangleTernaryInitializerReboundLater(1);
+    result &= Test("dangle_ternary_initializer_rebound_later", v25.area(), 81);
+    delete v25;
+
+    IShape v26 = dangleTwoInterfaceLocalsSameClass(1);
+    result &= Test("dangle_two_interface_locals_same_class", v26.area(), 81);
+    delete v26;
+
+    IShape v27 = dangleInnerScopeLocalDiscarded();
+    result &= Test("dangle_inner_scope_local_discarded", v27.area(), 81);
+    delete v27;
+
+    IShape v28 = dangleSlotToSlotInterfaceCopy();
+    result &= Test("dangle_slot_to_slot_interface_copy", v28.area(), 81);
+    delete v28;
+
+    IShape v29 = dangleStructFieldRoundTrip();
+    result &= Test("dangle_struct_field_round_trip", v29.area(), 81);
+    delete v29;
+
+    IShape v30 = dangleInterfaceLocalPassedAsArg();
+    result &= Test("dangle_interface_local_passed_as_arg", v30.area(), 81);
+    delete v30;
+
+    IShape v31 = dangleReturnFromNestedScope();
+    result &= Test("dangle_return_from_nested_scope", v31.area(), 81);
+    delete v31;
+
+    IShape v32 = dangleLoopContinueThenReturnPrevious();
+    result &= Test("dangle_loop_continue_then_return_previous", v32.area(), 81);
+    delete v32;
+
+    Square* p33 = new Square(); p33.s = 9;
+    IShape v33 = dangleAdoptMovePointerParam(move p33);
+    result &= Test("dangle_adopt_move_pointer_param", v33.area(), 81);
+    delete v33;
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -2747,6 +3345,7 @@ extern int main()
     total++; passed += testInterfaceNamedArguments()              ? 1 : 0;
     total++; passed += testNamespacedClassExplicitCtor()          ? 1 : 0;
     total++; passed += testNamespacedInterfaces()                ? 1 : 0;
+    total++; passed += testInterfaceReturnDangleCorpus()          ? 1 : 0;
     total++; passed += testNamespacedInterfaceShadowsCoreName()   ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
