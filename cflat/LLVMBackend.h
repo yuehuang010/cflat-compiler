@@ -1122,6 +1122,14 @@ public:
         bool OwnershipTransferred = false;
     };
 
+    /*
+     * Holds raw llvm::Value* and is never retired mid-function, so it depends on an invariant:
+     * any site that erases instructions mid-body must either be bracketed by SaveBuilderState /
+     * RestoreBuilderState (which clear and then overwrite this ledger) or be followed by the
+     * per-function clear before anything queries it. Every erasure site today satisfies that.
+     * Adding an unbracketed mid-function erasure would let a freed Value* be recycled and match
+     * a stale FrameStorage record - a spurious taint for RunInterfaceReturnDangleCheck.
+     */
     std::vector<InterfaceBoxRecord> interfaceBoxRecords_;
 
     void RegisterInterfaceBox(const InterfaceBoxRecord& record)
@@ -1148,6 +1156,45 @@ public:
         for (const auto& entry : interfaceBoxRecords_)
             if (entry.DataPointer == value && entry.Source == source) return &entry;
         return nullptr;
+    }
+
+    /*
+     * Deferred interface-return-dangle check (the "existential" attempt - see
+     * interface-return-dangle-defeated-by-intermediate-local.md). The emission-time value
+     * walk (FrameLocalDataOfFatValue in MainListener.h) deliberately stops at a load, so
+     * `IShape r = loc as IShape; return r;` reaches the return as a plain load with nothing
+     * to reject. Rather than ask "which store reaches this return" (unanswerable soundly at
+     * emission time - see the issue's abandoned attempts), this asks an EXISTENTIAL question
+     * once the function's CFG is complete: does the returned slot have any writer that is a
+     * frame box, AND no writer/user that proves the slot is not exclusively frame-boxed.
+     * Recorded per llvm::Function* (mirrors nullEventLog_), resolved at the same end-of-body
+     * hook as RunNullDerefDataflow, and dropped (not analyzed) on abort or leftover sweep.
+     */
+    struct PendingReturnDangleCheck
+    {
+        llvm::Function* Fn = nullptr;
+        llvm::AllocaInst* Slot = nullptr;
+        int Line = 0;
+        int Col = 0;
+        std::string InterfaceName;
+    };
+    std::unordered_map<llvm::Function*, std::vector<PendingReturnDangleCheck>> pendingReturnDangleChecks_;
+
+    void RecordPendingReturnDangleCheck(llvm::AllocaInst* slot, int line, int col,
+                                        const std::string& ifaceName)
+    {
+        if (!slot || !builder) return;
+        llvm::BasicBlock* bb = builder->GetInsertBlock();
+        if (!bb || !bb->getParent()) return;
+        pendingReturnDangleChecks_[bb->getParent()].push_back(
+            { bb->getParent(), slot, line, col, ifaceName });
+    }
+
+    // Drop a function's pending return-dangle checks without analyzing them (an aborted body
+    // has a partial CFG - same rationale as DiscardNullDerefEvents).
+    void DiscardPendingReturnDangleChecks(llvm::Function* F)
+    {
+        if (F) pendingReturnDangleChecks_.erase(F);
     }
 
     // Pointer SSA values detached by a `move` expression, keyed by value identity. A move nulls its
@@ -17997,6 +18044,109 @@ public:
             "dereference of moved variable '{}' (it is null after the move)", earliest->name));
     }
 
+    /*
+     * A store of null/undef/zero into the returned slot is ACCEPT evidence. Treating it as
+     * merely NEUTRAL was tried and rejected in review: it false-rejects legal programs that
+     * null the slot before returning (`r = probe as IShape; ...; r = nullptr; return r;`
+     * always returns null, yet the slot's only non-null writer is a frame box). That is the
+     * "does a frame box MAY-reach the return" question this design exists to avoid, arriving
+     * through the back door - the null store IS the CFG edge the rule refuses to look at.
+     * With this true the rule stays purely existential: reject only when EVERY writer of the
+     * slot is a frame box. The cost is missing a dangle in any function that also nulls the
+     * slot, which is today's behaviour and the acceptable side of the asymmetry.
+     */
+    static constexpr bool kNullStoreIsAcceptEvidence = true;
+
+    // Resolve the pending interface-return-dangle checks for ONE function as soon as its body
+    // is fully lowered (same hook as RunNullDerefDataflow, right beside it) - the CFG is
+    // complete, so every store to the slot exists and every back-edge is wired.
+    //
+    // For each pending record, this is an EXISTENTIAL question over the slot's COMPLETE
+    // use-list, never a reachability query: does the slot have a writer that is a frame box
+    // (TAINT), and does it have NO user that proves otherwise (ACCEPT evidence - a non-frame
+    // store, or any use this analysis does not explicitly recognize). Rejecting requires both
+    // taint AND a total absence of accept evidence; any unrecognized shape is accept evidence,
+    // so an unrecognized shape can only suppress a rejection, never manufacture one - a false
+    // rejection cannot come from missing a case.
+    void RunInterfaceReturnDangleCheck(llvm::Function* F)
+    {
+        if (!F) return;
+        auto it = pendingReturnDangleChecks_.find(F);
+        if (it == pendingReturnDangleChecks_.end()) return;
+        std::vector<PendingReturnDangleCheck> pending = std::move(it->second);
+        pendingReturnDangleChecks_.erase(it);
+
+        for (const auto& rec : pending)
+        {
+            if (!rec.Slot) continue;
+            bool tainted = false;
+            bool accepted = false;
+            std::string taintClassName;
+            for (llvm::User* u : rec.Slot->users())
+            {
+                if (llvm::isa<llvm::LoadInst>(u)) continue;
+                if (const auto* call = llvm::dyn_cast<llvm::CallBase>(u))
+                {
+                    // Only debug/lifetime markers are inert for a SLOT. Deliberately NOT
+                    // CallIsPointerOpaqueIntrinsic: that helper also admits llvm.mem*, which
+                    // is sound for its question (a pointer VALUE's escape) but not for this
+                    // one - a memcpy into the slot is a real write of a possibly non-frame
+                    // value, so it must fall through to accept.
+                    if (const llvm::Function* callee = call->getCalledFunction();
+                        callee != nullptr && (callee->getName().starts_with("llvm.dbg.")
+                            || callee->getName().starts_with("llvm.lifetime.")))
+                        continue;
+                    accepted = true;
+                    break;
+                }
+                if (auto* store = llvm::dyn_cast<llvm::StoreInst>(u))
+                {
+                    // The slot's ADDRESS stored elsewhere (not a store INTO the slot) is an
+                    // escape, not a write - fall through to the catch-all accept below.
+                    if (store->getPointerOperand() != rec.Slot) { accepted = true; break; }
+                    llvm::Value* v = store->getValueOperand();
+                    bool isNullish = llvm::isa<llvm::UndefValue>(v)
+                        || llvm::isa<llvm::ConstantAggregateZero>(v)
+                        || (llvm::isa<llvm::Constant>(v) && llvm::cast<llvm::Constant>(v)->isNullValue());
+                    if (isNullish)
+                    {
+                        if (kNullStoreIsAcceptEvidence) { accepted = true; break; }
+                        continue;
+                    }
+                    if (const InterfaceBoxRecord* box = FindInterfaceBoxByFatValue(v);
+                        box != nullptr && box->Source == InterfaceBoxSource::FrameStorage)
+                    {
+                        tainted = true;
+                        taintClassName = box->SourceClassName;
+                        continue;
+                    }
+                    // No ledger record at all, or Heap / Parameter / Global / Unknown, or a
+                    // load of another slot / call result / phi / argument - accept evidence.
+                    accepted = true;
+                    break;
+                }
+                // Any other user whatsoever - a call argument (handled above), a GEP with
+                // any non-load user, the address stored anywhere, memcpy/memmove, an
+                // AtomicRMW, anything not explicitly whitelisted above - accept.
+                accepted = true;
+                break;
+            }
+            if (!tainted || accepted) continue;
+
+            SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
+            if (taintClassName.empty())
+                LogError(std::format(
+                    "cannot return a local value as interface '{}' - the interface fat pointer "
+                    "would dangle once this function returns; allocate the object on the heap "
+                    "and return the pointer", rec.InterfaceName));
+            else
+                LogError(std::format(
+                    "cannot return local value '{}' as interface '{}' - the interface fat "
+                    "pointer would dangle once this function returns; allocate on the heap "
+                    "('new {}') and return the pointer", taintClassName, rec.InterfaceName, taintClassName));
+        }
+    }
+
     // Solve the MaybeMoved fixpoint per llvm::Function over the emitted module. This is the
     // source of truth for loop-carried / cross-block / switch use-after-move (the inline
     // linear checker owns straight-line + if/else and aborts before this runs). On any
@@ -18009,6 +18159,12 @@ public:
             for (auto& F : *module)
                 if (!F.isDeclaration() && !F.empty()) RunNullDerefDataflow(&F);
         nullEventLog_.clear();
+
+        // Leftover pending return-dangle checks belong to a function this pass never saw
+        // consumed at end-of-body - by module end interfaceBoxRecords_ no longer describes
+        // that function (it is cleared/parked per-function), so the ledger lookups the check
+        // depends on would be answering for the WRONG function. Drop them unanalyzed (accept).
+        pendingReturnDangleChecks_.clear();
 
         // Escape hatch: skip the pass entirely without a rebuild if it ever misfires.
         const char* off = std::getenv("CFLAT_MOVE_DF_OFF");

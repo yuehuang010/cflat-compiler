@@ -9,24 +9,169 @@ here in the same change.
 
 Last updated 2026-07-29.
 
+## HISTORICAL - attempt 4, now LANDED as `2bcc5a0`
+
+Kept for the design record only. The account below was written while the attempt was held;
+everything in it shipped, with two changes made during review - the `llvm.mem*` fix listed as
+"still owed" item 1, and the null-store knob (item 3) resolved to `true`, not `false`. See the
+"Closed in the 2026-07-29 session" entry for what actually landed and why the knob flipped.
+
+<details>
+<summary>Original in-flight notes</summary>
+
+## IN FLIGHT - attempt 4 at the queue head, DELIBERATELY HELD
+
+Status as of 2026-07-29: **paused by the maintainer until the API tier recovers.** Do not
+restart this from scratch - the design work and the test infrastructure are done and are the
+expensive part. Pick up from here.
+
+**The design (new, and materially different from attempts 1-3).** Consulted Fable, then
+verified its load-bearing claims directly against the code. The move that makes it different:
+**it never asks reachability.** Attempts 1-3 all tried to answer "which store REACHES this
+return", which is unanswerable soundly at emission time. Attempt 4 defers the check to a point
+where the function's CFG is COMPLETE, then asks a purely EXISTENTIAL question over the
+complete use-list of the returned local's alloca: "does any writer of this slot exist that is
+not a frame box?" There is no notion of "reaches", so neither killing failure mode can recur -
+the loop case (attempt 3) cannot, because all stores exist by then; the
+`if (c>0) else if (c<=0)` case cannot, because the rule never asks whether the non-frame store
+reaches the return, only that it EXISTS.
+
+Rule: enumerate every user of the slot. Reject iff at least one store is a ledger-confirmed
+`Source == FrameStorage` box AND there is ZERO accept evidence. Loads and dbg/lifetime
+intrinsics are neutral; a null/zero store is neutral (the one deliberate accept-bias knob, to
+be kept behind a single named switch); **every other user whatsoever - a store with no ledger
+record, a `Heap`/`Parameter`/`Global`/`Unknown` record, a call argument, an address escape, a
+memcpy, anything unrecognised - ACCEPTS and stops the walk.**
+
+Soundness argument: rejection requires positive whitelisted evidence for every writer and
+escape. Therefore EVERY class of missing information - an unseen shape, an unrouted boxing
+site, an unclassifiable store, ledger incompleteness from
+[[interface-boxing-guards-are-binding-dependent]] - lands on ACCEPT. Only a positive
+misclassification could flip it, and see the `FrameStorage` row below for why that cannot
+happen.
+
+**Facts verified by hand (do NOT re-derive these):**
+
+| Claim | Verified |
+|---|---|
+| Post-emission hook with a working twin | `RunNullDerefDataflow`, called at `MainListener.h:7574`; CFG complete there |
+| Abort path already discards partial CFGs | `MainListener.h:7537` (`DiscardNullDerefEvents`) |
+| Ledger alive at that hook, per-function | cleared `LLVMBackend.h:3462`; parked/restored 8991 / 9018 |
+| **Viability probe** - the fat value is ONE aggregate store, not field-wise GEP stores, so the whitelist can see it | `CreateAssignment` (`LLVMBackend.h:13742`) returns a single `llvm::StoreInst*` |
+| No zero-init of locals, so an initialised interface local has no spurious null store (this would have made the pass vacuous) | no memset/zero store in `CreateLocalVariable` (`LLVMBackend.h:13591`) |
+| **`FrameStorage` cannot be over-stamped** - the one thing that could flip the rule toward rejection | `ClassifyInterfaceBoxSource` stamps it only when the dataPtr, after stripping casts and GEPs, IS an `AllocaInst`; `Square* p = new Square()` arrives as a LOAD of p's slot, so it classifies `Heap`. A true statement about storage, not an inference. |
+| The slot's address cannot escape via source | `IShape*` is rejected by the front end ("pointer '*' is not allowed on interface type") - whitelist escapes anyway, synthesized/lambda paths may still do it |
+| The return path already resolves the slot | `retStorage`, `MainListener.h:5870-5872` |
+
+Rejected alternative, recorded so it is not retried: a SOURCE-level "tainted binding" property.
+It requires observing every assignment site to interface locals, so a missed site produces a
+FALSE REJECTION - the wrong polarity, and this family's documented disease is exactly that
+assignment sites drift. Ground the rule in the finished IR's use-list instead, where
+completeness is a property of LLVM's def-use graph rather than of the compiler having
+remembered to log something.
+
+**Artifacts in place:**
+
+- Worktree `../cflat-fix-return-dangle-4`, branch `fix/return-dangle-existential` (off
+  `888455e`). The full written spec - anchors, rule, test list, process rules - is at
+  `scratch/SPEC.md` in that worktree. **Read it before resuming.**
+- Positive corpus: `scratch/rev4/positive/`, 21 files, **21/21 green on master**, with a
+  `run.sh` that resolves its own directory so any worktree can run it as
+  `run.sh <path-to-cflat>`. Covers the prior attempts' killing shapes PLUS the boxing SOURCES
+  the in-tree corpus does not (fat parameter, global, `(new Square()) as IShape`, owning
+  pointer local, call result, `?:` join of two heap arms, copy chain, `return move r;`).
+- Implementation: **WRITTEN, UNCOMMITTED, PARTIALLY REVIEWED.** 182 insertions across
+  `cflat/LLVMBackend.h` (the pass + the pending-record store), `cflat/LLVMBackend.cpp`
+  (`ResetForReanalysis` hygiene), `cflat/MainListener.h` (record site + discard + hook), and
+  two new scoped-block legs in the EXISTING `Test/errors/err_return_interface_value.cb`.
+  Three opus attempts died on transient 529s before their first tool round; the delivered work
+  is from a sonnet run against the spec, with the main session owning soundness.
+
+**Verified by hand in the main session (not taken from the agent's report):**
+
+| Check | Result |
+|---|---|
+| Suite on the NEW binary | 522 passed / 0 failed / 8 skipped |
+| Suite on MASTER, re-run to establish the true baseline | **also 522** - so no regression, and the queue's earlier "520" figure was STALE. Corrected. |
+| Positive corpus (21 files) on the new binary | 21 / 0 |
+| Regression test is NON-VACUOUS | new binary exit 0; **master exit 1** with "FAIL: expected error ... did not occur". A real tripwire, not a test that passes either way. |
+| `Test/test_interface.cb` (the 33 `dangle*` functions) | compiles, runs, 56/56, untouched |
+| Suite count cannot confirm the new test fires | correct - the legs went into an EXISTING file, so the count is unchanged by design. That is why the master-exit-1 check above was needed. |
+
+**CONFIRMED DEFECT found in the main session's own read - fix this FIRST on resume.** The pass
+treats any call user satisfying `CallIsPointerOpaqueIntrinsic` as NEUTRAL, and that predicate
+(`LLVMBackend.h:2734`) covers `llvm.dbg.*`, `llvm.lifetime.*` **and `llvm.mem*`**. A
+`llvm.memcpy` whose DESTINATION is the slot is a real write of a possibly-non-frame value, so
+treating it as neutral can produce a FALSE REJECTION - the exact failure class that killed
+attempts 1-3. Two things make this a textbook instance of a hazard already in this file's
+working notes:
+
+- The helper's contract is about a POINTER VALUE's escape ("touch the POINTEE, never the
+  pointer value itself"), which is sound for its original caller at `LLVMBackend.h:2605` - and
+  that caller correctly special-cases `llvm.mem*`. The new pass asks a DIFFERENT question,
+  about writes to a SLOT, and for that question touching the pointee IS the write. Reusing the
+  helper silently changed its meaning. (Working note: "when an agent cites a justification,
+  check it still holds AFTER the change it is justifying.")
+- The codebase already knew: the sibling `AllocaIsLoadStoreOnly` comments that for a slot
+  "Only debug/lifetime markers are inert here: llvm.mem* would copy the parked" pointer.
+
+Severity: **LATENT, not demonstrated.** Only 4 `CreateMemCpy` sites exist, and the array-element
+seeding one (`MainListener.h:8308`) writes through a GEP, which the catch-all already accepts -
+so no reachable false rejection was found today. It must still be fixed, because the invariant
+the WHOLE design rests on is "any unrecognized user accepts", and this is a hole in exactly that
+invariant. Fix is one line and strictly accept-biased: in the pass, treat only `llvm.dbg.*` and
+`llvm.lifetime.*` as neutral and let everything else, `llvm.mem*` included, fall to accept. Do
+NOT change the shared helper - its other caller depends on the current contract.
+
+Sequencing note: master's working tree was deliberately left pristine (only `.md` edits) because
+`x64/Release/cflat` is the reference binary the corpus and the review both compare against.
+Fable's zero-risk recommendation to extend `LogInterfaceReturnDangle`'s wording with "binding the
+value to a local first does not extend its lifetime" - so the direct diagnostic stops teaching
+the laundering workaround - is therefore NOT yet applied. It is worth shipping on its own even
+if the pass never lands, and is the honest fallback if attempt 4 also fails.
+
+**Still owed when work resumes, in this order:**
+
+1. The one-line `llvm.mem*` fix above.
+2. The ADVERSARIAL review, which has NOT run - the checks above are the main session's own read
+   plus mechanical verification, not an independent adversarial pass. Its explicit hunt is a
+   legal program turned red. Every round of this work has found a confirmed defect, and this
+   round already found one before the review even started; do not skip it.
+3. Decide the `kNullStoreIsAcceptEvidence` knob (`LLVMBackend.h`, currently `false` = null store
+   is neutral). Consequence of `false`: `IShape r; if (c) r = loc as IShape; return r;` is
+   rejected. That is a true conditional dangle and parity with the direct guard, but it is the
+   deliberate accept-bias knob and review should weigh it explicitly rather than inherit it.
+4. Only then consider whether `FrameLocalDataOfFatValue` can be reduced to a fallback, as the
+   fix direction suggests. Not part of this change.
+
+</details>
+
 ## Resume point
 
 - master is the closure-parameter lowering fix (`df32dd8`), linear, tree clean. The
   primitive-array boxing fix sits on top of it.
-- Full verification re-run on macOS with that fix: **520 passed / 0 failed / 8 skipped**,
+- Full verification re-run on macOS with that fix: **522 passed / 0 failed / 8 skipped**,
   examples **35 / 0**. (Baseline at `df32dd8` was 518/0/8; the new error test adds two, cold
   and warm cache.) LSP was NOT re-run - it is Windows-only.
-- Queue head is STILL [[interface-return-dangle-defeated-by-intermediate-local]] - the
-  primitive-array fix did not touch it - the LAST member of the `as`/`is` family still open. **It was ATTEMPTED on 2026-07-29 and ABANDONED after
-  three analyses each rejected legal programs; read that file's abandoned-attempt section
-  before touching it.** An earlier note here called it "the cheapest it will ever be, a
-  lookup replacing an IR walk" - that was wrong. The ledger answers what a value IS; the
-  hard part is which store REACHES the return, and that cannot be answered soundly while
-  the function is still being emitted. The attempt is preserved on branch
-  `fix/return-dangle-provenance` (`f39410e`, worktree `../cflat-fix-return-dangle`) with its
-  repro corpus in `scratch/rev*/`.
-- Note for this whole family: all three failed attempts passed the suite at 512/0/8. A green
-  suite does not detect a false rejection here - no in-repo `.cb` uses the shapes involved.
+  - This figure was recorded as 520 and was WRONG; `./test.sh Release` on `888455e` measures
+    **522** - re-measured 2026-07-29. Trust a fresh run over any number written here.
+- **The return-dangle issue is CLOSED** (`2bcc5a0`) and with it the LAST member of the
+  `as`/`is` family. There is no obvious next queue head - pick from the open tables below by
+  severity. `[[generic-interface-registered-as-opaque-struct]]` is the largest remaining
+  functional gap (`IFace<T>` unusable in most positions).
+- Artifacts of the ABANDONED attempts 1-3 are now DELETED: branch
+  `fix/return-dangle-provenance` (`f39410e`) and its worktree `../cflat-fix-return-dangle`
+  are gone (2026-07-29). Its lesson is preserved above and in the
+  landed commit message: the ledger answers what a value IS, but which store REACHES the
+  return cannot be answered soundly while the function is still being emitted - which is
+  precisely why the fix that worked defers to a complete CFG and never asks reachability.
+- Note for this whole family: all three failed attempts passed the suite at 512/0/8, because
+  no in-repo `.cb` used the shapes involved. **That gap is now CLOSED by `3726a75`** - 33
+  `dangle*` functions in `Test/test_interface.cb` (run from
+  `testInterfaceReturnDangleCorpus()`, line 3500) cover every shape in the abandoned-attempt
+  table, and a false rejection is a compile error, so the suite DOES detect one now. Do not
+  repeat the old "a green suite proves nothing" claim unqualified; and if that file stops
+  compiling, the analysis is wrong, not the test.
 - The `as`/`is` family is otherwise DONE: routing (2 issues) and boxing guards (2 issues) are
   closed. What remains under `as` are the follow-ups those fixes surfaced, all of which are
   PLAIN-path or diagnostic-quality rather than `as` defects.
@@ -42,6 +187,43 @@ Last updated 2026-07-29.
   reopen it.
 
 ## Closed in the 2026-07-29 session
+
+- **A return-dangle laundered through an intermediate interface local was accepted** - fixed
+  as `2bcc5a0`, closing `interface-return-dangle-defeated-by-intermediate-local` on the FOURTH
+  attempt after three abandonments. The whole difference is that it **never asks reachability**.
+  The return records the slot; the answer is resolved at the end-of-body hook beside
+  `RunNullDerefDataflow`, where the CFG is complete, as an existential question over the slot's
+  complete use-list. Rejection requires positive whitelisted evidence for EVERY writer, so
+  every class of missing information lands on ACCEPT and cannot produce a false rejection -
+  which is what killed attempts 1-3.
+  - **The null-store knob resolved to `true` (accept evidence), NOT the `false` the design
+    shipped with.** Review found four confirmed false rejections under `false`, and the reason
+    is the reusable lesson: a slot that is frame-boxed and then nulled before the return cannot
+    dangle, so treating the null store as merely NEUTRAL is the "does a frame box MAY-reach the
+    return" question - the exact thing that killed attempt 2 - **re-entering through the back
+    door**. The null store IS the CFG edge the rule refuses to look at. Under `true` the rule
+    stays purely existential: reject only when EVERY writer is a frame box. The flip is
+    provably monotone (the flag is read in one place and only ever sets `accepted = true`), so
+    it cannot manufacture a rejection.
+  - **Do not reuse a predicate across a change of question.** The pass first used
+    `CallIsPointerOpaqueIntrinsic` for its neutral set; that helper also admits `llvm.mem*`,
+    which is sound for ITS question (a pointer VALUE's escape) and wrong for this one, where a
+    memcpy into the slot is a real write. The codebase already knew - sibling
+    `AllocaIsLoadStoreOnly` comments exactly this. Latent, not demonstrated, and fixed anyway
+    because the whole design rests on "any unrecognized user accepts".
+  - `interfaceBoxRecords_` holds raw `llvm::Value*` and is never retired mid-function. Review
+    traced all 9 erasure sites and found the invariant holds today (each is either bracketed by
+    `SaveBuilderState`/`RestoreBuilderState`, which clear the ledger, or followed by the
+    per-function clear before any query). It is now stated at the declaration, because an
+    unbracketed mid-function erasure added later would let a freed `Value*` be recycled into a
+    spurious taint - a FALSE REJECTION mechanism.
+  - Residue filed as [[return-dangle-missed-when-slot-has-extra-user]]: any extra user of the
+    slot (notably a method dispatch through it) is accept evidence, so `r.area()` misses the
+    dangle where `measure(r)` catches it. Pre-existing behaviour, and widening the whitelist to
+    fix it is the direction that produced the earlier false rejections.
+  - Two review rounds, both at opus, ~60 adversarial legal programs on top of the 21-file
+    corpus. Round 1 found the blocker; round 2 was clean. The corpus and the spec are preserved
+    at `scratch/rev4/` (`positive/`, `review/`, `SPEC.md`) in the main checkout.
 
 - **A primitive-element array boxed into an interface was accepted and miscompiled** -
   fixed, closing `global-primitive-array-boxed-into-interface`. The real mechanism is
@@ -101,9 +283,11 @@ Last updated 2026-07-29.
     because `IsOwningValue` answers only a `LoadInst` and reading its `false` as "not owned" is
     precisely what produced the original false rejection. `move` parameters, direct `new` arms and
     move-returning call results were all re-verified as still accepted.
-  - The dangle gap of [[interface-return-dangle-defeated-by-intermediate-local]] applies to this
-    shape too and was deliberately left alone: `Square a; Square* p = &a; return c ? p : q;`
-    boxes and compiles, exactly as the non-ternary `return p;` does today.
+  - The dangle gap applied to this shape too and was deliberately left alone at the time:
+    `Square a; Square* p = &a; return c ? p : q;` boxes and compiles, exactly as the
+    non-ternary `return p;` did. **Still true after `2bcc5a0`** - that fix keys off a
+    ledger-confirmed `FrameStorage` box stored into the returned SLOT, and here the frame
+    address arrives through a pointer local, which classifies as a load rather than an alloca.
   - A DIRECT `&local` arm names no class, so it is now rejected by the arm-boxing diagnostic
     rather than the dangle one. A rejection either way; the wording is about the wrong thing.
 
@@ -223,7 +407,7 @@ Last updated 2026-07-29.
 | [[generic-interface-registered-as-opaque-struct]] | LLVM verifier failure + false rejections. `IFace<T>` unusable in most positions. |
 | [[interface-boxing-guards-are-binding-dependent]] | Double free (exit 134). Parens or `?:` erase the binding the guards key off. |
 | [[generic-interface-namespace-scope-limit]] | Silent miscompile. DELIBERATE scope limit of `c9acb6c`, recorded so it is not lost. |
-| [[interface-return-dangle-defeated-by-intermediate-local]] | Dangling fat pointer, no diagnostic. Both spellings. QUEUE HEAD. |
+| [[return-dangle-missed-when-slot-has-extra-user]] | Missed dangle, no diagnostic. Residue of `2bcc5a0`; pre-existing, and NOT to be fixed by widening the whitelist. |
 | [[iface-call-does-no-argument-type-matching]] | Silent miscompile then SIGBUS. An `int` reaches a closure slot; the direct path rejects it. |
 | [[function-array-body-silently-truncated]] | Silent miscompile, exit 133. NOT interface-related; filed here because it has no other queue. |
 | [[nondeterministic-ir-switch-case-order]] | No miscompile - a METHODOLOGY hazard. NOT interface-related; listed here for the same reason as the row above: it is the only index. Read it before using "0 IR diffs" as proof. |

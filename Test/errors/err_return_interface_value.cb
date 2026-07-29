@@ -44,3 +44,18 @@ expect_error("cannot return interface value 'IShape' from a function declared to
     move IShape makeOwned() { Square* sq = new Square(); return sq; }
     Square* makeBad() { IShape s = makeOwned(); return s; }
 }
+
+// An intermediate local defeats the emission-time value-walk: `return r;` is a plain load
+// of r's slot, so the walk stops before it ever sees the boxing site. This is caught by a
+// DEFERRED pass over the finished function's complete use-list of r's slot instead (see
+// interface-return-dangle-defeated-by-intermediate-local.md) - hence the scoped-block form
+// here rather than the bare-semicolon form, which only covers errors raised before the
+// function's compound statement finishes closing.
+expect_error("cannot return local value 'Square' as interface 'IShape'") {
+    IShape viaLocal(int n) { Square loc; loc.s = n; IShape r = loc as IShape; return r; }
+}
+
+// Same shape via the plain (non-`as`) spelling.
+expect_error("cannot return local value 'Square' as interface 'IShape'") {
+    IShape viaLocalPlain(int n) { Square loc; loc.s = n; IShape r = loc; return r; }
+}

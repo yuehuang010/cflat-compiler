@@ -72,4 +72,9 @@ Route the two remaining open-coded sites (assignment-statement, call-argument) t
 ## Related
 
 [[interface-boxing-guards-are-binding-dependent]],
-[[interface-return-dangle-defeated-by-intermediate-local]], [[interface-issue-queue]]
+[[return-dangle-missed-when-slot-has-extra-user]], [[interface-issue-queue]]
+
+The return-dangle issue this used to link (`interface-return-dangle-defeated-by-intermediate-local`)
+was closed by `2bcc5a0`. Its residue above is the live successor, and consolidating the two
+remaining open-coded boxing sites is the prerequisite for the provenance-based fix that
+residue calls for.

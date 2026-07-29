@@ -2522,6 +2522,9 @@ void LLVMBackend::ResetForReanalysis()
     // Same hazard for the cross-block half: a stale event log from an aborted compile would
     // misattribute the next file's deref diagnostic.
     nullEventLog_.clear();
+    // Same hazard as nullEventLog_: a pending check from an aborted compile keys off a slot
+    // in the module being discarded and must not survive into the next file's analysis.
+    pendingReturnDangleChecks_.clear();
     provenNoReturn_.clear();
     // Sibling of lastCallIsBonded: a per-call bond flag that, if left set by an aborted compile,
     // would mark the next file's first bonded value as by-address.

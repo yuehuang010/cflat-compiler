@@ -5882,6 +5882,28 @@ public:
                         llvm::AllocaInst* returnedFatFrameSlot =
                             right != nullptr && right->getType() == compiler->GetFatPtrType()
                                 ? FrameLocalDataOfFatValue(right) : nullptr;
+                        /*
+                         * DEFERRED existential check for the shape the walk above cannot see:
+                         * `IShape r = loc as IShape; return r;` arrives here as a plain load of
+                         * r's slot, with returnedFatFrameSlot null (the walk stops at loads by
+                         * design). Record the slot now - the answer is resolved once this
+                         * function's body is fully lowered and its CFG is complete
+                         * (RunInterfaceReturnDangleCheck, called from the same hook as
+                         * RunNullDerefDataflow), not here.
+                         */
+                        if (right != nullptr && compiler->currentFunction != nullptr
+                            && compiler->currentFunction->getReturnType() == compiler->GetFatPtrType()
+                            && right->getType() == compiler->GetFatPtrType()
+                            && returnedFatFrameSlot == nullptr)
+                        {
+                            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(right))
+                                if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(
+                                        load->getPointerOperand()->stripPointerCasts()))
+                                    compiler->RecordPendingReturnDangleCheck(
+                                        slot, static_cast<int>(jump->getStart()->getLine()),
+                                        static_cast<int>(jump->getStart()->getCharPositionInLine()),
+                                        compiler->currentFunctionReturnTypeName);
+                        }
                         if (auto* fatTy = compiler->GetFatPtrType();
                             right != nullptr && fatTy != nullptr && compiler->currentFunction != nullptr
                             && compiler->currentFunction->getReturnType() == fatTy
@@ -7535,6 +7557,9 @@ public:
                     // The body was aborted mid-way: its CFG is partial, so its null-state log
                     // must be dropped rather than analyzed by the end-of-module sweep.
                     compiler->DiscardNullDerefEvents(fn);
+                    // Same reasoning for pending return-dangle checks: a partial CFG cannot
+                    // answer the existential use-list question soundly.
+                    compiler->DiscardPendingReturnDangleChecks(fn);
                     expectErrorHandled = true;
                 }
                 else
@@ -7572,6 +7597,10 @@ public:
             // The body's CFG is complete - solve the MAY-null fixpoint here so the error still
             // lands inside an enclosing scoped expect_error rather than at end-of-module.
             compiler->RunNullDerefDataflow(fn);
+
+            // Same reasoning, for the deferred interface-return-dangle existential check: the
+            // slot's use-list is only complete once the body is fully lowered.
+            compiler->RunInterfaceReturnDangleCheck(fn);
         }
 
         if (isAutoReturn)
