@@ -49,7 +49,7 @@ diagnostic. Either honour type arguments on an interface parent or reject them.
   `MangledGenericName` while templates stay bare-keyed). Before: parse error.
 
 Both still reject, so no accept-set damage - but the widening advertises capability that
-does not exist. See [[generic-template-namespace-key-space]].
+does not exist. See [[interface-issue-queue]] (landed design records).
 
 ## 5. LOW - annotation key / template key split for a namespaced generic interface
 
@@ -68,4 +68,4 @@ the Windows `[winrt]` / `[uuid]` path.
 `PASS: expected error received` TWICE (the forward scan and the codegen walk both
 register), then links. Cosmetic.
 
-Related: [[generic-template-namespace-key-space]], [[interface-issue-queue]]
+Related: [[interface-issue-queue]] (landed design records), [[interface-issue-queue]]

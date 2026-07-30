@@ -56,8 +56,8 @@ source-level "tainted binding" property was explicitly rejected for the ORIGINAL
 see the deleted issue file's history in the queue - because a missed assignment site
 produces a false rejection. Any attempt here must solve that first: it needs every
 assignment site to interface locals to be observable, which
-[[interface-boxing-sites-not-fully-consolidated]] is the prerequisite for.
+[[interface-boxing-keyed-on-source-binding]] is the prerequisite for.
 
 Until then this is a known, bounded gap and should stay filed rather than patched.
 
-Related: [[interface-issue-queue]], [[interface-boxing-guards-are-binding-dependent]].
+Related: [[interface-issue-queue]], [[interface-boxing-keyed-on-source-binding]].

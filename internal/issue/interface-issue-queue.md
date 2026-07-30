@@ -1,858 +1,598 @@
-# Interface issue queue
+# Issue queue
 
-The tracker for the interface-related entries in `internal/issue/`. Two files already
-linked `[[interface-issue-queue]]` before this existed; this is that file.
+The index for `internal/issue/`. Started as an interface-only tracker and is now the index for
+everything here - several entries below say "filed here because it has no other queue", which
+is why the family headings replaced the old interface-first framing.
 
-Not a separate issue - an index. Each row points at the file that owns the detail.
-When an issue is fixed its file is deleted (the repo convention), so delete its row
-here in the same change.
+Not an issue itself, and **the only non-issue file in this directory**. Each row points at the
+file that owns the detail. When an issue is fixed its file is deleted (the repo convention);
+delete its row here in the same change. `internal/issue/` holds ACTIVE items only.
 
-Last updated 2026-07-29 (namespace key space: fixed, reviewed, uncommitted).
+Layout: every issue file lives in a subfolder - **[`p1/`](p1/)**, **[`p2/`](p2/)**,
+**[`p3/`](p3/)** by fix priority (P1 highest), plus **[`ui/`](ui/)** for the separate UI / Win32 /
+WinRT track, which gates no compiler work and is not ranked against them. This file is the only
+thing at the top level. Every file is indexed below; when you re-bucket a row, `git mv` the file
+in the same edit.
 
-## HISTORICAL - attempt 4, now LANDED as `2bcc5a0`
+Two things deliberately live elsewhere:
 
-Kept for the design record only. The account below was written while the attempt was held;
-everything in it shipped, with two changes made during review - the `llvm.mem*` fix listed as
-"still owed" item 1, and the null-store knob (item 3) resolved to `true`, not `false`. See the
-"Closed in the 2026-07-29 session" entry for what actually landed and why the knob flipped.
+- **Durable, cross-cutting lessons** - how to review, how to sequence rounds, guard polarity,
+  what to distrust in an agent report - are in
+  [`internal/fix-issue-lessons.md`](../fix-issue-lessons.md). They outlive any one issue, so
+  deleting a fixed issue must not delete them.
+- **Suite mechanics** (SKIP list, warm-cache pass, the `--init` serializer rule) are in
+  [`internal/testing-notes.md`](../testing-notes.md).
 
-<details>
-<summary>Original in-flight notes</summary>
+What stays HERE besides the index: the **landed design records** at the bottom - the account of
+why the shipped code has the shape it does, which approaches must not be retried, and every
+ratified behaviour change that future work must not "fix" back. That section is the convergence
+point for the interface/generics work and is the reason this file is long.
 
-## IN FLIGHT - attempt 4 at the queue head, DELIBERATELY HELD
-
-Status as of 2026-07-29: **paused by the maintainer until the API tier recovers.** Do not
-restart this from scratch - the design work and the test infrastructure are done and are the
-expensive part. Pick up from here.
-
-**The design (new, and materially different from attempts 1-3).** Consulted Fable, then
-verified its load-bearing claims directly against the code. The move that makes it different:
-**it never asks reachability.** Attempts 1-3 all tried to answer "which store REACHES this
-return", which is unanswerable soundly at emission time. Attempt 4 defers the check to a point
-where the function's CFG is COMPLETE, then asks a purely EXISTENTIAL question over the
-complete use-list of the returned local's alloca: "does any writer of this slot exist that is
-not a frame box?" There is no notion of "reaches", so neither killing failure mode can recur -
-the loop case (attempt 3) cannot, because all stores exist by then; the
-`if (c>0) else if (c<=0)` case cannot, because the rule never asks whether the non-frame store
-reaches the return, only that it EXISTS.
-
-Rule: enumerate every user of the slot. Reject iff at least one store is a ledger-confirmed
-`Source == FrameStorage` box AND there is ZERO accept evidence. Loads and dbg/lifetime
-intrinsics are neutral; a null/zero store is neutral (the one deliberate accept-bias knob, to
-be kept behind a single named switch); **every other user whatsoever - a store with no ledger
-record, a `Heap`/`Parameter`/`Global`/`Unknown` record, a call argument, an address escape, a
-memcpy, anything unrecognised - ACCEPTS and stops the walk.**
-
-Soundness argument: rejection requires positive whitelisted evidence for every writer and
-escape. Therefore EVERY class of missing information - an unseen shape, an unrouted boxing
-site, an unclassifiable store, ledger incompleteness from
-[[interface-boxing-guards-are-binding-dependent]] - lands on ACCEPT. Only a positive
-misclassification could flip it, and see the `FrameStorage` row below for why that cannot
-happen.
-
-**Facts verified by hand (do NOT re-derive these):**
-
-| Claim | Verified |
-|---|---|
-| Post-emission hook with a working twin | `RunNullDerefDataflow`, called at `MainListener.h:7574`; CFG complete there |
-| Abort path already discards partial CFGs | `MainListener.h:7537` (`DiscardNullDerefEvents`) |
-| Ledger alive at that hook, per-function | cleared `LLVMBackend.h:3462`; parked/restored 8991 / 9018 |
-| **Viability probe** - the fat value is ONE aggregate store, not field-wise GEP stores, so the whitelist can see it | `CreateAssignment` (`LLVMBackend.h:13742`) returns a single `llvm::StoreInst*` |
-| No zero-init of locals, so an initialised interface local has no spurious null store (this would have made the pass vacuous) | no memset/zero store in `CreateLocalVariable` (`LLVMBackend.h:13591`) |
-| **`FrameStorage` cannot be over-stamped** - the one thing that could flip the rule toward rejection | `ClassifyInterfaceBoxSource` stamps it only when the dataPtr, after stripping casts and GEPs, IS an `AllocaInst`; `Square* p = new Square()` arrives as a LOAD of p's slot, so it classifies `Heap`. A true statement about storage, not an inference. |
-| The slot's address cannot escape via source | `IShape*` is rejected by the front end ("pointer '*' is not allowed on interface type") - whitelist escapes anyway, synthesized/lambda paths may still do it |
-| The return path already resolves the slot | `retStorage`, `MainListener.h:5870-5872` |
-
-Rejected alternative, recorded so it is not retried: a SOURCE-level "tainted binding" property.
-It requires observing every assignment site to interface locals, so a missed site produces a
-FALSE REJECTION - the wrong polarity, and this family's documented disease is exactly that
-assignment sites drift. Ground the rule in the finished IR's use-list instead, where
-completeness is a property of LLVM's def-use graph rather than of the compiler having
-remembered to log something.
-
-**Artifacts in place:**
-
-- Worktree `../cflat-fix-return-dangle-4`, branch `fix/return-dangle-existential` (off
-  `888455e`). The full written spec - anchors, rule, test list, process rules - is at
-  `scratch/SPEC.md` in that worktree. **Read it before resuming.**
-- Positive corpus: `scratch/rev4/positive/`, 21 files, **21/21 green on master**, with a
-  `run.sh` that resolves its own directory so any worktree can run it as
-  `run.sh <path-to-cflat>`. Covers the prior attempts' killing shapes PLUS the boxing SOURCES
-  the in-tree corpus does not (fat parameter, global, `(new Square()) as IShape`, owning
-  pointer local, call result, `?:` join of two heap arms, copy chain, `return move r;`).
-- Implementation: **WRITTEN, UNCOMMITTED, PARTIALLY REVIEWED.** 182 insertions across
-  `cflat/LLVMBackend.h` (the pass + the pending-record store), `cflat/LLVMBackend.cpp`
-  (`ResetForReanalysis` hygiene), `cflat/MainListener.h` (record site + discard + hook), and
-  two new scoped-block legs in the EXISTING `Test/errors/err_return_interface_value.cb`.
-  Three opus attempts died on transient 529s before their first tool round; the delivered work
-  is from a sonnet run against the spec, with the main session owning soundness.
-
-**Verified by hand in the main session (not taken from the agent's report):**
-
-| Check | Result |
-|---|---|
-| Suite on the NEW binary | 522 passed / 0 failed / 8 skipped |
-| Suite on MASTER, re-run to establish the true baseline | **also 522** - so no regression, and the queue's earlier "520" figure was STALE. Corrected. |
-| Positive corpus (21 files) on the new binary | 21 / 0 |
-| Regression test is NON-VACUOUS | new binary exit 0; **master exit 1** with "FAIL: expected error ... did not occur". A real tripwire, not a test that passes either way. |
-| `Test/test_interface.cb` (the 33 `dangle*` functions) | compiles, runs, 56/56, untouched |
-| Suite count cannot confirm the new test fires | correct - the legs went into an EXISTING file, so the count is unchanged by design. That is why the master-exit-1 check above was needed. |
-
-**CONFIRMED DEFECT found in the main session's own read - fix this FIRST on resume.** The pass
-treats any call user satisfying `CallIsPointerOpaqueIntrinsic` as NEUTRAL, and that predicate
-(`LLVMBackend.h:2734`) covers `llvm.dbg.*`, `llvm.lifetime.*` **and `llvm.mem*`**. A
-`llvm.memcpy` whose DESTINATION is the slot is a real write of a possibly-non-frame value, so
-treating it as neutral can produce a FALSE REJECTION - the exact failure class that killed
-attempts 1-3. Two things make this a textbook instance of a hazard already in this file's
-working notes:
-
-- The helper's contract is about a POINTER VALUE's escape ("touch the POINTEE, never the
-  pointer value itself"), which is sound for its original caller at `LLVMBackend.h:2605` - and
-  that caller correctly special-cases `llvm.mem*`. The new pass asks a DIFFERENT question,
-  about writes to a SLOT, and for that question touching the pointee IS the write. Reusing the
-  helper silently changed its meaning. (Working note: "when an agent cites a justification,
-  check it still holds AFTER the change it is justifying.")
-- The codebase already knew: the sibling `AllocaIsLoadStoreOnly` comments that for a slot
-  "Only debug/lifetime markers are inert here: llvm.mem* would copy the parked" pointer.
-
-Severity: **LATENT, not demonstrated.** Only 4 `CreateMemCpy` sites exist, and the array-element
-seeding one (`MainListener.h:8308`) writes through a GEP, which the catch-all already accepts -
-so no reachable false rejection was found today. It must still be fixed, because the invariant
-the WHOLE design rests on is "any unrecognized user accepts", and this is a hole in exactly that
-invariant. Fix is one line and strictly accept-biased: in the pass, treat only `llvm.dbg.*` and
-`llvm.lifetime.*` as neutral and let everything else, `llvm.mem*` included, fall to accept. Do
-NOT change the shared helper - its other caller depends on the current contract.
-
-Sequencing note: master's working tree was deliberately left pristine (only `.md` edits) because
-`x64/Release/cflat` is the reference binary the corpus and the review both compare against.
-Fable's zero-risk recommendation to extend `LogInterfaceReturnDangle`'s wording with "binding the
-value to a local first does not extend its lifetime" - so the direct diagnostic stops teaching
-the laundering workaround - is therefore NOT yet applied. It is worth shipping on its own even
-if the pass never lands, and is the honest fallback if attempt 4 also fails.
-
-**Still owed when work resumes, in this order:**
-
-1. The one-line `llvm.mem*` fix above.
-2. The ADVERSARIAL review, which has NOT run - the checks above are the main session's own read
-   plus mechanical verification, not an independent adversarial pass. Its explicit hunt is a
-   legal program turned red. Every round of this work has found a confirmed defect, and this
-   round already found one before the review even started; do not skip it.
-3. Decide the `kNullStoreIsAcceptEvidence` knob (`LLVMBackend.h`, currently `false` = null store
-   is neutral). Consequence of `false`: `IShape r; if (c) r = loc as IShape; return r;` is
-   rejected. That is a true conditional dangle and parity with the direct guard, but it is the
-   deliberate accept-bias knob and review should weigh it explicitly rather than inherit it.
-4. Only then consider whether `FrameLocalDataOfFatValue` can be reduced to a fallback, as the
-   fix direction suggests. Not part of this change.
-
-</details>
-
+State on 2026-07-30: **59 open issues** (13 P1 / 23 P2 / 16 P3 / 7 UI). Ten files merged into three on their shared root
+(consolidation record at the bottom), the generic namespace key space fixed and its file
+deleted, its corpus deleted, `archive/` folded into this file, and one new issue filed.
 ## Resume point
 
-## IN FLIGHT - generic-interface registration, UNCOMMITTED in the main checkout
+**The generic namespace key space is DONE - all four layers, committed as `e2a23d5`.** That was
+the head of this queue for four sessions; its issue file and its three corpora are deleted, and
+the account of what shipped is under "Landed design records" below. Nothing in that family is
+open except the separately-filed gaps listed there.
 
-Status as of 2026-07-29, end of session. `[[generic-interface-registered-as-opaque-struct]]`
-is **fixed and verified but NOT committed** - the working tree holds the compiler change plus
-the merged tests. Nothing was committed (repo rule). Do not restart this; read the issue file
-and this entry first.
+Verified on macOS arm64 Release at `e2a23d5`: `./test.sh` **536 / 0 / 8**, `./test_lsp.sh`
+**152 / 0**, `Test/test_generics.cb` 132/132 (was 102), `Test/test_interface.cb` 92/92 (was 90).
 
-**Where it stands.** ~600 insertions across `cflat/MainListener.h`, `cflat/LLVMBackend.h`,
-`cflat/LLVMBackend.cpp`. Verified on macOS:
+**One claim in that work is UNSETTLED, and it is the thing to check first if `--init` ever
+misbehaves: the `decl_ns` cache round-trip for the generic FUNCTION family.** A review probe
+showed it load-bearing; the implementer could not reproduce that and showed the first probe was
+vacuous (it put a caller next to the template, which pre-instantiates it, so the call resolved
+through the cached `functions` table and the template read path never ran). Redone without the
+caller, the read path is inert on macOS for a different reason: only `runtime.cb` is implicitly
+imported, so every other core template comes from a file the program also `import`s, and
+`ProcessImports` re-parses it and overwrites the lazily-registered entry - stripping `decl_ns`,
+renaming the entry, deleting it, and filling its cached `source` with garbage all leave the
+result unchanged. Both agree the conclusion (**the round-trip does not need to move**), which
+rests on the code citations plus a byte-identical PRE/NEW `core_macos.bc`, not on either probe.
 
-| Artifact | State |
-|---|---|
-| `./test.sh Release` | 530 passed / 0 failed / 8 skipped (was 522 at session start) |
-| `Test/test_interface.cb` | 85/85 (was 56/56) |
-| `scratch/gi/test_generic_interface.cb` | 29 legs, green cold AND `--init`-warm; master fails it |
-| `Test/errors/` | 4 new `err_*` legs |
-| `Test/library/` | `gi_collide_iface.cb`, `gi_collide_struct.cb` - needed by the cross-file collision legs, NOT strays |
+- The narrow, honest claim: `decl_ns` has a real write path, a real read path and **no live test
+  on macOS** - the same status layer 1's `decl_ns` and layer 2's `interfaceTable` leg already
+  have. It goes live the first time a core file declares a namespaced generic.
+- **The decisive experiment nobody ran**: declare the namespaced generic in `runtime.cb` itself
+  rather than another core file, `--init`, then compile a program that imports nothing. That is
+  the only configuration where the lazily-registered entry is not overwritten by a re-parse.
+- On Windows `core/os.windows.cb` declares 14 structs inside `namespace os.windows`, so dotted
+  keys do reach the cache there and both legs are plausibly LIVE - a concrete cross-platform
+  gap, not a routine disclaimer.
 
-What now works that did not: generic interface as parameter, struct field, return type, generic
-type argument, with multiple/nested/pointer type arguments, across files, and under `if const`.
+Other live state:
 
-**The final cleanup round is DONE and verified** (six review rounds plus this one). It fixed four
-accuracy/dead-code/test-vacuity items, no miscompiles:
+- `stash@{0}: review-fixes-and-untracked-plans` is **recovered and DROPPED** (2026-07-30). There
+  are no stashes left. It held three untracked docs -
+  [[macos-header-import-and-framework-link]], `internal/plan/macos-gui-cocoa.md`,
+  `internal/plan/os-abstraction.md` - all three restored and now tracked; plus changes to four
+  TRACKED files (`cocoa` host, `fedit`, `example_mac.sh`, `internal/plan/ui-native-framework.md`)
+  whose content **had already landed on master**. The stash was based on `c287034`, 12+ commits
+  back, and `doc/UI.md` plus `cocoa.cb` already carried its `performSelectorOnMainThread:`
+  marshaling change; applying it conflicted only because those files were later moved and
+  rewritten. Its commit was `d2db363`, recoverable with `git stash apply d2db363` until gc prunes
+  it - but nothing unique remains in it.
+- **`fix/iface-ifconst` is SHELVED, not pending.** Branch `23418c2`, worktree
+  `../cflat-fix-iface-ifconst`, with its ~60-file repro corpus in `scratch/` - the most valuable
+  artifact of that attempt. Read [[iface-ifconst-blame-attempt-shelved]] before touching it.
+- The `as` / `is` family is **DONE**: routing (2 issues), boxing guards (2 issues) and the
+  return dangle are all closed. What remains under `as` is diagnostic quality.
+- The "may a user file-scope interface share a name with a core interface" product question is
+  **RESOLVED** (hard error, shipped as `853cb87`). Do not reopen it.
 
-- **`certain` had TWO causes and they were conflated.** `expect_error` blocks also set
-  `certain=false`, so they wrongly got the `if const` hint - the false-cause class by another
-  door. Now split: `certain` gates the struct-name veto; a separate `ifConstUnfoldable` is the
-  ONLY thing that may populate `ifConstUncertainInterfaceNames`. Keep them distinct.
-- **"Reports every offender" was false** - `LogError` never returns (`exit(1)` on the CLI path),
-  so the loop ran one body and its dedupe set and RAII restore guard were dead. Now ONE aggregated
-  diagnostic: caret on the first offender, the rest named in the body. Nothing runs after
-  `LogError`; do not add code that assumes it does.
-- **Aggregation made the `is`/`as`-source records LIVE reporters**, so they were kept, not deleted -
-  and both negative tests now pin their ROLE (`"as the source of 'is'"`,
-  `"as the target of an interface conversion"`) with the declaration and the operation on separate
-  lines so column-sort cannot mask the intended record. Both pins were MUTATION-TESTED: delete the
-  record, the test fails; restore it, it passes. Do that for any test pinning a multi-site message.
-- Duplicated comment fragment repaired; `RecordInterfaceMaterialization` early-outs on an empty
-  instance set; the sort comment no longer claims "source order" (the key is the RECORDING site, so
-  several fields of one template share a line and order is layout order).
+## Open issues, by fix priority
 
-`internal/testing-notes.md` gained a section on the scoped-`expect_error`/deferred-diagnostic trap.
+`internal/issue/` is now bucketed by **fix priority**, one folder per bucket, plus the separate
+UI track. **P1 is the highest.** The bucket is a fix-order judgment, not a restatement of
+severity - re-bucket a row when the judgment changes, and move its file in the same edit.
 
-**The design, and why it is the fourth shape tried.** Four strategies failed first; the surviving
-one is **record-then-resolve**:
+| Bucket | Folder | Rule | Count |
+|---|---|---|---|
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 13 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 23 |
+| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 16 |
+| **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
-- `RecordInterfaceMaterialization(name, role)` appends `{name, file, line, col, role}` to
-  `gts.materializedInterfaceUses` at eight value-materialisation sites (global, local, struct
-  field, by-value parameter slot, rebox source, rebox target, argument coercion, `is`/`as`
-  source). It **cannot reject**, so a missed site degrades to "no diagnostic" - never to a false
-  rejection or a false cause.
-- `ResolveMaterializedInterfaceUses()` runs once where `interfaceTable` is COMPLETE (in `Compile`
-  after `CheckPoisonedFunctionCalls`, and in `Analyze`).
-
-**Why the earlier shapes failed - do not retry them:**
-
-1. *Reject at end-of-compile over every syntactic occurrence.* False-rejected mainstream code:
-   `int countOf<T>(IEnumerable<T> e)` and any `if const (__WINDOWS__)`-guarded helper with a
-   generic-interface parameter. The set is filled from every occurrence including uninstantiated
-   template bodies whose recorded name is the placeholder `IEnumerable__T`, which can never gain
-   an `interfaceTable` entry.
-2. *Reject at each materialisation site.* Site enumeration failed twice running - rebox, then
-   local, then field, then **global**, then **by-value parameter** - each miss a SIGSEGV.
-3. *Delete the check entirely.* Re-opened a vtable-laundering miscompile (below).
-4. **The killer argument against any at-site check**: the precondition "in
-   `genericInterfaceInstances`, not in `interfaceTable`" is **legitimately transient**. The
-   codebase says so at `LLVMBackend.h:16301` - a generic interface lowers to a fat pointer before
-   its table entry exists, because the forward-ref scan materializes signatures first. So
-   `CreateStructType`'s field loop cannot distinguish "never instantiated" from "not yet", which
-   is why it emitted a false cause. Deferring did not merely fix the message - it turned three
-   legitimate shapes (`class Wrapper<U> { Container<U> ci; }`, an interface declared after the
-   struct using it) from REJECTED into WORKING.
-
-This is the same lesson as `2bcc5a0`: **defer the decision to where the facts are complete, but
-capture location and role where you have them.**
-
-**Six review rounds, six confirmed defect sets, EVERY ONE while the suite was green** (522, then
-526, then 530). In order: (1) cross-file struct/interface name collision false-rejected a legal
-generic struct - reachable from `core/interfaces.cb` via any transitive import, so a user
-`struct IQueue<T>` broke; (2) a generic interface in a dead `if const` branch compiled and
-SIGSEGV'd; (3) the round-2 fix's `if const` decider drift turned `if const ((__MACOS__))` -
-merely parenthesized, and idiomatic in `core/cruntime.cb:63` - into a raw verifier failure, plus
-the mainstream false rejections above; (4) **vtable laundering** - an unrouted name is not called
-but ASSIGNED THROUGH, so `IA ia = a; GiU<int> u = ia; IB ib = u; ib.M7()` dispatched `IB::M7`
-through a 1-slot `IA` vtable (exit 133, and a silent wrong-value variant at exit 0); (5) global
-and by-value-parameter materialisations still SIGSEGV'd, `--check` reported the crashing program
-CLEAN, and the `is`/`as` backstops were **dead code** because `ClassifyCastSource` returned
-`InterfaceValue` without populating `shape.TypeName`; (6) the four items above.
-
-**Generalizable lessons, both already in this file's themes:**
-
-- **When you widen a ROUTING predicate, every VALIDATION predicate keyed on the narrow one
-  becomes a hole.** `GetType`'s `isInterface` was widened to accept `genericInterfaceInstances`;
-  `IsInterfaceType` (which reads `interfaceTable` only) was not - and `ReboxInterfaceIfNeeded`'s
-  `if (!IsInterfaceType(src) || !IsInterfaceType(dst)) return fatVal;` silently skipped the
-  conversion guard. Sweep for the other copies; a 68-site sweep was needed here.
-- **A test can assert a lie.** Two negative tests passed while unable to reach the leg they
-  claimed - once via a local caught by a different site, once because a declaration and a
-  conversion shared a line number. Both were found by review, not by the suite.
-
-**The struct-wins tiebreak must allow COEXISTENCE, not pick a winner.**
-`Test/test_generics.cb` declares `struct Container<T>` (line 21) AND `interface Container<T>`
-(line 204) and is green on master - it emits both `%Container__int` and
-`Storage__int_Container__int_vtable`, because the two roles live in different maps and `GetType`
-prefers `interfaceTable`. An exclusive decision at pre-declare time is the WRONG SHAPE. Note this
-collision is also why the issue file's suggested backstop `LogError` ("a name in both
-`dataStructures` and `interfaceTable`") was **deliberately not shipped** - it would false-reject
-that green test.
-
-**Before deleting the issue file**, narrow its accept set: several shapes it claims are filed-but-
-unfixed (see the new rows in the open tables). Do not close it on a promise it does not keep.
-
-- master is the closure-parameter lowering fix (`df32dd8`), linear, tree clean. The
-  primitive-array boxing fix sits on top of it.
-- Full verification re-run on macOS with that fix: **522 passed / 0 failed / 8 skipped**,
-  examples **35 / 0**. (Baseline at `df32dd8` was 518/0/8; the new error test adds two, cold
-  and warm cache.) LSP was NOT re-run - it is Windows-only.
-  - This figure was recorded as 520 and was WRONG; `./test.sh Release` on `888455e` measures
-    **522** - re-measured 2026-07-29. Trust a fresh run over any number written here.
-- **The return-dangle issue is CLOSED** (`2bcc5a0`) and with it the LAST member of the
-  `as`/`is` family.
-- **`[[generic-interface-registered-as-opaque-struct]]` was the next head and is now FIXED but
-  UNCOMMITTED** - see the IN FLIGHT section above. Finish the cleanup round, review the diff,
-  commit, then narrow and delete the issue file.
-- **The next head is `[[generic-template-namespace-key-space]]`** (consolidated 2026-07-29). It
-  merges what were three separate issues - the core-template veto, the namespaced generic interface
-  signature, and the declared `c9acb6c` scope limit - into their one root: generic templates have a
-  namespace-blind key space, with three sites disagreeing about whether the key is qualified, bare,
-  or the spelled base verbatim. Probing it widened the blast radius twice and narrowed the severity
-  once, so read the issue before scoping the work:
-  - It is **not interface-specific.** A generic STRUCT or CLASS in a namespace is equally unusable,
-    qualified (`unknown type 'NS.Box__int'`) or bare-from-inside (`incomplete layout`, a nonsense
-    diagnostic mentioning C interop that is not involved). The three predecessor issues all framed
-    it as an interface problem because that is what was being looked at.
-  - The predecessor's **"SILENT MISCOMPILE" severity did not survive its own repro.** It was filed
-    as a repro *direction*, never built. Built this session: differing contracts reject cleanly,
-    identical contracts are indistinguishable, and the qualified spelling errors out before the
-    collision can matter. Honest severity is false rejection plus a silent name collapse.
-  - The core-template veto is **not** fixed by namespace qualification, contrary to what this note
-    said before probing: core's `list<T>` and a user's global `interface list<T>` are genuinely the
-    same key. It needs the tie-break keyed on the declaring file/module - a separate step, kept in
-    the same issue because it is the same key space.
-  - **Zero test coverage existed** for namespaced generics anywhere in `Test/` or `cflat/core/`,
-    which is how an entire unusable feature went unnoticed. **Step 1 is now DONE**: a 39-leg corpus
-    (30 failing legs + 9 controls), written and verified leg-by-leg BEFORE the compiler was touched.
-    It was embedded verbatim in the issue file for the duration, because `scratch/` is gitignored and
-    a corpus living only there is lost on a fresh clone; step 3 then moved the assertions into the
-    suite and stripped the embedded copy. **Step 2 (the fix) is now DONE for issue
-    steps 1/2/3/5** - the key space is namespace-qualified end to end; the corpus carries 37 legs
-    that all assert values and pass, cold and on a `--init` warm cache, with `./test.sh Release` at
-    530/0/8. Issue **step 4 (the core-template veto) was implemented and REVERTED**: both the
-    module-inequality and the core-vs-user tie-break trade one false rejection for another (the
-    latter regresses `import "list.cb"` + `interface list<T>`, a program that worked). Re-filed as
-    `[[generic-interface-name-vetoed-by-core-template]]`, which records why no tie-break can work.
-    **Step 3 (folding the legs into `Test/test_generics.cb` / `Test/test_interface.cb`) is now DONE.**
-    23 struct/class legs landed in `Test/test_generics.cb` (prefix `testGnNs*`, 77/100 -> 100/100),
-    5 interface legs landed in `Test/test_interface.cb` (prefix `testGiNs*`, 85/90 -> 90/90), and the
-    three by-design rejections landed as `Test/errors/err_namespaced_generic_iface_collide_identical.cb`,
-    `err_namespaced_generic_iface_collide_differing.cb`, and `err_namespaced_generic_iface_bare_single_ns.cb`
-    (each mutation-tested to confirm non-vacuity). `./test.sh Release` is now 536/0/8 (+6: three new
-    `err_*.cb` files, cold and warm). `scratch/nsgi/` is deleted and the issue file's embedded corpus
-    is stripped down to a pointer at these files.
-    **Round 3 - adversarial review, three defects found while the suite was green at 536/0/8**, all
-    now fixed: (a) a struct-nesting key prefix was mistaken for a NAMESPACE, so a generic template
-    nested in `struct Outer` resolved its body against a same-named `namespace Outer` and returned
-    the wrong value; (b) a `using` generic-BASE alias was re-resolved against the namespace of the
-    USE site, so a global alias silently named a namespace-local template; (c) `currentNamespace_`
-    leaked across `ResetForReanalysis` (LogError throws past hand-rolled save/restore), causing FALSE
-    REJECTIONS in every later file of a batched `--check` - a shape `test.sh` cannot express, since
-    it runs one file per process. (a) and (b) now have regression legs
-    (`testGnNsNestedInStructNotNamespace`, `testGnNsGenericBaseAliasKeepsDeclSiteMeaning`, 100 ->
-    102/102). The standing lesson: **the declaring scope must be RECORDED at registration, never
-    re-derived from the key** - struct nesting and namespace nesting share one dotted key space.
-    Round 3 also filed `[[generic-type-arguments-not-key-space-resolved]]` (the same bug one level
-    down, in type ARGUMENTS) and `[[generic-function-templates-are-bare-keyed]]`, which falsifies
-    that issue's "every generic template kind" scope claim.
-    **Round 4 was a NARROW review of round 3's three fixes only. The review agent STALLED mid-run
-    and produced no report**, so the checks below were done by hand in the main session - do not read
-    the absence of a round-4 review document as a clean bill from a reviewer:
-    - **The `decl_ns` cache field is correct but UNEXERCISED.** A `--init` cache written by the fixed
-      binary contains ZERO `decl_ns` occurrences - every core template is at global scope and the
-      field is omitted when empty. Both paths exist, neither runs. This is fine because the cache is
-      a NAMED-KEY JSON map, not a positional record, so an absent field cannot desync later ones:
-      verified by having the PRE binary write the cache and the fixed binary read it, byte-identical
-      to cold. It goes live the moment any `cflat/core/*.cb` declares a generic template inside a
-      namespace, and that change must re-run the cold-vs-warm comparison.
-    - `GenericTemplateState::Clear()` is `*this = GenericTemplateState{}` - a whole-struct reset - so
-      the new `genericTemplateNamespace` map cannot go stale across an LSP re-analysis and could not
-      have been omitted from the reset. Worth knowing: this idiom is why the round-3 map was safe
-      by construction rather than by the author remembering.
-    - `LLVMBackend::NamespaceScope` has copy and assignment deleted, so no double-restore; all four
-      previously hand-rolled sites are converted (`grep savedNamespace` is empty).
-    - The alias short-circuit did NOT break alias-of-alias chaining: `using A1 = Box; using A2 = A1;`
-      gives `1 1` (correct declaration-site meaning) where PRE did not compile it at all.
-    **Two ratifications are still owed by the maintainer** and are the only thing between this and a
-    commit: (1) a generic interface declared in a namespace is no longer reachable by a BARE spelling
-    from outside it - pre-fix `a2=7`, now an error, on a single namespace with NO collision; the
-    argument for it is that the non-generic analogs reject on BOTH binaries, so bare reachability was
-    an artifact of the bare-key bug rather than a feature. (2) inner-scope-wins (`inner=1` ->
-    `inner=2`). Both are pinned by tests already in the suite.
-    The issue is otherwise fully closed except for
-    step 4, which lives on in `[[generic-interface-name-vetoed-by-core-template]]`.
-  - Two legs were labelled **non-discriminating** rather than dropped: the identical-contract
-    collision cannot observe a wrong bind (two identical interfaces dispatch the same), and the
-    qualified-collision leg is blocked by the qualified-lookup bug and only proves that earlier bug
-    until legs 1-18 pass. Post-fix: the qualified-collision leg PASSES (32 / 64). The two
-    bare-at-file-scope collision legs (20, 21) are by-design REJECTIONS now - a bare name at file
-    scope no longer collapses onto one namespace's template - and moved out of the runnable corpus,
-    as did leg 25 (the core-template veto, still failing). A new leg 40 pins the one shape whose
-    MEANING changed: a bare generic name inside a namespace now binds to the namespace-local
-    template, not the same-named global one (pre-fix printed 1, now prints 2 - ratified).
-  `[[interface-boxing-guards-are-binding-dependent]]` remains the largest non-generic gap.
-- Artifacts of the ABANDONED attempts 1-3 are now DELETED: branch
-  `fix/return-dangle-provenance` (`f39410e`) and its worktree `../cflat-fix-return-dangle`
-  are gone (2026-07-29). Its lesson is preserved above and in the
-  landed commit message: the ledger answers what a value IS, but which store REACHES the
-  return cannot be answered soundly while the function is still being emitted - which is
-  precisely why the fix that worked defers to a complete CFG and never asks reachability.
-- Note for this whole family: all three failed attempts passed the suite at 512/0/8, because
-  no in-repo `.cb` used the shapes involved. **That gap is now CLOSED by `3726a75`** - 33
-  `dangle*` functions in `Test/test_interface.cb` (run from
-  `testInterfaceReturnDangleCorpus()`, line 3500) cover every shape in the abandoned-attempt
-  table, and a false rejection is a compile error, so the suite DOES detect one now. Do not
-  repeat the old "a green suite proves nothing" claim unqualified; and if that file stops
-  compiling, the analysis is wrong, not the test.
-- The `as`/`is` family is otherwise DONE: routing (2 issues) and boxing guards (2 issues) are
-  closed. What remains under `as` are the follow-ups those fixes surfaced, all of which are
-  PLAIN-path or diagnostic-quality rather than `as` defects.
-- **`fix/iface-ifconst` is SHELVED, not pending.** Branch is at `23418c2`, worktree present
-  at `../cflat-fix-iface-ifconst` with its ~60-file repro corpus in `scratch/` - the most
-  valuable artifact of that attempt. Read
-  [[iface-ifconst-blame-attempt-shelved]] before touching it; do not restart from scratch
-  and do not re-litigate the grammar facts recorded there.
-- `stash@{0}: review-fixes-and-untracked-plans` is pre-existing and intact. Its contents
-  have never been confirmed by the user - do not drop it.
-- The old "may a user file-scope interface share a name with a core interface" product
-  question is **RESOLVED** (hard error, kept and polished, shipped as `853cb87`). Do not
-  reopen it.
-
-## Closed in the 2026-07-29 session
-
-- **A return-dangle laundered through an intermediate interface local was accepted** - fixed
-  as `2bcc5a0`, closing `interface-return-dangle-defeated-by-intermediate-local` on the FOURTH
-  attempt after three abandonments. The whole difference is that it **never asks reachability**.
-  The return records the slot; the answer is resolved at the end-of-body hook beside
-  `RunNullDerefDataflow`, where the CFG is complete, as an existential question over the slot's
-  complete use-list. Rejection requires positive whitelisted evidence for EVERY writer, so
-  every class of missing information lands on ACCEPT and cannot produce a false rejection -
-  which is what killed attempts 1-3.
-  - **The null-store knob resolved to `true` (accept evidence), NOT the `false` the design
-    shipped with.** Review found four confirmed false rejections under `false`, and the reason
-    is the reusable lesson: a slot that is frame-boxed and then nulled before the return cannot
-    dangle, so treating the null store as merely NEUTRAL is the "does a frame box MAY-reach the
-    return" question - the exact thing that killed attempt 2 - **re-entering through the back
-    door**. The null store IS the CFG edge the rule refuses to look at. Under `true` the rule
-    stays purely existential: reject only when EVERY writer is a frame box. The flip is
-    provably monotone (the flag is read in one place and only ever sets `accepted = true`), so
-    it cannot manufacture a rejection.
-  - **Do not reuse a predicate across a change of question.** The pass first used
-    `CallIsPointerOpaqueIntrinsic` for its neutral set; that helper also admits `llvm.mem*`,
-    which is sound for ITS question (a pointer VALUE's escape) and wrong for this one, where a
-    memcpy into the slot is a real write. The codebase already knew - sibling
-    `AllocaIsLoadStoreOnly` comments exactly this. Latent, not demonstrated, and fixed anyway
-    because the whole design rests on "any unrecognized user accepts".
-  - `interfaceBoxRecords_` holds raw `llvm::Value*` and is never retired mid-function. Review
-    traced all 9 erasure sites and found the invariant holds today (each is either bracketed by
-    `SaveBuilderState`/`RestoreBuilderState`, which clear the ledger, or followed by the
-    per-function clear before any query). It is now stated at the declaration, because an
-    unbracketed mid-function erasure added later would let a freed `Value*` be recycled into a
-    spurious taint - a FALSE REJECTION mechanism.
-  - Residue filed as [[return-dangle-missed-when-slot-has-extra-user]]: any extra user of the
-    slot (notably a method dispatch through it) is accept evidence, so `r.area()` misses the
-    dangle where `measure(r)` catches it. Pre-existing behaviour, and widening the whitelist to
-    fix it is the direction that produced the earlier false rejections.
-  - Two review rounds, both at opus, ~60 adversarial legal programs on top of the 21-file
-    corpus. Round 1 found the blocker; round 2 was clean. The corpus and the spec are preserved
-    at `scratch/rev4/` (`positive/`, `review/`, `SPEC.md`) in the main checkout.
-
-- **A primitive-element array boxed into an interface was accepted and miscompiled** -
-  fixed, closing `global-primitive-array-boxed-into-interface`. The real mechanism is
-  UNREACHABILITY, not a guard that failed to fire: `RejectPointerShapedInterfaceUpcast` sits
-  behind a `StructImplementsInterface()` early-out at every boxing site, and `"int"` never
-  satisfies that, so the shape guard could only ever see class sources. The plain-assignment
-  chain then fell out of its if/else with a raw `ptr` in hand and stored it into the fat
-  slot.
-  - The GLOBAL vs LOCAL divergence is purely **Constant vs Instruction**. A global array
-    operand is an `llvm::Constant`, so IRBuilder folds the bitcast into a ConstantExpr, which
-    the module verifier does not subject to the instruction-level bitcast check - it verified
-    clean and detonated later in SelectionDAG. A local array decays to a GEP instruction, so
-    a real `bitcast` INSTRUCTION is emitted and the verifier rejects it. Same source bug, two
-    completely different-looking outcomes.
-  - The issue file's runtime description was **wrong for the decl-init spelling**: "exit 139"
-    was the COMPILER segfaulting during ISel, not the program. It was **right for the
-    brace-init spelling**, which was found later in review - `Holder h = { s = gInt };` links
-    clean and the PROGRAM exits 139. Both are in the fix.
-  - Four boxing sites needed the guard, and the fourth (`CoerceInitValueToInterface`, shared
-    by brace-init and the `<Tag attr=...>` element path) was missed on the first pass for
-    exactly the reason the root-cause account names. When a guard is placed after an
-    implements check, ASSUME there are more copies of that early-out and go find them.
-  - Guard polarity, which is the reusable part: it proves three things before rejecting -
-    registered interface target, builtin-primitive source element, provably pointer-shaped
-    source - and accepts everything it cannot prove. A 493-file corpus sweep plus ~30 hand
-    probes found no false rejection. Parens do NOT defeat it; an `auto` intermediate does,
-    and that is filed as [[auto-binding-of-fixed-array-loses-shape]] rather than patched by
-    widening the guard.
-  - `as` and plain now agree, byte-identical, for the GLOBAL spelling. The LOCAL spelling
-    still gets the classifier's generic message - the same documented exception a local
-    `Circle*[3]` has, since a decayed GEP has no named binding to describe.
-
-- **Returning a `?:` join of concrete pointers as an interface aborted the compile with a raw
-  LLVM verifier dump** - fixed, closing `return-ternary-join-concrete-pointers-not-boxed`. The
-  issue file's account was RIGHT as far as it went (the return path had no
-  `UpcastTernaryPhiToInterface` call, so a phi of raw `ptr` reached `CreateReturnCall`), but it
-  missed two things. First, the plain spelling under a `move` return type did not reach the
-  verifier at all - it was a FALSE REJECTION ("returned expression is not owned"), because a phi
-  is not a `LoadInst` and so fails `IsOwningValue`. Second, boxing alone is not enough: the
-  helper builds its fat value with `BuildInterfaceFatValue` directly and never ledgered an
-  `InterfaceBoxRecord`, so `FatValueOwnsHeapBox` could not see the join and the non-`move` heap
-  arm silently leaked instead of being rejected - and nothing nulled the arms' owning locals, so
-  the callee's scope-exit free ran on the object it had just handed out (correct-looking compile,
-  garbage value). Fix: call the helper from the return path BEFORE the ownership and dangle
-  checks so all of them inspect the fat pointer exactly as they do for the `as` spelling; ledger
-  each arm's box with the ordinary provenance classification; and, only for a `move` return, null
-  each OWNING arm's source inside that arm's own block so the untaken arm still runs its normal
-  null-guarded free (verified 200 constructions / 200 destructions over 100 alternating calls).
-  - Boxing EARLY has a trap that cost one review round: the whole-expression owned-return check is
-    gated on `right->getType()->isPointerTy()`, so once the arms are boxed it is skipped
-    ENTIRELY. That is what cured the false rejection above - and it equally removed the check for
-    arms that are NOT owned, turning `move IW f(int c, W* p, W* q){ return c > 0 ? p : q; }` from
-    REJECTED into a compiling double free (exit 134). The check therefore had to move INTO the
-    per-arm walk. Its polarity is deliberately the opposite of the whole-expression one: it
-    rejects only an arm it can PROVE owns nothing (`IsProvablyNonOwningPointerLoad` - a load whose
-    slot is a live binding that declares itself non-owning) and accepts every "cannot tell" shape,
-    because `IsOwningValue` answers only a `LoadInst` and reading its `false` as "not owned" is
-    precisely what produced the original false rejection. `move` parameters, direct `new` arms and
-    move-returning call results were all re-verified as still accepted.
-  - The dangle gap applied to this shape too and was deliberately left alone at the time:
-    `Square a; Square* p = &a; return c ? p : q;` boxes and compiles, exactly as the
-    non-ternary `return p;` did. **Still true after `2bcc5a0`** - that fix keys off a
-    ledger-confirmed `FrameStorage` box stored into the returned SLOT, and here the frame
-    address arrives through a pointer local, which classifies as a load rather than an alloca.
-  - A DIRECT `&local` arm names no class, so it is now rejected by the arm-boxing diagnostic
-    rather than the dangle one. A rejection either way; the wording is about the wrong thing.
-
-- **Duplicate constructor signature crashed the compiler with no diagnostic** - fixed,
-  closing `duplicate-constructor-signature-hangs-compiler`. The issue file's guess (runaway
-  recursion or an unbounded loop) was WRONG. `CreateFunctionDefinition` early-returns an
-  already-bodied function BEFORE `createFunctionBlock`, which is the only thing that pushes a
-  function scope onto `stackNamedVariable`; `ParseFunctionDefinition` guards for exactly that
-  and returns, `ParseConstructorDefinition` did not, so `RegisterThisPointer` indexed
-  `stackNamedVariable.back()` on an empty deque. The "corrupted map, huge bogus size" in the
-  crash dump was that empty-container read, not stack smashing - which is why duplicate
-  METHODS and duplicate free functions never crashed. Fix is a mangled-name duplicate check in
-  the forward-ref scanner's constructor pre-declare loop plus the missing guard. Generic class
-  templates are not covered by the eager check (the scanner returns early for them); the guard
-  is what keeps them from crashing, and they silently drop the second body like methods do.
-  - The message's parameter renderer is cosmetically lossy on four shapes - `int*[]` and
-    `void*[]` drop `ElemPointer` and print `int[]` / `void[]`, `move B*` prints `B*`, and
-    `function<int(int)>` prints the internal `__c_fn_ptr`. Diagnostic text only.
-  - The noun is picked by "declares a typeSpecifier", NOT by `declarationSpecifiers() == nullptr`:
-    per `CFlat.g4:783` a real ctor may carry `inline`/`static`/`const`/`extern`/`stdcall`, so the
-    latter test silently drops the diagnostic on those. Verified - do not "simplify" it back.
-    That rule has four exceptions, all message-wording only: `move` IS a `typeSpecifier`
-    (`CFlat.g4:323`), and `unique`/`alias`/`bond` are not grammar keywords at all - they parse
-    as `genericIdentifier`, also a `typeSpecifier` - so a ctor carrying one of the four reads as
-    "member". The duplicate is still caught and the crash still fixed; only the noun is wrong.
-    Twelve modifier spellings and fourteen return-type spellings were probed; the forward
-    direction (every real return type yields "member") had no counterexample.
-
-- **A function-pointer parameter on an interface method was never lowered, in EITHER
-  direction** - fixed, closing `iface-thin-function-param-no-lowering`. The direct call path
-  converts a closure fat struct to a bare invoker for a thin `function<>` slot, and widens a
-  named function / thin value into a fat struct for a `Lambda<>` slot; `CallInterfaceMethod`
-  did neither, so both spellings died in the verifier with no source location and the
-  fat-to-thin miss also lost its capture-naming diagnostic. Both conversions are now the
-  shared helpers `LowerClosureFatToThinFnPtr` and `WidenBareOrThinToClosureFat`, reached on
-  the virtual path through `LowerByValueArg` under guards only virtual dispatch can satisfy;
-  the interface argument loop also copies `LambdaCaptureNames`. Direct-path IR proven
-  byte-identical across twelve modules.
-  - The issue was originally filed and first fixed for the fat-to-thin half ONLY, because the
-    regression test used lambda literals - the one shape that half handles. A named function
-    or a stored `function<>` value into a `Lambda<>` slot still aborted. If you add a closure
-    test here, cover all four source shapes (literal, named function, thin variable, fat
-    variable) against BOTH slot flavours - that is what the 19 assertions in
-    `testInterfaceFunctionPointerParam` do.
-  - The widen must not key off `isPointerTy()`: under opaque pointers every data pointer looks
-    like a code pointer, and the first cut of the fix would have put a `void*` in a closure's
-    code slot and called it. The guard REJECTS ONLY WHAT IT CAN PROVE IS DATA and widens
-    everything else. That polarity is load-bearing: the intermediate allowlist version
-    (accept only a named function, an `IsFunctionPointer` value or null) false-rejected a
-    legal `io.lam(k > 0 ? a : b)`, because a `?:` join carries none of the three. Read
-    [[closure-param-accepts-data-pointer]] before touching this - it records why an allowlist
-    cannot work here, that the direct path still has the hole, and that the durable fix is
-    frontend-recorded provenance rather than interrogating the `llvm::Value`.
-
-- **`as` boxing skipped every ownership guard the plain spelling applies** - fixed, closing
-  BOTH `as-boxing-skips-ownership-transfer` (all four manifestations) and
-  `as-boxing-skips-pointer-shape-rejection`. `GenerateSafeCast` carried the fewest of the six
-  guards, so `x as IFace` skipped ownership transfer, pointer-shape rejection, and the
-  non-`move` ownership-escape rejection. Now one `BoxConcreteIntoInterface`
-  (`MainListener.h:9969`) carries all of them, and the declaration-init path and the `as`
-  path both route through it.
-  - Prerequisite that unblocked it: the source `NamedVariable` is now plumbed into
-    `ParseTypeCheckExpression` via `SoleCastOperandOf`, reusing the single-child passthrough
-    idiom already in `ParseAssignmentExpressionNamed`. This was built and verified
-    BEHAVIOUR-NEUTRAL before any guard was added - do that in this order if you touch it.
-  - It also added the provenance ledger `interfaceBoxRecords_`, which is the prerequisite for
-    [[interface-return-dangle-defeated-by-intermediate-local]] - that issue's fix direction
-    has been rewritten to use it and is now wiring, not design.
-  - **The change BREAKS source that was only memory-correct because the transfer was missing**
-    - boxing an owning local with `as` and then still using the local is now `use of moved`,
-    exactly as the plain spelling always said. The repo's own `Test/test_interface.cb`
-    contained such a program and was adapted (every assertion retained, a `delete` added).
-    Nothing in `core/` or `example/` was affected: every `as <Interface>` there is an
-    interface-to-interface downcast, never a class-to-interface box.
-
-## Closed in the 2026-07-28 session
-
-- **`as` / `is` fell through to the interface-source path on any unrecognised operand** -
-  fixed, closing BOTH `as-cast-pointer-ternary-operand-compiler-crash` and
-  `as-cast-array-shaped-source-no-diagnostic`. They were one defect:
-  `GenerateSafeCast` / `GenerateIsCheck` inferred "this is a fat pointer" from the ABSENCE
-  of a concrete struct name, so a pointer `?:` phi and a decayed `T[N]` both read unrelated
-  storage as {vtable,data}. Replaced with `ClassifyCastSource`, a positive routing decision;
-  `Unknown` is now diagnosed rather than miscompiled. The two shapes needed DIFFERENT
-  answers, which is the part worth remembering: the ternary had to be made to BOX (the plain
-  spelling already worked, so rejecting it would have regressed expressiveness), while the
-  array had to be REJECTED with the plain spelling's exact wording. Three review rounds; the
-  residue is the two new entries below. **The severity in the ternary issue file was wrong** -
-  it was recorded as a compiler crash with zero output, but the compiler never crashed:
-  `--run` JITs the miscompiled program in-process, so the program's SIGSEGV looked like the
-  compiler's. Verify crash claims with `-o` before believing them.
-
-- **`as` cast of a stack value to an interface crashed the compiler** - fixed. Root cause
-  was `elemType` propagation: `ParseMultiplicativeExpression` populates
-  `TypedValue::elemType` only for pointer sources, so a stack class value reached
-  `GenerateSafeCast` with a null `elemType`, fell through to the interface-source path,
-  and `CreateExtractValue(value, {1u})` ran on a class aggregate. Stack values now join
-  the statically-resolved concrete branch. Three review rounds; the fallout is the four
-  `as-*` files below, which are all PRE-EXISTING gaps the fix surfaced rather than caused.
-- **Named arguments ignored on the interface call path** - fixed. The interface arm never
-  called `namedArgument->Identifier()`, so `VariableName` was never set and `MatchFunction`
-  saw no named arguments. Fixing it made call-site index and declared-parameter index
-  diverge on that path for the first time, which exposed three downstream sites that had
-  silently relied on them being equal (duplicate-name crash, lambda expected-type seeding,
-  positional brace-init resolution). Two further pre-existing bugs surfaced while auditing
-  the fields the interface arm failed to copy: a FALSE REJECTION of legal `alignas` code on
-  a `move` parameter, and a SILENT MISCOMPILE where `u8 200` through an interface widened to
-  `-56`. Both fixed. Residue is [[named-arg-replay-reports-losing-candidate]],
-  [[iface-slot-replay-blames-wrong-slot]], and
-  [[iface-arg-lambda-fnptr-type-not-propagated]]. (The thin-`function<>` parameter entry
-  that was also listed here is closed - see the 2026-07-29 session below.)
-
-## Open - crashes and silent miscompiles
+### P1 - wrong programs and crashes (`p1/`)
 
 | Issue | Severity |
 |---|---|
-| [[generic-interface-registered-as-opaque-struct]] | LLVM verifier failure + false rejections. `IFace<T>` unusable in most positions. |
-| [[interface-boxing-guards-are-binding-dependent]] | Double free (exit 134). Parens or `?:` erase the binding the guards key off. |
-| [[return-dangle-missed-when-slot-has-extra-user]] | Missed dangle, no diagnostic. Residue of `2bcc5a0`; pre-existing, and NOT to be fixed by widening the whitelist. |
+| [[interface-boxing-keyed-on-source-binding]] | Double free (exit 134) via parens / `?:`; verifier failure via `??`; two un-routed boxing sites. Merged 2026-07-30. |
 | [[iface-call-does-no-argument-type-matching]] | Silent miscompile then SIGBUS. An `int` reaches a closure slot; the direct path rejects it. |
-| [[function-array-body-silently-truncated]] | Silent miscompile, exit 133. NOT interface-related; filed here because it has no other queue. |
-| [[nondeterministic-ir-switch-case-order]] | No miscompile - a METHODOLOGY hazard. NOT interface-related; listed here for the same reason as the row above: it is the only index. Read it before using "0 IR diffs" as proof. |
-| [[closure-param-accepts-data-pointer]] | SIGSEGV, no diagnostic. DIRECT-path residue; the virtual path is now guarded. |
+| [[function-array-body-silently-truncated]] | Silent miscompile, exit 133. `--check` reports PASS. NOT interface-related. |
 | [[auto-binding-of-fixed-array-loses-shape]] | Silent miscompile (`auto` on an array is not indexable), and it defeats the primitive-array guard. Fix the deduction, NOT the guard. |
-| [[null-coalesce-join-into-interface-not-boxed]] | Verifier failure, no diagnostic. A THIRD join shape - not the `?:` double-free entry, not the return-path entry. |
-| [[fixed-array-copy-invalid-bitcast]] | Verifier failure, no diagnostic. NOT interface-related; filed here because it has no other queue. |
-| [[fixed-array-parameter-not-callable]] | False rejection: a `T[N]` parameter registers as a bare `T`, so no call resolves. NOT interface-related; same reason as the row above. |
-| [[interface-method-call-on-null-value-segfaults]] | SIGSEGV (139), no guard. Fires on a PLAIN non-generic interface on MASTER too - `NgLive lv = default; lv.Get();`. Pre-existing and language-wide, not generic-specific. |
-| [[ifconst-const-global-condition-corrupts-ir]] | Missing block terminator in an unrelated already-emitted function. `if const (<const global>)` at file scope; `DecideIfConstCondition` hard-codes `forceScratch=false`. Identical on master. NOT interface-related. |
-| [[interface-type-alias-not-resolved-in-is-as-target]] | Wrong answer + false rejection: `ia is AliasIB` rejected while `ia is IB` works. `IsInterfaceType` resolves aliases; the ~12 direct `interfaceTable.find/count` sites do not. Pre-existing; fix with one resolving accessor. |
+| [[interface-type-alias-not-resolved-in-is-as-target]] | Wrong answer + false rejection: `ia is AliasIB` rejected while `ia is IB` works. Fix with one resolving accessor over the ~12 direct `interfaceTable.find/count` sites. |
+| [[ftell-fseek-long-width-on-windows]] | Silent wrong value on Windows: core binds C `long` as pointer-sized, so `ftell`/`fseek` read garbage under LLP64. Not a UI issue despite being Windows-only. |
+| [[closure-param-accepts-data-pointer]] | SIGSEGV, no diagnostic. DIRECT-path residue; the virtual path is now guarded. |
+| [[interface-method-call-on-null-value-segfaults]] | SIGSEGV (139), no guard. Fires on a PLAIN non-generic interface too. Pre-existing and language-wide. |
+| [[unique-ptr-field-stack-address-aborts-silently]] | Silent abort (exit 134), **no diagnostic at all**. Per CLAUDE.md's LLVM-assert convention this should become a proper error. |
+| [[return-dangle-missed-when-slot-has-extra-user]] | Missed dangle, no diagnostic. Residue of `2bcc5a0`; NOT to be fixed by widening the whitelist. |
+| [[fixed-array-copy-invalid-bitcast]] | Verifier failure, no diagnostic. NOT interface-related. |
+| [[ifconst-const-global-condition-corrupts-ir]] | Missing block terminator in an unrelated already-emitted function. Identical on master. |
+| [[null-conditional-args-eval-order]] | `?.` call arguments evaluate before the null-guard branch - the guard does not guard them. Filed as latent; it is a wrong-order semantics bug. |
 
-## Open - false rejections and accept-set problems
+### P2 - false rejections, unavailable features, ownership holes (`p2/`)
 
-| Issue | Severity |
+| Issue | Family | Severity |
+|---|---|---|
+| [[array-view-params-unconditionally-noalias]] | latent miscompile | Latent `-O2` miscompile hazard - UB handed to LLVM. P1 the moment a witness exists. |
+| [[incomplete-layout-message-blames-c-interop]] | diagnostic | **Raised above its severity.** One emission site, three unrelated causes, and the wording names the cause that is usually absent. Two ratification records cite a C-interop cause on files with no C interop. |
+| [[overload-replay-blames-wrong-candidate]] | diagnostic | Factually false message on two paths; on the interface-slot path it converts a success into a failure. Merged 2026-07-30. |
+| [[variadic-free-generic-function-does-not-link]] | false reject | Compiles, does not link - raw JIT symbol dump, not a diagnostic. |
+| [[namespaced-struct-static-method-not-dispatched]] | false reject | A whole dispatch form is unavailable inside a namespace. |
+| [[namespaced-interface-shadowed-by-global-is-broken]] | false reject | False rejection with a nonsense diagnostic. Non-generic controls fail on both binaries. |
+| [[namespaced-using-alias-leaks-globally]] | false reject | Name leak / silent shadowing. Also the reason a layer-2 accept-set limit is only conditionally safe. |
+| [[tuple-sugar-in-namespace-does-not-compile]] | false reject | A whole syntax is unavailable inside a namespace. |
+| [[paren-as-cast-method-call-not-parsed]] | false reject | `(x as IFoo).m()` -> `unknown function '(xasIFoo)'`. Parser, not diagnostics. |
+| [[generic-interface-name-vetoed-by-core-template]] | false reject | A core generic template vetoes a same-named user generic interface. Two tie-breaks tried, both reverted - records why none can work. |
+| [[generic-interface-cannot-inherit-generic-interface]] | false reject | `unknown parent interface` on INSTANTIATION, not on the declaration. |
+| [[fixed-array-parameter-not-callable]] | false reject | A `T[N]` parameter registers as a bare `T`, so no call resolves. |
+| [[sizeof-of-generic-instantiation]] | false reject | `sizeof(B<int>)` -> `unknown type`. The operand skips the generic mangling/queue path. Check `alignof` and cast operands too. |
+| [[function-type-as-generic-interface-type-argument]] | false reject | `C<function<int(int)>>` fails on both binaries. Clean failure. |
+| [[bare-interface-name-resolves-outward-before-namespace]] | false reject | Outer scope wins for non-generic interface names, opposite to the ratified generic rule. |
+| [[iface-ifconst-base-clause-implementor]] | false reject | Implementor inside a non-taken `if const` -> "no class implements it". |
+| [[macos-header-import-and-framework-link]] | false reject | Two gaps block first-class Apple-API binding: header import hard-codes a Linux triple on Darwin (`objc/runtime.h` registers 1 of ~80 functions), and there is no `-framework` / `-F` link channel. The macOS demos work around both with dlopen + typed `objc_msgSend` casts. |
+| [[unique-assign-syntactic-owned-rhs-leaks]] | ownership | Owning value laundered through a BORROW-returning call still leaks. |
+| [[alias-borrow-local-launder-gaps]] | ownership | An `IsAliasBorrow` owning-struct local launders its borrow through `=` and through `move`. |
+| [[delete-borrow-via-named-local]] | ownership | Opt-in spelling closes it; the bare case is still open. |
+| [[deref-of-moved-pointer-guard-inside-callee]] | ownership | False positive: guarded only by a conditionally-terminating callee. |
+| [[owning-temp-ledgers-should-be-split]] | ownership | `ownedReturnTemps_` fails UNSAFE, `ownedNewTemps_` fails SAFE. |
+| [[detection-ledgers-not-discarded-on-aborted-arm]] | ownership | Detection-only ledgers survive an aborted `?:` arm. |
+
+### P3 - diagnostics, latent, deliberate deferrals (`p3/`)
+
+| Issue | Family | Severity |
+|---|---|---|
+| [[generic-function-call-diagnostics-are-misleading]] | diagnostic | Three defects on one path: a PHANTOM candidate invented for an undeclared generic function, wrong type-arg arity reported as "unknown function 'D3.id__int__float'", and a mangled name leaking into user-facing text. Pre-existing, identical before `e2a23d5`; filed 2026-07-30 out of the layer-4 review. |
+| [[interface-collision-message-prefix-still-basename]] | diagnostic | The `file(line,col):` prefix is still a bare basename. |
+| [[as-cast-unbound-pointer-shape-generic-message]] | diagnostic | Correctly rejected, generic wording. Struct field and LOCAL `T*[N]` only. |
+| [[constructor-discriminator-inconsistent-name-only-sites]] | diagnostic | Name-only outside a lock/program body, null-declarationSpecifiers inside one. |
+| [[expect-error-leaves-outer-nullcond-block-unterminated]] | diagnostic | Raw verifier dump instead of a clean diagnostic. |
+| [[failed-expect-error-type-poisons-its-name]] | false reject | Contained to the declaring file, and test-only. Not repairable from the generic accept set. |
+| [[unique-array-view-accepted-as-generic-type-argument]] | accept set | Inconsistent accept set, no miscompile shown. |
+| [[duplicate-generic-template-name-silently-accepted]] | accept set | Undocumented "struct wins" tiebreak, no diagnostic. `Test/test_generics.cb` depends on the collision, so the obvious backstop cannot ship. |
+| [[nodiscard-residual-gaps]] | ownership | Value-identity detection gaps. |
+| [[thread-cannot-go-raii]] | ownership | Two independent blockers on giving `Thread` a destructor. |
+| [[pools-no-destructor-shutdown-ordering]] | ownership | The pools stay manual - deliberately. |
+| [[core-bitcode-may-cache-bodyless-rebox-thunk]] | latent | Unreachable today; trips when any core file reachable from `runtime.cb` gains an interface-to-interface conversion. |
+| [[iface-arg-lambda-fnptr-type-not-propagated]] | latent | No failing shape found; recorded with what was tried. |
+| [[nondeterministic-ir-switch-case-order]] | methodology | No miscompile - a METHODOLOGY hazard. Read it before using "0 IR diffs" as proof. |
+| [[iface-namespace-follow-ups]] | follow-up | Items 2-6 of the round-1 review of `c9acb6c`. Item 1 is RESOLVED (`853cb87`); items 4 and 5 were fixed by `15809e0`. Item 5's remainder (annotation/template key split) is reachable only on the Windows `[uuid]` / `[winrt]` path. |
+| [[iface-ifconst-blame-attempt-shelved]] | shelved | READ BEFORE attempting the `if const` blame diagnostic again. A serious attempt shelved after eight review rounds / nine defects. |
+
+### UI and Win32 (`ui/`)
+
+Separate track; none of these gate compiler work. Design and staging are in
+`internal/plan/ui-*.md`; the user-facing reference is [`doc/UI.md`](../../doc/UI.md).
+
+| Issue | Area |
 |---|---|
-| [[bare-interface-name-resolves-outward-before-namespace]] | Makes the documented namespace workaround awkward. |
-| [[iface-ifconst-base-clause-implementor]] | Implementor inside a non-taken `if const` -> "no class implements it". |
-| [[unique-array-view-accepted-as-generic-type-argument]] | Inconsistent accept set, no miscompile shown. |
-| [[generic-template-namespace-key-space]] | **FIXED but UNCOMMITTED** - see the IN FLIGHT entry. Namespaced generics work end to end now. The file stays open only for the three gaps it spawned (the rows below plus the veto); narrow its accept set before deleting it. |
-| [[generic-type-arguments-not-key-space-resolved]] | Silent wrong value on BOTH binaries, so not a regression - but the namespace fix FLIPS which caller loses, onto the namespace-local one. `Box<Item>` at global scope and inside `namespace A` collapse onto `Box__Item`. Fix carries the resolved arg into the mangled name, so it is `--init`-relevant. |
-| [[generic-function-templates-are-bare-keyed]] | Silent wrong value: two same-named generic FUNCTION templates in different namespaces collapse and the namespaced body is discarded. Unchanged by the namespace fix - it is the fourth template kind, and it falsifies that issue's "every generic template kind" claim. |
-| [[function-type-as-generic-interface-type-argument]] | `C<function<int(int)>>` fails on both binaries. Clean failure, no verifier issue. |
-| [[sizeof-of-generic-instantiation]] | `sizeof(B<int>)` -> `unknown type`. NOT interface-related - fails on a plain generic struct too; `sizeof`'s operand skips the generic mangling/queue path. Check `alignof` and cast operands in the same pass. |
-| [[generic-interface-cannot-inherit-generic-interface]] | False rejection: `unknown parent interface` when a generic interface's base clause names another generic interface. Fires on INSTANTIATION, not on the declaration - declaring and never using it passes. |
-| [[duplicate-generic-template-name-silently-accepted]] | No miscompile shown. Undocumented "struct wins" tiebreak lets a generic struct and generic interface share a name with no diagnostic. |
+| [[ui-native-canvas-input-images-win32-winui]] | canvas input + images, Win32/WinUI parity gaps |
+| [[ui-native-visual-polish-win32-winui]] | visual polish parity, Win32/WinUI |
+| [[ui-boxed-closure-unguarded-null]] | boxed closure with no null guard |
+| [[win32-classic-common-controls-v5]] | classic common controls fall back to v5 |
+| [[winmd-scrollviewer-statics-vtable-mismatch]] | winmd statics vtable mismatch; same family as the next row |
+| [[winrt-self-new-missing-vtable]] | `self` / `new` on a WinRT type has no vtable |
+| [[winui-icontrol-get-template-misreads]] | projected interface whose `GetTemplate` misreads |
 
-## Open - diagnostic quality
-
-| Issue | Severity |
-|---|---|
-| [[named-arg-replay-reports-losing-candidate]] | Reports a losing candidate's name miss instead of the real failure. |
-| [[iface-slot-replay-blames-wrong-slot]] | Message names a parameter that IS declared. Same root shape as the row above; fix together. |
-| [[interface-collision-message-prefix-still-basename]] | The `file(line,col):` prefix is still a bare basename. |
-| [[paren-as-cast-method-call-not-parsed]] | `(x as IFoo).m()` -> `unknown function '(xasIFoo)'`. Operand-shape independent. |
-| [[as-cast-unbound-pointer-shape-generic-message]] | Correctly rejected, generic wording. Struct field and LOCAL `T*[N]` only. |
-| [[interface-boxing-sites-not-fully-consolidated]] | No live defect. Two open-coded sites + two inert ledger sharp edges. |
-
-## Open - latent / no repro found
-
-| Issue | Severity |
-|---|---|
-| [[core-bitcode-may-cache-bodyless-rebox-thunk]] | Unreachable today; trips when any core file reachable from `runtime.cb` gains an interface-to-interface conversion. |
-| [[iface-arg-lambda-fnptr-type-not-propagated]] | No failing shape found; recorded with what was tried. |
-
-## Open - follow-ups and shelved work
-
-- [[iface-namespace-follow-ups]] - items 2-6 of the round-1 review of `c9acb6c`. Item 1 is
-  RESOLVED (`853cb87`). Item 5 (annotation/template key split) is the one reachable only
-  on the Windows `[uuid]` / `[winrt]` path.
-- [[iface-ifconst-blame-attempt-shelved]] - READ BEFORE attempting the `if const` blame
-  diagnostic again. A serious attempt shelved after eight review rounds / nine defects.
-  See the resume point above for branch and worktree state.
 
 ## The structural theme
 
-**Interface boxing bookkeeping was duplicated across four sites** - assignment, return,
-`?:`, and `as` - each carrying a different subset of the six guards, and shapes kept falling
-through the gaps. This was the single largest source of entries in this queue.
+**Bookkeeping duplicated across sites, each copy carrying a different subset of the guards.**
+This is the single largest source of entries in this queue, and it has now produced two merged
+issues rather than a dozen scattered ones:
 
-It is now PARTLY resolved: `BoxConcreteIntoInterface` (`MainListener.h:9969`) is the shared
-site for the declaration-init and `as` paths and carries every guard, and it records
-provenance so later checks can look a fact up instead of recovering it by walking IR.
-The remaining work is tracked in [[interface-boxing-sites-not-fully-consolidated]] (two
-sites still open-coded) and [[interface-boxing-guards-are-binding-dependent]] (the guards
-key off a NamedVariable, so any spelling that erases the binding still slips through).
+- Interface boxing was open-coded at four sites - assignment, return, `?:`, `as`.
+  `BoxConcreteIntoInterface` (`MainListener.h:9969`) now carries every guard for two of them;
+  the rest is [[interface-boxing-keyed-on-source-binding]].
+- Overload scoring is three hand-copied probe/replay loop pairs;
+  [[overload-replay-blames-wrong-candidate]] wants one `ScoreCandidates(probe)` helper.
+- Generic name resolution had three disagreeing key conventions;
+  the generic key space was four layers of it - see the landed design records below.
 
 The lesson worth carrying to the next duplication: **the guards were only as good as the
-information reaching them.** Every fix in this family was blocked on plumbing - the source
-`NamedVariable` reaching `ParseTypeCheckExpression` - not on the guard logic itself, which
+information reaching them.** Every fix in the boxing family was blocked on plumbing - getting
+the source `NamedVariable` to `ParseTypeCheckExpression` - not on the guard logic, which
 already existed and was correct. Look for the missing input before writing a new check.
 
-A third theme, from the named-arguments work: **replay loops report the first failing
-candidate rather than the relevant one**. Two entries above are that shape
-([[named-arg-replay-reports-losing-candidate]], [[iface-slot-replay-blames-wrong-slot]]).
-Both files agree the durable fix is a single `ScoreCandidates(probe)` helper called twice,
-which also removes the desync hazard of two hand-maintained loop pairs.
+A second theme, CLOSED and worth keeping as precedent: `GenerateSafeCast` / `GenerateIsCheck`
+used to decide "concrete source" by pattern-matching the operand's LLVM type and fall through
+to the interface-source path on anything unrecognised. The fix was a positive routing decision,
+and it closed the family at once. Two transferable lessons:
 
-A second, smaller theme, now CLOSED and worth keeping as precedent: `GenerateSafeCast` /
-`GenerateIsCheck` used to decide "concrete source" by pattern-matching the operand's LLVM
-type and fall through to the interface-source path on anything unrecognised. The fix was
-the positive routing decision both issue files predicted, and it did close the family at
-once. Two lessons transfer to the boxing consolidation above:
+- **Check the plain spelling before choosing reject-vs-support.** The two fall-through shapes
+  needed OPPOSITE answers, and only the plain-assignment control told us which.
+- **A guard is only as good as the shapes that can reach it.** Parity with the plain spelling
+  was achieved for six source shapes and missed for two
+  ([[as-cast-unbound-pointer-shape-generic-message]]) purely because a GEP-derived source has
+  no storage key to look up. Provenance recorded AT the boxing site would not have had that
+  failure mode.
 
-- **Check the plain spelling before choosing reject-vs-support.** The two fall-through
-  shapes needed opposite answers, and only the plain-assignment control told us which.
-- **A guard is only as good as the shapes that can reach it.** Parity with the plain
-  spelling was achieved for six source shapes and missed for two
-  ([[as-cast-unbound-pointer-shape-generic-message]]) purely because a GEP-derived source
-  has no storage key to look up. Provenance recorded AT the boxing site would not have had
-  that failure mode - which is the argument for the consolidation, made concrete.
-
-## Adjacent - found during interface reviews, not interface bugs
+## Adjacent - found during reviews, not bugs in the feature being reviewed
 
 [[constructor-discriminator-inconsistent-name-only-sites]],
 [[array-view-params-unconditionally-noalias]],
-[[expect-error-leaves-outer-nullcond-block-unterminated]].
+[[expect-error-leaves-outer-nullcond-block-unterminated]],
+[[generic-function-call-diagnostics-are-misleading]].
 
-## Working notes from the fix-issue rounds
+## Working notes
 
-Accumulated across the interface sessions. These are the notes that changed an outcome
-more than once; keep them with the queue rather than in any one issue file.
+The portable lessons from these rounds - reviews, sequencing, guard polarity, agent reports,
+tests - now live in [`internal/fix-issue-lessons.md`](../fix-issue-lessons.md). They were moved
+out of this file because they outlive every issue in it.
 
-**On reviews**
+## Landed design records
 
-- A review round found a CONFIRMED defect in nearly every round of this work. Never skip
-  them. Reviews repeatedly caught the fix agent's REASONING while its code was fine.
-- **The generic-interface work is the strongest datum: SIX rounds, SIX confirmed defect sets,
-  every one found while `./test.sh` was GREEN** (522, 526, 530). Among them a SIGSEGV, a silent
-  wrong-value miscompile, a stdlib-breaking false rejection, and two checks that were dead code.
-  A green suite is a floor here, never the bar.
-- **Scope each review round to what the last round CHANGED, and say what not to re-verify.**
-  Rounds that re-covered settled ground burned budget; the rounds that found the worst defects
-  (laundering, dead backstops) were the narrowly-scoped ones. Listing the previous round's
-  confirmed-clean items in the brief is what buys that focus.
-- **A "safe with listed fixes" verdict is not "clean".** Read the list; twice in this work the
-  listed items included a factually false diagnostic and a test that could not reach its leg.
+Nothing here is open. These accounts are kept because they explain WHY the shipped code has the
+shape it does, they record approaches that were tried and **must not be retried**, and they hold
+the **ratified behaviour changes** - deliberate changes to what already-compiling programs do,
+which a future session must not "fix" back without reopening the decision.
 
-**On sequencing the rounds**
+| Work | Commit |
+|---|---|
+| `as` / `is` routing, named args on the interface path | 2026-07-28 session |
+| `as` boxing ownership guards; primitive-array boxing; `?:` join return; duplicate ctor; thin `function<>` param | 2026-07-29 session |
+| Return dangle laundered through an intermediate local (attempt 4) | `2bcc5a0` |
+| Generic-interface registration | `09f1d56` |
+| Generic namespace key space, layer 1 (template base) | `15809e0` |
+| Generic namespace key space, layers 2-4 (arguments, body, functions) + LSP `expect_error` fix | `e2a23d5` |
 
-- **Run the review BEFORE the test merge, not beside it.** In the namespace work these were launched
-  in parallel to save wall-clock, and the review then found two silent wrong values - so the fixes
-  landed after their tests had already been folded into `Test/`, and the merge agent deleted the
-  scratch directory the review was still drawing witnesses from. Nothing was lost, but the ordering
-  cost rework and the parallelism saved less than it looked like it would.
-- **Build a PRE binary early and keep it until the very end.** A detached worktree at HEAD plus
-  `cmake_build.sh release` is one command and it is what converts "the agent says this is a
-  tightening" into a verified before/after. It caught a report that framed a REGRESSION as a
-  tightening to ratify, and separately caught a tightening whose claimed witness did not compile on
-  PRE at all - the claim was true, the evidence was not.
-- **A stalled or failed review agent is not a clean review.** Round 4's reviewer died mid-run with no
-  report. Its priority items had to be done by hand; treating the silence as "nothing found" would
-  have shipped an unverified cache round-trip.
+Suite trajectory across the whole sequence: 522 -> 530 -> 536.
 
-**On the issue files themselves**
+### `2bcc5a0` - the return dangle, on the fourth attempt
 
-- **Probe an issue before scoping work from it, even a carefully written one.** Consolidating three
-  files into `[[generic-template-namespace-key-space]]` took under an hour of probes and corrected
-  all three: one claimed a severity its repro does not support, one asserted a shape works that does
-  not, and my own queue note claimed two issues shared a fix that they do not. A filed root cause is
-  a hypothesis with a citation, not a measurement.
-- **A severity recorded from a repro DIRECTION is unverified.** Both "silent miscompile" claims in
-  this queue that were never actually run turned out to be false rejections instead. Mark the
-  difference in the file so the next reader does not budget for a wrong-value hunt.
-- **Issues filed while looking at feature X tend to be described as X bugs.** Three separate files
-  called this an interface problem; it affects every generic template kind. Before fixing, probe the
-  neighbouring kinds - it is cheap and it sets the real scope.
-- **Consolidate on the shared ROOT, not the shared symptom, and say what you did NOT merge.** The
-  adjacent files here (`[[duplicate-generic-template-name-silently-accepted]]`,
-  `[[bare-interface-name-resolves-outward-before-namespace]]`, `[[iface-namespace-follow-ups]]`)
-  overlap partly; merging them would have buried unrelated findings, so they are cross-linked with
-  the specific findings named.
+**The move that made it work: it never asks reachability.** Attempts 1-3 all tried to answer
+"which store REACHES this return", which is unanswerable soundly at emission time. Attempt 4
+defers to the end-of-body hook beside `RunNullDerefDataflow` (`MainListener.h:7574`), where the
+CFG is COMPLETE, and asks a purely EXISTENTIAL question over the returned local's complete
+use-list: reject iff at least one store is a ledger-confirmed `FrameStorage` box AND there is
+zero accept evidence. Loads and `llvm.dbg`/`llvm.lifetime` are neutral; **every other user
+whatsoever - an unrecorded store, a `Heap`/`Parameter`/`Global`/`Unknown` record, a call
+argument, an address escape, a memcpy, anything unrecognised - ACCEPTS and stops the walk.**
+Every class of missing information therefore lands on ACCEPT, which is what killed 1-3.
 
-**On changing approach vs. patching**
+- **The null-store knob is `true` (null store is ACCEPT evidence), not the `false` the design
+  shipped with.** Review found four confirmed false rejections under `false`, and the reason is
+  the durable part: a slot that is frame-boxed and then nulled before the return cannot dangle,
+  so treating the null store as merely NEUTRAL re-asks "does a frame box MAY-reach the return"
+   - the exact question that killed attempt 2 - through the back door. The flip is provably
+  monotone (the flag is read in one place and only ever sets `accepted = true`).
+- **Rejected alternative, do not retry**: a SOURCE-level "tainted binding" property. It requires
+  observing every assignment site to interface locals, so a missed site is a FALSE REJECTION -
+  the wrong polarity, and this family's documented disease is that assignment sites drift.
+  Ground the rule in the finished IR's use-list, where completeness is a property of LLVM's
+  def-use graph rather than of the compiler having remembered to log something.
+- `interfaceBoxRecords_` holds raw `llvm::Value*` and is never retired mid-function. All 9
+  erasure sites were traced and the invariant holds today; it is stated at the declaration
+  because an unbracketed mid-function erasure added later would let a freed `Value*` be recycled
+  into a spurious taint - a FALSE REJECTION mechanism.
+- Residue: [[return-dangle-missed-when-slot-has-extra-user]]. Any extra user of the slot
+  (notably a method dispatch through it) is accept evidence, so `r.area()` misses the dangle
+  where `measure(r)` catches it. **Widening the whitelist to fix it is the direction that
+  produced the earlier false rejections.**
 
-- **When site enumeration misses twice, change the method - do not add two more sites.** The
-  generic-interface fix cycled reject-at-end-of-compile -> reject-at-site -> delete-the-check
-  before landing on record-then-resolve. Recording cannot reject, so a MISSED site degrades to
-  "no diagnostic" instead of to a false rejection; resolving only where the facts are complete
-  removes the transient-state ambiguity entirely.
-- **Check whether your precondition is TRANSIENT before rejecting on it.** "In
-  `genericInterfaceInstances`, not in `interfaceTable`" reads like a bug state and is the normal
-  state during monomorphization (`LLVMBackend.h:16301` says so in a comment). Deferring turned
-  three legitimate shapes from rejected into working - the check was not just mis-worded.
-- **When you widen a ROUTING predicate, every VALIDATION predicate keyed on the narrow one
-  becomes a hole.** `GetType`'s `isInterface` was widened; `IsInterfaceType` was not; a
-  `if (!IsInterfaceType(src) || !IsInterfaceType(dst)) return fatVal;` early-out then skipped
-  the conversion guard and laundered a 1-slot vtable into an 8-slot interface. A 68-site sweep
-  was needed to be sure. Same shape as the "more copies of that early-out" note below.
-- **A deleted safety check needs its harm argument tested, not reasoned.** "A fat pointer with
-  no vtable must crash at the first method call" was true of the CALL path and false as a general
-  claim - the unrouted type is a PIPE you assign through, and the call lands on a routed
-  interface whose lookup succeeds. One experiment settled what three paragraphs of reasoning
-  could not.
-- Never let the agent that wrote a fix be the only one to hunt for its consequences.
-  Rounds 6 and 7 of the `if const` attempt each INTRODUCED the next defect while fixing
-  the previous one, and self-review missed both times.
-- **When an agent cites a justification, check it still holds AFTER the change it is
-  justifying.** The shape-8 defect: "the Mark site feeds only `uncertainInterfaceImpls`,
-  which can only weaken a proof" was true when written and false after its own edit.
-  Over-broad candidate sets are SAFE for suppression and UNSAFE for blame.
-- Point reviewers at the TRUE master binary (`x64/Release/cflat`); make them rebuild BOTH
-  sides and verify the master binary's identity themselves.
-- **Verify the PROOF, not just the answer.** One proof drove both binaries with `--check`,
-  was vacuous, and still reported the right conclusion. Demand real `-o` codegen.
-  (Correction: `--check` DOES reach the zero-implementor rebox diagnostic - the blanket
-  claim that it never reaches rebox finalization is too strong.)
-- Make reviewers state how they validated their own harness is non-vacuous. One reviewer
-  ran its classifier against known-differing files in both directions first, and caught
-  that 2 of its 3 real diffs were HIDDEN because `expect_error` output looks like a
-  diagnostic on both sides.
+### `09f1d56` - generic-interface registration
 
-**On agent reports**
+The surviving design is **record-then-resolve**: `RecordInterfaceMaterialization(name, role)`
+appends `{name, file, line, col, role}` at eight value-materialisation sites (global, local,
+struct field, by-value parameter slot, rebox source, rebox target, argument coercion, `is`/`as`
+source); `ResolveMaterializedInterfaceUses()` runs once where `interfaceTable` is COMPLETE. It
+**cannot reject**, so a missed site degrades to "no diagnostic" - never to a false rejection.
 
-- Agents have reported work that did not exist: one returned a status update as if it had
-  implemented the feature (worktree had 0 commits, 0 modified files); one claimed a review
-  round "found the correctness core clean" while that review was still RUNNING. **After
-  every agent report, check `git rev-list --count master..HEAD`, `git log`,
-  `git status --porcelain`, and the diff yourself before believing any of it.**
-- An agent that delegates can orphan a child that keeps writing to the worktree with no
-  one watching. Detect that before spawning a replacement, or two writers corrupt the
-  same files.
-- Counterexample worth trusting: an agent reporting a bug ITS OWN tests caught is doing
-  real work. Fabricated reports do not contain self-inflicted findings.
+**Four earlier shapes failed. Do not retry them:**
 
-**On the code**
+1. *Reject at end-of-compile over every syntactic occurrence.* False-rejected mainstream code
+   (`int countOf<T>(IEnumerable<T> e)`, any `if const (__WINDOWS__)`-guarded helper with a
+   generic-interface parameter): the set includes uninstantiated template bodies whose recorded
+   name is the placeholder `IEnumerable__T`, which can never gain an `interfaceTable` entry.
+2. *Reject at each materialisation site.* Site enumeration failed twice running - rebox, then
+   local, then field, then global, then by-value parameter - each miss a SIGSEGV.
+3. *Delete the check entirely.* Re-opened a vtable-laundering miscompile.
+4. **The killer argument against any at-site check**: "in `genericInterfaceInstances`, not in
+   `interfaceTable`" is a **legitimately transient** state (`LLVMBackend.h:16301`) - a generic
+   interface lowers to a fat pointer before its table entry exists. Deferring did not merely fix
+   the message; it turned three legitimate shapes from REJECTED into WORKING.
 
-- **`LogError` THROWS - treat it as a control-flow edge.** Three bugs traced to state or
-  an IR bracket left open on the unwind path. Brief every fix agent on it.
-- A "this is dead code, so it needs no handling" justification is a deferred bug. Make the
-  agent prove the grammar constraint it depends on.
-- Before tightening a name-only discriminator, sweep `core/` and `example/` first. A
-  name-only rejection once turned `int C()` in a lock group - which master compiles and
-  runs correctly - into a hard error with a factually false message, and **the suite could
-  not see it: no in-repo `.cb` used the construct.**
+**The struct-wins tiebreak must allow COEXISTENCE, not pick a winner.** `Test/test_generics.cb`
+declares `struct Container<T>` (line 21) AND `interface Container<T>` (line 204) and is green:
+the two roles live in different maps and `GetType` prefers `interfaceTable`. An exclusive
+decision at pre-declare time is the WRONG SHAPE - which is why the suggested backstop `LogError`
+("a name in both `dataStructures` and `interfaceTable`") was **deliberately not shipped**. See
+[[duplicate-generic-template-name-silently-accepted]].
 
-**On tests and docs**
+Two implementation facts worth keeping: `certain` had TWO causes and they were conflated
+(`expect_error` blocks also set `certain=false`, so they wrongly got the `if const` hint) - it is
+now split, with a separate `ifConstUnfoldable` the ONLY thing that may populate
+`ifConstUncertainInterfaceNames`. And "reports every offender" was false, because `LogError`
+never returns; the loop, its dedupe set and its RAII restore were dead code, replaced by ONE
+aggregated diagnostic.
 
-- **A test that pins a PATH in `expect_error` breaks on the other platform.**
-  `ShortenDefSiteForDisplay` returns native separators, deliberately. Pin the
-  basename + (line,col) TAIL only: separator- and cwd-agnostic, still a loud tripwire.
-  `expect_error` is a plain `.find()` substring check (`LLVMBackend.h:1201`).
-- **Docs must not sell an unreachable guard as the safety story.** `--init-clear`'s four
-  safety guards are provably dead code today; the doc called them "deliberately defensive"
-  and was rewritten to state the real contract. Apply such a correction to the COMMIT
-  MESSAGE too, since that outlives the doc.
-- Bugs needing 2+ `expect_error` legs in ONE function are a recurring blind spot.
-- **A test can PASS while unable to reach the leg it claims.** Two generic-interface negative
-  tests did exactly that - one pinned a shape caught by an EARLIER record site, the other passed
-  only because a declaration and a conversion happened to share a line number. Both were caught
-  by review, never by the suite. When a test pins a diagnostic that several sites can emit, pin
-  the ROLE/site-specific wording, not the shared prefix - and prove which site fired.
-- **A deferred (end-of-compile) diagnostic cannot be caught by a SCOPED `expect_error` block.**
-  The block closes first and prints `FAIL: expected error ... did not occur`, then `exit(1)`s
-  BEFORE the real diagnostic - so the stated reason is the opposite of the truth. Use the bare
-  file-scope `expect_error` form for anything deferred, and say so in the file.
-- **Verify a negative test is non-vacuous against the RIGHT baseline.** A test can be vacuous vs
-  master yet still be a real tripwire for a defect introduced mid-work: the dead-`if const` leg
-  passes on both master and the fixed binary, but would have caught round 2's compile-then-
-  SIGSEGV. Record which binary it discriminates against, rather than labelling it vacuous.
+Six review rounds, six confirmed defect sets, every one while the suite was green: (1) a
+cross-file struct/interface name collision false-rejected a legal generic struct reachable from
+`core/interfaces.cb`; (2) a generic interface in a dead `if const` branch compiled and SIGSEGV'd;
+(3) the round-2 `if const` decider drift turned the merely-parenthesized `if const ((__MACOS__))`
+- idiomatic in `core/cruntime.cb:63` - into a raw verifier failure; (4) **vtable laundering** -
+an unrouted name is not called but ASSIGNED THROUGH, so `IA ia = a; GiU<int> u = ia; IB ib = u;
+ib.M7()` dispatched `IB::M7` through a 1-slot `IA` vtable; (5) global and by-value-parameter
+materialisations still SIGSEGV'd while `--check` reported the program CLEAN, and the `is`/`as`
+backstops were dead code because `ClassifyCastSource` returned `InterfaceValue` without
+populating `shape.TypeName`; (6) the accuracy items above.
 
-**On process**
+### `15809e0` - namespace key space, layer 1 (the template BASE)
 
-- Issue files can be wrong: one repro did not reproduce as written, another described a
-  fault milder than reality. Have the fix agent verify the repro FIRST and report what it
-  actually saw.
-- When an agent proposes diverging from the issue file's fix direction, treat it as a RISK.
-- Tell agents to use repo-root `scratch/` and never run `git stash`.
+**Root cause: three sites disagreed about the key.** Generic STRUCT (`MainListener.h:24091`) and
+CLASS (`26488`) registration used the qualified `ns.Base`; generic INTERFACE registration used
+the **bare** `Base` (`4111-4113`, where `name` was deliberately shadowed back to `baseName`); the
+use site mangled the **spelled** base verbatim (`MangledGenericName("NS.Box", {"int"})` ->
+`"NS.Box__int"`), with `ResolveQualifiedName` never applied; and the scanner claim/veto sets
+(`2459`, `2478`) used the bare `getText()`. So a qualified use produced a name nothing creates
+(`unknown type`), a bare use from inside the namespace missed the qualified key and landed on the
+forward scanner's opaque shell (`incomplete layout`), and two namespaces declaring the same
+generic interface collapsed onto one key with no diagnostic. **It was never interface-specific** -
+generic STRUCT and CLASS were equally unusable; three predecessor files all framed it as an
+interface bug because that is what was being looked at.
+
+Shipped as steps 1, 2, 3 and 5: qualify interface registration, resolve the use-site base through
+the enclosing-namespace chain (innermost first) before mangling, keep the dot in the mangled form,
+and key the scanner sets the same way.
+
+**The mangled-form question was a non-decision.** A NON-generic namespaced struct already
+registers and lowers under its dotted name (`%NS.Plain = type { i32 }`,
+`define internal %NS.Plain @_NS.Plain_NS.Plain__()`), so a dot is already legal in both LLVM type
+names and function symbols. `NS.Box__int` was never an illegal or unusable name - nothing ever
+created it.
+
+**Step 4 (key the struct-wins tie-break on the declaring module) was implemented, REVERTED, and
+re-filed as [[generic-interface-name-vetoed-by-core-template]].** Two findings, in order:
+"different module -> interface wins" is directly contradicted by ratified assertions in
+`Test/test_interface.cb` (legs 16/17/19 pin a user `interface GiCollideRev<T>` LOSING to an
+imported `struct GiCollideRev<T>`), giving `529 passed, 1 failed`; and narrowing it to
+core-vs-user keeps the suite green but TRADES ONE FALSE REJECTION FOR ANOTHER, breaking a program
+that declares `interface list<T>` and then uses core's `list<int>`. The root obstruction: both
+shapes spell a bare `list<int>` at GLOBAL scope, so they are mutually exclusive and `global::`
+cannot distinguish two roles that both live at root scope. It needs a new disambiguating spelling
+or an outright collision diagnostic - not a tie-break.
+
+**RATIFIED BEHAVIOUR CHANGES (T1-T5). Do not revert without reopening the decision.** Only these
+six shapes behave differently; everything else that compiled compiles the same.
+
+| # | Change | Ratified because | Pinned by |
+|---|---|---|---|
+| T1 | **TIGHTENING.** A generic interface declared in a namespace is no longer reachable by a BARE spelling from OUTSIDE it (single namespace, no collision): pre-fix `t1=7`, now `Unknown identifier 'Width'.` | The NON-generic analog rejects on BOTH binaries (`unknown type 'P'`), so bare reachability was an artifact of the bare-key bug, not a feature | `Test/errors/err_namespaced_generic_iface_bare_single_ns.cb` |
+| T2 | **SILENT MEANING CHANGE.** Inside a namespace, a bare generic name binds to the namespace-local template instead of a same-named GLOBAL one. Nested `A`, `A.B`, `A.C` over a global template: pre-fix `inB=1 inC=1 inA=1`, now `inB=3 inC=2 inA=2` | Inner scope must win; the walk is innermost-first and falls outward correctly | `testGnNsInnerScopeWins` |
+| T2b | **SILENT MEANING CHANGE.** A bare generic name inside `namespace Outer` now finds a template nested in a same-named `struct Outer`: pre-fix `1`, now `5` | The non-generic control prints `5` on BOTH binaries, so 5 is the compiler's own answer and pre-fix's 1 was the anomaly | - |
+| T3 | **LOOSENING.** A generic struct/class in a NAMESPACE no longer vetoes a same-named GLOBAL generic interface: pre-fix `Unknown identifier 'Width'.`, now `t3=11` | `scannedGenericStructNames` was over-inclusive; step 5 keys it qualified | - |
+| T4 | **LOOSENING (bonus).** A generic template nested inside a struct now works: pre-fix `unknown type 'Outer.Inner__int'` | Fell out of the same repair. Round 2 shipped it as a WRONG VALUE (returned 5, the namespace's `Helper`); it now returns 9, matching its non-generic control | `testGnNsNestedInStructNotNamespace` |
+| T5 | **TIGHTENING.** A bare generic name used BEFORE a same-named namespace-local template is declared now fails | T2 meeting a PRE-EXISTING gap: use-before-generic-declaration fails identically at global scope on both binaries | - |
+
+T5's diagnostic blames C interop on a file with no C interop - it is the generic opaque-shell
+message reused for an incomplete layout of any cause. Filed as
+[[incomplete-layout-message-blames-c-interop]].
+
+**Two silent wrong values shipped in round 2 and were caught by review. Both are the same
+mistake:** struct nesting and namespace nesting share ONE dotted key space (a template in
+`namespace Outer` and one nested in `struct Outer` are both keyed `Outer.Box`), so recovering the
+declaring scope with `rfind('.')` on the key resolved a struct-nested template's body against a
+same-named namespace. Fixed with a parallel map, `GenericTemplateState::genericTemplateNamespace`,
+written at registration from `GetCurrentNamespace()`. The mirror of it lived in the ALIAS path: a
+`using` generic-base alias's already-qualified TARGET was piped through the namespace walk at the
+USE site, so a global `using GBox = Box;` silently named `NS.Box` inside `namespace NS`. An alias
+hit now short-circuits the walk. Pinned by `testGnNsNestedInStructNotNamespace` and
+`testGnNsGenericBaseAliasKeepsDeclSiteMeaning`.
+
+**`currentNamespace_` must not survive a reset.** `LogError` THROWS on the batch (`--check`) and
+LSP paths, unwinding past any hand-rolled save/restore. Since this fix that value steers the key
+space, so a file erroring inside a namespace caused FALSE REJECTIONS in every later file of a
+batched `--check` (`Checked 2 file(s), 2 failed` where the second passes alone). Both halves are
+required: `ResetForReanalysis` clears it, and every save/restore site is RAII via
+`LLVMBackend::NamespaceScope`. **`test.sh` cannot express this regression** - it runs one file per
+process; `test.bat` is the batching consumer, and the same reset path backs LSP re-analysis.
+
+**Untested cross-platform risk (Windows only).** `ScanGenericTypeUses`,
+`QueueInstantiateGenericType` and `ScanAndQueueGenericTypeUses` now also see the dotted
+`qualifiedGenericIdentifier` spelling, so a WinRT base such as
+`Windows.Foundation.IReference<int>` can reach `pendingInstantiations` from two sites it
+previously could not. It falls through to the idempotent `InstantiateWinrtGenericInterface`, and
+the new qualified branch is gated on `IsGenericTemplateKey`, which a winmd base never satisfies.
+
+### `e2a23d5` - namespace key space, layers 2, 3 and 4
+
+The one root, stated once: a generic template's identity, its type arguments, and the names
+inside its body were all carried as **spellings re-resolved later**, against whatever scope
+happened to be current at the time. The rule every layer converged on:
+
+> **A name must be RESOLVED once, where the scope that gives it meaning is still current, and the
+> resolved result RECORDED. Never re-derive a declaring scope from a key string, and never
+> re-resolve a spelling downstream.**
+
+It was learned four separate times: (1) layer 1's key conventions; (2) layer 1 round 3's declaring
+scope, derived with `rfind('.')`; (3) layer 1 round 3's alias target, re-resolved at the use site;
+(4) layer 3's body consumers - `activeTypeSubstitutions` stores the CALLER-resolved name
+correctly, but for a global type that name is a bare string, and three downstream sites ran it
+back through the enclosing-namespace walk.
+
+**Layer 2 - type ARGUMENTS.** `Box<Item>` in `namespace A` and at global scope both mangled to
+`Box__Item`, so the two uses collapsed onto ONE instantiation whose contents were decided by
+whichever caller drained it first. Correct is `inA=7 global=9`; pre-fix `09f1d56` gave
+`inA=7 global=7` and layer 1 flipped it to `inA=9 global=9` - same wrongness, now landing on the
+namespace-local caller, the case this work exists to enable. Fixed with
+`LLVMBackend::ResolveTypeArgBaseName` plus `IsTypeArgTypeKey`, whose accept set is
+`dataStructures + interfaceTable + gts.scannedTypeNames` - **types only**, so a namespace sibling
+function, global or namespace cannot hijack an argument spelling. Both passes resolve through that
+one function, and tuple ELEMENTS go through it too, so `(Item, int)` sugar and an explicit
+`tuple<Item, int>` cannot mangle differently.
+
+**Layer 3 - the template BODY.** Layer 2 gave the two instantiations distinct mangled names, and
+the body then re-resolved the substituted spelling `Item` while the template's DECLARING namespace
+was installed, filling both with `N.Item`. Fixed by resolving a substituted name from the root
+(`forceRoot`) instead of relative to the declaring namespace - three sites, plus **six
+`CreateOverloadedFunctionCall(fieldTypeName, {})` field-initializer sites found in review**, which
+the first cut missed: `T t = default;` routes through `GenerateDefaultValue`, so a field with no
+initializer took a different path and produced
+`Invalid InsertValueInst operands! ... insertvalue %N.Box__Item zeroinitializer, %N.Item %1, 0`.
+
+**Layer 4 - generic FUNCTION templates.** The whole key space was untouched for free functions:
+`IsGenericTemplateKey` never consulted `genericFunctionTemplates`, so a BARE call from inside the
+declaring namespace either fell back to a same-named GLOBAL template (silent wrong answer) or hard
+-errored if none existed. **It was not primarily a collision problem** - a completely unique
+namespaced generic function was unreachable bare from its own namespace
+(`no overload of 'gf7IdentNsOnly__int' matches the given arguments.`). Qualified calls already
+worked, because the call-site text spells the registered key. Headline repro after the fix:
+`ns=11 global=10 unique=15`.
+
+**Verbatim pre-fix witnesses**, rescued from the three corpora before they were deleted. Each row
+is a shape that a green suite could not see:
+
+| Layer | Shape | Pre-fix result |
+|---|---|---|
+| 2 | global `Item` vs `A.Item` as a `Box<T>` argument | `inA=9 global=9` (want `inA=7`) |
+| 2 | two namespaces + global, one template | `inA=1 inB=1 global=1` (want 2, 3, 1) |
+| 2 | `Box<Item*>` with DIFFERING field layouts | `inA=0 global=9` |
+| 2 | differing layouts, field only on the losing side | `Unknown identifier 'x'.` |
+| 3 | `T` as a FIELD, global instantiation | `9 != 3` (both instantiations got the namespace's `Item`) |
+| 3 | `T` as a method PARAMETER | did not compile: `arg=Bs3Item param=BsN3.Bs3Item` - the clearest single statement of the layer |
+| 3 | `T` as a method RETURN type | verifier: `Function return type does not match operand type of return inst!` |
+| 3 | field with NO `= default`, and a mismatching initializer | silent `expected 9 got 3` (found in review, after the first fix) |
+| 4 | bare call from inside the declaring namespace | `ns=10 global=10` (want 11, 10) |
+| 4 | UNIQUE namespaced name, bare call from its own namespace | hard error - not a collision at all |
+| 4 | declaration order reversed (namespaced first) | hard error |
+| 4 | varargs / nested namespaces / inferred type args / member-vs-free | wrong VALUE (all got the global 10) |
+
+**The review lesson this work paid for twice, stated precisely.** Both misses were missing
+INPUTS, not weak assertions - every leg here asserts a value and asserts the namespaced and
+global answers together, so a collapse cannot hide. Layer 3's legs covered one SPELLING of the
+shape; layer 4's first cut covered only the COLLIDING spelling, where a same-named global
+template absorbs the call, so a value-correct leg still passes when the bare spelling never
+reaches its own namespace's key. Legs C, F, I and L in `Test/test_generics.cb` now carry
+UNIQUE-NAME twins whose names exist nowhere globally, and leg J carries the opposite direction of
+its collision. **With those axes covered, the current 536/0/8 is much stronger evidence than the
+522/526/530 runs were** - those were green over a suite with no namespaced-generic legs at all.
+The generalized form is in [`internal/fix-issue-lessons.md`](../fix-issue-lessons.md) under
+"On tests".
+
+**Shapes deliberately NOT covered, because they do not exist or fail identically on both
+binaries:** parameter pack / `sizeof...` on a generic free function (the grammar rejects
+`f<T...>`; `genericFunctionPackIndex` is read but never written); an interface-typed receiver with
+a `where`-constrained plain parameter (`InferAndInstantiateGenericFunction` structurally cannot
+infer `T` from that shape - the `IVal<T>`-shaped-first-parameter form DOES work and is covered);
+member template with inferred type args; and the partially-qualified sibling spelling
+(`In.p9id<int>(...)` -> `Undefined variable In.`, non-generic control identical).
+
+**What is still not true about "namespaced generics work".** All four layers are closed, but each
+of these remains, filed separately: [[generic-interface-name-vetoed-by-core-template]];
+[[namespaced-using-alias-leaks-globally]], [[namespaced-struct-static-method-not-dispatched]],
+[[namespaced-interface-shadowed-by-global-is-broken]],
+[[tuple-sugar-in-namespace-does-not-compile]]; a generic-interface parameter with a namespaced
+type argument fails module verification; a template body cannot name a sibling TYPE of its
+declaring namespace; a type nested in `struct Outer` cannot be a generic argument from inside
+`Outer`; and a bare call from a STRUCT METHOD body inside a namespace answers the global template
+(pinned next to its non-generic control, which does the same). That last one is what a reader is
+most likely to hit next when writing namespaced generic code.
+
+**UNFILED, never root-caused:** a `using` generic-BASE alias used in the same namespace as a BARE
+use of its target fails on BOTH binaries (pre-fix `incomplete layout`, post-fix `cannot cast an
+aggregate value...`). Only the message moved, so not a regression, but the shape had to be avoided
+when writing `testGnNsGenericBaseAliasKeepsDeclSiteMeaning`. Suspected: `ScanGenericTypeUses`'s
+`tryPreDeclare` pre-declares the shell under the ALIAS spelling while the main pass mangles the
+alias TARGET - a guess, not a diagnosis.
+
+### The 2026-07-29 session
+
+- **A primitive-element array boxed into an interface was accepted and miscompiled.** The real
+  mechanism is UNREACHABILITY, not a guard that failed to fire: `RejectPointerShapedInterfaceUpcast`
+  sits behind a `StructImplementsInterface()` early-out at every boxing site, and `"int"` never
+  satisfies that. The GLOBAL vs LOCAL divergence is purely **Constant vs Instruction**: a global
+  array operand is an `llvm::Constant`, so IRBuilder folds the bitcast into a ConstantExpr, which
+  the verifier does not subject to the instruction-level check - it verified clean and detonated in
+  SelectionDAG; a local array decays to a GEP, so a real bitcast INSTRUCTION is emitted and the
+  verifier rejects it. Same bug, two completely different-looking outcomes. Four boxing sites
+  needed the guard and the fourth (`CoerceInitValueToInterface`, shared by brace-init and the
+  `<Tag attr=...>` element path) was missed on the first pass. Parens do NOT defeat the guard; an
+  `auto` intermediate does, and that is [[auto-binding-of-fixed-array-loses-shape]] rather than a
+  widening of the guard.
+- **Returning a `?:` join of concrete pointers as an interface** aborted with a raw verifier dump.
+  The filed account was right as far as it went but missed two things: under a `move` return type
+  the plain spelling was a FALSE REJECTION ("returned expression is not owned") because a phi is
+  not a `LoadInst`; and boxing alone was not enough, since the helper built its fat value directly
+  and never ledgered an `InterfaceBoxRecord`, so the non-`move` heap arm silently leaked and
+  nothing nulled the arms' owning locals. Fix: box from the return path BEFORE the ownership and
+  dangle checks, ledger each arm, and null each OWNING arm's source inside its own block (verified
+  200 constructions / 200 destructions over 100 alternating calls).
+- **Duplicate constructor signature crashed the compiler with no diagnostic.** The filed guess
+  (runaway recursion) was WRONG: `CreateFunctionDefinition` early-returns an already-bodied
+  function before `createFunctionBlock`, the only thing that pushes a function scope, and
+  `ParseConstructorDefinition` lacked the guard `ParseFunctionDefinition` has, so
+  `RegisterThisPointer` indexed an empty deque. The "corrupted map" in the crash dump was that
+  empty-container read - which is why duplicate METHODS never crashed. The message's noun is
+  picked by "declares a typeSpecifier", NOT by `declarationSpecifiers() == nullptr`, because a
+  real ctor may carry `inline`/`static`/`const`/`extern`/`stdcall` (`CFlat.g4:783`). **Do not
+  "simplify" that back.**
+- **A function-pointer parameter on an interface method was never lowered, in EITHER direction.**
+  Both conversions are now the shared `LowerClosureFatToThinFnPtr` /
+  `WidenBareOrThinToClosureFat`. The widen must not key off `isPointerTy()`: under opaque pointers
+  every data pointer looks like a code pointer. It REJECTS ONLY WHAT IT CAN PROVE IS DATA. The
+  issue was originally fixed for the fat-to-thin half only, because the regression test used
+  lambda literals - the one shape that half handles. Cover all four source shapes (literal, named
+  function, thin variable, fat variable) against BOTH slot flavours. See
+  [[closure-param-accepts-data-pointer]].
+- **`as` boxing skipped every ownership guard the plain spelling applies.** One
+  `BoxConcreteIntoInterface` (`MainListener.h:9969`) now carries all six guards for the
+  declaration-init and `as` paths. The prerequisite that unblocked it - plumbing the source
+  `NamedVariable` into `ParseTypeCheckExpression` via `SoleCastOperandOf` - was built and verified
+  BEHAVIOUR-NEUTRAL before any guard was added; do it in that order. **The change BREAKS source
+  that was only memory-correct because the transfer was missing**: boxing an owning local with
+  `as` and then still using it is now `use of moved`. `Test/test_interface.cb` contained such a
+  program and was adapted.
+
+### The 2026-07-28 session
+
+- **`as` / `is` fell through to the interface-source path on any unrecognised operand.**
+  `GenerateSafeCast` / `GenerateIsCheck` inferred "this is a fat pointer" from the ABSENCE of a
+  concrete struct name, so a pointer `?:` phi and a decayed `T[N]` both read unrelated storage as
+  `{vtable, data}`. Replaced with `ClassifyCastSource`, a positive routing decision. **The two
+  shapes needed OPPOSITE answers** - the ternary had to be made to BOX (the plain spelling already
+  worked, so rejecting it would have regressed expressiveness) while the array had to be REJECTED
+  with the plain spelling's exact wording. That is why checking the plain spelling first is the
+  rule, not a nicety. The filed severity was also wrong: it was recorded as a compiler crash with
+  zero output, but `--run` JITs in-process, so the PROGRAM's SIGSEGV looked like the compiler's.
+- **`as` cast of a stack value to an interface crashed the compiler** - `elemType` propagation:
+  `ParseMultiplicativeExpression` populates `TypedValue::elemType` only for pointer sources, so a
+  stack class value reached `GenerateSafeCast` with a null `elemType` and `CreateExtractValue`
+  ran on a class aggregate.
+- **Named arguments were ignored on the interface call path.** Fixing it made call-site index and
+  declared-parameter index diverge on that path for the first time, exposing three downstream
+  sites that had silently relied on them being equal. Auditing the fields the interface arm failed
+  to copy surfaced two more: a FALSE REJECTION of legal `alignas` code on a `move` parameter, and
+  a SILENT MISCOMPILE where `u8 200` through an interface widened to `-56`.
+
+
+## Consolidation record (2026-07-30)
+
+Three root-level merges, 64 open issues -> 58. Each merged only where the files themselves
+named a shared root and a shared fix vehicle - never on a shared symptom.
+
+| Merged into | From | Root |
+|---|---|---|
+| Generic namespace key space (fixed, `e2a23d5`; record below) | `generic-template-namespace-key-space`, `generic-type-arguments-not-key-space-resolved`, `generic-template-body-rebinds-substituted-type-arg`, `generic-function-templates-are-bare-keyed` | Names carried as SPELLINGS re-resolved later, instead of resolved once and recorded. Four layers: base, arguments, body, function templates. |
+| [[interface-boxing-keyed-on-source-binding]] | `interface-boxing-guards-are-binding-dependent`, `null-coalesce-join-into-interface-not-boxed`, `interface-boxing-sites-not-fully-consolidated` | Boxing keys off the source `NamedVariable`, so parens / `?:` / `??` fall through. |
+| [[overload-replay-blames-wrong-candidate]] | `named-arg-replay-reports-losing-candidate`, `iface-slot-replay-blames-wrong-slot` | A non-probed replay with no notion of which candidate the user meant. Both files already named the same fix. |
+
+Also retired: `generic-interface-registered-as-opaque-struct` (fixed and committed as
+`09f1d56`; its design record is in the archive, and the gaps it spawned are all filed
+separately). Newly filed: [[incomplete-layout-message-blames-c-interop]], split out of the
+key-space work because two ratification records lean on a message that names the wrong cause.
+
+**Deliberately NOT merged**, so their findings are not buried:
+
+- The four namespace gaps ([[namespaced-using-alias-leaks-globally]],
+  [[namespaced-struct-static-method-not-dispatched]],
+  [[namespaced-interface-shadowed-by-global-is-broken]],
+  [[tuple-sugar-in-namespace-does-not-compile]]) share the word "namespace" and nothing else:
+  registration scope, call dispatch, lookup order, and a parser gap.
+- The fixed-array trio ([[fixed-array-copy-invalid-bitcast]],
+  [[fixed-array-parameter-not-callable]], [[auto-binding-of-fixed-array-loses-shape]]) has a
+  plausible shared root - the array SHAPE is dropped to a bare `T` - but it is UNPROBED.
+  Grouping them in the index is honest; merging them on an unverified hypothesis is not.

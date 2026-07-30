@@ -68,7 +68,7 @@ walking IR" argument that drove the boxing consolidation, which has since landed
 NOT close this issue - the shapes here fail EARLIER, at the point of recovering a declared
 type to name in the message, before any boxing record exists. But it means the recovery
 should be written once, in the helper, rather than as a third walk bolted onto the
-classifier. See [[interface-boxing-sites-not-fully-consolidated]].
+classifier. See [[interface-boxing-keyed-on-source-binding]].
 
 ## Guard rail
 
@@ -78,4 +78,4 @@ issue is fixed, update that comment and add legs for both shapes.
 
 ## Related
 
-[[interface-boxing-sites-not-fully-consolidated]], [[interface-issue-queue]]
+[[interface-boxing-keyed-on-source-binding]], [[interface-issue-queue]]

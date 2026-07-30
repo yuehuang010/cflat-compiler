@@ -1,7 +1,7 @@
 # 'if const (<const global>)' at file scope corrupts an already-emitted unrelated function
 
 Filed 2026-07-29, found while building corpus legs for
-`generic-interface-registered-as-opaque-struct.md`. **Pre-existing on master** (verified against a
+the generic-interface registration work (`09f1d56`, design record in `interface-issue-queue.md`). **Pre-existing on master** (verified against a
 pre-fix binary) and unrelated to the generic-interface work - it just happens to be the shape you
 reach for when you want an `if const` condition that a source-only pass cannot fold.
 

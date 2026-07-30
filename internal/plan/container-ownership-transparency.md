@@ -3,7 +3,7 @@
 Opened 2026-07-21. GOAL, multi-change, iterative. This is the forward direction that the queue
 `if const` spike surfaced. It extends the `unique` workstream ([[unique-ownership]]) and relates to
 [[ownership-move-alias-discipline]], [[move-dataflow]], and the delete-borrow issue
-(`internal/issue/delete-borrow-via-named-local.md`).
+(`internal/issue/p2/delete-borrow-via-named-local.md`).
 
 ## The goal, in one line
 

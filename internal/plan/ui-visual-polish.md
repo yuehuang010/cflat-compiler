@@ -23,7 +23,7 @@ no typographic hierarchy.
   caches `NSFont` variants (`_fontFor`), applies them on ELEM_TEXT create + re-sync
   (`_applyTextFont`), and honors fontId in `measureText`. Canvas/TUI paint is a
   documented no-op; Win32/WinUI fall back to the default font.
-- **Parity**: `internal/issue/ui-native-visual-polish-win32-winui.md` records both
+- **Parity**: `internal/issue/ui/ui-native-visual-polish-win32-winui.md` records both
   features as Cocoa-only (Win32/WinUI no-op, non-silent).
 - **Tests**: tui_demo self-test +1 (`testTextFont`, 19/19); gallery self-test stays
   33/33 (card backdrops key off container paths, not policed by the stress census).

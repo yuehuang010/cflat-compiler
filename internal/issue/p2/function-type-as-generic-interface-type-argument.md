@@ -1,7 +1,7 @@
 # 'function<R(Args)>' as a generic-interface type argument does not round-trip
 
 Filed 2026-07-29 out of round 2 of the adversarial review of
-`generic-interface-registered-as-opaque-struct.md`. Fails on both the pre-fix and post-fix binaries
+the generic-interface registration work (`09f1d56`, design record in `interface-issue-queue.md`). Fails on both the pre-fix and post-fix binaries
 with a clean, located diagnostic in each case - a **gap, not a regression**, and no verifier failure
 or crash in either.
 

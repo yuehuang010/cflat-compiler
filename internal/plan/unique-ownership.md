@@ -72,7 +72,7 @@ explicitly NOT chosen yet - LANDED 2026-07-20 for six types, see the ledger;
 (3) `~Thread()` on a still-running thread is an ERROR (compile-time
 ideal, runtime acceptable), never a silent join or detach - NOT IMPLEMENTED: the audit found a
 real copy path AND a deliberate detach pattern in `channel.operator>>` that the ruling's own
-semantics would abort. See `internal/issue/thread-cannot-go-raii.md`.
+semantics would abort. See `internal/issue/p3/thread-cannot-go-raii.md`.
 
 **Process lessons from this session - these cost real time, do not relearn them.**
 
@@ -242,8 +242,8 @@ the call sites - C#-like local readability, with the complexity paid once in the
    | `event` | none (only `latch._ev`; `latch` never copied) | **RAII** - `~event()` + null guard in `destroy()` |
    | `semaphore` | none (only `ThreadPool._ready` + 3 locals) | **RAII** - `~semaphore()` |
    | `barrier` | none (2 locals; workers get `barrier*`) | **RAII** - `~barrier()` |
-   | `Thread` | **YES** - `nw[i] = _workers[i]` in `ThreadPool.resize()`, `threadpool.cb:659` | **SKIPPED** - `internal/issue/thread-cannot-go-raii.md` |
-   | `block_pool` / `arena_channel` / `page_pool` | n/a - blocked on a precondition, not a copy | **SKIPPED** - `internal/issue/pools-no-destructor-shutdown-ordering.md` |
+   | `Thread` | **YES** - `nw[i] = _workers[i]` in `ThreadPool.resize()`, `threadpool.cb:659` | **SKIPPED** - `internal/issue/p3/thread-cannot-go-raii.md` |
+   | `block_pool` / `arena_channel` / `page_pool` | n/a - blocked on a precondition, not a copy | **SKIPPED** - `internal/issue/p3/pools-no-destructor-shutdown-ordering.md` |
 
    Transitive containment was audited too (`event` -> `latch`; `mutex` -> `BucketAllocator`
    -> `block_pool` -> `arena_channel`; `mutex` -> `barrier`/`stream`/`ThreadPool`/

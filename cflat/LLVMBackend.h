@@ -175,6 +175,13 @@ struct GenericTemplateState
     // veto is preferred over guessing the other way. Tracked in
     // internal/issue/generic-interface-name-vetoed-by-core-template.md.
     std::unordered_set<std::string>                                             scannedGenericStructNames;
+    // Qualified names of every struct/class/interface DEFINITION the forward-ref scan saw, generic
+    // or not. The accept set for resolving a generic type ARGUMENT's spelling (see
+    // ResolveTypeArgBaseName): dataStructures/interfaceTable are not populated yet when
+    // ScanGenericTypeUses runs, and are order-dependent while ScanExternalDeclaration walks. Like
+    // the two scannedGeneric*Names sets it is deliberately NOT cached - a warm cache restores
+    // dataStructures + interfaceTable, which is what a cached core type needs.
+    std::unordered_set<std::string>                                             scannedTypeNames;
     // Template key -> the NAMESPACE it was declared in, recorded at registration. It CANNOT be
     // derived from the key: struct nesting and namespace nesting share one dotted key space, so a
     // template nested in `struct Outer` is keyed "Outer.Box" exactly like one in `namespace Outer`.
@@ -1338,8 +1345,13 @@ public:
         // is re-evaluated for real later, where the diagnostic (if any) fires normally.
         if (suppressErrors_)
             throw SpeculativeEvalAbort{};
+        // An expect_error match is not a real diagnostic - test it before the sink dispatch so it
+        // never reaches the editor as a live error, nor aborts LSP analysis of the rest of the file.
+        bool isExpectedMatch = !expectedError.empty() && message.find(expectedError) != std::string::npos;
         if (diagnosticSink_)
         {
+            if (isExpectedMatch)
+                throw ExpectedErrorReceived{};
             // LSP mode: cout is redirected to stderr and would duplicate the diagnostic already
             // sent to the client over the sink. Don't echo.
             diagnosticSink_(sourceFileName, currentLine, currentColumn, message, 1);
@@ -1348,7 +1360,7 @@ public:
         std::cout << std::format("{}({},{}): {}\n", sourceFileName, currentLine, currentColumn, message);
         if (!expectedError.empty())
         {
-            if (message.find(expectedError) != std::string::npos)
+            if (isExpectedMatch)
             {
                 std::cout << "PASS: expected error received\n";
                 throw ExpectedErrorReceived{};
@@ -9397,6 +9409,97 @@ public:
                 if (dot == std::string::npos) break;
                 prefix = prefix.substr(0, dot);
             }
+        }
+        return base;
+    }
+
+    /*
+     * True when `key` is a generic FUNCTION template that was declared DIRECTLY in namespace `ns`.
+     * The declaring namespace is the one RECORDED at registration, never re-derived from the key:
+     * "Outer.get" is equally the key of a free template in `namespace Outer` and of a method
+     * template on `struct Outer`, and only the recorded value tells them apart.
+     */
+    bool IsGenericFunctionKeyInNamespace(const std::string& key, const std::string& ns) const
+    {
+        if (gts.genericFunctionTemplates.count(key) == 0) return false;
+        auto it = gts.genericTemplateNamespace.find(key);
+        return it != gts.genericTemplateNamespace.end() && it->second == ns;
+    }
+
+    /*
+     * Resolve the SPELLED base of a generic FUNCTION call to the key its template is registered
+     * under - the function-side counterpart of ResolveGenericTemplateBase. A free generic function
+     * declared in a namespace is keyed "NS.f", so a BARE call written inside that namespace has to
+     * walk the enclosing-namespace chain (INNERMOST FIRST, so a namespace-local template wins over
+     * a same-named global one) or it can never reach its own namespace's key.
+     *
+     * Deliberately NOT folded into IsGenericTemplateKey: that predicate also routes TYPE spellings
+     * (an instantiation's base, a forward-scan shell), and a function key must never name a type.
+     * A spelling that ALREADY contains a dot is root-anchored and returned untouched, matching the
+     * type-argument rule - a qualified call site already spells its own key.
+     */
+    std::string ResolveGenericFunctionBase(const std::string& base) const
+    {
+        if (base.empty() || currentNamespace_.empty()) return base;
+        if (base.find('.') != std::string::npos) return base;
+        std::string prefix = currentNamespace_;
+        while (true)
+        {
+            if (std::string candidate = prefix + "." + base;
+                IsGenericFunctionKeyInNamespace(candidate, prefix))
+                return candidate;
+            auto dot = prefix.rfind('.');
+            if (dot == std::string::npos) break;
+            prefix = prefix.substr(0, dot);
+        }
+        return base;
+    }
+
+    /*
+     * True when `key` names a TYPE. The accept set for resolving a generic type ARGUMENT: only
+     * type-shaped keys, so a same-named namespace sibling function or global never hijacks an
+     * argument spelling (the mirror of IsGenericTemplateKey accepting only template keys).
+     * All three legs are load-bearing and none is redundant: `scannedTypeNames` is the only one
+     * populated while ScanGenericTypeUses runs and the only ORDER-INDEPENDENT one during the main
+     * pass, but it is rebuilt per compile and so is empty for anything a WARM --init cache
+     * restored; dataStructures and interfaceTable are the cached halves, and they are separate
+     * registries - an interface has an interfaceTable entry, not a dataStructures one.
+     */
+    bool IsTypeArgTypeKey(const std::string& key) const
+    {
+        return dataStructures.count(key) != 0
+            || interfaceTable.count(key) != 0
+            || gts.scannedTypeNames.count(key) != 0;
+    }
+
+    /*
+     * Resolve the SPELLED bare name of a generic type ARGUMENT to the key its type is registered
+     * under - the argument-side counterpart of ResolveGenericTemplateBase. Without it `Box<Item>`
+     * written at global scope and inside `namespace A` (which declares its own `Item`) both mangle
+     * to "Box__Item" and collapse onto ONE instantiation whose layout is decided by drain order.
+     * Enclosing-namespace chain, INNERMOST FIRST, accepting only a candidate that names a type.
+     * Callers must not apply it to an already-substituted argument.
+     *
+     * A spelling that ALREADY contains a dot is returned untouched, which is where this differs
+     * from ResolveGenericTemplateBase. Ordinary type lookup resolves a dotted name from the top
+     * (`ResolveQualifiedName` only walks outward for a name with NO dot), so relatively resolving
+     * one here made a single spelling mean two types in one scope: `B.Item` as a plain local named
+     * the top-level B.Item while `Box<B.Item>` named A.B.Item. For a template BASE there is no
+     * second lookup to disagree with - the mangled name IS the identity - which is why the base
+     * walk is deliberately left unguarded.
+     */
+    std::string ResolveTypeArgBaseName(const std::string& base) const
+    {
+        if (base.empty() || currentNamespace_.empty()) return base;
+        if (base.find('.') != std::string::npos) return base;
+        std::string prefix = currentNamespace_;
+        while (true)
+        {
+            if (std::string candidate = prefix + "." + base; IsTypeArgTypeKey(candidate))
+                return candidate;
+            auto dot = prefix.rfind('.');
+            if (dot == std::string::npos) break;
+            prefix = prefix.substr(0, dot);
         }
         return base;
     }

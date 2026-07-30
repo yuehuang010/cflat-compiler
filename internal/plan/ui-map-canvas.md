@@ -10,7 +10,7 @@ Status - M1+M2: DONE (2026-07-12). Interactive CanvasView input (pointer/wheel/
 pinch, POINTS coords, opt-in via setOn*/has* flags) + canvas image handles
 (canvasCreateImage/canvasReleaseImage + Canvas.drawImage) landed on the Cocoa
 host; TUI host + drivers headless-testable; Win32/WinUI recorded as a parity gap
-(internal/issue/ui-native-canvas-input-images-win32-winui.md). Gates on the mac
+(internal/issue/ui/ui-native-canvas-input-images-win32-winui.md). Gates on the mac
 box: tui_demo 22/22 (was 19), gallery 35/35, fedit pass, test.sh 160/0,
 example_mac.sh 34/0; live cocoa event path smoke-verified (no crash). Docs in
 doc/UI.md. See the annotated M1/M2 sections below for the shipped seam.

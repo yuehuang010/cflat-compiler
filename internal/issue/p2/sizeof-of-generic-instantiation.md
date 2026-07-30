@@ -1,6 +1,6 @@
 # 'sizeof(Generic<T>)' does not mangle its type arguments - "unknown type 'B<int>'"
 
-Filed 2026-07-29, split out of `generic-interface-registered-as-opaque-struct.md`. That issue
+Filed 2026-07-29, split out of the generic-interface registration work (`09f1d56`, design record in `interface-issue-queue.md`). That issue
 listed `sizeof(C<int>)` on a generic INTERFACE as part of its accept set, but the gap is not
 interface-specific at all and is unchanged by that fix.
 

@@ -312,7 +312,7 @@ into a `CGImage`-backed `NSImage` and drawn upright into the flipped `CfCanvasVi
 | `canvasCreateImage` / `Release` | real `NSImage` | nonzero DUMMY handle | nonzero DUMMY handle | nonzero DUMMY handle |
 | `ICanvas.drawImage` | real blit | no-op | no-op | no-op |
 
-The Win32/WinUI gaps are tracked in `internal/issue/ui-native-canvas-input-images-win32-winui.md`;
+The Win32/WinUI gaps are tracked in `internal/issue/ui/ui-native-canvas-input-images-win32-winui.md`;
 the map example is native-host-first and SKIPs there until they close.
 
 **Accent buttons (v15).** A themed push button no longer stays light in dark mode. The Win32 host
@@ -525,7 +525,7 @@ backdrop (a native handle keyed by the container's path), not a layout parent:
 children still position at their absolute frames, and inside a `ScrollView` the
 backdrop lives in the document view so it scrolls with its card. `Box` maps to a
 native `NSBox` and is unaffected. Win32/WinUI do not paint container backgrounds yet
-(see `internal/issue/ui-native-visual-polish-win32-winui.md`).
+(see `internal/issue/ui/ui-native-visual-polish-win32-winui.md`).
 
 ## Layout protocol (one pass, pluggable strategy)
 

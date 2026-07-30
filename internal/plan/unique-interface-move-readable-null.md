@@ -8,7 +8,7 @@ work discovered during implementation is tracked in its own issue files, NOT her
 found by the step-5 audit) and `internal/issue/ternary-iface-borrow-arm-module-verify.md`
 (borrowed thin-pointer arm in an interface ternary fails module verification). This file is
 kept as the design record. Promoted from the residual section of
-`internal/issue/deref-of-moved-pointer-guard-inside-callee.md` because closing it is a
+`internal/issue/p2/deref-of-moved-pointer-guard-inside-callee.md` because closing it is a
 LANGUAGE semantics change to what a moved-from interface local is, not the one-line
 `RecordNullDerefFor` call that residual advertised.
 

@@ -19,7 +19,7 @@ the main session, not just self-reported. Its `scratch/` holds the entire repro 
 (~60 files: `repro_*.cb`, `p_*.cb`, `q*.cb`, `rv/*.cb`) - that corpus is the single most
 valuable artifact here and is worth more than the diff.
 
-Note the branch DELETES `internal/issue/iface-ifconst-base-clause-implementor.md`. If it is
+Note the branch DELETES `internal/issue/p2/iface-ifconst-base-clause-implementor.md`. If it is
 ever revived, that deletion is premature until the feature actually ships.
 
 ## The design, and what survived

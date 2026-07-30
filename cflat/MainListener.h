@@ -98,9 +98,14 @@ static bool IsBadArrayArg(Ctx* c)
 // Type-arg string for one tuple element: the bare type plus its reference-kind suffix
 // ("*" pointer, "[]" noalias array-view). Bad bracket forms (`[N]`, `[]*`) contribute no
 // suffix here - the authoritative tuple-sugar path rejects them with a diagnostic.
-static std::string TupleEntryArgName(CFlatParser::TupleTypeEntryContext* entry)
+// `compiler` namespace-resolves the element type the same way a generic type ARGUMENT is
+// resolved, so the `(Item, int)` sugar and an explicit `tuple<Item, int>` keep mangling to one
+// name inside a namespace that declares its own Item.
+static std::string TupleEntryArgName(const LLVMBackend* compiler, CFlatParser::TupleTypeEntryContext* entry)
 {
-    std::string argName = entry->typeSpecifier()->getText();
+    std::string argName = compiler != nullptr
+        ? compiler->ResolveTypeArgBaseName(entry->typeSpecifier()->getText())
+        : entry->typeSpecifier()->getText();
     if (entry->pointer() != nullptr) argName += "*";
     else if (IsArrayViewArg(entry)) argName += "[]";
     return argName;
@@ -313,6 +318,25 @@ static std::string MangleTypeArg(const std::string& typeName)
         else result += typeName[i];
     }
     return result;
+}
+
+// Namespace-resolve a type-argument string that carries a reference-kind suffix ("Item*",
+// "Item[]"): only the bare core participates in the walk. For the two scanner paths that build the
+// arg string from a raw getText(); paths that keep the core separate call
+// LLVMBackend::ResolveTypeArgBaseName directly. No ownership-prefix handling: getText() has no
+// whitespace, so a `unique`/`alias` arg arrives as "uniqueItem*" and never reaches here as a
+// prefixed spelling (those two are routed through ResolveForwardTypeArg instead).
+static std::string ResolveTypeArgSpelling(const LLVMBackend* compiler, const std::string& arg)
+{
+    if (compiler == nullptr || arg.empty()) return arg;
+    size_t end = arg.size();
+    while (end > 0 && (arg[end - 1] == '*' || arg[end - 1] == '[' || arg[end - 1] == ']'))
+        end--;
+    if (end == 0) return arg;
+    std::string core = arg.substr(0, end);
+    std::string resolved = compiler->ResolveTypeArgBaseName(core);
+    if (resolved == core) return arg;
+    return resolved + arg.substr(end);
 }
 
 // The generic instantiation written at `ts`, covering BOTH spellings: the bare `Box<int>`
@@ -1216,7 +1240,7 @@ private:
                             break;
                         std::vector<std::string> typeArgs;
                         for (auto* entry : tts->tupleTypeEntry())
-                            typeArgs.push_back(TupleEntryArgName(entry));
+                            typeArgs.push_back(TupleEntryArgName(compiler, entry));
                         std::string mangledName = "tuple";
                         for (const auto& arg : typeArgs) mangledName += "__" + MangleTypeArg(arg);
                         compiler->CreateStructType(mangledName, {});
@@ -1294,7 +1318,7 @@ private:
                             || TypeArgHasUnique(entry))
                             typeArgs.push_back(ResolveForwardTypeArg(entry));
                         else
-                            typeArgs.push_back(entry->getText());
+                            typeArgs.push_back(ResolveTypeArgSpelling(compiler, entry->getText()));
                     }
                     std::string mangledName = baseName;
                     for (const auto& arg : typeArgs) mangledName += "__" + MangleTypeArg(arg);
@@ -2018,7 +2042,10 @@ public:
         }
         else
         {
-            resolved = typeSpec ? typeSpec->getText() : entry->getText();
+            // Same namespace walk as the main pass's ResolveTypeArgEntry (no active substitutions
+            // during the scan), so a bare 'Item' inside 'namespace A' names A.Item in both passes.
+            resolved = Compiler(entry)->ResolveTypeArgBaseName(
+                typeSpec ? typeSpec->getText() : entry->getText());
         }
         // `T[]` array-view arg encodes as a "[]" suffix (mirrors "*" for a pointer); the bad
         // bracket forms are rejected in the main pass, so the forward scan just names them.
@@ -2359,6 +2386,9 @@ public:
     // condition and routes the local to a fat pointer while the scan had built an opaque struct
     // signature), while the struct name does NOT, because a struct name only ever VETOES the
     // interface routing and a guess there silently disables the fix.
+    // No typePath parameter: the grammar puts `ifConstDeclaration` only in `externalDeclaration`
+    // and `ifConstBlock`, so this arm is reachable only at file/namespace scope. A struct-body
+    // `if const` parses as `ifConstMember`, which is the overload below.
     void CollectGenericTemplateDeclsIfConst(CFlatParser::IfConstDeclarationContext* ctx, bool certain,
                                             bool ifConstUnfoldable = false, const std::string& ns = {})
     {
@@ -2382,26 +2412,29 @@ public:
         else if (ifBlocks.size() > 1) CollectGenericTemplateDecls(ifBlocks[1], certain, ifConstUnfoldable, ns);
     }
 
-    // Same walk for a member-scope `if const` (a nested generic type inside a class).
+    // Same walk for a member-scope `if const` (a nested generic type inside a class). Member scope
+    // is inside a type body, so `typePath`/`unkeyable` ride along unchanged - a type declared in
+    // one of these arms is still keyed under its enclosing struct.
     void CollectGenericTemplateDeclsIfConstMember(CFlatParser::IfConstMemberContext* ctx, bool certain,
-                                                 bool ifConstUnfoldable = false, const std::string& ns = {})
+                                                 bool ifConstUnfoldable, const std::string& ns,
+                                                 const std::string& typePath, bool unkeyable)
     {
         int decision = ScannerDecideIfConst(ctx->expression());
         auto ifBlocks = ctx->ifConstMemberBlock();
         if (ifBlocks.empty()) return;
         if (decision < 0)
         {
-            for (auto* blk : ifBlocks) CollectGenericTemplateDecls(blk, false, /*ifConstUnfoldable*/ true, ns);
-            if (auto* elseIf = ctx->ifConstMember()) CollectGenericTemplateDeclsIfConstMember(elseIf, false, true, ns);
+            for (auto* blk : ifBlocks) CollectGenericTemplateDecls(blk, false, /*ifConstUnfoldable*/ true, ns, typePath, unkeyable);
+            if (auto* elseIf = ctx->ifConstMember()) CollectGenericTemplateDeclsIfConstMember(elseIf, false, true, ns, typePath, unkeyable);
             return;
         }
         if (decision != 0)
         {
-            CollectGenericTemplateDecls(ifBlocks[0], certain, ifConstUnfoldable, ns);
+            CollectGenericTemplateDecls(ifBlocks[0], certain, ifConstUnfoldable, ns, typePath, unkeyable);
             return;
         }
-        if (auto* elseIf = ctx->ifConstMember()) CollectGenericTemplateDeclsIfConstMember(elseIf, certain, ifConstUnfoldable, ns);
-        else if (ifBlocks.size() > 1) CollectGenericTemplateDecls(ifBlocks[1], certain, ifConstUnfoldable, ns);
+        if (auto* elseIf = ctx->ifConstMember()) CollectGenericTemplateDeclsIfConstMember(elseIf, certain, ifConstUnfoldable, ns, typePath, unkeyable);
+        else if (ifBlocks.size() > 1) CollectGenericTemplateDecls(ifBlocks[1], certain, ifConstUnfoldable, ns, typePath, unkeyable);
     }
 
     // Record every generic template declared in the tree: struct/class bare names into
@@ -2414,9 +2447,30 @@ public:
     // but that is NOT sufficient on its own: the name still lowers to a fat pointer, so it can
     // LAUNDER one real interface's vtable into another real interface - see that function.
     void CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bool certain, bool ifConstUnfoldable = false,
-                                     const std::string& ns = {})
+                                     const std::string& ns = {}, const std::string& typePath = {},
+                                     bool unkeyable = false)
     {
         auto* compiler = compilerLLVM;
+        /*
+         * Record every type DEFINITION name in scannedTypeNames (the type-argument accept set)
+         * under the key it is ACTUALLY registered with. A type nested in a struct is keyed with the
+         * outer struct's full name (ScanStructOrClassDefinition passes it as the nested scan's
+         * `namespaceName`), so `typePath` accumulates the enclosing struct/class names - the key is
+         * never re-derived from a dotted string. Suppressing nested types instead left their only
+         * source as dataStructures, which fills in textual order during the main pass, so one
+         * spelling in one namespace got two answers depending on line order.
+         * `unkeyable` covers a body whose nested types have NO fixed key: inside a GENERIC template
+         * the real key is per-instantiation (Box__int.Inner), not Box.Inner.
+         * `certain` gates the whole thing: it is false inside an unfoldable `if const` arm (a dead
+         * arm's type never becomes a real key) and inside an expect_error block (whose type may fail
+         * to register while a claim here would redirect a later argument to a key that never
+         * appears). An invented key is a false rejection, so both must stay out.
+         */
+        auto recordTypeName = [&](const std::string& name)
+        {
+            if (certain && !unkeyable && !name.empty())
+                compiler->gts.scannedTypeNames.insert(QualifyName(QualifyName(ns, typePath), name));
+        };
         for (auto* child : ctx->children)
         {
             auto* ruleCtx = dynamic_cast<antlr4::RuleContext*>(child);
@@ -2426,7 +2480,8 @@ public:
             case CFlatParser::RuleNamespaceDefinition:
                 // Every name declared below here is keyed qualified, matching the main pass.
                 CollectGenericTemplateDecls(ruleCtx, certain, ifConstUnfoldable,
-                                            NestedNamespaceName(ns, static_cast<CFlatParser::NamespaceDefinitionContext*>(ruleCtx)));
+                                            NestedNamespaceName(ns, static_cast<CFlatParser::NamespaceDefinitionContext*>(ruleCtx)),
+                                            typePath, unkeyable);
                 continue;
             case CFlatParser::RuleIfConstDeclaration:
                 CollectGenericTemplateDeclsIfConst(
@@ -2434,32 +2489,43 @@ public:
                 continue;
             case CFlatParser::RuleIfConstMember:
                 CollectGenericTemplateDeclsIfConstMember(
-                    static_cast<CFlatParser::IfConstMemberContext*>(ruleCtx), certain, ifConstUnfoldable, ns);
+                    static_cast<CFlatParser::IfConstMemberContext*>(ruleCtx), certain, ifConstUnfoldable, ns,
+                    typePath, unkeyable);
                 continue;
             case CFlatParser::RuleExpectErrorDeclaration:
                 // An expect_error block is compiled but its errors are swallowed, so a template
                 // declared inside it must not veto (or claim) a name used outside the block. It is
                 // NOT if-const-unfoldable: passing that on made the diagnostic blame `if const` on a
                 // file containing none (scratch/rev6/g1_expect_error_false_ifconst_hint.cb).
-                CollectGenericTemplateDecls(ruleCtx, false, /*ifConstUnfoldable*/ false, ns);
+                CollectGenericTemplateDecls(ruleCtx, false, /*ifConstUnfoldable*/ false, ns, typePath, unkeyable);
                 continue;
             case CFlatParser::RuleStructDefinition:
             {
                 auto* sd = static_cast<CFlatParser::StructDefinitionContext*>(ruleCtx);
-                if (certain && sd->genericTypeParameters() != nullptr && sd->directDeclarator() != nullptr)
-                    RecordScannedGenericStructName(QualifyName(ns, sd->directDeclarator()->getText()));
-                break;
+                std::string tn = sd->directDeclarator() != nullptr ? sd->directDeclarator()->getText() : std::string{};
+                recordTypeName(tn);
+                if (certain && sd->genericTypeParameters() != nullptr && !tn.empty())
+                    RecordScannedGenericStructName(QualifyName(ns, tn));
+                CollectGenericTemplateDecls(ruleCtx, certain, ifConstUnfoldable, ns, QualifyName(typePath, tn),
+                                            unkeyable || sd->genericTypeParameters() != nullptr);
+                continue;
             }
             case CFlatParser::RuleClassDefinition:
             {
                 auto* cd = static_cast<CFlatParser::ClassDefinitionContext*>(ruleCtx);
-                if (certain && cd->genericTypeParameters() != nullptr && cd->directDeclarator() != nullptr)
-                    RecordScannedGenericStructName(QualifyName(ns, cd->directDeclarator()->getText()));
-                break;
+                std::string tn = cd->directDeclarator() != nullptr ? cd->directDeclarator()->getText() : std::string{};
+                recordTypeName(tn);
+                if (certain && cd->genericTypeParameters() != nullptr && !tn.empty())
+                    RecordScannedGenericStructName(QualifyName(ns, tn));
+                CollectGenericTemplateDecls(ruleCtx, certain, ifConstUnfoldable, ns, QualifyName(typePath, tn),
+                                            unkeyable || cd->genericTypeParameters() != nullptr);
+                continue;
             }
             case CFlatParser::RuleInterfaceDefinition:
             {
                 auto* nameGid = static_cast<CFlatParser::InterfaceDefinitionContext*>(ruleCtx)->genericIdentifier();
+                if (nameGid && nameGid->Identifier())
+                    recordTypeName(nameGid->Identifier()->getText());
                 if (nameGid && nameGid->Identifier() && nameGid->genericTypeParameters() != nullptr)
                 {
                     std::string key = QualifyName(ns, nameGid->Identifier()->getText());
@@ -2474,7 +2540,7 @@ public:
                 break;
             }
             }
-            CollectGenericTemplateDecls(ruleCtx, certain, ifConstUnfoldable, ns);
+            CollectGenericTemplateDecls(ruleCtx, certain, ifConstUnfoldable, ns, typePath, unkeyable);
         }
     }
 
@@ -2593,7 +2659,7 @@ public:
                         {
                             std::vector<std::string> typeArgs;
                             for (auto* entry : tts->tupleTypeEntry())
-                                typeArgs.push_back(TupleEntryArgName(entry));
+                                typeArgs.push_back(TupleEntryArgName(Compiler(tts), entry));
                             std::string mangledName = "tuple";
                             for (const auto& arg : typeArgs)
                                 mangledName += "__" + MangleTypeArg(arg);
@@ -2691,7 +2757,7 @@ public:
                     || TypeArgHasUnique(entry))
                     mangledName += "__" + MangleTypeArg(ResolveForwardTypeArg(entry));
                 else
-                    mangledName += "__" + MangleTypeArg(entry->getText());
+                    mangledName += "__" + MangleTypeArg(ResolveTypeArgSpelling(compiler, entry->getText()));
             }
             // A generic interface instantiation gets no struct shell / default ctor (see
             // tryPreDeclare); the alias still names the mangled interface.
@@ -3349,6 +3415,7 @@ private:
             // Simple type or type parameter: look up in activeTypeSubstitutions
             resolved = typeSpec ? typeSpec->getText() : entry->getText();
             auto substIt = activeTypeSubstitutions.find(resolved);
+            bool substituted = substIt != activeTypeSubstitutions.end();
             if (substIt != activeTypeSubstitutions.end())
             {
                 // A substituted arg may itself carry "*"/"[]" (e.g. a pack param bound to "int[]")
@@ -3371,6 +3438,10 @@ private:
                         LogErrorContext(entry, "unique requires a pointer or interface type");
                     return EncodeClosureFromSig(Compiler(entry), fit->second);
                 }
+            // Resolve the ARGUMENT the way the template BASE is resolved. A SUBSTITUTED argument
+            // is already resolved in the CALLER's scope - re-resolving rebinds it to this one.
+            if (!substituted)
+                resolved = Compiler(entry)->ResolveTypeArgBaseName(resolved);
         }
 
         // The bare base (before the pointer/view suffix) drives the D1 type check below.
@@ -3605,6 +3676,10 @@ private:
                                 argName = substIt->second;
                                 PeelTypeArgSuffix(argName, argPtr, argView);
                             }
+                            else
+                                // Same namespace walk as a generic type ARGUMENT (a substituted arg
+                                // is already resolved in the caller's scope - never re-resolve it).
+                                argName = Compiler(entry)->ResolveTypeArgBaseName(argName);
                             if (argView) argName += "[]";
                             else if (argPtr) argName += "*";
                             typeArgs.push_back(argName);
@@ -3751,6 +3826,9 @@ private:
                     bool substPointer = false;
                     bool substArrayView = false;
                     auto substIt = activeTypeSubstitutions.find(typeName);
+                    // A substituted name is ALREADY resolved in the caller's scope; re-resolving it
+                    // here rebinds it to the template's declaring namespace (layer 3).
+                    bool wasSubstituted = substIt != activeTypeSubstitutions.end();
                     if (substIt != activeTypeSubstitutions.end())
                     {
                         // A substituted type may carry a "*" (pointer) or "[]" (noalias array-view)
@@ -3779,10 +3857,12 @@ private:
                         // double-free. Never a move sink (IsUniqueTypeArg stays clear).
                         if (substAliasArg) declType.IsBorrowOfAliasElement = true;
                     }
-                    // Resolve namespace-qualified type names (alias expansion + parent namespace search)
-                    typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName);
-                    // If still unresolved, try qualifying with the enclosing struct scope (e.g. Inner -> Outer.Inner)
-                    if (!structScopeStack.empty() && !Compiler(declSpecs)->IsDataStructure(typeName))
+                    // Resolve namespace-qualified type names (alias expansion + parent namespace search).
+                    // forceRoot on a substituted name: the outward walk would re-bind it here.
+                    typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName, wasSubstituted);
+                    // If still unresolved, try qualifying with the enclosing struct scope (e.g. Inner -> Outer.Inner).
+                    // The !wasSubstituted guard is DEFENSIVE and inert today: removing it changed no leg or probe.
+                    if (!wasSubstituted && !structScopeStack.empty() && !Compiler(declSpecs)->IsDataStructure(typeName))
                     {
                         std::string qualified = structScopeStack.back() + "." + typeName;
                         if (Compiler(declSpecs)->IsDataStructure(qualified))
@@ -4077,8 +4157,10 @@ private:
         if (!resolved.Pointer && llvmType->isStructTy() && !global_scope)
         {
             auto structData = compiler->GetDataStructure(resolved.TypeName);
+            // forceRoot: the guards above are EXACT-key lookups, so the default ctor must be the
+            // one of that exact type - a namespace walk here would call a same-named sibling's.
             if (structData.StructType != nullptr && compiler->GetFunction(resolved.TypeName))
-                return compiler->CreateOverloadedFunctionCall(resolved.TypeName, {});
+                return compiler->CreateOverloadedFunctionCall(resolved.TypeName, {}, true);
         }
 
         return llvm::Constant::getNullValue(llvmType);
@@ -4309,6 +4391,11 @@ public:
         if (dot == std::string::npos || tmplCtx == nullptr || isFunctionStatic(tmplCtx))
             return {};
         std::string owner = baseName.substr(0, dot);
+        // Struct nesting and namespace nesting share ONE dotted key space, so the prefix alone
+        // cannot say which this is. The RECORDED declaring namespace can: when it equals the
+        // prefix, "Ov.f" is a FREE template in `namespace Ov`, never a method on `struct Ov`.
+        if (Compiler()->IsGenericFunctionKeyInNamespace(baseName, owner))
+            return {};
         return Compiler()->IsDataStructure(owner) ? owner : std::string{};
     }
 
@@ -4350,6 +4437,10 @@ public:
         auto* tmplCtx = compilerLLVM->MaterializeGenericFunction(baseName);
         if (!tmplCtx) return {};
 
+        // The body is re-walked long after the declaring namespace's scope closed, so install it:
+        // without this a sibling name inside the body resolves globally (or not at all).
+        TemplateNamespaceScope nsScope(compilerLLVM, baseName);
+
         const auto& typeParams = genericFunctionTypeParams[baseName];
         if (typeParams.size() != typeArgs.size()) return {};
 
@@ -4377,7 +4468,7 @@ public:
         // and "Instruction does not dominate all uses" verifier error).
         auto savedStack = std::move(instCompiler->stackNamedVariable);
         instCompiler->stackNamedVariable.clear();
-        ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName);
+        ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName, DeclaringNamespaceOf(compilerLLVM, baseName));
         instCompiler->stackNamedVariable = std::move(savedStack);
         instCompiler->RestoreBuilderState(savedState);
 
@@ -7853,7 +7944,10 @@ public:
         return (*v != 0) ? 1 : 0;
     }
 
-    void ParseFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {}, const std::string& nameOverride = {})
+    // bodyNamespace: the namespace the BODY resolves in when it differs from the one the NAME is
+    // built from - a generic instantiation carries its whole key in nameOverride, so namespaceName
+    // must stay empty there while the body still belongs to the template's declaring namespace.
+    void ParseFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {}, const std::string& nameOverride = {}, const std::string& bodyNamespace = {})
     {
         auto* compiler = Compiler(func);
         // Create Function Definition
@@ -7871,6 +7965,9 @@ public:
         {
             auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters());
             genericFunctionTemplates[name] = func;
+            // Record the declaring namespace, never re-derive it from the key: a call site's bare
+            // spelling resolves through it (ResolveGenericFunctionBase) and the body is lowered in it.
+            Compiler()->gts.genericTemplateNamespace[name] = namespaceName;
             genericFunctionTypeParams[name] = typeParams;
             genericFunctionConstraints[name] = ParseWhereClause(func->whereClause());
             return;
@@ -8023,7 +8120,7 @@ public:
         // sibling reference (bare "helper" inside "namespace N") resolves to "N.helper".
         // RAII: a LogError inside the body throws on the batch/LSP paths, and a skipped restore
         // would steer the next file's generic-template resolution.
-        LLVMBackend::NamespaceScope nsScope(compiler, namespaceName);
+        LLVMBackend::NamespaceScope nsScope(compiler, bodyNamespace.empty() ? namespaceName : bodyNamespace);
 
         currentFunctionIsVariadic = varargs;
 
@@ -15318,9 +15415,12 @@ public:
         std::string name = ctx->getText();
         // Apply active type substitutions (for generic templates)
         auto it = activeTypeSubstitutions.find(name);
+        // A substituted name is already resolved in the caller's scope - resolve it from the root
+        // so the template's declaring namespace cannot rebind it (layer 3).
+        bool wasSubstituted = it != activeTypeSubstitutions.end();
         if (it != activeTypeSubstitutions.end()) name = it->second;
         StripOwnershipQualifiers(name);  // resolve to the underlying LLVM type; storage markers only
-        return Compiler(ctx)->ResolveQualifiedName(name);
+        return Compiler(ctx)->ResolveQualifiedName(name, wasSubstituted);
     }
 
     // Resolves the struct type expected at a call-site field initializer argument.
@@ -18848,7 +18948,10 @@ public:
                                     namedVar.BorrowedOrigin   = structVar.BorrowedOrigin;
                                 }
                             }
-                            else if (Compiler(ctx)->GetFunction(primaryIdentifier) || genericFunctionTemplates.count(primaryIdentifier)
+                            // The generic-template leg resolves the bare spelling to its namespace's
+                            // key: this gate decides whether the extension-method dispatch is reached.
+                            else if (Compiler(ctx)->GetFunction(primaryIdentifier)
+                                     || genericFunctionTemplates.count(Compiler(ctx)->ResolveGenericFunctionBase(primaryIdentifier))
                                      || !GenericMethodTemplateKey(structVar.TypeAndValue.TypeName, primaryIdentifier).empty()
                                      || (primaryIdentifier == "toFunction" && structVar.TypeAndValue.TypeName == "__closure_fat_ptr")
                                      || Compiler(ctx)->GetWinrtSlot(structVar.TypeAndValue.TypeName, primaryIdentifier))
@@ -19035,6 +19138,10 @@ public:
                         if (prevPrimary->genericIdentifier() != nullptr && prevPrimary->genericIdentifier()->genericTypeParameters() != nullptr && prevPrimary->genericIdentifier()->Identifier() != nullptr)
                         {
                             std::string baseName = prevPrimary->genericIdentifier()->Identifier()->getText();
+                            // A BARE call inside a namespace must reach its own namespace's
+                            // generic-function key before a same-named global one.
+                            std::string gfKey = Compiler(ctx)->ResolveGenericFunctionBase(baseName);
+                            bool isGenericFunc = genericFunctionTemplates.count(gfKey) != 0;
                             std::string mangledName = baseName;
                             std::vector<std::string> typeArgs;
                             for (auto* entry : prevPrimary->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
@@ -19048,17 +19155,23 @@ public:
                                 std::string arg = entry->getText();
                                 // Apply active type substitutions to each type argument
                                 auto it = activeTypeSubstitutions.find(arg);
-                                if (it != activeTypeSubstitutions.end())
+                                bool substituted = it != activeTypeSubstitutions.end();
+                                if (substituted)
                                     arg = it->second;
+                                // A generic FUNCTION's argument resolves like a template base; a
+                                // SUBSTITUTED one is already resolved in the caller's scope.
+                                if (isGenericFunc && !substituted)
+                                    arg = Compiler(ctx)->ResolveTypeArgBaseName(arg);
                                 typeArgs.push_back(arg);
                                 mangledName += "__" + MangleTypeArg(arg);
                             }
                             // If this is a generic function template (e.g. wrap<int>),
                             // instantiate it and record the mangled name as CallerName so
                             // ParseDeclaration can resolve the correct function pointer.
-                            if (genericFunctionTemplates.count(baseName))
+                            if (isGenericFunc)
                             {
-                                InstantiateGenericFunction(baseName, typeArgs);
+                                mangledName = MangledGenericName(gfKey, typeArgs);
+                                InstantiateGenericFunction(gfKey, typeArgs);
                                 primaryIdentifier = mangledName;
                                 namedVar = {};
                                 namedVar.CallerName = mangledName;
@@ -19518,8 +19631,13 @@ public:
                         // A generic method called on a receiver (`h.get<int>()`) is keyed by its owner;
                         // that key wins over a same-named free generic function.
                         std::string templateName = GenericMethodTemplateKey(structVar.TypeAndValue.TypeName, primaryIdentifier);
-                        if (templateName.empty() && genericFunctionTemplates.count(primaryIdentifier))
-                            templateName = primaryIdentifier;
+                        if (templateName.empty())
+                        {
+                            // Bare spelling inside a namespace: reach that namespace's key first.
+                            std::string gfKey = Compiler(ctx)->ResolveGenericFunctionBase(primaryIdentifier);
+                            if (genericFunctionTemplates.count(gfKey))
+                                templateName = gfKey;
+                        }
                         if (!templateName.empty())
                         {
                             std::vector<std::string> typeArgs;
@@ -19533,8 +19651,13 @@ public:
                                     LogErrorContext(entry, "alias is not supported as an explicit generic function type argument");
                                 std::string arg = entry->getText();
                                 auto it = activeTypeSubstitutions.find(arg);
-                                if (it != activeTypeSubstitutions.end())
+                                bool substituted = it != activeTypeSubstitutions.end();
+                                if (substituted)
                                     arg = it->second;
+                                // Same rule as the primary path: resolve an unsubstituted argument
+                                // spelling, leave an already-resolved substituted one alone.
+                                if (!substituted)
+                                    arg = Compiler(ctx)->ResolveTypeArgBaseName(arg);
                                 typeArgs.push_back(arg);
                             }
                             std::string mangled = InstantiateGenericFunction(templateName, typeArgs);
@@ -21251,8 +21374,10 @@ public:
                                 // Extension method: find a standalone or generic function and
                                 // pass the interface value as the first argument.
                                 std::string extFuncName;
-                                if (genericFunctionTemplates.count(primaryIdentifier))
-                                    extFuncName = InferAndInstantiateGenericFunction(primaryIdentifier, interfaceVar.TypeAndValue.TypeName);
+                                // Bare spelling inside a namespace reaches that namespace's key first.
+                                std::string gfIface = Compiler(ctx)->ResolveGenericFunctionBase(primaryIdentifier);
+                                if (genericFunctionTemplates.count(gfIface))
+                                    extFuncName = InferAndInstantiateGenericFunction(gfIface, interfaceVar.TypeAndValue.TypeName);
                                 if (extFuncName.empty())
                                     extFuncName = primaryIdentifier;
 
@@ -21825,7 +21950,9 @@ public:
                                 // Resolve generic extension method if needed, then gate the call
                                 // (and the rest of the chain, via ncEnterGuard) on the receiver.
                                 std::string resolvedFuncName = functionName;
-                                if (!Compiler(ctx)->GetFunction(functionName) && genericFunctionTemplates.count(functionName))
+                                // Bare spelling inside a namespace reaches that namespace's key first.
+                                std::string gfName = Compiler(ctx)->ResolveGenericFunctionBase(functionName);
+                                if (!Compiler(ctx)->GetFunction(functionName) && genericFunctionTemplates.count(gfName))
                                 {
                                     std::string structTypeName = structVar.TypeAndValue.TypeName;
                                     if (structTypeName.empty() && structVar.BaseType)
@@ -21835,7 +21962,7 @@ public:
                                     }
                                     for (const auto& iface : Compiler(ctx)->GetStructInterfaces(structTypeName))
                                     {
-                                        auto inst = InferAndInstantiateGenericFunction(functionName, iface);
+                                        auto inst = InferAndInstantiateGenericFunction(gfName, iface);
                                         if (!inst.empty()) { resolvedFuncName = inst; break; }
                                     }
                                 }
@@ -21866,7 +21993,9 @@ public:
                                 // Try generic extension method instantiation if this is a
                                 // generic function template and the struct implements a matching interface.
                                 std::string resolvedFuncName = functionName;
-                                if (!Compiler(primaryCtx)->GetFunction(functionName) && genericFunctionTemplates.count(functionName))
+                                // Bare spelling inside a namespace reaches that namespace's key first.
+                                std::string gfName = Compiler(primaryCtx)->ResolveGenericFunctionBase(functionName);
+                                if (!Compiler(primaryCtx)->GetFunction(functionName) && genericFunctionTemplates.count(gfName))
                                 {
                                     std::string structTypeName = structVar.TypeAndValue.TypeName;
                                     if (structTypeName.empty() && structVar.BaseType)
@@ -21876,13 +22005,13 @@ public:
                                     }
                                     for (const auto& iface : Compiler(primaryCtx)->GetStructInterfaces(structTypeName))
                                     {
-                                        auto inst = InferAndInstantiateGenericFunction(functionName, iface);
+                                        auto inst = InferAndInstantiateGenericFunction(gfName, iface);
                                         if (!inst.empty()) { resolvedFuncName = inst; break; }
                                     }
                                     // If interface-based inference failed, try to infer from argument types.
                                     if (resolvedFuncName == functionName)
                                     {
-                                        auto inst = TryInferAndInstantiateFromArgs(functionName, arguments);
+                                        auto inst = TryInferAndInstantiateFromArgs(gfName, arguments);
                                         if (!inst.empty()) resolvedFuncName = inst;
                                     }
                                 }
@@ -23484,8 +23613,10 @@ public:
 
         // Generic function templates have no IR entry until instantiated.
         // The call-site dispatch (PostfixExpression's RuleArgumentExpressionList branch)
-        // calls TryInferAndInstantiateFromArgs once the arguments are known.
-        if (genericFunctionTemplates.count(name))
+        // calls TryInferAndInstantiateFromArgs once the arguments are known. The bare spelling is
+        // resolved to its namespace's key here: the ResolveQualifiedName fallback below has no
+        // generic-function-only key in its accept set, so it can never rescue this.
+        if (genericFunctionTemplates.count(compiler->ResolveGenericFunctionBase(name)))
             return {};
 
         // Compiler intrinsics handled at the call site - not in the function table.
@@ -23865,7 +23996,7 @@ public:
                     break;
                 std::vector<std::string> typeArgs;
                 for (auto* entry : tts->tupleTypeEntry())
-                    typeArgs.push_back(TupleEntryArgName(entry));
+                    typeArgs.push_back(TupleEntryArgName(Compiler(declSpec), entry));
                 std::string mangledName = MangledGenericName("tuple", typeArgs);
                 tupleTypeArgs[mangledName] = typeArgs;
                 if (!instantiatedGenerics.count(mangledName))
@@ -24437,8 +24568,10 @@ public:
                     if (rvalue == nullptr && destType->isStructTy())
                     {
                         std::string fieldTypeName = declList[structIndex].TypeName;
+                        // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
+                        // here would call a same-named sibling type's ctor (layer 3).
                         if (compiler->GetFunction(fieldTypeName))
-                            rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
+                            rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
                         else
                             rvalue = llvm::Constant::getNullValue(destType);
                     }
@@ -24459,8 +24592,10 @@ public:
                                 // a struct-typed generic field).  Call the field's default constructor when
                                 // one is available; otherwise zero-initialize the aggregate.
                                 std::string fieldTypeName = declList[structIndex].TypeName;
+                                // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
+                                // here would call a same-named sibling type's ctor (layer 3).
                                 if (compiler->GetFunction(fieldTypeName))
-                                    rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
+                                    rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
                                 else
                                     rvalue = llvm::Constant::getNullValue(destType);
                             }
@@ -24560,6 +24695,9 @@ public:
                 {
                     std::string qualifiedName = structName + "." + funcName;
                     genericFunctionTemplates[qualifiedName] = func;
+                    // Declaring NAMESPACE of the owner, recorded not derived: the key's last dot
+                    // separates the owner, not a namespace, so only this tells the two apart.
+                    Compiler()->gts.genericTemplateNamespace[qualifiedName] = Compiler()->GetCurrentNamespace();
                     genericFunctionTypeParams[qualifiedName] = ParseGenericTypeParameters(func->genericTypeParameters());
                     genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
                 }
@@ -26002,8 +26140,10 @@ public:
                     if (rvalue->getType() != destType && destType->isStructTy())
                     {
                         std::string fieldTypeName = declList[idx].TypeName;
+                        // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
+                        // here would call a same-named sibling type's ctor (layer 3).
                         if (compiler->GetFunction(fieldTypeName))
-                            rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
+                            rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
                         else
                             rvalue = llvm::Constant::getNullValue(destType);
                     }
@@ -26331,8 +26471,10 @@ public:
                     {
                         // Initializer type doesn't match struct field type (same fallback as ParseStructDefinition).
                         std::string fieldTypeName = declList[idx].TypeName;
+                        // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
+                        // here would call a same-named sibling type's ctor (layer 3).
                         if (compiler->GetFunction(fieldTypeName))
-                            rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
+                            rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
                         else
                             rvalue = llvm::Constant::getNullValue(destType);
                     }
@@ -26827,8 +26969,10 @@ public:
                 if (rvalue == nullptr && destType->isStructTy())
                 {
                     std::string fieldTypeName = declList[structIndex].TypeName;
+                    // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
+                    // here would call a same-named sibling type's ctor (layer 3).
                     if (compiler->GetFunction(fieldTypeName))
-                        rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
+                        rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
                     else
                         rvalue = llvm::Constant::getNullValue(destType);
                 }
@@ -26838,8 +26982,10 @@ public:
                     if (rvalue->getType() != destType && destType->isStructTy())
                     {
                         std::string fieldTypeName = declList[structIndex].TypeName;
+                        // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
+                        // here would call a same-named sibling type's ctor (layer 3).
                         if (compiler->GetFunction(fieldTypeName))
-                            rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
+                            rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
                         else
                             rvalue = llvm::Constant::getNullValue(destType);
                     }
@@ -26980,6 +27126,9 @@ public:
                 {
                     std::string qualifiedName = structName + "." + funcName;
                     genericFunctionTemplates[qualifiedName] = func;
+                    // Declaring NAMESPACE of the owner, recorded not derived: the key's last dot
+                    // separates the owner, not a namespace, so only this tells the two apart.
+                    Compiler()->gts.genericTemplateNamespace[qualifiedName] = Compiler()->GetCurrentNamespace();
                     genericFunctionTypeParams[qualifiedName] = ParseGenericTypeParameters(func->genericTypeParameters());
                     genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
                 }

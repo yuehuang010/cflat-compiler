@@ -1,7 +1,7 @@
 # A `using` alias of an interface is rejected as an `is` / `as` target
 
 Filed 2026-07-29 out of round 5 of the adversarial review of
-`generic-interface-registered-as-opaque-struct.md`. **Pre-existing**: fails identically on that
+the generic-interface registration work (`09f1d56`, design record in `interface-issue-queue.md`). **Pre-existing**: fails identically on that
 issue's before and after binaries, with a value-level consequence.
 
 ## Repro

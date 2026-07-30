@@ -1,7 +1,7 @@
 # A method call on a default/null interface value SIGSEGVs - no null guard
 
 Filed 2026-07-29 out of round 4 of the adversarial review of
-`generic-interface-registered-as-opaque-struct.md`. **Pre-existing and language-wide** - it is NOT
+the generic-interface registration work (`09f1d56`, design record in `interface-issue-queue.md`). **Pre-existing and language-wide** - it is NOT
 specific to generic interfaces and is NOT caused by that change. Verified against the pre-fix
 binary.
 

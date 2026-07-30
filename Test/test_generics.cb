@@ -3194,6 +3194,736 @@ bool testGnNsGenericBaseAliasKeepsDeclSiteMeaning()
     return result;
 }
 
+// =============================================================
+// Layer 2 (type ARGUMENTS) corpus, merged from the layer-2 corpus (deleted with the issue) per
+// internal/issue/interface-issue-queue.md (landed design records). Each leg gives the SAME wrong-namespace's
+// Item a DIFFERENT value than the other Item so a wrong bind is visible both directions at once.
+// =============================================================
+
+// Leg 1: known repro - global Item vs A.Item as a Box<T> argument, both bare-spelled.
+struct Ta1Item { int v = 9; };
+struct Ta1Box<T> { T t = default; int Get() { return t.v; } };
+namespace Ta1A
+{
+    struct Ta1Item { int v = 7; };
+    int f() { Ta1Box<Ta1Item> b = default; return b.Get(); }
+}
+int ta1g() { Ta1Box<Ta1Item> b = default; return b.Get(); }
+
+bool testGnNsTaCollision()
+{
+    bool result = true;
+    result &= Test("ta_collision_inA", Ta1A.f(), 7);
+    result &= Test("ta_collision_global", ta1g(), 9);
+    return result;
+}
+
+// Leg 2: same shape, but the template itself is ALSO declared inside a namespace.
+namespace Ta2Ns
+{
+    struct Ta2Item { int v = 9; };
+    struct Ta2Box<T> { T t = default; int Get() { return t.v; } };
+    namespace Ta2A
+    {
+        struct Ta2Item { int v = 7; };
+        int f() { Ta2Ns.Ta2Box<Ta2Item> b = default; return b.Get(); }
+    }
+    int g() { Ta2Box<Ta2Item> b = default; return b.Get(); }
+}
+
+bool testGnNsTaTemplateInNamespaceToo()
+{
+    bool result = true;
+    result &= Test("ta_template_in_ns_inA", Ta2Ns.Ta2A.f(), 7);
+    result &= Test("ta_template_in_ns_global", Ta2Ns.g(), 9);
+    return result;
+}
+
+// Leg 3: two DIFFERENT namespaces each supplying their own Item, plus the global one -
+// three-way against one global template.
+struct Ta3Item { int v = 1; };
+struct Ta3Box<T> { T t = default; int Get() { return t.v; } };
+namespace Ta3A { struct Ta3Item { int v = 2; }; int f() { Ta3Box<Ta3Item> b = default; return b.Get(); } }
+namespace Ta3B { struct Ta3Item { int v = 3; }; int f() { Ta3Box<Ta3Item> b = default; return b.Get(); } }
+int ta3g() { Ta3Box<Ta3Item> b = default; return b.Get(); }
+
+bool testGnNsTaThreeWayNamespaces()
+{
+    bool result = true;
+    result &= Test("ta_three_way_inA", Ta3A.f(), 2);
+    result &= Test("ta_three_way_inB", Ta3B.f(), 3);
+    result &= Test("ta_three_way_global", ta3g(), 1);
+    return result;
+}
+
+// Leg 4: a namespaced type spelled QUALIFIED as a type argument (Ta4A.Item), alongside a bare
+// use. Non-discriminating: qualified vs bare are different TEXT so they already mangled apart
+// before the fix; kept because it documents mixed qualified/bare is not how the bug manifests.
+struct Ta4Item { int v = 9; };
+struct Ta4Box<T> { T t = default; int Get() { return t.v; } };
+namespace Ta4A
+{
+    struct Ta4Item { int v = 7; };
+}
+int ta4Qualified() { Ta4Box<Ta4A.Ta4Item> b = default; return b.Get(); }
+int ta4Bare() { Ta4Box<Ta4Item> b = default; return b.Get(); }
+
+bool testGnNsTaQualifiedVsBareTypeArg()
+{
+    bool result = true;
+    result &= Test("ta_qualified_typearg", ta4Qualified(), 7);
+    result &= Test("ta_bare_typearg", ta4Bare(), 9);
+    return result;
+}
+
+// Leg 5: multiple type arguments, only ONE is ambiguous (Pair<Item, int>).
+struct Ta5Item { int v = 9; };
+struct Ta5Pair<K, V> { K k = default; V v = default; int GetK() { return k.v; } int GetV() { return v; } };
+namespace Ta5A
+{
+    struct Ta5Item { int v = 7; };
+    int fK() { Ta5Pair<Ta5Item, int> p = default; p.v = 100; return p.GetK(); }
+    int fV() { Ta5Pair<Ta5Item, int> p = default; p.v = 100; return p.GetV(); }
+}
+int ta5gK() { Ta5Pair<Ta5Item, int> p = default; p.v = 200; return p.GetK(); }
+int ta5gV() { Ta5Pair<Ta5Item, int> p = default; p.v = 200; return p.GetV(); }
+
+bool testGnNsTaMultiTypeArgOneAmbiguous()
+{
+    bool result = true;
+    result &= Test("ta_multi_typearg_k_inA", Ta5A.fK(), 7);
+    result &= Test("ta_multi_typearg_k_global", ta5gK(), 9);
+    result &= Test("ta_multi_typearg_v_inA", Ta5A.fV(), 100);
+    result &= Test("ta_multi_typearg_v_global", ta5gV(), 200);
+    return result;
+}
+
+// Leg 6: a NESTED type argument (Box<Box<Item>>) with the inner Item ambiguous.
+struct Ta6Item { int v = 9; };
+struct Ta6Box<T> { T t = default; };
+namespace Ta6A
+{
+    struct Ta6Item { int v = 7; };
+    int f() { Ta6Box<Ta6Box<Ta6Item>> b = default; return b.t.t.v; }
+}
+int ta6g() { Ta6Box<Ta6Box<Ta6Item>> b = default; return b.t.t.v; }
+
+bool testGnNsTaNestedTypeArg()
+{
+    bool result = true;
+    result &= Test("ta_nested_typearg_inA", Ta6A.f(), 7);
+    result &= Test("ta_nested_typearg_global", ta6g(), 9);
+    return result;
+}
+
+// Leg 7: a POINTER-to-ambiguous-type argument. The two Item variants have DIFFERENT field
+// layouts (a leading pad) so a wrong metadata bind shows up as a wrong value, not a coincidence.
+struct Ta7Item { int pad = 100; int v = 9; };
+struct Ta7Box<T> { T t = default; };
+namespace Ta7A
+{
+    struct Ta7Item { int v = 7; };
+    int f() { Ta7Item i = default; Ta7Box<Ta7Item*> b = default; b.t = &i; return b.t->v; }
+}
+int ta7g() { Ta7Item i = default; Ta7Box<Ta7Item*> b = default; b.t = &i; return b.t->v; }
+
+bool testGnNsTaPointerTypeArg()
+{
+    bool result = true;
+    result &= Test("ta_pointer_typearg_inA", Ta7A.f(), 7);
+    result &= Test("ta_pointer_typearg_global", ta7g(), 9);
+    return result;
+}
+
+// Leg 8: nested namespaces (A.B.Item).
+struct Ta8Item { int v = 9; };
+struct Ta8Box<T> { T t = default; int Get() { return t.v; } };
+namespace Ta8A
+{
+    namespace Ta8B
+    {
+        struct Ta8Item { int v = 7; };
+        int f() { Ta8Box<Ta8Item> b = default; return b.Get(); }
+    }
+}
+int ta8g() { Ta8Box<Ta8Item> b = default; return b.Get(); }
+
+bool testGnNsTaNestedNamespaces()
+{
+    bool result = true;
+    result &= Test("ta_nested_namespaces_inAB", Ta8A.Ta8B.f(), 7);
+    result &= Test("ta_nested_namespaces_global", ta8g(), 9);
+    return result;
+}
+
+// Leg 10: layout probe - the two Item variants have DISJOINT fields (global a/b/c/d,
+// Ta10A x) so a collapsed instantiation could not resolve 'x' at all pre-fix; post-fix each
+// layout gets its own instantiation and both are readable.
+struct Ta10Item { int a = 1; int b = 2; int c = 3; int d = 4; };
+struct Ta10Box<T> { T t = default; int tail = 77; };
+namespace Ta10A
+{
+    struct Ta10Item { i64 x = 111; };
+    int f() { Ta10Box<Ta10Item> b = default; return b.tail + (int)b.t.x; }
+}
+int ta10g() { Ta10Box<Ta10Item> b = default; return b.tail + b.t.a + b.t.d; }
+
+bool testGnNsTaDifferingLayouts()
+{
+    bool result = true;
+    result &= Test("ta_differing_layouts_inA", Ta10A.f(), 188);
+    result &= Test("ta_differing_layouts_global", ta10g(), 82);
+    return result;
+}
+
+// Leg 13: a DOTTED argument spelling must mean the same type as a plain dotted local in the
+// same scope. Ordinary lookup resolves a dotted name from the top, so the argument walk must
+// not relatively resolve one either (pinned with the non-generic control).
+struct Ta13Box<T> { T t = default; int Get() { return t.v; } };
+namespace Ta13B { struct Item { int v = 9; }; }
+namespace Ta13A
+{
+    namespace Ta13B { struct Item { int v = 7; }; }
+    int split() { Ta13B.Item direct = default; Ta13Box<Ta13B.Item> boxed = default; return direct.v * 100 + boxed.Get(); }
+    int ctrl() { Ta13B.Item direct = default; return direct.v; }
+}
+
+bool testGnNsTaDottedArgIsNotRelative()
+{
+    bool result = true;
+    result &= Test("ta_dotted_arg_same_as_local", Ta13A.split(), 909);
+    result &= Test("ta_dotted_arg_control", Ta13A.ctrl(), 9);
+    return result;
+}
+
+// Leg 14: a type declared inside an expect_error block whose OWN declaration is fine is still a
+// real type; the scan deliberately keeps such a name out of scannedTypeNames (it may fail to
+// register), and this leg pins that the main pass still resolves it via dataStructures.
+struct Ta14Item { int v = 9; };
+struct Ta14Box<T> { T t = default; int Get() { return t.v; } };
+namespace Ta14A
+{
+    expect_error("Undefined variable ta14zzz.")
+    {
+        struct Ta14Item { int v = 7; };
+        int bad() { return ta14zzz + 1; }
+    }
+    int f() { Ta14Box<Ta14Item> b = default; return b.Get(); }
+}
+
+bool testGnNsTaExpectErrorBlockTypeIsReachable()
+{
+    bool result = true;
+    result &= Test("ta_expect_error_block_type", Ta14A.f(), 7);
+    return result;
+}
+
+// Leg 15: a type NESTED in `struct Outer` is keyed "Outer.Item", the same dotted key a
+// `namespace Outer` produces, so a bare argument inside `namespace Outer` reaches it,
+// order-independently. The use must come textually AFTER `struct Ta15Outer` below.
+struct Ta15Item { int v = 9; };
+struct Ta15Box<T> { T t = default; int Get() { return t.v; } };
+struct Ta15Outer { struct Ta15Item { int v = 7; }; int dummy = 0; };
+namespace Ta15Outer
+{
+    int f() { Ta15Box<Ta15Item> b = default; return b.Get(); }
+    int ctrl() { Ta15Item i = default; return i.v; }
+}
+
+bool testGnNsTaNestedStructKeyIsOrderIndependent()
+{
+    bool result = true;
+    result &= Test("ta_nested_struct_key", Ta15Outer.f(), 7);
+    result &= Test("ta_nested_struct_key_control", Ta15Outer.ctrl(), 7);
+    return result;
+}
+
+// Control 1: unique type names, global scope + namespace, NO ambiguity. Must keep passing.
+struct Ta11GlobalItem { int v = 9; };
+struct Ta11Box<T> { T t = default; int Get() { return t.v; } };
+namespace Ta11A
+{
+    int f() { Ta11Box<Ta11GlobalItem> b = default; return b.Get(); }
+}
+int ta11g() { Ta11Box<Ta11GlobalItem> b = default; return b.Get(); }
+
+bool testGnNsTaCtrlUniqueNames()
+{
+    bool result = true;
+    result &= Test("ta_ctrl_unique_names_inA", Ta11A.f(), 9);
+    result &= Test("ta_ctrl_unique_names_global", ta11g(), 9);
+    return result;
+}
+
+// Control 2: unique names, template ALSO declared inside a namespace. Must keep passing.
+namespace Ta12Ns
+{
+    struct Ta12NsItem { int v = 9; };
+    struct Ta12Box<T> { T t = default; int Get() { return t.v; } };
+    int g() { Ta12Box<Ta12NsItem> b = default; return b.Get(); }
+}
+int ta12UseOutside() { Ta12Ns.Ta12Box<Ta12Ns.Ta12NsItem> b = default; return b.Get(); }
+
+bool testGnNsTaCtrlUniqueTemplateInNs()
+{
+    bool result = true;
+    result &= Test("ta_ctrl_unique_template_in_ns_inside", Ta12Ns.g(), 9);
+    result &= Test("ta_ctrl_unique_template_in_ns_outside", ta12UseOutside(), 9);
+    return result;
+}
+
+// ---- Layer 3: a template's BODY must keep the argument the CALLER resolved. A template
+// declared in a namespace that owns its own same-named type, instantiated at GLOBAL scope with
+// the GLOBAL type, used to fill both instantiations with the namespace's type. Each leg asserts
+// the global AND the qualified instantiation together, so a collapse cannot hide. Corpus:
+// the layer-3 corpus (deleted with the issue).
+struct BsItem { int v = 9; };
+namespace BsN1
+{
+    struct BsItem { int v = 3; };
+    struct BsTpl<T>
+    {
+        T t = default;
+        int Get() { return t.v; }
+        int FromParam(T p) { return p.v; }
+        T MakeRet() { T r = default; return r; }
+    };
+}
+int bs1Global()    { BsN1.BsTpl<BsItem> x = default; return x.Get(); }
+int bs1Dotted()    { BsN1.BsTpl<BsN1.BsItem> x = default; return x.Get(); }
+int bs1ParamG()    { BsN1.BsTpl<BsItem> x = default; BsItem i = default; return x.FromParam(i); }
+int bs1ParamD()    { BsN1.BsTpl<BsN1.BsItem> x = default; BsN1.BsItem i = default; return x.FromParam(i); }
+int bs1RetG()      { BsN1.BsTpl<BsItem> x = default; return x.MakeRet().v; }
+int bs1RetD()      { BsN1.BsTpl<BsN1.BsItem> x = default; return x.MakeRet().v; }
+
+// A field with NO `= default` (and one with a mismatching initializer) takes a DIFFERENT code
+// path than `T t = default;`: the struct's field-initializer sites call the field type's default
+// ctor directly, and those sites must not walk the namespace either.
+namespace BsN13
+{
+    struct Bs13Item { int v = 3; };
+    struct Bs13Tpl<T> { T t; int Get() { return t.v; } };
+    struct Bs13Mismatch<T> { T t = 0; int Get() { return t.v; } };
+}
+struct Bs13Item { int v = 9; };
+int bs13NoInitG()   { BsN13.Bs13Tpl<Bs13Item> x = default; return x.Get(); }
+int bs13NoInitD()   { BsN13.Bs13Tpl<BsN13.Bs13Item> x = default; return x.Get(); }
+int bs13MismatchG() { BsN13.Bs13Mismatch<Bs13Item> x = default; return x.Get(); }
+int bs13MismatchD() { BsN13.Bs13Mismatch<BsN13.Bs13Item> x = default; return x.Get(); }
+
+bool testGnNsBodyKeepsCallerTypeArg()
+{
+    bool result = true;
+    result &= Test("bs_body_field_global",  bs1Global(), 9);
+    result &= Test("bs_body_field_dotted",  bs1Dotted(), 3);
+    result &= Test("bs_body_param_global",  bs1ParamG(), 9);
+    result &= Test("bs_body_param_dotted",  bs1ParamD(), 3);
+    result &= Test("bs_body_return_global", bs1RetG(),   9);
+    result &= Test("bs_body_return_dotted", bs1RetD(),   3);
+    result &= Test("bs_body_noinit_global",   bs13NoInitG(),   9);
+    result &= Test("bs_body_noinit_dotted",   bs13NoInitD(),   3);
+    result &= Test("bs_body_mismatch_global", bs13MismatchG(), 9);
+    result &= Test("bs_body_mismatch_dotted", bs13MismatchD(), 3);
+    return result;
+}
+
+// Layer 3, disjoint layouts: the two same-spelled types share no field, so a wrong bind cannot
+// be masked by a coincidentally matching offset (pre-fix: "Unknown identifier 'a'.").
+struct Bs8Item { int a = 1; int b = 2; };
+namespace BsN8
+{
+    struct Bs8Item { i64 x = 111; };
+    struct Bs8Tpl<T> { T t = default; int tail = 77; };
+}
+int bs8Global() { BsN8.Bs8Tpl<Bs8Item> b = default; return b.tail + b.t.a + b.t.b; }
+int bs8Dotted() { BsN8.Bs8Tpl<BsN8.Bs8Item> b = default; return b.tail + (int)b.t.x; }
+
+bool testGnNsBodyDisjointLayouts()
+{
+    bool result = true;
+    result &= Test("bs_body_layout_global", bs8Global(), 80);
+    result &= Test("bs_body_layout_dotted", bs8Dotted(), 188);
+    return result;
+}
+
+// Layer 3, nested instantiation + generic class + the `namespace Outer` / `struct Outer` shared
+// key space (struct nesting and namespace nesting are ONE dotted key space, so the declaring
+// scope must come from what registration recorded, never from splitting the key).
+struct Bs4Item { int v = 9; };
+namespace BsN4
+{
+    struct Bs4Item { int v = 3; };
+    struct Bs4In<T>  { T t = default; };
+    struct Bs4Out<T> { T t = default; };
+    class  Bs4Box<T> { T t = default; int Get() { return t.v; } };
+}
+struct Bs7Outer { struct Bs7Inner { int q = 1; }; int dummy = 0; };
+namespace Bs7Outer
+{
+    struct Bs7Item { int v = 3; };
+    struct Bs7Tpl<T> { T t = default; int Get() { return t.v; } };
+}
+struct Bs7Item { int v = 9; };
+int bs4NestedG() { BsN4.Bs4Out<BsN4.Bs4In<Bs4Item>> x = default; return x.t.t.v; }
+int bs4NestedD() { BsN4.Bs4Out<BsN4.Bs4In<BsN4.Bs4Item>> x = default; return x.t.t.v; }
+int bs4ClassG()  { BsN4.Bs4Box<Bs4Item> b = default; return b.Get(); }
+int bs4ClassD()  { BsN4.Bs4Box<BsN4.Bs4Item> b = default; return b.Get(); }
+int bs7Global()  { Bs7Outer.Bs7Tpl<Bs7Item> x = default; return x.Get(); }
+int bs7Dotted()  { Bs7Outer.Bs7Tpl<Bs7Outer.Bs7Item> x = default; return x.Get(); }
+
+bool testGnNsBodyNestedClassAndStructNsKeySpace()
+{
+    bool result = true;
+    result &= Test("bs_body_nested_global",   bs4NestedG(), 9);
+    result &= Test("bs_body_nested_dotted",   bs4NestedD(), 3);
+    result &= Test("bs_body_class_global",    bs4ClassG(),  9);
+    result &= Test("bs_body_class_dotted",    bs4ClassD(),  3);
+    result &= Test("bs_body_nsstruct_global", bs7Global(),  9);
+    result &= Test("bs_body_nsstruct_dotted", bs7Dotted(),  3);
+    return result;
+}
+
+// Layer 3 controls, correct on both binaries: a template NESTED in `struct Holder` declares at
+// GLOBAL scope even when a `namespace Holder` exists, and an instantiation from INSIDE the
+// declaring namespace keeps meaning that namespace's type.
+struct Bs9Item { int v = 9; };
+struct Bs9Holder { struct Bs9Tpl<T> { T t = default; int Get() { return t.v; } }; int dummy = 0; };
+namespace Bs9Holder { struct Bs9Item { int v = 3; }; }
+namespace BsN10
+{
+    struct Bs10Item { int v = 3; };
+    struct Bs10Tpl<T> { T t = default; int Get() { return t.v; } };
+    int f() { Bs10Tpl<Bs10Item> x = default; return x.Get(); }
+}
+int bs9Global() { Bs9Holder.Bs9Tpl<Bs9Item> x = default; return x.Get(); }
+
+bool testGnNsBodyCtrlDeclaringScope()
+{
+    bool result = true;
+    result &= Test("bs_body_ctrl_struct_nested_tpl", bs9Global(), 9);
+    result &= Test("bs_body_ctrl_from_declaring_ns", BsN10.f(),   3);
+    return result;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Layer 4 of the generic key space (internal/issue/interface-issue-queue.md): generic FUNCTION templates are keyed
+// on the namespace-QUALIFIED name, and a BARE call inside a namespace walks the enclosing chain
+// (innermost first) to reach its own namespace's key. Every leg asserts the namespaced answer AND
+// the global one together so a collapse onto one key cannot hide.
+// Corpus: deleted with the issue; pre-fix witnesses are in the landed design records.
+// ---------------------------------------------------------------------------------------------
+
+// Leg A - bare call, EXPLICIT type argument, fixed arity, free function. Three declaration
+// orders: global first, namespaced first, and a UNIQUE namespaced name with no global at all
+// (the last two did not compile before the fix).
+Gq1T gq1Ident<Gq1T>(Gq1T x) { return x; }
+namespace Gq1NS
+{
+    Gq1T gq1Ident<Gq1T>(Gq1T x) { return x + 1; }
+    int f() { return gq1Ident<int>(10); }
+}
+namespace Gq2NS
+{
+    Gq2T gq2Ident<Gq2T>(Gq2T x) { return x + 1; }
+    Gq2U gq2Unique<Gq2U>(Gq2U x) { return x + 2; }
+    int f()       { return gq2Ident<int>(10); }
+    int fUnique() { return gq2Unique<int>(10); }
+}
+Gq2T gq2Ident<Gq2T>(Gq2T x) { return x; }
+Gq3K gq3First<Gq3K, Gq3V>(Gq3K k, Gq3V v) { return k; }
+namespace Gq3A { Gq3K gq3First<Gq3K, Gq3V>(Gq3K k, Gq3V v) { return k + v; } int f() { return gq3First<int, int>(10, 1); } }
+namespace Gq3B { Gq3K gq3First<Gq3K, Gq3V>(Gq3K k, Gq3V v) { return k + v + v; } int f() { return gq3First<int, int>(10, 1); } }
+
+bool testGnNsGfBareCallInNamespace()
+{
+    bool result = true;
+    result &= Test("gf_bare_ns",            Gq1NS.f(),               11);
+    result &= Test("gf_bare_global",        gq1Ident<int>(10),       10);
+    result &= Test("gf_declorder_ns",       Gq2NS.f(),               11);
+    result &= Test("gf_declorder_global",   gq2Ident<int>(10),       10);
+    result &= Test("gf_unique_name_ns",     Gq2NS.fUnique(),         12);
+    result &= Test("gf_multi_typeparam_a",  Gq3A.f(),                11);
+    result &= Test("gf_multi_typeparam_b",  Gq3B.f(),                12);
+    result &= Test("gf_multi_typeparam_gl", gq3First<int, int>(10, 1), 10);
+    return result;
+}
+
+// Leg B - NESTED namespaces: the inner one's own template wins, a sibling inner namespace with no
+// template walks OUT to the enclosing namespace's (not to the global one), and global stays global.
+Gq4T gq4Id<Gq4T>(Gq4T x) { return x; }
+namespace Gq4Out
+{
+    Gq4T gq4Id<Gq4T>(Gq4T x) { return x + 1; }
+    namespace In  { Gq4T gq4Id<Gq4T>(Gq4T x) { return x + 2; } int f() { return gq4Id<int>(10); } }
+    namespace In2 { int f() { return gq4Id<int>(10); } }
+    int f() { return gq4Id<int>(10); }
+}
+
+bool testGnNsGfNestedNamespaces()
+{
+    bool result = true;
+    result &= Test("gf_nested_inner",     Gq4Out.In.f(),   12);
+    result &= Test("gf_nested_walks_out", Gq4Out.In2.f(),  11);
+    result &= Test("gf_nested_outer",     Gq4Out.f(),      11);
+    result &= Test("gf_nested_global",    gq4Id<int>(10),  10);
+    return result;
+}
+
+// Leg C - the INFERRED spelling (no explicit type arguments) bare inside the namespace, plus the
+// QUALIFIED call spellings from outside in both the inferred and explicit forms.
+// The UNIQUE-NAME twin is load-bearing: the colliding form alone passes even when the bare
+// spelling never reaches its own namespace's key, because the global template absorbs the call.
+Gq5T gq5Id<Gq5T>(Gq5T x) { return x; }
+namespace Gq5NS
+{
+    Gq5T gq5Id<Gq5T>(Gq5T x) { return x + 1; }
+    Gq5U gq5UniqInferred<Gq5U>(Gq5U x) { return x + 2; }
+    int f()       { return gq5Id(10); }
+    int fUnique() { return gq5UniqInferred(10); }
+}
+
+bool testGnNsGfInferredAndQualifiedSpellings()
+{
+    bool result = true;
+    result &= Test("gf_inferred_bare_ns",       Gq5NS.f(),            11);
+    result &= Test("gf_inferred_global",        gq5Id(10),            10);
+    result &= Test("gf_inferred_unique_name",   Gq5NS.fUnique(),      12);
+    result &= Test("gf_qualified_inferred",     Gq5NS.gq5Id(10),      11);
+    result &= Test("gf_qualified_explicit",     Gq5NS.gq5Id<int>(10), 11);
+    result &= Test("gf_explicit_global",        gq5Id<int>(10),       10);
+    return result;
+}
+
+// Leg D - VARARGS arity, the `T f<T>(T a, ...)` spelling the fixed-arity legs never reach.
+Gq6T gq6First<Gq6T>(Gq6T a, ...) { return a; }
+namespace Gq6NS
+{
+    Gq6T gq6First<Gq6T>(Gq6T a, ...) { return a + 1; }
+    int f() { return gq6First<int>(10, 99); }
+}
+
+bool testGnNsGfVarargs()
+{
+    bool result = true;
+    result &= Test("gf_varargs_ns",     Gq6NS.f(),                11);
+    result &= Test("gf_varargs_global", gq6First<int>(10, 99),    10);
+    return result;
+}
+
+// Leg E - the layer-2 interaction: the generic function's TYPE ARGUMENT is itself
+// namespace-ambiguous. One global template, two same-named argument types.
+struct Gq7Item { int v = 9; };
+Gq7T gq7Pass<Gq7T>(Gq7T x) { return x; }
+namespace Gq7NS
+{
+    struct Gq7Item { int v = 7; };
+    int f() { Gq7Item i = default; Gq7Item r = gq7Pass<Gq7Item>(i); return r.v; }
+}
+int gq7Global() { Gq7Item i = default; Gq7Item r = gq7Pass<Gq7Item>(i); return r.v; }
+
+bool testGnNsGfTypeArgNamespaceAmbiguous()
+{
+    bool result = true;
+    result &= Test("gf_typearg_ns",     Gq7NS.f(),    7);
+    result &= Test("gf_typearg_global", gq7Global(),  9);
+    return result;
+}
+
+// Leg F - the EXTENSION-METHOD spelling: a `where`-constrained generic free function invoked on a
+// class receiver (`t.gq8Ext()`), which routes through the argument/interface inference path rather
+// than the explicit-type-argument path.
+interface IGq8 { int val(); };
+class Gq8Thing : IGq8 { int v = 7; int val() { return v; } };
+int gq8Ext<Gq8T>(Gq8T t) where Gq8T : IGq8 { return t.val(); }
+namespace Gq8NS
+{
+    int gq8Ext<Gq8T>(Gq8T t) where Gq8T : IGq8 { return t.val() + 100; }
+    // UNIQUE-NAME twin: no global template of this name exists to absorb the call, so this leg
+    // fails outright unless the bare spelling reaches the namespace's own key.
+    int gq8UniqueExt<Gq8U>(Gq8U t) where Gq8U : IGq8 { return t.val() + 200; }
+    int f()       { Gq8Thing t = default; return t.gq8Ext(); }
+    int fUnique() { Gq8Thing t = default; return t.gq8UniqueExt(); }
+}
+int gq8Global() { Gq8Thing t = default; return t.gq8Ext(); }
+
+bool testGnNsGfExtensionMethodReceiver()
+{
+    bool result = true;
+    result &= Test("gf_ext_method_ns",          Gq8NS.f(),       107);
+    result &= Test("gf_ext_method_unique_name", Gq8NS.fUnique(), 207);
+    result &= Test("gf_ext_method_global",      gq8Global(),       7);
+    return result;
+}
+
+// Leg L - the INTERFACE-TYPED receiver spelling. A generic free function whose FIRST PARAMETER is
+// the generic interface itself (`Ctr<T>`) is inferred from an interface-typed receiver - a
+// different dispatch site from leg F's `where`-constrained parameter. Colliding and unique-name
+// forms, plus the global control that proves the branch executes at all.
+interface IGq16<T> { T get(); };
+class Gq16Holder : IGq16<int> { int v = 7; int get() { return v; } };
+int gq16Ext<Gq16T>(IGq16<Gq16T> c) { return c.get() + 1; }
+namespace Gq16NS
+{
+    int gq16Ext<Gq16T>(IGq16<Gq16T> c) { return c.get() + 100; }
+    int gq16UniqueExt<Gq16U>(IGq16<Gq16U> c) { return c.get() + 200; }
+    int f()       { Gq16Holder h = default; IGq16<int> i = h; return i.gq16Ext(); }
+    int fUnique() { Gq16Holder h = default; IGq16<int> i = h; return i.gq16UniqueExt(); }
+}
+int gq16Global() { Gq16Holder h = default; IGq16<int> i = h; return i.gq16Ext(); }
+
+bool testGnNsGfInterfaceReceiverExtension()
+{
+    bool result = true;
+    result &= Test("gf_iface_recv_ns",          Gq16NS.f(),       107);
+    result &= Test("gf_iface_recv_unique_name", Gq16NS.fUnique(), 207);
+    result &= Test("gf_iface_recv_global",      gq16Global(),       8);
+    return result;
+}
+
+// Leg G - the instantiated BODY resolves in the template's DECLARING namespace, for a bare call
+// from inside it and for a qualified call from outside.
+namespace Gq9NS
+{
+    int gq9Helper() { return 5; }
+    Gq9T gq9Add<Gq9T>(Gq9T x) { return x + gq9Helper(); }
+    int f() { return gq9Add<int>(10); }
+}
+int gq9Helper() { return 500; }
+
+bool testGnNsGfBodyNamesDeclaringNsSibling()
+{
+    bool result = true;
+    result &= Test("gf_body_sibling_bare",      Gq9NS.f(),              15);
+    result &= Test("gf_body_sibling_qualified", Gq9NS.gq9Add<int>(10),  15);
+    result &= Test("gf_body_sibling_global_fn", gq9Helper(),           500);
+    return result;
+}
+
+// Leg H (MUST-NOT-REGRESS CONTROLS) - the "Owner.method" member-template convention: static and
+// instance methods, an owner struct nested in a namespace (key "NS.Struct.method", two dots), and
+// an owner struct whose name collides with a real namespace elsewhere.
+struct Gq10Holder
+{
+    static Gq10T identStatic<Gq10T>(Gq10T x) { return x; }
+    Gq10T identInstance<Gq10T>(Gq10T x) { return x; }
+};
+namespace Gq11NS
+{
+    struct Util { Gq11T identInstance<Gq11T>(Gq11T x) { return x + 5; } };
+    int callInside() { Util u = default; return u.identInstance<int>(10); }
+}
+namespace Gq12Nest { struct Gq12Helper { int v = 9; }; }
+struct Gq12Helper { int v = 5; };
+struct Gq12Nest
+{
+    int pad = 0;
+    Gq12Helper h = default;
+    Gq12T identInstance<Gq12T>(Gq12T x) { return x + h.v; }
+};
+
+bool testGnNsGfCtrlMemberTemplates()
+{
+    bool result = true;
+    Gq10Holder h = default;
+    result &= Test("gf_member_static",           Gq10Holder.identStatic<int>(5), 5);
+    result &= Test("gf_member_instance",         h.identInstance<int>(6),        6);
+    Gq11NS.Util u = default;
+    result &= Test("gf_member_owner_in_ns_in",   Gq11NS.callInside(),           15);
+    result &= Test("gf_member_owner_in_ns_out",  u.identInstance<int>(20),      25);
+    Gq12Nest s = default;
+    result &= Test("gf_member_owner_vs_ns_name", s.identInstance<int>(10),      15);
+    return result;
+}
+
+// Leg I - an owner struct inside a namespace whose METHOD template name collides with a free
+// generic function of the same name in that namespace AND at global scope. The receiver call must
+// keep binding to the member key, the bare call to the namespace's free key.
+Gq13T gq13Ident<Gq13T>(Gq13T x) { return x; }
+namespace Gq13NS
+{
+    Gq13T gq13Ident<Gq13T>(Gq13T x) { return x + 100; }
+    struct Box { int b = 3; Gq13T gq13Ident<Gq13T>(Gq13T x) { return x + b; } };
+    int viaReceiver() { Box bx = default; return bx.gq13Ident<int>(10); }
+    int viaFree()     { return gq13Ident<int>(10); }
+    // UNIQUE-NAME twin: a member template and a free template sharing a name that exists NOWHERE
+    // globally, so neither call can be absorbed by a global key.
+    struct Box2 { int b = 4; Gq13U gq13Uniq<Gq13U>(Gq13U x) { return x + b; } };
+    Gq13U gq13Uniq<Gq13U>(Gq13U x) { return x + 300; }
+    int uniqViaReceiver() { Box2 bx = default; return bx.gq13Uniq<int>(10); }
+    int uniqViaFree()     { return gq13Uniq<int>(10); }
+}
+
+bool testGnNsGfMemberVsFreeNameCollision()
+{
+    bool result = true;
+    result &= Test("gf_member_vs_free_receiver",      Gq13NS.viaReceiver(),     13);
+    result &= Test("gf_member_vs_free_bare",          Gq13NS.viaFree(),        110);
+    result &= Test("gf_member_vs_free_global",        gq13Ident<int>(10),       10);
+    result &= Test("gf_member_vs_free_uniq_receiver", Gq13NS.uniqViaReceiver(),  14);
+    result &= Test("gf_member_vs_free_uniq_bare",     Gq13NS.uniqViaFree(),     310);
+    return result;
+}
+
+// Leg J (CONTROL) - struct nesting and namespace nesting share one dotted key space, so the member
+// key "Gq14Own.mget" and a `namespace Gq14Own` look alike. The declaring namespace is RECORDED at
+// registration, so a bare call inside `namespace Gq14Own` must NOT reach the struct's member
+// template; it takes the global free one. Correct on both binaries - a tripwire, not a fix.
+Gq14T gq14Mget<Gq14T>(Gq14T x) { return x; }
+struct Gq14Own { int b = 50; Gq14T gq14Mget<Gq14T>(Gq14T x) { return x + b; } };
+namespace Gq14Own { int f() { return gq14Mget<int>(10); } }
+// The OPPOSITE direction of the same collision, and a false rejection before it was fixed: a FREE
+// template in `namespace Gq17Ov` is keyed "Gq17Ov.gq17F", which a last-dot split reads as a method
+// on `struct Gq17Ov` and lowers with an implicit `this`. Static and no-struct forms included.
+struct Gq17Ov { int v = 3; };
+namespace Gq17Ov
+{
+    Gq17T gq17F<Gq17T>(Gq17T x) { return x + 5; }
+    int use() { return gq17F<int>(10); }
+}
+namespace Gq18NoStruct
+{
+    Gq18T gq18F<Gq18T>(Gq18T x) { return x + 5; }
+    int use() { return gq18F<int>(10); }
+}
+
+bool testGnNsGfCtrlOwnerStructNameEqualsNamespace()
+{
+    bool result = true;
+    Gq14Own o = default;
+    result &= Test("gf_owner_ns_name_bare",      Gq14Own.f(),             10);
+    result &= Test("gf_owner_ns_name_member",    o.gq14Mget<int>(10),     60);
+    result &= Test("gf_owner_ns_name_global",    gq14Mget<int>(10),       10);
+    result &= Test("gf_free_tpl_ns_name_bare",   Gq17Ov.use(),            15);
+    result &= Test("gf_free_tpl_ns_name_qual",   Gq17Ov.gq17F<int>(10),   15);
+    result &= Test("gf_free_tpl_no_struct_ctrl", Gq18NoStruct.use(),      15);
+    return result;
+}
+
+// Leg K (CONTROL) - a bare call from inside a STRUCT METHOD body in a namespace does NOT see the
+// namespace, so it takes the global template. Pinned together with its NON-GENERIC control, which
+// answers the same way: this is a general namespace-scope limit, not a generic-function one.
+Gq15T gq15Id<Gq15T>(Gq15T x) { return x; }
+int gq15Plain(int x) { return x; }
+namespace Gq15NS
+{
+    Gq15T gq15Id<Gq15T>(Gq15T x) { return x + 1; }
+    int gq15Plain(int x) { return x + 1; }
+    struct S { int mGeneric() { return gq15Id<int>(10); } int mPlain() { return gq15Plain(10); } };
+    int freeGeneric() { return gq15Id<int>(10); }
+    int freePlain()   { return gq15Plain(10); }
+}
+
+bool testGnNsGfCtrlStructMethodBodyScope()
+{
+    bool result = true;
+    Gq15NS.S s = default;
+    result &= Test("gf_method_body_generic",  s.mGeneric(),        10);
+    result &= Test("gf_method_body_plain",    s.mPlain(),          10);
+    result &= Test("gf_free_body_generic",    Gq15NS.freeGeneric(), 11);
+    result &= Test("gf_free_body_plain",      Gq15NS.freePlain(),   11);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -3301,6 +4031,38 @@ extern int main()
     total++; passed += testGnNsInnerScopeWins()                 ? 1 : 0;
     total++; passed += testGnNsNestedInStructNotNamespace()     ? 1 : 0;
     total++; passed += testGnNsGenericBaseAliasKeepsDeclSiteMeaning() ? 1 : 0;
+
+    total++; passed += testGnNsTaCollision()                    ? 1 : 0;
+    total++; passed += testGnNsTaTemplateInNamespaceToo()        ? 1 : 0;
+    total++; passed += testGnNsTaThreeWayNamespaces()            ? 1 : 0;
+    total++; passed += testGnNsTaQualifiedVsBareTypeArg()        ? 1 : 0;
+    total++; passed += testGnNsTaMultiTypeArgOneAmbiguous()      ? 1 : 0;
+    total++; passed += testGnNsTaNestedTypeArg()                 ? 1 : 0;
+    total++; passed += testGnNsTaPointerTypeArg()                ? 1 : 0;
+    total++; passed += testGnNsTaNestedNamespaces()              ? 1 : 0;
+    total++; passed += testGnNsTaDifferingLayouts()              ? 1 : 0;
+    total++; passed += testGnNsTaDottedArgIsNotRelative()        ? 1 : 0;
+    total++; passed += testGnNsTaExpectErrorBlockTypeIsReachable() ? 1 : 0;
+    total++; passed += testGnNsTaNestedStructKeyIsOrderIndependent() ? 1 : 0;
+    total++; passed += testGnNsTaCtrlUniqueNames()               ? 1 : 0;
+    total++; passed += testGnNsTaCtrlUniqueTemplateInNs()        ? 1 : 0;
+    total++; passed += testGnNsBodyKeepsCallerTypeArg()          ? 1 : 0;
+    total++; passed += testGnNsBodyDisjointLayouts()             ? 1 : 0;
+    total++; passed += testGnNsBodyNestedClassAndStructNsKeySpace() ? 1 : 0;
+    total++; passed += testGnNsBodyCtrlDeclaringScope()          ? 1 : 0;
+
+    total++; passed += testGnNsGfBareCallInNamespace()            ? 1 : 0;
+    total++; passed += testGnNsGfNestedNamespaces()               ? 1 : 0;
+    total++; passed += testGnNsGfInferredAndQualifiedSpellings()  ? 1 : 0;
+    total++; passed += testGnNsGfVarargs()                        ? 1 : 0;
+    total++; passed += testGnNsGfTypeArgNamespaceAmbiguous()      ? 1 : 0;
+    total++; passed += testGnNsGfExtensionMethodReceiver()        ? 1 : 0;
+    total++; passed += testGnNsGfInterfaceReceiverExtension()     ? 1 : 0;
+    total++; passed += testGnNsGfBodyNamesDeclaringNsSibling()    ? 1 : 0;
+    total++; passed += testGnNsGfCtrlMemberTemplates()            ? 1 : 0;
+    total++; passed += testGnNsGfMemberVsFreeNameCollision()      ? 1 : 0;
+    total++; passed += testGnNsGfCtrlOwnerStructNameEqualsNamespace() ? 1 : 0;
+    total++; passed += testGnNsGfCtrlStructMethodBodyScope()      ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

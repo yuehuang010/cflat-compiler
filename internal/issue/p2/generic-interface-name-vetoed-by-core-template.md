@@ -1,7 +1,7 @@
 # A core generic struct/class template vetoes a same-named user generic interface
 
 Re-filed 2026-07-29 (round 2 of the key-space fix). This shape was folded into
-[[generic-template-namespace-key-space]] as its step 4, then implemented and **reverted**; that
+[[interface-issue-queue]] (landed design records) as its step 4, then implemented and **reverted**; that
 issue's other four steps shipped without it. It is back on its own because it is NOT a key-space
 problem and cannot be solved by qualifying namespaces.
 
@@ -131,5 +131,5 @@ must keep passing) are the two shapes any fix must satisfy simultaneously - whic
 constraints. Corpus leg 39 (`testVetoListControl`, `interface myList<T>` with no collision) passes
 and stays in the key-space corpus as the negative control.
 
-Related: [[generic-template-namespace-key-space]],
+Related: [[interface-issue-queue]] (landed design records),
 [[duplicate-generic-template-name-silently-accepted]], [[interface-issue-queue]]

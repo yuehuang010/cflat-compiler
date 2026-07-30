@@ -92,7 +92,7 @@ arguments and mangle to the parent's concrete name (`IBase` + `<T>` under `T=int
 `IBase__int`) before looking it up / passing it to `CreateInterfaceDefinition`, and queue
 the parent's own instantiation if it has not happened yet (mirroring how
 `ProcessPendingInstantiations` already drains interface instantiations before struct
-layouts, per `generic-interface-registered-as-opaque-struct`). The non-generic-parent
+layouts, per the generic-interface registration work (`09f1d56`)). The non-generic-parent
 case (repro #4) already works, so whatever the fix is, it must not touch the plain
 bare-name path.
 

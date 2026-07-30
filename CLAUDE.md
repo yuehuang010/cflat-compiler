@@ -85,7 +85,8 @@ Current skills:
 
 - After finding the root cause of the issue, consider writing a regression test.
 - When encountering a LLVM assert, after identifying the root cause, then write an proper error message in the compiler to avoid that case.
-- Known, diagnosed-but-deferred bugs/gaps live in `internal/issue/` (tracked in git, like `internal/plan/`). Check there before re-investigating a failure, and record new known issues there (one file per issue: summary, repro, root cause, fix direction). Delete the file when the issue is fixed.
+- Known, diagnosed-but-deferred bugs/gaps live in `internal/issue/` (tracked in git, like `internal/plan/`). Check there before re-investigating a failure, and record new known issues there (one file per issue: summary, repro, root cause, fix direction). Delete the file when the issue is fixed. `internal/issue/` holds ACTIVE items only; `internal/issue/interface-issue-queue.md` is the index and the home of the landed design records (ratified behaviour changes and approaches that must not be retried).
+- Durable lessons from past fix rounds - review sequencing, guard polarity, what to distrust in an agent report, how tests go vacuous - live in `internal/fix-issue-lessons.md`. Read it before starting a non-trivial compiler fix; add to it when a lesson changes an outcome twice.
 
 ## Building
 

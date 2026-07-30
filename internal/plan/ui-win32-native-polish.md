@@ -110,7 +110,7 @@ Both now grow to hold their inset children instead of overflowing.
 Push BUTTONS, the COMBO box, the TRACKBAR thumb, and the size-grip GLYPH are still
 light in dark theme. Same root cause as Phase 4: the exe has no manifest, so the app
 binds the CLASSIC (v5) common controls (see
-`internal/issue/win32-classic-common-controls-v5.md`).
+`internal/issue/ui/win32-classic-common-controls-v5.md`).
 
 DECISION (2026-07-13): embed a comctl32 v6 manifest, rather than owner-drawing the
 remaining controls on v5. It modernizes every control at once, makes `SetWindowTheme`
@@ -289,7 +289,7 @@ controls this phase exists to fix.
 ## Not done / parity gaps
 
 - `Text.font` variants (`FONT_TITLE` / `FONT_CAPTION`) are still Cocoa-only on both
-  Windows hosts - see `internal/issue/ui-native-visual-polish-win32-winui.md`.
+  Windows hosts - see `internal/issue/ui/ui-native-visual-polish-win32-winui.md`.
 - macOS: none of this was re-verified on a Mac box (no hardware). The Win32 changes
   are gated to `win32.cb`; only the Phase-4b layout change is host-neutral and it is
   covered by `test.bat` / `example.bat`.

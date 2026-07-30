@@ -4186,6 +4186,54 @@ bool testGiNsCollideQualified()
         && Test("gi_ns_collide_qualified_b", GiNsB.useB(b), 64) == 1;
 }
 
+// Layer 2 (type ARGUMENTS) corpus leg 9, merged from the layer-2 corpus (deleted with the issue):
+// an ambiguous type used as a type argument to a generic INTERFACE. The consumer must live in
+// the SAME scope as the ambiguous type - an interface parameter spelled at global scope names
+// the global Item, so passing A's box to it is a genuine type error once the two instantiations
+// are distinct.
+struct Ta9Item { int v = 9; };
+interface Ta9IHolder<T> { T Get(); };
+class Ta9Box<T> : Ta9IHolder<T> { T t = default; T Get() { return t; } };
+int ta9UseIface(Ta9IHolder<Ta9Item> h) { return h.Get().v; }
+namespace Ta9A
+{
+    struct Ta9Item { int v = 7; };
+    int use(Ta9IHolder<Ta9Item> h) { return h.Get().v; }
+    int f() { Ta9Box<Ta9Item> b = default; return use(b); }
+}
+int ta9g() { Ta9Box<Ta9Item> b = default; return ta9UseIface(b); }
+
+bool testGiNsTaInterfaceTypeArg()
+{
+    bool result = true;
+    result &= Test("ta_interface_typearg_inA", Ta9A.f(), 7);
+    result &= Test("ta_interface_typearg_global", ta9g(), 9);
+    return result;
+}
+
+// Layer 3: a generic INTERFACE declared in a namespace that owns its own same-named type must
+// keep the argument the CALLER resolved. Reached through an interface-typed LOCAL - an interface
+// PARAMETER whose type argument is a namespaced type fails on both binaries with a module
+// verification error, a separate pre-existing gap. Corpus:
+// the layer-3 corpus (deleted with the issue).
+struct Bs5Item { int v = 9; };
+namespace BsN5
+{
+    struct Bs5Item { int v = 3; };
+    interface Bs5IH<T> { T Get(); };
+    class Bs5Box<T> : Bs5IH<T> { T t = default; T Get() { return t; } };
+}
+int bs5Global() { BsN5.Bs5Box<Bs5Item> b = default; BsN5.Bs5IH<Bs5Item> h = b; return h.Get().v; }
+int bs5Dotted() { BsN5.Bs5Box<BsN5.Bs5Item> b = default; BsN5.Bs5IH<BsN5.Bs5Item> h = b; return h.Get().v; }
+
+bool testGiNsBodyKeepsCallerTypeArg()
+{
+    bool result = true;
+    result &= Test("bs_iface_body_global", bs5Global(), 9);
+    result &= Test("bs_iface_body_dotted", bs5Dotted(), 3);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -4283,6 +4331,8 @@ extern int main()
     total++; passed += testGiNsIfaceReturn()                             ? 1 : 0;
     total++; passed += testGiNsIfaceField()                              ? 1 : 0;
     total++; passed += testGiNsCollideQualified()                        ? 1 : 0;
+    total++; passed += testGiNsTaInterfaceTypeArg()                      ? 1 : 0;
+    total++; passed += testGiNsBodyKeepsCallerTypeArg()                  ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;
