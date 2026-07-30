@@ -2,6 +2,8 @@ import "test_helper.cb";
 import "list.cb";
 import "channel.cb";
 import "library/iface_rebox_lib.cb";
+import "library/gi_collide_iface.cb";
+import "library/gi_collide_struct.cb";
 import "function.cb";
 
 // === Interfaces ===
@@ -3439,6 +3441,674 @@ bool testInterfaceReturnDangleCorpus()
     return result;
 }
 
+// === Generic-interface regression corpus =================================================
+// Merged from scratch/gi/test_generic_interface.cb, the standalone accept-set pin for
+// internal/issue/generic-interface-registered-as-opaque-struct.md (tryPreDeclare
+// unconditionally CreateStructType'd every Base<Args> use, so a generic interface
+// instantiation landed as an opaque struct in dataStructures ahead of interfaceTable).
+// Types below are prefixed Gi* only where the bare corpus name collided with an existing
+// name in this file (Container, INamed, Mirror); everything else keeps the corpus name.
+
+interface GiContainer<T> { T Get(); void Set(T v); };
+class GiStorage<T> : GiContainer<T> { T data = default; T Get() { return data; } void Set(T v) { data = v; } };
+
+struct GiFieldHolder { GiContainer<int> c = default; };
+
+// Force the instantiation early with a file-scope global - forcing does not help (leg 6).
+GiContainer<int> gGiForceInstantiate = default;
+
+// Leg 1: callee defined after the call site (function is below in this file).
+bool testGiParamAfterMain()
+{
+    GiStorage<int> s = default;
+    s.Set(42);
+    GiContainer<int> ci = s;
+    return Test("gen_iface_param_after_main", sumGiInt_leg1(ci), 42) == 1;
+}
+int sumGiInt_leg1(GiContainer<int> c) { return c.Get(); }
+
+// Leg 2: callee defined BEFORE the call site, no forward prototype.
+int sumGiInt_leg2(GiContainer<int> c) { return c.Get(); }
+bool testGiParamDefinedBeforeUse()
+{
+    GiStorage<int> s = default;
+    s.Set(43);
+    GiContainer<int> ci = s;
+    return Test("gen_iface_param_defined_before_use", sumGiInt_leg2(ci), 43) == 1;
+}
+
+// Leg 2p: explicit forward prototype, then later definition.
+int sumGiInt_leg2p(GiContainer<int> c);
+bool testGiParamForwardPrototype()
+{
+    GiStorage<int> s = default;
+    s.Set(44);
+    GiContainer<int> ci = s;
+    return Test("gen_iface_param_forward_prototype", sumGiInt_leg2p(ci), 44) == 1;
+}
+int sumGiInt_leg2p(GiContainer<int> c) { return c.Get(); }
+
+// Leg 3: struct field of generic-interface type.
+bool testGiStructField()
+{
+    GiStorage<int> s = default;
+    s.Set(45);
+    GiFieldHolder h = default;
+    h.c = s;
+    return Test("gen_iface_struct_field", h.c.Get(), 45) == 1;
+}
+
+// Leg 4: generic-interface type used as a generic type ARGUMENT: list<GiContainer<int>>.
+bool testGiListGenericArg()
+{
+    GiStorage<int> s = default;
+    s.Set(46);
+    list<GiContainer<int>> l = default;
+    l.add(s);
+    return Test("gen_iface_list_generic_arg", l[0].Get(), 46) == 1;
+}
+
+// Leg 5 / 5m: generic-interface RETURN type, plain and 'move'.
+move GiContainer<int> makeGiContainer_leg5()
+{
+    GiStorage<int>* s = new GiStorage<int>();
+    s->Set(47);
+    return s;
+}
+bool testGiReturnPlainAndMove()
+{
+    GiContainer<int> ci = makeGiContainer_leg5();
+    bool ok = Test("gen_iface_return_move", ci.Get(), 47) == 1;
+    delete ci;
+    return ok;
+}
+
+// Leg 6: forced early instantiation does not help - same shape as leg 1.
+bool testGiForcedGlobalDoesNotHelp()
+{
+    GiStorage<int> s = default;
+    s.Set(48);
+    GiContainer<int> ci = s;
+    return Test("gen_iface_forced_global", sumGiInt_leg6(ci), 48) == 1;
+}
+int sumGiInt_leg6(GiContainer<int> c) { return c.Get(); }
+
+// Leg 7: LOCAL of generic-interface type - control, must keep passing.
+bool testGiLocalControl()
+{
+    GiStorage<int> s = default;
+    s.Set(49);
+    GiContainer<int> ci = s;
+    return Test("gen_iface_local_control", ci.Get(), 49) == 1;
+}
+
+// --- Leg 8: generic class implementing a NON-generic interface, all positions - control ----
+interface GiINamed { int id(); };
+class GiBox<T> : GiINamed { T data = default; int tag = 0; int id() { return tag; } };
+struct GiBoxField { GiINamed n = default; };
+int sumGiId_leg8(GiINamed n) { return n.id(); }
+move GiINamed makeGiBox_leg8(int t)
+{
+    GiBox<int>* b = new GiBox<int>();
+    b->tag = t;
+    return b;
+}
+bool testGiGenericClassNonGenericInterfaceAllPositions()
+{
+    bool ok = true;
+    GiBox<int> b = default;
+    b.tag = 5;
+
+    GiINamed local = b;
+    ok &= Test("gen_iface_leg8_local", local.id(), 5);
+    ok &= Test("gen_iface_leg8_param", sumGiId_leg8(local), 5);
+
+    GiBoxField h = default;
+    h.n = b;
+    ok &= Test("gen_iface_leg8_field", h.n.id(), 5);
+
+    list<GiINamed> l = default;
+    l.add(b);
+    ok &= Test("gen_iface_leg8_list", l[0].id(), 5);
+
+    GiINamed r = makeGiBox_leg8(8);
+    ok &= Test("gen_iface_leg8_return", r.id(), 8);
+    delete r;
+
+    return ok;
+}
+
+// --- Leg 9: plain (non-generic) interface in all leg-1..6 positions - control --------------
+interface GiPlainContainer { int Get(); void Set(int v); };
+class GiPlainStorage : GiPlainContainer { int data = default; int Get() { return data; } void Set(int v) { data = v; } };
+struct GiPlainField { GiPlainContainer c = default; };
+GiPlainContainer gGiForcePlain_leg9 = default;
+int sumGiPlain_leg9(GiPlainContainer c) { return c.Get(); }
+move GiPlainContainer makeGiPlain_leg9()
+{
+    GiPlainStorage* s = new GiPlainStorage();
+    s->Set(99);
+    return s;
+}
+move GiPlainContainer makeGiPlainMv_leg9()
+{
+    GiPlainStorage* s = new GiPlainStorage();
+    s->Set(77);
+    return s;
+}
+bool testGiNonGenericInterfaceAllPositions()
+{
+    bool ok = true;
+    GiPlainStorage s = default;
+    s.Set(42);
+    GiPlainContainer ci = s;
+
+    ok &= Test("gen_iface_leg9_param", sumGiPlain_leg9(ci), 42);
+
+    GiPlainField h = default;
+    h.c = s;
+    ok &= Test("gen_iface_leg9_field", h.c.Get(), 42);
+
+    list<GiPlainContainer> l = default;
+    l.add(s);
+    ok &= Test("gen_iface_leg9_list", l[0].Get(), 42);
+
+    GiPlainContainer r1 = makeGiPlain_leg9();
+    ok &= Test("gen_iface_leg9_return", r1.Get(), 99);
+    delete r1;
+
+    GiPlainContainer r2 = makeGiPlainMv_leg9();
+    ok &= Test("gen_iface_leg9_return_move", r2.Get(), 77);
+    delete r2;
+
+    return ok;
+}
+
+// --- Leg 10: two type parameters: Pair<int, float> -----------------------------------------
+interface Pair<A, B> { A First(); B Second(); };
+class PairBox<A, B> : Pair<A, B> { A a = default; B b = default; A First() { return a; } B Second() { return b; } };
+int sumPair_leg10(Pair<int, float> p) { return (int)(p.First() + p.Second()); }
+bool testGiMultiTypeArgPair()
+{
+    PairBox<int, float> pb = default;
+    pb.a = 3;
+    pb.b = 4.5f;
+    Pair<int, float> p = pb;
+    return Test("gen_iface_leg10_multi_typearg", sumPair_leg10(p), 7) == 1;
+}
+
+// --- Leg 11: non-primitive type argument: GiContainer<GiPoint> -----------------------------
+struct GiPoint { int x = default; int y = default; };
+int sumGiPoint_leg11(GiContainer<GiPoint> c) { GiPoint p = c.Get(); return p.x + p.y; }
+bool testGiNonPrimitiveTypeArg()
+{
+    GiStorage<GiPoint> s = default;
+    GiPoint p = default;
+    p.x = 3; p.y = 4;
+    s.Set(p);
+    GiContainer<GiPoint> ci = s;
+    return Test("gen_iface_leg11_nonprimitive_typearg", sumGiPoint_leg11(ci), 7) == 1;
+}
+
+// --- Leg 12: pointer type argument: GiContainer<GiPoint*> ----------------------------------
+int sumGiPointPtr_leg12(GiContainer<GiPoint*> c) { GiPoint* p = c.Get(); return p->x + p->y; }
+bool testGiPointerTypeArg()
+{
+    GiStorage<GiPoint*> s = default;
+    GiPoint* p = new GiPoint();
+    p->x = 5; p->y = 6;
+    s.Set(p);
+    GiContainer<GiPoint*> ci = s;
+    bool ok = Test("gen_iface_leg12_pointer_typearg", sumGiPointPtr_leg12(ci), 11) == 1;
+    delete p;
+    return ok;
+}
+
+// --- Leg 13: two distinct instantiations of the same template live together ----------------
+int sumGiInt_leg13(GiContainer<int> c) { return c.Get(); }
+float sumGiFloat_leg13(GiContainer<float> c) { return c.Get(); }
+bool testGiTwoInstantiationsLiveTogether()
+{
+    GiStorage<int> si = default;
+    si.Set(11);
+    GiContainer<int> ci = si;
+
+    GiStorage<float> sf = default;
+    sf.Set(2.5f);
+    GiContainer<float> cf = sf;
+
+    bool ok = Test("gen_iface_leg13_two_inst_int", sumGiInt_leg13(ci), 11) == 1;
+    ok &= Test("gen_iface_leg13_two_inst_float", sumGiFloat_leg13(cf), 2.5f) == 1;
+    return ok;
+}
+
+// --- Leg 14: class implementing TWO generic interfaces --------------------------------------
+interface Getter<T> { T Get(); };
+interface Setter<T> { void Set(T v); };
+class Both<T> : Getter<T>, Setter<T> { T data = default; T Get() { return data; } void Set(T v) { data = v; } };
+int sumGet_leg14(Getter<int> g) { return g.Get(); }
+void doSet_leg14(Setter<int> s, int v) { s.Set(v); }
+bool testGiClassImplementsTwoGenericInterfaces()
+{
+    Both<int> b = default;
+    b.Set(13);
+    Getter<int> g = b;
+    bool ok = Test("gen_iface_leg14_two_iface_get", sumGet_leg14(g), 13) == 1;
+
+    Setter<int> s = b;
+    doSet_leg14(s, 21);
+    ok &= Test("gen_iface_leg14_two_iface_after_set", b.Get(), 21) == 1;
+    return ok;
+}
+
+// --- Leg 15b: 'as' downcast between two SIBLING generic interfaces, all-local - control -----
+// (Leg 15, generic interface inheriting a generic interface, is a distinct pre-existing bug
+// - "unknown parent interface" at the base-clause declaration itself - and is out of scope
+// for this fix; see internal/issue/generic-interface-registered-as-opaque-struct.md.)
+bool testGiAsDowncastBetweenSiblingGenericInterfaces()
+{
+    Both<int> b = default;
+    b.data = 17;
+    Getter<int> g = b;
+    Setter<int> s = g as Setter<int>;
+    s.Set(23);
+    return Test("gen_iface_leg15b_as_sibling", b.Get(), 23) == 1;
+}
+
+// --- Legs 16/17/19: cross-file bare-name collisions - the struct role owns the mangled name --
+// gi_collide_iface.cb declares ONLY "interface GiCollideName<T>"; gi_collide_struct.cb
+// declares ONLY "struct GiCollideRev<T>". The two roles must coexist under one mangled name
+// per file rather than becoming exclusive globally.
+struct GiCollideName<T> { T v = default; };
+interface GiCollideRev<T> { T Get(); };
+using GiCollideNameAlias_leg19 = GiCollideName<int>;
+bool testGiCrossFileCollisionStructWins()
+{
+    bool ok = true;
+    GiCollideName<int> a = default;
+    a.v = 61;
+    ok &= Test("gen_iface_leg16_struct_vs_imported_iface", a.v, 61);
+
+    GiCollideRev<int> b = default;
+    b.v = 62;
+    ok &= Test("gen_iface_leg17_iface_vs_imported_struct", b.v, 62);
+
+    GiCollideNameAlias_leg19 c = default;
+    c.v = 64;
+    ok &= Test("gen_iface_leg19_using_alias_collision", c.v, 64);
+    return ok;
+}
+
+// --- Leg 18: collision with a CORE generic interface reached transitively through list.cb ----
+// core/interfaces.cb declares "interface IQueue<T>"; this is a generic STRUCT of the same
+// bare name declared in a user file - needs no helper module, core supplies the collision.
+struct IQueue<T> { T v = default; };
+bool testGiCoreInterfaceNameCollision()
+{
+    IQueue<int> q = default;
+    q.v = 63;
+    list<int> l = default;
+    l.add(q.v);
+    bool ok = Test("gen_iface_leg18_core_iface_name_collision", q.v, 63) == 1;
+    ok &= Test("gen_iface_leg18_core_iface_list_still_works", l[0], 63);
+    return ok;
+}
+
+// --- Leg 21: a DEAD 'if const' generic STRUCT must not veto the LIVE generic INTERFACE of the
+// same name in a sibling branch. (The mirror negative leg - an interface declared ONLY in a
+// dead branch - is a rejection and lives in Test/errors/err_generic_interface_dead_ifconst_branch.cb.)
+if const (__WINDOWS__) {
+    struct GiMirror<T> { T v = default; };
+}
+if const (__MACOS__) {
+    interface GiMirror<T> { T Get(); };
+    class GiMirrorBox<T> : GiMirror<T> { T d = default; T Get() { return d; } };
+}
+if const (__LINUX__) {
+    interface GiMirror<T> { T Get(); };
+    class GiMirrorBox<T> : GiMirror<T> { T d = default; T Get() { return d; } };
+}
+int useGiMirror_leg21(GiMirror<int> m) { return m.Get(); }
+bool testGiLiveInterfaceDeadStructMirror()
+{
+    GiMirrorBox<int> b = default;
+    b.d = 65;
+    GiMirror<int> m = b;
+    return Test("gen_iface_leg21_live_iface_dead_struct", useGiMirror_leg21(m), 65) == 1;
+}
+
+// --- Legs 22/23: NESTED generic type arguments in a generic-interface signature -------------
+// The scanner once mangled the arg non-recursively (GiContainer__GiBox<int>) while the main
+// pass produced GiContainer__GiBox__int, so the pre-declared signature never matched the call.
+class GiBoxCarrier : Getter<int> { int Get() { return 41; } };
+int takeGiNested_leg22(GiContainer<GiBox<int>> c) { GiBox<int> r = c.Get(); return r.tag; }
+int takeGiNested_leg23(GiContainer<Getter<int>> c) { Getter<int> inner = c.Get(); return inner.Get(); }
+bool testGiNestedGenericTypeArg()
+{
+    GiBox<int> b = default;
+    b.tag = 11;
+    GiStorage<GiBox<int>> sb = default;
+    sb.Set(b);
+    GiContainer<GiBox<int>> cb = sb;
+    bool ok = Test("gen_iface_leg22_nested_struct_typearg", takeGiNested_leg22(cb), 11) == 1;
+
+    GiBoxCarrier bc = default;
+    Getter<int> g = bc;
+    GiStorage<Getter<int>> sg = default;
+    sg.Set(g);
+    GiContainer<Getter<int>> cg = sg;
+    ok &= Test("gen_iface_leg23_nested_iface_typearg", takeGiNested_leg23(cg), 41);
+    return ok;
+}
+
+// --- Leg 24: the 'if const' CONDITION-FORM matrix around a generic-interface declaration ----
+// The forward scan and the main pass must reach the SAME decision about which branch is live,
+// for every condition SHAPE (bare, parens, ||, ==, &&+else, !=0+else-if-const) - a mismatch
+// once surfaced as a raw LLVM verifier failure with no source location.
+if const ((__MACOS__)) {
+    interface GiCParen<T> { T Get(); void Set(T v); };
+    class GiCParenBox<T> : GiCParen<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+if const ((__WINDOWS__)) {
+    interface GiCParen<T> { T Get(); void Set(T v); };
+    class GiCParenBox<T> : GiCParen<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+if const ((__LINUX__)) {
+    interface GiCParen<T> { T Get(); void Set(T v); };
+    class GiCParenBox<T> : GiCParen<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+if const (__MACOS__ || __WINDOWS__ || __LINUX__) {
+    interface GiCOr<T> { T Get(); void Set(T v); };
+    class GiCOrBox<T> : GiCOr<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+if const (__PLATFORM__ == 64) {
+    interface GiCCmp<T> { T Get(); void Set(T v); };
+    class GiCCmpBox<T> : GiCCmp<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+if const (!__WINDOWS__ && __POSIX__) {
+    interface GiCAnd<T> { T Get(); void Set(T v); };
+    class GiCAndBox<T> : GiCAnd<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+else {
+    interface GiCAnd<T> { T Get(); void Set(T v); };
+    class GiCAndBox<T> : GiCAnd<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+if const (__WINDOWS__ != 0) {
+    interface GiCNe<T> { T Get(); void Set(T v); };
+    class GiCNeBox<T> : GiCNe<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+else if const (__POSIX__ != 0) {
+    interface GiCNe<T> { T Get(); void Set(T v); };
+    class GiCNeBox<T> : GiCNe<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+int useGiParen_leg24(GiCParen<int> c) { return c.Get(); }
+int useGiOr_leg24(GiCOr<int> c)       { return c.Get(); }
+int useGiCmp_leg24(GiCCmp<int> c)     { return c.Get(); }
+int useGiAnd_leg24(GiCAnd<int> c)     { return c.Get(); }
+int useGiNe_leg24(GiCNe<int> c)       { return c.Get(); }
+bool testGiIfConstConditionForms()
+{
+    bool ok = true;
+    GiCParenBox<int> p = default; p.Set(71);
+    GiCParen<int> pi = p;
+    ok &= Test("gen_iface_leg24_paren", useGiParen_leg24(pi), 71);
+
+    GiCOrBox<int> o = default; o.Set(72);
+    GiCOr<int> oi = o;
+    ok &= Test("gen_iface_leg24_or", useGiOr_leg24(oi), 72);
+
+    GiCCmpBox<int> c = default; c.Set(73);
+    GiCCmp<int> ci2 = c;
+    ok &= Test("gen_iface_leg24_comparison", useGiCmp_leg24(ci2), 73);
+
+    GiCAndBox<int> a = default; a.Set(74);
+    GiCAnd<int> ai = a;
+    ok &= Test("gen_iface_leg24_and_with_else", useGiAnd_leg24(ai), 74);
+
+    GiCNeBox<int> n = default; n.Set(75);
+    GiCNe<int> ni = n;
+    ok &= Test("gen_iface_leg24_ne0_else_if_const", useGiNe_leg24(ni), 75);
+    return ok;
+}
+
+// --- Leg 25: an UNDECIDABLE-to-the-scanner dead generic struct must not veto a live interface -
+// The scanner cannot fold 'sizeof', so this branch is undecidable to it (and dead to the main
+// pass). Registering 'GiVetoer' as a struct name here must not silently disable the interface.
+if const (sizeof(int) == 8) {
+    class GiVetoer<T> { T junk = default; };
+}
+interface GiVetoer<T> { T Get(); void Set(T v); };
+class GiVetoerBox<T> : GiVetoer<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+int useGiVetoer_leg25(GiVetoer<int> v) { return v.Get(); }
+bool testGiUndecidableDeadStructDoesNotVeto()
+{
+    GiVetoerBox<int> b = default;
+    b.Set(76);
+    GiVetoer<int> vi = b;
+    return Test("gen_iface_leg25_undecidable_dead_struct_no_veto", useGiVetoer_leg25(vi), 76) == 1;
+}
+
+// --- Round-3 legs: shapes the suite was blind to while two defects were live -----------------
+// 1) A GENERIC FUNCTION whose parameter is a generic interface - the mainstream shape. A check
+//    that treated "recorded as a generic-interface instance" as "must have been instantiated"
+//    hard-rejected this, because the recorded name for an uninstantiated template body is the
+//    unsubstituted placeholder 'GiContainer__T', which can never gain an interfaceTable entry.
+int giTemplateGet<T>(GiContainer<T> c) { return (int)c.Get(); }
+// 2) The same with a CORE generic interface, and reached only through a template that is never
+//    instantiated - this is the form that broke a plain 'import "interfaces.cb";'.
+int giCoreTemplateCount<T>(IEnumerable<T> e) { return e.count(); }
+bool testGiGenericFunctionInterfaceParam()
+{
+    bool ok = true;
+    GiStorage<int> s = default;
+    s.Set(81);
+    GiContainer<int> ci = s;
+    ok &= Test("gen_iface_template_param_user", giTemplateGet<int>(ci), 81);
+
+    list<int> l = default;
+    l.add(3); l.add(4);
+    IEnumerable<int> e = l;
+    ok &= Test("gen_iface_template_param_core", giCoreTemplateCount<int>(e), 2);
+    return ok;
+}
+
+// 3) A generic interface used ONLY inside a NOT-TAKEN 'if const' branch - the platform-helper
+//    shape. Any Windows-only helper with a generic-interface parameter must not break a
+//    macOS/Linux build. The interface itself is declared at file scope and IS compiled.
+if const (__WINDOWS__ && __LINUX__) {
+    int giDeadArmHelper(GiContainer<int> c) { return c.Get(); }
+}
+bool testGiInterfaceOnlyUsedInDeadIfConstArm()
+{
+    // Nothing to call - the point of the leg is that the file above still COMPILES, and that the
+    // interface is fully usable outside the dead arm.
+    GiStorage<int> s = default;
+    s.Set(82);
+    GiContainer<int> ci = s;
+    return Test("gen_iface_dead_arm_helper_does_not_break_build", ci.Get(), 82) == 1;
+}
+
+// 4) HIGH-BIT HEX and OCTAL 'if const' conditions, both polarities. The scanner's constant folder
+//    must never type a literal differently from codegen: when it did, the two passes disagreed
+//    about which arm was live and the mismatch surfaced as a raw LLVM verifier failure. These
+//    forms are now deliberately UNDECIDABLE to the scanner, which is the safe direction.
+if const (0xFFFFFFFF == -1) {
+    interface GiHexA<T> { T Get(); void Set(T v); };
+    class GiHexABox<T> : GiHexA<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+else {
+    interface GiHexA<T> { T Get(); void Set(T v); };
+    class GiHexABox<T> : GiHexA<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+if const (0x80000000 > 0) {
+    interface GiHexB<T> { T Get(); void Set(T v); };
+    class GiHexBBox<T> : GiHexB<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+else {
+    interface GiHexB<T> { T Get(); void Set(T v); };
+    class GiHexBBox<T> : GiHexB<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+if const (010 == 8) {
+    interface GiOctA<T> { T Get(); void Set(T v); };
+    class GiOctABox<T> : GiOctA<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+else {
+    interface GiOctA<T> { T Get(); void Set(T v); };
+    class GiOctABox<T> : GiOctA<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+if const (010 == 10) {
+    interface GiOctB<T> { T Get(); void Set(T v); };
+    class GiOctBBox<T> : GiOctB<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+else {
+    interface GiOctB<T> { T Get(); void Set(T v); };
+    class GiOctBBox<T> : GiOctB<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+}
+int useGiHexA(GiHexA<int> c) { return c.Get(); }
+int useGiHexB(GiHexB<int> c) { return c.Get(); }
+int useGiOctA(GiOctA<int> c) { return c.Get(); }
+int useGiOctB(GiOctB<int> c) { return c.Get(); }
+bool testGiIfConstLiteralTypingForms()
+{
+    bool ok = true;
+    GiHexABox<int> a = default; a.Set(83);
+    GiHexA<int> ai = a;
+    ok &= Test("gen_iface_ifconst_highbit_hex_eq_neg1", useGiHexA(ai), 83);
+
+    GiHexBBox<int> b = default; b.Set(84);
+    GiHexB<int> bi = b;
+    ok &= Test("gen_iface_ifconst_highbit_hex_gt_zero", useGiHexB(bi), 84);
+
+    GiOctABox<int> c = default; c.Set(85);
+    GiOctA<int> ci = c;
+    ok &= Test("gen_iface_ifconst_octal_eq_8", useGiOctA(ci), 85);
+
+    GiOctBBox<int> d = default; d.Set(86);
+    GiOctB<int> di = d;
+    ok &= Test("gen_iface_ifconst_octal_eq_10", useGiOctB(di), 86);
+    return ok;
+}
+
+// 5) TWO uninstantiated generic-interface names in one file, inside a dead arm. When a global
+//    end-of-compile check existed it reported only one of them, chosen from an unordered_set.
+if const (__WINDOWS__ && __LINUX__) {
+    int giTwoA(GiContainer<int> s) { return s.Get(); }
+    int giTwoB(GiContainer<long> s) { return (int)s.Get(); }
+}
+bool testGiTwoUnroutedNamesInOneFile()
+{
+    GiStorage<long> s = default;
+    s.Set(87);
+    GiContainer<long> ci = s;
+    return Test("gen_iface_two_dead_arm_names", (int)ci.Get(), 87) == 1;
+}
+
+// --- Round-4 leg: the rejection that closes the vtable-laundering hole must stay NARROW ----------
+// A generic-interface name that is never instantiated (its declaration is in an if-const branch this
+// target does not take) is rejected wherever a VALUE of it is materialised or converted - see
+// Test/errors/err_generic_interface_vtable_launder.cb. Every shape below is the mainstream code that
+// a previous, whole-compile version of that rejection FALSE-REJECTED, so it is pinned here: a future
+// tightening of the diagnostic must not re-break any of it.
+//   - a generic function whose parameter is a generic interface, called and uninstantiated
+//   - the same with a CORE generic interface (this broke a plain `import "interfaces.cb";`)
+//   - a helper with a generic-interface parameter inside a NOT-TAKEN if-const arm
+//   - a struct field, an array element and a list element of a fully ROUTED generic interface
+struct GiR4Holder { GiContainer<int> f = default; };
+int giR4Template<T>(GiContainer<T> c) { return (int)c.Get(); }
+int giR4CoreTemplate<T>(IEnumerable<T> e) { return e.count(); }
+int giR4Uninstantiated<T>(GiContainer<T> c) { return 0; }   // never called, never instantiated
+if const (__WINDOWS__ && __LINUX__) {
+    int giR4DeadArm(GiContainer<int> c) { return c.Get(); }
+}
+bool testGiUnroutedRejectionStaysNarrow()
+{
+    bool ok = true;
+    GiStorage<int> s = default;
+    s.Set(91);
+    GiContainer<int> ci = s;
+
+    ok &= Test("gen_iface_r4_template_param", giR4Template<int>(ci), 91);
+
+    list<int> l = default;
+    l.add(1); l.add(2); l.add(3);
+    IEnumerable<int> e = l;
+    ok &= Test("gen_iface_r4_core_template_param", giR4CoreTemplate<int>(e), 3);
+
+    GiR4Holder h = default;
+    h.f = s;
+    ok &= Test("gen_iface_r4_struct_field", h.f.Get(), 91);
+
+    list<GiContainer<int>> gl = default;
+    gl.add(s);
+    ok &= Test("gen_iface_r4_list_element", gl[0].Get(), 91);
+
+    // 'is'/'as' on a ROUTED generic interface must keep working in both directions.
+    ok &= Test("gen_iface_r4_is_routed", (ci is GiStorage<int>) ? 1 : 0, 1);
+    GiStorage<int>* p = ci as GiStorage<int>;
+    ok &= Test("gen_iface_r4_as_routed", p == nullptr ? 0 : 1, 1);
+    return ok;
+}
+
+// --- Round-5 legs: GLOBAL and by-value PARAMETER materialisation of a ROUTED generic interface ---
+// Rounds 4 and 5 each found a materialisation site the previous enumeration had missed - rebox, then
+// local, then field, then GLOBAL, then by-value PARAMETER. The rejection is now recorded at each
+// site and resolved once after every instantiation has drained, so a missed site degrades to "no
+// diagnostic" instead of a false rejection. These legs pin the POSITIVE side of the two sites round 5
+// found: a global and a by-value parameter of a fully routed generic interface must keep working.
+GiContainer<int> gGiR5Global = default;
+int giR5ByValueParam(GiContainer<int> c) { return (int)c.Get(); }
+int giR5ByValueParamIs(GiContainer<int> c) { return (c is GiStorage<int>) ? 1 : 0; }
+bool testGiGlobalAndByValueParam()
+{
+    bool ok = true;
+    GiStorage<int> s = default;
+    s.Set(93);
+    gGiR5Global = s;
+    ok &= Test("gen_iface_r5_global_read", gGiR5Global.Get(), 93);
+    // A global is the only vehicle that reaches the 'is' source with a value in hand.
+    ok &= Test("gen_iface_r5_global_is_source", (gGiR5Global is GiStorage<int>) ? 1 : 0, 1);
+
+    // Passing an already-fat argument to a by-value interface parameter skips argument coercion, so
+    // the parameter's own slot is the materialisation.
+    GiContainer<int> ci = s;
+    ok &= Test("gen_iface_r5_byvalue_param", giR5ByValueParam(ci), 93);
+    ok &= Test("gen_iface_r5_byvalue_param_is", giR5ByValueParamIs(ci), 1);
+    ok &= Test("gen_iface_r5_global_as_arg", giR5ByValueParam(gGiR5Global), 93);
+    return ok;
+}
+
+// --- Round-5 leg: the TRANSIENT "routed but not yet instantiated" state is not an error ----------
+// A field whose type is a generic interface over the ENCLOSING template's own parameter is laid out
+// during monomorphization, BEFORE the drain that instantiates that very interface. An earlier
+// site-local rejection read that transient state as "never instantiated" and emitted a diagnostic
+// blaming an 'if const' on files containing none. Every shape here has zero 'if const'.
+class GiR5Wrapper<U> { GiContainer<U> ci = default; };
+class GiR5Holder { GiContainer<int> ci = default; };     // field declared BEFORE... nothing; see below
+struct GiR5Nested { GiR5Holder inner = default; };
+bool testGiTransientNotYetInstantiated()
+{
+    bool ok = true;
+    GiStorage<int> s = default;
+    s.Set(94);
+
+    GiR5Wrapper<int> w = default;
+    w.ci = s;
+    ok &= Test("gen_iface_r5_field_of_template_param", w.ci.Get(), 94);
+
+    GiR5Holder h = default;
+    h.ci = s;
+    ok &= Test("gen_iface_r5_field_concrete", h.ci.Get(), 94);
+
+    GiR5Nested n = default;
+    n.inner.ci = s;
+    ok &= Test("gen_iface_r5_nested_field", n.inner.ci.Get(), 94);
+
+    list<GiContainer<int>> l = default;
+    l.add(s);
+    ok &= Test("gen_iface_r5_list_of_iface", l[0].Get(), 94);
+    return ok;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -3500,6 +4170,36 @@ extern int main()
     total++; passed += testInterfaceReturnDangleCorpus()          ? 1 : 0;
     total++; passed += testNamespacedInterfaceShadowsCoreName()   ? 1 : 0;
     total++; passed += testInterfaceFunctionPointerParam()         ? 1 : 0;
+
+    total++; passed += testGiParamAfterMain()                            ? 1 : 0;
+    total++; passed += testGiParamDefinedBeforeUse()                     ? 1 : 0;
+    total++; passed += testGiParamForwardPrototype()                     ? 1 : 0;
+    total++; passed += testGiStructField()                               ? 1 : 0;
+    total++; passed += testGiListGenericArg()                            ? 1 : 0;
+    total++; passed += testGiReturnPlainAndMove()                        ? 1 : 0;
+    total++; passed += testGiForcedGlobalDoesNotHelp()                   ? 1 : 0;
+    total++; passed += testGiLocalControl()                              ? 1 : 0;
+    total++; passed += testGiGenericClassNonGenericInterfaceAllPositions() ? 1 : 0;
+    total++; passed += testGiNonGenericInterfaceAllPositions()           ? 1 : 0;
+    total++; passed += testGiMultiTypeArgPair()                          ? 1 : 0;
+    total++; passed += testGiNonPrimitiveTypeArg()                       ? 1 : 0;
+    total++; passed += testGiPointerTypeArg()                            ? 1 : 0;
+    total++; passed += testGiTwoInstantiationsLiveTogether()             ? 1 : 0;
+    total++; passed += testGiClassImplementsTwoGenericInterfaces()       ? 1 : 0;
+    total++; passed += testGiAsDowncastBetweenSiblingGenericInterfaces() ? 1 : 0;
+    total++; passed += testGiCrossFileCollisionStructWins()              ? 1 : 0;
+    total++; passed += testGiCoreInterfaceNameCollision()                ? 1 : 0;
+    total++; passed += testGiLiveInterfaceDeadStructMirror()             ? 1 : 0;
+    total++; passed += testGiNestedGenericTypeArg()                      ? 1 : 0;
+    total++; passed += testGiIfConstConditionForms()                     ? 1 : 0;
+    total++; passed += testGiUndecidableDeadStructDoesNotVeto()          ? 1 : 0;
+    total++; passed += testGiGenericFunctionInterfaceParam()             ? 1 : 0;
+    total++; passed += testGiInterfaceOnlyUsedInDeadIfConstArm()         ? 1 : 0;
+    total++; passed += testGiIfConstLiteralTypingForms()                 ? 1 : 0;
+    total++; passed += testGiTwoUnroutedNamesInOneFile()                 ? 1 : 0;
+    total++; passed += testGiUnroutedRejectionStaysNarrow()             ? 1 : 0;
+    total++; passed += testGiGlobalAndByValueParam()                     ? 1 : 0;
+    total++; passed += testGiTransientNotYetInstantiated()               ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

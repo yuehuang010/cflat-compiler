@@ -1,0 +1,42 @@
+// An UNROUTED generic-interface name (declared only inside an 'if const' branch the forward scanner
+// cannot fold, and which the main pass does not take) still lowers to a fat pointer. Without a
+// rejection it acts as a LAUNDERING PIPE between two unrelated real interfaces:
+//
+//     IA ia = a;          // 1-slot vtable
+//     GiLaunder<int> u = ia;   // conversion skipped - the name is not a known interface
+//     IB ib = u;               // conversion skipped again - IA's vtable now sits in an IB value
+//     ib.M7();                 // reads slot 7 of a 1-slot vtable
+//
+// That was SIGTRAP with these method counts and a silent wrong value when the two interfaces had
+// the same slot count. The CONVERSION is the leg this file covers, so the expectation names that
+// role: deleting the rebox-site record makes this test FAIL rather than silently passing on the
+// declaration's record.
+// NOTE on the expect_error FORM: this diagnostic is deferred to the END of the compile (it can only
+// be decided once every generic instantiation has drained), so it fires after any scoped
+// expect_error block has closed. The BARE FILE-SCOPE form is the one that stays armed to that point.
+// A scoped block does NOT merely fail to catch it - it prints "expected error ... did not occur" and
+// exits BEFORE the real diagnostic is emitted, so the stated reason is the opposite of the truth.
+// Every offender is aggregated into ONE diagnostic, so the expectation below names its ROLE, which is
+// what actually pins the leg this file claims to cover.
+expect_error("as the target of an interface conversion");
+
+interface GlA { int Get(); };
+interface GlB { int M0(); int M1(); int M2(); int M3(); int M4(); int M5(); int M6(); int M7(); };
+class GlCA : GlA { int d = default; int Get() { return d; } };
+class GlCB : GlB { int M0(){return 0;} int M1(){return 1;} int M2(){return 2;} int M3(){return 3;}
+                   int M4(){return 4;} int M5(){return 5;} int M6(){return 6;} int M7(){return 7;} };
+if const (sizeof(int) == 8) {
+    interface GiLaunder<T> { T Get(); };
+}
+
+extern int main()
+{
+    GlCA a = default;
+    a.d = 5;
+    GlA ia = a;
+    // Declaration and conversion on SEPARATE lines on purpose: when they shared a line, the test
+    // passed on whichever record sorted first, so the conversion leg was not actually pinned.
+    GiLaunder<int> u = default;
+    u = ia;
+    return 0;
+}

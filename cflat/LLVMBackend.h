@@ -134,6 +134,47 @@ struct GenericTemplateState
     std::unordered_map<std::string, CFlatParser::InterfaceDefinitionContext*>   genericInterfaceTemplates;
     std::unordered_map<std::string, std::vector<std::string>>                   genericInterfaceTypeParams;
     std::unordered_set<std::string>                                             instantiatedInterfaces;
+    // Mangled names known to name a generic INTERFACE instantiation (Container__int). Recorded
+    // wherever such a use is seen so it lowers to a fat pointer before interfaceTable has it.
+    // Revoked by RevokeGenericInterfaceInstances if a struct/class template of the same base
+    // name later appears - the struct role owns the mangled name then.
+    std::unordered_set<std::string>                                             genericInterfaceInstances;
+    // One place a VALUE of a generic-interface type was actually materialised or converted, with the
+    // location and role captured at that point. Resolved once, after every instantiation has been
+    // drained - see LLVMBackend::ResolveMaterializedInterfaceUses for why the decision cannot be
+    // made at the site.
+    struct MaterializedInterfaceUse
+    {
+        std::string MangledName;
+        std::string File;
+        size_t Line = 0;
+        size_t Column = 0;
+        std::string Role;
+    };
+    std::vector<MaterializedInterfaceUse>                                       materializedInterfaceUses;
+    // Bare template names of interface templates declared under an if-const condition the forward
+    // scan could not FOLD. The only basis on which a diagnostic may mention `if const`. Deliberately
+    // NOT every `certain == false` context: an expect_error block is also scanned with certain=false
+    // (so a template inside it cannot veto or claim a name outside it) and has nothing to do with
+    // `if const` - conflating the two made the diagnostic blame `if const` on files containing none.
+    std::unordered_set<std::string>                                             ifConstUncertainInterfaceNames;
+    // Bare template names the forward-ref scan saw declared as a generic INTERFACE, in a live
+    // (non-dead-if-const) position. Answers "is Base<...> a fat pointer?" before the main pass
+    // has registered the template. Deliberately NOT genericInterfaceTemplates: nothing may be
+    // INSTANTIATED off this set, only routed.
+    std::unordered_set<std::string>                                             scannedGenericInterfaceNames;
+    // NOTE on the --init cache: genericInterfaceInstances and the two scannedGeneric*Names sets
+    // below are deliberately NOT part of the LLVMBackend.cpp cache round-trip. They are rebuilt
+    // from source by the forward-ref scan of every file that is actually compiled, and a warm
+    // cache still restores interfaceTable + genericInterfaceTemplates, which is what a cached
+    // core template needs. Do not "fix" this by serializing them.
+    // Bare template names the forward-ref scan saw declared as a generic STRUCT or CLASS.
+    // Over-inclusive: a namespace-qualified declaration contributes its bare name, so a core
+    // template can veto a same-named user interface. That is NOT "safe" - it is master-parity,
+    // i.e. the name keeps the ORIGINAL BUG - but it never yields a fat pointer, which is why the
+    // veto is preferred over guessing the other way. Tracked in
+    // internal/issue/generic-interface-name-vetoed-by-core-template.md.
+    std::unordered_set<std::string>                                             scannedGenericStructNames;
     std::unordered_map<std::string, CFlatParser::FunctionDefinitionContext*>    genericFunctionTemplates;
     std::unordered_map<std::string, std::vector<std::string>>                   genericFunctionTypeParams;
     std::unordered_set<std::string>                                             instantiatedGenericFunctions;
@@ -3528,6 +3569,9 @@ private:
             {
                 // Interface args arrive by value ({i8*,i8*}). Store in a temp alloca so
                 // Storage is a {i8*,i8*}* pointer suitable for CallInterfaceMethod GEP.
+                // The parameter's own slot bypasses CreateLocalVariable, and a direct call passing
+                // an already-fat argument bypasses CoerceArgToInterface, so record it here.
+                RecordInterfaceMaterialization(itr_nameArg->TypeName, "the type of a parameter");
                 auto fatTy = GetFatPtrType();
                 auto tmp = builder->CreateAlloca(fatTy, nullptr, itr_nameArg->VariableName);
                 builder->CreateStore(&arg, tmp);
@@ -9342,6 +9386,33 @@ public:
         return std::string{};
     }
 
+    // True when 'name' names a generic INTERFACE template and nothing else. A generic struct or
+    // class template of the same name WINS - the two roles coexist under one mangled name
+    // (Test/test_generics.cb emits both %Container__int and a Container__int vtable), and only the
+    // struct role needs the mangled name to be a real struct type, so it takes it.
+    bool IsGenericInterfaceTemplateName(const std::string& name) const
+    {
+        if (gts.genericStructTemplates.count(name) != 0
+            || gts.genericClassTemplates.count(name) != 0
+            || gts.scannedGenericStructNames.count(name) != 0)
+            return false;
+        return gts.genericInterfaceTemplates.count(name) != 0
+            || gts.scannedGenericInterfaceNames.count(name) != 0;
+    }
+
+    // A struct/class template named 'base' has appeared, so 'base__<args>' names a struct, not a
+    // fat pointer. Drop any instance recorded under the interface role before it misroutes.
+    void RevokeGenericInterfaceInstances(const std::string& base)
+    {
+        if (gts.genericInterfaceInstances.empty()) return;
+        std::string prefix = base + "__";
+        for (auto it = gts.genericInterfaceInstances.begin(); it != gts.genericInterfaceInstances.end(); )
+        {
+            if (it->rfind(prefix, 0) == 0) it = gts.genericInterfaceInstances.erase(it);
+            else ++it;
+        }
+    }
+
     bool IsInterfaceType(const std::string& name) const
     {
         return interfaceTable.count(ResolveTypeAlias(name)) > 0;
@@ -10196,7 +10267,11 @@ public:
     llvm::Value* CoerceArgToInterface(const NamedVariable& arg, llvm::Value* val,
                                       const std::string& ifaceName, const std::string& calleeDesc)
     {
-        if (val == nullptr || ifaceName.empty() || !IsInterfaceType(ifaceName)) return val;
+        if (val == nullptr || ifaceName.empty()) return val;
+        // Same hole as ReboxInterfaceIfNeeded: an unrouted name as the PARAMETER type would skip
+        // boxing entirely and drop a raw struct into a fat-pointer slot.
+        RecordInterfaceMaterialization(ifaceName, "an argument type");
+        if (!IsInterfaceType(ifaceName)) return val;
         if (arg.TypeAndValue.IsInterface)
             return ReboxInterfaceIfNeeded(val, arg.TypeAndValue.TypeName, ifaceName);
         if (val->getType() == GetFatPtrType()) return val;   // already a fat pointer
@@ -10346,6 +10421,108 @@ public:
         return sawSourceImplementor;
     }
 
+    // RECORD that a value of `name` was materialised or converted here. Cheap, and it CANNOT
+    // reject - so a materialisation site this misses degrades to "no diagnostic", never to a false
+    // rejection or a false cause. The decision is deferred to ResolveMaterializedInterfaceUses.
+    //
+    // Why the decision cannot be made here: "in genericInterfaceInstances but not yet in
+    // interfaceTable" is a LEGITIMATE TRANSIENT state, not the bug. CreateStructType's field loop
+    // runs during monomorphization, BEFORE ProcessPendingInstantiations drains the interface
+    // instantiation queued by that very declaration, and GetType documents the same thing ("lowers
+    // to a fat pointer even before its interfaceTable entry exists"). Rejecting at the site cannot
+    // tell "never instantiated" from "not instantiated yet", which is exactly how an earlier
+    // version of this check came to assert a false `if const` cause on programs containing no
+    // `if const` at all.
+    void RecordInterfaceMaterialization(const std::string& nameIn, const std::string& role)
+    {
+        // Cheapest possible early-out first: no routed instance anywhere means nothing to record,
+        // and this runs on every local / global / field / parameter / argument.
+        if (gts.genericInterfaceInstances.empty() || nameIn.empty()) return;
+        std::string name = ResolveTypeAlias(nameIn);
+        // Only a name the routing actually treats as a fat pointer can be the bug state.
+        if (name.empty() || gts.genericInterfaceInstances.count(name) == 0) return;
+        gts.materializedInterfaceUses.push_back(
+            { name, sourceFileName, currentLine, currentColumn, role });
+    }
+
+    // Resolve the recorded materialisations, once, at a point where interfaceTable is COMPLETE.
+    // A recorded name still absent from it here was never instantiated at all, so the value is a
+    // fat pointer with no method table: a method call on it is already a clean error, but it can
+    // still be assigned between two unrelated real interfaces and launder one's vtable into the
+    // other, and `is` on it dereferences a null type descriptor.
+    //
+    // EVERY offender is aggregated into ONE diagnostic, because LogError does not return: on the CLI
+    // path it reaches FailCompilation -> exit(1) (running no destructors), and on the batch/LSP path
+    // it throws. A loop that called LogError per offender would therefore report exactly one and
+    // silently drop the rest - which is what an earlier version of this did while claiming otherwise.
+    //
+    // The message states only what is KNOWN. The `if const` cause is appended ONLY for a name the
+    // forward scan recorded as declared under a condition it could not fold.
+    void ResolveMaterializedInterfaceUses()
+    {
+        if (gts.materializedInterfaceUses.empty()) return;
+        auto uses = std::move(gts.materializedInterfaceUses);
+        gts.materializedInterfaceUses.clear();
+        // Deterministic order. NOTE: this is file/line/column of the RECORDING site, which for a
+        // struct field is the field's declaration - so several fields of one template share a line
+        // and the order among them is the order they were laid out, not textual "source order".
+        std::stable_sort(uses.begin(), uses.end(),
+            [](const GenericTemplateState::MaterializedInterfaceUse& a,
+               const GenericTemplateState::MaterializedInterfaceUse& b)
+            {
+                if (a.File != b.File) return a.File < b.File;
+                if (a.Line != b.Line) return a.Line < b.Line;
+                return a.Column < b.Column;
+            });
+
+        std::vector<const GenericTemplateState::MaterializedInterfaceUse*> offenders;
+        std::unordered_set<std::string> seen;
+        bool anyIfConst = false;
+        for (const auto& u : uses)
+        {
+            if (interfaceTable.count(u.MangledName) != 0) continue;
+            std::string key = u.MangledName + "\x1f" + u.Role + "\x1f" + u.File
+                            + "\x1f" + std::to_string(u.Line) + ":" + std::to_string(u.Column);
+            if (!seen.insert(key).second) continue;
+            offenders.push_back(&u);
+            if (gts.ifConstUncertainInterfaceNames.count(TemplateBaseOfMangledName(u.MangledName)))
+                anyIfConst = true;
+        }
+        if (offenders.empty()) return;
+
+        // Name every offender in the body; the caret goes on the first one.
+        const auto& first = *offenders.front();
+        std::string body = std::format(
+            "generic interface '{}' was never instantiated, so it has no method table and cannot "
+            "carry a value - it is used here as {}.", first.MangledName, first.Role);
+        for (size_t i = 1; i < offenders.size(); i++)
+        {
+            const auto& u = *offenders[i];
+            body += std::format("\n  also: '{}' as {} at {}({},{})",
+                                u.MangledName, u.Role, u.File, u.Line, u.Column);
+        }
+        if (anyIfConst)
+            body += "\n  One or more of these interfaces is declared inside an 'if const' whose "
+                    "condition this pass could not evaluate; if that branch is not taken for this "
+                    "target, move the declaration outside the 'if const' or guard the uses with the "
+                    "same condition.";
+
+        // Point the caret at the first offender. LogError does not return (exit(1) or throw), so
+        // this location is never restored - nothing runs after it.
+        sourceFileName = first.File;
+        currentLine = first.Line;
+        currentColumn = first.Column;
+        LogError(body);
+    }
+
+    // "Container__int" -> "Container". The bare template name a mangled instantiation came from,
+    // used only to look up the if-const hint.
+    static std::string TemplateBaseOfMangledName(const std::string& mangled)
+    {
+        size_t pos = mangled.find("__");
+        return pos == std::string::npos ? mangled : mangled.substr(0, pos);
+    }
+
     // Rebuild only when the source and destination interfaces actually differ (the common
     // same-interface case stays a plain by-value copy, with no if-chain emitted). The ambiguous
     // sentinel (a '?:' join whose two arms disagreed - see PropagateFatInterfaceJoin) always
@@ -10356,6 +10533,10 @@ public:
         if (fatVal == nullptr || fatVal->getType() != GetFatPtrType() || dstIface.empty()) return fatVal;
         if (srcIface == kAmbiguousFatInterface) return RebuildInterfaceFatValue(fatVal, dstIface);
         if (srcIface.empty() || srcIface == dstIface) return fatVal;
+        // Recorded before the IsInterfaceType early-out below silently passes the value through
+        // unconverted: an unrouted name on either side is the vtable-laundering state.
+        RecordInterfaceMaterialization(srcIface, "the source of an interface conversion");
+        RecordInterfaceMaterialization(dstIface, "the target of an interface conversion");
         if (!IsInterfaceType(srcIface) || !IsInterfaceType(dstIface)) return fatVal;
         // A rebuild with no possible typedesc match would silently yield a null vtable that the
         // next method call dispatches through. Reject it here, where both names are still known.
@@ -13422,6 +13603,9 @@ public:
 
     llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue, bool threadLocal = false, uint64_t userAlign = 0, bool externalDecl = false)
     {
+        // A file-scope global never passes through CreateLocalVariable.
+        if (!typeValue.Pointer)
+            RecordInterfaceMaterialization(typeValue.TypeName, "the type of a global variable");
         llvm::Type* destinationType = GetType(typeValue);
         if (initValue)
         {
@@ -13642,6 +13826,9 @@ public:
         if (stackNamedVariable.empty())
             LogError(std::format("internal: local variable '{}' declared with no enclosing scope",
                                  typeValue.VariableName));
+
+        if (!typeValue.Pointer)
+            RecordInterfaceMaterialization(typeValue.TypeName, "the type of a local variable");
 
         auto type = GetType(typeValue, autoType);
         // An abandoned C-imported record (field type the extractor couldn't map, e.g.
@@ -14366,6 +14553,11 @@ public:
 
             for (const auto& typeValue : typeAndValues)
             {
+                // A FIELD reaches a vtable read through 'h.f is X' without ever passing
+                // CreateLocalVariable. Recorded, not rejected: this loop runs during
+                // monomorphization, BEFORE the drain that instantiates this very interface.
+                if (!typeValue.Pointer)
+                    RecordInterfaceMaterialization(typeValue.TypeName, "the type of a struct field");
                 types.emplace_back(GetType(typeValue));
             }
 
@@ -16203,7 +16395,10 @@ public:
 
         // resolvedTypeName is final; hoist the struct/interface map lookups once.
         auto dsIt = dataStructures.find(resolvedTypeName);
-        bool isInterface = interfaceTable.count(resolvedTypeName) > 0;
+        // A generic interface instantiation lowers to a fat pointer even before its interfaceTable
+        // entry exists (the forward-ref scan materializes signatures first).
+        bool isInterface = interfaceTable.count(resolvedTypeName) > 0
+                        || gts.genericInterfaceInstances.count(resolvedTypeName) > 0;
         bool skipPointerWrap = false;
 
         if (resolvedTypeName == "void") { type = builder->getVoidTy(); }

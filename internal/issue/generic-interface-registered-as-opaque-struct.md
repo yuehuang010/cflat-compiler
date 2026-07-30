@@ -89,3 +89,67 @@ As a backstop, `LogError` if a name ever lands in both `dataStructures` and
 ## Variance
 
 Identical at `-O0`, `-g`, `-O2`.
+
+## Test plan - BUILD THE TEST FIRST (added 2026-07-29)
+
+This issue is a whole-feature hole, not a single shape, so the accept set has to be pinned
+before the fix is written. Work in this order and do not reorder it.
+
+**Step 1 - write a comprehensive STANDALONE test file, before touching the compiler.**
+
+- Location: `scratch/gi/test_generic_interface.cb`. It MUST live in `scratch/`, never in
+  `Test/`, while the fix is in progress: `test.bat` / `test.sh` glob `Test/*.*`, so a
+  half-red file there breaks the suite for everyone. `scratch/` is gitignored and excluded
+  from the globs.
+- It is a normal runnable program: `extern int main()` returning 0 on success, with one
+  `bool test*()` function per shape family and an assertion helper in the style of
+  `Test/test_interface.cb`. Compile and run it as
+  `x64/Release/cflat scratch/gi/test_generic_interface.cb -i Test/library -o scratch/gi/gi.exe`
+  (also exercise `--run`).
+- Every assertion must check a VALUE, not merely that the program compiled. The whole
+  failure mode of this family is silent miscompilation into an opaque struct, so
+  "it links" proves nothing.
+- Shapes to cover, at minimum. The first six are the reported failures; the last three are
+  the controls that currently PASS and must not regress:
+
+  | # | Shape | Status on master |
+  |---|---|---|
+  | 1 | `IFace<int>` as a function PARAMETER, function defined after `main` | verifier failure |
+  | 2 | Same, function DECLARED before use | `Unknown identifier 'Get'` |
+  | 3 | `IFace<int>` as a STRUCT FIELD (`struct H { Container<int> c = default; };`) | `Invalid InsertValueInst operands!` |
+  | 4 | `IFace<int>` as a generic type ARGUMENT (`list<Container<int>>`) | `'X' does not implement interface 'X'` |
+  | 5 | `IFace<int>` as a RETURN type, both plain and `move` | same nonsense self-check |
+  | 6 | Forced instantiation by a file-scope global before use | does not help; still fails |
+  | 7 | LOCAL of generic-interface type | PASSES - control |
+  | 8 | Generic class implementing a NON-generic interface, all positions | PASSES - control |
+  | 9 | Non-generic interface in all the same positions | PASSES - control |
+
+  Extend beyond the table where it is cheap: more than one type argument (`Pair<int,float>`),
+  a non-primitive type argument (`Container<Point>`), a pointer type argument, two distinct
+  instantiations of the same template live in one program (`Container<int>` and
+  `Container<float>` - this is where a shared-mangled-name bug would show), a class
+  implementing TWO generic interfaces, and an interface-to-interface `as` downcast between
+  generic instantiations.
+- Also record, in a comment block at the top of the file, the exact master behaviour of each
+  leg (verifier text / diagnostic / pass). That is the non-vacuity evidence: after the fix,
+  every leg must pass, and before the fix, the legs listed as failing must actually fail.
+  A leg that passes on BOTH binaries is testing nothing and must be replaced.
+
+**Step 2 - fix the compiler**, per the fix direction above, verifying against the standalone
+file the whole way. The fix is not done until every leg of the standalone file passes AND the
+current host's full suite is green (`./test.sh Release` on macOS, `test.bat` on Windows).
+
+Watch the accept-set polarity, which is the recurring lesson of this queue: the backstop
+`LogError` for "a name landed in both `dataStructures` and `interfaceTable`" must only fire on
+a state that is provably that bug. If it can fire on a legal program it is a false rejection,
+which is worse than the miscompile it guards.
+
+**Step 3 - merge the standalone test into the existing suite, only once step 2 is green.**
+
+- Positive shapes fold into `Test/test_interface.cb` as one `bool testGenericInterface*()`
+  function per family, called from the existing `extern int main()` there. Do NOT add a new
+  file under `Test/` - the repo convention is to extend a related file.
+- Any shape that is REJECTED by design after the fix (if any) goes to `Test/errors/` as an
+  `expect_error` leg. Pin the message substring only, never a path.
+- Delete `scratch/gi/` after the merge; the merged assertions are the durable artifact.
+- Then delete this issue file and its row in [[interface-issue-queue]] in the same change.

@@ -1,0 +1,3 @@
+// Mirror helper for testGiCrossFileCollisionStructWins: declares ONLY a generic struct
+// named GiCollideRev; the importing file declares a generic INTERFACE of the same name.
+struct GiCollideRev<T> { T v = default; };

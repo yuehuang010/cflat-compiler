@@ -1,0 +1,29 @@
+// 'sizeof' is deliberately NOT foldable by the forward scanner, and it is FALSE here ('int' is
+// always 4 bytes), so the interface declaration is never compiled. The scanner cannot decide the
+// branch, so it routes 'GiUnd<int>' as a fat pointer with no method table behind it.
+//
+// An earlier version of this test asserted that a METHOD CALL is the only thing that can go wrong,
+// because a call resolves through the interface table and a missing entry makes it a clean compile
+// error. That is true but NOT sufficient, and the difference is the reason this test exists: the
+// name still lowers to a FAT POINTER, so even though you cannot call through it you CAN assign
+// through it. It then launders one real interface's vtable into another unrelated real interface,
+// because every validation predicate keys on "is this a known interface" - false for this name - so
+// both the rebox and the impossible-conversion check are skipped. That produced a SIGTRAP in one
+// variant and a silent wrong value with exit 0 in another.
+//
+// So the point that must be rejected is where a VALUE of the type is materialised. Rejecting the
+// declaration closes every downstream use (assignment, 'is'/'as', field, argument) at once.
+// NOTE on the expect_error FORM: this diagnostic is deferred to the END of the compile (it can only
+// be decided once every generic instantiation has drained), so it fires after any scoped
+// expect_error block has closed. The BARE FILE-SCOPE form is the one that stays armed to that point.
+expect_error("was never instantiated");
+
+if const (sizeof(int) == 8) {
+    interface GiUnd<T> { T Get(); };
+}
+
+extern int main()
+{
+    GiUnd<int> u = default;
+    return 0;
+}

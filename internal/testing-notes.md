@@ -43,4 +43,34 @@ serializer is silently dropped on a warm cache and the `expect_error` stops firi
 analysis reads MUST be added to the `LLVMBackend.cpp` cache round-trip in the same
 change. (This rule is important enough that a short form stays in CLAUDE.md.)
 
+## A SCOPED `expect_error { ... }` cannot catch a DEFERRED diagnostic
+
+Some diagnostics can only be decided after the whole walk finishes - the generic-interface
+"was never instantiated" check, for example, must wait until every generic instantiation has
+drained, so it is emitted at the very end of `LLVMBackend::Compile` (and `Analyze`). A scoped
+`expect_error("...") { ... }` block has already closed by then.
+
+The failure mode is **actively misleading, not just a miss**: the scoped block reports
+
+```
+FAIL: expected error '<substring>' did not occur
+```
+
+and exits **before** the real diagnostic is emitted, so the actual error is suppressed and the
+printed reason is the opposite of the truth ("did not occur" for an error that was about to occur).
+
+**Rule:** a negative test for a deferred diagnostic must use the **bare file-scope form**
+(`expect_error("substring");` at file scope, no braces), which stays armed to the end of the
+compile. `Test/errors/err_generic_interface_vtable_launder.cb`,
+`err_generic_interface_unrouted_is_source.cb` and
+`err_if_const_generic_interface_undecidable_dead.cb` each carry a comment saying so.
+
+Two further traps when pinning a deferred diagnostic that AGGREGATES several offenders into one
+message:
+
+- Pin the **role**, not the generic sentence. Two versions of the tests above passed on shared
+  wording while reporting a completely different role, so they asserted a leg they never reached.
+- Put the declaration and the operation under test on **separate lines**. When they share a line,
+  the aggregate reports whichever record sorts first and the intended leg is not pinned.
+
 `.gitattributes` pins `*.sh` to LF so it stays runnable on a Windows checkout.

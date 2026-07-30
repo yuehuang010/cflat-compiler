@@ -1274,6 +1274,9 @@ private:
                     // Pointer depth contributed by a pointer alias (using Handle = void*); peeled
                     // from the resolved alias string below and combined with the declarator's stars.
                     int aliasPtrDepth = 0;
+                    // Set when the spec names a generic interface instantiation, whose interfaceTable
+                    // entry does not exist yet during this pre-pass.
+                    bool genericSpecIsInterface = false;
                     // grammar: some Identifier occurrences were refactored into a genericIdentifier rule
                     std::string baseName;
                     auto* genParams = GenericSpecOf(typeSpec, baseName);
@@ -1295,12 +1298,28 @@ private:
                     }
                     std::string mangledName = baseName;
                     for (const auto& arg : typeArgs) mangledName += "__" + MangleTypeArg(arg);
-                    // Pre-declare opaque struct type and default constructor so that
-                    // uses inside function bodies are resolvable before the full
-                    // definition is emitted by ProcessPendingInstantiations().
-                    compiler->CreateStructType(mangledName, {});
-                    LLVMBackend::TypeAndValue returnType{ .TypeName = mangledName };
-                    compiler->CreateFunctionDeclaration(mangledName, returnType, {});
+                    // A generic INTERFACE instantiation is a fat pointer, not a struct: no shell,
+                    // no default ctor. Mark it now - interfaceTable only fills in the main pass.
+                    // The genericInterfaceInstances insert is deferred to the common tail below,
+                    // past the LogErrors that can throw out of this function.
+                    if (compiler->IsGenericInterfaceTemplateName(baseName))
+                    {
+                        genericSpecIsInterface = true;
+                        // Re-mangle through ResolveForwardTypeArg so a nested generic argument
+                        // (Container<Box<int>>) matches the main pass's Container__Box__int.
+                        mangledName = baseName;
+                        for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
+                            mangledName += "__" + MangleTypeArg(ResolveForwardTypeArg(entry));
+                    }
+                    else
+                    {
+                        // Pre-declare opaque struct type and default constructor so that
+                        // uses inside function bodies are resolvable before the full
+                        // definition is emitted by ProcessPendingInstantiations().
+                        compiler->CreateStructType(mangledName, {});
+                        LLVMBackend::TypeAndValue returnType{ .TypeName = mangledName };
+                        compiler->CreateFunctionDeclaration(mangledName, returnType, {});
+                    }
                     declType.TypeName = mangledName;
                 }
                 else if (auto fit = compiler->functionTypeAliases.find(typeSpec->getText());
@@ -1368,9 +1387,12 @@ private:
                             "pass '{}*' (a fixed array decays to a pointer to its first element).",
                             declType.TypeName, declType.TypeName));
                 }
-                declType.IsInterface = compiler->IsInterfaceType(declType.TypeName);
+                declType.IsInterface = genericSpecIsInterface || compiler->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface && declSpec->pointer() != nullptr)
                     compiler->LogError(std::format("pointer '*' is not allowed on interface type '{}'", declType.TypeName));
+                // Past the throwing checks: this spec really does name a generic interface.
+                if (genericSpecIsInterface)
+                    compiler->gts.genericInterfaceInstances.insert(declType.TypeName);
                 if (declType.IsInterface)
                 {
                     declType.IsInterfacePointer = declSpec->pointer() != nullptr;
@@ -2052,6 +2074,420 @@ public:
         return BuildEncodedClosureName(isThin, retName, retPtr, encParams);
     }
 
+    // ---- Scanner-side `if const` folding -------------------------------------------------------
+    // The main pass decides an `if const` with DecideIfConstCondition -> EvalIfConstConstant, whose
+    // leaves bottom out in EmitAndFoldIfConstLeaf (real IR emission into a scratch function). That
+    // leaf cannot be hoisted out of MainListener, so the scanner cannot literally call it. What IS
+    // shared is the part that decided bf1/bf2/bf3/bf5: the STRUCTURAL recursion. The two functions
+    // below mirror EvalIfConstConstant's tree walk arm for arm (?:, ||, &&, expression /
+    // assignmentExpression unwrap, and the same "any known-false wins" partial-knowledge rules) and
+    // only substitute a constant-folding leaf for the emitting one. Any change to
+    // EvalIfConstConstant's structure must be mirrored here.
+    // Whatever still folds to nullopt is handled by the provisional-routing machinery below - the
+    // scanner never guesses a routing that the main pass could contradict silently.
+    std::optional<int64_t> ScannerFoldIfConst(antlr4::tree::ParseTree* node)
+    {
+        if (node == nullptr) return std::nullopt;
+        if (auto* c = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
+        {
+            if (c->expression() != nullptr)
+            {
+                auto cond = ScannerFoldIfConst(c->logicalOrExpression());
+                if (!cond) return std::nullopt;
+                return (*cond != 0) ? ScannerFoldIfConst(c->expression())
+                                    : ScannerFoldIfConst(c->conditionalExpression());
+            }
+            if (c->children.size() > 1) return std::nullopt;  // `??` null-coalescing
+            return ScannerFoldIfConst(c->logicalOrExpression());
+        }
+        if (auto* o = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node))
+        {
+            auto operands = o->logicalAndExpression();
+            if (operands.size() == 1) return ScannerFoldIfConst(operands[0]);
+            bool allKnownFalse = true;
+            for (auto* op : operands)
+            {
+                auto v = ScannerFoldIfConst(op);
+                if (v && *v != 0) return (int64_t)1;
+                if (!v) allKnownFalse = false;
+            }
+            return allKnownFalse ? std::optional<int64_t>(0) : std::nullopt;
+        }
+        if (auto* a = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(node))
+        {
+            auto operands = a->inclusiveOrExpression();
+            if (operands.size() == 1) return ScannerFoldIfConst(operands[0]);
+            bool allKnownTrue = true;
+            for (auto* op : operands)
+            {
+                auto v = ScannerFoldIfConst(op);
+                if (v && *v == 0) return (int64_t)0;
+                if (!v) allKnownTrue = false;
+            }
+            return allKnownTrue ? std::optional<int64_t>(1) : std::nullopt;
+        }
+        if (auto* e = dynamic_cast<CFlatParser::ExpressionContext*>(node))
+            return ScannerFoldIfConst(e->assignmentExpression());
+        if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+        {
+            if (asn->conditionalExpression() != nullptr)
+                return ScannerFoldIfConst(asn->conditionalExpression());
+            return std::nullopt;  // an actual assignment is not a constant
+        }
+        return ScannerFoldIfConstLeaf(node);
+    }
+
+    // The leaf half: constant-folds the integer operator chain without emitting IR. Covers what an
+    // `if const` platform guard is actually written with - a compile-time macro, an integer literal,
+    // redundant parens, unary !/-/~/+, and the comparison / bitwise / arithmetic chain over those
+    // (`__PLATFORM__ == 32`, `__MACOS__ != 0`). Anything else folds to nullopt.
+    std::optional<int64_t> ScannerFoldIfConstLeaf(antlr4::tree::ParseTree* node)
+    {
+        if (node == nullptr) return std::nullopt;
+
+        // Left-associative binary chains: fold pairwise using the operator token between operands.
+        auto foldChain = [&](const std::vector<antlr4::tree::ParseTree*>& ops,
+                            antlr4::RuleContext* parent) -> std::optional<int64_t>
+        {
+            if (ops.empty()) return std::nullopt;
+            auto acc = ScannerFoldIfConstLeaf(ops[0]);
+            if (ops.size() == 1 || !acc) return acc;
+            // Walk the parent's children to recover the operator tokens in source order.
+            size_t opIdx = 0;
+            for (size_t i = 0; i < parent->children.size(); i++)
+            {
+                auto* term = dynamic_cast<antlr4::tree::TerminalNode*>(parent->children[i]);
+                if (term == nullptr) continue;
+                std::string op = term->getText();
+                if (op == "<" || op == ">")
+                {
+                    // '>' '>' is a shift written as two tokens; join it when adjacent.
+                    if (i + 1 < parent->children.size())
+                        if (auto* n2 = dynamic_cast<antlr4::tree::TerminalNode*>(parent->children[i + 1]))
+                            if (op == ">" && n2->getText() == ">") { op = ">>"; i++; }
+                }
+                if (++opIdx > ops.size() - 1) break;
+                auto rhs = ScannerFoldIfConstLeaf(ops[opIdx]);
+                if (!rhs) return std::nullopt;
+                int64_t l = *acc, r = *rhs, out = 0;
+                // Every operand is already inside the 32-bit range (ParseScannerIntegerLiteral and
+                // the macro leaf both guarantee it), so computing in int64 and rejecting an
+                // out-of-range RESULT means no fold can differ from codegen's i32 arithmetic by a
+                // wraparound - it becomes undecidable instead.
+                if (op == "|")       out = l | r;
+                else if (op == "^")  out = l ^ r;
+                else if (op == "&")  out = l & r;
+                else if (op == "==") out = (l == r) ? 1 : 0;
+                else if (op == "!=") out = (l != r) ? 1 : 0;
+                else if (op == "<")  out = (l < r) ? 1 : 0;
+                else if (op == ">")  out = (l > r) ? 1 : 0;
+                else if (op == "<=") out = (l <= r) ? 1 : 0;
+                else if (op == ">=") out = (l >= r) ? 1 : 0;
+                else if (op == "<<") { if (r < 0 || r > 31) return std::nullopt; out = l << r; }
+                else if (op == ">>") { if (r < 0 || r > 31) return std::nullopt; out = l >> r; }
+                else if (op == "+")  { if (__builtin_add_overflow(l, r, &out)) return std::nullopt; }
+                else if (op == "-")  { if (__builtin_sub_overflow(l, r, &out)) return std::nullopt; }
+                else if (op == "*")  { if (__builtin_mul_overflow(l, r, &out)) return std::nullopt; }
+                else if (op == "/")  { if (r == 0) return std::nullopt; out = l / r; }
+                else if (op == "%")  { if (r == 0) return std::nullopt; out = l % r; }
+                else return std::nullopt;
+                if (!InScannerInt32Range(out)) return std::nullopt;
+                acc = out;
+            }
+            return acc;
+        };
+
+        if (auto* n = dynamic_cast<CFlatParser::InclusiveOrExpressionContext*>(node))
+        {
+            auto ops = n->exclusiveOrExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::ExclusiveOrExpressionContext*>(node))
+        {
+            auto ops = n->andExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::AndExpressionContext*>(node))
+        {
+            auto ops = n->equalityExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::EqualityExpressionContext*>(node))
+        {
+            auto ops = n->typeCheckExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::TypeCheckExpressionContext*>(node))
+        {
+            // `is` / `as` are not integer constants; a bare relational passes through.
+            if (n->children.size() != 1) return std::nullopt;
+            return ScannerFoldIfConstLeaf(n->relationalExpression());
+        }
+        if (auto* n = dynamic_cast<CFlatParser::RelationalExpressionContext*>(node))
+        {
+            auto ops = n->shiftExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::ShiftExpressionContext*>(node))
+        {
+            auto ops = n->additiveExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::AdditiveExpressionContext*>(node))
+        {
+            auto ops = n->multiplicativeExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(node))
+        {
+            auto ops = n->castExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
+        {
+            if (n->typeName() != nullptr) return std::nullopt;  // a cast is not folded here
+            if (n->unaryExpression() != nullptr) return ScannerFoldIfConstLeaf(n->unaryExpression());
+            return ParseScannerIntegerLiteral(n->getText());
+        }
+        if (auto* n = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
+        {
+            if (n->postfixExpression() != nullptr) return ScannerFoldIfConstLeaf(n->postfixExpression());
+            if (n->unaryOperator() != nullptr && n->castExpression() != nullptr)
+            {
+                auto v = ScannerFoldIfConstLeaf(n->castExpression());
+                if (!v) return std::nullopt;
+                std::string op = n->unaryOperator()->getText();
+                if (op == "!") return (*v == 0) ? (int64_t)1 : (int64_t)0;
+                if (op == "+") return *v;
+                int64_t out = 0;
+                if (op == "-")      { if (__builtin_sub_overflow((int64_t)0, *v, &out)) return std::nullopt; }
+                else if (op == "~") out = ~*v;
+                else return std::nullopt;  // '&' / '*' are not integer constants
+                return InScannerInt32Range(out) ? std::optional<int64_t>(out) : std::nullopt;
+            }
+            return std::nullopt;      // sizeof/alignof/new/delete/move/operator
+        }
+        if (auto* n = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+        {
+            // Only a bare primary folds - a call, index or member access does not.
+            if (n->children.size() != 1) return std::nullopt;
+            return ScannerFoldIfConstLeaf(n->primaryExpression());
+        }
+        if (auto* n = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+        {
+            if (n->expression() != nullptr && n->children.size() == 3)
+                return ScannerFoldIfConstLeaf(n->expression());   // redundant parens
+            if (n->expression() != nullptr) return std::nullopt;  // nameof/typeof(expr)
+            if (auto* gid = n->genericIdentifier())
+            {
+                if (gid->genericTypeParameters() != nullptr || gid->Identifier() == nullptr)
+                    return std::nullopt;
+                const auto& macros = compilerLLVM->compileTimeMacros;
+                auto it = macros.find(gid->Identifier()->getText());
+                if (it == macros.end()) return std::nullopt;
+                auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(it->second.value);
+                if (ci == nullptr || it->second.type != "int") return std::nullopt;
+                int64_t mv = (int64_t)ci->getSExtValue();
+                return InScannerInt32Range(mv) ? std::optional<int64_t>(mv) : std::nullopt;
+            }
+            return ParseScannerIntegerLiteral(n->getText());
+        }
+        if (auto* e = dynamic_cast<CFlatParser::ExpressionContext*>(node))
+            return ScannerFoldIfConst(e);
+        return std::nullopt;
+    }
+
+    // True when a value is representable as codegen's default `int` (i32). Every value this folder
+    // produces is kept inside this range, so no fold can silently differ from codegen by a 32-bit
+    // wraparound - the alternative reproduces codegen's exact literal typing, which the scanner
+    // cannot see (suffixes, u32/long promotion), so out-of-range folds to nullopt instead.
+    static bool InScannerInt32Range(int64_t v)
+    {
+        return v >= (int64_t)INT32_MIN && v <= (int64_t)INT32_MAX;
+    }
+
+    // An integer literal this pass can type EXACTLY the way codegen does, else nullopt. Deliberately
+    // narrow, because a literal typed differently from codegen is a silent scanner/main-pass
+    // disagreement, which surfaces as a raw LLVM verifier failure with no source location:
+    //   - a u/U/l/L suffix changes the type (unsigned / 64-bit) -> refuse
+    //   - a C OCTAL literal (leading 0) is base 8 to codegen -> refuse rather than misread as decimal
+    //   - a value outside i32 (0xFFFFFFFF, 0x80000000, 2147483648) is typed and wrapped by codegen
+    //     in a way this pass cannot reproduce -> refuse
+    // Refusing only makes the condition undecidable, which the if-const walk already handles safely.
+    std::optional<int64_t> ParseScannerIntegerLiteral(const std::string& textIn)
+    {
+        if (textIn == "true") return (int64_t)1;
+        if (textIn == "false") return (int64_t)0;
+        std::string text = textIn;
+        if (!text.empty() && (text.back() == 'u' || text.back() == 'U'
+                           || text.back() == 'l' || text.back() == 'L'))
+            return std::nullopt;   // suffixed literal - codegen's type differs from ours
+        bool neg = false;
+        size_t pos = 0;
+        if (!text.empty() && text[0] == '-') { neg = true; pos = 1; }
+        if (pos >= text.size()) return std::nullopt;
+        int base = 10;
+        if (text.size() > pos + 1 && text[pos] == '0')
+        {
+            char c = text[pos + 1];
+            if (c == 'x' || c == 'X')      { base = 16; pos += 2; }
+            else if (c == 'b' || c == 'B') { base = 2;  pos += 2; }
+            else return std::nullopt;      // C octal (leading 0) - not folded here
+        }
+        if (pos >= text.size()) return std::nullopt;
+        uint64_t v = 0;
+        auto res = std::from_chars(text.data() + pos, text.data() + text.size(), v, base);
+        if (res.ec != std::errc() || res.ptr != text.data() + text.size()) return std::nullopt;
+        if (v > (uint64_t)INT32_MAX) return std::nullopt;
+        int64_t out = neg ? -(int64_t)v : (int64_t)v;
+        return InScannerInt32Range(out) ? std::optional<int64_t>(out) : std::nullopt;
+    }
+
+    // Tri-state, same contract as the main pass's DecideIfConstCondition: 1 taken, 0 not taken,
+    // -1 undecidable at scan time.
+    int ScannerDecideIfConst(CFlatParser::ExpressionContext* expr)
+    {
+        auto v = ScannerFoldIfConst(expr);
+        if (!v) return -1;
+        return (*v != 0) ? 1 : 0;
+    }
+
+    // Recurse the `if const` chain. A DECIDABLE condition visits exactly the taken arm, so a
+    // provably-dead declaration is invisible. An UNDECIDABLE one visits every arm with
+    // certain=false: the interface name still registers (suppressing it is what made
+    // `if const ((__MACOS__))` reach the LLVM verifier - the main pass's folder decides that
+    // condition and routes the local to a fat pointer while the scan had built an opaque struct
+    // signature), while the struct name does NOT, because a struct name only ever VETOES the
+    // interface routing and a guess there silently disables the fix.
+    void CollectGenericTemplateDeclsIfConst(CFlatParser::IfConstDeclarationContext* ctx, bool certain,
+                                            bool ifConstUnfoldable = false)
+    {
+        int decision = ScannerDecideIfConst(ctx->expression());
+        auto ifBlocks = ctx->ifConstBlock();
+        if (ifBlocks.empty()) return;
+        if (decision < 0)
+        {
+            // Unfoldable condition: not certain, AND the reason genuinely IS `if const` - the only
+            // context permitted to claim `if const` as a cause downstream.
+            for (auto* blk : ifBlocks) CollectGenericTemplateDecls(blk, false, /*ifConstUnfoldable*/ true);
+            if (auto* elseIf = ctx->ifConstDeclaration()) CollectGenericTemplateDeclsIfConst(elseIf, false, true);
+            return;
+        }
+        if (decision != 0)
+        {
+            CollectGenericTemplateDecls(ifBlocks[0], certain, ifConstUnfoldable);
+            return;
+        }
+        if (auto* elseIf = ctx->ifConstDeclaration()) CollectGenericTemplateDeclsIfConst(elseIf, certain, ifConstUnfoldable);
+        else if (ifBlocks.size() > 1) CollectGenericTemplateDecls(ifBlocks[1], certain, ifConstUnfoldable);
+    }
+
+    // Same walk for a member-scope `if const` (a nested generic type inside a class).
+    void CollectGenericTemplateDeclsIfConstMember(CFlatParser::IfConstMemberContext* ctx, bool certain,
+                                                 bool ifConstUnfoldable = false)
+    {
+        int decision = ScannerDecideIfConst(ctx->expression());
+        auto ifBlocks = ctx->ifConstMemberBlock();
+        if (ifBlocks.empty()) return;
+        if (decision < 0)
+        {
+            for (auto* blk : ifBlocks) CollectGenericTemplateDecls(blk, false, /*ifConstUnfoldable*/ true);
+            if (auto* elseIf = ctx->ifConstMember()) CollectGenericTemplateDeclsIfConstMember(elseIf, false, true);
+            return;
+        }
+        if (decision != 0)
+        {
+            CollectGenericTemplateDecls(ifBlocks[0], certain, ifConstUnfoldable);
+            return;
+        }
+        if (auto* elseIf = ctx->ifConstMember()) CollectGenericTemplateDeclsIfConstMember(elseIf, certain, ifConstUnfoldable);
+        else if (ifBlocks.size() > 1) CollectGenericTemplateDecls(ifBlocks[1], certain, ifConstUnfoldable);
+    }
+
+    // Record every generic template declared in the tree: struct/class bare names into
+    // scannedGenericStructNames, generic interface bare names into scannedGenericInterfaceNames.
+    // `certain` is false only inside an if-const branch this pass could not fold; see
+    // CollectGenericTemplateDeclsIfConst for why that gates the struct half and not the interface
+    // half. An interface routed from an unfoldable branch that turns out to be DEAD is caught by
+    // LLVMBackend::RejectUnroutedGenericInterface at the points a value of that type is
+    // materialised or converted. A method call on such a value is already a clean compile error,
+    // but that is NOT sufficient on its own: the name still lowers to a fat pointer, so it can
+    // LAUNDER one real interface's vtable into another real interface - see that function.
+    void CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bool certain, bool ifConstUnfoldable = false)
+    {
+        auto* compiler = compilerLLVM;
+        for (auto* child : ctx->children)
+        {
+            auto* ruleCtx = dynamic_cast<antlr4::RuleContext*>(child);
+            if (!ruleCtx) continue;
+            switch (ruleCtx->getRuleIndex())
+            {
+            case CFlatParser::RuleIfConstDeclaration:
+                CollectGenericTemplateDeclsIfConst(
+                    static_cast<CFlatParser::IfConstDeclarationContext*>(ruleCtx), certain, ifConstUnfoldable);
+                continue;
+            case CFlatParser::RuleIfConstMember:
+                CollectGenericTemplateDeclsIfConstMember(
+                    static_cast<CFlatParser::IfConstMemberContext*>(ruleCtx), certain, ifConstUnfoldable);
+                continue;
+            case CFlatParser::RuleExpectErrorDeclaration:
+                // An expect_error block is compiled but its errors are swallowed, so a template
+                // declared inside it must not veto (or claim) a name used outside the block. It is
+                // NOT if-const-unfoldable: passing that on made the diagnostic blame `if const` on a
+                // file containing none (scratch/rev6/g1_expect_error_false_ifconst_hint.cb).
+                CollectGenericTemplateDecls(ruleCtx, false, /*ifConstUnfoldable*/ false);
+                continue;
+            case CFlatParser::RuleStructDefinition:
+            {
+                auto* sd = static_cast<CFlatParser::StructDefinitionContext*>(ruleCtx);
+                if (certain && sd->genericTypeParameters() != nullptr && sd->directDeclarator() != nullptr)
+                    RecordScannedGenericStructName(sd->directDeclarator()->getText());
+                break;
+            }
+            case CFlatParser::RuleClassDefinition:
+            {
+                auto* cd = static_cast<CFlatParser::ClassDefinitionContext*>(ruleCtx);
+                if (certain && cd->genericTypeParameters() != nullptr && cd->directDeclarator() != nullptr)
+                    RecordScannedGenericStructName(cd->directDeclarator()->getText());
+                break;
+            }
+            case CFlatParser::RuleInterfaceDefinition:
+            {
+                auto* nameGid = static_cast<CFlatParser::InterfaceDefinitionContext*>(ruleCtx)->genericIdentifier();
+                if (nameGid && nameGid->Identifier() && nameGid->genericTypeParameters() != nullptr)
+                {
+                    compiler->gts.scannedGenericInterfaceNames.insert(nameGid->Identifier()->getText());
+                    // Only genuine if-const UNFOLDABILITY may claim `if const` as a cause. `certain`
+                    // is ALSO false inside an expect_error block, which has nothing to do with
+                    // `if const` - conflating the two reasons made the diagnostic blame `if const`
+                    // on files containing none, so they must stay distinct.
+                    if (ifConstUnfoldable)
+                        compiler->gts.ifConstUncertainInterfaceNames.insert(nameGid->Identifier()->getText());
+                }
+                break;
+            }
+            }
+            CollectGenericTemplateDecls(ruleCtx, certain, ifConstUnfoldable);
+        }
+    }
+
+    // A generic struct/class of this bare name exists, so the name is not interface-only. Revoke
+    // any instance an earlier file already routed to a fat pointer.
+    void RecordScannedGenericStructName(const std::string& name)
+    {
+        compilerLLVM->gts.scannedGenericStructNames.insert(name);
+        compilerLLVM->RevokeGenericInterfaceInstances(name);
+    }
+
+    // Pre-pass that runs before ScanGenericTypeUses: records which generic templates this file
+    // declares, so a use of 'Container<int>' is routed as a fat-pointer interface instead of being
+    // pre-declared as an opaque struct shell. Accumulates across files (imports scan first), and
+    // the struct role always wins a collision - see IsGenericInterfaceTemplateName.
+    void ScanGenericInterfaceTemplateNames(antlr4::RuleContext* ctx)
+    {
+        CollectGenericTemplateDecls(ctx, /*certain*/ true);
+    }
+
     // Walk every typeSpecifier in the entire parse tree and pre-declare an opaque
     // struct type + default constructor for each generic instantiation found.
     // This ensures that Box<MyType> references inside function bodies resolve
@@ -2069,6 +2505,14 @@ public:
                 std::string mangledName = baseName;
                 for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
                     mangledName += "__" + MangleTypeArg(ResolveForwardTypeArg(entry));
+                // A generic INTERFACE instantiation has no struct shell and no default ctor - the
+                // main pass builds it in interfaceTable. Pre-declaring one shadows it as opaque.
+                if (compiler->IsGenericInterfaceTemplateName(
+                        compiler->ResolveGenericBaseAlias(baseName)))
+                {
+                    compiler->gts.genericInterfaceInstances.insert(mangledName);
+                    return;
+                }
                 compiler->CreateStructType(mangledName, {});
                 LLVMBackend::TypeAndValue returnType{ .TypeName = mangledName };
                 compiler->CreateFunctionDeclaration(mangledName, returnType, {});
@@ -2207,9 +2651,16 @@ public:
                 else
                     mangledName += "__" + MangleTypeArg(entry->getText());
             }
-            compiler->CreateStructType(mangledName, {});
-            LLVMBackend::TypeAndValue returnType{ .TypeName = mangledName };
-            compiler->CreateFunctionDeclaration(mangledName, returnType, {});
+            // A generic interface instantiation gets no struct shell / default ctor (see
+            // tryPreDeclare); the alias still names the mangled interface.
+            if (compiler->IsGenericInterfaceTemplateName(compiler->ResolveGenericBaseAlias(baseName)))
+                compiler->gts.genericInterfaceInstances.insert(mangledName);
+            else
+            {
+                compiler->CreateStructType(mangledName, {});
+                LLVMBackend::TypeAndValue returnType{ .TypeName = mangledName };
+                compiler->CreateFunctionDeclaration(mangledName, returnType, {});
+            }
             compiler->RegisterTypeAlias(alias, mangledName + suffix);
             return;
         }
@@ -2931,6 +3382,9 @@ private:
             return;
         pendingInstantiations.push_back({baseName, typeArgs, mangledName});
         instantiatedGenerics.insert(mangledName);
+        // One predicate for "is this base an interface name", shared with the three scanner sites.
+        if (Compiler()->IsGenericInterfaceTemplateName(baseName))
+            Compiler()->gts.genericInterfaceInstances.insert(mangledName);
         if (isStructOrClass)
         {
             auto* c = Compiler();
@@ -3049,6 +3503,9 @@ private:
                 // Pointer depth from a pointer alias (using Handle = void*); peeled off the
                 // resolved alias string below and combined with the declarator's stars.
                 int aliasPtrDepth = 0;
+                // Set when the spec names a generic interface instantiation, whose interfaceTable
+                // entry is only built by the next ProcessPendingInstantiations.
+                bool genericSpecIsInterface = false;
                 // 'move', 'alias', 'bond' and 'unique' are soft keywords parsed as Identifiers
                 // in typeSpecifier context
                 if (typeSpec->getText() == "move")
@@ -3201,6 +3658,12 @@ private:
                     }
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
                     declType.TypeName = mangledName;
+                    // A generic INTERFACE instantiation is a fat pointer, not a struct. interfaceTable
+                    // only gains it at the next drain, so mark it from the template name here. The
+                    // genericInterfaceInstances insert waits for the common tail, past the LogErrors
+                    // that can throw out of this function.
+                    if (Compiler(declSpecs)->IsGenericInterfaceTemplateName(baseName))
+                        genericSpecIsInterface = true;
                     // A namespace-qualified generic names an imported winmd template: build the
                     // concrete thin interface + PIID now so the declared type is a real struct.
                     if (baseName.find('.') != std::string::npos)
@@ -3376,9 +3839,13 @@ private:
                         "pointer to fixed array '{}[N]*' is not a valid type; "
                         "pass '{}*' (a fixed array decays to a pointer to its first element).",
                         declType.TypeName, declType.TypeName));
-                declType.IsInterface = Compiler(declSpecs)->IsInterfaceType(declType.TypeName);
+                declType.IsInterface = genericSpecIsInterface
+                                    || Compiler(declSpecs)->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface && hasExplicitPointer && activeTypeSubstitutions.empty())
                     LogErrorContext(declSpec, std::format("pointer '*' is not allowed on interface type '{}'", declType.TypeName));
+                // Past the throwing checks: this spec really does name a generic interface.
+                if (genericSpecIsInterface)
+                    Compiler(declSpecs)->gts.genericInterfaceInstances.insert(declType.TypeName);
                 if (declType.IsInterface)
                 {
                     // IsInterfacePointer: this represents a pointer TO a fat-ptr, not the fat-ptr itself.
@@ -12431,13 +12898,19 @@ public:
                 std::string op = ctx->children[2 * i + 1]->getText();  // 'is' or 'as' token
                 std::string targetTypeName = ParseTypeSpecifierName(typeSpecs[i]);
 
+                // Name the source when a binding survived, so ClassifyCastSource can fill in
+                // shape.TypeName for an interface-valued source (an LLVM fat pointer carries no
+                // interface identity, so the name can only come from here).
+                std::string srcTypeName = srcBinding != nullptr ? srcBinding->TypeAndValue.TypeName
+                                                                : std::string{};
                 if (op == "is")
                 {
-                    result = GenerateIsCheck(result, targetTypeName, ctx, srcElemType);
+                    result = GenerateIsCheck(result, targetTypeName, ctx, srcElemType, srcTypeName);
                 }
                 else if (op == "as")
                 {
-                    result = GenerateSafeCast(result, targetTypeName, ctx, srcElemType, srcBinding);
+                    result = GenerateSafeCast(result, targetTypeName, ctx, srcElemType, srcBinding,
+                                              srcTypeName);
                 }
                 // Only the first operand's static type is known here; a chained is/as
                 // operates on the previous op's result, whose element type isn't tracked.
@@ -12587,7 +13060,8 @@ public:
      * is empty.
      */
     CastSourceKind ClassifyCastSource(llvm::Value* value, llvm::Type* elemType, LLVMBackend* compiler,
-                                      std::string& structName, LLVMBackend::TypeAndValue& shape)
+                                      std::string& structName, LLVMBackend::TypeAndValue& shape,
+                                      const std::string& srcTypeName = {})
     {
         structName.clear();
         shape = LLVMBackend::TypeAndValue{};
@@ -12595,9 +13069,16 @@ public:
         llvm::Type* valueType = value->getType();
         auto* fatTy = compiler->GetFatPtrType();
 
-        // A genuine interface value: the fat aggregate itself, or a pointer to one.
-        if (valueType == fatTy) return CastSourceKind::InterfaceValue;
-        if (valueType->isPointerTy() && elemType == fatTy) return CastSourceKind::InterfaceValue;
+        // A genuine interface value: the fat aggregate itself, or a pointer to one. `shape` is
+        // populated on BOTH arms - it used to be left default-constructed here, which silently gave
+        // every caller an empty TypeName for the entire interface-valued input class.
+        if (valueType == fatTy || (valueType->isPointerTy() && elemType == fatTy))
+        {
+            shape.TypeName = srcTypeName;   // empty when the caller could not name the source
+            shape.IsInterface = true;
+            shape.Pointer = (valueType != fatTy);
+            return CastSourceKind::InterfaceValue;
+        }
 
         structName = ConcreteStructNameFromElemType(elemType, compiler);
         if (!structName.empty()) return CastSourceKind::ConcretePointer;
@@ -12676,14 +13157,21 @@ public:
     }
 
     llvm::Value* GenerateIsCheck(llvm::Value* interfaceValue, const std::string& targetTypeName,
-                                  antlr4::ParserRuleContext* ctx, llvm::Type* srcElemType = nullptr)
+                                  antlr4::ParserRuleContext* ctx, llvm::Type* srcElemType = nullptr,
+                                  const std::string& srcTypeName = {})
     {
         auto* compiler = Compiler(ctx);
 
         std::string srcStructName;
         LLVMBackend::TypeAndValue srcShape;
         CastSourceKind srcKind = ClassifyCastSource(interfaceValue, srcElemType, compiler,
-                                                    srcStructName, srcShape);
+                                                    srcStructName, srcShape, srcTypeName);
+
+        // An unrouted generic-interface SOURCE has no method table, so its type-descriptor slot is
+        // null and dereferencing it crashes. Only the SOURCE: as a TARGET the name is never
+        // dereferenced (the answer is a pure implementor lookup, correctly false), and rejecting it
+        // there is a false rejection - see scratch/rev4/p/t13_iscls.cb.
+        compiler->RecordInterfaceMaterialization(srcShape.TypeName, "the source of 'is'");
 
         // Interface target: shared helper, shared wording. Guard on its bool exactly as the other
         // call sites do, so control cannot reach the concrete-target message if it stopped throwing.
@@ -12789,7 +13277,8 @@ public:
 
     llvm::Value* GenerateSafeCast(llvm::Value* interfaceValue, const std::string& targetTypeName,
                                   antlr4::ParserRuleContext* ctx, llvm::Type* srcElemType = nullptr,
-                                  const LLVMBackend::NamedVariable* srcBinding = nullptr)
+                                  const LLVMBackend::NamedVariable* srcBinding = nullptr,
+                                  const std::string& srcTypeName = {})
     {
         auto* compiler = Compiler(ctx);
         auto ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
@@ -12797,7 +13286,13 @@ public:
         std::string srcStructName;
         LLVMBackend::TypeAndValue srcShape;
         CastSourceKind srcKind = ClassifyCastSource(interfaceValue, srcElemType, compiler,
-                                                    srcStructName, srcShape);
+                                                    srcStructName, srcShape, srcTypeName);
+
+        // An unrouted generic-interface SOURCE has no method table, so its type-descriptor slot is
+        // null and dereferencing it crashes. Only the SOURCE: as a TARGET the name is never
+        // dereferenced (the answer is a pure implementor lookup, correctly false), and rejecting it
+        // there is a false rejection - see scratch/rev4/p/t13_iscls.cb.
+        compiler->RecordInterfaceMaterialization(srcShape.TypeName, "the source of 'as'");
         bool srcIsValue = srcKind == CastSourceKind::ConcreteValue;
 
         // Not one object: same rejection, same wording, as the plain-assignment spelling. Guarded
@@ -23363,8 +23858,17 @@ public:
     {
         while (!pendingInstantiations.empty())
         {
-            auto pending = pendingInstantiations.back();
-            pendingInstantiations.pop_back();
+            // Interface instantiations drain FIRST: a struct layout naming Container<int> in a
+            // field (list<Container<int>>._data) needs interfaceTable to already hold it.
+            size_t pick = pendingInstantiations.size() - 1;
+            for (size_t i = pendingInstantiations.size(); i-- > 0; )
+                if (Compiler()->IsGenericInterfaceTemplateName(pendingInstantiations[i].templateName))
+                {
+                    pick = i;
+                    break;
+                }
+            auto pending = pendingInstantiations[pick];
+            pendingInstantiations.erase(pendingInstantiations.begin() + pick);
 
             // Now safe to instantiate
             auto structIt = genericStructTemplates.find(pending.templateName);
@@ -23585,6 +24089,7 @@ public:
         {
             auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters());
             genericStructTemplates[structName] = ctx;
+            Compiler()->RevokeGenericInterfaceInstances(structName);
             genericStructTypeParams[structName] = typeParams;
             genericStructConstraints[structName] = ParseWhereClause(ctx->whereClause());
             // Record which param (if any) is variadic - always the last one
@@ -25981,6 +26486,7 @@ public:
         {
             auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters());
             genericClassTemplates[structName] = ctx;
+            Compiler()->RevokeGenericInterfaceInstances(structName);
             genericStructTypeParams[structName] = typeParams;
             genericClassConstraints[structName] = ParseWhereClause(ctx->whereClause());
             return;

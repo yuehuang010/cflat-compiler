@@ -1,0 +1,4 @@
+// Helper for the generic-interface cross-file collision legs in Test/test_interface.cb
+// (testGiCrossFileCollisionStructWins). Declares ONLY a generic interface named
+// GiCollideName; the importing file declares a generic STRUCT of the same name.
+interface GiCollideName<T> { T Get(); };

@@ -769,13 +769,17 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             // First pass: pre-declare opaque types and constructors for every
             // generic instantiation found anywhere in the file (including inside
             // function bodies), so uses like Box<MyType> b = Box__MyType() resolve.
+            // Generic interface templates first: a use like Container<int> must not be
+            // pre-declared as an opaque struct shell (it is a fat-pointer interface).
             if (auto* tu = computeUnit->translationUnit())
+            {
+                scanner.ScanGenericInterfaceTemplateNames(tu);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanGenericTypeUses(decl);
-            // Second pass: register non-generic struct shells and function signatures.
-            if (auto* tu = computeUnit->translationUnit())
+                // Second pass: register non-generic struct shells and function signatures.
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanExternalDeclaration(decl);
+            }
         }
 
         // Cross-thread sharing scan (--xthread-scan N): a read-only pre-pass that records
@@ -812,6 +816,11 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         // called (e.g. copy() on a list of unique elements). Inside the try + before the
         // did-not-occur check so a file-scope expect_error catches it.
         CheckPoisonedFunctionCalls();
+
+        // Every generic instantiation has been drained by now, so interfaceTable is COMPLETE:
+        // resolve the materialisation records captured during the walk. Inside the try so a
+        // negative test can expect_error it.
+        ResolveMaterializedInterfaceUses();
 
         }
         catch (const ExpectedErrorReceived&)
@@ -1573,12 +1582,15 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         // (including inside function/program bodies) before scanning declarations.
         // Without this pass, program definitions that pre-declare run(Name*, list__string)
         // fail because the opaque shell for list__string hasn't been created yet.
+        // Generic interface templates first (see the main-file scan for why).
         if (auto* tu = computeUnit->translationUnit())
+        {
+            scanner.ScanGenericInterfaceTemplateNames(tu);
             for (auto* decl : tu->externalDeclaration())
                 scanner.ScanGenericTypeUses(decl);
-        if (auto* tu = computeUnit->translationUnit())
             for (auto* decl : tu->externalDeclaration())
                 scanner.ScanExternalDeclaration(decl);
+        }
     }
 
     // Code-gen walk the imported file
@@ -2323,12 +2335,16 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         {
             ForwardRefScanner scanner(this);
             scanner.SetTokens(&tokens);
+            // Generic interface templates first: a use like Container<int> must not be
+            // pre-declared as an opaque struct shell (it is a fat-pointer interface).
             if (auto* tu = computeUnit->translationUnit())
+            {
+                scanner.ScanGenericInterfaceTemplateNames(tu);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanGenericTypeUses(decl);
-            if (auto* tu = computeUnit->translationUnit())
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanExternalDeclaration(decl);
+            }
         }
 
         // Code-gen walk
@@ -2342,6 +2358,9 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         // bodies of deferred delete-site destructor wrappers (recursive containers whose
         // element type was incomplete when the container dtor was emitted).
         EmitDeferredFullDestructorBodies();
+        // Same resolve as the Compile path: without it --check reports a program clean that -o
+        // rejects, and the IDE shows nothing for a use that cannot work.
+        ResolveMaterializedInterfaceUses();
         stream.close();
     }
     catch (CompilerAbortException&) { return false; }

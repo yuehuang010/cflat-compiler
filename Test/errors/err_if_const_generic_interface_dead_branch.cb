@@ -1,0 +1,15 @@
+// A generic interface declared ONLY inside a dead 'if const' branch never gets a
+// registered template - it must be rejected at the first use, not routed to a fat
+// pointer and run (that segfaults on the missing vtable). '__WINDOWS__ && __LINUX__'
+// is decidably false on every target (a build can never be both), so this branch is
+// dead on whichever host runs this test.
+if const (__WINDOWS__ && __LINUX__) {
+    interface GiDeadOnly<T> { T Get(); };
+}
+
+extern int main()
+{
+    expect_error("has an incomplete layout");
+    GiDeadOnly<int> z = default;
+    return 0;
+}

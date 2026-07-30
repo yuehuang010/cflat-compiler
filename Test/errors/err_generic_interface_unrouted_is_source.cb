@@ -1,0 +1,42 @@
+// A value of an UNROUTED generic-interface type used as the SOURCE of 'is'. A GLOBAL is the vehicle
+// on purpose: a local is caught by the local-variable record, so the 'is'-source leg would never be
+// exercised. A global reaches the 'is' source with the value in hand, and it is the shape that
+// actually SIGSEGVed (scratch/rev5/g3_global_is.cb).
+//
+// The expectation pins the ROLE, not the generic sentence - two earlier versions of this file passed
+// on the generic text while reporting a different role entirely, so they asserted a leg they did not
+// reach. With "as the source of 'is'" pinned, deleting the 'is'-source record makes this test FAIL.
+//
+// The two candidate classes have DELIBERATELY MISMATCHED layouts and slot counts, so a foreign
+// vtable read answers wrongly rather than coincidentally right.
+//
+// An unrouted name as the 'is' TARGET is deliberately still accepted: nothing dereferences a target,
+// the answer is a pure implementor lookup and is correctly false. See scratch/rev4/p/t13_iscls.cb,
+// which a target-side rejection false-rejected.
+// NOTE on the expect_error FORM: this diagnostic is deferred to the END of the compile (it can only
+// be decided once every generic instantiation has drained), so it fires after any scoped
+// expect_error block has closed. The BARE FILE-SCOPE form is the one that stays armed to that point.
+// A scoped block does NOT merely fail to catch it - it prints "expected error ... did not occur" and
+// exits BEFORE the real diagnostic is emitted, so the stated reason is the opposite of the truth.
+// Every offender is aggregated into ONE diagnostic, so the expectation below names its ROLE, which is
+// what actually pins the leg this file claims to cover.
+interface IsSmall { int A(); };
+interface IsWide  { int B0(); int B1(); int B2(); int B3(); int B4(); int B5(); int B6(); int B7(); };
+class IsCSmall : IsSmall { int s = default; int A() { return 1; } };
+class IsCWide : IsWide {
+    long w0 = default; long w1 = default; long w2 = default;
+    int B0(){return 0;} int B1(){return 1;} int B2(){return 2;} int B3(){return 3;}
+    int B4(){return 4;} int B5(){return 5;} int B6(){return 6;} int B7(){return 7;}
+};
+if const (sizeof(int) == 8) {
+    interface GiIsSrc<T> { T Get(); };
+}
+
+expect_error("as the source of 'is'");
+GiIsSrc<int> gIsSrc = default;
+
+extern int main()
+{
+    printf("%d %d\n", gIsSrc is IsCSmall ? 1 : 0, gIsSrc is IsCWide ? 1 : 0);
+    return 0;
+}
