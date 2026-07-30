@@ -1,0 +1,17 @@
+// A generic interface declared in a SINGLE namespace, referenced by a BARE spelling from file
+// scope. This is the most innocuous-looking shape in the corpus: only one namespace is in play,
+// so there is no collision to reason about - yet it still rejects, because a generic interface
+// template is now keyed on its qualified name (NS.IV), and a bare 'IV<T>' at file scope is a
+// different key. Pre-fix this compiled and printed a2=7 (the bare key was the ONLY key the
+// template used). The working spelling is qualified: NS.IV<int>.
+// See internal/issue/generic-template-namespace-key-space.md, "T1".
+namespace NS { interface IV<T> { int Width(); }; }
+class C<T> : IV<T> { int Width() { return 7; } };
+
+expect_error("Unknown identifier 'Width'.");
+int use(IV<int> v) { return v.Width(); }
+
+extern int main()
+{
+    return 0;
+}

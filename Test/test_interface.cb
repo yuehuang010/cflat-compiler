@@ -4109,6 +4109,83 @@ bool testGiTransientNotYetInstantiated()
     return ok;
 }
 
+// =============================================================
+// Namespaced generic-interface corpus, merged from
+// scratch/nsgi/test_namespaced_generic.cb per
+// internal/issue/generic-template-namespace-key-space.md. A generic interface template is
+// keyed on its qualified name (NS.Base), the same convention generic struct/class templates
+// already used, so it must be reachable qualified from outside its namespace and two
+// namespaces may each declare their own same-named generic interface without one silently
+// replacing the other. The namespaced generic struct/class positive legs for the same issue
+// live in Test/test_generics.cb (prefix GnNs*).
+// =============================================================
+
+namespace GiNs
+{
+    interface IV<T> { int Width(); };
+    class CV<T> : IV<T> { int Width() { return 143; } };
+}
+
+int useVGiNs(GiNs.IV<int> v) { return v.Width(); }
+GiNs.IV<int> makeVGiNs() { GiNs.CV<int>* c = new GiNs.CV<int>(); GiNs.IV<int> v = c; return v; }
+struct HolderVGiNs { GiNs.IV<int> v = default; };
+
+// Leg 15: NS.IV<int>, qualified, local.
+bool testGiNsIfaceLocal()
+{
+    GiNs.CV<int> c = default;
+    GiNs.IV<int> v = c;
+    return Test("gi_ns_iface_local", v.Width(), 143) == 1;
+}
+
+// Leg 16: NS.IV<int>, qualified, parameter.
+bool testGiNsIfaceParam()
+{
+    GiNs.CV<int> c = default;
+    GiNs.IV<int> v = c;
+    return Test("gi_ns_iface_param", useVGiNs(v), 143) == 1;
+}
+
+// Leg 17: NS.IV<int>, qualified, return type.
+bool testGiNsIfaceReturn()
+{
+    GiNs.IV<int> v = makeVGiNs();
+    return Test("gi_ns_iface_return", v.Width(), 143) == 1;
+}
+
+// Leg 18: NS.IV<int>, qualified, struct field.
+bool testGiNsIfaceField()
+{
+    GiNs.CV<int> c = default;
+    HolderVGiNs h = default;
+    h.v = c;
+    return Test("gi_ns_iface_field", h.v.Width(), 143) == 1;
+}
+
+// Leg 22: two namespaces, each declaring its own generic interface IV3<T> and an implementing
+// class, used qualified - reaches and discriminates the collision directly (this shape was
+// previously blocked by the struct/class qualified-lookup half of the same issue).
+namespace GiNsA
+{
+    interface IV3<T> { int Width(); };
+    class CA<T> : IV3<T> { int Width() { return 32; } };
+    int useA(IV3<int> v) { return v.Width(); }
+}
+namespace GiNsB
+{
+    interface IV3<T> { int Width(); };
+    class CB<T> : IV3<T> { int Width() { return 64; } };
+    int useB(IV3<int> v) { return v.Width(); }
+}
+
+bool testGiNsCollideQualified()
+{
+    GiNsA.CA<int> a = default;
+    GiNsB.CB<int> b = default;
+    return Test("gi_ns_collide_qualified_a", GiNsA.useA(a), 32) == 1
+        && Test("gi_ns_collide_qualified_b", GiNsB.useB(b), 64) == 1;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -4200,6 +4277,12 @@ extern int main()
     total++; passed += testGiUnroutedRejectionStaysNarrow()             ? 1 : 0;
     total++; passed += testGiGlobalAndByValueParam()                     ? 1 : 0;
     total++; passed += testGiTransientNotYetInstantiated()               ? 1 : 0;
+
+    total++; passed += testGiNsIfaceLocal()                              ? 1 : 0;
+    total++; passed += testGiNsIfaceParam()                              ? 1 : 0;
+    total++; passed += testGiNsIfaceReturn()                             ? 1 : 0;
+    total++; passed += testGiNsIfaceField()                              ? 1 : 0;
+    total++; passed += testGiNsCollideQualified()                        ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

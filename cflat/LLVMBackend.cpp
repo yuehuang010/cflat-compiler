@@ -2505,6 +2505,10 @@ void LLVMBackend::ResetForReanalysis()
     // fires mid-assignment, before the bond flag is consumed) can leave them set. Clearing
     // them here prevents stale state from leaking into the next file's analysis - notably a
     // stale lastCallIsBonded would raise a spurious bond error on the next assignment.
+    // A LogError thrown from inside a namespace body unwinds past the NamespaceScope restores,
+    // so the namespace can still be set here. It is NOT cosmetic: it steers generic-template key
+    // resolution, and a stale value misbinds templates in the NEXT file of a batched --check.
+    currentNamespace_.clear();
     lastCallReturnType = TypeAndValue{};
     lastCallReturnsOwned = false;
     lastOwningResult = false;
@@ -4542,6 +4546,11 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     using PackIndexMap   = std::unordered_map<std::string, size_t>;
     using ConstraintsMap = std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>;
 
+    // "decl_ns" is load-bearing for the --init round-trip: TemplateNamespaceScope reads the
+    // declaring namespace when instantiating a cached template, and it cannot be re-derived from
+    // the key. Every core template is at global scope today, so dropping it happens to be
+    // harmless right now - which is exactly how it would go unnoticed if a core library ever
+    // declared a generic inside a namespace.
     auto serializeGenericTemplates = [&](
         const auto&           templatesMap,
         const TypeParamsMap&  typeParams,
@@ -4568,6 +4577,9 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
             if (constraints)
                 if (auto cit = constraints->find(name); cit != constraints->end())
                     to["constraints"] = SerializeConstraints(cit->second);
+            if (auto nsIt = gts.genericTemplateNamespace.find(name);
+                nsIt != gts.genericTemplateNamespace.end() && !nsIt->second.empty())
+                to["decl_ns"] = nsIt->second;
             arr.push_back(std::move(to));
         }
         root[jsonKey] = std::move(arr);
@@ -4929,6 +4941,8 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
                 constraintsMap[name] = DeserializeConstraints(cobj);
             if (auto v = to->getInteger("pack_index"))
                 packIndexMap[name] = static_cast<size_t>(*v);
+            if (auto dns = to->getString("decl_ns"))
+                gts.genericTemplateNamespace[name] = dns->str();
             gts.lazyTemplateSource[name] = tsource->str();
         }
     };

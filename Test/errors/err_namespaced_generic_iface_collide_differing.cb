@@ -1,0 +1,16 @@
+// Same shape as err_namespaced_generic_iface_collide_identical.cb, but the two namespaces'
+// 'interface IV2<T>' contracts DIFFER (Tag() vs Other()). A bare 'IV2<T>' at file scope names
+// no template post-fix, so this rejects the same way regardless of contract identity. Pre-fix
+// this already rejected too, but for the opposite reason: the bare key collapsed onto ONE
+// namespace's template and the other contract's method was simply missing.
+namespace DA { interface IV2<T> { int Tag(); }; }
+namespace DB { interface IV2<T> { int Other(); }; }
+class DC1<T> : IV2<T> { int Tag() { return 32; } };
+
+expect_error("Unknown identifier 'Tag'.");
+int useD1(IV2<int> v) { return v.Tag(); }
+
+extern int main()
+{
+    return 0;
+}

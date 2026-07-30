@@ -2851,6 +2851,349 @@ bool testConformanceOverloadOrder()
     return result;
 }
 
+// =============================================================
+// Namespaced generic struct/class corpus, merged from
+// scratch/nsgi/test_namespaced_generic.cb per
+// internal/issue/generic-template-namespace-key-space.md. A generic struct/class template is
+// keyed on its qualified name (NS.Base), so it must be reachable qualified from outside its
+// namespace, bare from inside it (binding to the namespace-local template, not a same-named
+// outer one), and composable with itself as a type argument. The generic-interface positive
+// legs for the same issue live in Test/test_interface.cb (prefix GiNs*).
+// =============================================================
+
+namespace GnNs
+{
+    struct Box<T> { T v = default; };
+    class S<T> { T d = default; T Get() { return d; } void Set(T v) { d = v; } };
+
+    int useSInside(S<int> s) { return s.Get(); }
+    int useBoxInside(Box<int> b) { return b.v; }
+    Box<int> makeBoxInside(int v) { Box<int> b = default; b.v = v; return b; }
+    int useSBareLocal() { S<int> s = default; s.Set(29); return s.Get(); }
+
+    struct Inner<T> { T v = default; };
+    struct Outer<T> { T v = default; };
+    struct Pair<K, V> { K k = default; V v = default; };
+}
+
+int useBoxGnNs(GnNs.Box<int> b) { return b.v; }
+GnNs.Box<int> makeBoxGnNs(int v) { GnNs.Box<int> b = default; b.v = v; return b; }
+struct HolderBoxGnNs { GnNs.Box<int> b = default; };
+
+int useSGnNs(GnNs.S<int> s) { return s.Get(); }
+GnNs.S<int> makeSGnNs(int v) { GnNs.S<int> s = default; s.Set(v); return s; }
+struct HolderSGnNs { GnNs.S<int> s = default; };
+
+// Leg 1: NS.Box<int>, qualified, local.
+bool testGnNsStructLocal()
+{
+    bool result = true;
+    GnNs.Box<int> b = default;
+    b.v = 5;
+    result &= Test("gn_ns_struct_local", b.v, 5);
+    return result;
+}
+
+// Leg 2: NS.Box<int>, qualified, parameter.
+bool testGnNsStructParam()
+{
+    bool result = true;
+    GnNs.Box<int> b = default;
+    b.v = 9;
+    result &= Test("gn_ns_struct_param", useBoxGnNs(b), 9);
+    return result;
+}
+
+// Leg 3: NS.Box<int>, qualified, return type.
+bool testGnNsStructReturn()
+{
+    bool result = true;
+    GnNs.Box<int> b = makeBoxGnNs(13);
+    result &= Test("gn_ns_struct_return", b.v, 13);
+    return result;
+}
+
+// Leg 4: NS.Box<int>, qualified, struct field.
+bool testGnNsStructField()
+{
+    bool result = true;
+    HolderBoxGnNs h = default;
+    h.b.v = 21;
+    result &= Test("gn_ns_struct_field", h.b.v, 21);
+    return result;
+}
+
+// Leg 5: Box<int>, bare, local, inside the declaring namespace.
+bool testGnNsStructBareLocal()
+{
+    bool result = true;
+    result &= Test("gn_ns_struct_bare_local", GnNs.useBoxInside(GnNs.makeBoxInside(3)), 3);
+    return result;
+}
+
+// Leg 6: Box<int>, bare, parameter, inside the declaring namespace.
+bool testGnNsStructBareParam()
+{
+    bool result = true;
+    GnNs.Box<int> b = default;
+    b.v = 31;
+    result &= Test("gn_ns_struct_bare_param", GnNs.useBoxInside(b), 31);
+    return result;
+}
+
+// Leg 7: Box<int>, bare, return type, inside the declaring namespace.
+bool testGnNsStructBareReturn()
+{
+    bool result = true;
+    GnNs.Box<int> b = GnNs.makeBoxInside(37);
+    result &= Test("gn_ns_struct_bare_return", b.v, 37);
+    return result;
+}
+
+// Leg 8: NS.S<int>, qualified, local.
+bool testGnNsClassLocal()
+{
+    bool result = true;
+    GnNs.S<int> s = default;
+    s.Set(7);
+    result &= Test("gn_ns_class_local", s.Get(), 7);
+    return result;
+}
+
+// Leg 9: NS.S<int>, qualified, parameter.
+bool testGnNsClassParam()
+{
+    bool result = true;
+    GnNs.S<int> s = default;
+    s.Set(7);
+    result &= Test("gn_ns_class_param", useSGnNs(s), 7);
+    return result;
+}
+
+// Leg 10: NS.S<int>, qualified, return type.
+bool testGnNsClassReturn()
+{
+    bool result = true;
+    GnNs.S<int> s = makeSGnNs(17);
+    result &= Test("gn_ns_class_return", s.Get(), 17);
+    return result;
+}
+
+// Leg 11: NS.S<int>, qualified, struct field.
+bool testGnNsClassField()
+{
+    bool result = true;
+    HolderSGnNs h = default;
+    h.s.Set(23);
+    result &= Test("gn_ns_class_field", h.s.Get(), 23);
+    return result;
+}
+
+// Leg 12: S<int>, bare, local, inside the declaring namespace.
+bool testGnNsClassBareLocal()
+{
+    bool result = true;
+    result &= Test("gn_ns_class_bare_local", GnNs.useSBareLocal(), 29);
+    return result;
+}
+
+// Leg 13: S<int>, bare, parameter, inside the declaring namespace.
+bool testGnNsClassBareParam()
+{
+    bool result = true;
+    GnNs.S<int> s = default;
+    s.Set(41);
+    result &= Test("gn_ns_class_bare_param", GnNs.useSInside(s), 41);
+    return result;
+}
+
+// Leg 14: class + param BOTH declared inside the namespace.
+bool testGnNsClassInside()
+{
+    bool result = true;
+    GnNs.S<int> s = default;
+    s.Set(11);
+    result &= Test("gn_ns_class_inside", GnNs.useSInside(s), 11);
+    return result;
+}
+
+// Leg 19: identity - two namespaces declaring the same generic STRUCT name with DIFFERENT
+// contracts, each used qualified. Must dispatch to its own template.
+namespace GnIdA { struct Box<T> { T v = default; int Tag() { return 100; } }; }
+namespace GnIdB { struct Box<T> { T v = default; int Tag() { return 200; } }; }
+
+bool testGnNsIdentityStructTwoNamespaces()
+{
+    bool result = true;
+    GnIdA.Box<int> a = default;
+    GnIdB.Box<int> b = default;
+    result &= Test("gn_ns_identity_struct_a", a.Tag(), 100);
+    result &= Test("gn_ns_identity_struct_b", b.Tag(), 200);
+    return result;
+}
+
+// Leg 23: nested namespaces, A.B.Box<int>.
+namespace GnNest
+{
+    namespace GnNestInner
+    {
+        struct Box<T> { T v = default; };
+    }
+}
+
+bool testGnNsNestedNamespace()
+{
+    bool result = true;
+    GnNest.GnNestInner.Box<int> b = default;
+    b.v = 61;
+    result &= Test("gn_ns_nested_namespace", b.v, 61);
+    return result;
+}
+
+// Leg 24: a namespaced generic taking a namespaced generic as a type argument - mangling
+// composition.
+bool testGnNsNestedTypeArg()
+{
+    bool result = true;
+    GnNs.Outer<GnNs.Inner<int>> o = default;
+    o.v.v = 67;
+    result &= Test("gn_ns_nested_typearg", o.v.v, 67);
+    return result;
+}
+
+// Leg 26: a namespaced generic instantiated ONLY from a different namespace than the one
+// declaring it - resolution is use-site, not declaration-site.
+namespace GnCrossA { struct Box<T> { T v = default; }; }
+namespace GnCrossB
+{
+    int useBox() { GnCrossA.Box<int> b = default; b.v = 71; return b.v; }
+}
+
+bool testGnNsCrossNamespaceUse()
+{
+    bool result = true;
+    result &= Test("gn_ns_cross_namespace_use", GnCrossB.useBox(), 71);
+    return result;
+}
+
+// Leg 27: two distinct instantiations of one namespaced template live at once.
+bool testGnNsTwoInstantiationsLive()
+{
+    bool result = true;
+    GnNs.Box<int> bi = default;
+    bi.v = 73;
+    GnNs.Box<float> bf = default;
+    bf.v = 7.5;
+    result &= Test("gn_ns_two_inst_int", bi.v, 73);
+    result &= Test("gn_ns_two_inst_float", bf.v, 7.5f);
+    return result;
+}
+
+// Extra cheap shapes: multiple type args, non-primitive type arg, pointer type arg - all on a
+// namespaced template.
+bool testGnNsMultiTypeArg()
+{
+    bool result = true;
+    GnNs.Pair<int, int> p = default;
+    p.k = 3;
+    p.v = 79;
+    result &= Test("gn_ns_multi_typearg_k", p.k, 3);
+    result &= Test("gn_ns_multi_typearg_v", p.v, 79);
+    return result;
+}
+
+struct GnNsPoint { int x = 0; int y = 0; };
+
+bool testGnNsNonPrimitiveTypeArg()
+{
+    bool result = true;
+    GnNs.Box<GnNsPoint> b = default;
+    b.v.x = 3;
+    b.v.y = 83;
+    result &= Test("gn_ns_nonprim_typearg", b.v.y, 83);
+    return result;
+}
+
+bool testGnNsPointerTypeArg()
+{
+    bool result = true;
+    int val = 89;
+    GnNs.Box<int*> b = default;
+    b.v = &val;
+    result &= Test("gn_ns_pointer_typearg", *b.v, 89);
+    return result;
+}
+
+// Leg 40: inner-scope-wins. A bare generic name written INSIDE a namespace binds to the
+// namespace-local template, not to a same-named GLOBAL one. Ratified in
+// internal/issue/generic-template-namespace-key-space.md ("T2") as the correct behaviour, and
+// pinned here because it is the one shape whose MEANING silently changed rather than being
+// un-broken: the pre-fix compiler bound the bare name outward to the global template instead.
+struct GnShadowBox<T> { T v = default; int Tag() { return 1; } };
+namespace GnShadow
+{
+    struct GnShadowBox<T> { T v = default; int Tag() { return 2; } };
+    int inner() { GnShadowBox<int> b = default; return b.Tag(); }
+}
+int gnShadowOuter() { GnShadowBox<int> b = default; return b.Tag(); }
+
+bool testGnNsInnerScopeWins()
+{
+    bool result = true;
+    result &= Test("gn_ns_inner_scope_wins_inner", GnShadow.inner(), 2);
+    result &= Test("gn_ns_inner_scope_wins_outer", gnShadowOuter(), 1);
+    return result;
+}
+
+// Leg 41: a generic template nested in a STRUCT resolves its body against the LEXICAL scope,
+// not against a same-named NAMESPACE. Its registered key is "GnNest.GnNestBox" - identical in
+// shape to a namespaced template's key - so recovering the declaring scope by splitting the key
+// picks namespace GnNest and silently returns ITS Helper (5) instead of the global one (9).
+// The declaring namespace is therefore RECORDED at registration. The non-generic analog below
+// is the compiler's own answer for this shape and both must agree.
+struct GnNestHelper { int v = 9; };
+namespace GnNest { struct GnNestHelper { int v = 5; }; }
+struct GnNest
+{
+    int pad = 0;
+    struct GnNestBox<T> { GnNestHelper h = default; T t = default; int Get() { return h.v; } };
+    struct GnNestBoxNG { GnNestHelper h = default; int Get() { return h.v; } };
+};
+
+bool testGnNsNestedInStructNotNamespace()
+{
+    bool result = true;
+    GnNest.GnNestBox<int> b = default;
+    GnNest.GnNestBoxNG ng = default;
+    result &= Test("gn_ns_nested_in_struct_generic", b.Get(), 9);
+    result &= Test("gn_ns_nested_in_struct_nongeneric", ng.Get(), 9);
+    return result;
+}
+
+// Leg 42: a `using` alias to a generic BASE keeps its declaration-site meaning. The alias target
+// is already explicit, so it must not be re-resolved against the namespace of the USE site -
+// doing so made a global `using GnAliasBox = GnAliasBoxG;` silently name the namespace-local
+// template (2) wherever it appeared inside that namespace, instead of the global one (1).
+struct GnAliasBoxG<T> { T v = default; int Tag() { return 1; } };
+namespace GnAliasNs { struct GnAliasBoxG<T> { T v = default; int Tag() { return 2; } }; }
+using GnAliasBox = GnAliasBoxG;
+namespace GnAliasNs
+{
+    int viaAlias() { GnAliasBox<int> b = default; return b.Tag(); }
+}
+// The bare-name half of the pair lives OUTSIDE the namespace on purpose: an alias use and a bare
+// use of its target inside ONE namespace hits a pre-existing generic-base-alias gap that fails on
+// the pre-fix compiler too (see the issue's adjacent list). Leg 40 already pins the bare binding.
+int gnAliasGlobal() { GnAliasBoxG<int> b = default; return b.Tag(); }
+
+bool testGnNsGenericBaseAliasKeepsDeclSiteMeaning()
+{
+    bool result = true;
+    result &= Test("gn_ns_alias_keeps_decl_site", GnAliasNs.viaAlias(), 1);
+    result &= Test("gn_ns_alias_global_target", gnAliasGlobal(), 1);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -2932,6 +3275,33 @@ extern int main()
     total++; passed += testIfConstMemberScope()          ? 1 : 0;
     total++; passed += testIfConstInterfaceScope()       ? 1 : 0;
     total++; passed += testConformanceOverloadOrder()    ? 1 : 0;
+
+    total++; passed += testGnNsStructLocal()                    ? 1 : 0;
+    total++; passed += testGnNsStructParam()                    ? 1 : 0;
+    total++; passed += testGnNsStructReturn()                   ? 1 : 0;
+    total++; passed += testGnNsStructField()                    ? 1 : 0;
+    total++; passed += testGnNsStructBareLocal()                ? 1 : 0;
+    total++; passed += testGnNsStructBareParam()                ? 1 : 0;
+    total++; passed += testGnNsStructBareReturn()               ? 1 : 0;
+    total++; passed += testGnNsClassLocal()                     ? 1 : 0;
+    total++; passed += testGnNsClassParam()                     ? 1 : 0;
+    total++; passed += testGnNsClassReturn()                    ? 1 : 0;
+    total++; passed += testGnNsClassField()                     ? 1 : 0;
+    total++; passed += testGnNsClassBareLocal()                 ? 1 : 0;
+    total++; passed += testGnNsClassBareParam()                 ? 1 : 0;
+    total++; passed += testGnNsClassInside()                    ? 1 : 0;
+    total++; passed += testGnNsIdentityStructTwoNamespaces()    ? 1 : 0;
+    total++; passed += testGnNsNestedNamespace()                ? 1 : 0;
+    total++; passed += testGnNsNestedTypeArg()                  ? 1 : 0;
+    total++; passed += testGnNsCrossNamespaceUse()              ? 1 : 0;
+    total++; passed += testGnNsTwoInstantiationsLive()          ? 1 : 0;
+    total++; passed += testGnNsMultiTypeArg()                   ? 1 : 0;
+    total++; passed += testGnNsNonPrimitiveTypeArg()            ? 1 : 0;
+    total++; passed += testGnNsPointerTypeArg()                 ? 1 : 0;
+    total++; passed += testGnNsInnerScopeWins()                 ? 1 : 0;
+    total++; passed += testGnNsNestedInStructNotNamespace()     ? 1 : 0;
+    total++; passed += testGnNsGenericBaseAliasKeepsDeclSiteMeaning() ? 1 : 0;
+
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

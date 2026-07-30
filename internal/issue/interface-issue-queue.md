@@ -7,7 +7,7 @@ Not a separate issue - an index. Each row points at the file that owns the detai
 When an issue is fixed its file is deleted (the repo convention), so delete its row
 here in the same change.
 
-Last updated 2026-07-29.
+Last updated 2026-07-29 (namespace key space: fixed, reviewed, uncommitted).
 
 ## HISTORICAL - attempt 4, now LANDED as `2bcc5a0`
 
@@ -290,8 +290,75 @@ unfixed (see the new rows in the open tables). Do not close it on a promise it d
     said before probing: core's `list<T>` and a user's global `interface list<T>` are genuinely the
     same key. It needs the tie-break keyed on the declaring file/module - a separate step, kept in
     the same issue because it is the same key space.
-  - **Zero test coverage exists** for namespaced generics anywhere in `Test/` or `cflat/core/`,
-    which is how an entire unusable feature went unnoticed.
+  - **Zero test coverage existed** for namespaced generics anywhere in `Test/` or `cflat/core/`,
+    which is how an entire unusable feature went unnoticed. **Step 1 is now DONE**: a 39-leg corpus
+    (30 failing legs + 9 controls), written and verified leg-by-leg BEFORE the compiler was touched.
+    It was embedded verbatim in the issue file for the duration, because `scratch/` is gitignored and
+    a corpus living only there is lost on a fresh clone; step 3 then moved the assertions into the
+    suite and stripped the embedded copy. **Step 2 (the fix) is now DONE for issue
+    steps 1/2/3/5** - the key space is namespace-qualified end to end; the corpus carries 37 legs
+    that all assert values and pass, cold and on a `--init` warm cache, with `./test.sh Release` at
+    530/0/8. Issue **step 4 (the core-template veto) was implemented and REVERTED**: both the
+    module-inequality and the core-vs-user tie-break trade one false rejection for another (the
+    latter regresses `import "list.cb"` + `interface list<T>`, a program that worked). Re-filed as
+    `[[generic-interface-name-vetoed-by-core-template]]`, which records why no tie-break can work.
+    **Step 3 (folding the legs into `Test/test_generics.cb` / `Test/test_interface.cb`) is now DONE.**
+    23 struct/class legs landed in `Test/test_generics.cb` (prefix `testGnNs*`, 77/100 -> 100/100),
+    5 interface legs landed in `Test/test_interface.cb` (prefix `testGiNs*`, 85/90 -> 90/90), and the
+    three by-design rejections landed as `Test/errors/err_namespaced_generic_iface_collide_identical.cb`,
+    `err_namespaced_generic_iface_collide_differing.cb`, and `err_namespaced_generic_iface_bare_single_ns.cb`
+    (each mutation-tested to confirm non-vacuity). `./test.sh Release` is now 536/0/8 (+6: three new
+    `err_*.cb` files, cold and warm). `scratch/nsgi/` is deleted and the issue file's embedded corpus
+    is stripped down to a pointer at these files.
+    **Round 3 - adversarial review, three defects found while the suite was green at 536/0/8**, all
+    now fixed: (a) a struct-nesting key prefix was mistaken for a NAMESPACE, so a generic template
+    nested in `struct Outer` resolved its body against a same-named `namespace Outer` and returned
+    the wrong value; (b) a `using` generic-BASE alias was re-resolved against the namespace of the
+    USE site, so a global alias silently named a namespace-local template; (c) `currentNamespace_`
+    leaked across `ResetForReanalysis` (LogError throws past hand-rolled save/restore), causing FALSE
+    REJECTIONS in every later file of a batched `--check` - a shape `test.sh` cannot express, since
+    it runs one file per process. (a) and (b) now have regression legs
+    (`testGnNsNestedInStructNotNamespace`, `testGnNsGenericBaseAliasKeepsDeclSiteMeaning`, 100 ->
+    102/102). The standing lesson: **the declaring scope must be RECORDED at registration, never
+    re-derived from the key** - struct nesting and namespace nesting share one dotted key space.
+    Round 3 also filed `[[generic-type-arguments-not-key-space-resolved]]` (the same bug one level
+    down, in type ARGUMENTS) and `[[generic-function-templates-are-bare-keyed]]`, which falsifies
+    that issue's "every generic template kind" scope claim.
+    **Round 4 was a NARROW review of round 3's three fixes only. The review agent STALLED mid-run
+    and produced no report**, so the checks below were done by hand in the main session - do not read
+    the absence of a round-4 review document as a clean bill from a reviewer:
+    - **The `decl_ns` cache field is correct but UNEXERCISED.** A `--init` cache written by the fixed
+      binary contains ZERO `decl_ns` occurrences - every core template is at global scope and the
+      field is omitted when empty. Both paths exist, neither runs. This is fine because the cache is
+      a NAMED-KEY JSON map, not a positional record, so an absent field cannot desync later ones:
+      verified by having the PRE binary write the cache and the fixed binary read it, byte-identical
+      to cold. It goes live the moment any `cflat/core/*.cb` declares a generic template inside a
+      namespace, and that change must re-run the cold-vs-warm comparison.
+    - `GenericTemplateState::Clear()` is `*this = GenericTemplateState{}` - a whole-struct reset - so
+      the new `genericTemplateNamespace` map cannot go stale across an LSP re-analysis and could not
+      have been omitted from the reset. Worth knowing: this idiom is why the round-3 map was safe
+      by construction rather than by the author remembering.
+    - `LLVMBackend::NamespaceScope` has copy and assignment deleted, so no double-restore; all four
+      previously hand-rolled sites are converted (`grep savedNamespace` is empty).
+    - The alias short-circuit did NOT break alias-of-alias chaining: `using A1 = Box; using A2 = A1;`
+      gives `1 1` (correct declaration-site meaning) where PRE did not compile it at all.
+    **Two ratifications are still owed by the maintainer** and are the only thing between this and a
+    commit: (1) a generic interface declared in a namespace is no longer reachable by a BARE spelling
+    from outside it - pre-fix `a2=7`, now an error, on a single namespace with NO collision; the
+    argument for it is that the non-generic analogs reject on BOTH binaries, so bare reachability was
+    an artifact of the bare-key bug rather than a feature. (2) inner-scope-wins (`inner=1` ->
+    `inner=2`). Both are pinned by tests already in the suite.
+    The issue is otherwise fully closed except for
+    step 4, which lives on in `[[generic-interface-name-vetoed-by-core-template]]`.
+  - Two legs were labelled **non-discriminating** rather than dropped: the identical-contract
+    collision cannot observe a wrong bind (two identical interfaces dispatch the same), and the
+    qualified-collision leg is blocked by the qualified-lookup bug and only proves that earlier bug
+    until legs 1-18 pass. Post-fix: the qualified-collision leg PASSES (32 / 64). The two
+    bare-at-file-scope collision legs (20, 21) are by-design REJECTIONS now - a bare name at file
+    scope no longer collapses onto one namespace's template - and moved out of the runnable corpus,
+    as did leg 25 (the core-template veto, still failing). A new leg 40 pins the one shape whose
+    MEANING changed: a bare generic name inside a namespace now binds to the namespace-local
+    template, not the same-named global one (pre-fix printed 1, now prints 2 - ratified).
   `[[interface-boxing-guards-are-binding-dependent]]` remains the largest non-generic gap.
 - Artifacts of the ABANDONED attempts 1-3 are now DELETED: branch
   `fix/return-dangle-provenance` (`f39410e`) and its worktree `../cflat-fix-return-dangle`
@@ -560,7 +627,9 @@ unfixed (see the new rows in the open tables). Do not close it on a promise it d
 | [[bare-interface-name-resolves-outward-before-namespace]] | Makes the documented namespace workaround awkward. |
 | [[iface-ifconst-base-clause-implementor]] | Implementor inside a non-taken `if const` -> "no class implements it". |
 | [[unique-array-view-accepted-as-generic-type-argument]] | Inconsistent accept set, no miscompile shown. |
-| [[generic-template-namespace-key-space]] | **Next head.** A whole feature is unusable: ANY generic template declared in a namespace - struct, class or interface - cannot be named, qualified or bare. Also silently reverts to the UNFIXED compiler for 18 core generic names (`list`, `tuple`, `channel`, `span`, `array`, `stack`, `queue`, `dictionary`, `Pair`, `view`, ...). Consolidates three previously-separate issues; zero test coverage today. |
+| [[generic-template-namespace-key-space]] | **FIXED but UNCOMMITTED** - see the IN FLIGHT entry. Namespaced generics work end to end now. The file stays open only for the three gaps it spawned (the rows below plus the veto); narrow its accept set before deleting it. |
+| [[generic-type-arguments-not-key-space-resolved]] | Silent wrong value on BOTH binaries, so not a regression - but the namespace fix FLIPS which caller loses, onto the namespace-local one. `Box<Item>` at global scope and inside `namespace A` collapse onto `Box__Item`. Fix carries the resolved arg into the mangled name, so it is `--init`-relevant. |
+| [[generic-function-templates-are-bare-keyed]] | Silent wrong value: two same-named generic FUNCTION templates in different namespaces collapse and the namespaced body is discarded. Unchanged by the namespace fix - it is the fourth template kind, and it falsifies that issue's "every generic template kind" claim. |
 | [[function-type-as-generic-interface-type-argument]] | `C<function<int(int)>>` fails on both binaries. Clean failure, no verifier issue. |
 | [[sizeof-of-generic-instantiation]] | `sizeof(B<int>)` -> `unknown type`. NOT interface-related - fails on a plain generic struct too; `sizeof`'s operand skips the generic mangling/queue path. Check `alignof` and cast operands in the same pass. |
 | [[generic-interface-cannot-inherit-generic-interface]] | False rejection: `unknown parent interface` when a generic interface's base clause names another generic interface. Fires on INSTANTIATION, not on the declaration - declaring and never using it passes. |
@@ -656,6 +725,22 @@ more than once; keep them with the queue rather than in any one issue file.
   confirmed-clean items in the brief is what buys that focus.
 - **A "safe with listed fixes" verdict is not "clean".** Read the list; twice in this work the
   listed items included a factually false diagnostic and a test that could not reach its leg.
+
+**On sequencing the rounds**
+
+- **Run the review BEFORE the test merge, not beside it.** In the namespace work these were launched
+  in parallel to save wall-clock, and the review then found two silent wrong values - so the fixes
+  landed after their tests had already been folded into `Test/`, and the merge agent deleted the
+  scratch directory the review was still drawing witnesses from. Nothing was lost, but the ordering
+  cost rework and the parallelism saved less than it looked like it would.
+- **Build a PRE binary early and keep it until the very end.** A detached worktree at HEAD plus
+  `cmake_build.sh release` is one command and it is what converts "the agent says this is a
+  tightening" into a verified before/after. It caught a report that framed a REGRESSION as a
+  tightening to ratify, and separately caught a tightening whose claimed witness did not compile on
+  PRE at all - the claim was true, the evidence was not.
+- **A stalled or failed review agent is not a clean review.** Round 4's reviewer died mid-run with no
+  report. Its priority items had to be done by hand; treating the silence as "nothing found" would
+  have shipped an unverified cache round-trip.
 
 **On the issue files themselves**
 

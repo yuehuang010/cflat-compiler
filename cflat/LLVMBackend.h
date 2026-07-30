@@ -175,6 +175,12 @@ struct GenericTemplateState
     // veto is preferred over guessing the other way. Tracked in
     // internal/issue/generic-interface-name-vetoed-by-core-template.md.
     std::unordered_set<std::string>                                             scannedGenericStructNames;
+    // Template key -> the NAMESPACE it was declared in, recorded at registration. It CANNOT be
+    // derived from the key: struct nesting and namespace nesting share one dotted key space, so a
+    // template nested in `struct Outer` is keyed "Outer.Box" exactly like one in `namespace Outer`.
+    // Deriving it with rfind('.') made a nested template's body resolve its bare names against a
+    // same-named NAMESPACE and silently return that namespace's type.
+    std::unordered_map<std::string, std::string>                                genericTemplateNamespace;
     std::unordered_map<std::string, CFlatParser::FunctionDefinitionContext*>    genericFunctionTemplates;
     std::unordered_map<std::string, std::vector<std::string>>                   genericFunctionTypeParams;
     std::unordered_set<std::string>                                             instantiatedGenericFunctions;
@@ -9350,8 +9356,49 @@ public:
 
     std::string ResolveGenericBaseAlias(const std::string& base) const
     {
+        // An alias TARGET is explicit and already resolved at its declaration site: returning it
+        // verbatim is what stops a global `using GBox = Box;` naming NS.Box inside `namespace NS`.
         auto it = genericBaseAliases_.find(base);
-        return (it != genericBaseAliases_.end()) ? it->second : base;
+        if (it != genericBaseAliases_.end()) return it->second;
+        return ResolveGenericTemplateBase(base);
+    }
+
+    // True when `key` is a key some generic template kind is registered (or was scanned) under.
+    // The single definition of "the generic template key space" - both the routing predicates and
+    // the use-site base resolution below consult it, so they cannot drift apart.
+    bool IsGenericTemplateKey(const std::string& key) const
+    {
+        return gts.genericStructTemplates.count(key) != 0
+            || gts.genericClassTemplates.count(key) != 0
+            || gts.genericInterfaceTemplates.count(key) != 0
+            || gts.scannedGenericStructNames.count(key) != 0
+            || gts.scannedGenericInterfaceNames.count(key) != 0;
+    }
+
+    /*
+     * Resolve the SPELLED base of a generic instantiation to the key its template is registered
+     * under. Templates declared in a namespace are keyed qualified ("NS.Box"), so both `NS.Box<int>`
+     * and a bare `Box<int>` written inside `namespace NS` must land on that one key - otherwise the
+     * mangled name never becomes a real type. The enclosing-namespace chain is walked INNERMOST
+     * FIRST so a namespace-local template wins over a same-named global one; only a candidate that
+     * actually names a template is accepted, so an unrelated sibling never hijacks the spelling.
+     */
+    std::string ResolveGenericTemplateBase(const std::string& base) const
+    {
+        if (base.empty()) return base;
+        if (!currentNamespace_.empty())
+        {
+            std::string prefix = currentNamespace_;
+            while (true)
+            {
+                if (std::string candidate = prefix + "." + base; IsGenericTemplateKey(candidate))
+                    return candidate;
+                auto dot = prefix.rfind('.');
+                if (dot == std::string::npos) break;
+                prefix = prefix.substr(0, dot);
+            }
+        }
+        return base;
     }
 
     // True if `fullName` is a parameterized interface template from an imported .winmd.
@@ -19384,6 +19431,23 @@ public:
     void RegisterNamespace(const std::string& name) { namespaceTable.insert(name); }
     const std::string& GetCurrentNamespace() const { return currentNamespace_; }
     void SetCurrentNamespace(const std::string& name) { currentNamespace_ = name; }
+
+    // RAII holder for currentNamespace_. Hand-rolled save/restore pairs do NOT survive a
+    // LogError, which THROWS on the batch (--check) and LSP paths: the restore is skipped and the
+    // stale namespace steers the next file's generic-template key resolution.
+    class NamespaceScope
+    {
+    public:
+        NamespaceScope(LLVMBackend* c, const std::string& name)
+            : compiler_(c), saved_(c->GetCurrentNamespace()) { c->SetCurrentNamespace(name); }
+        ~NamespaceScope() { compiler_->SetCurrentNamespace(saved_); }
+        NamespaceScope(const NamespaceScope&) = delete;
+        NamespaceScope& operator=(const NamespaceScope&) = delete;
+        const std::string& Saved() const { return saved_; }
+    private:
+        LLVMBackend* compiler_;
+        std::string saved_;
+    };
     void RegisterNamespaceAlias(const std::string& alias, const std::string& target) { namespaceAliasTable[alias] = target; }
     void RegisterLocalNamespaceAlias(const std::string& alias, const std::string& target)
     {

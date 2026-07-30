@@ -2360,7 +2360,7 @@ public:
     // signature), while the struct name does NOT, because a struct name only ever VETOES the
     // interface routing and a guess there silently disables the fix.
     void CollectGenericTemplateDeclsIfConst(CFlatParser::IfConstDeclarationContext* ctx, bool certain,
-                                            bool ifConstUnfoldable = false)
+                                            bool ifConstUnfoldable = false, const std::string& ns = {})
     {
         int decision = ScannerDecideIfConst(ctx->expression());
         auto ifBlocks = ctx->ifConstBlock();
@@ -2369,39 +2369,39 @@ public:
         {
             // Unfoldable condition: not certain, AND the reason genuinely IS `if const` - the only
             // context permitted to claim `if const` as a cause downstream.
-            for (auto* blk : ifBlocks) CollectGenericTemplateDecls(blk, false, /*ifConstUnfoldable*/ true);
-            if (auto* elseIf = ctx->ifConstDeclaration()) CollectGenericTemplateDeclsIfConst(elseIf, false, true);
+            for (auto* blk : ifBlocks) CollectGenericTemplateDecls(blk, false, /*ifConstUnfoldable*/ true, ns);
+            if (auto* elseIf = ctx->ifConstDeclaration()) CollectGenericTemplateDeclsIfConst(elseIf, false, true, ns);
             return;
         }
         if (decision != 0)
         {
-            CollectGenericTemplateDecls(ifBlocks[0], certain, ifConstUnfoldable);
+            CollectGenericTemplateDecls(ifBlocks[0], certain, ifConstUnfoldable, ns);
             return;
         }
-        if (auto* elseIf = ctx->ifConstDeclaration()) CollectGenericTemplateDeclsIfConst(elseIf, certain, ifConstUnfoldable);
-        else if (ifBlocks.size() > 1) CollectGenericTemplateDecls(ifBlocks[1], certain, ifConstUnfoldable);
+        if (auto* elseIf = ctx->ifConstDeclaration()) CollectGenericTemplateDeclsIfConst(elseIf, certain, ifConstUnfoldable, ns);
+        else if (ifBlocks.size() > 1) CollectGenericTemplateDecls(ifBlocks[1], certain, ifConstUnfoldable, ns);
     }
 
     // Same walk for a member-scope `if const` (a nested generic type inside a class).
     void CollectGenericTemplateDeclsIfConstMember(CFlatParser::IfConstMemberContext* ctx, bool certain,
-                                                 bool ifConstUnfoldable = false)
+                                                 bool ifConstUnfoldable = false, const std::string& ns = {})
     {
         int decision = ScannerDecideIfConst(ctx->expression());
         auto ifBlocks = ctx->ifConstMemberBlock();
         if (ifBlocks.empty()) return;
         if (decision < 0)
         {
-            for (auto* blk : ifBlocks) CollectGenericTemplateDecls(blk, false, /*ifConstUnfoldable*/ true);
-            if (auto* elseIf = ctx->ifConstMember()) CollectGenericTemplateDeclsIfConstMember(elseIf, false, true);
+            for (auto* blk : ifBlocks) CollectGenericTemplateDecls(blk, false, /*ifConstUnfoldable*/ true, ns);
+            if (auto* elseIf = ctx->ifConstMember()) CollectGenericTemplateDeclsIfConstMember(elseIf, false, true, ns);
             return;
         }
         if (decision != 0)
         {
-            CollectGenericTemplateDecls(ifBlocks[0], certain, ifConstUnfoldable);
+            CollectGenericTemplateDecls(ifBlocks[0], certain, ifConstUnfoldable, ns);
             return;
         }
-        if (auto* elseIf = ctx->ifConstMember()) CollectGenericTemplateDeclsIfConstMember(elseIf, certain, ifConstUnfoldable);
-        else if (ifBlocks.size() > 1) CollectGenericTemplateDecls(ifBlocks[1], certain, ifConstUnfoldable);
+        if (auto* elseIf = ctx->ifConstMember()) CollectGenericTemplateDeclsIfConstMember(elseIf, certain, ifConstUnfoldable, ns);
+        else if (ifBlocks.size() > 1) CollectGenericTemplateDecls(ifBlocks[1], certain, ifConstUnfoldable, ns);
     }
 
     // Record every generic template declared in the tree: struct/class bare names into
@@ -2413,7 +2413,8 @@ public:
     // materialised or converted. A method call on such a value is already a clean compile error,
     // but that is NOT sufficient on its own: the name still lowers to a fat pointer, so it can
     // LAUNDER one real interface's vtable into another real interface - see that function.
-    void CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bool certain, bool ifConstUnfoldable = false)
+    void CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bool certain, bool ifConstUnfoldable = false,
+                                     const std::string& ns = {})
     {
         auto* compiler = compilerLLVM;
         for (auto* child : ctx->children)
@@ -2422,33 +2423,38 @@ public:
             if (!ruleCtx) continue;
             switch (ruleCtx->getRuleIndex())
             {
+            case CFlatParser::RuleNamespaceDefinition:
+                // Every name declared below here is keyed qualified, matching the main pass.
+                CollectGenericTemplateDecls(ruleCtx, certain, ifConstUnfoldable,
+                                            NestedNamespaceName(ns, static_cast<CFlatParser::NamespaceDefinitionContext*>(ruleCtx)));
+                continue;
             case CFlatParser::RuleIfConstDeclaration:
                 CollectGenericTemplateDeclsIfConst(
-                    static_cast<CFlatParser::IfConstDeclarationContext*>(ruleCtx), certain, ifConstUnfoldable);
+                    static_cast<CFlatParser::IfConstDeclarationContext*>(ruleCtx), certain, ifConstUnfoldable, ns);
                 continue;
             case CFlatParser::RuleIfConstMember:
                 CollectGenericTemplateDeclsIfConstMember(
-                    static_cast<CFlatParser::IfConstMemberContext*>(ruleCtx), certain, ifConstUnfoldable);
+                    static_cast<CFlatParser::IfConstMemberContext*>(ruleCtx), certain, ifConstUnfoldable, ns);
                 continue;
             case CFlatParser::RuleExpectErrorDeclaration:
                 // An expect_error block is compiled but its errors are swallowed, so a template
                 // declared inside it must not veto (or claim) a name used outside the block. It is
                 // NOT if-const-unfoldable: passing that on made the diagnostic blame `if const` on a
                 // file containing none (scratch/rev6/g1_expect_error_false_ifconst_hint.cb).
-                CollectGenericTemplateDecls(ruleCtx, false, /*ifConstUnfoldable*/ false);
+                CollectGenericTemplateDecls(ruleCtx, false, /*ifConstUnfoldable*/ false, ns);
                 continue;
             case CFlatParser::RuleStructDefinition:
             {
                 auto* sd = static_cast<CFlatParser::StructDefinitionContext*>(ruleCtx);
                 if (certain && sd->genericTypeParameters() != nullptr && sd->directDeclarator() != nullptr)
-                    RecordScannedGenericStructName(sd->directDeclarator()->getText());
+                    RecordScannedGenericStructName(QualifyName(ns, sd->directDeclarator()->getText()));
                 break;
             }
             case CFlatParser::RuleClassDefinition:
             {
                 auto* cd = static_cast<CFlatParser::ClassDefinitionContext*>(ruleCtx);
                 if (certain && cd->genericTypeParameters() != nullptr && cd->directDeclarator() != nullptr)
-                    RecordScannedGenericStructName(cd->directDeclarator()->getText());
+                    RecordScannedGenericStructName(QualifyName(ns, cd->directDeclarator()->getText()));
                 break;
             }
             case CFlatParser::RuleInterfaceDefinition:
@@ -2456,22 +2462,39 @@ public:
                 auto* nameGid = static_cast<CFlatParser::InterfaceDefinitionContext*>(ruleCtx)->genericIdentifier();
                 if (nameGid && nameGid->Identifier() && nameGid->genericTypeParameters() != nullptr)
                 {
-                    compiler->gts.scannedGenericInterfaceNames.insert(nameGid->Identifier()->getText());
+                    std::string key = QualifyName(ns, nameGid->Identifier()->getText());
+                    compiler->gts.scannedGenericInterfaceNames.insert(key);
                     // Only genuine if-const UNFOLDABILITY may claim `if const` as a cause. `certain`
                     // is ALSO false inside an expect_error block, which has nothing to do with
                     // `if const` - conflating the two reasons made the diagnostic blame `if const`
                     // on files containing none, so they must stay distinct.
                     if (ifConstUnfoldable)
-                        compiler->gts.ifConstUncertainInterfaceNames.insert(nameGid->Identifier()->getText());
+                        compiler->gts.ifConstUncertainInterfaceNames.insert(key);
                 }
                 break;
             }
             }
-            CollectGenericTemplateDecls(ruleCtx, certain, ifConstUnfoldable);
+            CollectGenericTemplateDecls(ruleCtx, certain, ifConstUnfoldable, ns);
         }
     }
 
-    // A generic struct/class of this bare name exists, so the name is not interface-only. Revoke
+    // "NS" + "Box" -> "NS.Box"; the one place the generic template key is assembled in the scan.
+    static std::string QualifyName(const std::string& ns, const std::string& name)
+    {
+        return ns.empty() ? name : ns + "." + name;
+    }
+
+    // The dotted name of `ctx` as seen from an enclosing namespace `ns` (handles both the
+    // `namespace A.B` and the nested `namespace A { namespace B` spellings).
+    static std::string NestedNamespaceName(const std::string& ns, CFlatParser::NamespaceDefinitionContext* ctx)
+    {
+        std::string inner;
+        for (auto* id : ctx->Identifier())
+            inner += (inner.empty() ? "" : ".") + id->getText();
+        return QualifyName(ns, inner);
+    }
+
+    // A generic struct/class of this key exists, so the key is not interface-only. Revoke
     // any instance an earlier file already routed to a fat pointer.
     void RecordScannedGenericStructName(const std::string& name)
     {
@@ -2499,16 +2522,19 @@ public:
             auto* ruleCtx = dynamic_cast<antlr4::RuleContext*>(child);
             if (!ruleCtx) continue;
 
-            auto tryPreDeclare = [&](const std::string& baseName, CFlatParser::GenericTypeParametersContext* genericParams)
+            auto tryPreDeclare = [&](const std::string& spelledBase, CFlatParser::GenericTypeParametersContext* genericParams)
             {
                 auto* compiler = Compiler(genericParams);
+                // Name the shell after the registered KEY, not the spelling: a bare use inside a
+                // namespace would otherwise leave an opaque 'Box__int' that 'NS.Box__int' never completes.
+                std::string baseName = compiler->ResolveGenericTemplateBase(spelledBase);
                 std::string mangledName = baseName;
                 for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
                     mangledName += "__" + MangleTypeArg(ResolveForwardTypeArg(entry));
                 // A generic INTERFACE instantiation has no struct shell and no default ctor - the
                 // main pass builds it in interfaceTable. Pre-declaring one shadows it as opaque.
                 if (compiler->IsGenericInterfaceTemplateName(
-                        compiler->ResolveGenericBaseAlias(baseName)))
+                        compiler->ResolveGenericBaseAlias(spelledBase)))
                 {
                     compiler->gts.genericInterfaceInstances.insert(mangledName);
                     return;
@@ -2522,6 +2548,16 @@ public:
             // to avoid the RTTI hierarchy walk (FindSITargetTypeInstance) on every tree node.
             switch (ruleCtx->getRuleIndex())
             {
+            case CFlatParser::RuleNamespaceDefinition:
+            {
+                // Make the enclosing namespace visible so a bare 'Box<int>' written inside
+                // 'namespace NS' resolves to the NS.Box template key, as the main pass does.
+                auto* nsCtx = static_cast<CFlatParser::NamespaceDefinitionContext*>(ruleCtx);
+                LLVMBackend::NamespaceScope nsScope(
+                    compilerLLVM, NestedNamespaceName(compilerLLVM->GetCurrentNamespace(), nsCtx));
+                ScanGenericTypeUses(ruleCtx);
+                continue;
+            }
             case CFlatParser::RuleStructDefinition:
                 // Skip generic template definitions - bodies contain unbound type parameters (e.g. T).
                 if (static_cast<CFlatParser::StructDefinitionContext*>(ruleCtx)->genericTypeParameters() != nullptr)
@@ -2541,6 +2577,12 @@ public:
                     auto* typeSpec = static_cast<CFlatParser::TypeSpecifierContext*>(ruleCtx);
                     if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr && typeSpec->genericIdentifier()->Identifier() != nullptr)
                         tryPreDeclare(typeSpec->genericIdentifier()->Identifier()->getText(), typeSpec->genericIdentifier()->genericTypeParameters());
+                    // The qualified spelling 'NS.Box<int>', only when it names a CFlat template key:
+                    // an imported winmd generic is built elsewhere and must get no opaque shell.
+                    if (std::string qBase; auto* qParams = GenericSpecOf(typeSpec, qBase))
+                        if (typeSpec->qualifiedGenericIdentifier() != nullptr
+                            && Compiler(typeSpec)->IsGenericTemplateKey(qBase))
+                            tryPreDeclare(qBase, qParams);
 
                     // Tuple type sugar: (T1, T2) -> pre-declare tuple__T1__T2
                     if (typeSpec->tupleTypeSpecifier() != nullptr)
@@ -2996,11 +3038,9 @@ public:
         // Member signatures may reference sibling types unqualified (a struct param
         // declared earlier in the namespace) - make the namespace visible to GetType.
         auto* compiler = Compiler(ctx);
-        std::string savedNamespace = compiler->GetCurrentNamespace();
-        compiler->SetCurrentNamespace(namespaceName);
+        LLVMBackend::NamespaceScope nsScope(compiler, namespaceName);
         for (auto* extDecl : ctx->externalDeclaration())
             ScanExternalDeclaration(extDecl, namespaceName);
-        compiler->SetCurrentNamespace(savedNamespace);
     }
 };
 
@@ -4090,9 +4130,8 @@ public:
         if (!nameGid || !nameGid->Identifier()) return;
 
         std::string baseName = nameGid->Identifier()->getText();
-        // Qualified by the enclosing namespace, exactly like a struct or class, so two namespaces
-        // may each declare their own "IV". A generic template keeps its bare key (below): its
-        // instantiation machinery is keyed on the unqualified template name throughout.
+        // Qualified by the enclosing namespace, exactly like a struct or class, so two
+        // namespaces may each declare their own "IV" - generic templates included.
         std::string name = namespaceName.empty() ? baseName : namespaceName + "." + baseName;
 
         // Validate type-level annotations (e.g. [uuid("...")]) against the registry and replace the
@@ -4108,9 +4147,11 @@ public:
         // Generic interface template - store for on-demand instantiation
         if (nameGid->genericTypeParameters() != nullptr)
         {
-            std::string name = baseName;
+            // Keyed on the namespace-QUALIFIED name, like a generic struct or class. The use site
+            // resolves its spelled base to this key via LLVMBackend::ResolveGenericTemplateBase.
             auto typeParams = ParseGenericTypeParameters(nameGid->genericTypeParameters());
             genericInterfaceTemplates[name] = ctx;
+            Compiler()->gts.genericTemplateNamespace[name] = Compiler()->GetCurrentNamespace();
             genericInterfaceTypeParams[name] = typeParams;
             {
                 auto entries = nameGid->genericTypeParameters()->typeParameterList()->typeParameterEntry();
@@ -4189,6 +4230,23 @@ public:
         return fields;
     }
 
+    // The namespace a generic template was declared in, as RECORDED at registration.
+    // Never re-derive this from the key: "Outer.Box" is equally the key of a template in
+    // `namespace Outer` and of one nested in `struct Outer`, and guessing picks the namespace.
+    static std::string DeclaringNamespaceOf(LLVMBackend* compiler, const std::string& key)
+    {
+        auto it = compiler->gts.genericTemplateNamespace.find(key);
+        return it != compiler->gts.genericTemplateNamespace.end() ? it->second : std::string{};
+    }
+
+    // Installs a template's declaring namespace for the duration of an instantiation: the body is
+    // re-walked long after that scope closed, so without this a bare sibling name resolves globally.
+    struct TemplateNamespaceScope : LLVMBackend::NamespaceScope
+    {
+        TemplateNamespaceScope(LLVMBackend* c, const std::string& key)
+            : LLVMBackend::NamespaceScope(c, DeclaringNamespaceOf(c, key)) {}
+    };
+
     void InstantiateGenericInterface(const std::string& baseName, const std::string& mangledName,
                                      const std::unordered_map<std::string, std::string>& substitutions,
                                      const std::unordered_map<std::string, std::vector<std::string>>& packSubstitutions = {})
@@ -4201,6 +4259,8 @@ public:
 
         auto* ctx = compilerLLVM->MaterializeGenericInterface(baseName);
         if (!ctx) return;
+
+        TemplateNamespaceScope nsScope(compilerLLVM, baseName);
 
         // Collect parent interface names
         std::vector<std::string> parentNames;
@@ -5219,11 +5279,9 @@ public:
 
         // Member declarations (extern signatures, struct fields) may reference sibling
         // types unqualified - make the namespace visible to GetType while parsing them.
-        std::string savedNamespace = compiler->GetCurrentNamespace();
-        compiler->SetCurrentNamespace(namespaceName);
+        LLVMBackend::NamespaceScope nsScope(compiler, namespaceName);
         for (auto* extDecl : ctx->externalDeclaration())
             ParseExternalDeclaration(extDecl, namespaceName);
-        compiler->SetCurrentNamespace(savedNamespace);
     }
 
     void enterExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx) override
@@ -7963,9 +8021,9 @@ public:
 
         // Make the enclosing namespace visible to body resolution so an unqualified
         // sibling reference (bare "helper" inside "namespace N") resolves to "N.helper".
-        // Restored at function exit so it does not leak into the next definition.
-        std::string savedNamespace = compiler->GetCurrentNamespace();
-        compiler->SetCurrentNamespace(namespaceName);
+        // RAII: a LogError inside the body throws on the batch/LSP paths, and a skipped restore
+        // would steer the next file's generic-template resolution.
+        LLVMBackend::NamespaceScope nsScope(compiler, namespaceName);
 
         currentFunctionIsVariadic = varargs;
 
@@ -8074,11 +8132,8 @@ public:
         {
             auto sites = compiler->EndAutoReturnCapture();
             compiler->FinalizeAutoReturnFunction(name, fn, sites, allParams, varargs, returnsOwned, !structName.empty());
-            compiler->SetCurrentNamespace(savedNamespace);
             return;  // auto functions do not participate in default-param overload generation in v1
         }
-
-        compiler->SetCurrentNamespace(savedNamespace);
 
         GenerateDefaultParamOverloads(name, returnType, params, varargs, line);
     }
@@ -23746,13 +23801,15 @@ public:
                     // typeSpecifier with generic params: e.g. the "Box<MyInt>" in "Box<MyInt> b"
                     // Apply type substitutions for generic parameters.
                     auto* typeSpec = static_cast<CFlatParser::TypeSpecifierContext*>(ruleCtx);
-                    if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr && typeSpec->genericIdentifier()->Identifier() != nullptr)
+                    std::string baseName;
+                    // GenericSpecOf covers both spellings: bare 'Box<int>' and qualified 'NS.Box<int>'.
+                    if (auto* genParams = GenericSpecOf(typeSpec, baseName))
                     {
-                        std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
+                        baseName = Compiler()->ResolveGenericBaseAlias(baseName);
                         std::vector<std::string> typeArgs;
                         // ResolveTypeArgEntry applies active substitutions AND recursively
                         // resolves/queues nested generics (e.g. list<int> inside list<list<int>>).
-                        for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                        for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                             typeArgs.push_back(ResolveTypeArgEntry(entry));
                         std::string mangledName = MangledGenericName(baseName, typeArgs);
                         if (!instantiatedGenerics.count(mangledName))
@@ -23770,7 +23827,8 @@ public:
                     auto* primaryExpr = static_cast<CFlatParser::PrimaryExpressionContext*>(ruleCtx);
                     if (primaryExpr->genericIdentifier() != nullptr && primaryExpr->genericIdentifier()->genericTypeParameters() != nullptr && primaryExpr->genericIdentifier()->Identifier() != nullptr)
                     {
-                        std::string baseName = primaryExpr->genericIdentifier()->Identifier()->getText();
+                        std::string baseName = Compiler()->ResolveGenericBaseAlias(
+                            primaryExpr->genericIdentifier()->Identifier()->getText());
                         std::vector<std::string> typeArgs;
                         for (auto* entry : primaryExpr->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                             typeArgs.push_back(ResolveTypeArgEntry(entry));
@@ -23818,17 +23876,19 @@ public:
                 break;
             }
 
-            if (!typeSpec->genericIdentifier() || !typeSpec->genericIdentifier()->genericTypeParameters())
+            std::string baseName;
+            auto* genParams = GenericSpecOf(typeSpec, baseName);
+            if (genParams == nullptr)
                 continue;
 
             // This is a generic type instantiation
-            std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
+            baseName = Compiler()->ResolveGenericBaseAlias(baseName);
             std::vector<std::string> typeArgs;
             // Resolve via ResolveTypeArgEntry so active type-parameter substitutions are
             // applied (e.g. channel<T> -> channel__int inside an instantiated generic body).
             // Without this, the literal "T" is queued (channel__T), which later fails to
             // instantiate with "unknown type 'T'". No-op for already-concrete args.
-            for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+            for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                 typeArgs.push_back(ResolveTypeArgEntry(entry));
 
             std::string mangledName = MangledGenericName(baseName, typeArgs);
@@ -23954,10 +24014,13 @@ public:
                     std::vector<std::string>(pending.typeArgs.begin() + packIdx, pending.typeArgs.end());
             }
 
-            if (isStruct)
-                ParseStructDefinition(structCtx, pending.mangledName);
-            else
-                ParseClassDefinition(classCtx, pending.mangledName);
+            {
+                TemplateNamespaceScope nsScope(compilerLLVM, pending.templateName);
+                if (isStruct)
+                    ParseStructDefinition(structCtx, pending.mangledName);
+                else
+                    ParseClassDefinition(classCtx, pending.mangledName);
+            }
 
             activeTypeSubstitutions = savedSubst;
             activePackSubstitutions = savedPackSubst;
@@ -24089,6 +24152,7 @@ public:
         {
             auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters());
             genericStructTemplates[structName] = ctx;
+            Compiler()->gts.genericTemplateNamespace[structName] = Compiler()->GetCurrentNamespace();
             Compiler()->RevokeGenericInterfaceInstances(structName);
             genericStructTypeParams[structName] = typeParams;
             genericStructConstraints[structName] = ParseWhereClause(ctx->whereClause());
@@ -26486,6 +26550,7 @@ public:
         {
             auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters());
             genericClassTemplates[structName] = ctx;
+            Compiler()->gts.genericTemplateNamespace[structName] = Compiler()->GetCurrentNamespace();
             Compiler()->RevokeGenericInterfaceInstances(structName);
             genericStructTypeParams[structName] = typeParams;
             genericClassConstraints[structName] = ParseWhereClause(ctx->whereClause());
@@ -26877,8 +26942,11 @@ public:
                 std::string ifaceName = ifaceBaseName;
                 if (spec->genericTypeParameters() != nullptr)
                 {
+                    // A base clause names the TEMPLATE, so the spelling resolves through the
+                    // generic key space (a bare 'IV<T>' inside namespace NS means NS.IV).
                     auto concreteTypeArgs = resolveImplsTypeArgs(spec->genericTypeParameters());
-                    ifaceName = MangledGenericName(ifaceBaseName, concreteTypeArgs);
+                    ifaceName = MangledGenericName(compiler->ResolveGenericBaseAlias(ifaceBaseName),
+                                                   concreteTypeArgs);
                 }
                 else
                 {
@@ -26963,7 +27031,7 @@ public:
 
             if (spec->genericTypeParameters() != nullptr)
             {
-                ifaceName = ifaceBaseName;
+                ifaceBaseName = compiler->ResolveGenericBaseAlias(ifaceBaseName);
                 auto concreteTypeArgs = resolveImplsTypeArgs(spec->genericTypeParameters());
                 ifaceName = MangledGenericName(ifaceBaseName, concreteTypeArgs);
 
