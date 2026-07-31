@@ -1599,6 +1599,61 @@ bool testInterfaceTernaryAsCast()
     return result;
 }
 
+// `using` aliases of an interface name and of a concrete class name, plus an alias of an alias -
+// exercised as the TARGET of 'is'/'as', as the SOURCE of 'is'/'as', and across a pointer '?:'
+// join. Direct interfaceTable.find/count sites used to miss an aliased spelling that
+// IsInterfaceType (which resolves aliases) would accept - see
+// internal/issue/p1/interface-type-alias-not-resolved-in-is-as-target.md.
+using AliasIPress = IPress;
+using AliasIPress2 = AliasIPress;      // alias of an alias: registration flattens the chain
+using AliasPressy = Pressy;
+bool testInterfaceAliasIsAsTarget()
+{
+    bool result = true;
+    gWidgetDtorCount = 0;
+
+    // Boxing a Pressy* into an IPress local moves ownership, so each leg below gets its
+    // own fresh pointer rather than reusing one already moved into a prior local.
+    Pressy* p1 = new Pressy();
+    IPress ip = p1;
+
+    // Alias naming the interface as the 'is'/'as' TARGET.
+    result &= Test("iface_alias_is_target", ip is AliasIPress, true);
+    IPress viaAlias = ip as AliasIPress;
+    result &= Test("iface_alias_as_target", viaAlias.kind(), 1);
+
+    // Alias of an alias as the TARGET: the chain must resolve fully, not just one hop.
+    result &= Test("iface_alias_of_alias_is_target", ip is AliasIPress2, true);
+    IPress viaAlias2 = ip as AliasIPress2;
+    result &= Test("iface_alias_of_alias_as_target", viaAlias2.kind(), 1);
+
+    // TRIPWIRE, not a regression test for the fixed bug: `AliasIPress src = p2;` is a
+    // DECLARATION, so ParseDeclarationSpecifiers already resolves the alias and
+    // src.TypeAndValue.TypeName is "IPress" before GenerateIsCheck/GenerateSafeCast ever run -
+    // these two legs pass identically on the PRE-FIX binary. Kept so a future change that lets
+    // an unresolved alias spelling reach srcTypeNameIn (see the "defensive, not load-bearing"
+    // comment at that resolution) has a test that would catch it.
+    Pressy* p2 = new Pressy();
+    AliasIPress src = p2;
+    result &= Test("iface_alias_is_source", src is IPress, true);
+    IPress backOut = src as IPress;
+    result &= Test("iface_alias_as_source", backOut.kind(), 1);
+
+    // Alias of a CONCRETE class as the 'is' target from a concrete (non-boxed, unowned-check)
+    // source - 'is' never transfers ownership, so p3 is still deleted directly below.
+    Pressy* p3 = new Pressy();
+    result &= Test("iface_alias_concrete_is_target", p3 is AliasPressy, true);
+
+    // Alias as the target across a pointer '?:' join of two DIFFERENT concrete classes.
+    Toggly* t = new Toggly();
+    result &= Test("iface_alias_ternary_is_target",
+                   (ternaryPick(true) ? p3 : t) is AliasIPress, true);
+
+    delete ip; delete src; delete p3; delete t;
+    result &= Test("iface_alias_dtor_count", gWidgetDtorCount, 4);
+    return result;
+}
+
 /*
  * The RETURN spelling of the same '?:' join. A ternary result carries no NamedVariable TypeName,
  * so the interface-return upcast found no class to box and a bare `ptr` reached the `ret` - the
@@ -4274,6 +4329,7 @@ extern int main()
     total++; passed += testInterfaceIsNullUpcast()       ? 1 : 0;
     total++; passed += testInterfaceTernaryUpcast()      ? 1 : 0;
     total++; passed += testInterfaceTernaryAsCast()      ? 1 : 0;
+    total++; passed += testInterfaceAliasIsAsTarget()    ? 1 : 0;
     total++; passed += testInterfaceTernaryReturnUpcast() ? 1 : 0;
     total++; passed += testGenericInterfaceField()       ? 1 : 0;
     total++; passed += testGenericInterfaceExplicitPtrArg() ? 1 : 0;

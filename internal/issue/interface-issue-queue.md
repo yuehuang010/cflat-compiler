@@ -49,8 +49,9 @@ Next P1s, and the sequencing that matters:
   language decisions were settled going in: `auto x = <fixed array>` deduces the VIEW `T[]`
   (a borrow - `auto` introduces no storage), and `int[3] b = a;` IS a copy lowered as a memcpy
   (the declared type allocates its own storage, so it cannot alias).
-- `interface-boxing-keyed-on-source-binding`, `interface-type-alias-not-resolved-in-is-as-target`
-  and `return-dangle-missed-when-slot-has-extra-user` are the next group.
+- `interface-boxing-keyed-on-source-binding` and `return-dangle-missed-when-slot-has-extra-user`
+  are the next group. (`interface-type-alias-not-resolved-in-is-as-target`, formerly grouped
+  here, is fixed on `fix/iface-alias` - not yet merged to master.)
 - `ifconst-const-global-condition-corrupts-ir` and `null-conditional-args-eval-order` follow.
 - `interface-method-call-on-null-value-segfaults` needs a PRODUCT DECISION first: its fix
   direction proposes a runtime null-vtable check on every interface dispatch, which is a
@@ -132,9 +133,9 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 14 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 13 |
 | **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 30 |
-| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 20 |
+| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 21 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
 ### P1 - wrong programs and crashes (`p1/`)
@@ -142,7 +143,6 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | Issue | Severity |
 |---|---|
 | [[interface-boxing-keyed-on-source-binding]] | Double free (exit 134) via parens / `?:`; verifier failure via `??`; two un-routed boxing sites. Merged 2026-07-30. |
-| [[interface-type-alias-not-resolved-in-is-as-target]] | Wrong answer + false rejection: `ia is AliasIB` rejected while `ia is IB` works. Fix with one resolving accessor over the ~12 direct `interfaceTable.find/count` sites. |
 | [[ftell-fseek-long-width-on-windows]] | Silent wrong value on Windows: core binds C `long` as pointer-sized, so `ftell`/`fseek` read garbage under LLP64. Not a UI issue despite being Windows-only. |
 | [[interface-method-call-on-null-value-segfaults]] | SIGSEGV (139), no guard. Fires on a PLAIN non-generic interface too. Pre-existing and language-wide. |
 | [[data-pointer-into-thin-function-param-segfaults]] | Silent miscompile then SIGSEGV (exit 139), no diagnostic. A data pointer bitcasts straight into a THIN `function<>` parameter and is called. Deliberate residue of `ce9858e` - that fix gated only the FAT (`Lambda<>`) parameter arm. Filed 2026-07-31. |
@@ -211,6 +211,7 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | [[thread-cannot-go-raii]] | ownership | Two independent blockers on giving `Thread` a destructor. |
 | [[pools-no-destructor-shutdown-ordering]] | ownership | The pools stay manual - deliberately. |
 | [[core-bitcode-may-cache-bodyless-rebox-thunk]] | latent | Unreachable today; trips when any core file reachable from `runtime.cb` gains an interface-to-interface conversion. |
+| [[interface-lookup-alias-asymmetry-latent]] | latent | Follow-up from the now-closed `is`/`as`-alias-target fix (`fix/iface-alias`, not yet merged). Of 46 direct `interfaceTable.find/count` sites, 6 (`HasInterfaceMethod`, `FindInterfaceMethod`, `InterfaceDtorSlotIndex`, `EmitInterfaceFieldAddress`, etc.) are unreachable today because `TypeAndValue.TypeName` is always pre-resolved by declaration time - but 2 MORE (interface type-switch `case AliasX:` / arm-style `case AliasX* v`) are reachable RIGHT NOW, pre-existing on master; 32 sites remain untriaged. |
 | [[iface-arg-lambda-fnptr-type-not-propagated]] | latent | No failing shape found; recorded with what was tried. |
 | [[nondeterministic-ir-switch-case-order]] | methodology | No miscompile - a METHODOLOGY hazard. Read it before using "0 IR diffs" as proof. |
 | [[iface-namespace-follow-ups]] | follow-up | Items 2-6 of the round-1 review of `c9acb6c`. Item 1 is RESOLVED (`853cb87`); items 4 and 5 were fixed by `15809e0`. Item 5's remainder (annotation/template key split) is reachable only on the Windows `[uuid]` / `[winrt]` path. |
@@ -299,6 +300,7 @@ which a future session must not "fix" back without reopening the decision.
 | `function<T>` split from `function<T>*`; `Lambda<T>*` rejected | `4000fa1` |
 | Closure widening gated on the direct call path; interface argument slots type-gated | `4097959` |
 | Fixed-array shape: `auto` deduces a view, `T[N] b = a` is a copy | fix/array-shape |
+| `using` interface alias resolved as an `is`/`as` target (`GenerateIsCheck`/`GenerateSafeCast`); residual asymmetry filed as [[interface-lookup-alias-asymmetry-latent]] | fix/iface-alias (branch, not yet merged) |
 
 Suite trajectory across the whole sequence: 522 -> 530 -> 536 -> 538 -> 540.
 

@@ -13639,11 +13639,25 @@ public:
         return slot;
     }
 
-    llvm::Value* GenerateIsCheck(llvm::Value* interfaceValue, const std::string& targetTypeName,
+    llvm::Value* GenerateIsCheck(llvm::Value* interfaceValue, const std::string& targetTypeNameIn,
                                   antlr4::ParserRuleContext* ctx, llvm::Type* srcElemType = nullptr,
-                                  const std::string& srcTypeName = {})
+                                  const std::string& srcTypeNameIn = {})
     {
         auto* compiler = Compiler(ctx);
+        // targetTypeName is LOAD-BEARING: every direct interfaceTable.find/count below used to
+        // miss an aliased spelling that IsInterfaceType (which resolves aliases) would accept -
+        // that was the bug (see internal/issue p1, now closed). targetTypeNameIn (unresolved) is
+        // kept around and used in every LogErrorContext message below, so a rejected 'AliasIA'
+        // is reported as 'AliasIA', not as the interface it resolves to.
+        //
+        // srcTypeName's resolution here is DEFENSIVE, not load-bearing: srcTypeNameIn always
+        // arrives already resolved (the caller reads it off a NamedVariable.TypeAndValue.TypeName,
+        // which ParseDeclarationSpecifiers resolves at declaration time), so this is a no-op today.
+        // Kept so a future caller that stops pre-resolving does not silently reintroduce the same
+        // asymmetry on the source side - Test/test_interface.cb's iface_alias_is_source /
+        // iface_alias_as_source legs are a tripwire for exactly that, not current-bug coverage.
+        std::string targetTypeName = compiler->ResolveTypeAlias(targetTypeNameIn);
+        std::string srcTypeName = compiler->ResolveTypeAlias(srcTypeNameIn);
 
         std::string srcStructName;
         LLVMBackend::TypeAndValue srcShape;
@@ -13660,8 +13674,9 @@ public:
         // call sites do, so control cannot reach the concrete-target message if it stopped throwing.
         if (srcKind == CastSourceKind::PointerShaped)
         {
+            // Membership gates on the resolved name; the message spells what the user wrote.
             if (compiler->interfaceTable.count(targetTypeName)
-                && RejectPointerShapedInterfaceUpcast(ctx, srcShape, targetTypeName))
+                && RejectPointerShapedInterfaceUpcast(ctx, srcShape, targetTypeNameIn))
                 return nullptr;
             LogErrorContext(ctx, std::format(
                 "'is' needs an interface value or a single class instance, not '{}'",
@@ -13677,13 +13692,13 @@ public:
             if (!ResolveTernaryArmClasses(interfaceValue, compiler, armTypes, failure))
             {
                 LogErrorContext(ctx, std::format("cannot test '?:' arm against '{}': {}",
-                                                 targetTypeName, failure));
+                                                 targetTypeNameIn, failure));
                 return nullptr;
             }
             bool targetIsInterface = compiler->interfaceTable.count(targetTypeName) != 0;
             if (!targetIsInterface && !compiler->dataStructures.count(targetTypeName))
             {
-                LogErrorContext(ctx, std::format("'{}' is not a known struct or interface type for 'is' check", targetTypeName));
+                LogErrorContext(ctx, std::format("'{}' is not a known struct or interface type for 'is' check", targetTypeNameIn));
                 return nullptr;
             }
             std::vector<bool> answers(armTypes.size(), false);
@@ -13701,7 +13716,7 @@ public:
         {
             LogErrorContext(ctx, std::format(
                 "'is' requires an interface value or a class instance on the left of '{}'; this "
-                "expression is neither", targetTypeName));
+                "expression is neither", targetTypeNameIn));
             return nullptr;
         }
 
@@ -13715,7 +13730,7 @@ public:
             if (compiler->dataStructures.count(targetTypeName))
                 return compiler->builder->getInt1(srcStructName == targetTypeName);
 
-            LogErrorContext(ctx, std::format("'{}' is not a known struct or interface type for 'is' check", targetTypeName));
+            LogErrorContext(ctx, std::format("'{}' is not a known struct or interface type for 'is' check", targetTypeNameIn));
             return nullptr;
         }
 
@@ -13743,14 +13758,14 @@ public:
         auto targetIt = compiler->dataStructures.find(targetTypeName);
         if (targetIt == compiler->dataStructures.end())
         {
-            LogErrorContext(ctx, std::format("'{}' is not a known struct type for 'is' check", targetTypeName));
+            LogErrorContext(ctx, std::format("'{}' is not a known struct type for 'is' check", targetTypeNameIn));
             return nullptr;
         }
 
         auto* typeDesc = targetIt->second.typeDescriptor;
         if (!typeDesc)
         {
-            LogErrorContext(ctx, std::format("'{}' has no type descriptor", targetTypeName));
+            LogErrorContext(ctx, std::format("'{}' has no type descriptor", targetTypeNameIn));
             return nullptr;
         }
 
@@ -13758,13 +13773,19 @@ public:
         return compiler->builder->CreateICmpEQ(loadedDesc, typeDesc);
     }
 
-    llvm::Value* GenerateSafeCast(llvm::Value* interfaceValue, const std::string& targetTypeName,
+    llvm::Value* GenerateSafeCast(llvm::Value* interfaceValue, const std::string& targetTypeNameIn,
                                   antlr4::ParserRuleContext* ctx, llvm::Type* srcElemType = nullptr,
                                   const LLVMBackend::NamedVariable* srcBinding = nullptr,
-                                  const std::string& srcTypeName = {})
+                                  const std::string& srcTypeNameIn = {})
     {
         auto* compiler = Compiler(ctx);
         auto ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
+        // targetTypeName resolution is LOAD-BEARING (see the matching comment in
+        // GenerateIsCheck); targetTypeNameIn (unresolved) is kept for every message below so a
+        // rejected alias is reported by the name the user wrote. srcTypeName's resolution is
+        // DEFENSIVE only - srcTypeNameIn always arrives pre-resolved already.
+        std::string targetTypeName = compiler->ResolveTypeAlias(targetTypeNameIn);
+        std::string srcTypeName = compiler->ResolveTypeAlias(srcTypeNameIn);
 
         std::string srcStructName;
         LLVMBackend::TypeAndValue srcShape;
@@ -13782,12 +13803,13 @@ public:
         // on the helper's bool like every other call site (see its comment for why).
         if (srcKind == CastSourceKind::PointerShaped)
         {
+            // Membership gates on the resolved name; the message spells what the user wrote.
             if (compiler->interfaceTable.count(targetTypeName)
-                && RejectPointerShapedInterfaceUpcast(ctx, srcShape, targetTypeName))
+                && RejectPointerShapedInterfaceUpcast(ctx, srcShape, targetTypeNameIn))
                 return nullptr;
             LogErrorContext(ctx, std::format(
                 "cannot cast '{}' to '{}' - index or dereference it first to get a single instance",
-                compiler->DescribePointerShapedInterfaceSource(srcShape), targetTypeName));
+                compiler->DescribePointerShapedInterfaceSource(srcShape), targetTypeNameIn));
             return nullptr;
         }
 
@@ -13801,13 +13823,13 @@ public:
                 if (auto* fat = UpcastTernaryPhiToInterface(interfaceValue, targetTypeName, &armFailure))
                     return fat;
                 LogErrorContext(ctx, armFailure.empty()
-                    ? std::format("cannot convert '?:' result to interface '{}'", targetTypeName)
-                    : std::format("cannot convert '?:' arm to interface '{}': {}", targetTypeName, armFailure));
+                    ? std::format("cannot convert '?:' result to interface '{}'", targetTypeNameIn)
+                    : std::format("cannot convert '?:' arm to interface '{}': {}", targetTypeNameIn, armFailure));
                 return nullptr;
             }
             LogErrorContext(ctx, std::format(
                 "cannot cast a '?:' result to '{}'; 'as' performs a runtime-checked downcast only "
-                "from an interface value - bind the '?:' to a local first", targetTypeName));
+                "from an interface value - bind the '?:' to a local first", targetTypeNameIn));
             return nullptr;
         }
 
@@ -13815,7 +13837,7 @@ public:
         {
             LogErrorContext(ctx, std::format(
                 "'as' requires an interface value or a class instance on the left of '{}'; this "
-                "expression is neither", targetTypeName));
+                "expression is neither", targetTypeNameIn));
             return nullptr;
         }
 
@@ -13842,11 +13864,11 @@ public:
                 // no runtime type info on the object, so this can never be a checked downcast.
                 LogErrorContext(ctx, std::format(
                     "cannot cast '{}' to unrelated type '{}'; 'as' performs a runtime-checked downcast only from an interface value",
-                    srcStructName, targetTypeName));
+                    srcStructName, targetTypeNameIn));
                 return nullptr;
             }
 
-            LogErrorContext(ctx, std::format("'{}' is not a known struct or interface type for 'as' cast", targetTypeName));
+            LogErrorContext(ctx, std::format("'{}' is not a known struct or interface type for 'as' cast", targetTypeNameIn));
             return nullptr;
         }
 
@@ -13929,14 +13951,14 @@ public:
         auto targetIt = compiler->dataStructures.find(targetTypeName);
         if (targetIt == compiler->dataStructures.end())
         {
-            LogErrorContext(ctx, std::format("'{}' is not a known struct or interface type for 'as' cast", targetTypeName));
+            LogErrorContext(ctx, std::format("'{}' is not a known struct or interface type for 'as' cast", targetTypeNameIn));
             return nullptr;
         }
 
         auto* typeDesc = targetIt->second.typeDescriptor;
         if (!typeDesc)
         {
-            LogErrorContext(ctx, std::format("'{}' has no type descriptor", targetTypeName));
+            LogErrorContext(ctx, std::format("'{}' has no type descriptor", targetTypeNameIn));
             return nullptr;
         }
 
