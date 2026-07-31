@@ -7883,12 +7883,14 @@ public:
         if (node == nullptr) return std::nullopt;
         auto* compiler = Compiler();
 
-        // Statement scope (a live insert block that is the function body currently being emitted):
+        // Statement scope (a LIVE insert block that is the function body currently being emitted):
         // emit into it directly, exactly as the pre-evaluator code did. The dead leaf IR left
         // behind is harmless (a plain if-const decision, later DCE'd). forceScratch overrides this
         // for the owning-sink pre-body scan, where the "current" block is a FOREIGN, already-
         // terminated function block; emitting there would leak instructions past its terminator.
-        if (!forceScratch && compiler->builder->GetInsertBlock() != nullptr)
+        // Liveness (not just non-null) is required: at FILE / member / interface scope the builder
+        // still points at the last, already-terminated block of the previously emitted function.
+        if (!forceScratch && compiler->IsInsertBlockLive())
         {
             llvm::Value* v = EmitIfConstLeafValue(node);
             uint64_t folded = 0;
@@ -7897,8 +7899,9 @@ public:
             return std::nullopt;
         }
 
-        // No usable insert block (declaration / member / interface scope) or forceScratch: emit
-        // into a throwaway function (mirrors EvalGlobalArrayDim) so the builder has a valid, private
+        // No usable insert block - null, or terminated (declaration / member / interface scope, or
+        // dead code after a return) - or forceScratch: emit into a throwaway function
+        // (mirrors EvalGlobalArrayDim) so the builder has a valid, private
         // block. This is the crash fix - a global/enum load can no longer dereference a null insert
         // block - and it also keeps the owning-sink scan from corrupting a foreign function.
         auto savedState = compiler->SaveBuilderState();

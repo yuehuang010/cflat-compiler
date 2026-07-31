@@ -1609,6 +1609,85 @@ else if const (__PLATFORM__ == 32)
     int chainedNoElseValue() { return 32; }
 }
 
+// Test 6: declaration-scope `if const` whose condition EMITS (a const-global load, an enum
+// member). The literal/macro conditions above fold without emitting anything, so they never
+// exercised the insert point. At file / member / interface scope the builder still points at the
+// last, already-terminated block of the previously emitted function; a non-null (rather than
+// live) insert-block check appended the load past that terminator and broke module verification
+// of an unrelated function. Untaken arms are not type-checked, hence the undefined calls.
+const int GLOBAL_IFC_OFF = 0;
+const int GLOBAL_IFC_ON = 1;
+const bool GLOBAL_IFC_BOOL_OFF = false;
+enum GlobalIfcEnum : int { GIFC_A = 0, GIFC_B = 1 };
+
+if const (GLOBAL_IFC_OFF)
+{
+    int globalConstGlobalValue() { return neverDefinedD(); }
+}
+else
+{
+    int globalConstGlobalValue() { return 271; }
+}
+
+if const (GLOBAL_IFC_ON)
+{
+    class GlobalConstGlobalBox<T> { T item = default; };
+    int globalConstGlobalTaken() { return 618; }
+}
+
+if const (GlobalIfcEnum.GIFC_B == 1)
+{
+    int globalIfcEnumValue() { return 141; }
+}
+else
+{
+    int globalIfcEnumValue() { return neverDefinedE(); }
+}
+
+// Nested: an emitting condition inside a taken emitting-condition arm.
+if const (GLOBAL_IFC_ON)
+{
+    if const (GLOBAL_IFC_BOOL_OFF)
+    {
+        int globalIfcNestedValue() { return neverDefinedF(); }
+    }
+    else
+    {
+        int globalIfcNestedValue() { return 355; }
+    }
+}
+
+namespace GlobalIfcNS
+{
+    if const (GLOBAL_IFC_OFF)
+    {
+        int nsValue() { return neverDefinedG(); }
+    }
+    else
+    {
+        int nsValue() { return 433; }
+    }
+}
+
+// Member scope and interface scope reach the same evaluator.
+class GlobalIfcMember
+{
+    int base = 5;
+    if const (GLOBAL_IFC_ON) { int extra = 6; }
+    if const (GLOBAL_IFC_OFF) { int absent = 7; }
+};
+
+interface IGlobalIfc
+{
+    int gv();
+    if const (GLOBAL_IFC_OFF) { int neverInContract(); }
+};
+
+class GlobalIfcImpl : IGlobalIfc
+{
+    int gv() { return 808; }
+};
+
 bool testGlobalIfConst()
 {
     bool result = true;
@@ -1638,6 +1717,27 @@ bool testGlobalIfConst()
 
     // Call platform-specific function
     platformSpecificFunc();
+
+    // Emitting (const-global / enum-member) conditions at declaration scope
+    result &= Test("global_if_const_const_global_else", globalConstGlobalValue(), 271);
+    result &= Test("global_if_const_const_global_taken", globalConstGlobalTaken(), 618);
+    GlobalConstGlobalBox<int> gcgb = default;
+    gcgb.item = 99;
+    result &= Test("global_if_const_const_global_generic", gcgb.item, 99);
+    result &= Test("global_if_const_enum_member", globalIfcEnumValue(), 141);
+    result &= Test("global_if_const_nested_emitting", globalIfcNestedValue(), 355);
+    result &= Test("global_if_const_namespace", GlobalIfcNS.nsValue(), 433);
+
+    GlobalIfcMember gim = default;
+    result &= Test("global_if_const_member_base", gim.base, 5);
+    result &= Test("global_if_const_member_extra", gim.extra, 6);
+    // Discriminator for the UNTAKEN member arm: `absent` is never referenced, so a wrongly
+    // taken arm would just add a field and every other assertion would still pass. Size sees it.
+    result &= Test("global_if_const_member_absent_size", (int)sizeof(GlobalIfcMember), 8);
+
+    GlobalIfcImpl gii = default;
+    IGlobalIfc giface = gii;
+    result &= Test("global_if_const_interface_member", giface.gv(), 808);
 
     return result;
 }

@@ -52,7 +52,8 @@ Next P1s, and the sequencing that matters:
 - `interface-boxing-keyed-on-source-binding` and `return-dangle-missed-when-slot-has-extra-user`
   are the next group. (`interface-type-alias-not-resolved-in-is-as-target`, formerly grouped
   here, is fixed on `fix/iface-alias` - not yet merged to master.)
-- `ifconst-const-global-condition-corrupts-ir` and `null-conditional-args-eval-order` follow.
+- `null-conditional-args-eval-order` follows. (`ifconst-const-global-condition-corrupts-ir` is
+  fixed on `fix/ifconst-ir` - not yet merged to master.)
 - `interface-method-call-on-null-value-segfaults` needs a PRODUCT DECISION first: its fix
   direction proposes a runtime null-vtable check on every interface dispatch, which is a
   per-call branch someone must agree to pay.
@@ -154,7 +155,6 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | [[llvm-cannot-select-sign-extend-on-const-array-index]] | LLVM fatal error, compiler exit 134. Pre-existing; the front-end shape that fed it is now rejected earlier, so no live repro remains - confirm no other spelling reaches it, then re-rank. |
 | [[delete-of-array-view-over-stack-storage]] | Silent abort (exit 134), no diagnostic. PRE-EXISTING on the explicit `int[] v = a;` spelling; the fixed-array shape fix makes `auto` reach it too. |
 | [[multidim-array-view-binding-loses-shape]] | Silent miscompile. The `T[][]` view spelling drops the row stride, so `auto` over a 2-D fixed array has no correct target to deduce to. Residual of the 1-D fixed-array-shape fix. |
-| [[ifconst-const-global-condition-corrupts-ir]] | Missing block terminator in an unrelated already-emitted function. Identical on master. |
 | [[null-conditional-args-eval-order]] | `?.` call arguments evaluate before the null-guard branch - the guard does not guard them. Filed as latent; it is a wrong-order semantics bug. |
 
 ### P2 - false rejections, unavailable features, ownership holes (`p2/`)
@@ -214,6 +214,7 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | [[core-bitcode-may-cache-bodyless-rebox-thunk]] | latent | Unreachable today; trips when any core file reachable from `runtime.cb` gains an interface-to-interface conversion. |
 | [[interface-lookup-alias-asymmetry-latent]] | latent | Follow-up from the now-closed `is`/`as`-alias-target fix (`fix/iface-alias`, not yet merged). Of 46 direct `interfaceTable.find/count` sites, 6 (`HasInterfaceMethod`, `FindInterfaceMethod`, `InterfaceDtorSlotIndex`, `EmitInterfaceFieldAddress`, etc.) are unreachable today because `TypeAndValue.TypeName` is always pre-resolved by declaration time - but 2 MORE (interface type-switch `case AliasX:` / arm-style `case AliasX* v`) are reachable RIGHT NOW, pre-existing on master; 32 sites remain untriaged. |
 | [[iface-arg-lambda-fnptr-type-not-propagated]] | latent | No failing shape found; recorded with what was tried. |
+| [[insert-block-liveness-not-audited-repo-wide]] | latent | `GetInsertBlock() != nullptr` is used repo-wide as a liveness test and is not one - nothing clears the insert point at end-of-function, so at declaration scope it points at the PREVIOUS function's terminated last block. `if const` was one instance (fixed, `fix/ifconst-ir`). SMALLER than it sounds: of 49 `GetInsertBlock()` uses in `LLVMBackend.h` only 3 are null-compares and only ONE (`12488`) is on the shared builder - and that one is unreachable by construction, since the only declaration-scope route needs a non-constant global initializer, which is rejected earlier. Read the fix-direction section before reaching for the one-line "just clear it" fix. |
 | [[nondeterministic-ir-switch-case-order]] | methodology | No miscompile - a METHODOLOGY hazard. Read it before using "0 IR diffs" as proof. |
 | [[iface-namespace-follow-ups]] | follow-up | Items 2-6 of the round-1 review of `c9acb6c`. Item 1 is RESOLVED (`853cb87`); items 4 and 5 were fixed by `15809e0`. Item 5's remainder (annotation/template key split) is reachable only on the Windows `[uuid]` / `[winrt]` path. |
 | [[iface-ifconst-blame-attempt-shelved]] | shelved | READ BEFORE attempting the `if const` blame diagnostic again. A serious attempt shelved after eight review rounds / nine defects. |
@@ -303,8 +304,60 @@ which a future session must not "fix" back without reopening the decision.
 | Fixed-array shape: `auto` deduces a view, `T[N] b = a` is a copy | fix/array-shape |
 | `using` interface alias resolved as an `is`/`as` target (`GenerateIsCheck`/`GenerateSafeCast`); residual asymmetry filed as [[interface-lookup-alias-asymmetry-latent]] | fix/iface-alias (branch, not yet merged) |
 | Interface boxing keyed on the VALUE, not the source binding; `??` join boxed per arm | fix/iface-boxing (branch, not yet merged) |
+| `if const` leaf emission gated on insert-block LIVENESS, not non-nullness | fix/ifconst-ir (branch, not yet merged) |
 
 Suite trajectory across the whole sequence: 522 -> 530 -> 536 -> 538 -> 540.
+
+### fix/ifconst-ir - `if const` leaf emission gated on insert-block LIVENESS
+
+The mechanism, because the symptom points at the wrong file entirely. `EmitAndFoldIfConstLeaf`
+(`MainListener.h:7891`) chose "emit into the current block" whenever
+`builder->GetInsertBlock() != nullptr`, on the assumption that a null insert block is what
+declaration scope looks like. It is not: nothing clears the insert point when a function
+definition finishes, so at file / member / interface scope the builder still points at the LAST,
+already-terminated block of the previously emitted function. A condition that FOLDS without
+emitting (a literal, `sizeof`, `__MACOS__`) never noticed. A condition that must EMIT - a const
+global load, an enum member - had its `load` appended after that block's `ret`:
+
+```
+ifResume:                 ; in _Test_int_charPtrstringstring_, from Test/test_helper.cb
+  call void @printf(...)
+  ret i32 0
+  %11 = load i32, ptr @GI_NEVER, align 4     <- leaked here from a file-scope `if const`
+```
+
+The verifier reports this as "Basic Block ... does not have terminator!" in a function the user
+never wrote near the `if const`.
+
+The fix is one predicate: `compiler->IsInsertBlockLive()` (non-null AND unterminated) instead of
+non-null. That routes the leaf into the existing throwaway `__if_const_eval_tmp` function - the
+path that already existed for the null case and for the owning-sink `forceScratch` scan. It is
+one change at the single leaf site rather than a `forceScratch=true` at the file-scope call site,
+because all four `DecideIfConstCondition` callers share the hazard: file, member (aggregate) and
+interface scope all reproduced on master and are all fixed by the one predicate. Statement scope
+is unaffected - a live body block still takes the direct path, so normal `if const` emission is
+byte-identical.
+
+Not changed, deliberately: nothing rejects anything. `if const (<const global>)` is legal code and
+now works in both polarities. The insert point is still not cleared at end-of-function, and the
+other ~30 `GetInsertBlock()` null-checks in `LLVMBackend.h` were not audited for the same
+non-null-vs-live confusion. That deferral is filed as
+[[insert-block-liveness-not-audited-repo-wide]], which counts the set properly (49 uses, 3
+null-compares, exactly one - `LLVMBackend.h:12488` - on the shared builder, and its comment carries
+the same false premise), records WHY that one is unreachable today by construction, and says why
+the tempting one-line "clear the insert point at end-of-function" fix is the wrong first move.
+
+A bonus the issue did not ask for: at member and interface scope master loses the diagnostic
+entirely - a non-constant `if const` condition there produces a raw "module verification failed"
+dump. On this branch the same input correctly reports `'if const' condition must be a compile-time
+constant expression`, because the leaf now folds in a scratch function instead of corrupting the
+module before the decision is reported.
+
+Verification: `./test.sh Release` 554/0/8; `./example_mac.sh Release` 35/0; a differential corpus
+sweep over all 512 `.cb` under `Test/`, `example/` and `cflat/core/` with real `-o` codegen plus
+program stdout, isolated `HOME` per side, found 8 differing files, all 8 proven nondeterministic
+by running the MASTER binary against itself twice (thread-pool throughputs, `rdtsc` deltas,
+`CFAbsoluteTimeGetCurrent`, pid). Zero behavioural differences.
 
 ### `99d73f3` and `696060d` - the two P1s of 2026-07-31
 
