@@ -10083,36 +10083,19 @@ public:
     }
 
     /*
-     * True only when `value` is PROVABLY the address of a stack slot in the current frame: the
-     * value itself is an alloca, or a GEP chain rooted at one (`&local`, `&arr[0]`, `&s.f`).
-     * Deliberately one-directional - anything not provable returns false and is let through, so
-     * this can never reject a legal heap/global/borrowed source.
+     * A `unique` location owns its pointee and its synthesized teardown frees it. A stack or
+     * global address is not ownable - the free would run on memory the program never allocated
+     * (abort / heap corruption at run time, with no diagnostic). Rejected only for a PROVABLE
+     * non-heap address (LLVMBackend::IsProvableNonHeapAddress).
      */
-    static bool IsProvableStackAddress(llvm::Value* value)
-    {
-        if (value == nullptr || !value->getType()->isPointerTy())
-            return false;
-        llvm::Value* base = value->stripPointerCasts();
-        // Walk GEP bases; stripInBoundsOffsets is not used since a non-constant index still
-        // keeps the address inside the same stack object.
-        while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(base))
-            base = gep->getPointerOperand()->stripPointerCasts();
-        return llvm::isa<llvm::AllocaInst>(base);
-    }
-
-    /*
-     * A `unique` location owns its pointee and its synthesized teardown frees it. A stack address
-     * is not ownable - the free would run on memory the program never allocated (abort / heap
-     * corruption at run time, with no diagnostic). Rejected only for a PROVABLE stack address.
-     */
-    void RejectStackAddressIntoUnique(const std::string& destDesc,
-                                      antlr4::ParserRuleContext* ctx)
+    void RejectNonHeapAddressIntoUnique(const std::string& destDesc,
+                                        antlr4::ParserRuleContext* ctx)
     {
         LogErrorContext(ctx, std::format(
-            "cannot store the address of a stack value into {} - a 'unique' location owns its "
-            "pointee and its synthesized destructor frees it, but a stack address was never "
-            "allocated and freeing it is undefined. Use 'new' to allocate on the heap, or drop "
-            "'unique' if it only borrows.", destDesc));
+            "cannot store the address of a stack or global value into {} - a 'unique' location "
+            "owns its pointee and its synthesized destructor frees it, but neither is "
+            "heap-allocated and freeing it is undefined. Use 'new' to allocate on the heap, or "
+            "drop 'unique' if it only borrows.", destDesc));
     }
 
     /*
@@ -11829,9 +11812,9 @@ public:
                 && namedVar.TypeAndValue.ConstArraySize == 0
                 && !namedVar.TypeAndValue.IsInterface
                 && !selfUniqueFieldAssign
-                && IsProvableStackAddress(right))
+                && LLVMBackend::IsProvableNonHeapAddress(right))
             {
-                RejectStackAddressIntoUnique(
+                RejectNonHeapAddressIntoUnique(
                     std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar)), ctx);
                 return right;
             }
@@ -12193,11 +12176,11 @@ public:
                 && !namedVar.TypeAndValue.IsInterfacePointer
                 && !namedVar.TypeAndValue.IsFunctionPointer
                 && !namedVar.TypeAndValue.IsArrayView
-                && IsProvableStackAddress(right))
+                && LLVMBackend::IsProvableNonHeapAddress(right))
             {
                 std::string slot = namedVar.FieldName.empty() && !namedVar.CallerName.empty()
                     ? namedVar.CallerName : DescribeUniqueFieldOwner(namedVar);
-                RejectStackAddressIntoUnique(
+                RejectNonHeapAddressIntoUnique(
                     std::format("an element of unique array '{}'", slot), ctx);
                 return right;
             }
@@ -12214,9 +12197,9 @@ public:
                 && !namedVar.TypeAndValue.IsInterfacePointer
                 && !namedVar.TypeAndValue.IsFunctionPointer
                 && !namedVar.TypeAndValue.IsArrayView
-                && IsProvableStackAddress(right))
+                && LLVMBackend::IsProvableNonHeapAddress(right))
             {
-                RejectStackAddressIntoUnique(
+                RejectNonHeapAddressIntoUnique(
                     std::format("unique local '{}'", namedVar.CallerName), ctx);
                 return right;
             }
@@ -15754,8 +15737,8 @@ public:
         // shape gate; `&local` carries no borrow provenance for the legs above to see.
         if ((fieldType.IsUnique || fieldType.IsUniqueTypeArg)
             && fieldType.Pointer && fieldType.ConstArraySize == 0 && !fieldType.IsInterface
-            && IsProvableStackAddress(val))
-            RejectStackAddressIntoUnique(
+            && LLVMBackend::IsProvableNonHeapAddress(val))
+            RejectNonHeapAddressIntoUnique(
                 std::format("unique field '{}.{}'", typeName, fieldName), errCtx);
 
         // Same allocation-alignment agreement the `=` path demands: this store reaches the very

@@ -15115,6 +15115,27 @@ public:
         return n != "__iface_fat_ptr" && n != "__closure_fat_ptr";
     }
 
+    /*
+     * True only when `value` is PROVABLY an address that was never `new`-allocated: an alloca
+     * (a stack slot), a global variable, or a GEP chain rooted at either (`&local`, `&arr[0]`,
+     * `&s.f`, `&globalStruct.f`). Deliberately one-directional - anything not provable returns
+     * false and is let through, so this can never reject a legal heap/borrowed source. Shared by
+     * MainListener (a 'unique' store site) and the call-argument lowering here (a 'move' pointer
+     * parameter) - both classes need it, so it lives on LLVMBackend rather than duplicated twice.
+     * Named for what it proves ("non-heap"), not "stack": a global is exactly as un-free()-able.
+     */
+    static bool IsProvableNonHeapAddress(llvm::Value* value)
+    {
+        if (value == nullptr || !value->getType()->isPointerTy())
+            return false;
+        llvm::Value* base = value->stripPointerCasts();
+        // Walk GEP bases; stripInBoundsOffsets is not used since a non-constant index still
+        // keeps the address inside the same stack/global object.
+        while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(base))
+            base = gep->getPointerOperand()->stripPointerCasts();
+        return llvm::isa<llvm::AllocaInst>(base) || llvm::isa<llvm::GlobalVariable>(base);
+    }
+
     llvm::Value* CreateOperation(std::string oper, llvm::Value* left, llvm::Value* right)
     {
         if (left == nullptr)
@@ -17504,6 +17525,25 @@ public:
                         argList.push_back(CreateLoad(arg.Storage));
                     else
                         argList.push_back(arg.GetValue());
+                }
+
+                // Mirrors the 'uniqueAutoSink' entry rule (~3581/3608): both spellings bind the
+                // param owning, and only HERE is the argument's origin still visible.
+                llvm::Value* loweredArg = argList.back();
+                bool paramIsUniqueAutoSink = candParamItr->IsUniqueTypeArg
+                    && !candParamItr->IsAlias && !candParamItr->IsBorrowOfUniqueElement;
+                if ((candParamItr->IsMove || paramIsUniqueAutoSink)
+                    && IsProvableNonHeapAddress(loweredArg))
+                {
+                    const char* qualifier = candParamItr->IsMove ? "'move'" : "unique";
+                    LogError(std::format(
+                        "call to '{}': cannot pass the address of a stack or global value to {} "
+                        "parameter '{}' - it takes ownership and frees the pointee at scope exit, "
+                        "but neither is heap-allocated and freeing it is undefined. Use 'new' to "
+                        "allocate on the heap, or drop '{}' if the callee only borrows.",
+                        functionName, qualifier, candParamItr->VariableName,
+                        candParamItr->IsMove ? "move" : "unique"));
+                    return nullptr;
                 }
             }
             else if (!inVariadicRange && candParamItr->IsFunctionPointer)

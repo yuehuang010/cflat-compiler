@@ -1,9 +1,11 @@
 // A `unique` location owns its pointee and its synthesized teardown frees it. The address
-// of a stack local was never allocated, so that free is undefined - it aborted at run time
-// with no diagnostic at all (internal/issue: unique-ptr-field-stack-address-aborts-silently).
+// of a stack local (or a global) was never heap-allocated, so that free is undefined - it
+// aborted at run time with no diagnostic at all (internal/issue:
+// unique-ptr-field-stack-address-aborts-silently, move-param-stack-address-aborts-silently).
 // `&local` carries no borrow provenance, so none of the existing Trap-A borrow legs saw it.
-// Rejected only for a PROVABLY stack address (an alloca, or a GEP chain rooted at one);
-// anything not provable is still let through.
+// Rejected only for a PROVABLY non-heap address (an alloca or global, or a GEP chain rooted
+// at one); anything not provable is still let through.
+import "list.cb";
 struct Item { int v = 0; };
 
 struct Holder { unique Item* slot = nullptr; };
@@ -13,17 +15,30 @@ struct Holder { unique Item* slot = nullptr; };
 // spelling from the filed issue.
 struct Box<T> { T t = default; };
 
-expect_error("cannot store the address of a stack value into unique field 'Holder.slot'") {
+// A GLOBAL is exactly as un-free()-able as a stack local, and exactly as provable
+// (isa<GlobalVariable> is as one-sided a test as isa<AllocaInst>). Same reject, same message.
+Item gItem = default;
+
+// A `move T*` parameter takes ownership; its synthesized scope-exit teardown frees the
+// pointee. Declared once at file scope so every calling leg below (and the legal call in
+// main) shares one definition.
+void take(move Item* p) {}
+
+expect_error("cannot store the address of a stack or global value into unique field 'Holder.slot'") {
     void storeField() { Item i; Holder h = default; h.slot = &i; }
+}
+
+expect_error("cannot store the address of a stack or global value into unique field 'Holder.slot'") {
+    void storeFieldGlobal() { Holder h = default; h.slot = &gItem; }
 }
 
 // Pinned to the stable prefix only: the diagnostic names the INSTANTIATED struct, so the
 // full substring would embed the `Box__unique_Itemptr` mangling and break if it ever changes.
-expect_error("cannot store the address of a stack value into unique field 'Box") {
+expect_error("cannot store the address of a stack or global value into unique field 'Box") {
     void storeGenericField() { Item i; Box<unique Item*> b = default; b.t = &i; }
 }
 
-expect_error("cannot store the address of a stack value into unique local 'p'") {
+expect_error("cannot store the address of a stack or global value into unique local 'p'") {
     void storeLocal() { Item i; unique Item* p = nullptr; p = &i; }
 }
 
@@ -33,12 +48,18 @@ expect_error("cannot store the address of a stack value into unique local 'p'") 
 // struct-field nor the local leg above matches - hence its own check.
 struct Tree { unique Item* kids[8] = default; };
 
-expect_error("cannot store the address of a stack value into an element of unique array 'Tree.kids'") {
+expect_error("cannot store the address of a stack or global value into an element of unique array 'Tree.kids'") {
     void storeFieldArrayElem() { Item i; Tree t = default; t.kids[0] = &i; }
 }
 
-expect_error("cannot store the address of a stack value into an element of unique array 'kids'") {
+expect_error("cannot store the address of a stack or global value into an element of unique array 'kids'") {
     void storeLocalArrayElem() { Item i; unique Item* kids[8] = default; kids[0] = &i; }
+}
+
+// The GLOBAL analogue of the fixed-array leg above: `kids[0] = &gItem;` - a two-index GEP
+// whose source is a GlobalVariable, not an AllocaInst.
+expect_error("cannot store the address of a stack or global value into an element of unique array 'kids'") {
+    void storeLocalArrayElemGlobal() { unique Item* kids[8] = default; kids[0] = &gItem; }
 }
 
 // A bare self-field array element access (no explicit `this.` receiver) inside the owning
@@ -48,8 +69,30 @@ expect_error("cannot store the address of a stack value into an element of uniqu
 // recover the struct name here (a plain instance method's frame name carries no struct
 // prefix - only "~Type" and static methods do), so the owner is dropped and the bare field
 // name is printed, matching the existing delete-unique-field diagnostic's convention.
-expect_error("cannot store the address of a stack value into an element of unique array 'kids'") {
+expect_error("cannot store the address of a stack or global value into an element of unique array 'kids'") {
     struct SelfFieldTree { unique Item* kids[8] = default; void bad() { Item i; kids[1] = &i; } };
+}
+
+// The same free-what-was-never-allocated hazard as the store legs above, but caught at a
+// CALL site instead of a store site (internal/issue: move-param-stack-address-aborts-
+// silently). The reject fires immediately at the call (not deferred), so the SCOPED block
+// form works.
+expect_error("cannot pass the address of a stack or global value to 'move' parameter 'p'") {
+    void callTakeStack() { Item i; take(&i); }
+}
+
+expect_error("cannot pass the address of a stack or global value to 'move' parameter 'p'") {
+    void callTakeGlobal() { take(&gItem); }
+}
+
+// A plain (non-'move') `unique`-type-arg pointer parameter (a generic container's synthesized
+// owning sink, e.g. `list<unique T*>::add(T value)`) is bound owning at entry via the same
+// 'uniqueAutoSink' rule as an explicit 'move' param, with no 'move' keyword at the call site.
+// The dynamic buffer's OWN element store (`_data[_size] = value;`) cannot see this - by the
+// time the value reaches the callee it is an opaque function-argument SSA value with no
+// visible origin - so the reject lives at the CALL to add(), keyed on IsUniqueTypeArg.
+expect_error("cannot pass the address of a stack or global value to unique parameter 'value'") {
+    void addStackToList() { list<unique Item*> l; Item i; l.add(&i); }
 }
 
 extern int main()
@@ -63,5 +106,8 @@ extern int main()
     t.kids[0] = new Item();
     unique Item* kids[8] = default;
     kids[0] = new Item();
+    take(new Item());
+    list<unique Item*> l;
+    l.add(new Item());
     return 0;
 }
