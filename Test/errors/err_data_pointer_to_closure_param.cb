@@ -33,3 +33,94 @@ expect_error("only a named function, a 'function<>' value or a lambda converts t
         return io.lam(ip);
     }
 }
+
+// Same hole on the DIRECT (non-virtual) call path: `CreateOverloadedFunctionCall` widened any
+// pointer into the fat closure's CODE slot. Both call spellings now share one gate
+// (WidenToClosureFatChecked), so the accept set cannot drift between them.
+
+expect_error("cannot pass a non-function pointer value to closure parameter 'f'") {
+    class ClosureArgDirect { int lam(Lambda<int(int)> f) { return f(5); } };
+
+    int passVoidPointerDirect()
+    {
+        ClosureArgDirect d;
+        int q = 1;
+        void* vp = &q;
+        return d.lam(vp);
+    }
+}
+
+expect_error("only a named function, a 'function<>' value or a lambda converts to a closure") {
+    class ClosureArgDirect2 { int lam(Lambda<int(int)> f) { return f(5); } };
+
+    int passIntPointerDirect()
+    {
+        ClosureArgDirect2 d;
+        int q = 1;
+        int* ip = &q;
+        return d.lam(ip);
+    }
+}
+
+// Virtual dispatch used to take the lone same-arity vtable slot on ARITY alone and then lower
+// each argument by bit pattern - an 'int' became `inttoptr` in a closure code slot and was
+// CALLED. Both slot-picking arms now reject a PROVABLE mismatch (a scalar can never be code).
+// Gating on "the scorer found no match" would instead false-reject legal code: the scorer has
+// no int->floating-point rule, so its silence is absence of a rule, not proof of mismatch.
+
+expect_error("no method of 'IClosureIntArg.lam' matches the given arguments") {
+    interface IClosureIntArg { int lam(function<int(int)> f); };
+    class ClosureIntArgImpl : IClosureIntArg { int lam(function<int(int)> f) { return f(5); } };
+
+    int passIntLiteral()
+    {
+        ClosureIntArgImpl impl;
+        IClosureIntArg io = impl;
+        return io.lam(7);
+    }
+}
+
+// The lone-slot arm above is not the only one. With TWO same-arity candidates the arity filter
+// leaves both, the scorer ranks neither, and the resolver falls through to a historical
+// "take the first slot" arm that was ungated - so one extra overload turned the clean error
+// above back into a silent miscompile (exit 138). Both arms now share one gate.
+//
+// The second overload must have the SAME arity as the first, or the arity filter leaves a
+// single candidate and this exercises the lone-slot arm above instead of the fallback.
+
+expect_error("no method of 'IClosureTwoSlot.lam' matches the given arguments") {
+    interface IClosureTwoSlot
+    {
+        int lam(function<int(int)> f);
+        int lam(double d);
+    };
+    class ClosureTwoSlotImpl : IClosureTwoSlot
+    {
+        int lam(function<int(int)> f) { return f(5); }
+        int lam(double d) { return (int)d + 100; }
+    };
+
+    int passIntLiteralTwoSlot()
+    {
+        ClosureTwoSlotImpl impl;
+        IClosureTwoSlot io = impl;
+        return io.lam(3);
+    }
+}
+
+// The gate must stay one-sided. An int argument to a floating-point interface parameter is NOT
+// a provable mismatch: the overload scorer has no int->floating-point rule, so an earlier
+// revision that gated on "the scorer found no match" rejected this. Compiling is the whole
+// assertion - files here are compiled, never run - so a future allowlist cannot silently
+// re-break it.
+
+interface IFpParam { int absorb(double d); };
+class FpParamImpl : IFpParam { int absorb(double d) { return (int)d; } };
+
+int acceptIntIntoFpParam()
+{
+    FpParamImpl impl;
+    IFpParam io = impl;
+    int n = 3;
+    return io.absorb(n);
+}

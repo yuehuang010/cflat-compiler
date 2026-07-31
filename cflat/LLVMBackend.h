@@ -9838,8 +9838,9 @@ public:
             }
             return builder->CreateBitCast(val, BuildThinFnPtrType(retTV), "thinret");
         }
-        // Same widening the call paths use; routed through the shared helper so the three
-        // sites cannot drift. An already-fat closure value is returned untouched.
+        // Same widening the call paths use. This RETURN site is deliberately ungated: unlike the
+        // two argument sites it does not run WidenToClosureFatChecked, so a data pointer returned
+        // as a closure is not diagnosed here. An already-fat closure value is returned untouched.
         return WidenBareOrThinToClosureFat(val);
     }
 
@@ -12796,6 +12797,29 @@ public:
         return std::format("a '{}{}' value", tn, arg.TypeAndValue.Pointer ? "*" : "");
     }
 
+    /*
+     * The gate for widening a CALL ARGUMENT into a fat `Lambda<>` parameter. Under opaque pointers
+     * a data pointer is indistinguishable from code, so reject only what is PROVABLY data and widen
+     * everything else. Both the direct call path (CreateOverloadedFunctionCall) and virtual dispatch
+     * (LowerByValueArg) route through here so the two accept sets cannot drift - a divergence lets
+     * the same program compile through one call spelling and not the other. NOT every widen site:
+     * the RETURN path (CoerceToFuncPtrReturn) still calls WidenBareOrThinToClosureFat ungated, so
+     * `Lambda<int(int)> f() { void* p = ...; return p; }` is unguarded on both paths.
+     */
+    llvm::Value* WidenToClosureFatChecked(llvm::Value* val, const NamedVariable& arg,
+        const std::string& paramName)
+    {
+        if (val && val->getType()->isPointerTy() && ArgumentIsProvablyDataPointer(val, arg))
+        {
+            LogError(std::format(
+                "cannot pass {} to closure parameter '{}': only a named function, a "
+                "'function<>' value or a lambda converts to a closure - a data pointer "
+                "would be called as code.",
+                DescribeNonFunctionArgument(arg), paramName));
+        }
+        return WidenBareOrThinToClosureFat(val);
+    }
+
     // Mirror of LowerClosureFatToThinFnPtr: widen what a fat `Lambda<>` parameter expects.
     // A named function becomes {shim, null} and a thin `function<>` value becomes {code, null};
     // an already-fat value and a non-pointer are returned untouched. Shared by the normal call
@@ -12888,20 +12912,11 @@ public:
                 return LowerClosureFatToThinFnPtr(value, GetType(param),
                     param.VariableName, arg.LambdaCaptureNames);
             }
-            // Fat `Lambda<>` slot. Under opaque pointers a data pointer is indistinguishable from
-            // code, so reject only what is PROVABLY data and widen everything else.
+            // Fat `Lambda<>` slot - shared provenance gate, identical to the direct call path.
             if (!param.IsThinFnPtr() && !value->getType()->isStructTy()
                 && value->getType()->isPointerTy())
             {
-                if (ArgumentIsProvablyDataPointer(value, arg))
-                {
-                    LogError(std::format(
-                        "cannot pass {} to closure parameter '{}': only a named function, a "
-                        "'function<>' value or a lambda converts to a closure - a data pointer "
-                        "would be called as code.",
-                        DescribeNonFunctionArgument(arg), param.VariableName));
-                }
-                return WidenBareOrThinToClosureFat(value);
+                return WidenToClosureFatChecked(value, arg, param.VariableName);
             }
         }
         if (param.TypeName == "string" && !param.Pointer
@@ -12985,6 +13000,51 @@ public:
     }
 
     /*
+     * Is this argument PROVABLY unusable for this parameter? Deliberately one-sided, and NOT
+     * "the overload scorer failed to rank it" - the scorer has no int->floating-point rule, so
+     * its silence is absence of a rule, not proof of incompatibility. The only proof taken here
+     * is an integer or floating-point VALUE reaching a closure slot: a scalar can never be code,
+     * and lowering it emits an `inttoptr` that virtual dispatch then CALLS. Everything else stays
+     * accepted, which is the pre-existing permissive behaviour.
+     *
+     * One legal-looking program does change: `io.lam(0)`, integer 0 as a null function pointer,
+     * now errors. That spelling is already rejected on the direct path and for a plain `int*`
+     * parameter, so this brings the interface arm into parity; `nullptr` works on both.
+     */
+    bool ArgumentProvablyMismatchesParameter(const NamedVariable& arg, const TypeAndValue& param) const
+    {
+        if (!param.IsFunctionPointer && !IsEncodedClosureType(param.TypeName))
+            return false;
+        // Any recorded closure evidence disproves the mismatch.
+        if (arg.TypeAndValue.IsFunctionPointer || arg.TypeAndValue.TypeName == "__closure_fat_ptr"
+            || IsEncodedClosureType(arg.TypeAndValue.TypeName))
+            return false;
+        if (arg.Primary && llvm::isa<llvm::Function>(arg.Primary))
+            return false;
+        // Positive evidence only: a pointer, a struct, or an unknown shape is NOT proof.
+        return arg.BaseType != nullptr
+            && (arg.BaseType->isIntegerTy() || arg.BaseType->isFloatingPointTy());
+    }
+
+    // Reject a virtual call whose argument provably cannot satisfy its parameter. Shared by both
+    // slot-picking arms so a second same-arity overload cannot turn a clean error into a miscompile.
+    bool DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceName,
+        const std::string& methodName, const std::vector<NamedVariable>& args,
+        const std::vector<TypeAndValue>& params)
+    {
+        for (size_t i = 0; i < args.size() && i < params.size(); i++)
+        {
+            if (ArgumentProvablyMismatchesParameter(args[i], params[i]))
+            {
+                LogError(std::format("no method of '{}.{}' matches the given arguments",
+                    ifaceName, methodName));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /*
      * Pick the vtable slot for an interface method call by FULL SIGNATURE. Slots are gathered by
      * name, filtered by arity, then ranked with the same scorer the direct-call path uses
      * (ComputeOverloadFunction), so `io.go(a)` and `io.go(a, b)` reach different slots.
@@ -13044,6 +13104,11 @@ public:
                 auto matched = MatchFunction(args, methods[byArity[0]].Parameters);
                 if (!matched.empty()) matchedArgs = matched;
             }
+            // The lone slot was taken on ARITY alone, so an `int` reached a closure slot and
+            // was called. Reject only a PROVABLE mismatch (LogError does not return).
+            if (DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, matchedArgs,
+                    methods[byArity[0]].Parameters))
+                return -1;
             return byArity[0];
         }
 
@@ -13085,6 +13150,11 @@ public:
             auto matched = MatchFunction(args, methods[byArity[0]].Parameters);
             if (!matched.empty()) matchedArgs = matched;
         }
+        // Same provable-mismatch gate as the lone-slot arm above: without it, adding a second
+        // same-arity overload turns that arm's clean error back into a silent miscompile.
+        if (DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, matchedArgs,
+                methods[byArity[0]].Parameters))
+            return -1;
         return byArity[0];
     }
 
@@ -17618,7 +17688,9 @@ public:
                                     arg.CallerName, candParamItr->VariableName));
                             }
                         }
-                        val = WidenBareOrThinToClosureFat(val);
+                        // Same provenance gate virtual dispatch applies (LowerByValueArg): under
+                        // opaque pointers a data pointer would otherwise land in the code slot.
+                        val = WidenToClosureFatChecked(val, arg, candParamItr->VariableName);
                     }
                 }
                 else
