@@ -1309,6 +1309,63 @@ bool testFuncPtrArray2D()
     return result;
 }
 
+// Regression: 'function<T>' and 'function<T>*' are DISTINCT overloads. Both the mangled key
+// (ToUniqueString skipped Pointer for function-pointer types) and the overload scorer (which
+// scored any function-compatible argument as a perfect match) ignored the '*', so the second
+// declaration collided onto the first and both calls jumped through the wrong one (SIGSEGV).
+// The two arms apply different constants, so a collapse onto one overload changes the value.
+int applyFnPtrOverload(function<int(int)> f)  { return f(3); }
+int applyFnPtrOverload(function<int(int)>* f) { return (*f)(4); }
+
+// Declared pointer-arm-FIRST: the winner must not depend on declaration order.
+int applyFnPtrOverloadRev(function<int(int)>* f) { return (*f)(4); }
+int applyFnPtrOverloadRev(function<int(int)> f)  { return f(3); }
+
+// Regression: 'function<T>[]' (array view) and 'function<T>*' (pointer) are DISTINCT arms too.
+// The trailing int literal is only a PROMOTION match, which demotes every arm out of the
+// perfect tier - and that tier ignored per-argument quality, so the winner was decided by
+// declaration position. A fixed array then bound the '*' arm and was read as if the array
+// itself were the pointer, silently and with no diagnostic. The +100/+200 tags turn a wrong
+// bind into a wrong VALUE, and both declaration orders are pinned.
+int pickFnPtrShape(function<int(int)>[] fns, int n) { return 100 + fns[0](n); }
+int pickFnPtrShape(function<int(int)>* f, int n)    { return 200 + (*f)(n); }
+
+int pickFnPtrShapeRev(function<int(int)>* f, int n)    { return 200 + (*f)(n); }
+int pickFnPtrShapeRev(function<int(int)>[] fns, int n) { return 100 + fns[0](n); }
+
+bool testFuncPtrPointerOverload()
+{
+    bool result = true;
+
+    function<int(int)> g = doubleIt;
+    result &= Test("func ptr by-value overload", applyFnPtrOverload(g), 6);
+    result &= Test("func ptr pointer overload", applyFnPtrOverload(&g), 8);
+
+    result &= Test("func ptr by-value overload (rev decl order)", applyFnPtrOverloadRev(g), 6);
+    result &= Test("func ptr pointer overload (rev decl order)", applyFnPtrOverloadRev(&g), 8);
+
+    // A named function binds the by-value arm, never the pointer arm.
+    result &= Test("func ptr overload takes named function by value", applyFnPtrOverload(square), 9);
+
+    // The pointer arm is a real out-parameter path: writing through it must be visible here.
+    selectFuncPtr(&g, 1);
+    result &= Test("func ptr pointer overload sees out-param write", applyFnPtrOverload(&g), 16);
+
+    // '[]' vs '*': a fixed array must bind the array-view arm, a '&' the pointer arm, in
+    // either declaration order. doubleIt(3) = 6 -> 106; square(3) = 9 -> 209.
+    function<int(int)>[2] shapeArr;
+    shapeArr[0] = doubleIt;
+    shapeArr[1] = negate;
+    function<int(int)> one = square;
+
+    result &= Test("fixed array binds the '[]' arm", pickFnPtrShape(shapeArr, 3), 106);
+    result &= Test("pointer binds the '*' arm", pickFnPtrShape(&one, 3), 209);
+    result &= Test("fixed array binds '[]' arm (rev decl order)", pickFnPtrShapeRev(shapeArr, 3), 106);
+    result &= Test("pointer binds '*' arm (rev decl order)", pickFnPtrShapeRev(&one, 3), 209);
+
+    return result;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LIST SORT TESTS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1891,6 +1948,7 @@ extern int main()
     total++; passed += testFuncPtrArray()               ? 1 : 0;
     total++; passed += testFuncPtrArray2D()             ? 1 : 0;
     total++; passed += testFuncPtrAliasArray()          ? 1 : 0;
+    total++; passed += testFuncPtrPointerOverload()     ? 1 : 0;
 
     // 'move' in function pointer signatures
     total++; passed += testFuncPtrMoveSignature()      ? 1 : 0;

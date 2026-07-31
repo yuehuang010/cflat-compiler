@@ -3769,6 +3769,13 @@ private:
                     // This branch breaks out of the specifier loop, so nothing else consumes a
                     // trailing '[N]' or '*'; capture both here (as the alias branch below does).
                     declType.Pointer = declSpec->pointer() != nullptr;
+                    // A fat closure is a by-value struct, so a pointer to one loads the struct
+                    // as if it were the address itself and the module fails LLVM verification.
+                    if (declType.Pointer && !declType.IsThinFnPtr())
+                        LogErrorContext(declSpec, std::format(
+                            "pointer '*' is not supported on closure type '{}'; "
+                            "pass the closure by value or use a fixed size '{}[N]' instead",
+                            typeSpec->getText(), typeSpec->getText()));
                     if (auto* fpDimSpec = ArrayDimsOf(declSpec))
                     {
                         auto fpDims = fpDimSpec->assignmentExpression();
@@ -3869,6 +3876,12 @@ private:
                     declType.FuncPtrReturnPointer  = fit->second.FuncPtrReturnPointer;
                     declType.FuncPtrParams         = fit->second.FuncPtrParams;
                     declType.Pointer               = declSpec->pointer() != nullptr;
+                    // Same fat-closure pointer rejection as the functionPointerSpecifier branch.
+                    if (declType.Pointer && !declType.IsThinFnPtr())
+                        LogErrorContext(declSpec, std::format(
+                            "pointer '*' is not supported on closure type '{}'; "
+                            "pass the closure by value or use a fixed size '{}[N]' instead",
+                            typeSpec->getText(), typeSpec->getText()));
                     // Like the functionPointerSpecifier branch, this one breaks out of the
                     // specifier loop, so a trailing '[N]' has to be captured right here.
                     if (auto* fpDimSpec = ArrayDimsOf(declSpec))

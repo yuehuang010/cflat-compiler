@@ -14,10 +14,28 @@ expect_error("array-view '[]' is not supported on closure type 'Lambda<int(int)>
     }
 }
 
+// A pointer to a fat closure loads the {code,data} struct as if the pointer WERE the
+// struct, so the module fails LLVM verification with no source location. Reject the
+// declarator instead; the thin 'function<T>*' spelling is a real pointer and still works.
+expect_error("pointer '*' is not supported on closure type 'Lambda<int(int)>'; pass the closure by value or use a fixed size 'Lambda<int(int)>[N]' instead") {
+    int callThroughClosurePtr(Lambda<int(int)>* p, int v)
+    {
+        return (*p)(v);
+    }
+}
+
+// Same rejection through the 'using' function-type-alias branch of ParseDeclarationSpecifiers.
+expect_error("pointer '*' is not supported on closure type 'ClosureAlias'") {
+    using ClosureAlias = Lambda<int(int)>;
+    ClosureAlias* aliasPtr = nullptr;
+}
+
 // A closure/function-pointer field does not own an allocation, so 'unique' on one is
 // rejected rather than silently laying the field out by value and freeing a code address.
+// Spelled with the THIN 'function<T>*' - the fat 'Lambda<T>*' declarator is rejected
+// above before ValidateUniqueField can run, so it could no longer reach this diagnostic.
 expect_error("'unique' on field 'FH.p': a function pointer or closure does not own an allocation") {
-    struct FH { unique Lambda<int(int)>* p = nullptr; };
+    struct FH { unique function<int(int)>* p = nullptr; };
 }
 
 extern int main()

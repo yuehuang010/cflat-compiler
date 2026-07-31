@@ -714,7 +714,12 @@ public:
         {
             if (IsFunctionPointer)
             {
-                std::string s = (IsThinFnPtr() ? "cfuncptr_" : "funcptr_")
+                // The indirection marker rides the generated PREFIX, not the tail: a tail suffix
+                // would collide with a trailing pointer param (`function<int(int*)>` vs `function<int(int)>*`).
+                std::string kind = IsThinFnPtr() ? "cfuncptr" : "funcptr";
+                if (IsArrayView)   kind += "Arr";
+                else if (Pointer)  kind += (ElemPointer ? "PtrPtr" : "Ptr");
+                std::string s = kind + "_"
                               + FuncPtrReturnTypeName + (FuncPtrReturnPointer ? "Ptr" : "");
                 for (const auto& p : FuncPtrParams)
                     s += "_" + p.TypeName + (p.Pointer ? "Ptr" : "") + (p.IsMove ? "M" : "");
@@ -16736,12 +16741,40 @@ public:
         return moveScore;
     }
 
+    /*
+     * Indirection shape of a function-pointer/closure parameter or argument:
+     *   2 = array   ('function<T>[]' view, or a fixed 'function<T>[N]')
+     *   1 = pointer ('function<T>*')
+     *   0 = plain value ('function<T>' / 'Lambda<T>')
+     * These are three distinct overloads, so the scorer compares shapes instead of accepting
+     * every function-compatible argument as a perfect match. Pass `nv` on the ARGUMENT side
+     * only: a fixed 'function<T>[N]' local reaches a call site with every TypeAndValue shape
+     * flag cleared, so its array-ness survives only on the storage behind it. A subscripted
+     * element ('arr[0]') has a GEP for Storage, not the alloca, and correctly scores a value.
+     */
+    static int FunctionPointerShapeOf(const LLVMBackend::TypeAndValue& tv, const NamedVariable* nv)
+    {
+        if (tv.IsArrayView || tv.ConstArraySize > 0)
+            return 2;
+        if (nv != nullptr)
+        {
+            if (nv->BaseType != nullptr && nv->BaseType->isArrayTy())
+                return 2;
+            if (auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(nv->Storage))
+                if (slot->getAllocatedType()->isArrayTy())
+                    return 2;
+        }
+        return tv.Pointer ? 1 : 0;
+    }
+
     std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> candidates) const
     {
         std::pair<std::vector<NamedVariable>, FunctionSymbol> possibleResult;
         std::pair<std::vector<NamedVariable>, FunctionSymbol> bestPerfect;
         int bestPerfectScore = -1;  // moveScore is always >= 0; -1 means "no perfect match yet"
         int bestPossibleScore = -1; // same, for the promotion/implicit tier
+        // Fewest function-pointer shape mismatches seen in the promotion/implicit tier so far.
+        int bestPossibleShapeMismatches = std::numeric_limits<int>::max();
         // int score = 0; // 2 for promotionMatch, 1 for implicitMatch
 
         for (const auto& pair : candidates)
@@ -16754,12 +16787,15 @@ public:
                 // Reset the score so a later non-variadic candidate always overrides it.
                 possibleResult = pair;
                 bestPossibleScore = -1;
+                bestPossibleShapeMismatches = std::numeric_limits<int>::max();
                 continue;
             }
 
             bool perfectMatch = true;
             bool promotionMatch = true;
             bool implicitMatch = true;
+            // Function-pointer arguments whose indirection shape disagrees with the parameter.
+            int shapeMismatches = 0;
 
             auto candidateParamItr = candidate.Parameters.begin();
             for (const auto& arg : arguments)
@@ -16780,7 +16816,12 @@ public:
                         || (arg.Primary && llvm::isa<llvm::Function>(arg.Primary))
                         || (arg.BaseType && arg.BaseType->isPointerTy())))
                 {
-                    result = 0;
+                    // `function<T>`, `function<T>*` and `function<T>[]` are three DISTINCT
+                    // overloads; a disagreeing shape may still bind but never scores perfect.
+                    result = (FunctionPointerShapeOf(arg.TypeAndValue, &arg)
+                           == FunctionPointerShapeOf(*candidateParamItr, nullptr)) ? 0 : 1;
+                    if (result != 0)
+                        shapeMismatches++;
                 }
                 else if (arg.TypeAndValue.TypeName != "")
                 {
@@ -16931,8 +16972,13 @@ public:
             if (promotionMatch || implicitMatch)
             {
                 int moveScore = ScoreMoveAgreement(arguments, candidate);
-                if (moveScore >= bestPossibleScore)   // >= keeps the pre-existing last-wins tie
+                // This tier ignores per-argument quality, so `pick(arr, 3)` picked by declaration
+                // position. Prefer agreeing shapes; equal counts fall through to the old rule.
+                if (shapeMismatches < bestPossibleShapeMismatches
+                    || (shapeMismatches == bestPossibleShapeMismatches
+                        && moveScore >= bestPossibleScore))   // >= keeps the pre-existing last-wins tie
                 {
+                    bestPossibleShapeMismatches = shapeMismatches;
                     bestPossibleScore = moveScore;
                     possibleResult = pair;
                 }
