@@ -6,11 +6,12 @@
 // in it. Before this, the join was never boxed at all and the compile died on a bare LLVM
 // module-verifier dump with no source location.
 //
-// SCOPE: only the DECLARATION-INITIALIZER and ASSIGNMENT spellings of '??' are covered here,
-// because only those two are wired to the boxing helper. `return p ?? q;` into an interface still
-// emits a raw verifier dump, and `take(z ?? b)` is still a false rejection - both are filed as
-// internal/issue/p1/nullcoalesce-join-not-boxed-on-return-and-call-arg.md. Do not read this file
-// as covering the return path.
+// SCOPE: the DECLARATION-INITIALIZER, ASSIGNMENT and RETURN spellings of '??' all reach the boxing
+// helper and all reject an unresolvable arm with this wording. The RETURN leg is the one that used
+// to die on the verifier dump. A separate BACKSTOP on the return path words itself "cannot convert
+// this expression to interface '<I>': its concrete class cannot be determined" - it names no
+// operator, because pointer arithmetic reaches it too - and the last leg in this file pins THAT
+// wording. The two substrings are disjoint, so each leg proves which of the two sites fired.
 
 interface IThing { int value(); };
 
@@ -39,6 +40,46 @@ expect_error("cannot convert '??' arm to interface 'IThing'") {
         IThing t = nullptr;
         t = &a ?? &b;
         return t.value();
+    }
+}
+
+// The RETURN spelling. Before this it never reached a diagnostic at all: the join was unboxed and
+// a raw 'ptr' hit the `ret`, so the compile died on an LLVM module-verifier dump with NO source
+// location and no way to tell which function was at fault.
+expect_error("cannot convert '??' arm to interface 'IThing'") {
+    IThing returnNullCoalesceAddressOfLocal()
+    {
+        Thing a; a.n = 1;
+        Thing b; b.n = 2;
+        return &a ?? &b;
+    }
+}
+
+// A '??' join whose only candidate takes the class BY VALUE. The join is a `Thing*` and cannot
+// bind to a `Thing` parameter, so this must stay a LOCATED rejection. An earlier cut stamped the
+// arms' CLASS name onto the argument; `TypeAndValue::IsTypeMatch` compares TypeName and ignores
+// Pointer, so the by-value parameter scored a PERFECT match and lowered a raw pointer into a
+// struct slot - "Call parameter type does not match function signature!", no source location.
+int byValThing(Thing t) { return t.n; }
+
+expect_error("no overload of 'byValThing' matches the given arguments") {
+    int passJoinByValue()
+    {
+        Thing* a = new Thing(); a->n = 1;
+        Thing* z = nullptr;
+        return byValThing(z ?? a);
+    }
+}
+
+// The RETURN BACKSTOP - the last-resort guard that stops a raw pointer reaching the module
+// verifier. Reachable by ANY nameless pointer expression, not just a join (pointer arithmetic
+// gets here), so its wording names no operator. It is deliberately DIFFERENT from the per-arm
+// helper's "cannot convert '??' arm ..." above, so a test pinning either wording proves which
+// site fired.
+expect_error("cannot convert this expression to interface 'IThing'") {
+    IThing returnPointerArithmetic(Thing* t)
+    {
+        return t + 0;
     }
 }
 

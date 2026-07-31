@@ -6220,18 +6220,19 @@ public:
                             && ReturnUpcastStructName(returnNV).empty())
                         {
                             std::string ternaryArmFailure;
+                            std::string joinSpelling = "?:";
                             bool ternaryArmNotOwned = false;
                             const std::string& ifaceName = compiler->currentFunctionReturnTypeName;
-                            if (auto* fat = UpcastTernaryPhiToInterface(
-                                    right, ifaceName, &ternaryArmFailure,
+                            if (auto* fat = UpcastPointerJoinToInterface(
+                                    right, ifaceName, &ternaryArmFailure, &joinSpelling,
                                     compiler->currentFunctionReturnsOwned, &ternaryArmNotOwned))
                                 right = fat;
                             else if (ternaryArmNotOwned)
                                 LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
                             else if (!ternaryArmFailure.empty())
                                 LogErrorContext(jump, std::format(
-                                    "cannot convert '?:' arm to interface '{}': {}",
-                                    ifaceName, ternaryArmFailure));
+                                    "cannot convert '{}' arm to interface '{}': {}",
+                                    joinSpelling, ifaceName, ternaryArmFailure));
                         }
 
                         // String ownership transfer (runtime-bit model). Classify the returned
@@ -6658,6 +6659,15 @@ public:
                             {
                                 // `return nullptr;` for an interface return -> null fat pointer.
                                 right = llvm::ConstantAggregateZero::get(fatTy);
+                            }
+                            else if (right->getType()->isPointerTy())
+                            {
+                                // Backstop against a raw pointer reaching the module verifier.
+                                // Any nameless pointer expression (`c + 0`) gets here, not just a join.
+                                LogErrorContext(jump, std::format(
+                                    "cannot convert this expression to interface '{}': its concrete "
+                                    "class cannot be determined; bind it to a local variable of the "
+                                    "class type first", ifaceName));
                             }
                         }
 
@@ -11296,7 +11306,9 @@ public:
      * join's resume block, so the fat phi inserted before it is still the block's leading phi.
      */
     llvm::Value* UpcastNullCoalesceToInterface(llvm::Value* right, const std::string& interfaceName,
-                                               std::string* armFailure = nullptr)
+                                               std::string* armFailure = nullptr,
+                                               bool transferArmOwnership = false,
+                                               bool* armNotOwned = nullptr)
     {
         auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(right);
         if (load == nullptr || interfaceName.empty() || !load->getType()->isPointerTy()) return nullptr;
@@ -11304,7 +11316,8 @@ public:
         if (join == nullptr) return nullptr;
         std::vector<InterfaceJoinArm> arms;
         for (const auto& arm : join->Arms) arms.push_back({ arm.Value, arm.Block });
-        return BoxInterfaceJoinArms(arms, load, load, interfaceName, armFailure, false, nullptr);
+        return BoxInterfaceJoinArms(arms, load, load, interfaceName, armFailure, transferArmOwnership,
+                                    armNotOwned);
     }
 
     /*
@@ -11312,22 +11325,116 @@ public:
      * when neither applies, leaving the caller's normal path untouched. `joinSpelling` (when given)
      * names the spelling that produced a failure, so the diagnostic blames the operator the source
      * actually wrote; it is left alone unless this call sets `armFailure`.
+     *
+     * `transferArmOwnership` / `armNotOwned` are threaded through to BOTH spellings unchanged: the
+     * `move`-interface RETURN path is the only caller that sets them, and a '??' return escapes the
+     * frame exactly as a '?:' return does, so hardcoding "no transfer" for one spelling would drop
+     * arm ownership on that half. At most ONE spelling can ever run (a PHINode is never a LoadInst),
+     * so the early return on `armNotOwned` guards nothing - it is only there to name the spelling
+     * for the caller's diagnostic, exactly like the `armFailure` return below it.
      */
     llvm::Value* UpcastPointerJoinToInterface(llvm::Value* right, const std::string& interfaceName,
                                               std::string* armFailure,
-                                              std::string* joinSpelling = nullptr)
+                                              std::string* joinSpelling = nullptr,
+                                              bool transferArmOwnership = false,
+                                              bool* armNotOwned = nullptr)
     {
-        if (auto* fat = UpcastTernaryPhiToInterface(right, interfaceName, armFailure))
+        if (auto* fat = UpcastTernaryPhiToInterface(right, interfaceName, armFailure,
+                                                   transferArmOwnership, armNotOwned))
             return fat;
+        if (armNotOwned != nullptr && *armNotOwned)
+        {
+            if (joinSpelling != nullptr) *joinSpelling = "?:";
+            return nullptr;
+        }
         if (armFailure != nullptr && !armFailure->empty())
         {
             if (joinSpelling != nullptr) *joinSpelling = "?:";
             return nullptr;
         }
-        auto* fat = UpcastNullCoalesceToInterface(right, interfaceName, armFailure);
-        if (fat == nullptr && joinSpelling != nullptr && armFailure != nullptr
-            && !armFailure->empty())
+        auto* fat = UpcastNullCoalesceToInterface(right, interfaceName, armFailure,
+                                                  transferArmOwnership, armNotOwned);
+        if (fat == nullptr && joinSpelling != nullptr
+            && ((armNotOwned != nullptr && *armNotOwned)
+                || (armFailure != nullptr && !armFailure->empty())))
             *joinSpelling = "??";
+        return fat;
+    }
+
+    /*
+     * A '??' join in ARGUMENT position. The join lowers through a SLOT, so its result is a plain
+     * load with no TypeName - and the overload scorer's interface clause needs one to score a class
+     * against an interface parameter, so `take(z ?? a)` was a false rejection before any boxing
+     * could run. The target interface is not known until overload selection, so resolve it HERE
+     * from the candidate parameters at this position: the one interface every arm's class
+     * implements. Then box per arm (each arm boxes in its own block with its own vtable, so
+     * mixed-class arms work) and hand the scorer a genuine INTERFACE argument.
+     *
+     * Deliberately NOT a bare TypeName stamp of the arms' class. `TypeAndValue::IsTypeMatch`
+     * compares TypeName and IGNORES Pointer, so stamping the CLASS made a by-value `f(Circle c)`
+     * parameter score a PERFECT match on a `Circle*` and lower a raw pointer into a struct slot -
+     * a module-verifier dump with no source location; and where an interface overload also existed,
+     * the by-value candidate displaced the very interface call this exists to enable. An
+     * interface-typed argument cannot match a by-value class parameter at all, which is correct.
+     *
+     * Returns nullptr - leaving the argument untouched, so the ordinary LOCATED "no overload
+     * matches" diagnostic stands - for every case it cannot prove: not a ledgered join, an arm
+     * whose class will not resolve, no interface parameter all arms implement, two candidates
+     * offering DIFFERENT interfaces here, or ANY candidate taking a POINTER of any kind at this
+     * position. That last bail was once narrowed to pointers-to-a-CLASS, which silently STOLE the
+     * call from `f(void*)`, `f(char*)` and `q(int*)` competitors - all working programs before -
+     * because boxing runs BEFORE the scorer and those parameters would have won it. The narrowing
+     * bought nothing: a `T*` parameter is no more the join's natural home than a `void*` one.
+     *
+     * NOT inverted to "bail unless EVERY candidate parameter here is an interface", which looks
+     * like the safer polarity and is not: `f(Circle c)` / `f(IShape s)` has a non-interface
+     * candidate, so the inversion would refuse to box and leave BOTH candidates unmatchable - the
+     * false rejection this whole helper exists to remove. A by-value class parameter cannot take a
+     * pointer at all, so there is nothing to steal there; a pointer parameter can, so there is.
+     */
+    llvm::Value* BoxNullCoalesceJoinArgument(
+        const std::vector<const LLVMBackend::TypeAndValue*>& paramsAtPosition,
+        llvm::Value* argValue, std::string& ifaceNameOut)
+    {
+        auto* compiler = compilerLLVM;
+        auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(argValue);
+        if (load == nullptr || !load->getType()->isPointerTy()) return nullptr;
+        const auto* join = compiler->FindNullCoalesceJoin(load);
+        if (join == nullptr) return nullptr;
+
+        // Every arm's concrete class, so "implements" can be asked of all of them at once.
+        std::vector<std::string> armClasses;
+        for (const auto& arm : join->Arms)
+        {
+            if (arm.Value == nullptr) return nullptr;
+            if (llvm::isa<llvm::ConstantPointerNull>(arm.Value)) continue;
+            std::string name = compiler->ResolvePointerElementTypeName(arm.Value);
+            if (name.empty() || !compiler->IsDataStructure(name)) return nullptr;
+            armClasses.push_back(name);
+        }
+        if (armClasses.empty()) return nullptr;
+
+        std::string target;
+        for (const auto* param : paramsAtPosition)
+        {
+            if (param == nullptr) continue;
+            // ANY pointer parameter can take the raw join and would win the call it is
+            // about to be pre-empted out of - void*, char*, int* included. Never box past one.
+            if (param->Pointer) return nullptr;
+            if (!param->IsInterface || param->TypeName.empty()) continue;
+            bool allImplement = true;
+            for (const auto& cls : armClasses)
+                if (!compiler->StructImplementsInterface(cls, param->TypeName)) allImplement = false;
+            if (!allImplement) continue;
+            if (!target.empty() && target != param->TypeName) return nullptr;
+            target = param->TypeName;
+        }
+        if (target.empty()) return nullptr;
+
+        std::string armFailure;
+        llvm::Value* fat = UpcastNullCoalesceToInterface(load, target, &armFailure);
+        if (fat == nullptr) return nullptr;
+        ifaceNameOut = target;
         return fat;
     }
 
@@ -21919,6 +22026,25 @@ public:
                                         argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
                                     }
 
+                                    // Same '??'-join recovery as the direct-call arg loop; here the
+                                    // method's own declared params ARE the candidate set.
+                                    if (argVar.TypeAndValue.TypeName.empty() && ifaceParams != nullptr
+                                        && declaredIdx[argIdx] >= 0
+                                        && declaredIdx[argIdx] < (int64_t)ifaceParams->size())
+                                    {
+                                        std::vector<const LLVMBackend::TypeAndValue*> paramsHere{
+                                            &(*ifaceParams)[declaredIdx[argIdx]] };
+                                        std::string joinIface;
+                                        if (auto* fat = BoxNullCoalesceJoinArgument(paramsHere, argValue, joinIface))
+                                        {
+                                            argVar.Primary = fat;
+                                            argVar.BaseType = fat->getType();
+                                            argVar.TypeAndValue.TypeName = joinIface;
+                                            argVar.TypeAndValue.IsInterface = true;
+                                            argVar.TypeAndValue.Pointer = false;
+                                        }
+                                    }
+
                                     extraArgs.emplace_back(argVar);
                                 }
                             }
@@ -22392,6 +22518,32 @@ public:
                                         && Compiler(ctx)->IsDataStructure(argNV.TypeAndValue.TypeName))
                                     {
                                         argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
+                                    }
+
+                                    // A '??' join has no TypeName for the scorer's interface clause.
+                                    // Resolve the target interface here, then box the join per arm.
+                                    if (argVar.TypeAndValue.TypeName.empty())
+                                    {
+                                        // Arity-filtered: a same-named overload of different arity
+                                        // is not a candidate here.
+                                        std::vector<const LLVMBackend::TypeAndValue*> paramsHere;
+                                        size_t wantParams = paramOffset + namedArgCtx.size();
+                                        auto ftIt = Compiler(ctx)->functionTable.find(functionName);
+                                        if (ftIt != Compiler(ctx)->functionTable.end())
+                                            for (const auto& cand : ftIt->second)
+                                                if (cand.Parameters.size() == wantParams
+                                                    && declaredIdx[argIdx] >= 0
+                                                    && declaredIdx[argIdx] < (int64_t)cand.Parameters.size())
+                                                    paramsHere.push_back(&cand.Parameters[declaredIdx[argIdx]]);
+                                        std::string joinIface;
+                                        if (auto* fat = BoxNullCoalesceJoinArgument(paramsHere, argValue, joinIface))
+                                        {
+                                            argVar.Primary = fat;
+                                            argVar.BaseType = fat->getType();
+                                            argVar.TypeAndValue.TypeName = joinIface;
+                                            argVar.TypeAndValue.IsInterface = true;
+                                            argVar.TypeAndValue.Pointer = false;
+                                        }
                                     }
 
                                     // Propagate function-pointer type for lambda arguments

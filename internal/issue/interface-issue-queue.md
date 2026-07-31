@@ -138,8 +138,8 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 12 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 30 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 11 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 32 |
 | **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 24 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
@@ -148,7 +148,6 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | Issue | Severity |
 |---|---|
 | [[interface-boxing-keyed-on-source-binding]] | NARROWED 2026-07-31: the two binding erasures (parens, `??`) and the two un-routed boxing sites are closed. What remains is `delete` of a BORROWED interface box (exit 139/133, no diagnostic) - a different root, reachable with no join at all. |
-| [[nullcoalesce-join-not-boxed-on-return-and-call-arg]] | Module-verifier dump with NO source location for `return p ?? q;` into an interface; the call-argument spelling is a false rejection. Residue of the fix that closed the decl-init and assignment spellings. Filed 2026-07-31. |
 | [[ftell-fseek-long-width-on-windows]] | Silent wrong value on Windows: core binds C `long` as pointer-sized, so `ftell`/`fseek` read garbage under LLP64. Not a UI issue despite being Windows-only. |
 | [[interface-method-call-on-null-value-segfaults]] | SIGSEGV (139), no guard. Fires on a PLAIN non-generic interface too. Pre-existing and language-wide. |
 | [[data-pointer-into-thin-function-param-segfaults]] | Silent miscompile then SIGSEGV (exit 139), no diagnostic. A data pointer bitcasts straight into a THIN `function<>` parameter and is called. Deliberate residue of `ce9858e` - that fix gated only the FAT (`Lambda<>`) parameter arm. Filed 2026-07-31. |
@@ -164,6 +163,8 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[chained-nullcoalesce-not-boxed-into-interface]] | false rejection | `take(z ?? y ?? a)` and `IShape j = z ?? y ?? a;` do not compile - the outer join's arm is the inner join's LOAD, which names no class. Spans EVERY position that boxes a `??` (decl-init, assignment, return, argument), so it predates the return/argument work. Fix at the ledger by splicing a nested join's arms. Filed 2026-07-31. |
+| [[pointer-arg-binds-by-value-class-param]] | miscompile | `byVal(a)` with a `Circle*` and a by-value `Circle` parameter scores a PERFECT match and lowers a raw pointer into a struct slot - module-verifier dump, NO source location, exit 1. `IsTypeMatch` compares TypeName and ignores `Pointer`; the sibling `IsTypePromotion` does gate on it. PRE-EXISTING and language-wide, no join involved. Scorer change - wide blast radius, wants the corpus sweep. Filed 2026-07-31. |
 | [[generic-wrapper-over-function-type-llvm-fatal]] | feature gap | `Box<function<int(int)>>` raises LLVM fatal `Cannot select: AArch64ISD::CALL` (exit 134) when the substituted field is INVOKED. Store-only may be fine - check that first. Borderline P1 (dies with no usable diagnostic); filed P2 because nothing lies to you. Filed 2026-07-31. |
 | [[auto-binding-of-fixed-array-loses-shape]] | feature gap | RESTORED and narrowed, re-ranked P1 -> P2. The non-pointer half is fixed; `auto v = <T*[N]>` now REJECTS because `T*[]` collapses to `T[]` in both parser copies. Representation is free - no new field needed. |
 | [[char-array-from-string-literal-has-no-spelling]] | feature gap | `char[N] b = "literal";` now has a clear diagnostic and three suggested spellings, but no direct replacement for the C idiom. Master miscompiled it silently. |
@@ -785,11 +786,126 @@ owning value through parentheses. The move consequence above was found by hand-w
 against the base binary, not by the sweep, and a future change to this path needs the same
 treatment.
 
-**Still unfixed, filed rather than closed**:
-[[nullcoalesce-join-not-boxed-on-return-and-call-arg]]. Only the DECL-INIT and ASSIGNMENT
-spellings of `??` were wired to the new helper; `return p ?? q;` still emits a raw
-`Function return type does not match operand type of return inst!` on base, master and branch, and
-`take(z ?? b)` is still a false rejection.
+**Filed rather than closed at the time, and FIXED since** - see the `fix/iface-join-return-boxing`
+record below. Only the DECL-INIT and ASSIGNMENT spellings of `??` were wired to the new helper
+here; `return p ?? q;` emitted a raw `Function return type does not match operand type of return
+inst!` and `take(z ?? b)` was a false rejection. Both now work for a SINGLE `??`, mixed-class arms included.
+A CHAINED `a ?? b ?? c` still does not box in any position - filed as
+[[chained-nullcoalesce-not-boxed-into-interface]], and note it never worked in the decl-init
+position either, so it is not a residue of the return/argument work.
+
+### `fix/iface-join-return-boxing` - `??` joins in RETURN and CALL-ARGUMENT position
+
+Closes the P1 residue of `d1935a2`. Two different mechanisms, because the two positions differ in
+what they know and when.
+
+**RETURN - reroute, plus ownership threaded through.** The return site called
+`UpcastTernaryPhiToInterface`, which only matches a PHI; a `??` result is a LoadInst, so nothing
+boxed and a raw `ptr` reached the `ret`. It now calls the `UpcastPointerJoinToInterface` wrapper,
+which tries both spellings. **The trap that had to be avoided:** the wrapper and
+`UpcastNullCoalesceToInterface` took no `transferArmOwnership` / `armNotOwned` parameters and the
+`??` half hardcoded `false, nullptr`, while the return site passes real ownership handling
+(`currentFunctionReturnsOwned`) because a `move`-interface return ESCAPES THE FRAME. Swapping the
+call without threading those through would have silently dropped arm ownership for the `?:` leg
+that already worked - a regression indistinguishable from a successful fix. Both parameters are now
+threaded, and an `armNotOwned` verdict from the `?:` attempt is FINAL (the `??` attempt must not
+run and overwrite it). `Test/test_move.cb`'s `iface_ternary_move_return_*` legs pin the `?:`
+behaviour: measured, dropping the transfer takes `..._untaken_arm_freed` from 1 to 2 and then
+aborts 134 freeing the taken arm twice.
+
+A BACKSTOP was added at the end of the interface-return branch chain: a pointer operand that no
+branch could box now raises a LOCATED `cannot convert this expression to interface '<I>': its
+concrete class cannot be determined` instead of falling through to the module verifier. **It was
+first shipped claiming to be unreachable, and worded as if only a join could reach it; review
+disproved both** with `IShape g(Circle* c) { return c + 0; }` - pointer arithmetic, no join
+anywhere, and the message said "the join's arms could not be recovered". The wording is now
+generic and names no operator. It stays deliberately DIFFERENT from the per-arm helper's
+`cannot convert '??' ARM to interface '<I>': the arm's concrete class cannot be determined`, so a
+test pinning either wording proves which site fired;
+`Test/errors/err_nullcoalesce_iface_arm_unresolved.cb` pins both (the return-join leg on the ARM
+wording, the `c + 0` leg on the backstop's).
+
+**CALL ARGUMENT - resolve the target interface locally, then BOX. Do not stamp a class name.**
+The issue file's prescription ("route both sites through `UpcastPointerJoinToInterface`") is WRONG
+for this half, and this is worth recording: **there is no upcast site to reroute.**
+`take(z ?? a)` fails at SCORING - `ComputeOverloadFunction`'s interface clause requires
+`StructImplementsInterface(arg.TypeName, ...)` and a join carries no TypeName, so "no overload
+matches" fires before any boxing could run. There is also a chicken-and-egg: the target interface
+is not known until after overload selection.
+
+The resolution is to answer the chicken-and-egg locally. `BoxNullCoalesceJoinArgument`
+(`MainListener.h`) reads the arms out of the join ledger, looks at the ARITY-FILTERED candidate
+parameters at THIS argument position, takes the one interface every arm's class implements, and
+boxes the join per arm through `UpcastNullCoalesceToInterface`. The argument handed to the scorer
+is then a genuine INTERFACE value. `ComputeOverloadFunction` and `CreateOverloadedFunctionCall`'s
+argument arms are untouched, which was a hard constraint (a concurrent branch owns that file).
+
+**Do not retry the bare TypeName stamp.** The first cut stamped the arms' shared CLASS name (plus
+`Pointer`) onto the argument and let the existing scorer clause and existing lowering do the rest.
+It looked minimal and it passed the whole suite. It is wrong, because
+`TypeAndValue::IsTypeMatch` compares `TypeName` and IGNORES `Pointer`
+(`LLVMBackend.h:624`; the sibling `IsTypePromotion` twenty lines below DOES gate on it). So:
+
+- `int byVal(Circle c); byVal(z ?? a);` - the by-value parameter scored a PERFECT match on a
+  `Circle*` and lowered a raw pointer into a struct slot: `Call parameter type does not match
+  function signature!`, NO source location. Master rejects the same call with a located
+  diagnostic, so the stamp turned a clean rejection into a verifier dump.
+- With BOTH `int f(Circle c)` and `int f(IShape s)` present, the by-value candidate WON - the
+  stamp displaced the very interface call it existed to enable.
+
+Boxing has neither failure: an interface-typed argument cannot match a by-value class parameter at
+all, so the interface candidate wins on its own merits. The underlying `IsTypeMatch` hole is
+PRE-EXISTING and reachable with no join at all (`Circle* a; byVal(a);` dumps identically on
+master); it is filed separately as [[pointer-arg-binds-by-value-class-param]] and is NOT this
+change's to fix.
+
+**What the boxing refuses to do**, so it can only ever help: it bails - leaving the argument
+untouched so the ordinary LOCATED diagnostic stands - when the value is not a ledgered join, when
+an arm's class will not resolve, when no candidate offers an interface all arms implement, when
+two candidates offer DIFFERENT interfaces here, or when ANY candidate takes a POINTER OF ANY KIND
+at this position.
+
+That last bail shipped NARROWED to pointers-to-a-CLASS (`param->Pointer &&
+IsDataStructure(param->TypeName)`) and review found it silently STEALING the call: with
+`f(void* p)` / `f(IShape s)` the branch ran the interface overload (10) where master ran the
+pointer one (500), and likewise for `char*` (400) and `int*` (401). All three were working
+programs, and neither binary emitted any diagnostic - boxing happens BEFORE the scorer, so the
+pre-empted candidate never gets to win. **The whole-corpus differential `--check` could not see
+it** (493 files, only the two intended test files differed), and neither could the leg written to
+guard the bail: it used a `CiMove*` competitor, the one pointer shape the narrowed predicate DID
+cover, so it was aimed at the wrong half of its own predicate. The bail is now plain
+`param->Pointer`, and there are four legs - class / `void*` / `char*` / `int*`.
+
+The reviewer's suggested INVERSION ("bail unless every candidate parameter here is an interface")
+was evaluated and REJECTED: `f(Circle c)` / `f(IShape s)` has a non-interface candidate, so the
+inversion refuses to box and leaves both candidates unmatchable - reinstating the exact false
+rejection this helper exists to remove. The asymmetry is real, not a compromise: a by-value class
+parameter cannot accept a pointer at all, so there is nothing there to steal; a pointer parameter
+can, so there is.
+
+The arity filter matters too - without it the stdlib's unrelated 2-parameter
+`take(list<string>*, int)` overload contributed a pointer parameter to a 1-argument call's
+candidate set and suppressed the fix entirely.
+
+Applied in BOTH MainListener argument loops. The second (virtual dispatch through
+`CallInterfaceMethod`) was not in the issue file at all: `ib.run(z ?? a)` died as
+`GetOrCreateVTable: '' does not implement 'IShape::area'` on the pre-fix binary AND on master.
+Same root; found by enumerating the spelling axis rather than from the repro. There the interface
+method's own declared parameters ARE the candidate set, so the resolution is exact.
+
+Because boxing is per arm and each arm carries its own vtable, MIXED-class arms work in argument
+position too - the residue the stamp version had to file as a separate issue does not exist.
+
+**Not closed**: a CHAINED `a ?? b ?? c`, in ANY position. The outer join's arm is the inner
+join's LOAD, which names no class, so both consumers bail - inertly and correctly, but nothing
+flattens the chain. Filed as [[chained-nullcoalesce-not-boxed-into-interface]].
+
+**Verification** (macOS arm64, Release): `./test.sh Release` 554 / 0 / 8; `example_mac.sh` 35 / 0;
+`Test/test_move.cb` 516 / 516 (was 497). Every new leg asserts a VALUE, not a compile - the ledger
+keys on load IDENTITY, so an intermediate spill makes the lookup miss and the fix silently not
+engage, and the pre-fix failure and the did-not-engage failure are BOTH exit 1. `test_move.cb`
+does not compile on the pre-fix binary (`(2066,4): ... returned expression is not owned`), which
+is the non-vacuity proof for the block as a whole.
 
 ### `2bcc5a0` - the return dangle, on the fourth attempt
 

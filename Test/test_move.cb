@@ -2043,6 +2043,41 @@ class Circle : IDrawableBase
  * struct (invalid IR). Each arm is now boxed inside its own branch, so arms with different
  * concrete classes work too - and only the taken arm allocates.
  */
+// RETURN and CALL-ARGUMENT position for an interface-bound pointer JOIN - the two spellings the
+// decl-init/assignment fix did not reach. The two 'move' returns pin arm ownership (see the legs).
+IShapeMove pickJoinNC(CiMove* p, CiMove* q) { return p ?? q; }
+IShapeMove pickJoinMixed(CiMove* p, SqMove* q) { return p ?? q; }
+int takeJoinIface(IShapeMove s) { return s.area(); }
+
+interface IJoinRunner { int run(IShapeMove s); };
+class JoinRunner : IJoinRunner { int run(IShapeMove s) { return s.area(); } };
+
+// Overload pairs that pin WHICH candidate a '??' join argument binds to. See the legs.
+int joinOverload(CiMove c) { return 1000 + c.r; }
+int joinOverload(IShapeMove s) { return s.area(); }
+int joinPtrPref(CiMove* c) { return 7000 + c->r; }
+int joinPtrPref(IShapeMove s) { return s.area(); }
+int joinVoidPref(void* p) { return 500; }
+int joinVoidPref(IShapeMove s) { return s.area(); }
+int joinCharPref(char* p) { return 400; }
+int joinCharPref(IShapeMove s) { return s.area(); }
+int joinIntPref(int* p) { return 401; }
+int joinIntPref(IShapeMove s) { return s.area(); }
+
+move IShapeMove ownJoinTernary(bool c)
+{
+    unique CiMove* p = new CiMove(); p->r = 1;
+    unique CiMove* q = new CiMove(); q->r = 20;
+    return c ? p : q;
+}
+
+move IShapeMove ownJoinNC()
+{
+    unique CiMove* p = new CiMove(); p->r = 2;
+    unique CiMove* q = new CiMove(); q->r = 30;
+    return p ?? q;
+}
+
 int testUniqueInterfaceTernary()
 {
     int passed = 0;
@@ -2350,6 +2385,95 @@ int testUniqueInterfaceTernary()
         delete ncA;
         delete ncB;
     }
+
+    /*
+     * The same '??' join in RETURN and CALL-ARGUMENT position - both unfixed when the decl-init
+     * half landed. The return reached the module verifier with no source location; the argument
+     * was a false rejection ("no overload of 'takeJoinIface' matches"), because a join carries no
+     * TypeName for the scorer's interface clause to score. Each pair selects a DIFFERENT arm and
+     * the arms carry different areas, so no leg can pass off the other arm's box. A compile-only
+     * check would be VACUOUS here: the pre-fix failure and a fix that does not engage (the ledger
+     * keys on load identity, so any intermediate spill silently misses) are both exit 1.
+     */
+    {
+        CiMove* rA = new CiMove(); rA->r = 2;
+        CiMove* rB = new CiMove(); rB->r = 30;
+        CiMove* rNull = nullptr;
+        passed += Test("iface_nullcoalesce_return_right_arm", pickJoinNC(rNull, rB).area(), 37);
+        passed += Test("iface_nullcoalesce_return_left_arm", pickJoinNC(rA, rB).area(), 9);
+        passed += Test("iface_nullcoalesce_arg_right_arm", takeJoinIface(rNull ?? rB), 37);
+        passed += Test("iface_nullcoalesce_arg_left_arm", takeJoinIface(rA ?? rB), 9);
+        delete rA;
+        delete rB;
+    }
+
+    /*
+     * Arms of DIFFERENT concrete classes through the same RETURN (each arm is boxed in its own
+     * block, so each gets its own vtable - the two legs carry different areas to pin that), and a
+     * '??' argument to a VIRTUALLY DISPATCHED method. The latter boxes off TypeName as well, so an
+     * empty one used to reach GetOrCreateVTable as "'' does not implement 'IShapeMove::area'" -
+     * that spelling failed identically on the pre-fix binary and on master.
+     */
+    {
+        CiMove* mA = new CiMove(); mA->r = 2;
+        SqMove* mB = new SqMove(); mB->s = 6;
+        CiMove* mNull = nullptr;
+        passed += Test("iface_nullcoalesce_return_mixed_right", pickJoinMixed(mNull, mB).area(), 36);
+        passed += Test("iface_nullcoalesce_return_mixed_left", pickJoinMixed(mA, mB).area(), 9);
+        IJoinRunner runner = new JoinRunner();
+        passed += Test("iface_nullcoalesce_arg_virtual_dispatch", runner.run(mNull ?? mA), 9);
+        // MIXED-class arms in ARGUMENT position: the target interface is resolved from the
+        // candidate set and each arm boxes with its OWN vtable, so the arms need not agree.
+        passed += Test("iface_nullcoalesce_arg_mixed_class", takeJoinIface(mNull ?? mB), 36);
+
+        /*
+         * WHICH candidate a '??' join argument binds to. The join is a `CiMove*`.
+         * - Against `joinOverload(CiMove)` / `joinOverload(IShapeMove)` the INTERFACE candidate
+         *   must win: a pointer cannot bind a by-value class parameter. An earlier cut stamped
+         *   the arms' CLASS name instead of boxing, and because IsTypeMatch ignores Pointer the
+         *   BY-VALUE candidate scored perfect and won - lowering a raw pointer into a struct slot
+         *   (verifier dump, no location). 9 is the interface answer; 1002 would be by-value.
+         * - Against a POINTER competitor the POINTER candidate must win: boxing runs BEFORE the
+         *   scorer, so pre-empting one silently runs a DIFFERENT FUNCTION with no diagnostic on
+         *   either side. All FOUR pointer spellings are covered on purpose - the bail was once
+         *   narrowed to pointers-to-a-CLASS, which left `void*` / `char*` / `int*` competitors
+         *   stolen (each returned the interface's 9 instead of its own value) while the CiMove*
+         *   leg below still passed, so that leg alone is structurally blind to the defect.
+         */
+        passed += Test("iface_nullcoalesce_arg_interface_beats_byvalue", joinOverload(mNull ?? mA), 9);
+        passed += Test("iface_nullcoalesce_arg_class_ptr_preferred", joinPtrPref(mNull ?? mA), 7002);
+        passed += Test("iface_nullcoalesce_arg_void_ptr_preferred", joinVoidPref(mNull ?? mA), 500);
+        passed += Test("iface_nullcoalesce_arg_char_ptr_preferred", joinCharPref(mNull ?? mA), 400);
+        passed += Test("iface_nullcoalesce_arg_int_ptr_preferred", joinIntPref(mNull ?? mA), 401);
+        delete mA;
+        delete mB;
+    }
+
+    /*
+     * OWNERSHIP PIN for a 'move <interface>' RETURN of a join. The box ESCAPES the frame, so the
+     * TAKEN arm's owning local is nulled inside its own arm block while the untaken arm still runs
+     * its ordinary scope-exit free - hence exactly one destructor before the caller's scope ends
+     * and two after. Drop that transfer (pass transferArmOwnership=false at the return site) and
+     * both locals free at function exit: the '..._untaken_arm_freed' leg reads 2 and the process
+     * then aborts 134 freeing the taken arm twice - measured. The '?:' leg pins the behaviour that
+     * already worked; the '??' leg is new (it was a false "returned expression is not owned"
+     * rejection before this join was boxed here).
+     */
+    dtorCount = 0;
+    {
+        unique IShapeMove k = ownJoinTernary(identityBool(true));
+        passed += Test("iface_ternary_move_return_area", k.area(), 8);
+        passed += Test("iface_ternary_move_return_untaken_arm_freed", dtorCount, 1);
+    }
+    passed += Test("iface_ternary_move_return_freed_once", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        unique IShapeMove k = ownJoinNC();
+        passed += Test("iface_nullcoalesce_move_return_area", k.area(), 9);
+        passed += Test("iface_nullcoalesce_move_return_untaken_arm_freed", dtorCount, 1);
+    }
+    passed += Test("iface_nullcoalesce_move_return_freed_once", dtorCount, 2);
 
     return passed;
 }
@@ -3534,7 +3658,7 @@ extern int main()
     total += 8;
 
     passed += testUniqueInterfaceTernary();
-    total += 79;
+    total += 98;
 
     passed += testTernaryInterfaceInheritanceRebox();
     total += 22;
