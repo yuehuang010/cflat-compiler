@@ -16484,9 +16484,21 @@ public:
     {
         if (typeAndValue.IsFunctionPointer)
         {
-            if (typeAndValue.IsThinFnPtr())
-                return BuildThinFnPtrType(typeAndValue);
-            return GetClosureFatPtrType();
+            llvm::Type* fnPtrType = typeAndValue.IsThinFnPtr()
+                ? BuildThinFnPtrType(typeAndValue)
+                : GetClosureFatPtrType();
+            // A 'function<T>[N]' (or 'Lambda<T>[N]') array needs the same outer array wrap
+            // every other type gets; the bare scalar type under-sizes the alloca.
+            uint64_t fnOuterDim = typeAndValue.ConstArraySize;
+            if (fnOuterDim > 0)
+            {
+                llvm::Type* inner = fnPtrType;
+                const auto& fnInnerDims = typeAndValue.ConstInnerDimensions;
+                for (int i = (int)fnInnerDims.size() - 1; i >= 0; i--)
+                    inner = llvm::ArrayType::get(inner, fnInnerDims[i]);
+                return llvm::ArrayType::get(inner, fnOuterDim);
+            }
+            return fnPtrType;
         }
 
         llvm::Type* type = nullptr;

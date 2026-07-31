@@ -1196,6 +1196,119 @@ bool testDispatchTable()
     return result;
 }
 
+// A fixed-size array of thin `function<T>` values. Regression for a miscompile where
+// `GetType()` returned the bare scalar function-pointer type for `function<T>[N]`,
+// ignoring ConstArraySize; the alloca was under-sized and invoking two or more elements
+// corrupted the block, silently truncating the rest of the enclosing function body.
+// Takes the array as a 'function<T>[]' array-view so the subscript has to be honoured
+// on the callee side; a dropped subscript would return n copies of fns[0].
+int applyAllFuncPtrs(function<int(int)>[] fns, int n, int v)
+{
+    int sum = 0;
+    for (int i = 0; i < n; i++)
+        sum += fns[i](v);
+    return sum;
+}
+
+// A scalar 'function<T>*' out-parameter: the declarator's '*' must survive
+// ParseDeclarationSpecifiers, or the store-through writes the wrong location.
+void selectFuncPtr(function<int(int)>* slot, int which)
+{
+    if (which == 0) *slot = doubleIt;
+    else            *slot = square;
+}
+
+bool testFuncPtrArray()
+{
+    bool result = true;
+
+    function<int(int)>[3] fns;
+    fns[0] = doubleIt;
+    fns[1] = square;
+    fns[2] = negate;
+
+    result &= Test("func ptr array[0](5)", fns[0](5), 10);
+    result &= Test("func ptr array[1](5)", fns[1](5), 25);
+    result &= Test("func ptr array[2](5)", fns[2](5), -5);
+
+    int sum = fns[0](2) + fns[1](2) + fns[2](2);
+    result &= Test("func ptr array sum of all elements", sum, 4 + 4 - 2);
+
+    // A 'function<T>[]' array-view parameter must GEP by the subscript, not drop it.
+    result &= Test("func ptr array view param", applyAllFuncPtrs(fns, 3, 3), 6 + 9 - 3);
+
+    // 'function<T>*' out-parameter: the callee writes back through the pointer.
+    function<int(int)> slot = negate;
+    selectFuncPtr(&slot, 0);
+    result &= Test("func ptr out-param writes doubleIt", slot(5), 10);
+    selectFuncPtr(&slot, 1);
+    result &= Test("func ptr out-param writes square", slot(5), 25);
+
+    return result;
+}
+
+// The 'using Cb = function<R(Args)>' alias spelling goes through a different
+// ParseDeclarationSpecifiers branch, which must capture '[N]' the same way.
+using IntFnPtr = function<int(int)>;
+
+bool testFuncPtrAliasArray()
+{
+    bool result = true;
+
+    IntFnPtr[3] arr;
+    arr[0] = doubleIt;
+    arr[1] = square;
+    arr[2] = negate;
+
+    result &= Test("alias func ptr array[0](3)", arr[0](3), 6);
+    result &= Test("alias func ptr array[1](3)", arr[1](3), 9);
+    result &= Test("alias func ptr array[2](3)", arr[2](3), -3);
+
+    int sum = arr[0](2) + arr[1](2) + arr[2](2);
+    result &= Test("alias func ptr array sum of all elements", sum, 4 + 4 - 2);
+
+    // An alias array must also survive being passed as a 'function<T>[]' view.
+    result &= Test("alias func ptr array view param", applyAllFuncPtrs(arr, 3, 3), 6 + 9 - 3);
+
+    // Multi-dimensional through the alias spelling.
+    IntFnPtr[2][3] grid;
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 3; j++)
+            grid[i][j] = doubleIt;
+    grid[1][2] = square;
+    result &= Test("alias func ptr array 2d [1][2](3)", grid[1][2](3), 9);
+    result &= Test("alias func ptr array 2d [0][0](3)", grid[0][0](3), 6);
+
+    return result;
+}
+
+// Multi-dimensional 'function<T>[N][M]': every dimension after the first must survive
+// ParseDeclarationSpecifiers, or the storage is under-sized and writes smash the stack.
+bool testFuncPtrArray2D()
+{
+    bool result = true;
+
+    function<int(int)>[2][3] grid;
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 3; j++)
+            grid[i][j] = doubleIt;
+    grid[1][2] = negate;
+    grid[0][1] = square;
+
+    result &= Test("func ptr array 2d [0][0](5)", grid[0][0](5), 10);
+    result &= Test("func ptr array 2d [0][1](5)", grid[0][1](5), 25);
+    result &= Test("func ptr array 2d [1][2](5)", grid[1][2](5), -5);
+    result &= Test("func ptr array 2d last row untouched", grid[1][0](5), 10);
+
+    int sum = 0;
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 3; j++)
+            sum += grid[i][j](2);
+    result &= Test("func ptr array 2d sum of all 6 elements", sum, 4 + 4 + 4 + 4 + 4 - 2);
+
+    return result;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LIST SORT TESTS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1773,6 +1886,11 @@ extern int main()
 
     // Dispatch table tests
     total++; passed += testDispatchTable()             ? 1 : 0;
+
+    // Fixed-size array of function<T> values (multiple element invokes)
+    total++; passed += testFuncPtrArray()               ? 1 : 0;
+    total++; passed += testFuncPtrArray2D()             ? 1 : 0;
+    total++; passed += testFuncPtrAliasArray()          ? 1 : 0;
 
     // 'move' in function pointer signatures
     total++; passed += testFuncPtrMoveSignature()      ? 1 : 0;

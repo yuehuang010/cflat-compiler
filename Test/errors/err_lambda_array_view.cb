@@ -1,0 +1,26 @@
+// A 'T[]' array-view is a thin 'ptr' representation, so only a thin `function<T>`
+// can take one. A `Lambda<T>` is a fat closure (a by-value struct), so subscripting
+// an array-view of them GEPs a struct through a pointer and the module fails LLVM
+// verification. Reject it up front; 'Lambda<T>[N]' (a fixed-size array) works.
+import "function.cb";
+
+expect_error("array-view '[]' is not supported on closure type 'Lambda<int(int)>'") {
+    int sumClosureView(Lambda<int(int)>[] fns, int n, int v)
+    {
+        int sum = 0;
+        for (int i = 0; i < n; i++)
+            sum += fns[i](v);
+        return sum;
+    }
+}
+
+// A closure/function-pointer field does not own an allocation, so 'unique' on one is
+// rejected rather than silently laying the field out by value and freeing a code address.
+expect_error("'unique' on field 'FH.p': a function pointer or closure does not own an allocation") {
+    struct FH { unique Lambda<int(int)>* p = nullptr; };
+}
+
+extern int main()
+{
+    return 0;
+}

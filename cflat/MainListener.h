@@ -1279,6 +1279,23 @@ private:
                             }
                         }
                         // For bare 'function', signature inferred from initializer at declaration site
+                        // This branch breaks out of the specifier loop, so nothing else consumes a
+                        // trailing '[N]' or '*'; capture both here (as the alias branch below does).
+                        declType.Pointer = declSpec->pointer() != nullptr;
+                        if (auto* fpDimSpec = ArrayDimsOf(declSpec))
+                        {
+                            auto fpDims = fpDimSpec->assignmentExpression();
+                            declType.ArraySize = fpDims.empty() ? nullptr : fpDims[0];
+                            for (size_t di = 1; di < fpDims.size(); di++)
+                                declType.ExtraArrayDims.push_back(fpDims[di]);
+                            // '[]' array-view is a thin 'ptr' repr, so only a thin function
+                            // pointer can take it; the main pass reports the fat-closure case.
+                            if (fpDims.empty() && declType.IsThinFnPtr())
+                            {
+                                declType.IsArrayView = true;
+                                declType.Pointer = true;
+                            }
+                        }
                         break;
                     }
                     // simd<T,N> builtin vector type. Record fields best-effort; the main pass reports
@@ -1357,6 +1374,20 @@ private:
                     declType.FuncPtrReturnPointer  = fit->second.FuncPtrReturnPointer;
                     declType.FuncPtrParams         = fit->second.FuncPtrParams;
                     declType.Pointer               = declSpec->pointer() != nullptr;
+                    // Like the functionPointerSpecifier branch, this one breaks out of the
+                    // specifier loop, so a trailing '[N]' has to be captured right here.
+                    if (auto* fpDimSpec = ArrayDimsOf(declSpec))
+                    {
+                        auto fpDims = fpDimSpec->assignmentExpression();
+                        declType.ArraySize = fpDims.empty() ? nullptr : fpDims[0];
+                        for (size_t di = 1; di < fpDims.size(); di++)
+                            declType.ExtraArrayDims.push_back(fpDims[di]);
+                        if (fpDims.empty() && declType.IsThinFnPtr())
+                        {
+                            declType.IsArrayView = true;
+                            declType.Pointer = true;
+                        }
+                    }
                     break;
                 }
                 else
@@ -3735,6 +3766,28 @@ private:
                         }
                     }
                     // For bare 'function', signature inferred from initializer at declaration site
+                    // This branch breaks out of the specifier loop, so nothing else consumes a
+                    // trailing '[N]' or '*'; capture both here (as the alias branch below does).
+                    declType.Pointer = declSpec->pointer() != nullptr;
+                    if (auto* fpDimSpec = ArrayDimsOf(declSpec))
+                    {
+                        auto fpDims = fpDimSpec->assignmentExpression();
+                        declType.ArraySize = fpDims.empty() ? nullptr : fpDims[0];
+                        for (size_t di = 1; di < fpDims.size(); di++)
+                            declType.ExtraArrayDims.push_back(fpDims[di]);
+                        if (fpDims.empty())
+                        {
+                            // '[]' array-view is a thin 'ptr' repr, so a fat closure - which is
+                            // a struct by value - cannot be viewed this way.
+                            if (!declType.IsThinFnPtr())
+                                LogErrorContext(declSpec, std::format(
+                                    "array-view '[]' is not supported on closure type '{}'; "
+                                    "use a fixed size '{}[N]' instead",
+                                    typeSpec->getText(), typeSpec->getText()));
+                            declType.IsArrayView = true;
+                            declType.Pointer = true;
+                        }
+                    }
                     break;
                 }
                 // simd<T,N> builtin vector type (not a generic): record element type + lane count.
@@ -3816,6 +3869,25 @@ private:
                     declType.FuncPtrReturnPointer  = fit->second.FuncPtrReturnPointer;
                     declType.FuncPtrParams         = fit->second.FuncPtrParams;
                     declType.Pointer               = declSpec->pointer() != nullptr;
+                    // Like the functionPointerSpecifier branch, this one breaks out of the
+                    // specifier loop, so a trailing '[N]' has to be captured right here.
+                    if (auto* fpDimSpec = ArrayDimsOf(declSpec))
+                    {
+                        auto fpDims = fpDimSpec->assignmentExpression();
+                        declType.ArraySize = fpDims.empty() ? nullptr : fpDims[0];
+                        for (size_t di = 1; di < fpDims.size(); di++)
+                            declType.ExtraArrayDims.push_back(fpDims[di]);
+                        if (fpDims.empty())
+                        {
+                            if (!declType.IsThinFnPtr())
+                                LogErrorContext(declSpec, std::format(
+                                    "array-view '[]' is not supported on closure type '{}'; "
+                                    "use a fixed size '{}[N]' instead",
+                                    typeSpec->getText(), typeSpec->getText()));
+                            declType.IsArrayView = true;
+                            declType.Pointer = true;
+                        }
+                    }
                     break;
                 }
                 else
@@ -8406,6 +8478,8 @@ public:
             LogErrorContext(ctx, "'unique' on " + field + ": simd is not a pointer type");
         if (f.IsBitfield)
             LogErrorContext(ctx, "'unique' on " + field + ": a bitfield is not a pointer type");
+        if (f.IsFunctionPointer)
+            LogErrorContext(ctx, "'unique' on " + field + ": a function pointer or closure does not own an allocation");
         // A boxed interface VALUE is a {i8*,i8*} fat pointer, not a single-indirection pointer, but
         // the synthesized destructor releases it through the vtable dtor slot - so allow it.
         bool ifaceValue = f.IsFatInterfaceValue() && !f.ElemPointer;
