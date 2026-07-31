@@ -1,0 +1,7 @@
+// `T[N] b = a;` is a memcpy of the extent. When T owns a resource both arrays would
+// destruct the same resource element-wise, so the copy is rejected instead.
+import "string.cb";
+struct Owner { string s = default; };
+expect_error("owns a resource, so a bitwise copy would let both arrays destruct it") {
+    void f() { Owner[2] a; Owner[2] b = a; b[0].s = "x"; }
+}

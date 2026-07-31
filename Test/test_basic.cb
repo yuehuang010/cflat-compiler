@@ -2383,6 +2383,10 @@ int sumFixedBuf(i8* buf, int len)
     return sum;
 }
 
+// Plain value struct used by the fixed-array copy legs below (declared here so it
+// precedes its first use in testFixedArrays).
+struct CopyCell { int x = 0; int y = 0; };
+
 // Global (file-scope) fixed-size arrays. Regression: indexing a global array
 // folded the all-zero element GEP (e.g. gFixedArr[0]) back onto the GlobalVariable
 // symbol, so the read loaded the whole [N x T] aggregate and module verification
@@ -2516,6 +2520,73 @@ bool testFixedArrays()
     int gpval = 99;
     gPtrArr[0] = &gpval;
     result &= Test("fixed_global_ptrarr", *gPtrArr[0], 99);
+
+    // 'auto' bound to a fixed array deduces the array VIEW 'T[]' - a borrow, never a
+    // copy (auto introduces no new storage). Regression: the binding used to carry no
+    // shape at all, so the local was never materialised and 'av[i]' indexed nothing;
+    // the array pointer itself was passed on as the value.
+    int[3] adSrc = default;
+    adSrc[0] = 5; adSrc[1] = 6; adSrc[2] = 7;
+    auto av = adSrc;
+    result &= Test("auto_fixed_array_index0", av[0], 5);
+    result &= Test("auto_fixed_array_index2", av[2], 7);
+    // A borrow, so a write through the view is visible in the source array...
+    av[1] = 60;
+    result &= Test("auto_fixed_array_is_borrow", adSrc[1], 60);
+    // ...and a later write to the source is visible through the view.
+    adSrc[0] = 50;
+    result &= Test("auto_fixed_array_sees_source", av[0], 50);
+    // The same deduction from a GLOBAL fixed array (different Storage kind).
+    gInitArr[1] = 21;
+    auto gav = gInitArr;
+    result &= Test("auto_global_fixed_array_index", gav[1], 21);
+
+    // 'T[N] b = a;' IS a copy - the declared type allocates its own storage, so it
+    // cannot alias a. Regression: this used to cast the decayed source pointer to the
+    // [N x T] aggregate and fail module verification with no source location.
+    int[3] cpSrc = default;
+    cpSrc[0] = 1; cpSrc[1] = 2; cpSrc[2] = 3;
+    int[3] cpDst = cpSrc;
+    result &= Test("fixed_copy_elem0", cpDst[0], 1);
+    result &= Test("fixed_copy_elem2", cpDst[2], 3);
+    // Independence: mutating the source must not disturb the copy.
+    cpSrc[0] = 99;
+    result &= Test("fixed_copy_is_independent", cpDst[0], 1);
+    result &= Test("fixed_copy_source_moved", cpSrc[0], 99);
+    // ...and mutating the copy must not disturb the source.
+    cpDst[2] = 77;
+    result &= Test("fixed_copy_source_untouched", cpSrc[2], 3);
+
+    // Struct element type with no owned resource: the copy is a memcpy of the extent.
+    CopyCell[2] scSrc = default;
+    scSrc[1].x = 4; scSrc[1].y = 5;
+    CopyCell[2] scDst = scSrc;
+    scSrc[1].x = 40;
+    result &= Test("fixed_copy_struct_elem", scDst[1].x, 4);
+    result &= Test("fixed_copy_struct_elem_y", scDst[1].y, 5);
+
+    // Pointer ELEMENT type (int*[2]): a memcpy of addresses. On a fixed array the
+    // element's pointer-ness lives on Pointer, not ElemPointer, so reading the wrong
+    // flag skipped this shape entirely and it kept failing module verification.
+    int pcA = 4; int pcB = 5;
+    int*[2] pcSrc = default;
+    pcSrc[0] = &pcA; pcSrc[1] = &pcB;
+    int*[2] pcDst = pcSrc;
+    result &= Test("fixed_copy_ptr_elem0", *pcDst[0], 4);
+    result &= Test("fixed_copy_ptr_elem1", *pcDst[1], 5);
+    // The copied array holds its own slots: repointing a source slot leaves the copy alone,
+    // while the pointee stays shared (a copy of addresses, not of what they address).
+    pcSrc[0] = &pcB;
+    result &= Test("fixed_copy_ptr_slot_independent", *pcDst[0], 4);
+    pcA = 40;
+    result &= Test("fixed_copy_ptr_pointee_shared", *pcDst[0], 40);
+
+    // Multi-dimensional copy: extents must match on every dimension.
+    int[2][3] mdSrc = default;
+    mdSrc[1][2] = 9;
+    int[2][3] mdDst = mdSrc;
+    mdSrc[1][2] = 90;
+    result &= Test("fixed_copy_multidim", mdDst[1][2], 9);
 
     return result;
 }

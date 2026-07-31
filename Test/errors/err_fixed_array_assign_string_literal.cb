@@ -1,0 +1,7 @@
+// The ASSIGNMENT axis of the C string-literal idiom, distinct from the decl-init axis in
+// err_fixed_array_from_string_literal.cb. This spelling survived the decl-init fix: it
+// compiled and printed garbage, and the indexed-read form killed the compiler with
+// "LLVM fatal error: Cannot select: i64 = sign_extend" at exit 134.
+expect_error("CFlat has no C-style character-array assignment") {
+    void f() { char[8] b = default; b = "hello"; }
+}

@@ -8897,6 +8897,16 @@ public:
                 std::string srcInferredTypeName;
                 bool srcInferredPointer = false;
                 bool srcInferredElemPointer = false;
+                // Fixed-array shape of the initializer (`int[3] a` -> 3). Drives the `auto`
+                // array-view deduction and the fixed-array-to-fixed-array copy below.
+                uint64_t srcConstArraySize = 0;
+                std::vector<uint64_t> srcConstInnerDimensions;
+                bool srcIsArrayView = false;
+                bool srcIsSimd = false;
+                // True when the initializer is itself array-shaped (a fixed array or a view).
+                // A fixed-array destination only takes the copy path for such a source; a scalar
+                // pointer / `new` / string-literal RHS keeps its pre-existing diagnostic.
+                bool srcIsArrayShaped = false;
                 // Managed-value copy at decl-init (string-redesign Phase 1): captured from the
                 // RHS NamedVariable so the store site can route `ManagedType b = a;` through
                 // a.copy() instead of a shallow alias. srcStorage non-null + !srcIsMove + a
@@ -9222,6 +9232,11 @@ public:
                                 srcInferredTypeName = rightNV.TypeAndValue.TypeName;
                                 srcInferredPointer = rightNV.TypeAndValue.Pointer;
                                 srcInferredElemPointer = rightNV.TypeAndValue.ElemPointer;
+                                srcConstArraySize = rightNV.TypeAndValue.ConstArraySize;
+                                srcConstInnerDimensions = rightNV.TypeAndValue.ConstInnerDimensions;
+                                srcIsArrayView = rightNV.TypeAndValue.IsArrayView;
+                                srcIsSimd = rightNV.TypeAndValue.IsSimd;
+                                srcIsArrayShaped = srcConstArraySize > 0 || srcIsArrayView;
                                 srcStorage = rightNV.Storage;
                                 srcBaseType = rightNV.BaseType;
                                 srcPrimary = rightNV.Primary;
@@ -9385,7 +9400,13 @@ public:
 
                             // Value-typed local assigned a pointer (`Foo f = new Foo();`): catch the
                             // mismatch here rather than emitting an invalid pointer->struct bitcast.
+                            // A fixed-array destination with an ARRAY-SHAPED source
+                            // (`Foo[3] b = a;`) is exempt - its RHS is a decayed array pointer,
+                            // handled by EmitFixedArrayValueCopy below. `Foo[3] b = new Foo();`
+                            // is NOT exempt: the RHS is a scalar `Foo*` and this message is the
+                            // accurate one for it.
                             if (right && !typeAndValue.Pointer && !typeAndValue.IsFunctionPointer
+                                && !(typeAndValue.ConstArraySize > 0 && srcIsArrayShaped)
                                 && right->getType()->isPointerTy()
                                 && compiler->GetDataStructure(typeAndValue.TypeName).StructType != nullptr)
                             {
@@ -9455,6 +9476,55 @@ public:
                         else
                             LogWarningContext(direct, std::format("({}) struct and class is not initialized on the stack.", typeAndValue.TypeName));
                     }
+                }
+
+                /*
+                 * `auto x = <fixed array>` deduces the ARRAY VIEW `T[]`, i.e. a borrow. CFlat is
+                 * borrow-by-default and `auto` introduces no new storage, so it must not copy.
+                 * Without this the binding kept TypeName "auto" with no shape at all: the local
+                 * was never materialised, `x[i]` did not index, and every downstream guard that
+                 * decides on the array shape (interface boxing among them) was handed a source
+                 * that no longer says "array". A multi-dimensional source is left alone - its
+                 * decayed element is a row, not a `T`, so `T[]` would be the wrong deduction.
+                 * File scope is left alone too: `auto` is rejected there for every other source
+                 * ("unknown type 'auto'"), and this is not the change that lifts that.
+                 */
+                /*
+                 * A POINTER-ELEMENT fixed array (`T*[N]`, which carries Pointer on the ELEMENT)
+                 * has no view to deduce to: `T*[]` collapses to `T[]` in both
+                 * ParseDeclarationSpecifiers copies, so the explicit spelling does not work
+                 * either. Pointer-element views are an unimplemented feature, not a broken one.
+                 * Reject instead of deducing - the alternative was an unmaterialised shapeless
+                 * binding that indexed nothing and produced garbage.
+                 */
+                if (typeAndValue.TypeName == "auto" && right != nullptr && !global_scope
+                    && !typeAndValue.Pointer && !typeAndValue.IsSimd
+                    && typeAndValue.ConstArraySize == 0
+                    && srcConstArraySize > 0 && srcInferredPointer
+                    && !srcIsArrayView && !srcIsSimd && !srcInferredTypeName.empty())
+                {
+                    LogErrorContext(direct, std::format(
+                        "cannot deduce 'auto' from pointer-element fixed array '{}*[{}]' - the "
+                        "array view '{}*[]' is not supported. Bind one element "
+                        "('{}* p = {}[i];') or index the array directly.",
+                        srcInferredTypeName, srcConstArraySize, srcInferredTypeName,
+                        srcInferredTypeName, DescribeInitializerPath(srcCallerName,
+                                                                     srcBorrowedField)));
+                }
+
+                if (typeAndValue.TypeName == "auto" && right != nullptr && !global_scope
+                    && !typeAndValue.Pointer && !typeAndValue.IsSimd
+                    && typeAndValue.ConstArraySize == 0
+                    && srcConstArraySize > 0 && srcConstInnerDimensions.empty()
+                    && !srcInferredPointer && !srcIsArrayView && !srcIsSimd
+                    && !srcInferredTypeName.empty() && srcInferredTypeName != "auto"
+                    && right->getType()->isPointerTy())
+                {
+                    typeAndValue.TypeName = srcInferredTypeName;
+                    typeAndValue.ElemPointer = srcInferredElemPointer;
+                    typeAndValue.Pointer = true;
+                    typeAndValue.IsArrayView = true;
+                    typeAndValue.IsInterface = compiler->IsInterfaceType(typeAndValue.TypeName);
                 }
 
                 // Resolve an 'auto' declaration to the initializer's concrete type so the
@@ -9689,7 +9759,46 @@ public:
                             didDeepCopyBorrowString = true;
                         }
 
-                        compiler->CreateAssignment(right, alloc, srcIsUnsigned);
+                        /*
+                         * `T[N] b = a;` (fixed array from an ARRAY-SHAPED source) is a COPY: the
+                         * declared type allocates its own storage, so it cannot alias `a`. The RHS
+                         * has already decayed to a pointer to its first element, so the plain
+                         * store below would cast that pointer to the `[N x T]` aggregate - the
+                         * invalid bitcast this branch exists to replace. A NON-array-shaped source
+                         * (a scalar pointer, `new T()`) is deliberately left to the pre-existing
+                         * checks above, whose diagnostics are the accurate ones for it.
+                         */
+                        auto* destArrTy = llvm::dyn_cast_or_null<llvm::ArrayType>(
+                            compiler->GetTypeFromStorage(alloc));
+                        bool destIsFixedArray = destArrTy != nullptr
+                            && typeAndValue.ConstArraySize > 0
+                            && right->getType()->isPointerTy();
+                        auto* rightConst = llvm::dyn_cast<llvm::Constant>(right);
+                        if (destIsFixedArray && rightConst != nullptr
+                            && compiler->IsStringLiteralConstant(rightConst))
+                        {
+                            // `char[8] b = "hello";` - the C idiom. A string literal is an
+                            // llvm::Constant, so the bad cast folds into a ConstantExpr that the
+                            // verifier does not check: the bytes then come from the POINTER value.
+                            LogErrorContext(direct, std::format(
+                                "cannot initialize fixed array '{}' from a string literal - CFlat "
+                                "has no C-style character-array initializer. Use 'char* {} = ...' "
+                                "to point at the literal, 'string {} = ...' for a managed string, "
+                                "or '{}[{}] {} = {{'a','b',...}}' to spell the bytes out.",
+                                DescribeArrayShape(typeAndValue), name, name,
+                                typeAndValue.TypeName, typeAndValue.ConstArraySize, name));
+                        }
+                        else if (destIsFixedArray && srcIsArrayShaped)
+                        {
+                            EmitFixedArrayValueCopy(direct, typeAndValue, alloc, destArrTy, right,
+                                                    srcInferredTypeName, srcInferredPointer,
+                                                    srcInferredElemPointer, srcConstArraySize,
+                                                    srcConstInnerDimensions);
+                        }
+                        else
+                        {
+                            compiler->CreateAssignment(right, alloc, srcIsUnsigned);
+                        }
 
                         // Implied move of a `move`-temp's owning field: the local now owns the buffer, so
                         // zero the source in the temp and mark a string local owning (not a borrow).
@@ -11251,6 +11360,38 @@ public:
                     "cannot assign into an inline array field of a temporary value - the slot lives in "
                     "a copy that dies at the end of the expression, so the store is discarded. Bind the "
                     "call result to a local first, then assign into it.");
+            }
+
+            /*
+             * Assignment to a WHOLE fixed array (`b = ...` where b is `T[N]`, not `b[i] = ...`).
+             * Unsupported, and every spelling was already broken: a non-literal RHS reached an
+             * invalid `ptr` -> `[N x T]` bitcast and failed module verification, while a string
+             * literal folded that cast into a ConstantExpr the verifier does not check - which
+             * then miscompiled to garbage, or crashed the compiler in SelectionDAG on an indexed
+             * read. Rejected here rather than implemented: whole-array assignment is a feature
+             * with its own axes (compound operators, field arrays, globals).
+             */
+            if (namedVar.TypeAndValue.ConstArraySize > 0
+                && !namedVar.TypeAndValue.IsArrayView && !namedVar.TypeAndValue.IsSimd
+                && namedVar.BaseType != nullptr && llvm::isa<llvm::ArrayType>(namedVar.BaseType))
+            {
+                std::string rhsText = assignCtx != nullptr ? assignCtx->getText() : std::string();
+                std::string lhsName = namedVar.CallerName.empty() ? unaryCtx->getText()
+                                                                  : namedVar.CallerName;
+                if (!rhsText.empty() && rhsText.front() == '"')
+                    LogErrorContext(unaryCtx, std::format(
+                        "cannot assign a string literal to fixed array '{}' - CFlat has no "
+                        "C-style character-array assignment. Use 'char* p = ...' to point at the "
+                        "literal, 'string s = ...' for a managed string, or copy the bytes into "
+                        "'{}' element by element.",
+                        DescribeArrayShape(namedVar.TypeAndValue), lhsName));
+                else
+                    LogErrorContext(unaryCtx, std::format(
+                        "assignment to a whole fixed array '{}' is not supported - assign its "
+                        "elements ('{}[i] = ...'), or initialise it at its declaration "
+                        "('{} {} = <array>;'), which copies.",
+                        DescribeArrayShape(namedVar.TypeAndValue), lhsName,
+                        DescribeArrayShape(namedVar.TypeAndValue), lhsName));
             }
 
             // The left side must resolve to an addressable storage location. A null Storage
@@ -16064,6 +16205,108 @@ public:
             auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, { zero, idx }, "arrelem");
             compiler->CreateAssignment(val, elemPtr, false, elemTy);
         }
+    }
+
+    // Name the initializer for a diagnostic hint: "a", "h.d", or a neutral placeholder.
+    static std::string DescribeInitializerPath(const std::string& callerName,
+                                               const std::string& fieldName)
+    {
+        if (callerName.empty()) return "arr";
+        if (fieldName.empty()) return callerName;
+        return callerName + "." + fieldName;
+    }
+
+    /*
+     * Element indirection depth of a FIXED ARRAY type. On `T[N]`, GetType applies Pointer /
+     * ElemPointer to the ELEMENT before wrapping it in the ArrayType, so `int*[2]` carries
+     * Pointer (one star on the element) and `int**[2]` carries both. Reading ElemPointer alone
+     * as "the element is a pointer" is wrong and silently answers 0 for `int*[2]`.
+     */
+    static int FixedArrayElementStars(const LLVMBackend::TypeAndValue& tv)
+    {
+        return (tv.Pointer ? 1 : 0) + (tv.ElemPointer ? 1 : 0);
+    }
+
+    // Render a fixed-array type for a diagnostic: "int[3]", "int*[2]", "Foo**[2][4]".
+    static std::string DescribeArrayShape(const LLVMBackend::TypeAndValue& tv)
+    {
+        std::string text = tv.TypeName + std::string(FixedArrayElementStars(tv), '*');
+        text += std::format("[{}]", tv.ConstArraySize);
+        for (uint64_t d : tv.ConstInnerDimensions) text += std::format("[{}]", d);
+        return text;
+    }
+
+    // Same, for the initializer side, whose extents arrive as loose values.
+    static std::string DescribeArrayShape(const std::string& typeName, int stars, uint64_t n,
+                                          const std::vector<uint64_t>& innerDims)
+    {
+        std::string text = typeName + std::string(stars, '*');
+        text += std::format("[{}]", n);
+        for (uint64_t d : innerDims) text += std::format("[{}]", d);
+        return text;
+    }
+
+    /*
+     * `T[N] b = a;` - copy one fixed array into another. The destination owns its storage, so
+     * this is a memcpy of sizeof(T) * N, not an alias. Only ever entered for an ARRAY-SHAPED
+     * source (a fixed array or a view); a scalar RHS keeps its own, better, diagnostic. Every
+     * shape this cannot prove safe gets a LogError naming both array types; the repo rule is
+     * that an unsupported construct produces a diagnostic, never an LLVM verifier dump.
+     */
+    void EmitFixedArrayValueCopy(antlr4::ParserRuleContext* ctx,
+                                 const LLVMBackend::TypeAndValue& destTV,
+                                 llvm::Value* destAlloc, llvm::ArrayType* destArrTy,
+                                 llvm::Value* srcPtr,
+                                 const std::string& srcTypeName, bool srcPointer,
+                                 bool srcElemPointer, uint64_t srcConstArraySize,
+                                 const std::vector<uint64_t>& srcInnerDims)
+    {
+        auto* compiler = Compiler(ctx);
+        std::string destText = DescribeArrayShape(destTV);
+
+        // A VIEW source is the only array-shaped thing with no compile-time extent, so the copy
+        // cannot be sized. (The caller guarantees array-shaped, so this IS the view case.)
+        if (srcConstArraySize == 0)
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot initialize fixed array '{}' from array-view '{}[]' - a view carries no "
+                "compile-time extent, so the copy cannot be sized. Declare '{}[] {}' to bind the "
+                "view instead, or copy the elements in a loop.",
+                destText, srcTypeName, destTV.TypeName, destTV.VariableName));
+            return;
+        }
+
+        int destStars = FixedArrayElementStars(destTV);
+        int srcStars = (srcPointer ? 1 : 0) + (srcElemPointer ? 1 : 0);
+        std::string srcText = DescribeArrayShape(srcTypeName, srcStars, srcConstArraySize,
+                                                 srcInnerDims);
+        if (srcTypeName != destTV.TypeName || srcStars != destStars
+            || srcConstArraySize != destTV.ConstArraySize
+            || srcInnerDims != destTV.ConstInnerDimensions)
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot initialize fixed array '{}' from '{}' - a fixed-array copy requires "
+                "identical element type and extents", destText, srcText));
+            return;
+        }
+
+        // A memcpy of elements that own a resource would hand the same pointer to two arrays'
+        // scope-exit destructors (both run element-wise), so it is a double free. There is no
+        // element-wise copy constructor to fall back on, so reject rather than emit one. An
+        // array OF POINTERS (destStars > 0) is exempt: its elements are addresses, which the
+        // language already lets two variables hold, and no destructor runs over them.
+        if (destStars == 0 && compiler->IsOwningValueType(destTV.TypeName))
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot copy fixed array '{}' - element type '{}' owns a resource, so a bitwise "
+                "copy would let both arrays destruct it. Copy the elements explicitly.",
+                destText, destTV.TypeName));
+            return;
+        }
+
+        uint64_t bytes = compiler->module->getDataLayout().getTypeAllocSize(destArrTy);
+        compiler->builder->CreateMemCpy(destAlloc, llvm::MaybeAlign(), srcPtr,
+                                        llvm::MaybeAlign(), bytes);
     }
 
     /*

@@ -1,0 +1,8 @@
+// Assigning to a WHOLE fixed array (not an element) is unsupported. Every spelling was
+// already broken: a non-literal RHS reached an invalid ptr -> [N x T] bitcast and failed
+// module verification, while a string literal folded that cast into a ConstantExpr the
+// verifier does not check - which miscompiled to garbage, or crashed the compiler in
+// SelectionDAG on an indexed read. Element assignment (`b[i] = ...`) is unaffected.
+expect_error("assignment to a whole fixed array 'int[3]' is not supported") {
+    void f() { int[3] a = default; int[3] b = default; b = a; }
+}

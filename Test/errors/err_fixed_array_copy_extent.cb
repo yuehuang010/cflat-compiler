@@ -1,0 +1,6 @@
+// `int[4] b = a;` where a is int[3]: a fixed-array copy needs identical element type
+// and extents. Regression: this used to reach an LLVM verifier dump (invalid bitcast
+// of the decayed source pointer to [4 x i32]) with no source location at all.
+expect_error("a fixed-array copy requires identical element type and extents") {
+    void f() { int[3] a = default; int[4] b = a; b[0] = 1; }
+}

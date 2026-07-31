@@ -132,8 +132,8 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 13 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 28 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 14 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 30 |
 | **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 20 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
@@ -142,7 +142,6 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | Issue | Severity |
 |---|---|
 | [[interface-boxing-keyed-on-source-binding]] | Double free (exit 134) via parens / `?:`; verifier failure via `??`; two un-routed boxing sites. Merged 2026-07-30. |
-| [[auto-binding-of-fixed-array-loses-shape]] | Silent miscompile (`auto` on an array is not indexable), and it defeats the primitive-array guard. Fix the deduction, NOT the guard. |
 | [[interface-type-alias-not-resolved-in-is-as-target]] | Wrong answer + false rejection: `ia is AliasIB` rejected while `ia is IB` works. Fix with one resolving accessor over the ~12 direct `interfaceTable.find/count` sites. |
 | [[ftell-fseek-long-width-on-windows]] | Silent wrong value on Windows: core binds C `long` as pointer-sized, so `ftell`/`fseek` read garbage under LLP64. Not a UI issue despite being Windows-only. |
 | [[interface-method-call-on-null-value-segfaults]] | SIGSEGV (139), no guard. Fires on a PLAIN non-generic interface too. Pre-existing and language-wide. |
@@ -151,7 +150,9 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | [[funcptr-overload-binding-ignores-signature]] | Silent wrong value, exit 0, no diagnostic. A `function<>` argument binds a function-pointer parameter of a mismatched SIGNATURE and is called anyway - the scorer compares indirection shape only, never callee/parameter signatures. Filed 2026-07-31. |
 | [[unique-field-to-field-copy-double-frees]] | Silent abort (exit 134), no diagnostic. Copying one `unique` field into another double-frees in a GENERIC container, while the identical plain-struct spelling is correctly diagnosed. Filed 2026-07-31. |
 | [[return-dangle-missed-when-slot-has-extra-user]] | Missed dangle, no diagnostic. Residue of `2bcc5a0`; NOT to be fixed by widening the whitelist. |
-| [[fixed-array-copy-invalid-bitcast]] | Verifier failure, no diagnostic. NOT interface-related. |
+| [[llvm-cannot-select-sign-extend-on-const-array-index]] | LLVM fatal error, compiler exit 134. Pre-existing; the front-end shape that fed it is now rejected earlier, so no live repro remains - confirm no other spelling reaches it, then re-rank. |
+| [[delete-of-array-view-over-stack-storage]] | Silent abort (exit 134), no diagnostic. PRE-EXISTING on the explicit `int[] v = a;` spelling; the fixed-array shape fix makes `auto` reach it too. |
+| [[multidim-array-view-binding-loses-shape]] | Silent miscompile. The `T[][]` view spelling drops the row stride, so `auto` over a 2-D fixed array has no correct target to deduce to. Residual of the 1-D fixed-array-shape fix. |
 | [[ifconst-const-global-condition-corrupts-ir]] | Missing block terminator in an unrelated already-emitted function. Identical on master. |
 | [[null-conditional-args-eval-order]] | `?.` call arguments evaluate before the null-guard branch - the guard does not guard them. Filed as latent; it is a wrong-order semantics bug. |
 
@@ -160,6 +161,8 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | Issue | Family | Severity |
 |---|---|---|
 | [[generic-wrapper-over-function-type-llvm-fatal]] | feature gap | `Box<function<int(int)>>` raises LLVM fatal `Cannot select: AArch64ISD::CALL` (exit 134) when the substituted field is INVOKED. Store-only may be fine - check that first. Borderline P1 (dies with no usable diagnostic); filed P2 because nothing lies to you. Filed 2026-07-31. |
+| [[auto-binding-of-fixed-array-loses-shape]] | feature gap | RESTORED and narrowed, re-ranked P1 -> P2. The non-pointer half is fixed; `auto v = <T*[N]>` now REJECTS because `T*[]` collapses to `T[]` in both parser copies. Representation is free - no new field needed. |
+| [[char-array-from-string-literal-has-no-spelling]] | feature gap | `char[N] b = "literal";` now has a clear diagnostic and three suggested spellings, but no direct replacement for the C idiom. Master miscompiled it silently. |
 | [[array-view-params-unconditionally-noalias]] | latent miscompile | Latent `-O2` miscompile hazard - UB handed to LLVM. P1 the moment a witness exists. |
 | [[data-pointer-returned-as-closure-not-gated]] | miscompile | Silent miscompile then SIGBUS (exit 138), no diagnostic. `CoerceToFuncPtrReturn` is the one caller of `WidenBareOrThinToClosureFat` never routed through the `ce9858e` provenance gate, so a data pointer returned as a closure lands in the CODE slot and is called. Filed 2026-07-31. |
 | [[shape-mismatched-funcptr-arg-binds-silently]] | miscompile | Silent miscompile then SIGBUS (exit 138), no diagnostic. A `function<T>*` binds where a plain `function<T>` value is expected; the scorer now detects the shape mismatch but still lowers the mismatched arm when no better-shaped candidate exists. Filed 2026-07-31. |
@@ -295,6 +298,7 @@ which a future session must not "fix" back without reopening the decision.
 | Generic-substituted `unique` field ownership seen by the field-store gates | `d65f000` |
 | `function<T>` split from `function<T>*`; `Lambda<T>*` rejected | `4000fa1` |
 | Closure widening gated on the direct call path; interface argument slots type-gated | `4097959` |
+| Fixed-array shape: `auto` deduces a view, `T[N] b = a` is a copy | fix/array-shape |
 
 Suite trajectory across the whole sequence: 522 -> 530 -> 536 -> 538 -> 540.
 
@@ -512,6 +516,120 @@ virtual arms diverge was already a regression once:
   parameter arm never widens to a fat struct, so it does not route through the new gate) and
   [[data-pointer-returned-as-closure-not-gated]] (the RETURN path, `CoerceToFuncPtrReturn`, is a
   third caller of the same widening helper and was out of scope for this fix).
+
+### fix/array-shape - the fixed-array shape on the decl-init path
+
+Closed [[fixed-array-copy-invalid-bitcast]] outright, and the NON-POINTER half of
+[[auto-binding-of-fixed-array-loses-shape]] - whose pointer-element half is restored at P2 as a
+feature gap (see below). They
+were one worktree because both are the fixed-array SHAPE being dropped on the SAME binding path
+(`ParseDeclaration`'s decl-init in `cflat/MainListener.h`), which the index had flagged as a
+plausible-but-unprobed shared root. Probing confirmed it for these two and refuted it for
+[[fixed-array-parameter-not-callable]], which stays open.
+
+**Two ratified language decisions.** Both are deliberate; do not "fix" them back.
+
+1. **`auto x = <fixed array>` deduces the array VIEW `T[]` - a borrow, not a copy.** CFlat is
+   borrow-by-default and infers copy/move rather than having the user annotate it, and `auto`
+   introduces no new storage, so it must not copy. A write through the deduced view IS visible in
+   the source array, and vice versa; `Test/test_basic.cb` asserts both directions
+   (`auto_fixed_array_is_borrow`, `auto_fixed_array_sees_source`). Anyone who reads the aliasing
+   as a bug is reading the decision, not a defect.
+2. **`T[N] b = a;` IS a copy**, lowered as a memcpy of the extent. The declared type allocates its
+   own storage, so it cannot alias `a`; `fixed_copy_is_independent` / `fixed_copy_source_untouched`
+   assert independence in both directions, because a copy that secretly aliased would pass a naive
+   read-back check.
+
+**The interface symptom was fixed by the DEDUCTION, not by the guard.** `IShape t = s;` after
+`auto s = gInt;` used to emit a raw `Invalid bitcast ... to %__iface_fat_ptr` with no source
+location. Nothing in the boxing guards changed: once the binding says `int[]` again, the existing
+primitive-array guard sees a pointer-shaped source and produces the correct diagnostic on its own.
+Widening that guard to reject un-shaped sources was explicitly considered and rejected - it is the
+accept-everything-unproven polarity the guard exists to preserve.
+
+**One rejection was NARROWED, not added.** The "value-typed local assigned a pointer" check
+(`Foo f = new Foo()`) fired on `Foo[3] b = a;` with a factually wrong message ("declare it as
+`Foo* b`"). It is now exempt for a fixed-array destination, which is a strict reduction in what is
+rejected; the shape then reaches the copy path, which validates it properly.
+
+**The copy branch only INTERCEPTS an array-shaped source** - a fixed array or a view. A scalar
+RHS (`Foo[3] b = new Foo();`, `char[8] b = "hello";`) is left to the pre-existing checks, whose
+diagnostics are the accurate ones for it. The first cut intercepted every pointer RHS and so
+replaced a correct, actionable message ("cannot initialize value of type 'Foo' with a pointer of
+type 'Foo*'; declare it as 'Foo* b = ...'") with one that was wrong in both halves - it called the
+scalar `Foo*` an `Foo[]` and recommended binding a view. Narrowing the interception, not rewording
+the message, is the fix; the pre-existing diagnostic is restored verbatim.
+
+**What the copy path rejects, and what master ACTUALLY did with each.** Measured against the
+`4097959` binary, not assumed - the first cut of this record claimed all of them were verifier
+dumps, and that was false twice over:
+
+| rejected shape | master's real behaviour |
+|---|---|
+| element/star/extent mismatch (`int[4] b = a`, `int[2] b = <int*[2]>`) | verifier dump, no source location |
+| view source (`int[3] c = v`) | verifier dump, no source location |
+| owning element type (`Owner[2] b = a`) | a LOCATED LogError, but a factually wrong one ("declare it as `Owner* b`") - never accepted |
+| string literal (`char[8] b = "hello"`) | **compiled, linked, ran, exit 0, printed garbage** |
+
+So only ONE shape is a true "master accepted this, we now reject it", and it was a silent
+miscompile: a string literal is an `llvm::Constant`, so the bad cast folds into a **ConstantExpr**
+that the verifier does not check at the instruction level, and the emitted body then extracts the
+bytes of the POINTER VALUE. (Same Constant-vs-Instruction divergence as the primitive-array boxing
+record above.) The indexing form crashed the compiler outright at exit 134. Rejecting it is a
+strict improvement; it gets its own message that mentions neither extents nor views, and the
+missing capability is filed as [[char-array-from-string-literal-has-no-spelling]] with the crash
+filed separately as [[llvm-cannot-select-sign-extend-on-const-array-index]].
+
+**On a fixed array the element's pointer-ness lives on `Pointer`, not `ElemPointer`.** `GetType`
+applies both flags to the ELEMENT before wrapping it in the ArrayType, so `int*[2]` carries
+`Pointer` and `int**[2]` carries both. The first cut read `ElemPointer` alone, which answers 0 for
+`int*[2]`; conjoined with `!typeAndValue.Pointer` it made the whole branch UNREACHABLE for every
+pointer-element array, leaving `int*[2] b = a;` on the original verifier dump and leaving two
+conjuncts dead. Both now do real work and each is pinned by a probe: the star comparison fires in
+three spellings (`int[2]` <- `int*[2]`, `int*[2]` <- `int[2]`, `int*[2]` <- `int**[2]`), and the
+`destStars == 0` guard on the owning-element arm is what correctly lets `Owner*[2] b = a;` memcpy
+rather than be rejected - an array of addresses runs no element destructors.
+
+**Two shapes are REJECTED rather than implemented, both converting a silent miscompile into a
+located diagnostic.**
+
+*Pointer-element `auto`.* `auto v = <T*[N]>` produced an unmaterialised shapeless binding that
+indexed nothing (garbage), and defeated the interface guard the same way the non-pointer case
+did. It is NOT fixable by setting the right flags: `T*[]` COLLAPSES TO `T[]` at parse time in
+both `ParseDeclarationSpecifiers` copies, so the explicit spelling does not work either - a
+`int first(int*[] v)` parameter accepts a plain `int[3]` and indexes it as `int`, printing
+`r=99` on both binaries. Pointer-element array views are an UNIMPLEMENTED FEATURE. Implementing
+them means both parser copies plus a full audit of every `ElemPointer`/`IsArrayView` reader,
+which the lessons file says costs three review rounds when a widely-read type flag changes. The
+representation is not forced and needs no new field - recorded in
+[[auto-binding-of-fixed-array-loses-shape]], which is RESTORED at P2 as a feature gap.
+
+*Whole fixed-array assignment.* Closing the decl-init axis left the ASSIGNMENT axis open, and
+nobody enumerated it for a full review round: `char[8] b = default; b = "hello";` still printed
+garbage, and its indexed-read form still killed the compiler at exit 134. `b = <anything>` on a
+whole fixed array is now rejected, with a string-literal wording variant. This breaks no
+compiling program - every non-literal spelling ALREADY failed module verification, and the
+literal spelling only ever produced garbage or a crash. Element assignment (`b[i] = ...`) is
+untouched.
+
+**One pre-existing hole becomes reachable through one more spelling.** `delete[_]` on a view over
+stack storage aborts (exit 134, no diagnostic) - always has, via the explicit `int[] v = a;`
+spelling ([[delete-of-array-view-over-stack-storage]]). Master rejected the `auto` form only
+because the broken binding looked like a value type; that was an accident, not a safety check.
+Deducing the view makes `auto` behave exactly like the spelling it deduces, which is the point.
+
+**Deferred: the multi-dimensional case** ([[multidim-array-view-binding-loses-shape]]). The `auto`
+deduction is guarded on `ConstInnerDimensions.empty()` because there is no correct 2-D target to
+deduce to - the `T[][]` view spelling is itself broken on master. The multi-dimensional COPY works
+and is asserted (`fixed_copy_multidim`); only the view/`auto` half is deferred.
+
+**Blast radius, measured rather than argued.** A 419-file differential sweep (`Test/` + `example/`,
+both binaries, isolated `HOME` per side) found exactly 3 differences, all of them the intended new
+test legs. Because a corpus sweep that only COMPILES cannot see a silent value change - and the
+`auto` defect was exactly that - the sweep was backed by an instrumented build that printed a
+marker whenever either new code path fired: across `Test/`, `example/` and all 64 `core/*.cb`, the
+paths fire ONLY in the three files this change edits. No pre-existing program in the repo reaches
+either one.
 
 ### `2bcc5a0` - the return dangle, on the fourth attempt
 
@@ -782,8 +900,8 @@ alias TARGET - a guess, not a diagnosis.
   verifier rejects it. Same bug, two completely different-looking outcomes. Four boxing sites
   needed the guard and the fourth (`CoerceInitValueToInterface`, shared by brace-init and the
   `<Tag attr=...>` element path) was missed on the first pass. Parens do NOT defeat the guard; an
-  `auto` intermediate does, and that is [[auto-binding-of-fixed-array-loses-shape]] rather than a
-  widening of the guard.
+  `auto` intermediate did, and that was the DEDUCTION rather than a widening of the guard - see
+  the fixed-array shape record below, which closed it exactly that way.
 - **Returning a `?:` join of concrete pointers as an interface** aborted with a raw verifier dump.
   The filed account was right as far as it went but missed two things: under a `move` return type
   the plain spelling was a FALSE REJECTION ("returned expression is not owned") because a phi is
@@ -863,7 +981,7 @@ key-space work because two ratification records lean on a message that names the
   [[namespaced-interface-shadowed-by-global-is-broken]],
   [[tuple-sugar-in-namespace-does-not-compile]]) share the word "namespace" and nothing else:
   registration scope, call dispatch, lookup order, and a parser gap.
-- The fixed-array trio ([[fixed-array-copy-invalid-bitcast]],
-  [[fixed-array-parameter-not-callable]], [[auto-binding-of-fixed-array-loses-shape]]) has a
-  plausible shared root - the array SHAPE is dropped to a bare `T` - but it is UNPROBED.
-  Grouping them in the index is honest; merging them on an unverified hypothesis is not.
+- The fixed-array trio was grouped on a plausible-but-unprobed shared root (the array SHAPE is
+  dropped to a bare `T`). Probing it settled the grouping: the `auto` binding and the array-to-array
+  copy DID share the decl-init path and were fixed together; [[fixed-array-parameter-not-callable]]
+  did not and remains open. See the fixed-array shape record below.

@@ -1,0 +1,7 @@
+// The C idiom `char[N] b = "literal";` has no working spelling in CFlat. A string literal
+// is an llvm::Constant, so the bad array cast folds into a ConstantExpr the module verifier
+// does not check: it compiled and then read the bytes out of the POINTER value (garbage),
+// and the indexing form crashed the compiler in SelectionDAG. Rejected with its own message.
+expect_error("CFlat has no C-style character-array initializer") {
+    void f() { char[8] b = "hello"; b[0] = 'x'; }
+}
