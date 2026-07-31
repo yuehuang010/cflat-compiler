@@ -21748,6 +21748,33 @@ public:
                         }
                         else if (interfaceVar.TypeAndValue.IsInterface)
                         {
+                            // [PFX-nc-iface] '?.': test the receiver BEFORE the argument list, so a
+                            // null receiver skips the arguments. Both arms share this one guard.
+                            llvm::Value* ncIfacePtr = nullptr;
+                            if (nullConditionalPending)
+                            {
+                                auto* compiler = Compiler(ctx);
+                                ncIfacePtr = interfaceVar.Storage;
+                                if (ncIfacePtr == nullptr && interfaceVar.Primary != nullptr)
+                                {
+                                    auto fatTy = compiler->GetFatPtrType();
+                                    ncIfacePtr = compiler->CreateAlloca(fatTy);
+                                    compiler->CreateAssignment(interfaceVar.Primary, ncIfacePtr);
+                                }
+                                // No Storage and no Primary (an unspillable receiver): fall through
+                                // unguarded - nullConditionalPending stays armed but unconsumed here.
+                                if (ncIfacePtr != nullptr)
+                                {
+                                    // Fat {vtable,data} receiver: test the DATA slot (index 1), not
+                                    // ifacePtr itself (always a live alloca address, never null).
+                                    auto* fatTy = compiler->GetFatPtrType();
+                                    auto* ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
+                                    auto* dataField = compiler->CreateStructGEP(fatTy, ncIfacePtr, 1);
+                                    auto* dataPtr = compiler->CreateLoad(ptrTy, dataField);
+                                    ncEnterGuard(dataPtr);
+                                }
+                            }
+
                             // Collect extra call arguments
                             std::vector<LLVMBackend::NamedVariable> extraArgs;
                             if (argumentList.size() > 0)
@@ -21902,7 +21929,8 @@ public:
                                 // Ensure we have a {i8*,i8*}* pointer (alloca address).
                                 // If the interface value was produced inline (Primary set, no Storage),
                                 // spill it into a temp alloca first.
-                                llvm::Value* ifacePtr = interfaceVar.Storage;
+                                // A guarded chain already spilled/derived the receiver address above.
+                                llvm::Value* ifacePtr = ncIfacePtr ? ncIfacePtr : interfaceVar.Storage;
                                 if (ifacePtr == nullptr && interfaceVar.Primary != nullptr)
                                 {
                                     auto fatTy = Compiler(ctx)->GetFatPtrType();
@@ -21910,41 +21938,20 @@ public:
                                     Compiler(ctx)->CreateAssignment(interfaceVar.Primary, ifacePtr);
                                 }
 
-                                if (nullConditionalPending)
-                                {
-                                    // Fat {vtable,data} receiver: test the DATA slot (index 1), not
-                                    // ifacePtr itself (always a live alloca address, never null).
-                                    auto* compiler = Compiler(ctx);
-                                    auto* fatTy = compiler->GetFatPtrType();
-                                    auto* ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
-                                    auto* dataField = compiler->CreateStructGEP(fatTy, ifacePtr, 1);
-                                    auto* dataPtr = compiler->CreateLoad(ptrTy, dataField);
-                                    ncEnterGuard(dataPtr);
-
-                                    namedVar.Primary = compiler->CallInterfaceMethod(
-                                        ifacePtr, interfaceVar.TypeAndValue.TypeName, primaryIdentifier, extraArgs);
-                                    namedVar.Storage = nullptr;
-                                    namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
-                                    if (namedVar.Primary)
-                                        namedVar.TypeAndValue = compiler->lastCallReturnType;
-                                }
-                                else
-                                {
-                                    namedVar.Primary = Compiler(ctx)->CallInterfaceMethod(
-                                        ifacePtr,
-                                        interfaceVar.TypeAndValue.TypeName,
-                                        primaryIdentifier,
-                                        extraArgs
-                                    );
-                                    namedVar.Storage = nullptr;
-                                    namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
-                                    // Populate TypeAndValue from the interface method's return type and
-                                    // re-classify the result so a chained member/method call on it works
-                                    // (e.g. `e.toJson().data()` or `e.mk().get()`). Without this the result
-                                    // has no struct receiver and the chained call re-dispatches the stale name.
-                                    if (namedVar.Primary)
-                                        namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
-                                }
+                                namedVar.Primary = Compiler(ctx)->CallInterfaceMethod(
+                                    ifacePtr,
+                                    interfaceVar.TypeAndValue.TypeName,
+                                    primaryIdentifier,
+                                    extraArgs
+                                );
+                                namedVar.Storage = nullptr;
+                                namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
+                                // Populate TypeAndValue from the interface method's return type and
+                                // re-classify the result so a chained member/method call on it works
+                                // (e.g. `e.toJson().data()` or `e.mk().get()`). Without this the result
+                                // has no struct receiver and the chained call re-dispatches the stale name.
+                                if (namedVar.Primary)
+                                    namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
                                 interfaceVar = {};
                                 structVar = {};
                                 ClassifyPostfixCallResult(ctx, namedVar, structVar, interfaceVar);
@@ -21968,30 +21975,8 @@ public:
                                 for (const auto& e : extraArgs)
                                     allArgs.push_back(e);
 
-                                if (nullConditionalPending)
-                                {
-                                    // Gate on the fat receiver's data slot, same as the vtable-method
-                                    // arm above - this path used to never consult nullConditionalPending.
-                                    auto* compiler = Compiler(ctx);
-                                    llvm::Value* ifacePtr = interfaceVar.Storage;
-                                    if (ifacePtr == nullptr && interfaceVar.Primary != nullptr)
-                                    {
-                                        auto fatTy = compiler->GetFatPtrType();
-                                        ifacePtr = compiler->CreateAlloca(fatTy);
-                                        compiler->CreateAssignment(interfaceVar.Primary, ifacePtr);
-                                    }
-                                    // No Storage and no Primary (an unspillable receiver): fall through
-                                    // unguarded - nullConditionalPending stays armed but unconsumed here.
-                                    if (ifacePtr != nullptr)
-                                    {
-                                        auto* fatTy = compiler->GetFatPtrType();
-                                        auto* ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
-                                        auto* dataField = compiler->CreateStructGEP(fatTy, ifacePtr, 1);
-                                        auto* dataPtr = compiler->CreateLoad(ptrTy, dataField);
-                                        ncEnterGuard(dataPtr);
-                                    }
-                                }
-
+                                // The receiver guard for this arm is emitted at [PFX-nc-iface], before
+                                // the argument list, so a null receiver skips the arguments too.
                                 namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(extFuncName, allArgs);
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
@@ -22148,6 +22133,21 @@ public:
                                 auto thisVar = Compiler(ctx)->GetCurrentMemberThis(functionName);
                                 if (thisVar.Storage != nullptr)
                                     arguments.push_back(thisVar);
+                            }
+
+                            // [PFX-7-slot] Resolved before [PFX-7] because the '?.' guard below must
+                            // skip a COM slot call, which owns its own '?.'/HResult lowering.
+                            const LLVMBackend::DeclTypeAndValue* winrtSlot =
+                                (structVar.BaseType && !structVar.TypeAndValue.TypeName.empty())
+                                ? Compiler(primaryCtx)->GetWinrtSlot(structVar.TypeAndValue.TypeName, functionName)
+                                : nullptr;
+                            // [PFX-nc-struct] '?.' short-circuit: emit the receiver null test BEFORE the
+                            // argument list so a null receiver skips the arguments' side effects too.
+                            bool ncCallGuarded = false;
+                            if (winrtSlot == nullptr && nullConditionalPending && structVar.Storage != nullptr)
+                            {
+                                ncEnterGuard(structVar.Storage);
+                                ncCallGuarded = true;
                             }
 
                             if (argumentList.size() > 0)
@@ -22424,10 +22424,7 @@ public:
                             // [PFX-7] call lowering, three ways: a [winrt] COM vtable dispatch
                             // (recv->lpVtbl->slot), a null-conditional `?.` guarded call, or the
                             // normal overloaded (member/free/extension) function call.
-                            const LLVMBackend::DeclTypeAndValue* winrtSlot =
-                                (structVar.BaseType && !structVar.TypeAndValue.TypeName.empty())
-                                ? Compiler(primaryCtx)->GetWinrtSlot(structVar.TypeAndValue.TypeName, functionName)
-                                : nullptr;
+                            // `winrtSlot` is resolved above at [PFX-7-slot].
                             if (winrtSlot)
                             {
                                 // [winrt] COM sugar: recv->Slot(args) dispatches through the vtable as
@@ -22525,10 +22522,10 @@ public:
                                     globalScopeCall = false;
                                 }
                             }
-                            else if (nullConditionalPending && structVar.Storage != nullptr)
+                            else if (ncCallGuarded)
                             {
-                                // Resolve generic extension method if needed, then gate the call
-                                // (and the rest of the chain, via ncEnterGuard) on the receiver.
+                                // The receiver guard (and the rest of the chain) was already entered
+                                // at [PFX-nc-struct]; only the generic extension resolution is left.
                                 std::string resolvedFuncName = functionName;
                                 // Bare spelling inside a namespace reaches that namespace's key first.
                                 std::string gfName = Compiler(ctx)->ResolveGenericFunctionBase(functionName);
@@ -22546,8 +22543,6 @@ public:
                                         if (!inst.empty()) { resolvedFuncName = inst; break; }
                                     }
                                 }
-
-                                ncEnterGuard(structVar.Storage);
 
                                 namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(resolvedFuncName, arguments, globalScopeCall);
                                 globalScopeCall = false;

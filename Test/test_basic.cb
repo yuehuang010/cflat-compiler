@@ -2041,6 +2041,45 @@ struct NcBag
     int arr[4] = default;
 };
 
+// '?.' ARGUMENT EVALUATION ORDER fixtures. A '?.' promises to short-circuit, so a null
+// receiver must skip the argument expressions too - they used to run before the guard
+// branch was even emitted. ncSeCount counts every argument evaluation and ncSeOrder
+// records the ORDER (left-to-right => 12, not 21), so a leaked or reordered side effect
+// is observable as a value, not merely as "it compiled".
+int ncSeCount = 0;
+int ncSeOrder = 0;
+int ncSe(int x) { ncSeCount = ncSeCount + 1; return x; }
+int ncSeq(int x) { ncSeCount = ncSeCount + 1; ncSeOrder = ncSeOrder * 10 + x; return x; }
+
+struct NcArg
+{
+    int v = default;
+    int arr[3] = default;
+    int add(int a) { return v + a; }
+    int add2(int a, int b) { return v + a + b; }
+    void bump(int a) { v = v + a; }
+};
+// UFCS extension function on a struct pointer receiver (the '?.' extension-call arm).
+int ncArgExt(NcArg* self, int a) { return self->v + a; }
+
+struct NcArgHolder
+{
+    NcArg* p = default;
+};
+
+// Interface receiver whose contract method TAKES an argument, plus an extension (UFCS)
+// function on the same interface - the two interface '?.' dispatch arms.
+interface INcArgIface { int getv(int a); };
+class NcArgImpl : INcArgIface
+{
+    int v = 0;
+    NcArgImpl(int val) { v = val; }
+    int getv(int a) { return v + a; }
+};
+int ncIfaceExt(INcArgIface c, int a) { return c.getv(0) + a; }
+
+int ncPair(int a, int b) { return a * 100 + b; }
+
 // Fixture pinning CURRENT correct thin-pointer chain behavior: `a?.nxt().get()` must dispatch
 // the SECOND link on nxt()'s result, not on the original receiver `a`.
 struct NcNode
@@ -2148,6 +2187,168 @@ bool testNullableTypes()
     int arrTotalNull = 0;
     for (int v in zBag?.arr) arrTotalNull = arrTotalNull + v;
     result &= Test("?. chain to whole array on null receiver", arrTotalNull, 0);
+
+    result &= testNullConditionalArgOrder();
+
+    return result;
+}
+
+// '?.' short-circuits its ARGUMENTS as well as its dispatch: on a null receiver the
+// argument expressions must not run at all, and on a live receiver they must run exactly
+// once, left to right. Every leg asserts the call's VALUE and the side-effect COUNT, so a
+// leaked argument evaluation fails even though the returned value is right either way.
+bool testNullConditionalArgOrder()
+{
+    bool result = true;
+
+    NcArg argVal = NcArg();
+    argVal.v = 10;
+    argVal.arr[1] = 7;
+    NcArg* liveArg = &argVal;
+    NcArg* zArg = nullptr;
+
+    // 1. Struct method through a thin pointer.
+    ncSeCount = 0;
+    result &= Test("nc_argord_method_null_value", zArg?.add(ncSe(5)), 0);
+    result &= Test("nc_argord_method_null_skips_arg", ncSeCount, 0);
+    result &= Test("nc_argord_method_live_value", liveArg?.add(ncSe(5)), 15);
+    result &= Test("nc_argord_method_live_arg_once", ncSeCount, 1);
+
+    // 2. Two arguments: left-to-right order on the live path, nothing on the null path.
+    ncSeCount = 0; ncSeOrder = 0;
+    result &= Test("nc_argord_two_null_value", zArg?.add2(ncSeq(1), ncSeq(2)), 0);
+    result &= Test("nc_argord_two_null_skips_args", ncSeCount, 0);
+    result &= Test("nc_argord_two_null_no_order", ncSeOrder, 0);
+    result &= Test("nc_argord_two_live_value", liveArg?.add2(ncSeq(1), ncSeq(2)), 13);
+    result &= Test("nc_argord_two_live_args_twice", ncSeCount, 2);
+    result &= Test("nc_argord_two_live_left_to_right", ncSeOrder, 12);
+
+    // 3. Extension (UFCS) function on a struct pointer receiver.
+    ncSeCount = 0;
+    result &= Test("nc_argord_structext_null_value", zArg?.ncArgExt(ncSe(3)), 0);
+    result &= Test("nc_argord_structext_null_skips_arg", ncSeCount, 0);
+    result &= Test("nc_argord_structext_live_value", liveArg?.ncArgExt(ncSe(3)), 13);
+    result &= Test("nc_argord_structext_live_arg_once", ncSeCount, 1);
+
+    // 4. Interface contract method (fat {vtable,data} receiver, vtable dispatch).
+    INcArgIface zIface = nullptr;
+    INcArgIface liveIface = new NcArgImpl(50);
+    ncSeCount = 0;
+    result &= Test("nc_argord_iface_null_value", zIface?.getv(ncSe(4)), 0);
+    result &= Test("nc_argord_iface_null_skips_arg", ncSeCount, 0);
+    result &= Test("nc_argord_iface_live_value", liveIface?.getv(ncSe(4)), 54);
+    result &= Test("nc_argord_iface_live_arg_once", ncSeCount, 1);
+
+    // 5. Extension (UFCS) function on an interface receiver.
+    ncSeCount = 0;
+    result &= Test("nc_argord_ifaceext_null_value", zIface?.ncIfaceExt(ncSe(6)), 0);
+    result &= Test("nc_argord_ifaceext_null_skips_arg", ncSeCount, 0);
+    result &= Test("nc_argord_ifaceext_live_value", liveIface?.ncIfaceExt(ncSe(6)), 56);
+    result &= Test("nc_argord_ifaceext_live_arg_once", ncSeCount, 1);
+
+    // 6. A VOID '?.' call used as a STATEMENT, not assigned.
+    NcArg stmtVal = NcArg();
+    stmtVal.v = 1;
+    NcArg* liveStmt = &stmtVal;
+    NcArg* zStmt = nullptr;
+    ncSeCount = 0;
+    zStmt?.bump(ncSe(2));
+    result &= Test("nc_argord_void_stmt_null_skips_arg", ncSeCount, 0);
+    result &= Test("nc_argord_void_stmt_null_no_effect", stmtVal.v, 1);
+    liveStmt?.bump(ncSe(2));
+    result &= Test("nc_argord_void_stmt_live_arg_once", ncSeCount, 1);
+    result &= Test("nc_argord_void_stmt_live_runs", stmtVal.v, 3);
+
+    // 7. A field receiver and an array-element receiver reach the same guard.
+    NcArgHolder zHold = NcArgHolder();
+    NcArgHolder liveHold = NcArgHolder();
+    liveHold.p = liveArg;
+    ncSeCount = 0;
+    result &= Test("nc_argord_field_recv_null_value", zHold.p?.add(ncSe(8)), 0);
+    result &= Test("nc_argord_field_recv_null_skips_arg", ncSeCount, 0);
+    result &= Test("nc_argord_field_recv_live_value", liveHold.p?.add(ncSe(8)), 18);
+    result &= Test("nc_argord_field_recv_live_arg_once", ncSeCount, 1);
+
+    NcArg* elems[2] = default;
+    elems[0] = nullptr;
+    elems[1] = liveArg;
+    ncSeCount = 0;
+    result &= Test("nc_argord_elem_recv_null_value", elems[0]?.add(ncSe(9)), 0);
+    result &= Test("nc_argord_elem_recv_null_skips_arg", ncSeCount, 0);
+    result &= Test("nc_argord_elem_recv_live_value", elems[1]?.add(ncSe(9)), 19);
+    result &= Test("nc_argord_elem_recv_live_arg_once", ncSeCount, 1);
+
+    // 8. The argument is itself a '?.' call - each receiver gates only its own arguments.
+    ncSeCount = 0;
+    result &= Test("nc_argord_nested_outer_null_value", zArg?.add(liveArg?.add(ncSe(11))), 0);
+    result &= Test("nc_argord_nested_outer_null_skips_all", ncSeCount, 0);
+    result &= Test("nc_argord_nested_inner_null_value", liveArg?.add(zArg?.add(ncSe(12))), 10);
+    result &= Test("nc_argord_nested_inner_null_skips_arg", ncSeCount, 0);
+    result &= Test("nc_argord_nested_live_value", liveArg?.add(liveArg?.add(ncSe(1))), 21);
+    result &= Test("nc_argord_nested_live_arg_once", ncSeCount, 1);
+
+    // 9. A '?.' call in ARGUMENT position of an ordinary call, and with '??' on the same line.
+    ncSeCount = 0;
+    result &= Test("nc_argord_as_arg_null_value", ncPair(zArg?.add(ncSe(14)), 1), 1);
+    result &= Test("nc_argord_as_arg_null_skips_arg", ncSeCount, 0);
+    result &= Test("nc_argord_as_arg_live_value", ncPair(liveArg?.add(ncSe(14)), 1), 2401);
+    result &= Test("nc_argord_as_arg_live_arg_once", ncSeCount, 1);
+
+    ncSeCount = 0;
+    result &= Test("nc_argord_coalesce_null_value", zArg?.add(ncSe(15)) ?? -1, -1);
+    result &= Test("nc_argord_coalesce_null_skips_arg", ncSeCount, 0);
+    result &= Test("nc_argord_coalesce_live_value", liveArg?.add(ncSe(15)) ?? -1, 25);
+    result &= Test("nc_argord_coalesce_live_arg_once", ncSeCount, 1);
+
+    // 10. An argument value that is READ AGAIN after the guarded call: the guarded block
+    // must not be where that value is defined, or the IR fails dominance verification.
+    ncSeCount = 0;
+    int kept = ncSe(16);
+    result &= Test("nc_argord_reuse_null_value", zArg?.add(kept), 0);
+    result &= Test("nc_argord_reuse_live_value", liveArg?.add(kept), 26);
+    result &= Test("nc_argord_reuse_kept_intact", kept, 16);
+    result &= Test("nc_argord_reuse_arg_once", ncSeCount, 1);
+
+    // 11. A '?.' chain whose LATER link takes arguments: the first link's guard already
+    // covers the rest of the chain, so the later link's arguments are skipped too.
+    ncSeCount = 0;
+    result &= Test("nc_argord_chain_field_null_value", zArg?.arr[1], 0);
+    result &= Test("nc_argord_chain_field_live_value", liveArg?.arr[1], 7);
+    result &= Test("nc_argord_chain_no_stray_args", ncSeCount, 0);
+
+    // 12. Everything above uses a receiver the optimizer can prove null or non-null, so it
+    // constant-folds and no guard branch survives into the emitted IR. These legs make the
+    // null-ness OPAQUE (`ncSeCount > 999` is false at runtime but unknowable at compile
+    // time), so each one emits a real `br i1` and exercises the guard that was actually
+    // added, once per call-site kind.
+    NcArg* zOpaque = ncSeCount > 999 ? liveArg : nullptr;
+    NcArg* liveOpaque = ncSeCount > 999 ? nullptr : liveArg;
+    INcArgIface zIfOpaque = ncSeCount > 999 ? liveIface : nullptr;
+    INcArgIface liveIfOpaque = ncSeCount > 999 ? nullptr : liveIface;
+
+    ncSeCount = 0;
+    result &= Test("nc_argord_opaque_method_null_value", zOpaque?.add(ncSe(5)), 0);
+    result &= Test("nc_argord_opaque_method_null_skips_arg", ncSeCount, 0);
+    result &= Test("nc_argord_opaque_method_live_value", liveOpaque?.add(ncSe(5)), 15);
+    result &= Test("nc_argord_opaque_method_live_arg_once", ncSeCount, 1);
+
+    ncSeCount = 0;
+    result &= Test("nc_argord_opaque_structext_null_value", zOpaque?.ncArgExt(ncSe(3)), 0);
+    result &= Test("nc_argord_opaque_structext_null_skips_arg", ncSeCount, 0);
+    result &= Test("nc_argord_opaque_structext_live_value", liveOpaque?.ncArgExt(ncSe(3)), 13);
+    result &= Test("nc_argord_opaque_structext_live_arg_once", ncSeCount, 1);
+
+    ncSeCount = 0;
+    result &= Test("nc_argord_opaque_iface_null_value", zIfOpaque?.getv(ncSe(4)), 0);
+    result &= Test("nc_argord_opaque_iface_null_skips_arg", ncSeCount, 0);
+    result &= Test("nc_argord_opaque_iface_live_value", liveIfOpaque?.getv(ncSe(4)), 54);
+    result &= Test("nc_argord_opaque_iface_live_arg_once", ncSeCount, 1);
+
+    ncSeCount = 0;
+    result &= Test("nc_argord_opaque_ifaceext_null_value", zIfOpaque?.ncIfaceExt(ncSe(6)), 0);
+    result &= Test("nc_argord_opaque_ifaceext_null_skips_arg", ncSeCount, 0);
+    result &= Test("nc_argord_opaque_ifaceext_live_value", liveIfOpaque?.ncIfaceExt(ncSe(6)), 56);
+    result &= Test("nc_argord_opaque_ifaceext_live_arg_once", ncSeCount, 1);
 
     return result;
 }

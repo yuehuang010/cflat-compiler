@@ -28,8 +28,8 @@ why the shipped code has the shape it does, which approaches must not be retried
 ratified behaviour change that future work must not "fix" back. That section is the convergence
 point for the interface/generics work and is the reason this file is long.
 
-State on 2026-07-31: **68 open issues** (13 P1 / 28 P2 / 20 P3 / 7 UI), counted from disk, not
-from arithmetic. Two P1s were fixed and their files deleted this session
+State on 2026-07-31: **73 open issues** (12 P1 / 30 P2 / 24 P3 / 7 UI), counted from disk
+(`ls internal/issue/p{1,2,3}/*.md ui/*.md | wc -l`), not from arithmetic. Two P1s were fixed and their files deleted this session
 (`unique-ptr-field-stack-address-aborts-silently`, `function-array-body-silently-truncated`),
 and nine new issues were filed - every one of them found by the ADVERSARIAL REVIEWS of those two
 fixes, not by the original investigation. That ratio is the story of the session: fixing two
@@ -52,8 +52,12 @@ Next P1s, and the sequencing that matters:
 - `interface-boxing-keyed-on-source-binding` and `return-dangle-missed-when-slot-has-extra-user`
   are the next group. (`interface-type-alias-not-resolved-in-is-as-target`, formerly grouped
   here, is fixed on `fix/iface-alias` - not yet merged to master.)
-- `null-conditional-args-eval-order` follows. (`ifconst-const-global-condition-corrupts-ir` is
-  fixed on `fix/ifconst-ir` - not yet merged to master.)
+- `ifconst-const-global-condition-corrupts-ir` is fixed and merged (`4c2b2d3`).
+  `null-conditional-args-eval-order` is fixed on `fix/nullcond-order` for every
+  pointer-guarded '?.' spelling; its two residues are narrowed to
+  `p3/null-conditional-args-eval-order-hresult` (HResult/COM half) and
+  `p3/nullcond-guard-skips-move-argument-cleanup` (the move-argument leak the guard
+  introduces on the null path).
 - `interface-method-call-on-null-value-segfaults` needs a PRODUCT DECISION first: its fix
   direction proposes a runtime null-vtable check on every interface dispatch, which is a
   per-call branch someone must agree to pay.
@@ -134,9 +138,9 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 14 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 12 |
 | **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 30 |
-| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 21 |
+| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 24 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
 ### P1 - wrong programs and crashes (`p1/`)
@@ -155,7 +159,6 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | [[llvm-cannot-select-sign-extend-on-const-array-index]] | LLVM fatal error, compiler exit 134. Pre-existing; the front-end shape that fed it is now rejected earlier, so no live repro remains - confirm no other spelling reaches it, then re-rank. |
 | [[delete-of-array-view-over-stack-storage]] | Silent abort (exit 134), no diagnostic. PRE-EXISTING on the explicit `int[] v = a;` spelling; the fixed-array shape fix makes `auto` reach it too. |
 | [[multidim-array-view-binding-loses-shape]] | Silent miscompile. The `T[][]` view spelling drops the row stride, so `auto` over a 2-D fixed array has no correct target to deduce to. Residual of the 1-D fixed-array-shape fix. |
-| [[null-conditional-args-eval-order]] | `?.` call arguments evaluate before the null-guard branch - the guard does not guard them. Filed as latent; it is a wrong-order semantics bug. |
 
 ### P2 - false rejections, unavailable features, ownership holes (`p2/`)
 
@@ -196,6 +199,8 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[nullcond-guard-skips-move-argument-cleanup]] | latent | INTRODUCED by the `null-conditional-args-eval-order` fix, and accepted rather than fixed. A `move` argument to a '?.' call on a NULL receiver never runs, so nothing takes ownership - but the source is still statically marked moved, so scope exit frees nothing either, and the allocation leaks (`frees=0` vs master's `frees=1`). Not memory-unsafe and not observable in-language; reading the source after the call is rejected identically on both binaries. Filed 2026-07-31. |
+| [[null-conditional-args-eval-order-hresult]] | latent | Residual of the fixed P1 `null-conditional-args-eval-order`. On an `HResult<T*>` receiver '?.' means "propagate the failure code", and its `chain.ok`/`chain.fail` lowering still runs after the argument list is evaluated - so a failed HResult skips the call but not its arguments' side effects. COM/winrt only, therefore Windows only; not reachable from any in-repo `.cb` on macOS. Narrowed 2026-07-31. |
 | [[mangled-generic-name-leaks-into-diagnostics]] | diagnostic | `Box__unique_Itemptr` shown where the user wrote `Box<unique Item*>`. Also a TEST-FRAGILITY problem: pinning an `expect_error` to a mangled name pins it to the mangling scheme. **Prefer prefix-pinning until fixed.** No demangler exists and `MangleTypeArg` is lossy one-way, so the fix is to STORE the source spelling. Filed 2026-07-31. |
 | [[function-pointer-to-fixed-array-not-rejected]] | diagnostic | `function<T>[N]*` silently accepted while `int[N]*` is correctly rejected - the funcptr branch breaks before the `ArrayPtrOf` check. Two-line fix in BOTH `ParseDeclarationSpecifiers` copies; fold into whatever next touches that branch. Filed 2026-07-31. |
 | [[sizeof-of-sized-array-type-parsed-as-cast]] | diagnostic | `sizeof(T[N])` is parsed as a cast and rejected with a message about CASTS - blaming a construct the user never wrote. Not multi-dim specific (`sizeof(int[3])` fails too); `sizeof(variable)` works. Filed 2026-07-31. |
