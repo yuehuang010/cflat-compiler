@@ -13,7 +13,29 @@ expect_error("cannot store borrowed parameter 'n' into unique field 'Holder.slot
     Holder make(Node* n) { Holder h = { slot = n }; return h; }
 }
 
+// The generic spelling of the same brace-init store: the field is made owning by
+// substitution (IsUniqueTypeArg), which this path's IsUnique-only gate could not see.
+// Prefix-pinned to keep the `Box__unique_Nodeptr` mangling out of the assertion.
+struct Box<T> { T t = default; };
+
+expect_error("cannot store borrowed parameter 'n' into unique field 'Box") {
+    void makeGeneric(Node* n) { Box<unique Node*> b = { t = n }; }
+}
+
+// The brace form of the MIXED field-to-field shape: a written `unique` source field into a
+// generic unique destination field. Same double free, same destination-only blindness. The
+// fully generic source stays uncovered here too (IsUniqueFieldRead gates on the source).
+expect_error("cannot store unique field 'a.slot' into unique field 'Box") {
+    void mixedBrace() { Holder a = default; Box<unique Node*> c = { t = a.slot }; }
+}
+
 extern int main()
 {
+    // A fresh allocation brace-inits the generic unique field legally - unchanged.
+    Box<unique Node*> b = { t = new Node() };
+    // The recommended remedy must work in the brace form too: `move` nulls the source field.
+    Holder a = default;
+    a.slot = new Node();
+    Box<unique Node*> c = { t = move a.slot };
     return 0;
 }

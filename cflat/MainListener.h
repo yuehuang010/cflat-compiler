@@ -10048,6 +10048,26 @@ public:
     }
 
     /*
+     * True when a destination field PROVABLY owns a raw pointer whose synthesized destructor
+     * frees it, by either spelling: the written `unique` qualifier, or generic substitution of a
+     * `unique T*` type argument. Destructor synthesis already ORs the two (LLVMBackend.h ~4614),
+     * but the borrow-provenance rejects were keyed on IsUnique alone, so the generic spelling
+     * (`Box<unique Item*>::t`) reached that free with no diagnostic at all (silent abort).
+     * The type-arg arm mirrors the `uniqueAutoSink` ownership rule (LLVMBackend.h ~3581) and is
+     * further restricted to the exact scalar-pointer shape whose free is synthesized, so it can
+     * only reject a slot that is provably freed. Everything else is let through: an `alias` type
+     * argument and a borrow-of-unique-element never set IsUniqueTypeArg in the first place, and a
+     * container's own `T* _data` buffer has it cleared by the explicit-star rule (~3974).
+     */
+    static bool IsOwningUniquePointerField(const LLVMBackend::TypeAndValue& tv)
+    {
+        if (tv.IsUnique) return true;
+        return tv.IsUniqueTypeArg && !tv.IsAlias && !tv.IsBorrowOfUniqueElement
+            && tv.Pointer && !tv.ElemPointer && !tv.IsArrayView && !tv.IsSimd
+            && tv.ConstArraySize == 0;
+    }
+
+    /*
      * Trap A: storing a BORROW into a `unique` field. The field declares that it owns the pointee
      * and its synthesized destructor deletes it, but the borrow's real owner frees it as well.
      * Shared by the two independent field-store paths - the `=` assignment in
@@ -11826,7 +11846,7 @@ public:
             // `nullptr`, and ownership-transferring call results are not borrows and never reach here;
             // `h->slot = h->slot` is a self-assign, not a second owner, so it is excluded too.
             if (operatorText == "=" && right && destIsStructField
-                && namedVar.TypeAndValue.IsUnique
+                && IsOwningUniquePointerField(namedVar.TypeAndValue)
                 && rightNV.IsBorrowed
                 && !rightNV.TypeAndValue.IsMove
                 && !selfUniqueFieldAssign)
@@ -11840,7 +11860,7 @@ public:
             // carries no IsBorrowed, yet the field adopted a live pointee and double-freed (abort).
             std::string fieldBorrowMoveOrigin;
             if (operatorText == "=" && right && destIsStructField
-                && namedVar.TypeAndValue.IsUnique
+                && IsOwningUniquePointerField(namedVar.TypeAndValue)
                 && !rightNV.TypeAndValue.IsMove
                 && !selfUniqueFieldAssign
                 && compiler->IsMovedBorrowedPtrValue(rightNV.Primary, &fieldBorrowMoveOrigin))
@@ -11857,9 +11877,13 @@ public:
             // pointee. Checked after Trap A so a source reached through a borrowed parameter keeps
             // the more precise borrow message. `move a.p` clears Storage, so it is not a field read
             // and stays legal (it nulls the source field); self-assign is excluded above.
+            // The DESTINATION uses the owning-slot predicate so a generic-substituted slot is seen
+            // too. The SOURCE gate IsUniqueFieldRead still requires a written `unique`, so this
+            // closes the MIXED shape (`Box<unique Item*>::t = a.slot`) only; a fully generic
+            // source (`c.t = a.t`) short-circuits there and remains its own filed issue.
             if (operatorText == "=" && right && right->getType()->isPointerTy()
                 && destIsStructField
-                && namedVar.TypeAndValue.IsUnique
+                && IsOwningUniquePointerField(namedVar.TypeAndValue)
                 && IsUniqueFieldRead(rightNV)
                 && !selfUniqueFieldAssign)
             {
@@ -15710,7 +15734,9 @@ public:
         // `unique` field initialized here: this is a second field-store path, so it needs the same
         // two source rejections the `=` path applies (Trap A, and field-to-field). No reassign-free
         // is needed - both callers construct a fresh slot, so there is no old pointee to release.
-        if (fieldType.IsUnique)
+        // The two borrow legs use the same owning-slot predicate as the `=` path, so a field made
+        // owning by generic substitution (`Box<unique Item*>::t`) is seen by both store paths.
+        if (IsOwningUniquePointerField(fieldType))
         {
             std::string fieldDesc = std::format("unique field '{}.{}'", typeName, fieldName);
             if (rightNV.IsBorrowed && !rightNV.TypeAndValue.IsMove)
@@ -15726,9 +15752,12 @@ public:
                 borrowSrc.BorrowedOrigin = braceBorrowMoveOrigin;
                 RejectBorrowIntoUniqueField(borrowSrc, fieldDesc, errCtx);
             }
-            if (IsUniqueFieldRead(rightNV))
-                RejectUniqueFieldToUniqueField(rightNV, fieldDesc, errCtx);
         }
+        // Destination widened as in the `=` path; the source stays written-`unique`-only, so this
+        // closes the MIXED shape and leaves the fully generic source deferred.
+        if (IsOwningUniquePointerField(fieldType) && IsUniqueFieldRead(rightNV))
+            RejectUniqueFieldToUniqueField(rightNV,
+                std::format("unique field '{}.{}'", typeName, fieldName), errCtx);
 
         llvm::Value* val = LoadNamedVariable(rightNV);
         if (!val) return false;

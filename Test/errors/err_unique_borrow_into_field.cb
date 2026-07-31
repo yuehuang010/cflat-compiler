@@ -12,7 +12,36 @@ expect_error("cannot store borrowed parameter 'n' into unique field 'Holder.slot
     void store(Holder* h, Node* n) { h->slot = n; }
 }
 
+// The SAME mistake spelled through a generic: substitution marks the field IsUniqueTypeArg,
+// not IsUnique, and destructor synthesis ORs the two - so the field was freed identically
+// while this reject, keyed on IsUnique alone, never saw it (silent abort, exit 134, no
+// diagnostic at all). Pinned to the stable prefix only: the message names the INSTANTIATED
+// struct, so the full substring would embed the `Box__unique_Nodeptr` mangling.
+struct Box<T> { T t = default; };
+
+expect_error("cannot store borrowed parameter 'n' into unique field 'Box") {
+    void storeGeneric(Node* n) { Box<unique Node*> b = default; b.t = n; }
+}
+
+// The MIXED field-to-field shape: a written `unique` source field into a GENERIC unique
+// destination field. Both synthesized destructors free the one pointee (silent abort, exit
+// 134). The source gate already passed here - only the destination was blind. The FULLY
+// generic source (`c.t = a.t` between two Box) is NOT covered: IsUniqueFieldRead requires
+// `unique` on the source too, so it short-circuits there; that is its own filed issue.
+expect_error("cannot store unique field 'a.slot' into unique field 'Box") {
+    void mixedFieldToField() { Holder a = default; Box<unique Node*> c = default; c.t = a.slot; }
+}
+
 extern int main()
 {
+    // A `move` parameter DOES transfer ownership, so the generic unique field may take it -
+    // the reject above must not widen into this. Same for a fresh heap allocation.
+    Box<unique Node*> b = default;
+    b.t = new Node();
+    // The remedy the field-to-field message recommends must actually work: `move` transfers
+    // out of the source field and nulls it, so there is only ever one owner.
+    Holder a = default;
+    a.slot = new Node();
+    b.t = move a.slot;
     return 0;
 }
