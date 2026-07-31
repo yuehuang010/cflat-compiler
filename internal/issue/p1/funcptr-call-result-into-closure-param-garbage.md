@@ -38,14 +38,31 @@ other source of a thin `function<>` value - local variable, struct field, array 
 join, `??` join, named function, lambda literal - passes correctly on BOTH paths. A
 by-value CALL RESULT is the one that breaks.
 
-## Root cause direction - not diagnosed
+## Root cause direction - LEAD, from the 2026-07-31 advisor pass (unverified by repro)
 
-Not investigated beyond the observation. The likely area is the direct path's fat-parameter
-widen in `CreateOverloadedFunctionCall` (`cflat/LLVMBackend.h`, the arm that now routes through
-`WidenToClosureFatChecked` as of `ce9858e`): a call result has no stable storage, so if the
-widen reads through a slot that was never populated - or materializes a temporary whose
-lifetime ends before the widen - the code slot of the fat `{code, data}` struct would hold
-whatever was on the stack.
+The original guess below ("uninitialized stack") is probably WRONG. A stronger reading of the
+code, not yet confirmed against the IR:
+
+The call result's `TypeAndValue` still carries `CallerName = "make"` - the callee's name
+survives onto the returned value. In `CreateOverloadedFunctionCall`'s fat arm
+(`cflat/LLVMBackend.h` ~17719) the `CallerName` re-resolve then fires and calls
+`GetFunctionForFuncPtr("make", expectedCount = 1, ...)`. That helper's **single-overload early
+return (~18021) returns `overloads.front().Function` unconditionally, ignoring
+`expectedParamCount` entirely** - so `val` is replaced with the address of `make` ITSELF. The
+closure's code slot becomes `&make`, `f(5)` calls `make(5)`, which returns `&dbl`, and that
+address is printed as an int. That also explains "differs between builds": it is a function
+address, not uninitialized memory. `HasFunctionWithMoveFlags` stays silent via its
+`!sawCountMatch` escape (~18010).
+
+The interface path is correct because `LowerByValueArg` has no `CallerName` re-resolve block.
+
+If this holds, the fix is small: clear `CallerName` on call results (preferred), or make the
+~18021 early return respect `expectedParamCount`. Prefer the former - ~18021 also feeds the
+scorer (~16846) and has a much wider blast radius. **Confirm against the IR before editing** -
+this is a code-reading lead, not a diagnosed root cause.
+
+Original guess, retained: a call result has no stable storage, so the widen might read through
+an unpopulated slot or a temporary whose lifetime ended.
 
 Confirm by dumping the IR (`--out-lli`) for the repro and comparing the `insertvalue`
 sequence against the working local-variable spelling; the difference should be immediate.

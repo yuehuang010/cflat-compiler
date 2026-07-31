@@ -21988,6 +21988,11 @@ public:
                                     // value from an arbitrary data pointer. TypeName is left alone
                                     // so overload scoring is unaffected.
                                     argVar.TypeAndValue.IsFunctionPointer = argNV.TypeAndValue.IsFunctionPointer;
+                                    // The SIGNATURE too: the overload scorer rejects a function
+                                    // pointer whose signature disagrees with the parameter's.
+                                    argVar.TypeAndValue.FuncPtrReturnTypeName = argNV.TypeAndValue.FuncPtrReturnTypeName;
+                                    argVar.TypeAndValue.FuncPtrReturnPointer  = argNV.TypeAndValue.FuncPtrReturnPointer;
+                                    argVar.TypeAndValue.FuncPtrParams         = argNV.TypeAndValue.FuncPtrParams;
                                     // Reading the side channel RETIRES it, like the two other
                                     // consumers, so a stale list cannot reach the next argument.
                                     argVar.LambdaCaptureNames = argNV.LambdaCaptureNames;
@@ -22478,6 +22483,12 @@ public:
                                     // Same for `T**`: without it the argument looks like a plain `T*` and a
                                     // pointer-to-pointer would be boxed into an interface parameter.
                                     argVar.TypeAndValue.ElemPointer = argNV.TypeAndValue.ElemPointer;
+                                    // A stored 'function<>'/'Lambda<>' argument's SIGNATURE, so the overload
+                                    // scorer can reject a function pointer of a disagreeing signature.
+                                    // TypeName and IsFunctionPointer are deliberately left alone here.
+                                    argVar.TypeAndValue.FuncPtrReturnTypeName = argNV.TypeAndValue.FuncPtrReturnTypeName;
+                                    argVar.TypeAndValue.FuncPtrReturnPointer  = argNV.TypeAndValue.FuncPtrReturnPointer;
+                                    argVar.TypeAndValue.FuncPtrParams         = argNV.TypeAndValue.FuncPtrParams;
                                     // Propagate bond info so bond-to-move checks work at the call site.
                                     argVar.IsBonded = argNV.IsBonded;
                                     argVar.BondByAddress = argNV.BondByAddress;

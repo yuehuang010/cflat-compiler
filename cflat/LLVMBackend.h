@@ -572,6 +572,12 @@ public:
         // IsThinFnPtr() is DERIVED from TypeName (not stored) so the two can never drift; set
         // TypeName to one of the two names above and this follows.
         bool IsThinFnPtr() const { return TypeName == "__c_fn_ptr"; }
+        // The three signature fields below can be populated with IsFunctionPointer still FALSE:
+        // the direct call-argument loop copies the SIGNATURE of a stored `function<>`/`Lambda<>`
+        // argument without claiming the argument IS one, because setting IsFunctionPointer or
+        // TypeName there would re-route unrelated calls through other branches of the scorer.
+        // A reader of these three must therefore NOT assume IsFunctionPointer (FuncPtrSignatureOf
+        // is the first such reader); a reader of IsFunctionPointer may still assume these.
         std::string FuncPtrReturnTypeName;
         bool FuncPtrReturnPointer = false;
         struct FuncPtrParam { std::string TypeName; bool Pointer = false; bool IsMove = false; };
@@ -12861,6 +12867,25 @@ public:
         return WidenBareOrThinToClosureFat(val);
     }
 
+    /*
+     * The THIN sibling of WidenToClosureFatChecked. A thin `function<>` parameter takes a bare
+     * code address, so a provable data pointer bitcast into that slot is CALLED as code. Shares
+     * the one provenance predicate with the fat gate, and is applied on both the direct call path
+     * and virtual dispatch (LowerByValueArg) so all four combinations keep ONE accept set.
+     */
+    void CheckThinFnPtrArgProvenance(llvm::Value* val, const NamedVariable& arg,
+        const std::string& paramName) const
+    {
+        if (val && val->getType()->isPointerTy() && ArgumentIsProvablyDataPointer(val, arg))
+        {
+            LogError(std::format(
+                "cannot pass {} to 'function<>' parameter '{}': only a named function, a "
+                "'function<>' value or a non-capturing lambda converts to a function pointer - "
+                "a data pointer would be called as code.",
+                DescribeNonFunctionArgument(arg), paramName));
+        }
+    }
+
     // Mirror of LowerClosureFatToThinFnPtr: widen what a fat `Lambda<>` parameter expects.
     // A named function becomes {shim, null} and a thin `function<>` value becomes {code, null};
     // an already-fat value and a non-pointer are returned untouched. Shared by the normal call
@@ -12959,6 +12984,10 @@ public:
             {
                 return WidenToClosureFatChecked(value, arg, param.VariableName);
             }
+            // Thin `function<>` slot fed a raw pointer - same provenance gate, thin wording.
+            // Check only: the lowering below (Upconvert/bitcast) is unchanged.
+            if (param.IsThinFnPtr() && value->getType()->isPointerTy())
+                CheckThinFnPtrArgProvenance(value, arg, param.VariableName);
         }
         if (param.TypeName == "string" && !param.Pointer
             && value && value->getType() == builder->getInt8Ty()->getPointerTo())
@@ -13056,6 +13085,16 @@ public:
     {
         if (!param.IsFunctionPointer && !IsEncodedClosureType(param.TypeName))
             return false;
+        // Second proof: two signatures of KNOWN type classes that differ at the same indirection
+        // shape. Must precede the closure-evidence early-out, which such a pointer would satisfy.
+        if (param.IsFunctionPointer
+            && FunctionPointerShapeOf(arg.TypeAndValue, &arg) == FunctionPointerShapeOf(param, nullptr))
+        {
+            std::string argSig, paramSig;
+            if (FuncPtrSignatureOf(arg.TypeAndValue, argSig)
+                && FuncPtrSignatureOf(param, paramSig) && argSig != paramSig)
+                return true;
+        }
         // Any recorded closure evidence disproves the mismatch.
         if (arg.TypeAndValue.IsFunctionPointer || arg.TypeAndValue.TypeName == "__closure_fat_ptr"
             || IsEncodedClosureType(arg.TypeAndValue.TypeName))
@@ -16878,6 +16917,63 @@ public:
         return tv.Pointer ? 1 : 0;
     }
 
+    /*
+     * TYPE CLASS of one component of a function-pointer signature - deliberately not its spelling.
+     * 'i' = any integer (any width or signedness, plus bool/char and an enum via its backing
+     * type), 'f' = floating point, 'p' = any pointer, 'v' = void. Returns 0 for everything else
+     * (a struct, an interface, an unsubstituted generic), which the caller treats as NOT PROOF.
+     *
+     * Comparing spellings instead would be a false-rejection engine: the compiler already treats
+     * int/i32, long/i64, u32/i32, `int*` and `void*`, an alias and its target, and an enum and its
+     * backing type as one type (see the scorer's own int==i32 rule below), so a differing name is
+     * not evidence of a differing type. Classes are coarse ON PURPOSE - a width or signedness
+     * difference lowers to the same register class and is left to bind exactly as it did before.
+     */
+    char FuncPtrTypeClass(const std::string& typeName, bool pointer) const
+    {
+        if (pointer) return 'p';                  // every pointer is one class under opaque pointers
+        std::string cur = typeName;
+        // Resolve an alias chain / enum to whatever it ultimately names.
+        for (int hop = 0; hop < 8 && !cur.empty(); hop++)
+        {
+            if (auto a = typeAliases.find(cur); a != typeAliases.end()) { cur = a->second; continue; }
+            if (auto e = enumBackingTypes.find(cur); e != enumBackingTypes.end()) { cur = e->second; continue; }
+            break;
+        }
+        if (cur.empty()) return 0;
+        if (cur == "void") return 'v';
+        if (cur == "bool") return 'i';
+        LLVMBackend::TypeAndValue probe;
+        probe.TypeName = cur;
+        if (probe.IsInteger() != -1)       return 'i';
+        if (probe.IsFloatingPoint() != -1) return 'f';
+        return 0;                                  // struct, interface, generic: unknown, not proof
+    }
+
+    /*
+     * Signature of a function-pointer type as a string of TYPE CLASSES (return first, then each
+     * parameter), WITHOUT the thin/fat flavour ToUniqueString carries - a thin `function<>` value
+     * still widens into a fat `Lambda<>` parameter of the same signature (WidenThinToFat), so the
+     * flavour must not participate. Returns false if ANY component is of an unknown class: an
+     * unsubstituted generic or a struct proves nothing and must keep binding as it did before.
+     * Two signatures that both resolve and differ therefore differ in a component's TYPE, or in
+     * arity - never merely in how a type was spelled.
+     */
+    bool FuncPtrSignatureOf(const LLVMBackend::TypeAndValue& tv, std::string& out) const
+    {
+        if (tv.FuncPtrReturnTypeName.empty()) return false;
+        char r = FuncPtrTypeClass(tv.FuncPtrReturnTypeName, tv.FuncPtrReturnPointer);
+        if (r == 0) return false;
+        out = std::string(1, r);
+        for (const auto& p : tv.FuncPtrParams)
+        {
+            char c = FuncPtrTypeClass(p.TypeName, p.Pointer);
+            if (c == 0) return false;
+            out += c;
+        }
+        return true;
+    }
+
     std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> candidates) const
     {
         std::pair<std::vector<NamedVariable>, FunctionSymbol> possibleResult;
@@ -16933,6 +17029,17 @@ public:
                            == FunctionPointerShapeOf(*candidateParamItr, nullptr)) ? 0 : 1;
                     if (result != 0)
                         shapeMismatches++;
+
+                    // Shapes agree: signatures of KNOWN type classes that differ are proof.
+                    // Only at equal shape - a shape mismatch stays score-1 bindable.
+                    if (result == 0)
+                    {
+                        std::string argSig, paramSig;
+                        if (FuncPtrSignatureOf(arg.TypeAndValue, argSig)
+                            && FuncPtrSignatureOf(*candidateParamItr, paramSig)
+                            && argSig != paramSig)
+                            result = -1;
+                    }
                 }
                 else if (arg.TypeAndValue.TypeName != "")
                 {
@@ -17760,6 +17867,9 @@ public:
                     }
                     else if (val)
                     {
+                        // Same provenance gate virtual dispatch applies (LowerByValueArg): the
+                        // bitcast below would otherwise make a data pointer callable as code.
+                        CheckThinFnPtrArgProvenance(val, arg, candParamItr->VariableName);
                         val = builder->CreateBitCast(val, llvmParamTy, "fn_for_extern");
                     }
                 }

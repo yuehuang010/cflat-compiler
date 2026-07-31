@@ -124,3 +124,87 @@ int acceptIntIntoFpParam()
     int n = 3;
     return io.absorb(n);
 }
+
+// The THIN (`function<>`) parameter arm of the same hole. A thin slot takes a BARE code address,
+// so the argument is bitcast straight in and then CALLED (exit 139, no diagnostic). The fat gate
+// above never ran for it: a thin parameter never widens to a {code, env} struct. Both arms now
+// share one provenance predicate (ArgumentIsProvablyDataPointer) applied at the thin lowering
+// sites, so all four combinations of {direct, virtual} x {thin, fat} keep ONE accept set.
+// Both legs pin "'function<>' parameter", which is the ONLY part of the message the fat gate
+// does not also emit - its tail ("a data pointer would be called as code") is shared verbatim.
+
+expect_error("cannot pass a non-function pointer value to 'function<>' parameter 'f'") {
+    class ThinArgDirect { int lam(function<int(int)> f) { return f(5); } };
+
+    int passVoidPointerThinDirect()
+    {
+        ThinArgDirect d;
+        int q = 1;
+        void* vp = &q;
+        return d.lam(vp);
+    }
+}
+
+expect_error("to 'function<>' parameter 'f'") {
+    interface IThinArg { int lam(function<int(int)> f); };
+    class ThinArgImpl : IThinArg { int lam(function<int(int)> f) { return f(5); } };
+
+    int passIntPointerThinVirtual()
+    {
+        ThinArgImpl impl;
+        IThinArg io = impl;
+        int q = 1;
+        int* ip = &q;
+        return io.lam(ip);
+    }
+}
+
+// A function pointer of a DIFFERENT signature bound the parameter and was called through it -
+// `dd` invoked as `int(int)`, printing a silent wrong value at exit 0. Two signatures that BOTH
+// resolve and DIFFER at the same indirection shape are proof and are rejected; an absent or
+// unresolved signature (an unsubstituted generic) is not proof and still binds.
+//
+// Each leg declares TWO overloads of the SAME arity on purpose. With distinct arities the arity
+// filter leaves a single candidate and the direct call never reaches the overload SCORER (and
+// the virtual call takes the lone-slot arm), so a one-overload leg would pass without ever
+// exercising the code these pin.
+
+expect_error("no overload of 'lam' matches the given arguments") {
+    double sigMismatchFn(double x) { return x + 1000.0; }
+
+    class SigDirect
+    {
+        int lam(function<int(int)> f) { return f(5); }
+        int lam(double d)             { return (int)d + 100; }
+    };
+
+    int passWrongSignatureDirect()
+    {
+        SigDirect d;
+        function<double(double)> g = sigMismatchFn;
+        return d.lam(g);
+    }
+}
+
+expect_error("no method of 'ISigSlot.lam' matches the given arguments") {
+    double sigMismatchFn2(double x) { return x + 1000.0; }
+
+    interface ISigSlot
+    {
+        int lam(function<int(int)> f);
+        int lam(double d);
+    };
+    class SigSlotImpl : ISigSlot
+    {
+        int lam(function<int(int)> f) { return f(5); }
+        int lam(double d)             { return (int)d + 100; }
+    };
+
+    int passWrongSignatureVirtual()
+    {
+        SigSlotImpl impl;
+        ISigSlot io = impl;
+        function<double(double)> g = sigMismatchFn2;
+        return io.lam(g);
+    }
+}

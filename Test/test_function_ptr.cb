@@ -1886,6 +1886,103 @@ bool testLambdaParamShadowsEnclosing()
 // MAIN
 // ─────────────────────────────────────────────────────────────────────────────
 
+// -- Argument provenance / signature gating (must-keep-working side) ---------
+//
+// Two rejections were added for function-pointer arguments: a provable DATA pointer into a thin
+// `function<>` slot, and a function pointer whose SIGNATURE disagrees with the parameter's. Both
+// reject only what they can PROVE, so every legal spelling below must still bind and produce its
+// value. A ternary join is a select/phi and a `??` join is a load from an alloca - neither
+// carries any closure evidence, so an allowlist-shaped gate would false-reject them.
+
+int thinCall(function<int(int)> f)   { return f(5); }
+int fatCall(Lambda<int(int)> f)      { return f(5); }
+int fatCall(double d)                { return 300 + (int)d; }   // same arity: forces the scorer
+
+// Two candidates of the SAME arity: the funcptr arm must still win for a MATCHING signature.
+// (A distinct arity would let the arity filter decide and prove nothing about the scorer.)
+int sigPick(function<int(int)> f)    { return 100 + f(5); }
+int sigPick(double d)                { return 200 + (int)d; }
+
+int add10FnPtr(int x)                { return x + 10; }
+
+// Signature EQUIVALENCE across spellings. The compiler treats int/i32, long/i64 and any two
+// pointer types as one type, so a differing SPELLING is not evidence of a differing type and
+// must still bind - on the scorer, on the single-candidate path, and through a vtable slot.
+int spellCall(function<i32(i32)> f)  { return f(5); }
+int spellCall(double d)              { return 400 + (int)d; }   // same arity: forces the scorer
+int spellCallOnly(function<i32(i32)> f)  { return f(5); }
+long add10Long(long x)               { return x + (long)10; }
+int spellCallI64(function<i64(i64)> f)   { return (int)f((i64)5); }
+void takeVoidPtr(void* p)            { int* ip = (int*)p; ip[0] = 15; }
+int spellCallVoidPtr(function<void(void*)> f) { int q = 0; f(&q); return q; }
+
+interface ISpell { int lam(function<i32(i32)> f); };
+class SpellImpl : ISpell { int lam(function<i32(i32)> f) { return f(5); } };
+
+// RECORDED GAP, not desired behaviour. Rejecting a function-pointer candidate in the overload
+// scorer is a PREFERENCE verdict ("this candidate does not match"), not a validation one, so a
+// same-arity sibling that can absorb a pointer takes the call SILENTLY instead of the call being
+// an error. Master bound the funcptr arm and called the callee at the wrong type; neither answer
+// is right. Pinned so the behaviour is recorded rather than rediscovered - see
+// internal/issue/p1/funcptr-overload-binding-ignores-signature.md.
+double rebindOther(double x)         { return x + 1000.0; }
+int rebindProbe(function<int(int)> f) { return f(5); }
+int rebindProbe(void* p)              { return 999; }
+
+bool testFuncPtrArgProvenanceAccepts()
+{
+    bool result = true;
+
+    // A thin `function<>` value into a FAT `Lambda<>` parameter: the signature comparison must
+    // ignore the thin/fat flavour, or this legal widening (WidenThinToFat) would be rejected.
+    function<int(int)> thin = add10FnPtr;
+    result &= Test("thin value into fat param", fatCall(thin), 15);
+
+    // A `?:` join carries no closure evidence at all.
+    function<int(int)> a = add10FnPtr;
+    function<int(int)> b = doubleIt;
+    int k = 1;
+    result &= Test("ternary join into thin param", thinCall(k > 0 ? a : b), 15);
+    result &= Test("ternary join other arm",       thinCall(k > 0 ? b : a), 10);
+
+    // A `??` join lowers to a load from an alloca, not a select.
+    function<int(int)>? maybe = add10FnPtr;
+    result &= Test("null-coalesce join into thin param", thinCall(maybe ?? doubleIt), 15);
+
+    // A matching signature still binds the function-pointer arm over a same-arity double arm.
+    result &= Test("matching signature picks the funcptr arm", sigPick(thin), 115);
+    result &= Test("double still picks the double arm",        sigPick(2.0), 202);
+
+    // int vs i32 is ONE type spelled two ways. All three proof sites must stay permissive:
+    // the overload scorer (two same-arity candidates), the single-candidate direct path, and
+    // the interface lone-slot arm. A spelling-level comparison hard-errors on every one.
+    result &= Test("int/i32 crossing, scorer",           spellCall(thin),     15);
+    result &= Test("int/i32 crossing, single candidate", spellCallOnly(thin), 15);
+    SpellImpl si;
+    ISpell iso = si;
+    result &= Test("int/i32 crossing, interface slot",   iso.lam(thin),       15);
+
+    // long/i64 is the same story, and any two pointer types are one class under opaque pointers.
+    function<long(long)> gl = add10Long;
+    result &= Test("long/i64 crossing",   spellCallI64(gl), 15);
+    function<void(int*)> gp = takeVoidPtr;
+    result &= Test("int*/void* crossing", spellCallVoidPtr(gp), 15);
+
+    // The double arm of the crossing overload set is still reachable.
+    result &= Test("crossing set keeps its double arm", spellCall(3.0), 403);
+    result &= Test("fat crossing set keeps double arm", fatCall(4.0),   304);
+
+    // A MATCHING signature must still beat the pointer-absorbing sibling - the rejection is
+    // per candidate, so the void* arm must not start stealing legal function-pointer calls.
+    result &= Test("matching signature beats the void* sibling", rebindProbe(thin), 15);
+    // ... and the recorded gap: a MISMATCHED signature rebinds to that sibling instead of
+    // erroring. Asserting 999 (not 5) pins the current answer AND that master's is gone.
+    function<double(double)> wrongSig = rebindOther;
+    result &= Test("mismatched signature rebinds to the sibling", rebindProbe(wrongSig), 999);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -1986,6 +2083,9 @@ extern int main()
     // Brace-init of a closure field auto-clones the env, same as the `=` store
     total++; passed += testClosureBraceInitClonesEnv()   ? 1 : 0;
     total++; passed += testClosureFieldReadIntoLocal()   ? 1 : 0;
+
+    // Function-pointer argument provenance / signature gating: legal spellings still bind
+    total++; passed += testFuncPtrArgProvenanceAccepts()  ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

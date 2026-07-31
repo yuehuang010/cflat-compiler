@@ -64,12 +64,14 @@ Next P1s, and the sequencing that matters:
 - `ftell-fseek-long-width-on-windows` cannot be verified on a macOS host - land it from Windows.
 
 The four function-pointer / closure P1s fixed on 2026-07-31 left FIVE residues, all filed rather
-than implied: `data-pointer-into-thin-function-param-segfaults`,
-`funcptr-overload-binding-ignores-signature`, `funcptr-call-result-into-closure-param-garbage`
-(P1), and `data-pointer-returned-as-closure-not-gated`,
-`shape-mismatched-funcptr-arg-binds-silently` (P2). They are one defect family - argument and
-return lowering for callable values - and a future pass should scope them together rather than
-one at a time.
+than implied. `fix/funcptr-arg-accept-set` closes ONE of them outright
+(`data-pointer-into-thin-function-param-segfaults`, deleted) and NARROWS a second:
+`funcptr-overload-binding-ignores-signature` is closed for the type-CLASS axis and rewritten in
+place for what remains (width, signedness, pointee, aggregates - see the landed record below).
+Still open unchanged: `funcptr-call-result-into-closure-param-garbage` (P1), and
+`data-pointer-returned-as-closure-not-gated`, `shape-mismatched-funcptr-arg-binds-silently` (P2).
+They are one defect family - argument and return lowering for callable values - and a future pass
+should scope them together rather than one at a time.
 
 **`fix/iface-ifconst` is rebased and parked** at `2dc0b51` (was 24 commits stale; rebased with
 two trivial conflicts, all five hook points untouched by master). Nothing from it has landed. It
@@ -150,9 +152,8 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | [[interface-boxing-keyed-on-source-binding]] | NARROWED 2026-07-31: the two binding erasures (parens, `??`) and the two un-routed boxing sites are closed. What remains is `delete` of a BORROWED interface box (exit 139/133, no diagnostic) - a different root, reachable with no join at all. |
 | [[ftell-fseek-long-width-on-windows]] | Silent wrong value on Windows: core binds C `long` as pointer-sized, so `ftell`/`fseek` read garbage under LLP64. Not a UI issue despite being Windows-only. |
 | [[interface-method-call-on-null-value-segfaults]] | SIGSEGV (139), no guard. Fires on a PLAIN non-generic interface too. Pre-existing and language-wide. |
-| [[data-pointer-into-thin-function-param-segfaults]] | Silent miscompile then SIGSEGV (exit 139), no diagnostic. A data pointer bitcasts straight into a THIN `function<>` parameter and is called. Deliberate residue of `ce9858e` - that fix gated only the FAT (`Lambda<>`) parameter arm. Filed 2026-07-31. |
+| [[funcptr-overload-binding-ignores-signature]] | NARROWED 2026-07-31 by `fix/funcptr-arg-accept-set`: the type-CLASS axis is closed on both paths (the filed `double`-into-`int` repro now errors). Still open, silent and identical on master: floating-point WIDTH (same SHAPE as the closed repro), integer width/signedness, POINTEE type (memory-unsafe - reads past the end of the object), and aggregates. Do NOT re-close by widening the comparison to spellings; see the file. |
 | [[funcptr-call-result-into-closure-param-garbage]] | Silent wrong value, exit 0, **no diagnostic at all**. A `function<>` returned by value into a fat `Lambda<>` parameter yields uninitialized garbage. DIRECT path only; every other source of a thin value passes correctly. Filed 2026-07-31. |
-| [[funcptr-overload-binding-ignores-signature]] | Silent wrong value, exit 0, no diagnostic. A `function<>` argument binds a function-pointer parameter of a mismatched SIGNATURE and is called anyway - the scorer compares indirection shape only, never callee/parameter signatures. Filed 2026-07-31. |
 | [[unique-field-to-field-copy-double-frees]] | Silent abort (exit 134), no diagnostic. Copying one `unique` field into another double-frees in a GENERIC container, while the identical plain-struct spelling is correctly diagnosed. Filed 2026-07-31. |
 | [[return-dangle-missed-when-slot-has-extra-user]] | Missed dangle, no diagnostic. Residue of `2bcc5a0`; NOT to be fixed by widening the whitelist. |
 | [[llvm-cannot-select-sign-extend-on-const-array-index]] | LLVM fatal error, compiler exit 134. Pre-existing; the front-end shape that fed it is now rejected earlier, so no live repro remains - confirm no other spelling reaches it, then re-rank. |
@@ -307,12 +308,104 @@ which a future session must not "fix" back without reopening the decision.
 | Generic-substituted `unique` field ownership seen by the field-store gates | `d65f000` |
 | `function<T>` split from `function<T>*`; `Lambda<T>*` rejected | `4000fa1` |
 | Closure widening gated on the direct call path; interface argument slots type-gated | `4097959` |
+| Thin `function<>` argument provenance gated; function-pointer SIGNATURE participates in binding | fix/funcptr-arg-accept-set (branch, not yet merged) |
 | Fixed-array shape: `auto` deduces a view, `T[N] b = a` is a copy | fix/array-shape |
 | `using` interface alias resolved as an `is`/`as` target (`GenerateIsCheck`/`GenerateSafeCast`); residual asymmetry filed as [[interface-lookup-alias-asymmetry-latent]] | fix/iface-alias (branch, not yet merged) |
 | Interface boxing keyed on the VALUE, not the source binding; `??` join boxed per arm | fix/iface-boxing (branch, not yet merged) |
 | `if const` leaf emission gated on insert-block LIVENESS, not non-nullness | fix/ifconst-ir (branch, not yet merged) |
 
 Suite trajectory across the whole sequence: 522 -> 530 -> 536 -> 538 -> 540.
+
+### fix/funcptr-arg-accept-set - the thin `function<>` accept set, and signature-aware binding
+
+Two P1s, deliberately fixed in DIFFERENT LAYERS. Collapsing them into one check was the trap.
+
+**The thin data-pointer hole is a LOWERING bug, not a scorer bug.** `ce9858e` closed the FAT
+(`Lambda<>`) parameter arm through one provenance gate; the THIN arm never widens to a
+`{code, env}` struct, so it never reached that gate and the argument was bitcast straight into a
+bare code slot and CALLED (exit 139). The fix is `CheckThinFnPtrArgProvenance`, a thin-flavoured
+sibling of `WidenToClosureFatChecked` sharing the SAME predicate
+(`ArgumentIsProvablyDataPointer`), applied at both thin lowering sites - the "extern
+C-compatible" else-branch of the funcptr arm in `CreateOverloadedFunctionCall`, which also
+serves internal thin params, and the thin case in `LowerByValueArg` (virtual dispatch), where
+thin+pointer previously fell through BOTH guards. The scorer's `arg.BaseType->isPointerTy()`
+clause STAYS PERMISSIVE on purpose: a legal thin value is an indistinguishable pointer at scoring
+time, and `TypeAndValue.IsFunctionPointer` is measurably FALSE for every legal source of one.
+Putting the rejection in the scorer would recreate the direct-vs-virtual accept-set divergence.
+
+**The issue file's root cause for the SIGNATURE bug was incomplete, and the correction is the
+whole fix.** It said `ComputeOverloadFunction` "compares function-pointer arguments by SHAPE
+only". Measured with an instrumented build: the scorer never sees the argument's signature at
+all. Call-site argument assembly in `MainListener.h` rebuilds `argVar` field by field and
+propagated the function-pointer type ONLY for a lambda literal, so a stored `function<>` variable
+arrived with `IsFunctionPointer` false and an empty `FuncPtrReturnTypeName`. The enabling change
+is propagating the three signature fields (`FuncPtrReturnTypeName`, `FuncPtrReturnPointer`,
+`FuncPtrParams`) in BOTH argument loops - and ONLY those three. `TypeName` and
+`IsFunctionPointer` are deliberately left alone in the direct loop: setting `TypeName` would move
+the argument out of the scorer's LLVM-type branch into its named-type branch and change
+resolution for unrelated calls.
+
+**The comparison is TYPE-level, never SPELLING-level - and the first cut got this wrong.**
+`ToUniqueString` encodes the thin/fat flavour (`cfuncptr` vs `funcptr`), so naive encoded-name
+equality would have rejected the legal thin -> fat widening that `WidenThinToFat` exists to
+support. That much was caught before landing. What was NOT, and what review round 1 caught as a
+confirmed P1 false-rejection regression, is that resolving aliases and enums is **necessary but
+nowhere near sufficient**: `int`/`i32`, `long`/`i64`, `u32`/`i32` and any two pointer types are
+ONE type spelled two ways - the scorer says so itself 40 lines below (`int==i32`), and
+`IsKnownTypeName` puts them in one scalar set. A name-equality comparison hard-errored on six
+programs master runs correctly, on BOTH proof sites and BOTH paths, including the ordinary
+single-candidate call. In-repo code was green only because no `.cb` happens to cross a spelling
+boundary at a `function<>` argument - the "name-only discriminator, sweep first" trap, and a
+differential sweep over existing corpus files structurally cannot see it.
+
+The shipped comparison therefore reduces each component to a coarse TYPE CLASS
+(`FuncPtrTypeClass`): `i` any integer (any width or signedness, plus bool/char and an enum via
+its backing type), `f` floating point, `p` any pointer, `v` void, and 0 = unknown for a struct,
+an interface or an unsubstituted generic. `FuncPtrSignatureOf` returns FALSE if any component is
+unknown. Classes are coarse ON PURPOSE: a width or signedness difference lowers to the same
+register class, so it is left binding exactly as before. What remains provable is a component
+whose CLASS differs (the filed repro, `double` where `int` is expected) or an arity difference -
+never a spelling.
+
+**Signatures are compared only at EQUAL indirection shape.** A shape disagreement is the separate
+open [[shape-mismatched-funcptr-arg-binds-silently]] and must stay score-1 bindable, or the
+`pickFnPtrShape` / `pickFnPtrShapeRev` legs in `Test/test_function_ptr.cb` (which pin the shape
+ranking from `4000fa1`) break.
+
+**Parity forced a SECOND consumer.** The scorer fix alone left the interface path unfixed: a
+lone same-arity slot never reaches `ComputeOverloadFunction`, it takes the lone-slot arm in
+`ResolveInterfaceMethodSlot`. The same PROOF ("both signatures reduce to known type classes,
+shapes agree, TYPE CLASSES differ") was therefore also added to
+`ArgumentProvablyMismatchesParameter`, ahead of its closure-evidence early-out - which a genuine
+function pointer of the wrong signature would otherwise satisfy.
+
+Ratified behaviour changes. A data pointer into a thin `function<>` parameter is now a COMPILE
+ERROR on both the direct and the virtual path; it previously compiled to a segfault.
+
+A function pointer whose signature differs from the parameter's in a component's TYPE CLASS (or
+in arity) at the same indirection shape is now a compile error too - **but only when no
+same-arity sibling can take the call.** The rejection lives in the overload SCORER, where
+`result = -1` means "this candidate does not match", a preference verdict and not a validation
+one. With a sibling that absorbs a pointer (`int lam(void* p)`, a variadic `int lam(char* fmt,
+...)`, or the same pair as interface slots) the call silently REBINDS to the sibling instead:
+master printed `b=5`, calling the callee at the wrong type; this prints `b=999`. Neither answer
+is right, and the rebind is pre-existing behaviour of the pointer-permissive scorer rather than
+something this change introduced - what changed is only that the funcptr candidate stopped being
+viable. It is pinned by the `rebindProbe` legs in `Test/test_function_ptr.cb` and recorded in the
+narrowed issue file; do not read the ratified line as "a mismatched signature always errors".
+
+RESIDUAL, and the reason the second issue file was rewritten rather than deleted: the type
+classes are coarse ON PURPOSE, so a mismatch WITHIN a class is still invisible - floating-point
+WIDTH (`float` into a `double` slot, the same SHAPE as the closed repro), integer width and
+signedness, POINTEE type (memory-unsafe: reads past the end of the object), and aggregates. All
+silent, all identical on master, none of them regressions. See
+[[funcptr-overload-binding-ignores-signature]], which carries the repros and the fix direction -
+including the explicit instruction NOT to retry a widened SPELLING comparison.
+
+Not fixed, and deliberately left alone: a `function<>` returned BY VALUE from a call into a fat
+`Lambda<>` parameter still yields garbage on the DIRECT path
+([[funcptr-call-result-into-closure-param-garbage]], different root - a `CallerName` re-resolve
+hitting `GetFunctionForFuncPtr`'s single-overload early return).
 
 ### fix/ifconst-ir - `if const` leaf emission gated on insert-block LIVENESS
 
@@ -875,6 +968,16 @@ it** (493 files, only the two intended test files differed), and neither could t
 guard the bail: it used a `CiMove*` competitor, the one pointer shape the narrowed predicate DID
 cover, so it was aimed at the wrong half of its own predicate. The bail is now plain
 `param->Pointer`, and there are four legs - class / `void*` / `char*` / `int*`.
+
+**Why this does NOT interact with the funcptr signature binding landed alongside it** (both edit
+the same two call-site argument loops). The propagation of the three `FuncPtr*` fields runs BEFORE
+the boxing block in both loops, and the boxing gate reads `TypeName.empty()`, which the
+propagation never writes. Note the tempting wrong reason: "boxing bails on any pointer parameter,
+and a funcptr parameter is a pointer" is FALSE - a plain `function<T>` parameter has
+`Pointer == false` (only `function<T>*` sets it), and boxing does fire at a position shared with a
+`function<>` overload. The actual protection is that a funcptr parameter is never `IsInterface`,
+so it can never be the boxing TARGET, and a `??` join of function pointers can never satisfy
+`ResolvePointerElementTypeName` + `IsDataStructure`. Do not lean on the pointer premise.
 
 The reviewer's suggested INVERSION ("bail unless every candidate parameter here is an interface")
 was evaluated and REJECTED: `f(Circle c)` / `f(IShape s)` has a non-interface candidate, so the
