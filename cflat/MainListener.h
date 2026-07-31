@@ -10009,6 +10009,39 @@ public:
     }
 
     /*
+     * True only when `value` is PROVABLY the address of a stack slot in the current frame: the
+     * value itself is an alloca, or a GEP chain rooted at one (`&local`, `&arr[0]`, `&s.f`).
+     * Deliberately one-directional - anything not provable returns false and is let through, so
+     * this can never reject a legal heap/global/borrowed source.
+     */
+    static bool IsProvableStackAddress(llvm::Value* value)
+    {
+        if (value == nullptr || !value->getType()->isPointerTy())
+            return false;
+        llvm::Value* base = value->stripPointerCasts();
+        // Walk GEP bases; stripInBoundsOffsets is not used since a non-constant index still
+        // keeps the address inside the same stack object.
+        while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(base))
+            base = gep->getPointerOperand()->stripPointerCasts();
+        return llvm::isa<llvm::AllocaInst>(base);
+    }
+
+    /*
+     * A `unique` location owns its pointee and its synthesized teardown frees it. A stack address
+     * is not ownable - the free would run on memory the program never allocated (abort / heap
+     * corruption at run time, with no diagnostic). Rejected only for a PROVABLE stack address.
+     */
+    void RejectStackAddressIntoUnique(const std::string& destDesc,
+                                      antlr4::ParserRuleContext* ctx)
+    {
+        LogErrorContext(ctx, std::format(
+            "cannot store the address of a stack value into {} - a 'unique' location owns its "
+            "pointee and its synthesized destructor frees it, but a stack address was never "
+            "allocated and freeing it is undefined. Use 'new' to allocate on the heap, or drop "
+            "'unique' if it only borrows.", destDesc));
+    }
+
+    /*
      * The LOCAL counterpart of RejectBorrowIntoUniqueField: a BORROW stored into a `unique` local.
      * The local's scope-exit teardown frees the pointee and so does its real owner, so this would
      * free it twice. Shared by the decl-init and `=` reassignment paths so both spell it the same.
@@ -11714,6 +11747,21 @@ public:
                 && RejectOwningValueCopyIntoField(rightNV, right, selfUniqueFieldAssign, rejectCopied, ctx))
                 return right;
 
+            // A PROVABLE stack address into a scalar `unique` field: the shape gate keeps the
+            // pointer-worded message off whole-array and interface fields, where it would be untrue.
+            if (operatorText == "=" && right && destIsStructField
+                && (namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg)
+                && namedVar.TypeAndValue.Pointer
+                && namedVar.TypeAndValue.ConstArraySize == 0
+                && !namedVar.TypeAndValue.IsInterface
+                && !selfUniqueFieldAssign
+                && IsProvableStackAddress(right))
+            {
+                RejectStackAddressIntoUnique(
+                    std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar)), ctx);
+                return right;
+            }
+
             // Storing a BORROW into a `unique` field. The field declares that it owns the pointee and
             // its synthesized destructor deletes it, but the borrow's real owner frees it as well.
             // This is Trap A from internal/plan/ownership-move-alias-discipline.md, diagnosable here
@@ -12049,6 +12097,54 @@ public:
                         consumedUniqueFieldSource = true;
                     }
                 }
+            }
+
+            /*
+             * Same reject for an ELEMENT of a `unique T* f[N]` fixed array, field or local. The
+             * synthesized teardown releases every slot (EmitOwningUniqueArrayCleanup for a local,
+             * EmitUniqueArrayFieldRelease for a field), so a stack address in any slot is freed
+             * exactly like the scalar case. The subscript zeroes ConstArraySize and produces a
+             * two-index GEP over the ARRAY type, so neither the struct-field nor the local leg
+             * sees it: destIsStructField requires a struct source element type, and the local leg
+             * requires an alloca/global destination.
+             */
+            auto* destArrGep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(destination);
+            if (operatorText == "=" && right && right->getType()->isPointerTy()
+                && namedVar.IsElementAccess
+                && destArrGep && destArrGep->getNumIndices() == 2
+                && destArrGep->getSourceElementType()->isArrayTy()
+                && (namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg)
+                && namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsInterface
+                && !namedVar.TypeAndValue.IsInterfacePointer
+                && !namedVar.TypeAndValue.IsFunctionPointer
+                && !namedVar.TypeAndValue.IsArrayView
+                && IsProvableStackAddress(right))
+            {
+                std::string slot = namedVar.FieldName.empty() && !namedVar.CallerName.empty()
+                    ? namedVar.CallerName : DescribeUniqueFieldOwner(namedVar);
+                RejectStackAddressIntoUnique(
+                    std::format("an element of unique array '{}'", slot), ctx);
+                return right;
+            }
+
+            // Storing a PROVABLE stack address into a `unique T*` LOCAL. The local's scope-exit
+            // teardown frees the pointee, so this would free a stack address. `&local` carries no
+            // borrow provenance, so the reassignment legs below never see it.
+            if (operatorText == "=" && right && right->getType()->isPointerTy()
+                && !destIsStructField
+                && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination))
+                && (namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg)
+                && namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsInterface
+                && !namedVar.TypeAndValue.IsInterfacePointer
+                && !namedVar.TypeAndValue.IsFunctionPointer
+                && !namedVar.TypeAndValue.IsArrayView
+                && IsProvableStackAddress(right))
+            {
+                RejectStackAddressIntoUnique(
+                    std::format("unique local '{}'", namedVar.CallerName), ctx);
+                return right;
             }
 
             // `unique T* LOCAL` reassignment (`b = a`): free the old pointee before overwriting,
@@ -15579,6 +15675,14 @@ public:
 
         llvm::Value* val = LoadNamedVariable(rightNV);
         if (!val) return false;
+
+        // Same provable stack-address reject the `=` path applies, with the same scalar-pointer
+        // shape gate; `&local` carries no borrow provenance for the legs above to see.
+        if ((fieldType.IsUnique || fieldType.IsUniqueTypeArg)
+            && fieldType.Pointer && fieldType.ConstArraySize == 0 && !fieldType.IsInterface
+            && IsProvableStackAddress(val))
+            RejectStackAddressIntoUnique(
+                std::format("unique field '{}.{}'", typeName, fieldName), errCtx);
 
         // Same allocation-alignment agreement the `=` path demands: this store reaches the very
         // same synthesized free site, so a mismatch here corrupts the heap identically.

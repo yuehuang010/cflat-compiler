@@ -1,0 +1,67 @@
+// A `unique` location owns its pointee and its synthesized teardown frees it. The address
+// of a stack local was never allocated, so that free is undefined - it aborted at run time
+// with no diagnostic at all (internal/issue: unique-ptr-field-stack-address-aborts-silently).
+// `&local` carries no borrow provenance, so none of the existing Trap-A borrow legs saw it.
+// Rejected only for a PROVABLY stack address (an alloca, or a GEP chain rooted at one);
+// anything not provable is still let through.
+struct Item { int v = 0; };
+
+struct Holder { unique Item* slot = nullptr; };
+
+// A generic-substituted `unique` field reaches the very same synthesized free site, so the
+// check ORs in IsUniqueTypeArg the way destructor synthesis already does. This is the exact
+// spelling from the filed issue.
+struct Box<T> { T t = default; };
+
+expect_error("cannot store the address of a stack value into unique field 'Holder.slot'") {
+    void storeField() { Item i; Holder h = default; h.slot = &i; }
+}
+
+// Pinned to the stable prefix only: the diagnostic names the INSTANTIATED struct, so the
+// full substring would embed the `Box__unique_Itemptr` mangling and break if it ever changes.
+expect_error("cannot store the address of a stack value into unique field 'Box") {
+    void storeGenericField() { Item i; Box<unique Item*> b = default; b.t = &i; }
+}
+
+expect_error("cannot store the address of a stack value into unique local 'p'") {
+    void storeLocal() { Item i; unique Item* p = nullptr; p = &i; }
+}
+
+// `unique T* f[N]` is a supported spelling (see err_unique_fixed_array.cb): the synthesized
+// teardown releases EVERY slot, so a stack address in any slot is freed just like the scalar
+// case. The subscript produces a two-index GEP over the array type, which neither the
+// struct-field nor the local leg above matches - hence its own check.
+struct Tree { unique Item* kids[8] = default; };
+
+expect_error("cannot store the address of a stack value into an element of unique array 'Tree.kids'") {
+    void storeFieldArrayElem() { Item i; Tree t = default; t.kids[0] = &i; }
+}
+
+expect_error("cannot store the address of a stack value into an element of unique array 'kids'") {
+    void storeLocalArrayElem() { Item i; unique Item* kids[8] = default; kids[0] = &i; }
+}
+
+// A bare self-field array element access (no explicit `this.` receiver) inside the owning
+// struct's own method: GetMemberVariable leaves both FieldName and CallerName empty, so the
+// name must be recovered via DescribeUniqueFieldOwner's VariableName fallback - the same
+// fallback the scalar unique-field leg above already gets. SplitEnclosingStruct cannot
+// recover the struct name here (a plain instance method's frame name carries no struct
+// prefix - only "~Type" and static methods do), so the owner is dropped and the bare field
+// name is printed, matching the existing delete-unique-field diagnostic's convention.
+expect_error("cannot store the address of a stack value into an element of unique array 'kids'") {
+    struct SelfFieldTree { unique Item* kids[8] = default; void bad() { Item i; kids[1] = &i; } };
+}
+
+extern int main()
+{
+    // Legal ownership code still compiles: a heap source is what `unique` is for.
+    Holder h = default;
+    h.slot = new Item();
+    Box<unique Item*> b = default;
+    b.t = new Item();
+    Tree t = default;
+    t.kids[0] = new Item();
+    unique Item* kids[8] = default;
+    kids[0] = new Item();
+    return 0;
+}
