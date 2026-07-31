@@ -2290,6 +2290,67 @@ int testUniqueInterfaceTernary()
     }
     passed += Test("iface_ternary_move_vs_null_untaken_g_freed_once", dtorCount, 1);
 
+    /*
+     * BINDING-ERASED sources. Every guard on the class->interface boxing path used to key off the
+     * source's NamedVariable, so a spelling that carries no binding - parentheses around the
+     * operand, with or without 'as' - skipped the ownership transfer entirely. The box and the
+     * source both owned the object and it was freed twice (SIGTRAP/SIGABRT, no diagnostic). The
+     * transfer is keyed on the VALUE now, so every spelling agrees with the plain `k = owner` one.
+     * dtorCount is the discriminator: exactly one free, and the second free would abort the run.
+     */
+    dtorCount = 0;
+    {
+        CiMove* pOwner = new CiMove();
+        IShapeMove pk = (pOwner);
+        passed += Test("iface_paren_box_value", pk.area(), 7);
+        passed += Test("iface_paren_box_no_early_free", dtorCount, 0);
+        delete pk;
+        passed += Test("iface_paren_box_freed_once", dtorCount, 1);
+    }
+    passed += Test("iface_paren_box_source_not_freed_again", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        CiMove* aOwner = new CiMove();
+        IShapeMove ak = (aOwner) as IShapeMove;
+        passed += Test("iface_paren_as_box_value", ak.area(), 7);
+        delete ak;
+        passed += Test("iface_paren_as_box_freed_once", dtorCount, 1);
+    }
+    passed += Test("iface_paren_as_box_source_not_freed_again", dtorCount, 1);
+
+    // The assignment-STATEMENT spelling of the same erasure. It is a different code path from the
+    // declaration initializer and was open-coded until it was routed through the shared helper.
+    dtorCount = 0;
+    {
+        CiMove* sOwner = new CiMove();
+        IShapeMove sk = nullptr;
+        sk = (sOwner);
+        passed += Test("iface_paren_assign_box_value", sk.area(), 7);
+        delete sk;
+        passed += Test("iface_paren_assign_box_freed_once", dtorCount, 1);
+    }
+    passed += Test("iface_paren_assign_box_source_not_freed_again", dtorCount, 1);
+
+    /*
+     * A '??' join into an interface. It joins through a SLOT rather than a phi, so its result
+     * carried no class name, every boxing branch was skipped, and a raw 'ptr' was stored into the
+     * fat slot - the compile died on an LLVM module-verifier dump with no source location. Both
+     * arms are boxed per arm now. The two legs select DIFFERENT arms and the arms carry different
+     * areas, so neither leg can pass off the other arm's box.
+     */
+    {
+        CiMove* ncA = new CiMove(); ncA->r = 2;
+        CiMove* ncB = new CiMove(); ncB->r = 30;
+        CiMove* ncNull = nullptr;
+        IShapeMove ncRight = ncNull ?? ncB;
+        passed += Test("iface_nullcoalesce_right_arm", ncRight.area(), 37);
+        IShapeMove ncLeft = ncA ?? ncB;
+        passed += Test("iface_nullcoalesce_left_arm", ncLeft.area(), 9);
+        delete ncA;
+        delete ncB;
+    }
+
     return passed;
 }
 
@@ -3473,7 +3534,7 @@ extern int main()
     total += 8;
 
     passed += testUniqueInterfaceTernary();
-    total += 67;
+    total += 79;
 
     passed += testTernaryInterfaceInheritanceRebox();
     total += 22;

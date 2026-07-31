@@ -1,0 +1,48 @@
+// The '??' spelling of an interface-bound pointer JOIN. Unlike '?:' it joins through a SLOT, so
+// its result is a plain load and its arms cannot be recovered from the IR; the lowering ledgers
+// them and the boxing path reads them back. An arm that names no class - here the address of a
+// by-value local - must reach the SAME diagnostic the '?:' spelling gives
+// (err_return_ternary_iface_arm_unresolved.cb), with the operator the source actually wrote named
+// in it. Before this, the join was never boxed at all and the compile died on a bare LLVM
+// module-verifier dump with no source location.
+//
+// SCOPE: only the DECLARATION-INITIALIZER and ASSIGNMENT spellings of '??' are covered here,
+// because only those two are wired to the boxing helper. `return p ?? q;` into an interface still
+// emits a raw verifier dump, and `take(z ?? b)` is still a false rejection - both are filed as
+// internal/issue/p1/nullcoalesce-join-not-boxed-on-return-and-call-arg.md. Do not read this file
+// as covering the return path.
+
+interface IThing { int value(); };
+
+class Thing : IThing
+{
+    int n = 0;
+    int value() { return n; }
+};
+
+expect_error("cannot convert '??' arm to interface 'IThing'") {
+    int bindNullCoalesceAddressOfLocal()
+    {
+        Thing a; a.n = 1;
+        Thing b; b.n = 2;
+        IThing t = &a ?? &b;
+        return t.value();
+    }
+}
+
+// The ASSIGNMENT spelling of the same join reaches the same helper by a different code path.
+expect_error("cannot convert '??' arm to interface 'IThing'") {
+    int assignNullCoalesceAddressOfLocal()
+    {
+        Thing a; a.n = 1;
+        Thing b; b.n = 2;
+        IThing t = nullptr;
+        t = &a ?? &b;
+        return t.value();
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

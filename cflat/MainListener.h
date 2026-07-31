@@ -9095,17 +9095,20 @@ public:
                                 // Catch the case where the RHS is a known type that doesn't implement the interface.
                                 bool rhsIsKnownType = !structName.empty() &&
                                     (compiler->dataStructures.count(structName) || compiler->programTable.count(structName));
-                                // A '?:' result carries no TypeName: box each arm in its own branch.
+                                // A '?:' / '??' join result carries no TypeName: box each arm in
+                                // its own branch. The arms keep their ownership (see the helper).
                                 std::string ternaryArmFailure;
+                                std::string joinSpelling = "?:";
                                 llvm::Value* ternaryFat = structName.empty()
-                                    ? UpcastTernaryPhiToInterface(right, typeAndValue.TypeName, &ternaryArmFailure)
+                                    ? UpcastPointerJoinToInterface(right, typeAndValue.TypeName,
+                                                                   &ternaryArmFailure, &joinSpelling)
                                     : nullptr;
                                 if (ternaryFat != nullptr)
                                     right = ternaryFat;
                                 else if (!ternaryArmFailure.empty())
                                     LogErrorContext(assignmentExpression, std::format(
-                                        "cannot convert '?:' arm to interface '{}': {}",
-                                        typeAndValue.TypeName, ternaryArmFailure));
+                                        "cannot convert '{}' arm to interface '{}': {}",
+                                        joinSpelling, typeAndValue.TypeName, ternaryArmFailure));
                                 else if (rhsIsKnownType && !compiler->StructImplementsInterface(structName, typeAndValue.TypeName))
                                 {
                                     LogErrorContext(assignmentExpression,
@@ -10964,18 +10967,55 @@ public:
     }
 
     /*
-     * The shared class->interface boxing site: the decl-init path and 'as' both route here, so
-     * they cannot drift apart again. NOT yet the only one - the assignment-STATEMENT and
-     * call-argument paths are still open-coded. Applies the implements check, the pointer-shape
-     * rejection, data-pointer selection and the owning-source transfer in that order, then
-     * ledgers what it boxed so later guards can ask instead of re-deriving it from emitted IR. `srcNV` is null when the operand has no named binding (a '?:' arm, an
-     * arithmetic result); the binding-dependent guards are then skipped by construction.
+     * Retire the OWNING source behind an already-boxed VALUE when the name-keyed transfer could
+     * not run - the spelling erased the binding (parentheses, a cast chain, anything that drops
+     * Storage / IsOwning off the NamedVariable). Keyed on value identity, so no new spelling can
+     * defeat it the way SoleCastOperandOf's syntactic walk could.
+     *
+     * Polarity: this PROVES ownership before acting - `value` must be a pointer LoadInst whose
+     * slot IS the Storage of a live binding that declares itself owning (IsOwningValue). A call
+     * result, a phi, a field GEP, a borrow: none of them is proven owning, so all are left alone
+     * and keep today's behaviour. The marks mirror what the plain named spelling already emits, so
+     * `IShape s = (c);` and `IShape s = c;` diagnose a later use of `c` identically.
+     */
+    bool RetireOwningSourceOfBoxedValue(llvm::Value* value)
+    {
+        auto* compiler = compilerLLVM;
+        auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(value);
+        if (load == nullptr || !load->getType()->isPointerTy()) return false;
+        if (!compiler->IsOwningValue(load)) return false;
+        auto* slot = load->getPointerOperand();
+        compiler->builder->CreateStore(
+            llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(load->getType())), slot);
+        std::string name = compiler->FindVariableNameByStorage(slot);
+        if (!name.empty())
+        {
+            compiler->MarkVariableMoved(name);
+            compiler->MarkVariableMovedIntoInterface(name);
+        }
+        return true;
+    }
+
+    /*
+     * The shared class->interface boxing site: decl-init, 'as', the assignment STATEMENT and
+     * brace/element init all route here, so this is the only place a class is boxed into an
+     * interface from a single concrete source and the guards cannot drift apart again (the '?:'
+     * and '??' JOINS box per arm through BoxInterfaceJoinArms, which applies the same ledger).
+     * Applies the implements check, the pointer-shape rejection, data-pointer selection and the
+     * owning-source transfer in that order, then ledgers what it boxed so later guards can ask
+     * instead of re-deriving it from emitted IR. `srcNV` is null when the operand has no named
+     * binding (a '?:' arm, an arithmetic result); the binding-dependent guards are then skipped by
+     * construction, and the VALUE-keyed retirement below covers the ownership half.
+     * `adoptsOwnership` is false for the sites whose destination runs its own ownership
+     * bookkeeping (a struct FIELD store refcounts an escaping `new` instead of nulling the source),
+     * so this helper must not pre-empt it.
      * Every LogError below throws, so no partially-built fat value or ledger entry escapes.
      */
     llvm::Value* BoxConcreteIntoInterface(antlr4::ParserRuleContext* errCtx, llvm::Value* srcValue,
                                           bool sourceIsPointer, const std::string& structName,
                                           const std::string& interfaceName,
-                                          const LLVMBackend::NamedVariable* srcNV)
+                                          const LLVMBackend::NamedVariable* srcNV,
+                                          bool adoptsOwnership = true)
     {
         auto* compiler = compilerLLVM;
         if (!compiler->StructImplementsInterface(structName, interfaceName))
@@ -11001,7 +11041,8 @@ public:
         // Ownership transfer: null the owning source and mark it moved so its scope-exit free
         // cannot double-free the object the interface box now owns.
         bool transferred = false;
-        if (srcNV != nullptr && srcNV->IsOwning && sourceIsPointer && srcNV->Storage != nullptr)
+        if (adoptsOwnership && srcNV != nullptr && srcNV->IsOwning && sourceIsPointer
+            && srcNV->Storage != nullptr)
         {
             if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(srcNV->BaseType))
             {
@@ -11014,6 +11055,9 @@ public:
                 }
             }
         }
+        // The binding-erased spelling: same transfer, recovered from the VALUE instead of a name.
+        if (adoptsOwnership && !transferred && sourceIsPointer)
+            transferred = RetireOwningSourceOfBoxedValue(dataPtr);
 
         LLVMBackend::InterfaceBoxRecord record;
         record.FatValue = fat;
@@ -11071,42 +11115,52 @@ public:
                 || compiler->lastOwningResult);
     }
 
+    // One arm of an interface-bound join: the incoming value and the predecessor block whose
+    // terminator the arm's box is emitted before.
+    struct InterfaceJoinArm
+    {
+        llvm::Value* Value = nullptr;
+        llvm::BasicBlock* Block = nullptr;
+    };
+
     /*
-     * Upcast a '?:' result to an interface fat pointer. A ternary phi carries no NamedVariable
-     * TypeName, so the ordinary upcast is skipped and a raw `ptr` would be bitcast into the fat
-     * struct type - invalid IR. Box each incoming arm inside the arm's OWN block, which also
+     * Box the arms of a pointer JOIN ('?:' or '??') into an interface fat pointer. A join carries
+     * no NamedVariable TypeName, so the ordinary upcast is skipped and a raw `ptr` would be bitcast
+     * into the fat struct type - invalid IR. Box each arm inside the arm's OWN block, which also
      * covers arms with DIFFERENT concrete classes (each gets its own vtable), and join the fat
-     * pointers with a second phi. A null arm contributes a null fat pointer. An arm's concrete
-     * class comes from ResolvePointerElementTypeName, which answers a BORROWED arm (a plain load,
-     * absent from the `new`-site ledger) from the loaded binding's declared type - otherwise that
-     * arm would fail to resolve and the caller would bitcast a raw `ptr` into the fat struct.
-     * Returns nullptr when this does not apply, leaving the caller's normal path untouched.
-     * `armFailure` (when given) is set ONLY for a pointer '?:' that genuinely targets this
-     * interface but has an arm that cannot be boxed - the caller must diagnose that instead of
+     * pointers with a phi inserted at `joinPoint`. A null arm contributes a null fat pointer. An
+     * arm's concrete class comes from ResolvePointerElementTypeName, which answers a BORROWED arm
+     * (a plain load, absent from the `new`-site ledger) from the loaded binding's declared type -
+     * otherwise that arm would fail to resolve and the caller would bitcast a raw `ptr` into the
+     * fat struct. Returns nullptr when this does not apply, leaving the caller's normal path
+     * untouched. `armFailure` (when given) is set ONLY for a pointer join that genuinely targets
+     * this interface but has an arm that cannot be boxed - the caller must diagnose that instead of
      * bitcasting a raw `ptr` into the fat struct. It stays empty for every "does not apply" bail.
+     *
      * `transferArmOwnership` is set ONLY by the `move`-interface RETURN path: the box escapes the
      * frame there, so an OWNING arm local is nulled inside its own arm block and the untaken arm
      * still runs its ordinary null-guarded scope-exit free (no leak, no double free). Every other
-     * caller keeps the box inside the frame and must not disturb the arms' owners. It also arms
-     * the per-arm ownership check that reports through `armNotOwned`: transferring an arm that
-     * owns nothing would make the caller a second owner of a live borrow, so the caller must
-     * raise the ordinary not-owned return diagnostic instead of boxing.
+     * caller keeps the box inside the frame and must not disturb the arms' owners - a join into a
+     * plain interface local is a BORROW by design (test_move's iface_ternary_thin_* legs pin that
+     * the owner stays alive and frees exactly once), so no transfer may happen there. It also arms
+     * the per-arm ownership check that reports through `armNotOwned`: transferring an arm that owns
+     * nothing would make the caller a second owner of a live borrow, so the caller must raise the
+     * ordinary not-owned return diagnostic instead of boxing.
      */
-    llvm::Value* UpcastTernaryPhiToInterface(llvm::Value* right, const std::string& interfaceName,
-                                             std::string* armFailure = nullptr,
-                                             bool transferArmOwnership = false,
-                                             bool* armNotOwned = nullptr)
+    llvm::Value* BoxInterfaceJoinArms(const std::vector<InterfaceJoinArm>& arms,
+                                      llvm::Value* joinValue, llvm::Instruction* joinPoint,
+                                      const std::string& interfaceName, std::string* armFailure,
+                                      bool transferArmOwnership, bool* armNotOwned)
     {
         auto* compiler = compilerLLVM;
-        auto* phi = llvm::dyn_cast_or_null<llvm::PHINode>(right);
-        if (phi == nullptr || interfaceName.empty() || !phi->getType()->isPointerTy()) return nullptr;
-        unsigned count = phi->getNumIncomingValues();
-        if (count == 0) return nullptr;
+        unsigned count = static_cast<unsigned>(arms.size());
+        if (count == 0 || joinPoint == nullptr || interfaceName.empty()) return nullptr;
         // Resolve every arm first: a partial rewrite would leave half-boxed IR behind.
         std::vector<std::string> armTypes(count);
         for (unsigned i = 0; i < count; i++)
         {
-            llvm::Value* incoming = phi->getIncomingValue(i);
+            llvm::Value* incoming = arms[i].Value;
+            if (incoming == nullptr || arms[i].Block == nullptr) return nullptr;
             if (llvm::isa<llvm::ConstantPointerNull>(incoming)) continue;
             armTypes[i] = compiler->ResolvePointerElementTypeName(incoming);
             if (armTypes[i].empty())
@@ -11122,7 +11176,7 @@ public:
                     *armFailure = std::format("'{}' does not implement it", armTypes[i]);
                 return nullptr;
             }
-            if (phi->getIncomingBlock(i)->getTerminator() == nullptr) return nullptr;
+            if (arms[i].Block->getTerminator() == nullptr) return nullptr;
             /*
              * A 'move' return transfers EVERY arm, so an arm that owns nothing would hand the
              * caller a second owner of a live borrow (double free). The whole-expression check on
@@ -11153,9 +11207,9 @@ public:
                 boxed[i] = llvm::Constant::getNullValue(fatTy);
                 continue;
             }
-            compiler->builder->SetInsertPoint(phi->getIncomingBlock(i)->getTerminator());
+            compiler->builder->SetInsertPoint(arms[i].Block->getTerminator());
             auto* vtable = compiler->GetOrCreateVTable(armTypes[i], interfaceName);
-            llvm::Value* armData = phi->getIncomingValue(i);
+            llvm::Value* armData = arms[i].Value;
             boxed[i] = compiler->BuildInterfaceFatValue(vtable, armData);
 
             // Ownership transfer for an escaping box (see transferArmOwnership). Null the arm's
@@ -11184,10 +11238,10 @@ public:
             record.OwnershipTransferred = transferred;
             compiler->RegisterInterfaceBox(record);
         }
-        compiler->builder->SetInsertPoint(phi);
+        compiler->builder->SetInsertPoint(joinPoint);
         auto* fatPhi = compiler->builder->CreatePHI(fatTy, count, "ternary_iface");
         for (unsigned i = 0; i < count; i++)
-            fatPhi->addIncoming(boxed[i], phi->getIncomingBlock(i));
+            fatPhi->addIncoming(boxed[i], arms[i].Block);
         compiler->builder->SetInsertPoint(savedBlock, savedPoint);
 
         /*
@@ -11195,24 +11249,83 @@ public:
          * arms, and the receiver now adopts a different value (fatPhi), so the verdict must travel
          * with it or a join with a live BORROW arm is destroyed by its receiver and again by its
          * real owner. The diagnostic entry rides along either way (a suppressed one stays visible
-         * to the no-discard check); the thin phi's own entries are retired so nothing misfires off
+         * to the no-discard check); the thin join's own entries are retired so nothing misfires off
          * a value that only feeds the boxing.
          */
         bool armsAllOwn = true;
         for (unsigned i = 0; i < count; i++)
-            if (!compiler->TernaryArmJoinsOwning(phi->getIncomingValue(i))) armsAllOwn = false;
-        compiler->PropagateOwnedReturnTemp(phi, fatPhi);
+            if (!compiler->TernaryArmJoinsOwning(arms[i].Value)) armsAllOwn = false;
+        compiler->PropagateOwnedReturnTemp(joinValue, fatPhi);
         if (armsAllOwn)
         {
-            if (compiler->IsMovedOutPtrValue(phi)) compiler->RegisterMovedOutPtrValue(fatPhi);
+            if (compiler->IsMovedOutPtrValue(joinValue)) compiler->RegisterMovedOutPtrValue(fatPhi);
         }
         else
         {
             compiler->SuppressCallerRelease(fatPhi);
-            compiler->SuppressCallerRelease(phi);
+            compiler->SuppressCallerRelease(joinValue);
             compiler->ClearOwnedResultChannels();
         }
         return fatPhi;
+    }
+
+    // The '?:' spelling of a join: the arms ARE the phi's incoming edges. See BoxInterfaceJoinArms.
+    llvm::Value* UpcastTernaryPhiToInterface(llvm::Value* right, const std::string& interfaceName,
+                                             std::string* armFailure = nullptr,
+                                             bool transferArmOwnership = false,
+                                             bool* armNotOwned = nullptr)
+    {
+        auto* phi = llvm::dyn_cast_or_null<llvm::PHINode>(right);
+        if (phi == nullptr || interfaceName.empty() || !phi->getType()->isPointerTy()) return nullptr;
+        std::vector<InterfaceJoinArm> arms;
+        for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+            arms.push_back({ phi->getIncomingValue(i), phi->getIncomingBlock(i) });
+        return BoxInterfaceJoinArms(arms, phi, phi, interfaceName, armFailure, transferArmOwnership,
+                                    armNotOwned);
+    }
+
+    /*
+     * The '??' spelling of the same join. Unlike '?:' it lowers through a SLOT, so the joined value
+     * is a plain load and the arms are unrecoverable from the IR - the lowering ledgers them
+     * (RegisterNullCoalesceJoin) and this reads them back. Without it the boxing chain found no
+     * TypeName on the result, skipped every branch, and stored a raw `ptr` into the fat slot: a
+     * module-verifier failure with no source diagnostic. The load is the first instruction of the
+     * join's resume block, so the fat phi inserted before it is still the block's leading phi.
+     */
+    llvm::Value* UpcastNullCoalesceToInterface(llvm::Value* right, const std::string& interfaceName,
+                                               std::string* armFailure = nullptr)
+    {
+        auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(right);
+        if (load == nullptr || interfaceName.empty() || !load->getType()->isPointerTy()) return nullptr;
+        const auto* join = compilerLLVM->FindNullCoalesceJoin(load);
+        if (join == nullptr) return nullptr;
+        std::vector<InterfaceJoinArm> arms;
+        for (const auto& arm : join->Arms) arms.push_back({ arm.Value, arm.Block });
+        return BoxInterfaceJoinArms(arms, load, load, interfaceName, armFailure, false, nullptr);
+    }
+
+    /*
+     * Box a pointer JOIN of either spelling ('?:' or '??') into `interfaceName`. Returns nullptr
+     * when neither applies, leaving the caller's normal path untouched. `joinSpelling` (when given)
+     * names the spelling that produced a failure, so the diagnostic blames the operator the source
+     * actually wrote; it is left alone unless this call sets `armFailure`.
+     */
+    llvm::Value* UpcastPointerJoinToInterface(llvm::Value* right, const std::string& interfaceName,
+                                              std::string* armFailure,
+                                              std::string* joinSpelling = nullptr)
+    {
+        if (auto* fat = UpcastTernaryPhiToInterface(right, interfaceName, armFailure))
+            return fat;
+        if (armFailure != nullptr && !armFailure->empty())
+        {
+            if (joinSpelling != nullptr) *joinSpelling = "?:";
+            return nullptr;
+        }
+        auto* fat = UpcastNullCoalesceToInterface(right, interfaceName, armFailure);
+        if (fat == nullptr && joinSpelling != nullptr && armFailure != nullptr
+            && !armFailure->empty())
+            *joinSpelling = "??";
+        return fat;
     }
 
     // True when every arm of a '?:' phi is a null pointer, so the joined value owns nothing.
@@ -11756,38 +11869,31 @@ public:
                 if (!namedVar.TypeAndValue.IsInterfacePointer && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(right))
                     right = llvm::Constant::getNullValue(compiler->GetFatPtrType());
                 std::string structName = rightNV.TypeAndValue.TypeName;
-                // A '?:' result carries no TypeName: box each arm in its own branch.
+                // A '?:' / '??' join result carries no TypeName: box each arm in its own branch.
+                // No ownership transfer: a join into a plain interface local is a BORROW by design.
                 if (structName.empty() && !namedVar.TypeAndValue.IsInterfacePointer)
                 {
                     std::string ternaryArmFailure;
-                    auto* ternaryFat = UpcastTernaryPhiToInterface(
-                        right, namedVar.TypeAndValue.TypeName, &ternaryArmFailure);
+                    std::string joinSpelling = "?:";
+                    auto* ternaryFat = UpcastPointerJoinToInterface(
+                        right, namedVar.TypeAndValue.TypeName, &ternaryArmFailure, &joinSpelling);
                     if (ternaryFat != nullptr)
                         right = ternaryFat;
                     else if (!ternaryArmFailure.empty())
                         LogErrorContext(ctx, std::format(
-                            "cannot convert '?:' arm to interface '{}': {}",
-                            namedVar.TypeAndValue.TypeName, ternaryArmFailure));
+                            "cannot convert '{}' arm to interface '{}': {}",
+                            joinSpelling, namedVar.TypeAndValue.TypeName, ternaryArmFailure));
                 }
                 if (!structName.empty()
-                    && compiler->StructImplementsInterface(structName, namedVar.TypeAndValue.TypeName)
-                    && !RejectPointerShapedInterfaceUpcast(
-                           ctx, rightNV.TypeAndValue, namedVar.TypeAndValue.TypeName))
+                    && compiler->StructImplementsInterface(structName, namedVar.TypeAndValue.TypeName))
                 {
-                    auto vtable = compiler->GetOrCreateVTable(structName, namedVar.TypeAndValue.TypeName);
-                    llvm::Value* dataPtr;
-                    if (rightNV.TypeAndValue.Pointer)
-                        dataPtr = right;
-                    else
-                    {
-                        dataPtr = rightNV.Storage;
-                        if (!dataPtr)
-                        {
-                            dataPtr = compiler->CreateAlloca(right->getType());
-                            compiler->CreateAssignment(right, dataPtr);
-                        }
-                    }
-                    right = compiler->BuildInterfaceFatValue(vtable, dataPtr);
+                    // A FIELD store keeps its own bookkeeping (TransferPointerOwnershipOnStore
+                    // refcounts an escaping `new`), so only a plain slot adopts here.
+                    bool destAdopts = llvm::isa_and_nonnull<llvm::AllocaInst>(destination)
+                        || llvm::isa_and_nonnull<llvm::GlobalVariable>(destination);
+                    right = BoxConcreteIntoInterface(
+                        ctx, right, rightNV.TypeAndValue.Pointer, structName,
+                        namedVar.TypeAndValue.TypeName, &rightNV, destAdopts);
                 }
                 // Same provable rejection as the decl-init spelling; a fat-ptr DESTINATION only,
                 // since an 'IFoo*' slot stores a pointer and never bitcasts to the fat struct.
@@ -12978,15 +13084,23 @@ public:
             compiler->CreateConditionJump(lhs, notNullBlock, nullBlock);
             // insert point is now notNullBlock (lhs is not null)
             compiler->CreateAssignment(lhs, resultAlloca);
-            compiler->CreateJump(resumeBlock);
+            auto* lhsBr = compiler->CreateJump(resumeBlock);
 
             compiler->SwitchToBlock(nullBlock);
             llvm::Value* rhs = ParseConditionalExpression(ctx->conditionalExpression());
             compiler->CreateAssignment(rhs, resultAlloca);
-            compiler->CreateJump(resumeBlock);
+            auto* rhsBr = compiler->CreateJump(resumeBlock);
 
             compiler->SwitchToBlock(resumeBlock);
-            return { compiler->CreateLoad(resultAlloca), false };
+            auto* joined = compiler->CreateLoad(resultAlloca);
+            // Ledger the arms for the interface-boxing path: this joins through a SLOT, so the
+            // result is a plain load and the arms are unrecoverable from the IR afterwards.
+            if (joined != nullptr && lhsBr != nullptr && rhsBr != nullptr
+                && rhs != nullptr && joined->getType()->isPointerTy()
+                && lhs->getType()->isPointerTy() && rhs->getType()->isPointerTy())
+                compiler->RegisterNullCoalesceJoin(
+                    joined, { { lhs, lhsBr->getParent() }, { rhs, rhsBr->getParent() } });
+            return { joined, false };
         }
 
         // Grammar: logicalOrExpression ('?' expression ':' conditionalExpression)?
@@ -15869,15 +15983,10 @@ public:
         // placed after it can only ever see class sources (see RejectPrimitiveShapedInterfaceUpcast).
         if (RejectPrimitiveShapedInterfaceUpcast(errCtx, rightNV.TypeAndValue, ifaceName)) return val;
         if (srcName.empty() || !compiler->StructImplementsInterface(srcName, ifaceName)) return val;
-        if (RejectPointerShapedInterfaceUpcast(errCtx, rightNV.TypeAndValue, ifaceName)) return val;
-        auto vtable = compiler->GetOrCreateVTable(srcName, ifaceName);
-        llvm::Value* dataPtr = rightNV.TypeAndValue.Pointer ? val : rightNV.Storage;
-        if (!dataPtr)
-        {
-            dataPtr = compiler->CreateAlloca(val->getType());
-            compiler->CreateAssignment(val, dataPtr);
-        }
-        return compiler->BuildInterfaceFatValue(vtable, dataPtr);
+        // A FIELD / array-ELEMENT destination: TransferPointerOwnershipOnStore owns the
+        // bookkeeping, so this must not adopt (see BoxConcreteIntoInterface's adoptsOwnership).
+        return BoxConcreteIntoInterface(errCtx, val, rightNV.TypeAndValue.Pointer, srcName,
+                                        ifaceName, &rightNV, false);
     }
 
     bool EmitOneFieldInit(

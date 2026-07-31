@@ -133,7 +133,7 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 13 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 14 |
 | **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 30 |
 | **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 21 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
@@ -142,7 +142,8 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Issue | Severity |
 |---|---|
-| [[interface-boxing-keyed-on-source-binding]] | Double free (exit 134) via parens / `?:`; verifier failure via `??`; two un-routed boxing sites. Merged 2026-07-30. |
+| [[interface-boxing-keyed-on-source-binding]] | NARROWED 2026-07-31: the two binding erasures (parens, `??`) and the two un-routed boxing sites are closed. What remains is `delete` of a BORROWED interface box (exit 139/133, no diagnostic) - a different root, reachable with no join at all. |
+| [[nullcoalesce-join-not-boxed-on-return-and-call-arg]] | Module-verifier dump with NO source location for `return p ?? q;` into an interface; the call-argument spelling is a false rejection. Residue of the fix that closed the decl-init and assignment spellings. Filed 2026-07-31. |
 | [[ftell-fseek-long-width-on-windows]] | Silent wrong value on Windows: core binds C `long` as pointer-sized, so `ftell`/`fseek` read garbage under LLP64. Not a UI issue despite being Windows-only. |
 | [[interface-method-call-on-null-value-segfaults]] | SIGSEGV (139), no guard. Fires on a PLAIN non-generic interface too. Pre-existing and language-wide. |
 | [[data-pointer-into-thin-function-param-segfaults]] | Silent miscompile then SIGSEGV (exit 139), no diagnostic. A data pointer bitcasts straight into a THIN `function<>` parameter and is called. Deliberate residue of `ce9858e` - that fix gated only the FAT (`Lambda<>`) parameter arm. Filed 2026-07-31. |
@@ -240,8 +241,8 @@ This is the single largest source of entries in this queue, and it has now produ
 issues rather than a dozen scattered ones:
 
 - Interface boxing was open-coded at four sites - assignment, return, `?:`, `as`.
-  `BoxConcreteIntoInterface` (`MainListener.h:9969`) now carries every guard for two of them;
-  the rest is [[interface-boxing-keyed-on-source-binding]].
+  `BoxConcreteIntoInterface` now carries every guard for every SINGLE-VALUE source (2026-07-31);
+  the two JOIN spellings share `BoxInterfaceJoinArms`.
 - Overload scoring is three hand-copied probe/replay loop pairs;
   [[overload-replay-blames-wrong-candidate]] wants one `ScoreCandidates(probe)` helper.
 - Generic name resolution had three disagreeing key conventions;
@@ -301,6 +302,7 @@ which a future session must not "fix" back without reopening the decision.
 | Closure widening gated on the direct call path; interface argument slots type-gated | `4097959` |
 | Fixed-array shape: `auto` deduces a view, `T[N] b = a` is a copy | fix/array-shape |
 | `using` interface alias resolved as an `is`/`as` target (`GenerateIsCheck`/`GenerateSafeCast`); residual asymmetry filed as [[interface-lookup-alias-asymmetry-latent]] | fix/iface-alias (branch, not yet merged) |
+| Interface boxing keyed on the VALUE, not the source binding; `??` join boxed per arm | fix/iface-boxing (branch, not yet merged) |
 
 Suite trajectory across the whole sequence: 522 -> 530 -> 536 -> 538 -> 540.
 
@@ -632,6 +634,104 @@ test legs. Because a corpus sweep that only COMPILES cannot see a silent value c
 marker whenever either new code path fired: across `Test/`, `example/` and all 64 `core/*.cb`, the
 paths fire ONLY in the three files this change edits. No pre-existing program in the repo reaches
 either one.
+
+### fix/iface-boxing - boxing keyed on the VALUE; the `??` join boxed per arm
+
+Closed the two BINDING ERASURES that
+[[interface-boxing-keyed-on-source-binding]] was consolidated on, and routed the last two
+open-coded boxing sites through `BoxConcreteIntoInterface`. The issue file survives, NARROWED onto
+a different root (see below).
+
+**The two erasures, and how each was closed.**
+
+1. **Parentheses erase the binding, so the ownership transfer never ran.** Every guard in
+   `BoxConcreteIntoInterface` keyed off the source `NamedVariable`, and a parenthesized primary
+   arrives with `Storage` / `IsOwning` / `CallerName` dropped. `IShape s = (c);`,
+   `IShape s = (c) as IShape;` and the assignment-statement `s = (c);` therefore built the box and
+   left `c` owning: `delete s` plus `c`'s scope-exit free was a DOUBLE FREE (exit 133/134, no
+   diagnostic). The fix is `RetireOwningSourceOfBoxedValue`, keyed on VALUE identity: a pointer
+   `LoadInst` whose slot IS the `Storage` of a live owning binding is nulled and marked moved.
+   Widening `SoleCastOperandOf` to see through parentheses was explicitly rejected - a syntactic
+   walk closes one spelling and the next binding-eraser reopens it.
+2. **`??` joins through a SLOT, so nothing was boxed at all.** Its result is a plain `LoadInst`
+   with no `TypeName` and no arms recoverable from the IR, so every boxing branch was skipped and
+   a raw `ptr` was stored into the fat slot - a module-verifier dump with NO source location.
+   `UpcastTernaryPhiToInterface` was generalized into `BoxInterfaceJoinArms` (arms + join point),
+   the `??` lowering ledgers its arms (`LLVMBackend::RegisterNullCoalesceJoin`, same clear/park
+   points and the same raw-`Value*` invariant as `interfaceBoxRecords_`), and
+   `UpcastNullCoalesceToInterface` reads them back. An unresolvable arm now gets the `?:`
+   diagnostic with the operator the source actually wrote named in it.
+
+**RATIFIED BEHAVIOUR CHANGE: the paren and `as`-through-paren spellings now MOVE their source.**
+`RetireOwningSourceOfBoxedValue` calls `MarkVariableMoved`, so programs that COMPILED AND RAN on
+`4097959` are now hard errors:
+
+```cflat
+IShape s1 = (c); IShape s2 = (c);   // base: runs. branch: "use of moved variable 'c'"
+for (int i = 0; i < 3; i++) { IShape s = (c); }
+                                    // base: runs. branch: "use of moved variable 'c'
+                                    //                      (moved on an earlier loop iteration)"
+```
+
+This is intended. The no-paren spelling `IShape s1 = c; IShape s2 = c;` ALREADY produced exactly
+that error on the base binary, so the change makes the two spellings agree; boxing an owning value
+into an interface genuinely IS a move, and the old acceptance is precisely what double-freed on
+`delete`. Do not "fix" it back without reopening this decision.
+
+A second, milder consequence of the same move: an owning source retired through a paren spelling
+whose box is never `delete`d LEAKS, because interface locals are not auto-destructed
+(`IShape s = argc > 99 ? ((c) as IShape) : ((e) as IShape);` runs 2 destructors on base and 1 on
+the branch). Pre-existing for the no-paren spelling, which already leaks the same way.
+
+**DO NOT RETRY: a per-arm ownership transfer for the `?:` join.** The issue file prescribed it as
+the fix for the `?:` double free. It was implemented, measured, and reverted, and an independent
+review then rebuilt the branch WITH it enabled and measured it again. Both runs agree:
+
+- It does fix the headline shape (`IShape s = k ? a : b; delete s;` goes 134 -> 0)...
+- ...and it breaks `Test/test_move.cb`'s `iface_ternary_thin_borrow_arm_*` legs, which exit 139 at
+  `owner->area()` because the borrowed arm's `unique CiMove* owner` was nulled inside its own arm
+  block. `test.sh` went 540/0 -> 539/1. It trades a double free for a use-after-null.
+- **The existing `armNotOwned` guard cannot rescue it.** That guard rejects only
+  `IsProvablyNonOwningPointerLoad`, and `owner` GENUINELY OWNS, so it never fires. Neither would an
+  all-arms-own guard, for the same reason.
+- **The fact that distinguishes "consume this arm" from "borrow this arm" lives on the
+  DESTINATION, not on the arm.** A join into a plain interface local is a BORROW by design - the
+  same rule the declaration side already states by rejecting
+  `unique IShape s = k ? a : b;` ("cannot initialize unique 's' from a borrowed value"). A per-arm
+  transfer at that site is therefore unfixable IN PRINCIPLE, not merely unfinished.
+
+**So the surviving `?:` double free is a DIFFERENT bug**, and the issue file was re-rooted onto it
+rather than deleted: `delete` of a borrowed interface box is not diagnosed. It needs no join at
+all - `int f(Circle* p) { IShape s = p; delete s; ... }` is exit 139 on both binaries.
+
+**Two sites were ROUTED, not rewritten.** The assignment-STATEMENT boxing and
+`CoerceInitValueToInterface` (brace / element init) were open-coded copies of implements-check ->
+`RejectPointerShapedInterfaceUpcast` -> data-pointer selection -> `BuildInterfaceFatValue`. Both
+now call `BoxConcreteIntoInterface`, so the "this is the only place" claim in its comment is true
+again for every SINGLE-VALUE source. A new `adoptsOwnership` parameter is false where the
+destination runs its own ownership bookkeeping - a FIELD store refcounts an escaping `new` in
+`TransferPointerOwnershipOnStore` instead of nulling the source - so routing did not move
+ownership from one mechanism to the other. Routing changed no behaviour EXCEPT through the shared
+value-keyed retirement described above.
+
+**Blast radius, measured.** A 505-file differential sweep (`Test/`, `example/` and all of
+`cflat/core/`, both binaries, isolated `HOME` per side, comparing stdout+stderr+exit for compile
+AND run) found 493 byte-identical, 12 differing: 10 proven nondeterministic (each self-differs
+across two runs of the SAME binary - timings, PIDs, ASLR addresses, `HOME` paths) and 2 the
+intended new test legs. An instrumented build showed the rerouted assignment site firing in 17
+files and the brace-init site in 1, all with identical output.
+
+**What the sweep does NOT bound.** The instrumented build showed `RetireOwningSourceOfBoxedValue`
+firing in exactly one file - but that bounds nothing, because NO file in the corpus boxes an
+owning value through parentheses. The move consequence above was found by hand-written probes
+against the base binary, not by the sweep, and a future change to this path needs the same
+treatment.
+
+**Still unfixed, filed rather than closed**:
+[[nullcoalesce-join-not-boxed-on-return-and-call-arg]]. Only the DECL-INIT and ASSIGNMENT
+spellings of `??` were wired to the new helper; `return p ?? q;` still emits a raw
+`Function return type does not match operand type of return inst!` on base, master and branch, and
+`take(z ?? b)` is still a false rejection.
 
 ### `2bcc5a0` - the return dangle, on the fourth attempt
 
@@ -968,7 +1068,7 @@ named a shared root and a shared fix vehicle - never on a shared symptom.
 | Merged into | From | Root |
 |---|---|---|
 | Generic namespace key space (fixed, `e2a23d5`; record below) | `generic-template-namespace-key-space`, `generic-type-arguments-not-key-space-resolved`, `generic-template-body-rebinds-substituted-type-arg`, `generic-function-templates-are-bare-keyed` | Names carried as SPELLINGS re-resolved later, instead of resolved once and recorded. Four layers: base, arguments, body, function templates. |
-| [[interface-boxing-keyed-on-source-binding]] | `interface-boxing-guards-are-binding-dependent`, `null-coalesce-join-into-interface-not-boxed`, `interface-boxing-sites-not-fully-consolidated` | Boxing keys off the source `NamedVariable`, so parens / `?:` / `??` fall through. |
+| [[interface-boxing-keyed-on-source-binding]] | `interface-boxing-guards-are-binding-dependent`, `null-coalesce-join-into-interface-not-boxed`, `interface-boxing-sites-not-fully-consolidated` | Boxing keys off the source `NamedVariable`, so parens / `?:` / `??` fall through. Correct for parens and `??` (both fixed 2026-07-31); WRONG for `?:`, whose join is a deliberate borrow - see the narrowed file. |
 | [[overload-replay-blames-wrong-candidate]] | `named-arg-replay-reports-losing-candidate`, `iface-slot-replay-blames-wrong-slot` | A non-probed replay with no notion of which candidate the user meant. Both files already named the same fix. |
 
 Also retired: `generic-interface-registered-as-opaque-struct` (fixed and committed as

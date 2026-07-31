@@ -1218,6 +1218,42 @@ public:
     }
 
     /*
+     * The arms of a '??' join, recorded where the lowering still knows them. Unlike '?:' - whose
+     * result is a PHI the boxing path can read arms off - '??' joins through a slot, so the joined
+     * value is a plain load and the arms are unrecoverable downstream. Same lifetime and the same
+     * park/clear points as interfaceBoxRecords_, and the same raw-Value* invariant.
+     */
+    struct NullCoalesceJoinArm
+    {
+        llvm::Value* Value = nullptr;
+        llvm::BasicBlock* Block = nullptr;
+    };
+
+    struct NullCoalesceJoin
+    {
+        llvm::Value* Joined = nullptr;
+        std::vector<NullCoalesceJoinArm> Arms;
+    };
+
+    std::vector<NullCoalesceJoin> nullCoalesceJoins_;
+
+    void RegisterNullCoalesceJoin(llvm::Value* joined, std::vector<NullCoalesceJoinArm> arms)
+    {
+        if (joined == nullptr || arms.empty()) return;
+        for (auto& entry : nullCoalesceJoins_)
+            if (entry.Joined == joined) { entry.Arms = std::move(arms); return; }
+        nullCoalesceJoins_.push_back({ joined, std::move(arms) });
+    }
+
+    const NullCoalesceJoin* FindNullCoalesceJoin(const llvm::Value* value) const
+    {
+        if (value == nullptr) return nullptr;
+        for (const auto& entry : nullCoalesceJoins_)
+            if (entry.Joined == value) return &entry;
+        return nullptr;
+    }
+
+    /*
      * Deferred interface-return-dangle check (the "existential" attempt - see
      * interface-return-dangle-defeated-by-intermediate-local.md). The emission-time value
      * walk (FrameLocalDataOfFatValue in MainListener.h) deliberately stops at a load, so
@@ -3571,6 +3607,7 @@ private:
         // Boxing provenance is per-function value identity; a prior function's entries must not
         // answer a lookup here (see interfaceBoxRecords_).
         interfaceBoxRecords_.clear();
+        nullCoalesceJoins_.clear();
 
         // populate function arguments
         auto itr_nameArg = arguments.begin();
@@ -9068,6 +9105,7 @@ public:
         std::vector<std::pair<llvm::Value*, std::string>> valueElementTypeNames;
         std::vector<std::pair<llvm::Value*, std::string>> fatInterfaceValueTypeNames;
         std::vector<InterfaceBoxRecord> interfaceBoxRecords;
+        std::vector<NullCoalesceJoin> nullCoalesceJoins;
         std::vector<llvm::Value*> movedOutPtrValues;
         std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues;
         std::vector<llvm::Value*> nonOwningStructJoins;
@@ -9088,6 +9126,7 @@ public:
         s.valueElementTypeNames = std::move(valueElementTypeNames_);
         s.fatInterfaceValueTypeNames = std::move(fatInterfaceValueTypeNames_);
         s.interfaceBoxRecords = std::move(interfaceBoxRecords_);
+        s.nullCoalesceJoins   = std::move(nullCoalesceJoins_);
         s.movedOutPtrValues   = std::move(movedOutPtrValues_);
         s.movedBorrowedPtrValues = std::move(movedBorrowedPtrValues_);
         s.nonOwningStructJoins = std::move(nonOwningStructJoins_);
@@ -9103,6 +9142,7 @@ public:
         valueElementTypeNames_.clear();
         fatInterfaceValueTypeNames_.clear();
         interfaceBoxRecords_.clear();
+        nullCoalesceJoins_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
         nonOwningStructJoins_.clear();
@@ -9130,6 +9170,7 @@ public:
         valueElementTypeNames_   = state.valueElementTypeNames;
         fatInterfaceValueTypeNames_ = state.fatInterfaceValueTypeNames;
         interfaceBoxRecords_    = state.interfaceBoxRecords;
+        nullCoalesceJoins_      = state.nullCoalesceJoins;
         movedOutPtrValues_       = state.movedOutPtrValues;
         movedBorrowedPtrValues_  = state.movedBorrowedPtrValues;
         nonOwningStructJoins_    = state.nonOwningStructJoins;
@@ -19103,6 +19144,21 @@ public:
                 if (nv.Storage == srcAlloca && nv.IsOwning) return true;
         }
         return false;
+    }
+
+    // The live binding whose Storage is `slot`, or empty. Recovers the NAME from the VALUE, so a
+    // spelling that erased the binding can still reach the name-keyed move bookkeeping.
+    std::string FindVariableNameByStorage(const llvm::Value* slot) const
+    {
+        if (slot == nullptr) return {};
+        for (const auto& frame : stackNamedVariable)
+        {
+            for (const auto& [varName, nv] : frame.namedVariable)
+                if (nv.Storage == slot) return varName;
+            for (const auto& [varName, nv] : frame.functionArgument)
+                if (nv.Storage == slot) return varName;
+        }
+        return {};
     }
 
     /*
