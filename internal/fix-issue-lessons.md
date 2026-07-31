@@ -191,6 +191,42 @@ The recurring failure mode of this whole family, stated once:
   work. Fabricated reports do not contain self-inflicted findings.
 - When an agent proposes diverging from the issue file's fix direction, treat it as a RISK.
 - Tell agents to use repo-root `scratch/` and never run `git stash`.
+- **Before declaring an agent has flailed, check for a LIVE PROCESS** (`ps` for the worktree
+  path), not just `git log` / `git status`. An agent resumed mid-turn can look idle at the exact
+  moment you sample it. On 2026-07-31 a resume was misread as a flail on correct evidence (HEAD
+  unmoved, tree clean, defect still live) and an opus escalation was spawned into the same
+  worktree; the two writers collided. The escalated agent detected it and stopped, which is the
+  only reason nothing was clobbered.
+- **When an agent overrules your instruction and explains why, check whether it is right** - it
+  often is. Twice on 2026-07-31 an agent rejected a key I suggested (`ElementOwningUnique`,
+  which is only ever set for a case that could never match) and corrected my arithmetic about
+  test counts. Both corrections were right. An agent that pushes back with a reason is
+  displaying exactly the behaviour you want.
+
+## On concluding something is unused or unsupported
+
+- **A repo-wide grep proves the SPELLING is unused. It proves nothing about whether the
+  CAPABILITY is real.** On 2026-07-31 `function<T>*` was rejected wholesale on the reasoning
+  that master's success looked like a constant-folding coincidence and that no file in `Test/`,
+  `example/` or `core/` used it. Both premises were checked; the conclusion was still wrong -
+  the out-parameter had genuine store-through IR (`store ptr %storemerge, ptr %slot`), and the
+  rejection removed a working language feature. It was also trivially bypassed by a type alias,
+  so it was not even self-consistent.
+- **Read the IR before calling a behaviour accidental.** "It only worked by luck" is a strong
+  claim about the compiler's semantics and needs the same evidence as any other. If the emitted
+  code does the right thing for the right reason, the capability is real.
+- **A fix can be HALF DONE along a spelling axis you did not enumerate.** The same
+  `break`-without-dims bug lived in both the direct `function<T>` branch and the function-type
+  ALIAS branch. Two rounds fixed only the direct one while the issue file was already staged for
+  deletion - the P1 would have been "closed" while still reproducing under `using Cb = ...`.
+  Before deleting an issue file, re-run the repro through every spelling that reaches the same
+  code path: alias, generic argument, namespace-qualified, nested.
+- **When a widely-read type flag changes, audit every guard that READS it.** Setting `Pointer`
+  on the function-pointer parser branch was correct and fixed real bugs - and it silently
+  disarmed the `unique`-field shape guard (`!f.Pointer || f.ElemPointer`), so a
+  `unique Lambda<T>*` field started compiling and freeing a CODE address. Found only by the
+  third review. The blast radius of a type-flag change is every predicate mentioning that flag,
+  not the feature you were working on.
 
 ## On issue files and severities
 
@@ -209,3 +245,90 @@ The recurring failure mode of this whole family, stated once:
 - **Consolidate on the shared ROOT, not the shared symptom, and say what you did NOT merge.**
 - Issue files can be wrong: one repro did not reproduce as written, another described a fault
   milder than reality. Have the fix agent verify the repro FIRST and report what it saw.
+
+## On the differential corpus sweep
+
+- **The strongest available evidence for "did any behaviour change?" is a whole-corpus A/B, not
+  hand-written probes.** Build the parent commit in a separate scratch worktree, run `--check`
+  (or compile+run where values matter) over EVERY `.cb` in `Test/` and `example/` with both
+  binaries, and diff. One review did this across 417 files and found exactly two differences,
+  both the intended new test legs - which settled a false-rejection question that no amount of
+  targeted probing could have closed.
+- Reach for it whenever a change touches something every program flows through: a guard
+  predicate, overload resolution, symbol mangling, type-flag semantics. Targeted probes only
+  prove the shapes you thought of, and the dangerous shapes are the ones you did not.
+- Tell the reviewer to report the scratch worktree path so it can be removed afterward; a
+  forgotten one shows up in `git worktree list` later and reads like an abandoned fix branch.
+
+## On concurrent agents sharing a worktree
+
+- **Concurrent agents WILL collide on scratch filenames.** A reviewer and a fix agent both wrote
+  `scratch/keep.cb` and destroyed each other's evidence; the round-1 must-keep-working results
+  had to be regenerated from scratch. Assign every agent a unique scratch prefix (`r2_`, `rev_`)
+  in its prompt.
+- **A delegating agent's "no live children" notification does NOT mean nothing is running.** One
+  fix agent spawned a sub-agent and returned immediately; the task notification fired, the branch
+  had zero commits, and the tree was clean - every git-visible signal said "flailed, escalate."
+  A build was in fact running in that worktree the whole time. `lsof -c ninja` / `ps` identified
+  which worktree owned it. **Check for a live process before escalating into an occupied
+  worktree** - escalating blind was already a near-clobber once before.
+- Escalation and cleanup both look at git state; git state alone cannot distinguish "not started"
+  from "in progress."
+
+## On deciding whether a deferral was correct
+
+- **A deferred item is often two sub-cases with different answers.** A fix agent deferred a
+  field-to-field leg saying it needed the SOURCE predicate widened. Testing the plain spelling
+  showed it already diagnosed, which looked like proof the reason was wrong - so the deferral got
+  called wrong. It was not. The leg was MIXED (plain source into generic destination - closable
+  by re-keying the destination alone) plus FULLY GENERIC (both sides substituted - genuinely
+  needs the source predicate, because the source gate short-circuits independently). The agent
+  was correct-but-incomplete; the correction overcorrected.
+- Before overruling a deferral, enumerate the sub-cases and test each. "The plain spelling works"
+  proves the machinery exists, not that every spelling reaches it.
+- Record the overcorrection in the issue file too. A confident wrong correction in the history is
+  worse than the original gap, because the next reader trusts it.
+
+## On calling something a regression
+
+- **Permute the input before declaring master correct.** A branch turned a program that printed
+  `106` on master into one printing `206` - an apparently clear regression. But master printed
+  `206` for the same program with the two overload declarations SWAPPED: it was never resolving
+  by shape, just picking the first-registered symbol. The regression was real, the "previously
+  correct" framing was not, and the fix ended up strictly better than master rather than a
+  restoration.
+- For anything order-, arity-, or declaration-sensitive, run the permuted form on the OLD binary
+  before writing "previously correct" into a review or a report.
+
+## On proving a test leg reaches the arm it names
+
+- **A test leg must be proven to reach the arm it names, not just to fail on master.** A
+  regression leg was written to pin a specific overload-resolution arm - the multi-candidate
+  "take the first slot" fallback in `ResolveInterfaceMethodSlot`. It declared two overloads,
+  `lam(function<int(int)>)` and `lam(int, int)`. Those have DIFFERENT arities, so for a
+  one-argument call the arity filter left a single candidate and the LONE-SLOT arm ran instead -
+  the arm an earlier leg in the same file already covered. The leg did fail on the pre-fix binary,
+  so the usual non-vacuity check ("fails on master, passes on the branch") PASSED and hid the
+  problem: it failed for the wrong reason. Deleting the gate the leg was written to protect would
+  have left the suite green. The correct construction needed two candidates of the SAME arity
+  (`lam(function<int(int)>)` and `lam(double)`).
+- Why it matters: "fails on master" proves the leg is not vacuous; it does NOT prove the leg tests
+  what its comment claims. When a leg is written to pin a SPECIFIC branch of a resolver, the check
+  has to be that the branch is reached - e.g. by confirming the discriminator that selects it
+  (here, candidate count after the arity filter), or by temporarily reasoning through the filter by
+  hand. State the discriminator in the test's comment so the next person can see the leg's
+  validity condition.
+
+## On issue files referenced by a commit before it lands
+
+- **An issue file referenced by a commit message must be tracked before the commit.** A commit
+  deleted two P1 issue files it had fixed, and its message pointed at a follow-up issue file as the
+  record of a deliberate deferral. That follow-up file existed on disk but had never been `git
+  add`ed - it was untracked in the main checkout. The commit would have removed two tracked issues
+  while the deferral it promised to record existed nowhere in history. A reviewer caught it with
+  `git ls-files <path>`.
+- Why it matters: `internal/issue/` files are routinely created untracked and stay that way for a
+  while, so "I wrote that file" and "that file is in git" are different claims. Any issue path
+  named in a commit message is a promise about HISTORY, not about the working tree. Before
+  committing, run `git ls-files` on every issue path the message mentions, and add the referenced
+  files to the same commit.

@@ -28,10 +28,51 @@ why the shipped code has the shape it does, which approaches must not be retried
 ratified behaviour change that future work must not "fix" back. That section is the convergence
 point for the interface/generics work and is the reason this file is long.
 
-State on 2026-07-30: **59 open issues** (13 P1 / 23 P2 / 16 P3 / 7 UI). Ten files merged into three on their shared root
-(consolidation record at the bottom), the generic namespace key space fixed and its file
-deleted, its corpus deleted, `archive/` folded into this file, and one new issue filed.
+State on 2026-07-31: **68 open issues** (13 P1 / 28 P2 / 20 P3 / 7 UI), counted from disk, not
+from arithmetic. Two P1s were fixed and their files deleted this session
+(`unique-ptr-field-stack-address-aborts-silently`, `function-array-body-silently-truncated`),
+and nine new issues were filed - every one of them found by the ADVERSARIAL REVIEWS of those two
+fixes, not by the original investigation. That ratio is the story of the session: fixing two
+things in this area surfaced nine more, seven of which are silent-abort or wrong-value class.
 ## Resume point
+
+**Current head: the P1 campaign.** `master` is `4097959`, macOS arm64 Release **540 / 0 / 8**
+plus `example_mac.sh` **35 / 0**. Six P1s fixed on 2026-07-31 (`99d73f3`, `696060d`, `8c29ca7`,
+`d65f000`, `4000fa1`, `4097959`); the design records are at the bottom. **P1 is being cleared
+before P2 starts** - that includes `iface-ifconst-base-clause-implementor`, so the parked
+`fix/iface-ifconst` branch stays parked.
+
+Next P1s, and the sequencing that matters:
+
+- `auto-binding-of-fixed-array-loses-shape` and `fixed-array-copy-invalid-bitcast` are both
+  array-shape and would collide if run concurrently. IN FLIGHT on `fix/array-shape`. Two
+  language decisions were settled going in: `auto x = <fixed array>` deduces the VIEW `T[]`
+  (a borrow - `auto` introduces no storage), and `int[3] b = a;` IS a copy lowered as a memcpy
+  (the declared type allocates its own storage, so it cannot alias).
+- `interface-boxing-keyed-on-source-binding`, `interface-type-alias-not-resolved-in-is-as-target`
+  and `return-dangle-missed-when-slot-has-extra-user` are the next group.
+- `ifconst-const-global-condition-corrupts-ir` and `null-conditional-args-eval-order` follow.
+- `interface-method-call-on-null-value-segfaults` needs a PRODUCT DECISION first: its fix
+  direction proposes a runtime null-vtable check on every interface dispatch, which is a
+  per-call branch someone must agree to pay.
+- `ftell-fseek-long-width-on-windows` cannot be verified on a macOS host - land it from Windows.
+
+The four function-pointer / closure P1s fixed on 2026-07-31 left FIVE residues, all filed rather
+than implied: `data-pointer-into-thin-function-param-segfaults`,
+`funcptr-overload-binding-ignores-signature`, `funcptr-call-result-into-closure-param-garbage`
+(P1), and `data-pointer-returned-as-closure-not-gated`,
+`shape-mismatched-funcptr-arg-binds-silently` (P2). They are one defect family - argument and
+return lowering for callable values - and a future pass should scope them together rather than
+one at a time.
+
+**`fix/iface-ifconst` is rebased and parked** at `2dc0b51` (was 24 commits stale; rebased with
+two trivial conflicts, all five hook points untouched by master). Nothing from it has landed. It
+was shelved for DEFECT RATE - 9 defects over 8 review rounds - not staleness, and master's plain
+`no class implements it` is unhelpful but never wrong, which is the safe side. Its `scratch/`
+corpus (97 files) is where a revival starts. The rebase moved it to base `64b6118`, so it needs
+another rebase onto `696060d` before any future merge.
+
+---
 
 **The generic namespace key space is DONE - all four layers, committed as `e2a23d5`.** That was
 the head of this queue for four sessions; its issue file and its three corpora are deleted, and
@@ -92,8 +133,8 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
 | **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 13 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 23 |
-| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 16 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 28 |
+| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 20 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
 ### P1 - wrong programs and crashes (`p1/`)
@@ -101,14 +142,14 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | Issue | Severity |
 |---|---|
 | [[interface-boxing-keyed-on-source-binding]] | Double free (exit 134) via parens / `?:`; verifier failure via `??`; two un-routed boxing sites. Merged 2026-07-30. |
-| [[iface-call-does-no-argument-type-matching]] | Silent miscompile then SIGBUS. An `int` reaches a closure slot; the direct path rejects it. |
-| [[function-array-body-silently-truncated]] | Silent miscompile, exit 133. `--check` reports PASS. NOT interface-related. |
 | [[auto-binding-of-fixed-array-loses-shape]] | Silent miscompile (`auto` on an array is not indexable), and it defeats the primitive-array guard. Fix the deduction, NOT the guard. |
 | [[interface-type-alias-not-resolved-in-is-as-target]] | Wrong answer + false rejection: `ia is AliasIB` rejected while `ia is IB` works. Fix with one resolving accessor over the ~12 direct `interfaceTable.find/count` sites. |
 | [[ftell-fseek-long-width-on-windows]] | Silent wrong value on Windows: core binds C `long` as pointer-sized, so `ftell`/`fseek` read garbage under LLP64. Not a UI issue despite being Windows-only. |
-| [[closure-param-accepts-data-pointer]] | SIGSEGV, no diagnostic. DIRECT-path residue; the virtual path is now guarded. |
 | [[interface-method-call-on-null-value-segfaults]] | SIGSEGV (139), no guard. Fires on a PLAIN non-generic interface too. Pre-existing and language-wide. |
-| [[unique-ptr-field-stack-address-aborts-silently]] | Silent abort (exit 134), **no diagnostic at all**. Per CLAUDE.md's LLVM-assert convention this should become a proper error. |
+| [[data-pointer-into-thin-function-param-segfaults]] | Silent miscompile then SIGSEGV (exit 139), no diagnostic. A data pointer bitcasts straight into a THIN `function<>` parameter and is called. Deliberate residue of `ce9858e` - that fix gated only the FAT (`Lambda<>`) parameter arm. Filed 2026-07-31. |
+| [[funcptr-call-result-into-closure-param-garbage]] | Silent wrong value, exit 0, **no diagnostic at all**. A `function<>` returned by value into a fat `Lambda<>` parameter yields uninitialized garbage. DIRECT path only; every other source of a thin value passes correctly. Filed 2026-07-31. |
+| [[funcptr-overload-binding-ignores-signature]] | Silent wrong value, exit 0, no diagnostic. A `function<>` argument binds a function-pointer parameter of a mismatched SIGNATURE and is called anyway - the scorer compares indirection shape only, never callee/parameter signatures. Filed 2026-07-31. |
+| [[unique-field-to-field-copy-double-frees]] | Silent abort (exit 134), no diagnostic. Copying one `unique` field into another double-frees in a GENERIC container, while the identical plain-struct spelling is correctly diagnosed. Filed 2026-07-31. |
 | [[return-dangle-missed-when-slot-has-extra-user]] | Missed dangle, no diagnostic. Residue of `2bcc5a0`; NOT to be fixed by widening the whitelist. |
 | [[fixed-array-copy-invalid-bitcast]] | Verifier failure, no diagnostic. NOT interface-related. |
 | [[ifconst-const-global-condition-corrupts-ir]] | Missing block terminator in an unrelated already-emitted function. Identical on master. |
@@ -118,7 +159,12 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[generic-wrapper-over-function-type-llvm-fatal]] | feature gap | `Box<function<int(int)>>` raises LLVM fatal `Cannot select: AArch64ISD::CALL` (exit 134) when the substituted field is INVOKED. Store-only may be fine - check that first. Borderline P1 (dies with no usable diagnostic); filed P2 because nothing lies to you. Filed 2026-07-31. |
 | [[array-view-params-unconditionally-noalias]] | latent miscompile | Latent `-O2` miscompile hazard - UB handed to LLVM. P1 the moment a witness exists. |
+| [[data-pointer-returned-as-closure-not-gated]] | miscompile | Silent miscompile then SIGBUS (exit 138), no diagnostic. `CoerceToFuncPtrReturn` is the one caller of `WidenBareOrThinToClosureFat` never routed through the `ce9858e` provenance gate, so a data pointer returned as a closure lands in the CODE slot and is called. Filed 2026-07-31. |
+| [[shape-mismatched-funcptr-arg-binds-silently]] | miscompile | Silent miscompile then SIGBUS (exit 138), no diagnostic. A `function<T>*` binds where a plain `function<T>` value is expected; the scorer now detects the shape mismatch but still lowers the mismatched arm when no better-shaped candidate exists. Filed 2026-07-31. |
+| [[lambda-pointer-as-generic-type-arg-bypasses-guard]] | diagnostic | Hard compile failure with no source diagnostic - raw module-verifier dump. `Lambda<T>*` as a generic type argument (`Box<Lambda<int(int)>*>`) bypasses the declarator guard that already rejects this shape elsewhere. `function<T>*` as a generic type argument fails identically but should be SUPPORTED, not rejected - the two halves want opposite outcomes. Filed 2026-07-31. |
+| [[list-of-function-element-into-closure-param-fails-verifier]] | diagnostic | Hard compile failure with no source diagnostic - raw module-verifier dump. Passing a `list<function<>>` element to a closure parameter fails; building the list and invoking the element directly both work. Likely shares a root with [[generic-wrapper-over-function-type-llvm-fatal]]. Filed 2026-07-31. |
 | [[incomplete-layout-message-blames-c-interop]] | diagnostic | **Raised above its severity.** One emission site, three unrelated causes, and the wording names the cause that is usually absent. Two ratification records cite a C-interop cause on files with no C interop. |
 | [[overload-replay-blames-wrong-candidate]] | diagnostic | Factually false message on two paths; on the interface-slot path it converts a success into a failure. Merged 2026-07-30. |
 | [[variadic-free-generic-function-does-not-link]] | false reject | Compiles, does not link - raw JIT symbol dump, not a diagnostic. |
@@ -146,6 +192,10 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[mangled-generic-name-leaks-into-diagnostics]] | diagnostic | `Box__unique_Itemptr` shown where the user wrote `Box<unique Item*>`. Also a TEST-FRAGILITY problem: pinning an `expect_error` to a mangled name pins it to the mangling scheme. **Prefer prefix-pinning until fixed.** No demangler exists and `MangleTypeArg` is lossy one-way, so the fix is to STORE the source spelling. Filed 2026-07-31. |
+| [[function-pointer-to-fixed-array-not-rejected]] | diagnostic | `function<T>[N]*` silently accepted while `int[N]*` is correctly rejected - the funcptr branch breaks before the `ArrayPtrOf` check. Two-line fix in BOTH `ParseDeclarationSpecifiers` copies; fold into whatever next touches that branch. Filed 2026-07-31. |
+| [[sizeof-of-sized-array-type-parsed-as-cast]] | diagnostic | `sizeof(T[N])` is parsed as a cast and rejected with a message about CASTS - blaming a construct the user never wrote. Not multi-dim specific (`sizeof(int[3])` fails too); `sizeof(variable)` works. Filed 2026-07-31. |
+| [[funcptr-fixed-array-vs-view-overloads-collide]] | diagnostic | Silent overload loss, no diagnostic: `function<T>[N]` and `function<T>[]` overloads of the same name collide onto one mangled key and one shape, so the last-registered overload silently wins. Low severity - the two spellings are arguably the same parameter type. Filed 2026-07-31. |
 | [[generic-function-call-diagnostics-are-misleading]] | diagnostic | Three defects on one path: a PHANTOM candidate invented for an undeclared generic function, wrong type-arg arity reported as "unknown function 'D3.id__int__float'", and a mangled name leaking into user-facing text. Pre-existing, identical before `e2a23d5`; filed 2026-07-30 out of the layer-4 review. |
 | [[interface-collision-message-prefix-still-basename]] | diagnostic | The `file(line,col):` prefix is still a bare basename. |
 | [[as-cast-unbound-pointer-shape-generic-message]] | diagnostic | Correctly rejected, generic wording. Struct field and LOCAL `T*[N]` only. |
@@ -239,8 +289,229 @@ which a future session must not "fix" back without reopening the decision.
 | Generic-interface registration | `09f1d56` |
 | Generic namespace key space, layer 1 (template base) | `15809e0` |
 | Generic namespace key space, layers 2-4 (arguments, body, functions) + LSP `expect_error` fix | `e2a23d5` |
+| Stack address into a `unique` location rejected | `99d73f3` |
+| `function<T>[N]` losing its array size | `696060d` |
+| Non-heap (stack/global) addresses rejected at call sites, not just store sites | `8c29ca7` |
+| Generic-substituted `unique` field ownership seen by the field-store gates | `d65f000` |
+| `function<T>` split from `function<T>*`; `Lambda<T>*` rejected | `4000fa1` |
+| Closure widening gated on the direct call path; interface argument slots type-gated | `4097959` |
 
-Suite trajectory across the whole sequence: 522 -> 530 -> 536.
+Suite trajectory across the whole sequence: 522 -> 530 -> 536 -> 538 -> 540.
+
+### `99d73f3` and `696060d` - the two P1s of 2026-07-31
+
+Both landed via the `fix-issue` skill (worktree -> fix agent -> opus review loop -> `--ff-only`).
+Recorded together because the SAME lesson produced both: **every defect that mattered was found
+by an adversarial review, never by the fix agent, and never by a green suite.** Nine new issues
+were filed out of these two fixes.
+
+**`99d73f3` - stack address into a `unique` location.** Root cause was NOT a compiler bug in the
+usual sense: compilation succeeded, and the SYNTHESIZED DESTRUCTOR called `free()` on a stack
+alloca, so libmalloc aborted before any diagnostic site was reached - hence total silence at exit
+134. The existing `unique` checks all keyed off borrow-provenance flags, and a bare `&local` sets
+none of them.
+
+Now rejected across six spellings: plain field, generic-substituted field, local, field-array
+element, local-array element, and a bare self-field inside a method.
+
+- **`IsProvableStackAddress` is one-sided BY CONSTRUCTION** - true only when the value, after
+  `stripPointerCasts` and a GEP-base walk, `isa<AllocaInst>`. An independent probe of `?:`, `??`
+  (which lowers to a LOAD FROM AN ALLOCA here - the classic false-positive trap), local
+  round-trips, function returns, struct fields, `list<unique Item*>` and `Box<alias Item*>` found
+  ZERO false rejections. **Do not widen it to catch more cases.**
+- **The array-element leg is keyed on GEP SHAPE, not on a flag - deliberately.**
+  `ElementOwningUnique` looks like the natural key and is WRONG: it is written in exactly one
+  place, gated on `IsUniqueTypeArg`, which a written `unique T* f[N]` never sets. Keying off it
+  matches nothing. The subscript path zeroes `ConstArraySize` and emits a two-index GEP whose
+  source element type is the ARRAY type, which is what the leg tests.
+- **RATIFIED:** `unique` on a function-pointer or closure FIELD is rejected
+  (`'unique' on field ...: a function pointer or closure does not own an allocation`). Added in
+  `696060d`, not this commit - see below.
+
+**`696060d` - `function<T>[N]` losing its array size.** The `functionPointerSpecifier` branch
+broke out of the specifier loop without capturing a trailing `[N]`, and `GetType()` had an early
+return for `IsFunctionPointer` that bypassed the `[N x T]` wrap. So a 2-element array got storage
+for ONE element, and indexing past it was out-of-bounds UB that LLVM legally folded into
+`unreachable` - silently discarding most of the enclosing function body while `--check` reported
+PASS.
+
+- **RATIFIED - `Pointer` is now set on the function-pointer parser branch.** This makes
+  `function<T>*` behave identically to the already-working alias spelling `using Cb = ...; Cb*`.
+  A scalar `function<T>*` out-parameter keeps working exactly as before, and a SUBSCRIPTED
+  `function<T>*` parameter now works where master segfaulted. Verified by byte-identical IR
+  against the previous compiler across every declaration position.
+- **DO NOT RETRY: rejecting `function<T>*` wholesale.** Round 2 did exactly that, on the false
+  premise that master's support was constant-folding coincidence. It is not - the out-parameter
+  has genuine store-through IR. The rejection also removed a working capability and was trivially
+  bypassed by a type alias. Round 3 replaced it with the `Pointer` fix above.
+- **The fix was HALF DONE for two rounds.** The function-type-ALIAS branch (`using Cb = ...;
+  Cb[3]`) had the identical `break`-without-dims bug, so the P1 stayed live under a second
+  spelling while its issue file was already staged for deletion. Any fix in
+  `ParseDeclarationSpecifiers` must be applied to the alias branch AND the direct branch, in BOTH
+  copies - four sites, not two.
+- **RATIFIED:** `Lambda<T>[]` (array-view of FAT closures) is rejected with
+  `array-view '[]' is not supported on closure type ...; use a fixed size '...[N]' instead`. It
+  previously leaked an LLVM verifier dump. Fixed-size `Lambda<T>[N]` arrays WORK and are a new
+  capability - do not reject those.
+- **A guard fix can open a hole elsewhere.** Setting `Pointer` made a `unique Lambda<T>*` field
+  pass the `unique` shape guard, which then freed a CODE address (exit 138) where the previous
+  compiler had cleanly rejected it. Caught only by the third review. When a widely-read type flag
+  changes, audit every guard that reads it.
+
+### `8c29ca7` - non-heap addresses rejected at call sites, not just store sites
+
+Three silent-abort shapes (exit 134, no diagnostic) all stem from a stack or global address
+reaching a location whose synthesized teardown will `free()` it - a value that was never
+heap-allocated there, so the free is undefined. `99d73f3` had already closed the STORE sites;
+this commit found the same hole at CALL-argument lowering and widened the underlying probe to
+globals.
+
+- A `move T*` parameter takes ownership and frees the pointee at scope exit, but the existing
+  stack-address guard never ran at the call site, only at stores. The check is now applied to
+  call arguments too, gated on `IsMove` (explicit `move`) or the same `uniqueAutoSink` condition
+  (`IsUniqueTypeArg && !IsAlias && !IsBorrowOfUniqueElement`) used at function entry - this also
+  catches a generic container's synthesized owning-sink parameter (e.g.
+  `list<unique T*>::add(T value)`) with no `move` keyword at the call site, which is the only
+  place such an argument's origin is still visible before it becomes an opaque SSA value inside
+  the callee.
+- **RATIFIED: a GLOBAL address is exactly as un-`free()`-able and exactly as provable as a stack
+  address.** `IsProvableStackAddress` is renamed `IsProvableNonHeapAddress` (moved to
+  `LLVMBackend` so both `LLVMBackend.h` and `MainListener.h` can share it) and widened to also
+  accept a `GlobalVariable` base. The shared diagnostic wording changed to match, and
+  `Test/errors/err_unique_stack_address.cb`'s pinned substrings were updated for it.
+- Left unresolved: none of the three repros in the two source issue files - both issue files' fix
+  directions were confirmed correct by this commit.
+
+Regression legs added to `Test/errors/err_unique_stack_address.cb`: a global into a unique
+field/local-array, a stack/global address into a `move` pointer parameter, and a stack address
+into a `list<unique T*>` element via `add()`.
+
+### `d65f000` - generic-substituted `unique` field ownership seen by the field-store gates
+
+A `unique` field made owning by GENERIC SUBSTITUTION (`Box<unique Item*>::t`) is freed by the
+synthesized destructor exactly like a written `unique` field, but the ownership rejects on the
+field-store paths never saw it: substitution sets `IsUniqueTypeArg`, not `IsUnique` (the latter
+is reserved for the written qualifier), and destructor synthesis is the only consumer that ORs
+the two (`LLVMBackend.h` ~4614). Storing a second owner there made two owners of one pointer and
+aborted at run time (exit 134) with no diagnostic at all, while the identical mistake in a plain
+struct was diagnosed cleanly.
+
+- **STANDING HAZARD, named explicitly by this commit: `IsUnique` (written qualifier) and
+  `IsUniqueTypeArg` (generic substitution) are two separate flags, while destructor synthesis ORs
+  them.** That split is the root of this bug and is worth treating as a recurring source of
+  "diagnosed in a plain struct, silent in a generic instantiation" defects - any new ownership
+  check added against `IsUnique` alone should be checked against `IsUniqueTypeArg` too.
+- Fix: add `IsOwningUniquePointerField` and re-key the DESTINATION gate of the affected legs onto
+  it, in BOTH field-store paths - `=` in `ParseAssignmentExpression` and brace-init via
+  `EmitOneFieldInit` - closing Trap A (a borrowed parameter into a unique field, and its
+  `?:`-laundered twin) and the MIXED field-to-field shape (a written `unique` SOURCE field into a
+  generic DESTINATION field).
+- The type-arg arm mirrors the `uniqueAutoSink` ownership rule (`LLVMBackend.h` ~3581) and is
+  further narrowed to the exact scalar-pointer shape whose free is synthesized, so it rejects only
+  a slot that is PROVABLY freed. Legitimate-borrow shapes are excluded by construction, not by an
+  allowlist: an `alias` type argument and a borrow-of-unique-element never set `IsUniqueTypeArg`
+  (`MainListener.h` ~3918), and a container's own `T* _data` buffer has it cleared by the
+  explicit-star rule (~3974). A generic container's own setter (`void set(T v) { t = v; }`) stays
+  accepted.
+- **Deliberately NOT closed: the FULLY generic field-to-field copy** (`c.t = a.t` between two
+  `Box<unique Item*>`) still compiles and double-frees. `IsUniqueFieldRead` independently requires
+  `IsUnique` on the SOURCE, so that shape short-circuits there regardless of the destination gate;
+  widening the source predicate has a broader blast radius than this destination-only change and
+  is filed as its own issue.
+- No new `TypeAndValue` field, so no `--init` cache change was needed - every flag the new
+  predicate reads already round-trips in `LLVMBackend.cpp`.
+
+Regression legs added to the two existing Trap A files, prefix-pinned to keep the
+`Box__unique_Nodeptr` mangling out of the assertions: the borrowed-parameter and mixed
+field-to-field shapes, in the `=` form in `err_unique_borrow_into_field.cb` and the brace form in
+`err_unique_brace_init_borrow.cb`. Both files also gained legal heap-allocated and
+`move`-transferred generic-unique-field inits, so the reject cannot widen unnoticed.
+
+### `4000fa1` - separating `function<T>` from `function<T>*`; rejecting `Lambda<T>*`
+
+Two related function-pointer/closure declarator bugs, both silent (no diagnostic) before this fix.
+
+1. **`function<T>` and `function<T>*` were treated as the same overload, then SIGSEGV.** Three
+   causes, all needed:
+   - `ToUniqueString()` returned early for `IsFunctionPointer` and never folded in
+     `Pointer`/`IsArrayView`, so both spellings produced the same mangled key and the second
+     declaration was absorbed by the first before any duplicate check saw two signatures. The
+     marker now rides the generated prefix (`cfuncptrPtr_`, `cfuncptrArr_`) rather than the tail,
+     where it would collide with a trailing pointer parameter (`function<int(int*)>` vs
+     `function<int(int)>*`).
+   - `ComputeOverloadFunction`'s function-pointer fast path scored ANY function-compatible
+     argument as a PERFECT match, ignoring indirection, so both candidates tied and the
+     first-declared one won regardless of the call. **RATIFIED: the scorer now compares a
+     three-state indirection SHAPE** - array (`function<T>[]` view or fixed `function<T>[N]`) /
+     pointer (`function<T>*`) / plain value - via the new `FunctionPointerShapeOf`. A fixed array
+     reaches a call site with every `TypeAndValue` shape flag cleared, so its array-ness is
+     recovered from the storage behind it; a subscripted element has a GEP rather than the alloca
+     and correctly scores a value.
+   - Shape comparison alone was not enough: a non-function-pointer argument can demote every arm
+     out of the perfect tier (an int literal is only a promotion match), and the promotion/implicit
+     tier ignored per-argument quality entirely, picking by declaration position. So
+     `pick(arr, 3)` bound a fixed array to the `function<T>*` arm and read the array as if it were
+     the pointer, silently. That tier now prefers the arm with fewer function-pointer shape
+     mismatches before falling back to the existing move-score/last-wins rule, which leaves every
+     overload set WITHOUT such a mismatch resolving exactly as before.
+2. **`Lambda<T>*` (a pointer to a fat closure) failed the LLVM module verifier** with "Invalid
+   bitcast ... to %__closure_fat_ptr" and no source location. A fat closure is a by-value
+   `{code,data}` struct, so a pointer to one was loaded as if the pointer were the struct. Every
+   spelling was broken (local, parameter, `&arr[i]`). **RATIFIED: the declarator is now rejected up
+   front** with a diagnostic pointing at the working alternatives, in both function-pointer
+   branches of the MainListener copy of `ParseDeclarationSpecifiers`. The THIN `function<T>*` is a
+   real machine pointer and is unaffected.
+- **Measured scope of the tier change, and a correction to what master's prior behaviour actually
+  was:** an overload set needs only ONE function-pointer parameter to accumulate a shape mismatch,
+  so single-fn-ptr-arm sets can rebind too - verified `pick(function<int(int)>)` vs `pick(int*)`
+  called with a `function<T>*` returns 100 on `8c29ca7` and 200 here. Master's choice there was
+  itself a bind into a miscompile (the lone `function<T>` arm SIGBUSes on both builds, exit 138),
+  so the new choice is at least well typed, not a behaviour change away from something correct. A
+  whole-corpus A/B over 369 files in `Test/` and `example/` found no such overload set in the repo
+  - the only IR deltas were two intended symbol renames.
+
+Tests: `Test/test_function_ptr.cb` gains `testFuncPtrPointerOverload` (value/pointer arms in both
+declaration orders, named-function binding, an out-param write seen through the pointer arm, and
+the `[]`-vs-`*` pair in both declaration orders - every leg asserts a value a mis-bound arm cannot
+produce). `Test/errors/err_lambda_array_view.cb` gains the `Lambda<T>*` rejection for both the
+direct and the `using`-alias branch; its existing `unique` leg moves to the thin `function<T>*`
+spelling, since the fat spelling is now rejected at the declarator before `ValidateUniqueField`
+can run.
+
+### `4097959` - closure widening gated on the direct call path; interface argument slots type-gated
+
+Two coupled holes, fixed together because they share one accept set and letting the direct and
+virtual arms diverge was already a regression once:
+
+1. **A fat `Lambda<>` parameter on a DIRECT call accepted any data pointer and called it.**
+   `CreateOverloadedFunctionCall` widened with `isPointerTy()`, which under opaque pointers is
+   true for EVERY pointer, so a `void*` landed in the closure's CODE slot (SIGSEGV, no
+   diagnostic). The virtual path was already guarded (`LowerByValueArg`). Both arms now route
+   through one `WidenToClosureFatChecked`, so the two accept sets are identical by construction.
+2. **`CallInterfaceMethod` did no argument type-matching at all.** `ResolveInterfaceMethodSlot`
+   took a same-arity slot unconditionally and the argument loop lowered by bit pattern, so an
+   `int` reaching a closure slot emitted `inttoptr` into a code slot and called it (SIGBUS). Both
+   slot-picking arms - the lone-slot arm and the multi-candidate first-slot fallback - now share
+   one gate; gating only the first left the miscompile reachable through a second same-arity
+   overload.
+
+- **RATIFIED: the gate proves a MISMATCH, it does not require proof of a match.** An earlier
+  revision gated on "the overload scorer found no match for these arguments" - **WRONG POLARITY**,
+  and it broke legal code: the scorer has no int -> floating-point promotion rule, so it declines
+  to rank `io.absorb(3)` against a `double` parameter, and every int-like argument to a
+  floating-point interface parameter started failing to compile. **Scorer silence is absence of a
+  rule, not proof of incompatibility.** `ArgumentProvablyMismatchesParameter` instead takes exactly
+  one kind of proof - an integer or floating-point VALUE reaching a function-pointer/closure
+  parameter, which can never be code - and accepts everything else.
+- **Gating only one of the two interface slot-picking arms left the headline miscompile
+  reachable.** Adding a second SAME-ARITY overload to the issue's own repro still exited 138. A
+  test leg for that arm is only valid if both overloads share an arity - an arity-2 second
+  overload leaves one candidate after the arity filter and silently retests the other arm.
+- Not changed, and filed alongside this commit as residues of the same defect class needing their
+  own accept-set discussion: [[data-pointer-into-thin-function-param-segfaults]] (the THIN
+  parameter arm never widens to a fat struct, so it does not route through the new gate) and
+  [[data-pointer-returned-as-closure-not-gated]] (the RETURN path, `CoerceToFuncPtrReturn`, is a
+  third caller of the same widening helper and was out of scope for this fix).
 
 ### `2bcc5a0` - the return dangle, on the fourth attempt
 
