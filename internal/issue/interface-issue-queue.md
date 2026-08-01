@@ -28,13 +28,19 @@ why the shipped code has the shape it does, which approaches must not be retried
 ratified behaviour change that future work must not "fix" back. That section is the convergence
 point for the interface/generics work and is the reason this file is long.
 
-State on 2026-08-01: **75 open issues** (11 P1 / 33 P2 / 24 P3 / 7 UI), counted from disk
+State on 2026-08-01: **74 open issues** (10 P1 / 33 P2 / 24 P3 / 7 UI), counted from disk
 (`ls internal/issue/p{1,2,3}/*.md ui/*.md | wc -l`) on the merged tree, not from arithmetic.
-Two more P1s were fixed and their files deleted this round
-(`funcptr-call-result-into-closure-param-garbage`, `unique-field-to-field-copy-double-frees`),
-and four new issues were filed - every one of them found by the ADVERSARIAL REVIEWS of those two
-fixes, not by the original investigation. That ratio keeps holding: fixing two things in this
-area surfaces three or four more, and the reviews find them, not the fix work.
+Four P1s were fixed and their files deleted this round
+(`funcptr-call-result-into-closure-param-garbage`, `unique-field-to-field-copy-double-frees`,
+`delete-of-array-view-over-stack-storage`, `interface-method-call-on-null-value-segfaults`), and
+five new issues were filed - every one of them found by the ADVERSARIAL REVIEWS of those fixes,
+not by the original investigation. That ratio keeps holding: fixing two things in this area
+surfaces three or four more, and the reviews find them, not the fix work.
+
+**The 2026-08-01 P1 campaign is running to ZERO.** Two of the remaining items are expected to end
+as RECLASSIFICATIONS rather than fixes, and that is the queue working as designed, not a
+shortfall - see the `return-dangle` note in the P1 table and the `ftell-fseek` park note. Do not
+read a non-zero P1 count at the end of that campaign as unfinished work without reading why.
 ## Resume point
 
 **Current head: the P1 campaign.** macOS arm64 Release **554 / 0 / 8** plus `example_mac.sh`
@@ -49,11 +55,10 @@ parked `fix/iface-ifconst` branch stays parked.
 > anyone read it), and a stale hash asserting itself as current state is worse than no hash.
 > Run `git log --oneline -1` instead.
 
-Two P1s are SETTLED but not started, and both settlements are recorded in their files rather
-than here:
-- `interface-method-call-on-null-value-segfaults` - the product decision is made (2026-08-01):
-  reject at COMPILE TIME as far as is provable, and NO per-dispatch runtime guard. `?.` is the
-  answer for anything not provable. Do not re-propose a runtime null-vtable check.
+- `interface-method-call-on-null-value-segfaults` - SETTLED and now FIXED; see the landed design
+  record below. The ratified rule survives there, not here: reject at COMPILE TIME as far as is
+  provable, NO per-dispatch runtime guard, `?.` is the answer for anything not provable. Residue
+  filed as `null-interface-access-residue-unproven-receivers`.
 - `ftell-fseek-long-width-on-windows` - PARKED. Windows-only, unverifiable from a macOS host;
   land it from Windows. Skip it when picking P1 work on a Mac.
 
@@ -73,9 +78,6 @@ Next P1s, and the sequencing that matters:
   `p3/null-conditional-args-eval-order-hresult` (HResult/COM half) and
   `p3/nullcond-guard-skips-move-argument-cleanup` (the move-argument leak the guard
   introduces on the null path).
-- `interface-method-call-on-null-value-segfaults` needs a PRODUCT DECISION first: its fix
-  direction proposes a runtime null-vtable check on every interface dispatch, which is a
-  per-call branch someone must agree to pay.
 - `ftell-fseek-long-width-on-windows` cannot be verified on a macOS host - land it from Windows.
 
 The four function-pointer / closure P1s fixed on 2026-07-31 left FIVE residues, all filed rather
@@ -186,11 +188,10 @@ file recorded on 2026-07-31.
 |---|---|
 | [[interface-boxing-keyed-on-source-binding]] | NARROWED 2026-07-31: the two binding erasures (parens, `??`) and the two un-routed boxing sites are closed. What remains is `delete` of a BORROWED interface box (exit 139/133, no diagnostic) - a different root, reachable with no join at all. |
 | [[ftell-fseek-long-width-on-windows]] | Silent wrong value on Windows: core binds C `long` as pointer-sized, so `ftell`/`fseek` read garbage under LLP64. Not a UI issue despite being Windows-only. |
-| [[interface-method-call-on-null-value-segfaults]] | SIGSEGV (139), no guard. Fires on a PLAIN non-generic interface too. Pre-existing and language-wide. |
+| [[null-interface-access-residue-unproven-receivers]] | SIGSEGV (139), no diagnostic. Residue of the null-access fix: a PARENTHESIZED field access `(lv).tag` slips the guard while `(lv).Get()` is caught, plus struct-field / array-element / global receivers. The `?.`, branch-, loop-, parameter- and folded-`if const` shapes are DELIBERATELY accepted per the ratified design and are NOT residue. |
 | [[funcptr-overload-binding-ignores-signature]] | NARROWED 2026-07-31 by `fix/funcptr-arg-accept-set`: the type-CLASS axis is closed on both paths (the filed `double`-into-`int` repro now errors). Still open, silent and identical on master: floating-point WIDTH (same SHAPE as the closed repro), integer width/signedness, POINTEE type (memory-unsafe - reads past the end of the object), and aggregates. Do NOT re-close by widening the comparison to spellings; see the file. |
 | [[return-dangle-missed-when-slot-has-extra-user]] | Missed dangle, no diagnostic. Residue of `2bcc5a0`; NOT to be fixed by widening the whitelist. |
 | [[llvm-cannot-select-sign-extend-on-const-array-index]] | LLVM fatal error, compiler exit 134. Pre-existing; the front-end shape that fed it is now rejected earlier, so no live repro remains - confirm no other spelling reaches it, then re-rank. |
-| [[delete-of-array-view-over-stack-storage]] | Silent abort (exit 134), no diagnostic. PRE-EXISTING on the explicit `int[] v = a;` spelling; the fixed-array shape fix makes `auto` reach it too. |
 | [[multidim-array-view-binding-loses-shape]] | Silent miscompile. The `T[][]` view spelling drops the row stride, so `auto` over a 2-D fixed array has no correct target to deduce to. Residual of the 1-D fixed-array-shape fix. |
 | [[unique-field-to-field-residue-temp-and-interface-source]] | Silent abort (exit 134), no diagnostic. Residue of `unique-field-to-field-copy-double-frees`: the fix (fix/unique-f2f) closes a wide named-local-shaped source set, but a temp/call-result source (`c.t = makeBox().t`), a container-element source (`list.get(0).t`), and a fat-interface generic source (`Box<unique IShape>`) all still double-free undiagnosed, while their plain-struct equivalents are diagnosed. |
 | [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. Pre-existing: an interface-field-to-interface-field copy with the same field name on both sides is misread as a self-assign (both receivers carry an empty `CallerName`), suppressing the field-to-field reject. Found probing the residue above; a different bug (self-assign discriminator), not a gate-width problem. |
@@ -351,8 +352,108 @@ which a future session must not "fix" back without reopening the decision.
 | Interface boxing keyed on the VALUE, not the source binding; `??` join boxed per arm | fix/iface-boxing (branch, not yet merged) |
 | `if const` leaf emission gated on insert-block LIVENESS, not non-nullness | fix/ifconst-ir (branch, not yet merged) |
 | `IsUniqueFieldRead` (SOURCE gate) re-keyed onto `IsOwningUniquePointerField`, closing the fully-generic field-to-field leg `d65f000` deliberately left open | fix/unique-f2f (branch, not yet merged) |
+| `delete` of an array view rejected when the view was bound from fixed-array storage; provenance tracked DECLARATION-ONLY | `11e85a1` |
+| Provably-null interface access rejected at COMPILE TIME; no runtime guard (RATIFIED) | fix/null-iface |
 
 Suite trajectory across the whole sequence: 522 -> 530 -> 536 -> 538 -> 540.
+
+### fix/null-iface - null interface access rejected at COMPILE TIME, and the runtime guard REJECTED
+
+Closes `interface-method-call-on-null-value-segfaults`. `IFace lv = default; lv.Get();` compiled
+clean and SIGSEGVed (139): the zero-initialised `{vtable, data}` fat pointer was dispatched through
+with no guard. Fires on a PLAIN non-generic interface; generic interfaces inherit it.
+
+**RATIFIED BY THE MAINTAINER 2026-08-01, and this is the part that must not be re-litigated:
+reject at compile time as far as is provable, and there is NO per-dispatch runtime guard.** `?.`
+is the language's answer for what the compiler cannot prove - a user who does not statically know
+whether an interface value is live writes `lv?.Get()`, which already lowers to a guarded dispatch.
+Paying a branch on every dispatch to re-detect what `?.` exists to express was considered and
+REJECTED. **Do not re-propose a runtime null-vtable check, in debug builds or otherwise.** The
+issue file that carried this decision is deleted; this record is where it now lives.
+
+The no-guard constraint was PROVED, not asserted: `--out-lli` on four programs including the
+4,300-line `Test/test_interface.cb` is byte-identical between the pre- and post-fix binaries except
+the module-ID hash. Zero codegen change.
+
+**What is rejected** requires all three: the receiver is a named LOCAL's own frame slot accessed
+with a plain `.`; the slot's address provably never leaves the frame; and the last write before the
+access, IN THE ACCESS'S OWN BASIC BLOCK, is a whole-slot store of a null constant. A basic block has
+one entry and no internal branch, so that write is exactly what the access reads. The rule reads
+EMITTED IR rather than enumerating assignment sites, so an unrecognized shape degrades to "no
+diagnostic" and never to a false rejection - that polarity is the whole design.
+
+**Deliberately ACCEPTED and NOT residue**: `?.`, branch-assigned, loop-assigned, call-separated on
+another path, parameters, and folded `if const` arms. A conditionally-null value on which the user
+wrote a plain `.` remains a runtime SIGSEGV BY DESIGN. `IFace lv = default;` must also stay legal to
+DECLARE - `Test/test_interface.cb` and the `struct H { IFace c = default; }` field shape depend on a
+default-initialised slot assigned later. Only the ACCESS on a still-null value is the error.
+
+**The field (property) axis is closed too, and its gate differs from the method axis.** On the
+method path the anchor (the vtable load) and the read are two adjacent instructions; on the field
+path they are the SAME instruction, so "the access's own block" is *defined as* the block the read
+lives in and cannot drift. That holds only while the fat value is a FRESH load - hence the
+`interfaceVar.Primary == nullptr` gate. When `Primary` is already set the value may have been loaded
+in an EARLIER block, and anchoring in the current block would inspect stores that happened AFTER the
+read: a null store following an earlier non-null load would be a FALSE REJECTION. **Anyone widening
+this must carry `Primary`'s defining `LoadInst` and require `load->getParent() == access->getParent()`,
+not widen the anchor.** The parenthesized spelling `(lv).tag` reaches `Primary != nullptr` and is
+therefore undiagnosed while `(lv).Get()` is caught - filed as
+[[null-interface-access-residue-unproven-receivers]], not fixed here.
+
+Two review lessons worth carrying: a claim that each reject leg lived in its own file was FALSE, and
+it mattered - the shared file exits at the first failed expectation on the pre-fix binary, so later
+legs were not self-proving. Legs are now split by RECORD SITE, the unit that regresses independently.
+And an accept leg that assigned the field BEFORE the call could not have tripped any widening onto
+field receivers; the shape that would trip it SIGSEGVs on every binary, so it cannot exist as a
+runnable leg at all - that is now stated in the test file rather than papered over.
+
+### `11e85a1` - the array-view delete guard, and why it tracks the DECLARATION ONLY
+
+Closes `delete-of-array-view-over-stack-storage`: `int[3] a; int[] v = a; delete[_] v;` compiled
+clean and aborted (134) with `free()` handed a stack address. A `T[]` view is a thin `T*`, so the
+delete path could not tell a view over `new T[n]` from a view over a decayed fixed array. The
+distinction exists at the BIND site (`ConstArraySize > 0 && !IsArrayView`) and is now carried onto
+the local as `NamedVariable::ViewOfFixedArrayStorage`.
+
+**The ratified shape, arrived at by fixing a false rejection in review: the flag is set at the
+DECLARATION site only, and ANY later plain `=` to that local clears it permanently.** The first
+attempt RECOMPUTED the flag on each reassignment, which is walk-order rather than flow-sensitive -
+so a `v = <fixed array>` inside any branch poisoned every later `delete` in the function. That
+rejected this program, which master compiles and runs correctly:
+
+```cflat
+int[3] a;
+int[] v = new int[4];
+if (argc > 100) { v = a; v[0] = 1; return 0; }   // stack path returns, never deletes
+v[0] = 2;
+delete[_] v;                                      // reachable only holding the heap alloc
+```
+
+**Do not re-propose recomputing on reassignment, and do not attempt full flow-sensitivity here.**
+A reassigned local has an origin that is not provable at the delete site, so it must ACCEPT. The
+cost is one accepted true-positive (`int[] v = a; ... v = new int[4]` in the other order still
+aborts); that is recorded as the must-keep-compiling leg `reassignHeapToStackNotDiagnosed`, not as
+a bug to close.
+
+Why the narrowing is SAFE rather than merely convenient: **`int[]*` is not a legal type.** Both
+`int[]* p = &v;` and an `int[]*` out-parameter are rejected by a pre-existing gate, so a view local
+cannot be rebound through an alias, an out-parameter, or any address-taking route. A plain `=` is
+the ONLY rebind path, so clearing on `=` cannot be bypassed. Twelve assignment spellings were
+probed against both binaries to confirm it.
+
+Deliberately left ACCEPTED as unprovable: view parameters, struct fields, call results, conditional
+joins, view-of-view rebinds, and the cast spelling `delete[_] (int*)v;`. The comment at the guard
+says so plainly - an earlier draft claimed the cast case "already picked its own diagnostic path",
+which was FALSE and is the kind of justification that must be verified after the change it justifies.
+
+**Two message defects were found by review and both are the same class**: a diagnostic that names
+something absent from the user's source. The first printed the literal fallback `"a fixed-array
+local"` for a GLOBAL source; the second read the name off the `llvm::GlobalVariable`, which carries
+LLVM's `.N` uniquifying suffix whenever the name collides with a symbol the runtime already declared
+- so an ordinary `int[3] read;` reported `'read.1'` (also reproduced with `write`, `stat`, `strlen`,
+`printf`). The fix takes the identifier text from the AST instead. **Do not recover a user-facing
+name from a lowered LLVM artifact**; this is the same failure family as recovering a declaring scope
+from a mangled key, which shipped two silent wrong values.
 
 ### fix/funcptr-arg-accept-set - the thin `function<>` accept set, and signature-aware binding
 
@@ -923,7 +1024,8 @@ untouched.
 
 **One pre-existing hole becomes reachable through one more spelling.** `delete[_]` on a view over
 stack storage aborts (exit 134, no diagnostic) - always has, via the explicit `int[] v = a;`
-spelling ([[delete-of-array-view-over-stack-storage]]). Master rejected the `auto` form only
+spelling (`delete-of-array-view-over-stack-storage`, since fixed by `11e85a1` - see its record
+above). Master rejected the `auto` form only
 because the broken binding looked like a value type; that was an accident, not a safety check.
 Deducing the view makes `auto` behave exactly like the spelling it deduces, which is the point.
 
