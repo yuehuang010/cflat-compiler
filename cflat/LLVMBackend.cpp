@@ -2549,6 +2549,9 @@ void LLVMBackend::ResetForReanalysis()
     // Same hazard as nullEventLog_: a pending check from an aborted compile keys off a slot
     // in the module being discarded and must not survive into the next file's analysis.
     pendingReturnDangleChecks_.clear();
+    // Same hazard: a pending dispatch record keys off a slot and an anchor instruction in the
+    // module being discarded, so it must not survive into the next file's analysis.
+    pendingNullIfaceDispatch_.clear();
     provenNoReturn_.clear();
     // Sibling of lastCallIsBonded: a per-call bond flag that, if left set by an aborted compile,
     // would mark the next file's first bonded value as by-address.

@@ -2,6 +2,10 @@
 
 Created: 2026-07-14 (found while fixing atol-llp64-truncation-on-posix)
 
+> **PARKED 2026-08-01 by the maintainer - skip this one when picking P1 work.** The defect is
+> Windows-only and cannot be verified from a macOS host, so it is not part of the P1 clearing
+> campaign. Land it from a Windows host. Do not scope it into a macOS session.
+
 ## Summary
 
 `core/cruntime.cb` declares C's `ftell` and `fseek` with `win_size` (pointer-sized:

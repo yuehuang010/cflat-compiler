@@ -4289,6 +4289,109 @@ bool testGiNsBodyKeepsCallerTypeArg()
     return result;
 }
 
+/*
+ * Accept set for the definitely-null interface access diagnostic (its REJECT legs are one-per-file
+ * under Test/errors/, starting at err_iface_call_too_few_args.cb). Each leg here is a plain '.'
+ * member access whose receiver was declared `= default`, and each must keep compiling because the
+ * null init is NOT the last write before the access inside the access's own straight-line block.
+ * Values are asserted, never mere compilability: a receiver bound to the wrong object gives a
+ * different number.
+ *
+ * Legs 1-4 (method) and 8-10 (field) are proven tripwires: widening the guard to a shape-only
+ * rejection makes each of them fail to compile. There is deliberately NO leg aimed at a widening
+ * onto struct-FIELD receivers - the only shape such a widening could trip
+ * (`NdHolder h = default; h.c.Get();` with no assignment) SIGSEGVs at run time on every binary,
+ * so it cannot exist as a passing runtime leg. That axis is guarded by the record's alloca
+ * requirement instead, and leg 12 covers the one field-receiver shape that IS runnable.
+ */
+interface NdLive { int tag; int Get(); };
+class NdImpl : NdLive { int tag = default; int d = default; int Get() { return d; } };
+struct NdHolder { NdLive c = default; };
+
+int ndPick(int n) { return n; }
+int ndViaParam(NdLive lv) { return lv.Get(); }
+int ndTagOfParam(NdLive lv) { return lv.tag; }
+
+bool testNullIfaceDispatchAcceptSet()
+{
+    bool result = true;
+
+    NdImpl s21; s21.d = 21;
+    NdImpl s22; s22.d = 22;
+    NdImpl s24; s24.d = 24;
+    NdImpl s26; s26.d = 26; s26.tag = 66;
+    NdImpl s27; s27.tag = 71;
+    NdImpl s28; s28.tag = 81;
+    NdImpl s29; s29.tag = 91;
+
+    // (1) Reassigned in the SAME block before the call: the last write is not the null init.
+    NdLive a = default;
+    a = s21;
+    result &= Test("nid_same_block_assign", a.Get(), 21);
+
+    // (2) Assigned inside a branch: the call's own block carries no write at all.
+    NdLive b = default;
+    if (ndPick(1) == 1) { b = s22; }
+    result &= Test("nid_branch_assign", b.Get(), 22);
+
+    // (3) Assigned in a loop body: the write lives in a different block from the call.
+    NdLive c = default;
+    for (int i = 0; i < 2; i++) { c = s24; }
+    result &= Test("nid_loop_assign", c.Get(), 24);
+
+    // (4) The CALL sits under a branch that is false at run time. Provably null once reached,
+    // but reached through a branch - deliberately left to '?.' and run time, so it must compile.
+    NdLive d = default;
+    int guardHits = 0;
+    if (ndPick(0) == 1) { guardHits = d.Get(); }
+    result &= Test("nid_call_under_branch", guardHits, 0);
+
+    // (5) '?.' on a still-null receiver is the sanctioned spelling and short-circuits.
+    NdLive e = default;
+    result &= Test("nid_null_conditional", e?.Get(), 0);
+
+    // (6) A parameter receiver's slot is written by the argument, so its only store is never a
+    // constant - dispatch and field read both go through the callee, not through a local here.
+    result &= Test("nid_param_receiver", ndViaParam(s26), 26);
+    result &= Test("nid_param_field_receiver", ndTagOfParam(s26), 66);
+
+    // (7) Declaring a default interface local and never accessing it stays legal - the shape
+    // `struct H { IFace c = default; }` and every deferred binding depend on it.
+    NdLive z = default;
+    result &= Test("nid_decl_only_is_legal", z == nullptr, true);
+
+    // (8) Field READ after a same-block assignment: the last write is not the null init.
+    NdLive f1 = default;
+    f1 = s27;
+    result &= Test("nid_field_read_same_block", f1.tag, 71);
+
+    // (9) Field READ after a branch assignment - the read's own block carries no write.
+    NdLive f2 = default;
+    if (ndPick(1) == 1) { f2 = s28; }
+    result &= Test("nid_field_read_branch_assign", f2.tag, 81);
+
+    // (10) Field WRITE then read, both after a branch assignment. The write form shares the
+    // read's lvalue, so a widening onto it would reject this identically.
+    NdLive f3 = default;
+    if (ndPick(1) == 1) { f3 = s29; }
+    f3.tag = 92;
+    result &= Test("nid_field_write_branch_assign", f3.tag, 92);
+
+    // (11) '?.' on a still-null receiver, FIELD spelling: short-circuits to the zero value.
+    NdLive f4 = default;
+    result &= Test("nid_field_null_conditional", f4?.tag, 0);
+
+    // (12) A struct FIELD receiver, never assigned, accessed under a branch that is false at
+    // run time. A field receiver is not a frame-local slot, so it is never recorded; this is
+    // the only field-receiver shape that can be exercised without crashing.
+    NdHolder h = default;
+    int fieldHits = 0;
+    if (ndPick(0) == 1) { fieldHits = h.c.Get(); }
+    result &= Test("nid_field_receiver_under_branch", fieldHits, 0);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -4351,6 +4454,7 @@ extern int main()
     total++; passed += testInterfaceReturnDangleCorpus()          ? 1 : 0;
     total++; passed += testNamespacedInterfaceShadowsCoreName()   ? 1 : 0;
     total++; passed += testInterfaceFunctionPointerParam()         ? 1 : 0;
+    total++; passed += testNullIfaceDispatchAcceptSet()             ? 1 : 0;
 
     total++; passed += testGiParamAfterMain()                            ? 1 : 0;
     total++; passed += testGiParamDefinedBeforeUse()                     ? 1 : 0;

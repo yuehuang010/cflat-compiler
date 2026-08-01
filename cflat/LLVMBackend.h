@@ -1302,6 +1302,65 @@ public:
         if (F) pendingReturnDangleChecks_.erase(F);
     }
 
+    /*
+     * Deferred definitely-null interface dispatch check (see
+     * interface-method-call-on-null-value-segfaults.md). `IFace lv = default;` zero-fills the
+     * {vtable,data} fat pointer, and a plain `.` call then loads the method slot off a null
+     * vtable and segfaults with no diagnostic. `?.` is the language's answer whenever the
+     * compiler cannot prove liveness, so this rejects ONLY the straight-line case it can prove:
+     * the last write to the slot BEFORE the dispatch, in the dispatch's OWN basic block, is a
+     * null constant, and the slot's address never leaves the frame. Recorded at the dispatch
+     * (which cannot reject), resolved at the same end-of-body hook as the return-dangle check,
+     * where the block is complete. Anything unrecognized - a branch or loop between, an escaped
+     * address, a field/array/global receiver, a `?.` spelling - is simply not proven and compiles.
+     *
+     * Interface FIELD access (`lv.tag`, and the `lv.tag = ...` write form, which share one
+     * lvalue) has the identical hazard and uses the identical proof: the field address is
+     * data + vtable[slot], so a null vtable faults on the offset load itself.
+     */
+    struct NullIfaceDispatchSite
+    {
+        std::string VarName;
+        std::string MemberName;
+        bool IsField = false;
+        int Line = 0;
+        int Col = 0;
+    };
+
+    struct PendingNullIfaceDispatch
+    {
+        llvm::AllocaInst* Slot = nullptr;
+        llvm::Instruction* Anchor = nullptr;   // the access's own load off the slot
+        std::string VarName;
+        std::string MemberName;
+        std::string IfaceName;
+        bool IsField = false;
+        int Line = 0;
+        int Col = 0;
+    };
+    std::unordered_map<llvm::Function*, std::vector<PendingNullIfaceDispatch>> pendingNullIfaceDispatch_;
+
+    void RecordPendingNullIfaceDispatch(const NullIfaceDispatchSite& site, llvm::Value* slot,
+                                        llvm::Value* anchor, const std::string& ifaceName)
+    {
+        if (site.VarName.empty() || site.Line <= 0) return;
+        auto* alloca = llvm::dyn_cast_or_null<llvm::AllocaInst>(slot);
+        auto* anchorInst = llvm::dyn_cast_or_null<llvm::Instruction>(anchor);
+        if (alloca == nullptr || anchorInst == nullptr) return;
+        llvm::BasicBlock* bb = anchorInst->getParent();
+        if (bb == nullptr || bb->getParent() == nullptr) return;
+        if (alloca->getFunction() != bb->getParent()) return;
+        pendingNullIfaceDispatch_[bb->getParent()].push_back(
+            { alloca, anchorInst, site.VarName, site.MemberName, ifaceName, site.IsField,
+              site.Line, site.Col });
+    }
+
+    // Same rationale as DiscardPendingReturnDangleChecks: an aborted body's blocks are partial.
+    void DiscardPendingNullIfaceDispatch(llvm::Function* F)
+    {
+        if (F) pendingNullIfaceDispatch_.erase(F);
+    }
+
     // Pointer SSA values detached by a `move` expression, keyed by value identity. A move nulls its
     // source, so nobody owns the value until a receiver adopts it - but it is not a `new` result and
     // carries no free-site type, so it belongs in neither ledger above. Lets a '?:' join ask "is
@@ -13243,13 +13302,20 @@ public:
     }
 
     llvm::Value* CallInterfaceMethod(llvm::Value* ifacePtr, const std::string& ifaceName,
-        const std::string& methodName, const std::vector<NamedVariable>& extraArgNVs)
+        const std::string& methodName, const std::vector<NamedVariable>& extraArgNVs,
+        const NullIfaceDispatchSite* site = nullptr)
     {
         auto fatTy = GetFatPtrType();
         auto ptrTy = builder->getInt8Ty()->getPointerTo();
 
         auto vtablePtrField = builder->CreateStructGEP(fatTy, ifacePtr, 0);
         auto vtablePtr = builder->CreateLoad(ptrTy, vtablePtrField);
+
+        // Record only - the definitely-null proof needs the finished block (see
+        // RunNullIfaceDispatchCheck). The vtable load is the anchor: it is used by the call
+        // below, so it cannot be erased out from under the deferred walk.
+        if (site != nullptr)
+            RecordPendingNullIfaceDispatch(*site, ifacePtr, vtablePtr, ifaceName);
 
         auto dataPtrField = builder->CreateStructGEP(fatTy, ifacePtr, 1);
         auto dataPtr = builder->CreateLoad(ptrTy, dataPtrField);
@@ -18845,6 +18911,122 @@ public:
         }
     }
 
+    /*
+     * True when `slot`'s address provably never leaves the frame, so the only writes to it are
+     * the direct stores this analysis can see. Every user must be a plain load, a store INTO the
+     * slot, an all-constant GEP whose own users are only loads and stores into it, or a debug /
+     * lifetime marker. Deliberately NOT CallIsPointerOpaqueIntrinsic: that helper also admits
+     * llvm.mem*, and a memcpy into the slot is a real write this walk would then miss.
+     * Anything else answers false, which only ever suppresses a rejection.
+     */
+    bool InterfaceSlotIsFrameLocal(const llvm::AllocaInst* slot) const
+    {
+        for (const llvm::User* u : slot->users())
+        {
+            if (llvm::isa<llvm::LoadInst>(u)) continue;
+            if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(u))
+            {
+                // The slot's ADDRESS stored elsewhere is an escape, not a write.
+                if (st->getPointerOperand() == slot) continue;
+                return false;
+            }
+            if (const auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(u))
+            {
+                if (!gep->hasAllConstantIndices()) return false;
+                for (const llvm::User* gu : gep->users())
+                {
+                    if (llvm::isa<llvm::LoadInst>(gu)) continue;
+                    const auto* gst = llvm::dyn_cast<llvm::StoreInst>(gu);
+                    if (gst != nullptr && gst->getPointerOperand() == gep) continue;
+                    return false;
+                }
+                continue;
+            }
+            if (const auto* call = llvm::dyn_cast<llvm::CallBase>(u))
+                if (const llvm::Function* f = call->getCalledFunction(); f != nullptr
+                    && (f->getName().starts_with("llvm.dbg.")
+                        || f->getName().starts_with("llvm.lifetime."))) continue;
+            return false;
+        }
+        return true;
+    }
+
+    // Does this store write into `slot` (whole slot, or one field through a constant GEP)?
+    static bool StoreWritesInterfaceSlot(const llvm::StoreInst* st, const llvm::AllocaInst* slot)
+    {
+        const llvm::Value* dest = st->getPointerOperand();
+        if (dest == slot) return true;
+        if (const auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(dest))
+            return gep->getPointerOperand() == slot;
+        return false;
+    }
+
+    /*
+     * Resolve the pending definitely-null interface dispatches for ONE function, at the same
+     * end-of-body hook as RunInterfaceReturnDangleCheck. Rejecting requires proving all three:
+     * the slot never escapes, a write to it precedes the dispatch IN THE DISPATCH'S OWN BLOCK
+     * (so no branch, loop back-edge or call sits between the two), and that write is a whole-slot
+     * store of a null constant. Any gap in any of the three leaves the program compiling.
+     */
+    void RunNullIfaceDispatchCheck(llvm::Function* F)
+    {
+        if (!F) return;
+        auto it = pendingNullIfaceDispatch_.find(F);
+        if (it == pendingNullIfaceDispatch_.end()) return;
+        std::vector<PendingNullIfaceDispatch> pending = std::move(it->second);
+        pendingNullIfaceDispatch_.erase(it);
+
+        // Escape hatch: skip the diagnostic entirely without a rebuild if it ever misfires.
+        const char* off = std::getenv("CFLAT_NULL_IFACE_OFF");
+        if (off && off[0] != '\0') return;
+
+        for (const auto& rec : pending)
+        {
+            if (rec.Slot == nullptr || rec.Anchor == nullptr) continue;
+            llvm::BasicBlock* bb = rec.Anchor->getParent();
+            if (bb == nullptr || bb->getParent() != F) continue;
+            if (rec.Slot->getFunction() != F) continue;
+            if (!InterfaceSlotIsFrameLocal(rec.Slot)) continue;
+
+            // Last write to the slot at or before the dispatch, within its own straight-line
+            // block. A block has one entry and no branch inside it, so that write is exactly
+            // what the dispatch reads.
+            const llvm::StoreInst* last = nullptr;
+            bool reachedAnchor = false;
+            for (const llvm::Instruction& inst : *bb)
+            {
+                if (&inst == rec.Anchor) { reachedAnchor = true; break; }
+                if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(&inst))
+                    if (StoreWritesInterfaceSlot(st, rec.Slot)) last = st;
+            }
+            if (!reachedAnchor || last == nullptr) continue;
+            // A partial (single-field) write leaves the other half unaccounted for.
+            if (last->getPointerOperand() != rec.Slot) continue;
+            const auto* stored = llvm::dyn_cast<llvm::Constant>(last->getValueOperand());
+            if (stored == nullptr || !stored->isNullValue()) continue;
+
+            SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
+            // One wording per role. "last set to null" covers BOTH origins the proof accepts:
+            // an `= default` / `= nullptr` initializer, and a mid-block reassignment to null.
+            if (rec.IsField)
+                LogError(std::format(
+                    "member access on null interface value '{}' - '{}' has not been assigned an "
+                    "implementation since it was last set to null, so '{}.{}' would resolve its "
+                    "address through a null '{}' vtable; assign one before the access, or write "
+                    "'{}?.{}' to skip it when null",
+                    rec.VarName, rec.VarName, rec.VarName, rec.MemberName, rec.IfaceName,
+                    rec.VarName, rec.MemberName));
+            else
+                LogError(std::format(
+                    "method call on null interface value '{}' - '{}' has not been assigned an "
+                    "implementation since it was last set to null, so '{}.{}()' would dispatch "
+                    "through a null '{}' vtable; assign one before the call, or write '{}?.{}()' "
+                    "to skip it when null",
+                    rec.VarName, rec.VarName, rec.VarName, rec.MemberName, rec.IfaceName,
+                    rec.VarName, rec.MemberName));
+        }
+    }
+
     // Solve the MaybeMoved fixpoint per llvm::Function over the emitted module. This is the
     // source of truth for loop-carried / cross-block / switch use-after-move (the inline
     // linear checker owns straight-line + if/else and aborts before this runs). On any
@@ -18863,6 +19045,11 @@ public:
         // that function (it is cleared/parked per-function), so the ledger lookups the check
         // depends on would be answering for the WRONG function. Drop them unanalyzed (accept).
         pendingReturnDangleChecks_.clear();
+
+        // Leftover null-interface dispatch records belong to a body that never reached the
+        // end-of-body hook (a lambda, a synthesized body, or an erased global-init temp
+        // function whose blocks are gone). Drop them unanalyzed - accept, never reject.
+        pendingNullIfaceDispatch_.clear();
 
         // Escape hatch: skip the pass entirely without a rebuild if it ever misfires.
         const char* off = std::getenv("CFLAT_MOVE_DF_OFF");

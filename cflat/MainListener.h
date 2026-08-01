@@ -8280,6 +8280,9 @@ public:
                     // Same reasoning for pending return-dangle checks: a partial CFG cannot
                     // answer the existential use-list question soundly.
                     compiler->DiscardPendingReturnDangleChecks(fn);
+                    // Same reasoning for pending null-interface dispatches: the anchor's block
+                    // was never finished, so "the last write before the dispatch" is unanswerable.
+                    compiler->DiscardPendingNullIfaceDispatch(fn);
                     expectErrorHandled = true;
                 }
                 else
@@ -8321,6 +8324,10 @@ public:
             // Same reasoning, for the deferred interface-return-dangle existential check: the
             // slot's use-list is only complete once the body is fully lowered.
             compiler->RunInterfaceReturnDangleCheck(fn);
+
+            // Same reasoning again for the definitely-null interface dispatch: the proof reads
+            // the dispatch's own block, which is only complete now.
+            compiler->RunNullIfaceDispatchCheck(fn);
         }
 
         if (isAutoReturn)
@@ -19428,9 +19435,32 @@ public:
                             int ifaceFieldIdx = compiler->InterfaceFieldIndex(ifaceName, primaryIdentifier);
                             if (ifaceFieldIdx >= 0 && !interfaceVar.TypeAndValue.IsInterfacePointer)
                             {
-                                llvm::Value* fatVal = interfaceVar.Primary != nullptr
-                                    ? interfaceVar.Primary
+                                // A FRESH load off the slot is emitted here and now, so it can anchor
+                                // the definitely-null proof. An already-set Primary may have been
+                                // loaded in an EARLIER block, where this block's stores are the wrong
+                                // evidence, so that shape is left unrecorded (no diagnostic).
+                                llvm::LoadInst* freshFatLoad = interfaceVar.Primary != nullptr
+                                    ? nullptr
                                     : compiler->CreateLoad(compiler->GetFatPtrType(), interfaceVar.Storage);
+                                llvm::Value* fatVal = interfaceVar.Primary != nullptr
+                                    ? interfaceVar.Primary : freshFatLoad;
+
+                                // Definitely-null member access: same slot proof as the method
+                                // dispatch below (RunNullIfaceDispatchCheck). Covers the write form
+                                // too - `lv.tag = 5` shares this one lvalue. '?.' is the sanctioned
+                                // spelling for a maybe-null receiver and is never recorded.
+                                if (!nullConditionalPending && freshFatLoad != nullptr)
+                                {
+                                    LLVMBackend::NullIfaceDispatchSite fldSite;
+                                    fldSite.VarName = interfaceVar.CallerName.empty()
+                                        ? interfaceVar.TypeAndValue.VariableName : interfaceVar.CallerName;
+                                    fldSite.MemberName = primaryIdentifier;
+                                    fldSite.IsField = true;
+                                    fldSite.Line = (int)ctx->getStart()->getLine();
+                                    fldSite.Col = (int)ctx->getStart()->getCharPositionInLine();
+                                    compiler->RecordPendingNullIfaceDispatch(
+                                        fldSite, interfaceVar.Storage, freshFatLoad, ifaceName);
+                                }
 
                                 // '?.' on an interface FIELD: the address is data + vtable[slot], so
                                 // BOTH halves must be live or the offset load itself faults.
@@ -22149,11 +22179,29 @@ public:
                                     Compiler(ctx)->CreateAssignment(interfaceVar.Primary, ifacePtr);
                                 }
 
+                                // Definitely-null dispatch: record the receiver only when it is a
+                                // NAMED local's own slot dispatched with a plain '.'. A '?.' chain
+                                // is the sanctioned spelling for a maybe-null receiver, and a
+                                // spilled temp names no variable, so neither is recorded.
+                                LLVMBackend::NullIfaceDispatchSite ncSite;
+                                const LLVMBackend::NullIfaceDispatchSite* ncSitePtr = nullptr;
+                                if (ncIfacePtr == nullptr && !nullConditionalPending
+                                    && interfaceVar.Storage != nullptr && ifacePtr == interfaceVar.Storage)
+                                {
+                                    ncSite.VarName = interfaceVar.CallerName.empty()
+                                        ? interfaceVar.TypeAndValue.VariableName : interfaceVar.CallerName;
+                                    ncSite.MemberName = primaryIdentifier;
+                                    ncSite.Line = (int)ctx->getStart()->getLine();
+                                    ncSite.Col = (int)ctx->getStart()->getCharPositionInLine();
+                                    ncSitePtr = &ncSite;
+                                }
+
                                 namedVar.Primary = Compiler(ctx)->CallInterfaceMethod(
                                     ifacePtr,
                                     interfaceVar.TypeAndValue.TypeName,
                                     primaryIdentifier,
-                                    extraArgs
+                                    extraArgs,
+                                    ncSitePtr
                                 );
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;

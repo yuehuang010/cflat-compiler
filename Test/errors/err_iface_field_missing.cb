@@ -17,6 +17,29 @@ expect_error("does not implement interface field 'ITitled::title'") {
     };
 }
 
+/*
+ * Accessing an interface FIELD on a provably-null receiver has the same hazard as a method call:
+ * the field address is data + vtable[slot], so a null vtable faults on the OFFSET LOAD itself,
+ * before any field byte is touched. Same proof, same end-of-body resolution; the wording says
+ * "member access", not "method call", which is what proves the FIELD record fired rather than the
+ * dispatch one. These two legs are here rather than beside the three method legs in
+ * err_iface_call_too_few_args.cb because they are a SEPARATE record site: a regression in either
+ * site is always observed, since a failed expectation exits the compile and cannot mask a leg in
+ * another file. Read comes first, so a write-only regression surfaces on its own.
+ */
+interface PTagged { int tag; int kind(); };
+class PTag : PTagged { int tag = default; int kind() { return 1; } };
+
+expect_error("member access on null interface value 'pv' - 'pv' has not been assigned an implementation since it was last set to null, so 'pv.tag' would resolve its address through a null 'PTagged' vtable") {
+    int pvNullFieldRead() { PTagged pv = default; return pv.tag; }
+}
+
+// The WRITE form shares the read's lvalue (EmitInterfaceFieldAddress), so this leg exists to pin
+// that a store-only use really does reach the record placed on that lvalue.
+expect_error("member access on null interface value 'wv' - 'wv' has not been assigned an implementation since it was last set to null, so 'wv.tag' would resolve its address through a null 'PTagged' vtable") {
+    void wvNullFieldWrite() { PTagged wv = default; wv.tag = 5; }
+}
+
 extern int main()
 {
     return 0;

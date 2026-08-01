@@ -11,6 +11,47 @@ class One : IOne
     int go(int a) { return 100 + a; }
 };
 
+/*
+ * A plain '.' call on an interface value that is PROVABLY still null used to compile clean and
+ * SIGSEGV, because the dispatch loads the method slot off a null vtable
+ * (interface-method-call-on-null-value-segfaults.md). Only the straight-line case is rejected:
+ * the null init is the last write to the receiver's own slot before the call, in the call's own
+ * basic block. The diagnostic is DEFERRED to the end of the function body (the proof needs the
+ * finished block), so this uses the scoped-block form around a whole function - a
+ * statement-scoped block would close before the check runs.
+ *
+ * LEG LAYOUT. A failed expectation exits the compile, so only the FIRST failing leg in a file is
+ * ever seen. The family is therefore split by RECORD SITE - the unit that can regress on its own:
+ * the three METHOD-dispatch legs live here, the two FIELD-access legs in err_iface_field_missing.cb.
+ * Within this file the legs share one record site and are ordered fundamental-first, so leg 1
+ * failing already implies legs 2 and 3; a leg-2 or leg-3 -only regression (the proof going
+ * keyword-based, or generic type-name resolution breaking) still surfaces because leg 1 passes.
+ * The shapes that must KEEP compiling live in Test/test_interface.cb
+ * (testNullIfaceDispatchAcceptSet).
+ */
+interface NgLive { int Get(); };
+class NgImpl : NgLive { int d = default; int Get() { return d; } };
+
+// Leg 1 - the canonical repro.
+expect_error("method call on null interface value 'lv' - 'lv' has not been assigned an implementation since it was last set to null, so 'lv.Get()' would dispatch through a null 'NgLive' vtable") {
+    int ngNullDispatch() { NgLive lv = default; return lv.Get(); }
+}
+
+// Leg 2 - the '= nullptr' spelling emits the SAME null store, so it must be rejected by the same
+// proof. This is the leg that fails alone if the proof ever starts keying on the keyword.
+expect_error("method call on null interface value 'lv2' - 'lv2' has not been assigned an implementation since it was last set to null, so 'lv2.Get()' would dispatch through a null 'NgLive' vtable") {
+    int ngNullptrDispatch() { NgLive lv2 = nullptr; return lv2.Get(); }
+}
+
+// Leg 3 - through a GENERIC interface. The receiver's type name arrives already monomorphized,
+// so naming 'GLive__int' is what proves the instantiation, not the template, was resolved.
+interface GLive<T> { T Get(); };
+class GImpl<T> : GLive<T> { T d = default; T Get() { return d; } };
+
+expect_error("method call on null interface value 'gv' - 'gv' has not been assigned an implementation since it was last set to null, so 'gv.Get()' would dispatch through a null 'GLive__int' vtable") {
+    int giNullDispatch() { GLive<int> gv = default; return gv.Get(); }
+}
+
 extern int main()
 {
     One o;
