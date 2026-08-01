@@ -2,3 +2,91 @@
 expect_error("cannot bind a raw pointer 'T*' to an array-view 'T[]'") {
     void f(int* p) { int[] a = p; a[0] = 1; }
 }
+
+// A view bound directly from a fixed array's decayed storage (stack or global) is legal to
+// read, but a later 'delete' hands free() a non-heap address and used to abort at runtime
+// with no diagnostic at all (internal/issue/p1/delete-of-array-view-over-stack-storage.md).
+// Proven from the RHS's own ConstArraySize at THIS bind site.
+expect_error("cannot delete array-view 'v' - it was bound from 'a'") {
+    void declInitStack() { int[3] a; int[] v = a; delete[_] v; }
+}
+
+// Same hole through the 'auto' spelling: 'auto v = a;' deduces the view 'int[]' the same way
+// as the explicit 'int[] v = a;' above - it must reach the identical guard.
+expect_error("cannot delete array-view 'v' - it was bound from 'a'") {
+    void declInitStackAuto() { int[3] a; auto v = a; delete[_] v; }
+}
+
+// 'delete' (no brackets) reaches the exact same hole - the guard is not keyed on the
+// '[_]'/'[n]' delete spelling.
+expect_error("cannot delete array-view 'v' - it was bound from 'a'") {
+    void declInitStackPlainDelete() { int[3] a; int[] v = a; delete v; }
+}
+
+// A GLOBAL fixed array is exactly as un-free()-able as a stack one, and exactly as provable
+// (the RHS's ConstArraySize proves it regardless of where the array itself lives). Pinned to
+// the real global name: GetGlobalVariableNV never sets CallerName, so the message is built
+// from the RHS's own AST text, not a generic "local" fallback.
+int[3] gArrForDelete;
+expect_error("cannot delete array-view 'v' - it was bound from 'gArrForDelete'") {
+    void declInitGlobalArray() { int[] v = gArrForDelete; delete[_] v; }
+}
+
+// Round-2 review (G1): a global whose name COLLIDES with a symbol the runtime already
+// declares (libc's 'read', here) gets a '.N' LLVM uniquifying suffix on its mangled name.
+// The diagnostic must print the SOURCE spelling 'read', never the mangled 'read.1' - printing
+// the LLVM symbol name off the GlobalVariable (the original implementation) would name
+// something absent from the user's code. Sourced from the RHS's AST text instead.
+int[3] read;
+expect_error("cannot delete array-view 'v' - it was bound from 'read'") {
+    void declInitGlobalCollision() { int[] v = read; delete[_] v; }
+}
+
+// A struct FIELD read (not the field ITSELF, which is left alone below) names the actual
+// source path 'h.a', not the base struct instance 'h' - 'h' is a Holder, not fixed-array
+// storage, so blaming it would be a factually false diagnostic.
+struct DeclInitFieldSourceHolder { int[3] a; };
+expect_error("cannot delete array-view 'v' - it was bound from 'h.a'") {
+    void declInitFieldSource() { DeclInitFieldSourceHolder h; int[] v = h.a; delete[_] v; }
+}
+
+// G2 (round-2 review): a GLOBAL struct's fixed-array field is a GEP off the global, not a
+// plain GlobalVariable and not a local CallerName - the same AST-text fallback that fixes G1
+// names it correctly too ('gDeclInitFieldHolder.a'), for free.
+struct DeclInitGlobalFieldHolder { int[3] a; };
+DeclInitGlobalFieldHolder gDeclInitFieldHolder = default;
+expect_error("cannot delete array-view 'v' - it was bound from 'gDeclInitFieldHolder.a'") {
+    void declInitGlobalFieldSource() { int[] v = gDeclInitFieldHolder.a; delete[_] v; }
+}
+
+// Legal: a view from 'new T[n]' (explicit or 'auto'-deduced) is a genuine heap allocation -
+// 'delete[_]' is exactly right and must keep compiling.
+void declInitHeapOk() { int[] v = new int[3]; delete[_] v; }
+void declInitHeapAutoOk() { auto v = new int[3]; delete[_] v; }
+
+// Legal: the view's origin cannot be proven here (it comes from a 'move' parameter, so the
+// caller's original binding is out of view) - the guard must not reject what it cannot prove.
+void declInitMoveParamOk(move int[] v) { delete[_] v; }
+void declInitMoveParamCaller() { int[] h = new int[3]; declInitMoveParamOk(move h); }
+
+// Legal (compile-time; not proven safe at runtime - a residual gap the issue's fix direction
+// does not require closing): rebinding one view from another is not traced transitively, so
+// v2's origin is not provable from v1 alone even though v1 itself came from fixed-array
+// storage. The guard only reasons about the DIRECT bind site's own ConstArraySize.
+void declInitViewOfViewOk() { int[3] a; int[] v1 = a; int[] v2 = v1; delete[_] v2; }
+
+// Legal: a conditional-join source is never traced, even when both arms are individually
+// provable - joins are always treated as unprovable, matching the polarity of the sibling
+// RejectRawPointerToArrayView gate.
+void declInitCondJoinOk() { int[3] a; int[3] b; int[] v = 1 > 0 ? a : b; delete[_] v; }
+
+// Legal: a struct FIELD of view type is never traced by this guard - field provenance is
+// out of scope for this fix (the field-vs-outsider encapsulation check is a separate,
+// pre-existing gate; deleting a field from INSIDE the owning struct's own method reaches
+// this code path and must still compile).
+struct DeclInitFieldHolder {
+    int[] v;
+    void takeIt(int[] src) { v = src; }
+    void kill() { delete[_] v; }
+};
+void declInitFieldOk() { int[3] a; DeclInitFieldHolder h; h.takeIt(a); h.kill(); }

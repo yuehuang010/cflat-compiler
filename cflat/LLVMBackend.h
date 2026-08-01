@@ -817,6 +817,10 @@ public:
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
         bool IsExplicitMove = false;
         bool MovedIntoInterface = false; // compile-time: ownership was boxed into an interface local ('IFace x = ptr'); 'delete ptr' is a no-op that leaks - delete the interface instead
+        // compile-time: this array-view LOCAL's DECLARATION bound it from fixed-array storage
+        // (proven, never reassigned since); 'delete' would hand free() a non-heap address.
+        bool ViewOfFixedArrayStorage = false;
+        std::string ViewOfFixedArraySourceName; // name of the fixed array it was bound from, for the diagnostic
         // compile-time: explicitly 'move'd-out thin pointer local - null but plain-readable by
         // design; only a same-block '->'/'.'/'*'/'[]' DEREFERENCE is rejected (see MarkVariableExplicitlyMovedNull).
         bool ExplicitlyMovedNull = false;
@@ -18469,6 +18473,34 @@ public:
                 { it->second.MovedIntoInterface = true; return; }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
                 { it->second.MovedIntoInterface = true; return; }
+        }
+    }
+
+    // Record (declaration) or permanently clear (any later plain '=' reassignment) whether an
+    // array-view LOCAL was bound from stack/global fixed-array storage - see
+    // ViewOfFixedArrayStorage on NamedVariable. Deliberately NOT flow-sensitive: a reassignment
+    // is walk-order over the AST, not control flow, so it cannot tell "this branch reassigns
+    // and returns" from "this branch reassigns and falls through to the delete". Once a local
+    // is EVER reassigned its declaration-time provenance can no longer be trusted on every
+    // path, so it is cleared for good rather than recomputed from the new RHS - proven-reject
+    // only, never proven-accept from a later assignment.
+    void SetViewOfFixedArrayStorage(const std::string& name, bool value, const std::string& sourceName = {})
+    {
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+            {
+                it->second.ViewOfFixedArrayStorage = value;
+                it->second.ViewOfFixedArraySourceName = value ? sourceName : std::string();
+                return;
+            }
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+            {
+                it->second.ViewOfFixedArrayStorage = value;
+                it->second.ViewOfFixedArraySourceName = value ? sourceName : std::string();
+                return;
+            }
         }
     }
 

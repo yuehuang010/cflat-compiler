@@ -8916,6 +8916,9 @@ public:
                 std::vector<uint64_t> srcConstInnerDimensions;
                 bool srcIsArrayView = false;
                 bool srcIsSimd = false;
+                // Raw AST text of the initializer, used as the delete-guard's source name for a
+                // GLOBAL read: CallerName is unset there, and the LLVM symbol may carry a '.N' suffix.
+                std::string srcRhsExprText;
                 // True when the initializer is itself array-shaped (a fixed array or a view).
                 // A fixed-array destination only takes the copy path for such a source; a scalar
                 // pointer / `new` / string-literal RHS keeps its pre-existing diagnostic.
@@ -9075,6 +9078,8 @@ public:
                 if (initializer != nullptr)
                 {
                     auto assignmentExpression = initializer->assignmentExpression();
+                    if (assignmentExpression != nullptr)
+                        srcRhsExprText = assignmentExpression->getText();
                     // Inbound alloc-align channel: an align-declared local whose initializer is a
                     // DIRECT `new` hands the declared allocation alignment down so the bare `new`
                     // allocates aligned. Gated on AsDirectNew so an indirect `new` (ternary/cast/
@@ -9630,6 +9635,28 @@ public:
                             "redeclaration of '{}' in the same scope; use a different name or assign to the existing variable", name));
                     auto alloc = compiler->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize, line, typeAndValue.UserAlignValue);
                     allocList.push_back(std::pair(name, alloc));
+
+                    // A view bound directly from a fixed array's decayed storage (ConstArraySize
+                    // proves it - 'new T[n]' and another 'T[]' both carry IsArrayView instead)
+                    // came from stack/global storage, not the heap; tag it so 'delete' can reject
+                    // the free() of a non-heap address. Every other RHS shape (parameter, field,
+                    // call result, conditional join) leaves the flag at its default false.
+                    if (typeAndValue.IsArrayView)
+                    {
+                        bool boundFromFixedArray = srcConstArraySize > 0 && !srcIsArrayView;
+                        // Name the source for the diagnostic: 'callerName[.field]' for a local
+                        // or field read. A plain (or field-of-global) GLOBAL read never sets
+                        // CallerName (GetGlobalVariableNV doesn't), so fall back to the RHS's own
+                        // AST text - never the LLVM symbol name: a name collision with a runtime
+                        // declaration (e.g. a global 'read' vs. the libc '@read' the runtime
+                        // imports) gets a '.N' uniquifying suffix that does not exist in source.
+                        std::string srcDesc = boundFromFixedArray
+                            ? (!srcCallerName.empty()
+                                ? DescribeInitializerPath(srcCallerName, srcBorrowedField)
+                                : srcRhsExprText)
+                            : std::string();
+                        compiler->SetViewOfFixedArrayStorage(name, boundFromFixedArray, srcDesc);
+                    }
 
                     if (needsArrayDefaultInit)
                         EmitFixedArrayDefaultInit(alloc, typeAndValue);
@@ -11767,7 +11794,19 @@ public:
             // Reassignment / field store into an array-view: `a = rawIntPtr;` or `s.view = p;`
             // would launder a raw pointer into the noalias contract - reject (decay is one-way).
             if (operatorText == "=")
+            {
                 RejectRawPointerToArrayView(ctx, namedVar.TypeAndValue, rightNV.TypeAndValue);
+                // Permanently clear the declaration-time provenance flag on ANY reassignment,
+                // regardless of what this RHS is. Recomputing it from THIS RHS would be
+                // WALK-ORDER over the AST, not control flow: a reassignment inside one branch
+                // must not poison (or clear) a delete reachable only from a different branch -
+                // see SetViewOfFixedArrayStorage. Scoped to a plain bare-identifier LHS (field
+                // stores are never tracked in the first place).
+                if (namedVar.TypeAndValue.IsArrayView && namedVar.FieldName.empty()
+                    && !namedVar.CallerName.empty() && namedVar.Storage != nullptr
+                    && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
+                    compiler->SetViewOfFixedArrayStorage(namedVar.CallerName, false);
+            }
             // An assignment to an existing variable (not a declaration) does not transfer
             // ownership - consuming lastOwningResult here would be wrong (the new-allocated
             // value is either moved via items.add(move p) or managed by the caller).
@@ -17467,6 +17506,34 @@ public:
                     "destructed automatically at scope exit; 'delete' applies to pointers "
                     "from 'new'",
                     namedVar.CallerName.empty() ? "<expr>" : namedVar.CallerName, displayType));
+                return {};
+            }
+
+            // Error: deleting an array-view local whose DECLARATION bound it from stack/global
+            // fixed-array storage ('int[3] a; int[] v = a;' or the 'auto' spelling deducing the
+            // same view), and which was never reassigned since (SetViewOfFixedArrayStorage
+            // clears the flag for good on any later '='). A T[] view is a thin T* with no
+            // runtime tag distinguishing a heap allocation from decayed fixed-array storage, so
+            // without this the operand reaches free() with a non-heap address and aborts with no
+            // diagnostic. A view whose origin is a parameter, a field, a call result, a
+            // conditional join, or ANY reassigned local (even one only conditionally reassigned,
+            // or reassigned back to a fixed array) is never flagged here and stays compiling -
+            // rejecting a reassigned local would be a reject on a MAY-alias, not a proof, which
+            // is unsound in the reject direction. Matches the RejectRawPointerToArrayView guard's
+            // polarity. Scoped to !sawCast: casting a stack-bound view ('delete[_] (int*)v;') is
+            // a known, deliberately unproven hole - see the cast-peeling comment above.
+            if (!sawCast && namedVar.TypeAndValue.IsArrayView && namedVar.ViewOfFixedArrayStorage)
+            {
+                std::string name = namedVar.CallerName.empty()
+                    ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
+                std::string boundFrom = namedVar.ViewOfFixedArraySourceName.empty()
+                    ? std::string("a stack or global fixed array")
+                    : std::format("'{}', a stack or global fixed array", namedVar.ViewOfFixedArraySourceName);
+                LogErrorContext(ctx, std::format(
+                    "cannot delete array-view '{}' - it was bound from {}, not a heap allocation; "
+                    "'delete' would hand free() a non-heap address. Only a view from 'new {}[n]' "
+                    "can be deleted.",
+                    name, boundFrom, namedVar.TypeAndValue.TypeName));
                 return {};
             }
 

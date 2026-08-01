@@ -2,3 +2,49 @@
 expect_error("cannot bind a raw pointer 'T*' to an array-view 'T[]'") {
     void f(int* p) { int[] a = new int[4]; a = p; }
 }
+
+// Legal, but NOT proven safe (deliberately not diagnosed - a known, pre-existing gap, not a
+// regression: this program aborts identically on master, which has no delete-of-array-view
+// guard at all). Reassigning a HEAP-bound view to a fixed array's decayed storage moves it
+// into the delete-of-non-heap-address hole (internal/issue/p1/delete-of-array-view-over-
+// stack-storage.md), but the guard is declaration-only: ANY '=' to a view local permanently
+// clears its provenance flag (SetViewOfFixedArrayStorage), regardless of what the new RHS is.
+// Recomputing "is the NEW rhs a fixed array" from the textual last assignment was tried and
+// reverted (round-1 review, F1/F5) - it is WALK-ORDER over the AST, not control flow, so it
+// both false-rejects a reassignment guarded by an early return on another path (F1) and
+// false-accepts one reachable on some other path (this leg, F5). Declaration-only reject is
+// the only shape that is sound in the REJECT direction.
+void reassignHeapToStackNotDiagnosed() { int[3] a; int[] v = new int[4]; v = a; delete[_] v; }
+
+// Legal: reassigning the OTHER direction (stack storage -> a fresh heap allocation) is
+// accepted for the same declaration-only reason above - the flag is cleared on the '=' before
+// the delete is ever reached, so this is unconditionally safe to compile (and happens to also
+// be genuinely safe at runtime here, unlike the leg above).
+void reassignStackToHeapOk() { int[3] a; int[] v = a; v = new int[4]; delete[_] v; }
+
+// F1 (round-1 review, merge-blocking false rejection): a conditional REASSIGNMENT - not a
+// ternary at the declaration site (see declInitCondJoinOk) - must not poison a delete that is
+// reachable only from a path which never took the stack rebind. Rejecting any of the three
+// legs below is a reject on a MAY-alias, not a proof, and is strictly worse than the original
+// silent abort. All three must keep compiling AND must run identically to master (rc 0).
+void f1EarlyReturn(int argc) {
+    int[3] a; int[] v = new int[4];
+    if (argc > 100) { v = a; v[0] = 1; return; }
+    v[0] = 2;
+    delete[_] v;
+}
+// Falls through unconditionally after the 'if' - on the taken branch this is genuinely unsafe
+// at runtime (same accepted gap as reassignHeapToStackNotDiagnosed above), but the guard must
+// still not reject it: it cannot tell "always taken" from "never taken" from AST walk order.
+void f1IfFallthrough(int argc) {
+    int[3] a; int[] v = new int[4];
+    if (argc > 100) { v = a; }
+    v[0] = 2;
+    delete[_] v;
+}
+void f1WhileBreakFallthrough(int argc) {
+    int[3] a; int[] v = new int[4];
+    while (argc > 100) { v = a; break; }
+    v[0] = 2;
+    delete[_] v;
+}
