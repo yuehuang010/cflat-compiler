@@ -17821,9 +17821,9 @@ public:
                     // Internal function<T>: provide a closure fat struct {i8*, i8*}.
                     if (val && !val->getType()->isStructTy())
                     {
-                        // Re-resolve by CallerName to skip method overloads sharing the same key,
-                        // and pick the overload whose per-param 'move' flags match the destination.
-                        if (!arg.CallerName.empty())
+                        // Re-resolve a NAMED FUNCTION only: skips same-key method overloads and
+                        // picks matching 'move' flags. On a call result CallerName is the CALLEE.
+                        if (!arg.CallerName.empty() && llvm::isa<llvm::Function>(val))
                         {
                             int expectedCount = (int)candParamItr->FuncPtrParams.size();
                             if (auto* correctFn = GetFunctionForFuncPtr(arg.CallerName, expectedCount, &candParamItr->FuncPtrParams))

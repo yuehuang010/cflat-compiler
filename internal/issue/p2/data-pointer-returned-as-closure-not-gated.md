@@ -60,5 +60,6 @@ become true as written again.
 None for the return path. `Test/errors/err_data_pointer_to_closure_param.cb` covers the
 argument side on both call paths and is the natural home.
 
-Related: [[data-pointer-into-thin-function-param-segfaults]],
-[[funcptr-call-result-into-closure-param-garbage]], [[interface-issue-queue]]
+Related: [[data-pointer-into-thin-function-param-segfaults]], [[interface-issue-queue]]
+(`funcptr-call-result-into-closure-param-garbage` was the ARGUMENT-side sibling of this defect;
+it is fixed and its file deleted - the "fix/funcptr-callresult" landed record has the detail).

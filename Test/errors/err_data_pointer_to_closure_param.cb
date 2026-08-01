@@ -208,3 +208,33 @@ expect_error("no method of 'ISigSlot.lam' matches the given arguments") {
         return io.lam(g);
     }
 }
+
+// `move` is part of a function-pointer TYPE, so a fat parameter that TAKES OWNERSHIP cannot be
+// bound by a function whose own parameter only borrows - the callee would be handed a pointer it
+// must free and does not. This rejection lives in the same fat-argument arm as the gates above,
+// behind the guard that decides whether a bare function NAME re-resolves at all, so deleting
+// that lookup drops the diagnostic with nothing else to notice. The positive halves - a
+// `move`-matching overload still binds, and re-resolution picks it over the borrow sibling -
+// are value legs in Test/test_function_ptr.cb.
+//
+// Distinct from err_funcptr_move_mismatch.cb, which pins a DIFFERENT diagnostic ("'move'
+// modifiers of function pointer signature") raised on the ASSIGNMENT path.
+
+expect_error("has no overload matching the 'move' modifiers required by parameter 'f'") {
+    struct MoveModMismatch { int value = 0; };
+
+    // Only a BORROW overload exists, so nothing in the set matches the destination's `move`.
+    int borrowsOnly(MoveModMismatch* p) { return p->value; }
+
+    int takesMoveClosure(Lambda<int(move MoveModMismatch*)> f)
+    {
+        MoveModMismatch* q = new MoveModMismatch();
+        q->value = 7;
+        return f(q);
+    }
+
+    int passBorrowIntoMoveClosure()
+    {
+        return takesMoveClosure(borrowsOnly);
+    }
+}

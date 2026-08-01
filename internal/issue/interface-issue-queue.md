@@ -28,7 +28,7 @@ why the shipped code has the shape it does, which approaches must not be retried
 ratified behaviour change that future work must not "fix" back. That section is the convergence
 point for the interface/generics work and is the reason this file is long.
 
-State on 2026-07-31: **73 open issues** (12 P1 / 30 P2 / 24 P3 / 7 UI), counted from disk
+State on 2026-08-01: **73 open issues** (9 P1 / 33 P2 / 24 P3 / 7 UI), counted from disk
 (`ls internal/issue/p{1,2,3}/*.md ui/*.md | wc -l`), not from arithmetic. Two P1s were fixed and their files deleted this session
 (`unique-ptr-field-stack-address-aborts-silently`, `function-array-body-silently-truncated`),
 and nine new issues were filed - every one of them found by the ADVERSARIAL REVIEWS of those two
@@ -36,7 +36,7 @@ fixes, not by the original investigation. That ratio is the story of the session
 things in this area surfaced nine more, seven of which are silent-abort or wrong-value class.
 ## Resume point
 
-**Current head: the P1 campaign.** `master` is `4097959`, macOS arm64 Release **540 / 0 / 8**
+**Current head: the P1 campaign.** `master` is `3b6e3e8`, macOS arm64 Release **554 / 0 / 8**
 plus `example_mac.sh` **35 / 0**. Six P1s fixed on 2026-07-31 (`99d73f3`, `696060d`, `8c29ca7`,
 `d65f000`, `4000fa1`, `4097959`); the design records are at the bottom. **P1 is being cleared
 before P2 starts** - that includes `iface-ifconst-base-clause-implementor`, so the parked
@@ -68,7 +68,8 @@ than implied. `fix/funcptr-arg-accept-set` closes ONE of them outright
 (`data-pointer-into-thin-function-param-segfaults`, deleted) and NARROWS a second:
 `funcptr-overload-binding-ignores-signature` is closed for the type-CLASS axis and rewritten in
 place for what remains (width, signedness, pointee, aggregates - see the landed record below).
-Still open unchanged: `funcptr-call-result-into-closure-param-garbage` (P1), and
+`funcptr-call-result-into-closure-param-garbage` (P1) is now fixed and deleted - see the landed
+record at the bottom. Still open unchanged:
 `data-pointer-returned-as-closure-not-gated`, `shape-mismatched-funcptr-arg-binds-silently` (P2).
 They are one defect family - argument and return lowering for callable values - and a future pass
 should scope them together rather than one at a time.
@@ -140,8 +141,8 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 11 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 32 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 9 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 33 |
 | **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 24 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
@@ -153,7 +154,6 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | [[ftell-fseek-long-width-on-windows]] | Silent wrong value on Windows: core binds C `long` as pointer-sized, so `ftell`/`fseek` read garbage under LLP64. Not a UI issue despite being Windows-only. |
 | [[interface-method-call-on-null-value-segfaults]] | SIGSEGV (139), no guard. Fires on a PLAIN non-generic interface too. Pre-existing and language-wide. |
 | [[funcptr-overload-binding-ignores-signature]] | NARROWED 2026-07-31 by `fix/funcptr-arg-accept-set`: the type-CLASS axis is closed on both paths (the filed `double`-into-`int` repro now errors). Still open, silent and identical on master: floating-point WIDTH (same SHAPE as the closed repro), integer width/signedness, POINTEE type (memory-unsafe - reads past the end of the object), and aggregates. Do NOT re-close by widening the comparison to spellings; see the file. |
-| [[funcptr-call-result-into-closure-param-garbage]] | Silent wrong value, exit 0, **no diagnostic at all**. A `function<>` returned by value into a fat `Lambda<>` parameter yields uninitialized garbage. DIRECT path only; every other source of a thin value passes correctly. Filed 2026-07-31. |
 | [[unique-field-to-field-copy-double-frees]] | Silent abort (exit 134), no diagnostic. Copying one `unique` field into another double-frees in a GENERIC container, while the identical plain-struct spelling is correctly diagnosed. Filed 2026-07-31. |
 | [[return-dangle-missed-when-slot-has-extra-user]] | Missed dangle, no diagnostic. Residue of `2bcc5a0`; NOT to be fixed by widening the whitelist. |
 | [[llvm-cannot-select-sign-extend-on-const-array-index]] | LLVM fatal error, compiler exit 134. Pre-existing; the front-end shape that fed it is now rejected earlier, so no live repro remains - confirm no other spelling reaches it, then re-rank. |
@@ -167,6 +167,7 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | [[chained-nullcoalesce-not-boxed-into-interface]] | false rejection | `take(z ?? y ?? a)` and `IShape j = z ?? y ?? a;` do not compile - the outer join's arm is the inner join's LOAD, which names no class. Spans EVERY position that boxes a `??` (decl-init, assignment, return, argument), so it predates the return/argument work. Fix at the ledger by splicing a nested join's arms. Filed 2026-07-31. |
 | [[pointer-arg-binds-by-value-class-param]] | miscompile | `byVal(a)` with a `Circle*` and a by-value `Circle` parameter scores a PERFECT match and lowers a raw pointer into a struct slot - module-verifier dump, NO source location, exit 1. `IsTypeMatch` compares TypeName and ignores `Pointer`; the sibling `IsTypePromotion` does gate on it. PRE-EXISTING and language-wide, no join involved. Scorer change - wide blast radius, wants the corpus sweep. Filed 2026-07-31. |
 | [[generic-wrapper-over-function-type-llvm-fatal]] | feature gap | `Box<function<int(int)>>` raises LLVM fatal `Cannot select: AArch64ISD::CALL` (exit 134) when the substituted field is INVOKED. Store-only may be fine - check that first. Borderline P1 (dies with no usable diagnostic); filed P2 because nothing lies to you. Filed 2026-07-31. |
+| [[generic-funcptr-return-poisons-enclosing-return]] | false rejection | Legal code rejected with a P1-grade diagnostic: a raw module-verifier dump (`%thinret`) and NO source location. CALLING a generic function that returns `function<>` routes the ENCLOSING function's `return` through `CoerceToFuncPtrReturn`. `main` does NOT escape; `void` and POINTER returns escape (the latter by a no-op ptr-to-ptr bitcast, which is why this is P2 and not P1 - no spelling is silently wrong). A second, different failure on the no-value-parameter spelling is recorded in the file; do not conflate. Filed 2026-08-01. |
 | [[auto-binding-of-fixed-array-loses-shape]] | feature gap | RESTORED and narrowed, re-ranked P1 -> P2. The non-pointer half is fixed; `auto v = <T*[N]>` now REJECTS because `T*[]` collapses to `T[]` in both parser copies. Representation is free - no new field needed. |
 | [[char-array-from-string-literal-has-no-spelling]] | feature gap | `char[N] b = "literal";` now has a clear diagnostic and three suggested spellings, but no direct replacement for the C idiom. Master miscompiled it silently. |
 | [[array-view-params-unconditionally-noalias]] | latent miscompile | Latent `-O2` miscompile hazard - UB handed to LLVM. P1 the moment a witness exists. |
@@ -402,10 +403,82 @@ silent, all identical on master, none of them regressions. See
 [[funcptr-overload-binding-ignores-signature]], which carries the repros and the fix direction -
 including the explicit instruction NOT to retry a widened SPELLING comparison.
 
-Not fixed, and deliberately left alone: a `function<>` returned BY VALUE from a call into a fat
-`Lambda<>` parameter still yields garbage on the DIRECT path
-([[funcptr-call-result-into-closure-param-garbage]], different root - a `CallerName` re-resolve
-hitting `GetFunctionForFuncPtr`'s single-overload early return).
+Left alone by that pass and fixed separately since: a `function<>` returned BY VALUE from a call
+into a fat `Lambda<>` parameter yielded garbage on the DIRECT path. See the
+"fix/funcptr-callresult" record below - the root was the `CallerName` re-resolve firing on a
+value that is not a named function.
+
+### fix/funcptr-callresult - the `CallerName` re-resolve only fires on a NAMED FUNCTION
+
+Closed `funcptr-call-result-into-closure-param-garbage` (file deleted). The filed lead was
+RIGHT about the mechanism and WRONG about the value: the printed number is a function address,
+not uninitialized memory, and the substituted code slot is a SHIM over the producer rather than
+its bare address.
+
+The mechanism. `CreateOverloadedFunctionCall`'s fat-closure argument arm re-resolves the
+argument by `arg.CallerName` to skip method overloads sharing a key and to pick the `move`-flag
+match. A CALL RESULT keeps the CALLEE's name in `CallerName` (the postfix walker sets it when
+the primary resolves to a function, then clears `Storage` and overwrites `TypeAndValue` but not
+`CallerName`), so `GetFunctionForFuncPtr("make", 1, ...)` ran on a value that is not a function
+at all. Its single-overload early return ignores `expectedParamCount`, so `val` became the
+`llvm::Function` for `make`; `WidenBareOrThinToClosureFat` then saw an `llvm::Function` and
+built `{__shim__make, null}` instead of `insertvalue`-ing the returned pointer. `f(5)` called
+`make(5)`, which returned `&dbl`, printed as an int.
+
+The fix is one condition: the re-resolve requires `llvm::isa<llvm::Function>(val)`. It is
+narrower than either option the issue file proposed, and it mirrors the guard `MainListener.h`
+already applies at its own two re-resolve sites (`:9339`, `:11876`) - the argument arm was the
+one place the pattern was missing. Clearing `CallerName` on call results was NOT taken -
+`CallerName` also feeds `ScoreMoveAgreement`'s rvalue test, the bond-source ledger, and move
+tracking, and blanking it changes all of them. Touching `GetFunctionForFuncPtr`'s early return
+was not taken either, for the reason the file gives.
+
+What the axis sweep settled, and why a narrower test would have shipped half a fix:
+
+- The defect is DIRECT-call + FAT (`Lambda<>`) slot only. The interface path is correct because
+  `LowerByValueArg` has no re-resolve, and the THIN (`function<>`) slot takes the extern-C arm,
+  which has none either. Both are parity legs, not the bug.
+- Producer kind is irrelevant EXCEPT for a method receiver: free function, `static`, a
+  namespaced callee, a `using Cb = function<int(int)>` return, and an arity-overloaded producer
+  all failed identically. `d.lam(m.makeMethod())` was already correct only by accident -
+  `CallerName` there is the RECEIVER `m`, which resolves to nothing in the function table.
+  Do not read that leg as evidence the method path is structurally safe.
+- Taker shape is irrelevant too: a fat parameter at argument index 1, a method on a GENERIC
+  class, and a namespaced free function all failed. Testing only "fat parameter at index 0 of a
+  plain method" would have proved much less than it looks.
+- TWO MORE SILENT WRONG VALUES fall out of the same fix, neither of them in the issue file. A
+  local `function<>` whose NAME collides with a global function called the GLOBAL and discarded
+  the local's value (500 instead of 15). And a producer with a SAME-ARITY sibling of its own
+  name returned 1005 - a plausible number, not a stray address, which makes it the worst shape
+  in this family: nothing about the output says "miscompile".
+
+Coverage, and the trap in writing it. The first version of the regression test asserted that a
+named argument "still re-resolves" using a function declared exactly ONCE. That is vacuous:
+`GetFunctionForFuncPtr`'s single-overload early return answers first and the multi-candidate arm
+is never entered - a build with the re-resolve DELETED OUTRIGHT ran the whole suite green. The
+discriminator both re-resolve legs need is TWO OVERLOADS OF THE NAME, which is what escapes that
+early return; what separates the survivors then differs per leg, and the two are not the same
+test. The ARITY leg has two candidates ENTER and exactly ONE survive the count filter (the
+wrong-arity arm is declared first, so a count-blind pick is visibly wrong). The `move` leg has
+both candidates survive the count filter - same name, same arity - so `moveFlagsMatch` is the
+only thing that can separate them. Do not copy "two candidates survive the arity filter" onto a
+new leg; it is true of the `move` leg only. The
+`move` REJECTION had no coverage anywhere in the repo and is now the last block of
+`Test/errors/err_data_pointer_to_closure_param.cb` - the existing closure-PARAMETER
+argument-binding family, same arm and same call path. It lives behind this same guard, so
+without that block deleting the lookup would drop a diagnostic silently. It is NOT the
+diagnostic `err_funcptr_move_mismatch.cb` pins: that one is raised on the ASSIGNMENT path and
+reads "'move' modifiers of function pointer signature".
+
+Found while sweeping, NOT part of this defect and filed separately - a generic function
+returning `function<>` poisons the ENCLOSING function's return coercion. See
+[[generic-funcptr-return-poisons-enclosing-return]]. It is why the regression test has no
+generic-producer leg.
+
+Still open in this family and NOT addressed here: the `move` flags are only checked when the
+argument is a bare NAME, so a `function<int(MP*)>` VARIABLE binds to a
+`Lambda<int(move MP*)>` parameter with no diagnostic. Same before and after this fix; it belongs
+with [[shape-mismatched-funcptr-arg-binds-silently]].
 
 ### fix/ifconst-ir - `if const` leaf emission gated on insert-block LIVENESS
 

@@ -125,6 +125,5 @@ scorer is what they test). The rebind residual is pinned in `Test/test_function_
 axes above have NO coverage - they compile and run silently, so an `expect_error` leg cannot be
 written until there is an error to expect.
 
-Related: [[funcptr-call-result-into-closure-param-garbage]],
-[[shape-mismatched-funcptr-arg-binds-silently]],
+Related: [[shape-mismatched-funcptr-arg-binds-silently]],
 [[funcptr-fixed-array-vs-view-overloads-collide]], [[interface-issue-queue]]

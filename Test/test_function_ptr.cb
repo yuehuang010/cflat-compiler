@@ -1983,6 +1983,124 @@ bool testFuncPtrArgProvenanceAccepts()
     return result;
 }
 
+// --- A `function<>` CALL RESULT passed to a closure parameter -----------------
+// The call result carried the CALLEE's name in CallerName, and the fat-closure argument arm
+// re-resolved that name to the callee's own address - so the closure's code slot became the
+// PRODUCER (`makeFree`) instead of the produced value, and the call returned a function
+// address printed as an int. Every producer spelling below feeds the same fat slot, since the
+// defect keys on the name resolving in the function table, not on how the value was made.
+
+int callResultDbl(int x)                 { return x * 2; }
+function<int(int)> makeCallResult()      { return callResultDbl; }
+using CallResultCb = function<int(int)>;
+CallResultCb makeCallResultAlias()       { return callResultDbl; }
+// Overloaded producer whose other arm has a DIFFERENT arity - the shape the single-overload
+// early return in GetFunctionForFuncPtr cannot see.
+function<int(int)> makeCallResultOv()    { return callResultDbl; }
+int makeCallResultOv(int a, int b)       { return a + b; }
+
+// Producer with a SAME-ARITY sibling of the same name. The worst pre-fix shape in this family:
+// re-resolving picked the sibling and the call returned a PLAUSIBLE 1005, not a stray address.
+function<int(int)> callResultProd()      { return callResultDbl; }
+int callResultProd(int x)                { return x + 1000; }
+
+// A local `function<>` whose NAME collides with a global function: the name resolved in the
+// function table, so the local's value was discarded and the global was called instead.
+int callResultShadow(int x)              { return x * 100; }
+int callResultTrip(int x)                { return x * 3; }
+
+// The re-resolve's own two jobs, which the guard must NOT disable for a bare function name.
+// (1) arity: TWO overloads exist, so the single-overload early return is escaped and the arity
+//     filter picks. The 2-arg arm is declared FIRST, so a count-blind pick returns it.
+int callResultOvf(int a, int b)          { return a + b; }
+int callResultOvf(int x)                 { return x * 2; }
+// (2) 'move' modifiers: same name, same arity, differing only in `move`.
+int callResultCons(MovePayload* p)       { return p->value + 1; }
+int callResultCons(move MovePayload* p)  { int v = p->value; delete p; return v + 2; }
+int callResultTakeMove(Lambda<int(move MovePayload*)> f)
+{
+    MovePayload* q = new MovePayload();
+    q->value = 7;
+    return f(q);
+}
+
+namespace CallResultNs
+{
+    function<int(int)> makeNs()          { return callResultDbl; }
+    int nsFat(Lambda<int(int)> f)        { return f(5); }
+}
+
+class CallResultMaker
+{
+    int tag = default;
+    function<int(int)> makeMethod()        { return callResultDbl; }
+    static function<int(int)> makeStatic() { return callResultDbl; }
+};
+
+interface ICallResult { int lam(Lambda<int(int)> f); };
+class CallResultTaker : ICallResult
+{
+    int tag = default;
+    int lam(Lambda<int(int)> f)   { return f(5); }
+    int thin(function<int(int)> f) { return f(5); }
+};
+
+// Taker shapes other than "fat parameter at index 0 of a plain method".
+int callResultFatAt1(int a, Lambda<int(int)> f)   { return a + f(5); }
+class CallResultG<T> { int tag = default; int lam(Lambda<int(int)> f) { return f(5); } };
+
+bool testFuncPtrCallResultIntoClosureParam()
+{
+    bool result = true;
+
+    CallResultTaker t;
+    ICallResult io = t;
+    CallResultMaker m;
+
+    // The reported shape: a free producer into a fat `Lambda<>` method parameter.
+    result &= Test("call result -> fat method",      t.lam(makeCallResult()),   10);
+    result &= Test("call result -> fat free fn",     fatCall(makeCallResult()), 10);
+    // The interface path was already correct; keep it as the parity leg.
+    result &= Test("call result -> fat interface",   io.lam(makeCallResult()),  10);
+
+    // Producer kind must not matter.
+    result &= Test("method result -> fat",           t.lam(m.makeMethod()),              10);
+    result &= Test("static result -> fat",           t.lam(CallResultMaker.makeStatic()), 10);
+    result &= Test("namespaced result -> fat",       t.lam(CallResultNs.makeNs()),       10);
+    result &= Test("alias-typed result -> fat",      t.lam(makeCallResultAlias()),       10);
+    result &= Test("overloaded producer -> fat",     t.lam(makeCallResultOv()),          10);
+    result &= Test("overloaded producer other arm",  makeCallResultOv(3, 4),             7);
+
+    // The THIN destination takes a different arm; assert it rather than assume parity.
+    result &= Test("call result -> thin method",     t.thin(makeCallResult()),   10);
+    result &= Test("call result -> thin free fn",    thinCall(makeCallResult()), 10);
+
+    // Taker shape must not matter either: a fat parameter that is not argument 0, a method on a
+    // GENERIC class, and a namespaced free function all reach the same arm.
+    result &= Test("call result -> fat param at index 1", callResultFatAt1(100, callResultProd()), 110);
+    CallResultG<int> gi;
+    result &= Test("call result -> generic class method",  gi.lam(callResultProd()),         10);
+    result &= Test("call result -> namespaced taker",      CallResultNs.nsFat(callResultProd()), 10);
+
+    // A producer with a SAME-ARITY sibling of its own name returned a plausible wrong answer
+    // (1005) rather than an obvious address - the shape least likely to be noticed.
+    result &= Test("producer with same-arity sibling",     fatCall(callResultProd()),        10);
+
+    // A local closure whose NAME collides with a global function: the local's VALUE must win.
+    function<int(int)> callResultShadow = callResultTrip;
+    result &= Test("local shadowing a function name",      fatCall(callResultShadow),        15);
+
+    // A NAMED function argument must still re-resolve. Both legs need TWO OVERLOADS of the name,
+    // or GetFunctionForFuncPtr's single-overload early return answers first and the
+    // multi-candidate arm that does the picking is never reached at all.
+    result &= Test("named arg re-resolves by arity",       fatCall(callResultOvf),           10);
+    g_move_fp_dtor_count = 0;
+    result &= Test("named arg re-resolves by move flags",  callResultTakeMove(callResultCons), 9);
+    result &= Test("the move overload really ran",         g_move_fp_dtor_count,             1);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -2086,6 +2204,9 @@ extern int main()
 
     // Function-pointer argument provenance / signature gating: legal spellings still bind
     total++; passed += testFuncPtrArgProvenanceAccepts()  ? 1 : 0;
+
+    // A `function<>` CALL RESULT into a closure parameter (fat and thin)
+    total++; passed += testFuncPtrCallResultIntoClosureParam() ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;
