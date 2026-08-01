@@ -867,6 +867,9 @@ public:
         // Field extracted from a BY-VALUE owning-struct temp (`makeToken().text`): may be read, but
         // persisting it (store/bind/return) double-frees so those sites reject it. See FlushOwnedStructTemps.
         bool FromOwningTempField = false;
+        // The parent temp OWNS this field (not an `alias` borrow return). Distinct from
+        // MovableTempField below, which also requires the FIELD to be an owning value type.
+        bool OwningTempParent = false;
         // Parent was a `move`-return temp (the temp OWNS this field): a persist site may MOVE the field
         // out (store + zero the source) instead of forcing `.copy()`. An alias temp leaves these unset.
         bool MovableTempField = false;

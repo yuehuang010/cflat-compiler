@@ -3043,6 +3043,124 @@ move DiscardOwner* makeDiscardOwner()
     return p;
 }
 
+// A generic slot whose owning-ness comes purely from SUBSTITUTION (IsUniqueTypeArg, never a
+// written `unique`). Both the pointer and the fat-interface instantiations are exercised below.
+struct MoveBox<T> { T t = default; };
+
+// area() returns a NON-default value, so a dispatch leg through a generic unique-interface slot
+// asserts a distinguishing number rather than the type default.
+class Sq7Move : IShapeMove
+{
+    int s = 7;
+    int area() { return s * s; }
+    ~Sq7Move() { dtorCount = dtorCount + 1; }
+};
+
+// The WRITTEN `unique <interface>` field spelling, for the brace-init leg below.
+struct WrittenIfaceSlot { unique IShapeMove s = default; };
+
+MoveBox<unique Resource*> makeMoveBox()
+{
+    MoveBox<unique Resource*> b = default;
+    b.t = new Resource();
+    b.t->id = 44;
+    return b;
+}
+
+/*
+ * The shapes deliberately left LEGAL by the `unique` field-store rejects in
+ * Test/errors/err_unique_borrow_into_field.cb. Each asserts a value and a free COUNT, so a
+ * reject that widened too far shows up as a compile error and a store that silently aliased
+ * shows up as a double count.
+ */
+int testUniqueFieldStoreRemedies()
+{
+    int passed = 0;
+
+    // The remedy the TEMP-source message names: bind the whole call result to a local (which
+    // gives the source field an address), then `move` the field out of that local. One owner.
+    dtorCount = 0;
+    {
+        MoveBox<unique Resource*> tmp = makeMoveBox();
+        MoveBox<unique Resource*> c = default;
+        c.t = move tmp.t;
+        passed += Test("uniq_temp_remedy_value", c.t->id, 44);
+        passed += Test("uniq_temp_remedy_source_nulled", tmp.t == nullptr ? 1 : 0, 1);
+        passed += Test("uniq_temp_remedy_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uniq_temp_remedy_freed_once", dtorCount, 1);
+
+    // The remedy the FAT-INTERFACE message names: `new`, giving the destination its own boxed
+    // object. Dispatches to a non-default value and is freed exactly once.
+    dtorCount = 0;
+    {
+        MoveBox<unique IShapeMove> bi = default;
+        bi.t = new Sq7Move();
+        passed += Test("uniq_generic_iface_new_dispatches", bi.t.area(), 49);
+        passed += Test("uniq_generic_iface_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uniq_generic_iface_new_freed_once", dtorCount, 1);
+
+    // Same remedy through the WRITTEN `unique IShapeMove` field spelling and the BRACE-INIT
+    // store path - the shape whose message used to name 'move' and a "pointer". Dispatches to a
+    // non-default value and frees exactly once.
+    dtorCount = 0;
+    {
+        WrittenIfaceSlot w = { s = new Sq7Move() };
+        passed += Test("uniq_written_iface_new_dispatches", w.s.area(), 49);
+        passed += Test("uniq_written_iface_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uniq_written_iface_new_freed_once", dtorCount, 1);
+
+    // `move` between two generic `unique T*` FIELDS stays legal and single-owner - the reject
+    // added for the temp source must not widen onto an addressable field source.
+    dtorCount = 0;
+    {
+        MoveBox<unique Resource*> a = default;
+        a.t = new Resource();
+        a.t->id = 43;
+        MoveBox<unique Resource*> c = default;
+        c.t = move a.t;
+        passed += Test("uniq_generic_ptr_move_value", c.t->id, 43);
+        passed += Test("uniq_generic_ptr_move_source_nulled", a.t == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("uniq_generic_ptr_move_freed_once", dtorCount, 1);
+
+    // A boxed interface receiver assigning its own unique field to itself is ONE owner: the
+    // store is a no-op, the pointee stays readable, and it is freed exactly once. (The
+    // TWO-receiver form of this is still undiagnosed - see
+    // internal/issue/p1/interface-field-self-assign-false-positive.md.)
+    dtorCount = 0;
+    {
+        UniqueIfaceBox s = default;
+        s.item = new Resource();
+        s.item->id = 41;
+        IUniqueBox isf = s;
+        isf.item = isf.item;
+        passed += Test("uniq_iface_selfassign_value", isf.item->id, 41);
+        passed += Test("uniq_iface_selfassign_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uniq_iface_selfassign_freed_once", dtorCount, 1);
+
+    // `move` between two DIFFERENT boxed receivers' unique interface fields transfers and nulls
+    // the source, so the one pointee is still freed exactly once.
+    dtorCount = 0;
+    {
+        UniqueIfaceBox a = default;
+        a.item = new Resource();
+        a.item->id = 42;
+        UniqueIfaceBox c = default;
+        IUniqueBox ia = a;  IUniqueBox ic = c;
+        ic.item = move ia.item;
+        passed += Test("uniq_iface_move_dest_value", ic.item->id, 42);
+        passed += Test("uniq_iface_move_source_nulled", ia.item == nullptr ? 1 : 0, 1);
+        passed += Test("uniq_iface_move_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uniq_iface_move_freed_once", dtorCount, 1);
+
+    return passed;
+}
+
 int testDiscardMoveReturningCall()
 {
     int passed = 0;
@@ -3674,6 +3792,9 @@ extern int main()
 
     passed += testDiscardMoveReturningCall();
     total += 6;
+
+    passed += testUniqueFieldStoreRemedies();
+    total += 20;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

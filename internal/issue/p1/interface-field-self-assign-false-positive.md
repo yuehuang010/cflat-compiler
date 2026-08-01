@@ -151,25 +151,91 @@ four are equally exposed; they are excluded by independent, correct gates unrela
 
 ## Fix direction - polarity matters
 
-Two options:
+Two options were on the table originally:
 1. Set `CallerName` at the interface-field materialization site (`:19391-19394`) so two
    different receivers are distinguishable the same way a plain struct field access already is.
 2. Make `selfFieldAssign` refuse to conclude self-assign purely from two EMPTY caller names.
 
-**Option 2 is the safer polarity.** An empty-vs-empty comparison is not proof of sameness - it
-is proof of missing information. Reading it as "same" is a guess that happens to be wrong here;
-the fix should not conclude identity from the absence of a distinguishing signal, even if
-setting `CallerName` (option 1) also happens to close this specific repro. Whichever is chosen,
-re-run the field-to-field regression legs in `Test/errors/err_unique_borrow_into_field.cb` plus
-this file's control repro to confirm no legitimate bare self-field access
-(`this.slot = this.slot` inside a method, the documented `selfFieldAssign` carve-out for
-`GetMemberVariable`'s empty `FieldName`) regresses, and consider whether point 3 above (interface
-fields never carrying borrow provenance) should be filed and fixed alongside it.
+Option 1 is still untried and still carries the blast radius the `fix/funcptr-callresult`
+landed record describes (`CallerName` feeds `ScoreMoveAgreement`'s rvalue test, the bond-source
+ledger, and move tracking).
+
+## ATTEMPTED AND REVERTED (2026-08-01): receiver identity is NOT provable from NAMES
+
+Option 2 was implemented on `fix/uniq-family` as an extra conjunct on `selfFieldAssign`:
+
+```cpp
+bool differentFieldReceivers =
+    !namedVar.TypeAndValue.ParentVariableName.empty()
+    && !rightNV.TypeAndValue.ParentVariableName.empty()
+    && namedVar.TypeAndValue.ParentVariableName != rightNV.TypeAndValue.ParentVariableName;
+```
+
+It closed the repro above and **false-rejected working programs**, so it was reverted before
+landing. The defect: it concludes two receivers are different objects from variable-NAME
+inequality, and **two names can denote one object**. That is a rejection on an unproven
+premise - strictly worse than the missing diagnostic it was fixing.
+
+Both witnesses below compile, run, and free exactly once on master (`cf5e909`) and were
+rejected outright by the attempted fix. Verified by direct measurement on both binaries.
+
+**Witness 1 - `alias`, which is by definition the same object:**
+
+```cflat
+int gfreed = 0;
+struct Node { int v = default; ~Node() { gfreed = gfreed + 1; } };
+interface ISlot { unique Node* slot; };
+class BoxA : ISlot { unique Node* slot = nullptr; };
+extern int main()
+{
+    {
+        BoxA a = default; a.slot = new Node(); a.slot->v = 7;
+        ISlot ia = a;
+        alias ISlot ib = ia;
+        ib.slot = ia.slot;
+        printf("v=%d freed=%d\n", ib.slot->v, gfreed);
+    }
+    printf("after freed=%d\n", gfreed);
+    return 0;
+}
+```
+Master: compile rc 0, prints `v=7 freed=0` then `after freed=1`, exit 0 - one owner, freed
+exactly once. Attempted fix: compile rc 1,
+`cannot store unique field 'slot' into unique field 'ISlot.slot'`.
+
+**Witness 2 - two boxes of the SAME object, no `alias` involved:** replace the two receiver
+lines above with `ISlot ia = a; ISlot ib = a;`. Same split, same numbers.
+
+**What will NOT work, so the next attempt does not re-derive it:**
+
+- **Variable names.** Both witnesses above. Do not ship a name comparison in any form.
+- **The interface LOCALS' storage.** `ISlot ia = a; ISlot ib = a;` boxes `a` twice into two
+  distinct allocas, so comparing the locals' `Storage` (or the fat values loaded from them, as
+  LLVM Values) reports "different" for witness 2 and false-rejects it identically.
+- **A bare LLVM `Value` comparison of the computed field address.** Each access re-loads the
+  fat pointer, so even the TRUE self-assign `ia.slot = ia.slot` produces two distinct
+  `LoadInst`s and would compare unequal - inverting the bug into a false rejection of the one
+  shape master gets right.
+
+What an actual fix needs is proof that the two field lvalues denote DIFFERENT SLOTS - i.e. the
+boxed DATA pointers differ. Both witnesses share one data pointer (`&a`) while differing in
+name and in local storage, so the discriminator has to reach through the box to the underlying
+object. Comparing the data pointers after resolving each back to its root store is the
+direction to try; note it must answer "same" for two distinct boxes of one object, which is
+what makes this more than a `Value` equality test.
+
+Keep the polarity: `selfFieldAssign` treating "cannot tell" as SAME is what makes today's bug
+a missing diagnostic rather than a false rejection. Any fix must PROVE difference before
+rejecting, and accept whatever it cannot prove.
 
 ## Test coverage
 
-None. Wants an `expect_error` leg once fixed; cannot be expressed today since the program
-currently compiles (it fails only at runtime, and only under ASan/careful inspection - a
-double-free through libmalloc is not itself a compile-time `expect_error` shape).
+None, and none can be added while it reproduces. `Test/errors/err_unique_borrow_into_field.cb`
+carries a NOTE pointing here in place of a leg. Two must-keep-working legs guarding the
+neighbouring shapes are in `Test/test_move.cb::testUniqueFieldStoreRemedies`
+(`uniq_iface_selfassign_*` - one receiver assigning its own field to itself, and
+`uniq_iface_move_*` - `move` between two receivers, which does transfer and null correctly).
+When this is fixed, the leg to add is the SAME-field-name shape: the different-name control
+already rejects on master, so a leg spelled that way is vacuous.
 
-Related: [[unique-field-to-field-residue-temp-and-interface-source]], [[interface-issue-queue]]
+Related: [[interface-issue-queue]]

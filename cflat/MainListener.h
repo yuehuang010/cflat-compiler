@@ -6429,7 +6429,10 @@ public:
                             // for a string field (clears its owned bit) or an owning struct field (the
                             // aggregate-zero recursively clears every owning subfield's owned bit). An
                             // ALIAS temp (plain accessor) is still rejected - you cannot move out of a borrow.
+                            // POINTER fields are excluded here as at the two sibling implied-move sites:
+                            // the aggregate-zero store below emits IR that crashes codegen on one.
                             if (returnNV.MovableTempField && right != nullptr
+                                && !returnNV.TypeAndValue.Pointer
                                 && right->getType() == returnNV.BaseType)
                             {
                                 clearReturnedStringBorrowBit = false;
@@ -9203,7 +9206,10 @@ public:
                                 right = LoadNamedVariable(rightNV);
                                 // A `move`-temp's owning field can be MOVED into the local (the temp owns it):
                                 // capture the source so the store site adopts it and zeros the temp's field.
+                                // POINTER fields excluded as at the `=` twin: the aggregate-zero
+                                // store on a pointer field emits IR that crashes codegen.
                                 srcMovableTempField = rightNV.MovableTempField
+                                    && !rightNV.TypeAndValue.Pointer
                                     && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName);
                                 srcMoveTempStructAlloca = rightNV.MoveTempStructAlloca;
                                 srcMoveTempStructType = rightNV.MoveTempStructType;
@@ -10202,22 +10208,15 @@ public:
      * bare self-field access inside the owning struct's own method). `move a.p` returns a fresh
      * NamedVariable with no Storage, so it is not a field read and never matches - which is
      * what keeps the sanctioned transfer legal. IsInterfaceField mirrors the sibling
-     * srcIsStructField test and fires for the WRITTEN-`unique` spelling, whose `Pointer` is set
-     * true; it does NOT fire for a generic-substituted fat-interface source, whose `Pointer` is
-     * false - blocked by THIS function's own `!nv.TypeAndValue.Pointer` conjunct below (shared by
-     * both arms of IsOwningUniquePointerField), not by anything specific to that function's
-     * per-arm Pointer requirement, which never gets a chance to matter here.
+     * srcIsStructField test and fires for the WRITTEN-`unique` spelling as well as for a
+     * generic-substituted fat-interface source (`Box<unique IShape>::t`), whose `Pointer` is
+     * false and which is admitted by IsOwningUniqueInterfaceField rather than the pointer gate.
      *
-     * The ownership gate reuses IsOwningUniquePointerField (declared later in this class; legal
-     * since member bodies are compiled as if after the class is complete). This closes far more
-     * than its headline NAMED-LOCAL shape (`c.t = a.t`) - see
-     * internal/issue/p1/unique-field-to-field-residue-temp-and-interface-source.md for the full
-     * closed/open enumeration. Still open: a source read that never lands on a 2-index struct
-     * GEP (the `gep` check below) - a temp/call-result or container-element source
-     * (`c.t = makeBox().t`, `c.t = list.get(0).t`) - and a fat-interface generic source
-     * (`Box<unique IShape>`), blocked as described above. Both are tracked in that file, along
-     * with a separate, pre-existing self-assign false positive on interface-field copies
-     * (internal/issue/p1/interface-field-self-assign-false-positive.md).
+     * The ownership gate reuses IsOwningUniquePointerField / IsOwningUniqueInterfaceField
+     * (declared later in this class; legal since member bodies are compiled as if after the class
+     * is complete). A source read off an owning TEMPORARY (`makeBox().t`, `list.get(0).t`) has no
+     * field GEP for the shape test below and is answered by the sibling IsUniqueTempFieldRead;
+     * the shape test itself stays narrow on purpose.
      */
     bool IsUniqueFieldRead(const LLVMBackend::NamedVariable& nv)
     {
@@ -10225,13 +10224,31 @@ public:
         // type, so the carried alias flag is the only surviving provenance. `move b.p` yields a
         // fresh NamedVariable with the flag unset, so it stays legal.
         if (nv.IsUniqueFieldAlias && !nv.TypeAndValue.IsMove) return true;
-        if (!IsOwningUniquePointerField(nv.TypeAndValue) || !nv.TypeAndValue.Pointer
-            || nv.TypeAndValue.IsMove)
-            return false;
+        if (nv.TypeAndValue.IsMove) return false;
+        // Ownership gate only - the GEP-shape test below is deliberately NOT widened (it
+        // over-matches borrows through casts; see the IsUniqueFieldAlias carve-out above).
+        bool ownsPointee = IsOwningUniquePointerField(nv.TypeAndValue) && nv.TypeAndValue.Pointer;
+        if (!ownsPointee && !IsOwningUniqueInterfaceField(nv.TypeAndValue)) return false;
         if (nv.IsInterfaceField) return true;
         auto* gep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(nv.Storage);
         return gep != nullptr && gep->getNumIndices() == 2
             && gep->getSourceElementType()->isStructTy();
+    }
+
+    /*
+     * True when this reads an owning `unique` POINTER field off a TEMPORARY - a call result
+     * (`makeBox().t`) or a borrowed container element (`l.get(0).t`). Such a read never lands on
+     * a field GEP, so IsUniqueFieldRead's shape test cannot see it, yet the temp's synthesized
+     * destructor frees the pointee just the same and a second owner would double-free. The temp
+     * provenance is already recorded by the by-value member-access branch (MovableTempField for a
+     * call result, FromOwningTempField for a borrowed element), so nothing new is tracked here.
+     * `move` off a temp is rejected earlier ("requires an addressable source") and never arrives.
+     */
+    bool IsUniqueTempFieldRead(const LLVMBackend::NamedVariable& nv)
+    {
+        if (!nv.MovableTempField && !nv.FromOwningTempField) return false;
+        if (nv.TypeAndValue.IsMove) return false;
+        return IsOwningUniquePointerField(nv.TypeAndValue) && nv.TypeAndValue.Pointer;
     }
 
     /*
@@ -10252,6 +10269,22 @@ public:
         return tv.IsUniqueTypeArg && !tv.IsAlias && !tv.IsBorrowOfUniqueElement
             && tv.Pointer && !tv.ElemPointer && !tv.IsArrayView && !tv.IsSimd
             && tv.ConstArraySize == 0;
+    }
+
+    /*
+     * The fat-interface counterpart of IsOwningUniquePointerField: a field that PROVABLY owns a
+     * boxed interface value, by the written `unique IShape` spelling or by generic substitution
+     * of a `unique IShape` type argument. The value is a {vtable,data} struct rather than a raw
+     * pointer, so the function above - whose type-arg arm requires `Pointer` - can never see it.
+     * The exclusions mirror that function: an `alias` type argument and a borrow-of-unique
+     * element never claim ownership, and an array/simd shape is not the scalar slot whose
+     * teardown frees one boxed object.
+     */
+    static bool IsOwningUniqueInterfaceField(const LLVMBackend::TypeAndValue& tv)
+    {
+        return (tv.IsUnique || tv.IsUniqueTypeArg) && tv.IsInterface && !tv.Pointer
+            && !tv.IsAlias && !tv.IsBorrowOfUniqueElement && !tv.IsArrayView
+            && !tv.IsSimd && tv.ConstArraySize == 0;
     }
 
     /*
@@ -10351,6 +10384,60 @@ public:
             "already frees it, and two 'unique' fields cannot own one pointer. Use 'move {}' to "
             "transfer ownership out of the source field (which nulls it).",
             access, fieldDesc, access));
+    }
+
+    /*
+     * The TEMPORARY-source form of the reject above. Neither spelling may suggest `move <access>`:
+     * the access names a temporary and `move` off one is rejected outright ("requires an
+     * addressable source"). The two halves of IsUniqueTempFieldRead have DIFFERENT owners and so
+     * different true explanations and different working remedies, measured on both binaries:
+     *
+     *   - OwningTempParent: a call result (`makeBox().t`). The TEMP owns the pointee and its
+     *     destructor frees it at the end of the statement. Binding the whole call result to a
+     *     local gives the field an address, after which `move` out of that local works.
+     *   - Without it: a borrowed element (`l.get(0).t`, an `alias` return). Nothing
+     *     is freed at end of statement - the CONTAINER owns the pointee and frees it at its own
+     *     teardown. Binding it to a local and moving out of that DOUBLE-FREES, so that remedy must
+     *     not be named here; a borrowing (non-`unique`) destination is the one that works.
+     */
+    void RejectUniqueTempFieldToField(const LLVMBackend::NamedVariable& rightNV,
+                                      const std::string& fieldDesc,
+                                      antlr4::ParserRuleContext* ctx)
+    {
+        std::string access = DescribeUniqueFieldAccess(rightNV);
+        if (rightNV.OwningTempParent)
+            LogErrorContext(ctx, std::format(
+                "cannot store unique field '{}' of a temporary into {} - the temporary's "
+                "synthesized destructor frees it at the end of this statement, and two 'unique' "
+                "fields cannot own one pointer. 'move' needs an addressable source, so bind the "
+                "whole call result to a local first and move the field out of that local instead.",
+                access, fieldDesc));
+        else
+            LogErrorContext(ctx, std::format(
+                "cannot store unique field '{}' borrowed from a temporary into {} - the container "
+                "the temporary was borrowed from still owns it and frees it at its own teardown, "
+                "so two 'unique' fields would own one pointer. Drop 'unique' from the destination "
+                "field if it only borrows, or store an independent copy of the pointee.",
+                access, fieldDesc));
+    }
+
+    /*
+     * The fat-interface form of the reject above. Deliberately does NOT suggest `move`: the
+     * written `unique IShape` field spelling refuses a `move` source too (the D5 leg above only
+     * admits `new` / a move-returning call / nullptr), so naming `move` here would send the user
+     * at a spelling that does not work. `new` is the transfer that does. The wording holds for a
+     * `move` source as well, because a `move` out of an interface FIELD does not null it.
+     */
+    void RejectUniqueInterfaceFieldToField(const LLVMBackend::NamedVariable& rightNV,
+                                           const std::string& fieldDesc,
+                                           antlr4::ParserRuleContext* ctx)
+    {
+        LogErrorContext(ctx, std::format(
+            "cannot store unique interface field '{}' into {} - the source field keeps ownership "
+            "(a 'move' out of an interface field does not null it) and its synthesized destructor "
+            "still frees the boxed object, so two 'unique' fields would own one interface value. "
+            "Assign 'new' so the destination owns its own object.",
+            DescribeUniqueFieldAccess(rightNV), fieldDesc));
     }
 
     /*
@@ -12218,6 +12305,8 @@ public:
             bool srcIsStructField = (srcFieldGep && srcFieldGep->getNumIndices() == 2
                 && srcFieldGep->getSourceElementType()->isStructTy())
                 || rightNV.IsInterfaceField;
+            // Two interface-field reads both carry an EMPTY CallerName, so this can misread a
+            // two-receiver copy as a no-op (interface-field-self-assign-false-positive.md).
             bool selfFieldAssign = !namedVar.FieldName.empty()
                 && namedVar.FieldName == rightNV.FieldName
                 && namedVar.CallerName == rightNV.CallerName;
@@ -12308,16 +12397,26 @@ public:
             // pointee. Checked after Trap A so a source reached through a borrowed parameter keeps
             // the more precise borrow message. `move a.p` clears Storage, so it is not a field read
             // and stays legal (it nulls the source field); self-assign is excluded above.
-            // Source gate now also matches a generic-substituted NAMED-LOCAL source (see
-            // IsUniqueFieldRead); a temp/call-result or fat-interface source still slips through.
-            if (operatorText == "=" && right && right->getType()->isPointerTy()
-                && destIsStructField
-                && IsOwningUniquePointerField(namedVar.TypeAndValue)
-                && IsUniqueFieldRead(rightNV)
+            // A fat-interface slot fails both pointer-shaped tests, so it gets its own
+            // destination leg (IsUniqueTempFieldRead / IsOwningUniqueInterfaceField).
+            bool destOwnsUniquePointee = right && right->getType()->isPointerTy()
+                && IsOwningUniquePointerField(namedVar.TypeAndValue);
+            bool destOwnsUniqueInterface = right && right->getType()->isStructTy()
+                && IsOwningUniqueInterfaceField(namedVar.TypeAndValue);
+            if (operatorText == "=" && destIsStructField
+                && (destOwnsUniquePointee || destOwnsUniqueInterface)
+                && (IsUniqueFieldRead(rightNV) || IsUniqueTempFieldRead(rightNV))
                 && !selfUniqueFieldAssign)
             {
-                RejectUniqueFieldToUniqueField(rightNV,
-                    std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar)), ctx);
+                std::string destDesc = std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar));
+                // Temp source first: it is the more specific shape, and only its message names a
+                // remedy that exists (`move <temp>.<field>` is rejected as unaddressable).
+                if (IsUniqueTempFieldRead(rightNV))
+                    RejectUniqueTempFieldToField(rightNV, destDesc, ctx);
+                else if (destOwnsUniqueInterface)
+                    RejectUniqueInterfaceFieldToField(rightNV, destDesc, ctx);
+                else
+                    RejectUniqueFieldToUniqueField(rightNV, destDesc, ctx);
                 return right;
             }
 
@@ -12354,7 +12453,10 @@ public:
 
             // Implied move of a `move`-temp's owning field (`dest = makeToken().text`): the temp OWNS it,
             // so free dest's old value, store the field, and zero the source so the temp dtor skips it.
+            // POINTER fields are excluded: this branch was written for owning VALUE types, and on a
+            // `unique Item*` field it destructs the destination SLOT's address (crashes codegen).
             if (operatorText == "=" && right && rightNV.MovableTempField
+                && !rightNV.TypeAndValue.Pointer
                 && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
             {
                 if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
@@ -16207,11 +16309,22 @@ public:
                 RejectBorrowIntoUniqueField(borrowSrc, fieldDesc, errCtx);
             }
         }
-        // Source gate widened as in the `=` path (see IsUniqueFieldRead): a generic-substituted
-        // NAMED-LOCAL source is caught; a temp/call-result or fat-interface source is not.
-        if (IsOwningUniquePointerField(fieldType) && IsUniqueFieldRead(rightNV))
-            RejectUniqueFieldToUniqueField(rightNV,
-                std::format("unique field '{}.{}'", typeName, fieldName), errCtx);
+        // Source and destination gates kept in lockstep with the `=` path: a generic-substituted
+        // NAMED-LOCAL source, a source read off an owning temporary, and a fat-interface slot.
+        bool braceSrcIsUniqueFieldRead = IsUniqueFieldRead(rightNV) || IsUniqueTempFieldRead(rightNV);
+        // `fieldType.Pointer` stands in for the `=` path's isPointerTy() test on the stored value:
+        // IsOwningUniquePointerField answers TRUE for any written `unique`, fat interface included.
+        bool braceDestOwnsPointee = IsOwningUniquePointerField(fieldType) && fieldType.Pointer;
+        if (braceSrcIsUniqueFieldRead && (braceDestOwnsPointee || IsOwningUniqueInterfaceField(fieldType)))
+        {
+            std::string braceDesc = std::format("unique field '{}.{}'", typeName, fieldName);
+            if (braceDestOwnsPointee && IsUniqueTempFieldRead(rightNV))
+                RejectUniqueTempFieldToField(rightNV, braceDesc, errCtx);
+            else if (braceDestOwnsPointee)
+                RejectUniqueFieldToUniqueField(rightNV, braceDesc, errCtx);
+            else
+                RejectUniqueInterfaceFieldToField(rightNV, braceDesc, errCtx);
+        }
 
         llvm::Value* val = LoadNamedVariable(rightNV);
         if (!val) return false;
@@ -19707,6 +19820,9 @@ public:
                                         // Owns the temp's buffer unless it is an `alias` (borrow) return.
                                         bool parentOwnsTemp = parentIsOwningTemp
                                             && !structVar.TypeAndValue.IsAlias;
+                                        // Records WHO owns the field for the temp-source diagnostics:
+                                        // the temp itself, or whatever an `alias` return borrowed from.
+                                        namedVar.OwningTempParent = parentOwnsTemp;
                                         if (parentOwnsTemp && !structVar.FromOwningTempField)
                                         {
                                             auto* tempAlloca = Compiler(ctx)->AllocaAtEntry(structVar.BaseType, nullptr, "owntemp");

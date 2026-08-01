@@ -56,6 +56,120 @@ expect_error("cannot store unique field 'a.t' into unique field 'Box") {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// A source read off an owning TEMPORARY. `makeBox().t` never lands on a 2-index field GEP,
+// so IsUniqueFieldRead's shape test cannot see it - the temp's own synthesized destructor
+// frees the pointee just the same, so the store made two owners (silent abort, exit 134, no
+// diagnostic). Closed by the sibling IsUniqueTempFieldRead gate, which reads the temp
+// provenance the member-access branch already records instead of widening the shape test.
+Box<unique Node*> makeBox() { Box<unique Node*> b = default; b.t = new Node(); return b; }
+
+expect_error("cannot store unique field 'makeBox.t' of a temporary into unique field 'Box") {
+    void tempSourceFieldToField() { Box<unique Node*> c = default; c.t = makeBox().t; }
+}
+
+// The realistic spelling of the same shape: a BORROWED container element. `list<T>::get`
+// returns `alias T`, so the `.t` read is a field of a borrowed temp rather than a call
+// result - a different provenance flag (FromOwningTempField, not MovableTempField) reaching
+// the same gate, and a DIFFERENT owner - the list, not the temp - so it gets its own wording.
+// Naming the call-result remedy here would be wrong twice over: nothing is freed at the end of
+// this statement, and binding-then-moving out of the borrowed element double-frees.
+expect_error("cannot store unique field 't' borrowed from a temporary into unique field 'Box") {
+    void tempElementFieldToField()
+    {
+        list<Box<unique Node*>> l;
+        Box<unique Node*> b = default; b.t = new Node(); l.add(move b);
+        Box<unique Node*> c = default;
+        c.t = l.get(0).t;
+    }
+}
+
+// Same temp source through the SECOND field-store path (brace-init / EmitOneFieldInit),
+// which applies its own copy of the gate. Reverting the widening only there still
+// double-freed here silently.
+expect_error("cannot store unique field 'makeBox.t' of a temporary into unique field 'Box") {
+    void tempSourceBraceInit() { Box<unique Node*> c = { t = makeBox().t }; }
+}
+
+// A pointee with a USER DESTRUCTOR turned the same temp source into a COMPILER CRASH
+// (SIGSEGV, exit 139, zero output) when the destination was NOT a unique field: the
+// implied-move-of-a-move-temp's-owning-field branch fired on a POINTER field and emitted the
+// pointee's destructor against the destination SLOT's address, producing IR that killed
+// LLVM's DAG combiner. That branch is for owning VALUE types only; a pointer source now
+// falls through to the owning-temp-field reject, which is the correct diagnosis.
+class Dtored { int v = default; ~Dtored() {} };
+struct PlainSlot { Dtored* p = nullptr; };
+Box<unique Dtored*> makeDtored() { Box<unique Dtored*> b = default; b.t = new Dtored(); return b; }
+
+expect_error("taken from a temporary into a longer-lived location") {
+    void tempPointerFieldIntoPlainSlot() { PlainSlot q = default; q.p = makeDtored().t; }
+}
+
+// The SAME crash through the DECLARATION-with-initializer spelling. That path has its own
+// copy of the implied-move capture (ParseDeclaration, `srcMovableTempField`) reaching the
+// same aggregate-zero store, so guarding only the `=` twin left this one crashing: the
+// assignment spelling above is diagnosed while `Dtored* raw = makeDtored().t;` still died at
+// exit 139. Half-a-fix along the spelling axis is the recorded failure mode for this family.
+expect_error("taken from a temporary to a local") {
+    void tempPointerFieldIntoDeclaredLocal() { Dtored* raw = makeDtored().t; }
+}
+
+// And the THIRD copy of the same implied-move capture: the RETURN path (ParseStatement's jump
+// handling). Same aggregate-zero store, same exit-139 crash, and guarding the assignment and
+// declaration twins left this one dying. N-1 sites fixed is the recorded failure mode here.
+expect_error("taken from a temporary; its buffer is owned elsewhere") {
+    Dtored* returnTempPointerField() { return makeDtored().t; }
+}
+
+// ---------------------------------------------------------------------------------------
+// A FAT-INTERFACE owning slot (`Box<unique IShape>::t`). The value is a {vtable,data} struct,
+// so it failed BOTH the pointer-shaped ownership gate (IsOwningUniquePointerField's type-arg
+// arm requires Pointer) and the `=` site's own isPointerTy() test on the stored value - two
+// independent blockers, either one alone enough to keep the leg from firing. The message
+// deliberately names 'new' rather than 'move': the written `unique IShape` field spelling
+// refuses a `move` source too, so suggesting it would send the user at a dead end.
+interface IShape { int area(); };
+class Circle : IShape { int r = 3; int area() { return r * r; } };
+
+expect_error("cannot store unique interface field 'a.t' into unique field 'Box") {
+    void ifaceFieldToField()
+    {
+        Box<unique IShape> a = default; a.t = new Circle();
+        Box<unique IShape> c = default;
+        c.t = a.t;
+    }
+}
+
+expect_error("cannot store unique interface field 'a.t' into unique field 'Box") {
+    void ifaceFieldToFieldBraceInit()
+    {
+        Box<unique IShape> a = default; a.t = new Circle();
+        Box<unique IShape> c = { t = a.t };
+    }
+}
+
+// The WRITTEN `unique IShape` spelling through brace-init. IsOwningUniquePointerField answers
+// TRUE unconditionally for any written `unique`, fat interface included, so the pointer leg won
+// and told the user two fields "cannot own one pointer. Use 'move a.s'" - untrue (a fat
+// interface is not a pointer) and a closed loop (`move a.s` earns the identical message). The
+// destination gate now mirrors the `=` path's value-shape test, so the interface leg wins and
+// names 'new', which is verified to work (Test/test_move.cb::uniq_generic_iface_new_*).
+struct WrittenIfaceHolder { unique IShape s = default; };
+
+expect_error("cannot store unique interface field 'a.s' into unique field 'WrittenIfaceHolder.s'") {
+    void writtenIfaceFieldToFieldBraceInit()
+    {
+        WrittenIfaceHolder a = default; a.s = new Circle();
+        WrittenIfaceHolder c = { s = a.s };
+    }
+}
+
+// NOTE: an interface-field-to-interface-field copy with the SAME field name on both sides is
+// still MISSING its diagnostic - two different boxed receivers both carry an empty CallerName
+// and the store is misread as a no-op self-assign. It has no leg here because it still
+// reproduces; see internal/issue/p1/interface-field-self-assign-false-positive.md, which also
+// records why a name-based receiver comparison is NOT the fix.
+
 extern int main()
 {
     // A `move` parameter DOES transfer ownership, so the generic unique field may take it -
@@ -71,5 +185,17 @@ extern int main()
     // Box<unique Node*> fields must still compile and transfer with a single owner.
     Box<unique Node*> d = default;
     d.t = move b.t;
+
+    // The remedy the TEMP message recommends must actually exist: bind the whole call result
+    // to a local, which gives the source field an address, then 'move' out of that local.
+    Box<unique Node*> tmp = makeBox();
+    Box<unique Node*> e = default;
+    e.t = move tmp.t;
+
+    // A fat-interface owning slot still takes a fresh heap object; the field-to-field reject
+    // above must not widen into the spelling its own message recommends. (Values for these
+    // shapes are asserted in Test/test_move.cb - this file is compiled, never run.)
+    Box<unique IShape> bi = default;
+    bi.t = new Circle();
     return 0;
 }
