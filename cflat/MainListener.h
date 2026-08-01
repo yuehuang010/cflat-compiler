@@ -10164,12 +10164,26 @@ public:
     }
 
     /*
-     * True when this NamedVariable reads a `unique` field's slot directly (`a.p`, or a bare
-     * self-field access inside the owning struct's own method). `move a.p` returns a fresh
+     * True when this NamedVariable reads an owning `unique` field's slot directly (`a.p`, or a
+     * bare self-field access inside the owning struct's own method). `move a.p` returns a fresh
      * NamedVariable with no Storage, so it is not a field read and never matches - which is
      * what keeps the sanctioned transfer legal. IsInterfaceField mirrors the sibling
-     * srcIsStructField test and DOES fire: `unique` is part of the interface field contract,
-     * so a read through the interface's byte-offset slot carries the flag too.
+     * srcIsStructField test and fires for the WRITTEN-`unique` spelling, whose `Pointer` is set
+     * true; it does NOT fire for a generic-substituted fat-interface source, whose `Pointer` is
+     * false - blocked by THIS function's own `!nv.TypeAndValue.Pointer` conjunct below (shared by
+     * both arms of IsOwningUniquePointerField), not by anything specific to that function's
+     * per-arm Pointer requirement, which never gets a chance to matter here.
+     *
+     * The ownership gate reuses IsOwningUniquePointerField (declared later in this class; legal
+     * since member bodies are compiled as if after the class is complete). This closes far more
+     * than its headline NAMED-LOCAL shape (`c.t = a.t`) - see
+     * internal/issue/p1/unique-field-to-field-residue-temp-and-interface-source.md for the full
+     * closed/open enumeration. Still open: a source read that never lands on a 2-index struct
+     * GEP (the `gep` check below) - a temp/call-result or container-element source
+     * (`c.t = makeBox().t`, `c.t = list.get(0).t`) - and a fat-interface generic source
+     * (`Box<unique IShape>`), blocked as described above. Both are tracked in that file, along
+     * with a separate, pre-existing self-assign false positive on interface-field copies
+     * (internal/issue/p1/interface-field-self-assign-false-positive.md).
      */
     bool IsUniqueFieldRead(const LLVMBackend::NamedVariable& nv)
     {
@@ -10177,7 +10191,8 @@ public:
         // type, so the carried alias flag is the only surviving provenance. `move b.p` yields a
         // fresh NamedVariable with the flag unset, so it stays legal.
         if (nv.IsUniqueFieldAlias && !nv.TypeAndValue.IsMove) return true;
-        if (!nv.TypeAndValue.IsUnique || !nv.TypeAndValue.Pointer || nv.TypeAndValue.IsMove)
+        if (!IsOwningUniquePointerField(nv.TypeAndValue) || !nv.TypeAndValue.Pointer
+            || nv.TypeAndValue.IsMove)
             return false;
         if (nv.IsInterfaceField) return true;
         auto* gep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(nv.Storage);
@@ -12247,10 +12262,8 @@ public:
             // pointee. Checked after Trap A so a source reached through a borrowed parameter keeps
             // the more precise borrow message. `move a.p` clears Storage, so it is not a field read
             // and stays legal (it nulls the source field); self-assign is excluded above.
-            // The DESTINATION uses the owning-slot predicate so a generic-substituted slot is seen
-            // too. The SOURCE gate IsUniqueFieldRead still requires a written `unique`, so this
-            // closes the MIXED shape (`Box<unique Item*>::t = a.slot`) only; a fully generic
-            // source (`c.t = a.t`) short-circuits there and remains its own filed issue.
+            // Source gate now also matches a generic-substituted NAMED-LOCAL source (see
+            // IsUniqueFieldRead); a temp/call-result or fat-interface source still slips through.
             if (operatorText == "=" && right && right->getType()->isPointerTy()
                 && destIsStructField
                 && IsOwningUniquePointerField(namedVar.TypeAndValue)
@@ -16148,8 +16161,8 @@ public:
                 RejectBorrowIntoUniqueField(borrowSrc, fieldDesc, errCtx);
             }
         }
-        // Destination widened as in the `=` path; the source stays written-`unique`-only, so this
-        // closes the MIXED shape and leaves the fully generic source deferred.
+        // Source gate widened as in the `=` path (see IsUniqueFieldRead): a generic-substituted
+        // NAMED-LOCAL source is caught; a temp/call-result or fat-interface source is not.
         if (IsOwningUniquePointerField(fieldType) && IsUniqueFieldRead(rightNV))
             RejectUniqueFieldToUniqueField(rightNV,
                 std::format("unique field '{}.{}'", typeName, fieldName), errCtx);

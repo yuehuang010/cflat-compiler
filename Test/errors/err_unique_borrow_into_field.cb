@@ -25,11 +25,35 @@ expect_error("cannot store borrowed parameter 'n' into unique field 'Box") {
 
 // The MIXED field-to-field shape: a written `unique` source field into a GENERIC unique
 // destination field. Both synthesized destructors free the one pointee (silent abort, exit
-// 134). The source gate already passed here - only the destination was blind. The FULLY
-// generic source (`c.t = a.t` between two Box) is NOT covered: IsUniqueFieldRead requires
-// `unique` on the source too, so it short-circuits there; that is its own filed issue.
+// 134). The source gate already passed here - only the destination was blind.
 expect_error("cannot store unique field 'a.slot' into unique field 'Box") {
     void mixedFieldToField() { Holder a = default; Box<unique Node*> c = default; c.t = a.slot; }
+}
+
+// The FULLY generic field-to-field shape: both sides IsUniqueTypeArg, no written `unique`
+// anywhere. IsUniqueFieldRead was keyed on IsUnique alone, so even after the destination
+// widening above this leg still short-circuited on the SOURCE and reached the double-free
+// with no diagnostic at all (silent abort, exit 134). Fixed by widening IsUniqueFieldRead
+// to the same owning-slot predicate (IsOwningUniquePointerField) already used for the
+// destination.
+expect_error("cannot store unique field 'a.t' into unique field 'Box") {
+    void fullyGenericFieldToField()
+    {
+        Box<unique Node*> a = default;
+        Box<unique Node*> c = default;
+        c.t = a.t;
+    }
+}
+
+// Same fully-generic shape through the SECOND field-store path: brace-init (`EmitOneFieldInit`)
+// applies the same widened source gate independently of the `=` path above. Uncovered before
+// this leg: reverting the widening only in EmitOneFieldInit still double-frees here silently.
+expect_error("cannot store unique field 'a.t' into unique field 'Box") {
+    void fullyGenericBraceInit()
+    {
+        Box<unique Node*> a = default;
+        Box<unique Node*> c = { t = a.t };
+    }
 }
 
 extern int main()
@@ -43,5 +67,9 @@ extern int main()
     Holder a = default;
     a.slot = new Node();
     b.t = move a.slot;
+    // Same remedy for the FULLY generic shape just rejected above: `move` between two
+    // Box<unique Node*> fields must still compile and transfer with a single owner.
+    Box<unique Node*> d = default;
+    d.t = move b.t;
     return 0;
 }

@@ -28,19 +28,34 @@ why the shipped code has the shape it does, which approaches must not be retried
 ratified behaviour change that future work must not "fix" back. That section is the convergence
 point for the interface/generics work and is the reason this file is long.
 
-State on 2026-08-01: **73 open issues** (9 P1 / 33 P2 / 24 P3 / 7 UI), counted from disk
-(`ls internal/issue/p{1,2,3}/*.md ui/*.md | wc -l`), not from arithmetic. Two P1s were fixed and their files deleted this session
-(`unique-ptr-field-stack-address-aborts-silently`, `function-array-body-silently-truncated`),
-and nine new issues were filed - every one of them found by the ADVERSARIAL REVIEWS of those two
-fixes, not by the original investigation. That ratio is the story of the session: fixing two
-things in this area surfaced nine more, seven of which are silent-abort or wrong-value class.
+State on 2026-08-01: **75 open issues** (11 P1 / 33 P2 / 24 P3 / 7 UI), counted from disk
+(`ls internal/issue/p{1,2,3}/*.md ui/*.md | wc -l`) on the merged tree, not from arithmetic.
+Two more P1s were fixed and their files deleted this round
+(`funcptr-call-result-into-closure-param-garbage`, `unique-field-to-field-copy-double-frees`),
+and four new issues were filed - every one of them found by the ADVERSARIAL REVIEWS of those two
+fixes, not by the original investigation. That ratio keeps holding: fixing two things in this
+area surfaces three or four more, and the reviews find them, not the fix work.
 ## Resume point
 
-**Current head: the P1 campaign.** `master` is `3b6e3e8`, macOS arm64 Release **554 / 0 / 8**
-plus `example_mac.sh` **35 / 0**. Six P1s fixed on 2026-07-31 (`99d73f3`, `696060d`, `8c29ca7`,
-`d65f000`, `4000fa1`, `4097959`); the design records are at the bottom. **P1 is being cleared
-before P2 starts** - that includes `iface-ifconst-base-clause-implementor`, so the parked
-`fix/iface-ifconst` branch stays parked.
+**Current head: the P1 campaign.** macOS arm64 Release **554 / 0 / 8** plus `example_mac.sh`
+**35 / 0**. Six P1s fixed on 2026-07-31 (`99d73f3`, `696060d`, `8c29ca7`, `d65f000`, `4000fa1`,
+`4097959`) and two more on 2026-08-01 (`funcptr-call-result-into-closure-param-garbage`,
+`unique-field-to-field-copy-double-frees`); the design records are at the bottom. **P1 is being
+cleared before P2 starts** - that includes `iface-ifconst-base-clause-implementor`, so the
+parked `fix/iface-ifconst` branch stays parked.
+
+> Deliberately no commit hash here. Every previous revision of this line named a `master` that
+> was stale within the day (it has read `4097959` and `3b6e3e8` in turn, each wrong by the time
+> anyone read it), and a stale hash asserting itself as current state is worse than no hash.
+> Run `git log --oneline -1` instead.
+
+Two P1s are SETTLED but not started, and both settlements are recorded in their files rather
+than here:
+- `interface-method-call-on-null-value-segfaults` - the product decision is made (2026-08-01):
+  reject at COMPILE TIME as far as is provable, and NO per-dispatch runtime guard. `?.` is the
+  answer for anything not provable. Do not re-propose a runtime null-vtable check.
+- `ftell-fseek-long-width-on-windows` - PARKED. Windows-only, unverifiable from a macOS host;
+  land it from Windows. Skip it when picking P1 work on a Mac.
 
 Next P1s, and the sequencing that matters:
 
@@ -141,10 +156,29 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 9 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 11 |
 | **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 33 |
 | **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 24 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
+
+Counts re-verified from disk on 2026-08-01 (`ls internal/issue/p{1,2,3}/*.md ui/*.md | wc -l` per
+bucket) on the MERGED tree, after both of this round's P1 fixes landed:
+**11 P1 / 33 P2 / 24 P3 / 7 UI = 75 total**, up from the 73 recorded 2026-07-31.
+
+Net movement: two P1s fixed and their files deleted (`funcptr-call-result-into-closure-param-garbage`,
+`unique-field-to-field-copy-double-frees`), and four new issues filed - three P1
+([[unique-field-to-field-residue-temp-and-interface-source]],
+[[interface-field-self-assign-false-positive]],
+[[generic-unique-field-temp-source-crashes-compiler]]) and one P2
+([[generic-funcptr-return-poisons-enclosing-return]]). Every one of the four was found by the
+ADVERSARIAL REVIEWS of the two fixes, not by the original investigation - the same ratio this
+file recorded on 2026-07-31.
+
+> Counted on the merged tree deliberately. Each branch recounted from a disk that lacked the
+> other's files, so BOTH branch headers were wrong (one said 9 P1 / 33 P2, the other 12 P1 /
+> 32 P2). When two branches that both touch this file are in flight, the only trustworthy count
+> is the one taken after the second merge. Not hand-arithmetic - counted directly per the
+> command above.
 
 ### P1 - wrong programs and crashes (`p1/`)
 
@@ -154,11 +188,13 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | [[ftell-fseek-long-width-on-windows]] | Silent wrong value on Windows: core binds C `long` as pointer-sized, so `ftell`/`fseek` read garbage under LLP64. Not a UI issue despite being Windows-only. |
 | [[interface-method-call-on-null-value-segfaults]] | SIGSEGV (139), no guard. Fires on a PLAIN non-generic interface too. Pre-existing and language-wide. |
 | [[funcptr-overload-binding-ignores-signature]] | NARROWED 2026-07-31 by `fix/funcptr-arg-accept-set`: the type-CLASS axis is closed on both paths (the filed `double`-into-`int` repro now errors). Still open, silent and identical on master: floating-point WIDTH (same SHAPE as the closed repro), integer width/signedness, POINTEE type (memory-unsafe - reads past the end of the object), and aggregates. Do NOT re-close by widening the comparison to spellings; see the file. |
-| [[unique-field-to-field-copy-double-frees]] | Silent abort (exit 134), no diagnostic. Copying one `unique` field into another double-frees in a GENERIC container, while the identical plain-struct spelling is correctly diagnosed. Filed 2026-07-31. |
 | [[return-dangle-missed-when-slot-has-extra-user]] | Missed dangle, no diagnostic. Residue of `2bcc5a0`; NOT to be fixed by widening the whitelist. |
 | [[llvm-cannot-select-sign-extend-on-const-array-index]] | LLVM fatal error, compiler exit 134. Pre-existing; the front-end shape that fed it is now rejected earlier, so no live repro remains - confirm no other spelling reaches it, then re-rank. |
 | [[delete-of-array-view-over-stack-storage]] | Silent abort (exit 134), no diagnostic. PRE-EXISTING on the explicit `int[] v = a;` spelling; the fixed-array shape fix makes `auto` reach it too. |
 | [[multidim-array-view-binding-loses-shape]] | Silent miscompile. The `T[][]` view spelling drops the row stride, so `auto` over a 2-D fixed array has no correct target to deduce to. Residual of the 1-D fixed-array-shape fix. |
+| [[unique-field-to-field-residue-temp-and-interface-source]] | Silent abort (exit 134), no diagnostic. Residue of `unique-field-to-field-copy-double-frees`: the fix (fix/unique-f2f) closes a wide named-local-shaped source set, but a temp/call-result source (`c.t = makeBox().t`), a container-element source (`list.get(0).t`), and a fat-interface generic source (`Box<unique IShape>`) all still double-free undiagnosed, while their plain-struct equivalents are diagnosed. |
+| [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. Pre-existing: an interface-field-to-interface-field copy with the same field name on both sides is misread as a self-assign (both receivers carry an empty `CallerName`), suppressing the field-to-field reject. Found probing the residue above; a different bug (self-assign discriminator), not a gate-width problem. |
+| [[generic-unique-field-temp-source-crashes-compiler]] | COMPILER CRASH, exit 139, zero output. A generic `unique` field assigned from a temp whose pointee has a user destructor SIGSEGVs the compiler; needs all three (user dtor + generic field + temp source). Shares the temp-source spelling with the residue above but is a different failure (crash, not a missed diagnostic). |
 
 ### P2 - false rejections, unavailable features, ownership holes (`p2/`)
 
@@ -314,6 +350,7 @@ which a future session must not "fix" back without reopening the decision.
 | `using` interface alias resolved as an `is`/`as` target (`GenerateIsCheck`/`GenerateSafeCast`); residual asymmetry filed as [[interface-lookup-alias-asymmetry-latent]] | fix/iface-alias (branch, not yet merged) |
 | Interface boxing keyed on the VALUE, not the source binding; `??` join boxed per arm | fix/iface-boxing (branch, not yet merged) |
 | `if const` leaf emission gated on insert-block LIVENESS, not non-nullness | fix/ifconst-ir (branch, not yet merged) |
+| `IsUniqueFieldRead` (SOURCE gate) re-keyed onto `IsOwningUniquePointerField`, closing the fully-generic field-to-field leg `d65f000` deliberately left open | fix/unique-f2f (branch, not yet merged) |
 
 Suite trajectory across the whole sequence: 522 -> 530 -> 536 -> 538 -> 540.
 
@@ -659,6 +696,49 @@ Regression legs added to the two existing Trap A files, prefix-pinned to keep th
 field-to-field shapes, in the `=` form in `err_unique_borrow_into_field.cb` and the brace form in
 `err_unique_brace_init_borrow.cb`. Both files also gained legal heap-allocated and
 `move`-transferred generic-unique-field inits, so the reject cannot widen unnoticed.
+
+### fix/unique-f2f - the SOURCE gate re-keyed onto `IsOwningUniquePointerField`, closing what `d65f000` left open
+
+`d65f000` deliberately left the FULLY generic field-to-field shape open (`c.t = a.t` between two
+`Box<unique Item*>`): `IsUniqueFieldRead` required a written `unique` on the SOURCE, so that
+shape short-circuited there regardless of how widely the destination gate had been widened. This
+commit re-keys `IsUniqueFieldRead` onto the same `IsOwningUniquePointerField` predicate already
+used for the destination - both field-store paths (`=` in `ParseAssignmentExpression` and
+brace-init via `EmitOneFieldInit`) now apply the identical owning-slot test to BOTH sides.
+
+- **Ratified behaviour change**: a generic-substituted `unique` field read out of a `move`
+  PARAMETER (`void adopt(move Box<unique Item*> other) { t = other.t; }`, where only `other`, not
+  the field, was moved) now REJECTS instead of silently double-freeing. `move other.t` is the
+  correct spelling and was verified to compile, transfer, and exit 0. Do not "fix" this back to
+  compiling - it was a silent double-free, not a false rejection.
+- **What actually closed, confirmed by direct repro, wider than the headline shape**: a plain
+  local (`c.t = a.t`), a pointer-to-struct source (`bp->t`), a by-value `Box<>` parameter, a
+  fixed-array element, a nested field, a generic CLASS (not just a generic struct), a bare
+  self-field read inside the owner's own method (`other.t = t`), a type-alias spelling, a chained
+  assignment, a global source, and the `move`-parameter shape above. All of these share one
+  property: the source read lands on a 2-index struct GEP off a named, alloca-backed local (the
+  `IsUniqueFieldRead` shape test).
+- **Do NOT retry - reflexively widening `IsUniqueFieldRead`'s GEP-shape test to close the
+  residue below.** Two source shapes still miss the shape test and remain open, tracked in
+  [[unique-field-to-field-residue-temp-and-interface-source]]: a temp/call-result source
+  (`c.t = makeBox().t`) and a container-element source (`list.get(0).t`) - both reduce to the
+  same root cause (no GEP to test). A THIRD shape, a fat-interface generic source
+  (`Box<unique IShape>`), misses for a DIFFERENT reason (`tv.Pointer` is false on that shape, at
+  two independent sites) and is also tracked there. Widening the GEP-shape test risks
+  over-matching a borrow read through a cast (see the existing `IsUniqueFieldAlias` carve-out in
+  that function) - each residue shape needs its own provenance signal, not a blanket loosening.
+- A SEPARATE, pre-existing defect was found while probing this area and is explicitly NOT part of
+  this change: [[interface-field-self-assign-false-positive]] - an interface-field-to-field copy
+  with the SAME field name on both sides is misread as a self-assign (both receivers carry an
+  empty `CallerName`), suppressing the new leg (and, in principle, four sibling traps that share
+  the same `selfFieldAssign`/`selfUniqueFieldAssign` computation, though only this one is
+  reachable for that shape today - see that file for the per-trap reachability check).
+- No new `TypeAndValue` field, so no `--init` cache change was needed.
+
+Regression legs added to `err_unique_borrow_into_field.cb`: the fully-generic field-to-field
+shape via `=` and via brace-init (`EmitOneFieldInit`, the second, independently-gated field-store
+path), plus a positive `move`-transfer leg between two generic fields. Both new `expect_error`
+legs were confirmed to fail on the pre-fix binary for the right reason (not vacuously).
 
 ### `4000fa1` - separating `function<T>` from `function<T>*`; rejecting `Lambda<T>*`
 
