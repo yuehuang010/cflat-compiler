@@ -4311,6 +4311,7 @@ struct NdHolder { NdLive c = default; };
 int ndPick(int n) { return n; }
 int ndViaParam(NdLive lv) { return lv.Get(); }
 int ndTagOfParam(NdLive lv) { return lv.tag; }
+int ndTagOfParenParam(NdLive lv) { return (lv).tag; }
 
 bool testNullIfaceDispatchAcceptSet()
 {
@@ -4388,6 +4389,57 @@ bool testNullIfaceDispatchAcceptSet()
     int fieldHits = 0;
     if (ndPick(0) == 1) { fieldHits = h.c.Get(); }
     result &= Test("nid_field_receiver_under_branch", fieldHits, 0);
+
+    // (13) Parenthesised receiver, reassigned in the SAME block before the read. The paren leaves
+    // the fat value in Primary; anchoring on THAT load is what keeps this accepted.
+    NdImpl s31; s31.tag = 31;
+    NdLive p1 = default;
+    p1 = s31;
+    result &= Test("nid_paren_field_same_block_assign", (p1).tag, 31);
+
+    // (14) A live read, then a null store LATER in the same block. NOT a tripwire: an anchor
+    // widened to the access point accepts this too, since the store follows the access.
+    NdImpl s32; s32.tag = 32;
+    NdLive p2 = default;
+    p2 = s32;
+    int p2Tag = (p2).tag;
+    p2 = nullptr;
+    result &= Test("nid_paren_read_then_null_store", p2Tag, 32);
+
+    // (15) Null store, then a non-null reassignment, then the parenthesised read.
+    NdImpl s33; s33.tag = 33;
+    NdLive p3 = default;
+    p3 = s33;
+    p3 = nullptr;
+    p3 = s33;
+    result &= Test("nid_paren_reassign_after_null", (p3).tag, 33);
+
+    // (16) Parenthesised read whose assignment is in a branch - the read's own block has no write.
+    NdImpl s34; s34.tag = 34;
+    NdLive p4 = default;
+    if (ndPick(1) == 1) { p4 = s34; }
+    result &= Test("nid_paren_field_branch_assign", (p4).tag, 34);
+
+    // (17) Parenthesised read under a branch that is false at run time: provably null once
+    // reached, but reached through a branch, so it stays a run-time concern.
+    NdLive p5 = default;
+    int parenHits = 0;
+    if (ndPick(0) == 1) { parenHits = (p5).tag; }
+    result &= Test("nid_paren_field_under_branch", parenHits, 0);
+
+    // (18) '?.' on a parenthesised still-null receiver stays the sanctioned spelling.
+    NdLive p6 = default;
+    result &= Test("nid_paren_field_null_conditional", (p6)?.tag, 0);
+
+    // (19) Parenthesised WRITE then read on a live receiver - the write shares the read's lvalue.
+    NdImpl s35; s35.tag = 1;
+    NdLive p7 = default;
+    p7 = s35;
+    (p7).tag = 35;
+    result &= Test("nid_paren_field_write_live", (p7).tag, 35);
+
+    // (20) A parameter receiver read through parens: its slot's only store is the argument.
+    result &= Test("nid_paren_param_field", ndTagOfParenParam(s26), 66);
 
     return result;
 }

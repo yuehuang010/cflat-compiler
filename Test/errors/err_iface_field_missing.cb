@@ -40,6 +40,28 @@ expect_error("member access on null interface value 'wv' - 'wv' has not been ass
     void wvNullFieldWrite() { PTagged wv = default; wv.tag = 5; }
 }
 
+/*
+ * Parenthesising the receiver used to defeat the FIELD proof and only the FIELD proof: the fat
+ * value is already loaded into Primary by the time the member name is walked, and the record was
+ * gated on emitting the load here and now. The three legs below pin the paren spellings; the
+ * validity condition is that each is a NAMED local whose earlier load reads its own slot in the
+ * access's own block - which is what makes that load a sound anchor. Companion accept legs live
+ * in testNullIfaceDispatchAcceptSet; they assert values, but note there that a build widening the
+ * anchor to the access point still passes the whole suite, so they are not tripwires for it.
+ */
+expect_error("member access on null interface value 'qv' - 'qv' has not been assigned an implementation since it was last set to null, so 'qv.tag' would resolve its address through a null 'PTagged' vtable") {
+    int qvNullParenFieldRead() { PTagged qv = default; return (qv).tag; }
+}
+
+expect_error("member access on null interface value 'dv' - 'dv' has not been assigned an implementation since it was last set to null, so 'dv.tag' would resolve its address through a null 'PTagged' vtable") {
+    int dvNullDoubleParenFieldRead() { PTagged dv = default; return ((dv)).tag; }
+}
+
+// The paren WRITE form: same lvalue as the paren read, so it must reject identically.
+expect_error("member access on null interface value 'zv' - 'zv' has not been assigned an implementation since it was last set to null, so 'zv.tag' would resolve its address through a null 'PTagged' vtable") {
+    void zvNullParenFieldWrite() { PTagged zv = default; (zv).tag = 5; }
+}
+
 extern int main()
 {
     return 0;

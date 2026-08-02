@@ -19549,20 +19549,34 @@ public:
                             if (ifaceFieldIdx >= 0 && !interfaceVar.TypeAndValue.IsInterfacePointer)
                             {
                                 // A FRESH load off the slot is emitted here and now, so it can anchor
-                                // the definitely-null proof. An already-set Primary may have been
-                                // loaded in an EARLIER block, where this block's stores are the wrong
-                                // evidence, so that shape is left unrecorded (no diagnostic).
+                                // the definitely-null proof.
                                 llvm::LoadInst* freshFatLoad = interfaceVar.Primary != nullptr
                                     ? nullptr
                                     : compiler->CreateLoad(compiler->GetFatPtrType(), interfaceVar.Storage);
                                 llvm::Value* fatVal = interfaceVar.Primary != nullptr
                                     ? interfaceVar.Primary : freshFatLoad;
 
+                                // A parenthesised receiver (`(lv).tag`) leaves the fat value already
+                                // in Primary. That earlier load anchors the proof only when it reads
+                                // THIS slot in THIS block; the access consumes the loaded value, so
+                                // stores after it cannot change what faults. A load from an EARLIER
+                                // block is not anchored - this block's stores are the wrong evidence.
+                                llvm::LoadInst* anchorFatLoad = freshFatLoad;
+                                if (anchorFatLoad == nullptr && interfaceVar.Storage != nullptr)
+                                {
+                                    auto* priorLoad = llvm::dyn_cast<llvm::LoadInst>(interfaceVar.Primary);
+                                    if (priorLoad != nullptr
+                                        && priorLoad->getPointerOperand() == interfaceVar.Storage
+                                        && priorLoad->getType() == compiler->GetFatPtrType()
+                                        && priorLoad->getParent() == compiler->builder->GetInsertBlock())
+                                        anchorFatLoad = priorLoad;
+                                }
+
                                 // Definitely-null member access: same slot proof as the method
                                 // dispatch below (RunNullIfaceDispatchCheck). Covers the write form
                                 // too - `lv.tag = 5` shares this one lvalue. '?.' is the sanctioned
                                 // spelling for a maybe-null receiver and is never recorded.
-                                if (!nullConditionalPending && freshFatLoad != nullptr)
+                                if (!nullConditionalPending && anchorFatLoad != nullptr)
                                 {
                                     LLVMBackend::NullIfaceDispatchSite fldSite;
                                     fldSite.VarName = interfaceVar.CallerName.empty()
@@ -19572,7 +19586,7 @@ public:
                                     fldSite.Line = (int)ctx->getStart()->getLine();
                                     fldSite.Col = (int)ctx->getStart()->getCharPositionInLine();
                                     compiler->RecordPendingNullIfaceDispatch(
-                                        fldSite, interfaceVar.Storage, freshFatLoad, ifaceName);
+                                        fldSite, interfaceVar.Storage, anchorFatLoad, ifaceName);
                                 }
 
                                 // '?.' on an interface FIELD: the address is data + vtable[slot], so
