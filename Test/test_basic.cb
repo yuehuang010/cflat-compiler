@@ -2708,6 +2708,23 @@ const int kGCols = 9;
 int[kGRows * kGCols] gConstExprArr = default;
 int[kGRows] gConstNameArr = default;
 
+// The two supported stand-ins for a by-value fixed-array return, named by the reject in
+// Test/errors/err_fixed_array_byval_return.cb: wrap the array in a struct, or fill a
+// caller-owned buffer through a 'T* out' parameter.
+struct ArrayRetBox { int[3] v = default; };
+
+ArrayRetBox makeArrayRetBox()
+{
+    ArrayRetBox b = default;
+    b.v[0] = 5; b.v[1] = 6; b.v[2] = 10;
+    return b;
+}
+
+void fillArrayOut(int* out)
+{
+    out[0] = 5; out[1] = 6; out[2] = 10;
+}
+
 bool testFixedArrays()
 {
     bool result = true;
@@ -2888,6 +2905,35 @@ bool testFixedArrays()
     int[2][3] mdDst = mdSrc;
     mdSrc[1][2] = 90;
     result &= Test("fixed_copy_multidim", mdDst[1][2], 9);
+
+    // The three remedies the fixed-array-storage rejects name. Each is asserted by VALUE
+    // so a diagnostic can never recommend something that stopped working:
+    //   Test/errors/err_fixed_array_row_assign.cb  -> "bind an array view and write through that"
+    //   Test/errors/err_fixed_array_byval_return.cb -> "return a struct" / "take an out-parameter"
+
+    // A view bound to a ROW of a 2-D array borrows that row's storage, so a write
+    // through the view lands in the array (the remedy for `b[0] = <row>`).
+    int[2][3] rvArr = default;
+    rvArr[1][0] = 3;
+    int[] rvRow = rvArr[1];
+    result &= Test("fixed_row_view_reads", rvRow[0], 3);
+    rvRow[2] = 77;
+    result &= Test("fixed_row_view_writes_through", rvArr[1][2], 77);
+    // Element-wise copy into a row - the other remedy that reject names.
+    int[3] rvSrc = default;
+    rvSrc[0] = 8; rvSrc[1] = 9; rvSrc[2] = 10;
+    int rvI = 0;
+    while (rvI < 3) { rvArr[0][rvI] = rvSrc[rvI]; rvI++; }
+    result &= Test("fixed_row_elementwise_copy", rvArr[0][1] + rvArr[0][2], 19);
+
+    // Returning a fixed array by value is rejected; a struct WRAPPING one works and
+    // carries the elements back by value.
+    ArrayRetBox arb = makeArrayRetBox();
+    result &= Test("fixed_return_struct_wrapper", arb.v[0] + arb.v[2], 15);
+    // ...as does filling a caller-owned buffer through a 'T* out' parameter.
+    int[3] outBuf = default;
+    fillArrayOut(outBuf);
+    result &= Test("fixed_return_out_param", outBuf[0] + outBuf[2], 15);
 
     return result;
 }

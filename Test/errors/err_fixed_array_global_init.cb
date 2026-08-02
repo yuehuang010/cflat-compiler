@@ -1,0 +1,22 @@
+// GLOBAL decl-init of a fixed array from a pointer-valued initializer. The identical
+// spelling as a LOCAL was already rejected cleanly - the guard existed only on the
+// local path. A global's initializer is an llvm::Constant, so nothing ever casts it:
+// the mismatched pointer landed straight in the module and failed verification with
+// "Global variable initializer type does not match global variable type!" and NO
+// source location. Working global forms (brace list, partial brace, '= default',
+// const-expr size) are covered by value legs in test_basic.cb's testFixedArrays.
+
+expect_error("cannot initialize global fixed array 'char[8]' from a string literal") {
+    char[8] gLit = "hello";
+}
+
+// A non-literal expression on a global fixed array reaches the same bad initializer.
+char[8] gSrc = default;
+expect_error("cannot initialize global fixed array 'char[8] gCopy' from this expression") {
+    char[8] gCopy = gSrc;
+}
+
+extern int main()
+{
+    return 0;
+}

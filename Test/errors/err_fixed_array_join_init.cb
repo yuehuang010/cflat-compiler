@@ -1,0 +1,29 @@
+// Initializing fixed-array storage from a '?:' or '??' JOIN. A join has no source
+// NamedVariable and yields a plain pointer, so it matched neither the string-literal
+// leg nor the array-shaped-copy leg of the decl-init guard and fell through to a
+// store that cast the joined pointer to `[N x T]` - "Invalid bitcast", no source
+// location. The remedies the diagnostic names are exercised in test_basic.cb
+// (testFixedArrays: a writable array view bound to a row).
+extern int main(int argc, char** argv)
+{
+    // '?:' with string-literal arms.
+    expect_error("cannot initialize fixed array 'char[8]' from a pointer-valued expression") {
+        char[8] b = argc > 1 ? "hello" : "world";
+    }
+
+    // '?:' whose arms are both fixed arrays: they decay to pointers before the join,
+    // so the result still carries no array length to size a copy from.
+    expect_error("cannot initialize fixed array 'char[8]' from a pointer-valued expression") {
+        char[8] x = default;
+        char[8] y = default;
+        char[8] c = argc > 1 ? x : y;
+    }
+
+    // '??' reaches the same join.
+    expect_error("cannot initialize fixed array 'char[8]' from a pointer-valued expression") {
+        char* p = nullptr;
+        char[8] d = p ?? "world";
+    }
+
+    return 0;
+}

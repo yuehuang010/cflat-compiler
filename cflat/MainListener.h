@@ -8199,6 +8199,24 @@ public:
             ScanAndQueueGenericTypeUses(blockItemList);
         ProcessPendingInstantiations();
 
+        /*
+         * Returning a fixed array BY VALUE is unimplemented, not merely mis-lowered: every
+         * spelling probed (1-D, 2-D, alias, string-literal body, never-called) emitted `ret ptr`
+         * against an `[N x T]` return type and failed module verification. Rejected rather than
+         * implemented - a real by-value array return needs an sret-style hidden out-parameter and
+         * a copy at every call site, which is a feature, not a defect fix. C forbids it outright.
+         */
+        if ((returnType.ArraySize != nullptr || returnType.AliasArraySize > 0)
+            && !returnType.IsArrayView && !returnType.IsSimd && !returnType.Pointer)
+        {
+            LogErrorContext(func, std::format(
+                "function '{}' cannot return the fixed array '{}[N]' by value - CFlat has no "
+                "by-value array return, and the size was being dropped silently (the function "
+                "returned a single '{}'). Return a struct with the array as a field, or take an "
+                "out-parameter ('{}* out') and fill it in.",
+                name, returnType.TypeName, returnType.TypeName, returnType.TypeName));
+        }
+
         size_t bodyLine = 0;
         if (auto* body = func->compoundStatement())
             bodyLine = body->getStart()->getLine();
@@ -9608,6 +9626,37 @@ public:
                         compiler->globalDeclSite[name] = curLine;
                     }
                     auto constant = llvm::dyn_cast_or_null<llvm::Constant>(right);
+
+                    /*
+                     * Global counterpart of the local `T[N] b = <pointer>` reject below. A global's
+                     * initializer is a Constant, so the bad `ptr` -> `[N x T]` conversion is never
+                     * cast: it lands in the module and fails verification with no source location.
+                     * Brace lists and `= default` produce an aggregate Constant and are unaffected.
+                     */
+                    if (!externDeclOnly && typeAndValue.ConstArraySize > 0
+                        && !typeAndValue.IsArrayView && !typeAndValue.IsSimd
+                        && right != nullptr && right->getType()->isPointerTy()
+                        && llvm::isa_and_nonnull<llvm::ArrayType>(compiler->GetType(typeAndValue)))
+                    {
+                        bool fromStringLiteral = constant != nullptr
+                            && compiler->IsStringLiteralConstant(constant);
+                        if (fromStringLiteral)
+                            LogErrorContext(direct, std::format(
+                                "cannot initialize global fixed array '{}' from a string literal - "
+                                "CFlat has no C-style character-array initializer. Use 'char* {} = "
+                                "...' to point at the literal, 'string {} = ...' for a managed "
+                                "string, or '{} {} = {{'a','b',...}}' to spell the bytes out.",
+                                DescribeArrayShape(typeAndValue), name, name,
+                                DescribeArrayShape(typeAndValue), name));
+                        else
+                            LogErrorContext(direct, std::format(
+                                "cannot initialize global fixed array '{} {}' from this expression - "
+                                "a global's initializer must be a compile-time constant of the array's "
+                                "own shape. Use a brace list ('{{...}}'), '= default' to zero it, or "
+                                "fill '{}' element by element at the start of main.",
+                                DescribeArrayShape(typeAndValue), name, name));
+                    }
+
                     compiler->CreateGlobalVariable(typeAndValue, constant, typeAndValue.threadLocal, typeAndValue.UserAlignValue, externDeclOnly);
                     // A const-qualified global scalar with a constant-int initializer is foldable
                     // in an `if const` condition; a mutable global is not (see constFoldableGlobals_).
@@ -9850,6 +9899,23 @@ public:
                                                     srcInferredTypeName, srcInferredPointer,
                                                     srcInferredElemPointer, srcConstArraySize,
                                                     srcConstInnerDimensions);
+                        }
+                        else if (destIsFixedArray)
+                        {
+                            /*
+                             * Pointer-shaped initializer that is neither a string literal nor an
+                             * array-shaped source: a '?:' or '??' JOIN is the reachable spelling.
+                             * A join has no source NamedVariable, so it carries no array shape for
+                             * EmitFixedArrayValueCopy to size a copy from, and the plain store
+                             * below would cast the joined pointer to '[N x T]'.
+                             */
+                            LogErrorContext(direct, std::format(
+                                "cannot initialize fixed array '{}' from a pointer-valued expression "
+                                "- a '?:' or '??' join yields a pointer, which carries no array "
+                                "length to copy. Declare '{}' as a pointer or an array view ('T[]') "
+                                "to borrow the chosen operand, or select between the arrays and copy "
+                                "the elements in a branch.",
+                                DescribeArrayShape(typeAndValue), name));
                         }
                         else
                         {
@@ -11828,6 +11894,30 @@ public:
             auto derefAssign = [&](llvm::Value* val, bool isUnsigned) -> llvm::Value* {
                 if (namedVar.BitfieldStorage)
                     return bitfieldAssign(val);
+
+                /*
+                 * Storing a non-array value into `[N x T]` storage. The whole-VARIABLE spelling is
+                 * rejected above with its own wording; this catches every other receiver, of which
+                 * a ROW of a multidimensional array (`b[0] = ...`) is the reachable one - indexing
+                 * strips the outer dimension, so the whole-array guard never sees it. A string
+                 * literal source here folded the bad cast into a ConstantExpr and crashed the
+                 * compiler in SelectionDAG (SIGSEGV, no diagnostic).
+                 */
+                auto* rowDestTy = namedVar.UnionFieldType ? namedVar.UnionFieldType
+                    : (isDerefStorage() ? namedVar.BaseType
+                                        : compiler->GetTypeFromStorage(destination));
+                if (llvm::isa_and_nonnull<llvm::ArrayType>(rowDestTy)
+                    && val != nullptr && val->getType() != rowDestTy)
+                {
+                    std::string lhsText = unaryCtx != nullptr ? unaryCtx->getText() : std::string("<lhs>");
+                    LogErrorContext(unaryCtx, std::format(
+                        "cannot assign to '{}' as a whole - it names fixed-array storage '{}', and "
+                        "CFlat has no whole-array assignment. Copy the elements ('{}[i] = ...'), or "
+                        "bind an array view ('T[] row = {};') and write through that.",
+                        lhsText, LLVMBackend::DescribeAggregateStorageShape(rowDestTy), lhsText,
+                        lhsText));
+                }
+
                 if (namedVar.UnionFieldType)
                     return compiler->CreateAssignment(val, destination, isUnsigned, namedVar.UnionFieldType);
                 return isDerefStorage()

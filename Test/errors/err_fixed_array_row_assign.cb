@@ -1,0 +1,37 @@
+// Assigning to a ROW of a multidimensional fixed array. Indexing strips the outer
+// dimension, so the whole-array-assignment guard (which keys on the LHS naming a
+// whole T[N] variable) never saw this receiver and the store emitted an invalid
+// `ptr` -> `[N x T]` cast. With a STRING LITERAL source that cast folded into a
+// ConstantExpr the verifier does not check and CRASHED the compiler (SIGSEGV, exit
+// 139, no diagnostic at all); with an array source it failed module verification
+// with no source location. Both are rejected at the assignment site now.
+extern int main()
+{
+    // Literal source, 2-D receiver - this was the compiler SIGSEGV.
+    expect_error("cannot assign to 'b[0]' as a whole") {
+        char[2][8] b = default;
+        b[0] = "hello";
+    }
+
+    // Array source, 2-D receiver - this was "Invalid bitcast ptr -> [8 x i8]".
+    expect_error("cannot assign to 'd[0]' as a whole") {
+        char[2][8] d = default;
+        char[8] src = default;
+        d[0] = src;
+    }
+
+    // Deeper nesting: a 3-D array indexed twice still leaves array storage.
+    expect_error("cannot assign to 'e[0][1]' as a whole") {
+        char[2][2][8] e = default;
+        e[0][1] = "hello";
+    }
+
+    // Not char-specific: an int element type reaches the same store.
+    expect_error("cannot assign to 'f[0]' as a whole") {
+        int[2][3] f = default;
+        int[3] isrc = default;
+        f[0] = isrc;
+    }
+
+    return 0;
+}

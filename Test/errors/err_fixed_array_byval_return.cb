@@ -1,0 +1,30 @@
+// Returning a fixed array BY VALUE. This was never implemented rather than merely
+// mis-lowered: the '[N]' on the return type was dropped silently, so 'char[8] mk()'
+// built a function returning a single 'char', and 'return b;' then emitted 'ret ptr'
+// against an i8 return type - "Function return type does not match operand type of
+// return inst!", no source location. Every spelling probed (1-D, 2-D, alias return
+// type, string-literal body, never-called function) failed the same way, so the
+// capability was absent, not accidental. Rejected at the definition, which also
+// covers a function that is never called. Both named remedies (a struct wrapping the
+// array, and a 'T* out' out-parameter) are exercised in test_basic.cb.
+
+expect_error("function 'mk1' cannot return the fixed array 'char[N]' by value") {
+    char[8] mk1() { char[8] b = default; return b; }
+}
+
+// Multidimensional, non-char element: the same dropped-size path.
+expect_error("function 'mk2' cannot return the fixed array 'int[N]' by value") {
+    int[2][3] mk2() { int[2][3] b = default; return b; }
+}
+
+// An array type ALIAS carries its size on the type, not in the declarator brackets,
+// so it reaches the reject through AliasArraySize rather than ArraySize.
+using RetBuf = char[8];
+expect_error("function 'mk3' cannot return the fixed array 'char[N]' by value") {
+    RetBuf mk3() { RetBuf b = default; return b; }
+}
+
+extern int main()
+{
+    return 0;
+}
