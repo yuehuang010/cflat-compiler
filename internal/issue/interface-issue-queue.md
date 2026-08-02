@@ -28,19 +28,30 @@ why the shipped code has the shape it does, which approaches must not be retried
 ratified behaviour change that future work must not "fix" back. That section is the convergence
 point for the interface/generics work and is the reason this file is long.
 
-State on 2026-08-01: **74 open issues** (10 P1 / 33 P2 / 24 P3 / 7 UI), counted from disk
+State on 2026-08-01: **75 open issues** (11 P1 / 33 P2 / 24 P3 / 7 UI), counted from disk
 (`ls internal/issue/p{1,2,3}/*.md ui/*.md | wc -l`) on the merged tree, not from arithmetic.
-Four P1s were fixed and their files deleted this round
-(`funcptr-call-result-into-closure-param-garbage`, `unique-field-to-field-copy-double-frees`,
-`delete-of-array-view-over-stack-storage`, `interface-method-call-on-null-value-segfaults`), and
-five new issues were filed - every one of them found by the ADVERSARIAL REVIEWS of those fixes,
-not by the original investigation. That ratio keeps holding: fixing two things in this area
-surfaces three or four more, and the reviews find them, not the fix work.
 
-**The 2026-08-01 P1 campaign is running to ZERO.** Two of the remaining items are expected to end
-as RECLASSIFICATIONS rather than fixes, and that is the queue working as designed, not a
-shortfall - see the `return-dangle` note in the P1 table and the `ftell-fseek` park note. Do not
-read a non-zero P1 count at the end of that campaign as unfinished work without reading why.
+**Read the P1 count honestly: the 2026-08-01 campaign fixed SIX P1s and P1 went from 11 to 11.**
+Fixed and deleted: `funcptr-call-result-into-closure-param-garbage`,
+`unique-field-to-field-copy-double-frees`, `delete-of-array-view-over-stack-storage`,
+`interface-method-call-on-null-value-segfaults`,
+`unique-field-to-field-residue-temp-and-interface-source`,
+`generic-unique-field-temp-source-crashes-compiler`. Filed in their place: six new issues, EVERY
+ONE found by the ADVERSARIAL REVIEWS of those fixes rather than by the fix work or the original
+investigation.
+
+**This is the campaign's central finding, and it should change how the next one is scoped.**
+Driving P1 to zero by count does not converge, because reviewing a fix in this area reliably
+surfaces one or more neighbouring defects. What DID converge is severity: the six closed were
+silent double frees, silent wrong values, and two zero-output COMPILER CRASHES; the six filed are
+narrower, diagnosed, and mostly wrong-diagnostic or unprovable-shape gaps. Scope the next campaign
+on the SEVERITY MIX (are there silent wrong values left?), not on the count reaching zero.
+
+Two items also ended as deliberate NON-fixes, which is the queue working as designed rather than a
+shortfall: `return-dangle-missed-when-slot-has-extra-user` (its own file says do not patch it, and
+the prerequisite it names does not actually unblock it) and `ftell-fseek-long-width-on-windows`
+(parked, Windows-only). And `interface-field-self-assign-false-positive` was ATTEMPTED and
+REVERTED - see its file for the three discriminators that cannot work.
 ## Resume point
 
 **Current head: the P1 campaign.** macOS arm64 Release **554 / 0 / 8** plus `example_mac.sh`
@@ -169,9 +180,9 @@ bucket) on the MERGED tree, after both of this round's P1 fixes landed:
 
 Net movement: two P1s fixed and their files deleted (`funcptr-call-result-into-closure-param-garbage`,
 `unique-field-to-field-copy-double-frees`), and four new issues filed - three P1
-([[unique-field-to-field-residue-temp-and-interface-source]],
-[[interface-field-self-assign-false-positive]],
-[[generic-unique-field-temp-source-crashes-compiler]]) and one P2
+(`unique-field-to-field-residue-temp-and-interface-source` and
+`generic-unique-field-temp-source-crashes-compiler`, both since FIXED by `3d33bfe`; plus
+[[interface-field-self-assign-false-positive]], still open) and one P2
 ([[generic-funcptr-return-poisons-enclosing-return]]). Every one of the four was found by the
 ADVERSARIAL REVIEWS of the two fixes, not by the original investigation - the same ratio this
 file recorded on 2026-07-31.
@@ -193,9 +204,10 @@ file recorded on 2026-07-31.
 | [[return-dangle-missed-when-slot-has-extra-user]] | Missed dangle, no diagnostic. Residue of `2bcc5a0`; NOT to be fixed by widening the whitelist. |
 | [[llvm-cannot-select-sign-extend-on-const-array-index]] | LLVM fatal error, compiler exit 134. Pre-existing; the front-end shape that fed it is now rejected earlier, so no live repro remains - confirm no other spelling reaches it, then re-rank. |
 | [[multidim-array-view-binding-loses-shape]] | Silent miscompile. The `T[][]` view spelling drops the row stride, so `auto` over a 2-D fixed array has no correct target to deduce to. Residual of the 1-D fixed-array-shape fix. |
-| [[unique-field-to-field-residue-temp-and-interface-source]] | Silent abort (exit 134), no diagnostic. Residue of `unique-field-to-field-copy-double-frees`: the fix (fix/unique-f2f) closes a wide named-local-shaped source set, but a temp/call-result source (`c.t = makeBox().t`), a container-element source (`list.get(0).t`), and a fat-interface generic source (`Box<unique IShape>`) all still double-free undiagnosed, while their plain-struct equivalents are diagnosed. |
-| [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. Pre-existing: an interface-field-to-interface-field copy with the same field name on both sides is misread as a self-assign (both receivers carry an empty `CallerName`), suppressing the field-to-field reject. Found probing the residue above; a different bug (self-assign discriminator), not a gate-width problem. |
-| [[generic-unique-field-temp-source-crashes-compiler]] | COMPILER CRASH, exit 139, zero output. A generic `unique` field assigned from a temp whose pointee has a user destructor SIGSEGVs the compiler; needs all three (user dtor + generic field + temp source). Shares the temp-source spelling with the residue above but is a different failure (crash, not a missed diagnostic). |
+| [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. An interface-field-to-interface-field copy with the SAME field name on both sides is misread as a self-assign, suppressing the reject. **ATTEMPTED AND REVERTED 2026-08-01** - see the file for the three discriminators that cannot work (names, box storage, and a bare `Value` compare of the field address all fail at least one witness). A sound test needs real dataflow through the box to the underlying data pointer. |
+| [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. An array-element receiver (`arr[0].slot = arr[1].slot`) bypasses the field-to-field guard entirely because `ParentVariableName`/`CallerName` name the CONTAINER, so both sides match and the self-assign carve-out swallows a genuine two-owner store. Identical on the pre-fix binary - not caused by `3d33bfe`. |
+| [[temp-unique-field-into-borrow-slot-use-after-free]] | Use-after-free, compiles clean and exits 0 on both binaries. A temp's `unique` field bound into a NON-unique (borrow) slot with a destructor-less pointee: the temp's `Box` destructor frees the pointee before the load. No `unique` claim on the destination for a guard to key on. |
+| [[owning-temp-parent-misroutes-chained-alias-access]] | WRONG DIAGNOSTIC, no correctness change. At depth >= 2 under an `alias` container return, `OwningTempParent` is wrongly true, so the call-result message fires on a container-element shape - stating a false mechanism and naming a remedy that aborts 134. Depth 1 routes correctly. The pre-fix binary names an equally dead remedy, so nothing regressed. |
 
 ### P2 - false rejections, unavailable features, ownership holes (`p2/`)
 
@@ -353,9 +365,59 @@ which a future session must not "fix" back without reopening the decision.
 | `if const` leaf emission gated on insert-block LIVENESS, not non-nullness | fix/ifconst-ir (branch, not yet merged) |
 | `IsUniqueFieldRead` (SOURCE gate) re-keyed onto `IsOwningUniquePointerField`, closing the fully-generic field-to-field leg `d65f000` deliberately left open | fix/unique-f2f (branch, not yet merged) |
 | `delete` of an array view rejected when the view was bound from fixed-array storage; provenance tracked DECLARATION-ONLY | `11e85a1` |
-| Provably-null interface access rejected at COMPILE TIME; no runtime guard (RATIFIED) | fix/null-iface |
+| Provably-null interface access rejected at COMPILE TIME; no runtime guard (RATIFIED) | `3311842` |
+| Temp-source and fat-interface `unique` field stores rejected; the implied-move pointer guard in all THREE copies | `3d33bfe` |
 
 Suite trajectory across the whole sequence: 522 -> 530 -> 536 -> 538 -> 540.
+
+### `3d33bfe` - temp-source `unique` field stores, and the implied-move guard in THREE copies
+
+Closes `unique-field-to-field-residue-temp-and-interface-source` and
+`generic-unique-field-temp-source-crashes-compiler`. Does NOT close
+`interface-field-self-assign-false-positive` - see below.
+
+**The provenance the issue file said was missing already existed.** `MovableTempField` and
+`FromOwningTempField` already rode the exact temp spellings in question; the only thing blocking a
+diagnostic was the `IsOwningValueType(TypeName)` gate on those branches, false for a
+destructor-less pointee. The fix adds sibling legs keyed on the owning-unique-pointer-field shape.
+Take this as the standing lesson: **probe whether the signal exists before designing one.**
+
+**The implied-move pointer guard lives in THREE copies, and two rounds fixed only N-1 of them.**
+`!TypeAndValue.Pointer` is required at the assignment path (`~12397`), the
+declaration-with-initializer path (`~9197`), AND the RETURN path (`~6432`). Each unguarded copy is
+a zero-output compiler SIGSEGV (`ConstantAggregateZero::get` on a pointer type, detonating in
+`DAGCombiner::visitBUILD_VECTOR` during Mach-O emission - the crash handler cannot see it because a
+SIGSEGV in LLVM native code is not a hooked signal). Round 1 fixed one, round 2 found the second,
+round 3 found the third. The completeness proof that ended it: **all 19 `ConstantAggregateZero::get`
+sites and all 12 `MovableTempField` readers were enumerated - exactly three intersect.** The rest
+are gated by `ClassifyOwningAssignSource(...) == AssignSourceKind::Move` under `isStructTy()` and
+are off the pointer/temp-field path. Do not re-derive this by sampling; enumerate.
+
+**`interface-field-self-assign-false-positive` was ATTEMPTED AND REVERTED.** A `differentFieldReceivers`
+test concluded two receivers were different from variable-NAME inequality, which false-rejected
+`alias ISlot ib = ia; ib.slot = ia.slot;` - a program master runs correctly, and `alias` is the same
+object by definition. Three discriminators were then shown unusable, and this is the part worth
+keeping: **names** fail both witnesses; the **interface locals' storage** fails
+`ISlot ia = a; ISlot ib = a;` (two distinct boxes over one object); and a bare **LLVM `Value` compare
+of the field address** fails even the TRUE self-assign `ia.slot = ia.slot`, because each access
+re-loads the fat pointer and yields two distinct `LoadInst`s - inverting the bug into a false
+rejection of the one shape master gets right. A sound test needs real dataflow through the box to
+the underlying data pointer. Do not retry any of the three.
+
+**Three diagnostics in this family recommended remedies that do not work**, all caught by review,
+none by the suite. A temp message named `move makeBox.t` (invalid syntax, and `move` on a call
+result is itself rejected); a written `unique IShape` brace-init named `move a.s` and then emitted
+the IDENTICAL message when the user wrote it - a closed loop, about a fat interface it called a
+"pointer"; and the container-element half claimed a destructor frees at end-of-statement when the
+LIST owns the pointee, with the named remedy aborting 134. **A diagnostic's stated mechanism is a
+factual claim - run the remedy before shipping it.** The residual misroute at chained depth >= 2 is
+filed as [[owning-temp-parent-misroutes-chained-alias-access]].
+
+One correction worth recording because it inverted an instruction: splitting the two-owner message
+on `MovableTempField` does NOT work, because that flag is additionally gated on `IsOwningValueType`
+and so is false for a dtor-less pointee - the headline `makeBox().t` shape would have taken the
+container branch. The discriminator is `parentOwnsTemp` (parent is an owning temp, not an `alias`
+return), now recorded as `NamedVariable::OwningTempParent`.
 
 ### fix/null-iface - null interface access rejected at COMPILE TIME, and the runtime guard REJECTED
 
