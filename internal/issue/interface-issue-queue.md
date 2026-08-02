@@ -49,7 +49,8 @@ on the SEVERITY MIX (are there silent wrong values left?), not on the count reac
 
 Two items also ended as deliberate NON-fixes, which is the queue working as designed rather than a
 shortfall: `return-dangle-missed-when-slot-has-extra-user` (its own file says do not patch it, and
-the prerequisite it names does not actually unblock it) and `ftell-fseek-long-width-on-windows`
+the prerequisite it names does not actually unblock it - RECLASSIFIED to P3 on 2026-08-02 by the
+maintainer, since a permanent non-fix does not belong in the P1 working set) and `ftell-fseek-long-width-on-windows`
 (parked, Windows-only). And `interface-field-self-assign-false-positive` was ATTEMPTED and
 REVERTED - see its file for the three discriminators that cannot work.
 ## Resume point
@@ -199,16 +200,14 @@ file recorded on 2026-07-31.
 |---|---|
 | [[interface-boxing-keyed-on-source-binding]] | NARROWED 2026-07-31: the two binding erasures (parens, `??`) and the two un-routed boxing sites are closed. What remains is `delete` of a BORROWED interface box (exit 139/133, no diagnostic) - a different root, reachable with no join at all. |
 | [[ftell-fseek-long-width-on-windows]] | Silent wrong value on Windows: core binds C `long` as pointer-sized, so `ftell`/`fseek` read garbage under LLP64. Not a UI issue despite being Windows-only. |
-| [[null-interface-access-residue-unproven-receivers]] | SIGSEGV (139), no diagnostic. Residue of the null-access fix: a PARENTHESIZED field access `(lv).tag` slips the guard while `(lv).Get()` is caught, plus struct-field / array-element / global receivers. The `?.`, branch-, loop-, parameter- and folded-`if const` shapes are DELIBERATELY accepted per the ratified design and are NOT residue. |
+| [[null-interface-access-residue-unproven-receivers]] | SIGSEGV (139), no diagnostic. NARROWED 2026-08-02 by `78c678b`: the PARENTHESIZED field access `(lv).tag` is CLOSED (all paren depths, plus the write form `(lv).tag = 5`). What remains is struct-field / array-element / global receivers. The `?.`, branch-, loop-, parameter- and folded-`if const` shapes are DELIBERATELY accepted per the ratified design and are NOT residue. |
 | [[funcptr-overload-binding-ignores-signature]] | NARROWED 2026-07-31 by `fix/funcptr-arg-accept-set`: the type-CLASS axis is closed on both paths (the filed `double`-into-`int` repro now errors). Still open, silent and identical on master: floating-point WIDTH (same SHAPE as the closed repro), integer width/signedness, POINTEE type (memory-unsafe - reads past the end of the object), and aggregates. Do NOT re-close by widening the comparison to spellings; see the file. |
-| [[return-dangle-missed-when-slot-has-extra-user]] | Missed dangle, no diagnostic. Residue of `2bcc5a0`; NOT to be fixed by widening the whitelist. |
 | [[llvm-cannot-select-sign-extend-on-const-array-index]] | Compiler crash. **CORRECTED 2026-08-02**: the `Cannot select` / exit-134 TEXT is NOT reproducible on `ca5a02a` - what reproduces is a bare SIGSEGV, exit 139, no output, and only when a CONSTANT-index element read follows the row assign (a `%s` whole-row read or a runtime index miscompiles silently instead). The decl-init, whole-array-assign and ROW-assign shapes that fed it are all rejected now; the backend node itself is still undiagnosed. |
 | [[global-struct-positional-init-silently-zeroes]] | Silent miscompile, exit 0. `S g = {1,2};` at FILE scope compiles clean and reads back `0 0`; the identical LOCAL spelling is properly rejected ("positional initializers are not supported"). The two scopes disagree about whether the construct exists. Global fixed-ARRAY brace lists are unaffected and work. Pre-existing, identical on `ca5a02a`. Filed 2026-08-02. |
 | [[multidim-array-view-binding-loses-shape]] | Silent miscompile. The `T[][]` view spelling drops the row stride, so `auto` over a 2-D fixed array has no correct target to deduce to. Residual of the 1-D fixed-array-shape fix. |
 | [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. An interface-field-to-interface-field copy with the SAME field name on both sides is misread as a self-assign, suppressing the reject. **ATTEMPTED AND REVERTED 2026-08-01** - see the file for the three discriminators that cannot work (names, box storage, and a bare `Value` compare of the field address all fail at least one witness). A sound test needs real dataflow through the box to the underlying data pointer. |
 | [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. An array-element receiver (`arr[0].slot = arr[1].slot`) bypasses the field-to-field guard entirely because `ParentVariableName`/`CallerName` name the CONTAINER, so both sides match and the self-assign carve-out swallows a genuine two-owner store. Identical on the pre-fix binary - not caused by `3d33bfe`. |
 | [[temp-unique-field-into-borrow-slot-use-after-free]] | Use-after-free, compiles clean and exits 0 on both binaries. A temp's `unique` field bound into a NON-unique (borrow) slot with a destructor-less pointee: the temp's `Box` destructor frees the pointee before the load. No `unique` claim on the destination for a guard to key on. |
-| [[owning-temp-parent-misroutes-chained-alias-access]] | WRONG DIAGNOSTIC, no correctness change. At depth >= 2 under an `alias` container return, `OwningTempParent` is wrongly true, so the call-result message fires on a container-element shape - stating a false mechanism and naming a remedy that aborts 134. Depth 1 routes correctly. The pre-fix binary names an equally dead remedy, so nothing regressed. |
 
 ### P2 - false rejections, unavailable features, ownership holes (`p2/`)
 
@@ -253,6 +252,8 @@ file recorded on 2026-07-31.
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[owning-temp-parent-misroutes-chained-alias-access]] | diagnostic | RE-RANKED P1 -> P3 2026-08-02, on the file's own "re-rank freely" and on a re-measurement: the VERDICT is right (two `unique` owners really is an error) and only the WORDING is wrong, so no program's accept/reject status changes. A wrong message is P3 by this table's own rubric; it sat at P1 only for visibility to whoever next touched the `unique` field-store routing, and that work has landed. Still live on `ca5a02a`: the call-result message fires on a container-element shape, stating a false mechanism and naming a remedy that aborts 134. |
+| [[return-dangle-missed-when-slot-has-extra-user]] | deliberate deferral | RECLASSIFIED P1 -> P3 2026-08-02 by the maintainer, rationale kept intact. Missed dangle, no diagnostic - but the shapes were ALL accepted before `2bcc5a0` too, so this is residue, not a regression, and its own file rules out the obvious remedy (widening the extra-user whitelist re-introduces false rejections). Stays open as a record of what the pass cannot see. |
 | [[nullcond-guard-skips-move-argument-cleanup]] | latent | INTRODUCED by the `null-conditional-args-eval-order` fix, and accepted rather than fixed. A `move` argument to a '?.' call on a NULL receiver never runs, so nothing takes ownership - but the source is still statically marked moved, so scope exit frees nothing either, and the allocation leaks (`frees=0` vs master's `frees=1`). Not memory-unsafe and not observable in-language; reading the source after the call is rejected identically on both binaries. Filed 2026-07-31. |
 | [[null-conditional-args-eval-order-hresult]] | latent | Residual of the fixed P1 `null-conditional-args-eval-order`. On an `HResult<T*>` receiver '?.' means "propagate the failure code", and its `chain.ok`/`chain.fail` lowering still runs after the argument list is evaluated - so a failed HResult skips the call but not its arguments' side effects. COM/winrt only, therefore Windows only; not reachable from any in-repo `.cb` on macOS. Narrowed 2026-07-31. |
 | [[mangled-generic-name-leaks-into-diagnostics]] | diagnostic | `Box__unique_Itemptr` shown where the user wrote `Box<unique Item*>`. Also a TEST-FRAGILITY problem: pinning an `expect_error` to a mangled name pins it to the mangling scheme. **Prefer prefix-pinning until fixed.** No demangler exists and `MangleTypeArg` is lossy one-way, so the fix is to STORE the source spelling. Filed 2026-07-31. |
@@ -1052,7 +1053,9 @@ bytes of the POINTER VALUE. (Same Constant-vs-Instruction divergence as the prim
 record above.) The indexing form crashed the compiler outright at exit 134. Rejecting it is a
 strict improvement; it gets its own message that mentions neither extents nor views, and the
 missing capability is filed as [[char-array-from-string-literal-has-no-spelling]] with the crash
-filed separately as [[llvm-cannot-select-sign-extend-on-const-array-index]].
+filed separately as [[fixed-array-storage-guards-miss-four-axes]] (renamed from
+`llvm-cannot-select-sign-extend-on-const-array-index` on 2026-08-02, when the fatal error it was
+named for stopped reproducing and four other axes were measured in its place).
 
 **On a fixed array the element's pointer-ness lives on `Pointer`, not `ElemPointer`.** `GetType`
 applies both flags to the ELEMENT before wrapping it in the ArrayType, so `int*[2]` carries

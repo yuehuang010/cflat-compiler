@@ -25,6 +25,24 @@ extern int main() { int[2][3] a; a[1][2]=7; auto s = a; printf("s=%d\n", s[1][2]
 Prints garbage (`-142573312`, varies per run) - the same never-materialised binding the
 1-D `auto` case had.
 
+## Repro 3 - the PARAMETER axis (measured 2026-08-02 on `ca5a02a`)
+
+```cflat
+int f(int[][] v){ return v[1][2]; }
+extern int main(){ int[2][3] a; a[1][2]=7; printf("p=%d\n", f(a)); return 0; }
+```
+
+Compiles clean, exit 0, prints `p=1` - expected `7`. Same silent wrong value as repro 1, so a
+`T[][]` PARAMETER is a live defect and not merely a theoretical consequence of the view repr.
+This matters for scoping: rejecting `T[][]` parameters outright is a legitimate scope cut (a
+thin-pointer view cannot express a row stride), but it is a real behaviour change on a shape that
+compiles today, not a no-op.
+
+Note the counterpart `char[8]` FIXED-extent parameter does not even bind - `int f(char[8] b)`
+called with a `char[8]` gives `no overload of 'f' matches the given arguments` with the argument
+shown as `[0] ptr <unnamed>`. So the parameter axis is inconsistent across the two spellings: the
+view spelling silently miscompiles, the fixed-extent spelling false-rejects.
+
 ## Why it was deferred rather than fixed
 
 The 1-D fix deduces the array view `T[]` for `auto x = <fixed array>`. That deduction is

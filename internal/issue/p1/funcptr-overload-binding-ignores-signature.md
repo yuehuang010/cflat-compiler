@@ -11,6 +11,79 @@ wrong-pointee pointer, not merely a wrong number, and because every case is sile
 value with no diagnostic is the failure mode this queue ranks worst. It is NOT a regression:
 every repro below behaves identically on master and on the fix.
 
+## PARKED WORK IN PROGRESS - branch `fix/funcptr-sig`, do not restart from scratch (2026-08-02)
+
+An attempt ran the full fix-issue loop and **did not land**: it used all 3 review rounds and each
+round found a real defect, so per the workflow it was NOT merged. **The branch and its worktree are
+deliberately left in place** at `/Users/felixhuang/source/cflat-fix-funcptr-sig`, branch
+`fix/funcptr-sig`, commit `b2f564b`, one commit ahead of `master` = `ca5a02a`. Suite on the branch
+is green (554/0/8, examples 35/0) - green is not the bar it failed.
+
+**What the branch achieves** (verified by the main session, not just claimed): the signature is
+proved by canonical COMPONENTS rather than a coarse `i`/`f`/`p`/`v` class, closing floating-point
+width, integer width, signedness-independent width, `bool`-vs-`int` (a real `i1`-vs-`i32` function
+type difference), aggregates, arity, and non-generic struct POINTEE identity - including the
+memory-unsafe `Circle*`/`Square*` read. The comparator is one-sided and `Known == false` can never
+contribute a rejection.
+
+**Why it did not land - four FALSE REJECTIONS, each a program master compiles and runs correctly:**
+
+1. Round 1: signedness baked into the canon. `function<int(int)>` into a `u32(u32)` slot - master
+   exit 42, branch hard-error. Signedness is not part of an `llvm::FunctionType`. FIXED on the branch.
+2. Round 1: `char*` vs `u8*` - same defect on a pointee. FIXED on the branch.
+3. Round 1: struct identity taken from a raw source spelling with no namespace resolution, breaking
+   both directions (a false reject AND a memory-unsafe false accept). FIXED on the branch, but the
+   round-2 fix for it introduced a WEAKENING - a "one match wins, 2+ means unknown" suffix rule made
+   the flagship guard defeatable by adding one unrelated `namespace Zz { struct SquareP ... }` line
+   anywhere in the program. Round 3 replaced that with SET-DISJOINTNESS (compare both spellings'
+   candidate key sets; reject only when shapes match and the sets are disjoint), which is verified
+   working in both directions.
+4. **STILL OPEN, the reason it is parked**: generic instantiations are compared by MANGLED KEY, so
+   `Box<int>` and `Box<i32>` are "provably different types". Measured on `ca5a02a` vs `b2f564b`:
+   ```cflat
+   import "function.cb";
+   struct Box<T> { T v = default; };
+   void onBoxInt(Box<int>* b) { b->v = 51; }
+   int run(function<void(Box<i32>*)> f) { Box<i32> q = default; f(&q); return q.v; }
+   extern int main() { function<void(Box<int>*)> g = onBoxInt; printf("g1=%d\n", run(g)); return 0; }
+   ```
+   Master prints `g1=51`; the branch rejects, and its diagnostic prints the mangled keys
+   (`'void(Box__i32*)'` vs `'void(Box__int*)'`) - a factually false claim in user-facing text.
+   Also true of `Box<int>`/`Box<u32>` and `Box<long>`/`Box<i64>`. Present since round 1; survived
+   all three reviews. Monomorphization does not normalize type-argument spellings at all.
+
+**The agreed next step, if this is resumed** (an advisor reviewed the disposition and the main
+session concurs) - a SUBTRACTION, not a fourth attempt at identity:
+
+- Make the component `Known = false` when the spelling or any candidate key is a generic
+  instantiation. **Component-level, never by filtering keys out of `StructKeys`**: the struct rule
+  rejects on DISJOINT sets, and removing elements can only make sets more disjoint, so filtering is
+  a TIGHTENING that can invent a new false rejection. Only the component-level form is strictly
+  relaxing. Put that reason in the code comment so it is not "optimized" back.
+- Bias the "is a generic instantiation" test WIDE on purpose - over-triggering yields more accepts,
+  which is the safe direction.
+- This gives up a genuine memory-safety catch, and that must be recorded rather than glossed:
+  `Box<double>*` into a `Box<i32>*` slot writes 8 bytes of double into a 4-byte object (master
+  prints `gh=0`). It moves to the residual list, scoped to Stage 2 alongside the qualified-key work.
+- Verify with VALUE legs, not compile-success: a relaxation restores a candidate to the perfect
+  tier and can change WHICH overload is selected, silently.
+- Scope the review to one question - is the change strictly relaxing? Round 3 already settled the
+  disjointness proof, the dotted-boundary check (not a substring match), and empty-set polarity; do
+  not re-derive them.
+- If that round is not clean, hand the branch over rather than taking another.
+
+**Two files exist only on the branch and are NOT on master** - retrieve them from
+`fix/funcptr-sig` rather than rewriting them: this file's branch-side rewrite (which carries the
+corrected residual measurements, `hazA=111` and `neigh=2333`), and
+`internal/issue/p1/funcptr-pointer-depth-not-compared.md`, a separate P1 recording that pointer
+DEPTH is lost at parse (`param->pointer() != nullptr` collapses `*` and `**`), so
+`function<void(int**)>` binds a `function<void(int*)>` slot and SIGSEGVs - pre-existing, exit 139
+on master too, and it needs a new serialized field plus its `--init` round-trip.
+
+**Standing constraint, reaffirmed by every round above:** do NOT close this by widening the
+comparison to more of the spelling. Prove what you REJECT; accept what you cannot prove. A false
+rejection takes away a working program and, in this area, has done so four times.
+
 ## What was closed
 
 `fix/funcptr-arg-accept-set` made the function-pointer SIGNATURE participate in binding on both

@@ -10,6 +10,69 @@ guards nor, in one case, the boxing at all."
 That root is CLOSED. What is left is a DIFFERENT root that the old file's `?:` repro was blaming
 on the closed one - see "Why the `?:` repro is not the same bug" and "What was closed" below.
 
+## PARKED WORK IN PROGRESS - branch `fix/delete-borrowed-box`, do not restart from scratch (2026-08-02)
+
+An attempt ran the full fix-issue loop and **did not land**: all 3 review rounds were used and each
+found real defects, so per the workflow it was NOT merged. **The branch and worktree are
+deliberately left in place** at `/Users/felixhuang/source/cflat-fix-delete-borrowed-box`, branch
+`fix/delete-borrowed-box`, commit `b157a27`, one commit ahead of `master` = `ca5a02a`. Suite on the
+branch is green (556/0/8, examples 35/0) - green was never the bar it failed.
+
+**What the branch achieves** (verified by the main session): the live defect below IS closed for
+seven borrow spellings - pointer parameter, borrowed local, `alias` binding, `?:` join, `??` join,
+the assignment spelling, and a parenthesized source - each turning a silent exit-134/139 double free
+into a located diagnostic. It also closes the owning-`unique`-FIELD box read, which the round-1
+matrix had wrongly recorded as "already rejected by a pre-existing guard" when it was in fact a live
+double free.
+
+**The recurring failure, across all three rounds, was the same one**: the guard kept treating
+something that is not proof of a second owner as proof, and false-rejecting correct programs. Five
+such shapes were found and fixed (late-assigned `new`; plain-field read through a parameter;
+`IsAliasBorrow`, which means the scope-exit free is SUPPRESSED and is therefore the opposite of
+evidence; a NAME-ONLY parameter lookup across every live frame; and a parameter reassigned in its
+own body). Each false rejection also emitted a remedy that LEAKED.
+
+**Why it is parked - three blockers open at the cap, all measured:**
+
+1. **False rejection with a leaking remedy, via `??=`.** `MainListener.h:12025` returns before the
+   `operatorText == "="` retirement block at `:12086`, so `int f(Ci* p) { p ??= new Ci(); IS s = p;
+   delete s; }` keeps its declaration-time borrowed-parameter fact. Master runs it correctly
+   (`dtor=1`); the branch rejects, and its suggested remedy runs to `dtor=0` - it leaks. Round 3
+   fixed the plain-`=` acquisition spelling and left this one.
+2. **`MarkPointerRebound` retires too much - two real double frees now accepted that round 2 caught.**
+   (a) `int f(Ci* p, Ci* q) { p = q; IS s = p; delete s; }` - `p` is STILL a borrow after the store,
+   but the store clears the fact; compiles clean and exits 134. Deleting the single line `p = q;`
+   makes it reject, so one statement defeats the guard. (b) An ordering bug at
+   `MainListener.h:11257-11258`: `if (nv->PointerRebound) return false;` is checked BEFORE
+   `if (nv->BorrowsOwnedElement) return true;`, and `SetVariableBorrowsOwnedElement`
+   (`:13190-13201`) re-establishes the element taint on that very same `=`. Swapping the two lines
+   is the natural fix and costs no existing leg.
+3. **Dropping `IsBorrowed` reopened two double frees, and created a LAUNDERING PATH.** I verified
+   this directly: with `int f(Ci* p) { Ci* b = p; ... }`, the branch REJECTS `delete b;` but ACCEPTS
+   `IS s = b; delete s;` on the identical binding, and the accepted form exits 134. The same holds
+   for a one-hop copy of a `unique` field - the direct read is rejected, the copy is not, which
+   undercuts the branch's own flagship case. So the compiler forbids the raw spelling and permits
+   boxing around it. `IsBorrowed` was removed because it survives a reassignment that makes the
+   local a sole owner - but that is exactly what `MarkPointerRebound` now handles, so restoring
+   `IsBorrowed` BELOW the `PointerRebound` retirement should recover both shapes at no cost.
+
+**Structural note for whoever resumes**: the container-element clause is the one surviving proof
+with ZERO test coverage in either `Test/test_move.cb` or `Test/errors/`, and that is how blocker 2b
+got in. Add a leg for it first.
+
+**Verified good, do not re-derive**: all four new must-still-work legs discriminate individually
+against the round-2 binary; all 8 `expect_error` legs fire individually under mutation; every
+diagnostic states only true things and every remedy compiles and frees correctly EXCEPT the `??=`
+one in blocker 1; `PointerRebound` lives on `NamedVariable` and needs no `--init` round-trip and
+nothing in `ResetForReanalysis`. The `'u'` vs `'UHolder.u'` naming residue is cosmetic and not
+ambiguous - the message is anchored in the offending class's own method, so the bare field name
+cannot point at the wrong field.
+
+**Also filed from this work, and NOT on master** - retrieve from the branch rather than rewriting:
+`internal/issue/p1/delete-of-untracked-pointer-copy-not-diagnosed.md`, recording that
+`Ci* b = c; delete b;` off an owning local is undiagnosed on master too (exit 134). Its "file rather
+than reject" decision was independently verified correct.
+
 ## The live defect
 
 Deleting an interface box the receiver only BORROWS is accepted and double-frees at runtime. It

@@ -245,6 +245,17 @@ The recurring failure mode of this whole family, stated once:
 - **Consolidate on the shared ROOT, not the shared symptom, and say what you did NOT merge.**
 - Issue files can be wrong: one repro did not reproduce as written, another described a fault
   milder than reality. Have the fix agent verify the repro FIRST and report what it saw.
+- **A stale crash SIGNATURE does not mean a healthy area - re-measure the area, not the
+  signature.** `llvm-cannot-select-sign-extend-on-const-array-index` was named for a fatal error
+  that stopped reproducing on every one of 12 probes; re-running the axes it had never enumerated
+  found four live failures in the same area, one of them a compiler SIGSEGV worse than the crash
+  the file was named for. Renaming it to describe the measured behaviour
+  ([[fixed-array-storage-guards-miss-four-axes]]) was worth the churn of updating three
+  references: a slug naming a dead symptom sends the next reader looking for the wrong thing.
+- **"The shape that fed it is rejected now, so there is no live repro" is a hypothesis about
+  every OTHER shape.** It has been written twice in this repo and been wrong twice. Enumerate
+  the axes - decl-init, assignment, compound assignment, global, join, parameter, return, field,
+  element-of-multidim - and only then write it.
 
 ## On the differential corpus sweep
 
@@ -259,6 +270,25 @@ The recurring failure mode of this whole family, stated once:
   prove the shapes you thought of, and the dangerous shapes are the ones you did not.
 - Tell the reviewer to report the scratch worktree path so it can be removed afterward; a
   forgotten one shows up in `git worktree list` later and reads like an abandoned fix branch.
+- **A zero-difference sweep rules out NOTHING when the corpus performs no crossing.** The sweep
+  answers "did any file I already have change behaviour", never "is the new rule correct". On
+  2026-08-02 a funcptr comparator swept 424 files with zero differences and was then shown to
+  hard-error on three programs master runs correctly, each reachable in about three lines. No
+  corpus file crossed a signedness or namespace boundary at a `function<>` argument, so the sweep
+  structurally could not see it. When the change adds a REJECTION, the sweep is the weaker half of
+  the evidence: the stronger half is a TARGETED must-still-work corpus that deliberately crosses
+  every equivalence boundary the new rule could mistake for a difference. Build that first.
+- **A macOS sweep never compiles the Windows-only core.** `core/com.cb` and `core/ui_native/*.cb`
+  are not in the swept set on this host, and they are where some type spellings are dense. A green
+  sweep here says nothing about them - reason about the affected spelling instead of counting files.
+- **A sweep run with `--check` cannot see a codegen crash.** `--check` stops before the backend,
+  so a program that segfaults the compiler under `-o` can pass `--check` with exit 0. Measured
+  2026-08-02: `char[2][8] b = default; b[0] = "hello";` gives `--check` rc 0 and `-o` rc 139 with
+  zero output. If the change touches anything that lowers, sweep with a real compile on at least
+  a sample, or the sweep's green is only about the front end.
+- **Do not pipe the compiler into `head` and then read `$?`** - you get `head`'s exit code, not
+  the compiler's. Two "exit 0" readings in the 2026-08-02 array sweep were this mistake.
+  Redirect to a file, then check `$?`.
 
 ## On concurrent agents sharing a worktree
 
@@ -318,6 +348,20 @@ The recurring failure mode of this whole family, stated once:
   (here, candidate count after the arity filter), or by temporarily reasoning through the filter by
   hand. State the discriminator in the test's comment so the next person can see the leg's
   validity condition.
+- **The two `expect_error` forms have DIFFERENT multi-leg semantics; do not carry one file's rule
+  over to the other.** The SCOPED-BLOCK form (`expect_error("...") { ... }`) supports many legs in
+  one file: each block is armed and checked independently, so a later leg IS self-proving. The
+  BARE-SEMICOLON form is the one that stops at the first error, because the expectation covers the
+  rest of the enclosing scope. On 2026-08-02 the main session told two fix agents "one reject leg
+  per file, a file exits at the first error"; both agents tested it rather than complying, and both
+  disproved it for the scoped-block form by mutating each leg separately and watching the file flip
+  to exit 1 every time. **The agents were right and the instruction was wrong.** The real rule is
+  the mutation test itself: mutate each leg individually and confirm the file fails for that leg.
+  That works for both forms and needs no assumption about file semantics.
+- **Verify a leg fires the NEW guard, not a pre-existing one.** In an area that already rejects
+  several neighbouring shapes, a leg can pass for a reason the diff did not create. One 2026-08-02
+  matrix recorded three cells as "already rejected by a pre-existing guard" and one of them was in
+  fact ACCEPTED and a live double free - recorded on the safe side without being run.
 
 ## On issue files referenced by a commit before it lands
 
@@ -332,3 +376,34 @@ The recurring failure mode of this whole family, stated once:
   named in a commit message is a promise about HISTORY, not about the working tree. Before
   committing, run `git ls-files` on every issue path the message mentions, and add the referenced
   files to the same commit.
+
+## On the baseline binary a severity claim is measured against
+
+- **Pin the baseline to a binary you verified is the merge-base, in the configuration you name.**
+  On 2026-08-02 the main session filed a P1 whose headline was "the compiler SIGSEGVs, exit 139,
+  zero output" for `char[2][8] b = default; b[0] = "hello";`. A review re-measured it against a
+  verified `ca5a02a` Release build: the compiler exits 0, links, and the program RUNS to exit 0
+  printing garbage. It is a SILENT MISCOMPILE, not a crash. The 139 came from a stale binary, and
+  a stale Debug binary in the same tree asserts with rc 134 - three different "baselines", three
+  different severities, one program.
+- The false claim had already been committed into a test-file comment, so the record outlived the
+  measurement. Before writing an exit code into an issue file or a test comment, confirm the binary
+  you measured with: check its mtime against the source, and confirm the commit it was built from.
+- **Severity CATEGORY, not just the number, drives triage.** Crash / silent-wrong-value /
+  hard-error are ranked differently by this queue, and a wrong category sends the next round after
+  the wrong evidence. Here the corrected category was WORSE than the filed one, so the P1 survived
+  on its merits - do not assume a correction always demotes.
+- Corollary: the same construct can be a crash in one containment and a miscompile in another.
+  `u.a[2] = 9` on a `union U { int[4] a; double d; }` really is a compiler SIGSEGV on the same
+  master where the plain local miscompiles silently. "It crashes" and "it does not crash" were both
+  true of neighbouring spellings, which is exactly why the repro must be quoted verbatim with its
+  measurement.
+
+## On a fix that MASKS a pre-existing defect
+
+- **A new rejection can hide a crash rather than fix it; check what the guard is standing in front
+  of.** The 2026-08-02 array-storage branch false-rejected every element write into a union array
+  field. That same false rejection also suppressed a genuine pre-existing compiler SIGSEGV on
+  `u.a[2] = 9`. Removing the false rejection is correct AND re-exposes the crash, so the fix round
+  has to carry both. A guard that turns a crash into a hard error looks like progress in the suite
+  and is not, if the programs it rejects are correct ones.

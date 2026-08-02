@@ -36,7 +36,7 @@ The indexing form was worse - it crashed the compiler:
 extern int main(){ char[8] b = "hello"; printf("c=%c\n", b[0]); return 0; }
 ```
 
-See [[llvm-cannot-select-sign-extend-on-const-array-index]].
+See [[fixed-array-storage-guards-miss-four-axes]] (renamed 2026-08-02).
 
 The ASSIGNMENT axis behaved identically, and survived the decl-init fix by a full review
 round - it was closed only after a later round enumerated it:
