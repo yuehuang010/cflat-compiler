@@ -13989,7 +13989,15 @@ public:
         {
             if (auto intValue = llvm::dyn_cast<llvm::ConstantInt>(initValue))
             {
-                if (intValue->getIntegerType()->getBitWidth() != destinationType->getIntegerBitWidth())
+                // An FP global from an integer literal (`float g = 1;`) - legal for a LOCAL, and
+                // the int path below asks a non-integer type for its bit width.
+                if (destinationType->isFloatingPointTy())
+                {
+                    initValue = llvm::ConstantFP::get(destinationType,
+                        (double)intValue->getSExtValue());
+                }
+                else if (destinationType->isIntegerTy()
+                    && intValue->getIntegerType()->getBitWidth() != destinationType->getIntegerBitWidth())
                 {
                     // Sign-extend, not zero-extend: a negative literal (e.g. the unary-minus
                     // fold that narrows -150 to i16) must widen via its signed value or the
@@ -14027,20 +14035,34 @@ public:
         // externalDecl with no initValue: leave initValue null so the GlobalVariable below is a
         // declaration (external reference), not a definition.
 
-        // A global's initializer is a Constant, so nothing casts it: a pointer initializer on
-        // fixed-array storage lands straight in the module and fails verification with no source
-        // location. Same shape as the pointer -> aggregate reject in CreateCast. The name comes
-        // from the declaration, never from the GlobalVariable (LLVM appends a '.N' on collision).
-        if (initValue != nullptr && destinationType != nullptr
-            && destinationType->isAggregateType() && initValue->getType()->isPointerTy())
+        // A global's initializer is a Constant, so nothing casts it: a single non-aggregate value
+        // on aggregate/vector storage fails module verification with no source location.
+        bool destIsWideStorage = destinationType != nullptr
+            && (destinationType->isAggregateType() || destinationType->isVectorTy());
+        bool srcIsSingleValue = initValue != nullptr
+            && !initValue->getType()->isAggregateType() && !initValue->getType()->isVectorTy();
+        if (destIsWideStorage && srcIsSingleValue && initValue->getType() != destinationType)
         {
+            if (initValue->getType()->isPointerTy())
+                LogError(std::format(
+                    "cannot initialize global {} '{}' from a pointer value or a string literal - "
+                    "CFlat has no C-style character-array initializer. Use a brace list "
+                    "('{{'a','b',...}}'), '= default' to zero it, or declare '{}' as a pointer or a "
+                    "'string' to point at the literal.",
+                    DescribeAggregateStorageShape(destinationType, typeValue.TypeName),
+                    typeValue.VariableName, typeValue.VariableName));
+            std::string declText = typeValue.IsSimd
+                ? std::format("simd<{},{}>", typeValue.TypeName, typeValue.SimdLanes)
+                : typeValue.TypeName;
             LogError(std::format(
-                "cannot initialize global fixed array '{} {}' from a pointer value or a string "
-                "literal - CFlat has no C-style character-array initializer. Use a brace list "
-                "('{{'a','b',...}}'), '= default' to zero it, or declare '{}' as a pointer or a "
-                "'string' to point at the literal.",
-                DescribeAggregateStorageShape(destinationType), typeValue.VariableName,
-                typeValue.VariableName));
+                "cannot initialize global '{} {}' from a single scalar value - it names {}, which "
+                "is not assignable from one value. Use a brace list ('{{...}}') to fill it, or "
+                "'= default' to zero it.",
+                declText, typeValue.VariableName,
+                destinationType->isVectorTy()
+                    ? std::format("simd vector storage with {} lanes",
+                                  llvm::cast<llvm::FixedVectorType>(destinationType)->getNumElements())
+                    : DescribeAggregateStorageShape(destinationType, typeValue.TypeName)));
         }
 
         // Extern globals link to the bare C symbol: a namespaced declaration like
@@ -14564,22 +14586,27 @@ public:
     }
 
     /*
-     * Structural description of an aggregate storage type for a diagnostic: the dimension list of
-     * a fixed array ("T[2][8]"), or "a struct value" for anything else. Deliberately does not
-     * invent a CFlat element-type name - an LLVM type does not carry one (i8 is char, bool and i8
-     * alike), and a diagnostic must not state something it cannot know.
+     * Noun phrase describing aggregate storage for a diagnostic. Callers that know the CFlat
+     * element-type name pass it and get "fixed array 'int[2][8]'". Where no name is available an
+     * LLVM type cannot supply one (i8 is char and bool alike), so the phrase says the dimensions
+     * in words rather than printing a placeholder letter that would read as a real type name.
+     * The name must come from the declaration, never from a lowered artifact whose symbol may
+     * carry an LLVM '.N' collision suffix.
      */
-    static std::string DescribeAggregateStorageShape(llvm::Type* type)
+    static std::string DescribeAggregateStorageShape(llvm::Type* type,
+                                                     const std::string& elementTypeName = "")
     {
         if (!llvm::isa_and_nonnull<llvm::ArrayType>(type))
-            return "a struct value";
+            return "struct storage";
         std::string dims;
         while (auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(type))
         {
             dims += std::format("[{}]", arrTy->getNumElements());
             type = arrTy->getElementType();
         }
-        return "T" + dims;
+        if (!elementTypeName.empty())
+            return std::format("fixed array '{}{}'", elementTypeName, dims);
+        return std::format("fixed-array storage with dimensions {}", dims);
     }
 
     llvm::Value* CreateCast(llvm::Value* value, llvm::Type* destType, bool isSigned = false)
@@ -14667,15 +14694,15 @@ public:
         {
             if (srcType->isPointerTy())
                 LogError(std::format(
-                    "cannot store a pointer value into fixed-array storage '{}' - a fixed array is "
-                    "not assignable from a pointer or a string literal. Assign its elements "
-                    "individually, or declare the destination as a pointer 'T*' or an array view "
-                    "'T[]' to borrow the source instead of copying it.",
+                    "cannot store a pointer value into {} - a fixed array is not assignable from a "
+                    "pointer or a string literal. Assign its elements individually, or declare the "
+                    "destination as a pointer 'T*' or an array view 'T[]' to borrow the source "
+                    "instead of copying it.",
                     DescribeAggregateStorageShape(destType)));
             LogError(std::format(
-                "cannot store a scalar value into aggregate storage '{}' - a fixed array or struct "
-                "is not assignable from a single value. Use '= default' to zero it, a brace list to "
-                "fill it, or assign its elements or fields individually.",
+                "cannot store a single scalar value into {} - a fixed array or struct is not "
+                "assignable from one value. Use '= default' to zero it, a brace list to fill it, "
+                "or assign its elements or fields individually.",
                 DescribeAggregateStorageShape(destType)));
             return value;
         }

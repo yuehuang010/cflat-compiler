@@ -1,16 +1,23 @@
 // Assigning to a ROW of a multidimensional fixed array. Indexing strips the outer
 // dimension, so the whole-array-assignment guard (which keys on the LHS naming a
 // whole T[N] variable) never saw this receiver and the store emitted an invalid
-// `ptr` -> `[N x T]` cast. With a STRING LITERAL source that cast folded into a
-// ConstantExpr the verifier does not check and CRASHED the compiler (SIGSEGV, exit
-// 139, no diagnostic at all); with an array source it failed module verification
-// with no source location. Both are rejected at the assignment site now.
+// `ptr` -> `[N x T]` cast. With an ARRAY source it failed module verification with no
+// source location. With a STRING LITERAL source the cast folded into a ConstantExpr the
+// verifier does not check, and the outcome on ca5a02a splits on whether a CONSTANT-index
+// element read of the row follows the assignment:
+//   b[0] = "hello"; printf("%c", b[0][1]);  -> compiler SIGSEGV, exit 139, no diagnostic
+//   b[0] = "hello"; printf("%s", b[0]);     -> compiles and runs, printing garbage bytes
+//   b[0] = "hello";                          -> compiles silently
+// A RUNTIME index (b[0][argc]) also compiles. A silent wrong value is the worse of the
+// two, and the crash is real; both are rejected at the assignment site now. The legs
+// below use the constant-index spelling that crashed.
 extern int main()
 {
     // Literal source, 2-D receiver - this was the compiler SIGSEGV.
     expect_error("cannot assign to 'b[0]' as a whole") {
         char[2][8] b = default;
         b[0] = "hello";
+        printf("c=%c\n", b[0][1]);
     }
 
     // Array source, 2-D receiver - this was "Invalid bitcast ptr -> [8 x i8]".
@@ -24,6 +31,7 @@ extern int main()
     expect_error("cannot assign to 'e[0][1]' as a whole") {
         char[2][2][8] e = default;
         e[0][1] = "hello";
+        printf("c=%c\n", e[0][1][2]);
     }
 
     // Not char-specific: an int element type reaches the same store.

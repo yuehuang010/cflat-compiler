@@ -2707,6 +2707,24 @@ const int kGRows = 9;
 const int kGCols = 9;
 int[kGRows * kGCols] gConstExprArr = default;
 int[kGRows] gConstNameArr = default;
+// '= nullptr' on GLOBAL fixed-array storage zero-fills it, exactly like '= default'.
+// The pointer-initializer reject must not swallow a null constant.
+int[4] gNullArr = nullptr;
+char[8] gNullBuf = nullptr;
+using GNullBuf = char[8];
+GNullBuf gNullAlias = nullptr;
+
+// Union with an ARRAY arm. Writing one ELEMENT of a union's array field targets that
+// element's slot; the whole FIELD type must not be used as the store type or the write
+// splats the array's full width (and, on an int arm, crashed the compiler).
+union ByteInt { char[8] bytes; int[2] words; };
+union RowUnion { char[2][8] rows; int tag; };
+
+// An FP global from an INTEGER literal - legal for a local, but the global path asked a
+// non-integer type for its bit width and emitted a mismatched initializer (module
+// verification failure, no source location).
+float gFloatFromInt = 1;
+double gDoubleFromInt = 2;
 
 // The two supported stand-ins for a by-value fixed-array return, named by the reject in
 // Test/errors/err_fixed_array_byval_return.cb: wrap the array in a struct, or fill a
@@ -2723,6 +2741,13 @@ ArrayRetBox makeArrayRetBox()
 void fillArrayOut(int* out)
 {
     out[0] = 5; out[1] = 6; out[2] = 10;
+}
+
+// Element write into a union's array field THROUGH A POINTER: the receiver is still an
+// indexed slot, not the whole field.
+void pokeByteUnion(ByteInt* u)
+{
+    u->bytes[3] = (char)67;
 }
 
 bool testFixedArrays()
@@ -2934,6 +2959,49 @@ bool testFixedArrays()
     int[3] outBuf = default;
     fillArrayOut(outBuf);
     result &= Test("fixed_return_out_param", outBuf[0] + outBuf[2], 15);
+
+    // '= nullptr' on fixed-array storage zero-fills it, local and global alike. The
+    // pointer-initializer reject keys on a pointer VALUE and must exclude a null constant.
+    char[8] nb = nullptr;
+    result &= Test("fixed_null_init_local_zero", (int)nb[0], 0);
+    nb[0] = (char)65;
+    result &= Test("fixed_null_init_local_writable", (int)nb[0], 65);
+    int[4] ni = nullptr;
+    result &= Test("fixed_null_init_local_int", ni[3], 0);
+    result &= Test("fixed_null_init_global_int", gNullArr[2], 0);
+    result &= Test("fixed_null_init_global_char", (int)gNullBuf[7], 0);
+    result &= Test("fixed_null_init_global_alias", (int)gNullAlias[0], 0);
+    gNullArr[1] = 44;
+    result &= Test("fixed_null_init_global_writable", gNullArr[1], 44);
+
+    // Element write into a UNION's array field. The whole field type must not be the store
+    // type: it wrote the array's full width at the field's base and ignored the index,
+    // overrunning the union on the char arm and crashing the compiler on the int arm.
+    ByteInt bu = default;
+    bu.bytes[0] = (char)65;
+    bu.bytes[1] = (char)66;
+    result &= Test("union_array_elem0", (int)bu.bytes[0], 65);
+    result &= Test("union_array_elem1", (int)bu.bytes[1], 66);
+    // The index must be honoured: element 2 was never written, so it stays zero.
+    result &= Test("union_array_untouched_slot", (int)bu.bytes[2], 0);
+    pokeByteUnion(&bu);
+    result &= Test("union_array_elem_via_pointer", (int)bu.bytes[3], 67);
+    // The other arm aliases the same bytes: 65 | (66 << 8) reads back as 16961.
+    result &= Test("union_array_other_arm_aliases", bu.words[0] & 0xFFFF, 16961);
+    // Non-char element arm: an int[N] union field element write (this was the SIGSEGV).
+    ByteInt wu = default;
+    wu.words[1] = 9;
+    result &= Test("union_array_int_elem", wu.words[1], 9);
+    result &= Test("union_array_int_slot0_zero", wu.words[0], 0);
+    // A 2-D union arm: two subscripts still land on one element.
+    RowUnion ru = default;
+    ru.rows[1][2] = (char)88;
+    result &= Test("union_array_2d_elem", (int)ru.rows[1][2], 88);
+    result &= Test("union_array_2d_untouched", (int)ru.rows[0][0], 0);
+
+    // FP global initialized from an integer literal: the value must survive, not just compile.
+    result &= Test("global_float_from_int_literal", (int)(gFloatFromInt * 10.0), 10);
+    result &= Test("global_double_from_int_literal", (int)(gDoubleFromInt * 10.0), 20);
 
     return result;
 }

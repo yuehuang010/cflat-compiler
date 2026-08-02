@@ -1,7 +1,9 @@
 // The ASSIGNMENT axis of the C string-literal idiom, distinct from the decl-init axis in
 // err_fixed_array_from_string_literal.cb. This spelling survived the decl-init fix: it
-// compiled and printed garbage, and the indexed-read form killed the compiler with
-// "LLVM fatal error: Cannot select: i64 = sign_extend" at exit 134.
+// compiled and printed garbage, and the indexed-read form killed the compiler. The exact
+// failure text is build-dependent and was NOT reproducible on ca5a02a Release (see the
+// 2026-08-02 correction in internal/issue/p1/llvm-cannot-select-sign-extend-on-const-array-index.md);
+// what reproduces there is a bare SIGSEGV at exit 139 with no output.
 expect_error("CFlat has no C-style character-array assignment") {
     void f() { char[8] b = default; b = "hello"; }
 }

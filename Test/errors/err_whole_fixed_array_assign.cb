@@ -6,3 +6,11 @@
 expect_error("assignment to a whole fixed array 'int[3]' is not supported") {
     void f() { int[3] a = default; int[3] b = default; b = a; }
 }
+
+// A union's ARRAY ARM is still a whole fixed array, so the whole-array reject covers it.
+// The remedy must name the receiver AS WRITTEN ('u.a'), not the base variable 'u' - an
+// element write into a union array field is legal and is a value leg in test_basic.cb.
+union WholeArmUnion { int[3] a; char[12] b; };
+expect_error("assign its elements ('u.a[i] = ...')") {
+    void g() { WholeArmUnion u = default; WholeArmUnion v = default; u.a = v.a; }
+}

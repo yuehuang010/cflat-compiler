@@ -34,6 +34,33 @@ In function: main ===
 The non-indexed form of each (`printf("%s", b)`) did not crash - it compiled, ran, exit 0,
 and printed garbage. See [[char-array-from-string-literal-has-no-spelling]].
 
+> **Correction (2026-08-02, `fix/array-storage` round 2).** Re-measured on the verified
+> `ca5a02a` Release binary. Two changes to the record:
+>
+> 1. **The exit-134 fatal-error TEXT above could not be reproduced in any spelling.** Every
+>    crashing program measured aborts with a bare **SIGSEGV, exit 139, zero output** - no
+>    `Cannot select` line, no `LLVM fatal error` banner. The `sign_extend` node is therefore
+>    NOT confirmed as the specific failing node on `ca5a02a`; treat the quoted text as
+>    historical (it was recorded against `4097959`, a different build). Record the live
+>    symptom as "SIGSEGV exit 139 on a row assign followed by a CONSTANT-index element read".
+> 2. **Both repros listed above are now front-end rejected on `ca5a02a`** by the whole-array
+>    assignment and decl-init guards, so neither is live. The spelling that IS live is the
+>    ROW receiver, which those guards cannot see:
+>
+>    ```cflat
+>    // exit 139 on ca5a02a - closed on fix/array-storage
+>    extern int main(){ char[2][8] b = default; b[0] = "hello"; printf("c=%c\n", b[0][1]); return 0; }
+>    extern int main(){ char[2][2][8] e = default; e[0][1] = "hello"; printf("c=%c\n", e[0][1][2]); return 0; }
+>    ```
+>
+>    The trailing read is the discriminator, and it must use a CONSTANT index. `printf("%s", b[0])`
+>    (whole-row read) and `b[0][argc]` (runtime index) both compile rc 0 and MISCOMPILE instead.
+>    Compiling to IR only (`-l`, no object) also succeeds - the crash is in the backend.
+>
+> Lesson: quote repros verbatim. Substituting `%s` for `%c` in the trailing read turns this
+> crash into a silent wrong value, and a reviewer who made that substitution concluded the
+> whole premise did not reproduce.
+
 ## Root cause
 
 Not fully diagnosed; only the front-end shapes that FEED it are closed. Both spellings stored
@@ -51,6 +78,13 @@ on `fix/array-shape`. That is NOT the same as the unselectable node being unreac
 whether any other spelling can still fold a Constant into array storage has not been
 enumerated, and the last time that distinction was glossed over it produced the correction
 at the top of this file.
+
+On `fix/array-storage` the ROW-receiver axis (item 2 of the corrections above) is closed as
+well, by a reject in `derefAssign`, plus a `CreateCast` backstop that refuses any
+non-aggregate -> aggregate conversion. The UNION array-field axis turned out not to need a
+reject at all: it was a stale store type (the whole FIELD type used for an indexed slot) and
+is now lowered correctly. The file stays open because the backend node itself is still
+undiagnosed and no exhaustive enumeration of Constant-into-array-storage folds exists.
 
 ## Fix direction
 

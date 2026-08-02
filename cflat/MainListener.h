@@ -9631,10 +9631,12 @@ public:
                      * Global counterpart of the local `T[N] b = <pointer>` reject below. A global's
                      * initializer is a Constant, so the bad `ptr` -> `[N x T]` conversion is never
                      * cast: it lands in the module and fails verification with no source location.
-                     * Brace lists and `= default` produce an aggregate Constant and are unaffected.
+                     * Brace lists and `= default` produce an aggregate Constant and are unaffected,
+                     * and `= nullptr` is coerced to a zeroinitializer by CreateGlobalVariable.
                      */
+                    bool initIsNull = constant != nullptr && constant->isNullValue();
                     if (!externDeclOnly && typeAndValue.ConstArraySize > 0
-                        && !typeAndValue.IsArrayView && !typeAndValue.IsSimd
+                        && !typeAndValue.IsArrayView && !typeAndValue.IsSimd && !initIsNull
                         && right != nullptr && right->getType()->isPointerTy()
                         && llvm::isa_and_nonnull<llvm::ArrayType>(compiler->GetType(typeAndValue)))
                     {
@@ -9642,11 +9644,11 @@ public:
                             && compiler->IsStringLiteralConstant(constant);
                         if (fromStringLiteral)
                             LogErrorContext(direct, std::format(
-                                "cannot initialize global fixed array '{}' from a string literal - "
+                                "cannot initialize global fixed array '{} {}' from a string literal - "
                                 "CFlat has no C-style character-array initializer. Use 'char* {} = "
                                 "...' to point at the literal, 'string {} = ...' for a managed "
                                 "string, or '{} {} = {{'a','b',...}}' to spell the bytes out.",
-                                DescribeArrayShape(typeAndValue), name, name,
+                                DescribeArrayShape(typeAndValue), name, name, name,
                                 DescribeArrayShape(typeAndValue), name));
                         else
                             LogErrorContext(direct, std::format(
@@ -9869,9 +9871,8 @@ public:
                          * declared type allocates its own storage, so it cannot alias `a`. The RHS
                          * has already decayed to a pointer to its first element, so the plain
                          * store below would cast that pointer to the `[N x T]` aggregate - the
-                         * invalid bitcast this branch exists to replace. A NON-array-shaped source
-                         * (a scalar pointer, `new T()`) is deliberately left to the pre-existing
-                         * checks above, whose diagnostics are the accurate ones for it.
+                         * invalid bitcast this branch exists to replace. `= nullptr` zeroes the
+                         * storage; any other pointer-shaped source is rejected by the last arm.
                          */
                         auto* destArrTy = llvm::dyn_cast_or_null<llvm::ArrayType>(
                             compiler->GetTypeFromStorage(alloc));
@@ -9879,7 +9880,14 @@ public:
                             && typeAndValue.ConstArraySize > 0
                             && right->getType()->isPointerTy();
                         auto* rightConst = llvm::dyn_cast<llvm::Constant>(right);
-                        if (destIsFixedArray && rightConst != nullptr
+                        if (destIsFixedArray && rightConst != nullptr && rightConst->isNullValue())
+                        {
+                            // `T[N] b = nullptr;` zeroes the storage. Emit the zeroinitializer
+                            // directly rather than letting a null pointer fold through a cast.
+                            compiler->builder->CreateStore(
+                                llvm::Constant::getNullValue(destArrTy), alloc);
+                        }
+                        else if (destIsFixedArray && rightConst != nullptr
                             && compiler->IsStringLiteralConstant(rightConst))
                         {
                             // `char[8] b = "hello";` - the C idiom. A string literal is an
@@ -9903,19 +9911,24 @@ public:
                         else if (destIsFixedArray)
                         {
                             /*
-                             * Pointer-shaped initializer that is neither a string literal nor an
-                             * array-shaped source: a '?:' or '??' JOIN is the reachable spelling.
-                             * A join has no source NamedVariable, so it carries no array shape for
-                             * EmitFixedArrayValueCopy to size a copy from, and the plain store
-                             * below would cast the joined pointer to '[N x T]'.
+                             * Pointer-shaped initializer that is neither a string literal, a null,
+                             * nor an array-shaped source: a plain `T*` expression, or a '?:' / '??'
+                             * join. Neither carries an array length for EmitFixedArrayValueCopy to
+                             * size a copy from, and the store below would cast it to '[N x T]'.
                              */
+                            std::string srcText = initializer != nullptr ? initializer->getText()
+                                                                         : std::string();
+                            bool isJoin = srcText.find('?') != std::string::npos;
                             LogErrorContext(direct, std::format(
                                 "cannot initialize fixed array '{}' from a pointer-valued expression "
-                                "- a '?:' or '??' join yields a pointer, which carries no array "
-                                "length to copy. Declare '{}' as a pointer or an array view ('T[]') "
-                                "to borrow the chosen operand, or select between the arrays and copy "
-                                "the elements in a branch.",
-                                DescribeArrayShape(typeAndValue), name));
+                                "- a pointer carries no array length, so there is nothing to size a "
+                                "copy from.{} Declare '{}' as a pointer or an array view ('T[]') to "
+                                "borrow the source instead of copying it, or copy the elements into "
+                                "'{}' individually.",
+                                DescribeArrayShape(typeAndValue),
+                                isJoin ? " A '?:' or '??' join yields a pointer for this reason too."
+                                       : "",
+                                name, name));
                         }
                         else
                         {
@@ -11801,8 +11814,10 @@ public:
                 && namedVar.BaseType != nullptr && llvm::isa<llvm::ArrayType>(namedVar.BaseType))
             {
                 std::string rhsText = assignCtx != nullptr ? assignCtx->getText() : std::string();
-                std::string lhsName = namedVar.CallerName.empty() ? unaryCtx->getText()
-                                                                  : namedVar.CallerName;
+                // The LHS as written, not CallerName - on a field receiver ('u.a') CallerName is
+                // just the base variable, and the suggested remedy would name the wrong thing.
+                std::string lhsName = unaryCtx != nullptr && !unaryCtx->getText().empty()
+                    ? unaryCtx->getText() : namedVar.CallerName;
                 if (!rhsText.empty() && rhsText.front() == '"')
                     LogErrorContext(unaryCtx, std::format(
                         "cannot assign a string literal to fixed array '{}' - CFlat has no "
@@ -11813,10 +11828,10 @@ public:
                 else
                     LogErrorContext(unaryCtx, std::format(
                         "assignment to a whole fixed array '{}' is not supported - assign its "
-                        "elements ('{}[i] = ...'), or initialise it at its declaration "
-                        "('{} {} = <array>;'), which copies.",
+                        "elements ('{}[i] = ...'), or copy at the DECLARATION instead "
+                        "('{} dst = <source>;'), which is supported.",
                         DescribeArrayShape(namedVar.TypeAndValue), lhsName,
-                        DescribeArrayShape(namedVar.TypeAndValue), lhsName));
+                        DescribeArrayShape(namedVar.TypeAndValue)));
             }
 
             // The left side must resolve to an addressable storage location. A null Storage
@@ -11900,22 +11915,25 @@ public:
                  * rejected above with its own wording; this catches every other receiver, of which
                  * a ROW of a multidimensional array (`b[0] = ...`) is the reachable one - indexing
                  * strips the outer dimension, so the whole-array guard never sees it. A string
-                 * literal source here folded the bad cast into a ConstantExpr and crashed the
-                 * compiler in SelectionDAG (SIGSEGV, no diagnostic).
+                 * literal source here folded the bad cast into a ConstantExpr, which miscompiled
+                 * to garbage or crashed the compiler in SelectionDAG on a later indexed read.
+                 * The type is the INDEXED storage's (the GEP's), never the union FIELD's - a
+                 * subscripted union field targets one element, not the whole field.
                  */
-                auto* rowDestTy = namedVar.UnionFieldType ? namedVar.UnionFieldType
-                    : (isDerefStorage() ? namedVar.BaseType
-                                        : compiler->GetTypeFromStorage(destination));
+                auto* rowDestTy = isDerefStorage() ? namedVar.BaseType
+                                                   : compiler->GetTypeFromStorage(destination);
                 if (llvm::isa_and_nonnull<llvm::ArrayType>(rowDestTy)
                     && val != nullptr && val->getType() != rowDestTy)
                 {
                     std::string lhsText = unaryCtx != nullptr ? unaryCtx->getText() : std::string("<lhs>");
                     LogErrorContext(unaryCtx, std::format(
-                        "cannot assign to '{}' as a whole - it names fixed-array storage '{}', and "
-                        "CFlat has no whole-array assignment. Copy the elements ('{}[i] = ...'), or "
-                        "bind an array view ('T[] row = {};') and write through that.",
-                        lhsText, LLVMBackend::DescribeAggregateStorageShape(rowDestTy), lhsText,
-                        lhsText));
+                        "cannot assign to '{}' as a whole - it names {}, and CFlat has no "
+                        "whole-array assignment. Copy the elements ('{}[i] = ...'), or bind an "
+                        "array view ('T[] row = {};') and write through that.",
+                        lhsText,
+                        LLVMBackend::DescribeAggregateStorageShape(
+                            rowDestTy, namedVar.TypeAndValue.TypeName),
+                        lhsText, lhsText));
                 }
 
                 if (namedVar.UnionFieldType)
@@ -20549,6 +20567,9 @@ public:
                             namedVar.Storage = elemPtr;
                             namedVar.BaseType = arrTy->getElementType();
                             namedVar.TypeAndValue.ConstArraySize = 0;
+                            // The GEP above already resolved the union reinterpret; leaving the
+                            // whole FIELD type set would load/store the element as the whole array.
+                            namedVar.UnionFieldType = nullptr;
                         }
                         else if (namedVar.TypeAndValue.Pointer)
                         {

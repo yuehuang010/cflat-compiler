@@ -2,10 +2,15 @@
 // mis-lowered: the '[N]' on the return type was dropped silently, so 'char[8] mk()'
 // built a function returning a single 'char', and 'return b;' then emitted 'ret ptr'
 // against an i8 return type - "Function return type does not match operand type of
-// return inst!", no source location. Every spelling probed (1-D, 2-D, alias return
-// type, string-literal body, never-called function) failed the same way, so the
-// capability was absent, not accidental. Rejected at the definition, which also
-// covers a function that is never called. Both named remedies (a struct wrapping the
+// return inst!", no source location. No probed spelling that actually returned an
+// ARRAY worked (1-D, 2-D, alias return type, method, namespaced, array-of-struct,
+// never-called, generic over an array alias). The one spelling that did compile and
+// run - 'char[8] mk() { return 'a'; }' - only worked BECAUSE the '[8]' was dropped:
+// the body returns a single char, which matches the silently-narrowed type. So the
+// capability is absent, not accidental. Array-VIEW returns ('T[]') and returns of a
+// struct CONTAINING an array are unaffected and still work. Rejected at the
+// definition, which also covers a function that is never called. Both named remedies
+// (a struct wrapping the
 // array, and a 'T* out' out-parameter) are exercised in test_basic.cb.
 
 expect_error("function 'mk1' cannot return the fixed array 'char[N]' by value") {

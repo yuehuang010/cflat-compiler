@@ -5,8 +5,10 @@
 // "Global variable initializer type does not match global variable type!" and NO
 // source location. Working global forms (brace list, partial brace, '= default',
 // const-expr size) are covered by value legs in test_basic.cb's testFixedArrays.
+// '= nullptr' is NOT one of these: it is coerced to a zeroinitializer and stays legal
+// (value legs fixed_null_init_global_* in test_basic.cb).
 
-expect_error("cannot initialize global fixed array 'char[8]' from a string literal") {
+expect_error("cannot initialize global fixed array 'char[8] gLit' from a string literal") {
     char[8] gLit = "hello";
 }
 
