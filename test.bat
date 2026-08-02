@@ -153,10 +153,13 @@ del /q "%OUT%\results\*.log" 2>nul
 
 REM Warm the compiler cache (linker paths + core-library bitcode) once up front so the
 REM parallel worker compiles load bitcode instead of re-parsing the stdlib closure each time.
-REM Use the compiler under test; --init must succeed - a failure is a real regression.
-"%COMPILER%" --init --nologo >"%OUT%\results\init.log" 2>&1
+REM Use the compiler under test; --init-local must succeed - a failure is a real regression.
+REM --init-local (not --init) so the cache lands in <exe dir>\.cflat: two worktrees or a
+REM Debug/Release pair testing concurrently then cannot collide on one %USERPROFILE%\.cflat,
+REM and the suite never overwrites the developer's own per-user cache.
+"%COMPILER%" --init-local --nologo >"%OUT%\results\init.log" 2>&1
 if errorlevel 1 (
-    echo FAILED: cflat.exe --init
+    echo FAILED: cflat.exe --init-local
     type "%OUT%\results\init.log"
     exit /b 1
 )

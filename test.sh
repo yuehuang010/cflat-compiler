@@ -11,7 +11,7 @@
 #   ./test.sh Debug      # Debug
 #   ./test.sh -j 8       # cap parallelism (default: nproc)
 #
-# Like test.bat, after the cold pass this runs `cflat --init` and re-runs the
+# Like test.bat, after the cold pass this runs `cflat --init-local` and re-runs the
 # negative tests against the warm bitcode cache. --init reconstructs compiler
 # state from a hand-written serializer (a second code path), so a field the
 # analysis reads but that is missing from the serializer is silently dropped on a
@@ -175,14 +175,17 @@ fi
 printf '%s' "$cb_list"  | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_cb "$@"' _ {}
 printf '%s' "$err_list" | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_err "$@"' _ {}
 
-# Warm-cache pass: populate the --init bitcode cache, then re-run the negative
+# Warm-cache pass: populate the --init-local bitcode cache, then re-run the negative
 # tests against it. This exercises the serializer round-trip that test.bat covers
 # on Windows but test.sh previously never did. See
 # internal/issue/init-cache-state-drop-invisible-on-posix.md.
-if "$CFLAT" --init >"$RES/_init.log" 2>&1; then
+# --init-local (not --init) so the cache lands in <exe dir>/.cflat: two worktrees or a
+# Debug/Release pair testing concurrently then cannot collide on one ~/.cflat, and the
+# suite never overwrites the developer's own per-user cache.
+if "$CFLAT" --init-local >"$RES/_init.log" 2>&1; then
   printf '%s' "$err_list" | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_err_warm "$@"' _ {}
 else
-  echo "FAIL: cflat --init crashed (warm-cache pass could not run)"
+  echo "FAIL: cflat --init-local crashed (warm-cache pass could not run)"
   echo "FAIL" >"$RES/_init.result"
   tail -n 8 "$RES/_init.log" 2>/dev/null
 fi

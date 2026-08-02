@@ -376,9 +376,10 @@ if exist "!NUGETROOT!\microsoft.windowsappsdk.winui\1.8.260224000" (
 
 REM Warm the compiler cache (linker paths + core-library bitcode) once up front so the
 REM parallel worker compiles load bitcode instead of re-parsing the stdlib closure each time.
-"%CFLAT%" --init --nologo >"%RESDIR%\init.log" 2>&1
+REM --init-local so a worktree/config pair cannot collide on one %USERPROFILE%\.cflat.
+"%CFLAT%" --init-local --nologo >"%RESDIR%\init.log" 2>&1
 if errorlevel 1 (
-    echo FAILED: cflat.exe --init
+    echo FAILED: cflat.exe --init-local
     type "%RESDIR%\init.log"
     exit /b 1
 )

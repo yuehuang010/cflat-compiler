@@ -5654,8 +5654,10 @@ private:
         return true;
     }
 
-    static std::string GetCflatCacheDir();
-    // Records the running cflat.exe's full path to %USERPROFILE%\.cflat\compiler_path.txt
+    // GetCflatCacheDir() / GetUserCacheDir() / SetCacheDirOverride() are declared in the
+    // public section below (near RunInit) since main.cpp needs to call them for
+    // --init/--init-local/--init-clear/--init-clear-local.
+    // Records the running cflat.exe's full path to <cache dir>\compiler_path.txt
     // so the VS Code extension can auto-detect the compiler without manual configuration.
     static bool WriteCompilerPathToCache();
     static LinkerPaths DiscoverLinkerPaths(const std::string& arch, const std::string& runtimeDir, bool verbose = false);
@@ -21459,13 +21461,33 @@ public:
     bool Analyze(const std::string& filePath, const std::vector<std::string>& importDirs, const std::string& runtimeDirPath);
     void ResetForReanalysis();
 
+    /*
+        Resolution order: (1) process override set via SetCacheDirOverride (used by
+        --init-local), (2) CFLAT_CACHE_DIR env var, (3) <exeDir>/.cflat if it exists as a
+        directory, (4) the per-user cache (GetUserCacheDir). Resolved once per process into
+        a function-local static memo.
+    */
+    static std::string GetCflatCacheDir();
+    // Which rule GetCflatCacheDir() matched ("override", "CFLAT_CACHE_DIR", "local",
+    // "per-user"), for -v reporting. Empty until GetCflatCacheDir() has been called once.
+    static std::string GetCflatCacheDirRule();
+    // The per-user cache root (%USERPROFILE%\.cflat / ~/.cflat), independent of any
+    // process override or local cache. Shared by the resolver and --init-clear.
+    static std::string GetUserCacheDir();
+    // Process-lifetime override for GetCflatCacheDir(), used by --init-local. Must be set
+    // before the first GetCflatCacheDir() call in the process (resolution memoizes once).
+    static void SetCacheDirOverride(std::string dir);
+
     // Populate %USERPROFILE%\.cflat\ with cached linker paths for x64 and x86.
     // Prints discovered paths to stdout. Returns false if the cache dir cannot be created.
     static bool RunInit(const std::string& runtimeDir, bool verbose);
 
-    // Delete the whole %USERPROFILE%\.cflat / ~/.cflat cache tree (inverse of RunInit).
-    // Prints what was removed. Returns false on a real failure; a missing cache is success.
-    static bool RunInitClear(bool verbose);
+    // Delete the compiler cache tree rooted at `root` (inverse of RunInit for that root).
+    // Caller supplies the exact target - this never calls GetCflatCacheDir() itself, so
+    // --init-clear (both roots) and --init-clear-local (local root only) stay unambiguous.
+    // `label` (e.g. "local", "per-user") is used only in the printed status lines.
+    // Prints what was removed. Returns false on a real failure; a missing root is success.
+    static bool ClearCacheDir(const std::string& root, bool verbose, const std::string& label);
 
 #if defined(__APPLE__)
     // Harvest libSystem's reexported symbols from the live dyld shared cache and

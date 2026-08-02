@@ -501,6 +501,9 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     if (!noCache_ && !runMode_ && !runtimeDir.empty() && !skipRuntimeImport)
     {
         std::string bcCacheDir = GetRuntimeBitcodeDir(runtimeDir);
+        if (verbose)
+            std::cout << std::format("[verbose] cache dir: {} (rule: {})\n",
+                                     GetCflatCacheDir(), GetCflatCacheDirRule());
         if (!bcCacheDir.empty())
         {
             llvm::TimeTraceScope bcScope("RuntimeImport", "core.bc");
@@ -2813,7 +2816,7 @@ void LLVMBackend::ScanCrossThreadEscapes(CFlatParser::CompilationUnitContext* cu
 
 // ---- Linker path cache helpers ----
 
-std::string LLVMBackend::GetCflatCacheDir()
+std::string LLVMBackend::GetUserCacheDir()
 {
 #if defined(_WIN32)
     char buf[260] = {};
@@ -2828,53 +2831,142 @@ std::string LLVMBackend::GetCflatCacheDir()
 #endif
 }
 
-/*
-    --init-clear: remove the entire compiler cache tree so the next --init rebuilds it from
-    scratch. Everything cached lives under the one root (core bitcode, compiler_path.txt,
-    linker_paths_*.json, the synthesized import libs, the cheaders/ C-header cache, and the
-    macOS macsdk stubs), so a single recursive delete covers it. The target is exactly whatever
-    GetCflatCacheDir returns, i.e. where --init writes; it is not canonicalised. The name/parent
-    checks below cannot fail today and exist to catch a future change to GetCflatCacheDir.
-*/
-bool LLVMBackend::RunInitClear(bool verbose)
+// Process-lifetime storage for SetCacheDirOverride(); a function-local static so it survives
+// independent of GetCflatCacheDir()'s own memo.
+static std::string& CacheDirOverrideStorage()
 {
-    std::string cacheDir = GetCflatCacheDir();
-    if (cacheDir.empty())
-    {
-        std::cout << "Error: could not determine cache directory (HOME/USERPROFILE not set).\n";
+    static std::string override_;
+    return override_;
+}
+
+void LLVMBackend::SetCacheDirOverride(std::string dir)
+{
+    CacheDirOverrideStorage() = std::move(dir);
+}
+
+// Which resolution rule GetCflatCacheDir() matched, for the -v report. Filled in alongside
+// the memo below; empty until the first GetCflatCacheDir() call.
+static std::string& CacheDirRuleStorage()
+{
+    static std::string rule;
+    return rule;
+}
+
+std::string LLVMBackend::GetCflatCacheDirRule()
+{
+    return CacheDirRuleStorage();
+}
+
+/*
+    A local <exeDir>/.cflat only counts when it actually looks populated: an empty or partial
+    dir (interrupted or permission-failed --init-local) must not hijack a good per-user cache -
+    that would silently cold-start the core bitcode and, on macOS, drop the libSystem stub so
+    self-contained linking falls back to the Xcode SDK.
+*/
+static bool LocalCacheLooksPopulated(const std::filesystem::path& localCache)
+{
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(localCache / "compiler_path.txt", ec) || ec)
         return false;
+    ec.clear();
+    if (!std::filesystem::is_directory(localCache / "runtime", ec) || ec)
+        return false;
+    return true;
+}
+
+/*
+    Resolution order (see internal/plan/init-local-cache.md):
+      1. Process override - set by --init-local for its own run.
+      2. CFLAT_CACHE_DIR env var, if set and non-empty.
+      3. <exeDir>/.cflat, if it exists as a directory AND looks populated - makes --init-local
+         sticky: once created, every later compile from that exe picks it up with no flag.
+      4. The per-user cache (today's behaviour when no local cache exists).
+    Resolved once per process into a function-local static. SetCacheDirOverride() must be
+    called before the first call to this function in the process.
+*/
+std::string LLVMBackend::GetCflatCacheDir()
+{
+    static const std::string memo = []() -> std::string
+    {
+        if (const std::string& override_ = CacheDirOverrideStorage(); !override_.empty())
+        {
+            CacheDirRuleStorage() = "override";
+            return override_;
+        }
+
+        if (const char* envDir = std::getenv("CFLAT_CACHE_DIR"); envDir && *envDir)
+        {
+            CacheDirRuleStorage() = "CFLAT_CACHE_DIR";
+            return std::string(envDir);
+        }
+
+        std::string exeDir = std::filesystem::path(PlatformExePath()).parent_path().string();
+        if (!exeDir.empty())
+        {
+            std::filesystem::path localCache = std::filesystem::path(exeDir) / ".cflat";
+            std::error_code ec;
+            if (std::filesystem::is_directory(localCache, ec) && !ec && LocalCacheLooksPopulated(localCache))
+            {
+                CacheDirRuleStorage() = "local";
+                return localCache.string();
+            }
+        }
+
+        CacheDirRuleStorage() = "per-user";
+        return GetUserCacheDir();
+    }();
+    return memo;
+}
+
+/*
+    Deletes the compiler cache tree rooted at `root`, e.g. via --init-clear / --init-clear-local.
+    Everything cached lives under the one root (core bitcode, compiler_path.txt,
+    linker_paths_*.json, the synthesized import libs, the cheaders/ C-header cache, and the
+    macOS macsdk stubs), so a single recursive delete covers it. The caller supplies `root`
+    directly - this function never resolves it itself, so --init-clear (both roots) and
+    --init-clear-local (local root only) each name their exact target unambiguously. `root` is
+    not canonicalised. The name/parent checks below cannot fail for a root produced by
+    GetUserCacheDir() or <exeDir>/.cflat as they stand today; they exist to catch a future
+    change to either.
+*/
+bool LLVMBackend::ClearCacheDir(const std::string& root, bool verbose, const std::string& label)
+{
+    if (root.empty())
+    {
+        std::cout << std::format("{} cache: (could not determine path)\n", label);
+        return true;
     }
 
-    std::filesystem::path root(cacheDir);
+    std::filesystem::path rootPath(root);
     if (verbose)
-        std::cout << std::format("[verbose] resolved cache directory: {}\n", root.string());
+        std::cout << std::format("[verbose] resolved {} cache directory: {}\n", label, rootPath.string());
 
-    // Defence-in-depth only (see the comment above): GetCflatCacheDir always appends
-    // ".cflat", so neither of these can trip as the code stands today.
-    if (root.filename() != ".cflat")
+    // Defence-in-depth only (see the comment above): a caller-supplied root should always end
+    // in ".cflat", so neither of these can trip as the code stands today.
+    if (rootPath.filename() != ".cflat")
     {
-        std::cout << std::format("Error: refusing to delete '{}': the path does not end in '.cflat'.\n", root.string());
+        std::cout << std::format("Error: refusing to delete '{}': the path does not end in '.cflat'.\n", rootPath.string());
         return false;
     }
-    if (!root.has_parent_path() || root.parent_path() == root || root == root.root_path())
+    if (!rootPath.has_parent_path() || rootPath.parent_path() == rootPath || rootPath == rootPath.root_path())
     {
-        std::cout << std::format("Error: refusing to delete '{}': it has no parent directory or is a filesystem root.\n", root.string());
+        std::cout << std::format("Error: refusing to delete '{}': it has no parent directory or is a filesystem root.\n", rootPath.string());
         return false;
     }
 
     // symlink_status (not status) so a symlinked root is seen as a link, never followed.
     // Check not_found before ec: a missing path reports ENOENT through ec on some libraries.
     std::error_code ec;
-    std::filesystem::file_status st = std::filesystem::symlink_status(root, ec);
+    std::filesystem::file_status st = std::filesystem::symlink_status(rootPath, ec);
     if (st.type() == std::filesystem::file_type::not_found)
     {
-        std::cout << std::format("Cache directory: {}\n", root.string());
-        std::cout << "  Nothing to clear (the cache directory does not exist).\n";
+        std::cout << std::format("{} cache: {}\n", label, rootPath.string());
+        std::cout << std::format("  Not present (no {} cache at {}).\n", label, rootPath.string());
         return true;
     }
     if (ec)
     {
-        std::cout << std::format("Error: could not inspect {}: {}\n", root.string(), ec.message());
+        std::cout << std::format("Error: could not inspect {}: {}\n", rootPath.string(), ec.message());
         return false;
     }
 
@@ -2884,20 +2976,19 @@ bool LLVMBackend::RunInitClear(bool verbose)
     {
         // remove() returns false with ec CLEARED when the path is already gone (a race
         // against symlink_status above); only a set ec is a real failure.
-        if (!std::filesystem::remove(root, ec) && ec)
+        if (!std::filesystem::remove(rootPath, ec) && ec)
         {
-            std::cout << std::format("Error: could not remove symlink {}: {}\n", root.string(), ec.message());
+            std::cout << std::format("Error: could not remove symlink {}: {}\n", rootPath.string(), ec.message());
             return false;
         }
-        std::cout << std::format("Cache directory: {}\n", root.string());
+        std::cout << std::format("{} cache: {}\n", label, rootPath.string());
         std::cout << "  Removed the symlink only; its target tree was left untouched.\n";
-        std::cout << "Run 'cflat --init' to repopulate the cache.\n";
         return true;
     }
 
     if (!std::filesystem::is_directory(st))
     {
-        std::cout << std::format("Error: refusing to delete '{}': it is not a directory.\n", root.string());
+        std::cout << std::format("Error: refusing to delete '{}': it is not a directory.\n", rootPath.string());
         return false;
     }
 
@@ -2912,10 +3003,10 @@ bool LLVMBackend::RunInitClear(bool verbose)
     uintmax_t fileCount = 0, dirCount = 1, linkCount = 0, byteCount = 0;   // dirCount counts root
     std::string blockedPath;
     bool walkIncomplete = false;
-    std::filesystem::recursive_directory_iterator it(root, ec), end;
+    std::filesystem::recursive_directory_iterator it(rootPath, ec), end;
     if (ec)
     {
-        blockedPath = root.string();
+        blockedPath = rootPath.string();
         walkIncomplete = true;
     }
     while (!walkIncomplete && it != end)
@@ -2948,47 +3039,50 @@ bool LLVMBackend::RunInitClear(bool verbose)
     }
     if (walkIncomplete && verbose)
         std::cout << std::format("[verbose] could not fully walk {} (blocked at {}); counts are a lower bound.\n",
-                                 root.string(), blockedPath);
+                                 rootPath.string(), blockedPath);
 
     std::error_code rmEc;
-    std::filesystem::remove_all(root, rmEc);
+    std::filesystem::remove_all(rootPath, rmEc);
     if (rmEc)
     {
         // remove_all deletes what it can before failing, so the cache is likely half gone.
-        std::cout << std::format("Error: could not fully remove {}: {}\n", root.string(), rmEc.message());
+        std::cout << std::format("Error: could not fully remove {}: {}\n", rootPath.string(), rmEc.message());
         if (!blockedPath.empty())
             std::cout << std::format("  Blocked at: {} (check its permissions).\n", blockedPath);
         else
             std::cout << "  The blocking path was not reported by the filesystem; check permissions under the cache directory.\n";
-        std::cout << "  The cache is now PARTIALLY deleted. Run 'cflat --init' to repopulate it either way.\n";
+        std::cout << "  The cache is now PARTIALLY deleted.\n";
         return false;
     }
 
-    std::cout << std::format("Cache directory: {}\n", root.string());
-    std::cout << std::format("  Removed {} file(s) and {} symlink(s) in {} directory(ies), {} bytes total{}.\n",
+    std::cout << std::format("{} cache: {}\n", label, rootPath.string());
+    std::cout << std::format("  Deleted {} file(s) and {} symlink(s) in {} directory(ies), {} bytes total{}.\n",
                              fileCount, linkCount, dirCount, byteCount, walkIncomplete ? " (at least)" : "");
-    std::cout << "Run 'cflat --init' to repopulate the cache (on macOS this also re-harvests the\n";
-    std::cout << "libSystem link stub at macsdk/usr/lib/libSystem.tbd that self-contained linking needs).\n";
     return true;
 }
 
-bool LLVMBackend::WriteCompilerPathToCache()
+// Shared by WriteCompilerPathToCache() and RunInit()'s per-user best-effort write below.
+static bool WriteCompilerPathTo(const std::string& dir)
 {
-    std::string cacheDir = GetCflatCacheDir();
-    if (cacheDir.empty()) return false;
-    if (std::error_code ec = llvm::sys::fs::create_directories(cacheDir); ec)
+    if (dir.empty()) return false;
+    if (std::error_code ec = llvm::sys::fs::create_directories(dir); ec)
         return false;
 
     std::string exePath = PlatformExePath();
     if (exePath.empty())
         return false;
 
-    std::string outPath = (std::filesystem::path(cacheDir) / "compiler_path.txt").string();
+    std::string outPath = (std::filesystem::path(dir) / "compiler_path.txt").string();
     std::error_code ec;
     llvm::raw_fd_ostream os(outPath, ec, llvm::sys::fs::OF_Text);
     if (ec) return false;
     os << exePath << "\n";
     return true;
+}
+
+bool LLVMBackend::WriteCompilerPathToCache()
+{
+    return WriteCompilerPathTo(GetCflatCacheDir());
 }
 
 #if defined(_WIN32)
@@ -3200,7 +3294,7 @@ std::optional<LinkerPaths> LLVMBackend::LoadLinkerPathsFromCache(const std::stri
     std::string cacheDir = GetCflatCacheDir();
     if (cacheDir.empty()) return std::nullopt;
 
-    std::string jsonPath = cacheDir + "\\linker_paths_" + arch + ".json";
+    std::string jsonPath = cacheDir + "/linker_paths_" + arch + ".json";
     auto buf = llvm::MemoryBuffer::getFile(jsonPath);
     if (!buf) return std::nullopt;
 
@@ -3234,7 +3328,7 @@ bool LLVMBackend::SaveLinkerPathsToCache(const std::string& arch, const LinkerPa
     obj["ucrt_lib"] = paths.ucrtLib;
     obj["um_lib"]   = paths.umLib;
 
-    std::string jsonPath = cacheDir + "\\linker_paths_" + arch + ".json";
+    std::string jsonPath = cacheDir + "/linker_paths_" + arch + ".json";
     std::error_code fec;
     llvm::raw_fd_ostream out(jsonPath, fec);
     if (fec) return false;
@@ -3257,7 +3351,7 @@ LinkerPaths LLVMBackend::FindLinkerPaths(const std::string& arch, const std::str
         if (emptyUcrtCovered)
         {
             if (verbose)
-                std::cout << std::format("[verbose] linker paths: loaded from cache ({}\\linker_paths_{}.json)\n",
+                std::cout << std::format("[verbose] linker paths: loaded from cache ({}/linker_paths_{}.json)\n",
                                          GetCflatCacheDir(), arch);
             return *cached;
         }
@@ -3504,7 +3598,7 @@ std::string LLVMBackend::GetSyntheticLibDir(const std::string& arch)
 {
     std::string base = GetCflatCacheDir();
     if (base.empty()) return {};
-    return base + "\\lib\\" + arch;
+    return base + "/lib/" + arch;
 }
 
 // Generate kernel32/ws2_32/ntdll/dbghelp/ucrt import libs for <arch> into the synthetic lib
@@ -3817,6 +3911,40 @@ bool LLVMBackend::HarvestMacImageStub(const std::string& cacheDir, const std::st
 }
 #endif
 
+/*
+    Should RunInit re-seed the per-user ~/.cflat/compiler_path.txt when this run writes its
+    cache somewhere else (--init-local, CFLAT_CACHE_DIR)? Yes when the record is missing,
+    unreadable, empty, or names a compiler that no longer exists on disk - a worktree that has
+    since been removed leaves the VS Code extension pointed at nothing, and because a local
+    cache makes plain --init resolve locally too, no invocation could otherwise repair it.
+    No when it names a file that is still there: that is someone's live registration, and
+    silently repointing it at a worktree/portable build is the collision --init-local exists
+    to avoid (test.sh/test.bat run --init-local on every suite run).
+*/
+static bool PerUserCompilerRecordIsStale(const std::filesystem::path& userRecord)
+{
+    std::error_code ec;
+    if (!std::filesystem::exists(userRecord, ec) || ec)
+        return true;
+
+    std::ifstream in(userRecord);
+    if (!in)
+        return true;
+    std::string recorded;
+    std::getline(in, recorded);
+    while (!recorded.empty() && (recorded.back() == '\r' || recorded.back() == '\n' ||
+                                 recorded.back() == ' '  || recorded.back() == '\t'))
+        recorded.pop_back();
+    size_t firstNonWs = recorded.find_first_not_of(" \t");
+    recorded = (firstNonWs == std::string::npos) ? std::string() : recorded.substr(firstNonWs);
+    if (recorded.empty())
+        return true;
+
+    ec.clear();
+    bool present = std::filesystem::exists(recorded, ec) && !ec;
+    return !present;
+}
+
 bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
 {
     std::string cacheDir = GetCflatCacheDir();
@@ -3838,6 +3966,15 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
         std::cout << "  Saved compiler_path.txt\n";
     else
         std::cout << "  Warning: could not write compiler_path.txt\n";
+
+    // Best-effort seed of the per-user compiler_path.txt (the only file the VS Code extension
+    // reads) when this run writes elsewhere; see PerUserCompilerRecordIsStale above.
+    if (std::string userCacheDir = GetUserCacheDir(); !userCacheDir.empty() && userCacheDir != cacheDir)
+    {
+        std::filesystem::path userRecord = std::filesystem::path(userCacheDir) / "compiler_path.txt";
+        if (PerUserCompilerRecordIsStale(userRecord) && WriteCompilerPathTo(userCacheDir))
+            std::cout << std::format("  Also saved compiler_path.txt to {} (per-user cache) for the VS Code extension\n", userCacheDir);
+    }
 
 #if defined(__APPLE__)
     // macOS: synthesize the SDK-free libSystem link stub. The Windows linker-path /
@@ -3862,6 +3999,9 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
     for (const auto& fs : macFwSpecs)
         HarvestMacImageStub(cacheDir, fs.dlopenPath, fs.relTbd, verbose);
 
+    // The core bitcode cache is the one hard requirement of --init: without it the warm-cache
+    // test pass runs cold and silently stops testing the serializer round-trip.
+    bool anyCoreBitcodeSaved = false;
     for (const char* platform : {"macos"})
     {
         std::cout << std::format("Building core bitcode cache for {}...\n", platform);
@@ -3885,9 +4025,17 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
             continue;
         }
         if (coreCompiler.SaveCoreBitcode(bcCacheDir, platform))
+        {
             std::cout << std::format("  Saved core_{}.bc + .meta.json\n", platform);
+            anyCoreBitcodeSaved = true;
+        }
         else
             std::cout << std::format("  Warning: could not write core bitcode cache for {}.\n", platform);
+    }
+    if (!anyCoreBitcodeSaved)
+    {
+        std::cout << "Error: no core bitcode cache could be written; the cache is incomplete.\n";
+        return false;
     }
     return true;
 #else
@@ -3921,7 +4069,9 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
         }
     }
 
-    // Build core bitcode cache for win64 (win32 has pre-existing compilation issues).
+    // Build core bitcode cache for win64 (win32 has pre-existing compilation issues). This is
+    // the one hard requirement of --init: without it the warm-cache test pass runs cold.
+    bool anyCoreBitcodeSaved = false;
     for (const char* platform : {"win64"})
     {
         std::cout << std::format("Building core bitcode cache for {}...\n", platform);
@@ -3945,11 +4095,19 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
             continue;
         }
         if (coreCompiler.SaveCoreBitcode(bcCacheDir, platform))
+        {
             std::cout << std::format("  Saved core_{}.bc + .meta.json\n", platform);
+            anyCoreBitcodeSaved = true;
+        }
         else
             std::cout << std::format("  Warning: could not write core bitcode cache for {}.\n", platform);
     }
 
+    if (!anyCoreBitcodeSaved)
+    {
+        std::cout << "Error: no core bitcode cache could be written; the cache is incomplete.\n";
+        return false;
+    }
     return true;
 #endif
 }

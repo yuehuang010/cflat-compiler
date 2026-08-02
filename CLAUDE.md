@@ -140,7 +140,7 @@ wsl.exe -e bash -lc "cd /mnt/c/source/cflat-compiler && cmake --preset linux-x64
 
 ```bash
 ./cmake_build.sh release   # resolves VCPKG_ROOT + openjdk PATH, then configures/builds
-./test.sh Release          # 178 passed, 0 failed
+./test.sh Release          # 554 passed, 0 failed, 8 skipped
 ```
 
 `cmake_build.sh` is the Mac/Linux counterpart to `cmake_build.bat` (`debug` | `release`, picks the preset from `uname`). The macOS preset points `VCPKG_INSTALLED_DIR` at a **shared tree outside the source dir** (`~/.cflat-compiler-deps/vcpkg_installed`, override with `CFLAT_VCPKG_INSTALLED`) - see [Git worktrees](#git-worktrees) below. The build is **self-contained (no Xcode / Command Line Tools)** after a one-time `cflat --init` (bundled `ld64.lld` + a harvested libSystem tbd stub). Toolchain, link path, self-contained mechanism, Darwin runtime specifics (`if const (__MACOS__)`), and `--run` on Mach-O are documented in [`internal/macos-build.md`](internal/macos-build.md).
@@ -156,8 +156,20 @@ works with zero post-processing, no junction, no symlink, and no deletion hazard
 ```bash
 git worktree add ../cflat-feature -b feature/foo
 cd ../cflat-feature && ./cmake_build.sh release   # or cmake_build.bat on Windows; no vcpkg step
+cd ../cflat-feature && x64/Release/cflat --init-local   # per-worktree compiler cache
 git worktree remove ../cflat-feature               # shared tree untouched
 ```
+
+**In a worktree, use `--init-local`, not `--init`.** The compiler cache is *not* shared the
+way `vcpkg_installed` is: `--init` writes one per-user `~/.cflat` / `%USERPROFILE%\.cflat`
+that every worktree and every build config would fight over, so a `--init` in one worktree
+silently replaces the core bitcode another worktree is about to compile against.
+`--init-local` puts the cache in `<exe dir>/.cflat` - i.e. `x64/Release/.cflat` inside that
+worktree - and every later compile from that same exe picks it up automatically, no flag
+needed. This is the preferred collision-avoidance mechanism for worktrees, and for Debug vs
+Release side by side. `test.sh`, `test.bat`, and `example.bat` already run `--init-local`
+for exactly this reason, so a suite run never clobbers your per-user cache.
+`git worktree remove` takes the local cache with it; nothing to clean up separately.
 
 `cmake_build.sh` resolves `VCPKG_ROOT` from the main checkout's gitignored `./vcpkg`
 clone (a linked worktree has none); `cmake_build.bat` does the equivalent via
@@ -203,7 +215,9 @@ Run once after installing or updating cflat to populate `%USERPROFILE%\.cflat\`:
 x64/Debug/cflat.exe --init
 ```
 
-Pre-compiles the core `.cb` libraries to LLVM bitcode and caches resolved linker paths, so subsequent compiles load bitcode instead of re-parsing (~44% faster cold start). The cache is keyed on the core `.cb` mod-times and auto-invalidates. See [`doc/CACHING.md`](doc/CACHING.md) for the full design and troubleshooting.
+Pre-compiles the core `.cb` libraries to LLVM bitcode and caches resolved linker paths, so subsequent compiles load bitcode instead of re-parsing (~44% faster cold start). The cache is keyed on the core `.cb` mod-times and auto-invalidates.
+
+`--init-local` populates `<exe dir>/.cflat` instead of the per-user cache; once created, later compiles from that same exe pick it up automatically (no flag needed) - useful for portable installs, CI, or keeping several builds/worktrees from sharing one cache. `--init-clear` deletes **both** the per-user and local caches; `--init-clear-local` deletes only the local one. A `CFLAT_CACHE_DIR` env var override and the full 4-step resolution order are documented in [`doc/CACHING.md`](doc/CACHING.md), which also covers the full design and troubleshooting.
 
 ### C interop (`.c` files compiled by clang)
 

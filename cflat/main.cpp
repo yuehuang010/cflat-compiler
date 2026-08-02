@@ -261,6 +261,27 @@ static int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool s
     return 0;
 }
 
+/*
+    The local cache root, <exe dir>/.cflat, or "" when the exe directory is unknown.
+    GetExeDir() returns "" when the platform lookup fails (null _get_pgmptr, a chroot with no
+    /proc), and a bare concatenation would then yield the literal filesystem root "/.cflat" -
+    a live create/delete target that passes every guard. Callers must treat "" as "skip".
+*/
+static std::string LocalCacheDir()
+{
+    std::string exeDir = GetExeDir();
+    if (exeDir.empty()) return {};
+    return exeDir + "/.cflat";
+}
+
+// Compare two cache roots as normalised paths: on Windows the per-user root uses backslashes
+// while the local root is built with '/', so a raw string compare misses the same directory.
+static bool SameCacheRoot(const std::string& a, const std::string& b)
+{
+    if (a.empty() || b.empty()) return false;
+    return std::filesystem::path(a).lexically_normal() == std::filesystem::path(b).lexically_normal();
+}
+
 int main(int argc, char* argv[])
 {
     if (argc >= 2 && std::string_view(argv[1]) == "lsp")
@@ -319,7 +340,9 @@ int main(int argc, char* argv[])
     args.addOption("nuget-packages-dir", 0, "Explicit NuGet global packages folder (overrides NUGET_PACKAGES / %USERPROFILE%\\.nuget\\packages discovery)");
     args.addFlag("nuget-no-install", 0, "Do not download NuGet packages; error out if a package-nuget package is not already in the packages folder");
     args.addFlag("init", 0, "Populate %USERPROFILE%\\.cflat\\ cache with linker paths, core bitcode, and the compiler path, then exit");
-    args.addFlag("init-clear", 0, "Delete the %USERPROFILE%\\.cflat\\ (macOS/Linux ~/.cflat) cache directory and exit; re-run --init afterward to repopulate it");
+    args.addFlag("init-local", 0, "Populate <exe dir>/.cflat cache instead of the per-user cache, then exit; later compiles from this exe pick it up automatically");
+    args.addFlag("init-clear", 0, "Delete BOTH the per-user (%USERPROFILE%\\.cflat / ~/.cflat) and local (<exe dir>/.cflat) cache directories and exit; re-run --init/--init-local afterward to repopulate");
+    args.addFlag("init-clear-local", 0, "Delete only the <exe dir>/.cflat cache directory and exit; leaves the per-user cache alone");
     args.addFlag("print-supported-cpus", 0, "List target CPUs supported on Windows x86/x64, then exit");
     args.addFlag("print-host-cpu", 0, "Print the LLVM name of the host CPU (what --cpu native resolves to), then exit");
     args.addOption("cpu", 0, "Target CPU for code generation (name from --print-supported-cpus, or 'native'); sets ISA features + tuning", "");
@@ -348,18 +371,139 @@ int main(int argc, char* argv[])
     // Locate runtime.cb next to this executable (needed for lld-link discovery too).
     std::string runtimeDir = GetExeDir();
 
-    // --init and --init-clear are opposites; refuse rather than guessing which one was meant.
-    if (args.hasFlag("init") && args.hasFlag("init-clear"))
+    // --init / --init-local / --init-clear / --init-clear-local are mutually exclusive;
+    // refuse rather than guessing which one was meant.
     {
-        std::cout << "Error: --init and --init-clear cannot be combined. Pass --init-clear to delete the cache, then --init to repopulate it.\n";
-        return 1;
+        std::vector<std::string> initFlagsSeen;
+        for (const char* f : {"init", "init-local", "init-clear", "init-clear-local"})
+            if (args.hasFlag(f))
+                initFlagsSeen.push_back(f);
+        if (initFlagsSeen.size() > 1)
+        {
+            std::string joined;
+            for (size_t i = 0; i < initFlagsSeen.size(); ++i)
+            {
+                if (i) joined += ", ";
+                joined += "--" + initFlagsSeen[i];
+            }
+            std::cout << std::format("Error: {} cannot be combined. Pass exactly one of --init, --init-local, --init-clear, --init-clear-local.\n", joined);
+            return 1;
+        }
+    }
+
+    if (args.hasFlag("init-clear-local"))
+    {
+        std::string localDir = LocalCacheDir();
+        if (const char* envDir = std::getenv("CFLAT_CACHE_DIR"); envDir && *envDir)
+            std::cout << std::format("Note: CFLAT_CACHE_DIR={} is set; it is not touched by --init-clear-local.\n", envDir);
+        if (localDir.empty())
+        {
+            std::cout << "local cache: (could not determine the local cache path; the executable directory is unknown)\n";
+            return 0;
+        }
+        std::cout << std::format("cache dir: {}\n", localDir);
+        bool ok = LLVMBackend::ClearCacheDir(localDir, args.hasFlag("verbose"), "local");
+        return ok ? 0 : 1;
     }
 
     if (args.hasFlag("init-clear"))
-        return LLVMBackend::RunInitClear(args.hasFlag("verbose")) ? 0 : 1;
+    {
+        if (const char* envDir = std::getenv("CFLAT_CACHE_DIR"); envDir && *envDir)
+            std::cout << std::format("Note: CFLAT_CACHE_DIR={} is set; it is not touched by --init-clear.\n", envDir);
+
+        std::string localDir = LocalCacheDir();
+        std::string userDir = LLVMBackend::GetUserCacheDir();
+        bool verbose = args.hasFlag("verbose");
+        bool ok = true;
+
+        if (localDir.empty())
+        {
+            std::cout << "local cache: (could not determine the local cache path; the executable directory is unknown)\n";
+        }
+        else
+        {
+            std::cout << std::format("cache dir: {}\n", localDir);
+            if (!LLVMBackend::ClearCacheDir(localDir, verbose, "local"))
+                ok = false;
+        }
+
+        if (userDir.empty())
+        {
+            std::cout << "per-user cache: (could not determine path; HOME/USERPROFILE not set)\n";
+        }
+        else if (!SameCacheRoot(userDir, localDir))
+        {
+            std::cout << std::format("cache dir: {}\n", userDir);
+            if (!LLVMBackend::ClearCacheDir(userDir, verbose, "per-user"))
+                ok = false;
+        }
+
+        return ok ? 0 : 1;
+    }
+
+    if (args.hasFlag("init-local"))
+    {
+        std::string localDir = LocalCacheDir();
+        if (localDir.empty())
+        {
+            std::cout << "Error: could not determine the local cache path; the executable directory is unknown.\n";
+            return 1;
+        }
+        if (std::error_code ec = llvm::sys::fs::create_directories(localDir); ec)
+        {
+            std::cout << std::format("Error: could not create local cache directory {}: {} ({})\n", localDir, ec.message(), ec.value());
+            return 1;
+        }
+        // create_directories succeeds on an existing read-only directory, so probe with a real
+        // write; otherwise --init-local exits 0 having written nothing but warnings.
+        {
+            std::string probePath = (std::filesystem::path(localDir) / ".cflat-write-probe").string();
+            std::error_code probeEc;
+            {
+                llvm::raw_fd_ostream probe(probePath, probeEc, llvm::sys::fs::OF_Text);
+                if (!probeEc)
+                {
+                    probe << "probe\n";
+                    probe.close();
+                    if (probe.has_error())
+                    {
+                        probeEc = probe.error();
+                        probe.clear_error();
+                    }
+                }
+            }
+            if (probeEc)
+            {
+                std::cout << std::format("Error: local cache directory {} is not writable: {} ({})\n",
+                                         localDir, probeEc.message(), probeEc.value());
+                return 1;
+            }
+            std::error_code rmEc;
+            std::filesystem::remove(probePath, rmEc);
+        }
+        LLVMBackend::SetCacheDirOverride(localDir);
+        std::cout << std::format("cache dir: {}\n", localDir);
+
+        // --init-local exits before the main -ftime-trace wiring below, so init/write the
+        // profiler here too. Captures the CoreCacheJsonBuild/Write scopes in SaveCoreBitcode.
+        bool ft = args.hasFlag("ftime-trace");
+        if (ft) llvm::timeTraceProfilerInitialize(500, "cflat");
+        bool ok = LLVMBackend::RunInit(runtimeDir, args.hasFlag("verbose"));
+        if (ft)
+        {
+            if (auto err = llvm::timeTraceProfilerWrite("init.time-trace.json", ""))
+                llvm::consumeError(std::move(err));
+            else
+                std::cout << "Time trace written to init.time-trace.json\n";
+            llvm::timeTraceProfilerCleanup();
+        }
+        return ok ? 0 : 1;
+    }
 
     if (args.hasFlag("init"))
     {
+        std::cout << std::format("cache dir: {}\n", LLVMBackend::GetCflatCacheDir());
+
         // --init exits before the main -ftime-trace wiring below, so init/write the
         // profiler here too. Captures the CoreCacheJsonBuild/Write scopes in SaveCoreBitcode.
         bool ft = args.hasFlag("ftime-trace");
