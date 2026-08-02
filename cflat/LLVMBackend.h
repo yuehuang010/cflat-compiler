@@ -14692,13 +14692,22 @@ public:
          */
         if (destType->isAggregateType() && !srcType->isAggregateType())
         {
+            // A null source zeroes the storage, matching the '= nullptr' carve-out on the pointer
+            // path. Rejecting '= 0' while accepting '= nullptr' on the same storage is arbitrary.
+            auto* srcConst = llvm::dyn_cast<llvm::Constant>(value);
+            if (srcConst != nullptr && srcConst->isNullValue())
+                return llvm::Constant::getNullValue(destType);
+
             if (srcType->isPointerTy())
+            {
                 LogError(std::format(
                     "cannot store a pointer value into {} - a fixed array is not assignable from a "
                     "pointer or a string literal. Assign its elements individually, or declare the "
                     "destination as a pointer 'T*' or an array view 'T[]' to borrow the source "
                     "instead of copying it.",
                     DescribeAggregateStorageShape(destType)));
+                return value;
+            }
             LogError(std::format(
                 "cannot store a single scalar value into {} - a fixed array or struct is not "
                 "assignable from one value. Use '= default' to zero it, a brace list to fill it, "

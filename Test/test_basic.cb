@@ -2714,6 +2714,10 @@ char[8] gNullBuf = nullptr;
 using GNullBuf = char[8];
 GNullBuf gNullAlias = nullptr;
 
+// '= 0' must zero aggregate storage too, not hit the scalar-into-aggregate reject.
+struct ZeroInitPair { int a = default; int b = default; };
+struct ZeroInitHolder { int[2] f = default; };
+
 // Union with an ARRAY arm. Writing one ELEMENT of a union's array field targets that
 // element's slot; the whole FIELD type must not be used as the store type or the write
 // splats the array's full width (and, on an int arm, crashed the compiler).
@@ -2973,6 +2977,21 @@ bool testFixedArrays()
     result &= Test("fixed_null_init_global_alias", (int)gNullAlias[0], 0);
     gNullArr[1] = 44;
     result &= Test("fixed_null_init_global_writable", gNullArr[1], 44);
+
+    // '= 0' zeroes aggregate storage exactly as '= nullptr' does. The scalar-into-aggregate
+    // backstop must carve out a null constant, or the two spellings disagree on one storage.
+    char[8] zb = 0;
+    result &= Test("fixed_zero_init_local_char", (int)zb[0] + (int)zb[7], 0);
+    zb[2] = (char)77;
+    result &= Test("fixed_zero_init_local_writable", (int)zb[2], 77);
+    int[4] zi = 0;
+    result &= Test("fixed_zero_init_local_int", zi[0] + zi[3], 0);
+    double[3] zd = 0;
+    result &= Test("fixed_zero_init_local_double", (int)zd[1], 0);
+    ZeroInitPair zs = 0;
+    result &= Test("fixed_zero_init_struct", zs.a + zs.b, 0);
+    ZeroInitHolder zh = 0;
+    result &= Test("fixed_zero_init_struct_array_field", zh.f[0] + zh.f[1], 0);
 
     // Element write into a UNION's array field. The whole field type must not be the store
     // type: it wrote the array's full width at the field's base and ignored the index,
