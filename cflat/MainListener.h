@@ -10346,6 +10346,11 @@ public:
                         compiler->SetViewOfFixedArrayStorage(name, boundFromFixedArray, srcDesc);
                     }
 
+                    // Declaration leg of the borrowed-box tag: `right` is the fat value this local
+                    // is about to receive. See TagInterfaceBoxProvenance.
+                    if (typeAndValue.IsFatInterfaceValue())
+                        TagInterfaceBoxProvenance(name, right);
+
                     if (needsArrayDefaultInit)
                         EmitFixedArrayDefaultInit(alloc, typeAndValue);
 
@@ -12101,8 +12106,224 @@ public:
         record.InterfaceName = interfaceName;
         record.Source = ClassifyInterfaceBoxSource(dataPtr, srcNV, transferred);
         record.OwnershipTransferred = transferred;
+        record.SourceKeepsOwner = ClassifyBoxedSourceKeepsOwner(dataPtr, srcNV, transferred);
+        if (record.SourceKeepsOwner) record.SourceDisplayName = DescribeBoxedSourceOwner(dataPtr, srcNV);
         compiler->RegisterInterfaceBox(record);
         return fat;
+    }
+
+    /*
+     * PROVE, from ONE binding, that a NAMEABLE other owner frees the object being boxed. Three
+     * positive proofs and nothing else: the binding frees it itself at scope exit (IsOwning, so the
+     * box would be a second owner); it reads a `unique` FIELD, whose synthesized destructor frees
+     * it; or it is a non-move pointer PARAMETER, whose caller owns it.
+     *
+     * `IsAliasBorrow` is deliberately excluded, having been measured false-rejecting a correct
+     * program: it is the OPPOSITE of this question. It means this binding's scope-exit free is
+     * SUPPRESSED, i.e. it frees NOTHING - `alias` hands the lifetime to the caller to manage by
+     * hand, so `alias T* e = makeT(); IS s = e; delete s;` is the CORRECT way to release it and
+     * rejecting it both false-rejects and leaks.
+     *
+     * An unannotated copy off an OWNING local (`T* b = c;`) and a local that received its `new` in
+     * a LATER statement are not proofs either: neither carries IsOwning, and for the late-assigned
+     * local the box is the ONLY owner.
+     *
+     * ORDER IS LOAD-BEARING below the IsOwning gate. The two clauses a plain '=' REFRESHES -
+     * BorrowsOwnedElement (re-established by SetVariableBorrowsOwnedElement on that same store) and
+     * InheritedKeepsOwner (set by MarkPointerRebound from the RHS binding's own proof) - are asked
+     * ABOVE the PointerRebound retirement, because both describe the store that set the bit and are
+     * therefore fresher than it. The two DECLARATION-time clauses - IsBorrowed and the parameter
+     * test - are asked BELOW it, because a rebound binding no longer points at what its declaration
+     * established an owner for.
+     */
+    bool BindingKeepsOwnershipOfBoxedObject(const LLVMBackend::NamedVariable* nv) const
+    {
+        if (nv == nullptr || nv->Storage == nullptr) return false;
+        // A `unique` field's synthesized destructor frees it. Field-specific and proven by the
+        // field itself, so it is asked before the direct-binding gate below excludes field reads.
+        if (nv->IsUniqueFieldAlias || nv->TypeAndValue.IsUnique) return true;
+        // Direct bindings only below: a FIELD read's Storage is a GEP and its CallerName names the
+        // BASE object, so without this gate a plain field read is blamed on the enclosing parameter.
+        if (!llvm::isa<llvm::AllocaInst>(nv->Storage)) return false;
+        if (nv->IsOwning) return true;
+        // Refreshed by the same '=' that sets PointerRebound, so both outrank it. A '??=' returns
+        // before that refresh, so its element fact may be stale and is not a proof on its own -
+        // the join proof below carries the case where the '??=' RHS proved an owner too.
+        if (nv->BorrowsOwnedElement && !nv->CoalesceRebound) return true;
+        if (nv->InheritedKeepsOwner) return true;
+        // A rebound pointer no longer points at whatever its declaration established an owner for.
+        if (nv->PointerRebound) return false;
+        // A local that aliases a borrowed parameter. Retired above by any reassignment, which is
+        // what makes it safe to consult here - `IS s = b;` must not launder what `delete b;` rejects.
+        // Same pair of conditions the raw-delete guard uses, so the two spellings agree exactly.
+        if (nv->IsBorrowed && !nv->BorrowedOrigin.empty()) return true;
+        // Identity, never spelling: a local SHADOWING a parameter's name is a different binding.
+        return !nv->TypeAndValue.IsMove
+            && compilerLLVM->IsFunctionParameterStorage(nv->Storage);
+    }
+
+    /*
+     * The AST name to blame, taken from the binding that ACTUALLY proved the claim - which is often
+     * not `srcNV`: a self-field read and a container-element read both arrive here as a transient
+     * NamedVariable stripped of the flags, and only the binding recovered from the loaded slot
+     * carries them. Describing `srcNV` regardless printed the local's own name for both.
+     * Never an LLVM value name - those carry '.N' uniquifying suffixes absent from the source.
+     */
+    std::string DescribeBoxedSourceOwner(llvm::Value* dataPtr,
+                                         const LLVMBackend::NamedVariable* srcNV) const
+    {
+        const LLVMBackend::NamedVariable* nv = ProvingBindingForBoxedSource(dataPtr, srcNV);
+        if (nv == nullptr) return {};
+        // A container's element: the CONTAINER frees it, never the local holding the borrow, so
+        // an unnameable container falls back to a phrase rather than blaming the local.
+        // Gated exactly as in BindingKeepsOwnershipOfBoxedObject: after a '??=' the element fact is
+        // not the proof, so naming the container alone would under-name a join the guard fired on.
+        if (nv->BorrowsOwnedElement && !nv->CoalesceRebound)
+            return nv->OwnedElementContainer.empty()
+                ? std::string("its container") : std::format("'{}'", nv->OwnedElementContainer);
+        // Carried across a `p = q;` store from the RHS binding's own proof; already rendered there.
+        if (nv->InheritedKeepsOwner && !nv->InheritedKeepsOwnerSource.empty())
+            return nv->InheritedKeepsOwnerSource;
+        if (!nv->FieldName.empty())
+            return nv->OwningStructName.empty()
+                ? std::format("'{}'", nv->FieldName)
+                : std::format("'{}.{}'", nv->OwningStructName, nv->FieldName);
+        // A bare self-field read (`u` inside the struct's own method) comes from GetMemberVariable,
+        // which leaves FieldName and OwningStructName empty; the enclosing method names the owner.
+        if (nv->IsUniqueFieldAlias || nv->TypeAndValue.IsUnique)
+        {
+            std::string field = nv->TypeAndValue.VariableName.empty()
+                ? nv->CallerName : nv->TypeAndValue.VariableName;
+            std::string owner = compilerLLVM->GetCurrentFunctionName();
+            if (auto dot = owner.find('.'); dot != std::string::npos) owner = owner.substr(0, dot);
+            else if (!owner.empty() && owner[0] == '~') owner = owner.substr(1);
+            else owner.clear();
+            if (field.empty()) return "its owner";
+            return owner.empty() || !compilerLLVM->IsDataStructure(owner)
+                ? std::format("'{}'", field) : std::format("'{}.{}'", owner, field);
+        }
+        // A borrow: name the ORIGIN, never the local holding it - the caller's parameter (or the
+        // `unique` field) is what frees the object, exactly as the raw-delete diagnostic reports it.
+        if (!nv->BorrowedUniqueField.empty()) return std::format("'{}'", nv->BorrowedUniqueField);
+        if (nv->IsBorrowed && !nv->BorrowedOrigin.empty())
+            return std::format("'{}'", nv->BorrowedOrigin);
+        if (!nv->CallerName.empty()) return std::format("'{}'", nv->CallerName);
+        auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(dataPtr);
+        std::string name = load == nullptr
+            ? std::string() : compilerLLVM->FindVariableNameByStorage(load->getPointerOperand());
+        return name.empty() ? std::string() : std::format("'{}'", name);
+    }
+
+    /*
+     * The owner a `lhs = rhs` store hands ACROSS to the LHS, or empty when the RHS proves nothing.
+     * Recovered by STORAGE IDENTITY, never spelling: a name-keyed lookup off `rightNV.CallerName`
+     * would resolve a field read (`p = q->next`) to its BASE object and blame the wrong binding.
+     * Empty is the accept direction, so every shape that does not resolve retires as before.
+     */
+    std::string DescribeAssignedSourceOwner(const LLVMBackend::NamedVariable& rightNV) const
+    {
+        if (rightNV.Storage == nullptr || !llvm::isa<llvm::AllocaInst>(rightNV.Storage)) return {};
+        const auto* srcNV = compilerLLVM->FindVariableByStorage(rightNV.Storage);
+        if (!BindingKeepsOwnershipOfBoxedObject(srcNV)) return {};
+        std::string owner = DescribeBoxedSourceOwner(nullptr, srcNV);
+        return owner.empty() ? std::string("the binding it was assigned from") : owner;
+    }
+
+    /*
+     * The binding that PROVES some other owner frees the boxed object, or null when none does.
+     * `srcNV` is the source binding when the spelling carried one; parentheses, a join arm, a
+     * self-field read and a container-element read all arrive without the deciding flags, so the
+     * binding is also recovered from the boxed VALUE - a pointer load off a live slot. Both routes
+     * are positive proofs, so asking both only widens what can be PROVEN, never what is assumed.
+     */
+    const LLVMBackend::NamedVariable* ProvingBindingForBoxedSource(
+        llvm::Value* dataPtr, const LLVMBackend::NamedVariable* srcNV) const
+    {
+        if (BindingKeepsOwnershipOfBoxedObject(srcNV)) return srcNV;
+        auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(dataPtr);
+        if (load == nullptr || !load->getType()->isPointerTy()) return nullptr;
+        const auto* slotNV = compilerLLVM->FindVariableByStorage(load->getPointerOperand());
+        return BindingKeepsOwnershipOfBoxedObject(slotNV) ? slotNV : nullptr;
+    }
+
+    // The boxing site's verdict for InterfaceBoxRecord::SourceKeepsOwner.
+    bool ClassifyBoxedSourceKeepsOwner(llvm::Value* dataPtr,
+                                       const LLVMBackend::NamedVariable* srcNV,
+                                       bool ownershipTransferred) const
+    {
+        return !ownershipTransferred && ProvingBindingForBoxedSource(dataPtr, srcNV) != nullptr;
+    }
+
+    /*
+     * PROVE that the fat value about to be bound to an interface local is a box the frame does not
+     * own. A join ('?:' / '??') is a PHI of the per-arm boxes: EVERY non-null arm must resolve to a
+     * ledgered record whose source keeps ownership, so a MIXED join - where one arm owns nothing
+     * else - is accepted rather than rejected on a may-alias. A null arm owns nothing and is
+     * skipped. Anything with no ledger entry at all answers false and keeps compiling.
+     *
+     * `sourceNames` collects EVERY arm that keeps an owner, because the taken arm is a runtime
+     * choice: naming only the first would state as fact something the run can contradict.
+     */
+    bool InterfaceBoxValueIsProvablyBorrowed(llvm::Value* fatValue,
+                                             std::vector<std::string>& sourceNames)
+    {
+        if (fatValue == nullptr) return false;
+        auto* compiler = compilerLLVM;
+        if (auto* record = compiler->FindInterfaceBoxByFatValue(fatValue))
+        {
+            if (!record->SourceKeepsOwner) return false;
+            if (!record->SourceDisplayName.empty())
+                sourceNames.push_back(record->SourceDisplayName);
+            return true;
+        }
+
+        auto* phi = llvm::dyn_cast<llvm::PHINode>(fatValue);
+        if (phi == nullptr) return false;
+        bool sawBox = false;
+        for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+        {
+            llvm::Value* arm = phi->getIncomingValue(i);
+            if (auto* constant = llvm::dyn_cast<llvm::Constant>(arm);
+                constant != nullptr && constant->isNullValue())
+                continue;
+            const auto* record = compiler->FindInterfaceBoxByFatValue(arm);
+            if (record == nullptr || !record->SourceKeepsOwner) return false;
+            sawBox = true;
+            const std::string& name = record->SourceDisplayName;
+            if (!name.empty()
+                && std::find(sourceNames.begin(), sourceNames.end(), name) == sourceNames.end())
+                sourceNames.push_back(name);
+        }
+        return sawBox;
+    }
+
+    // "'a'", "'a' or 'b'", "'a', 'b' or 'c'" - every owner the value can carry, never just one.
+    std::string DescribeInterfaceBoxOwners(const std::vector<std::string>& names) const
+    {
+        std::string text;
+        for (size_t i = 0; i < names.size(); i++)
+        {
+            if (i > 0) text += (i + 1 == names.size()) ? " or " : ", ";
+            text += names[i];   // already quoted (or a phrase) by DescribeBoxedSourceOwner
+        }
+        return text;
+    }
+
+    /*
+     * The one binding-site hook: tag an interface LOCAL with the provenance of the box it was just
+     * handed. A NULL box is neutral - it owns nothing, deleting it is a no-op - so it neither arms
+     * nor poisons the tag. Everything else either proves a borrow or poisons the local for good.
+     */
+    void TagInterfaceBoxProvenance(const std::string& varName, llvm::Value* fatValue)
+    {
+        if (varName.empty() || fatValue == nullptr) return;
+        if (auto* constant = llvm::dyn_cast<llvm::Constant>(fatValue);
+            constant != nullptr && constant->isNullValue())
+            return;
+        std::vector<std::string> sourceNames;
+        bool borrowed = InterfaceBoxValueIsProvablyBorrowed(fatValue, sourceNames);
+        compilerLLVM->SetInterfaceBoxIsBorrowed(varName, borrowed,
+                                                DescribeInterfaceBoxOwners(sourceNames));
     }
 
     // True when any boxing site reachable through `fatValue` (following '?:' joins) boxed a heap
@@ -12271,6 +12492,8 @@ public:
             record.InterfaceName = interfaceName;
             record.Source = ClassifyInterfaceBoxSource(armData, nullptr, transferred);
             record.OwnershipTransferred = transferred;
+            record.SourceKeepsOwner = ClassifyBoxedSourceKeepsOwner(armData, nullptr, transferred);
+            if (record.SourceKeepsOwner) record.SourceDisplayName = DescribeBoxedSourceOwner(armData, nullptr);
             compiler->RegisterInterfaceBox(record);
         }
         compiler->builder->SetInsertPoint(joinPoint);
@@ -12759,6 +12982,20 @@ public:
                 // Null-coalescing assignment: x ??= rhs  ->  if (x == 0/null) x = rhs
                 auto* lhs = derefLoad();
 
+                // Is this an ownership-tracked pointer binding? Same gate the plain '=' retirement
+                // uses: bare identifier, its own alloca, not a field store.
+                bool tracksOwnership = namedVar.TypeAndValue.Pointer && namedVar.FieldName.empty()
+                    && !namedVar.CallerName.empty() && namedVar.Storage != nullptr
+                    && llvm::isa<llvm::AllocaInst>(namedVar.Storage);
+                // The LHS's PRE-STORE proof, taken before anything below can mutate the binding.
+                std::string lhsOwner;
+                if (tracksOwnership)
+                {
+                    const auto* lhsNV = compiler->FindVariableByStorage(namedVar.Storage);
+                    if (BindingKeepsOwnershipOfBoxedObject(lhsNV))
+                        lhsOwner = DescribeBoxedSourceOwner(nullptr, lhsNV);
+                }
+
                 auto* assignBlock  = compiler->CreateBasicBlock("nullcoalasgn_assign");
                 auto* resumeBlock  = compiler->CreateBasicBlock("nullcoalasgn_resume");
 
@@ -12769,6 +13006,41 @@ public:
                 auto* rhs = ParseAssignmentExpression(assignCtx);
                 derefAssign(rhs, false);
                 compiler->CreateJump(resumeBlock);
+
+                /*
+                 * '??=' is a JOIN: afterwards the binding holds either its OLD referent (arm not
+                 * taken) or the RHS's (arm taken). So the fact survives only when BOTH sides prove
+                 * an owner, and the diagnostic then names both - a rule that has to mirror the one
+                 * for the '?:' / '??' joins rather than either side alone. Taking the RHS alone
+                 * false-rejects `c = new Ci(); c ??= q;` (the not-taken arm leaves `c` the sole
+                 * owner, and IsOwning is decl-with-init only, so the box's delete is the ONLY
+                 * free); taking neither laundered `p ??= q` between two borrowed parameters, which
+                 * the raw `delete p;` on the same binding rejects.
+                 *
+                 * The store is also marked as a '??=' rebinding, which suppresses the element clause
+                 * of THIS proof. That handler returns before the SetVariableBorrowsOwnedElement
+                 * refresh the plain '=' path runs, so the DECLARATION's element fact would otherwise
+                 * survive a store that may have replaced it - and it outranks the retirement by
+                 * design, so it would win. The raw-delete guard reads BorrowsOwnedElement directly
+                 * and is deliberately NOT touched: clearing the taint outright also widened it,
+                 * which is a behaviour change master does not have. See
+                 * internal/issue/p2/coalesce-assign-skips-store-bookkeeping.md for the rest of that
+                 * skipped bookkeeping, which is a pre-existing gap and not fixed here.
+                 */
+                if (tracksOwnership)
+                {
+                    std::string rhsOwner;
+                    if (ProvingBindingForBoxedSource(rhs, nullptr) != nullptr)
+                        rhsOwner = DescribeBoxedSourceOwner(rhs, nullptr);
+                    std::string joined;
+                    if (!lhsOwner.empty() && !rhsOwner.empty())
+                    {
+                        std::vector<std::string> owners{lhsOwner};
+                        if (rhsOwner != lhsOwner) owners.push_back(rhsOwner);
+                        joined = DescribeInterfaceBoxOwners(owners);
+                    }
+                    compiler->MarkPointerRebound(namedVar.CallerName, joined, /*coalesceJoin*/ true);
+                }
 
                 compiler->SwitchToBlock(resumeBlock);
                 return derefLoad();
@@ -12815,6 +13087,15 @@ public:
                     && !namedVar.CallerName.empty() && namedVar.Storage != nullptr
                     && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
                     compiler->SetViewOfFixedArrayStorage(namedVar.CallerName, false);
+                // Retire the declaration-time "someone else frees this" facts about a POINTER
+                // binding that has just been pointed elsewhere - UNLESS the RHS binding proves an
+                // owner of its own, in which case the proof is carried across. `p = q;` between two
+                // borrowed parameters leaves p a borrow; retiring there laundered a double free.
+                if (namedVar.TypeAndValue.Pointer && namedVar.FieldName.empty()
+                    && !namedVar.CallerName.empty() && namedVar.Storage != nullptr
+                    && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
+                    compiler->MarkPointerRebound(namedVar.CallerName,
+                                                 DescribeAssignedSourceOwner(rightNV));
             }
             // An assignment to an existing variable (not a declaration) does not transfer
             // ownership - consuming lastOwningResult here would be wrong (the new-allocated
@@ -13086,6 +13367,13 @@ public:
                 right = compiler->ReboxInterfaceIfNeeded(
                     right, srcIface, namedVar.TypeAndValue.TypeName);
             }
+
+            // Assignment leg of the borrowed-box tag. Scoped to a plain bare-identifier LHS with
+            // alloca storage - a field store is never tracked. See TagInterfaceBoxProvenance.
+            if (operatorText == "=" && namedVar.TypeAndValue.IsFatInterfaceValue()
+                && namedVar.FieldName.empty() && !namedVar.CallerName.empty()
+                && llvm::isa_and_nonnull<llvm::AllocaInst>(destination))
+                TagInterfaceBoxProvenance(namedVar.CallerName, right);
 
             // D5 (assignment leg): a `unique` interface local owns a heap-boxed object, and its
             // scope-exit teardown frees the fat-ptr data pointer. Reassigning it from a borrowed
@@ -18722,6 +19010,25 @@ public:
                     "frees nothing and the object leaks (interface locals are not auto-destructed). "
                     "Delete through the interface instead.",
                     namedVar.CallerName.empty() ? "<expr>" : namedVar.CallerName));
+                return {};
+            }
+
+            // Error: deleting an interface box whose object a DIFFERENT owner already frees - see
+            // BorrowedInterfaceBox. Proven at the binding site; never inferred at this one.
+            if (isInterfaceOperand && namedVar.BorrowedInterfaceBox
+                && namedVar.Storage != nullptr && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
+            {
+                std::string name = namedVar.CallerName.empty()
+                    ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
+                if (name.empty()) name = "<expr>";
+                std::string owner = namedVar.BorrowedInterfaceBoxSource.empty()
+                    ? std::string("the binding it was boxed from")
+                    : namedVar.BorrowedInterfaceBoxSource;
+                LogErrorContext(ctx, std::format(
+                    "cannot delete interface '{}' - it boxes an object that {} already frees, so this "
+                    "is a double-free. Remove this delete and let {} release it; box a 'new' object "
+                    "into '{}' instead if this frame should own it.",
+                    name, owner, owner, name));
                 return {};
             }
 

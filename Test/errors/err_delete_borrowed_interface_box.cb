@@ -1,0 +1,241 @@
+// 'delete' of an interface box whose object a DIFFERENT owner already frees. Every leg below
+// COMPILED before this guard and aborted at runtime with no diagnostic at all (exit 139 as
+// written, because each leg reads the box back after the free).
+//
+// Each leg names its interface local DIFFERENTLY and each expect_error pins that name, so the
+// substring proves WHICH leg fired and no leg can be satisfied by another's diagnostic. Verified
+// by mutation: breaking any single expectation in this file makes the whole file exit 1, so every
+// leg is self-proving even though they share one file.
+//
+// POLARITY. The rejection needs a POSITIVE proof that some other owner frees the object, taken at
+// the BOXING site while the source binding is still in hand: either the binding frees it itself at
+// scope exit (IsOwning), or it is an established borrow - a non-move pointer parameter, a `unique`
+// field, an `alias` return, a container-owned element. "Ownership was not transferred here" is NOT
+// such a proof and must never be used as one: it is also false for a local that received its `new`
+// in a LATER statement, and that local is the box's ONLY owner, so deleting the box is correct.
+// The must-still-work half is the delete_box_* / delete_borrowed_box_* legs in Test/test_move.cb.
+//
+// KNOWN GAPS, deliberately accepted (both double-free at runtime on master and still do):
+//   CircleB* c = new CircleB(); CircleB* b = c;       IShapeB s = b; delete s;
+//   CircleB* c = new CircleB(); alias CircleB* b = c; IShapeB s = b; delete s;
+// An unannotated copy off an OWNING LOCAL and an `alias` LOCAL carry no borrow flag at all in this
+// compiler - the plain `delete b;` spelling of both is equally undiagnosed - so nothing at the
+// boxing site proves the object has another owner. Proving it needs aliasing from `b` back to `c`,
+// which does not exist here; rejecting on the guess would be the polarity error above. The same
+// copy off a PARAMETER is a different matter and IS rejected (sHop below): there the copy carries
+// IsBorrowed with a named origin, exactly what the raw `delete b;` guard already rejects on.
+
+interface IShapeB { int area(); };
+class CircleB : IShapeB { int r = 0; int area() { return r * r; } ~CircleB() {} };
+
+bool identityBoolB(bool b) { return b; }
+
+// A borrowed pointer PARAMETER: the caller owns it and frees it after the call returns.
+expect_error("cannot delete interface 'sParam'") {
+    int borrowParam(CircleB* p)
+    {
+        IShapeB sParam = p;
+        delete sParam;
+        return sParam.area();
+    }
+}
+
+// The ASSIGNMENT STATEMENT spelling - a different code path from the declaration initializer. The
+// 'nullptr' declaration is deliberately NEUTRAL: a null box owns nothing, so it must neither arm
+// the rejection nor poison the local before the real binding runs.
+expect_error("cannot delete interface 'sAssign'") {
+    int borrowAssign(CircleB* p)
+    {
+        IShapeB sAssign = nullptr;
+        sAssign = p;
+        delete sAssign;
+        return sAssign.area();
+    }
+}
+
+// A PARENTHESIZED source. Parentheses erase the source binding and have twice defeated a guard in
+// this exact area, so the proof falls back to the boxed VALUE's slot.
+expect_error("cannot delete interface 'sParen'") {
+    int borrowParen(CircleB* p)
+    {
+        IShapeB sParen = (p);
+        delete sParen;
+        return sParen.area();
+    }
+}
+
+// The 'as' CAST spelling. It reaches the shared boxing helper through GenerateSafeCast rather than
+// the declaration initializer, so it needs its own leg.
+expect_error("cannot delete interface 'sAsCast'") {
+    int borrowAsCast(CircleB* p)
+    {
+        IShapeB sAsCast = p as IShapeB;
+        delete sAsCast;
+        return sAsCast.area();
+    }
+}
+
+// Inside a GENERIC. The box is created during monomorphization, where the source is the
+// instantiated template's own parameter, so the proof has to survive substitution.
+struct BoxOfB<T>
+{
+    int take(T p)
+    {
+        IShapeB sGeneric = p;
+        delete sGeneric;
+        return sGeneric.area();
+    }
+};
+
+expect_error("cannot delete interface 'sGeneric'") {
+    int borrowGeneric(CircleB* p)
+    {
+        BoxOfB<CircleB*> b;
+        return b.take(p);
+    }
+}
+
+// A 'unique' FIELD read. The field's SYNTHESIZED destructor frees it, so the box is a second
+// owner. This is a field-specific proof and is asked BEFORE the direct-binding test. A PLAIN
+// 'CircleB* h' field carries no such proof and is therefore ACCEPTED - not proven safe: a holder
+// whose hand-written destructor frees the same field still double-frees, identically on master,
+// and is an open gap. Test/test_move.cb's delete_box_plain_field_read leg pins the accept side.
+class HolderB { unique CircleB* h = default; };
+
+expect_error("cannot delete interface 'sUniqueField'") {
+    int borrowUniqueField(HolderB* hh)
+    {
+        IShapeB sUniqueField = hh.h;
+        delete sUniqueField;
+        return sUniqueField.area();
+    }
+}
+
+// The '?:' JOIN. A join into a plain interface local is a BORROW BY DESIGN (a per-arm ownership
+// transfer at the boxing site was tried, measured and reverted - it trades this double free for a
+// use-after-null; see the fix/iface-boxing design record). BOTH arms here are owning locals that
+// free at scope exit, so the join is proven on every path; a MIXED join is deliberately accepted.
+// The diagnostic names BOTH arms, because which arm is taken is a runtime choice.
+expect_error("cannot delete interface 'sTernary'") {
+    int borrowTernary()
+    {
+        CircleB* a = new CircleB();
+        CircleB* b = new CircleB();
+        IShapeB sTernary = identityBoolB(true) ? a : b;
+        delete sTernary;
+        return sTernary.area();
+    }
+}
+
+// The '??' spelling of the same join. It lowers through a SLOT rather than a phi, so it reaches
+// the boxing helper by a different route and needs its own leg.
+expect_error("cannot delete interface 'sCoalesce'") {
+    int borrowCoalesce()
+    {
+        CircleB* a = new CircleB();
+        CircleB* b = new CircleB();
+        IShapeB sCoalesce = a ?? b;
+        delete sCoalesce;
+        return sCoalesce.area();
+    }
+}
+
+// A CONTAINER-owned element, bound by DECLARATION. The list's destructor frees every element, so
+// the box is a second owner. This clause of the proof (BorrowsOwnedElement) had NO leg at all in
+// this file or in Test/test_move.cb, which is how the ordering defect the next leg pins got in.
+// The diagnostic names the CONTAINER, never the local holding the borrow.
+expect_error("cannot delete interface 'sElemDecl'") {
+    int borrowElemDecl()
+    {
+        list<unique CircleB*> le;
+        le.add(new CircleB());
+        CircleB* e = le.get(0);
+        IShapeB sElemDecl = e;
+        delete sElemDecl;
+        return sElemDecl.area();
+    }
+}
+
+// The same element borrow acquired by ASSIGNMENT. This is the ORDER leg: the `=` sets PointerRebound
+// and SetVariableBorrowsOwnedElement re-establishes the element fact on that very same store, so a
+// predicate asking PointerRebound first retires a fact that is FRESHER than the bit retiring it.
+// It compiled and double-freed (exit 134) until BorrowsOwnedElement was moved above the retirement.
+// `nullptr` initializes, so the local is never owning and the IsOwning clause cannot reach the leg.
+expect_error("cannot delete interface 'sElemAssign'") {
+    int borrowElemAssign()
+    {
+        list<unique CircleB*> lf;
+        lf.add(new CircleB());
+        CircleB* g = nullptr;
+        g = lf.get(0);
+        IShapeB sElemAssign = g;
+        delete sElemAssign;
+        return sElemAssign.area();
+    }
+}
+
+// `p = q` between two borrowed PARAMETERS. `p` is STILL a borrow after the store, so retiring its
+// facts unconditionally laundered a double free that the identical program without the store
+// rejects. The proof is PROPAGATED from the RHS binding, and the diagnostic names 'q' - the binding
+// the value actually came from - not the LHS's own declaration origin.
+expect_error("cannot delete interface 'sPropagated'") {
+    int borrowPropagated(CircleB* p, CircleB* q)
+    {
+        p = q;
+        IShapeB sPropagated = p;
+        delete sPropagated;
+        return sPropagated.area();
+    }
+}
+
+// A one-hop COPY of a borrowed parameter. The raw `delete b;` on this binding has always been
+// rejected ("it aliases borrowed parameter 'p'"); boxing it was an accepted LAUNDERING of exactly
+// that, on the identical binding, and ran to a double free. The two spellings now agree, and it is
+// the reassignment retirement above - not dropping IsBorrowed - that keeps `b = new CircleB();`
+// before the box accepted (Test/test_move.cb's delete_box_hop_reassigned_* legs).
+expect_error("cannot delete interface 'sHop'") {
+    int borrowHop(CircleB* p)
+    {
+        CircleB* b = p;
+        IShapeB sHop = b;
+        delete sHop;
+        return sHop.area();
+    }
+}
+
+// `??=` between two borrowed PARAMETERS. `??=` is a JOIN - afterwards the binding holds either its
+// OLD referent (arm not taken) or the RHS's - so the fact survives exactly when BOTH sides prove an
+// owner, and the diagnostic must name both because which arm ran is a runtime choice. Retiring
+// unconditionally here laundered a double free that the raw `delete p;` on the same binding rejects.
+// The accept side of the same rule is delete_box_coalesce_* in Test/test_move.cb; taking the RHS
+// alone instead would false-reject the sole-owner-LHS leg there.
+expect_error("cannot delete interface 'sCoalesceJoin'") {
+    int borrowCoalesceJoin(CircleB* p, CircleB* q)
+    {
+        p ??= q;
+        IShapeB sCoalesceJoin = p;
+        delete sCoalesceJoin;
+        return sCoalesceJoin.area();
+    }
+}
+
+// The join with two DIFFERENT kinds of proof: a container element on the left, a borrowed parameter
+// on the right. Pins that the rendered owner is the JOIN and not just the first clause to match -
+// the element clause is asked first and would otherwise name the container alone.
+expect_error("cannot delete interface 'sCoalesceElemJoin' - it boxes an object that its container or 'q'") {
+    int borrowCoalesceElemJoin(CircleB* q)
+    {
+        list<unique CircleB*> lh;
+        lh.add(nullptr);
+        CircleB* eh = lh.get(0);
+        eh ??= q;
+        IShapeB sCoalesceElemJoin = eh;
+        delete sCoalesceElemJoin;
+        return sCoalesceElemJoin.area();
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

@@ -916,6 +916,25 @@ public:
         // (proven, never reassigned since); 'delete' would hand free() a non-heap address.
         bool ViewOfFixedArrayStorage = false;
         std::string ViewOfFixedArraySourceName; // name of the fixed array it was bound from, for the diagnostic
+        // compile-time: the box this interface LOCAL was last bound to is PROVEN to be one a
+        // different owner already frees. Cleared by any later binding. See SetInterfaceBoxIsBorrowed.
+        bool BorrowedInterfaceBox = false;
+        std::string BorrowedInterfaceBoxSource; // pre-rendered owner list, for the diagnostic
+        // Sticky: set once any binding hands this local a box that is NOT proven, and never cleared.
+        // From then on the local can never be rejected - walk order over the AST is not control flow.
+        bool InterfaceBoxProvenanceUnknown = false;
+        // compile-time: this POINTER binding was reassigned by a plain '='. Every "someone else
+        // frees this" fact established at its declaration is stale from here on.
+        bool PointerRebound = false;
+        // Set by that same '=' when the RHS binding itself proved another owner, so the proof is
+        // carried across the store instead of retired. Refreshed on every '='; see MarkPointerRebound.
+        bool InheritedKeepsOwner = false;
+        std::string InheritedKeepsOwnerSource; // that proof's rendered owner name, for the diagnostic
+        // The rebinding was a '??=', whose handler returns before the container-element refresh the
+        // plain '=' path runs. Suppresses the (possibly stale) element clause of the BOXING proof
+        // only - the raw-delete guard reads BorrowsOwnedElement directly and is deliberately
+        // untouched. See internal/issue/p2/coalesce-assign-skips-store-bookkeeping.md.
+        bool CoalesceRebound = false;
         // compile-time: explicitly 'move'd-out thin pointer local - null but plain-readable by
         // design; only a same-block '->'/'.'/'*'/'[]' DEREFERENCE is rejected (see MarkVariableExplicitlyMovedNull).
         bool ExplicitlyMovedNull = false;
@@ -1287,6 +1306,11 @@ public:
         InterfaceBoxSource Source = InterfaceBoxSource::Unknown;
         // The owning source was nulled and marked moved at this site, so the box is the sole owner.
         bool OwnershipTransferred = false;
+        // PROVEN at the boxing site: a nameable OTHER owner frees this object anyway, so deleting
+        // the box double-frees. See BindingKeepsOwnershipOfBoxedObject for what does and does not count.
+        bool SourceKeepsOwner = false;
+        // The AST spelling of that other owner, resolved where the binding was still in hand.
+        std::string SourceDisplayName;
     };
 
     /*
@@ -19728,6 +19752,94 @@ public:
         }
     }
 
+    /*
+     * Record at a BINDING SITE whether an interface local now holds a box the frame only BORROWS
+     * (see BorrowedInterfaceBox). Called with `borrowed == true` only when the boxing site PROVED
+     * it; every unresolvable provenance arrives as false.
+     *
+     * Exactly ONE of the two flags is sticky, and only the ACCEPT-direction one. A not-proven
+     * binding sets InterfaceBoxProvenanceUnknown, which is never cleared, so no later site can
+     * re-arm the rejection - the same one-way rule SetViewOfFixedArrayStorage uses. BorrowedInterfaceBox
+     * itself is NOT sticky: a later not-proven store clears it below, which is what keeps
+     * `IShapeB s = p; s = new SqMove(); delete s;` compiling. The cost of the sticky half is the
+     * reverse order - `IShapeB s = new Ci(); if (k) { s = p; } delete s;` stays accepted - and that
+     * is deliberate: walk order over the AST is not control flow, so a binding seen earlier in the
+     * text may not be the one that reaches the delete. A null box is neither proven nor unproven -
+     * it owns nothing and deleting it is a no-op - so callers skip this call entirely for one.
+     */
+    void SetInterfaceBoxIsBorrowed(const std::string& name, bool borrowed,
+                                   const std::string& sourceName = {})
+    {
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            NamedVariable* nv = nullptr;
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                nv = &it->second;
+            else if (auto it2 = frame.functionArgument.find(name); it2 != frame.functionArgument.end())
+                nv = &it2->second;
+            if (nv == nullptr) continue;
+            if (!borrowed)
+            {
+                nv->InterfaceBoxProvenanceUnknown = true;
+                nv->BorrowedInterfaceBox = false;
+                nv->BorrowedInterfaceBoxSource.clear();
+                return;
+            }
+            if (nv->InterfaceBoxProvenanceUnknown) return;
+            nv->BorrowedInterfaceBox = true;
+            nv->BorrowedInterfaceBoxSource = sourceName;
+            return;
+        }
+    }
+
+    /*
+     * A plain '=' into a POINTER binding retires the declaration-time facts about WHO frees what
+     * it points at. "This is a borrowed parameter" and "this borrows a container's element" are
+     * both true of the DECLARATION and false the moment the binding is pointed somewhere else -
+     * `int g(Ci* p) { p = new Ci(); ... }` makes the frame the sole owner.
+     *
+     * Retirement is NOT unconditional: when the RHS is itself a binding that PROVES another owner
+     * (`p = q;` between two borrowed parameters), the proof is PROPAGATED rather than dropped, or
+     * the store would launder a borrow into an unblamable one. `inheritedOwner` carries that
+     * proof's rendered owner name; empty means the RHS proved nothing and the facts really do go
+     * stale. The inherited proof is refreshed on EVERY '=', so it never outlives its own store.
+     *
+     * `coalesceJoin` marks a '??=' rebinding, whose handler returns before the element-borrow
+     * refresh. All three fields are written unconditionally so a later plain '=' clears whatever a
+     * '??=' left behind.
+     */
+    void MarkPointerRebound(const std::string& name, const std::string& inheritedOwner = {},
+                            bool coalesceJoin = false)
+    {
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            NamedVariable* nv = nullptr;
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                nv = &it->second;
+            else if (auto it2 = frame.functionArgument.find(name); it2 != frame.functionArgument.end())
+                nv = &it2->second;
+            if (nv == nullptr) continue;
+            nv->PointerRebound = true;
+            nv->InheritedKeepsOwner = !inheritedOwner.empty();
+            nv->InheritedKeepsOwnerSource = inheritedOwner;
+            nv->CoalesceRebound = coalesceJoin;
+            return;
+        }
+    }
+
+    // True when `slot` IS a function argument's own storage. Identity, never spelling: a local that
+    // merely SHARES a parameter's name is a different binding and must not be classified as one.
+    bool IsFunctionParameterStorage(const llvm::Value* slot) const
+    {
+        if (slot == nullptr) return false;
+        for (const auto& frame : stackNamedVariable)
+            for (const auto& [varName, nv] : frame.functionArgument)
+                if (nv.Storage == slot) return true;
+        return false;
+    }
+
     void MarkVariableUnmoved(const std::string& name)
     {
         if (name.empty()) return;
@@ -21018,6 +21130,21 @@ public:
 
     // The live binding whose Storage is `slot`, or empty. Recovers the NAME from the VALUE, so a
     // spelling that erased the binding can still reach the name-keyed move bookkeeping.
+    // The binding behind a slot, for guards that need its ownership flags and not just its name.
+    // Same search order as FindVariableNameByStorage; null when the slot is not a live binding.
+    const NamedVariable* FindVariableByStorage(const llvm::Value* slot) const
+    {
+        if (slot == nullptr) return nullptr;
+        for (const auto& frame : stackNamedVariable)
+        {
+            for (const auto& [varName, nv] : frame.namedVariable)
+                if (nv.Storage == slot) return &nv;
+            for (const auto& [varName, nv] : frame.functionArgument)
+                if (nv.Storage == slot) return &nv;
+        }
+        return nullptr;
+    }
+
     std::string FindVariableNameByStorage(const llvm::Value* slot) const
     {
         if (slot == nullptr) return {};

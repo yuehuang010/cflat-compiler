@@ -2021,6 +2021,240 @@ class CiMove : IShapeMove
 
 bool identityBool(bool b) { return b; }
 
+// A PROVABLY-BORROWED interface box and an OWNED one live in the SAME function. Rejecting
+// 'delete' of a borrowed box must not poison the OWNED box's delete: the provenance tag is per
+// VARIABLE, not per function. `p` stays the caller's to free; `owned` is freed here.
+int borrowAndOwnShape(CiMove* p)
+{
+    IShapeMove borrowed = p;
+    IShapeMove owned = new SqMove();
+    int both = borrowed.area() + owned.area();
+    delete owned;
+    return both;
+}
+
+move CiMove* makeCiMovePtr() { CiMove* m = new CiMove(); return move m; }
+
+/*
+ * The OWNERSHIP-ACQUISITION axis for the borrowed-box 'delete' guard. A pointer that received its
+ * `new` in a LATER statement is the box's ONLY owner, so deleting the box is correct - and
+ * `IsOwning` is set at declaration-with-initializer ONLY, so it is absent here for a reason that
+ * has nothing to do with borrowing. An early cut read that absence as proof of a borrow and
+ * hard-errored on every function below, with advice ("let the source release it") that LEAKS: the
+ * source releases nothing. dtorCount is the discriminator - a leak shows as a MISSING free.
+ */
+int lateAssignedOwnerBox()
+{
+    CiMove* c = nullptr;
+    c = new CiMove();
+    IShapeMove s = c;
+    int a = s.area();
+    delete s;
+    return a;
+}
+
+// The same late assignment reaching the box through an 'as' CAST rather than a plain initializer.
+int lateAssignedAsCastBox()
+{
+    CiMove* c = nullptr;
+    c = new CiMove();
+    IShapeMove s = c as IShapeMove;
+    int a = s.area();
+    delete s;
+    return a;
+}
+
+// Assigned inside a BRANCH, from a move-returning factory on one side and a bare `new` on the
+// other. Both arms leave the box as sole owner.
+int branchAssignedOwnerBox(bool k)
+{
+    CiMove* c = nullptr;
+    if (k) { c = makeCiMovePtr(); } else { c = new CiMove(); }
+    IShapeMove s = c;
+    int a = s.area();
+    delete s;
+    return a;
+}
+
+// Assigned inside a LOOP: the binding site is walked once but reached three times.
+int loopAssignedOwnerBox()
+{
+    int total = 0;
+    for (int i = 0; i < 3; i = i + 1)
+    {
+        CiMove* c = nullptr;
+        c = new CiMove();
+        IShapeMove s = c;
+        total = total + s.area();
+        delete s;
+    }
+    return total;
+}
+
+/*
+ * `alias` means the binding OPTS OUT of ownership tracking - its own scope-exit free is
+ * SUPPRESSED, so it frees NOTHING and the receiver is expected to delete it by hand. An early cut
+ * read that flag as "someone else frees it", which is backwards: it false-rejected this function
+ * and its advice ("let the source release it") leaked, since the source releases nothing.
+ */
+alias CiMove* aliasMakeCiMove() { CiMove* n = new CiMove(); return n; }
+
+int aliasReturnOwnerBox()
+{
+    CiMove* e = aliasMakeCiMove();
+    IShapeMove s = e;
+    int a = s.area();
+    delete s;
+    return a;
+}
+
+// An `alias` call result REASSIGNED to a fresh allocation. Whatever the declaration established is
+// stale; the local is now the sole owner. A plain `list<T*>` owns nothing, so its element is freed
+// by hand here too - which is what makes the expected count exactly 2.
+int aliasResultReassignedBox()
+{
+    list<CiMove*> l = default;
+    l.add(new CiMove());
+    CiMove* e = l.get(0);
+    e = new CiMove();
+    IShapeMove s = e;
+    int a = s.area();
+    delete s;
+    CiMove* kept = l.get(0);
+    delete kept;
+    return a;
+}
+
+// A local SHADOWING a parameter's name is a DIFFERENT binding and the sole owner of its own
+// allocation. A name-only parameter lookup classified it as the borrowed parameter and rejected
+// it - the caller's object is a second, unrelated allocation and frees separately.
+int shadowedParamNameBox(CiMove* p)
+{
+    int t = 0;
+    { CiMove* p = nullptr; p = new CiMove(); IShapeMove s = p; t = s.area(); delete s; }
+    return t + p->area();
+}
+
+// A PARAMETER pointed somewhere else before being boxed. "This is a borrowed parameter" is true of
+// the DECLARATION and false from the reassignment on: the frame is now the sole owner.
+int paramReassignedBox(CiMove* p)
+{
+    p = new CiMove();
+    IShapeMove s = p;
+    int a = s.area();
+    delete s;
+    return a;
+}
+
+// A parameter given a fallback allocation with '??='. That is a JOIN of "still the caller's borrow"
+// and "a fresh sole owner", so the provenance afterwards is UNKNOWN and the polarity rule accepts
+// it. Rejecting it was a false rejection whose only offered remedy - dropping the delete - LEAKED
+// (measured dtor=0). The cost of accepting is the other arm: called with a non-null argument this
+// same function double-frees, which is why the leg passes nullptr and nothing else.
+int coalesceAssignedOwnerBox(CiMove* p)
+{
+    p ??= new CiMove();
+    IShapeMove s = p;
+    int a = s.area();
+    delete s;
+    return a;
+}
+
+// A `list<unique T*>` element borrow given a fallback with '??='. The element was null, so the
+// frame's own allocation is the only object and the box's delete is the only free. `??=` returns
+// before the element-borrow refresh the plain '=' path runs, so the DECLARATION's element fact is
+// stale here; consulting it false-rejected this - which master compiles and runs at dtor=1 - and
+// the offered remedy leaked. The RAW `delete e;` spelling is left exactly as master has it.
+int coalesceElemFallbackBox()
+{
+    int a = 0;
+    {
+        list<unique CiMove*> lk = default;
+        lk.add(nullptr);
+        CiMove* ek = lk.get(0);
+        ek ??= new CiMove();
+        IShapeMove s = ek;
+        a = s.area();
+        delete s;
+    }
+    return a;
+}
+
+// The LHS is already the SOLE owner when '??=' runs, so the not-taken arm frees nothing on its own
+// (`IsOwning` is declaration-with-initializer only, and this local got its `new` in a later
+// statement) and the box's delete is the ONLY free. This is the leg that forces the join rule:
+// blaming the RHS alone would reject it, and its remedy would leak. `caller_alive` proves the
+// argument's object was never touched.
+int coalesceSoleOwnerLhsBox(CiMove* q)
+{
+    CiMove* c = nullptr;
+    c = new CiMove();
+    c ??= q;
+    IShapeMove s = c;
+    int a = s.area();
+    delete s;
+    return a;
+}
+
+// A one-hop COPY of a borrowed parameter, then REASSIGNED to a fresh allocation. This is the exact
+// case that once justified dropping IsBorrowed from the proof. It is covered by the reassignment
+// retirement instead, so IsBorrowed could be restored - which is what closes the laundering leg
+// borrowHop in Test/errors/err_delete_borrowed_interface_box.cb - at no cost here. The caller's
+// object must survive: `caller_alive` is what separates "reassigned correctly" from "aliased".
+int hopReassignedBox(CiMove* p)
+{
+    CiMove* b = p;
+    b = new CiMove();
+    IShapeMove s = b;
+    int a = s.area();
+    delete s;
+    return a;
+}
+
+// A `list<unique T*>` ELEMENT borrow reassigned to a fresh allocation before being boxed. The
+// element proof is REFRESHED by that same store (cleared, here), which is what makes it safe to
+// ask it ahead of the reassignment retirement - the ordering the borrowElemAssign leg pins from the
+// reject side. Count is 2: the boxed allocation freed by `delete s`, the element by the list's dtor.
+int elemBorrowReassignedBox()
+{
+    int a = 0;
+    {
+        list<unique CiMove*> lg = default;
+        lg.add(new CiMove());
+        CiMove* e = lg.get(0);
+        e = new CiMove();
+        IShapeMove s = e;
+        a = s.area();
+        delete s;
+    }
+    return a;
+}
+
+class PlainHolderMove { CiMove* h = default; };
+
+// A PLAIN pointer field read is ACCEPTED because nothing at the boxing site can prove another
+// owner frees it - not because it is provably safe. A holder with a hand-written destructor that
+// frees the same field WOULD double-free and is an open gap, identical on master. A `unique` field
+// carries that proof and IS rejected; see Test/errors/err_delete_borrowed_interface_box.cb.
+int plainFieldReadBox(PlainHolderMove* hh)
+{
+    IShapeMove s = hh.h;
+    int a = s.area();
+    delete s;
+    return a;
+}
+
+// Declared from a BORROW, then REASSIGNED to an owned box before the delete. Walk order over the
+// AST is not control flow, so the reassignment poisons the tag for good rather than recomputing
+// it - the delete must keep compiling. Called with `k` true, so the freed box is the owned one.
+int borrowThenOwnShape(CiMove* p, bool k)
+{
+    IShapeMove s = p;
+    if (k) { s = new SqMove(); }
+    delete s;
+    return 1;
+}
+
 // Interface INHERITANCE fixture for the '?:' rebox tests below: IDrawableBase extends
 // IShapeBase, so a Circle's IDrawableBase vtable has an extra 'draw' slot the IShapeBase
 // vtable does not - joining/rebinding across the two needs a real rebox, not a raw copy.
@@ -2366,6 +2600,134 @@ int testUniqueInterfaceTernary()
         passed += Test("iface_paren_assign_box_freed_once", dtorCount, 1);
     }
     passed += Test("iface_paren_assign_box_source_not_freed_again", dtorCount, 1);
+
+    /*
+     * FALSE-REJECTION tripwires for the borrowed-box 'delete' guard (the reject half lives in
+     * Test/errors/err_delete_borrowed_interface_box.cb, which cannot assert values). Every leg
+     * here compiles and gives these values on master too - they exist to catch the guard growing
+     * one cell too wide, which is how this area has failed before. Values, not "it compiled":
+     * SqMove.area() is 0 and CiMove.area() is 7, so the sums pin WHICH box each leg read, and
+     * dtorCount pins that each object is freed exactly once and never early.
+     */
+    dtorCount = 0;
+    {
+        CiMove* bOwner = new CiMove();
+        // 7 (borrowed CiMove) + 0 (owned SqMove); only the SqMove is freed inside the call.
+        passed += Test("delete_borrowed_box_owned_sibling_value", borrowAndOwnShape(bOwner), 7);
+        passed += Test("delete_borrowed_box_owned_sibling_freed_once", dtorCount, 1);
+        passed += Test("delete_borrowed_box_borrow_source_alive", bOwner->area(), 7);
+        delete bOwner;
+        passed += Test("delete_borrowed_box_borrow_source_freed_once", dtorCount, 2);
+    }
+
+    dtorCount = 0;
+    {
+        CiMove* rOwner = new CiMove();
+        passed += Test("delete_borrowed_box_reassigned_local", borrowThenOwnShape(rOwner, true), 1);
+        // Exactly one free inside the call: the SqMove the reassignment allocated.
+        passed += Test("delete_borrowed_box_reassigned_freed_once", dtorCount, 1);
+        passed += Test("delete_borrowed_box_reassigned_source_alive", rOwner->area(), 7);
+        delete rOwner;
+        passed += Test("delete_borrowed_box_reassigned_source_freed_once", dtorCount, 2);
+    }
+
+    // Every way a local can come to own a heap object before being boxed. All of these compile and
+    // free exactly once on master; the guard must not take any of them away. CiMove.area() is 7.
+    dtorCount = 0;
+    passed += Test("delete_box_late_assigned_value", lateAssignedOwnerBox(), 7);
+    passed += Test("delete_box_late_assigned_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    passed += Test("delete_box_late_ascast_value", lateAssignedAsCastBox(), 7);
+    passed += Test("delete_box_late_ascast_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    passed += Test("delete_box_branch_assigned_factory_arm", branchAssignedOwnerBox(true), 7);
+    passed += Test("delete_box_branch_assigned_new_arm", branchAssignedOwnerBox(false), 7);
+    passed += Test("delete_box_branch_assigned_freed_twice", dtorCount, 2);
+
+    dtorCount = 0;
+    passed += Test("delete_box_loop_assigned_total", loopAssignedOwnerBox(), 21);
+    passed += Test("delete_box_loop_assigned_freed_thrice", dtorCount, 3);
+
+    dtorCount = 0;
+    {
+        PlainHolderMove* ph = new PlainHolderMove();
+        ph->h = new CiMove();
+        passed += Test("delete_box_plain_field_read", plainFieldReadBox(ph), 7);
+        passed += Test("delete_box_plain_field_freed_once", dtorCount, 1);
+        delete ph;
+        // This holder frees nothing of its own, so the count stays at 1. That is what makes the
+        // probe well-defined - it is NOT a proof that a plain-field box is always safe to delete.
+        passed += Test("delete_box_plain_field_holder_frees_nothing", dtorCount, 1);
+    }
+
+    /*
+     * The two shapes a NEGATIVE read of an ownership flag false-rejected. Both compile and free
+     * exactly once on master, and in both the rejected local was the SOLE owner - so the advice
+     * "let the source release it" would have leaked. Free counts, not compilation, are what
+     * discriminates: a leg that only checked that these compile would not have caught either.
+     */
+    dtorCount = 0;
+    passed += Test("delete_box_alias_return_owner_value", aliasReturnOwnerBox(), 7);
+    passed += Test("delete_box_alias_return_owner_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    passed += Test("delete_box_alias_result_reassigned_value", aliasResultReassignedBox(), 7);
+    passed += Test("delete_box_alias_result_reassigned_freed_twice", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        CiMove* outer = new CiMove();
+        // 7 from the shadowing local's own object + 7 from the caller's, proving both are live.
+        passed += Test("delete_box_shadowed_param_value", shadowedParamNameBox(outer), 14);
+        passed += Test("delete_box_shadowed_param_freed_once", dtorCount, 1);
+        passed += Test("delete_box_shadowed_param_caller_alive", outer->area(), 7);
+        delete outer;
+        passed += Test("delete_box_shadowed_param_freed_twice", dtorCount, 2);
+    }
+
+    dtorCount = 0;
+    {
+        CiMove* held = new CiMove();
+        passed += Test("delete_box_param_reassigned_value", paramReassignedBox(held), 7);
+        passed += Test("delete_box_param_reassigned_freed_once", dtorCount, 1);
+        passed += Test("delete_box_param_reassigned_caller_alive", held->area(), 7);
+        delete held;
+        passed += Test("delete_box_param_reassigned_freed_twice", dtorCount, 2);
+    }
+
+    dtorCount = 0;
+    passed += Test("delete_box_coalesce_assigned_value", coalesceAssignedOwnerBox(nullptr), 7);
+    passed += Test("delete_box_coalesce_assigned_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        CiMove* kept = new CiMove();
+        passed += Test("delete_box_hop_reassigned_value", hopReassignedBox(kept), 7);
+        passed += Test("delete_box_hop_reassigned_freed_once", dtorCount, 1);
+        passed += Test("delete_box_hop_reassigned_caller_alive", kept->area(), 7);
+        delete kept;
+        passed += Test("delete_box_hop_reassigned_freed_twice", dtorCount, 2);
+    }
+
+    dtorCount = 0;
+    passed += Test("delete_box_elem_reassigned_value", elemBorrowReassignedBox(), 7);
+    passed += Test("delete_box_elem_reassigned_freed_twice", dtorCount, 2);
+
+    dtorCount = 0;
+    passed += Test("delete_box_coalesce_elem_fallback_value", coalesceElemFallbackBox(), 7);
+    passed += Test("delete_box_coalesce_elem_fallback_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        CiMove* qOwned = new CiMove();
+        passed += Test("delete_box_coalesce_sole_owner_value", coalesceSoleOwnerLhsBox(qOwned), 7);
+        passed += Test("delete_box_coalesce_sole_owner_freed_once", dtorCount, 1);
+        passed += Test("delete_box_coalesce_sole_owner_caller_alive", qOwned->area(), 7);
+        delete qOwned;
+        passed += Test("delete_box_coalesce_sole_owner_freed_twice", dtorCount, 2);
+    }
 
     /*
      * A '??' join into an interface. It joins through a SLOT rather than a phi, so its result
@@ -3933,7 +4295,7 @@ extern int main()
     total += 8;
 
     passed += testUniqueInterfaceTernary();
-    total += 98;
+    total += 144;
 
     passed += testTernaryInterfaceInheritanceRebox();
     total += 22;

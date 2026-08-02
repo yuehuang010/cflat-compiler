@@ -1,172 +1,172 @@
-# `delete` of a BORROWED interface box is not diagnosed (double free)
+# `RegisterInterfaceBox` dedupes on `FatValue` only (preventive)
 
-NARROWED 2026-07-31. This file was the 2026-07-30 consolidation of three files
-(`interface-boxing-guards-are-binding-dependent`,
-`null-coalesce-join-into-interface-not-boxed`,
-`interface-boxing-sites-not-fully-consolidated`) on the root "the boxing path decides what to do
-by looking up the source `NamedVariable`, so a spelling that carries no binding gets neither the
-guards nor, in one case, the boxing at all."
+NARROWED AGAIN 2026-08-02. The live defect this file carried - `delete` of an interface box whose
+object a different owner already frees is accepted and double-frees - is CLOSED. Only the
+preventive remainder below is left. The FILENAME and path are kept unchanged so the
+`[[interface-boxing-keyed-on-source-binding]]` links from [[interface-issue-queue]] and the related
+issues still resolve; the title no longer describes a live double free, and this is no longer a P1.
 
-That root is CLOSED. What is left is a DIFFERENT root that the old file's `?:` repro was blaming
-on the closed one - see "Why the `?:` repro is not the same bug" and "What was closed" below.
+## What was closed (2026-08-02)
 
-## PARKED WORK IN PROGRESS - branch `fix/delete-borrowed-box`, do not restart from scratch (2026-08-02)
+`delete <interface value>` is rejected when the boxing site can PROVE that a different owner frees
+the object. Eight spellings reached the double free and all eight now diagnose: a borrowed pointer
+PARAMETER, the assignment statement, a parenthesized source, an `as` cast, a box created inside a
+GENERIC, a `unique` FIELD read, the `?:` join and the `??` join. Regression legs:
+`Test/errors/err_delete_borrowed_interface_box.cb` (one leg per spelling, each pinning its own
+local's name, each mutation-tested individually) and the `delete_box_*` / `delete_borrowed_box_*`
+legs in `Test/test_move.cb` (the must-still-work half, which asserts values and free counts).
 
-An attempt ran the full fix-issue loop and **did not land**: all 3 review rounds were used and each
-found real defects, so per the workflow it was NOT merged. **The branch and worktree are
-deliberately left in place** at `/Users/felixhuang/source/cflat-fix-delete-borrowed-box`, branch
-`fix/delete-borrowed-box`, commit `b157a27`, one commit ahead of `master` = `ca5a02a`. Suite on the
-branch is green (556/0/8, examples 35/0) - green was never the bar it failed.
+### The proof, and the negative that must never be used as one
 
-**What the branch achieves** (verified by the main session): the live defect below IS closed for
-seven borrow spellings - pointer parameter, borrowed local, `alias` binding, `?:` join, `??` join,
-the assignment spelling, and a parenthesized source - each turning a silent exit-134/139 double free
-into a located diagnostic. It also closes the owning-`unique`-FIELD box read, which the round-1
-matrix had wrongly recorded as "already rejected by a pre-existing guard" when it was in fact a live
-double free.
+The rejection needs a POSITIVE proof of a NAMEABLE other owner, taken at the BOXING site while the
+source binding is still in hand. Six things count, in `BindingKeepsOwnershipOfBoxedObject`: the
+binding frees the object itself at scope exit (`IsOwning`); it reads a `unique` FIELD, whose
+synthesized destructor frees it; it borrows a CONTAINER's element; a proof PROPAGATED across an
+assignment from the RHS binding (`InheritedKeepsOwner`); it aliases a borrowed parameter
+(`IsBorrowed` with a named `BorrowedOrigin`); or it is a non-move pointer PARAMETER. It is recorded
+on the ledger as `InterfaceBoxRecord::SourceKeepsOwner`.
 
-**The recurring failure, across all three rounds, was the same one**: the guard kept treating
-something that is not proof of a second owner as proof, and false-rejecting correct programs. Five
-such shapes were found and fixed (late-assigned `new`; plain-field read through a parameter;
-`IsAliasBorrow`, which means the scope-exit free is SUPPRESSED and is therefore the opposite of
-evidence; a NAME-ONLY parameter lookup across every live frame; and a parameter reassigned in its
-own body). Each false rejection also emitted a remedy that LEAKED.
+`IsAliasBorrow` is excluded, measured false-rejecting a program master compiles and runs correctly:
+it is the OPPOSITE of this question. It means the binding's own scope-exit free is SUPPRESSED - it
+frees NOTHING. `alias` hands the lifetime to the receiver to manage by hand, so
+`alias T* e = makeT(); IS s = e; delete s;` is the CORRECT way to release it. Rejecting it both
+false-rejected and leaked, and contradicted the compiler itself, which accepts the raw `delete e;`
+for the same binding.
 
-**Why it is parked - three blockers open at the cap, all measured:**
+### Retirement, propagation, and why the clause ORDER is load-bearing
 
-1. **False rejection with a leaking remedy, via `??=`.** `MainListener.h:12025` returns before the
-   `operatorText == "="` retirement block at `:12086`, so `int f(Ci* p) { p ??= new Ci(); IS s = p;
-   delete s; }` keeps its declaration-time borrowed-parameter fact. Master runs it correctly
-   (`dtor=1`); the branch rejects, and its suggested remedy runs to `dtor=0` - it leaks. Round 3
-   fixed the plain-`=` acquisition spelling and left this one.
-2. **`MarkPointerRebound` retires too much - two real double frees now accepted that round 2 caught.**
-   (a) `int f(Ci* p, Ci* q) { p = q; IS s = p; delete s; }` - `p` is STILL a borrow after the store,
-   but the store clears the fact; compiles clean and exits 134. Deleting the single line `p = q;`
-   makes it reject, so one statement defeats the guard. (b) An ordering bug at
-   `MainListener.h:11257-11258`: `if (nv->PointerRebound) return false;` is checked BEFORE
-   `if (nv->BorrowsOwnedElement) return true;`, and `SetVariableBorrowsOwnedElement`
-   (`:13190-13201`) re-establishes the element taint on that very same `=`. Swapping the two lines
-   is the natural fix and costs no existing leg.
-3. **Dropping `IsBorrowed` reopened two double frees, and created a LAUNDERING PATH.** I verified
-   this directly: with `int f(Ci* p) { Ci* b = p; ... }`, the branch REJECTS `delete b;` but ACCEPTS
-   `IS s = b; delete s;` on the identical binding, and the accepted form exits 134. The same holds
-   for a one-hop copy of a `unique` field - the direct read is rejected, the copy is not, which
-   undercuts the branch's own flagship case. So the compiler forbids the raw spelling and permits
-   boxing around it. `IsBorrowed` was removed because it survives a reassignment that makes the
-   local a sole owner - but that is exactly what `MarkPointerRebound` now handles, so restoring
-   `IsBorrowed` BELOW the `PointerRebound` retirement should recover both shapes at no cost.
+Facts that can go stale are retired by `MarkPointerRebound` on a plain `=` into a pointer binding:
+"this is a borrowed parameter" is true of the DECLARATION and false once the binding points
+elsewhere. `int g(T* p) { p = new T(); ... }` makes the frame the sole owner, and both the
+shadowed-name and the reassigned-parameter forms were false-rejected before that retirement existed.
 
-**Structural note for whoever resumes**: the container-element clause is the one surviving proof
-with ZERO test coverage in either `Test/test_move.cb` or `Test/errors/`, and that is how blocker 2b
-got in. Add a leg for it first.
+Retirement is NOT unconditional, and it is not the only thing that store does. Three corrections,
+each measured against a binary built at the first cut of this guard:
 
-**Verified good, do not re-derive**: all four new must-still-work legs discriminate individually
-against the round-2 binary; all 8 `expect_error` legs fire individually under mutation; every
-diagnostic states only true things and every remedy compiles and frees correctly EXCEPT the `??=`
-one in blocker 1; `PointerRebound` lives on `NamedVariable` and needs no `--init` round-trip and
-nothing in `ResetForReanalysis`. The `'u'` vs `'UHolder.u'` naming residue is cosmetic and not
-ambiguous - the message is anchored in the offending class's own method, so the bare field name
-cannot point at the wrong field.
+- **`??=` is a JOIN and takes the JOIN rule, not either side alone.** Its handler `return`s before
+  the `operatorText == "="` block, so `int f(Ci* p) { p ??= new Ci(); IS s = p; delete s; }` kept
+  its declaration-time borrowed-parameter fact and was FALSE-REJECTED - master runs it correctly at
+  dtor=1 - and the diagnostic's own remedy (drop the delete) ran to dtor=0, a LEAK. Afterwards the
+  binding holds either its OLD referent (arm not taken) or the RHS's (arm taken), so the rule
+  mirrors the one for the `?:` / `??` joins:
+  - **Both sides prove** -> propagate, with the two owners rendered as a join
+    (`'p' or 'q'`, `its container or 'q'`). Retiring here instead laundered `p ??= q` between two
+    borrowed parameters into a double free that the raw `delete p;` on the same binding rejects.
+  - **Either side proves nothing** -> provenance unknown -> plain retirement.
 
-**Also filed from this work, and NOT on master** - retrieve from the branch rather than rewriting:
-`internal/issue/p1/delete-of-untracked-pointer-copy-not-diagnosed.md`, recording that
-`Ci* b = c; delete b;` off an owning local is undiagnosed on master too (exit 134). Its "file rather
-than reject" decision was independently verified correct.
+  "Proves" on the RHS is bounded by what proof RECOVERY can see: a load off a live binding's
+  alloca, on both the `=` and `??=` paths. A FIELD-read RHS is a load off a GEP and proves
+  nothing, even a `unique` field - see the accepted-gaps list below.
 
-## The live defect
+  Taking the RHS alone was considered and rejected: for `Ci* c = nullptr; c = new Ci(); c ??= q;`
+  the not-taken arm leaves `c` the SOLE owner (`IsOwning` is decl-with-init only, so `c` never
+  scope-exit-frees and the box's delete is the only free), so blaming `q` would be a false rejection
+  with a leaking remedy - the failure class this branch died on. `delete_box_coalesce_sole_owner_*`
+  in `Test/test_move.cb` is that leg.
 
-Deleting an interface box the receiver only BORROWS is accepted and double-frees at runtime. It
-needs no join at all - the minimal repro has no `?:` and no `??`:
+  Because the handler returns early, the `??=` store is also marked `CoalesceRebound`, which
+  suppresses the ELEMENT clause of this proof only: `SetVariableBorrowsOwnedElement` never runs for
+  `??=`, so the declaration's element fact may be stale, and it outranks the retirement by design.
+  Without that, `l.add(nullptr); T* e = l.get(0); e ??= new T(); IS s = e; delete s;` was
+  false-rejected with a leaking remedy while master runs it at dtor=1. The RAW-delete guard reads
+  `BorrowsOwnedElement` directly and is deliberately NOT gated - clearing the taint outright also
+  widened the raw guard, a behaviour change master does not have. The rest of the bookkeeping that
+  early return skips is [[coalesce-assign-skips-store-bookkeeping]].
+- **A proving RHS PROPAGATES instead of retiring.** `int f(Ci* p, Ci* q) { p = q; IS s = p;
+  delete s; }` leaves `p` a borrow, yet the store cleared the fact and the program compiled clean and
+  aborted (134); deleting the `p = q;` line made it reject. `MarkPointerRebound` now takes the RHS
+  binding's own rendered owner - recovered by STORAGE IDENTITY, never by spelling, so `p = q->next`
+  cannot resolve to its base object - and sets `InheritedKeepsOwner` when it proves. Empty is the
+  accept direction, so every shape that does not resolve retires exactly as before.
+- **The clauses a store REFRESHES outrank the bit that store sets.** `BorrowsOwnedElement` was asked
+  BELOW `PointerRebound`, while `SetVariableBorrowsOwnedElement` re-establishes the element taint on
+  that very same `=`. So `T* g = nullptr; g = l.get(0); IS s = g; delete s;` had a fact fresher than
+  the bit retiring it, and the stale bit won: accepted, exit 134. `BorrowsOwnedElement` and
+  `InheritedKeepsOwner` are now asked ABOVE the retirement; `IsBorrowed` and the parameter test,
+  which are DECLARATION-time, stay below it. `Test/test_move.cb`'s `delete_box_hop_reassigned_*` and
+  `delete_box_elem_reassigned_*` legs pin the accept side of exactly that ordering - moving
+  `IsBorrowed` above the retirement makes `Test/test_move.cb` fail to compile.
 
-```cflat
-interface IShape { int area(); };
-class Circle : IShape { int r = 0; int area() { return r * r; } ~Circle() {} };
+**`IsBorrowed` was briefly dropped from the proof** because it survives a reassignment that makes
+the local a sole owner (`T* b = p; b = new T();`). Dropping it opened a LAUNDERING PATH: for
+`int f(Ci* p) { Ci* b = p; ... }` the compiler REJECTED `delete b;` and ACCEPTED `IS s = b;
+delete s;` on the identical binding, and the accepted form aborted (134); same for a one-hop copy of
+a `unique` field. It is restored, asked BELOW the retirement - which is what the reassignment case
+actually needs - and gated on `!BorrowedOrigin.empty()`, the same pair of conditions the raw-delete
+guard uses, so the boxed and raw spellings now reject exactly the same set. Measured, not inferred:
+the reassignment legs behave identically on the pre-restore and post-restore binaries.
 
-int borrow(Circle* p)
-{
-    IShape s = p;      // p is BORROWED - the box borrows too, correctly
-    delete s;          // accepted; frees an object this frame does not own
-    return s.area();
-}
+The parameter test is by STORAGE IDENTITY, never by spelling: `IsFunctionParameter` is a name-only
+scan of every live frame, so a local SHADOWING a parameter's name was classified as that parameter
+and its solely-owned allocation was blamed on the caller.
 
-extern int main()
-{
-    Circle* c = new Circle(); c.r = 2;
-    int a = borrow(c);
-    delete c;          // second free
-    return a;
-}
-```
+**`OwnershipTransferred == false` is NOT a proof and an earlier cut used it as one.** It is also
+false for a pointer that received its `new` in a LATER statement (`T* c = nullptr; c = new T();`),
+because `IsOwning` is set at declaration-with-initializer only, so there was never anything for
+`RetireOwningSourceOfBoxedValue` to retire. Such a local is the box's ONLY owner, so deleting the
+box is correct - and the diagnostic's "let the source release it" advice LEAKED there, freeing
+nothing. Four natural spellings (late assignment, the assignment-statement box, assignment in a
+branch from a factory, assignment in a loop) were all false-rejected. A 513-file corpus sweep found
+this defect NOT AT ALL, because no in-repo `.cb` boxes a late-assigned pointer and deletes it; only
+a targeted acquisition-axis corpus found it.
 
-Exit 139 (use after free), no diagnostic, on the pre-fix and post-fix binaries alike.
+A field read is asked about the FIELD, never about the enclosing binding: a plain `T* h` field read
+through a parameter was briefly blamed on the parameter, false-rejecting a boxed
+`delete param->field`. A plain field is ACCEPTED because nothing proves another owner - NOT because
+it is safe: a holder whose hand-written destructor frees the same field still double-frees, exactly
+as on master, and that stays an open gap. `unique` carries the proof and is rejected.
 
-The `?:` / `??` join spelling is the same defect reached through the join's non-adoption rule:
+### The two flags, and which one is sticky
 
-```cflat
-Circle* a = new Circle(); a.r = 2;
-Circle* b = new Circle(); b.r = 3;
-IShape s = k > 0 ? a : b;   // a JOIN into a plain interface local: a BORROW by design
-delete s;                   // accepted; a and b still own, and free again at scope exit
-```
+`BorrowedInterfaceBox` is NOT sticky - any later not-proven binding clears it, which is what keeps
+`IShapeMove s = p; s = new SqMove(); delete s;` compiling. Only `InterfaceBoxProvenanceUnknown` is
+sticky, and only in the ACCEPT direction. The cost of that stickiness is exactly one shape:
+`IShapeB s = new Ci(); if (k) { s = p; } delete s;` stays accepted. That is deliberate - walk order
+over the AST is not control flow, so a binding seen earlier in the text may not be the one that
+reaches the delete - and it is the price of not false-rejecting the reverse order.
 
-Exit 133/134 on both binaries.
+### Deliberately accepted, and not regressions
 
-## Why the `?:` repro is NOT "boxing is keyed on the binding"
+- `T* c = new T(); T* b = c; IS s = b; delete s;` and the `alias T* b = c;` spelling still
+  double-free at runtime, exactly as on master. Filed as
+  [[delete-of-untracked-pointer-copy-not-diagnosed]] - the gap is not boxing-specific, the plain
+  `delete b;` spelling is equally undiagnosed, and closing it needs aliasing from `b` back to `c`.
+  The copy off a PARAMETER is a different case and IS rejected: it carries `IsBorrowed` with a
+  named origin, so there is a real proof to consult.
+- `IShapeB s = new Ci(); delete s; s = p; delete s;` - see the stickiness note above.
+- A plain `T* h` field whose holder has a HAND-WRITTEN destructor freeing it. Identical on master;
+  no proof is available at the boxing site, since a plain field carries no ownership marker.
+- `T* g = new T(); g = l.get(0); IS s = g; delete s;` - an element borrow assigned over an
+  ALREADY-OWNING local. `g` keeps a stale `IsOwning`, so the box takes ownership transfer from it
+  and the container frees the element too. Out of scope here: the RAW `delete g;` spelling
+  double-frees identically, on master and on this branch, so the defect is in the ownership
+  bookkeeping the raw guard reads, not in the boxing proof. The `nullptr`-initialized spelling of
+  the same program IS rejected (`borrowElemAssign`).
 
-The old file read the `?:` double free as a missing ownership TRANSFER and prescribed transferring
-per arm in `UpcastTernaryPhiToInterface`. That was implemented, measured and reverted on
-2026-07-31, and an independent review then rebuilt the branch WITH it enabled and measured it
-again; both runs agree it trades the double free for a use-after-null. **The full account, the
-mechanism, and why no guard can rescue it are the "DO NOT RETRY" paragraph of the
-`fix/iface-boxing` landed design record in [[interface-issue-queue]]** - that is the durable home,
-because this file is deleted when its (now different) bug is fixed. The short version: a join into
-a plain interface local is a BORROW by design, `Test/test_move.cb`'s
-`iface_ternary_thin_borrow_arm_*` legs pin it (nulling the owning arm exits 139 at
-`owner->area()`, `test.sh` 539/1), and the consume-vs-borrow fact lives on the DESTINATION, not on
-the arm.
+- GLOBAL bindings are outside the guard entirely - both a global pointer as the assignment LHS or
+  RHS, and a global interface RECEIVER (`IS gs = nullptr; gs = p; delete gs;`). Every clause is
+  gated on `AllocaInst` storage and every lookup scans `stackNamedVariable` only, so a
+  `GlobalVariable` binding can never be proven and always lands accept-direction. Measured rc=134 on
+  master, on the first cut of this guard, and here - pre-existing, not delta-introduced.
+- `T* e = nullptr; e ??= <proving RHS>;` - the null LHS proves nothing, so the join rule retires and
+  the shape is accepted. rc=134 on all three binaries; the deliberate cost of not false-rejecting
+  the sole-owner-LHS leg above.
+- A FIELD-read RHS is not recoverable as a proof, on the `=` path or the `??=` path: recovery
+  requires a load off a live binding's ALLOCA (`DescribeAssignedSourceOwner` /
+  `ProvingBindingForBoxedSource`), and a field read is a load off a GEP. This includes a `unique`
+  field: `int f(Ci* p, HoldU* hh) { p ??= hh->h; IS s = p; delete s; }` runs rc=134 on master, the
+  first cut, and here (the raw `delete p;` twin rejects), and the plain-`=` twin `p = hh->h;` misses
+  identically. Symmetric, pre-existing, accept-direction - a missed rejection, never a false one.
 
-So the join behaves as designed; the unchecked `delete` is the defect, and it is not
-join-specific.
+## Measured asymmetry left in place
 
-## Fix direction
+`int f(Ci* p) { Ci* b = p; b = new Ci(); delete b; }` is FALSE-REJECTED by the raw-delete guard
+("it aliases borrowed parameter 'p'") on master and here, while the boxed spelling of the same
+program is correctly accepted. The raw guard does not consult `PointerRebound`. Pinning the boxing
+proof to the raw guard's answer would therefore have imported a false rejection; the two agree on
+the un-reassigned binding, which is the case that mattered for the laundering path.
 
-Reject `delete <interface value>` when the value is PROVABLY a box the frame does not own. The
-provenance ledger `LLVMBackend::interfaceBoxRecords_` already records `Source` and
-`OwnershipTransferred` per box, and `SuppressCallerRelease` already marks a non-adopted join, so
-the facts exist. Polarity is the whole difficulty: reject only a box PROVEN borrowed (a ledgered
-record with `OwnershipTransferred == false` and a `Parameter` / non-owning `Source`, or a join the
-boxing site suppressed) and accept every value whose provenance cannot be resolved - a
-move-returning call, an `IShape` parameter, a field read, a re-boxed value. A `delete` that cannot
-be proven wrong must keep compiling.
-
-## What was closed (2026-07-31)
-
-- **Binding-erased SINGLE-VALUE sources.** `IShape s = (c);`, `IShape s = (c) as IShape;` and the
-  assignment-statement `s = (c);` skipped the ownership transfer because it keyed off the source
-  `NamedVariable`, which parentheses erase; both the box and `c` then owned the object and it was
-  freed twice. `BoxConcreteIntoInterface` now falls back to a VALUE-keyed retirement
-  (`RetireOwningSourceOfBoxedValue`): a pointer `LoadInst` off a live owning binding's slot is
-  nulled and marked moved, exactly as the plain `IShape s = c;` spelling does. That MOVE is a
-  RATIFIED behaviour change - `IShape s1 = (c); IShape s2 = (c);` compiled and ran before and is
-  now `use of moved variable 'c'`; see the landed design record. Regression legs:
-  `Test/test_move.cb` `iface_paren_box_*`, `iface_paren_as_box_*`, `iface_paren_assign_box_*`.
-- **`??` into an interface was never boxed at all** (LLVM module-verifier dump, no source
-  location). `??` joins through a SLOT, so its result is a plain load and its arms cannot be
-  recovered from the IR; the lowering now ledgers them (`RegisterNullCoalesceJoin`) and
-  `UpcastNullCoalesceToInterface` boxes per arm through the same `BoxInterfaceJoinArms` core `?:`
-  uses. An unresolvable arm now gets the `?:` wording with `??` named as the operator. Legs:
-  `Test/test_move.cb` `iface_nullcoalesce_left_arm` / `_right_arm`,
-  `Test/errors/err_nullcoalesce_iface_arm_unresolved.cb`. Only the DECL-INIT and ASSIGNMENT
-  spellings were wired up; the RETURN and CALL-ARGUMENT spellings are still broken and are filed
-  as [[nullcoalesce-join-not-boxed-on-return-and-call-arg]].
-- **The two open-coded boxing sites** (the assignment STATEMENT on the `=` path and
-  `CoerceInitValueToInterface` for brace / element init) are routed through
-  `BoxConcreteIntoInterface`, which is now the only place a single concrete source is boxed. Sites
-  whose destination runs its own ownership bookkeeping (a FIELD store refcounts an escaping `new`
-  rather than nulling the source) pass `adoptsOwnership = false`, so routing them changed no
-  behaviour.
-
-## Still open, preventive (was "the second sharp edge, NARROWED")
+## Still open, preventive
 
 `RegisterInterfaceBox` still dedupes on `FatValue` only, so two records sharing BOTH a
 `DataPointer` and the same `Source` resolve first-registered-wins. Harmless today: such a pair is
@@ -175,6 +175,8 @@ variable`). Closing it properly means keying the dedupe on `(FatValue, DataPoint
 
 ## Related
 
+[[delete-of-untracked-pointer-copy-not-diagnosed]] - the accepted gap above.
 [[return-dangle-missed-when-slot-has-extra-user]] - its residue wants the same provenance-based
-reasoning as the fix direction above. [[nullcoalesce-join-not-boxed-on-return-and-call-arg]] -
-the unfinished half of the `??` work. [[interface-issue-queue]]
+reasoning the closed half above now uses.
+[[nullcoalesce-join-not-boxed-on-return-and-call-arg]] - the unfinished half of the `??` work.
+[[interface-issue-queue]]
