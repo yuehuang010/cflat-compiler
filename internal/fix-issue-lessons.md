@@ -54,6 +54,41 @@ the work these came out of. `internal/testing-notes.md` holds the mechanics of t
 - Never let the agent that wrote a fix be the only one to hunt for its consequences. Rounds 6
   and 7 of the `if const` attempt each INTRODUCED the next defect while fixing the previous one.
 
+## On the reference you are matching
+
+- **When the fix is "make X agree with Y", Y is an ORACLE and must be verified
+  independently before you trust it.** On 2026-08-02 `S gs = {1,2};` at global scope silently
+  zeroed while the identical local spelling was rejected, so the fix was specified as "make the
+  global declarator agree with the local one". The agent copied the local path's gating
+  condition (`initializer->initializerList()`), which carried the identical hole: a second brace
+  spelling lives on `initDecl` directly, so `S gs {1,2};` bypassed the new guard entirely and
+  the filed bug survived its own fix. **Agreement with a broken reference is invisible to a
+  strategy built on agreement** - every check available to that strategy said the two scopes now
+  matched, and they did, including in the hole. The measurement that exposed it was running the
+  ORACLE against itself: local `S ls = { a=1,b=2 }` gives `a=1 b=2`, local `S ls { a=1,b=2 }`
+  gives `a=0 b=0`.
+- Corollary for the axis list: a construct's SYNTAX spellings are a separate axis from the types
+  and scopes it appears in. That enumeration covered struct/union/class, global/local,
+  namespaced, `static`, `const`, containers, arrays and nesting, and never asked how the
+  initializer itself could be written. The existing spelling-axis lesson is about NAME spellings
+  (bare/qualified/aliased); this is its syntactic twin and was missed because the first pattern
+  matched so readily.
+
+## On claims of equivalence between two binaries
+
+- **"Pre-existing" / "unchanged" / "not a regression" is a MEASUREMENT, and it must be taken in
+  the exact spelling the claim is about.** Two such claims were wrong in a single 2026-08-02
+  issue. A filed P1 said its repro was "identical on both `58d5d27` and `26d1fe2`" using the
+  bare spelling; measured, `S* p = {a=1}` really was identical (`0x1` both sides) while
+  `S* p {a=1}` went from `ptr undef` to `inttoptr (i64 1 to ptr)` - changed by the very commit
+  filing the issue. Separately a coverage cell reported as "now deep-copies exactly like the
+  named-local spelling" in fact leaked 16 bytes the named-local form does not.
+- Both errors have the same shape: equivalence INFERRED from a sibling spelling rather than
+  measured per spelling. In an issue where two spellings behaved differently pre-fix - which was
+  the whole finding - inference between them is exactly the step that cannot be taken.
+- Cost: one round-trip each, after the fact, on work already believed finished. Requiring a
+  measured pre/post pair with every equivalence claim is cheaper than any of them.
+
 ## On changing approach vs. patching
 
 - **When site enumeration misses twice, change the method - do not add two more sites.** The
@@ -144,6 +179,19 @@ The recurring failure mode of this whole family, stated once:
   hide. This is why a green run is worth trusting for what it covers: the failure family here
   includes binding to the wrong template, which links cleanly and would pass any compile-only
   check. Keep this property when adding legs.
+- **Assert the RESOURCE, not only the value, when the change touches ownership or lifetime -
+  and for EVERY owning type the change can reach.** On 2026-08-02 a unique-field fix wrote 23
+  value legs that rigorously asserted destructor counts (`no_early_free`, `freed_once`,
+  `source_nulled`) for the `Node*` it was reasoning about, and asserted values only for the
+  `string` case. The values were correct - the leaked buffer was the OLD destination, not the
+  one being read - so the leg passed while the commit leaked 16 bytes. Nothing in the suite said
+  so; the evidence was `Test/test_move.cb` itself moving from 13 allocations / 256 bytes to
+  14 / 272 under `leaks --atExit`. The discipline was present and applied to one axis; the
+  defect landed in the neighbouring one.
+- **A leg that cannot fail is worse than no leg, because it reads as coverage.** The same file
+  carried `Test("uae_string_elem_copy_survived_teardown", 1, 1)` - literally `1 == 1`. Sweep new
+  legs for this before reporting: any leg whose expression cannot produce a value other than the
+  expected one, and any leg that would still pass with the fix reverted.
 - **One spelling tests one code path - so enumerate the axes BEFORE writing the legs.** This,
   not assertion strength, is where the misses came from. Two axes were each missed twice: the
   **spelling axis** (bare vs qualified vs aliased vs inferred use of the same name) and the

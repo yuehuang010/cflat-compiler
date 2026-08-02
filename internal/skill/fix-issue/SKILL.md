@@ -70,6 +70,15 @@ compiler):**
   - **Spelling axis**: every spelling that reaches the same code path - bare,
     namespace-qualified, aliased (`using X = ...`), as a generic argument,
     nested, inferred. Past fixes have been half-done along this axis twice.
+  - **Syntax axis**: every way the SAME construct can be written, which is a
+    different question from what type it is written on. `T x = {...}` vs
+    `T x {...}`; prefix vs postfix; parenthesized vs bare receiver; the
+    statement form vs the declaration form. On 2026-08-02 an enumeration
+    covered struct/union/class, global/local, namespaced, `static`, `const`,
+    containers, arrays and nesting - every axis about TYPES and SCOPES - and
+    missed that the grammar carries a second brace spelling on `initDecl`.
+    The filed bug survived the fix untouched under a one-character-different
+    spelling, and it cost the most expensive round of that issue.
   - **Collision axis**: the same name declared in two scopes, plus its
     unique-name twin (the twin proves the bare spelling reaches its own key).
   - **Neighbour axis**: adjacent construct kinds that flow through the same
@@ -91,13 +100,56 @@ compiler):**
 - Fix ALL cells that share the root cause, not just the filed spelling. If a
   cell genuinely needs separate work, say so explicitly per cell (it may become
   a new issue file).
+- **Audit every COPY of the predicate you are changing, and report per-site.**
+  Before reporting, grep for every site that asks the same question the fixed
+  predicate asks - the same field comparison, the same flag test, the same
+  early-out - and state for each whether it has the same defect and why it does
+  or does not need the same treatment. A site left out of the report is a site
+  nobody checked. On 2026-08-02 this cost two separate defects in one day: a
+  gating condition existed in both the global and the local declarator path and
+  only one was fixed, and `CallerName ==` existed at two sites where fixing one
+  turned an abort into a silent 16-byte leak. When the same instruction was
+  finally given up front, the agent produced a clean three-site audit
+  immediately. This is the third recorded instance of "go find the other
+  copies"; it is now a required deliverable, not a review finding.
 - Regression tests must cover every in-scope cell of the matrix, assert VALUES
   (never "it compiled"), and each leg must fail on the pre-fix binary for the
   reason its comment states - state the discriminator that proves the leg
   reaches the arm it names.
+- **Assert the RESOURCE, not only the value, wherever the change touches
+  ownership, lifetime, or destruction** - free counts, null-after-move, and an
+  actual leak measurement (`leaks --atExit` on macOS). A value can be right
+  while the resource is wrong. On 2026-08-02 a fix's own new leg asserted string
+  values only; the values were correct because the leaked buffer was the OLD
+  destination, so the leg passed while the commit leaked 16 bytes. The suite
+  caught it only because `Test/test_move.cb` itself moved from 13 allocations /
+  256 bytes to 14 / 272. Apply this to EVERY owning type the change can reach,
+  not just the one being reasoned about - that fix counted destructors
+  rigorously for `Node*` and not at all for `string`, and the defect landed in
+  the gap.
+- **Sweep your own new legs for ones that cannot fail** before reporting. A leg
+  like `Test("x_survived_teardown", 1, 1)` asserts `1 == 1` and can never go
+  red; it reads as coverage and is worse than no leg. Any leg that would still
+  pass with the fix reverted is in the same category - check by reverting.
 
 The prompt must also contain:
 
+- **Claims discipline.** Every "pre-existing" / "unchanged" / "not a regression"
+  / "identical on both binaries" claim must ship with a MEASURED pre/post pair,
+  in the exact spelling the claim is about. Asserting equivalence by inference
+  from a sibling spelling is banned: on 2026-08-02 two such claims were wrong in
+  one issue - `S* p = {a=1}` really was identical on both binaries while
+  `S* p {a=1}` went from `undef` to `0x1`, and a string cell reported as "now
+  deep-copies exactly like the named-local" in fact leaked 16 bytes. Each cost a
+  full round-trip to correct after the fact.
+- **The oracle caution.** If the fix is specified as "make X agree with Y" - a
+  scope matching another scope, a new path matching an existing one - Y must be
+  verified INDEPENDENTLY before it is used as the reference. On 2026-08-02 the
+  local declarator was the oracle for the global one, the agent copied its
+  gating condition, and that condition carried the identical hole. Every check
+  the agent could run said the two scopes now matched, and they did, including
+  in the hole. Agreement with a broken reference is invisible to a strategy
+  built on agreement.
 - The absolute worktree path, and an instruction to do ALL work there.
 - The full issue text (summary, repro, root cause, fix direction) pasted inline.
 - The relevant sections of `internal/fix-issue-lessons.md` (at minimum "On
@@ -136,6 +188,23 @@ agents have reported work that did not exist. A report with no coverage matrix,
 or a matrix whose cells were never run pre-fix, is incomplete: send it back
 before review, not into review.
 
+**Do that verification as ONE pass, and send ONE message.** Read the whole diff,
+every new or changed issue file and test comment, and run your probe matrix -
+then write a single consolidated message. Do NOT stream findings as you notice
+them. On 2026-08-02 one issue took nine agent invocations and about 63 minutes
+of agent wall-clock for an 88-line guard; four of the nine were maintainer
+findings and the last two were a comment naming a case the code never reaches
+and a false measurement in an issue file - each of which cost a full invocation
+plus a mandatory bar re-run for a change that touched only prose. All of them
+were discoverable in one reading.
+
+**Skip the full bar for provably doc-only amendments.** Confirm with
+`git diff --stat` that no `.h`/`.cpp`/`.cb` file is touched, and say in the
+message that the bar is being skipped for that reason. A rebuild plus
+`test.sh` plus the example gate is several minutes; spending it to re-prove that
+a markdown edit did not change the compiler is pure overhead. Anything touching
+compiler sources or `Test/` still runs the full bar, always.
+
 If the agent fails or flails at `sonnet`, escalate ONCE to `opus` with the failure
 context appended - do not retry the same tier verbatim, and do not absorb the work
 into the main session.
@@ -170,6 +239,12 @@ is not clean.
   commit with `git commit --amend`, never stacked as follow-up commits. Then
   re-review, scoping the next round to what the last round CHANGED and saying
   what not to re-verify - narrowly-scoped rounds found the worst defects.
+- **Carry cosmetic findings as a punch-list into the next SUBSTANTIVE round**
+  rather than spending a round-trip on each. A comment with a wrong example, an
+  over-long comment, a message that mis-describes a declaration - none of these
+  justify their own agent invocation and bar re-run. Accumulate them and attach
+  them to the next round that has real work in it. Correctness findings and
+  false claims in a tracked record still go back immediately.
 - Repeat until the review is clean or 3 rounds have elapsed.
 - If still not clean after 3 rounds, STOP. Do not merge. Report the outstanding
   findings and leave the worktree in place for the user.
