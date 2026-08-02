@@ -10376,6 +10376,145 @@ public:
         return owner.empty() ? field : owner + "." + field;
     }
 
+    /*
+     * Flatten a constant-offset address chain to its root value, accumulating the byte offset.
+     * Stops at the first non-constant index (a runtime array subscript), reporting allConstant
+     * false - the caller then knows nothing about that address and must not conclude anything.
+     */
+    static llvm::Value* ResolveConstantOffsetRoot(llvm::Value* addr, const llvm::DataLayout& dl,
+                                                  llvm::APInt& offset, bool& allConstant)
+    {
+        allConstant = (addr != nullptr);
+        if (addr == nullptr) return nullptr;
+        addr = addr->stripPointerCasts();
+        while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(addr))
+        {
+            if (!gep->accumulateConstantOffset(dl, offset)) { allConstant = false; break; }
+            addr = gep->getPointerOperand()->stripPointerCasts();
+        }
+        return addr;
+    }
+
+    /*
+     * True when an address bottoms out in a STACK or GLOBAL object, walking the whole GEP chain
+     * (an array element is two or more GEPs deep). Such storage is default/zero-initialized, so
+     * destructing the old value in a slot is safe. A chain rooted at a LOAD - a pointer receiver
+     * or an array view - is NOT, since a raw-malloc'd block holds uninitialized garbage and
+     * destructing that corrupts the heap. Same trade, and same polarity, as the closure store.
+     */
+    static bool AddressRootIsStackOrGlobal(llvm::Value* addr)
+    {
+        if (addr == nullptr) return false;
+        addr = addr->stripPointerCasts();
+        while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(addr))
+            addr = gep->getPointerOperand()->stripPointerCasts();
+        return llvm::isa<llvm::AllocaInst>(addr) || llvm::isa<llvm::GlobalVariable>(addr);
+    }
+
+    /*
+     * PROOF that two LoadInsts yield the same pointer: they read the same address in one basic
+     * block with no memory write in between, so nothing can have changed the loaded value. An
+     * array reached through a pointer or an array VIEW re-loads its base for each element, so
+     * without this the two roots are distinct Values and nothing about them is provable.
+     */
+    bool SameLoadedPointer(llvm::Value* a, llvm::Value* b)
+    {
+        auto* la = llvm::dyn_cast_or_null<llvm::LoadInst>(a);
+        auto* lb = llvm::dyn_cast_or_null<llvm::LoadInst>(b);
+        if (la == nullptr || lb == nullptr || !la->isSimple() || !lb->isSimple()) return false;
+        if (la->getParent() == nullptr || la->getParent() != lb->getParent()) return false;
+        if (compilerLLVM == nullptr || compilerLLVM->module == nullptr) return false;
+        const llvm::DataLayout& dl = compilerLLVM->module->getDataLayout();
+        llvm::Value* pa = la->getPointerOperand();
+        llvm::Value* pb = lb->getPointerOperand();
+        if (!pa->getType()->isPointerTy() || !pb->getType()->isPointerTy()) return false;
+        unsigned bits = dl.getIndexTypeSizeInBits(pa->getType());
+        if (bits != dl.getIndexTypeSizeInBits(pb->getType())) return false;
+        llvm::APInt offA(bits, 0), offB(bits, 0);
+        bool okA = false, okB = false;
+        llvm::Value* rootA = ResolveConstantOffsetRoot(pa, dl, offA, okA);
+        llvm::Value* rootB = ResolveConstantOffsetRoot(pb, dl, offB, okB);
+        if (!okA || !okB || rootA == nullptr || rootA != rootB || offA != offB) return false;
+        // No store, call, or other memory writer may sit between the two reads.
+        const llvm::Instruction* first = la->comesBefore(lb) ? la : lb;
+        const llvm::Instruction* last  = (first == la) ? lb : la;
+        for (auto it = std::next(first->getIterator()); &*it != last; ++it)
+            if (it->mayWriteToMemory()) return false;
+        return true;
+    }
+
+    /*
+     * PROOF that two lvalues denote DIFFERENT slots: both flatten to the SAME root with
+     * all-constant offsets and those offsets DIFFER. A runtime subscript (`arr[i].slot`) leaves a
+     * non-constant index and answers false, so an unprovable pair stays treated as a self-assign -
+     * the polarity that makes an unseen case a missing diagnostic, never a false rejection.
+     */
+    bool ProvablyDifferentSlots(llvm::Value* a, llvm::Value* b)
+    {
+        if (a == nullptr || b == nullptr || a == b) return false;
+        if (compilerLLVM == nullptr || compilerLLVM->module == nullptr) return false;
+        const llvm::DataLayout& dl = compilerLLVM->module->getDataLayout();
+        if (!a->getType()->isPointerTy() || !b->getType()->isPointerTy()) return false;
+        unsigned bits = dl.getIndexTypeSizeInBits(a->getType());
+        if (bits != dl.getIndexTypeSizeInBits(b->getType())) return false;
+        llvm::APInt offA(bits, 0), offB(bits, 0);
+        bool okA = false, okB = false;
+        llvm::Value* rootA = ResolveConstantOffsetRoot(a, dl, offA, okA);
+        llvm::Value* rootB = ResolveConstantOffsetRoot(b, dl, offB, okB);
+        if (!okA || !okB || rootA == nullptr) return false;
+        if (rootA != rootB && !SameLoadedPointer(rootA, rootB)) return false;
+        return offA != offB;
+    }
+
+    /*
+     * The WRITTEN spelling of an INDEXED field-read RHS ("arr[1].slot", "p->arr[0].slot"), for a
+     * diagnostic that would otherwise name the slot from CallerName - which is the CONTAINER for
+     * an array element, so "<caller>.<field>" points at element 0 and its `move` remedy either
+     * transfers the wrong slot or does not compile at all. Keyed on the SOURCE TEXT rather than
+     * the GEP shape because a zero index folds its element GEP away, and that is exactly the
+     * element whose name-derived spelling is wrong. Returns empty for anything that is not a
+     * plain indexed lvalue path, leaving the name-derived spelling in place.
+     */
+    static std::string IndexedFieldPathText(const std::string& text)
+    {
+        if (text.find('[') == std::string::npos) return {};
+        std::string path = text;
+        for (size_t at = path.find("->"); at != std::string::npos; at = path.find("->", at))
+            path.replace(at, 2, ".");
+        // Outside brackets the text must be a bare lvalue path - a leading '(' would make the
+        // whole thing a parenthesized expression, not a path. Inside an index, arithmetic and a
+        // cast are allowed: the index still spells one element and `move <text>` still parses.
+        int depth = 0;
+        for (char c : path)
+        {
+            if (c == '[') { ++depth; continue; }
+            if (c == ']') { if (--depth < 0) return {}; continue; }
+            if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') continue;
+            if (depth == 0 && c == '.') continue;
+            if (depth > 0 && (c == '.' || c == '+' || c == '-' || c == '*' || c == '/'
+                              || c == '%' || c == ' ' || c == '(' || c == ')')) continue;
+            return {};
+        }
+        return depth == 0 ? text : std::string();
+    }
+
+    /*
+     * The one spelling of a `unique` field SOURCE that is known to name the right slot, or empty
+     * when none is. The written text wins for an indexed path; otherwise the name-derived
+     * "<caller>.<field>" is trusted only when it IS what the user wrote. Empty means the caller
+     * must not put any expression in a `move` remedy - naming the wrong element silently
+     * transfers the wrong pointee, which is worse than the missing diagnostic this all replaced.
+     */
+    std::string ExactUniqueFieldAccess(const LLVMBackend::NamedVariable& nv,
+                                       const std::string& srcText)
+    {
+        std::string indexed = IndexedFieldPathText(srcText);
+        if (!indexed.empty()) return indexed;
+        std::string derived = DescribeUniqueFieldAccess(nv);
+        if (srcText.empty() || derived.empty()) return derived;
+        return srcText == derived ? derived : std::string();
+    }
+
     // Spell the source expression a `unique` field was read through, as the user wrote it
     // ("b.p", or bare "p" for a self-field access), so a diagnostic can suggest `move <that>`.
     std::string DescribeUniqueFieldAccess(const LLVMBackend::NamedVariable& nv)
@@ -10559,9 +10698,21 @@ public:
      */
     void RejectUniqueFieldToUniqueField(const LLVMBackend::NamedVariable& rightNV,
                                         const std::string& fieldDesc,
-                                        antlr4::ParserRuleContext* ctx)
+                                        antlr4::ParserRuleContext* ctx,
+                                        const std::string& srcText = {})
     {
-        std::string access = DescribeUniqueFieldAccess(rightNV);
+        std::string access = ExactUniqueFieldAccess(rightNV, srcText);
+        if (access.empty())
+        {
+            // No spelling is known to be right, so name NO expression: "<caller>.<field>" would
+            // name element 0 here, and `move` on that transfers the wrong slot (silently).
+            LogErrorContext(ctx, std::format(
+                "cannot store unique field '{}' into {} - the source field's synthesized destructor "
+                "already frees it, and two 'unique' fields cannot own one pointer. Prefix the source "
+                "expression with 'move' to transfer ownership out of the source field (which nulls it).",
+                rightNV.FieldName.empty() ? std::string("<field>") : rightNV.FieldName, fieldDesc));
+            return;
+        }
         LogErrorContext(ctx, std::format(
             "cannot store unique field '{}' into {} - the source field's synthesized destructor "
             "already frees it, and two 'unique' fields cannot own one pointer. Use 'move {}' to "
@@ -12517,11 +12668,24 @@ public:
             bool srcIsStructField = (srcFieldGep && srcFieldGep->getNumIndices() == 2
                 && srcFieldGep->getSourceElementType()->isStructTy())
                 || rightNV.IsInterfaceField;
-            // Two interface-field reads both carry an EMPTY CallerName, so this can misread a
-            // two-receiver copy as a no-op (interface-field-self-assign-false-positive.md).
+            // Names cannot tell two receivers apart (an element's CallerName is the CONTAINER), so
+            // only this proof can. DIAGNOSTICS may use it as-is; anything that EMITS a copy or a
+            // destruct must use the -Initialized form, which also requires both slots to root in
+            // stack/global storage. A slot reached through a heap pointer may hold garbage, and
+            // deep-copying or destructing that is a SIGSEGV, so those paths keep the old no-op.
+            bool provablyDifferentSlots = ProvablyDifferentSlots(destination, rightNV.Storage);
+            bool provablyDifferentInitializedSlots = provablyDifferentSlots
+                && AddressRootIsStackOrGlobal(destination)
+                && AddressRootIsStackOrGlobal(rightNV.Storage);
             bool selfFieldAssign = !namedVar.FieldName.empty()
                 && namedVar.FieldName == rightNV.FieldName
-                && namedVar.CallerName == rightNV.CallerName;
+                && namedVar.CallerName == rightNV.CallerName
+                && !provablyDifferentSlots;
+            // The store-side twin of selfFieldAssign, for the copy/destruct paths below.
+            bool sameFieldStore = !namedVar.FieldName.empty()
+                && namedVar.FieldName == rightNV.FieldName
+                && namedVar.CallerName == rightNV.CallerName
+                && !provablyDifferentInitializedSlots;
 
             // Self-assign of a `unique` field is one owner, not two, so neither reject below may
             // fire on it. selfFieldAssign misses the bare `item = item` inside a method: that
@@ -12532,6 +12696,8 @@ public:
                 || (namedVar.FieldName.empty() && rightNV.FieldName.empty()
                     && !namedVar.TypeAndValue.VariableName.empty()
                     && namedVar.TypeAndValue.VariableName == rightNV.TypeAndValue.VariableName);
+            // Store-side twin, for the one helper below that COPIES as well as rejects.
+            bool selfUniqueFieldStore = selfUniqueFieldAssign || sameFieldStore;
 
             // A suppressed (mixed) '?:' join of an owning-value struct: neither an existing owning
             // local nor a field can carry the suppression, so reject before any store path runs.
@@ -12553,7 +12719,7 @@ public:
             // records whether it produced the copy, so the field-to-field block below does not copy again.
             bool rejectCopied = false;
             if (operatorText == "=" && destIsStructField
-                && RejectOwningValueCopyIntoField(rightNV, right, selfUniqueFieldAssign, rejectCopied, ctx))
+                && RejectOwningValueCopyIntoField(rightNV, right, selfUniqueFieldStore, rejectCopied, ctx))
                 return right;
 
             // A PROVABLE stack address into a scalar `unique` field: the shape gate keeps the
@@ -12623,12 +12789,13 @@ public:
                 std::string destDesc = std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar));
                 // Temp source first: it is the more specific shape, and only its message names a
                 // remedy that exists (`move <temp>.<field>` is rejected as unaddressable).
+                std::string srcText = assignCtx != nullptr ? assignCtx->getText() : std::string();
                 if (IsUniqueTempFieldRead(rightNV))
                     RejectUniqueTempFieldToField(rightNV, destDesc, ctx);
                 else if (destOwnsUniqueInterface)
                     RejectUniqueInterfaceFieldToField(rightNV, destDesc, ctx);
                 else
-                    RejectUniqueFieldToUniqueField(rightNV, destDesc, ctx);
+                    RejectUniqueFieldToUniqueField(rightNV, destDesc, ctx, srcText);
                 return right;
             }
 
@@ -12650,7 +12817,7 @@ public:
                 && rightNV.FieldName.empty()
                 && rightNV.Storage != nullptr
                 && !rightNV.CallerName.empty()
-                && !selfFieldAssign)
+                && !sameFieldStore)
             {
                 auto argNV = compiler->GetFunctionArgument(rightNV.CallerName);
                 bool srcIsByValueStringParam =
@@ -12708,7 +12875,7 @@ public:
                 && (rightNV.IsOwningString || rightNV.BorrowsOwnedString)
                 && rightNV.Storage != nullptr
                 && !rightNV.TypeAndValue.IsMove
-                && !selfFieldAssign)
+                && !sameFieldStore)
             {
                 if (rightNV.IsOwningString && !rightNV.BorrowsOwnedString)
                     right = compiler->EmitOwnedStringDeepCopy(right);
@@ -12727,7 +12894,7 @@ public:
             // copy()) stays REJECTED - it has no safe generic duplicate.
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && destIsStructField && srcIsStructField
-                && !selfFieldAssign
+                && !sameFieldStore
                 && !rightNV.TypeAndValue.IsMove
                 && rightNV.TypeAndValue.TypeName == namedVar.TypeAndValue.TypeName
                 && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))
@@ -12851,15 +13018,14 @@ public:
             // variable-RHS move is already handled and returned above at the MOVE path, and an explicit
             // `move` RHS is nulled below, so only a temp/call-result RHS reaches here for a local dest).
             // Container element stores are excluded (would double-free if touched here).
-            bool sameField = !namedVar.FieldName.empty()
-                && namedVar.FieldName == rightNV.FieldName
-                && namedVar.CallerName == rightNV.CallerName;
             bool destIsLocalOwningVar = namedVar.FieldName.empty()
                 && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination));
+            // sameFieldStore, not selfFieldAssign: this EMITS a destruct, so it may only treat two
+            // elements as distinct when both root in known-initialized stack/global storage.
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && (destIsStructField || destIsLocalOwningVar)
                 && destination != rightNV.Storage
-                && !sameField
+                && !sameFieldStore
                 && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))
             {
                 // NOTE: closes the reassignment LEAK but does NOT fix aliasing of an owning-value RHS -

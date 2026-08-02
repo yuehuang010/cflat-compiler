@@ -3067,6 +3067,163 @@ MoveBox<unique Resource*> makeMoveBox()
     return b;
 }
 
+// An array of `unique`-owning holders: the receiver shape whose CallerName is the CONTAINER
+// ("arr") on BOTH sides of a field-to-field copy, so the self-assign discriminator used to read
+// two different elements as one slot. See Test/errors/err_unique_array_element_field_to_field.cb.
+struct ElemHolder { unique Resource* slot = nullptr; };
+struct ElemOuter { ElemHolder[2] arr = default; };
+// A COPYABLE owning value with a counting destructor: the element-to-element store copies it
+// rather than being rejected, so the reassignment-destruct of the OLD value is observable.
+int elemBufDtor = 0;
+struct ElemBuf
+{
+    string b = default;
+    ElemBuf copy() { ElemBuf r = default; r.b = b.copy(); return r; }
+    ~ElemBuf() { elemBufDtor = elemBufDtor + 1; }
+};
+struct ElemBufHolder { ElemBuf f = default; };
+
+/*
+ * Array-ELEMENT receivers of a `unique` / owning field store. The reject added for
+ * element-to-element copies must prove the two slots differ before firing, so every shape whose
+ * indices are NOT provably different has to keep compiling AND keep its exact free count here.
+ * Each leg asserts a value and a free COUNT: a widened reject shows up as a compile error, a
+ * store that silently aliased shows up as a double count.
+ */
+int testUniqueArrayElementFieldStore()
+{
+    int passed = 0;
+
+    // Runtime index, SAME index variable - a genuine self-assign the compiler cannot distinguish
+    // from a two-element copy. Must stay a no-op: one owner, value intact, freed exactly once.
+    dtorCount = 0;
+    {
+        ElemHolder[2] arr = default;
+        int i = 0;
+        arr[i].slot = new Resource();
+        arr[i].slot->id = 61;
+        arr[i].slot = arr[i].slot;
+        passed += Test("uae_rt_self_value", arr[i].slot->id, 61);
+        passed += Test("uae_rt_self_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uae_rt_self_freed_once", dtorCount, 1);
+
+    // Runtime index, DIFFERENT index variables holding the SAME value. Nothing is provable here,
+    // so it must be ACCEPTED - rejecting it would take away a program that frees correctly.
+    dtorCount = 0;
+    {
+        ElemHolder[2] arr = default;
+        int i = 0;
+        int j = 0;
+        arr[i].slot = new Resource();
+        arr[i].slot->id = 62;
+        arr[i].slot = arr[j].slot;
+        passed += Test("uae_rt_diff_value", arr[i].slot->id, 62);
+        passed += Test("uae_rt_diff_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uae_rt_diff_freed_once", dtorCount, 1);
+
+    // CONSTANT index, SAME on both sides - provably the same slot, so a real self-assign and
+    // still a no-op. This is the polarity control for the reject: same offset, no rejection.
+    dtorCount = 0;
+    {
+        ElemHolder[2] arr = default;
+        arr[0].slot = new Resource();
+        arr[0].slot->id = 63;
+        arr[0].slot = arr[0].slot;
+        passed += Test("uae_const_self_value", arr[0].slot->id, 63);
+        passed += Test("uae_const_self_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uae_const_self_freed_once", dtorCount, 1);
+
+    // The remedy the new element-to-element message names, spelled with the element index.
+    // It transfers, nulls the source element, and the two pointees are freed exactly twice.
+    dtorCount = 0;
+    {
+        ElemHolder[2] arr = default;
+        arr[0].slot = new Resource();
+        arr[0].slot->id = 64;
+        arr[1].slot = new Resource();
+        arr[1].slot->id = 65;
+        arr[0].slot = move arr[1].slot;
+        passed += Test("uae_move_remedy_value", arr[0].slot->id, 65);
+        passed += Test("uae_move_remedy_source_nulled", arr[1].slot == nullptr ? 1 : 0, 1);
+        passed += Test("uae_move_remedy_old_freed", dtorCount, 1);
+    }
+    passed += Test("uae_move_remedy_freed_twice", dtorCount, 2);
+
+    // Assigning `new` directly into an element stays a plain adoption - two elements, two owners,
+    // two frees. The reject must not reach a source that is not a field read at all.
+    dtorCount = 0;
+    {
+        ElemHolder[2] arr = default;
+        arr[0].slot = new Resource();
+        arr[0].slot->id = 66;
+        arr[1].slot = new Resource();
+        arr[1].slot->id = 67;
+        passed += Test("uae_new_into_elem_first", arr[0].slot->id, 66);
+        passed += Test("uae_new_into_elem_second", arr[1].slot->id, 67);
+        passed += Test("uae_new_into_elem_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uae_new_into_elem_freed_twice", dtorCount, 2);
+
+    // An element through a POINTER receiver, runtime index - the base is re-loaded per access, so
+    // even with one index variable nothing is provable. Must be accepted and free exactly once.
+    dtorCount = 0;
+    {
+        ElemOuter o = default;
+        ElemOuter* p = &o;
+        int i = 1;
+        p->arr[i].slot = new Resource();
+        p->arr[i].slot->id = 68;
+        p->arr[i].slot = p->arr[i].slot;
+        passed += Test("uae_ptr_rt_self_value", p->arr[i].slot->id, 68);
+        passed += Test("uae_ptr_rt_self_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uae_ptr_rt_self_freed_once", dtorCount, 1);
+
+    // An owning field copied element-to-element must destruct the OLD destination and deep-copy,
+    // exactly as the named-local spelling does. A plain `string` field cannot express that here -
+    // its destructor is not observable in-language and the VALUES are identical either way, so a
+    // string leg would pass on every binary. ElemBuf below is the same store with a counting
+    // destructor, which is what actually discriminates; see uae_elem_reassign_destructs_old.
+
+    /*
+     * The reassignment-destruct leg. `sameField` is a SECOND copy of the same name comparison and
+     * gates the destruct that frees the OLD destination value; with only the first copy fixed the
+     * element store stopped aborting but silently leaked the old buffer, which no value leg can
+     * see. ElemBuf has a hand-written copy() (so the store copies rather than being rejected) and
+     * a counting destructor, so the destruct is observable in-language: exactly one per store.
+     * The named-local spelling is asserted beside it as the reference answer.
+     */
+    {
+        ElemBufHolder[2] a = default;
+        a[0].f.b = "aa" + "bb";
+        a[1].f.b = "cc" + "dd";
+        elemBufDtor = 0;
+        a[0].f = a[1].f;
+        passed += Test("uae_elem_reassign_destructs_old", elemBufDtor, 1);
+        passed += Test("uae_elem_reassign_dest", a[0].f.b == "ccdd" ? 1 : 0, 1);
+        passed += Test("uae_elem_reassign_src_alive", a[1].f.b == "ccdd" ? 1 : 0, 1);
+    }
+    {
+        ElemBufHolder x = default;
+        ElemBufHolder y = default;
+        x.f.b = "aa" + "bb";
+        y.f.b = "cc" + "dd";
+        elemBufDtor = 0;
+        x.f = y.f;
+        passed += Test("uae_local_reassign_destructs_old", elemBufDtor, 1);
+    }
+    // LIMIT: a receiver reached through a POINTER or an array VIEW re-loads its base, so the
+    // storage cannot be proven initialized and the copy/destruct is NOT emitted for it (doing so
+    // SIGSEGVs on a raw-malloc'd block). Those shapes keep the pre-fix aliasing and cannot be
+    // asserted here - they abort at teardown. The `unique` REJECT is a diagnostic and still fires
+    // for them; err_unique_array_element_field_to_field.cb pins the p-> and view forms.
+
+    return passed;
+}
+
 /*
  * The shapes deliberately left LEGAL by the `unique` field-store rejects in
  * Test/errors/err_unique_borrow_into_field.cb. Each asserts a value and a free COUNT, so a
@@ -3795,6 +3952,9 @@ extern int main()
 
     passed += testUniqueFieldStoreRemedies();
     total += 20;
+
+    passed += testUniqueArrayElementFieldStore();
+    total += 24;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
