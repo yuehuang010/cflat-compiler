@@ -170,9 +170,9 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 11 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 33 |
-| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 24 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 10 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 37 |
+| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 27 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
 Counts re-verified from disk on 2026-08-01 (`ls internal/issue/p{1,2,3}/*.md ui/*.md | wc -l` per
@@ -194,6 +194,22 @@ file recorded on 2026-07-31.
 > is the one taken after the second merge. Not hand-arithmetic - counted directly per the
 > command above.
 
+Counts re-verified from disk on 2026-08-02 (same `ls | wc -l` per bucket), on `fix/global-positional`:
+**9 P1 / 37 P2 / 27 P3 / 7 UI = 80 total.** The bucket table above was stale before this
+recount (it still read 11/33/24, but the true pre-existing disk count on `master` at the time
+was already 10 P1 / 34 P2 / 26 P3 - drifted from unrelated fixes/filings between 2026-08-01 and
+this round, never caught because nothing had re-verified the table since). Net movement this
+round: one P1 fixed and deleted ([[global-struct-positional-init-silently-zeroes]]), and four
+new issues filed in its place - three P2 ([[class-no-ctor-default-construct-returns-undef]],
+[[struct-field-default-brace-list-discarded]], [[interface-typed-global-brace-init-discarded]])
+and one P3 ([[global-struct-no-initializer-ignores-field-defaults]]). All four were found by
+review of that P1's fix, not by the original investigation - the same pattern this file has
+recorded before (see the 2026-08-01 paragraph above).
+
+A further review round of the same fix filed a FIFTH: [[pointer-decl-field-init-brace-corrupts-pointer-storage]]
+(P1 - `S* p {a=1};` writes a nonsense address into `p` itself). Current true count:
+**10 P1 / 37 P2 / 27 P3 / 7 UI = 81 total.**
+
 ### P1 - wrong programs and crashes (`p1/`)
 
 | Issue | Severity |
@@ -203,11 +219,11 @@ file recorded on 2026-07-31.
 | [[null-interface-access-residue-unproven-receivers]] | SIGSEGV (139), no diagnostic. NARROWED 2026-08-02 by `78c678b`: the PARENTHESIZED field access `(lv).tag` is CLOSED (all paren depths, plus the write form `(lv).tag = 5`). What remains is struct-field / array-element / global receivers. The `?.`, branch-, loop-, parameter- and folded-`if const` shapes are DELIBERATELY accepted per the ratified design and are NOT residue. |
 | [[funcptr-overload-binding-ignores-signature]] | NARROWED 2026-07-31 by `fix/funcptr-arg-accept-set`: the type-CLASS axis is closed on both paths (the filed `double`-into-`int` repro now errors). Still open, silent and identical on master: floating-point WIDTH (same SHAPE as the closed repro), integer width/signedness, POINTEE type (memory-unsafe - reads past the end of the object), and aggregates. Do NOT re-close by widening the comparison to spellings; see the file. |
 | [[llvm-cannot-select-sign-extend-on-const-array-index]] | Compiler crash. **CORRECTED 2026-08-02**: the `Cannot select` / exit-134 TEXT is NOT reproducible on `ca5a02a` - what reproduces is a bare SIGSEGV, exit 139, no output, and only when a CONSTANT-index element read follows the row assign (a `%s` whole-row read or a runtime index miscompiles silently instead). The decl-init, whole-array-assign and ROW-assign shapes that fed it are all rejected now; the backend node itself is still undiagnosed. |
-| [[global-struct-positional-init-silently-zeroes]] | Silent miscompile, exit 0. `S g = {1,2};` at FILE scope compiles clean and reads back `0 0`; the identical LOCAL spelling is properly rejected ("positional initializers are not supported"). The two scopes disagree about whether the construct exists. Global fixed-ARRAY brace lists are unaffected and work. Pre-existing, identical on `ca5a02a`. Filed 2026-08-02. |
 | [[multidim-array-view-binding-loses-shape]] | Silent miscompile. The `T[][]` view spelling drops the row stride, so `auto` over a 2-D fixed array has no correct target to deduce to. Residual of the 1-D fixed-array-shape fix. |
 | [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. An interface-field-to-interface-field copy with the SAME field name on both sides is misread as a self-assign, suppressing the reject. **ATTEMPTED AND REVERTED 2026-08-01** - see the file for the three discriminators that cannot work (names, box storage, and a bare `Value` compare of the field address all fail at least one witness). A sound test needs real dataflow through the box to the underlying data pointer. |
 | [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. An array-element receiver (`arr[0].slot = arr[1].slot`) bypasses the field-to-field guard entirely because `ParentVariableName`/`CallerName` name the CONTAINER, so both sides match and the self-assign carve-out swallows a genuine two-owner store. Identical on the pre-fix binary - not caused by `3d33bfe`. |
 | [[temp-unique-field-into-borrow-slot-use-after-free]] | Use-after-free, compiles clean and exits 0 on both binaries. A temp's `unique` field bound into a NON-unique (borrow) slot with a destructor-less pointee: the temp's `Box` destructor frees the pointee before the load. No `unique` claim on the destination for a guard to key on. |
+| [[pointer-decl-field-init-brace-corrupts-pointer-storage]] | Silent miscompile, memory-unsafe. `S* p = {a=1};` compiles clean, exits 0, and leaves `p` holding the nonsense address `0x1` (built from the field VALUE, not any real object) on BOTH `58d5d27` and `af68158` - genuinely pre-existing. The BARE spelling `S* p {a=1};` is NOT an identical baseline: PRE it is `undef` (the bare-brace bug `fix/global-positional` closes), POST it is the same `0x1` as the '=' spelling, now reached because that fix made the two spellings agree. `EmitFieldInitializer` GEPs into `alloc` assuming it addresses an `S`, but for a pointer declaration `alloc` addresses the POINTER's own 8-byte slot. Found by review of `fix/global-positional`'s comments; the bug itself is not caused or fixed by that commit, though it does change the bare spelling's specific wrong value - see the file. Filed 2026-08-02. |
 
 ### P2 - false rejections, unavailable features, ownership holes (`p2/`)
 
@@ -247,6 +263,9 @@ file recorded on 2026-07-31.
 | [[deref-of-moved-pointer-guard-inside-callee]] | ownership | False positive: guarded only by a conditionally-terminating callee. |
 | [[owning-temp-ledgers-should-be-split]] | ownership | `ownedReturnTemps_` fails UNSAFE, `ownedNewTemps_` fails SAFE. |
 | [[detection-ledgers-not-discarded-on-aborted-arm]] | ownership | Detection-only ledgers survive an aborted `?:` arm. |
+| [[class-no-ctor-default-construct-returns-undef]] | miscompile | A `class` with no user-written constructor default-constructs to IR `undef`, not zero - the synthesized zero-arg constructor's body never stores anything before returning. The `struct` twin (same fields, no constructor) is correct (real zero-init). Found while reviewing `[[global-struct-positional-init-silently-zeroes]]`'s fix; unrelated root cause. Filed 2026-08-02. |
+| [[struct-field-default-brace-list-discarded]] | miscompile | A struct FIELD's own `= { x = 1, y = 2 }` default brace list is silently discarded when the containing struct is default-constructed - the field lands all-zero instead. Found auditing the same fix for neighbouring shapes; different code path (a field's default expression, not a variable declarator). Filed 2026-08-02. |
+| [[interface-typed-global-brace-init-discarded]] | miscompile | `I gi = { a = 1 };` on an interface-typed global compiles clean with the brace list silently dropped, no diagnostic. The `[[global-struct-positional-init-silently-zeroes]]` fix's guard cannot see it - `GetDataStructure("I").StructType` is null for an interface name, so this falls through unguarded. Found by review of that fix. Filed 2026-08-02. |
 
 ### P3 - diagnostics, latent, deliberate deferrals (`p3/`)
 
@@ -278,6 +297,7 @@ file recorded on 2026-07-31.
 | [[nondeterministic-ir-switch-case-order]] | methodology | No miscompile - a METHODOLOGY hazard. Read it before using "0 IR diffs" as proof. |
 | [[iface-namespace-follow-ups]] | follow-up | Items 2-6 of the round-1 review of `c9acb6c`. Item 1 is RESOLVED (`853cb87`); items 4 and 5 were fixed by `15809e0`. Item 5's remainder (annotation/template key split) is reachable only on the Windows `[uuid]` / `[winrt]` path. |
 | [[iface-ifconst-blame-attempt-shelved]] | shelved | READ BEFORE attempting the `if const` blame diagnostic again. A serious attempt shelved after eight review rounds / nine defects. |
+| [[global-struct-no-initializer-ignores-field-defaults]] | miscompile | A global struct with NO initializer at all zeroes instead of honoring its fields' own `= default` expressions (`struct S { int a = 9; }; S gs;` reads `0`, not `9`). The LOCAL declarator handles this correctly (calls the default constructor). Lower severity than the sibling P1/P2 findings in this family because a working spelling exists. Found while reviewing `[[global-struct-positional-init-silently-zeroes]]`'s fix. Filed 2026-08-02. |
 
 ### UI and Win32 (`ui/`)
 
@@ -370,6 +390,7 @@ which a future session must not "fix" back without reopening the decision.
 | `delete` of an array view rejected when the view was bound from fixed-array storage; provenance tracked DECLARATION-ONLY | `11e85a1` |
 | Provably-null interface access rejected at COMPILE TIME; no runtime guard (RATIFIED) | `3311842` |
 | Temp-source and fat-interface `unique` field stores rejected; the implied-move pointer guard in all THREE copies | `3d33bfe` |
+| Brace-list initializer on a global (or bare-brace local) struct/union/class/container rejected instead of silently discarded (RATIFIED) | fix/global-positional (branch, not yet merged) |
 
 Suite trajectory across the whole sequence: 522 -> 530 -> 536 -> 538 -> 540.
 
@@ -1686,3 +1707,120 @@ key-space work because two ratification records lean on a message that names the
   dropped to a bare `T`). Probing it settled the grouping: the `auto` binding and the array-to-array
   copy DID share the decl-init path and were fixed together; [[fixed-array-parameter-not-callable]]
   did not and remains open. See the fixed-array shape record below.
+
+### fix/global-positional - brace-list globals rejected, both scopes and both brace spellings (RATIFIED)
+
+Closes [[global-struct-positional-init-silently-zeroes]].
+
+**What is now rejected.** A struct/union/class-typed variable with a non-empty brace-list
+initializer, in EITHER spelling (`S x = {...};` or the bare `S x {...};`, which carry the list on
+different grammar nodes - `initializer->initializerList()` vs. `initDecl`'s own
+`LeftBrace()`/`initializerList()` - and previously only the `=` spelling was even considered):
+
+- At GLOBAL scope: both the positional form (`S gs = {1,2};`) and the named form
+  (`S gs = {a=1,b=2};`) are rejected. Positional gets the same diagnostic the LOCAL declarator
+  already gave ("positional initializers are not supported for struct type 'S'; use 'field =
+  value'"); named gets a new one, since the local declarator DOES support named field-init but
+  there is no compile-time-constant construction path for it at global scope.
+- Generic containers (`list<T>`, `array<T>`, `dictionary<K,V>`) hit the identical fallthrough at
+  global scope and get their OWN message - their positional form is exactly what the LOCAL
+  declarator supports (desugars to `add()`/`set()` calls), so "use 'field = value'" would be a
+  false remedy for them.
+- At LOCAL scope, the bare-brace spelling is now routed through the same handling the `=`
+  spelling already had: bare positional (`S ls {1,2};`) is rejected exactly like `S ls = {1,2};`
+  always was; bare named (`S ls {a=1,b=2};`) now WORKS exactly like `S ls = {a=1,b=2};` always
+  did (assigns the fields for real) - this is not a new reject, it closes a silent-zero gap the
+  local declarator had for one specific spelling.
+
+**Why reject rather than implement, at global scope.** A global's initializer must be an LLVM
+`Constant` built at compile time; the local declarator's named-field-init path stores through a
+real stack `alloca` (`EmitFieldInitializer`) and its container path emits real `add()`/`set()`
+CALL instructions (`TryEmitContainerInitializer`) - neither has any global counterpart, and
+building one (recursively constant-folding arbitrary field-initializer expressions, or inventing
+a global-constructor mechanism for containers) is a materially larger feature than closing a
+silent-discard bug. Rejecting turns "compiles clean, wrong value, exit 0" into a diagnostic with
+a working remedy (`= default` then assign fields in a function, verified to actually compile and
+produce the right values) - strictly safer, and swept against `Test/`, `example/`, and
+`cflat/core/` first: no `.cb` anywhere in the tree declared a global struct/union/class/container
+with a brace-list initializer, so nothing that worked before this change stopped working.
+
+**The container carve-out from round 1 of this fix was wrong and got reverted in round 2.**
+The first pass exempted `list__`/`array__`/`dictionary__` types from the new guard on the theory
+that implementing their construction was out of scope - but leaving them unrejected preserved
+the EXACT bug the issue was filed for for those three types (silent discard, no diagnostic,
+`list<int> g = {1,2,3};` at global scope compiled clean and read back empty). Rejecting a
+construct needs nothing the struct case did not already have; only IMPLEMENTING it needs the
+missing global-constructor mechanism. Read as a general lesson: when a "cannot implement, so
+carve out" decision is made, check whether REJECTING the carved-out shape was actually blocked
+by the same constraint - usually it is not.
+
+**The mangled-name-prefix container test is verdict-invariant by construction.** `isContainerType`
+(matching `list__`/`array__`/`dictionary__`, the same prefixes `TryEmitContainerInitializer`
+already keys on) selects WORDING ONLY - a miss degrades to the less-precise but still-true
+struct/union/class message, never to acceptance. Kept as a prefix test rather than a proper type
+property because none exists on `StructData` to distinguish a generic container from a plain
+aggregate; a future refactor that adds one should switch this over.
+
+**Three more user-visible behaviour changes ride along with the bare-brace-spelling work, all
+found by review and all worth recording explicitly rather than leaving implicit in the diff.**
+
+1. A PRIMITIVE-typed local declaration with a non-empty brace list (`int x {5};` / the
+   pre-existing `int x = {5};`) now REJECTS with an accurate message ("brace initializer with
+   values is not supported on 'x' - 'int' is not a struct/union/class or a recognized
+   container..."). PRE, the bare spelling silently read an UNINITIALIZED garbage value (`x`
+   held whatever was already on the stack, e.g. `x=1876644176`, compiled clean, exit 0) - a
+   second, independent silent-garbage bug this fix's bare-brace routing exposed by finally
+   giving `right` a value to fall through to `EmitFieldInitializer` with. The `=` spelling
+   already rejected before this fix, but with the SAME misdescriptive message
+   ("'int' is not a known struct type") this change also corrects for both spellings. Primitive
+   brace-VALUE-init (making `int x {5};` actually assign `5`) is NOT implemented - that is a
+   language feature, out of scope for this bug fix, and not filed as its own issue since nothing
+   currently depends on it and the reject is the safe default. Note this does NOT apply at
+   GLOBAL scope: `int x = {5};` / `int x {5};` at file scope are a different, PRE-EXISTING
+   silent-zero gap (confirmed identical on `58d5d27`, unaffected by this fix in either
+   direction) - primitive globals are not struct-shaped, so the guard in this fix's global path
+   (gated on `GetDataStructure(...).StructType != nullptr`) never sees them, exactly like the
+   interface-typed-global gap recorded below.
+2. Empty bare-brace (`T x {};`) now zero-initializes on types that PRE left as uninitialized
+   garbage: a primitive (`int x {};` -> PRE garbage, POST `0`) and a pointer, including `unique`
+   (`S* p {};` / `unique S* p {};` -> PRE a non-null garbage POINTER VALUE, POST `nullptr`). This
+   is because `GenerateDefaultValue` is now called unconditionally for ANY `barebraceInit`
+   (empty or not) rather than only when the brace list was non-empty - the empty case simply
+   never took the old "apply field overrides" step, so it inherits the safe default. Silent and
+   strictly safer, which is exactly the kind of change that needs a record rather than the kind
+   that does not: a caller relying on `S* p {};` NOT being null (there should be none - reading
+   an uninitialized garbage pointer is undefined behaviour in the first place) would observe a
+   different, DEFINED value now.
+3. A NON-empty bare-brace field-init on a POINTER declaration (`S* p {a=1};`) changed VALUE, not
+   just verdict: PRE, `undef` (stable at one garbage bit pattern on a given build, e.g.
+   `0x1f7808100`, per `--out-lli` literally `ptr undef`, since the bare spelling's brace list was
+   discarded entirely - the exact bug this fix closes for struct/container/primitive); POST,
+   the deterministic bogus address `0x1` (the SAME pre-existing pointer-corruption bug the `=`
+   spelling already had, now reached by the bare spelling too because both now share one code
+   path). Both values are wrong and neither is safe to dereference; this is the routing fix
+   working as intended (making the two spellings agree) colliding with a DIFFERENT, unfixed
+   pre-existing bug ([[pointer-decl-field-init-brace-corrupts-pointer-storage]], filed, not
+   fixed here) rather than a new defect class of its own. Recorded here because "from undef to
+   a different wrong value" is still a measured behaviour change, and a first draft of that
+   issue file wrongly called the bare spelling's value identical across both binaries -
+   corrected in the file itself; this entry exists so the design record does not repeat that
+   error.
+
+**Left open, filed separately, NOT closed by this change** (all found during Phase A enumeration
+or the review rounds of this fix, all confirmed to reproduce identically on `master`):
+[[class-no-ctor-default-construct-returns-undef]] (a `class` with no user constructor
+default-constructs to `undef`, unrelated code path), [[struct-field-default-brace-list-discarded]]
+(a struct FIELD's own brace-list default is dropped, not a variable declarator), and
+[[interface-typed-global-brace-init-discarded]] (an interface-typed global falls through this
+fix's guard entirely, since `GetDataStructure` has no entry for an interface name) - plus the
+pre-existing [[global-struct-no-initializer-ignores-field-defaults]] (a global with NO
+initializer at all zeroes instead of honoring field defaults; different code path again, the
+`right == nullptr` branch rather than the brace-list branch) and
+[[pointer-decl-field-init-brace-corrupts-pointer-storage]] (`S* p = {a=1};` - a POINTER
+declaration reaches the pre-existing `EmitFieldInitializer` call unguarded, since its `TypeName`
+is the pointee `S`, a known struct; `EmitFieldInitializer` then GEPs into the pointer's own
+8-byte slot as if it addressed an `S`, leaving `p` holding a nonsense address built from the
+field values. The `=` spelling is identical on `58d5d27` and `af68158`; the BARE spelling
+`S* p {a=1};` is NOT - see behaviour change 3 above and the file itself. This fix's new
+primitive-typed guard does not and cannot see either spelling, since it is gated on the pointee
+name resolving to a non-struct).

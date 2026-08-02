@@ -1,0 +1,25 @@
+// A brace initializer with values on a LOCAL PRIMITIVE-typed declaration ('int x {5};' /
+// 'int x = {5};') is not struct field-init and not a recognized container brace-init,
+// so it used to fall into EmitFieldInitializer's generic struct-field-init failure
+// message ("'int' is not a known struct type") - technically true but describing a
+// construct the user did not write. Found while routing the bare-brace spelling
+// ('int x {5};', no '=') through the same local declarator handling the '=' spelling
+// already used: PRE, the bare form silently read an uninitialized garbage value (rc 0,
+// e.g. "x=1876644176"); this reject is new and intentional for that spelling, and the
+// message must name the real situation for BOTH spellings rather than misdescribe it
+// as a struct problem (the '=' spelling already rejected before this fix, just with
+// the same misleading wording).
+// Not fixed here: making 'int x {5};' actually assign 5 - that is a language feature
+// (primitive brace-value-init), out of scope for this bug fix; file separately if wanted.
+// (A GLOBAL primitive brace-init like 'int x = {5};' at file scope is a different,
+// pre-existing silent-zero gap - unaffected by this fix, not covered by this leg.)
+extern int main()
+{
+    expect_error("brace initializer with values is not supported on 'x' - 'int' is not a struct/union/class or a recognized container") {
+        int x = { 5 };
+    }
+    expect_error("brace initializer with values is not supported on 'x' - 'int' is not a struct/union/class or a recognized container") {
+        int x { 5 };
+    }
+    return 0;
+}

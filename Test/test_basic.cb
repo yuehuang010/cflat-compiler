@@ -3924,6 +3924,16 @@ bool testFieldInit()
     FieldInitPoint p = { x=10, y=20 };
     result &= Test("field_init_xy",   p.x + p.y, 30);
 
+    // Bare-brace spelling (no '=') is grammatically distinct - initDecl carries
+    // its own LeftBrace/initializerList instead of routing through initializer()
+    // - and used to silently discard the field overrides (both x and y stayed 0,
+    // matching the '= default' value, on both PRE and an earlier round of this
+    // fix that only handled the '=' spelling). Assert both fields to prove the
+    // bare form now reaches the same field-init path as '= { x=.., y=.. }'.
+    FieldInitPoint r { x=100, y=200 };
+    result &= Test("field_init_bare_brace_x", r.x, 100);
+    result &= Test("field_init_bare_brace_y", r.y, 200);
+
     FieldInitPoint q = { x=5 };
     result &= Test("field_init_partial", q.x, 5);
     result &= Test("field_init_default", q.y, 0);

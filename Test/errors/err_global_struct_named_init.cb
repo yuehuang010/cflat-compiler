@@ -1,0 +1,24 @@
+// The NAMED brace form ('{field = value}') is what the positional diagnostic
+// tells callers to switch to, and it works fine on a LOCAL struct declarator.
+// At global scope it shared the same silent-zero root cause as the positional
+// form (found while enumerating the global-struct-positional-init issue): the
+// scalar struct global path never applies field overrides to the Constant, so
+// the brace values were discarded with no diagnostic either. There is no
+// compile-time-constant construction path for this at global scope, so it is
+// rejected too rather than silently losing the values.
+expect_error("field initializers ('{field = value}') are not supported for struct type 'GpiNamed' at global scope") {
+    struct GpiNamed { int x; int y; };
+    GpiNamed gpiNamed = { x = 1, y = 2 };
+}
+
+// Same construct without '=' ('GpiNamed2 g {x=1,y=2};') - a different grammar node
+// (barebraceList) carries the identical brace list; the guard must see this spelling
+// too or the global still zeroes it, exactly as the filed bug did for the '=' spelling.
+// (The bare spelling was not FULLY silent pre-fix the way '=' was: with no brace-list
+// handling at all for it, 'right' stayed null, which also prints a non-blocking
+// "struct and class is not initialized on the stack" note - noisy, but still wrong
+// values, still exit 0, still no real diagnostic naming the construct.)
+expect_error("field initializers ('{field = value}') are not supported for struct type 'GpiNamed2' at global scope") {
+    struct GpiNamed2 { int x; int y; };
+    GpiNamed2 gpiNamed2 { x = 1, y = 2 };
+}

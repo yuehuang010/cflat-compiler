@@ -9482,6 +9482,21 @@ public:
                         right = GenerateDefaultValue(typeAndValue);
                     }
                 }
+                else if (barebraceInit)
+                {
+                    // Bare-brace scalar form ('S ls {1,2};' / 'S ls {a=1,b=2};', no '='). A
+                    // fixed-array or array-view target already consumed barebraceInit above and
+                    // `continue`d before reaching here, so this is the scalar struct/union/class
+                    // case - the exact counterpart of the 'initializerList() != nullptr' arm just
+                    // above, reached through 'initDecl' instead of 'initializer' because the
+                    // brace list has no '=' in front of it. Route it the same way so the
+                    // EmitFieldInitializer / global-guard code below (which falls back to
+                    // barebraceList when 'initializer' is null) sees a non-null 'right' instead of
+                    // discarding the brace values as a bare declaration with no initializer would
+                    // (silently at local scope; with a non-blocking "not initialized on the stack"
+                    // note but still no real diagnostic at global scope).
+                    right = GenerateDefaultValue(typeAndValue);
+                }
 
                 if (globalInitTempFn != nullptr)
                 {
@@ -9626,6 +9641,72 @@ public:
                         compiler->globalDeclSite[name] = curLine;
                     }
                     auto constant = llvm::dyn_cast_or_null<llvm::Constant>(right);
+
+                    /*
+                     * A scalar struct/union/class global with a non-empty brace-list initializer
+                     * ('{1,2}' or '{a=1,b=2}') has no path to a real Constant here: the fixed-array
+                     * and array-view brace forms are handled above and `continue` before reaching
+                     * this block. Left alone, `right` is just the zero default value computed
+                     * earlier, so the global silently lands as a zeroinitializer with every brace
+                     * value discarded - including for generic containers (list/array/dictionary),
+                     * which desugar to add()/set() CALLS at local scope (TryEmitContainerInitializer)
+                     * that this Constant-only global path cannot emit. Reject every case rather than
+                     * silently losing the values; only the WORDING differs by shape. Route positional
+                     * struct/union/class lists to the same diagnostic the LOCAL declarator gives
+                     * (EmitFieldInitializer); the named form ('{field = value}') DOES work locally but
+                     * not here, so it gets its own honest message. Containers get a third message,
+                     * since for THEM the positional form is exactly what local supports and
+                     * 'field = value' would be a false remedy.
+                     *
+                     * isContainerType is a mangled-name-prefix test (matches
+                     * TryEmitContainerInitializer's own discriminator) used ONLY to pick which
+                     * message is the least misleading; it can never flip accept vs. reject; a type
+                     * whose prefix this misses still hits the struct/union/class branch below (any
+                     * false positive would need a mangled name accidentally starting with
+                     * "list__"/"array__"/"dictionary__", which the mangler does not produce for
+                     * anything else) and gets the (slightly less precise but still true) struct
+                     * wording instead.
+                     *
+                     * The brace list may arrive with no '=' in front of it ('S gs {1,2};' -
+                     * barebraceList, captured above) instead of through 'initializer'; both spell
+                     * the identical construct, so both must reach this guard or the bare form
+                     * would silently zero exactly like the filed bug, one character away.
+                     */
+                    auto* scalarInitList = (initializer != nullptr) ? initializer->initializerList() : barebraceList;
+                    if (!externDeclOnly && scalarInitList != nullptr)
+                    {
+                        auto scalarElements = scalarInitList->fieldInit();
+                        const std::string& scalarTypeName = typeAndValue.TypeName;
+                        if (!scalarElements.empty()
+                            && compiler->GetDataStructure(scalarTypeName).StructType != nullptr)
+                        {
+                            bool isContainerType = scalarTypeName.rfind("list__", 0) == 0
+                                || scalarTypeName.rfind("array__", 0) == 0
+                                || scalarTypeName.rfind("dictionary__", 0) == 0;
+                            bool hasPositional = false;
+                            for (auto* fi : scalarElements)
+                                if (fi->Identifier() == nullptr) { hasPositional = true; break; }
+                            // A pointer declarator ('S* gp = {a=1};') hits this same guard - GetDataStructure
+                            // looks up by name, not by pointer-ness - so say "pointer to struct" instead of
+                            // "struct type" for one; the message would otherwise misdescribe the declaration.
+                            const char* kindWord = typeAndValue.Pointer ? "pointer to struct type" : "struct type";
+                            if (isContainerType)
+                                LogErrorContext(direct, std::format(
+                                    "brace initializers are not supported for '{}{}' at global scope - "
+                                    "it requires runtime construction (add()/set() calls) that a "
+                                    "global's compile-time constant cannot hold; declare it '= default' "
+                                    "and populate it in a function", scalarTypeName, typeAndValue.Pointer ? "*" : ""));
+                            else if (hasPositional)
+                                LogErrorContext(direct, std::format(
+                                    "positional initializers are not supported for {} '{}'; use 'field = value'",
+                                    kindWord, scalarTypeName));
+                            else
+                                LogErrorContext(direct, std::format(
+                                    "field initializers ('{{field = value}}') are not supported for {} '{}' "
+                                    "at global scope; assign fields individually after declaration, or use "
+                                    "'= default' to zero-initialize", kindWord, scalarTypeName));
+                        }
+                    }
 
                     /*
                      * Global counterpart of the local `T[N] b = <pointer>` reject below. A global's
@@ -9992,10 +10073,33 @@ public:
                         // Apply field initializer overrides after the default value is stored.
                         // A brace list targeting a generic container (list/array/dictionary) is
                         // desugared into add/init+set/set calls; otherwise it is a struct field-init.
-                        if (initializer && initializer->initializerList())
+                        // The bare-brace spelling ('S ls {a=1};', no '=') carries its list on
+                        // barebraceList instead of 'initializer', which is null for that form.
+                        auto* localInitList = (initializer != nullptr) ? initializer->initializerList() : barebraceList;
+                        if (localInitList != nullptr)
                         {
-                            if (!TryEmitContainerInitializer(alloc, typeAndValue, initializer->initializerList()))
-                                EmitFieldInitializer(alloc, typeAndValue.TypeName, initializer->initializerList());
+                            bool localIsContainer = typeAndValue.TypeName.rfind("list__", 0) == 0
+                                || typeAndValue.TypeName.rfind("array__", 0) == 0
+                                || typeAndValue.TypeName.rfind("dictionary__", 0) == 0;
+                            if (!localIsContainer && compiler->GetDataStructure(typeAndValue.TypeName).StructType == nullptr)
+                            {
+                                // A brace list with values on a non-struct, non-container declaration
+                                // ('int x {5};' / 'int x = {5};' / 'bool b {true};') - EmitFieldInitializer's
+                                // own message ("'int' is not a known struct type") describes a struct-
+                                // field-init failure, not what the user wrote here, so name the real
+                                // construct instead. Brace-VALUE-init on a primitive is not implemented
+                                // (a language feature, not this fix's job); reject rather than read
+                                // whatever 'right' happened to be seeded to. A POINTER-typed declaration
+                                // ('S* p {a=1};') does NOT reach this branch: TypeName is the pointee
+                                // ('S'), which IS a known struct, so it takes the 'else' below instead -
+                                // pre-existing, unaffected by this fix, not this branch's business.
+                                LogErrorContext(direct, std::format(
+                                    "brace initializer with values is not supported on '{}' - '{}' is not "
+                                    "a struct/union/class or a recognized container; assign it after declaration instead",
+                                    name, typeAndValue.TypeName));
+                            }
+                            else if (!TryEmitContainerInitializer(alloc, typeAndValue, localInitList))
+                                EmitFieldInitializer(alloc, typeAndValue.TypeName, localInitList);
                         }
 
                         // Taint a string local that borrows an owning string field, so storing it

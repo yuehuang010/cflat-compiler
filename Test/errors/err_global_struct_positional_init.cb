@@ -1,0 +1,20 @@
+// A positional brace initializer on a GLOBAL struct used to silently zero the
+// global (right fell through to the default-value Constant with the brace
+// values discarded, no diagnostic, exit 0). The identical LOCAL spelling was
+// already rejected by err_struct_positional_init.cb; this pins the global
+// declarator now routing through the same diagnostic instead of disagreeing
+// with the local scope.
+expect_error("positional initializers are not supported for struct type 'GpiPoint'") {
+    struct GpiPoint { int x; int y; };
+    GpiPoint gpiPoint = {1, 2};
+}
+
+// The identical construct spelled without '=' ('GpiPoint2 p {1,2};') carries its
+// brace list on a different grammar node (initDecl's own LeftBrace/initializerList,
+// not initializer->initializerList()) - a guard keyed only on the '=' spelling
+// would miss this one and the bug would survive under a one-character-different
+// spelling. Same diagnostic, same reason.
+expect_error("positional initializers are not supported for struct type 'GpiPoint2'") {
+    struct GpiPoint2 { int x; int y; };
+    GpiPoint2 gpiPoint2 {1, 2};
+}

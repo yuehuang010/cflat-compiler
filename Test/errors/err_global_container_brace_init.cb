@@ -1,0 +1,17 @@
+// A generic container (list/array/dictionary) brace-list initializer shares the
+// same silent-discard root cause as the global struct cases in the sibling
+// err_global_struct_*.cb legs (the global scalar declarator path has no way to
+// build a real Constant from the brace list), but the local declarator makes
+// the positional form WORK for containers (TryEmitContainerInitializer desugars
+// to add()/set() calls) - so "use 'field = value'" would be a false remedy here.
+// Containers get their own honest message instead.
+import "list.cb";
+expect_error("brace initializers are not supported for 'list__int' at global scope") {
+    list<int> gpiContainer = {1, 2, 3};
+}
+
+// Same construct without '=' ('list<int> g {1,2,3};') - barebraceList, not
+// initializer->initializerList(); must reach the same guard.
+expect_error("brace initializers are not supported for 'list__int' at global scope") {
+    list<int> gpiContainer2 {1, 2, 3};
+}
