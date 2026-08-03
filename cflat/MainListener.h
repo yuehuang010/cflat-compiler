@@ -682,6 +682,33 @@ static bool TryParseSimdLaneCount(const std::string& text, uint64_t& lanesOut, s
     return true;
 }
 
+/*
+ * Record the declarator's pointer depth and array dimensions onto a simd<T,N> declared type.
+ * The simd branch breaks out of the specifier loop before the common tail that does this for
+ * every other type, so without it `simd<T,N>**` lost its second level and `simd<T,N>[N]`
+ * silently lost its dimension (allocating one vector and turning `a[i]` into a LANE read).
+ * Shared by BOTH ParseDeclarationSpecifiers copies (ForwardRefScanner and MainListener).
+ */
+static void RecordSimdPointerAndDims(LLVMBackend::DeclTypeAndValue& declType,
+                                     CFlatParser::DeclarationSpecifierContext* declSpec)
+{
+    declType.Pointer = declSpec->pointer() != nullptr;
+    if (declType.Pointer && declSpec->pointer()->Star().size() >= 2)
+        declType.ElemPointer = true;
+    // An empty '[]' on a simd type is left alone: simd array views are unimplemented, and
+    // deducing one here would change a shape that currently compiles.
+    if (auto* dimSpec = ArrayDimsOf(declSpec))
+    {
+        auto dims = dimSpec->assignmentExpression();
+        if (!dims.empty())
+        {
+            declType.ArraySize = dims[0];
+            for (size_t di = 1; di < dims.size(); di++)
+                declType.ExtraArrayDims.push_back(dims[di]);
+        }
+    }
+}
+
 // Extract function name from FunctionDefinitionContext (handles operator overloads).
 static std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx)
 {
@@ -1397,7 +1424,7 @@ private:
                         declType.TypeName = sd->typeSpecifier()->getText();
                         declType.IsSimd = true;
                         declType.SimdLanes = lanes;
-                        declType.Pointer = declSpec->pointer() != nullptr;
+                        RecordSimdPointerAndDims(declType, declSpec);
                         break;
                     }
                     // Pointer depth contributed by a pointer alias (using Handle = void*); peeled
@@ -4039,7 +4066,7 @@ private:
                     declType.TypeName = elemType;
                     declType.IsSimd = true;
                     declType.SimdLanes = lanes;
-                    declType.Pointer = declSpec->pointer() != nullptr;
+                    RecordSimdPointerAndDims(declType, declSpec);
                     break;
                 }
                 std::string baseName;
@@ -8488,14 +8515,19 @@ public:
          * a copy at every call site, which is a feature, not a defect fix. C forbids it outright.
          */
         if ((returnType.ArraySize != nullptr || returnType.AliasArraySize > 0)
-            && !returnType.IsArrayView && !returnType.IsSimd && !returnType.Pointer)
+            && !returnType.IsArrayView && !returnType.Pointer)
         {
+            // A simd type's TypeName is its ELEMENT ('float'), so spell the vector back out; the
+            // dimension carried here is the ARRAY's, not the lane count.
+            std::string elem = returnType.IsSimd
+                ? std::format("simd<{},{}>", returnType.TypeName, returnType.SimdLanes)
+                : returnType.TypeName;
             LogErrorContext(func, std::format(
                 "function '{}' cannot return the fixed array '{}[N]' by value - CFlat has no "
                 "by-value array return, and the size was being dropped silently (the function "
                 "returned a single '{}'). Return a struct with the array as a field, or take an "
                 "out-parameter ('{}* out') and fill it in.",
-                name, returnType.TypeName, returnType.TypeName, returnType.TypeName));
+                name, elem, elem, elem));
         }
 
         size_t bodyLine = 0;
@@ -10170,9 +10202,11 @@ public:
                         srcMovedFromSlot = compiler->lastMovedFromContainerSlot;
                         compiler->lastMovedFromContainerSlot = false;
 
-                        // simd<T,N> initialized from a scalar: splat across all lanes.
-                        if (typeAndValue.IsSimd && !right->getType()->isVectorTy())
-                            right = compiler->SplatToSimd(right, typeAndValue);
+                        // simd<T,N> from a scalar splats across all lanes - but only when the declared
+                        // SLOT lowers to a vector (`simd<T,N>*` and `[N]` carry IsSimd and do not).
+                        if (typeAndValue.IsSimd && !right->getType()->isVectorTy()
+                            && llvm::isa_and_nonnull<llvm::FixedVectorType>(compiler->GetType(typeAndValue)))
+                            right = compiler->SplatToSimd(right, typeAndValue, srcIsUnsigned);
 
                         /*
                          * Closure decl-init from a FIELD / ELEMENT (Option A clone). The
@@ -17448,7 +17482,11 @@ public:
     // Render a fixed-array type for a diagnostic: "int[3]", "int*[2]", "Foo**[2][4]".
     static std::string DescribeArrayShape(const LLVMBackend::TypeAndValue& tv)
     {
-        std::string text = tv.TypeName + std::string(FixedArrayElementStars(tv), '*');
+        // A simd element keeps its own spelling: TypeName is only the LANE type, so without this
+        // a simd<float,4>[2] reads as 'float[2]'. Wording only - the shape is unchanged.
+        std::string elem = tv.IsSimd ? std::format("simd<{},{}>", tv.TypeName, tv.SimdLanes)
+                                     : tv.TypeName;
+        std::string text = elem + std::string(FixedArrayElementStars(tv), '*');
         text += std::format("[{}]", tv.ConstArraySize);
         for (uint64_t d : tv.ConstInnerDimensions) text += std::format("[{}]", d);
         return text;

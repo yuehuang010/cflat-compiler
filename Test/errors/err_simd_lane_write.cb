@@ -7,4 +7,15 @@ extern int main()
     expect_error("simd<T,N> lane write 'v[i] = ...' is not supported") {
         v[1] = 2.0;
     }
+
+    // An ARRAY of vectors is real array storage since fix/simdptr, so `a[i]` selects a whole
+    // vector element (writable) and the lane rule above does not apply to it. What IS rejected
+    // is assigning the array as a whole, exactly like any other fixed array. The message must
+    // name the SIMD element spelling, not the bare lane type 'float'.
+    simd<float, 4>[2] a = default;
+    simd<float, 4>[2] b = default;
+    a[0] = 3.0;                     // legal: element store, not a lane write
+    expect_error("cannot assign to 'a' as a whole - it names fixed array 'simd<float,4>[2]'") {
+        a = b;
+    }
 }

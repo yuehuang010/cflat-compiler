@@ -29,7 +29,21 @@ expect_error("function 'mk3' cannot return the fixed array 'char[N]' by value") 
     RetBuf mk3() { RetBuf b = default; return b; }
 }
 
+// An ARRAY of simd vectors. Before fix/simdptr the simd branch dropped the declarator's
+// dimension, so 'ArraySize' was always null here and the guard carried a '!IsSimd' carve-out
+// that was harmless only because of that. With the dimension recorded, the carve-out would
+// have suppressed exactly this shape and left an unlocated 'ret ptr' verifier dump. The
+// message must name 'simd<float,4>[N]' - the TypeName alone is just the lane type 'float'.
+expect_error("function 'mk4' cannot return the fixed array 'simd<float,4>[N]' by value") {
+    simd<float,4>[2] mk4() { simd<float,4>[2] b = default; return b; }
+}
+
+// A BARE simd return is not an array return and must stay legal - it is how every
+// simd-producing helper in test_hpc.cb is written.
+simd<float,4> mkVec() { simd<float,4> v = 1.0; return v; }
+
 extern int main()
 {
-    return 0;
+    simd<float,4> v = mkVec();
+    return v[0] == 1.0 ? 0 : 1;
 }

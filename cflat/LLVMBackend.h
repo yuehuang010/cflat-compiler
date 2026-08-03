@@ -10343,9 +10343,13 @@ public:
     {
         if (src.TypeName.empty()) return "";
         if (src.IsInterface || src.IsInterfacePointer) return "";
-        if (src.ElemPointer) return src.TypeName + "**";
-        if (src.IsArrayView) return src.TypeName + "[]";
-        if (src.ConstArraySize != 0) return std::format("{}[{}]", src.TypeName, src.ConstArraySize);
+        // A simd element keeps its own spelling: TypeName is only the LANE type, so without this
+        // a simd<float,4>[2] source reads as 'float[2]'. Wording only - the arms are unchanged.
+        std::string elem = src.IsSimd ? std::format("simd<{},{}>", src.TypeName, src.SimdLanes)
+                                      : src.TypeName;
+        if (src.ElemPointer) return elem + "**";
+        if (src.IsArrayView) return elem + "[]";
+        if (src.ConstArraySize != 0) return std::format("{}[{}]", elem, src.ConstArraySize);
         if (src.IsSimd) return src.TypeName + " simd vector";
         return "";
     }
@@ -14713,6 +14717,16 @@ public:
             {
                 value = WrapStringLiteralAsString(value);
             }
+            else if (auto* dvt = llvm::dyn_cast<llvm::FixedVectorType>(destType);
+                     dvt != nullptr && !value->getType()->isVectorTy()
+                     && (value->getType()->isIntegerTy() || value->getType()->isFloatingPointTy()))
+            {
+                // Scalar into simd<T,N> storage: splat across the lanes, the same rule the
+                // declaration initializer uses. The else arm below casts scalar-to-vector, a
+                // bitcast that wrote the value into every EVEN lane and left the odd ones zero.
+                value = ConvertScalarToType(value, dvt->getElementType(), srcIsUnsigned);
+                value = builder->CreateVectorSplat(dvt->getElementCount(), value);
+            }
             else
             {
                 // Upconvert handles integer widening with correct sign semantics (SExt for signed, ZExt for unsigned).
@@ -14912,8 +14926,13 @@ public:
             dims += std::format("[{}]", arrTy->getNumElements());
             type = arrTy->getElementType();
         }
-        if (!elementTypeName.empty())
-            return std::format("fixed array '{}{}'", elementTypeName, dims);
+        // A simd element keeps its own spelling: the caller's name is only the LANE type, so
+        // without this an array of vectors reads as 'float[2]' instead of 'simd<float,4>[2]'.
+        std::string elemName = elementTypeName;
+        if (auto* vecTy = llvm::dyn_cast<llvm::FixedVectorType>(type); vecTy != nullptr && !elemName.empty())
+            elemName = std::format("simd<{},{}>", elemName, vecTy->getNumElements());
+        if (!elemName.empty())
+            return std::format("fixed array '{}{}'", elemName, dims);
         return std::format("fixed-array storage with dimensions {}", dims);
     }
 
@@ -15633,19 +15652,23 @@ public:
     // a comparison (== != < <= > >=) yields a `<N x i1>` mask (a simd<bool,N>) for use with
     // simd<T,N>.select - the branchless primitive that lets a masked kernel (e.g. LBM bounce-back)
     // stay straight-line and vectorize.
-    llvm::Value* CreateVectorOperation(Operation op, llvm::Value* left, llvm::Value* right, bool isUnsigned = false)
+    llvm::Value* CreateVectorOperation(Operation op, llvm::Value* left, llvm::Value* right,
+                                       bool leftIsUnsigned = false, bool rightIsUnsigned = false)
     {
+        // Comparison signedness keeps its long-standing "either operand unsigned" rule; the
+        // per-operand flags exist so a splatted scalar widens with its OWN signedness.
+        bool isUnsigned = leftIsUnsigned || rightIsUnsigned;
         auto* lvt = llvm::dyn_cast<llvm::FixedVectorType>(left->getType());
         auto* rvt = llvm::dyn_cast<llvm::FixedVectorType>(right->getType());
         llvm::FixedVectorType* vt = lvt ? lvt : rvt;
 
-        auto splat = [&](llvm::Value* scalar) -> llvm::Value*
+        auto splat = [&](llvm::Value* scalar, bool srcIsUnsigned) -> llvm::Value*
         {
-            scalar = ConvertScalarToType(scalar, vt->getElementType());
+            scalar = ConvertScalarToType(scalar, vt->getElementType(), srcIsUnsigned);
             return builder->CreateVectorSplat(vt->getElementCount(), scalar);
         };
-        if (!lvt) left = splat(left);
-        if (!rvt) right = splat(right);
+        if (!lvt) left = splat(left, leftIsUnsigned);
+        if (!rvt) right = splat(right, rightIsUnsigned);
 
         if (left->getType() != right->getType())
         {
@@ -15690,19 +15713,36 @@ public:
     }
 
     // Splat a scalar across all lanes of a simd<T,N> value (converting element type as needed).
-    // Used to initialize/assign a simd variable from a scalar (e.g. simd<float,8> v = 1.0;).
-    llvm::Value* SplatToSimd(llvm::Value* scalar, const TypeAndValue& tv)
+    // srcIsUnsigned steers the widening step so an unsigned source zero-extends into a wider lane.
+    llvm::Value* SplatToSimd(llvm::Value* scalar, const TypeAndValue& tv, bool srcIsUnsigned = false)
     {
-        auto* vecTy = llvm::cast<llvm::FixedVectorType>(GetType(tv));
-        scalar = ConvertScalarToType(scalar, vecTy->getElementType());
+        // BACKSTOP, not the primary guard: the sole caller already proves the slot lowers to a
+        // vector. An unchecked cast here aborted the compiler with no diagnostic on `simd<T,N>*`.
+        auto* vecTy = llvm::dyn_cast_or_null<llvm::FixedVectorType>(GetType(tv));
+        if (vecTy == nullptr)
+        {
+            // Spell the whole declared shape - pointer AND array - so the message is true of
+            // every slot kind that can reach here, not just the pointer one. LogError throws.
+            std::string decl = std::format("simd<{},{}>", tv.TypeName, tv.SimdLanes);
+            if (tv.Pointer) decl += tv.ElemPointer ? "**" : "*";
+            if (tv.ConstArraySize > 0) decl += std::format("[{}]", tv.ConstArraySize);
+            LogError(std::format(
+                "cannot splat a scalar into '{}' - it does not name simd vector storage", decl));
+            return scalar;
+        }
+        scalar = ConvertScalarToType(scalar, vecTy->getElementType(), srcIsUnsigned);
         return builder->CreateVectorSplat(vecTy->getElementCount(), scalar);
     }
 
-    // Convert a scalar to an exact target scalar type, handling both widening (Upconvert)
-    // and narrowing (e.g. a double literal into a float lane), which Upconvert alone won't do.
-    llvm::Value* ConvertScalarToType(llvm::Value* scalar, llvm::Type* target)
+    /*
+     * Convert a scalar to an exact target scalar type, handling both widening (Upconvert)
+     * and narrowing (e.g. a double literal into a float lane), which Upconvert alone won't do.
+     * srcIsUnsigned only steers the WIDENING step; the CreateCast leg keeps its long-standing
+     * default so threading the flag through cannot change a narrowing or an int<->float cast.
+     */
+    llvm::Value* ConvertScalarToType(llvm::Value* scalar, llvm::Type* target, bool srcIsUnsigned = false)
     {
-        scalar = Upconvert(scalar, target);
+        scalar = Upconvert(scalar, target, srcIsUnsigned);
         if (scalar->getType() != target)
             scalar = CreateCast(scalar, target);
         return scalar;
@@ -16067,7 +16107,7 @@ public:
         // simd<T,N> operands: element-wise ops. A <N x iX>/<N x float> answers false to the scalar
         // isFloatingPointTy() check below, so vectors must be handled before the integer switch.
         if (left->getType()->isVectorTy() || right->getType()->isVectorTy())
-            return CreateVectorOperation(op, left, right, leftIsUnsigned || rightIsUnsigned);
+            return CreateVectorOperation(op, left, right, leftIsUnsigned, rightIsUnsigned);
 
         // C integer promotion for compile-time constants only (see PromoteToInt).
         // Signedness preserved so unsigned narrow constants zero-extend.

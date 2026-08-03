@@ -162,6 +162,9 @@ simd<i32, 4> q = p * p;        // 25 per lane
   hardware mapping, so a count that would silently waste a lane is rejected with a hint
   (`did you mean simd<...,8>?`).
 - **Construction**: a scalar initializer is *splatted* across all lanes (`simd<float,8> v = 1.0;`).
+  A scalar *assigned* to an existing vector splats the same way (`v = 3.0;` sets every lane).
+  An unsigned source zero-extends into a wider lane type at every splat site - declaration,
+  assignment and operator alike (`u32 x = 4000000000; simd<i64,2> v = x;` gives `4000000000`).
 - **Operators**: element-wise `+ - * /`. Either operand may be a scalar, which is splatted to
   match (`a * 2.0`, `10.0 - a`); both vector operands must share lane count and element type.
 - **Lane access**: `v[i]` reads lane `i`. Lanes are *read-only* - there is no lane write
@@ -176,6 +179,11 @@ simd<i32, 4> q = p * p;        // 25 per lane
   see [Comparisons and `select`](#comparisons-and-select---branchless-masking) below.
 - It is a **primitive value**, not a struct or array - no ownership, destructor, or `move`
   interaction. (Lane writes and shuffles are not yet supported.)
+- **Storage**: like any other value type it can be pointed at (`simd<float,4>* p = &v;`,
+  including `**`) and put in an array (`simd<float,4>[2] a;`), a struct field, or a global.
+  On an ARRAY of vectors `a[i]` selects an *element* (a whole vector), not a lane - lane
+  indexing applies to a bare `simd<T,N>`. The type spelling is not yet accepted in a cast
+  target, a lambda parameter, or a tuple/`function<>` signature component.
 
 ### `simd<T,N>.load` / `simd<T,N>.store` - the memory bridge
 

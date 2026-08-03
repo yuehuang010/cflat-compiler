@@ -272,7 +272,6 @@ distinguish from "nothing happened", so both integrity checks above were re-run 
 | [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. **NARROWED 2026-08-02** by `fix/uniq-array-elem`: root cause CONFIRMED by instrumentation (`FieldName`/`CallerName` name the CONTAINER, so `selfFieldAssign` swallowed a genuine two-owner store), and every element pair whose addresses are constant-provably different now rejects - local, generic-substituted, nested, array-as-field, through-pointer, view, and global arrays. BOTH copies of the name comparison were fixed; the second (`sameField`) also guards the reassignment-destruct, and fixing only the first traded an abort for a leak. Residue: any index not constant in the emitted IR - a runtime subscript, and a `const` integer (`const` is unenforced, so folding it would be unsound). |
 | [[unique-field-global-struct-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. `gA.slot = gB.slot` on two file-scope structs. **Mechanism CORRECTED 2026-08-02** (the first filing read optimized IR and blamed `destIsStructField`; at `--no-opt` that predicate is TRUE and the stack IS entered): a global-struct field read carries an EMPTY `CallerName`, so `selfFieldAssign` reads two different globals as one slot - the same failure as the interface receiver, through a third receiver kind. Renaming the fields apart rejects on both binaries. Closable by extending `ProvablyDifferentSlots` to distinct `GlobalVariable`/`AllocaInst` roots, which is sound but is a widening of a predicate every field store flows through - do it with its own sweep. |
 | [[temp-unique-field-into-borrow-slot-use-after-free]] | Use-after-free, compiles clean and exits 0 on both binaries. A temp's `unique` field bound into a NON-unique (borrow) slot with a destructor-less pointee: the temp's `Box` destructor frees the pointee before the load. No `unique` claim on the destination for a guard to key on. |
-| [[simd-pointer-declaration-aborts-the-compiler]] | Compiler abort (rc 138, zero output, no diagnostic) for `simd<float,4>* sp = nullptr;`. PRE-EXISTING - measured identical on `5a6580c` and on `fix/emptybrace`. Found because that fix's diagnostic suggests `nullptr` as the remedy and for this one type the remedy crashes; the `= {}` spelling is rejected there, `= nullptr` is not. Root cause NOT diagnosed. Filed 2026-08-02. |
 
 ### P2 - false rejections, unavailable features, ownership holes (`p2/`)
 
@@ -318,6 +317,7 @@ distinguish from "nothing happened", so both integrity checks above were re-run 
 | [[interface-typed-global-brace-init-discarded]] | miscompile | `I gi = { a = 1 };` on an interface-typed global compiles clean with the brace list silently dropped, no diagnostic. The `fix/global-positional` guard (that P1 is fixed and deleted; see its landed record below) cannot see it - `GetDataStructure("I").StructType` is null for an interface name, so this falls through unguarded. Found by review of that fix. Filed 2026-08-02. |
 | [[file-offsets-capped-at-2gb]] | silent wrong value | `core/filesystem.cb` narrows every offset through `int`, so `File.size()`/`tell()`/`seek()` truncate past 2 GB on ALL platforms - the public surface is `int` too, so widening the internals alone is not enough. Split out of `ftell-fseek-long-width-on-windows` when that P1 landed 2026-08-02; NOT the `long`-width defect, which is fixed. Had no row in this table until 2026-08-03 - it was filed in narrative only. |
 | [[string-literal-containing-braces-retyped-as-string]] | miscompile + false rejection | A string literal whose CONTENT contains a brace pair (`"a = {} b"`) is typed `string` instead of `char*`. At a call it stops every `char*` overload matching and the diagnostic blames the call; at a VARIADIC it is a SILENT MISCOMPILE - `printf("a = {} b\n");` compiles and runs rc 0 printing binary garbage, and the dedicated `cannot pass 'string' to the variadic '...'` guard does not fire. Identical on both binaries. Filed 2026-08-02 in `p2/` for the rejection face; the miscompile face may warrant P1. |
+| [[simd-type-spelling-unusable-outside-declarations]] | feature gap | `simd<T,N>` is recognised only in `ParseDeclarationSpecifiers` and as a `primaryExpression`, so a cast target, a lambda parameter and a tuple/`function<>` signature component all say "unknown type 'simd<float,4>'", and `simd<T,N>[]` silently DROPS the empty bracket and compiles as a plain vector local. Measured identical on `904f026` and `fix/simdptr`. Wants one encoded-name mechanism (mirroring `BuildEncodedClosureName`), not four patches. Filed 2026-08-03. |
 
 ### P3 - diagnostics, latent, deliberate deferrals (`p3/`)
 
@@ -332,6 +332,8 @@ distinguish from "nothing happened", so both integrity checks above were re-run 
 | [[sizeof-of-sized-array-type-parsed-as-cast]] | diagnostic | `sizeof(T[N])` is parsed as a cast and rejected with a message about CASTS - blaming a construct the user never wrote. Not multi-dim specific (`sizeof(int[3])` fails too); `sizeof(variable)` works. Filed 2026-07-31. |
 | [[funcptr-fixed-array-vs-view-overloads-collide]] | diagnostic | Silent overload loss, no diagnostic: `function<T>[N]` and `function<T>[]` overloads of the same name collide onto one mangled key and one shape, so the last-registered overload silently wins. Low severity - the two spellings are arguably the same parameter type. Filed 2026-07-31. |
 | [[generic-function-call-diagnostics-are-misleading]] | diagnostic | Three defects on one path: a PHANTOM candidate invented for an undeclared generic function, wrong type-arg arity reported as "unknown function 'D3.id__int__float'", and a mangled name leaking into user-facing text. Pre-existing, identical before `e2a23d5`; filed 2026-07-30 out of the layer-4 review. |
+| [[simd-array-error-wording-differs-from-plain-arrays]] | diagnostic | `simd<T,N>[N]` gets DIFFERENT wording than a plain array for the identical rejection (whole-array assignment, global fixed-array init): two `!IsSimd` guard exclusions in `MainListener.h` became reachable when `fix/simdptr` started recording the dimension, so a second guard catches the shape and prints a different message. Both spellings are still rejected - wording only, no miscompile. Deliberately deferred: removing `!IsSimd` WIDENS a rejection predicate and needs an accept-set exercise first. Filed 2026-08-04. |
+| [[simd-array-view-decl-verifier-failure]] | diagnostic | `simd<T,N>[] v = a;` (view bound to a `simd<T,N>[N]`) emits `Invalid bitcast ptr to float` and dies in module verification with NO located diagnostic - CLAUDE.md requires a `LogError` before the verifier trips. Identical pre-amend and at `fix/simdptr` HEAD; on `master` the same file exits 0 only vacuously (the `[2]` was dropped, so there was no array to view). Distinct from the p2 spelling issue: the spelling parses, the view BIND lowers against the lane type. Filed 2026-08-04. |
 | [[interface-collision-message-prefix-still-basename]] | diagnostic | The `file(line,col):` prefix is still a bare basename. |
 | [[as-cast-unbound-pointer-shape-generic-message]] | diagnostic | Correctly rejected, generic wording. Struct field and LOCAL `T*[N]` only. |
 | [[constructor-discriminator-inconsistent-name-only-sites]] | diagnostic | Name-only outside a lock/program body, null-declarationSpecifiers inside one. |
@@ -2341,7 +2343,9 @@ initialized declaration spelling that compiles. (The `= default` face was found 
 the simd leg, after the issue file had already been written claiming only `nullptr`; the file
 records the correction.) It matters here because those are exactly the two remedies this fix's
 diagnostic names, so for that one type neither suggestion compiles. Not fixed here - different root
-cause, in the type's slot computation rather than in brace handling.
+cause, in the type's slot computation rather than in brace handling. (That issue is now CLOSED by
+`fix/simdptr` below, and its file is deleted; the reading above was right about where the root
+cause lived and wrong about which site - see that record.)
 
 Bar (measured after rebasing onto `fix/mdview`, so the compiler carries both changes):
 `./test.sh Release` 576 passed / 0 failed / 8 skipped, unchanged from master's own 576/0/8 -
@@ -2519,3 +2523,165 @@ verified non-vacuous against a binary built from `a32e55e`.
 
 Bar: macOS arm64 Release `./test.sh` 576 passed / 0 failed / 8 skipped cold and warm,
 `example_mac.sh` 35 passed / 0 failed, `test_lsp.sh` 152 passed / 0 failed.
+
+### fix/simdptr - a `simd<T,N>` slot that is NOT a vector no longer takes the splat (RATIFIED)
+
+Closes `p1/simd-pointer-declaration-aborts-the-compiler` (deleted). `simd<float,4>* sp = nullptr;`
+and `... = default;` aborted the compiler with rc 138 and zero output.
+
+**The DESIGN question the issue file asked first - is `simd<T,N>*` a supported type - is answered
+YES, on measured evidence, and answering it NO would have been a false rejection of working code.**
+`internal/simd-type.md`'s "no pointer" line and a repo-wide grep finding zero uses both point the
+other way, and both are the trap the lessons file names: a grep proves the SPELLING is unused, not
+that the CAPABILITY is absent. On `904f026` a `simd<T,N>*` PARAMETER compiles, is callable with
+`&v`, and `simd<float,4> t = *p;` inside the callee reads the right lanes; a GLOBAL, a STRUCT FIELD
+and a UNION FIELD of that type all compile and run. `GetType` has carried an explicit
+`simd<float,8>* lowers to <8 x float>*` arm since the type landed. Only the LOCAL declaration was
+broken, so the fix is the issue file's second branch: pointer-ness wins over `IsSimd` where the
+slot type is computed.
+
+**Root cause CONFIRMED by stack, and the issue file's un-measured citation was half right.** It
+guessed `ParseDeclarationSpecifiers` setting `Pointer` on the simd branch and "something downstream
+asking `GetType` for the vector rather than the pointer". The real site asks `GetType` for the
+POINTER (`allowPointer` defaults true) and then blindly `cast<FixedVectorType>`s it:
+`MainListener.h` decl-init did `if (typeAndValue.IsSimd && !right->getType()->isVectorTy())
+right = SplatToSimd(...)`, and `SplatToSimd` (`LLVMBackend.h`) opened with
+`cast<FixedVectorType>(GetType(tv))`. A Debug breakpoint puts all five crashing spellings -
+`= nullptr`, `= default`, `= &v`, `simd<T,N>**`, `static` - on that one frame.
+
+Three changes, all narrow:
+
+- **Decl-init splat gated on the SLOT** - `llvm::isa_and_nonnull<FixedVectorType>(GetType(tv))`.
+  This is a ROUTING predicate, not a rejection: a slot that is not a vector simply stores the value
+  as any other type would, so a shape nobody enumerated degrades to normal behaviour rather than to
+  a false rejection.
+- **`SplatToSimd` `dyn_cast` + `LogError` backstop.** Honestly a backstop - the only caller now
+  proves the slot is a vector, so it is unreachable today. It is here because CLAUDE.md requires an
+  LLVM assert to become a message, and it is deliberately NOT sold as the fix or given a test.
+- **`RecordSimdPointerAndDims`, shared by BOTH `ParseDeclarationSpecifiers` copies.** The simd
+  branch `break`s out of the specifier loop before the common tail that records pointer depth and
+  array dims for every other type, so `simd<T,N>**` lost its second level and `simd<T,N>[N]`
+  silently lost its DIMENSION - allocating one vector and turning `a[i]` into a LANE index.
+
+**TWO traps recording that dimension sprang, both closed in the same commit. Both have the same
+shape and it is the durable lesson here: when a change makes a field newly non-null, every guard
+that READS that field has to be re-audited under the NEW conditions, not the old ones.**
+
+- `CreateAssignment` turned `simd<float,4>[2] a; a[0] = 3.0f;` from a clean rejection (master reads
+  it as a lane write) into a SILENT MISCOMPILE, casting the scalar to the vector slot as
+  `bitcast (<1 x float> ... to <4 x float>)`, which writes the value into every EVEN lane and
+  leaves the odd ones zero. A dimension fix that upgrades a hard error into a wrong value is worse
+  than no fix. `CreateAssignment` now splats a scalar into vector storage the same way the
+  declaration initializer does - which ALSO fixes a pre-existing silent miscompile the matrix
+  turned up on the PLAIN type. **Measured on a `f463e7f` (pre-fix) Release build**, not inferred:
+  `simd<float,4> r = default; r = 5.0f;` gives `5 0 5 0`; `simd<float,8>` gives `5 0 5 0 5 0 5 0`;
+  `simd<int,4> i = default; i = 7;` gives `7 0 7 0`. The earlier record of this said "lane 0 only",
+  which was wrong in three places and made every single-lane assertion look like a discriminator
+  when it only discriminated by parity.
+- The by-value fixed-array-RETURN rejection (`MainListener.h`) carried a `!returnType.IsSimd`
+  carve-out that was harmless only because the simd branch never set `ArraySize`. With the
+  dimension recorded it suppressed the rejection for exactly the shape that now needs it, and
+  `simd<float,4>[2] f()` emitted an unlocated `ret ptr` verifier dump where `float[2] g()` gets a
+  clean located message. The carve-out is REMOVED - it is now redundant for a bare `simd<T,N>`
+  return, whose `ArraySize` is null anyway, and wrong for an array of them. The message renders the
+  vector spelling, since the type's `TypeName` is only the lane type. Found by review, not by the
+  fix's own site audit, which had classified that site from master's conditions.
+
+Ratified behaviour, do not "fix" back:
+
+- `simd<T,N>` array/pointer storage is REAL storage: `simd<float,4>[2]` is `[2 x <4 x float>]` and
+  `a[i]` is an ELEMENT, not a lane. Lane indexing still applies to a bare `simd<T,N>` value, and
+  `Test/errors/err_simd_lane_write.cb` still pins the lane-write rejection.
+- A scalar assigned into vector storage SPLATS, at a declaration and at an assignment alike. Every
+  lane gets the value; there is no partial (even-lane-only) store.
+- A `simd<T,N>[N]` RETURN is a by-value fixed-array return and is rejected like any other. A bare
+  `simd<T,N>` return stays legal and is how every simd-producing helper is written.
+- **`simd<T,N>[N]` now occupies its full size, so STRUCT LAYOUT changes for anyone out of tree.**
+  Measured: a struct with one `simd<float,4>[2]` field, and a global of that type, both go from
+  `sizeof` 16 to 32 - master allocated a single vector. There are zero in-tree uses, so nothing in
+  this repo moved, but a persisted or FFI-shared layout built against an older compiler will not
+  match. This is the correct size; the old one was the dropped dimension.
+- An empty `[]` on a simd type is deliberately left alone (a simd array view is unimplemented, and
+  deducing one would change a shape that currently compiles). That, with three name-keyed positions
+  that cannot spell the type at all and the pointer-to-array spellings that never reach the guard
+  every other element type reaches, is filed as
+  [[simd-type-spelling-unusable-outside-declarations]] at P2.
+- Three diagnostic helpers now spell a simd element as `simd<float,4>` instead of the bare lane
+  type: `DescribeAggregateStorageShape` (`LLVMBackend.h`), `DescribePointerShapedInterfaceSource`
+  (`LLVMBackend.h`, its `**` / `[]` / `[N]` arms - the bare-simd arm is untouched) and
+  `DescribeArrayShape` (`MainListener.h`). Wording only: measured pre/post, every plain-array and
+  plain-pointer spelling renders byte-identically and every verdict (rc) is unchanged.
+- TWO `!IsSimd` guard exclusions (`MainListener.h`, whole-array assignment and global fixed-array
+  init) became REACHABLE when the dimension started being recorded, and are DELIBERATELY left
+  alone. A second guard catches the shape either way, so both spellings are still rejected - only
+  the wording differs. Widening a rejection predicate for a wording benefit is not worth an
+  accept-set exercise here; filed as
+  [[simd-array-error-wording-differs-from-plain-arrays]] at P3, with both measured repros.
+
+No new `TypeAndValue` field: the change sets `ElemPointer` and `ConstArraySize`, both already in
+BOTH `--init` serializers (`ep`/`arr`). No new transient state, nothing to clear in
+`ResetForReanalysis`.
+
+One more edit worth naming, since it is a behaviour change and not a comment: the splat threads
+`srcIsUnsigned` into the element conversion at **all THREE splat sites**, which the `else` arm
+`CreateAssignment` bypasses was already doing. Only the WIDENING step takes the flag; the narrowing
+/ int-float leg keeps its long-standing default so threading it cannot change an unrelated cast.
+
+- `CreateAssignment`'s splat arm (`LLVMBackend.h`) - assignment.
+- `SplatToSimd(scalar, tv, srcIsUnsigned)` (`LLVMBackend.h`), passed from the decl-init caller in
+  `MainListener.h` - declaration initializer.
+- `CreateVectorOperation`'s `splat` lambda (`LLVMBackend.h`) - a scalar operand of a vector
+  operator. Its single `isUnsigned` parameter became a PER-OPERAND pair
+  (`leftIsUnsigned`, `rightIsUnsigned`) so a splatted scalar widens with its OWN signedness;
+  comparison signedness still uses `leftIsUnsigned || rightIsUnsigned`, exactly as before.
+
+The first cut of this commit threaded the flag at the assignment site ONLY, which made three
+shipped statements false. Measured on that binary and on this one, `simd<i64,2>` lane 1:
+
+| source            | site      | before | after      |
+|-------------------|-----------|--------|------------|
+| `u32 4000000000`  | assign    | 4000000000 | 4000000000 |
+| `u32 4000000000`  | decl-init | -294967296 | 4000000000 |
+| `u32 4000000000`  | vector-op | -294967296 | 4000000000 |
+| `u16 60000`       | decl-init | -5536      | 60000      |
+| `u16 60000`       | vector-op | -5536      | 60000      |
+| `u8 200`          | decl-init | -56        | 200        |
+| `u8 200`          | vector-op | -56        | 200        |
+| `i32 -5`          | all three | -5         | -5         |
+
+The signed row is the must-not-break half: only genuinely unsigned sources zero-extend.
+`Test/test_hpc.cb` section 11 freezes all ten cells as value legs; the six unsigned decl-init /
+vector-op legs fail on the assignment-only binary and pass here.
+
+Bar: macOS arm64 Release `./test.sh Release` 576 passed / 0 failed / 8 skipped, `bash
+example_mac.sh Release` 35 passed / 0 failed, `bash test_lsp.sh Release` 152 passed / 0 failed. The
+suite counts FILES and this commit adds none: it extends `Test/test_hpc.cb` with
+`testSimdPointerStorage` (33 value legs, 259 -> 292 asserts in that file),
+`Test/errors/err_simd_lane_write.cb` with the whole-array-assign leg, and
+`Test/errors/err_fixed_array_byval_return.cb` with the simd-array-return leg. Differential `--check`
+sweep of a `904f026` build against this one over all 523 `.cb` files under `Test/`, `example/` and
+`cflat/core/`: the only real differences are the three touched test files; every other apparent diff
+is the compiler's own worktree path echoed inside an "imported file not found: windows.h" message.
+That sweep predates the amend that threaded `srcIsUnsigned` at the remaining two splat sites and
+taught the two sibling describe helpers the simd spelling. Those were verified by targeted pre/post
+pairs against a build of the pre-amend commit (every plain-array and plain-pointer spelling
+byte-identical, every rc identical) plus a full green bar, NOT by a second whole-corpus sweep.
+
+**How to read the 33 `test_hpc.cb` legs, stated honestly because a review round had to correct the
+first version of this claim.** On a pre-fix binary that FILE does not compile at all, so the
+pointer legs share ONE failure and none of them is an independent pre-fix discriminator - they are
+forward tripwires, not twenty separate proofs. Two specific corrections the review forced, both now
+in the file's comments: the `simd ptr passed to callee` leg was described as covering the parameter
+path, which was never broken (its pre-fix failure comes from the local declaration above it); and
+the first cut of the scalar-reassign pair asserted lane 0, which the pre-fix miscompile wrote
+CORRECTLY (it writes every EVEN lane) - that leg passed with the `CreateAssignment` splat reverted.
+The ALL-LANE SUM is now the discriminator, precisely because it does not depend on which lanes the
+bad store happened to hit; the lane-3 leg is kept as a supplementary per-lane check. Every `== 0`
+pointer leg is now followed by a round-trip through a real address, so a splat-into-the-slot could
+not satisfy it. The legs that ARE independently discriminating against `904f026`, extracted and
+mutation-tested standalone: the four array legs (hard-error "simd<T,N> lane write 'v[i] = ...' is
+not supported" - the dropped dimension made `a[0]` a lane) and the reassign pair (measured
+`5 0 5 0`, so the sum leg reads 10 against the expected 20 and the lane-3 leg reads 0 against 5).
+The six section-11 unsigned-splat legs discriminate against the assignment-only first cut of this
+same commit rather than against `904f026`. Both `err_simd_lane_write.cb` legs and the new `mk4` return leg were mutation-tested
+individually and each flips its file to rc 1.

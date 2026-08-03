@@ -681,6 +681,185 @@ int testSimdGatherScatter()
     return passed;
 }
 
+// Deref helper for the simd pointer legs below. A `simd<T,N>*` PARAMETER already worked on
+// master, so this helper is not itself under test - it exists so one leg can prove a pointer
+// value survives a call boundary.
+float simdPtrLane0(simd<float,4>* p)
+{
+    simd<float,4> t = *p;
+    return t[0];
+}
+
+// Returns a bare simd BY VALUE - the shape the fixed-array-return rejection must never catch.
+// Lanes are made DISTINCT (via load) so the caller's all-lane sum sees a whole vector.
+simd<float,4> simdMakeByValue(float base)
+{
+    float[] f = new float[4];
+    f[0] = base; f[1] = base + 1.0f; f[2] = base + 2.0f; f[3] = base + 3.0f;
+    simd<float,4> t = simd<float,4>.load(f, 0);
+    delete[] f;
+    return t;
+}
+
+/*
+ * simd<T,N> pointer / array storage. Every leg here declares a LOCAL whose slot is a pointer or
+ * an array - the only shape that reached the decl-init splat arm with a non-vector slot type, and
+ * the shape that aborted the compiler (rc 138/139, zero output). Globals, struct fields and
+ * parameters take other paths and already worked, so they are not re-covered here.
+ *
+ * Non-vacuity note, so the next reader does not over-read these legs: on a pre-fix binary this
+ * FILE does not compile at all, so the pointer legs share ONE failure and none of them is an
+ * independent pre-fix discriminator. They are written as forward tripwires - each asserts a VALUE
+ * that a re-broken slot type would change - not as twenty separate proofs. Where a leg can only
+ * say `== 0` ("it compiled"), a round-trip leg follows it that a splat into the slot would break.
+ */
+int testSimdPointerStorage()
+{
+    int passed = 0;
+    simd<float,4> v = 2.0f;
+
+    // 1. The two filed repro spellings. `== 0` alone would still pass if the slot had been
+    //    splatted with zeroes, so each is followed by a round-trip through a real address.
+    simd<float,4>* pnull = nullptr;
+    simd<float,4>* pdef = default;
+    passed += Test("simd ptr local nullptr", (i64)pnull, (i64)0);
+    passed += Test("simd ptr local default", (i64)pdef, (i64)0);
+    pnull = &v;
+    pdef = &v;
+    simd<float,4> tn = *pnull;
+    simd<float,4> td = *pdef;
+    passed += Test("simd ptr nullptr slot holds an address", tn[0], 2.0f);
+    passed += Test("simd ptr default slot holds an address", td[0], 2.0f);
+
+    // 2. Address-of a simd local in the DECLARATION (not a later assignment), read back.
+    simd<float,4>* p = &v;
+    simd<float,4> t = *p;
+    passed += Test("simd ptr addr-of read", t[0], 2.0f);
+    passed += Test("simd ptr across a call boundary", simdPtrLane0(p), 2.0f);
+
+    // 3. Write through the pointer. This is the strongest leg for the slot holding v's real
+    //    address: bytes of a splatted vector could not land 9.0 back in v.
+    *p = 9.0f;
+    passed += Test("simd ptr write-through lane0", v[0], 9.0f);
+    passed += Test("simd ptr write-through lane3", v[3], 9.0f);
+
+    // 4. Pointer copied from another pointer, then reassigned.
+    simd<float,4> w = 4.0f;
+    simd<float,4>* q = pnull;
+    q = &w;
+    simd<float,4> tw = *q;
+    passed += Test("simd ptr reassigned", tw[0], 4.0f);
+
+    // 5. simd<T,N>** - the second indirection level was dropped, so *pp lowered as a vector.
+    simd<float,4>** pp = &q;
+    simd<float,4>* deref = *pp;
+    simd<float,4> tpp = *deref;
+    passed += Test("simd ptr-to-ptr deref", tpp[0], 4.0f);
+
+    // 6. static / const local pointer spellings, each proved by a round-trip rather than by
+    //    the `== 0` that only says the declaration compiled.
+    static simd<float,4>* sp = nullptr;
+    passed += Test("simd ptr static local", (i64)sp, (i64)0);
+    sp = &v;
+    simd<float,4> ts = *sp;
+    passed += Test("simd ptr static local round-trip", ts[0], 9.0f);
+    const simd<float,4>* cp = &w;
+    simd<float,4> tc = *cp;
+    passed += Test("simd ptr const local round-trip", tc[0], 4.0f);
+
+    // 7. Element type / lane count axis: the abort was not specific to simd<float,4>. Each
+    //    declares the crashing `= nullptr` spelling and then round-trips a real address.
+    simd<int,8> iv = 11;
+    simd<int,8>* pi = nullptr;
+    pi = &iv;
+    simd<int,8> ti = *pi;
+    passed += Test("simd<int,8> ptr round-trip", ti[5], 11);
+    simd<double,2> dv = 7.0;
+    simd<double,2>* pd = nullptr;
+    pd = &dv;
+    simd<double,2> tdv = *pd;
+    passed += Test("simd<double,2> ptr round-trip", (float)tdv[1], 7.0f);
+
+    // 8. simd<T,N>[N] array storage: the declarator's dimension used to be dropped, so `a` was
+    //    ONE vector and a[i] was a LANE index. The elem1 and lane3 legs are NOT independent
+    //    pre-fix discriminators (pre-fix the file stops at the first a[i] store, which master
+    //    reads as a lane write); they are the tripwire against an element access silently
+    //    collapsing back onto a lane, which the elem0/lane0 leg alone could not see.
+    simd<float,4>[2] a = default;
+    a[0] = 3.0f;
+    a[1] = 7.0f;
+    simd<float,4> a0 = a[0];
+    simd<float,4> a1 = a[1];
+    passed += Test("simd array elem0 lane0", a0[0], 3.0f);
+    passed += Test("simd array elem0 lane3", a0[3], 3.0f);
+    passed += Test("simd array elem1 lane0", a1[0], 7.0f);
+    passed += Test("simd array elem1 lane3", a1[3], 7.0f);
+
+    // 9. Array of simd pointers: pointer-ness and array-ness together.
+    simd<float,4>*[2] ap = default;
+    ap[0] = &v;
+    ap[1] = &w;
+    simd<float,4> ap0 = *ap[0];
+    simd<float,4> ap1 = *ap[1];
+    passed += Test("simd ptr array elem0", ap0[0], 9.0f);
+    passed += Test("simd ptr array elem1", ap1[0], 4.0f);
+
+    // 10. Whole-vector scalar REASSIGNMENT (not decl-init) splats EVERY lane. Pre-fix the bad
+    //     bitcast wrote every EVEN lane and left the odd ones zero (measured: 5 0 5 0; simd<float,8>
+    //     gives 5 0 5 0 5 0 5 0 and simd<int,4> 7 0 7 0), so any single-lane assertion only
+    //     discriminates by accident of parity. The ALL-LANE SUM is the discriminator: it is robust
+    //     against any lane-pattern variant and catches a single stale lane.
+    simd<float,4> r = default;
+    r = 5.0f;
+    passed += Test("simd scalar reassign all lanes", r[0]+r[1]+r[2]+r[3], 20.0f);
+    passed += Test("simd scalar reassign lane3", r[3], 5.0f);
+
+    // 11. An UNSIGNED source widened into a wider lane type must ZERO-extend, at all THREE splat
+    //     sites. Only the assignment site threaded the source signedness; on the pre-fix binary
+    //     the decl-init and vector-op sites both gave -294967296 for a u32 of 4000000000.
+    //     (test_helper prints i64 with %d, so the u32 legs' failure line truncates BOTH values to
+    //     the same int - the exit code, and the u8/u16 legs below, are the legible signal.)
+    u32 ux = 4000000000;
+    simd<i64,2> ua = default;
+    ua = ux;
+    passed += Test("simd unsigned splat assign",    ua[1], 4000000000);
+    simd<i64,2> ud = ux;
+    passed += Test("simd unsigned splat decl-init", ud[1], 4000000000);
+    simd<i64,2> uz = 0;
+    simd<i64,2> uv = uz + ux;
+    passed += Test("simd unsigned splat vector-op", uv[1], 4000000000);
+
+    // A SIGNED source must still SIGN-extend at the same three sites: the fix must widen only
+    // genuinely unsigned sources, so these legs are the must-not-break half of the pair.
+    i32 sx = -5;
+    simd<i64,2> sa = default;
+    sa = sx;
+    passed += Test("simd signed splat assign",    sa[1], -5);
+    simd<i64,2> sd = sx;
+    passed += Test("simd signed splat decl-init", sd[1], -5);
+    simd<i64,2> sv = uz + sx;
+    passed += Test("simd signed splat vector-op", sv[1], -5);
+
+    // Narrower unsigned sources reach the same widening step.
+    u8 u8x = 200;
+    simd<i64,2> d8 = u8x;
+    passed += Test("simd u8 splat decl-init",  d8[1], 200);
+    simd<i64,2> v8 = uz + u8x;
+    passed += Test("simd u8 splat vector-op",  v8[1], 200);
+    u16 u16x = 60000;
+    simd<i64,2> d16 = u16x;
+    passed += Test("simd u16 splat decl-init", d16[1], 60000);
+    simd<i64,2> v16 = uz + u16x;
+    passed += Test("simd u16 splat vector-op", v16[1], 60000);
+
+    // 12. A BARE simd returned BY VALUE. This passes on every current binary - it is a forward
+    //     tripwire so widening the fixed-array-return rejection cannot silently swallow it.
+    simd<float,4> bv = simdMakeByValue(10.0f);
+    passed += Test("simd by-value return all-lane sum", bv[0]+bv[1]+bv[2]+bv[3], 46.0f);
+
+    return passed;
+}
+
 // ---------------------------------------------------------------------------
 // span<T> (noalias) and view<T> (may-alias) library types - see doc/HPC.md.
 // span rides the T[] array-view noalias metadata; view is the may-alias sibling.
@@ -1626,6 +1805,7 @@ extern int main(int argc, char** argv)
     passed += testSimdReduce();            total += 12;
     passed += testSimdMasked();            total += 8;
     passed += testSimdGatherScatter();     total += 9;
+    passed += testSimdPointerStorage();    total += 34;
 
     // ---- span<T> / view<T> ----
     passed += testSpanView(); total += 24;
