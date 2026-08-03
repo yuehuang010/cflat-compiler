@@ -30,8 +30,9 @@ int _fs_fwrite(i8* buf, int size, int count, void* s) {
     return (int)fwrite(buf, (win_size)size, (win_size)count, s);
 }
 win_int _fs_feof(void* s) { return feof(s); }
+// The int offsets here cap File at 2 GB; widening that is a separate change.
 win_int _fs_fseek(void* s, int offset, int origin) {
-    return fseek(s, (win_size)offset, origin);
+    return fseek(s, (long)offset, origin);
 }
 int _fs_ftell(void* s) { return (int)ftell(s); }
 

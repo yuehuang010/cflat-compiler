@@ -208,6 +208,22 @@ int testFileInstanceMethods()
     passed += Test("tell after seek", f->tell(), 1);
     delete f;
     delete[] rbuf;
+
+    // Raw ftell/fseek must bind C's `long` (i32 on LLP64), not a pointer-sized type:
+    // a too-wide return reads a garbage upper half. Origins: 2 == SEEK_END, 0 == SEEK_SET.
+    void* raw = fopen(bpath.data(), "rb");
+    passed += Test("raw fopen", raw != nullptr, true);
+    if (raw != nullptr)
+    {
+        fseek(raw, 0, 2);
+        auto rawEnd = ftell(raw);
+        passed += Test("ftell binds C long", typeof(rawEnd), "long");
+        passed += Test("raw ftell at end", rawEnd == 4, true);
+        fseek(raw, 2, 0);
+        passed += Test("raw ftell after seek", ftell(raw) == 2, true);
+        fclose(raw);
+    }
+
     File.remove(bpath);
 
     // readLines
@@ -437,7 +453,7 @@ extern int main()
     r = testDirectoryFunctions();   passed += r; total += 6;
     r = testDirectoryClass();       passed += r; total += 4;
     r = testFileStaticHelpers();    passed += r; total += 7;
-    r = testFileInstanceMethods();  passed += r; total += 9;
+    r = testFileInstanceMethods();  passed += r; total += 13;
     r = testPathClass();            passed += r; total += 17;
     r = testDirectoryExtended();    passed += r; total += 8;
     r = testMappedFile();           passed += r; total += 14;

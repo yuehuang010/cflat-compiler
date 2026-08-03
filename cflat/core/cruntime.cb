@@ -36,8 +36,9 @@ extern win_int  fclose(void* stream);
 extern win_size fread(i8* buf, win_size size, win_size count, void* stream);
 extern win_size fwrite(const i8* buf, win_size size, win_size count, void* stream);
 extern win_int  feof(void* stream);
-extern win_int  fseek(void* stream, win_size offset, win_int origin);
-extern win_size ftell(void* stream);
+// C spells both offsets `long`: 32-bit on Windows/LLP64, 64-bit on LP64.
+extern win_int  fseek(void* stream, long offset, win_int origin);
+extern long     ftell(void* stream);
 
 // === Formatting primitives (canonical home; keep an if const only where the CRT
 // vs libc entry-point NAME differs). These share the one linkage symbol with the

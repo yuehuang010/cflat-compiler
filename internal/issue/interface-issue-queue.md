@@ -50,8 +50,9 @@ on the SEVERITY MIX (are there silent wrong values left?), not on the count reac
 Two items also ended as deliberate NON-fixes, which is the queue working as designed rather than a
 shortfall: `return-dangle-missed-when-slot-has-extra-user` (its own file says do not patch it, and
 the prerequisite it names does not actually unblock it - RECLASSIFIED to P3 on 2026-08-02 by the
-maintainer, since a permanent non-fix does not belong in the P1 working set) and `ftell-fseek-long-width-on-windows`
-(parked, Windows-only). And `interface-field-self-assign-false-positive` was ATTEMPTED and
+maintainer, since a permanent non-fix does not belong in the P1 working set). The other,
+`ftell-fseek-long-width-on-windows`, was parked rather than declined and is now FIXED - see the
+landed design record below. And `interface-field-self-assign-false-positive` was ATTEMPTED and
 REVERTED - see its file for the three discriminators that cannot work.
 ## Resume point
 
@@ -71,8 +72,8 @@ parked `fix/iface-ifconst` branch stays parked.
   record below. The ratified rule survives there, not here: reject at COMPILE TIME as far as is
   provable, NO per-dispatch runtime guard, `?.` is the answer for anything not provable. Residue
   filed as `null-interface-access-residue-unproven-receivers`.
-- `ftell-fseek-long-width-on-windows` - PARKED. Windows-only, unverifiable from a macOS host;
-  land it from Windows. Skip it when picking P1 work on a Mac.
+- `ftell-fseek-long-width-on-windows` - FIXED on a Windows host 2026-08-02 and deleted; see the
+  landed design record below. The >2 GB half it deferred is now `p2/file-offsets-capped-at-2gb`.
 
 Next P1s, and the sequencing that matters:
 
@@ -90,7 +91,6 @@ Next P1s, and the sequencing that matters:
   `p3/null-conditional-args-eval-order-hresult` (HResult/COM half) and
   `p3/nullcond-guard-skips-move-argument-cleanup` (the move-argument leak the guard
   introduces on the null path).
-- `ftell-fseek-long-width-on-windows` cannot be verified on a macOS host - land it from Windows.
 
 The four function-pointer / closure P1s fixed on 2026-07-31 left FIVE residues, all filed rather
 than implied. `fix/funcptr-arg-accept-set` closes ONE of them outright
@@ -211,14 +211,14 @@ A further review round of the same fix filed a FIFTH: `pointer-decl-field-init-b
 `fix/ptr-fieldinit`; see the landed design record below. That fix in turn filed two more from its own
 Phase A enumeration - [[empty-brace-initializer-never-seeds-and-crashes-on-defaults]] (P1) and
 [[string-literal-containing-braces-retyped-as-string]] (P2) - which is the same pattern again. Current
-true count: **10 P1 / 38 P2 / 27 P3 / 7 UI = 82 total.**
+true count: **9 P1 / 39 P2 / 27 P3 / 7 UI = 82 total** (`ftell-fseek-long-width-on-windows` fixed
+2026-08-02; its >2 GB half re-filed as [[file-offsets-capped-at-2gb]] at P2).
 
 ### P1 - wrong programs and crashes (`p1/`)
 
 | Issue | Severity |
 |---|---|
 | [[interface-boxing-keyed-on-source-binding]] | NARROWED 2026-07-31: the two binding erasures (parens, `??`) and the two un-routed boxing sites are closed. What remains is `delete` of a BORROWED interface box (exit 139/133, no diagnostic) - a different root, reachable with no join at all. |
-| [[ftell-fseek-long-width-on-windows]] | Silent wrong value on Windows: core binds C `long` as pointer-sized, so `ftell`/`fseek` read garbage under LLP64. Not a UI issue despite being Windows-only. |
 | [[null-interface-access-residue-unproven-receivers]] | SIGSEGV (139), no diagnostic. NARROWED 2026-08-02 by `78c678b`: the PARENTHESIZED field access `(lv).tag` is CLOSED (all paren depths, plus the write form `(lv).tag = 5`). What remains is struct-field / array-element / global receivers. The `?.`, branch-, loop-, parameter- and folded-`if const` shapes are DELIBERATELY accepted per the ratified design and are NOT residue. |
 | [[funcptr-overload-binding-ignores-signature]] | NARROWED 2026-07-31 by `fix/funcptr-arg-accept-set`: the type-CLASS axis is closed on both paths (the filed `double`-into-`int` repro now errors). Still open, silent and identical on master: floating-point WIDTH (same SHAPE as the closed repro), integer width/signedness, POINTEE type (memory-unsafe - reads past the end of the object), and aggregates. Do NOT re-close by widening the comparison to spellings; see the file. |
 | [[llvm-cannot-select-sign-extend-on-const-array-index]] | Compiler crash. **CORRECTED 2026-08-02**: the `Cannot select` / exit-134 TEXT is NOT reproducible on `ca5a02a` - what reproduces is a bare SIGSEGV, exit 139, no output, and only when a CONSTANT-index element read follows the row assign (a `%s` whole-row read or a runtime index miscompiles silently instead). The decl-init, whole-array-assign and ROW-assign shapes that fed it are all rejected now; the backend node itself is still undiagnosed. |
@@ -2228,3 +2228,37 @@ the suite counts FILES and this commit adds none, it extends `Test/test_initiali
 `expect_error` legs in `Test/errors/err_ptr_brace_init.cb` - the 13 added here AND the 9 inherited
 from `fix/ptr-fieldinit`, whose message tails this commit changed - mutation-tested individually,
 22 for 22: replacing each brace form with a legal spelling flips the file to rc 1 naming that leg.
+
+### fix/ftell-long - `ftell`/`fseek` re-bound to C's `long` (RATIFIED)
+
+Landed 2026-08-02 from a **Windows** host, which is the whole reason this one sat parked: the
+defect does not exist on LP64, so a macOS or Linux session could neither reproduce nor verify it.
+
+`core/cruntime.cb`, `core/os.windows.cb` and `core/os.posix.cb` all declared C's `ftell` as
+returning `win_size` (pointer-sized) and `fseek` as taking a `win_size` offset. C spells both
+`long`. On Windows/LLP64 that is a 32-bit type, so the CRT's `ftell` writes only `eax` and the
+caller read whatever was left in the upper half of `rax`. All three decl sites now say `long`,
+and `filesystem.cb:35` casts to `(long)` instead of `(win_size)`.
+
+Three things worth carrying forward:
+
+- **The fix is invisible in observed VALUES.** The garbage upper half is ABI-permitted but does
+  not materialize on this UCRT - a pre-fix build returns exactly `4` for a 4-byte file, same as
+  post-fix. The first version of the regression test asserted `ftell(f) == 4` and was therefore
+  VACUOUS; it passed identically against a stale pre-fix core deployment. What discriminates is
+  the DECLARED TYPE, so the test asserts `typeof(rawEnd) == "long"` instead
+  (`Test/test_filesystem.cb`, `testFileInstanceMethods`). Verified non-vacuous by compiling
+  against the not-yet-redeployed `x64/Debug/core`, where it fails with
+  `expected 'long' got 'i64'`. General lesson: when a fix corrects a TYPE whose wrong value is
+  merely permitted rather than guaranteed, assert the type.
+- **The three-site decl duplication is unguarded.** Declaring the same extern twice with
+  DIFFERENT types compiles clean with no diagnostic - the compiler keeps the first and silently
+  drops the rest, so the winner is import order. Only cruntime's un-namespaced copy has callers
+  today (`filesystem.cb`); nothing spells `os.ftell`. A future divergence in the namespaced
+  copies would sit undetected until someone calls them.
+- **`File` is still capped at 2 GB** on every platform - `_fs_ftell` narrows through `int` and
+  the public `tell()`/`size()`/`seek()` are `int`. Deliberately NOT fixed here (it is a public
+  API change needing `_ftelli64`/`_fseeki64` and `ftello`/`fseeko`); filed as
+  [[file-offsets-capped-at-2gb]] at P2, which also carries the `extern i32 strlen` note.
+
+Bar: `test.bat Release` all passed, `example.bat Release` 90 passed / 0 failed / 27 skipped.

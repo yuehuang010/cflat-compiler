@@ -320,10 +320,10 @@ namespace os.windows
     extern i8*      fgets(i8* buf, win_int size, void* stream);
     // Return nonzero once a stream has reached end-of-file.
     extern win_int  feof(void* stream);
-    // Move a stream's file position relative to origin.
-    extern win_int  fseek(void* stream, win_size offset, win_int origin);
-    // Return a stream's current file position.
-    extern win_size ftell(void* stream);
+    // Move a stream's file position relative to origin (C `long` offset).
+    extern win_int  fseek(void* stream, long offset, win_int origin);
+    // Return a stream's current file position as a C `long`.
+    extern long     ftell(void* stream);
     // Delete a file by path.
     extern win_int  _unlink(const char* path);
     // Move or rename a file (flags control replace/copy behavior).

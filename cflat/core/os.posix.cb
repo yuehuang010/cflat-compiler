@@ -379,8 +379,8 @@ namespace os.posix
     extern win_size fread(i8* buf, win_size size, win_size count, void* stream);
     extern win_size fwrite(const i8* buf, win_size size, win_size count, void* stream);
     extern win_int  feof(void* stream);
-    extern win_int  fseek(void* stream, win_size offset, win_int origin);
-    extern win_size ftell(void* stream);
+    extern win_int  fseek(void* stream, long offset, win_int origin);
+    extern long     ftell(void* stream);
 
     // POSIX file ops.
     extern win_int  access(const char* path, win_int mode);     // mode 0 == F_OK (exists)
