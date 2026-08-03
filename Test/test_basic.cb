@@ -2934,6 +2934,23 @@ bool testFixedArrays()
     int[2][3] mdDst = mdSrc;
     mdSrc[1][2] = 90;
     result &= Test("fixed_copy_multidim", mdDst[1][2], 9);
+    // A FULLY SIZED multi-dim declaration stays legal: the reject that bans an empty '[]' among
+    // several dimensions ('int[][]', 'int[][3]', 'int[2][]' - see
+    // Test/errors/err_multidim_array_view.cb) keys on the bracket count VERSUS the sized-
+    // dimension count, so it must not fire here. The tripwire is the `int[2][3]` declarations
+    // above, which predate that reject; this line only asserts both survived the copy.
+    result &= Test("fixed_multidim_sized_decl", mdDst[1][2] + mdSrc[1][2], 99);
+    // ...and the single empty pair, the one bracket form that IS a view, keeps working over a
+    // multi-dimensional source. 'int[] v = a' is a FLAT view of the whole allocation (mdSrc is
+    // [2][3], so v[4] is mdSrc[1][1]) - that is why 'int[][] v = a' had to be rejected rather
+    // than silently kept: it produced this same flat addressing under a 2-D spelling.
+    mdSrc[1][1] = 11;
+    int[] mdFlat = mdSrc;
+    result &= Test("fixed_multidim_flat_view", mdFlat[4], 11);
+    // A ROW bind is the supported way to get a per-row view, and it writes through.
+    int[] mdRow = mdSrc[1];
+    mdRow[2] = 55;
+    result &= Test("fixed_multidim_row_view_writes", mdSrc[1][2], 55);
 
     // The three remedies the fixed-array-storage rejects name. Each is asserted by VALUE
     // so a diagnostic can never recommend something that stopped working:

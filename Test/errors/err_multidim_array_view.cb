@@ -1,0 +1,99 @@
+// An empty '[]' is representable only as the SOLE dimension: the `T[]` array view is a thin
+// `ptr` and carries no row stride. The grammar folds every bracket pair into one arrayDimSpec
+// and drops the empty pairs from assignmentExpression(), so before this reject `int[][]` parsed
+// as `int[]`, `int[][3]` as `int[3]` and `int[2][]` as `int[2]` - every one of them a silent
+// miscompile (`v[1][2]` on a 2-D source read flat index 3, i.e. a[1][0]).
+import "tuple.cb";
+
+// The filed repro: a 2-D view spelling in a local declaration.
+expect_error("with an empty '[]' among several dimensions") {
+    void mdv_decl() { int[2][3] a = default; int[][] v = a; a[0][0] = v[1][2]; }
+}
+
+// The PARAMETER axis - a thin view cannot carry a per-call row stride.
+expect_error("with an empty '[]' among several dimensions") {
+    int mdv_param(int[][] v) { return v[1][2]; }
+}
+
+// The RETURN axis.
+expect_error("with an empty '[]' among several dimensions") {
+    int[][] mdv_ret(int[2][3] unusedm) { return nullptr; }
+}
+
+// A struct FIELD.
+expect_error("with an empty '[]' among several dimensions") {
+    struct MdvHolder { int[][] v = default; };
+}
+
+// A GLOBAL declaration.
+expect_error("with an empty '[]' among several dimensions") {
+    int[][] gMdvView = nullptr;
+}
+
+// Partially sized: the empty pair is the OUTER one. Used to parse as `int[3]`, so the
+// diagnostic the user saw named a type they never wrote.
+expect_error("with an empty '[]' among several dimensions") {
+    void mdv_inner_sized() { int[2][3] a = default; int[][3] v = a; a[0][0] = v[1][2]; }
+}
+
+// Partially sized: the empty pair is the INNER one. Used to parse as `int[2]`.
+expect_error("with an empty '[]' among several dimensions") {
+    void mdv_outer_sized() { int[2][3] a = default; int[2][] v = a; a[0][0] = v[1][2]; }
+}
+
+// Three dimensions - the rule is bracket-count based, not 2-D specific.
+expect_error("with an empty '[]' among several dimensions") {
+    void mdv_three_d() { int[2][3][4] a = default; int[][][] v = a; a[0][0][0] = v[1][2][3]; }
+}
+
+// The CAST target `(T[][])` reaches the abstract-declarator path, not the declaration path.
+// Discriminator: the declaration here is a single-bracket `int[] v`, so the two
+// ParseDeclarationSpecifiers guards cannot fire and only the cast site is left.
+expect_error("with an empty '[]' among several dimensions") {
+    void mdv_cast(int* p) { int[] v = (int[][])p; v[0] = 1; }
+}
+
+// A `using` alias folds its brackets into a string, so `int[][3]` became the alias "int[3]".
+// The expectation names the alias AND the new clause: "using alias 'MdvAlias'" alone is the
+// shared prefix of every alias diagnostic and any future alias reject would satisfy it.
+expect_error("using alias 'MdvAlias': 'int' with an empty '[]' among several dimensions") {
+    using MdvAlias = int[][3];
+}
+
+// A generic type ARGUMENT reaches IsBadArrayArg, which shares the bracket-count predicate.
+// The message is shared with the sized-`T[N]` arm, so the discriminator is the SOURCE: this
+// argument has no sized bracket, so only the unsized-multi-dim arm can have fired.
+expect_error("an unsized multi-dimensional 'T[][]' and a pointer-to-array 'T[]*' are not") {
+    struct MdvBox<T> { T item = default; };
+    void mdv_generic_arg() { MdvBox<int[][]> b = default; b.item = nullptr; }
+}
+
+// A tuple ELEMENT - the second IsBadArrayArg site, with its own wording. Same discriminator
+// as the leg above: no sized bracket is present, so no pre-existing arm can reach it.
+expect_error("tuple element; a sized 'T[N]', an unsized multi-dimensional 'T[][]'") {
+    void mdv_tuple_arg() { (int, int[][]) t = default; t.item_0 = 1; }
+}
+
+// `auto` over a multi-dimensional fixed array: the decayed element is a ROW, not a `T`, so
+// `T[]` would be the wrong deduction and `T[][]` does not exist. Before this reject the
+// binding carried no shape and `s[1][2]` read garbage.
+expect_error("cannot deduce 'auto' from multi-dimensional fixed array 'int[2][3]'") {
+    void mdv_auto_2d() { int[2][3] a = default; auto s = a; a[0][0] = s[1][2]; }
+}
+
+// Same deduction over a 3-D source: the row-bind remedy is dropped, because a row of a 3-D
+// array is itself multi-dimensional and has no view either.
+expect_error("cannot deduce 'auto' from multi-dimensional fixed array 'int[2][3][4]'") {
+    void mdv_auto_3d() { int[2][3][4] a = default; auto s = a; a[0][0][0] = s[1][2][3]; }
+}
+
+// A struct element type takes the same deduction path.
+expect_error("cannot deduce 'auto' from multi-dimensional fixed array 'MdvCell[2][3]'") {
+    struct MdvCell { int x = default; };
+    void mdv_auto_struct() { MdvCell[2][3] a = default; auto s = a; a[0][0].x = s[1][2].x; }
+}
+
+extern int main()
+{
+    return 0;
+}

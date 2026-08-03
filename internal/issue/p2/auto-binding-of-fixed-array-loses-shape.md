@@ -70,5 +70,6 @@ new field" hypothesis is dead, do not revive it.
 
 ## Related
 
-[[interface-issue-queue]], [[multidim-array-view-binding-loses-shape]] - the other axis of
-the same "which array shapes can `auto` deduce" question.
+[[interface-issue-queue]] - the multi-dimensional axis of the same "which array shapes can
+`auto` deduce" question is SETTLED (see the `fix/mdview` design record): `auto` over a
+`T[N][M]` now rejects, alongside every `T[][]` spelling.

@@ -222,7 +222,6 @@ true count: **10 P1 / 38 P2 / 27 P3 / 7 UI = 82 total.**
 | [[null-interface-access-residue-unproven-receivers]] | SIGSEGV (139), no diagnostic. NARROWED 2026-08-02 by `78c678b`: the PARENTHESIZED field access `(lv).tag` is CLOSED (all paren depths, plus the write form `(lv).tag = 5`). What remains is struct-field / array-element / global receivers. The `?.`, branch-, loop-, parameter- and folded-`if const` shapes are DELIBERATELY accepted per the ratified design and are NOT residue. |
 | [[funcptr-overload-binding-ignores-signature]] | NARROWED 2026-07-31 by `fix/funcptr-arg-accept-set`: the type-CLASS axis is closed on both paths (the filed `double`-into-`int` repro now errors). Still open, silent and identical on master: floating-point WIDTH (same SHAPE as the closed repro), integer width/signedness, POINTEE type (memory-unsafe - reads past the end of the object), and aggregates. Do NOT re-close by widening the comparison to spellings; see the file. |
 | [[llvm-cannot-select-sign-extend-on-const-array-index]] | Compiler crash. **CORRECTED 2026-08-02**: the `Cannot select` / exit-134 TEXT is NOT reproducible on `ca5a02a` - what reproduces is a bare SIGSEGV, exit 139, no output, and only when a CONSTANT-index element read follows the row assign (a `%s` whole-row read or a runtime index miscompiles silently instead). The decl-init, whole-array-assign and ROW-assign shapes that fed it are all rejected now; the backend node itself is still undiagnosed. |
-| [[multidim-array-view-binding-loses-shape]] | Silent miscompile. The `T[][]` view spelling drops the row stride, so `auto` over a 2-D fixed array has no correct target to deduce to. Residual of the 1-D fixed-array-shape fix. |
 | [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. An interface-field-to-interface-field copy with the SAME field name on both sides is misread as a self-assign, suppressing the reject. **ATTEMPTED AND REVERTED 2026-08-01** - see the file for the three discriminators that cannot work (names, box storage, and a bare `Value` compare of the field address all fail at least one witness). A sound test needs real dataflow through the box to the underlying data pointer. |
 | [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. **NARROWED 2026-08-02** by `fix/uniq-array-elem`: root cause CONFIRMED by instrumentation (`FieldName`/`CallerName` name the CONTAINER, so `selfFieldAssign` swallowed a genuine two-owner store), and every element pair whose addresses are constant-provably different now rejects - local, generic-substituted, nested, array-as-field, through-pointer, view, and global arrays. BOTH copies of the name comparison were fixed; the second (`sameField`) also guards the reassignment-destruct, and fixing only the first traded an abort for a leak. Residue: any index not constant in the emitted IR - a runtime subscript, and a `const` integer (`const` is unenforced, so folding it would be unsound). |
 | [[unique-field-global-struct-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. `gA.slot = gB.slot` on two file-scope structs. **Mechanism CORRECTED 2026-08-02** (the first filing read optimized IR and blamed `destIsStructField`; at `--no-opt` that predicate is TRUE and the stack IS entered): a global-struct field read carries an EMPTY `CallerName`, so `selfFieldAssign` reads two different globals as one slot - the same failure as the interface receiver, through a third receiver kind. Renaming the fields apart rejects on both binaries. Closable by extending `ProvablyDifferentSlots` to distinct `GlobalVariable`/`AllocaInst` roots, which is sound but is a widening of a predicate every field store flows through - do it with its own sweep. |
@@ -237,6 +236,7 @@ true count: **10 P1 / 38 P2 / 27 P3 / 7 UI = 82 total.**
 | [[pointer-arg-binds-by-value-class-param]] | miscompile | `byVal(a)` with a `Circle*` and a by-value `Circle` parameter scores a PERFECT match and lowers a raw pointer into a struct slot - module-verifier dump, NO source location, exit 1. `IsTypeMatch` compares TypeName and ignores `Pointer`; the sibling `IsTypePromotion` does gate on it. PRE-EXISTING and language-wide, no join involved. Scorer change - wide blast radius, wants the corpus sweep. Filed 2026-07-31. |
 | [[generic-wrapper-over-function-type-llvm-fatal]] | feature gap | `Box<function<int(int)>>` raises LLVM fatal `Cannot select: AArch64ISD::CALL` (exit 134) when the substituted field is INVOKED. Store-only may be fine - check that first. Borderline P1 (dies with no usable diagnostic); filed P2 because nothing lies to you. Filed 2026-07-31. |
 | [[generic-funcptr-return-poisons-enclosing-return]] | false rejection | Legal code rejected with a P1-grade diagnostic: a raw module-verifier dump (`%thinret`) and NO source location. CALLING a generic function that returns `function<>` routes the ENCLOSING function's `return` through `CoerceToFuncPtrReturn`. `main` does NOT escape; `void` and POINTER returns escape (the latter by a no-op ptr-to-ptr bitcast, which is why this is P2 and not P1 - no spelling is silently wrong). A second, different failure on the no-value-parameter spelling is recorded in the file; do not conflate. Filed 2026-08-01. |
+| [[multidim-fixed-array-has-no-brace-initializer]] | feature gap | A multi-dimensional fixed array has no working brace initializer on either binary: nested braces are a PARSE error, a flat list counts against the OUTER dimension only (`int[2][3] a = {1,2,3,4,5,6}` -> "too many initializers for 'int[2]'"), and string-literal elements hit the fixed-array pointer-store reject. `= default` plus element assignment works. Matters because `fix/mdview`'s diagnostic points at `T[N][M]`. Fix the FLAT list first (multiply through `ConstInnerDimensions`); nested braces need a grammar change. Filed 2026-08-02. |
 | [[auto-binding-of-fixed-array-loses-shape]] | feature gap | RESTORED and narrowed, re-ranked P1 -> P2. The non-pointer half is fixed; `auto v = <T*[N]>` now REJECTS because `T*[]` collapses to `T[]` in both parser copies. Representation is free - no new field needed. |
 | [[extern-decl-drops-fixed-array-return-size]] | silent wrong ABI | `extern char[8] extmk();` compiles clean on BOTH `ca5a02a` and `fix/array-storage` - the `[8]` is dropped and the declaration binds to a symbol returning one `char`. The by-value fixed-array-return reject landed on the DEFINITION path only; this is the one remaining spelling of that axis. Not a regression. Filed 2026-08-02. |
 | [[char-array-from-string-literal-has-no-spelling]] | feature gap | `char[N] b = "literal";` now has a clear diagnostic and three suggested spellings, but no direct replacement for the C idiom. Master miscompiled it silently. |
@@ -1123,10 +1123,13 @@ above). Master rejected the `auto` form only
 because the broken binding looked like a value type; that was an accident, not a safety check.
 Deducing the view makes `auto` behave exactly like the spelling it deduces, which is the point.
 
-**Deferred: the multi-dimensional case** ([[multidim-array-view-binding-loses-shape]]). The `auto`
-deduction is guarded on `ConstInnerDimensions.empty()` because there is no correct 2-D target to
-deduce to - the `T[][]` view spelling is itself broken on master. The multi-dimensional COPY works
-and is asserted (`fixed_copy_multidim`); only the view/`auto` half is deferred.
+**Deferred: the multi-dimensional case.** The `auto` deduction is guarded on
+`ConstInnerDimensions.empty()` because there is no correct 2-D target to deduce to - the `T[][]`
+view spelling is itself broken on master. The multi-dimensional COPY works and is asserted
+(`fixed_copy_multidim`); only the view/`auto` half is deferred. SETTLED by
+`fix/mdview` below: the guard stays, and both `T[][]` and `auto` over a multi-dimensional
+fixed array are now REJECTED - see that record for why the filed "carry the inner extent"
+direction cannot work.
 
 **Blast radius, measured rather than argued.** A 419-file differential sweep (`Test/` + `example/`,
 both binaries, isolated `HOME` per side) found exactly 3 differences, all of them the intended new
@@ -1937,3 +1940,139 @@ Bar (measured on the round-2 commit, rebased onto master `7f41a15`): `./test.sh 
 0 failed / 8 skipped against master's own 572/0/8 - +2 for the one new errors file, which the suite
 runs cold and warm. The suite counts FILES, so dropping the two named-argument legs from that file
 does not move the number. `bash example_mac.sh Release` 35 passed / 0 failed, same as master.
+
+### fix/mdview - every unsized multi-dimensional bracket form REJECTED (RATIFIED)
+
+Closes `multidim-array-view-binding-loses-shape`. All three filed repros were verified verbatim
+on a Release build of the parent `5a6580c` before any edit, and all three reproduced exactly as
+filed (`v=1`, garbage, `p=1`).
+
+**Root cause, and why it is bigger than the file said.** The grammar is
+`arrayDimSpec : ('[' assignmentExpression? ']')+`, so every bracket pair folds into ONE context
+and the EMPTY pairs contribute nothing to `assignmentExpression()`. Every consumer read only that
+vector, so the bracket COUNT was invisible: `int[][]` parsed as `int[]`, `int[][3]` as `int[3]`,
+and `int[2][]` as `int[2]`. The filed root cause ("the row stride is gone") is the symptom; the
+mechanism is a dropped bracket. Measured with `a[i][j] = i*10+j` on an `int[2][3]`, a `T[][]`
+view read flat index 3 (`a[1][0]`, value 10) for `v[1][2]` - stride-less pointer arithmetic, in
+the declaration, parameter, return, field and global positions alike.
+
+**The filed fix direction cannot work and was NOT taken.** "Carry `ConstInnerDimensions` on the
+view so the subscript emits the row stride" is expressible only where the extent is known at the
+binding site, i.e. a local with an initializer. A `T[][]` PARAMETER has a different extent per
+call, and a `T[][]` return type, field and global have none at all - a thin `ptr` view carries no
+row stride by construction, and making views fat is a whole-language representation change. That
+direction fixes 2 of the 11 miscompiling cells and leaves 9 needing a rejection anyway; rejecting
+all 11 consistently is the smaller and provable change.
+
+**What is now rejected.** One predicate, `LeftBracket().size() > 1 && assignmentExpression().size()
+< LeftBracket().size()` - i.e. an empty `[]` anywhere in a multi-bracket list - at six sites:
+both copies of `ParseDeclarationSpecifiers` (guarded once at the top of each, before any branch
+consumes the brackets, so the funcptr, funcptr-alias and general branches are all covered), the
+`using` alias path, the `(T[][])` cast/abstract-declarator path, and `IsArrayViewArg` /
+`IsBadArrayArg` for the generic- and tuple-type-argument positions. Separately, `auto x = <T[N][M]>`
+is rejected in `ParseDeclaration` as a sibling of the existing pointer-element reject: the decayed
+element of a multi-dimensional array is a ROW, so `T[]` is the wrong deduction and `T[][]` no
+longer exists. The `ConstInnerDimensions.empty()` guard on the deduction therefore STAYS.
+
+Pre/post per cell, measured on `5a6580c` Release and on this commit (`10` = the stride-less flat
+index 3 of an `int[2][3]` filled with `i*10+j`; the correct answer is `12`):
+
+| Cell | Pre | Post |
+|---|---|---|
+| `int[][] v = a;` (local decl) | rc 0, prints 10 | rejected |
+| `int f(int[][] v)` (parameter) | rc 0, prints 10 | rejected |
+| `int[][] f()` (return) | rc 0, prints 10 | rejected |
+| `struct H { int[][] v; }` (field) | rc 0, prints 10 | rejected |
+| `int[][] gv = ga;` (global) | rc 0, prints 10 | rejected |
+| `int[][] v = nullptr; v = a;` (assign) | rc 0, prints 10 | rejected |
+| `struct S { int m(int[][] v) }` (method param) | rc 0, prints 10 | rejected |
+| `int[][] v` passed on to an `int[] ` param | rc 0, prints 10 | rejected |
+| **`int[][] v = new int[10]; v[3]=3;`** | **rc 0, prints 3 - CORRECT** | **rejected (see "Two working shapes removed")** |
+| **`int f(int[][] v)` called with a 1-D `int[4]`** | **rc 0, prints 7 - CORRECT** | **rejected (see "Two working shapes removed")** |
+| `int[][3] v = a;` | rc 1, "cannot initialize fixed array 'int[3]'" (a type never written) | rejected, named correctly |
+| `int[2][] v = a;` | rc 1, "cannot initialize fixed array 'int[2]'" (ditto) | rejected, named correctly |
+| `int[][][] v = a;` (3-D) | rc 0, wrong value | rejected |
+| `(int[][])p` (cast) | rc 0, wrong value | rejected |
+| `using M = int[][3];` | rc 1, folds to alias "int[3]" | rejected as an alias |
+| `Box<int[][]>` (generic type arg) | rc 0, prints 10 | rejected |
+| `(int, int[][])` (tuple element) | rc 1, unrelated cast-of-aggregate error | rejected on the bracket form |
+| `auto s = a;` over `int[2][3]` | rc 0, garbage (`-142573312`) | rejected |
+| `auto s = a;` over `int[2][3][4]` | rc 0, garbage | rejected |
+| `auto s = a;` over `Cell[2][3]` | rc 1, "Undefined variable x" (shapeless binding) | rejected, named correctly |
+
+**Two working shapes ARE removed by this change - accepted deliberately.** The rest of the table
+is "was silently wrong -> now rejected", but two rows are not, and a reader must not scan past
+them. Measured on `5a6580c` Release:
+
+```
+int[][] v = new int[10]; v[3]=3;  ->  r=3   correct
+int f(int[][] v){ return v[1]; }  ->  r=7   correct   (called with an int[4])
+```
+
+Both now hard-error. They work only BECAUSE the extra `[]` is silently dropped - they are
+misspellings of `int[]`, and the one-character rewrite (`int[] v = new int[10];`,
+`int f(int[] v)`) gives the identical answer on both binaries, verified. Keeping them accepted
+is not a free win either: the same dropped bracket is exactly what made `int[][] v = a` over a
+2-D array flat-address, so there is no rule that accepts these two and rejects that. The
+diagnostic names the rewrite ("Write a single `T[]` for a flat view of the whole allocation"),
+which is why that clause is in the message rather than only in this record.
+
+**One remedy the diagnostic names has a known gap, filed not fixed.** "size every dimension
+(`T[N][M]`)" is sound for the TYPE - `char[2][8] b = default;` compiles and runs - but a
+multi-dimensional fixed array has no working brace initializer on EITHER binary (nested braces
+are a parse error, a flat list counts against the outer dimension only, and string-literal
+elements hit the fixed-array pointer-store reject). Pre-existing and untouched here; filed as
+[[multidim-fixed-array-has-no-brace-initializer]]. The shape that surfaced it,
+`char[][8] names = {"ab","cd","ef"};`, was rc 0 + SIGSEGV before this change (the outer
+dimension was dropped, so `sizeof` was 8) and is a genuine new catch.
+
+**Accept set, frozen BEFORE the guard was written and re-run after - byte-identical on both
+binaries.** 1-D view decl (`7`), `auto` over a 1-D fixed array (`7 5`, borrow both ways), 1-D
+view parameter (`7`), 1-D view return (`7`), view reassignment (`9`), fixed 2-D copy (`7`), row
+view read+write-through (`3 77`), struct-element view (`7`), view as a struct field (`7`), direct
+2-D subscript (`7 3`), `sizeof` of a 2-D array (`24`), `char[]` view (`h`), a row passed to a
+`T[]` parameter (`7`), a global 1-D view (`7`), a fully-sized 2-D alias copy (`7`), `Box<int[]>`
+(`7`), `(int[])p` cast (`7`), 1-D view as a method parameter (`7`), and `int[] v = <2-D array>`,
+which is a FLAT view of the whole allocation (`v[4]` is `a[1][1]`) - identical pre and post. That
+last one is why `int[][] v = a` had to go: it was producing exactly this flat addressing under a
+2-D spelling. Unchanged rejections in the same neighbourhood, also measured on both: `T*` bound to
+a `T[]`, `int*[] v = <int*[3]>`, `using V = int[];`, a tuple element initialized from a fixed
+array, and a non-constant array dimension.
+
+**Not in scope, with the reason.** A FIXED-extent parameter (`int f(int[3] r)`, `int f(char[8] b)`,
+and equally `int f(int[2][3] m)`) still false-rejects at the CALL with `[0] ptr <unnamed>` and a
+candidate mangled `(int r)` - identical on both binaries. That is a dropped SIZED extent, a
+different defect from a dropped EMPTY bracket, in a path this change does not touch; it is already
+filed as [[fixed-array-parameter-not-callable]], whose file now records the multi-dimensional
+spelling too. The parameter axis is therefore still inconsistent across the two spellings, but no
+longer between "silently wrong" and "false reject" - both are now hard errors.
+
+**Blast radius.** A 677-file `--check` differential over every `.cb` in the tree (both binaries,
+each with a freshly rebuilt local cache) found 3 differences: the new errors file, and the two
+tuple diagnostics whose wording gained "an unsized multi-dimensional 'T[][]'" (same exit code,
+still PASS). No `.cb` anywhere in the repo - `Test/`, `example/`, `core/` - contains a `[][]`,
+`[][N]` or `[N][]` spelling, so no file in the repo changed behaviour. That is NOT the same as
+"nothing that worked before stopped working" - see the section directly below. Caveat on that
+number: a first sweep reported 14 extra "regressions" in `core/*.cb` ("redeclaration of global");
+they were an artifact of one side having a STALE local cache, and vanish when both sides are
+re-`--init-local`ed - the pre binary reproduces them exactly with a fresh cache.
+
+**Coverage.** `Test/errors/err_multidim_array_view.cb` carries 15 scoped-block legs, one per
+rejecting site/axis; each was extracted into a single-leg file and run against BOTH binaries -
+all 15 fail on `5a6580c` and pass here, so none is vacuous and none is riding a pre-existing
+guard. `Test/test_basic.cb` gains three VALUE legs next to `fixed_copy_multidim`: a fully-sized
+2-D declaration, the flat whole-array view, and the row view's write-through. To be precise
+about what protects the guard's polarity: the tripwire is the `int[2][3]` DECLARATIONS that
+`fixed_copy_multidim` already had - a bracket-count-only rule would hard-error on those, and
+they predate this commit. The added `fixed_multidim_sized_decl` line is a value assertion over
+them, not the tripwire itself.
+
+No new `TypeAndValue` / `StructData` / `AnnotationValue` field, so no `--init` round-trip work:
+`ConstInnerDimensions` already serializes in BOTH systems (`internal/simd-type.md` documents the
+pair) - llvm::json in `LLVMBackend.cpp` under key `"aid"` (write `:4221`, read `:4275`, nested
+inside the `ConstArraySize > 0` guard) and nlohmann in `LLVMBackend.h` under key `"idims"`
+(`:20666` / `:20696`). This change only READS the field, in one new place.
+
+Bar: `./test.sh Release` **576 passed / 0 failed / 8 skipped** against master's 574/0/8 - +2 for
+the one new errors file, which the suite runs cold and warm. `bash example_mac.sh Release`
+**35 passed / 0 failed**, same as master.

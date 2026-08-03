@@ -38,6 +38,13 @@ The generic spelling fails the same way: `T firstOf<T>(T[4] a)` mangles to
 The array-VIEW spelling is the working alternative: `int sum(int[] v, int n)` and
 `T firstOf<T>(T[] a)` both declare, resolve and run correctly.
 
+Re-measured 2026-08-02 on the `fix/mdview` branch and its parent `5a6580c`, identical on both:
+the MULTI-DIMENSIONAL fixed-extent parameter fails the same way (`int f(int[2][3] m)` called
+with an `int[2][3]` mangles to `_f_int_int_(int m)` and gives the same `[0] ptr <unnamed>` /
+`arg=ptr param=int` message). Left out of `fix/mdview` deliberately: that fix rejects an EMPTY
+`[]` among several dimensions, which is a different defect from dropping SIZED extents, and it
+did not touch this path.
+
 ## Root cause
 
 Not diagnosed, but the mangled candidate name is the evidence: `_sumFixed_int_int_(int a)`

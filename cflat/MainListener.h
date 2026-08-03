@@ -78,21 +78,46 @@ static const char* LongSpellingTypeName(int longSpecifierCount)
 {
     return longSpecifierCount >= 2 ? "i64" : "long";
 }
+// An empty `[]` is representable ONLY as the sole dimension: the `T[]` array-view is a thin
+// `ptr` and carries no row stride, so `T[][]`, `T[][M]` and `T[N][]` have no lowering. The
+// grammar folds every bracket pair into one arrayDimSpec and drops the empty ones from
+// assignmentExpression(), so an unsized dimension is visible only as a bracket-count mismatch.
+static bool DimSpecIsUnsizedMultiDim(CFlatParser::ArrayDimSpecContext* dims)
+{
+    return dims != nullptr && dims->LeftBracket().size() > 1
+        && dims->assignmentExpression().size() < dims->LeftBracket().size();
+}
+template <class Ctx>
+static bool HasUnsizedMultiDim(Ctx* c)
+{
+    return DimSpecIsUnsizedMultiDim(ArrayDimsOf(c));
+}
+// One wording for every site that rejects an unsized multi-dimensional bracket form.
+static std::string UnsizedMultiDimMessage(const std::string& typeName)
+{
+    return std::format("'{0}' with an empty '[]' among several dimensions ('{0}[][]', '{0}[][M]', "
+        "'{0}[N][]') is not a valid type - a '{0}[]' array view is a thin pointer and carries no "
+        "row stride. Write a single '{0}[]' for a flat view of the whole allocation, or size "
+        "every dimension ('{0}[N][M]'); a row of a sized 2-D array binds to a '{0}[]' one at a "
+        "time.", typeName);
+}
 // A type-argument position (tuple element, generic type arg) admits exactly the bare `T[]`
-// array-view among the bracket forms. Returns true for `T[]` (empty dims, no trailing '*').
+// array-view among the bracket forms. Returns true for `T[]` (one empty pair, no trailing '*').
 template <class Ctx>
 static bool IsArrayViewArg(Ctx* c)
 {
     auto* dims = ArrayDimsOf(c);
-    return dims != nullptr && dims->assignmentExpression().empty() && ArrayPtrOf(c) == nullptr;
+    return dims != nullptr && dims->assignmentExpression().empty() && ArrayPtrOf(c) == nullptr
+        && dims->LeftBracket().size() == 1;
 }
-// The bracket forms that are NOT valid in a type-argument position: a sized `T[N]` or a
-// pointer-to-array `T[]*` / `T[N]*`. Returns true so the caller can emit one diagnostic.
+// The bracket forms that are NOT valid in a type-argument position: a sized `T[N]`, an unsized
+// multi-dim `T[][]`, or a pointer-to-array `T[]*` / `T[N]*`. One diagnostic covers them.
 template <class Ctx>
 static bool IsBadArrayArg(Ctx* c)
 {
     if (ArrayPtrOf(c) != nullptr) return true;
     auto* dims = ArrayDimsOf(c);
+    if (DimSpecIsUnsizedMultiDim(dims)) return true;
     return dims != nullptr && !dims->assignmentExpression().empty();
 }
 // Type-arg string for one tuple element: the bare type plus its reference-kind suffix
@@ -1195,6 +1220,12 @@ private:
         }
         auto* compiler = Compiler(declSpecs);
         LLVMBackend::DeclTypeAndValue declType;
+        // Reject `T[][]` / `T[][M]` / `T[N][]` before any branch consumes the brackets - every
+        // branch below drops the empty pairs and would silently parse a narrower type.
+        for (auto declSpec : declSpecs->declarationSpecifier())
+            if (HasUnsizedMultiDim(declSpec))
+                compiler->LogError(UnsizedMultiDimMessage(
+                    declSpec->typeSpecifier() != nullptr ? declSpec->typeSpecifier()->getText() : "T"));
         // `long long` arrives as two `long` typeSpecifiers; count them before the loop breaks
         // out on the first one, so the pair can canonicalize to i64.
         int longSpecCount = 0;
@@ -3410,7 +3441,8 @@ private:
         bool hasArrayView = IsArrayViewArg(entry);
         if (IsBadArrayArg(entry))
             LogErrorContext(entry, "'T[]' is the only bracketed form valid as a generic or tuple "
-                "type argument; a sized 'T[N]' and a pointer-to-array 'T[]*' are not");
+                "type argument; a sized 'T[N]', an unsized multi-dimensional 'T[][]' and a "
+                "pointer-to-array 'T[]*' are not");
         std::string resolved;
 
         std::string innerBase;
@@ -3629,6 +3661,12 @@ private:
         LLVMBackend::DeclTypeAndValue declType;
         std::string typeName;
         auto declSpecList = declSpecs->declarationSpecifier();
+        // Reject `T[][]` / `T[][M]` / `T[N][]` before any branch consumes the brackets - every
+        // branch below drops the empty pairs and would silently parse a narrower type.
+        for (auto declSpec : declSpecList)
+            if (HasUnsizedMultiDim(declSpec))
+                LogErrorContext(declSpec, UnsizedMultiDimMessage(
+                    declSpec->typeSpecifier() != nullptr ? declSpec->typeSpecifier()->getText() : "T"));
         // `long long` arrives as two `long` typeSpecifiers; count them before the loop breaks
         // out on the first one, so the pair can canonicalize to i64.
         int longSpecCount = 0;
@@ -3695,7 +3733,8 @@ private:
                             // `(T[], ...)` element is a noalias array-view member; `[N]`/`[]*` are not.
                             if (IsBadArrayArg(entry))
                                 LogErrorContext(entry, "'T[]' is the only bracketed form valid as a "
-                                    "tuple element; a sized 'T[N]' and a pointer-to-array 'T[]*' are not");
+                                    "tuple element; a sized 'T[N]', an unsized multi-dimensional "
+                                    "'T[][]' and a pointer-to-array 'T[]*' are not");
                             std::string argName = entry->typeSpecifier()->getText();
                             bool argPtr = entry->pointer() != nullptr;
                             bool argView = IsArrayViewArg(entry);
@@ -4754,6 +4793,10 @@ public:
             if (ArrayPtrOf(ctx) != nullptr)
                 compiler->LogError(std::format(
                     "using alias '{}': pointer to fixed array 'T[N]*' is not a valid type", alias));
+            // `using M = int[][3];` would otherwise fold to "int[3]" - the empty pair is dropped.
+            if (DimSpecIsUnsizedMultiDim(dimSpec))
+                compiler->LogError(std::format("using alias '{}': {}", alias,
+                    UnsizedMultiDimMessage(target)));
             auto dims = dimSpec->assignmentExpression();
             if (dims.empty())
                 compiler->LogError(std::format(
@@ -9600,6 +9643,36 @@ public:
                         srcInferredTypeName, srcConstArraySize, srcInferredTypeName,
                         srcInferredTypeName, DescribeInitializerPath(srcCallerName,
                                                                      srcBorrowedField)));
+                }
+
+                /*
+                 * A MULTI-DIMENSIONAL fixed array (`T[N][M]`) has no view to deduce to either:
+                 * its decayed element is a ROW, so `T[]` is the wrong deduction, and the `T[][]`
+                 * spelling is rejected outright (a thin view carries no row stride). Reject
+                 * rather than leave the shapeless binding that indexed nothing and read garbage.
+                 */
+                if (typeAndValue.TypeName == "auto" && right != nullptr && !global_scope
+                    && !typeAndValue.Pointer && !typeAndValue.IsSimd
+                    && typeAndValue.ConstArraySize == 0
+                    && srcConstArraySize > 0 && !srcConstInnerDimensions.empty()
+                    && !srcInferredPointer && !srcIsArrayView && !srcIsSimd
+                    && !srcInferredTypeName.empty() && srcInferredTypeName != "auto"
+                    && right->getType()->isPointerTy())
+                {
+                    std::string srcDims = std::format("[{}]", srcConstArraySize);
+                    for (uint64_t d : srcConstInnerDimensions) srcDims += std::format("[{}]", d);
+                    std::string srcPath = DescribeInitializerPath(srcCallerName, srcBorrowedField);
+                    // The row-bind remedy only reaches a `T[]` when the source is exactly 2-D;
+                    // a row of a 3-D array is itself multi-dimensional and has no view either.
+                    std::string rowRemedy = srcConstInnerDimensions.size() == 1
+                        ? std::format("bind one row ('{}[] row = {}[i];'), or ",
+                                      srcInferredTypeName, srcPath)
+                        : "or ";
+                    LogErrorContext(direct, std::format(
+                        "cannot deduce 'auto' from multi-dimensional fixed array '{0}{1}' - a "
+                        "multi-dimensional array has no array-view type (a thin view carries no "
+                        "row stride). Copy it ('{0}{1} b = {2};'), {3}index the array directly.",
+                        srcInferredTypeName, srcDims, srcPath, rowRemedy));
                 }
 
                 if (typeAndValue.TypeName == "auto" && right != nullptr && !global_scope
@@ -16107,6 +16180,8 @@ public:
             }
             if (auto* dimSpec = ArrayDimsOf(abstractDecl))
             {
+                if (DimSpecIsUnsizedMultiDim(dimSpec))
+                    LogErrorContext(ctx, UnsizedMultiDimMessage(typeValue.TypeName));
                 if (!dimSpec->assignmentExpression().empty())
                     LogErrorContext(ctx, "a sized array '(T[N])' is not a valid cast target; "
                         "use '(T[])' for the noalias array-view");
