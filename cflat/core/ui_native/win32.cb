@@ -3092,8 +3092,10 @@ bool _setCurFromFrame(void* hwnd)
 stdcall i64 ContainerCtlProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
 {
     // The stock proc this subclass displaced; parked per-window, so BUTTON and STATIC containers
-    // share one subclass without a class-name test on every message.
-    void* orig = (void*)GetWindowLongPtrA(hwnd, (int)GWLP_USERDATA);
+    // share one subclass without a class-name test on every message. Typed as a `function<>`, not
+    // a `void*` - only a function value converts to CallWindowProcA's WNDPROC parameter.
+    function<i64(void*, u32, u64, i64)> orig =
+        (function<i64(void*, u32, u64, i64)>)GetWindowLongPtrA(hwnd, (int)GWLP_USERDATA);
     if (msg == WM_ERASEBKGND)
     {
         void* brush = nullptr;
@@ -3131,7 +3133,8 @@ void _subclassContainerCtl(void* h) { _subclassCtl(h, (void*)ContainerCtlProc); 
 // system colors) notifies the ListView, not us. Everything else falls through to the stock proc.
 stdcall i64 ListCtlProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
 {
-    void* orig = (void*)GetWindowLongPtrA(hwnd, (int)GWLP_USERDATA);
+    function<i64(void*, u32, u64, i64)> orig =
+        (function<i64(void*, u32, u64, i64)>)GetWindowLongPtrA(hwnd, (int)GWLP_USERDATA);
     if (msg == WM_NOTIFY)
     {
         NMHDR* nh = (NMHDR*)u2h((u64)lParam);

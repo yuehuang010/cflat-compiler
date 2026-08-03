@@ -3812,14 +3812,12 @@ bool testGiCoreInterfaceNameCollision()
 // --- Leg 21: a DEAD 'if const' generic STRUCT must not veto the LIVE generic INTERFACE of the
 // same name in a sibling branch. (The mirror negative leg - an interface declared ONLY in a
 // dead branch - is a rejection and lives in Test/errors/err_generic_interface_dead_ifconst_branch.cb.)
-if const (__WINDOWS__) {
+// The branches are keyed on constants, NOT on platform macros: keying the struct on one platform
+// makes it the LIVE declaration on that host, which inverts the leg.
+if const (0) {
     struct GiMirror<T> { T v = default; };
 }
-if const (__MACOS__) {
-    interface GiMirror<T> { T Get(); };
-    class GiMirrorBox<T> : GiMirror<T> { T d = default; T Get() { return d; } };
-}
-if const (__LINUX__) {
+if const (1) {
     interface GiMirror<T> { T Get(); };
     class GiMirrorBox<T> : GiMirror<T> { T d = default; T Get() { return d; } };
 }

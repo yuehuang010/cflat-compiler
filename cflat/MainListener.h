@@ -2274,9 +2274,9 @@ public:
                 else if (op == ">=") out = (l >= r) ? 1 : 0;
                 else if (op == "<<") { if (r < 0 || r > 31) return std::nullopt; out = l << r; }
                 else if (op == ">>") { if (r < 0 || r > 31) return std::nullopt; out = l >> r; }
-                else if (op == "+")  { if (__builtin_add_overflow(l, r, &out)) return std::nullopt; }
-                else if (op == "-")  { if (__builtin_sub_overflow(l, r, &out)) return std::nullopt; }
-                else if (op == "*")  { if (__builtin_mul_overflow(l, r, &out)) return std::nullopt; }
+                else if (op == "+")  { if (ScannerAddOverflow(l, r, &out)) return std::nullopt; }
+                else if (op == "-")  { if (ScannerSubOverflow(l, r, &out)) return std::nullopt; }
+                else if (op == "*")  { if (ScannerMulOverflow(l, r, &out)) return std::nullopt; }
                 else if (op == "/")  { if (r == 0) return std::nullopt; out = l / r; }
                 else if (op == "%")  { if (r == 0) return std::nullopt; out = l % r; }
                 else return std::nullopt;
@@ -2349,7 +2349,7 @@ public:
                 if (op == "!") return (*v == 0) ? (int64_t)1 : (int64_t)0;
                 if (op == "+") return *v;
                 int64_t out = 0;
-                if (op == "-")      { if (__builtin_sub_overflow((int64_t)0, *v, &out)) return std::nullopt; }
+                if (op == "-")      { if (ScannerSubOverflow((int64_t)0, *v, &out)) return std::nullopt; }
                 else if (op == "~") out = ~*v;
                 else return std::nullopt;  // '&' / '*' are not integer constants
                 return InScannerInt32Range(out) ? std::optional<int64_t>(out) : std::nullopt;
@@ -2393,6 +2393,28 @@ public:
     static bool InScannerInt32Range(int64_t v)
     {
         return v >= (int64_t)INT32_MIN && v <= (int64_t)INT32_MAX;
+    }
+
+    // Portable stand-ins for __builtin_*_overflow, which MSVC does not provide. Each computes in
+    // unsigned (well-defined wraparound) and reports whether the signed result overflowed.
+    static bool ScannerAddOverflow(int64_t a, int64_t b, int64_t* out)
+    {
+        *out = (int64_t)((uint64_t)a + (uint64_t)b);
+        return ((a ^ *out) & (b ^ *out)) < 0;
+    }
+
+    static bool ScannerSubOverflow(int64_t a, int64_t b, int64_t* out)
+    {
+        *out = (int64_t)((uint64_t)a - (uint64_t)b);
+        return ((a ^ b) & (a ^ *out)) < 0;
+    }
+
+    static bool ScannerMulOverflow(int64_t a, int64_t b, int64_t* out)
+    {
+        *out = (int64_t)((uint64_t)a * (uint64_t)b);
+        if (a == 0) return false;
+        if (a == -1 && b == INT64_MIN) return true;
+        return *out / a != b;
     }
 
     // An integer literal this pass can type EXACTLY the way codegen does, else nullopt. Deliberately
