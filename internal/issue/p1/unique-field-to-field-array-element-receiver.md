@@ -148,7 +148,12 @@ enforced first; that is a language change, not a widening of this guard.
   undiagnosed on both binaries. Same mechanism as here - a global-struct field read carries an
   EMPTY `CallerName`, so `selfFieldAssign` reads two globals as one slot - but the addresses have
   two DISTINCT roots, which this fix's proof deliberately does not treat as different. Filed
-  separately as [[unique-field-global-struct-self-assign-false-positive]].
+  separately as [[unique-field-global-struct-self-assign-false-positive]]. That file now records
+  WHY the name is empty: globals resolve through `globalNamedVariable` (name -> `GlobalVariable*`)
+  rather than through the scope stack (name -> `NamedVariable`, which carries `Storage`), so the
+  receiver kind has no `NamedVariable` representation to hold an identity. Its preferred fix is
+  to give globals that representation - additive, and it makes the address proof built here cover
+  the global case with no change to the predicate.
 - The INTERFACE receiver of the same mechanism is its own open file
   ([[interface-field-self-assign-false-positive]]) and is unchanged in both directions: its
   repro still aborts and both of its must-keep-working witnesses still work. An interface field

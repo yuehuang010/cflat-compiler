@@ -228,6 +228,26 @@ Keep the polarity: `selfFieldAssign` treating "cannot tell" as SAME is what make
 a missing diagnostic rather than a false rejection. Any fix must PROVE difference before
 rejecting, and accept whatever it cannot prove.
 
+## Where this sits among the three receiver kinds (2026-08-02)
+
+The same empty-or-ambiguous `CallerName` root cause has now been measured in three receiver
+kinds: an ARRAY ELEMENT (`CallerName` names the container - closed for constant indices by
+`fix/uniq-array-elem`), a GLOBAL struct (`CallerName` empty - open, see
+[[unique-field-global-struct-self-assign-false-positive]]), and an interface field (this file).
+
+They share a cause and do NOT share a remedy. The other two are reachable from the scope-stack
+identity the compiler already has: `stackNamedVariable` resolves a local to a `NamedVariable`
+carrying `Storage`, and `ProvablyDifferentSlots` already proves slots apart from it. **That route
+is ruled out HERE by measurement, not by argument** - the "What will NOT work" list above records
+that comparing the interface locals' `Storage` false-rejects witness 2 (`ISlot ia = a;
+ISlot ib = a;` - one object, two boxes, two distinct allocas), and that a bare `Value` comparison
+of the field address false-rejects even the true self-assign, since each access re-loads the fat
+pointer.
+
+So do not import a fix from the global or array-element work on the assumption that one
+mechanism covers all three. This face still needs the boxed DATA pointer resolved back to its
+root store, and it must answer "same" for two distinct boxes of one object.
+
 ## Test coverage
 
 None, and none can be added while it reproduces. `Test/errors/err_unique_borrow_into_field.cb`

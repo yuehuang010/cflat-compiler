@@ -141,6 +141,20 @@ The recurring failure mode of this whole family, stated once:
   The check had to move INTO the per-arm walk, with the opposite polarity from the outer one.
 - **A guard placed after an implements check has more copies of that early-out.** Go find them:
   the fourth boxing site was missed on the first pass for exactly this reason.
+- **Build the accept-set BEFORE the guard, not after.** Enumerate and freeze as value legs the
+  programs in the same neighbourhood that master compiles and runs correctly, then write the
+  rejection. Reviewed on 2026-08-02 across five issues: false rejections are the single largest
+  consumer of rounds in this repo. Two issues were parked having landed nothing after three rounds
+  each (`fix/funcptr-sig`, four false rejections; `fix/delete-borrowed-box`, five), and a third
+  spent a full fix+review round adding a rejection site and taking it back out. The accept-set gets
+  built either way - the reviewer cannot judge a guard without it. Building it first costs a
+  fraction of building it as review findings.
+- **Do not add a site to a rejection because a probe printed a strange number.** Establish that the
+  site is broken from the `--no-opt` IR. On 2026-08-02 a named-argument site was rejected on a probe
+  reading `(int)(i64)p`; the number was a truncated stack address of a correctly materialized temp,
+  and that site had never had the bug. Its three genuinely-broken siblings returned the packed field
+  bytes (`0x1`, `0x200000001`) - an address versus field bytes is the whole distinction, and it is
+  invisible in the decimal value. The rejection's own message was false at that site.
 
 ## On the code
 
@@ -318,6 +332,12 @@ The recurring failure mode of this whole family, stated once:
   prove the shapes you thought of, and the dangerous shapes are the ones you did not.
 - Tell the reviewer to report the scratch worktree path so it can be removed afterward; a
   forgotten one shows up in `git worktree list` later and reads like an abandoned fix branch.
+- **Hand the corpus over; do not build it twice.** The fix agent's probe corpus stays in `scratch/`
+  until the merge, and the reviewer spot-checks it rather than reconstructing one. Measured over
+  2026-08-02's rounds, fix agent and reviewer each spent roughly 130k tokens on probes, and the
+  duplicated half never found anything: every real defect came from attacking an axis the fix
+  agent's corpus did not cover. Re-measure a sample to confirm the report's pre/post pairs are
+  real - that is cheap - and spend the rest of the budget on the gaps.
 - **A zero-difference sweep rules out NOTHING when the corpus performs no crossing.** The sweep
   answers "did any file I already have change behaviour", never "is the new rule correct". On
   2026-08-02 a funcptr comparator swept 424 files with zero differences and was then shown to

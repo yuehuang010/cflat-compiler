@@ -73,12 +73,13 @@ compiler):**
   - **Syntax axis**: every way the SAME construct can be written, which is a
     different question from what type it is written on. `T x = {...}` vs
     `T x {...}`; prefix vs postfix; parenthesized vs bare receiver; the
-    statement form vs the declaration form. On 2026-08-02 an enumeration
-    covered struct/union/class, global/local, namespaced, `static`, `const`,
-    containers, arrays and nesting - every axis about TYPES and SCOPES - and
-    missed that the grammar carries a second brace spelling on `initDecl`.
-    The filed bug survived the fix untouched under a one-character-different
-    spelling, and it cost the most expensive round of that issue.
+    statement form vs the declaration form. An enumeration that covers only
+    TYPES and SCOPES - struct/union/class, global/local, namespaced, `static`,
+    `const`, containers, arrays, nesting - looks exhaustive and still misses a
+    second grammar spelling of the same construct. Check the grammar for
+    alternate spellings rather than inferring them from the source you have
+    read; a filed bug has survived a fix untouched under a
+    one-character-different spelling.
   - **Collision axis**: the same name declared in two scopes, plus its
     unique-name twin (the twin proves the bare spelling reaches its own key).
   - **Neighbour axis**: adjacent construct kinds that flow through the same
@@ -94,6 +95,24 @@ compiler):**
 - Report the matrix: each cell's shape, its pre-fix behaviour, and whether the
   fix will change it. Cells deliberately left out of scope must be listed with
   a reason each, not silently dropped.
+- **If the fix will REJECT anything, the ACCEPT-SET is a Phase A deliverable -
+  produced and frozen as value legs BEFORE any guard is written.** Enumerate the
+  programs in the same syntactic neighbourhood that master compiles and runs
+  CORRECTLY, measure each one's value on the current binary, and commit them as
+  must-still-work legs. Only then write the guard, and re-run that set after.
+  False rejections are the single highest-cost failure mode in this workflow -
+  they have consumed whole 3-round budgets and landed nothing more than once.
+  The ordering is the point. Writing the guard first and letting the review hunt
+  for what it broke puts discovery in the most expensive place, and the reviewer
+  has to reconstruct the accept-set anyway - so it gets built either way, just
+  later and by the wrong party. A guard whose accept-set was never enumerated is
+  not ready to review. See "On guard polarity" in
+  `internal/fix-issue-lessons.md` for the case history.
+  Corollary: a rejection's DIAGNOSTIC must be true of the site it fires at, and
+  every site added to a reject must be shown broken from the `--no-opt` IR -
+  never from a probe value alone. A decimal probe cannot distinguish corrupted
+  field bytes from a valid address, and a site has been added to a reject, with
+  a message that was false there, on exactly that confusion.
 
 **Phase B - Fix and test to the matrix:**
 
@@ -105,13 +124,12 @@ compiler):**
   predicate asks - the same field comparison, the same flag test, the same
   early-out - and state for each whether it has the same defect and why it does
   or does not need the same treatment. A site left out of the report is a site
-  nobody checked. On 2026-08-02 this cost two separate defects in one day: a
-  gating condition existed in both the global and the local declarator path and
-  only one was fixed, and `CallerName ==` existed at two sites where fixing one
-  turned an abort into a silent 16-byte leak. When the same instruction was
-  finally given up front, the agent produced a clean three-site audit
-  immediately. This is the third recorded instance of "go find the other
-  copies"; it is now a required deliverable, not a review finding.
+  nobody checked. This has repeatedly cost real defects - a gating condition
+  fixed in one declarator path and not its twin, and a receiver-identity
+  comparison fixed at one of two sites where the unfixed one turned an abort
+  into a silent leak. Given as an instruction up front, agents produce a clean
+  per-site audit immediately, so it is a required deliverable, not a review
+  finding.
 - Regression tests must cover every in-scope cell of the matrix, assert VALUES
   (never "it compiled"), and each leg must fail on the pre-fix binary for the
   reason its comment states - state the discriminator that proves the leg
@@ -119,14 +137,12 @@ compiler):**
 - **Assert the RESOURCE, not only the value, wherever the change touches
   ownership, lifetime, or destruction** - free counts, null-after-move, and an
   actual leak measurement (`leaks --atExit` on macOS). A value can be right
-  while the resource is wrong. On 2026-08-02 a fix's own new leg asserted string
-  values only; the values were correct because the leaked buffer was the OLD
-  destination, so the leg passed while the commit leaked 16 bytes. The suite
-  caught it only because `Test/test_move.cb` itself moved from 13 allocations /
-  256 bytes to 14 / 272. Apply this to EVERY owning type the change can reach,
-  not just the one being reasoned about - that fix counted destructors
-  rigorously for `Node*` and not at all for `string`, and the defect landed in
-  the gap.
+  while the resource is wrong: a leg asserting only values passes when the
+  leaked buffer is the OLD destination, since the new value is correct either
+  way. Record the leak baseline before and after and compare the numbers. Apply
+  this to EVERY owning type the change can reach, not just the one being
+  reasoned about - a fix that counted destructors rigorously for a pointer type
+  and not at all for `string` shipped its defect in exactly that gap.
 - **Sweep your own new legs for ones that cannot fail** before reporting. A leg
   like `Test("x_survived_teardown", 1, 1)` asserts `1 == 1` and can never go
   red; it reads as coverage and is worse than no leg. Any leg that would still
@@ -137,19 +153,18 @@ The prompt must also contain:
 - **Claims discipline.** Every "pre-existing" / "unchanged" / "not a regression"
   / "identical on both binaries" claim must ship with a MEASURED pre/post pair,
   in the exact spelling the claim is about. Asserting equivalence by inference
-  from a sibling spelling is banned: on 2026-08-02 two such claims were wrong in
-  one issue - `S* p = {a=1}` really was identical on both binaries while
-  `S* p {a=1}` went from `undef` to `0x1`, and a string cell reported as "now
-  deep-copies exactly like the named-local" in fact leaked 16 bytes. Each cost a
-  full round-trip to correct after the fact.
+  from a sibling spelling is banned - two spellings of one construct have
+  diverged (one genuinely unchanged, its twin going from `undef` to a corrupt
+  value), and a cell reported as "now behaves exactly like its named-local
+  equivalent" was leaking. Each such claim costs a full round-trip to correct
+  after the fact.
 - **The oracle caution.** If the fix is specified as "make X agree with Y" - a
   scope matching another scope, a new path matching an existing one - Y must be
-  verified INDEPENDENTLY before it is used as the reference. On 2026-08-02 the
-  local declarator was the oracle for the global one, the agent copied its
-  gating condition, and that condition carried the identical hole. Every check
-  the agent could run said the two scopes now matched, and they did, including
-  in the hole. Agreement with a broken reference is invisible to a strategy
-  built on agreement.
+  verified INDEPENDENTLY before it is used as the reference. When one declarator
+  path was used as the oracle for another, the copied gating condition carried
+  the identical hole: every check the agent could run said the two now matched,
+  and they did, including in the hole. Agreement with a broken reference is
+  invisible to a strategy built on agreement.
 - The absolute worktree path, and an instruction to do ALL work there.
 - The full issue text (summary, repro, root cause, fix direction) pasted inline.
 - The relevant sections of `internal/fix-issue-lessons.md` (at minimum "On
@@ -191,12 +206,11 @@ before review, not into review.
 **Do that verification as ONE pass, and send ONE message.** Read the whole diff,
 every new or changed issue file and test comment, and run your probe matrix -
 then write a single consolidated message. Do NOT stream findings as you notice
-them. On 2026-08-02 one issue took nine agent invocations and about 63 minutes
-of agent wall-clock for an 88-line guard; four of the nine were maintainer
-findings and the last two were a comment naming a case the code never reaches
-and a false measurement in an issue file - each of which cost a full invocation
-plus a mandatory bar re-run for a change that touched only prose. All of them
-were discoverable in one reading.
+them. Streaming has cost issues several extra agent invocations each, and the
+late ones are typically a comment naming a case the code never reaches or a
+false measurement in an issue file - prose defects that still force a full
+invocation plus a mandatory bar re-run, and that were all discoverable in one
+reading.
 
 **Skip the full bar for provably doc-only amendments.** Confirm with
 `git diff --stat` that no `.h`/`.cpp`/`.cb` file is touched, and say in the
@@ -226,6 +240,20 @@ agent's coverage matrix and ask it to audit the matrix, not re-derive it:
   overload resolution, mangling, type-flag semantics), require the differential
   corpus sweep: build the parent commit in a scratch worktree, run both binaries
   over every `.cb` in `Test/` and `example/`, and diff.
+- **Hand the fix agent's probe corpus to the reviewer; do NOT have it rebuild
+  one.** The fix agent leaves its corpus in `scratch/` (it is gitignored, so tell
+  it not to delete it until the merge). The reviewer's job on that corpus is to
+  SPOT-CHECK it - re-measure a sample, and confirm the pre/post pairs say what
+  the report claims - and then spend its budget on the axes the corpus does NOT
+  cover. Both parties independently building a full probe corpus is the largest
+  avoidable duplication in this workflow, and the duplicated half is the half
+  that finds nothing: real defects come from attacking an unprobed axis, never
+  from re-running a cell the fix agent already ran.
+  Weight the evidence accordingly. The whole-corpus differential sweep is the
+  WEAK half for any change that adds a rejection - it structurally cannot see a
+  crossing no corpus file performs, and it has certified changes that targeted
+  probes then broke. Targeted crossings are the strong half. A clean sweep is
+  necessary, never sufficient.
 
 Tell it to use a unique `scratch/` file prefix (e.g. `rev_`) so it cannot
 collide with the fix agent's files, to report findings as a ranked list with

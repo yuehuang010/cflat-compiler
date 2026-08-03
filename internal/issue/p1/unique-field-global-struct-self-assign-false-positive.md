@@ -64,6 +64,30 @@ Neither half is individually blind; only the pair is. The decisive control is re
 fields apart - `struct HolderAB { unique Node* a; unique Node* b; }` with `gA.a = gB.b` - which
 **rejects on both binaries**. Equal field name plus two empty caller names is the whole of it.
 
+## Why the `CallerName` is empty - a lookup asymmetry, not an oversight at one site
+
+Established 2026-08-02 by reading the declarations. Locals and globals resolve through two
+different structures with different richness:
+
+```
+stackNamedVariable  : std::vector<StackState>                                (LLVMBackend.h:1526)
+                      StackState::namedVariable / functionArgument
+                          : name -> NamedVariable                            (LLVMBackend.h:988)
+globalNamedVariable : std::unordered_map<std::string, llvm::GlobalVariable*> (LLVMBackend.h:1537)
+```
+
+A local resolves to a full `NamedVariable`, which carries `Storage` ("the container holding the
+value, used to load or store", `LLVMBackend.h:806`), `CallerName` (`:861`) and `FieldName`
+(`:863`). A global resolves to a bare `llvm::GlobalVariable*` - there is no `NamedVariable` in
+that map at all, so there is no `CallerName` to carry. The empty string is not a missed
+assignment at one materialization site; it is what a receiver kind with no `NamedVariable`
+representation necessarily produces.
+
+That reframes the fix. The scope stack already IS the identity mechanism this guard wants -
+`Storage` is the slot, and `ProvablyDifferentSlots` (added by `fix/uniq-array-elem`) already
+consumes `rightNV.Storage`. The name comparison is a legacy proxy layered on top of a primitive
+that already exists for locals and is simply absent for globals.
+
 ## Fix direction - not attempted here, and why
 
 `fix/uniq-array-elem` added exactly the kind of discriminator this needs,
@@ -81,6 +105,34 @@ own change, with the sweep.
 
 The proof must stay keyed on the ROOT KIND, not on inequality of two `Value*`s: two `LoadInst`s
 can name one object, which is exactly why `SameLoadedPointer` exists beside it.
+
+**The preferred order, given the asymmetry above.** Two steps, and the first one alone may be
+enough:
+
+1. **Give a global receiver the same `NamedVariable` representation a local already has**, so
+   every receiver kind carries a real `Storage` and a non-empty identity. This is ADDITIVE: a
+   receiver that today has no identity gaining a correct one cannot false-reject any program
+   that works now, which is the opposite risk profile from widening the name predicate (that
+   widening was attempted on a sibling issue and false-rejected working programs - see
+   [[interface-field-self-assign-false-positive]]). Once globals carry `Storage`, the existing
+   root-kind proof covers this repro with no change to the predicate at all.
+2. Only if step 1 leaves gaps, extend the root-kind proof to distinct `GlobalVariable` /
+   `AllocaInst` roots as described above - with the differential sweep and the
+   distinct-root must-still-work corpus.
+
+Unverified and worth checking first, since it sets the size of step 1: whether any path already
+wraps a global into a `NamedVariable` (which would make this mostly plumbing), and whether
+`Storage` is populated consistently for every receiver kind the field-store guards see - an
+array element behind a pointer, an array view, and a temp spill each reach `Storage`
+differently, and `fix/uniq-array-elem` needed `SameLoadedPointer` to treat two loads of one
+address as one root.
+
+**This route does NOT close the interface face**, and that is recorded rather than assumed:
+[[interface-field-self-assign-false-positive]] measured that comparing the interface locals'
+`Storage` false-rejects `ISlot ia = a; ISlot ib = a;` (two boxes of ONE object, two distinct
+allocas). That face needs the boxed DATA pointer resolved to its root store, which is a related
+but separate proof. Three receiver kinds share the empty/ambiguous-`CallerName` root cause;
+they do not share one remedy.
 
 Wants an `expect_error` leg once fixed, plus a must-keep-working leg for `gA.slot = gA.slot`
 (a genuine self-assign on one global - compiles, prints `freed=0`, rc 0 on both binaries today).
