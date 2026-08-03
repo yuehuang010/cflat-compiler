@@ -19,9 +19,23 @@ import "array.cb";
 import "dictionary.cb";
 import "test_helper.cb";
 
-// Seed struct for the pointer-array empty-brace leg below. Its leading field defaults to a
-// NON-ZERO value on purpose: that is the discriminator.
+// Seed struct for the empty-brace legs below. Its fields default to NON-ZERO values on purpose:
+// that is what distinguishes a real default-construction from a zero-fill or an undef read.
 struct PtrSeed { int a = 7; int b = 9; };
+
+// Empty '{}' as a PARAMETER DEFAULT. These are the deterministic half of the '= {}' seeding
+// coverage: pre-fix BOTH were a hard compile error ("cannot build the default value for
+// parameter ... this default initializer form is not supported"), because '{}' yields a null
+// initializerList() and the wrapper's arms all missed. The struct one returns 79 (7*10+9), a
+// value only real default-construction can produce - it cannot pass by zero-fill or by luck.
+int ebParamInt(int x = {}) { return x; }
+int ebParamStruct(PtrSeed s = {}) { return s.a * 10 + s.b; }
+
+// '= default' is the remedy the empty-brace-on-a-pointer diagnostic names FIRST, and it is the
+// only one valid at every instantiation of a generic body: 'T x = {}' rejects when T substitutes
+// to a pointer (Test/errors/err_ptr_brace_init.cb pins that), so the guidance is only honest if
+// the same body compiles at BOTH a pointer and a non-pointer T. Both are instantiated below.
+struct EbHold<T> { T v = default; void seed() { T x = default; v = x; } };
 
 // Brace-init bound to a POINTER PARAMETER at a call. This site is CORRECT and must stay working:
 // it builds its own struct temp and passes THAT address, never a pointer variable's own 8 bytes.
@@ -167,15 +181,46 @@ extern int main()
     list<string> afterArr = {"x", "y", "z"};   // alloc after array<string> destruct
     total++; passed += Test("post array<string> alloc ok", afterArr.count(), 3);
 
-    // ===== `T*[N] = {}` zero-init (regression: seed memcpy through POINTER slots) =====
-    // Empty braces on a fixed array of POINTERS took the struct seed path: one
-    // default-constructed PtrSeed was built and its first 8 bytes memcpy'd over every
-    // 8-byte pointer slot, so each element became an address made of the pointee's field
-    // defaults. Discriminator: PtrSeed.a defaults to 7, so pre-fix pa[0] was (PtrSeed*)0x7
-    // and only the zero-init path can make it null.
-    PtrSeed*[2] pa = {};
-    total++; passed += Test("ptr array empty brace elem0", (i64)pa[0], (i64)0);
-    total++; passed += Test("ptr array empty brace elem1", (i64)pa[1], (i64)0);
+    // ===== empty '{}' on a NON-POINTER target seeds the default =====
+    // '{}' produces a NULL initializerList() (the list rule requires >= 1 element), so the
+    // '= {}' declarator arm - which was gated on that list - matched nothing and emitted no
+    // store at all: 'int x = {}' read undef. The arm is now gated on the brace TOKEN, exactly
+    // as the bare-brace form 'int x {}' always was. Both spellings are asserted together here
+    // because the pair disagreeing was the whole bug.
+    //
+    // '{}' on a POINTER target is REJECTED in every spelling (it is ambiguous between the null
+    // pointer and a pointer to an empty object) - see Test/errors/err_ptr_brace_init.cb. That
+    // supersedes the `PtrSeed*[2] pa = {}` zero-init legs this block replaced.
+    int ebEq = {};
+    int ebBare {};
+    total++; passed += Test("int eq-empty-brace seeds zero", ebEq, 0);
+    total++; passed += Test("int bare-empty-brace seeds zero", ebBare, 0);
+    total++; passed += Test("int eq-empty-brace agrees with bare", ebEq, ebBare);
+
+    PtrSeed ebs = {};                          // struct: real default-construction, not zero-fill
+    total++; passed += Test("struct eq-empty-brace field default a", ebs.a, 7);
+    total++; passed += Test("struct eq-empty-brace field default b", ebs.b, 9);
+
+    PtrSeed[2] ebArr = {};                      // NON-pointer array keeps seeding per element
+    total++; passed += Test("struct-array eq-empty-brace elem1 a", ebArr[1].a, 7);
+    total++; passed += Test("struct-array eq-empty-brace elem1 b", ebArr[1].b, 9);
+
+    // Parameter defaults - the deterministic legs (pre-fix: hard compile error, see above).
+    total++; passed += Test("param default int eq-empty-brace", ebParamInt(), 0);
+    total++; passed += Test("param default struct eq-empty-brace", ebParamStruct(), 79);
+
+    // 'T x = default;' at a non-pointer AND a pointer type argument - the remedy the reject
+    // suggests. Seed the non-pointer one from a non-zero value first so the leg cannot pass by
+    // reading an already-zero slot: seed() must overwrite 5 with the default 0.
+    EbHold<int> ebhi = default;
+    ebhi.v = 5;
+    ebhi.seed();
+    total++; passed += Test("generic 'T x = default' at T=int", ebhi.v, 0);
+
+    EbHold<PtrSeed*> ebhp = default;
+    ebhp.v = new PtrSeed();
+    ebhp.seed();
+    total++; passed += Test("generic 'T x = default' at T=ptr", (i64)ebhp.v, (i64)0);
 
     // ===== brace argument bound to a POINTER parameter (must NOT be rejected) =====
     // Discriminator: both field values arrive intact through a real materialized temp, so 12

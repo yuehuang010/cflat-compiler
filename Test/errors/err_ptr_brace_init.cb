@@ -30,6 +30,43 @@ expect_error("POINTER parameter default for 'p'") {
     int pbi_def(PbiS* p = {a=1}) { return (int)(i64)p; }
 }
 
+/*
+ * EMPTY '{}' on a POINTER target. Rejected for a DIFFERENT reason than the non-empty lists
+ * above: not memory-unsafe, but AMBIGUOUS - '{}' reads either as the null pointer or as a
+ * pointer to an empty object, and zero-init happens to produce null, so silently picking the
+ * first reading would look correct while teaching the second one wrong. The legs pin the word
+ * AMBIGUOUS plus the role, so they cannot be satisfied by the non-empty message above.
+ * Pre-fix these four SPELLINGS behaved three different ways: '= {}' emitted no store and read
+ * undef (measured 0x1f7808100), while the bare, global and array forms all produced null - the
+ * array form being a decision ratified in 3b331cc that this ruling deliberately supersedes.
+ */
+expect_error("AMBIGUOUS on the POINTER declaration 'gp'") {
+    PbiS* gp = {};
+}
+
+expect_error("AMBIGUOUS on the POINTER parameter default for 'p'") {
+    int pbi_edef(PbiS* p = {}) { return (int)(i64)p; }
+}
+
+// A generic body whose 'T x = {}' becomes a POINTER only for some type arguments. Intended
+// collateral of the ruling, not an oversight: 'Holder<int>' still compiles (its value leg lives in
+// Test/test_initializer_list.cb) while 'Holder<PbiS*>' rejects, so a generic body's validity can
+// depend on its type argument. This is why the message names '= default' FIRST - 'nullptr' is
+// nonsense guidance for the same body at T=int. Codegen'd where INSTANTIATED, so the use must sit
+// inside the armed block.
+struct PbiHold<T> { T v = default; void seed() { T x = {}; v = x; } };
+expect_error("AMBIGUOUS on the POINTER declaration 'x'") {
+    int pbi_hold_use() { PbiHold<PbiS*> h = default; h.seed(); return (int)(i64)h.v; }
+}
+
+// An array VIEW is Pointer-flagged and is NOT a pointer target. The declarator arm exempts it;
+// the parameter arm did not, and produced "POINTER parameter default ... write 'nullptr'" - three
+// falsehoods at once (int[] is not a pointer, nullptr is not a legal view spelling, and the type
+// printed was 'int' not 'int[]'). Both positions now give the length message.
+expect_error("cannot infer the length of 'int[]' from an empty initializer list") {
+    int pbi_view(int[] v = {}) { return v[0]; }
+}
+
 extern int main()
 {
     // Local scalar declarator, '=' spelling - the filed repro (pre-fix: p == 0x1).
@@ -67,6 +104,56 @@ extern int main()
     // so add() ran on a null receiver - pre-fix this compiled and the program SIGSEGV'd.
     expect_error("POINTER declaration 'lp'") {
         list<int>* lp = {1,2};
+    }
+
+    // EMPTY '{}' local spellings (see the file-scope block above for the reason). '= {}' read
+    // undef pre-fix; the bare form produced null. Both are ambiguous and both are rejected.
+    expect_error("AMBIGUOUS on the POINTER declaration 'ep'") {
+        PbiS* ep = {};
+    }
+    expect_error("AMBIGUOUS on the POINTER declaration 'eb'") {
+        PbiS* eb {};
+    }
+
+    // Fixed array of POINTERS. 3b331cc ratified this spelling as ZERO-INIT (elements became
+    // null); the 2026-08-02 ruling supersedes that and rejects it, so this leg is the record
+    // of a deliberately reversed decision, not of a newly-found defect.
+    expect_error("AMBIGUOUS on the POINTER array element of 'earr'") {
+        PbiS*[2] earr = {};
+    }
+
+    // Primitive pointee and 'unique'/nullable qualifiers reach the same declarator arm - the
+    // guard keys on the target being a POINTER, never on the pointee being a struct.
+    expect_error("AMBIGUOUS on the POINTER declaration 'ip'") {
+        int* ip = {};
+    }
+    expect_error("AMBIGUOUS on the POINTER declaration 'eu'") {
+        unique PbiS* eu = {};
+    }
+    expect_error("AMBIGUOUS on the POINTER declaration 'en'") {
+        PbiS? en = {};
+    }
+
+    // The remedy is built from the DECLARED type, not from the bare pointee name: there is no
+    // 'new void()', and 'new S()' is the wrong shape for an 'S**'. Both legs pin the rendered
+    // type, so a regression to TypeName-only formatting fails them.
+    expect_error("of type 'void*' - it could mean the null pointer") {
+        void* vp = {};
+    }
+    expect_error("of type 'PbiS**' - it could mean the null pointer") {
+        PbiS** pp = {};
+    }
+
+    // 'simd<T,N>' sets Pointer from its own '*' like any other type. Exempting it from this
+    // guard did not merely miss a rejection: the seeding arm then stored a VECTOR into an
+    // 8-byte pointer slot and ABORTED the compiler (rc 138, no output). Array views are the
+    // only exemption, and they never reach this arm - their branch continues above it.
+    // Pins the RENDERED type: 'simd<float,4>*', since TypeName alone is just 'float'.
+    // Mutating this leg to '= nullptr' or '= default' does NOT prove it - both abort the
+    // compiler pre-existing (internal/issue/p1/simd-pointer-declaration-aborts-the-compiler.md);
+    // dropping the star is the only legal mutation.
+    expect_error("declaration 'sp' of type 'simd<float,4>*'") {
+        simd<float,4>* sp = {};
     }
 
     return 0;

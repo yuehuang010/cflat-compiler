@@ -7869,18 +7869,49 @@ public:
                 {
                     defaultVal = GenerateDefaultValue(params[i]);
                 }
-                else if (auto* initList = initCtx->initializerList())
+                else if (initCtx->LeftBrace() != nullptr)
                 {
-                    // A pointer-typed parameter default ('int f(S* p = {a=1})') allocas a POINTER
-                    // and field-inits through it, so the caller receives the field bytes as 'p'.
+                    // Gated on the brace TOKEN so the EMPTY form ('int f(int x = {})') reaches
+                    // this arm too - initializerList() is null for '{}' and it used to miss.
+                    auto* initList = initCtx->initializerList();
+                    /*
+                     * An array VIEW is Pointer-flagged but is not a pointer target. Exempt it
+                     * exactly as the declarator guard does: the empty form gets the declarator's
+                     * own length message instead of naming a pointer that is not there, and the
+                     * non-empty form - which the declarator supports by building backing storage,
+                     * and which a parameter default cannot - says so rather than borrowing the
+                     * pointer wording. Both LogErrorContext calls throw, so neither falls through.
+                     */
+                    if (params[i].IsArrayView)
+                    {
+                        if (initList == nullptr)
+                            LogErrorContext(initCtx, std::format(
+                                "cannot infer the length of '{}[]' from an empty initializer list; "
+                                "use an explicit size '{}[N]'",
+                                params[i].TypeName, params[i].TypeName));
+                        LogErrorContext(initCtx, std::format(
+                            "a brace list is not supported as the default for the array-view "
+                            "parameter '{}' of type '{}[]' - it would need backing storage the "
+                            "default cannot own; use '= default' and fill it in the body",
+                            params[i].VariableName, params[i].TypeName));
+                    }
+
                     if (params[i].Pointer)
-                        LogPointerBraceInitReject(initCtx,
-                            std::format("parameter default for '{}'", params[i].VariableName),
-                            params[i].TypeName);
+                    {
+                        // Non-empty: field-inits through a POINTER alloca, so the caller gets the
+                        // field bytes as 'p'. Empty: ambiguous between null and a default object.
+                        std::string role = std::format("parameter default for '{}'", params[i].VariableName);
+                        if (initList != nullptr)
+                            LogPointerBraceInitReject(initCtx, role, params[i].TypeName,
+                                DescribePointerDeclType(params[i]),
+                                CanSuggestAllocation(initCtx, params[i]));
+                        else
+                            LogEmptyBraceOnPointerReject(initCtx, role, params[i]);
+                    }
 
                     // Field initializer default: build the struct, apply overrides, pass by value.
                     defaultVal = GenerateDefaultValue(params[i]);
-                    if (defaultVal)
+                    if (defaultVal && initList != nullptr)
                     {
                         auto* alloca = compiler->CreateAlloca(defaultVal->getType());
                         compiler->CreateAssignment(defaultVal, alloca);
@@ -9050,6 +9081,22 @@ public:
                 bool barebraceInit = initDecl->LeftBrace() != nullptr;
                 CFlatParser::InitializerListContext* barebraceList = barebraceInit ? initDecl->initializerList() : nullptr;
 
+                // Empty '{}' on a POINTER target: rejected as AMBIGUOUS (null pointer vs pointer
+                // to an empty object) in every spelling. A NON-pointer '{}' has ONE reading, so
+                // it seeds instead - that one-reading-vs-two split is why this arm exists.
+                bool emptyBraceToken = (barebraceInit && barebraceList == nullptr)
+                    || (initializer != nullptr && initializer->LeftBrace() != nullptr
+                        && initializer->initializerList() == nullptr);
+                // Array VIEWS are the ONLY exemption; they keep their "cannot infer the length"
+                // message. 'simd' is NOT exempt - it sets Pointer from its own '*' (~3816).
+                if (emptyBraceToken && typeAndValue.Pointer && !typeAndValue.IsArrayView)
+                {
+                    std::string role = typeAndValue.ConstArraySize > 0
+                        ? std::format("array element of '{}'", name)
+                        : std::format("declaration '{}'", name);
+                    LogEmptyBraceOnPointerReject(direct, role, typeAndValue);
+                }
+
                 // Array value-initializer: T[N] arr = {} / T[N] arr {} / T[N] arr = {field=v,...}
                 // Seed-once pattern: construct one element, then memcpy into every slot.
                 if (typeAndValue.ConstArraySize > 0 &&
@@ -9094,7 +9141,8 @@ public:
                             // 'S*[N] a = {field=v}' - the seed built below is an 'S', memcpy'd over
                             // each POINTER slot, so the field values become the element addresses.
                             LogPointerBraceInitReject(initDecl, std::format("array element of '{}'", name),
-                                typeAndValue.TypeName);
+                                typeAndValue.TypeName, DescribePointerDeclType(typeAndValue),
+                                CanSuggestAllocation(initDecl, typeAndValue));
                         }
                         else if (structData.StructType == nullptr)
                         {
@@ -9541,10 +9589,14 @@ public:
                     {
                         right = GenerateDefaultValue(typeAndValue);
                     }
-                    else if (initializer->initializerList() != nullptr)
+                    else if (initializer->LeftBrace() != nullptr)
                     {
-                        // Field initializer: MyStruct s = { field=val, ... }
-                        // Initialize with the default constructor first, then override named fields.
+                        // Field initializer: MyStruct s = { field=val, ... }, and the EMPTY form
+                        // 'T x = {}'. Gated on the brace TOKEN, not on initializerList(): the list
+                        // rule requires >= 1 element, so '{}' yields a null list and this arm used
+                        // to match nothing, leaving 'right' null and the target never written
+                        // ('int x = {}' read undef). The bare-brace arm below has always gated on
+                        // the token, which is why 'T x {}' seeded correctly.
                         right = GenerateDefaultValue(typeAndValue);
                     }
                 }
@@ -10198,7 +10250,8 @@ public:
                                 // 'alloc' is the POINTER VARIABLE's own 8 bytes, so both paths below
                                 // write through it. Fixed arrays / 'T[]' views 'continue' above, not here.
                                 LogPointerBraceInitReject(direct, std::format("declaration '{}'", name),
-                                    typeAndValue.TypeName, typeAndValue.IsUnique);
+                                    typeAndValue.TypeName, DescribePointerDeclType(typeAndValue),
+                                    CanSuggestAllocation(direct, typeAndValue), typeAndValue.IsUnique);
                             }
                             else if (!TryEmitContainerInitializer(alloc, typeAndValue, localInitList))
                                 EmitFieldInitializer(alloc, typeAndValue.TypeName, localInitList);
@@ -16946,15 +16999,71 @@ public:
         antlr4::ParserRuleContext* ctx,
         const std::string& what,
         const std::string& typeName,
+        const std::string& typeText,
+        bool canAllocate,
         bool isUnique = false)
     {
         // Carry 'unique' into the remedy so the suggestion is still a legal declaration.
         std::string qual = isUnique ? "unique " : "";
+        std::string remedy = canAllocate
+            ? std::format("allocate one first ('{}{}* p = new {}();') and assign through the "
+                          "pointer instead", qual, typeName, typeName)
+            : "assign an address to it instead";
         LogErrorContext(ctx, std::format(
-            "cannot apply a brace initializer to the POINTER {} - the braces would write into the "
-            "pointer itself, which holds an address and not a '{}'; allocate one first "
-            "('{}{}* p = new {}();') and assign through the pointer instead",
-            what, typeName, qual, typeName, typeName));
+            "cannot apply a brace initializer to the POINTER {} of type '{}' - the braces would "
+            "write into the pointer itself, which holds an address and not a '{}'; {}",
+            what, typeText, typeName, remedy));
+    }
+
+    /*
+     * Render the declared type for a diagnostic - 'S*', 'S**', 'void*', 'S*[2]' - so a remedy is
+     * never synthesized from the bare pointee name. A type ALIAS ('using PS = S*') is already
+     * resolved away by ParseDeclarationSpecifiers, so this names the resolved type, not 'PS'.
+     */
+    static std::string DescribePointerDeclType(const LLVMBackend::TypeAndValue& tv)
+    {
+        if (tv.ConstArraySize > 0) return DescribeArrayShape(tv);
+        // A simd type's TypeName is its ELEMENT ('float'), so spell the vector back out.
+        std::string base = tv.IsSimd ? std::format("simd<{},{}>", tv.TypeName, tv.SimdLanes)
+                                     : tv.TypeName;
+        return base + std::string(FixedArrayElementStars(tv), '*');
+    }
+
+    // 'new T()' is meaningful only for a SINGLE star over a known struct: there is no 'new void()',
+    // and 'new S()' is the wrong shape for an 'S**'.
+    bool CanSuggestAllocation(antlr4::ParserRuleContext* ctx, const LLVMBackend::TypeAndValue& tv)
+    {
+        return !tv.ElemPointer && tv.TypeName != "void"
+            && Compiler(ctx)->GetDataStructure(tv.TypeName).StructType != nullptr;
+    }
+
+    /*
+     * The EMPTY-'{}' companion to LogPointerBraceInitReject. A non-empty list on a pointer is
+     * rejected because it is memory-unsafe; an empty one is rejected because it is AMBIGUOUS -
+     * "the null pointer" and "a pointer to an empty object" are both reasonable readings, and
+     * the compiler picking one silently would teach the other one wrong. Role-named the same
+     * way so a test can prove which site fired. LogErrorContext throws; this never returns.
+     *
+     * '= default' is named FIRST and unconditionally because it is the only remedy valid at every
+     * site: a generic body's 'T x = {}' rejects when T substitutes to a pointer, and there
+     * 'nullptr' is nonsense guidance for the same body instantiated at T=int. The two cases are
+     * not distinguished - the parameter-default arm has no declSpec to ask whether a '*' was
+     * written - so both remedies are named everywhere rather than inventing a type-flag for it.
+     */
+    void LogEmptyBraceOnPointerReject(
+        antlr4::ParserRuleContext* ctx,
+        const std::string& what,
+        const LLVMBackend::TypeAndValue& tv)
+    {
+        std::string alloc = CanSuggestAllocation(ctx, tv)
+            ? std::format(", or 'new {}()' for a pointer to a real object", tv.TypeName)
+            : "";
+        LogErrorContext(ctx, std::format(
+            "empty brace initializer '{{}}' is AMBIGUOUS on the POINTER {} of type '{}' - it could "
+            "mean the null pointer, or a pointer to a default-constructed '{}'; write '= default' "
+            "(valid for any type, including a generic parameter substituted to a pointer) or "
+            "'nullptr'{}",
+            what, DescribePointerDeclType(tv), tv.TypeName, alloc));
     }
 
     void EmitFieldInitializer(
@@ -17974,7 +18083,9 @@ public:
             // Reachable only when substitution made the element a pointer ('new T{...}' with
             // T=S*): 'typedPtr' then addresses a POINTER slot, not an 'S'.
             if (typeIsPtr)
-                LogPointerBraceInitReject(ctx, std::format("element of 'new {}*'", typeName), typeName);
+                // The element type IS 'typeName*' here; allocating one 'typeName' is the remedy.
+                LogPointerBraceInitReject(ctx, std::format("element of 'new {}*'", typeName), typeName,
+                    typeName + "*", true);
             EmitFieldInitializer(typedPtr, typeName, initList);
         }
 

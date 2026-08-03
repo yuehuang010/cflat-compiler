@@ -226,7 +226,7 @@ true count: **10 P1 / 38 P2 / 27 P3 / 7 UI = 82 total.**
 | [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. **NARROWED 2026-08-02** by `fix/uniq-array-elem`: root cause CONFIRMED by instrumentation (`FieldName`/`CallerName` name the CONTAINER, so `selfFieldAssign` swallowed a genuine two-owner store), and every element pair whose addresses are constant-provably different now rejects - local, generic-substituted, nested, array-as-field, through-pointer, view, and global arrays. BOTH copies of the name comparison were fixed; the second (`sameField`) also guards the reassignment-destruct, and fixing only the first traded an abort for a leak. Residue: any index not constant in the emitted IR - a runtime subscript, and a `const` integer (`const` is unenforced, so folding it would be unsound). |
 | [[unique-field-global-struct-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. `gA.slot = gB.slot` on two file-scope structs. **Mechanism CORRECTED 2026-08-02** (the first filing read optimized IR and blamed `destIsStructField`; at `--no-opt` that predicate is TRUE and the stack IS entered): a global-struct field read carries an EMPTY `CallerName`, so `selfFieldAssign` reads two different globals as one slot - the same failure as the interface receiver, through a third receiver kind. Renaming the fields apart rejects on both binaries. Closable by extending `ProvablyDifferentSlots` to distinct `GlobalVariable`/`AllocaInst` roots, which is sound but is a widening of a predicate every field store flows through - do it with its own sweep. |
 | [[temp-unique-field-into-borrow-slot-use-after-free]] | Use-after-free, compiles clean and exits 0 on both binaries. A temp's `unique` field bound into a NON-unique (borrow) slot with a destructor-less pointee: the temp's `Box` destructor frees the pointee before the load. No `unique` claim on the destination for a guard to key on. |
-| [[empty-brace-initializer-never-seeds-and-crashes-on-defaults]] | Silent uninitialized read for the `T x = {};` local spelling - the bare-brace and global spellings of the same construct both seed correctly. As a parameter default it was a compiler SIGSEGV (139, zero output) for EVERY type; `fix/ptr-fieldinit` added a null-`defaultVal` bail, so that face is now a located diagnostic (rc 1) while the SEEDING root cause is untouched. Found by the SYNTAX-axis enumeration of the pointer-brace fix; different root cause, deliberately not closed by it. Filed 2026-08-02. |
+| [[simd-pointer-declaration-aborts-the-compiler]] | Compiler abort (rc 138, zero output, no diagnostic) for `simd<float,4>* sp = nullptr;`. PRE-EXISTING - measured identical on `5a6580c` and on `fix/emptybrace`. Found because that fix's diagnostic suggests `nullptr` as the remedy and for this one type the remedy crashes; the `= {}` spelling is rejected there, `= nullptr` is not. Root cause NOT diagnosed. Filed 2026-08-02. |
 
 ### P2 - false rejections, unavailable features, ownership holes (`p2/`)
 
@@ -397,6 +397,7 @@ which a future session must not "fix" back without reopening the decision.
 | Temp-source and fat-interface `unique` field stores rejected; the implied-move pointer guard in all THREE copies | `3d33bfe` |
 | Brace-list initializer on a global (or bare-brace local) struct/union/class/container rejected instead of silently discarded (RATIFIED) | fix/global-positional (branch, not yet merged) |
 | Brace initializer on a POINTER target rejected at FOUR of the five `EmitFieldInitializer` call sites; the named-argument site audited and left alone because it is CORRECT (RATIFIED) | fix/ptr-fieldinit (branch, not yet merged) |
+| Empty `{}` split by TARGET TYPE - seeds a non-pointer in both spellings, REJECTED on a pointer in every spelling as AMBIGUOUS between null and a pointer-to-empty. Supersedes `fix/ptr-fieldinit`'s `S*[N] a = {}` zero-init row (RATIFIED) | fix/emptybrace (branch, not yet merged) |
 
 Suite trajectory across the whole sequence: 522 -> 530 -> 536 -> 538 -> 540.
 
@@ -1898,31 +1899,33 @@ present.
   placed one branch earlier would have false-rejected it. Measured, not assumed.
 - The declaration message carries the `unique` qualifier into its remedy suggestion
   (`unique Uq* p = new Uq();`), so the suggested spelling is a legal declaration.
-- Empty `{}` is never rejected BY THE POINTER GUARD. It carries no field values, so nothing can be
-  proven wrong about it, and three of its four neighbouring spellings already accept it. Note this
-  is scoped to the pointer guard: the separate null-`defaultVal` bail added by the same change does
-  reject `f(T x = {})`, which used to segfault the compiler - see the paragraph below.
+- ~~Empty `{}` is never rejected BY THE POINTER GUARD.~~ **SUPERSEDED** by the empty-brace record
+  below: empty `{}` on a pointer target is now rejected in every spelling, on an AMBIGUITY
+  argument this record did not consider.
 
-**Behaviour change beyond the rejection (ratified).** `S*[N] a = {};` used to build one
-default-constructed pointee and memcpy its first 8 bytes over every pointer slot, so a struct with
-a non-zero leading field default produced non-null element addresses (`0x7`). It now zero-inits,
-which is what the same empty-brace spelling does for a primitive element type and at global scope.
-`Test/test_initializer_list.cb` carries the VALUE legs (this zero-init pair plus the three
-named-argument must-still-work legs); the negative coverage is `Test/errors/err_ptr_brace_init.cb`
-(9 legs, each mutation-tested individually).
+**Behaviour change beyond the rejection (~~ratified~~ SUPERSEDED).** `S*[N] a = {};` used to build
+one default-constructed pointee and memcpy its first 8 bytes over every pointer slot, so a struct
+with a non-zero leading field default produced non-null element addresses (`0x7`). This change made
+it zero-init. **That decision was reversed the same day** - see "empty `{}` split by target type"
+below, which rejects the spelling instead. The zero-init VALUE legs described here are gone from
+`Test/test_initializer_list.cb`; the spelling's coverage is now an `expect_error` leg. What survives
+from this record: the three named-argument must-still-work legs, and
+`Test/errors/err_ptr_brace_init.cb`'s 9 non-empty-list legs, each mutation-tested individually.
 
 **A compiler SIGSEGV turned into a diagnostic, in the same function this fix edits.**
 `int f(int x = {})` - an EMPTY brace list as a parameter default - left `defaultVal` null in the
 default-parameter wrapper and segfaulted the compiler (rc 139, zero output) for `int`, a struct and
 a pointer alike, on master and on the first cut of this branch. Per CLAUDE.md's debugging workflow
 (a diagnosed crash gets a proper error message), a null-`defaultVal` bail was added here; all three
-spellings now give rc 1 with a located diagnostic. This is containment only - the SEEDING root cause
-stays open in [[empty-brace-initializer-never-seeds-and-crashes-on-defaults]].
+spellings now give rc 1 with a located diagnostic. This was containment only; the SEEDING root cause was
+closed the same day by `fix/emptybrace` (record at the end of this file), which also removed the
+bail for a NON-pointer default and replaced it for a POINTER one with the ambiguity diagnostic.
 
 **Left open, filed separately, NOT closed here** (both found by this fix's Phase A enumeration):
-[[empty-brace-initializer-never-seeds-and-crashes-on-defaults]] - the `T x = {};` spelling never
-seeds anything (`int x = {};` reads undef); the bare-brace spelling of the same construct seeds
-correctly, so the two gates ask different questions. Only its crash face is contained here. And
+the `T x = {};` spelling never seeds anything (`int x = {};` reads undef) while the bare-brace
+spelling of the same construct seeds correctly, so the two gates ask different questions - only its
+crash face was contained here. (That one is now CLOSED by `fix/emptybrace`; its issue file is
+deleted.) And
 [[string-literal-containing-braces-retyped-as-string]] - a literal whose CONTENT contains `{}` is
 typed `string` rather than `char*`; found only because a test label contained `= {}`. That one was
 filed as a false rejection and is worse than filed: `printf("a = {} b\n");` compiles rc 0, runs rc 0
@@ -2076,3 +2079,152 @@ inside the `ConstArraySize > 0` guard) and nlohmann in `LLVMBackend.h` under key
 Bar: `./test.sh Release` **576 passed / 0 failed / 8 skipped** against master's 574/0/8 - +2 for
 the one new errors file, which the suite runs cold and warm. `bash example_mac.sh Release`
 **35 passed / 0 failed**, same as master.
+### fix/emptybrace - empty `{}` split by TARGET TYPE: seeds a non-pointer, rejected on a pointer (RATIFIED)
+
+Closes [[empty-brace-initializer-never-seeds-and-crashes-on-defaults]]. `{}` produces a NULL
+`initializerList()` (the list rule requires >= 1 element), so every gate written as
+`initializerList() != nullptr` missed it while the sibling gates written on the `LeftBrace()` TOKEN
+did not. That single asymmetry is the whole root cause, confirmed from `--no-opt` IR rather than taken from
+the issue file. Two halves, verified apart.
+
+**Half 1 - a NON-pointer `{}` seeds, in both spellings.** The local declarator arm
+(`MainListener.h`) and the default-parameter wrapper are now gated on the brace token. Measured
+`--no-opt` IR, not probe values: PRE `int x = {}` emitted `%x = alloca i32` followed directly by a
+`load` - no store anywhere - so the value read was whatever the frame held; POST emits
+`store i32 0`. This matters because the PRE probe for `double d = {}` / `bool b = {}` PRINTED
+`0.000000` / `0` while emitting no store at all - an incidental stack read that a value-only check
+would have scored as correct. `S s = {}` was already correct pre-fix (a null `right` fell through to
+the struct default-construction fallback), and its `@main` IR is byte-identical PRE and POST; only
+primitives, and `function<>`, were unseeded.
+
+**Half 2 - a POINTER `{}` is REJECTED, in every spelling.** The reason is AMBIGUITY, not the
+memory-unsafety that motivated the non-empty pointer reject in `fix/ptr-fieldinit`: on a pointer
+target `{}` reads either as the null pointer or as a pointer to an empty object. Both are things a
+reader could reasonably expect; zero-init happens to produce null, so silently choosing the first
+reading would LOOK correct while quietly teaching the second one wrong. `nullptr` is the unambiguous
+spelling and is what the diagnostic names. This is also the scope test for any spelling the rule
+does not obviously cover: ask whether the target admits two readings. A non-pointer `{}` admits one
+(`S s = {}` is the default-constructed `S`), which is why half 1 seeds rather than rejects.
+
+The guard is ONE site in the declarator, placed before the fixed-array and array-view branches (both
+of which `continue`), keyed on `Pointer && !IsArrayView`, plus the parameter-default arm.
+It role-names through `LogEmptyBraceOnPointerReject`, the empty-`{}` companion to
+`LogPointerBraceInitReject`, so a test can prove WHICH site fired and cannot be satisfied by the
+non-empty message. Covered by one guard, measured individually: `S* p = {}`, `S* p {}`, global
+`S* gp = {}` and `gp {}`, `S*[2] a = {}` and `a {}` (local and global), `int*`/`char*`/`void*`/`S**`,
+`unique S*`, nullable `S?`, `simd<float,4>*`, `list<int>*`, namespace-qualified `N.S*`, a generic
+`Box<int>*`, and a `using PS = S*` alias.
+
+**This REVERSES `fix/ptr-fieldinit`'s ratified `S*[N] a = {}` row** (see the strikethrough above).
+That record had ratified the spelling as ZERO-INIT, replacing a garbage memcpy of the pointee
+defaults (`0x7` -> `0x0`); it is now a rejection. Three of the four pointer spellings compiled and
+produced null CORRECTLY before this change - bare, global, array - so this is a real behaviour
+change on working programs, not a no-op. The only in-repo fallout was
+`Test/test_initializer_list.cb`'s `PtrSeed*[2] pa = {}` legs, replaced in the same commit.
+
+**Accept-set (built BEFORE the guard, all measured PRE and POST, all unchanged).** `S s = {}` /
+`S s {}`; `S s = {a=1,b=2}` and its bare twin; `S[3] = {a=5}`, `S[3] = {}`, `S[3] {}`; `int[3] = {}`
+and `{}` bare; `int[] v = {1,2,3}` - an array VIEW, which IS Pointer-flagged and is exactly what a
+naive `Pointer` test false-rejects, hence the `!IsArrayView` term; `int[] v = {}` and `S*[] v = {}`
+keep their own "cannot infer the length" message; `list`/`array`/`dictionary` brace init and their
+empty `= {}` / `{}` forms; `string`, `char* c = "hi"`, `void* p = nullptr`, `function<>` by name, a
+NON-pointer `simd<float,4>` local, an interface local, `static`/namespaced/union/class/generic/aliased struct targets;
+and all five non-empty pointer rejects from `fix/ptr-fieldinit`, whose messages are byte-identical.
+
+**Intended collateral: a generic body's validity can now depend on its type argument.** Round-1
+review found this and the maintainer ruled on it:
+
+```cflat
+struct Holder<T> { T v = default; void seed() { T x = {}; v = x; } };
+```
+
+`Holder<int>` compiles and prints 0 on both binaries; `Holder<S*>` printed 0 on master and now
+hard-errors. `ParseDeclarationSpecifiers` sets `Pointer` for a T substituted to a pointer exactly as
+it does for a written `S*`, and the guard cannot tell them apart. **The rejection STAYS** - the
+ruling was "try `= default` first, exempt only if that does not work", and `T x = default;` was
+measured rc 0 and identical PRE/POST across `int`, `double`, `bool`, `S*`, `char*`, `S` (prints 79,
+so field defaults genuinely ran), `string`, `Box<int>` and `Box<int>*`. So the remedy works and no
+substituted-generic exemption was added. This is a real behaviour change on working code that the
+original ruling did not enumerate - the accept-set had `Box<int>*`, a pointer TO a generic, not a T
+substituted TO a pointer - so it is recorded here rather than left to be discovered.
+
+It did change the WORDING. The first cut named only `nullptr`, which is bad guidance inside a
+generic body: for `T=int` it is nonsense, and it only compiles by coercion. `= default` is now named
+FIRST and unconditionally, since it is the one remedy valid at every site and every instantiation.
+The written-`*` case is NOT distinguished from the substituted one: it would be cheap at the
+declarator (`declSpec->pointer()`) and is not available at the parameter-default arm, and having the
+two positions word the same construct differently is exactly the divergence that caused the finding
+below. Naming both remedies everywhere was preferred over a new type-flag. `Test/test_initializer_list.cb`
+carries `T x = default;` instantiated at BOTH a pointer and a non-pointer T, so the guidance is
+proven, not asserted; `Test/errors/err_ptr_brace_init.cb` carries the rejection.
+
+**The two gates diverged again - in the commit that exists to unify them.** The declarator guard
+carried `!IsArrayView`; the parameter-default arm tested bare `Pointer`. So
+`int f(int[] v = {})` said "AMBIGUOUS on the POINTER parameter default for 'v' ... write 'nullptr'
+... 'new int()'" - `int[]` is not a pointer, `nullptr` is not a legal view spelling, and the type
+printed was `int` rather than `int[]`. The parameter arm now carries the same exemption and gives
+the declarator's own "cannot infer the length of 'int[]'" message. The NON-empty view default
+(`int f(int[] v = {1,2})`) had inherited the same false pointer wording from `fix/ptr-fieldinit`
+(measured identical PRE/POST, so pre-existing); it now gets an honest message naming backing
+storage. Both positions are pinned by legs.
+
+**The remedy text is built from the DECLARED type, not the pointee name.** `LogEmptyBraceOnPointerReject`
+and its sibling `LogPointerBraceInitReject` both formatted from `TypeName` alone, so `void* p = {}`
+suggested `new void()` and `S** pp = {}` suggested `new S()`. Both helpers now take a rendered type
+text (`DescribePointerDeclType`: `S*`, `S**`, `void*`, `S*[2]`, `simd<float,4>*`) and a
+`CanSuggestAllocation` flag that withholds the `new T()` hint unless it is meaningful - a single
+star over a known struct. The non-empty helper says "assign an address to it instead" when it is
+not. The inherited defect is fixed in both, which is why five `fix/ptr-fieldinit` legs saw their
+message TAIL change; all five pin the role phrase, which is unchanged, and all nine of that
+commit's legs were re-mutation-tested here. **Not fixed: a type ALIAS loses its identity** -
+`using PS = S*; PS p = {}` names `S*`, because `ParseDeclarationSpecifiers` resolves the alias
+before the guard ever runs and recovering the written spelling means carrying raw declSpec text.
+`= default` is spelling-agnostic and is named first, so the guidance is still correct for an alias.
+
+**A behaviour change worth naming: `function<int(int)> f = {}`.** Function-pointer locals are not
+`Pointer`-flagged on this path, so they take half 1 rather than half 2: PRE the `=` spelling read an
+undef non-null value while the bare `f {}` gave null, and POST both give null. The two spellings now
+agree, which is the whole point of half 1.
+
+**Out of scope, with the reason.** A struct FIELD default (`struct H { S* p = {}; };`) discards the
+brace list entirely for POINTER and NON-POINTER fields alike - `S s = {a=1}` in a field yields the
+field defaults, not `1` - which is the already-filed
+[[struct-field-default-brace-list-discarded]], a different path. `new T{}` and `f({})` are PARSE
+errors (both grammar rules require a non-empty `initializerList`), so the `new` and named-argument
+`EmitFieldInitializer` callers cannot see an empty brace at all; confirmed from `CFlat.g4`, not
+inferred. A non-pointer `{}` on a GLOBAL struct zero-fills rather than running field defaults
+(`S gs = {}` gives `0 0`, not `7 9`) identically PRE and POST - a pre-existing global-constant
+limitation, untouched here.
+
+No new `TypeAndValue` / `StructData` / `AnnotationValue` field: the guard reads `Pointer`,
+`IsArrayView` and `ConstArraySize`, all three already in the `--init` round-trip
+(`LLVMBackend.cpp`), so the errors file fires cold and warm. No new transient state, so nothing to
+clear in `ResetForReanalysis`. Neither edit is in `ForwardRefScanner` (which only stores the
+initializer context, never interprets it) and no type parsing changed, so the both-copies rule does
+not apply.
+
+**A hole this fix opened and closed in the same commit, worth the record.** The guard's first cut
+exempted `IsSimd` alongside `IsArrayView`. `simd<T,N>` sets `Pointer` from its own `*` like any
+other type, so that did not merely miss a rejection: `simd<float,4>* sp = {};` then fell into half
+1's seeding arm, which stored a whole VECTOR into an 8-byte pointer slot and ABORTED the compiler
+(rc 138, zero output) - a shape that ran clean, if garbage, on master. `IsArrayView` is the ONLY
+exemption, and it is needed only because `int[] v = {1,2,3}` is Pointer-flagged; views never reach
+the seeding arm anyway (their branch `continue`s above it). `Test/errors/err_ptr_brace_init.cb`
+carries the simd leg as the tripwire.
+
+Chasing that down surfaced a PRE-EXISTING abort, filed as
+[[simd-pointer-declaration-aborts-the-compiler]]: `simd<float,4>* sp = nullptr;` AND
+`... = default;` are both rc 138 on `5a6580c` and on this commit alike - so `simd<T,N>*` has no
+initialized declaration spelling that compiles. (The `= default` face was found by mutation-testing
+the simd leg, after the issue file had already been written claiming only `nullptr`; the file
+records the correction.) It matters here because those are exactly the two remedies this fix's
+diagnostic names, so for that one type neither suggestion compiles. Not fixed here - different root
+cause, in the type's slot computation rather than in brace handling.
+
+Bar (measured after rebasing onto `fix/mdview`, so the compiler carries both changes):
+`./test.sh Release` 576 passed / 0 failed / 8 skipped, unchanged from master's own 576/0/8 -
+the suite counts FILES and this commit adds none, it extends `Test/test_initializer_list.cb` and
+`Test/errors/err_ptr_brace_init.cb`. `bash example_mac.sh Release` 35 passed / 0 failed. All
+`expect_error` legs in `Test/errors/err_ptr_brace_init.cb` - the 13 added here AND the 9 inherited
+from `fix/ptr-fieldinit`, whose message tails this commit changed - mutation-tested individually,
+22 for 22: replacing each brace form with a legal spelling flips the file to rc 1 naming that leg.
