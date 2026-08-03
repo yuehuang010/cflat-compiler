@@ -171,7 +171,7 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
 | **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 10 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 37 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 38 |
 | **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 27 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
@@ -206,9 +206,12 @@ and one P3 ([[global-struct-no-initializer-ignores-field-defaults]]). All four w
 review of that P1's fix, not by the original investigation - the same pattern this file has
 recorded before (see the 2026-08-01 paragraph above).
 
-A further review round of the same fix filed a FIFTH: [[pointer-decl-field-init-brace-corrupts-pointer-storage]]
-(P1 - `S* p {a=1};` writes a nonsense address into `p` itself). Current true count:
-**10 P1 / 37 P2 / 27 P3 / 7 UI = 81 total.**
+A further review round of the same fix filed a FIFTH: `pointer-decl-field-init-brace-corrupts-pointer-storage`
+(P1 - `S* p {a=1};` writes a nonsense address into `p` itself). **FIXED and deleted 2026-08-02** by
+`fix/ptr-fieldinit`; see the landed design record below. That fix in turn filed two more from its own
+Phase A enumeration - [[empty-brace-initializer-never-seeds-and-crashes-on-defaults]] (P1) and
+[[string-literal-containing-braces-retyped-as-string]] (P2) - which is the same pattern again. Current
+true count: **10 P1 / 38 P2 / 27 P3 / 7 UI = 82 total.**
 
 ### P1 - wrong programs and crashes (`p1/`)
 
@@ -224,7 +227,7 @@ A further review round of the same fix filed a FIFTH: [[pointer-decl-field-init-
 | [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. **NARROWED 2026-08-02** by `fix/uniq-array-elem`: root cause CONFIRMED by instrumentation (`FieldName`/`CallerName` name the CONTAINER, so `selfFieldAssign` swallowed a genuine two-owner store), and every element pair whose addresses are constant-provably different now rejects - local, generic-substituted, nested, array-as-field, through-pointer, view, and global arrays. BOTH copies of the name comparison were fixed; the second (`sameField`) also guards the reassignment-destruct, and fixing only the first traded an abort for a leak. Residue: any index not constant in the emitted IR - a runtime subscript, and a `const` integer (`const` is unenforced, so folding it would be unsound). |
 | [[unique-field-global-struct-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. `gA.slot = gB.slot` on two file-scope structs. **Mechanism CORRECTED 2026-08-02** (the first filing read optimized IR and blamed `destIsStructField`; at `--no-opt` that predicate is TRUE and the stack IS entered): a global-struct field read carries an EMPTY `CallerName`, so `selfFieldAssign` reads two different globals as one slot - the same failure as the interface receiver, through a third receiver kind. Renaming the fields apart rejects on both binaries. Closable by extending `ProvablyDifferentSlots` to distinct `GlobalVariable`/`AllocaInst` roots, which is sound but is a widening of a predicate every field store flows through - do it with its own sweep. |
 | [[temp-unique-field-into-borrow-slot-use-after-free]] | Use-after-free, compiles clean and exits 0 on both binaries. A temp's `unique` field bound into a NON-unique (borrow) slot with a destructor-less pointee: the temp's `Box` destructor frees the pointee before the load. No `unique` claim on the destination for a guard to key on. |
-| [[pointer-decl-field-init-brace-corrupts-pointer-storage]] | Silent miscompile, memory-unsafe. `S* p = {a=1};` compiles clean, exits 0, and leaves `p` holding the nonsense address `0x1` (built from the field VALUE, not any real object) on BOTH `58d5d27` and `af68158` - genuinely pre-existing. The BARE spelling `S* p {a=1};` is NOT an identical baseline: PRE it is `undef` (the bare-brace bug `fix/global-positional` closes), POST it is the same `0x1` as the '=' spelling, now reached because that fix made the two spellings agree. `EmitFieldInitializer` GEPs into `alloc` assuming it addresses an `S`, but for a pointer declaration `alloc` addresses the POINTER's own 8-byte slot. Found by review of `fix/global-positional`'s comments; the bug itself is not caused or fixed by that commit, though it does change the bare spelling's specific wrong value - see the file. Filed 2026-08-02. |
+| [[empty-brace-initializer-never-seeds-and-crashes-on-defaults]] | Silent uninitialized read for the `T x = {};` local spelling - the bare-brace and global spellings of the same construct both seed correctly. As a parameter default it was a compiler SIGSEGV (139, zero output) for EVERY type; `fix/ptr-fieldinit` added a null-`defaultVal` bail, so that face is now a located diagnostic (rc 1) while the SEEDING root cause is untouched. Found by the SYNTAX-axis enumeration of the pointer-brace fix; different root cause, deliberately not closed by it. Filed 2026-08-02. |
 
 ### P2 - false rejections, unavailable features, ownership holes (`p2/`)
 
@@ -267,6 +270,7 @@ A further review round of the same fix filed a FIFTH: [[pointer-decl-field-init-
 | [[class-no-ctor-default-construct-returns-undef]] | miscompile | A `class` with no user-written constructor default-constructs to IR `undef`, not zero - the synthesized zero-arg constructor's body never stores anything before returning. The `struct` twin (same fields, no constructor) is correct (real zero-init). Found while reviewing `[[global-struct-positional-init-silently-zeroes]]`'s fix; unrelated root cause. Filed 2026-08-02. |
 | [[struct-field-default-brace-list-discarded]] | miscompile | A struct FIELD's own `= { x = 1, y = 2 }` default brace list is silently discarded when the containing struct is default-constructed - the field lands all-zero instead. Found auditing the same fix for neighbouring shapes; different code path (a field's default expression, not a variable declarator). Filed 2026-08-02. |
 | [[interface-typed-global-brace-init-discarded]] | miscompile | `I gi = { a = 1 };` on an interface-typed global compiles clean with the brace list silently dropped, no diagnostic. The `[[global-struct-positional-init-silently-zeroes]]` fix's guard cannot see it - `GetDataStructure("I").StructType` is null for an interface name, so this falls through unguarded. Found by review of that fix. Filed 2026-08-02. |
+| [[string-literal-containing-braces-retyped-as-string]] | miscompile + false rejection | A string literal whose CONTENT contains a brace pair (`"a = {} b"`) is typed `string` instead of `char*`. At a call it stops every `char*` overload matching and the diagnostic blames the call; at a VARIADIC it is a SILENT MISCOMPILE - `printf("a = {} b\n");` compiles and runs rc 0 printing binary garbage, and the dedicated `cannot pass 'string' to the variadic '...'` guard does not fire. Identical on both binaries. Filed 2026-08-02 in `p2/` for the rejection face; the miscompile face may warrant P1. |
 
 ### P3 - diagnostics, latent, deliberate deferrals (`p3/`)
 
@@ -392,6 +396,7 @@ which a future session must not "fix" back without reopening the decision.
 | Provably-null interface access rejected at COMPILE TIME; no runtime guard (RATIFIED) | `3311842` |
 | Temp-source and fat-interface `unique` field stores rejected; the implied-move pointer guard in all THREE copies | `3d33bfe` |
 | Brace-list initializer on a global (or bare-brace local) struct/union/class/container rejected instead of silently discarded (RATIFIED) | fix/global-positional (branch, not yet merged) |
+| Brace initializer on a POINTER target rejected at FOUR of the five `EmitFieldInitializer` call sites; the named-argument site audited and left alone because it is CORRECT (RATIFIED) | fix/ptr-fieldinit (branch, not yet merged) |
 
 Suite trajectory across the whole sequence: 522 -> 530 -> 536 -> 538 -> 540.
 
@@ -1800,7 +1805,7 @@ found by review and all worth recording explicitly rather than leaving implicit 
    spelling already had, now reached by the bare spelling too because both now share one code
    path). Both values are wrong and neither is safe to dereference; this is the routing fix
    working as intended (making the two spellings agree) colliding with a DIFFERENT, unfixed
-   pre-existing bug ([[pointer-decl-field-init-brace-corrupts-pointer-storage]], filed, not
+   pre-existing bug (`pointer-decl-field-init-brace-corrupts-pointer-storage` (FIXED 2026-08-02, file deleted), filed, not
    fixed here) rather than a new defect class of its own. Recorded here because "from undef to
    a different wrong value" is still a measured behaviour change, and a first draft of that
    issue file wrongly called the bare spelling's value identical across both binaries -
@@ -1817,7 +1822,7 @@ fix's guard entirely, since `GetDataStructure` has no entry for an interface nam
 pre-existing [[global-struct-no-initializer-ignores-field-defaults]] (a global with NO
 initializer at all zeroes instead of honoring field defaults; different code path again, the
 `right == nullptr` branch rather than the brace-list branch) and
-[[pointer-decl-field-init-brace-corrupts-pointer-storage]] (`S* p = {a=1};` - a POINTER
+`pointer-decl-field-init-brace-corrupts-pointer-storage` (FIXED 2026-08-02, file deleted) (`S* p = {a=1};` - a POINTER
 declaration reaches the pre-existing `EmitFieldInitializer` call unguarded, since its `TypeName`
 is the pointee `S`, a known struct; `EmitFieldInitializer` then GEPs into the pointer's own
 8-byte slot as if it addressed an `S`, leaving `p` holding a nonsense address built from the
@@ -1825,3 +1830,110 @@ field values. The `=` spelling is identical on `58d5d27` and `af68158`; the BARE
 `S* p {a=1};` is NOT - see behaviour change 3 above and the file itself. This fix's new
 primitive-typed guard does not and cannot see either spelling, since it is gated on the pointee
 name resolving to a non-struct).
+
+### fix/ptr-fieldinit - a brace initializer on a POINTER target rejected at four of five call sites (RATIFIED)
+
+Closes `pointer-decl-field-init-brace-corrupts-pointer-storage`. The filed repro was verified
+verbatim on a `dd6f836` Release build before any edit: `S* p = {a=1};` compiles rc 0, runs rc 0 and
+prints `p=0x1`. The `--no-opt` IR confirms the filed root cause exactly - the optimized IR folds it
+to a constant `inttoptr`, so this reading had to be taken unoptimized:
+
+```
+%p = alloca ptr, align 8                                  ; the POINTER's own 8 bytes
+store ptr null, ptr %p, align 8
+%a_init = getelementptr inbounds %S, ptr %p, i32 0, i32 0  ; GEP'd as if %p addressed an S
+store i8 1, ptr %a_init, align 1                           ; field "a" lands in the pointer
+%0 = load ptr, ptr %p, align 8                             ; read back as the pointer VALUE
+```
+
+**Five call sites; FOUR were broken.** The issue file named the local scalar declarator and said the
+`new` and named-argument callers were "not checked". All four of the others were checked by probe,
+and three of them reproduced. A first cut of this fix rejected at all five and was WRONG about the
+fifth - see the last row.
+
+| `EmitFieldInitializer` caller | Reachable with a pointer target? | Pre-fix behaviour |
+|---|---|---|
+| local scalar declarator (`~10102`) | YES - `S* p = {a=1};` and every neighbouring spelling | BROKEN: `p == 0x1`; the container sibling `list<int>* lp = {1,2};` compiled and SIGSEGV'd at runtime |
+| fixed-array seed (`~9052`) | YES - `S*[2] arr = {a=1};` | BROKEN: `arr[0]` is the PACKED FIELD BYTES - `0x1` for `struct S { int a=0; int b=0; }`, `0x900000001` for `{ int a=7; int b=9; }` with `{a=1}` (b keeps its 9); and `S*[2] arr = {};` memcpy'd the pointee's field DEFAULTS over each slot (`0x7` for a leading `int a = 7`) |
+| default-parameter wrapper (`~7837`) | YES - `int f(S* p = {a=1})` | BROKEN: the caller received the field bytes as `p` (`1`) |
+| `new T{...}` (`~17680`) | YES, but ONLY via generic substitution | BROKEN: `new S*{a=1}` and `new PS{a=1}` (alias) are both rejected before codegen, so the syntax axis alone said "unreachable". `struct Mk<T> { ... new T{a=1} ... }` instantiated as `Mk<S*>` reaches it and yields `0x1`. The probe that found this was written only because the site was on the audit list |
+| named-argument brace at a call (`~22859`) | YES - `g({a=1})` and `g(p: {a=1})` where `g` takes `S*` | **CORRECT - not rejected, nothing changed here.** See below |
+
+**The named-argument site was audited and found CORRECT.** It is structurally incapable of the bug:
+it builds its OWN struct alloca (`paramType.TypeName = structType` with `Pointer` left false, then
+`CreateAlloca` on the struct's default value) and hands THAT to `EmitFieldInitializer`. The pointer
+variable's 8 bytes are never the destination, because there is no pointer variable - the argument is
+a materialized temp whose address is passed. Measured on master `7f41a15` with
+`struct Ptt { int a = default; int b = default; }` and `int zzt(Ptt* p) { return p->a*10 + p->b; }`:
+
+```
+zzt({a=1,b=2})        -> 12    (correct field values, through a real temp)
+zzt(p: {a=1,b=2})     -> 12
+h.use({a=3,b=4})      -> 304   (method receiver spelling)
+```
+
+The first draft's audit misread a truncated stack ADDRESS of a valid temp as "corrupted field
+bytes". The tell that separates this site from the other four: the three genuinely-broken sites
+return the packed field bytes themselves (`0x1`, `0x900000001`), while this one returns an address.
+Rejecting here removed a working feature, so the reject, the `outAllPointer` out-parameter of
+`ResolveInitializerArgType`, and the `sawPointer && !sawValue` overload-set logic that existed only
+to serve it were all removed; the site is byte-identical to master. Three positive legs in
+`Test/test_initializer_list.cb` (positional, `name:`, method receiver) now pin the values so it
+cannot be broken by a future round.
+
+**The rejection, and its polarity.** All four rejecting sites go through one helper,
+`LogPointerBraceInitReject`, whose message names the ROLE (`declaration 'p'`, `array element of
+'arr'`, `parameter default for 'p'`, `element of 'new S*'`) so a test can prove WHICH site fired.
+What is rejected is provable, not inferred: the target is a pointer AND a non-empty brace list is
+present.
+
+- The local-site guard sits in the `else if` chain AFTER the existing non-struct reject, so `int x
+  {5};`, `void* p = {a=1};`, `function<int(int)> fp = {a=1};` and an interface-typed local keep
+  their own (better) messages instead of being re-blamed as pointer errors.
+- Fixed arrays and `T[]` views never reach that arm - both branches above it `continue`. This
+  matters: `int[] v = {1,2,3}` is legal and IS `IsArrayView + Pointer`, so a bare `Pointer` test
+  placed one branch earlier would have false-rejected it. Measured, not assumed.
+- The declaration message carries the `unique` qualifier into its remedy suggestion
+  (`unique Uq* p = new Uq();`), so the suggested spelling is a legal declaration.
+- Empty `{}` is never rejected BY THE POINTER GUARD. It carries no field values, so nothing can be
+  proven wrong about it, and three of its four neighbouring spellings already accept it. Note this
+  is scoped to the pointer guard: the separate null-`defaultVal` bail added by the same change does
+  reject `f(T x = {})`, which used to segfault the compiler - see the paragraph below.
+
+**Behaviour change beyond the rejection (ratified).** `S*[N] a = {};` used to build one
+default-constructed pointee and memcpy its first 8 bytes over every pointer slot, so a struct with
+a non-zero leading field default produced non-null element addresses (`0x7`). It now zero-inits,
+which is what the same empty-brace spelling does for a primitive element type and at global scope.
+`Test/test_initializer_list.cb` carries the VALUE legs (this zero-init pair plus the three
+named-argument must-still-work legs); the negative coverage is `Test/errors/err_ptr_brace_init.cb`
+(9 legs, each mutation-tested individually).
+
+**A compiler SIGSEGV turned into a diagnostic, in the same function this fix edits.**
+`int f(int x = {})` - an EMPTY brace list as a parameter default - left `defaultVal` null in the
+default-parameter wrapper and segfaulted the compiler (rc 139, zero output) for `int`, a struct and
+a pointer alike, on master and on the first cut of this branch. Per CLAUDE.md's debugging workflow
+(a diagnosed crash gets a proper error message), a null-`defaultVal` bail was added here; all three
+spellings now give rc 1 with a located diagnostic. This is containment only - the SEEDING root cause
+stays open in [[empty-brace-initializer-never-seeds-and-crashes-on-defaults]].
+
+**Left open, filed separately, NOT closed here** (both found by this fix's Phase A enumeration):
+[[empty-brace-initializer-never-seeds-and-crashes-on-defaults]] - the `T x = {};` spelling never
+seeds anything (`int x = {};` reads undef); the bare-brace spelling of the same construct seeds
+correctly, so the two gates ask different questions. Only its crash face is contained here. And
+[[string-literal-containing-braces-retyped-as-string]] - a literal whose CONTENT contains `{}` is
+typed `string` rather than `char*`; found only because a test label contained `= {}`. That one was
+filed as a false rejection and is worse than filed: `printf("a = {} b\n");` compiles rc 0, runs rc 0
+and prints binary garbage on BOTH binaries, and the dedicated `cannot pass 'string' to the variadic
+'...'` guard does not fire for it. Its file now records the miscompile face too.
+
+Also confirmed NOT reachable, with the measurement rather than an argument: `S* p; p = {a=1};`
+(assignment form) and `S** q = new S*{a=1};` are parse errors; a global pointer declaration in every
+brace spelling was already rejected by `fix/global-positional`; a struct FIELD default
+(`struct W { S* q = {a=1}; };`) silently discards the list and is the already-filed
+[[struct-field-default-brace-list-discarded]], a different path that never calls
+`EmitFieldInitializer`.
+
+Bar (measured on the round-2 commit, rebased onto master `7f41a15`): `./test.sh Release` 574 passed /
+0 failed / 8 skipped against master's own 572/0/8 - +2 for the one new errors file, which the suite
+runs cold and warm. The suite counts FILES, so dropping the two named-argument legs from that file
+does not move the number. `bash example_mac.sh Release` 35 passed / 0 failed, same as master.

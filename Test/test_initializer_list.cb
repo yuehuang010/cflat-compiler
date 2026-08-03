@@ -19,6 +19,16 @@ import "array.cb";
 import "dictionary.cb";
 import "test_helper.cb";
 
+// Seed struct for the pointer-array empty-brace leg below. Its leading field defaults to a
+// NON-ZERO value on purpose: that is the discriminator.
+struct PtrSeed { int a = 7; int b = 9; };
+
+// Brace-init bound to a POINTER PARAMETER at a call. This site is CORRECT and must stay working:
+// it builds its own struct temp and passes THAT address, never a pointer variable's own 8 bytes.
+struct PtrArg { int a = default; int b = default; };
+int ptrArgSum(PtrArg* p) { return p->a * 10 + p->b; }
+struct PtrArgHost { int use(PtrArg* p) { return p->a * 100 + p->b; } };
+
 extern int main()
 {
     int passed = 0;
@@ -156,6 +166,24 @@ extern int main()
     }
     list<string> afterArr = {"x", "y", "z"};   // alloc after array<string> destruct
     total++; passed += Test("post array<string> alloc ok", afterArr.count(), 3);
+
+    // ===== `T*[N] = {}` zero-init (regression: seed memcpy through POINTER slots) =====
+    // Empty braces on a fixed array of POINTERS took the struct seed path: one
+    // default-constructed PtrSeed was built and its first 8 bytes memcpy'd over every
+    // 8-byte pointer slot, so each element became an address made of the pointee's field
+    // defaults. Discriminator: PtrSeed.a defaults to 7, so pre-fix pa[0] was (PtrSeed*)0x7
+    // and only the zero-init path can make it null.
+    PtrSeed*[2] pa = {};
+    total++; passed += Test("ptr array empty brace elem0", (i64)pa[0], (i64)0);
+    total++; passed += Test("ptr array empty brace elem1", (i64)pa[1], (i64)0);
+
+    // ===== brace argument bound to a POINTER parameter (must NOT be rejected) =====
+    // Discriminator: both field values arrive intact through a real materialized temp, so 12
+    // and 304 are unreachable if the braces ever wrote into the pointer slot instead.
+    PtrArgHost pah = default;
+    total++; passed += Test("ptr param brace arg positional", ptrArgSum({a=1,b=2}), 12);
+    total++; passed += Test("ptr param brace arg named", ptrArgSum(p: {a=1,b=2}), 12);
+    total++; passed += Test("ptr param brace arg method", pah.use({a=3,b=4}), 304);
 
     if (passed == total)
     {

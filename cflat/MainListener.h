@@ -7828,6 +7828,13 @@ public:
                 }
                 else if (auto* initList = initCtx->initializerList())
                 {
+                    // A pointer-typed parameter default ('int f(S* p = {a=1})') allocas a POINTER
+                    // and field-inits through it, so the caller receives the field bytes as 'p'.
+                    if (params[i].Pointer)
+                        LogPointerBraceInitReject(initCtx,
+                            std::format("parameter default for '{}'", params[i].VariableName),
+                            params[i].TypeName);
+
                     // Field initializer default: build the struct, apply overrides, pass by value.
                     defaultVal = GenerateDefaultValue(params[i]);
                     if (defaultVal)
@@ -7838,6 +7845,14 @@ public:
                         defaultVal = compiler->CreateLoad(alloca);
                     }
                 }
+                // An unsupported default-initializer spelling (notably an empty '= {}') leaves
+                // defaultVal null, which the call below dereferences - diagnose instead of crashing.
+                if (!defaultVal)
+                    LogErrorContext(initCtx, std::format(
+                        "cannot build the default value for parameter '{}' of type '{}' - this default "
+                        "initializer form is not supported; use '= default' or an explicit expression",
+                        params[i].VariableName, params[i].TypeName));
+
                 LLVMBackend::NamedVariable namedVar;
                 namedVar.Primary = defaultVal;
                 namedVar.BaseType = defaultVal ? defaultVal->getType() : nullptr;
@@ -9018,7 +9033,8 @@ public:
                     {
                         EmitPositionalFixedArrayInit(name, typeAndValue, arrInitList, arraySize, line, allocList);
                     }
-                    else if (emptyArrInit && compiler->GetDataStructure(typeAndValue.TypeName).StructType == nullptr)
+                    else if (emptyArrInit && (typeAndValue.Pointer
+                             || compiler->GetDataStructure(typeAndValue.TypeName).StructType == nullptr))
                     {
                         // Empty `{}` on a primitive/pointer element type is zero-init,
                         // equivalent to `= default`. (Struct empty-{} still seeds below.)
@@ -9030,7 +9046,14 @@ public:
                     else
                     {
                         auto structData = compiler->GetDataStructure(typeAndValue.TypeName);
-                        if (structData.StructType == nullptr)
+                        if (typeAndValue.Pointer)
+                        {
+                            // 'S*[N] a = {field=v}' - the seed built below is an 'S', memcpy'd over
+                            // each POINTER slot, so the field values become the element addresses.
+                            LogPointerBraceInitReject(initDecl, std::format("array element of '{}'", name),
+                                typeAndValue.TypeName);
+                        }
+                        else if (structData.StructType == nullptr)
                         {
                             LogErrorContext(initDecl, std::format("array value-initializer '= {{}}' requires a struct element type, '{}' is not a struct", typeAndValue.TypeName));
                         }
@@ -10091,12 +10114,18 @@ public:
                                 // (a language feature, not this fix's job); reject rather than read
                                 // whatever 'right' happened to be seeded to. A POINTER-typed declaration
                                 // ('S* p {a=1};') does NOT reach this branch: TypeName is the pointee
-                                // ('S'), which IS a known struct, so it takes the 'else' below instead -
-                                // pre-existing, unaffected by this fix, not this branch's business.
+                                // ('S'), which IS a known struct, so it takes the pointer reject below.
                                 LogErrorContext(direct, std::format(
                                     "brace initializer with values is not supported on '{}' - '{}' is not "
                                     "a struct/union/class or a recognized container; assign it after declaration instead",
                                     name, typeAndValue.TypeName));
+                            }
+                            else if (typeAndValue.Pointer)
+                            {
+                                // 'alloc' is the POINTER VARIABLE's own 8 bytes, so both paths below
+                                // write through it. Fixed arrays / 'T[]' views 'continue' above, not here.
+                                LogPointerBraceInitReject(direct, std::format("declaration '{}'", name),
+                                    typeAndValue.TypeName, typeAndValue.IsUnique);
                             }
                             else if (!TryEmitContainerInitializer(alloc, typeAndValue, localInitList))
                                 EmitFieldInitializer(alloc, typeAndValue.TypeName, localInitList);
@@ -16830,6 +16859,29 @@ public:
         return true;
     }
 
+    /*
+     * A brace list whose DESTINATION is a pointer slot is memory-unsafe: EmitFieldInitializer
+     * GEPs the pointee struct out of those 8 bytes (writing field values into the pointer
+     * itself), and TryEmitContainerInitializer passes that same slot as the container's `this`.
+     * The four sites that can produce such a destination reject here. The fifth caller - the
+     * named-argument site - builds its own struct temp and is CORRECT; it does not call this.
+     * Note LogErrorContext throws, so this never returns on the compile path.
+     */
+    void LogPointerBraceInitReject(
+        antlr4::ParserRuleContext* ctx,
+        const std::string& what,
+        const std::string& typeName,
+        bool isUnique = false)
+    {
+        // Carry 'unique' into the remedy so the suggestion is still a legal declaration.
+        std::string qual = isUnique ? "unique " : "";
+        LogErrorContext(ctx, std::format(
+            "cannot apply a brace initializer to the POINTER {} - the braces would write into the "
+            "pointer itself, which holds an address and not a '{}'; allocate one first "
+            "('{}{}* p = new {}();') and assign through the pointer instead",
+            what, typeName, qual, typeName, typeName));
+    }
+
     void EmitFieldInitializer(
         llvm::Value* structPtr,
         const std::string& typeName,
@@ -17843,7 +17895,13 @@ public:
 
         // Apply field initializer: new Type { field=val, ... }
         if (auto* initList = ctx->initializerList())
+        {
+            // Reachable only when substitution made the element a pointer ('new T{...}' with
+            // T=S*): 'typedPtr' then addresses a POINTER slot, not an 'S'.
+            if (typeIsPtr)
+                LogPointerBraceInitReject(ctx, std::format("element of 'new {}*'", typeName), typeName);
             EmitFieldInitializer(typedPtr, typeName, initList);
+        }
 
         // [winrt] object: wire lpVtbl -> static vtable and set refcount = 1 after the ctor ran.
         bool isWinrtNew = !isArray && !typeIsPtr && compiler->IsWinrtClass(typeName);

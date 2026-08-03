@@ -1,0 +1,73 @@
+// A brace list whose target is a POINTER used to write through the POINTER VARIABLE's own
+// storage: EmitFieldInitializer GEPs the pointee struct out of the 8-byte pointer slot, so
+// `S* p = {a=1};` compiled and ran clean while leaving `p` holding the address 0x1. The four
+// sites that can hand a brace list a pointer target now reject it. Each leg below pins the ROLE
+// wording ("POINTER declaration" / "array element" / "parameter default" /
+// "element of 'new ...'") so it proves WHICH call site fired, not merely that something did.
+// The fifth EmitFieldInitializer caller - the named-argument site - was audited and found
+// CORRECT: it builds its OWN struct alloca and passes that, never the pointer's 8 bytes, so
+// `f({a=1})` on an `S*` parameter already materializes a real temp. It is not rejected.
+import "list.cb";
+
+struct PbiS { int a = default; int b = default; };
+
+struct PbiMk<T>
+{
+    int make() { alias T* q = new T{a=1}; return (int)(i64)(*q); }
+};
+
+// 'new T{...}' where substitution made T a pointer: the only spelling that reaches the 'new'
+// call site with a pointer target ('new S*{...}' is a parse error). The instantiation is
+// codegen'd where it is USED, so the use must sit inside the armed block - in main() it fires
+// after the block has closed.
+expect_error("POINTER element of 'new PbiS*'") {
+    int pbi_use() { PbiMk<PbiS*> m = default; return m.make(); }
+}
+
+// Parameter default: the wrapper allocas a POINTER and field-inits through it, so the caller
+// received the field bytes as the argument value (measured pre-fix: 1).
+expect_error("POINTER parameter default for 'p'") {
+    int pbi_def(PbiS* p = {a=1}) { return (int)(i64)p; }
+}
+
+extern int main()
+{
+    // Local scalar declarator, '=' spelling - the filed repro (pre-fix: p == 0x1).
+    expect_error("POINTER declaration 'p'") {
+        PbiS* p = {a=1};
+    }
+
+    // Bare-brace spelling of the same declaration, no '=' (pre-fix: p == 0x1).
+    expect_error("POINTER declaration 'p'") {
+        PbiS* p {a=1};
+    }
+
+    // Positional list on a pointer: pre-fix this reached EmitFieldInitializer's own
+    // "positional initializers are not supported for struct type" message, which describes a
+    // struct field-init failure rather than the pointer target the user actually wrote.
+    expect_error("POINTER declaration 'p'") {
+        PbiS* p = {1,2};
+    }
+
+    // 'unique' and nullable pointer spellings reach the same declarator arm.
+    expect_error("POINTER declaration 'u'") {
+        unique PbiS* u = {a=1};
+    }
+    expect_error("POINTER declaration 'n'") {
+        PbiS? n = {a=1};
+    }
+
+    // Fixed array of POINTERS: the seed is an 'S' memcpy'd over each 8-byte pointer slot,
+    // so the field values became the element addresses (pre-fix: arr[0] == 0x1).
+    expect_error("POINTER array element of 'arr'") {
+        PbiS*[2] arr = {a=1};
+    }
+
+    // Pointer to a CONTAINER: the container path passed the pointer's own slot as `this`,
+    // so add() ran on a null receiver - pre-fix this compiled and the program SIGSEGV'd.
+    expect_error("POINTER declaration 'lp'") {
+        list<int>* lp = {1,2};
+    }
+
+    return 0;
+}
