@@ -608,3 +608,176 @@ expect_error("no overload of 'rebindReject' matches the given arguments") {
         return rebindReject(w);
     }
 }
+
+// The residue of the leg above, one parameter type over. The `void*` gate was keyed on the
+// pointee NAME, so a refuted funcptr candidate simply rebound onto the next pointer-absorbing
+// sibling instead: a `Rec*` one took the code address and `r->a = 11` wrote through it (SIGBUS,
+// exit 138, no diagnostic), and an `int*` one was silent because the callee never dereferenced.
+// Under opaque pointers CompareUpconvert cannot tell a code pointer from a data pointer, so the
+// gate is now on the ARGUMENT being code and applies to every data-pointer parameter.
+//
+// Same construction rule as the legs above: TWO overloads of the SAME arity, so the arity filter
+// leaves both and the overload SCORER is what decides. Each pins the new per-candidate line,
+// which names the sibling that absorbed the value - the generic "no overload" header alone does
+// not distinguish this from the signature refutation that precedes it.
+
+expect_error("parameter 0 is a data type ('RecRb*') and the argument is a function-pointer") {
+    struct RecRb { int a = default; int b = default; };
+
+    double rebindStructOther(double x) { return x + 1000.0; }
+
+    int rebindStruct(function<int(int)> f) { return f(5); }
+    int rebindStruct(RecRb* r)             { r->a = 11; r->b = 22; return r->a + r->b; }
+
+    int passMismatchedIntoStructSibling()
+    {
+        function<double(double)> w = rebindStructOther;
+        return rebindStruct(w);
+    }
+}
+
+expect_error("parameter 0 is a data type ('int*') and the argument is a function-pointer") {
+    double rebindIntOther(double x) { return x + 1000.0; }
+
+    int rebindInt(function<int(int)> f) { return f(5); }
+    int rebindInt(int* p)               { return 888; }
+
+    int passMismatchedIntoIntSibling()
+    {
+        function<double(double)> w = rebindIntOther;
+        return rebindInt(w);
+    }
+}
+
+// `string` is not a pointer parameter, so it is reached by a different acceptance - the implicit
+// char* -> string coercion - and needs the same gate. It lowered to
+// `call %string @"_operator string_string_charPtr_"(ptr @_rebindStrOther_double_double_)`, i.e.
+// the callee's machine code read as a NUL-terminated buffer.
+expect_error("parameter 0 is a data type ('string') and the argument is a function-pointer") {
+    double rebindStrOther(double x) { return x + 1000.0; }
+
+    int rebindStr(function<int(int)> f) { return f(5); }
+    int rebindStr(string s)             { return 500 + (int)s.length(); }
+
+    int passMismatchedIntoStringSibling()
+    {
+        function<double(double)> w = rebindStrOther;
+        return rebindStr(w);
+    }
+}
+
+// The gate is NOT "the funcptr candidate lost": with no funcptr overload in the set at all, the
+// pointer parameter still must not absorb a code value. Discriminator: exactly one 'rebindOnly',
+// so the arity filter leaves a single candidate and the multi-candidate ranking never runs.
+expect_error("parameter 0 is a data type ('RecRo*') and the argument is a function-pointer") {
+    struct RecRo { int a = default; int b = default; };
+
+    double rebindOnlyOther(double x) { return x + 1000.0; }
+
+    int rebindOnly(RecRo* r) { r->a = 11; r->b = 22; return r->a + r->b; }
+
+    int passCodeIntoLoneDataPointer()
+    {
+        function<double(double)> w = rebindOnlyOther;
+        return rebindOnly(w);
+    }
+}
+
+// The VARIADIC arm of the same gate. A variadic candidate is taken as a fallback without any
+// per-argument scoring at all - `if (candidate.Variadic) { possibleResult = pair; continue; }` -
+// so neither this gate nor the `void*` one it was widened from ever ran for it, and
+// `lam(Rec*, ...)` absorbed the code address exactly as its non-variadic sibling used to (exit
+// 138, no diagnostic, on master AND on the first cut of this fix). Only the DECLARED parameters
+// are judged; the `...` tail keeps binding, which is what `printf("%p", fn)` needs.
+//
+// Discriminator: the absorbing candidate is `Variadic`, so it is refused in the variadic
+// short-circuit and never reaches the per-argument loop the legs above pin.
+
+expect_error("parameter 0 is a data type ('RecVa*') and the argument is a function-pointer") {
+    struct RecVa { int a = default; int b = default; };
+
+    double rebindVarOther(double x) { return x + 1000.0; }
+
+    int rebindVar(function<int(int)> f) { return f(5); }
+    int rebindVar(RecVa* r, ...)        { r->a = 11; r->b = 22; return r->a + r->b; }
+
+    int passMismatchedIntoVariadicSibling()
+    {
+        function<double(double)> w = rebindVarOther;
+        return rebindVar(w);
+    }
+}
+
+// The same with no funcptr overload in the set at all - a LONE variadic data-pointer candidate.
+expect_error("parameter 0 is a data type ('RecVo*') and the argument is a function-pointer") {
+    struct RecVo { int a = default; int b = default; };
+
+    double rebindVarOnlyOther(double x) { return x + 1000.0; }
+
+    int rebindVarOnly(RecVo* r, ...) { r->a = 11; r->b = 22; return r->a + r->b; }
+
+    int passCodeIntoLoneVariadicDataPointer()
+    {
+        function<double(double)> w = rebindVarOnlyOther;
+        return rebindVarOnly(w);
+    }
+}
+
+// The `void*` spelling of the same hole. It was NOT closed by the gate this file's `rebindReject`
+// leg pins - it printed 901 on master and on the first cut of this fix - so it is the oracle's own
+// variadic hole rather than a widening of it.
+expect_error("parameter 0 is a data type ('void*') and the argument is a function-pointer") {
+    double rebindVarVoidOther(double x) { return x + 1000.0; }
+
+    int rebindVarVoid(function<int(int)> f) { return f(5); }
+    int rebindVarVoid(void* p, ...)         { return 901; }
+
+    int passMismatchedIntoVariadicVoidSibling()
+    {
+        function<double(double)> w = rebindVarVoidOther;
+        return rebindVarVoid(w);
+    }
+}
+
+// A DECLARED SCALAR parameter of a variadic candidate. `ParameterStoresData` answers false for a
+// non-pointer scalar, so the variadic gate let the code address through into an i32 slot and the
+// failure surfaced as a raw LLVM verifier fatal - `Call parameter type does not match function
+// signature!`, `call i32 (i32, ...) @_lamScalarVar_i32_i32_(ptr %0)` - identical on 904f026 and on
+// the first cut of this fix. The variadic arm now asks whether the parameter ACCEPTS code rather
+// than whether it stores data, which subsumes the pointer/string question and adds this cell.
+//
+// Discriminator: the absorbing candidate is `Variadic`, and its parameter is not a pointer, so
+// neither the non-variadic scorer sites nor the pointer half of the gate can be what refused. The
+// non-variadic twin `lamScalarPlain(int n)` already rejected cleanly and is left alone; the pinned
+// wording is the non-pointer one, which no other leg in this file emits.
+expect_error("parameter 0 has type 'int' and the argument is a function-pointer or closure VALUE") {
+    double lamScalarVarOther(double x) { return x + 1000.0; }
+
+    int lamScalarVar(int n, ...) { return 700 + n; }
+
+    int passCodeIntoVariadicScalar()
+    {
+        function<double(double)> w = lamScalarVarOther;
+        return lamScalarVar(w);
+    }
+}
+
+// A FAT `Lambda<T>` value into a variadic data pointer. The variadic gate REFUSED this on the
+// first cut of the fix (904f026 compiles it and the callee writes through the fat pointer), but
+// the explanation loop required an empty-TypeName argument for every candidate - a requirement
+// that belongs to the two non-variadic scorer sites - so this cell was rejected with no line
+// naming the cause. The loop's shape requirement is now per-arm.
+//
+// Discriminator: `__closure_fat_ptr` is a NON-empty TypeName, the one shape the empty-TypeName
+// requirement excluded; every other reject leg in this file passes a thin `function<>` value.
+expect_error("parameter 0 is a data type ('RecFatVa*') and the argument is a function-pointer") {
+    struct RecFatVa { int a = default; int b = default; };
+
+    int lamFatVar(RecFatVa* r, ...) { r->a = 11; r->b = 22; return r->a + r->b; }
+
+    int passFatValueIntoVariadicDataPointer()
+    {
+        Lambda<double(double)> w = (double x) => { return x + 1.0; };
+        return lamFatVar(w);
+    }
+}

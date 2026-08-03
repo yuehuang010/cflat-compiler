@@ -141,5 +141,5 @@ The funcptr site is exercised by the generic reject leg at the end of
 `Test/errors/err_data_pointer_to_closure_param.cb`, which deliberately pins only
 `"function-pointer signature mismatch"` - the stable prefix - and not the mangled operands.
 
-Related: [[interface-issue-queue]], [[funcptr-refuted-candidate-rebinds-onto-pointer-sibling]],
+Related: [[interface-issue-queue]] (see the `fix/funcptr-rebind` landed record),
 [[generic-function-call-diagnostics-are-misleading]]

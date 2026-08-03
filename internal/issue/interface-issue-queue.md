@@ -118,7 +118,8 @@ than implied. `fix/funcptr-arg-accept-set` closes ONE of them outright
 place for what remains (width, signedness, pointee, aggregates - see the landed record below).
 That file went on to be narrowed twice more and was **fixed and deleted 2026-08-03** by
 `fix/funcptr-close`, leaving one residue,
-[[funcptr-refuted-candidate-rebinds-onto-pointer-sibling]] (P1).
+`funcptr-refuted-candidate-rebinds-onto-pointer-sibling` (P1) - itself fixed and deleted later the
+same day by `fix/funcptr-rebind` (landed record at the bottom).
 `funcptr-call-result-into-closure-param-garbage` (P1) is now fixed and deleted - see the landed
 record at the bottom. Still open unchanged:
 `data-pointer-returned-as-closure-not-gated`, `shape-mismatched-funcptr-arg-binds-silently` (P2).
@@ -257,9 +258,14 @@ verification said, so do not read this recount as a statement that they are all 
 
 Later the same day, `fix/funcptr-close` closed the last two items of
 `funcptr-overload-binding-ignores-signature` and that file was deleted, with one residue split out
-as [[funcptr-refuted-candidate-rebinds-onto-pointer-sibling]] (P1). **The bucket count is unchanged
+as `funcptr-refuted-candidate-rebinds-onto-pointer-sibling` (P1). **The bucket count was unchanged
 at 8 P1** - one file out, one file in - which is exactly the case a bare recount cannot
 distinguish from "nothing happened", so both integrity checks above were re-run and are clean.
+`fix/funcptr-rebind` then fixed and deleted that residue the same day. That change is
+count-neutral for P1: one file out, and
+[[code-value-into-data-pointer-outside-overload-resolution]] in, recorded rather
+than left implicit when that fix was scoped to argument binding. It also added
+`p2/c-binder-misses-decorated-function-pointer-parameter`, found while verifying its oracle.
 
 ### P1 - wrong programs and crashes (`p1/`)
 
@@ -267,7 +273,7 @@ distinguish from "nothing happened", so both integrity checks above were re-run 
 |---|---|
 | [[interface-boxing-keyed-on-source-binding]] | NARROWED 2026-07-31: the two binding erasures (parens, `??`) and the two un-routed boxing sites are closed. What remains is `delete` of a BORROWED interface box (exit 139/133, no diagnostic) - a different root, reachable with no join at all. |
 | null-interface-access residue - **FIXED 2026-08-03 in three stages**; design record at [`internal/plan/null-interface-access-widening.md`](../plan/null-interface-access-widening.md), remainder filed as [[null-interface-access-remaining-storage-kinds]] | Was SIGSEGV (139), no diagnostic. Stage 1 (`9e7ffc4`) re-keyed the proof on (frame-local alloca, constant index path), closing struct-field and array-element receivers - and `PHolder h;` / `h = {}`, which turned out to be provably null via the synthesized default ctor. Stage 3 (`727f53d`) made it cross-block with a **MUST** lattice (intersection, NOT `nulldf`'s union - see the plan's section 5; a MAY merge false-rejects accept leg 2) plus control-dependence containment, closing the four local spellings where intervening control flow dropped the diagnostic. Stage 2 closed whole-global receivers via a whole-module never-written fact AND the CD test - **neither alone is sound**, see probe e3. A field/element of a global aggregate was closed 2026-08-03 (new `ResolveIfaceStorageGlobal` walks a `GEPOperator` chain back to the `GlobalVariable` base). Still open and filed separately: a bare `PLive lv;` with no initializer (exit 133, a genuinely uninitialised read, not a null one). |
-| [[funcptr-refuted-candidate-rebinds-onto-pointer-sibling]] | SIGBUS (exit 138) with a struct-pointer sibling, silent `c=888` with an `int*` one. Split out of `funcptr-overload-binding-ignores-signature` on 2026-08-03 when `fix/funcptr-close` closed that file's last two items and deleted it. The `void*` half of the rebind is closed; ANY other pointee still absorbs a function-pointer VALUE that a refuted candidate handed back. Pre-existing, unchanged by that fix (the gate keys on `TypeName == "void"`). Widening it needs C interop and header-import paths measured first, and must not be read as closing the MIRROR leg (a raw data pointer into a `function<T>` slot). Do NOT approach it by turning the scorer's per-candidate `-1` into a hard error. |
+| [[code-value-into-data-pointer-outside-overload-resolution]] | Exit 138, no diagnostic, identical on `904f026` and on `fix/funcptr-rebind`. `Rec* r = w;`, `return w;` and a `b.p = w;` field store all put a function-pointer VALUE into a data pointer and write through it. Recorded by review round 1 of `fix/funcptr-rebind`, which closed the OVERLOAD-BINDING path of the same defect class (`ComputeOverloadFunction` plus its variadic short-circuit) and deliberately did not reach the store paths - the shared predicates `ArgumentIsCodeValue` / `ParameterStoresData` exist, what is missing is a destination-side reader. Build the accept set first; an explicit cast must keep working. |
 | [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. An interface-field-to-interface-field copy with the SAME field name on both sides is misread as a self-assign, suppressing the reject. **ATTEMPTED AND REVERTED 2026-08-01** - see the file for the three discriminators that cannot work (names, box storage, and a bare `Value` compare of the field address all fail at least one witness). A sound test needs real dataflow through the box to the underlying data pointer. |
 | [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. **NARROWED 2026-08-02** by `fix/uniq-array-elem`: root cause CONFIRMED by instrumentation (`FieldName`/`CallerName` name the CONTAINER, so `selfFieldAssign` swallowed a genuine two-owner store), and every element pair whose addresses are constant-provably different now rejects - local, generic-substituted, nested, array-as-field, through-pointer, view, and global arrays. BOTH copies of the name comparison were fixed; the second (`sameField`) also guards the reassignment-destruct, and fixing only the first traded an abort for a leak. Residue: any index not constant in the emitted IR - a runtime subscript, and a `const` integer (`const` is unenforced, so folding it would be unsound). |
 | [[unique-field-global-struct-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. `gA.slot = gB.slot` on two file-scope structs. **Mechanism CORRECTED 2026-08-02** (the first filing read optimized IR and blamed `destIsStructField`; at `--no-opt` that predicate is TRUE and the stack IS entered): a global-struct field read carries an EMPTY `CallerName`, so `selfFieldAssign` reads two different globals as one slot - the same failure as the interface receiver, through a third receiver kind. Renaming the fields apart rejects on both binaries. Closable by extending `ProvablyDifferentSlots` to distinct `GlobalVariable`/`AllocaInst` roots, which is sound but is a widening of a predicate every field store flows through - do it with its own sweep. |
@@ -2504,13 +2510,17 @@ DELIBERATELY NOT DONE, both recorded rather than left implicit:
 
 - **Variadic is untouched.** A variadic candidate is selected without inspecting the arguments at
   all, C passes function pointers through `...` too, and there is no measured repro. Blocking it is
-  a separate and much larger tightening.
+  a separate and much larger tightening. RETIRED 2026-08-03 by `fix/funcptr-rebind`: review round 1
+  produced the measured repro (`lam(Rec*, ...)`, exit 138) and it is memory-unsafe. The tightening
+  was neither separate nor large - it judges the DECLARED parameters only, so the `...` tail is
+  untouched and `printf("%p", fn)` still binds.
 - **A non-`void*` pointer sibling still absorbs a refuted candidate**, and that one is
   memory-unsafe: with an `int*` sibling it silently returns 888, with a `Rec*` sibling that writes
   through the parameter it is `exit 138`. Pre-existing and unchanged by this fix (the gate keys on
-  `TypeName == "void"`). Split out as [[funcptr-refuted-candidate-rebinds-onto-pointer-sibling]] at
+  `TypeName == "void"`). Split out as `funcptr-refuted-candidate-rebinds-onto-pointer-sibling` at
   P1 rather than folded into this change, because widening the gate to any pointee needs C interop
-  and header-import paths measured first.
+  and header-import paths measured first. CLOSED later the same day by `fix/funcptr-rebind`, which
+  measured both - see its landed record at the bottom.
 
 RATIFIED tightening: passing a `function<>`/`Lambda<>` VALUE to a `void*` parameter is now an
 error; write a cast. No test or core library in the corpus depended on it.
@@ -2685,3 +2695,152 @@ not supported" - the dropped dimension made `a[0]` a lane) and the reassign pair
 The six section-11 unsigned-splat legs discriminate against the assignment-only first cut of this
 same commit rather than against `904f026`. Both `err_simd_lane_write.cb` legs and the new `mk4` return leg were mutation-tested
 individually and each flips its file to rc 1.
+
+---
+
+## Landed: `fix/funcptr-rebind` (2026-08-03) - a code VALUE no longer converts to ANY data parameter
+
+Closes `funcptr-refuted-candidate-rebinds-onto-pointer-sibling` (P1), the last residue of the
+funcptr family's item 2, and DELETES the file. The `void*` gate landed by `fix/funcptr-close` was
+keyed on the pointee NAME (`candidateParamItr->TypeName == "void"`), so a candidate refuted on its
+signature simply rebound onto the next pointer sibling instead. The gate is now on the ARGUMENT
+being code and covers every data parameter the branch can reach.
+
+Two predicates, shared by every reader so they cannot drift (`cflat/LLVMBackend.h`):
+
+    bool ArgumentIsCodeValue(const NamedVariable& arg) const;   // shape 0 + function-pointerish
+    bool ParameterStoresData(const TypeAndValue& param) const;  // pointer or `string`, not code
+    bool ParameterAcceptsCodeValue(const TypeAndValue& p) const; // the argument side's code shapes
+
+Read at three sites - two in `ComputeOverloadFunction`'s empty-TypeName branch, one in the variadic
+short-circuit that precedes all per-argument scoring:
+
+- the `CompareUpconvert` acceptance now rejects for ANY `candidateParamItr->Pointer`, not just
+  `void`. The pointee is never itself a function-pointer type here: the funcptr arm above claims
+  every such parameter whenever the argument is code, which the "funcptr* sibling still binds"
+  probe (`scratch/fpr_p_funcptrptrsib.cb`, 913 on both binaries) confirms empirically.
+- the implicit `char*` -> `string` coercion, which is NOT a pointer parameter and so was reached by
+  a different acceptance entirely. Verified broken from `--no-opt` IR, not from a probe value:
+  `call %string @"_operator string_string_charPtr_"(ptr @_ro_double_double_)` - the callee's
+  machine code read as a NUL-terminated buffer.
+
+MEASURED, since the issue file required both before any widening:
+
+- **C interop is clean.** The C binder maps a recognized callback parameter to `__c_fn_ptr` (its
+  own arm) and an unrecognized one to `void*`; it never produces a non-`void` pointee for a
+  callback. Surveyed on macOS SDK headers: `qsort`, `bsearch`, `signal`, `pthread_create`,
+  `pthread_once`, `pthread_key_create`, `pthread_atfork` are all `__c_fn_ptr`. `qsort(..., cmpi)`
+  and `signal(2, onSig)` compile and run identically on both binaries.
+- **The mirror arm is untouched.** The funcptr parameter arm still accepts
+  `arg.BaseType->isPointerTy()`; `data-pointer-into-thin-function-param-segfaults` and
+  [[shape-mismatched-funcptr-arg-binds-silently]] are unaffected. A string LITERAL into a
+  `function<int(int)>` overload set is still `exit 138` on both binaries - that is the mirror leg,
+  not this one.
+
+THE ORACLE HAD TWO HOLES, and the first attempt to describe one of them was wrong in a way worth
+recording.
+
+**Hole 1 - VARIADIC, and the serious one.** `ComputeOverloadFunction` takes a variadic candidate as
+a fallback with NO per-argument scoring at all (`if (candidate.Variadic) { possibleResult = pair;
+continue; }`), so neither the `void*` gate nor its widening ever ran for one. `lam(Rec*, ...)`
+absorbed the code address exactly as the non-variadic sibling used to - exit 138, no diagnostic, on
+master AND on the first cut of this fix, so the widening alone did NOT close the P1 it was written
+for. `lam(void* p, ...)` printed 901 on both, so this was the oracle's own hole and the widening
+copied it. The gate is now repeated in the variadic short-circuit, over the DECLARED parameters
+only: an argument in the `...` tail has no parameter to disagree with, and C passes function
+pointers through `...` routinely. `printf("%p", fn)` is a value leg. This also retires the
+"Variadic is untouched - there is no measured repro" deferral recorded under `fix/funcptr-close`:
+there is a measured repro now, and it is memory-unsafe.
+
+The variadic arm asks a WIDER question than the two non-variadic sites, corrected by review round 2
+after its first cut asked the same one. `ParameterStoresData` answers false for a non-pointer
+scalar, so a code value into a DECLARED scalar of a variadic candidate - `lam(int n, ...)` - was
+unjudged and reached the LLVM verifier as a fatal `Call parameter type does not match function
+signature!` / `call i32 (i32, ...) @_lamS_i32_i32_(ptr %0)`, identical on `904f026` and on the
+first cut here. That arm now drops when `ArgumentIsCodeValue(arg) && !ParameterAcceptsCodeValue(p)`,
+which subsumes the pointer/`string` question and additionally judges scalars, so the repo rule that
+a diagnosed LLVM-level failure becomes a proper compiler error is satisfied. The NON-variadic sites
+are deliberately left on `ParameterStoresData`: the non-variadic twin `lam(int n)` already rejects
+cleanly with the standard no-overload error, so there is nothing there to close.
+
+`ParameterAcceptsCodeValue` must MIRROR the argument side's code-shape spellings, not be spelled
+from `IsEncodedClosureType` alone - review round 3's one confirmed finding. That helper is a map
+lookup of ENCODED closure names and does not contain the literal `__closure_fat_ptr`, which is
+exactly what a MONOMORPHIZED generic parameter carries (`ArgumentIsFunctionPointerish` lists the
+spelling explicitly; so does the reader at `LLVMBackend.h:12889`). Omitting it FALSE-REJECTED
+`int useT<T>(T v, ...)` called with a `Lambda<int(int)>`, with a self-refuting message - the dump
+printed `__closure_fat_ptr` for both the argument and the parameter. Measured: `65d9283` and the
+round-1 branch binary both exit 0 with `a=42 b=42`; round 2's first cut exited 1. The round-1 gate
+was harmless here only because `ParameterStoresData` also answered false for that TypeName, so
+widening the question is what exposed the gap. The complement of the predicate is therefore
+"pointer, string, or scalar", NOT "anything IsEncodedClosureType does not name".
+
+**Hole 2 - a false rejection, in the C binder.** `regConst(cb)` for a header-declared
+`int regConst(int (* const cb)(int));` is REJECTED on master and stays rejected here:
+`MapCTypeToTypeAndValueImpl` detects a function pointer by the literal `"(*)"` substring, clang
+spells that parameter `int (* const)(int)`, and the qualifier between `*` and `)` defeats the
+probe, so it binds as `void*`. Filed as `p2/c-binder-misses-decorated-function-pointer-parameter`;
+NOT fixed here, and the widening neither creates nor worsens it (an unparsed callback always lands
+on `void*`, which the pre-existing gate already refused).
+
+That P2 was first filed against `atexit(bye)` with `_Nonnull` named as the trigger, and **both were
+wrong**: `_Nonnull` keeps `(*)` intact and binds correctly, and the `atexit(void* func)` candidate
+that rejects that call is `cflat/core/cruntime.cb:584`, a hand-written prototype, not a binder
+mis-parse. Two supporting measurements in that first filing were also false. The corrected file
+records the withdrawals; the lesson is the one already in `internal/fix-issue-lessons.md` about
+measuring per spelling instead of inferring, applied here to WHICH DECLARATION a candidate came
+from - `--symbol` names the defining file and settles it in one command.
+
+Diagnostics: the no-match dump printed two indistinguishable `ptr`s for this family, so a second
+per-candidate line now names the absorbing sibling - "parameter 0 is a data type ('Rec*') and the
+argument is a function-pointer or closure VALUE - code does not convert to a data pointer." The
+new reject legs pin that line rather than the generic header, so they cannot pass on the
+signature refutation that precedes it.
+
+Two corrections to that loop from review round 2. Its condition is now PER-ARM, because the gate's
+question is: the two non-variadic sites judge only an argument in their own empty-TypeName shape,
+the variadic gate calls `ArgumentIsCodeValue` unconditionally, and applying the non-variadic shape
+requirement to every candidate meant a fat `Lambda<T>` value into `lam(Rec*, ...)` - correctly
+REJECTED by the variadic gate - got no explanation line at all. And the wording is per-SHAPE: the
+"is a data type" sentence is false at the scalar cell the widened variadic arm also judges, so a
+non-pointer parameter gets "parameter 0 has type 'int' and the argument is a function-pointer or
+closure VALUE - code does not convert to a non-pointer type." A rejection's diagnostic has to be
+true of the site it fires at.
+
+DELIBERATELY NOT DONE, recorded rather than left implicit: the same code-value-into-data-pointer
+conversion at DECLARATION-INIT (`Rec* r = w;`), at `return`, and at a field store is unfixed and
+memory-unsafe (exit 138, no diagnostic, identical on both binaries). Filed as
+`p1/code-value-into-data-pointer-outside-overload-resolution`. The scorer is one funnel with a
+measured accept set; the store paths are several sites, and a rejection there is exactly the shape
+that has repeatedly false-rejected working code here - it needs its own accept set built first.
+
+`Test/errors/err_data_pointer_to_closure_param.cb` gained nine reject legs: struct-pointer
+sibling, `int*` sibling, `string` sibling, a LONE data-pointer candidate with no funcptr overload
+in the set at all (the proof the gate is not "the funcptr candidate lost"), the three variadic
+shapes (sibling, lone, and the `void*` spelling that the previous gate never covered), plus the two
+from round 2 - a code value into a variadic candidate's DECLARED SCALAR (`lam(int n, ...)`, an LLVM
+verifier fatal on `904f026` and on round 1), and a fat `Lambda<T>` value into `lam(Rec*, ...)`,
+which round 1 rejected with no explanation line. Each was mutation-tested in isolation. The round-2
+pair discriminates against the ROUND-1 branch binary, not only against `904f026`: reverting the
+variadic gate flips the scalar leg, reverting the diagnostic loop's per-arm condition flips the fat
+leg, and neither reversion flips the other.
+`Test/test_function_ptr.cb` gained fourteen must-still-bind value legs - the three `void*` shapes
+repeated against a struct-pointer sibling, the matching-signature half for both new siblings, the
+two `string` coercions, and five variadic ones (data pointer into the declared param, a matching
+signature into a variadic funcptr param, and all three `...` tail argument shapes: a NAMED
+function, a `function<>` VALUE, and a FAT `Lambda<T>` value, since the tail is what a gate applied
+to the whole argument list would break) - all with identical values on both binaries, and each
+mutation-checked to confirm it can go red. The round-2 tail pair was measured on the round-1 branch
+binary and on the main checkout's `65d9283` Release binary: both compile and return 923 on both,
+so they are ACCEPT-side freezes, not discriminators. The round-3 pair - a generic VARIADIC and its
+non-variadic twin, each taking a fat `Lambda<>` and forwarding it to a `Lambda<>` callee - returns
+42 on `65d9283` and on the round-1 binary and is a real DISCRIMINATOR against round 2's first cut,
+which failed to compile the whole file.
+
+An A/B `--check` sweep over 546 `.cb` files under `Test/`, `example/`, `cflat/core/`,
+`performance/` and `vscode-extension/` differs on exactly one file, the new reject test. Seven
+core files first read as differences and were CACHE artifacts (`--init-local` state, not the
+change): with `CFLAT_CACHE_DIR` equalized all seven agree.
+
+Bar: macOS arm64 Release `./test.sh` 576 passed / 0 failed / 8 skipped, `example_mac.sh`
+35 passed / 0 failed.

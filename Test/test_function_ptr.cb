@@ -2031,6 +2031,34 @@ int  sigBoxI64(double d)                          { return 700 + (int)d; }
 int rebindProbe(function<int(int)> f) { return f(5); }
 int rebindProbe(void* p)              { return 999; }
 
+// The same accept set one parameter type over. The gate above was keyed on the pointee NAME, so a
+// refuted candidate rebound onto any OTHER pointer sibling instead; it is now on the ARGUMENT
+// being code and covers every data-pointer parameter, including the non-pointer `string` one
+// reached through the implicit char* -> string coercion. Widening a rejection breaks its accept
+// set first, so each shape that must KEEP binding a data parameter is a leg below.
+struct RebindRec { int a = default; int b = default; };
+int rebindRecProbe(function<int(int)> f) { return f(5); }
+int rebindRecProbe(RebindRec* r)         { return 909; }
+int rebindStrProbe(function<int(int)> f) { return f(5); }
+int rebindStrProbe(string s)             { return 500 + (int)s.length(); }
+
+// A VARIADIC candidate is taken as a fallback with no per-argument scoring, so the gate had to be
+// repeated in that short-circuit. Only the DECLARED parameters are judged there - an argument in
+// the `...` tail has no parameter to disagree with, and C passes function pointers through `...`
+// routinely. These are the shapes that must keep binding; the reject legs are in
+// Test/errors/err_data_pointer_to_closure_param.cb.
+int rebindVarProbe(RebindRec* r, ...)          { return 920 + r->a; }
+int rebindVarFn(function<int(int)> f, ...)     { return 100 + f(5); }
+
+// A MONOMORPHIZED generic parameter carries the LITERAL `__closure_fat_ptr` TypeName, which is not
+// in IsEncodedClosureType's map, so a parameter-side predicate spelled only from that map
+// false-rejects a generic variadic taking a closure - with a self-refuting message, since the dump
+// prints `__closure_fat_ptr` for both the argument and the parameter. The value is forwarded to a
+// `Lambda<>` callee so the leg proves the closure arrives intact rather than merely binding.
+int rebindGenApply(Lambda<int(int)> f) { return f(41); }
+int rebindGenVar<T>(T v, ...)          { return rebindGenApply(v); }
+int rebindGenPlain<T>(T v)             { return rebindGenApply(v); }
+
 // Two slots that differ ONLY in how many '*' a signature component carries. They must be two
 // distinct overloads, and each must select the arm whose depth matches.
 void depthWriteOne(int* p)   { *p = 1; }
@@ -2160,6 +2188,45 @@ bool testFuncPtrArgProvenanceAccepts()
     function<int(int)>[2] rebindArr = default;
     rebindArr[0] = add10FnPtr;
     result &= Test("array of funcptrs binds void*", rebindProbe(rebindArr), 999);
+
+    // The same three shapes against a STRUCT-pointer sibling, plus the matching-signature half.
+    // 909 is reachable only through the `RebindRec*` arm and 15 only through the funcptr arm, so
+    // a gate that widens from "the argument is code" to "the parameter is a pointer" fails here.
+    result &= Test("matching signature beats the struct sibling", rebindRecProbe(thin), 15);
+    RebindRec rebindRecData = default;
+    result &= Test("data pointer still binds the struct sibling", rebindRecProbe(&rebindRecData), 909);
+    result &= Test("address of a funcptr slot binds struct sibling", rebindRecProbe(&rebindSlot), 909);
+    result &= Test("array of funcptrs binds struct sibling", rebindRecProbe(rebindArr), 909);
+
+    // A `string` parameter is not a pointer, so it is reached by the char* -> string coercion.
+    // Both halves: a real char buffer still coerces, and a matching signature still wins.
+    char[8] rebindBuf = default;
+    rebindBuf[0] = 'x'; rebindBuf[1] = 'y'; rebindBuf[2] = (char)0;
+    result &= Test("char* still coerces to the string sibling", rebindStrProbe(&rebindBuf[0]), 502);
+    string rebindStrVal = "hello";
+    result &= Test("string value still binds the string sibling", rebindStrProbe(rebindStrVal), 505);
+    result &= Test("matching signature beats the string sibling", rebindStrProbe(thin), 15);
+
+    // The variadic accept set. 923 is reachable only through the declared `RebindRec*`, and the
+    // tail leg passes a function pointer through `...` - the shape a gate applied to the whole
+    // argument list instead of the declared prefix breaks first.
+    rebindRecData.a = 3;
+    result &= Test("data pointer still binds a variadic data param", rebindVarProbe(&rebindRecData), 923);
+    result &= Test("funcptr through the ... tail still binds", rebindVarProbe(&rebindRecData, add10FnPtr), 923);
+    // The tail's other two argument shapes. The leg above passes a NAMED function; a `function<>`
+    // VALUE and a FAT `Lambda<T>` value are what the variadic gate actually inspects, and both
+    // already compile and return 923 on a pre-fix binary - so widening that gate to judge the
+    // whole argument list, or to judge a scalar in the tail, breaks these first.
+    result &= Test("funcptr VALUE through the ... tail still binds", rebindVarProbe(&rebindRecData, thin), 923);
+    Lambda<int(int)> rebindFatTail = (int x) => { return x + 1; };
+    result &= Test("fat closure through the ... tail still binds", rebindVarProbe(&rebindRecData, rebindFatTail), 923);
+
+    // The generic-variadic closure shape. Only the variadic spelling crosses the gate; the twin is
+    // the control that the shape works without it. 42 is reachable only if the closure survives.
+    Lambda<int(int)> rebindGenClosure = (int x) => { return x + 1; };
+    result &= Test("generic variadic takes a fat closure", rebindGenVar(rebindGenClosure), 42);
+    result &= Test("generic non-variadic takes a fat closure", rebindGenPlain(rebindGenClosure), 42);
+    result &= Test("matching signature binds a variadic funcptr param", rebindVarFn(thin), 115);
 
     return result;
 }

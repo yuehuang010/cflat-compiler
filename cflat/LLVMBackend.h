@@ -17901,6 +17901,38 @@ public:
             || (arg.Primary && llvm::isa<llvm::Function>(arg.Primary));
     }
 
+    /*
+     * Is this ARGUMENT a code value - a function pointer or closure in its plain VALUE shape? The
+     * shape check is load-bearing: a `function<T>*` is the ADDRESS of a slot and a `function<T>[N]`
+     * decays to one, and both are real DATA pointers that must keep converting.
+     */
+    bool ArgumentIsCodeValue(const NamedVariable& arg) const
+    {
+        return FunctionPointerShapeOf(arg.TypeAndValue, &arg) == 0 && ArgumentIsFunctionPointerish(arg);
+    }
+
+    // Does this PARAMETER store data rather than code? `string` counts: it is not a pointer but is
+    // reached by the implicit char* -> string coercion, which lowers a code address the same way.
+    bool ParameterStoresData(const TypeAndValue& param) const
+    {
+        if (param.IsFunctionPointer || IsEncodedClosureType(param.TypeName)) return false;
+        return param.Pointer || param.TypeName == "string";
+    }
+
+    /*
+     * Does this PARAMETER accept a code value at all? The list mirrors the code-shape spellings
+     * ArgumentIsFunctionPointerish accepts on the argument side, including the literal
+     * `__closure_fat_ptr` a MONOMORPHIZED generic parameter carries - IsEncodedClosureType is a
+     * map lookup of encoded names and does not contain it. Everything not listed here - pointer,
+     * string, scalar - is a slot a function pointer or closure must not be poured into.
+     */
+    bool ParameterAcceptsCodeValue(const TypeAndValue& param) const
+    {
+        return param.IsFunctionPointer
+            || param.TypeName == "__closure_fat_ptr"
+            || IsEncodedClosureType(param.TypeName);
+    }
+
     std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> candidates) const
     {
         std::pair<std::vector<NamedVariable>, FunctionSymbol> possibleResult;
@@ -17917,6 +17949,31 @@ public:
 
             if (candidate.Variadic)
             {
+                /*
+                 * A variadic candidate is taken without per-argument scoring, so the code-value
+                 * gate below never runs for it and `lam(Rec*, ...)` absorbed a function pointer
+                 * exactly as the non-variadic sibling used to. Only the DECLARED parameters are
+                 * judged: an argument in the `...` tail has no parameter to disagree with, and C
+                 * passes function pointers through `...` routinely (`printf("%p", fn)`).
+                 *
+                 * Wider than the non-variadic sites: those judge only pointer/string parameters,
+                 * and a DECLARED scalar here (`lam(int n, ...)`) absorbed the code address into an
+                 * i32 slot and reached the LLVM verifier as a fatal "Call parameter type does not
+                 * match function signature!". The non-variadic twin `lam(int n)` already rejects
+                 * cleanly, so only this arm needs the wider question.
+                 */
+                bool codeIntoDataParam = false;
+                auto varParamItr = candidate.Parameters.begin();
+                for (const auto& arg : arguments)
+                {
+                    if (varParamItr == candidate.Parameters.end()) break;
+                    if (ArgumentIsCodeValue(arg) && !ParameterAcceptsCodeValue(*varParamItr))
+                        codeIntoDataParam = true;
+                    ++varParamItr;
+                }
+                if (codeIntoDataParam)
+                    continue;
+
                 // Variadic is a fallback: prefer any exact non-variadic match over it.
                 // Reset the score so a later non-variadic candidate always overrides it.
                 possibleResult = pair;
@@ -18047,21 +18104,23 @@ public:
                     result = CompareUpconvert(arg.BaseType, candidateParam);
 
                     /*
-                     * A function pointer or closure VALUE does not implicitly convert to `void*` -
-                     * it is code, not data, and ISO C has no function-to-object-pointer conversion
-                     * either. Without this a candidate refuted on its SIGNATURE silently rebound
-                     * onto a `void*` sibling. This branch is where such a value arrives: the
-                     * call-argument loop copies its signature but deliberately leaves TypeName
-                     * empty, and opaque pointers then make CompareUpconvert accept it.
+                     * A function pointer or closure VALUE does not implicitly convert to a DATA
+                     * pointer of any pointee - it is code, not data, and ISO C has no
+                     * function-to-object-pointer conversion either. Without this a candidate
+                     * refuted on its SIGNATURE silently rebound onto a pointer-absorbing sibling.
+                     * This branch is where such a value arrives: the call-argument loop copies its
+                     * signature but deliberately leaves TypeName empty, and opaque pointers then
+                     * make CompareUpconvert accept it against any pointer parameter alike.
                      *
                      * Only the plain-VALUE shape is refused, decided by the same helper the funcptr
                      * arm uses: a `function<T>*` is the ADDRESS of a slot and a `function<T>[N]`
                      * decays to one, and both are plain data pointers that must keep converting.
                      */
-                    if (result >= 0 && candidateParamItr->Pointer
-                        && candidateParamItr->TypeName == "void"
-                        && FunctionPointerShapeOf(arg.TypeAndValue, &arg) == 0
-                        && ArgumentIsFunctionPointerish(arg))
+                    bool argIsCodeValue = ArgumentIsCodeValue(arg);
+
+                    // The pointee is never itself a function-pointer type here: the funcptr arm
+                    // above claims every such parameter whenever the argument is code.
+                    if (result >= 0 && candidateParamItr->Pointer && argIsCodeValue)
                         result = -1;
 
                     // Opaque pointers make every pointer pair look identical to CompareUpconvert.
@@ -18088,8 +18147,10 @@ public:
                         }
                     }
                     // Implicit char* -> string coercion: string literal or char* passed to a string param.
+                    // A code value is refused here for the same reason as the pointer gate above -
+                    // it lowered to `operator string(char*)` reading the callee's machine code.
                     if (result < 0 && candidateParamItr->TypeName == "string" && !candidateParamItr->Pointer
-                        && arg.BaseType && arg.BaseType->isPointerTy())
+                        && arg.BaseType && arg.BaseType->isPointerTy() && !argIsCodeValue)
                         result = 1;
                 }
 
@@ -18612,6 +18673,44 @@ public:
                     std::string why = DescribeFuncPtrSignatureMismatch(arguments[i].TypeAndValue, *pi);
                     if (why.empty()) continue;
                     msg += std::format("  [{}] {}\n", c.UniqueName, why);
+                    break;
+                }
+            }
+
+            /*
+             * Same service for the parameters a refuted funcptr candidate used to rebind onto:
+             * opaque pointers make the dump above print two indistinguishable `ptr`s. Conditioned to
+             * fire ONLY where the code-value gate is what refused, and the gate's question differs
+             * per arm, so this condition is per-arm too. The NON-VARIADIC sites judge only an
+             * argument in their own empty-TypeName shape (without that it misdirects: an arity
+             * mismatch or a `__closure_fat_ptr` argument, which the non-empty-TypeName branch
+             * rejects and where no such gate exists, would claim the line) and only a data
+             * parameter. The VARIADIC gate calls ArgumentIsCodeValue unconditionally against every
+             * declared parameter, so both requirements are dropped for a variadic candidate - a fat
+             * `Lambda<T>` value into `lam(Rec*, ...)` is refused there and otherwise got no line.
+             */
+            for (const auto& c : candidates)
+            {
+                bool arityFits = c.Variadic ? arguments.size() >= c.Parameters.size()
+                                            : arguments.size() == c.Parameters.size();
+                if (!arityFits) continue;
+                auto pi = c.Parameters.begin();
+                for (size_t i = 0; i < arguments.size() && pi != c.Parameters.end(); i++, ++pi)
+                {
+                    if (!c.Variadic && !arguments[i].TypeAndValue.TypeName.empty()) continue;
+                    if (!ArgumentIsCodeValue(arguments[i])) continue;
+                    bool refused = c.Variadic ? !ParameterAcceptsCodeValue(*pi) : ParameterStoresData(*pi);
+                    if (!refused) continue;
+                    // Per-shape wording: "data type" is false at the scalar cell the variadic arm
+                    // also judges, and a rejection's message must be true where it fires.
+                    if (ParameterStoresData(*pi))
+                        msg += std::format("  [{}] parameter {} is a data type ('{}{}') and the argument is "
+                            "a function-pointer or closure VALUE - code does not convert to a data "
+                            "pointer.\n", c.UniqueName, i, pi->TypeName, pi->Pointer ? "*" : "");
+                    else
+                        msg += std::format("  [{}] parameter {} has type '{}' and the argument is a "
+                            "function-pointer or closure VALUE - code does not convert to a "
+                            "non-pointer type.\n", c.UniqueName, i, pi->TypeName);
                     break;
                 }
             }
