@@ -56,8 +56,9 @@ landed design record below. And `interface-field-self-assign-false-positive` was
 REVERTED - see its file for the three discriminators that cannot work.
 ## Resume point
 
-**Current head: the P1 campaign.** macOS arm64 Release **554 / 0 / 8** plus `example_mac.sh`
-**35 / 0**. Six P1s fixed on 2026-07-31 (`99d73f3`, `696060d`, `8c29ca7`, `d65f000`, `4000fa1`,
+**Current head: the P1 campaign.** macOS arm64 Release **576 / 0 / 8** plus `example_mac.sh`
+**35 / 0** and `test_lsp.sh` **152 / 0** (re-measured 2026-08-03; the 554 this line carried was
+stale by 22 tests). Six P1s fixed on 2026-07-31 (`99d73f3`, `696060d`, `8c29ca7`, `d65f000`, `4000fa1`,
 `4097959`) and two more on 2026-08-01 (`funcptr-call-result-into-closure-param-garbage`,
 `unique-field-to-field-copy-double-frees`); the design records are at the bottom. **P1 is being
 cleared before P2 starts** - that includes `iface-ifconst-base-clause-implementor`, so the
@@ -74,14 +75,29 @@ parked `fix/iface-ifconst` branch stays parked.
   filed as `null-interface-access-residue-unproven-receivers`.
 - `ftell-fseek-long-width-on-windows` - FIXED on a Windows host 2026-08-02 and deleted; see the
   landed design record below. The >2 GB half it deferred is now `p2/file-offsets-capped-at-2gb`.
+- `llvm-cannot-select-sign-extend-on-const-array-index` - FIXED and deleted 2026-08-03 by
+  `b7181e6` (verified an ancestor of HEAD). All four spellings the file listed as live now reject
+  with a clean front-end diagnostic and exit 1, where they previously died at SIGSEGV 139 with no
+  output - including the two the file recorded as SILENTLY MISCOMPILING (`%s` whole-row read and a
+  runtime index), which are now caught upstream at the row assign. **Carry this forward:** the
+  BACKEND node was never diagnosed. Only the front-end shapes that feed it are closed, so a new way
+  to store a folded `ConstantExpr` into fixed-array storage could reach it again. That is the
+  standing rule from CLAUDE.md - an LLVM-level failure gets a front-end `LogError`, and the axes
+  (decl-init, assignment, compound assignment, parameter, return, field) get ENUMERATED before
+  anyone writes "no live repro".
+- `generic-type-alias-arg-not-resolved` - FIXED 2026-08-02 and deleted; see the landed design
+  record below (fix/alias-mangling). The pure-rename alias set is now pre-registered ahead of BOTH
+  passes, which is the part a future session must not undo.
 
 Next P1s, and the sequencing that matters:
 
-- `auto-binding-of-fixed-array-loses-shape` and `fixed-array-copy-invalid-bitcast` are both
-  array-shape and would collide if run concurrently. IN FLIGHT on `fix/array-shape`. Two
-  language decisions were settled going in: `auto x = <fixed array>` deduces the VIEW `T[]`
-  (a borrow - `auto` introduces no storage), and `int[3] b = a;` IS a copy lowered as a memcpy
-  (the declared type allocates its own storage, so it cannot alias).
+- ~~`auto-binding-of-fixed-array-loses-shape` and `fixed-array-copy-invalid-bitcast`~~ - LANDED.
+  `fix/array-shape` shipped: `fixed-array-copy-invalid-bitcast` is fixed and its file deleted, and
+  `auto-binding-of-fixed-array-loses-shape` was narrowed and RE-RANKED P1 -> P2 (it now sits in the
+  P2 table, not here). The two language decisions settled going in are ratified and still binding:
+  `auto x = <fixed array>` deduces the VIEW `T[]` (a borrow - `auto` introduces no storage), and
+  `int[3] b = a;` IS a copy lowered as a memcpy (the declared type allocates its own storage, so it
+  cannot alias). Stale-bullet corrected 2026-08-03.
 - `interface-boxing-keyed-on-source-binding` and `return-dangle-missed-when-slot-has-extra-user`
   are the next group. (`interface-type-alias-not-resolved-in-is-as-target`, formerly grouped
   here, is fixed on `fix/iface-alias` - not yet merged to master.)
@@ -97,6 +113,9 @@ than implied. `fix/funcptr-arg-accept-set` closes ONE of them outright
 (`data-pointer-into-thin-function-param-segfaults`, deleted) and NARROWS a second:
 `funcptr-overload-binding-ignores-signature` is closed for the type-CLASS axis and rewritten in
 place for what remains (width, signedness, pointee, aggregates - see the landed record below).
+That file went on to be narrowed twice more and was **fixed and deleted 2026-08-03** by
+`fix/funcptr-close`, leaving one residue,
+[[funcptr-refuted-candidate-rebinds-onto-pointer-sibling]] (P1).
 `funcptr-call-result-into-closure-param-garbage` (P1) is now fixed and deleted - see the landed
 record at the bottom. Still open unchanged:
 `data-pointer-returned-as-closure-not-gated`, `shape-mismatched-funcptr-arg-binds-silently` (P2).
@@ -170,8 +189,8 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 10 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 38 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 8 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 40 |
 | **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 27 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
@@ -209,10 +228,35 @@ recorded before (see the 2026-08-01 paragraph above).
 A further review round of the same fix filed a FIFTH: `pointer-decl-field-init-brace-corrupts-pointer-storage`
 (P1 - `S* p {a=1};` writes a nonsense address into `p` itself). **FIXED and deleted 2026-08-02** by
 `fix/ptr-fieldinit`; see the landed design record below. That fix in turn filed two more from its own
-Phase A enumeration - [[empty-brace-initializer-never-seeds-and-crashes-on-defaults]] (P1) and
-[[string-literal-containing-braces-retyped-as-string]] (P2) - which is the same pattern again. Current
-true count: **9 P1 / 39 P2 / 27 P3 / 7 UI = 82 total** (`ftell-fseek-long-width-on-windows` fixed
-2026-08-02; its >2 GB half re-filed as [[file-offsets-capped-at-2gb]] at P2).
+Phase A enumeration - `empty-brace-initializer-never-seeds-and-crashes-on-defaults` (P1, since
+**FIXED and deleted** by `fix/emptybrace` / `b844137`; see the landed design record below) and
+[[string-literal-containing-braces-retyped-as-string]] (P2) - which is the same pattern again.
+(`ftell-fseek-long-width-on-windows` fixed 2026-08-02; its >2 GB half re-filed as
+[[file-offsets-capped-at-2gb]] at P2.)
+
+Counts re-verified from disk on 2026-08-03: **8 P1 / 40 P2 / 27 P3 / 7 UI = 82 total.** The bucket
+table above read 10/38/27/7 before this recount and is now corrected. Two integrity checks were run
+alongside the count, and BOTH should be re-run whenever this table is touched, because the count
+alone does not catch either failure:
+
+- **Every table row resolves to a file** - no row naming a deleted issue. (Clean.)
+- **Every file has a table row.** This one FAILED: `file-offsets-capped-at-2gb` had been filed in
+  the narrative above and never given a P2 row, so it was invisible in the priority list for a day.
+  Row added 2026-08-03. A file with no row is the failure mode this section had no guard against -
+  a bare `ls | wc -l` recount would have counted it and still left it unlisted.
+
+Net movement this round: **one P1 fixed and deleted** (`llvm-cannot-select-sign-extend-on-const-array-index`,
+by `b7181e6`), and no new issues filed. The remaining 8 P1s were each re-run against the current
+Release binary on 2026-08-03 and every one still reproduces exactly as its file documents - including
+`neigh=2333` on `funcptr-overload-binding-ignores-signature`, unchanged since the funcptr rounds.
+The P2/P3/UI buckets were NOT re-triaged this round; their rows carry whatever their last
+verification said, so do not read this recount as a statement that they are all still live.
+
+Later the same day, `fix/funcptr-close` closed the last two items of
+`funcptr-overload-binding-ignores-signature` and that file was deleted, with one residue split out
+as [[funcptr-refuted-candidate-rebinds-onto-pointer-sibling]] (P1). **The bucket count is unchanged
+at 8 P1** - one file out, one file in - which is exactly the case a bare recount cannot
+distinguish from "nothing happened", so both integrity checks above were re-run and are clean.
 
 ### P1 - wrong programs and crashes (`p1/`)
 
@@ -220,8 +264,7 @@ true count: **9 P1 / 39 P2 / 27 P3 / 7 UI = 82 total** (`ftell-fseek-long-width-
 |---|---|
 | [[interface-boxing-keyed-on-source-binding]] | NARROWED 2026-07-31: the two binding erasures (parens, `??`) and the two un-routed boxing sites are closed. What remains is `delete` of a BORROWED interface box (exit 139/133, no diagnostic) - a different root, reachable with no join at all. |
 | [[null-interface-access-residue-unproven-receivers]] | SIGSEGV (139), no diagnostic. NARROWED 2026-08-02 by `78c678b`: the PARENTHESIZED field access `(lv).tag` is CLOSED (all paren depths, plus the write form `(lv).tag = 5`). What remains is struct-field / array-element / global receivers. The `?.`, branch-, loop-, parameter- and folded-`if const` shapes are DELIBERATELY accepted per the ratified design and are NOT residue. |
-| [[funcptr-overload-binding-ignores-signature]] | NARROWED 2026-07-31 by `fix/funcptr-arg-accept-set`: the type-CLASS axis is closed on both paths (the filed `double`-into-`int` repro now errors). Still open, silent and identical on master: floating-point WIDTH (same SHAPE as the closed repro), integer width/signedness, POINTEE type (memory-unsafe - reads past the end of the object), and aggregates. Do NOT re-close by widening the comparison to spellings; see the file. |
-| [[llvm-cannot-select-sign-extend-on-const-array-index]] | Compiler crash. **CORRECTED 2026-08-02**: the `Cannot select` / exit-134 TEXT is NOT reproducible on `ca5a02a` - what reproduces is a bare SIGSEGV, exit 139, no output, and only when a CONSTANT-index element read follows the row assign (a `%s` whole-row read or a runtime index miscompiles silently instead). The decl-init, whole-array-assign and ROW-assign shapes that fed it are all rejected now; the backend node itself is still undiagnosed. |
+| [[funcptr-refuted-candidate-rebinds-onto-pointer-sibling]] | SIGBUS (exit 138) with a struct-pointer sibling, silent `c=888` with an `int*` one. Split out of `funcptr-overload-binding-ignores-signature` on 2026-08-03 when `fix/funcptr-close` closed that file's last two items and deleted it. The `void*` half of the rebind is closed; ANY other pointee still absorbs a function-pointer VALUE that a refuted candidate handed back. Pre-existing, unchanged by that fix (the gate keys on `TypeName == "void"`). Widening it needs C interop and header-import paths measured first, and must not be read as closing the MIRROR leg (a raw data pointer into a `function<T>` slot). Do NOT approach it by turning the scorer's per-candidate `-1` into a hard error. |
 | [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. An interface-field-to-interface-field copy with the SAME field name on both sides is misread as a self-assign, suppressing the reject. **ATTEMPTED AND REVERTED 2026-08-01** - see the file for the three discriminators that cannot work (names, box storage, and a bare `Value` compare of the field address all fail at least one witness). A sound test needs real dataflow through the box to the underlying data pointer. |
 | [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. **NARROWED 2026-08-02** by `fix/uniq-array-elem`: root cause CONFIRMED by instrumentation (`FieldName`/`CallerName` name the CONTAINER, so `selfFieldAssign` swallowed a genuine two-owner store), and every element pair whose addresses are constant-provably different now rejects - local, generic-substituted, nested, array-as-field, through-pointer, view, and global arrays. BOTH copies of the name comparison were fixed; the second (`sameField`) also guards the reassignment-destruct, and fixing only the first traded an abort for a leak. Residue: any index not constant in the emitted IR - a runtime subscript, and a `const` integer (`const` is unenforced, so folding it would be unsound). |
 | [[unique-field-global-struct-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. `gA.slot = gB.slot` on two file-scope structs. **Mechanism CORRECTED 2026-08-02** (the first filing read optimized IR and blamed `destIsStructField`; at `--no-opt` that predicate is TRUE and the stack IS entered): a global-struct field read carries an EMPTY `CallerName`, so `selfFieldAssign` reads two different globals as one slot - the same failure as the interface receiver, through a third receiver kind. Renaming the fields apart rejects on both binaries. Closable by extending `ProvablyDifferentSlots` to distinct `GlobalVariable`/`AllocaInst` roots, which is sound but is a widening of a predicate every field store flows through - do it with its own sweep. |
@@ -267,9 +310,10 @@ true count: **9 P1 / 39 P2 / 27 P3 / 7 UI = 82 total** (`ftell-fseek-long-width-
 | [[deref-of-moved-pointer-guard-inside-callee]] | ownership | False positive: guarded only by a conditionally-terminating callee. |
 | [[owning-temp-ledgers-should-be-split]] | ownership | `ownedReturnTemps_` fails UNSAFE, `ownedNewTemps_` fails SAFE. |
 | [[detection-ledgers-not-discarded-on-aborted-arm]] | ownership | Detection-only ledgers survive an aborted `?:` arm. |
-| [[class-no-ctor-default-construct-returns-undef]] | miscompile | A `class` with no user-written constructor default-constructs to IR `undef`, not zero - the synthesized zero-arg constructor's body never stores anything before returning. The `struct` twin (same fields, no constructor) is correct (real zero-init). Found while reviewing `[[global-struct-positional-init-silently-zeroes]]`'s fix; unrelated root cause. Filed 2026-08-02. |
+| [[class-no-ctor-default-construct-returns-undef]] | miscompile | A `class` with no user-written constructor default-constructs to IR `undef`, not zero - the synthesized zero-arg constructor's body never stores anything before returning. The `struct` twin (same fields, no constructor) is correct (real zero-init). Found while reviewing the fix for `global-struct-positional-init-silently-zeroes` (FIXED and deleted - see the `fix/global-positional` landed record below); unrelated root cause. Filed 2026-08-02. |
 | [[struct-field-default-brace-list-discarded]] | miscompile | A struct FIELD's own `= { x = 1, y = 2 }` default brace list is silently discarded when the containing struct is default-constructed - the field lands all-zero instead. Found auditing the same fix for neighbouring shapes; different code path (a field's default expression, not a variable declarator). Filed 2026-08-02. |
-| [[interface-typed-global-brace-init-discarded]] | miscompile | `I gi = { a = 1 };` on an interface-typed global compiles clean with the brace list silently dropped, no diagnostic. The `[[global-struct-positional-init-silently-zeroes]]` fix's guard cannot see it - `GetDataStructure("I").StructType` is null for an interface name, so this falls through unguarded. Found by review of that fix. Filed 2026-08-02. |
+| [[interface-typed-global-brace-init-discarded]] | miscompile | `I gi = { a = 1 };` on an interface-typed global compiles clean with the brace list silently dropped, no diagnostic. The `fix/global-positional` guard (that P1 is fixed and deleted; see its landed record below) cannot see it - `GetDataStructure("I").StructType` is null for an interface name, so this falls through unguarded. Found by review of that fix. Filed 2026-08-02. |
+| [[file-offsets-capped-at-2gb]] | silent wrong value | `core/filesystem.cb` narrows every offset through `int`, so `File.size()`/`tell()`/`seek()` truncate past 2 GB on ALL platforms - the public surface is `int` too, so widening the internals alone is not enough. Split out of `ftell-fseek-long-width-on-windows` when that P1 landed 2026-08-02; NOT the `long`-width defect, which is fixed. Had no row in this table until 2026-08-03 - it was filed in narrative only. |
 | [[string-literal-containing-braces-retyped-as-string]] | miscompile + false rejection | A string literal whose CONTENT contains a brace pair (`"a = {} b"`) is typed `string` instead of `char*`. At a call it stops every `char*` overload matching and the diagnostic blames the call; at a VARIADIC it is a SILENT MISCOMPILE - `printf("a = {} b\n");` compiles and runs rc 0 printing binary garbage, and the dedicated `cannot pass 'string' to the variadic '...'` guard does not fire. Identical on both binaries. Filed 2026-08-02 in `p2/` for the rejection face; the miscompile face may warrant P1. |
 
 ### P3 - diagnostics, latent, deliberate deferrals (`p3/`)
@@ -280,7 +324,7 @@ true count: **9 P1 / 39 P2 / 27 P3 / 7 UI = 82 total** (`ftell-fseek-long-width-
 | [[return-dangle-missed-when-slot-has-extra-user]] | deliberate deferral | RECLASSIFIED P1 -> P3 2026-08-02 by the maintainer, rationale kept intact. Missed dangle, no diagnostic - but the shapes were ALL accepted before `2bcc5a0` too, so this is residue, not a regression, and its own file rules out the obvious remedy (widening the extra-user whitelist re-introduces false rejections). Stays open as a record of what the pass cannot see. |
 | [[nullcond-guard-skips-move-argument-cleanup]] | latent | INTRODUCED by the `null-conditional-args-eval-order` fix, and accepted rather than fixed. A `move` argument to a '?.' call on a NULL receiver never runs, so nothing takes ownership - but the source is still statically marked moved, so scope exit frees nothing either, and the allocation leaks (`frees=0` vs master's `frees=1`). Not memory-unsafe and not observable in-language; reading the source after the call is rejected identically on both binaries. Filed 2026-07-31. |
 | [[null-conditional-args-eval-order-hresult]] | latent | Residual of the fixed P1 `null-conditional-args-eval-order`. On an `HResult<T*>` receiver '?.' means "propagate the failure code", and its `chain.ok`/`chain.fail` lowering still runs after the argument list is evaluated - so a failed HResult skips the call but not its arguments' side effects. COM/winrt only, therefore Windows only; not reachable from any in-repo `.cb` on macOS. Narrowed 2026-07-31. |
-| [[mangled-generic-name-leaks-into-diagnostics]] | diagnostic | `Box__unique_Itemptr` shown where the user wrote `Box<unique Item*>`. Also a TEST-FRAGILITY problem: pinning an `expect_error` to a mangled name pins it to the mangling scheme. **Prefer prefix-pinning until fixed.** No demangler exists and `MangleTypeArg` is lossy one-way, so the fix is to STORE the source spelling. Filed 2026-07-31. |
+| [[mangled-generic-name-leaks-into-diagnostics]] | diagnostic | `Box__unique_Itemptr` shown where the user wrote `Box<unique Item*>`. Also a TEST-FRAGILITY problem: pinning an `expect_error` to a mangled name pins it to the mangling scheme. **Prefer prefix-pinning until fixed.** No demangler exists and `MangleTypeArg` is lossy one-way, so the fix is to STORE the source spelling. Filed 2026-07-31. **BROADENED 2026-08-02**: a second site (function-pointer signature mismatch prints `'void(Box__i32*)'` vs `'void(Box__double*)'`, plus internal `__c_fn_ptr` tokens), and the predicted test-fragility FIRED - two unrelated `expect_error` legs broke when `MangleTypeArg` changed. Fix now needs a mangled-key -> spelling registry, not just a `StructData` field. |
 | [[function-pointer-to-fixed-array-not-rejected]] | diagnostic | `function<T>[N]*` silently accepted while `int[N]*` is correctly rejected - the funcptr branch breaks before the `ArrayPtrOf` check. Two-line fix in BOTH `ParseDeclarationSpecifiers` copies; fold into whatever next touches that branch. Filed 2026-07-31. |
 | [[sizeof-of-sized-array-type-parsed-as-cast]] | diagnostic | `sizeof(T[N])` is parsed as a cast and rejected with a message about CASTS - blaming a construct the user never wrote. Not multi-dim specific (`sizeof(int[3])` fails too); `sizeof(variable)` works. Filed 2026-07-31. |
 | [[funcptr-fixed-array-vs-view-overloads-collide]] | diagnostic | Silent overload loss, no diagnostic: `function<T>[N]` and `function<T>[]` overloads of the same name collide onto one mangled key and one shape, so the last-registered overload silently wins. Low severity - the two spellings are arguably the same parameter type. Filed 2026-07-31. |
@@ -302,7 +346,7 @@ true count: **9 P1 / 39 P2 / 27 P3 / 7 UI = 82 total** (`ftell-fseek-long-width-
 | [[nondeterministic-ir-switch-case-order]] | methodology | No miscompile - a METHODOLOGY hazard. Read it before using "0 IR diffs" as proof. |
 | [[iface-namespace-follow-ups]] | follow-up | Items 2-6 of the round-1 review of `c9acb6c`. Item 1 is RESOLVED (`853cb87`); items 4 and 5 were fixed by `15809e0`. Item 5's remainder (annotation/template key split) is reachable only on the Windows `[uuid]` / `[winrt]` path. |
 | [[iface-ifconst-blame-attempt-shelved]] | shelved | READ BEFORE attempting the `if const` blame diagnostic again. A serious attempt shelved after eight review rounds / nine defects. |
-| [[global-struct-no-initializer-ignores-field-defaults]] | miscompile | A global struct with NO initializer at all zeroes instead of honoring its fields' own `= default` expressions (`struct S { int a = 9; }; S gs;` reads `0`, not `9`). The LOCAL declarator handles this correctly (calls the default constructor). Lower severity than the sibling P1/P2 findings in this family because a working spelling exists. Found while reviewing `[[global-struct-positional-init-silently-zeroes]]`'s fix. Filed 2026-08-02. |
+| [[global-struct-no-initializer-ignores-field-defaults]] | miscompile | A global struct with NO initializer at all zeroes instead of honoring its fields' own `= default` expressions (`struct S { int a = 9; }; S gs;` reads `0`, not `9`). The LOCAL declarator handles this correctly (calls the default constructor). Lower severity than the sibling P1/P2 findings in this family because a working spelling exists. Found while reviewing the fix for `global-struct-positional-init-silently-zeroes` (FIXED and deleted - see the `fix/global-positional` landed record below). Filed 2026-08-02. |
 
 ### UI and Win32 (`ui/`)
 
@@ -398,8 +442,80 @@ which a future session must not "fix" back without reopening the decision.
 | Brace-list initializer on a global (or bare-brace local) struct/union/class/container rejected instead of silently discarded (RATIFIED) | fix/global-positional (branch, not yet merged) |
 | Brace initializer on a POINTER target rejected at FOUR of the five `EmitFieldInitializer` call sites; the named-argument site audited and left alone because it is CORRECT (RATIFIED) | fix/ptr-fieldinit (branch, not yet merged) |
 | Empty `{}` split by TARGET TYPE - seeds a non-pointer in both spellings, REJECTED on a pointer in every spelling as AMBIGUOUS between null and a pointer-to-empty. Supersedes `fix/ptr-fieldinit`'s `S*[N] a = {}` zero-init row (RATIFIED) | fix/emptybrace (branch, not yet merged) |
+| Overload identity canonicalized (`f(int)`/`f(i32)` are ONE overload); duplicate definitions diagnosed; function-pointer POINTER DEPTH carried; NAMED functions proved at the argument and declaration sites (RATIFIED) | 2026-08-02, uncommitted |
+| A pure-rename `using` alias folded at MONOMORPHIZATION, so `list<MyInt>` and `list<int>` are ONE instantiation; the alias set pre-registered ahead of BOTH passes (RATIFIED) | fix/alias-mangling, uncommitted |
 
 Suite trajectory across the whole sequence: 522 -> 530 -> 536 -> 538 -> 540.
+
+### 2026-08-02 - one TYPE IDENTITY for overloads, and the four sites a funcptr signature is read from
+
+Follows Stage -1 of `internal/plan/funcptr-type-mangling.md`, which folded `int`->`i32` at
+MONOMORPHIZATION. That left the compiler holding two different answers to "are these the same
+type?", and this round made them one. Four fixes, measured before and after:
+
+| Repro | Before | After |
+|---|---|---|
+| `f(int)` and `f(i32)` overloads | both compiled; `f(1)`=201 but an `i32` variable reached the `int` body | one overload, then a redefinition error |
+| `int f(int)` written TWICE | compiled, ran the first body | redefinition error |
+| `function<void(int**)>` into a `void(int*)` slot | **SIGSEGV** | rejected, naming `void(int**)` vs `void(int*)` |
+| `slot(fDbl)`, a NAMED `double(double)` into an `int(int)` slot | **101** - wrong body, exit 0 | 202, the right slot |
+| `function<int(int)> g = dd;` with `double dd(double)` | `s2=5`, wrong body | rejected |
+| `void(C2*)` bound to a `void(S2*)` slot | out-of-bounds read, exit 0 | rejected |
+
+**RATIFIED: `int` and `i32` are ONE overload, so a program declaring both stops compiling.** That
+is the point - before, both were emitted and argument selection between them was scrambled. The
+canon lives in ONE place (`CanonicalPrimitiveSpelling`, moved to `LLVMBackend.h`) and both type
+identities funnel through it: `MangleTypeArg` for instantiation, `ToUniqueString` for overload
+symbols. Symbol names moved; nothing else did.
+
+**The plan predicted "a canonical name makes it a redefinition error". That was wrong** - there
+was no duplicate detection at all. `CreateFunctionDefinition` had *deliberately* skipped a second
+body with only a `[verbose]` line since long before any of this. A canonical name only routes the
+two spellings to that same silent skip; the diagnostic is a separate mechanism.
+
+**The duplicate diagnostic discriminates on the source LINE, and deliberately not on the file.**
+`currentSourceFilePath_` is not stable across the LSP re-analysis path: a bulk sweep attached
+`cocoa.cb`'s `setMenuHandler` twice under two different path values, and comparing files reported
+the single definition as a redefinition of itself. Two different files holding the same overload at
+the same line therefore go unreported - silence is the safe direction, being what the compiler did
+before. Line 0 (compiler-generated: lambdas, trampolines, thread shims) never reports.
+
+**Pointer depth had to land in the SAME change as the duplicate diagnostic, not after it.** They
+look independent and are not: without depth, `f(function<void(int*)>)` and `f(function<void(int**)>)`
+mangle to one symbol, so the new diagnostic reported two GENUINE overloads as a redefinition. A
+fix that is safe alone can be unsafe in either order - check what a new diagnostic makes newly
+reachable.
+
+**`PointerDepth == 0` means NOT RECORDED, never "not a pointer".** Only the source-parse sites can
+count `Star()`; C interop, WinRT and synthesized signatures leave it 0 and must keep binding. Same
+one-sidedness as `Known`.
+
+**The four sites.** A function-pointer signature is read from four different places, and closing
+one proves nothing about the others:
+
+1. `ArgumentProvablyMismatchesParameter` and 2. `ComputeOverloadFunction` - argument paths, reading
+   `arg.TypeAndValue`.
+3. `GetFunctionForFuncPtr` - the declaration/assignment site, reading the destination.
+4. `ToUniqueString` - the overload NAME.
+
+The issue file had asserted "do not re-close it on the strength of an ARGUMENT repro, those are all
+fixed." **False.** Every recorded argument repro used a `function<>` VALUE; a bare function NAME
+carries no signature on its own `TypeAndValue`, so sites 1 and 2 saw an empty
+`FuncPtrReturnTypeName`, returned "no proof", and skipped the comparison entirely. Do not trust a
+"this path is closed" claim that names a path rather than a site.
+
+**RATIFIED, and the near-miss worth remembering: the bind site uses a DIFFERENT arity rule from the
+argument sites.** A callback taking FEWER parameters than the slot supplies binds legally at a
+declaration - the synthesized `onStdout` field is `void(char*, int)` while `doc/LANGUAGE.md:2552`
+documents the one-parameter form, and `Test/test_program.cb` binds a `void(char*)` to it (under
+cdecl the caller cleans up, so the unread argument is ignored). The first attempt reused the
+argument path's strict-arity rule and broke that test. The mirror direction - a callee reading a
+parameter the slot never supplies - stays proof, as do component types across the shared prefix.
+`DescribeFuncPtrBindMismatch` IS the rule: the candidate filter asks it rather than duplicating it,
+so the verdict and the message cannot drift apart. **Do not unify the two arity rules.**
+
+Residual 3 (`neigh=2333`, the namespace-intersecting overrun) re-measured unchanged, confirming
+none of this disturbed that axis. Suite 576 / 0 / 8, examples 35 / 0, LSP 152 / 0.
 
 ### `3d33bfe` - temp-source `unique` field stores, and the implied-move guard in THREE copies
 
@@ -631,8 +747,9 @@ classes are coarse ON PURPOSE, so a mismatch WITHIN a class is still invisible -
 WIDTH (`float` into a `double` slot, the same SHAPE as the closed repro), integer width and
 signedness, POINTEE type (memory-unsafe: reads past the end of the object), and aggregates. All
 silent, all identical on master, none of them regressions. See
-[[funcptr-overload-binding-ignores-signature]], which carries the repros and the fix direction -
-including the explicit instruction NOT to retry a widened SPELLING comparison.
+the `fix/funcptr-sig` and `fix/funcptr-close` records below, which absorbed that issue file's
+repros and constraints when it was closed and deleted on 2026-08-03 - including the explicit
+instruction NOT to retry a widened SPELLING comparison.
 
 Left alone by that pass and fixed separately since: a `function<>` returned BY VALUE from a call
 into a fat `Lambda<>` parameter yielded garbage on the DIRECT path. See the
@@ -2262,3 +2379,138 @@ Three things worth carrying forward:
   [[file-offsets-capped-at-2gb]] at P2, which also carries the `extern i32 strlen` note.
 
 Bar: `test.bat Release` all passed, `example.bat Release` 90 passed / 0 failed / 27 skipped.
+
+### fix/alias-mangling - a pure-rename `using` alias folded at MONOMORPHIZATION (RATIFIED)
+
+Closes `p2/generic-type-alias-arg-not-resolved` (deleted). `using MyInt = int;` then `list<MyInt>`
+now binds a `list<int>*` parameter, and `Lambda<int(MyInt)>` encodes `__fatfn_1_3_i32_3_i32` - one
+instantiation, as C++ gives a `typedef`. The alias was already resolved in every ordinary type
+position; only the paths that mangle from raw source text saw it as an opaque token.
+
+`MangleTypeArg` (`cflat/MainListener.h`) took a REQUIRED leading `const LLVMBackend*` - no default
+value, so the C++ compiler flagged all 15 call sites and each was handled deliberately. All 15
+reach a compiler; none passes `nullptr`. `BuildEncodedClosureName` threads the same pointer through
+to reach the closure encoder (3 call sites). The fold runs BEFORE `CanonicalPrimitiveSpelling`, so
+`MyInt` -> `int` -> `i32`, and chases an alias chain with an 8-hop guard.
+
+Three things worth carrying forward:
+
+- **The alias set is pre-registered, not accumulated.** This is the both-pass hazard, and it is
+  real: `ScanGenericTypeUses` mangles every generic use in a file BEFORE `ScanExternalDeclaration`
+  reaches the first `using`, while codegen sees the alias already registered - so a walk-populated
+  map builds a shell under `list__MyInt` and looks it up as `list__i32`.
+  `ForwardRefScanner::PreRegisterRenameAliases` sweeps file-scope `using` declarations at all three
+  scanner drivers before either pass starts, into a DEDICATED map (`manglingAliases_`) that nothing
+  else writes. `typeAliases` is deliberately NOT consulted by the mangler: it fills in
+  progressively and at different points in the two passes, and it also holds generic aliases
+  (`using IL = list<int>;` -> `list__i32`) whose targets look like bare names and would reintroduce
+  the same split.
+- **`if const` arms and function bodies are deliberately not swept.** `core/os.posix.cb` binds
+  `win_size` to `i64` in one arm and `i32` in the other; a naive whole-tree sweep takes the last
+  one and would fold a generic argument to the WRONG width. Those aliases stay opaque to the
+  mangler, which is what both passes did before.
+- **The new map is in the `--init` round-trip** (`mangling_aliases`, next to `type_aliases`). A
+  warm cache never re-scans the core `.cb` files, so without it `list<win_int>` would mangle
+  `list__i32` cold and `list__win_int` warm. Verified both ways.
+
+Constraint kept: PURE RENAMES only. A target is folded only when it is a bare (possibly dotted)
+identifier - `using Handle = void*;` and `using Vec3 = float[3];` store their suffix in the alias
+string and are unfolded at `GetType`/`ParseDeclarationSpecifiers`, so folding them here would
+double the mangler's own suffix walk. The measured `list<Handle>` baseline ("unknown function
+'_data'" at `list.cb(212,54)`) is unchanged.
+
+RATIFIED tightening: a program declaring both `f(list<MyInt>)` and `f(list<int>)` now collides as a
+redefinition. One of them was silently unreachable. Measured on a repro; no test in the corpus hit
+it.
+
+Two ordering limits confirmed PRE-EXISTING and left alone (both reproduce without generics):
+`NS.MyInt` never resolves - a `using` inside a namespace registers unqualified - and a chain
+written out of order (`using A2 = A1;` above `using A1 = int;`) leaves `A2` unregistered in
+`typeAliases`, because the scan declines an alias whose target is not yet a known type. The mangler
+handled both correctly; the failure is downstream in `typeAliases`.
+
+Regression legs added to `testGnCanonicalPrimitiveTypeArg` in `Test/test_generics.cb`: alias binds
+`list<int>`, alias binds a function written BEFORE the `using`, alias-of-alias chain (list and
+`CanonBox`), struct alias, and the closure-encoder form.
+
+Bar: macOS arm64 Release `./test.sh` 576 passed / 0 failed / 8 skipped, `example_mac.sh` 35 passed
+/ 0 failed, `test_lsp.sh` 152 passed / 0 failed. No test expectation was changed - the anticipated
+`expect_error`-on-old-mangled-name fallout did not materialize.
+
+### fix/funcptr-close - the last two funcptr-signature items, and the residue split out (RATIFIED)
+
+Closes `p1/funcptr-overload-binding-ignores-signature` (deleted after four narrowings). The two
+items it had left both diagnose now instead of running:
+
+- Item 3, `runGlobal(NS.touchNs)` through a bare-`Pt` slot: was `neigh=2333` exit 0, a 12-byte
+  write into a 4-byte element clobbering two neighbours. Now "no overload of 'runGlobal' matches
+  the given arguments"; the value-spelled form adds "parameter takes 'void(Pt*)' but the argument
+  is 'void(NS.Pt*)'".
+- Item 2, a candidate refuted on its signature rebinding onto a `void*` sibling: was `rb=999`
+  exit 0. Now "no overload of 'lam' matches", with the per-candidate mechanism line.
+
+**Item 3 is NOT a mangling change, and the deleted file's fix direction was wrong to say it was.**
+That file called for qualified keys in `FuncPtrParam.TypeName` and scheduled it as Stage 2. But
+that string feeds `BuildEncodedClosureName`, and the two passes must produce byte-identical
+encoded names or a struct shell is built under one name and looked up under another. The resolved
+key went into SEPARATE fields instead - `FuncPtrParam::ResolvedTypeKey` and
+`TypeAndValue::FuncPtrReturnResolvedKey` - and no mangled name moved. `""` means NOT RECORDED, the
+same convention `PointerDepth == 0` already uses one line above.
+
+Three things worth carrying forward:
+
+- **Narrowing is MEMBERSHIP-ONLY.** `FuncPtrComponentOf` collapses the candidate set to the
+  recorded key only when the ABI-canon form of that key is ALREADY in the set. So a stale or wrong
+  key can only collapse an ambiguity the compiler itself resolved; it can never invent a rejection.
+  The ABI-canon hop is kept inside the narrowing, or `Box<int>` vs `Box<i32>` starts false-rejecting
+  again - the regression that parked the previous branch for three review rounds.
+- **Inside a namespace, a bare spelling the walk could NOT qualify records nothing.**
+  `SigComponentResolvedKey` records only when `ResolveTypeArgBaseName` qualified the name, when the
+  spelling was already dotted, or at global scope where a bare name is unambiguous. Recording the
+  bare form inside a namespace would be a false rejection whenever the namespaced type is not
+  registered yet; recording nothing just falls back to today's broad set.
+- **The SCANNER copy is the load-bearing one, and the plan that said "codegen sites only" was
+  wrong.** Filling only the three `MainListener` sites was a no-op for the repro: a call site reads
+  the parameter signature the **ForwardRefScanner** registered into the function table, not the
+  main pass's. Instrumentation caught it - the key arrived as `""`. Both copies are filled, which
+  is what CLAUDE.md's both-pass rule required anyway. New fields are in the `--init` round-trip
+  (`fprk` / `rk`), verified warm.
+
+For item 2 the gate is on the ARGUMENT being code, not on the parameter being `void*`:
+`ArgumentIsFunctionPointerish` is one predicate shared by the funcptr overload arm and the `void*`
+leg so the two cannot drift, and it fires only at `FunctionPointerShapeOf(...) == 0`. **That shape
+check is load-bearing.** A first cut keyed on "the argument carries function evidence" and rejected
+`function<T>*` and `function<T>[N]` into a `void*` parameter - the ADDRESS of a slot and an array
+of slots are plain DATA pointers, and both are programs master compiles and runs. Three value legs
+pin them.
+
+The accepting site was not where the deleted file implied, either. A `function<>` VALUE reaches
+`ComputeOverloadFunction` with an EMPTY `TypeName` - the call-argument loop copies the signature
+fields but leaves `TypeName`/`IsFunctionPointer` alone - so it never touched the
+"any pointer converts to void*" leg at all; it fell to `CompareUpconvert`, which under opaque
+pointers sees two identical `ptr`s. The gate is in that branch. `ArgumentIsFunctionPointerish` has
+to accept a recorded SIGNATURE as evidence for the same reason.
+
+DELIBERATELY NOT DONE, both recorded rather than left implicit:
+
+- **Variadic is untouched.** A variadic candidate is selected without inspecting the arguments at
+  all, C passes function pointers through `...` too, and there is no measured repro. Blocking it is
+  a separate and much larger tightening.
+- **A non-`void*` pointer sibling still absorbs a refuted candidate**, and that one is
+  memory-unsafe: with an `int*` sibling it silently returns 888, with a `Rec*` sibling that writes
+  through the parameter it is `exit 138`. Pre-existing and unchanged by this fix (the gate keys on
+  `TypeName == "void"`). Split out as [[funcptr-refuted-candidate-rebinds-onto-pointer-sibling]] at
+  P1 rather than folded into this change, because widening the gate to any pointee needs C interop
+  and header-import paths measured first.
+
+RATIFIED tightening: passing a `function<>`/`Lambda<>` VALUE to a `void*` parameter is now an
+error; write a cast. No test or core library in the corpus depended on it.
+
+`Test/test_function_ptr.cb` lost the leg that PINNED item 2 (`rebindProbe(wrongSig) == 999`) and
+its "RECORDED GAP" comment block - the only assertion whose answer changed - and gained the three
+must-keep-binding shapes. `Test/errors/err_data_pointer_to_closure_param.cb` gained the two reject
+legs, each built as two same-arity overloads so the overload SCORER is the deciding path, and both
+verified non-vacuous against a binary built from `a32e55e`.
+
+Bar: macOS arm64 Release `./test.sh` 576 passed / 0 failed / 8 skipped cold and warm,
+`example_mac.sh` 35 passed / 0 failed, `test_lsp.sh` 152 passed / 0 failed.

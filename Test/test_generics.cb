@@ -3924,6 +3924,107 @@ bool testGnNsGfCtrlStructMethodBodyScope()
     return result;
 }
 
+// =============================================================
+// Canonical primitive spellings in a type argument
+// `int` and `i32` are ONE type, so they must monomorphize to ONE instantiation. They used to
+// produce two LLVM types of identical layout that did not interconvert. Signedness and the
+// target-native widths are deliberately NOT folded - the control legs below pin that, since
+// over-folding would silently merge two genuinely different instantiations.
+// =============================================================
+
+struct CanonBox<T> { T v = default; };
+
+int canonTakesInt(CanonBox<int> b)   { return b.v; }
+int canonTakesShort(CanonBox<short> b) { return (int)b.v; }
+int canonSumList(list<int> xs)
+{
+    int total = 0;
+    for (int i = 0; i < xs.count(); i++) total += xs[i];
+    return total;
+}
+
+// Controls: each pair must stay TWO distinct instantiations, so both overloads are selectable.
+int canonWhichSign(CanonBox<i32> b) { return 1; }
+int canonWhichSign(CanonBox<u32> b) { return 2; }
+int canonWhichLong(CanonBox<i64> b) { return 3; }
+int canonWhichLong(CanonBox<long> b) { return 4; }
+
+// A pure-rename `using` alias is transparent the way a C typedef is, so it must NOT monomorphize
+// as its own type: list<CanonAliasInt> and list<int> are one instantiation. Written FIRST, before
+// the `using` below, on purpose - the forward-ref scan mangles every generic use in the file
+// before it reaches the first `using`, so this leg pins the two passes to one mangled name.
+int canonAliasUsedBeforeUsing(list<CanonAliasInt>* p) { return (int)p->count(); }
+
+using CanonAliasInt  = int;
+using CanonAliasInt2 = CanonAliasInt;   // alias-of-alias: must still reach i32
+struct CanonAliasS { int v = default; };
+using CanonAliasS2 = CanonAliasS;       // alias of a struct, not a primitive
+
+int canonAliasTakesIntList(list<int>* p)          { return (int)p->count(); }
+int canonAliasTakesStructList(list<CanonAliasS>* p) { return (int)p->count(); }
+int canonAliasTakesBox(CanonBox<int> b)           { return b.v; }
+// Closure encoder leg: Lambda<int(CanonAliasInt)> must encode as __fatfn_1_3_i32_3_i32.
+int canonAliasTakesFnList(list<Lambda<int(int)>>* p) { return (int)p->count(); }
+
+bool testGnCanonicalPrimitiveTypeArg()
+{
+    bool result = true;
+
+    CanonBox<i32> bi = default; bi.v = 7;
+    result &= Test("canon_i32_binds_int_param", canonTakesInt(bi), 7);
+
+    CanonBox<int> bn = default; bn.v = 9;
+    CanonBox<i32> cross = bn;                       // assignment across the two spellings
+    result &= Test("canon_int_assigns_to_i32", cross.v, 9);
+
+    CanonBox<i16> bs = default; bs.v = (i16)11;
+    result &= Test("canon_i16_binds_short_param", canonTakesShort(bs), 11);
+
+    list<i32> xs = default;
+    xs.add(20); xs.add(22);
+    result &= Test("canon_list_i32_binds_list_int", canonSumList(xs), 42);
+
+    CanonBox<i32> s1 = default;
+    CanonBox<u32> s2 = default;
+    result &= Test("canon_ctrl_signed_distinct",   canonWhichSign(s1), 1);
+    result &= Test("canon_ctrl_unsigned_distinct", canonWhichSign(s2), 2);
+
+    CanonBox<i64>  l1 = default;
+    CanonBox<long> l2 = default;
+    result &= Test("canon_ctrl_i64_distinct",  canonWhichLong(l1), 3);
+    result &= Test("canon_ctrl_long_distinct", canonWhichLong(l2), 4);
+
+    // A pure-rename alias binds a parameter written with the underlying type - one instantiation.
+    list<CanonAliasInt> al;
+    al.add(7);
+    result &= Test("alias_list_binds_list_int", canonAliasTakesIntList(&al), 1);
+    // ... and the same list binds the parameter written with the alias, from the use-before-`using`
+    // function above: both passes have to have produced the SAME mangled name for it to resolve.
+    result &= Test("alias_list_binds_use_before_using", canonAliasUsedBeforeUsing(&al), 1);
+
+    // Alias of an alias chases to the same underlying instantiation.
+    list<CanonAliasInt2> al2;
+    al2.add(4); al2.add(5);
+    result &= Test("alias_chain_binds_list_int", canonAliasTakesIntList(&al2), 2);
+
+    CanonBox<CanonAliasInt2> ab = default; ab.v = 13;
+    result &= Test("alias_chain_binds_box_int", canonAliasTakesBox(ab), 13);
+
+    // A struct alias unifies too - the fold is not primitive-only.
+    list<CanonAliasS2> asl;
+    CanonAliasS one = default; one.v = 1;
+    asl.add(one);
+    result &= Test("alias_struct_binds_list_struct", canonAliasTakesStructList(&asl), 1);
+
+    // The closure encoder builds its name from raw source text as well: an alias inside a
+    // signature must encode as the underlying type, or the two list<Lambda<...>> split.
+    list<Lambda<int(CanonAliasInt)>> af;
+    af.add((int x) => x + 1);
+    result &= Test("alias_closure_param_unifies", canonAliasTakesFnList(&af), 1);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -4063,6 +4164,8 @@ extern int main()
     total++; passed += testGnNsGfMemberVsFreeNameCollision()      ? 1 : 0;
     total++; passed += testGnNsGfCtrlOwnerStructNameEqualsNamespace() ? 1 : 0;
     total++; passed += testGnNsGfCtrlStructMethodBodyScope()      ? 1 : 0;
+
+    total++; passed += testGnCanonicalPrimitiveTypeArg()          ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

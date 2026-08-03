@@ -78,3 +78,28 @@ extern int main()
 {
     return 0;
 }
+
+// Two definitions of ONE overload slot. Before this was diagnosed the first body silently won and
+// the second was unreachable, so all three legs below compiled and ran the wrong one. The
+// discriminator is the source LINE: a file processed twice (as the primary input and as its own
+// import) re-attaches the same body at the same line and must stay silent, which is why the plain
+// duplicate needs its own leg rather than being assumed to follow from the spelling cases.
+expect_error("redefinition of 'dupExact'") {
+    int dupExact(int x) { return 100 + x; }
+    int dupExact(int x) { return 200 + x; }
+}
+
+// `int` and `i32` name one type (doc/LANGUAGE.md), so these are the same parameter list. They used
+// to coexist AND pick each other's arguments: `dupSpelling(1)` reached the `i32` body while an
+// `i32` variable reached the `int` one.
+expect_error("redefinition of 'dupSpelling'") {
+    int dupSpelling(int x) { return 100 + x; }
+    int dupSpelling(i32 x) { return 200 + x; }
+}
+
+// The same identity has to hold INSIDE a function-pointer signature, which reaches the mangled
+// name through a different path (ToUniqueString's funcptr arm, not its scalar arm).
+expect_error("redefinition of 'dupSigSpelling'") {
+    int dupSigSpelling(function<int(int)> f) { return 1000 + f(1); }
+    int dupSigSpelling(function<i32(i32)> f) { return 2000 + f(1); }
+}

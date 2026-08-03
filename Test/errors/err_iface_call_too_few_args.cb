@@ -44,11 +44,11 @@ expect_error("method call on null interface value 'lv2' - 'lv2' has not been ass
 }
 
 // Leg 3 - through a GENERIC interface. The receiver's type name arrives already monomorphized,
-// so naming 'GLive__int' is what proves the instantiation, not the template, was resolved.
+// so naming 'GLive__i32' is what proves the instantiation, not the template, was resolved.
 interface GLive<T> { T Get(); };
 class GImpl<T> : GLive<T> { T d = default; T Get() { return d; } };
 
-expect_error("method call on null interface value 'gv' - 'gv' has not been assigned an implementation since it was last set to null, so 'gv.Get()' would dispatch through a null 'GLive__int' vtable") {
+expect_error("method call on null interface value 'gv' - 'gv' has not been assigned an implementation since it was last set to null, so 'gv.Get()' would dispatch through a null 'GLive__i32' vtable") {
     int giNullDispatch() { GLive<int> gv = default; return gv.Get(); }
 }
 

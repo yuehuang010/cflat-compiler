@@ -55,4 +55,33 @@ found, and `IsTypeArgTypeKey` will need a fourth leg that consults the alias map
 recorded declaring scope** - not by re-resolving the target. Do that in the same change as the
 scoping fix, or the scoping fix turns into a false rejection for generic arguments.
 
+## The other half of the same root cause: the QUALIFIED spelling does not resolve at all
+
+Re-measured 2026-08-03 (still reproduces). The flat unqualified map has a second symptom that this
+file originally recorded only as a leak - the leak and the miss are one bug:
+
+```cflat
+namespace NS { using MyInt = int; }
+extern int main() { NS.MyInt x = 5; return 0; }   // unknown type 'NS.MyInt'
+extern int main() { MyInt x = 5; return 0; }      // compiles - the leak, prints 5
+```
+
+`RegisterTypeAlias` keys on `ctx->Identifier()` verbatim, so the map holds `MyInt`. The unqualified
+spelling therefore hits from anywhere (the leak), and the qualified spelling - the one that is
+actually CORRECT to write - misses entirely. Fixing the keying closes both at once; a fix that only
+scoped the key without teaching lookup the qualified spelling would turn the leak into a false
+rejection.
+
+The generic form fails the same way (`list<NS.MyInt>` -> `unknown type 'NS.MyInt'`), which is the
+`IsTypeArgTypeKey` follow-on above reached from the other direction.
+
+## Not affected by fix/alias-mangling
+
+The pure-rename mangling fold (`fix/alias-mangling`, 2026-08-02) does NOT touch this.
+`PreRegisterRenameAliases` records the alias under the same unqualified spelling, so a namespaced
+alias is folded globally by the mangler exactly as `ResolveTypeAlias` already resolved it globally.
+That is consistent with today's behaviour and adds no new leak, but it means the namespace-scoping
+fix must update `manglingAliases_` keying in the SAME change - it is now a fourth alias map with
+the same flat-key defect.
+
 Related: [[interface-issue-queue]] (landed design records)

@@ -314,7 +314,13 @@ static void StripOwnershipQualifiers(std::string& name)
     StripAliasQualifier(name);
 }
 
-static std::string MangleTypeArg(const std::string& typeName)
+// CanonicalPrimitiveSpelling lives in LLVMBackend.h - the SAME map has to serve both type
+// identities (generic instantiation here, overload symbol names in ToUniqueString) or one
+// spelling of a type monomorphizes differently from how it overloads.
+// `compiler` is REQUIRED (no default): it supplies the pure-rename `using` alias fold, and a site
+// that silently skipped it would mangle a name the other pass spells differently. Every current
+// call site reaches one; a nullptr is only correct where the string cannot name a source alias.
+static std::string MangleTypeArg(const LLVMBackend* compiler, const std::string& typeName)
 {
     std::string result;
     size_t start = 0;
@@ -332,7 +338,21 @@ static std::string MangleTypeArg(const std::string& typeName)
         result += "alias_";
         start = kAliasQualifierPrefixLen;
     }
-    for (size_t i = start; i < typeName.size(); i++)
+    // Canonicalize the BASE only - everything before the first reference-kind suffix - and by
+    // exact match, so a struct named `Int` or a type named `integer` is never rewritten. A
+    // nested generic arrives already mangled (list<int> -> "list__i32"), since the inner name
+    // was built through this same funnel.
+    size_t baseEnd = start;
+    while (baseEnd < typeName.size() && typeName[baseEnd] != '*' && typeName[baseEnd] != '[')
+        baseEnd++;
+    // A pure-rename `using` alias is transparent, so fold it BEFORE canonicalizing: MyInt -> int
+    // -> i32, which is what makes list<MyInt> and list<int> one instantiation. Only the BASE is
+    // folded; the suffix walk below owns the reference-kind decoration either way.
+    std::string base = typeName.substr(start, baseEnd - start);
+    if (compiler != nullptr) base = compiler->ResolveManglingAlias(base);
+    result += CanonicalPrimitiveSpelling(base);
+
+    for (size_t i = baseEnd; i < typeName.size(); i++)
     {
         if (typeName[i] == '*') result += "ptr";
         else if (typeName[i] == '[' && i + 1 < typeName.size() && typeName[i + 1] == ']')
@@ -343,6 +363,18 @@ static std::string MangleTypeArg(const std::string& typeName)
         else result += typeName[i];
     }
     return result;
+}
+
+// A `using` target that is nothing but a (possibly dotted) identifier - the only shape that is a
+// PURE RENAME and so may be folded by MangleTypeArg. Anything carrying '*', '[', '<' or '(' stores
+// that structure in the alias string and is unfolded separately at GetType /
+// ParseDeclarationSpecifiers; folding it into the base would double the mangler's suffix walk.
+static bool IsBareTypeName(const std::string& s)
+{
+    if (s.empty() || !(std::isalpha((unsigned char)s[0]) || s[0] == '_')) return false;
+    for (char c : s)
+        if (!(std::isalnum((unsigned char)c) || c == '_' || c == '.')) return false;
+    return true;
 }
 
 // Namespace-resolve a type-argument string that carries a reference-kind suffix ("Item*",
@@ -394,20 +426,39 @@ static CFlatParser::GenericTypeParametersContext* GenericSpecOf(
 
 // Build the symbol-safe encoded name for a closure type used as a generic argument (gap a).
 // Length-prefixed components keep it collision-free; the result contains only [A-Za-z0-9_].
-// Each component folds its pointer flag in via MangleTypeArg ("int*" -> "intptr"); isThin selects
-// the thin/fat prefix. Examples: Lambda<int(int)> -> "__fatfn_1_3_int_3_int";
-// function<void(UiTest*)> -> "__thinfn_1_4_void_9_UiTestptr"; Lambda<list<string>()> ->
-// "__fatfn_0_12_list__string". Both compiler passes MUST call this identically.
-static std::string BuildEncodedClosureName(bool isThin, const std::string& ret, bool retPtr,
-    const std::vector<std::pair<std::string, bool>>& params)
+// Number of '*' written on a pointer() context. The grammar is ('*' typeQualifierList?)+, so the
+// depth is Star().size(); the funcptr signature sites used to collapse it to a bool.
+static int PointerDepthOf(CFlatParser::PointerContext* p)
 {
-    auto comp = [](const std::string& name, bool ptr) {
-        std::string c = MangleTypeArg(name + (ptr ? "*" : ""));
+    return p == nullptr ? 0 : (int)p->Star().size();
+}
+
+// Reconcile a written '*' count with the pointer flag ResolveSigComponent* may have CHANGED - a
+// `string` component resolves to char* with no '*' written. The FLAG wins; the count only adds
+// precision when the two agree.
+static int ReconcilePointerDepth(bool pointer, int stars)
+{
+    if (!pointer) return 0;
+    return stars > 0 ? stars : 1;
+}
+
+// Each component folds its pointer DEPTH in via MangleTypeArg ("int*" -> "intptr", "int**" ->
+// "intptrptr"); isThin selects the thin/fat prefix. Examples: Lambda<int(int)> ->
+// "__fatfn_1_3_i32_3_i32"; function<void(UiTest*)> -> "__thinfn_1_4_void_9_UiTestptr";
+// Lambda<list<string>()> -> "__fatfn_0_12_list__string". Both compiler passes MUST call this
+// identically. Depths are ints, so a caller that only knows "is a pointer" passes 0 or 1 and gets
+// the string this produced before depth existed.
+static std::string BuildEncodedClosureName(const LLVMBackend* compiler, bool isThin,
+    const std::string& ret, int retDepth,
+    const std::vector<std::pair<std::string, int>>& params)
+{
+    auto comp = [compiler](const std::string& name, int depth) {
+        std::string c = MangleTypeArg(compiler, name + std::string(depth < 0 ? 0 : depth, '*'));
         return std::to_string(c.size()) + "_" + c;
     };
     std::string s = isThin ? "__thinfn" : "__fatfn";
     s += "_" + std::to_string(params.size());
-    s += "_" + comp(ret, retPtr);
+    s += "_" + comp(ret, retDepth);
     for (const auto& p : params) s += "_" + comp(p.first, p.second);
     return s;
 }
@@ -1273,7 +1324,7 @@ private:
                         for (auto* entry : tts->tupleTypeEntry())
                             typeArgs.push_back(TupleEntryArgName(compiler, entry));
                         std::string mangledName = "tuple";
-                        for (const auto& arg : typeArgs) mangledName += "__" + MangleTypeArg(arg);
+                        for (const auto& arg : typeArgs) mangledName += "__" + MangleTypeArg(compiler, arg);
                         compiler->CreateStructType(mangledName, {});
                         LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
                         compiler->CreateFunctionDeclaration(mangledName, rt, {});
@@ -1294,17 +1345,23 @@ private:
                         {
                             // Resolve generic signature types (gap b) to match the main pass.
                             bool retPtr = fpSpec->pointer() != nullptr;
+                            int retStars = PointerDepthOf(fpSpec->pointer());
                             declType.FuncPtrReturnTypeName = ResolveSigComponentScanner(fpSpec->typeSpecifier(), retPtr);
                             declType.FuncPtrReturnPointer = retPtr;
+                            declType.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
+                            declType.FuncPtrReturnResolvedKey = SigComponentResolvedKeyScanner(declType.FuncPtrReturnTypeName);
                             if (fpSpec->functionPointerParamList() != nullptr)
                             {
                                 for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
                                 {
                                     LLVMBackend::TypeAndValue::FuncPtrParam p;
                                     bool pPtr = param->pointer() != nullptr;
+                                    int pStars = PointerDepthOf(param->pointer());
                                     p.TypeName = ResolveSigComponentScanner(param->typeSpecifier(), pPtr);
                                     p.Pointer = pPtr;
                                     p.IsMove = param->Move() != nullptr;
+                                    p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
+                                    p.ResolvedTypeKey = SigComponentResolvedKeyScanner(p.TypeName);
                                     declType.FuncPtrParams.push_back(p);
                                 }
                             }
@@ -1369,7 +1426,7 @@ private:
                             typeArgs.push_back(ResolveTypeArgSpelling(compiler, entry->getText()));
                     }
                     std::string mangledName = baseName;
-                    for (const auto& arg : typeArgs) mangledName += "__" + MangleTypeArg(arg);
+                    for (const auto& arg : typeArgs) mangledName += "__" + MangleTypeArg(compiler, arg);
                     // A generic INTERFACE instantiation is a fat pointer, not a struct: no shell,
                     // no default ctor. Mark it now - interfaceTable only fills in the main pass.
                     // The genericInterfaceInstances insert is deferred to the common tail below,
@@ -1381,7 +1438,7 @@ private:
                         // (Container<Box<int>>) matches the main pass's Container__Box__int.
                         mangledName = baseName;
                         for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
-                            mangledName += "__" + MangleTypeArg(ResolveForwardTypeArg(entry));
+                            mangledName += "__" + MangleTypeArg(compiler, ResolveForwardTypeArg(entry));
                     }
                     else
                     {
@@ -1403,6 +1460,7 @@ private:
                     declType.TypeName              = fit->second.IsThinFnPtr() ? "__c_fn_ptr" : "__closure_fat_ptr";
                     declType.FuncPtrReturnTypeName = fit->second.FuncPtrReturnTypeName;
                     declType.FuncPtrReturnPointer  = fit->second.FuncPtrReturnPointer;
+                    declType.FuncPtrReturnPointerDepth = fit->second.FuncPtrReturnPointerDepth;
                     declType.FuncPtrParams         = fit->second.FuncPtrParams;
                     declType.Pointer               = declSpec->pointer() != nullptr;
                     // Like the functionPointerSpecifier branch, this one breaks out of the
@@ -2073,9 +2131,61 @@ private:
             ScanFunctionDefinition(func, {}, namespaceName, groupLocks);
     }
 
+    // One `using` declaration considered as a mangling-visible pure rename (see
+    // PreRegisterRenameAliases). Registration is name-only: whether the target really names a type
+    // is the authoritative ParseUsingDeclaration's call, and an alias to a non-type still mangles
+    // to a name that fails the same way its target does.
+    void RegisterRenameAlias(CFlatParser::UsingDeclarationContext* ctx)
+    {
+        if (ctx->Identifier() == nullptr) return;  // `using "name" = T;` keys on a string literal
+        // A pointer/array suffix means the alias is not a pure rename.
+        if (ctx->pointer() != nullptr || ctx->arrayTypeSuffix() != nullptr) return;
+        auto* typeSpec = ctx->typeSpecifier();
+        if (typeSpec == nullptr) return;
+        std::string target = typeSpec->getText();
+        std::string alias = ctx->Identifier()->getText();
+        if (alias == target || !IsBareTypeName(target)) return;
+        compilerLLVM->RegisterManglingAlias(alias, target);
+    }
+
 public:
     ForwardRefScanner(LLVMBackend* compiler) : compilerLLVM(compiler) {}
     void SetTokens(antlr4::BufferedTokenStream* t) { tokens_ = t; }
+
+    /*
+     * Record every file-scope pure-rename `using` alias BEFORE either pass walks the file, so
+     * MangleTypeArg folds the same alias set in both. It cannot be left to the walk: ScanGenericTypeUses
+     * mangles every generic use in the file BEFORE ScanExternalDeclaration reaches the first `using`,
+     * while codegen sees the alias already registered - the two would build a struct shell under
+     * `list__MyInt` and look it up as `list__i32`.
+     *
+     * Only a bare-name target is a pure rename (IsBareTypeName); `using Handle = void*;` and
+     * `using Vec3 = float[3];` keep their suffix in the alias string and stay opaque here.
+     * Deliberately does NOT descend into `if const` arms or function bodies: the scan cannot tell
+     * which arm is taken, and the two arms legitimately bind one alias to different types
+     * (core/os.posix.cb binds `win_size` to i64 or i32). Those aliases stay opaque to the mangler,
+     * which is what both passes did before this existed.
+     */
+    void PreRegisterRenameAliases(antlr4::RuleContext* ctx)
+    {
+        for (auto* child : ctx->children)
+        {
+            auto* ruleCtx = dynamic_cast<antlr4::RuleContext*>(child);
+            if (ruleCtx == nullptr) continue;
+            switch (ruleCtx->getRuleIndex())
+            {
+            case CFlatParser::RuleUsingDeclaration:
+                RegisterRenameAlias(static_cast<CFlatParser::UsingDeclarationContext*>(ruleCtx));
+                break;
+            case CFlatParser::RuleExternalDeclaration:
+            case CFlatParser::RuleNamespaceDefinition:
+                PreRegisterRenameAliases(ruleCtx);
+                break;
+            default:
+                break;
+            }
+        }
+    }
 
     // Resolve a type-argument entry to the same string MainListener::ResolveTypeArgEntry
     // would produce at the top level (no active substitutions during the forward scan),
@@ -2094,7 +2204,7 @@ public:
         {
             resolved = Compiler(entry)->ResolveGenericBaseAlias(innerBase);
             for (auto* innerEntry : innerParams->typeParameterList()->typeParameterEntry())
-                resolved += "__" + MangleTypeArg(ResolveForwardTypeArg(innerEntry));
+                resolved += "__" + MangleTypeArg(compilerLLVM, ResolveForwardTypeArg(innerEntry));
         }
         else if (typeSpec && typeSpec->functionPointerSpecifier())
         {
@@ -2137,10 +2247,25 @@ public:
         {
             std::string mangled = ts->genericIdentifier()->Identifier()->getText();
             for (auto* entry : ts->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-                mangled += "__" + MangleTypeArg(ResolveForwardTypeArg(entry));
+                mangled += "__" + MangleTypeArg(compilerLLVM, ResolveForwardTypeArg(entry));
             return mangled;
         }
         return ts->getText();
+    }
+
+    /*
+     * Scanner counterpart of MainListener::SigComponentResolvedKey, kept identical the way the two
+     * ParseDeclarationSpecifiers copies are. This copy is the load-bearing one: a call site reads
+     * the parameter signature the SCANNER registered into the function table, not the main pass's.
+     * A type not yet scanned resolves to nothing, which records "" - no proof, today's behaviour.
+     */
+    std::string SigComponentResolvedKeyScanner(const std::string& name)
+    {
+        if (name.empty()) return "";
+        std::string key = compilerLLVM->ResolveTypeArgBaseName(name);
+        if (key != name) return key;                              // qualified by the walk
+        if (name.find('.') != std::string::npos) return name;      // already qualified
+        return compilerLLVM->GetCurrentNamespace().empty() ? name : "";  // global scope is unambiguous
     }
 
     // Scanner counterpart of EncodeClosureCodegen: builds the encoded name only (the main pass owns
@@ -2151,16 +2276,18 @@ public:
         if (fpSpec->typeSpecifier() == nullptr)
             return isThin ? "__c_fn_ptr" : "__closure_fat_ptr";  // main pass reports the error
         bool retPtr = fpSpec->pointer() != nullptr;
+        int retStars = PointerDepthOf(fpSpec->pointer());
         std::string retName = ResolveSigComponentScanner(fpSpec->typeSpecifier(), retPtr);
-        std::vector<std::pair<std::string, bool>> encParams;
+        std::vector<std::pair<std::string, int>> encParams;
         if (fpSpec->functionPointerParamList() != nullptr)
             for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
             {
                 bool pPtr = param->pointer() != nullptr;
+                int pStars = PointerDepthOf(param->pointer());
                 std::string pName = ResolveSigComponentScanner(param->typeSpecifier(), pPtr);
-                encParams.push_back({ pName, pPtr });
+                encParams.push_back({ pName, ReconcilePointerDepth(pPtr, pStars) });
             }
-        return BuildEncodedClosureName(isThin, retName, retPtr, encParams);
+        return BuildEncodedClosureName(compilerLLVM, isThin, retName, ReconcilePointerDepth(retPtr, retStars), encParams);
     }
 
     // ---- Scanner-side `if const` folding -------------------------------------------------------
@@ -2680,7 +2807,7 @@ public:
                 std::string baseName = compiler->ResolveGenericTemplateBase(spelledBase);
                 std::string mangledName = baseName;
                 for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
-                    mangledName += "__" + MangleTypeArg(ResolveForwardTypeArg(entry));
+                    mangledName += "__" + MangleTypeArg(compiler, ResolveForwardTypeArg(entry));
                 // A generic INTERFACE instantiation has no struct shell and no default ctor - the
                 // main pass builds it in interfaceTable. Pre-declaring one shadows it as opaque.
                 if (compiler->IsGenericInterfaceTemplateName(
@@ -2746,7 +2873,7 @@ public:
                                 typeArgs.push_back(TupleEntryArgName(Compiler(tts), entry));
                             std::string mangledName = "tuple";
                             for (const auto& arg : typeArgs)
-                                mangledName += "__" + MangleTypeArg(arg);
+                                mangledName += "__" + MangleTypeArg(Compiler(tts), arg);
                             auto* c = Compiler(tts);
                             c->CreateStructType(mangledName, {});
                             LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
@@ -2782,16 +2909,22 @@ public:
         {
             // Resolve generic signature types (gap b) to match the main pass.
             bool retPtr = fpSpec->pointer() != nullptr;
+            int retStars = PointerDepthOf(fpSpec->pointer());
             tv.FuncPtrReturnTypeName = ResolveSigComponentScanner(fpSpec->typeSpecifier(), retPtr);
             tv.FuncPtrReturnPointer  = retPtr;
+            tv.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
+            tv.FuncPtrReturnResolvedKey = SigComponentResolvedKeyScanner(tv.FuncPtrReturnTypeName);
             if (fpSpec->functionPointerParamList() != nullptr)
                 for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
                 {
                     LLVMBackend::TypeAndValue::FuncPtrParam p;
                     bool pPtr = param->pointer() != nullptr;
+                    int pStars = PointerDepthOf(param->pointer());
                     p.TypeName = ResolveSigComponentScanner(param->typeSpecifier(), pPtr);
                     p.Pointer  = pPtr;
                     p.IsMove   = param->Move() != nullptr;
+                    p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
+                    p.ResolvedTypeKey = SigComponentResolvedKeyScanner(p.TypeName);
                     tv.FuncPtrParams.push_back(p);
                 }
         }
@@ -2839,9 +2972,9 @@ public:
                 // name matches the authoritative ParseUsingDeclaration; others keep raw getText().
                 if ((entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
                     || TypeArgHasUnique(entry))
-                    mangledName += "__" + MangleTypeArg(ResolveForwardTypeArg(entry));
+                    mangledName += "__" + MangleTypeArg(compiler, ResolveForwardTypeArg(entry));
                 else
-                    mangledName += "__" + MangleTypeArg(ResolveTypeArgSpelling(compiler, entry->getText()));
+                    mangledName += "__" + MangleTypeArg(compiler, ResolveTypeArgSpelling(compiler, entry->getText()));
             }
             // A generic interface instantiation gets no struct shell / default ctor (see
             // tryPreDeclare); the alias still names the mangled interface.
@@ -3624,6 +3757,23 @@ private:
         return name;
     }
 
+    /*
+     * The declaring-scope-resolved key for a signature component, recorded ALONGSIDE the raw
+     * spelling (which still owns the mangled name). Empty = not recorded -> no proof. Inside a
+     * namespace a bare spelling the walk could NOT qualify records nothing: recording the bare
+     * form there would be a false rejection if the namespaced type is not registered yet, while
+     * recording nothing just falls back to the broad candidate set.
+     */
+    std::string SigComponentResolvedKey(const std::string& name)
+    {
+        if (name.empty()) return "";
+        auto* c = Compiler();
+        std::string key = c->ResolveTypeArgBaseName(name);
+        if (key != name) return key;                              // qualified by the walk
+        if (name.find('.') != std::string::npos) return name;      // already qualified
+        return c->GetCurrentNamespace().empty() ? name : "";       // global scope is unambiguous
+    }
+
     // Encode a closure type (Lambda<...>/function<...>) that appears as a generic argument or in a
     // nested signature position into a symbol-safe name (BuildEncodedClosureName), resolving its
     // signature component types, and register the call descriptor. Returns the encoded name.
@@ -3640,21 +3790,29 @@ private:
         sig.IsFunctionPointer = true;
         sig.TypeName = isThin ? "__c_fn_ptr" : "__closure_fat_ptr";
         bool retPtr = fpSpec->pointer() != nullptr;
+        int retStars = PointerDepthOf(fpSpec->pointer());
         std::string retName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr);
         sig.FuncPtrReturnTypeName = retName;
         sig.FuncPtrReturnPointer  = retPtr;
-        std::vector<std::pair<std::string, bool>> encParams;
+        sig.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
+        sig.FuncPtrReturnResolvedKey = SigComponentResolvedKey(retName);
+        std::vector<std::pair<std::string, int>> encParams;
         if (fpSpec->functionPointerParamList() != nullptr)
             for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
             {
                 bool pPtr = param->pointer() != nullptr;
+                int pStars = PointerDepthOf(param->pointer());
                 std::string pName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr);
-                encParams.push_back({ pName, pPtr });
+                int pDepth = ReconcilePointerDepth(pPtr, pStars);
+                encParams.push_back({ pName, pDepth });
                 LLVMBackend::TypeAndValue::FuncPtrParam fp;
                 fp.TypeName = pName; fp.Pointer = pPtr; fp.IsMove = param->Move() != nullptr;
+                fp.PointerDepth = pDepth;
+                fp.ResolvedTypeKey = SigComponentResolvedKey(pName);
                 sig.FuncPtrParams.push_back(fp);
             }
-        std::string encoded = BuildEncodedClosureName(isThin, retName, retPtr, encParams);
+        std::string encoded = BuildEncodedClosureName(Compiler(), isThin, retName,
+            sig.FuncPtrReturnPointerDepth, encParams);
         Compiler(fpSpec)->RegisterEncodedClosureType(encoded, sig);
         return encoded;
     }
@@ -3664,10 +3822,11 @@ private:
     // spelling). Produces the same name BuildEncodedClosureName gives for the direct form.
     std::string EncodeClosureFromSig(LLVMBackend* compiler, const LLVMBackend::TypeAndValue& sig)
     {
-        std::vector<std::pair<std::string, bool>> params;
-        for (const auto& p : sig.FuncPtrParams) params.push_back({ p.TypeName, p.Pointer });
-        std::string encoded = BuildEncodedClosureName(sig.IsThinFnPtr(),
-            sig.FuncPtrReturnTypeName, sig.FuncPtrReturnPointer, params);
+        std::vector<std::pair<std::string, int>> params;
+        for (const auto& p : sig.FuncPtrParams)
+            params.push_back({ p.TypeName, ReconcilePointerDepth(p.Pointer, p.PointerDepth) });
+        std::string encoded = BuildEncodedClosureName(compiler, sig.IsThinFnPtr(), sig.FuncPtrReturnTypeName,
+            ReconcilePointerDepth(sig.FuncPtrReturnPointer, sig.FuncPtrReturnPointerDepth), params);
         compiler->RegisterEncodedClosureType(encoded, sig);
         return encoded;
     }
@@ -3811,17 +3970,23 @@ private:
                         // substitution + generic mangling/queueing (gap b), so a generic inside the
                         // signature (e.g. Lambda<list<string>()>) stores the mangled "list__string".
                         bool retPtr = fpSpec->pointer() != nullptr;
+                        int retStars = PointerDepthOf(fpSpec->pointer());
                         declType.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr);
                         declType.FuncPtrReturnPointer  = retPtr;
+                        declType.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
+                        declType.FuncPtrReturnResolvedKey = SigComponentResolvedKey(declType.FuncPtrReturnTypeName);
                         if (fpSpec->functionPointerParamList() != nullptr)
                         {
                             for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
                             {
                                 LLVMBackend::TypeAndValue::FuncPtrParam p;
                                 bool pPtr = param->pointer() != nullptr;
+                                int pStars = PointerDepthOf(param->pointer());
                                 p.TypeName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr);
                                 p.Pointer  = pPtr;
                                 p.IsMove   = param->Move() != nullptr;
+                                p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
+                                p.ResolvedTypeKey = SigComponentResolvedKey(p.TypeName);
                                 declType.FuncPtrParams.push_back(p);
                             }
                         }
@@ -3935,6 +4100,7 @@ private:
                     declType.TypeName              = fit->second.IsThinFnPtr() ? "__c_fn_ptr" : "__closure_fat_ptr";
                     declType.FuncPtrReturnTypeName = fit->second.FuncPtrReturnTypeName;
                     declType.FuncPtrReturnPointer  = fit->second.FuncPtrReturnPointer;
+                    declType.FuncPtrReturnPointerDepth = fit->second.FuncPtrReturnPointerDepth;
                     declType.FuncPtrParams         = fit->second.FuncPtrParams;
                     declType.Pointer               = declSpec->pointer() != nullptr;
                     // Same fat-closure pointer rejection as the functionPointerSpecifier branch.
@@ -4756,16 +4922,22 @@ public:
             // Resolve generic signature types (gap b) so `using Cb = Lambda<list<string>()>` stores
             // the mangled "list__string" and queues the instantiation.
             bool retPtr = fpSpec->pointer() != nullptr;
+            int retStars = PointerDepthOf(fpSpec->pointer());
             tv.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr);
             tv.FuncPtrReturnPointer  = retPtr;
+            tv.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
+            tv.FuncPtrReturnResolvedKey = SigComponentResolvedKey(tv.FuncPtrReturnTypeName);
             if (fpSpec->functionPointerParamList() != nullptr)
                 for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
                 {
                     LLVMBackend::TypeAndValue::FuncPtrParam p;
                     bool pPtr = param->pointer() != nullptr;
+                    int pStars = PointerDepthOf(param->pointer());
                     p.TypeName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr);
                     p.Pointer  = pPtr;
                     p.IsMove   = param->Move() != nullptr;
+                    p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
+                    p.ResolvedTypeKey = SigComponentResolvedKey(p.TypeName);
                     tv.FuncPtrParams.push_back(p);
                 }
         }
@@ -9508,7 +9680,7 @@ public:
                                 std::string funcName = assignmentExpression->getText();
                                 int expectedParams = (int)typeAndValue.FuncPtrParams.size();
                                 if (llvm::isa<llvm::Function>(right))
-                                    if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams, &typeAndValue.FuncPtrParams))
+                                    if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams, &typeAndValue.FuncPtrParams, &typeAndValue))
                                         right = correctFn;
                                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
                                 {
@@ -9524,7 +9696,7 @@ public:
                             if (!right && typeAndValue.IsFunctionPointer && !genericFuncCallerName.empty())
                             {
                                 int expectedParams = (int)typeAndValue.FuncPtrParams.size();
-                                llvm::Function* genericFn = compiler->GetFunctionForFuncPtr(genericFuncCallerName, expectedParams, &typeAndValue.FuncPtrParams);
+                                llvm::Function* genericFn = compiler->GetFunctionForFuncPtr(genericFuncCallerName, expectedParams, &typeAndValue.FuncPtrParams, &typeAndValue);
                                 if (genericFn)
                                 {
                                     VerifyFuncPtrAssignmentMoveFlags(genericFuncCallerName, typeAndValue, assignmentExpression);
@@ -12561,7 +12733,7 @@ public:
                 std::string funcName = assignCtx->getText();
                 int expectedParams = (int)namedVar.TypeAndValue.FuncPtrParams.size();
                 if (llvm::isa<llvm::Function>(right))
-                    if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams, &namedVar.TypeAndValue.FuncPtrParams))
+                    if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams, &namedVar.TypeAndValue.FuncPtrParams, &namedVar.TypeAndValue))
                         right = correctFn;
                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
                 {
@@ -12578,7 +12750,7 @@ public:
                 && !rightNV.CallerName.empty())
             {
                 int expectedParams = (int)namedVar.TypeAndValue.FuncPtrParams.size();
-                llvm::Function* genericFn = compiler->GetFunctionForFuncPtr(rightNV.CallerName, expectedParams, &namedVar.TypeAndValue.FuncPtrParams);
+                llvm::Function* genericFn = compiler->GetFunctionForFuncPtr(rightNV.CallerName, expectedParams, &namedVar.TypeAndValue.FuncPtrParams, &namedVar.TypeAndValue);
                 if (genericFn)
                 {
                     VerifyFuncPtrAssignmentMoveFlags(rightNV.CallerName, namedVar.TypeAndValue, ctx);
@@ -20734,7 +20906,7 @@ public:
                                 if (isGenericFunc && !substituted)
                                     arg = Compiler(ctx)->ResolveTypeArgBaseName(arg);
                                 typeArgs.push_back(arg);
-                                mangledName += "__" + MangleTypeArg(arg);
+                                mangledName += "__" + MangleTypeArg(Compiler(), arg);
                             }
                             // If this is a generic function template (e.g. wrap<int>),
                             // instantiate it and record the mangled name as CallerName so
@@ -24589,11 +24761,13 @@ public:
         tv.TypeName = "__closure_fat_ptr";
         tv.FuncPtrReturnTypeName = returnType.TypeName;
         tv.FuncPtrReturnPointer  = returnType.Pointer;
+        tv.FuncPtrReturnPointerDepth = returnType.ValuePointerDepth();
         for (const auto& p : params)
         {
             LLVMBackend::TypeAndValue::FuncPtrParam fp;
             fp.TypeName = p.TypeName;
             fp.Pointer  = p.Pointer;
+            fp.PointerDepth = p.ValuePointerDepth();
             tv.FuncPtrParams.push_back(fp);
         }
 
@@ -25682,7 +25856,7 @@ public:
     {
         std::string name = baseName;
         for (const auto& arg : typeArgs)
-            name += "__" + MangleTypeArg(arg);
+            name += "__" + MangleTypeArg(Compiler(), arg);
         return name;
     }
 

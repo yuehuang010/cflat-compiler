@@ -399,6 +399,33 @@ enum class LockMode
     Optimistic,
 };
 
+/*
+ * Fold an alias SPELLING of a primitive onto its canonical name. `int` and `i32` are one type
+ * ("freely interchangeable", doc/LANGUAGE.md), so every place that builds a TYPE IDENTITY out of
+ * a spelling must funnel through here or the two spellings become two types. Two such places
+ * exist: MangleTypeArg (generic instantiation) and ToUniqueString (overload symbol names).
+ *
+ * This is SOURCE identity, not the ABI canon. Signedness is PRESERVED: `u32` is a distinct type
+ * from `i32`, not a spelling of it, and it divides, compares and prints differently. The
+ * function-pointer comparison wants the ABI canon instead (FuncPtrScalarCanon, which drops
+ * signedness) - see internal/plan/funcptr-type-mangling.md for why the two must stay separate.
+ *
+ * Two deliberate absences. `long`/`ulong` are target-native, so folding them onto `i64`/`u64`
+ * would make `Box<long>` and `Box<i64>` one type on LP64 and two on Windows - platform-varying
+ * symbol names. `char` carries a distinct DWARF encoding (DW_ATE_signed_char) that `i8` does not,
+ * so folding it would make a debugger print numbers instead of characters, and which of the two
+ * spellings won would depend on registration order.
+ */
+inline const std::string& CanonicalPrimitiveSpelling(const std::string& base)
+{
+    static const std::unordered_map<std::string, std::string> kCanonicalPrimitive = {
+        { "int",   "i32" },
+        { "short", "i16" },
+    };
+    auto it = kCanonicalPrimitive.find(base);
+    return it == kCanonicalPrimitive.end() ? base : it->second;
+}
+
 class LLVMBackend
 {
 public:
@@ -580,7 +607,36 @@ public:
         // is the first such reader); a reader of IsFunctionPointer may still assume these.
         std::string FuncPtrReturnTypeName;
         bool FuncPtrReturnPointer = false;
-        struct FuncPtrParam { std::string TypeName; bool Pointer = false; bool IsMove = false; };
+        /*
+         * Number of '*' on a signature component. 0 means NOT RECORDED, never "not a pointer" -
+         * `Pointer` already answers that, and many producers (C-interop, WinRT, synthesized
+         * signatures) set only `Pointer`. Readers must therefore treat 0 as unknown: the depth
+         * proof is one-sided like every other part of the comparison, so `int**` vs an unrecorded
+         * pointer accepts. Only the source-parse sites, which can count Star(), fill it in.
+         *
+         * Without it `*` and `**` collapsed: function<void(int**)> bound a void(int*) slot and
+         * SIGSEGV'd, and the two spelled one overload symbol.
+         */
+        int FuncPtrReturnPointerDepth = 0;
+        /*
+         * The declaring-scope-RESOLVED key of a signature component, recorded ALONGSIDE the raw
+         * spelling. The spelling still owns the mangled name (BuildEncodedClosureName), so this is
+         * a separate field rather than a re-spelling of TypeName. "" means NOT RECORDED, never
+         * "no type" - exactly the convention PointerDepth == 0 uses above. Only the source-parse
+         * sites fill it, in BOTH passes (the scanner's copy is the one a call site reads); C
+         * interop, WinRT and synthesized signatures leave it empty and keep binding. A reader may
+         * only NARROW a candidate set the key is already a member of, so a stale key cannot invent
+         * a rejection - a type not yet registered when the walk runs simply records nothing.
+         */
+        std::string FuncPtrReturnResolvedKey;
+        struct FuncPtrParam
+        {
+            std::string TypeName;
+            bool Pointer = false;
+            bool IsMove = false;
+            int PointerDepth = 0;   // 0 = not recorded; see FuncPtrReturnPointerDepth
+            std::string ResolvedTypeKey;  // "" = not recorded; see FuncPtrReturnResolvedKey
+        };
         std::vector<FuncPtrParam> FuncPtrParams;
 
         uint64_t ConstArraySize = 0;                   // outer (first) dimension; non-zero for fixed arrays
@@ -716,6 +772,18 @@ public:
             return -1;
         }
 
+        // '*' count this VALUE carries, for copying into a signature component's PointerDepth.
+        // ElemPointer is the only depth a TypeAndValue records, so 2 is the ceiling here.
+        int ValuePointerDepth() const { return ElemPointer ? 2 : (Pointer ? 1 : 0); }
+
+        /*
+         * The overload IDENTITY of this type: two parameters are the same overload slot exactly
+         * when this string matches. Every spelling goes through CanonicalPrimitiveSpelling, so
+         * `f(int)` and `f(i32)` are ONE overload rather than two - which is what the language
+         * reference already promises and what monomorphization now does for `Box<int>`. Without
+         * it the two coexisted and picked each other's arguments (`f(1)` reached the `i32` body
+         * while an `i32` variable reached the `int` one).
+         */
         std::string ToUniqueString() const
         {
             if (IsFunctionPointer)
@@ -725,14 +793,24 @@ public:
                 std::string kind = IsThinFnPtr() ? "cfuncptr" : "funcptr";
                 if (IsArrayView)   kind += "Arr";
                 else if (Pointer)  kind += (ElemPointer ? "PtrPtr" : "Ptr");
+                // One "Ptr" per level, so function<void(int*)> and function<void(int**)> are two
+                // overloads. An unrecorded depth still yields exactly one "Ptr", which is the
+                // string every producer emitted before depth existed.
+                auto ptrTail = [](bool ptr, int depth) {
+                    std::string t;
+                    for (int i = 0, n = ptr ? std::max(depth, 1) : 0; i < n; i++) t += "Ptr";
+                    return t;
+                };
                 std::string s = kind + "_"
-                              + FuncPtrReturnTypeName + (FuncPtrReturnPointer ? "Ptr" : "");
+                              + CanonicalPrimitiveSpelling(FuncPtrReturnTypeName)
+                              + ptrTail(FuncPtrReturnPointer, FuncPtrReturnPointerDepth);
                 for (const auto& p : FuncPtrParams)
-                    s += "_" + p.TypeName + (p.Pointer ? "Ptr" : "") + (p.IsMove ? "M" : "");
+                    s += "_" + CanonicalPrimitiveSpelling(p.TypeName)
+                       + ptrTail(p.Pointer, p.PointerDepth) + (p.IsMove ? "M" : "");
                 return s;
             }
 
-            std::string type = TypeName;
+            std::string type = CanonicalPrimitiveSpelling(TypeName);
 
             if (IsArrayView)
             {
@@ -1560,6 +1638,11 @@ private:
     std::unordered_map<std::string, ProgramData> programTable;
     std::unordered_map<std::string, std::string> enumBackingTypes;
     std::unordered_map<std::string, std::string> typeAliases;
+    // Pure-rename `using` aliases (`using MyInt = int;`) - alias -> bare target name. Written ONLY
+    // by ForwardRefScanner::PreRegisterRenameAliases, before either pass walks the file, and read
+    // only by MangleTypeArg. Kept out of typeAliases because that map fills in progressively as
+    // each pass reaches the `using`, which happens at different points in the two passes.
+    std::unordered_map<std::string, std::string> manglingAliases_;
     // `using IReference = Windows.Foundation.IReference;` - alias -> generic BASE name. Separate
     // from typeAliases because a base is not a type until its <...> arguments are supplied.
     std::unordered_map<std::string, std::string> genericBaseAliases_;
@@ -1994,6 +2077,10 @@ private:
     std::string currentSourceFilePath_;
     // True while the file being scanned/walked lives under runtimeDir/core (set by CompileImportedFile).
     bool currentSourceIsCore_ = false;
+    // Where a function BODY was first attached, keyed on the MANGLED name: source file leaf and
+    // line. Read only to tell a genuine redefinition apart from the same definition arriving twice.
+    // Per-compile; cleared by ResetForReanalysis with the module it describes.
+    std::unordered_map<std::string, std::pair<std::string, size_t>> functionBodyOrigin_;
     llvm::AllocaInst* autoVaListAlloca = nullptr;
 
     std::unique_ptr<llvm::DIBuilder> diBuilder;
@@ -9472,6 +9559,29 @@ public:
         return (it != typeAliases.end()) ? it->second : name;
     }
 
+    // A pure-rename `using` alias is transparent the way a C typedef is, so it must not produce its
+    // own monomorphization: list<MyInt> and list<int> are ONE instantiation. Registered ahead of
+    // both passes (see PreRegisterRenameAliases) so the two mangle a type argument identically.
+    void RegisterManglingAlias(const std::string& alias, const std::string& target)
+    {
+        manglingAliases_[alias] = target;
+    }
+
+    // Fold a type-arg base name through the pure-rename alias chain (`using MyInt2 = MyInt;` with
+    // `using MyInt = int;` reaches "int"). The hop guard bounds a cycle; a cyclic alias is a
+    // separate error the authoritative ParseUsingDeclaration owns.
+    std::string ResolveManglingAlias(const std::string& name) const
+    {
+        std::string cur = name;
+        for (int guard = 0; guard < 8; ++guard)
+        {
+            auto it = manglingAliases_.find(cur);
+            if (it == manglingAliases_.end() || it->second == cur) break;
+            cur = it->second;
+        }
+        return cur;
+    }
+
     // A `using` alias that names a GENERIC BASE rather than a concrete type - e.g.
     // `using IReference = Windows.Foundation.IReference;`, which then lets a body write the
     // familiar `IReference<int>`. Kept out of typeAliases: a base is not a usable type on its
@@ -13153,16 +13263,16 @@ public:
     {
         if (!param.IsFunctionPointer && !IsEncodedClosureType(param.TypeName))
             return false;
-        // Second proof: two signatures of KNOWN type classes that differ at the same indirection
-        // shape. Must precede the closure-evidence early-out, which such a pointer would satisfy.
+        // Second proof: two signatures that provably name different function types, at the same
+        // indirection shape. Precedes the closure early-out, which such a pointer would satisfy.
         if (param.IsFunctionPointer
-            && FunctionPointerShapeOf(arg.TypeAndValue, &arg) == FunctionPointerShapeOf(param, nullptr))
-        {
-            std::string argSig, paramSig;
-            if (FuncPtrSignatureOf(arg.TypeAndValue, argSig)
-                && FuncPtrSignatureOf(param, paramSig) && argSig != paramSig)
-                return true;
-        }
+            && FunctionPointerShapeOf(arg.TypeAndValue, &arg) == FunctionPointerShapeOf(param, nullptr)
+            && FuncPtrSignaturesProvablyDiffer(arg.TypeAndValue, param))
+            return true;
+        // Same proof for a NAMED function, whose signature lives in the function table rather than
+        // on the argument. Shape is not consulted: a bare name is always a plain value.
+        if (NamedFunctionArgMismatches(arg, param))
+            return true;
         // Any recorded closure evidence disproves the mismatch.
         if (arg.TypeAndValue.IsFunctionPointer || arg.TypeAndValue.TypeName == "__closure_fat_ptr"
             || IsEncodedClosureType(arg.TypeAndValue.TypeName))
@@ -13184,8 +13294,9 @@ public:
         {
             if (ArgumentProvablyMismatchesParameter(args[i], params[i]))
             {
-                LogError(std::format("no method of '{}.{}' matches the given arguments",
-                    ifaceName, methodName));
+                std::string why = DescribeFuncPtrSignatureMismatch(args[i].TypeAndValue, params[i]);
+                LogError(std::format("no method of '{}.{}' matches the given arguments{}",
+                    ifaceName, methodName, why.empty() ? "" : " - " + why));
                 return true;
             }
         }
@@ -15901,12 +16012,14 @@ public:
         tv.IsFunctionPointer = true;
         tv.FuncPtrReturnTypeName = chosen->ReturnType.TypeName;
         tv.FuncPtrReturnPointer = chosen->ReturnType.Pointer;
+        tv.FuncPtrReturnPointerDepth = chosen->ReturnType.ValuePointerDepth();
         for (const auto& p : chosen->Parameters)
         {
             TypeAndValue::FuncPtrParam fp;
             fp.TypeName = p.TypeName;
             fp.Pointer = p.Pointer;
             fp.IsMove = p.IsMove;
+            fp.PointerDepth = p.ValuePointerDepth();
             tv.FuncPtrParams.push_back(fp);
         }
         return tv;
@@ -16638,6 +16751,44 @@ public:
         return uniqueName;
     }
 
+    static std::string SourceFileLeaf(const std::string& path)
+    {
+        size_t slash = path.find_last_of("/\\");
+        return slash == std::string::npos ? path : path.substr(slash + 1);
+    }
+
+    /*
+     * A SECOND body for a mangled name - two definitions of one overload slot. Until now the first
+     * one silently won and the second was unreachable, so `int f(int)` written twice compiled and
+     * ran the first body. Since ToUniqueString became canonical, `f(int)` and `f(i32)` reach here
+     * too: they are one overload, and before that they were two that picked each other's arguments.
+     *
+     * Reported ONLY when both origins carry a real source line AND the LINES differ. Line 0 is a
+     * compiler-generated definition (lambda bodies, trampolines, thread shims) where re-entry is
+     * routine, and a file processed twice - as the primary input and as its own import - re-attaches
+     * the same body at the same line.
+     *
+     * The line alone is the discriminator; currentSourceFilePath_ is deliberately NOT part of it,
+     * only of the message. It is not stable across the LSP re-analysis path: a bulk sweep attached
+     * cocoa.cb's `setMenuHandler` twice under two different path values and the file comparison
+     * reported the single definition as a redefinition of itself. Two DIFFERENT files holding the
+     * same overload at the same line therefore go unreported - silence is the safe direction here,
+     * being exactly what the compiler did before.
+     */
+    void DiagnoseDuplicateFunctionBody(const std::string& functionName,
+        const std::string& mangledName, size_t line) const
+    {
+        auto it = functionBodyOrigin_.find(mangledName);
+        if (it == functionBodyOrigin_.end()) return;
+        const std::string& firstFile = it->second.first;
+        size_t firstLine = it->second.second;
+        if (line == 0 || firstLine == 0 || firstLine == line) return;
+        LogError(std::format("redefinition of '{}' - the same overload is already defined at "
+            "{}({}). Two parameter lists that differ only in a SPELLING of one type ('int' and "
+            "'i32' name the same type) are one overload, not two.",
+            functionName, firstFile, firstLine));
+    }
+
     llvm::Function* CreateFunctionDefinition(const std::string& functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, size_t scopeLine = 0)
     {
         llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs, external);
@@ -16656,6 +16807,7 @@ public:
         {
             if (!fn->empty())
             {
+                DiagnoseDuplicateFunctionBody(functionName, mangledName, line);
                 if (verbose) std::cout << std::format("[verbose] skipping duplicate definition of '{}'\n", functionName);
                 return fn;
             }
@@ -16666,6 +16818,10 @@ public:
         {
             fn = createFunctionProto(mangledName, functionType);
         }
+
+        // The slot this definition claims. Overwritten while the proto is still body-less, so the
+        // recorded origin is always the definition that actually attaches a body first.
+        functionBodyOrigin_[mangledName] = { SourceFileLeaf(currentSourceFilePath_), line };
 
         // CFlat treats null pointer dereferences as defined behavior (hardware fault -> SEH).
         // Ensure the attribute is set even on pre-declared functions that skipped createFunctionProto.
@@ -17089,60 +17245,425 @@ public:
     }
 
     /*
-     * TYPE CLASS of one component of a function-pointer signature - deliberately not its spelling.
-     * 'i' = any integer (any width or signedness, plus bool/char and an enum via its backing
-     * type), 'f' = floating point, 'p' = any pointer, 'v' = void. Returns 0 for everything else
-     * (a struct, an interface, an unsubstituted generic), which the caller treats as NOT PROOF.
+     * Canonical DESCRIPTOR of one component of a function-pointer signature. A function pointer's
+     * type is tracked in the type system rather than inferred from the LLVM value, which under
+     * opaque pointers carries no signature at all - so the proof below is made on the DECLARED
+     * components, canonicalized so that a differing spelling of one type is never mistaken for
+     * two types.
      *
-     * Comparing spellings instead would be a false-rejection engine: the compiler already treats
-     * int/i32, long/i64, u32/i32, `int*` and `void*`, an alias and its target, and an enum and its
-     * backing type as one type (see the scorer's own int==i32 rule below), so a differing name is
-     * not evidence of a differing type. Classes are coarse ON PURPOSE - a width or signedness
-     * difference lowers to the same register class and is left to bind exactly as it did before.
+     * `Known == false` means NO PROOF IS AVAILABLE: an interface, an unsubstituted generic
+     * parameter, a struct the compiler has not registered. Such a component can never contribute
+     * a rejection, so an unresolvable spelling keeps binding exactly as it did before.
      */
-    char FuncPtrTypeClass(const std::string& typeName, bool pointer) const
+    struct FuncPtrComponent
     {
-        if (pointer) return 'p';                  // every pointer is one class under opaque pointers
+        bool Known = false;
+        bool VoidPointee = false;   // `void*`: a wildcard over every pointee
+        std::string Canon;          // "i32", "f64", "p:v", "s", "p:s", ...
+        // Sorted candidate keys when Canon is "s"/"p:s". The SET is the answer, never one element.
+        std::vector<std::string> StructKeys;
+        // '*' count, or 0 for "not recorded" - one-sided like Known, so an unrecorded depth on
+        // either side proves nothing. Both Canon and this must be known to reject on depth.
+        int PointerDepth = 0;
+    };
+
+    // Resolve an alias chain (and an enum to its backing type) to whatever it ultimately names.
+    std::string ResolveFuncPtrTypeSpelling(const std::string& typeName) const
+    {
         std::string cur = typeName;
-        // Resolve an alias chain / enum to whatever it ultimately names.
         for (int hop = 0; hop < 8 && !cur.empty(); hop++)
         {
             if (auto a = typeAliases.find(cur); a != typeAliases.end()) { cur = a->second; continue; }
             if (auto e = enumBackingTypes.find(cur); e != enumBackingTypes.end()) { cur = e->second; continue; }
             break;
         }
-        if (cur.empty()) return 0;
-        if (cur == "void") return 'v';
-        if (cur == "bool") return 'i';
-        LLVMBackend::TypeAndValue probe;
-        probe.TypeName = cur;
-        if (probe.IsInteger() != -1)       return 'i';
-        if (probe.IsFloatingPoint() != -1) return 'f';
-        return 0;                                  // struct, interface, generic: unknown, not proof
+        return cur;
     }
 
     /*
-     * Signature of a function-pointer type as a string of TYPE CLASSES (return first, then each
-     * parameter), WITHOUT the thin/fat flavour ToUniqueString carries - a thin `function<>` value
-     * still widens into a fat `Lambda<>` parameter of the same signature (WidenThinToFat), so the
-     * flavour must not participate. Returns false if ANY component is of an unknown class: an
-     * unsubstituted generic or a struct proves nothing and must keep binding as it did before.
-     * Two signatures that both resolve and differ therefore differ in a component's TYPE, or in
-     * arity - never merely in how a type was spelled.
+     * Canonical token of a SCALAR type, or empty when the name is not a known scalar. The token is
+     * the LOWERED type, so the many spellings of one machine type collapse onto it: int/i32/u32
+     * all give "i32", long/i64/ulong all give the host's native width. `long` is 32 bits on
+     * Windows and 64 here, so `long` vs `i64` is one type on this host and two on Windows.
+     *
+     * SIGNEDNESS IS DELIBERATELY ABSENT. It is not part of an llvm::FunctionType - `u32(u32)` and
+     * `i32(i32)` both lower to `i32(i32)` - so a signedness difference is zero ABI risk and
+     * rejecting on it broke working programs. `bool` is NOT an integer here: it lowers to an `i1`
+     * return (`define internal i1 @_isPos_bool_int_(i32)`), so calling it through an `int(int)`
+     * pointer reads bits above bit 0 that the callee never defined.
      */
-    bool FuncPtrSignatureOf(const LLVMBackend::TypeAndValue& tv, std::string& out) const
+    std::string FuncPtrScalarCanon(const std::string& resolved) const
+    {
+        if (resolved == "void") return "v";
+        if (resolved == "bool") return "b";
+        LLVMBackend::TypeAndValue probe;
+        probe.TypeName = resolved;
+        int bits = probe.IsInteger();
+        if (bits != -1) return "i" + std::to_string(bits);
+        int fbits = probe.IsFloatingPoint();
+        if (fbits != -1) return "f" + std::to_string(fbits);
+        return "";
+    }
+
+    /*
+     * ABI-canonical form of a registered struct key. Every `__`-separated token that names a
+     * scalar is folded onto its LOWERED token (`Box__u32` and `Box__i32` both -> `Box__i32`);
+     * every other token is emitted verbatim, so a plain `Circle` is untouched.
+     *
+     * Monomorphization canonicalizes SOURCE identity and deliberately keeps signedness, because
+     * `u32` divides, compares and prints differently from `i32` - so `Box<i32>` and `Box<u32>`
+     * really are two instantiations. But neither signedness nor a spelling changes LAYOUT, so
+     * calling a `void(Box<i32>*)` through a `void(Box<u32>*)` pointer is safe, and rejecting it
+     * took away a working program. `Box<double>` vs `Box<i32>` still differs here (f64 vs i32)
+     * and is still caught - that is the memory-unsafe case, and it survives.
+     *
+     * `long` folds to the TARGET width, so `Box<long>` and `Box<i64>` are one key on LP64 and
+     * two on Windows, which is the truth on each.
+     *
+     * STRICTLY RELAXING, which is why this is a MAP over the key set and never a filter: the map
+     * is applied to both sides, so any key the two sets shared before still maps to a shared
+     * value, and a rejection can only be removed, never invented. Filtering keys OUT would be a
+     * tightening - the rule rejects on DISJOINT sets, so removing elements can only make two
+     * sets more disjoint.
+     */
+    std::string FuncPtrAbiCanonKey(const std::string& key) const
+    {
+        std::string out;
+        size_t i = 0;
+        for (;;)
+        {
+            size_t sep = key.find("__", i);
+            size_t end = (sep == std::string::npos) ? key.size() : sep;
+            std::string token = key.substr(i, end - i);
+
+            // Peel the reference-kind suffixes MangleTypeArg folded in ("int*" -> "intptr").
+            std::string suffix;
+            for (;;)
+            {
+                if (token.size() > 3 && token.compare(token.size() - 3, 3, "ptr") == 0)
+                { suffix = "ptr" + suffix; token.erase(token.size() - 3); continue; }
+                if (token.size() > 4 && token.compare(token.size() - 4, 4, "view") == 0)
+                { suffix = "view" + suffix; token.erase(token.size() - 4); continue; }
+                break;
+            }
+            // Rewrite ONLY a token that is a known scalar; anything else round-trips verbatim.
+            std::string canon = FuncPtrScalarCanon(ResolveFuncPtrTypeSpelling(token));
+            out += (canon.empty() ? token : canon) + suffix;
+
+            if (sep == std::string::npos) break;
+            out += "__";
+            i = sep + 2;
+        }
+        return out;
+    }
+
+    /*
+     * Every registered struct key a SPELLING could name: the key itself, plus any key whose
+     * trailing dotted component is the spelling. A signature records the raw source spelling
+     * (ResolveSigComponentCodegen keeps `ts->getText()` and no namespace resolution runs on that
+     * path), so a bare `Pt` written inside `namespace NS` arrives here as "Pt" and could mean the
+     * global `Pt` or `NS.Pt`.
+     *
+     * The caller compares SETS and never picks an element. Picking one would be a guess; and
+     * treating a multi-candidate spelling as "unknown" would let a single unrelated same-named
+     * struct - anywhere in the program or in anything it imports, referenced or not - silently
+     * disarm the pointee proof. Set DISJOINTNESS guesses nothing and is not defeatable that way.
+     */
+    std::vector<std::string> FuncPtrStructCandidates(const std::string& spelling) const
+    {
+        std::vector<std::string> keys;
+        if (spelling.empty() || interfaceTable.count(spelling) > 0) return keys;
+        for (const auto& entry : dataStructures)
+        {
+            const std::string& key = entry.first;
+            // The spelling matches a key outright, or matches its trailing dotted component.
+            bool tail = key.size() > spelling.size()
+                && key.compare(key.size() - spelling.size(), spelling.size(), spelling) == 0
+                && key[key.size() - spelling.size() - 1] == '.';
+            if (key != spelling && !tail) continue;
+            if (interfaceTable.count(key) > 0) continue;
+            // The SPELLING match is made on the raw key (that is what names the struct); the
+            // recorded identity is the ABI-canonical form, so two instantiations that differ
+            // only in a scalar spelling or in signedness compare equal.
+            keys.push_back(FuncPtrAbiCanonKey(key));
+        }
+        std::sort(keys.begin(), keys.end());
+        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+        return keys;
+    }
+
+    /*
+     * Descriptor of one component. `string` is normalized to `char*` BEFORE the pointer shape is
+     * read: it carries Pointer == false yet interconverts with `char*`/`i8*` at every call site.
+     */
+    FuncPtrComponent FuncPtrComponentOf(const std::string& typeName, bool pointer,
+        int pointerDepth = 0, const std::string& resolvedKey = "") const
+    {
+        FuncPtrComponent c;
+        c.PointerDepth = pointer ? pointerDepth : 0;
+        std::string resolved = ResolveFuncPtrTypeSpelling(typeName);
+        if (resolved.empty()) return c;
+        // `string` normalizes to char*, a single level - it cannot carry a written '*' count.
+        if (resolved == "string") { resolved = "char"; pointer = true; c.PointerDepth = 1; }
+
+        std::string scalar = FuncPtrScalarCanon(resolved);
+        if (!pointer)
+        {
+            if (!scalar.empty()) { c.Known = true; c.Canon = scalar; return c; }
+        }
+        else
+        {
+            if (scalar == "v") { c.Known = true; c.VoidPointee = true; c.Canon = "p:v"; return c; }
+            if (!scalar.empty()) { c.Known = true; c.Canon = "p:" + scalar; return c; }
+        }
+        // A spelling that names at least one registered struct carries its whole candidate set.
+        // An interface never does (a struct implementing it converts), nor does an unknown name.
+        std::vector<std::string> keys = FuncPtrStructCandidates(resolved);
+        // A recorded declaring-scope key collapses an ambiguity the compiler ITSELF resolved.
+        // Membership-only: a stale or wrong key can never invent a rejection, only narrow.
+        // The ABI-canon hop is kept, or Box<int> vs Box<i32> would start false-rejecting.
+        if (!resolvedKey.empty() && keys.size() > 1)
+        {
+            std::string canon = FuncPtrAbiCanonKey(resolvedKey);
+            if (std::find(keys.begin(), keys.end(), canon) != keys.end())
+                keys = { canon };
+        }
+        if (!keys.empty())
+        {
+            c.Known = true;
+            c.Canon = pointer ? "p:s" : "s";
+            c.StructKeys = std::move(keys);
+        }
+        return c;
+    }
+
+    /*
+     * One-sided: true only when BOTH components resolve AND name provably different types.
+     * A `void*` on either side is a wildcard over every other POINTER, matching the scorer's own
+     * "any pointer is implicitly convertible to void*" rule; against a non-pointer it is proof.
+     */
+    static bool ComponentsProvablyDiffer(const FuncPtrComponent& a, const FuncPtrComponent& b)
+    {
+        if (!a.Known || !b.Known) return false;
+        if (a.VoidPointee || b.VoidPointee)
+        {
+            bool aPtr = a.Canon.rfind("p:", 0) == 0;
+            bool bPtr = b.Canon.rfind("p:", 0) == 0;
+            if (aPtr && bPtr) return false;
+        }
+        if (a.Canon != b.Canon) return true;
+        // Same pointee, different number of '*'. Canon collapses every depth onto one "p:" token,
+        // so this is the only place `int*` and `int**` are told apart - and an unrecorded depth (0)
+        // on either side proves nothing, exactly like an unresolvable Canon.
+        if (a.PointerDepth > 0 && b.PointerDepth > 0 && a.PointerDepth != b.PointerDepth)
+            return true;
+        // Two struct spellings at the same shape. Proof is that NO registered struct could answer
+        // to BOTH; an intersection means one type satisfies both spellings, so nothing is proven.
+        if (!a.StructKeys.empty() && !b.StructKeys.empty())
+        {
+            std::vector<std::string> shared;
+            std::set_intersection(a.StructKeys.begin(), a.StructKeys.end(),
+                b.StructKeys.begin(), b.StructKeys.end(), std::back_inserter(shared));
+            return shared.empty();
+        }
+        return false;
+    }
+
+    /*
+     * Components of a function-pointer type (return first, then each parameter), WITHOUT the
+     * thin/fat flavour ToUniqueString carries - a thin `function<>` value still widens into a fat
+     * `Lambda<>` parameter of the same signature (WidenThinToFat), so the flavour must not
+     * participate. Returns false only when there is no signature at all to read.
+     */
+    bool FuncPtrSignatureOf(const LLVMBackend::TypeAndValue& tv, std::vector<FuncPtrComponent>& out) const
     {
         if (tv.FuncPtrReturnTypeName.empty()) return false;
-        char r = FuncPtrTypeClass(tv.FuncPtrReturnTypeName, tv.FuncPtrReturnPointer);
-        if (r == 0) return false;
-        out = std::string(1, r);
+        out.clear();
+        out.push_back(FuncPtrComponentOf(tv.FuncPtrReturnTypeName, tv.FuncPtrReturnPointer,
+            tv.FuncPtrReturnPointerDepth, tv.FuncPtrReturnResolvedKey));
         for (const auto& p : tv.FuncPtrParams)
-        {
-            char c = FuncPtrTypeClass(p.TypeName, p.Pointer);
-            if (c == 0) return false;
-            out += c;
-        }
+            out.push_back(FuncPtrComponentOf(p.TypeName, p.Pointer, p.PointerDepth, p.ResolvedTypeKey));
         return true;
+    }
+
+    /*
+     * PROOF that two function-pointer signatures name different function TYPES - the one question
+     * binding may reject on. One-sided throughout: a component unresolvable on either side
+     * accepts, and only a differing arity or a provably differing component rejects.
+     */
+    bool FuncPtrSignaturesProvablyDiffer(const LLVMBackend::TypeAndValue& a,
+        const LLVMBackend::TypeAndValue& b) const
+    {
+        std::vector<FuncPtrComponent> sa, sb;
+        if (!FuncPtrSignatureOf(a, sa) || !FuncPtrSignatureOf(b, sb))
+            return false;
+        if (sa.size() != sb.size())
+            return true;
+        for (size_t i = 0; i < sa.size(); i++)
+            if (ComponentsProvablyDiffer(sa[i], sb[i]))
+                return true;
+        return false;
+    }
+
+    // The function-pointer signature of ONE registered overload.
+    TypeAndValue FuncPtrSigOfSymbol(const FunctionSymbol& sym) const
+    {
+        TypeAndValue sig;
+        sig.IsFunctionPointer = true;
+        sig.TypeName = "__c_fn_ptr";
+        sig.FuncPtrReturnTypeName = sym.ReturnType.TypeName;
+        sig.FuncPtrReturnPointer = sym.ReturnType.Pointer;
+        sig.FuncPtrReturnPointerDepth = sym.ReturnType.ValuePointerDepth();
+        for (const auto& p : sym.Parameters)
+        {
+            TypeAndValue::FuncPtrParam fp;
+            fp.TypeName = p.TypeName;
+            fp.Pointer = p.Pointer;
+            fp.IsMove = p.IsMove;
+            fp.PointerDepth = p.ValuePointerDepth();
+            sig.FuncPtrParams.push_back(fp);
+        }
+        return sig;
+    }
+
+    /*
+     * PROOF that a NAMED function cannot satisfy a function-pointer parameter. A named function
+     * argument carries no signature on its own TypeAndValue - the value IS the function - so the
+     * component proof was skipped entirely for it and `slot(fDbl)` silently entered a
+     * `double(double)` body through an `int(int)` slot, returning a plausible wrong number.
+     *
+     * One-sided over the OVERLOAD SET, the same shape as the struct-candidate rule: proof requires
+     * EVERY overload of the name to be provably different, because one that could bind is a
+     * legitimate reading of the call. An unregistered name proves nothing.
+     */
+    bool NamedFunctionProvablyMismatchesFuncPtr(const std::string& functionName,
+        const TypeAndValue& param) const
+    {
+        auto it = functionTable.find(functionName);
+        if (it == functionTable.end() || it->second.empty()) return false;
+        for (const auto& sym : it->second)
+            if (!FuncPtrSignaturesProvablyDiffer(FuncPtrSigOfSymbol(sym), param))
+                return false;
+        return true;
+    }
+
+    /*
+     * Does this ARGUMENT name a function whose every overload is wrong for this parameter? Applies
+     * only when the argument carries no signature of its own: a `function<>` VALUE is judged on its
+     * declared type, and a local whose name shadows a function is that local, not the function.
+     */
+    bool NamedFunctionArgMismatches(const NamedVariable& arg, const TypeAndValue& param) const
+    {
+        if (!param.IsFunctionPointer || arg.CallerName.empty()) return false;
+        if (!arg.TypeAndValue.FuncPtrReturnTypeName.empty()) return false;
+        if (FindVariableStorage(arg.CallerName).Storage != nullptr) return false;
+        return NamedFunctionProvablyMismatchesFuncPtr(arg.CallerName, param);
+    }
+
+    // Source-shaped rendering of a function-pointer signature, for diagnostics: `double(double)`.
+    std::string FuncPtrSpellingOf(const LLVMBackend::TypeAndValue& tv) const
+    {
+        // One '*' per recorded level, so a depth mismatch is visible as `int**` vs `int*` rather
+        // than as two identical-looking spellings.
+        auto stars = [](bool ptr, int depth) {
+            return std::string(ptr ? (depth > 0 ? (size_t)depth : 1) : 0, '*');
+        };
+        std::string s = tv.FuncPtrReturnTypeName
+                      + stars(tv.FuncPtrReturnPointer, tv.FuncPtrReturnPointerDepth) + "(";
+        for (size_t i = 0; i < tv.FuncPtrParams.size(); i++)
+        {
+            if (i > 0) s += ", ";
+            s += tv.FuncPtrParams[i].TypeName;
+            s += stars(tv.FuncPtrParams[i].Pointer, tv.FuncPtrParams[i].PointerDepth);
+        }
+        return s + ")";
+    }
+
+    // WHICH component of two signatures differs, as a diagnostic tail. Empty when nothing is
+    // provably different. Shared, so the argument-site and bind-site messages cannot drift apart.
+    std::string FuncPtrDifferenceOf(const std::vector<FuncPtrComponent>& sa,
+        const std::vector<FuncPtrComponent>& sb) const
+    {
+        if (sa.size() != sb.size())
+            return std::format("arity differs: one takes {} parameter(s), the other {}",
+                sa.size() - 1, sb.size() - 1);
+        for (size_t i = 0; i < sa.size(); i++)
+            if (ComponentsProvablyDiffer(sa[i], sb[i]))
+                return (i == 0) ? "the return type differs" : std::format("parameter {} differs", i);
+        return "";
+    }
+
+    /*
+     * Why this function-pointer argument cannot bind this parameter, naming the mechanism and the
+     * component that differs. Empty when it can bind. Purely explanatory - it states what
+     * FuncPtrSignaturesProvablyDiffer already decided and never widens the rejection.
+     */
+    std::string DescribeFuncPtrSignatureMismatch(const LLVMBackend::TypeAndValue& arg,
+        const LLVMBackend::TypeAndValue& param) const
+    {
+        std::vector<FuncPtrComponent> sa, sb;
+        if (!FuncPtrSignatureOf(arg, sa) || !FuncPtrSignatureOf(param, sb))
+            return "";
+        std::string why = FuncPtrDifferenceOf(sa, sb);
+        if (why.empty()) return "";
+        return std::format(
+            "function-pointer signature mismatch: parameter takes '{}' but the argument is "
+            "'{}' - {}", FuncPtrSpellingOf(param), FuncPtrSpellingOf(arg), why);
+    }
+
+    /*
+     * Why a NAMED function cannot be entered through a destination function-pointer type. Empty
+     * when it can be. Deliberately NOT the same rule as the argument path:
+     *
+     * A function taking FEWER parameters than the slot supplies is legal here and load-bearing.
+     * The synthesized `onStdout` field is declared `void(char*, int)` and a `void(char*)` callback
+     * is the form doc/LANGUAGE.md documents; under cdecl the caller cleans up, so the argument the
+     * callee never reads is simply ignored. The MIRROR direction is not safe and stays proof - a
+     * callee taking more parameters than the slot supplies reads one the caller never passed.
+     * Component types must agree across the shared prefix either way.
+     */
+    std::string DescribeFuncPtrBindMismatch(const std::string& functionName,
+        const LLVMBackend::TypeAndValue& fn, const LLVMBackend::TypeAndValue& dest) const
+    {
+        std::vector<FuncPtrComponent> sa, sb;
+        if (!FuncPtrSignatureOf(fn, sa) || !FuncPtrSignatureOf(dest, sb))
+            return "";
+        std::string why;
+        if (sa.size() > sb.size())
+            why = std::format("it takes {} parameter(s) but the slot supplies only {}",
+                sa.size() - 1, sb.size() - 1);
+        for (size_t i = 0; i < sa.size() && why.empty(); i++)
+            if (ComponentsProvablyDiffer(sa[i], sb[i]))
+                why = (i == 0) ? "the return type differs" : std::format("parameter {} differs", i);
+        if (why.empty()) return "";
+        return std::format("cannot bind function '{}' to function-pointer type '{}': '{}' is "
+            "'{}' - {}. A function pointer is called with no conversion site, so the signature "
+            "has to match.",
+            functionName, FuncPtrSpellingOf(dest), functionName, FuncPtrSpellingOf(fn), why);
+    }
+
+    /*
+     * An argument that IS code: a function pointer, a closure value, or a function symbol. One
+     * predicate for the two readers that must not drift - the funcptr overload arm, which accepts
+     * such an argument for a function-pointer parameter, and the void* implicit-conversion leg,
+     * which refuses it. The trailing "any pointer" catch-all of the funcptr arm is deliberately
+     * NOT here: that one is about the parameter being a closure slot, not about the argument.
+     *
+     * A recorded SIGNATURE counts, and is the form the direct call-argument loop produces: it
+     * copies the three signature fields of a stored `function<>` without setting IsFunctionPointer
+     * or TypeName (see their declaration), so that is the only evidence such an argument carries.
+     */
+    bool ArgumentIsFunctionPointerish(const NamedVariable& arg) const
+    {
+        return arg.TypeAndValue.IsFunctionPointer
+            || !arg.TypeAndValue.FuncPtrReturnTypeName.empty()
+            || arg.TypeAndValue.TypeName == "__c_fn_ptr"
+            || arg.TypeAndValue.TypeName == "__closure_fat_ptr"
+            || IsEncodedClosureType(arg.TypeAndValue.TypeName)
+            || (arg.BaseType && arg.BaseType->isStructTy()
+                && llvm::isa<llvm::StructType>(arg.BaseType)
+                && llvm::cast<llvm::StructType>(arg.BaseType)->getName() == "__closure_fat_ptr")
+            || (arg.Primary && llvm::isa<llvm::Function>(arg.Primary));
     }
 
     std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> candidates) const
@@ -17185,13 +17706,7 @@ public:
                 // An encoded closure param (list<Lambda<...>>::add's `T value`, gap a) accepts the same
                 // arguments; an encoded closure arg satisfies a function<T> param likewise.
                 if ((candidateParamItr->IsFunctionPointer || IsEncodedClosureType(candidateParamItr->TypeName))
-                    && (arg.TypeAndValue.IsFunctionPointer
-                        || arg.TypeAndValue.TypeName == "__closure_fat_ptr"
-                        || IsEncodedClosureType(arg.TypeAndValue.TypeName)
-                        || (arg.BaseType && arg.BaseType->isStructTy()
-                            && llvm::isa<llvm::StructType>(arg.BaseType)
-                            && llvm::cast<llvm::StructType>(arg.BaseType)->getName() == "__closure_fat_ptr")
-                        || (arg.Primary && llvm::isa<llvm::Function>(arg.Primary))
+                    && (ArgumentIsFunctionPointerish(arg)
                         || (arg.BaseType && arg.BaseType->isPointerTy())))
                 {
                     // `function<T>`, `function<T>*` and `function<T>[]` are three DISTINCT
@@ -17201,16 +17716,15 @@ public:
                     if (result != 0)
                         shapeMismatches++;
 
-                    // Shapes agree: signatures of KNOWN type classes that differ are proof.
-                    // Only at equal shape - a shape mismatch stays score-1 bindable.
-                    if (result == 0)
-                    {
-                        std::string argSig, paramSig;
-                        if (FuncPtrSignatureOf(arg.TypeAndValue, argSig)
-                            && FuncPtrSignatureOf(*candidateParamItr, paramSig)
-                            && argSig != paramSig)
-                            result = -1;
-                    }
+                    // Shapes agree: signatures that provably name different function types are
+                    // proof. Only at equal shape - a shape mismatch stays score-1 bindable.
+                    if (result == 0
+                        && FuncPtrSignaturesProvablyDiffer(arg.TypeAndValue, *candidateParamItr))
+                        result = -1;
+                    // A NAMED function argument carries its signature in the function table, not
+                    // on the argument, so it needs the overload-set form of the same proof.
+                    if (result != -1 && NamedFunctionArgMismatches(arg, *candidateParamItr))
+                        result = -1;
                 }
                 else if (arg.TypeAndValue.TypeName != "")
                 {
@@ -17264,7 +17778,10 @@ public:
                                 result = (myFP == otherFP) ? 0 : 1;
                         }
 
-                        // Any pointer type is implicitly convertible to void*.
+                        // Any pointer type is implicitly convertible to void*. Deliberately NOT
+                        // gated on the argument's function-ness: `function<T>*` is the ADDRESS of a
+                        // slot, i.e. data. The gate that refuses a function-pointer VALUE is in the
+                        // empty-TypeName branch below - the shape such a value actually arrives in.
                         if (result < 0 && arg.TypeAndValue.Pointer &&
                             candidateParamItr->Pointer && candidateParamItr->TypeName == "void")
                         {
@@ -17293,6 +17810,24 @@ public:
                 {
                     auto candidateParam = GetType(*candidateParamItr);
                     result = CompareUpconvert(arg.BaseType, candidateParam);
+
+                    /*
+                     * A function pointer or closure VALUE does not implicitly convert to `void*` -
+                     * it is code, not data, and ISO C has no function-to-object-pointer conversion
+                     * either. Without this a candidate refuted on its SIGNATURE silently rebound
+                     * onto a `void*` sibling. This branch is where such a value arrives: the
+                     * call-argument loop copies its signature but deliberately leaves TypeName
+                     * empty, and opaque pointers then make CompareUpconvert accept it.
+                     *
+                     * Only the plain-VALUE shape is refused, decided by the same helper the funcptr
+                     * arm uses: a `function<T>*` is the ADDRESS of a slot and a `function<T>[N]`
+                     * decays to one, and both are plain data pointers that must keep converting.
+                     */
+                    if (result >= 0 && candidateParamItr->Pointer
+                        && candidateParamItr->TypeName == "void"
+                        && FunctionPointerShapeOf(arg.TypeAndValue, &arg) == 0
+                        && ArgumentIsFunctionPointerish(arg))
+                        result = -1;
 
                     // Opaque pointers make every pointer pair look identical to CompareUpconvert.
                     // An argument whose CFlat type is unknown (empty TypeName - primitive pointers
@@ -17831,6 +18366,21 @@ public:
                 }
             }
 
+            // Name the mechanism when a candidate was dropped for a function-pointer SIGNATURE:
+            // the dump above prints only `arg=ptr param=__c_fn_ptr`, which points at no cause.
+            for (const auto& c : candidates)
+            {
+                auto pi = c.Parameters.begin();
+                for (size_t i = 0; i < arguments.size() && pi != c.Parameters.end(); i++, ++pi)
+                {
+                    if (!pi->IsFunctionPointer) continue;
+                    std::string why = DescribeFuncPtrSignatureMismatch(arguments[i].TypeAndValue, *pi);
+                    if (why.empty()) continue;
+                    msg += std::format("  [{}] {}\n", c.UniqueName, why);
+                    break;
+                }
+            }
+
             LogError(msg);
             return nullptr;
         }
@@ -18291,17 +18841,52 @@ public:
         return !sawCountMatch;
     }
 
+    /*
+     * `destSig` is the DESTINATION's declared function-pointer type, when the caller has one. It
+     * is proof: an overload the comparator proves is a different function type cannot be entered
+     * through this pointer, because an indirect call has no conversion site. Until it was
+     * consulted, this function selected on name, arity and `move` flags alone and returned its
+     * candidate unconditionally - `function<int(int)> g = dd;` with `double dd(double)` entered
+     * `dd` as an `int(int)` and printed a plausible wrong number, and a WIDER pointee
+     * (`void(C2*)` into a `void(S2*)` slot) read past the end of the caller's object.
+     *
+     * One-sided over the overload set: refused only when EVERY overload is refuted, so a name the
+     * comparator cannot resolve keeps binding exactly as before.
+     */
     llvm::Function* GetFunctionForFuncPtr(std::string functionName, int expectedParamCount = -1,
-                                          const std::vector<TypeAndValue::FuncPtrParam>* expectedParams = nullptr)
+                                          const std::vector<TypeAndValue::FuncPtrParam>* expectedParams = nullptr,
+                                          const TypeAndValue* destSig = nullptr)
     {
         functionName = ResolveQualifiedName(functionName);
         auto it = functionTable.find(functionName);
         if (it == functionTable.end() || it->second.empty())
             return module->getFunction(functionName);
 
-        const auto& overloads = it->second;
+        std::vector<const FunctionSymbol*> viable;
+        for (const auto& sym : it->second) viable.push_back(&sym);
+
+        if (destSig != nullptr && !destSig->FuncPtrReturnTypeName.empty())
+        {
+            // The DESCRIBE function is the rule: asking it keeps the verdict and the message from
+            // ever disagreeing about which overloads were refused and why.
+            std::vector<const FunctionSymbol*> bindable;
+            for (auto* sym : viable)
+                if (DescribeFuncPtrBindMismatch(functionName, FuncPtrSigOfSymbol(*sym), *destSig).empty())
+                    bindable.push_back(sym);
+            if (bindable.empty())
+            {
+                LogError(DescribeFuncPtrBindMismatch(functionName,
+                    FuncPtrSigOfSymbol(*viable.front()), *destSig));
+            }
+            else
+            {
+                viable = std::move(bindable);
+            }
+        }
+
+        const auto& overloads = viable;
         if (overloads.size() == 1)
-            return overloads.front().Function;
+            return overloads.front()->Function;
 
         // When expectedParams is provided, prefer the overload whose per-param IsMove flags match exactly.
         auto moveFlagsMatch = [&](const FunctionSymbol& sym) -> bool {
@@ -18313,28 +18898,28 @@ public:
         };
 
         // Pass 1: non-method, param count + move flags match.
-        for (const auto& sym : overloads)
+        for (const auto* sym : overloads)
         {
-            if (sym.IsMethod) continue;
-            if (expectedParamCount >= 0 && (int)sym.Parameters.size() != expectedParamCount) continue;
-            if (!moveFlagsMatch(sym)) continue;
-            return sym.Function;
+            if (sym->IsMethod) continue;
+            if (expectedParamCount >= 0 && (int)sym->Parameters.size() != expectedParamCount) continue;
+            if (!moveFlagsMatch(*sym)) continue;
+            return sym->Function;
         }
         // Pass 2: non-method, count only (legacy behavior when no expectedParams).
-        for (const auto& sym : overloads)
+        for (const auto* sym : overloads)
         {
-            if (sym.IsMethod) continue;
-            if (expectedParamCount < 0 || (int)sym.Parameters.size() == expectedParamCount)
-                return sym.Function;
+            if (sym->IsMethod) continue;
+            if (expectedParamCount < 0 || (int)sym->Parameters.size() == expectedParamCount)
+                return sym->Function;
         }
         // Fallback: any overload whose effective (non-self) param count matches.
-        for (const auto& sym : overloads)
+        for (const auto* sym : overloads)
         {
-            int effectiveCount = sym.IsMethod ? (int)sym.Parameters.size() - 1 : (int)sym.Parameters.size();
+            int effectiveCount = sym->IsMethod ? (int)sym->Parameters.size() - 1 : (int)sym->Parameters.size();
             if (expectedParamCount < 0 || effectiveCount == expectedParamCount)
-                return sym.Function;
+                return sym->Function;
         }
-        return overloads.front().Function;
+        return overloads.front()->Function;
     }
 
     NamedVariable GetLocalVariable(const std::string& name)

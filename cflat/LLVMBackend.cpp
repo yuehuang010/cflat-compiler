@@ -776,6 +776,9 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             // pre-declared as an opaque struct shell (it is a fat-pointer interface).
             if (auto* tu = computeUnit->translationUnit())
             {
+                // Pure-rename `using` aliases first: MangleTypeArg folds them, and both passes
+                // must see the same set no matter where the `using` sits in the file.
+                scanner.PreRegisterRenameAliases(tu);
                 scanner.ScanGenericInterfaceTemplateNames(tu);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanGenericTypeUses(decl);
@@ -1588,6 +1591,8 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         // Generic interface templates first (see the main-file scan for why).
         if (auto* tu = computeUnit->translationUnit())
         {
+            // Pure-rename `using` aliases first (see the main-file scan for why).
+            scanner.PreRegisterRenameAliases(tu);
             scanner.ScanGenericInterfaceTemplateNames(tu);
             for (auto* decl : tu->externalDeclaration())
                 scanner.ScanGenericTypeUses(decl);
@@ -2342,6 +2347,9 @@ bool LLVMBackend::Analyze(const std::string& filePath,
             // pre-declared as an opaque struct shell (it is a fat-pointer interface).
             if (auto* tu = computeUnit->translationUnit())
             {
+                // Pure-rename `using` aliases first: MangleTypeArg folds them, and both passes
+                // must see the same set no matter where the `using` sits in the file.
+                scanner.PreRegisterRenameAliases(tu);
                 scanner.ScanGenericInterfaceTemplateNames(tu);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanGenericTypeUses(decl);
@@ -2424,6 +2432,9 @@ void LLVMBackend::ResetForReanalysis()
 
     functionTable.clear();
     dataStructures.clear();
+    // Body origins describe definitions in the module just discarded; a survivor would make the
+    // next analysis of the same file report its own definition as a redefinition of itself.
+    functionBodyOrigin_.clear();
     // Memoized full-destructor wrappers are synthesized llvm::Function* objects that live
     // in `module`, so they MUST be discarded with it - a stale entry would hand the next
     // file's analysis a Function* into the freed module/context, which crashes the moment a
@@ -2469,6 +2480,7 @@ void LLVMBackend::ResetForReanalysis()
     programTable.clear();
     enumBackingTypes.clear();
     typeAliases.clear();
+    manglingAliases_.clear();
     genericBaseAliases_.clear();
     functionTypeAliases.clear();
     interfaceTable.clear();
@@ -4200,6 +4212,12 @@ static llvm::json::Object SerializeTav(const TAV& t)
         o["fp"]  = true;
         o["fpr"] = t.FuncPtrReturnTypeName;
         if (t.FuncPtrReturnPointer) o["fprp"] = true;
+        // Depth is only written when it is above the single level a bare `Pointer` already
+        // implies, so a warm cache written before depth existed still reads back identically.
+        if (t.FuncPtrReturnPointerDepth > 1)
+            o["fprd"] = static_cast<int64_t>(t.FuncPtrReturnPointerDepth);
+        // Omitted when empty, which is exactly "not recorded" on the way back in.
+        if (!t.FuncPtrReturnResolvedKey.empty()) o["fprk"] = t.FuncPtrReturnResolvedKey;
         llvm::json::Array fps;
         for (auto& p : t.FuncPtrParams)
         {
@@ -4207,6 +4225,8 @@ static llvm::json::Object SerializeTav(const TAV& t)
             po["t"] = p.TypeName;
             if (p.Pointer) po["p"] = true;
             if (p.IsMove)  po["mv"] = true;
+            if (p.PointerDepth > 1) po["pd"] = static_cast<int64_t>(p.PointerDepth);
+            if (!p.ResolvedTypeKey.empty()) po["rk"] = p.ResolvedTypeKey;
             fps.push_back(std::move(po));
         }
         o["fpp"] = std::move(fps);
@@ -4260,6 +4280,10 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     {
         if (auto v = o.getString("fpr"))   t.FuncPtrReturnTypeName = v->str();
         if (auto v = o.getBoolean("fprp")) t.FuncPtrReturnPointer = *v;
+        // A pointer with no explicit depth is depth 1 - the level `Pointer` itself asserts.
+        if (t.FuncPtrReturnPointer) t.FuncPtrReturnPointerDepth = 1;
+        if (auto v = o.getInteger("fprd")) t.FuncPtrReturnPointerDepth = static_cast<int>(*v);
+        if (auto v = o.getString("fprk")) t.FuncPtrReturnResolvedKey = v->str();
         if (auto* fps = o.getArray("fpp"))
             for (auto& elem : *fps)
                 if (auto* po = elem.getAsObject())
@@ -4268,6 +4292,9 @@ static TAV DeserializeTav(const llvm::json::Object& o)
                     if (auto v = po->getString("t"))  p.TypeName = v->str();
                     if (auto v = po->getBoolean("p")) p.Pointer = *v;
                     if (auto v = po->getBoolean("mv"))p.IsMove = *v;
+                    if (p.Pointer) p.PointerDepth = 1;
+                    if (auto v = po->getInteger("pd")) p.PointerDepth = static_cast<int>(*v);
+                    if (auto v = po->getString("rk")) p.ResolvedTypeKey = v->str();
                     t.FuncPtrParams.push_back(std::move(p));
                 }
     }
@@ -4578,6 +4605,15 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
         root["type_aliases"] = std::move(obj);
     }
 
+    // manglingAliases_ - pure-rename `using` aliases MangleTypeArg folds. A warm cache never
+    // re-scans the core .cb files, so without this a core alias (os.posix.cb `using win_int = i32`)
+    // would mangle transparently cold and opaquely warm.
+    {
+        llvm::json::Object obj;
+        for (auto& [k, v] : manglingAliases_) obj[k] = v;
+        root["mangling_aliases"] = std::move(obj);
+    }
+
     // enumBackingTypes
     {
         llvm::json::Object obj;
@@ -4882,6 +4918,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     globalDtorOrder_.clear();
     namespaceTable.clear();
     typeAliases.clear();
+    manglingAliases_.clear();
     enumBackingTypes.clear();
     // strConcatRegistered / stringDtorRegistered: will be set below after deserialization
     // verifies the functions are present in the bitcode.
@@ -4915,6 +4952,11 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     if (auto* obj = root->getObject("type_aliases"))
         for (auto& kv : *obj)
             if (auto v = kv.second.getAsString()) typeAliases[kv.first.str()] = v->str();
+
+    // manglingAliases_ - pure-rename aliases the mangler folds (see the write side).
+    if (auto* obj = root->getObject("mangling_aliases"))
+        for (auto& kv : *obj)
+            if (auto v = kv.second.getAsString()) manglingAliases_[kv.first.str()] = v->str();
 
     // enumBackingTypes
     if (auto* obj = root->getObject("enum_backing_types"))

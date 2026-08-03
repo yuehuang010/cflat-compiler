@@ -209,6 +209,230 @@ expect_error("no method of 'ISigSlot.lam' matches the given arguments") {
     }
 }
 
+// The proof above was originally on coarse type CLASSES ('i' integer / 'f' floating point /
+// 'p' pointer / 'v' void), so every mismatch WITHIN a class stayed invisible and the callee was
+// still called at the wrong type. It is now on canonical COMPONENTS - width, signedness, pointee
+// identity, aggregate-vs-scalar - and each leg below is one axis that class comparison could not
+// see. Every one compiled and ran silently at exit 0 before this change.
+//
+// Same construction rule as the two legs above: TWO overloads of the SAME arity, so the arity
+// filter leaves both and the overload SCORER is what decides. A single overload would exercise
+// the single-candidate path instead and prove nothing about the scorer.
+
+// Floating-point WIDTH. Same SHAPE as the class-level leg above; 'float' and 'double' are one
+// class, so this printed d=0 with no diagnostic.
+expect_error("no overload of 'lamW' matches the given arguments") {
+    float fpWidthFn(float x) { return x + 1.5f; }
+
+    class SigFpWidth
+    {
+        int lamW(function<double(double)> f) { return (int)f(2.0); }
+        int lamW(int n)                      { return 200 + n; }
+    };
+
+    int passFpWidth()
+    {
+        SigFpWidth d;
+        function<float(float)> g = fpWidthFn;
+        return d.lamW(g);
+    }
+}
+
+// POINTEE type - the memory-unsafe axis. 'Circle*' and 'Square*' are one class under opaque
+// pointers, so 'onCircleP' read c->area past the end of a 4-byte Square and exited 0.
+// Both struct names are unique here; the 'lamZ' leg below covers the colliding case, which must
+// reach the SAME verdict - an unrelated same-named struct never changes an answer.
+expect_error("no overload of 'lamP' matches the given arguments") {
+    struct CircleP { int r = default; double area = default; };
+    struct SquareP { int side = default; };
+    void onCircleP(CircleP* c) { int unused = c->r + (int)c->area; }
+
+    class SigPointee
+    {
+        int lamP(function<void(SquareP*)> f) { SquareP s; s.side = 77; f(&s); return 7; }
+        int lamP(double d)                   { return 200 + (int)d; }
+    };
+
+    int passWrongPointee()
+    {
+        SigPointee d;
+        function<void(CircleP*)> g = onCircleP;
+        return d.lamP(g);
+    }
+}
+
+// The pointee proof must not be DEFEATABLE by an unrelated declaration. A signature stores the
+// raw source spelling, so 'SquareZ' alone cannot say which registered struct it means. An earlier
+// revision resolved the spelling to a single key and treated "more than one candidate" as
+// unknown-so-bind - which meant the one line below, a struct nobody references, silently disarmed
+// the leg above and let 'onCircleZ' read past a 4-byte object again (exit 0, area=0.000000).
+// The comparator now compares CANDIDATE SETS and rejects when they are DISJOINT, so an extra
+// same-named struct cannot change any verdict.
+//
+// THE 'namespace ZzUnrelated' DECLARATION BELOW IS LOAD-BEARING. Deleting it does not break this
+// test - it makes it stop testing what it was written for. Keep it, and keep it unreferenced.
+expect_error("no overload of 'lamZ' matches the given arguments") {
+    namespace ZzUnrelated { struct SquareZ { int unrelated = default; }; }
+
+    struct CircleZ { int r = default; double area = default; };
+    struct SquareZ { int side = default; };
+    void onCircleZ(CircleZ* c) { int unused = c->r + (int)c->area; }
+
+    class SigCollide
+    {
+        int lamZ(function<void(SquareZ*)> f) { SquareZ s; s.side = 3; f(&s); return 5; }
+        int lamZ(double d)                   { return 700 + (int)d; }
+    };
+
+    int passCollidingPointee()
+    {
+        SigCollide d;
+        function<void(CircleZ*)> g = onCircleZ;
+        return d.lamZ(g);
+    }
+}
+
+// Integer WIDTH. 'i8' and 'i64' were one class, so an i8 callee invoked through an i64 pointer
+// printed 705032705. SIGNEDNESS is deliberately NOT an axis here: `u32(u32)` and `i32(i32)` lower
+// to the same llvm::FunctionType, so a signedness-only difference must BIND - the positive legs
+// for that are in Test/test_function_ptr.cb ("u32/int crossing", "char*/u8* crossing").
+// The 'lamU' leg below differs in WIDTH too (u64 vs i32); it is not a signedness test.
+expect_error("no overload of 'lamI' matches the given arguments") {
+    i8 narrowFn(i8 x) { return (i8)(x + 1); }
+
+    class SigIntWidth
+    {
+        int lamI(function<i64(i64)> f) { return (int)f(5000000000); }
+        int lamI(double d)             { return 200 + (int)d; }
+    };
+
+    int passNarrowIntoWide()
+    {
+        SigIntWidth d;
+        function<i8(i8)> g = narrowFn;
+        return d.lamI(g);
+    }
+}
+
+expect_error("no overload of 'lamU' matches the given arguments") {
+    u64 unsignedFn(u64 x) { return x + 1; }
+
+    class SigSignedness
+    {
+        int lamU(function<i32(i32)> f) { return f(-4); }
+        int lamU(double d)             { return 200 + (int)d; }
+    };
+
+    int passUnsignedIntoSigned()
+    {
+        SigSignedness d;
+        function<u64(u64)> g = unsignedFn;
+        return d.lamU(g);
+    }
+}
+
+// AGGREGATE. A struct component used to make the WHOLE signature unresolvable (one unknown
+// component abandoned the comparison), so a struct-taking callee bound an 'int' slot and was
+// handed 9 as a two-field Pt. Components are now judged one at a time, so an unknown component
+// no longer launders a KNOWN mismatch elsewhere in the same signature.
+expect_error("no overload of 'lamA' matches the given arguments") {
+    struct PtA { int x = default; int y = default; };
+    void onPtA(PtA p) { int unused = p.x + p.y; }
+
+    class SigAggregate
+    {
+        int lamA(function<void(int)> f) { f(9); return 7; }
+        int lamA(double d)              { return 200 + (int)d; }
+    };
+
+    int passStructIntoIntSlot()
+    {
+        SigAggregate d;
+        function<void(PtA)> g = onPtA;
+        return d.lamA(g);
+    }
+}
+
+// `bool` is its OWN component, not an integer: it lowers to an `i1` return
+// (`define internal i1 @_isPos_bool_int_(i32)`), so a bool callee entered through an `int(int)`
+// pointer reads undefined bits above bit 0. Master happened to print the right answer for a
+// 0/1 result, which is exactly the kind of luck this proof exists to stop relying on.
+expect_error("no overload of 'lamB' matches the given arguments") {
+    bool boolFn(int x) { return x > 0; }
+
+    class SigBool
+    {
+        int lamB(function<int(int)> f) { return f(5); }
+        int lamB(double d)             { return 200 + (int)d; }
+    };
+
+    int passBoolIntoInt()
+    {
+        SigBool d;
+        function<bool(int)> g = boolFn;
+        return d.lamB(g);
+    }
+}
+
+// The VIRTUAL arm of the same axis (ArgumentProvablyMismatchesParameter, reached through the
+// interface slot resolver). Two same-arity slots, so this pins the multi-candidate fallback.
+expect_error("no method of 'ISigPointee.lamV' matches the given arguments") {
+    struct CircleV { int r = default; double area = default; };
+    struct SquareV { int side = default; };
+    void onCircleV(CircleV* c) { int unused = c->r + (int)c->area; }
+
+    interface ISigPointee
+    {
+        int lamV(function<void(SquareV*)> f);
+        int lamV(double d);
+    };
+    class SigPointeeImpl : ISigPointee
+    {
+        int lamV(function<void(SquareV*)> f) { SquareV s; s.side = 77; f(&s); return 7; }
+        int lamV(double d)                   { return 200 + (int)d; }
+    };
+
+    int passWrongPointeeVirtual()
+    {
+        SigPointeeImpl impl;
+        ISigPointee io = impl;
+        function<void(CircleV*)> g = onCircleV;
+        return io.lamV(g);
+    }
+}
+
+// The interface LONE-SLOT arm - one slot only, so the arity filter leaves a single candidate and
+// the multi-candidate fallback above is never reached. Discriminator: exactly one 'lamL'.
+expect_error("no method of 'ISigLone.lamL' matches the given arguments") {
+    float fpLoneFn(float x) { return x + 1.5f; }
+
+    interface ISigLone { int lamL(function<double(double)> f); };
+    class SigLoneImpl : ISigLone { int lamL(function<double(double)> f) { return (int)f(2.0); } };
+
+    int passFpWidthLoneSlot()
+    {
+        SigLoneImpl impl;
+        ISigLone io = impl;
+        function<float(float)> g = fpLoneFn;
+        return io.lamL(g);
+    }
+}
+
+// The SINGLE-CANDIDATE direct path - one overload, so the scorer's multi-candidate ranking never
+// runs. Discriminator: exactly one 'lamS'. This is the path round 1 of an earlier attempt broke.
+expect_error("no overload of 'lamS' matches the given arguments") {
+    float fpSingleFn(float x) { return x + 1.5f; }
+
+    class SigSingle { int lamS(function<double(double)> f) { return (int)f(2.0); } };
+
+    int passFpWidthSingleCandidate()
+    {
+        SigSingle d;
+        function<float(float)> g = fpSingleFn;
+        return d.lamS(g);
+    }
+}
+
 // `move` is part of a function-pointer TYPE, so a fat parameter that TAKES OWNERSHIP cannot be
 // bound by a function whose own parameter only borrows - the callee would be handed a pointer it
 // must free and does not. This rejection lives in the same fat-argument arm as the gates above,
@@ -236,5 +460,151 @@ expect_error("has no overload matching the 'move' modifiers required by paramete
     int passBorrowIntoMoveClosure()
     {
         return takesMoveClosure(borrowsOnly);
+    }
+}
+
+// A GENERIC INSTANTIATION pointee whose type argument changes the LAYOUT. The mangled key is
+// ABI-canonicalized before comparison, so `SigBoxE<i32>` and `SigBoxE<u32>` - and `<int>`/`<i32>`,
+// and `<long>`/`<i64>` on an LP64 target - are ONE key and still bind (value legs in
+// Test/test_function_ptr.cb). `double` is a different lowered type, not a different spelling of
+// the same one, so this one must still be caught: `onBoxDoubleE` writes 8 bytes of double into
+// the 4-byte object the slot allocated.
+//
+// This is the leg that proves the canonicalization is a NARROWING of the reject set and not its
+// removal. If it ever starts passing, the generic-pointee proof has been lost entirely.
+
+expect_error("function-pointer signature mismatch") {
+    struct SigBoxE<T> { T v = default; };
+
+    void onBoxDoubleE(SigBoxE<double>* b) { b->v = 51.0; }
+
+    int runBoxE(function<void(SigBoxE<i32>*)> f) { SigBoxE<i32> q = default; f(&q); return (int)q.v; }
+    int runBoxE(double d)                        { return 700 + (int)d; }
+
+    int passWrongGenericPointee()
+    {
+        function<void(SigBoxE<double>*)> g = onBoxDoubleE;
+        return runBoxE(g);
+    }
+}
+
+// POINTER DEPTH. `ParseDeclarationSpecifiers` recorded only "is a pointer", so `int**` and `int*`
+// were one signature component: `function<void(int**)>` bound a `void(int*)` slot and the callee
+// dereferenced the slot's `int` VALUE as a pointer - SIGSEGV, exit 139, no diagnostic, on master
+// too. FuncPtrParam.PointerDepth counts the stars and the comparator rejects when both sides
+// recorded one and they differ. A depth of 0 means NOT RECORDED and still proves nothing, so
+// every producer that cannot count stars (C interop, WinRT, synthesized signatures) keeps binding.
+expect_error("function-pointer signature mismatch") {
+    void takesIntPtrPtr(int** pp) { **pp = 42; }
+
+    int runIntPtr(function<void(int*)> f) { int v = 7; f(&v); return v; }
+    int runIntPtr(double d)               { return 700 + (int)d; }
+
+    int passDeeperPointer()
+    {
+        function<void(int**)> g = takesIntPtrPtr;
+        return runIntPtr(g);
+    }
+}
+
+// The DECLARATION site. GetFunctionForFuncPtr selected on name, arity and `move` flags and then
+// returned its candidate unconditionally, so the destination's declared component types never
+// participated. All three legs below compiled and ran on master. A prefix-arity callback is NOT
+// rejected here - see the "declaration-site prefix arity" value leg in Test/test_function_ptr.cb.
+
+// Silent WRONG VALUE: `dd` was entered as an int(int), so its double argument was garbage and its
+// double return was truncated. Printed s2=5, exit 0.
+expect_error("cannot bind function 'declRetDiff'") {
+    double declRetDiff(double x) { return x + 1000.0; }
+
+    int bindWrongReturn()
+    {
+        function<int(int)> g = declRetDiff;
+        return g(5);
+    }
+}
+
+// Memory-unsafe: the callee reads `area` past the end of the 4-byte object the caller allocated.
+// Printed `c r=77 area=0.000000`, exit 0.
+expect_error("cannot bind function 'declTouchWide'") {
+    struct DeclNarrow { int side = default; };
+    struct DeclWide   { int r = default; double area = default; };
+
+    void declTouchWide(DeclWide* c) { c->area = 1.0; }
+
+    int bindWiderPointee()
+    {
+        function<void(DeclNarrow*)> g = declTouchWide;
+        DeclNarrow s;
+        g(&s);
+        return 0;
+    }
+}
+
+// Memory-unsafe: SIGSEGV. The callee dereferences the slot's `int` VALUE as a pointer.
+expect_error("cannot bind function 'declDeepPtr'") {
+    void declDeepPtr(int** pp) { **pp = 42; }
+
+    int bindDeeperPointer()
+    {
+        function<void(int*)> g = declDeepPtr;
+        int v = 7;
+        g(&v);
+        return v;
+    }
+}
+
+// Struct spellings whose candidate SETS INTERSECT. The 'lamZ' leg above covers the DISJOINT half;
+// this is the residual. A signature records the raw source spelling, so the bare `PtI` slot below
+// - written at global scope - reached the comparator as a set of {PtI, NsI.PtI} and the argument's
+// {NsI.PtI} intersected it, proving nothing. `touchNsI` then wrote 12 bytes into a 4-byte element
+// and clobbered both neighbours: measured neigh=2333 instead of 20030, exit 0, no diagnostic.
+//
+// Each signature component now also records the key its DECLARING SCOPE resolves it to, which
+// narrows a set the key is already a member of. The must-still-bind mirror (a bare spelling inside
+// a namespace, argument spelled qualified) is the "namespace-ambiguous pointee binds" value leg in
+// Test/test_function_ptr.cb - a fix that records the wrong key breaks that leg first.
+//
+// Same construction rule as the legs above: TWO overloads of the SAME arity, so the arity filter
+// leaves both and the overload SCORER is what decides.
+expect_error("no overload of 'runGlobalI' matches the given arguments") {
+    struct PtI { int a = default; };
+    namespace NsI
+    {
+        struct PtI { int a = default; int b = default; int c = default; };
+        void touchNsI(PtI* p) { p->a = 1; p->b = 2; p->c = 333; }
+    }
+
+    int runGlobalI(function<void(PtI*)> f)
+    {
+        PtI[3] arr = default;
+        f(&arr[0]);
+        return arr[1].a * 1000 + arr[2].a;
+    }
+    int runGlobalI(double d) { return 700 + (int)d; }
+
+    int passIntersectingPointee()
+    {
+        return runGlobalI(NsI.touchNsI);
+    }
+}
+
+// A candidate refuted on its SIGNATURE used to REBIND onto a same-arity sibling that absorbs any
+// pointer, so the call ran silently instead of erroring: this printed rb=999, exit 0. Rejecting in
+// the overload scorer is a PREFERENCE verdict, so the refuted funcptr candidate simply lost to the
+// `void*` one. A function-pointer / closure VALUE no longer converts to a `void*` parameter at all
+// (ISO C has no function-to-object-pointer conversion either). The two halves that must KEEP
+// working - a matching signature still beating the void* sibling, and a real DATA pointer still
+// binding it - are value legs in Test/test_function_ptr.cb.
+expect_error("no overload of 'rebindReject' matches the given arguments") {
+    double rebindRejectOther(double x) { return x + 1000.0; }
+
+    int rebindReject(function<int(int)> f) { return f(5); }
+    int rebindReject(void* p)              { return 999; }
+
+    int passMismatchedIntoVoidSibling()
+    {
+        function<double(double)> w = rebindRejectOther;
+        return rebindReject(w);
     }
 }

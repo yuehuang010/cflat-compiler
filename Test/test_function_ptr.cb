@@ -1700,6 +1700,27 @@ bool testClosureListAliasUnify()
     return result;
 }
 
+// Takes the `int` spelling; the caller below hands it the `i32` spelling. A POINTER parameter,
+// so nothing is copied or transferred - the leg is about type IDENTITY, not ownership.
+int countIntUnaryList(list<Lambda<int(int)>>* p) { return p->count(); }
+
+bool testClosureListSpellingUnify()
+{
+    bool result = true;
+
+    // `list<Lambda<i32(i32)>>` must be the SAME instantiation as `list<Lambda<int(int)>>`:
+    // `int` and `i32` are one type, so the encoded element name must not fork on the spelling.
+    // They used to encode as __fatfn_1_3_int_3_int and __fatfn_1_3_i32_3_i32 - two container
+    // types of identical layout that did not interconvert.
+    int cap = 5;
+    list<Lambda<i32(i32)>> fns;
+    fns.add((int x) => x + cap);
+    result &= Test("gap-a spelling-unify call",  fns.get(0)(10),           15);
+    result &= Test("gap-a spelling-unify ident", countIntUnaryList(&fns),   1);
+
+    return result;
+}
+
 // A sugar target: any struct in scope, with Lambda fields of non-void return type.
 struct FnHolder
 {
@@ -1919,15 +1940,121 @@ int spellCallVoidPtr(function<void(void*)> f) { int q = 0; f(&q); return q; }
 interface ISpell { int lam(function<i32(i32)> f); };
 class SpellImpl : ISpell { int lam(function<i32(i32)> f) { return f(5); } };
 
-// RECORDED GAP, not desired behaviour. Rejecting a function-pointer candidate in the overload
-// scorer is a PREFERENCE verdict ("this candidate does not match"), not a validation one, so a
-// same-arity sibling that can absorb a pointer takes the call SILENTLY instead of the call being
-// an error. Master bound the funcptr arm and called the callee at the wrong type; neither answer
-// is right. Pinned so the behaviour is recorded rather than rediscovered - see
-// internal/issue/p1/funcptr-overload-binding-ignores-signature.md.
-double rebindOther(double x)         { return x + 1000.0; }
+// The signature proof compares canonical COMPONENTS, so every equivalence the compiler already
+// honours has to survive component-wise or these legal calls become hard errors. `string` carries
+// Pointer == false yet interconverts with `char*`, so it must normalize to `char*` BEFORE the
+// pointer shape is read; a `using` alias must resolve to its target first; an unsubstituted
+// generic parameter and an interface are NOT proof of anything and must keep binding.
+// Each pair below has a same-arity `double` sibling on purpose, so the overload SCORER decides.
+using SigInt = int;
+int add10Alias(SigInt x)                     { return x + 10; }
+int spellCallAlias(function<int(int)> f)     { return f(5); }
+int spellCallAlias(double d)                 { return 700 + (int)d; }
+
+int onCharPtrArg(char* s)                    { return 17; }
+int spellCallString(function<int(string)> f) { return f("hi"); }
+int spellCallString(double d)                { return 700 + (int)d; }
+
+int onStringArg(string s)                    { return 18; }
+int spellCallCharPtr(function<int(char*)> f) { return f("hi"); }
+int spellCallCharPtr(double d)               { return 700 + (int)d; }
+
+// A struct component proves only its OWN identity - the same struct spelled through an alias is
+// one type, and must still bind. (The rejection this guards is in err_data_pointer_to_closure_param.cb.)
+struct SigRec { int v = default; };
+using SigRecAlias = SigRec;
+void onSigRec(SigRecAlias* r)                { r->v = 24; }
+int spellCallRec(function<void(SigRec*)> f)  { SigRec r; f(&r); return r.v; }
+int spellCallRec(double d)                   { return 700 + (int)d; }
+
+interface IShapeSig { int sides(); };
+class SigTri : IShapeSig { int sides() { return 22; } };
+int onSigShape(IShapeSig s)                  { return s.sides(); }
+int spellCallIface(function<int(IShapeSig)> f) { SigTri t; IShapeSig s = t; return f(s); }
+int spellCallIface(double d)                 { return 700 + (int)d; }
+
+int gCallSig<T>(function<T(T)> f, T v)       { return (int)f(v); }
+
+// SIGNEDNESS is not part of an llvm::FunctionType - `u32(u32)` and `i32(i32)` both lower to
+// `i32(i32)` - so a signedness difference must BIND, at scalar and at pointee level alike.
+// An earlier revision put signedness in the canonical token and hard-errored on all four of
+// these; core/com.cb and core/ui_native/winui.cb are dense with `function<u32(...)>` slots.
+int add10Signed(int x)                       { return x + 10; }
+int spellCallU32(function<u32(u32)> f)       { return (int)f((u32)5); }
+int spellCallU32(double d)                   { return 700 + (int)d; }
+
+i64 add10I64(i64 x)                          { return x + 10; }
+int spellCallU64(function<u64(u64)> f)       { return (int)f((u64)5); }
+int spellCallU64(double d)                   { return 700 + (int)d; }
+
+int onCharPtrSigned(char* s)                 { return 65; }
+int spellCallU8Ptr(function<int(u8*)> f)     { return f((u8*)"hi"); }
+int spellCallU8Ptr(double d)                 { return 700 + (int)d; }
+
+// A signature records the SOURCE SPELLING, so a bare `Pt` written inside `namespace SigNs` and
+// the global `Pt` are the same string at comparison time. That ambiguity must resolve to "no
+// proof" and BIND - guessing the global would reject this legal program.
+struct SigPt { int a = default; };
+namespace SigNs
+{
+    struct SigPt { int a = default; int b = default; int c = default; };
+    void touchNs(SigPt* p)                   { p->a = 5; }
+    int runNs(function<void(SigPt*)> f)      { SigPt q; f(&q); return q.a; }
+}
+
+// A GENERIC INSTANTIATION as a pointee. A signature records the MANGLED key (`Box__i32`), and
+// monomorphization keeps signedness and the target-native widths, so `SigBox<i32>` and
+// `SigBox<u32>` are two instantiations - correct at the source level, since `u32` divides and
+// prints differently. Neither difference changes LAYOUT, though, so all three crossings below
+// must BIND. `SigBox<double>` vs `SigBox<i32>` DOES change layout and is the reject leg in
+// Test/errors/err_data_pointer_to_closure_param.cb.
+struct SigBox<T> { T v = default; };
+void onSigBoxInt(SigBox<int>* b)                  { b->v = 51; }
+int  sigBoxI32(function<void(SigBox<i32>*)> f)    { SigBox<i32> q = default; f(&q); return (int)q.v; }
+int  sigBoxI32(double d)                          { return 700 + (int)d; }
+
+void onSigBoxU32(SigBox<u32>* b)                  { b->v = (u32)51; }
+int  sigBoxIntSlot(function<void(SigBox<int>*)> f) { SigBox<int> q = default; f(&q); return q.v; }
+int  sigBoxIntSlot(double d)                      { return 700 + (int)d; }
+
+void onSigBoxLong(SigBox<long>* b)                { b->v = (long)51; }
+int  sigBoxI64(function<void(SigBox<i64>*)> f)    { SigBox<i64> q = default; f(&q); return (int)q.v; }
+int  sigBoxI64(double d)                          { return 700 + (int)d; }
+
+// A function-pointer / closure VALUE does not implicitly convert to a `void*` parameter - it is
+// code, not data, and ISO C has no function-to-object-pointer conversion either. Without that gate
+// a candidate refuted on its SIGNATURE simply rebound onto this pointer-absorbing sibling and the
+// call ran silently (rejecting in the scorer is a PREFERENCE verdict, not a validation one). The
+// two legs below assert both halves: the void* arm must not steal a matching function-pointer
+// call, and it must still take a real DATA pointer. The mismatched-signature call is now a reject
+// leg in Test/errors/err_data_pointer_to_closure_param.cb.
 int rebindProbe(function<int(int)> f) { return f(5); }
 int rebindProbe(void* p)              { return 999; }
+
+// Two slots that differ ONLY in how many '*' a signature component carries. They must be two
+// distinct overloads, and each must select the arm whose depth matches.
+void depthWriteOne(int* p)   { *p = 1; }
+void depthWriteTwo(int** pp) { **pp = 2; }
+int  depthSlot(function<void(int*)> f)  { int v = 0; f(&v); return 10 + v; }
+int  depthSlot(function<void(int**)> f) { int v = 0; int* q = &v; f(&q); return 20 + v; }
+
+// A NAMED function argument carries its signature in the function table, not on the argument, so
+// the component proof used to be skipped for it entirely: `sigPickSlot(sigPickDbl)` scored the
+// `int(int)` slot as a perfect match and entered a `double(double)` body through it, returning
+// 101 - a plausible wrong number, exit 0, no diagnostic.
+int    sigPickInt(int x)    { return x + 1; }
+double sigPickDbl(double x) { return x + 1.0; }
+int sigPickSlot(function<int(int)> f)       { return 100 + f(1); }
+int sigPickSlot(function<double(double)> f) { return 200 + (int)f(1.0); }
+
+// A callback taking FEWER parameters than the slot supplies. Load-bearing, not an accident: the
+// synthesized `onStdout` field is `void(char*, int)` and doc/LANGUAGE.md documents the
+// one-parameter form (Test/test_program.cb binds exactly that). Under cdecl the caller cleans up,
+// so the argument the callee never reads is ignored. The declaration-site signature proof must
+// keep accepting it - the reject legs it DOES fire on are in
+// Test/errors/err_data_pointer_to_closure_param.cb. The MIRROR direction is unsafe and is refused.
+int g_prefixArityCalls = 0;
+void prefixArityOne(char* s) { g_prefixArityCalls = g_prefixArityCalls + 1; }
 
 bool testFuncPtrArgProvenanceAccepts()
 {
@@ -1968,17 +2095,71 @@ bool testFuncPtrArgProvenanceAccepts()
     function<void(int*)> gp = takeVoidPtr;
     result &= Test("int*/void* crossing", spellCallVoidPtr(gp), 15);
 
+    // Component-wise equivalences. A `string`/`char*` pair compared shape-first false-rejects
+    // (string has Pointer == false); an alias compared before resolution false-rejects; a struct
+    // or interface or unsubstituted generic component is not proof and must keep binding.
+    function<SigInt(SigInt)> ga = add10Alias;
+    result &= Test("alias hop crossing",     spellCallAlias(ga), 15);
+    function<int(char*)> gs = onCharPtrArg;
+    result &= Test("char*/string crossing",  spellCallString(gs), 17);
+    function<int(string)> gt = onStringArg;
+    result &= Test("string/char* crossing",  spellCallCharPtr(gt), 18);
+    function<void(SigRecAlias*)> gr = onSigRec;
+    result &= Test("struct pointee via alias", spellCallRec(gr), 24);
+    function<int(IShapeSig)> gi = onSigShape;
+    result &= Test("interface component binds", spellCallIface(gi), 22);
+    function<int(int)> gg = add10FnPtr;
+    result &= Test("generic component binds", gCallSig<int>(gg, 5), 15);
+
+    // Signedness-only crossings - the isolated axis, with no width difference to carry them.
+    function<int(int)> gu = add10Signed;
+    result &= Test("u32/int crossing",     spellCallU32(gu), 15);
+    function<i64(i64)> gu64 = add10I64;
+    result &= Test("u64/i64 crossing",     spellCallU64(gu64), 15);
+    function<int(char*)> gcp = onCharPtrSigned;
+    result &= Test("char*/u8* crossing",   spellCallU8Ptr(gcp), 65);
+
+    // Bare vs qualified struct spelling with a same-named global in scope.
+    function<void(SigNs.SigPt*)> gns = SigNs.touchNs;
+    result &= Test("namespace-ambiguous pointee binds", SigNs.runNs(gns), 5);
+
+    // Generic-instantiation pointees whose type args are one type spelled two ways, or differ
+    // only in signedness / a target-native width. All three are layout-identical, so all three
+    // bind; each hard-errored before the mangled key was ABI-canonicalized.
+    function<void(SigBox<int>*)> gbi = onSigBoxInt;
+    result &= Test("SigBox int/i32 crossing",  sigBoxI32(gbi),     51);
+    function<void(SigBox<u32>*)> gbu = onSigBoxU32;
+    result &= Test("SigBox u32/int crossing",  sigBoxIntSlot(gbu), 51);
+    function<void(SigBox<long>*)> gbl = onSigBoxLong;
+    result &= Test("SigBox long/i64 crossing", sigBoxI64(gbl),     51);
+
+    // The double arms prove each crossing set is a real two-candidate overload set, so the
+    // legs above are testing the scorer rather than a lone candidate that binds regardless.
+    result &= Test("SigBox set keeps double arm A", sigBoxI32(5.0),     705);
+    result &= Test("SigBox set keeps double arm B", sigBoxIntSlot(6.0), 706);
+    result &= Test("SigBox set keeps double arm C", sigBoxI64(7.0),     707);
+
     // The double arm of the crossing overload set is still reachable.
     result &= Test("crossing set keeps its double arm", spellCall(3.0), 403);
+    result &= Test("component set keeps double arm",    spellCallAlias(1.0), 701);
     result &= Test("fat crossing set keeps double arm", fatCall(4.0),   304);
 
     // A MATCHING signature must still beat the pointer-absorbing sibling - the rejection is
     // per candidate, so the void* arm must not start stealing legal function-pointer calls.
     result &= Test("matching signature beats the void* sibling", rebindProbe(thin), 15);
-    // ... and the recorded gap: a MISMATCHED signature rebinds to that sibling instead of
-    // erroring. Asserting 999 (not 5) pins the current answer AND that master's is gone.
-    function<double(double)> wrongSig = rebindOther;
-    result &= Test("mismatched signature rebinds to the sibling", rebindProbe(wrongSig), 999);
+    // ... and the gate is on the ARGUMENT's function-ness, not on the parameter: a real DATA
+    // pointer still binds the void* arm. 999 is only reachable through that arm, so this leg
+    // fails if the gate is ever widened from "is code" to "the parameter is void*".
+    int rebindData = 3;
+    result &= Test("data pointer still binds the void* sibling", rebindProbe(&rebindData), 999);
+    // The two SHAPES that are data even though their pointee is code: the ADDRESS of a function
+    // pointer slot, and an array of them. A first cut of the gate keyed on "the argument carries
+    // function evidence" and rejected both - programs master compiles and runs.
+    function<int(int)> rebindSlot = add10FnPtr;
+    result &= Test("address of a funcptr slot binds void*", rebindProbe(&rebindSlot), 999);
+    function<int(int)>[2] rebindArr = default;
+    rebindArr[0] = add10FnPtr;
+    result &= Test("array of funcptrs binds void*", rebindProbe(rebindArr), 999);
 
     return result;
 }
@@ -2098,6 +2279,31 @@ bool testFuncPtrCallResultIntoClosureParam()
     result &= Test("named arg re-resolves by move flags",  callResultTakeMove(callResultCons), 9);
     result &= Test("the move overload really ran",         g_move_fp_dtor_count,             1);
 
+    // POINTER DEPTH is part of the signature. The reject side lives in
+    // Test/errors/err_data_pointer_to_closure_param.cb; these are the must-still-BIND legs, and
+    // without them a blanket ban on `**` would look identical to the narrowing that was intended.
+    // Depth also has to reach the overload NAME: before it did, these two slots mangled to one
+    // symbol, so the second was a redefinition of the first rather than a sibling overload.
+    function<void(int*)>  d1 = depthWriteOne;
+    function<void(int**)> d2 = depthWriteTwo;
+    result &= Test("matching depth 1 binds",     depthSlot(d1), 11);
+    result &= Test("matching depth 2 binds",     depthSlot(d2), 22);
+    // The NAMED-function form resolves through the function table rather than a stored value, so
+    // it carries depth by a different route and needs its own leg.
+    result &= Test("named arg picks by depth",   depthSlot(depthWriteTwo), 22);
+
+    // ...and the same route has to pick by the whole signature, not just by depth. Both legs are
+    // needed: one alone passes if the scorer simply always takes the FIRST slot.
+    result &= Test("named arg picks int slot",    sigPickSlot(sigPickInt), 102);
+    result &= Test("named arg picks double slot", sigPickSlot(sigPickDbl), 202);
+
+    // The DECLARATION site now proves the destination's signature too. This is the leg that keeps
+    // that proof from becoming a blanket ban on any arity difference.
+    g_prefixArityCalls = 0;
+    function<void(char*, int)> pa = prefixArityOne;
+    pa("hi", 2);
+    result &= Test("declaration-site prefix arity", g_prefixArityCalls, 1);
+
     return result;
 }
 
@@ -2191,6 +2397,7 @@ extern int main()
     total++; passed += testClosureListFat()             ? 1 : 0;
     total++; passed += testClosureListThin()            ? 1 : 0;
     total++; passed += testClosureListAliasUnify()      ? 1 : 0;
+    total++; passed += testClosureListSpellingUnify()   ? 1 : 0;
 
     // <Tag/> sugar: lambda attribute return-type inference
     total++; passed += testSugarLambdaAttrReturnType()  ? 1 : 0;
