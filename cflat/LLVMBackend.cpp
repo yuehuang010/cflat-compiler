@@ -419,6 +419,11 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     cIncludeDirs_ = args.getMultiOption("c-include");
     cLinkLibs_    = args.getMultiOption("c-lib");
     cDefines_     = args.getMultiOption("c-define");
+    // Positional `.c` inputs are dispatched to clang only after the module-end analyses have
+    // run, so note their presence now for RunNullIfaceGlobalCheck's interop gate.
+    positionalCSource_ = false;
+    for (size_t i = 1; i < args.positionalCount(); ++i)
+        if (LowerExtension(*args.getPositional(i)) == ".c") positionalCSource_ = true;
     // macOS frameworks seeded from --framework (mirrors --c-lib). `import framework`
     // lines append more during ProcessImports; AddFrameworkImport dedups.
     for (const auto& fw : args.getMultiOption("framework"))
@@ -2567,6 +2572,8 @@ void LLVMBackend::ResetForReanalysis()
     // Same hazard: a pending dispatch record keys off a slot and an anchor instruction in the
     // module being discarded, so it must not survive into the next file's analysis.
     pendingNullIfaceDispatch_.clear();
+    // Same hazard for the global-receiver ledger, which normally survives to module end.
+    pendingNullIfaceGlobal_.clear();
     provenNoReturn_.clear();
     // Sibling of lastCallIsBonded: a per-call bond flag that, if left set by an aborted compile,
     // would mark the next file's first bonded value as by-address.

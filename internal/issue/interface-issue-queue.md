@@ -71,8 +71,11 @@ parked `fix/iface-ifconst` branch stays parked.
 
 - `interface-method-call-on-null-value-segfaults` - SETTLED and now FIXED; see the landed design
   record below. The ratified rule survives there, not here: reject at COMPILE TIME as far as is
-  provable, NO per-dispatch runtime guard, `?.` is the answer for anything not provable. Residue
-  filed as `null-interface-access-residue-unproven-receivers`.
+  provable, NO per-dispatch runtime guard, `?.` is the answer for anything not provable. Residue is
+  LIVE and now tracked in
+  [`internal/plan/null-interface-access-widening.md`](../plan/null-interface-access-widening.md) -
+  it was `p1/null-interface-access-residue-unproven-receivers`, merged into that plan and deleted
+  2026-08-03.
 - `ftell-fseek-long-width-on-windows` - FIXED on a Windows host 2026-08-02 and deleted; see the
   landed design record below. The >2 GB half it deferred is now `p2/file-offsets-capped-at-2gb`.
 - `llvm-cannot-select-sign-extend-on-const-array-index` - FIXED and deleted 2026-08-03 by
@@ -263,7 +266,7 @@ distinguish from "nothing happened", so both integrity checks above were re-run 
 | Issue | Severity |
 |---|---|
 | [[interface-boxing-keyed-on-source-binding]] | NARROWED 2026-07-31: the two binding erasures (parens, `??`) and the two un-routed boxing sites are closed. What remains is `delete` of a BORROWED interface box (exit 139/133, no diagnostic) - a different root, reachable with no join at all. |
-| [[null-interface-access-residue-unproven-receivers]] | SIGSEGV (139), no diagnostic. NARROWED 2026-08-02 by `78c678b`: the PARENTHESIZED field access `(lv).tag` is CLOSED (all paren depths, plus the write form `(lv).tag = 5`). What remains is struct-field / array-element / global receivers. The `?.`, branch-, loop-, parameter- and folded-`if const` shapes are DELIBERATELY accepted per the ratified design and are NOT residue. |
+| null-interface-access residue - **FIXED 2026-08-03 in three stages**; design record at [`internal/plan/null-interface-access-widening.md`](../plan/null-interface-access-widening.md), remainder filed as [[null-interface-access-remaining-storage-kinds]] | Was SIGSEGV (139), no diagnostic. Stage 1 (`9e7ffc4`) re-keyed the proof on (frame-local alloca, constant index path), closing struct-field and array-element receivers - and `PHolder h;` / `h = {}`, which turned out to be provably null via the synthesized default ctor. Stage 3 (`727f53d`) made it cross-block with a **MUST** lattice (intersection, NOT `nulldf`'s union - see the plan's section 5; a MAY merge false-rejects accept leg 2) plus control-dependence containment, closing the four local spellings where intervening control flow dropped the diagnostic. Stage 2 closed whole-global receivers via a whole-module never-written fact AND the CD test - **neither alone is sound**, see probe e3. A field/element of a global aggregate was closed 2026-08-03 (new `ResolveIfaceStorageGlobal` walks a `GEPOperator` chain back to the `GlobalVariable` base). Still open and filed separately: a bare `PLive lv;` with no initializer (exit 133, a genuinely uninitialised read, not a null one). |
 | [[funcptr-refuted-candidate-rebinds-onto-pointer-sibling]] | SIGBUS (exit 138) with a struct-pointer sibling, silent `c=888` with an `int*` one. Split out of `funcptr-overload-binding-ignores-signature` on 2026-08-03 when `fix/funcptr-close` closed that file's last two items and deleted it. The `void*` half of the rebind is closed; ANY other pointee still absorbs a function-pointer VALUE that a refuted candidate handed back. Pre-existing, unchanged by that fix (the gate keys on `TypeName == "void"`). Widening it needs C interop and header-import paths measured first, and must not be read as closing the MIRROR leg (a raw data pointer into a `function<T>` slot). Do NOT approach it by turning the scorer's per-candidate `-1` into a hard error. |
 | [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. An interface-field-to-interface-field copy with the SAME field name on both sides is misread as a self-assign, suppressing the reject. **ATTEMPTED AND REVERTED 2026-08-01** - see the file for the three discriminators that cannot work (names, box storage, and a bare `Value` compare of the field address all fail at least one witness). A sound test needs real dataflow through the box to the underlying data pointer. |
 | [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. **NARROWED 2026-08-02** by `fix/uniq-array-elem`: root cause CONFIRMED by instrumentation (`FieldName`/`CallerName` name the CONTAINER, so `selfFieldAssign` swallowed a genuine two-owner store), and every element pair whose addresses are constant-provably different now rejects - local, generic-substituted, nested, array-as-field, through-pointer, view, and global arrays. BOTH copies of the name comparison were fixed; the second (`sameField`) also guards the reassignment-destruct, and fixing only the first traded an abort for a leak. Residue: any index not constant in the emitted IR - a runtime subscript, and a `const` integer (`const` is unenforced, so folding it would be unsound). |
@@ -606,8 +609,10 @@ in an EARLIER block, and anchoring in the current block would inspect stores tha
 read: a null store following an earlier non-null load would be a FALSE REJECTION. **Anyone widening
 this must carry `Primary`'s defining `LoadInst` and require `load->getParent() == access->getParent()`,
 not widen the anchor.** The parenthesized spelling `(lv).tag` reaches `Primary != nullptr` and is
-therefore undiagnosed while `(lv).Get()` is caught - filed as
-[[null-interface-access-residue-unproven-receivers]], not fixed here.
+therefore undiagnosed while `(lv).Get()` is caught - not fixed here; the paren spelling was
+subsequently CLOSED by `78c678b`, and the remaining residue lives in
+[`internal/plan/null-interface-access-widening.md`](../plan/null-interface-access-widening.md),
+which restates the constraint in this paragraph as the rule any widening must obey.
 
 Two review lessons worth carrying: a claim that each reject leg lived in its own file was FALSE, and
 it mattered - the shared file exits at the first failed expectation on the pre-fix binary, so later

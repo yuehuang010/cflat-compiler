@@ -62,7 +62,122 @@ expect_error("member access on null interface value 'zv' - 'zv' has not been ass
     void zvNullParenFieldWrite() { PTagged zv = default; (zv).tag = 5; }
 }
 
+/*
+ * A receiver that is a SUB-OBJECT of a frame-local: a struct field or an array element. Same
+ * proof, keyed on (frame-local alloca, constant index path) instead of the alloca alone, so a
+ * whole-struct store of the synthesized default constructor's zero aggregate and a whole-array
+ * `zeroinitializer` store both count as a null write of the element they cover. The diagnostic
+ * names the receiver AS WRITTEN ('ph.c', 'pa[0]') - naming the container instead would be
+ * factually false, so a shape that cannot be named is not recorded at all.
+ *
+ * A base that is not a frame-local alloca is never proven: `this`, a heap object, a pointer
+ * deref, a by-value parameter, or a variable array index. Those stay compiling on purpose
+ * (`this->field.method()` is the ordinary way an interface field is used), and their accept
+ * legs live in testNullIfaceDispatchAcceptSet.
+ */
+struct PTagBox { PTagged c = default; };
+
+expect_error("method call on null interface value 'ph.c' - 'ph.c' has not been assigned an implementation since it was last set to null, so 'ph.c.kind()' would dispatch through a null 'PTagged' vtable") {
+    int phNullFieldCall() { PTagBox ph = default; return ph.c.kind(); }
+}
+
+expect_error("member access on null interface value 'ph2.c' - 'ph2.c' has not been assigned an implementation since it was last set to null, so 'ph2.c.tag' would resolve its address through a null 'PTagged' vtable") {
+    int ph2NullFieldRead() { PTagBox ph2 = default; return ph2.c.tag; }
+}
+
+// Parenthesised sub-object receiver: the paren is part of the spelling, so it is part of the name.
+expect_error("member access on null interface value '(ph3.c)' - '(ph3.c)' has not been assigned an implementation since it was last set to null, so '(ph3.c).tag' would resolve its address through a null 'PTagged' vtable") {
+    int ph3NullParenFieldRead() { PTagBox ph3 = default; return (ph3.c).tag; }
+}
+
+expect_error("method call on null interface value 'pa[0]' - 'pa[0]' has not been assigned an implementation since it was last set to null, so 'pa[0].kind()' would dispatch through a null 'PTagged' vtable") {
+    int paNullElemCall() { PTagged[2] pa = default; return pa[0].kind(); }
+}
+
+expect_error("member access on null interface value 'pa2[1]' - 'pa2[1]' has not been assigned an implementation since it was last set to null, so 'pa2[1].tag' would resolve its address through a null 'PTagged' vtable") {
+    int pa2NullElemRead() { PTagged[2] pa2 = default; return pa2[1].tag; }
+}
+
+// A TWO-level constant path (element, then field) off one whole-array zeroinitializer store: the
+// path has to be walked into the stored aggregate twice, and element 1 must not be read off
+// element 0. The accept companion (element 1's field assigned) is leg 33 of the accept set.
+expect_error("method call on null interface value 'pb[1].c' - 'pb[1].c' has not been assigned an implementation since it was last set to null, so 'pb[1].c.kind()' would dispatch through a null 'PTagged' vtable") {
+    int pbNullTwoLevel() { PTagBox[2] pb = default; return pb[1].c.kind(); }
+}
+
+/*
+ * CROSS-BLOCK receivers: control flow sits between the null init and the access, and no path
+ * anywhere assigns an implementation. The straight-line proof cannot see these - the access's
+ * own block carries no write at all - so they are proven by a forward MUST fixpoint over the
+ * storage location (definitely-null only when definitely-null on EVERY predecessor) plus the
+ * control-dependence containment test.
+ *
+ * MUST, not MAY, is the load-bearing choice: a receiver ASSIGNED inside a branch or a loop body
+ * reaches its access non-null on that path, and every such shape stays compiling on purpose.
+ * Those are legs 2, 3, 9, 10, 16 and 34-40 of testNullIfaceDispatchAcceptSet, which is where a
+ * lattice regression shows up. The containment test is what keeps an access UNDER a branch
+ * compiling (legs 4, 12, 17, 40) even though the receiver really is null on every path to it.
+ */
+int pkPick(int n) { return n; }
+
+expect_error("method call on null interface value 'cv' - 'cv' has not been assigned an implementation since it was last set to null, so 'cv.kind()' would dispatch through a null 'PTagged' vtable") {
+    int cvBranchBetween() { PTagged cv = default; if (pkPick(1) == 1) { pkPick(2); } return cv.kind(); }
+}
+
+expect_error("member access on null interface value 'lv' - 'lv' has not been assigned an implementation since it was last set to null, so 'lv.tag' would resolve its address through a null 'PTagged' vtable") {
+    int lvLoopBetween() { PTagged lv = default; for (int i = 0; i < 2; i++) { pkPick(i); } return lv.tag; }
+}
+
+// The `= nullptr` spelling of the init, so the proof is not tied to `= default`.
+expect_error("method call on null interface value 'nv' - 'nv' has not been assigned an implementation since it was last set to null, so 'nv.kind()' would dispatch through a null 'PTagged' vtable") {
+    int nvNullptrBranchBetween() { PTagged nv = nullptr; if (pkPick(1) == 1) { } return nv.kind(); }
+}
+
+// A SUB-OBJECT receiver across blocks: the constant index path and the cross-block fixpoint have
+// to work together, and the diagnostic must still name the receiver as written.
+expect_error("method call on null interface value 'sv.c' - 'sv.c' has not been assigned an implementation since it was last set to null, so 'sv.c.kind()' would dispatch through a null 'PTagged' vtable") {
+    int svFieldBranchBetween() { PTagBox sv = default; if (pkPick(1) == 1) { pkPick(3); } return sv.c.kind(); }
+}
+
+// An if/else where NEITHER arm assigns the receiver: the merge block's every predecessor carries
+// the null, so the meet is still null. The accept twin (both arms assign) is leg 34.
+expect_error("method call on null interface value 'ev' - 'ev' has not been assigned an implementation since it was last set to null, so 'ev.kind()' would dispatch through a null 'PTagged' vtable") {
+    int evBothArmsEmpty() { PTagged ev = default; if (pkPick(1) == 1) { pkPick(4); } else { pkPick(5); } return ev.kind(); }
+}
+
 extern int main()
 {
     return 0;
 }
+
+/*
+ * A FIELD of a global STRUCT. A global's null-ness is its module-level INITIALIZER -
+ * `PTagBox g = default;` emits no instruction anywhere - and "never assigned" is a whole-module
+ * fact, so this one is resolved at MODULE END, not at end-of-body. The field's address reaches
+ * the global through a CONSTANT-EXPRESSION GEP (folded by IRBuilder, since both the base and the
+ * indices are constants) rather than a literal GlobalVariable slot, so it needs its own resolver
+ * (ResolveIfaceStorageGlobal) walking a chain of `llvm::GEPOperator` back to the GlobalVariable -
+ * this used to fall through unrecorded and compile clean; see
+ * internal/issue/p2/null-interface-access-remaining-storage-kinds.md section 1.
+ *
+ * That is why this leg is written in the BARE-SEMICOLON file-scope form: it is armed before the
+ * module-end check runs. A scoped `expect_error { ... }` block closes long before that check and
+ * reports "did not occur" instead - measured, not assumed.
+ *
+ * Rejecting needs BOTH: no store anywhere in the module writes the global (or any field of it),
+ * and the access is control-dependent on nothing the function ENTRY block is not (the null
+ * witness is synthesised at entry, since the global is null on entry to every function). Either
+ * fact alone is unsound - see the accept twins, legs 41-49 of testNullIfaceDispatchAcceptSet.
+ *
+ * Only ONE module-end leg fits per file: the report throws and ends the compile. The WHOLE-global
+ * (empty path) spelling is therefore the last leg of err_iface_call_too_few_args.cb, following
+ * the same split-by-record-site layout as the rest of this family. The ARRAY-ELEMENT shape has no
+ * slot left: it shares this leg's resolver and differs only in the index fed to
+ * getAggregateElement, so its accept side (legs 50-51 of testNullIfaceDispatchAcceptSet) is what
+ * pins it.
+ */
+struct PTagBox2 { PTagged c = default; };
+PTagBox2 gpb = default;
+
+expect_error("member access on null interface value 'gpb.c' - 'gpb.c' has not been assigned an implementation since it was last set to null, so 'gpb.c.tag' would resolve its address through a null 'PTagged' vtable");
+int gpbNullGlobalFieldRead() { return gpb.c.tag; }

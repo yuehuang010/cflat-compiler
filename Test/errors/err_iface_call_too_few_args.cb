@@ -63,3 +63,24 @@ extern int main()
 
     return 0;
 }
+
+/*
+ * Leg 4 - a WHOLE-global receiver (empty path), the method-dispatch spelling. Resolved at MODULE
+ * END (a global's null-ness is its initializer, and "never assigned" is a whole-module fact), so
+ * it is written in the BARE-SEMICOLON file-scope form, which is still armed there; a scoped block
+ * closes first and reports "did not occur". It sits after main because the file-scope arming must
+ * not be live while main's own scoped expectation runs.
+ *
+ * Only ONE module-end leg fits per file - the report throws and ends the compile - and there are
+ * three global shapes against two files. This slot keeps the WHOLE-global path because it is the
+ * one that does not share code with the other two: the sub-object shapes both resolve through
+ * ResolveIfaceStorageGlobal, while this one reaches RunNullIfaceGlobalCheck as a literal
+ * GlobalVariable and walks an EMPTY path (zero getAggregateElement steps). The FIELD-of-a-global-
+ * struct spelling is the last leg of err_iface_field_missing.cb. The ARRAY-ELEMENT reject shape
+ * has no module-end slot left; it differs from the field shape only in the index it feeds
+ * getAggregateElement, and its accept side is legs 50-51 of testNullIfaceDispatchAcceptSet.
+ */
+NgLive gngv = default;
+
+expect_error("method call on null interface value 'gngv' - 'gngv' has not been assigned an implementation since it was last set to null, so 'gngv.Get()' would dispatch through a null 'NgLive' vtable");
+int gngvNullGlobalDispatch() { return gngv.Get(); }

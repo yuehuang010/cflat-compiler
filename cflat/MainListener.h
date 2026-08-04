@@ -5226,8 +5226,7 @@ public:
                     errorReceived = true;
                     compilerLLVM->AbortFunctionBlocks(0);
                     compilerLLVM->ClearCurrentSubprogram();
-                    compilerLLVM->expectedError.clear();
-                    compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
+                    compilerLLVM->RestoreFileScopeExpectedError();
                     // The throw unwound past the `global_scope = true` restore in the
                     // function branch; recovery resumes at file scope, so re-assert it.
                     global_scope = true;
@@ -7792,8 +7791,7 @@ public:
                             *compilerLLVM->context, "after_expect_error", bb->getParent());
                         compilerLLVM->builder->SetInsertPoint(resume);
                     }
-                    compilerLLVM->expectedError.clear();
-                    compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
+                    compilerLLVM->RestoreFileScopeExpectedError();
                 }
 
                 if (!errorReceived)
@@ -8575,8 +8573,7 @@ public:
                     compilerLLVM->expectedErrorScopeDepth == funcDepth)
                 {
                     compilerLLVM->AbortFunctionBlocks(funcDepth - 1);
-                    compilerLLVM->expectedError.clear();
-                    compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
+                    compilerLLVM->RestoreFileScopeExpectedError();
                     compiler->ClearCurrentSubprogram();
                     // The body was aborted mid-way: its CFG is partial, so its null-state log
                     // must be dropped rather than analyzed by the end-of-module sweep.
@@ -19944,6 +19941,21 @@ public:
             size_t childLimit = ctx->children.size();
             childLimit -= std::min(dropTrailingChildren, childLimit);
             size_t childIndex = 0;
+
+            // The receiver of the member name currently being walked, spelled as in source
+            // ("h.c", "a[0]"): every child before the '.'/'->' that introduced the name. Used
+            // only to NAME a sub-object receiver in the definitely-null diagnostic, where the
+            // NamedVariable's own name is the container's. childIndex is already past the name.
+            auto ReceiverSourceText = [&]() -> std::string
+            {
+                if (childIndex < 3) return std::string();
+                std::string text;
+                for (size_t i = 0; i + 2 < childIndex; ++i)
+                    text += ctx->children[i]->getText();
+                return text;
+            };
+            // Captured at the member name so the call suffix below can still name the receiver.
+            std::string nullIfaceRecvText;
             for (auto parseTree : ctx->children)
             {
                 if (childIndex++ >= childLimit) break;
@@ -20349,6 +20361,7 @@ public:
                             // is a method name, recorded for dispatch at the call site below.
                             primaryIdentifier = terminal->getText();
                             namedVar = {};
+                            nullIfaceRecvText = ReceiverSourceText();
 
                             auto* compiler = Compiler(ctx);
                             // Deref of a moved interface local (method receiver or interface field)
@@ -20397,6 +20410,7 @@ public:
                                     LLVMBackend::NullIfaceDispatchSite fldSite;
                                     fldSite.VarName = interfaceVar.CallerName.empty()
                                         ? interfaceVar.TypeAndValue.VariableName : interfaceVar.CallerName;
+                                    fldSite.ReceiverText = nullIfaceRecvText;
                                     fldSite.MemberName = primaryIdentifier;
                                     fldSite.IsField = true;
                                     fldSite.Line = (int)ctx->getStart()->getLine();
@@ -23139,6 +23153,7 @@ public:
                                 {
                                     ncSite.VarName = interfaceVar.CallerName.empty()
                                         ? interfaceVar.TypeAndValue.VariableName : interfaceVar.CallerName;
+                                    ncSite.ReceiverText = nullIfaceRecvText;
                                     ncSite.MemberName = primaryIdentifier;
                                     ncSite.Line = (int)ctx->getStart()->getLine();
                                     ncSite.Col = (int)ctx->getStart()->getCharPositionInLine();

@@ -4296,20 +4296,72 @@ bool testGiNsBodyKeepsCallerTypeArg()
  * different number.
  *
  * Legs 1-4 (method) and 8-10 (field) are proven tripwires: widening the guard to a shape-only
- * rejection makes each of them fail to compile. There is deliberately NO leg aimed at a widening
- * onto struct-FIELD receivers - the only shape such a widening could trip
- * (`NdHolder h = default; h.c.Get();` with no assignment) SIGSEGVs at run time on every binary,
- * so it cannot exist as a passing runtime leg. That axis is guarded by the record's alloca
- * requirement instead, and leg 12 covers the one field-receiver shape that IS runnable.
+ * rejection makes each of them fail to compile.
+ *
+ * Legs 21-32 cover the SUB-OBJECT receivers - a struct field or an array element of a
+ * frame-local, keyed as (alloca, constant index path). The unassigned form of each of those
+ * (`NdHolder h = default; h.c.Get();`) SIGSEGVs on every binary and is a REJECT leg in
+ * Test/errors/err_iface_field_missing.cb, so what lives here is the surrounding accept set: a
+ * per-path last write, a base that is not a frame-local alloca (`this`, a pointer deref, a
+ * by-value parameter), an escaped base address, and a variable array index. Legs 27, 29, 30 and
+ * 31 are the strongest of them - in each, the null init IS the last store the accessing block
+ * can see, so only the base restriction or the escape walk keeps them compiling.
  */
 interface NdLive { int tag; int Get(); };
 class NdImpl : NdLive { int tag = default; int d = default; int Get() { return d; } };
 struct NdHolder { NdLive c = default; };
+struct NdNest { NdHolder inner = default; };
+
+// `this->c` with no assignment anywhere in the accessing method: the ordinary way an interface
+// field is used, and the single largest false-rejection hazard of the sub-object widening.
+class NdWrap
+{
+    NdLive c = default;
+    void Set(NdLive v) { c = v; }
+    int Use() { return c.Get(); }
+    int UseTag() { return c.tag; }
+};
+
+class NdWrapCtor
+{
+    NdLive c = default;
+    NdWrapCtor(NdLive v) { c = v; }
+    int Use() { return c.Get(); }
+};
 
 int ndPick(int n) { return n; }
+
+/*
+ * GLOBAL receivers (legs 41-51). A global's null-ness is its module-level initializer, so this
+ * half is resolved at MODULE END and needs TWO facts before it rejects: no store anywhere in the
+ * module writes the global, AND the access is control-dependent on nothing the function entry
+ * block is not. ngA..ngD below exist to give each fact its own tripwire - ngB and ngC carry an
+ * in-module store, ngD and ngE carry none and are saved only by control dependence.
+ *
+ * ngH, ngI and ngArr are SUB-OBJECTS of a global (a field of a global struct, an element of a
+ * global array) - resolved through a CONSTANT-EXPRESSION GEP back to the GlobalVariable base
+ * rather than a literal GlobalVariable slot (ResolveIfaceStorageGlobal). The field shape's reject
+ * twin is the last leg of err_iface_field_missing.cb; the array-element shape has no module-end
+ * slot left (one per file, and err_iface_call_too_few_args.cb keeps the whole-global path), so
+ * legs 50-51 here are the only thing pinning it.
+ */
+NdLive ngA = default;   // stored in the accessing function itself
+NdLive ngB = default;   // stored in another function
+NdLive ngC = default;   // stored only inside a branch
+NdLive ngD = default;   // never stored anywhere - guarded read
+NdLive ngE = default;   // never stored anywhere - '?.' and a run-time-false branch
+NdHolder ngH = default;    // a SUB-OBJECT of a global, stored in another function - leg 47
+NdHolder ngI = default;    // a SUB-OBJECT of a global, never stored - guarded / branch, legs 48-49
+NdLive[2] ngArr = default; // an ARRAY-ELEMENT of a global, never stored - guarded / branch, legs 50-51
+
+void ndSetGlobalB(NdLive v) { ngB = v; }
+void ndSetGlobalH(NdLive v) { ngH.c = v; }
+
 int ndViaParam(NdLive lv) { return lv.Get(); }
 int ndTagOfParam(NdLive lv) { return lv.tag; }
 int ndTagOfParenParam(NdLive lv) { return (lv).tag; }
+int ndFieldOfParam(NdHolder h) { return h.c.Get(); }
+void ndFill(NdHolder* p, NdLive v) { p->c = v; }
 
 bool testNullIfaceDispatchAcceptSet()
 {
@@ -4381,8 +4433,9 @@ bool testNullIfaceDispatchAcceptSet()
     result &= Test("nid_field_null_conditional", f4?.tag, 0);
 
     // (12) A struct FIELD receiver, never assigned, accessed under a branch that is false at
-    // run time. A field receiver is not a frame-local slot, so it is never recorded; this is
-    // the only field-receiver shape that can be exercised without crashing.
+    // run time. The null init sits in an earlier block than the access, so the access's own
+    // block carries no write to reason about; this is the only never-assigned field-receiver
+    // shape that can be exercised without crashing.
     NdHolder h = default;
     int fieldHits = 0;
     if (ndPick(0) == 1) { fieldHits = h.c.Get(); }
@@ -4438,6 +4491,249 @@ bool testNullIfaceDispatchAcceptSet()
 
     // (20) A parameter receiver read through parens: its slot's only store is the argument.
     result &= Test("nid_paren_param_field", ndTagOfParenParam(s26), 66);
+
+    // ---- Sub-object receivers: (frame-local alloca, constant index path) ----
+
+    // (21) A struct FIELD of a frame-local, assigned in the access's own block. The field write
+    // is a store through a constant GEP, so it must count as the last write AT that path.
+    NdImpl s36; s36.d = 36;
+    NdHolder fh = default;
+    fh.c = s36;
+    result &= Test("nid_field_local_same_block_assign", fh.c.Get(), 36);
+
+    // (22) The FIELD spelling of the same shape.
+    NdImpl s37; s37.d = 37; s37.tag = 137;
+    NdHolder fh2 = default;
+    fh2.c = s37;
+    result &= Test("nid_field_local_same_block_read", fh2.c.tag, 137);
+
+    // (23) An array ELEMENT of a frame-local, assigned in the access's own block. The whole-array
+    // zeroinitializer store covers a strict prefix of the path and must not outrank the element
+    // write that follows it.
+    NdImpl s38; s38.d = 38;
+    NdLive[2] fa = default;
+    fa[0] = s38;
+    result &= Test("nid_elem_local_same_block_assign", fa[0].Get(), 38);
+
+    // (24) Two elements written in one block: each access must read the write at ITS OWN path,
+    // so a write to element 0 can never stand in for element 1.
+    NdImpl s39; s39.d = 39;
+    NdImpl s40; s40.d = 40;
+    NdLive[2] fb = default;
+    fb[0] = s39;
+    fb[1] = s40;
+    result &= Test("nid_elem_path_zero", fb[0].Get(), 39);
+    result &= Test("nid_elem_path_one", fb[1].Get(), 40);
+
+    // (25) A two-level constant path: the write lands at inner.c, the access reads inner.c.
+    NdImpl s41; s41.d = 41;
+    NdNest nn = default;
+    nn.inner.c = s41;
+    result &= Test("nid_nested_path_assign", nn.inner.c.Get(), 41);
+
+    // (26) Element written in a loop body, dispatched after the loop - a variable index, so the
+    // base is never even frame-local.
+    NdImpl s42; s42.d = 42;
+    NdLive[2] fc = default;
+    for (int i = 0; i < 2; i++) { fc[i] = s42; }
+    result &= Test("nid_elem_loop_assign", fc[1].Get(), 42);
+
+    // (27) `this->c` in a method that never assigns it - the base is a parameter, not a
+    // frame-local alloca, so the receiver can never be proven null here.
+    NdImpl s43; s43.d = 43; s43.tag = 143;
+    NdWrap w1;
+    w1.Set(s43);
+    result &= Test("nid_this_field_method", w1.Use(), 43);
+    result &= Test("nid_this_field_read", w1.UseTag(), 143);
+
+    // (28) Same, with the field assigned in the class constructor instead.
+    NdImpl s44; s44.d = 44;
+    NdWrapCtor w2 = NdWrapCtor(s44);
+    result &= Test("nid_ctor_field_method", w2.Use(), 44);
+
+    // (29) The base's ADDRESS escapes into a call that writes the field. The accessing block sees
+    // only the null init, so the escape walk is the sole thing keeping this compiling.
+    NdImpl s45; s45.d = 45;
+    NdHolder fe = default;
+    ndFill(&fe, s45);
+    result &= Test("nid_field_addr_escape", fe.c.Get(), 45);
+
+    // (30) Written through a pointer to the local, then read by name. The store's destination
+    // resolves to no alloca, so again only the escape walk saves the read.
+    NdImpl s46; s46.d = 46;
+    NdHolder fp = default;
+    NdHolder* pp = &fp;
+    pp->c = s46;
+    result &= Test("nid_ptr_base_field", fp.c.Get(), 46);
+
+    // (31) A by-value parameter base: the callee's spilled slot is written with the incoming
+    // argument, which is not a constant and not a constant-returning call.
+    NdImpl s47; s47.d = 47;
+    NdHolder fpar = default;
+    fpar.c = s47;
+    result &= Test("nid_by_value_param_field", ndFieldOfParam(fpar), 47);
+
+    // (32) '?.' on a still-null FIELD receiver stays the sanctioned spelling.
+    NdHolder fq = default;
+    result &= Test("nid_field_null_conditional_sub", fq.c?.Get(), 0);
+
+    // (33) A two-level path (array element, then its field) written at that exact path. The
+    // unassigned form of this one IS proven and rejected, so this leg is the tripwire that the
+    // element write is found two levels down instead of the whole-array zero init.
+    NdImpl s48; s48.d = 48;
+    NdHolder[2] fd = default;
+    fd[1].c = s48;
+    result &= Test("nid_two_level_path_assign", fd[1].c.Get(), 48);
+
+    /*
+     * ---- Cross-block receivers: the MUST lattice and the control-dependence test ----
+     *
+     * Their reject twins - a receiver never assigned on ANY path, with control flow in between -
+     * live in Test/errors/err_iface_field_missing.cb.
+     *
+     * Measured discriminators, by mutating the compiler and re-running each leg alone:
+     * flipping the merge from MUST (intersection) to MAY (union) false-rejects legs 36, 37, 38
+     * and 39 (and existing leg 2); deleting the control-dependence containment test
+     * false-rejects leg 40 (and existing legs 4 and 12). Legs 34 and 35 are NOT discriminated by
+     * either mutation - they are value legs for two shapes the others do not spell (an if/else
+     * where both arms assign, and a loop that sits between a live write and the access), and
+     * they are recorded as such rather than sold as tripwires.
+     */
+
+    // (34) Assigned in BOTH arms of an if/else. Every predecessor of the merge block carries a
+    // live implementation, so the meet is not null. A union lattice would still carry the entry
+    // block's null witness down both edges and reject.
+    NdImpl s49; s49.d = 49;
+    NdImpl s50; s50.d = 50;
+    NdLive x1 = default;
+    if (ndPick(1) == 1) { x1 = s49; } else { x1 = s50; }
+    result &= Test("nid_both_arms_assign", x1.Get(), 49);
+
+    // (35) Assigned, then an UNRELATED loop, then the access. The loop's back edge must not
+    // re-import the entry block's null state onto the location.
+    NdImpl s51; s51.d = 51;
+    NdLive x2 = default;
+    x2 = s51;
+    int spin = 0;
+    for (int i = 0; i < 3; i++) { spin = spin + i; }
+    result &= Test("nid_loop_between_assign_and_use", x2.Get() + spin, 54);
+
+    // (36) Assigned inside an `if` nested in a `for`, accessed after the loop - two levels of
+    // control flow between the null init and the only write.
+    NdImpl s52; s52.d = 52;
+    NdLive x3 = default;
+    for (int i = 0; i < 2; i++) { if (ndPick(i) == 0) { x3 = s52; } }
+    result &= Test("nid_nested_loop_branch_assign", x3.Get(), 52);
+
+    // (37) A struct FIELD of a frame-local assigned in a branch and accessed after the merge:
+    // the constant index path and the cross-block fixpoint have to agree on the same location.
+    NdImpl s53; s53.d = 53;
+    NdHolder xh = default;
+    if (ndPick(1) == 1) { xh.c = s53; }
+    result &= Test("nid_field_cross_block_assign", xh.c.Get(), 53);
+
+    // (38) An array ELEMENT at a constant index, same shape. Element 1 must be seen as written
+    // by its own branch write, not by the whole-array zero init that precedes it.
+    NdImpl s54; s54.d = 54;
+    NdLive[2] xa = default;
+    if (ndPick(1) == 1) { xa[1] = s54; }
+    result &= Test("nid_elem_cross_block_assign", xa[1].Get(), 54);
+
+    // (39) Assigned in a `while` body that runs at least once, accessed after the loop.
+    NdImpl s55; s55.d = 55;
+    NdLive x4 = default;
+    int n4 = 0;
+    while (n4 < 1) { x4 = s55; n4 = n4 + 1; }
+    result &= Test("nid_while_body_assign", x4.Get(), 55);
+
+    // (40) Never assigned at all, with an unrelated branch between the init and the access, and
+    // the access itself under a branch that is false at run time. Definitely null on every path
+    // that reaches it - only the control-dependence containment test keeps this compiling, and
+    // it is the one leg here that a lattice fix alone would not save.
+    NdLive x5 = default;
+    if (ndPick(1) == 1) { ndPick(2); }
+    int crossHits = 0;
+    if (ndPick(0) == 1) { crossHits = x5.Get(); }
+    result &= Test("nid_cross_block_under_branch", crossHits, 0);
+
+    /*
+     * ---- GLOBAL receivers: the whole-module store test and the entry-block witness ----
+     *
+     * Their reject twins are the last leg of err_iface_field_missing.cb (field) and of
+     * err_iface_call_too_few_args.cb (method), both in the bare-semicolon file-scope form
+     * because the diagnostic lands at module end.
+     *
+     * Legs 41-43 are tripwires for the whole-module store test: each global they touch is
+     * written somewhere in the module, and dropping that test rejects all three. Legs 45 and 46
+     * are tripwires for the control-dependence test: ngD and ngE are written NOWHERE, so only
+     * the entry-block witness containment keeps them compiling - and leg 45 is the shape that
+     * every guarded `if (__active_allocator != nullptr)` in core/memory.cb reduces to.
+     */
+
+    // (41) Assigned in the accessing function itself, then dispatched.
+    NdImpl s56; s56.d = 56;
+    ngA = s56;
+    result &= Test("nid_global_same_fn_assign", ngA.Get(), 56);
+
+    // (42) Assigned in ANOTHER function. Nothing in the accessing function writes it, so only
+    // the whole-module store test tells this apart from a global nobody ever assigns.
+    NdImpl s57; s57.d = 57;
+    ndSetGlobalB(s57);
+    result &= Test("nid_global_other_fn_assign", ngB.Get(), 57);
+
+    // (43) Assigned only inside a branch, dispatched unconditionally afterwards.
+    NdImpl s58; s58.d = 58;
+    if (ndPick(1) == 1) { ngC = s58; }
+    result &= Test("nid_global_branch_assign", ngC.Get(), 58);
+
+    // (44) '?.' on a never-assigned global is the sanctioned spelling and short-circuits.
+    result &= Test("nid_global_null_conditional", ngE?.Get(), 0);
+
+    // (45) The GUARDED read of a global that is written nowhere in the module. The else arm is
+    // correct code and must compile: the access is control-dependent on the null test, the
+    // synthesised witness at the function entry is not, so containment fails and it is accepted.
+    int guardedGlobal = 0;
+    if (ngD == nullptr) { guardedGlobal = 7; } else { guardedGlobal = ngD.Get(); }
+    result &= Test("nid_global_guarded_else", guardedGlobal, 7);
+
+    // (46) The FIELD spelling under a branch that is false at run time, on the same never-written
+    // global. Provably null once reached, but reached through a branch.
+    int globalHits = 0;
+    if (ndPick(0) == 1) { globalHits = ngE.tag; }
+    result &= Test("nid_global_field_under_branch", globalHits, 0);
+
+    // (47) A SUB-OBJECT of a global (a field of a global struct), stored in ANOTHER function -
+    // the whole-module store test (fact 1) is not path-aware, so a write to ngH.c disqualifies
+    // the whole of ngH the same way a write to a whole-global receiver would.
+    NdImpl s59; s59.d = 59;
+    ndSetGlobalH(s59);
+    result &= Test("nid_global_struct_field", ngH.c.Get(), 59);
+
+    // (48) A never-stored SUB-OBJECT of a global, GUARDED. ngI is never written anywhere, so
+    // ngI.c really is null on every path - but the access sits in the else arm of a null check,
+    // control-dependent on the guard rather than on nothing, so containment fails and it accepts.
+    int guardedField = 0;
+    if (ngI.c == nullptr) { guardedField = 8; } else { guardedField = ngI.c.Get(); }
+    result &= Test("nid_global_subfield_guarded_else", guardedField, 8);
+
+    // (49) The same never-stored field SUB-OBJECT under a branch that is false at run time -
+    // provably null once reached, but reached through a branch, so the entry-block witness does
+    // not contain it.
+    int globalFieldHits = 0;
+    if (ndPick(0) == 1) { globalFieldHits = ngI.c.tag; }
+    result &= Test("nid_global_subfield_under_branch", globalFieldHits, 0);
+
+    // (50) A never-stored ARRAY-ELEMENT of a global, GUARDED - the array-element counterpart of
+    // leg 48.
+    int guardedElem = 0;
+    if (ngArr[0] == nullptr) { guardedElem = 10; } else { guardedElem = ngArr[0].Get(); }
+    result &= Test("nid_global_elem_guarded_else", guardedElem, 10);
+
+    // (51) The same never-stored array-element SUB-OBJECT under a branch that is false at run
+    // time - the array-element counterpart of leg 49.
+    int elemHits = 0;
+    if (ndPick(0) == 1) { elemHits = ngArr[0].Get(); }
+    result &= Test("nid_global_elem_under_branch", elemHits, 0);
 
     return result;
 }

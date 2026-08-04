@@ -40,6 +40,14 @@ the work these came out of. `internal/testing-notes.md` holds the mechanics of t
   into a verified before/after. It caught a report that framed a REGRESSION as a tightening, and
   separately caught a tightening whose claimed witness did not compile on PRE at all - the claim
   was true, the evidence was not.
+- **Keep the PRE binary OUTSIDE the repo - `scratch/` is the fix agent's workspace, not the
+  reviewer's.** Second occurrence 2026-08-03 (the first was a merge agent deleting the scratch
+  directory a review was still drawing witnesses from): a PRE binary parked in `scratch/pre/` was
+  deleted by the Stage 1 implementation agent tidying up, and had to be rebuilt mid-review. Build it
+  in a detached worktree under `/tmp` and reference it by absolute path. Corollary: **verify the PRE
+  binary's identity before quoting it** - the first sign anything was wrong was every probe
+  returning exit 127, which is a missing binary, not a compiler verdict. A silent substitution
+  would have been far worse than a loud one.
 - **A stalled or failed review agent is not a clean review.** One round's reviewer died mid-run
   with no report; treating the silence as "nothing found" would have shipped an unverified cache
   round-trip.

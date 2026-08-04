@@ -47,6 +47,8 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/IR/Dominators.h>   // llvm::DominatorTree (dominance-aware owned-temp flush)
+#include <llvm/IR/Operator.h>     // llvm::GEPOperator (constant-expr GEPs off a global)
+#include <llvm/IR/ValueHandle.h>  // llvm::WeakVH (records that outlive their function)
 #include <llvm/IR/DIBuilder.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
@@ -1393,7 +1395,12 @@ public:
      * null constant, and the slot's address never leaves the frame. Recorded at the dispatch
      * (which cannot reject), resolved at the same end-of-body hook as the return-dangle check,
      * where the block is complete. Anything unrecognized - a branch or loop between, an escaped
-     * address, a field/array/global receiver, a `?.` spelling - is simply not proven and compiles.
+     * address, a global receiver, a `?.` spelling - is simply not proven and compiles.
+     *
+     * The receiver's storage is keyed as a frame-local alloca plus a constant index path, so a
+     * struct FIELD (`h.c`) and an array ELEMENT (`a[0]`) of a frame-local are proven the same
+     * way as a whole local (empty path). A `this`, heap, through-pointer or variable-index base
+     * resolves to no alloca and is never proven - that is what keeps `this->c.Get()` compiling.
      *
      * Interface FIELD access (`lv.tag`, and the `lv.tag = ...` write form, which share one
      * lvalue) has the identical hazard and uses the identical proof: the field address is
@@ -1402,6 +1409,9 @@ public:
     struct NullIfaceDispatchSite
     {
         std::string VarName;
+        // The receiver exactly as written in source ("h.c", "a[0]"). Only consulted for a
+        // sub-object receiver, where VarName names the CONTAINER and would be factually false.
+        std::string ReceiverText;
         std::string MemberName;
         bool IsField = false;
         int Line = 0;
@@ -1410,7 +1420,8 @@ public:
 
     struct PendingNullIfaceDispatch
     {
-        llvm::AllocaInst* Slot = nullptr;
+        llvm::AllocaInst* Base = nullptr;      // frame-local alloca the receiver lives in
+        llvm::SmallVector<uint64_t, 4> Path;   // constant GEP indices from Base to the fat slot
         llvm::Instruction* Anchor = nullptr;   // the access's own load off the slot
         std::string VarName;
         std::string MemberName;
@@ -1421,25 +1432,193 @@ public:
     };
     std::unordered_map<llvm::Function*, std::vector<PendingNullIfaceDispatch>> pendingNullIfaceDispatch_;
 
+    /*
+     * The same access with a module-level GLOBAL receiver. A global's null-ness is its
+     * INITIALIZER, not a store - `PLive g = default;` emits no instruction anywhere - and the
+     * "never assigned" fact is whole-module, so this cannot be answered at end-of-body. Resolved
+     * in RunNullIfaceGlobalCheck at module end. Value handles because a body erased before then
+     * (a temp global-init function) takes its instructions with it.
+     */
+    struct PendingNullIfaceGlobalAccess
+    {
+        llvm::WeakVH Global;   // the GlobalVariable the receiver lives in (whole global, or its base)
+        llvm::WeakVH Anchor;   // the access's own load off the global
+        std::string VarName;
+        std::string MemberName;
+        std::string IfaceName;
+        bool IsField = false;
+        int Line = 0;
+        int Col = 0;
+        // Constant GEP indices from Global to the fat slot; empty for a whole-global receiver.
+        llvm::SmallVector<uint64_t, 4> Path;
+    };
+    std::vector<PendingNullIfaceGlobalAccess> pendingNullIfaceGlobal_;
+
+    // WeakVH nulls itself when its value is deleted, so a null answer here means "gone".
+    static llvm::Value* NullIfaceHandleValue(const llvm::WeakVH& h)
+    {
+        return static_cast<llvm::Value*>(h);
+    }
+
+    /*
+     * Resolve a storage address to (frame-local alloca, constant index path). An LLVM GEP's FIRST
+     * index steps over whole pointee objects, so it must be zero here (anything else addresses a
+     * different object) and is dropped; the remaining indices are the path. Each link's source
+     * element type must match the type reached so far, which is what makes the path meaningful
+     * against a constant stored at the base. Returns nullptr - i.e. "not proven, accept" - on a
+     * non-constant index, a non-GEP link, or a base that is not an alloca.
+     */
+    static llvm::AllocaInst* ResolveIfaceStorageLoc(llvm::Value* slot,
+                                                    llvm::SmallVectorImpl<uint64_t>& path)
+    {
+        path.clear();
+        llvm::SmallVector<llvm::GetElementPtrInst*, 4> chain;
+        llvm::Value* cur = slot;
+        while (auto* gep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(cur))
+        {
+            if (chain.size() >= 8) return nullptr;
+            chain.push_back(gep);
+            cur = gep->getPointerOperand();
+        }
+        auto* base = llvm::dyn_cast_or_null<llvm::AllocaInst>(cur);
+        if (base == nullptr) return nullptr;
+
+        llvm::Type* ty = base->getAllocatedType();
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+        {
+            llvm::GetElementPtrInst* gep = *it;
+            if (!gep->hasAllConstantIndices()) return nullptr;
+            if (gep->getSourceElementType() != ty) return nullptr;
+            auto idx = gep->idx_begin();
+            if (idx == gep->idx_end()) return nullptr;
+            if (!llvm::cast<llvm::ConstantInt>(idx->get())->isZero()) return nullptr;
+            for (++idx; idx != gep->idx_end(); ++idx)
+            {
+                const auto* ci = llvm::cast<llvm::ConstantInt>(idx->get());
+                if (ci->getBitWidth() > 64 || ci->isNegative()) return nullptr;
+                if (ci->getZExtValue() > 0xFFFFFFFFull) return nullptr;
+                if (path.size() >= 8) return nullptr;
+                path.push_back(ci->getZExtValue());
+            }
+            ty = gep->getResultElementType();
+        }
+        return base;
+    }
+
+    /*
+     * Same resolution as ResolveIfaceStorageLoc, but for a sub-object of a GLOBAL rather than a
+     * frame-local alloca. A field/element of a global is addressed through a GEP whose base and
+     * indices are all constants, so IRBuilder folds it to a CONSTANT-EXPRESSION GEP
+     * (`llvm::GEPOperator` covers both that form and the ordinary instruction form) instead of a
+     * `GetElementPtrInst` - which is why the alloca resolver above never sees it. Same discipline:
+     * bounded chain length, all-constant indices, a leading zero pointer-step index (dropped),
+     * each link's source type must match the type reached so far, bounded path length. Returns
+     * nullptr - i.e. "not proven, accept" - on anything that does not fit.
+     */
+    static llvm::GlobalVariable* ResolveIfaceStorageGlobal(llvm::Value* slot,
+                                                            llvm::SmallVectorImpl<uint64_t>& path)
+    {
+        path.clear();
+        llvm::SmallVector<llvm::GEPOperator*, 4> chain;
+        llvm::Value* cur = slot;
+        while (auto* gep = llvm::dyn_cast_or_null<llvm::GEPOperator>(cur))
+        {
+            if (chain.size() >= 8) return nullptr;
+            chain.push_back(gep);
+            cur = gep->getPointerOperand();
+        }
+        auto* base = llvm::dyn_cast_or_null<llvm::GlobalVariable>(cur);
+        if (base == nullptr) return nullptr;
+
+        llvm::Type* ty = base->getValueType();
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+        {
+            llvm::GEPOperator* gep = *it;
+            if (!gep->hasAllConstantIndices()) return nullptr;
+            if (gep->getSourceElementType() != ty) return nullptr;
+            auto idx = gep->idx_begin();
+            if (idx == gep->idx_end()) return nullptr;
+            if (!llvm::cast<llvm::ConstantInt>(idx->get())->isZero()) return nullptr;
+            for (++idx; idx != gep->idx_end(); ++idx)
+            {
+                const auto* ci = llvm::cast<llvm::ConstantInt>(idx->get());
+                if (ci->getBitWidth() > 64 || ci->isNegative()) return nullptr;
+                if (ci->getZExtValue() > 0xFFFFFFFFull) return nullptr;
+                if (path.size() >= 8) return nullptr;
+                path.push_back(ci->getZExtValue());
+            }
+            ty = gep->getResultElementType();
+        }
+        return base;
+    }
+
     void RecordPendingNullIfaceDispatch(const NullIfaceDispatchSite& site, llvm::Value* slot,
                                         llvm::Value* anchor, const std::string& ifaceName)
     {
         if (site.VarName.empty() || site.Line <= 0) return;
-        auto* alloca = llvm::dyn_cast_or_null<llvm::AllocaInst>(slot);
         auto* anchorInst = llvm::dyn_cast_or_null<llvm::Instruction>(anchor);
-        if (alloca == nullptr || anchorInst == nullptr) return;
+        if (slot == nullptr || anchorInst == nullptr) return;
         llvm::BasicBlock* bb = anchorInst->getParent();
         if (bb == nullptr || bb->getParent() == nullptr) return;
-        if (alloca->getFunction() != bb->getParent()) return;
-        pendingNullIfaceDispatch_[bb->getParent()].push_back(
-            { alloca, anchorInst, site.VarName, site.MemberName, ifaceName, site.IsField,
-              site.Line, site.Col });
+
+        // A GLOBAL receiver goes to its own ledger: its null-ness is a module-level initializer
+        // and the "never assigned" fact is whole-module, neither of which is knowable here.
+        if (auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(slot))
+        {
+            pendingNullIfaceGlobal_.push_back(
+                { gv, anchorInst, site.VarName, site.MemberName, ifaceName, site.IsField,
+                  site.Line, site.Col, {} });
+            return;
+        }
+
+        llvm::SmallVector<uint64_t, 4> path;
+        llvm::AllocaInst* base = ResolveIfaceStorageLoc(slot, path);
+        if (base != nullptr)
+        {
+            if (base->getFunction() != bb->getParent()) return;
+            // A sub-object receiver must be nameable as written, or the diagnostic would name
+            // the container instead of the thing that is null. No name, no record.
+            std::string varName = site.VarName;
+            if (!path.empty())
+            {
+                if (site.ReceiverText.empty()) return;
+                varName = site.ReceiverText;
+            }
+            pendingNullIfaceDispatch_[bb->getParent()].push_back(
+                { base, path, anchorInst, varName, site.MemberName, ifaceName, site.IsField,
+                  site.Line, site.Col });
+            return;
+        }
+
+        // Not a frame-local - try a FIELD/ELEMENT of a global: the base is a GlobalVariable
+        // reached through a constant-expression GEP chain rather than a literal GlobalVariable
+        // slot. Same naming rule as the sub-object-of-alloca case above.
+        llvm::SmallVector<uint64_t, 4> gpath;
+        llvm::GlobalVariable* gbase = ResolveIfaceStorageGlobal(slot, gpath);
+        if (gbase == nullptr) return;
+        std::string gVarName = site.VarName;
+        if (!gpath.empty())
+        {
+            if (site.ReceiverText.empty()) return;
+            gVarName = site.ReceiverText;
+        }
+        pendingNullIfaceGlobal_.push_back(
+            { gbase, anchorInst, gVarName, site.MemberName, ifaceName, site.IsField,
+              site.Line, site.Col, gpath });
     }
 
     // Same rationale as DiscardPendingReturnDangleChecks: an aborted body's blocks are partial.
     void DiscardPendingNullIfaceDispatch(llvm::Function* F)
     {
-        if (F) pendingNullIfaceDispatch_.erase(F);
+        if (!F) return;
+        pendingNullIfaceDispatch_.erase(F);
+        // The global ledger survives to module end, so an aborted body's records must be
+        // removed here or the control-dependence test would run on a partial CFG.
+        std::erase_if(pendingNullIfaceGlobal_, [F](const PendingNullIfaceGlobalAccess& r)
+        {
+            auto* inst = llvm::dyn_cast_or_null<llvm::Instruction>(NullIfaceHandleValue(r.Anchor));
+            return inst == nullptr || inst->getFunction() == F;
+        });
     }
 
     // Pointer SSA values detached by a `move` expression, keyed by value identity. A move nulls its
@@ -1843,6 +2022,9 @@ private:
     std::vector<std::string> cIncludeDirs_;
     std::vector<std::string> cLinkLibs_;
     std::vector<std::string> cDefines_;
+    // A positional `.c` input, noted at arg-parse time because clang is only invoked for it
+    // AFTER the module-end analyses run. Read by RunNullIfaceGlobalCheck.
+    bool positionalCSource_ = false;
     // macOS frameworks requested via `import framework "X"` / --framework. Each becomes
     // a `-framework X` pair on the Mach-O link. Deduped, first-seen order preserved.
     std::vector<std::string> cFrameworks_;
@@ -1981,6 +2163,19 @@ private:
     // Armed before ProcessImports so import-time errors can match. An unmatched expectation
     // at end of compilation is a did-not-occur failure.
     std::string fileScopeExpectedError_;
+
+    /*
+     * A nested (scoped or statement-level) expect_error OVERWRITES the armed file-scope bare
+     * expectation while it runs, so clearing it on completion would drop the file-scope one for
+     * the rest of the compile. Re-arm instead. This is what lets one file combine the two forms,
+     * which a MODULE-END diagnostic needs: only the bare file-scope form is still armed then.
+     * Empty fileScopeExpectedError_ makes this exactly the old clear().
+     */
+    void RestoreFileScopeExpectedError()
+    {
+        expectedError = fileScopeExpectedError_;
+        expectedErrorScopeDepth = SIZE_MAX;
+    }
 
     // Compile-time macros (constant throughout compilation, set early)
     struct CompileTimeMacro
@@ -19600,59 +19795,331 @@ public:
     /*
      * True when `slot`'s address provably never leaves the frame, so the only writes to it are
      * the direct stores this analysis can see. Every user must be a plain load, a store INTO the
-     * slot, an all-constant GEP whose own users are only loads and stores into it, or a debug /
-     * lifetime marker. Deliberately NOT CallIsPointerOpaqueIntrinsic: that helper also admits
-     * llvm.mem*, and a memcpy into the slot is a real write this walk would then miss.
+     * slot, an all-constant GEP (walked RECURSIVELY, since a field or element receiver reaches
+     * its fat pointer through two or more nested GEPs), or a debug / lifetime marker.
+     * Deliberately NOT CallIsPointerOpaqueIntrinsic: that helper also admits llvm.mem*, and a
+     * memcpy into the slot is a real write this walk would then miss.
      * Anything else answers false, which only ever suppresses a rejection.
      */
-    bool InterfaceSlotIsFrameLocal(const llvm::AllocaInst* slot) const
+    bool InterfaceSlotIsFrameLocal(const llvm::Value* slot) const
     {
-        for (const llvm::User* u : slot->users())
+        llvm::SmallPtrSet<const llvm::Value*, 16> seen;
+        llvm::SmallVector<const llvm::Value*, 16> work;
+        seen.insert(slot);
+        work.push_back(slot);
+        unsigned budget = 1024;
+        while (!work.empty())
         {
-            if (llvm::isa<llvm::LoadInst>(u)) continue;
-            if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(u))
+            if (budget-- == 0) return false;
+            const llvm::Value* cur = work.pop_back_val();
+            for (const llvm::User* u : cur->users())
             {
-                // The slot's ADDRESS stored elsewhere is an escape, not a write.
-                if (st->getPointerOperand() == slot) continue;
-                return false;
-            }
-            if (const auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(u))
-            {
-                if (!gep->hasAllConstantIndices()) return false;
-                for (const llvm::User* gu : gep->users())
+                if (llvm::isa<llvm::LoadInst>(u)) continue;
+                if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(u))
                 {
-                    if (llvm::isa<llvm::LoadInst>(gu)) continue;
-                    const auto* gst = llvm::dyn_cast<llvm::StoreInst>(gu);
-                    if (gst != nullptr && gst->getPointerOperand() == gep) continue;
+                    // The address stored elsewhere is an escape, not a write.
+                    if (st->getPointerOperand() == cur) continue;
                     return false;
                 }
-                continue;
+                if (const auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(u))
+                {
+                    if (!gep->hasAllConstantIndices()) return false;
+                    if (seen.insert(gep).second) work.push_back(gep);
+                    continue;
+                }
+                if (const auto* call = llvm::dyn_cast<llvm::CallBase>(u))
+                    if (const llvm::Function* f = call->getCalledFunction(); f != nullptr
+                        && (f->getName().starts_with("llvm.dbg.")
+                            || f->getName().starts_with("llvm.lifetime."))) continue;
+                return false;
             }
-            if (const auto* call = llvm::dyn_cast<llvm::CallBase>(u))
-                if (const llvm::Function* f = call->getCalledFunction(); f != nullptr
-                    && (f->getName().starts_with("llvm.dbg.")
-                        || f->getName().starts_with("llvm.lifetime."))) continue;
-            return false;
         }
         return true;
     }
 
-    // Does this store write into `slot` (whole slot, or one field through a constant GEP)?
-    static bool StoreWritesInterfaceSlot(const llvm::StoreInst* st, const llvm::AllocaInst* slot)
+    /*
+     * MAY-write test over the (Base, Path) location: true when this store's destination is Base
+     * itself, or a constant GEP off Base whose path is a prefix of, equal to, or an extension of
+     * Path. The destination's own path is returned so the caller can tell a covering write from a
+     * partial one. A store through a NON-constant GEP off Base cannot reach here - the escape walk
+     * above has already answered false for that base - so it simply does not match.
+     */
+    static bool StoreWritesInterfaceLoc(const llvm::StoreInst* st, const llvm::AllocaInst* base,
+                                        llvm::ArrayRef<uint64_t> path,
+                                        llvm::SmallVectorImpl<uint64_t>& storePath)
     {
-        const llvm::Value* dest = st->getPointerOperand();
-        if (dest == slot) return true;
-        if (const auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(dest))
-            return gep->getPointerOperand() == slot;
-        return false;
+        auto* dest = const_cast<llvm::Value*>(st->getPointerOperand());
+        if (ResolveIfaceStorageLoc(dest, storePath) != base) return false;
+        const size_t common = std::min(storePath.size(), path.size());
+        for (size_t i = 0; i < common; ++i)
+            if (storePath[i] != path[i]) return false;
+        return true;
+    }
+
+    /*
+     * The constant a store's value operand provably lands in memory: the value itself, or the
+     * single constant `ret` of a directly-called DEFINED function - which is how a synthesized
+     * default constructor supplies a struct's null interface field. Anything else answers null,
+     * which accepts.
+     */
+    static const llvm::Constant* NullIfaceStoredConstant(const llvm::Value* v)
+    {
+        if (const auto* c = llvm::dyn_cast<llvm::Constant>(v)) return c;
+        const auto* call = llvm::dyn_cast<llvm::CallInst>(v);
+        if (call == nullptr) return nullptr;
+        const llvm::Function* callee = call->getCalledFunction();
+        if (callee == nullptr || callee->isDeclaration()) return nullptr;
+        const llvm::Constant* result = nullptr;
+        for (const llvm::BasicBlock& b : *callee)
+        {
+            const auto* ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(b.getTerminator());
+            if (ret == nullptr) continue;
+            if (result != nullptr) return nullptr;
+            const auto* rv = llvm::dyn_cast_or_null<llvm::Constant>(ret->getReturnValue());
+            if (rv == nullptr) return nullptr;
+            result = rv;
+        }
+        return result;
+    }
+
+    /*
+     * Does this store touch the (base, path) location, and does it leave a PROVABLE null there?
+     * A write covering a prefix of the path, or the path exactly, is a full write of the
+     * location and is classified from the constant it lands. A write at a LONGER path touches
+     * only part of the fat pointer, so it leaves the location unproven - which accepts.
+     */
+    static bool NullIfaceStoreAffectsLoc(const llvm::StoreInst* st, const llvm::AllocaInst* base,
+                                         llvm::ArrayRef<uint64_t> path, bool& leavesNull)
+    {
+        leavesNull = false;
+        llvm::SmallVector<uint64_t, 4> storePath;
+        if (!StoreWritesInterfaceLoc(st, base, path, storePath)) return false;
+        if (storePath.size() > path.size()) return true;
+        const llvm::Constant* stored = NullIfaceStoredConstant(st->getValueOperand());
+        for (size_t i = storePath.size(); stored != nullptr && i < path.size(); ++i)
+            stored = stored->getAggregateElement(static_cast<unsigned>(path[i]));
+        leavesNull = (stored != nullptr && stored->isNullValue());
+        return true;
+    }
+
+    // Per-block summary of one storage location: the LAST store in that block that writes it,
+    // and whether that store leaves the location provably null.
+    struct NullIfaceLocFacts
+    {
+        std::unordered_map<const llvm::BasicBlock*, std::pair<const llvm::StoreInst*, bool>> ByBlock;
+        bool AnyNullWrite = false;
+    };
+
+    // Per-function CFG data shared by every record in one function, built lazily. The block
+    // order costs O(B); the control-dependence closure costs O(B^2) and is built only once a
+    // record has actually been proven definitely-null at its access, which correct code never
+    // reaches - that is this analysis's counterpart of nulldf's 'haveSet' fast path.
+    struct NullIfaceCfgInfo
+    {
+        llvm::Function* Fn = nullptr;
+        std::unordered_map<llvm::BasicBlock*, int> Rpo;
+        std::vector<llvm::BasicBlock*> Blocks;
+        bool HaveCd = false;
+        std::unordered_map<llvm::BasicBlock*, nulldf::CdSet> Cd;
+    };
+
+    /*
+     * One pass over F classifying every store against every candidate location at once, so the
+     * cost is O(instructions + stores * locations) rather than a full walk per record.
+     */
+    static std::vector<NullIfaceLocFacts> CollectNullIfaceLocFacts(
+        llvm::Function* F, const std::vector<const PendingNullIfaceDispatch*>& live)
+    {
+        std::vector<NullIfaceLocFacts> facts(live.size());
+        for (llvm::BasicBlock& BB : *F)
+            for (llvm::Instruction& inst : BB)
+            {
+                const auto* st = llvm::dyn_cast<llvm::StoreInst>(&inst);
+                if (st == nullptr) continue;
+                for (size_t i = 0; i < live.size(); ++i)
+                {
+                    bool leavesNull = false;
+                    if (!NullIfaceStoreAffectsLoc(st, live[i]->Base, live[i]->Path, leavesNull))
+                        continue;
+                    facts[i].ByBlock[&BB] = { st, leavesNull };
+                    if (leavesNull) facts[i].AnyNullWrite = true;
+                }
+            }
+        return facts;
+    }
+
+    void EnsureNullIfaceBlocks(NullIfaceCfgInfo& cfg, llvm::Function* F)
+    {
+        if (cfg.Fn == F) return;
+        cfg.Fn = F;
+        cfg.Rpo = movedf::ComputeRpoIndex(F);
+        cfg.Blocks.clear();
+        for (llvm::BasicBlock& BB : *F) if (cfg.Rpo.count(&BB)) cfg.Blocks.push_back(&BB);
+        std::sort(cfg.Blocks.begin(), cfg.Blocks.end(),
+                  [&](llvm::BasicBlock* a, llvm::BasicBlock* b) { return cfg.Rpo[a] < cfg.Rpo[b]; });
+    }
+
+    /*
+     * Cross-block half of the definitely-null interface proof. A forward MUST fixpoint over one
+     * storage location: definitely-null at a block only when definitely-null on EVERY
+     * predecessor, so a value assigned on any one path leaves the access accepted. This is
+     * deliberately NOT nulldf's lattice - that one unions witness sets, which answers "was this
+     * moved out on some path" and would reject a receiver assigned inside a branch or a loop.
+     *
+     * Blocks are seeded optimistically (null) except the entry, which starts unproven; the
+     * greatest fixpoint of an AND-meet framework is the meet-over-all-paths answer here, since
+     * every transfer function is a constant or the identity.
+     *
+     * On top of the lattice the control-dependence containment test still runs: a report needs
+     * CD*(access) to be a subset of CD*(M) for EVERY block M establishing the null-ness, which
+     * is what keeps a guarded or run-time-skippable access compiling. 'every' rather than
+     * nulldf's 'some' is the conservative direction, since more suppression means more accepts.
+     */
+    bool CrossBlockProvesNullIface(llvm::Function* F, const PendingNullIfaceDispatch& rec,
+                                   const NullIfaceLocFacts& facts, NullIfaceCfgInfo& cfg)
+    {
+        if (!facts.AnyNullWrite) return false;   // nothing in F ever proves this location null
+        llvm::BasicBlock* anchorBB = rec.Anchor->getParent();
+        EnsureNullIfaceBlocks(cfg, F);
+        if (!cfg.Rpo.count(anchorBB)) return false;
+
+        // The last write covering the location BEFORE the anchor in its own block decides on
+        // its own; that is the same-block proof, which has already run and failed, so reaching
+        // here with one means the location is not null at the access.
+        for (llvm::Instruction& inst : *anchorBB)
+        {
+            if (&inst == rec.Anchor) break;
+            const auto* st = llvm::dyn_cast<llvm::StoreInst>(&inst);
+            if (st == nullptr) continue;
+            bool leavesNull = false;
+            if (NullIfaceStoreAffectsLoc(st, rec.Base, rec.Path, leavesNull) && !leavesNull)
+                return false;
+        }
+
+        llvm::BasicBlock* entry = &F->getEntryBlock();
+        std::unordered_map<llvm::BasicBlock*, char> outState;
+        auto transfer = [&](llvm::BasicBlock* bb, char in) -> char
+        {
+            auto fit = facts.ByBlock.find(bb);
+            if (fit == facts.ByBlock.end()) return in;
+            return fit->second.second ? 1 : 0;
+        };
+        for (llvm::BasicBlock* bb : cfg.Blocks)
+            outState[bb] = transfer(bb, bb == entry ? 0 : 1);
+
+        auto meetIn = [&](llvm::BasicBlock* bb) -> char
+        {
+            if (bb == entry) return 0;
+            bool any = false;
+            for (llvm::BasicBlock* p : llvm::predecessors(bb))
+            {
+                if (!cfg.Rpo.count(p)) continue;
+                any = true;
+                if (!outState[p]) return 0;
+            }
+            return any ? 1 : 0;
+        };
+
+        // Monotone descent: a block's OUT only ever moves from null to not-null, so this
+        // terminates in at most one pass per block. The budget is a pure safety net.
+        unsigned budget = static_cast<unsigned>(cfg.Blocks.size()) + 8;
+        bool changed = true;
+        while (changed)
+        {
+            if (budget-- == 0) return false;
+            changed = false;
+            for (llvm::BasicBlock* bb : cfg.Blocks)
+            {
+                char out = transfer(bb, meetIn(bb));
+                if (out != outState[bb]) { outState[bb] = out; changed = true; }
+            }
+        }
+        if (!meetIn(anchorBB)) return false;
+
+        // Blocks whose last covering write leaves the location null - the witnesses the
+        // control-dependence test is taken against.
+        std::vector<llvm::BasicBlock*> witnesses;
+        for (const auto& [bb, f] : facts.ByBlock)
+        {
+            auto* mut = const_cast<llvm::BasicBlock*>(bb);
+            if (f.second && cfg.Rpo.count(mut)) witnesses.push_back(mut);
+        }
+        if (witnesses.empty()) return false;
+
+        if (!cfg.HaveCd)
+        {
+            cfg.Cd = nulldf::ComputeControlDependence(cfg.Blocks, cfg.Rpo, &provenNoReturn_);
+            cfg.HaveCd = true;
+        }
+        const nulldf::CdSet& cdAccess = cfg.Cd[anchorBB];
+        for (llvm::BasicBlock* m : witnesses)
+            if (!nulldf::IsSubset(cdAccess, cfg.Cd[m])) return false;
+        return true;
+    }
+
+    /*
+     * Straight-line half of the proof, unchanged: the last write covering the receiver's
+     * location at or before the dispatch, within the dispatch's OWN block, lands a null
+     * constant. A block has one entry and no branch inside it, so that write is exactly what
+     * the dispatch reads.
+     */
+    bool SameBlockProvesNullIface(const PendingNullIfaceDispatch& rec) const
+    {
+        llvm::BasicBlock* bb = rec.Anchor->getParent();
+        const llvm::StoreInst* last = nullptr;
+        llvm::SmallVector<uint64_t, 4> storePath, lastPath;
+        bool reachedAnchor = false;
+        for (const llvm::Instruction& inst : *bb)
+        {
+            if (&inst == rec.Anchor) { reachedAnchor = true; break; }
+            if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(&inst))
+                if (StoreWritesInterfaceLoc(st, rec.Base, rec.Path, storePath))
+                { last = st; lastPath = storePath; }
+        }
+        if (!reachedAnchor || last == nullptr) return false;
+        // A write reaching only PART of the receiver (e.g. just the vtable half of the fat
+        // pointer) leaves the rest unaccounted for. A write covering a strict PREFIX of the
+        // path - a whole-struct or whole-array store - is a full write of the sub-location.
+        if (lastPath.size() > rec.Path.size()) return false;
+        const llvm::Constant* stored = NullIfaceStoredConstant(last->getValueOperand());
+        for (size_t i = lastPath.size(); stored != nullptr && i < rec.Path.size(); ++i)
+            stored = stored->getAggregateElement(static_cast<unsigned>(rec.Path[i]));
+        return stored != nullptr && stored->isNullValue();
+    }
+
+    // LogError THROWS, so this never returns on the reporting path.
+    void ReportNullIfaceAccess(const PendingNullIfaceDispatch& rec)
+    {
+        SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
+        // One wording per role. "last set to null" covers BOTH origins the proof accepts:
+        // an `= default` / `= nullptr` initializer, and a reassignment to null.
+        if (rec.IsField)
+            LogError(std::format(
+                "member access on null interface value '{}' - '{}' has not been assigned an "
+                "implementation since it was last set to null, so '{}.{}' would resolve its "
+                "address through a null '{}' vtable; assign one before the access, or write "
+                "'{}?.{}' to skip it when null",
+                rec.VarName, rec.VarName, rec.VarName, rec.MemberName, rec.IfaceName,
+                rec.VarName, rec.MemberName));
+        else
+            LogError(std::format(
+                "method call on null interface value '{}' - '{}' has not been assigned an "
+                "implementation since it was last set to null, so '{}.{}()' would dispatch "
+                "through a null '{}' vtable; assign one before the call, or write '{}?.{}()' "
+                "to skip it when null",
+                rec.VarName, rec.VarName, rec.VarName, rec.MemberName, rec.IfaceName,
+                rec.VarName, rec.MemberName));
     }
 
     /*
      * Resolve the pending definitely-null interface dispatches for ONE function, at the same
      * end-of-body hook as RunInterfaceReturnDangleCheck. Rejecting requires proving all three:
-     * the slot never escapes, a write to it precedes the dispatch IN THE DISPATCH'S OWN BLOCK
-     * (so no branch, loop back-edge or call sits between the two), and that write is a whole-slot
-     * store of a null constant. Any gap in any of the three leaves the program compiling.
+     * the base never escapes, a write covering the receiver's location reaches the access with
+     * no assignment of an implementation on ANY path in between, and the value that write lands
+     * at the location is a null constant. The straight-line proof answers within the access's
+     * own block; the cross-block MUST fixpoint answers when control flow sits between the null
+     * init and the access, and adds the control-dependence containment test so a guarded or
+     * run-time-skippable access still compiles. Any gap anywhere leaves the program compiling.
      */
     void RunNullIfaceDispatchCheck(llvm::Function* F)
     {
@@ -19665,51 +20132,158 @@ public:
         // Escape hatch: skip the diagnostic entirely without a rebuild if it ever misfires.
         const char* off = std::getenv("CFLAT_NULL_IFACE_OFF");
         if (off && off[0] != '\0') return;
+        // Second hatch for the cross-block half alone, so it can be disabled without also
+        // giving up the straight-line proof.
+        const char* xoff = std::getenv("CFLAT_NULL_IFACE_XBLOCK_OFF");
+        const bool crossBlockOn = !(xoff && xoff[0] != '\0');
 
+        std::vector<const PendingNullIfaceDispatch*> live;
         for (const auto& rec : pending)
         {
-            if (rec.Slot == nullptr || rec.Anchor == nullptr) continue;
+            if (rec.Base == nullptr || rec.Anchor == nullptr) continue;
             llvm::BasicBlock* bb = rec.Anchor->getParent();
             if (bb == nullptr || bb->getParent() != F) continue;
-            if (rec.Slot->getFunction() != F) continue;
-            if (!InterfaceSlotIsFrameLocal(rec.Slot)) continue;
+            if (rec.Base->getFunction() != F) continue;
+            if (!InterfaceSlotIsFrameLocal(rec.Base)) continue;
+            live.push_back(&rec);
+        }
+        if (live.empty()) return;
 
-            // Last write to the slot at or before the dispatch, within its own straight-line
-            // block. A block has one entry and no branch inside it, so that write is exactly
-            // what the dispatch reads.
-            const llvm::StoreInst* last = nullptr;
-            bool reachedAnchor = false;
-            for (const llvm::Instruction& inst : *bb)
+        std::vector<NullIfaceLocFacts> facts;
+        NullIfaceCfgInfo cfg;
+        if (crossBlockOn) facts = CollectNullIfaceLocFacts(F, live);
+
+        for (size_t i = 0; i < live.size(); ++i)
+        {
+            const PendingNullIfaceDispatch& rec = *live[i];
+            bool proven = SameBlockProvesNullIface(rec);
+            if (!proven && crossBlockOn)
+                proven = CrossBlockProvesNullIface(F, rec, facts[i], cfg);
+            if (proven) ReportNullIfaceAccess(rec);
+        }
+    }
+
+    /*
+     * True when NOTHING in this module can write `gv`: every user, transitively through GEPs, is
+     * a plain load or a debug / lifetime marker. A store (into the global, or of its address
+     * elsewhere), a call taking its address, an atomic, a constant referencing it, or any user
+     * this walk does not recognise all answer false - which accepts. This is deliberately
+     * stricter than InterfaceSlotIsFrameLocal, which permits stores INTO the slot: here a single
+     * store anywhere in the module is exactly the fact that must not exist.
+     */
+    bool InterfaceGlobalNeverWritten(const llvm::GlobalVariable* gv) const
+    {
+        llvm::SmallPtrSet<const llvm::Value*, 16> seen;
+        llvm::SmallVector<const llvm::Value*, 16> work;
+        seen.insert(gv);
+        work.push_back(gv);
+        unsigned budget = 1024;
+        while (!work.empty())
+        {
+            if (budget-- == 0) return false;
+            const llvm::Value* cur = work.pop_back_val();
+            for (const llvm::User* u : cur->users())
             {
-                if (&inst == rec.Anchor) { reachedAnchor = true; break; }
-                if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(&inst))
-                    if (StoreWritesInterfaceSlot(st, rec.Slot)) last = st;
+                if (llvm::isa<llvm::LoadInst>(u)) continue;
+                if (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(u))
+                {
+                    if (seen.insert(gep).second) work.push_back(gep);
+                    continue;
+                }
+                if (const auto* call = llvm::dyn_cast<llvm::CallBase>(u))
+                    if (const llvm::Function* f = call->getCalledFunction(); f != nullptr
+                        && (f->getName().starts_with("llvm.dbg.")
+                            || f->getName().starts_with("llvm.lifetime."))) continue;
+                return false;
             }
-            if (!reachedAnchor || last == nullptr) continue;
-            // A partial (single-field) write leaves the other half unaccounted for.
-            if (last->getPointerOperand() != rec.Slot) continue;
-            const auto* stored = llvm::dyn_cast<llvm::Constant>(last->getValueOperand());
-            if (stored == nullptr || !stored->isNullValue()) continue;
+        }
+        return true;
+    }
 
-            SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
-            // One wording per role. "last set to null" covers BOTH origins the proof accepts:
-            // an `= default` / `= nullptr` initializer, and a mid-block reassignment to null.
-            if (rec.IsField)
-                LogError(std::format(
-                    "member access on null interface value '{}' - '{}' has not been assigned an "
-                    "implementation since it was last set to null, so '{}.{}' would resolve its "
-                    "address through a null '{}' vtable; assign one before the access, or write "
-                    "'{}?.{}' to skip it when null",
-                    rec.VarName, rec.VarName, rec.VarName, rec.MemberName, rec.IfaceName,
-                    rec.VarName, rec.MemberName));
-            else
-                LogError(std::format(
-                    "method call on null interface value '{}' - '{}' has not been assigned an "
-                    "implementation since it was last set to null, so '{}.{}()' would dispatch "
-                    "through a null '{}' vtable; assign one before the call, or write '{}?.{}()' "
-                    "to skip it when null",
-                    rec.VarName, rec.VarName, rec.VarName, rec.MemberName, rec.IfaceName,
-                    rec.VarName, rec.MemberName));
+    /*
+     * Module-end half of the definitely-null interface proof: receivers that ARE a global.
+     * Rejecting needs TWO independent facts, and neither alone is sufficient:
+     *
+     *  1. Whole-module "never assigned" - the initializer is null and no store anywhere in the
+     *     module writes the global or any GEP off it, and its address never escapes.
+     *  2. Control-dependence containment - the null witness is synthesised at the accessing
+     *     function's ENTRY block, since the global is null on entry to every function. An access
+     *     control-dependent on anything the entry block is not (a guard, a run-time-skippable
+     *     branch) fails the subset test and compiles.
+     *
+     * Fact 1 alone is unsound: `if (g == nullptr) {} else { g.Get(); }` has no store anywhere
+     * and the else arm is correct code. Fact 2 alone is unsound: a global assigned in another
+     * translation unit has no in-module guard at the access.
+     */
+    void RunNullIfaceGlobalCheck()
+    {
+        std::vector<PendingNullIfaceGlobalAccess> pending;
+        pending.swap(pendingNullIfaceGlobal_);
+        if (pending.empty() || module == nullptr) return;
+
+        // Escape hatches: the shared one, plus a third for the global half alone.
+        const char* off = std::getenv("CFLAT_NULL_IFACE_OFF");
+        if (off && off[0] != '\0') return;
+        const char* goff = std::getenv("CFLAT_NULL_IFACE_GLOBAL_OFF");
+        if (goff && goff[0] != '\0') return;
+
+        // Interop caveat, handled rather than documented away: cflat globals get ExternalLinkage,
+        // so a user C translation unit or a bound import library could write one with no store
+        // anywhere in this module, which would make fact 1 false. Skip the whole check whenever
+        // user C code is linked in. System frameworks and libc are not user code and cannot name
+        // a cflat global, so they do not count.
+        if (!cObjectFiles_.empty() || !cLinkLibs_.empty() || positionalCSource_) return;
+
+        std::unordered_map<const llvm::GlobalVariable*, bool> neverWritten;
+        std::unordered_map<llvm::Function*, NullIfaceCfgInfo> cfgs;
+        for (const auto& rec : pending)
+        {
+            auto* gv = llvm::dyn_cast_or_null<llvm::GlobalVariable>(NullIfaceHandleValue(rec.Global));
+            auto* anchor = llvm::dyn_cast_or_null<llvm::Instruction>(NullIfaceHandleValue(rec.Anchor));
+            if (gv == nullptr || anchor == nullptr) continue;
+            if (gv->getParent() != module.get()) continue;
+            llvm::BasicBlock* bb = anchor->getParent();
+            if (bb == nullptr) continue;
+            llvm::Function* F = bb->getParent();
+            if (F == nullptr || F->isDeclaration() || F->empty()) continue;
+            if (F->getParent() != module.get()) continue;
+
+            // Fact 1. An extern declaration has no initializer and is never proven. For a
+            // sub-object receiver, walk the constant path into the initializer the same way
+            // SameBlockProvesNullIface walks a store's constant - anything that does not
+            // resolve (a non-constant-aggregate initializer, an out-of-range index) accepts.
+            if (!gv->hasInitializer()) continue;
+            const llvm::Constant* init = gv->getInitializer();
+            for (size_t i = 0; init != nullptr && i < rec.Path.size(); ++i)
+                init = init->getAggregateElement(static_cast<unsigned>(rec.Path[i]));
+            if (init == nullptr || !init->isNullValue()) continue;
+            auto nw = neverWritten.find(gv);
+            if (nw == neverWritten.end())
+                nw = neverWritten.emplace(gv, InterfaceGlobalNeverWritten(gv)).first;
+            if (!nw->second) continue;
+
+            // Fact 2. Witness = entry block, so this asks that the access be reached on every
+            // path through the function - exactly what a guard around it makes false.
+            NullIfaceCfgInfo& cfg = cfgs[F];
+            EnsureNullIfaceBlocks(cfg, F);
+            llvm::BasicBlock* entry = &F->getEntryBlock();
+            if (!cfg.Rpo.count(bb) || !cfg.Rpo.count(entry)) continue;
+            if (!cfg.HaveCd)
+            {
+                cfg.Cd = nulldf::ComputeControlDependence(cfg.Blocks, cfg.Rpo, &provenNoReturn_);
+                cfg.HaveCd = true;
+            }
+            if (!nulldf::IsSubset(cfg.Cd[bb], cfg.Cd[entry])) continue;
+
+            PendingNullIfaceDispatch out;
+            out.Anchor = anchor;
+            out.VarName = rec.VarName;
+            out.MemberName = rec.MemberName;
+            out.IfaceName = rec.IfaceName;
+            out.IsField = rec.IsField;
+            out.Line = rec.Line;
+            out.Col = rec.Col;
+            ReportNullIfaceAccess(out);   // LogError THROWS - nothing after this runs
         }
     }
 
@@ -19736,6 +20310,10 @@ public:
         // end-of-body hook (a lambda, a synthesized body, or an erased global-init temp
         // function whose blocks are gone). Drop them unanalyzed - accept, never reject.
         pendingNullIfaceDispatch_.clear();
+
+        // The GLOBAL-receiver half, by contrast, can only be answered here: the whole-module
+        // "never assigned" fact needs every function emitted. LogError throws out of this.
+        RunNullIfaceGlobalCheck();
 
         // Escape hatch: skip the pass entirely without a rebuild if it ever misfires.
         const char* off = std::getenv("CFLAT_MOVE_DF_OFF");

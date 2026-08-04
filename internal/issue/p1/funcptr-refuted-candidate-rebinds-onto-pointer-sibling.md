@@ -79,3 +79,68 @@ still bind a later matching one - pinned by "matching signature beats the void* 
 
 Related: [[shape-mismatched-funcptr-arg-binds-silently]],
 [[data-pointer-returned-as-closure-not-gated]], [[interface-issue-queue]]
+
+## PARKED 2026-08-03 - branch `fix/funcptr-rebind`, worktree `../cflat-fix-funcptr-rebind`
+
+Two review rounds, stopped before a third at the maintainer's instruction. The branch is ONE
+commit `b2e0e9b` on `904f026`; nothing merged, `master` untouched. The work is close - the fix
+direction above is confirmed correct and the bar is green (`test.sh` 576/0/8,
+`example_mac.sh` 35/0, A/B `--check` sweep over 546 files = 1 intended difference) - it is parked
+on two open review findings, not on a wrong approach.
+
+**What the branch already does, all measured pre/post and reviewed clean:**
+
+- Widens the gate from `TypeName == "void"` to any pointer parameter, via two new helpers
+  `ArgumentIsCodeValue` / `ParameterStoresData` (`cflat/LLVMBackend.h` ~17669).
+- Gates the implicit `char*` -> `string` coercion the same way - `string` is not a pointer but is
+  reached by that coercion, and it lowered to `operator string(char*)` reading the callee's machine
+  code (proven from `--no-opt` IR).
+- Runs the gate on the VARIADIC short-circuit (~17700), which round 1 found bypasses per-argument
+  scoring entirely: `lam(Rec*, ...)` absorbed the code value exactly as the non-variadic sibling
+  did, exit 138 with no diagnostic. Only DECLARED parameters are judged - an argument in the `...`
+  tail has no parameter to disagree with, and `printf("%p", fn)` must keep working.
+- Adds a per-candidate explanation line to the "no overload matches" dump, since opaque pointers
+  make it print two indistinguishable `ptr`s.
+- 7 reject legs and value legs, each mutation-tested in isolation (exit 1 on a `904f026` binary,
+  0 on the branch).
+
+**The two findings that stopped it:**
+
+1. **MEDIUM - the diagnostic loop misses the variadic gate's own cell.**
+   `cflat/LLVMBackend.h:18437` applies the scorer's empty-`TypeName` shape requirement to every
+   candidate, but the variadic gate does not require that shape - it calls `ArgumentIsCodeValue`
+   unconditionally. A `Lambda<T>` FAT value into `int lam(Rec* r, ...)` is `r=902` on master and
+   correctly rejected on the branch, but gets no explanation line at all. The condition has to be
+   per-arm (empty `TypeName` for the two scorer sites, unconditional for the variadic one), or the
+   loop needs to know which arm refused. There is also no test leg for this cell: all seven reject
+   legs and all three new value legs use a thin `function<>` value, so fat-value-into-variadic is
+   unprobed on BOTH the reject and the accept side.
+
+2. **LOW - a code value into a variadic's declared SCALAR parameter is still unjudged.**
+   `ParameterStoresData` returns false for a non-pointer scalar, so `int lam(int n, ...)` competing
+   with a funcptr overload produces a raw LLVM verifier failure on both binaries:
+   `Call parameter type does not match function signature!`. CLAUDE.md's rule is to turn a
+   diagnosed LLVM-level failure into a proper compiler error. Variadic-specific - the non-variadic
+   twin `int lam(int n)` rejects cleanly with the normal "no overload matches" on both binaries.
+   Pre-existing, but the branch's landed record claims the variadic hole is closed, and this is the
+   one variadic shape it does not cover.
+
+**Settled along the way, do not re-litigate:**
+
+- The `ParameterStoresData` vs raw `Pointer` asymmetry at ~17862 is CORRECT, proven not assumed:
+  the only two cases where they differ are `IsFunctionPointer` and `IsEncodedClosureType`, which is
+  exactly the funcptr arm's first conjunct, and `ArgumentIsCodeValue` implies its second - so the
+  arm claims those parameters and the else branch is unreachable for them.
+- Dropping the variadic candidate cannot change which other candidate wins in a call with no code
+  value at all. Structural, not empirical: the drop is conditioned on a code value at a declared
+  data parameter.
+- Core variadics are safe by construction - `printf`/`sprintf`/`snprintf`/`fprintf`/`scanf`/
+  `sscanf`/`fscanf` and `os.posix.open` declare only `char*`/`void*`/scalar prefixes, and
+  `cflat/core/cocoa.cb` already passes IMPs through explicit `(void*)imp` casts.
+- The branch also files two issues that should land with it:
+  `p2/c-binder-misses-decorated-function-pointer-parameter` (a `const`-qualified C function-pointer
+  parameter defeats the literal `"(*)"` probe and binds as `void*`; the `atexit` rejection is
+  separately caused by a hand-written `extern int atexit(void* func);` at `cflat/core/cruntime.cb:584`)
+  and `p1/code-value-into-data-pointer-outside-overload-resolution` (`Rec* r = w;`, `return w;`, and
+  a field store are exit 138 with no diagnostic, identical on both binaries - the store paths this
+  fix deliberately does not reach).
