@@ -1146,3 +1146,246 @@ expect_error("cannot brace-initialize a function-pointer or closure VALUE into e
         return (int)v[0].length();
     }
 }
+
+/*
+ * A '?:' / '??' JOIN erases the source evidence every gate above reads: the '?:' spelling is a PHI
+ * and the '??' spelling a load out of a slot, and neither carries a TypeName, a recorded signature
+ * or an llvm::Function Primary. On the merge base every leg below compiled with NO diagnostic and
+ * ran to exit 138 (a code address written through as a data pointer). The gates now resolve a join
+ * through the per-value code ledger, so all three - argument, store and return - see it again.
+ *
+ * Discriminator for every leg: the bare spelling of the same store is already diagnosed, so what
+ * these pin is the JOIN wrapper. Each one is mutation-tested by deleting the RegisterCodeValue
+ * call - the whole family reverts to compiling.
+ */
+struct JoinRec { int a = default; int b = default; };
+double joinRo(double x) { return x + 1000.0; }
+double joinR2(double x) { return x + 2000.0; }
+int joinLam(JoinRec* p) { p->a = 11; return p->a; }
+
+// The DECLARATOR, both join spellings. '??' arms are unrecoverable from the IR, so this leg is the
+// one that proves the nullCoalesceJoins_ ledger (not the PHI walk) answers.
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'JoinRec*'") {
+    int ternaryIntoDataPointer(int c)
+    {
+        function<double(double)> w = joinRo;
+        JoinRec* n = nullptr;
+        JoinRec* r = c > 0 ? w : n;
+        return r->a;
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'JoinRec*'") {
+    int nullCoalesceIntoDataPointer()
+    {
+        function<double(double)> w = joinRo;
+        JoinRec* n = nullptr;
+        JoinRec* r = n ?? w;
+        return r->a;
+    }
+}
+
+/*
+ * The ARGUMENT gate - the leg that shows this is not a store-side defect. `joinLam(w)` has been
+ * diagnosed since the code VALUE stopped converting to a data parameter; wrapping the same value
+ * in a join made it bind again. Discriminator: the pinned text is the per-CANDIDATE line of the
+ * overload dump, which only the code-value arm of the scorer emits, and the single candidate has
+ * the matching arity so no other arm can claim the refusal.
+ */
+expect_error("parameter 0 is a data type ('JoinRec*') and the argument is a function-pointer or closure VALUE") {
+    int ternaryAsDataArgument(int c)
+    {
+        function<double(double)> w = joinRo;
+        JoinRec* n = nullptr;
+        return joinLam(c > 0 ? w : n);
+    }
+}
+
+expect_error("parameter 0 is a data type ('JoinRec*') and the argument is a function-pointer or closure VALUE") {
+    int nullCoalesceAsDataArgument()
+    {
+        function<double(double)> w = joinRo;
+        JoinRec* n = nullptr;
+        return joinLam(n ?? w);
+    }
+}
+
+// The RETURN leg, against the declared return type.
+expect_error("cannot return a function-pointer or closure VALUE into data type 'JoinRec*'") {
+    JoinRec* returnTernaryAsDataPointer(int c, function<double(double)> w, JoinRec* n)
+    {
+        return c > 0 ? w : n;
+    }
+}
+
+// The ASSIGNMENT leg ('=' also carries the field, element and global stores).
+expect_error("cannot assign a function-pointer or closure VALUE into data type 'JoinRec*'") {
+    int assignTernaryIntoDataPointer(int c)
+    {
+        function<double(double)> w = joinRo;
+        JoinRec* r = nullptr;
+        r = c > 0 ? w : nullptr;
+        return r->a;
+    }
+}
+
+// The SYNTAX-axis sites: a brace field initializer, a fixed-array element, a struct field DEFAULT
+// and a parameter DEFAULT are four separate lowering paths, reached by none of the three above.
+expect_error("cannot brace-initialize a function-pointer or closure VALUE into field 'JoinHolder.p'") {
+    struct JoinHolder { JoinRec* p = default; int n = default; };
+
+    int braceInitFromTernary(int c)
+    {
+        function<double(double)> w = joinRo;
+        JoinRec* n = nullptr;
+        JoinHolder h = { p = c > 0 ? w : n, n = 3 };
+        return h.p->a;
+    }
+}
+
+expect_error("cannot brace-initialize a function-pointer or closure VALUE into element 0 of 'a'") {
+    int arrayElementFromTernary(int c)
+    {
+        function<double(double)> w = joinRo;
+        JoinRec* n = nullptr;
+        JoinRec*[2] a = { c > 0 ? w : n, n };
+        return a[0]->a;
+    }
+}
+
+expect_error("cannot default-initialize a function-pointer or closure VALUE into field 'JoinDef.p'") {
+    function<double(double)> gJoinW = joinRo;
+    struct JoinDef { JoinRec* p = gJoinW ?? nullptr; };
+}
+
+expect_error("cannot default-initialize a function-pointer or closure VALUE into parameter 'p'") {
+    function<double(double)> gJoinW2 = joinRo;
+    int paramDefaultFromJoin(JoinRec* p = gJoinW2 ?? nullptr) { return p->a; }
+}
+
+// A NESTED join and a join-of-joins: the resolution walks arms recursively, so a code value buried
+// one level down is still found. Discriminator: the outer join's own arms are both plain pointers.
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'JoinRec*'") {
+    int nestedTernaryIntoDataPointer(int c)
+    {
+        function<double(double)> w = joinRo;
+        JoinRec* n = nullptr;
+        JoinRec* r = c > 0 ? (c > 1 ? w : n) : n;
+        return r->a;
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'JoinRec*'") {
+    int joinOfJoinIntoDataPointer(int c)
+    {
+        function<double(double)> w = joinRo;
+        JoinRec* n = nullptr;
+        JoinRec* r = (c > 0 ? w : n) ?? n;
+        return r->a;
+    }
+}
+
+// A bare function NAME as an arm carries no ledger entry at all - it arrives as an llvm::Function,
+// which the arm walk recognizes directly. Discriminator: no read of a `function<>` local happens.
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'JoinRec*'") {
+    int functionNameArmIntoDataPointer(int c)
+    {
+        JoinRec* n = nullptr;
+        JoinRec* r = c > 0 ? joinRo : n;
+        return r->a;
+    }
+}
+
+// A join of TWO code arms into a data pointer: neither arm is a legal source, and the resolution
+// answering on the FIRST one must not depend on the other being data.
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'JoinRec*'") {
+    int bothArmsCodeIntoDataPointer(int c)
+    {
+        function<double(double)> w = joinRo;
+        function<double(double)> w2 = joinR2;
+        JoinRec* r = c > 0 ? w : w2;
+        return r->a;
+    }
+}
+
+/*
+ * `void*` through a join. Ratified separately from the crashing legs: this one does NOT crash on
+ * the merge base (exit 0, the address is simply stored), and it is the join spelling of the rule
+ * that a code VALUE does not convert to a `void*` destination - already an error for the bare
+ * store and for a `void*` parameter. The two spellings of one rule now agree.
+ */
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    int ternaryIntoVoidPointer(int c)
+    {
+        function<double(double)> w = joinRo;
+        void* n = nullptr;
+        void* v = c > 0 ? w : n;
+        return v == nullptr ? 0 : 1;
+    }
+}
+
+/*
+ * The one join arm that CONSUMES the evidence instead of erasing it: when the other arm is a
+ * `string`, the arm harmonizer wraps the code pointer as a NUL-terminated buffer, so the join
+ * delivers a `string` VALUE and no downstream gate has a pointer left to question. On the merge
+ * base this is a SILENT MISCOMPILE (exit 0, an empty string), not a crash. It is refused at the
+ * harmonizer instead, which is why its wording is the arm one rather than the store one.
+ */
+expect_error("cannot convert a function-pointer or closure VALUE in a '?:' arm to 'string'") {
+    int ternaryStringArmFromCode(int c)
+    {
+        function<double(double)> w = joinRo;
+        string s = "hi";
+        string picked = c > 0 ? w : s;
+        return (int)picked.length();
+    }
+}
+
+/*
+ * '??=' is a SEPARATE store path from '=': it emits its own compare/branch/store and returns
+ * before the plain-'=' gate ever runs, and it parses its RHS through the lean VALUE path, which
+ * discards the NamedVariable that gate reads. On the merge base `r ??= w;` compiled clean and
+ * exited 138 while the bare `r = w;` was already diagnosed - so the two spellings of one store
+ * disagreed. Discriminator: the pinned wording is the ASSIGN role, and the leg uses '??=', whose
+ * store the '=' site never sees.
+ */
+expect_error("cannot assign a function-pointer or closure VALUE into data type 'JoinRec*'") {
+    int nullAssignCodeIntoDataPointer()
+    {
+        function<double(double)> w = joinRo;
+        JoinRec* r = nullptr;
+        r ??= w;
+        return r->a;
+    }
+}
+
+expect_error("cannot assign a function-pointer or closure VALUE into data type 'void*'") {
+    int nullAssignCodeIntoVoidPointer()
+    {
+        function<double(double)> w = joinRo;
+        void* v = nullptr;
+        v ??= w;
+        return v == nullptr ? 0 : 1;
+    }
+}
+
+/*
+ * A join argument scored against an overload SET where EVERY candidate is a data parameter. The
+ * code-value rule is read by the scorer's refute arm, so this is the shape where it moves overload
+ * resolution: on the merge base the call silently selected `g(void*)` and stored a code address
+ * there. It is refused now, with a per-candidate line for BOTH candidates - and that pair is the
+ * discriminator, since a single-candidate leg cannot show the whole set was refuted rather than
+ * one candidate simply losing. The sibling set that CONTAINS a `function<>` candidate still binds
+ * it, unchanged on both binaries; its accept leg is cvj_overload_set_binds_funcptr.
+ */
+expect_error("[_joinOv_i32_U8Ptr_] parameter 0 is a data type ('void*') and the argument is a function-pointer or closure VALUE") {
+    int joinOv(JoinRec* p) { return 1; }
+    int joinOv(void* p) { return 2; }
+
+    int joinArgumentAgainstAllDataOverloadSet(int c)
+    {
+        function<double(double)> w = joinRo;
+        JoinRec* n = nullptr;
+        return joinOv(c > 0 ? w : n);
+    }
+}

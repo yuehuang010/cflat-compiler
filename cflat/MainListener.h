@@ -13249,6 +13249,19 @@ public:
 
                 compiler->SwitchToBlock(assignBlock);
                 auto* rhs = ParseAssignmentExpression(assignCtx);
+                /*
+                 * Code-value store gate for '??='. This branch emits its own compare/branch/store
+                 * and returns before the plain-'=' gate below ever runs, and it parses its RHS
+                 * through the lean VALUE path, which discards the NamedVariable that gate reads -
+                 * so ask the per-value ledger about the stored value itself. That answers for a
+                 * `function<>` read, a bare function name and a join alike, and an explicitly
+                 * cast RHS stays laundered, exactly as at every other store site.
+                 */
+                if (rhs != nullptr && compiler->JoinArmCarriesCodeValue(rhs)
+                    && compiler->ParameterStoresData(namedVar.TypeAndValue))
+                    LogErrorContext(ctx, compiler->DescribeCodeValueIntoData(
+                        CodeValueDestSpelling(namedVar.TypeAndValue), "assign",
+                        CodeValueCastAdvice(namedVar.TypeAndValue)));
                 derefAssign(rhs, false);
                 compiler->CreateJump(resumeBlock);
 
@@ -14559,6 +14572,24 @@ public:
     }
 
     /*
+     * The one join arm that CONSUMES the code evidence instead of carrying it: a `?:` whose other
+     * arm is a `string` wraps the pointer arm as a NUL-terminated buffer, so the machine code is
+     * read as text and the join delivers a `string` value no downstream gate can question. Refuse
+     * it here, where the arm value is still ledgered. Proof-only: an unledgered pointer arm (a
+     * literal, a `char*`) keeps wrapping exactly as before.
+     */
+    bool RejectCodeValueTernaryStringArm(CFlatParser::ConditionalExpressionContext* ctx,
+                                         llvm::Value* armValue)
+    {
+        auto* compiler = Compiler(ctx);
+        if (!compiler->JoinArmCarriesCodeValue(armValue)) return false;
+        LogErrorContext(ctx, "cannot convert a function-pointer or closure VALUE in a '?:' arm to "
+            "'string' - code is not a NUL-terminated buffer; write an explicit '(char*)' cast if "
+            "the raw code address is what you want");
+        return true;
+    }
+
+    /*
      * Align the two '?:' arm values onto one LLVM type so the join (a PHI, or a select in the
      * constant-context fallback) has matching operand types. `atTrue`/`atFalse` reposition the
      * builder into the block that produced the corresponding arm - required by the branching
@@ -14607,11 +14638,13 @@ public:
         {
             // string vs char* literal (e.g. cond ? prefix : "0"): wrap the raw
             // pointer into a non-owning string so both branches are `string`.
+            if (RejectCodeValueTernaryStringArm(ctx, falseValue)) return false;
             atFalse();
             falseValue = compiler->WrapStringLiteralAsString(falseValue);
         }
         else if (strTy && ft == strTy && tt->isPointerTy())
         {
+            if (RejectCodeValueTernaryStringArm(ctx, trueValue)) return false;
             atTrue();
             trueValue = compiler->WrapStringLiteralAsString(trueValue);
         }
@@ -16584,6 +16617,10 @@ public:
         if (result != nullptr && namedVar.TypeAndValue.IsFatInterfaceValue()
             && !namedVar.TypeAndValue.Pointer)
             compiler->RegisterFatInterfaceValueTypeName(result, namedVar.TypeAndValue.TypeName);
+        // Ledger a CODE value by the same value identity, for the same reason: a '?:' / '??' join
+        // erases the declared facts every code-value gate reads (see codeValues_).
+        if (result != nullptr && compiler->ArgumentIsCodeValue(namedVar))
+            compiler->RegisterCodeValue(result);
         return result;
     }
 
@@ -17100,6 +17137,10 @@ public:
             bool srcIsSigned = namedVar.TypeAndValue.IsUnsignedInteger() == -1;
             namedVar.Primary = compiler->CreateCast(namedVar.Primary, type, srcIsSigned);
             namedVar.TypeAndValue = destTypeName;
+            // A ptr->ptr cast is a no-op under opaque pointers, so the result IS the ledgered
+            // code value; launder it or the explicit cast the rejection advises is itself refused.
+            if (compiler->ParameterStoresData(destTypeName))
+                compiler->RegisterCodeValueDataCast(namedVar.Primary);
             return namedVar;
         }
 

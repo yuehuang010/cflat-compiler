@@ -1395,6 +1395,95 @@ public:
     }
 
     /*
+     * Values PROVEN to be code - a function pointer or closure in its plain VALUE shape - keyed by
+     * value identity and recorded at the read where the declared facts are still in hand
+     * (LoadNamedVariable, beside the fat-interface ledger). A join carries none of those facts: the
+     * '?:' spelling is a PHI and the '??' spelling a load out of a slot, and under opaque pointers
+     * an arm is an indistinguishable `ptr`. Recording cannot reject, so a read this misses degrades
+     * to no diagnostic. Same lifetime and park/clear points as nullCoalesceJoins_.
+     */
+    std::vector<llvm::Value*> codeValues_;
+
+    /*
+     * Values an EXPLICIT cast to a data type produced. A ptr->ptr cast is a no-op under opaque
+     * pointers, so the cast result IS the ledgered arm value - without this, `(Rec*)w` and
+     * `(Rec*)(c ? w : w2)` would be refused by the very escape hatch the rejection advises.
+     *
+     * STATEMENT-SCOPED, unlike codeValues_, and that scope is load-bearing: a NAMED FUNCTION is a
+     * module-level llvm::Function constant, so every mention of `ro` in a function is the SAME
+     * Value. Held for the whole function, one `(void*)ro` would launder `ro` for every later gate
+     * in that function - measured, memory-unsafe. FlushOwnedTemps (the block-item boundary) retires
+     * it, which is strictly later than every gate that reads it and no later than the next
+     * statement. Residual, inherent to keying the launder on value identity ALONE: a laundering
+     * cast and a bare join of the SAME named function inside ONE statement still launder each
+     * other, e.g. `two((void*)ro, c ? ro : n)` compiles clean and exits 138. Occurrence keying
+     * (value + syntactic cast site) would distinguish them; tracked in
+     * internal/issue/p2/same-statement-cast-launders-join-code-evidence.md.
+     */
+    std::vector<llvm::Value*> codeValueDataCasts_;
+
+    void RegisterCodeValue(llvm::Value* value)
+    {
+        if (value == nullptr) return;
+        for (auto* entry : codeValues_) if (entry == value) return;
+        codeValues_.push_back(value);
+    }
+
+    void RegisterCodeValueDataCast(llvm::Value* value)
+    {
+        if (value == nullptr) return;
+        for (auto* entry : codeValueDataCasts_) if (entry == value) return;
+        codeValueDataCasts_.push_back(value);
+    }
+
+    bool IsLedgeredCodeValue(const llvm::Value* value) const
+    {
+        for (auto* entry : codeValues_) if (entry == value) return true;
+        return false;
+    }
+
+    bool IsCodeValueDataCast(const llvm::Value* value) const
+    {
+        for (auto* entry : codeValueDataCasts_) if (entry == value) return true;
+        return false;
+    }
+
+    static constexpr int kMaxJoinArmDepth = 8;
+
+    // One ARM of a join: code when it is a function symbol, a ledgered read, or itself a join
+    // carrying one. An explicitly data-cast arm is laundered and stops the walk.
+    bool JoinArmCarriesCodeValue(const llvm::Value* value, int depth = 0) const
+    {
+        if (value == nullptr || depth > kMaxJoinArmDepth) return false;
+        if (IsCodeValueDataCast(value)) return false;
+        if (llvm::isa<llvm::Function>(value)) return true;
+        if (IsLedgeredCodeValue(value)) return true;
+        return JoinCarriesCodeValue(value, depth);
+    }
+
+    /*
+     * Does a '?:' / '??' JOIN deliver a code value down at least one arm? The '?:' arms are the
+     * PHI's incoming values; the '??' arms are unrecoverable from the IR and come from
+     * nullCoalesceJoins_. ANY code arm answers yes - one arm is enough to write a code address
+     * into the destination - and a join of two data pointers answers no.
+     */
+    bool JoinCarriesCodeValue(const llvm::Value* value, int depth = 0) const
+    {
+        if (value == nullptr || depth > kMaxJoinArmDepth) return false;
+        if (IsCodeValueDataCast(value)) return false;
+        if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+        {
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+                if (JoinArmCarriesCodeValue(phi->getIncomingValue(i), depth + 1)) return true;
+            return false;
+        }
+        if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
+            for (const auto& arm : join->Arms)
+                if (JoinArmCarriesCodeValue(arm.Value, depth + 1)) return true;
+        return false;
+    }
+
+    /*
      * Deferred interface-return-dangle check (the "existential" attempt - see
      * interface-return-dangle-defeated-by-intermediate-local.md). The emission-time value
      * walk (FrameLocalDataOfFatValue in MainListener.h) deliberately stops at a load, so
@@ -3912,6 +4001,9 @@ private:
         ownedNewTemps_.clear();
         valueElementTypeNames_.clear();
         fatInterfaceValueTypeNames_.clear();
+        // A named function is one shared llvm::Function constant, so a cast's launder must not
+        // outlive its statement (see codeValueDataCasts_). codeValues_ deliberately survives.
+        codeValueDataCasts_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
         nonOwningStructJoins_.clear();
@@ -4111,6 +4203,8 @@ private:
         // answer a lookup here (see interfaceBoxRecords_).
         interfaceBoxRecords_.clear();
         nullCoalesceJoins_.clear();
+        codeValues_.clear();
+        codeValueDataCasts_.clear();
 
         // populate function arguments
         auto itr_nameArg = arguments.begin();
@@ -9611,6 +9705,8 @@ public:
         std::vector<std::pair<llvm::Value*, std::string>> fatInterfaceValueTypeNames;
         std::vector<InterfaceBoxRecord> interfaceBoxRecords;
         std::vector<NullCoalesceJoin> nullCoalesceJoins;
+        std::vector<llvm::Value*> codeValues;
+        std::vector<llvm::Value*> codeValueDataCasts;
         std::vector<llvm::Value*> movedOutPtrValues;
         std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues;
         std::vector<llvm::Value*> nonOwningStructJoins;
@@ -9632,6 +9728,8 @@ public:
         s.fatInterfaceValueTypeNames = std::move(fatInterfaceValueTypeNames_);
         s.interfaceBoxRecords = std::move(interfaceBoxRecords_);
         s.nullCoalesceJoins   = std::move(nullCoalesceJoins_);
+        s.codeValues          = std::move(codeValues_);
+        s.codeValueDataCasts  = std::move(codeValueDataCasts_);
         s.movedOutPtrValues   = std::move(movedOutPtrValues_);
         s.movedBorrowedPtrValues = std::move(movedBorrowedPtrValues_);
         s.nonOwningStructJoins = std::move(nonOwningStructJoins_);
@@ -9648,6 +9746,8 @@ public:
         fatInterfaceValueTypeNames_.clear();
         interfaceBoxRecords_.clear();
         nullCoalesceJoins_.clear();
+        codeValues_.clear();
+        codeValueDataCasts_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
         nonOwningStructJoins_.clear();
@@ -9676,6 +9776,8 @@ public:
         fatInterfaceValueTypeNames_ = state.fatInterfaceValueTypeNames;
         interfaceBoxRecords_    = state.interfaceBoxRecords;
         nullCoalesceJoins_      = state.nullCoalesceJoins;
+        codeValues_             = state.codeValues;
+        codeValueDataCasts_     = state.codeValueDataCasts;
         movedOutPtrValues_       = state.movedOutPtrValues;
         movedBorrowedPtrValues_  = state.movedBorrowedPtrValues;
         nonOwningStructJoins_    = state.nonOwningStructJoins;
@@ -18164,7 +18266,10 @@ public:
      */
     bool ArgumentIsCodeValue(const NamedVariable& arg) const
     {
-        return FunctionPointerShapeOf(arg.TypeAndValue, &arg) == 0 && ArgumentIsFunctionPointerish(arg);
+        if (FunctionPointerShapeOf(arg.TypeAndValue, &arg) != 0) return false;
+        // A join is the one shape carrying no declared facts at all - resolve it through the
+        // per-value ledger, which only ever recorded reads that were shape-0 code themselves.
+        return ArgumentIsFunctionPointerish(arg) || JoinCarriesCodeValue(arg.Primary);
     }
 
     // Does this PARAMETER store data rather than code? `string` counts: it is not a pointer but is

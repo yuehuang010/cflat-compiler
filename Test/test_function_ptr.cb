@@ -2549,6 +2549,140 @@ bool testCodeValueAggregateStoreAccepts()
     return result;
 }
 
+/*
+ * Accept set for the JOIN spellings. The code-value gates now resolve a '?:' PHI and a '??' join
+ * through a per-value code ledger, so the programs in the same neighbourhood that a join is the
+ * NORMAL way to write must keep compiling and keep their values: a join of two code values into a
+ * function slot, a join of two data pointers, a join whose code arm was explicitly cast, and a
+ * join of CALL RESULTS whose return type happens to be a data pointer.
+ *
+ * These pass on the pre-fix binary too, by construction - they discriminate against an over-broad
+ * guard, and each one was measured on the merge base before the resolution was written.
+ */
+struct JoinAcc    { int a = default; int b = default; };
+struct JoinAccBox { function<double(double)> f = default; };
+
+JoinAcc* joinAccMake(int v) { JoinAcc* r = new JoinAcc(); r->a = v; return r; }
+double joinAccRo(double x) { return x + 1000.0; }
+double joinAccR2(double x) { return x + 2000.0; }
+double joinAccApply(function<double(double)> f) { return f(1.0); }
+// An overload SET the join argument is scored against. The code-value rule is read by the
+// scorer's refute arm, so a set is the shape where it can change WHICH candidate is chosen.
+int joinAccPickOv(JoinAcc* p) { return p == nullptr ? 0 : p->a; }
+int joinAccPickOv(function<double(double)> f) { return (int)f(1.0); }
+int joinAccDataOv(JoinAcc* p) { return p == nullptr ? 0 : p->a; }
+int joinAccDataOv(double d) { return 99; }
+double joinAccPick(int c, function<double(double)> a, function<double(double)> b)
+{
+    function<double(double)> p = c > 0 ? a : b;
+    return p(1.0);
+}
+
+bool testCodeValueJoinAccepts()
+{
+    bool result = true;
+    int c = 1;
+
+    // A join of two CODE values into a FUNCTION-typed slot - the destination accepts code, so no
+    // gate may fire. Both join spellings, plus the call-argument and named-parameter positions.
+    function<double(double)> w = joinAccRo;
+    function<double(double)> w2 = joinAccR2;
+    function<double(double)> empty = default;
+    function<double(double)> ternIntoFn = c > 0 ? w : w2;
+    function<double(double)> coalIntoFn = empty ?? w;
+    result &= Test("cvj_tern_into_fn_slot",  (int)ternIntoFn(1.0),          1001);
+    result &= Test("cvj_coal_into_fn_slot",  (int)coalIntoFn(1.0),          1001);
+    result &= Test("cvj_tern_fn_argument",   (int)joinAccApply(c > 0 ? w : w2), 1001);
+    result &= Test("cvj_tern_fn_parameter",  (int)joinAccPick(0, w, w2),    2001);
+
+    // The arms read through the spellings the ledger records at: a struct FIELD and a fixed-array
+    // ELEMENT are both code values, and a join of them into a code slot is still legal.
+    JoinAccBox box = default; box.f = joinAccRo;
+    function<double(double)>[2] arr = default;
+    arr[0] = joinAccRo; arr[1] = joinAccR2;
+    function<double(double)> fromField = c > 0 ? box.f : w2;
+    function<double(double)> fromElem  = c > 0 ? arr[1] : arr[0];
+    result &= Test("cvj_tern_field_arm", (int)fromField(1.0), 1001);
+    result &= Test("cvj_tern_elem_arm",  (int)fromElem(1.0),  2001);
+
+    // The EXPLICIT cast is the escape hatch the rejection's message advises, and a ptr->ptr cast is
+    // a no-op under opaque pointers - so the cast result IS the ledgered arm value. Both placements
+    // must survive: the cast INSIDE an arm, and the cast OVER the whole join.
+    JoinAcc* castInArm = c > 0 ? (JoinAcc*)w : nullptr;
+    JoinAcc* castOverJoin = (JoinAcc*)(c > 0 ? w : w2);
+    void*    castVoidInArm = c > 0 ? (void*)w : nullptr;
+    // The PARENTHESIZED operand is the spelling that actually exercises the launder: `(T*)w`
+    // materializes its own unledgered load, while `(T*)(w)` casts the ledgered read itself.
+    JoinAcc* castParenInArm = c > 0 ? (JoinAcc*)(w) : nullptr;
+    result &= Test("cvj_cast_in_arm_nonnull",    castInArm      == nullptr ? 0 : 1, 1);
+    result &= Test("cvj_cast_over_join_nonnull", castOverJoin   == nullptr ? 0 : 1, 1);
+    result &= Test("cvj_cast_void_in_arm",       castVoidInArm  == nullptr ? 0 : 1, 1);
+    result &= Test("cvj_cast_paren_in_arm",      castParenInArm == nullptr ? 0 : 1, 1);
+
+    // A join of two DATA pointers into a data pointer - the control proving the resolution is not
+    // simply refusing pointer joins. Both join spellings, decl-init and argument.
+    JoinAcc x = default; x.a = 5;
+    JoinAcc y = default; y.a = 6;
+    JoinAcc* px = &x;
+    JoinAcc* py = &y;
+    JoinAcc* nothing = nullptr;
+    JoinAcc* ternData = c > 0 ? px : py;
+    JoinAcc* coalData = nothing ?? py;
+    result &= Test("cvj_tern_data_ptr", ternData->a, 5);
+    result &= Test("cvj_coal_data_ptr", coalData->a, 6);
+
+    // The CALL RESULT of a function pointer whose return type is a data pointer. The callee is a
+    // ledgered code value; its result is not, and joining results must stay legal.
+    function<JoinAcc*(int)> maker = joinAccMake;
+    JoinAcc* ternCall = c > 0 ? maker(7) : nothing;
+    JoinAcc* coalCall = nothing ?? maker(8);
+    result &= Test("cvj_tern_call_result", ternCall->a, 7);
+    result &= Test("cvj_coal_call_result", coalCall->a, 8);
+    delete ternCall;
+    delete coalCall;
+
+    // `function<T>*` is the ADDRESS of a slot, so it is genuinely data and a join of two of them
+    // into `void*` must keep converting - the shape check, not the ledger, is what allows this.
+    function<double(double)>* slot = &w;
+    function<double(double)>* noSlot = nullptr;
+    void* slotAddr = c > 0 ? slot : noSlot;
+    result &= Test("cvj_fnptr_slot_join_into_voidstar", slotAddr == nullptr ? 0 : 1, 1);
+
+    // A join argument scored against an overload SET. The code-value rule is read by the scorer's
+    // REFUTE arm, so a set is where it can move resolution - and it must only ever refute, never
+    // re-select. A set that CONTAINS a candidate accepting code still binds that candidate (the
+    // value discriminates: the funcptr overload returns 1001, the pointer one 0), and a set of
+    // data candidates still binds on a data join.
+    result &= Test("cvj_overload_set_binds_funcptr", joinAccPickOv(c > 0 ? w : w2), 1001);
+    result &= Test("cvj_overload_set_binds_data",    joinAccDataOv(c > 0 ? px : py), 5);
+
+    // '??=' is its own store path - it emits its own compare/branch/store and returns before the
+    // plain '=' gate. A code value into a FUNCTION slot, and data into data, must stay legal.
+    function<double(double)> coalSlot = default;
+    coalSlot ??= joinAccRo;
+    function<double(double)> coalFromLocal = default;
+    coalFromLocal ??= w2;
+    JoinAcc* coalPtr = nullptr;
+    coalPtr ??= px;
+    JoinAcc* coalCast = nullptr;
+    coalCast ??= (JoinAcc*)w;
+    result &= Test("cvj_nullassign_fn_slot",   (int)coalSlot(1.0),      1001);
+    result &= Test("cvj_nullassign_fn_local",  (int)coalFromLocal(1.0), 2001);
+    result &= Test("cvj_nullassign_data_ptr",  coalPtr->a,              5);
+    result &= Test("cvj_nullassign_cast",      coalCast == nullptr ? 0 : 1, 1);
+
+    // A '?:' arm harmonized into `string`: legal for a real string and for a raw char*, refused
+    // only when the pointer arm is PROVEN code. These are the accept twins of that rejection.
+    string sa = "aa";
+    char*  raw = "raw";
+    string ternStr = c > 0 ? sa : "0";
+    string ternRaw = c > 0 ? raw : sa;
+    result &= Test("cvj_tern_string_literal_arm", (int)ternStr.length(), 2);
+    result &= Test("cvj_tern_string_charptr_arm", (int)ternRaw.length(), 3);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -2662,6 +2796,9 @@ extern int main()
 
     // Accept set for the AGGREGATE / DEFAULT store spellings (brace, array, field/param default)
     total++; passed += testCodeValueAggregateStoreAccepts() ? 1 : 0;
+
+    // Accept set for the JOIN spellings ('?:' and '??', into code slots, casts, data joins)
+    total++; passed += testCodeValueJoinAccepts()          ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -79,9 +79,11 @@ below. The count will move again when the parallel branches land, so re-derive i
 `ls internal/issue/p1/` rather than trusting this sentence. The runtime-index residue of
 `unique-field-to-field-array-element-receiver` was then RE-RANKED P1 -> P3 2026-08-05 as a
 deliberate deferral (**4 -> 3**; see its P3 row for the rationale and the explicit invitation to
-override). The three P1s that remain were all FILED BY THIS CAMPAIGN'S OWN REVIEWS of the fixes -
-none of the six originally-open P1s is still open. Progress is tracked by row deletion here, as
-always.
+override). [[join-erases-code-value-evidence-at-every-gate]] is the SIXTH campaign landing
+(`fix/joinledger`, 2026-08-05) and is count-neutral again: its own neighbour audit filed the MIRROR
+defect, [[join-defeats-the-closure-widen-gate]], so **3 -> 3**. The P1s that remain were all FILED
+BY THIS CAMPAIGN'S OWN REVIEWS of the fixes - none of the six originally-open P1s is still open.
+Progress is tracked by row deletion here, as always.
 
 **Previous head: the P1 campaign.** macOS arm64 Release **576 / 0 / 8** plus `example_mac.sh`
 **35 / 0** and `test_lsp.sh` **152 / 0** (re-measured 2026-08-03; the 554 this line carried was
@@ -217,7 +219,7 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
 | **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 3 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 44 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 45 |
 | **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 31 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
@@ -362,23 +364,41 @@ from the BOXED OBJECT and why the verdict is deferred to end of body.
 `unique-field-to-field-array-element-receiver` moved P1 -> P3 as a deliberate deferral (file moved
 to `p3/`, name unchanged so links resolve; rationale in its P3 row and at the top of the file):
 **3 P1 / 44 P2 / 31 P3 / 7 UI = 85 total**. This is a bucketing change, not a fix - no compiler
-edit, no test change. Both integrity checks re-run against this tree, clean. The three remaining
-P1s are all campaign-review discoveries: [[pointer-copy-propagates-no-ownership-fact]],
-[[join-erases-code-value-evidence-at-every-gate]],
-[[temp-unique-field-escapes-through-unguarded-spellings]].
+edit, no test change. Both integrity checks re-run against this tree, clean. The three P1s open AT
+THAT MOMENT were all campaign-review discoveries: [[pointer-copy-propagates-no-ownership-fact]],
+`join-erases-code-value-evidence-at-every-gate` and
+[[temp-unique-field-escapes-through-unguarded-spellings]]. **Superseded by the next recount** -
+the second of those has since been fixed and its file deleted; read the paragraph below for the
+live list.
+
+**Recount 2026-08-05, after `fix/joinledger` landed:**
+[[join-erases-code-value-evidence-at-every-gate]] is FIXED and its file DELETED, and the fix's own
+neighbour audit filed [[join-defeats-the-closure-widen-gate]] in its place - P1 unchanged. Review
+round 2 additionally promoted the fix's same-statement launder residual from a landed-record
+footnote to its own P2 file, [[same-statement-cast-launders-join-code-evidence]]:
+**3 P1 / 45 P2 / 31 P3 / 7 UI = 86 total**. Both integrity checks re-run against
+this tree (every row resolves to a file, every file has a row, per bucket), clean.
+
+The new file is the MIRROR of the one it replaces, not a residue of it: the fixed issue is a join
+erasing the evidence that a value IS code, and the new one is a join erasing the evidence that a
+value is NOT code, on the closure-widen gate. They need opposite ledgers and opposite quantifiers
+("any arm is code" versus "every arm is data"), which is why it was filed rather than folded in -
+the second guard would have been written past an already-frozen accept set. The landed design
+record is at the bottom of this file.
 
 ### P1 - wrong programs and crashes (`p1/`)
 
 | Issue | Severity |
 |---|---|
 | [[pointer-copy-propagates-no-ownership-fact]] | Four silent double frees (exit 134), no diagnostic, all identical on `312d202` and on the merged `fix/untracked-copy`. A pointer DECLARATION copies the VALUE and nothing else, so every ownership fact a source binding carries needs its own hand-written clause at the decl-init site and any fact without one vanishes across the copy. Live members: a copy stored into a `unique` FIELD; a one-hop copy of a container-ELEMENT borrow (the direct spelling rejects); `T* d = move b;` off a copy (whose `delete b;` twin now rejects, so the two spellings disagree); and a `?:` join into a pointer declaration (whose DIRECT boxed spelling rejects). Fix direction: one clause per fact, recorded by storage identity and re-asked for liveness at the consumer, exactly like `BorrowsOwningLocal`. Each needs its own accept set first - (a) and (b) both have sole-owner shapes where a rejection would LEAK. Filed 2026-08-04 by the round-1 review of `fix/untracked-copy`. |
-| [[join-erases-code-value-evidence-at-every-gate]] | Exit 138, no diagnostic, on `6e9ab46`, on `a846e6e` and on `fix/codeval-store` (re-measured per spelling after the rebase). `Rec* r = c ? w : n;`, `Rec* r = n ?? w;` and - the telling one - `lam(c ? w : n)` into a `Rec*` PARAMETER, which the ARGUMENT gate `fix/funcptr-rebind` landed diagnoses in the bare spelling. A join produces a bare `llvm::Value` (a PHI, or a load out of a slot for `??`) carrying no TypeName, no recorded signature and no `llvm::Function` Primary, so every code-value predicate reads false before any gate runs. NOT the store defect: there the destination reader was missing; here the SOURCE evidence is erased. Fix by record-then-resolve, ledgering code-ness by value identity exactly as `fatInterfaceValueTypeNames_` does, and serving all three gates from it. Filed 2026-08-04 by `fix/codeval-store`. |
+| [[join-defeats-the-closure-widen-gate]] | Exit 139, no diagnostic, on `d93c359` AND on the merged `fix/joinledger`. `applyL(c ? vp : vq)` and `d.lam(c ? vp : vq)` widen a `void*` into a fat closure's CODE slot and call it; the BARE `applyL(vp)` is diagnosed on both binaries, so the join is what defeats the gate. Mirror of the code-value join defect: `WidenToClosureFatChecked` gates on PROVENANCE and a join proves nothing, so the correct polarity accepts and the widen happens. Needs the OPPOSITE ledger - values proven to be DATA - and the opposite quantifier, EVERY arm rather than ANY arm; getting that backwards false-rejects every mixed join. A join of two `function<>` values into the same parameter runs correctly on both binaries and is the first accept-set cell. Filed 2026-08-05 by the neighbour audit of `fix/joinledger`. |
 | [[temp-unique-field-escapes-through-unguarded-spellings]] | Silent use-after-free, compiles clean and exits 0. The residue spellings `fix/temp-uniq-borrow` did NOT reach, all measured identical on `6e9ab46` and on the merged fix: a same-type C-style cast, a `??` join, a `?:` join, an ARRAY AGGREGATE initializer (`Node*[2] a = { makeBox().t, nullptr };` - not the `EmitOneFieldInit` path), and a call ARGUMENT that stores. The argument case is PARTLY closable - a `unique T*` or `move T*` parameter states the claim at the call site (both measured still broken); a plain `T*` parameter is the undecidable remainder. Fix order and per-spelling accept sets are in the file. Filed 2026-08-04 by the round-1 review. |
 
 ### P2 - false rejections, unavailable features, ownership holes (`p2/`)
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[same-statement-cast-launders-join-code-evidence]] | memory-unsafe accept | Silent exit 138: `two((void*)ro, c ? ro : n)` - a data cast of a NAMED function anywhere in a statement launders every other mention of that function in the SAME statement, because the launder is keyed on `llvm::Value*` alone and a named function is one shared constant. Cross-statement and cross-function are closed (`fix/joinledger`); only the same-statement window remains. P2 under the residue-not-regression precedent ([[unique-field-to-field-interface-receiver-residues]]) - the spelling was accepted before the fix too; re-rank to P1 if the memory-unsafe-accept rubric wins. Fix direction: occurrence keying (value + syntactic cast site). Filed 2026-08-05 by review round 2 of `fix/joinledger`. |
 | [[lambda-body-owning-temp-never-destructed]] | ownership hole | LEAK, no diagnostic, identical on `6e9ab46` and the merged fix. `Lambda<Dt*()> f = () => makeDt().t;` prints `dtors=0` - the owning `Box` temp inside a lambda BODY is never registered/flushed, so its destructor never runs at all. The same body as a free function is rejected by the temp-escape gate. Not a missed guard: the lambda body does not run the statement-boundary owned-temp machinery, so the read carries no temp provenance for any guard to see. Fixing it will likely turn the leak into a use-after-free the gate then rejects - land both halves together. Filed 2026-08-04 by the round-1 review of `fix/temp-uniq-borrow`. |
 | [[chained-nullcoalesce-not-boxed-into-interface]] | false rejection | `take(z ?? y ?? a)` and `IShape j = z ?? y ?? a;` do not compile - the outer join's arm is the inner join's LOAD, which names no class. Spans EVERY position that boxes a `??` (decl-init, assignment, return, argument), so it predates the return/argument work. Fix at the ledger by splicing a nested join's arms. Filed 2026-07-31. |
 | [[pointer-arg-binds-by-value-class-param]] | miscompile | `byVal(a)` with a `Circle*` and a by-value `Circle` parameter scores a PERFECT match and lowers a raw pointer into a struct slot - module-verifier dump, NO source location, exit 1. `IsTypeMatch` compares TypeName and ignores `Pointer`; the sibling `IsTypePromotion` does gate on it. PRE-EXISTING and language-wide, no join involved. Scorer change - wide blast radius, wants the corpus sweep. Filed 2026-07-31. |
@@ -3459,3 +3479,172 @@ three reject legs still fire).
 > the post-fix binary alike - so the `--init` bitcode cache changes generated code. Pre-existing,
 > filed for its own investigation, and worth knowing before quoting a leak baseline from any of the
 > records above.
+
+## Landed: `fix/joinledger` (2026-08-05) - a `?:` / `??` JOIN no longer erases the code-value evidence
+
+Closes `p1/join-erases-code-value-evidence-at-every-gate` and DELETES the file. Every repro was
+re-measured per spelling on a verified `d93c359` PRE binary first (identity confirmed the way the
+lessons file requires: it ACCEPTS the repros and the programs exit 138 at runtime).
+
+MECHANISM - **record-then-resolve, keyed by VALUE IDENTITY**, the shape this repo already converged
+on twice. Two ledgers on `LLVMBackend`, parked and cleared exactly where `nullCoalesceJoins_` /
+`interfaceBoxRecords_` are (per-function clear, `SaveBuilderState` / `RestoreBuilderState` pair,
+`ResetForReanalysis` clear) - NOT with `ownedNewTemps_`, since the argument gate does not
+necessarily run before the end-of-expression flush:
+
+- `codeValues_` - a value PROVEN to be code, recorded in `LoadNamedVariable` three lines from the
+  fat-interface ledger it mirrors, gated on the gates' own `ArgumentIsCodeValue`. Recording cannot
+  reject, so a read this misses degrades to no diagnostic, never to a false rejection.
+- `codeValueDataCasts_` - a value an explicit cast to a data type produced. Load-bearing, not
+  defensive: a ptr->ptr cast is a NO-OP under opaque pointers, so the cast result IS the ledgered
+  read, and without the launder the escape hatch the rejection advises is itself refused. Proven by
+  mutation - see the accept set below. **STATEMENT-scoped, retired by `FlushOwnedTemps` at the
+  block-item boundary**, and that scope is itself memory-safety-critical: a NAMED FUNCTION is one
+  module-level `llvm::Function` constant, so every mention of `ro` in a body is the SAME Value.
+  Round 1 held this ledger for the whole function, and one `void* v = (void*)ro;` then laundered
+  `ro` for every later gate in that function - `Rec* r = c ? ro : n;` accepted and exited 138 with
+  the cast line present, rejected without it, and the same leak defeated the argument gate and the
+  string-arm gate. Found by review round 1. The retire point is strictly later than every gate that
+  reads the entry and no later than the next statement, so the accept cells `c ? (Rec*)ro : n` and
+  `c ? (Rec*)(ro) : n` are untouched. **Reordering `isa<Function>` ahead of the launder check is NOT
+  the fix** - the reviewer mutation-tested it and it false-rejects both of those. Residual, left
+  deliberately and **memory-unsafe (exit 138)**: a laundering cast and a bare join of the same
+  named function inside ONE statement still launder each other, and the reachable spelling is an
+  ordinary two-argument call - `two((void*)ro, argc > 0 ? ro : n)` compiles clean and exits 138,
+  while the same program with the cast hoisted to its own statement is diagnosed (round-2 probes
+  `scratch/rev2/r2/g20`/`g21`). "Inherent" only to keying the launder on VALUE identity alone;
+  occurrence keying (value + syntactic cast site) is an open direction. Filed as
+  [[same-statement-cast-launders-join-code-evidence]] rather than left as a footnote here.
+
+`ArgumentIsCodeValue` then answers through a join as well as from declared facts, and since every
+gate (the NINE store sites, the argument gate, the return gate) already reads that one predicate,
+all of them are served from one source of truth with no per-site work:
+
+    if (FunctionPointerShapeOf(arg.TypeAndValue, &arg) != 0) return false;
+    return ArgumentIsFunctionPointerish(arg) || JoinCarriesCodeValue(arg.Primary);
+
+`JoinCarriesCodeValue` walks a PHI's incoming values for `?:` and `nullCoalesceJoins_`'s recorded
+arms for `??` (whose arms are unrecoverable from the IR - it joins through a slot, so the joined
+value is a plain load). It recurses through nested joins with a depth cap, so a PHI cycle in a loop
+terminates. The widening is confined to `ArgumentIsCodeValue` and deliberately kept out of its
+helper `ArgumentIsFunctionPointerish`, which the scorer's funcptr ACCEPT arm also reads - widening
+THERE would have let a join start claiming function-pointer parameters.
+
+**Overload resolution did move, and an earlier draft of this record and of the commit message said
+it did not.** `ArgumentIsCodeValue` is read by the scorer's REFUTE arm, so a join argument now
+refutes every data-parameter candidate it is scored against. Measured across the review's overload
+probes, the movement is one-directional and bounded:
+
+- A set where EVERY candidate takes a data parameter (`g(Rec*)` / `g(void*)`) went from silently
+  SELECTING `g(void*)` and storing a code address there, to "no overload of 'g' matches" with a
+  per-candidate line for both. That is accept -> diagnosed, and it is the same verdict the single
+  candidate spelling already gave.
+- A set that CONTAINS a candidate accepting code (`f(Rec*)` / `f(function<double(double)>)`) still
+  binds the `function<>` one, identical on both binaries - the refute arm removes candidates, it
+  never re-ranks the survivors.
+
+No SILENT selection shift was found: every difference is a call that used to compile becoming a
+diagnostic. Both cells are pinned - `cvj_overload_set_binds_funcptr` and
+`cvj_overload_set_binds_data` on the accept side, and a reject leg pinning BOTH per-candidate
+lines, since a single-candidate leg cannot show the whole set was refuted.
+
+POLARITY - **any ONE code arm answers yes.** One arm is enough to write a code address into the
+destination, and the join of two data pointers answers no because neither arm was ever ledgered. A
+call RESULT is not code even when the callee is: the ledger records the callee read, and the
+`CallInst` is a different value.
+
+TWO SITES outside the predicate.
+
+**`??=` is its own store path**, and on the merge base `r ??= w;` compiled clean and exited 138
+while the bare `r = w;` was already diagnosed - the two spellings of one store disagreed. Found by
+review round 1, and pre-existing rather than caused here. It emits its own compare/branch/store and
+returns before the plain-`=` gate, and it parses its RHS through the lean VALUE path, which
+discards the NamedVariable that gate reads - so it asks the ledger about the STORED VALUE directly
+(`JoinArmCarriesCodeValue`), which answers for a `function<>` read, a bare function name and a join
+alike, and leaves an explicitly cast RHS laundered like every other site. Its own mini accept set is
+in `testCodeValueJoinAccepts` (`??=` into a function slot from a name and from a local, between data
+pointers, and of a cast code value) and the 20 pre-existing `??=` uses in `Test/test_basic.cb` are
+unchanged. `p2/coalesce-assign-skips-store-bookkeeping.md` documents seven OTHER bookkeeping calls
+this path skips and stays at P2 - the memory-unsafe member is closed here, the rest are not.
+
+The second, because it CONSUMES the evidence rather than erasing it: a `?:`
+whose other arm is a `string` harmonizes the pointer arm through `WrapStringLiteralAsString`, so
+the machine code is read as a NUL-terminated buffer and the join delivers a `string` VALUE with no
+pointer left for any gate to question. On the merge base that is a SILENT MISCOMPILE (exit 0, empty
+string), not a crash. `RejectCodeValueTernaryStringArm` refuses it in `UnifyTernaryArmTypes`, where
+the arm value is still ledgered, with the arm wording rather than the store wording - the rejection
+has to be true where it fires. Proof-only: an unledgered pointer arm (a literal, a `char*`) keeps
+wrapping, and both spellings are accept legs.
+
+MATRIX - 51 cells, every one measured on the PRE binary before any guard was written.
+**29 cells changed**, all from memory-unsafe-or-silent to diagnosed: exit 138 for the pointer
+destinations, 139 for the nested and false-leg spellings, and exit-0 silent miscompiles for the
+`string`, `char*` and `void*` ones. Axes covered: both join kinds x {declarator, assignment,
+argument, return, brace field, fixed-array element, array-view element, field default, parameter
+default, global store}; arm PROVENANCE {local, parameter, struct field, array element, global,
+alias-typed, bare function name, `Lambda<>` closure}; arm POSITION (true leg and false leg, and the
+`??` left-hand side); and nesting {nested join, join-of-join, join under cast}.
+
+ACCEPT SET - frozen as value legs BEFORE the guard, per the ordering the lessons file requires.
+**22 cells, all identical pre and post**, now in `Test/test_function_ptr.cb::testCodeValueJoinAccepts`:
+a join of two code values into a `function<>` slot (decl-init, argument and parameter positions,
+both join kinds); arms read from a struct field and a fixed-array element into a code slot; a
+`Lambda<>` join; `(T*)` / `(void*)` casts inside an arm and over the whole join; a join of two data
+pointers; a join of funcptr CALL RESULTS whose return type is a data pointer; a `function<T>*` join
+into `void*`; and the two legal `?:` string-arm harmonizations (a literal and a `char*`).
+
+Two accept findings worth keeping, both from mutation rather than reasoning:
+
+- **`(T*)w` and `(T*)(w)` are different programs.** The bare spelling materializes its OWN
+  unledgered load inside `ParseCastExpression`, so it never needed the launder; the PARENTHESIZED
+  operand casts the ledgered read itself, and with the launder removed it false-rejects a program
+  master compiles and runs. `cvj_cast_paren_in_arm` is the leg that pins this - the bare spelling
+  alone would have certified a dead check.
+- **A cast OVER a join is protected by the shape check, not the launder**: the cast's own
+  `TypeAndValue` is `T*`, so `FunctionPointerShapeOf` answers 1 and the predicate returns early.
+- The `(T[])` array-view cast branch got NO launder: a `function<>` VALUE has `Pointer == false` and
+  that branch already errors on a non-pointer source, so a launder there would be dead code.
+
+RATIFIED, the join spelling of a rule both other spellings already carry: `void* v = c ? w : n;` is
+an error. `fix/funcptr-close` ratified it for a `void*` PARAMETER and `fix/codeval-store` for a
+`void*` STORE; the join spelling was the last one that disagreed. It is the one changed cell that
+does NOT crash on the merge base (exit 0, the address is simply stored), so it is called out
+separately rather than folded into the memory-unsafe count.
+
+EVIDENCE / BAR: `./test.sh Release` 598 passed / 0 failed / 8 skipped; `bash example_mac.sh Release`
+35 passed / 0 failed. Differential `--check` sweep of both binaries over all 534 `.cb` files in
+`Test/`, `example/` and `cflat/core/`: ONE difference, `err_data_pointer_to_closure_param.cb` going
+rc=1 -> rc=0, which is this change's own new legs starting to pass.
+
+Two harness lessons paid for on the way to that number, both worth the next reader's attention:
+
+- **The first sweep was VACUOUS and reported a clean zero.** It recorded
+  `echo "$(basename $f) rc=$?"`, and the command substitution runs before `$?` is read - so every
+  line recorded `basename`'s exit code, not the compiler's. It is the same mistake as piping the
+  compiler into `head` and reading `$?`, in a new costume, and it printed exactly the answer the
+  change wanted. Capture rc into a variable BEFORE any command substitution.
+- **A warm `--init` cache produced 7 phantom diffs** - `memory.cb`, `os.cb`, `os.posix.cb`,
+  `thread.cb`, `cruntime.cb`, `page_pool.cb`, `bucket_allocator.cb` all "newly" failing with
+  `redeclaration of global '...' in the same scope`. The POST binary had a local cache from an
+  earlier `--init-local` and the PRE binary did not; clearing it made all 7 pass. Both sides must
+  be in the SAME cache state, and cold is the state to compare in.
+
+Sixteen reject legs in
+`Test/errors/err_data_pointer_to_closure_param.cb`, each mutation-tested INDIVIDUALLY - extracted to
+its own file and run on PRE, where all sixteen report `FAIL: expected error ... did not occur`, i.e.
+PRE compiled each one silently - and each verified to PASS in isolation on POST, so no leg is being
+satisfied by an earlier leg's error.
+
+RESIDUE. The neighbour audit found the MIRROR defect and filed it at P1 as
+[[join-defeats-the-closure-widen-gate]]: a join of two `void*` values into a `Lambda<>` PARAMETER is
+widened into the closure's code slot and called (exit 139 on `d93c359` and here), while the bare
+`applyL(vp)` is diagnosed on both binaries. It is not closable from this ledger - `codeValues_`
+records values proven to be CODE and answers "any arm", and that gate needs values proven to be
+DATA answering "every arm". Writing that second guard here would have meant adding a rejection past
+an accept set frozen for the opposite question.
+
+Also measured and deliberately left: a `Lambda<>` (fat closure) arm joined against a thin
+pointer is rejected by the PRE-EXISTING arm harmonizer ("ternary branches have incompatible types
+'__closure_fat_ptr' and 'pointer'"), identically on both binaries. That is a different message from
+this gate's and arguably a worse one, but it is a rejection, not a memory-unsafe accept, so it is
+recorded here rather than re-worded.
