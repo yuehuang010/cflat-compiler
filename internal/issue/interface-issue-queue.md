@@ -447,6 +447,22 @@ not a join residue). Counted from disk per bucket:
 **0 P1 / 49 P2 / 32 P3 / 7 UI = 88 total. The P1 bucket is EMPTY.** Both integrity checks re-run
 against this tree (every row resolves to a file, every file has a row, per bucket), clean.
 
+**Recount 2026-08-05, after the cache-codegen investigation:** the standing claim that the `--init`
+bitcode cache CHANGES CODEGEN - measured repeatedly by review agents as `leaks --atExit` drifting
+by 2 leaks / 48 bytes on `Test/test_move.cb` between a cold and a warm cache - was investigated and
+**REFUTED**. The bitcode cache is semantically pure: with the cache state as the only variable, a
+10-test leak sweep is identical, and the only IR differences are LLVM value-name uniquing
+(`%.unpack4` vs `%.unpack8`) plus global emission order. The real variable is the harvested `macsdk`
+libSystem stub that `--init` writes into the same directory, which flips the `LC_BUILD_VERSION` sdk
+stamp of every emitted binary; patching only those 4 bytes in an otherwise byte-identical
+executable reproduces the entire leak delta. Filed as ONE new P2,
+[[macos-sdk-stamp-differs-by-cache-state]] (bucket note in the file invites a re-rank to P3). No
+compiler change, no fix, no test change - investigation only. Counted from disk per bucket:
+**0 P1 / 50 P2 / 32 P3 / 7 UI = 89 total.** Both integrity checks re-run against this tree (every
+row resolves to a file, every file has a row, per bucket), clean. **Carry this forward:** leak
+counts are NOT comparable across cache states, so any future ownership measurement must fix the
+cache state across the binaries it compares, or it will re-derive this same false alarm.
+
 ### P1 - wrong programs and crashes (`p1/`)
 
 | Issue | Severity |
@@ -459,6 +475,7 @@ row here and a file in `p1/`, as always.
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[macos-sdk-stamp-differs-by-cache-state]] | silent wrong build metadata | Every macOS executable carries a different `LC_BUILD_VERSION` **sdk** depending on cache state: `11.0` when `--init` has harvested the `macsdk` stub, the live SDK version (26.5) when it has not - because `sdkVer` in `EmitExecutableMachO` (`LLVMBackend.h:8729-8743`) is only read from `xcrun` on the stub-ABSENT branch. macOS gates real behaviour on that field: flipping ONLY those 4 bytes in an otherwise byte-identical binary moves `leaks --atExit` on `test_move` from 14/272 to 16/320, and `test_stream` allocates 2048 fewer libSystem bytes under the 11.0 stamp. **The cached side is the wrong one** - the stub is harvested from the running 26.5 dyld shared cache, so `sdk 11.0` is a false claim, and it is the stamp every `test.sh` / `example_mac.sh` / post-`--init` binary gets. **This is the refutation of the standing "the `--init` bitcode cache changes codegen" claim**: the bitcode cache alone is measured IDENTICAL across 10 tests and the IR differs only in LLVM value-name uniquing. Fix: hoist the SDK-version query out of the fallback branch (or record it at harvest time); leave `minos 11.0.0` alone. Filed 2026-08-05 by the cache-codegen investigation. |
 | [[same-statement-cast-launders-join-code-evidence]] | memory-unsafe accept | Silent exit 138: `two((void*)ro, c ? ro : n)` - a data cast of a NAMED function anywhere in a statement launders every other mention of that function in the SAME statement, because the launder is keyed on `llvm::Value*` alone and a named function is one shared constant. Cross-statement and cross-function are closed (`fix/joinledger`); only the same-statement window remains. P2 under the residue-not-regression precedent ([[unique-field-to-field-interface-receiver-residues]]) - the spelling was accepted before the fix too; re-rank to P1 if the memory-unsafe-accept rubric wins. Fix direction: occurrence keying (value + syntactic cast site). Filed 2026-08-05 by review round 2 of `fix/joinledger`. |
 | [[owning-temp-in-coalesce-fallback-arm-never-destructed]] | ownership hole | LEAK, no diagnostic, identical on `14097e1` and on the merged `fix/tempuniq`. `p ?? makeBox().t` measures `dtors=0` and reads the LIVE value: the `??` right operand is evaluated in `nullcoal_null`, which neither dominates the join nor gets the per-arm `FlushOwnedTempsSince` the `?:` arms get, so the owning temp is never destructed. The `?:` twins measure `dtors=1` and dangle, which is what makes this specific to `??`'s fallback arm rather than to joins generally. **Coupled**: `fix/tempuniq`'s join walk EXCLUDES this arm (rejecting it would refuse a correct program), so fixing the leak turns the shape into a use-after-free and must delete the arm-0-only restriction in `JoinCarriesOwningTempUniqueField` in the same change - both halves together. Same root as [[lambda-body-owning-temp-never-destructed]] and the `??=` half of [[coalesce-assign-skips-store-bookkeeping]]. Filed 2026-08-05 by `fix/tempuniq`. |
 | [[temp-unique-field-escapes-through-a-plain-pointer-parameter]] | memory-unsafe accept | Silent use-after-free, compiles clean and exits 0, identical on `14097e1` and on the merged `fix/tempuniq`. `keep(makeBox().t)` where `void keep(Node* n) { g = n; }` reads a freed block (proven by dtor count + reallocation aliasing; the `MallocScribble` fill shows only on ld64.lld-linked builds`. The DECLARED remainder of `temp-unique-field-escapes-through-unguarded-spellings` (closed and
