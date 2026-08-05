@@ -1433,6 +1433,66 @@ public:
      */
     std::vector<llvm::Value*> codeValueDataCasts_;
 
+    /*
+     * Values read out of a `unique` field of an owning TEMPORARY this statement destructs
+     * (`makeBox().t`), keyed by value identity and recorded at the read, where the temp
+     * provenance (FromOwningTempField + OwningTempParent) is still on the NamedVariable. A CAST
+     * rewrites TypeAndValue and a JOIN produces a PHI or a load out of a slot, so both spellings
+     * lose every declared fact the persist-site guard reads. Recording cannot reject, so a read
+     * this misses degrades to no diagnostic, never to a false rejection.
+     *
+     * STATEMENT-SCOPED, retired by FlushOwnedTemps at the block-item boundary - the same boundary
+     * that runs the temp's destructor, so an entry never outlives the dangle it describes.
+     */
+    std::vector<llvm::Value*> owningTempUniqueFields_;
+
+    void RegisterOwningTempUniqueField(llvm::Value* value)
+    {
+        if (value == nullptr) return;
+        for (auto* entry : owningTempUniqueFields_) if (entry == value) return;
+        owningTempUniqueFields_.push_back(value);
+    }
+
+    bool IsLedgeredOwningTempUniqueField(const llvm::Value* value) const
+    {
+        for (auto* entry : owningTempUniqueFields_) if (entry == value) return true;
+        return false;
+    }
+
+    /*
+     * Does this value, or any ARM of a '?:' / '??' join reaching it, carry a temp's `unique`
+     * field? ANY arm answers yes - one dangling arm is enough to leave the destination pointing
+     * at freed memory - and a join of two ordinary reads answers no because neither arm was ever
+     * ledgered. Mirrors JoinCarriesCodeValue, including the depth cap that terminates a PHI cycle.
+     *
+     * THE '??' FALLBACK ARM IS EXCLUDED, and that is a measured accept, not caution. A '?:' arm
+     * gets an explicit FlushOwnedTempsSince inside the arm block, so its temp really is destructed
+     * and the read really does dangle (measured `dtors=1` for both the true and the taken false
+     * arm). The '??' right-hand operand is evaluated in `nullcoal_null`, which neither dominates
+     * the join nor gets that per-arm flush, so its temp is NEVER destructed: `p ?? makeBox().t`
+     * measures `dtors=0` and reads the LIVE value. Rejecting it would refuse a program master
+     * runs correctly. The underlying LEAK is filed as
+     * internal/issue/p2/owning-temp-in-coalesce-fallback-arm-never-destructed.md; when it is
+     * fixed the shape becomes a real dangle and this exclusion must be removed with it.
+     * Arm 0 is the left operand at the one RegisterNullCoalesceJoin call site (MainListener.h,
+     * `{ { lhs, ... }, { rhs, ... } }`).
+     */
+    bool JoinCarriesOwningTempUniqueField(const llvm::Value* value, int depth = 0) const
+    {
+        if (value == nullptr || depth > kMaxJoinArmDepth) return false;
+        if (IsLedgeredOwningTempUniqueField(value)) return true;
+        if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+        {
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+                if (JoinCarriesOwningTempUniqueField(phi->getIncomingValue(i), depth + 1)) return true;
+            return false;
+        }
+        if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
+            if (!join->Arms.empty())
+                return JoinCarriesOwningTempUniqueField(join->Arms[0].Value, depth + 1);
+        return false;
+    }
+
     void RegisterCodeValue(llvm::Value* value)
     {
         if (value == nullptr) return;
@@ -4015,6 +4075,8 @@ private:
         // A named function is one shared llvm::Function constant, so a cast's launder must not
         // outlive its statement (see codeValueDataCasts_). codeValues_ deliberately survives.
         codeValueDataCasts_.clear();
+        // Same boundary destructs the owning temp, so its unique-field reads retire with it.
+        owningTempUniqueFields_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
         nonOwningStructJoins_.clear();
@@ -4216,6 +4278,7 @@ private:
         nullCoalesceJoins_.clear();
         codeValues_.clear();
         codeValueDataCasts_.clear();
+        owningTempUniqueFields_.clear();
 
         // populate function arguments
         auto itr_nameArg = arguments.begin();
@@ -9718,6 +9781,7 @@ public:
         std::vector<NullCoalesceJoin> nullCoalesceJoins;
         std::vector<llvm::Value*> codeValues;
         std::vector<llvm::Value*> codeValueDataCasts;
+        std::vector<llvm::Value*> owningTempUniqueFields;
         std::vector<llvm::Value*> movedOutPtrValues;
         std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues;
         std::vector<llvm::Value*> nonOwningStructJoins;
@@ -9741,6 +9805,7 @@ public:
         s.nullCoalesceJoins   = std::move(nullCoalesceJoins_);
         s.codeValues          = std::move(codeValues_);
         s.codeValueDataCasts  = std::move(codeValueDataCasts_);
+        s.owningTempUniqueFields = std::move(owningTempUniqueFields_);
         s.movedOutPtrValues   = std::move(movedOutPtrValues_);
         s.movedBorrowedPtrValues = std::move(movedBorrowedPtrValues_);
         s.nonOwningStructJoins = std::move(nonOwningStructJoins_);
@@ -9759,6 +9824,7 @@ public:
         nullCoalesceJoins_.clear();
         codeValues_.clear();
         codeValueDataCasts_.clear();
+        owningTempUniqueFields_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
         nonOwningStructJoins_.clear();
@@ -9789,6 +9855,7 @@ public:
         nullCoalesceJoins_      = state.nullCoalesceJoins;
         codeValues_             = state.codeValues;
         codeValueDataCasts_     = state.codeValueDataCasts;
+        owningTempUniqueFields_ = state.owningTempUniqueFields;
         movedOutPtrValues_       = state.movedOutPtrValues;
         movedBorrowedPtrValues_  = state.movedBorrowedPtrValues;
         nonOwningStructJoins_    = state.nonOwningStructJoins;
@@ -13370,11 +13437,37 @@ public:
             functionName, param.VariableName, param.TypeName, paramIsSink, arg);
     }
 
+    /*
+     * A `unique T*` / `move T*` PARAMETER states the ownership claim AT the call site, so passing
+     * a temp's `unique` field there is decidable here: the temp's destructor frees the pointee at
+     * the end of this statement and the callee would own - and later free - the same block.
+     *
+     * A PLAIN `T*` parameter is the undecidable remainder and is deliberately left alone: the
+     * store happens in the CALLEE, and a read-only `int rd(Node* n) { return n->v; }` must keep
+     * accepting `rd(makeBox().t)`. Tracked in
+     * internal/issue/p2/temp-unique-field-escapes-through-a-plain-pointer-parameter.md.
+     */
+    void RejectOwningTempUniqueFieldIntoSinkParam(const std::string& functionName,
+        const TypeAndValue& param, const NamedVariable& arg)
+    {
+        bool paramClaimsOwnership = param.Pointer && !param.IsAlias
+            && (param.IsMove || param.IsUnique || param.IsUniqueTypeArg);
+        if (!paramClaimsOwnership) return;
+        if (!JoinCarriesOwningTempUniqueField(arg.Primary)) return;
+        LogError(std::format(
+            "call to '{}': cannot pass a unique field of a temporary to parameter '{}', which "
+            "takes ownership - the temporary's synthesized destructor frees the pointee at the "
+            "end of this statement, so the callee would own freed memory. Bind the whole call "
+            "result to a local first and 'move' the field out of that local.",
+            functionName, param.VariableName));
+    }
+
     void ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args)
     {
         for (size_t i = 0; i < params.size() && i < args.size(); i++)
         {
+            RejectOwningTempUniqueFieldIntoSinkParam(functionName, params[i], args[i]);
             // A plain by-value parameter the callee body unconditionally moves is a synthesized
             // move sink too - but only when the concrete type owns a resource AND the matched arg
             // is itself an OWNER (not a borrow/alias). A borrow arg has nothing to transfer, so

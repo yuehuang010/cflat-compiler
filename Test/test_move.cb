@@ -4206,6 +4206,12 @@ PodPair makePodPair()
     return p;
 }
 
+// Helpers for the accept set below. `readResourceId` is the read-only plain-`T*` parameter the
+// call-site reject deliberately leaves alone; the two sinks state the ownership claim it reads.
+int readResourceId(Resource* r) { return r->id; }
+void sinkResourceUnique(unique Resource* r) { }
+void sinkResourceMove(move Resource* r) { delete r; }
+
 int testTempUniqueFieldBorrowAccepts()
 {
     int passed = 0;
@@ -4256,6 +4262,100 @@ int testTempUniqueFieldBorrowAccepts()
     int seen = makeMoveBox().t->id;
     passed += Test("temp_uniq_field_read_resource_value", seen, 44);
     passed += Test("temp_uniq_field_read_freed_once", dtorCount, 1);
+
+    // ------------------------------------------------------------------------------------
+    // THE ACCEPT SET for the cast / join / array-aggregate / sink-parameter rejects. Each
+    // cell below is a program the pre-fix binary compiles and runs correctly, frozen here
+    // BEFORE those guards were written; all are byte-identical on both binaries.
+
+    // A cast off an ORDINARY pointer carries no temp provenance and is never ledgered - the
+    // ledger is keyed on the READ, so only a read off an owning temp can enter it.
+    {
+        PodItem* n = new PodItem();
+        n->id = 71;
+        PodPair castHolder = default;
+        castHolder.borrow = (PodItem*)n;
+        PodItem*[2] castArr = { (PodItem*)n, nullptr };
+        passed += Test("temp_uniq_accept_cast_plain_field", castHolder.borrow->id, 71);
+        passed += Test("temp_uniq_accept_cast_array_elem", castArr[0]->id, 71);
+        delete n;
+    }
+
+    // A cast and a join off a BORROWED element's unique field. OwningTempParent is clear (the
+    // LIST owns the pointee, nothing is freed at end of statement), so the read is never
+    // ledgered and both spellings stay legal. This is the polarity leg for the new sites: a
+    // ledger keyed on FromOwningTempField alone would false-reject every cell here.
+    {
+        list<MoveBox<unique PodItem*>> l;
+        MoveBox<unique PodItem*> b = default;
+        b.t = new PodItem();
+        b.t->id = 72;
+        l.add(move b);
+        PodItem* castElem = (PodItem*)l.get(0).t;
+        PodItem* joinElem = l.get(0).t ?? nullptr;
+        passed += Test("temp_uniq_accept_cast_borrowed_elem", castElem->id, 72);
+        passed += Test("temp_uniq_accept_join_borrowed_elem", joinElem->id, 72);
+    }
+
+    // Joins of two ORDINARY reads, and a cast over such a join. Neither arm was ever ledgered,
+    // so the arm walk answers no - the walk must not treat "is a join" as evidence by itself.
+    {
+        PodItem* p1 = new PodItem(); p1->id = 73;
+        PodItem* p2 = new PodItem(); p2->id = 74;
+        int c = 1;
+        PodItem* jt = c > 0 ? p1 : p2;
+        PodItem* jc = p1 ?? p2;
+        PodItem* jx = (PodItem*)(c > 0 ? p1 : p2);
+        PodItem*[2] joinArr = { jt, p2 };
+        passed += Test("temp_uniq_accept_ternary_plain", jt->id, 73);
+        passed += Test("temp_uniq_accept_coalesce_plain", jc->id, 73);
+        passed += Test("temp_uniq_accept_cast_of_plain_join", jx->id, 73);
+        passed += Test("temp_uniq_accept_join_into_array", joinArr[1]->id, 74);
+        delete p1;
+        delete p2;
+    }
+
+    // The DECLARED REMAINDER, and the reason the call-site reject is restricted to `unique` /
+    // `move` parameters: a plain `T*` parameter that only READS must keep working. The value is
+    // consumed inside the statement, before the temp's destructor runs at its end - so this is
+    // correct code, not a tolerated hole, and the dtor count proves the free still happens once.
+    dtorCount = 0;
+    passed += Test("temp_uniq_accept_plain_param_read", readResourceId(makeMoveBox().t), 44);
+    passed += Test("temp_uniq_accept_plain_param_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("temp_uniq_accept_plain_param_cast_read",
+                   readResourceId((Resource*)makeMoveBox().t), 44);
+    passed += Test("temp_uniq_accept_plain_param_cast_freed_once", dtorCount, 1);
+
+    // The '??' FALLBACK arm is the ONE join position that does not dangle, and it is excluded
+    // from the arm walk for that measured reason rather than out of caution. Its operand is
+    // evaluated in `nullcoal_null`, which neither dominates the join nor gets the per-arm
+    // FlushOwnedTempsSince the '?:' arms get, so the temp is never destructed at all - the '?:'
+    // twins measure dtors=1 and ARE rejected. `dtors == 0` below pins that LEAK on purpose: see
+    // internal/issue/p2/owning-temp-in-coalesce-fallback-arm-never-destructed.md, whose fix has to
+    // flip BOTH halves - this leg and the arm-0-only restriction in the walk - in one change.
+    dtorCount = 0;
+    {
+        Resource* nul = nullptr;
+        Resource* fallback = nul ?? makeMoveBox().t;
+        passed += Test("temp_uniq_accept_coalesce_fallback_arm_live", fallback->id, 44);
+        passed += Test("temp_uniq_accept_coalesce_fallback_arm_not_freed", dtorCount, 0);
+    }
+
+    // A `unique` / `move` SINK parameter fed a genuinely OWNED argument - a fresh allocation and
+    // a moved-from local. The new call-site reject asks the ledger, not the parameter kind alone,
+    // so these two must be untouched; the dtor counts prove the callee frees exactly once and
+    // the caller does not double-free.
+    dtorCount = 0;
+    sinkResourceUnique(new Resource());
+    passed += Test("temp_uniq_accept_sink_unique_new_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    {
+        Resource* owned = new Resource();
+        owned->id = 75;
+        sinkResourceMove(move owned);
+    }
+    passed += Test("temp_uniq_accept_sink_move_local_freed_once", dtorCount, 1);
 
     return passed;
 }
@@ -4896,7 +4996,7 @@ extern int main()
     total += 29;
 
     passed += testTempUniqueFieldBorrowAccepts();
-    total += 8;
+    total += 24;
 
     passed += testUniqueArrayElementFieldStore();
     total += 24;

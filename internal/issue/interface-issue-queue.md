@@ -81,9 +81,12 @@ below. The count will move again when the parallel branches land, so re-derive i
 deliberate deferral (**4 -> 3**; see its P3 row for the rationale and the explicit invitation to
 override). [[join-erases-code-value-evidence-at-every-gate]] is the SIXTH campaign landing
 (`fix/joinledger`, 2026-08-05) and is count-neutral again: its own neighbour audit filed the MIRROR
-defect, [[join-defeats-the-closure-widen-gate]], so **3 -> 3**. The P1s that remain were all FILED
-BY THIS CAMPAIGN'S OWN REVIEWS of the fixes - none of the six originally-open P1s is still open.
-Progress is tracked by row deletion here, as always.
+defect, [[join-defeats-the-closure-widen-gate]], so **3 -> 3**.
+`pointer-copy-propagates-no-ownership-fact` is the SEVENTH (`fix/ptrcopy`, 2026-08-05, filed its
+residues at P2/P3): **3 -> 2**. `temp-unique-field-escapes-through-unguarded-spellings` is the
+EIGHTH (`fix/tempuniq`, 2026-08-05, plain-`T*` remainder filed at P2): **2 -> 1**. The P1s that
+remain were all FILED BY THIS CAMPAIGN'S OWN REVIEWS of the fixes - none of the six
+originally-open P1s is still open. Progress is tracked by row deletion here, as always.
 
 **Previous head: the P1 campaign.** macOS arm64 Release **576 / 0 / 8** plus `example_mac.sh`
 **35 / 0** and `test_lsp.sh` **152 / 0** (re-measured 2026-08-03; the 554 this line carried was
@@ -218,8 +221,8 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 2 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 47 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 1 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 49 |
 | **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 32 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
@@ -367,7 +370,7 @@ to `p3/`, name unchanged so links resolve; rationale in its P3 row and at the to
 edit, no test change. Both integrity checks re-run against this tree, clean. The three P1s open AT
 THAT MOMENT were all campaign-review discoveries: [[pointer-copy-propagates-no-ownership-fact]],
 `join-erases-code-value-evidence-at-every-gate` and
-[[temp-unique-field-escapes-through-unguarded-spellings]]. **Superseded by the next recount** -
+`temp-unique-field-escapes-through-unguarded-spellings`. **Superseded by the next recount** -
 the second of those has since been fixed and its file deleted; read the paragraph below for the
 live list.
 
@@ -403,22 +406,47 @@ store is an IMPLIED MOVE. The accept leg caught it before the guard shipped; the
 half of the same mis-blame is what got filed. That is the "build the accept set FIRST" rule paying
 for itself inside a single round, and it is why the join proof is a separate field.
 
-The two remaining P1s are both campaign-review discoveries:
-[[join-defeats-the-closure-widen-gate]] and
-[[temp-unique-field-escapes-through-unguarded-spellings]].
+**Recount 2026-08-05, after `fix/tempuniq` landed:**
+`temp-unique-field-escapes-through-unguarded-spellings` is FIXED and its file DELETED - the
+SEVENTH campaign fix, and it takes the P1 count to ONE. It files TWO new items, neither at P1:
+its own declared remainder ([[temp-unique-field-escapes-through-a-plain-pointer-parameter]]) and
+the LEAK its accept set uncovered ([[owning-temp-in-coalesce-fallback-arm-never-destructed]]).
+Counted from disk per bucket:
+**1 P1 / 49 P2 / 32 P3 / 7 UI = 89 total.** Both integrity checks were re-run against this tree
+(every row resolves to a file, every file has a row, per bucket) and are clean.
+
+The second filing is the one worth reading. The fix's own arm-position probe measured that a
+`?:` arm really does dangle (`dtors=1`, both the true arm and a taken false arm) while the `??`
+FALLBACK arm is never destructed at all (`dtors=0`, the read returns the LIVE value) - so an
+"any arm" walk would have false-rejected `p ?? makeBox().t`, a program master runs correctly.
+The arm walk excludes that one position and the leak behind it is filed with an explicit
+instruction that fixing it must delete the exclusion in the same change.
+
+The split is not a scope cut dressed up as a filing. The parent issue enumerated FIVE spellings
+and named the plain-`T*` parameter as the undecidable one in its own text; four of the five are
+closed, and the remainder is filed with the accept cell that blocks the obvious wrong fix
+(`rd(makeBox().t)`, a read-only plain parameter, is CORRECT code) already frozen as a value leg.
+Separately, `fix/tempuniq` reduced [[coalesce-assign-skips-store-bookkeeping]] from a file of
+predictions to one with a MEASURED memory-unsafe repro - it did not file a new issue for the
+`??=` spelling, because the root is that issue's, not this one's.
+
+The one remaining P1 is a campaign-review discovery:
+[[join-defeats-the-closure-widen-gate]].
 
 ### P1 - wrong programs and crashes (`p1/`)
 
 | Issue | Severity |
 |---|---|
 | [[join-defeats-the-closure-widen-gate]] | Exit 139, no diagnostic, on `d93c359` AND on the merged `fix/joinledger`. `applyL(c ? vp : vq)` and `d.lam(c ? vp : vq)` widen a `void*` into a fat closure's CODE slot and call it; the BARE `applyL(vp)` is diagnosed on both binaries, so the join is what defeats the gate. Mirror of the code-value join defect: `WidenToClosureFatChecked` gates on PROVENANCE and a join proves nothing, so the correct polarity accepts and the widen happens. Needs the OPPOSITE ledger - values proven to be DATA - and the opposite quantifier, EVERY arm rather than ANY arm; getting that backwards false-rejects every mixed join. A join of two `function<>` values into the same parameter runs correctly on both binaries and is the first accept-set cell. Filed 2026-08-05 by the neighbour audit of `fix/joinledger`. |
-| [[temp-unique-field-escapes-through-unguarded-spellings]] | Silent use-after-free, compiles clean and exits 0. The residue spellings `fix/temp-uniq-borrow` did NOT reach, all measured identical on `6e9ab46` and on the merged fix: a same-type C-style cast, a `??` join, a `?:` join, an ARRAY AGGREGATE initializer (`Node*[2] a = { makeBox().t, nullptr };` - not the `EmitOneFieldInit` path), and a call ARGUMENT that stores. The argument case is PARTLY closable - a `unique T*` or `move T*` parameter states the claim at the call site (both measured still broken); a plain `T*` parameter is the undecidable remainder. Fix order and per-spelling accept sets are in the file. Filed 2026-08-04 by the round-1 review. |
 
 ### P2 - false rejections, unavailable features, ownership holes (`p2/`)
 
 | Issue | Family | Severity |
 |---|---|---|
 | [[same-statement-cast-launders-join-code-evidence]] | memory-unsafe accept | Silent exit 138: `two((void*)ro, c ? ro : n)` - a data cast of a NAMED function anywhere in a statement launders every other mention of that function in the SAME statement, because the launder is keyed on `llvm::Value*` alone and a named function is one shared constant. Cross-statement and cross-function are closed (`fix/joinledger`); only the same-statement window remains. P2 under the residue-not-regression precedent ([[unique-field-to-field-interface-receiver-residues]]) - the spelling was accepted before the fix too; re-rank to P1 if the memory-unsafe-accept rubric wins. Fix direction: occurrence keying (value + syntactic cast site). Filed 2026-08-05 by review round 2 of `fix/joinledger`. |
+| [[owning-temp-in-coalesce-fallback-arm-never-destructed]] | ownership hole | LEAK, no diagnostic, identical on `14097e1` and on the merged `fix/tempuniq`. `p ?? makeBox().t` measures `dtors=0` and reads the LIVE value: the `??` right operand is evaluated in `nullcoal_null`, which neither dominates the join nor gets the per-arm `FlushOwnedTempsSince` the `?:` arms get, so the owning temp is never destructed. The `?:` twins measure `dtors=1` and dangle, which is what makes this specific to `??`'s fallback arm rather than to joins generally. **Coupled**: `fix/tempuniq`'s join walk EXCLUDES this arm (rejecting it would refuse a correct program), so fixing the leak turns the shape into a use-after-free and must delete the arm-0-only restriction in `JoinCarriesOwningTempUniqueField` in the same change - both halves together. Same root as [[lambda-body-owning-temp-never-destructed]] and the `??=` half of [[coalesce-assign-skips-store-bookkeeping]]. Filed 2026-08-05 by `fix/tempuniq`. |
+| [[temp-unique-field-escapes-through-a-plain-pointer-parameter]] | memory-unsafe accept | Silent use-after-free, compiles clean and exits 0, identical on `14097e1` and on the merged `fix/tempuniq`. `keep(makeBox().t)` where `void keep(Node* n) { g = n; }` reads a freed block (proven by dtor count + reallocation aliasing; the `MallocScribble` fill shows only on ld64.lld-linked builds`. The DECLARED remainder of `temp-unique-field-escapes-through-unguarded-spellings` (closed and
+deleted 2026-08-05), which closed the four decidable spellings and named this one undecidable at the call site: the store happens in the CALLEE, and the read-only `rd(makeBox().t)` is CORRECT code that must keep working (frozen as `temp_uniq_accept_plain_param_read` with a destructor count). `unique T*` / `move T*` parameters ARE closed - those state the claim at the call site. All four reachable shapes (free function, `list.add`, constructor argument, global-storing callee) are the one plain-`T*` parameter. Fix direction: a CALLEE-side escape fact, not a call-site predicate - `RegisterNonEscapingOwningPtrArgs` answers a close question already. P2 under the residue-not-regression precedent ([[unique-field-to-field-interface-receiver-residues]]); re-rank to P1 if the memory-unsafe-accept rubric wins. Filed 2026-08-05 by `fix/tempuniq`. |
 | [[lambda-body-owning-temp-never-destructed]] | ownership hole | LEAK, no diagnostic, identical on `6e9ab46` and the merged fix. `Lambda<Dt*()> f = () => makeDt().t;` prints `dtors=0` - the owning `Box` temp inside a lambda BODY is never registered/flushed, so its destructor never runs at all. The same body as a free function is rejected by the temp-escape gate. Not a missed guard: the lambda body does not run the statement-boundary owned-temp machinery, so the read carries no temp provenance for any guard to see. Fixing it will likely turn the leak into a use-after-free the gate then rejects - land both halves together. Filed 2026-08-04 by the round-1 review of `fix/temp-uniq-borrow`. |
 | [[chained-nullcoalesce-not-boxed-into-interface]] | false rejection | `take(z ?? y ?? a)` and `IShape j = z ?? y ?? a;` do not compile - the outer join's arm is the inner join's LOAD, which names no class. Spans EVERY position that boxes a `??` (decl-init, assignment, return, argument), so it predates the return/argument work. Fix at the ledger by splicing a nested join's arms. Filed 2026-07-31. |
 | [[pointer-arg-binds-by-value-class-param]] | miscompile | `byVal(a)` with a `Circle*` and a by-value `Circle` parameter scores a PERFECT match and lowers a raw pointer into a struct slot - module-verifier dump, NO source location, exit 1. `IsTypeMatch` compares TypeName and ignores `Pointer`; the sibling `IsTypePromotion` does gate on it. PRE-EXISTING and language-wide, no join involved. Scorer change - wide blast radius, wants the corpus sweep. Filed 2026-07-31. |
@@ -3340,7 +3368,8 @@ a `unique IShape` temp field into a plain interface field) - pure tightenings.
 **Deliberately NOT closed**, each pre-existing and measured identical on both binaries: a
 same-type C-style cast, a `??` join, a `?:` join, an ARRAY AGGREGATE initializer, and a call
 ARGUMENT that stores. All five are filed together as
-[[temp-unique-field-escapes-through-unguarded-spellings]] (P1) with a measured pre/post pair
+`temp-unique-field-escapes-through-unguarded-spellings` (P1, CLOSED 2026-08-05 by `fix/tempuniq`,
+file deleted) with a measured pre/post pair
 each and a fix order. Correction to the round-1 framing: the argument case is **partly**
 closable, not indistinguishable - a `unique T*` or `move T*` parameter states the ownership
 claim at the call site (both measured still broken); only a plain `T*` parameter is undecidable
@@ -3614,6 +3643,183 @@ three reject legs still fire).
 > the post-fix binary alike - so the `--init` bitcode cache changes generated code. Pre-existing,
 > filed for its own investigation, and worth knowing before quoting a leak baseline from any of the
 > records above.
+
+## Landed: `fix/tempuniq` (2026-08-05) - a temp's `unique` field no longer escapes through a cast, a join, an array aggregate or a sink parameter
+
+Closes `p1/temp-unique-field-escapes-through-unguarded-spellings` and DELETES the file. Every row
+of that file was RE-MEASURED on a verified `14097e1` PRE binary before any guard was written (the
+file's own table was taken on `6e9ab46`); identity confirmed the way the lessons file requires - the
+PRE binary ACCEPTS every spelling and the programs print the `MallocScribble=1` fill at runtime.
+
+MECHANISM - **record-then-resolve, keyed by VALUE IDENTITY**, the third use of this shape in this
+repo and deliberately a PARALLEL ledger rather than an extension of `codeValues_` (the sibling
+`fix/widengate` owns that neighbourhood). One vector on `LLVMBackend`, `owningTempUniqueFields_`,
+parked and cleared exactly where `codeValueDataCasts_` is - per-function clear, `SaveBuilderState` /
+`RestoreBuilderState` pair, `ResetForReanalysis`, and **statement-scoped, retired by
+`FlushOwnedTemps` at the block-item boundary**. That scope is not defensive: it is the SAME boundary
+that runs the temp's destructor, so an entry can never outlive the dangle it describes.
+
+The read is ledgered in the by-value member-access branch of `MainListener.h`, three lines from
+where `FromOwningTempField` / `OwningTempParent` are set, under exactly the predicate the persist
+sites already used - extracted as `DeclaredOwningTempUniqueFieldRead`. **Recording cannot reject**,
+so a read this misses degrades to no diagnostic, never to a false rejection.
+`IsOwningTempUniqueFieldEscape` then answers from the declared facts OR from
+`JoinCarriesOwningTempUniqueField`, which walks a PHI's incoming values for `?:` and
+`nullCoalesceJoins_`'s recorded arms for `??`, recursing with the same depth cap that terminates a
+PHI cycle in a loop. Because all FIVE pre-existing persist sites read that one predicate, the cast
+and join spellings were closed at every one of them with no per-site work.
+
+**Why value identity is safe here and needed occurrence keying there.** `codeValueDataCasts_` had to
+be statement-scoped because a NAMED FUNCTION is one shared module-level constant, so every mention of
+`ro` in a body is the same `llvm::Value` - the residual that became
+[[same-statement-cast-launders-join-code-evidence]]. A temp field READ is a distinct `ExtractValue`
+instruction per occurrence, so two spellings of `makeBox().t` in one statement are two different
+values and cannot launder each other. The scoping here is belt-and-braces, not load-bearing.
+
+FOUR STEPS, each landed with its own frozen accept set BEFORE its guard, in the order the issue
+file specified:
+
+1. **Array aggregate initializer.** `Node*[2] a = { makeBox().t, nullptr };` is lowered by
+   `EmitPositionalFixedArrayInit`, NOT by `EmitOneFieldInit`, so the brace-init leg the previous fix
+   added could never see it - it was a silent use-after-free even for the BARE spelling, which makes
+   this the one step that was a plain missing call. Its array-VIEW twin `EmitArrayViewInferredInit`
+   is a THIRD separate lowering and needed the same call; both legs quote the element INDEX, which
+   is what proves the array site fired rather than a declarator gate. `EmitGlobalFixedArrayInit` is
+   deliberately untouched: a global initializer already gets the truer pre-existing "must be
+   compile-time constants" diagnostic, the same reason both decl-init sites are gated on
+   `!global_scope`.
+2. **Same-type C-style cast.** `ParseCastExpression` REUSES the operand's NamedVariable and
+   overwrites `TypeAndValue` with the destination type, which drops `IsUnique` / `IsUniqueTypeArg` -
+   the flags survive, the TYPE test does not. Fixed by ledgering the cast RESULT when the operand
+   answered the predicate, mirroring `RegisterCodeValueDataCast` three lines away. A cast is the
+   "I mean this" spelling, so its accept set was built first: casts off ordinary pointers, off
+   BORROWED container elements (`(Node*)l.get(0).t`), and over joins of two ordinary reads are all
+   untouched, because the ledger is keyed on the READ and only a read off an OWNING temp
+   (`OwningTempParent`) ever enters it.
+3. **`unique T*` / `move T*` parameters.** The claim is stated at the CALL SITE, so these are
+   decidable there. One site: `RejectOwningTempUniqueFieldIntoSinkParam`, called from the top of
+   `ApplyMoveParamTransfer`, which is the ONE shared helper both the free-function path
+   (`ResolveAndCall`) and the INTERFACE-METHOD path already funnel through - so the two call kinds
+   cannot drift. Gated on `param.Pointer && !param.IsAlias && (IsMove || IsUnique || IsUniqueTypeArg)`.
+4. **Joins.** Served entirely by the ledger walk above; no new site - EXCEPT for the one arm
+   position that must not answer, below.
+
+**THE '??' FALLBACK ARM IS EXCLUDED FROM THE WALK, and that exclusion is measured, not cautious.**
+The obvious polarity - "ANY arm answers yes", copied from `JoinCarriesCodeValue` - is wrong here,
+and the ARM-POSITION probe is what caught it (`scratch/tu/arm_A..arm_D`, destructor counts, both
+binaries):
+
+| Arm position | pre-fix behaviour | verdict |
+|---|---|---|
+| `makeBox().t ?? nullptr` (LHS) | `v=garbage`, `dtors=1` | dangles - REJECT |
+| `p ?? makeBox().t` (RHS/fallback) | `v=70` (LIVE), `dtors=0` | never freed - ACCEPT |
+| `c > 0 ? makeBox().t : nullptr` (true arm) | `v=garbage`, `dtors=1` | dangles - REJECT |
+| `c > 5 ? nullptr : makeBox().t` (taken false arm) | `v=garbage`, `dtors=1` | dangles - REJECT |
+
+The asymmetry is real and has a mechanism: a `?:` arm gets an explicit `FlushOwnedTempsSince`
+INSIDE the arm block - `FlushOwnedTempsSince`'s own comment says it exists because an arm block
+does not dominate the join - while the `??` path makes no such call, so its `nullcoal_null` temps
+are skipped by `OwnedTempDominatesHere` and never destructed at all. Rejecting the fallback arm
+would have refused a program master compiles and runs correctly, which is the single
+highest-cost failure mode in this workflow. The walk therefore follows only `Arms[0]` (the left
+operand at the one `RegisterNullCoalesceJoin` call site), the leak is filed as
+[[owning-temp-in-coalesce-fallback-arm-never-destructed]], and BOTH the code comment and that
+file say the exclusion must be deleted in the same change that fixes the leak - at which point
+the shape becomes a genuine use-after-free. `temp_uniq_accept_coalesce_fallback_arm_not_freed`
+pins `dtors == 0` deliberately, so the leg goes red the moment the leak is fixed.
+
+**One site was missed on the first pass and found by this fix's own matrix, not by review**:
+`EmitOneFieldInit` skipped the escape reject whenever the destination field OWNS
+(`!braceDestOwnsPointee`), on the assumption that the field-to-field source gate would catch it
+there - and that gate reads the declared facts a cast or a join has already stripped, so
+`Holder h = { slot = (Node*)makeBox().t };` still aborted (rc 134). The guard now runs whenever the
+source gate did NOT fire, with the destination described as a `unique field` in that case. This is
+the "N-1 sites" failure mode this test file already records three times.
+
+**The join diagnostic needed its own wording, and the first cut printed an empty name.** A PHI has
+no `CallerName`/`FieldName` to quote, so `DescribeUniqueFieldAccess` returned `""` and the message
+read `cannot store unique field '' of a temporary`. It now says "a unique field of a temporary,
+reached through a cast or a '?:' / '??' join" when there is no name - a rejection's message has to
+be true of the site it fires at. The CAST legs keep the quoted name (the NamedVariable survives the
+cast), which is itself the discriminator that tells the two paths apart in the test file.
+
+MATRIX - **150 cells**, ten source spellings x fifteen destinations, every one measured on the PRE
+binary before any guard was written. Spellings: bare, parenthesized, same-type cast, cast-of-paren,
+paren-of-cast, `??`, `?:` (one temp arm), `?:` (two temp arms), cast-of-join, join-of-cast.
+Destinations: local decl-init, assignment, `unique` field, plain field, global store, brace init,
+fixed-array aggregate, array-view aggregate, return, `??=`, and the argument kinds (plain `T*`,
+`unique T*`, `move T*`, constructor argument, `list.add`). **86 cells changed**, all from
+memory-unsafe to diagnosed: exit 0 freed-then-read for the silent ones, and rc 134 (double free)
+for the `unique`-field and brace-init destinations, which were the only spellings that were not
+silent. Round-1 review caveat on the discriminator: the `MallocScribble` 0x55 fill
+(`1431655765`) shows only in an ld64.lld-linked build; the PRE binary here links `Linking
+(mach-o)` and shows allocator-REUSE values (e.g. `v=4`) instead, so the UAF was re-proven with
+destructor counts plus a reallocation-aliasing witness (`raw` reads the fresh object's 99,
+`same=1`), not with the fill. Do not compare the fill across differently-linked binaries.
+
+**64 cells are unchanged, and they are exactly three things** - not a long tail:
+
+- **14 cells: already rejected on PRE** - the `bare` and `paren` spellings at the seven
+  destinations `fix/temp-uniq-borrow` already guarded (decl-init, assignment, `unique` field,
+  brace init, global store, plain field, return).
+- **40 cells: the plain-`T*` parameter**, in all four shapes it reaches (a free function, a
+  global-storing callee, `list.add`, a constructor argument). This is the remainder the issue file
+  itself declared undecidable at the call site, and it is filed as
+  [[temp-unique-field-escapes-through-a-plain-pointer-parameter]] (P2, residue-not-regression
+  precedent, re-rank hatch stated) rather than left as a footnote.
+- **10 cells: `??=`**, which RETURNS before the shared store tail and so is not a persist site at
+  all. Measured, and memory-unsafe in two different ways depending on spelling:
+  `raw ??= makeBox().t` LEAKS (dtors=0 - the owning temp is never registered), while
+  `raw ??= c > 0 ? makeBox().t : nullptr` is a use-after-free (dtors=1, garbage read). Both
+  identical on both binaries. NOT filed as a new issue - the root is the seven skipped bookkeeping
+  calls already recorded in [[coalesce-assign-skips-store-bookkeeping]], which this fix upgrades
+  from a file of PREDICTIONS to one with a measured memory-unsafe repro. Adding `??=` to the list
+  of guarded sites is not the fix; routing it through the tail is.
+
+ACCEPT SET - frozen as value legs BEFORE the guards, per the ordering the lessons file requires.
+**16 legs in `Test/test_move.cb::testTempUniqueFieldBorrowAccepts`**, and the whole file's output is
+BYTE-IDENTICAL on the PRE and POST binaries (713/713 both) - these legs discriminate against an
+over-broad guard, not against master, which is the right non-vacuity pairing for an accept set. The
+cells: a cast off an ordinary pointer into a plain field and into an array element; a cast AND a `??`
+join off a BORROWED container element's unique field (the polarity leg - `FromOwningTempField` is
+set there too, so a ledger keyed on it alone would false-reject every cell); `?:`, `??` and
+cast-over-join of two ordinary reads, plus a join stored into an array aggregate; the read-only
+plain-`T*` parameter in bare and cast spellings with `dtors == 1` asserted either side; and `unique`
+/ `move` SINK parameters fed a genuinely owned argument (`new Res()`, a moved-from local), again
+with destructor counts, since those are the two parameter kinds the new call-site reject judges;
+and the `??` FALLBACK arm, with `dtors == 0` asserted, per the table above.
+
+EVIDENCE. `Test/errors/err_unique_borrow_into_field.cb` gains **11 reject legs** (34 PASS legs
+total, file exits 0). Each was extracted to a standalone file and run on PRE, where all eleven
+report `FAIL: expected error ... did not occur` - i.e. PRE compiled each one silently - and PASS in
+isolation on POST, so no leg is satisfied by an earlier leg's error. Each was ALSO mutation-tested
+individually in place (poison one expectation, the file must flip to exit 1): all 14 tail legs
+flip. LEAKS on `Test/test_move.cb` are unchanged - **15 leaks / 304 bytes on both binaries** when
+both are measured COLD (`--init-clear-local`). Worth recording because it corrects a trap: the
+warm-cache number is 13/256 with run-to-run variance up to 16/320, so a PRE-cold vs POST-warm
+comparison reads as a 2-leak improvement that the diff cannot possibly have caused - the cache
+state, not the compiler, is the variable. Bar: macOS arm64 Release `./test.sh` **598 / 0 / 8** and
+`example_mac.sh` **35 / 0**.
+
+DIFFERENTIAL SWEEP: `--check` over all **534** `.cb` in `Test/`, `example/` and `cflat/core/` with
+both binaries, diagnostics compared by normalized hash - **exactly one real difference, the intended
+reject file**. Two protocol notes, both of which produced false alarms first: the two binaries must
+be in the SAME `--init-local` cache state (a warm POST against a cold PRE reported seven `core/*.cb`
+going rc 0 -> rc 1, which is the redeclaration a warm core cache produces and not a rejection at
+all), and the runtime-core PATH has to be normalized out of the diagnostic text or every
+Windows-only file diffs on its own "imported file not found" message.
+
+NEIGHBOUR AXES probed beyond the matrix, each a measured pre/post pair: the WRITTEN `unique Node*`
+field spelling (not just the generic type-arg one) through cast and join - UAF pre, diagnosed now;
+a NESTED field (`makeOutr().inner.p`) through cast and join - same; a cast of a NAMED (non-temp)
+`unique` field, which the pre-existing `IsUniqueFieldAlias` channel already rejects identically on
+both binaries; the GLOBAL array aggregate, which keeps its truer pre-existing "must be compile-time
+constants" message on both, confirming that leaving `EmitGlobalFixedArrayInit` alone was measured
+rather than assumed; and a PHI reached through a LOOP, which terminates on the depth cap.
+
+No new serialized field - the ledger is an `llvm::Value*` vector on the backend, not a
+`TypeAndValue` / `StructData` / `AnnotationValue` member - so the `--init` cache round-trip is
+untouched; `test.sh` runs `--init-local` and covers the warm-cache path.
 
 ## Landed: `fix/joinledger` (2026-08-05) - a `?:` / `??` JOIN no longer erases the code-value evidence
 

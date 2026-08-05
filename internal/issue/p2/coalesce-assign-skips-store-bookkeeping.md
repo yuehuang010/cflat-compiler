@@ -42,6 +42,30 @@ Anything whose correctness depends on a store being observed. Predicted, NOT yet
 - `s ??= b.name;` should mark `s` as borrowing an owned string field and does not.
 - A bonded variable reassigned with `??=` should break the bond and does not.
 
+## MEASURED, memory-unsafe (added 2026-08-05 by `fix/tempuniq`)
+
+The first repro of this issue that is not a prediction, and it is memory-unsafe in TWO different
+ways depending on the spelling. `Res` has a destructor that counts; identical on `14097e1` and on
+the merged `fix/tempuniq` (`scratch/tu/ca.cb`):
+
+```cflat
+Box<unique Res*> makeBox() { Box<unique Res*> b = default; b.t = new Res(); b.t->v = 70; return b; }
+
+Res* raw = nullptr;  raw ??= makeBox().t;                    // v=70,         dtors=0  -> LEAK
+Res* r2  = nullptr;  r2  ??= c > 0 ? makeBox().t : nullptr;  // v=1431655765, dtors=1  -> UAF
+```
+
+The bare spelling never registers the owning temp at all, so nothing is ever freed; the join
+spelling does register it, frees at end of statement, and leaves `r2` dangling. Both slip the
+temp-unique-field escape gate for the same reason the seven calls above are skipped: the `??=`
+branch RETURNS before the shared store tail, so it is not one of the persist sites, and adding it
+to the list of guarded sites is not the fix - routing `??=` through the tail is.
+
+Deliberately NOT closed by `fix/tempuniq`: that branch's accept set is the seven unrelated
+ownership subsystems above, which is a wider change than the escape gate this issue is being
+noted from. This raises the issue's severity evidence but it stays P2 under the
+residue-not-regression precedent; re-rank if the memory-unsafe-accept rubric wins.
+
 ## Fix direction
 
 Hoist the common post-store tail out of the `=` branch into a helper and call it from both, or make

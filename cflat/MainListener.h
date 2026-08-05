@@ -11335,8 +11335,24 @@ public:
      * (`l.get(0).t`, an `alias` return) leaves it clear, nothing is freed at end of statement, and
      * the read is legal - measured on both binaries. Reads that do not outlive the statement
      * (`makeBox().t->v`, passing it to a reader) never reach a persist site and are untouched.
+     *
+     * TWO SOURCES, because a CAST overwrites TypeAndValue with the destination type and a JOIN
+     * delivers a PHI with no NamedVariable at all - both drop every declared fact below. The
+     * second source is owningTempUniqueFields_, ledgered at the READ under exactly the declared
+     * predicate, and consulted through the join-arm walk. Ledgering cannot reject, so a spelling
+     * the ledger misses degrades to no diagnostic rather than to a false rejection.
      */
     bool IsOwningTempUniqueFieldEscape(const LLVMBackend::NamedVariable& nv)
+    {
+        if (nv.TypeAndValue.IsMove) return false;
+        if (DeclaredOwningTempUniqueFieldRead(nv)) return true;
+        return compilerLLVM != nullptr
+            && compilerLLVM->JoinCarriesOwningTempUniqueField(nv.Primary);
+    }
+
+    // The DECLARED half of the predicate above, read straight off the NamedVariable the
+    // member-access branch built. Also the condition under which the read is ledgered.
+    static bool DeclaredOwningTempUniqueFieldRead(const LLVMBackend::NamedVariable& nv)
     {
         if (!nv.FromOwningTempField || !nv.OwningTempParent) return false;
         if (nv.TypeAndValue.IsMove) return false;
@@ -11352,12 +11368,25 @@ public:
                                            const std::string& destDesc,
                                            antlr4::ParserRuleContext* ctx)
     {
+        // A join arrives as a PHI and a cast severs Storage, so neither carries a name to quote;
+        // say so rather than printing an empty one.
+        std::string access = DescribeUniqueFieldAccess(rightNV);
+        if (access.empty())
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot store a unique field of a temporary, reached through a cast or a "
+                "'?:' / '??' join, into {} - the temporary's synthesized destructor frees the "
+                "pointee at the end of this statement, leaving it dangling. Bind the whole call "
+                "result to a local first and read the field from that local.",
+                destDesc));
+            return;
+        }
         LogErrorContext(ctx, std::format(
             "cannot store unique field '{}' of a temporary into {} - the temporary's synthesized "
             "destructor frees the pointee at the end of this statement, leaving it dangling. "
             "'move' needs an addressable source, so bind the whole call result to a local first "
             "and read the field from that local.",
-            DescribeUniqueFieldAccess(rightNV), destDesc));
+            access, destDesc));
     }
 
     /*
@@ -17309,8 +17338,13 @@ public:
             }
 
             bool srcIsSigned = namedVar.TypeAndValue.IsUnsignedInteger() == -1;
+            // A cast off a temp's `unique` field is the "I mean this" spelling, and it drops the
+            // ownership facts with the type; carry them to the RESULT so persist sites still see it.
+            bool castOfTempUniqueField = IsOwningTempUniqueFieldEscape(namedVar);
             namedVar.Primary = compiler->CreateCast(namedVar.Primary, type, srcIsSigned);
             namedVar.TypeAndValue = destTypeName;
+            if (castOfTempUniqueField)
+                compiler->RegisterOwningTempUniqueField(namedVar.Primary);
             // A ptr->ptr cast is a no-op under opaque pointers, so the result IS the ledgered
             // code value; launder it or the explicit cast the rejection advises is itself refused.
             if (compiler->ParameterStoresData(destTypeName))
@@ -18046,12 +18080,17 @@ public:
             else
                 RejectUniqueInterfaceFieldToField(rightNV, braceDesc, errCtx);
         }
-        // The BORROWING destination field, kept in lockstep with the `=` path: the temp's
-        // destructor dangles the pointee at end of statement whoever the destination is.
-        if (!braceDestOwnsPointee && !IsOwningUniqueInterfaceField(fieldType)
-            && IsOwningTempUniqueFieldEscape(rightNV))
+        // Belt-and-braces: the source gates above all throw, so this leg runs only for the
+        // cast/join spellings that reach an owning destination with every declared fact stripped.
+        bool braceSrcGateFired = braceSrcIsUniqueFieldRead
+            && (braceDestOwnsPointee || IsOwningUniqueInterfaceField(fieldType));
+        if (!braceSrcGateFired && IsOwningTempUniqueFieldEscape(rightNV))
+        {
+            bool braceDestOwns = braceDestOwnsPointee || IsOwningUniqueInterfaceField(fieldType);
             RejectOwningTempUniqueFieldEscape(
-                rightNV, std::format("field '{}.{}'", typeName, fieldName), errCtx);
+                rightNV, std::format("{}field '{}.{}'", braceDestOwns ? "unique " : "",
+                                     typeName, fieldName), errCtx);
+        }
 
         llvm::Value* val = LoadNamedVariable(rightNV);
         if (!val) return false;
@@ -18483,6 +18522,12 @@ public:
             // Aggregate leg of the code-value store gate: `Rec*[2] arr = { w, w };`.
             RejectCodeValueIntoDataSlot(fi, nv, fixedElemTV, "brace-initialize",
                                         std::format("element {} of '{}' of", i, name));
+
+            // Array-aggregate leg of the temp-unique-field escape. This lowering is NOT
+            // EmitOneFieldInit, so the struct brace-init leg could never see it.
+            if (IsOwningTempUniqueFieldEscape(nv))
+                RejectOwningTempUniqueFieldEscape(
+                    nv, std::format("element {} of array '{}'", i, name), fi);
 
             if (tv.TypeName == "string"
                 && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
@@ -19046,6 +19091,12 @@ public:
             // Aggregate leg of the code-value store gate: `Rec*[] v = { w, w };`.
             RejectCodeValueIntoDataSlot(fi, nv, elemTV, "brace-initialize",
                                         std::format("element {} of '{}' of", i, name));
+
+            // Array-VIEW twin of the fixed-array leg above; a separate lowering reached by
+            // neither the fixed path nor EmitOneFieldInit.
+            if (IsOwningTempUniqueFieldEscape(nv))
+                RejectOwningTempUniqueFieldEscape(
+                    nv, std::format("element {} of array '{}'", i, name), fi);
 
             if (tv.TypeName == "string"
                 && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
@@ -21901,6 +21952,10 @@ public:
                                     // the borrow rules still fire (see IsUniqueFieldRead / Trap B).
                                     if (fieldType.IsUnique && fieldType.Pointer)
                                         namedVar.IsUniqueFieldAlias = true;
+                                    // Ledger the read by VALUE so a cast or a join, which drop every
+                                    // flag above, still answer the persist-site guard.
+                                    if (DeclaredOwningTempUniqueFieldRead(namedVar))
+                                        Compiler(ctx)->RegisterOwningTempUniqueField(namedVar.Primary);
                                     // Field declared `alignas(_, N)`: stamp the block alignment onto the
                                     // result so `delete obj->field` / scope-exit free via __delete_aligned.
                                     namedVar.AllocAlignment   = fieldType.AllocAlignValue;

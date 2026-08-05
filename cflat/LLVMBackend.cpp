@@ -2552,6 +2552,7 @@ void LLVMBackend::ResetForReanalysis()
     nullCoalesceJoins_.clear();
     codeValues_.clear();
     codeValueDataCasts_.clear();
+    owningTempUniqueFields_.clear();
     movedOutPtrValues_.clear();
     movedBorrowedPtrValues_.clear();
     nonOwningStructJoins_.clear();

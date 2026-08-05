@@ -169,9 +169,8 @@ expect_error("cannot store unique field 'makeOutr.p' of a temporary into a local
 // parenthesized primary kept only Primary/type/storage - so the identical program in brackets
 // slipped past every persist site (the review's witness: the issue file's own verbatim repro
 // plus one token still use-after-freed). The provenance now rides a side channel next to the
-// existing lastParenExprType/Storage ones. Both store paths get a leg; a same-type C-style
-// cast is a DIFFERENT path and is still open - see
-// internal/issue/p1/temp-unique-field-escapes-through-unguarded-spellings.md.
+// existing lastParenExprType/Storage ones. Both store paths get a leg. A same-type C-style cast
+// is a DIFFERENT path and was open until 2026-08-05; its legs are in the next section.
 expect_error("cannot store unique field 'makeBox.t' of a temporary into a longer-lived location") {
     void tempDtorlessParenIntoPlainSlot() { PlainNodeSlot q = default; q.p = (makeBox().t); }
 }
@@ -240,6 +239,95 @@ expect_error("cannot store unique field 'makeIBox.t' of a temporary into a longe
 // ("an interface local") is the discriminator that proves THIS site fired, not the else.
 expect_error("cannot store unique field 'makeIBox.t' of a temporary into an interface local") {
     void tempIfaceFieldIntoIfaceLocal() { IShape s = makeIBox().t; }
+}
+
+// ---------------------------------------------------------------------------------------
+// THE SPELLINGS THAT LOST THE PROVENANCE. A same-type C-style CAST rewrites TypeAndValue and
+// a `?:` / `??` JOIN delivers a PHI (or a load out of a slot), so by the time either reaches a
+// persist site every declared fact the gate above reads is gone - each of these compiled
+// clean, ran and printed 1431655765 (the MallocScribble 0x55 fill) on the pre-fix binary.
+// Closed by ledgering the READ by llvm::Value identity (owningTempUniqueFields_) and walking
+// the join arms, which is the record-then-resolve shape this repo already uses for code values.
+// The cast legs still quote the field name (the NamedVariable survives the cast); the join
+// legs cannot, because a PHI has no name to quote, so they get their own wording.
+
+expect_error("cannot store unique field 'makeBox.t' of a temporary into a local") {
+    void tempDtorlessCastIntoLocal() { Node* raw = (Node*)makeBox().t; }
+}
+
+expect_error("cannot store unique field 'makeBox.t' of a temporary into a longer-lived location") {
+    void tempDtorlessCastIntoPlainSlot() { PlainNodeSlot q = default; q.p = (Node*)makeBox().t; }
+}
+
+// The CAST-OF-PARENTHESIZED operand is a different program from the bare one: the parenthesized
+// primary is rebuilt from the lastParenExpr* side channel and the cast then rewrites THAT
+// NamedVariable, so both halves of the provenance chain have to hold for this leg to fire.
+expect_error("cannot store unique field 'makeBox.t' of a temporary into the return value") {
+    Node* returnTempDtorlessCastParen() { return (Node*)(makeBox().t); }
+}
+
+// The '??' join. Its arms are unrecoverable from the IR (it joins through a slot, so the
+// joined value is a plain load), which is why the walk consults nullCoalesceJoins_ rather
+// than the PHI - the '?:' leg below is the one that exercises the PHI walk.
+expect_error("reached through a cast or a '?:' / '??' join, into a local") {
+    void tempDtorlessCoalesceIntoLocal() { Node* raw = makeBox().t ?? nullptr; }
+}
+
+// The '?:' join, whose arms ARE the PHI's incoming values. ANY dangling arm answers yes: here
+// only the TRUE arm reads the temp field, and one arm is enough to leave the destination
+// pointing at freed memory.
+expect_error("reached through a cast or a '?:' / '??' join, into a longer-lived location") {
+    void tempDtorlessTernaryIntoPlainSlot()
+    {
+        PlainNodeSlot q = default;
+        int c = 1;
+        q.p = c > 0 ? makeBox().t : nullptr;
+    }
+}
+
+// NESTED spellings - a cast over a join, and a join over a cast. Each needs the walk to
+// recurse through the other's shape rather than stopping at the outermost one.
+expect_error("reached through a cast or a '?:' / '??' join, into a local") {
+    void tempDtorlessCastOfJoin() { Node* raw = (Node*)(makeBox().t ?? nullptr); }
+}
+
+expect_error("reached through a cast or a '?:' / '??' join, into a local") {
+    void tempDtorlessJoinOfCast() { Node* raw = ((Node*)makeBox().t) ?? nullptr; }
+}
+
+// ---------------------------------------------------------------------------------------
+// THE ARRAY AGGREGATE INITIALIZER. `Node*[2] a = { makeBox().t, nullptr };` is lowered by
+// EmitPositionalFixedArrayInit, not by EmitOneFieldInit, so the brace-init leg above could
+// never see it - it was a silent use-after-free even for the BARE spelling. The element index
+// in the message is what proves this site fired rather than a declarator or assignment gate.
+expect_error("of a temporary into element 0 of array 'aggFixed'") {
+    void tempDtorlessArrayAggregate() { Node*[2] aggFixed = { makeBox().t, nullptr }; }
+}
+
+// The array-VIEW twin (EmitArrayViewInferredInit), a third separate lowering. Element 1 here,
+// so the leg cannot pass by accidentally matching the fixed-array leg's wording.
+expect_error("of a temporary into element 1 of array 'aggView'") {
+    void tempDtorlessArrayViewAggregate() { Node*[] aggView = { nullptr, (Node*)makeBox().t }; }
+}
+
+// ---------------------------------------------------------------------------------------
+// A `unique T*` / `move T*` PARAMETER. The store happens in the CALLEE, so a call site cannot
+// in general tell a storing argument from a read-only one - but these two parameter spellings
+// state the ownership claim AT the call site, which makes them decidable there. A plain `T*`
+// parameter is the undecidable remainder and deliberately still compiles; the read-only
+// `rd(makeBox().t)` that depends on it is frozen as an accept leg in Test/test_move.cb.
+// The message names the CALLEE and the PARAMETER, which is what tells this site from a store.
+void sinkUnique(unique Node* n) { }
+void sinkMove(move Node* n) { delete n; }
+
+expect_error("call to 'sinkUnique': cannot pass a unique field of a temporary to parameter 'n'") {
+    void tempDtorlessIntoUniqueParam() { sinkUnique(makeBox().t); }
+}
+
+// The `move` parameter spelling, through a CAST - both halves (the parameter kind and the
+// ledger walk past the cast) have to hold, so this cannot pass for the reason above does.
+expect_error("call to 'sinkMove': cannot pass a unique field of a temporary to parameter 'n'") {
+    void tempDtorlessCastIntoMoveParam() { sinkMove((Node*)makeBox().t); }
 }
 
 // NOTE: an interface-field-to-interface-field copy with the SAME field name on both sides is
