@@ -122,6 +122,65 @@ expect_error("taken from a temporary; its buffer is owned elsewhere") {
 }
 
 // ---------------------------------------------------------------------------------------
+// THE DTOR-LESS POINTEE. Every reject above is keyed on IsOwningValueType(TypeName), which is
+// true only when the POINTEE has a destructor. `Node` has none, so the identical programs
+// compiled clean, ran, printed a plausible value and exited 0 - a silent use-after-free
+// (measured: under MallocScribble=1 the read returns 1431655765, the 0x55 fill). The
+// discriminator that was missing is the TEMP's own synthesized destructor, which frees the
+// pointee at the end of the statement whoever the destination is; the new gate
+// (IsOwningTempUniqueFieldEscape) reads that provenance instead of the pointee's type name.
+// Every leg below compiles and runs on the pre-fix binary, so each is non-vacuous on its own.
+struct PlainNodeSlot { Node* p = nullptr; };
+
+expect_error("cannot store unique field 'makeBox.t' of a temporary into a longer-lived location") {
+    void tempDtorlessFieldIntoPlainSlot() { PlainNodeSlot q = default; q.p = makeBox().t; }
+}
+
+// The DECLARATION spelling - a separate copy of the gate in ParseDeclaration. Reverting only
+// that copy leaves this leg compiling while the assignment leg above still fails.
+expect_error("cannot store unique field 'makeBox.t' of a temporary into a local") {
+    void tempDtorlessFieldIntoLocal() { Node* raw = makeBox().t; }
+}
+
+// The RETURN spelling - the third copy, in ParseStatement's jump handling.
+expect_error("cannot store unique field 'makeBox.t' of a temporary into the return value") {
+    Node* returnTempDtorlessField() { return makeBox().t; }
+}
+
+// The BRACE-INIT store path (EmitOneFieldInit), whose destination field only BORROWS - the
+// pre-existing temp gate there requires an owning `unique` destination and declines. This
+// destination names itself in the message, which is how the brace path is told from the `=`
+// path when both would otherwise read alike.
+expect_error("of a temporary into field 'PlainNodeSlot.p'") {
+    void tempDtorlessFieldIntoBraceInit() { PlainNodeSlot q = { p = makeBox().t }; }
+}
+
+// A NESTED field of the temp (`makeOutr().inner.p`): the provenance propagates through the
+// inner member access, and the OUTER temp is the one destructed at end of statement.
+struct Inn { unique Node* p = nullptr; };
+struct Outr { Inn inner = default; };
+Outr makeOutr() { Outr o = default; o.inner.p = new Node(); return o; }
+
+expect_error("cannot store unique field 'makeOutr.p' of a temporary into a local") {
+    void tempDtorlessNestedField() { Node* raw = makeOutr().inner.p; }
+}
+
+// PARENTHESES. One token is the whole difference, and the rebuilt NamedVariable behind a
+// parenthesized primary kept only Primary/type/storage - so the identical program in brackets
+// slipped past every persist site (the review's witness: the issue file's own verbatim repro
+// plus one token still use-after-freed). The provenance now rides a side channel next to the
+// existing lastParenExprType/Storage ones. Both store paths get a leg; a same-type C-style
+// cast is a DIFFERENT path and is still open - see
+// internal/issue/p1/temp-unique-field-escapes-through-unguarded-spellings.md.
+expect_error("cannot store unique field 'makeBox.t' of a temporary into a longer-lived location") {
+    void tempDtorlessParenIntoPlainSlot() { PlainNodeSlot q = default; q.p = (makeBox().t); }
+}
+
+expect_error("cannot store unique field 'makeBox.t' of a temporary into a local") {
+    void tempDtorlessParenIntoLocal() { Node* raw = (makeBox().t); }
+}
+
+// ---------------------------------------------------------------------------------------
 // A FAT-INTERFACE owning slot (`Box<unique IShape>::t`). The value is a {vtable,data} struct,
 // so it failed BOTH the pointer-shaped ownership gate (IsOwningUniquePointerField's type-arg
 // arm requires Pointer) and the `=` site's own isPointerTy() test on the stored value - two
@@ -162,6 +221,25 @@ expect_error("cannot store unique interface field 'a.s' into unique field 'Writt
         WrittenIfaceHolder a = default; a.s = new Circle();
         WrittenIfaceHolder c = { s = a.s };
     }
+}
+
+// The FAT-INTERFACE form of the dtor-less escape: a `unique IShape` field read off a temp and
+// stored into a plain (borrowing) interface field. The pointer-shaped legs above cannot see a
+// {vtable,data} value, and the pre-existing interface leg needs an OWNING destination, so this
+// compiled and dispatched through a freed box (measured: area() returned 954437177 pre-fix).
+struct PlainIfaceSlot { IShape s = default; };
+Box<unique IShape> makeIBox() { Box<unique IShape> b = default; b.t = new Circle(); return b; }
+
+expect_error("cannot store unique field 'makeIBox.t' of a temporary into a longer-lived location") {
+    void tempIfaceFieldIntoPlainSlot() { PlainIfaceSlot q = default; q.s = makeIBox().t; }
+}
+
+// An INTERFACE-typed decl-init is its own branch of ParseDeclaration (IsFatInterfaceValue),
+// not the else the pointer legs above land in, so it needed its own call - the review's
+// witness dispatched through a box the temp had already freed. The destination wording
+// ("an interface local") is the discriminator that proves THIS site fired, not the else.
+expect_error("cannot store unique field 'makeIBox.t' of a temporary into an interface local") {
+    void tempIfaceFieldIntoIfaceLocal() { IShape s = makeIBox().t; }
 }
 
 // NOTE: an interface-field-to-interface-field copy with the SAME field name on both sides is

@@ -3556,6 +3556,13 @@ private:
     // Companion to lastParenExprType: the storage (lvalue address) of a parenthesized
     // expression, so postfix ++/-- on a parenthesized lvalue (e.g. '(*p)++') can write back.
     llvm::Value* lastParenExprStorage = nullptr;
+    // Third companion: the owning-TEMP field provenance of a parenthesized expression, so
+    // `(makeBox().t)` keeps the flags the persist-site escape gates read.
+    bool lastParenExprFromOwningTempField = false;
+    bool lastParenExprOwningTempParent = false;
+    std::string lastParenExprOwningStructName;
+    std::string lastParenExprFieldName;
+    std::string lastParenExprCallerName;
 
     // Variadic forwarding: true when the current function being codegen'd accepts '...'
     bool currentFunctionIsVariadic = false;
@@ -6885,6 +6892,11 @@ public:
                             }
                         }
 
+                        // Same escape with a dtor-LESS pointee, which the type-name gate above
+                        // cannot see. After it, so a dtor-bearing pointee keeps its wording.
+                        if (IsOwningTempUniqueFieldEscape(returnNV))
+                            RejectOwningTempUniqueFieldEscape(returnNV, "the return value", jump);
+
                         // Returning a whole `alias` (borrow) value from a non-`alias` function hands
                         // the caller a value whose always-run destructor frees a buffer the real owner
                         // still holds. Allowed only when the function itself is declared `alias` (the
@@ -9632,6 +9644,11 @@ public:
                             // For interface declarations, preserve NamedVariable type info
                             // so we can do the class->interface fat-struct upcast when needed.
                             auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
+                            // Interface decl-init is its OWN branch, so the escape gate in the
+                            // else below never sees `IShape s = makeIBox().t;` (it dangled).
+                            if (!global_scope && IsOwningTempUniqueFieldEscape(rightNV))
+                                RejectOwningTempUniqueFieldEscape(
+                                    rightNV, "an interface local", assignmentExpression);
                             right = LoadNamedVariable(rightNV);
                             srcPrimary = rightNV.Primary;
                             // Derived-interface -> parent-interface: re-box (a derived vtable is not
@@ -9752,6 +9769,10 @@ public:
                                         "result first (e.g. `auto t = ...;`) or use '.copy()' for an independent copy.",
                                         rightNV.OwningStructName, rightNV.FieldName));
                                 }
+                                // Same escape with a dtor-LESS pointee. Skipped at global scope,
+                                // where the compile-time-constant message is the truer one.
+                                if (!global_scope && IsOwningTempUniqueFieldEscape(rightNV))
+                                    RejectOwningTempUniqueFieldEscape(rightNV, "a local", assignmentExpression);
                                 srcIsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
                                 genericFuncCallerName = rightNV.CallerName;
                                 srcIsBorrowed = rightNV.IsBorrowed;
@@ -11128,6 +11149,43 @@ public:
         if (!nv.MovableTempField && !nv.FromOwningTempField) return false;
         if (nv.TypeAndValue.IsMove) return false;
         return IsOwningUniquePointerField(nv.TypeAndValue) && nv.TypeAndValue.Pointer;
+    }
+
+    /*
+     * True when this reads a `unique` field off a temporary THIS STATEMENT destructs
+     * (`makeBox().t`): the temp's synthesized destructor frees the pointee at the end of the
+     * statement, so binding the value into any slot that outlives the statement dangles - whether
+     * or not the POINTEE itself has a destructor. The sibling FromOwningTempField rejects are
+     * keyed on IsOwningValueType(TypeName), which is only true for a dtor-bearing pointee, so a
+     * dtor-less one fell through every gate as a silent use-after-free.
+     *
+     * OwningTempParent is the load-bearing half of the polarity: a BORROWED element
+     * (`l.get(0).t`, an `alias` return) leaves it clear, nothing is freed at end of statement, and
+     * the read is legal - measured on both binaries. Reads that do not outlive the statement
+     * (`makeBox().t->v`, passing it to a reader) never reach a persist site and are untouched.
+     */
+    bool IsOwningTempUniqueFieldEscape(const LLVMBackend::NamedVariable& nv)
+    {
+        if (!nv.FromOwningTempField || !nv.OwningTempParent) return false;
+        if (nv.TypeAndValue.IsMove) return false;
+        return (IsOwningUniquePointerField(nv.TypeAndValue) && nv.TypeAndValue.Pointer)
+            || IsOwningUniqueInterfaceField(nv.TypeAndValue);
+    }
+
+    /*
+     * The diagnostic for the predicate above. `move <temp>.<field>` is not a remedy (a temporary
+     * has no address), so it names the one that works: bind the whole call result to a local.
+     */
+    void RejectOwningTempUniqueFieldEscape(const LLVMBackend::NamedVariable& rightNV,
+                                           const std::string& destDesc,
+                                           antlr4::ParserRuleContext* ctx)
+    {
+        LogErrorContext(ctx, std::format(
+            "cannot store unique field '{}' of a temporary into {} - the temporary's synthesized "
+            "destructor frees the pointee at the end of this statement, leaving it dangling. "
+            "'move' needs an addressable source, so bind the whole call result to a local first "
+            "and read the field from that local.",
+            DescribeUniqueFieldAccess(rightNV), destDesc));
     }
 
     /*
@@ -13699,6 +13757,14 @@ public:
                     "is owned elsewhere and would double-free. Use '.copy()' for an independent copy, or "
                     "bind the whole call result to a local first and assign from that.",
                     rightNV.OwningStructName, rightNV.FieldName));
+                return right;
+            }
+
+            // Same escape into a BORROWING destination (field, local, global, array element) with
+            // a dtor-LESS pointee. After the gate above, so a dtor-bearing pointee keeps its wording.
+            if (operatorText == "=" && IsOwningTempUniqueFieldEscape(rightNV))
+            {
+                RejectOwningTempUniqueFieldEscape(rightNV, "a longer-lived location", ctx);
                 return right;
             }
 
@@ -17545,6 +17611,12 @@ public:
             else
                 RejectUniqueInterfaceFieldToField(rightNV, braceDesc, errCtx);
         }
+        // The BORROWING destination field, kept in lockstep with the `=` path: the temp's
+        // destructor dangles the pointee at end of statement whoever the destination is.
+        if (!braceDestOwnsPointee && !IsOwningUniqueInterfaceField(fieldType)
+            && IsOwningTempUniqueFieldEscape(rightNV))
+            RejectOwningTempUniqueFieldEscape(
+                rightNV, std::format("field '{}.{}'", typeName, fieldName), errCtx);
 
         llvm::Value* val = LoadNamedVariable(rightNV);
         if (!val) return false;
@@ -21515,8 +21587,23 @@ public:
                             // back to it (e.g. '(*p)++' increments the pointee, not a temp copy).
                             if (prevPrimary->expression() != nullptr)
                                 namedVar.Storage = lastParenExprStorage;
+                            // Restore the owning-temp provenance only when the inner expression
+                            // carried it, so no other parenthesized shape gains names it lacked.
+                            if (prevPrimary->expression() != nullptr && lastParenExprFromOwningTempField)
+                            {
+                                namedVar.FromOwningTempField = true;
+                                namedVar.OwningTempParent = lastParenExprOwningTempParent;
+                                namedVar.OwningStructName = lastParenExprOwningStructName;
+                                namedVar.FieldName = lastParenExprFieldName;
+                                namedVar.CallerName = lastParenExprCallerName;
+                            }
                             lastParenExprType = {};
                             lastParenExprStorage = nullptr;
+                            lastParenExprFromOwningTempField = false;
+                            lastParenExprOwningTempParent = false;
+                            lastParenExprOwningStructName.clear();
+                            lastParenExprFieldName.clear();
+                            lastParenExprCallerName.clear();
 
                             // A parenthesized expression yielding a known struct publishes its type
                             // and (for an lvalue) its storage through the side channel above, but
@@ -25627,6 +25714,11 @@ public:
         lastParenExprType.TypeName = tagName;
         lastParenExprType.Pointer = true;
         lastParenExprStorage = nullptr;
+        lastParenExprFromOwningTempField = false;
+        lastParenExprOwningTempParent = false;
+        lastParenExprOwningStructName.clear();
+        lastParenExprFieldName.clear();
+        lastParenExprCallerName.clear();
 
         // Launder ownership: the result is an unowned-by-tracker heap pointer the
         // caller manages (add to a parent or deleteTree), exactly like a factory such
@@ -25793,6 +25885,11 @@ public:
             ProcessPlusPlus();
             lastParenExprType = nv.TypeAndValue;
             lastParenExprStorage = nv.Storage;
+            lastParenExprFromOwningTempField = nv.FromOwningTempField;
+            lastParenExprOwningTempParent = nv.OwningTempParent;
+            lastParenExprOwningStructName = nv.OwningStructName;
+            lastParenExprFieldName = nv.FieldName;
+            lastParenExprCallerName = nv.CallerName;
             return LoadNamedVariable(nv);
         }
         else if (stringLiteral.size() > 0)

@@ -59,8 +59,11 @@ REVERTED - see its file for the three discriminators that cannot work.
 **2026-08-04: P1-to-zero release campaign in progress.** Goal: zero open P1s ahead of a release.
 The 6 open P1s (post re-bucket, see the 2026-08-04 recount below) are being driven through the
 `fix-issue` workflow (worktree, opus fix agent with coverage matrix, opus review loop, linear
-merge), roughly narrowest-first: `temp-unique-field-into-borrow-slot-use-after-free` and
-`code-value-into-data-pointer-outside-overload-resolution` in parallel worktrees first, then
+merge), roughly narrowest-first. `temp-unique-field-into-borrow-slot-use-after-free` is FIXED
+and deleted (see the landed design record below), but its round-1 review split out
+`temp-unique-field-escapes-through-unguarded-spellings` (P1, residue spellings) - so the P1
+count is back at 6, not 5, and the campaign is honest about it;
+`code-value-into-data-pointer-outside-overload-resolution` is in a parallel worktree, then
 `delete-of-untracked-pointer-copy-not-diagnosed`,
 `unique-field-global-struct-self-assign-false-positive`,
 `interface-field-self-assign-false-positive`, and last the deliberately-accepted runtime-index
@@ -201,7 +204,7 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
 | **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 6 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 43 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 44 |
 | **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 29 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
@@ -274,8 +277,9 @@ count-neutral for P1: one file out, and
 than left implicit when that fix was scoped to argument binding. It also added
 `p2/c-binder-misses-decorated-function-pointer-parameter`, found while verifying its oracle.
 
-Counts re-verified from disk on 2026-08-04 at the start of the P1-to-zero release campaign:
-**6 P1 / 43 P2 / 29 P3 / 7 UI = 85 total** (after this round's re-bucket). Both integrity checks
+Counts re-verified from disk on 2026-08-04 AT THE START of the P1-to-zero release campaign,
+BEFORE any campaign fix landed - history, superseded by the bucket table above:
+**6 P1 / 43 P2 / 29 P3 / 7 UI = 85 total** (after that round's re-bucket). Both integrity checks
 were re-run scriptably (extract `[[...]]` links per table section, diff against `ls` per bucket)
 and FOUR failures were found and fixed in this edit - the worst tally since the checks were
 introduced:
@@ -289,11 +293,14 @@ introduced:
   preventive `RegisterInterfaceBox` dedupe remainder is left).
 
 Net movement: no fixes this edit - bookkeeping only, so the true open-P1 count entering the
-campaign is **6**: `code-value-into-data-pointer-outside-overload-resolution`,
+campaign was **6**: `code-value-into-data-pointer-outside-overload-resolution`,
 `delete-of-untracked-pointer-copy-not-diagnosed`, `interface-field-self-assign-false-positive`,
 `temp-unique-field-into-borrow-slot-use-after-free`,
 `unique-field-global-struct-self-assign-false-positive`, and the runtime-index residue of
-`unique-field-to-field-array-element-receiver`.
+`unique-field-to-field-array-element-receiver`. The first campaign fix has since landed
+(`temp-unique-field-into-borrow-slot-use-after-free`), and its review split out one new P1
+(`temp-unique-field-escapes-through-unguarded-spellings`) plus one new P2
+(`lambda-body-owning-temp-never-destructed`), so the bucket table above reads **6 P1 / 44 P2**.
 
 ### P1 - wrong programs and crashes (`p1/`)
 
@@ -304,12 +311,13 @@ campaign is **6**: `code-value-into-data-pointer-outside-overload-resolution`,
 | [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. An interface-field-to-interface-field copy with the SAME field name on both sides is misread as a self-assign, suppressing the reject. **ATTEMPTED AND REVERTED 2026-08-01** - see the file for the three discriminators that cannot work (names, box storage, and a bare `Value` compare of the field address all fail at least one witness). A sound test needs real dataflow through the box to the underlying data pointer. |
 | [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. **NARROWED 2026-08-02** by `fix/uniq-array-elem`: root cause CONFIRMED by instrumentation (`FieldName`/`CallerName` name the CONTAINER, so `selfFieldAssign` swallowed a genuine two-owner store), and every element pair whose addresses are constant-provably different now rejects - local, generic-substituted, nested, array-as-field, through-pointer, view, and global arrays. BOTH copies of the name comparison were fixed; the second (`sameField`) also guards the reassignment-destruct, and fixing only the first traded an abort for a leak. Residue: any index not constant in the emitted IR - a runtime subscript, and a `const` integer (`const` is unenforced, so folding it would be unsound). |
 | [[unique-field-global-struct-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. `gA.slot = gB.slot` on two file-scope structs. **Mechanism CORRECTED 2026-08-02** (the first filing read optimized IR and blamed `destIsStructField`; at `--no-opt` that predicate is TRUE and the stack IS entered): a global-struct field read carries an EMPTY `CallerName`, so `selfFieldAssign` reads two different globals as one slot - the same failure as the interface receiver, through a third receiver kind. Renaming the fields apart rejects on both binaries. Closable by extending `ProvablyDifferentSlots` to distinct `GlobalVariable`/`AllocaInst` roots, which is sound but is a widening of a predicate every field store flows through - do it with its own sweep. |
-| [[temp-unique-field-into-borrow-slot-use-after-free]] | Use-after-free, compiles clean and exits 0 on both binaries. A temp's `unique` field bound into a NON-unique (borrow) slot with a destructor-less pointee: the temp's `Box` destructor frees the pointee before the load. No `unique` claim on the destination for a guard to key on. |
+| [[temp-unique-field-escapes-through-unguarded-spellings]] | Silent use-after-free, compiles clean and exits 0. The residue spellings `fix/temp-uniq-borrow` did NOT reach, all measured identical on `6e9ab46` and on the merged fix: a same-type C-style cast, a `??` join, a `?:` join, an ARRAY AGGREGATE initializer (`Node*[2] a = { makeBox().t, nullptr };` - not the `EmitOneFieldInit` path), and a call ARGUMENT that stores. The argument case is PARTLY closable - a `unique T*` or `move T*` parameter states the claim at the call site (both measured still broken); a plain `T*` parameter is the undecidable remainder. Fix order and per-spelling accept sets are in the file. Filed 2026-08-04 by the round-1 review. |
 
 ### P2 - false rejections, unavailable features, ownership holes (`p2/`)
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[lambda-body-owning-temp-never-destructed]] | ownership hole | LEAK, no diagnostic, identical on `6e9ab46` and the merged fix. `Lambda<Dt*()> f = () => makeDt().t;` prints `dtors=0` - the owning `Box` temp inside a lambda BODY is never registered/flushed, so its destructor never runs at all. The same body as a free function is rejected by the temp-escape gate. Not a missed guard: the lambda body does not run the statement-boundary owned-temp machinery, so the read carries no temp provenance for any guard to see. Fixing it will likely turn the leak into a use-after-free the gate then rejects - land both halves together. Filed 2026-08-04 by the round-1 review of `fix/temp-uniq-borrow`. |
 | [[chained-nullcoalesce-not-boxed-into-interface]] | false rejection | `take(z ?? y ?? a)` and `IShape j = z ?? y ?? a;` do not compile - the outer join's arm is the inner join's LOAD, which names no class. Spans EVERY position that boxes a `??` (decl-init, assignment, return, argument), so it predates the return/argument work. Fix at the ledger by splicing a nested join's arms. Filed 2026-07-31. |
 | [[pointer-arg-binds-by-value-class-param]] | miscompile | `byVal(a)` with a `Circle*` and a by-value `Circle` parameter scores a PERFECT match and lowers a raw pointer into a struct slot - module-verifier dump, NO source location, exit 1. `IsTypeMatch` compares TypeName and ignores `Pointer`; the sibling `IsTypePromotion` does gate on it. PRE-EXISTING and language-wide, no join involved. Scorer change - wide blast radius, wants the corpus sweep. Filed 2026-07-31. |
 | [[generic-wrapper-over-function-type-llvm-fatal]] | feature gap | `Box<function<int(int)>>` raises LLVM fatal `Cannot select: AArch64ISD::CALL` (exit 134) when the substituted field is INVOKED. Store-only may be fine - check that first. Borderline P1 (dies with no usable diagnostic); filed P2 because nothing lies to you. Filed 2026-07-31. |
@@ -2931,3 +2939,72 @@ Verified: batch `--check` (multi-file, both orders) shows no stale-registry leak
 `ResetForReanalysis`. Bar: macOS arm64 Release `./test.sh` 596 passed / 0 failed / 8 skipped,
 `example_mac.sh` 35 passed / 0 failed. Review: two opus rounds; round 1 found the class-rung
 scope defect (fixed as above), round 2 clean.
+
+## Landed: `fix/temp-uniq-borrow` (2026-08-04) - a temp's `unique` field may not escape the statement
+
+Closes [[temp-unique-field-into-borrow-slot-use-after-free]] (P1). `q.p = makeBox().t;` where
+`Node` has no destructor compiled clean, ran, printed `70` and exited 0 - the `70` was read out
+of memory the temp `Box`'s synthesized destructor had already freed.
+
+**Root cause, confirmed as filed.** All three persist-site rejects
+(`ParseAssignmentExpression`, `ParseDeclaration`'s decl-init, and the RETURN path) tested
+`rightNV.FromOwningTempField && IsOwningValueType(rightNV.TypeAndValue.TypeName)`. That type-name
+gate is true only when the POINTEE has a destructor; the pointer being freed belongs to the TEMP,
+not to the pointee's type, so a dtor-less pointee fell through every gate. The field-to-field
+reject declined correctly - the destination is a plain borrow, not a second owner.
+
+**The rule.** `IsOwningTempUniqueFieldEscape(nv)` = `FromOwningTempField && OwningTempParent &&
+!IsMove &&` (owning `unique` POINTER field, or owning `unique` INTERFACE field). It is applied at
+FIVE persist sites: the three above, plus `EmitOneFieldInit` (brace-init) and the INTERFACE
+decl-init branch (`IsFatInterfaceValue()`), neither of which had a leg of this family at all.
+Reads that do not persist never reach a persist site and are untouched.
+
+**The interface decl-init branch was missed on the first pass**, found by review: `IShape s =
+makeIBox().t;` takes its own branch of `ParseDeclaration`, so the guard sitting in that branch's
+ELSE never saw it and the program dispatched through a freed box. This is the "N-1 sites" failure
+mode this same test file already records twice; the destination wording ("an interface local") is
+what proves which of the two decl-init sites fired.
+
+**PARENTHESES defeated the whole gate**, also found by review - the issue file's own verbatim
+repro plus one token (`q.p = (makeBox().t);`) still use-after-freed. A parenthesized primary is
+rebuilt in `ParsePostfixExpression` from a side channel that carried only type and storage, so
+every provenance flag was dropped. Fixed by widening that side channel
+(`lastParenExprFromOwningTempField` and friends) rather than by touching the gate. The lessons
+file's syntax-axis note is exactly this: a construct's SPELLINGS are an axis separate from its
+types and scopes, and one token is enough.
+
+**Global scope is excluded on purpose.** `Node* gp = makeBox().t;` at file scope already had a
+truer diagnostic ("global variable initializer must be a compile-time constant"); the new guard
+fired first and MASKED it with a message naming a "local". Both decl-init call sites are gated on
+`!global_scope` so the pre-existing message survives.
+
+**`OwningTempParent` is the load-bearing half of the polarity.** `FromOwningTempField` alone is
+also set for a BORROWED element (`l.get(0).t`, an `alias` return), where nothing is freed at the
+end of the statement and binding to a local is legal - measured on both binaries. A gate keyed on
+`FromOwningTempField` alone would have false-rejected it; `Test/test_move.cb::
+temp_uniq_borrowed_elem_value` freezes that accept.
+
+**Ordering matters and was got wrong once.** The new leg sits AFTER the existing type-name leg at
+each of the three shared sites. Placed before it, a dtor-BEARING pointee took the new wording and
+three legs of `Test/errors/err_unique_borrow_into_field.cb` broke. Only two cells change wording
+for a dtor-bearing pointee, and both were ACCEPTED before (brace-init into a borrowing field, and
+a `unique IShape` temp field into a plain interface field) - pure tightenings.
+
+**Measurement method worth reusing.** `MallocScribble=1` on macOS turns this whole family from
+"prints a plausible value" into a one-bit discriminator: a use-after-free read returns
+`1431655765` (the 0x55 fill). Every cell of the coverage matrix was classified with it.
+
+**Deliberately NOT closed**, each pre-existing and measured identical on both binaries: a
+same-type C-style cast, a `??` join, a `?:` join, an ARRAY AGGREGATE initializer, and a call
+ARGUMENT that stores. All five are filed together as
+[[temp-unique-field-escapes-through-unguarded-spellings]] (P1) with a measured pre/post pair
+each and a fix order. Correction to the round-1 framing: the argument case is **partly**
+closable, not indistinguishable - a `unique T*` or `move T*` parameter states the ownership
+claim at the call site (both measured still broken); only a plain `T*` parameter is undecidable
+there. Separately, [[lambda-body-owning-temp-never-destructed]] (P2) records that an owning temp
+in a LAMBDA body is never destructed at all - a leak with a different root, which no guard can
+see because the provenance is never set.
+
+Bar: macOS arm64 Release `./test.sh` 598 passed / 0 failed / 8 skipped, `example_mac.sh` 35 passed
+/ 0 failed, `leaks --atExit` on `Test/test_move.cb` unchanged at 13 leaks / 256 bytes across
+(pre-binary, pre-tests), (post-binary, pre-tests) and (post-binary, post-tests).

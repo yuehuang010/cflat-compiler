@@ -3680,6 +3680,90 @@ int testUniqueFieldStoreRemedies()
     return passed;
 }
 
+// A dtor-LESS pointee in a generic `unique` slot - the shape the temp-escape gate is written
+// for (Test/errors/err_unique_borrow_into_field.cb rejects the persisting spellings). None of
+// the legs below persist the field past its statement, so every one must keep compiling and
+// reading live memory. `PodItem` has no destructor, so dtorCount cannot speak for it; the
+// observable resource assertion for the family is the `Resource` leg at the end plus this
+// file's `leaks --atExit` allocation count.
+struct PodItem { int id = 0; };
+
+MoveBox<unique PodItem*> makePodBox()
+{
+    MoveBox<unique PodItem*> b = default;
+    b.t = new PodItem();
+    b.t->id = 61;
+    return b;
+}
+
+// An owning temp carrying a BORROWING pointer field alongside its owning one. Reading the
+// borrow out is legal - the temp's synthesized destructor never frees that field.
+struct PodPair { unique PodItem* own = nullptr; PodItem* borrow = nullptr; };
+
+PodItem* podKeeper = nullptr;
+
+PodPair makePodPair()
+{
+    PodPair p = default;
+    p.own = new PodItem();
+    p.borrow = podKeeper;
+    return p;
+}
+
+int testTempUniqueFieldBorrowAccepts()
+{
+    int passed = 0;
+
+    // Reading THROUGH the temp's unique field does not outlive the statement: still legal.
+    int v0 = makePodBox().t->id;
+    passed += Test("temp_uniq_field_read_value", v0, 61);
+
+    // The remedy the reject names: bind the whole call result to a local, then read the field
+    // off that local. The local owns the box, so the pointee outlives the statement legally.
+    {
+        MoveBox<unique PodItem*> b = makePodBox();
+        passed += Test("temp_uniq_field_bound_local_value", b.t->id, 61);
+        PodItem* p = b.t;
+        passed += Test("temp_uniq_field_local_borrow_value", p->id, 61);
+    }
+
+    // A BORROWED element (`l.get(0).t`, an `alias` return) leaves OwningTempParent clear:
+    // nothing is freed at the end of this statement, the LIST still owns the pointee, and
+    // binding it to a local is legal. This is the polarity leg - a gate keyed on
+    // FromOwningTempField alone (which is set here too) would false-reject it.
+    {
+        list<MoveBox<unique PodItem*>> l;
+        MoveBox<unique PodItem*> b = default;
+        b.t = new PodItem();
+        b.t->id = 62;
+        l.add(move b);
+        PodItem* e = l.get(0).t;
+        passed += Test("temp_uniq_borrowed_elem_value", e->id, 62);
+        passed += Test("temp_uniq_borrowed_elem_live", l.get(0).t->id, 62);
+    }
+
+    // A NON-unique pointer field of an owning temp: the temp's destructor does not free it, so
+    // binding it to a local is legal even though the read carries the temp provenance.
+    podKeeper = new PodItem();
+    podKeeper->id = 63;
+    {
+        PodItem* borrowed = makePodPair().borrow;
+        passed += Test("temp_plain_field_borrow_value", borrowed->id, 63);
+    }
+    delete podKeeper;
+    podKeeper = nullptr;
+
+    // The same read shape with a dtor-BEARING pointee, so the free is observable: the read is
+    // legal, sees the live value, and the temp frees its pointee exactly once at the end of
+    // the statement - no early free before the read, nothing left over after.
+    dtorCount = 0;
+    int seen = makeMoveBox().t->id;
+    passed += Test("temp_uniq_field_read_resource_value", seen, 44);
+    passed += Test("temp_uniq_field_read_freed_once", dtorCount, 1);
+
+    return passed;
+}
+
 int testDiscardMoveReturningCall()
 {
     int passed = 0;
@@ -4314,6 +4398,9 @@ extern int main()
 
     passed += testUniqueFieldStoreRemedies();
     total += 20;
+
+    passed += testTempUniqueFieldBorrowAccepts();
+    total += 8;
 
     passed += testUniqueArrayElementFieldStore();
     total += 24;
