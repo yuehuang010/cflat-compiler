@@ -80,7 +80,7 @@ The REJECT half is guarded ONLY by `Test/errors/err_unique_array_element_field_t
 a full revert to the pre-fix compiler ZERO value legs fail, because the binary aborts before
 producing leg output at all. Do not read the value legs as protecting the rejection.
 
-## What REMAINS - the runtime-index shape, deliberately accepted
+## What REMAINS - the runtime-index shape within ONE array, deliberately accepted
 
 ```cflat
 int gfreed = 0;
@@ -110,7 +110,16 @@ shapes are value-asserted in `Test/test_move.cb::testUniqueArrayElementFieldStor
 (`uae_rt_self_*`, `uae_rt_diff_*`, `uae_const_self_*`, `uae_ptr_rt_self_*`); an over-broad
 polarity was mutation-tested against them and all four flipped to compile errors.
 
-Closing the residue needs a runtime owner check, not a stronger compile-time proof - i.e. the
+**Narrowed again 2026-08-04 by `fix/uniq-global`.** The residue is no longer "any index not
+constant in the emitted IR": it now excludes the pair of DISTINCT GLOBAL arrays.
+`gArrA[i].slot = gArrB[j].slot` on two different file-scope arrays flipped accept -> reject
+there (measured: accepted and aliased on `a846e6e`), since the distinct-roots arm proves two
+objects apart without looking at the indices at all. Two distinct LOCAL arrays already rejected
+before that change - their `CallerName`s differ - so nothing moved for them. What is left is
+strictly the ONE-array case above, where a single root leaves nothing to prove, and that is
+exactly the case where `i` and `j` may be equal.
+
+Closing that needs a runtime owner check, not a stronger compile-time proof - i.e. the
 store would have to compare the two slot addresses and skip when equal, which is a different
 piece of work (a codegen change with a cost, not a diagnostic).
 
@@ -144,16 +153,14 @@ enforced first; that is a language change, not a widening of this guard.
 
 ## Also out of scope
 
-- The GLOBAL NAMED struct receiver (`gA.slot = gB.slot` on two file-scope `Holder`s) aborts 134
-  undiagnosed on both binaries. Same mechanism as here - a global-struct field read carries an
-  EMPTY `CallerName`, so `selfFieldAssign` reads two globals as one slot - but the addresses have
-  two DISTINCT roots, which this fix's proof deliberately does not treat as different. Filed
-  separately as [[unique-field-global-struct-self-assign-false-positive]]. That file now records
-  WHY the name is empty: globals resolve through `globalNamedVariable` (name -> `GlobalVariable*`)
-  rather than through the scope stack (name -> `NamedVariable`, which carries `Storage`), so the
-  receiver kind has no `NamedVariable` representation to hold an identity. Its preferred fix is
-  to give globals that representation - additive, and it makes the address proof built here cover
-  the global case with no change to the predicate.
+- The GLOBAL NAMED struct receiver (`gA.slot = gB.slot` on two file-scope `Holder`s) was out of
+  scope here because its addresses have two DISTINCT roots, which this fix's proof deliberately
+  did not treat as different. **FIXED 2026-08-04** by `fix/uniq-global`, which added
+  `ProvablyDifferentObjects` beside the same-root offset rule: two distinct `AllocaInst`s /
+  `GlobalVariable`s are distinct objects whatever the indices in between. The runtime-index
+  residue below is untouched by it - a single array has ONE root, so the new arm cannot fire.
+  See the landed design record in [[interface-issue-queue]], including why that change did NOT
+  give globals a `CallerName` (the empty string is load-bearing at two funcptr checks).
 - The INTERFACE receiver of the same mechanism is its own open file
   ([[interface-field-self-assign-false-positive]]) and is unchanged in both directions: its
   repro still aborts and both of its must-keep-working witnesses still work. An interface field

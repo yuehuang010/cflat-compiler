@@ -58,9 +58,9 @@ REVERTED - see its file for the three discriminators that cannot work.
 
 **2026-08-04: P1-to-zero release campaign in progress.** Goal: zero open P1s ahead of a release.
 The open P1s are being driven through the `fix-issue` workflow (worktree, opus fix agent with
-coverage matrix, opus review loop, linear merge), roughly narrowest-first. **The count is 6 as of
-this edit, and the campaign is honest about why it keeps not falling**: THREE campaign fixes have
-now landed and each one's review split out a residue P1, so the table has gone 6 -> 6 -> 6 -> 6
+coverage matrix, opus review loop, linear merge), roughly narrowest-first. **The count is 5 as of
+this edit, and the campaign is honest about why it took four fixes to fall**: the first THREE
+campaign fixes each had a review that split out a residue P1, so the table went 6 -> 6 -> 6 -> 6
 rather than 6 -> 5 -> 4 -> 3. `temp-unique-field-into-borrow-slot-use-after-free` is FIXED and
 deleted, and its round-1 review split out `temp-unique-field-escapes-through-unguarded-spellings`;
 `delete-of-untracked-pointer-copy-not-diagnosed` is FIXED and deleted, and its round-1 review split
@@ -69,10 +69,11 @@ measured, plus a `?:` join spelling the reviewer found);
 `code-value-into-data-pointer-outside-overload-resolution` is FIXED and deleted, and its round-1
 review split out [[join-erases-code-value-evidence-at-every-gate]] (a `?:`/`??` join erases the
 source evidence every code-value predicate reads, which defeats the already-landed ARGUMENT gate as
-well as the store sites). All three design records are below. The count will move again when the
-parallel branches land, so re-derive it from `ls internal/issue/p1/` rather than trusting this
-sentence. Remaining, in order:
-`unique-field-global-struct-self-assign-false-positive`,
+well as the store sites). **`unique-field-global-struct-self-assign-false-positive` is the FOURTH
+campaign fix and the first whose review split out nothing, so the count now falls: 6 -> 5 as of
+this edit.** All four design records are below. The count will move again when the parallel
+branches land, so re-derive it from `ls internal/issue/p1/` rather than trusting this sentence.
+Remaining, in order:
 `interface-field-self-assign-false-positive`, and last the deliberately-accepted runtime-index
 residue of `unique-field-to-field-array-element-receiver` (decision needed: runtime owner check
 vs re-rank, per its own file). Progress is tracked by row deletion here, as always.
@@ -210,7 +211,7 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 6 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 5 |
 | **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 44 |
 | **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 29 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
@@ -334,6 +335,15 @@ adding `lambda-body-owning-temp-never-destructed`; this change adds no P2). Two 
 filed, net zero - which is the pattern this file has now recorded four times, and the reason the
 campaign is tracked by row deletion rather than by the count.
 
+**Recount 2026-08-04, after `unique-field-global-struct-self-assign-false-positive` landed:** its
+file is deleted and its P1 row removed, and its round-1 review filed NOTHING new - the FOURTH
+campaign fix, and the first that actually moves the count: **5 P1 / 44 P2 / 29 P3 / 7 UI = 85
+total**, so the net-zero pattern above is broken rather than repeated a fifth time. Both integrity
+checks were re-run scriptably against this tree (every row resolves to a file, every file has a
+row, per bucket) and are clean. See the landed design record below for why the file's preferred
+step 1 (give a global receiver a `NamedVariable` identity) was NOT taken - its premise was
+measurably wrong - and for the one other behaviour change the change carries.
+
 ### P1 - wrong programs and crashes (`p1/`)
 
 | Issue | Severity |
@@ -341,8 +351,7 @@ campaign is tracked by row deletion rather than by the count.
 | [[pointer-copy-propagates-no-ownership-fact]] | Four silent double frees (exit 134), no diagnostic, all identical on `312d202` and on the merged `fix/untracked-copy`. A pointer DECLARATION copies the VALUE and nothing else, so every ownership fact a source binding carries needs its own hand-written clause at the decl-init site and any fact without one vanishes across the copy. Live members: a copy stored into a `unique` FIELD; a one-hop copy of a container-ELEMENT borrow (the direct spelling rejects); `T* d = move b;` off a copy (whose `delete b;` twin now rejects, so the two spellings disagree); and a `?:` join into a pointer declaration (whose DIRECT boxed spelling rejects). Fix direction: one clause per fact, recorded by storage identity and re-asked for liveness at the consumer, exactly like `BorrowsOwningLocal`. Each needs its own accept set first - (a) and (b) both have sole-owner shapes where a rejection would LEAK. Filed 2026-08-04 by the round-1 review of `fix/untracked-copy`. |
 | [[join-erases-code-value-evidence-at-every-gate]] | Exit 138, no diagnostic, on `6e9ab46`, on `a846e6e` and on `fix/codeval-store` (re-measured per spelling after the rebase). `Rec* r = c ? w : n;`, `Rec* r = n ?? w;` and - the telling one - `lam(c ? w : n)` into a `Rec*` PARAMETER, which the ARGUMENT gate `fix/funcptr-rebind` landed diagnoses in the bare spelling. A join produces a bare `llvm::Value` (a PHI, or a load out of a slot for `??`) carrying no TypeName, no recorded signature and no `llvm::Function` Primary, so every code-value predicate reads false before any gate runs. NOT the store defect: there the destination reader was missing; here the SOURCE evidence is erased. Fix by record-then-resolve, ledgering code-ness by value identity exactly as `fatInterfaceValueTypeNames_` does, and serving all three gates from it. Filed 2026-08-04 by `fix/codeval-store`. |
 | [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. An interface-field-to-interface-field copy with the SAME field name on both sides is misread as a self-assign, suppressing the reject. **ATTEMPTED AND REVERTED 2026-08-01** - see the file for the three discriminators that cannot work (names, box storage, and a bare `Value` compare of the field address all fail at least one witness). A sound test needs real dataflow through the box to the underlying data pointer. |
-| [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. **NARROWED 2026-08-02** by `fix/uniq-array-elem`: root cause CONFIRMED by instrumentation (`FieldName`/`CallerName` name the CONTAINER, so `selfFieldAssign` swallowed a genuine two-owner store), and every element pair whose addresses are constant-provably different now rejects - local, generic-substituted, nested, array-as-field, through-pointer, view, and global arrays. BOTH copies of the name comparison were fixed; the second (`sameField`) also guards the reassignment-destruct, and fixing only the first traded an abort for a leak. Residue: any index not constant in the emitted IR - a runtime subscript, and a `const` integer (`const` is unenforced, so folding it would be unsound). |
-| [[unique-field-global-struct-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. `gA.slot = gB.slot` on two file-scope structs. **Mechanism CORRECTED 2026-08-02** (the first filing read optimized IR and blamed `destIsStructField`; at `--no-opt` that predicate is TRUE and the stack IS entered): a global-struct field read carries an EMPTY `CallerName`, so `selfFieldAssign` reads two different globals as one slot - the same failure as the interface receiver, through a third receiver kind. Renaming the fields apart rejects on both binaries. Closable by extending `ProvablyDifferentSlots` to distinct `GlobalVariable`/`AllocaInst` roots, which is sound but is a widening of a predicate every field store flows through - do it with its own sweep. |
+| [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. **NARROWED 2026-08-02** by `fix/uniq-array-elem`: root cause CONFIRMED by instrumentation (`FieldName`/`CallerName` name the CONTAINER, so `selfFieldAssign` swallowed a genuine two-owner store), and every element pair whose addresses are constant-provably different now rejects - local, generic-substituted, nested, array-as-field, through-pointer, view, and global arrays. BOTH copies of the name comparison were fixed; the second (`sameField`) also guards the reassignment-destruct, and fixing only the first traded an abort for a leak. **Narrowed again 2026-08-04** by `fix/uniq-global`, whose distinct-roots arm also closes the two-DISTINCT-GLOBAL-array pair (`gArrA[i].slot = gArrB[j].slot`, measured accepted-and-aliasing before it). Residue: a non-constant index within ONE array - a runtime subscript, and a `const` integer (`const` is unenforced, so folding it would be unsound). |
 | [[temp-unique-field-escapes-through-unguarded-spellings]] | Silent use-after-free, compiles clean and exits 0. The residue spellings `fix/temp-uniq-borrow` did NOT reach, all measured identical on `6e9ab46` and on the merged fix: a same-type C-style cast, a `??` join, a `?:` join, an ARRAY AGGREGATE initializer (`Node*[2] a = { makeBox().t, nullptr };` - not the `EmitOneFieldInit` path), and a call ARGUMENT that stores. The argument case is PARTLY closable - a `unique T*` or `move T*` parameter states the claim at the call site (both measured still broken); a plain `T*` parameter is the undecidable remainder. Fix order and per-spelling accept sets are in the file. Filed 2026-08-04 by the round-1 review. |
 
 ### P2 - false rejections, unavailable features, ownership holes (`p2/`)
@@ -490,6 +499,69 @@ tests - now live in [`internal/fix-issue-lessons.md`](../fix-issue-lessons.md). 
 out of this file because they outlive every issue in it.
 
 ## Landed design records
+
+### fix/uniq-global - two distinct STACK-or-GLOBAL roots proved different (RATIFIED)
+
+Closes [[unique-field-global-struct-self-assign-false-positive]]. `gA.slot = gB.slot` on two
+file-scope structs compiled clean and aborted at teardown (exit 134) with no diagnostic; the same
+copy between two LOCAL holders rejected. The corrected mechanism in the issue file held exactly:
+the guard stack IS entered, and `selfFieldAssign` suppressed it because a global-struct field read
+carries an EMPTY `CallerName`, so two different globals compared equal on caller + field name.
+
+**The issue file's PREFERRED step 1 was not taken, because its premise is false.** It said globals
+have no `NamedVariable` representation at all, so giving them one would be additive and would let
+the existing root proof cover the repro. Measured on `a846e6e`: `GetGlobalVariableNV`
+(`LLVMBackend.h`) already builds a `NamedVariable` for a global and already populates `Storage`
+with the `GlobalVariable*`, which is what `ProvablyDifferentSlots` consumes - so "once globals
+carry Storage the existing proof covers this" was already true of `Storage` and still did not fire.
+The only thing missing was `CallerName`, and setting it is NOT additive: the empty string is
+load-bearing at several sites that read `!CallerName.empty() && FindVariableStorage(CallerName) ==
+nullptr` as "this is a call result, not a named variable" (`LLVMBackend.h:17605`, `:17963`) - a
+global satisfies both halves, so those funcptr checks would start firing on globals - and a dozen
+diagnostics print `CallerName` in preference to the type name. Step 2 was taken instead.
+
+The proof: `ProvablyDifferentObjects` (`cflat/MainListener.h`) strips the whole GEP chain off each
+address and answers true when the two roots are DISTINCT and each is an `AllocaInst` or a
+`GlobalVariable` - two such objects are distinct objects in LLVM whatever the indices in between.
+It is keyed on the root KIND, never on `Value*` inequality alone; a `LoadInst` root (a pointer
+receiver, an array view) is not admitted, which is what `SameLoadedPointer` exists for and why
+`gA.slot = pa->slot` with `pa = &gA` is untouched. `ProvablyDifferentSlots` consults it first and
+otherwise keeps the same-root constant-offset rule unchanged, so the runtime-index residue of
+[[unique-field-to-field-array-element-receiver]] stays accepted by construction.
+
+ONE other behaviour change, sound and recorded rather than left implicit: two DISTINCT GLOBAL
+arrays with runtime indices (`gArrA[i].slot = gArrB[j].slot`) flip accept -> reject, because two
+globals are two objects whatever the indices. Measured accepted-and-aliasing on `a846e6e`. Two
+distinct LOCAL arrays already rejected (their `CallerName`s differ), and the ONE-array runtime
+pair is untouched - that file's residue framing is amended to say so.
+
+Both halves of the guard move together, as they must: `selfFieldAssign` (the diagnostic) and
+`sameFieldStore` (which EMITS the reassignment-destruct and the auto copy). The store half was
+independently broken for globals and is what the owning-VALUE legs pin - `gGB1.f = gGB2.f` on two
+global holders of a counting-destructor value measured ZERO destructs and aborted, where the
+identical local spelling destructs once. Distinct alloca/global roots satisfy
+`AddressRootIsStackOrGlobal` by construction, so the `-Initialized` form gains nothing extra here.
+
+Evidence: a 27-cell receiver-kind matrix in `scratch/ugs_*` (global-to-global, nested, namespaced,
+class, global array, through-pointer, global-to-local, local-to-global, `move` spelling, plain
+non-owning fields, and owning-VALUE `string` / counting-destructor twins, each with local oracles);
+`--check` differential sweep over 446 `.cb` in `Test/`, `example/` and `core/` with 29 diffs, ALL of
+them the binary's own core path inside an "imported file not found" message and zero behavioural;
+compile+run A/B over the 45 top-level `Test/*.cb` with 8 diffs - 4 nondeterministic (an address, a
+concurrent-btree restart count, a cycle counter, a `timeout` message for the Windows-only files) and
+one intended (`test_move.cb`). `leaks --atExit` on `test_move.cb` is 13 leaks / 256 bytes on both
+binaries with the baseline legs; the new legs add none (PRE with the new legs measures 15 / 288).
+
+Legs: `Test/test_move.cb::testUniqueGlobalReceiverFieldStore` (15 value legs - self-assign on one
+global, namespaced, nested, the owning-VALUE destruct count, the owning-VALUE self-assign, and a
+`string` field pair) and three scoped `expect_error` legs in
+`Test/errors/err_unique_array_element_field_to_field.cb` (global-to-global, nested, namespaced),
+each mutation-tested individually to a self-assign and each flipping the file to exit 1.
+
+KNOWN LIMIT, deliberate: the message still names the source as `'slot'` with no caller, because
+the caller name genuinely is not available for a global receiver. That is the same wording the
+global-into-local form already produced, and the remedy correctly degrades to "prefix the source
+expression with 'move'" rather than naming an expression that would not compile.
 
 ### fix/untracked-copy - the copy of an owning local aliased at its DECLARATION (RATIFIED)
 

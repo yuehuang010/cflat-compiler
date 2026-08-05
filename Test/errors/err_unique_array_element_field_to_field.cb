@@ -23,6 +23,14 @@ struct Outer { Holder[2] arr = default; };
 
 Holder[2] gArr = default;
 
+struct GlobOuter { Holder inner = default; };
+
+Holder gNamedA = default;
+Holder gNamedB = default;
+GlobOuter gOuter1 = default;
+GlobOuter gOuter2 = default;
+namespace GlobNS { Holder gA = default; Holder gB = default; }
+
 // The filed spelling: a plain local array, two constant indices.
 expect_error("cannot store unique field 'arr[1].slot' into unique field 'Holder.slot'") {
     void elemToElem()
@@ -103,6 +111,40 @@ expect_error("cannot store unique field 'gArr[1].slot' into unique field 'Holder
         gArr[0].slot = new Node();
         gArr[1].slot = new Node();
         gArr[0].slot = gArr[1].slot;
+    }
+}
+
+// Two GLOBAL NAMED structs. A global resolves through globalNamedVariable, which carries no
+// CallerName, so both sides reported caller "" and field "slot" and read as one slot; the copy
+// compiled clean and aborted at teardown (exit 134) with no diagnostic. The proof that separates
+// them is the root KIND - two distinct GlobalVariables are distinct objects - so the message
+// still names the source without a caller ('slot'), exactly as the global-into-local form does.
+expect_error("cannot store unique field 'slot' into unique field 'Holder.slot'") {
+    void globalToGlobal()
+    {
+        gNamedA.slot = new Node();
+        gNamedB.slot = new Node();
+        gNamedA.slot = gNamedB.slot;
+    }
+}
+
+// The same pair reached through a NESTED global field: the chain is two GEPs deep on each side.
+expect_error("cannot store unique field 'slot' into unique field 'Holder.slot'") {
+    void globalNestedToGlobalNested()
+    {
+        gOuter1.inner.slot = new Node();
+        gOuter2.inner.slot = new Node();
+        gOuter1.inner.slot = gOuter2.inner.slot;
+    }
+}
+
+// NAMESPACE-qualified globals - a third spelling of the same empty-CallerName receiver.
+expect_error("cannot store unique field 'slot' into unique field 'Holder.slot'") {
+    void namespacedGlobalToGlobal()
+    {
+        GlobNS.gA.slot = new Node();
+        GlobNS.gB.slot = new Node();
+        GlobNS.gA.slot = GlobNS.gB.slot;
     }
 }
 

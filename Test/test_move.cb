@@ -3520,6 +3520,88 @@ struct ElemBuf
 };
 struct ElemBufHolder { ElemBuf f = default; };
 
+// GLOBAL (file-scope) struct receivers of the same field store. A global resolves through
+// globalNamedVariable, which carries no CallerName, so BOTH sides of `gA.slot = gB.slot`
+// reported caller "" and field "slot" and the whole guard stack was suppressed as a self-assign.
+struct GlobHolder { unique Resource* slot = nullptr; };
+GlobHolder gGH = default;
+struct GlobOuter { GlobHolder inner = default; };
+GlobOuter gGO = default;
+namespace GlobNS { GlobHolder gN = default; }
+struct GlobBufHolder { ElemBuf f = default; };
+GlobBufHolder gGB1 = default;
+GlobBufHolder gGB2 = default;
+struct GlobStrHolder { string s = default; };
+GlobStrHolder gGS1 = default;
+GlobStrHolder gGS2 = default;
+
+/*
+ * GLOBAL struct receivers of a `unique` / owning field store. Two DIFFERENT globals are two
+ * owners and must be rejected (pinned in Test/errors/err_unique_array_element_field_to_field.cb);
+ * a global assigned from ITSELF is one owner and must keep compiling with its exact free count.
+ * The owning-VALUE legs discriminate the store-side half of the guard, which EMITS the
+ * reassignment-destruct: before the fix a global-to-global copy of an owning value silently
+ * aliased (zero destructs) and aborted at teardown, where the local spelling destructs once.
+ */
+int testUniqueGlobalReceiverFieldStore()
+{
+    int passed = 0;
+
+    // A genuine self-assign on ONE global: one owner, value intact, nothing freed early.
+    dtorCount = 0;
+    gGH.slot = new Resource();
+    gGH.slot->id = 81;
+    gGH.slot = gGH.slot;
+    passed += Test("ugr_self_value", gGH.slot->id, 81);
+    passed += Test("ugr_self_no_early_free", dtorCount, 0);
+
+    // The same self-assign through a NAMESPACE-qualified global and through a NESTED global
+    // field - two more spellings of the empty-CallerName receiver.
+    dtorCount = 0;
+    GlobNS.gN.slot = new Resource();
+    GlobNS.gN.slot->id = 82;
+    GlobNS.gN.slot = GlobNS.gN.slot;
+    passed += Test("ugr_ns_self_value", GlobNS.gN.slot->id, 82);
+    passed += Test("ugr_ns_self_no_early_free", dtorCount, 0);
+
+    dtorCount = 0;
+    gGO.inner.slot = new Resource();
+    gGO.inner.slot->id = 83;
+    gGO.inner.slot = gGO.inner.slot;
+    passed += Test("ugr_nested_self_value", gGO.inner.slot->id, 83);
+    passed += Test("ugr_nested_self_no_early_free", dtorCount, 0);
+
+    // The store-side half: an owning VALUE field copied between two DIFFERENT globals must
+    // destruct the old destination exactly once and deep-copy, like the named-local spelling.
+    gGB1.f.b = "aa" + "bb";
+    gGB2.f.b = "cc" + "dd";
+    elemBufDtor = 0;
+    gGB1.f = gGB2.f;
+    passed += Test("ugr_val_reassign_destructs_old", elemBufDtor, 1);
+    passed += Test("ugr_val_reassign_dest", gGB1.f.b == "ccdd" ? 1 : 0, 1);
+    passed += Test("ugr_val_reassign_src_alive", gGB2.f.b == "ccdd" ? 1 : 0, 1);
+    // Independence, not just equal contents: overwriting the SOURCE after the copy must not
+    // reach the destination. A shallow alias reads "eeff" on both sides here.
+    gGB2.f.b = "ee" + "ff";
+    passed += Test("ugr_val_copy_independent_dest", gGB1.f.b == "ccdd" ? 1 : 0, 1);
+    passed += Test("ugr_val_copy_independent_src", gGB2.f.b == "eeff" ? 1 : 0, 1);
+
+    // The same owning value assigned from ITSELF is one owner: no destruct, buffer intact.
+    elemBufDtor = 0;
+    gGB1.f = gGB1.f;
+    passed += Test("ugr_val_self_no_destruct", elemBufDtor, 0);
+    passed += Test("ugr_val_self_intact", gGB1.f.b == "ccdd" ? 1 : 0, 1);
+
+    // A `string` field between two globals: the same store path with the stdlib owner.
+    gGS1.s = "ee" + "ff";
+    gGS2.s = "gg" + "hh";
+    gGS1.s = gGS2.s;
+    passed += Test("ugr_str_dest", gGS1.s == "gghh" ? 1 : 0, 1);
+    passed += Test("ugr_str_src_alive", gGS2.s == "gghh" ? 1 : 0, 1);
+
+    return passed;
+}
+
 /*
  * Array-ELEMENT receivers of a `unique` / owning field store. The reject added for
  * element-to-element copies must prove the two slots differ before firing, so every shape whose
@@ -4479,6 +4561,9 @@ extern int main()
 
     passed += testUniqueArrayElementFieldStore();
     total += 24;
+
+    passed += testUniqueGlobalReceiverFieldStore();
+    total += 15;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

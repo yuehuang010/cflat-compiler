@@ -232,8 +232,9 @@ rejecting, and accept whatever it cannot prove.
 
 The same empty-or-ambiguous `CallerName` root cause has now been measured in three receiver
 kinds: an ARRAY ELEMENT (`CallerName` names the container - closed for constant indices by
-`fix/uniq-array-elem`), a GLOBAL struct (`CallerName` empty - open, see
-[[unique-field-global-struct-self-assign-false-positive]]), and an interface field (this file).
+`fix/uniq-array-elem`), a GLOBAL struct (`CallerName` empty - closed 2026-08-04 by
+`fix/uniq-global`, which proved two distinct stack/global ROOTS apart rather than touching the
+name predicate), and an interface field (this file).
 
 They share a cause and do NOT share a remedy. The other two are reachable from the scope-stack
 identity the compiler already has: `stackNamedVariable` resolves a local to a `NamedVariable`

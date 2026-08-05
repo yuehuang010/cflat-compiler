@@ -11040,20 +11040,45 @@ public:
         return addr;
     }
 
-    /*
-     * True when an address bottoms out in a STACK or GLOBAL object, walking the whole GEP chain
-     * (an array element is two or more GEPs deep). Such storage is default/zero-initialized, so
-     * destructing the old value in a slot is safe. A chain rooted at a LOAD - a pointer receiver
-     * or an array view - is NOT, since a raw-malloc'd block holds uninitialized garbage and
-     * destructing that corrupts the heap. Same trade, and same polarity, as the closure store.
-     */
-    static bool AddressRootIsStackOrGlobal(llvm::Value* addr)
+    // The object an address bottoms out in, walking the whole GEP chain (an array element is two
+    // or more GEPs deep). The result is an alloca, a global, a load, or anything else.
+    static llvm::Value* StripAllGeps(llvm::Value* addr)
     {
-        if (addr == nullptr) return false;
+        if (addr == nullptr) return nullptr;
         addr = addr->stripPointerCasts();
         while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(addr))
             addr = gep->getPointerOperand()->stripPointerCasts();
-        return llvm::isa<llvm::AllocaInst>(addr) || llvm::isa<llvm::GlobalVariable>(addr);
+        return addr;
+    }
+
+    /*
+     * True when an address bottoms out in a STACK or GLOBAL object. Such storage is
+     * default/zero-initialized, so destructing the old value in a slot is safe. A chain rooted at
+     * a LOAD - a pointer receiver or an array view - is NOT, since a raw-malloc'd block holds
+     * uninitialized garbage and destructing that corrupts the heap. Same trade, and same
+     * polarity, as the closure store.
+     */
+    static bool AddressRootIsStackOrGlobal(llvm::Value* addr)
+    {
+        addr = StripAllGeps(addr);
+        return addr != nullptr
+            && (llvm::isa<llvm::AllocaInst>(addr) || llvm::isa<llvm::GlobalVariable>(addr));
+    }
+
+    /*
+     * PROOF that two addresses lie in DIFFERENT objects: each bottoms out in its own stack or
+     * global object, and two DISTINCT AllocaInsts / GlobalVariables are distinct objects in LLVM,
+     * whatever the indices in between. Keyed on the root KIND, never on Value* inequality alone -
+     * two LoadInsts can name one object, which is what SameLoadedPointer exists for.
+     */
+    static bool ProvablyDifferentObjects(llvm::Value* a, llvm::Value* b)
+    {
+        if (a == nullptr || b == nullptr || a == b) return false;
+        llvm::Value* rootA = StripAllGeps(a);
+        llvm::Value* rootB = StripAllGeps(b);
+        if (rootA == nullptr || rootB == nullptr || rootA == rootB) return false;
+        return (llvm::isa<llvm::AllocaInst>(rootA) || llvm::isa<llvm::GlobalVariable>(rootA))
+            && (llvm::isa<llvm::AllocaInst>(rootB) || llvm::isa<llvm::GlobalVariable>(rootB));
     }
 
     /*
@@ -11089,14 +11114,19 @@ public:
     }
 
     /*
-     * PROOF that two lvalues denote DIFFERENT slots: both flatten to the SAME root with
-     * all-constant offsets and those offsets DIFFER. A runtime subscript (`arr[i].slot`) leaves a
-     * non-constant index and answers false, so an unprovable pair stays treated as a self-assign -
-     * the polarity that makes an unseen case a missing diagnostic, never a false rejection.
+     * PROOF that two lvalues denote DIFFERENT slots: either they root in two distinct stack or
+     * global OBJECTS, or they flatten to the SAME root with all-constant offsets and those
+     * offsets DIFFER. A runtime subscript of ONE array (`arr[i].slot`) leaves a non-constant
+     * index off a single root and answers false, so an unprovable pair stays treated as a
+     * self-assign - the polarity that makes an unseen case a missing diagnostic, never a false
+     * rejection.
      */
     bool ProvablyDifferentSlots(llvm::Value* a, llvm::Value* b)
     {
         if (a == nullptr || b == nullptr || a == b) return false;
+        // Two different globals (or two different locals) named by a receiver kind whose
+        // CallerName is empty - a file-scope struct - are otherwise indistinguishable here.
+        if (ProvablyDifferentObjects(a, b)) return true;
         if (compilerLLVM == nullptr || compilerLLVM->module == nullptr) return false;
         const llvm::DataLayout& dl = compilerLLVM->module->getDataLayout();
         if (!a->getType()->isPointerTy() || !b->getType()->isPointerTy()) return false;
