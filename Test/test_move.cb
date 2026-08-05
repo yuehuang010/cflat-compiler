@@ -2211,6 +2211,62 @@ int hopReassignedBox(CiMove* p)
     return a;
 }
 
+// ---- Plain COPY of an OWNING LOCAL (`T* b = c;`), the RETIREMENT half of that guard. The reject
+// half is the copyOfOwner* legs in Test/errors/err_delete_borrowed_interface_box.cb. Both ends of
+// the alias retire the fact, and each of these programs frees every object exactly once on master
+// too - they exist to catch the guard growing one cell wider than the aliasing it can prove.
+
+// The COPY reassigned: `b` is the sole owner of its own allocation. The two objects carry different
+// `r`, so the returned sum proves both are live and distinct rather than one aliased twice.
+int copyOfOwnerReassignedCopy()
+{
+    CiMove* c = new CiMove();
+    CiMove* b = c;
+    b = new CiMove();
+    b->r = 3;
+    int a = b->area() + c->area();
+    delete b;
+    return a;
+}
+
+// The SOURCE reassigned instead: `c` owns a DIFFERENT object now, so `b` holds the ONLY reference
+// to the original and `delete b` is the only thing that frees it. Rejecting this would LEAK.
+int copyOfOwnerReassignedSource()
+{
+    CiMove* c = new CiMove();
+    CiMove* b = c;
+    c = new CiMove();
+    c->r = 4;
+    int a = b->area() + c->area();
+    delete b;
+    return a;
+}
+
+// The boxed spelling of the same retirement - the boxing proof and the raw guard must agree here
+// too, so a source reassignment leaves the box deletable.
+int copyOfOwnerReassignedSourceBox()
+{
+    CiMove* c = new CiMove();
+    CiMove* b = c;
+    c = new CiMove();
+    c->r = 5;
+    IShapeMove s = b;
+    int a = s.area() + c->area();
+    delete s;
+    return a;
+}
+
+// The copy is only READ and the OWNER is deleted, which is always correct. Tagging the copy must
+// not disturb the owner's own delete.
+int copyOfOwnerDeleteOwner()
+{
+    CiMove* c = new CiMove();
+    CiMove* b = c;
+    int a = b->area();
+    delete c;
+    return a;
+}
+
 // A `list<unique T*>` ELEMENT borrow reassigned to a fresh allocation before being boxed. The
 // element proof is REFRESHED by that same store (cleared, here), which is what makes it safe to
 // ask it ahead of the reassignment retirement - the ordering the borrowElemAssign leg pins from the
@@ -2710,6 +2766,25 @@ int testUniqueInterfaceTernary()
         delete kept;
         passed += Test("delete_box_hop_reassigned_freed_twice", dtorCount, 2);
     }
+
+    // Copy-of-an-owning-local retirement. Each leg's value pins WHICH objects were read (the
+    // reassigned object carries a distinct `r`), and the free counts pin that both objects are
+    // released exactly once - a leg checking only that these compile would miss the leak direction.
+    dtorCount = 0;
+    passed += Test("delete_copy_owner_reassign_copy_value", copyOfOwnerReassignedCopy(), 17);
+    passed += Test("delete_copy_owner_reassign_copy_freed_twice", dtorCount, 2);
+
+    dtorCount = 0;
+    passed += Test("delete_copy_owner_reassign_source_value", copyOfOwnerReassignedSource(), 18);
+    passed += Test("delete_copy_owner_reassign_source_freed_twice", dtorCount, 2);
+
+    dtorCount = 0;
+    passed += Test("delete_copy_owner_reassign_source_box_value", copyOfOwnerReassignedSourceBox(), 19);
+    passed += Test("delete_copy_owner_reassign_source_box_freed_twice", dtorCount, 2);
+
+    dtorCount = 0;
+    passed += Test("delete_copy_owner_delete_owner_value", copyOfOwnerDeleteOwner(), 7);
+    passed += Test("delete_copy_owner_delete_owner_freed_once", dtorCount, 1);
 
     dtorCount = 0;
     passed += Test("delete_box_elem_reassigned_value", elemBorrowReassignedBox(), 7);
@@ -4379,7 +4454,7 @@ extern int main()
     total += 8;
 
     passed += testUniqueInterfaceTernary();
-    total += 144;
+    total += 152;
 
     passed += testTernaryInterfaceInheritanceRebox();
     total += 22;

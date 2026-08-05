@@ -57,14 +57,18 @@ REVERTED - see its file for the three discriminators that cannot work.
 ## Resume point
 
 **2026-08-04: P1-to-zero release campaign in progress.** Goal: zero open P1s ahead of a release.
-The 6 open P1s (post re-bucket, see the 2026-08-04 recount below) are being driven through the
-`fix-issue` workflow (worktree, opus fix agent with coverage matrix, opus review loop, linear
-merge), roughly narrowest-first. `temp-unique-field-into-borrow-slot-use-after-free` is FIXED
-and deleted (see the landed design record below), but its round-1 review split out
-`temp-unique-field-escapes-through-unguarded-spellings` (P1, residue spellings) - so the P1
-count is back at 6, not 5, and the campaign is honest about it;
+The open P1s are being driven through the `fix-issue` workflow (worktree, opus fix agent with
+coverage matrix, opus review loop, linear merge), roughly narrowest-first. **The count is 6 as of
+this edit, and the campaign is honest about why it keeps not falling**: two campaign fixes have
+landed and each one's review split out a residue P1, so the table has gone 6 -> 6 -> 6 rather than
+6 -> 5 -> 4. `temp-unique-field-into-borrow-slot-use-after-free` is FIXED and deleted, and its
+round-1 review split out `temp-unique-field-escapes-through-unguarded-spellings`;
+`delete-of-untracked-pointer-copy-not-diagnosed` is FIXED and deleted, and its round-1 review split
+out `pointer-copy-propagates-no-ownership-fact` (the three sibling double frees its accept set
+measured, plus a `?:` join spelling the reviewer found). Both design records are below. The count
+will move again when the parallel branches land, so re-derive it from `ls internal/issue/p1/`
+rather than trusting this sentence.
 `code-value-into-data-pointer-outside-overload-resolution` is in a parallel worktree, then
-`delete-of-untracked-pointer-copy-not-diagnosed`,
 `unique-field-global-struct-self-assign-false-positive`,
 `interface-field-self-assign-false-positive`, and last the deliberately-accepted runtime-index
 residue of `unique-field-to-field-array-element-receiver` (decision needed: runtime owner check
@@ -300,13 +304,23 @@ campaign was **6**: `code-value-into-data-pointer-outside-overload-resolution`,
 `unique-field-to-field-array-element-receiver`. The first campaign fix has since landed
 (`temp-unique-field-into-borrow-slot-use-after-free`), and its review split out one new P1
 (`temp-unique-field-escapes-through-unguarded-spellings`) plus one new P2
-(`lambda-body-owning-temp-never-destructed`), so the bucket table above reads **6 P1 / 44 P2**.
+(`lambda-body-owning-temp-never-destructed`), so the bucket table above read **6 P1 / 44 P2**.
+
+**Recount 2026-08-04, after `delete-of-untracked-pointer-copy-not-diagnosed` landed:** its file is
+deleted and its P1 row removed, and its round-1 review filed one new P1 in the same commit -
+`pointer-copy-propagates-no-ownership-fact`, holding the four sibling double frees the fix's accept
+set measured and deliberately left alone (a copy stored into a `unique` FIELD, a one-hop copy of a
+CONTAINER-ELEMENT borrow, `T* d = move b;` off a copy, and a `?:` join into a pointer declaration -
+all four identical on `312d202` and on the merged fix). ONE OUT, ONE IN, so the bucket table still
+reads **6 P1 / 44 P2 / 29 P3 / 7 UI = 86 total** - the same net pattern as the codeval branch. They
+were filed rather than parked in the design record below because that section's own heading says
+"Nothing here is open", and three live silent double frees do not belong under it.
 
 ### P1 - wrong programs and crashes (`p1/`)
 
 | Issue | Severity |
 |---|---|
-| [[delete-of-untracked-pointer-copy-not-diagnosed]] | Silent double free (exit 134), no diagnostic. `Ci* b = c;` (or `alias Ci* b = c;`) off an owning local, then `delete b;` - the copy is neither `IsOwning` nor flagged as a borrow, so nothing distinguishes it from a legitimate owner. Not boxing-specific; the boxed spelling reaches the same hole. Fix direction: establish the borrow at the DECLARATION (set `IsBorrowed`/`BorrowedOrigin` when the initializer is a plain read of a live `IsOwning` binding), which both existing consumers already consult. Filed 2026-08-02; had no row here until 2026-08-04. |
+| [[pointer-copy-propagates-no-ownership-fact]] | Four silent double frees (exit 134), no diagnostic, all identical on `312d202` and on the merged `fix/untracked-copy`. A pointer DECLARATION copies the VALUE and nothing else, so every ownership fact a source binding carries needs its own hand-written clause at the decl-init site and any fact without one vanishes across the copy. Live members: a copy stored into a `unique` FIELD; a one-hop copy of a container-ELEMENT borrow (the direct spelling rejects); `T* d = move b;` off a copy (whose `delete b;` twin now rejects, so the two spellings disagree); and a `?:` join into a pointer declaration (whose DIRECT boxed spelling rejects). Fix direction: one clause per fact, recorded by storage identity and re-asked for liveness at the consumer, exactly like `BorrowsOwningLocal`. Each needs its own accept set first - (a) and (b) both have sole-owner shapes where a rejection would LEAK. Filed 2026-08-04 by the round-1 review of `fix/untracked-copy`. |
 | [[code-value-into-data-pointer-outside-overload-resolution]] | Exit 138, no diagnostic, identical on `904f026` and on `fix/funcptr-rebind`. `Rec* r = w;`, `return w;` and a `b.p = w;` field store all put a function-pointer VALUE into a data pointer and write through it. Recorded by review round 1 of `fix/funcptr-rebind`, which closed the OVERLOAD-BINDING path of the same defect class (`ComputeOverloadFunction` plus its variadic short-circuit) and deliberately did not reach the store paths - the shared predicates `ArgumentIsCodeValue` / `ParameterStoresData` exist, what is missing is a destination-side reader. Build the accept set first; an explicit cast must keep working. |
 | [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. An interface-field-to-interface-field copy with the SAME field name on both sides is misread as a self-assign, suppressing the reject. **ATTEMPTED AND REVERTED 2026-08-01** - see the file for the three discriminators that cannot work (names, box storage, and a bare `Value` compare of the field address all fail at least one witness). A sound test needs real dataflow through the box to the underlying data pointer. |
 | [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. **NARROWED 2026-08-02** by `fix/uniq-array-elem`: root cause CONFIRMED by instrumentation (`FieldName`/`CallerName` name the CONTAINER, so `selfFieldAssign` swallowed a genuine two-owner store), and every element pair whose addresses are constant-provably different now rejects - local, generic-substituted, nested, array-as-field, through-pointer, view, and global arrays. BOTH copies of the name comparison were fixed; the second (`sameField`) also guards the reassignment-destruct, and fixing only the first traded an abort for a leak. Residue: any index not constant in the emitted IR - a runtime subscript, and a `const` integer (`const` is unenforced, so folding it would be unsound). |
@@ -458,6 +472,67 @@ tests - now live in [`internal/fix-issue-lessons.md`](../fix-issue-lessons.md). 
 out of this file because they outlive every issue in it.
 
 ## Landed design records
+
+### fix/untracked-copy - the copy of an owning local aliased at its DECLARATION (RATIFIED)
+
+Closes [[delete-of-untracked-pointer-copy-not-diagnosed]]. `T* b = c;` and `alias T* b = c;` off a
+live owning local produced a binding with NO ownership fact at all, so `delete b;` and the boxed
+`IS s = b; delete s;` both compiled and double-freed (exit 134). Thirteen spellings did: the plain
+copy, the `alias` declaration, `auto`, a parenthesized initializer, a `using` type alias, two hops,
+a copy in a nested scope, each of their boxed twins, and a copy whose source is later `move`d out
+or deleted. Measured over a 62-cell corpus (13 changed, 49 byte-identical on both binaries).
+
+The aliasing is recorded where BOTH sides are in hand - the declaration - as its own pair,
+`NamedVariable::BorrowsOwningLocal` + `OwningLocalOrigin`, plus the source's SLOT in
+`OwningLocalStorage`. It is deliberately NOT `IsBorrowed`: that flag is read by roughly thirty
+sites (argument passing, returns, stores into `unique` fields, struct copies), and widening it
+would have changed all of them. `BorrowsOwnedElement` set the precedent and says so in its own
+comment. The decision is made by STORAGE IDENTITY (`FindVariableByStorage`), never by spelling, so
+a parenthesized or `auto` source resolves and a shadowing name cannot be mistaken for another
+binding. Consumers: the raw-delete guard in `ParseDeleteExpression` and
+`BindingKeepsOwnershipOfBoxedObject`, which use the SAME predicate, so the raw and boxed spellings
+reject exactly the same set and boxing cannot launder what `delete b;` rejects.
+
+**`alias` is NOT what arms this, and the issue file's fix direction was wrong on that point.** It
+said the `alias T* b = c;` spelling should set the flag unconditionally, "since `alias` is the user
+saying borrow out loud". Measured, that would have false-rejected three programs master compiles
+and frees correctly, each with a LEAKING remedy: `alias T* e = makeAliasT(); delete e;`,
+`alias T* e = makeMoveT(); delete e;` and `alias T* b = new T(); delete b;` - in all three the
+delete is the ONLY release, the same polarity error `IsAliasBorrow` was excluded from the boxing
+proof for. What arms it is the SOURCE being a live owning local; the `alias` spelling then falls
+out for free, because `alias T* b = c;` has the same source as `T* b = c;`.
+
+**The proof RETIRES at BOTH ends, and the source end was found by measurement, not reasoning.**
+The first cut checked only the copy's own `PointerRebound` and FALSE-REJECTED
+`T* c = new T(); T* b = c; c = new T(); delete b;` - a program master runs at one free per object,
+where reassigning the SOURCE leaves the copy holding the ONLY reference to the original, so the
+rejection's remedy ("delete `c` instead") would have freed the wrong object and leaked. Both ends
+are now re-asked at the delete site through `OwningLocalCopyStillAliases`, which resolves the
+recorded slot and requires that binding to STILL be a non-rebound owner. An unresolvable or dead
+source answers false - the accept direction. `Test/test_move.cb`'s `delete_copy_owner_reassign_*`
+legs pin all four retirement shapes with values and free counts; the reject half is the
+`copyOfOwner*` legs in `Test/errors/err_delete_borrowed_interface_box.cb`.
+
+Untouched by design, because none of them is an owning local: a LATE-ASSIGNED local
+(`T* c = nullptr; c = new T();` - the box is its only owner, the polarity error this family died
+on twice), a GLOBAL owning pointer (globals never scope-exit-free), an `alias`- or `move`-returning
+call result, a container element, a parameter (already rejected), and a `unique` local (already
+rejected). All measured accepted-and-correct on both binaries.
+
+**The neighbouring double frees this accept set measured are FILED, not parked here**, since this
+section's heading says nothing in it is open: [[pointer-copy-propagates-no-ownership-fact]] (P1)
+holds all four, with repros - a copy stored into a `unique` field, a one-hop copy of a
+container-element borrow, `T* d = move b;` off a copy, and a `?:` join into a pointer declaration.
+All four are the same missing propagation through a plain copy, each needing a different fact
+carried and its own accept set, which is why none was folded in here.
+
+**Stale blame, tolerated (P3-grade).** In the two cells where the source stops owning the object
+BEFORE the copy's delete - `T* d = move c;` and a preceding `delete c;` - the REJECTION is correct
+(the object is `d`'s, or already freed) but the message still names `c` as the live owner, and its
+"Delete 'c' instead" remedy frees nothing: measured `D=0`, rc 0 for the moved-from form and a
+no-op second delete for the other. The retirement check answers about the SLOT's binding, which is
+still owning in both. The sibling record documents the same tolerance for stale blame elsewhere in
+this proof; correct blame needs move/delete state threaded into the recheck.
 
 Nothing here is open. These accounts are kept because they explain WHY the shipped code has the
 shape it does, they record approaches that were tried and **must not be retried**, and they hold

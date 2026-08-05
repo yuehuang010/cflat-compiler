@@ -971,6 +971,15 @@ public:
         // elsewhere) rather than a container-owned unique element. Selects the delete message only.
         bool BorrowedElementExternallyOwned = false;
         std::string OwnedElementContainer; // container variable name, for the delete diagnostic
+        // compile-time: this pointer local's DECLARATION plainly copied a live OWNING local
+        // (`T* b = c;` / `alias T* b = c;`), which still frees the pointee at its own scope exit.
+        // Retired by PointerRebound like the other declaration-time facts. Kept off the general
+        // IsBorrowed path so it drives only the delete guards, not store/return/move diagnostics.
+        bool BorrowsOwningLocal = false;
+        std::string OwningLocalOrigin; // that owning binding's name, for the diagnostic
+        // The owning binding's SLOT, so the delete sites can re-ask whether it STILL owns. Rebinding
+        // the SOURCE (`c = new T();`) makes this copy the sole owner of what it holds.
+        llvm::Value* OwningLocalStorage = nullptr;
         llvm::Value* RefCountStorage = nullptr; // lazy i32 alloca at function entry; non-null only when pointer escaped to a field
         std::string CallerName;          // the variable's name at the call site, for move tracking
         std::string OwningStructName;    // when this NamedVariable is a struct-field access, the field's owning struct
@@ -21143,6 +21152,20 @@ public:
                 if (nv.Storage == slot) return &nv;
         }
         return nullptr;
+    }
+
+    /*
+     * True when a plain copy of an owning local (BorrowsOwningLocal) STILL aliases a live binding
+     * that owns the object. Both ends retire the fact: rebinding the COPY makes it the sole owner
+     * of what it now holds, and rebinding the SOURCE leaves the copy holding the only reference to
+     * the original. An unresolvable or dead source answers false - the accept direction.
+     */
+    bool OwningLocalCopyStillAliases(const NamedVariable& nv) const
+    {
+        if (!nv.BorrowsOwningLocal || nv.OwningLocalOrigin.empty()) return false;
+        if (nv.IsOwning || nv.PointerRebound) return false;
+        const NamedVariable* src = FindVariableByStorage(nv.OwningLocalStorage);
+        return src != nullptr && src->IsOwning && !src->PointerRebound;
     }
 
     std::string FindVariableNameByStorage(const llvm::Value* slot) const

@@ -19,11 +19,12 @@ legs in `Test/test_move.cb` (the must-still-work half, which asserts values and 
 ### The proof, and the negative that must never be used as one
 
 The rejection needs a POSITIVE proof of a NAMEABLE other owner, taken at the BOXING site while the
-source binding is still in hand. Six things count, in `BindingKeepsOwnershipOfBoxedObject`: the
+source binding is still in hand. Seven things count, in `BindingKeepsOwnershipOfBoxedObject`: the
 binding frees the object itself at scope exit (`IsOwning`); it reads a `unique` FIELD, whose
 synthesized destructor frees it; it borrows a CONTAINER's element; a proof PROPAGATED across an
 assignment from the RHS binding (`InheritedKeepsOwner`); it aliases a borrowed parameter
-(`IsBorrowed` with a named `BorrowedOrigin`); or it is a non-move pointer PARAMETER. It is recorded
+(`IsBorrowed` with a named `BorrowedOrigin`); it is a plain COPY of a still-live owning local
+(`BorrowsOwningLocal`, added by fix/untracked-copy); or it is a non-move pointer PARAMETER. It is recorded
 on the ledger as `InterfaceBoxRecord::SourceKeepsOwner`.
 
 `IsAliasBorrow` is excluded, measured false-rejecting a program master compiles and runs correctly:
@@ -127,12 +128,12 @@ reaches the delete - and it is the price of not false-rejecting the reverse orde
 
 ### Deliberately accepted, and not regressions
 
-- `T* c = new T(); T* b = c; IS s = b; delete s;` and the `alias T* b = c;` spelling still
-  double-free at runtime, exactly as on master. Filed as
-  [[delete-of-untracked-pointer-copy-not-diagnosed]] - the gap is not boxing-specific, the plain
-  `delete b;` spelling is equally undiagnosed, and closing it needs aliasing from `b` back to `c`.
-  The copy off a PARAMETER is a different case and IS rejected: it carries `IsBorrowed` with a
-  named origin, so there is a real proof to consult.
+- `T* c = new T(); T* b = c; IS s = b; delete s;` and the `alias T* b = c;` spelling were left
+  double-freeing here, and are now CLOSED - see the fix/untracked-copy design record in
+  [[interface-issue-queue]]. The aliasing is recorded at the DECLARATION as its own flag pair
+  (`BorrowsOwningLocal` + the source's slot), not by widening `IsBorrowed`, and it is a SEVENTH
+  clause of the proof below, asked with the declaration-time ones. It retires at BOTH ends: the
+  copy rebound, or the SOURCE rebound. The copy off a PARAMETER is still the separate case it was.
 - `IShapeB s = new Ci(); delete s; s = p; delete s;` - see the stickiness note above.
 - A plain `T* h` field whose holder has a HAND-WRITTEN destructor freeing it. Identical on master;
   no proof is available at the boxing site, since a plain field carries no ownership marker.

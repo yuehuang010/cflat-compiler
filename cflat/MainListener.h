@@ -9428,6 +9428,11 @@ public:
                 std::string srcBorrowedField;       // RHS field name, when the borrow came through a field read
                 bool srcIsOwningMove = false;       // RHS is an owning pointer (move param or alias thereof via cast)
                 std::string srcOwningName;          // name of the original owning source, for nulling on transfer
+                // RHS is a plain read of a live OWNING local (or of another such copy). See
+                // NamedVariable::BorrowsOwningLocal - the copy owns nothing, so deleting it double-frees.
+                bool srcBorrowsOwningLocal = false;
+                std::string srcOwningLocalOrigin;
+                llvm::Value* srcOwningLocalStorage = nullptr;
                 // Concrete type inferred from the initializer, used to resolve an 'auto'
                 // declaration's TypeName (LLVM opaque pointers cannot recover the pointee
                 // from the value type alone, so typeof/nameof need the name captured here).
@@ -9811,6 +9816,32 @@ public:
                                     && rightNV.Storage == nullptr
                                     && !rightNV.CallerName.empty();
                                 srcOwningName = rightNV.CallerName;
+                                // A plain copy of a live OWNING local: the source still frees the
+                                // pointee at its own scope exit, so the copy owns nothing. Resolved by
+                                // STORAGE IDENTITY (a spelling that erased CallerName still resolves,
+                                // and a shadowing name cannot be mistaken for another binding).
+                                if (!rightNV.TypeAndValue.IsMove && rightNV.TypeAndValue.Pointer
+                                    && llvm::isa_and_nonnull<llvm::AllocaInst>(rightNV.Storage))
+                                {
+                                    const auto* srcBind = compiler->FindVariableByStorage(rightNV.Storage);
+                                    if (srcBind != nullptr && srcBind->IsOwning)
+                                    {
+                                        srcBorrowsOwningLocal = true;
+                                        srcOwningLocalOrigin =
+                                            compiler->FindVariableNameByStorage(rightNV.Storage);
+                                        srcOwningLocalStorage = rightNV.Storage;
+                                    }
+                                    // One hop further (`T* d = b;`): carry the origin, unless the
+                                    // source was rebound since - then its declaration fact is stale.
+                                    else if (srcBind != nullptr && srcBind->BorrowsOwningLocal
+                                             && !srcBind->PointerRebound
+                                             && !srcBind->OwningLocalOrigin.empty())
+                                    {
+                                        srcBorrowsOwningLocal = true;
+                                        srcOwningLocalOrigin = srcBind->OwningLocalOrigin;
+                                        srcOwningLocalStorage = srcBind->OwningLocalStorage;
+                                    }
+                                }
                                 srcInferredTypeName = rightNV.TypeAndValue.TypeName;
                                 srcInferredPointer = rightNV.TypeAndValue.Pointer;
                                 srcInferredElemPointer = rightNV.TypeAndValue.ElemPointer;
@@ -10860,6 +10891,21 @@ public:
                                 nv.IsBorrowed = true;
                                 nv.BorrowedOrigin = srcBorrowedOrigin;
                                 nv.BorrowedUniqueField = srcBorrowedUniqueField;
+                            }
+                        }
+
+                        // Tag a plain copy of a live OWNING local so a later `delete` of it (raw or
+                        // through an interface box) is rejected. A genuine transfer (move/new) makes
+                        // this local IsOwning/IsNewAllocated above and is skipped.
+                        if (srcBorrowsOwningLocal && typeAndValue.Pointer
+                            && !srcOwningLocalOrigin.empty() && srcOwningLocalStorage != nullptr)
+                        {
+                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            if (!nv.IsOwning && !nv.IsNewAllocated)
+                            {
+                                nv.BorrowsOwningLocal = true;
+                                nv.OwningLocalOrigin = srcOwningLocalOrigin;
+                                nv.OwningLocalStorage = srcOwningLocalStorage;
                             }
                         }
 
@@ -12182,9 +12228,11 @@ public:
      * hand, so `alias T* e = makeT(); IS s = e; delete s;` is the CORRECT way to release it and
      * rejecting it both false-rejects and leaks.
      *
-     * An unannotated copy off an OWNING local (`T* b = c;`) and a local that received its `new` in
-     * a LATER statement are not proofs either: neither carries IsOwning, and for the late-assigned
-     * local the box is the ONLY owner.
+     * A local that received its `new` in a LATER statement is not a proof: it does not carry
+     * IsOwning, and the box is its ONLY owner. An unannotated copy off an OWNING local
+     * (`T* b = c;`) carries no IsOwning either, but IS a proof - established at its DECLARATION and
+     * re-asked here through OwningLocalCopyStillAliases, which requires the source to still be a
+     * live non-rebound owner. The two are only distinguishable at the declaration, not here.
      *
      * ORDER IS LOAD-BEARING below the IsOwning gate. The two clauses a plain '=' REFRESHES -
      * BorrowsOwnedElement (re-established by SetVariableBorrowsOwnedElement on that same store) and
@@ -12215,6 +12263,10 @@ public:
         // what makes it safe to consult here - `IS s = b;` must not launder what `delete b;` rejects.
         // Same pair of conditions the raw-delete guard uses, so the two spellings agree exactly.
         if (nv->IsBorrowed && !nv->BorrowedOrigin.empty()) return true;
+        // A plain copy of an OWNING local, established at ITS declaration - so it belongs below the
+        // retirement with the other declaration-time clauses. The raw `delete b;` guard uses the
+        // same pair of conditions, so the boxed and raw spellings reject exactly the same set.
+        if (compilerLLVM->OwningLocalCopyStillAliases(*nv)) return true;
         // Identity, never spelling: a local SHADOWING a parameter's name is a different binding.
         return !nv->TypeAndValue.IsMove
             && compilerLLVM->IsFunctionParameterStorage(nv->Storage);
@@ -12265,6 +12317,9 @@ public:
         if (!nv->BorrowedUniqueField.empty()) return std::format("'{}'", nv->BorrowedUniqueField);
         if (nv->IsBorrowed && !nv->BorrowedOrigin.empty())
             return std::format("'{}'", nv->BorrowedOrigin);
+        // A plain copy of an owning local: name the OWNER, never the copy holding it.
+        if (compilerLLVM->OwningLocalCopyStillAliases(*nv))
+            return std::format("'{}'", nv->OwningLocalOrigin);
         if (!nv->CallerName.empty()) return std::format("'{}'", nv->CallerName);
         auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(dataPtr);
         std::string name = load == nullptr
@@ -19179,6 +19234,25 @@ public:
                         "this pointer and will free it on scope exit. Declare the source parameter "
                         "'move {}' to take ownership.",
                         name, namedVar.BorrowedOrigin, namedVar.BorrowedOrigin));
+                return {};
+            }
+
+            // Error: deleting a plain copy of an OWNING local (`T* b = c;`, `alias T* b = c;`). The
+            // source still frees the pointee at its own scope exit, so this delete double-frees.
+            // Retired by any reassignment: a rebound copy is the sole owner of what it now holds.
+            if (compiler->OwningLocalCopyStillAliases(namedVar)
+                && namedVar.Storage != nullptr
+                && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
+            {
+                std::string name = namedVar.CallerName.empty()
+                    ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
+                if (name.empty()) name = "<expr>";
+                LogErrorContext(ctx, std::format(
+                    "cannot delete '{}' - it copies '{}', which still owns the object and frees it at "
+                    "scope exit, so this is a double-free. Delete '{}' instead, or use 'move {}' to "
+                    "take ownership out of it (which nulls it).",
+                    name, namedVar.OwningLocalOrigin, namedVar.OwningLocalOrigin,
+                    namedVar.OwningLocalOrigin));
                 return {};
             }
 

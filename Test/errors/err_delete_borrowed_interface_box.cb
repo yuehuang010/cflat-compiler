@@ -15,15 +15,13 @@
 // in a LATER statement, and that local is the box's ONLY owner, so deleting the box is correct.
 // The must-still-work half is the delete_box_* / delete_borrowed_box_* legs in Test/test_move.cb.
 //
-// KNOWN GAPS, deliberately accepted (both double-free at runtime on master and still do):
-//   CircleB* c = new CircleB(); CircleB* b = c;       IShapeB s = b; delete s;
-//   CircleB* c = new CircleB(); alias CircleB* b = c; IShapeB s = b; delete s;
-// An unannotated copy off an OWNING LOCAL and an `alias` LOCAL carry no borrow flag at all in this
-// compiler - the plain `delete b;` spelling of both is equally undiagnosed - so nothing at the
-// boxing site proves the object has another owner. Proving it needs aliasing from `b` back to `c`,
-// which does not exist here; rejecting on the guess would be the polarity error above. The same
-// copy off a PARAMETER is a different matter and IS rejected (sHop below): there the copy carries
-// IsBorrowed with a named origin, exactly what the raw `delete b;` guard already rejects on.
+// The plain COPY of an OWNING LOCAL (`CircleB* b = c;` and its `alias` spelling) was recorded here
+// as an accepted gap. It is CLOSED: the DECLARATION now records the aliasing that no later site
+// could reconstruct - BorrowsOwningLocal plus the source's SLOT - and the raw and boxed spellings
+// reject the same set (the copyOfOwner* legs below). It stays a POSITIVE proof: the source must
+// still be a LIVE owner at the delete, so reassigning either end retires it (Test/test_move.cb's
+// delete_copy_owner_reassign_* legs). A late-assigned local, a global, an `alias`/`move` return
+// result and a container element are not owning locals and stay accepted, exactly as before.
 
 interface IShapeB { int area(); };
 class CircleB : IShapeB { int r = 0; int area() { return r * r; } ~CircleB() {} };
@@ -232,6 +230,59 @@ expect_error("cannot delete interface 'sCoalesceElemJoin' - it boxes an object t
         IShapeB sCoalesceElemJoin = eh;
         delete sCoalesceElemJoin;
         return sCoalesceElemJoin.area();
+    }
+}
+
+// A plain COPY of an OWNING LOCAL. The source frees the pointee at its own scope exit, so the copy
+// owns nothing. This is the RAW spelling; the boxed twin is two legs below. The origin is recovered
+// from the source's SLOT, so the diagnostic names 'cOwner' and never the copy holding it.
+expect_error("cannot delete 'bCopy' - it copies 'cOwner'") {
+    int copyOfOwnerRaw()
+    {
+        CircleB* cOwner = new CircleB();
+        CircleB* bCopy = cOwner;
+        delete bCopy;
+        return bCopy->area();
+    }
+}
+
+// The `alias` DECLARATION spelling of the same copy. `alias` is NOT what arms this - the SOURCE
+// being a live owning local is - so `alias T* e = makeT();` off an `alias`/`move` RETURN stays
+// accepted (delete_box_alias_return_owner_* in Test/test_move.cb), where the delete is the ONLY
+// release and rejecting it would leak.
+expect_error("cannot delete 'bAliasCopy' - it copies 'cAliasOwner'") {
+    int copyOfOwnerAliasDecl()
+    {
+        CircleB* cAliasOwner = new CircleB();
+        alias CircleB* bAliasCopy = cAliasOwner;
+        delete bAliasCopy;
+        return bAliasCopy->area();
+    }
+}
+
+// The BOXED spelling. The raw guard and the boxing proof must reject the same set or boxing
+// launders what `delete bBoxCopy;` rejects - the failure the sHop leg above was written for.
+expect_error("cannot delete interface 'sOwnCopy' - it boxes an object that 'cBoxOwner' already frees") {
+    int copyOfOwnerBoxed()
+    {
+        CircleB* cBoxOwner = new CircleB();
+        CircleB* bBoxCopy = cBoxOwner;
+        IShapeB sOwnCopy = bBoxCopy;
+        delete sOwnCopy;
+        return sOwnCopy.area();
+    }
+}
+
+// TWO hops (`d = b = c`). The fact is carried across the second declaration from the first copy's
+// recorded slot, so the diagnostic still names the real owner and not the intermediate copy.
+expect_error("cannot delete 'dHopCopy' - it copies 'cHopOwner'") {
+    int copyOfOwnerTwoHops()
+    {
+        CircleB* cHopOwner = new CircleB();
+        CircleB* bHopCopy = cHopOwner;
+        CircleB* dHopCopy = bHopCopy;
+        delete dHopCopy;
+        return dHopCopy->area();
     }
 }
 
