@@ -59,16 +59,19 @@ REVERTED - see its file for the three discriminators that cannot work.
 **2026-08-04: P1-to-zero release campaign in progress.** Goal: zero open P1s ahead of a release.
 The open P1s are being driven through the `fix-issue` workflow (worktree, opus fix agent with
 coverage matrix, opus review loop, linear merge), roughly narrowest-first. **The count is 6 as of
-this edit, and the campaign is honest about why it keeps not falling**: two campaign fixes have
-landed and each one's review split out a residue P1, so the table has gone 6 -> 6 -> 6 rather than
-6 -> 5 -> 4. `temp-unique-field-into-borrow-slot-use-after-free` is FIXED and deleted, and its
-round-1 review split out `temp-unique-field-escapes-through-unguarded-spellings`;
+this edit, and the campaign is honest about why it keeps not falling**: THREE campaign fixes have
+now landed and each one's review split out a residue P1, so the table has gone 6 -> 6 -> 6 -> 6
+rather than 6 -> 5 -> 4 -> 3. `temp-unique-field-into-borrow-slot-use-after-free` is FIXED and
+deleted, and its round-1 review split out `temp-unique-field-escapes-through-unguarded-spellings`;
 `delete-of-untracked-pointer-copy-not-diagnosed` is FIXED and deleted, and its round-1 review split
 out `pointer-copy-propagates-no-ownership-fact` (the three sibling double frees its accept set
-measured, plus a `?:` join spelling the reviewer found). Both design records are below. The count
-will move again when the parallel branches land, so re-derive it from `ls internal/issue/p1/`
-rather than trusting this sentence.
-`code-value-into-data-pointer-outside-overload-resolution` is in a parallel worktree, then
+measured, plus a `?:` join spelling the reviewer found);
+`code-value-into-data-pointer-outside-overload-resolution` is FIXED and deleted, and its round-1
+review split out [[join-erases-code-value-evidence-at-every-gate]] (a `?:`/`??` join erases the
+source evidence every code-value predicate reads, which defeats the already-landed ARGUMENT gate as
+well as the store sites). All three design records are below. The count will move again when the
+parallel branches land, so re-derive it from `ls internal/issue/p1/` rather than trusting this
+sentence. Remaining, in order:
 `unique-field-global-struct-self-assign-false-positive`,
 `interface-field-self-assign-false-positive`, and last the deliberately-accepted runtime-index
 residue of `unique-field-to-field-array-element-receiver` (decision needed: runtime owner check
@@ -316,12 +319,27 @@ reads **6 P1 / 44 P2 / 29 P3 / 7 UI = 86 total** - the same net pattern as the c
 were filed rather than parked in the design record below because that section's own heading says
 "Nothing here is open", and three live silent double frees do not belong under it.
 
+**Amended later on 2026-08-04 by `fix/codeval-store`.** That change fixed and DELETED
+`code-value-into-data-pointer-outside-overload-resolution` and filed
+[[join-erases-code-value-evidence-at-every-gate]] in its place, so the P1 count is unchanged at
+**6** - one file out, one file in, the same count-neutral shape `fix/funcptr-rebind` had, and the
+same reason it is spelled out rather than left to a bare recount. The new file is NOT a residue of
+the old one: the store gate it replaces was a missing DESTINATION reader, and the new one is
+erased SOURCE evidence that defeats the already-landed ARGUMENT gate equally.
+
+So BOTH campaign fixes that ran in parallel worktrees have now landed, and both were P1
+count-neutral for the same reason - each had a residue split out of it by its round-1 review. The
+bucket table above therefore stays at **6 P1 / 44 P2** (the 43 -> 44 move is `fix/temp-uniq-borrow`
+adding `lambda-body-owning-temp-never-destructed`; this change adds no P2). Two P1s fixed, two P1s
+filed, net zero - which is the pattern this file has now recorded four times, and the reason the
+campaign is tracked by row deletion rather than by the count.
+
 ### P1 - wrong programs and crashes (`p1/`)
 
 | Issue | Severity |
 |---|---|
 | [[pointer-copy-propagates-no-ownership-fact]] | Four silent double frees (exit 134), no diagnostic, all identical on `312d202` and on the merged `fix/untracked-copy`. A pointer DECLARATION copies the VALUE and nothing else, so every ownership fact a source binding carries needs its own hand-written clause at the decl-init site and any fact without one vanishes across the copy. Live members: a copy stored into a `unique` FIELD; a one-hop copy of a container-ELEMENT borrow (the direct spelling rejects); `T* d = move b;` off a copy (whose `delete b;` twin now rejects, so the two spellings disagree); and a `?:` join into a pointer declaration (whose DIRECT boxed spelling rejects). Fix direction: one clause per fact, recorded by storage identity and re-asked for liveness at the consumer, exactly like `BorrowsOwningLocal`. Each needs its own accept set first - (a) and (b) both have sole-owner shapes where a rejection would LEAK. Filed 2026-08-04 by the round-1 review of `fix/untracked-copy`. |
-| [[code-value-into-data-pointer-outside-overload-resolution]] | Exit 138, no diagnostic, identical on `904f026` and on `fix/funcptr-rebind`. `Rec* r = w;`, `return w;` and a `b.p = w;` field store all put a function-pointer VALUE into a data pointer and write through it. Recorded by review round 1 of `fix/funcptr-rebind`, which closed the OVERLOAD-BINDING path of the same defect class (`ComputeOverloadFunction` plus its variadic short-circuit) and deliberately did not reach the store paths - the shared predicates `ArgumentIsCodeValue` / `ParameterStoresData` exist, what is missing is a destination-side reader. Build the accept set first; an explicit cast must keep working. |
+| [[join-erases-code-value-evidence-at-every-gate]] | Exit 138, no diagnostic, on `6e9ab46`, on `a846e6e` and on `fix/codeval-store` (re-measured per spelling after the rebase). `Rec* r = c ? w : n;`, `Rec* r = n ?? w;` and - the telling one - `lam(c ? w : n)` into a `Rec*` PARAMETER, which the ARGUMENT gate `fix/funcptr-rebind` landed diagnoses in the bare spelling. A join produces a bare `llvm::Value` (a PHI, or a load out of a slot for `??`) carrying no TypeName, no recorded signature and no `llvm::Function` Primary, so every code-value predicate reads false before any gate runs. NOT the store defect: there the destination reader was missing; here the SOURCE evidence is erased. Fix by record-then-resolve, ledgering code-ness by value identity exactly as `fatInterfaceValueTypeNames_` does, and serving all three gates from it. Filed 2026-08-04 by `fix/codeval-store`. |
 | [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. An interface-field-to-interface-field copy with the SAME field name on both sides is misread as a self-assign, suppressing the reject. **ATTEMPTED AND REVERTED 2026-08-01** - see the file for the three discriminators that cannot work (names, box storage, and a bare `Value` compare of the field address all fail at least one witness). A sound test needs real dataflow through the box to the underlying data pointer. |
 | [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. **NARROWED 2026-08-02** by `fix/uniq-array-elem`: root cause CONFIRMED by instrumentation (`FieldName`/`CallerName` name the CONTAINER, so `selfFieldAssign` swallowed a genuine two-owner store), and every element pair whose addresses are constant-provably different now rejects - local, generic-substituted, nested, array-as-field, through-pointer, view, and global arrays. BOTH copies of the name comparison were fixed; the second (`sameField`) also guards the reassignment-destruct, and fixing only the first traded an abort for a leak. Residue: any index not constant in the emitted IR - a runtime subscript, and a `const` integer (`const` is unenforced, so folding it would be unsound). |
 | [[unique-field-global-struct-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. `gA.slot = gB.slot` on two file-scope structs. **Mechanism CORRECTED 2026-08-02** (the first filing read optimized IR and blamed `destIsStructField`; at `--no-opt` that predicate is TRUE and the stack IS entered): a global-struct field read carries an EMPTY `CallerName`, so `selfFieldAssign` reads two different globals as one slot - the same failure as the interface receiver, through a third receiver kind. Renaming the fields apart rejects on both binaries. Closable by extending `ProvablyDifferentSlots` to distinct `GlobalVariable`/`AllocaInst` roots, which is sound but is a widening of a predicate every field store flows through - do it with its own sweep. |
@@ -3083,3 +3101,173 @@ see because the provenance is never set.
 Bar: macOS arm64 Release `./test.sh` 598 passed / 0 failed / 8 skipped, `example_mac.sh` 35 passed
 / 0 failed, `leaks --atExit` on `Test/test_move.cb` unchanged at 13 leaks / 256 bytes across
 (pre-binary, pre-tests), (post-binary, pre-tests) and (post-binary, post-tests).
+
+## Landed: `fix/codeval-store` (2026-08-04) - a code VALUE no longer converts to a data pointer at a store
+
+Closes `p1/code-value-into-data-pointer-outside-overload-resolution` and DELETES the file. That
+issue was recorded by review round 1 of `fix/funcptr-rebind`, which closed the OVERLOAD-BINDING
+path of this defect class and deliberately did not reach the store paths. All three filed repros
+verified on the merge-base binary first: compile rc 0, run **exit 138**, no diagnostic.
+
+The two predicates the scorer already uses are now read from the DESTINATION side by one shared
+helper (`cflat/LLVMBackend.h`), so the argument path and the store paths cannot drift:
+
+    bool CodeValueIntoDataDestination(const NamedVariable& src, const TypeAndValue& dest) const
+    { return ArgumentIsCodeValue(src) && ParameterStoresData(dest); }
+
+**NINE gate call sites in `cflat/MainListener.h`, along TWO axes** (thirteen syntactic entry
+points - the field-default site is shared by five default-constructor emitters). The first cut had three and claimed
+they were "the whole set" on the strength of `b.p = w` being rejected. That claim was false and
+review round 1 measured it: the field, element, nested-field and global stores do reach the
+assignment site, but only through the `=` OPERATOR. Write the same store as a brace initializer, a
+field default or a parameter default and none of the three sites is on the path - four more
+spellings, all still exit 138 with no diagnostic after the first cut landed. This is the syntax
+axis, recorded in `internal/fix-issue-lessons.md` as the twin of the name-spelling axis, and it
+was missed the same way: the type axis (`Rec*`, `Rec**`, `char*`, `void*`, `string`, alias,
+element, global, nested) was enumerated exhaustively and the SYNTAX by which a value arrives was
+not enumerated at all.
+
+The TYPE-axis sites (the `=` operator, a declarator, a return):
+
+- the declarator initializer, inside the `rightNV` scope beside `RejectRawPointerToArrayView`;
+- `ParseAssignment`, which carries the `=` spelling of the field, element, nested-field and global
+  stores, and the compound operators;
+- the `return` leg, against `currentFunctionReturnTV`, before `LoadNamedVariable(returnNV)`.
+
+The SYNTAX-axis sites, each a separate lowering path reached by none of the above:
+
+- `EmitOneFieldInit` - the named brace field init, which is where `= {f=v}`, bare `{f=v}`,
+  `new T {f=v}` and the `<Tag attr=>` sugar all funnel;
+- `EmitPositionalFixedArrayInit` - `T*[N] a = {w, w}`. **The element type is derived from the
+  array's star count** (`Pointer + ElemPointer`), not from `ElemPointer` alone: the view path's
+  derivation is correct for `T[]`, where the array itself is a pointer, and copying it to the FIXED
+  path silently disarmed the guard for every `T*[N]`. Caught by the leg, not by reasoning;
+- `EmitArrayViewInferredInit` - the length-inferred view. **Its live spelling is a `string` element,
+  not a pointer one**, which an earlier draft of this record got wrong: `Rec*[] v = {w, w}` never
+  reaches this gate at all (the pre-existing "a fixed array is not assignable from a pointer" fires
+  first, identically on both binaries), so citing it as the example described coverage that does not
+  exist. The spelling that DOES reach it is `string[] v = {w, w}`, and on the merge base it is a
+  SILENT MISCOMPILE - exit 0, `length()` reads 1, `.data()` prints empty - not a crash. Proven from
+  `--no-opt` IR rather than from the probe value: the element store is
+  `store %string %1, ptr %arrview_elem` where `%1` wraps `@_ro_double_double_`, i.e. the callee's
+  machine code read as a NUL-terminated buffer, the same shape as the `char*` -> `string` coercion
+  the argument gate already refuses;
+- `EmitGlobalFixedArrayInit` - the global twin. Its elements fold to constants inside a throwaway
+  function with the builder redirected, so the reject is RECORDED and raised after
+  `RestoreBuilderState`. `LogErrorContext` throws, and unwinding from inside that loop would leave
+  the insert point in the temp function - the "IR bracket left open on the unwind path" failure
+  this repo has already paid for three times;
+- the FIVE default-constructor emitters share `ParseFieldDefaultInitializer`:
+  `ParseStructDefinition`, `ParseClassDefinition`, `ParseConstructorDefinition`, and BOTH `program`
+  emitters (`ParseProgramDefinition` and `ParseImportedProgramDefinition`). **None of them is a
+  union-carrying emitter** - an earlier draft of this record and of the code comment said so and
+  was simply wrong; the union branch of `ParseStructDefinition` returns a zeroed value and never
+  runs a field-init loop at all. Gating only the struct ones left the class spelling reproducing,
+  measured. The `program` pair is reached too: `program P { Rec* p = ro; }` now emits this gate's
+  message where the merge base emitted an unrelated `run()`-generation error;
+- the omitted-argument forwarding wrapper - `f(Rec* p = ro)` filled the parameter slot with a code
+  address and the body wrote through it.
+
+**The shape check inside `ArgumentIsCodeValue` is what makes a destination-side rejection safe.**
+`function<T>*` is the ADDRESS of a slot and `function<T>[N]` decays to one; a wholesale rejection
+of `function<T>*` was landed once in this repo and had to be reverted. Shape 0 is the only
+rejecting shape, and `ParameterStoresData` answers false for a function-pointer destination, so
+storing a code value into a code slot of every spelling is untouched.
+
+RATIFIED, and the point at which the store rule now agrees with the argument rule: `void* v = w;`
+is an error. `fix/funcptr-close` already ratified the same tightening for a `void*` PARAMETER
+("write a cast"); until now the two spellings of one rule disagreed. Measured: nothing in `Test/`,
+`example/` or the swept corpus depended on it.
+
+Two cells were judged separately rather than swept in with the rest:
+
+- **Compound `+=` gets its OWN wording, because the question is different.** It is not a store: the
+  code address is consumed as an INTEGER OFFSET (`ptrtoint` of the callee added to the pointer),
+  forging an address that is neither the function nor the pointee. Established from `--no-opt` IR
+  (`%2 = ptrtoint ptr %1 to i64  %3 = ptrtoint ptr %0 to i64 ... store ptr %4, ptr %r`), not from a
+  probe value - the repo has added a site to a rejection on a strange decimal once, with a message
+  that was false where it fired. "code does not convert to a data pointer" would have been that
+  message here, so the compound arm says "a code address is not an offset" instead. Likewise the
+  cast advice is dropped for the `string` destination, where `(string)` of a raw value is itself
+  rejected.
+- **A `?:` / `??` JOIN is out of scope and is filed at P1**, not deferred silently, as
+  [[join-erases-code-value-evidence-at-every-gate]]. The measurement that settles it is the
+  ARGUMENT leg: `lam(c ? w : n)` into a `Rec*` parameter is exit 138 on the merge base AND on this
+  branch, while the bare `lam(w)` has been diagnosed since `fix/funcptr-rebind`. A join erases the
+  source evidence every code-value predicate reads, so it defeats the already-landed argument gate
+  exactly as it defeats these store sites - a source-side recording problem, not a missing
+  destination reader, and it must serve all three gates at once or the halves drift.
+
+Interface destinations need no work: `IThing t = w;` and `IThing* t = w;` are already rejected by
+pre-existing guards, identically on both binaries. A `list<Rec*>.add(w)` is refused by the scorer.
+
+PRE-EXISTING RESIDUE noticed while doing this, neither caused nor worsened here, recorded so the
+next visitor does not re-derive it:
+
+- **The deferred-raise hazard is only half fixed in `EmitGlobalFixedArrayInit`.** The code-value
+  reject added here is recorded and raised after `RestoreBuilderState`, but the pre-existing
+  `LogErrorContext(fi, "global array initializer elements must be compile-time constants")` one
+  line below it still throws from INSIDE the redirected-builder region - the exact hazard this
+  change documents avoiding. Its `ok = false; break;` is therefore dead code, and the unwind skips
+  `tmpFn->eraseFromParent()` and the state restore. Pre-existing, untouched, and it wants the same
+  record-then-raise treatment.
+- **A `Lambda<>` field default segfaults, and correctly does NOT fire this gate.**
+  `struct S { Lambda<double(double)> lf = ro; };` is exit 139 on `6e9ab46` AND here. The
+  destination is a closure slot, so `ParameterStoresData` answers false and the gate is right to
+  stay out of the way - this is a neighbouring defect in the fat-closure field-default lowering,
+  not a hole in the code-value rule. Not filed separately; noted here because it is the first
+  thing a reader will hit when probing the field-default site.
+
+WHAT EACH CELL ACTUALLY WAS, since the first cut's report lumped them together as "~19 reject
+cells, all exit 138 on the merge base" and that was overstated. Three categories, and they are
+ranked differently:
+
+- **Memory-unsafe closed (exit 138 on the merge base, diagnosed now)** - 19 cells: declarator,
+  assignment, return, struct field, class field, global store, array element, nested field,
+  `using` alias destination, global declarator, `char*`, and the source spellings (named function,
+  `move`d value, `function<>` field read, parameter, call result, `Lambda<>` local), plus the four
+  syntax-axis spellings review round 1 found (brace field init in three spellings, array
+  aggregate local and global, struct and class field default, parameter default).
+- **Ratified TIGHTENINGS (the merge base compiles and RUNS them, exit 0)** - 3 cells: `void* v = w`
+  (now agreeing with the `void*` PARAMETER rule `fix/funcptr-close` already ratified), `Rec** pp = w`,
+  and `r += w`. These are not closed crashes; they are programs that stop compiling. Nothing in the
+  swept corpus depended on any of them.
+- **Message REPLACEMENTS (already rejected on the merge base, different wording now)** - the
+  lambda-literal and `Lambda<>` destinations, which said "cannot initialize pointer 'r' with a
+  value of type 'Rec'" - factually wrong, the RHS is not a `Rec`. The `string`, interface and
+  container cells did not compile on the merge base either and are unchanged or untouched.
+
+EVIDENCE. The accept set was built and frozen as value legs BEFORE the guard, and every cell was
+run on the merge-base binary first. `Test/test_function_ptr.cb` gains
+`testCodeValueStoreAccepts()` and `testCodeValueAggregateStoreAccepts()` (44 legs); the file runs
+67/67 and its output is BYTE-IDENTICAL on both binaries - these legs discriminate against an over-broad guard, not against master, which is
+why that pairing is the right non-vacuity check for them. The most dangerous accepted shape is a
+function pointer whose RETURN type is a data pointer (`function<StoreRec*(int)>`): its call result
+is genuine data and reaches all four gated destinations. `Test/errors/err_data_pointer_to_closure_param.cb`
+gains 21 reject legs; each was mutation-tested individually (mutate one expectation, the file must
+flip to exit 1) and each was extracted to a standalone file and shown to FAIL on the merge base and
+PASS here. The file runs 58 PASS legs in total.
+
+DIAGNOSTIC ACCURACY, all three found by review round 1 and all three cases of a message describing
+something the source did not write:
+
+- The destination is spelled at FULL pointer depth. A `Rec**` was being reported as `Rec*`, with a
+  `'(Rec*)'` remedy - naming a type the user never wrote. `CodeValueDestSpelling` renders `Rec**`,
+  and an array VIEW as `int[]` rather than the `int*` the shared pointer-speller gives.
+- The cast escape is advised only where one COMPILES, verified per spelling. There is none for a
+  `T[]` view: `(int*)w` then fails the view's own "cannot bind a raw pointer 'T*' to an array-view"
+  check and `(int[])w` is refused outright, so the advice was sending the user into a second error.
+  Dropped there and for `string`, kept for `Rec*` / `Rec**` / `void*`, each measured.
+- A COMPOUND operator on a non-pointer destination gets its own wording. `string +=` is
+  concatenation, not pointer arithmetic, so "a code address is not an offset" - true for `Rec* +=`,
+  and proven there from IR - was false on `string`. On the merge base that spelling reached the
+  LLVM verifier as "GEP indexes must be integers" with no source location. Differential A/B over all 446 `.cb` in `Test/` and `example/`: zero real differences
+under `--check` and zero under a real `-o` compile (run separately, since `--check` cannot see a
+codegen crash); after the new legs landed, exactly one - the intended reject file. macOS arm64
+Release **598 / 0 / 8** and `example_mac.sh` **35 / 0**, re-run on the final base after this
+branch was rebased twice (`6e9ab46` -> `312d202` -> `a846e6e`) while it was in review; the
+sweep figures above were taken against `6e9ab46`, and the two reject/accept regression files
+plus a reject/accept spot-check were re-measured on each later base.
+
+No new serialized field, so the `--init` round-trip is untouched; `test.sh` runs `--init-local` and
+covers the warm-cache path.

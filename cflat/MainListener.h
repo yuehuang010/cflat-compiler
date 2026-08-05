@@ -6629,6 +6629,15 @@ public:
                             LogErrorContext(jump, "cannot return a raw pointer 'T*' as an array-view 'T[]' - "
                                 "a view must span a whole allocation (from 'new T[n]' or another 'T[]'); "
                                 "the 'T[] -> T*' decay is one-way");
+                        // Return leg of the code-value store gate: `return w;` from a `Rec*`
+                        // function handed the caller a code address to write through.
+                        if (compiler->CodeValueIntoDataDestination(
+                                returnNV, compiler->currentFunctionReturnTV))
+                        {
+                            const auto& retTV = compiler->currentFunctionReturnTV;
+                            LogErrorContext(jump, compiler->DescribeCodeValueIntoData(
+                                CodeValueDestSpelling(retTV), "return", CodeValueCastAdvice(retTV)));
+                        }
                         auto right = LoadNamedVariable(returnNV);
                         // Coerce the returned value to the function-pointer return type (thin vs
                         // fat): a named function, a thin function<> value, or a fat closure value.
@@ -8263,7 +8272,12 @@ public:
                 llvm::Value* defaultVal = nullptr;
                 if (auto* ae = initCtx->assignmentExpression())
                 {
-                    defaultVal = ParseAssignmentExpression(ae);
+                    // Parameter-DEFAULT leg of the code-value store gate: `f(Rec* p = ro)` put a
+                    // code address in the omitted argument's slot and the body wrote through it.
+                    auto defNV = ParseAssignmentExpressionNamed(ae);
+                    defaultVal = LoadNamedVariable(defNV);
+                    RejectCodeValueIntoDataSlot(ae, defNV, params[i], "default-initialize",
+                        std::format("parameter '{}' of", params[i].VariableName));
                 }
                 else if (initCtx->Default())
                 {
@@ -9879,6 +9893,13 @@ public:
                                 rhsLambdaCaptureNames = rightNV.LambdaCaptureNames;
                                 // int[] v = rawIntPtr; is the laundering door - reject it.
                                 RejectRawPointerToArrayView(assignmentExpression, typeAndValue, rightNV.TypeAndValue);
+                                // Declarator-init leg of the code-value store gate: `Rec* r = w;`
+                                // stored a code address in a data pointer and wrote through it.
+                                if (compiler->CodeValueIntoDataDestination(rightNV, typeAndValue))
+                                    LogErrorContext(assignmentExpression,
+                                        compiler->DescribeCodeValueIntoData(
+                                            CodeValueDestSpelling(typeAndValue), "initialize",
+                                            CodeValueCastAdvice(typeAndValue)));
                             }
                             lambdaExpectedType = {};
                             // Implicit char* -> string coercion: string s = "hello" or string s = charPtr.
@@ -13526,6 +13547,22 @@ public:
                     compiler->SetVariableOwning(namedVar.CallerName, true);
                     compiler->ConsumeOwnedNewTemp(rightNV.Primary);
                 }
+            }
+
+            // Assignment leg of the code-value store gate - this one site also carries the field,
+            // element and global stores, which all reach ParseAssignment with the slot's own type.
+            if (right && compiler->CodeValueIntoDataDestination(rightNV, namedVar.TypeAndValue))
+            {
+                const auto& destTV = namedVar.TypeAndValue;
+                // A compound operator asks a different question, and on a non-pointer destination
+                // ('string +=' is concatenation) the offset wording would be false.
+                LogErrorContext(ctx, operatorText == "="
+                    ? compiler->DescribeCodeValueIntoData(
+                        CodeValueDestSpelling(destTV), "assign", CodeValueCastAdvice(destTV))
+                    : compiler->DescribeCodeValueAsCompoundOperand(
+                        CodeValueDestSpelling(destTV), operatorText,
+                        destTV.Pointer && !destTV.IsArrayView));
+                return right;
             }
 
             // Pointer variable assigned a struct value: catch the mismatch here
@@ -17628,6 +17665,11 @@ public:
             return false;
         }
 
+        // Brace leg of the code-value store gate. This is a SEPARATE lowering path from the `=`
+        // assignment site, so `h.p = w` being rejected says nothing about `Holder h = { p = w }`.
+        RejectCodeValueIntoDataSlot(errCtx, rightNV, fieldType, "brace-initialize",
+                                    std::format("field '{}.{}' of", typeName, fieldName));
+
         // `unique` field initialized here: this is a second field-store path, so it needs the same
         // two source rejections the `=` path applies (Trap A, and field-to-field). No reassign-free
         // is needed - both callers construct a fresh slot, so there is no old pointee to release.
@@ -17841,6 +17883,68 @@ public:
         return base + std::string(FixedArrayElementStars(tv), '*');
     }
 
+    /*
+     * Spell a code-value store DESTINATION the way the source wrote it: 'Rec*', 'Rec**', 'int[]',
+     * 'Rec*[2]', 'string'. DescribePointerDeclType renders an array VIEW as 'int*', which is not
+     * what the declaration says, so views are spelled here instead.
+     */
+    static std::string CodeValueDestSpelling(const LLVMBackend::TypeAndValue& dest)
+    {
+        if (dest.IsArrayView && dest.ConstArraySize == 0)
+            return dest.TypeName + std::string(dest.ElemPointer ? 1 : 0, '*') + "[]";
+        return DescribePointerDeclType(dest);
+    }
+
+    /*
+     * The cast escape is advised only where one actually COMPILES - verified per spelling, not
+     * assumed. A plain pointer takes '(Rec*)' / '(Rec**)'. An array VIEW takes neither: '(int*)w'
+     * then fails the view's own "cannot bind a raw pointer 'T*' to an array-view" check and
+     * '(int[])w' is refused outright, so advising either would send the user into a second error.
+     * `string` is reached by the char* coercion and '(string)' of a raw value is itself rejected.
+     */
+    static std::string CodeValueCastAdvice(const LLVMBackend::TypeAndValue& dest)
+    {
+        if (!dest.Pointer || dest.IsArrayView || dest.ConstArraySize > 0) return {};
+        return CodeValueDestSpelling(dest);
+    }
+
+    /*
+     * Parse a struct/class field DEFAULT initializer and gate it. `struct H { Rec* p = ro; };` is a
+     * store path reached by neither the declarator nor the braces, and it has FIVE default-ctor
+     * emitters - ParseStructDefinition, ParseClassDefinition, ParseConstructorDefinition, and BOTH
+     * `program` emitters (ParseProgramDefinition and ParseImportedProgramDefinition). The guard has
+     * to be in all five or the same spelling survives through another declaration kind.
+     */
+    llvm::Value* ParseFieldDefaultInitializer(
+        const std::string& structName,
+        const LLVMBackend::TypeAndValue& field,
+        CFlatParser::AssignmentExpressionContext* ae)
+    {
+        auto nv = ParseAssignmentExpressionNamed(ae);
+        llvm::Value* val = LoadNamedVariable(nv);
+        RejectCodeValueIntoDataSlot(ae, nv, field, "default-initialize",
+            std::format("field '{}.{}' of", structName, field.VariableName));
+        return val;
+    }
+
+    /*
+     * Code-value store gate for the AGGREGATE spellings the declarator, assignment and return
+     * sites never see: a brace field initializer, a positional fixed-array or view element, a
+     * global array element, and a struct field DEFAULT. `dest` is the SLOT's type - for an array
+     * element that is the ELEMENT type, not the array's. LogErrorContext throws.
+     */
+    void RejectCodeValueIntoDataSlot(antlr4::ParserRuleContext* ctx,
+                                     const LLVMBackend::NamedVariable& src,
+                                     const LLVMBackend::TypeAndValue& dest,
+                                     const std::string& role,
+                                     const std::string& what)
+    {
+        auto* compiler = Compiler(ctx);
+        if (!compiler->CodeValueIntoDataDestination(src, dest)) return;
+        LogErrorContext(ctx, compiler->DescribeCodeValueIntoData(
+            CodeValueDestSpelling(dest), role, CodeValueCastAdvice(dest), what));
+    }
+
     // 'new T()' is meaningful only for a SINGLE star over a known struct: there is no 'new void()',
     // and 'new S()' is the wrong shape for an 'S**'.
     bool CanSuggestAllocation(antlr4::ParserRuleContext* ctx, const LLVMBackend::TypeAndValue& tv)
@@ -18022,6 +18126,14 @@ public:
         // Zero-fill the whole array so unspecified trailing slots are well-defined.
         compiler->builder->CreateStore(llvm::Constant::getNullValue(arrTy), arrAlloc);
 
+        // The ELEMENT's type is what a stored value has to agree with, not the array's.
+        LLVMBackend::TypeAndValue fixedElemTV = tv;
+        int fixedElemTVStars = FixedArrayElementStars(tv);
+        fixedElemTV.Pointer = fixedElemTVStars >= 1;
+        fixedElemTV.ElemPointer = fixedElemTVStars >= 2;
+        fixedElemTV.ConstArraySize = 0;
+        fixedElemTV.IsArrayView = false;
+
         llvm::Value* zero = compiler->builder->getInt32(0);
         for (size_t i = 0; i < elements.size(); i++)
         {
@@ -18029,6 +18141,10 @@ public:
             auto nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
             llvm::Value* val = LoadNamedVariable(nv);
             if (!val) continue;
+
+            // Aggregate leg of the code-value store gate: `Rec*[2] arr = { w, w };`.
+            RejectCodeValueIntoDataSlot(fi, nv, fixedElemTV, "brace-initialize",
+                                        std::format("element {} of '{}' of", i, name));
 
             if (tv.TypeName == "string"
                 && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
@@ -18291,11 +18407,31 @@ public:
             std::vector<llvm::Constant*> elems;
             elems.reserve(n);
             bool ok = true;
+            // The ELEMENT's type is what a stored value has to agree with, not the array's.
+            LLVMBackend::TypeAndValue globalElemTV = tv;
+            int globalElemTVStars = FixedArrayElementStars(tv);
+            globalElemTV.Pointer = globalElemTVStars >= 1;
+            globalElemTV.ElemPointer = globalElemTVStars >= 2;
+            globalElemTV.ConstArraySize = 0;
+            globalElemTV.IsArrayView = false;
+            // Code-value store reject, RECORDED not raised: LogErrorContext throws, and the
+            // builder is redirected into a throwaway function here, so unwinding from inside the
+            // loop would leave the insert point in `tmpFn` and skip the restore below.
+            CFlatParser::FieldInitContext* codeValueElem = nullptr;
+            size_t codeValueIndex = 0;
             for (size_t i = 0; i < elements.size(); i++)
             {
                 auto* fi = elements[i];
                 auto nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
                 llvm::Value* val = LoadNamedVariable(nv);
+                if (codeValueElem == nullptr
+                    && compiler->CodeValueIntoDataDestination(nv, globalElemTV))
+                {
+                    codeValueElem = fi;
+                    codeValueIndex = i;
+                    ok = false;
+                    break;
+                }
                 auto* c = llvm::dyn_cast_or_null<llvm::Constant>(val);
                 if (c) c = CoerceConstantToArrayElement(compiler, c, elemTy);
                 if (!c)
@@ -18313,6 +18449,11 @@ public:
             tmpFn->eraseFromParent();
             compiler->RestoreBuilderState(savedState);
 
+            if (codeValueElem != nullptr)
+                LogErrorContext(codeValueElem, compiler->DescribeCodeValueIntoData(
+                    CodeValueDestSpelling(globalElemTV), "brace-initialize",
+                    CodeValueCastAdvice(globalElemTV),
+                    std::format("element {} of '{}' of", codeValueIndex, name)));
             if (!ok) return;
             arrConst = llvm::ConstantArray::get(arrTy, elems);
         }
@@ -18563,6 +18704,10 @@ public:
             auto nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
             llvm::Value* val = LoadNamedVariable(nv);
             if (!val) continue;
+
+            // Aggregate leg of the code-value store gate: `Rec*[] v = { w, w };`.
+            RejectCodeValueIntoDataSlot(fi, nv, elemTV, "brace-initialize",
+                                        std::format("element {} of '{}' of", i, name));
 
             if (tv.TypeName == "string"
                 && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
@@ -27047,7 +27192,8 @@ public:
                         auto assignmentExpression = initializer->assignmentExpression();
                         if (assignmentExpression != nullptr)
                         {
-                            rvalue = ParseAssignmentExpression(assignmentExpression);
+                            rvalue = ParseFieldDefaultInitializer(
+                                structName, typeValue, assignmentExpression);
                             if (typeValue.TypeName == "auto")
                             {
                                 typeValue.TypeName = rvalue->getType()->getStructName();
@@ -28632,7 +28778,7 @@ public:
                 if (initializer)
                 {
                     if (auto* ae = initializer->assignmentExpression())
-                        rvalue = ParseAssignmentExpression(ae);
+                        rvalue = ParseFieldDefaultInitializer(name, typeValue, ae);
                     else if (initializer->Default())
                     {
                         // Synthetic default-ctor body: clear the stale file-scope global_scope so a
@@ -28962,7 +29108,7 @@ public:
                 if (initializer)
                 {
                     if (auto* ae = initializer->assignmentExpression())
-                        rvalue = ParseAssignmentExpression(ae);
+                        rvalue = ParseFieldDefaultInitializer(name, typeValue, ae);
                     else if (initializer->Default())
                     {
                         // Synthetic default-ctor body: clear the stale file-scope global_scope so a
@@ -29455,7 +29601,8 @@ public:
                     auto assignmentExpression = initializer->assignmentExpression();
                     if (assignmentExpression != nullptr)
                     {
-                        rvalue = ParseAssignmentExpression(assignmentExpression);
+                        rvalue = ParseFieldDefaultInitializer(
+                            structName, typeValue, assignmentExpression);
                         if (typeValue.TypeName == "auto")
                         {
                             typeValue.TypeName = rvalue->getType()->getStructName();
@@ -29877,7 +30024,8 @@ public:
                     auto* assignExpr = field.Initializer->assignmentExpression();
                     if (assignExpr != nullptr)
                     {
-                        llvm::Value* fieldVal = ParseAssignmentExpression(assignExpr);
+                        llvm::Value* fieldVal = ParseFieldDefaultInitializer(
+                            structName, field, assignExpr);
                         if (fieldVal)
                         {
                             auto* destType = structLLVMType->getTypeAtIndex(fieldIdx);

@@ -18104,6 +18104,55 @@ public:
             || IsEncodedClosureType(param.TypeName);
     }
 
+    /*
+     * DESTINATION-side reader for the conversion sites the overload scorer never sees: a declarator
+     * initializer, an assignment (which also carries a field, element and global store), and a
+     * `return`. Both predicates are the scorer's own, so the argument path and the store paths
+     * cannot drift. Under opaque pointers a code pointer and a data pointer are one `ptr`, so the
+     * proof has to be made on the DECLARED shapes: shape 0 on the source (a `function<T>*` is the
+     * ADDRESS of a slot and a `function<T>[N]` decays to one - both genuinely data), and a
+     * pointer-or-`string` destination that is not itself a function-pointer slot.
+     */
+    bool CodeValueIntoDataDestination(const NamedVariable& src, const TypeAndValue& dest) const
+    {
+        return ArgumentIsCodeValue(src) && ParameterStoresData(dest);
+    }
+
+    /*
+     * One wording for every store site, matching the scorer's per-candidate line. `spelling` and
+     * `castAdvice` are rendered by the CALLER (MainListener owns the declared-type spellers), so a
+     * `Rec**` is never described as a `Rec*` and a cast is only ever advised when one COMPILES -
+     * there is no cast that binds a code address to a `T[]` view, and `(string)` of a raw value is
+     * itself rejected. `what` names the slot when it is not the declaration being reported on.
+     */
+    std::string DescribeCodeValueIntoData(const std::string& spelling, const std::string& role,
+                                          const std::string& castAdvice,
+                                          const std::string& what = {}) const
+    {
+        std::string target = what.empty() ? std::string() : std::format(" {}", what);
+        std::string msg = std::format("cannot {} a function-pointer or closure VALUE into{} data "
+            "type '{}' - code does not convert to a data pointer", role, target, spelling);
+        if (!castAdvice.empty())
+            msg += std::format("; write an explicit '({})' cast if the raw code address is what "
+                "you want", castAdvice);
+        return msg;
+    }
+
+    /*
+     * A COMPOUND operator is a different question from a store. On a POINTER the code address is
+     * consumed as an INTEGER OFFSET (`ptrtoint` of the callee, added to the pointer), proven from
+     * --no-opt IR. On a non-pointer destination the operator is not pointer arithmetic at all -
+     * `string +=` is concatenation - so the offset wording would be false there.
+     */
+    std::string DescribeCodeValueAsCompoundOperand(const std::string& spelling, const std::string& op,
+                                                   bool destIsPointer) const
+    {
+        return std::format("cannot use a function-pointer or closure VALUE as the right operand of "
+            "'{}' on data type '{}' - {}", op, spelling,
+            destIsPointer ? "a code address is not an offset"
+                          : "a code address is not a value of that type");
+    }
+
     std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> candidates) const
     {
         std::pair<std::vector<NamedVariable>, FunctionSymbol> possibleResult;

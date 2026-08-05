@@ -781,3 +781,368 @@ expect_error("parameter 0 is a data type ('RecFatVa*') and the argument is a fun
         return lamFatVar(w);
     }
 }
+
+// -----------------------------------------------------------------------------
+// The STORE side of the same defect class. Everything above judges an ARGUMENT against a
+// parameter inside the overload scorer. A declarator initializer, an assignment (which also
+// carries the field, element and global stores) and a `return` are separate lowering paths that
+// the scorer never sees, so a code VALUE reached a data pointer through them and was written
+// through: exit 138, no diagnostic, on 6e9ab46. The gate is the same two predicates read from the
+// DESTINATION side (CodeValueIntoDataDestination).
+//
+// Discriminator for every leg below: the destination is a plain slot, not a call argument, so no
+// overload set exists and none of the scorer legs above can be what refuses. The wording pinned
+// here ("cannot initialize/assign/return a function-pointer or closure VALUE into data type") is
+// emitted only by the three store sites and by no other diagnostic in the compiler.
+
+// Declarator initializer - the filed repro.
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'StoreRejRec*'") {
+    struct StoreRejRec { int a = default; int b = default; };
+    double storeRejInit(double x) { return x + 1000.0; }
+
+    int storeIntoDeclInit()
+    {
+        function<double(double)> w = storeRejInit;
+        StoreRejRec* r = w;
+        r->a = 11;
+        return r->a;
+    }
+}
+
+// Plain assignment to an existing pointer local.
+expect_error("cannot assign a function-pointer or closure VALUE into data type 'StoreRejRec2*'") {
+    struct StoreRejRec2 { int a = default; int b = default; };
+    double storeRejAssign(double x) { return x + 1000.0; }
+
+    int storeIntoAssign()
+    {
+        function<double(double)> w = storeRejAssign;
+        StoreRejRec2* r = nullptr;
+        r = w;
+        r->a = 11;
+        return r->a;
+    }
+}
+
+// `return` - the destination is the function's declared return type, read from
+// currentFunctionReturnTV rather than from a NamedVariable, so it is its own site.
+expect_error("cannot return a function-pointer or closure VALUE into data type 'StoreRejRec3*'") {
+    struct StoreRejRec3 { int a = default; int b = default; };
+    double storeRejRet(double x) { return x + 1000.0; }
+
+    StoreRejRec3* storeIntoReturn()
+    {
+        function<double(double)> w = storeRejRet;
+        return w;
+    }
+}
+
+// A struct FIELD store through the `=` operator. It reaches the ASSIGNMENT site with the field's
+// own type, so that one site covers this spelling - and ONLY this spelling. The brace, field-
+// default and parameter-default spellings of the same store are separate lowering paths with their
+// own legs further down; `b.p = w` being rejected proved nothing about any of them, and all four
+// were live after the assignment gate landed.
+expect_error("cannot assign a function-pointer or closure VALUE into data type 'StoreRejRec4*'") {
+    struct StoreRejRec4 { int a = default; int b = default; };
+    struct StoreRejBox { StoreRejRec4* p = default; };
+    double storeRejField(double x) { return x + 1000.0; }
+
+    int storeIntoField()
+    {
+        function<double(double)> w = storeRejField;
+        StoreRejBox b = default;
+        b.p = w;
+        b.p->a = 11;
+        return b.p->a;
+    }
+}
+
+// A fixed-array ELEMENT store: the destination is a GEP, not an alloca.
+expect_error("cannot assign a function-pointer or closure VALUE into data type 'StoreRejRec5*'") {
+    struct StoreRejRec5 { int a = default; int b = default; };
+    double storeRejElem(double x) { return x + 1000.0; }
+
+    int storeIntoArrayElement()
+    {
+        function<double(double)> w = storeRejElem;
+        StoreRejRec5*[4] arr = default;
+        arr[0] = w;
+        arr[0]->a = 11;
+        return arr[0]->a;
+    }
+}
+
+// A `void*` destination. The argument side already rejects a code VALUE into a `void*` parameter
+// (the tightening ratified by fix/funcptr-close); the store side accepted it until now, so the
+// two spellings of the same rule disagreed.
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    double storeRejVoid(double x) { return x + 1000.0; }
+
+    int storeIntoVoidPointer()
+    {
+        function<double(double)> w = storeRejVoid;
+        void* v = w;
+        return v == nullptr ? 0 : 1;
+    }
+}
+
+// A `string` destination. Not a pointer, but reached by the implicit char* -> string coercion,
+// which lowers the code address as a NUL-terminated buffer. The message drops the cast advice
+// here, because '(string)' of a raw value is itself rejected - a rejection's guidance has to be
+// true where it fires.
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'string'") {
+    double storeRejStr(double x) { return x + 1000.0; }
+
+    int storeIntoString()
+    {
+        function<double(double)> w = storeRejStr;
+        string s = w;
+        return (int)s.length();
+    }
+}
+
+// A BARE NAMED FUNCTION straight into a data pointer - no `function<>` local in between, so the
+// evidence is `Primary` being an llvm::Function rather than a recorded signature.
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'StoreRejRec6*'") {
+    struct StoreRejRec6 { int a = default; int b = default; };
+    double storeRejNamed(double x) { return x + 1000.0; }
+
+    int storeNamedFunctionIntoPointer()
+    {
+        StoreRejRec6* r = storeRejNamed;
+        r->a = 11;
+        return r->a;
+    }
+}
+
+// The `using` ALIAS spelling of the destination. A fix has been half-done along this exact axis
+// before (the direct branch fixed, the alias branch left live), so it is pinned separately.
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'StoreRejRec7*'") {
+    struct StoreRejRec7 { int a = default; int b = default; };
+    using StoreRejAlias = StoreRejRec7*;
+    double storeRejAliasFn(double x) { return x + 1000.0; }
+
+    int storeIntoAliasedPointer()
+    {
+        function<double(double)> w = storeRejAliasFn;
+        StoreRejAlias r = w;
+        r->a = 11;
+        return r->a;
+    }
+}
+
+// Compound `+=` is a DIFFERENT question and gets its own wording: the code address is consumed as
+// an INTEGER OFFSET (`ptrtoint` of the callee, added to the pointer), forging an address that is
+// neither the function nor the original pointee. Verified from --no-opt IR on 6e9ab46:
+//   %2 = ptrtoint ptr %1 to i64   %3 = ptrtoint ptr %0 to i64   ...   store ptr %4, ptr %r
+expect_error("as the right operand of '+=' on data type 'StoreRejRec8*' - a code address is not an offset") {
+    struct StoreRejRec8 { int a = default; int b = default; };
+    double storeRejOffset(double x) { return x + 1000.0; }
+
+    int storeCodeValueAsPointerOffset()
+    {
+        function<double(double)> w = storeRejOffset;
+        StoreRejRec8* r = nullptr;
+        r += w;
+        return r == nullptr ? 0 : 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The AGGREGATE and DEFAULT store spellings. None of these reach the declarator, assignment or
+// return sites, so all four were still exit 138 with no diagnostic after those three gates landed
+// - the syntax axis, not the type axis. Each is a distinct lowering path:
+//   brace field init  -> EmitOneFieldInit         ('= {f=v}', bare '{f=v}', 'new T {f=v}')
+//   array aggregate   -> EmitPositionalFixedArrayInit / EmitArrayViewInferredInit / global twin
+//   field default     -> the five default-constructor emitters
+//   parameter default -> the omitted-argument forwarding wrapper
+//
+// Discriminator for all of them: no assignment operator and no declarator initializer is written,
+// so neither of those gates can be what refuses; the wording ("brace-initialize" /
+// "default-initialize", naming the field, element or parameter) is emitted only by these sites.
+
+expect_error("cannot brace-initialize a function-pointer or closure VALUE into field 'BraceHolder.p' of data type 'BraceRec*'") {
+    struct BraceRec { int a = default; int b = default; };
+    struct BraceHolder { BraceRec* p = default; int n = default; };
+    double braceRo(double x) { return x + 1000.0; }
+
+    int storeIntoBraceField()
+    {
+        function<double(double)> w = braceRo;
+        BraceHolder h = { p = w, n = 3 };
+        h.p->a = 11;
+        return h.p->a;
+    }
+}
+
+// The BARE-brace spelling of the same declaration. A previous fix in this repo gated only the
+// '= {...}' form and left this one live, because the brace token sits on the declarator instead
+// of on an initializer - that is exactly the hole this leg exists to pin.
+expect_error("cannot brace-initialize a function-pointer or closure VALUE into field 'BareHolder.p' of data type 'BareRec*'") {
+    struct BareRec { int a = default; int b = default; };
+    struct BareHolder { BareRec* p = default; int n = default; };
+    double bareRo(double x) { return x + 1000.0; }
+
+    int storeIntoBareBraceField()
+    {
+        function<double(double)> w = bareRo;
+        BareHolder h { p = w, n = 3 };
+        h.p->a = 11;
+        return h.p->a;
+    }
+}
+
+// The 'new T { ... }' spelling: a heap destination rather than a stack one.
+expect_error("cannot brace-initialize a function-pointer or closure VALUE into field 'NewHolder.p' of data type 'NewRec*'") {
+    struct NewRec { int a = default; int b = default; };
+    struct NewHolder { NewRec* p = default; int n = default; };
+    double newRo(double x) { return x + 1000.0; }
+
+    int storeIntoNewBraceField()
+    {
+        function<double(double)> w = newRo;
+        NewHolder* h = new NewHolder { p = w, n = 3 };
+        h->p->a = 11;
+        return h->p->a;
+    }
+}
+
+// A positional fixed-array aggregate. The destination is the ELEMENT type, which is derived from
+// the array's star count (Pointer + ElemPointer) - deriving it from ElemPointer alone, as the
+// array-VIEW path does, silently disarms the guard for every 'T*[N]'.
+expect_error("cannot brace-initialize a function-pointer or closure VALUE into element 0 of 'arr' of data type 'ArrRec*'") {
+    struct ArrRec { int a = default; int b = default; };
+    double arrRo(double x) { return x + 1000.0; }
+
+    int storeIntoArrayAggregate()
+    {
+        function<double(double)> w = arrRo;
+        ArrRec*[2] arr = { w, w };
+        arr[0]->a = 11;
+        return arr[0]->a;
+    }
+}
+
+// The 'T**' element spelling, which also proves the diagnostic renders the FULL pointer depth: a
+// message naming 'ArrRec2*' would be describing a type the source never wrote.
+expect_error("into element 0 of 'arr' of data type 'ArrRec2**' - code does not convert to a data pointer; write an explicit '(ArrRec2**)' cast") {
+    struct ArrRec2 { int a = default; int b = default; };
+    double arrRo2(double x) { return x + 1000.0; }
+
+    int storeIntoPointerToPointerElement()
+    {
+        function<double(double)> w = arrRo2;
+        ArrRec2**[2] arr = { w, w };
+        return arr[0] == nullptr ? 0 : 1;
+    }
+}
+
+// A struct field DEFAULT initializer - no declaration and no braces at the use site at all.
+expect_error("cannot default-initialize a function-pointer or closure VALUE into field 'DefH.p' of data type 'DefRec*'") {
+    struct DefRec { int a = default; int b = default; };
+    double defRo(double x) { return x + 1000.0; }
+    struct DefH { DefRec* p = defRo; };
+
+    int storeIntoFieldDefault()
+    {
+        DefH h = default;
+        h.p->a = 11;
+        return h.p->a;
+    }
+}
+
+// The CLASS twin of the field default. Struct and class have SEPARATE default-constructor
+// emitters (five in total across the declaration kinds), and gating only the struct ones left
+// this spelling reproducing - measured, not assumed.
+expect_error("cannot default-initialize a function-pointer or closure VALUE into field 'DefC.p' of data type 'DefRec2*'") {
+    struct DefRec2 { int a = default; int b = default; };
+    double defRo2(double x) { return x + 1000.0; }
+    class DefC { DefRec2* p = defRo2; };
+
+    int storeIntoClassFieldDefault()
+    {
+        DefC h = default;
+        h.p->a = 11;
+        return h.p->a;
+    }
+}
+
+// A PARAMETER default value: the slot is filled by the omitted-argument forwarding wrapper, which
+// is neither a field nor a declarator.
+expect_error("cannot default-initialize a function-pointer or closure VALUE into parameter 'p' of data type 'ParamRec*'") {
+    struct ParamRec { int a = default; int b = default; };
+    double paramRo(double x) { return x + 1000.0; }
+
+    int takesDefaulted(ParamRec* p = paramRo) { p->a = 11; return p->a; }
+
+    int storeIntoParameterDefault()
+    {
+        return takesDefaulted();
+    }
+}
+
+// An ARRAY-VIEW destination gets NO cast advice, because no cast reaches it: '(int*)w' then fails
+// the view's own "cannot bind a raw pointer 'T*' to an array-view" check and '(int[])w' is refused
+// outright. Both were measured before the advice was dropped. The leg pins the ABSENCE by pinning
+// the message's end - a rejection must not send the user into a second error.
+expect_error("into data type 'int[]' - code does not convert to a data pointer") {
+    double viewRo(double x) { return x + 1000.0; }
+
+    int storeIntoArrayView()
+    {
+        function<double(double)> w = viewRo;
+        int[] v = w;
+        return v == nullptr ? 0 : 1;
+    }
+}
+
+// A COMPOUND operator on a non-pointer destination. 'string +=' is concatenation, not pointer
+// arithmetic, so the offset wording that is true for 'Rec* +=' would be false here. On the merge
+// base this spelling reached the LLVM verifier as "GEP indexes must be integers" with no source
+// location, so this also satisfies the rule that a diagnosed LLVM failure becomes a real error.
+expect_error("as the right operand of '+=' on data type 'string' - a code address is not a value of that type") {
+    double strOpRo(double x) { return x + 1000.0; }
+
+    int storeCodeValueIntoStringConcat()
+    {
+        function<double(double)> w = strOpRo;
+        string s = "x";
+        s += w;
+        return (int)s.length();
+    }
+}
+
+// The GLOBAL fixed-array aggregate. Its elements are folded to LLVM constants inside a throwaway
+// function with the builder redirected, so the reject is RECORDED and raised after the builder
+// state is restored - LogErrorContext throws, and unwinding from inside that loop would leave the
+// insert point in the temp function. Same wording as the local twin; the discriminator is that no
+// function body encloses it.
+expect_error("cannot brace-initialize a function-pointer or closure VALUE into element 0 of 'gArrReject' of data type 'GlobRec*'") {
+    struct GlobRec { int a = default; int b = default; };
+    double globRo(double x) { return x + 1000.0; }
+    GlobRec*[2] gArrReject = { globRo, globRo };
+}
+
+// The length-inferred ARRAY-VIEW aggregate (EmitArrayViewInferredInit). Its live spelling is a
+// `string` element, NOT a pointer one: `Rec*[] v = {w, w}` never reaches this gate - the
+// pre-existing "a fixed array is not assignable from a pointer" fires first, identically on both
+// binaries - so a pointer leg here would pass for the wrong reason and pin nothing.
+//
+// On the merge base this is a SILENT MISCOMPILE, not a crash: exit 0, length() reads 1, .data()
+// prints empty. Established from --no-opt IR rather than the probe value - the element store is
+// `store %string %1, ptr %arrview_elem` with %1 wrapping @_ro_double_double_, the callee's machine
+// code read as a NUL-terminated buffer.
+//
+// Discriminator: `string` is not a pointer, so the pointer half of the gate cannot be what refused,
+// and the message carries no cast advice (there is no '(string)' of a raw value) - the only other
+// leg with that shape names a declarator, not an element.
+expect_error("cannot brace-initialize a function-pointer or closure VALUE into element 0 of 'v' of data type 'string'") {
+    double viewStrRo(double x) { return x + 1000.0; }
+
+    int storeIntoStringArrayViewElement()
+    {
+        function<double(double)> w = viewStrRo;
+        string[] v = { w, w };
+        return (int)v[0].length();
+    }
+}

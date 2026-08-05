@@ -2374,6 +2374,181 @@ bool testFuncPtrCallResultIntoClosureParam()
     return result;
 }
 
+/*
+ * Accept set for the code-value STORE gate (a code VALUE into a data-pointer destination at a
+ * declarator initializer, an assignment - which also carries the field, element and global stores
+ * - and a `return`). Widening a rejection breaks its accept set first, so every neighbouring shape
+ * that master compiles and runs correctly is a value leg here.
+ *
+ * These legs pass on the pre-fix binary too, by construction: they discriminate against an
+ * OVER-BROAD guard, not against master. The reject half lives in
+ * Test/errors/err_data_pointer_to_closure_param.cb and is what fails on the pre-fix binary.
+ */
+struct StoreRec { int a = default; int b = default; };
+struct StoreBox { StoreRec* p = default; function<double(double)> f = default; };
+using StoreCb = function<double(double)>;
+
+double storeRo(double x)  { return x + 1000.0; }
+double storeR2(double x)  { return x + 2000.0; }
+
+// A function pointer whose RETURN TYPE is a data pointer: the call RESULT is genuine data and must
+// keep reaching every destination the gate reads. This is the shape a source-side predicate that
+// looked at the recorded signature (rather than at the value's shape) would false-reject.
+StoreRec* storeMakeRec(int v) { StoreRec* r = new StoreRec(); r->a = v; return r; }
+StoreRec* storeFwdCall(function<StoreRec*(int)> f) { return f(9); }
+
+// `function<T>*` is the ADDRESS of a slot and `function<T>[N]` decays to one - both are real DATA
+// pointers. A wholesale rejection of `function<T>*` was landed once and had to be reverted.
+void storeSetThrough(function<double(double)>* out) { *out = storeRo; }
+void* storeRawSlot(function<double(double)>* a)     { return a; }
+double storeSumView(function<double(double)>[] fs)  { return fs[0](1.0) + fs[1](1.0); }
+
+bool testCodeValueStoreAccepts()
+{
+    bool result = true;
+
+    StoreCb w = storeRo;
+
+    // An EXPLICIT cast is the escape hatch the rejection's message points at; it must keep working
+    // at every destination shape. Assert non-null rather than a value: the address is the point.
+    StoreRec* castRec = (StoreRec*)w;
+    void*     castVoid = (void*)w;
+    result &= Test("cvs_cast_rec_nonnull",  castRec  == nullptr ? 0 : 1, 1);
+    result &= Test("cvs_cast_void_nonnull", castVoid == nullptr ? 0 : 1, 1);
+
+    // A code value into a FUNCTION-TYPED destination, in every spelling the gate can see:
+    // decl-init, assignment, struct field, alias-typed local, and a returned call result.
+    StoreCb declInit = storeRo;
+    StoreCb assigned = default; assigned = storeR2;
+    StoreBox box = default; box.f = storeRo;
+    StoreCb aliased = default; aliased = declInit;
+    result &= Test("cvs_fn_declinit", (int)declInit(1.0), 1001);
+    result &= Test("cvs_fn_assign",   (int)assigned(1.0), 2001);
+    result &= Test("cvs_fn_field",    (int)box.f(1.0),    1001);
+    result &= Test("cvs_fn_alias",    (int)aliased(1.0),  1001);
+
+    // `function<T>*` out-parameter: a real store-through, not a constant fold.
+    StoreCb outSlot = default;
+    storeSetThrough(&outSlot);
+    result &= Test("cvs_fnptr_out_param", (int)outSlot(1.0), 1001);
+
+    // `function<T>*` into a `void*` DESTINATION - the pointer-to-a-slot is data, so the gate's
+    // shape check (not just its destination check) is what has to let this through.
+    void* rawSlot = storeRawSlot(&outSlot);
+    result &= Test("cvs_fnptr_ptr_into_voidstar", rawSlot == nullptr ? 0 : 1, 1);
+
+    // `function<T>[N]` element stores, the array as a view argument, and `&arr[0]` into `void*`.
+    function<double(double)>[2] arr = default;
+    arr[0] = storeRo;
+    arr[1] = storeR2;
+    void* arrAddr = &arr[0];
+    result &= Test("cvs_fnptr_array_elem0", (int)arr[0](1.0), 1001);
+    result &= Test("cvs_fnptr_array_elem1", (int)arr[1](1.0), 2001);
+    result &= Test("cvs_fnptr_array_view",  (int)storeSumView(arr), 3002);
+    result &= Test("cvs_fnptr_array_addr_into_voidstar", arrAddr == nullptr ? 0 : 1, 1);
+
+    // The CALL RESULT of a function pointer returning a data pointer, at every gated destination.
+    function<StoreRec*(int)> maker = storeMakeRec;
+    StoreRec* fromInit = maker(7);
+    StoreRec* fromAssign = nullptr; fromAssign = maker(8);
+    StoreBox holder = default; holder.p = maker(3);
+    StoreRec* fromReturn = storeFwdCall(maker);
+    result &= Test("cvs_callret_declinit", fromInit->a,   7);
+    result &= Test("cvs_callret_assign",   fromAssign->a, 8);
+    result &= Test("cvs_callret_field",    holder.p->a,   3);
+    result &= Test("cvs_callret_return",   fromReturn->a, 9);
+    StoreRec* heldOut = move holder.p;
+    delete fromInit;
+    delete fromAssign;
+    delete heldOut;
+    delete fromReturn;
+
+    // A plain data pointer into every destination the gate reads - the control that the gate is
+    // not simply refusing pointer stores.
+    StoreRec plain = default; plain.a = 42;
+    StoreRec* borrowed = &plain;
+    StoreBox plainBox = default; plainBox.p = borrowed;
+    result &= Test("cvs_plain_ptr_declinit", borrowed->a,    42);
+    result &= Test("cvs_plain_ptr_field",    plainBox.p->a,  42);
+
+    return result;
+}
+
+/*
+ * Accept set for the AGGREGATE and DEFAULT store spellings (brace field init, array aggregate,
+ * struct/class field default, parameter default). Those are four more lowering paths the gate now
+ * reads, and each one's rejection has to leave the legal neighbour compiling: a code value into a
+ * FUNCTION-typed slot, and a real data pointer into a data slot, through the same syntax.
+ *
+ * These pass on the pre-fix binary too, by construction - they discriminate against an over-broad
+ * guard. Measured on the merge base before the guard was written.
+ */
+struct AggRec { int a = default; int b = default; };
+struct AggBoxFn  { function<double(double)> f = default; int n = default; };
+struct AggBoxPtr { AggRec* p = default; int n = default; };
+// Field DEFAULTS of function type, in both declaration kinds - struct and class have separate
+// default-constructor emitters, so both are legs.
+struct AggDefS { function<double(double)> f = aggRo; int n = 4; };
+class  AggDefC { function<double(double)> f = aggRo; int n = 5; };
+
+double aggRo(double x) { return x + 1000.0; }
+double aggR2(double x) { return x + 2000.0; }
+
+// A function-typed PARAMETER default: the omitted-argument wrapper is its own store path.
+double aggCallDefault(function<double(double)> f = aggRo) { return f(1.0); }
+
+bool testCodeValueAggregateStoreAccepts()
+{
+    bool result = true;
+
+    // Brace-init of a FUNCTION-typed field, in all three brace spellings.
+    AggBoxFn braceEq = { f = aggRo, n = 3 };
+    AggBoxFn braceBare { f = aggR2, n = 4 };
+    AggBoxFn* braceNew = new AggBoxFn { f = aggRo, n = 5 };
+    result &= Test("cvs_brace_fn_field_eq",   (int)braceEq.f(1.0),   1001);
+    result &= Test("cvs_brace_fn_field_bare", (int)braceBare.f(1.0), 2001);
+    result &= Test("cvs_brace_fn_field_new",  (int)braceNew->f(1.0), 1001);
+    result &= Test("cvs_brace_fn_field_n",    braceNew->n,           5);
+    delete braceNew;
+
+    // Brace-init of a POINTER field and a pointer array aggregate with REAL data pointers - the
+    // control that the new aggregate gates are not simply refusing pointer slots.
+    AggRec target = default; target.a = 42;
+    AggBoxPtr bracePtr = { p = &target, n = 7 };
+    AggRec*[2] arrPtr = { &target, &target };
+    result &= Test("cvs_brace_ptr_field", bracePtr.p->a, 42);
+    result &= Test("cvs_brace_ptr_n",     bracePtr.n,     7);
+    result &= Test("cvs_agg_ptr_elem0",   arrPtr[0]->a,  42);
+    result &= Test("cvs_agg_ptr_elem1",   arrPtr[1]->a,  42);
+
+    // An array aggregate of FUNCTION values.
+    function<double(double)>[2] arrFn = { aggRo, aggR2 };
+    result &= Test("cvs_agg_fn_elem0", (int)arrFn[0](1.0), 1001);
+    result &= Test("cvs_agg_fn_elem1", (int)arrFn[1](1.0), 2001);
+
+    // The length-inferred array VIEW, whose gate is live through a `string` element (a pointer
+    // element never reaches it - a pre-existing guard fires first). This is the accept twin of
+    // that reject leg: a real string and a literal must both still land.
+    string aggStr = "aa";
+    string[] strView = { aggStr, "b" };
+    result &= Test("cvs_agg_view_string_elem0", (int)strView[0].length(), 2);
+    result &= Test("cvs_agg_view_string_elem1", (int)strView[1].length(), 1);
+
+    // Field DEFAULTS of function type, struct and class.
+    AggDefS ds = default;
+    AggDefC dc = default;
+    result &= Test("cvs_fielddefault_fn_struct", (int)ds.f(1.0), 1001);
+    result &= Test("cvs_fielddefault_fn_class",  (int)dc.f(1.0), 1001);
+    result &= Test("cvs_fielddefault_n_struct",  ds.n, 4);
+    result &= Test("cvs_fielddefault_n_class",   dc.n, 5);
+
+    // Parameter default of function type, omitted and supplied.
+    result &= Test("cvs_paramdefault_fn_omitted",  (int)aggCallDefault(),       1001);
+    result &= Test("cvs_paramdefault_fn_supplied", (int)aggCallDefault(aggR2),  2001);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -2481,6 +2656,12 @@ extern int main()
 
     // A `function<>` CALL RESULT into a closure parameter (fat and thin)
     total++; passed += testFuncPtrCallResultIntoClosureParam() ? 1 : 0;
+
+    // Accept set for the code-value STORE gate (decl-init / assignment / field / return)
+    total++; passed += testCodeValueStoreAccepts()        ? 1 : 0;
+
+    // Accept set for the AGGREGATE / DEFAULT store spellings (brace, array, field/param default)
+    total++; passed += testCodeValueAggregateStoreAccepts() ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;
