@@ -56,7 +56,18 @@ landed design record below. And `interface-field-self-assign-false-positive` was
 REVERTED - see its file for the three discriminators that cannot work.
 ## Resume point
 
-**Current head: the P1 campaign.** macOS arm64 Release **576 / 0 / 8** plus `example_mac.sh`
+**2026-08-04: P1-to-zero release campaign in progress.** Goal: zero open P1s ahead of a release.
+The 6 open P1s (post re-bucket, see the 2026-08-04 recount below) are being driven through the
+`fix-issue` workflow (worktree, opus fix agent with coverage matrix, opus review loop, linear
+merge), roughly narrowest-first: `temp-unique-field-into-borrow-slot-use-after-free` and
+`code-value-into-data-pointer-outside-overload-resolution` in parallel worktrees first, then
+`delete-of-untracked-pointer-copy-not-diagnosed`,
+`unique-field-global-struct-self-assign-false-positive`,
+`interface-field-self-assign-false-positive`, and last the deliberately-accepted runtime-index
+residue of `unique-field-to-field-array-element-receiver` (decision needed: runtime owner check
+vs re-rank, per its own file). Progress is tracked by row deletion here, as always.
+
+**Previous head: the P1 campaign.** macOS arm64 Release **576 / 0 / 8** plus `example_mac.sh`
 **35 / 0** and `test_lsp.sh` **152 / 0** (re-measured 2026-08-03; the 554 this line carried was
 stale by 22 tests). Six P1s fixed on 2026-07-31 (`99d73f3`, `696060d`, `8c29ca7`, `d65f000`, `4000fa1`,
 `4097959`) and two more on 2026-08-01 (`funcptr-call-result-into-closure-param-garbage`,
@@ -189,9 +200,9 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 8 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 40 |
-| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 27 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 6 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 43 |
+| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 29 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
 Counts re-verified from disk on 2026-08-01 (`ls internal/issue/p{1,2,3}/*.md ui/*.md | wc -l` per
@@ -263,12 +274,32 @@ count-neutral for P1: one file out, and
 than left implicit when that fix was scoped to argument binding. It also added
 `p2/c-binder-misses-decorated-function-pointer-parameter`, found while verifying its oracle.
 
+Counts re-verified from disk on 2026-08-04 at the start of the P1-to-zero release campaign:
+**6 P1 / 43 P2 / 29 P3 / 7 UI = 85 total** (after this round's re-bucket). Both integrity checks
+were re-run scriptably (extract `[[...]]` links per table section, diff against `ls` per bucket)
+and FOUR failures were found and fixed in this edit - the worst tally since the checks were
+introduced:
+
+- `p1/delete-of-untracked-pointer-copy-not-diagnosed` had a file and no row (filed 2026-08-02).
+- `p2/null-interface-access-remaining-storage-kinds`, `p2/c-binder-misses-decorated-function-pointer-parameter`
+  and `p2/coalesce-assign-skips-store-bookkeeping` all had files and no rows.
+- One P1 table row (the null-interface-access residue) described a FIXED item and resolved to no
+  file; removed - its record lives in the plan file and the new P2 row.
+- `interface-boxing-keyed-on-source-binding` re-bucketed P1 -> P3 per its own text (only the
+  preventive `RegisterInterfaceBox` dedupe remainder is left).
+
+Net movement: no fixes this edit - bookkeeping only, so the true open-P1 count entering the
+campaign is **6**: `code-value-into-data-pointer-outside-overload-resolution`,
+`delete-of-untracked-pointer-copy-not-diagnosed`, `interface-field-self-assign-false-positive`,
+`temp-unique-field-into-borrow-slot-use-after-free`,
+`unique-field-global-struct-self-assign-false-positive`, and the runtime-index residue of
+`unique-field-to-field-array-element-receiver`.
+
 ### P1 - wrong programs and crashes (`p1/`)
 
 | Issue | Severity |
 |---|---|
-| [[interface-boxing-keyed-on-source-binding]] | NARROWED 2026-07-31, then CLOSED 2026-08-04: `delete` of a BORROWED interface box now diagnoses at the boxing site via a positive keeps-owner proof (six clauses, join rule for `??=`; see the file for the accepted gaps). No longer a P1 - only the preventive `RegisterInterfaceBox` dedupe remainder is left. |
-| null-interface-access residue - **FIXED 2026-08-03 in three stages**; design record at [`internal/plan/null-interface-access-widening.md`](../plan/null-interface-access-widening.md), remainder filed as [[null-interface-access-remaining-storage-kinds]] | Was SIGSEGV (139), no diagnostic. Stage 1 (`9e7ffc4`) re-keyed the proof on (frame-local alloca, constant index path), closing struct-field and array-element receivers - and `PHolder h;` / `h = {}`, which turned out to be provably null via the synthesized default ctor. Stage 3 (`727f53d`) made it cross-block with a **MUST** lattice (intersection, NOT `nulldf`'s union - see the plan's section 5; a MAY merge false-rejects accept leg 2) plus control-dependence containment, closing the four local spellings where intervening control flow dropped the diagnostic. Stage 2 closed whole-global receivers via a whole-module never-written fact AND the CD test - **neither alone is sound**, see probe e3. A field/element of a global aggregate was closed 2026-08-03 (new `ResolveIfaceStorageGlobal` walks a `GEPOperator` chain back to the `GlobalVariable` base). Still open and filed separately: a bare `PLive lv;` with no initializer (exit 133, a genuinely uninitialised read, not a null one). |
+| [[delete-of-untracked-pointer-copy-not-diagnosed]] | Silent double free (exit 134), no diagnostic. `Ci* b = c;` (or `alias Ci* b = c;`) off an owning local, then `delete b;` - the copy is neither `IsOwning` nor flagged as a borrow, so nothing distinguishes it from a legitimate owner. Not boxing-specific; the boxed spelling reaches the same hole. Fix direction: establish the borrow at the DECLARATION (set `IsBorrowed`/`BorrowedOrigin` when the initializer is a plain read of a live `IsOwning` binding), which both existing consumers already consult. Filed 2026-08-02; had no row here until 2026-08-04. |
 | [[code-value-into-data-pointer-outside-overload-resolution]] | Exit 138, no diagnostic, identical on `904f026` and on `fix/funcptr-rebind`. `Rec* r = w;`, `return w;` and a `b.p = w;` field store all put a function-pointer VALUE into a data pointer and write through it. Recorded by review round 1 of `fix/funcptr-rebind`, which closed the OVERLOAD-BINDING path of the same defect class (`ComputeOverloadFunction` plus its variadic short-circuit) and deliberately did not reach the store paths - the shared predicates `ArgumentIsCodeValue` / `ParameterStoresData` exist, what is missing is a destination-side reader. Build the accept set first; an explicit cast must keep working. |
 | [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. An interface-field-to-interface-field copy with the SAME field name on both sides is misread as a self-assign, suppressing the reject. **ATTEMPTED AND REVERTED 2026-08-01** - see the file for the three discriminators that cannot work (names, box storage, and a bare `Value` compare of the field address all fail at least one witness). A sound test needs real dataflow through the box to the underlying data pointer. |
 | [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. **NARROWED 2026-08-02** by `fix/uniq-array-elem`: root cause CONFIRMED by instrumentation (`FieldName`/`CallerName` name the CONTAINER, so `selfFieldAssign` swallowed a genuine two-owner store), and every element pair whose addresses are constant-provably different now rejects - local, generic-substituted, nested, array-as-field, through-pointer, view, and global arrays. BOTH copies of the name comparison were fixed; the second (`sameField`) also guards the reassignment-destruct, and fixing only the first traded an abort for a leak. Residue: any index not constant in the emitted IR - a runtime subscript, and a `const` integer (`const` is unenforced, so folding it would be unsound). |
@@ -319,11 +350,15 @@ than left implicit when that fix was scoped to argument binding. It also added
 | [[file-offsets-capped-at-2gb]] | silent wrong value | `core/filesystem.cb` narrows every offset through `int`, so `File.size()`/`tell()`/`seek()` truncate past 2 GB on ALL platforms - the public surface is `int` too, so widening the internals alone is not enough. Split out of `ftell-fseek-long-width-on-windows` when that P1 landed 2026-08-02; NOT the `long`-width defect, which is fixed. Had no row in this table until 2026-08-03 - it was filed in narrative only. |
 | [[string-literal-containing-braces-retyped-as-string]] | miscompile + false rejection | A string literal whose CONTENT contains a brace pair (`"a = {} b"`) is typed `string` instead of `char*`. At a call it stops every `char*` overload matching and the diagnostic blames the call; at a VARIADIC it is a SILENT MISCOMPILE - `printf("a = {} b\n");` compiles and runs rc 0 printing binary garbage, and the dedicated `cannot pass 'string' to the variadic '...'` guard does not fire. Identical on both binaries. Filed 2026-08-02 in `p2/` for the rejection face; the miscompile face may warrant P1. |
 | [[simd-type-spelling-unusable-outside-declarations]] | feature gap | `simd<T,N>` is recognised only in `ParseDeclarationSpecifiers` and as a `primaryExpression`, so a cast target, a lambda parameter and a tuple/`function<>` signature component all say "unknown type 'simd<float,4>'", and `simd<T,N>[]` silently DROPS the empty bracket and compiles as a plain vector local. Measured identical on `904f026` and `fix/simdptr`. Wants one encoded-name mechanism (mirroring `BuildEncodedClosureName`), not four patches. Filed 2026-08-03. |
+| [[null-interface-access-remaining-storage-kinds]] | crash at run time | SIGSEGV (139) / SIGTRAP (133) with a clean compile, no diagnostic - the storage kinds the three-stage null-interface widening left open. NOT a regression (identical on `904f026`). Read [`internal/plan/null-interface-access-widening.md`](../plan/null-interface-access-widening.md) first, especially the deliberately-accepted section and the MUST-vs-MAY correction. Filed 2026-08-03; had no row here until 2026-08-04. |
+| [[c-binder-misses-decorated-function-pointer-parameter]] | false rejection | A `const`-qualified C function-pointer parameter binds as `void*`, and the code-value gate then rejects the legal call. Found 2026-08-03 verifying the `void*` oracle for `fix/funcptr-rebind`; the file's first filing named the wrong qualifier and repro - the correction inside is the useful part. Had no row here until 2026-08-04. |
+| [[coalesce-assign-skips-store-bookkeeping]] | ownership | `??=` emits its own compare/branch/store then RETURNS, skipping every piece of post-store bookkeeping the plain `=` path runs (`TransferPointerOwnershipOnStore`, move/unmove marking, element-borrow refresh). Pre-existing; filed 2026-08-04 while fixing the `??=` half of the borrowed-interface-box guard. Had no row here until 2026-08-04. |
 
 ### P3 - diagnostics, latent, deliberate deferrals (`p3/`)
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[interface-boxing-keyed-on-source-binding]] | deliberate deferral | RE-BUCKETED P1 -> P3 2026-08-04, on the file's own text: the live double free it was filed for was CLOSED 2026-08-02 (borrowed-interface-box delete diagnosed via the positive keeps-owner proof; landed record below), and only the preventive remainder is left - `RegisterInterfaceBox` dedupes on `FatValue` alone, harmless today. The file kept its name and moved to `p3/`, so existing links still resolve. |
 | [[owning-temp-parent-misroutes-chained-alias-access]] | diagnostic | RE-RANKED P1 -> P3 2026-08-02, on the file's own "re-rank freely" and on a re-measurement: the VERDICT is right (two `unique` owners really is an error) and only the WORDING is wrong, so no program's accept/reject status changes. A wrong message is P3 by this table's own rubric; it sat at P1 only for visibility to whoever next touched the `unique` field-store routing, and that work has landed. Still live on `ca5a02a`: the call-result message fires on a container-element shape, stating a false mechanism and naming a remedy that aborts 134. |
 | [[return-dangle-missed-when-slot-has-extra-user]] | deliberate deferral | RECLASSIFIED P1 -> P3 2026-08-02 by the maintainer, rationale kept intact. Missed dangle, no diagnostic - but the shapes were ALL accepted before `2bcc5a0` too, so this is residue, not a regression, and its own file rules out the obvious remedy (widening the extra-user whitelist re-introduces false rejections). Stays open as a record of what the pass cannot see. |
 | [[nullcond-guard-skips-move-argument-cleanup]] | latent | INTRODUCED by the `null-conditional-args-eval-order` fix, and accepted rather than fixed. A `move` argument to a '?.' call on a NULL receiver never runs, so nothing takes ownership - but the source is still statically marked moved, so scope exit frees nothing either, and the allocation leaks (`frees=0` vs master's `frees=1`). Not memory-unsafe and not observable in-language; reading the source after the call is rejected identically on both binaries. Filed 2026-07-31. |
