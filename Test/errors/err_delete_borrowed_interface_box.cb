@@ -286,6 +286,91 @@ expect_error("cannot delete 'dHopCopy' - it copies 'cHopOwner'") {
     }
 }
 
+// A ONE-HOP copy of a container-ELEMENT borrow. The direct `delete eSrc;` spelling already
+// rejected; the decl-init clause read IsBorrowOfUniqueElement off the accessor RESULT, so exactly
+// one hop through a plain local defeated it. The fact is now carried off the source BINDING too.
+// Retirement is COPY-end only here: the container owns the element whatever the source local is
+// later pointed at, which is why rebinding `eSrc` does not retire it (unlike an owning-local copy).
+expect_error("cannot delete 'bElemCopy' - it borrows an element that its container owns") {
+    int copyOfElemBorrow()
+    {
+        list<unique CircleB*> lElem;
+        lElem.add(new CircleB());
+        CircleB* eSrc = lElem.get(0);
+        CircleB* bElemCopy = eSrc;
+        delete bElemCopy;
+        return 1;
+    }
+}
+
+// The BOXED twin of that copy. The raw guard and the boxing proof read the same propagated fact,
+// so boxing cannot launder what `delete bElemBox;` rejects.
+expect_error("cannot delete interface 'sElemCopy' - it boxes an object that its container already frees") {
+    int copyOfElemBorrowBoxed()
+    {
+        list<unique CircleB*> lBox;
+        lBox.add(new CircleB());
+        CircleB* eBox = lBox.get(0);
+        CircleB* bElemBox = eBox;
+        IShapeB sElemCopy = bElemBox;
+        delete sElemCopy;
+        return 1;
+    }
+}
+
+// `move` off a copy of an owning local. `delete bMoveCopy;` was already rejected while
+// `CircleB* dAdopt = move bMoveCopy;` compiled and adopted ownership the copy never had - the two
+// spellings of one mistake disagreed. The move guard now reads the SAME proof as the delete guard.
+expect_error("cannot 'move' 'bMoveCopy' - it copies 'cMoveOwner'") {
+    int moveOffCopyOfOwner()
+    {
+        CircleB* cMoveOwner = new CircleB();
+        CircleB* bMoveCopy = cMoveOwner;
+        CircleB* dAdopt = move bMoveCopy;
+        return dAdopt->area();
+    }
+}
+
+// `move` off a container-element borrow, in its DIRECT spelling: moving the borrow never clears
+// the container's slot, so the container's destructor still frees the pointee.
+expect_error("cannot 'move' 'eMoveSrc' - it borrows an element its container owns") {
+    int moveOffElemBorrow()
+    {
+        list<unique CircleB*> lMove;
+        lMove.add(new CircleB());
+        CircleB* eMoveSrc = lMove.get(0);
+        CircleB* dElemAdopt = move eMoveSrc;
+        return dElemAdopt->area();
+    }
+}
+
+// A '?:' JOIN bound to a POINTER local. The DIRECT boxed spelling was already rejected because the
+// join boxes per arm with each arm's binding still in hand; routing it through a pointer local
+// first erased that. BOTH-ARMS rule: every non-null arm must prove another owner, so the mixed
+// `cJoin : new CircleB()` shape stays ACCEPTED (join_owner_new_* in Test/test_move.cb).
+expect_error("cannot delete 'bJoined' - every arm of the join it was bound from") {
+    int deleteJoinOfOwner()
+    {
+        CircleB* cJoinOwner = new CircleB();
+        CircleB* bJoined = identityBoolB(true) ? cJoinOwner : cJoinOwner;
+        delete bJoined;
+        return 1;
+    }
+}
+
+// The same join reached by ASSIGNMENT rather than declaration. The proof is recorded by the '='
+// that rebound the local, and is retired by any later plain '=' that proves nothing.
+expect_error("cannot delete 'pJoinAssigned' - every arm of the join it was bound from") {
+    int deleteJoinAssigned()
+    {
+        CircleB* cAssignOwner = new CircleB();
+        CircleB* pJoinAssigned = nullptr;
+        pJoinAssigned = identityBoolB(true) ? cAssignOwner : cAssignOwner;
+        delete pJoinAssigned;
+        return 1;
+    }
+}
+
 extern int main()
 {
     return 0;

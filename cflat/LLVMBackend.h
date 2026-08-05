@@ -930,6 +930,17 @@ public:
         // carried across the store instead of retired. Refreshed on every '='; see MarkPointerRebound.
         bool InheritedKeepsOwner = false;
         std::string InheritedKeepsOwnerSource; // that proof's rendered owner name, for the diagnostic
+        // compile-time: this POINTER binding was bound from a '?:' / '??' JOIN whose EVERY non-null
+        // arm proved another owner. A join carries no source binding, so no source-keyed clause can
+        // see it; recorded where the arms are in hand and re-asked at the delete / store sites.
+        // Deliberately NOT InheritedKeepsOwner: that one is also set by the plain `p = c;` store,
+        // which IMPLIED-MOVES the pointee out of `c`, so `delete p;` there is correct.
+        bool JoinKeepsOwner = false;
+        std::string JoinKeepsOwnerSource; // that join's rendered owner name, for the diagnostic
+        // Every proving ARM's SLOT, so the consumers can re-ask whether they ALL still prove.
+        // Without these the proof retires only when the JOIN end is rebound, and nulling or
+        // rebinding an ARM leaves it stale - a false rejection whose remedy leaks.
+        std::vector<llvm::Value*> JoinKeepsOwnerSlots;
         // The rebinding was a '??=', whose handler returns before the container-element refresh the
         // plain '=' path runs. Suppresses the (possibly stale) element clause of the BOXING proof
         // only - the raw-delete guard reads BorrowsOwnedElement directly and is deliberately
@@ -20073,6 +20084,32 @@ public:
             nv->InheritedKeepsOwner = !inheritedOwner.empty();
             nv->InheritedKeepsOwnerSource = inheritedOwner;
             nv->CoalesceRebound = coalesceJoin;
+            // Written unconditionally so a plain '=' retires whatever join a declaration (or an
+            // earlier store) recorded; SetJoinKeepsOwner re-arms it when THIS RHS is such a join.
+            nv->JoinKeepsOwner = false;
+            nv->JoinKeepsOwnerSource.clear();
+            nv->JoinKeepsOwnerSlots.clear();
+            return;
+        }
+    }
+
+    // Re-arm the join proof on a pointer binding a '?:' / '??' join was just stored into. Always
+    // called AFTER MarkPointerRebound, which clears it; empty `owner` leaves it retired.
+    void SetJoinKeepsOwner(const std::string& name, const std::string& owner,
+                           const std::vector<llvm::Value*>& slots)
+    {
+        if (name.empty() || owner.empty() || slots.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            NamedVariable* nv = nullptr;
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                nv = &it->second;
+            else if (auto it2 = frame.functionArgument.find(name); it2 != frame.functionArgument.end())
+                nv = &it2->second;
+            if (nv == nullptr) continue;
+            nv->JoinKeepsOwner = true;
+            nv->JoinKeepsOwnerSource = owner;
+            nv->JoinKeepsOwnerSlots = slots;
             return;
         }
     }

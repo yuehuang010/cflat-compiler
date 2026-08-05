@@ -5,6 +5,8 @@
 struct Res { int v = 0; };
 struct Box { unique Res* p = nullptr; };
 
+bool identityBoolRes(bool b) { return b; }
+
 extern int main()
 {
     expect_error("cannot store 'alias' into unique field 'Box.p' - it aliases 'a.p', a unique field") {
@@ -13,6 +15,37 @@ extern int main()
         Box c = default;
         Res* alias = a.p;
         c.p = alias;
+    }
+
+    // The same second owner reached through a plain COPY of an owning LOCAL. The copy carries no
+    // IsBorrowed, so the alias clause above cannot see it; the fact is recorded at the copy's
+    // DECLARATION and re-asked here. The DIRECT store `c.p = owner;` transfers ownership out of
+    // `owner`, which is why the message names it as the remedy - see the
+    // uf_store_copy_* accept legs in Test/test_move.cb for the shapes that must stay legal.
+    expect_error("cannot store 'copyOne' into unique field 'Box.p' - 'copyOne' copies 'ownerOne'") {
+        Box d = default;
+        Res* ownerOne = new Res();
+        Res* copyOne = ownerOne;
+        d.p = copyOne;
+    }
+
+    // TWO hops. The origin is carried from the first copy's recorded SLOT, so the diagnostic still
+    // names the real owner and never the intermediate copy.
+    expect_error("cannot store 'copyTwo' into unique field 'Box.p' - 'copyTwo' copies 'ownerTwo'") {
+        Box e = default;
+        Res* ownerTwo = new Res();
+        Res* hopTwo = ownerTwo;
+        Res* copyTwo = hopTwo;
+        e.p = copyTwo;
+    }
+
+    // A '?:' JOIN bound to a pointer local first. The join carries no source binding at all, so
+    // this is the arm-keyed proof, not the copy-keyed one - the message says "every arm".
+    expect_error("cannot store 'joined' into unique field 'Box.p' - every arm of the join") {
+        Box f = default;
+        Res* ownerThree = new Res();
+        Res* joined = identityBoolRes(true) ? ownerThree : ownerThree;
+        f.p = joined;
     }
     return 0;
 }

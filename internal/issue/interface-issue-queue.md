@@ -218,9 +218,9 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 3 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 45 |
-| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 31 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 2 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 47 |
+| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 32 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
 Counts re-verified from disk on 2026-08-01 (`ls internal/issue/p{1,2,3}/*.md ui/*.md | wc -l` per
@@ -386,11 +386,31 @@ value is NOT code, on the closure-widen gate. They need opposite ledgers and opp
 the second guard would have been written past an already-frozen accept set. The landed design
 record is at the bottom of this file.
 
+**Recount 2026-08-05, after `pointer-copy-propagates-no-ownership-fact` landed:** its file is
+deleted and its P1 row removed - the SIXTH campaign fix. All FOUR of its filed repros now reject
+with a diagnostic. The change is NOT count-neutral in the usual direction: it files THREE new items,
+none at P1 - two P2 ([[move-of-borrowed-pointer-adopts-into-plain-destination]],
+[[coalesce-join-null-local-arm-erases-owner-proof]]) and one P3
+([[implied-move-store-boxed-spelling-false-rejects]]). Counted from disk per bucket, on the tree
+rebased over the merged `fix/joinledger`:
+**2 P1 / 47 P2 / 32 P3 / 7 UI = 88 total.** Both integrity checks were re-run against this tree
+(every row resolves to a file, every file has a row, per bucket) and are clean.
+
+The P3 is the notable one, and it was found by the fix's own ACCEPT SET rather than by a review: an
+intermediate cut of this change read `InheritedKeepsOwner` in the raw-`delete` guard, which
+false-rejected `Ci* p = nullptr; p = c; delete p;` - a program master runs at one free, because that
+store is an IMPLIED MOVE. The accept leg caught it before the guard shipped; the pre-existing BOXED
+half of the same mis-blame is what got filed. That is the "build the accept set FIRST" rule paying
+for itself inside a single round, and it is why the join proof is a separate field.
+
+The two remaining P1s are both campaign-review discoveries:
+[[join-defeats-the-closure-widen-gate]] and
+[[temp-unique-field-escapes-through-unguarded-spellings]].
+
 ### P1 - wrong programs and crashes (`p1/`)
 
 | Issue | Severity |
 |---|---|
-| [[pointer-copy-propagates-no-ownership-fact]] | Four silent double frees (exit 134), no diagnostic, all identical on `312d202` and on the merged `fix/untracked-copy`. A pointer DECLARATION copies the VALUE and nothing else, so every ownership fact a source binding carries needs its own hand-written clause at the decl-init site and any fact without one vanishes across the copy. Live members: a copy stored into a `unique` FIELD; a one-hop copy of a container-ELEMENT borrow (the direct spelling rejects); `T* d = move b;` off a copy (whose `delete b;` twin now rejects, so the two spellings disagree); and a `?:` join into a pointer declaration (whose DIRECT boxed spelling rejects). Fix direction: one clause per fact, recorded by storage identity and re-asked for liveness at the consumer, exactly like `BorrowsOwningLocal`. Each needs its own accept set first - (a) and (b) both have sole-owner shapes where a rejection would LEAK. Filed 2026-08-04 by the round-1 review of `fix/untracked-copy`. |
 | [[join-defeats-the-closure-widen-gate]] | Exit 139, no diagnostic, on `d93c359` AND on the merged `fix/joinledger`. `applyL(c ? vp : vq)` and `d.lam(c ? vp : vq)` widen a `void*` into a fat closure's CODE slot and call it; the BARE `applyL(vp)` is diagnosed on both binaries, so the join is what defeats the gate. Mirror of the code-value join defect: `WidenToClosureFatChecked` gates on PROVENANCE and a join proves nothing, so the correct polarity accepts and the widen happens. Needs the OPPOSITE ledger - values proven to be DATA - and the opposite quantifier, EVERY arm rather than ANY arm; getting that backwards false-rejects every mixed join. A join of two `function<>` values into the same parameter runs correctly on both binaries and is the first accept-set cell. Filed 2026-08-05 by the neighbour audit of `fix/joinledger`. |
 | [[temp-unique-field-escapes-through-unguarded-spellings]] | Silent use-after-free, compiles clean and exits 0. The residue spellings `fix/temp-uniq-borrow` did NOT reach, all measured identical on `6e9ab46` and on the merged fix: a same-type C-style cast, a `??` join, a `?:` join, an ARRAY AGGREGATE initializer (`Node*[2] a = { makeBox().t, nullptr };` - not the `EmitOneFieldInit` path), and a call ARGUMENT that stores. The argument case is PARTLY closable - a `unique T*` or `move T*` parameter states the claim at the call site (both measured still broken); a plain `T*` parameter is the undecidable remainder. Fix order and per-spelling accept sets are in the file. Filed 2026-08-04 by the round-1 review. |
 
@@ -442,12 +462,15 @@ record is at the bottom of this file.
 | [[simd-type-spelling-unusable-outside-declarations]] | feature gap | `simd<T,N>` is recognised only in `ParseDeclarationSpecifiers` and as a `primaryExpression`, so a cast target, a lambda parameter and a tuple/`function<>` signature component all say "unknown type 'simd<float,4>'", and `simd<T,N>[]` silently DROPS the empty bracket and compiles as a plain vector local. Measured identical on `904f026` and `fix/simdptr`. Wants one encoded-name mechanism (mirroring `BuildEncodedClosureName`), not four patches. Filed 2026-08-03. |
 | [[null-interface-access-remaining-storage-kinds]] | crash at run time | SIGSEGV (139) / SIGTRAP (133) with a clean compile, no diagnostic - the storage kinds the three-stage null-interface widening left open. NOT a regression (identical on `904f026`). Read [`internal/plan/null-interface-access-widening.md`](../plan/null-interface-access-widening.md) first, especially the deliberately-accepted section and the MUST-vs-MAY correction. Filed 2026-08-03; had no row here until 2026-08-04. |
 | [[c-binder-misses-decorated-function-pointer-parameter]] | false rejection | A `const`-qualified C function-pointer parameter binds as `void*`, and the code-value gate then rejects the legal call. Found 2026-08-03 verifying the `void*` oracle for `fix/funcptr-rebind`; the file's first filing named the wrong qualifier and repro - the correction inside is the useful part. Had no row here until 2026-08-04. |
+| [[move-of-borrowed-pointer-adopts-into-plain-destination]] | ownership | Exit 134, no diagnostic, identical on `d93c359` and on the merged `fix/ptrcopy`. `move` of an `IsBorrowed` source is gated only on a `unique` DESTINATION, so `Ci* d = move p;` off a borrowed pointer PARAMETER (and its one-hop copy, and the `move`-returning-wrapper spelling) adopts ownership the borrow never had. `fix/ptrcopy` added the destination-agnostic move guard next to this and deliberately left `IsBorrowed` out of it: `MainListener.h` carries an explicit ratified policy that forwarding an ordinary borrow as `move` stays legal, so closing this means REOPENING that policy with its own accept set, not adding a clause. Filed 2026-08-05 by `fix/ptrcopy`. Silent double free, so P1 by the bare rubric; filed P2 under the residue-not-regression precedent (`unique-field-to-field-interface-receiver-residues`, `return-dangle-missed-when-slot-has-extra-user`) - accepted by the PRE binary too, so residue rather than regression. Re-rank to P1 if the maintainer rules the silent-double-free rubric wins. |
+| [[coalesce-join-null-local-arm-erases-owner-proof]] | ownership | Exit 134, no diagnostic, identical on `d93c359` and on the merged `fix/ptrcopy`. `Ci* n = nullptr; Ci* b = n ?? c; delete b;` and its BOXED twin both double-free. The BOTH-ARMS join rule skips a null LITERAL arm as neutral but counts a LOCAL that merely HOLDS null as a non-proving arm, so the whole join is dropped. The raw and boxed spellings AGREE here, so this is a pre-existing hole in the arm CLASSIFICATION, not an asymmetry `fix/ptrcopy` introduced - its `?:` twins reject on both binaries. Silent double free, so P1 by the bare rubric; filed P2 under the residue-not-regression precedent (`unique-field-to-field-interface-receiver-residues`, `return-dangle-missed-when-slot-has-extra-user`) - accepted by the PRE binary too, so residue rather than regression. Re-rank to P1 if the maintainer rules the silent-double-free rubric wins. Filed 2026-08-05 by `fix/ptrcopy`. |
 | [[coalesce-assign-skips-store-bookkeeping]] | ownership | `??=` emits its own compare/branch/store then RETURNS, skipping every piece of post-store bookkeeping the plain `=` path runs (`TransferPointerOwnershipOnStore`, move/unmove marking, element-borrow refresh). Pre-existing; filed 2026-08-04 while fixing the `??=` half of the borrowed-interface-box guard. Had no row here until 2026-08-04. |
 
 ### P3 - diagnostics, latent, deliberate deferrals (`p3/`)
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[implied-move-store-boxed-spelling-false-rejects]] | diagnostic | PRE-EXISTING false rejection, identical on `d93c359` and on the merged `fix/ptrcopy`. A plain `p = c;` store between two pointer locals is an IMPLIED MOVE, so the raw `delete p;` is correct and accepted - but `MarkPointerRebound` runs BEFORE the transfer and records `InheritedKeepsOwner` naming `c`, which is null by then. Nothing reads that in the raw-delete guard; `BindingKeepsOwnershipOfBoxedObject` does, so the BOXED twin is rejected with a message that is false at that site. P3: working remedy, mis-blamed rather than dangerous. Recorded because it is why `fix/ptrcopy` introduced `JoinKeepsOwner` as a SEPARATE field. Filed 2026-08-05 by `fix/ptrcopy`. |
 | [[interface-boxing-keyed-on-source-binding]] | deliberate deferral | RE-BUCKETED P1 -> P3 2026-08-04, on the file's own text: the live double free it was filed for was CLOSED 2026-08-02 (borrowed-interface-box delete diagnosed via the positive keeps-owner proof; landed record below), and only the preventive remainder is left - `RegisterInterfaceBox` dedupes on `FatValue` alone, harmless today. The file kept its name and moved to `p3/`, so existing links still resolve. |
 | [[owning-temp-parent-misroutes-chained-alias-access]] | diagnostic | RE-RANKED P1 -> P3 2026-08-02, on the file's own "re-rank freely" and on a re-measurement: the VERDICT is right (two `unique` owners really is an error) and only the WORDING is wrong, so no program's accept/reject status changes. A wrong message is P3 by this table's own rubric; it sat at P1 only for visibility to whoever next touched the `unique` field-store routing, and that work has landed. Still live on `ca5a02a`: the call-result message fires on a container-element shape, stating a false mechanism and naming a remedy that aborts 134. |
 | [[return-dangle-missed-when-slot-has-extra-user]] | deliberate deferral | RECLASSIFIED P1 -> P3 2026-08-02 by the maintainer, rationale kept intact. Missed dangle, no diagnostic - but the shapes were ALL accepted before `2bcc5a0` too, so this is residue, not a regression, and its own file rules out the obvious remedy (widening the extra-user whitelist re-introduces false rejections). Stays open as a record of what the pass cannot see. |
@@ -652,12 +675,14 @@ on twice), a GLOBAL owning pointer (globals never scope-exit-free), an `alias`- 
 call result, a container element, a parameter (already rejected), and a `unique` local (already
 rejected). All measured accepted-and-correct on both binaries.
 
-**The neighbouring double frees this accept set measured are FILED, not parked here**, since this
-section's heading says nothing in it is open: [[pointer-copy-propagates-no-ownership-fact]] (P1)
-holds all four, with repros - a copy stored into a `unique` field, a one-hop copy of a
-container-element borrow, `T* d = move b;` off a copy, and a `?:` join into a pointer declaration.
-All four are the same missing propagation through a plain copy, each needing a different fact
-carried and its own accept set, which is why none was folded in here.
+**The neighbouring double frees this accept set measured were FILED, not parked here**, since this
+section's heading says nothing in it is open: `pointer-copy-propagates-no-ownership-fact` (P1) held
+all four, with repros - a copy stored into a `unique` field, a one-hop copy of a container-element
+borrow, `T* d = move b;` off a copy, and a `?:` join into a pointer declaration. All four are the
+same missing propagation through a plain copy, each needing a different fact carried and its own
+accept set, which is why none was folded in here. **All four are now CLOSED by `fix/ptrcopy`** and
+that file is deleted; see its own design record below for the four mechanisms and the three residues
+it split out.
 
 **Stale blame, tolerated (P3-grade).** In the two cells where the source stops owning the object
 BEFORE the copy's delete - `T* d = move c;` and a preceding `delete c;` - the REJECTION is correct
@@ -666,6 +691,115 @@ BEFORE the copy's delete - `T* d = move c;` and a preceding `delete c;` - the RE
 no-op second delete for the other. The retirement check answers about the SLOT's binding, which is
 still owning in both. The sibling record documents the same tolerance for stale blame elsewhere in
 this proof; correct blame needs move/delete state threaded into the recheck.
+
+### fix/ptrcopy - the four ownership facts a plain pointer COPY drops (RATIFIED)
+
+Closes `pointer-copy-propagates-no-ownership-fact`, the sibling of `fix/untracked-copy` above. That
+change carried ONE fact across a pointer declaration (`BorrowsOwningLocal`, consumed by the raw and
+boxed `delete` guards); this one carries the rest and serves the other two consumers. All four filed
+repros were silent double frees with no diagnostic on `d93c359`, and all four now reject. Measured
+over an 88-cell corpus (`scratch/upc/final_matrix.txt`): **30 cells changed** (crash -> diagnostic),
+**53 byte-identical**, and **5 that crash on BOTH binaries** - the filed residues below, whose only
+difference is the abort code (133 vs 134, a benign cold-vs-warm cache property of the two builds,
+not a behaviour difference). 30 + 53 + 5 = 88.
+
+| Member | Mechanism | Consumers reached |
+|---|---|---|
+| (a) copy stored into a `unique` FIELD | the store site re-asks `OwningLocalCopyStillAliases` on the SOURCE binding, resolved by storage identity | unique-field store |
+| (b) one-hop copy of a container-ELEMENT borrow | `BorrowsOwnedElement` propagated at decl-init off the source BINDING, not just off the accessor RESULT | raw `delete`, boxed `delete`, `move` |
+| (c) `move` off a copy | a destination-agnostic guard in `ParseMoveExpression` reading the SAME two proofs the `delete` guard reads | every `move` spelling: decl, `=`, argument, `return` |
+| (d) `?:` / `??` JOIN into a pointer declaration | `JoinArmsKeepOwner` walks the arms and records `JoinKeepsOwner` + `JoinKeepsOwnerSource` | raw `delete`, boxed `delete`, unique-field store |
+
+**(a) is a store-side re-ask, NOT a new fact.** The decl-init recording `fix/untracked-copy` landed
+already holds everything the store needs; only the consumer was missing. The DIRECT spelling
+`h.f = c;` is an IMPLIED MOVE that transfers ownership out of `c` and stays legal, which is why the
+diagnostic names it as the remedy - a rejection whose remedy does not exist is the failure mode this
+family has hit before.
+
+**(b)'s retirement is COPY-END ONLY, and that asymmetry is deliberate.** For an owning-local copy,
+rebinding the SOURCE leaves the copy holding the only reference, so the fact retires at both ends.
+For a container element the CONTAINER owns it no matter what the source LOCAL is later pointed at,
+so only the copy's own rebinding retires it - `SetVariableBorrowsOwnedElement` on the plain `=`
+already does that, and the accept leg `elem_copy_rebound_*` pins it. A source that was rebound or
+`??=`'d BEFORE the copy is the stale direction and is dropped at the declaration (accept side).
+
+**(d) uses the BOTH-ARMS rule, taken from the per-arm interface boxing ledger** (`BoxInterfaceJoinArms`):
+every non-null arm must resolve to a live binding that keeps ownership, or the fact is dropped. A
+null LITERAL arm is neutral - it owns nothing, so it neither proves nor blocks. A MIXED join (one arm
+an owning local, one a fresh `new`) is therefore ACCEPTED rather than rejected on a may-alias, which
+is what keeps this from reopening the false-rejection direction. Both spellings are covered: `?:`
+arms come off the PHI, `??` arms off `FindNullCoalesceJoin`, the same two routes the boxing helper
+uses. The ASSIGNMENT form is covered too, recorded by the `=` that rebound the local.
+
+**`JoinKeepsOwner` is a SEPARATE field from `InheritedKeepsOwner`, and reusing the latter was tried
+and MUST NOT be retried.** It looked ideal: same shape, same retirement, already consulted by the
+boxing proof. But `MarkPointerRebound` also sets `InheritedKeepsOwner` on a plain `p = c;` store
+between two pointer locals - and that store is an IMPLIED MOVE, so `c` is nulled and `delete p;` is
+CORRECT (measured: one free, exit 0, on both binaries). Reading it in the raw-`delete` guard
+false-rejected exactly that program. The accept leg caught it before the guard shipped. The
+pre-existing BOXED half of the same stale blame is filed as
+[[implied-move-store-boxed-spelling-false-rejects]] (P3) - `BindingKeepsOwnershipOfBoxedObject` does
+read `InheritedKeepsOwner`, so the boxed twin of that correct program is rejected on both binaries.
+
+**One RATIFIED behaviour change.** `T* d = nullptr; d = move b;` off a copy - the ASSIGNMENT spelling
+with no later `delete` - compiled and ran correctly on `d93c359` (one free: the move transferred
+nothing, and the source still freed at scope exit) and is now REJECTED. It works by accident: the
+identical program with `delete d;` added aborts 134 on `d93c359`. The guard is at the `move`
+expression rather than at each destination, so every spelling of the same mistake agrees, which was
+the point of the member. The diagnostic is true at the site and its remedy (`move` the owner itself)
+is real.
+
+**Scoped out, with reasons, not silently.** `move` of an ordinary `IsBorrowed` binding (a borrowed
+pointer PARAMETER, its one-hop copy, and the `move`-returning-wrapper spelling) is still a silent
+double free - filed as [[move-of-borrowed-pointer-adopts-into-plain-destination]] (P2). It was left
+out because `MainListener.h` carries an explicit policy directly above the new guard - "Forwarding an
+ordinary borrow as 'move' stays legal (the programmer asserts the borrow is dead)" - so closing it
+means REOPENING a ratified decision with its own accept set, not adding a clause. A `??` join whose
+LHS arm is a null-VALUED LOCAL (rather than the null literal) still drops the proof in BOTH the raw
+and the boxed spelling; filed as [[coalesce-join-null-local-arm-erases-owner-proof]] (P2), and the
+agreement between the two spellings is why it is a pre-existing classification hole rather than an
+asymmetry this change introduced.
+
+**Both are silent double frees, which is literally the P1 rubric, and both are filed at P2 under the
+residue-not-regression precedent** - the same rationale as
+[[unique-field-to-field-interface-receiver-residues]] and
+`return-dangle-missed-when-slot-has-extra-user`: every shape they cover was accepted by the PRE
+binary too, so they are residue this change did not reach rather than anything it broke. **Re-rank
+either to P1 if the maintainer rules the silent-double-free rubric wins** - that escape hatch is
+stated here and in both rows deliberately, exactly as the sibling row states it.
+
+Untouched by design, all measured accepted-and-correct on both binaries: a late-assigned source, a
+source rebound after the copy, a copy rebound before its use, a GLOBAL owning source, an
+`alias`/`move` return result, reading through any of these copies, and passing one as a borrowed
+argument. Every one is a shape where the copy or the field is the SOLE owner and a rejection would
+LEAK. The accept half is `Test/test_move.cb`'s `testCopyFactPropagationAccepts` (51 legs, values plus
+free counts); the reject half is three legs in `Test/errors/err_unique_alias_into_field.cb` and six
+in `Test/errors/err_delete_borrowed_interface_box.cb`, each pinning its own wording and each verified
+non-vacuous individually against the `d93c359` binary.
+
+**The join proof records every ARM's SLOT, not just a rendered owner name, and re-asks them all at
+each consumer** (`JoinArmsStillKeepOwner`) - the arm-side twin of `OwningLocalCopyStillAliases`, using
+the same explicit `!PointerRebound` test for the same reason: a rebound binding keeps its `IsOwning`
+flag, which `BindingKeepsOwnershipOfBoxedObject` answers ABOVE its own retirement, so asking that
+helper alone would never retire an arm. Round 1 of this change recorded only the NAME, so the proof
+retired only when the JOIN end was rebound: nulling or rebinding an ARM left it stale and
+FALSE-REJECTED seven programs master runs at one free - and the plain-copy siblings of those exact
+spellings were accepted, so the change made copy and join disagree on the very axis it set out to
+align. The 38-leg accept set had no cell on the arm axis, which is how it shipped; the
+`join_arm_nulled_*` / `join_arm_rebound_*` legs are that missing axis. `T* o = move c;` does NOT
+retire an arm (a move sets no `PointerRebound`), so the genuine double free stays rejected - the same
+stale-blame tolerance the sibling record documents.
+
+**What the arm re-ask gives up** (round-2 measurement; every shape is accepted by the PRE binary
+too, so residue, not regression, and each is the ratified unprovable-then-accept polarity): five
+genuine double frees round 1 rejected are accepted again once liveness is unprovable at the
+consumer. The shapes: an arm nulled inside an UNTAKEN `if` (the walk is not control-flow-aware,
+the same principle the `InterfaceBoxProvenanceUnknown` comment states); an arm that is itself a
+COPY later rebound (the copy's `PointerRebound` short-circuits before anyone asks whether the
+copy's own source still owns - the sharpest of the five); the same copy shape one level into a
+join-of-joins; an arm rebound away and then back to the original object; and a join nest deeper
+than the cap. On that cap: `JoinArmsStillKeepOwner` bounds recursion at depth 4 - a 5-deep join
+chain still rejects, a 6-deep one degrades to accept, the safe direction.
 
 Nothing here is open. These accounts are kept because they explain WHY the shipped code has the
 shape it does, they record approaches that were tried and **must not be retried**, and they hold
@@ -700,6 +834,7 @@ which a future session must not "fix" back without reopening the decision.
 | Empty `{}` split by TARGET TYPE - seeds a non-pointer in both spellings, REJECTED on a pointer in every spelling as AMBIGUOUS between null and a pointer-to-empty. Supersedes `fix/ptr-fieldinit`'s `S*[N] a = {}` zero-init row (RATIFIED) | fix/emptybrace (branch, not yet merged) |
 | Overload identity canonicalized (`f(int)`/`f(i32)` are ONE overload); duplicate definitions diagnosed; function-pointer POINTER DEPTH carried; NAMED functions proved at the argument and declaration sites (RATIFIED) | 2026-08-02, uncommitted |
 | A pure-rename `using` alias folded at MONOMORPHIZATION, so `list<MyInt>` and `list<int>` are ONE instantiation; the alias set pre-registered ahead of BOTH passes (RATIFIED) | fix/alias-mangling, uncommitted |
+| The four ownership facts a plain pointer COPY drops - `unique`-field store, container-element borrow, `move`, and a `?:` / `??` JOIN; `move` of a provable borrow rejected into ANY destination (RATIFIED) | fix/ptrcopy (branch, not yet merged) |
 
 Suite trajectory across the whole sequence: 522 -> 530 -> 536 -> 538 -> 540.
 

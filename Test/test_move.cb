@@ -3543,6 +3543,289 @@ GlobStrHolder gGS2 = default;
  * reassignment-destruct: before the fix a global-to-global copy of an owning value silently
  * aliased (zero destructs) and aborted at teardown, where the local spelling destructs once.
  */
+/*
+ * The ACCEPT SET of the copy-fact propagation (the fix/ptrcopy landed design record in
+ * internal/issue/interface-issue-queue.md; the issue file itself is deleted, per convention).
+ * Four ownership facts now cross a plain pointer DECLARATION - a copy of an owning local into a
+ * `unique` FIELD, a container-ELEMENT borrow, a `move` off either, and a '?:' / '??' JOIN - and
+ * each of those rejections has shapes in the SAME syntactic neighbourhood where the copy is the
+ * SOLE owner. Rejecting one of those would LEAK, which is the polarity error this family has paid
+ * for twice, so every leg below is a program master compiles and frees correctly and must keep
+ * doing so. Values pin WHICH object was read (each object carries a distinct `id`) and the free
+ * counts pin that every object is released exactly once - a leg asserting only "it compiled"
+ * cannot see the leak direction.
+ */
+int testCopyFactPropagationAccepts()
+{
+    int passed = 0;
+
+    // A LATE-ASSIGNED source: `src` never became an owning local, so the copy stored into the
+    // `unique` field is the field's ONLY owner. Rejecting this store would leak the object.
+    dtorCount = 0;
+    {
+        MoveParamHolder h = default;
+        Resource* lateSrc = nullptr;
+        lateSrc = new Resource();
+        lateSrc->id = 61;
+        Resource* lateCopy = lateSrc;
+        h.p = lateCopy;
+        passed += Test("uf_store_copy_late_value", h.p->id, 61);
+        passed += Test("uf_store_copy_late_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uf_store_copy_late_freed_once", dtorCount, 1);
+
+    // The SOURCE rebound AFTER the copy: the copy then holds the ONLY reference to the original,
+    // so the field is its sole owner and the rebound source owns the new object. Two objects,
+    // two frees - the values prove both were read, not one aliased twice.
+    dtorCount = 0;
+    {
+        MoveParamHolder h2 = default;
+        Resource* reSrc = new Resource();
+        reSrc->id = 62;
+        Resource* reCopy = reSrc;
+        reSrc = new Resource();
+        reSrc->id = 63;
+        h2.p = reCopy;
+        passed += Test("uf_store_copy_src_rebound_field", h2.p->id, 62);
+        passed += Test("uf_store_copy_src_rebound_src", reSrc->id, 63);
+        delete reSrc;
+        passed += Test("uf_store_copy_src_rebound_one_free", dtorCount, 1);
+    }
+    passed += Test("uf_store_copy_src_rebound_freed_twice", dtorCount, 2);
+
+    // The COPY rebound BEFORE the store: it is the sole owner of what it now holds, so its
+    // declaration-time fact is retired and the store is a genuine transfer.
+    dtorCount = 0;
+    {
+        MoveParamHolder h3 = default;
+        Resource* keepSrc = new Resource();
+        keepSrc->id = 64;
+        Resource* movedCopy = keepSrc;
+        movedCopy = new Resource();
+        movedCopy->id = 65;
+        h3.p = movedCopy;
+        passed += Test("uf_store_copy_rebound_field", h3.p->id, 65);
+        passed += Test("uf_store_copy_rebound_src", keepSrc->id, 64);
+        delete keepSrc;
+        passed += Test("uf_store_copy_rebound_one_free", dtorCount, 1);
+    }
+    passed += Test("uf_store_copy_rebound_freed_twice", dtorCount, 2);
+
+    // A GLOBAL source: a global owning pointer never scope-exit-frees, so it is not an owning
+    // LOCAL and the field is the only owner. Untouched by the guard, exactly as before.
+    dtorCount = 0;
+    {
+        MoveParamHolder h4 = default;
+        g_retainedResource = new Resource();
+        g_retainedResource->id = 66;
+        Resource* globalCopy = g_retainedResource;
+        h4.p = globalCopy;
+        passed += Test("uf_store_copy_global_value", h4.p->id, 66);
+        passed += Test("uf_store_copy_global_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uf_store_copy_global_freed_once", dtorCount, 1);
+    g_retainedResource = nullptr;
+
+    // A copy of a container-ELEMENT borrow, REBOUND before the delete. The plain '=' refreshes
+    // the element taint from the new RHS, so the copy is the sole owner of its `new` and the
+    // delete is correct; the container still frees its own element.
+    dtorCount = 0;
+    {
+        list<unique Resource*> lAcc;
+        Resource* firstElem = new Resource();
+        firstElem->id = 67;
+        lAcc.add(firstElem);
+        Resource* elemBorrow = lAcc.get(0);
+        Resource* elemCopy = elemBorrow;
+        elemCopy = new Resource();
+        elemCopy->id = 68;
+        passed += Test("elem_copy_rebound_value", elemCopy->id, 68);
+        delete elemCopy;
+        passed += Test("elem_copy_rebound_one_free", dtorCount, 1);
+        passed += Test("elem_copy_rebound_container_alive", lAcc.get(0)->id, 67);
+    }
+    passed += Test("elem_copy_rebound_freed_twice", dtorCount, 2);
+
+    // READING through a copy of an element borrow stays legal - the tag drives the delete/move
+    // guards only, never plain use. The container frees its element exactly once.
+    dtorCount = 0;
+    {
+        list<unique Resource*> lRead;
+        Resource* readElem = new Resource();
+        readElem->id = 69;
+        lRead.add(readElem);
+        Resource* readBorrow = lRead.get(0);
+        Resource* readCopy = readBorrow;
+        passed += Test("elem_copy_read_value", readCopy->id, 69);
+        passed += Test("elem_copy_read_no_early_free", dtorCount, 0);
+    }
+    passed += Test("elem_copy_read_freed_once", dtorCount, 1);
+
+    // `move` off a copy whose SOURCE was rebound: the copy holds the only reference, so the move
+    // is a real transfer. The guard re-asks liveness, so this must not be rejected - the remedy a
+    // rejection would name ("move the owner instead") would move the WRONG object here.
+    dtorCount = 0;
+    {
+        Resource* mvSrc = new Resource();
+        mvSrc->id = 70;
+        Resource* mvCopy = mvSrc;
+        mvSrc = new Resource();
+        mvSrc->id = 71;
+        Resource* adopted = move mvCopy;
+        passed += Test("move_copy_src_rebound_value", adopted->id, 70);
+        delete adopted;
+        passed += Test("move_copy_src_rebound_one_free", dtorCount, 1);
+        passed += Test("move_copy_src_rebound_src_alive", mvSrc->id, 71);
+        delete mvSrc;
+    }
+    passed += Test("move_copy_src_rebound_freed_twice", dtorCount, 2);
+
+    // `move` off a copy of a LATE-ASSIGNED source - the same sole-owner shape on the move axis.
+    dtorCount = 0;
+    {
+        Resource* mvLate = nullptr;
+        mvLate = new Resource();
+        mvLate->id = 72;
+        Resource* mvLateCopy = mvLate;
+        Resource* lateAdopted = move mvLateCopy;
+        passed += Test("move_copy_late_value", lateAdopted->id, 72);
+        delete lateAdopted;
+        passed += Test("move_copy_late_one_free", dtorCount, 1);
+    }
+    passed += Test("move_copy_late_freed_once", dtorCount, 1);
+
+    // The DIRECT `move` of an owning local - the remedy both new move diagnostics name. It must
+    // keep working or the rejections point at nothing.
+    dtorCount = 0;
+    {
+        Resource* directOwner = new Resource();
+        directOwner->id = 73;
+        Resource* directAdopted = move directOwner;
+        passed += Test("move_direct_owner_value", directAdopted->id, 73);
+        delete directAdopted;
+        passed += Test("move_direct_owner_one_free", dtorCount, 1);
+    }
+    passed += Test("move_direct_owner_freed_once", dtorCount, 1);
+
+    // A MIXED '?:' join - one arm an owning local, one a fresh `new`. The BOTH-ARMS rule drops
+    // the fact rather than rejecting on a may-alias, matching the per-arm interface boxing ledger.
+    dtorCount = 0;
+    {
+        Resource* joinOwner = new Resource();
+        joinOwner->id = 74;
+        Resource* mixedJoin = identityBool(false) ? joinOwner : new Resource();
+        mixedJoin->id = 75;
+        passed += Test("join_owner_new_value", mixedJoin->id, 75);
+        delete mixedJoin;
+        delete joinOwner;
+        passed += Test("join_owner_new_freed_twice", dtorCount, 2);
+    }
+
+    // A join of two fresh `new`s owns what it holds, so deleting it is the ONLY release.
+    dtorCount = 0;
+    {
+        Resource* newJoin = identityBool(true) ? new Resource() : new Resource();
+        newJoin->id = 76;
+        passed += Test("join_two_new_value", newJoin->id, 76);
+        delete newJoin;
+        passed += Test("join_two_new_freed_once", dtorCount, 1);
+    }
+
+    // A join ARM nulled after the join. `b` then holds the ONLY reference, so `delete b;` is the
+    // only release and rejecting it would LEAK. This is the arm-liveness axis: the join proof
+    // records every arm's SLOT and re-asks it at the consumer, exactly as the copy proof re-asks
+    // its source. Round 1 of this fix recorded only a rendered owner NAME, could not re-ask, and
+    // false-rejected this program - the 38-leg accept set had no cell on this axis, which is how
+    // it shipped. The plain-copy sibling (`assign_copy_delete_*` above) was always accepted, so
+    // without these legs copy and join disagreed on the very axis the change set out to align.
+    dtorCount = 0;
+    {
+        Resource* armOwner = new Resource();
+        armOwner->id = 78;
+        Resource* joinNulled = identityBool(true) ? armOwner : armOwner;
+        armOwner = nullptr;
+        passed += Test("join_arm_nulled_value", joinNulled->id, 78);
+        delete joinNulled;
+        passed += Test("join_arm_nulled_freed_once", dtorCount, 1);
+    }
+    passed += Test("join_arm_nulled_no_second_free", dtorCount, 1);
+
+    // The same retirement through the '??' spelling, whose arms are recovered from the coalesce
+    // ledger rather than from a PHI - both routes must retire or the two spellings disagree.
+    dtorCount = 0;
+    {
+        Resource* coalOwner = new Resource();
+        coalOwner->id = 79;
+        Resource* coalJoin = coalOwner ?? coalOwner;
+        coalOwner = nullptr;
+        passed += Test("join_arm_nulled_coalesce_value", coalJoin->id, 79);
+        delete coalJoin;
+        passed += Test("join_arm_nulled_coalesce_freed_once", dtorCount, 1);
+    }
+
+    // A join arm REBOUND to a fresh object rather than nulled: the join holds the original alone
+    // and the arm owns the new one, so both deletes are correct and there are two distinct frees.
+    dtorCount = 0;
+    {
+        Resource* reboundArm = new Resource();
+        reboundArm->id = 80;
+        Resource* joinRebound = identityBool(true) ? reboundArm : reboundArm;
+        reboundArm = new Resource();
+        reboundArm->id = 81;
+        passed += Test("join_arm_rebound_join_value", joinRebound->id, 80);
+        passed += Test("join_arm_rebound_arm_value", reboundArm->id, 81);
+        delete joinRebound;
+        delete reboundArm;
+        passed += Test("join_arm_rebound_freed_twice", dtorCount, 2);
+    }
+
+    // The arm-nulled retirement reaching the OTHER two consumers: the `unique`-field store and
+    // the store-recorded (assignment) form of the join. Both re-ask the same slots.
+    dtorCount = 0;
+    {
+        MoveParamHolder hj = default;
+        Resource* ufArm = new Resource();
+        ufArm->id = 82;
+        Resource* ufJoin = identityBool(true) ? ufArm : ufArm;
+        ufArm = nullptr;
+        hj.p = ufJoin;
+        passed += Test("join_arm_nulled_uf_store_value", hj.p->id, 82);
+        passed += Test("join_arm_nulled_uf_store_no_early_free", dtorCount, 0);
+    }
+    passed += Test("join_arm_nulled_uf_store_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* stArm = new Resource();
+        stArm->id = 83;
+        Resource* stJoin = nullptr;
+        stJoin = identityBool(true) ? stArm : stArm;
+        stArm = nullptr;
+        passed += Test("join_arm_nulled_store_form_value", stJoin->id, 83);
+        delete stJoin;
+        passed += Test("join_arm_nulled_store_form_freed_once", dtorCount, 1);
+    }
+
+    // The plain `p = owner;` STORE (not a declaration) IMPLIED-MOVES the pointee out of `owner`,
+    // so `delete p;` is the only release and must stay legal. This leg is the tripwire for the
+    // false rejection an earlier cut of this fix produced by reading InheritedKeepsOwner - which
+    // this store also sets - in the raw-delete guard; the join proof is a separate field for
+    // exactly that reason.
+    dtorCount = 0;
+    {
+        Resource* implSrc = new Resource();
+        implSrc->id = 77;
+        Resource* implDst = nullptr;
+        implDst = implSrc;
+        passed += Test("assign_copy_delete_value", implDst->id, 77);
+        delete implDst;
+        passed += Test("assign_copy_delete_freed_once", dtorCount, 1);
+    }
+    passed += Test("assign_copy_delete_no_second_free", dtorCount, 1);
+
+    return passed;
+}
+
 int testUniqueGlobalReceiverFieldStore()
 {
     int passed = 0;
@@ -4620,6 +4903,9 @@ extern int main()
 
     passed += testUniqueGlobalReceiverFieldStore();
     total += 15;
+
+    passed += testCopyFactPropagationAccepts();
+    total += 51;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -9879,6 +9879,24 @@ public:
                                 srcElementExternallyOwned = rightNV.TypeAndValue.IsBorrowOfAliasElement;
                                 srcOwnedElementContainer = rightNV.TypeAndValue.ParentVariableName.empty()
                                     ? rightNV.CallerName : rightNV.TypeAndValue.ParentVariableName;
+                                // One hop off a source BINDING that already borrows the element: the
+                                // flags above read the ACCESSOR result, so a plain copy carried none.
+                                // The CONTAINER still owns whatever the source was rebound to since,
+                                // so a rebound/'??='d source is the stale direction and is dropped.
+                                if (!srcBorrowsOwnedElement && !rightNV.TypeAndValue.IsMove
+                                    && rightNV.TypeAndValue.Pointer
+                                    && llvm::isa_and_nonnull<llvm::AllocaInst>(rightNV.Storage))
+                                {
+                                    const auto* elemBind = compiler->FindVariableByStorage(rightNV.Storage);
+                                    if (elemBind != nullptr && elemBind->BorrowsOwnedElement
+                                        && !elemBind->IsOwning && !elemBind->PointerRebound
+                                        && !elemBind->CoalesceRebound)
+                                    {
+                                        srcBorrowsOwnedElement = true;
+                                        srcElementExternallyOwned = elemBind->BorrowedElementExternallyOwned;
+                                        srcOwnedElementContainer = elemBind->OwnedElementContainer;
+                                    }
+                                }
                                 // Alias if the RHS is an `alias` call result OR a read of an
                                 // alias-borrow local (chained `Token t2 = t1;`) - both borrow.
                                 srcIsAlias = rightNV.TypeAndValue.IsAlias || rightNV.IsAliasBorrow;
@@ -10945,6 +10963,29 @@ public:
                                 nv.BorrowsOwnedElement = true;
                                 nv.OwnedElementContainer = srcOwnedElementContainer;
                                 nv.BorrowedElementExternallyOwned = srcElementExternallyOwned;
+                            }
+                        }
+
+                        // Tag a local declared from a '?:' / '??' JOIN whose every non-null arm
+                        // proves another owner. A join carries no source binding, so no clause above
+                        // can fire; the arms are still in hand HERE. Recorded in the same pair a
+                        // later `p = q;` refreshes, so any reassignment retires or replaces it.
+                        // Asked BEFORE the map is indexed: every other clause here is already gated
+                        // by a source fact, and `operator[]` would insert on a miss.
+                        if (typeAndValue.Pointer && !compiler->lastOwningResult)
+                        {
+                            std::vector<llvm::Value*> joinSlots;
+                            std::string joinOwner = JoinArmsKeepOwner(right, &joinSlots);
+                            if (!joinOwner.empty() && !joinSlots.empty())
+                            {
+                                auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                                if (!nv.IsOwning && !nv.IsNewAllocated && !nv.IsBorrowed
+                                    && !nv.BorrowsOwningLocal && !nv.BorrowsOwnedElement)
+                                {
+                                    nv.JoinKeepsOwner = true;
+                                    nv.JoinKeepsOwnerSource = joinOwner;
+                                    nv.JoinKeepsOwnerSlots = joinSlots;
+                                }
                             }
                         }
 
@@ -12389,6 +12430,10 @@ public:
         // the join proof below carries the case where the '??=' RHS proved an owner too.
         if (nv->BorrowsOwnedElement && !nv->CoalesceRebound) return true;
         if (nv->InheritedKeepsOwner) return true;
+        // Recorded where the join's arms were in hand, and refreshed by every later '=', so it
+        // outranks the retirement below for the same reason InheritedKeepsOwner does. Every ARM's
+        // liveness is re-asked here too, or nulling an arm would leave a stale false rejection.
+        if (JoinArmsStillKeepOwner(*nv)) return true;
         // A rebound pointer no longer points at whatever its declaration established an owner for.
         if (nv->PointerRebound) return false;
         // A local that aliases a borrowed parameter. Retired above by any reassignment, which is
@@ -12426,6 +12471,8 @@ public:
         // Carried across a `p = q;` store from the RHS binding's own proof; already rendered there.
         if (nv->InheritedKeepsOwner && !nv->InheritedKeepsOwnerSource.empty())
             return nv->InheritedKeepsOwnerSource;
+        if (JoinArmsStillKeepOwner(*nv) && !nv->JoinKeepsOwnerSource.empty())
+            return nv->JoinKeepsOwnerSource;
         if (!nv->FieldName.empty())
             return nv->OwningStructName.empty()
                 ? std::format("'{}'", nv->FieldName)
@@ -12472,6 +12519,81 @@ public:
         if (!BindingKeepsOwnershipOfBoxedObject(srcNV)) return {};
         std::string owner = DescribeBoxedSourceOwner(nullptr, srcNV);
         return owner.empty() ? std::string("the binding it was assigned from") : owner;
+    }
+
+    /*
+     * The owner a '?:' / '??' pointer JOIN hands to whatever receives it, or empty when it proves
+     * nothing. BOTH-ARMS rule, the same one the per-arm interface boxing ledger settled: EVERY
+     * non-null arm must resolve to a live binding that keeps ownership, so a MIXED join (one arm a
+     * fresh `new`, one an unresolvable call result) is ACCEPTED rather than rejected on a may-alias.
+     * A null arm owns nothing, so it neither proves nor blocks. Empty is the accept direction.
+     */
+    std::string JoinArmsKeepOwner(llvm::Value* joined,
+                                  std::vector<llvm::Value*>* slotsOut = nullptr) const
+    {
+        if (slotsOut != nullptr) slotsOut->clear();
+        std::vector<llvm::Value*> arms;
+        if (auto* phi = llvm::dyn_cast_or_null<llvm::PHINode>(joined))
+        {
+            if (!phi->getType()->isPointerTy()) return {};
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+                arms.push_back(phi->getIncomingValue(i));
+        }
+        else if (auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(joined))
+        {
+            const auto* join = compilerLLVM->FindNullCoalesceJoin(load);
+            if (join == nullptr) return {};
+            for (const auto& arm : join->Arms) arms.push_back(arm.Value);
+        }
+        else return {};
+
+        std::string owner;
+        bool proved = false;
+        for (auto* arm : arms)
+        {
+            if (arm == nullptr) return {};
+            if (llvm::isa<llvm::ConstantPointerNull>(arm)) continue;
+            auto* load = llvm::dyn_cast<llvm::LoadInst>(arm);
+            if (load == nullptr || !load->getType()->isPointerTy()) return {};
+            const auto* nv = compilerLLVM->FindVariableByStorage(load->getPointerOperand());
+            if (!BindingKeepsOwnershipOfBoxedObject(nv)) return {};
+            if (owner.empty()) owner = DescribeBoxedSourceOwner(arm, nullptr);
+            if (slotsOut != nullptr) slotsOut->push_back(load->getPointerOperand());
+            proved = true;
+        }
+        if (!proved) return {};
+        return owner.empty() ? std::string("the binding each arm was joined from") : owner;
+    }
+
+    /*
+     * Re-ask a recorded join proof at a CONSUMER: EVERY arm slot must STILL resolve to a binding
+     * that proves another owner. Recording alone is not enough - nulling or rebinding an ARM
+     * (`c = nullptr;` after `T* b = cond ? c : c;`) makes the join's receiver the sole owner, and a
+     * rejection there is a false one whose remedy leaks. This is the arm-side twin of
+     * OwningLocalCopyStillAliases, and it uses the same explicit `!PointerRebound` test: a rebound
+     * binding keeps its IsOwning flag, which BindingKeepsOwnershipOfBoxedObject answers ABOVE its
+     * own retirement, so asking that helper alone would never retire an arm.
+     * An unresolvable, dead or self-referential arm answers false - the accept direction.
+     */
+    bool JoinArmsStillKeepOwner(const LLVMBackend::NamedVariable& nv, int depth = 0) const
+    {
+        if (!nv.JoinKeepsOwner || nv.JoinKeepsOwnerSlots.empty()) return false;
+        if (depth > 4) return false;
+        for (auto* slot : nv.JoinKeepsOwnerSlots)
+        {
+            if (slot == nullptr || slot == nv.Storage) return false;
+            const auto* arm = compilerLLVM->FindVariableByStorage(slot);
+            if (arm == nullptr || arm->PointerRebound) return false;
+            // A join OF joins re-asks the inner arms and stops there: re-entering
+            // BindingKeepsOwnershipOfBoxedObject at depth 0 would loop on a cyclic arm graph.
+            if (arm->JoinKeepsOwner)
+            {
+                if (!JoinArmsStillKeepOwner(*arm, depth + 1)) return false;
+                continue;
+            }
+            if (!BindingKeepsOwnershipOfBoxedObject(arm)) return false;
+        }
+        return true;
     }
 
     /*
@@ -13352,8 +13474,16 @@ public:
                 if (namedVar.TypeAndValue.Pointer && namedVar.FieldName.empty()
                     && !namedVar.CallerName.empty() && namedVar.Storage != nullptr
                     && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
+                {
                     compiler->MarkPointerRebound(namedVar.CallerName,
                                                  DescribeAssignedSourceOwner(rightNV));
+                    // A JOIN RHS carries no source binding, so no clause above can see it; ask its
+                    // arms directly. After MarkPointerRebound, which retires any earlier join.
+                    std::vector<llvm::Value*> storeJoinSlots;
+                    std::string storeJoinOwner =
+                        JoinArmsKeepOwner(rightNV.Primary, &storeJoinSlots);
+                    compiler->SetJoinKeepsOwner(namedVar.CallerName, storeJoinOwner, storeJoinSlots);
+                }
             }
             // An assignment to an existing variable (not a declaration) does not transfer
             // ownership - consuming lastOwningResult here would be wrong (the new-allocated
@@ -13866,6 +13996,50 @@ public:
                 RejectBorrowIntoUniqueField(rightNV,
                     std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar)), ctx);
                 return right;
+            }
+
+            // Storing a plain COPY of a live OWNING local into a `unique` field. The copy carries no
+            // IsBorrowed, so the clause above cannot see it, and the field's synthesized destructor
+            // then frees a pointee the source frees again at scope exit. The DIRECT spelling
+            // (`h.f = c;`) transfers ownership out of `c`, so it is both legal and the remedy.
+            // Re-asked for liveness, so rebinding either end retires it (that copy is then the
+            // sole owner and rejecting the store would LEAK).
+            if (operatorText == "=" && right && destIsStructField
+                && IsOwningUniquePointerField(namedVar.TypeAndValue)
+                && !rightNV.TypeAndValue.IsMove
+                && !selfUniqueFieldAssign
+                && llvm::isa_and_nonnull<llvm::AllocaInst>(rightNV.Storage))
+            {
+                const auto* copyBind = compiler->FindVariableByStorage(rightNV.Storage);
+                std::string srcName = rightNV.CallerName.empty()
+                    ? rightNV.TypeAndValue.VariableName : rightNV.CallerName;
+                if (srcName.empty()) srcName = "<expr>";
+                if (copyBind != nullptr && compiler->OwningLocalCopyStillAliases(*copyBind))
+                {
+                    LogErrorContext(ctx, std::format(
+                        "cannot store '{}' into unique field '{}' - '{}' copies '{}', which still owns "
+                        "the object and frees it at scope exit, so the field's synthesized destructor "
+                        "double-frees it. Store '{}' directly (that transfers ownership out of it), or "
+                        "use 'move {}'.",
+                        srcName, DescribeUniqueFieldOwner(namedVar), srcName,
+                        copyBind->OwningLocalOrigin, copyBind->OwningLocalOrigin,
+                        copyBind->OwningLocalOrigin));
+                    return right;
+                }
+                // The same store off a local bound from a proving '?:' / '??' JOIN. Its own delete
+                // is rejected above; the field's synthesized destructor is the same second free.
+                if (copyBind != nullptr && !copyBind->IsOwning
+                    && JoinArmsStillKeepOwner(*copyBind)
+                    && !copyBind->JoinKeepsOwnerSource.empty())
+                {
+                    LogErrorContext(ctx, std::format(
+                        "cannot store '{}' into unique field '{}' - every arm of the join '{}' was "
+                        "bound from holds an object {} already frees, so the field's synthesized "
+                        "destructor double-frees it. Store an object this frame owns instead.",
+                        srcName, DescribeUniqueFieldOwner(namedVar), srcName,
+                        copyBind->JoinKeepsOwnerSource));
+                    return right;
+                }
             }
 
             // Same store through a '?:' join that laundered a borrowed `move`: the joined value
@@ -19565,6 +19739,27 @@ public:
                 return {};
             }
 
+            // Error: deleting a local bound from a '?:' / '??' JOIN whose every non-null arm proves
+            // another owner. The join carries no source binding, so the proof is recorded where the
+            // arms are in hand - the declaration, or the '=' that rebound this local - and re-asked
+            // here. Refreshed by every later '=', so it never outlives its own store.
+            if (!namedVar.IsOwning
+                && JoinArmsStillKeepOwner(namedVar)
+                && !namedVar.JoinKeepsOwnerSource.empty()
+                && namedVar.Storage != nullptr
+                && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
+            {
+                std::string name = namedVar.CallerName.empty()
+                    ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
+                if (name.empty()) name = "<expr>";
+                LogErrorContext(ctx, std::format(
+                    "cannot delete '{}' - every arm of the join it was bound from holds an object {} "
+                    "already frees, so this is a double-free. Remove this delete and let {} release "
+                    "it, or bind '{}' to an object this frame owns.",
+                    name, namedVar.JoinKeepsOwnerSource, namedVar.JoinKeepsOwnerSource, name));
+                return {};
+            }
+
             // Error: deleting a `unique` field. The synthesized destructor calls the user dtor
             // FIRST and then deletes the field, so a hand-written `delete _root;` double-frees -
             // exactly what a migration produces when someone adds `unique` and forgets to remove
@@ -19935,6 +20130,44 @@ public:
                     "holding it is owned here.",
                     name, argNV.BorrowedUniqueField, argNV.BorrowedOrigin));
             return {};
+        }
+
+        /*
+         * 'move' of a POINTER binding that PROVABLY borrows - a plain copy of a live owning local,
+         * or a container-owned element - transfers nothing: the real owner still frees the pointee,
+         * so whatever adopts it here frees it twice. The raw `delete` guard rejects exactly these
+         * two proofs, and rejecting the `move` spelling too is what stops the two from disagreeing.
+         * Destination-agnostic on purpose: a plain `T*` destination double-freed just as a `unique`
+         * one did. Only these two proofs, re-asked for liveness - an ordinary borrow forwarded as
+         * `move` stays legal by the rule stated above, and a rebound copy is the sole owner.
+         */
+        if (argNV.TypeAndValue.Pointer && argNV.FieldName.empty() && !argNV.IsElementAccess
+            && llvm::isa_and_nonnull<llvm::AllocaInst>(argNV.Storage))
+        {
+            const auto* srcBind = compiler->FindVariableByStorage(argNV.Storage);
+            std::string name = argNV.CallerName.empty()
+                ? argNV.TypeAndValue.VariableName : argNV.CallerName;
+            if (name.empty()) name = "<expr>";
+            if (srcBind != nullptr && compiler->OwningLocalCopyStillAliases(*srcBind))
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot 'move' '{}' - it copies '{}', which still owns the object and frees it at "
+                    "scope exit, so this move transfers nothing and the destination double-frees it. "
+                    "Use 'move {}' to take ownership out of the owner itself (which nulls it).",
+                    name, srcBind->OwningLocalOrigin, srcBind->OwningLocalOrigin));
+                return {};
+            }
+            if (srcBind != nullptr && !srcBind->IsOwning && srcBind->BorrowsOwnedElement)
+            {
+                std::string owner = srcBind->OwnedElementContainer.empty()
+                    ? std::string("its container") : "'" + srcBind->OwnedElementContainer + "'";
+                LogErrorContext(ctx, std::format(
+                    "cannot 'move' '{}' - it borrows an element {} owns, and moving the borrow does "
+                    "not clear the container's slot, so the container's destructor still frees the "
+                    "pointee. Move the element slot itself, or remove it from {} first.",
+                    name, owner, owner));
+                return {};
+            }
         }
 
         // 'move' of a whole value this function only BORROWS (a plain by-value owning-value
