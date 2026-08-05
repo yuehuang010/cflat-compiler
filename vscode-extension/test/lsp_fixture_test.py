@@ -22,6 +22,7 @@ Exit code: 0 = all passed, 1 = one or more failures.
 # Defer annotation evaluation so PEP 604 unions (str | None) run on Python 3.9.
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import re
 import sys
@@ -412,6 +413,8 @@ def test_reanalysis_state_isolation(exe: str) -> str | None:
     deterministic repro: both pass standalone (they are part of test.bat), but with the cache
     clear removed B reliably fails on this exact ordering. B-after-A must equal B-alone."""
     # Pool size 1 => one backend slot => B is guaranteed to reanalyze the slot A just used.
+    # os.environ is process-wide and this now runs alongside the shard threads, but every other
+    # client passes an explicit --lsp-pool-size, which the server prefers over this env var.
     saved = os.environ.get("CFLAT_LSP_POOL_SIZE")
     os.environ["CFLAT_LSP_POOL_SIZE"] = "1"
     try:
@@ -507,6 +510,118 @@ def test_server_resilience(client: LspClient) -> str | None:
 # Test runner
 # ---------------------------------------------------------------------------
 
+def _status(name: str, err: str | None) -> tuple:
+    """Turn a run_fixture()/test_*() error result into a (name, status, message) triple."""
+    return (name, "fail" if err else "pass", err)
+
+
+def _parse_shard_count_and_args(extra_args: list) -> tuple[int, list]:
+    """Pull --lsp-pool-size N out of extra_args to use as the SHARD COUNT (default 4);
+    forward --lsp-pool-size 1 to each shard instead - a shard only ever has one analysis
+    in flight, so a bigger per-shard pool just allocates idle LLVMBackends for nothing."""
+    shard_count = 4
+    remaining: list = []
+    i = 0
+    while i < len(extra_args):
+        if extra_args[i] == "--lsp-pool-size" and i + 1 < len(extra_args):
+            try:
+                shard_count = int(extra_args[i + 1])
+            except ValueError:
+                pass
+            i += 2
+            continue
+        remaining.append(extra_args[i])
+        i += 1
+    shard_args = remaining + ["--lsp-pool-size", "1"]
+    return shard_count, shard_args
+
+
+# Sharding, not pipelining: LspServer.cpp keeps a SINGLE currentIndex_ (shared_ptr,
+# replaced wholesale at the end of every analysis - see LspServer.cpp GetCurrentIndex),
+# so hover/definition/completion always read the MOST RECENTLY analyzed document.
+# Interleaving two fixtures' didOpen/hover sequences on one server would clobber that
+# slot and make results nondeterministic. Each shard therefore owns its own server
+# process and keeps its own fixtures strictly serial - only the shards run concurrently.
+def _run_fixture_shard(exe: str, shard_args: list, fixture_items: list) -> tuple:
+    """fixture_items: list of (original_index, fixture_path). Returns (results, stderr)."""
+    client = LspClient(exe, shard_args)
+    results = []
+    try:
+        initialize(client)
+        for idx, fixture_path in fixture_items:
+            name = fixture_path.name
+            directives, _ = parse_fixture(fixture_path.read_text(encoding="utf-8"))
+            req = directives.get("platform")
+            if req and req != HOST_PLATFORM:
+                results.append((idx, name, "skip", f"requires {req}, host is {HOST_PLATFORM}"))
+                continue
+            try:
+                err = run_fixture(client, fixture_path)
+            except TimeoutError as e:
+                err = f"TIMEOUT: {e}"
+            except Exception as e:
+                err = f"EXCEPTION: {e}"
+            results.append((idx,) + _status(name, err))
+    finally:
+        try:
+            client.request("shutdown")
+            client.notify("exit")
+        except Exception:
+            pass
+        stderr = client.close()
+    return results, stderr
+
+
+def _run_scenario_shard(exe: str, shard_args: list) -> tuple:
+    """Runs the four hardcoded scenario tests serially on one client. Returns (results, stderr)."""
+    client = LspClient(exe, shard_args)
+    results = []
+    try:
+        initialize(client)
+        scenarios = [
+            ("diagnostic lifecycle", test_diagnostic_lifecycle),
+            ("server resilience", test_server_resilience),
+            ("def: non-primitives (namespace/struct/local var)", test_def_non_primitives),
+            ("def: nested struct/class", test_def_nested_struct),
+        ]
+        for name, fn in scenarios:
+            try:
+                err = fn(client)
+            except Exception as e:
+                err = f"EXCEPTION: {e}"
+            results.append(_status(name, err))
+    finally:
+        try:
+            client.request("shutdown")
+            client.notify("exit")
+        except Exception:
+            pass
+        stderr = client.close()
+    return results, stderr
+
+
+def _run_negative_hover(exe: str) -> tuple:
+    try:
+        err = test_negative_hover_before_initialize(exe)
+    except Exception as e:
+        err = f"EXCEPTION: {e}"
+    return _status("negative: hover before initialize", err)
+
+
+def _run_reanalysis(exe: str) -> tuple:
+    name = "reanalysis: B-after-A state isolation (L1)"
+    # The L1 repro pins Test/test_threadpool.cb as "file A", which uses os.windows.*
+    # and so is not clean standalone off Windows (it is in test.sh's skip list). The
+    # regression stays covered by the Windows test_lsp.bat run.
+    if HOST_PLATFORM != "windows":
+        return (name, "skip", "repro files are Windows-only")
+    try:
+        err = test_reanalysis_state_isolation(exe)
+    except Exception as e:
+        err = f"EXCEPTION: {e}"
+    return _status(name, err)
+
+
 def run_all(exe: str, extra_args: list) -> bool:
     if not FIXTURE_DIR.exists():
         print(f"error: fixture directory not found: {FIXTURE_DIR}", file=sys.stderr)
@@ -516,96 +631,65 @@ def run_all(exe: str, extra_args: list) -> bool:
     print(f"Server:   {exe}")
     print(f"Fixtures: {FIXTURE_DIR} ({len(fixtures)} files)\n")
 
-    client = LspClient(exe, extra_args)
-    initialize(client)
+    shard_count, shard_args = _parse_shard_count_and_args(extra_args)
+    shard_count = max(1, min(shard_count, len(fixtures))) if fixtures else 1
 
+    fixtures_indexed = list(enumerate(fixtures))
+    shards = [fixtures_indexed[i::shard_count] for i in range(shard_count)]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=shard_count + 3) as pool:
+        fixture_futures = [pool.submit(_run_fixture_shard, exe, shard_args, shard) for shard in shards]
+        scenario_future = pool.submit(_run_scenario_shard, exe, shard_args)
+        negative_future = pool.submit(_run_negative_hover, exe)
+        reanalysis_future = pool.submit(_run_reanalysis, exe)
+
+        stderrs: list = []
+        fixture_results: list = []
+        for f in fixture_futures:
+            results, stderr = f.result()
+            fixture_results.extend(results)
+            if stderr.strip():
+                stderrs.append(stderr.strip())
+        fixture_results.sort(key=lambda t: t[0])
+
+        scenario_results, scenario_stderr = scenario_future.result()
+        if scenario_stderr.strip():
+            stderrs.append(scenario_stderr.strip())
+
+        negative_result = negative_future.result()
+        reanalysis_result = reanalysis_future.result()
+
+    # All threads have joined - print results in the fixed, deterministic order below.
     passed = 0
     failed = 0
     skipped = 0
 
-    def record(name: str, error: str | None):
-        nonlocal passed, failed
-        if error is None:
+    def emit(name: str, status: str, message: str | None):
+        nonlocal passed, failed, skipped
+        if status == "skip":
+            print(f"  SKIP  {name} ({message})")
+            skipped += 1
+        elif status == "pass":
             print(f"  PASS  {name}")
             passed += 1
         else:
             print(f"  FAIL  {name}")
-            print(f"        {error}")
+            print(f"        {message}")
             failed += 1
 
-    def skip(name: str, reason: str):
-        nonlocal skipped
-        print(f"  SKIP  {name} ({reason})")
-        skipped += 1
+    for _idx, name, status, message in fixture_results:
+        emit(name, status, message)
 
-    # --- fixture-driven tests ---
-    for fixture_path in fixtures:
-        name = fixture_path.name
-        directives, _ = parse_fixture(fixture_path.read_text(encoding="utf-8"))
-        req = directives.get("platform")
-        if req and req != HOST_PLATFORM:
-            skip(name, f"requires {req}, host is {HOST_PLATFORM}")
-            continue
-        try:
-            err = run_fixture(client, fixture_path)
-        except TimeoutError as e:
-            err = f"TIMEOUT: {e}"
-        except Exception as e:
-            err = f"EXCEPTION: {e}"
-        record(name, err)
+    for name, status, message in scenario_results:
+        emit(name, status, message)
 
-    # --- hardcoded scenario tests ---
-    try:
-        record("diagnostic lifecycle", test_diagnostic_lifecycle(client))
-    except Exception as e:
-        record("diagnostic lifecycle", f"EXCEPTION: {e}")
-
-    try:
-        record("server resilience", test_server_resilience(client))
-    except Exception as e:
-        record("server resilience", f"EXCEPTION: {e}")
-
-    try:
-        record("def: non-primitives (namespace/struct/local var)", test_def_non_primitives(client))
-    except Exception as e:
-        record("def: non-primitives (namespace/struct/local var)", f"EXCEPTION: {e}")
-
-    try:
-        record("def: nested struct/class", test_def_nested_struct(client))
-    except Exception as e:
-        record("def: nested struct/class", f"EXCEPTION: {e}")
-
-    # Shutdown main client.
-    try:
-        client.request("shutdown")
-        client.notify("exit")
-    except Exception:
-        pass
-    stderr = client.close()
+    emit(*negative_result)
+    emit(*reanalysis_result)
 
     print(f"\n{passed} passed, {failed} failed")
-    if stderr.strip():
+    if stderrs:
         print("\n--- server stderr ---")
-        print(stderr.strip())
-
-    # --- out-of-process tests (each needs its own client) ---
-    try:
-        err = test_negative_hover_before_initialize(exe)
-        record("negative: hover before initialize", err)
-    except Exception as e:
-        record("negative: hover before initialize", f"EXCEPTION: {e}")
-
-    # The L1 repro pins Test/test_threadpool.cb as "file A", which uses os.windows.*
-    # and so is not clean standalone off Windows (it is in test.sh's skip list). The
-    # regression stays covered by the Windows test_lsp.bat run.
-    if HOST_PLATFORM != "windows":
-        skip("reanalysis: B-after-A state isolation (L1)", "repro files are Windows-only")
-    else:
-        try:
-            err = test_reanalysis_state_isolation(exe)
-            record("reanalysis: B-after-A state isolation (L1)", err)
-        except Exception as e:
-            record("reanalysis: B-after-A state isolation (L1)", f"EXCEPTION: {e}")
+        print("\n\n".join(stderrs))
 
     if skipped:
         print(f"({skipped} skipped: platform-specific)")

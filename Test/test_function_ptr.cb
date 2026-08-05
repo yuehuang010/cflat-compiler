@@ -2117,9 +2117,18 @@ bool testFuncPtrArgProvenanceAccepts()
     ISpell iso = si;
     result &= Test("int/i32 crossing, interface slot",   iso.lam(thin),       15);
 
-    // long/i64 is the same story, and any two pointer types are one class under opaque pointers.
+    // `long` is TARGET-NATIVE - i32 under Windows LLP64, i64 under LP64 - so the crossing leg
+    // pairs it with whichever fixed-width spelling names the same type on this target.
     function<long(long)> gl = add10Long;
-    result &= Test("long/i64 crossing",   spellCallI64(gl), 15);
+    if const (__WINDOWS__)
+    {
+        result &= Test("long/i32 crossing", spellCall(gl), 15);
+    }
+    else
+    {
+        result &= Test("long/i64 crossing", spellCallI64(gl), 15);
+    }
+    // Any two pointer types are one class under opaque pointers.
     function<void(int*)> gp = takeVoidPtr;
     result &= Test("int*/void* crossing", spellCallVoidPtr(gp), 15);
 
@@ -2158,8 +2167,17 @@ bool testFuncPtrArgProvenanceAccepts()
     result &= Test("SigBox int/i32 crossing",  sigBoxI32(gbi),     51);
     function<void(SigBox<u32>*)> gbu = onSigBoxU32;
     result &= Test("SigBox u32/int crossing",  sigBoxIntSlot(gbu), 51);
+    // Same target-native split as the scalar leg above: `SigBox<long>` is `SigBox<i32>` on
+    // Windows and `SigBox<i64>` on LP64.
     function<void(SigBox<long>*)> gbl = onSigBoxLong;
-    result &= Test("SigBox long/i64 crossing", sigBoxI64(gbl),     51);
+    if const (__WINDOWS__)
+    {
+        result &= Test("SigBox long/i32 crossing", sigBoxI32(gbl), 51);
+    }
+    else
+    {
+        result &= Test("SigBox long/i64 crossing", sigBoxI64(gbl), 51);
+    }
 
     // The double arms prove each crossing set is a real two-candidate overload set, so the
     // legs above are testing the scorer rather than a lone candidate that binds regardless.

@@ -177,6 +177,20 @@ def is_macos_only(path: Path) -> bool:
     return path.name in _MAC_ONLY_FILES
 
 
+# example/vcpkg/*.cb bind headers out of the ports vcpkg installs under
+# example/vcpkg/vcpkg_installed/<triplet>/include. LSP analysis deliberately never runs
+# `vcpkg install` (it would build ports from source on a keystroke), so until the first CLI
+# build of those examples that tree is absent, the header binding degrades to a silent skip,
+# and every C symbol in the file then reports as an undefined variable. example.bat is what
+# populates it; skip them here until it has.
+VCPKG_EXAMPLE_DIR = "example/vcpkg"
+
+
+def vcpkg_example_ports_installed() -> bool:
+    installed = REPO_ROOT / "example" / "vcpkg" / "vcpkg_installed"
+    return any(d.joinpath("include").is_dir() for d in installed.glob("*")) if installed.is_dir() else False
+
+
 def collect_files(include_win32_demo: bool) -> list[Path]:
     files: list[Path] = []
     files += sorted((REPO_ROOT / "Test").glob("*.cb"))
@@ -227,6 +241,13 @@ def collect_files(include_win32_demo: bool) -> list[Path]:
     # LAUNCHER, map.cb, which shares one global scope with it. map.cb is swept, and
     # example.bat exercises the app. Skip the standalone component here.
     files = [f for f in files if f.name != "map_app.cb"]
+    if not vcpkg_example_ports_installed():
+        before = len(files)
+        files = [
+            f for f in files
+            if not f.relative_to(REPO_ROOT).as_posix().startswith(VCPKG_EXAMPLE_DIR + "/")
+        ]
+        print(f"vcpkg example ports: not installed - skipping {before - len(files)} {VCPKG_EXAMPLE_DIR}/ source(s)")
     return files
 
 

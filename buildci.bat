@@ -34,6 +34,18 @@ if errorlevel 1 (
     set /a OVERALL_ERRORS+=1
 )
 
+REM Ahead of test_lsp.bat on purpose: this is the only stage that CLI-compiles
+REM example/vcpkg, which is what installs the ports its LSP sweep reads.
+echo.
+echo =========================================================================
+echo EXAMPLES [%CFG%]: example.bat
+echo =========================================================================
+call "%~dp0example.bat" %CFG%
+if errorlevel 1 (
+    echo EXAMPLES FAILED: %CFG% example.bat
+    set /a OVERALL_ERRORS+=1
+)
+
 echo.
 echo =========================================================================
 echo TESTS [%CFG%]: test_lsp.bat

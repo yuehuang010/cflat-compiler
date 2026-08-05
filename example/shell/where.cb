@@ -10,8 +10,9 @@ import "filesystem.cb";
 
 extern stdcall i32 GetEnvironmentVariableA(const char* name, char* buf, i32 size);
 
-// Make an owned string from a raw buffer (copies len bytes).
-string makeString(i8* buf, int len)
+// Make an owned string from a raw buffer (copies len bytes). Prefixed because fsh.cb pulls this
+// file in with `import program`, which shares one overload table with the host program.
+string whereMakeString(i8* buf, int len)
 {
     i8* nb = new i8[len + 1];
     int i = 0;
@@ -36,7 +37,7 @@ extern int main(int argc, char** argv)
     i32 plen = GetEnvironmentVariableA("PATH", pbuf, 32768);
     if (plen > 0 && plen < 32768)
     {
-        string pathVar = makeString(pbuf, (int)plen);
+        string pathVar = whereMakeString(pbuf, (int)plen);
         list<string> parts = pathVar.split((i8)';');
         int i = 0;
         while (i < parts.count())
