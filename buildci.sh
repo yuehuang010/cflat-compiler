@@ -2,7 +2,7 @@
 # buildci.sh - macOS counterpart of buildci.bat.
 #
 # Stages:
-#   1. BUILD Release        (cmake macos-arm64-release preset)
+#   1. BUILD Release        (cmake_build.sh release)
 #   2. TESTS                (test.sh Release)
 #   3. LSP TESTS            (test_lsp.sh Release)
 #   4. BUILD vscode-extension (vscode-extension/build.sh)
@@ -30,7 +30,10 @@ banner() {
 }
 
 banner "BUILD: Release"
-if ! (cmake --preset macos-arm64-release && cmake --build --preset macos-arm64-release); then
+# Go through cmake_build.sh (as buildci.bat goes through cmake_build.bat) rather
+# than calling cmake directly: the presets read $env{VCPKG_ROOT}, and resolving it
+# from the main checkout's ./vcpkg clone is that script's job.
+if ! bash "$SCRIPT_DIR/cmake_build.sh" release; then
     echo "BUILD FAILED: Release"
     OVERALL_ERRORS=$((OVERALL_ERRORS + 1))
     banner ""

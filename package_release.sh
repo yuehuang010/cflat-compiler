@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # package_release.sh - macOS counterpart of package_release.ps1.
 #
-# Stages Release artifacts into out/publish and archives them as a .tar.gz
-# (tar preserves executable permissions natively, unlike zip on this path).
+# Stages Release artifacts into out/publish/<stem> and archives them as a .tar.gz
+# (tar preserves executable permissions natively, unlike zip on this path), so the
+# archive unpacks into a single <stem>/ directory.
 #
 # Usage:
 #   ./package_release.sh          # version parsed from cflat/Version.h
@@ -30,15 +31,19 @@ if [ -z "$VERSION" ]; then
 fi
 
 RELEASE_DIR="$SCRIPT_DIR/x64/Release"
-PUBLISH_DIR="$SCRIPT_DIR/out/publish"
 OUT_DIR="$SCRIPT_DIR/out"
+# Stage under a versioned directory so the archive unpacks into one folder
+# instead of scattering its contents across the extracting shell's cwd.
+STEM="cflat-macos-arm64-v$VERSION"
+STAGE_ROOT="$SCRIPT_DIR/out/publish"
+PUBLISH_DIR="$STAGE_ROOT/$STEM"
 
 if [ ! -f "$RELEASE_DIR/cflat" ]; then
     echo "ERROR: cflat not found at $RELEASE_DIR - run a Release build first." >&2
     exit 1
 fi
 
-rm -rf "$PUBLISH_DIR"
+rm -rf "$STAGE_ROOT"
 mkdir -p "$PUBLISH_DIR"
 
 # Core deployed binaries. macOS has no LTO.dll/Remarks.dll/lld-link.exe/clang-cl.exe
@@ -90,10 +95,12 @@ if [ -z "$VSIX" ]; then
 fi
 cp "$VSIX" "$PUBLISH_DIR/"
 
-ARCHIVE="$OUT_DIR/cflat-macos-arm64-v$VERSION.tar.gz"
+ARCHIVE="$OUT_DIR/$STEM.tar.gz"
 rm -f "$ARCHIVE"
 mkdir -p "$OUT_DIR"
-tar -czf "$ARCHIVE" -C "$PUBLISH_DIR" .
+# COPYFILE_DISABLE stops macOS tar from emitting ._ AppleDouble members for
+# extended attributes. A Mach-O code signature is embedded, so nothing is lost.
+COPYFILE_DISABLE=1 tar -czf "$ARCHIVE" -C "$STAGE_ROOT" "$STEM"
 
 SUM_FILE="$ARCHIVE.sha256"
 if command -v shasum >/dev/null 2>&1; then
