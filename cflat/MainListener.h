@@ -8859,6 +8859,10 @@ public:
             // Same reasoning again for the definitely-null interface dispatch: the proof reads
             // the dispatch's own block, which is only complete now.
             compiler->RunNullIfaceDispatchCheck(fn);
+
+            // And for the interface field-to-field `unique` store: the receivers' slots only stop
+            // gaining stores here, so a rebinding after the access is finally visible.
+            compiler->RunUniqueIfaceFieldStoreCheck(fn);
         }
 
         if (isAutoReturn)
@@ -11142,6 +11146,36 @@ public:
     }
 
     /*
+     * The OBJECT an interface-FIELD lvalue reads through, resolved back to the value that was
+     * boxed. The address is a GEP chain off `extractvalue fat, 1`, so the fat value is
+     * recoverable; a fat value loaded out of an interface LOCAL is traced to the single box
+     * stored into that slot. Two DISTINCT boxes of one object share a data pointer, which is what
+     * makes this more than a Value equality test on the field address. Returns null - "cannot
+     * tell" - for a parameter, a call result, a rebound slot, or any other shape.
+     */
+    llvm::Value* ResolveBoxedObjectOfInterfaceField(llvm::Value* addr, llvm::AllocaInst*& slot,
+                                                    llvm::StoreInst*& boxStore)
+    {
+        slot = nullptr; boxStore = nullptr;
+        if (compilerLLVM == nullptr || addr == nullptr) return nullptr;
+        auto* dataExtract = llvm::dyn_cast_or_null<llvm::ExtractValueInst>(StripAllGeps(addr));
+        if (dataExtract == nullptr || dataExtract->getNumIndices() != 1
+            || dataExtract->getIndices()[0] != 1u) return nullptr;
+        llvm::Value* fat = dataExtract->getAggregateOperand();
+        if (const auto* direct = compilerLLVM->FindInterfaceBoxByFatValue(fat))
+            return direct->DataPointer;
+        auto* load = llvm::dyn_cast<llvm::LoadInst>(fat);
+        if (load == nullptr) return nullptr;
+        auto* candidate = llvm::dyn_cast<llvm::AllocaInst>(load->getPointerOperand()->stripPointerCasts());
+        llvm::StoreInst* sole = LLVMBackend::SoleStoreIntoSlot(candidate);
+        if (sole == nullptr) return nullptr;
+        const auto* box = compilerLLVM->FindInterfaceBoxByFatValue(sole->getValueOperand());
+        if (box == nullptr) return nullptr;
+        slot = candidate; boxStore = sole;
+        return box->DataPointer;
+    }
+
+    /*
      * The WRITTEN spelling of an INDEXED field-read RHS ("arr[1].slot", "p->arr[0].slot"), for a
      * diagnostic that would otherwise name the slot from CallerName - which is the CONTAINER for
      * an array element, so "<caller>.<field>" points at element 0 and its `move` remedy either
@@ -11408,28 +11442,32 @@ public:
      * local is not a borrow - and the owning-value field-to-field rule cannot either, since a raw
      * pointer is not an owning value type. Shared by the `=` and brace-init store paths.
      */
+    std::string FormatUniqueFieldToUniqueField(const LLVMBackend::NamedVariable& rightNV,
+                                               const std::string& fieldDesc,
+                                               const std::string& srcText)
+    {
+        std::string access = ExactUniqueFieldAccess(rightNV, srcText);
+        if (access.empty())
+            // No spelling is known to be right, so name NO expression: "<caller>.<field>" would
+            // name element 0 here, and `move` on that transfers the wrong slot (silently).
+            return std::format(
+                "cannot store unique field '{}' into {} - the source field's synthesized destructor "
+                "already frees it, and two 'unique' fields cannot own one pointer. Prefix the source "
+                "expression with 'move' to transfer ownership out of the source field (which nulls it).",
+                rightNV.FieldName.empty() ? std::string("<field>") : rightNV.FieldName, fieldDesc);
+        return std::format(
+            "cannot store unique field '{}' into {} - the source field's synthesized destructor "
+            "already frees it, and two 'unique' fields cannot own one pointer. Use 'move {}' to "
+            "transfer ownership out of the source field (which nulls it).",
+            access, fieldDesc, access);
+    }
+
     void RejectUniqueFieldToUniqueField(const LLVMBackend::NamedVariable& rightNV,
                                         const std::string& fieldDesc,
                                         antlr4::ParserRuleContext* ctx,
                                         const std::string& srcText = {})
     {
-        std::string access = ExactUniqueFieldAccess(rightNV, srcText);
-        if (access.empty())
-        {
-            // No spelling is known to be right, so name NO expression: "<caller>.<field>" would
-            // name element 0 here, and `move` on that transfers the wrong slot (silently).
-            LogErrorContext(ctx, std::format(
-                "cannot store unique field '{}' into {} - the source field's synthesized destructor "
-                "already frees it, and two 'unique' fields cannot own one pointer. Prefix the source "
-                "expression with 'move' to transfer ownership out of the source field (which nulls it).",
-                rightNV.FieldName.empty() ? std::string("<field>") : rightNV.FieldName, fieldDesc));
-            return;
-        }
-        LogErrorContext(ctx, std::format(
-            "cannot store unique field '{}' into {} - the source field's synthesized destructor "
-            "already frees it, and two 'unique' fields cannot own one pointer. Use 'move {}' to "
-            "transfer ownership out of the source field (which nulls it).",
-            access, fieldDesc, access));
+        LogErrorContext(ctx, FormatUniqueFieldToUniqueField(rightNV, fieldDesc, srcText));
     }
 
     /*
@@ -11446,25 +11484,30 @@ public:
      *     teardown. Binding it to a local and moving out of that DOUBLE-FREES, so that remedy must
      *     not be named here; a borrowing (non-`unique`) destination is the one that works.
      */
-    void RejectUniqueTempFieldToField(const LLVMBackend::NamedVariable& rightNV,
-                                      const std::string& fieldDesc,
-                                      antlr4::ParserRuleContext* ctx)
+    std::string FormatUniqueTempFieldToField(const LLVMBackend::NamedVariable& rightNV,
+                                             const std::string& fieldDesc)
     {
         std::string access = DescribeUniqueFieldAccess(rightNV);
         if (rightNV.OwningTempParent)
-            LogErrorContext(ctx, std::format(
+            return std::format(
                 "cannot store unique field '{}' of a temporary into {} - the temporary's "
                 "synthesized destructor frees it at the end of this statement, and two 'unique' "
                 "fields cannot own one pointer. 'move' needs an addressable source, so bind the "
                 "whole call result to a local first and move the field out of that local instead.",
-                access, fieldDesc));
-        else
-            LogErrorContext(ctx, std::format(
-                "cannot store unique field '{}' borrowed from a temporary into {} - the container "
-                "the temporary was borrowed from still owns it and frees it at its own teardown, "
-                "so two 'unique' fields would own one pointer. Drop 'unique' from the destination "
-                "field if it only borrows, or store an independent copy of the pointee.",
-                access, fieldDesc));
+                access, fieldDesc);
+        return std::format(
+            "cannot store unique field '{}' borrowed from a temporary into {} - the container "
+            "the temporary was borrowed from still owns it and frees it at its own teardown, "
+            "so two 'unique' fields would own one pointer. Drop 'unique' from the destination "
+            "field if it only borrows, or store an independent copy of the pointee.",
+            access, fieldDesc);
+    }
+
+    void RejectUniqueTempFieldToField(const LLVMBackend::NamedVariable& rightNV,
+                                      const std::string& fieldDesc,
+                                      antlr4::ParserRuleContext* ctx)
+    {
+        LogErrorContext(ctx, FormatUniqueTempFieldToField(rightNV, fieldDesc));
     }
 
     /*
@@ -11474,16 +11517,54 @@ public:
      * at a spelling that does not work. `new` is the transfer that does. The wording holds for a
      * `move` source as well, because a `move` out of an interface FIELD does not null it.
      */
-    void RejectUniqueInterfaceFieldToField(const LLVMBackend::NamedVariable& rightNV,
-                                           const std::string& fieldDesc,
-                                           antlr4::ParserRuleContext* ctx)
+    std::string FormatUniqueInterfaceFieldToField(const LLVMBackend::NamedVariable& rightNV,
+                                                  const std::string& fieldDesc)
     {
-        LogErrorContext(ctx, std::format(
+        return std::format(
             "cannot store unique interface field '{}' into {} - the source field keeps ownership "
             "(a 'move' out of an interface field does not null it) and its synthesized destructor "
             "still frees the boxed object, so two 'unique' fields would own one interface value. "
             "Assign 'new' so the destination owns its own object.",
-            DescribeUniqueFieldAccess(rightNV), fieldDesc));
+            DescribeUniqueFieldAccess(rightNV), fieldDesc);
+    }
+
+    void RejectUniqueInterfaceFieldToField(const LLVMBackend::NamedVariable& rightNV,
+                                           const std::string& fieldDesc,
+                                           antlr4::ParserRuleContext* ctx)
+    {
+        LogErrorContext(ctx, FormatUniqueInterfaceFieldToField(rightNV, fieldDesc));
+    }
+
+    /*
+     * RECORD an interface field-to-field `unique` store whose two receivers are PROVABLY different
+     * objects - two distinct boxed roots. Recording cannot reject, so a shape this cannot resolve
+     * degrades to today's missing diagnostic, never to a false rejection; the verdict is settled at
+     * end of body (RunUniqueIfaceFieldStoreCheck), where a receiver rebound later is visible.
+     */
+    void RecordInterfaceFieldToFieldStore(const LLVMBackend::NamedVariable& namedVar,
+                                          const LLVMBackend::NamedVariable& rightNV,
+                                          llvm::Value* destination,
+                                          bool destOwnsUniqueInterface,
+                                          const std::string& srcText,
+                                          antlr4::ParserRuleContext* ctx)
+    {
+        LLVMBackend::PendingUniqueIfaceFieldStore rec;
+        llvm::Value* destData = ResolveBoxedObjectOfInterfaceField(
+            destination, rec.DestSlot, rec.DestBoxStore);
+        llvm::Value* srcData = ResolveBoxedObjectOfInterfaceField(
+            rightNV.Storage, rec.SrcSlot, rec.SrcBoxStore);
+        if (!ProvablyDifferentObjects(destData, srcData)) return;
+
+        std::string destDesc = std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar));
+        if (IsUniqueTempFieldRead(rightNV))
+            rec.Message = FormatUniqueTempFieldToField(rightNV, destDesc);
+        else if (destOwnsUniqueInterface)
+            rec.Message = FormatUniqueInterfaceFieldToField(rightNV, destDesc);
+        else
+            rec.Message = FormatUniqueFieldToUniqueField(rightNV, destDesc, srcText);
+        rec.Line = (int)ctx->getStart()->getLine();
+        rec.Col  = (int)ctx->getStart()->getCharPositionInLine();
+        compilerLLVM->RecordPendingUniqueIfaceFieldStore(rec);
     }
 
     /*
@@ -13818,6 +13899,18 @@ public:
                     RejectUniqueFieldToUniqueField(rightNV, destDesc, ctx, srcText);
                 return right;
             }
+
+            // Same store between two INTERFACE receivers: neither side carries a caller name, so
+            // the reject above reads them as a self-assign. Record it and settle at end of body.
+            if (operatorText == "=" && destIsStructField
+                && namedVar.IsInterfaceField && rightNV.IsInterfaceField
+                && (destOwnsUniquePointee || destOwnsUniqueInterface)
+                && (IsUniqueFieldRead(rightNV) || IsUniqueTempFieldRead(rightNV))
+                && !rightNV.TypeAndValue.IsMove
+                && selfUniqueFieldAssign)
+                RecordInterfaceFieldToFieldStore(
+                    namedVar, rightNV, destination, destOwnsUniqueInterface,
+                    assignCtx != nullptr ? assignCtx->getText() : std::string(), ctx);
 
             // A plain (non-move) by-value `string` PARAMETER stored into a struct field: deep-copy it.
             // The parameter is a by-value copy of the caller's argument, but the CALLER still owns and

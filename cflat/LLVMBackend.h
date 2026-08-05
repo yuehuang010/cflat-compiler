@@ -1655,11 +1655,96 @@ public:
               site.Line, site.Col, gpath });
     }
 
+    /*
+     * A `unique` field-to-field store between two INTERFACE receivers, RECORDED rather than
+     * rejected on the spot. Neither receiver carries a caller name, so the store looks like a
+     * self-assign; the boxed object behind each side is resolvable, but only at end of body is it
+     * known that neither receiver is rebound later (a loop can rebind after the access).
+     */
+    struct PendingUniqueIfaceFieldStore
+    {
+        llvm::AllocaInst* DestSlot = nullptr;  // null when the box is an SSA value - nothing to recheck
+        llvm::AllocaInst* SrcSlot = nullptr;
+        llvm::StoreInst* DestBoxStore = nullptr;
+        llvm::StoreInst* SrcBoxStore = nullptr;
+        std::string Message;
+        int Line = 0;
+        int Col = 0;
+    };
+    std::unordered_map<llvm::Function*, std::vector<PendingUniqueIfaceFieldStore>> pendingUniqueIfaceFieldStore_;
+
+    void RecordPendingUniqueIfaceFieldStore(const PendingUniqueIfaceFieldStore& rec)
+    {
+        llvm::BasicBlock* bb = builder != nullptr ? builder->GetInsertBlock() : nullptr;
+        if (bb == nullptr || bb->getParent() == nullptr) return;
+        pendingUniqueIfaceFieldStore_[bb->getParent()].push_back(rec);
+    }
+
+    /*
+     * The ONE store of an implementation into an interface local's slot, or null when there are
+     * none, several, or the slot's address escapes. Debug and lifetime intrinsics are skipped -
+     * they write no memory. A store of a NULL fat value is skipped too: it leaves the slot with no
+     * implementation, so any access reaching through it faults before ownership can matter, and
+     * `I i = default; i = a;` is one binding written in two statements. Re-run at end of body,
+     * where a rebinding emitted AFTER the access is finally visible.
+     */
+    static llvm::StoreInst* SoleStoreIntoSlot(llvm::AllocaInst* slot)
+    {
+        if (slot == nullptr) return nullptr;
+        llvm::StoreInst* only = nullptr;
+        for (llvm::User* u : slot->users())
+        {
+            if (llvm::isa<llvm::LoadInst>(u)) continue;
+            if (auto* call = llvm::dyn_cast<llvm::CallBase>(u))
+            {
+                const llvm::Function* f = call->getCalledFunction();
+                if (f != nullptr && (f->getName().starts_with("llvm.dbg.")
+                                     || f->getName().starts_with("llvm.lifetime."))) continue;
+                return nullptr;
+            }
+            auto* st = llvm::dyn_cast<llvm::StoreInst>(u);
+            if (st == nullptr || st->getPointerOperand() != slot) return nullptr;
+            if (auto* c = llvm::dyn_cast<llvm::Constant>(st->getValueOperand());
+                c != nullptr && c->isNullValue()) continue;
+            if (only != nullptr) return nullptr;
+            only = st;
+        }
+        return only;
+    }
+
+    /*
+     * Settle the recorded interface field-to-field stores for ONE function, at the same
+     * end-of-body hook as RunInterfaceReturnDangleCheck. Rejecting requires each receiver's slot
+     * to STILL hold exactly the one box store the site resolved it through; a rebinding later in
+     * the body, or an escaping address, leaves the store compiling - the polarity that makes an
+     * unprovable pair a missing diagnostic rather than a false rejection.
+     */
+    void RunUniqueIfaceFieldStoreCheck(llvm::Function* F)
+    {
+        if (!F) return;
+        auto it = pendingUniqueIfaceFieldStore_.find(F);
+        if (it == pendingUniqueIfaceFieldStore_.end()) return;
+        std::vector<PendingUniqueIfaceFieldStore> pending = std::move(it->second);
+        pendingUniqueIfaceFieldStore_.erase(it);
+        for (const auto& rec : pending)
+        {
+            // Stale-record guard, same shape as RunNullIfaceDispatchCheck: a record whose slot
+            // now lives in another function (recycled address) must not be walked.
+            if (rec.DestSlot != nullptr && rec.DestSlot->getFunction() != F) continue;
+            if (rec.SrcSlot != nullptr && rec.SrcSlot->getFunction() != F) continue;
+            if (rec.DestSlot != nullptr && SoleStoreIntoSlot(rec.DestSlot) != rec.DestBoxStore) continue;
+            if (rec.SrcSlot != nullptr && SoleStoreIntoSlot(rec.SrcSlot) != rec.SrcBoxStore) continue;
+            SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
+            LogError(rec.Message);
+        }
+    }
+
     // Same rationale as DiscardPendingReturnDangleChecks: an aborted body's blocks are partial.
     void DiscardPendingNullIfaceDispatch(llvm::Function* F)
     {
         if (!F) return;
         pendingNullIfaceDispatch_.erase(F);
+        pendingUniqueIfaceFieldStore_.erase(F);
         // The global ledger survives to module end, so an aborted body's records must be
         // removed here or the control-dependence test would run on a partial CFG.
         std::erase_if(pendingNullIfaceGlobal_, [F](const PendingNullIfaceGlobalAccess& r)
@@ -20757,6 +20842,8 @@ public:
         // end-of-body hook (a lambda, a synthesized body, or an erased global-init temp
         // function whose blocks are gone). Drop them unanalyzed - accept, never reject.
         pendingNullIfaceDispatch_.clear();
+        // Same, for the interface field-to-field records: an unreached body is unproven.
+        pendingUniqueIfaceFieldStore_.clear();
 
         // The GLOBAL-receiver half, by contrast, can only be answered here: the whole-module
         // "never assigned" fact needs every function emitted. LogError throws out of this.

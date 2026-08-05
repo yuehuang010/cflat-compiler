@@ -21,6 +21,48 @@ expect_error("cannot store unique field 'a.slot' into unique field 'Holder.slot'
     }
 }
 
+/*
+ * The same copy between two boxed INTERFACE receivers, with the SAME field name on both sides.
+ * Neither side carries a caller name, so the name comparison reads them as a self-assign; the
+ * receivers are told apart by resolving each box back to the object it wraps. The different-NAME
+ * spelling is caught by the leg above and would be vacuous here.
+ *
+ * Both legs wrap a whole FUNCTION: the verdict is deferred to the end of the body, where a
+ * receiver rebound after the store is finally visible, so a scoped block INSIDE the function
+ * would close before the diagnostic fires. Two boxes of ONE object must keep compiling - that
+ * accept set is value-asserted in Test/test_move.cb::testUniqueFieldStoreRemedies.
+ */
+interface ISlotIf { unique Node* slot; };
+class BoxIf : ISlotIf { unique Node* slot = nullptr; };
+
+expect_error("cannot store unique field 'slot' into unique field 'ISlotIf.slot'") {
+    void stealThroughInterfaces()
+    {
+        BoxIf a = default;
+        BoxIf c = default;
+        a.slot = new Node();
+        ISlotIf ia = a;
+        ISlotIf ic = c;
+        ic.slot = ia.slot;
+    }
+}
+
+// The two-statement binding is ONE binding: the `= default` null store leaves the slot with no
+// implementation, so it cannot be the store the access reads through.
+expect_error("cannot store unique field 'slot' into unique field 'ISlotIf.slot'") {
+    void stealThroughLateBoundInterfaces()
+    {
+        BoxIf a = default;
+        BoxIf c = default;
+        a.slot = new Node();
+        ISlotIf ia = default;
+        ISlotIf ic = default;
+        ia = a;
+        ic = c;
+        ic.slot = ia.slot;
+    }
+}
+
 extern int main()
 {
     return 0;

@@ -3804,8 +3804,7 @@ int testUniqueFieldStoreRemedies()
 
     // A boxed interface receiver assigning its own unique field to itself is ONE owner: the
     // store is a no-op, the pointee stays readable, and it is freed exactly once. (The
-    // TWO-receiver form of this is still undiagnosed - see
-    // internal/issue/p1/interface-field-self-assign-false-positive.md.)
+    // TWO-receiver form is rejected - Test/errors/err_unique_field_to_field.cb.)
     dtorCount = 0;
     {
         UniqueIfaceBox s = default;
@@ -3833,6 +3832,63 @@ int testUniqueFieldStoreRemedies()
         passed += Test("uniq_iface_move_no_early_free", dtorCount, 0);
     }
     passed += Test("uniq_iface_move_freed_once", dtorCount, 1);
+
+    /*
+     * The accept set the two-receiver reject must not swallow. Receiver identity is proved from
+     * the BOXED OBJECT, never from a name or from the interface local's own storage: two boxes of
+     * ONE object are two distinct allocas holding one data pointer, so the copy is a self-assign
+     * and the pointee is freed exactly once. A name comparison rejected both of these.
+     */
+    dtorCount = 0;
+    {
+        UniqueIfaceBox s = default;
+        s.item = new Resource();
+        s.item->id = 44;
+        IUniqueBox ia = s;
+        IUniqueBox ib = s;
+        ib.item = ia.item;
+        passed += Test("uniq_iface_twobox_value", ib.item->id, 44);
+        passed += Test("uniq_iface_twobox_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uniq_iface_twobox_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        UniqueIfaceBox s = default;
+        s.item = new Resource();
+        s.item->id = 45;
+        IUniqueBox ia = s;
+        alias IUniqueBox ib = ia;
+        ib.item = ia.item;
+        passed += Test("uniq_iface_alias_value", ib.item->id, 45);
+        passed += Test("uniq_iface_alias_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uniq_iface_alias_freed_once", dtorCount, 1);
+
+    /*
+     * A receiver REBOUND after the store. On the second trip `ia` and `ic` box one object, so the
+     * copy is a legal self-assign - which is only knowable once the whole body is lowered, and is
+     * why the verdict is deferred to the end of the body rather than taken at the store.
+     */
+    dtorCount = 0;
+    {
+        UniqueIfaceBox a = default;
+        a.item = new Resource();
+        a.item->id = 46;
+        UniqueIfaceBox c = default;
+        c.item = new Resource();
+        c.item->id = 47;
+        IUniqueBox ia = a;
+        IUniqueBox ic = c;
+        for (int k = 0; k < 2; k = k + 1)
+        {
+            if (k > 0) { ic.item = ia.item; }
+            ia = ic;
+        }
+        passed += Test("uniq_iface_rebound_value", ic.item->id, 47);
+        passed += Test("uniq_iface_rebound_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uniq_iface_rebound_freed_twice", dtorCount, 2);
 
     return passed;
 }
@@ -4554,7 +4610,7 @@ extern int main()
     total += 6;
 
     passed += testUniqueFieldStoreRemedies();
-    total += 20;
+    total += 29;
 
     passed += testTempUniqueFieldBorrowAccepts();
     total += 8;

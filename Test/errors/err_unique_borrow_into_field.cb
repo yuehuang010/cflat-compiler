@@ -243,10 +243,9 @@ expect_error("cannot store unique field 'makeIBox.t' of a temporary into an inte
 }
 
 // NOTE: an interface-field-to-interface-field copy with the SAME field name on both sides is
-// still MISSING its diagnostic - two different boxed receivers both carry an empty CallerName
-// and the store is misread as a no-op self-assign. It has no leg here because it still
-// reproduces; see internal/issue/p1/interface-field-self-assign-false-positive.md, which also
-// records why a name-based receiver comparison is NOT the fix.
+// rejected as of 2026-08-05 - two different boxed receivers still both carry an empty CallerName,
+// so they are told apart by the OBJECT each box wraps. Its legs live in
+// err_unique_field_to_field.cb, beside the plain field-to-field shape they mirror.
 
 extern int main()
 {

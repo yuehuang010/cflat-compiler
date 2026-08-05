@@ -105,7 +105,8 @@ compile rc 0, run rc 134 - identical before and after the fix.
 This is NOT an oversight and must not be closed by widening the rule. `i` and `j` can hold the
 same value, and `arr[i].slot = arr[i].slot` is a legal self-assign that compiles and frees once
 today. Rejecting an unprovable pair would take away working programs, which is the failure
-mode [[interface-field-self-assign-false-positive]] records an attempt at. The must-keep-working
+mode the `interface-field-self-assign-false-positive` landed record (in
+[[interface-issue-queue]]) records an attempt at. The must-keep-working
 shapes are value-asserted in `Test/test_move.cb::testUniqueArrayElementFieldStore`
 (`uae_rt_self_*`, `uae_rt_diff_*`, `uae_const_self_*`, `uae_ptr_rt_self_*`); an over-broad
 polarity was mutation-tested against them and all four flipped to compile errors.
@@ -161,10 +162,12 @@ enforced first; that is a language change, not a widening of this guard.
   residue below is untouched by it - a single array has ONE root, so the new arm cannot fire.
   See the landed design record in [[interface-issue-queue]], including why that change did NOT
   give globals a `CallerName` (the empty string is load-bearing at two funcptr checks).
-- The INTERFACE receiver of the same mechanism is its own open file
-  ([[interface-field-self-assign-false-positive]]) and is unchanged in both directions: its
-  repro still aborts and both of its must-keep-working witnesses still work. An interface field
-  has no address with a constant offset to compare, so this fix's proof cannot reach it.
+- The INTERFACE receiver of the same mechanism was its own file
+  (`interface-field-self-assign-false-positive`) and was **FIXED 2026-08-05** by
+  `fix/iface-selfassign` - see the landed design record in [[interface-issue-queue]]. An interface
+  field has no address with a constant offset to compare, so this fix's proof could not reach it;
+  that one resolves each receiver's fat pointer back to the OBJECT its box wraps and then reuses
+  `ProvablyDifferentObjects`. Nothing here moved in either direction.
 - The `move` remedy names an expression ONLY when one is known to be right. Two review rounds
   were spent on this arm, so the rule is now stated as an invariant: `ExactUniqueFieldAccess`
   returns the written RHS text for a plain indexed lvalue path, the name-derived
@@ -178,4 +181,4 @@ enforced first; that is a language change, not a widening of this guard.
   (`(arr[1]).slot`) is not, and takes the no-expression wording. Every arm was run end to end -
   compile rc 0, correct value moved in, source nulled, freed exactly once, 0 leaks.
 
-Related: [[interface-field-self-assign-false-positive]], [[interface-issue-queue]]
+Related: [[unique-field-to-field-interface-receiver-residues]], [[interface-issue-queue]]

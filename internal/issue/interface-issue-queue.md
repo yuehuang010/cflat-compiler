@@ -53,7 +53,8 @@ the prerequisite it names does not actually unblock it - RECLASSIFIED to P3 on 2
 maintainer, since a permanent non-fix does not belong in the P1 working set). The other,
 `ftell-fseek-long-width-on-windows`, was parked rather than declined and is now FIXED - see the
 landed design record below. And `interface-field-self-assign-false-positive` was ATTEMPTED and
-REVERTED - see its file for the three discriminators that cannot work.
+REVERTED once (a receiver comparison by variable NAME) before being FIXED on the second attempt -
+see its landed design record below, which keeps the three discriminators that cannot work.
 ## Resume point
 
 **2026-08-04: P1-to-zero release campaign in progress.** Goal: zero open P1s ahead of a release.
@@ -71,10 +72,10 @@ review split out [[join-erases-code-value-evidence-at-every-gate]] (a `?:`/`??` 
 source evidence every code-value predicate reads, which defeats the already-landed ARGUMENT gate as
 well as the store sites). **`unique-field-global-struct-self-assign-false-positive` is the FOURTH
 campaign fix and the first whose review split out nothing, so the count now falls: 6 -> 5 as of
-this edit.** All four design records are below. The count will move again when the parallel
-branches land, so re-derive it from `ls internal/issue/p1/` rather than trusting this sentence.
-Remaining, in order:
-`interface-field-self-assign-false-positive`, and last the deliberately-accepted runtime-index
+that edit.** `interface-field-self-assign-false-positive` is the FIFTH, also splitting out
+nothing: **5 -> 4**. All five design records are below. The count will move again when the
+parallel branches land, so re-derive it from `ls internal/issue/p1/` rather than trusting this
+sentence. Remaining, last: the deliberately-accepted runtime-index
 residue of `unique-field-to-field-array-element-receiver` (decision needed: runtime owner check
 vs re-rank, per its own file). Progress is tracked by row deletion here, as always.
 
@@ -211,9 +212,9 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 5 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. | 4 |
 | **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 44 |
-| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 29 |
+| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 30 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
 Counts re-verified from disk on 2026-08-01 (`ls internal/issue/p{1,2,3}/*.md ui/*.md | wc -l` per
@@ -344,13 +345,21 @@ row, per bucket) and are clean. See the landed design record below for why the f
 step 1 (give a global receiver a `NamedVariable` identity) was NOT taken - its premise was
 measurably wrong - and for the one other behaviour change the change carries.
 
+**Recount 2026-08-05, after `interface-field-self-assign-false-positive` landed:** its file is
+deleted and its P1 row removed - the FIFTH campaign fix, and the second in a row to move the P1
+count: **4 P1 / 44 P2 / 30 P3 / 7 UI = 85 total**. The round-1 review filed ONE new item, at P3
+not P1: [[unique-field-to-field-interface-receiver-residues]], consolidating the fix's own
+deliberate-deferral residues on disk instead of leaving them only in a review report. Both
+integrity checks were re-run against this tree (every row resolves to a file, every file has a
+row, per bucket) and are clean. The landed design record below states why the receiver identity is taken
+from the BOXED OBJECT and why the verdict is deferred to end of body.
+
 ### P1 - wrong programs and crashes (`p1/`)
 
 | Issue | Severity |
 |---|---|
 | [[pointer-copy-propagates-no-ownership-fact]] | Four silent double frees (exit 134), no diagnostic, all identical on `312d202` and on the merged `fix/untracked-copy`. A pointer DECLARATION copies the VALUE and nothing else, so every ownership fact a source binding carries needs its own hand-written clause at the decl-init site and any fact without one vanishes across the copy. Live members: a copy stored into a `unique` FIELD; a one-hop copy of a container-ELEMENT borrow (the direct spelling rejects); `T* d = move b;` off a copy (whose `delete b;` twin now rejects, so the two spellings disagree); and a `?:` join into a pointer declaration (whose DIRECT boxed spelling rejects). Fix direction: one clause per fact, recorded by storage identity and re-asked for liveness at the consumer, exactly like `BorrowsOwningLocal`. Each needs its own accept set first - (a) and (b) both have sole-owner shapes where a rejection would LEAK. Filed 2026-08-04 by the round-1 review of `fix/untracked-copy`. |
 | [[join-erases-code-value-evidence-at-every-gate]] | Exit 138, no diagnostic, on `6e9ab46`, on `a846e6e` and on `fix/codeval-store` (re-measured per spelling after the rebase). `Rec* r = c ? w : n;`, `Rec* r = n ?? w;` and - the telling one - `lam(c ? w : n)` into a `Rec*` PARAMETER, which the ARGUMENT gate `fix/funcptr-rebind` landed diagnoses in the bare spelling. A join produces a bare `llvm::Value` (a PHI, or a load out of a slot for `??`) carrying no TypeName, no recorded signature and no `llvm::Function` Primary, so every code-value predicate reads false before any gate runs. NOT the store defect: there the destination reader was missing; here the SOURCE evidence is erased. Fix by record-then-resolve, ledgering code-ness by value identity exactly as `fatInterfaceValueTypeNames_` does, and serving all three gates from it. Filed 2026-08-04 by `fix/codeval-store`. |
-| [[interface-field-self-assign-false-positive]] | Silent abort (exit 134), no diagnostic. An interface-field-to-interface-field copy with the SAME field name on both sides is misread as a self-assign, suppressing the reject. **ATTEMPTED AND REVERTED 2026-08-01** - see the file for the three discriminators that cannot work (names, box storage, and a bare `Value` compare of the field address all fail at least one witness). A sound test needs real dataflow through the box to the underlying data pointer. |
 | [[unique-field-to-field-array-element-receiver]] | Silent abort (exit 134), no diagnostic. **NARROWED 2026-08-02** by `fix/uniq-array-elem`: root cause CONFIRMED by instrumentation (`FieldName`/`CallerName` name the CONTAINER, so `selfFieldAssign` swallowed a genuine two-owner store), and every element pair whose addresses are constant-provably different now rejects - local, generic-substituted, nested, array-as-field, through-pointer, view, and global arrays. BOTH copies of the name comparison were fixed; the second (`sameField`) also guards the reassignment-destruct, and fixing only the first traded an abort for a leak. **Narrowed again 2026-08-04** by `fix/uniq-global`, whose distinct-roots arm also closes the two-DISTINCT-GLOBAL-array pair (`gArrA[i].slot = gArrB[j].slot`, measured accepted-and-aliasing before it). Residue: a non-constant index within ONE array - a runtime subscript, and a `const` integer (`const` is unenforced, so folding it would be unsound). |
 | [[temp-unique-field-escapes-through-unguarded-spellings]] | Silent use-after-free, compiles clean and exits 0. The residue spellings `fix/temp-uniq-borrow` did NOT reach, all measured identical on `6e9ab46` and on the merged fix: a same-type C-style cast, a `??` join, a `?:` join, an ARRAY AGGREGATE initializer (`Node*[2] a = { makeBox().t, nullptr };` - not the `EmitOneFieldInit` path), and a call ARGUMENT that stores. The argument case is PARTLY closable - a `unique T*` or `move T*` parameter states the claim at the call site (both measured still broken); a plain `T*` parameter is the undecidable remainder. Fix order and per-spelling accept sets are in the file. Filed 2026-08-04 by the round-1 review. |
 
@@ -410,6 +419,7 @@ measurably wrong - and for the one other behaviour change the change carries.
 | [[interface-boxing-keyed-on-source-binding]] | deliberate deferral | RE-BUCKETED P1 -> P3 2026-08-04, on the file's own text: the live double free it was filed for was CLOSED 2026-08-02 (borrowed-interface-box delete diagnosed via the positive keeps-owner proof; landed record below), and only the preventive remainder is left - `RegisterInterfaceBox` dedupes on `FatValue` alone, harmless today. The file kept its name and moved to `p3/`, so existing links still resolve. |
 | [[owning-temp-parent-misroutes-chained-alias-access]] | diagnostic | RE-RANKED P1 -> P3 2026-08-02, on the file's own "re-rank freely" and on a re-measurement: the VERDICT is right (two `unique` owners really is an error) and only the WORDING is wrong, so no program's accept/reject status changes. A wrong message is P3 by this table's own rubric; it sat at P1 only for visibility to whoever next touched the `unique` field-store routing, and that work has landed. Still live on `ca5a02a`: the call-result message fires on a container-element shape, stating a false mechanism and naming a remedy that aborts 134. |
 | [[return-dangle-missed-when-slot-has-extra-user]] | deliberate deferral | RECLASSIFIED P1 -> P3 2026-08-02 by the maintainer, rationale kept intact. Missed dangle, no diagnostic - but the shapes were ALL accepted before `2bcc5a0` too, so this is residue, not a regression, and its own file rules out the obvious remedy (widening the extra-user whitelist re-introduces false rejections). Stays open as a record of what the pass cannot see. |
+| [[unique-field-to-field-interface-receiver-residues]] | deliberate deferral | The five interface-receiver shapes the `fix/iface-selfassign` proof deliberately cannot reach (pointer/`new`-boxed receivers, parameters and call results, sub-objects of one container, lambda bodies). All missing diagnostics, never false rejections; all accepted by the PRE binary too, so residue, not regression - same rationale as `return-dangle-missed-when-slot-has-extra-user`. P3 by that precedent; re-rank to P1 if the maintainer rules the silent-double-free rubric wins. Filed 2026-08-05 out of the fix's round-1 review. |
 | [[nullcond-guard-skips-move-argument-cleanup]] | latent | INTRODUCED by the `null-conditional-args-eval-order` fix, and accepted rather than fixed. A `move` argument to a '?.' call on a NULL receiver never runs, so nothing takes ownership - but the source is still statically marked moved, so scope exit frees nothing either, and the allocation leaks (`frees=0` vs master's `frees=1`). Not memory-unsafe and not observable in-language; reading the source after the call is rejected identically on both binaries. Filed 2026-07-31. |
 | [[null-conditional-args-eval-order-hresult]] | latent | Residual of the fixed P1 `null-conditional-args-eval-order`. On an `HResult<T*>` receiver '?.' means "propagate the failure code", and its `chain.ok`/`chain.fail` lowering still runs after the argument list is evaluated - so a failed HResult skips the call but not its arguments' side effects. COM/winrt only, therefore Windows only; not reachable from any in-repo `.cb` on macOS. Narrowed 2026-07-31. |
 | [[mangled-generic-name-leaks-into-diagnostics]] | diagnostic | `Box__unique_Itemptr` shown where the user wrote `Box<unique Item*>`. Also a TEST-FRAGILITY problem: pinning an `expect_error` to a mangled name pins it to the mangling scheme. **Prefer prefix-pinning until fixed.** No demangler exists and `MangleTypeArg` is lossy one-way, so the fix is to STORE the source spelling. Filed 2026-07-31. **BROADENED 2026-08-02**: a second site (function-pointer signature mismatch prints `'void(Box__i32*)'` vs `'void(Box__double*)'`, plus internal `__c_fn_ptr` tokens), and the predicted test-fragility FIRED - two unrelated `expect_error` legs broke when `MangleTypeArg` changed. Fix now needs a mangled-key -> spelling registry, not just a `StructData` field. |
@@ -3343,3 +3353,96 @@ plus a reject/accept spot-check were re-measured on each later base.
 
 No new serialized field, so the `--init` round-trip is untouched; `test.sh` runs `--init-local` and
 covers the warm-cache path.
+
+## Landed: `fix/iface-selfassign` (2026-08-05) - receiver identity taken from the BOXED OBJECT, settled at end of body
+
+Closes `p1/interface-field-self-assign-false-positive` and DELETES the file. `ic.slot = ia.slot`
+between two boxed interface receivers with the SAME field name compiled clean and aborted (compile
+rc 0, run rc 133/134, no diagnostic); the different-NAME control already rejected. Root cause held
+exactly as filed: the interface-field materialization branch never assigns `CallerName`, so both
+sides carry `""` and the same `FieldName`, and `selfFieldAssign` reads two different receivers as a
+self-assign.
+
+**The FIRST attempt (2026-08-01, reverted) compared variable NAMES.** The file's "what will not
+work" list was re-verified rather than assumed, and all three entries hold: two NAMES can denote
+one object; the interface LOCALS' storage is two allocas for two boxes of one object; and a bare
+`Value` compare of the field address false-rejects even the true self-assign, since each access
+re-loads the fat pointer.
+
+**The mechanism: resolve each side's fat pointer back to the OBJECT its box wraps.** An interface
+field address is a GEP chain off `extractvalue fat, 1`, so the fat value is recoverable
+(`ResolveBoxedObjectOfInterfaceField`, `cflat/MainListener.h`). A fat value that is itself a
+registered box answers directly from `interfaceBoxRecords_`; a fat value LOADED out of an interface
+local is traced to the one box stored into that slot (`SoleStoreIntoSlot`, `cflat/LLVMBackend.h`).
+The two data pointers then go to the EXISTING `ProvablyDifferentObjects` that `fix/uniq-global`
+added - two distinct alloca/global roots are distinct objects. This is what makes it more than a
+`Value` compare: two distinct boxes of ONE object are two allocas holding ONE data pointer, so they
+answer "same" and keep compiling. Nothing resolvable answers "cannot tell" and is ACCEPTED.
+
+**The verdict is DEFERRED to the end of the body, and that is load-bearing, not tidiness.** At the
+store, a receiver's slot has only the stores emitted SO FAR. A loop can rebind it afterwards:
+
+```cflat
+ISlot ia = a; ISlot ic = c;
+for (int k = 0; k < 2; k = k + 1) { if (k > 0) { ic.slot = ia.slot; } ia = ic; }
+```
+compiles, runs, and frees each pointee exactly once on master - on the only iteration that runs the
+store, both receivers box ONE object. An at-site rule sees one store into `ia` and false-rejects it.
+So the site RECORDS (recording cannot reject, so a missed shape degrades to today's missing
+diagnostic) and `RunUniqueIfaceFieldStoreCheck` settles it at the same end-of-body hook as
+`RunInterfaceReturnDangleCheck` / `RunNullIfaceDispatchCheck`, re-running `SoleStoreIntoSlot` where
+a later rebinding is finally visible. `InterfaceBoxProvenanceUnknown` was NOT used - counting stores
+on the slot answers the same question from the IR and also covers an escaping address.
+
+**A NULL fat store is skipped when counting** - `I i = default; i = a;` is one binding written in
+two statements, and a slot the null store reaches has no implementation, so an access through it
+faults before ownership can matter. Without this the two-statement spelling stayed undiagnosed.
+
+**The change is purely ADDITIVE: `selfFieldAssign`, `sameFieldStore`, `ProvablyDifferentSlots` and
+every emission path are untouched.** So the four sibling `selfUniqueFieldAssign` traps the issue
+file audited keep their exact polarity, and an ACCEPTED program's IR is byte-identical. The only
+other edits are three `Reject*` helpers split into `Format*` + `Reject*` so the deferred site can
+build the same message text (messages verbatim unchanged - the pre-existing legs still match).
+
+Deliberate residue, each measured accepted on BOTH binaries and left that way: an interface
+receiver boxed from a POINTER or from `new` (the data root is a load / a heap call, not an
+alloca); an interface PARAMETER or a call RESULT (no box record); two boxes of two SUB-OBJECTS of
+one container (one root - nothing to prove); a GLOBAL interface local (its slot is a
+`GlobalVariable` whose stores span functions); and a flagged store inside a LAMBDA body (the
+end-of-body hook runs only in the named-function path - the same architectural gap shared by
+`RunNullDerefDataflow` and `RunInterfaceReturnDangleCheck`). All five are missing diagnostics,
+never false rejections; they are consolidated in
+[[unique-field-to-field-interface-receiver-residues]].
+
+Evidence: a 20-cell matrix in `scratch/ifs_*` (repro, both witnesses from the issue file with
+destructor counts, true self-assign, different-name control, pointer/`new`/parameter/return/
+branch-rebound/global receivers, `move` spelling, non-`unique` field, owning-VALUE `string` field,
+two interfaces over one object, sub-object receivers, a method receiver, and the loop-rebind
+program above), every cell measured pre and post. `--check` differential sweep over **534 `.cb` in
+`Test/`, `example/` and `cflat/core/`: 32 diffs, 31 of them the binary's own core path inside an
+"imported file not found" message and ONE behavioural - the new test legs.**
+
+Legs: three file-scope `expect_error` blocks in `Test/errors/err_unique_field_to_field.cb` (the
+plain shape, the interface shape, the two-statement binding), each wrapping a whole FUNCTION because
+the diagnostic is deferred to end of body - a scoped block INSIDE the function closes first. Each was
+mutation-tested individually to a self-assign and each flipped the file to exit 1; the two new legs
+FAIL on the pre-fix binary. Nine value legs in
+`Test/test_move.cb::testUniqueFieldStoreRemedies` pin the accept set with destructor counts
+(`uniq_iface_twobox_*`, `uniq_iface_alias_*`, `uniq_iface_rebound_*`). Those pass on both binaries
+by construction, so they were mutation-tested against the COMPILER instead: resolving to the
+interface local's storage rather than the boxed object flips `uniq_iface_twobox_value`, and
+deleting the end-of-body re-verification flips `uniq_iface_rebound_value` - the two defects this
+design exists to avoid.
+
+Bar: macOS arm64 Release `./test.sh` **598 passed / 0 failed / 8 skipped**, `example_mac.sh`
+**35 passed / 0 failed**, `test_lsp.sh` **152 passed / 0 failed**. `leaks --atExit` on
+`Test/test_move.cb` is **13 leaks / 256 bytes** on (pre-binary, pre-tests), (post-binary,
+pre-tests) and (post-binary, post-tests) - unchanged, new legs add none. No new serialized field,
+so the `--init` round-trip is untouched; verified directly on a warm `--init-local` cache (all
+three reject legs still fire).
+
+> Measured in passing and NOT part of this change: those leak figures are the WARM-cache numbers.
+> The same source compiled with a COLD cache gives 15 leaks / 304 bytes, on the pre-fix binary and
+> the post-fix binary alike - so the `--init` bitcode cache changes generated code. Pre-existing,
+> filed for its own investigation, and worth knowing before quoting a leak baseline from any of the
+> records above.
