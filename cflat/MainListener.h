@@ -16824,6 +16824,10 @@ public:
         // erases the declared facts every code-value gate reads (see codeValues_).
         if (result != nullptr && compiler->ArgumentIsCodeValue(namedVar))
             compiler->RegisterCodeValue(result);
+        // Mirror ledger for the closure-widen gate, which asks the opposite question: a join of
+        // values PROVEN to be data must not widen into a fat closure's code slot (see dataValues_).
+        if (result != nullptr && compiler->ArgumentIsDataValue(namedVar))
+            compiler->RegisterDataValue(result);
         return result;
     }
 
@@ -17349,6 +17353,10 @@ public:
             // code value; launder it or the explicit cast the rejection advises is itself refused.
             if (compiler->ParameterStoresData(destTypeName))
                 compiler->RegisterCodeValueDataCast(namedVar.Primary);
+            // The mirror launder: a cast TO a code type is the escape hatch the closure-widen
+            // gate advises, and the no-op cast result is still the ledgered data value.
+            else if (destTypeName.IsFunctionPointer)
+                compiler->RegisterDataValueCodeCast(namedVar.Primary);
             return namedVar;
         }
 

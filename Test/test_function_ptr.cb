@@ -2578,6 +2578,82 @@ double joinAccPick(int c, function<double(double)> a, function<double(double)> b
     return p(1.0);
 }
 
+/*
+ * ACCEPT SET for the MIRROR resolution: a '?:' / '??' join into a fat `Lambda<>` or thin
+ * `function<>` PARAMETER. The closure-widen gate rejects only what is PROVABLY data, and a join
+ * carries no declared facts, so it is resolved through the DATA ledger with the EVERY-arm
+ * quantifier: the widen is refused only when every arm is proven data. The legs below are the
+ * shapes an ANY-arm quantifier would false-reject - every one of them was measured running
+ * correctly on the merge base first, and each flips to a hard error if the quantifier is inverted.
+ * Discriminator for the mixed legs: exactly one arm is proven data, so ANY-arm rejects and
+ * EVERY-arm accepts; the all-code legs discriminate against a guard that refuses joins outright.
+ */
+int djInc(int x) { return x + 1; }
+int djDec(int x) { return x - 1; }
+int djApplyFat(Lambda<int(int)> f) { return f(5); }
+int djApplyThin(function<int(int)> f) { return f(5); }
+Lambda<int(int)> djMake() { return djInc; }
+class DjBox { int lam(Lambda<int(int)> f) { return f(5); } };
+interface IDjBox { int lam(Lambda<int(int)> f); };
+class DjIface : IDjBox { int lam(Lambda<int(int)> f) { return f(5); } };
+// A MIXED join: one arm is a `void*` PARAMETER, which IS proven data (its declared type says so,
+// exactly as a local's does), and the other is a proven code value. EVERY-arm leaves this accepted
+// and the code arm is the one taken; ANY-arm would refuse it.
+int djMixedUnknownArm(void* u, int c)
+{
+    function<int(int)> a = djInc;
+    return djApplyFat(c > 0 ? a : u);
+}
+// The ESCAPE HATCH the rejection's message advises, in its JOIN spelling: an explicit cast to the
+// thin `function<>` is the user's own assertion and must launder the whole join, not only an arm.
+// A ptr->ptr cast is a no-op under opaque pointers, so the value reaching the gate is still the
+// PHI - without the mirror launder this spelling is refused while the per-arm one is accepted.
+
+bool testDataJoinClosureAccepts()
+{
+    bool result = true;
+    int c = 1;
+
+    // Two `function<>` values joined into one fat `Lambda<>` parameter - the first accept cell.
+    function<int(int)> a = djInc;
+    function<int(int)> b = djDec;
+    result &= Test("dj_tern_two_function_values", djApplyFat(c > 0 ? a : b), 6);
+    result &= Test("dj_tern_two_function_values_else", djApplyFat(c > 1 ? a : b), 4);
+    result &= Test("dj_coal_two_function_values",  djApplyFat(a ?? b), 6);
+    result &= Test("dj_tern_two_named_functions",  djApplyFat(c > 0 ? djInc : djDec), 6);
+    result &= Test("dj_thin_two_function_values",  djApplyThin(c > 0 ? a : b), 6);
+
+    // Two lambda VALUES, and a join whose arms are a call result (unledgered) and a lambda.
+    Lambda<int(int)> la = (int x) => { return x + 1; };
+    Lambda<int(int)> lb = (int x) => { return x - 1; };
+    result &= Test("dj_tern_two_lambdas",     djApplyFat(c > 0 ? la : lb), 6);
+    result &= Test("dj_tern_call_result_arm", djApplyFat(c > 0 ? djMake() : lb), 6);
+
+    // MIXED: one proven-data arm and one code arm. ANY-arm rejects these; EVERY-arm must not.
+    int q = 1;
+    void* vp = &q;
+    result &= Test("dj_tern_mixed_code_then_data", djApplyFat(c > 0 ? a : vp), 6);
+    result &= Test("dj_tern_mixed_data_then_code", djApplyFat(c > 1 ? vp : a), 6);
+    result &= Test("dj_tern_unknown_param_arm",    djMixedUnknownArm(nullptr, 1), 6);
+
+    // The escape hatch, both placements: the cast OVER the whole join and the cast per ARM. Both
+    // run on the merge base; the whole-join spelling is the one an arm-only launder false-rejects.
+    void* fp = (void*)djInc;
+    void* fq = (void*)djInc;
+    result &= Test("dj_cast_over_join",  djApplyFat((function<int(int)>)(c > 0 ? fp : fq)), 6);
+    result &= Test("dj_cast_in_each_arm", djApplyFat(c > 0 ? (function<int(int)>)fp
+                                                           : (function<int(int)>)fq), 6);
+
+    // The same accept, through the METHOD and VIRTUAL-dispatch spellings of the one gate.
+    DjBox d;
+    DjIface impl;
+    IDjBox io = impl;
+    result &= Test("dj_method_two_function_values", d.lam(c > 0 ? a : b), 6);
+    result &= Test("dj_iface_two_function_values",  io.lam(c > 0 ? a : b), 6);
+
+    return result;
+}
+
 bool testCodeValueJoinAccepts()
 {
     bool result = true;
@@ -2799,6 +2875,9 @@ extern int main()
 
     // Accept set for the JOIN spellings ('?:' and '??', into code slots, casts, data joins)
     total++; passed += testCodeValueJoinAccepts()          ? 1 : 0;
+
+    // Accept set for a JOIN into a closure PARAMETER (the widen gate's EVERY-arm data question)
+    total++; passed += testDataJoinClosureAccepts()        ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

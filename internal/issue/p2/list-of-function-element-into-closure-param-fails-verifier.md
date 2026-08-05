@@ -65,3 +65,21 @@ None. Wants a value-asserting leg once supported, or an `expect_error` leg if re
 
 Related: [[generic-wrapper-over-function-type-llvm-fatal]],
 [[data-pointer-into-thin-function-param-segfaults]], [[interface-issue-queue]]
+
+## The ADD direction fails the same way (measured 2026-08-05)
+
+Found by `fix/widengate` while sweeping container spellings for the closure-widen gate. It is not
+only `get` into a closure parameter - `add` of a raw pointer INTO a `list<Lambda<>>` dies in the
+same verifier, before any gate can see it:
+
+```cflat
+list<Lambda<int(int)>> fns;
+void* vp = &q;
+fns.add(vp);            // Module verification failed: Call parameter type does not match ...
+```
+
+Identical on `14097e1` and on `fix/widengate` (exit 1, no `file(line,col):` prefix), and identical
+with the argument wrapped in a `?:` join - so it is not join-related and the widen-gate resolution
+neither helps nor harms it. Recorded here rather than as a new issue because it is the same
+encoded-closure-element lowering; note it means the container axis of the closure-widen accept set
+cannot be exercised in EITHER direction until this is fixed.

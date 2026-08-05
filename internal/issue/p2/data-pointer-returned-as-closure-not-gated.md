@@ -63,3 +63,18 @@ argument side on both call paths and is the natural home.
 Related: [[data-pointer-into-thin-function-param-segfaults]], [[interface-issue-queue]]
 (`funcptr-call-result-into-closure-param-garbage` was the ARGUMENT-side sibling of this defect;
 it is fixed and its file deleted - the "fix/funcptr-callresult" landed record has the detail).
+
+## The JOIN spelling is unguarded here too (measured 2026-08-05)
+
+`fix/widengate` closed the join hole on the ARGUMENT gate (`WidenToClosureFatChecked`, and its thin
+sibling). The RETURN path is unchanged, and both spellings still widen and crash identically on
+`14097e1` and on `fix/widengate`:
+
+```cflat
+Lambda<int(int)> mkBad(int c) { int z = 1; void* vp = &z; void* vq = nullptr; return c > 0 ? vp : vq; }
+Lambda<int(int)> mkBad2()     { int z = 1; void* vp = &z; return vp; }   // bare spelling, also 139
+```
+
+Both exit 139. When this issue is fixed, the return site should read the SAME two predicates the
+argument gate now shares - `ArgumentIsProvablyDataPointer` plus its join fall-through
+`JoinDeliversDataValue` - so the return accept set cannot drift from the argument one.

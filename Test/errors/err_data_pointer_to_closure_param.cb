@@ -1389,3 +1389,249 @@ expect_error("[_joinOv_i32_U8Ptr_] parameter 0 is a data type ('void*') and the 
         return joinOv(c > 0 ? w : n);
     }
 }
+
+/*
+ * THE JOIN MIRROR. `WidenToClosureFatChecked` gates on argument PROVENANCE and rejects only what
+ * is PROVABLY data, which is the correct polarity - but a '?:' / '??' join carries no declared
+ * facts at all, so on the merge base every leg below COMPILED CLEAN and exited 139 at runtime: a
+ * data pointer landed in the fat closure's CODE slot and was called. The bare spelling of each was
+ * already diagnosed, which is what makes these join defects rather than plain holes.
+ *
+ * The resolution ledgers values proven to be DATA and asks the join whether EVERY arm is proven
+ * data (a null arm is neutral). Discriminator for these legs: every arm is proven data, so the
+ * mixed joins in testDataJoinClosureAccepts (one code arm) stay accepted while these are refused.
+ */
+expect_error("cannot pass a non-function pointer value to closure parameter 'f'") {
+    int djApplyFatTern(Lambda<int(int)> f) { return f(5); }
+
+    int ternaryDataJoinIntoClosureParam(int c)
+    {
+        int q = 1;
+        void* vp = &q;
+        void* vq = nullptr;
+        return djApplyFatTern(c > 0 ? vp : vq);
+    }
+}
+
+expect_error("cannot pass a non-function pointer value to closure parameter 'f'") {
+    int djApplyFatCoal(Lambda<int(int)> f) { return f(5); }
+
+    int nullCoalesceDataJoinIntoClosureParam()
+    {
+        int q = 1;
+        void* vp = &q;
+        void* vq = nullptr;
+        return djApplyFatCoal(vq ?? vp);
+    }
+}
+
+// The METHOD-call spelling of the same join - a different lowering path to the one gate.
+expect_error("cannot pass a non-function pointer value to closure parameter 'f'") {
+    class DjRejectBox { int lam(Lambda<int(int)> f) { return f(5); } };
+
+    int methodDataJoinIntoClosureParam(int c)
+    {
+        DjRejectBox d;
+        int q = 1;
+        void* vp = &q;
+        void* vq = nullptr;
+        return d.lam(c > 0 ? vp : vq);
+    }
+}
+
+// VIRTUAL dispatch (LowerByValueArg) - the second half of the one shared accept set.
+expect_error("cannot pass a non-function pointer value to closure parameter 'f'") {
+    interface IDjReject { int lam(Lambda<int(int)> f); };
+    class DjRejectImpl : IDjReject { int lam(Lambda<int(int)> f) { return f(5); } };
+
+    int virtualDataJoinIntoClosureParam(int c)
+    {
+        DjRejectImpl impl;
+        IDjReject io = impl;
+        int q = 1;
+        void* vp = &q;
+        void* vq = nullptr;
+        return io.lam(c > 0 ? vp : vq);
+    }
+}
+
+// A NESTED join: the inner '?:' is itself an arm, so the walk has to recurse to prove all-data.
+expect_error("cannot pass a non-function pointer value to closure parameter 'f'") {
+    int djApplyFatNested(Lambda<int(int)> f) { return f(5); }
+
+    int nestedDataJoinIntoClosureParam(int c)
+    {
+        int q = 1;
+        void* vp = &q;
+        void* vq = nullptr;
+        void* vr = &q;
+        return djApplyFatNested(c > 0 ? (c > 1 ? vp : vq) : vr);
+    }
+}
+
+// A literal `nullptr` arm is NEUTRAL, not proof of code: null can never be called either, so a
+// data-plus-null join is still refused. The all-null join has no proven arm and is not refused.
+expect_error("cannot pass a non-function pointer value to closure parameter 'f'") {
+    int djApplyFatNull(Lambda<int(int)> f) { return f(5); }
+
+    int dataPlusNullJoinIntoClosureParam(int c)
+    {
+        int q = 1;
+        void* vp = &q;
+        return djApplyFatNull(c > 0 ? vp : nullptr);
+    }
+}
+
+// A `void*` PARAMETER is proven data by its declared type exactly as a local is - the bare
+// spelling of this leg was already diagnosed on the merge base, the join spelling was not.
+expect_error("cannot pass a non-function pointer value to closure parameter 'f'") {
+    int djApplyFatParam(Lambda<int(int)> f) { return f(5); }
+
+    int paramDataJoinIntoClosureParam(void* u, int c)
+    {
+        int q = 1;
+        void* vp = &q;
+        return djApplyFatParam(c > 0 ? u : vp);
+    }
+}
+
+// The SECOND argument position, with a legal closure in the first: the gate runs per argument.
+expect_error("cannot pass a non-function pointer value to closure parameter 'g'") {
+    int djApply2(Lambda<int(int)> f, Lambda<int(int)> g) { return f(5) + g(6); }
+
+    int secondPositionDataJoinIntoClosureParam(int c)
+    {
+        int q = 1;
+        void* vp = &q;
+        void* vq = nullptr;
+        Lambda<int(int)> good = (int x) => { return x + 1; };
+        return djApply2(good, c > 0 ? vp : vq);
+    }
+}
+
+// The THIN `function<>` sibling shares the one provenance predicate, so the join resolution has to
+// reach it too or the two parameter flavours drift into different accept sets.
+expect_error("cannot pass a non-function pointer value to 'function<>' parameter 'f'") {
+    int djApplyThinRej(function<int(int)> f) { return f(5); }
+
+    int ternaryDataJoinIntoThinParam(int c)
+    {
+        int q = 1;
+        void* vp = &q;
+        void* vq = nullptr;
+        return djApplyThinRej(c > 0 ? vp : vq);
+    }
+}
+
+/*
+ * The ARM-SPELLING axis. The ledger records at the one read site, so a struct FIELD and a
+ * fixed-array ELEMENT arm are proven data exactly as a local is - the same axis the code-value
+ * accept legs (cvj_tern_field_arm / cvj_tern_elem_arm) cover from the other side. Both compiled
+ * clean and exited 139 on the merge base.
+ */
+expect_error("cannot pass a non-function pointer value to closure parameter 'f'") {
+    struct DjFieldBox { void* p = default; void* q = default; };
+    int djApplyFatField(Lambda<int(int)> f) { return f(5); }
+
+    int fieldArmDataJoinIntoClosureParam(int c)
+    {
+        int z = 1;
+        DjFieldBox b = default;
+        b.p = &z;
+        return djApplyFatField(c > 0 ? b.p : b.q);
+    }
+}
+
+expect_error("cannot pass a non-function pointer value to closure parameter 'f'") {
+    int djApplyFatElem(Lambda<int(int)> f) { return f(5); }
+
+    int elementArmDataJoinIntoClosureParam(int c)
+    {
+        int z = 1;
+        void*[2] arr = default;
+        arr[0] = &z;
+        return djApplyFatElem(c > 0 ? arr[0] : arr[1]);
+    }
+}
+
+/*
+ * A RATIFIED TIGHTENING, not a closed hole: these three ran CORRECTLY on the merge base. A `void*`
+ * that happens to hold a code address is proven DATA by its declared type, so a join of such
+ * values is refused - and refusing it is what makes the join spelling agree with the bare one,
+ * which was already rejected on the merge base (`void* fp = (void*)hInc; applyL(fp);` is a hard
+ * error on BOTH binaries). The remedy is the escape hatch the message now names, exercised as
+ * an accept leg: cast to the thin `function<>`, over the whole join (dj_cast_over_join) or per arm
+ * (dj_cast_in_each_arm). Discriminator: the arms are declared `void*`, so nothing at the call site
+ * distinguishes them from the memory-unsafe legs above - which is exactly why they are refused.
+ */
+expect_error("cannot pass a non-function pointer value to closure parameter 'f'") {
+    int djTightenInc(int x) { return x + 1; }
+    int djApplyFatTighten(Lambda<int(int)> f) { return f(5); }
+
+    int voidPointerHoldingCodeJoinedIntoClosureParam(int c)
+    {
+        void* fp = (void*)djTightenInc;
+        void* fq = (void*)djTightenInc;
+        return djApplyFatTighten(c > 0 ? fp : fq);
+    }
+}
+
+// The same tightening reached through a CALL RESULT arm and a DEREFERENCE arm - both are proven
+// data by their declared return / pointee type, and both ran correctly on the merge base.
+expect_error("cannot pass a non-function pointer value to closure parameter 'f'") {
+    int djTightenInc2(int x) { return x + 1; }
+    void* djMakeVoid() { return (void*)djTightenInc2; }
+    int djApplyFatTighten2(Lambda<int(int)> f) { return f(5); }
+
+    int callResultArmJoinedIntoClosureParam(int c)
+    {
+        void* vp = (void*)djTightenInc2;
+        return djApplyFatTighten2(c > 0 ? djMakeVoid() : vp);
+    }
+}
+
+expect_error("cannot pass a non-function pointer value to closure parameter 'f'") {
+    int djTightenInc3(int x) { return x + 1; }
+    int djApplyFatTighten3(Lambda<int(int)> f) { return f(5); }
+
+    int dereferenceArmJoinedIntoClosureParam(int c)
+    {
+        void* vp = (void*)djTightenInc3;
+        void** pp = &vp;
+        return djApplyFatTighten3(c > 0 ? *pp : vp);
+    }
+}
+
+/*
+ * THE MIRROR LAUNDER MUST NOT KEY ON A SHARED CONSTANT. `(function<>)nullptr` casts the ONE shared
+ * ConstantPointerNull, so recording the cast SOURCE let an unrelated join's null arm in the same
+ * statement read as user-asserted code and re-opened the widen - the same hazard that makes
+ * codeValueDataCasts_ statement-scoped, in the opposite direction. The register site now refuses
+ * shared constants outright (null and llvm::Function), which is structural rather than scoped.
+ * Discriminator: the cast is on a DIFFERENT argument from the join, so only a launder keyed on the
+ * shared null can connect them; the same statement with a non-null-arm join was already refused.
+ */
+expect_error("cannot pass a non-function pointer value to closure parameter 'g'") {
+    int djApply2Null(Lambda<int(int)> f, Lambda<int(int)> g) { return f(5) + g(6); }
+
+    int nullCastLaundersUnrelatedJoinNullArm(int c)
+    {
+        int z = 1;
+        void* vp = &z;
+        return djApply2Null((function<int(int)>)nullptr, c > 0 ? vp : nullptr);
+    }
+}
+
+// The same shared-null hazard reached from INSIDE the join: a `(function<>)nullptr` ARM must not
+// launder the join it sits in. The other arm is proven data, so the program calls either null or a
+// data pointer and never a function - null arms stay NEUTRAL by design and cannot rescue it.
+expect_error("cannot pass a non-function pointer value to closure parameter 'f'") {
+    int djApplyFatNullArm(Lambda<int(int)> f) { return f(5); }
+
+    int castNullArmDoesNotLaunderTheJoin(int c)
+    {
+        int z = 1;
+        void* vp = &z;
+        return djApplyFatNullArm(c > 0 ? (function<int(int)>)nullptr : vp);
+    }
+}

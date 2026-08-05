@@ -1493,6 +1493,29 @@ public:
         return false;
     }
 
+    /*
+     * The MIRROR ledger of codeValues_: values PROVEN to be DATA - a pointer whose declared type
+     * is not code - recorded at the same read where the facts are in hand. The closure-widen gate
+     * asks the OPPOSITE question of the code-value gates, so it needs the opposite evidence: a
+     * join of two data pointers must not widen into a fat closure's CODE slot. Recording cannot
+     * reject, so a read this misses degrades to the pre-existing accept. Same lifetime and
+     * park/clear points as codeValues_; deliberately NOT statement-scoped.
+     */
+    std::vector<llvm::Value*> dataValues_;
+
+    void RegisterDataValue(llvm::Value* value)
+    {
+        if (value == nullptr) return;
+        for (auto* entry : dataValues_) if (entry == value) return;
+        dataValues_.push_back(value);
+    }
+
+    bool IsLedgeredDataValue(const llvm::Value* value) const
+    {
+        for (auto* entry : dataValues_) if (entry == value) return true;
+        return false;
+    }
+
     void RegisterCodeValue(llvm::Value* value)
     {
         if (value == nullptr) return;
@@ -1516,6 +1539,38 @@ public:
     bool IsCodeValueDataCast(const llvm::Value* value) const
     {
         for (auto* entry : codeValueDataCasts_) if (entry == value) return true;
+        return false;
+    }
+
+    /*
+     * The MIRROR launder: values an EXPLICIT cast to a CODE type produced. `(function<int(int)>)x`
+     * is the escape hatch this gate's own message advises, and a ptr->ptr cast is a no-op under
+     * opaque pointers, so the cast result IS the ledgered data value - without this, casting a
+     * whole JOIN would be refused while casting each ARM (which carries the declared flag) is
+     * accepted, an asymmetry of exactly the kind this fix removes. STATEMENT-SCOPED like
+     * codeValueDataCasts_, retired by FlushOwnedTemps, so one cast cannot launder a later gate.
+     */
+    std::vector<llvm::Value*> dataValueCodeCasts_;
+
+    /*
+     * A SHARED CONSTANT must never enter this ledger. `(function<>)nullptr` casts the one shared
+     * ConstantPointerNull, so registering it let an unrelated join's null arm read as
+     * user-asserted code and re-opened the widen - measured, memory-unsafe. Null needs no launder
+     * anyway: the arm walk already treats null as neutral. llvm::Function is skipped for the same
+     * reason, making an invariant explicit that today only holds by short-circuit order.
+     */
+    void RegisterDataValueCodeCast(llvm::Value* value)
+    {
+        if (value == nullptr) return;
+        if (llvm::isa<llvm::ConstantPointerNull>(value)) return;
+        if (llvm::isa<llvm::Function>(value)) return;
+        for (auto* entry : dataValueCodeCasts_) if (entry == value) return;
+        dataValueCodeCasts_.push_back(value);
+    }
+
+    bool IsDataValueCodeCast(const llvm::Value* value) const
+    {
+        for (auto* entry : dataValueCodeCasts_) if (entry == value) return true;
         return false;
     }
 
@@ -1551,6 +1606,54 @@ public:
         if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
             for (const auto& arm : join->Arms)
                 if (JoinArmCarriesCodeValue(arm.Value, depth + 1)) return true;
+        return false;
+    }
+
+    // One ARM of a join, for the DATA question: 1 = proven data, 0 = neutral (a null constant can
+    // never be code), -1 = unproven, which alone makes the whole join unproven.
+    int JoinArmDataKind(const llvm::Value* value, int depth) const
+    {
+        if (value == nullptr) return -1;
+        if (IsDataValueCodeCast(value)) return -1;   // the user cast this arm to a code type
+        if (llvm::isa<llvm::ConstantPointerNull>(value)) return 0;
+        if (llvm::isa<llvm::Function>(value)) return -1;
+        if (IsLedgeredDataValue(value)) return 1;
+        return JoinDeliversDataValue(value, depth) ? 1 : -1;
+    }
+
+    /*
+     * Does a '?:' / '??' JOIN deliver a value proven to be DATA? The mirror of
+     * JoinCarriesCodeValue, over dataValues_ and with the OPPOSITE quantifier: EVERY arm must be
+     * proven data (a null arm is neutral) and at least one must be proven, because a single
+     * unproven arm can still be code at runtime. ANY-arm here would false-reject every mixed
+     * code/data join - shapes master compiles and runs correctly.
+     */
+    bool JoinDeliversDataValue(const llvm::Value* value, int depth = 0) const
+    {
+        if (value == nullptr || depth > kMaxJoinArmDepth) return false;
+        bool proven = false;
+        if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+        {
+            if (phi->getNumIncomingValues() == 0) return false;
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+            {
+                const int kind = JoinArmDataKind(phi->getIncomingValue(i), depth + 1);
+                if (kind < 0) return false;
+                if (kind > 0) proven = true;
+            }
+            return proven;
+        }
+        if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
+        {
+            if (join->Arms.empty()) return false;
+            for (const auto& arm : join->Arms)
+            {
+                const int kind = JoinArmDataKind(arm.Value, depth + 1);
+                if (kind < 0) return false;
+                if (kind > 0) proven = true;
+            }
+            return proven;
+        }
         return false;
     }
 
@@ -4077,6 +4180,7 @@ private:
         codeValueDataCasts_.clear();
         // Same boundary destructs the owning temp, so its unique-field reads retire with it.
         owningTempUniqueFields_.clear();
+        dataValueCodeCasts_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
         nonOwningStructJoins_.clear();
@@ -4277,8 +4381,10 @@ private:
         interfaceBoxRecords_.clear();
         nullCoalesceJoins_.clear();
         codeValues_.clear();
+        dataValues_.clear();
         codeValueDataCasts_.clear();
         owningTempUniqueFields_.clear();
+        dataValueCodeCasts_.clear();
 
         // populate function arguments
         auto itr_nameArg = arguments.begin();
@@ -9780,8 +9886,10 @@ public:
         std::vector<InterfaceBoxRecord> interfaceBoxRecords;
         std::vector<NullCoalesceJoin> nullCoalesceJoins;
         std::vector<llvm::Value*> codeValues;
+        std::vector<llvm::Value*> dataValues;
         std::vector<llvm::Value*> codeValueDataCasts;
         std::vector<llvm::Value*> owningTempUniqueFields;
+        std::vector<llvm::Value*> dataValueCodeCasts;
         std::vector<llvm::Value*> movedOutPtrValues;
         std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues;
         std::vector<llvm::Value*> nonOwningStructJoins;
@@ -9804,8 +9912,10 @@ public:
         s.interfaceBoxRecords = std::move(interfaceBoxRecords_);
         s.nullCoalesceJoins   = std::move(nullCoalesceJoins_);
         s.codeValues          = std::move(codeValues_);
+        s.dataValues          = std::move(dataValues_);
         s.codeValueDataCasts  = std::move(codeValueDataCasts_);
         s.owningTempUniqueFields = std::move(owningTempUniqueFields_);
+        s.dataValueCodeCasts  = std::move(dataValueCodeCasts_);
         s.movedOutPtrValues   = std::move(movedOutPtrValues_);
         s.movedBorrowedPtrValues = std::move(movedBorrowedPtrValues_);
         s.nonOwningStructJoins = std::move(nonOwningStructJoins_);
@@ -9823,8 +9933,10 @@ public:
         interfaceBoxRecords_.clear();
         nullCoalesceJoins_.clear();
         codeValues_.clear();
+        dataValues_.clear();
         codeValueDataCasts_.clear();
         owningTempUniqueFields_.clear();
+        dataValueCodeCasts_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
         nonOwningStructJoins_.clear();
@@ -9854,8 +9966,10 @@ public:
         interfaceBoxRecords_    = state.interfaceBoxRecords;
         nullCoalesceJoins_      = state.nullCoalesceJoins;
         codeValues_             = state.codeValues;
+        dataValues_             = state.dataValues;
         codeValueDataCasts_     = state.codeValueDataCasts;
         owningTempUniqueFields_ = state.owningTempUniqueFields;
+        dataValueCodeCasts_     = state.dataValueCodeCasts;
         movedOutPtrValues_       = state.movedOutPtrValues;
         movedBorrowedPtrValues_  = state.movedBorrowedPtrValues;
         nonOwningStructJoins_    = state.nonOwningStructJoins;
@@ -13667,9 +13781,15 @@ public:
         if (llvm::isa<llvm::Function>(value)) return false;               // a named function
         if (llvm::isa<llvm::ConstantPointerNull>(value)) return false;    // parity with the direct path
         if (arg.TypeAndValue.IsFunctionPointer) return false;             // a closure value
-        // The only positive evidence available here: the declared type is a pointer. A join,
-        // a call result with no recorded shape, or a bare identifier leaves this false.
-        return arg.TypeAndValue.Pointer;
+        // The only declared evidence available here: the type is a pointer. A call result with no
+        // recorded shape, or a bare identifier, leaves this false.
+        if (arg.TypeAndValue.Pointer) return true;
+        // An explicit cast to a code type is the user's own assertion, and it is the escape hatch
+        // this gate's message advises - honour it here as the bare spelling already does.
+        if (IsDataValueCodeCast(value)) return false;
+        // A JOIN carries no declared facts at all - resolve it through the per-value DATA ledger,
+        // which answers yes only when EVERY arm is proven data (see JoinDeliversDataValue).
+        return JoinDeliversDataValue(value);
     }
 
     // Name a data-pointer argument for the closure-parameter rejection. The interface argument
@@ -13700,7 +13820,8 @@ public:
             LogError(std::format(
                 "cannot pass {} to closure parameter '{}': only a named function, a "
                 "'function<>' value or a lambda converts to a closure - a data pointer "
-                "would be called as code.",
+                "would be called as code. If the value really holds a code address, assert "
+                "it with an explicit cast: '(function<...>)value'.",
                 DescribeNonFunctionArgument(arg), paramName));
         }
         return WidenBareOrThinToClosureFat(val);
@@ -13720,7 +13841,8 @@ public:
             LogError(std::format(
                 "cannot pass {} to 'function<>' parameter '{}': only a named function, a "
                 "'function<>' value or a non-capturing lambda converts to a function pointer - "
-                "a data pointer would be called as code.",
+                "a data pointer would be called as code. If the value really holds a code "
+                "address, assert it with an explicit cast: '(function<...>)value'.",
                 DescribeNonFunctionArgument(arg), paramName));
         }
     }
@@ -18374,6 +18496,18 @@ public:
         // A join is the one shape carrying no declared facts at all - resolve it through the
         // per-value ledger, which only ever recorded reads that were shape-0 code themselves.
         return ArgumentIsFunctionPointerish(arg) || JoinCarriesCodeValue(arg.Primary);
+    }
+
+    /*
+     * Is this ARGUMENT a value PROVEN to be data - a pointer whose declared type is not code? The
+     * mirror of ArgumentIsCodeValue and the only positive evidence dataValues_ ever records.
+     * Anything code-shaped or non-pointer answers no and stays unproven, so the closure-widen
+     * gate keeps accepting it.
+     */
+    bool ArgumentIsDataValue(const NamedVariable& arg) const
+    {
+        if (!arg.TypeAndValue.Pointer) return false;
+        return !ArgumentIsFunctionPointerish(arg);
     }
 
     // Does this PARAMETER store data rather than code? `string` counts: it is not a pointer but is
