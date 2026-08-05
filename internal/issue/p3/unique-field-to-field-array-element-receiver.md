@@ -7,6 +7,16 @@ compile-time constant in the IR - a runtime subscript, and also a `const`-declar
 
 Severity of the residue: silent abort (exit 134), no diagnostic - unchanged for those shapes.
 
+**RE-RANKED P1 -> P3 2026-08-05 as a deliberate deferral**, per the
+`return-dangle-missed-when-slot-has-extra-user` precedent: the residue is unprovable without
+taking away legal programs (this file's own "NOT an oversight" section below rules out widening),
+every residue shape was also accepted before any of the narrowing fixes (residue, not
+regression), and a permanent-or-deferred non-fix does not belong in the P1 working set. The
+decision was made by the release campaign, not the maintainer - re-rank back to P1 if the
+maintainer rules the silent-double-free rubric wins over the precedent. The two live remedies if
+this is ever picked up (a runtime same-address owner check, or `const`-index folding made sound
+by enforcing `const`) are discussed in the fix-direction section.
+
 ## Root cause - CONFIRMED 2026-08-02 by instrumentation, not by description
 
 The filed hypothesis held exactly as written. Measured by printing the two `NamedVariable`s at
