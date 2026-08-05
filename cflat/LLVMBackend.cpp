@@ -47,6 +47,7 @@
 #include <mach-o/loader.h>
 #include <dlfcn.h>
 #include <cstring>
+#include <sys/sysctl.h>
 #endif
 
 // Win32 unwind registration for the --run JIT (see cflat_jit::SehRegistrationPlugin). Declared
@@ -3805,6 +3806,26 @@ std::string LLVMBackend::MacStubSyslibroot()
     return {};
 }
 
+std::string LLVMBackend::MacHostOsProductVersion()
+{
+    char buf[64] = {};
+    size_t size = sizeof(buf);
+    if (sysctlbyname("kern.osproductversion", buf, &size, nullptr, 0) != 0) return {};
+    return std::string(buf);
+}
+
+std::string LLVMBackend::MacStubSdkVersion()
+{
+    std::string root = MacStubSyslibroot();
+    if (root.empty()) return {};
+    std::ifstream in(root + "/SDKVersion");
+    if (!in) return {};
+    std::string line;
+    std::getline(in, line);
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+    return line;
+}
+
 bool LLVMBackend::HarvestMacSystemStub(const std::string& cacheDir, bool verbose)
 {
     // libSystem's reexport closure lives under /usr/lib/system/ (plus libSystem
@@ -3864,6 +3885,30 @@ bool LLVMBackend::HarvestMacSystemStub(const std::string& cacheDir, bool verbose
     if (verbose)
         std::cout << std::format("  scanned {} images from the dyld shared cache\n", images);
     std::cout << std::format("  Saved macsdk/usr/lib/libSystem.tbd ({} symbols)\n", symbols.size());
+
+    // Provenance: symbols were harvested from the LIVE dyld shared cache of the
+    // running OS, so its product version IS the SDK version this stub represents.
+    // Non-fatal - an older stub without this file just falls back at link time.
+    std::string ver = TwoComponentVersion(MacHostOsProductVersion());
+    if (!ver.empty())
+    {
+        std::string verPath = cacheDir + "/macsdk/SDKVersion";
+        std::error_code vec;
+        llvm::raw_fd_ostream vos(verPath, vec, llvm::sys::fs::OF_Text);
+        if (!vec)
+        {
+            vos << ver << "\n";
+            vos.close();
+        }
+        else
+        {
+            std::cout << std::format("  Warning: could not write {}: {}\n", verPath, vec.message());
+        }
+    }
+    else
+    {
+        std::cout << "  Warning: could not determine host OS version; SDKVersion not written.\n";
+    }
     return true;
 }
 

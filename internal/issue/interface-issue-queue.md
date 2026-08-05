@@ -4178,3 +4178,36 @@ RESIDUES, all measured identical on both binaries and therefore not regressions:
   `applyL(c ? (void*)&q : vq)` and `applyL(c ? (void*)&q : nullptr)` compiled clean and exited 139
   on PRE and are diagnosed now - so the launder hole was not extended and no coverage was traded
   away for that.
+
+## Landed: `fix/macos-sdkstamp` (2026-08-05) - the emitted `LC_BUILD_VERSION` sdk no longer depends on cache state
+
+Closes `macos-sdk-stamp-differs-by-cache-state.md` (P2). `EmitExecutableMachO` resolved the
+`-platform_version macos 11.0.0 <sdkVer>` argument's sdk field ONLY on the branch where the
+harvested `macsdk` stub was absent; with the stub present (i.e. after any `--init`) it used a
+hardcoded `"11.0"`. So the compiler cache - a pure-performance artifact by contract - decided the
+SDK version stamped into every macOS executable cflat emits, and macOS gates real runtime
+behaviour on that field.
+
+What landed:
+
+- `HarvestMacSystemStub` now writes `<cacheDir>/macsdk/SDKVersion` alongside `libSystem.tbd`. The
+  stub's symbols come from the LIVE dyld shared cache of the running OS, so that OS version IS the
+  SDK the binary is really built against. Sourced from `sysctlbyname("kern.osproductversion")` -
+  NOT `xcrun` - so the self-contained (no Xcode / no CLT) property does not regress. Non-fatal.
+- `sdkVer` is resolved on BOTH branches: stub present -> its provenance file, falling back to the
+  live host version for a cache harvested by an older cflat; stub absent -> `xcrun
+  --show-sdk-version`, same fallback. `"11.0"` survives only as the last-resort default.
+- `TwoComponentVersion` trims to major.minor at the stamp. `kern.osproductversion` carries a patch
+  digit (`26.5.2`) and `xcrun --show-sdk-version` does not (`26.5`); without the trim the field
+  still differed by cache state, just one digit further right. Apple's own convention for this
+  field is two components.
+- `minos` stays `11.0.0`. The deployment target is the separate, correct knob and was not touched.
+
+Verified by the issue's own repro - warm / cold-bitcode-stub-present / bare-no-stub all stamp
+`minos 11.0, sdk 26.5`, and `leaks --atExit` on `Test/test_move.cb` converges on 16 leaks / 320
+bytes across all three (previously 14/272 warm vs 16/320 bare). The cold path was the correct side,
+as the issue predicted. `test.sh Release`: 598 passed, 0 failed, 8 skipped.
+
+Standing consequence worth keeping: leak counts measured before this change are NOT comparable with
+counts measured after it. The pre-fix warm numbers were taken under a false `sdk 11.0` stamp that
+opted every binary into legacy libSystem behaviour.

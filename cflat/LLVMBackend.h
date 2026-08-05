@@ -391,6 +391,17 @@ inline std::string CaptureToolLine(const char* cmd)
     return out;
 }
 
+// Trim a version string to major.minor. LC_BUILD_VERSION's sdk field is a two-component
+// SDK label by Apple convention, so an OS patch level ("26.5.2") must not leak into it.
+inline std::string TwoComponentVersion(const std::string& v)
+{
+    size_t first = v.find('.');
+    if (first == std::string::npos) return v;
+    size_t second = v.find('.', first + 1);
+    if (second == std::string::npos) return v;
+    return v.substr(0, second);
+}
+
 // Cached real SDK path for macOS C-header binding ($SDKROOT, else `xcrun --show-sdk-path`).
 // The harvested ~/.cflat/macsdk carries link stubs but no headers, so it is never used here.
 // Empty when no SDK is available (no Xcode / Command Line Tools and no $SDKROOT).
@@ -8728,14 +8739,25 @@ private:
             // fall back to $SDKROOT / xcrun when it hasn't been generated.
             const std::string stubRoot = MacStubSyslibroot();
             std::string sdk = stubRoot;
-            std::string sdkVer = "11.0";
-            if (sdk.empty())
+            // sdkVer is resolved the same way regardless of cache state, so a warm vs
+            // cold `--init` cache never changes what gets stamped: stub present -> its
+            // own harvest-time provenance file; stub absent -> xcrun. Either path falls
+            // back to the live running-OS version, then "11.0" as the last resort.
+            std::string sdkVer;
+            if (!sdk.empty())
+            {
+                sdkVer = MacStubSdkVersion();
+                if (sdkVer.empty()) sdkVer = MacHostOsProductVersion();
+            }
+            else
             {
                 if (const char* env = std::getenv("SDKROOT")) sdk = env;
                 if (sdk.empty()) sdk = CaptureToolLine("xcrun --show-sdk-path 2>/dev/null");
-                std::string v = CaptureToolLine("xcrun --show-sdk-version 2>/dev/null");
-                if (!v.empty()) sdkVer = v;
+                sdkVer = CaptureToolLine("xcrun --show-sdk-version 2>/dev/null");
+                if (sdkVer.empty()) sdkVer = MacHostOsProductVersion();
             }
+            sdkVer = TwoComponentVersion(sdkVer);
+            if (sdkVer.empty()) sdkVer = "11.0";
             if (!ld64.empty() && !sdk.empty())
             {
                 std::vector<std::string> argStrs = {
@@ -23596,6 +23618,12 @@ public:
                                     const std::string& relTbdPath, bool verbose);
     // The harvested stub's syslibroot (<cacheDir>/macsdk) if present, else "".
     static std::string MacStubSyslibroot();
+    // The running OS's product version (e.g. "26.5") via sysctlbyname("kern.osproductversion"),
+    // or "" on failure. Never shells out - keeps the self-contained-build property.
+    static std::string MacHostOsProductVersion();
+    // Trimmed contents of <MacStubSyslibroot()>/SDKVersion (the stub's own provenance
+    // record), or "" if the stub root or the file is absent.
+    static std::string MacStubSdkVersion();
 #endif
 
     // List the target CPUs supported on the currently supported platforms
