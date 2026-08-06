@@ -43,7 +43,7 @@ let that row be filled in.
 ## Root cause direction - not diagnosed
 
 Not investigated. Note the neighbouring, already-filed
-`p2/generic-wrapper-over-function-type-llvm-fatal` covers a generic STRUCT wrapper over a
+`p1/crash/generic-wrapper-over-function-type-llvm-fatal` covers a generic STRUCT wrapper over a
 function type (`Box<function<>>`) and is likely the same root - a generic instantiated over a
 function type mis-lowering its element. Check whether one fix closes both before scoping work;
 if so, consolidate on the shared root rather than fixing twice.

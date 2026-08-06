@@ -214,12 +214,21 @@ if(MSVC)
     PROPERTIES COMPILE_OPTIONS "/wd4251")
 endif()
 
-# cflat needs RTTI: the ANTLR C++ runtime and generated parser use dynamic_cast/
-# typeid, and MainListener.h (compiled into LLVMBackend.cpp alongside LLVM-derived
-# classes) leans on them too. LLVM/Clang must therefore also be built with
-# LLVM_ENABLE_RTTI=ON (Linux apt LLVM is; the vcpkg arm64-osx triplet enables it
-# via triplets/arm64-osx.cmake). A no-RTTI LLVM leaves clang/llvm base-class
-# typeinfo undefined at link once cflat is compiled with RTTI.
+# cflat needs RTTI. We do not pass -frtti (MSVC "/GR") explicitly - RTTI is the
+# compiler default and nothing here disables it; the rule is just "never add
+# -fno-rtti (MSVC GR-)". Two independent reasons it must stay on:
+#   1. The ANTLR C++ runtime and generated CFlatParser.cpp use dynamic_cast/typeid
+#      (antlrcpp::is<T>, getRuleContext<T>, downCast). MainListener.h and
+#      CFlatErrorListener.h dynamic_cast parse-tree contexts throughout.
+#   2. cflat derives from polymorphic LLVM/Clang bases - ASTConsumer and
+#      ASTFrontendAction in CClangExtract.cpp, llvm::DiagnosticHandler and
+#      orc::ObjectLinkingLayer::Plugin in LLVMBackend - so the derived typeinfo we
+#      emit references the base's typeinfo symbol.
+# Reason 2 is what makes LLVM/Clang's own build matter: a no-RTTI LLVM never emits
+# those base typeinfos, so the link fails. LLVM_ENABLE_RTTI=ON is required (Linux
+# apt LLVM has it; on vcpkg it comes from the "enable-rtti" feature on the llvm
+# dependency in vcpkg.json, which the llvm portfile maps to LLVM_ENABLE_RTTI).
+# find_package(LLVM) above sets LLVM_ENABLE_RTTI from LLVMConfig.cmake.
 if(NOT MSVC AND DEFINED LLVM_ENABLE_RTTI AND NOT LLVM_ENABLE_RTTI)
   message(WARNING "LLVM was built without RTTI (LLVM_ENABLE_RTTI=OFF); linking cflat "
                   "will fail on clang/llvm typeinfo. Rebuild LLVM with RTTI enabled.")
