@@ -166,7 +166,8 @@ That file went on to be narrowed twice more and was **fixed and deleted 2026-08-
 same day by `fix/funcptr-rebind` (landed record at the bottom).
 `funcptr-call-result-into-closure-param-garbage` (P1) is now fixed and deleted - see the landed
 record at the bottom. Still open unchanged:
-`data-pointer-returned-as-closure-not-gated`, `shape-mismatched-funcptr-arg-binds-silently` (P2).
+`data-pointer-returned-as-closure-not-gated` (itself fixed and deleted 2026-08-06 by
+`fix/return-gate` - landed record below), `shape-mismatched-funcptr-arg-binds-silently` (P2).
 They are one defect family - argument and return lowering for callable values - and a future pass
 should scope them together rather than one at a time.
 
@@ -515,7 +516,6 @@ produce a program.
 
 | Issue | Family | Severity |
 |---|---|---|
-| [[data-pointer-returned-as-closure-not-gated]] | miscompile | Silent miscompile then SIGBUS (exit 138), no diagnostic. `CoerceToFuncPtrReturn` is the one caller of `WidenBareOrThinToClosureFat` never routed through the `ce9858e` provenance gate, so a data pointer returned as a closure lands in the CODE slot and is called. Filed 2026-07-31. |
 | [[shape-mismatched-funcptr-arg-binds-silently]] | miscompile | Silent miscompile then SIGBUS (exit 138), no diagnostic. A `function<T>*` binds where a plain `function<T>` value is expected; the scorer now detects the shape mismatch but still lowers the mismatched arm when no better-shaped candidate exists. Filed 2026-07-31. |
 | [[extern-decl-drops-fixed-array-return-size]] | silent wrong ABI | `extern char[8] extmk();` compiles clean on BOTH `ca5a02a` and `fix/array-storage` - the `[8]` is dropped and the declaration binds to a symbol returning one `char`. The by-value fixed-array-return reject landed on the DEFINITION path only; this is the one remaining spelling of that axis. Not a regression. Filed 2026-08-02. |
 | [[string-literal-containing-braces-retyped-as-string]] | miscompile + false rejection | A string literal whose CONTENT contains a brace pair (`"a = {} b"`) is typed `string` instead of `char*`. At a call it stops every `char*` overload matching and the diagnostic blames the call; at a VARIADIC it is a SILENT MISCOMPILE - `printf("a = {} b\n");` compiles and runs rc 0 printing binary garbage, and the dedicated `cannot pass 'string' to the variadic '...'` guard does not fire. Identical on both binaries. Filed 2026-08-02 in `p2/` for the rejection face; the miscompile face may warrant P1. |
@@ -5461,3 +5461,63 @@ in `test_initializer_list.cb`; the other 9 diffs are addresses, PIDs, timings an
 counters. `leaks --atExit` on an owning-field probe: 186 nodes / 16 KB / 0 leaks on BOTH
 binaries, destructor count 3 on both. Warm `--init-local` cache re-verified (the fix adds no
 field, so nothing enters the serializer).
+
+### fix/return-gate - the RETURN leg of the closure provenance gate, LANDED
+
+Fixed and deleted [[data-pointer-returned-as-closure-not-gated]]. `CoerceToFuncPtrReturn` was the
+one caller of `WidenBareOrThinToClosureFat` never routed through the `ce9858e` provenance gate -
+`Lambda<int(int)> f() { void* p = &g; return p; }` (bare and `?:`/`??` join spellings, both fat
+`Lambda<>` and thin `function<>` return types) widened a data pointer into the CODE slot and
+called it (exit 138/139, no diagnostic). The THIN return arm (`return builder->CreateBitCast(val,
+BuildThinFnPtrType(retTV), ...)`) had the identical hole and was not named in the issue file - it
+shares the same function and is fixed by the same change.
+
+Fix: a new `CheckClosureReturnProvenance(val, returnNV, thin)` reuses
+`ArgumentIsProvablyDataPointer` - the SAME predicate the two argument-passing sites already share
+- against the return expression's own `NamedVariable` (`returnNV`, already resolved by
+`ParseAssignmentExpressionNamed` at the call site), so the accept set cannot drift between "pass"
+and "return". Return-flavoured wording ("cannot return {} as a closure" / "... as a 'function<>'
+value") distinguishes it from the argument-site diagnostics in a mutation-testable way.
+
+Accept-set matrix (bare/local, named function, thin `function<>` value, fat `Lambda<>`
+passthrough, lambda literal, `?:` join of two legal closures (named-fn and value arms), `??` join
+of two legal thin values, explicit `(function<...>)value` cast escape hatch, closure read from a
+struct field, closure read from a global, closure returned via a nested call, generic
+`Box<Lambda<>>` field read) - 15 probes, every one measured BYTE-IDENTICAL (same compile exit,
+same runtime output) on `x64/Release/cflat` before and after. Reject-set (bare `void*`/`int*`
+return, `?:` join of two data pointers, `??` join of two data pointers, thin twins of all three,
+a generic `Box<void*>` field returned as a closure) - 7 probes, every one silently miscompiled
+(138/139) pre-fix and now diagnoses with the return-flavoured message post-fix.
+
+The one user-visible tightening: a data-TYPED pointer that provably holds a code address,
+returned as a closure, was accepted and ran correctly on master and now hard-errors. Measured:
+`Lambda<int(int)> f() { void* vp = (void*)namedFn; return vp; }` ran `r=11` on the PRE binary; the
+`i8*` spelling behaves identically. Both now diagnose post-fix. This is deliberate and matches
+the argument-site behaviour on master, where the identical spellings already reject as arguments;
+the documented escape hatch `(function<...>)value` still works at the return site (measured,
+`r=11` post-fix).
+
+Differential sweep: `--check` over all 447 `Test/` + `example/` `.cb` files, pre vs post - the
+ONLY difference is `Test/errors/err_data_pointer_to_closure_param.cb`, the intended new legs.
+macOS arm64 Release `test.sh` 600/0/8, `example_mac.sh` 35/0.
+
+Confirmed OUT of scope, measured unchanged (still exit 138 on both binaries): the ASSIGNMENT-path
+sibling [[data-pointer-assigned-to-thin-function-value]] (`function<int(int)> f = vp;` and
+`s.f = vp;`) - a different site (`MainListener_Expressions.cpp`'s `operatorText == "="` block),
+left open per that issue file. Also probed as a neighbour and confirmed still ungated: the plain
+(non-generic) thin `f = vp;` reassignment and the thin arm of a generic-substituted closure field
+assignment (`enc->IsThinFnPtr() && right->getType()->isPointerTy()`, `MainListener_Expressions.cpp`
+around the generic-field conversion block) - both fall through every existing conversion arm
+untouched, same root cause as the filed sibling, not fixed by this change.
+
+Test legs: `Test/errors/err_data_pointer_to_closure_param.cb` gained 7 `expect_error` blocks - fat
+bare (through a local), fat bare (address-of straight into the return), fat `?:` join, thin bare,
+thin `?:` join, fat `??` coalesce join, and a generic `Box<void*>` field returned as a closure
+(exercises the field-read arm of `ArgumentIsProvablyDataPointer` through a monomorphized
+struct; a non-generic field twin rejects identically) - covering both return
+flavours (fat `Lambda<>`, thin `function<>`), both bare/join spellings, and the coalesce/generic
+shapes. Each leg was isolated into its own single-leg scratch file and mutation-tested there
+individually: every one exits 1 on the PRE binary (merge-base `33b3ac4`) with "expected error ...
+did not occur", and every one exits 0 with `PASS: expected error received` on the POST binary,
+firing the return-flavoured wording - proving each leg is non-vacuous on its own, not merely as
+the first failure in a longer file.

@@ -3640,8 +3640,16 @@ public:
     llvm::Value* EmitFuncToFunctionLowering(llvm::Value* fatVal, const TypeAndValue& thinTV);
 
     // Coerce a returned value to the declared function-pointer return type. Handles a named
-    // function, a thin function<> value, and a fat closure value in either direction.
-    llvm::Value* CoerceToFuncPtrReturn(llvm::Value* val, const TypeAndValue& retTV);
+    // function, a thin function<> value, and a fat closure value in either direction. `returnNV`
+    // is the NamedVariable the return expression resolved to - the same shape of evidence the
+    // argument-passing gates read - so the return site can share ArgumentIsProvablyDataPointer.
+    llvm::Value* CoerceToFuncPtrReturn(llvm::Value* val, const TypeAndValue& retTV,
+        const NamedVariable& returnNV);
+
+    // The RETURN-flavoured provenance gate, sharing ArgumentIsProvablyDataPointer with the
+    // argument-passing gates so the accept set cannot drift between "pass" and "return". `thin`
+    // selects the 'function<>' wording vs the closure wording; reject only what is PROVEN data.
+    void CheckClosureReturnProvenance(llvm::Value* val, const NamedVariable& returnNV, bool thin) const;
 
     // Widen a thin `function<T>` (bare C ptr) to a fat `Lambda<T>` value {code, null}. No thunk:
     // the thin ptr goes straight into the code slot, env is null. When the resulting Lambda is
@@ -4263,11 +4271,11 @@ public:
     /*
      * The gate for widening a CALL ARGUMENT into a fat `Lambda<>` parameter. Under opaque pointers
      * a data pointer is indistinguishable from code, so reject only what is PROVABLY data and widen
-     * everything else. Both the direct call path (CreateOverloadedFunctionCall) and virtual dispatch
-     * (LowerByValueArg) route through here so the two accept sets cannot drift - a divergence lets
-     * the same program compile through one call spelling and not the other. NOT every widen site:
-     * the RETURN path (CoerceToFuncPtrReturn) still calls WidenBareOrThinToClosureFat ungated, so
-     * `Lambda<int(int)> f() { void* p = ...; return p; }` is unguarded on both paths.
+     * everything else. The direct call path (CreateOverloadedFunctionCall), virtual dispatch
+     * (LowerByValueArg), and the RETURN path (CoerceToFuncPtrReturn, via
+     * CheckClosureReturnProvenance sharing ArgumentIsProvablyDataPointer) all route through this
+     * one predicate so the three accept sets cannot drift - a divergence lets the same program
+     * compile through one spelling and not another.
      */
     llvm::Value* WidenToClosureFatChecked(llvm::Value* val, const NamedVariable& arg,
         const std::string& paramName, const std::string& fieldDesc = {});

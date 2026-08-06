@@ -53,4 +53,6 @@ those, `nullptr`, and an explicit `(function<...>)value` cast must all keep comp
 None for this direction. The argument direction is covered by
 `Test/errors/err_data_pointer_to_closure_param.cb`, which is where an assignment leg belongs.
 
-Related: [[interface-issue-queue]], [[data-pointer-returned-as-closure-not-gated]]
+Related: [[interface-issue-queue]]. The RETURN-path sibling
+(`data-pointer-returned-as-closure-not-gated`) was fixed and deleted 2026-08-06 by
+`fix/return-gate` - see its landed record in the queue file.

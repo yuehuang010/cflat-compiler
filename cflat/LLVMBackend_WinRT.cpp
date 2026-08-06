@@ -1776,6 +1776,28 @@ llvm::Value* LLVMBackend::WidenToClosureFatChecked(llvm::Value* val, const Named
         return WidenBareOrThinToClosureFat(val);
     }
 
+void LLVMBackend::CheckClosureReturnProvenance(llvm::Value* val, const NamedVariable& returnNV,
+        bool thin) const
+{
+        if (val && val->getType()->isPointerTy() && ArgumentIsProvablyDataPointer(val, returnNV))
+        {
+            if (thin)
+                LogError(std::format(
+                    "cannot return {} as a 'function<>' value: only a named function, a "
+                    "'function<>' value or a non-capturing lambda converts to a function pointer - "
+                    "a data pointer would be called as code. If the value really holds a code "
+                    "address, assert it with an explicit cast: '(function<...>)value'.",
+                    DescribeNonFunctionArgument(returnNV)));
+            else
+                LogError(std::format(
+                    "cannot return {} as a closure: only a named function, a "
+                    "'function<>' value or a lambda converts to a closure - a data pointer "
+                    "would be called as code. If the value really holds a code address, assert "
+                    "it with an explicit cast: '(function<...>)value'.",
+                    DescribeNonFunctionArgument(returnNV)));
+        }
+    }
+
 void LLVMBackend::CheckThinFnPtrArgProvenance(llvm::Value* val, const NamedVariable& arg,
         const std::string& paramName) const
 {

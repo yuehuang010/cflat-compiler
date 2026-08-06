@@ -676,7 +676,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         // Coerce the returned value to the function-pointer return type (thin vs
                         // fat): a named function, a thin function<> value, or a fat closure value.
                         if (right && returnFnPtrTV.IsFunctionPointer)
-                            right = compiler->CoerceToFuncPtrReturn(right, returnFnPtrTV);
+                            right = compiler->CoerceToFuncPtrReturn(right, returnFnPtrTV, returnNV);
                         ProcessPlusPlus();
 
                         /*

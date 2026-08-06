@@ -539,7 +539,8 @@ llvm::Value* LLVMBackend::EmitFuncToFunctionLowering(llvm::Value* fatVal, const 
         return builder->CreateSelect(envNull, codeThin, nullThin, "tofn");
     }
 
-llvm::Value* LLVMBackend::CoerceToFuncPtrReturn(llvm::Value* val, const TypeAndValue& retTV)
+llvm::Value* LLVMBackend::CoerceToFuncPtrReturn(llvm::Value* val, const TypeAndValue& retTV,
+        const NamedVariable& returnNV)
 {
         bool valIsStruct = val->getType()->isStructTy();   // fat closure value
         if (retTV.IsThinFnPtr())
@@ -554,11 +555,12 @@ llvm::Value* LLVMBackend::CoerceToFuncPtrReturn(llvm::Value* val, const TypeAndV
                 LogError(DescribeCapturingClosureToThin({}));
                 return llvm::UndefValue::get(BuildThinFnPtrType(retTV));
             }
+            CheckClosureReturnProvenance(val, returnNV, /*thin=*/true);
             return builder->CreateBitCast(val, BuildThinFnPtrType(retTV), "thinret");
         }
-        // Same widening the call paths use. This RETURN site is deliberately ungated: unlike the
-        // two argument sites it does not run WidenToClosureFatChecked, so a data pointer returned
-        // as a closure is not diagnosed here. An already-fat closure value is returned untouched.
+        // Same widening the call paths use, behind the same provenance gate. Fat closure values
+        // are not pointer-typed, so the gate below is a no-op for them.
+        CheckClosureReturnProvenance(val, returnNV, /*thin=*/false);
         return WidenBareOrThinToClosureFat(val);
     }
 

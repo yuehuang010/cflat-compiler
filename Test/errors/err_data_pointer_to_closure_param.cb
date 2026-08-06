@@ -1683,3 +1683,96 @@ expect_error("cannot pass a non-function pointer value to 'function<>' parameter
         fns.add(vp);
     }
 }
+
+/*
+ * The RETURN leg of the same hole. `CoerceToFuncPtrReturn` widened/bitcast a returned value into
+ * the declared function-pointer return type WITHOUT running the provenance gate the two argument
+ * sites (direct call, virtual dispatch) already share - a returned `void*` landed in the closure's
+ * CODE slot and was CALLED (SIGBUS/SIGSEGV, no diagnostic). It now shares
+ * ArgumentIsProvablyDataPointer through CheckClosureReturnProvenance, so all three sites (pass,
+ * pass-virtual, return) keep ONE accept set. The wording is return-flavoured ("cannot return ...
+ * as a closure" / "... as a 'function<>' value") and cannot be confused with the argument-site
+ * messages above, which pin "to closure parameter" / "to 'function<>' parameter" instead.
+ */
+expect_error("cannot return a 'void*' value as a closure") {
+    int dpgrQ = 1;
+
+    Lambda<int(int)> dataPointerReturnedAsClosure()
+    {
+        void* vp = &dpgrQ;
+        return vp;
+    }
+}
+
+// A bare-spelling twin: no intermediate local, the address-of expression flows straight into the
+// return. Proves the gate does not depend on the value passing through a named local first.
+expect_error("cannot return a 'void*' value as a closure") {
+    int dpgrQ2 = 1;
+
+    Lambda<int(int)> dataPointerReturnedAsClosureBare()
+    {
+        return (void*)&dpgrQ2;
+    }
+}
+
+// The '?:' JOIN spelling on the return path: neither arm carries a NamedVariable, so the gate must
+// resolve the PHI through the same per-value data ledger the argument-side join legs above use.
+// Both arms here are provably data (one address-of, one an explicit null), so EVERY-arm proves the
+// whole join is data and it is rejected - matching the argument-side join legs' polarity.
+expect_error("cannot return a non-function pointer value as a closure") {
+    Lambda<int(int)> dataPointerJoinReturnedAsClosure(int c)
+    {
+        int dpgrZ = 1;
+        void* vp = &dpgrZ;
+        void* vq = nullptr;
+        return c > 0 ? vp : vq;
+    }
+}
+
+// THIN element, same shape as the fat legs above: a `function<>` return takes a bare code
+// address, so a provable data pointer bitcast straight into the return value is CALLED as code.
+expect_error("cannot return a 'void*' value as a 'function<>' value") {
+    int dpgrQ3 = 1;
+
+    function<int(int)> dataPointerReturnedAsThinClosure()
+    {
+        void* vp = &dpgrQ3;
+        return vp;
+    }
+}
+
+// THIN join twin.
+expect_error("cannot return a non-function pointer value as a 'function<>' value") {
+    function<int(int)> dataPointerJoinReturnedAsThinClosure(int c)
+    {
+        int dpgrZ2 = 1;
+        void* vp = &dpgrZ2;
+        void* vq = nullptr;
+        return c > 0 ? vp : vq;
+    }
+}
+
+// The '??' COALESCE join spelling on the return path: the same PHI-resolving path as the '?:'
+// join above, but through the null-coalesce operator instead.
+expect_error("cannot return a non-function pointer value as a closure") {
+    Lambda<int(int)> dataPointerCoalesceReturnedAsClosure(int c)
+    {
+        int dpgrZ3 = 1;
+        void* vp = &dpgrZ3;
+        void* vq = nullptr;
+        return vq ?? vp;
+    }
+}
+
+// A generic field's data pointer, read out and returned as a closure: exercises the
+// field-read arm of ArgumentIsProvablyDataPointer through a monomorphized struct.
+struct DataPointerReturnBox<T> { T item = default; };
+int dataPointerReturnBoxSource = 1;
+expect_error("cannot return a 'void*' value as a closure") {
+    Lambda<int(int)> genericFieldDataPointerReturnedAsClosure()
+    {
+        DataPointerReturnBox<void*> b = default;
+        b.item = &dataPointerReturnBoxSource;
+        return b.item;
+    }
+}
