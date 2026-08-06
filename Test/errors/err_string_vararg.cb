@@ -7,6 +7,13 @@ import "string.cb";
 
 extern int main()
 {
+    // An interpolated literal IS a 'string'; printf's fixed 'char* fmt' is outside the variadic
+    // range, so PRE the pair's address was passed as the format string and printed garbage.
+    expect_error("cannot pass 'string' to the 'char*' parameter") {
+        i32 n = 7;
+        printf("n={n}\n");
+    }
+
     string s = "hello";
     expect_error("cannot pass 'string' to the variadic '...'");
     printf("%s %d\n", s, 42);

@@ -4267,23 +4267,67 @@ CFlatParser::CastExpressionContext* MainListener::tryGetCastExpression(antlr4::R
         return singleRuleChild ? tryGetCastExpression(singleRuleChild) : nullptr;
     }
 
+namespace {
+
+enum class BraceKind { Escaped, PlainChar, Verbatim, Segment };
+
+/*
+ * The single definition of what a '{' at rawText[i] means (i < end, end = index of the closing
+ * quote); ParseFormatString and HasInterpolation both use it so they cannot disagree.
+ *   Escaped   - '{{', a literal '{'.
+ *   PlainChar - an empty pair '{}' or a '{' with no matching '}': no expression, so the braces
+ *               are ordinary text and the literal is NOT interpolated (closeIdx = last index).
+ *   Verbatim  - matched braces whose content cannot be an expression (JSON-ish, starting with
+ *               '"' or '\'). Still routed through the format path, which copies the region
+ *               verbatim - the plain path would fold any '{{'/'}}' inside it.
+ *   Segment   - a real interpolation; closeIdx is the matching '}'.
+ */
+BraceKind ClassifyBrace(const std::string& rawText, size_t i, size_t end, size_t& closeIdx)
+{
+    if (i + 1 < end && rawText[i + 1] == '{')
+        return BraceKind::Escaped;
+
+    int depth = 1;
+    size_t j = i + 1;
+    while (j < end && depth > 0)
+    {
+        if (rawText[j] == '{') depth++;
+        else if (rawText[j] == '}') depth--;
+        if (depth > 0) j++;
+    }
+    if (depth > 0)
+    {
+        closeIdx = i; // no matching '}' in this literal - the '{' is a plain character
+        return BraceKind::PlainChar;
+    }
+
+    closeIdx = j;
+    if (j == i + 1)
+        return BraceKind::PlainChar; // empty '{}' - no expression to interpolate
+    char first = rawText[i + 1];
+    if (first == '\\' || first == '"')
+        return BraceKind::Verbatim;
+    return BraceKind::Segment;
+}
+
+} // namespace
+
 bool MainListener::HasInterpolation(const std::string& rawText) {
         bool inEscape = false;
-        for (size_t i = 1; i + 1 < rawText.size(); i++) // skip opening/closing "
+        size_t end = rawText.size() - 1; // index of the closing "
+        for (size_t i = 1; i < end; i++) // skip opening/closing "
         {
             char c = rawText[i];
             if (inEscape) { inEscape = false; continue; }
             if (c == '\\') { inEscape = true; continue; }
-            if (c == '{')
-            {
-                // {{ is an escaped literal '{', not an interpolation start.
-                if (i + 1 < rawText.size() - 1 && rawText[i + 1] == '{')
-                {
-                    i++; // skip second '{'
-                    continue;
-                }
+            if (c != '{') continue;
+
+            size_t closeIdx = i;
+            BraceKind kind = ClassifyBrace(rawText, i, end, closeIdx);
+            if (kind == BraceKind::Segment || kind == BraceKind::Verbatim)
                 return true;
-            }
+            // Escaped '{{' consumes one extra char; a plain-char run consumes through closeIdx.
+            i = (kind == BraceKind::Escaped) ? i + 1 : closeIdx;
         }
         return false;
     }
@@ -4337,42 +4381,25 @@ llvm::Value* MainListener::ParseFormatString(CFlatParser::PrimaryExpressionConte
             }
             if (c == '{')
             {
-                // {{ is a literal '{', not an interpolation start.
-                if (i + 1 < end && rawText[i + 1] == '{')
+                size_t closeIdx = i;
+                BraceKind kind = ClassifyBrace(rawText, i, end, closeIdx);
+                if (kind == BraceKind::Escaped)
                 {
+                    // {{ is a literal '{', not an interpolation start.
                     litAccum += '{';
                     i += 2;
                     continue;
                 }
-
-                // Find matching '}'
-                size_t exprStart = i + 1;
-                int depth = 1;
-                size_t j = exprStart;
-                while (j < end && depth > 0)
+                if (kind == BraceKind::PlainChar || kind == BraceKind::Verbatim)
                 {
-                    if (rawText[j] == '{') depth++;
-                    else if (rawText[j] == '}') depth--;
-                    if (depth > 0) j++;
-                }
-                if (depth > 0)
-                {
-                    // No matching '}' within this string literal - treat '{' as a literal character.
-                    litAccum += '{';
-                    i++;
+                    // Unmatched '{', empty '{}', or non-expression content (e.g. JSON) - literal text.
+                    litAccum.append(rawText, i, closeIdx - i + 1);
+                    i = closeIdx + 1;
                     continue;
                 }
-                std::string exprText = rawText.substr(exprStart, j - exprStart);
-                i = j + 1; // skip past '}'
 
-                // Empty or non-expression content (e.g. JSON {"key": "value"}) - keep as literal.
-                if (exprText.empty() || exprText[0] == '\\' || exprText[0] == '"')
-                {
-                    litAccum += '{';
-                    litAccum += exprText;
-                    litAccum += '}';
-                    continue;
-                }
+                std::string exprText = rawText.substr(i + 1, closeIdx - i - 1);
+                i = closeIdx + 1; // skip past '}'
 
                 flushLiteral();
 

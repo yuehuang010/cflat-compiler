@@ -266,15 +266,21 @@ string s = "Point is {p}.";   // "Point is 10, 20."
 string s = "value is {{x}} = {x}";   // "value is {x} = 42"  (x == 42)
 ```
 
-> **Any `{` in a string literal triggers interpolation.** This is a common surprise
-> when embedding JSON, format strings, or code templates. When a `{` is encountered
-> but the content inside is not a valid expression, the compiler reports "Undefined
-> variable" at line 1 of the file - not at the brace in question.
+An empty brace pair `{}` holds no expression, so it is ordinary text and does not make the
+literal interpolated - `"a = {} b"` stays a plain `char*` reading `a = {} b`. The same is true
+of a `{` with no matching `}`. Once the literal is not interpolated, `}}` still folds to `}` as
+usual, so `"a {}} b"` reads `a {} b`.
+
+> **Any other `{` in a string literal triggers interpolation.** This is a common surprise
+> when embedding JSON, format strings, or code templates. When a `{` is encountered but the
+> content inside is not a single valid expression, the compiler reports a located error at the
+> brace ("'{' in this string starts an interpolation, but the text between the braces is not a
+> single valid expression"), suggesting `{{` / `}}` for literal braces.
 >
 > Escape all literal braces that are not meant as interpolation anchors:
 >
 > ```c
-> // BROKEN - compiler sees {value} as an interpolation, reports "Undefined variable 'value'"
+> // BROKEN - compiler sees {value} as an interpolation and {"key"...} as a bad expression
 > string tpl = "{"key": "{value}"}";
 >
 > // Correct - all structural braces escaped

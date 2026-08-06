@@ -910,6 +910,24 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
             else if (!inVariadicRange && candParamItr->Pointer)
             {
+                // A 'string' is a {ptr,len} value, not a char*: the lowering below would hand the
+                // callee the PAIR's address. Only a variadic candidate reaches here with one (a
+                // non-variadic candidate is rejected by overload scoring first).
+                bool argIsStringValue = !arg.TypeAndValue.Pointer
+                    && (arg.TypeAndValue.TypeName == "string"
+                        || (arg.Primary != nullptr
+                            && arg.Primary->getType() == llvm::StructType::getTypeByName(*context, "string")));
+                if (argIsStringValue && (candParamItr->TypeName == "char" || candParamItr->TypeName == "i8"))
+                {
+                    LogError(std::format(
+                        "cannot pass 'string' to the 'char*' parameter '{}' of '{}': a 'string' is a "
+                        "{{ptr,len}} value, not a 'char*' - the callee would read the pair itself. Pass "
+                        "the buffer explicitly with '.data()'. An interpolated string literal is a "
+                        "'string': bind it first (string s = \"{{x}}\"; printf(\"%s\", s.data())).",
+                        candParamItr->VariableName, functionName));
+                    return nullptr;
+                }
+
                 // For a non-pointer value passed to a pointer parameter (e.g. a field access
                 // used as the 'this' receiver), prefer Storage (the GEP address) over Primary
                 // (the pre-loaded value). Primary holds the struct value itself, which would
@@ -1069,9 +1087,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     // only known here (CreateFunctionCall sees a bare llvm::Value).
                     value = PromoteToInt(value, arg.TypeAndValue.IsUnsignedInteger() != -1);
                 }
-                else if (arg.TypeAndValue.TypeName == "string" && !arg.TypeAndValue.Pointer
-                         && value->getType()->isStructTy())
+                else if (!arg.TypeAndValue.Pointer
+                         && value->getType() == llvm::StructType::getTypeByName(*context, "string"))
                 {
+                    // Keyed on the REPRESENTATION, not the spelling: an interpolated string
+                    // literal reaches here as a string struct with no 'string' TypeName.
                     // A 'string' is a {ptr,len} value type, not a char*. A variadic slot is
                     // untyped, so the compiler cannot know the callee wants the char* (the
                     // format string is not visible here) - passing the struct silently feeds

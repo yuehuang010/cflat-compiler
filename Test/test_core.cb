@@ -1314,6 +1314,25 @@ int testStringInterpolation()
     i32 value = 99;
     passed += Test("interp_mixed",     "{label}={value}", "score=99");
 
+    // An EMPTY brace pair is not interpolated: the literal stays a plain char*. PRE, the label
+    // failed overload resolution and 'emptyPair' failed pointer initialization ('string' source).
+    char* emptyPair = "a = {} b";
+    passed += Test("interp_empty_pair_is_charptr = {} in label", emptyPair, "a = {} b");
+
+    // A '{' with no matching '}' is a plain character for the same reason.
+    char* unmatched = "unmatched { brace";
+    passed += Test("interp_unmatched_brace_is_charptr", unmatched, "unmatched { brace");
+
+    // Accept-set freeze (passes on both binaries by design): a literal that DOES interpolate
+    // is unchanged, and the empty pair stays ordinary text inside it.
+    i32 seven = 7;
+    passed += Test("interp_empty_pair_with_segment", "a {} b {seven}", "a {} b 7");
+
+    // Deliberate PRE->POST change: on the plain path an empty pair's trailing '}' now folds
+    // with the next one per the '}}' escape rule (PRE read "a {}} b").
+    char* braceRun = "a {}} b";
+    passed += Test("interp_empty_pair_brace_run", braceRun, "a {} b");
+
     return passed;
 }
 
@@ -2141,7 +2160,7 @@ extern int main()
     r = testString();           passed += r; total += 26;
     r = testStringConcat();     passed += r; total += 10;
     r = testStringIString();    passed += r; total += 4;
-    r = testStringInterpolation(); passed += r; total += 6;
+    r = testStringInterpolation(); passed += r; total += 10;
     r = testStringSwitch();     passed += r; total += 6;
     r = testStringBuilder();    passed += r; total += 20;
     r = testStringView();       passed += r; total += 12;

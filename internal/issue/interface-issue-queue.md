@@ -305,7 +305,9 @@ A further review round of the same fix filed a FIFTH: `pointer-decl-field-init-b
 `fix/ptr-fieldinit`; see the landed design record below. That fix in turn filed two more from its own
 Phase A enumeration - `empty-brace-initializer-never-seeds-and-crashes-on-defaults` (P1, since
 **FIXED and deleted** by `fix/emptybrace` / `b844137`; see the landed design record below) and
-[[string-literal-containing-braces-retyped-as-string]] (P2) - which is the same pattern again.
+[[string-literal-containing-braces-retyped-as-string]] (filed P2, re-ranked P1 for its
+miscompile face) - which is the same pattern again. **FIXED and deleted 2026-08-06** by
+`fix/brace-literal`; see the landed design record below.
 (`ftell-fseek-long-width-on-windows` fixed 2026-08-02; its >2 GB half re-filed as
 [[file-offsets-capped-at-2gb]] at P2.)
 
@@ -520,6 +522,7 @@ produce a program.
 |---|---|---|
 | [[shape-mismatched-funcptr-arg-binds-silently]] | miscompile | Silent miscompile then SIGBUS (exit 138), no diagnostic. A `function<T>*` binds where a plain `function<T>` value is expected; the scorer now detects the shape mismatch but still lowers the mismatched arm when no better-shaped candidate exists. Filed 2026-07-31. |
 | [[string-literal-containing-braces-retyped-as-string]] | miscompile + false rejection | A string literal whose CONTENT contains a brace pair (`"a = {} b"`) is typed `string` instead of `char*`. At a call it stops every `char*` overload matching and the diagnostic blames the call; at a VARIADIC it is a SILENT MISCOMPILE - `printf("a = {} b\n");` compiles and runs rc 0 printing binary garbage, and the dedicated `cannot pass 'string' to the variadic '...'` guard does not fire. Identical on both binaries. Filed 2026-08-02 in `p2/` for the rejection face; the miscompile face may warrant P1. |
+| [[extern-decl-drops-fixed-array-return-size]] | silent wrong ABI | `extern char[8] extmk();` compiles clean on BOTH `ca5a02a` and `fix/array-storage` - the `[8]` is dropped and the declaration binds to a symbol returning one `char`. The by-value fixed-array-return reject landed on the DEFINITION path only; this is the one remaining spelling of that axis. Not a regression. Filed 2026-08-02. |
 | [[temp-unique-field-escapes-through-a-plain-pointer-parameter]] | memory-unsafe accept | Silent use-after-free, compiles clean and exits 0, identical on `14097e1` and on the merged `fix/tempuniq`. `keep(makeBox().t)` where `void keep(Node* n) { g = n; }` reads a freed block (proven by dtor count + reallocation aliasing; the `MallocScribble` fill shows only on ld64.lld-linked builds`. The DECLARED remainder of `temp-unique-field-escapes-through-unguarded-spellings` (closed and
 | [[same-statement-cast-launders-join-code-evidence]] | memory-unsafe accept | Silent exit 138: `two((void*)ro, c ? ro : n)` - a data cast of a NAMED function anywhere in a statement launders every other mention of that function in the SAME statement, because the launder is keyed on `llvm::Value*` alone and a named function is one shared constant. Cross-statement and cross-function are closed (`fix/joinledger`); only the same-statement window remains. P2 under the residue-not-regression precedent ([[unique-field-to-field-interface-receiver-residues]]) - the spelling was accepted before the fix too; re-rank to P1 if the memory-unsafe-accept rubric wins. Fix direction: occurrence keying (value + syntactic cast site). Filed 2026-08-05 by review round 2 of `fix/joinledger`. |
 | [[move-of-borrowed-pointer-adopts-into-plain-destination]] | ownership | Exit 134, no diagnostic, identical on `d93c359` and on the merged `fix/ptrcopy`. `move` of an `IsBorrowed` source is gated only on a `unique` DESTINATION, so `Ci* d = move p;` off a borrowed pointer PARAMETER (and its one-hop copy, and the `move`-returning-wrapper spelling) adopts ownership the borrow never had. `fix/ptrcopy` added the destination-agnostic move guard next to this and deliberately left `IsBorrowed` out of it: `MainListener.h` carries an explicit ratified policy that forwarding an ordinary borrow as `move` stays legal, so closing this means REOPENING that policy with its own accept set, not adding a clause. Filed 2026-08-05 by `fix/ptrcopy`. Silent double free, so P1 by the bare rubric; filed P2 under the residue-not-regression precedent (`unique-field-to-field-interface-receiver-residues`, `return-dangle-missed-when-slot-has-extra-user`) - accepted by the PRE binary too, so residue rather than regression. Re-rank to P1 if the maintainer rules the silent-double-free rubric wins. |
@@ -636,6 +639,8 @@ deleted 2026-08-05), which closed the four decidable spellings and named this on
 | [[simd-array-error-wording-differs-from-plain-arrays]] | diagnostic | `simd<T,N>[N]` gets DIFFERENT wording than a plain array for the identical rejection (whole-array assignment, global fixed-array init): two `!IsSimd` guard exclusions in `MainListener.h` became reachable when `fix/simdptr` started recording the dimension, so a second guard catches the shape and prints a different message. Both spellings are still rejected - wording only, no miscompile. Deliberately deferred: removing `!IsSimd` WIDENS a rejection predicate and needs an accept-set exercise first. Filed 2026-08-04. |
 | [[simd-array-view-decl-verifier-failure]] | diagnostic | `simd<T,N>[] v = a;` (view bound to a `simd<T,N>[N]`) emits `Invalid bitcast ptr to float` and dies in module verification with NO located diagnostic - CLAUDE.md requires a `LogError` before the verifier trips. Identical pre-amend and at `fix/simdptr` HEAD; on `master` the same file exits 0 only vacuously (the `[2]` was dropped, so there was no array to view). Distinct from the p2 spelling issue: the spelling parses, the view BIND lowers against the lane type. Filed 2026-08-04. |
 | [[interface-collision-message-prefix-still-basename]] | diagnostic | The `file(line,col):` prefix is still a bare basename. |
+| [[json-ish-brace-literal-still-typed-string]] | false reject | `char* j = "{\"k\":1}";` is rejected ("cannot initialize pointer ... with a value of type 'char'") because a matched brace pair whose content cannot be an expression still routes through the interpolation path and comes out a `string`. The EMPTY-pair face of the same defect is closed (`fix/brace-literal`); this one was left open because the two paths disagree about `{{`/`}}` INSIDE such a region and `Test/test_reflect.cb`'s `toJson_nested` literal depends on the current verbatim copy. Filed 2026-08-06. |
+| [[indirect-call-string-to-charptr-fails-in-verifier]] | diagnostic | A `string` passed to a `char*` parameter through a `function<int(char*)>` value dies with `Module verification failed:` and no source location. The DIRECT spellings are diagnosed (`fix/brace-literal`); the indirect arms (`CheckIndirectCallArgShape`) do not know the case. Identical on `56ebc52` and on `fix/brace-literal`. Filed 2026-08-06. |
 | [[as-cast-unbound-pointer-shape-generic-message]] | diagnostic | Correctly rejected, generic wording. Struct field and LOCAL `T*[N]` only. |
 | [[constructor-discriminator-inconsistent-name-only-sites]] | diagnostic | Name-only outside a lock/program body, null-declarationSpecifiers inside one. |
 | [[expect-error-leaves-outer-nullcond-block-unterminated]] | diagnostic | Raw verifier dump instead of a clean diagnostic. |
@@ -2595,7 +2600,8 @@ deleted.) And
 typed `string` rather than `char*`; found only because a test label contained `= {}`. That one was
 filed as a false rejection and is worse than filed: `printf("a = {} b\n");` compiles rc 0, runs rc 0
 and prints binary garbage on BOTH binaries, and the dedicated `cannot pass 'string' to the variadic
-'...'` guard does not fire for it. Its file now records the miscompile face too.
+'...'` guard does not fire for it. Its file recorded the miscompile face too. **FIXED and deleted
+2026-08-06** by `fix/brace-literal`; see the landed design record below.
 
 Also confirmed NOT reachable, with the measurement rather than an argument: `S* p; p = {a=1};`
 (assignment form) and `S** q = new S*{a=1};` are parse errors; a global pointer declaration in every
@@ -5460,7 +5466,7 @@ use, none an aggregate ctor seed.
 - Positional `C c = {1,2}` is a hard error for class and struct alike, unchanged.
 - A `Test(...)` message string whose CONTENT contains `{}` retypes the literal as `string` and
   breaks overload resolution - hit while writing the legs; it is the already-filed
-  [[string-literal-containing-braces-retyped-as-string]].
+  [[string-literal-containing-braces-retyped-as-string]] (FIXED 2026-08-06 by `fix/brace-literal`).
 
 ### Verification
 
@@ -6404,3 +6410,117 @@ not correctness) in
 [[interface-and-struct-member-fixed-array-return-not-rejected]] rather than folded into this
 commit, since it is a different registration path (interface/struct-member contract, in
 `MainListener_Aggregates.cpp`) that this fix's scope did not cover.
+---
+
+### fix/brace-literal - an EMPTY brace pair is not an interpolation, and a `string` reaching a `char*` parameter is diagnosed (LANDED)
+
+Closes `string-literal-containing-braces-retyped-as-string` (filed P2 for its false-rejection face,
+re-ranked P1 for the miscompile face); its file is deleted in this commit. Branched from `56ebc52`.
+
+**Root cause, measured (the filed file said "not diagnosed").** `HasInterpolation`
+(`cflat/MainListener_PostfixExpression.cpp`) returned true on the first unescaped `{`, so ANY brace
+pair sent the literal down `ParseFormatString`, which returns a `string`. `ParseFormatString` itself
+already disagreed: it treats an empty `{}`, an unmatched `{`, and JSON-ish content as LITERAL TEXT
+and emits them verbatim. So for `"a = {} b"` the format path produced one literal segment and
+wrapped it in a `string` - the retype had no interpolation behind it at all. Two predicates asking
+the same question, one of them wrong; the fix makes them one function (`ClassifyBrace`) that both
+call.
+
+**Face 2 was NOT where the issue file said it was.** The file blamed the variadic guard
+(`cannot pass 'string' to the variadic '...'`). Measured: for `printf("{x}\n")` the interpolated
+string is argument 0, which binds printf's DECLARED `char* fmt` parameter and is therefore not in
+the variadic range - the variadic guard never sees it. The pointer-parameter arm then materialized
+the `{ptr,len}` struct on the stack and passed its ADDRESS, which is the binary garbage. A variadic
+candidate is taken without per-argument scoring (`LLVMBackend_Overloads.cpp:72-81`), so the overload
+scoring that rejects `f(char*)` for a user function never runs for `printf`. The guard was added at
+the pointer-parameter arm, keyed on the REPRESENTATION (the named `string` struct type), not on
+`TypeAndValue.TypeName` - an interpolated literal carries no `string` spelling. The variadic-range
+guard was re-keyed the same way in the same change (it was `TypeName == "string" && isStructTy`).
+
+**Design decision: only the EMPTY pair and the unmatched `{` stop triggering interpolation.** The
+first cut also moved JSON-ish content (matched braces starting with `"` or `\`) onto the plain
+literal path and BROKE `Test/test_reflect.cb` (`toJson_nested FAILED (expected ...12345} got
+...12345}}`)`. The two paths do not fold braces the same way - but NOT in the way this record first
+claimed: `ParseFormatString` ALSO folds `}}` to `}` at top level (review round 1 measured it), so
+neither path is byte-for-byte. The real divergence is at the BOUNDARY: the format path consumed an
+empty pair's `}` as part of the pair, leaving a following `}` standing alone, while the plain path
+pairs that `}` with the next one and folds. So `string s = "a {}} b"` read `a {}} b` PRE and reads
+`a {} b` POST - a narrow, deliberate value change (empty pair followed by an odd run of `}`),
+pinned by the `interp_empty_pair_brace_run` leg and consistent with the documented `}}` escape
+rule. Every other neighbouring spelling (`"{}}}"`, `"{}{}"`, `"a {} }} b"`, `"{{}"`, ...) was
+measured identical PRE/POST. JSON-ish matched-pair content is different: its interior region IS
+copied differently enough that moving it broke `test_reflect.cb`, so it keeps its routing. JSON-ish content therefore keeps its pre-fix routing
+(`BraceKind::Verbatim`), and the remaining false rejection is filed as
+[[json-ish-brace-literal-still-typed-string]]. Whitespace-only `{ }` is deliberately unchanged too:
+it already produced the located "the text between the braces (\" \") is not a single valid
+expression" diagnostic, which cannot be distinguished from a typo of `{ x }` and is more useful
+than silently accepting it.
+
+No escape syntax was invented; `{{` / `}}` / `\{` are unchanged.
+
+**Measured matrix** (PRE = `56ebc52` Release in a throwaway worktree, removed after use; POST = this
+commit; every cell compiled with `-o` and RUN):
+
+| Cell | PRE | POST |
+|---|---|---|
+| `printf("a = {} b\n")` | rc 0, runs, prints address bytes (the filed repro A) | rc 0, prints `a = {} b` |
+| `printf("a {} b\n")` / `printf("{}\n")` | rc 0, garbage | rc 0, prints the literal |
+| `Test("a = {} b", 1, 1)` (label with `{}`) | `no overload of 'Test' matches` (repro B) | rc 0, binds `char* name` |
+| `char* p = "a {} b";` | `cannot initialize pointer 'p' with a value of type 'char'` | rc 0, prints `a {} b` |
+| `char* u = "unmatched { brace";` | same false rejection | rc 0 |
+| `printf("unmatched { brace\n")` | rc 0, garbage | rc 0, prints the text |
+| `string s = "a {} b";` | prints `a {} b` | prints `a {} b` (unchanged) |
+| `"a {} b {x}"` (empty pair inside a REAL interpolation) | `a {} b 7` | `a {} b 7` (unchanged) |
+| `"{x}"`, `"n={n}"`, `"{a} and {b}"`, IString `{p}` | correct values | byte-identical |
+| `"{{escaped}}"` | `{escaped}` | `{escaped}` (unchanged) |
+| `"{ }"` (whitespace only) | located "not a single valid expression" | identical |
+| `"{x}"` with no `x` in scope | `Undefined variable x.` | identical |
+| `string s = "{\"key\": 1}"` (JSON) | prints `{"key": 1}` | identical |
+| `char* j = "{\"k\":1}";` | false rejection | STILL rejected - [[json-ish-brace-literal-still-typed-string]] |
+| `printf("{x}\n")` (real interpolation into printf) | rc 0, garbage, NO diagnostic | rc 1, `cannot pass 'string' to the 'char*' parameter 'fmt' of 'printf'` |
+| `printf("{\"k\":1}\n")` | rc 0, garbage | rc 1, same diagnostic |
+| `string t = "zz"; printf(t);` | rc 0, garbage, no diagnostic | rc 1, same diagnostic |
+| `string t = "zz"; printf("%s\n", t);` | variadic guard fires | fires, wording unchanged |
+| `printf("%s\n", s.data())` | prints `hi` | unchanged |
+| `int f(char* p); f(s)` (non-variadic) | `no overload of 'f' matches` | unchanged (scoring, not the new guard) |
+| `function<int(char*)> fp; fp(s)` | `Module verification failed:` | identical - filed as [[indirect-call-string-to-charptr-fails-in-verifier]] |
+
+**Accept set frozen before the guard was written**: every real-interpolation spelling in
+`Test/test_core.cb::testStringInterpolation` (simple, two-var, sandwich, int, IString, mixed, i64,
+double, bool), `s.data()` into printf, string-typed method receivers, and `test_reflect`'s
+`toJson_nested` verbatim-JSON literal. All measured on PRE and re-measured on POST; all identical.
+
+**Per-site audit of the changed predicate** (a `string` value reaching a pointer parameter):
+- `LLVMBackend_Overloads.cpp` pointer-parameter arm - the defect; guard added.
+- `LLVMBackend_Overloads.cpp` variadic-range arm - had the guard, but spelling-keyed; re-keyed on
+  the struct type. Wording unchanged, so `err_string_vararg.cb`'s existing leg still pins it.
+- `LLVMBackend_WinRT.cpp` interface-dispatch arm (`param.Pointer`) - same shape, NOT changed: an
+  interface method cannot be variadic (`err_iface_variadic_method.cb`), so overload scoring always
+  runs and rejects `string` -> `char*` before this arm.
+- `LLVMBackend_ControlFlowAndFunctions.cpp` indirect-call arms (C fn ptr, closure invoker) - same
+  shape, reached today, and they fail in the verifier instead of diagnosing. Left alone and filed:
+  [[indirect-call-string-to-charptr-fails-in-verifier]].
+- `HasInterpolation` had exactly one caller; `ParseFormatString`'s brace scan was the only other
+  copy of the predicate, and it is now the same function.
+
+**Differential corpus sweep**: every `.cb` under `Test/` and `example/` (447 files), compiled with
+`-o` and RUN on both binaries. After normalizing the two binaries' own paths, exactly two files
+differ - `Test/test_core.cb` and `Test/errors/err_string_vararg.cb`, the two files this commit
+edits. Everything else differs only in addresses, timings, thread counts and pids (`test_c`,
+`test_hpc`, `test_time`, the four hpc examples, `macos_framework_link`, `sysinfo_mac`), or in the
+PRE binary's own `runtime core '...'` path inside an unrelated `imported file not found` message
+(the four Win32-only UI examples).
+
+**Test legs.** `Test/test_core.cb::testStringInterpolation` (+3, total bumped 6 -> 9): an empty pair
+bound to a `char*` AND used in the `Test` label itself (fails on PRE with
+`cannot initialize pointer 'emptyPair' ...`; the label alone, isolated, fails with
+`no overload of 'Test' matches` - the filed repro B), an unmatched `{` bound to a `char*` (same PRE
+rejection), and an accept-set freeze leg for an empty pair inside a real interpolation (passes on
+both binaries by design, and its comment says so). `Test/errors/err_string_vararg.cb` gained a
+scoped-block leg for `printf("n={n}\n")`; on PRE that file prints
+`FAIL: expected error ... did not occur` and exits 1. Both legs in that file were mutation-checked
+individually and each flips the file to exit 1 on its own.
+
+`./cmake_build.sh release && bash test.sh Release` - 600 passed, 0 failed, 8 skipped.
+`bash example_mac.sh Release` - 35 passed, 0 failed. One commit,
+`git rev-list --count 56ebc52..HEAD` = 1.
