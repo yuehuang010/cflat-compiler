@@ -38,6 +38,33 @@ expect_error("'unique' on field 'FH.p': a function pointer or closure does not o
     struct FH { unique function<int(int)>* p = nullptr; };
 }
 
+// The same fat-closure pointer reaching the compiler as a GENERIC TYPE ARGUMENT. Generic
+// substitution does not route through ParseDeclarationSpecifiers, so the declarator guard above
+// cannot see it; ResolveTypeArgEntry carries the '*' and rejects the fat case there instead.
+// Thin 'function<T>*' as a generic argument is SUPPORTED - see Test/test_function_ptr.cb.
+expect_error("pointer '*' is not supported on closure type 'Lambda<int(int)>'; pass the closure by value or use a fixed size 'Lambda<int(int)>[N]' instead") {
+    struct LavBoxDirect<T> { T item = default; };
+    LavBoxDirect<Lambda<int(int)>*> lavDirect = default;
+}
+
+// The function-type-ALIAS arm of the same resolver: 'using' names the closure, so the rejection
+// has to reach it through functionTypeAliases rather than the functionPointerSpecifier branch.
+expect_error("pointer '*' is not supported on closure type 'LavAlias'; pass the closure by value or use a fixed size 'LavAlias[N]' instead") {
+    using LavAlias = Lambda<int(int)>;
+    struct LavBoxAlias<T> { T item = default; };
+    LavBoxAlias<LavAlias*> lavAlias = default;
+}
+
+// The SUBSTITUTION arm: the '*' is written on a type PARAMETER, so by the time it is resolved the
+// argument is already an encoded closure name and neither arm above can see it. This spelling
+// SIGSEGV'd the compiler (exit with no diagnostic) before the encoded-name funnel got the guard;
+// the message names the closure rebuilt from the registered signature.
+expect_error("pointer '*' is not supported on closure type 'Lambda<int(int)>'; pass the closure by value or use a fixed size 'Lambda<int(int)>[N]' instead") {
+    struct LavBoxSubst<T> { T item = default; };
+    struct LavOuter<T> { LavBoxSubst<T*> inner = default; };
+    LavOuter<Lambda<int(int)>> lavSubst = default;
+}
+
 extern int main()
 {
     return 0;

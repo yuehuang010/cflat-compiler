@@ -3808,11 +3808,16 @@ private:
         else if (typeSpec && typeSpec->functionPointerSpecifier())
         {
             // Closure type as a generic argument (gap a): encode to a symbol-safe name and register
-            // the call descriptor + backing value type. The encoded name never carries a pointer/
-            // array-view suffix (a closure arg is a value), so return it directly.
+            // the call descriptor + backing value type. A trailing '*' is carried through as a
+            // pointer suffix for the THIN spelling only (see RejectFatClosurePointerArg).
+            auto* fpSpec = typeSpec->functionPointerSpecifier();
             if (isUnique)
                 LogErrorContext(entry, "unique requires a pointer or interface type");
-            return EncodeClosureCodegen(typeSpec->functionPointerSpecifier());
+            std::string encodedArg = EncodeClosureCodegen(fpSpec);
+            if (!hasPointer)
+                return encodedArg;
+            RejectFatClosurePointerArg(entry, fpSpec->Function() != nullptr, typeSpec->getText());
+            return encodedArg + "*";
         }
         else
         {
@@ -3834,13 +3839,17 @@ private:
             }
             // A function-type alias (using IntFn = Lambda<int(int)>) used as a generic arg resolves
             // to the SAME encoded closure type as the direct spelling (canonicalization / gap a).
-            if (!hasPointer && !hasArrayView)
+            if (!hasArrayView)
                 if (auto fit = Compiler(entry)->functionTypeAliases.find(resolved);
                     fit != Compiler(entry)->functionTypeAliases.end())
                 {
                     if (isUnique)
                         LogErrorContext(entry, "unique requires a pointer or interface type");
-                    return EncodeClosureFromSig(Compiler(entry), fit->second);
+                    std::string encodedAlias = EncodeClosureFromSig(Compiler(entry), fit->second);
+                    if (!hasPointer)
+                        return encodedAlias;
+                    RejectFatClosurePointerArg(entry, fit->second.IsThinFnPtr(), resolved);
+                    return encodedAlias + "*";
                 }
             // Resolve the ARGUMENT the way the template BASE is resolved. A SUBSTITUTED argument
             // is already resolved in the CALLER's scope - re-resolving rebinds it to this one.
@@ -3857,6 +3866,9 @@ private:
         {
             if (Compiler(entry)->IsInterfaceType(resolved))
                 LogErrorContext(entry, std::format("pointer '*' is not allowed on interface type '{}'", resolved));
+            // A type parameter already BOUND to a closure reaches here as an encoded name, so the
+            // two closure branches above cannot see it; reject the fat case at this funnel too.
+            RejectFatEncodedClosurePointerArg(entry, uniqueBase);
             resolved += "*";
         }
         // D1: unique is only meaningful on a pointer or interface type; carry it as a leading
@@ -3958,6 +3970,63 @@ private:
         if (key != name) return key;                              // qualified by the walk
         if (name.find('.') != std::string::npos) return name;      // already qualified
         return c->GetCurrentNamespace().empty() ? name : "";       // global scope is unambiguous
+    }
+
+    // A generic type argument `Lambda<...>*` is the substitution-path twin of the declarator guard
+    // in ParseDeclarationSpecifiers: a fat closure is a by-value struct with no working
+    // pointer lowering. The THIN `function<...>*` spelling is a real machine pointer and is kept.
+    void RejectFatClosurePointerArg(antlr4::ParserRuleContext* ctx, bool isThin,
+                                    const std::string& spelling)
+    {
+        if (isThin) return;
+        LogErrorContext(ctx, std::format(
+            "pointer '*' is not supported on closure type '{}'; "
+            "pass the closure by value or use a fixed size '{}[N]' instead",
+            spelling, spelling));
+    }
+
+    /*
+     * Rebuild a readable source spelling ("Lambda<int(int)>") from a registered encoded closure
+     * name, so a diagnostic raised on the substitution path can name the closure the way it was
+     * written rather than the mangled symbol. A signature component that is itself a generic
+     * instantiation arrives mangled ("list__i32"), so each one goes through
+     * DisplayNameOfMangledType - and if ANY component is not provably writable source, the whole
+     * spelling falls back to the raw encoded name rather than emitting a half-demangled hybrid
+     * ("Lambda<int(list__list__i32*)>") that names no type the user can write.
+     */
+    static std::string ClosureArgSpelling(LLVMBackend* compiler, const std::string& encodedName)
+    {
+        const auto* sig = compiler->GetEncodedClosureType(encodedName);
+        if (sig == nullptr) return encodedName;
+        bool allWritable = true;
+        auto comp = [&](const std::string& n, bool ptr, int depth) {
+            bool writable = true;
+            std::string shown = compiler->DisplayNameOfMangledType(n, &writable);
+            if (!writable) allWritable = false;
+            return shown + std::string(ptr ? (depth > 0 ? depth : 1) : 0, '*');
+        };
+        std::string s = sig->IsThinFnPtr() ? "function<" : "Lambda<";
+        s += comp(sig->FuncPtrReturnTypeName, sig->FuncPtrReturnPointer, sig->FuncPtrReturnPointerDepth);
+        s += "(";
+        for (size_t i = 0; i < sig->FuncPtrParams.size(); i++)
+        {
+            if (i != 0) s += ", ";
+            s += comp(sig->FuncPtrParams[i].TypeName, sig->FuncPtrParams[i].Pointer,
+                      sig->FuncPtrParams[i].PointerDepth);
+        }
+        s += ")>";
+        return allWritable ? s : encodedName;
+    }
+
+    // Substitution-path twin of RejectFatClosurePointerArg: fires only when `baseName` is a
+    // REGISTERED FAT closure type, so every non-closure type argument is left untouched.
+    void RejectFatEncodedClosurePointerArg(antlr4::ParserRuleContext* ctx, const std::string& baseName)
+    {
+        auto* c = Compiler(ctx);
+        const auto* sig = c->GetEncodedClosureType(baseName);
+        bool isFat = (sig != nullptr && !sig->IsThinFnPtr()) || baseName == "__closure_fat_ptr";
+        if (!isFat) return;
+        RejectFatClosurePointerArg(ctx, false, ClosureArgSpelling(c, baseName));
     }
 
     // Encode a closure type (Lambda<...>/function<...>) that appears as a generic argument or in a

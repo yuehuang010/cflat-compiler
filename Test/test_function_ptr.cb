@@ -2854,6 +2854,80 @@ class GfpHolder
     int probe() { function<int(int)> g = gfpMk<int>(1); return k + g(5); }
 };
 
+// A THIN `function<T>*` used as a GENERIC TYPE ARGUMENT. Generic substitution used to DROP the
+// declarator's '*', so the element type came out as the encoded closure VALUE and every store of
+// an address into it was rejected as "cannot store a pointer value into struct storage".
+struct TgpBox<T> { T item = default; };
+// Separate template so its body is only instantiated for the callable-pointer element.
+struct TgpCaller<T> { T item = default;
+    int use(int v) { return (*item)(v); } };
+struct TgpOuter<T> { TgpBox<T*> inner = default; };
+using TgpAlias = function<int(int)>;
+namespace TgpNs { struct Box<T> { T item = default; }; }
+
+bool testThinFuncPtrGenericArg()
+{
+    bool result = true;
+
+    // Store an address into the generic field, then call THROUGH it. Pre-fix the dropped '*' made
+    // the field the encoded closure VALUE, so this store was rejected as "into struct storage".
+    function<int(int)> g = doubleIt;
+    TgpBox<function<int(int)>*> b = default;
+    b.item = &g;
+    result &= Test("tgp_box_call",   (*b.item)(6), 12);
+    TgpCaller<function<int(int)>*> c = default;
+    c.item = &g;
+    result &= Test("tgp_box_method", c.use(6),     12);
+
+    // Reseat the borrowed target: the field must be a real pointer slot, so pointing it at a
+    // different function<> changes the answer (square gives 36, not 12).
+    function<int(int)> g2 = square;
+    b.item = &g2;
+    result &= Test("tgp_box_reseat", (*b.item)(6), 36);
+
+    // A local of the pointee type read back out of the generic field.
+    b.item = &g;
+    function<int(int)>* p = b.item;
+    result &= Test("tgp_box_load",   (*p)(6), 12);
+
+    // Nested generic: the pointer argument is resolved by the recursive inner-generic arm.
+    TgpBox<TgpBox<function<int(int)>*>> nested = default;
+    nested.item.item = &g;
+    result &= Test("tgp_nested",     (*nested.item.item)(6), 12);
+
+    // The pointer reaches Box<T*> only after T is SUBSTITUTED - the encoded-name funnel, a
+    // different arm from the spellings above. This one already worked pre-fix: it is here as a
+    // must-still-work leg, because that funnel is where the FAT rejection was added.
+    TgpOuter<function<int(int)>> o = default;
+    o.inner.item = &g;
+    result &= Test("tgp_subst",      (*o.inner.item)(6), 12);
+
+    // Function-type ALIAS spelling of the same argument (the functionTypeAliases arm).
+    TgpBox<TgpAlias*> ab = default;
+    ab.item = &g;
+    result &= Test("tgp_alias",      (*ab.item)(6), 12);
+
+    // Namespace-qualified template, and a double pointer.
+    TgpNs.Box<function<int(int)>*> nb = default;
+    nb.item = &g;
+    result &= Test("tgp_namespace",  (*nb.item)(6), 12);
+    function<int(int)>* pp = &g;
+    TgpBox<function<int(int)>**> db = default;
+    db.item = &pp;
+    result &= Test("tgp_double_ptr", (**db.item)(6), 12);
+
+    // A container instantiated on the pointer element.
+    list<function<int(int)>*> l;
+    l.add(&g);
+    l.add(&g2);
+    function<int(int)>* e0 = l.get(0);
+    function<int(int)>* e1 = l.get(1);
+    result &= Test("tgp_list_0",     (*e0)(6), 12);
+    result &= Test("tgp_list_1",     (*e1)(6), 36);
+
+    return result;
+}
+
 bool testGenericFuncPtrProducer()
 {
     bool result = true;
@@ -3021,6 +3095,10 @@ extern int main()
 
     // A GENERIC function returning function<>/Lambda<> must not poison its CALLER's return
     total++; passed += testGenericFuncPtrProducer()        ? 1 : 0;
+
+    // A THIN 'function<T>*' as a GENERIC TYPE ARGUMENT (the fat twin is rejected in
+    // Test/errors/err_lambda_array_view.cb)
+    total++; passed += testThinFuncPtrGenericArg()         ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

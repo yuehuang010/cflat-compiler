@@ -233,14 +233,17 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. Split into [`p1/codegen/`](p1/codegen/) (15) and [`p1/crash/`](p1/crash/) (6). | 21 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 29 |
-| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 32 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. Split into [`p1/codegen/`](p1/codegen/) (15) and [`p1/crash/`](p1/crash/) (3). | 18 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 34 |
+| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 34 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
-Counts re-verified from disk on 2026-08-01 (`ls internal/issue/p{1,2,3}/*.md ui/*.md | wc -l` per
-bucket) on the MERGED tree, after both of this round's P1 fixes landed:
-**11 P1 / 33 P2 / 24 P3 / 7 UI = 75 total**, up from the 73 recorded 2026-07-31.
+Counts re-verified from disk on 2026-08-05 (`ls internal/issue/p1/*/*.md internal/issue/p{2,3}/*.md
+internal/issue/ui/*.md | wc -l` per bucket) on the `fix/lamptr-generic` tree:
+**18 P1 (15 codegen / 3 crash) / 34 P2 / 34 P3 / 7 UI = 93 total**. The table above had drifted
+badly - it still read 21 P1 / 29 P2 / 32 P3, and the P1-crash figure of 6 was already wrong on
+`4c06cce`, where disk held 4. Recount with `ls` before quoting these; the prose figures below are
+a dated snapshot of an earlier round and are deliberately left as written.
 
 Net movement: two P1s fixed and their files deleted (`funcptr-call-result-into-closure-param-garbage`,
 `unique-field-to-field-copy-double-frees`), and four new issues filed - three P1
@@ -508,7 +511,6 @@ produce a program.
 | Issue | Family | Severity |
 |---|---|---|
 | [[generic-wrapper-over-function-type-llvm-fatal]] | feature gap | `Box<function<int(int)>>` raises LLVM fatal `Cannot select: AArch64ISD::CALL` (exit 134) when the substituted field is INVOKED. Store-only may be fine - check that first. Borderline P1 (dies with no usable diagnostic); filed P2 because nothing lies to you. Filed 2026-07-31. |
-| [[lambda-pointer-as-generic-type-arg-bypasses-guard]] | diagnostic | Hard compile failure with no source diagnostic - raw module-verifier dump. `Lambda<T>*` as a generic type argument (`Box<Lambda<int(int)>*>`) bypasses the declarator guard that already rejects this shape elsewhere. `function<T>*` as a generic type argument fails identically but should be SUPPORTED, not rejected - the two halves want opposite outcomes. Filed 2026-07-31. |
 | [[list-of-function-element-into-closure-param-fails-verifier]] | diagnostic | Hard compile failure with no source diagnostic - raw module-verifier dump. Passing a `list<function<>>` element to a closure parameter fails; building the list and invoking the element directly both work. Likely shares a root with [[generic-wrapper-over-function-type-llvm-fatal]]. Filed 2026-07-31. |
 | [[chained-nullcoalesce-not-boxed-into-interface]] | false rejection | `take(z ?? y ?? a)` and `IShape j = z ?? y ?? a;` do not compile - the outer join's arm is the inner join's LOAD, which names no class. Spans EVERY position that boxes a `??` (decl-init, assignment, return, argument), so it predates the return/argument work. Fix at the ledger by splicing a nested join's arms. Filed 2026-07-31. |
 
@@ -566,6 +568,8 @@ deleted 2026-08-05), which closed the four decidable spellings and named this on
 | [[simd-type-spelling-unusable-outside-declarations]] | feature gap | `simd<T,N>` is recognised only in `ParseDeclarationSpecifiers` and as a `primaryExpression`, so a cast target, a lambda parameter and a tuple/`function<>` signature component all say "unknown type 'simd<float,4>'", and `simd<T,N>[]` silently DROPS the empty bracket and compiles as a plain vector local. Measured identical on `904f026` and `fix/simdptr`. Wants one encoded-name mechanism (mirroring `BuildEncodedClosureName`), not four patches. Filed 2026-08-03. |
 | [[c-binder-misses-decorated-function-pointer-parameter]] | false rejection | A `const`-qualified C function-pointer parameter binds as `void*`, and the code-value gate then rejects the legal call. Found 2026-08-03 verifying the `void*` oracle for `fix/funcptr-rebind`; the file's first filing named the wrong qualifier and repro - the correction inside is the useful part. Had no row here until 2026-08-04. |
 | [[double-pointer-arg-binds-single-pointer-param]] | silent wrong value | `byPtr(pp)` with a `Circle**` and a `Circle*` parameter compiles, links and RUNS, returning the low bytes of the pointee address instead of the field (`2003` expected; the exit code is the pointee ADDRESS's low bytes, so it is ENVIRONMENT-dependent - the same binary gives 176 and 224 from two different output directories - and a change in it is NOT a change in behaviour). Opaque pointers make both sides one LLVM type, so unlike its `T*`-into-`T` sibling there is nothing for the module verifier to catch. Same predicate (`IsTypeMatch`), depth axis instead of the pointer-ness axis; held out of `fix/ptrarg-byval` because an `ElemPointer` rejection would reject programs that compile and run today, whereas that fix rejected a shape no compiling program can contain. Filed 2026-08-05 by `fix/ptrarg-byval`. |
+| [[closure-by-value-into-generic-struct-field]] | feature gap | `Box<function<T>> b; b.item = g;` is rejected with "cannot store a pointer value into struct storage - a fixed array is not assignable from a pointer" on a program containing no fixed array. A THIN encoded closure gets a `{ i8* }` STRUCT backing type (`LLVMBackend.h:5049`) while a `function<>` VALUE is a bare `ptr`, so the field store sees a pointer going into struct storage; `list<function<T>>` avoids it by entering through a parameter. Carries a second cell: a lambda LITERAL into a fat generic field (`Box<Lambda<int(int)>> b; b.item = (int x) => x + 1;`) is an UNLOCATED verifier dump, while the same lambda through a named local works and the same literal into a NON-generic field works. Both measured identical on `4c06cce` and on the merged `fix/lamptr-generic` - a by-value root, not the pointer-depth one that branch fixed, and the reason its accept-set could freeze "by value keeps working" for `Lambda<T>` but not `function<T>`. Filed 2026-08-05 by `fix/lamptr-generic`. |
+| [[closure-type-argument-to-a-generic-function]] | feature gap | A closure type as a generic FUNCTION's type argument does not resolve, in either spelling: explicit `idf<function<int(int)>>(g)` gives `unknown type 'function<int(int)>'` reported on the TEMPLATE's parameter list, and inferred `idf(g)` mangles the argument from its LLVM repr and instantiates `idf__i8`. The generic STRUCT path funnels through `ResolveTypeArgEntry` and works (`Box<Lambda<...>>`, `list<function<...>>`, and after `fix/lamptr-generic` also `Box<function<T>*>`); this path appears not to, so the fat/thin pointer asymmetry that landed there does not reach it. Non-closure control `idf<int*>(&n)` works on both binaries. Measured identical on `4c06cce` and on the merged `fix/lamptr-generic`. Filed 2026-08-05 by `fix/lamptr-generic`. |
 
 ### P3 - diagnostics, latent, deliberate deferrals (`p3/`)
 
@@ -603,6 +607,8 @@ deleted 2026-08-05), which closed the four decidable spellings and named this on
 | [[nondeterministic-ir-switch-case-order]] | methodology | No miscompile - a METHODOLOGY hazard. Read it before using "0 IR diffs" as proof. |
 | [[iface-namespace-follow-ups]] | follow-up | Items 2-6 of the round-1 review of `c9acb6c`. Item 1 is RESOLVED (`853cb87`); items 4 and 5 were fixed by `15809e0`. Item 5's remainder (annotation/template key split) is reachable only on the Windows `[uuid]` / `[winrt]` path. |
 | [[global-struct-no-initializer-ignores-field-defaults]] | miscompile | A global struct with NO initializer at all zeroes instead of honoring its fields' own `= default` expressions (`struct S { int a = 9; }; S gs;` reads `0`, not `9`). The LOCAL declarator handles this correctly (calls the default constructor). Lower severity than the sibling P1/P2 findings in this family because a working spelling exists. Found while reviewing the fix for `global-struct-positional-init-silently-zeroes` (FIXED and deleted - see the `fix/global-positional` landed record below). Filed 2026-08-02. |
+| [[closure-arg-suffixes-unvalidated-in-signature-position]] | diagnostic | Two missing rejections left deliberately open by `fix/lamptr-generic`, both measured identical on `4c06cce` and on the merged branch. (1) The `[]` suffix on a closure generic type argument is unvalidated - `Box<Lambda<int(int)>[]>` compiles, though the DECLARATOR spelling is rejected by `err_lambda_array_view.cb`'s first leg; it is the structural twin of the pointer bug one suffix over, in the same branch that returned before the suffix was applied. (2) A fat closure POINTER inside a closure SIGNATURE (`Box<Lambda<int(Lambda<int(int)>*)>>`) is accepted by `ResolveSigComponentCodegen` - a THIRD site, distinct from the declarator guard and the type-argument funnel. Neither is reachable to a store or a call today (the lambda literal that would exercise (2) fails with `unknown type`), so neither was rejected: the standing rule is that a site added to a reject must be shown broken from the `--no-opt` IR first. Filed 2026-08-05 by `fix/lamptr-generic`. |
+| [[unique-on-closure-arg-message-denies-the-pointer]] | diagnostic | `RBox<unique TA*>` (and the direct `RBox<unique function<int(int)>*>`) is rejected with `unique requires a pointer or interface type` - factually false, since `TA*` IS a pointer. The REJECTION is correct (a closure owns no allocation) and the declarator path already words it correctly ("a function pointer or closure does not own an allocation"); only these two type-argument arms disagree. The DIRECT arm measures identical on `4c06cce` and on the merged `fix/lamptr-generic`; the ALIAS arm's message is newly REACHABLE there (that branch re-gated the arm from `!hasPointer` to `!hasArrayView`) with the wording itself unchanged - exposure, not regression. Fix both arms together and reuse the declarator wording. Filed 2026-08-05 by the round-1 review of `fix/lamptr-generic`. |
 
 ### UI and Win32 (`ui/`)
 
@@ -4523,3 +4529,219 @@ binary too and are labelled accept-set in the file - `gfp_encl_nongeneric`, `gfp
 there to prove the fix breaks nothing, not to discriminate. The other 17 fail on the pre-fix binary
 for the reason each one's comment states. `test.sh Release`: 600 passed, 0 failed, 8 skipped.
 `example_mac.sh Release`: 35 passed, 0 failed.
+
+## Landed: `fix/lamptr-generic` (2026-08-05) - a closure POINTER as a generic type argument: fat rejected, thin supported
+
+Closes [[lambda-pointer-as-generic-type-arg-bypasses-guard]] (P1/crash). The asymmetric outcome
+the issue file called for is the one that landed: a FAT `Lambda<T>*` generic type argument is
+rejected with the declarator guard's own wording, and a THIN `function<T>*` generic type argument
+compiles, links and calls through correctly.
+
+### The filed repro had DRIFTED - re-measured before any fix
+
+The issue file (filed against `8c29ca7`) recorded both spellings dying in an unlocated LLVM
+module-verifier dump. On master `4c06cce` neither does. Measured on a Release binary built from
+`4c06cce` in a detached worktree:
+
+| Spelling | Filed (`8c29ca7`) | Measured on `4c06cce` |
+|---|---|---|
+| `Box<Lambda<int(int)>*> b; b.item = &f;` | `Error: module verification failed.`, unlocated, exit 1 | `(6,4): cannot store a pointer value into struct storage - a fixed array is not assignable from a pointer ...`, LOCATED, exit 1 |
+| `Box<function<int(int)>*> b; b.item = &g;` | same verifier dump | same fixed-array message, LOCATED, exit 1 |
+
+So the recorded severity ("no source diagnostic") was stale. What survived was the real defect
+underneath: a MISLEADING diagnostic naming a fixed array where the source contains none. The
+severity category still justified P1 - see the crash cell found in Phase A below, which really did
+die with no diagnostic.
+
+### Root cause
+
+`MainListener::ResolveTypeArgEntry` is the generic type-argument funnel. Its
+`functionPointerSpecifier` branch encoded the closure and `return`ed immediately, on the stated
+reasoning that "a closure arg is a value", so the entry's `pointer()` was never consulted and the
+`*` was silently DROPPED. `Box<Lambda<int(int)>*>` and `Box<Lambda<int(int)>>` resolved to the
+same instantiation.
+
+That explains the misleading store diagnostic too. With the pointer dropped, the field's type is
+the encoded closure's backing VALUE type - a struct (`__closure_fat_ptr` for fat, a `{ i8* }`
+wrapper for thin, `LLVMBackend.h:5049`). `b.item = &f` is then a pointer going into struct
+storage, and the store gate reports the fixed-array case of that message. Nothing in the program
+is a fixed array; the diagnostic was true of the LOWERED type and false of the source.
+
+The `ForwardRefScanner` twin (`ResolveForwardTypeArg`) already appended `"*"` after its closure
+branch, so the two passes disagreed on the instantiation name (`Box____thinfn_..._ptr` vs
+`Box____thinfn_...`). The fix makes them agree.
+
+### What changed (`cflat/MainListener.h`, 3 sites, all in `ResolveTypeArgEntry`)
+
+1. **`functionPointerSpecifier` branch** - the direct `Lambda<...>*` / `function<...>*` spelling.
+   Encode as before, then reject the fat case and append `"*"` for the thin one.
+2. **`functionTypeAliases` branch** - the `using FA = Lambda<int(int)>; Box<FA*>` spelling. The
+   arm was gated `if (!hasPointer && !hasArrayView)`, so a pointer fell past it into ordinary name
+   resolution and produced `unknown type 'FA'`. Re-gated to `if (!hasArrayView)` with the same
+   two outcomes. The message names the ALIAS (`'FA'`), matching the declarator guard's existing
+   alias leg.
+3. **The pointer-suffix funnel** - `RejectFatEncodedClosurePointerArg`, next to the existing
+   interface-pointer rejection. A type parameter already BOUND to a closure arrives as an encoded
+   name, so neither branch above can see it.
+
+Two helpers were added: `RejectFatClosurePointerArg` (the shared message) and
+`ClosureArgSpelling`, which rebuilds `Lambda<int(int)>` from the registered signature so the
+funnel's diagnostic names the closure rather than `__fatfn_1_3_i32_3_i32`.
+
+**`ClosureArgSpelling` is all-or-nothing about writability.** A signature component that is itself
+a generic instantiation arrives mangled, so each one goes through the existing
+`DisplayNameOfMangledType` / `MangledGenericNameIsAmbiguous` pair rather than a second demangler.
+If ANY component comes back not-provably-writable, the whole spelling falls back to the raw
+encoded name. Measured, on a `Box<T*>` over `Outer<Lambda<int(list<int>*)>>`:
+
+| Signature component | Before this rule | After |
+|---|---|---|
+| `list<int>*` (unambiguous) | `Lambda<int(list__i32*)>` | `Lambda<int(list<i32>*)>` |
+| `list<list<int>>*` (ambiguous - nested) | `Lambda<int(list__list__i32*)>` | `__fatfn_1_3_i32_18_list__list__i32ptr` |
+
+The first is real source: `XBoxW<Lambda<int(list<i32>*)>> b = default;` compiles and runs. The
+second is deliberately ugly - a nested instantiation cannot be rendered from the flat mangled
+string (`Box__Box__i32` would come out `Box<Box, i32>`, which names no type), so the raw name is
+the honest answer and a half-demangled hybrid would be worse than either. This is the one place
+the diagnostic quotes a mangled symbol, and it is bounded to closures whose signature contains a
+NESTED generic.
+
+**Guard polarity, per site.** Nothing is rejected without proof of FAT. Sites 1 and 2 are inside
+branches that only a closure reaches, where "not thin" IS fat (a `functionPointerSpecifier` is
+either `function` or `Lambda`). Site 3 is the one that sees every type argument in the language,
+and it fires only when the base name is a REGISTERED fat encoded closure (or literally
+`__closure_fat_ptr`); every other pointer type argument - `int*`, `Circle*`, interfaces, nested
+generics, thin closures - returns before the message is built.
+
+**No `--init` round-trip change.** No field was added to `TypeAndValue` / `StructData` /
+`AnnotationValue`. The mangled name DOES change for `Box<function<T>*>`, but only for a spelling
+that did not compile before, and no file under `cflat/core/` uses a closure pointer as a generic
+type argument (grepped), so no cached core symbol moves.
+
+**`ParseDeclarationSpecifiers` was NOT touched**, so the both-copies rule does not apply to this
+diff. The declarator guard it already carries is unchanged and still fires for direct declarators
+(`Lambda<int(int)>* p = &f;` -> same message, both binaries).
+
+### Phase A coverage matrix - every cell measured on BOTH binaries
+
+PRE is a Release build of `4c06cce`; POST is the branch. `12` is `doubleIt(6)`, `6` is the fat
+closure `f(5)`, `36` is `square(6)`.
+
+**Fat `Lambda<T>*` - REJECT (all now the guard message, located):**
+
+| Cell | PRE | POST |
+|---|---|---|
+| `Box<Lambda<T>*>` declare only | compiles + RUNS (pointer silently dropped) | guard message |
+| `Box<Lambda<T>*>` store `&f` | fixed-array message | guard message |
+| `Box<Lambda<T>*>` load / call-through | fixed-array message | guard message |
+| `Box<Box<Lambda<T>*>>` nested | fixed-array message | guard message |
+| `list<Lambda<T>*>` | fixed-array message | guard message |
+| `using FA = Lambda<T>; Box<FA*>` | `unknown type 'FA'` | guard message naming `'FA'` |
+| `Outer<Lambda<T>>` over `Box<T*>`, declare only | compiles + RUNS | guard message |
+| `Outer<Lambda<T>>` over `Box<T*>`, store + call | **compiler SIGSEGV, exit 139, no diagnostic** | guard message |
+
+The substitution cell is the one that justified the P1 severity on its own merits, and it was
+never in the issue file. It is pre-existing: measured 139 on the `4c06cce` binary, not introduced
+by this branch.
+
+**Thin `function<T>*` - SUPPORT (all now compile and run):**
+
+| Cell | PRE | POST |
+|---|---|---|
+| `Box<function<T>*>` store `&g` | fixed-array message | compiles |
+| `Box<function<T>*>` load into `function<T>*` | fixed-array message | `12` |
+| `Box<function<T>*>` call `(*b.item)(6)` | fixed-array message | `12` |
+| generic METHOD `int use(int v) { return (*item)(v); }` | fixed-array message | `12` |
+| `Box<Box<function<T>*>>` nested | fixed-array message | `12` |
+| `list<function<T>*>` + `get(0)` | `cannot assign a struct value to a pointer variable` | `12` |
+| `using TA = function<T>; Box<TA*>` | `unknown type 'TA'` | `12` |
+| `N.Box<function<T>*>` namespaced | fixed-array message | `12` |
+| `Box<function<T>**>` double pointer | fixed-array message | `12` |
+| `Outer<function<T>>` over `Box<T*>` | `12` (already worked) | `12` |
+
+The thin lowering was verified from `--no-opt` IR, not from the value alone: the field is a real
+`ptr` slot (`store ptr %g, ptr %1`) and the call loads through it
+(`%7 = load ptr, ptr %5` / `call i32 %7(i32 6)`). It is a genuine store-through, not a fold.
+
+**Accept-set, frozen BEFORE the guard was written - unchanged PRE and POST:**
+
+| Cell | PRE | POST |
+|---|---|---|
+| `Box<Lambda<T>> b; b.item = f;` (fat by value) | `6` | `6` |
+| `Lambda<int(int)>[2] arr;` (fixed array) | `6` | `6` |
+| `function<int(int)>[2] arr;` | `12` | `12` |
+| `function<int(int)>* p = &g;` (direct declarator) | `12` | `12` |
+| `list<function<int(int)>>` by value | `12` | `12` |
+| plain struct field `function<T>` / `function<T>*` / `Lambda<T>` literal | `12` / `12` / `6` | same |
+| `idf<int*>(&n)` (non-closure generic ptr arg) | `7` | `7` |
+| `Lambda<int(int)>* p` declarator | guard message | guard message |
+| `Box<Lambda<T>[]>` / `Box<function<T>[]>` declare only | compiles | compiles |
+
+### Differential corpus sweep
+
+Compile AND run every `.cb` under `Test/` and `example/` (447 files) with both binaries. The PRE
+side was run TWICE first to identify nondeterminism before comparing PRE to POST: 8 files differ
+PRE-vs-PRE (timings, addresses, thread-scheduling counts) and were excluded. Comparing PRE to
+POST over the remaining 439 gives **exactly 2 differences, both the intended new test legs** -
+`Test/errors/err_lambda_array_view.cb` (its three new legs now pass) and
+`Test/test_function_ptr.cb` (`unknown type 'TgpAlias'` -> `71/71 passed`). Those two are also
+what proves the comparison is not vacuous. Harness and verbatim outputs are in the branch's
+`scratch/` (`sweep.sh`, `sweep_pre*.txt`, `sweep_post.txt`); the diff normalizes the worktree
+path and the harness's own temp-exe name out, which otherwise show up as differences in the
+"imported file not found (searched ...)" rows for the 29 Windows-only files.
+
+A note on the harness, because the first version was wrong: exit status was being read from a
+`grep` at the end of a pipe rather than from the compiler, which made every row's status
+meaningless. The corrected version redirects to a file and reads `$?` directly. This is the
+mistake `fix-issue-lessons.md` already records under the corpus sweep; it happened again.
+
+Weighting, per the standing rule: this change ADDS a rejection, so the sweep is the weaker half
+of the evidence - no corpus file writes a closure pointer as a generic type argument, so the
+sweep structurally cannot see the new rule at all. The strong half is the targeted accept-set
+above, which deliberately crosses every fat/thin, direct/alias/substitution boundary the new rule
+could confuse.
+
+### Coverage landed
+
+- `Test/errors/err_lambda_array_view.cb` gains THREE legs, one per resolver arm: direct spelling,
+  `using` alias, and substitution. Each was mutation-tested individually against the `4c06cce`
+  binary and fails there for a DIFFERENT stated reason - `unknown type
+  'LavBoxDirect____fatfn_1_3_i32_3_i32'`, `unknown type 'LavAlias'`, and "did not occur"
+  (the SIGSEGV cell) respectively - which is what proves the three legs reach three different
+  arms rather than one shared one.
+- `Test/test_function_ptr.cb` gains `testThinFuncPtrGenericArg()` - 11 value legs (`tgp_*`)
+  across the direct, method, reseat, load, nested, substitution, alias, namespace, double-pointer
+  and container spellings. The reseat leg (`&g` -> `&g2`, `12` -> `36`) is the one that proves the
+  field is a pointer SLOT and not a copied value. `tgp_subst` already passed on the pre-fix binary
+  and is labelled in the file as a must-still-work leg, not a discriminator - it is there because
+  that funnel is where the fat rejection was added.
+
+`test.sh Release`: 600 passed, 0 failed, 8 skipped. `example_mac.sh Release`: 35 passed, 0 failed.
+`test_lsp.sh Release`: 152 passed, 0 failed.
+
+### Diagnosed and deliberately NOT fixed here
+
+Four files filed in this commit. The first three are measured identical on both binaries; the
+fourth is a wording defect the branch EXPOSES on one of two arms without changing the wording:
+
+- [[closure-by-value-into-generic-struct-field]] (P2). `Box<function<T>> b; b.item = g;` is
+  rejected with the same misleading fixed-array message - a BY-VALUE root (the thin encoded
+  closure's `{ i8* }` backing type vs a bare `ptr` value), not a pointer-depth one. Also carries
+  the lambda-LITERAL-into-a-generic-field cell, which is an unlocated verifier dump. This is why
+  the accept-set could freeze "by value must keep working" for `Lambda<T>` but not `function<T>`.
+- [[closure-type-argument-to-a-generic-function]] (P2). A closure type argument to a generic
+  FUNCTION does not resolve, explicitly (`unknown type 'function<int(int)>'`) or by inference
+  (mangles to `idf__i8`). The generic-STRUCT path funnels through `ResolveTypeArgEntry`; this one
+  appears not to, so the asymmetry that landed here does not reach it.
+- [[closure-arg-suffixes-unvalidated-in-signature-position]] (P3). The `[]` suffix on a closure
+  type argument is unvalidated (the structural twin of this bug, one suffix over), and a fat
+  closure pointer inside a closure SIGNATURE is accepted by `ResolveSigComponentCodegen` - a
+  third site. Neither is reachable to a store or a call today, so neither was rejected: the
+  standing rule is that a site added to a reject must be shown broken from the IR first.
+- [[unique-on-closure-arg-message-denies-the-pointer]] (P3). `RBox<unique TA*>` is rejected with
+  `unique requires a pointer or interface type`, which is false - `TA*` is a pointer. The
+  rejection is CORRECT (a closure owns no allocation) and the declarator path already words it
+  right. The direct arm measures identical on both binaries; the ALIAS arm's message is newly
+  reachable here because this commit re-gated that arm, with the wording itself untouched. Left
+  alone deliberately: editing a rejection's text is a different concern from carrying pointer
+  depth, and both arms should change together.
