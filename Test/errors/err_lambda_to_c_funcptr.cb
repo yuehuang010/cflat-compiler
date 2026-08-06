@@ -65,3 +65,33 @@ expect_error("this lambda captured 7 variables [c0, c1, c2, c3, c4, ... (and 2 m
         return a[0];
     }
 }
+
+// The same rule on a GENERIC-substituted THIN field. `Box<function<int(int)>>.item` is the same
+// bare code pointer as a spelled `function<int(int)>` field, so a capturing lambda assigned to it
+// must be refused with the SAME diagnostic rather than silently dropping the env. Pre-fix this
+// shape reported "cannot cast an aggregate value - a fixed array decays to a pointer..." (the
+// generic field had a struct backing), which named neither the capture nor the closure rule.
+expect_error("it captured 1 variable [bias2]") {
+    struct LcfBox<T> { T item = default; };
+
+    void capturingLambdaIntoThinGenericField()
+    {
+        LcfBox<function<int(int)>> b = default;
+        int bias2 = 7;
+        b.item = (int x) => x + bias2;
+    }
+}
+
+// Same rule through the BRACE-INIT spelling, which is a different emission path (EmitOneFieldInit,
+// not the `=` assignment). Pre-fix the brace path applied NO thin/fat conversion at all, so this
+// landed in the module verifier with no source location - on the plain field too. The generic
+// spelling is used here because it is the one the closure-element work touched.
+expect_error("it captured 1 variable [bias3]") {
+    struct LcfBraceBox<T> { T item = default; };
+
+    void capturingLambdaBraceInitIntoThinField()
+    {
+        int bias3 = 7;
+        LcfBraceBox<function<int(int)>> b = { item = (int x) => x + bias3 };
+    }
+}

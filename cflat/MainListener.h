@@ -13567,6 +13567,11 @@ public:
             // Thread expected function-pointer type into lambda RHS (for f = (x) => {...} reassignment)
             if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer)
                 lambdaExpectedType = namedVar.TypeAndValue;
+            // A generic-substituted closure field carries an ENCODED type name, not IsFunctionPointer;
+            // recover its call descriptor so the lambda RHS infers the same return type.
+            else if (operatorText == "=" && !namedVar.TypeAndValue.Pointer)
+                if (const auto* enc = compiler->GetEncodedClosureType(namedVar.TypeAndValue.TypeName))
+                    lambdaExpectedType = *enc;
 
             if (operatorText == "??=")
             {
@@ -13878,6 +13883,33 @@ public:
             {
                 right = compiler->WidenThinToFat(right);
             }
+            // Same two conversions for a GENERIC-SUBSTITUTED closure field, whose type is an
+            // ENCODED name rather than IsFunctionPointer. The destination decides the repr.
+            if (operatorText == "=" && right && !namedVar.TypeAndValue.IsFunctionPointer
+                && !namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsArrayView
+                && namedVar.TypeAndValue.ConstArraySize == 0)
+            {
+                if (const auto* enc = compiler->GetEncodedClosureType(namedVar.TypeAndValue.TypeName))
+                {
+                    if (enc->IsThinFnPtr() && right->getType() == compiler->GetClosureFatPtrType())
+                    {
+                        compiler->UnregisterOwnedClosureTemp(right);
+                        if (compiler->ClosureIsStaticallyNonCapturing(right))
+                            right = compiler->CoerceClosureFatToThin(right, *enc);
+                        else
+                        {
+                            LogErrorContext(ctx, compiler->DescribeCapturingClosureToThin(rightNV.LambdaCaptureNames));
+                            right = llvm::UndefValue::get(compiler->BuildThinFnPtrType(*enc));
+                        }
+                    }
+                    else if (!enc->IsThinFnPtr() && !right->getType()->isStructTy()
+                             && right->getType()->isPointerTy())
+                        right = compiler->WidenToClosureFatChecked(right, rightNV, {},
+                            namedVar.FieldName.empty()
+                                ? std::format("'{}'", namedVar.CallerName)
+                                : std::format("'{}.{}'", namedVar.CallerName, namedVar.FieldName));
+                }
+            }
             // Funcptr-to-funcptr assignment: per-param IsMove flags must agree on both sides.
             if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer
                 && rightNV.TypeAndValue.IsFunctionPointer
@@ -14099,8 +14131,12 @@ public:
 
             // Closure store (Option A): closures are clone-safe, so named-source assignment auto-clones.
             // Old dest env freed for alloca/global only - skipped for struct-field GEP (slot may be uninitialized).
-            if (operatorText == "=" && right && right->getType()->isStructTy()
-                && namedVar.TypeAndValue.TypeName == "__closure_fat_ptr")
+            // Keyed on the REPRESENTATION, not the spelling: a generic-substituted fat field
+            // carries an ENCODED name but is the same `__closure_fat_ptr` struct and owns an env.
+            bool destIsClosureFat = namedVar.TypeAndValue.TypeName == "__closure_fat_ptr"
+                || (!namedVar.TypeAndValue.Pointer
+                    && compiler->IsFatEncodedClosureType(namedVar.TypeAndValue.TypeName));
+            if (operatorText == "=" && right && right->getType()->isStructTy() && destIsClosureFat)
             {
                 right = CloneClosureFromNamedSource(rightNV, right, ctx);
                 // Free the old env when overwriting a KNOWN-INITIALIZED destination slot, so the
@@ -18383,6 +18419,32 @@ public:
         {
             val = CoerceInitValueToInterface(rightNV, val, fieldType.TypeName, errCtx);
         }
+        // Closure destination, spelled OR generic-substituted: the same two conversions the `=`
+        // path applies. Without them a fat lambda literal lands in a thin slot and fails the verifier.
+        else if (!fieldType.Pointer && fieldType.ConstArraySize == 0)
+        {
+            const LLVMBackend::TypeAndValue* clo = fieldType.IsFunctionPointer
+                ? static_cast<const LLVMBackend::TypeAndValue*>(&fieldType)
+                : compiler->GetEncodedClosureType(fieldType.TypeName);
+            if (clo != nullptr && clo->IsThinFnPtr()
+                && val->getType() == compiler->GetClosureFatPtrType())
+            {
+                compiler->UnregisterOwnedClosureTemp(val);
+                if (compiler->ClosureIsStaticallyNonCapturing(val))
+                    val = compiler->CoerceClosureFatToThin(val, *clo);
+                else
+                {
+                    LogErrorContext(errCtx, compiler->DescribeCapturingClosureToThin(rightNV.LambdaCaptureNames));
+                    val = llvm::UndefValue::get(compiler->BuildThinFnPtrType(*clo));
+                }
+            }
+            else if (clo != nullptr && !clo->IsThinFnPtr()
+                     && !val->getType()->isStructTy() && val->getType()->isPointerTy())
+                // Brace-init knows the INSTANTIATION name, which is mangled; render it as source
+                // the user could write, or hand back the raw name when it cannot be rendered.
+                val = compiler->WidenToClosureFatChecked(val, rightNV, {},
+                    std::format("'{}.{}'", compiler->DisplayNameOfMangledType(typeName), fieldName));
+        }
 
         llvm::Value* destination = nullptr;
         if (sd.IsUnion)
@@ -18626,7 +18688,18 @@ public:
                 continue;
             }
 
+            // Thread the target field's closure signature into a lambda RHS so its return type is
+            // inferred as `s.f = (int n) => ...` does. Spelled and ENCODED field types both.
+            for (const auto& field : sd.StructFields)
+            {
+                if (field.VariableName != fieldName) continue;
+                if (field.IsFunctionPointer) lambdaExpectedType = field;
+                else if (const auto* enc = compiler->GetEncodedClosureType(field.TypeName))
+                    lambdaExpectedType = *enc;
+                break;
+            }
             auto rightNV = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
+            lambdaExpectedType = {};
             EmitOneFieldInit(structPtr, sd, typeName, fieldName, rightNV, fi);
         }
     }
@@ -21519,8 +21592,12 @@ public:
                         // auto-deref below still runs (a harmless load) and leaves namedVar as the pointer,
                         // so the arm keys off namedVar; this flag only records that the receiver is a
                         // non-owning pointer so a `unique`/owning pointer keeps its actionable error.
+                        // A thin encoded closure element joins this arm: it is a bare code pointer
+                        // with no struct backing, so its `.copy()` is the same identity copy.
                         if ((tokenType == CFlatParser::Dot || tokenType == CFlatParser::Arrow)
-                            && namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsInterface
+                            && (namedVar.TypeAndValue.Pointer
+                                || Compiler(ctx)->IsThinEncodedClosureType(namedVar.TypeAndValue.TypeName))
+                            && !namedVar.TypeAndValue.IsInterface
                             && !(namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg
                                  || namedVar.IsOwning || namedVar.TypeAndValue.ElementOwningUnique)
                             && NextMemberName(ctx, parseTree) == "copy")
@@ -22229,6 +22306,11 @@ public:
                                 || (namedVar.Primary != nullptr
                                     && namedVar.Primary->getType()->isIntegerTy());
                             if (baseIsIntegerLike && Compiler(ctx)->GetFunction(terminal->getText()))
+                                return true;
+                            // A thin encoded closure element is a bare code pointer with no struct
+                            // backing, so a free function on it (`.copy()`) is the same UFCS call.
+                            if (Compiler(ctx)->IsThinEncodedClosureType(namedVar.TypeAndValue.TypeName)
+                                && Compiler(ctx)->GetFunction(terminal->getText()))
                                 return true;
                             return false;
                         }())
@@ -24191,11 +24273,6 @@ public:
                                 funcPtr = Compiler(ctx)->CreateLoad(namedVar.Storage);
                             else if (namedVar.Primary != nullptr)
                                 funcPtr = namedVar.Primary;
-                            // A thin encoded closure is stored as a { i8* } POD wrapper; unwrap to the
-                            // bare fn ptr the thin CreateIndirectCall path expects.
-                            if (funcPtr != nullptr && encClosure != nullptr && funcPtrTV.IsThinFnPtr()
-                                && funcPtr->getType()->isStructTy())
-                                funcPtr = Compiler(ctx)->builder->CreateExtractValue(funcPtr, { 0u }, "thinfn");
 
                             if (funcPtr != nullptr)
                             {

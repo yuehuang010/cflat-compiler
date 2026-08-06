@@ -483,3 +483,19 @@ The recurring failure mode of this whole family, stated once:
   `u.a[2] = 9`. Removing the false rejection is correct AND re-exposes the crash, so the fix round
   has to carry both. A guard that turns a crash into a hard error looks like progress in the suite
   and is not, if the programs it rejects are correct ones.
+- **The mirror: UNBLOCKING compilation moves a program onto runtime paths a rejection was hiding,
+  and those paths can be keyed on a spelling your fix just changed.** `fix/genfn-lowering` made a
+  lambda literal into a generic-substituted field compile for the first time (it had died in the
+  module verifier), and the program promptly ran onto the `=` path's closure OWNERSHIP-transfer
+  arm - which tested `TypeName == "__closure_fat_ptr"` and therefore skipped the encoded name. The
+  env was freed while the field still pointed at it: wrong value, then SIGSEGV, i.e. a compile-time
+  rejection turned into a miscompile. When a fix newly ADMITS a construct, enumerate the ownership,
+  destructor and lifetime predicates that construct will now reach, and check each for a
+  SPELLING-keyed test that should have been a REPRESENTATION-keyed one. A sibling site getting it
+  right (here `EmitOneFieldInit` keyed on `val->getType() == GetClosureFatPtrType()`) is the tell.
+- **An axis-at-a-time coverage matrix silently drops CROSSES.** The same round's matrix listed
+  "capturing literal" on the operation axis and "fat element" on the type axis, and had no cell
+  where both held - fat literals were probed non-capturing, capturing literals only against thin
+  destinations where they are rejected before any ownership path runs. The miscompile lived exactly
+  in the missing cross. Freezing an accept set per axis is not the same as covering the product;
+  before declaring a matrix complete, name the crosses you are NOT taking and say why.

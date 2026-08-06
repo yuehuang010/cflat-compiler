@@ -233,9 +233,9 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. Split into [`p1/codegen/`](p1/codegen/) (15) and [`p1/crash/`](p1/crash/) (2). | 17 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 38 |
-| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 34 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. Split into [`p1/codegen/`](p1/codegen/) (16) and [`p1/crash/`](p1/crash/) (1). | 17 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 37 |
+| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 35 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
 Counts re-verified from disk on 2026-08-05 (`ls internal/issue/p1/*/*.md internal/issue/p{2,3}/*.md
@@ -248,6 +248,16 @@ above had drifted
 badly - it still read 21 P1 / 29 P2 / 32 P3, and the P1-crash figure of 6 was already wrong on
 `4c06cce`, where disk held 4. Recount with `ls` before quoting these; the prose figures below are
 a dated snapshot of an earlier round and are deliberately left as written.
+
+**Recount 2026-08-05, after `fix/genfn-lowering` rebased onto `fix/chain-coalesce`** (`ls` per
+bucket on that tree, counted not computed):
+**17 P1 (16 codegen / 1 crash) / 37 P2 / 35 P3 / 7 UI = 96 total.** Three files deleted
+(`generic-wrapper-over-function-type-llvm-fatal` and
+`list-of-function-element-into-closure-param-fails-verifier` from `p1/crash/`,
+`closure-by-value-into-generic-struct-field` from `p2/`) and three filed
+([[data-pointer-assigned-to-thin-function-value]] in `p1/codegen/`,
+[[sizeof-generic-over-closure-type-segfaults-compiler]] in `p1/crash/`,
+[[inline-deref-of-container-call-result-has-no-storage]] in `p3/`).
 
 Net movement: two P1s fixed and their files deleted (`funcptr-call-result-into-closure-param-garbage`,
 `unique-field-to-field-copy-double-frees`), and four new issues filed - three P1
@@ -509,20 +519,30 @@ produce a program.
 | [[null-interface-access-remaining-storage-kinds]] | crash at run time | SIGSEGV (139) / SIGTRAP (133) with a clean compile, no diagnostic - the storage kinds the three-stage null-interface widening left open. NOT a regression (identical on `904f026`). Read [`internal/plan/null-interface-access-widening.md`](../plan/null-interface-access-widening.md) first, especially the deliberately-accepted section and the MUST-vs-MAY correction. Filed 2026-08-03; had no row here until 2026-08-04. |
 | [[coalesce-assign-skips-store-bookkeeping]] | ownership | `??=` emits its own compare/branch/store then RETURNS, skipping every piece of post-store bookkeeping the plain `=` path runs (`TransferPointerOwnershipOnStore`, move/unmove marking, element-borrow refresh). Pre-existing; filed 2026-08-04 while fixing the `??=` half of the borrowed-interface-box guard. Had no row here until 2026-08-04. |
 | [[unresolved-generic-preregisters-opaque-shell]] | missed rejection | `int use(ZZZ<int> v) { return 1; }` with `ZZZ` declared NOWHERE compiles, links and runs clean - exit 0. `ForwardRefScanner`'s bare `tryPreDeclare` (`MainListener.h:3034`) creates an opaque struct shell for any `Name<Args>` WITHOUT checking `Name` is a known template; the qualified call one line below IS gated on `IsGenericTemplateKey`. The shell then satisfies the `dataStructures` lookup and suppresses the `unknown type '...'` the non-generic spelling gets. Both-copies divergence - `QueueGenericInstantiation` (`MainListener.h:3894`) does the check correctly. Registration site confirmed by lldb, not by reading. This is the CAUSE of two of the three causes in [[incomplete-layout-message-blames-c-interop]]; fix them together. Fix is gating the bare call, but `certain=false` regions (`if const`, `expect_error`) are not collected and would false-reject. Filed 2026-08-05. |
+| [[data-pointer-assigned-to-thin-function-value]] | memory-unsafe accept | Compiles clean with no diagnostic, then exits **138** (SIGBUS). `function<int(int)> f = default; f = vp;` (a `void*`) and the struct-field twin `s.f = vp;` both store a DATA address into a thin code slot and then CALL it. Measured identical on `8c5a860` and on the merged `fix/genfn-lowering`, and NOT generic-specific - the bare local has it. The `ce9858e` provenance gate covers ARGUMENT positions only, and `fix/codeval-store` answers the opposite question (code into data), so the assignment leg of data-into-thin-code is unguarded. The FAT twin is rejected only by accident (struct storage). Fix direction: run `ArgumentIsProvablyDataPointer` on the assignment RHS for a thin `function<>` destination, accept-set first. Filed 2026-08-05 by `fix/genfn-lowering`. |
 
 #### P1 / crash - dies with no usable diagnostic (`p1/crash/`)
 
 | Issue | Family | Severity |
 |---|---|---|
-| [[generic-wrapper-over-function-type-llvm-fatal]] | feature gap | `Box<function<int(int)>>` raises LLVM fatal `Cannot select: AArch64ISD::CALL` (exit 134) when the substituted field is INVOKED. Store-only may be fine - check that first. Borderline P1 (dies with no usable diagnostic); filed P2 because nothing lies to you. Filed 2026-07-31. |
-| [[list-of-function-element-into-closure-param-fails-verifier]] | diagnostic | Hard compile failure with no source diagnostic - raw module-verifier dump. Passing a `list<function<>>` element to a closure parameter fails; building the list and invoking the element directly both work. Likely shares a root with [[generic-wrapper-over-function-type-llvm-fatal]]. Filed 2026-07-31. |
+| [[sizeof-generic-over-closure-type-segfaults-compiler]] | crash | Compiler **SIGSEGV, exit 139, zero output, no diagnostic at all** (not even the `CompilerManager` dump). `sizeof(Box<function<int(int)>>)` - and the `Lambda<>` and `list<T>` spellings - crash, while `sizeof(function<int(int)>)` compiles and `sizeof(Box<int>)` gives a located `unknown type 'Box<int>'`. So it is specific to a generic instantiation whose type ARGUMENT is a closure type. Identical on `8c5a860` and on the merged `fix/genfn-lowering`. Floor: reach the same `unknown type` arm `Box<int>` reaches. Filed 2026-08-05 by `fix/genfn-lowering`. |
 
-On the `crash/` bucket: only [[generic-wrapper-over-function-type-llvm-fatal]] is a true abort
-(LLVM fatal, exit 134). The other one exits 1 with a raw LLVM module-verifier dump and NO
-`file(line,col):` prefix. Both are bucketed here on CLAUDE.md's standing convention - an LLVM
-assert, fatal, or verifier failure reachable from plain source must become a proper compiler
-error - not on a claim that they crash. Each wants a located diagnostic as its floor, whether or
-not the underlying feature gap is closed in the same change.
+This bucket now holds exactly ONE row, and it is a TRUE crash: SIGSEGV, exit 139, no output at
+all. Two landings emptied the rest of it. `fix/chain-coalesce` fixed and deleted
+`chained-nullcoalesce-not-boxed-into-interface`; `fix/genfn-lowering` (2026-08-05) fixed and
+deleted BOTH `generic-wrapper-over-function-type-llvm-fatal` and
+`list-of-function-element-into-closure-param-fails-verifier`, as well as the P2
+`closure-by-value-into-generic-struct-field` that shared their root. See the landed record below -
+the filed LLVM ISel fatal had already DRIFTED into a located hard error before that branch
+started, and re-measuring found two spellings that were compiler SIGSEGVs, which the files did not
+record. The row above is what that branch left behind, found on a neighbour axis and measured
+identical on both binaries.
+
+The bucket's standing convention is unchanged by the emptying: an LLVM assert, fatal, or verifier
+failure reachable from plain source belongs here whether or not it literally aborts, because a raw
+verifier dump with no `file(line,col):` prefix is "dies with no usable diagnostic". A located
+diagnostic is the floor for any such row, whether or not the underlying feature gap closes in the
+same change.
 
 Rows that did NOT move, and why - the rubric is about wrong values and crashes, so a LEAK stays
 P2 ([[lambda-body-owning-temp-never-destructed]],
@@ -575,13 +595,13 @@ deleted 2026-08-05), which closed the four decidable spellings and named this on
 | [[simd-type-spelling-unusable-outside-declarations]] | feature gap | `simd<T,N>` is recognised only in `ParseDeclarationSpecifiers` and as a `primaryExpression`, so a cast target, a lambda parameter and a tuple/`function<>` signature component all say "unknown type 'simd<float,4>'", and `simd<T,N>[]` silently DROPS the empty bracket and compiles as a plain vector local. Measured identical on `904f026` and `fix/simdptr`. Wants one encoded-name mechanism (mirroring `BuildEncodedClosureName`), not four patches. Filed 2026-08-03. |
 | [[c-binder-misses-decorated-function-pointer-parameter]] | false rejection | A `const`-qualified C function-pointer parameter binds as `void*`, and the code-value gate then rejects the legal call. Found 2026-08-03 verifying the `void*` oracle for `fix/funcptr-rebind`; the file's first filing named the wrong qualifier and repro - the correction inside is the useful part. Had no row here until 2026-08-04. |
 | [[double-pointer-arg-binds-single-pointer-param]] | silent wrong value | `byPtr(pp)` with a `Circle**` and a `Circle*` parameter compiles, links and RUNS, returning the low bytes of the pointee address instead of the field (`2003` expected; the exit code is the pointee ADDRESS's low bytes, so it is ENVIRONMENT-dependent - the same binary gives 176 and 224 from two different output directories - and a change in it is NOT a change in behaviour). Opaque pointers make both sides one LLVM type, so unlike its `T*`-into-`T` sibling there is nothing for the module verifier to catch. Same predicate (`IsTypeMatch`), depth axis instead of the pointer-ness axis; held out of `fix/ptrarg-byval` because an `ElemPointer` rejection would reject programs that compile and run today, whereas that fix rejected a shape no compiling program can contain. Filed 2026-08-05 by `fix/ptrarg-byval`. |
-| [[closure-by-value-into-generic-struct-field]] | feature gap | `Box<function<T>> b; b.item = g;` is rejected with "cannot store a pointer value into struct storage - a fixed array is not assignable from a pointer" on a program containing no fixed array. A THIN encoded closure gets a `{ i8* }` STRUCT backing type (`LLVMBackend.h:5049`) while a `function<>` VALUE is a bare `ptr`, so the field store sees a pointer going into struct storage; `list<function<T>>` avoids it by entering through a parameter. Carries a second cell: a lambda LITERAL into a fat generic field (`Box<Lambda<int(int)>> b; b.item = (int x) => x + 1;`) is an UNLOCATED verifier dump, while the same lambda through a named local works and the same literal into a NON-generic field works. Both measured identical on `4c06cce` and on the merged `fix/lamptr-generic` - a by-value root, not the pointer-depth one that branch fixed, and the reason its accept-set could freeze "by value keeps working" for `Lambda<T>` but not `function<T>`. Filed 2026-08-05 by `fix/lamptr-generic`. |
 | [[closure-type-argument-to-a-generic-function]] | feature gap | A closure type as a generic FUNCTION's type argument does not resolve, in either spelling: explicit `idf<function<int(int)>>(g)` gives `unknown type 'function<int(int)>'` reported on the TEMPLATE's parameter list, and inferred `idf(g)` mangles the argument from its LLVM repr and instantiates `idf__i8`. The generic STRUCT path funnels through `ResolveTypeArgEntry` and works (`Box<Lambda<...>>`, `list<function<...>>`, and after `fix/lamptr-generic` also `Box<function<T>*>`); this path appears not to, so the fat/thin pointer asymmetry that landed there does not reach it. Non-closure control `idf<int*>(&n)` works on both binaries. Measured identical on `4c06cce` and on the merged `fix/lamptr-generic`. Filed 2026-08-05 by `fix/lamptr-generic`. |
 
 ### P3 - diagnostics, latent, deliberate deferrals (`p3/`)
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[inline-deref-of-container-call-result-has-no-storage]] | diagnostic | False rejection with a LOCATED but internal-sounding message: `(*ls.get(0))(2)` on a `list<function<int(int)>*>` gives `Unable to dereference an object without a Storage.` while the two-line form (`function<int(int)>* e0 = ls.get(0); (*e0)(2)`) compiles and runs - that two-line spelling is what `Test/test_function_ptr.cb` already covers. A deref wants an addressable `Storage`; a call RESULT has only `Primary`. Element type is probably incidental - check `*someCall()` on a plain `int*` return before scoping it as a container issue. Identical on `8c5a860` and on the merged `fix/genfn-lowering`. Filed 2026-08-05 by `fix/genfn-lowering`. |
 | [[implied-move-store-boxed-spelling-false-rejects]] | diagnostic | PRE-EXISTING false rejection, identical on `d93c359` and on the merged `fix/ptrcopy`. A plain `p = c;` store between two pointer locals is an IMPLIED MOVE, so the raw `delete p;` is correct and accepted - but `MarkPointerRebound` runs BEFORE the transfer and records `InheritedKeepsOwner` naming `c`, which is null by then. Nothing reads that in the raw-delete guard; `BindingKeepsOwnershipOfBoxedObject` does, so the BOXED twin is rejected with a message that is false at that site. P3: working remedy, mis-blamed rather than dangerous. Recorded because it is why `fix/ptrcopy` introduced `JoinKeepsOwner` as a SEPARATE field. Filed 2026-08-05 by `fix/ptrcopy`. |
 | [[interface-boxing-keyed-on-source-binding]] | deliberate deferral | RE-BUCKETED P1 -> P3 2026-08-04, on the file's own text: the live double free it was filed for was CLOSED 2026-08-02 (borrowed-interface-box delete diagnosed via the positive keeps-owner proof; landed record below), and only the preventive remainder is left - `RegisterInterfaceBox` dedupes on `FatValue` alone, harmless today. The file kept its name and moved to `p3/`, so existing links still resolve. |
 | [[owning-temp-parent-misroutes-chained-alias-access]] | diagnostic | RE-RANKED P1 -> P3 2026-08-02, on the file's own "re-rank freely" and on a re-measurement: the VERDICT is right (two `unique` owners really is an error) and only the WORDING is wrong, so no program's accept/reject status changes. A wrong message is P3 by this table's own rubric; it sat at P1 only for visibility to whoever next touched the `unique` field-store routing, and that work has landed. Still live on `ca5a02a`: the call-result message fires on a container-element shape, stating a false mechanism and naming a remedy that aborts 134. |
@@ -4926,3 +4946,302 @@ convert '??' arm` / `cannot convert '?:' arm` elsewhere. The first cut of that m
 INVALID and was redone: every probe carried the `pickJoinNC3` helper in its header, so all 25
 "failures" were the header failing to compile, not the leg. Per-leg headers made the pre-fix
 diagnostics vary by position, which is the evidence that each probe reaches the arm it names.
+
+## Landed: `fix/genfn-lowering` (2026-08-05) - a generic instantiated over a closure type lowers its element like the spelling it encodes
+
+Consolidated fix for the last two `p1/crash/` closure rows -
+`generic-wrapper-over-function-type-llvm-fatal` and
+`list-of-function-element-into-closure-param-fails-verifier` - plus the P2
+`closure-by-value-into-generic-struct-field` that shared their root. All three files are DELETED
+by this commit. The P2 deletion was re-justified after review round 1 rather than carried over,
+by compiling and running the file's OWN two repro programs verbatim rather than a sibling probe:
+sub-case 1 (`function<int(int)> g = dbl; b.item = g;` then `b.item(6)`) prints `byval=12`,
+sub-case 2 (`b.item = (int x) => x + 1;` then `b.item(5)`) prints `byval=6`, and the capturing
+variant of sub-case 2 - the cell review round 1 found miscompiled - prints `byval=11`. Every cell
+the file recorded is fixed and measured so, which is the condition for deleting rather than
+trimming it. (The first of those numbers was quoted wrong in the round-1 draft: it read `R=6`,
+which is a NEIGHBOURING probe's output - one that stores `triple` instead of `dbl`. Sibling
+inference, caught in review round 2; the repros are now run as written.)
+
+### The filed repros had DRIFTED, and re-measuring found worse
+
+Every cell below was re-measured on a Release binary built from master `8c5a860` before any code
+was written. Two of the three filed headline symptoms were already gone, and two spellings nobody
+had filed were compiler SIGSEGVs:
+
+| Filed as | Measured on `8c5a860` |
+|---|---|
+| `Box<function<int(int)>>` invoke -> `LLVM ERROR: Cannot select: AArch64ISD::CALL`, exit 134 | The ISel fatal is GONE. The STORE `b.value = triple` now rejects first with a located but false message: `cannot store a pointer value into struct storage - a fixed array is not assignable from a pointer...` (exit 1). The invoke is never reached. |
+| `list<function<>>` element into a closure param -> unlocated verifier dump | Reproduces exactly as filed (`Call parameter type does not match function signature!`, exit 1, no `file(line,col):`). |
+| `list<Lambda<>>.add(void*)` -> unlocated verifier dump (annotated 2026-08-05) | Reproduces. |
+| not filed | `int callit(function<int(int)> f); callit(ls.get(0))` - **compiler SIGSEGV, exit 139, zero output**. |
+| not filed | `function<int(int)> unwrap(Box<function<int(int)>> b) { return b.value; }` - **compiler SIGSEGV, exit 139, zero output**. |
+| not filed | `list<Lambda<int(int)>>.add(namedFn)` - unlocated verifier dump. |
+| not filed | A lambda LITERAL brace-initialized into a closure field - unlocated verifier dump, and **not generic-specific**: plain `struct S { function<int(int)> f; }; S s = { f = (int x) => x + 1 };` fails identically. |
+
+The lesson that "a stale crash SIGNATURE does not mean a healthy area" held again: the file named
+after the ISel fatal pointed at a live area whose worst symptom was a different, unfiled crash.
+
+### Root cause - one representation decision, leaking at every boundary
+
+`RegisterEncodedClosureType` (`LLVMBackend.h`) gave a THIN encoded closure - the element type a
+generic instantiation over `function<T>` gets, e.g. `__thinfn_1_3_i32_3_i32` - a `{ i8* }` STRUCT
+backing "so it stores/copies like a normal value-type element". A `function<T>` VALUE is a bare
+machine `ptr`. Those two facts cannot both hold, so every place the encoded element met ordinary
+code, the struct wrapper leaked:
+
+- a FIELD store saw a pointer going into struct storage -> the fixed-array message, which named a
+  construct the program did not contain;
+- a field LOAD into a `function<T>` local saw a struct going into a pointer -> `cannot assign a
+  struct value to a pointer variable`;
+- an element passed ON to a `Lambda<>` or `function<>` parameter reached the callee as the wrapper
+  struct -> the module verifier, or (for the thin destination) a compiler SIGSEGV;
+- a lambda LITERAL assigned to a substituted field inferred its return type from a target that
+  reported no signature -> a `void`-returning body with an `i32` return -> the verifier.
+
+Only two boundaries had been patched around it (a wrap in `LowerByValueArg`, an unwrap at the
+invoke site), which is exactly why `list<function<>>` could be BUILT and its element INVOKED while
+every other use died.
+
+The fix deletes the representation, rather than adding a third and fourth patch:
+
+1. **`RegisterEncodedClosureType`** no longer creates a `dataStructures` entry for a thin encoded
+   closure. **`GetType`** resolves the encoded name straight to `BuildThinFnPtrType` - the same
+   type the spelled `function<T>` gets. Pointer and array wrapping run unchanged after it, so
+   `Box<function<T>*>` (the `fix/lamptr-generic` shape) keeps working and now lowers to `ptr*`
+   rather than `{ i8* }*`.
+2. **`LowerByValueArg`** converts an encoded closure argument exactly as an `IsFunctionPointer`
+   parameter does - fat->thin narrowing, thin->fat widening - and routes BOTH through the existing
+   provenance gates (`CheckThinFnPtrArgProvenance`, `WidenToClosureFatChecked`). The old wrap
+   bypassed them, which is why `list<function<>>.add(vp)` on a `void*` COMPILED on `8c5a860`.
+3. **`ParseAssignment`** applies the same two conversions when the destination is an encoded
+   closure field, and threads the encoded signature into `lambdaExpectedType` so a lambda literal
+   on the RHS infers its return type.
+4. **`EmitFieldInitializer` / `EmitOneFieldInit`** do the same for the BRACE-INIT spelling, which
+   had NEITHER the signature threading nor any thin/fat conversion. This is the one part of the
+   change that also fixes a non-generic program.
+5. Two small routing follow-ons in the postfix walk: a thin encoded receiver reaches the UFCS
+   member-name arm and the pointer-identity `.copy()` arm. Without them `list<T>::copy()`'s
+   `_data[i].copy()` stopped resolving the moment the element lost its struct backing - the
+   regression this fix introduced and closed mid-flight, caught by the probe corpus, not by
+   reasoning.
+6. **The `=` path's closure OWNERSHIP-transfer arm is re-keyed on the REPRESENTATION**, not the
+   spelling. It tested `TypeName == "__closure_fat_ptr"`; a generic-substituted FAT field carries
+   the encoded name (`__fatfn_...`) but is bit-for-bit the same `{ code, env }` struct and owns the
+   same env, so it now takes the same arm (via the new `IsFatEncodedClosureType`, mirroring what
+   `EmitOneFieldInit` already did by testing `val->getType() == GetClosureFatPtrType()`). See the
+   review-caught regression below - this is the fix for it, and it is why the rule is stated as
+   "same representation, same ownership rule" rather than as a fourth special case.
+
+### Guard polarity - what is REJECTED, and what the accept set proves
+
+Two spellings that PRE accepted are now rejected, both by pre-existing provenance gates the old
+wrap had bypassed, both located:
+
+- `list<function<int(int)>>.add(vp)` on a `void*` - PRE compiled it and would have called a data
+  address as code. Now: `cannot pass a non-function pointer value to 'function<>' parameter
+  'value'`.
+- `Box<Lambda<int(int)>>.item = vp` - PRE rejected it, but only by accident (struct storage), with
+  the fixed-array message. Now: the closure-parameter provenance message, which is true of the site.
+
+The must-still-work accept set was frozen BEFORE those gates were wired in, as a probe corpus that
+grew to 59 programs.
+The ones that cross the boundary the new gates could mistake for a violation - a named function, a
+`function<>` value, a non-capturing lambda literal, a thin `function<T>*`, an aliased spelling
+(`using IntFn = function<int(int)>`), a `Lambda<>` local, and the brace-init form of each - all
+compile and produce their expected values. Three FAT-into-thin rejections (`Box<Lambda<>>` and
+`list<Lambda<>>` elements into a C `function<>` parameter) are unchanged in both verdict and
+wording from PRE.
+
+### The regression review round 1 caught, and the matrix hole that hid it
+
+The first version of this branch MISCOMPILED a capturing lambda LITERAL assigned with `=` to a FAT
+generic-substituted field: `Box<Lambda<int(int)>> b; int cap = 10; b.item = (int x) => { return x
++ cap; };` then `b.item(1)` printed **1** instead of 11 and then SIGSEGVed. Same on a generic
+`class`, on a nested `Outer<T>{Box<T>}`, on a heap receiver `bp->item`, and on a reassign; the
+spelled non-generic control printed 11 on both binaries. On `8c5a860` that program did not compile
+at all (the unlocated verifier dump), so the branch turned a compile-time rejection into a wrong
+answer plus a crash - strictly worse.
+
+Cause: the `=` path's ownership-transfer arm keyed on `TypeName == "__closure_fat_ptr"`, so the
+encoded fat field skipped it; `FlushOwnedClosureTemps` then freed the env at end-of-full-expression
+while the field still pointed at it (visible in `--out-lli` as an extra `__closure_fat_ptr.dtor`
+right after the store, with the later `Box` dtor as the double free). The `lambdaExpectedType`
+threading is what made the program compile in the first place, which is exactly what exposed the
+pre-existing spelling-keyed predicate: **unblocking compilation moves a program onto ownership
+paths that a compile-time rejection had been hiding.** The brace-init path never had the bug,
+because it keys on the VALUE's type (`val->getType() == GetClosureFatPtrType()`) rather than on the
+destination's spelling.
+
+Why the matrix missed it: the operation axis listed "lambda literal" and "capturing literal", and
+the element axis listed thin and fat, but the fat x capturing-literal CROSS had no cell - fat
+literals were probed only non-capturing, and capturing literals only against thin destinations
+(where they are rejected outright, so no ownership path runs). A cross that both axes cover
+individually is exactly the cell an axis-at-a-time matrix drops. The nine cells below close it.
+
+### Coverage matrix (70 probe programs, every cell measured on both binaries)
+
+Shapes: `Box<T>` generic struct, generic `class`, nested `Box<Box<T>>`, `list<T>`, alias spelling,
+heap-pointer receiver. Element types: `function<int(int)>` (thin), `Lambda<int(int)>` (fat),
+`function<int(int)>*`. Operations: field store (named fn / `function<>` value / `Lambda<>` value /
+non-capturing literal / **capturing literal** / `void*`), brace-init, reassign, field load into a
+local, invoke the element, pass it to a `Lambda<>` param, pass it to a `function<>` param, return
+it, pass the whole instantiation, `list` add/get, and the non-generic controls for each.
+
+Net over 70 cells, every one measured on both binaries (re-measured on the rebased binary):
+
+| Transition | Cells |
+|---|---|
+| hard failure -> compiles and produces the expected value | **31** |
+| hard failure -> COMPILES, matching its non-generic control (see the loosening note) | 1 |
+| rejected -> rejected with a DIFFERENT and truer message | 4 |
+| accepted -> rejected (the `void*` tightenings) | 3 |
+| unchanged, compiles with the identical output | 24 |
+| unchanged, rejected with the identical message | 7 |
+
+Two of the three tightenings were only PROBED in review round 2 - they are not new behaviour from
+it. `Box<Lambda<int(int)>> b = { item = vp };` on a `void*`, and its NON-generic twin
+`struct Plain { Lambda<int(int)> item; }`, both compiled on `8c5a860` (a data address stored in a
+code slot) and are refused now; the brace-init widen gate that refuses them landed in round 1,
+before either cell existed. The third is `list<function<>>.add(vp)`.
+
+The generic one is also where the field-store diagnostic quoted a MANGLED instantiation name -
+`closure field 'Box____fatfn_1_3_i32_3_i32.item'`. It now renders `Box<Lambda<int(int)>>.item`:
+`DisplayNameOfMangledType` learned that an argument segment beginning with `__` is an encoded
+closure and spells it back from its recorded signature, and returns the raw mangled name with
+`*writable = false` when it cannot - never a half-demangled hybrid like `Box<, fatfn_1_3_i32_3_i32>`.
+The `=` path (`b.value`) and the non-generic path (`Plain.item`) are unchanged, measured.
+
+No cell produces a different VALUE than it did before - but that claim was worth little as
+originally written, because on this branch's first version the 59-cell matrix had no cell that
+COULD have shown the miscompile. It is stated here only as an accompaniment to the nine cells that
+now cover the cross, not as evidence on its own.
+
+Of the 31 genuinely fixed, **2 were a compiler SIGSEGV (exit 139, zero output)**, **15 were an
+UNLOCATED module-verifier dump** (the 7 new capturing-into-fat cells among them), and 14 were a
+located but false "cannot store a pointer value into struct storage - a fixed array..." / "cannot
+assign a struct value to a pointer variable" / "cannot cast an aggregate value" message. Of the 4
+that changed message, 2 were an unlocated verifier dump and are now located.
+**No LLVM fatal, verifier dump or compiler crash remains in the matrix.**
+
+Ownership was re-checked on the nine new cells, not assumed: all nine run to `rc=0` with the
+expected value, all nine report `0 leaks for 0 total leaked bytes` under `leaks --atExit`, the
+reassign cell (the double-free-prone one) prints 21 and exits clean, and the `--out-lli` for the
+store cell shows the old-slot dtor BEFORE the store and no dtor after it - the same shape the
+spelled control emits. `Test/test_function_ptr.cb` as a whole is also leak-clean.
+
+The one LOOSENING: `Box<function<int(int)>>.item = vp` on a `void*` was rejected on PRE and
+compiles now. That PRE rejection was not a gate - it was the struct-storage message firing on the
+`{ i8* }` backing - and the non-generic control `struct S { function<int(int)> f; }; s.f = vp;`
+compiles on BOTH binaries. So the generic spelling now MATCHES its control rather than being
+accidentally stricter, and the underlying hole (both spellings SIGBUS at the call, exit 138) is
+filed as [[data-pointer-assigned-to-thin-function-value]] with the accept set the real gate needs.
+
+Cells deliberately NOT closed, each filed:
+
+- `(*ls.get(0))(2)` - inline deref of a call result - `Unable to dereference an object without a
+  Storage.`, identical on both binaries and not closure-specific. Filed as
+  [[inline-deref-of-container-call-result-has-no-storage]] (P3). The two-line form
+  (`function<int(int)>* e0 = ls.get(0); (*e0)(2)`) works and is already covered in
+  `Test/test_function_ptr.cb`.
+- `s.f = vp` on a THIN `function<>` field OR a bare local - compiles clean and exits 138 (SIGBUS),
+  identical on both binaries and NOT generic-specific. Filed as
+  [[data-pointer-assigned-to-thin-function-value]] (P1/codegen). The generic thin field inherits
+  exactly this and no more: closing it means gating the ASSIGNMENT leg for a thin destination,
+  which is a separate accept set from the argument leg this commit reuses.
+- `sizeof(Box<function<int(int)>>)` - compiler **SIGSEGV, exit 139, zero output**, identical on
+  both binaries, and true of the `Lambda<>` and `list<T>` spellings too while
+  `sizeof(function<int(int)>)` compiles and `sizeof(Box<int>)` gives a located `unknown type`.
+  Found on the neighbour axis, not on any filed repro. Filed as
+  [[sizeof-generic-over-closure-type-segfaults-compiler]] (P1/crash) - so this commit closes two
+  rows of that bucket and opens one.
+
+Neighbour axes probed and measured UNCHANGED on both binaries: a `list<function<>>` captured
+BY REFERENCE in a lambda body (`R=8` both), `dictionary<string, function<int(int)>>` set/get
+(`R=10` both), and `list<function<>>::copy()` (`R=10 1` both - the path whose `_data[i].copy()`
+the postfix follow-ons had to keep resolving). All three are cells of the 59 above. One cell in that
+set is a fix nobody asked for: a fixed-array field of the element type,
+`struct Box<T> { T[3] items; }` with `b.items[0] = dbl`, went from the same false fixed-array
+rejection to `R=10`.
+
+### The `--init` cache is not involved, and that was checked rather than assumed
+
+No field was added to `TypeAndValue` / `StructData` / `AnnotationValue`, so the round-trip rule
+does not bite. The change does REMOVE a `dataStructures` entry (the thin encoded closure's `{ i8* }`
+shell), and `dataStructures` IS cached - a cache written by an older binary could in principle
+restore the shell. It cannot here: `encodedClosureTypes_` is never serialized, no `core/*.cb`
+instantiates a generic over a thin closure type (grepped), and no cached artifact under
+`.cflat/runtime/` contains a `__thinfn` name (grepped). Encoded closure types are rebuilt from user
+source on every compile.
+
+### Verification
+
+- `./cmake_build.sh release`, `./test.sh Release`: **600 passed, 0 failed, 8 skipped**.
+- `bash example_mac.sh Release`: **35 passed, 0 failed**.
+- `./test_lsp.sh Release`: **152 passed, 0 failed**.
+- All three re-run on the binary built AFTER the rebase onto `fix/chain-coalesce` (`47d3609`),
+  not carried over from before it. Interaction with that landing checked directly rather than
+  inferred: `take(z ?? y ?? a)` into an interface argument still returns 9, and
+  `Test/test_move.cb` - the file that landing extended - passes 738/738.
+- Differential corpus sweep, compile AND run, every `.cb` under `Test/` and `example/` - **447
+  files**, PRE (`8c5a860`, built in a detached worktree) run TWICE first to identify nondeterminism,
+  then POST. Harness and raw results in `scratch/gf_sweep.sh`, `scratch/sweep_PRE1/`,
+  `scratch/sweep_PRE2/`, `scratch/sweep_POST/`.
+
+  Honest composition of the 447 rows (PRE2): 290 compiled clean, 156 rejected, 1 crashed the
+  compiler. Of the 156 rejections, 129 are `Test/errors/` fixtures where a rejection IS the pass
+  condition and 22 are Windows-only sources whose headers do not exist on macOS - so only 5
+  rejections are ordinary. Of the rows that produced a binary, 138 ran to `rc=0`, 15 exited nonzero
+  by design, 6 hit the harness's 60 s cap (interactive/GUI examples), and 78 are error fixtures
+  whose stub binary aborts. Because the sweep compiles with `-o`, the `Test/errors/` rows carry no
+  signal beyond "the compiler still reaches the same place"; the real check for those is `test.sh`.
+
+  PRE1 vs PRE2 differ on exactly **10** rows, all output-hash-only, all inherently nondeterministic
+  (`test_c`, `test_hpc`, `test_time`, the four `example/hpc` benchmarks, `framework_link`,
+  `sysinfo_mac`, `shell/pwd` - timings, addresses, uptime, cwd). That is the noise floor.
+
+  PRE vs POST: **exactly one row changes status** - `Test/test_function_ptr.cb`, `C139` (compiler
+  SIGSEGV, no output) -> `C0 R0`, i.e. the file carrying the new regression legs goes from crashing
+  the PRE compiler to compiling and running green. The set of rows whose output hash differs is
+  **identical to the 10-row noise floor**, so no program's behaviour changed. Every other textual
+  diff is the PRE binary's own install path appearing inside `imported file not found` messages -
+  a harness artifact of running PRE out of a separate directory, not a compiler difference.
+
+  Re-run in full against the FINAL binary after review round 1 (`scratch/sweep_POST2/`): same
+  single status change vs PRE, and vs the round-1 POST the only differing rows are the same 10
+  noise-floor rows - the ownership re-keying and the message rewording disturbed nothing.
+
+  Weighting: the sweep is the weaker half of the evidence here, because no corpus file other than
+  the one I extended instantiates a generic over a closure type - the sweep structurally cannot see
+  the new lowering. Its value is the negative result: the representation change did not disturb the
+  446 files that do not use the shape. The strong half is the 70-cell matrix above.
+
+### Regression tests
+
+`Test/test_function_ptr.cb::testClosureByValueGenericArg` - 28 value-asserting legs. Every one was
+measured failing on the PRE binary first, and each comment states which failure mode it pins
+(hard error / unlocated verifier / SIGSEGV) so a later reader can tell a real leg from a vacuous
+one. `cbv_thin_brace_init` is explicitly labelled a must-still-work leg: it passes on both
+binaries and is there to protect the brace path, not to prove the fix. Seven of the 28 are the
+`cbv_fat_capturing_*` legs added after review round 1 - store, reassign, pass-to-param, generic
+class, nested, heap-pointer receiver, brace-init - each mutation-tested standalone and each
+failing on PRE with the unlocated verifier dump. They are value-asserting on purpose: the
+regression they pin compiled fine and returned the WRONG number, so a compile-only leg would have
+been vacuous against it.
+
+`Test/errors/err_data_pointer_to_closure_param.cb` - 3 new `expect_error` legs (fat container, fat
+generic field, thin container). The field-store leg pins the reworded diagnostic `cannot store a
+'void*' value into closure field 'gb.item'`: the gate is shared with the argument path, but a
+field store is not a parameter pass and the message must not say it is (review round 1, LOW). `Test/errors/err_lambda_to_c_funcptr.cb` - 2 new legs (a capturing
+lambda into a thin generic field, via `=` and via brace-init). All five were mutation-tested
+individually against the PRE binary: each fails there, three with `expected error ... did not
+occur` (PRE accepted the program or deferred the failure past the block) and two with a DIFFERENT
+message (`cannot store a pointer value into struct storage`, `cannot cast an aggregate value`),
+which is what proves the leg pins the new diagnostic rather than a pre-existing one.
+
+### References left as written
+
+`fix/widengate`'s landed record says the `list<Lambda<>>` container axis of its accept set "cannot
+be exercised in either direction until that is fixed". It is fixed now, and the `add` direction is
+exercised by `cbv_fat_list_named` (accept) and the new `expect_error` leg (reject). The record
+itself is a dated snapshot and is left as written, per this file's standing convention.

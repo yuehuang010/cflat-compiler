@@ -2928,6 +2928,137 @@ bool testThinFuncPtrGenericArg()
     return result;
 }
 
+// A closure stored BY VALUE in a generic instantiation. A THIN `function<T>` element used to get
+// a `{ i8* }` STRUCT backing while a `function<T>` value is a bare code pointer, so every field
+// store was rejected ("cannot store a pointer value into struct storage"), reading one back or
+// passing one on hit the module verifier, and two spellings crashed the compiler outright. The
+// thin encoded element is now the same bare code pointer the non-generic spelling is.
+struct CbvBox<T> { T item = default; };
+class CbvCls<T> { T item = default; };
+struct CbvOuter<T> { CbvBox<T> inner = default; };
+struct CbvPlainFat  { Lambda<int(int)>   item = default; };
+struct CbvPlainThin { function<int(int)> item = default; };
+int cbvTakesFat(Lambda<int(int)> f)  { return f(5); }
+int cbvTakesThin(function<int(int)> f) { return f(5); }
+function<int(int)> cbvUnwrap(CbvBox<function<int(int)>> b) { return b.item; }
+
+bool testClosureByValueGenericArg()
+{
+    bool result = true;
+
+    // Field store of a NAMED function, then invoke through the substituted field.
+    // Pre-fix: "cannot store a pointer value into struct storage" (hard error, exit 1).
+    CbvBox<function<int(int)>> b = default;
+    b.item = doubleIt;
+    result &= Test("cbv_thin_store_named", b.item(6), 12);
+
+    // Store a thin `function<>` VALUE (not a bare name) - the other source spelling.
+    function<int(int)> g = square;
+    b.item = g;
+    result &= Test("cbv_thin_store_value", b.item(6), 36);
+
+    // Read the substituted field back into a local of the spelled type.
+    // Pre-fix: "cannot assign a struct value to a pointer variable".
+    function<int(int)> back = b.item;
+    result &= Test("cbv_thin_field_to_local", back(6), 36);
+
+    // The field as an ARGUMENT, to a fat `Lambda<>` slot and to a thin `function<>` slot.
+    // Pre-fix both were unreachable (the store above already errored).
+    b.item = doubleIt;
+    result &= Test("cbv_thin_to_fat_param",  cbvTakesFat(b.item),  10);
+    result &= Test("cbv_thin_to_thin_param", cbvTakesThin(b.item), 10);
+
+    // The whole instantiation passed by value, and a substituted field RETURNED.
+    // `cbvUnwrap` was a compiler SIGSEGV (exit 139, no output) pre-fix.
+    result &= Test("cbv_thin_return_field", cbvUnwrap(b)(6), 12);
+
+    // Generic CLASS and NESTED generic spellings of the same store.
+    CbvCls<function<int(int)>> c;
+    c.item = doubleIt;
+    result &= Test("cbv_thin_class_store", c.item(6), 12);
+    CbvOuter<function<int(int)>> o = default;
+    o.inner.item = square;
+    result &= Test("cbv_thin_nested_store", o.inner.item(6), 36);
+
+    // A lambda LITERAL assigned to a substituted field: its return type is inferred from the
+    // element's signature. Fat pre-fix was an UNLOCATED module-verifier dump ("Found return
+    // instr that returns non-void ... ret i32"); thin was "cannot cast an aggregate value".
+    CbvBox<Lambda<int(int)>> fb = default;
+    fb.item = (int x) => x + 1;
+    result &= Test("cbv_fat_literal", fb.item(5), 6);
+    CbvBox<function<int(int)>> tb = default;
+    tb.item = (int x) => x + 3;
+    result &= Test("cbv_thin_literal", tb.item(5), 8);
+
+    // A named function into a FAT field / a fat CONTAINER: both widen to {code, null}.
+    // Pre-fix the field store errored and `add` was an unlocated verifier dump.
+    fb.item = doubleIt;
+    result &= Test("cbv_fat_store_named", fb.item(6), 12);
+    list<Lambda<int(int)>> fl;
+    fl.add(square);
+    result &= Test("cbv_fat_list_named", fl.get(0)(6), 36);
+
+    // Container element passed ON to a closure parameter - the filed `list<function<>>` repro.
+    // Pre-fix: the fat slot was an unlocated verifier dump, the thin slot a compiler SIGSEGV.
+    list<function<int(int)>> tl;
+    tl.add(doubleIt);
+    result &= Test("cbv_list_elem_to_fat",  cbvTakesFat(tl.get(0)),  10);
+    result &= Test("cbv_list_elem_to_thin", cbvTakesThin(tl.get(0)), 10);
+    function<int(int)> elem = tl.get(0);
+    result &= Test("cbv_list_elem_to_local", elem(6), 12);
+
+    // A lambda literal INTO the thin container (pre-fix: unlocated verifier dump).
+    list<function<int(int)>> tl2;
+    tl2.add((int x) => x + 4);
+    result &= Test("cbv_list_thin_literal", tl2.get(0)(5), 9);
+
+    // Must-still-work: the brace-init spelling with a NAMED function, which worked pre-fix.
+    CbvBox<function<int(int)>> bi = { item = doubleIt };
+    result &= Test("cbv_thin_brace_init", bi.item(6), 12);
+
+    // Brace-init with a lambda LITERAL. The brace path never threaded the target field's closure
+    // signature into the literal, so its return type came out `void` and the module verifier
+    // rejected the whole module with no source location - on the NON-generic field too, which is
+    // why the two plain-struct legs below are here rather than in a generics-only test.
+    CbvBox<Lambda<int(int)>>   fbi = { item = (int x) => x + 1 };
+    CbvBox<function<int(int)>> tbi = { item = (int x) => x + 2 };
+    result &= Test("cbv_fat_brace_literal",  fbi.item(5), 6);
+    result &= Test("cbv_thin_brace_literal", tbi.item(5), 7);
+    CbvPlainFat  pf = { item = (int x) => x + 3 };
+    CbvPlainThin pt = { item = (int x) => x + 4 };
+    result &= Test("cbv_plain_fat_brace_literal",  pf.item(5), 8);
+    result &= Test("cbv_plain_thin_brace_literal", pt.item(5), 9);
+
+    // A CAPTURING literal into a FAT generic field. The ownership-transfer arm keyed on the
+    // spelling "__closure_fat_ptr", so a substituted field skipped it and the env was freed at
+    // end-of-full-expression while the field still pointed at it - wrong value, then SIGSEGV.
+    int cap = 10;
+    CbvBox<Lambda<int(int)>> cb = default;
+    cb.item = (int x) => { return x + cap; };
+    result &= Test("cbv_fat_capturing_store", cb.item(1), 11);
+    cb.item = (int x) => { return x + cap + cap; };
+    result &= Test("cbv_fat_capturing_reassign", cb.item(1), 21);
+    result &= Test("cbv_fat_capturing_to_param", cbvTakesFat(cb.item), 25);
+
+    CbvCls<Lambda<int(int)>> cc = default;
+    cc.item = (int x) => { return x + cap; };
+    result &= Test("cbv_fat_capturing_class", cc.item(1), 11);
+
+    CbvOuter<Lambda<int(int)>> co = default;
+    co.inner.item = (int x) => { return x + cap; };
+    result &= Test("cbv_fat_capturing_nested", co.inner.item(1), 11);
+
+    CbvBox<Lambda<int(int)>>* cp = new CbvBox<Lambda<int(int)>>();
+    cp->item = (int x) => { return x + cap; };
+    result &= Test("cbv_fat_capturing_heapptr", cp->item(1), 11);
+    delete cp;
+
+    CbvBox<Lambda<int(int)>> cbi = { item = (int x) => { return x + cap; } };
+    result &= Test("cbv_fat_capturing_brace", cbi.item(1), 11);
+
+    return result;
+}
+
 bool testGenericFuncPtrProducer()
 {
     bool result = true;
@@ -3099,6 +3230,7 @@ extern int main()
     // A THIN 'function<T>*' as a GENERIC TYPE ARGUMENT (the fat twin is rejected in
     // Test/errors/err_lambda_array_view.cb)
     total++; passed += testThinFuncPtrGenericArg()         ? 1 : 0;
+    total++; passed += testClosureByValueGenericArg()      ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -5074,27 +5074,34 @@ private:
                 functionTable["copy"].push_back(sym);
             }
         }
-        else
-        {
-            // Thin C fn ptr: an 8-byte POD. Represent as a { i8* } struct so it stores/copies like a
-            // normal value-type element; no destructor.
-            auto& ds = dataStructures[encodedName];
-            if (!ds.StructType)
-            {
-                auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
-                ds.StructType = llvm::StructType::create(*context, { i8PtrTy }, encodedName);
-                DeclTypeAndValue fnField;
-                fnField.TypeName    = "i8";
-                fnField.VariableName = "fn";
-                fnField.Pointer     = true;
-                ds.StructFields = { fnField };
-            }
-        }
+        // Thin C fn ptr: a bare code pointer, exactly like a non-generic `function<T>` value. It
+        // gets NO struct backing - GetType lowers the encoded name straight to the fn-ptr type.
     }
 
     bool IsEncodedClosureType(const std::string& name) const
     {
         return encodedClosureTypes_.count(name) != 0;
+    }
+    // A THIN encoded closure is a bare code pointer with no struct backing, so it copies, stores
+    // and passes exactly like a plain pointer value.
+    bool IsThinEncodedClosureType(const std::string& name) const
+    {
+        auto it = encodedClosureTypes_.find(name);
+        return it != encodedClosureTypes_.end() && it->second.IsThinFnPtr();
+    }
+
+    // The source spelling an encoded closure type argument was written as. DIAGNOSTICS ONLY.
+    std::string SpellEncodedClosureType(const TypeAndValue& enc) const
+    {
+        return std::format("{}<{}>", enc.IsThinFnPtr() ? "function" : "Lambda", FuncPtrSpellingOf(enc));
+    }
+
+    // A FAT encoded closure has the same representation as a spelled `Lambda<T>` - the
+    // `__closure_fat_ptr` struct - so every ownership rule keyed on that struct applies to it.
+    bool IsFatEncodedClosureType(const std::string& name) const
+    {
+        auto it = encodedClosureTypes_.find(name);
+        return it != encodedClosureTypes_.end() && !it->second.IsThinFnPtr();
     }
     const TypeAndValue* GetEncodedClosureType(const std::string& name) const
     {
@@ -11751,8 +11758,21 @@ public:
         for (size_t pos = 0; pos <= args.size(); )
         {
             size_t sep = args.find("__", pos);
-            if (sep == std::string::npos) { joined += args.substr(pos); break; }
-            joined += args.substr(pos, sep - pos) + ", ";
+            std::string seg = (sep == std::string::npos) ? args.substr(pos) : args.substr(pos, sep - pos);
+            // An EMPTY segment means the argument itself began with "__" - an encoded closure type
+            // ("Box____fatfn_1_3_i32_3_i32"). Splitting it gives "Box<, fatfn_...>", a hybrid that
+            // names no type. A SINGLE such argument can be spelled back exactly; anything else is
+            // not writable source and the raw mangled name is handed back.
+            if (seg.empty())
+            {
+                if (joined.empty())
+                    if (const TypeAndValue* enc = GetEncodedClosureType(args))
+                        return mangled.substr(0, d) + "<" + SpellEncodedClosureType(*enc) + ">";
+                if (writable) *writable = false;
+                return mangled;
+            }
+            if (sep == std::string::npos) { joined += seg; break; }
+            joined += seg + ", ";
             pos = sep + 2;
         }
         return mangled.substr(0, d) + "<" + joined + ">";
@@ -13949,16 +13969,23 @@ public:
      * `Lambda<int(int)> f() { void* p = ...; return p; }` is unguarded on both paths.
      */
     llvm::Value* WidenToClosureFatChecked(llvm::Value* val, const NamedVariable& arg,
-        const std::string& paramName)
+        const std::string& paramName, const std::string& fieldDesc = {})
     {
         if (val && val->getType()->isPointerTy() && ArgumentIsProvablyDataPointer(val, arg))
         {
+            // A field STORE reaches the same gate as an argument pass; name the real
+            // destination so the diagnostic does not call a struct field a parameter.
+            std::string action = fieldDesc.empty()
+                ? std::format("pass {} to closure parameter '{}'",
+                    DescribeNonFunctionArgument(arg), paramName)
+                : std::format("store {} into closure field {}",
+                    DescribeNonFunctionArgument(arg), fieldDesc);
             LogError(std::format(
-                "cannot pass {} to closure parameter '{}': only a named function, a "
+                "cannot {}: only a named function, a "
                 "'function<>' value or a lambda converts to a closure - a data pointer "
                 "would be called as code. If the value really holds a code address, assert "
                 "it with an explicit cast: '(function<...>)value'.",
-                DescribeNonFunctionArgument(arg), paramName));
+                action));
         }
         return WidenBareOrThinToClosureFat(val);
     }
@@ -14054,17 +14081,22 @@ public:
     // call can arrive here with such a parameter.
     llvm::Value* LowerByValueArg(llvm::Value* value, const TypeAndValue& param, const NamedVariable& arg)
     {
-        // Encoded thin closure param (list<function<...>>::add's `T value`, gap a): the element is a
-        // { i8* } POD wrapper. A bare C fn ptr / thin function<> value arrives as a pointer - wrap it
-        // into the struct so it stores as the element type. The invoke site unwraps field 0.
+        // Encoded closure param (list<function<...>>::add's `T value`, a substituted generic field).
+        // The encoded element has the SAME machine repr as the spelling it encodes - bare code
+        // pointer (thin) or fat struct - so convert exactly as an IsFunctionPointer param would.
         if (const TypeAndValue* enc = GetEncodedClosureType(param.TypeName);
-            enc && enc->IsThinFnPtr() && value && value->getType()->isPointerTy() && !param.Pointer)
+            enc && value && !param.Pointer)
         {
-            auto* wrapTy  = dataStructures[param.TypeName].StructType;
-            auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
-            auto* asI8    = builder->CreateBitCast(value, i8PtrTy, "thinfn_i8");
-            llvm::Value* wrapped = llvm::UndefValue::get(wrapTy);
-            return builder->CreateInsertValue(wrapped, asI8, { 0u });
+            if (enc->IsThinFnPtr() && value->getType()->isStructTy())
+                return LowerClosureFatToThinFnPtr(value, GetType(param),
+                    param.VariableName, arg.LambdaCaptureNames);
+            if (enc->IsThinFnPtr() && value->getType()->isPointerTy())
+            {
+                CheckThinFnPtrArgProvenance(value, arg, param.VariableName);
+                return builder->CreateBitCast(value, GetType(param), "thinfn");
+            }
+            if (!enc->IsThinFnPtr() && value->getType()->isPointerTy())
+                return WidenToClosureFatChecked(value, arg, param.VariableName);
         }
         // Function-pointer parameter fed the other flavour's representation, both directions.
         if (param.IsFunctionPointer && value)
@@ -18153,7 +18185,14 @@ public:
             }
             else
             {
-                if (dsIt != dataStructures.end())
+                // A THIN encoded closure (list<function<T>> element, Box<function<T>> field) is a
+                // bare code pointer with no struct backing - lower it as `function<T>` lowers.
+                const TypeAndValue* thinEnc = GetEncodedClosureType(resolvedTypeName);
+                if (thinEnc != nullptr && thinEnc->IsThinFnPtr())
+                {
+                    type = BuildThinFnPtrType(*thinEnc);
+                }
+                else if (dsIt != dataStructures.end())
                 {
                     type = dsIt->second.StructType;
                 }

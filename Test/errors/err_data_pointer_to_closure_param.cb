@@ -1,4 +1,5 @@
 import "function.cb";
+import "list.cb";
 
 // A fat `Lambda<>` parameter reached through a VIRTUAL slot widens a named function or a
 // `function<>` value into a {code, null} closure. Under opaque pointers every data pointer has
@@ -1633,5 +1634,52 @@ expect_error("cannot pass a non-function pointer value to closure parameter 'f'"
         int z = 1;
         void* vp = &z;
         return djApplyFatNullArm(c > 0 ? (function<int(int)>)nullptr : vp);
+    }
+}
+
+/*
+ * The same gate on a GENERIC instantiation over a closure type. A `list<Lambda<>>` element and a
+ * substituted `Box<Lambda<>>` field are the same fat {code, env} slot as a spelled parameter, so a
+ * data pointer must be refused there too. Both spellings pre-dated any gate: they died in the
+ * module verifier with NO source location ("Call parameter type does not match function
+ * signature!"), so the diagnostic below is what proves the gate now runs on the encoded element.
+ * Discriminator: the message names the real destination ('value' for the container's add, the
+ * qualified field for the store) - the verifier dump named neither.
+ */
+expect_error("cannot pass a non-function pointer value to closure parameter 'value'") {
+    int dpgcQ = 3;
+
+    void dataPointerIntoFatContainer()
+    {
+        list<Lambda<int(int)>> fns;
+        void* vp = &dpgcQ;
+        fns.add(vp);
+    }
+}
+
+// A field STORE reaches the same provenance gate as an argument pass, so the message must name
+// the field it stores into - not call the struct variable a "parameter".
+expect_error("cannot store a 'void*' value into closure field 'gb.item'") {
+    struct DpgcBox<T> { T item = default; };
+    int dpgcQ2 = 3;
+
+    void dataPointerIntoFatGenericField()
+    {
+        DpgcBox<Lambda<int(int)>> gb = default;
+        void* vp = &dpgcQ2;
+        gb.item = vp;
+    }
+}
+
+// THIN element, same shape: `list<function<>>` used to WRAP any pointer into its element slot
+// without asking where it came from, so this compiled and called a data address as code.
+expect_error("cannot pass a non-function pointer value to 'function<>' parameter 'value'") {
+    int dpgcQ3 = 3;
+
+    void dataPointerIntoThinContainer()
+    {
+        list<function<int(int)>> fns;
+        void* vp = &dpgcQ3;
+        fns.add(vp);
     }
 }
