@@ -2634,7 +2634,9 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                 initializers.push_back(rvalue);
             }
 
-            llvm::Value* structVal = llvm::UndefValue::get(structType);
+            // Seed with zero (not undef) so fields lacking an explicit initializer read as
+            // 0/null instead of leaking stack garbage. Mirrors the struct default ctor above.
+            llvm::Value* structVal = llvm::Constant::getNullValue(structType);
 
             LLVMBackend::TypeAndValue myStruct;
             myStruct.TypeName = structName;

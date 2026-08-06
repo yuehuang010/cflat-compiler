@@ -291,7 +291,7 @@ recount (it still read 11/33/24, but the true pre-existing disk count on `master
 was already 10 P1 / 34 P2 / 26 P3 - drifted from unrelated fixes/filings between 2026-08-01 and
 this round, never caught because nothing had re-verified the table since). Net movement this
 round: one P1 fixed and deleted ([[global-struct-positional-init-silently-zeroes]]), and four
-new issues filed in its place - three P2 ([[class-no-ctor-default-construct-returns-undef]],
+new issues filed in its place - three P2 (`class-no-ctor-default-construct-returns-undef`,
 [[struct-field-default-brace-list-discarded]], [[interface-typed-global-brace-init-discarded]])
 and one P3 ([[global-struct-no-initializer-ignores-field-defaults]]). All four were found by
 review of that P1's fix, not by the original investigation - the same pattern this file has
@@ -515,7 +515,6 @@ produce a program.
 
 | Issue | Family | Severity |
 |---|---|---|
-| [[class-no-ctor-default-construct-returns-undef]] | miscompile | A `class` with no user-written constructor default-constructs to IR `undef`, not zero - the synthesized zero-arg constructor's body never stores anything before returning. The `struct` twin (same fields, no constructor) is correct (real zero-init). Found while reviewing the fix for `global-struct-positional-init-silently-zeroes` (FIXED and deleted - see the `fix/global-positional` landed record below); unrelated root cause. Filed 2026-08-02. |
 | [[data-pointer-returned-as-closure-not-gated]] | miscompile | Silent miscompile then SIGBUS (exit 138), no diagnostic. `CoerceToFuncPtrReturn` is the one caller of `WidenBareOrThinToClosureFat` never routed through the `ce9858e` provenance gate, so a data pointer returned as a closure lands in the CODE slot and is called. Filed 2026-07-31. |
 | [[shape-mismatched-funcptr-arg-binds-silently]] | miscompile | Silent miscompile then SIGBUS (exit 138), no diagnostic. A `function<T>*` binds where a plain `function<T>` value is expected; the scorer now detects the shape mismatch but still lowers the mismatched arm when no better-shaped candidate exists. Filed 2026-07-31. |
 | [[extern-decl-drops-fixed-array-return-size]] | silent wrong ABI | `extern char[8] extmk();` compiles clean on BOTH `ca5a02a` and `fix/array-storage` - the `[8]` is dropped and the declaration binds to a symbol returning one `char`. The by-value fixed-array-return reject landed on the DEFINITION path only; this is the one remaining spelling of that axis. Not a regression. Filed 2026-08-02. |
@@ -611,6 +610,7 @@ deleted 2026-08-05), which closed the four decidable spellings and named this on
 | [[sizeof-over-generic-instantiation-unresolved-while-alignof-resolves]] | feature gap | `sizeof(Box<double>)` gives a located `unknown type 'Box<double>'` while `alignof(Box<double>)` returns the correct 8 - and `alignof` is not guessing (`Box<char>` 1, `Box<BigA>` 32 under `alignas(32)`). The `('sizeof')*` prefix loop in `unaryExpression` consumes the token before the `('sizeof'\|'alignof') '(' typeName ')'` alternative can match, so a prefix `sizeof` is serviced by a TEXT-reconstruction handler that asks `GetType` for the source spelling, and `dataStructures` is keyed on the mangled instantiation name. `alignof` has no prefix loop and lands on the real `ParseTypeName`. This is the residual FEATURE gap behind the crash `fix/sizeof-closure` closed; that branch's floor was the located diagnostic. Measured identical on `f24fb18` and on the fix. Filed 2026-08-06 by `fix/sizeof-closure`. |
 | [[zero-parameter-generic-function-emits-double-mangled-symbol]] | link failure | `int gid<T>() { T v = default; return 7; }` called as `gid<P>()` fails to link: `undefined symbol: __gid__P_gid__P__`, the instantiation name applied twice. One value parameter is enough to make the same shape work (`gone<P>(5)` runs), and inference works (`gtwo(p)` runs) - it is the ZERO-value-parameter generic function called with an explicit type argument. Not diagnosed. Measured identical on `f24fb18` and on `fix/sizeof-closure`; unrelated to that fix, found on its probe run. Filed 2026-08-06. |
 | [[closure-type-argument-to-a-generic-function]] | feature gap | A closure type as a generic FUNCTION's type argument does not resolve, in either spelling: explicit `idf<function<int(int)>>(g)` gives `unknown type 'function<int(int)>'` reported on the TEMPLATE's parameter list, and inferred `idf(g)` mangles the argument from its LLVM repr and instantiates `idf__i8`. The generic STRUCT path funnels through `ResolveTypeArgEntry` and works (`Box<Lambda<...>>`, `list<function<...>>`, and after `fix/lamptr-generic` also `Box<function<T>*>`); this path appears not to, so the fat/thin pointer asymmetry that landed there does not reach it. Non-closure control `idf<int*>(&n)` works on both binaries. Measured identical on `4c06cce` and on the merged `fix/lamptr-generic`. Filed 2026-08-05 by `fix/lamptr-generic`. |
+| [[defaulted-ctor-param-default-construct-aborts]] | compiler crash | Default-constructing a `class`/`struct` whose only ctor has ALL parameters defaulted crashes the COMPILER at compile time - the `-o` compile itself nondeterministically exits `134`, `139`, or `1` with an internal "declared with no enclosing scope" diagnostic; no executable is ever produced. Also fails on the explicit-argument spelling (`CDef d = CDef(7);`). Identical on `master` (33b3ac4, 134 8/8) and `fix/class-undef` (63107e2); not a regression from that fix. Root cause not traced. Found by the round-1 review of `fix/class-undef`. |
 
 ### P3 - diagnostics, latent, deliberate deferrals (`p3/`)
 
@@ -2479,8 +2479,8 @@ found by review and all worth recording explicitly rather than leaving implicit 
 
 **Left open, filed separately, NOT closed by this change** (all found during Phase A enumeration
 or the review rounds of this fix, all confirmed to reproduce identically on `master`):
-[[class-no-ctor-default-construct-returns-undef]] (a `class` with no user constructor
-default-constructs to `undef`, unrelated code path), [[struct-field-default-brace-list-discarded]]
+`class-no-ctor-default-construct-returns-undef` (a `class` with no user constructor
+default-constructs to `undef`, unrelated code path; FIXED by `fix/class-undef`, record below), [[struct-field-default-brace-list-discarded]]
 (a struct FIELD's own brace-list default is dropped, not a variable declarator), and
 [[interface-typed-global-brace-init-discarded]] (an interface-typed global falls through this
 fix's guard entirely, since `GetDataStructure` has no entry for an interface name) - plus the
@@ -5401,3 +5401,63 @@ error` on the POST binary when its expected string is corrupted.
 fat closure, two-parameter signature, `void()`, closure pointer, and `sizeof` of a named fixed
 array). These pass on BOTH binaries by design: they are the frozen accept set for the predicate,
 not regression legs, and they are what would have caught an over-broad widening of it.
+
+---
+
+## Landed: `fix/class-undef` (2026-08-06) - a `class` with no user-written constructor default-constructs to zero, not `undef`
+
+Closes and deletes `internal/issue/p1/codegen/class-no-ctor-default-construct-returns-undef.md`.
+
+### The issue file's root cause was WRONG, and the truth is simpler
+
+The file hypothesised that a `struct` with no constructor "leaves `GetFunction` empty and falls
+through to a real zero-init alloca", i.e. that struct and class take DIFFERENT paths. Measured,
+they take the SAME path: `ParseStructDefinition` also synthesizes `_S_S__` and the declaration
+site also calls it. The only difference is the seed of the aggregate the synthetic body builds:
+
+- `MainListener_Aggregates.cpp:300` (struct/union) - `llvm::Constant::getNullValue(structType)`,
+  carrying a comment that says exactly why ("so fields lacking an explicit initializer read as
+  0/null ... instead of leaking stack garbage").
+- `MainListener_Aggregates.cpp:2637` (class) - `llvm::UndefValue::get(structType)`, the
+  un-updated twin. Fields WITH an initializer are `CreateInsertValue`d over the seed; fields
+  without one are never written, so they kept the `undef`. With no defaulted field at all the
+  whole return stayed `undef`: `define internal %C @_C_C__() { entry: ret %C undef }`.
+
+Verified oracle: `struct S {int a; int b;}` emits `ret %S zeroinitializer` and
+`struct SD {int a = 5; int b;}` emits `ret %SD { i32 5, i32 0 }` - so the struct reference is
+correct on BOTH the zero axis and the field-default axis before being matched.
+
+### Fix shape
+
+Shape 2 from the issue file (give the synthesized ctor a real body), one token:
+seed with `Constant::getNullValue` instead of `UndefValue::get`. Shape 1 (do not register the
+ctor at all) was rejected on measurement: `struct Box<T> { T v; }` instantiated at `Box<CNoCtor>`
+calls `_CNoCtor_CNoCtor__` from the CONTAINER's own default ctor, so the symbol is depended on.
+
+Site audit for the seed: all four synthetic-ctor emitters in `MainListener_Aggregates.cpp` now
+agree - struct/union (300), imported program (1813), program (2142), class (2639). The class one
+was the sole outlier; no `UndefValue::get` remains in `MainListener_Aggregates.cpp`, the survivors
+elsewhere in the listener are all closure/thin-fn-ptr seeds that are fully insertvalue'd before
+use, none an aggregate ctor seed.
+
+### Out of scope, measured pre AND post, identical on both
+
+- Globals never run the ctor at all. `SD gs;` / `CD gc;` / `= default` all print `0 0` on both
+  binaries for BOTH struct and class - field defaults are dropped at global scope. That is
+  [[global-struct-no-initializer-ignores-field-defaults]], already filed, untouched here.
+- `string s = "hi";` as a field default is dropped for struct AND class, both binaries
+  (`s=[] n=0` post, `s=[]` pre). Pre-existing, shared, not this fix.
+- Positional `C c = {1,2}` is a hard error for class and struct alike, unchanged.
+- A `Test(...)` message string whose CONTENT contains `{}` retypes the literal as `string` and
+  breaks overload resolution - hit while writing the legs; it is the already-filed
+  [[string-literal-containing-braces-retyped-as-string]].
+
+### Verification
+
+`./test.sh Release` 600 passed / 0 failed / 8 skipped. `example_mac.sh Release` 35 passed /
+0 failed. Differential corpus sweep (compile+run of every `Test/*.cb` and `example/**/*.cb`,
+184 entries, both binaries): the only non-nondeterministic difference is the intended new legs
+in `test_initializer_list.cb`; the other 9 diffs are addresses, PIDs, timings and thread-race
+counters. `leaks --atExit` on an owning-field probe: 186 nodes / 16 KB / 0 leaks on BOTH
+binaries, destructor count 3 on both. Warm `--init-local` cache re-verified (the fix adds no
+field, so nothing enters the serializer).

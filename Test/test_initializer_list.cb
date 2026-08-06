@@ -43,6 +43,23 @@ struct PtrArg { int a = default; int b = default; };
 int ptrArgSum(PtrArg* p) { return p->a * 10 + p->b; }
 struct PtrArgHost { int use(PtrArg* p) { return p->a * 100 + p->b; } };
 
+// ===== class with no user-written constructor: the synthesized default ctor =====
+// Pre-fix the CLASS default ctor seeded its return aggregate with `undef` (the struct twin
+// already seeded with zero), so `_C_C__` was literally `ret %C undef`.
+class CNoCtor  { int a; int b; int c; int d; };            // no field has a default
+class CMixed   { int a = 7; int b; int c = 9; int d; };    // some defaulted, some not
+class CInner   { int x; int y; };
+class CNest    { CInner i; int z; };                       // class-in-class field
+class CWithDtor{ int a; int b; int c; int d; ~CWithDtor() { } };   // dtor, still no ctor
+class CWithCtor{ int a; int b; CWithCtor() { a = 11; b = 12; } };  // must be UNTOUCHED
+interface IArea { int Area(); };
+class CSide : IArea { int side; int Area() { return side * side; } };
+class COwn     { string s; int n; };                       // owning field: null, then teardown
+struct CBox<T> { T v; int tag; };                          // class inside a generic container
+
+int cNoCtorSum(CNoCtor v) { return v.a + v.b + v.c + v.d; }      // pass by value
+CNoCtor cNoCtorMake()     { CNoCtor t; return t; }               // return by value
+
 extern int main()
 {
     int passed = 0;
@@ -229,6 +246,74 @@ extern int main()
     total++; passed += Test("ptr param brace arg positional", ptrArgSum({a=1,b=2}), 12);
     total++; passed += Test("ptr param brace arg named", ptrArgSum(p: {a=1,b=2}), 12);
     total++; passed += Test("ptr param brace arg method", pah.use({a=3,b=4}), 304);
+
+    // ===== class with no user-written ctor default-constructs like the struct twin =====
+    // Every leg below read `undef` pre-fix. Discriminator for the all-zero legs: they SUM four
+    // (or three) independent fields, so a single stale stack word makes the sum non-zero - the
+    // pre-fix binary produced a different, varying non-zero value on each run.
+    CNoCtor cnc;
+    total++; passed += Test("class no-ctor bare local zero", cNoCtorSum(cnc), 0);
+    CNoCtor cnc2 = {};
+    total++; passed += Test("class no-ctor eq-empty-brace zero", cnc2.a + cnc2.b + cnc2.c + cnc2.d, 0);
+    CNoCtor cnc3 = default;
+    total++; passed += Test("class no-ctor '= default' zero", cnc3.a + cnc3.b + cnc3.c + cnc3.d, 0);
+
+    // Field defaults must still be honoured: 7*1000 + 9 is only reachable if the defaulted
+    // fields keep their values AND the undefaulted ones are zero. Garbage cannot hit 7009.
+    CMixed cmx;
+    total++; passed += Test("class no-ctor field defaults honoured", cmx.a * 1000 + cmx.b + cmx.c + cmx.d, 7009);
+
+    // Class-typed field of a class: the nested default ctor's result is inserted, so the
+    // nested fields are the ones that were undef.
+    CNest cn;
+    total++; passed += Test("class no-ctor nested class field zero", cn.i.x + cn.i.y + cn.z, 0);
+
+    // A destructor but no constructor still gets the synthesized zero ctor.
+    CWithDtor cwd;
+    total++; passed += Test("class no-ctor with dtor zero", cwd.a + cwd.b + cwd.c + cwd.d, 0);
+
+    // Must be UNTOUCHED: a user-written no-arg ctor suppresses the synthesized one entirely.
+    CWithCtor cwc;
+    total++; passed += Test("class user ctor unchanged", cwc.a * 100 + cwc.b, 1112);
+
+    // Interface dispatch after default construction: side is 0, so Area() is 0 through both the
+    // direct call and the fat-pointer slot. Assigning 6 then re-dispatching proves the vtable is
+    // real (36 is unreachable if the interface value lost its object or its slot).
+    CSide cs;
+    total++; passed += Test("class no-ctor iface direct after default", cs.Area(), 0);
+    IArea csi = cs;
+    total++; passed += Test("class no-ctor iface slot after default", csi.Area(), 0);
+    cs.side = 6;
+    IArea csi2 = cs;
+    total++; passed += Test("class no-ctor iface slot still dispatches", csi2.Area(), 36);
+
+    // Owning field: default must NULL the string (length 0, no garbage pointer) and the value
+    // must survive scope exit. length() on an undef {ptr,len} pair was reading a stale word.
+    {
+        COwn co;
+        total++; passed += Test("class no-ctor owning field empty", co.s.length() + co.n, 0);
+        co.s = "hello";
+        total++; passed += Test("class no-ctor owning field assignable", co.s.length(), 5);
+    }
+
+    // Storage axis: array element, heap `new`, by-value return, whole-value copy.
+    CNoCtor[3] cncArr;
+    total++; passed += Test("class no-ctor array elem zero",
+                            cncArr[0].a + cncArr[0].b + cncArr[2].c + cncArr[2].d, 0);
+    CNoCtor* cncHeap = new CNoCtor();
+    total++; passed += Test("class no-ctor heap new zero",
+                            cncHeap->a + cncHeap->b + cncHeap->c + cncHeap->d, 0);
+    delete cncHeap;
+    CNoCtor cncRet = cNoCtorMake();
+    total++; passed += Test("class no-ctor return by value zero", cNoCtorSum(cncRet), 0);
+    CNoCtor cncCopy = cnc;
+    total++; passed += Test("class no-ctor whole-value copy zero", cNoCtorSum(cncCopy), 0);
+
+    // A class inside a generic struct: the container's own default ctor CALLS _CNoCtor_CNoCtor__,
+    // so the undef propagated through the generic instantiation too.
+    CBox<CNoCtor> cbx;
+    total++; passed += Test("class no-ctor inside generic zero",
+                            cbx.v.a + cbx.v.b + cbx.v.c + cbx.v.d + cbx.tag, 0);
 
     if (passed == total)
     {
