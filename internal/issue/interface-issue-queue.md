@@ -233,9 +233,9 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. Split into [`p1/codegen/`](p1/codegen/) (16) and [`p1/crash/`](p1/crash/) (1). | 17 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 37 |
-| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 35 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. Split into [`p1/codegen/`](p1/codegen/) (16) and `p1/crash/` (0 - the folder is EMPTY and therefore absent from disk, since git cannot track an empty directory; recreate it when the next row is filed). | 16 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 39 |
+| **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 36 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
 Counts re-verified from disk on 2026-08-05 (`ls internal/issue/p1/*/*.md internal/issue/p{2,3}/*.md
@@ -258,6 +258,17 @@ bucket on that tree, counted not computed):
 ([[data-pointer-assigned-to-thin-function-value]] in `p1/codegen/`,
 [[sizeof-generic-over-closure-type-segfaults-compiler]] in `p1/crash/`,
 [[inline-deref-of-container-call-result-has-no-storage]] in `p3/`).
+
+**Recount 2026-08-06, after `fix/sizeof-closure`** (`ls` per bucket on that tree, counted not
+computed): **16 P1 (16 codegen / 0 crash) / 39 P2 / 36 P3 / 7 UI = 98 total.** One file deleted
+(`sizeof-generic-over-closure-type-segfaults-compiler` from `p1/crash/`, which EMPTIES that
+bucket) and three filed: two in `p2/`
+([[sizeof-over-generic-instantiation-unresolved-while-alignof-resolves]], the deliberately-left
+feature gap behind that crash, and
+[[zero-parameter-generic-function-emits-double-mangled-symbol]], an unrelated link failure found
+on the same probe run), and one in `p3/`
+([[sizeof-steals-discarded-tuple-comparison-spelling]], the measured cost of the fix's character
+test, found by review round 1 - the fix agent's matrix had no comma-comparison cell).
 
 Net movement: two P1s fixed and their files deleted (`funcptr-call-result-into-closure-param-garbage`,
 `unique-field-to-field-copy-double-frees`), and four new issues filed - three P1
@@ -523,20 +534,22 @@ produce a program.
 
 #### P1 / crash - dies with no usable diagnostic (`p1/crash/`)
 
-| Issue | Family | Severity |
-|---|---|---|
-| [[sizeof-generic-over-closure-type-segfaults-compiler]] | crash | Compiler **SIGSEGV, exit 139, zero output, no diagnostic at all** (not even the `CompilerManager` dump). `sizeof(Box<function<int(int)>>)` - and the `Lambda<>` and `list<T>` spellings - crash, while `sizeof(function<int(int)>)` compiles and `sizeof(Box<int>)` gives a located `unknown type 'Box<int>'`. So it is specific to a generic instantiation whose type ARGUMENT is a closure type. Identical on `8c5a860` and on the merged `fix/genfn-lowering`. Floor: reach the same `unknown type` arm `Box<int>` reaches. Filed 2026-08-05 by `fix/genfn-lowering`. |
+**This bucket is EMPTY as of 2026-08-06.** No rows. The folder itself is gone from disk because
+git cannot track an empty directory - recreate `internal/issue/p1/crash/` when the next row is
+filed, and restore the table header with it.
 
-This bucket now holds exactly ONE row, and it is a TRUE crash: SIGSEGV, exit 139, no output at
-all. Two landings emptied the rest of it. `fix/chain-coalesce` fixed and deleted
+Three landings emptied it. `fix/chain-coalesce` fixed and deleted
 `chained-nullcoalesce-not-boxed-into-interface`; `fix/genfn-lowering` (2026-08-05) fixed and
 deleted BOTH `generic-wrapper-over-function-type-llvm-fatal` and
 `list-of-function-element-into-closure-param-fails-verifier`, as well as the P2
-`closure-by-value-into-generic-struct-field` that shared their root. See the landed record below -
+`closure-by-value-into-generic-struct-field` that shared their root (see the landed record below -
 the filed LLVM ISel fatal had already DRIFTED into a located hard error before that branch
 started, and re-measuring found two spellings that were compiler SIGSEGVs, which the files did not
-record. The row above is what that branch left behind, found on a neighbour axis and measured
-identical on both binaries.
+record). `fix/sizeof-closure` (2026-08-06) fixed and deleted the last one,
+`sizeof-generic-over-closure-type-segfaults-compiler` - the residual FEATURE gap behind it is now
+[[sizeof-over-generic-instantiation-unresolved-while-alignof-resolves]] in `p2/`, which is exactly
+the "located diagnostic is the floor, the feature gap may stay open" split this bucket's
+convention calls for.
 
 The bucket's standing convention is unchanged by the emptying: an LLVM assert, fatal, or verifier
 failure reachable from plain source belongs here whether or not it literally aborts, because a raw
@@ -595,12 +608,15 @@ deleted 2026-08-05), which closed the four decidable spellings and named this on
 | [[simd-type-spelling-unusable-outside-declarations]] | feature gap | `simd<T,N>` is recognised only in `ParseDeclarationSpecifiers` and as a `primaryExpression`, so a cast target, a lambda parameter and a tuple/`function<>` signature component all say "unknown type 'simd<float,4>'", and `simd<T,N>[]` silently DROPS the empty bracket and compiles as a plain vector local. Measured identical on `904f026` and `fix/simdptr`. Wants one encoded-name mechanism (mirroring `BuildEncodedClosureName`), not four patches. Filed 2026-08-03. |
 | [[c-binder-misses-decorated-function-pointer-parameter]] | false rejection | A `const`-qualified C function-pointer parameter binds as `void*`, and the code-value gate then rejects the legal call. Found 2026-08-03 verifying the `void*` oracle for `fix/funcptr-rebind`; the file's first filing named the wrong qualifier and repro - the correction inside is the useful part. Had no row here until 2026-08-04. |
 | [[double-pointer-arg-binds-single-pointer-param]] | silent wrong value | `byPtr(pp)` with a `Circle**` and a `Circle*` parameter compiles, links and RUNS, returning the low bytes of the pointee address instead of the field (`2003` expected; the exit code is the pointee ADDRESS's low bytes, so it is ENVIRONMENT-dependent - the same binary gives 176 and 224 from two different output directories - and a change in it is NOT a change in behaviour). Opaque pointers make both sides one LLVM type, so unlike its `T*`-into-`T` sibling there is nothing for the module verifier to catch. Same predicate (`IsTypeMatch`), depth axis instead of the pointer-ness axis; held out of `fix/ptrarg-byval` because an `ElemPointer` rejection would reject programs that compile and run today, whereas that fix rejected a shape no compiling program can contain. Filed 2026-08-05 by `fix/ptrarg-byval`. |
+| [[sizeof-over-generic-instantiation-unresolved-while-alignof-resolves]] | feature gap | `sizeof(Box<double>)` gives a located `unknown type 'Box<double>'` while `alignof(Box<double>)` returns the correct 8 - and `alignof` is not guessing (`Box<char>` 1, `Box<BigA>` 32 under `alignas(32)`). The `('sizeof')*` prefix loop in `unaryExpression` consumes the token before the `('sizeof'\|'alignof') '(' typeName ')'` alternative can match, so a prefix `sizeof` is serviced by a TEXT-reconstruction handler that asks `GetType` for the source spelling, and `dataStructures` is keyed on the mangled instantiation name. `alignof` has no prefix loop and lands on the real `ParseTypeName`. This is the residual FEATURE gap behind the crash `fix/sizeof-closure` closed; that branch's floor was the located diagnostic. Measured identical on `f24fb18` and on the fix. Filed 2026-08-06 by `fix/sizeof-closure`. |
+| [[zero-parameter-generic-function-emits-double-mangled-symbol]] | link failure | `int gid<T>() { T v = default; return 7; }` called as `gid<P>()` fails to link: `undefined symbol: __gid__P_gid__P__`, the instantiation name applied twice. One value parameter is enough to make the same shape work (`gone<P>(5)` runs), and inference works (`gtwo(p)` runs) - it is the ZERO-value-parameter generic function called with an explicit type argument. Not diagnosed. Measured identical on `f24fb18` and on `fix/sizeof-closure`; unrelated to that fix, found on its probe run. Filed 2026-08-06. |
 | [[closure-type-argument-to-a-generic-function]] | feature gap | A closure type as a generic FUNCTION's type argument does not resolve, in either spelling: explicit `idf<function<int(int)>>(g)` gives `unknown type 'function<int(int)>'` reported on the TEMPLATE's parameter list, and inferred `idf(g)` mangles the argument from its LLVM repr and instantiates `idf__i8`. The generic STRUCT path funnels through `ResolveTypeArgEntry` and works (`Box<Lambda<...>>`, `list<function<...>>`, and after `fix/lamptr-generic` also `Box<function<T>*>`); this path appears not to, so the fat/thin pointer asymmetry that landed there does not reach it. Non-closure control `idf<int*>(&n)` works on both binaries. Measured identical on `4c06cce` and on the merged `fix/lamptr-generic`. Filed 2026-08-05 by `fix/lamptr-generic`. |
 
 ### P3 - diagnostics, latent, deliberate deferrals (`p3/`)
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[sizeof-steals-discarded-tuple-comparison-spelling]] | deliberate deferral | `fix/sizeof-closure`'s admission of `(` `)` `,` inside generic brackets also classifies the tuple-comparison text `a<b,c>d` as a type. Measured cost is ONE spelling: the value-DISCARDED statement `sizeof(a<b,c>d);` went from rc 0 (a no-op that printed `ok`) to `unknown type 'a<b,c>d'`. Every CONSUMING form was already rejected on PRE with a different message (`cannot cast an aggregate value`; `no overload of 'operator+' ... tuple__bool__bool`, which is what proves the tuple reading), and the tuple WITHOUT `sizeof` (`tuple<bool, bool> t = (a<b, c>d);`) is accepted identically on both binaries - nothing outside the `sizeof` operand was taken. The POST message also calls a tuple expression a "type". NOT fixed by an expression fallback: that is exactly the fallthrough that reached `CreateCast` with a null `Primary` and SIGSEGVed. Take it with [[sizeof-over-generic-instantiation-unresolved-while-alignof-resolves]], whose fix makes the parser (not a character test) decide. Filed 2026-08-06 by review round 1 of `fix/sizeof-closure`. |
 | [[inline-deref-of-container-call-result-has-no-storage]] | diagnostic | False rejection with a LOCATED but internal-sounding message: `(*ls.get(0))(2)` on a `list<function<int(int)>*>` gives `Unable to dereference an object without a Storage.` while the two-line form (`function<int(int)>* e0 = ls.get(0); (*e0)(2)`) compiles and runs - that two-line spelling is what `Test/test_function_ptr.cb` already covers. A deref wants an addressable `Storage`; a call RESULT has only `Primary`. Element type is probably incidental - check `*someCall()` on a plain `int*` return before scoping it as a container issue. Identical on `8c5a860` and on the merged `fix/genfn-lowering`. Filed 2026-08-05 by `fix/genfn-lowering`. |
 | [[implied-move-store-boxed-spelling-false-rejects]] | diagnostic | PRE-EXISTING false rejection, identical on `d93c359` and on the merged `fix/ptrcopy`. A plain `p = c;` store between two pointer locals is an IMPLIED MOVE, so the raw `delete p;` is correct and accepted - but `MarkPointerRebound` runs BEFORE the transfer and records `InheritedKeepsOwner` naming `c`, which is null by then. Nothing reads that in the raw-delete guard; `BindingKeepsOwnershipOfBoxedObject` does, so the BOXED twin is rejected with a message that is false at that site. P3: working remedy, mis-blamed rather than dangerous. Recorded because it is why `fix/ptrcopy` introduced `JoinKeepsOwner` as a SEPARATE field. Filed 2026-08-05 by `fix/ptrcopy`. |
 | [[interface-boxing-keyed-on-source-binding]] | deliberate deferral | RE-BUCKETED P1 -> P3 2026-08-04, on the file's own text: the live double free it was filed for was CLOSED 2026-08-02 (borrowed-interface-box delete diagnosed via the positive keeps-owner proof; landed record below), and only the preventive remainder is left - `RegisterInterfaceBox` dedupes on `FatValue` alone, harmless today. The file kept its name and moved to `p3/`, so existing links still resolve. |
@@ -5245,3 +5261,143 @@ which is what proves the leg pins the new diagnostic rather than a pre-existing 
 be exercised in either direction until that is fixed". It is fixed now, and the `add` direction is
 exercised by `cbv_fat_list_named` (accept) and the new `expect_error` leg (reject). The record
 itself is a dated snapshot and is left as written, per this file's standing convention.
+
+---
+
+## Landed: `fix/sizeof-closure` (2026-08-06) - a `sizeof` operand that looks like a generic type stays on the TYPE path
+
+Closes `sizeof-generic-over-closure-type-segfaults-compiler` (P1/crash, deleted; that bucket is
+now empty). The floor the issue file set - "reach the same `unknown type` arm `Box<int>` reaches" -
+is what landed. The FEATURE question it separated out is filed as
+[[sizeof-over-generic-instantiation-unresolved-while-alignof-resolves]].
+
+### Root cause
+
+`ParseUnaryExpression` (`cflat/MainListener.h:17712`) services a prefix `sizeof` by rebuilding the
+operand's type from raw TEXT, and only takes the type path when a character test passes. That test
+was a whitelist of `[A-Za-z0-9_.<>*]`. Every closure spelling carries `(` and `)` in its signature
+(`function<int(int)>`), and every multi-argument instantiation carries `,` (`Pair<int,float>`), so
+those texts failed the test and fell through to `ParsePostfixExpression`, which evaluated the
+parenthesized text as an ordinary expression and returned a NamedVariable with a NULL `Primary`
+and NO diagnostic. The `(int)` cast in the filed repro then dereferenced that null inside
+`LLVMBackend::CreateCast` (confirmed under lldb: `EXC_BAD_ACCESS` at `+48`, the `Value->getType()`
+load) - SIGSEGV, exit 139, zero output. Without a cast the same operand SILENTLY produced garbage:
+`long long s = sizeof(Box<function<int(int)>>);` compiled, ran, and printed `8512798976`. The
+issue file recorded the crash face only; the silent face is the same defect in a different
+containment.
+
+The filed framing ("specifically an instantiation whose type ARGUMENT is a closure type") is
+NARROWER than the truth. The discriminator is the CHARACTER, not the closure: `sizeof(Pair<int,float>)`
+and `sizeof(map<int,int>)` SIGSEGV identically with no closure anywhere.
+
+### The fix
+
+The character test now admits `(`, `)` and `,` when they occur at generic-bracket depth >= 1, and
+requires the brackets to balance when it used that admission. Texts with parens at depth 0
+(`sizeof(f(1))`, `sizeof(buf)`, `sizeof(x + 1)`) and unbalanced texts (`sizeof(a<b)`) keep their
+existing classification exactly. One site: `likelyType` has no other copy (grepped), and the
+neighbouring variable-name gate two blocks below is keyed on `find('<') == npos`, which every
+newly-admitted text fails, so it is unreachable from the new admission by construction.
+
+### Coverage matrix - measured pre (`f24fb18`) and post, `-o` compiles, never `--check`
+
+| Cell | PRE | POST |
+|---|---|---|
+| `sizeof(Box<function<int(int)>>)` | SIGSEGV, no output | `unknown type 'Box<function<int(int)>>'` |
+| `sizeof(Box<Lambda<int(int)>>)` | SIGSEGV | `unknown type 'Box<Lambda<int(int)>>'` |
+| `sizeof(list<function<int(int)>>)` | SIGSEGV | `unknown type 'list<function<int(int)>>'` |
+| `sizeof(Box<function<void()>>)` | SIGSEGV | located `unknown type` |
+| `sizeof(Box<function<int(int)>*>)` | SIGSEGV | located `unknown type` |
+| `sizeof(Box<Box<function<int(int)>>>)` | SIGSEGV | located `unknown type` |
+| `sizeof(Pair<int,float>)` - NO closure | SIGSEGV | `unknown type 'Pair<int,float>'` |
+| `sizeof(map<int,int>)` - NO closure | SIGSEGV | `unknown type 'map<int,int>'` |
+| same, with the instantiation USED first | SIGSEGV | located `unknown type` |
+| same, inside `if const` | SIGSEGV | located `unknown type` |
+| `long long s = sizeof(Box<function<int(int)>>)` (no cast) | compiles, runs, prints `8512798976` | located `unknown type` |
+| `sizeof(N.Box2<function<int(int)>>)` | `'Box2' does not name a value here` | `unknown type 'N.Box2<function<int(int)>>'` |
+| `sizeof(Box<int>)`, `sizeof(Box<Box<int>>)`, `sizeof(list<int>)`, `sizeof(Box<Cb>)` | located `unknown type` | IDENTICAL |
+| `sizeof(function<int(int)>)` / `<int(int,int)>` / `<void()>` / `*` | 8 | 8 |
+| `sizeof(Lambda<int(int)>)` | 16 | 16 |
+| `sizeof(int)` 4, `sizeof(S)` 8, `sizeof(S*)` 8, `sizeof(string)` 16 | as listed | IDENTICAL |
+| `sizeof(buf)` on `char[128]` | 128 | 128 |
+| `sizeof(f(1))` 1, `sizeof(x + 1)` 2, `sizeof(sizeof(int))` 4 | as listed | IDENTICAL (bogus on both - see below) |
+| `sizeof(a<b)` | `unknown type 'a<b'` | IDENTICAL |
+| `sizeof(Nope)` | `unknown type 'Nope'` | IDENTICAL |
+| `sizeof(int[4])`, `sizeof(*p)` | pre-existing located cast errors | IDENTICAL |
+| `alignof(Box<function<int(int)>>)` 8, `alignof(Box<int>)` 4, `alignof(Pair<int,float>)` 4 | as listed | IDENTICAL |
+
+`alignof` is untouched by the diff and could not be otherwise: its operand text starts `alignof(`,
+whose paren is at bracket depth 0, so the character test rejects it before and after. That it
+nonetheless RESOLVES generic instantiations correctly is the asymmetry now filed as a P2.
+
+`sizeof(f(1))` = 1 and `sizeof(x + 1)` = 2 are wrong on BOTH binaries. They are the expression
+path's own answers, they predate this branch, and this fix deliberately does not move them - a
+change there would move `sizeof` of a value expression, which is a much larger accept set.
+
+### The axis the matrix MISSED, and what review round 1 found in it
+
+The matrix above enumerated closure spellings, generic-argument shapes, containment (used
+instantiation, `if const`, namespace-qualified), and expression operands with parens at depth 0.
+It had **no comma-comparison / tuple cell at all** - no operand where the newly-admitted `,` sits
+inside brackets that are a COMPARISON rather than a generic argument list. Review round 1 attacked
+exactly that gap and found the one spelling the fix takes: `a<b,c>d`, which in cflat is a genuine
+two-element tuple expression (`tuple__bool__bool`).
+
+Measured cost, PRE `f24fb18` vs POST:
+
+| Program | PRE | POST |
+|---|---|---|
+| `sizeof(a<b,c>d);` - value DISCARDED | rc 0, runs, prints `ok` | rc 1, `unknown type 'a<b,c>d'` |
+| `i64 z = sizeof(a<b,c>d);` | rc 1, `cannot cast an aggregate value ...` | rc 1, `unknown type 'a<b,c>d'` |
+| `i64 z = sizeof(a<b,c>d) + 0;` | rc 1, `no overload of 'operator+' ... [0] tuple__bool__bool` | rc 1, `unknown type 'a<b,c>d'` |
+| `tuple<bool, bool> t = (a<b, c>d);` - no `sizeof` | rc 1, `Unknown identifier 'item0'` (the TUPLE on the line above is accepted) | IDENTICAL |
+
+So the loss is one value-DISCARDED no-op statement; every consuming form was already rejected on
+PRE with a different message, and the tuple outside a `sizeof` operand is untouched. Left as-is
+deliberately and filed as [[sizeof-steals-discarded-tuple-comparison-spelling]] (P3), including
+the note that the POST message calls a tuple expression a "type". The obvious repair - fall back
+to the expression path when the type lookup fails - is precisely the fallthrough that reached
+`CreateCast` with a null `Primary` and SIGSEGVed the compiler, so it is the one repair that must
+not be made here; it becomes safe only once the operand is routed through the real `typeName` rule
+(the P2's fix), where the PARSER decides instead of a character test.
+
+The generalizable lesson is the one this file already carries about axis products: an operand
+classifier's axes are the SHAPES OF TEXT it can see, and "a comma inside angle brackets that is
+not a type-argument list" is a shape. Enumerating closure and generic spellings covered the
+intended readings of the admitted characters and none of the unintended ones.
+
+### Cells deliberately out of scope
+
+- Making `sizeof` over an instantiation RESOLVE. Not trivially contained: it needs the operand
+  re-parsed through the `typeName` rule or a grammar change to the `('sizeof')*` prefix loop, and
+  the loop is what makes `sizeof(buf)` and `sizeof(expr)` work at all. Filed as a P2 with its
+  accept set enumerated.
+- `sizeof(T)` in a generic body where `T` substitutes to a closure spelling
+  (`unknown type 'function<int(int)>'`, identical on both binaries) - same P2, same root: the
+  prefix handler resolves by source spelling and `GetType` is keyed on the mangled name.
+- The `alignof` operand never reaching the text handler at all. Correct as-is; it reaches the
+  better resolver.
+
+### Why no differential corpus sweep
+
+The change can only alter the classification of a `sizeof`/`alignof` PREFIX operand, and only for
+texts carrying `(`, `)` or `,` inside balanced generic brackets. `grep -rn "sizeof([^)]*<" Test/
+example/ cflat/core/ performance/` returns **8 hits, all of them lines this branch added**. No
+pre-existing corpus file performs the crossing, so a whole-corpus A/B is structurally incapable of
+saying anything here (the standing lesson about zero-difference sweeps, applied in the honest
+direction). The evidence is the targeted matrix above plus the two suites, which compile the whole
+corpus anyway.
+
+### Test legs
+
+`Test/errors/err_types.cb` - 3 new `expect_error` legs: a thin closure argument, a fat `Lambda<>`
+argument, and the closure-free two-argument `SizeofPair<int, float>` (which proves the
+discriminator is the character, not the closure). Each was mutation-tested INDIVIDUALLY against
+the PRE binary as a single-leg file: all three make PRE exit 139 with no output - i.e. each fails
+there for exactly the filed reason, the compiler SIGSEGV - and each flips to `FAIL: expected
+error` on the POST binary when its expected string is corrupted.
+
+`Test/test_interface.cb::testSizeofClosureTypeSpellings` - 6 accept-set value legs (thin closure,
+fat closure, two-parameter signature, `void()`, closure pointer, and `sizeof` of a named fixed
+array). These pass on BOTH binaries by design: they are the frozen accept set for the predicate,
+not regression legs, and they are what would have caught an over-broad widening of it.

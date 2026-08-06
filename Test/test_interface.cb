@@ -4738,6 +4738,27 @@ bool testNullIfaceDispatchAcceptSet()
     return result;
 }
 
+// Accept-set for the sizeof operand's type-name test: closure type spellings carry '(' and ')'
+// in their signature, and the sizeof/alignof grammar path must keep resolving them. Their
+// rejected neighbour (a closure INSIDE a generic instantiation) is pinned in err_types.cb.
+bool testSizeofClosureTypeSpellings()
+{
+    bool result = true;
+
+    result &= Test("sizeof_thin_closure", (int)sizeof(function<int(int)>), 8);
+    result &= Test("sizeof_fat_closure", (int)sizeof(Lambda<int(int)>), 16);
+    result &= Test("sizeof_thin_closure_two_params", (int)sizeof(function<int(int, int)>), 8);
+    result &= Test("sizeof_thin_closure_void", (int)sizeof(function<void()>), 8);
+    result &= Test("sizeof_thin_closure_ptr", (int)sizeof(function<int(int)>*), 8);
+
+    // sizeof of a VARIABLE keeps measuring the variable's storage: its text has no generic
+    // brackets, so the type-name test must keep classifying it the way it always did.
+    char[24] scBuf = default;
+    result &= Test("sizeof_named_fixed_array", (int)sizeof(scBuf), 24);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -4798,6 +4819,7 @@ extern int main()
     total++; passed += testNamespacedClassExplicitCtor()          ? 1 : 0;
     total++; passed += testNamespacedInterfaces()                ? 1 : 0;
     total++; passed += testInterfaceReturnDangleCorpus()          ? 1 : 0;
+    total++; passed += testSizeofClosureTypeSpellings()            ? 1 : 0;
     total++; passed += testNamespacedInterfaceShadowsCoreName()   ? 1 : 0;
     total++; passed += testInterfaceFunctionPointerParam()         ? 1 : 0;
     total++; passed += testNullIfaceDispatchAcceptSet()             ? 1 : 0;

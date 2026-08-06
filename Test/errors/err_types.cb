@@ -1,5 +1,7 @@
 // Type errors: unknown types, identifiers, fields, is/as casts
 
+import "function.cb";
+
 interface IShape { int Area(); };
 class Circle : IShape
 {
@@ -56,6 +58,33 @@ expect_error("is not a known struct or interface type for 'as' cast") {
         IShape shape = c;
         Circle* gp = shape as GhostType;
         return 0;
+    }
+}
+
+// sizeof over a generic INSTANTIATION is not resolved (alignof is - see
+// p2/sizeof-over-generic-instantiation-unresolved-while-alignof-resolves). All
+// three spellings below used to SIGSEGV the compiler with no diagnostic at all.
+struct SizeofBox<T> { T item = default; };
+struct SizeofPair<A, B> { A a = default; B b = default; };
+
+expect_error("unknown type 'SizeofBox<function<int(int)>>'") {
+    int test_sizeof_thin_closure_arg()
+    {
+        return (int)sizeof(SizeofBox<function<int(int)>>);
+    }
+}
+
+expect_error("unknown type 'SizeofBox<Lambda<int(int)>>'") {
+    int test_sizeof_fat_closure_arg()
+    {
+        return (int)sizeof(SizeofBox<Lambda<int(int)>>);
+    }
+}
+
+expect_error("unknown type 'SizeofPair<int,float>'") {
+    int test_sizeof_two_type_args()
+    {
+        return (int)sizeof(SizeofPair<int, float>);
     }
 }
 

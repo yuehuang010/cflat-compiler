@@ -17729,16 +17729,29 @@ public:
                     postfixText = postfixText.substr(1, postfixText.length() - 2);
                 }
 
-                // Check if this looks like a type name (alphanumeric, dots, underscores, generics)
+                // Does this look like a type name? '(' ')' ',' count as type text only INSIDE
+                // balanced generic brackets (Pair<int,float>, Box<function<int(int)>>).
                 bool likelyType = !postfixText.empty() && (std::isalpha(postfixText[0]) || postfixText[0] == '_');
+                int angleDepth = 0;
+                bool usedBracketPunct = false;
                 for (char c : postfixText)
                 {
-                    if (!std::isalnum(c) && c != '_' && c != '.' && c != '<' && c != '>' && c != '*')
+                    if (c == '<') { angleDepth++; continue; }
+                    if (c == '>') { angleDepth--; continue; }
+                    if (std::isalnum(c) || c == '_' || c == '.' || c == '*')
+                        continue;
+                    if (angleDepth > 0 && (c == '(' || c == ')' || c == ','))
                     {
-                        likelyType = false;
-                        break;
+                        usedBracketPunct = true;
+                        continue;
                     }
+                    likelyType = false;
+                    break;
                 }
+                // Only the newly-admitted punctuation demands balanced brackets; an unbalanced
+                // spelling like 'a<b' keeps its existing (bracket-free) classification.
+                if (usedBracketPunct && angleDepth != 0)
+                    likelyType = false;
 
                 if (likelyType)
                 {
