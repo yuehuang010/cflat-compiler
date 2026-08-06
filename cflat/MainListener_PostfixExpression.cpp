@@ -3237,6 +3237,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                     // `T[]` looks like a thin `T*` and gets boxed into an interface param.
                                     argVar.TypeAndValue.ElemPointer = argNV.TypeAndValue.ElemPointer;
                                     argVar.TypeAndValue.IsArrayView = argNV.TypeAndValue.IsArrayView;
+                                    // Same for a FIXED `T[N]`: LoadNamedVariable already decayed argValue
+                                    // to the element-0 address, so ConstArraySize is the only surviving
+                                    // signal that this argument was an array, not a plain value - the
+                                    // funcptr shape gate (FunctionPointerShapeOf) needs it to tell
+                                    // `function<T>[N]` apart from a bare `function<T>` at the call site.
+                                    argVar.TypeAndValue.ConstArraySize = argNV.TypeAndValue.ConstArraySize;
                                     argVar.CallerName = argNV.CallerName;
                                     // Per-field move tracking: moving `node->left` marks only that field.
                                     argVar.FieldName = argNV.FieldName;
@@ -3767,6 +3773,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                     // Same for `T**`: without it the argument looks like a plain `T*` and a
                                     // pointer-to-pointer would be boxed into an interface parameter.
                                     argVar.TypeAndValue.ElemPointer = argNV.TypeAndValue.ElemPointer;
+                                    // Same for a FIXED `T[N]`: argValue is already the decayed element-0
+                                    // address (LoadNamedVariable), so ConstArraySize is the only surviving
+                                    // signal that this was an array - needed by the funcptr shape gate
+                                    // (FunctionPointerShapeOf) to tell `function<T>[N]` from a bare value.
+                                    argVar.TypeAndValue.ConstArraySize = argNV.TypeAndValue.ConstArraySize;
                                     // A stored 'function<>'/'Lambda<>' argument's SIGNATURE, so the overload
                                     // scorer can reject a function pointer of a disagreeing signature.
                                     // TypeName and IsFunctionPointer are deliberately left alone here.

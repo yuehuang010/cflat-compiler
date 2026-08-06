@@ -311,6 +311,33 @@ int LLVMBackend::FunctionPointerShapeOf(const LLVMBackend::TypeAndValue& tv, con
         return tv.Pointer ? 1 : 0;
     }
 
+std::string LLVMBackend::FuncPtrShapeWord(const TypeAndValue& tv, const NamedVariable* nv) const
+{
+        // Family, when the source says which one; empty means "say 'closure' and no more".
+        std::string family;
+        if (tv.TypeName == "__c_fn_ptr") family = "function<>";
+        else if (tv.TypeName == "__closure_fat_ptr") family = "Lambda<>";
+        else if (IsEncodedClosureType(tv.TypeName))
+            family = IsThinEncodedClosureType(tv.TypeName) ? "function<>" : "Lambda<>";
+        else if (nv != nullptr && nv->Primary != nullptr && llvm::isa<llvm::Function>(nv->Primary))
+            family = "function<>";  // a bare named function is a thin code address
+
+        int shape = FunctionPointerShapeOf(tv, nv);
+        if (shape == 2)
+        {
+            // A fixed 'T[N]' and a 'T[]' view share a shape but are not the same spelling; the
+            // length is only known from ConstArraySize, which an alloca-derived shape lacks.
+            bool isView = tv.IsArrayView && tv.ConstArraySize == 0;
+            if (family.empty()) return isView ? "a closure view" : "a closure array";
+            std::string dim = isView ? "[]"
+                : (tv.ConstArraySize > 0 ? std::format("[{}]", tv.ConstArraySize) : "[N]");
+            return std::format("a '{}{}' {}", family, dim, isView ? "view" : "array");
+        }
+        if (shape == 1)
+            return family.empty() ? "a closure pointer" : std::format("a '{}*' pointer", family);
+        return family.empty() ? "a closure value" : std::format("a '{}' value", family);
+    }
+
 std::string LLVMBackend::ResolveFuncPtrTypeSpelling(const std::string& typeName) const
 {
         std::string cur = typeName;

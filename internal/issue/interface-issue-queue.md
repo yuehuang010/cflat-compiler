@@ -520,7 +520,6 @@ produce a program.
 
 | Issue | Family | Severity |
 |---|---|---|
-| [[shape-mismatched-funcptr-arg-binds-silently]] | miscompile | Silent miscompile then SIGBUS (exit 138), no diagnostic. A `function<T>*` binds where a plain `function<T>` value is expected; the scorer now detects the shape mismatch but still lowers the mismatched arm when no better-shaped candidate exists. Filed 2026-07-31. |
 | [[string-literal-containing-braces-retyped-as-string]] | miscompile + false rejection | A string literal whose CONTENT contains a brace pair (`"a = {} b"`) is typed `string` instead of `char*`. At a call it stops every `char*` overload matching and the diagnostic blames the call; at a VARIADIC it is a SILENT MISCOMPILE - `printf("a = {} b\n");` compiles and runs rc 0 printing binary garbage, and the dedicated `cannot pass 'string' to the variadic '...'` guard does not fire. Identical on both binaries. Filed 2026-08-02 in `p2/` for the rejection face; the miscompile face may warrant P1. |
 | [[extern-decl-drops-fixed-array-return-size]] | silent wrong ABI | `extern char[8] extmk();` compiles clean on BOTH `ca5a02a` and `fix/array-storage` - the `[8]` is dropped and the declaration binds to a symbol returning one `char`. The by-value fixed-array-return reject landed on the DEFINITION path only; this is the one remaining spelling of that axis. Not a regression. Filed 2026-08-02. |
 | [[temp-unique-field-escapes-through-a-plain-pointer-parameter]] | memory-unsafe accept | Silent use-after-free, compiles clean and exits 0, identical on `14097e1` and on the merged `fix/tempuniq`. `keep(makeBox().t)` where `void keep(Node* n) { g = n; }` reads a freed block (proven by dtor count + reallocation aliasing; the `MallocScribble` fill shows only on ld64.lld-linked builds`. The DECLARED remainder of `temp-unique-field-escapes-through-unguarded-spellings` (closed and
@@ -6660,3 +6659,152 @@ and the cold-cache probe above confirms it).
   one - so it is NOT a regression. Narrowing the clause would move the three ratified
   `Test/errors/err_namespaced_generic_iface_*.cb` messages, which is why it is deliberately not
   fixed here. Filed as [[last-segment-collision-still-shells-unknown-generic]].
+### fix/shape-arg - a SELECTED shape-mismatched funcptr argument now rejects instead of lowering
+
+Closed `shape-mismatched-funcptr-arg-binds-silently` (file deleted).
+
+**Subsumption first.** The filed repro `only(&g)` and the issue file's own "variable spelling"
+`only(p)` (a `function<T>*` VARIABLE, not just `&expr`) are BOTH already rejected on `bdd6869`
+with the pre-existing "cannot pass a non-function pointer value ... a data pointer would be
+called as code" message - `closure-param-accepts-data-pointer`'s provenance gate landed first and
+subsumed the filed spelling. Verified directly (not inferred): both compile-reject with that exact
+wording on the pre-`fix/shape-arg` binary. What remained live was the residual shape cross-product
+the provenance gate cannot see, because the argument genuinely IS a function pointer there - just
+the wrong INDIRECTION SHAPE.
+
+**Matrix (argument shape x parameter shape, `function<int(int)>`), PRE -> POST:**
+
+| Argument | Param VALUE (shape 0) | Param POINTER `T*` (shape 1) | Param VIEW `T[]` (shape 2) |
+|---|---|---|---|
+| VALUE (a `function<T>` variable) | ok (shape0->shape0) | **SIGSEGV 139 -> rejected** | **SIGSEGV 139 -> rejected** |
+| NAMED FUNCTION (bare `dbl`, no variable) | ok | **SIGSEGV 139 -> rejected** | **SIGSEGV 139 -> rejected** |
+| POINTER `&var` / a `T*` variable (`p`) | already rejected (provenance gate, message frozen) | ok (shape1->shape1) | rejected (separate "raw pointer as array-view" gate, frozen, unrelated to this fix) |
+| FIXED ARRAY `T[N]` (the whole array) | **SIGBUS 138 -> rejected** | ok (array decays to its own address = a valid slot address; frozen accept, `shape_array_into_pointer_decay`) | ok (array decays to a view; pre-existing, `cvs_fnptr_array_view`) |
+| ARRAY ELEMENT `arr[i]` | ok (shape0->shape0; frozen accept, `shape_array_element_into_value`) | n/a (address-of an element into `T*` is `&arr[i]`, a POINTER arg, covered above) | n/a |
+| `nullptr` | SIGSEGV 139, uninvestigated - filed separately as `nullptr-into-thin-funcptr-value-calls-null` (P3), likely a DIFFERENT bug (null-deref-at-call, not a shape confusion; `FunctionPointerShapeOf` sees shape0==shape0, no disagreement to reject) | ok, unaffected (compared, never called; frozen accept, `shape_nullptr_into_pointer`) | ok, unaffected (frozen accept, `shape_nullptr_into_view`) |
+
+Two-arm overload ranking (`pickFnPtrShape`/`pickFnPtrShapeRev`, the `4000fa1` behaviour) is
+unaffected by construction: the gate only fires on the SELECTED candidate's argument, and ranking
+already prefers the shape-matching arm, so a correctly-resolving two-arm call never reaches a
+mismatch. Frozen as accept-set legs (`shape_overload_picks_array_arm`,
+`shape_overload_picks_pointer_arm`).
+
+Note the matrix has THREE live faces, not the two the issue file described: the issue's repro and
+root cause covered VALUE->POINTER only. Phase A's cross-product also found VALUE->VIEW and
+ARRAY->VALUE live (both SIGSEGV/SIGBUS, no diagnostic) and a named-function spelling of the first
+two (bare `dbl`, not through a variable) - all fixed by the same two gates below, since a named
+function scores `FunctionPointerShapeOf` shape 0 exactly like a variable.
+
+**The gate** is one shared function, `LLVMBackend::RejectFuncPtrShapeMismatch`
+(`cflat/LLVMBackend_Overloads.cpp`), judging the (argument, parameter) pair and reporting; it runs
+after the candidate is already SELECTED, so multi-arm ranking is untouched. Two faces:
+- Parameter shape 1 or 2 (`function<T>*` / `function<T>[]`, both `Pointer=true`) with argument
+  shape 0 - a bare VALUE reaching a pointer/view slot. Exempts a literal `nullptr`
+  (`ConstantPointerNull`) explicitly, matching `ArgumentIsProvablyDataPointer`'s own escape hatch.
+- Parameter shape 0 (the plain-VALUE param) with argument shape 2 (array/view) only, NOT `!= 0` -
+  a shape-1 (pointer) argument is already caught by `ArgumentIsProvablyDataPointer`, with its OWN
+  message; widening to `!= 0` would preempt that check and change its wording (would have broken
+  the `only(&g)`/`only(p)` freeze).
+
+**Gate INVENTORY - three doors, not one.** A first cut applied the two checks inline at the two
+lowering arms of `CreateOverloadedFunctionCall`, which left two live faces behind (both measured on
+`bdd6869` AND on that first cut: compiles clean, exit 139, no diagnostic):
+- **Virtual dispatch.** `LLVMBackend::CallInterfaceMethod` (`cflat/LLVMBackend_WinRT.cpp`) lowers
+  its own argument list and never enters `CreateOverloadedFunctionCall`, so ARRAY->VALUE and
+  VALUE->POINTER through an interface method were untouched. It now calls the shared gate at the
+  head of its per-argument loop (skipping an interface parameter, whose own arm owns that pair).
+- **Encoded (monomorphized generic) closure parameters.** `list<function<int(int)>>::add`'s
+  `T value` is not `IsFunctionPointer`, so a gate keyed on that flag alone never saw it -
+  `L.add(arr)` with a `function<int(int)>[2]` bound silently and SIGSEGV'd at `L[0](3)`. The gate's
+  parameter predicate now mirrors the SCORER's, `IsFunctionPointer || IsEncodedClosureType(...)`,
+  which has always treated the two as one family.
+
+**Message wording** (`LLVMBackend::FuncPtrShapeWord`, now taking the `TypeAndValue` + optional
+`NamedVariable` instead of a bare shape int):
+- The old version hard-coded `a 'function<>[]' view` for EVERY shape-2 operand and `function<>` for
+  every family, so a fixed `function<T>[N]` and a `Lambda<T>[N]` were both described as a
+  `function<>[]` view - a spelling the source never wrote.
+- The family is now derived: `__c_fn_ptr` -> `function<>`, `__closure_fat_ptr` -> `Lambda<>`, an
+  encoded closure via its registered flavour, and a bare `llvm::Function` argument -> `function<>`
+  (a named function is a thin code address). When none of those answers - the common case on the
+  ARGUMENT side, since the call-argument loops copy a stored closure's SIGNATURE but deliberately
+  not its TypeName - the word is the generic "closure value" / "closure array" / "closure view"
+  rather than an asserted spelling. The PARAMETER word is always exact (shape and family are part
+  of its declaration), so the message still names what the slot wants.
+- The trailing ADVICE branches on the parameter's shape: "Take the address with `&`" for a pointer
+  param, "Pass a `function<>[N]` array or another view" for a VIEW param. The old text advised `&`
+  for both, which is false for a view - `&g` is a pointer, and a raw pointer into a `T[]` slot is
+  refused by the array-view gate, i.e. the advice sent the user into a second error.
+
+**Guard polarity.** Both gates reject only a PROVABLE shape disagreement between two CLASSIFIED
+shapes (`FunctionPointerShapeOf` on the PARAMETER is always fully reliable - shape is part of its
+static declaration; on the ARGUMENT it is reliable once `Pointer`/`IsArrayView`/`ConstArraySize`
+are correctly threaded through). `0 == 0` (both value-shaped, the common case) is never touched.
+
+**A real defect surfaced mid-fix, not in the gate polarity but in the SIGNAL the gate reads.** The
+ARRAY->VALUE direction (`only(arr)`) does not lower through a shape computed at the gate site at
+all - by the time an argument reaches `CreateOverloadedFunctionCall`, a by-value read of a fixed
+array has already been decayed to its element-0 address by `LoadNamedVariable`
+(`MainListener_Expressions.cpp`), and neither METHOD call-argument-assembly loop
+(`MainListener_PostfixExpression.cpp`, the INTERFACE-method-call loop and the STRUCT-method-call
+loop - not the free-function-call loop, which never needed it) propagated `ConstArraySize` onto the
+argument `NamedVariable` the way it already propagates `IsArrayView` (with an explicit comment
+stating why: "otherwise ... looks like a thin `T*`"). Both sites now propagate `ConstArraySize`
+alongside `IsArrayView`, for the identical reason.
+
+**Which spellings the propagation actually decides** (measured against a build of this commit with
+the two `ConstArraySize` lines removed, not inferred): a LOCAL fixed array through a FREE call
+(`only(arr)`), through a STRUCT method, and a `Lambda<T>[N]` array all still reject WITHOUT it -
+those carry their array-ness some other way. The two spellings that need it are a struct FIELD
+holding a fixed array (`only(b.cbs)`, `scratch/rv_d3.cb`: compiles clean and exits 139 without the
+propagation) and a FILE-SCOPE fixed array (the `shapeArrayIntoValue` leg's spelling: silently
+compiles and links without it). Both are pinned by legs, so the two lines are not dead weight. A first
+attempt fell back to re-deriving the argument's shape from its declared symbol-table entry by
+`CallerName` when the direct read gave shape 0 - this FALSE-REJECTED an array ELEMENT access
+(`arr[i]`, correctly shape 0) because `CallerName` names the base array for BOTH the whole-array
+and the per-element spelling, and the fallback could not tell them apart; found via the accept-set
+leg `shape_array_element_into_value` before it shipped, then removed in favour of the direct
+`ConstArraySize` propagation (which distinguishes them correctly, since indexing already clears
+`ConstArraySize` to 0 on the element's `NamedVariable`).
+
+**Accept set** (`Test/test_function_ptr.cb::testFuncPtrShapeGateAccepts`, frozen before the reject
+was written, re-run after - every leg also passed on the pre-fix binary): array decaying to a
+pointer parameter, an array element into a value parameter, `nullptr` into a pointer parameter,
+`nullptr` into a view parameter, and both arms of the two-arm shape-ranking overload set. Plus the
+accept halves of the two extra doors: value -> value through a VTABLE slot (variable and bare-name
+spellings) and through an ENCODED closure parameter (`list<function<int(int)>>::add`, then calling
+the stored element). Plus the full existing `Test/test_function_ptr.cb` (`74/74`, was `73/73` - one
+new test function added) and `Test/errors/err_data_pointer_to_closure_param.cb` (`127/127`
+`expect_error` legs, all PASS, including the 5 pre-existing legs that pin the frozen
+provenance-gate wording).
+
+**Legs** (`Test/errors/err_data_pointer_to_closure_param.cb`, new `expect_error` blocks, each
+proven fail-on-PRE against a build at `bdd6869`): VALUE->POINTER (`shapeValueIntoPointer`),
+VALUE->VIEW (`shapeValueIntoView`), ARRAY->VALUE (`shapeArrayIntoValue`), the named-function
+spelling of the first two (`shapeNamedFunctionIntoPointer`, `shapeNamedFunctionIntoView` - the
+latter pins the corrected VIEW advice rather than the message head), the two VIRTUAL faces
+(`shapeArrayIntoValueVirtual`, `shapeValueIntoPointerVirtual`, both exit 139 pre-fix), the ENCODED
+closure parameter (`shapeArrayIntoEncodedClosureValue`, exit 139 pre-fix), the FAT family of
+ARRAY->VALUE (`shapeLambdaArrayIntoValue`, `Lambda<int(int)>[2]` into a `Lambda<int(int)>` value,
+exit 139 pre-fix - every other leg passes a thin `function<>`), and the view-VARIABLE face
+(`shapeViewVariableIntoValue`, see the message change below) - 10 legs.
+
+**A message CHANGE, recorded deliberately.** A `function<T>[]` VIEW VARIABLE passed into a VALUE
+parameter (`function<int(int)>[] v = arr; only(v);`, `scratch/rv_e3.cb`) was ALREADY rejected pre-fix
+by the closure-PROVENANCE gate, with "cannot pass a non-function pointer value to `function<>`
+parameter `f`". The shape gate now runs first and reports the SHAPES instead. This is a deliberate
+preemption, not a regression: the provenance wording asserted the value was not a function pointer,
+which is false for a view OF function pointers, while the shape wording names the real defect and
+the fix ("index an element"). Pinned by `shapeViewVariableIntoValue` so it cannot silently revert.
+The `only(&g)` / `only(p)` POINTER spellings keep the provenance wording untouched (shape 1 into a
+value parameter is still left to that gate on purpose).
+
+**Found, filed, not fixed here**: `nullptr` into a plain `function<T>` VALUE parameter compiles
+clean and SIGSEGVs when called - filed as `nullptr-into-thin-funcptr-value-calls-null` (P3),
+flagged as an open DESIGN question (intentional null-pointer-call UB, matching C, vs. a missed
+null-safety gap) rather than fixed, since `FunctionPointerShapeOf` sees no shape disagreement
+there and forcing it into this gate would conflate two different questions.
+
+`./cmake_build.sh release && bash test.sh Release` - 600 passed, 0 failed, 8 skipped.
+`bash example_mac.sh Release` - 35 passed, 0 failed. One commit,
+`git rev-list --count bdd6869..HEAD` = 1.

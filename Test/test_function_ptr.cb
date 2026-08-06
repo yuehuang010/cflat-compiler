@@ -2249,6 +2249,72 @@ bool testFuncPtrArgProvenanceAccepts()
     return result;
 }
 
+int spAcceptDbl(int x) { return x * 2; }
+int spAcceptSq(int x)  { return x * x; }
+int spTakesPtrAccept(function<int(int)>* fp) { return (*fp)(4); }
+int spOnlyAccept(function<int(int)> f) { return f(3); }
+int spCheckPtrNull(function<int(int)>* fp) { return fp == nullptr ? -1 : 0; }
+double spSumViewAccept(function<int(int)>[] fs) { return fs == nullptr ? -1.0 : 0.0; }
+
+// The gate is applied at virtual dispatch and to an ENCODED (monomorphized generic) closure
+// parameter too, so the shape-0 -> shape-0 crossing must keep binding through both.
+interface ISpShape { int only(function<int(int)> f); };
+class SpShapeImpl : ISpShape { int only(function<int(int)> f) { return f(3); } };
+
+// Accept set for the shape-mismatch gate (fix/shape-arg): every crossing that must stay legal
+// once `function<T>`, `function<T>*` and `function<T>[]` mismatches start being rejected.
+// Frozen BEFORE the reject was written (per internal/skill/fix-issue - build the accept set
+// first), then re-run after: every leg here passed on the pre-fix binary too.
+bool testFuncPtrShapeGateAccepts()
+{
+    bool result = true;
+
+    // shape 2 (ARRAY) -> shape 1 (POINTER): a fixed `function<T>[N]` decays to the address of
+    // its own element 0, which IS what a `function<T>*` parameter wants - the array's own
+    // address and `&arr[0]` are the same bits. Must stay legal: only ARRAY -> VALUE (a plain
+    // `function<T>` slot, which needs the callable itself, not an address) is the live bug.
+    function<int(int)>[2] spArrAccept = { spAcceptDbl, spAcceptSq };
+    result &= Test("shape_array_into_pointer_decay", spTakesPtrAccept(spArrAccept), 8);
+
+    // shape 0 (an array ELEMENT, not the array itself) -> shape 0 (VALUE): `arr[0]` is a plain
+    // value read (a GEP, not the whole allocation), so it must keep binding a value parameter.
+    result &= Test("shape_array_element_into_value", spOnlyAccept(spArrAccept[1]), 9);
+
+    // nullptr into every pointer/view shape: a null literal carries no shape flags at all and
+    // must not be mistaken for a shape-0 value (it is never called, only compared).
+    result &= Test("shape_nullptr_into_pointer", spCheckPtrNull(nullptr), -1);
+    result &= Test("shape_nullptr_into_view", (int)spSumViewAccept(nullptr), -1);
+
+    // Two-arm overload ranking by shape (the pre-existing 4000fa1 behaviour) must be unaffected:
+    // the correctly-shaped arm is chosen, so the gate (which only fires on a SELECTED mismatch)
+    // never sees a disagreement here.
+    function<int(int)>[2] spShapeArr;
+    spShapeArr[0] = spAcceptDbl;
+    spShapeArr[1] = spAcceptSq;
+    function<int(int)> spShapeOne = spAcceptSq;
+    result &= Test("shape_overload_picks_array_arm", pickFnPtrShape(spShapeArr, 3), 106);
+    result &= Test("shape_overload_picks_pointer_arm", pickFnPtrShape(&spShapeOne, 3), 209);
+
+    // VIRTUAL dispatch: the same gate runs in CallInterfaceMethod, so a matching value->value
+    // crossing through a vtable slot must stay legal - both the variable and the bare-name
+    // spelling. The rejecting faces of the same slot are legs in err_data_pointer_to_closure_param.
+    SpShapeImpl spImpl;
+    ISpShape spIface = spImpl;
+    function<int(int)> spIfaceVal = spAcceptDbl;
+    result &= Test("shape_iface_value_into_value", spIface.only(spIfaceVal), 6);
+    result &= Test("shape_iface_named_into_value", spIface.only(spAcceptDbl), 6);
+
+    // ENCODED closure parameter (list<function<int(int)>>::add's `T value`): the gate's parameter
+    // predicate now covers it, so a plain value must still bind and remain callable.
+    list<function<int(int)>> spList;
+    spList.add(spIfaceVal);
+    spList.add(spAcceptSq);
+    result &= Test("shape_encoded_closure_value_into_value", spList[0](3), 6);
+    result &= Test("shape_encoded_closure_named_into_value", spList[1](3), 9);
+
+    return result;
+}
+
 // --- A `function<>` CALL RESULT passed to a closure parameter -----------------
 // The call result carried the CALLEE's name in CallerName, and the fat-closure argument arm
 // re-resolved that name to the callee's own address - so the closure's code slot became the
@@ -3255,6 +3321,10 @@ extern int main()
 
     // Function-pointer argument provenance / signature gating: legal spellings still bind
     total++; passed += testFuncPtrArgProvenanceAccepts()  ? 1 : 0;
+
+    // Accept set for the shape-mismatch gate (fix/shape-arg): array->pointer decay, an array
+    // element (shape 0), nullptr into pointer/view, and two-arm shape ranking stay legal.
+    total++; passed += testFuncPtrShapeGateAccepts()       ? 1 : 0;
 
     // A `function<>` CALL RESULT into a closure parameter (fat and thin)
     total++; passed += testFuncPtrCallResultIntoClosureParam() ? 1 : 0;

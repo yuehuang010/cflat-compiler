@@ -2254,6 +2254,12 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         {
             const auto& nv = callArgNVs[i];
             const auto& param = methodInfo->Parameters[i];
+
+            // Same closure SHAPE gate the direct call path applies (RejectFuncPtrShapeMismatch):
+            // a vtable slot lowers each argument by bit pattern, so a mismatch is called as code.
+            if (!param.IsInterface && RejectFuncPtrShapeMismatch(nv, param))
+                return nullptr;
+
             if (param.IsInterface && !nv.TypeAndValue.IsInterface)
             {
                 // Concrete struct/pointer -> interface fat ptr upconversion.

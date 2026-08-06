@@ -1979,3 +1979,181 @@ expect_error("cannot assign a 'void*' value to closure destination 'cb'") {
         return cb(1);
     }
 }
+
+/*
+ * Shape-mismatched function-pointer argument, a DIFFERENT hole than everything above: the value
+ * genuinely IS a function pointer (ArgumentIsProvablyDataPointer correctly says "not data"), it
+ * is just the WRONG INDIRECTION SHAPE for the parameter - `function<T>`, `function<T>*` and
+ * `function<T>[]` are three distinct shapes with no implicit conversion between them. The
+ * overload scorer (FunctionPointerShapeOf, added by 4000fa1) already detects the disagreement
+ * and scores it non-perfect, but with a single candidate the mismatched arm still bound and
+ * lowered - a bare VALUE landed in a POINTER/VIEW slot (or vice versa) and the wrong bytes got
+ * called as code (SIGSEGV/SIGBUS, no diagnostic). See
+ * internal/issue/p1/codegen/shape-mismatched-funcptr-arg-binds-silently.md (deleted by this fix).
+ *
+ * The filed repro's `only(&g)` and `only(p)` spellings are a SEPARATE, already-landed hole
+ * (closure-param-accepts-data-pointer's provenance gate above) - both keep their existing
+ * "cannot pass a non-function pointer value" message unchanged; this section is only the
+ * residual VALUE<->POINTER/VIEW shape gate that gate does not cover.
+ */
+
+int spDbl(int x) { return x * 2; }
+
+// shape 0 (VALUE) into shape 1 (POINTER): passing a `function<T>` variable, with no '&', where
+// `function<T>*` is expected. Pre-fix: compiled clean, called the callee's own machine code as
+// data and SIGSEGV'd (the value's Primary is already pointer-typed under opaque pointers, so
+// the generic by-value-into-pointer-param path passed it through unchanged).
+// The ARGUMENT word is the generic "closure" here and the PARAMETER word is exact: a call
+// argument carries the stored closure's signature but not its TypeName (the call-argument loops
+// leave TypeName alone on purpose), so the family is genuinely unknown on the argument side,
+// while a parameter's shape and family are both part of its declaration. The named-function legs
+// below DO name the family - an llvm::Function argument is a thin code address, i.e. `function<>`.
+expect_error("cannot pass a closure value to closure parameter 'fp', which expects a 'function<>*' pointer") {
+    function<int(int)> spgVal = spDbl;
+    int spTakesPtr(function<int(int)>* fp) { return (*fp)(4); }
+
+    int shapeValueIntoPointer()
+    {
+        return spTakesPtr(spgVal);
+    }
+}
+
+// shape 0 (VALUE) into shape 2 (VIEW): same hole, on the `function<T>[]` view parameter.
+expect_error("cannot pass a closure value to closure parameter 'fs', which expects a 'function<>[]' view") {
+    function<int(int)> spgVal2 = spDbl;
+    int spSumView(function<int(int)>[] fs) { return fs[0](4); }
+
+    int shapeValueIntoView()
+    {
+        return spSumView(spgVal2);
+    }
+}
+
+// shape 2 (ARRAY) into shape 0 (VALUE): a fixed `function<T>[N]` passed where a plain
+// `function<T>` is wanted. Pre-fix: compiled clean, called the ARRAY's own address as code and
+// SIGBUS'd. This direction needed ConstArraySize propagated onto the call-argument NamedVariable
+// (MainListener_PostfixExpression.cpp) alongside IsArrayView - LoadNamedVariable already decays
+// a fixed array to its element-0 address before the shape gate ever sees the argument, so the
+// gate reads ConstArraySize off the call-site NamedVariable, not off the decayed value.
+expect_error("cannot pass a closure array to closure parameter 'f', which expects a 'function<>' value") {
+    function<int(int)>[2] spArr = { spDbl, spDbl };
+    int spOnly(function<int(int)> f) { return f(3); }
+
+    int shapeArrayIntoValue()
+    {
+        return spOnly(spArr);
+    }
+}
+
+// A NAMED FUNCTION (not a variable) is shape 0 too: passing 'spDbl' directly, with no
+// intervening variable, to a pointer or view parameter is the same VALUE shape mismatch.
+expect_error("cannot pass a 'function<>' value to closure parameter 'fp', which expects a 'function<>*' pointer") {
+    int spTakesPtr2(function<int(int)>* fp) { return (*fp)(4); }
+
+    int shapeNamedFunctionIntoPointer()
+    {
+        return spTakesPtr2(spDbl);
+    }
+}
+
+// The VIEW parameter's ADVICE, pinned here rather than the message head (the head is pinned by
+// `shapeValueIntoView` above). "Take the address with '&'" is true for a `function<T>*` parameter
+// and FALSE for a view - `&g` is a pointer, and a raw pointer into a `T[]` slot is refused by the
+// array-view gate - so the advice branches on the PARAMETER's shape.
+expect_error("Pass a 'function<>[N]' array or another view to supply the shape it expects") {
+    int spSumView2(function<int(int)>[] fs) { return fs[0](4); }
+
+    int shapeNamedFunctionIntoView()
+    {
+        return spSumView2(spDbl);
+    }
+}
+
+/*
+ * The gate INVENTORY. The two faces above are the DIRECT call path; the same shape mismatch
+ * reaches a lowering site through two other doors, and each was still a silent SIGSEGV after the
+ * direct gate landed (measured on the pre-fix binary, exit 139 with no diagnostic):
+ *   - VIRTUAL dispatch (CallInterfaceMethod) lowers its own argument list and never enters
+ *     CreateOverloadedFunctionCall, so it needed the same gate applied to its loop.
+ *   - An ENCODED closure parameter - the monomorphized `T value` of `list<function<int(int)>>::add`
+ *     - is not `IsFunctionPointer`, so the gates' parameter predicate had to mirror the SCORER's
+ *     (`IsFunctionPointer || IsEncodedClosureType`), which already treats the two as one family.
+ * The accept halves of both doors (value -> value through a vtable slot and through `add`) are
+ * value legs in Test/test_function_ptr.cb::testFuncPtrShapeGateAccepts.
+ */
+
+// VIRTUAL, ARRAY -> VALUE. Pre-fix: compiled clean, exit 139.
+expect_error("cannot pass a closure array to closure parameter 'f', which expects a 'function<>' value") {
+    interface IShapeArr { int only(function<int(int)> f); };
+    class ShapeArrImpl : IShapeArr { int only(function<int(int)> f) { return f(3); } };
+
+    int shapeArrayIntoValueVirtual()
+    {
+        ShapeArrImpl impl;
+        IShapeArr io = impl;
+        function<int(int)>[2] arr = { spDbl, spDbl };
+        return io.only(arr);
+    }
+}
+
+// VIRTUAL, VALUE -> POINTER. Pre-fix: compiled clean, exit 139.
+expect_error("cannot pass a closure value to closure parameter 'fp', which expects a 'function<>*' pointer") {
+    interface IShapePtr { int takesPtr(function<int(int)>* fp); };
+    class ShapePtrImpl : IShapePtr { int takesPtr(function<int(int)>* fp) { return (*fp)(4); } };
+
+    int shapeValueIntoPointerVirtual()
+    {
+        ShapePtrImpl impl;
+        IShapePtr io = impl;
+        function<int(int)> g = spDbl;
+        return io.takesPtr(g);
+    }
+}
+
+// ENCODED closure parameter: `list<function<int(int)>>::add(T value)`. Pre-fix: compiled clean,
+// stored the array's own address as the element and exit 139 on the first `L[0](3)`.
+// Discriminator: the parameter is named 'value' - the generic's own parameter name, which no
+// hand-written leg in this file uses.
+expect_error("cannot pass a closure array to closure parameter 'value', which expects a 'function<>' value") {
+    int shapeArrayIntoEncodedClosureValue()
+    {
+        function<int(int)>[2] arr = { spDbl, spDbl };
+        list<function<int(int)>> L;
+        L.add(arr);
+        return L[0](3);
+    }
+}
+
+// The FAT (`Lambda<>`) family of the ARRAY -> VALUE face. Every other reject leg in this section
+// passes a thin `function<>`; a fat closure is 16 bytes {code, env} rather than 8, so its array
+// decays to a differently-strided address. Pre-fix: compiled clean, exit 139. Discriminator: the
+// parameter word is "a 'Lambda<>' value", emitted by no other leg.
+expect_error("which expects a 'Lambda<>' value") {
+    int spOnlyFat(Lambda<int(int)> f) { return f(3); }
+
+    int shapeLambdaArrayIntoValue()
+    {
+        int k = 3;
+        Lambda<int(int)>[2] fatArr;
+        fatArr[0] = (int x) => { return x + k; };
+        fatArr[1] = fatArr[0];
+        return spOnlyFat(fatArr);
+    }
+}
+
+// A `function<T>[]` VIEW VARIABLE (not a fixed array) into a VALUE parameter. This spelling was
+// ALREADY rejected pre-fix, by the closure-PROVENANCE gate ("cannot pass a non-function pointer
+// value to 'function<>' parameter 'f'"); the shape gate now preempts it and reports the SHAPES
+// instead. That message change is deliberate - the shape wording names the actual defect and the
+// fix ("index an element"), where the provenance wording claimed the value was not a function
+// pointer, which is false for a view of them. Pinned so the preemption cannot silently revert.
+expect_error("cannot pass a closure view to closure parameter 'f'") {
+    int spOnlyView(function<int(int)> f) { return f(3); }
+
+    int shapeViewVariableIntoValue()
+    {
+        function<int(int)>[2] backing = { spDbl, spDbl };
+        function<int(int)>[] v = backing;
+        return spOnlyView(v);
+    }
+}

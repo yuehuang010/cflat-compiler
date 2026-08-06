@@ -555,6 +555,43 @@ llvm::Value* LLVMBackend::TryEmitAtomicBuiltin(const std::string& name, const st
         return nullptr; // not an atomic builtin
     }
 
+bool LLVMBackend::RejectFuncPtrShapeMismatch(const NamedVariable& arg, const TypeAndValue& param)
+{
+        if (!param.IsFunctionPointer && !IsEncodedClosureType(param.TypeName))
+            return false;
+
+        int paramShape = FunctionPointerShapeOf(param, nullptr);
+        int argShape = FunctionPointerShapeOf(arg.TypeAndValue, &arg);
+        bool argIsNullLiteral = arg.Primary != nullptr
+            && llvm::isa<llvm::ConstantPointerNull>(arg.Primary);
+
+        const char* shapesAre = "'function<>', 'function<>*' and 'function<>[]' are three distinct "
+            "shapes and none converts to another implicitly.";
+
+        if (paramShape != 0 && argShape == 0 && !argIsNullLiteral)
+        {
+            // '&' produces a POINTER, so that advice is false for a view parameter.
+            const char* advice = paramShape == 2
+                ? "Pass a 'function<>[N]' array or another view to supply the shape it expects."
+                : "Take the address with '&' to supply the shape it expects.";
+            LogError(std::format("cannot pass {} to closure parameter '{}', which expects {}: {} {}",
+                FuncPtrShapeWord(arg.TypeAndValue, &arg), param.VariableName,
+                FuncPtrShapeWord(param, nullptr), shapesAre, advice));
+            return true;
+        }
+
+        if (paramShape == 0 && argShape == 2)
+        {
+            LogError(std::format("cannot pass {} to closure parameter '{}', which expects {}: {} "
+                "Index an element to supply the shape it expects.",
+                FuncPtrShapeWord(arg.TypeAndValue, &arg), param.VariableName,
+                FuncPtrShapeWord(param, nullptr), shapesAre));
+            return true;
+        }
+
+        return false;
+    }
+
 llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot)
 {
         std::string functionName = ResolveQualifiedName(functionNameIn, forceRoot);
@@ -835,6 +872,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     "cannot pass a raw pointer 'T*' as array-view parameter '{}' ('T[]') - a view "
                     "must span a whole allocation (it comes only from 'new T[n]' or another 'T[]'); "
                     "the 'T[] -> T*' decay is one-way", candParamItr->VariableName));
+
+            // Closure SHAPE gate (value vs pointer vs view), shared with virtual dispatch.
+            // Hoisted above the binding branches: it judges the pair, not one binding arm.
+            if (!inVariadicRange && !candParamItr->IsInterface
+                && RejectFuncPtrShapeMismatch(arg, *candParamItr))
+                return nullptr;
 
             if (!inVariadicRange && candParamItr->IsInterface && !arg.TypeAndValue.IsInterface)
             {

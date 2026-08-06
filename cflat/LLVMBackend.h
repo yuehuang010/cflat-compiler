@@ -4934,6 +4934,38 @@ public:
     static int FunctionPointerShapeOf(const LLVMBackend::TypeAndValue& tv, const NamedVariable* nv);
 
     /*
+     * How to SPELL a function-pointer shape in a diagnostic. The shape itself is
+     * FunctionPointerShapeOf's, re-derived here so the word and the verdict cannot drift. The
+     * FAMILY comes from the closure TypeName markers (thin '__c_fn_ptr' is 'function<>', fat
+     * '__closure_fat_ptr' is 'Lambda<>', an encoded generic closure carries its own flavour) and
+     * from a bare llvm::Function argument, which is a named function and therefore thin. When
+     * none of those says which family is in play the word stays a generic "closure": the call
+     * argument loops copy a stored closure's SIGNATURE without its TypeName, and naming a
+     * spelling the source may not have written is worse than naming less. Shape 2 likewise
+     * distinguishes a fixed 'function<>[N]' array from a 'function<>[]' view.
+     */
+    std::string FuncPtrShapeWord(const TypeAndValue& tv, const NamedVariable* nv) const;
+
+    /*
+     * The shape gate shared by every site that lowers an ALREADY-SELECTED candidate: the direct
+     * call (CreateOverloadedFunctionCall) and virtual dispatch (CallInterfaceMethod). 'function<T>',
+     * 'function<T>*' and 'function<T>[]' are three distinct shapes with no implicit conversion
+     * between them; the scorer ranks a disagreement non-perfect but with no better-shaped candidate
+     * the mismatched arm still bound, so a bare VALUE landed in a pointer/view slot (or an ARRAY's
+     * own address in a value slot) and the wrong bytes were called as code (SIGSEGV/SIGBUS, no
+     * diagnostic). Returns true, having reported, when the argument must not bind.
+     *
+     * Two faces only. A VALUE into a pointer/view parameter, and an ARRAY/VIEW into a plain value
+     * parameter. A POINTER argument into a value parameter is deliberately left to
+     * ArgumentIsProvablyDataPointer, which owns its own (frozen) wording - widening this gate to
+     * cover it would preempt that message. A literal 'nullptr' carries no shape flags at all and is
+     * exempt, the same escape that gate grants it. The PARAMETER predicate mirrors the scorer's
+     * ('IsFunctionPointer || IsEncodedClosureType'), so a monomorphized generic closure parameter -
+     * 'list<function<int(int)>>::add(T value)' - is gated exactly like a spelled one.
+     */
+    bool RejectFuncPtrShapeMismatch(const NamedVariable& arg, const TypeAndValue& param);
+
+    /*
      * Canonical DESCRIPTOR of one component of a function-pointer signature. A function pointer's
      * type is tracked in the type system rather than inferred from the LLVM value, which under
      * opaque pointers carries no signature at all - so the proof below is made on the DECLARED
