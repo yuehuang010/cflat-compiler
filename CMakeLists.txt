@@ -140,7 +140,13 @@ set(CFLAT_SOURCES
   ${CFLAT_DIR}/main.cpp
   ${CFLAT_DIR}/LLVMBackend.cpp
   ${CFLAT_DIR}/ForwardRefScanner.cpp
-  ${CFLAT_DIR}/MainListener.cpp
+  ${CFLAT_DIR}/MainListener_Declarations.cpp
+  ${CFLAT_DIR}/MainListener_Generics.cpp
+  ${CFLAT_DIR}/MainListener_Statements.cpp
+  ${CFLAT_DIR}/MainListener_Expressions.cpp
+  ${CFLAT_DIR}/MainListener_PostfixExpression.cpp
+  ${CFLAT_DIR}/MainListener_Aggregates.cpp
+  ${CFLAT_DIR}/MainListener_Utilities.cpp
   ${CFLAT_DIR}/CClangExtract.cpp
   ${CFLAT_DIR}/JsonRpcLoop.cpp
   ${CFLAT_DIR}/LspServer.cpp
@@ -207,7 +213,13 @@ if(MSVC)
   set_source_files_properties(
     ${CFLAT_DIR}/LLVMBackend.cpp
     ${CFLAT_DIR}/ForwardRefScanner.cpp
-    ${CFLAT_DIR}/MainListener.cpp
+    ${CFLAT_DIR}/MainListener_Declarations.cpp
+    ${CFLAT_DIR}/MainListener_Generics.cpp
+    ${CFLAT_DIR}/MainListener_Statements.cpp
+    ${CFLAT_DIR}/MainListener_Expressions.cpp
+    ${CFLAT_DIR}/MainListener_PostfixExpression.cpp
+    ${CFLAT_DIR}/MainListener_Aggregates.cpp
+    ${CFLAT_DIR}/MainListener_Utilities.cpp
     ${CFLAT_DIR}/CClangExtract.cpp
     ${ANTLR_GEN_DIR}/CFlatParser.cpp
     PROPERTIES COMPILE_OPTIONS "/bigobj")

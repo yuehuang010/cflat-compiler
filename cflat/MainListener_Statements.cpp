@@ -1,0 +1,2554 @@
+#include "MainListener.h"
+
+void MainListener::ParseBlockItemList(CFlatParser::BlockItemListContext* ctx) {
+        auto blockItems = ctx->blockItem();
+
+        // Unreachable-code hint (LSP only): a direct return/break/continue ends the
+        // block, so the items after it are dead - but only up to the next label. A
+        // `case:`/`default:`/goto label is a fresh entry point, so a switch body (whose
+        // arms each end in `break;`) has no dead code at all. Report each dead run and
+        // let normal codegen proceed unchanged (the loop below reopens a dead block).
+        if (auto* compiler = Compiler(ctx); compiler->HasHintRegionSink())
+        {
+            auto isLabel = [](CFlatParser::BlockItemContext* item)
+            {
+                auto* stmt = item->statement();
+                return stmt != nullptr && stmt->labeledStatement() != nullptr;
+            };
+
+            for (size_t i = 0; i + 1 < blockItems.size(); ++i)
+            {
+                auto* stmt = blockItems[i]->statement();
+                if (!stmt || stmt->jumpStatement() == nullptr) continue;
+
+                size_t deadEnd = i + 1;
+                while (deadEnd < blockItems.size() && !isLabel(blockItems[deadEnd]))
+                    ++deadEnd;
+
+                if (deadEnd > i + 1)
+                {
+                    auto* startTok = blockItems[i + 1]->getStart();
+                    auto* stopTok  = blockItems[deadEnd - 1]->getStop();
+                    int endCol = (int)stopTok->getCharPositionInLine()
+                               + (int)stopTok->getText().size();
+                    compiler->ReportHintRegion(
+                        (int)startTok->getLine(), (int)startTok->getCharPositionInLine(),
+                        (int)stopTok->getLine(), endCol,
+                        "unreachable code");
+                }
+                // Resume past the label that revives the block (it can never itself be a
+                // direct jump item, so skipping it as a candidate loses nothing).
+                i = deadEnd;
+            }
+        }
+
+        for (const auto& blockItem : blockItems)
+        {
+            auto decl = blockItem->declaration();
+            auto statement = blockItem->statement();
+            auto usingDecl = blockItem->usingDeclaration();
+            auto destructuring = blockItem->destructuringDeclaration();
+
+            auto* compiler = Compiler(blockItem);
+
+            // Dead code after a return/break/continue (typically one nested in a compound
+            // block or an `if const` arm, which inline into this block): the insert block is
+            // already terminated, so reopen emission in a fresh unreachable block. A
+            // `case:`/`default:` label switches blocks itself - a block injected here would be
+            // left empty and unterminated - so leave those to the labeled-statement path.
+            if (compiler->IsBlockTerminated()
+                && !(statement != nullptr && statement->labeledStatement() != nullptr))
+                compiler->ReopenAfterTerminator();
+
+            if (decl != nullptr)
+            {
+                compiler->SetCurrentDebugLocation(decl->getStart()->getLine());
+                ParseDeclaration(decl);
+            }
+            else if (statement != nullptr)
+            {
+                ParseStatement(statement);
+            }
+            else if (usingDecl != nullptr)
+            {
+                compiler->SetCurrentDebugLocation(usingDecl->getStart()->getLine());
+                ParseUsingDeclaration(usingDecl);
+            }
+            else if (destructuring != nullptr)
+            {
+                compiler->SetCurrentDebugLocation(destructuring->getStart()->getLine());
+                ParseDestructuringDeclaration(destructuring);
+            }
+
+            // End of a full expression / statement: free owned temporaries not claimed by a named
+            // local or move parameter (e.g. the unnamed `a + b` of a chained concat). Like C++.
+            compiler->FlushOwnedTemps();
+        }
+    }
+
+void MainListener::EnsureTupleInstantiated(const std::string& mangledName) {
+        if (!instantiatedGenerics.count(mangledName) && !genericStructTemplates.count("tuple"))
+            return;  // tuple.cb not imported - nothing to instantiate from
+        auto it = tupleTypeArgs.find(mangledName);
+        if (it == tupleTypeArgs.end())
+            return;
+        if (!instantiatedGenerics.count(mangledName))
+        {
+            pendingInstantiations.push_back({"tuple", it->second, mangledName});
+            instantiatedGenerics.insert(mangledName);
+        }
+        auto savedState = Compiler()->SaveBuilderState();
+        ProcessPendingInstantiations();
+        Compiler()->RestoreBuilderState(savedState);
+    }
+
+void MainListener::ParseDestructuringDeclaration(CFlatParser::DestructuringDeclarationContext* ctx) {
+        auto* compiler = Compiler(ctx);
+
+        // Evaluate the RHS once
+        auto rhsNV = ParseAssignmentExpressionNamed(ctx->assignmentExpression());
+        std::string rhsType = rhsNV.TypeAndValue.TypeName;
+
+        // Verify the RHS is a tuple type (mangled name starts with "tuple__")
+        if (rhsType.substr(0, 7) != "tuple__")
+        {
+            LogErrorContext(ctx, std::format("Destructuring requires a tuple type, got '{}'", rhsType));
+            return;
+        }
+
+        // A tuple reached only via a return type (its producer not yet code-generated, e.g. defined
+        // below this destructure) has a registered shell but no fields yet. Instantiate them now
+        // from the type args recorded when the shell was named.
+        if (compiler->GetDataStructure(rhsType).StructFields.empty())
+            EnsureTupleInstantiated(rhsType);
+
+        auto* structType = compiler->GetDataStructure(rhsType).StructType;
+        if (!structType)
+        {
+            LogErrorContext(ctx, std::format("Tuple type '{}' is not fully instantiated", rhsType));
+            return;
+        }
+
+        // Load the tuple value into a temporary alloca so we can GEP its fields
+        llvm::Value* tupleAlloca = rhsNV.Storage;
+        if (!tupleAlloca)
+        {
+            // RHS was a value not stored - create a temp alloca
+            tupleAlloca = compiler->CreateAlloca(structType);
+            compiler->builder->CreateStore(LoadNamedVariable(rhsNV), tupleAlloca);
+        }
+
+        const auto& structData = compiler->GetDataStructure(rhsType);
+        auto entries = ctx->destructuringEntry();
+
+        if (entries.size() != structData.StructFields.size())
+        {
+            LogErrorContext(ctx, std::format("Destructuring arity mismatch: {} variables for {} fields",
+                entries.size(), structData.StructFields.size()));
+            return;
+        }
+
+        // Declare each variable and load from the corresponding item_i field
+        for (size_t i = 0; i < entries.size(); i++)
+        {
+            auto* entry = entries[i];
+            std::string varName = entry->Identifier()->getText();
+
+            std::string fieldName = "item_" + std::to_string(i);
+            unsigned fieldIdx = 0;
+            for (const auto& f : structData.StructFields)
+            {
+                if (f.VariableName == fieldName) break;
+                fieldIdx++;
+            }
+
+            // `_` is the discard wildcard: skip binding this slot entirely. The value stays in
+            // the tuple, so the tuple's own destructor frees it (no extra var -> no double-free).
+            if (entry->declarationSpecifiers() == nullptr && varName == "_")
+                continue;
+
+            // Two entry forms: `T name` (explicit type) or a bare `name` whose type is inferred
+            // from the corresponding tuple field. A bare identifier other than `_` always infers.
+            LLVMBackend::TypeAndValue declType = entry->declarationSpecifiers() != nullptr
+                ? static_cast<LLVMBackend::TypeAndValue>(ParseDeclarationSpecifiers(entry->declarationSpecifiers()))
+                : static_cast<LLVMBackend::TypeAndValue>(structData.StructFields[fieldIdx]);
+
+            auto* gep = compiler->CreateStructGEP(structType, tupleAlloca, fieldIdx);
+            auto* fieldLLVMType = compiler->GetType(structData.StructFields[fieldIdx]);
+            auto* fieldVal = compiler->builder->CreateLoad(fieldLLVMType, gep);
+
+            // Allocate and store into the new variable
+            auto* alloca = compiler->CreateAlloca(fieldLLVMType);
+            compiler->builder->CreateStore(fieldVal, alloca);
+
+            declType.VariableName = varName;
+            LLVMBackend::NamedVariable namedVar;
+            namedVar.TypeAndValue = declType;
+            namedVar.Storage = alloca;
+            namedVar.BaseType = fieldLLVMType;
+            compiler->stackNamedVariable.back().namedVariable[varName] = namedVar;
+            compiler->RecordMoveGenBind(varName); // fresh tuple-destructure binding
+        }
+    }
+
+void MainListener::CollectCasesFromStatement(CFlatParser::StatementContext* stmt, SwitchContext& ctx) {
+        auto* compiler = Compiler(stmt);
+        if (!stmt) return;
+        auto labeled = stmt->labeledStatement();
+        if (!labeled) return;
+
+        bool hasArrow = labeled->FatArrow() != nullptr;
+
+        // Reject mixing C-style (:) and arm-style (=>) cases in the same switch.
+        if (hasArrow && !ctx.caseMap.empty() && !ctx.isArmStyle)
+            LogErrorContext(labeled, "cannot mix ':' and '=>' cases in the same switch");
+        if (!hasArrow && !ctx.caseMap.empty() && ctx.isArmStyle)
+            LogErrorContext(labeled, "cannot mix ':' and '=>' cases in the same switch");
+        if (hasArrow)
+            ctx.isArmStyle = true;
+
+        if (labeled->Case())
+        {
+            // Arm-style type pointer case: case TypeName* optVar => body
+            if (labeled->typeSpecifier() && labeled->pointer())
+            {
+                std::string typeName = labeled->typeSpecifier()->getText();
+                std::string boundVar = labeled->Identifier() ? labeled->Identifier()->getText() : "";
+                bool isStruct = compiler->dataStructures.count(typeName) > 0;
+                bool isInterface = compiler->interfaceTable.count(typeName) > 0;
+                if (!isStruct && !isInterface)
+                    LogErrorContext(labeled, std::format("'{}' is not a known struct or interface type", typeName));
+                if (!ctx.isTypeSwitch && !ctx.caseMap.empty())
+                    LogErrorContext(labeled, "cannot mix type cases with constant cases in a switch");
+                ctx.isTypeSwitch = true;
+                ctx.caseMap[labeled] = { nullptr, nullptr, compiler->CreateBasicBlock("switchTypeCase"), true, typeName, boundVar, true };
+                return;
+            }
+
+            // C-style or arm-style value/type case via constantExpression
+            auto constExpr = labeled->constantExpression();
+            if (!constExpr)
+            {
+                LogErrorContext(labeled, "case must have an expression");
+                return;
+            }
+
+            std::string exprText = constExpr->getText();
+            bool isStruct = compiler->dataStructures.count(exprText) > 0;
+            bool isInterface = compiler->interfaceTable.count(exprText) > 0;
+
+            // _ is a soft wildcard in arm-style switches - register as both default and caseMap entry
+            // so ParseStatement can locate this labeled node and emit the arm body with auto-jump.
+            if (hasArrow && exprText == "_")
+            {
+                ctx.defaultBlock = compiler->CreateBasicBlock("switchDefault");
+                ctx.caseMap[labeled] = { nullptr, nullptr, ctx.defaultBlock, false, "", "", true };
+                return;
+            }
+
+            if (isStruct || isInterface)
+            {
+                if (!ctx.isTypeSwitch && !ctx.caseMap.empty())
+                    LogErrorContext(labeled, "cannot mix type cases with constant cases in a switch");
+                ctx.isTypeSwitch = true;
+                ctx.caseMap[labeled] = { nullptr, nullptr, compiler->CreateBasicBlock("switchTypeCase"), true, exprText, "", hasArrow };
+                if (!hasArrow) CollectCasesFromStatement(labeled->statement(), ctx);
+            }
+            else
+            {
+                if (ctx.isTypeSwitch)
+                    LogErrorContext(labeled, "cannot mix constant cases with type cases in a switch");
+
+                llvm::Value* rawVal = ParseConditionalExpression(constExpr->conditionalExpression());
+                auto* val = llvm::dyn_cast<llvm::ConstantInt>(rawVal);
+                llvm::Constant* strLit = nullptr;
+                if (!val)
+                {
+                    strLit = llvm::dyn_cast<llvm::Constant>(rawVal);
+                    if (strLit && compiler->IsStringLiteralConstant(strLit))
+                        ctx.isStringSwitch = true;
+                    else
+                        LogErrorContext(labeled, "case value must be a constant integer or string literal");
+                }
+                ctx.caseMap[labeled] = { val, strLit, compiler->CreateBasicBlock("switchCase"), false, "", "", hasArrow };
+                if (!hasArrow) CollectCasesFromStatement(labeled->statement(), ctx);
+            }
+        }
+        else if (labeled->Default())
+        {
+            ctx.defaultBlock = compiler->CreateBasicBlock("switchDefault");
+            if (!hasArrow) CollectCasesFromStatement(labeled->statement(), ctx);
+        }
+    }
+
+CFlatParser::PostfixExpressionContext* MainListener::FindFirstCall(antlr4::tree::ParseTree* node) {
+        if (node == nullptr) return nullptr;
+        if (auto* pf = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+            if (!pf->argumentExpressionList().empty())
+                return pf;
+        for (auto* child : node->children)
+            if (auto* found = FindFirstCall(child))
+                return found;
+        return nullptr;
+    }
+
+void MainListener::ScanComparisons(antlr4::tree::ParseTree* node, bool& hasRelational, bool& hasEquality) {
+        if (node == nullptr) return;
+        if (auto* rel = dynamic_cast<CFlatParser::RelationalExpressionContext*>(node))
+            if (rel->shiftExpression().size() > 1) hasRelational = true;   // < <= > >=
+        if (auto* eq = dynamic_cast<CFlatParser::EqualityExpressionContext*>(node))
+            if (eq->typeCheckExpression().size() > 1) hasEquality = true;  // == !=
+        for (auto* child : node->children)
+            ScanComparisons(child, hasRelational, hasEquality);
+    }
+
+bool MainListener::ConditionIsSentinel(antlr4::tree::ParseTree* node) {
+        bool hasRelational = false, hasEquality = false;
+        ScanComparisons(node, hasRelational, hasEquality);
+        return hasEquality && !hasRelational;
+    }
+
+void MainListener::ParseControlledBody(CFlatParser::StatementContext* body) {
+        ParseStatement(body);
+        if (body != nullptr && body->compoundStatement() == nullptr)
+            Compiler(body)->FlushOwnedTemps();
+    }
+
+llvm::AllocaInst* MainListener::FrameLocalDataPointer(llvm::Value* data,
+                                            std::unordered_set<const llvm::Value*>& seen) {
+        if (data == nullptr || !seen.insert(data).second) return nullptr;
+        data = data->stripPointerCasts();
+        // An element/field address (`arr[0] as IShape`) is frame-local iff its base is.
+        while (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(data))
+            data = gep->getPointerOperand()->stripPointerCasts();
+        // A '?:' arrives as a join of the two arms' data pointers. It dangles if EITHER arm
+        // does, so the first frame-local incoming decides it.
+        if (auto* phi = llvm::dyn_cast<llvm::PHINode>(data))
+        {
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+                if (auto* slot = FrameLocalDataPointer(phi->getIncomingValue(i), seen)) return slot;
+            return nullptr;
+        }
+        if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(data))
+        {
+            if (auto* slot = FrameLocalDataPointer(sel->getTrueValue(), seen)) return slot;
+            return FrameLocalDataPointer(sel->getFalseValue(), seen);
+        }
+        return llvm::dyn_cast<llvm::AllocaInst>(data);
+    }
+
+void MainListener::CollectFatValueFields(llvm::Value* fatValue, unsigned index,
+                               std::vector<llvm::Value*>& out,
+                               std::unordered_set<const llvm::Value*>& seen) {
+        if (fatValue == nullptr || !seen.insert(fatValue).second) return;
+        if (auto* phi = llvm::dyn_cast<llvm::PHINode>(fatValue))
+        {
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+                CollectFatValueFields(phi->getIncomingValue(i), index, out, seen);
+            return;
+        }
+        if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(fatValue))
+        {
+            CollectFatValueFields(sel->getTrueValue(), index, out, seen);
+            CollectFatValueFields(sel->getFalseValue(), index, out, seen);
+            return;
+        }
+        llvm::Value* agg = fatValue;
+        while (auto* iv = llvm::dyn_cast<llvm::InsertValueInst>(agg))
+        {
+            if (iv->getNumIndices() == 1 && iv->getIndices()[0] == index)
+            {
+                out.push_back(iv->getInsertedValueOperand());
+                return;
+            }
+            agg = iv->getAggregateOperand();
+        }
+        // The base of the chain folds to a constant once the vtable is inserted into undef,
+        // so the vtable half usually lives here rather than in an insertvalue.
+        if (auto* c = llvm::dyn_cast<llvm::Constant>(agg))
+            if (auto* elem = c->getAggregateElement(index);
+                elem != nullptr && !llvm::isa<llvm::UndefValue>(elem))
+                out.push_back(elem);
+    }
+
+llvm::AllocaInst* MainListener::FrameLocalDataOfFatValue(llvm::Value* fatValue) {
+        std::vector<llvm::Value*> dataPtrs;
+        std::unordered_set<const llvm::Value*> seenFat, seenData;
+        CollectFatValueFields(fatValue, 1u, dataPtrs, seenFat);
+        for (auto* data : dataPtrs)
+            if (auto* slot = FrameLocalDataPointer(data, seenData)) return slot;
+        return nullptr;
+    }
+
+std::string MainListener::VTableOwnerName(llvm::GlobalVariable* vtable, LLVMBackend* compiler) {
+        for (auto& [sName, sd] : compiler->dataStructures)
+            for (auto& [iName, vt] : sd.VTables) if (vt == vtable) return sName;
+        for (auto& [pName, pd] : compiler->programTable)
+            for (auto& [iName, vt] : pd.VTables) if (vt == vtable) return pName;
+        return "";
+    }
+
+std::string MainListener::BoxedStructNameOfFatValue(llvm::Value* fatValue, LLVMBackend* compiler) {
+        std::vector<llvm::Value*> vtables;
+        std::unordered_set<const llvm::Value*> seen;
+        CollectFatValueFields(fatValue, 0u, vtables, seen);
+        std::string found;
+        for (auto* v : vtables)
+        {
+            auto* g = llvm::dyn_cast<llvm::GlobalVariable>(v->stripPointerCasts());
+            std::string name = g != nullptr ? VTableOwnerName(g, compiler) : std::string();
+            if (name.empty() || (!found.empty() && found != name)) return "";
+            found = name;
+        }
+        return found;
+    }
+
+std::string MainListener::ReturnUpcastStructName(const LLVMBackend::NamedVariable& nv) {
+        if (!nv.TypeAndValue.TypeName.empty()) return nv.TypeAndValue.TypeName;
+        if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(nv.BaseType)) return st->getName().str();
+        return {};
+    }
+
+void MainListener::LogInterfaceReturnDangle(antlr4::ParserRuleContext* ctx, const std::string& structName,
+                                  const std::string& ifaceName) {
+        if (structName.empty())
+        {
+            LogErrorContext(ctx, std::format("cannot return a local value as interface '{}' - "
+                "the interface fat pointer would dangle once this function returns; "
+                "allocate the object on the heap and return the pointer", ifaceName));
+            return;
+        }
+        LogErrorContext(ctx, std::format("cannot return local value '{}' as interface '{}' - "
+            "the interface fat pointer would dangle once this function returns; "
+            "allocate on the heap ('new {}') and return the pointer", structName, ifaceName, structName));
+    }
+
+void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
+        auto* compiler = Compiler(statement);
+        compiler->SetCurrentDebugLocation(statement->getStart()->getLine());
+
+        auto jump = statement->jumpStatement();
+        auto expressStatement = statement->expressionStatement();
+        auto iterationStatement = statement->iterationStatement();
+        auto vectorizeStatement = statement->vectorizeStatement();
+        auto selectionStatement = statement->selectionStatement();
+
+        // `vectorize <loop>` is handled by the iteration path below with the
+        // request flag armed. Only counted `for` and `while` can be vectorized;
+        // do-while and foreach (which lowers to count()/get() calls) are rejected
+        // up front with a clear message rather than a cryptic LLVM remark.
+        if (vectorizeStatement != nullptr)
+        {
+            iterationStatement = vectorizeStatement->iterationStatement();
+            if (iterationStatement->Do() ||
+                (iterationStatement->declarationSpecifiers() && iterationStatement->In()))
+            {
+                LogErrorContext(vectorizeStatement,
+                    "vectorize supports counted 'for' and 'while' loops only");
+                return;
+            }
+            // Optional FP-math tier flag: 'contract' or 'reassoc' (tiers, not composable;
+            // reassoc implies contract). Anything else is rejected.
+            vectorizeFpTier_ = VectorizeFpTier::None;
+            if (auto* flagId = vectorizeStatement->Identifier())
+            {
+                const std::string flag = flagId->getText();
+                if (flag == "contract")
+                    vectorizeFpTier_ = VectorizeFpTier::Contract;
+                else if (flag == "reassoc")
+                    vectorizeFpTier_ = VectorizeFpTier::Reassoc;
+                else
+                {
+                    LogErrorContext(vectorizeStatement,
+                        "vectorize flag must be 'contract' or 'reassoc'");
+                    return;
+                }
+            }
+            vectorizeActive_ = true;
+            vectorizeLine_ = static_cast<int>(vectorizeStatement->getStart()->getLine());
+
+            // Gather AST facts about this loop so a failed vectorization (detected
+            // post-optimization) can report a precise, well-located reason.
+            LLVMBackend::VectorizeLoopInfo vinfo;
+            vinfo.line = vectorizeLine_;
+            vinfo.col  = static_cast<int>(vectorizeStatement->getStart()->getCharPositionInLine());
+            vinfo.isWhile = iterationStatement->While() != nullptr && iterationStatement->Do() == nullptr;
+            if (vinfo.isWhile)
+            {
+                auto* cond = iterationStatement->expression();
+                if (cond != nullptr)
+                {
+                    vinfo.condText = cond->getText();
+                    vinfo.condLine = static_cast<int>(cond->getStart()->getLine());
+                    vinfo.condCol  = static_cast<int>(cond->getStart()->getCharPositionInLine());
+                    // A counted loop compares against a bound (< <= > >=); an
+                    // equality/sentinel condition (== / !=, e.g. `p != nullptr`)
+                    // is the classic non-countable pointer-chase.
+                    vinfo.conditionCounted = !ConditionIsSentinel(cond);
+                }
+            }
+            if (auto* call = FindFirstCall(iterationStatement->statement()))
+            {
+                vinfo.hasCall = true;
+                vinfo.callName = call->primaryExpression() ? call->primaryExpression()->getText() : std::string("a function");
+                vinfo.callLine = static_cast<int>(call->getStart()->getLine());
+                vinfo.callCol  = static_cast<int>(call->getStart()->getCharPositionInLine());
+            }
+            compiler->AddVectorizeLoopInfo(vinfo);
+        }
+        auto compoundStatement = statement->compoundStatement();
+        auto labeledStatement = statement->labeledStatement();
+        auto expectErrorStmt = statement->expectErrorStatement();
+
+        if (labeledStatement != nullptr && !switchStack.empty())
+        {
+            auto& ctx = switchStack.back();
+            llvm::BasicBlock* targetBlock = nullptr;
+
+            if (labeledStatement->Case())
+            {
+                auto it = ctx.caseMap.find(labeledStatement);
+                if (it != ctx.caseMap.end())
+                    targetBlock = it->second.block;
+            }
+            else if (labeledStatement->Default())
+            {
+                targetBlock = ctx.defaultBlock;
+            }
+
+            if (targetBlock)
+            {
+                compiler->CreateJump(targetBlock);    // fallthrough if no terminator yet
+                compiler->SwitchToBlock(targetBlock);
+            }
+
+            // Arm-style: inject bound variable, execute body in its own scope, auto-jump to resume.
+            // `default =>` and `case _ =>` arms are detected via FatArrow token.
+            auto it = ctx.caseMap.find(labeledStatement);
+            bool isDefaultArm = labeledStatement->FatArrow() != nullptr
+                             && (labeledStatement->Default()
+                                 || (labeledStatement->Case()
+                                     && labeledStatement->constantExpression()
+                                     && labeledStatement->constantExpression()->getText() == "_"));
+            bool isArm = (it != ctx.caseMap.end() && it->second.isArmStyle) || isDefaultArm;
+            bool hasBound = isArm && it != ctx.caseMap.end() && it->second.isTypeCase && !it->second.boundVarName.empty();
+
+            if (isArm)
+            {
+                compiler->InitializeBlock(nullptr, true);
+
+                if (hasBound && ctx.condValue)
+                {
+                    // Extract the data pointer (field 1) from the interface fat ptr and bind it.
+                    auto* dataPtr = compiler->builder->CreateExtractValue(ctx.condValue, { 1u }, "typecase_data");
+                    auto* alloca = compiler->AllocaAtEntry(dataPtr->getType(), nullptr, it->second.boundVarName);
+                    compiler->builder->CreateStore(dataPtr, alloca);
+
+                    LLVMBackend::NamedVariable nv;
+                    nv.Storage  = alloca;
+                    nv.Primary  = dataPtr;
+                    nv.TypeAndValue.TypeName = it->second.typeCaseName;
+                    nv.TypeAndValue.Pointer  = true;
+                    nv.IsOwning    = false;
+                    compiler->stackNamedVariable.back().namedVariable[it->second.boundVarName] = nv;
+                    compiler->RecordMoveGenBind(it->second.boundVarName); // fresh type-case arm binding
+                }
+
+                ParseStatement(labeledStatement->statement());
+                compiler->CreateBlockBreak(ctx.resumeBlock, true);
+                return;
+            }
+
+            ParseStatement(labeledStatement->statement());
+            return;
+        }
+
+        if (jump != nullptr)
+        {
+            if (jump->Return())
+            {
+                // Mark the straight-line as returned so the if/else move-merge treats this branch's
+                // moves as dead-path even if a (dead) statement follows the return.
+                straightLineReturned_ = true;
+                if (jump->Default() != nullptr)
+                {
+                    // return default; - zero-initialize the return type (null for pointers/interfaces, 0 for integers)
+                    auto* retTy = compiler->currentFunction->getReturnType();
+                    auto* defaultVal = retTy->isVoidTy() ? nullptr : llvm::Constant::getNullValue(retTy);
+                    compiler->CreateReturnCall(defaultVal);
+                }
+                else if (auto* blockBody = jump->compoundStatement())
+                {
+                    compiler->InitializeBlock(nullptr, true);
+                    if (auto* blockItems = blockBody->blockItemList())
+                        ParseBlockItemList(blockItems);
+                    compiler->CreateBlockBreak(nullptr, true);
+                }
+                else
+                {
+                    auto express = jump->expression();
+                    if (express != nullptr)
+                    {
+                        // Evaluate via NV path so we can inspect bond info alongside ownership.
+                        auto assignExpr = express->assignmentExpression();
+                        LLVMBackend::NamedVariable returnNV;
+                        // Thread a function<> return type into a returned lambda literal so the
+                        // lambda's invoker is typed from the function's declared return type
+                        // (`return () => {...};`) instead of defaulting to void. Mirrors the
+                        // declaration/argument lambda-context threading.
+                        // Capture the function-pointer return type BEFORE parsing the return
+                        // expression - lowering a returned lambda calls createFunctionBlock, which
+                        // overwrites currentFunctionReturnTV with the lambda's own return type.
+                        LLVMBackend::TypeAndValue returnFnPtrTV;
+                        if (compiler->currentFunctionReturnTV.IsFunctionPointer)
+                        {
+                            lambdaExpectedType = compiler->currentFunctionReturnTV;
+                            returnFnPtrTV = compiler->currentFunctionReturnTV;
+                        }
+                        // Inbound alloc-align channel for `return new T[n];`: a function whose return
+                        // type declares `alignas(_, N)` hands the allocation alignment down to a DIRECT
+                        // `new` in the return, exactly as a decl-init does. Indirect return shapes are
+                        // rejected by the check below rather than silently under-aligned.
+                        if (assignExpr != nullptr
+                            && compiler->currentFunctionReturnTV.AllocAlignValue > LLVMBackend::kDefaultNewAlign
+                            && AsDirectNew(assignExpr) != nullptr)
+                            compiler->pendingInitAllocAlign = compiler->currentFunctionReturnTV.AllocAlignValue;
+                        if (assignExpr != nullptr)
+                            returnNV = ParseAssignmentExpressionNamed(assignExpr);
+                        compiler->pendingInitAllocAlign = 0;  // one-shot
+                        lambdaExpectedType = {};
+
+                        // Implicit move on `return <local>;` (C++-style, narrow). Triggers only when the
+                        // return expression is a BARE IDENTIFIER naming a local (or by-value parameter)
+                        // whose owning value-struct type matches the function's return type; then it is
+                        // treated exactly as `return move <local>;` - snapshot the value, zero the source
+                        // so its scope-exit destructor is a no-op, and hand ownership to the caller. A
+                        // borrowing local (alias / borrowed field / borrowed by-value param) is excluded so
+                        // the alias path still wins and no second owner is created (which would double-free).
+                        if (assignExpr != nullptr && express != nullptr)
+                        {
+                            std::string retName = express->getText();
+                            LLVMBackend::NamedVariable localNV = compiler->GetScopedLocalOrArgument(retName);
+                            bool movableLocalReturn =
+                                !retName.empty()
+                                && !localNV.TypeAndValue.TypeName.empty()
+                                && !localNV.TypeAndValue.Pointer && !localNV.TypeAndValue.ElemPointer
+                                && localNV.Storage != nullptr
+                                && compiler->IsDataStructure(localNV.TypeAndValue.TypeName)
+                                && compiler->IsOwningValueType(localNV.TypeAndValue.TypeName)
+                                && localNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName
+                                && !compiler->currentFunctionReturnTV.Pointer
+                                && !localNV.IsAliasBorrow && !localNV.BorrowsOwnedString
+                                && localNV.BorrowedUniqueField.empty()
+                                && !compiler->IsBorrowStringParamStorage(localNV.Storage)
+                                && !IsBorrowedStructParameter(compiler, retName);
+                            if (movableLocalReturn)
+                            {
+                                llvm::Value* snapshot = LoadNamedVariable(localNV);
+                                if (llvm::Type* st = compiler->GetType(localNV.TypeAndValue))
+                                    compiler->builder->CreateStore(
+                                        llvm::ConstantAggregateZero::get(st), localNV.Storage);
+                                compiler->lastOwningResult = true;
+                                returnNV.Primary = snapshot;
+                                returnNV.Storage = nullptr;
+                                returnNV.CallerName.clear();
+                                returnNV.IdentifierLine = 0;
+                            }
+                        }
+
+                        // Returning a raw `T*` as a `T[]` return type would forge the noalias
+                        // contract (a view must span a whole allocation). Decay T[]->T* is fine.
+                        if (compiler->currentFunctionReturnIsArrayView
+                            && returnNV.TypeAndValue.Pointer && !returnNV.TypeAndValue.IsArrayView)
+                            LogErrorContext(jump, "cannot return a raw pointer 'T*' as an array-view 'T[]' - "
+                                "a view must span a whole allocation (from 'new T[n]' or another 'T[]'); "
+                                "the 'T[] -> T*' decay is one-way");
+                        // Return leg of the code-value store gate: `return w;` from a `Rec*`
+                        // function handed the caller a code address to write through.
+                        if (compiler->CodeValueIntoDataDestination(
+                                returnNV, compiler->currentFunctionReturnTV))
+                        {
+                            const auto& retTV = compiler->currentFunctionReturnTV;
+                            LogErrorContext(jump, compiler->DescribeCodeValueIntoData(
+                                CodeValueDestSpelling(retTV), "return", CodeValueCastAdvice(retTV)));
+                        }
+                        auto right = LoadNamedVariable(returnNV);
+                        // Coerce the returned value to the function-pointer return type (thin vs
+                        // fat): a named function, a thin function<> value, or a fat closure value.
+                        if (right && returnFnPtrTV.IsFunctionPointer)
+                            right = compiler->CoerceToFuncPtrReturn(right, returnFnPtrTV);
+                        ProcessPlusPlus();
+
+                        /*
+                         * A '?:' join of concrete implementer pointers carries no NamedVariable
+                         * TypeName, so the interface-return upcast further down cannot see a class
+                         * to box and a bare `ptr` would reach the `ret`. Box each arm in its own
+                         * branch HERE - before the ownership and dangle checks - so every one of
+                         * them inspects the fat pointer, exactly as they already do for the
+                         * `return c ? (x as I) : (y as I);` spelling. The helper bails to nullptr
+                         * for anything that is not a pointer '?:' targeting this interface, so the
+                         * normal path is untouched; it only reports an armFailure for a join that
+                         * genuinely targets the interface and cannot be boxed, which today reaches
+                         * the verifier as a raw type mismatch with no source location.
+                         */
+                        if (auto* fatTy = compiler->GetFatPtrType();
+                            right != nullptr && fatTy != nullptr && compiler->currentFunction != nullptr
+                            && compiler->currentFunction->getReturnType() == fatTy
+                            && right->getType()->isPointerTy()
+                            && !returnNV.TypeAndValue.IsInterface
+                            && ReturnUpcastStructName(returnNV).empty())
+                        {
+                            std::string ternaryArmFailure;
+                            std::string joinSpelling = "?:";
+                            bool ternaryArmNotOwned = false;
+                            const std::string& ifaceName = compiler->currentFunctionReturnTypeName;
+                            if (auto* fat = UpcastPointerJoinToInterface(
+                                    right, ifaceName, &ternaryArmFailure, &joinSpelling,
+                                    compiler->currentFunctionReturnsOwned, &ternaryArmNotOwned))
+                                right = fat;
+                            else if (ternaryArmNotOwned)
+                                LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
+                            else if (!ternaryArmFailure.empty())
+                                LogErrorContext(jump, std::format(
+                                    "cannot convert '{}' arm to interface '{}': {}",
+                                    joinSpelling, ifaceName, ternaryArmFailure));
+                        }
+
+                        // String ownership transfer (runtime-bit model). Classify the returned
+                        // value once, before the owned-return flags below are cleared.
+                        //  - A whole string LOCAL read (its NamedVariable.Storage is an alloca, not
+                        //    a field/element GEP) that does not itself borrow an owned field is
+                        //    MOVED to the caller by CreateReturnCall (which zeroes the source), so
+                        //    its OWNED bit must stay set.
+                        //  - A genuinely-owned temp / new / owned call result keeps its bit too.
+                        //  - Anything else returned by a plain (non-`move`) string function is a
+                        //    BORROW of a location someone else owns (a field/element read such as
+                        //    list.get's `return _data[i]`, or a local that borrows an owned field).
+                        //    Clear the OWNED bit so the caller's always-run string destructor does
+                        //    not free a buffer the real owner still holds.
+                        bool returnExprOwned = compiler->IsOwningValue(right)
+                            || compiler->lastCallReturnsOwned
+                            || compiler->lastOwningResult
+                            || returnNV.IsOwningString;
+                        bool returnIsWholeLocal = returnNV.FieldName.empty()
+                            && returnNV.Storage != nullptr
+                            && llvm::isa<llvm::AllocaInst>(returnNV.Storage)
+                            && !returnNV.BorrowsOwnedString;
+                        // A direct call result carries an authoritative runtime OWNED bit: the callee
+                        // already cleared it for a borrow return (list.get's `return _data[i]`) or left
+                        // it set for an owned return (`return "k" + s;`). Re-clearing here would orphan
+                        // a buffer the caller must free - the leak in `return makeOwned();`. Genuine
+                        // borrows are loads from storage (field/element GEP), never a CallInst.
+                        bool returnIsCallResult = right != nullptr && llvm::isa<llvm::CallInst>(right);
+                        // A borrow string PARAMETER (`string echo(string s){return s;}`) has an
+                        // alloca Storage so it looks like a movable whole-local, but the frame does
+                        // not own its buffer - returning it must clear the OWNED bit so the caller
+                        // gets a BORROW, not a second owner of the caller's buffer (double-free).
+                        bool returnIsBorrowStringParam =
+                            compiler->IsBorrowStringParamStorage(returnNV.Storage);
+                        bool clearReturnedStringBorrowBit =
+                            NamedVarIsString(returnNV)
+                            && !compiler->currentFunctionReturnsOwned
+                            && !returnExprOwned
+                            && (!returnIsWholeLocal || returnIsBorrowStringParam)
+                            && !returnIsCallResult;
+                        // Same borrow classification for a STRUCT taken from a collection the
+                        // function does not own (e.g. `alias T get` returning `_data[i]`). The
+                        // shallow copy handed back carries the OWNED bit of every owning string
+                        // (or nested-struct) field; a copy that escapes alias compile-time tracking
+                        // - notably a for-in loop variable - is destructed and would free buffers
+                        // the container still owns. Clear those field bits so any such destruct is
+                        // a no-op (the container keeps its single owner). A whole-local move-out or
+                        // a `move`-returning function keeps its bits so ownership transfers.
+                        bool clearReturnedStructBorrowBits =
+                            right != nullptr && right->getType()->isStructTy()
+                            && !NamedVarIsString(returnNV)
+                            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)
+                            && !compiler->currentFunctionReturnsOwned
+                            && !returnExprOwned
+                            && !returnIsWholeLocal
+                            && !returnIsCallResult;
+
+                        if (compiler->currentFunctionReturnsOwned && right != nullptr
+                            && !llvm::isa<llvm::Constant>(right)
+                            && right->getType()->isPointerTy())
+                        {
+                            bool returnIsOwned = compiler->IsOwningValue(right)
+                                || compiler->lastCallReturnsOwned
+                                || compiler->lastOwningResult;
+                            if (!returnIsOwned)
+                                LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
+                        }
+
+                        // Same ownership rule as above, widened to BY-VALUE STRUCT returns. A
+                        // borrowed by-value struct parameter is not owned, so handing it back as a
+                        // 'move' result makes the caller a second owner of the same unique pointee.
+                        // A 'move S' struct-VALUE return is deliberately not `currentFunctionReturnsOwned`
+                        // (see the NOTE on ComputeReturnsOwned), so key off the declared return type.
+                        if (compiler->currentFunctionReturnTV.IsMove
+                            && !compiler->currentFunctionReturnTV.Pointer
+                            && right != nullptr
+                            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)
+                            && IsBorrowedStructParameter(compiler, returnNV.CallerName))
+                        {
+                            LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
+                        }
+
+                        // Plain 'return h' of a 'move' owning-struct PARAMETER copies its owning bits
+                        // into the caller's return slot without releasing the parameter, so both the
+                        // returned value and the expiring parameter free the same storage (double-free).
+                        // An explicit 'return move h' detaches the source (returnExprOwned, empty
+                        // CallerName), so it is not flagged. An owned LOCAL returned plain transfers
+                        // correctly and is not a parameter, so it is excluded too.
+                        if (compiler->currentFunctionReturnTV.IsMove
+                            && !compiler->currentFunctionReturnTV.Pointer
+                            && right != nullptr
+                            && !returnExprOwned
+                            && IsMoveOwningStructParameter(compiler, returnNV.CallerName))
+                        {
+                            LogErrorContext(jump, std::format(
+                                "cannot return 'move' parameter '{}' by a plain 'return' - it copies the "
+                                "parameter's owning fields without releasing it, so both the returned value "
+                                "and the expiring parameter free the same storage (double-free). Write "
+                                "'return move {}' to transfer ownership to the caller.",
+                                returnNV.CallerName, returnNV.CallerName));
+                        }
+
+                        // `return new T();` where the declared return type is the VALUE struct 'T'.
+                        // The operand is a 'T*' against a struct return type - LLVM rejects the
+                        // module with no source location, so diagnose it here instead.
+                        if (right != nullptr && returnNV.TypeAndValue.Pointer
+                            && compiler->currentFunction != nullptr
+                            && compiler->currentFunction->getReturnType()->isStructTy()
+                            && !returnNV.TypeAndValue.TypeName.empty()
+                            && returnNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName)
+                        {
+                            LogErrorContext(jump, std::format(
+                                "cannot return pointer '{}*' from a function declared to return value type '{}' - "
+                                "declare the return type '{}*' (or 'move {}*' to transfer ownership to the caller), "
+                                "or dereference the pointer to return a copy.",
+                                returnNV.TypeAndValue.TypeName, compiler->currentFunctionReturnTypeName,
+                                compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName));
+                        }
+
+                        if (ReturnLeaksOwnershipIntoInterface(right, compiler))
+                        {
+                            LogErrorContext(jump, std::format(
+                                "returning a heap object boxed into interface '{}' from a non-'move' function "
+                                "transfers ownership the caller cannot see - it will leak. Declare the return "
+                                "type 'move {}' so the caller knows to 'delete' it.",
+                                compiler->currentFunctionReturnTypeName,
+                                compiler->currentFunctionReturnTypeName));
+                        }
+
+                        // A FRESH ALLOCATION handed back through a BARE pointer return type gives the
+                        // caller no signal that it owns the result, so a forgotten 'delete' is a silent
+                        // leak. Require the intent to be explicit: 'move T*' transfers ownership (the
+                        // caller adopts with `unique T* x = f();`), 'alias T*' opts out of ownership
+                        // tracking and the caller frees by hand. Scoped to the DIRECT `return new T();`
+                        // form - indirect provenance (`T* h = new T(); return h;`) is not tracked here.
+                        if (assignExpr != nullptr && AsDirectNew(assignExpr) != nullptr
+                            && compiler->currentFunctionReturnTV.Pointer
+                            && !compiler->currentFunctionReturnTV.IsMove
+                            && !compiler->currentFunctionReturnTV.IsAlias
+                            && !compiler->currentFunctionReturnsOwned
+                            && !compiler->currentFunctionReturnIsArrayView
+                            && compiler->currentFunction != nullptr
+                            && compiler->currentFunction->getReturnType()->isPointerTy())
+                        {
+                            LogErrorContext(jump, std::format(
+                                "returning a fresh allocation from a function whose return type is the bare "
+                                "pointer '{}*' gives the caller no signal that it owns the result - a forgotten "
+                                "'delete' is a silent leak. Declare the return type 'move {}*' to transfer "
+                                "ownership to the caller (which adopts it with 'unique {}* x = f();'), or "
+                                "'alias {}*' to opt out of ownership tracking and manage the lifetime by hand.",
+                                compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName,
+                                compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName));
+                        }
+
+                        // The mirror image: an INTERFACE VALUE returned from a function whose declared
+                        // return type is not that interface (e.g. a `View*` factory whose body now
+                        // returns an `IView`). The ret operand would be a fat pointer against a
+                        // pointer return type - LLVM module verification fails with no source location.
+                        if (right != nullptr && compiler->GetFatPtrType() != nullptr
+                            && right->getType() == compiler->GetFatPtrType()
+                            && compiler->currentFunction != nullptr
+                            && compiler->currentFunction->getReturnType() != compiler->GetFatPtrType())
+                        {
+                            LogErrorContext(jump, std::format(
+                                "cannot return interface value '{}' from a function declared to return '{}' - "
+                                "declare the return type as the interface (e.g. 'move {}')",
+                                returnNV.TypeAndValue.TypeName.empty() ? "<interface>" : returnNV.TypeAndValue.TypeName,
+                                compiler->currentFunctionReturnTypeName,
+                                returnNV.TypeAndValue.TypeName.empty() ? "<interface>" : returnNV.TypeAndValue.TypeName));
+                        }
+
+                        // Bond return check: bonded value may only be returned if all its sources
+                        // are 'bond' parameters of the current function (not locals).
+                        auto checkBondSources = [&](const std::vector<std::string>& sources) {
+                            for (const auto& source : sources)
+                            {
+                                auto funcArg = compiler->GetFunctionArgument(source);
+                                if (funcArg.GetValue() == nullptr || !funcArg.TypeAndValue.IsBond)
+                                    LogErrorContext(jump, std::format("returning bonded value whose source '{}' is not a 'bond' parameter - bonded values cannot escape their source's scope", source));
+                            }
+                        };
+                        if (returnNV.IsBonded)
+                            checkBondSources(returnNV.BondedSources);
+                        if (compiler->lastCallIsBonded)
+                            checkBondSources(compiler->lastCallBondedSources);
+
+                        // Returning an owning field of a by-value temp (`return makeToken().text;`).
+                        if (returnNV.FromOwningTempField
+                            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName))
+                        {
+                            // A `move`-temp OWNS the field: move it out as the return value (Phase B).
+                            // Keep the owned bit (ownership transfers to the caller) and zero the source
+                            // field so the temp's full-dtor (FlushOwnedStructTemps below) skips it. Works
+                            // for a string field (clears its owned bit) or an owning struct field (the
+                            // aggregate-zero recursively clears every owning subfield's owned bit). An
+                            // ALIAS temp (plain accessor) is still rejected - you cannot move out of a borrow.
+                            // POINTER fields are excluded here as at the two sibling implied-move sites:
+                            // the aggregate-zero store below emits IR that crashes codegen on one.
+                            if (returnNV.MovableTempField && right != nullptr
+                                && !returnNV.TypeAndValue.Pointer
+                                && right->getType() == returnNV.BaseType)
+                            {
+                                clearReturnedStringBorrowBit = false;
+                                // Same exclusion for a moved-out owning STRUCT field (e.g.
+                                // `return makeOuterTok(n).inner;`): the buffer's ownership transfers
+                                // to the caller, so its owning-field bits must stay set, not be
+                                // cleared as a borrow - clearing would orphan the buffer (leak).
+                                clearReturnedStructBorrowBits = false;
+                                auto* srcGep = compiler->builder->CreateStructGEP(
+                                    returnNV.MoveTempStructType, returnNV.MoveTempStructAlloca,
+                                    returnNV.MoveTempFieldIndex, "movedfld");
+                                compiler->builder->CreateStore(
+                                    llvm::ConstantAggregateZero::get(right->getType()), srcGep);
+                            }
+                            else
+                            {
+                                LogErrorContext(jump, std::format(
+                                    "cannot return '{}.{}' taken from a temporary; its buffer is owned elsewhere and "
+                                    "would be freed. Use '.copy()' for an independent copy.",
+                                    returnNV.OwningStructName, returnNV.FieldName));
+                            }
+                        }
+
+                        // Same escape with a dtor-LESS pointee, which the type-name gate above
+                        // cannot see. After it, so a dtor-bearing pointee keeps its wording.
+                        if (IsOwningTempUniqueFieldEscape(returnNV))
+                            RejectOwningTempUniqueFieldEscape(returnNV, "the return value", jump);
+
+                        // Returning a whole `alias` (borrow) value from a non-`alias` function hands
+                        // the caller a value whose always-run destructor frees a buffer the real owner
+                        // still holds. Allowed only when the function itself is declared `alias` (the
+                        // borrow passes through). `.copy()` makes an independent owned value. `string`
+                        // and `__closure_fat_ptr` are excluded - they carry a runtime owned bit that
+                        // already clears on a borrow return (the string-redesign borrow path), so the
+                        // `alias` compile-time machinery is only for owning STRUCTS with no runtime bit.
+                        // A borrow can only dangle when the caller could destruct it: a pointer (the
+                        // pointee is freed) or an owning value type (its destructor frees buffers the
+                        // real owner still holds). An alias of a primitive or a POD struct hands back a
+                        // plain value copy with nothing to free - e.g. `dict<string,u64>.get(k)`.
+                        if ((returnNV.TypeAndValue.IsAlias || returnNV.IsAliasBorrow)
+                            && returnNV.TypeAndValue.TypeName != "string"
+                            && returnNV.TypeAndValue.TypeName != "__closure_fat_ptr"
+                            && !compiler->currentFunctionReturnTV.IsAlias
+                            && (returnNV.TypeAndValue.Pointer
+                                || compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)))
+                        {
+                            LogErrorContext(jump, std::format(
+                                "cannot return an 'alias' value '{}'; it borrows storage it does not own and "
+                                "would dangle. Declare the function 'alias', or use '.copy()' for an owned copy.",
+                                returnNV.CallerName.empty() ? returnNV.TypeAndValue.TypeName : returnNV.CallerName));
+                        }
+
+                        // Same hazard through a suppressed (mixed) '?:' join of an owning-value
+                        // struct: the caller adopts and destroys bits a live borrow still owns.
+                        // An `alias` function passes the borrow through, exactly as above.
+                        if (!compiler->currentFunctionReturnTV.IsAlias)
+                            RejectNonOwningStructJoinStore(right, compiler->currentFunctionReturnTypeName,
+                                                           "a return slot", jump);
+
+                        // The allocation alignment of an over-aligned `new T[n]` is not in the element
+                        // type, so the caller recovers it only when the RETURN TYPE declares the same
+                        // `alignas(_, N)` clause (threaded to the caller via lastCallReturnsAllocAlign).
+                        // A matching clause is allowed; a missing/mismatched one would free the block
+                        // wrong. (Alignment carried by the TYPE returns freely, untagged, as in C++.)
+                        if (returnNV.AllocAlignment > LLVMBackend::kDefaultNewAlign
+                            && compiler->currentFunctionReturnTV.AllocAlignValue != returnNV.AllocAlignment)
+                        {
+                            if (compiler->currentFunctionReturnTV.AllocAlignValue == 0)
+                                LogErrorContext(jump, std::format(
+                                    "cannot return the over-aligned buffer '{}' ('new T[n] alignas(0, {})'): that "
+                                    "alignment is a property of the allocation, not of the type, so the caller cannot "
+                                    "recover it from the return type and would free the block as an ordinary "
+                                    "allocation. Declare the return type 'alignas(0, {})' so the block alignment is "
+                                    "recorded, or over-align the ELEMENT TYPE instead.",
+                                    returnNV.CallerName.empty() ? returnNV.TypeAndValue.TypeName : returnNV.CallerName,
+                                    returnNV.AllocAlignment, returnNV.AllocAlignment));
+                            else
+                                LogErrorContext(jump, std::format(
+                                    "allocation alignment mismatch on return: the return type is declared "
+                                    "'alignas(0, {})' but the returned buffer was allocated {}-aligned. The two must "
+                                    "agree so the caller frees with the correct alignment.",
+                                    compiler->currentFunctionReturnTV.AllocAlignValue, returnNV.AllocAlignment));
+                        }
+
+                        /*
+                         * Returning a closure read from a FIELD / ELEMENT (`return p->get;`), the
+                         * mirror of the decl-init clone. A whole-variable closure local returns by
+                         * move (its storage is handed to the caller and its dtor suppressed), but a
+                         * field read has no such transfer: the raw TAGGED OWNED env would be handed
+                         * to the caller while the struct still owns it, and both free it. Clone so
+                         * the caller gets an independent env; a `move` source already transferred.
+                         */
+                        if (right != nullptr
+                            && right->getType()->isStructTy()
+                            && returnNV.TypeAndValue.TypeName == "__closure_fat_ptr"
+                            && !returnNV.TypeAndValue.IsMove
+                            && returnNV.Storage != nullptr
+                            && !llvm::isa<llvm::AllocaInst>(returnNV.Storage)
+                            && !llvm::isa<llvm::GlobalVariable>(returnNV.Storage))
+                        {
+                            LLVMBackend::NamedVariable srcNV;
+                            srcNV.Storage  = returnNV.Storage;
+                            srcNV.BaseType = compiler->GetClosureFatPtrType();
+                            srcNV.TypeAndValue.TypeName = "__closure_fat_ptr";
+                            if (auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
+                                right = cloned;
+                        }
+
+                        // Clear flags consumed by the return check.
+                        compiler->lastOwningResult = false;
+                        compiler->lastAllocAlignment = 0;
+                        compiler->lastCallReturnsAllocAlign = 0;
+                        compiler->lastCallReturnsOwned = false;
+                        compiler->lastCallIsBonded = false;
+                        compiler->lastCallBondByAddress = false;
+                        compiler->lastCallBondedSources.clear();
+                        // The returned value (e.g. the final string of `return a + b + c;`)
+                        // is moved to the caller - drop it from the temporary cleanup list
+                        // so we do not free a buffer the caller now owns. Any other owned-
+                        // string intermediates of the return expression must be freed before
+                        // the ret terminates the block.
+                        compiler->UnregisterOwnedStringTemp(right);
+                        compiler->FlushOwnedStringTemps();
+                        // Same for a returned closure literal (`return () => {...};`): the closure
+                        // env is moved to the caller, so drop it from the temp list before flushing
+                        // or we would free an env the caller now owns (double free on its teardown).
+                        compiler->UnregisterOwnedClosureTemp(right);
+                        compiler->FlushOwnedClosureTemps();
+                        // Owning temp whose field was extracted in the return expr (returning an OWNING
+                        // field is rejected upstream, so this never frees a buffer the caller now owns).
+                        compiler->FlushOwnedStructTemps();
+                        // Borrow returns: hand the caller a non-owning copy (see the classification
+                        // above). Done after the temp-flush so the unregister logic above still sees
+                        // the original loaded value; a borrow is never a registered owned temp.
+                        if (clearReturnedStringBorrowBit)
+                            right = compiler->ClearStringOwnedBit(right);
+                        else if (clearReturnedStructBorrowBits)
+                            right = compiler->ClearStructOwnedBits(right, returnNV.TypeAndValue.TypeName);
+                        // Pass the returned local's storage so a by-value struct return whose
+                        // full-destructor frees members (e.g. owned string fields) moves
+                        // ownership to the caller instead of being destructed here. The struct
+                        // return value is materialized field-wise (and a struct read leaves
+                        // Storage null, keeping the value in Primary), so resolve the alloca by
+                        // name - CreateReturnCall's LoadInst-based detection cannot see it.
+                        llvm::Value* retStorage = returnNV.Storage;
+                        if (retStorage == nullptr && !returnNV.CallerName.empty())
+                            retStorage = compiler->FindVariableStorage(returnNV.CallerName).Storage;
+
+                        // Interface return upcast. When the function's declared return type is an
+                        // interface (LLVM { ptr vtable, ptr data } fat pointer), box a concrete
+                        // implementer here - mirroring the assignment/parameter upcast. Without
+                        // this the `ret` operand is a bare pointer and module verification fails.
+                        // An operand that is ALREADY a fat pointer still enters when its data half
+                        // is this frame's storage (`return sq as IShape;`): the boxing happened
+                        // upstream, but the dangle it creates is this path's to reject.
+                        std::string interfaceReturnStructName;
+                        llvm::AllocaInst* returnedFatFrameSlot =
+                            right != nullptr && right->getType() == compiler->GetFatPtrType()
+                                ? FrameLocalDataOfFatValue(right) : nullptr;
+                        /*
+                         * DEFERRED existential check for the shape the walk above cannot see:
+                         * `IShape r = loc as IShape; return r;` arrives here as a plain load of
+                         * r's slot, with returnedFatFrameSlot null (the walk stops at loads by
+                         * design). Record the slot now - the answer is resolved once this
+                         * function's body is fully lowered and its CFG is complete
+                         * (RunInterfaceReturnDangleCheck, called from the same hook as
+                         * RunNullDerefDataflow), not here.
+                         */
+                        if (right != nullptr && compiler->currentFunction != nullptr
+                            && compiler->currentFunction->getReturnType() == compiler->GetFatPtrType()
+                            && right->getType() == compiler->GetFatPtrType()
+                            && returnedFatFrameSlot == nullptr)
+                        {
+                            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(right))
+                                if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(
+                                        load->getPointerOperand()->stripPointerCasts()))
+                                    compiler->RecordPendingReturnDangleCheck(
+                                        slot, static_cast<int>(jump->getStart()->getLine()),
+                                        static_cast<int>(jump->getStart()->getCharPositionInLine()),
+                                        compiler->currentFunctionReturnTypeName);
+                        }
+                        if (auto* fatTy = compiler->GetFatPtrType();
+                            right != nullptr && fatTy != nullptr && compiler->currentFunction != nullptr
+                            && compiler->currentFunction->getReturnType() == fatTy
+                            && ((right->getType() != fatTy && !returnNV.TypeAndValue.IsInterface)
+                                || returnedFatFrameSlot != nullptr))
+                        {
+                            const std::string& ifaceName = compiler->currentFunctionReturnTypeName;
+                            std::string structName = ReturnUpcastStructName(returnNV);
+
+                            if (returnedFatFrameSlot != nullptr)
+                            {
+                                // Already boxed against this frame's storage. The implements/shape
+                                // checks below cannot apply (the operand is no longer the class),
+                                // and returnNV describes the fat pointer rather than what was boxed
+                                // - so name the class from the vtable the value carries, or say
+                                // nothing about it when no single class answers.
+                                LogInterfaceReturnDangle(jump, BoxedStructNameOfFatValue(right, compiler), ifaceName);
+                            }
+                            else if (!structName.empty() && !compiler->StructImplementsInterface(structName, ifaceName))
+                            {
+                                LogErrorContext(jump, std::format("'{}' does not implement interface '{}'", structName, ifaceName));
+                            }
+                            else if (!structName.empty()
+                                     && RejectPointerShapedInterfaceUpcast(
+                                            jump, returnNV.TypeAndValue, ifaceName))
+                            {
+                                // Diagnosed: a pointer/view-shaped binding cannot carry the vtable.
+                                // Empty body only because LogErrorContext throws; otherwise this
+                                // must not fall through to CreateReturnCall with an unboxed ptr.
+                            }
+                            else if (!structName.empty())
+                            {
+                                if (returnNV.TypeAndValue.Pointer)
+                                {
+                                    // Concrete implementer pointer: defer the boxing to
+                                    // CreateReturnCall so the owning local's scope-exit free is
+                                    // suppressed (ownership moves to the caller).
+                                    interfaceReturnStructName = structName;
+                                }
+                                else
+                                {
+                                    // Concrete implementer VALUE: the interface fat pointer must
+                                    // carry a data pointer that outlives this call. A by-value
+                                    // local lives in this frame, so boxing it would return a
+                                    // dangling pointer. Reject with a clear diagnostic steering to
+                                    // a heap allocation (rather than emitting UB / a verifier dump).
+                                    LogInterfaceReturnDangle(jump, structName, ifaceName);
+                                }
+                            }
+                            else if (llvm::isa<llvm::Constant>(right) && right->getType()->isPointerTy())
+                            {
+                                // `return nullptr;` for an interface return -> null fat pointer.
+                                right = llvm::ConstantAggregateZero::get(fatTy);
+                            }
+                            else if (right->getType()->isPointerTy())
+                            {
+                                // Backstop against a raw pointer reaching the module verifier.
+                                // Any nameless pointer expression (`c + 0`) gets here, not just a join.
+                                LogErrorContext(jump, std::format(
+                                    "cannot convert this expression to interface '{}': its concrete "
+                                    "class cannot be determined; bind it to a local variable of the "
+                                    "class type first", ifaceName));
+                            }
+                        }
+
+                        // Derived-interface -> parent-interface RETURN (`IElement f(){ IButton b = ...;
+                        // return b; }`). The returned value is already a fat pointer, but a derived
+                        // vtable is not layout-compatible with the parent's once field-offset slots
+                        // exist, so rebuild it through the typedesc chain - the same rebox the
+                        // assignment and call-argument paths do. A same-interface return is a no-op.
+                        // The ownership checks above are untouched: they fire on a returned concrete
+                        // POINTER (the boxing case), which this is not.
+                        if (auto* fatTy = compiler->GetFatPtrType();
+                            right != nullptr && fatTy != nullptr && right->getType() == fatTy)
+                        {
+                            // A '?:' result carries no NamedVariable TypeName; fall back to the
+                            // per-value ledger a ternary join stamps (PropagateFatInterfaceJoin).
+                            std::string srcIface = compiler->ResolveFatInterfaceSrcName(right,
+                                returnNV.TypeAndValue.IsInterface ? returnNV.TypeAndValue.TypeName : std::string());
+                            right = compiler->ReboxInterfaceIfNeeded(
+                                right, srcIface, compiler->currentFunctionReturnTypeName);
+                        }
+
+                        compiler->CreateReturnCall(right, retStorage, interfaceReturnStructName);
+                    }
+                    else
+                    {
+                        compiler->CreateReturnCall(nullptr);
+                    }
+                }
+                return;
+            }
+            else if (jump->Continue())
+            {
+                RecordLoopExitMovedState();
+                straightLineJumped_ = true;
+                compiler->CreateContinueCall();
+                return;
+            }
+            else if (jump->Break())
+            {
+                RecordLoopExitMovedState();
+                straightLineJumped_ = true;
+                compiler->CreateBreakCall();
+                return;
+            }
+        }
+        else if (expressStatement != nullptr)
+        {
+            auto express = expressStatement->expression();
+            if (express != nullptr)
+            {
+                // A discarded full expression (`makePlain(2);`). Evaluate via the Named path so we
+                // can see whether the result is an unclaimed owning-struct temp and register it for
+                // end-of-full-expression destruction (FlushOwnedTemps at the block-item boundary).
+                if (auto* assign = express->assignmentExpression())
+                {
+                    bool bareExpr = assign->assignmentOperator() == nullptr;
+                    auto resultNV = ParseAssignmentExpressionNamed(assign, true);
+                    if (bareExpr) DiagnoseDiscardedOwningReturn(assign, resultNV);
+                    ProcessPlusPlus();
+                    RegisterDiscardedOwningStructTemp(resultNV);
+                    return;
+                }
+                ParseExpression(express);
+                return;
+            }
+        }
+        else if (iterationStatement != nullptr)
+        {
+            // A loop falls through to its resume (it may run zero times or exit normally), so a
+            // return in its body does not mark the enclosing straight-line as returned.
+            ReturnFlagGuard returnFlagGuard(&straightLineReturned_);
+            ReturnFlagGuard jumpFlagGuard(&straightLineJumped_);
+            LoopMovedStateGuard loopMovedGuard(this, compiler);
+            // Consume the vectorize request immediately so it binds only to this
+            // loop level (a nested loop in the body re-reads a cleared flag).
+            bool doVectorize = vectorizeActive_;
+            int  vectorizeLine = vectorizeLine_;
+            VectorizeFpTier fpTier = vectorizeFpTier_;
+            vectorizeActive_ = false;
+            vectorizeFpTier_ = VectorizeFpTier::None;
+
+            /*
+            iterationStatement
+                : While '(' expression ')' statement
+                | Do statement While '(' expression ')' ';'
+                | For '(' forCondition ')' statement
+                ;
+            forCondition
+                : (forDeclaration | expression?) ';' forExpression? ';' forExpression?
+                ;
+            */
+
+            // Check Do before While: do-while contains the 'while' keyword, so While() returns
+            // non-null for both rules. Do() is unambiguous and must be tested first.
+            if (iterationStatement->Do())
+            {
+                auto expression = iterationStatement->expression();
+                auto innerStatement = iterationStatement->statement();
+
+                auto blockInner = compiler->CreateBasicBlock("doWhileInner");
+                auto blockCondition = compiler->CreateBasicBlock("doWhileCondition");
+                auto blockResume = compiler->CreateBasicBlock("doWhileResume");
+
+                compiler->CreateBlockBreak(blockInner, false);
+
+                compiler->InitializeBlock(blockInner, true, blockCondition, blockResume, blockResume);
+                ParseControlledBody(innerStatement);
+                compiler->CreateContinueCall();
+
+                compiler->InitializeBlock(blockCondition, false);
+                auto condition = ParseExpression(expression);
+                // Free owned-string temps produced inside the condition (e.g. `do {...} while
+                // (s.toString() != "x")`) here, in the condition block. The block-item flush runs
+                // in the post-loop block, where the dominance guard would drop them and leak.
+                compiler->FlushOwnedTemps();
+                compiler->CreateConditionJump(condition, blockInner, blockResume);
+
+                // resume
+                compiler->InitializeBlock(blockResume, false);
+
+                // pop the stack
+                compiler->CreateBlockBreak(nullptr, true);
+                return;
+            }
+            else if (iterationStatement->While())
+            {
+                auto expression = iterationStatement->expression();
+                auto innerStatement = iterationStatement->statement();
+
+                auto blockCondition = compiler->CreateBasicBlock("whileCondition");
+                auto blockInner = compiler->CreateBasicBlock("whileInner");
+                auto blockResume = compiler->CreateBasicBlock("whileResume");
+
+                compiler->CreateBlockBreak(blockCondition, false);
+
+                compiler->InitializeBlock(blockCondition, true, blockCondition, blockResume, blockResume);
+                auto condition = ParseExpression(expression);
+                // Free owned-string temps from the condition in the condition block (see do-while).
+                // Runs each iteration after the guard is evaluated.
+                compiler->FlushOwnedTemps();
+
+                // A constant-true guard (`while (true)` / `while (1)`) can only be
+                // left via `break`. Branch unconditionally into the body so the
+                // resume block keeps a predecessor only when a break targets it.
+                // CreateConditionJump would instead emit a cond-br that always
+                // lists blockResume as a successor, making the dead exit look like
+                // a live fall-through path and wrongly demanding a trailing return.
+                // When no break targets it, blockResume is left predecessor-less;
+                // IsCurrentBlockUnreachable() then recognizes it as dead at the end
+                // of the enclosing function/lambda (see the missing-return checks).
+                if (compiler->IsConstantTruthy(condition))
+                    compiler->CreateBlockBreak(blockInner, false);  // unconditional br to body
+                else
+                    compiler->CreateConditionJump(condition, blockInner, blockResume);
+
+                compiler->InitializeBlock(blockInner, false);
+                {
+                    int prevBody = currentVectorizeBodyLine_;
+                    if (doVectorize) currentVectorizeBodyLine_ = vectorizeLine;
+                    // Apply the FP-math tier to the body's FP ops; save/restore so nothing
+                    // outside the lexical body inherits the flags (and outer scopes compose).
+                    llvm::FastMathFlags prevFMF = compiler->builder->getFastMathFlags();
+                    ApplyVectorizeFpTier(compiler, fpTier);
+                    ParseControlledBody(innerStatement);
+                    compiler->builder->setFastMathFlags(prevFMF);
+                    currentVectorizeBodyLine_ = prevBody;
+                }
+                compiler->CreateContinueCall();
+
+                // The back-edge to blockCondition is now the terminator of the
+                // current block (the loop latch); stamp the vectorize hint on it.
+                if (doVectorize)
+                    compiler->AttachVectorizeHintToCurrentLatch(vectorizeLine);
+
+                // resume
+                compiler->InitializeBlock(blockResume, false);
+
+                // pop the stack
+                compiler->CreateBlockBreak(nullptr, true);
+
+                return;
+            }
+            else if (iterationStatement->For())
+            {
+                // Classic for-loop: for (init; cond; inc) statement
+                if (iterationStatement->forCondition())
+                {
+                    auto forCondition = iterationStatement->forCondition();
+                    auto declaration = forCondition->forDeclaration();
+                    auto expressionCtx = forCondition->expression();
+                    auto forIncrementCtx = forCondition->forExpression();
+                    auto compareCtx = forCondition->assignmentExpression();
+                    auto innerStatement = iterationStatement->statement();
+
+                    auto blockInit = compiler->CreateBasicBlock("forInit");
+                    auto blockCondition = compiler->CreateBasicBlock("forCondition");
+                    auto blockInner = compiler->CreateBasicBlock("forInner");
+                    auto blockIncrement = compiler->CreateBasicBlock("forIncrement");
+                    auto blockResume = compiler->CreateBasicBlock("forResume");
+
+                    compiler->CreateBlockBreak(blockInit, false);
+
+                    // Init => Condition => Inner => Increment => Condition
+
+                    // initialization
+                    compiler->InitializeBlock(blockInit, true, blockIncrement, blockResume, blockResume);
+                    if (declaration)
+                        ParseForDeclaration(declaration);
+                    if (expressionCtx)
+                    {
+                        // for-init is a discard position too: a bare owning-return call must error
+                        // and any owned temp must be freed here (mirrors the statement/for-update).
+                        auto* initAssign = expressionCtx->assignmentExpression();
+                        bool bareExpr = initAssign->assignmentOperator() == nullptr;
+                        auto nv = ParseAssignmentExpressionNamed(initAssign, true);
+                        if (bareExpr) DiagnoseDiscardedOwningReturn(initAssign, nv);
+                        ProcessPlusPlus();
+                        compiler->FlushOwnedTemps();
+                    }
+
+                    compiler->CreateBlockBreak(blockCondition, false);
+
+                    // Condition
+                    compiler->InitializeBlock(blockCondition, false);
+                    auto condition = ParseAssignmentExpression(compareCtx);
+                    // Free owned-string temps from the condition in the condition block (see do-while).
+                    compiler->FlushOwnedTemps();
+                    compiler->CreateConditionJump(condition, blockInner, blockResume);
+
+                    // Inner statement
+                    compiler->InitializeBlock(blockInner, false);
+                    {
+                        int prevBody = currentVectorizeBodyLine_;
+                        if (doVectorize) currentVectorizeBodyLine_ = vectorizeLine;
+                        // Apply the FP-math tier to every FP op the body emits (see while-form).
+                        llvm::FastMathFlags prevFMF = compiler->builder->getFastMathFlags();
+                        ApplyVectorizeFpTier(compiler, fpTier);
+                        ParseControlledBody(innerStatement);
+                        compiler->builder->setFastMathFlags(prevFMF);
+                        currentVectorizeBodyLine_ = prevBody;
+                    }
+                    compiler->CreateContinueCall();
+
+                    // Increment
+                    compiler->InitializeBlock(blockIncrement, false);
+
+                    auto assignments = forIncrementCtx->assignmentExpression();
+                    for (auto assign : assignments)
+                    {
+                        // A for-update is a discard position too (its value is unused).
+                        bool bareExpr = assign->assignmentOperator() == nullptr;
+                        auto nv = ParseAssignmentExpressionNamed(assign, true);
+                        if (bareExpr) DiagnoseDiscardedOwningReturn(assign, nv);
+                        ProcessPlusPlus();
+                    }
+
+                    compiler->CreateBlockBreak(blockCondition, false);
+
+                    // The increment block's back-edge to blockCondition is the
+                    // loop latch terminator; stamp the vectorize hint on it.
+                    if (doVectorize)
+                        compiler->AttachVectorizeHintToCurrentLatch(vectorizeLine);
+
+                    // resume
+                    compiler->InitializeBlock(blockResume, false);
+
+                    // pop the stack
+                    compiler->CreateBlockBreak(nullptr, true);
+
+                    return;
+                }
+                // Range-based for: for (T x in collection) statement
+                else if (iterationStatement->declarationSpecifiers() && iterationStatement->In())
+                {
+                    auto declSpecCtx = iterationStatement->declarationSpecifiers();
+                    auto varNameTok  = iterationStatement->Identifier();
+                    auto collExprCtx = iterationStatement->expression();
+                    auto bodyStmt    = iterationStatement->statement();
+
+                    std::string varName = varNameTok->getText();
+
+                    auto blockInit      = compiler->CreateBasicBlock("forRangeInit");
+                    auto blockCond      = compiler->CreateBasicBlock("forRangeCond");
+                    auto blockInner     = compiler->CreateBasicBlock("forRangeInner");
+                    auto blockIncrement = compiler->CreateBasicBlock("forRangeIncrement");
+                    auto blockResume    = compiler->CreateBasicBlock("forRangeResume");
+
+                    compiler->CreateBlockBreak(blockInit, false);
+
+                    // Push scope; continue -> increment, break/else -> resume
+                    compiler->InitializeBlock(blockInit, true, blockIncrement, blockResume, blockResume);
+
+                    // Evaluate the collection expression (needs typed NamedVariable for dispatch)
+                    auto collNV = ParseAssignmentExpressionNamed(collExprCtx->assignmentExpression());
+
+                    // Spill into alloca if the collection was returned by value (no storage)
+                    if (collNV.Storage == nullptr && collNV.Primary != nullptr)
+                    {
+                        llvm::Type* ty = collNV.BaseType;
+                        if (!ty) ty = compiler->GetType(collNV.TypeAndValue);
+                        auto spill = compiler->CreateAlloca(ty);
+                        compiler->CreateAssignment(collNV.Primary, spill);
+                        collNV.Storage = spill;
+                        collNV.Primary = nullptr;
+                    }
+
+                    // Imported winmd interface receiver -> iterate through the WinRT IIterable<T> /
+                    // IIterator<T> COM protocol instead of the count()/get() index path below.
+                    if (compiler->IsWinrtThinInterface(collNV.TypeAndValue.TypeName))
+                    {
+                        std::string collTypeName = collNV.TypeAndValue.TypeName;
+
+                        auto elemType = ParseDeclarationSpecifiers(declSpecCtx);
+                        elemType.VariableName = varName;
+                        std::string elemArg = elemType.TypeName;
+
+                        // Synthesize IIterable<T> and IIterator<T> (COM vtable + thin ptr + PIID).
+                        std::string iterableName = MangledGenericName(LLVMBackend::kWinrtIIterable, { elemArg });
+                        std::string iteratorName = MangledGenericName(LLVMBackend::kWinrtIIterator, { elemArg });
+                        bool haveIterable = compiler->InstantiateWinrtGenericInterface(LLVMBackend::kWinrtIIterable, { elemArg }, iterableName);
+                        bool haveIterator = compiler->InstantiateWinrtGenericInterface(LLVMBackend::kWinrtIIterator, { elemArg }, iteratorName);
+                        auto* iidGlobal = haveIterable ? compiler->EmitIidGlobalFor(iterableName) : nullptr;
+                        if (!haveIterable || !haveIterator || !iidGlobal)
+                        {
+                            LogErrorContext(iterationStatement,
+                                "foreach over a WinRT interface needs IIterable<T>/IIterator<T> "
+                                "(import \"Windows.Foundation.winmd\") and a scalar/named element type");
+                            return;
+                        }
+
+                        auto* i8PtrTy = compiler->builder->getInt8Ty()->getPointerTo();
+                        auto* i8Ty    = compiler->builder->getInt8Ty();
+                        auto* nullPtr = llvm::ConstantPointerNull::get(i8PtrTy);
+
+                        // The live interface pointer (load it out of storage if it is a variable).
+                        llvm::Value* objVal = collNV.Primary;
+                        if (!objVal) objVal = compiler->builder->CreateLoad(i8PtrTy, collNV.Storage);
+
+                        auto iterableAlloca = compiler->CreateAlloca(i8PtrTy);
+                        auto iteratorAlloca = compiler->CreateAlloca(i8PtrTy);
+                        auto hasAlloca      = compiler->CreateAlloca(i8Ty);
+                        compiler->builder->CreateStore(nullPtr, iterableAlloca);
+                        compiler->builder->CreateStore(nullPtr, iteratorAlloca);
+
+                        auto elemAlloca = compiler->CreateLocalVariable(elemType);
+
+                        // QueryInterface the receiver for IIterable<T> (IVector<T> only *requires*
+                        // it; an object that already is IIterable answers with itself + AddRef).
+                        auto* iidPtr = compiler->builder->CreateBitCast(iidGlobal, i8PtrTy);
+                        auto* ppvIterable = compiler->builder->CreateBitCast(iterableAlloca, i8PtrTy);
+                        auto* hrQI = compiler->EmitWinrtThinSlotCall(objVal, collTypeName, "QueryInterface", { iidPtr, ppvIterable });
+                        auto* iterableV = compiler->builder->CreateLoad(i8PtrTy, iterableAlloca);
+                        auto* qiOk = compiler->builder->CreateAnd(
+                            compiler->builder->CreateICmpEQ(hrQI, compiler->builder->getInt32(0)),
+                            compiler->builder->CreateICmpNE(iterableV, nullPtr));
+
+                        auto blockFirst = compiler->CreateBasicBlock("forIterFirst");
+                        compiler->CreateConditionJump(qiOk, blockFirst, blockResume);
+
+                        // First(&iterator) -> the IIterator<T>; bail to cleanup if it fails.
+                        compiler->InitializeBlock(blockFirst, false);
+                        auto* ppvIter = compiler->builder->CreateBitCast(iteratorAlloca, i8PtrTy);
+                        auto* hrFirst = compiler->EmitWinrtThinSlotCall(iterableV, iterableName, "First", { ppvIter });
+                        auto* iterV0 = compiler->builder->CreateLoad(i8PtrTy, iteratorAlloca);
+                        auto* firstOk = compiler->builder->CreateAnd(
+                            compiler->builder->CreateICmpEQ(hrFirst, compiler->builder->getInt32(0)),
+                            compiler->builder->CreateICmpNE(iterV0, nullPtr));
+                        compiler->CreateConditionJump(firstOk, blockCond, blockResume);
+
+                        // Condition: get_HasCurrent.
+                        compiler->InitializeBlock(blockCond, false);
+                        auto* iterC = compiler->builder->CreateLoad(i8PtrTy, iteratorAlloca);
+                        auto* ppHas = compiler->builder->CreateBitCast(hasAlloca, i8PtrTy);
+                        compiler->EmitWinrtThinSlotCall(iterC, iteratorName, "get_HasCurrent", { ppHas });
+                        auto* hasV = compiler->builder->CreateICmpNE(
+                            compiler->builder->CreateLoad(i8Ty, hasAlloca), compiler->builder->getInt8(0));
+                        compiler->CreateConditionJump(hasV, blockInner, blockResume);
+
+                        // Body: bind the element via get_Current, run the loop body.
+                        compiler->InitializeBlock(blockInner, false);
+                        auto* iterI = compiler->builder->CreateLoad(i8PtrTy, iteratorAlloca);
+                        auto* elemOut = compiler->builder->CreateBitCast(elemAlloca, i8PtrTy);
+                        compiler->EmitWinrtThinSlotCall(iterI, iteratorName, "get_Current", { elemOut });
+                        compiler->RecordMoveGenBind(varName); // element is a fresh binding each iteration
+                        ParseControlledBody(bodyStmt);
+                        compiler->CreateContinueCall();
+
+                        // Increment slot (continue target): MoveNext, then re-test HasCurrent.
+                        compiler->InitializeBlock(blockIncrement, false);
+                        auto* iterM = compiler->builder->CreateLoad(i8PtrTy, iteratorAlloca);
+                        auto* ppHas2 = compiler->builder->CreateBitCast(hasAlloca, i8PtrTy);
+                        compiler->EmitWinrtThinSlotCall(iterM, iteratorName, "MoveNext", { ppHas2 });
+                        compiler->CreateBlockBreak(blockCond, false);
+
+                        // Resume: null-safe Release of the iterator and the QI'd iterable.
+                        compiler->InitializeBlock(blockResume, false);
+                        auto releaseIfNonNull = [&](llvm::AllocaInst* slotAlloca, const std::string& thinNm) {
+                            auto* p = compiler->builder->CreateLoad(i8PtrTy, slotAlloca);
+                            auto* nn = compiler->builder->CreateICmpNE(p, nullPtr);
+                            auto relBB  = compiler->CreateBasicBlock("forIterRel");
+                            auto contBB = compiler->CreateBasicBlock("forIterRelCont");
+                            compiler->CreateConditionJump(nn, relBB, contBB);
+                            compiler->InitializeBlock(relBB, false);
+                            compiler->EmitWinrtThinSlotCall(p, thinNm, "Release", {});
+                            compiler->CreateBlockBreak(contBB, false);
+                            compiler->InitializeBlock(contBB, false);
+                        };
+                        releaseIfNonNull(iteratorAlloca, iteratorName);
+                        releaseIfNonNull(iterableAlloca, iterableName);
+                        compiler->CreateBlockBreak(nullptr, true);
+                        return;
+                    }
+
+                    bool isFaceType   = compiler->IsInterfaceType(collNV.TypeAndValue.TypeName);
+                    bool isFixedArray = collNV.BaseType && llvm::isa<llvm::ArrayType>(collNV.BaseType);
+
+                    // Call count() once and cache it
+                    llvm::Value* countVal = nullptr;
+                    llvm::Value* ifacePtr = nullptr;
+                    if (isFixedArray)
+                    {
+                        auto* arrTy = llvm::cast<llvm::ArrayType>(collNV.BaseType);
+                        countVal = compiler->builder->getInt32((uint32_t)arrTy->getNumElements());
+                    }
+                    else if (isFaceType)
+                    {
+                        ifacePtr = collNV.Storage;
+                        if (!ifacePtr)
+                        {
+                            auto fatTy = compiler->GetFatPtrType();
+                            ifacePtr = compiler->CreateAlloca(fatTy);
+                            compiler->CreateAssignment(collNV.Primary, ifacePtr);
+                        }
+                        countVal = compiler->CallInterfaceMethod(ifacePtr, collNV.TypeAndValue.TypeName, "count", {});
+                    }
+                    else
+                    {
+                        LLVMBackend::NamedVariable selfArg = collNV;
+                        selfArg.TypeAndValue.VariableName = "";
+                        countVal = compiler->CreateOverloadedFunctionCall("count", { selfArg });
+                    }
+
+                    auto* i32Ty = compiler->builder->getInt32Ty();
+
+                    auto countAlloca = compiler->CreateAlloca(i32Ty);
+                    compiler->builder->CreateStore(countVal, countAlloca);
+
+                    auto indexAlloca = compiler->CreateAlloca(i32Ty);
+                    compiler->builder->CreateStore(compiler->builder->getInt32(0), indexAlloca);
+
+                    // Pre-allocate the element variable in the init block (one alloca for all iterations)
+                    auto elemType = ParseDeclarationSpecifiers(declSpecCtx);
+                    elemType.VariableName = varName;
+                    auto elemAlloca = compiler->CreateLocalVariable(elemType);
+
+                    compiler->CreateBlockBreak(blockCond, false);
+
+                    // Condition: i < count
+                    compiler->InitializeBlock(blockCond, false);
+                    auto iVal   = compiler->CreateLoad(indexAlloca);
+                    auto cntVal = compiler->CreateLoad(countAlloca);
+                    auto cond   = compiler->builder->CreateICmpSLT(iVal, cntVal);
+                    compiler->CreateConditionJump(cond, blockInner, blockResume);
+
+                    // Inner block: load element, run body
+                    compiler->InitializeBlock(blockInner, false);
+
+                    LLVMBackend::NamedVariable indexNV;
+                    indexNV.Primary  = compiler->CreateLoad(indexAlloca);
+                    indexNV.BaseType = i32Ty;
+                    indexNV.TypeAndValue.TypeName = "int";
+
+                    llvm::Value* elemVal = nullptr;
+                    if (isFixedArray)
+                    {
+                        auto* arrTy = llvm::cast<llvm::ArrayType>(collNV.BaseType);
+                        llvm::Value* zero   = compiler->builder->getInt64(0);
+                        llvm::Value* idxI64 = compiler->builder->CreateZExt(
+                            compiler->CreateLoad(indexAlloca), compiler->builder->getInt64Ty(), "idxi64");
+                        auto* elemPtr = compiler->builder->CreateGEP(
+                            arrTy, collNV.Storage, {zero, idxI64}, "arrayelemptr");
+                        elemVal = compiler->builder->CreateLoad(arrTy->getElementType(), elemPtr, "arrayelem");
+                    }
+                    else if (isFaceType)
+                    {
+                        elemVal = compiler->CallInterfaceMethod(ifacePtr, collNV.TypeAndValue.TypeName, "get", { indexNV });
+                    }
+                    else
+                    {
+                        LLVMBackend::NamedVariable selfArg = collNV;
+                        selfArg.TypeAndValue.VariableName = "";
+                        elemVal = compiler->CreateOverloadedFunctionCall("get", { selfArg, indexNV });
+                    }
+
+                    if (elemVal)
+                        compiler->CreateAssignment(elemVal, elemAlloca);
+
+                    compiler->RecordMoveGenBind(varName); // element is a fresh binding each iteration
+                    ParseControlledBody(bodyStmt);
+                    compiler->CreateContinueCall();
+
+                    // Increment block: i++
+                    compiler->InitializeBlock(blockIncrement, false);
+                    compiler->CreateIncrement(indexAlloca, 1);
+                    compiler->CreateBlockBreak(blockCond, false);
+
+                    // Resume
+                    compiler->InitializeBlock(blockResume, false);
+                    compiler->CreateBlockBreak(nullptr, true);
+
+                    return;
+                }
+            }
+        }
+        else if (selectionStatement)
+        {
+            /*
+            selectionStatement
+                : 'if' '(' expression ')' statement ('else' statement)?
+                | 'if' 'const' '(' expression ')' statement ('else' statement)?
+                | 'switch' '(' expression ')' statement
+                ;
+            */
+
+            if (selectionStatement->If() && selectionStatement->Const())
+            {
+                // if const (...) - compile-time conditional
+                auto expression = selectionStatement->expression();
+                auto innerStatement = selectionStatement->statement();
+
+                int decision = DecideIfConstCondition(expression);
+                if (decision < 0)
+                {
+                    LogErrorContext(selectionStatement, "'if const' condition must be a compile-time constant expression");
+                    return;
+                }
+
+                bool taken = decision != 0;
+                if (taken)
+                    ParseStatement(innerStatement[0]);
+                else if (innerStatement.size() > 1)
+                    ParseStatement(innerStatement[1]);
+                return;
+            }
+            else if (selectionStatement->If())
+            {
+                auto expression = selectionStatement->expression();
+                auto innerStatement = selectionStatement->statement();
+
+                // Parse condition value before CreateBlock
+                auto blockCondition = compiler->CreateBasicBlock("ifCondition");
+                auto blockTrue = compiler->CreateBasicBlock("ifTrue");
+                auto blockResume = compiler->CreateBasicBlock("ifResume");
+                llvm::BasicBlock* blockElse = selectionStatement->Else() == nullptr ? nullptr : compiler->CreateBasicBlock("ifFalse");
+                auto blockFalse = blockElse ? blockElse : blockResume;
+
+                compiler->CreateBlockBreak(blockCondition, false);
+
+                compiler->InitializeBlock(blockCondition, true, nullptr, nullptr, blockFalse);
+                auto condition = ParseExpression(expression);
+                // Free owned-string temps produced inside the condition (e.g. `if (s.toString()
+                // == x)`) here, while still in the condition block. The block-item flush runs in
+                // the post-if merge block, where the dominance guard would drop them and leak.
+                compiler->FlushOwnedTemps();
+                compiler->CreateConditionJump(condition, blockTrue, blockFalse);
+
+                auto preIfMovedState = compiler->SaveMovedState();
+
+                // Only a `return` branch's moves truly vanish (the path exits the function). A
+                // break/continue branch REJOINS later code (post-loop / next iteration), so its
+                // moves must survive as maybe-moved - keep merging those. Track "this branch
+                // returned" via straightLineReturned_ (set by the return handler), which is immune
+                // to dead code after a return that would hide the ret terminator from a block check.
+                bool enclosingReturned = straightLineReturned_;
+                bool enclosingJumped = straightLineJumped_;
+
+                compiler->InitializeBlock(blockTrue, false);
+                straightLineReturned_ = false;
+                straightLineJumped_ = false;
+                ParseControlledBody(innerStatement[0]);
+                bool thenReturned = straightLineReturned_ || straightLineJumped_;
+                auto thenMovedState = compiler->SaveMovedState();
+
+                compiler->CreateBlockBreak(blockResume, true);
+
+                bool elseReturned = false;
+                if (blockElse != nullptr)
+                {
+                    // Restore pre-branch moved state so else doesn't inherit if-branch moves.
+                    compiler->RestoreMovedState(preIfMovedState);
+
+                    // else statement
+                    compiler->InitializeBlock(blockElse, true);
+                    straightLineReturned_ = false;
+                    straightLineJumped_ = false;
+                    ParseControlledBody(innerStatement[1]);
+                    elseReturned = straightLineReturned_ || straightLineJumped_;
+                    auto elseMovedState = compiler->SaveMovedState();
+                    compiler->CreateBlockBreak(blockResume, true);
+
+                    // Drop an EXITING branch's moves (return/break/continue never reach resume).
+                    // A break/continue path's moves are re-merged at loop exit, so they are not
+                    // lost. If both fall through, a var is moved if moved in either.
+                    if (thenReturned && !elseReturned)
+                        compiler->RestoreMovedState(elseMovedState);
+                    else if (!thenReturned && elseReturned)
+                        compiler->RestoreMovedState(thenMovedState);
+                    else if (thenReturned && elseReturned)
+                        compiler->RestoreMovedState(preIfMovedState);
+                    else
+                        compiler->MergeMovedStates(thenMovedState, elseMovedState);
+                }
+                else if (thenReturned)
+                {
+                    // No else: the resume path is the condition-false path, which never ran the
+                    // then-branch, so an exiting (return/break/continue) then-branch contributes
+                    // no moves here. A break/continue's moves rejoin at loop exit instead.
+                    compiler->RestoreMovedState(preIfMovedState);
+                }
+
+                // The enclosing straight-line has unconditionally returned iff it already had, or
+                // this if returns on every path (both branches return; a no-else if falls through).
+                straightLineReturned_ = enclosingReturned
+                    || (blockElse != nullptr && thenReturned && elseReturned);
+                straightLineJumped_ = enclosingJumped
+                    || (blockElse != nullptr && thenReturned && elseReturned);
+
+                // resume
+                compiler->InitializeBlock(blockResume, false);
+                return;
+            }
+            else if (selectionStatement->Switch())
+            {
+                // Conservatively treat a switch as falling through (a return in one case must not
+                // mark the enclosing straight-line as returned); restore the flag after the body.
+                ReturnFlagGuard returnFlagGuard(&straightLineReturned_);
+                auto expression = selectionStatement->expression();
+                auto body = selectionStatement->statement(0)->compoundStatement();
+
+                SwitchContext switchCtx;
+                switchCtx.resumeBlock = compiler->CreateBasicBlock("switchResume");
+
+                // Pre-scan: collect all case/default labels and create their blocks
+                if (body && body->blockItemList())
+                {
+                    for (auto blockItem : body->blockItemList()->blockItem())
+                    {
+                        auto stmt = blockItem->statement();
+                        if (stmt) CollectCasesFromStatement(stmt, switchCtx);
+                    }
+                }
+
+                auto switchDefault = switchCtx.defaultBlock ? switchCtx.defaultBlock : switchCtx.resumeBlock;
+
+                // Owned-string temporaries produced while evaluating the scrutinee (the scrutinee
+                // result of `switch (s.toString())`, plus any borrowed operands of a `switch (a + b)`
+                // concat) are temporaries nothing else frees. They cannot be flushed before the
+                // dispatch - the string-switch strcmp chain reads the scrutinee's buffer - and
+                // matched cases branch away before any common post-dispatch point. So collect every
+                // temp registered during scrutinee evaluation, pull them off the pending list (the
+                // merge-block flush would otherwise drop them via the dominance guard and leak), and
+                // re-register them at resumeBlock below, where every case/default path converges.
+                // (A `return` inside a case leaks on that path - the same documented across-branch
+                // temp limitation that applies elsewhere.)
+                size_t pendingBefore = compiler->pendingOwnedStringTemps.size();
+                auto condVal = ParseExpression(expression);
+                switchCtx.condValue = condVal;
+
+                std::vector<llvm::Value*> scrutineeTemps;
+                for (size_t t = pendingBefore; t < compiler->pendingOwnedStringTemps.size(); t++)
+                    scrutineeTemps.push_back(compiler->pendingOwnedStringTemps[t].first);
+                compiler->pendingOwnedStringTemps.resize(pendingBefore);
+                // A bare owned-call scrutinee (`switch (call())`) is not registered by any operator
+                // site, so add condVal explicitly when it is an owned string temp not already collected.
+                auto* condStrTy = llvm::StructType::getTypeByName(*compiler->context, "string");
+                if (compiler->lastCallReturnsOwned && condVal && condStrTy != nullptr
+                    && condVal->getType() == condStrTy
+                    && std::find(scrutineeTemps.begin(), scrutineeTemps.end(), condVal) == scrutineeTemps.end())
+                    scrutineeTemps.push_back(condVal);
+                compiler->lastCallReturnsOwned = false;
+
+                if (switchCtx.isTypeSwitch)
+                {
+                    // Type switch: dispatch on the concrete type behind an interface fat pointer
+                    auto fatTy = compiler->GetFatPtrType();
+                    auto ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
+
+                    // Validate: switch expression must be an interface-typed value (fat pointer)
+                    if (condVal->getType() != fatTy && condVal->getType() != fatTy->getPointerTo())
+                        LogErrorContext(expression, "type switch expression must be interface-typed (fat pointer)");
+
+                    // Extract dataPtr (field 1 of fat pointer)
+                    llvm::Value* dataPtr;
+                    if (condVal->getType()->isStructTy())
+                    {
+                        dataPtr = compiler->builder->CreateExtractValue(condVal, {1u});
+                    }
+                    else
+                    {
+                        auto dpField = compiler->builder->CreateStructGEP(fatTy, condVal, 1);
+                        dataPtr = compiler->builder->CreateLoad(ptrTy, dpField);
+                    }
+
+                    // Load type descriptor from vtable[0]
+                    llvm::Value* loadedDesc = LoadTypeDescFromInterface(condVal, expression);
+
+                    // Emit linear dispatch chain: for each type case, check if it matches
+                    for (auto& [labeledCtx, entry] : switchCtx.caseMap)
+                    {
+                        if (!entry.isTypeCase) continue;  // skip non-type cases (shouldn't happen)
+
+                        auto* nextCheck = compiler->CreateBasicBlock("typeswitch_next");
+
+                        if (auto dsIt = compiler->dataStructures.find(entry.typeCaseName); dsIt != compiler->dataStructures.end())
+                        {
+                            // Concrete struct case: single type descriptor comparison
+                            auto& sd = dsIt->second;
+                            if (!sd.typeDescriptor)
+                            {
+                                LogErrorContext(expression, std::format("struct '{}' has no type descriptor", entry.typeCaseName));
+                                continue;
+                            }
+                            auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, sd.typeDescriptor);
+                            compiler->builder->CreateCondBr(cmp, entry.block, nextCheck);
+                        }
+                        else if (compiler->programTable.count(entry.typeCaseName))
+                        {
+                            // Concrete program case: single type descriptor comparison
+                            auto& pd = compiler->programTable[entry.typeCaseName];
+                            if (!pd.typeDescriptor)
+                            {
+                                LogErrorContext(expression, std::format("program '{}' has no type descriptor", entry.typeCaseName));
+                                continue;
+                            }
+                            auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, pd.typeDescriptor);
+                            compiler->builder->CreateCondBr(cmp, entry.block, nextCheck);
+                        }
+                        else if (compiler->interfaceTable.count(entry.typeCaseName))
+                        {
+                            // Interface case: match if the concrete type implements this interface
+                            // Emit: if (typedesc == any_implementing_struct_typedesc) goto case block
+                            llvm::BasicBlock* anyMatchedBlock = entry.block;
+                            auto* nextStruct = nextCheck;
+
+                            // Enumerate all classes/structs that implement this interface
+                            for (auto& [sName, sd] : compiler->dataStructures)
+                            {
+                                if (!compiler->StructImplementsInterface(sName, entry.typeCaseName)) continue;
+                                if (!sd.typeDescriptor) continue;
+
+                                auto* matchBlock = compiler->CreateBasicBlock("typeswitch_match");
+                                auto* cmpNextStruct = compiler->CreateBasicBlock("typeswitch_cmp_next");
+
+                                auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, sd.typeDescriptor);
+                                compiler->builder->CreateCondBr(cmp, matchBlock, cmpNextStruct);
+
+                                compiler->SwitchToBlock(matchBlock);
+                                compiler->builder->CreateBr(anyMatchedBlock);
+
+                                compiler->SwitchToBlock(cmpNextStruct);
+                                nextStruct = cmpNextStruct;
+                            }
+                            // Also enumerate programs that implement this interface
+                            for (auto& [pName, pd] : compiler->programTable)
+                            {
+                                if (!compiler->StructImplementsInterface(pName, entry.typeCaseName)) continue;
+                                if (!pd.typeDescriptor) continue;
+
+                                auto* matchBlock = compiler->CreateBasicBlock("typeswitch_match");
+                                auto* cmpNextStruct = compiler->CreateBasicBlock("typeswitch_cmp_next");
+
+                                auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, pd.typeDescriptor);
+                                compiler->builder->CreateCondBr(cmp, matchBlock, cmpNextStruct);
+
+                                compiler->SwitchToBlock(matchBlock);
+                                compiler->builder->CreateBr(anyMatchedBlock);
+
+                                compiler->SwitchToBlock(cmpNextStruct);
+                                nextStruct = cmpNextStruct;
+                            }
+                            // Fall through nextStruct to nextCheck
+                            compiler->builder->CreateBr(nextCheck);
+                        }
+                        else
+                        {
+                            LogErrorContext(expression, std::format("'{}' is not a known struct or interface type", entry.typeCaseName));
+                        }
+
+                        compiler->SwitchToBlock(nextCheck);
+                    }
+                    // Fall through to default case
+                    compiler->CreateJump(switchDefault);
+                }
+                else if (switchCtx.isStringSwitch)
+                {
+                    // String switch: emit if-else chain using strcmp on _ptr (field 0)
+                    auto* strPtr = compiler->builder->CreateExtractValue(condVal, { 0u });
+                    auto* strcmpFn = compiler->GetOrDeclareStrcmp();
+                    auto* i32Zero = compiler->builder->getInt32(0);
+
+                    for (auto& [labeledCtx, entry] : switchCtx.caseMap)
+                    {
+                        if (!entry.strLiteral) continue;
+                        auto* nextBlock = compiler->CreateBasicBlock("switchCmp");
+                        auto* cmpResult = compiler->builder->CreateCall(strcmpFn, { strPtr, entry.strLiteral });
+                        auto* isEqual = compiler->builder->CreateICmpEQ(cmpResult, i32Zero);
+                        compiler->builder->CreateCondBr(isEqual, entry.block, nextBlock);
+                        compiler->SwitchToBlock(nextBlock);
+                    }
+                    compiler->CreateJump(switchDefault);
+                }
+                else
+                {
+                    auto switchInst = compiler->CreateSwitchInst(condVal, switchDefault, (unsigned)switchCtx.caseMap.size());
+                    for (auto& [labeledCtx, entry] : switchCtx.caseMap)
+                        if (entry.value)  // null value = wildcard (_) arm, handled via defaultBlock
+                            switchInst->addCase(compiler->CoerceCaseValue(entry.value, condVal->getType()), entry.block);
+                }
+
+                // Push scope: break -> resumeBlock, no continue (propagates to outer loop)
+                compiler->InitializeBlock(nullptr, true, nullptr, switchCtx.resumeBlock, nullptr);
+
+                switchStack.push_back(switchCtx);
+
+                if (body && body->blockItemList())
+                    ParseBlockItemList(body->blockItemList());
+
+                // Fallthrough at end of switch body -> resume
+                compiler->CreateBlockBreak(switchCtx.resumeBlock, true);
+
+                switchStack.pop_back();
+
+                compiler->InitializeBlock(switchCtx.resumeBlock, false);
+                // Free the scrutinee temporaries now that the dispatch is done and all paths have
+                // converged here. Registered against resumeBlock so the block-item flush (which runs
+                // next, still positioned in resumeBlock) emits the destructors; each temp is computed
+                // in the switch-entry block, which dominates resumeBlock.
+                for (auto* t : scrutineeTemps)
+                    compiler->RegisterOwnedStringTemp(t);
+                return;
+            }
+        }
+        else if (compoundStatement)
+        {
+            compiler->InitializeBlock(nullptr, true);
+            auto blockList = compoundStatement->blockItemList();
+            if (blockList)
+                ParseBlockItemList(blockList);
+            compiler->CreateBlockBreak(nullptr, true);
+            return;
+        }
+        else if (expectErrorStmt)
+        {
+            std::string rawText = expectErrorStmt->StringLiteral()->getText();
+            compilerLLVM->expectedError = ProcessRawText(rawText);
+
+            if (auto* cs = expectErrorStmt->compoundStatement())
+            {
+                // Scoped block form: expect_error("msg") { ... } - error must occur inside the braces.
+                compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;  // manual check after block
+                size_t savedDepth = compilerLLVM->stackNamedVariable.size();
+                compiler->InitializeBlock(nullptr, true);
+                bool errorReceived = false;
+                try
+                {
+                    if (auto* blockList = cs->blockItemList())
+                        ParseBlockItemList(blockList);
+                }
+                catch (const ExpectedErrorReceived&)
+                {
+                    errorReceived = true;
+                    // The rest of the block never ran (see the file-scope catch). Today the grammar
+                    // puts no classDefinition in a function body, so this is a defensive no-op.
+                    ForgetIfConstGuardedImpls(compilerLLVM, cs);
+                    // Pop any extra nested frames without destructors (error path).
+                    while (compilerLLVM->stackNamedVariable.size() > savedDepth)
+                        compilerLLVM->stackNamedVariable.pop_back();
+                    // Terminate the current block and create a new one so the outer
+                    // function's subsequent statements have a valid insertion point.
+                    if (auto* bb = compilerLLVM->builder->GetInsertBlock())
+                    {
+                        if (!compiler->IsBlockTerminated())
+                            compilerLLVM->builder->CreateUnreachable();
+                        auto* resume = llvm::BasicBlock::Create(
+                            *compilerLLVM->context, "after_expect_error", bb->getParent());
+                        compilerLLVM->builder->SetInsertPoint(resume);
+                    }
+                    compilerLLVM->RestoreFileScopeExpectedError();
+                }
+
+                if (!errorReceived)
+                {
+                    compiler->CreateBlockBreak(nullptr, true);
+                    if (!compilerLLVM->expectedError.empty())
+                    {
+                        std::cout << std::format("FAIL: expected error '{}' did not occur\n",
+                                                  compilerLLVM->expectedError);
+                        compilerLLVM->expectedError.clear();
+                        if (compilerLLVM->diagnosticSink_)
+                            throw CompilerAbortException{ "expected error did not occur", compilerLLVM->sourceFileName, 0, 0 };
+                        else
+                            compilerLLVM->FailCompilation("expected error did not occur");
+                    }
+                }
+            }
+            else
+            {
+                // Bare-semicolon form: expect_error("msg"); - error must occur before the enclosing scope exits.
+                compilerLLVM->expectedErrorScopeDepth = compilerLLVM->stackNamedVariable.size();
+            }
+            return;
+        }
+
+        else if (auto* lockStmt = statement->lockStatement())
+        {
+            // lock (expr1, expr2, ...) { body }
+            // Acquire all mutexes in order, parse body, release in reverse order on scope exit.
+            auto* lockClauseCtx = lockStmt->lockClause();
+            auto lockArgs = lockClauseCtx->lockArgList()->expression();
+
+            struct AcquiredLock
+            {
+                std::string canonical;
+                std::string acquireMethod;
+                std::string releaseMethod;
+                std::string typeName;
+                LockMode heldMode = LockMode::Exclusive;
+                llvm::Value* mutexPtr = nullptr; // address release() is called on - the mutex itself
+            };
+            std::vector<AcquiredLock> acquired;
+
+            for (auto* exprCtx : lockArgs)
+            {
+                // Determine mode: strip trailing .read/.write soft keyword.
+                std::string mode = GetLockArgMode(exprCtx);
+                std::string canonical = GetLockArgCanonical(exprCtx);
+
+                // Evaluate the base expression (without .read/.write suffix).
+                // For .read/.write, we need the base expression's assignmentExpression context.
+                // Since getText() strips whitespace, we reconstruct the base by truncating.
+                // The simplest approach: evaluate the full expression but intercept if mode set.
+                LLVMBackend::NamedVariable mutexNV;
+                if (mode.empty())
+                {
+                    mutexNV = ParseAssignmentExpressionNamed(exprCtx->assignmentExpression());
+                }
+                else
+                {
+                    // `rw.read` / `rw.write`: the mode suffix is a soft keyword, not a real field.
+                    // Evaluate the postfix chain minus the trailing '.'/'read'/'write' children.
+                    auto* pfx = tryGetPostfixExpression(exprCtx);
+                    if (pfx == nullptr || pfx->children.size() < 3)
+                    {
+                        LogErrorContext(lockStmt, std::format(
+                            "lock: '{}' mode requires a simple lock target, e.g. 'lock(rw.{})'.", mode, mode));
+                        return;
+                    }
+                    mutexNV = ParsePostfixExpression(pfx, true, 2);
+                }
+
+                // Spill into alloca if returned by value (no storage pointer).
+                if (mutexNV.Storage == nullptr && mutexNV.Primary != nullptr)
+                {
+                    llvm::Type* ty = mutexNV.BaseType ? mutexNV.BaseType : compiler->GetType(mutexNV.TypeAndValue);
+                    auto* spill = compiler->CreateAlloca(ty);
+                    compiler->CreateAssignment(mutexNV.Primary, spill);
+                    mutexNV.Storage = spill;
+                    mutexNV.Primary = nullptr;
+                }
+
+                if (!mutexNV.Storage)
+                {
+                    LogErrorContext(lockStmt, std::format("lock: expression '{}' must be a lock variable.", canonical));
+                    return;
+                }
+
+                std::string mutexTypeName = mutexNV.TypeAndValue.TypeName;
+
+                // A dynamically-dispatched lock cannot be named: the lock-set analysis
+                // canonicalizes targets by name, so an interface-typed value is rejected.
+                if (compiler->interfaceTable.count(mutexTypeName))
+                {
+                    LogErrorContext(lockStmt, std::format(
+                        "lock: '{}' is an interface value of type '{}'; lock() requires a concrete lock type.",
+                        canonical, mutexTypeName));
+                    return;
+                }
+
+                // Classify the receiver against the capability table. "write" and "" are both
+                // the exclusive mode; "read" selects the shared row; "optimistic" demands
+                // IOptimisticLockable, which is a checking capability with no scoped lowering.
+                std::string wantMode = (mode == "read" || mode == "optimistic") ? mode : "";
+                const char* wantIface = CapabilityForLockMode(wantMode);
+                if (!compiler->TypeHasCapability(mutexTypeName, wantIface))
+                {
+                    if (wantMode.empty())
+                        LogErrorContext(lockStmt, std::format(
+                            "lock: type '{}' is not a lock type (missing [Capability(ILockable)]).",
+                            mutexTypeName));
+                    else
+                        LogErrorContext(lockStmt, std::format(
+                            "lock: type '{}' does not support '{}' mode (missing [Capability({})]).",
+                            mutexTypeName, wantMode, wantIface));
+                    return;
+                }
+
+                const CapabilitySpec* spec = nullptr;
+                for (const auto& cap : kCapabilities)
+                {
+                    if (wantMode != cap.Mode) continue;
+                    if (!compiler->TypeHasCapability(mutexTypeName, cap.Iface)) continue;
+                    spec = &cap;
+                    break;
+                }
+                if (spec == nullptr)
+                {
+                    // Only 'optimistic' reaches here: it validates, it does not acquire, so there
+                    // is no acquire/release pair for a scoped block to bracket the body with.
+                    LogErrorContext(lockStmt, std::format(
+                        "lock: '{}' mode has no scoped form; call '{}.read(() => {{ ... }})' instead.",
+                        wantMode, canonical));
+                    return;
+                }
+                std::string acquireMethod = spec->Acquire;
+                std::string releaseMethod = spec->Release;
+
+                // For a pointer lock arg (mutex*), Storage is the address of the pointer field
+                // (mutex**); releasing that would unlock the wrong address and leak the lock forever.
+                llvm::Value* mutexPtr = mutexNV.Storage;
+                if (mutexNV.TypeAndValue.Pointer)
+                    mutexPtr = compiler->CreateLoad(compiler->builder->getPtrTy(), mutexNV.Storage);
+
+                // Call acquire / acquire_read.
+                LLVMBackend::NamedVariable selfArg = mutexNV;
+                selfArg.TypeAndValue.VariableName = "";
+                compiler->CreateOverloadedFunctionCall(acquireMethod, { selfArg });
+
+                llvm::Function* unlockFn = FindMethodOf(releaseMethod, mutexTypeName);
+                if (!unlockFn)
+                {
+                    LogErrorContext(lockStmt, std::format(
+                        "lock: type '{}' has no '{}' method.", mutexTypeName, releaseMethod));
+                    return;
+                }
+
+                acquired.push_back({ canonical, acquireMethod, releaseMethod, mutexTypeName,
+                                     LockModeFromSuffix(mode), mutexPtr });
+            }
+
+            // Push the lock scope and register a cleanup for every acquired mutex, so
+            // scope exit releases all of them (in reverse) instead of only the first.
+            compiler->InitializeBlock(nullptr, true);
+            for (const auto& lk : acquired)
+            {
+                compiler->stackNamedVariable.back().lockCleanups.push_back(
+                    LLVMBackend::StackState::LockCleanup{
+                        .UnlockFn = FindMethodOf(lk.releaseMethod, lk.typeName),
+                        .MutexPtr = lk.mutexPtr,
+                    });
+            }
+
+            // Update lock-set for static analysis. Save each token's prior state so a nested
+            // `lock (m.read)` inside an outer `lock (m)` restores the outer mode on exit
+            // instead of dropping the lock from the set entirely.
+            std::vector<std::pair<std::string, std::optional<LockMode>>> savedTokens;
+            for (const auto& lk : acquired)
+            {
+                for (auto& tok : LockSetAliases(lk.canonical))
+                {
+                    auto it = currentLockSet.find(tok);
+                    savedTokens.emplace_back(tok,
+                        it == currentLockSet.end() ? std::optional<LockMode>{} : std::optional<LockMode>{ it->second });
+                    currentLockSet[tok] = lk.heldMode;
+                }
+            }
+
+            // Parse the body.
+            auto* blockList = lockStmt->compoundStatement()->blockItemList();
+            if (blockList)
+                ParseBlockItemList(blockList);
+
+            // Restore the lock-set.
+            for (auto it = savedTokens.rbegin(); it != savedTokens.rend(); ++it)
+            {
+                if (it->second.has_value())
+                    currentLockSet[it->first] = *it->second;
+                else
+                    currentLockSet.erase(it->first);
+            }
+
+            // Close the scope - EmitDestructorsForScope will call unlock().
+            compiler->CreateBlockBreak(nullptr, true);
+            return;
+        }
+
+        LogErrorContext(statement, "Unhandled statement type.");
+        return;
+    }
+
+void MainListener::GenerateDefaultParamOverloads(
+        const std::string& name,
+        const LLVMBackend::DeclTypeAndValue& returnType,
+        const std::vector<LLVMBackend::DeclTypeAndValue>& params,
+        bool varargs,
+        size_t line) {
+        auto* compiler = Compiler();
+        int firstDefault = -1;
+        for (int i = 0; i < (int)params.size(); i++)
+        {
+            if (params[i].DefaultValue != nullptr)
+            {
+                firstDefault = i;
+                break;
+            }
+        }
+
+        if (firstDefault < 0)
+            return;
+
+        for (int cutoff = firstDefault; cutoff < (int)params.size(); cutoff++)
+        {
+            std::vector<LLVMBackend::TypeAndValue> wrapperParams(params.begin(), params.begin() + cutoff);
+
+            auto wrapperFn = compiler->CreateFunctionDefinition(name, returnType, wrapperParams, false, false, line);
+            compiler->InitializeBlock(&wrapperFn->front(), false);
+            // Fresh straight-line for the wrapper body; restore the enclosing walk's flag on exit.
+            ReturnFlagGuard wrapperReturnFlagGuard(&straightLineReturned_);
+            straightLineReturned_ = false;
+
+            // Clear each arg's VariableName: MatchFunction treats a non-empty VariableName as a
+            // NAMED argument, which hard-errors on same-named methods of unrelated types instead of rejecting.
+            std::vector<LLVMBackend::NamedVariable> callArgs;
+
+            for (int i = 0; i < cutoff; i++)
+            {
+                auto arg = compiler->GetFunctionArgument(params[i].VariableName);
+                arg.TypeAndValue.VariableName = "";   // forward positionally, never as a named arg
+                // A 'move' parameter must forward AS a move, or the wrapper binds the borrow
+                // overload and its own scope-exit teardown frees what the callee kept.
+                if (params[i].IsMove)
+                    arg.IsExplicitMove = true;
+                callArgs.push_back(arg);
+            }
+
+            for (int i = cutoff; i < (int)params.size(); i++)
+            {
+                auto* initCtx = params[i].DefaultValue;
+                llvm::Value* defaultVal = nullptr;
+                if (auto* ae = initCtx->assignmentExpression())
+                {
+                    // Parameter-DEFAULT leg of the code-value store gate: `f(Rec* p = ro)` put a
+                    // code address in the omitted argument's slot and the body wrote through it.
+                    auto defNV = ParseAssignmentExpressionNamed(ae);
+                    defaultVal = LoadNamedVariable(defNV);
+                    RejectCodeValueIntoDataSlot(ae, defNV, params[i], "default-initialize",
+                        std::format("parameter '{}' of", params[i].VariableName));
+                }
+                else if (initCtx->Default())
+                {
+                    defaultVal = GenerateDefaultValue(params[i]);
+                }
+                else if (initCtx->LeftBrace() != nullptr)
+                {
+                    // Gated on the brace TOKEN so the EMPTY form ('int f(int x = {})') reaches
+                    // this arm too - initializerList() is null for '{}' and it used to miss.
+                    auto* initList = initCtx->initializerList();
+                    /*
+                     * An array VIEW is Pointer-flagged but is not a pointer target. Exempt it
+                     * exactly as the declarator guard does: the empty form gets the declarator's
+                     * own length message instead of naming a pointer that is not there, and the
+                     * non-empty form - which the declarator supports by building backing storage,
+                     * and which a parameter default cannot - says so rather than borrowing the
+                     * pointer wording. Both LogErrorContext calls throw, so neither falls through.
+                     */
+                    if (params[i].IsArrayView)
+                    {
+                        if (initList == nullptr)
+                            LogErrorContext(initCtx, std::format(
+                                "cannot infer the length of '{}[]' from an empty initializer list; "
+                                "use an explicit size '{}[N]'",
+                                params[i].TypeName, params[i].TypeName));
+                        LogErrorContext(initCtx, std::format(
+                            "a brace list is not supported as the default for the array-view "
+                            "parameter '{}' of type '{}[]' - it would need backing storage the "
+                            "default cannot own; use '= default' and fill it in the body",
+                            params[i].VariableName, params[i].TypeName));
+                    }
+
+                    if (params[i].Pointer)
+                    {
+                        // Non-empty: field-inits through a POINTER alloca, so the caller gets the
+                        // field bytes as 'p'. Empty: ambiguous between null and a default object.
+                        std::string role = std::format("parameter default for '{}'", params[i].VariableName);
+                        if (initList != nullptr)
+                            LogPointerBraceInitReject(initCtx, role, params[i].TypeName,
+                                DescribePointerDeclType(params[i]),
+                                CanSuggestAllocation(initCtx, params[i]));
+                        else
+                            LogEmptyBraceOnPointerReject(initCtx, role, params[i]);
+                    }
+
+                    // Field initializer default: build the struct, apply overrides, pass by value.
+                    defaultVal = GenerateDefaultValue(params[i]);
+                    if (defaultVal && initList != nullptr)
+                    {
+                        auto* alloca = compiler->CreateAlloca(defaultVal->getType());
+                        compiler->CreateAssignment(defaultVal, alloca);
+                        EmitFieldInitializer(alloca, params[i].TypeName, initList);
+                        defaultVal = compiler->CreateLoad(alloca);
+                    }
+                }
+                // An unsupported default-initializer spelling (notably an empty '= {}') leaves
+                // defaultVal null, which the call below dereferences - diagnose instead of crashing.
+                if (!defaultVal)
+                    LogErrorContext(initCtx, std::format(
+                        "cannot build the default value for parameter '{}' of type '{}' - this default "
+                        "initializer form is not supported; use '= default' or an explicit expression",
+                        params[i].VariableName, params[i].TypeName));
+
+                LLVMBackend::NamedVariable namedVar;
+                namedVar.Primary = defaultVal;
+                namedVar.BaseType = defaultVal ? defaultVal->getType() : nullptr;
+                namedVar.TypeAndValue.TypeName = params[i].TypeName;
+                namedVar.TypeAndValue.Pointer = params[i].Pointer;
+                callArgs.push_back(namedVar);
+            }
+
+            if (returnType.TypeName == "void")
+            {
+                compiler->CreateOverloadedFunctionCall(name, callArgs);
+                compiler->CreateReturnCall(nullptr);
+            }
+            else
+            {
+                auto result = compiler->CreateOverloadedFunctionCall(name, callArgs);
+                compiler->CreateReturnCall(result);
+            }
+
+            compiler->CreateBlockBreak(nullptr, true);
+            compiler->ClearCurrentSubprogram();
+        }
+    }
+
+int MainListener::EvaluateIfConstForSink(CFlatParser::ExpressionContext* expr) {
+        if (expr == nullptr) return -1;
+        // Runs PRE-BODY, when the builder points at a FOREIGN, already-terminated function block.
+        // Route through the shared evaluator with forceScratch=true so every emitted leaf lands in
+        // a throwaway function - never leaking instructions past that foreign block's terminator -
+        // and suppress=true so an ill-formed condition (e.g. a not-yet-in-scope local) is silently
+        // "cannot decide" here, to be re-evaluated and reported at real body codegen.
+        auto v = EvalIfConstConstant(expr, /*forceScratch*/ true, /*suppress*/ true);
+        if (!v) return -1;
+        return (*v != 0) ? 1 : 0;
+    }
+
+IfConstEvaluator MainListener::SinkIfConstEvaluator() {
+        return [this](CFlatParser::ExpressionContext* e) { return EvaluateIfConstForSink(e); };
+    }
+
+std::optional<int64_t> MainListener::EmitAndFoldIfConstLeaf(antlr4::tree::ParseTree* node, bool forceScratch, bool suppress) {
+        if (node == nullptr) return std::nullopt;
+        auto* compiler = Compiler();
+
+        // Statement scope (a LIVE insert block that is the function body currently being emitted):
+        // emit into it directly, exactly as the pre-evaluator code did. The dead leaf IR left
+        // behind is harmless (a plain if-const decision, later DCE'd). forceScratch overrides this
+        // for the owning-sink pre-body scan, where the "current" block is a FOREIGN, already-
+        // terminated function block; emitting there would leak instructions past its terminator.
+        // Liveness (not just non-null) is required: at FILE / member / interface scope the builder
+        // still points at the last, already-terminated block of the previously emitted function.
+        if (!forceScratch && compiler->IsInsertBlockLive())
+        {
+            llvm::Value* v = EmitIfConstLeafValue(node);
+            uint64_t folded = 0;
+            if (v && TryFoldConstInt(v, folded, &constFoldableGlobals_))
+                return (int64_t)folded;
+            return std::nullopt;
+        }
+
+        // No usable insert block - null, or terminated (declaration / member / interface scope, or
+        // dead code after a return) - or forceScratch: emit into a throwaway function
+        // (mirrors EvalGlobalArrayDim) so the builder has a valid, private
+        // block. This is the crash fix - a global/enum load can no longer dereference a null insert
+        // block - and it also keeps the owning-sink scan from corrupting a foreign function.
+        auto savedState = compiler->SaveBuilderState();
+        auto* savedFn = compiler->currentFunction;
+        auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
+        auto* tmpFn = llvm::Function::Create(
+            voidTy, llvm::Function::PrivateLinkage, "__if_const_eval_tmp", compiler->module.get());
+        auto* tmpBB = llvm::BasicBlock::Create(*compiler->context, "entry", tmpFn);
+        compiler->builder->SetInsertPoint(tmpBB);
+        compiler->currentFunction = tmpFn;
+        bool savedSuppress = compiler->suppressErrors_;
+        if (suppress) compiler->suppressErrors_ = true;
+
+        std::optional<int64_t> result = std::nullopt;
+        try
+        {
+            llvm::Value* v = EmitIfConstLeafValue(node);
+            uint64_t folded = 0;
+            if (v && TryFoldConstInt(v, folded, &constFoldableGlobals_))
+                result = (int64_t)folded;
+        }
+        catch (const SpeculativeEvalAbort&) {}
+        catch (...)
+        {
+            compiler->suppressErrors_ = savedSuppress;
+            compiler->currentFunction = savedFn;
+            tmpFn->eraseFromParent();
+            compiler->RestoreBuilderState(savedState);
+            throw;
+        }
+        compiler->suppressErrors_ = savedSuppress;
+        compiler->currentFunction = savedFn;
+        tmpFn->eraseFromParent();
+        compiler->RestoreBuilderState(savedState);
+        return result;
+    }
+
+llvm::Value* MainListener::EmitIfConstLeafValue(antlr4::tree::ParseTree* node) {
+        if (auto* i = dynamic_cast<CFlatParser::InclusiveOrExpressionContext*>(node))
+            return ParseInclusiveOrExpression(i);
+        if (auto* a = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(node))
+            return ParseLogicalAndExpression(a);
+        if (auto* o = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node))
+            return ParseLogicalOrExpression(o);
+        if (auto* c = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
+            return ParseConditionalExpression(c);
+        if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+            return ParseAssignmentExpression(asn);
+        if (auto* e = dynamic_cast<CFlatParser::ExpressionContext*>(node))
+            return ParseExpression(e);
+        return nullptr;
+    }
+
+std::optional<int64_t> MainListener::EvalIfConstConstant(antlr4::tree::ParseTree* node, bool forceScratch, bool suppress) {
+        if (node == nullptr) return std::nullopt;
+
+        if (auto* c = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
+        {
+            // Ternary `cond ? a : b` short-circuits to one arm; `x ?? y` is not an integer const.
+            if (c->expression() != nullptr)
+            {
+                auto cond = EvalIfConstConstant(c->logicalOrExpression(), forceScratch, suppress);
+                if (!cond) return std::nullopt;
+                return (*cond != 0) ? EvalIfConstConstant(c->expression(), forceScratch, suppress)
+                                    : EvalIfConstConstant(c->conditionalExpression(), forceScratch, suppress);
+            }
+            if (c->children.size() > 1) return std::nullopt;  // `??` null-coalescing
+            return EvalIfConstConstant(c->logicalOrExpression(), forceScratch, suppress);
+        }
+        if (auto* o = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node))
+        {
+            auto operands = o->logicalAndExpression();
+            if (operands.size() == 1) return EvalIfConstConstant(operands[0], forceScratch, suppress);
+            // OR: any known-true wins; all-known-false is false; otherwise undecidable.
+            bool allKnownFalse = true;
+            for (auto* op : operands)
+            {
+                auto v = EvalIfConstConstant(op, forceScratch, suppress);
+                if (v && *v != 0) return (int64_t)1;
+                if (!v) allKnownFalse = false;
+            }
+            return allKnownFalse ? std::optional<int64_t>(0) : std::nullopt;
+        }
+        if (auto* a = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(node))
+        {
+            auto operands = a->inclusiveOrExpression();
+            if (operands.size() == 1) return EvalIfConstConstant(operands[0], forceScratch, suppress);
+            // AND: any known-false wins; all-known-true is true; otherwise undecidable.
+            bool allKnownTrue = true;
+            for (auto* op : operands)
+            {
+                auto v = EvalIfConstConstant(op, forceScratch, suppress);
+                if (v && *v == 0) return (int64_t)0;
+                if (!v) allKnownTrue = false;
+            }
+            return allKnownTrue ? std::optional<int64_t>(1) : std::nullopt;
+        }
+        if (auto* e = dynamic_cast<CFlatParser::ExpressionContext*>(node))
+            return EvalIfConstConstant(e->assignmentExpression(), forceScratch, suppress);
+        if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+        {
+            if (asn->conditionalExpression() != nullptr)
+                return EvalIfConstConstant(asn->conditionalExpression(), forceScratch, suppress);
+            return std::nullopt;  // an actual assignment is not a constant
+        }
+        // No short-circuit control flow at or below this node: emit-and-fold the leaf.
+        return EmitAndFoldIfConstLeaf(node, forceScratch, suppress);
+    }
+
+int MainListener::DecideIfConstCondition(CFlatParser::ExpressionContext* expr) {
+        auto v = EvalIfConstConstant(expr, /*forceScratch*/ false, /*suppress*/ false);
+        if (!v) return -1;
+        return (*v != 0) ? 1 : 0;
+    }
+

@@ -1819,7 +1819,7 @@ private:
     std::string importNamespace_;
 
     LLVMBackend* Compiler(antlr4::ParserRuleContext* ctx);
-    inline LLVMBackend* Compiler();
+    inline LLVMBackend* Compiler() { return compilerLLVM; }
 
     std::unordered_map<llvm::Value*, std::pair<int, llvm::Type*>> PlusPlus;
     bool global_scope = true; // true when parsing an entity in the global scope.
