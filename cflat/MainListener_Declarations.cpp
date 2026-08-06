@@ -2489,6 +2489,29 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         linkName = declName;
                     declName = namespaceName + "." + declName;
                 }
+                /*
+                 * Same reject as the function DEFINITION path (see ParseFunctionDefinition): a
+                 * prototype has no body, so it never reached that arm and the '[N]' was dropped
+                 * silently - the symbol bound as a single element while the callee returns N.
+                 * This is the only registration site for prototypes; ForwardRefScanner does not
+                 * scan file-scope `declaration` nodes.
+                 */
+                if ((typeAndValue.ArraySize != nullptr || typeAndValue.AliasArraySize > 0)
+                    && !typeAndValue.IsArrayView && !typeAndValue.Pointer)
+                {
+                    // A simd type's TypeName is its ELEMENT ('float'), so spell the vector back out;
+                    // the dimension carried here is the ARRAY's, not the lane count.
+                    std::string elem = typeAndValue.IsSimd
+                        ? std::format("simd<{},{}>", typeAndValue.TypeName, typeAndValue.SimdLanes)
+                        : typeAndValue.TypeName;
+                    LogErrorContext(direct, std::format(
+                        "function '{}' cannot return the fixed array '{}[N]' by value - CFlat has no "
+                        "by-value array return, and the size was being dropped silently (the function "
+                        "returned a single '{}'). Return a struct with the array as a field, or take an "
+                        "out-parameter ('{}* out') and fill it in.",
+                        declName, elem, elem, elem));
+                }
+
                 compiler->CreateFunctionDeclaration(declName, typeAndValue, allParams, typeAndValue.external, ellipsis, false, false, typeAndValue.CallConv, linkName);
 
                 // Register the declaration in the symbol index so extern-bound C

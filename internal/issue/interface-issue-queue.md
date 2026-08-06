@@ -519,7 +519,6 @@ produce a program.
 | Issue | Family | Severity |
 |---|---|---|
 | [[shape-mismatched-funcptr-arg-binds-silently]] | miscompile | Silent miscompile then SIGBUS (exit 138), no diagnostic. A `function<T>*` binds where a plain `function<T>` value is expected; the scorer now detects the shape mismatch but still lowers the mismatched arm when no better-shaped candidate exists. Filed 2026-07-31. |
-| [[extern-decl-drops-fixed-array-return-size]] | silent wrong ABI | `extern char[8] extmk();` compiles clean on BOTH `ca5a02a` and `fix/array-storage` - the `[8]` is dropped and the declaration binds to a symbol returning one `char`. The by-value fixed-array-return reject landed on the DEFINITION path only; this is the one remaining spelling of that axis. Not a regression. Filed 2026-08-02. |
 | [[string-literal-containing-braces-retyped-as-string]] | miscompile + false rejection | A string literal whose CONTENT contains a brace pair (`"a = {} b"`) is typed `string` instead of `char*`. At a call it stops every `char*` overload matching and the diagnostic blames the call; at a VARIADIC it is a SILENT MISCOMPILE - `printf("a = {} b\n");` compiles and runs rc 0 printing binary garbage, and the dedicated `cannot pass 'string' to the variadic '...'` guard does not fire. Identical on both binaries. Filed 2026-08-02 in `p2/` for the rejection face; the miscompile face may warrant P1. |
 | [[temp-unique-field-escapes-through-a-plain-pointer-parameter]] | memory-unsafe accept | Silent use-after-free, compiles clean and exits 0, identical on `14097e1` and on the merged `fix/tempuniq`. `keep(makeBox().t)` where `void keep(Node* n) { g = n; }` reads a freed block (proven by dtor count + reallocation aliasing; the `MallocScribble` fill shows only on ld64.lld-linked builds`. The DECLARED remainder of `temp-unique-field-escapes-through-unguarded-spellings` (closed and
 | [[same-statement-cast-launders-join-code-evidence]] | memory-unsafe accept | Silent exit 138: `two((void*)ro, c ? ro : n)` - a data cast of a NAMED function anywhere in a statement launders every other mention of that function in the SAME statement, because the launder is keyed on `llvm::Value*` alone and a named function is one shared constant. Cross-statement and cross-function are closed (`fix/joinledger`); only the same-statement window remains. P2 under the residue-not-regression precedent ([[unique-field-to-field-interface-receiver-residues]]) - the spelling was accepted before the fix too; re-rank to P1 if the memory-unsafe-accept rubric wins. Fix direction: occurrence keying (value + syntactic cast site). Filed 2026-08-05 by review round 2 of `fix/joinledger`. |
@@ -6109,6 +6108,7 @@ bails with `if (fieldType == nullptr) return nullptr;`, so `struct H { I h = { a
 and on this branch (exit 5 / exit 0 both sides). Appended as a new neighbouring-cell section to
 [[fixed-array-field-brace-default-discarded]] (P2), which already owns the field-default family,
 rather than opening a fourth file for one emitter. Its fix is the same helper.
+
 ### fix/fat-widen - the FIELD-default site now widens a legal fat closure source, LANDED
 
 Fixed and deleted [[fat-field-default-legal-source-not-widened]]. `fix/fat-default` deliberately
@@ -6210,3 +6210,197 @@ single-leg repros above. Passes 73/73 on POST.
 `./cmake_build.sh release && bash test.sh Release` - 600 passed, 0 failed, 8 skipped.
 `bash example_mac.sh Release` - 35 passed, 0 failed. One commit, `git rev-list --count
 a7bdc31..HEAD` = 1.
+
+## Landed: `fix/extern-array` (2026-08-06) - a bodyless PROTOTYPE no longer drops a fixed-array return size
+
+Closes [[extern-decl-drops-fixed-array-return-size]] (P1, silent wrong ABI), the last spelling
+of the by-value fixed-array-return axis whose DEFINITION half landed with `fix/array-storage`.
+
+### The filed repro, re-measured
+
+`extern char[8] extmk();` + a `main` that never calls it compiles rc 0 on `6a13b1a`, exactly as
+filed. The severity claim was verified rather than assumed, from the `--out-lli` IR of a CALLING
+variant:
+
+```
+  %0 = call i8 @extmk()
+  declare i8 @extmk()
+```
+
+So the ABI is genuinely wrong (one byte where the callee writes eight), not merely under-typed.
+The no-body case alone is harmless in practice - nothing defines `extmk`, so the CALLING probe
+dies at link with `ld64.lld: error: undefined symbol: _extmk` (rc 1). The real hazard is exactly
+the one the issue names: a `.c`/asm object elsewhere that DOES define an 8-byte-returning
+`extmk`, which links fine and reads one byte. The `declare i8` above is the proof; the link
+failure is an artifact of the probe having no definition, not a mitigation.
+
+### Root cause - a SECOND registration site, not a missed branch
+
+`CFlat.g4`'s `functionDefinition` ALWAYS requires a `compoundStatement` - there is no
+optional-body alternative. A bodyless prototype is therefore not a `functionDefinition` at all:
+it parses as a plain `declaration` whose `initDeclarator` has a function-shaped
+`directDeclarator`. It never enters `ParseFunctionDefinition`, so the existing reject at
+`MainListener_Declarations.cpp:1897` structurally cannot see it. Prototypes are registered at
+one other place entirely: `MainListener::ParseDeclaration(DeclarationSpecifiersContext*,
+InitDeclaratorListContext*, ...)`, in the `paramTypeList != nullptr || hasParens` arm.
+`CreateFunctionDeclaration` reads only `TypeName` / `Pointer` to pick the LLVM return type and
+never looks at `ArraySize` / `AliasArraySize`, so the size is dropped there silently.
+
+**Only ONE pass registers prototypes.** `ForwardRefScanner::ScanExternalDeclaration`
+(`ForwardRefScanner.cpp:1684`) dispatches on `annotationDefinition` / `namespaceDefinition` /
+`functionDefinition` / `structDefinition` / `classDefinition` / `interfaceDefinition` /
+`usingDeclaration` / `programDefinition` / `importDeclaration` / `lockFieldGroup` /
+`expectErrorDeclaration` / `ifConstDeclaration` - there is no `declaration()` arm. So the
+pre-pass never sees a prototype and the "both copies must move together" pattern does not apply
+here: a single gate at the single registration site is correct, and a second guard in
+`ForwardRefScanner` would be dead code.
+
+### What changed
+
+`cflat/MainListener_Declarations.cpp:2499` (one new guard, immediately before the
+`CreateFunctionDeclaration` at line 2515). Predicate and message text are copied
+verbatim from the definition-path reject at `:1897` so the two sites cannot drift:
+
+```cpp
+if ((typeAndValue.ArraySize != nullptr || typeAndValue.AliasArraySize > 0)
+    && !typeAndValue.IsArrayView && !typeAndValue.Pointer)
+```
+
+anchored on `direct` (the declarator) so the caret lands on the function name. `IsSimd` is used
+only to spell the element back out as `simd<T,N>`, never as a carve-out - the same shape as
+`:1897`, and the reason cell 7 below is rejected.
+
+### Phase A coverage matrix - every cell run on `6a13b1a` and on this branch
+
+| # | Cell | PRE `6a13b1a` | POST |
+|---|---|---|---|
+| 1 | `extern char[8] extmk();` (filed repro, uncalled) | compiles rc 0, links, runs rc 0 | REJECT `'extmk' ... 'char[N]'` |
+| 2 | same + a CALL using the result | `call i8 @extmk()` emitted; rc 1 at link (`undefined symbol: _extmk`) | REJECT at compile, before link |
+| 3 | `using RetBuf = char[8]; extern RetBuf extmk2();` (alias -> `AliasArraySize`) | compiles rc 0 | REJECT `'char[N]'` |
+| 4 | `extern int[2][3] extmk3();` (2-D) | compiles rc 0 | REJECT `'int[N]'` |
+| 5 | `extern char[] extmkview();` (array VIEW) | compiles rc 0 | rc 0 - unchanged (ACCEPT SET) |
+| 6 | `extern simd<float,4> extmkvec();` (bare simd) | compiles rc 0 | rc 0 - unchanged (ACCEPT SET) |
+| 7 | `extern simd<float,4>[2] extmkvecarr();` (simd ARRAY) | compiles rc 0 | REJECT `'simd<float,4>[N]'` |
+| 8 | `extern char* extmkptr();` (pointer) | compiles rc 0 | rc 0 - unchanged (ACCEPT SET) |
+| 9 | `struct Buf { char[8] b = default; }; extern Buf extmkbuf();` | compiles rc 0 | rc 0 - unchanged (ACCEPT SET) |
+| 10 | the same prototype inside an IMPORTED `.cb`, not the root file | compiles rc 0 | REJECT, located in the IMPORTED file |
+| 11 | generic prototype `extern T[8] extmkgen<T>();` | not expressible - `mismatched input ';' expecting {'lock','where','{'}`; the grammar requires a body on a generic | out of scope, grammar-impossible |
+| 12 | C-interop auto-extern (`import "ea_12_util.c";`, three ordinary C fns incl. `void ea_fill(char out[8])`) | compiles rc 0, runs `5 hi abcdefg` | identical - rc 0, `5 hi abcdefg` (ACCEPT SET) |
+| 13 | `namespace Nsx { extern char[8] extmkns(); }` | compiles rc 0 | REJECT, names the QUALIFIED `'Nsx.extmkns'` |
+| 14 | prototype declared inside a FUNCTION BODY (statement scope) | compiles rc 0 | REJECT |
+| 15 | `char[8] protomk();` - prototype with NO `extern` keyword | compiles rc 0 | REJECT |
+
+Cells 13/14/15 are the neighbour axis and are why the guard is NOT keyed on
+`typeAndValue.external`: the namespace-scope, statement-scope and plain (non-`extern`) prototype
+spellings all reach the same `ParseDeclaration` arm and all dropped the size identically.
+
+**Frozen ACCEPT SET** - cells 5, 6, 8, 9, 12, enumerated and measured BEFORE the guard was
+written, all rc 0 both binaries, and cell 12 additionally value-identical at runtime
+(`5 hi abcdefg`).
+
+### The C-interop caveat - CONFIRMED structurally unreachable
+
+The issue file's mandatory pre-check. Two independent reasons, both read from the source rather
+than inferred from a passing probe:
+
+1. **The auto-extern path does not go through the gated code at all.** `--c-include` /
+   `import "x.c"` / `import package "x.h"` all land in `LLVMBackend::RegisterCSignatures`, which
+   calls `CreateFunctionDeclaration(regName, e.ret, ...)` directly at
+   `LLVMBackend_CInterop.cpp:783`. The new guard is in `MainListener::ParseDeclaration`, which
+   no C-interop registration ever enters.
+2. **`e.ret` cannot carry array-ness even in principle.** It is built solely by
+   `MapCTypeToTypeAndValue` -> `MapCTypeToTypeAndValueImpl`
+   (`LLVMBackend_CInterop.cpp:617-751`), which writes exactly `TypeName`, `Pointer`,
+   `ElemPointer` (plus the `IsFunctionPointer` / `FuncPtrReturn*` set on the `(*)`  branch at
+   `:471-560`). It never touches `ArraySize` or `AliasArraySize` - and it could not:
+   `ArraySize` is an ANTLR parse-tree pointer with no string source available on this path, and
+   the impl's first act on seeing a `[` is to DECAY it (`:633-637`, `ptr++; ctype = ctype.substr(0, br);`).
+   `grep -n 'ArraySize' LLVMBackend_CInterop.cpp` returns three hits, all `ConstArraySize` on
+   struct FIELDS (`:1578`, `:1658`, `:1659`), none on a return type. C's own declarator grammar
+   cannot express an array return either, so clang's JSON AST has nothing to hand over.
+
+Empirically confirmed too (cell 12): a `.c` with `int ea_add(int,int)`, `const char* ea_greet(void)`
+and `void ea_fill(char out[8])` compiles and runs byte-identically on both binaries. The array
+PARAMETER in `ea_fill` is the closest real C gets to the shape, and it decays to `char*`.
+
+### Per-site audit - every read of `ArraySize` / `AliasArraySize` for a function RETURN
+
+`grep -n 'AliasArraySize' cflat/*.cpp cflat/*.h` gives 10 sites; the `ArraySize` grep adds the
+declarator/global paths. Per site:
+
+- `ForwardRefScanner.cpp:245` and `MainListener_Declarations.cpp:662` - the two
+  `ParseDeclarationSpecifiers` copies SETTING `AliasArraySize` from an array alias. Already
+  symmetric, unchanged; the fix is a registration-time value check, not a type-parsing change,
+  so the two-copy rule is not engaged.
+- `MainListener_Declarations.cpp:741` - `AliasArraySize > 0 && hasExplicitPointer` diagnostic on
+  a VARIABLE declarator. Different question (alias + `*`), no defect.
+- `MainListener_Declarations.cpp:1897` - the DEFINITION-path reject. The oracle; unchanged.
+- `MainListener_Declarations.cpp:2499` - the new PROTOTYPE reject. The defect; fixed.
+- `MainListener_Declarations.cpp:2163/2166` and `:2592/2596` - folding `AliasArraySize` into
+  `ConstArraySize` for a VARIABLE declarator (local and global). Legal and load-bearing
+  (`RetBuf b = default;` must keep working, and does - it is exercised by leg `mk3`). No change.
+- `ForwardRefScanner.cpp:436` - the definition-path `CreateFunctionDeclaration`. Reached only
+  for real `functionDefinition` nodes, all of which hit `:1897` in the main walk. No second
+  guard needed; a prototype never reaches this line (verified: `ScanExternalDeclaration` has no
+  `declaration()` arm).
+- `MainListener_Generics.cpp:481/513`, `MainListener_Aggregates.cpp:420/2756`,
+  `MainListener.h:1537/1573/1589`, `ForwardRefScanner.cpp:1252-1662`,
+  `MainListener_PostfixExpression.cpp:5061` - other `CreateFunctionDeclaration` callers
+  (ctor/dtor wrappers, `program` run wrappers, generic INSTANTIATION, on-demand generic decls).
+  None is a user-written prototype path; a size there would be a compiler invariant bug, not a
+  user error, which is why the gate was NOT put inside `CreateFunctionDeclaration` itself - that
+  layer cannot tell a user prototype from an internal wrapper registration.
+
+### Test legs
+
+`Test/errors/err_fixed_array_byval_return.cb`, +2 `expect_error` blocks (existing file, no new
+test file). Both proven fail-on-PRE against a detached worktree built at `6a13b1a`, isolated one
+per file:
+
+- `extern char[8] extmk1();` - PRE: `FAIL: expected error 'function 'extmk1' cannot return the
+  fixed array 'char[N]' by value' did not occur`, rc 1. POST: `PASS: expected error received`.
+  Discriminator: reaches the `ParseDeclaration` site through `ArraySize` (the prototype twin of
+  leg `mk1`).
+- `extern RetBuf extmk2();` (reusing the file's existing `using RetBuf = char[8];`) - PRE: same
+  `FAIL ... did not occur`, rc 1. POST: PASS. Discriminator: reaches the SAME site through
+  `AliasArraySize` instead - the `mk3` x `extmk1` cross-product.
+
+The file's header comment previously said the reject was "at the definition"; it is rewritten to
+name both registration sites and to say why a bodyless prototype is not a `functionDefinition`.
+
+No new value legs. Every cell the guard touches goes from compiling to erroring, so a runtime leg
+could only assert the accept set - and each accept-set cell is byte-identical on both binaries, so
+such a leg would pass with the fix reverted (the leg-that-cannot-fail pattern this file bans). The
+accept set is frozen in the table above instead. The guard adds no new carve-out logic: predicate
+and message are verbatim from `:1897`, already covered by legs `mk1`-`mk4` and `mkVec`.
+
+### Verification
+
+- `./cmake_build.sh release`: clean.
+- `bash test.sh Release`: 600 passed / 0 failed / 8 skipped (baseline 600/0/8 - the suite counts
+  FILES and both legs went into an existing one).
+- `bash example_mac.sh Release`: 35 passed / 0 failed.
+- No whole-corpus differential sweep was run: the change adds a rejection reachable only from a
+  bodyless function-shaped declarator, and `test.sh` (600 files) plus `example_mac.sh` (35, which
+  is where the C-interop and header-binding spellings actually live) both compile green, so no
+  corpus file performs the newly-rejected crossing. The strong evidence here is the targeted
+  PRE/POST matrix above, not a sweep.
+- No new `TypeAndValue` / `StructData` / `AnnotationValue` field, so no `--init` cache round-trip
+  change is owed.
+
+### Found, not fixed
+
+Cell 11 (a generic prototype) is grammar-impossible rather than a gap, and cells 13/14/15 - which
+WOULD have been residue if the guard had been keyed on `external` - are closed here by the same
+predicate.
+
+Review round 1 found a THIRD, still-open registration path: an interface method contract
+(`interface IBuf { char[8] get(); }`) and a struct-member method prototype
+(`struct S { char[8] get(); }`) both still accept a fixed-array return silently. Neither is a
+wrong-ABI hazard like the closed issue - any implementor of `IBuf.get()` is already rejected by
+the definition-path guard, so the interface can never be implemented or called through, and a
+bodyless struct-member prototype registers no callable symbol. Filed as P3 (diagnostic quality,
+not correctness) in
+[[interface-and-struct-member-fixed-array-return-not-rejected]] rather than folded into this
+commit, since it is a different registration path (interface/struct-member contract, in
+`MainListener_Aggregates.cpp`) that this fix's scope did not cover.

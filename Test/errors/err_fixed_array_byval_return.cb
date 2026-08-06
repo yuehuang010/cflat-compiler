@@ -8,9 +8,10 @@
 // run - 'char[8] mk() { return 'a'; }' - only worked BECAUSE the '[8]' was dropped:
 // the body returns a single char, which matches the silently-narrowed type. So the
 // capability is absent, not accidental. Array-VIEW returns ('T[]') and returns of a
-// struct CONTAINING an array are unaffected and still work. Rejected at the
-// definition, which also covers a function that is never called. Both named remedies
-// (a struct wrapping the
+// struct CONTAINING an array are unaffected and still work. Rejected at BOTH function
+// registration sites - the definition (which also covers a function that is never
+// called) and the bodyless PROTOTYPE, which the grammar parses as a plain declaration
+// and so never reaches the definition arm. Both named remedies (a struct wrapping the
 // array, and a 'T* out' out-parameter) are exercised in test_basic.cb.
 
 expect_error("function 'mk1' cannot return the fixed array 'char[N]' by value") {
@@ -36,6 +37,19 @@ expect_error("function 'mk3' cannot return the fixed array 'char[N]' by value") 
 // message must name 'simd<float,4>[N]' - the TypeName alone is just the lane type 'float'.
 expect_error("function 'mk4' cannot return the fixed array 'simd<float,4>[N]' by value") {
     simd<float,4>[2] mk4() { simd<float,4>[2] b = default; return b; }
+}
+
+// A bodyless PROTOTYPE is not a functionDefinition at all (the grammar always requires a
+// compoundStatement), so it is parsed as a declaration and registered in ParseDeclaration -
+// a second, independent site. It reaches the reject through ArraySize, like mk1.
+expect_error("function 'extmk1' cannot return the fixed array 'char[N]' by value") {
+    extern char[8] extmk1();
+}
+
+// The prototype's ALIAS spelling, reaching the ParseDeclaration site through
+// AliasArraySize rather than ArraySize (the mk3/extmk1 cross-product).
+expect_error("function 'extmk2' cannot return the fixed array 'char[N]' by value") {
+    extern RetBuf extmk2();
 }
 
 // A BARE simd return is not an array return and must stay legal - it is how every
