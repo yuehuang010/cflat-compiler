@@ -530,7 +530,6 @@ produce a program.
 | [[coalesce-join-null-local-arm-erases-owner-proof]] | ownership | Exit 134, no diagnostic, identical on `d93c359` and on the merged `fix/ptrcopy`. `Ci* n = nullptr; Ci* b = n ?? c; delete b;` and its BOXED twin both double-free. The BOTH-ARMS join rule skips a null LITERAL arm as neutral but counts a LOCAL that merely HOLDS null as a non-proving arm, so the whole join is dropped. The raw and boxed spellings AGREE here, so this is a pre-existing hole in the arm CLASSIFICATION, not an asymmetry `fix/ptrcopy` introduced - its `?:` twins reject on both binaries. Silent double free, so P1 by the bare rubric; filed P2 under the residue-not-regression precedent (`unique-field-to-field-interface-receiver-residues`, `return-dangle-missed-when-slot-has-extra-user`) - accepted by the PRE binary too, so residue rather than regression. Re-rank to P1 if the maintainer rules the silent-double-free rubric wins. Filed 2026-08-05 by `fix/ptrcopy`. |
 | [[null-interface-access-remaining-storage-kinds]] | crash at run time | SIGSEGV (139) / SIGTRAP (133) with a clean compile, no diagnostic - the storage kinds the three-stage null-interface widening left open. NOT a regression (identical on `904f026`). Read [`internal/plan/null-interface-access-widening.md`](../plan/null-interface-access-widening.md) first, especially the deliberately-accepted section and the MUST-vs-MAY correction. Filed 2026-08-03; had no row here until 2026-08-04. |
 | [[coalesce-assign-skips-store-bookkeeping]] | ownership | `??=` emits its own compare/branch/store then RETURNS, skipping every piece of post-store bookkeeping the plain `=` path runs (`TransferPointerOwnershipOnStore`, move/unmove marking, element-borrow refresh). Pre-existing; filed 2026-08-04 while fixing the `??=` half of the borrowed-interface-box guard. Had no row here until 2026-08-04. |
-| [[unresolved-generic-preregisters-opaque-shell]] | missed rejection | `int use(ZZZ<int> v) { return 1; }` with `ZZZ` declared NOWHERE compiles, links and runs clean - exit 0. `ForwardRefScanner`'s bare `tryPreDeclare` (`MainListener.h:3034`) creates an opaque struct shell for any `Name<Args>` WITHOUT checking `Name` is a known template; the qualified call one line below IS gated on `IsGenericTemplateKey`. The shell then satisfies the `dataStructures` lookup and suppresses the `unknown type '...'` the non-generic spelling gets. Both-copies divergence - `QueueGenericInstantiation` (`MainListener.h:3894`) does the check correctly. Registration site confirmed by lldb, not by reading. This is the CAUSE of two of the three causes in [[incomplete-layout-message-blames-c-interop]]; fix them together. Fix is gating the bare call, but `certain=false` regions (`if const`, `expect_error`) are not collected and would false-reject. Filed 2026-08-05. |
 
 #### P1 / crash - dies with no usable diagnostic (`p1/crash/`)
 
@@ -584,6 +583,7 @@ deleted 2026-08-05), which closed the four decidable spellings and named this on
 | [[array-view-params-unconditionally-noalias]] | latent miscompile | Latent `-O2` miscompile hazard - UB handed to LLVM. P1 the moment a witness exists. |
 | [[nested-emission-clears-enclosing-alias-scope-registry]] | latent miscompile | `createFunctionBlock` clears `aliasScopes_` / `viewScopeByOrigin_`; `BuilderState` saves every other field it clears but not these three, so a generic instantiation mid-body re-points the enclosing function's view scope IDs (they are vector indices). IR witness: one view's store and load end up on DIFFERENT `!alias.scope` nodes. Same defect shape and same boundary as the `fix/genfp-return` fix, deliberately not folded into it - it changes emitted alias metadata and needs its own `-O2` pass. Filed 2026-08-05; identical on both binaries of that branch. |
 | [[incomplete-layout-message-blames-c-interop]] | diagnostic | **Raised above its severity.** One emission site, three unrelated causes, and the wording names the cause that is usually absent. Two ratification records cite a C-interop cause on files with no C interop. |
+| [[last-segment-collision-still-shells-unknown-generic]] | silent accept | The residue of `fix/generic-shell`. `AnyGenericTypeTemplateNamed`'s last-dotted-segment clause still shells a BARE name that is declared nowhere at the use site but matches some namespaced template's last segment, so `namespace N { class Box<T> ... }` plus a top-level `int useIt(Box<int> b)` compiles, links and RUNS clean with no diagnostic - and so does the cross-namespace `Tag<T>` variant, where the template is not even in an enclosing scope. Its non-generic twin gets `unknown type`. NOT a regression: measured identical on `b18ae7f` and the post-fix binary. The clause is load-bearing - built without it, all three `Test/errors/err_namespaced_generic_iface_*.cb` move off their ratified `Unknown identifier` messages - and the obvious scoping narrowing fixes the cross-namespace cell while breaking exactly the top-level cell those tests are built on. Fix direction unknown; a deferred accept resolved by the main pass is the untested candidate. Filed 2026-08-06 by the round-1 review of `fix/generic-shell`. |
 | [[overload-replay-blames-wrong-candidate]] | diagnostic | Factually false message on two paths; on the interface-slot path it converts a success into a failure. Merged 2026-07-30. |
 | [[variadic-free-generic-function-does-not-link]] | false reject | Compiles, does not link - raw JIT symbol dump, not a diagnostic. |
 | [[namespaced-struct-static-method-not-dispatched]] | false reject | A whole dispatch form is unavailable inside a namespace. |
@@ -4570,10 +4570,10 @@ measured identical on the pre- and post-fix binaries):
   called this "a second defect on the neighbouring spelling"; it is not a `function<>` defect at
   all. `int mk<T>() { return 5; }` fails identically, and the IR shows
   `%mk__i32 = type opaque` - an EMPTY argument list parses as a generic TYPE construction and is
-  eaten by the ungated bare `tryPreDeclare` shell. Recorded as a second manifestation inside
-  [[unresolved-generic-preregisters-opaque-shell]], whose proposed `IsGenericTemplateKey` gate
-  should close it too. The namespaced (`N.mk<int>()`) and method spellings already work, which is
-  exactly the gated-vs-ungated asymmetry that file documents.
+  eaten by the ungated bare `tryPreDeclare` shell. Fixed later by `fix/generic-shell` (landed
+  record below), which gates that shell; `mk<int>()` now runs and returns 5. The namespaced
+  (`N.mk<int>()`) and method spellings already worked, which is exactly the gated-vs-ungated
+  asymmetry that motivated the gate.
 - A generic function called ABOVE its definition does not resolve. Filed as
   [[generic-function-cannot-be-forward-referenced]].
 
@@ -6524,3 +6524,139 @@ individually and each flips the file to exit 1 on its own.
 `./cmake_build.sh release && bash test.sh Release` - 600 passed, 0 failed, 8 skipped.
 `bash example_mac.sh Release` - 35 passed, 0 failed. One commit,
 `git rev-list --count 56ebc52..HEAD` = 1.
+
+### fix/generic-shell - an unresolved generic name no longer gets an opaque shell, LANDED
+
+Closes the P1 [[unresolved-generic-preregisters-opaque-shell]] (filed 2026-08-05, file
+deleted). Branch `fix/generic-shell`, one commit on `b18ae7f`.
+
+**Root cause, confirmed.** `ForwardRefScanner` pre-declared an opaque struct shell for every
+syntactic `Name<Args>` in a BARE type position without checking that `Name` names a generic type
+template. The filed citation was right about the site and right that the qualified spelling one
+line below IS gated on `IsGenericTemplateKey`. It was INCOMPLETE about the copies: gating
+`tryPreDeclare` alone left the headline repro - `int use(ZZZ<int> v)` with `ZZZ` declared nowhere -
+still compiling, linking and running clean. A SECOND ungated copy of the same shell creation lives
+in `ForwardRefScanner::ParseDeclarationSpecifiers` (`ForwardRefScanner.cpp:194`), which is what
+resolves a function SIGNATURE, and it re-created the shell the first gate had just refused. The
+main-pass twin of that branch was already gated (`isKnownTemplate`), so this really was the
+both-copies divergence CLAUDE.md warns about - in two places, not one.
+
+**Copies audited.** Shell-creating sites for a generic instantiation, per site:
+`ScanGenericTypeUses::tryPreDeclare` (bare + qualified) - GATED here; `ForwardRefScanner::
+ParseDeclarationSpecifiers` - GATED here; `MainListener::QueueGenericInstantiation` and
+`MainListener::ParseDeclarationSpecifiers` - already gated, unchanged; the `using` alias path
+(`ForwardRefScanner.cpp:1428`) - already rejects with its own message (`using alias 'BQ' =
+'QQQ<int>': 'QQQ' is not a generic type`), measured, unchanged; the tuple sites - a different
+construct whose template is always present, unchanged.
+
+**Gate shape.** One new predicate, `LLVMBackend::AnyGenericTypeTemplateNamed`. Accept-on-doubt:
+it refuses only a name with NO evidence anywhere, because the sole consequence of refusing is that
+the use falls through to the existing `unknown type '...'`. It accepts the template key space
+(`IsGenericTemplateKey`, before and after namespace resolution), a `using GB = Box;` base alias, an
+imported winmd generic, a template seen where the scan is not `certain`, and - load-bearing - any
+key whose LAST DOTTED SEGMENT matches the spelling. Generic FUNCTION templates are deliberately
+NOT consulted; that is what lets a zero-argument `mk<int>()` stop being shelled.
+
+**Trap 1 (`certain=false` regions), measured.** Interfaces are collected regardless of `certain`;
+only the struct/class half is skipped, so the exposure is a generic CLASS/STRUCT template inside an
+unfoldable `if const` arm or an expect_error block. Collection was widened into a new set
+`gts.scannedGenericStructNamesUncertain`, read by `AnyGenericTypeTemplateNamed` and nothing else -
+deliberately OUT of the key space, since an invented key is a false rejection. It is NOT optional:
+built without it, `Test/errors/err_lambda_array_view.cb` and
+`Test/errors/err_data_pointer_to_closure_param.cb` both go red (`unknown type
+'LavOuter____fatfn_1_3_i32_3_i32'`, `unknown type 'SigBoxE__double'`) - each declares a generic
+struct inside an expect_error block and then names it in a function SIGNATURE. Note the
+discriminator: a plain local declaration of such a type needs no shell at all (the main pass
+registers and instantiates the template itself), which is why the first three probes of this shape
+passed without the set and nearly certified it as dead code. The signature is the shape that needs
+it, and `Test/test_generics.cb`'s `gs_ifconst_uncertain_template_use` leg was rebuilt around a
+signature for exactly that reason (verified: it reports `unknown type 'GsUncertainBox__i32'` on a
+build with the set removed).
+
+**Trap 2 (ratified messages), measured.** The three `Test/errors/err_namespaced_generic_iface_*.cb`
+pin `Unknown identifier 'Width'.` / `'Tag'.`, confirmed correct by the maintainer 2026-08-05. Their
+whole mechanism is the shell for a BARE `IV<int>` that names the namespaced key `NS.IV`. The
+last-dotted-segment clause of the gate exists to keep them: with it, all three files are
+BYTE-IDENTICAL to the pre-fix binary (diffed, rc 0 both sides); built without it, all three report
+`unknown type 'IV__i32'` instead. Nothing about those tests changed.
+
+**One existing message DID change, deliberately.**
+`Test/errors/err_if_const_generic_interface_dead_branch.cb` moved from `has an incomplete layout (a
+field type C interop could not import)` to `unknown type 'GiDeadOnly__i32'`. A generic interface
+declared only in a DECIDABLY-DEAD `if const` arm genuinely does not exist in this build, so the new
+wording is true where the old one blamed C interop on a file with no C. The test's stated intent -
+"rejected at the first use, not routed to a fat pointer and run" - still holds; its expectation and
+comment were updated in this commit.
+
+**Three-face matrix, PRE (b18ae7f) -> POST.**
+
+| Shape | PRE | POST |
+|---|---|---|
+| `int use(ZZZ<int> v) { return 1; }`, never called | compiles, links, RUNS clean (exit 0) | `unknown type 'ZZZ__i32'` |
+| `ZZZ<int> z;` local | `type 'ZZZ__i32' has an incomplete layout (a field type C interop could not import)` | `unknown type 'ZZZ__i32'` |
+| `int mk<T>() { return 5; }` then `mk<int>()` | `cannot cast an aggregate value - a fixed array decays to a pointer` | RUNS, prints 5 |
+| `ZZZ<int>` as return type / global / struct field / pointer param | incomplete-layout, or silently accepted (pointer param, global) | `unknown type 'ZZZ__i32'` |
+| `NS.ZZZ<int> z;` (qualified, unknown) | `unknown type 'NS.ZZZ__i32'` | unchanged |
+| unknown NON-generic `WWW` / `WWW*` | `unknown type 'WWW'` | unchanged - the generic spelling now matches its non-generic twin |
+
+**Accept set, frozen BEFORE the gate was written and re-measured after - every cell identical
+PRE and POST:** declared bare template (`Box<int>` = 7); n-argument generic function
+(`mk2<int>(1)` = 6); namespaced zero-arg generic function (`N.mk<int>()` = 6); qualified known
+template (8); instantiation alias `using B4 = Box4<int>` (9); base alias `using GB5 = Box5` - BOTH spellings
+measured, local declaration (11) and function SIGNATURE (`int f(GB5<int> b)`, and the
+alias-of-alias and namespaced-base variants of it), all identical PRE and POST only after the
+round-1 punch fix below; the first cut measured the local spelling ALONE and shipped a regression
+where the signature spelling reported `unknown type 'GB5__i32'` (`ForwardRefScanner::
+ScanUsingDeclaration` gated base-alias registration on the MAIN-PASS template maps, empty during
+the scan for a template declared in the same file; it now also consults `IsGenericTemplateKey` and
+the uncertain set, and `scratch/rv_s_alias_base.cb` / `rv_s3_alias_after_use.cb` /
+`rv_w_alias_of_alias_sig.cb` / `rv_u_alias_ns_base_sig.cb` print 4 / 4 / 3 / 6 on b18ae7f and
+again now);
+generic interface template + boxing (12); nested type argument (`NBox<NBox<int>>`); imported
+user template (31); core `list<int>` / `dictionary<string,int>` (41, 42) on BOTH a warm and a
+cold cache; generic class in an unfoldable `if const` arm (21) and its interface twin (23);
+foldable arm (22); generic class declared and used inside an expect_error block; bare use of a
+namespaced generic interface (`Unknown identifier 'Width'.`); use-before-template of a real
+template (`Unknown identifier 'v'.`); unknown type ARGUMENT (`VBox<QQQ>` -> `unknown type 'QQQ'`).
+
+**Claims that were checked rather than inherited.** The filed issue said this bug is "the CAUSE of
+two of the three causes" in [[incomplete-layout-message-blames-c-interop]] and that fixing it
+"removes most of that P2's reach". Measured: FALSE. All three causes that P2 lists - an abandoned
+C-imported record, use-before-declaration (generic AND non-generic), and a type whose declaration
+failed inside an expect_error block - still produce the message, byte-identical on both binaries.
+The shell this commit gates was a FOURTH, unlisted funnel. That P2 file was updated with the
+measurement rather than deleted, and it keeps its severity.
+
+**Coverage.** `Test/errors/err_unknown_type_arg_qualifier.cb` gained two `expect_error` legs -
+the unknown generic in a local declaration and the unknown generic in an UNUSED signature (the
+silent-accept face). `Test/test_generics.cb` gained `testGnUnresolvedGenericShellGate()`: the
+zero-argument generic function call (5), its one-argument control (6), and the `if const`
+accept-set leg (21). Each leg was isolated and run against a b18ae7f binary: the two negative legs
+report `FAIL: expected error ... did not occur`, and the zero-arg call fails with `cannot cast an
+aggregate value`. The round-1 punch added three more legs to the same function -
+`gs_same_tu_base_alias_in_signature` (4), `gs_alias_of_alias_in_signature` (3) and
+`gs_namespaced_base_alias_in_signature` (6) - each isolated and run against a binary built from the
+first cut of this commit, where each reports `unknown type '<alias>__i32'`.
+
+**Verification.** `./test.sh Release` 600 passed / 0 failed / 8 skipped; `bash example_mac.sh
+Release` 35 passed / 0 failed. No new `TypeAndValue` / `StructData` / `AnnotationValue` field, so
+no `--init` round-trip change is owed; the new set sits beside `scannedGenericStructNames`, which
+that file already documents as deliberately not cached (it is rebuilt by every forward-ref scan,
+and the cold-cache probe above confirms it).
+
+### Found, not fixed
+
+- A generic name used BEFORE its template is declared still fails, with `Unknown identifier 'v'.`
+  rather than a message about ordering. Unchanged by this commit and not generics-specific (the
+  non-generic spelling fails the same way) - it is cause 2 of
+  [[incomplete-layout-message-blames-c-interop]].
+- The remaining three funnels into the incomplete-layout message, per the paragraph above.
+- The silent-accept face is NOT fully closed. `AnyGenericTypeTemplateNamed`'s last-dotted-segment
+  clause still admits a BARE unknown name that merely matches some namespaced template's last
+  segment, with no diagnostic at all: `scratch/rv_b_ns_collision_sig.cb` (`namespace N { class
+  Box<T> ... }` plus a top-level `int useIt(Box<int> b)`, where top-level `Box` is declared
+  nowhere) and `scratch/rv_m_cross_ns_collision.cb` (a cross-namespace `Tag<T>` collision) both
+  compile, link and run clean printing `ok`, measured identical on the b18ae7f binary and on this
+  one - so it is NOT a regression. Narrowing the clause would move the three ratified
+  `Test/errors/err_namespaced_generic_iface_*.cb` messages, which is why it is deliberately not
+  fixed here. Filed as [[last-segment-collision-still-shells-unknown-generic]].

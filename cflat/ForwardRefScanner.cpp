@@ -191,7 +191,9 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                             mangledName += "__" + MangleTypeArg(compiler, ResolveForwardTypeArg(entry));
                     }
-                    else
+                    // No template anywhere by this name: skip the shell, which would suppress the
+                    // `unknown type` this declaration is owed. Main pass gates alike (isKnownTemplate).
+                    else if (compiler->AnyGenericTypeTemplateNamed(baseName))
                     {
                         // Pre-declare opaque struct type and default constructor so that
                         // uses inside function bodies are resolvable before the full
@@ -1164,8 +1166,11 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
                 auto* sd = static_cast<CFlatParser::StructDefinitionContext*>(ruleCtx);
                 std::string tn = sd->directDeclarator() != nullptr ? sd->directDeclarator()->getText() : std::string{};
                 recordTypeName(tn);
-                if (certain && sd->genericTypeParameters() != nullptr && !tn.empty())
-                    RecordScannedGenericStructName(QualifyName(ns, tn));
+                if (sd->genericTypeParameters() != nullptr && !tn.empty())
+                {
+                    if (certain) RecordScannedGenericStructName(QualifyName(ns, tn));
+                    else compiler->gts.scannedGenericStructNamesUncertain.insert(QualifyName(ns, tn));
+                }
                 CollectGenericTemplateDecls(ruleCtx, certain, ifConstUnfoldable, ns, QualifyName(typePath, tn),
                                             unkeyable || sd->genericTypeParameters() != nullptr);
                 continue;
@@ -1175,8 +1180,11 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
                 auto* cd = static_cast<CFlatParser::ClassDefinitionContext*>(ruleCtx);
                 std::string tn = cd->directDeclarator() != nullptr ? cd->directDeclarator()->getText() : std::string{};
                 recordTypeName(tn);
-                if (certain && cd->genericTypeParameters() != nullptr && !tn.empty())
-                    RecordScannedGenericStructName(QualifyName(ns, tn));
+                if (cd->genericTypeParameters() != nullptr && !tn.empty())
+                {
+                    if (certain) RecordScannedGenericStructName(QualifyName(ns, tn));
+                    else compiler->gts.scannedGenericStructNamesUncertain.insert(QualifyName(ns, tn));
+                }
                 CollectGenericTemplateDecls(ruleCtx, certain, ifConstUnfoldable, ns, QualifyName(typePath, tn),
                                             unkeyable || cd->genericTypeParameters() != nullptr);
                 continue;
@@ -1233,6 +1241,10 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
             auto tryPreDeclare = [&](const std::string& spelledBase, CFlatParser::GenericTypeParametersContext* genericParams)
             {
                 auto* compiler = Compiler(genericParams);
+                // No evidence of a generic TYPE template by this name anywhere: pre-declaring an
+                // opaque shell here would suppress the `unknown type` diagnostic the use is owed.
+                if (!compiler->AnyGenericTypeTemplateNamed(spelledBase))
+                    return;
                 // Name the shell after the registered KEY, not the spelling: a bare use inside a
                 // namespace would otherwise leave an opaque 'Box__int' that 'NS.Box__int' never completes.
                 std::string baseName = compiler->ResolveGenericTemplateBase(spelledBase);
@@ -1420,11 +1432,11 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
         target = compiler->ResolveGenericBaseAlias(compiler->ResolveTypeAlias(target));
 
         // Alias of a generic BASE (using IVector = Windows.Foundation.Collections.IVector;) - the
-        // use site supplies the <...> arguments. Authoritative handling is in ParseUsingDeclaration.
+        // use site supplies the <...> args. IsGenericTemplateKey also sees a same-TU template, whose
+        // main-pass maps are still empty here. Authoritative handling is in ParseUsingDeclaration.
         if (suffix.empty() && (compiler->IsWinrtGenericBase(target)
-                               || compiler->gts.genericStructTemplates.count(target) != 0
-                               || compiler->gts.genericClassTemplates.count(target) != 0
-                               || compiler->gts.genericInterfaceTemplates.count(target) != 0))
+                               || compiler->IsGenericTemplateKey(target)
+                               || compiler->gts.scannedGenericStructNamesUncertain.count(target) != 0))
         {
             compiler->RegisterGenericBaseAlias(alias, target);
             return;

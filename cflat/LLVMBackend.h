@@ -177,6 +177,12 @@ struct GenericTemplateState
     // veto is preferred over guessing the other way. Tracked in
     // internal/issue/generic-interface-name-vetoed-by-core-template.md.
     std::unordered_set<std::string>                                             scannedGenericStructNames;
+    // Generic struct/class template names seen where `certain` is false - inside an unfoldable
+    // `if const` arm or an expect_error block. Deliberately OUT of the key space (an invented key
+    // is a false rejection, see CollectGenericTemplateDecls); recorded only so the opaque-shell
+    // gate can tell "declared where we do not key names" from "no such name anywhere". Read by
+    // AnyGenericTypeTemplateNamed and nothing else.
+    std::unordered_set<std::string>                                             scannedGenericStructNamesUncertain;
     // Qualified names of every struct/class/interface DEFINITION the forward-ref scan saw, generic
     // or not. The accept set for resolving a generic type ARGUMENT's spelling (see
     // ResolveTypeArgBaseName): dataStructures/interfaceTable are not populated yet when
@@ -3495,6 +3501,21 @@ public:
      * actually names a template is accepted, so an unrelated sibling never hijacks the spelling.
      */
     std::string ResolveGenericTemplateBase(const std::string& base) const;
+
+    /*
+     * True when SOME generic TYPE template (struct / class / interface) by this spelling was seen
+     * anywhere in this compile. The ACCEPT side of the opaque-shell gate in ScanGenericTypeUses,
+     * and deliberately wider than IsGenericTemplateKey: it also accepts a bare spelling of a
+     * namespace-qualified template (the `IV<int>` naming `NS.IV` that the namespaced-generic-
+     * interface diagnostics are built on), a `using GB = Box;` base alias, an imported winmd
+     * generic, and a template declared where the scan is not `certain` (an unfoldable `if const`
+     * arm, an expect_error block) and so has no key at all. Accept-on-doubt: only a name with NO
+     * evidence anywhere is refused, since the sole consequence of refusing is that the use falls
+     * through to `unknown type`.
+     * Generic FUNCTION templates are deliberately NOT consulted - a zero-argument `mk<int>()` call
+     * parses as a type construction, and shelling it is exactly the bug this gate closes.
+     */
+    bool AnyGenericTypeTemplateNamed(const std::string& spelledBase) const;
 
     /*
      * True when `key` is a generic FUNCTION template that was declared DIRECTLY in namespace `ns`.

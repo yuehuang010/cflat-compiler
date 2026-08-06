@@ -42,12 +42,12 @@ declared, later in the same file, so the message is wrong about the program as w
 scanning uses (`CollectGenericTemplateDecls` / `ScanGenericInterfaceTemplateNames`,
 `cflat/MainListener.h:2830`, driven from `cflat/LLVMBackend.cpp:788-790`). Establish whether the
 generic FUNCTION templates get an equivalent whole-TU collection pass, and if not, whether one can
-be added on the same ordering guarantee. Check the `certain=false` trap the
-[[unresolved-generic-preregisters-opaque-shell]] file documents (`if const` arms and
-`expect_error` blocks are deliberately not collected) before making anything depend on the
-registry being complete.
+be added on the same ordering guarantee. Check the `certain=false` trap recorded under
+`fix/generic-shell` in [[interface-issue-queue]] (an unfoldable `if const` arm and an
+expect_error block are deliberately not collected for the struct/class half, and that gap was
+measured to matter for a name used in a SIGNATURE) before making anything depend on the registry
+being complete.
 
 ## Related
 
-[[generic-function-call-diagnostics-are-misleading]],
-[[unresolved-generic-preregisters-opaque-shell]], [[interface-issue-queue]]
+[[generic-function-call-diagnostics-are-misleading]], [[interface-issue-queue]]

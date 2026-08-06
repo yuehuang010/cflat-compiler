@@ -232,6 +232,29 @@ std::string LLVMBackend::ResolveGenericTemplateBase(const std::string& base) con
         return base;
     }
 
+bool LLVMBackend::AnyGenericTypeTemplateNamed(const std::string& spelledBase) const
+{
+        if (spelledBase.empty()) return false;
+        if (IsGenericTemplateKey(spelledBase)) return true;
+        if (IsGenericTemplateKey(ResolveGenericTemplateBase(spelledBase))) return true;
+        if (IsGenericBaseAlias(spelledBase)) return true;
+        if (gts.scannedGenericStructNamesUncertain.count(spelledBase) != 0) return true;
+        // An imported winmd generic is a real template built elsewhere; keep whatever the shell
+        // sites did with it rather than turning a Windows-only spelling into `unknown type`.
+        if (IsWinrtGenericBase(spelledBase) || IsWinrtFullName(spelledBase)) return true;
+        // A bare spelling of a namespaced template: it names no key, but the template exists, and
+        // the shell is what carries today's downstream diagnostic for it.
+        std::string tail = "." + spelledBase;
+        auto endsWithTail = [&](const std::string& n) { return n.ends_with(tail); };
+        for (const auto& kv : gts.genericStructTemplates)    if (endsWithTail(kv.first)) return true;
+        for (const auto& kv : gts.genericClassTemplates)     if (endsWithTail(kv.first)) return true;
+        for (const auto& kv : gts.genericInterfaceTemplates) if (endsWithTail(kv.first)) return true;
+        for (const auto& n : gts.scannedGenericStructNames)          if (endsWithTail(n)) return true;
+        for (const auto& n : gts.scannedGenericInterfaceNames)       if (endsWithTail(n)) return true;
+        for (const auto& n : gts.scannedGenericStructNamesUncertain) if (endsWithTail(n)) return true;
+        return false;
+    }
+
 bool LLVMBackend::IsGenericFunctionKeyInNamespace(const std::string& key, const std::string& ns) const
 {
         if (gts.genericFunctionTemplates.count(key) == 0) return false;

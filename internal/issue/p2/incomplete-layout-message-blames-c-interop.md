@@ -31,6 +31,27 @@ So the wording is right about the MECHANISM (an opaque shell reached a by-value 
 about the CAUSE in two cases out of three. Use-before-declaration is the common one, and it
 fails identically at global scope on both binaries - it is not generics-specific.
 
+### A FOURTH cause was removed 2026-08-06; these four repros are untouched
+
+`fix/generic-shell` (landed record in [[interface-issue-queue]]) gated the forward-ref scan's
+opaque shell on the name actually naming a generic template, so an UNDECLARED generic
+(`ZZZ<int> z;`) now reports `unknown type 'ZZZ__i32'` instead of funnelling into this message.
+
+The P1 that fixed it claimed to be "the CAUSE of two of the three causes" here and to remove
+"most of this P2's reach". Measured against the b18ae7f and post-fix binaries, that claim is
+FALSE - it was a fourth, unlisted funnel, and all four repros below are byte-identical on both:
+
+| Repro | b18ae7f and post-fix, identical |
+|---|---|
+| generic use-before-declaration | `type 'P2Box__i32' has an incomplete layout ...` |
+| NON-generic use-before-declaration | `type 'P2S' has an incomplete layout ...` |
+| namespace-local generic use-before-declaration | `type 'P2N.P2NBox__i32' has an incomplete layout ...` |
+| failed `expect_error` declaration ([[failed-expect-error-type-poisons-its-name]]) | `type 'A.Item' has an incomplete layout ...` |
+
+Severity is unchanged. What DID change for this file's fix direction: one fewer cause to
+attribute, and one existing test (`Test/errors/err_if_const_generic_interface_dead_branch.cb`) has
+moved off this message, so the `Test coverage` note below is now short by that file.
+
 ## Where it has already misled
 
 - The layer-1 **T5** tightening record in [[interface-issue-queue]] (landed design records): a bare generic name

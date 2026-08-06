@@ -4025,6 +4025,76 @@ bool testGnCanonicalPrimitiveTypeArg()
     return result;
 }
 
+// =============================================================
+// The opaque-shell gate in the forward-ref scan. It used to pre-declare an unsized struct shell
+// for EVERY bare `Name<Args>`, which ate two live shapes below and suppressed the `unknown type`
+// diagnostic an undeclared generic is owed (the negative half lives in
+// Test/errors/err_unknown_type_arg_qualifier.cb).
+// =============================================================
+
+// A generic FUNCTION taking NO arguments: `gsMk<int>()` parses as a generic TYPE construction, so
+// it reached the shell path and the declared body was never emitted - the call then died on
+// "cannot cast an aggregate value". The one-argument sibling never had the bug (it parses as a
+// call), so it is the control that proves this leg is about the EMPTY argument list.
+int gsMk<T>() { return 5; }
+int gsMk1<T>(int u) { return u + 5; }
+
+// ACCEPT-SET leg for the gate. A generic CLASS declared inside an `if const` arm the forward scan
+// cannot FOLD (`sizeof` is deliberately unfoldable) is absent from the template KEY SPACE by
+// design - an invented key is a false rejection - so a gate keyed only on that space would refuse
+// it a shell and false-reject this file. The discriminator is the SIGNATURE below: a plain local
+// declaration of the type needs no shell (the main pass instantiates the template itself), but a
+// function signature naming it is parsed by the forward scan, which resolves the type before the
+// main pass runs. Test/errors/err_lambda_array_view.cb and err_data_pointer_to_closure_param.cb
+// are the expect_error-block twins of the same region rule. The arm IS taken on every host.
+if const (sizeof(int) == 4) {
+    class GsUncertainBox<T> { T v = default; };
+    int gsUncertainRead(GsUncertainBox<int>* b) { return b->v; }
+}
+
+// ACCEPT-SET legs for the gate, alias face. `using X = Template;` names a generic BASE, and the
+// forward scan only learns that through IsGenericTemplateKey - the main-pass template maps it used
+// to consult are still empty for a template declared in THIS file. Without that the alias is not
+// registered as a generic base, the gate refuses the shell, and a SIGNATURE naming the alias dies
+// on `unknown type`. A plain local declaration of the alias never needed the shell, so the
+// signature position is the discriminator here too.
+class GsAliasBox<T> { T v = default; };
+using GsAliasBase = GsAliasBox;
+int gsAliasRead(GsAliasBase<int> b) { return b.v; }
+
+using GsChainAlias = GsAliasBase;
+int gsChainRead(GsChainAlias<int>* b) { return b->v; }
+
+namespace GsNs { class GsNsBox<T> { T v = default; }; }
+using GsNsBase = GsNs.GsNsBox;
+int gsNsRead(GsNsBase<int>* b) { return b->v; }
+
+bool testGnUnresolvedGenericShellGate()
+{
+    bool result = true;
+
+    result &= Test("gs_zero_arg_generic_fn_call", gsMk<int>(), 5);
+    result &= Test("gs_one_arg_generic_fn_ctrl",  gsMk1<int>(1), 6);
+
+    GsUncertainBox<int> ub = default;
+    ub.v = 21;
+    result &= Test("gs_ifconst_uncertain_template_use", gsUncertainRead(&ub), 21);
+
+    GsAliasBase<int> ab = default;
+    ab.v = 4;
+    result &= Test("gs_same_tu_base_alias_in_signature", gsAliasRead(ab), 4);
+
+    GsChainAlias<int> cb = default;
+    cb.v = 3;
+    result &= Test("gs_alias_of_alias_in_signature", gsChainRead(&cb), 3);
+
+    GsNsBase<int> nb = default;
+    nb.v = 6;
+    result &= Test("gs_namespaced_base_alias_in_signature", gsNsRead(&nb), 6);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -4166,6 +4236,7 @@ extern int main()
     total++; passed += testGnNsGfCtrlStructMethodBodyScope()      ? 1 : 0;
 
     total++; passed += testGnCanonicalPrimitiveTypeArg()          ? 1 : 0;
+    total++; passed += testGnUnresolvedGenericShellGate()          ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
