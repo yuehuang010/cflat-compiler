@@ -139,6 +139,18 @@ add_custom_command(
 set(CFLAT_SOURCES
   ${CFLAT_DIR}/main.cpp
   ${CFLAT_DIR}/LLVMBackend.cpp
+  ${CFLAT_DIR}/LLVMBackend_OwnershipTemps.cpp
+  ${CFLAT_DIR}/LLVMBackend_CodegenHelpers.cpp
+  ${CFLAT_DIR}/LLVMBackend_CInterop.cpp
+  ${CFLAT_DIR}/LLVMBackend_EmitAndLink.cpp
+  ${CFLAT_DIR}/LLVMBackend_Interfaces.cpp
+  ${CFLAT_DIR}/LLVMBackend_WinRT.cpp
+  ${CFLAT_DIR}/LLVMBackend_VariablesAndIR.cpp
+  ${CFLAT_DIR}/LLVMBackend_ControlFlowAndFunctions.cpp
+  ${CFLAT_DIR}/LLVMBackend_Lookup.cpp
+  ${CFLAT_DIR}/LLVMBackend_Overloads.cpp
+  ${CFLAT_DIR}/LLVMBackend_MoveDataflow.cpp
+  ${CFLAT_DIR}/LLVMBackend_StateAndImports.cpp
   ${CFLAT_DIR}/ForwardRefScanner.cpp
   ${CFLAT_DIR}/MainListener_Declarations.cpp
   ${CFLAT_DIR}/MainListener_Generics.cpp
@@ -212,6 +224,18 @@ target_link_libraries(cflat PRIVATE
 if(MSVC)
   set_source_files_properties(
     ${CFLAT_DIR}/LLVMBackend.cpp
+    ${CFLAT_DIR}/LLVMBackend_OwnershipTemps.cpp
+    ${CFLAT_DIR}/LLVMBackend_CodegenHelpers.cpp
+    ${CFLAT_DIR}/LLVMBackend_CInterop.cpp
+    ${CFLAT_DIR}/LLVMBackend_EmitAndLink.cpp
+    ${CFLAT_DIR}/LLVMBackend_Interfaces.cpp
+    ${CFLAT_DIR}/LLVMBackend_WinRT.cpp
+    ${CFLAT_DIR}/LLVMBackend_VariablesAndIR.cpp
+    ${CFLAT_DIR}/LLVMBackend_ControlFlowAndFunctions.cpp
+    ${CFLAT_DIR}/LLVMBackend_Lookup.cpp
+    ${CFLAT_DIR}/LLVMBackend_Overloads.cpp
+    ${CFLAT_DIR}/LLVMBackend_MoveDataflow.cpp
+    ${CFLAT_DIR}/LLVMBackend_StateAndImports.cpp
     ${CFLAT_DIR}/ForwardRefScanner.cpp
     ${CFLAT_DIR}/MainListener_Declarations.cpp
     ${CFLAT_DIR}/MainListener_Generics.cpp
