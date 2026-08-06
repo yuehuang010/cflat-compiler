@@ -1776,3 +1776,168 @@ expect_error("cannot return a 'void*' value as a closure") {
         return b.item;
     }
 }
+
+/*
+ * The ASSIGNMENT-direction sibling of the same hole: 'f = vp' widens a data pointer straight into
+ * a thin `function<>` slot with no argument or return site involved at all. A thin destination is
+ * a bare pointer, so nothing ever objected here - the FAT twin ('Lambda<> g = vp;'/'s.g = vp;') is
+ * already caught by accident (a closure is a struct; the generic aggregate-store cast rejects a
+ * pointer source with an unrelated "cannot store a pointer value into struct storage" message).
+ * CheckThinFnPtrAssignProvenance shares ArgumentIsProvablyDataPointer with the argument/return/
+ * closure-field gates so all four accept sets cannot drift, with assignment-flavoured wording
+ * ("cannot assign ... to 'function<>' destination ...") that cannot be confused with the
+ * argument-site "to ... parameter" or the return-site "as a ... value" wording above.
+ */
+expect_error("cannot assign a 'void*' value to 'function<>' destination 'f'") {
+    int dpaqLocal = 3;
+
+    void dataPointerAssignedToThinLocal()
+    {
+        function<int(int)> f = default;
+        void* vp = &dpaqLocal;
+        f = vp;
+    }
+}
+
+// Struct FIELD assignment: the same gate, reached through a GEP destination instead of an alloca -
+// a separate storage shape from the bare-local leg above.
+expect_error("cannot assign a 'void*' value to 'function<>' destination 's.f'") {
+    struct DpaqS { function<int(int)> f = default; };
+    int dpaqField = 3;
+
+    void dataPointerAssignedToThinField()
+    {
+        DpaqS s = default;
+        void* vp = &dpaqField;
+        s.f = vp;
+    }
+}
+
+// Generic-encoded thin element: after generic lowering, Box<function<>>.item is the SAME bare code
+// pointer as the spelled form, so it inherits the hole exactly - the shared predicate covers it too.
+expect_error("cannot assign a 'void*' value to 'function<>' destination 'b.item'") {
+    struct DpaqBox<T> { T item = default; };
+    int dpaqGeneric = 3;
+
+    void dataPointerAssignedToThinGenericField()
+    {
+        DpaqBox<function<int(int)>> b = default;
+        void* vp = &dpaqGeneric;
+        b.item = vp;
+    }
+}
+
+// DECL-INIT spelling ('function<T> f = vp;'): a SEPARATE lowering path from the '=' assignment
+// site above (ParseDeclaration, not ParseAssignmentExpression) - closing one does not close the
+// other. rightNV itself is out of scope by the check site, so the provenance evidence is
+// reconstructed from three hoisted flags (IsFunctionPointer, Pointer, TypeName).
+expect_error("cannot assign a 'void*' value to 'function<>' destination 'f'") {
+    int dpaqDeclInit = 3;
+
+    void dataPointerDeclInitThin()
+    {
+        void* vp = &dpaqDeclInit;
+        function<int(int)> f = vp;
+    }
+}
+
+// Brace field-init spelling ('S s = { f = vp };'): a THIRD separate lowering path
+// (EmitOneFieldInit), so a data pointer reaching a thin field this way needs its own gate too.
+expect_error("cannot assign a 'void*' value to 'function<>' destination 'DpaqBrace.f'") {
+    struct DpaqBrace { function<int(int)> f = default; };
+    int dpaqBrace = 3;
+
+    void dataPointerBraceInitThin()
+    {
+        void* vp = &dpaqBrace;
+        DpaqBrace s = { f = vp };
+    }
+}
+
+// int* source: DescribeNonFunctionArgument names the TYPE, not just a generic phrase - proves the
+// assignment gate differentiates by source type exactly like the argument/return gates do.
+expect_error("cannot assign a 'int*' value to 'function<>' destination 'f'") {
+    int dpaqIntSrc = 3;
+
+    void intPointerAssignedToThinLocal()
+    {
+        function<int(int)> f = default;
+        int* ip = &dpaqIntSrc;
+        f = ip;
+    }
+}
+
+// '?:' JOIN spelling: neither arm carries a NamedVariable, so the gate must resolve through the
+// per-value data ledger (JoinDeliversDataValue) - matching the argument/return join legs' polarity.
+expect_error("cannot assign a non-function pointer value to 'function<>' destination 'f'") {
+    void dataPointerJoinAssignedToThinLocal(int c)
+    {
+        int dpaqJoin = 1;
+        function<int(int)> f = default;
+        void* vp = &dpaqJoin;
+        void* vq = nullptr;
+        f = c > 0 ? vp : vq;
+    }
+}
+
+/*
+ * Three more ungated lowering paths of the same defect class, found in review: a FIELD DEFAULT
+ * initializer, a positional FIXED-array brace-init, and an array-VIEW brace-init each store into
+ * a thin `function<>` slot without going through '=', decl-init, or the struct brace field-init
+ * path above - so closing those three left these open. Same shared predicate, same
+ * assignment-flavoured wording.
+ */
+
+// FIELD DEFAULT spelling ('struct S { function<T> f = gvp; };'): ParseFieldDefaultInitializer is
+// a fourth separate lowering path, reached only when a 'default' expression constructs the struct.
+expect_error("cannot assign a 'void*' value to 'function<>' destination 'DpaqFieldDefault.f'") {
+    int dpaqFieldDefaultSrc = 3;
+    void* gvp = &dpaqFieldDefaultSrc;
+
+    struct DpaqFieldDefault { function<int(int)> f = gvp; };
+
+    void dataPointerFieldDefaultThin()
+    {
+        DpaqFieldDefault s = default;
+    }
+}
+
+// Positional FIXED-array brace-init ('function<T>[N] arr = { vp, vp };'): EmitPositionalFixedArrayInit
+// is a separate lowering from both the struct-field and scalar decl-init paths above.
+expect_error("cannot assign a 'void*' value to 'function<>' destination 'arr[0]'") {
+    int dpaqArrFixedSrc = 3;
+
+    void dataPointerFixedArrayThin()
+    {
+        void* vp = &dpaqArrFixedSrc;
+        function<int(int)>[2] arr = { vp, vp };
+    }
+}
+
+// Array-VIEW brace-init ('function<T>[] arr = { vp };'): EmitArrayViewInferredInit is the array-
+// view twin of the fixed-array path above, reached only by the inferred-length '[]' spelling.
+expect_error("cannot assign a 'void*' value to 'function<>' destination 'arr[0]'") {
+    int dpaqArrViewSrc = 3;
+
+    void dataPointerArrayViewThin()
+    {
+        void* vp = &dpaqArrViewSrc;
+        function<int(int)>[] arr = { vp };
+    }
+}
+
+// PARAMETER-DEFAULT spelling ('int f(function<T> cb = vp)'): GenerateDefaultParamOverloads
+// builds the wrapper's forwarded default value directly, a seventh separate lowering path -
+// found in round-2 review. The forwarding NamedVariable that reaches the call inside the
+// wrapper is rebuilt with the DESTINATION type, laundering provenance, so the argument gate
+// at the call site never sees the original data pointer; this must gate at the default-value
+// site itself. Covers both free functions and struct methods, which share this one emitter.
+expect_error("cannot assign a 'void*' value to 'function<>' destination 'cb'") {
+    int dpaqParamDefaultSrc = 3;
+    void* dpaqParamDefaultVp = &dpaqParamDefaultSrc;
+
+    int dataPointerParamDefaultThin(function<int(int)> cb = dpaqParamDefaultVp)
+    {
+        return cb(1);
+    }
+}

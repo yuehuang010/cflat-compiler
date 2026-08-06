@@ -2906,6 +2906,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             std::string genericFuncCallerName;
                             bool rhsIsFuncPtr = false;
                             bool rhsIsThinFnPtr = false;
+                            // Hoisted for the thin function<> provenance gate below, which needs the
+                            // RHS's declared-pointer shape after rightNV itself goes out of scope.
+                            bool rhsIsPointer = false;
                             std::vector<LLVMBackend::TypeAndValue::FuncPtrParam> rhsFuncPtrParams;
                             // Captured-variable names of an RHS lambda literal, hoisted out of the
                             // rightNV scope so the fat->thin narrowing gate below can name them.
@@ -3053,6 +3056,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         || rightNV.BorrowsOwnedString);
                                 rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
                                 rhsIsThinFnPtr = rightNV.TypeAndValue.IsThinFnPtr();
+                                rhsIsPointer = rightNV.TypeAndValue.Pointer;
                                 rhsFuncPtrParams = rightNV.TypeAndValue.FuncPtrParams;
                                 rhsLambdaCaptureNames = rightNV.LambdaCaptureNames;
                                 // int[] v = rawIntPtr; is the laundering door - reject it.
@@ -3159,6 +3163,18 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         compiler->DescribeCapturingClosureToThin(rhsLambdaCaptureNames));
                                     right = llvm::UndefValue::get(compiler->BuildThinFnPtrType(typeAndValue));
                                 }
+                            }
+                            // Decl-init spelling of the thin gate ('function<T> f = vp;'); rightNV
+                            // is out of scope here, so rhsProvenance carries only the two flags read.
+                            if (right && typeAndValue.IsFunctionPointer && typeAndValue.IsThinFnPtr()
+                                && !typeAndValue.Pointer && right->getType()->isPointerTy())
+                            {
+                                LLVMBackend::NamedVariable rhsProvenance;
+                                rhsProvenance.TypeAndValue.IsFunctionPointer = rhsIsFuncPtr;
+                                rhsProvenance.TypeAndValue.Pointer = rhsIsPointer;
+                                rhsProvenance.TypeAndValue.TypeName = srcInferredTypeName;
+                                compiler->CheckThinFnPtrAssignProvenance(right, rhsProvenance,
+                                    std::format("'{}'", name));
                             }
                             // Widen a thin function<T> value to a fat Lambda<T>: store {code, null}, no
                             // thunk. Mirrors the call-arg widen; keeps thin -> Lambda -> toFunction lossless.

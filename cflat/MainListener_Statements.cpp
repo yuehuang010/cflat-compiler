@@ -2311,6 +2311,20 @@ void MainListener::GenerateDefaultParamOverloads(
                     defaultVal = LoadNamedVariable(defNV);
                     RejectCodeValueIntoDataSlot(ae, defNV, params[i], "default-initialize",
                         std::format("parameter '{}' of", params[i].VariableName));
+                    // Thin-function sibling of the gate above: a data pointer default for a
+                    // thin 'function<>' destination would be called as code (7th ungated site).
+                    if (defaultVal && !params[i].Pointer && params[i].ConstArraySize == 0
+                        && defaultVal->getType()->isPointerTy() && !defaultVal->getType()->isStructTy())
+                    {
+                        const LLVMBackend::TypeAndValue* thinDest = nullptr;
+                        if (params[i].IsFunctionPointer)
+                            thinDest = &params[i];
+                        else
+                            thinDest = compiler->GetEncodedClosureType(params[i].TypeName);
+                        if (thinDest && thinDest->IsThinFnPtr())
+                            compiler->CheckThinFnPtrAssignProvenance(defaultVal, defNV,
+                                std::format("'{}'", params[i].VariableName));
+                    }
                 }
                 else if (initCtx->Default())
                 {

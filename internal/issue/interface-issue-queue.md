@@ -517,6 +517,7 @@ produce a program.
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[data-pointer-into-fat-closure-default-not-gated]] | memory-unsafe accept | A data pointer as a FAT `Lambda<>` FIELD default (SIGSEGV 139) or PARAMETER default (SIGBUS 138) compiles with no diagnostic - the two default-value sites gate only thin destinations. Pre-existing on `68c78fc`; found by round-3 review of `fix/assign-gate`. Filed 2026-08-06. |
 | [[shape-mismatched-funcptr-arg-binds-silently]] | miscompile | Silent miscompile then SIGBUS (exit 138), no diagnostic. A `function<T>*` binds where a plain `function<T>` value is expected; the scorer now detects the shape mismatch but still lowers the mismatched arm when no better-shaped candidate exists. Filed 2026-07-31. |
 | [[extern-decl-drops-fixed-array-return-size]] | silent wrong ABI | `extern char[8] extmk();` compiles clean on BOTH `ca5a02a` and `fix/array-storage` - the `[8]` is dropped and the declaration binds to a symbol returning one `char`. The by-value fixed-array-return reject landed on the DEFINITION path only; this is the one remaining spelling of that axis. Not a regression. Filed 2026-08-02. |
 | [[string-literal-containing-braces-retyped-as-string]] | miscompile + false rejection | A string literal whose CONTENT contains a brace pair (`"a = {} b"`) is typed `string` instead of `char*`. At a call it stops every `char*` overload matching and the diagnostic blames the call; at a VARIADIC it is a SILENT MISCOMPILE - `printf("a = {} b\n");` compiles and runs rc 0 printing binary garbage, and the dedicated `cannot pass 'string' to the variadic '...'` guard does not fire. Identical on both binaries. Filed 2026-08-02 in `p2/` for the rejection face; the miscompile face may warrant P1. |
@@ -529,7 +530,6 @@ produce a program.
 | [[null-interface-access-remaining-storage-kinds]] | crash at run time | SIGSEGV (139) / SIGTRAP (133) with a clean compile, no diagnostic - the storage kinds the three-stage null-interface widening left open. NOT a regression (identical on `904f026`). Read [`internal/plan/null-interface-access-widening.md`](../plan/null-interface-access-widening.md) first, especially the deliberately-accepted section and the MUST-vs-MAY correction. Filed 2026-08-03; had no row here until 2026-08-04. |
 | [[coalesce-assign-skips-store-bookkeeping]] | ownership | `??=` emits its own compare/branch/store then RETURNS, skipping every piece of post-store bookkeeping the plain `=` path runs (`TransferPointerOwnershipOnStore`, move/unmove marking, element-borrow refresh). Pre-existing; filed 2026-08-04 while fixing the `??=` half of the borrowed-interface-box guard. Had no row here until 2026-08-04. |
 | [[unresolved-generic-preregisters-opaque-shell]] | missed rejection | `int use(ZZZ<int> v) { return 1; }` with `ZZZ` declared NOWHERE compiles, links and runs clean - exit 0. `ForwardRefScanner`'s bare `tryPreDeclare` (`MainListener.h:3034`) creates an opaque struct shell for any `Name<Args>` WITHOUT checking `Name` is a known template; the qualified call one line below IS gated on `IsGenericTemplateKey`. The shell then satisfies the `dataStructures` lookup and suppresses the `unknown type '...'` the non-generic spelling gets. Both-copies divergence - `QueueGenericInstantiation` (`MainListener.h:3894`) does the check correctly. Registration site confirmed by lldb, not by reading. This is the CAUSE of two of the three causes in [[incomplete-layout-message-blames-c-interop]]; fix them together. Fix is gating the bare call, but `certain=false` regions (`if const`, `expect_error`) are not collected and would false-reject. Filed 2026-08-05. |
-| [[data-pointer-assigned-to-thin-function-value]] | memory-unsafe accept | Compiles clean with no diagnostic, then exits **138** (SIGBUS). `function<int(int)> f = default; f = vp;` (a `void*`) and the struct-field twin `s.f = vp;` both store a DATA address into a thin code slot and then CALL it. Measured identical on `8c5a860` and on the merged `fix/genfn-lowering`, and NOT generic-specific - the bare local has it. The `ce9858e` provenance gate covers ARGUMENT positions only, and `fix/codeval-store` answers the opposite question (code into data), so the assignment leg of data-into-thin-code is unguarded. The FAT twin is rejected only by accident (struct storage). Fix direction: run `ArgumentIsProvablyDataPointer` on the assignment RHS for a thin `function<>` destination, accept-set first. Filed 2026-08-05 by `fix/genfn-lowering`. |
 
 #### P1 / crash - dies with no usable diagnostic (`p1/crash/`)
 
@@ -612,6 +612,7 @@ deleted 2026-08-05), which closed the four decidable spellings and named this on
 | [[closure-type-argument-to-a-generic-function]] | feature gap | A closure type as a generic FUNCTION's type argument does not resolve, in either spelling: explicit `idf<function<int(int)>>(g)` gives `unknown type 'function<int(int)>'` reported on the TEMPLATE's parameter list, and inferred `idf(g)` mangles the argument from its LLVM repr and instantiates `idf__i8`. The generic STRUCT path funnels through `ResolveTypeArgEntry` and works (`Box<Lambda<...>>`, `list<function<...>>`, and after `fix/lamptr-generic` also `Box<function<T>*>`); this path appears not to, so the fat/thin pointer asymmetry that landed there does not reach it. Non-closure control `idf<int*>(&n)` works on both binaries. Measured identical on `4c06cce` and on the merged `fix/lamptr-generic`. Filed 2026-08-05 by `fix/lamptr-generic`. |
 | [[defaulted-ctor-param-default-construct-aborts]] | compiler crash | Default-constructing a `class`/`struct` whose only ctor has ALL parameters defaulted crashes the COMPILER at compile time - the `-o` compile itself nondeterministically exits `134`, `139`, or `1` with an internal "declared with no enclosing scope" diagnostic; no executable is ever produced. Also fails on the explicit-argument spelling (`CDef d = CDef(7);`). Identical on `master` (33b3ac4, 134 8/8) and `fix/class-undef` (63107e2); not a regression from that fix. Root cause not traced. Found by the round-1 review of `fix/class-undef`. |
 | [[fixed-array-field-brace-default-discarded]] | miscompile | A FIXED-ARRAY field's own `= {1,2,3}` default brace list is silently discarded - `struct Outer { int[3] a = {1,2,3}; };` reads `0 0 0`, while the identical LOCAL declarator `int[3] a = {1,2,3};` prints `1 2 3`. Same family as the fixed [[struct-field-default-brace-list-discarded]] (landed record below) and deliberately left out of it: the list is POSITIONAL and needs an `[N x T]` aggregate builder, not `EmitFieldInitializer`, and the existing `EmitPositionalFixedArrayInit` registers an array LOCAL so it cannot be reused as-is. The neighbouring POINTER-field spelling (`Inner* p = {x=1};`) reads `nullptr` silently and probably wants the declarator's rejection instead. Measured identical on `68c78fc` and `fix/field-brace`. Filed 2026-08-06 by `fix/field-brace`. |
+| [[lambda-literal-param-default-invalid-ir]] | compile failure | A lambda literal as a PARAMETER default emits invalid IR (`Module verification failed: Found return instr that returns non-void in Function of void return type`); the same literal as a local decl-init works. Pre-existing on `68c78fc`; lives in `GenerateDefaultParamOverloads`, the emitter the `fix/assign-gate` amend touched. Found by round-3 review of `fix/assign-gate`. Filed 2026-08-06. |
 
 ### P3 - diagnostics, latent, deliberate deferrals (`p3/`)
 
@@ -5728,3 +5729,126 @@ config field read back through `.run()`/`exitCode`. FAILS on the PRE binary
 [[fixed-array-field-brace-default-discarded]] (P2) - the FIXED-ARRAY sibling, same root cause,
 different emitter (positional, needs an `[N x T]` aggregate builder), plus the POINTER-field cell
 that still silently reads `nullptr`. Both measured identical on `68c78fc` and this branch.
+### fix/assign-gate - the ASSIGNMENT leg of the closure provenance gate, LANDED
+
+Fixed and deleted [[data-pointer-assigned-to-thin-function-value]]. The `ce9858e` argument gate
+and yesterday's `fix/return-gate` (`CheckClosureReturnProvenance`) left the ASSIGNMENT direction
+open: `f = vp;` and `s.f = vp;` on a thin `function<>` destination stored a DATA address straight
+into the code slot with no diagnostic (exit 138, SIGBUS). A thin `function<>` slot is a bare
+pointer, so the generic aggregate-store cast that accidentally catches the FAT `Lambda<>` twin
+(a closure is a struct; "cannot store a pointer value into struct storage") never sees it - a
+`Pointer -> Pointer` bitcast in `CreateCast` accepted the store silently.
+
+Fix: a new `CheckThinFnPtrAssignProvenance(val, arg, destDesc)` reuses `ArgumentIsProvablyDataPointer`
+- the SAME predicate the argument and return gates already share - so all three "pass", "return",
+and "assign" accept sets cannot drift. Assignment-flavoured wording ("cannot assign {} to
+'function<>' destination {}") distinguishes it from the argument ("... parameter") and return
+("... as a ... value") wordings in a mutation-testable way. SEVEN separate lowering paths needed
+the gate, since none of them share code with each other:
+
+- `ParseAssignmentExpression` (`MainListener_Expressions.cpp`) - the plain `=` operator. Covers
+  local, struct field, nested field, through-pointer, array element, and global destinations alike,
+  since they all resolve to one destination-agnostic `NamedVariable` before this point - confirmed
+  by probing all six spellings, not inferred. Also covers the generic-encoded thin element
+  (`Box<function<>>.item = vp`), mirroring the existing FAT `WidenToClosureFatChecked` call in the
+  same encoded-closure-field block.
+- `ParseDeclaration`'s decl-init path (`MainListener_Declarations.cpp`) - `function<T> f = vp;` is
+  a genuinely separate lowering, not a call into the `=` path. `rightNV` itself is out of scope by
+  the check site (it lives inside an inner block whose other facts are hoisted into named locals
+  the same way this file already does for a dozen other properties), so the gate's evidence is a
+  reconstructed `NamedVariable` carrying only the three flags `ArgumentIsProvablyDataPointer` and
+  `DescribeNonFunctionArgument` read (`IsFunctionPointer`, `Pointer`, `TypeName`).
+- `EmitOneFieldInit` (`MainListener_Expressions.cpp`) - brace field-init (`S s = { f = vp };`), a
+  THIRD lowering path. `rightNV` is a real parameter here, so no reconstruction was needed; added
+  as the thin sibling of the existing FAT `WidenToClosureFatChecked` branch in the same block.
+- `ParseFieldDefaultInitializer` (`MainListener_Expressions.cpp`) - a struct FIELD DEFAULT
+  (`struct S { function<T> f = gvp; };`), a FOURTH lowering path, reached only when a `default`
+  expression constructs the struct. Found by review, not in the original round.
+- `EmitPositionalFixedArrayInit` (`MainListener_Expressions.cpp`) - a positional FIXED-array
+  brace-init (`function<T>[N] arr = { vp, vp };`), a FIFTH lowering path. Found by review.
+- `EmitArrayViewInferredInit` (`MainListener_Expressions.cpp`) - an array-VIEW brace-init
+  (`function<T>[] arr = { vp };`), the array-view twin of the fixed-array path, a SIXTH lowering
+  path. Found by review. `EmitGlobalFixedArrayInit` (the GLOBAL form of the fixed-array spelling)
+  is not a gap - a global array initializer is already required to be a compile-time constant, so
+  it is rejected earlier by that unrelated diagnostic, before this gate would ever see it.
+- `GenerateDefaultParamOverloads` (`MainListener_Statements.cpp`) - a PARAMETER-DEFAULT value
+  (`int f(function<T> cb = vp)`), a SEVENTH lowering path. Found in round-2 review. The wrapper's
+  forwarded default is built directly at this site (`defaultVal` from `LoadNamedVariable(defNV)`),
+  so no reconstruction was needed - the gate sits right after the existing opposite-direction
+  `RejectCodeValueIntoDataSlot` call, reusing the same `defNV`. The argument gate at the call site
+  inside the generated wrapper never sees this: the forwarding `NamedVariable` that reaches that
+  call is rebuilt with the DESTINATION's `TypeName` (`MainListener_Statements.cpp` around line
+  2378), which launders provenance before `CheckThinFnPtrArgProvenance` would run - so this gap
+  can only be closed at the default-value site itself, not the call site. Covers both free
+  functions and struct methods, which share this one emitter.
+
+Guard polarity bug found and fixed mid-round by `./test.sh`: the first two sites' new branches were
+missing the `!typeAndValue.Pointer` guard the pre-existing FAT/encoded-thin branches next to them
+already carry, so `function<int(int)>* p = b.item;` (a POINTER to a thin slot, not the slot itself -
+`Test/test_function_ptr.cb`'s `tgp_box_load` cell) false-rejected. `EmitOneFieldInit` was already
+safe - its whole closure-conversion block is wrapped in `!fieldType.Pointer` upstream.
+
+Accept-set matrix (named function, `function<>` value read from a local/field, `?:` join of two
+`function<>` values, `nullptr`, explicit `(function<...>)value` cast escape hatch, `function<>`
+parameter, call returning `function<>`, all six spellings above) - one combined probe file,
+byte-identical compile output and runtime values on `x64/Release/cflat` before and after (worktree
+`fix/assign-gate` vs a clean build of its base `68c78fc` in a scratch worktree). Reject-set (bare
+`void*`/`char*`/`int*`, `?:` join of two data pointers) x (local, field, nested field,
+through-pointer, array element, global, generic-encoded field, decl-init, brace-init) - 12 probes,
+every one measured silently accepted (compile exit 0, run exit 138) on the PRE binary and now
+diagnoses with the assignment-flavoured message post-fix. The FAT twin (`Lambda<>`/`Box<Lambda<>>`)
+was reconfirmed rejected, unchanged, by the pre-existing accidental struct-storage message on both
+binaries at the plain `=`, decl-init, brace field-init, and fixed-array/array-view brace-init
+spellings - not this gate. Round-3 review found the fat twin is NOT rejected at the two
+default-value sites (field default `Lambda<> f = gvp;` SIGSEGVs, parameter default
+`f(Lambda<> cb = gvp)` SIGBUSes) - pre-existing on the base binary, filed as
+`internal/issue/p1/codegen/data-pointer-into-fat-closure-default-not-gated.md`.
+
+Differential sweep: `--check`/compile over all 444 `Test/` + `example/` `.cb` files (`Test/errors/`
+run as whole-file compiles, not `--check`), pre vs post in a scratch worktree at the merge-base -
+the only differences are the intended new test legs and per-worktree absolute paths embedded in
+unrelated Windows-only "imported file not found" messages (`windows.h` et al., confirmed by diff to
+be path text only). macOS arm64 Release `test.sh` 600/0/8, `example_mac.sh` 35/0.
+
+Amend round (review): the three additional lowering paths above (field default, positional
+fixed-array brace-init, array-view brace-init) were each confirmed compiling clean and SIGBUSing
+(exit 138) on a `68c78fc` PRE binary, then confirmed diagnosing with the assignment-flavoured
+message post-fix; the array-shape accept legs (`function<T>[N] arr = { f, g };` and the `[]` twin,
+named functions) and the field-default accept leg were reconfirmed unchanged (correct runtime
+values, not just exit 0). Also fixed in the same round: a cosmetic empty-`destDesc` bug where a
+bare GLOBAL thin destination (`gf = vp;`) rendered `'function<>' destination ` with empty quotes,
+because the global spelling leaves `NamedVariable::CallerName` unset; the two `ParseAssignmentExpression`
+call sites now fall back to `TypeAndValue.VariableName`, then to the literal "the destination",
+same as the existing `CallerName`-fallback convention used elsewhere in this file. `./test.sh`
+600/0/8 and `example_mac.sh` 35/0 held after the amend.
+
+Found and filed, NOT fixed here (different mechanism, wider blast radius): the `??=` coalesce-assign
+spelling on a thin `function<>` destination is a STILL-OPEN instance of the same hole -
+`f ??= vp;` compiles and SIGBUSes, because `??=` evaluates its RHS through a value-only path that
+discards the `NamedVariable` this gate reads, for reasons already documented for the
+opposite-direction code-value gate. Added as a new dated section to the pre-existing
+[[coalesce-assign-skips-store-bookkeeping]] (its general "`??=` skips the shared post-store tail"
+root cause covers this too). The FAT `Lambda<>` twin is not open by this mechanism - `??=`'s
+scalar-condition requirement rejects it first, for an unrelated reason.
+
+Test legs: `Test/errors/err_data_pointer_to_closure_param.cb` gained 11 `expect_error` blocks -
+bare local, struct field, generic-encoded field, decl-init, brace field-init, an `int*` source (to
+pin that the message differentiates by source TYPE, not just a generic phrase), a `?:` join of
+two data pointers (exercises `JoinDeliversDataValue`, the same per-value ledger fallback the
+return-gate join legs use), the amend round's field default, positional fixed-array brace-init,
+and array-view brace-init legs, plus a second amend round's parameter-default leg (covers both
+free-function and struct-method defaults, since they share one emitter). Each leg was isolated
+into its own single-leg scratch file and mutation-tested there individually against a clean build
+of the merge-base `68c78fc`: every one fails with "... did not occur" pre-fix and passes with the
+assignment-flavoured wording post-fix - the parameter-default leg's PRE binary was also confirmed
+to compile the un-wrapped repro clean and exit 138 (SIGBUS) at runtime, matching the other legs'
+PRE behaviour.
+
+Second amend round (round-2 review): the parameter-DEFAULT path above was the sole blocker - the
+call-site argument gate cannot see it because `GenerateDefaultParamOverloads` rebuilds the
+forwarding `NamedVariable` with the destination's type before the call, laundering the source's
+provenance. Gated at the default-value site instead, immediately after the existing opposite-
+direction `RejectCodeValueIntoDataSlot` call. `./test.sh` 600/0/8 and `example_mac.sh` 35/0 held
+after this amend. `??=` on a thin `function<>` destination remains the sole still-open THIN
+spelling of this defect class (see above); the two FAT default-value spellings found by round-3
+review are filed separately (see the fat-twin note in the matrix paragraph).

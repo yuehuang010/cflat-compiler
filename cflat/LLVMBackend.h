@@ -4293,6 +4293,20 @@ public:
     void CheckThinFnPtrArgProvenance(llvm::Value* val, const NamedVariable& arg,
         const std::string& paramName) const;
 
+    /*
+     * The ASSIGNMENT-flavoured thin provenance gate: covers a thin `function<>` destination
+     * (spelled local/field/array-element, or a generic-encoded element) fed a raw pointer via
+     * '=', decl-init, brace field-init, field default-init, or brace array-init (fixed or view).
+     * The FAT destination is already caught by accident at these sites (a closure is a struct, so
+     * a pointer source fails the generic aggregate-store cast); a thin slot is a bare pointer, so
+     * nothing objected. Rejects only what ArgumentIsProvablyDataPointer proves, shared with the
+     * argument/return gates so the accept set cannot drift between "pass", "return", and "assign".
+     * `destDesc` is the destination as the user would write it (already quoted), e.g. "'f'" or
+     * "'s.f'" - reused for every spelling, the way WidenToClosureFatChecked's fieldDesc is.
+     */
+    void CheckThinFnPtrAssignProvenance(llvm::Value* val, const NamedVariable& arg,
+        const std::string& destDesc) const;
+
     // Mirror of LowerClosureFatToThinFnPtr: widen what a fat `Lambda<>` parameter expects.
     // A named function becomes {shim, null} and a thin `function<>` value becomes {code, null};
     // an already-fat value and a non-pointer are returned untouched. Shared by the normal call

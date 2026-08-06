@@ -1394,6 +1394,21 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     right = llvm::UndefValue::get(compiler->BuildThinFnPtrType(namedVar.TypeAndValue));
                 }
             }
+            // A thin function<T> destination fed a raw pointer not handled above (see
+            // CheckThinFnPtrAssignProvenance's doc comment for why the FAT twin needs no gate here).
+            if (operatorText == "=" && right && namedVar.TypeAndValue.IsFunctionPointer
+                && namedVar.TypeAndValue.IsThinFnPtr() && !namedVar.TypeAndValue.Pointer
+                && right->getType()->isPointerTy())
+            {
+                compiler->CheckThinFnPtrAssignProvenance(right, rightNV,
+                    namedVar.FieldName.empty()
+                        ? (namedVar.CallerName.empty()
+                              ? (namedVar.TypeAndValue.VariableName.empty()
+                                    ? std::string("the destination")
+                                    : std::format("'{}'", namedVar.TypeAndValue.VariableName))
+                              : std::format("'{}'", namedVar.CallerName))
+                        : std::format("'{}.{}'", namedVar.CallerName, namedVar.FieldName));
+            }
             // Widen a thin function<T> value to a fat Lambda<T>: store {code, null}, no thunk
             // (mirrors the decl path). Keeps thin -> Lambda -> toFunction lossless.
             if (operatorText == "=" && right && namedVar.TypeAndValue.IsFunctionPointer
@@ -1421,6 +1436,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                             right = llvm::UndefValue::get(compiler->BuildThinFnPtrType(*enc));
                         }
                     }
+                    else if (enc->IsThinFnPtr() && !right->getType()->isStructTy()
+                             && right->getType()->isPointerTy())
+                        // Same thin gate as the spelled destination above, for the
+                        // generic-encoded element (Box<function<...>>.item = vp).
+                        compiler->CheckThinFnPtrAssignProvenance(right, rightNV,
+                            namedVar.FieldName.empty()
+                                ? (namedVar.CallerName.empty() ? std::string("the destination")
+                                                                : std::format("'{}'", namedVar.CallerName))
+                                : std::format("'{}.{}'", namedVar.CallerName, namedVar.FieldName));
                     else if (!enc->IsThinFnPtr() && !right->getType()->isStructTy()
                              && right->getType()->isPointerTy())
                         right = compiler->WidenToClosureFatChecked(right, rightNV, {},
@@ -5724,6 +5748,12 @@ bool MainListener::EmitOneFieldInit(
                 // the user could write, or hand back the raw name when it cannot be rendered.
                 val = compiler->WidenToClosureFatChecked(val, rightNV, {},
                     std::format("'{}.{}'", compiler->DisplayNameOfMangledType(typeName), fieldName));
+            else if (clo != nullptr && clo->IsThinFnPtr()
+                     && !val->getType()->isStructTy() && val->getType()->isPointerTy())
+                // The thin sibling of the widen above: brace-init into a thin function<> field
+                // (spelled or generic-encoded) fed a raw pointer.
+                compiler->CheckThinFnPtrAssignProvenance(val, rightNV,
+                    std::format("'{}.{}'", compiler->DisplayNameOfMangledType(typeName), fieldName));
         }
 
         llvm::Value* destination = nullptr;
@@ -5805,10 +5835,19 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
         const std::string& structName,
         const LLVMBackend::TypeAndValue& field,
         CFlatParser::AssignmentExpressionContext* ae) {
+        auto* compiler = Compiler(ae);
         auto nv = ParseAssignmentExpressionNamed(ae);
         llvm::Value* val = LoadNamedVariable(nv);
         RejectCodeValueIntoDataSlot(ae, nv, field, "default-initialize",
             std::format("field '{}.{}' of", structName, field.VariableName));
+        // Thin sibling of the widen elsewhere: a default initializer into a thin
+        // function<> field fed a raw pointer (spelled or generic-encoded).
+        const LLVMBackend::TypeAndValue* clo = field.IsFunctionPointer
+            ? &field : compiler->GetEncodedClosureType(field.TypeName);
+        if (val && clo && clo->IsThinFnPtr() && !field.Pointer && field.ConstArraySize == 0
+            && val->getType()->isPointerTy() && !val->getType()->isStructTy())
+            compiler->CheckThinFnPtrAssignProvenance(val, nv,
+                std::format("'{}.{}'", structName, field.VariableName));
         return val;
     }
 
@@ -6046,6 +6085,17 @@ void MainListener::EmitPositionalFixedArrayInit(
             // Aggregate leg of the code-value store gate: `Rec*[2] arr = { w, w };`.
             RejectCodeValueIntoDataSlot(fi, nv, fixedElemTV, "brace-initialize",
                                         std::format("element {} of '{}' of", i, name));
+
+            // Thin sibling of the widen elsewhere: positional fixed-array brace-init into a
+            // thin function<> element fed a raw pointer (spelled or generic-encoded).
+            {
+                const LLVMBackend::TypeAndValue* clo = fixedElemTV.IsFunctionPointer
+                    ? &fixedElemTV : compiler->GetEncodedClosureType(fixedElemTV.TypeName);
+                if (clo && clo->IsThinFnPtr() && !fixedElemTV.Pointer && fixedElemTV.ConstArraySize == 0
+                    && val->getType()->isPointerTy() && !val->getType()->isStructTy())
+                    compiler->CheckThinFnPtrAssignProvenance(val, nv,
+                        std::format("'{}[{}]'", name, i));
+            }
 
             // Array-aggregate leg of the temp-unique-field escape. This lowering is NOT
             // EmitOneFieldInit, so the struct brace-init leg could never see it.
@@ -6560,6 +6610,17 @@ void MainListener::EmitArrayViewInferredInit(
             // Aggregate leg of the code-value store gate: `Rec*[] v = { w, w };`.
             RejectCodeValueIntoDataSlot(fi, nv, elemTV, "brace-initialize",
                                         std::format("element {} of '{}' of", i, name));
+
+            // Thin sibling of the widen elsewhere: array-view brace-init into a thin
+            // function<> element fed a raw pointer (spelled or generic-encoded).
+            {
+                const LLVMBackend::TypeAndValue* clo = elemTV.IsFunctionPointer
+                    ? &elemTV : compiler->GetEncodedClosureType(elemTV.TypeName);
+                if (clo && clo->IsThinFnPtr() && !elemTV.Pointer && elemTV.ConstArraySize == 0
+                    && val->getType()->isPointerTy() && !val->getType()->isStructTy())
+                    compiler->CheckThinFnPtrAssignProvenance(val, nv,
+                        std::format("'{}[{}]'", name, i));
+            }
 
             // Array-VIEW twin of the fixed-array leg above; a separate lowering reached by
             // neither the fixed path nor EmitOneFieldInit.

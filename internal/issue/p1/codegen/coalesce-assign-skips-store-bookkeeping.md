@@ -73,6 +73,40 @@ the `??=` handler fall through to the shared tail with the store already perform
 the accept-set has to be built per subsystem first - the `??=` path currently gets its *lack* of
 bookkeeping baked into whatever passes today.
 
+## MEASURED, memory-unsafe (added 2026-08-06 by `fix/assign-gate`)
+
+Another concrete repro of the same root cause, this time bypassing a PROVENANCE gate rather than
+ownership bookkeeping. `fix/assign-gate` added `CheckThinFnPtrAssignProvenance` to the plain `=`
+path (local, field, generic-encoded field, decl-init, brace field-init) so a data pointer can no
+longer be assigned into a thin `function<>` destination. The `??=` handler builds its own
+compare/branch/store and returns before that gate ever runs (same shape as every other skipped
+check this file documents), so it stayed a live hole:
+
+```cflat
+function<int(int)> f = default;
+void* vp = &q;
+f ??= vp;   // compiles clean, then CALLS vp as code
+```
+
+Measured on `x64/Release/cflat` (worktree `fix/assign-gate`, merge-base `68c78fc` plus the new
+gate): compiles exit 0, runs exit 138 (SIGBUS) - the exact same defect shape the just-landed
+assignment gate closes for `=`, decl-init, and brace-init. The FAT `Lambda<>` twin
+(`g ??= vp;`) is NOT an open hole by the same mechanism: it fails for an unrelated reason first -
+`??=`'s null-check condition (`if (x == 0) x = rhs;`) requires a scalar, and a fat closure is a
+16-byte `{code, env}` struct, so `condition must be a scalar ... not '__closure_fat_ptr'` fires
+before the store is ever reached. Only the THIN `function<>` destination is live.
+
+Not fixed here: the gate reads a `NamedVariable` (declared-pointer-shape evidence), and the
+`??=` handler evaluates its RHS through the lean `ParseAssignmentExpression(assignCtx)` VALUE path
+specifically because it discards that NamedVariable (see the "Code-value store gate for `??=`"
+comment on the opposite-direction gate, same handler) - a bare `void*` LOCAL read has no PHI/join
+for `JoinDeliversDataValue` to inspect and no declared-type carrier to consult, so a naively
+reconstructed empty-flags `NamedVariable` would silently NOT reject it (false accept, worse than
+today's known gap). Closing this requires either running `ParseAssignmentExpressionNamed` in the
+`??=` branch (thereby also picking up the seven skipped bookkeeping calls above, which is a wider
+change) or introducing a value-level "provably data" ledger query independent of NamedVariable.
+Left open; scope stays whatever fixes the general `??=`-skips-the-shared-tail defect.
+
 ## Related
 
 [[interface-boxing-keyed-on-source-binding]] - the guard whose `??=` leg forced the element fact

@@ -1812,6 +1812,20 @@ void LLVMBackend::CheckThinFnPtrArgProvenance(llvm::Value* val, const NamedVaria
         }
     }
 
+void LLVMBackend::CheckThinFnPtrAssignProvenance(llvm::Value* val, const NamedVariable& arg,
+        const std::string& destDesc) const
+{
+        if (val && val->getType()->isPointerTy() && ArgumentIsProvablyDataPointer(val, arg))
+        {
+            LogError(std::format(
+                "cannot assign {} to 'function<>' destination {}: only a named function, a "
+                "'function<>' value or a non-capturing lambda converts to a function pointer - "
+                "a data pointer would be called as code. If the value really holds a code "
+                "address, assert it with an explicit cast: '(function<...>)value'.",
+                DescribeNonFunctionArgument(arg), destDesc));
+        }
+    }
+
 llvm::Value* LLVMBackend::WidenBareOrThinToClosureFat(llvm::Value* val)
 {
         if (auto* fn = llvm::dyn_cast<llvm::Function>(val))
