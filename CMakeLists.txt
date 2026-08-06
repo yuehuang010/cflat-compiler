@@ -139,6 +139,8 @@ add_custom_command(
 set(CFLAT_SOURCES
   ${CFLAT_DIR}/main.cpp
   ${CFLAT_DIR}/LLVMBackend.cpp
+  ${CFLAT_DIR}/ForwardRefScanner.cpp
+  ${CFLAT_DIR}/MainListener.cpp
   ${CFLAT_DIR}/CClangExtract.cpp
   ${CFLAT_DIR}/JsonRpcLoop.cpp
   ${CFLAT_DIR}/LspServer.cpp
@@ -204,6 +206,8 @@ target_link_libraries(cflat PRIVATE
 if(MSVC)
   set_source_files_properties(
     ${CFLAT_DIR}/LLVMBackend.cpp
+    ${CFLAT_DIR}/ForwardRefScanner.cpp
+    ${CFLAT_DIR}/MainListener.cpp
     ${CFLAT_DIR}/CClangExtract.cpp
     ${ANTLR_GEN_DIR}/CFlatParser.cpp
     PROPERTIES COMPILE_OPTIONS "/bigobj")
