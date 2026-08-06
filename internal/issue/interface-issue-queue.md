@@ -92,6 +92,14 @@ EIGHTH (`fix/tempuniq`, 2026-08-05, plain-`T*` remainder filed at P2): **2 -> 1*
 filed by this campaign is closed; the six originally-open P1s and the three review-filed ones
 are all resolved. Progress is tracked by row deletion here, as always.
 
+**2026-08-05, after `f45c9ad` re-triaged the crash / codegen buckets to P1, the working set is the
+`p1/crash/` and `p1/codegen/` files rather than that campaign's list.**
+`fix/genfp-return` closes one of them ([[generic-funcptr-return-poisons-enclosing-return]], the
+`%thinret` verifier dump) and files two P2s -
+[[generic-function-cannot-be-forward-referenced]] and, from its own boundary audit,
+[[nested-emission-clears-enclosing-alias-scope-registry]]. Re-derive the count from
+`ls internal/issue/p1/*/*.md`; do not trust the paragraph above for it.
+
 **Previous head: the P1 campaign.** macOS arm64 Release **576 / 0 / 8** plus `example_mac.sh`
 **35 / 0** and `test_lsp.sh` **152 / 0** (re-measured 2026-08-03; the 554 this line carried was
 stale by 22 tests). Six P1s fixed on 2026-07-31 (`99d73f3`, `696060d`, `8c29ca7`, `d65f000`, `4000fa1`,
@@ -502,7 +510,6 @@ produce a program.
 | [[generic-wrapper-over-function-type-llvm-fatal]] | feature gap | `Box<function<int(int)>>` raises LLVM fatal `Cannot select: AArch64ISD::CALL` (exit 134) when the substituted field is INVOKED. Store-only may be fine - check that first. Borderline P1 (dies with no usable diagnostic); filed P2 because nothing lies to you. Filed 2026-07-31. |
 | [[lambda-pointer-as-generic-type-arg-bypasses-guard]] | diagnostic | Hard compile failure with no source diagnostic - raw module-verifier dump. `Lambda<T>*` as a generic type argument (`Box<Lambda<int(int)>*>`) bypasses the declarator guard that already rejects this shape elsewhere. `function<T>*` as a generic type argument fails identically but should be SUPPORTED, not rejected - the two halves want opposite outcomes. Filed 2026-07-31. |
 | [[list-of-function-element-into-closure-param-fails-verifier]] | diagnostic | Hard compile failure with no source diagnostic - raw module-verifier dump. Passing a `list<function<>>` element to a closure parameter fails; building the list and invoking the element directly both work. Likely shares a root with [[generic-wrapper-over-function-type-llvm-fatal]]. Filed 2026-07-31. |
-| [[generic-funcptr-return-poisons-enclosing-return]] | false rejection | Legal code rejected with a P1-grade diagnostic: a raw module-verifier dump (`%thinret`) and NO source location. CALLING a generic function that returns `function<>` routes the ENCLOSING function's `return` through `CoerceToFuncPtrReturn`. `main` does NOT escape; `void` and POINTER returns escape (the latter by a no-op ptr-to-ptr bitcast, which is why this is P2 and not P1 - no spelling is silently wrong). A second, different failure on the no-value-parameter spelling is recorded in the file; do not conflate. Filed 2026-08-01. |
 | [[chained-nullcoalesce-not-boxed-into-interface]] | false rejection | `take(z ?? y ?? a)` and `IShape j = z ?? y ?? a;` do not compile - the outer join's arm is the inner join's LOAD, which names no class. Spans EVERY position that boxes a `??` (decl-init, assignment, return, argument), so it predates the return/argument work. Fix at the ledger by splicing a nested join's arms. Filed 2026-07-31. |
 
 On the `crash/` bucket: only [[generic-wrapper-over-function-type-llvm-fatal]] is a true abort
@@ -533,6 +540,7 @@ deleted 2026-08-05), which closed the four decidable spellings and named this on
 | [[auto-binding-of-fixed-array-loses-shape]] | feature gap | RESTORED and narrowed, re-ranked P1 -> P2. The non-pointer half is fixed; `auto v = <T*[N]>` now REJECTS because `T*[]` collapses to `T[]` in both parser copies. Representation is free - no new field needed. |
 | [[char-array-from-string-literal-has-no-spelling]] | feature gap | `char[N] b = "literal";` now has a clear diagnostic and three suggested spellings, but no direct replacement for the C idiom. Master miscompiled it silently. |
 | [[array-view-params-unconditionally-noalias]] | latent miscompile | Latent `-O2` miscompile hazard - UB handed to LLVM. P1 the moment a witness exists. |
+| [[nested-emission-clears-enclosing-alias-scope-registry]] | latent miscompile | `createFunctionBlock` clears `aliasScopes_` / `viewScopeByOrigin_`; `BuilderState` saves every other field it clears but not these three, so a generic instantiation mid-body re-points the enclosing function's view scope IDs (they are vector indices). IR witness: one view's store and load end up on DIFFERENT `!alias.scope` nodes. Same defect shape and same boundary as the `fix/genfp-return` fix, deliberately not folded into it - it changes emitted alias metadata and needs its own `-O2` pass. Filed 2026-08-05; identical on both binaries of that branch. |
 | [[incomplete-layout-message-blames-c-interop]] | diagnostic | **Raised above its severity.** One emission site, three unrelated causes, and the wording names the cause that is usually absent. Two ratification records cite a C-interop cause on files with no C interop. |
 | [[overload-replay-blames-wrong-candidate]] | diagnostic | Factually false message on two paths; on the interface-slot path it converts a success into a failure. Merged 2026-07-30. |
 | [[variadic-free-generic-function-does-not-link]] | false reject | Compiles, does not link - raw JIT symbol dump, not a diagnostic. |
@@ -544,6 +552,7 @@ deleted 2026-08-05), which closed the four decidable spellings and named this on
 | [[generic-interface-name-vetoed-by-core-template]] | false reject | A core generic template vetoes a same-named user generic interface. Two tie-breaks tried, both reverted - records why none can work. |
 | [[generic-interface-cannot-inherit-generic-interface]] | false reject | `unknown parent interface` on INSTANTIATION, not on the declaration. |
 | [[fixed-array-parameter-not-callable]] | false reject | A `T[N]` parameter registers as a bare `T`, so no call resolves. |
+| [[generic-function-cannot-be-forward-referenced]] | false reject | A generic function called ABOVE its definition does not resolve; the message names a mangled symbol and invents a zero-parameter candidate. Non-generic functions forward-reference fine (that is the pre-pass's job). Not a `function<>` issue - reproduces on `T idg<T>(T v)`. Filed 2026-08-05 from the `fix/genfp-return` matrix; identical on both binaries of that branch. |
 | [[sizeof-of-generic-instantiation]] | false reject | `sizeof(B<int>)` -> `unknown type`. The operand skips the generic mangling/queue path. Check `alignof` and cast operands too. |
 | [[function-type-as-generic-interface-type-argument]] | false reject | `C<function<int(int)>>` fails on both binaries. Clean failure. |
 | [[bare-interface-name-resolves-outward-before-namespace]] | false reject | Outer scope wins for non-generic interface names, opposite to the ratified generic rule. |
@@ -1304,9 +1313,10 @@ diagnostic `err_funcptr_move_mismatch.cb` pins: that one is raised on the ASSIGN
 reads "'move' modifiers of function pointer signature".
 
 Found while sweeping, NOT part of this defect and filed separately - a generic function
-returning `function<>` poisons the ENCLOSING function's return coercion. See
-[[generic-funcptr-return-poisons-enclosing-return]]. It is why the regression test has no
-generic-producer leg.
+returning `function<>` poisons the ENCLOSING function's return coercion. That is why the
+regression test had no generic-producer leg at the time. **FIXED 2026-08-05** - see the landed
+design record "Generic instantiation leaked its return TypeAndValue into the caller" below;
+`Test/test_function_ptr.cb` now has the generic-producer legs (`gfp_*`).
 
 Still open in this family and NOT addressed here: the `move` flags are only checked when the
 argument is a bare NAME, so a `function<int(MP*)>` VARIABLE binds to a
@@ -4421,3 +4431,95 @@ legs), `example_mac.sh` **35 passed / 0 failed**, `test_lsp.sh` **152 passed / 0
 serialized field, and every field the three guards read already round-trips in `LLVMBackend.cpp`
 (`Pointer` `p`, `IsInterface` `if`, `IsFunctionPointer` `fp`, `IsArrayView` `av`, `ConstArraySize`
 `as`); the error test was verified firing on a COLD cache and a warm one alike.
+## Landed: `fix/genfp-return` (2026-08-05) - generic instantiation leaked its return TypeAndValue into the caller
+
+Closes [[generic-funcptr-return-poisons-enclosing-return]] (file deleted). The filed root-cause
+LEAD named `CoerceToFuncPtrReturn` and guessed at unscoped "current function returns a thin
+funcptr" state; that was correct in direction and one field off in detail.
+
+**Root cause.** `LLVMBackend::BuilderState` exists so that emitting a nested function mid-body
+(lambda invoker, global init, program shim, and - the case here - a monomorphized generic
+instantiation) can restore the enclosing function's return shape afterwards. It snapshotted THREE
+of the four `currentFunctionReturn*` fields (`returnsOwned`, `returnIsArrayView`,
+`returnTypeName`) and not the fourth, `currentFunctionReturnTV`, which was added later beside them
+in `CreateFunction` (`LLVMBackend.h`, right after the `createFunctionBlock` call) and never joined
+the snapshot. A generic producer whose return type is `function<>` / `Lambda<>` therefore left
+`currentFunctionReturnTV.IsFunctionPointer` set, and `ParseJumpStatement` reads exactly that flag
+to decide whether the ENCLOSING `return` goes through `CoerceToFuncPtrReturn`.
+
+Two consequences that make the fix a one-liner rather than a new guard: nothing about the CALL
+matters (the leak happens at instantiation, so discarding the result poisons the return just the
+same - `return 42;` came out as `ret ptr bitcast (i8 42 to ptr)` from an `i32` function), and the
+leak is bidirectional (a genuinely `function<>`-returning caller that instantiated a `Lambda<>`
+producer emitted `ret %__closure_fat_ptr` against a `ptr` return).
+
+**Fix.** Add `TypeAndValue returnTV` to `BuilderState` and save/restore it with the other three.
+No predicate changed, no rejection added, no new state.
+
+**Severity was understated in the filed row.** It said "no spelling is silently wrong, so P2".
+True, but the measured axes were worse than the file's list in two places: a STRUCT-VALUE
+enclosing return is a compiler SIGSEGV (exit 139, zero output), and a `string` enclosing return is
+a FALSE REJECTION with the capturing-closure diagnostic ("call .toFunction() instead"), which
+blames the user's code for a bug in the caller's bookkeeping. The round-1 review added a third:
+an OWNING-CONTAINER enclosing return (`list<int> f() { ...mk<int>(1)...; return l; }`) is the same
+false rejection with the same message, so the shape is any struct-by-value return, not `string`
+specifically - re-measured on both binaries from `scratch/rev_p8_owned.cb` (PRE: the
+`.toFunction()` diagnostic at (5,92); POST: prints `10 10.500000`). The re-triage to P1 by
+`f45c9ad` was right.
+
+Three further axes the review attacked were independently verified FIXED by this same change and
+had not been listed: a producer instantiated inside an `if const` block
+(`scratch/rev_p3_ifconst.cb`, PRE `Invalid bitcast` -> POST 11), inside a `program` shim body
+(`rev_p7_prog.cb`, PRE `Invalid bitcast` -> POST `7 2`), and inside an `expect_error` scope
+(`rev_p6_experr.cb`). The last is the sharpest: the expectation PASSES on both binaries, and PRE
+then fails the module with `ret ptr null` against `i32` - the `LogError` unwind left the leaked TV
+live and poisoned `main`'s own return, which is the concrete form of the RAII hazard noted below.
+
+**Per-site audit of the same boundary - and it found a second leak, filed not fixed.** Take
+`createFunctionBlock`'s clear-list as the definition of "per-function state" and check each entry
+against `BuilderState`. The three return-shape siblings were already saved; all seven owned-temp /
+provenance ledgers (`interfaceBoxRecords_`, `nullCoalesceJoins_`, `codeValues_`, `dataValues_`,
+`codeValueDataCasts_`, `owningTempUniqueFields_`, `dataValueCodeCasts_`) are moved out and
+restored. The three that are NOT saved are `aliasDomain_`, `aliasScopes_` and
+`viewScopeByOrigin_` - the array-view noalias registry - and they have exactly this defect, with
+teeth, because `TypeAndValue::NoaliasScopeId` is a vector INDEX: a generic instantiation mid-body
+clears the vector and an enclosing local's id then names a different scope. Measured IR witness
+(one view's store on `!alias.scope !0`, its own load on `!10`) in
+[[nested-emission-clears-enclosing-alias-scope-registry]]. Deliberately NOT folded into this
+commit: it changes emitted alias metadata for real programs and needs an `-O2` verification pass
+that neither suite performs, which is a different bar from this fix's.
+
+The other remaining hazard at this boundary is unchanged by this fix and worth knowing:
+of the ten `SaveBuilderState()` call sites (`LLVMBackend.h:11748` and `:14649`; `MainListener.h`
+4960, 6019, 8423, 9642, 18791, 19018, 25893, 26202 - counted by grep on the merged tree, excluding
+the definition itself), only `FullBuilderStateScope` (`LLVMBackend.h:11743`, which owns 11748) is
+RAII, so a `LogError` unwind past any of the other nine still leaks
+whatever they were bracketing. That is a pre-existing structural item, not a regression, and it is
+the reason the fix went into the shared struct rather than into a hand-rolled save at the generic
+path.
+
+**Two neighbouring defects probed and NOT fixed here** (deliberately, different roots, both
+measured identical on the pre- and post-fix binaries):
+
+- The zero-argument spelling `function<int(int)> mk<T>() { ... }` / `mk<int>()`. The filed issue
+  called this "a second defect on the neighbouring spelling"; it is not a `function<>` defect at
+  all. `int mk<T>() { return 5; }` fails identically, and the IR shows
+  `%mk__i32 = type opaque` - an EMPTY argument list parses as a generic TYPE construction and is
+  eaten by the ungated bare `tryPreDeclare` shell. Recorded as a second manifestation inside
+  [[unresolved-generic-preregisters-opaque-shell]], whose proposed `IsGenericTemplateKey` gate
+  should close it too. The namespaced (`N.mk<int>()`) and method spellings already work, which is
+  exactly the gated-vs-ungated asymmetry that file documents.
+- A generic function called ABOVE its definition does not resolve. Filed as
+  [[generic-function-cannot-be-forward-referenced]].
+
+**Coverage.** `Test/test_function_ptr.cb` gained `testGenericFuncPtrProducer()` - 23 value legs
+(`gfp_*`) across the enclosing-return-type axis (int, bool, struct value, string, owning container,
+`function<>`, `Lambda<>`), the producer axis (thin, fat, `function<T(T)>`, non-generic control, two
+producers, two instantiations of one template), the placement axis (nested loop, class method,
+lambda body, generic enclosing function, nested generic producer) and the call-context axis
+(discarded, as argument, immediately invoked, returned directly). SIX of the 23 pass on the pre-fix
+binary too and are labelled accept-set in the file - `gfp_encl_nongeneric`, `gfp_thin_from_thin`,
+`gfp_encl_fat_prod`, `gfp_as_argument`, `gfp_immediate_call`, `gfp_return_direct` - so they are
+there to prove the fix breaks nothing, not to discriminate. The other 17 fail on the pre-fix binary
+for the reason each one's comment states. `test.sh Release`: 600 passed, 0 failed, 8 skipped.
+`example_mac.sh Release`: 35 passed, 0 failed.

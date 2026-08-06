@@ -2777,6 +2777,128 @@ bool testCodeValueJoinAccepts()
     return result;
 }
 
+// --- Generic producers of function<> / Lambda<> ------------------------------
+// Emitting a GENERIC function's body happens mid-body of its CALLER (monomorphization),
+// through SaveBuilderState/RestoreBuilderState. Before the fix that pair snapshotted three of
+// the four `currentFunctionReturn*` fields and left `currentFunctionReturnTV` behind, so the
+// producer's function<>/Lambda<> return type stayed live and steered the CALLER's own `return`
+// through CoerceToFuncPtrReturn. Every leg below therefore asserts the ENCLOSING function's
+// value, not the producer's. Pre-fix behaviour is per-leg, recorded in the comments.
+
+int gfpDouble(int x) { return x * 2; }
+int gfpTriple(int x) { return x * 3; }
+
+function<int(int)> gfpMk<T>(T seed)    { return gfpDouble; }
+function<int(int)> gfpMk2<T>(T seed)   { return gfpTriple; }
+function<T(T)>     gfpMkT<T>(T seed)   { return gfpDouble; }
+Lambda<int(int)>   gfpMkFat<T>(T seed) { return gfpDouble; }
+function<int(int)> gfpOuter<U>(U seed) { function<int(int)> q = gfpMk<U>(seed); return q; }
+function<int(int)> gfpMkPlain(int seed) { return gfpDouble; }
+
+struct GfpBox { int a = default; };
+
+// Pre-fix: `ret ptr %thinret` against an i32 return -> module verification failure.
+int gfpEnclInt()  { function<int(int)> g = gfpMk<int>(1); return g(5); }
+// Pre-fix: `bitcast i1 ... to ptr` -> module verification failure.
+bool gfpEnclBool() { function<int(int)> g = gfpMk<int>(1); return g(5) == 10; }
+// Pre-fix: COMPILER SIGSEGV (exit 139, zero output) - the struct-value return path.
+GfpBox gfpEnclStruct() { function<int(int)> g = gfpMk<int>(1); GfpBox b = default; b.a = g(5); return b; }
+// Pre-fix: false rejection "a closure that may carry captured state cannot become a C
+// function pointer" - the returned `string` struct hit the fat-closure arm of the coercion.
+string gfpEnclString() { function<int(int)> g = gfpMk<int>(1); string s = "ok"; return s; }
+// Same false rejection on an OWNING CONTAINER return - the shape is any struct-by-value return,
+// not `string` specifically. Pre-fix: the same ".toFunction() instead" diagnostic.
+list<int> gfpEnclOwned() { function<int(int)> g = gfpMk<int>(1); list<int> l; l.add(g(5)); return l; }
+// The other direction: a legitimately function<>-returning caller must keep its own shape.
+// Pre-fix with a Lambda<> producer: `ret %__closure_fat_ptr` against a ptr return.
+function<int(int)> gfpEnclThinFromFat() { Lambda<int(int)> g = gfpMkFat<int>(1); return gfpTriple; }
+// Pre-fix: `ret ptr @gfpTriple` against a __closure_fat_ptr return.
+Lambda<int(int)> gfpEnclFatFromThin() { function<int(int)> g = gfpMk<int>(1); return gfpTriple; }
+// Same shape both sides: passes pre-fix too. Accept-set leg, kept so the fix cannot break it.
+function<int(int)> gfpEnclThinFromThin() { function<int(int)> g = gfpMk<int>(1); return gfpTriple; }
+// Pre-fix: `ret ptr bitcast (i8 42 to ptr)` - merely CALLING the producer poisoned the return,
+// the result is never bound. This leg is what proves usage is irrelevant.
+int gfpEnclDiscard() { gfpMk<int>(1); return 42; }
+int gfpEnclTwice() { function<int(int)> g = gfpMk<int>(1); function<int(int)> h = gfpMk<int>(2); return g(5) + h(1); }
+int gfpEnclTwoProducers() { function<int(int)> g = gfpMk<int>(1); function<int(int)> h = gfpMk2<int>(2); return g(5) + h(1); }
+// Two DIFFERENT instantiations of the same template in one body.
+int gfpEnclTwoT() { function<int(int)> g = gfpMk<int>(1); function<int(int)> h = gfpMk<double>(2.0); return g(5) + h(1); }
+// Instantiation inside a nested block / loop rather than at statement top level.
+int gfpEnclNested(int n)
+{
+    int acc = 0;
+    if (n > 0) { for (int i = 0; i < n; i++) { function<int(int)> g = gfpMk<int>(i); acc = acc + g(1); } }
+    return acc;
+}
+// A generic ENCLOSING function (its own body is itself emitted mid-caller).
+U gfpEnclGeneric<U>(U v) { function<int(int)> g = gfpMk<int>(1); return v + g(5); }
+// A producer that itself instantiates another producer - two nested save/restore frames.
+int gfpEnclNestedGen() { function<int(int)> g = gfpOuter<int>(1); return g(5); }
+// The producer's return type MENTIONS T.
+int gfpEnclTSig() { function<int(int)> g = gfpMkT<int>(1); return g(5); }
+// Fat producer into a fat local, plain int return. Measured to pass pre-fix as well: the leaked
+// Lambda<> TV is not thin, so the coercion took the widen arm, which no-ops on an i32. Accept-set.
+int gfpEnclFatProducer() { Lambda<int(int)> g = gfpMkFat<int>(1); return g(5); }
+// Non-generic producer control: worked pre-fix (its body is not emitted mid-caller) and must
+// keep working - this is the leg that pins the fix to the generic path only.
+int gfpEnclNonGeneric() { function<int(int)> g = gfpMkPlain(1); return g(5); }
+// Call-context legs that already worked pre-fix (accept set).
+int gfpUse(function<int(int)> f) { return f(5); }
+int gfpEnclAsArg()     { return gfpUse(gfpMk<int>(1)); }
+int gfpEnclImmediate() { return gfpMk<int>(1)(5); }
+function<int(int)> gfpEnclReturnDirect() { return gfpMk<int>(1); }
+
+class GfpHolder
+{
+    int k = default;
+    int probe() { function<int(int)> g = gfpMk<int>(1); return k + g(5); }
+};
+
+bool testGenericFuncPtrProducer()
+{
+    bool result = true;
+
+    result &= Test("gfp_encl_int",        gfpEnclInt(),        10);
+    result &= Test("gfp_encl_bool",       gfpEnclBool(),       true);
+    result &= Test("gfp_encl_struct",     gfpEnclStruct().a,   10);
+    result &= Test("gfp_encl_string",     (int)gfpEnclString().length(), 2);
+    result &= Test("gfp_encl_owned",      gfpEnclOwned().get(0), 10);
+    result &= Test("gfp_encl_discard",    gfpEnclDiscard(),    42);
+    result &= Test("gfp_encl_twice",      gfpEnclTwice(),      12);
+    result &= Test("gfp_encl_two_prod",   gfpEnclTwoProducers(), 13);
+    result &= Test("gfp_encl_two_t",      gfpEnclTwoT(),       12);
+    result &= Test("gfp_encl_nested",     gfpEnclNested(3),    6);
+    result &= Test("gfp_encl_generic",    gfpEnclGeneric<int>(1), 11);
+    result &= Test("gfp_encl_nested_gen", gfpEnclNestedGen(),  10);
+    result &= Test("gfp_encl_tsig",       gfpEnclTSig(),       10);
+    result &= Test("gfp_encl_fat_prod",   gfpEnclFatProducer(), 10);
+    result &= Test("gfp_encl_nongeneric", gfpEnclNonGeneric(), 10);
+
+    // The caller's own function-pointer return shape must survive the producer call in BOTH
+    // flavours - x3 distinguishes it from the producer's x2, so a clobber cannot read as 10.
+    function<int(int)> t1 = gfpEnclThinFromFat();
+    Lambda<int(int)>   t2 = gfpEnclFatFromThin();
+    function<int(int)> t3 = gfpEnclThinFromThin();
+    result &= Test("gfp_thin_from_fat",   t1(5), 15);
+    result &= Test("gfp_fat_from_thin",   t2(5), 15);
+    result &= Test("gfp_thin_from_thin",  t3(5), 15);
+
+    // A producer call inside a LAMBDA body and inside a class METHOD.
+    Lambda<int(int)> inLam = (int x) => { function<int(int)> g = gfpMk<int>(1); return x + g(5); };
+    result &= Test("gfp_in_lambda_body",  inLam(1), 11);
+    GfpHolder h = default;
+    h.k = 1;
+    result &= Test("gfp_in_method",       h.probe(), 11);
+
+    // Call-context accept set (each already worked pre-fix).
+    function<int(int)> direct = gfpEnclReturnDirect();
+    result &= Test("gfp_as_argument",     gfpEnclAsArg(),      10);
+    result &= Test("gfp_immediate_call",  gfpEnclImmediate(),  10);
+    result &= Test("gfp_return_direct",   direct(5),           10);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -2896,6 +3018,9 @@ extern int main()
 
     // Accept set for a JOIN into a closure PARAMETER (the widen gate's EVERY-arm data question)
     total++; passed += testDataJoinClosureAccepts()        ? 1 : 0;
+
+    // A GENERIC function returning function<>/Lambda<> must not poison its CALLER's return
+    total++; passed += testGenericFuncPtrProducer()        ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

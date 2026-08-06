@@ -87,6 +87,53 @@ of a broken forward reference - the non-generic analog (`int use(S s)` above `cl
 too, with `unknown type 'S'`. Use-before-declaration at file scope is simply not supported for
 by-value struct parameters; only the MESSAGE differs between the generic and non-generic spellings.
 
+## Second manifestation: a ZERO-ARGUMENT generic FUNCTION call is eaten by the shell
+
+Measured 2026-08-05 on the `fix/genfp-return` tree (pre and post that fix - unchanged by it),
+while probing the "second defect" named in
+`generic-funcptr-return-poisons-enclosing-return`. The name here is NOT unresolved - it is a
+perfectly ordinary, declared generic function - but the bare `tryPreDeclare` still shells it,
+and for an EMPTY argument list the shell wins over the function.
+
+```cflat
+int mk<T>() { return 5; }
+extern int main() { int q = mk<int>(); printf("%d\n", q); return 0; }
+```
+```
+z6.cb(2,28): cannot cast an aggregate value - a fixed array decays to a pointer to its first element
+```
+
+The IR names the shell directly (`--out-lli` on the discarded-result spelling):
+
+```llvm
+%mk__i32 = type opaque
+declare %mk__i32 @_mk__i32_mk__i32__()
+  %0 = call %mk__i32 @_mk__i32_mk__i32__()
+```
+
+`mk<int>()` with an empty argument list parses as a generic TYPE construction, so it reaches the
+`RuleTypeSpecifier` case and gets an opaque shell; the declared function body is never emitted and
+the opaque return value then fails the aggregate-cast check at `LLVMBackend.h:15676`. The message
+mentions fixed arrays and is factually false.
+
+The axes separate cleanly, and every one of them points at the SAME ungated bare `tryPreDeclare`:
+
+| Spelling | Result |
+|---|---|
+| `int mk<T>() { ... }` then `mk<int>()` | hard error, opaque shell (above) |
+| `int mk<T>(int u) { ... }` then `mk<int>(1)` | works - no shell in the IR at all |
+| `namespace N { int mk<T>() {...} }` then `N.mk<int>()` | works - the QUALIFIED path is gated |
+| `class C { int mk<T>() {...} }` then `c.mk<int>()` | works |
+| return type is irrelevant: `int`, a struct, `function<int(int)>`, `Lambda<int(int)>` all fail | |
+
+The last row matters for triage: the issue was originally described as a `function<>` problem
+("cannot assign a struct value to a pointer variable - use getPtr()"), and that wording is just
+what the opaque shell looks like when the destination happens to be a thin function pointer.
+
+The `IsGenericTemplateKey` gate this file already proposes should close this too - `mk` is not a
+generic TYPE template key - so it is recorded here rather than as its own issue. Whoever takes the
+fix should add the zero-argument generic-function call to the accept set.
+
 ## Backstop already landed (do not mistake it for the fix)
 
 `createFunctionBlock` now gives an unsized shell a sized placeholder slot and skips the store, so

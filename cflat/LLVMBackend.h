@@ -9915,9 +9915,14 @@ public:
         // Return-shape of the function being emitted. Emitting a nested function (e.g. a lambda
         // invoker) mid-body calls createFunctionBlock, which overwrites this trio with the nested
         // function's shape; snapshot it here so the enclosing function's return checks are restored.
+        // All FOUR fields below are that shape - see the returnTV note.
         bool returnsOwned = false;
         bool returnIsArrayView = false;
         std::string returnTypeName;
+        // Fourth member of the same return-shape group (set beside the trio in CreateFunction).
+        // Leaving it unsaved let a nested emission's function<>/Lambda<> return type steer the
+        // ENCLOSING function's `return` through CoerceToFuncPtrReturn.
+        TypeAndValue returnTV;
         // The enclosing function's not-yet-flushed owned temps. A nested function emitted
         // mid-body (lambda invoker, global init, program shim) runs its OWN end-of-expression
         // flushes; those must not see - and drop - the outer function's temps, which are
@@ -9945,7 +9950,8 @@ public:
     BuilderState SaveBuilderState()
     {
         BuilderState s{ builder->saveIP(), currentFunction, currentSubprogram, builder->getCurrentDebugLocation(),
-                        currentFunctionReturnsOwned, currentFunctionReturnIsArrayView, currentFunctionReturnTypeName };
+                        currentFunctionReturnsOwned, currentFunctionReturnIsArrayView, currentFunctionReturnTypeName,
+                        currentFunctionReturnTV };
         // Park the outer function's pending owned temps in the saved state and start the
         // nested emission with empty lists (see the BuilderState field comment).
         s.pendingStringTemps  = std::move(pendingOwnedStringTemps);
@@ -10002,6 +10008,7 @@ public:
         currentFunctionReturnsOwned = state.returnsOwned;
         currentFunctionReturnIsArrayView = state.returnIsArrayView;
         currentFunctionReturnTypeName = state.returnTypeName;
+        currentFunctionReturnTV  = state.returnTV;
         pendingOwnedStringTemps  = state.pendingStringTemps;
         pendingOwnedClosureTemps = state.pendingClosureTemps;
         pendingOwnedStructTemps  = state.pendingStructTemps;
