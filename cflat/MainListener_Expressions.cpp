@@ -5844,10 +5844,18 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
         // function<> field fed a raw pointer (spelled or generic-encoded).
         const LLVMBackend::TypeAndValue* clo = field.IsFunctionPointer
             ? &field : compiler->GetEncodedClosureType(field.TypeName);
-        if (val && clo && clo->IsThinFnPtr() && !field.Pointer && field.ConstArraySize == 0
+        if (val && clo && !field.Pointer && field.ConstArraySize == 0
             && val->getType()->isPointerTy() && !val->getType()->isStructTy())
-            compiler->CheckThinFnPtrAssignProvenance(val, nv,
-                std::format("'{}.{}'", structName, field.VariableName));
+        {
+            if (clo->IsThinFnPtr())
+                compiler->CheckThinFnPtrAssignProvenance(val, nv,
+                    std::format("'{}.{}'", structName, field.VariableName));
+            // Fat sibling: the field default never widens (see CheckFatClosureAssignProvenance's
+            // doc comment), so a provable data pointer needs its own reject here.
+            else
+                compiler->CheckFatClosureAssignProvenance(val, nv,
+                    std::format("'{}.{}'", structName, field.VariableName));
+        }
         return val;
     }
 

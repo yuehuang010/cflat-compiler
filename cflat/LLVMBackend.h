@@ -4297,14 +4297,27 @@ public:
      * The ASSIGNMENT-flavoured thin provenance gate: covers a thin `function<>` destination
      * (spelled local/field/array-element, or a generic-encoded element) fed a raw pointer via
      * '=', decl-init, brace field-init, field default-init, or brace array-init (fixed or view).
-     * The FAT destination is already caught by accident at these sites (a closure is a struct, so
-     * a pointer source fails the generic aggregate-store cast); a thin slot is a bare pointer, so
-     * nothing objected. Rejects only what ArgumentIsProvablyDataPointer proves, shared with the
-     * argument/return gates so the accept set cannot drift between "pass", "return", and "assign".
-     * `destDesc` is the destination as the user would write it (already quoted), e.g. "'f'" or
-     * "'s.f'" - reused for every spelling, the way WidenToClosureFatChecked's fieldDesc is.
+     * The FAT destination is already caught by accident at MOST of these sites (a closure is a
+     * struct, so a pointer source fails the generic aggregate-store cast); a thin slot is a bare
+     * pointer, so nothing objected. The two DEFAULT-VALUE spellings (field default, parameter
+     * default) are the exception - they never reach the aggregate-store cast, so they carry an
+     * explicit fat sibling, CheckFatClosureAssignProvenance, below. Rejects only what
+     * ArgumentIsProvablyDataPointer proves, shared with the argument/return gates so the accept
+     * set cannot drift between "pass", "return", and "assign". `destDesc` is the destination as
+     * the user would write it (already quoted), e.g. "'f'" or "'s.f'" - reused for every spelling,
+     * the way WidenToClosureFatChecked's fieldDesc is.
      */
     void CheckThinFnPtrAssignProvenance(llvm::Value* val, const NamedVariable& arg,
+        const std::string& destDesc) const;
+
+    /*
+     * The FAT sibling of CheckThinFnPtrAssignProvenance, check-only (no widen) like
+     * CheckClosureReturnProvenance's fat arm: a field default or parameter default never routes
+     * through WidenToClosureFatChecked (neither site widens legal fat sources today - a named-
+     * function default is a separate, pre-existing bug, out of scope here), so a provable data
+     * pointer needs its own reject here instead of inheriting one from a widen call.
+     */
+    void CheckFatClosureAssignProvenance(llvm::Value* val, const NamedVariable& arg,
         const std::string& destDesc) const;
 
     // Mirror of LowerClosureFatToThinFnPtr: widen what a fat `Lambda<>` parameter expects.

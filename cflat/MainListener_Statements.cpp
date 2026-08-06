@@ -2324,6 +2324,11 @@ void MainListener::GenerateDefaultParamOverloads(
                         if (thinDest && thinDest->IsThinFnPtr())
                             compiler->CheckThinFnPtrAssignProvenance(defaultVal, defNV,
                                 std::format("'{}'", params[i].VariableName));
+                        // Fat sibling: the parameter default never widens (see the doc
+                        // comment), so a provable data pointer needs its own reject here.
+                        else if (thinDest)
+                            compiler->CheckFatClosureAssignProvenance(defaultVal, defNV,
+                                std::format("'{}'", params[i].VariableName));
                     }
                 }
                 else if (initCtx->Default())

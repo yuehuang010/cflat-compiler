@@ -1826,6 +1826,20 @@ void LLVMBackend::CheckThinFnPtrAssignProvenance(llvm::Value* val, const NamedVa
         }
     }
 
+void LLVMBackend::CheckFatClosureAssignProvenance(llvm::Value* val, const NamedVariable& arg,
+        const std::string& destDesc) const
+{
+        if (val && val->getType()->isPointerTy() && ArgumentIsProvablyDataPointer(val, arg))
+        {
+            LogError(std::format(
+                "cannot assign {} to closure destination {}: only a named function, a "
+                "'function<>' value or a lambda converts to a closure - a data pointer "
+                "would be called as code. If the value really holds a code "
+                "address, assert it with an explicit cast: '(function<...>)value'.",
+                DescribeNonFunctionArgument(arg), destDesc));
+        }
+    }
+
 llvm::Value* LLVMBackend::WidenBareOrThinToClosureFat(llvm::Value* val)
 {
         if (auto* fn = llvm::dyn_cast<llvm::Function>(val))

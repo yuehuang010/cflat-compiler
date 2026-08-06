@@ -36,5 +36,5 @@ Whatever lands must also cover the struct-method twin (same emitter, called from
 path).
 
 Related: [[interface-issue-queue]],
-`internal/issue/p1/codegen/data-pointer-into-fat-closure-default-not-gated.md` (accept-set overlap:
-that fix must not regress or mask this one).
+the `fix/fat-default` landed record in the queue file (accept-set overlap:
+that gate must not regress or mask this issue; it verified this failure unchanged).

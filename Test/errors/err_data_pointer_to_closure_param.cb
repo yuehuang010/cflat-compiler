@@ -1941,3 +1941,41 @@ expect_error("cannot assign a 'void*' value to 'function<>' destination 'cb'") {
         return cb(1);
     }
 }
+
+/*
+ * The FAT twin of the two DEFAULT-VALUE spellings above: a fat `Lambda<>` field default or
+ * parameter default compiled clean and then called a DATA address as code (SIGSEGV/SIGBUS) -
+ * unlike every other fat destination, which is caught by accident (a closure is a struct, so a
+ * pointer source fails the generic aggregate-store cast). Neither default-value site ever
+ * widens a legal fat source today (a named-fn or thin-value FIELD default is a separate,
+ * pre-existing crash at the FIELD site only - see
+ * internal/issue/p1/codegen/fat-field-default-legal-source-not-widened.md - the PARAM site
+ * widens correctly via the call-site path), so CheckFatClosureAssignProvenance is a
+ * check-only reject, mirroring CheckThinFnPtrAssignProvenance's fat sibling in wording only.
+ */
+
+// FIELD DEFAULT spelling ('struct S { Lambda<T> f = gvp; };'): same ParseFieldDefaultInitializer
+// site as the thin leg above, now exercised with a FAT closure field.
+expect_error("cannot assign a 'void*' value to closure destination 'DpaqFatFieldDefault.f'") {
+    int dpaqFatFieldDefaultSrc = 3;
+    void* gvpFat = &dpaqFatFieldDefaultSrc;
+
+    struct DpaqFatFieldDefault { Lambda<int(int)> f = gvpFat; };
+
+    void dataPointerFieldDefaultFat()
+    {
+        DpaqFatFieldDefault s = default;
+    }
+}
+
+// PARAMETER-DEFAULT spelling ('int f(Lambda<T> cb = vp)'): same GenerateDefaultParamOverloads
+// site as the thin leg above, now exercised with a FAT closure parameter.
+expect_error("cannot assign a 'void*' value to closure destination 'cb'") {
+    int dpaqFatParamDefaultSrc = 3;
+    void* dpaqFatParamDefaultVp = &dpaqFatParamDefaultSrc;
+
+    int dataPointerParamDefaultFat(Lambda<int(int)> cb = dpaqFatParamDefaultVp)
+    {
+        return cb(1);
+    }
+}
