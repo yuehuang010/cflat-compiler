@@ -233,14 +233,18 @@ severity - re-bucket a row when the judgment changes, and move its file in the s
 
 | Bucket | Folder | Rule | Count |
 |---|---|---|---|
-| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. Split into [`p1/codegen/`](p1/codegen/) (15) and [`p1/crash/`](p1/crash/) (3). | 18 |
-| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 34 |
+| **P1** | [`p1/`](p1/) | The compiler produces a WRONG PROGRAM, or dies with no usable diagnostic. Silent wrong values, miscompiles, SIGSEGV/abort, verifier failures, missed lifetime errors. Split into [`p1/codegen/`](p1/codegen/) (15) and [`p1/crash/`](p1/crash/) (2). | 17 |
+| **P2** | [`p2/`](p2/) | Legal code is REJECTED, a feature is unavailable, or an ownership guard has a hole that does not (yet) produce a wrong value. The program does not run, but nothing lies to you. | 38 |
 | **P3** | [`p3/`](p3/) | Diagnostic quality, latent/no-repro, deliberate deferrals, and shelved attempts. Real, filed, and not blocking anyone. | 34 |
 | **UI** | [`ui/`](ui/) | Separate track - UI / Win32 / WinRT parity. Gates no compiler work; not priority-ranked against the compiler buckets. | 7 |
 
 Counts re-verified from disk on 2026-08-05 (`ls internal/issue/p1/*/*.md internal/issue/p{2,3}/*.md
-internal/issue/ui/*.md | wc -l` per bucket) on the `fix/lamptr-generic` tree:
-**18 P1 (15 codegen / 3 crash) / 34 P2 / 34 P3 / 7 UI = 93 total**. The table above had drifted
+internal/issue/ui/*.md | wc -l` per bucket) on the `fix/chain-coalesce` tree, which rebased onto
+`fix/lamptr-generic`:
+**17 P1 (15 codegen / 2 crash) / 38 P2 / 34 P3 / 7 UI = 96 total**. `fix/chain-coalesce` moved one
+P1/crash out (fixed and deleted) and filed four new P2s. On the `fix/lamptr-generic` tree
+immediately before that the same count read 18 P1 (15 / 3) / 34 P2 / 34 P3 / 7 UI = 93. The table
+above had drifted
 badly - it still read 21 P1 / 29 P2 / 32 P3, and the P1-crash figure of 6 was already wrong on
 `4c06cce`, where disk held 4. Recount with `ls` before quoting these; the prose figures below are
 a dated snapshot of an earlier round and are deliberately left as written.
@@ -512,11 +516,10 @@ produce a program.
 |---|---|---|
 | [[generic-wrapper-over-function-type-llvm-fatal]] | feature gap | `Box<function<int(int)>>` raises LLVM fatal `Cannot select: AArch64ISD::CALL` (exit 134) when the substituted field is INVOKED. Store-only may be fine - check that first. Borderline P1 (dies with no usable diagnostic); filed P2 because nothing lies to you. Filed 2026-07-31. |
 | [[list-of-function-element-into-closure-param-fails-verifier]] | diagnostic | Hard compile failure with no source diagnostic - raw module-verifier dump. Passing a `list<function<>>` element to a closure parameter fails; building the list and invoking the element directly both work. Likely shares a root with [[generic-wrapper-over-function-type-llvm-fatal]]. Filed 2026-07-31. |
-| [[chained-nullcoalesce-not-boxed-into-interface]] | false rejection | `take(z ?? y ?? a)` and `IShape j = z ?? y ?? a;` do not compile - the outer join's arm is the inner join's LOAD, which names no class. Spans EVERY position that boxes a `??` (decl-init, assignment, return, argument), so it predates the return/argument work. Fix at the ledger by splicing a nested join's arms. Filed 2026-07-31. |
 
 On the `crash/` bucket: only [[generic-wrapper-over-function-type-llvm-fatal]] is a true abort
-(LLVM fatal, exit 134). The other five exit 1 with a raw LLVM module-verifier dump and NO
-`file(line,col):` prefix. They are bucketed here on CLAUDE.md's standing convention - an LLVM
+(LLVM fatal, exit 134). The other one exits 1 with a raw LLVM module-verifier dump and NO
+`file(line,col):` prefix. Both are bucketed here on CLAUDE.md's standing convention - an LLVM
 assert, fatal, or verifier failure reachable from plain source must become a proper compiler
 error - not on a claim that they crash. Each wants a located diagnostic as its floor, whether or
 not the underlying feature gap is closed in the same change.
@@ -535,6 +538,10 @@ cost ~6 suite failures plus the core UI framework, and the latter needs cross-fu
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[as-is-does-not-recognize-nullcoalesce-join]] | false rejection | `(z ?? a) as IShape` / `is IShape` gives "requires an interface value or a class instance ... this expression is neither". NOT a chaining defect - it reproduces at chain length 1, and the `?:` spelling of the same construct WORKS. `ClassifyCastSource` in `MainListener.h` recognizes a pointer join only as a `PHINode`, and a `??` joins through a slot so its result is a `LoadInst`. Arms are recoverable via `CollectPointerJoinArms`. Note `ResolveTernaryArmClasses` does `llvm::cast<llvm::PHINode>` and must move onto the same collector in the SAME change or it asserts on the newly-admitted load. Measured identical on `4c06cce` and the chain fix. Filed 2026-08-05 by `fix/chain-coalesce`. |
+| [[nested-join-arm-unresolved-in-is-as-and-mixed-ternary]] | false rejection | The named residue of `fix/chain-coalesce`: that fix taught the two BOXING sites to recurse into a join arm that is itself a join; two other sites asking the same question were left. `ResolveTernaryArmClasses` - `is`/`as` against a CONCRETE class over a nested `?:` - and `BoxTernaryThinArmToInterface` - the thin arm of a MIXED fat/thin `?:` when that arm is a join (both in `MainListener.h`). Neither is a drop-in recursion: the first folds one i1 answer per arm and a nested arm has a SET of leaf answers; the second is called with the builder already positioned in the caller's block. Contrast that localizes it: the same chain through `as <Interface>` now works. Measured identical on `4c06cce` and the chain fix. Filed 2026-08-05 by `fix/chain-coalesce`. |
+| [[join-arm-from-call-result-not-boxed-into-interface]] | false rejection | `take(mk(0) ?? mk(3))` and `IShape j = mk(0) ?? mk(3);` do not compile - a join arm that is a direct CALL RESULT resolves to no class. NOT a chaining defect: reproduces at chain length 1, so `fix/chain-coalesce` neither caused nor closed it. `ResolvePointerElementTypeName` answers an arm from the declared type of the binding a LOAD reads, and a call result is not a load. Fix direction: answer a `CallInst` from the callee's registered return type - a widening of a RESOLUTION helper, so a miss degrades to today's bail; audit `JoinArmsKeepOwner` and the `as`/`is` readers first, where a newly-resolvable arm changes an OWNERSHIP verdict. Filed 2026-08-05 by `fix/chain-coalesce`. |
+| [[move-interface-return-of-nullcoalesce-join-not-owned]] | false rejection | `move IShape f() { unique T* a = new T(); T* z = nullptr; return z ?? a; }` is rejected "returned expression is not owned". NOT a chaining defect - reproduces at chain length 1. The whole-expression owned-return check runs BEFORE the per-arm machinery and `IsOwningValue` answers only a load off a NamedVariable, so the coalesce-SLOT load answers false. The existing `transferArmOwnership` path would answer correctly and is never consulted. Contrast: the passing `ownJoinNC` leg returns a join of two `unique` locals, which the whole-expression check does prove. Fix must WIDEN the accept side while keeping a genuinely borrowed arm rejected - build the accept-set first. Filed 2026-08-05 by `fix/chain-coalesce`. |
 | [[owning-temp-in-coalesce-fallback-arm-never-destructed]] | ownership hole | LEAK, no diagnostic, identical on `14097e1` and on the merged `fix/tempuniq`. `p ?? makeBox().t` measures `dtors=0` and reads the LIVE value: the `??` right operand is evaluated in `nullcoal_null`, which neither dominates the join nor gets the per-arm `FlushOwnedTempsSince` the `?:` arms get, so the owning temp is never destructed. The `?:` twins measure `dtors=1` and dangle, which is what makes this specific to `??`'s fallback arm rather than to joins generally. **Coupled**: `fix/tempuniq`'s join walk EXCLUDES this arm (rejecting it would refuse a correct program), so fixing the leak turns the shape into a use-after-free and must delete the arm-0-only restriction in `JoinCarriesOwningTempUniqueField` in the same change - both halves together. Same root as [[lambda-body-owning-temp-never-destructed]] and the `??=` half of [[coalesce-assign-skips-store-bookkeeping]]. Filed 2026-08-05 by `fix/tempuniq`. |
 deleted 2026-08-05), which closed the four decidable spellings and named this one undecidable at the call site: the store happens in the CALLEE, and the read-only `rd(makeBox().t)` is CORRECT code that must keep working (frozen as `temp_uniq_accept_plain_param_read` with a destructor count). `unique T*` / `move T*` parameters ARE closed - those state the claim at the call site. All four reachable shapes (free function, `list.add`, constructor argument, global-storing callee) are the one plain-`T*` parameter. Fix direction: a CALLEE-side escape fact, not a call-site predicate - `RegisterNonEscapingOwningPtrArgs` answers a close question already. P2 under the residue-not-regression precedent ([[unique-field-to-field-interface-receiver-residues]]); re-rank to P1 if the memory-unsafe-accept rubric wins. Filed 2026-08-05 by `fix/tempuniq`. |
 | [[lambda-body-owning-temp-never-destructed]] | ownership hole | LEAK, no diagnostic, identical on `6e9ab46` and the merged fix. `Lambda<Dt*()> f = () => makeDt().t;` prints `dtors=0` - the owning `Box` temp inside a lambda BODY is never registered/flushed, so its destructor never runs at all. The same body as a free function is rejected by the temp-escape gate. Not a missed guard: the lambda body does not run the statement-boundary owned-temp machinery, so the read carries no temp provenance for any guard to see. Fixing it will likely turn the leak into a use-after-free the gate then rejects - land both halves together. Filed 2026-08-04 by the round-1 review of `fix/temp-uniq-borrow`. |
@@ -4745,3 +4752,177 @@ fourth is a wording defect the branch EXPOSES on one of two arms without changin
   reachable here because this commit re-gated that arm, with the wording itself untouched. Left
   alone deliberately: editing a rejection's text is a different concern from carrying pointer
   depth, and both arms should change together.
+---
+
+## Landed: `fix/chain-coalesce` (2026-08-05) - chained and nested joins boxed into an interface
+
+Closes [[chained-nullcoalesce-not-boxed-into-interface]]. The filed issue was CHAINED `??`
+(`a ?? b ?? c`) into an interface in call-argument, decl-init and return position. The measured
+area is larger and the root cause is one predicate, not a `??` problem.
+
+**Root cause.** A join arm whose value is ITSELF a join has no concrete class.
+`ResolvePointerElementTypeName` answers an arm from the declared type of the binding a load reads;
+the result of an inner join is a load off the coalesce SLOT (for `??`) or a bare PHI (for `?:`),
+neither of which names a class. `BoxInterfaceJoinArms` then reported an unresolvable arm and
+`BoxNullCoalesceJoinArgument` bailed. Both bails were correct - no IR emitted, no wrong overload
+selected - nothing recursed.
+
+**The issue file's fix direction was measured WRONG and not followed.** It said to flatten the
+chain at the ledger, splicing an inner join's arms into the outer entry as `{a,b,c}` while
+"keeping each spliced arm's OWN predecessor block for the fat phi". The IR says that phi is
+invalid. For `Circle* p = z ?? y ?? a;` the `--no-opt` CFG is:
+
+```
+nullcoal_resume:   ; preds = %nullcoal_resume3, %nullcoal_notnull
+nullcoal_resume3:  ; preds = %nullcoal_null1, %nullcoal_notnull2
+```
+
+The inner arms live in `nullcoal_null1` / `nullcoal_notnull2`, which branch to the INNER resume
+block. They are not predecessors of the outer join point, so a flat phi over them has incoming
+edges from blocks that do not branch to it. Giving the spliced arms the outer arm's block instead
+is equally invalid - both inner arms would share one incoming block with different values.
+
+**What landed instead: recursion, not flattening.** The nested join is boxed at ITS OWN join
+point, so its fat phi lands in the block that really does branch to the outer join, and the outer
+phi takes that block. Three pieces in `cflat/MainListener.h`:
+
+- `CollectPointerJoinArms` - the arms of a join of EITHER spelling in one call (`?:` from the
+  PHI's incoming edges, `??` from `nullCoalesceJoins_`).
+- `NestedJoinArmsBoxable` - an IR-EMITTING-FREE recursive validation, so the existing "resolve
+  every arm before rewriting any" invariant survives: a later arm's failure cannot leave
+  half-boxed IR behind.
+
+The `kMaxNestedJoinDepth = 8` cap is ASYMMETRIC between the two paths and the two effective limits
+were measured, not derived. The argument path descends a whole chain inside ONE capped call, so the
+cap bounds the chain; the boxing path re-enters `NestedJoinArmsBoxable` at depth 0 once per level,
+so there the cap bounds only the per-level LOOK-AHEAD window and the chain length is not directly
+limited by it. Measured on the fix binary: argument position accepts a 10-arm chain and rejects an
+11-arm one; decl-init accepts 11 and rejects 12. Both are clean located rejections, no crash and no
+malformed IR, so the asymmetry is a cosmetic limit difference rather than a soundness issue and was
+deliberately NOT redesigned here.
+- `BoxInterfaceJoinArms` - an unresolvable arm that validates as a nested join is boxed by a
+  recursive `UpcastPointerJoinToInterface` instead of a vtable lookup it has no class for.
+
+The recursive box also THREADS the inner verdict back out (`armFailure` / `armNotOwned`). Without
+that, a `move`-interface return of a NESTED join whose inner arm is provably non-owning reported
+"bind the arm to a local variable of the class type first" - a remedy that does not work at a
+`move` return - where the length-1 spelling correctly reported the ownership diagnostic. Measured
+with one `unique` arm and one borrowed parameter arm, so the whole-expression check passes and the
+per-arm check is really reached: before the threading the nested form gave the wrong remedy and the
+length-1 form gave "returned expression is not owned"; after, both give the ownership message. It
+is a rejection on both sides either way - only the wording changed - and the underlying gap that
+makes these shapes reject at all is
+[[move-interface-return-of-nullcoalesce-join-not-owned]].
+
+`BoxNullCoalesceJoinArgument` was renamed `BoxPointerJoinArgument` and now collects LEAF arm
+classes recursively (`CollectJoinArmClasses`) and accepts either spelling. Its bail rules are
+untouched: still no boxing past ANY pointer parameter at that position, still a bail on two
+candidates offering different interfaces.
+
+**Why recursion and not flattening also matters downstream.** Four other consumers read the same
+ledger and ALREADY recurse through nested joins on their own terms - `JoinCarriesCodeValue`,
+`JoinDeliversDataValue`, `JoinCarriesOwningTempUniqueField` (arm 0 only) in `LLVMBackend.h`, and
+`JoinArmsKeepOwner` in `MainListener.h`. Flattening the ledger would have silently changed all
+four, `JoinArmsKeepOwner` most sharply: a chained join's arms would newly PROVE another owner and
+suppress a receiver's free. Recursion leaves every one of them seeing exactly what it saw before.
+
+**Per-site audit of the same predicate.** `ResolvePointerElementTypeName` has FIVE call sites
+(a repo-wide grep returns seven hits: its definition in `LLVMBackend.h` and one prose mention in a
+`BoxInterfaceJoinArms` comment are not calls). Two of the five are the new helpers
+`NestedJoinArmsBoxable` and `CollectJoinArmClasses`. `BoxInterfaceJoinArms` is fixed. The remaining
+two, plus the `as`/`is` classifier that never reaches this helper at all for a `??`, carry the same
+defect, were
+measured IDENTICAL on `4c06cce` and the fix binary, and are filed rather than fixed, because none
+is a drop-in recursion and each rejects today (so the hazard of a hasty widening is a silent wrong
+arm): the two remaining call sites `ResolveTernaryArmClasses` and
+`BoxTernaryThinArmToInterface` (both in `MainListener.h`) in
+[[nested-join-arm-unresolved-in-is-as-and-mixed-ternary]], and the `as`/`is` classifier that never
+recognizes a `??` at all in [[as-is-does-not-recognize-nullcoalesce-join]]. Two further neighbours
+found by the matrix, both reproducing at chain length 1 and so not chaining defects:
+[[join-arm-from-call-result-not-boxed-into-interface]] and
+[[move-interface-return-of-nullcoalesce-join-not-owned]].
+
+**Measured behaviour change.** Every cell below is a compile+run pair on the two Release binaries
+(`4c06cce` pre, this commit post). `4c06cce` was the merge-base when the pairs were taken; this
+commit was later rebased onto `8c5a860` (`fix/lamptr-generic`), and the whole 43-cell matrix, the
+25 leg probes and the ownership-diagnostic probes were re-run on the rebased binary and came back
+byte-identical - so the pairs above are not stale and the two lanes do not interact. Exit codes of the accept-set cells are the probes' own encoding
+of a value, not compiler exit codes.
+
+| Cell | Pre | Post |
+|------|-----|------|
+| `take(z ?? y ?? a)` (arg, len 3) | `no overload of 'take' matches` | 9 |
+| `take(z ?? y ?? x ?? a)` (arg, len 4) | `no overload of 'take' matches` | 9 |
+| `IShape j = z ?? y ?? a` (decl-init) | `cannot convert '??' arm ... cannot be determined` | 9 |
+| `IShape j = z ?? y ?? x ?? a` (decl, len 4) | same | 9 |
+| `return p ?? q ?? r` (return) | same | 9 |
+| `j = z ?? y ?? a` (assign to iface local) | same | 9 |
+| `h.s = z ?? y ?? a` (assign to iface field) | same | 9 |
+| `take(z ?? (y ?? a))` / `take((z ?? y) ?? a)` | `no overload` | 9 / 9 |
+| mixed classes in a chain (`z ?? b ?? a`) | `no overload` / `cannot convert` | 8 |
+| `nullptr` literal arm in a chain | `no overload` | 9 |
+| all-null chain into an interface | `cannot convert '??' arm` | 4 |
+| chain into a VIRTUAL method's iface param | `no overload of 'put' matches` | 9 |
+| `take(z ?? (k>0 ? a : b))` (`?:` in `??`) | `no overload` | 9 |
+| `take(k>0 ? (z ?? a) : b)` (`??` in `?:`) | `no overload` | 9 |
+| `take(k>0 ? (m>0?a:b) : b)` (pure `?:` chain) | `no overload` | 9 |
+| `IShape j = k>0 ? (m>0?a:b) : b` | `cannot convert '?:' arm` | 9 |
+| `return k>0 ? (m>0?p:q) : q` | `cannot convert '?:' arm` | 9 |
+| `take(k>0 ? a : b)` (SINGLE `?:`, arg) | `no overload of 'take' matches` | 9 |
+| `(ib(t) ? (ib(f) ? a : b) : a) as IShape` | `cannot convert '?:' arm` | 25 |
+
+Accept-set, frozen BEFORE the change and measured identical on both binaries: single `??` in arg
+/ decl / return (9, 9, 9); single all-null `??` into an interface (4); the documented `T*`-local
+workaround (9); chains NOT involving an interface - `Circle*`, `int*`, `void*` parameter, chained
+`??` return of `Circle*` (9, 9, 7, 9); a `void*` overload still beating the interface candidate at
+single AND chained length (7, 7); two candidate interfaces of which only one is implemented by
+every arm (`g(IShape)` / `g(IOther)` with `Circle` arms) at SINGLE `??` length, which selects
+`g(IShape)` and prints 1 on BOTH binaries; and a chain arm whose class implements no candidate
+interface still rejected.
+
+**No accept-set cell changed.** An earlier draft of this record claimed one did - that the two
+candidate-interface cell went from `no overload of 'g' matches` to selecting correctly. That claim
+was FALSE and is retracted. The probe behind it was chain-length THREE, so its pre-fix rejection
+was the ordinary chain rejection and it belongs with the reject-to-accept cells above, not with
+the accept set. Re-measured in isolation, the SINGLE-`??` spelling of the same program already
+printed 1 on `4c06cce`, and the diff does not touch the target-selection loop. This is the
+sibling-inference error `internal/fix-issue-lessons.md` warns about under "On claims of
+equivalence between two binaries": an accept-set claim was read off a cell one axis away from the
+one the claim was about.
+
+**Direction of the change.** Every cell moves from REJECT to ACCEPT; the diff adds no rejection.
+That is why the differential sweep is the favourable-polarity evidence here rather than the weak
+half - there is no new guard for a corpus to fail to cross.
+
+**Verification.** `test.sh Release`: 600 passed, 0 failed, 8 skipped. `example_mac.sh Release`:
+35 passed, 0 failed. `test_lsp.sh Release`: 152 passed, 0 failed. Differential corpus sweep over
+every `.cb` in `Test/` and `example/` at the MASTER sources (so the test-file diff cannot pollute
+it), compiling AND running with both binaries - 447 files: **0 behavioural differences** across the
+441 deterministic files.
+
+The COMPOSITION of that sweep is weaker than the file count suggests, and is stated here so nobody
+reads more into it than it carries. 157 rows are compile-rejections (signature = the normalized
+diagnostic text). The other 290 rows had a successful compile and were then run, but they break
+down as: 208 `Test/errors/` fixtures (79 exit 0, 76 exit 133 SIGTRAP, and **53 exit 127 - no binary
+was ever produced, so those 53 contribute only "compile succeeded" and nothing about runtime**),
+and just 82 ordinary programs (60 exit 0, 14 exit 1, 6 example timeouts at the 60s cap, 1 abort,
+1 exit 49). So roughly SIXTY non-error programs actually ran to a clean completion. The
+zero-difference conclusion stands for what it covers; it is not evidence about the 53 that
+produced no binary. The 6 excluded
+(`Test/test_hpc.cb`, `example/hpc/{lu_bench,mc_pi,nbody,poisson_cg}.cb`,
+`example/macos/sysinfo_mac.cb`) print timings and were proven nondeterministic by running the PRE
+binary TWICE before diffing, not assumed. The sweep harness was shown non-vacuous by dropping a
+known-differing file into the swept tree and confirming it was reported as a difference.
+
+**Coverage.** `Test/test_move.cb` gained 25 value legs in `testUniqueInterfaceTernary` -
+`iface_ncchain_*`, `iface_tern_in_nc_*`, `iface_nc_in_tern_*`, `iface_ternchain_*`,
+`iface_tern_single_arg` - across chain length (2/3/4), position (decl-init, argument, return,
+assignment), arm kind (nullable local, null literal, mixed concrete classes), explicit
+parenthesization, and both spellings nested in each other. Every leg asserts a VALUE and each
+selects a DIFFERENT arm with a different `area()`, so no leg can pass off another arm's box. All
+25 were mutation-tested individually against the `4c06cce` binary and each fails there for the
+reason its position implies - `no overload of 'takeJoinIface'` in argument position, `cannot
+convert '??' arm` / `cannot convert '?:' arm` elsewhere. The first cut of that mutation test was
+INVALID and was redone: every probe carried the `pickJoinNC3` helper in its header, so all 25
+"failures" were the header failing to compile, not the leg. Per-leg headers made the pre-fix
+diagnostics vary by position, which is the evidence that each probe reaches the arm it names.

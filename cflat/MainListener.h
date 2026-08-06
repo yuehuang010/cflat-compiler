@@ -12845,6 +12845,98 @@ public:
     };
 
     /*
+     * The arms of a pointer JOIN of either spelling, or empty when `value` is not a join. A '?:'
+     * is a PHI whose incoming edges ARE the arms; a '??' joins through a slot, so its arms are
+     * unrecoverable from the IR and come from the lowering's ledger.
+     */
+    std::vector<InterfaceJoinArm> CollectPointerJoinArms(llvm::Value* value) const
+    {
+        std::vector<InterfaceJoinArm> arms;
+        if (auto* phi = llvm::dyn_cast_or_null<llvm::PHINode>(value))
+        {
+            if (!phi->getType()->isPointerTy()) return arms;
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+                arms.push_back({ phi->getIncomingValue(i), phi->getIncomingBlock(i) });
+            return arms;
+        }
+        if (auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(value))
+        {
+            if (!load->getType()->isPointerTy()) return arms;
+            if (const auto* join = compilerLLVM->FindNullCoalesceJoin(load))
+                for (const auto& arm : join->Arms) arms.push_back({ arm.Value, arm.Block });
+        }
+        return arms;
+    }
+
+    static constexpr int kMaxNestedJoinDepth = 8;
+
+    /*
+     * Can every LEAF arm of a NESTED join be boxed into `interfaceName`? An arm that is itself a
+     * join - `a ?? b ?? c` (which parses as `a ?? (b ?? c)`), `x ? (y ? p : q) : r`, or either
+     * spelling nested in the other - has no concrete class of its own, so the flat resolve loop
+     * in BoxInterfaceJoinArms cannot name it. This answers for the whole subtree WITHOUT emitting
+     * IR, because a partial rewrite would leave half-boxed IR behind on a later arm's failure.
+     *
+     * Deliberately NOT a ledger-flattening of the chain into one arm list: the arms of an inner
+     * '??' live in blocks that branch to the INNER resume block, so they are not predecessors of
+     * the outer join point and a flat phi over them is invalid IR. The nested join is boxed in
+     * its own resume block instead - see the recursion in BoxInterfaceJoinArms.
+     */
+    bool NestedJoinArmsBoxable(llvm::Value* value, const std::string& interfaceName,
+                               std::string* armFailure, int depth = 0)
+    {
+        if (depth > kMaxNestedJoinDepth) return false;
+        auto arms = CollectPointerJoinArms(value);
+        if (arms.empty()) return false;
+        for (const auto& arm : arms)
+        {
+            if (arm.Value == nullptr || arm.Block == nullptr) return false;
+            if (arm.Block->getTerminator() == nullptr) return false;
+            if (llvm::isa<llvm::ConstantPointerNull>(arm.Value)) continue;
+            std::string name = compilerLLVM->ResolvePointerElementTypeName(arm.Value);
+            if (name.empty())
+            {
+                if (!NestedJoinArmsBoxable(arm.Value, interfaceName, armFailure, depth + 1))
+                    return false;
+                continue;
+            }
+            if (!compilerLLVM->StructImplementsInterface(name, interfaceName))
+            {
+                if (armFailure != nullptr)
+                    *armFailure = std::format("'{}' does not implement it", name);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /*
+     * Every LEAF arm's concrete class of a join, recursing into arms that are themselves joins.
+     * False when an arm resolves to neither a registered data structure nor a boxable join, which
+     * is the accept-nothing direction: the caller then leaves the argument untouched.
+     */
+    bool CollectJoinArmClasses(llvm::Value* value, std::vector<std::string>& out, int depth = 0)
+    {
+        if (depth > kMaxNestedJoinDepth) return false;
+        auto arms = CollectPointerJoinArms(value);
+        if (arms.empty()) return false;
+        for (const auto& arm : arms)
+        {
+            if (arm.Value == nullptr) return false;
+            if (llvm::isa<llvm::ConstantPointerNull>(arm.Value)) continue;
+            std::string name = compilerLLVM->ResolvePointerElementTypeName(arm.Value);
+            if (!name.empty())
+            {
+                if (!compilerLLVM->IsDataStructure(name)) return false;
+                out.push_back(name);
+                continue;
+            }
+            if (!CollectJoinArmClasses(arm.Value, out, depth + 1)) return false;
+        }
+        return true;
+    }
+
+    /*
      * Box the arms of a pointer JOIN ('?:' or '??') into an interface fat pointer. A join carries
      * no NamedVariable TypeName, so the ordinary upcast is skipped and a raw `ptr` would be bitcast
      * into the fat struct type - invalid IR. Box each arm inside the arm's OWN block, which also
@@ -12878,6 +12970,7 @@ public:
         if (count == 0 || joinPoint == nullptr || interfaceName.empty()) return nullptr;
         // Resolve every arm first: a partial rewrite would leave half-boxed IR behind.
         std::vector<std::string> armTypes(count);
+        std::vector<bool> armIsNestedJoin(count, false);
         for (unsigned i = 0; i < count; i++)
         {
             llvm::Value* incoming = arms[i].Value;
@@ -12886,9 +12979,20 @@ public:
             armTypes[i] = compiler->ResolvePointerElementTypeName(incoming);
             if (armTypes[i].empty())
             {
+                // The arm is itself a JOIN (a chained '??', or either spelling nested in the
+                // other), so it has no class of its own - box it recursively in its own block.
+                std::string nestedFailure;
+                if (NestedJoinArmsBoxable(incoming, interfaceName, &nestedFailure)
+                    && arms[i].Block->getTerminator() != nullptr)
+                {
+                    armIsNestedJoin[i] = true;
+                    continue;
+                }
                 if (armFailure != nullptr)
-                    *armFailure = "the arm's concrete class cannot be determined; bind the arm to a "
-                                  "local variable of the class type first";
+                    *armFailure = nestedFailure.empty()
+                        ? "the arm's concrete class cannot be determined; bind the arm to a "
+                          "local variable of the class type first"
+                        : nestedFailure;
                 return nullptr;
             }
             if (!compiler->StructImplementsInterface(armTypes[i], interfaceName))
@@ -12923,6 +13027,34 @@ public:
         std::vector<llvm::Value*> boxed(count, nullptr);
         for (unsigned i = 0; i < count; i++)
         {
+            if (armIsNestedJoin[i])
+            {
+                // Boxed at the NESTED join's own join point, so its fat phi lands in the block
+                // that really branches here - arms[i].Block is that block, and it dominates it.
+                std::string nestedFailure;
+                bool nestedNotOwned = false;
+                llvm::Value* nested = UpcastPointerJoinToInterface(
+                    arms[i].Value, interfaceName, &nestedFailure, nullptr, transferArmOwnership,
+                    &nestedNotOwned);
+                if (nested == nullptr)
+                {
+                    compiler->builder->SetInsertPoint(savedBlock, savedPoint);
+                    // Propagate the INNER verdict: a not-owned inner arm must reach the caller as
+                    // the ownership diagnostic, not as the useless "bind it to a local" remedy.
+                    if (nestedNotOwned)
+                    {
+                        if (armNotOwned != nullptr) *armNotOwned = true;
+                    }
+                    else if (armFailure != nullptr)
+                        *armFailure = nestedFailure.empty()
+                            ? "the arm's concrete class cannot be determined; bind the arm "
+                              "to a local variable of the class type first"
+                            : nestedFailure;
+                    return nullptr;
+                }
+                boxed[i] = nested;
+                continue;
+            }
             if (armTypes[i].empty())
             {
                 boxed[i] = llvm::Constant::getNullValue(fatTy);
@@ -13072,13 +13204,15 @@ public:
     }
 
     /*
-     * A '??' join in ARGUMENT position. The join lowers through a SLOT, so its result is a plain
-     * load with no TypeName - and the overload scorer's interface clause needs one to score a class
-     * against an interface parameter, so `take(z ?? a)` was a false rejection before any boxing
-     * could run. The target interface is not known until overload selection, so resolve it HERE
-     * from the candidate parameters at this position: the one interface every arm's class
-     * implements. Then box per arm (each arm boxes in its own block with its own vtable, so
-     * mixed-class arms work) and hand the scorer a genuine INTERFACE argument.
+     * A pointer JOIN of either spelling in ARGUMENT position. A join carries no TypeName - the
+     * '??' spelling lowers through a SLOT so its result is a plain load, and the '?:' spelling is
+     * a bare PHI - and the overload scorer's interface clause needs one to score a class against
+     * an interface parameter, so `take(z ?? a)` was a false rejection before any boxing could run.
+     * The target interface is not known until overload selection, so resolve it HERE from the
+     * candidate parameters at this position: the one interface every arm's class implements. Then
+     * box per arm (each arm boxes in its own block with its own vtable, so mixed-class arms work)
+     * and hand the scorer a genuine INTERFACE argument. Arms that are THEMSELVES joins (a chained
+     * '??', a join nested in a join arm) recurse - their class comes from their own leaf arms.
      *
      * Deliberately NOT a bare TypeName stamp of the arms' class. Measured when this was written:
      * stamping the CLASS made a by-value `f(Circle c)` parameter score a PERFECT match on a
@@ -13103,26 +13237,17 @@ public:
      * false rejection this whole helper exists to remove. A by-value class parameter cannot take a
      * pointer at all, so there is nothing to steal there; a pointer parameter can, so there is.
      */
-    llvm::Value* BoxNullCoalesceJoinArgument(
+    llvm::Value* BoxPointerJoinArgument(
         const std::vector<const LLVMBackend::TypeAndValue*>& paramsAtPosition,
         llvm::Value* argValue, std::string& ifaceNameOut)
     {
         auto* compiler = compilerLLVM;
-        auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(argValue);
-        if (load == nullptr || !load->getType()->isPointerTy()) return nullptr;
-        const auto* join = compiler->FindNullCoalesceJoin(load);
-        if (join == nullptr) return nullptr;
+        if (argValue == nullptr || !argValue->getType()->isPointerTy()) return nullptr;
 
-        // Every arm's concrete class, so "implements" can be asked of all of them at once.
+        // Every LEAF arm's concrete class, so "implements" can be asked of all of them at once.
+        // Recurses through nested joins, whose result carries no class of its own.
         std::vector<std::string> armClasses;
-        for (const auto& arm : join->Arms)
-        {
-            if (arm.Value == nullptr) return nullptr;
-            if (llvm::isa<llvm::ConstantPointerNull>(arm.Value)) continue;
-            std::string name = compiler->ResolvePointerElementTypeName(arm.Value);
-            if (name.empty() || !compiler->IsDataStructure(name)) return nullptr;
-            armClasses.push_back(name);
-        }
+        if (!CollectJoinArmClasses(argValue, armClasses)) return nullptr;
         if (armClasses.empty()) return nullptr;
 
         std::string target;
@@ -13143,7 +13268,7 @@ public:
         if (target.empty()) return nullptr;
 
         std::string armFailure;
-        llvm::Value* fat = UpcastNullCoalesceToInterface(load, target, &armFailure);
+        llvm::Value* fat = UpcastPointerJoinToInterface(argValue, target, &armFailure);
         if (fat == nullptr) return nullptr;
         ifaceNameOut = target;
         return fat;
@@ -24466,7 +24591,7 @@ public:
                                         std::vector<const LLVMBackend::TypeAndValue*> paramsHere{
                                             &(*ifaceParams)[declaredIdx[argIdx]] };
                                         std::string joinIface;
-                                        if (auto* fat = BoxNullCoalesceJoinArgument(paramsHere, argValue, joinIface))
+                                        if (auto* fat = BoxPointerJoinArgument(paramsHere, argValue, joinIface))
                                         {
                                             argVar.Primary = fat;
                                             argVar.BaseType = fat->getType();
@@ -24992,7 +25117,7 @@ public:
                                                     && declaredIdx[argIdx] < (int64_t)cand.Parameters.size())
                                                     paramsHere.push_back(&cand.Parameters[declaredIdx[argIdx]]);
                                         std::string joinIface;
-                                        if (auto* fat = BoxNullCoalesceJoinArgument(paramsHere, argValue, joinIface))
+                                        if (auto* fat = BoxPointerJoinArgument(paramsHere, argValue, joinIface))
                                         {
                                             argVar.Primary = fat;
                                             argVar.BaseType = fat->getType();

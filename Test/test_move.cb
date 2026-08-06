@@ -2339,6 +2339,15 @@ IShapeMove pickJoinNC(CiMove* p, CiMove* q) { return p ?? q; }
 IShapeMove pickJoinMixed(CiMove* p, SqMove* q) { return p ?? q; }
 int takeJoinIface(IShapeMove s) { return s.area(); }
 
+// CHAINED joins in RETURN position. `p ?? q ?? r` parses as `p ?? (q ?? r)`, so the outer join's
+// right arm is the INNER join's result - a value with no concrete class of its own.
+IShapeMove pickJoinNC3(CiMove* p, CiMove* q, CiMove* r) { return p ?? q ?? r; }
+IShapeMove pickJoinTernChain(CiMove* p, CiMove* q, CiMove* r, bool k, bool m)
+{
+    return k ? (m ? p : q) : r;
+}
+IShapeMove pickJoinTernInNC(CiMove* p, CiMove* q, CiMove* r, bool k) { return p ?? (k ? q : r); }
+
 interface IJoinRunner { int run(IShapeMove s); };
 class JoinRunner : IJoinRunner { int run(IShapeMove s) { return s.area(); } };
 
@@ -2884,6 +2893,110 @@ int testUniqueInterfaceTernary()
         passed += Test("iface_nullcoalesce_arg_int_ptr_preferred", joinIntPref(mNull ?? mA), 401);
         delete mA;
         delete mB;
+    }
+
+    /*
+     * CHAINED joins into an interface. `a ?? b ?? c` parses as `a ?? (b ?? c)`, so the outer
+     * join's right arm is the INNER join's result - a load off the inner slot with no concrete
+     * class, which ResolvePointerElementTypeName cannot name. Every position below was rejected
+     * before: argument as "no overload of 'takeJoinIface' matches", the rest as "cannot convert
+     * '??' arm to interface: the arm's concrete class cannot be determined".
+     *
+     * The arms are NOT flattened into one arm list: the inner arms' blocks branch to the INNER
+     * resume block, so they are not predecessors of the outer join point and a flat phi over them
+     * is invalid IR. The inner join is boxed in its own resume block and the outer phi takes THAT
+     * block. Each leg below selects a DIFFERENT arm and every arm carries a different area, so no
+     * leg can pass off another arm's box - which is what makes them non-vacuous: a compile-only
+     * check cannot tell a correct fix from one that boxes the wrong arm.
+     */
+    {
+        CiMove* c1 = new CiMove(); c1->r = 2;      // area 9
+        CiMove* c2 = new CiMove(); c2->r = 30;     // area 37
+        CiMove* c3 = new CiMove(); c3->r = 100;    // area 107
+        CiMove* c4 = new CiMove(); c4->r = 50;     // area 57
+        CiMove* cNull = nullptr;
+
+        // Declaration initializer, chain length 3 - each of the three arms selected in turn.
+        IShapeMove d1 = cNull ?? cNull ?? c3;
+        IShapeMove d2 = cNull ?? c2 ?? c3;
+        IShapeMove d3 = c1 ?? c2 ?? c3;
+        passed += Test("iface_ncchain_decl_third_arm",  d1.area(), 107);
+        passed += Test("iface_ncchain_decl_second_arm", d2.area(), 37);
+        passed += Test("iface_ncchain_decl_first_arm",  d3.area(), 9);
+
+        // Chain length 4: the recursion has to descend two levels, not just one.
+        IShapeMove d4 = cNull ?? cNull ?? cNull ?? c4;
+        passed += Test("iface_ncchain_decl_len4_fourth_arm", d4.area(), 57);
+
+        // Call-argument position, where the target interface is resolved from the candidate set
+        // before boxing - so the recursive class collection has to reach the LEAF arms.
+        passed += Test("iface_ncchain_arg_third_arm",  takeJoinIface(cNull ?? cNull ?? c3), 107);
+        passed += Test("iface_ncchain_arg_second_arm", takeJoinIface(cNull ?? c2 ?? c3), 37);
+        passed += Test("iface_ncchain_arg_len4",       takeJoinIface(cNull ?? cNull ?? cNull ?? c4), 57);
+
+        // Return position.
+        passed += Test("iface_ncchain_return_third_arm",  pickJoinNC3(cNull, cNull, c3).area(), 107);
+        passed += Test("iface_ncchain_return_second_arm", pickJoinNC3(cNull, c2, c3).area(), 37);
+        passed += Test("iface_ncchain_return_first_arm",  pickJoinNC3(c1, c2, c3).area(), 9);
+
+        // Assignment to an EXISTING interface local - a different boxing site from decl-init.
+        IShapeMove asg = default;
+        asg = cNull ?? c2 ?? c3;
+        passed += Test("iface_ncchain_assign_second_arm", asg.area(), 37);
+
+        // An explicitly parenthesized LEFT sub-chain: `(a ?? b) ?? c` nests the join in the
+        // outer join's LEFT arm, the mirror of the shape the grammar produces on its own.
+        IShapeMove pl = (cNull ?? c2) ?? c3;
+        passed += Test("iface_ncchain_paren_left_second_arm", pl.area(), 37);
+        passed += Test("iface_ncchain_paren_left_arg", takeJoinIface((cNull ?? cNull) ?? c3), 107);
+
+        delete c1; delete c2; delete c3; delete c4;
+    }
+
+    /*
+     * MIXED classes across a chain, and the two join spellings NESTED IN EACH OTHER. A nested arm
+     * is boxed by whichever spelling it is, so `??` inside `?:` and `?:` inside `??` both work and
+     * the arms need not share a class - each leaf arm gets its own vtable in its own block. The
+     * '?:'-in-'?:' legs carry NO '??' at all: the same defect reached a pure ternary chain, which
+     * is why this is not filed as a '??' bug. `identityBool` keeps the condition out of reach of
+     * constant folding, so both arms are really emitted.
+     */
+    {
+        CiMove* nA = new CiMove(); nA->r = 2;      // area 9
+        CiMove* nB = new CiMove(); nB->r = 30;     // area 37
+        SqMove* nS = new SqMove(); nS->s = 6;      // area 36
+        CiMove* nNull = nullptr;
+
+        // Chain whose surviving arm is a DIFFERENT concrete class from the earlier arms.
+        IShapeMove mx = nNull ?? nNull ?? nS;
+        passed += Test("iface_ncchain_mixed_class_decl", mx.area(), 36);
+        passed += Test("iface_ncchain_mixed_class_arg", takeJoinIface(nNull ?? nNull ?? nS), 36);
+
+        // '?:' nested inside a '??' arm.
+        IShapeMove t1 = nNull ?? (identityBool(true) ? nA : nB);
+        IShapeMove t2 = nNull ?? (identityBool(false) ? nA : nB);
+        passed += Test("iface_tern_in_nc_decl_true",  t1.area(), 9);
+        passed += Test("iface_tern_in_nc_decl_false", t2.area(), 37);
+        passed += Test("iface_tern_in_nc_arg", takeJoinIface(nNull ?? (identityBool(false) ? nA : nS)), 36);
+        passed += Test("iface_tern_in_nc_return", pickJoinTernInNC(nNull, nA, nB, false).area(), 37);
+
+        // '??' nested inside a '?:' arm.
+        IShapeMove t3 = identityBool(true) ? (nNull ?? nB) : nA;
+        passed += Test("iface_nc_in_tern_decl", t3.area(), 37);
+        passed += Test("iface_nc_in_tern_arg", takeJoinIface(identityBool(true) ? (nNull ?? nS) : nA), 36);
+
+        // A pure '?:' CHAIN - no '??' anywhere - in decl, argument and return position.
+        IShapeMove t4 = identityBool(true) ? (identityBool(false) ? nA : nB) : nA;
+        passed += Test("iface_ternchain_decl", t4.area(), 37);
+        passed += Test("iface_ternchain_arg",
+                       takeJoinIface(identityBool(true) ? (identityBool(false) ? nA : nS) : nA), 36);
+        passed += Test("iface_ternchain_return", pickJoinTernChain(nA, nB, nA, true, false).area(), 37);
+
+        // A SINGLE '?:' in ARGUMENT position: the argument-side boxing helper only ever handled
+        // the '??' spelling, so this was a "no overload" rejection too - not a chain at all.
+        passed += Test("iface_tern_single_arg", takeJoinIface(identityBool(false) ? nA : nB), 37);
+
+        delete nA; delete nB; delete nS;
     }
 
     /*
@@ -4975,7 +5088,7 @@ extern int main()
     total += 8;
 
     passed += testUniqueInterfaceTernary();
-    total += 152;
+    total += 177;
 
     passed += testTernaryInterfaceInheritanceRebox();
     total += 22;
