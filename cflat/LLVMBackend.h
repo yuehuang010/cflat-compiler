@@ -4472,8 +4472,16 @@ private:
             {
                 // move struct parameter: alloca a slot so the destructor runs on scope exit
                 auto* structTy = GetType(*itr_nameArg, nullptr, false);
-                auto* alloc = builder->CreateAlloca(structTy, nullptr, itr_nameArg->VariableName);
-                builder->CreateStore(&arg, alloc);
+                // An unresolved generic leaves a registered-but-unsized shell; allocating it
+                // asserts inside LLVM ("Cannot getTypeInfo() on a type that is unsized!").
+                // Give the slot a sized placeholder and skip the store, but keep BaseType as the
+                // shell so member lookup still fails where it should - the accurate diagnostic is
+                // the downstream one, and pre-empting it here would report a worse error.
+                bool unsizedShell = structTy != nullptr && structTy->isStructTy() && !structTy->isSized();
+                auto* slotTy = unsizedShell ? (llvm::Type*)builder->getInt8Ty() : structTy;
+                auto* alloc = builder->CreateAlloca(slotTy, nullptr, itr_nameArg->VariableName);
+                if (!unsizedShell)
+                    builder->CreateStore(&arg, alloc);
                 NamedVariable namedVar{
                     .TypeAndValue = *itr_nameArg,
                     .BaseType = structTy,
@@ -4488,8 +4496,12 @@ private:
                 // Struct value parameter: store into an alloca so its address is available
                 // (e.g. for reflect(), GEP field access, and taking &param).
                 auto* structTy = GetType(*itr_nameArg);
-                auto* alloc = builder->CreateAlloca(structTy, nullptr, itr_nameArg->VariableName);
-                builder->CreateStore(&arg, alloc);
+                // Same unsized-shell handling as the move-struct arm above.
+                bool unsizedShell = structTy != nullptr && structTy->isStructTy() && !structTy->isSized();
+                auto* slotTy = unsizedShell ? (llvm::Type*)builder->getInt8Ty() : structTy;
+                auto* alloc = builder->CreateAlloca(slotTy, nullptr, itr_nameArg->VariableName);
+                if (!unsizedShell)
+                    builder->CreateStore(&arg, alloc);
                 NamedVariable namedVar{
                     .TypeAndValue = *itr_nameArg,
                     .BaseType = structTy,
