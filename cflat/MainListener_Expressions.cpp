@@ -5860,11 +5860,14 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
             if (clo->IsThinFnPtr())
                 compiler->CheckThinFnPtrAssignProvenance(val, nv,
                     std::format("'{}.{}'", structName, field.VariableName));
-            // Fat sibling: the field default never widens (see CheckFatClosureAssignProvenance's
-            // doc comment), so a provable data pointer needs its own reject here.
+            // Fat sibling: reject a provable data pointer first (LogError throws, so a
+            // rejected source never reaches the widen), then widen a legal bare/thin source.
             else
-                compiler->CheckFatClosureAssignProvenance(val, nv,
-                    std::format("'{}.{}'", structName, field.VariableName));
+            {
+                std::string destDesc = std::format("'{}.{}'", structName, field.VariableName);
+                compiler->CheckFatClosureAssignProvenance(val, nv, destDesc);
+                val = compiler->WidenBareOrThinToClosureFat(val);
+            }
         }
         return val;
     }

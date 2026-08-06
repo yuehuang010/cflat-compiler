@@ -518,7 +518,6 @@ produce a program.
 
 | Issue | Family | Severity |
 |---|---|---|
-| [[fat-field-default-legal-source-not-widened]] | memory-unsafe accept | A LEGAL closure source (named fn OR thin `function<>` value) as a fat `Lambda<>` FIELD default compiles clean and SIGSEGVs at the call - `ParseFieldDefaultInitializer` stores the bare code pointer with no `{code,null}` wrap. Parameter-default site unaffected (widens via the call-site path). Pre-existing on `28ef745`; found by `fix/fat-default` Phase A, scope widened by its review. Filed 2026-08-07. |
 | [[shape-mismatched-funcptr-arg-binds-silently]] | miscompile | Silent miscompile then SIGBUS (exit 138), no diagnostic. A `function<T>*` binds where a plain `function<T>` value is expected; the scorer now detects the shape mismatch but still lowers the mismatched arm when no better-shaped candidate exists. Filed 2026-07-31. |
 | [[extern-decl-drops-fixed-array-return-size]] | silent wrong ABI | `extern char[8] extmk();` compiles clean on BOTH `ca5a02a` and `fix/array-storage` - the `[8]` is dropped and the declaration binds to a symbol returning one `char`. The by-value fixed-array-return reject landed on the DEFINITION path only; this is the one remaining spelling of that axis. Not a regression. Filed 2026-08-02. |
 | [[string-literal-containing-braces-retyped-as-string]] | miscompile + false rejection | A string literal whose CONTENT contains a brace pair (`"a = {} b"`) is typed `string` instead of `char*`. At a call it stops every `char*` overload matching and the diagnostic blames the call; at a VARIADIC it is a SILENT MISCOMPILE - `printf("a = {} b\n");` compiles and runs rc 0 printing binary garbage, and the dedicated `cannot pass 'string' to the variadic '...'` guard does not fire. Identical on both binaries. Filed 2026-08-02 in `p2/` for the rejection face; the miscompile face may warrant P1. |
@@ -611,6 +610,7 @@ deleted 2026-08-05), which closed the four decidable spellings and named this on
 | [[zero-parameter-generic-function-emits-double-mangled-symbol]] | link failure | `int gid<T>() { T v = default; return 7; }` called as `gid<P>()` fails to link: `undefined symbol: __gid__P_gid__P__`, the instantiation name applied twice. One value parameter is enough to make the same shape work (`gone<P>(5)` runs), and inference works (`gtwo(p)` runs) - it is the ZERO-value-parameter generic function called with an explicit type argument. Not diagnosed. Measured identical on `f24fb18` and on `fix/sizeof-closure`; unrelated to that fix, found on its probe run. Filed 2026-08-06. |
 | [[closure-type-argument-to-a-generic-function]] | feature gap | A closure type as a generic FUNCTION's type argument does not resolve, in either spelling: explicit `idf<function<int(int)>>(g)` gives `unknown type 'function<int(int)>'` reported on the TEMPLATE's parameter list, and inferred `idf(g)` mangles the argument from its LLVM repr and instantiates `idf__i8`. The generic STRUCT path funnels through `ResolveTypeArgEntry` and works (`Box<Lambda<...>>`, `list<function<...>>`, and after `fix/lamptr-generic` also `Box<function<T>*>`); this path appears not to, so the fat/thin pointer asymmetry that landed there does not reach it. Non-closure control `idf<int*>(&n)` works on both binaries. Measured identical on `4c06cce` and on the merged `fix/lamptr-generic`. Filed 2026-08-05 by `fix/lamptr-generic`. |
 | [[union-closure-member-call-crashes-compiler]] | compiler crash | Calling a closure member of a `union` SIGSEGVs the COMPILER (fat member; thin twin dies in module verification with an invalid whole-union bitcast), even for a legal named-fn source. The union member-default path also runs neither assign-provenance gate (unreachable at runtime today). Pre-existing; found by `fix/fat-default` review. Filed 2026-08-07. |
+| [[fixed-array-default-skips-field-initializers]] | silent wrong value / crash | Stack `S[N] a = default;` zero-fills and skips every element field initializer - `0 0` where the field default says `7 7`, SIGSEGV when the skipped field is a closure - while `new S[N]` and single `S s = default;` run them. Pre-existing; found by `fix/fat-widen` review. Filed 2026-08-07. |
 | [[defaulted-ctor-param-default-construct-aborts]] | compiler crash | Default-constructing a `class`/`struct` whose only ctor has ALL parameters defaulted crashes the COMPILER at compile time - the `-o` compile itself nondeterministically exits `134`, `139`, or `1` with an internal "declared with no enclosing scope" diagnostic; no executable is ever produced. Also fails on the explicit-argument spelling (`CDef d = CDef(7);`). Identical on `master` (33b3ac4, 134 8/8) and `fix/class-undef` (63107e2); not a regression from that fix. Root cause not traced. Found by the round-1 review of `fix/class-undef`. |
 | [[fixed-array-field-brace-default-discarded]] | miscompile | A FIXED-ARRAY field's own `= {1,2,3}` default brace list is silently discarded - `struct Outer { int[3] a = {1,2,3}; };` reads `0 0 0`, while the identical LOCAL declarator `int[3] a = {1,2,3};` prints `1 2 3`. Same family as the fixed [[struct-field-default-brace-list-discarded]] (landed record below) and deliberately left out of it: the list is POSITIONAL and needs an `[N x T]` aggregate builder, not `EmitFieldInitializer`, and the existing `EmitPositionalFixedArrayInit` registers an array LOCAL so it cannot be reused as-is. The neighbouring POINTER-field spelling (`Inner* p = {x=1};`) reads `nullptr` silently and probably wants the declarator's rejection instead. Measured identical on `68c78fc` and `fix/field-brace`. Filed 2026-08-06 by `fix/field-brace`. |
 | [[lambda-literal-param-default-invalid-ir]] | compile failure | A lambda literal as a PARAMETER default emits invalid IR (`Module verification failed: Found return instr that returns non-void in Function of void return type`); the same literal as a local decl-init works. Pre-existing on `68c78fc`; lives in `GenerateDefaultParamOverloads`, the emitter the `fix/assign-gate` amend touched. Found by round-3 review of `fix/assign-gate`. Filed 2026-08-06. |
@@ -5900,7 +5900,9 @@ problem - a named-function parameter default is forwarded as a call argument to 
 inner call, which already widens correctly through the existing `LowerByValueArg` /
 `WidenToClosureFatChecked` path at the call site, confirmed unchanged pre/post (compiles clean,
 returns the correct value both before and after this fix). `CheckFatClosureAssignProvenance`
-therefore only rejects; it never widens, at either site.
+itself still only rejects - it never widens on its own - but the FIELD-default call site now
+follows it with an explicit widen call, closing [[fat-field-default-legal-source-not-widened]];
+see `fix/fat-widen`'s landed record below for the follow-up and its measured matrix.
 
 Accept-set matrix, measured on both the PRE and POST binaries (identical unless noted): named-fn
 field default (SIGSEGV both, pre-existing bug, confirmed unchanged, out of scope), named-fn
@@ -6107,3 +6109,104 @@ bails with `if (fieldType == nullptr) return nullptr;`, so `struct H { I h = { a
 and on this branch (exit 5 / exit 0 both sides). Appended as a new neighbouring-cell section to
 [[fixed-array-field-brace-default-discarded]] (P2), which already owns the field-default family,
 rather than opening a fourth file for one emitter. Its fix is the same helper.
+### fix/fat-widen - the FIELD-default site now widens a legal fat closure source, LANDED
+
+Fixed and deleted [[fat-field-default-legal-source-not-widened]]. `fix/fat-default` deliberately
+left the FIELD-default site's legal accept set broken (named fn / thin `function<>` value into a
+`Lambda<>` field default compiled clean and SIGSEGVed, exit 139) because implementing the widen
+without measuring its blast radius would have been exactly the kind of unmeasured fix the skill
+forbids - so it was filed instead. This round does the widen.
+
+Fix: `MainListener::ParseFieldDefaultInitializer` (`MainListener_Expressions.cpp` ~5845-5858) -
+the fat `else` branch (sibling of the existing thin `CheckThinFnPtrAssignProvenance` branch) now
+reads:
+
+```cpp
+std::string destDesc = std::format("'{}.{}'", structName, field.VariableName);
+compiler->CheckFatClosureAssignProvenance(val, nv, destDesc);
+val = compiler->WidenBareOrThinToClosureFat(val);
+```
+
+`CheckFatClosureAssignProvenance` is unchanged and still runs FIRST: it `LogError`s (which
+throws / exits, per the "LogError is a control-flow edge" lesson) on a provable data pointer, so
+`WidenBareOrThinToClosureFat` never executes for a rejected source - the reject and the widen
+share the ordering the call-site path (`WidenToClosureFatChecked`) already encodes, just spelled
+as two calls instead of one so the existing reject wording (and its `err_data_pointer_to_closure_param.cb`
+legs) stays byte-identical. `WidenBareOrThinToClosureFat` is the same helper the call-site argument
+path already uses: a named function becomes `{shim, null}`, a thin `function<>` value becomes
+`{code, null}`, and an already-fat value or non-pointer passes through untouched - so a
+member-access source that reads an already-fat field needs no wrapping and is a no-op here, matched
+by measurement (see below). The returned value is what every caller already stores into the field
+(`MainListener_Aggregates.cpp` field-default and brace/positional-aggregate emitters), so no caller
+changed.
+
+Accept-set matrix, measured PRE (`a7bdc31`, throwaway worktree, removed after use) vs POST:
+- named-fn struct field default: PRE compiles clean, SIGSEGV (exit 139, no output before flush);
+  POST compiles clean, returns 31 for `s.f(30)`.
+- thin `function<>` VALUE struct field default: PRE SIGSEGV, POST returns 31. Confirms the bug was
+  not named-fn-specific, per the issue file.
+- `Lambda<>` VALUE struct field default (regression guard): PRE and POST both return 31,
+  byte-identical - already fat, `WidenBareOrThinToClosureFat` is a no-op on it.
+- `nullptr` field default (regression guard): PRE and POST both compile and read back null.
+- named-fn CLASS field default (separate default-ctor emitter): PRE SIGSEGV, POST returns 31.
+- named-fn NESTED struct field default (`Outer.inn.f`): PRE SIGSEGV, POST returns 31.
+- named-fn field default via `S s;` (no `= default`) vs `S s = default;`: both spellings PRE
+  SIGSEGV, POST returns 31 - identical to the `= default` spelling.
+- named-fn field default on a HEAP instance (`new S()`): PRE SIGSEGV, POST returns 31.
+- thin `function<>` FIELD default with a named-fn source (already thin, no widen needed): PRE and
+  POST both return 31, byte-identical - unaffected, confirms the thin sibling branch was never
+  broken.
+- explicit `(function<...>)value` cast escape hatch as a field default source: PRE and POST both
+  compile clean; the reject exemption (`IsDataValueCodeCast`) is unchanged, but the emitted IR is
+  NOT identical - PRE silently DROPPED the asserted address (`ret %D zeroinitializer`), POST emits
+  the real `insertvalue` pair, so the escape hatch now does what its diagnostic advertises
+  (review round 1 measured the IR delta; a strict improvement, recorded per the equivalence rule).
+- `?:` join of two `Lambda<>` VALUES as a field default source: PRE and POST both compile and
+  return the correct arm's value (31) - already fat on both arms, so nothing to widen. The
+  NAMED-FUNCTION-arm join (`k > 0 ? addOne : addTwo` as the default) was 139 PRE and 31 POST -
+  a cell this fix genuinely repairs (review round 1 measured it), not a never-broken one.
+- generic-encoded fat field default fed a bare named function (`struct G<T> { T item = fwAddOne;
+  }; G<Lambda<int(int)>> g = default;`) - the axis the issue file flagged as "if expressible": PRE
+  SIGSEGV, POST returns 31. `GetEncodedClosureType` routes the encoded element through the same
+  branch, so the generic axis needed no separate code path.
+- member-access source (`gh.g` reading an already-initialized `Lambda<>` field) as a field default:
+  PRE and POST both compile and return the correct value (31) - `val` arrives already struct-typed
+  (fat), so the `!val->getType()->isStructTy()` guard on the widen branch never fires; this axis
+  was never in the bug's blast radius. (A GLOBAL-scope struct instance's OWN field defaults do not
+  run at all - `S g = default;` zero-initializes by design, per the compiler's own diagnostic on a
+  global brace-init attempt - so this leg reads the source through a struct whose field was set by
+  an explicit assignment before the read, not through a global's own unrun field-default chain;
+  that zero-init-only behavior is pre-existing, applies identically to a plain `int` field, and is
+  unrelated to and unchanged by this fix. Review round 1 found the FIXED-ARRAY spelling shares it:
+  `S[2] a = default;` also skips every field initializer - silent zeros for an `int` field, and a
+  SIGSEGV when the skipped field is a closure (139 PRE and POST, unchanged) - while `new S[2]`
+  DOES run them and IS fixed by this commit, so the two array spellings diverge; filed as
+  `internal/issue/p2/fixed-array-default-skips-field-initializers.md`.)
+- capturing-lambda-literal FIELD default: PRE and POST both fail identically with "Module
+  verification failed: Found return instr that returns non-void in Function of void return type" -
+  unchanged, per [[lambda-literal-param-default-invalid-ir]] (still open, out of scope here, as the
+  issue file required).
+- data-pointer (`void*`) field default (provenance reject, must keep rejecting): PRE and POST both
+  reject with the byte-identical `CheckFatClosureAssignProvenance` wording ("cannot assign a
+  'void*' value to closure destination ..."), confirmed by re-running
+  `Test/errors/err_data_pointer_to_closure_param.cb` (all existing `expect_error` blocks, including
+  its two default-value legs from `fix/fat-default`, still PASS on POST).
+- union closure member field default (out of scope, [[union-closure-member-call-crashes-compiler]]):
+  PRE and POST both SIGSEGV the COMPILER identically (exit 139, no diagnostic) on the fat repro from
+  that issue file - untouched, as that file requires.
+- PARAMETER-default site (both source kinds, must stay unchanged - this fix does not touch
+  `GenerateDefaultParamOverloads`): PRE and POST both compile and return the correct value (31),
+  byte-identical.
+
+Test legs: `Test/test_function_ptr.cb` gained `testFatFieldDefaultWidensLegalSource` (named-fn
+struct field default, thin-value field default, `Lambda<>`-value regression guard, `nullptr`
+regression guard, named-fn class field default, named-fn generic-encoded field default - 6
+`Test()` value assertions), registered in `main`. Proven to fail on the PRE binary (`a7bdc31`,
+throwaway worktree, removed after use): compiling `Test/test_function_ptr.cb` with the new legs
+against PRE compiles clean and the whole suite binary SIGSEGVs (exit 139) at the first new leg,
+before any output flushes (stdout is fully buffered when not a tty) - matching the isolated
+single-leg repros above. Passes 73/73 on POST.
+
+`./cmake_build.sh release && bash test.sh Release` - 600 passed, 0 failed, 8 skipped.
+`bash example_mac.sh Release` - 35 passed, 0 failed. One commit, `git rev-list --count
+a7bdc31..HEAD` = 1.

@@ -3059,6 +3059,53 @@ bool testClosureByValueGenericArg()
     return result;
 }
 
+// A legal closure source (named fn or thin function<> value) as a fat Lambda<> FIELD default
+// was stored unwidened - the raw code pointer landed straight in the {code, env} struct with
+// no wrap, so the call read garbage env and crashed. See
+// internal/issue/interface-issue-queue.md, fix/fat-widen landed record.
+int fwAddOne(int x) { return x + 1; }
+function<int(int)> fwThinAddOne = fwAddOne;
+Lambda<int(int)> fwLamAddOne = fwAddOne;
+struct FwFieldDefaultNamedFn { Lambda<int(int)> f = fwAddOne; };
+struct FwFieldDefaultThinVal { Lambda<int(int)> f = fwThinAddOne; };
+struct FwFieldDefaultLamVal  { Lambda<int(int)> f = fwLamAddOne; };
+struct FwFieldDefaultNull    { Lambda<int(int)> f = nullptr; };
+class  FwFieldDefaultNamedFnClass { Lambda<int(int)> f = fwAddOne; };
+// Generic-encoded fat field default fed a bare named function - the same widen must apply
+// through the encoded-element path GetEncodedClosureType resolves.
+struct FwGenericFieldDefault<T> { T item = fwAddOne; };
+
+bool testFatFieldDefaultWidensLegalSource()
+{
+    bool result = true;
+
+    // Named function as a struct field default - pre-fix: compiles clean, SIGSEGVs at the call.
+    FwFieldDefaultNamedFn s1 = default;
+    result &= Test("fwfd_named_fn_struct", s1.f(30), 31);
+
+    // Thin function<> VALUE as a struct field default - same bug, not named-fn-specific.
+    FwFieldDefaultThinVal s2 = default;
+    result &= Test("fwfd_thin_value_struct", s2.f(30), 31);
+
+    // Lambda<> value source - already worked pre-fix; must stay byte-identical.
+    FwFieldDefaultLamVal s3 = default;
+    result &= Test("fwfd_lambda_value_regression", s3.f(30), 31);
+
+    // nullptr default - already worked pre-fix; must stay byte-identical.
+    FwFieldDefaultNull s4 = default;
+    result &= Test("fwfd_nullptr_regression", s4.f == nullptr ? 1 : 0, 1);
+
+    // Named function as a CLASS field default - the class default-ctor emitter is separate.
+    FwFieldDefaultNamedFnClass s5 = default;
+    result &= Test("fwfd_named_fn_class", s5.f(30), 31);
+
+    // Named function into a generic-substituted fat field default.
+    FwGenericFieldDefault<Lambda<int(int)>> s6 = default;
+    result &= Test("fwfd_named_fn_generic", s6.item(30), 31);
+
+    return result;
+}
+
 bool testGenericFuncPtrProducer()
 {
     bool result = true;
@@ -3231,6 +3278,10 @@ extern int main()
     // Test/errors/err_lambda_array_view.cb)
     total++; passed += testThinFuncPtrGenericArg()         ? 1 : 0;
     total++; passed += testClosureByValueGenericArg()      ? 1 : 0;
+
+    // Fat Lambda<> FIELD default widening: a legal bare/thin source is stored {code, null},
+    // not the raw pointer that crashed the call (fix/fat-widen).
+    total++; passed += testFatFieldDefaultWidensLegalSource() ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

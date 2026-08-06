@@ -4312,10 +4312,11 @@ public:
 
     /*
      * The FAT sibling of CheckThinFnPtrAssignProvenance, check-only (no widen) like
-     * CheckClosureReturnProvenance's fat arm: a field default or parameter default never routes
-     * through WidenToClosureFatChecked (neither site widens legal fat sources today - a named-
-     * function default is a separate, pre-existing bug, out of scope here), so a provable data
-     * pointer needs its own reject here instead of inheriting one from a widen call.
+     * CheckClosureReturnProvenance's fat arm: a parameter default never routes through
+     * WidenToClosureFatChecked, so a provable data pointer needs its own reject here instead
+     * of inheriting one from a widen call. The FIELD default site (ParseFieldDefaultInitializer)
+     * calls this too, but follows it with an explicit WidenBareOrThinToClosureFat - see
+     * [[fat-field-default-legal-source-not-widened]] in interface-issue-queue.md.
      */
     void CheckFatClosureAssignProvenance(llvm::Value* val, const NamedVariable& arg,
         const std::string& destDesc) const;
