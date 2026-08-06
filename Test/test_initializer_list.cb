@@ -57,6 +57,28 @@ class CSide : IArea { int side; int Area() { return side * side; } };
 class COwn     { string s; int n; };                       // owning field: null, then teardown
 struct CBox<T> { T v; int tag; };                          // class inside a generic container
 
+// ===== a struct FIELD whose OWN default is a brace list =====
+// Pre-fix every default-ctor emitter read only `initializer->assignmentExpression()` and
+// `initializer->Default()`, so a brace-list field default matched neither arm and the field
+// was left at the zero seed. Every leg below reads 0 on the pre-fix binary.
+struct FbIn    { int x; int y; };
+struct FbSeed  { int x = 7; int y = 8; int w = 9; };       // inner scalar defaults of its own
+struct FbEq    { FbIn i = { x = 1, y = 2 }; int z; };      // the '=' spelling
+struct FbBare  { FbIn i { x = 3, y = 4 }; int z; };        // the BARE spelling: list on initDeclarator
+struct FbPart  { FbSeed s = { x = 1 }; };                  // partial list: y/w keep FbSeed's defaults
+struct FbEmpty { FbSeed s = {}; };                         // accept set: '{}' still default-constructs
+class  FbClass { FbIn i = { x = 5, y = 6 }; int z; };      // class twin of FbEq
+struct FbNest  { FbEq o; int w; };                         // brace-defaulted field one level down
+struct FbBox<T>{ T v; };                                   // generic container over FbEq
+struct FbCtor  { FbIn i = { x = 1, y = 2 }; int z; FbCtor() { z = 7; } };  // user no-arg ctor
+interface IFbArea { int FbArea(); };
+class FbIface : IFbArea { FbIn i = { x = 1, y = 2 }; int FbArea() { return i.x * 1000 + i.y; } };
+struct FbList  { list<int> l = { 1, 2, 3 }; };             // container-typed field default
+int fbBumped = 0;
+int fbBump() { fbBumped = fbBumped + 1; return 41; }
+struct FbSide  { FbIn i = { x = fbBump(), y = 2 }; };      // the call must run exactly once
+FbEq fbGlobal = default;                                   // globals skip the ctor - still zero
+
 int cNoCtorSum(CNoCtor v) { return v.a + v.b + v.c + v.d; }      // pass by value
 CNoCtor cNoCtorMake()     { CNoCtor t; return t; }               // return by value
 
@@ -314,6 +336,84 @@ extern int main()
     CBox<CNoCtor> cbx;
     total++; passed += Test("class no-ctor inside generic zero",
                             cbx.v.a + cbx.v.b + cbx.v.c + cbx.v.d + cbx.tag, 0);
+
+    // ===== brace-list field defaults =====
+    // Every sum below is x*1000+y, so a zero-filled or garbage field cannot produce it.
+    FbEq fbe;
+    total++; passed += Test("field brace default eq spelling", fbe.i.x * 1000 + fbe.i.y, 1002);
+    // Accept set - identical on both binaries: a brace list naming 'i' must not disturb 'z'.
+    total++; passed += Test("field brace default leaves other fields zero", fbe.z, 0);
+
+    // The bare spelling carries its list on initDeclarator, not on an initializer - a separate
+    // grammar node, and the one the global-positional family was bitten by.
+    FbBare fbb;
+    total++; passed += Test("field brace default bare spelling", fbb.i.x * 1000 + fbb.i.y, 3004);
+
+    // Partial list: only x is named, so y and w must keep FbSeed's OWN scalar defaults (8, 9).
+    // 189 is unreachable both from a zero fill (000) and from ignoring the list (789).
+    FbPart fbp;
+    total++; passed += Test("field brace default partial keeps inner defaults",
+                            fbp.s.x * 100 + fbp.s.y * 10 + fbp.s.w, 189);
+
+    // Accept set - identical on both binaries: '{}' has no list and must still default-construct.
+    FbEmpty fbem;
+    total++; passed += Test("field brace default empty still default constructs",
+                            fbem.s.x * 100 + fbem.s.y * 10 + fbem.s.w, 789);
+
+    FbClass fbc;
+    total++; passed += Test("field brace default class twin", fbc.i.x * 1000 + fbc.i.y, 5006);
+
+    // One level down: FbNest has no initializer at all, so FbEq's ctor has to be called and
+    // carry the brace default with it.
+    FbNest fbn;
+    total++; passed += Test("field brace default nested container",
+                            fbn.o.i.x * 1000 + fbn.o.i.y + fbn.w, 1002);
+
+    FbBox<FbEq> fbx;
+    total++; passed += Test("field brace default inside generic", fbx.v.i.x * 1000 + fbx.v.i.y, 1002);
+
+    // A user-written no-arg ctor is a separate emitter (a store into 'this', not an insertvalue
+    // into a returned aggregate) and needs the same seeding before the ctor body runs.
+    FbCtor fbct;
+    total++; passed += Test("field brace default user no-arg ctor",
+                            fbct.i.x * 1000 + fbct.i.y + fbct.z, 1009);
+
+    FbIface fbi;
+    IFbArea fbia = fbi;
+    total++; passed += Test("field brace default through interface slot", fbia.FbArea(), 1002);
+
+    // A container-typed field default routes through the add() desugaring, not field-init.
+    FbList fbl;
+    int fblSum = 0;
+    for (int fbk = 0; fbk < fbl.l.count(); fbk = fbk + 1) { fblSum = fblSum + fbl.l.get(fbk); }
+    total++; passed += Test("field brace default container count", fbl.l.count(), 3);
+    total++; passed += Test("field brace default container values", fblSum, 6);
+
+    // A call in a brace-list field default must run exactly once per construction.
+    FbSide fbs;
+    total++; passed += Test("field brace default call value", fbs.i.x * 1000 + fbs.i.y, 41002);
+    total++; passed += Test("field brace default call runs once", fbBumped, 1);
+
+    // Instantiation axis - all four spellings run the same synthesized ctor.
+    FbEq fbeB = {};
+    total++; passed += Test("field brace default via empty brace", fbeB.i.x * 1000 + fbeB.i.y, 1002);
+    FbEq fbeD = default;
+    total++; passed += Test("field brace default via default", fbeD.i.x * 1000 + fbeD.i.y, 1002);
+    FbEq* fbeH = new FbEq();
+    total++; passed += Test("field brace default via new", fbeH->i.x * 1000 + fbeH->i.y, 1002);
+    delete fbeH;
+    FbEq[3] fbeArr;
+    total++; passed += Test("field brace default in array element",
+                            fbeArr[0].i.x * 1000 + fbeArr[2].i.y, 1002);
+    // A container brace-init that does NOT name i must not wipe i's own default.
+    FbEq fbeZ = { z = 5 };
+    total++; passed += Test("field brace default survives outer brace init",
+                            fbeZ.i.x * 1000 + fbeZ.i.y + fbeZ.z, 1007);
+
+    // Frozen, NOT fixed here: a global never runs the ctor at all, so it still reads zero.
+    // That is global-struct-no-initializer-ignores-field-defaults, identical on both binaries.
+    total++; passed += Test("field brace default at global scope still zero",
+                            fbGlobal.i.x * 1000 + fbGlobal.i.y, 0);
 
     if (passed == total)
     {

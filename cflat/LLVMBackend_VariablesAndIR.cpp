@@ -860,6 +860,7 @@ std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
             storage.BitOffset = 0;
             storage.StorageFieldIndex = 0;
             storage.Initializer = nullptr;  // zeroed by default; per-bitfield init handled at field-init time
+            storage.BraceInitializer = nullptr;
             storage.Annotations.clear();
             storage.GuardedBy.clear();
             out.push_back(storage);

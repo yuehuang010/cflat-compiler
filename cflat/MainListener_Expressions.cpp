@@ -5812,6 +5812,46 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
         return val;
     }
 
+CFlatParser::InitializerListContext* MainListener::FieldDefaultBraceList(
+        const LLVMBackend::DeclTypeAndValue& field) {
+        if (field.Initializer != nullptr)
+            return field.Initializer->initializerList();
+        return field.BraceInitializer;
+    }
+
+/*
+ * Build the value of a field whose default is a brace list. Mirrors the local declarator:
+ * seed the slot with the field type's OWN default (so its scalar field defaults survive a
+ * partial list), then let the named field-inits / container add() calls overwrite on top.
+ */
+llvm::Value* MainListener::ParseFieldDefaultBraceInitializer(
+        const std::string& structName,
+        const LLVMBackend::DeclTypeAndValue& field,
+        CFlatParser::InitializerListContext* list) {
+        auto* compiler = Compiler(list);
+        // Only a by-value struct/union/class/container field can hold a brace list here. A
+        // pointer, view or fixed-array field keeps its existing handling untouched.
+        if (field.Pointer || field.ElemPointer || field.IsArrayView || field.ConstArraySize > 0)
+            return nullptr;
+        auto* fieldType = compiler->GetDataStructure(field.TypeName).StructType;
+        if (fieldType == nullptr) return nullptr;
+
+        llvm::Value* slot = compiler->CreateAlloca(fieldType);
+        llvm::Value* seed = nullptr;
+        // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk here
+        // would call a same-named sibling type's constructor.
+        if (compiler->GetFunction(field.TypeName))
+            seed = compiler->CreateOverloadedFunctionCall(field.TypeName, {}, true);
+        if (seed == nullptr || seed->getType() != fieldType)
+            seed = llvm::Constant::getNullValue(fieldType);
+        compiler->builder->CreateStore(seed, slot);
+
+        if (!TryEmitContainerInitializer(slot, field, list))
+            EmitFieldInitializer(slot, field.TypeName, list);
+        return compiler->builder->CreateLoad(
+            fieldType, slot, structName + "_" + field.VariableName + "_braceinit");
+    }
+
 void MainListener::RejectCodeValueIntoDataSlot(antlr4::ParserRuleContext* ctx,
                                      const LLVMBackend::NamedVariable& src,
                                      const LLVMBackend::TypeAndValue& dest,

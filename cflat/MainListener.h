@@ -3731,6 +3731,19 @@ public:
         CFlatParser::AssignmentExpressionContext* ae);
 
     /*
+     * The brace-list spelling of a field default (`Inner i = { x = 1 };` and the bare
+     * `Inner i { x = 1 };`). Returns null when the list is not one this path can apply, in
+     * which case the caller keeps its pre-existing no-initializer handling.
+     */
+    CFlatParser::InitializerListContext* FieldDefaultBraceList(
+        const LLVMBackend::DeclTypeAndValue& field);
+
+    llvm::Value* ParseFieldDefaultBraceInitializer(
+        const std::string& structName,
+        const LLVMBackend::DeclTypeAndValue& field,
+        CFlatParser::InitializerListContext* list);
+
+    /*
      * Code-value store gate for the AGGREGATE spellings the declarator, assignment and return
      * sites never see: a brace field initializer, a positional fixed-array or view element, a
      * global array element, and a struct field DEFAULT. `dest` is the SLOT's type - for an array

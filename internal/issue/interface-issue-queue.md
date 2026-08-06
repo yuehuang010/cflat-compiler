@@ -293,7 +293,8 @@ was already 10 P1 / 34 P2 / 26 P3 - drifted from unrelated fixes/filings between
 this round, never caught because nothing had re-verified the table since). Net movement this
 round: one P1 fixed and deleted ([[global-struct-positional-init-silently-zeroes]]), and four
 new issues filed in its place - three P2 (`class-no-ctor-default-construct-returns-undef`,
-[[struct-field-default-brace-list-discarded]], [[interface-typed-global-brace-init-discarded]])
+[[struct-field-default-brace-list-discarded]] (since FIXED and deleted - see the `fix/field-brace`
+landed record below), [[interface-typed-global-brace-init-discarded]])
 and one P3 ([[global-struct-no-initializer-ignores-field-defaults]]). All four were found by
 review of that P1's fix, not by the original investigation - the same pattern this file has
 recorded before (see the 2026-08-01 paragraph above).
@@ -519,7 +520,6 @@ produce a program.
 | [[shape-mismatched-funcptr-arg-binds-silently]] | miscompile | Silent miscompile then SIGBUS (exit 138), no diagnostic. A `function<T>*` binds where a plain `function<T>` value is expected; the scorer now detects the shape mismatch but still lowers the mismatched arm when no better-shaped candidate exists. Filed 2026-07-31. |
 | [[extern-decl-drops-fixed-array-return-size]] | silent wrong ABI | `extern char[8] extmk();` compiles clean on BOTH `ca5a02a` and `fix/array-storage` - the `[8]` is dropped and the declaration binds to a symbol returning one `char`. The by-value fixed-array-return reject landed on the DEFINITION path only; this is the one remaining spelling of that axis. Not a regression. Filed 2026-08-02. |
 | [[string-literal-containing-braces-retyped-as-string]] | miscompile + false rejection | A string literal whose CONTENT contains a brace pair (`"a = {} b"`) is typed `string` instead of `char*`. At a call it stops every `char*` overload matching and the diagnostic blames the call; at a VARIADIC it is a SILENT MISCOMPILE - `printf("a = {} b\n");` compiles and runs rc 0 printing binary garbage, and the dedicated `cannot pass 'string' to the variadic '...'` guard does not fire. Identical on both binaries. Filed 2026-08-02 in `p2/` for the rejection face; the miscompile face may warrant P1. |
-| [[struct-field-default-brace-list-discarded]] | miscompile | A struct FIELD's own `= { x = 1, y = 2 }` default brace list is silently discarded when the containing struct is default-constructed - the field lands all-zero instead. Found auditing the same fix for neighbouring shapes; different code path (a field's default expression, not a variable declarator). Filed 2026-08-02. |
 | [[interface-typed-global-brace-init-discarded]] | miscompile | `I gi = { a = 1 };` on an interface-typed global compiles clean with the brace list silently dropped, no diagnostic. The `fix/global-positional` guard (that P1 is fixed and deleted; see its landed record below) cannot see it - `GetDataStructure("I").StructType` is null for an interface name, so this falls through unguarded. Found by review of that fix. Filed 2026-08-02. |
 | [[temp-unique-field-escapes-through-a-plain-pointer-parameter]] | memory-unsafe accept | Silent use-after-free, compiles clean and exits 0, identical on `14097e1` and on the merged `fix/tempuniq`. `keep(makeBox().t)` where `void keep(Node* n) { g = n; }` reads a freed block (proven by dtor count + reallocation aliasing; the `MallocScribble` fill shows only on ld64.lld-linked builds`. The DECLARED remainder of `temp-unique-field-escapes-through-unguarded-spellings` (closed and
 | [[same-statement-cast-launders-join-code-evidence]] | memory-unsafe accept | Silent exit 138: `two((void*)ro, c ? ro : n)` - a data cast of a NAMED function anywhere in a statement launders every other mention of that function in the SAME statement, because the launder is keyed on `llvm::Value*` alone and a named function is one shared constant. Cross-statement and cross-function are closed (`fix/joinledger`); only the same-statement window remains. P2 under the residue-not-regression precedent ([[unique-field-to-field-interface-receiver-residues]]) - the spelling was accepted before the fix too; re-rank to P1 if the memory-unsafe-accept rubric wins. Fix direction: occurrence keying (value + syntactic cast site). Filed 2026-08-05 by review round 2 of `fix/joinledger`. |
@@ -611,6 +611,7 @@ deleted 2026-08-05), which closed the four decidable spellings and named this on
 | [[zero-parameter-generic-function-emits-double-mangled-symbol]] | link failure | `int gid<T>() { T v = default; return 7; }` called as `gid<P>()` fails to link: `undefined symbol: __gid__P_gid__P__`, the instantiation name applied twice. One value parameter is enough to make the same shape work (`gone<P>(5)` runs), and inference works (`gtwo(p)` runs) - it is the ZERO-value-parameter generic function called with an explicit type argument. Not diagnosed. Measured identical on `f24fb18` and on `fix/sizeof-closure`; unrelated to that fix, found on its probe run. Filed 2026-08-06. |
 | [[closure-type-argument-to-a-generic-function]] | feature gap | A closure type as a generic FUNCTION's type argument does not resolve, in either spelling: explicit `idf<function<int(int)>>(g)` gives `unknown type 'function<int(int)>'` reported on the TEMPLATE's parameter list, and inferred `idf(g)` mangles the argument from its LLVM repr and instantiates `idf__i8`. The generic STRUCT path funnels through `ResolveTypeArgEntry` and works (`Box<Lambda<...>>`, `list<function<...>>`, and after `fix/lamptr-generic` also `Box<function<T>*>`); this path appears not to, so the fat/thin pointer asymmetry that landed there does not reach it. Non-closure control `idf<int*>(&n)` works on both binaries. Measured identical on `4c06cce` and on the merged `fix/lamptr-generic`. Filed 2026-08-05 by `fix/lamptr-generic`. |
 | [[defaulted-ctor-param-default-construct-aborts]] | compiler crash | Default-constructing a `class`/`struct` whose only ctor has ALL parameters defaulted crashes the COMPILER at compile time - the `-o` compile itself nondeterministically exits `134`, `139`, or `1` with an internal "declared with no enclosing scope" diagnostic; no executable is ever produced. Also fails on the explicit-argument spelling (`CDef d = CDef(7);`). Identical on `master` (33b3ac4, 134 8/8) and `fix/class-undef` (63107e2); not a regression from that fix. Root cause not traced. Found by the round-1 review of `fix/class-undef`. |
+| [[fixed-array-field-brace-default-discarded]] | miscompile | A FIXED-ARRAY field's own `= {1,2,3}` default brace list is silently discarded - `struct Outer { int[3] a = {1,2,3}; };` reads `0 0 0`, while the identical LOCAL declarator `int[3] a = {1,2,3};` prints `1 2 3`. Same family as the fixed [[struct-field-default-brace-list-discarded]] (landed record below) and deliberately left out of it: the list is POSITIONAL and needs an `[N x T]` aggregate builder, not `EmitFieldInitializer`, and the existing `EmitPositionalFixedArrayInit` registers an array LOCAL so it cannot be reused as-is. The neighbouring POINTER-field spelling (`Inner* p = {x=1};`) reads `nullptr` silently and probably wants the declarator's rejection instead. Measured identical on `68c78fc` and `fix/field-brace`. Filed 2026-08-06 by `fix/field-brace`. |
 
 ### P3 - diagnostics, latent, deliberate deferrals (`p3/`)
 
@@ -2481,7 +2482,8 @@ found by review and all worth recording explicitly rather than leaving implicit 
 or the review rounds of this fix, all confirmed to reproduce identically on `master`):
 `class-no-ctor-default-construct-returns-undef` (a `class` with no user constructor
 default-constructs to `undef`, unrelated code path; FIXED by `fix/class-undef`, record below), [[struct-field-default-brace-list-discarded]]
-(a struct FIELD's own brace-list default is dropped, not a variable declarator), and
+(a struct FIELD's own brace-list default is dropped, not a variable declarator; since FIXED by
+`fix/field-brace`, record below), and
 [[interface-typed-global-brace-init-discarded]] (an interface-typed global falls through this
 fix's guard entirely, since `GetDataStructure` has no entry for an interface name) - plus the
 pre-existing [[global-struct-no-initializer-ignores-field-defaults]] (a global with NO
@@ -2598,7 +2600,10 @@ Also confirmed NOT reachable, with the measurement rather than an argument: `S* 
 brace spelling was already rejected by `fix/global-positional`; a struct FIELD default
 (`struct W { S* q = {a=1}; };`) silently discards the list and is the already-filed
 [[struct-field-default-brace-list-discarded]], a different path that never calls
-`EmitFieldInitializer`.
+`EmitFieldInitializer`. **Superseded in part:** `fix/field-brace` (record below) fixed that path
+for by-value struct/class/container fields by routing them THROUGH `EmitFieldInitializer`; the
+POINTER-field spelling quoted here is the one cell it deliberately left untouched, and it still
+silently reads `nullptr` - now tracked by [[fixed-array-field-brace-default-discarded]].
 
 Bar (measured on the round-2 commit, rebased onto master `7f41a15`): `./test.sh Release` 574 passed /
 0 failed / 8 skipped against master's own 572/0/8 - +2 for the one new errors file, which the suite
@@ -2850,7 +2855,10 @@ agree, which is the whole point of half 1.
 **Out of scope, with the reason.** A struct FIELD default (`struct H { S* p = {}; };`) discards the
 brace list entirely for POINTER and NON-POINTER fields alike - `S s = {a=1}` in a field yields the
 field defaults, not `1` - which is the already-filed
-[[struct-field-default-brace-list-discarded]], a different path. `new T{}` and `f({})` are PARSE
+[[struct-field-default-brace-list-discarded]], a different path. **Superseded in part:**
+`fix/field-brace` (record below) fixed the NON-POINTER half of that sentence - a by-value struct
+field default `S s = {a=1}` now yields `1`; only the POINTER half is still discarded. `new T{}`
+and `f({})` are PARSE
 errors (both grammar rules require a non-empty `initializerList`), so the `new` and named-argument
 `EmitFieldInitializer` callers cannot see an empty brace at all; confirmed from `CFlat.g4`, not
 inferred. A non-pointer `{}` on a GLOBAL struct zero-fills rather than running field defaults
@@ -5521,3 +5529,202 @@ individually: every one exits 1 on the PRE binary (merge-base `33b3ac4`) with "e
 did not occur", and every one exits 0 with `PASS: expected error received` on the POST binary,
 firing the return-flavoured wording - proving each leg is non-vacuous on its own, not merely as
 the first failure in a longer file.
+
+---
+
+## Landed: `fix/field-brace` (2026-08-06) - a struct FIELD's own `= { ... }` default brace list is applied, not discarded
+
+Closes and deletes `internal/issue/p1/codegen/struct-field-default-brace-list-discarded.md`.
+
+### Root cause - the issue file's hypothesis was in the right area but named the wrong function
+
+The file guessed `GenerateDefaultValue`. `GenerateDefaultValue` is never reached: the five
+default-constructor emitters route a field's default expression themselves, and each one asks
+only two questions of the field's `InitializerContext`:
+
+```cpp
+if (auto* ae = initializer->assignmentExpression()) ...
+else if (initializer->Default()) ...
+```
+
+`CFlat.g4:521` gives `initializer` THREE alternatives - `assignmentExpression`,
+`'{' initializerList? ','? '}'`, and `Default`. The brace-list alternative matched neither arm,
+so `rvalue` stayed null and the field fell into the "no initializer" fallback: for a struct-typed
+field that calls the field type's own default ctor (all-zero for `Inner {int x; int y;}`), for a
+scalar it leaves the zero seed. Nothing dropped the list *late*; it was never read at all.
+
+The scalar-default ORACLE was verified independently before being matched: `struct S {int a = 9;
+int b;}` emits `ret %S { i32 9, i32 0 }` and prints `a=9 b=0` on the PRE binary. It is honoured
+because `int a = 9` IS an `assignmentExpression`.
+
+### The second brace SPELLING - the trap this family has now sprung twice
+
+`CFlat.g4:286` `initDeclarator` has a third alternative, `declarator '{' initializerList? ','? '}'`,
+so `Inner i { x = 1, y = 2 };` at FIELD position is grammatical and hangs its list on
+`initDeclarator`, where `typeValue.Initializer` is null. Gating the fix on
+`initializer->initializerList()` alone would have left that spelling reproducing the closed bug -
+exactly the hole `fix/global-positional` shipped and had to re-open. Measured PRE: `= { x=1,y=2 }`
+gives `x=0 y=0` and `{ x=1,y=2 }` gives `x=0 y=0`; POST: `1 2` and `3 4` respectively (leg
+`field brace default bare spelling`, discriminator 3004).
+
+`DeclTypeAndValue` therefore gained `BraceInitializer` (`LLVMBackend.h`), set from
+`initDecl->initializerList()` in `MainListener_Declarations.cpp`, and `FieldDefaultBraceList()`
+resolves the two spellings to one list.
+
+### Fix shape
+
+`MainListener::ParseFieldDefaultBraceInitializer` (`MainListener_Expressions.cpp`) mirrors the
+LOCAL declarator, which is the working reference for the same construct:
+
+1. Bail (return null, caller keeps its existing handling) when the field is a pointer, an
+   `ElemPointer`, an array view or a fixed array.
+2. Bail when `GetDataStructure(TypeName).StructType` is null - a primitive or an unsubstituted
+   generic parameter.
+3. Otherwise alloca the field type, SEED it with the field type's own default ctor result
+   (`GetFunction` exact-key guard, `forceRoot`), falling back to `getNullValue`.
+4. `TryEmitContainerInitializer` if the field is a `list`/`array`/`dictionary`, else
+   `EmitFieldInitializer`.
+5. Load the slot; the caller `CreateInsertValue`s it into the returned aggregate (or stores it
+   through `this` at the user-ctor site).
+
+Step 3 is what makes a PARTIAL list correct rather than merely non-zero: `struct FbSeed {int x=7;
+int y=8; int w=9;}` under `FbSeed s = { x = 1 }` must read `1 8 9`, not `1 0 0` and not `7 8 9`.
+The leg's discriminator `x*100 + y*10 + w == 189` is unreachable from either wrong answer.
+
+### Site audit - all five field-default readers
+
+| Site | What it emits | After the fix |
+|---|---|---|
+| `MainListener_Aggregates.cpp` struct/union ctor (~262) | insertvalue into a returned aggregate | honours brace lists (the UNION arm returns `getNullValue` and never reads field initializers at all - unchanged, `c3` identical on both binaries) |
+| `MainListener_Aggregates.cpp` imported-`program` ctor (~1796) | same | unreachable: this emitter's `declList` is entirely synthetic (no user-declared fields), so `FieldDefaultBraceList` never has a field to fire on; wired for symmetry with the other four sites |
+| `MainListener_Aggregates.cpp` `program` ctor (~2125) | same | honours brace lists |
+| `MainListener_Aggregates.cpp` class ctor (~2617) | same | honours brace lists |
+| `MainListener_Aggregates.cpp` user no-arg ctor (~3035) | GEP + store through `this` | honours brace lists (leg `field brace default user no-arg ctor`, 1009) |
+| `GenerateDefaultValue` | field-independent default of a TYPE | unchanged - it has no field initializer to read; the `= default` arms that call it are untouched |
+| Global emission (`MainListener_Declarations.cpp`) | compile-time `llvm::Constant` | UNCHANGED and still wrong; a global never runs a ctor. That is [[global-struct-no-initializer-ignores-field-defaults]], out of scope, frozen as a leg |
+| Brace-init merge (`EmitFieldInitializer` at a declarator) | overrides on top of the default value | unchanged; it now runs on top of a correctly-seeded default |
+
+Each aggregate site wraps the new call in `GlobalScopeGuard`, matching the `= default` arm next to
+it: the file-scope struct walk leaves `global_scope` true, and the brace path emits real stores
+and calls.
+
+### Coverage matrix - every cell measured on BOTH binaries (PRE = verified `68c78fc` Release)
+
+Probe corpus: `scratch/fb_*.cb`, tables `scratch/fb_pre.txt` / `scratch/fb_post.txt`.
+
+CHANGED (all were silent wrong values):
+
+| Cell | PRE | POST |
+|---|---|---|
+| struct, `=` spelling (`c1`) | `x=0 y=0 z=0` | `x=1 y=2 z=0` |
+| struct, BARE spelling (`s8`) | `x=0 y=0` | `x=1 y=2` |
+| class (`c2`) | `x=0 y=0 z=0` | `x=1 y=2 z=0` |
+| nested one level down (`c4`) | `x=0 y=0 z=0 w=0` | `x=1 y=2 z=0 w=0` |
+| generic container `Box<Outer>` (`c5`) | `x=0 y=0` | `x=1 y=2` |
+| generic field `Box<T> { T v = {x=3,y=4} }` (`e4`) | `x=0 y=0` | `x=3 y=4` |
+| user no-arg ctor (`c6`) | `x=0 y=0 z=7` | `x=1 y=2 z=7` |
+| user parameterized ctor (`c7`) | `x=0 y=0 z=7` | `x=1 y=2 z=7` |
+| PARTIAL list (`s4`) | `x=0 y=0` | `x=1 y=0` |
+| partial over inner scalar defaults (`m3`) | `x=7 y=8 w=9` | `x=1 y=8 w=9` |
+| brace default reached via `= default` of a default (`s5`) | `x=0 q=0` | `x=1 q=0` |
+| namespaced (`e5`) | `x=0 y=0` | `x=1 y=2` |
+| inner type with a destructor (`e6`) | `x=0 y=0` | `x=1 y=2` |
+| two brace-defaulted fields + a scalar (`e8`) | `0 0 5` | `1002 3004 5` |
+| interface-implementing class, through the fat slot (`m1`) | `0` | `1002` |
+| container field `list<int> l = {1,2,3}` (`m7`,`e7`) | `n=0 s=0` | `n=3 s=6` |
+| call in the list, run-once (`m4`) | `x=0 y=0 calls=0` | `x=1 y=100 calls=1` |
+| instantiation: `O o;` / `= {}` / `o {}` / `= default` / `new O()` / `O[3]` (`i1`-`i5`,`i7`) | `0` each | `1002` each |
+| container brace-init not naming the field (`i9`) | `0 z=5` | `1002 z=5` |
+| non-braced sibling field of a braced one (`m5`) | `p=0 x=0` | `p=0 x=5` |
+| POSITIONAL list at field position (`s2`) | compiles, silently `x=0 y=0` | HARD ERROR, the declarator's own wording |
+| `program` config field brace default (`Test/test_program.cb` leg `program config field brace default`) | `exitCode=0` | `exitCode=1008` |
+
+BYTE-IDENTICAL, measured in the exact spelling of the claim:
+
+| Cell | PRE = POST |
+|---|---|
+| union field (`c3`) | `x=0 y=0` - the union arm returns a zeroed value and reads no field initializer |
+| `= {}` over inner scalar defaults (`s3`) | `x=4 y=5` - empty list, no `initializerList`, still default-constructs |
+| `= default` field default (`s6`) | `x=4 y=5` |
+| scalar field default, the oracle (`s7`) | `a=9 b=0` |
+| GLOBAL `Outer g;` (`i6`) | `0` - globals never run the ctor |
+| explicit outer brace naming the field (`i10`) | `x=9 y=9 z=4` |
+| non-braced generic field (`m6` second value) | `0` |
+| POINTER field `Inner* p = {x=1}` (`m8`) | `0` (nullptr), silently |
+| `int a = {5}` / `int a {5}` primitive field (`e1`,`e2`) | `a=0 b=0` |
+| FIXED-ARRAY field `int[3] a = {1,2,3}` (`e3`) | `0 0 0 b=0` |
+| `string s = "hi"` inside the braced inner struct (`m2` string half) | `s=[]` - the pre-existing string-field-default drop; the INT half of the same struct went `x=0` -> `x=3` |
+
+Crosses deliberately NOT taken, and why: a brace-list value nested inside a brace list
+(`{ a = { x = 2 } }`) and its declarator twin `Outer o = { i = { x = 9 } };` are PARSE ERRORS -
+`CFlat.g4:531` `fieldInit` is `Identifier '=' assignmentExpression`, and a brace list is not an
+assignmentExpression. Confirmed from the grammar and by measuring
+(`no viable alternative at input 'a = {'`), not inferred. Nesting is therefore only reachable one
+level at a time, through a field whose type itself carries a brace default - which IS covered
+(`c4`, `s5`).
+
+### The one new REJECTION, and its accept set
+
+A POSITIONAL element in a field's default brace list (`Inner i = { 1, 2 };`) now gets
+`EmitFieldInitializer`'s existing message, identical to the one the LOCAL declarator has always
+given: `positional initializers are not supported for struct type 'Inner'; use 'field = value'`.
+It cannot break a working program - PRE the same spelling compiled and produced all zeros, i.e.
+the values were already discarded. The rejection is unreachable only for the containers
+`TryEmitContainerInitializer` actually handles - `list`/`array`/`dictionary` (matched by mangled
+prefix `list__`/`array__`/`dictionary__`), whose positional form is consumed there before
+`EmitFieldInitializer` is called (`m7`/`e7` prove that path stays open). `hashset`/`stack`/`queue`
+fields are NOT in that set: a positional list on one of those field types now hits the same
+rejection the LOCAL declarator has always given, converting a PRE silently-empty container into a
+diagnostic (measured: the identical positional spelling was already rejected at LOCAL declarator
+scope on PRE, so this closes the same gap at field-default scope - no working program regresses).
+The rejection is also unreachable for any field the helper bails on in steps 1-2 above - pointer,
+view, fixed array, primitive, unsubstituted generic parameter - all measured byte-identical in the
+table.
+
+### Verification
+
+- `./test.sh Release`: 600 passed / 0 failed / 8 skipped (baseline 600/0/8; the suite counts
+  FILES, and both new legs went into existing files).
+- `bash example_mac.sh Release`: 35 passed / 0 failed.
+- Differential corpus sweep, compile AND run, 432 entries (`Test/*.cb`, `Test/errors/*.cb`,
+  every `example/**/*.cb`), both binaries: 15 differing entries, of which 14 are addresses
+  (`test_c`), timings (`test_time`, the hpc benchmarks, `framework_link`), PIDs
+  (`sysinfo_mac`), cwd (`shell_pwd`), thread-race counters (`test_hpc`) and a `/private` prefix
+  on the `/tmp` PRE worktree's core path (4 Windows-only UI files that fail to import
+  `windows.h` on both). The ONE real difference is `Test/test_initializer_list.cb` - the
+  intended new legs.
+- `leaks --atExit` on the container-field-default probes (`fb_m7`, `fb_e7`, the newly-allocating
+  cells): 0 leaks / 0 bytes on both.
+- Warm `--init` cache: `--init-clear-local`, cold compile, `--init-local`, re-compile - the repro
+  prints `x=1 y=2 z=0` on both, and `c4`/`c5`/`c6`/`m7` are unchanged warm. The new
+  `BraceInitializer` field is a PARSE-TREE POINTER, the same class as the existing `Initializer`
+  next to it, and like it is not serialized: the cache stores compiled core bitcode, so a cached
+  type's synthesized ctor is already lowered and never re-reads a field initializer. No core
+  `.cb` uses a brace field default (swept), so nothing enters the round-trip.
+
+### Test legs
+
+`Test/test_initializer_list.cb` - 20 new legs. 17 FAIL on the PRE binary with the exact expected
+values recorded; 3 pass on both BY DESIGN and are labelled in the file:
+`field brace default empty still default constructs` (789 - the frozen accept set for `{}`),
+`field brace default at global scope still zero` (0 - the frozen
+[[global-struct-no-initializer-ignores-field-defaults]] behaviour), and
+`field brace default leaves other fields zero`. Discriminators are `x*1000+y` sums
+(1002, 3004, 5006, 41002) and positional digit packs (189 vs 789 vs 000), so neither a zero fill
+nor an ignored list can produce them.
+
+`Test/errors/err_struct_positional_init.cb` - one new file-scope scoped `expect_error` block for
+the positional-at-field-position rejection. It fires at `(7,40)`, a different site from the
+pre-existing declarator leg at `(13,15)`; on the PRE binary the file exits 1 with
+`FAIL: expected error ... did not occur`.
+
+`Test/test_program.cb` - one new leg, `program config field brace default`, covering the
+`program` default-ctor emitter (ParseProgramDefinition, ~2125) via a `FbConfig i = { x = 1 };`
+config field read back through `.run()`/`exitCode`. FAILS on the PRE binary
+(`exitCode=0`, expected `1008`).
+
+### Filed by this round
+
+[[fixed-array-field-brace-default-discarded]] (P2) - the FIXED-ARRAY sibling, same root cause,
+different emitter (positional, needs an `[N x T]` aggregate builder), plus the POINTER-field cell
+that still silently reads `nullptr`. Both measured identical on `68c78fc` and this branch.

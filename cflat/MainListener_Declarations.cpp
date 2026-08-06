@@ -2169,6 +2169,9 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseDeclarationList(st
                     }
                     typeAndValue.VariableName = name;
                     typeAndValue.Initializer = initializer;
+                    // Bare-brace field default (`Inner i { x = 1 };`): the list hangs on initDecl,
+                    // not on an initializer, so record it or the spelling is silently dropped.
+                    typeAndValue.BraceInitializer = initDecl->initializerList();
                     typeAndValue.Annotations = annotations;
 
                     // A field's `alignas(_, N)` allocation-alignment clause now rides in

@@ -265,7 +265,14 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 {
                     auto initializer = typeValue.Initializer;
                     llvm::Value* rvalue = nullptr;
-                    if (initializer != nullptr)
+                    if (auto* braceList = FieldDefaultBraceList(typeValue))
+                    {
+                        // Emitting a real function body; clear the stale file-scope global_scope
+                        // so the brace list's stores and calls lower as ordinary instructions.
+                        GlobalScopeGuard defaultCtorScope(global_scope);
+                        rvalue = ParseFieldDefaultBraceInitializer(structName, typeValue, braceList);
+                    }
+                    else if (initializer != nullptr)
                     {
                         auto assignmentExpression = initializer->assignmentExpression();
                         if (assignmentExpression != nullptr)
@@ -1790,7 +1797,15 @@ void MainListener::ParseImportedProgramDefinition(const std::string& name) {
             {
                 llvm::Value* rvalue = nullptr;
                 auto* initializer = typeValue.Initializer;
-                if (initializer)
+                // Unreachable today: this emitter's declList is entirely synthetic; wired for symmetry.
+                if (auto* braceList = FieldDefaultBraceList(typeValue))
+                {
+                    // Emitting a real function body; clear the stale file-scope global_scope
+                    // so the brace list's stores and calls lower as ordinary instructions.
+                    GlobalScopeGuard defaultCtorScope(global_scope);
+                    rvalue = ParseFieldDefaultBraceInitializer(name, typeValue, braceList);
+                }
+                else if (initializer)
                 {
                     if (auto* ae = initializer->assignmentExpression())
                         rvalue = ParseFieldDefaultInitializer(name, typeValue, ae);
@@ -2119,7 +2134,14 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
             {
                 llvm::Value* rvalue = nullptr;
                 auto* initializer = typeValue.Initializer;
-                if (initializer)
+                if (auto* braceList = FieldDefaultBraceList(typeValue))
+                {
+                    // Emitting a real function body; clear the stale file-scope global_scope
+                    // so the brace list's stores and calls lower as ordinary instructions.
+                    GlobalScopeGuard defaultCtorScope(global_scope);
+                    rvalue = ParseFieldDefaultBraceInitializer(name, typeValue, braceList);
+                }
+                else if (initializer)
                 {
                     if (auto* ae = initializer->assignmentExpression())
                         rvalue = ParseFieldDefaultInitializer(name, typeValue, ae);
@@ -2609,7 +2631,14 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             {
                 auto initializer = typeValue.Initializer;
                 llvm::Value* rvalue = nullptr;
-                if (initializer != nullptr)
+                if (auto* braceList = FieldDefaultBraceList(typeValue))
+                {
+                    // Emitting a real function body; clear the stale file-scope global_scope
+                    // so the brace list's stores and calls lower as ordinary instructions.
+                    GlobalScopeGuard defaultCtorScope(global_scope);
+                    rvalue = ParseFieldDefaultBraceInitializer(structName, typeValue, braceList);
+                }
+                else if (initializer != nullptr)
                 {
                     auto assignmentExpression = initializer->assignmentExpression();
                     if (assignmentExpression != nullptr)
@@ -3027,7 +3056,24 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
             unsigned fieldIdx = 0;
             for (const auto& field : structData.StructFields)
             {
-                if (field.Initializer != nullptr)
+                if (auto* braceList = FieldDefaultBraceList(field))
+                {
+                    // Same brace-list field default the synthesized ctors honour; a user-written
+                    // no-arg ctor must seed its fields identically before its own body runs.
+                    llvm::Value* fieldVal =
+                        ParseFieldDefaultBraceInitializer(structName, field, braceList);
+                    if (fieldVal)
+                    {
+                        auto* destType = structLLVMType->getTypeAtIndex(fieldIdx);
+                        if (fieldVal->getType() == destType)
+                        {
+                            auto* fieldPtr = compiler->builder->CreateStructGEP(
+                                structLLVMType, thisAlloca, fieldIdx, field.VariableName);
+                            compiler->builder->CreateStore(fieldVal, fieldPtr);
+                        }
+                    }
+                }
+                else if (field.Initializer != nullptr)
                 {
                     auto* assignExpr = field.Initializer->assignmentExpression();
                     if (assignExpr != nullptr)

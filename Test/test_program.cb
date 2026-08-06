@@ -50,6 +50,23 @@ program MultiField {
     }
 };
 
+// FbConfig: a struct with its own brace-list default (y keeps its OWN scalar default
+// when the config field's brace list only names x - the partial-list contract).
+struct FbConfig {
+    int x = 0;
+    int y = 8;
+};
+
+// FieldBraceDefault: a program config field carries a brace-list default. Regression for
+// the field-brace-default fix reaching the `program` default-ctor emitter.
+program FieldBraceDefault {
+    FbConfig i = { x = 1 };
+
+    int main(move list<string> args) {
+        return i.x * 1000 + i.y;
+    }
+};
+
 // UserDtor: a program with an explicit ~UserDtor(). The compiler emits exactly ONE
 // destructor - the user body runs first, then the builtin field teardown (allocator,
 // stop_source, inbox) is appended at the end. The user body bumps a global counter so
@@ -273,6 +290,17 @@ bool testProgramFieldDefaultValues() {
     m.run(args);
     m.WaitForExit();
     result &= Test("field defaults zero", m.exitCode, 0);
+    return result;
+}
+
+bool testProgramFieldBraceDefault() {
+    bool result = true;
+    // No override - i.x/i.y come entirely from FieldBraceDefault's own field default.
+    FieldBraceDefault p;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    result &= Test("program config field brace default", p.exitCode, 1008);
     return result;
 }
 
@@ -1476,6 +1504,7 @@ extern int main() {
     total++; passed += testProgramExitCodeNonZero()      ? 1 : 0;
     total++; passed += testProgramMultipleFields()       ? 1 : 0;
     total++; passed += testProgramFieldDefaultValues()   ? 1 : 0;
+    total++; passed += testProgramFieldBraceDefault()    ? 1 : 0;
     total++; passed += testProgramHeapAllocationsFreed() ? 1 : 0;
     total++; passed += testProgramMultipleRuns()         ? 1 : 0;
     total++; passed += testProgramArgsManyItems()        ? 1 : 0;

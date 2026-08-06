@@ -863,6 +863,10 @@ public:
         // Used for delayed Initialization
         CFlatParser::InitializerContext* Initializer = nullptr;
 
+        // The BARE brace spelling of a field default (`Inner i { x = 1 };`, no '='), which the
+        // grammar hangs on initDeclarator itself so `Initializer` is null for it.
+        CFlatParser::InitializerListContext* BraceInitializer = nullptr;
+
         // Used for array - first (outer) dimension; extra inner dimensions in ExtraArrayDims
         CFlatParser::AssignmentExpressionContext* ArraySize = nullptr;
         std::vector<CFlatParser::AssignmentExpressionContext*> ExtraArrayDims;
