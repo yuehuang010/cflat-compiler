@@ -4735,6 +4735,44 @@ bool testNullIfaceDispatchAcceptSet()
     if (ndPick(0) == 1) { elemHits = ngArr[0].Get(); }
     result &= Test("nid_global_elem_under_branch", elemHits, 0);
 
+    /*
+     * Legs 52-54 are the accept-set companion of the NEVER-INITIALISED check (a bare interface
+     * local with NO initializer at all, distinct from `= default`/`= nullptr`): a store on ANY
+     * path already disqualifies it, since the check is MUST-uninit (facts.ByBlock empty), not a
+     * proof about what value landed. Unlike legs 1-3, these declare with no initializer, so no
+     * store exists until the assignment shown - proving the new check's own axis rather than the
+     * pre-existing null proof's.
+     */
+    NdImpl s60; s60.d = 60;
+
+    // (52) A bare local, no initializer, assigned unconditionally before its only access.
+    NdLive u1;
+    u1 = s60;
+    result &= Test("niu_assigned_before_use", u1.Get(), 60);
+
+    // (53) A bare local, no initializer, assigned only inside a branch. MUST-uninit accepts any
+    // store on any path, so the branch assignment alone disqualifies the never-written check.
+    NdLive u2;
+    if (ndPick(1) == 1) { u2 = s60; }
+    result &= Test("niu_maybe_assigned_branch", u2.Get(), 60);
+
+    // (54) A bare local, no initializer, in a loop where the access precedes the assignment on
+    // the FIRST iteration and follows it on the second - the family's back-edge precedent: a
+    // false negative by design, and here proven safe because the store exists on some path.
+    NdLive u3;
+    int loopHits = 0;
+    for (int i = 0; i < 2; i++) { if (i == 1) { loopHits = u3.Get(); } u3 = s60; }
+    result &= Test("niu_loop_carried_accept", loopHits, 60);
+
+    // (55) A bare local, no initializer and NO store on any path at all - the never-initialised
+    // check's OWN axis (control-dependence containment, not the store disqualifier above): the
+    // access sits under a branch that is false at run time, so it is control-dependent on the
+    // guard rather than on nothing, and the entry-block witness does not contain it.
+    NdLive u4;
+    int guardedNeverTaken = 0;
+    if (ndPick(0) == 1) { guardedNeverTaken = u4.Get(); }
+    result &= Test("niu_guarded_never_taken", guardedNeverTaken, 0);
+
     return result;
 }
 

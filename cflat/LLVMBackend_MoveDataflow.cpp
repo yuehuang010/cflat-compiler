@@ -459,6 +459,25 @@ void LLVMBackend::ReportNullIfaceAccess(const PendingNullIfaceDispatch& rec)
                 rec.VarName, rec.MemberName));
     }
 
+void LLVMBackend::ReportNullIfaceUninitAccess(const PendingNullIfaceDispatch& rec)
+{
+        SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
+        // Honest wording: nothing set this to null, it was never assigned an implementation at
+        // all - a different fact from ReportNullIfaceAccess's "last set to null".
+        if (rec.IsField)
+            LogError(std::format(
+                "member access on uninitialized interface value '{}' - '{}' is never assigned an "
+                "implementation before this access, so '{}.{}' would resolve its address through "
+                "an uninitialized '{}' vtable; assign one before the access",
+                rec.VarName, rec.VarName, rec.VarName, rec.MemberName, rec.IfaceName));
+        else
+            LogError(std::format(
+                "method call on uninitialized interface value '{}' - '{}' is never assigned an "
+                "implementation before this call, so '{}.{}()' would dispatch through an "
+                "uninitialized '{}' vtable; assign one before the call",
+                rec.VarName, rec.VarName, rec.VarName, rec.MemberName, rec.IfaceName));
+    }
+
 void LLVMBackend::RunNullIfaceDispatchCheck(llvm::Function* F)
 {
         if (!F) return;
@@ -474,6 +493,10 @@ void LLVMBackend::RunNullIfaceDispatchCheck(llvm::Function* F)
         // giving up the straight-line proof.
         const char* xoff = std::getenv("CFLAT_NULL_IFACE_XBLOCK_OFF");
         const bool crossBlockOn = !(xoff && xoff[0] != '\0');
+        // Third hatch for the never-initialised check alone - a different question from the
+        // two above, so it gets its own toggle rather than sharing either one's.
+        const char* uoff = std::getenv("CFLAT_NULL_IFACE_UNINIT_OFF");
+        const bool uninitOn = !(uoff && uoff[0] != '\0');
 
         std::vector<const PendingNullIfaceDispatch*> live;
         for (const auto& rec : pending)
@@ -487,9 +510,10 @@ void LLVMBackend::RunNullIfaceDispatchCheck(llvm::Function* F)
         }
         if (live.empty()) return;
 
-        std::vector<NullIfaceLocFacts> facts;
+        // Needed by both the cross-block proof and the never-initialised check, so it runs
+        // unconditionally - crossBlockOn only gates whether its own proof is consulted.
+        std::vector<NullIfaceLocFacts> facts = CollectNullIfaceLocFacts(F, live);
         NullIfaceCfgInfo cfg;
-        if (crossBlockOn) facts = CollectNullIfaceLocFacts(F, live);
 
         for (size_t i = 0; i < live.size(); ++i)
         {
@@ -497,7 +521,25 @@ void LLVMBackend::RunNullIfaceDispatchCheck(llvm::Function* F)
             bool proven = SameBlockProvesNullIface(rec);
             if (!proven && crossBlockOn)
                 proven = CrossBlockProvesNullIface(F, rec, facts[i], cfg);
-            if (proven) ReportNullIfaceAccess(rec);
+            if (proven) { ReportNullIfaceAccess(rec); continue; }
+
+            // Never-initialised: the whole receiver (empty path) has no covering store anywhere
+            // in the function. MUST-uninit: any store on any path already populated ByBlock.
+            if (uninitOn && rec.Path.empty() && facts[i].ByBlock.empty())
+            {
+                // The declaration witness sits in the entry block, whose CD set is empty, so
+                // require the access itself to be control-dependent on nothing (i.e. reached
+                // unconditionally) before reporting - a guarded access may legitimately never run.
+                EnsureNullIfaceBlocks(cfg, F);
+                llvm::BasicBlock* ab = rec.Anchor->getParent();
+                if (!cfg.Rpo.count(ab)) continue;
+                if (!cfg.HaveCd)
+                {
+                    cfg.Cd = nulldf::ComputeControlDependence(cfg.Blocks, cfg.Rpo, &provenNoReturn_);
+                    cfg.HaveCd = true;
+                }
+                if (cfg.Cd[ab].empty()) ReportNullIfaceUninitAccess(rec);
+            }
         }
     }
 

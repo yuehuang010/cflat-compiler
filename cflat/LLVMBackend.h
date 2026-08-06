@@ -5574,6 +5574,15 @@ public:
     void ReportNullIfaceAccess(const PendingNullIfaceDispatch& rec);
 
     /*
+     * A DIFFERENT question from ReportNullIfaceAccess: not "proven null", but "this location has
+     * no store anywhere in the function at all" - a bare interface local with no initializer
+     * (`PLive lv;`), never assigned, never defaulted, so the alloca is genuinely uninitialised
+     * memory rather than a proven-null fat pointer. Wording must say so honestly; the "last set to
+     * null" phrasing of ReportNullIfaceAccess would be factually false here. LogError THROWS.
+     */
+    void ReportNullIfaceUninitAccess(const PendingNullIfaceDispatch& rec);
+
+    /*
      * Resolve the pending definitely-null interface dispatches for ONE function, at the same
      * end-of-body hook as RunInterfaceReturnDangleCheck. Rejecting requires proving all three:
      * the base never escapes, a write covering the receiver's location reaches the access with
@@ -5582,6 +5591,15 @@ public:
      * own block; the cross-block MUST fixpoint answers when control flow sits between the null
      * init and the access, and adds the control-dependence containment test so a guarded or
      * run-time-skippable access still compiles. Any gap anywhere leaves the program compiling.
+     *
+     * A second, separate check runs after: a receiver whose location has NO covering store
+     * ANYWHERE in the function (facts.ByBlock empty) - not "proven null", genuinely never
+     * initialised - and whose path is empty (the whole receiver, not a sub-object; a sub-object
+     * of an aggregate is always reached through a synthesized constructor call and covered above
+     * or left alone, per the do-not-widen list). MUST-uninit only: a store on ANY path (a branch,
+     * a loop body, an unconditional assignment) disqualifies it, which is the conservative,
+     * false-negative-safe direction for the same reason the null proof's cross-block half is a
+     * MUST lattice, not a MAY one.
      */
     void RunNullIfaceDispatchCheck(llvm::Function* F);
 

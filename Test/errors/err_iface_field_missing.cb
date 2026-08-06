@@ -145,6 +145,24 @@ expect_error("method call on null interface value 'ev' - 'ev' has not been assig
     int evBothArmsEmpty() { PTagged ev = default; if (pkPick(1) == 1) { pkPick(4); } else { pkPick(5); } return ev.kind(); }
 }
 
+/*
+ * A DIFFERENT question from the rest of this file: a bare interface local with NO initializer at
+ * all (`PTagged uv;`) has no null store and no constructor call to reason through - it is
+ * genuinely uninitialised memory, not a proven-null fat pointer, which is why the pre-fix binary
+ * crashed with SIGTRAP (133) rather than the SIGSEGV (139) every proven-null shape above produces.
+ * The wording says so honestly ("uninitialized", not "has not been assigned ... since it was last
+ * set to null" - nothing set it to null here). MUST-uninit only: a store on ANY path (assigned
+ * before use, assigned in a branch, assigned in a loop body) disqualifies it; those accept legs
+ * live in testNullIfaceDispatchAcceptSet.
+ */
+expect_error("method call on uninitialized interface value 'uv' - 'uv' is never assigned an implementation before this call, so 'uv.kind()' would dispatch through an uninitialized 'PTagged' vtable") {
+    int uvNeverInitCall() { PTagged uv; return uv.kind(); }
+}
+
+expect_error("member access on uninitialized interface value 'fv' - 'fv' is never assigned an implementation before this access, so 'fv.tag' would resolve its address through an uninitialized 'PTagged' vtable") {
+    int fvNeverInitFieldRead() { PTagged fv; return fv.tag; }
+}
+
 extern int main()
 {
     return 0;

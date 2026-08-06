@@ -527,7 +527,6 @@ produce a program.
 | [[move-of-borrowed-pointer-adopts-into-plain-destination]] | ownership | Exit 134, no diagnostic, identical on `d93c359` and on the merged `fix/ptrcopy`. `move` of an `IsBorrowed` source is gated only on a `unique` DESTINATION, so `Ci* d = move p;` off a borrowed pointer PARAMETER (and its one-hop copy, and the `move`-returning-wrapper spelling) adopts ownership the borrow never had. `fix/ptrcopy` added the destination-agnostic move guard next to this and deliberately left `IsBorrowed` out of it: `MainListener.h` carries an explicit ratified policy that forwarding an ordinary borrow as `move` stays legal, so closing this means REOPENING that policy with its own accept set, not adding a clause. Filed 2026-08-05 by `fix/ptrcopy`. Silent double free, so P1 by the bare rubric; filed P2 under the residue-not-regression precedent (`unique-field-to-field-interface-receiver-residues`, `return-dangle-missed-when-slot-has-extra-user`) - accepted by the PRE binary too, so residue rather than regression. Re-rank to P1 if the maintainer rules the silent-double-free rubric wins. |
 | [[alias-borrow-local-launder-gaps]] | ownership | An `IsAliasBorrow` owning-struct local launders its borrow through `=` and through `move`. |
 | [[coalesce-join-null-local-arm-erases-owner-proof]] | ownership | Exit 134, no diagnostic, identical on `d93c359` and on the merged `fix/ptrcopy`. `Ci* n = nullptr; Ci* b = n ?? c; delete b;` and its BOXED twin both double-free. The BOTH-ARMS join rule skips a null LITERAL arm as neutral but counts a LOCAL that merely HOLDS null as a non-proving arm, so the whole join is dropped. The raw and boxed spellings AGREE here, so this is a pre-existing hole in the arm CLASSIFICATION, not an asymmetry `fix/ptrcopy` introduced - its `?:` twins reject on both binaries. Silent double free, so P1 by the bare rubric; filed P2 under the residue-not-regression precedent (`unique-field-to-field-interface-receiver-residues`, `return-dangle-missed-when-slot-has-extra-user`) - accepted by the PRE binary too, so residue rather than regression. Re-rank to P1 if the maintainer rules the silent-double-free rubric wins. Filed 2026-08-05 by `fix/ptrcopy`. |
-| [[null-interface-access-remaining-storage-kinds]] | crash at run time | SIGSEGV (139) / SIGTRAP (133) with a clean compile, no diagnostic - the storage kinds the three-stage null-interface widening left open. NOT a regression (identical on `904f026`). Read [`internal/plan/null-interface-access-widening.md`](../plan/null-interface-access-widening.md) first, especially the deliberately-accepted section and the MUST-vs-MAY correction. Filed 2026-08-03; had no row here until 2026-08-04. |
 
 #### P1 / crash - dies with no usable diagnostic (`p1/crash/`)
 
@@ -6943,3 +6942,122 @@ files differ only in the runtime-core PATH printed inside an `imported file not 
   are unreachable by construction. Not filed - the reject face (`condition must be a scalar ...
   not 'string'`) is the accept set's boundary and is measured unchanged, as is the FAT `Lambda<>`
   twin (`g ??= vp;` -> `condition must be a scalar ... not '__closure_fat_ptr'`).
+
+### fix/iface-uninit - a bare interface local with no initializer, genuinely uninitialised (LANDED)
+
+Closed `null-interface-access-remaining-storage-kinds` (file deleted; face 1, the global sub-object
+case, was already fixed 2026-08-03 - this closes the last open item, face 2). Read
+[`internal/plan/null-interface-access-widening.md`](../plan/null-interface-access-widening.md)
+section 7 for the original "explicitly out of scope" note this supersedes for the local-declaration
+half; the plan file itself is unchanged except for a one-line pointer to this record.
+
+**Root cause / discriminator.** `PLive lv; lv.Get();` has NO null store and NO constructor call to
+reason through - unlike `PLive lv = default;` (a store of a null fat pointer, already rejected by
+the existing proof) or `PHolder h;` (a struct field, defaulted via a synthesized ctor call that
+returns a zero aggregate, also already rejected). Confirmed on the `--no-opt` IR: `%lv = alloca
+%__iface_fat_ptr` has ZERO `StoreInst` users anywhere in the function, only loads - the discriminator
+is exactly "this (Base, empty Path) location has no covering store anywhere in F", which is a
+whole-function existential fact, not a per-block or per-path proof. That is also why the crash
+signal differs: SIGTRAP (133, an LLVM-inserted trap for a load of literally undef/poison memory
+feeding a call) rather than the SIGSEGV (139) every proven-null shape produces - verified by
+`--no-opt` IR inspection, not inferred from the exit code alone.
+
+**Check site.** `cflat/LLVMBackend_MoveDataflow.cpp`, `RunNullIfaceDispatchCheck` - beside the
+existing null-interface proof, reusing its `InterfaceSlotIsFrameLocal` gate (so an escaped, `this`,
+heap, or through-pointer base is never even considered - the new check inherits that safety by
+construction, not by a repeated check) and its `CollectNullIfaceLocFacts` per-function pass (now
+computed unconditionally rather than only when the cross-block hatch is on, since the new check
+needs it too). For each live record that neither the same-block nor cross-block null proof
+resolves: if `rec.Path.empty()` (the WHOLE receiver, not a sub-object - a sub-object's null-ness
+always comes through a synthesized constructor call, which is a real store, so it can never reach
+this branch) and `facts[i].ByBlock.empty()` (zero stores anywhere in F touch this location), report
+a NEW diagnostic (`ReportNullIfaceUninitAccess`) rather than the existing "last set to null" one,
+which would be factually false here. New env hatch `CFLAT_NULL_IFACE_UNINIT_OFF`, independent of the
+existing two, since it answers a different question.
+
+**Matrix, PRE (`08328cd`, the branch point) vs POST.** PRE numbers were measured against an
+`08328cd` Release build; the main checkout has since advanced past the branch point, so re-running
+the scratch harness against `x64/Release/cflat` there measures a LATER commit - rebuild `08328cd`
+in a detached worktree instead. Round-2 review independently rebuilt a verified `08328cd` and
+reproduced every sampled cell:
+
+| Shape | PRE | POST |
+|---|---|---|
+| bare local, method call (`lv.Get()`) | compile 0, run 133 | **compile 1**, "uninitialized interface value" |
+| bare local, field read (`lv.tag`) | compile 0, run 133 | **compile 1**, "uninitialized interface value" |
+| assigned before use, no initializer (`lv; lv = s; lv.Get()`) | compile 0, run 0, value correct | unchanged - a store exists, `ByBlock` non-empty |
+| maybe-assigned in a branch, no initializer | compile 0, run 0, value correct | unchanged, same reason |
+| back-edge: access precedes assignment on iteration 1, follows on iteration 2 | compile 0, run 0 | unchanged - false negative by design, matching the family's existing loop-carried precedent |
+| `PLive lv = default;` (already-null twin) | compile 1 (existing proof) | unchanged, same message, same site - the two diagnostics never collide since a store disqualifies the new check |
+| `PHolder h;` (struct field, ctor-zeroed) | compile 1 (existing proof) | unchanged - Path is `[0]`, not empty, so the new check never even evaluates it |
+| `PHolder2 h;` (interface field declared WITHOUT `= default`) | compile 1 (existing proof) | unchanged - measured directly: the language still synthesizes a zeroing ctor call even without an explicit field initializer, so this was never actually reachable as a new axis |
+| `int x;` (non-interface bare local) | compile 0, run garbage value | unchanged - `pendingNullIfaceDispatch_` is never populated for a non-interface type, so this is out of scope by construction, not by a new guard |
+| bare local, access under a branch that is false at run time (`if (cond) { r = lv.Get(); }`) | compile 0, run 0 | **fixed to compile 0, run 0** - round-1 review found this rejected (regression vs PRE); the check now requires `cfg.Cd[accessBlock]` empty (control-dependent on nothing) before reporting, reusing the null proof's `ComputeControlDependence`/`EnsureNullIfaceBlocks` machinery, so a guarded access with no covering store anywhere accepts same as PRE |
+
+**Two conservatism axes, both inherited from the family, neither new in kind.** (1) Any-path-store
+disqualifier: `facts[i].ByBlock` non-empty on ANY path (even an unreached one, even one AFTER the
+access) turns the check off - this is the pre-existing MUST-uninit design, not new. (2)
+Control-dependence containment: the access must be reached unconditionally (its CD set is empty,
+the same emptiness the entry-block declaration witness has) - this is the fix landed in round 1 of
+review, and it reuses the null proof's own `NullIfaceCfgInfo`/`ComputeControlDependence` rather than
+adding a second CD implementation.
+
+**Address-of escape axis - could not be constructed, and does not need to be.** CFlat rejects
+`PLive*` outright ("pointer '*' is not allowed on interface type"), so there is no syntactic way to
+take the address of a bare interface local and hand it to a callee. This is not a gap: the new
+check's precondition is the SAME `InterfaceSlotIsFrameLocal` walk the existing proof already
+requires, and that walk already returns false (accept) for anything that is not a load, a
+store-into-it, a constant GEP, or a debug/lifetime marker - so even if some future spelling did
+expose the address, it would already be excluded before the new check runs, by the same discipline
+the plan's do-not-widen list documents for `this->field.method()`.
+
+**Disqualifier false negative - store AFTER the access, still accepted.** `PLive lv; int r =
+lv.Get(); lv = s;` compiles 0 on both PRE and POST and crashes 133 at runtime on both: the
+any-path-store disqualifier is path-blind about ORDER, not just about reachability, so a store that
+lexically follows the access still empties `facts[i].ByBlock` and turns the check off. Honest,
+recorded false negative - not a regression, since PRE already accepted this shape; the check narrows
+toward the two shapes it can prove (no store anywhere, reached unconditionally), not toward every
+uninitialised use.
+
+**Two round-2 observations, recorded for the next reader.** (1) The check infers "declared with no
+initializer" from the ABSENCE of stores, and an interface PARAMETER's slot is structurally
+identical - it stays accepted only because parameter lowering emits an entry store of the incoming
+argument (removing the `ByBlock` disqualifier rejects `core/string.cb`'s `operator string(IString)`
+immediately). If parameter lowering ever stops materialising that store, or the check moves after a
+mem2reg-class pass, every interface parameter becomes a false rejection. (2) `lv?.Get()` on a
+never-initialised local is silently accepted on both binaries and reads garbage - there is no null
+to test, which is exactly why the uninit diagnostic deliberately omits the `?.` advice the
+proven-null diagnostic gives. Pre-existing shape, safe direction, out of this change's scope.
+
+**Accept-set legs** (`Test/test_interface.cb`, `testNullIfaceDispatchAcceptSet`, legs 52-55 -
+`niu_assigned_before_use`, `niu_maybe_assigned_branch`, `niu_loop_carried_accept`,
+`niu_guarded_never_taken`): legs 52-55 declare with NO initializer (distinct from legs 1-3, which
+start from `= default` and therefore never reach the new check at all) and assert the dispatched
+VALUE. Legs 52-53 reach the store disqualifier by construction (axis 1: a store exists on some
+path, so `facts[i].ByBlock` is non-empty, and the access is unconditional). Leg 54's access sits
+under `if (i == 1)` inside the loop body, so it is accepted by the CD gate REGARDLESS of any store
+- it does not pin axis 1 (round-2 review, witnessed by the identical store-free loop-body shape
+compiling on POST); it stands as a loop-carried VALUE leg only. Leg 55, added in round-1 review,
+pins axis 2: NO store anywhere, but the access sits under a branch that is false at run time, so it
+must clear the control-dependence containment test to accept rather than the store disqualifier
+(mutation-verified: forcing the CD gate true rejects leg 55's `u4`).
+
+**Reject legs** (`Test/errors/err_iface_field_missing.cb`, SCOPED `expect_error` form - the check
+resolves at end-of-body inside `RunNullIfaceDispatchCheck`, the same hook as every other leg in
+that file, so a scoped block closes after the diagnostic fires, unlike the module-end global
+check): `uvNeverInitCall` (method call) and `fvNeverInitFieldRead` (field read), both proven
+fail-on-PRE against a verified `08328cd` Release build (compile 0, run 133) before being added to
+the tracked file, and both confirmed in round-2 review to go unmet under
+`CFLAT_NULL_IFACE_UNINIT_OFF=1` - pinned to the new check, not a neighbouring guard.
+
+**Sweep (no-regression result, not safety evidence for the guard).** All 535 `.cb` files under
+`cflat/core`, `example`, `Test` compiled with `--check`: exactly two hits, both the intentional
+error-test legs above; zero in `cflat/core` or `example`. The corpus contains no bare-interface-local
+access guarded by a branch, so it cannot exercise the control-dependence containment path added in
+round 1 - it shows the new check does not fire spuriously on existing code, nothing more; the
+guarded-shape probes and leg 55 above are what actually cover the containment logic.
+
+**Verification.** `./cmake_build.sh release && bash test.sh Release` - 600 passed, 0 failed, 8
+skipped. `bash example_mac.sh Release` - 35 passed, 0 failed. One commit,
+`git rev-list --count 08328cd..HEAD` = 1. Round 1 review fix (control-dependence suppression) applied
+and re-verified against the same two commands with the same result.

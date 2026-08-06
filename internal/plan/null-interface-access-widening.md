@@ -650,6 +650,9 @@ on control-dependence suppression.
   PRE binary: `PHolder h; if (h.c == nullptr)` prints `isnull`, i.e. the zero-init is pre-existing
   language semantics, not something the fix introduced. Both now reject, correctly. The claim holds
   only for the bare LOCAL (t4), which is untouched.
+  **2026-08-06 (`fix/iface-uninit`):** t4 landed separately as its own MUST-uninit check (a bare
+  interface local with no store anywhere in the function), beside this proof but not folded into
+  it, in `RunNullIfaceDispatchCheck` - see the `interface-issue-queue.md` landed record for detail.
 - **s3 / s4 / s8 - heap, through-pointer, and by-value-parameter bases.** Permanently accepted, by
   the same rule that protects c1/c2. These are DECIDED, not residue - if this plan lands and a
   successor record is written, they belong in the deliberately-accepted list of section 2b, not in
