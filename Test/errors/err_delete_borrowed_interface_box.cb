@@ -233,6 +233,20 @@ expect_error("cannot delete interface 'sCoalesceElemJoin' - it boxes an object t
     }
 }
 
+// The same join with a CAST on the RHS. A cast erases the source binding's storage, so the
+// binding-based owner derivation returns nothing and the join went EMPTY - which retired the proof
+// and laundered exactly the double free the leg above rejects. The owner is recovered from the
+// boxed VALUE's slot instead. The accept side is delete_box_coalesce_cast_* in Test/test_move.cb.
+expect_error("cannot delete interface 'sCoalesceCast' - it boxes an object that 'p' or 'q'") {
+    int borrowCoalesceCast(CircleB* p, CircleB* q)
+    {
+        p ??= (CircleB*)q;
+        IShapeB sCoalesceCast = p;
+        delete sCoalesceCast;
+        return sCoalesceCast.area();
+    }
+}
+
 // A plain COPY of an OWNING LOCAL. The source frees the pointee at its own scope exit, so the copy
 // owns nothing. This is the RAW spelling; the boxed twin is two legs below. The origin is recovered
 // from the source's SLOT, so the diagnostic names 'cOwner' and never the copy holding it.

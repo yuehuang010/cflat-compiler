@@ -287,6 +287,31 @@ expect_error("reached through a cast or a '?:' / '??' join, into a longer-lived 
 
 // NESTED spellings - a cast over a join, and a join over a cast. Each needs the walk to
 // recurse through the other's shape rather than stopping at the outermost one.
+/*
+ * The '??=' STORE spelling of the two shapes above. It is a different path from the '??' join
+ * expression already covered: on the merge base '??=' emitted its own compare/branch/store and
+ * RETURNED before every persist site, so neither escape gate could see it. Both were measured
+ * memory-unsafe there - the bare form left the owning temp unregistered (dtors=0, a leak) and the
+ * join form registered it, freed it at end of statement and left the destination dangling
+ * (v=1431655765, dtors=1). Discriminator: each leg pins the wording of the gate the '=' oracle
+ * fires for the SAME right-hand side (measured: 'raw = makeBox().t;' gives the bare wording,
+ * 'raw = c > 0 ? makeBox().t : nullptr;' the join one), so a leg passing on the other gate's
+ * message would be visible. Each block is armed and checked on its own, and the only store in
+ * either is the '??=', so no earlier site can satisfy them.
+ */
+expect_error("cannot store unique field 'makeBox.t' of a temporary into a longer-lived location") {
+    void tempDtorlessNullAssignBare() { Node* raw = nullptr; raw ??= makeBox().t; }
+}
+
+expect_error("reached through a cast or a '?:' / '??' join, into a longer-lived location") {
+    void tempDtorlessNullAssignJoin()
+    {
+        int c = 1;
+        Node* raw = nullptr;
+        raw ??= c > 0 ? makeBox().t : nullptr;
+    }
+}
+
 expect_error("reached through a cast or a '?:' / '??' join, into a local") {
     void tempDtorlessCastOfJoin() { Node* raw = (Node*)(makeBox().t ?? nullptr); }
 }

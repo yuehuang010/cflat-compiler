@@ -71,8 +71,9 @@ each measured against a binary built at the first cut of this guard:
   Without that, `l.add(nullptr); T* e = l.get(0); e ??= new T(); IS s = e; delete s;` was
   false-rejected with a leaking remedy while master runs it at dtor=1. The RAW-delete guard reads
   `BorrowsOwnedElement` directly and is deliberately NOT gated - clearing the taint outright also
-  widened the raw guard, a behaviour change master does not have. The rest of the bookkeeping that
-  early return skips is [[coalesce-assign-skips-store-bookkeeping]].
+  widened the raw guard, a behaviour change master does not have. `fix/coalesce-tail` later routed
+  `??=` through the shared store tail; the element refresh there takes the JOIN for a conditional
+  store, so the declaration's fact can still survive and this flag stays load-bearing.
 - **A proving RHS PROPAGATES instead of retiring.** `int f(Ci* p, Ci* q) { p = q; IS s = p;
   delete s; }` leaves `p` a borrow, yet the store cleared the fact and the program compiled clean and
   aborted (134); deleting the `p = q;` line made it reject. `MarkPointerRebound` now takes the RHS

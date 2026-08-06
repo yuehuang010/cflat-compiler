@@ -3,6 +3,16 @@ expect_error("cannot bind a raw pointer 'T*' to an array-view 'T[]'") {
     void f(int* p) { int[] a = new int[4]; a = p; }
 }
 
+// The '??=' spelling of the same laundering door. On the merge base '??=' emitted its own store
+// and returned before this reject, so the raw pointer went into the view's noalias contract.
+expect_error("cannot bind a raw pointer 'T*' to an array-view 'T[]'") {
+    void fCoalesce(int* p) { int[] a = new int[4]; a ??= p; }
+}
+
+// Accept twin of the leg above: a VIEW source through '??=' is still legal, unchanged on both
+// binaries. Routing '??=' through the shared store tail must not reject the whole spelling.
+void reassignViewToViewCoalesceOk() { int[3] a; int[] v = a; int[] w = default; w ??= v; }
+
 // Legal, but NOT proven safe (deliberately not diagnosed - a known, pre-existing gap, not a
 // regression: this program aborts identically on master, which has no delete-of-array-view
 // guard at all). Reassigning a HEAP-bound view to a fixed array's decayed storage moves it

@@ -7,3 +7,15 @@ expect_error("cannot reassign 'src' while 'v' holds a bonded reference") {
         src = other;   // error: v still holds a bond to src
     }
 }
+
+// The '??=' spelling of the same store. It emits a CONDITIONAL store, but the store may still
+// happen, so the bond source is still being reassigned. On the merge base '??=' returned before
+// this check ever ran (it was its own store path), so this compiled clean.
+expect_error("cannot reassign 'src2' while 'v2' holds a bonded reference") {
+    int* Borrow2(bond int* src2) { return src2; }
+
+    void Test2(int* src2, int* other2) {
+        int* v2 = Borrow2(src2);
+        src2 ??= other2;
+    }
+}

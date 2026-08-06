@@ -815,6 +815,9 @@ bool testNullCoalescing()
 // Null-coalescing assignment (??=) tests
 // =============================================================
 
+int nullCoalSideEffects = 0;
+int nullCoalBump() { nullCoalSideEffects = nullCoalSideEffects + 1; return 7; }
+
 bool testNullCoalescingAssignment()
 {
     bool result = true;
@@ -834,6 +837,18 @@ bool testNullCoalescingAssignment()
     z ??= 10;
     z ??= 20;
     result &= Test("nullcoalasgn_already_set", z, 10);
+
+    // Accept-set guard for the store-tail routing: '??=' short-circuits, so the RHS must not be
+    // evaluated at all when the LHS is already set. Identical on both binaries by design - this
+    // is the property a fall-through restructure could silently drop.
+    nullCoalSideEffects = 0;
+    int keep = 4;
+    keep ??= nullCoalBump();
+    result &= Test("nullcoalasgn_rhs_not_evaluated", nullCoalSideEffects, 0);
+    int take = 0;
+    take ??= nullCoalBump();
+    result &= Test("nullcoalasgn_rhs_evaluated_once", nullCoalSideEffects, 1);
+    result &= Test("nullcoalasgn_rhs_value", take, 7);
 
     // null pointer: should be assigned the rhs
     const char* p = nullptr;

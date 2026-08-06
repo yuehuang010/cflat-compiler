@@ -36,6 +36,22 @@ expect_error("use of moved variable 'child'") {
     }
 }
 
+/*
+ * The '??=' spelling of the store above. A '??=' into a unique FIELD consumes the named source
+ * exactly as '=' does (TransferPointerOwnershipOnStore), so a later read of the source is a use
+ * after move. On the merge base '??=' returned before that transfer: the program compiled, both
+ * bindings pointed at one object, and the scope exit double-freed it (measured rc 133).
+ * Discriminator: the pinned name is the SOURCE parameter, which only the transfer marks moved -
+ * the '??=' destination is never the subject of this message.
+ */
+expect_error("use of moved variable 'child3'") {
+    void nullAssignAndRead(Holder* h, move MoveResource* child3)
+    {
+        h->item ??= child3;
+        int y = child3->id;
+    }
+}
+
 // use after move - move param assigned to a field in each branch, read after the if/else
 expect_error("use of moved variable 'child2'") {
     void storeAndReadBranched(Holder* h, Holder* h2, move MoveResource* child2)

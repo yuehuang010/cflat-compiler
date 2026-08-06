@@ -528,7 +528,6 @@ produce a program.
 | [[alias-borrow-local-launder-gaps]] | ownership | An `IsAliasBorrow` owning-struct local launders its borrow through `=` and through `move`. |
 | [[coalesce-join-null-local-arm-erases-owner-proof]] | ownership | Exit 134, no diagnostic, identical on `d93c359` and on the merged `fix/ptrcopy`. `Ci* n = nullptr; Ci* b = n ?? c; delete b;` and its BOXED twin both double-free. The BOTH-ARMS join rule skips a null LITERAL arm as neutral but counts a LOCAL that merely HOLDS null as a non-proving arm, so the whole join is dropped. The raw and boxed spellings AGREE here, so this is a pre-existing hole in the arm CLASSIFICATION, not an asymmetry `fix/ptrcopy` introduced - its `?:` twins reject on both binaries. Silent double free, so P1 by the bare rubric; filed P2 under the residue-not-regression precedent (`unique-field-to-field-interface-receiver-residues`, `return-dangle-missed-when-slot-has-extra-user`) - accepted by the PRE binary too, so residue rather than regression. Re-rank to P1 if the maintainer rules the silent-double-free rubric wins. Filed 2026-08-05 by `fix/ptrcopy`. |
 | [[null-interface-access-remaining-storage-kinds]] | crash at run time | SIGSEGV (139) / SIGTRAP (133) with a clean compile, no diagnostic - the storage kinds the three-stage null-interface widening left open. NOT a regression (identical on `904f026`). Read [`internal/plan/null-interface-access-widening.md`](../plan/null-interface-access-widening.md) first, especially the deliberately-accepted section and the MUST-vs-MAY correction. Filed 2026-08-03; had no row here until 2026-08-04. |
-| [[coalesce-assign-skips-store-bookkeeping]] | ownership | `??=` emits its own compare/branch/store then RETURNS, skipping every piece of post-store bookkeeping the plain `=` path runs (`TransferPointerOwnershipOnStore`, move/unmove marking, element-borrow refresh). Pre-existing; filed 2026-08-04 while fixing the `??=` half of the borrowed-interface-box guard. Had no row here until 2026-08-04. |
 
 #### P1 / crash - dies with no usable diagnostic (`p1/crash/`)
 
@@ -569,11 +568,12 @@ cost ~6 suite failures plus the core UI framework, and the latter needs cross-fu
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[conditional-store-retires-borrow-facts-unconditionally]] | ownership | rc 133 (double free), no diagnostic, identical on `152728c` and on the merged `fix/coalesce-tail`. The store tail's three RETIREMENTS (`ClearVariableBond`, `SetVariableBorrowsOwnedString`, `SetVariableBorrowsOwnedElement`) are walk-order, not control flow, so an `=` inside a branch that is NEVER TAKEN still clears the fact: `R* g = l.get(0); if (g == nullptr) { g = new R(); } delete g;` compiles and double-frees the list's element, while the same `delete g` without the `if` is a hard error. Split out of `coalesce-assign-skips-store-bookkeeping` - `fix/coalesce-tail` answered the `??=` spelling by taking the JOIN (conservative, matches master), which does NOT generalize: joining would false-reject the always-taken `if (c) { g = new R(); } delete g;`. Needs a real MAY/MUST fact, so it is a feature, not a clause. Filed 2026-08-06 by `fix/coalesce-tail`. |
 | [[as-is-does-not-recognize-nullcoalesce-join]] | false rejection | `(z ?? a) as IShape` / `is IShape` gives "requires an interface value or a class instance ... this expression is neither". NOT a chaining defect - it reproduces at chain length 1, and the `?:` spelling of the same construct WORKS. `ClassifyCastSource` in `MainListener.h` recognizes a pointer join only as a `PHINode`, and a `??` joins through a slot so its result is a `LoadInst`. Arms are recoverable via `CollectPointerJoinArms`. Note `ResolveTernaryArmClasses` does `llvm::cast<llvm::PHINode>` and must move onto the same collector in the SAME change or it asserts on the newly-admitted load. Measured identical on `4c06cce` and the chain fix. Filed 2026-08-05 by `fix/chain-coalesce`. |
 | [[nested-join-arm-unresolved-in-is-as-and-mixed-ternary]] | false rejection | The named residue of `fix/chain-coalesce`: that fix taught the two BOXING sites to recurse into a join arm that is itself a join; two other sites asking the same question were left. `ResolveTernaryArmClasses` - `is`/`as` against a CONCRETE class over a nested `?:` - and `BoxTernaryThinArmToInterface` - the thin arm of a MIXED fat/thin `?:` when that arm is a join (both in `MainListener.h`). Neither is a drop-in recursion: the first folds one i1 answer per arm and a nested arm has a SET of leaf answers; the second is called with the builder already positioned in the caller's block. Contrast that localizes it: the same chain through `as <Interface>` now works. Measured identical on `4c06cce` and the chain fix. Filed 2026-08-05 by `fix/chain-coalesce`. |
 | [[join-arm-from-call-result-not-boxed-into-interface]] | false rejection | `take(mk(0) ?? mk(3))` and `IShape j = mk(0) ?? mk(3);` do not compile - a join arm that is a direct CALL RESULT resolves to no class. NOT a chaining defect: reproduces at chain length 1, so `fix/chain-coalesce` neither caused nor closed it. `ResolvePointerElementTypeName` answers an arm from the declared type of the binding a LOAD reads, and a call result is not a load. Fix direction: answer a `CallInst` from the callee's registered return type - a widening of a RESOLUTION helper, so a miss degrades to today's bail; audit `JoinArmsKeepOwner` and the `as`/`is` readers first, where a newly-resolvable arm changes an OWNERSHIP verdict. Filed 2026-08-05 by `fix/chain-coalesce`. |
 | [[move-interface-return-of-nullcoalesce-join-not-owned]] | false rejection | `move IShape f() { unique T* a = new T(); T* z = nullptr; return z ?? a; }` is rejected "returned expression is not owned". NOT a chaining defect - reproduces at chain length 1. The whole-expression owned-return check runs BEFORE the per-arm machinery and `IsOwningValue` answers only a load off a NamedVariable, so the coalesce-SLOT load answers false. The existing `transferArmOwnership` path would answer correctly and is never consulted. Contrast: the passing `ownJoinNC` leg returns a join of two `unique` locals, which the whole-expression check does prove. Fix must WIDEN the accept side while keeping a genuinely borrowed arm rejected - build the accept-set first. Filed 2026-08-05 by `fix/chain-coalesce`. |
-| [[owning-temp-in-coalesce-fallback-arm-never-destructed]] | ownership hole | LEAK, no diagnostic, identical on `14097e1` and on the merged `fix/tempuniq`. `p ?? makeBox().t` measures `dtors=0` and reads the LIVE value: the `??` right operand is evaluated in `nullcoal_null`, which neither dominates the join nor gets the per-arm `FlushOwnedTempsSince` the `?:` arms get, so the owning temp is never destructed. The `?:` twins measure `dtors=1` and dangle, which is what makes this specific to `??`'s fallback arm rather than to joins generally. **Coupled**: `fix/tempuniq`'s join walk EXCLUDES this arm (rejecting it would refuse a correct program), so fixing the leak turns the shape into a use-after-free and must delete the arm-0-only restriction in `JoinCarriesOwningTempUniqueField` in the same change - both halves together. Same root as [[lambda-body-owning-temp-never-destructed]] and the `??=` half of [[coalesce-assign-skips-store-bookkeeping]]. Filed 2026-08-05 by `fix/tempuniq`. |
+| [[owning-temp-in-coalesce-fallback-arm-never-destructed]] | ownership hole | LEAK, no diagnostic, identical on `14097e1` and on the merged `fix/tempuniq`. `p ?? makeBox().t` measures `dtors=0` and reads the LIVE value: the `??` right operand is evaluated in `nullcoal_null`, which neither dominates the join nor gets the per-arm `FlushOwnedTempsSince` the `?:` arms get, so the owning temp is never destructed. The `?:` twins measure `dtors=1` and dangle, which is what makes this specific to `??`'s fallback arm rather than to joins generally. **Coupled**: `fix/tempuniq`'s join walk EXCLUDES this arm (rejecting it would refuse a correct program), so fixing the leak turns the shape into a use-after-free and must delete the arm-0-only restriction in `JoinCarriesOwningTempUniqueField` in the same change - both halves together. Same root as [[lambda-body-owning-temp-never-destructed]]; the `??=` half (`coalesce-assign-skips-store-bookkeeping`) is closed by `fix/coalesce-tail`, which makes that spelling a hard error. Filed 2026-08-05 by `fix/tempuniq`. |
 deleted 2026-08-05), which closed the four decidable spellings and named this one undecidable at the call site: the store happens in the CALLEE, and the read-only `rd(makeBox().t)` is CORRECT code that must keep working (frozen as `temp_uniq_accept_plain_param_read` with a destructor count). `unique T*` / `move T*` parameters ARE closed - those state the claim at the call site. All four reachable shapes (free function, `list.add`, constructor argument, global-storing callee) are the one plain-`T*` parameter. Fix direction: a CALLEE-side escape fact, not a call-site predicate - `RegisterNonEscapingOwningPtrArgs` answers a close question already. P2 under the residue-not-regression precedent ([[unique-field-to-field-interface-receiver-residues]]); re-rank to P1 if the memory-unsafe-accept rubric wins. Filed 2026-08-05 by `fix/tempuniq`. |
 | [[lambda-body-owning-temp-never-destructed]] | ownership hole | LEAK, no diagnostic, identical on `6e9ab46` and the merged fix. `Lambda<Dt*()> f = () => makeDt().t;` prints `dtors=0` - the owning `Box` temp inside a lambda BODY is never registered/flushed, so its destructor never runs at all. The same body as a free function is rejected by the temp-escape gate. Not a missed guard: the lambda body does not run the statement-boundary owned-temp machinery, so the read carries no temp provenance for any guard to see. Fixing it will likely turn the leak into a use-after-free the gate then rejects - land both halves together. Filed 2026-08-04 by the round-1 review of `fix/temp-uniq-borrow`. |
 | [[multidim-fixed-array-has-no-brace-initializer]] | feature gap | A multi-dimensional fixed array has no working brace initializer on either binary: nested braces are a PARSE error, a flat list counts against the OUTER dimension only (`int[2][3] a = {1,2,3,4,5,6}` -> "too many initializers for 'int[2]'"), and string-literal elements hit the fixed-array pointer-store reject. `= default` plus element assignment works. Matters because `fix/mdview`'s diagnostic points at `T[N][M]`. Fix the FLAT list first (multiply through `ConstInnerDimensions`); nested braces need a grammar change. Filed 2026-08-02. |
@@ -5856,8 +5856,10 @@ call-site argument gate cannot see it because `GenerateDefaultParamOverloads` re
 forwarding `NamedVariable` with the destination's type before the call, laundering the source's
 provenance. Gated at the default-value site instead, immediately after the existing opposite-
 direction `RejectCodeValueIntoDataSlot` call. `./test.sh` 600/0/8 and `example_mac.sh` 35/0 held
-after this amend. `??=` on a thin `function<>` destination remains the sole still-open THIN
-spelling of this defect class (see above); the two FAT default-value spellings found by round-3
+after this amend. `??=` on a thin `function<>` destination was the last still-open THIN spelling of
+this defect class; it is CLOSED as of `fix/coalesce-tail` (see its landed record below), which
+routes `??=` through the shared store tail so it reaches this gate with a real `NamedVariable` -
+no THIN spelling of any assignment-direction gate remains open. The two FAT default-value spellings found by round-3
 review were filed separately and are now closed by `fix/fat-default` (see its landed record
 below) - no THIN or FAT spelling of the default-value gate remains open.
 
@@ -6808,3 +6810,136 @@ there and forcing it into this gate would conflate two different questions.
 `./cmake_build.sh release && bash test.sh Release` - 600 passed, 0 failed, 8 skipped.
 `bash example_mac.sh Release` - 35 passed, 0 failed. One commit,
 `git rev-list --count bdd6869..HEAD` = 1.
+
+### fix/coalesce-tail - `??=` routed through the shared store tail, LANDED
+
+Fixed and deleted `p1/codegen/coalesce-assign-skips-store-bookkeeping.md`. The `??=` handler in
+`ParseAssignmentExpression` emitted its own compare/branch/store and RETURNED, so every check the
+plain-`=` path runs afterwards was skipped for that one spelling. It now emits ONLY the null test
+and the branch, rewrites `operatorText` to `"="`, and falls through into the shared tail with the
+builder positioned in the assign arm; a `finishStore` lambda closes the arm and yields the
+destination's value at each of the tail's 29 return sites. The RHS is therefore parsed by
+`ParseAssignmentExpressionNamed` (a real `NamedVariable`, which is what the provenance gate reads)
+and still evaluated inside the assign arm, so `??=` keeps short-circuiting.
+
+**The oracle.** `??=` is defined as `if (x == null) x = rhs;`, so that desugared spelling - not the
+bare `=` - is the reference, and it was measured independently per subsystem. It says the tail's
+compile-time bookkeeping is FLOW-INSENSITIVE: an `=` inside an `if` applies its facts to the
+enclosing binding unconditionally. That is right for facts that RESTRICT later use and wrong for
+facts that RETIRE a restriction, which is the one place this fix deliberately diverges from the
+desugaring (below).
+
+**Per-subsystem oracle table.** PRE = `152728c`; `=` and desugared columns measured on PRE.
+
+| # | subsystem | probe | `=` / desugared oracle | `??=` PRE | `??=` POST |
+|---|-----------|-------|------------------------|-----------|------------|
+| 1 | `TransferPointerOwnershipOnStore` | `R* p = new R(); h.f ??= p;` then read `p` (`h.f` is `unique R*`) | rejects: `use of moved variable 'p'` | compiles, rc 133 (double free at scope exit) | rejects, same wording |
+| 2 | `TransferMoveStringOwnershipOnStore` | move-string RHS into a `??=` destination | n/a | UNREACHABLE | UNREACHABLE - the null test needs a scalar; a `string` destination dies first with `condition must be a scalar ... not 'string'` |
+| 3 | `MarkVariableUnmoved` / `...FieldUnmoved` / `...NotExplicitlyMovedNull` | `R* b = move a; a ??= new R(); a->v` | `a=9 b=3` rc 0 | rejects: `dereference of moved variable 'a'` (false rejection) | `a=9 b=3` rc 0 |
+| 4 | `ClearOwnMoveOrigin` | leg 3 compiled `--sanitize=ownership` | `a=9 b=3` rc 0 | same false rejection | `a=9 b=3` rc 0 |
+| 5 | `ClearVariableBond` | `int* view = Borrow(&a); view ??= &b; a = 6;` | `v=5 v2=5 a=6` rc 0 (bond cleared) | rejects `a = 6` (bond survives) | rejects `a = 6` - DELIBERATE, see below |
+| 6 | `SetVariableBorrowsOwnedString` | `string s; s ??= b.name;` | n/a | UNREACHABLE (same scalar rule as 2) | UNREACHABLE |
+| 7 | `SetVariableBorrowsOwnedElement` | `R* g = l.get(0); g ??= new R(); delete g;` | accepts, `mid dtors=1 end dtors=2`, and the DESUGARED spelling then rc 133 | rejects the `delete` | rejects the `delete` - DELIBERATE, see below |
+| 8 | `CheckThinFnPtrAssignProvenance` | `function<int(int)> f; f ??= vp;` | rejects: `cannot assign a 'void*' value to 'function<>' destination 'f'` | compiles, rc 138 (SIGBUS) | rejects, same wording |
+
+**Conditional-store decisions.** Rows 1, 3, 4 and 8 apply UNCONDITIONALLY, matching the desugaring.
+For 1 and 8 that is trivially sound: marking a source moved and rejecting a data pointer both
+RESTRICT, and a conservative restriction under a may-not-happen store is still sound. For 3 and 4
+there is a stronger argument - a moved-from pointer is NULL (CFlat's `move` nulls its source), so
+the `??=` null test is always true for one and the store always happens; reviving it can never
+un-restrict a live binding. Rows 5 and 7 (and 6, were it reachable) RETIRE a restriction, and there
+the desugaring is an unsound oracle: measured, `if (g == nullptr) { g = new R(); }` clears the
+container-element taint even though `g` is non-null at run time, and the following raw `delete g`
+double-frees (rc 133). Those three therefore take the JOIN under `??=` - the fact is kept unless the
+new RHS carries it too - which is byte-identical to what master does for `??=` and keeps the raw
+delete guard exactly where the interface-boxing record left it. Recorded as a deliberate divergence
+from `=`, not an oversight; see "Found, not fixed".
+
+Two NEW rejections come from the routing, both the `=` oracle's behaviour: `a ??= 6;` while a bond
+to `a` is live (`cannot reassign 'a' while 'view' holds a bonded reference`), and `a ??= p;` of a
+raw pointer into an array view. Neither one caught a live bug - on PRE both COMPILED and RAN
+correctly, because the destination was non-null and the store therefore never happened. They are a
+deliberate TIGHTENING to the flow-insensitive rule `=` already applies, and both oracle twins (the
+plain `=` and the desugared `if` spellings) reject identically on both binaries. Accept twins were
+frozen first: a view-source `w ??= v` (leg in `err_arrayview_bind_reassign.cb`), and the `ct_accept`
+corpus - the assignment expression's own value (`int r = (x ??= 5)`), short-circuiting (the RHS call
+runs 0 times when the LHS is set, 1 when it is not), `double`, a named function into `function<>`,
+and `??=` in a loop. Every one of those cells is byte-identical on both binaries. The corpus's
+remaining cell is NOT, and is excluded from that claim: the lambda RHS, which PRE rejects and POST
+compiles - see "Widening found in passing" below.
+
+**CoalesceRebound disposition: RETAINED, still load-bearing.** Because row 7 takes the JOIN rather
+than clearing, the DECLARATION's element fact still survives a `??=`, so the interface-boxing proof
+still needs `MarkPointerRebound`'s `coalesceJoin` flag to suppress the element clause. The
+lhs-owner / rhs-owner JOIN rule moved with it into the tail's `MarkPointerRebound` call. Deriving
+the RHS owner from `DescribeAssignedSourceOwner(rightNV)` alone was NOT equivalent to the
+pre-restructure derivation off the loaded value: it bails unless the RHS binding's `Storage` is an
+alloca, and a CAST erases that. Measured for `p ??= (CircleB*)q;` between two borrowed parameters,
+then boxed and deleted: PRE rejects it (`cannot delete interface ... it boxes an object that 'p' or
+'q' already frees`), the first cut of this branch ACCEPTED it and ran memory-unsafe (double free,
+rc 133; the read-back-after-free shape aborts rc 139), and it is now fixed by falling back to the
+value-based derivation - coalesce path only, and only when the binding-based one comes back empty -
+with the spelling pinned by the new `sCoalesceCast` leg in
+`Test/errors/err_delete_borrowed_interface_box.cb` and its accept twin
+`delete_box_coalesce_cast_*` in `Test/test_move.cb` (an owning-local cast source under an LHS that
+proves nothing, which must stay accepted). The parenthesized and container-element cast spellings
+were measured too and reject identically on PRE and on the fixed binary.
+`Test/test_move.cb`'s three `coalesce*Box` legs and `err_delete_borrowed_interface_box.cb`'s two
+other `??=` legs are unchanged and green.
+
+**One non-tail change was required.** `derefLoad()` bypasses `LoadNamedVariable`, which is where
+the null dataflow's guard-read event is logged, so with the store alone routed the pass still could
+not see that `??=` tests its destination and kept reporting row 3 as a moved-variable dereference.
+The handler now calls `RecordNullRead` for the destination, which is what makes `??=` and its
+desugaring agree. It costs one diagnostic: `R* b = move a; a ??= nullptr; a->v` was rejected on PRE
+with `dereference of moved variable 'a'`, and now compiles and SIGSEGVs (rc 139) - converging on the
+desugared-`=` oracle, which is rc 139 too, so the lost diagnostic is deliberate drift toward the
+oracle rather than a regression against it.
+
+**Destination-spelling matrix** (`scratch/ct_dest.cb`), all six PASS identically on PRE and POST:
+local, struct field, through-pointer (`*pp`), fixed-array element, global, generic-encoded field
+(`Box<R*>.t`). RHS spellings measured: plain value, `move` (unchanged - the move expression nulls
+its own source), owning-temp field (rows above), `?:` join, data pointer into thin `function<>`,
+interface-boxing sources, lambda literal.
+
+**Widening found in passing.** `f2 ??= (int a) => a + 1;` was rejected on PRE with `cannot assign a
+struct value to a pointer variable` - the expected-type threading and the fat-to-thin coercion both
+live in the tail. It now compiles and runs; leg `cvj_nullassign_fn_lambda` in
+`Test/test_function_ptr.cb`.
+
+**Test legs.** Six error legs, each measured failing on a `152728c` binary with `expected error ...
+did not occur` (the join leg in `err_unique_borrow_into_field.cb` was isolated by deleting the bare
+leg, since the bare one fires first): `err_unique_borrow_into_field.cb` (the two memory-unsafe
+repros - bare and `?:`-join owning temp field), `err_data_pointer_to_closure_param.cb` (the SIGBUS),
+`err_move.cb` (row 1), `err_bond_source_reassign.cb` and `err_arrayview_bind_reassign.cb` (the two
+new rejections). Three value legs: `coalesce_revives_moved_local_value` / `..._freed_twice` in
+`Test/test_move.cb` (fails on PRE with `dereference of moved variable 'a'`),
+`cvj_nullassign_fn_lambda` in `Test/test_function_ptr.cb` (fails on PRE with `cannot assign a struct
+value to a pointer variable`), and the three short-circuit accept-set legs in `Test/test_basic.cb`,
+which are identical on both binaries by design - they guard the property a fall-through restructure
+could silently drop. The punch round added one error leg (`sCoalesceCast` in
+`err_delete_borrowed_interface_box.cb`) and two value legs (`delete_box_coalesce_cast_*` in
+`Test/test_move.cb`); those three are vacuous vs `152728c` (it also rejects the cast spelling) and
+instead discriminate against the branch's first cut `6bc1b10`, which accepted it.
+
+**Verification.** `./test.sh Release` 600 passed / 0 failed / 8 skipped; `bash example_mac.sh
+Release` 35 passed / 0 failed. A `--check` differential sweep over all 447 `.cb` in `Test/` and
+`example/` reports exactly 7 differences, every one a file this commit edits; the other 29 flagged
+files differ only in the runtime-core PATH printed inside an `imported file not found` message
+(harness noise from two binaries in two directories). No new `TypeAndValue` / `StructData` /
+`AnnotationValue` field, so no `--init` round-trip change is owed.
+
+### Found, not fixed
+
+- **`ClearVariableBond` and `SetVariableBorrowsOwnedElement` do NOT converge on `=` for `??=`**
+  (rows 5 and 7 above). This is a decision, not a gap: the desugaring oracle retires those facts
+  unconditionally and that is measurably unsound under a store that may not happen
+  (`if (g == nullptr) { g = new R(); }` then `delete g` is rc 133 on both binaries). Converging
+  would need a flow-sensitive fact, which is a different feature. Filed as
+  [[conditional-store-retires-borrow-facts-unconditionally]] with both measured oracle pairs -
+  note the defect there is in the DESUGARED `=` spelling, not in `??=`.
+- `TransferMoveStringOwnershipOnStore` and `SetVariableBorrowsOwnedString` (rows 2 and 6) have no
+  live cell at all: `??=` requires a scalar destination and `string` is a two-word struct, so both
+  are unreachable by construction. Not filed - the reject face (`condition must be a scalar ...
+  not 'string'`) is the accept set's boundary and is measured unchanged, as is the FAT `Lambda<>`
+  twin (`g ??= vp;` -> `condition must be a scalar ... not '__closure_fat_ptr'`).

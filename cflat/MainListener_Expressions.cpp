@@ -1083,6 +1083,54 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     : compiler->CreateAssignment(val, destination, isUnsigned);
             };
 
+            /*
+             * Null-coalescing assignment: x ??= rhs  ->  if (x == 0/null) x = rhs. Only the null
+             * test and the branch are emitted here; the STORE and every piece of bookkeeping that
+             * goes with it are the plain-'=' tail below, entered with the builder positioned in the
+             * assign arm. That routing is the whole point: this handler used to emit its own store
+             * and RETURN, skipping the ownership transfer, the moved-flag revival, the bond and
+             * borrow refreshes and the thin-function<> provenance gate the tail runs.
+             */
+            llvm::BasicBlock* coalesceResume = nullptr;
+            std::string coalesceLhsOwner;
+            if (operatorText == "??=")
+            {
+                auto* lhs = derefLoad();
+                // The null test IS a guard read of the destination, and derefLoad bypasses
+                // LoadNamedVariable, which is where that event is normally logged. Without it the
+                // null dataflow cannot see the guard and reports the desugared-equivalent
+                // `if (a == nullptr) { a = ...; }` shape as a moved-variable dereference.
+                compiler->RecordNullRead(namedVar.CallerName);
+
+                // Is this an ownership-tracked pointer binding? Same gate the plain '=' retirement
+                // uses: bare identifier, its own alloca, not a field store.
+                bool tracksOwnership = namedVar.TypeAndValue.Pointer && namedVar.FieldName.empty()
+                    && !namedVar.CallerName.empty() && namedVar.Storage != nullptr
+                    && llvm::isa<llvm::AllocaInst>(namedVar.Storage);
+                // The LHS's PRE-STORE proof, taken before anything below can mutate the binding.
+                if (tracksOwnership)
+                {
+                    const auto* lhsNV = compiler->FindVariableByStorage(namedVar.Storage);
+                    if (BindingKeepsOwnershipOfBoxedObject(lhsNV))
+                        coalesceLhsOwner = DescribeBoxedSourceOwner(nullptr, lhsNV);
+                }
+
+                auto* assignBlock = compiler->CreateBasicBlock("nullcoalasgn_assign");
+                coalesceResume    = compiler->CreateBasicBlock("nullcoalasgn_resume");
+                // Jump to the assign block only when lhs is null/zero.
+                compiler->CreateConditionJump(lhs, coalesceResume, assignBlock);
+                compiler->SwitchToBlock(assignBlock);
+                operatorText = "=";  // the tail IS the store path from here on
+            }
+            // Closes the '??=' assign arm and yields the destination's value at the join. Identity
+            // for a plain '=', which has no arm to close.
+            auto finishStore = [&](llvm::Value* v) -> llvm::Value* {
+                if (coalesceResume == nullptr) return v;
+                compiler->CreateJump(coalesceResume);
+                compiler->SwitchToBlock(coalesceResume);
+                return derefLoad();
+            };
+
             // Thread expected function-pointer type into lambda RHS (for f = (x) => {...} reassignment)
             if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer)
                 lambdaExpectedType = namedVar.TypeAndValue;
@@ -1091,88 +1139,6 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             else if (operatorText == "=" && !namedVar.TypeAndValue.Pointer)
                 if (const auto* enc = compiler->GetEncodedClosureType(namedVar.TypeAndValue.TypeName))
                     lambdaExpectedType = *enc;
-
-            if (operatorText == "??=")
-            {
-                // Null-coalescing assignment: x ??= rhs  ->  if (x == 0/null) x = rhs
-                auto* lhs = derefLoad();
-
-                // Is this an ownership-tracked pointer binding? Same gate the plain '=' retirement
-                // uses: bare identifier, its own alloca, not a field store.
-                bool tracksOwnership = namedVar.TypeAndValue.Pointer && namedVar.FieldName.empty()
-                    && !namedVar.CallerName.empty() && namedVar.Storage != nullptr
-                    && llvm::isa<llvm::AllocaInst>(namedVar.Storage);
-                // The LHS's PRE-STORE proof, taken before anything below can mutate the binding.
-                std::string lhsOwner;
-                if (tracksOwnership)
-                {
-                    const auto* lhsNV = compiler->FindVariableByStorage(namedVar.Storage);
-                    if (BindingKeepsOwnershipOfBoxedObject(lhsNV))
-                        lhsOwner = DescribeBoxedSourceOwner(nullptr, lhsNV);
-                }
-
-                auto* assignBlock  = compiler->CreateBasicBlock("nullcoalasgn_assign");
-                auto* resumeBlock  = compiler->CreateBasicBlock("nullcoalasgn_resume");
-
-                // Jump to assign block only when lhs is null/zero
-                compiler->CreateConditionJump(lhs, resumeBlock, assignBlock);
-
-                compiler->SwitchToBlock(assignBlock);
-                auto* rhs = ParseAssignmentExpression(assignCtx);
-                /*
-                 * Code-value store gate for '??='. This branch emits its own compare/branch/store
-                 * and returns before the plain-'=' gate below ever runs, and it parses its RHS
-                 * through the lean VALUE path, which discards the NamedVariable that gate reads -
-                 * so ask the per-value ledger about the stored value itself. That answers for a
-                 * `function<>` read, a bare function name and a join alike, and an explicitly
-                 * cast RHS stays laundered, exactly as at every other store site.
-                 */
-                if (rhs != nullptr && compiler->JoinArmCarriesCodeValue(rhs)
-                    && compiler->ParameterStoresData(namedVar.TypeAndValue))
-                    LogErrorContext(ctx, compiler->DescribeCodeValueIntoData(
-                        CodeValueDestSpelling(namedVar.TypeAndValue), "assign",
-                        CodeValueCastAdvice(namedVar.TypeAndValue)));
-                derefAssign(rhs, false);
-                compiler->CreateJump(resumeBlock);
-
-                /*
-                 * '??=' is a JOIN: afterwards the binding holds either its OLD referent (arm not
-                 * taken) or the RHS's (arm taken). So the fact survives only when BOTH sides prove
-                 * an owner, and the diagnostic then names both - a rule that has to mirror the one
-                 * for the '?:' / '??' joins rather than either side alone. Taking the RHS alone
-                 * false-rejects `c = new Ci(); c ??= q;` (the not-taken arm leaves `c` the sole
-                 * owner, and IsOwning is decl-with-init only, so the box's delete is the ONLY
-                 * free); taking neither laundered `p ??= q` between two borrowed parameters, which
-                 * the raw `delete p;` on the same binding rejects.
-                 *
-                 * The store is also marked as a '??=' rebinding, which suppresses the element clause
-                 * of THIS proof. That handler returns before the SetVariableBorrowsOwnedElement
-                 * refresh the plain '=' path runs, so the DECLARATION's element fact would otherwise
-                 * survive a store that may have replaced it - and it outranks the retirement by
-                 * design, so it would win. The raw-delete guard reads BorrowsOwnedElement directly
-                 * and is deliberately NOT touched: clearing the taint outright also widened it,
-                 * which is a behaviour change master does not have. See
-                 * internal/issue/p2/coalesce-assign-skips-store-bookkeeping.md for the rest of that
-                 * skipped bookkeeping, which is a pre-existing gap and not fixed here.
-                 */
-                if (tracksOwnership)
-                {
-                    std::string rhsOwner;
-                    if (ProvingBindingForBoxedSource(rhs, nullptr) != nullptr)
-                        rhsOwner = DescribeBoxedSourceOwner(rhs, nullptr);
-                    std::string joined;
-                    if (!lhsOwner.empty() && !rhsOwner.empty())
-                    {
-                        std::vector<std::string> owners{lhsOwner};
-                        if (rhsOwner != lhsOwner) owners.push_back(rhsOwner);
-                        joined = DescribeInterfaceBoxOwners(owners);
-                    }
-                    compiler->MarkPointerRebound(namedVar.CallerName, joined, /*coalesceJoin*/ true);
-                }
-
-                compiler->SwitchToBlock(resumeBlock);
-                return derefLoad();
-            }
 
             // Bond source reassignment check: error if LHS is a live bond source.
             // Only fire when destination is the variable's own alloca/global - field assignments
@@ -1223,8 +1189,34 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     && !namedVar.CallerName.empty() && namedVar.Storage != nullptr
                     && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
                 {
-                    compiler->MarkPointerRebound(namedVar.CallerName,
-                                                 DescribeAssignedSourceOwner(rightNV));
+                    /*
+                     * '??=' is itself a JOIN: afterwards the binding holds either its OLD referent
+                     * (arm not taken) or the RHS's (arm taken). So the fact survives only when BOTH
+                     * sides prove an owner, and the diagnostic then names both - mirroring the
+                     * '?:' / '??' rule rather than either side alone. Taking the RHS alone
+                     * false-rejects `c = new Ci(); c ??= q;`; taking neither laundered `p ??= q`
+                     * between two borrowed parameters, which the raw `delete p;` rejects.
+                     */
+                    std::string assignedOwner = DescribeAssignedSourceOwner(rightNV);
+                    // A cast erases the RHS binding's Storage; the boxed VALUE still names the slot,
+                    // which is what the pre-tail '??=' handler asked. Coalesce path only.
+                    if (coalesceResume != nullptr && assignedOwner.empty()
+                        && ProvingBindingForBoxedSource(rightNV.Primary, nullptr) != nullptr)
+                        assignedOwner = DescribeBoxedSourceOwner(rightNV.Primary, nullptr);
+                    if (coalesceResume != nullptr)
+                    {
+                        std::string joined;
+                        if (!coalesceLhsOwner.empty() && !assignedOwner.empty())
+                        {
+                            std::vector<std::string> owners{coalesceLhsOwner};
+                            if (assignedOwner != coalesceLhsOwner) owners.push_back(assignedOwner);
+                            joined = DescribeInterfaceBoxOwners(owners);
+                        }
+                        compiler->MarkPointerRebound(namedVar.CallerName, joined,
+                                                     /*coalesceJoin*/ true);
+                    }
+                    else
+                        compiler->MarkPointerRebound(namedVar.CallerName, assignedOwner);
                     // A JOIN RHS carries no source binding, so no clause above can see it; ask its
                     // arms directly. After MarkPointerRebound, which retires any earlier join.
                     std::vector<llvm::Value*> storeJoinSlots;
@@ -1583,7 +1575,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     "it (or is a stack value), so this would leak or free a stack address at scope "
                     "exit; assign 'new', a 'move' expression, a move-returning call, or 'nullptr'",
                     namedVar.CallerName));
-                return right;
+                return finishStore(right);
             }
 
             // A valid owning reassignment to a `unique` interface LOCAL frees the OLD pointee first
@@ -1615,7 +1607,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     : compiler->DescribeCodeValueAsCompoundOperand(
                         CodeValueDestSpelling(destTV), operatorText,
                         destTV.Pointer && !destTV.IsArrayView));
-                return right;
+                return finishStore(right);
             }
 
             // Pointer variable assigned a struct value: catch the mismatch here
@@ -1629,7 +1621,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 LogErrorContext(ctx, std::format(
                     "cannot assign a value of type '{}' to pointer variable '{}' - the right-hand side must be a pointer (call getPtr() or use '&')",
                     rightNV.TypeAndValue.TypeName, namedVar.CallerName));
-                return right;
+                return finishStore(right);
             }
 
             bool rhsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
@@ -1705,7 +1697,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 // The destination now owns this closure env, so drop the stored value from the
                 // owned-closure temp-flush list to avoid a double-free (no-op for a clone result).
                 compiler->UnregisterOwnedClosureTemp(right);
-                return right;
+                return finishStore(right);
             }
 
             // Field-identity of the two sides, computed up front so the field-store rejects/copies
@@ -1752,13 +1744,13 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && RejectNonOwningStructJoinStore(right, namedVar.TypeAndValue.TypeName,
                                                   destIsStructField ? "a struct field"
                                                                     : "an owning variable", ctx))
-                return right;
+                return finishStore(right);
 
             // Storing a whole `alias` (borrow) value into a struct field - rejected ahead of the
             // generic owning-value reject below so the borrow keeps its precise message.
             if (operatorText == "=" && destIsStructField
                 && RejectAliasStoreIntoField(rightNV, right, ctx))
-                return right;
+                return finishStore(right);
 
             // Copying a named owning value into a struct field by value. THE FLIP copies a copyable
             // owner in place (proceeds); a non-copyable owner is rejected. A self-assign is a no-op
@@ -1767,7 +1759,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             bool rejectCopied = false;
             if (operatorText == "=" && destIsStructField
                 && RejectOwningValueCopyIntoField(rightNV, right, selfUniqueFieldStore, rejectCopied, ctx))
-                return right;
+                return finishStore(right);
 
             // A PROVABLE stack address into a scalar `unique` field: the shape gate keeps the
             // pointer-worded message off whole-array and interface fields, where it would be untrue.
@@ -1781,7 +1773,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             {
                 RejectNonHeapAddressIntoUnique(
                     std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar)), ctx);
-                return right;
+                return finishStore(right);
             }
 
             // Storing a BORROW into a `unique` field. The field declares that it owns the pointee and
@@ -1798,7 +1790,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             {
                 RejectBorrowIntoUniqueField(rightNV,
                     std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar)), ctx);
-                return right;
+                return finishStore(right);
             }
 
             // Storing a plain COPY of a live OWNING local into a `unique` field. The copy carries no
@@ -1827,7 +1819,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         srcName, DescribeUniqueFieldOwner(namedVar), srcName,
                         copyBind->OwningLocalOrigin, copyBind->OwningLocalOrigin,
                         copyBind->OwningLocalOrigin));
-                    return right;
+                    return finishStore(right);
                 }
                 // The same store off a local bound from a proving '?:' / '??' JOIN. Its own delete
                 // is rejected above; the field's synthesized destructor is the same second free.
@@ -1841,7 +1833,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         "destructor double-frees it. Store an object this frame owns instead.",
                         srcName, DescribeUniqueFieldOwner(namedVar), srcName,
                         copyBind->JoinKeepsOwnerSource));
-                    return right;
+                    return finishStore(right);
                 }
             }
 
@@ -1859,7 +1851,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 borrowSrc.BorrowedOrigin = fieldBorrowMoveOrigin;
                 RejectBorrowIntoUniqueField(borrowSrc,
                     std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar)), ctx);
-                return right;
+                return finishStore(right);
             }
 
             // Direct `unique`-field-to-`unique`-field copy (`c.p = a.p`) - two owners of one
@@ -1887,7 +1879,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     RejectUniqueInterfaceFieldToField(rightNV, destDesc, ctx);
                 else
                     RejectUniqueFieldToUniqueField(rightNV, destDesc, ctx, srcText);
-                return right;
+                return finishStore(right);
             }
 
             // Same store between two INTERFACE receivers: neither side carries a caller name, so
@@ -1948,7 +1940,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     rightNV.MoveTempStructType, rightNV.MoveTempStructAlloca, rightNV.MoveTempFieldIndex, "movedfld");
                 compiler->builder->CreateStore(
                     llvm::ConstantAggregateZero::get(right->getType()), srcGep);
-                return right;
+                return finishStore(right);
             }
 
             // Storing an owning field of a NON-move (alias) temp (`x = aliasTok().text`) into a longer-
@@ -1962,7 +1954,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     "is owned elsewhere and would double-free. Use '.copy()' for an independent copy, or "
                     "bind the whole call result to a local first and assign from that.",
                     rightNV.OwningStructName, rightNV.FieldName));
-                return right;
+                return finishStore(right);
             }
 
             // Same escape into a BORROWING destination (field, local, global, array element) with
@@ -1970,7 +1962,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             if (operatorText == "=" && IsOwningTempUniqueFieldEscape(rightNV))
             {
                 RejectOwningTempUniqueFieldEscape(rightNV, "a longer-lived location", ctx);
-                return right;
+                return finishStore(right);
             }
 
             // Assigning a named string LOCAL into a string field. THE FLIP: a NAMED OWNED source
@@ -1995,7 +1987,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     LogErrorContext(ctx, std::format(
                         "assigning a non-owning string '{}' into a struct field; use 'move' to transfer "
                         "ownership or '.copy()' for an independent copy", rightNV.CallerName));
-                    return right;
+                    return finishStore(right);
                 }
             }
 
@@ -2024,7 +2016,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         "field-to-field copy of owning value '{}' aliases its backing buffer and will "
                         "double-free at teardown; use '.copy()' for an independent copy or 'move' to "
                         "transfer ownership", namedVar.TypeAndValue.TypeName));
-                    return right;
+                    return finishStore(right);
                 }
             }
 
@@ -2073,7 +2065,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 // The destination is now live again (it may have been moved-from earlier).
                 if (!namedVar.CallerName.empty() && namedVar.FieldName.empty())
                     compiler->MarkVariableUnmoved(namedVar.CallerName);
-                return toStore;
+                return finishStore(toStore);
             }
 
             // Owning-value MOVE through a pointer-deref destination (`*pc = *pa`): a shallow store
@@ -2120,7 +2112,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     if (srcIsNamedVar && !rightNV.CallerName.empty())
                         compiler->MarkVariableMoved(rightNV.CallerName);
                 }
-                return assignResult;
+                return finishStore(assignResult);
             }
 
             // Destruct old value of an owning-value-type struct FIELD or whole LOCAL variable before
@@ -2226,7 +2218,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     ? namedVar.CallerName : DescribeUniqueFieldOwner(namedVar);
                 RejectNonHeapAddressIntoUnique(
                     std::format("an element of unique array '{}'", slot), ctx);
-                return right;
+                return finishStore(right);
             }
 
             // Storing a PROVABLE stack address into a `unique T*` LOCAL. The local's scope-exit
@@ -2245,7 +2237,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             {
                 RejectNonHeapAddressIntoUnique(
                     std::format("unique local '{}'", namedVar.CallerName), ctx);
-                return right;
+                return finishStore(right);
             }
 
             // `unique T* LOCAL` reassignment (`b = a`): free the old pointee before overwriting,
@@ -2281,7 +2273,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         ? std::format("{}.{}", rightNV.CallerName, rightNV.FieldName) : origin;
                     RejectBorrowIntoUniqueLocal(srcDesc, BorrowedOriginRoot(origin), srcIsField,
                                                 namedVar.CallerName, false, ctx);
-                    return right;
+                    return finishStore(right);
                 }
 
                 // Same rejection when a '?:' join laundered the borrowed move: the joined VALUE
@@ -2291,7 +2283,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 {
                     RejectBorrowIntoUniqueLocal(borrowMoveOrigin, BorrowedOriginRoot(borrowMoveOrigin),
                                                 false, namedVar.CallerName, false, ctx);
-                    return right;
+                    return finishStore(right);
                 }
 
                 compiler->EmitUniqueFieldDelete(
@@ -2367,7 +2359,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     right = CloneClosureFromNamedSource(rightNV, right, ctx);
                 compiler->builder->CreateStore(right, destination);
                 compiler->UnregisterOwnedClosureTemp(right);
-                return right;
+                return finishStore(right);
             }
 
             if (destIsElemSlot && namedVar.TypeAndValue.IsUnique && namedVar.TypeAndValue.Pointer
@@ -2388,7 +2380,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         compiler->MarkVariableMoved(rightNV.CallerName);
                     }
                 }
-                return right;
+                return finishStore(right);
             }
 
             if (destIsElemSlot && right->getType()->isStructTy()
@@ -2410,7 +2402,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         llvm::ConstantAggregateZero::get(right->getType()), rightNV.Storage);
                     compiler->MarkVariableMoved(rightNV.CallerName);
                 }
-                return right;
+                return finishStore(right);
             }
 
             if (destIsElemSlot && right->getType()->isStructTy()
@@ -2432,7 +2424,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                             || llvm::isa<llvm::GlobalVariable>(rightNV.Storage)))
                         compiler->MarkVariableMoved(rightNV.CallerName);
                 }
-                return toStore;
+                return finishStore(toStore);
             }
 
             auto* assignResult = derefAssign(right, rhsUnsigned);
@@ -2463,8 +2455,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     compiler->ClearOwnMoveOrigin(destination);
                 }
             }
+            /*
+             * The three refreshes below RETIRE a fact, and '??=' stores CONDITIONALLY - the old
+             * referent survives when the arm is not taken - so a '??=' takes the JOIN: the fact is
+             * kept unless the new RHS also carries it. Retiring unconditionally would launder a
+             * container-owned element borrow (measured: the desugared `if (g == nullptr) { g = ...; }`
+             * spelling clears the taint, and the resulting raw `delete g;` double-frees).
+             */
             // Reassignment to a bonded variable breaks the bond (per design: bond is to the instance).
-            if (operatorText == "=" && !namedVar.CallerName.empty())
+            if (operatorText == "=" && coalesceResume == nullptr && !namedVar.CallerName.empty())
                 compiler->ClearVariableBond(namedVar.CallerName);
             // Refresh the field-borrow taint on a reassigned whole-variable string local: it now
             // borrows a field iff the new RHS does (so `t = "lit"` after `t = b.name` clears it).
@@ -2475,7 +2474,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     && !rightNV.TypeAndValue.IsMove
                     && ((!rightNV.FieldName.empty() && !rightNV.OwningStructName.empty())
                         || rightNV.BorrowsOwnedString);
-                compiler->SetVariableBorrowsOwnedString(namedVar.CallerName, rhsBorrowsField);
+                if (rhsBorrowsField || coalesceResume == nullptr)
+                    compiler->SetVariableBorrowsOwnedString(namedVar.CallerName, rhsBorrowsField);
             }
             // Refresh the container-owned-element borrow taint on a reassigned pointer local: it
             // now borrows a container-owned element iff the new RHS does, so `g = new B()` after
@@ -2490,9 +2490,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     && !compiler->lastOwningResult;
                 std::string container = rightNV.TypeAndValue.ParentVariableName.empty()
                     ? rightNV.CallerName : rightNV.TypeAndValue.ParentVariableName;
-                compiler->SetVariableBorrowsOwnedElement(namedVar.CallerName, rhsBorrowsElem, container, rhsExternallyOwned);
+                if (rhsBorrowsElem || coalesceResume == nullptr)
+                    compiler->SetVariableBorrowsOwnedElement(namedVar.CallerName, rhsBorrowsElem, container, rhsExternallyOwned);
             }
-            return assignResult;
+            return finishStore(assignResult);
         }
         else if (unaryCtx)
         {

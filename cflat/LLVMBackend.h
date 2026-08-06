@@ -952,10 +952,10 @@ public:
         // Without these the proof retires only when the JOIN end is rebound, and nulling or
         // rebinding an ARM leaves it stale - a false rejection whose remedy leaks.
         std::vector<llvm::Value*> JoinKeepsOwnerSlots;
-        // The rebinding was a '??=', whose handler returns before the container-element refresh the
-        // plain '=' path runs. Suppresses the (possibly stale) element clause of the BOXING proof
-        // only - the raw-delete guard reads BorrowsOwnedElement directly and is deliberately
-        // untouched. See internal/issue/p2/coalesce-assign-skips-store-bookkeeping.md.
+        // The rebinding was a '??=', which stores CONDITIONALLY, so the element refresh takes the
+        // JOIN and the declaration's element fact can survive. Suppresses the element clause of the
+        // BOXING proof only - the raw-delete guard reads BorrowsOwnedElement directly and is
+        // deliberately untouched.
         bool CoalesceRebound = false;
         // compile-time: explicitly 'move'd-out thin pointer local - null but plain-readable by
         // design; only a same-block '->'/'.'/'*'/'[]' DEREFERENCE is rejected (see MarkVariableExplicitlyMovedNull).

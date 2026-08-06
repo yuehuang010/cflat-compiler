@@ -1799,6 +1799,26 @@ expect_error("cannot assign a 'void*' value to 'function<>' destination 'f'") {
     }
 }
 
+/*
+ * The '??=' spelling of the same store. It was the sole still-open THIN spelling when the '='
+ * gate landed: '??=' emitted its own compare/branch/store and RETURNED before the gate, and it
+ * parsed its RHS through the lean VALUE path, which discards the NamedVariable the gate reads.
+ * Measured on the merge base: compiles exit 0, then CALLS the data address (exit 138, SIGBUS).
+ * '??=' now enters the shared store tail with the builder in the assign arm, so it reaches this
+ * gate with a real rightNV. Discriminator: the pinned wording is the ASSIGN-site one, which the
+ * argument, return and decl-init sites do not produce, and the leg's only store is the '??='.
+ */
+expect_error("cannot assign a 'void*' value to 'function<>' destination 'fc'") {
+    int dpaqCoalesce = 3;
+
+    void dataPointerNullAssignedToThinLocal()
+    {
+        function<int(int)> fc = default;
+        void* vp = &dpaqCoalesce;
+        fc ??= vp;
+    }
+}
+
 // Struct FIELD assignment: the same gate, reached through a GEP destination instead of an alloca -
 // a separate storage shape from the bare-local leg above.
 expect_error("cannot assign a 'void*' value to 'function<>' destination 's.f'") {

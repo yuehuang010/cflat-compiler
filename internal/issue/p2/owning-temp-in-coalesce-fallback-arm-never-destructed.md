@@ -60,8 +60,9 @@ destructed" shape, so a fix here should be probed against both:
 
 - [[lambda-body-owning-temp-never-destructed]] - a lambda BODY runs no statement-boundary
   owned-temp machinery at all.
-- [[coalesce-assign-skips-store-bookkeeping]] - `raw ??= makeBox().t` measures `dtors=0` for the
-  same reason plus its own skipped store tail.
+- `coalesce-assign-skips-store-bookkeeping` (fixed and deleted by `fix/coalesce-tail`) -
+  `raw ??= makeBox().t` measured `dtors=0` for the same reason plus its own skipped store tail;
+  that spelling is a hard error now, so this `??` fallback-arm leak is the surviving half.
 
 ## Round-1 review addendum (2026-08-05)
 

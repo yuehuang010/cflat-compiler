@@ -2196,6 +2196,45 @@ int coalesceSoleOwnerLhsBox(CiMove* q)
     return a;
 }
 
+// The same sole-owner-LHS shape with a CAST on the RHS. The cast erases the source binding, so the
+// RHS owner is recovered from the boxed VALUE's slot; that fallback must not over-reject - the LHS
+// proves nothing here, so the join stays empty and the box's delete is still the only free of `c`'s
+// object. The reject side is the sCoalesceCast leg in err_delete_borrowed_interface_box.cb.
+int coalesceCastSoleOwnerLhsBox()
+{
+    CiMove* aOwn = new CiMove();
+    aOwn->r = 5;
+    CiMove* c = nullptr;
+    c = new CiMove();
+    c ??= (CiMove*)aOwn;
+    IShapeMove s = c;
+    int a = s.area();
+    delete s;
+    return a;
+}
+
+/*
+ * REVIVAL of a moved-out local through '??='. `move` nulls the source, so the '??=' null test is
+ * always TRUE for a moved-from pointer and the store always happens - which makes reviving it the
+ * same fact the plain '=' records (MarkVariableUnmoved / MarkVariableNotExplicitlyMovedNull), and
+ * makes the null test itself a guard read the null dataflow must see. On the merge base '??='
+ * returned before both, so this FALSE-REJECTED with "dereference of moved variable 'a'" while the
+ * '=' and the desugared `if (a == nullptr) { a = ...; }` spellings both compiled and ran. The two
+ * `r` values differ, so an aliased revival cannot pass for a fresh one.
+ */
+int coalesceRevivesMovedLocal()
+{
+    CiMove* a = new CiMove();
+    a->r = 2;
+    CiMove* b = move a;
+    a ??= new CiMove();
+    a->r = 3;
+    int total = a->area() + b->area();
+    delete a;
+    delete b;
+    return total;
+}
+
 // A one-hop COPY of a borrowed parameter, then REASSIGNED to a fresh allocation. This is the exact
 // case that once justified dropping IsBorrowed from the proof. It is covered by the reassignment
 // retirement instead, so IsBorrowed could be restored - which is what closes the laundering leg
@@ -2800,6 +2839,10 @@ int testUniqueInterfaceTernary()
     passed += Test("delete_box_elem_reassigned_freed_twice", dtorCount, 2);
 
     dtorCount = 0;
+    passed += Test("coalesce_revives_moved_local_value", coalesceRevivesMovedLocal(), 19);
+    passed += Test("coalesce_revives_moved_local_freed_twice", dtorCount, 2);
+
+    dtorCount = 0;
     passed += Test("delete_box_coalesce_elem_fallback_value", coalesceElemFallbackBox(), 7);
     passed += Test("delete_box_coalesce_elem_fallback_freed_once", dtorCount, 1);
 
@@ -2812,6 +2855,12 @@ int testUniqueInterfaceTernary()
         delete qOwned;
         passed += Test("delete_box_coalesce_sole_owner_freed_twice", dtorCount, 2);
     }
+
+    // The cast-RHS twin: value 7 pins that the LHS's own object was boxed, and dtors=2 pins that
+    // both it and the owning local the cast named were released exactly once.
+    dtorCount = 0;
+    passed += Test("delete_box_coalesce_cast_value", coalesceCastSoleOwnerLhsBox(), 7);
+    passed += Test("delete_box_coalesce_cast_freed_twice", dtorCount, 2);
 
     /*
      * A '??' join into an interface. It joins through a SLOT rather than a phi, so its result
@@ -5088,7 +5137,7 @@ extern int main()
     total += 8;
 
     passed += testUniqueInterfaceTernary();
-    total += 177;
+    total += 181;
 
     passed += testTernaryInterfaceInheritanceRebox();
     total += 22;

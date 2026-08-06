@@ -2826,6 +2826,14 @@ bool testCodeValueJoinAccepts()
     coalPtr ??= px;
     JoinAcc* coalCast = nullptr;
     coalCast ??= (JoinAcc*)w;
+    // A LAMBDA LITERAL through '??='. The expected-type threading and the fat-to-thin coercion
+    // both live in the shared store tail, which '??=' used to return before, so on the merge base
+    // this was rejected with "cannot assign a struct value to a pointer variable". The value 5
+    // (not 4) is what proves the lambda's own body ran through the thin slot.
+    function<int(int)> coalLambda = default;
+    coalLambda ??= (int a) => a + 1;
+    result &= Test("cvj_nullassign_fn_lambda", coalLambda(4), 5);
+
     result &= Test("cvj_nullassign_fn_slot",   (int)coalSlot(1.0),      1001);
     result &= Test("cvj_nullassign_fn_local",  (int)coalFromLocal(1.0), 2001);
     result &= Test("cvj_nullassign_data_ptr",  coalPtr->a,              5);
